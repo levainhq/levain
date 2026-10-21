@@ -14,7 +14,6 @@ import logging
 import os
 import socket
 import stat
-import struct
 import sys
 import threading
 import time
@@ -22,6 +21,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from levain.qbroker import wire
+from levain.qbroker.peercred import peer_uid
 from levain.qbroker.broker import Broker
 
 __all__ = ["IDLE_TIMEOUT", "MAX_CONNECTIONS", "SlotListener", "peer_uid", "socket_path"]
@@ -34,24 +34,6 @@ MAX_CONNECTIONS = 16
 IDLE_TIMEOUT = 60.0
 # after an accept() error that is not the listener's own close (EMFILE, ECONNABORTED), the pause before the next
 ACCEPT_BACKOFF = 0.1
-_SOL_LOCAL = 0            # macOS <sys/un.h>
-_LOCAL_PEERCRED = 0x001   # macOS <sys/un.h>: struct xucred
-_XUCRED = struct.Struct("@IIh16I")   # cr_version, cr_uid, cr_ngroups, cr_groups[NGROUPS]
-_UCRED = struct.Struct("3i")         # Linux struct ucred: pid, uid, gid
-
-
-def peer_uid(sock: socket.socket) -> int:
-    """The connected peer's effective uid, from the kernel."""
-    if sys.platform == "darwin":
-        raw = sock.getsockopt(_SOL_LOCAL, _LOCAL_PEERCRED, _XUCRED.size)
-        version, uid = _XUCRED.unpack(raw[:_XUCRED.size])[:2]
-        if version != 0:
-            raise OSError(f"xucred version {version}")
-        return uid
-    raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _UCRED.size)
-    return _UCRED.unpack(raw)[1]
-
-
 def socket_path(run_dir: Path | str, slot: int) -> Path:
     return Path(run_dir) / "qb" / f"slot{slot}" / "q.sock"
 

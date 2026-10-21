@@ -7,7 +7,7 @@ slot's broker socket, and :data:`CAP_ENV`, the queue cap CONTROL minted for the 
 the answer's signature, so a ``{decision}`` from the socket is the only authority the hook reads here.
 
 The client authenticates the server (L3 r1 A): after every connect it reads the socket's PEER uid from the kernel
-(:func:`levain.qbroker.server.peer_uid`, the listener's own primitive; for a connecting socket it is the uid that
+(:func:`levain.qbroker.peercred.peer_uid`, the listener's own primitive; for a connecting socket it is the uid that
 called ``listen``) and refuses (``peer-not-broker``) unless it is the uid of :data:`BROKER_ACCOUNT`, looked up with
 :func:`pwd.getpwnam`. A machine without that account (``no-broker-account``) reaches no broker at all. The variable
 names WHERE to connect; it can never name WHO answers, so a socket an untrusted repository's own process listens
@@ -70,6 +70,9 @@ FAST_POLLS = 8
 SLOW_POLL = 1.0
 # a REQUEST refused rate-limited is sent once more after this long (well past the broker's token interval)
 REQUEST_RETRY = 1.0
+# a socket timeout and time.monotonic read different clocks: a call that ran out this close to the hold's end ended
+# the hold (undecided), it did not fail to run
+DEADLINE_SLOP = 0.05
 
 
 class BrokerError(Exception):
@@ -127,16 +130,24 @@ class BrokerClient:
     def call(self, op: str, *, timeout: float | None = None, **fields: Any) -> dict[str, Any]:
         """One frame to the broker and its one answer, as ``{"ok": True, ...}``; a refusal raises
         :class:`BrokerError` with the broker's name for it. ``timeout`` (at most this client's own) bounds each
-        socket operation of this call."""
-        from levain.qbroker.server import peer_uid   # here, not at import: the local path never loads the broker
+        call, connect to answer, under one deadline (each step gets only the time left)."""
+        from levain.qbroker.peercred import peer_uid   # here, not at import: the local path loads nothing of it
 
         expected = self._broker_uid()
         limit = self._timeout if timeout is None else min(self._timeout, timeout)
+        deadline = time.monotonic() + limit
         rid = next(self._ids)
         message = {"v": wire.VERSION, "op": op, "id": rid, "cap": self._cap, **fields}
+
+        def left() -> float:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("the call's time ran out")
+            return remaining
+
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(limit)
+                sock.settimeout(left())
                 sock.connect(self._path)
                 try:
                     peer = peer_uid(sock)
@@ -146,8 +157,9 @@ class BrokerClient:
                 if peer != expected:
                     # not a byte is sent: the cap and the request never reach a socket the broker does not own
                     raise BrokerError("peer-not-broker", f"the socket's peer is uid {peer}, not {BROKER_ACCOUNT}")
+                sock.settimeout(left())
                 wire.write_frame(sock, message)
-                got = wire.read_frame(sock, timeout=limit)
+                got = wire.read_frame(sock, timeout=left())
         except BrokerError:
             raise
         except wire.FrameError as exc:
@@ -246,7 +258,7 @@ def _hold(client: BrokerClient, request_id: str, deadline: float, *, poll: float
         except BrokerError as exc:
             if exc.name == EXPIRED:
                 return None
-            if exc.name == "unreachable" and monotonic() >= deadline:
+            if exc.name == "unreachable" and monotonic() >= deadline - DEADLINE_SLOP:
                 return None   # the call ran out of hold (its timeout was the time left): the hold ended undecided
             raise
         if got is not None:
