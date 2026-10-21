@@ -1162,12 +1162,20 @@ def test_an_install_rule_from_another_interpreter_or_release_and_a_narrowed_one(
     old = tmp_path / "old"
     (old / ".claude").mkdir(parents=True)
     (old / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": ["Bash(levain coord:*)"]}}))
+    assert inst.installed_coordinator_levain(old) is None          # no recorded role: the operator's rules
+    (old / ".levain").mkdir()
+    (old / ".levain" / "config.json").write_text(json.dumps({"role": "coordinator"}))
     assert inst.installed_coordinator_levain(old) == "levain"
+    # a rule that names something else is not a levain (L3 r2 codex): `make coord`, a wrapper
+    for other in ("Bash(make coord:*)", f"Bash(nice {inst.coordinator_levain('/v/bin/python')} coord:*)"):
+        (old / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": [other]}}))
+        assert inst.installed_coordinator_levain(old) is None, other
     # a rule leaf is levain's under another interpreter, never once its other text is edited (L3 r1 codex MED)
     variant = f"Bash({inst.coordinator_levain(inst._VARIABLE)} coord:*)"
     assert inst._fits_variant(f"Bash({inst.coordinator_levain('/other venv/bin/python')} coord:*)", variant)
     assert not inst._fits_variant(f"Bash({inst.coordinator_levain('/v/bin/python')} coord status:*)", variant)
     assert not inst._fits_variant(f"Bash({inst.coordinator_levain('/v/bin/python')} doctor:*)", variant)
+    assert not inst._fits_variant(f"Bash(wrapper {inst.coordinator_levain('/v/bin/python')} coord:*)", variant)
 
 
 def test_a_settings_file_with_a_narrowed_coordinator_rule_is_not_levains_render(tmp_path):

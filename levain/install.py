@@ -2757,6 +2757,8 @@ def persisted_consent_hook(install: Path) -> str:
 # live install it reuses (tests/test_coordinator_launch.py "a_reused_install_gets_none" pins that).
 ROLE_CHOICES = ("coordinator",)
 COORDINATOR_VERBS = ("coord", "drops", "thread")
+# one shell word as shlex.quote or a hook template writes a path: single-quoted, double-quoted, or bare
+_SHELL_WORD = r"""(?:'[^']*'|"(?:[^"\\]|\\.)*"|[^\s'"]+)"""
 # Levain's own project MCP servers, the names its .mcp.json render writes (BAND_SERVER and DISPATCH_SERVER are
 # defined with that render; the test pins this tuple against a real coordinator install's .mcp.json keys)
 COORDINATOR_MCP_SERVERS = ("anneal_memory", "levain_band", "levain_dispatch")
@@ -2782,6 +2784,8 @@ def installed_coordinator_levain(install: Path) -> str | None:
     None (no such rule, or settings that cannot be read). A brief built from it tells the session exactly what this
     install pre-approves, whichever interpreter wrote the rule (an install from before the interpreter was named
     keeps its bare ``levain``) and whichever one is launching now (1021+11 L3 r1 codex HIGH)."""
+    if persisted_role(install) != "coordinator":
+        return None              # a reused live install: its rules are the operator's, never read as Levain's
     try:
         doc = json.loads((install / ".claude" / "settings.json").read_text(encoding="utf-8"))
         allow = doc["permissions"]["allow"]
@@ -2791,7 +2795,8 @@ def installed_coordinator_levain(install: Path) -> str | None:
         return None
     for rule in allow:
         m = re.fullmatch(r"Bash\((.+) coord:\*\)", rule) if isinstance(rule, str) else None
-        if m is not None:
+        # only a spelling Levain writes (L3 r2 codex: `Bash(make coord:*)` is not a levain)
+        if m is not None and (m.group(1) == "levain" or re.fullmatch(_SHELL_WORD + r" -P -m levain", m.group(1))):
             return m.group(1)
     return None
 
@@ -4539,7 +4544,8 @@ def _fits_variant(here: object, variant: str) -> bool:
     parts = variant.split(_VARIABLE)
     parts = [p.rstrip("'\"") if i < len(parts) - 1 else p for i, p in enumerate(parts)]
     parts = [p.lstrip("'\"") if i > 0 else p for i, p in enumerate(parts)]
-    return re.fullmatch(".+".join(re.escape(p) for p in parts), here, flags=re.S) is not None
+    # each span is one shell word, never a wrapper or extra arguments (L3 r2 codex)
+    return re.fullmatch(_SHELL_WORD.join(re.escape(p) for p in parts), here, flags=re.S) is not None
 
 
 # The base seed files a release adds to installs that never had them. Only these are written on
