@@ -82,6 +82,15 @@ V17_META_BYTES = 64 << 20
 # (plan §2h 8 asks only that it be known before any mutation). V4's SIGKILL-row tree bytes is the
 # order of magnitude a session's own work is sized at; refused as the manifest budget past it.
 LINK_COPY_BYTES = 2 << 30
+# The manifest's depth cap (the head's 1021+19 ruling on the s5 design's Q5): a tree entry deeper than this many
+# levels below the session root refuses ``manifest-depth-cap``, a budget refusal. The slot's code can build a chain
+# of any depth; the cap bounds the walk's work and its in-memory stack, never the fds it holds (that is
+# WALK_OPEN_DIRS, below the smallest default RLIMIT_NOFILE).
+MANIFEST_DEPTH = 1024
+# DECISION: the most directory fds one walk holds open at a time (its root's included). An ancestor past it is
+# closed when the walk descends and reopened through the child's ``..`` when the walk climbs back, checked to be
+# the same directory, so a deep chain costs reopens, not fds.
+WALK_OPEN_DIRS = 32
 # DECISION: how long END keeps retrying a CAS CONTROL did not take (``locked``, CONTROL down) before it
 # leaves the record for the next pass: V12's order, so one END never outlives a reaper pass by much.
 CAS_RETRY_SECONDS = V12_SECONDS
@@ -127,7 +136,7 @@ VAR_FOLDERS_NAME = b".levain-var-folders"     # CONTRACT §7.4: macOS /private/v
 #: The refusals that mean "past the manifest budget": HELD ``failed_step:"manifest_budget"``, whose
 #: exit is END again with larger caps (§7.3 force-retire a).
 BUDGET_REFUSALS = frozenset({"manifest-inode-cap", "manifest-time-cap", "manifest-byte-cap", "meta-byte-cap",
-                             "link-copy-cap"})
+                             "link-copy-cap", "manifest-depth-cap"})
 
 #: ``L/retained/<s>/linkcopy/<dev>-<ino>``: a foreign inode's bytes as the session uid read them, staged by
 #: the manifest step and linked into the tree by the tree step (L2 H2).
@@ -187,18 +196,21 @@ def _no_fault(point: str) -> None:
 
 @dataclass(frozen=True)
 class Caps:
-    """The manifest budget (V1 inodes, V2 seconds, V17 manifest + meta bytes) and the outside-link copy
-    cap. ``force-retire`` (a) is END again with a larger one."""
+    """The manifest budget (V1 inodes, V2 seconds, V17 manifest + meta bytes, the depth cap) and the
+    outside-link copy cap. ``force-retire`` (a) is END again with a larger one. DECISION: ``scaled`` leaves
+    ``depth`` as it is: depth is a shape of the tree, not an amount of work, so a scaled budget never makes
+    an ordinary nested tree refuse."""
 
     inodes: int = V1_INODES
     seconds: float = V2_SECONDS
     manifest_bytes: int = V17_MANIFEST_BYTES
     meta_bytes: int = V17_META_BYTES
     link_copy_bytes: int = LINK_COPY_BYTES
+    depth: int = MANIFEST_DEPTH
 
     def scaled(self, factor: float) -> "Caps":
         return Caps(int(self.inodes * factor), self.seconds * factor, int(self.manifest_bytes * factor),
-                    int(self.meta_bytes * factor), int(self.link_copy_bytes * factor))
+                    int(self.meta_bytes * factor), int(self.link_copy_bytes * factor), self.depth)
 
 
 # --- facts (from the alloc record only) ------------------------------------------------------------
@@ -350,18 +362,36 @@ def _open_dir_at(name: bytes, dirfd: int, st: os.stat_result) -> int:
     return fd
 
 
-def walk(root: Path, extra: Mapping[bytes, Path] | None = None) -> Iterator[Entry]:
+def _reopen_parent(child_fd: int, frame: list) -> None:
+    """Reopen a closed ancestor ``frame`` through its child's ``..`` (never a link), checked to be the
+    directory the walk opened before; anything else refuses ``tree-changed``."""
+    fd = os.open(b"..", _DIR_FLAGS, dir_fd=child_fd)
+    if not _same(os.fstat(fd), frame[7]):
+        os.close(fd)
+        raise Refused("tree-changed", f"{frame[2]!r} changed under the walk")
+    frame[0] = fd
+
+
+def walk(root: Path, extra: Mapping[bytes, Path] | None = None, *,
+         depth_cap: int = MANIFEST_DEPTH) -> Iterator[Entry]:
     """Every entry under ``root`` (not ``root`` itself), depth first, a directory before its children,
     names in byte order; never follows a link (each directory opened ``O_NOFOLLOW`` from its parent's
     fd and checked against the ``lstat`` that named it). ``extra`` adds root children that live
     elsewhere (macOS ``/var/folders/<slot>``, walked as ``.levain-var-folders`` before it is moved
     there); an absent one is skipped, a present one must be a real directory, and a name the tree
     already has is ``retain-conflict``. An entry on another filesystem than its directory (a mount inside
-    the tree, L2 L12) refuses ``tree-mount``: root never walks, strips or chowns into one."""
+    the tree, L2 L12) refuses ``tree-mount``: root never walks, strips or chowns into one.
+
+    An entry more than ``depth_cap`` levels below ``root`` (a root child is level 1) refuses
+    ``manifest-depth-cap``. At most :data:`WALK_OPEN_DIRS` directory fds are held: the root's always, and
+    the deepest ones; an ancestor closed on the way down is reopened from its child's ``..`` on the way back
+    up (:func:`_reopen_parent`). Only the directory of the entry yielded is guaranteed open."""
     extra = dict(extra or {})
     root_b = os.fsencode(root)
     root_fd = os.open(root_b, _DIR_FLAGS)
+    # frame: [fd (-1 = closed), prefix, absprefix, names, i, extra, dev, the directory's stat]
     stack: list[list] = []
+    low = 1   # the shallowest non-root frame that may still be open; every frame below it is closed
     try:
         names = [os.fsencode(n) for n in os.listdir(root_fd)]
         clash = set(names) & set(extra)
@@ -376,18 +406,28 @@ def walk(root: Path, extra: Mapping[bytes, Path] | None = None) -> Iterator[Entr
             if not stat.S_ISDIR(pst.st_mode):
                 raise Refused("var-folders-not-dir", str(p))
             live_extra[k] = (os.fsencode(p), pst)
-        stack.append([root_fd, b"", root_b, sorted(names + list(live_extra)), 0, live_extra,
-                      os.fstat(root_fd).st_dev])
+        root_st = os.fstat(root_fd)
+        stack.append([root_fd, b"", root_b, sorted(names + list(live_extra)), 0, live_extra, root_st.st_dev,
+                      root_st])
         while stack:
             frame = stack[-1]
-            fd, prefix, absprefix, names, i, fextra, dev = frame
+            fd, prefix, absprefix, names, i, fextra, dev, _dst = frame
             if i == len(names):
-                os.close(fd)
                 stack.pop()
+                if stack and stack[-1][0] < 0:
+                    try:
+                        _reopen_parent(fd, stack[-1])
+                    finally:
+                        os.close(fd)
+                    low = len(stack) - 1
+                else:
+                    os.close(fd)
                 continue
             frame[4] = i + 1
             name = names[i]
             path = prefix + name
+            if len(stack) > depth_cap:
+                raise Refused("manifest-depth-cap", f"{path[:200]!r}... is deeper than {depth_cap} levels")
             if name in fextra:
                 absp, st = fextra[name]
                 yield Entry(path, st, -1, name, absp)
@@ -406,13 +446,18 @@ def walk(root: Path, extra: Mapping[bytes, Path] | None = None) -> Iterator[Entr
             except BaseException:
                 os.close(child)
                 raise
-            stack.append([child, path + b"/", absp, cnames, 0, {}, st.st_dev])
+            stack.append([child, path + b"/", absp, cnames, 0, {}, st.st_dev, st])
+            if len(stack) - low > WALK_OPEN_DIRS - 1:   # the open frames are the root's and stack[low:]
+                os.close(stack[low][0])
+                stack[low][0] = -1
+                low += 1
     finally:
         for frame in stack:
-            try:
-                os.close(frame[0])
-            except OSError:
-                pass
+            if frame[0] >= 0:
+                try:
+                    os.close(frame[0])
+                except OSError:
+                    pass
 
 
 def entry_type(mode: int) -> str:
@@ -510,8 +555,8 @@ def iter_manifest(root: Path, *, extra: Mapping[bytes, Path] | None = None, caps
                   read_foreign: ForeignRead | None = None) -> Iterator[dict]:
     """The manifest records of the tree, in walk order: ``{path_b64, type, mode, size, nlink, digest}``
     (``mode`` = the permission bits, ``stat.S_IMODE``; a file's digest is over its bytes, a link's over
-    its ``readlink`` target bytes; a dir / fifo / socket / device: size 0, digest ""). The inode and
-    time caps refuse by name mid-walk.
+    its ``readlink`` target bytes; a dir / fifo / socket / device: size 0, digest ""). The inode, time
+    and depth caps refuse by name mid-walk.
 
     ``credentials``: the tree paths END parks (the session vendor's credential on a passthrough session,
     plan §2g 3); one still there refuses ``credential-not-parked`` (END parks first, so the manifest never
@@ -521,7 +566,7 @@ def iter_manifest(root: Path, *, extra: Mapping[bytes, Path] | None = None, caps
     budget = _Budget(caps, clock)
     creds = frozenset(credentials)
     foreign = frozenset(foreign)
-    for e in walk(root, extra):
+    for e in walk(root, extra, depth_cap=caps.depth):
         t = entry_type(e.st.st_mode)
         if e.path in creds and t != "dir":
             if skip_credentials:
@@ -563,17 +608,19 @@ def _count_link(links: dict[tuple[int, int], LinkCount], e: Entry) -> None:
         lc.seen += 1
 
 
-def _count_links(root: Path, extra: Mapping[bytes, Path] | None = None) -> dict[tuple[int, int], LinkCount]:
+def _count_links(root: Path, extra: Mapping[bytes, Path] | None = None, *,
+                 depth_cap: int = MANIFEST_DEPTH) -> dict[tuple[int, int], LinkCount]:
     links: dict[tuple[int, int], LinkCount] = {}
-    for e in walk(root, extra):
+    for e in walk(root, extra, depth_cap=depth_cap):
         _count_link(links, e)
     return links
 
 
-def foreign_links(root: Path, extra: Mapping[bytes, Path] | None = None) -> dict[tuple[int, int], LinkCount]:
+def foreign_links(root: Path, extra: Mapping[bytes, Path] | None = None, *,
+                  depth_cap: int = MANIFEST_DEPTH) -> dict[tuple[int, int], LinkCount]:
     """The non-directory inodes, of any type, some of whose links lie outside ``root`` (+ ``extra``):
     ``nlink`` greater than the links the walk sees. Root never strips or chowns one (comp r1 4)."""
-    return {k: lc for k, lc in _count_links(root, extra).items() if lc.seen < lc.nlink}
+    return {k: lc for k, lc in _count_links(root, extra, depth_cap=depth_cap).items() if lc.seen < lc.nlink}
 
 
 def outside_link_bytes(links: Mapping[tuple[int, int], LinkCount]) -> int:
@@ -582,8 +629,8 @@ def outside_link_bytes(links: Mapping[tuple[int, int], LinkCount]) -> int:
     return sum(lc.size for lc in links.values() if lc.regular and lc.seen < lc.nlink)
 
 
-def classify(root: Path, extra: Mapping[bytes, Path] | None, uids: Collection[int]
-             ) -> tuple[dict[tuple[int, int], str], dict[tuple[int, int], LinkCount]]:
+def classify(root: Path, extra: Mapping[bytes, Path] | None, uids: Collection[int], *,
+             depth_cap: int = MANIFEST_DEPTH) -> tuple[dict[tuple[int, int], str], dict[tuple[int, int], LinkCount]]:
     """ONE classification of the frozen tree's inodes, by one walk, before a byte is read (codex r1 4):
     :data:`OUTSIDE` for a regular file some of whose links lie outside the tree, :data:`UNOWNED` for any
     other inode whose owner is not one of ``uids`` (the session's), whatever its link count. Returns it with
@@ -592,7 +639,7 @@ def classify(root: Path, extra: Mapping[bytes, Path] | None, uids: Collection[in
     uids = frozenset(uids)
     links: dict[tuple[int, int], LinkCount] = {}
     classes: dict[tuple[int, int], str] = {}
-    for e in walk(root, extra):
+    for e in walk(root, extra, depth_cap=depth_cap):
         _count_link(links, e)
         if e.st.st_uid not in uids:
             classes[(e.st.st_dev, e.st.st_ino)] = UNOWNED
@@ -1094,13 +1141,14 @@ def default_strip() -> Strip:
 
 
 def iter_meta(root: Path, *, extra: Mapping[bytes, Path] | None = None, reader: MetaReader,
-              note: Callable[[str], None], skip: Collection[tuple[int, int]] = ()) -> Iterator[dict]:
+              note: Callable[[str], None], skip: Collection[tuple[int, int]] = (),
+              depth_cap: int = MANIFEST_DEPTH) -> Iterator[dict]:
     """``{path_b64, acl?, flags?, xattrs?}`` for every entry that carries any of the three. ``skip``: the
     classified inodes (:func:`classify`, any type: outside-linked, or not a session uid's), whose metadata
     root never reads. DECISION: an entry with none gets no line, so meta stays within V17's 64 MiB beside a
     full manifest."""
     skip = frozenset(skip)
-    for e in walk(root, extra):
+    for e in walk(root, extra, depth_cap=depth_cap):
         if (e.st.st_dev, e.st.st_ino) in skip:
             continue
         rec = reader(e, note)
@@ -1122,7 +1170,7 @@ def os_chown(dirfd: int, name: bytes, uid: int, gid: int) -> None:
     os.chown(name, uid, gid, dir_fd=dirfd, follow_symlinks=False)
 
 
-def _place_link_copies(facts: EndFacts, tree: Path, note: Callable[[str], None]) -> None:
+def _place_link_copies(facts: EndFacts, tree: Path, note: Callable[[str], None], depth_cap: int) -> None:
     """Each in-tree link of an outside-linked inode becomes a hard link to that inode's staged copy (the
     manifest step's: the bytes the session uid read and hashed), so an in-tree link set stays one inode
     and the outside file is no longer shared (root never chowns a shared inode, plan §2g 2). Redone after a
@@ -1147,7 +1195,7 @@ def _place_link_copies(facts: EndFacts, tree: Path, note: Callable[[str], None])
                 staged[nb] = st
         copies = {(st.st_dev, st.st_ino) for st in staged.values()}
         synced: set[bytes] = set()   # the tree dirs (by path) fsynced since their last placement
-        for e in walk(tree):
+        for e in walk(tree, depth_cap=depth_cap):
             if not stat.S_ISREG(e.st.st_mode):
                 continue
             key = (e.st.st_dev, e.st.st_ino)
@@ -1350,7 +1398,7 @@ def _manifest_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
     would be a false record). The copy cap is checked
     before anything is read, and is ONE budget across every reader: each gets only what the reads before it
     left (codex r1 8), so files an outside holder grows after the sum cannot stage past it."""
-    classes, outside = classify(facts.live, facts.extra, facts.uids)
+    classes, outside = classify(facts.live, facts.extra, facts.uids, depth_cap=caps.depth)
     copy = outside_link_bytes(outside)
     if copy > caps.link_copy_bytes:
         raise Refused("link-copy-cap", f"{copy} bytes hard-linked outside the tree > {caps.link_copy_bytes}")
@@ -1407,7 +1455,7 @@ def _meta_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
     recompute (codex r1 4: an outside link removed between the two steps cannot hand root the inode)."""
     _stream_jsonl(facts.retained / "meta.jsonl",
                   iter_meta(facts.live, extra=facts.extra, reader=seams.meta_reader, note=seams.note,
-                            skip=read_classes(facts)),
+                            skip=read_classes(facts), depth_cap=caps.depth),
                   caps.meta_bytes, "meta-byte-cap")
 
 
@@ -1442,7 +1490,7 @@ def _rename_durable(src: Path, dst: Path) -> None:
     fsync_dir(dst.parent)
 
 
-def _tree_step(facts: EndFacts, seams: EndSeams) -> None:
+def _tree_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
     """Rename the session's work into ``tree/`` (and macOS ``/var/folders/<slot>`` into
     ``tree/.levain-var-folders/``), link the staged copies over the outside-linked files, strip (setuid /
     setgid included), then chown root, then flush it all (:attr:`EndSeams.sync`) before the journal may
@@ -1484,15 +1532,15 @@ def _tree_step(facts: EndFacts, seams: EndSeams) -> None:
 
     # DECISION: the outside-link copies are placed before the strip (§7.4 names rename, strip, fchown),
     # so the strip never clears flags or xattrs on an inode a path outside the tree still shares.
-    _place_link_copies(facts, tree, seams.note)
+    _place_link_copies(facts, tree, seams.note, caps.depth)
     seams.fault("retain:tree:links")
 
     classes = read_classes(facts)
-    shared = foreign_links(tree)
+    shared = foreign_links(tree, depth_cap=caps.depth)
     special = [k for k, lc in shared.items() if not lc.regular]
     if special:
         raise Refused("tree-shared-special", f"inode {special[0][0]}-{special[0][1]} is linked outside the tree")
-    for e in walk(tree):
+    for e in walk(tree, depth_cap=caps.depth):
         key = (e.st.st_dev, e.st.st_ino)
         if key in shared:
             continue
@@ -1507,7 +1555,7 @@ def _tree_step(facts: EndFacts, seams: EndSeams) -> None:
         seams.chown(rfd, b"tree", seams.root_uid, seams.root_gid)
     finally:
         os.close(rfd)
-    for e in walk(tree):
+    for e in walk(tree, depth_cap=caps.depth):
         if (e.st.st_dev, e.st.st_ino) not in shared:
             seams.chown(e.dirfd, e.name, seams.root_uid, seams.root_gid)
     fsync_dir(tree)
@@ -1556,7 +1604,7 @@ def retain_plan(facts: EndFacts, seams: EndSeams, ri: RootIntent | None = None, 
         Phase("manifest", lambda: _manifest_step(facts, seams, caps)),
         Phase("meta", lambda: _meta_step(facts, seams, caps)),
         Phase("object", lambda: _object_step(facts, created)),
-        Phase("tree", lambda: _tree_step(facts, seams)),
+        Phase("tree", lambda: _tree_step(facts, seams, caps)),
         Phase("commit", lambda: _commit_step(facts, seams)),
     ), fields)
 

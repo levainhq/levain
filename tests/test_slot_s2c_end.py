@@ -10,6 +10,7 @@ from __future__ import annotations
 import errno
 import itertools
 import os
+import resource
 import shutil
 import stat
 import subprocess
@@ -599,6 +600,37 @@ def test_end_inode_and_time_caps_refused(tmp_path):
     _untouched(w, pre_live)
     assert end_session(w.facts, w.seams(ctl), record_state=HELD, failed_step="manifest_budget",
                        caps=Caps(inodes=n)) == RETAINED   # exactly at the cap ends normally
+
+
+def test_end_deep_chain_holds_bounded_fds_and_refuses_past_depth_cap(world):
+    """A slot-built directory chain deeper than the fd limit (reproduced on main 42585459: a 2000-deep chain at
+    RLIMIT_NOFILE 1024, and a 300-deep one at macOS's default 256, made the manifest walk raise EMFILE, so END
+    landed HELD at the bare ``manifest`` phase and failed the same way on every pass). The walk now holds a
+    bounded number of fds, so the chain is retained under a low limit; past the depth cap it is a budget
+    refusal (HELD ``manifest_budget``, nothing mutated), whose exit is END again with a larger cap. The chain is
+    under ``.levain-var-folders``, whose own frame is opened by path, not from the root's fd."""
+    fd = os.open(world.vf / "T", os.O_RDONLY | os.O_DIRECTORY)
+    for name in ["deep"] + ["d"] * 149:            # openat all the way down: PATH_MAX never limits it
+        os.mkdir(name, dir_fd=fd)
+        nfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+        os.close(fd)
+        fd = nfd
+    os.close(fd)
+    pre_live = {k: v for k, v in snapshot(world.S).items() if k != "config/claude/.credentials.json"}
+    pre, pre_manifest = world.pre(), world.pre_manifest()
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    ctl = Control()
+    resource.setrlimit(resource.RLIMIT_NOFILE, (96, hard))
+    try:
+        assert end_session(world.facts, world.seams(ctl), record_state=REVOKED, caps=Caps(depth=100)) == HELD
+        assert ctl.failed_step == "manifest_budget" and any("manifest-depth-cap" in n for n in world.notes)
+        _untouched(world, pre_live)
+        assert end_session(world.facts, world.seams(ctl), record_state=HELD, failed_step="manifest_budget",
+                           held_attempts=1) == RETAINED
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    ctl.history = [h for h in ctl.history if h[0] != HELD]
+    _assert_retained(world, pre, pre_manifest, ctl)
 
 
 def _node_modules_tree(root: Path, packages: int, targets: int) -> None:
