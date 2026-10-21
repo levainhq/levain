@@ -7,9 +7,8 @@ be root's, reaches ``sys.path``) with the import tree as the ONE path added to t
 standard library. One text (:func:`entry_text`) serves both helpers and the service units (§23).
 
 The helper entries hand off to ``levain.slot.install_helper`` / ``levain.slot.runtime_helper`` run as
-``__main__``; the service entry to :mod:`levain.slot.service_boot`. The install helper's ``__main__``
-refuses with a non-zero exit until its apply layer exists, and the runtime helper module does not
-exist yet: :data:`PENDING` says so in the plan output.
+``__main__``; the service entry to :mod:`levain.slot.service_boot`. Which of either helper's verbs are not
+built yet is derived from the helpers themselves (``install_helper.helper_pending``), never written here.
 """
 from __future__ import annotations
 
@@ -36,9 +35,6 @@ VENDOR_PREFIX: Mapping[str, Path] = {"darwin": Path("/usr/local/lib/levain-vendo
 ENTRY_MODULES = {"install-helper": "levain.slot.install_helper", "runtime-helper": "levain.slot.runtime_helper",
                  "service-entry": "levain.slot.service_boot"}
 HELPER_MODULES = {k: v for k, v in ENTRY_MODULES.items() if k != "service-entry"}
-
-PENDING = ("levain.slot.install_helper's __main__ refuses (exit 2): its apply layer is not built yet",
-           "levain.slot.runtime_helper does not exist yet")
 
 
 def entry_text(host: HostOS, entry: str, *, tree: Path | None = None) -> str:
@@ -191,5 +187,5 @@ def tree_steps(host: HostOS, source: Path) -> list[Step]:
     return steps
 
 
-__all__ = ["ENTRY_MODULES", "HELPER_MODULES", "PENDING", "PY_FLAGS", "ROOT_PYTHON", "VENDOR_PREFIX", "entry_text",
+__all__ = ["ENTRY_MODULES", "HELPER_MODULES", "PY_FLAGS", "ROOT_PYTHON", "VENDOR_PREFIX", "entry_text",
            "helper_entry_text", "tree_steps"]

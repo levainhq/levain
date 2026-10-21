@@ -57,7 +57,8 @@ def test_initialize_and_tools_list(ddir):
     assert init["result"]["serverInfo"]["name"] == "levain_dispatch"
     tools = mcp.handle("codex", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, directory=ddir)["result"]["tools"]
     names = {t["name"] for t in tools}
-    assert names == {"dispatch_file", "dispatch_show", "dispatch_list", "dispatch_recommend", "dispatch_cancel"}
+    assert names == {"dispatch_file", "dispatch_show", "dispatch_list", "dispatch_recommend", "dispatch_cancel",
+                     "dispatch_land"}
     assert not any("sign" in n for n in names)
     by = {t["name"]: t["description"] for t in tools}
     assert "must sign on their own device before anything runs" in by["dispatch_file"]
@@ -195,4 +196,94 @@ def test_a_value_error_from_below_is_a_fault(ddir, monkeypatch):
     result = call(ddir, "dispatch_list", {})["result"]
     assert result["isError"] is True and result["content"][0]["text"].startswith("This machine could not do it "
                                                                                  "(ValueError)")
+
+
+# --- F11-s2b: dispatch_land and the recommend's proposal -------------------------------------------------------------
+
+@pytest.fixture
+def lw(tmp_path, monkeypatch):
+    from tests.test_dispatch_adopt import LandWorld
+
+    for var in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+        monkeypatch.delenv(var, raising=False)
+    return LandWorld(tmp_path)
+
+
+def test_dispatch_land_takes_no_human_item_and_no_data_root():
+    tool = next(t for t in mcp.TOOLS if t["name"] == "dispatch_land")
+    schema = tool["inputSchema"]
+    assert set(schema["properties"]) == {"job", "onto", "capability"} and schema["additionalProperties"] is False
+    assert "never this call" in tool["description"] and "OPERATOR runs" in tool["description"]
+
+
+def test_dispatch_land_lands_a_planners_job_by_the_rule(lw):
+    job, cap = lw.verified()
+    staged = lw.jstore.run_record(job.id, 0).staged_commit
+    out = call(lw.ddir, "dispatch_land", {"job": job.id, "onto": "main"}, agent="claude_code",
+               meta={"sessionId": "someone-else"})["result"]
+    assert out["isError"] is True and "holds no capability" in out["content"][0]["text"]
+    out = call(lw.ddir, "dispatch_land", {"job": job.id, "onto": "main", "capability": cap + "x"},
+               agent="claude_code")["result"]
+    assert out["isError"] is True and "not job" in out["content"][0]["text"]
+    assert lw.jstore.get(job.id).state == "verified"
+    out = call(lw.ddir, "dispatch_land", {"job": job.id, "onto": "main", "capability": cap}, agent="claude_code")[
+        "result"]
+    assert out["isError"] is False and out["structuredContent"]["result"]["outcome"] == "adopted", out
+    assert lw.main() == staged
+
+
+def test_dispatch_land_resolves_through_the_servers_launch_data_root(lw, monkeypatch):
+    # F11-s2b §9(1): the one dispatch_file uses, never a tool argument (the schema has none)
+    from levain.dispatch.adopt import Landing
+
+    job, cap = lw.verified()
+    seen: dict = {}
+
+    def fake(store, job_id, **kw):
+        seen.update(kw)
+        failed = lw.jstore._transition(job_id, "failed", "lease_lapsed")
+        return Landing(outcome="failed", job=failed, message="m")
+
+    monkeypatch.setattr(mcp, "land_job", fake)
+    out = mcp.handle("claude_code", {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                     "params": {"name": "dispatch_land",
+                                                "arguments": {"job": job.id, "onto": "main", "capability": cap}}},
+                     directory=lw.ddir, data_root=lw.root)["result"]
+    assert seen == {"onto": "main", "data_root": lw.root}
+    # L3 r1 F: the job's own cause, never "its branch moved off the base"
+    assert out["isError"] is True and out["content"][0]["text"] == "Failed (lease_lapsed): m"
+
+
+def test_dispatch_land_refused_by_the_floor_is_the_tools_error(lw):
+    job, cap = lw.verified()
+    out = call(lw.ddir, "dispatch_land", {"job": job.id, "onto": "work", "capability": cap}, agent="claude_code")[
+        "result"]
+    assert out["isError"] is True and out["content"][0]["text"].startswith("Not landed, refused: criterion onto")
+
+
+def test_dispatch_land_onto_a_checked_out_branch_returns_the_operators_merge(lw, tmp_path):
+    from tests.test_dispatch_adopt import git
+
+    job, cap = lw.verified()
+    git(lw.repo, "worktree", "add", "-q", str(tmp_path / "wt"), "main")
+    out = call(lw.ddir, "dispatch_land", {"job": job.id, "onto": "main", "capability": cap}, agent="claude_code")[
+        "result"]
+    data = out["structuredContent"]["result"]
+    assert out["isError"] is False and data["outcome"] == "merge" and data["command"].startswith("git -C ")
+    assert "OPERATOR runs that merge" in out["content"][0]["text"]
+    assert lw.jstore.get(job.id).state == "authorised"
+
+
+def test_dispatch_recommend_carries_the_proposal_and_an_integer_is_never_a_boolean(lw):
+    job, cap = lw.verified()
+    out = call(lw.ddir, "dispatch_recommend", {"job": job.id, "capability": cap, "onto": "main", "run": True},
+               agent="claude_code")
+    assert out["error"]["code"] == mcp.INVALID_PARAMS and "run must be an integer" in out["error"]["message"]
+    out = call(lw.ddir, "dispatch_recommend", {"job": job.id, "capability": cap, "onto": "levain/x"},
+               agent="claude_code")["result"]
+    assert out["isError"] is True and "under levain/" in out["content"][0]["text"]
+    out = call(lw.ddir, "dispatch_recommend", {"job": job.id, "capability": cap, "onto": "main", "run": 1},
+               agent="claude_code")["result"]
+    assert out["isError"] is False and out["structuredContent"]["result"]["onto"] == "main"
+    assert json.loads(lw.jstore.get(job.id).history[-1].evidence) == {"onto": "main", "run": 1}
 

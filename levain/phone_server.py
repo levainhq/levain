@@ -17,8 +17,9 @@ it serves only these:
   - ``POST /sign/<id>/challenge``, ``.../answer`` and ``.../deny``: a statement a caller filed for the operator's
     passkey to sign, in a namespace the command was started with (``--sign-namespace``), listed in ``consent.json``
     as ``sign_pending``, with ``sign_overflow`` the request files past the listing's cap (:mod:`levain.consent.sign`).
-  - ``POST /dispatch/<job>/challenge``, ``.../answer``, ``.../cancel-challenge`` and ``.../cancel``: a filed dispatch
-    job's contract signed, or a live one cancelled, with a passkey, verified by the job store against the same one
+  - ``POST /dispatch/<job>/challenge``, ``.../answer``, ``.../cancel-challenge``, ``.../cancel``,
+    ``.../authorise-challenge`` and ``.../authorise``: a filed dispatch job's contract signed, a live one
+    cancelled, or a recommended one's run authorised and landed, with a passkey, verified by the job store against the same one
     cockpit as the sign requests; ``consent.json`` lists the live jobs as ``dispatch_pending``, with ``dispatch_note``
     (why the store could not be read) and ``dispatch_overflow`` (:mod:`levain.dispatch.phone`).
   - ``GET /consent.json`` also lists ``questions`` (the open ones an agent filed, :mod:`levain.consent.questions`) and
@@ -27,7 +28,8 @@ it serves only these:
     on its own thread (:func:`levain.consent.band.deliver_answer`), as a ruling is.
 
 A proxy the operator runs (``tailscale serve``) puts it on an https name. Every data route needs this server's own
-token (``X-Levain-Phone-Token``), printed once in the phone link's fragment; it is not the cockpit's write token and
+token (``X-Levain-Phone-Token``), printed in the phone link's fragment (new each run, unless ``--token-file`` keeps
+it; delete that file to make a new one); it is not the cockpit's write token and
 opens nothing on the cockpit. The https name is configured, never read from a request: it is the WebAuthn rpId, and a
 passkey enrolled on it signs that name's hash, which ssh-keygen checks against the key's application.
 
@@ -41,11 +43,13 @@ import base64
 import hashlib
 import hmac
 import ipaddress
+import os
 import json
 import re
 import secrets
 import shlex
 import sqlite3
+import stat
 import sys
 import threading
 from datetime import datetime, timezone
@@ -74,7 +78,8 @@ _QUESTION_ROUTE = re.compile(r"/question/([0-9]{1,12})/(answer|rule)")
 _KEY_LINE = "/passkey/key-line"
 _SIGN_PREFIX = "/sign/"
 _SIGN_ACTIONS = ("challenge", "answer", "deny")
-_DISPATCH_ROUTE = re.compile(r"/dispatch/(dj-[0-9a-f]{32})/(challenge|answer|cancel-challenge|cancel)")
+_DISPATCH_ROUTE = re.compile(
+    r"/dispatch/(dj-[0-9a-f]{32})/(challenge|answer|cancel-challenge|cancel|authorise-challenge|authorise)")
 _MAX_BODY = 16 * 1024          # an assertion is well under 2 KB, an answer record under 1 KB
 _MAX_INFLIGHT = 4              # each answer replays the authority log; past this a caller gets 503, never a queue
 # how long a ruling's response waits for its delivery, which runs on its own thread holding no request slot (a
@@ -321,7 +326,7 @@ class _PhoneHandler(GuardedHandler):
         # throw that ceremony away; everything else answers busy at once
         waits = ((consent is not None and consent[1] in ("answer", "rule")) or (sign is not None and sign[1] == "answer")
                  or (question is not None and question.group(2) == "rule")
-                 or (dispatch is not None and dispatch.group(2) in ("answer", "cancel")))
+                 or (dispatch is not None and dispatch.group(2) in ("answer", "cancel", "authorise")))
         if not (self.server.request_gate.acquire(timeout=5) if waits else self.server.request_gate.acquire(blocking=False)):
             self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503)
             return
@@ -912,11 +917,11 @@ def make_phone_server(queue_dir: Path, rp_id: str, *, host: str = "127.0.0.1", p
                       token: str | None = None, sign_namespaces: "tuple[str, ...]" = (),
                       dispatch_dir: Path | None = None) -> _PhoneServer:
     """A bound (not yet serving) phone port over the consent queue at ``queue_dir``, answering for the https name
-    ``rp_id``, and over the dispatch store in ``dispatch_dir`` (default: where ``levain dispatch`` keeps it,
-    :func:`levain.dispatch.jobs.default_dispatch_dir`). Loopback only: the proxy in front of it is what reaches the
-    phone."""
+    ``rp_id``, and over the dispatch store in ``dispatch_dir`` (default: ``queue_dir`` itself, since the dispatch
+    directory IS the consent directory, :func:`levain.dispatch.jobs.default_dispatch_dir`; so the keys an authorise
+    card offers and the keys its land verifies come from one directory's consent settings). Loopback only: the proxy
+    in front of it is what reaches the phone."""
     from levain.consent.passkey import is_host_name
-    from levain.dispatch.jobs import default_dispatch_dir
 
     if host != "localhost" and not _is_loopback_address(host):
         raise ValueError(f"the phone port binds loopback only (a proxy you run puts it on https), not {host!r}")
@@ -926,7 +931,7 @@ def make_phone_server(queue_dir: Path, rp_id: str, *, host: str = "127.0.0.1", p
                          "machine's own browser")
     return _PhoneServer((host, port), queue_dir=Path(queue_dir), rp_id=rp_id, token=token or secrets.token_urlsafe(32),
                         sign_namespaces=tuple(sign_namespaces),
-                        dispatch_dir=Path(dispatch_dir) if dispatch_dir is not None else default_dispatch_dir())
+                        dispatch_dir=Path(dispatch_dir) if dispatch_dir is not None else Path(queue_dir))
 
 
 def _is_loopback_address(host: str) -> bool:
@@ -971,8 +976,33 @@ def tailscale_name(timeout: float = 5.0) -> "tuple[str | None, str]":
     return None, why
 
 
+def _kept_token(path: Path) -> str:
+    """``--token-file``: the token kept in ``path`` (a regular file, never through a symlink), else a new one written
+    there (0600, whole, never over a file that appeared meanwhile). :class:`ValueError` for a file holding no
+    usable token."""
+    from levain.consent.sign import _read_bytes, _write_new
+
+    try:
+        st = os.lstat(path)
+        if stat.S_ISREG(st.st_mode) and st.st_mode & 0o077:
+            raise ValueError(f"--token-file: {path} is readable by others (mode {st.st_mode & 0o777:o}): chmod 600 it")
+        token = _read_bytes(path).decode("utf-8").strip()
+    except FileNotFoundError:
+        token = secrets.token_urlsafe(32)
+        _write_new(path, token + "\n")
+        return token
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"--token-file: cannot read {path}: {exc}") from None
+    if re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token) is None:
+        raise ValueError(f"--token-file: {path} holds no token (32-128 of [A-Za-z0-9_-])")
+    return token
+
+
 def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port: int,
-                     sign_namespaces: "tuple[str, ...]" = ()) -> int:
+                     sign_namespaces: "tuple[str, ...]" = (), link_file: Path | None = None,
+                     token_file: Path | None = None) -> int:
     """``levain consent phone``: serve the phone port until interrupted."""
     if name is None:
         if not tailscale:
@@ -982,8 +1012,12 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
         if name is None:
             print(f"--tailscale: {why}", file=sys.stderr)
             return 2
+    if link_file is not None and token_file is not None and link_file.resolve() == token_file.resolve():
+        print("--link-file and --token-file are one file: the link would overwrite the kept token", file=sys.stderr)
+        return 2
     try:
-        httpd = make_phone_server(queue_dir, name, port=port, sign_namespaces=sign_namespaces)
+        token = _kept_token(token_file) if token_file is not None else None
+        httpd = make_phone_server(queue_dir, name, port=port, token=token, sign_namespaces=sign_namespaces)
     except (ValueError, OSError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -996,11 +1030,46 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
 
         print(f"  signs requests in {sign_dir(queue_dir)} in namespace(s) {', '.join(sign_namespaces)}", flush=True)
     page = f"http://localhost:{bound}/" if name == "localhost" else f"https://{name}/"
-    print(f"  open on the phone (a secret; it dies when this stops): {page}#phone_token={httpd.phone_token}", flush=True)
+    lives = (f"it is kept in {token_file} across restarts: delete that file to make a new one" if token_file is not None
+             else "it dies when this stops")
+    print(f"  open on the phone (a secret; {lives}): {page}#phone_token={httpd.phone_token}", flush=True)
+    import signal
+
+    def _stop(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt        # a service stop (TERM) unwinds like Ctrl+C, so the link file goes
+
+    # TERM only, and only on the main thread (the only one signal handlers run on); HUP is left as inherited, so a
+    # server started under nohup keeps running when its terminal closes. Installed before the link file is written.
+    before = (signal.signal(signal.SIGTERM, _stop)
+              if link_file is not None and threading.current_thread() is threading.main_thread() else None)
     try:
+        if link_file is not None:
+            # for a caller that links straight onto one sign request's card (levain.consent.sign.deep_link)
+            from levain.consent.sign import _write_over
+
+            try:
+                _write_over(link_file, json.dumps({"page": page, "phone_token": httpd.phone_token,
+                                                   "pid": os.getpid()}) + "\n")
+            except OSError as exc:
+                print(f"--link-file: cannot write {link_file}: {exc.strerror or exc}", file=sys.stderr)
+                return 1
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         httpd.server_close()
+        if link_file is not None:
+            _drop_link_file(link_file)
+        if before is not None:
+            signal.signal(signal.SIGTERM, before)
     return 0
+
+
+def _drop_link_file(path: Path) -> None:
+    """``--link-file`` removed when this run stops, so no caller builds a link to a server that is gone; left alone
+    when it names another run (a later server wrote it). A kill -9 or a crash leaves it: a caller checks its pid."""
+    try:
+        if json.loads(path.read_text(encoding="utf-8")).get("pid") == os.getpid():
+            path.unlink()
+    except (OSError, ValueError, AttributeError):
+        pass

@@ -55,7 +55,8 @@ from levain.dispatch.jobs import JobStore
 
 __all__ = [
     "ACTORS", "KINDS", "REPLY_KINDS", "SCHEMA", "SOURCE_HOW", "STATES", "SURFACES", "CoordError", "CoordStore",
-    "Drop", "DropConflict", "Part", "Reply", "Source", "Thread", "check_source", "members_sha256",
+    "Drop", "DropConflict", "Part", "Reply", "Source", "Thread", "check_source", "check_words", "members_sha256",
+    "words_sha256",
 ]
 
 SURFACES = ("cli", "phone", "cockpit")
@@ -114,6 +115,11 @@ def _in(column: str, values: Sequence[str]) -> str:
 
 
 SCHEMA: tuple[str, ...] = (
+    # one store-wide order for every authority and event row: never wall-clock (C0 §3.4)
+    "CREATE TABLE IF NOT EXISTS gseq (gseq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL)",
+    *_append_only("gseq", "the sequence"),
+    "CREATE TRIGGER IF NOT EXISTS gseq_no_replace BEFORE INSERT ON gseq WHEN EXISTS (SELECT 1 FROM gseq WHERE "
+    "gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'the sequence is never replaced'); END",
     # a drop: your words verbatim; envelope_id arrives only with a structured envelope signed at send (C2), and
     # prior_envelope_id is written only by the S1 copy, as history
     "CREATE TABLE IF NOT EXISTS drops (drop_id TEXT PRIMARY KEY, "
@@ -161,13 +167,22 @@ SCHEMA: tuple[str, ...] = (
 )
 
 
+def next_gseq(conn: sqlite3.Connection, now: str) -> int:
+    """The next number of the store-wide sequence, taken inside the caller's writing transaction."""
+    return conn.execute("INSERT INTO gseq (at) VALUES (?)", (now,)).lastrowid
+
+
 def members_sha256(members: Iterable[str]) -> str:
     """``sha256:<hex>`` over the canonical JSON of the sorted drop ids: what a revision's signature will bind."""
     return "sha256:" + hashlib.sha256(canonical_bytes(sorted(members))).hexdigest()
 
 
-def _words_sha256(words: str) -> str:
+def words_sha256(words: str) -> str:
+    """``sha256:<hex>`` of a drop's exact words, as stored and as an envelope body names them."""
     return "sha256:" + hashlib.sha256(words.encode("utf-8")).hexdigest()
+
+
+_words_sha256 = words_sha256
 
 
 @dataclass(frozen=True)
@@ -249,6 +264,11 @@ def _one_line(name: str, value: Any, high: int) -> str:
     return value
 
 
+def check_words(words: Any) -> str:
+    """The words, if a drop can hold them; raises CoordError saying why not (checked before anything is signed)."""
+    return _check_words(words)
+
+
 def _check_words(words: Any) -> str:
     if not isinstance(words, str) or not words.strip():
         raise CoordError("a drop needs words")
@@ -291,6 +311,9 @@ class CoordStore:
     """The coordinator's tables in ``<directory>/dispatch.db`` (the consent directory by default). Every write is one
     ``BEGIN IMMEDIATE``; the clock is read only once the write lock is held."""
 
+    # a subclass that adds tables (the envelope store, C2) extends this; every statement is IF NOT EXISTS
+    _SCHEMA: tuple[str, ...] = SCHEMA
+
     def __init__(self, directory: Path | str | None = None, *,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
         # the file, its format marker, its store_id and its directory rule are the dispatch store's: one owner
@@ -299,15 +322,20 @@ class CoordStore:
         self.path = self._jobs.path
         self._clock = clock
         self._ready = False
+        # drop id -> the coordinator launch its own transaction asked for (read by woken_launch, this process only)
+        self._woken: dict[str, str] = {}
 
     # --- store ---------------------------------------------------------------------------------------------------
     def _connect(self) -> sqlite3.Connection:
         conn = self._jobs._connect()
         if not self._ready:
+            from levain.coordinator.lease import LEASE_SCHEMA
+
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
-                    for stmt in SCHEMA:
+                    # the lease is checked by every opener's coordinator writes, so its tables are every opener's
+                    for stmt in (*self._SCHEMA, *LEASE_SCHEMA):
                         conn.execute(stmt)
                     conn.execute("COMMIT")
                 except BaseException:
@@ -320,9 +348,19 @@ class CoordStore:
         return conn
 
     @contextmanager
-    def _write(self) -> Iterator[tuple[sqlite3.Connection, str]]:
+    def _write(self, by: str | None = None, token: object = None) -> Iterator[tuple[sqlite3.Connection, str]]:
+        """One write transaction. A write ``by`` the coordinator is fenced here, inside it: refused unless ``token``
+        is the live lease's (C0 §6). Your writes and the service's carry no token."""
+        if by != "coordinator" and token is not None:
+            raise CoordError("a lease token is the coordinator's; your own writes carry none")
         with write_transaction(self._connect) as conn:
-            yield conn, self._stamp()
+            now = self._stamp()
+            if by == "coordinator":
+                from levain.coordinator.lease import fence, record_write
+
+                # the write and its record commit together: a write that rolls back leaves no "it wrote" behind
+                record_write(conn, now, fence(conn, now, token))
+            yield conn, now
 
     def _stamp(self) -> str:
         now = self._clock()
@@ -332,7 +370,7 @@ class CoordStore:
 
     # --- drops ---------------------------------------------------------------------------------------------------
     def accept_drop(self, words: str, *, surface: str, outbox_id: str | None = None, sent_at: str | None = None,
-                    source: Source = Source()) -> tuple[Drop, bool]:
+                    source: Source = Source(), _carry: Callable[..., Drop] | None = None) -> tuple[Drop, bool]:
         """Store a drop and its ``delivered`` drop receipt in one transaction; ``(drop, True)``. A resend of a stored
         ``outbox_id`` with the same words from the same surface writes nothing: ``(stored drop, False)``."""
         words = _check_words(words)
@@ -361,26 +399,60 @@ class CoordStore:
                     raise CoordError(f"sent_at: {exc}") from None
                 if sent > parse_stamp(now) + _SENT_SKEW:
                     raise CoordError(f"sent_at {sent_at} is ahead of the store's clock ({now})")
+            if _carry is not None:
+                # a drop carrying an envelope (C2): the carrier inserts it, after its own checks, in this transaction
+                return _carry(conn, now, words=words, sha=sha, surface=surface, outbox_id=outbox_id, sent_at=sent_at,
+                              source=source), True
+            return self._insert_drop(conn, now, words=words, sha=sha, surface=surface, outbox_id=outbox_id,
+                                     sent_at=sent_at, source=source), True
+
+    def _insert_drop(self, conn: sqlite3.Connection, now: str, *, words: str, sha: str, surface: str,
+                     outbox_id: str, sent_at: str, source: Source, drop_id: str | None = None,
+                     envelope_id: str | None = None, receipt: dict[str, Any] | None = None) -> Drop:
+        """Insert a checked drop and its ``delivered`` drop receipt inside the caller's write transaction.
+        ``drop_id`` and ``envelope_id`` are given only by a drop that carries a structured envelope (C2), whose body
+        names the drop id it was signed for; ``envelope_id`` is written in the insert, never set later."""
+        if drop_id is None:
             drop_id = "dr-" + secrets.token_hex(16)
-            conn.execute(
-                "INSERT INTO drops (drop_id, surface, outbox_id, words, words_sha256, sent_at, received_at, "
-                "source_repo, source_ref, source_head, source_how, envelope_id, prior_envelope_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
-                (drop_id, surface, outbox_id, words, sha, sent_at, now, source.repo, source.ref, source.head,
-                 source.how))
-            self._reply(conn, None, "drop_receipt", "drops", drop_id,
-                        {"stage": "delivered", "drop_id": drop_id, "outbox_id": outbox_id}, now)
-            return self._drop(conn, drop_id), True
+        elif not isinstance(drop_id, str) or _DROP_ID.fullmatch(drop_id) is None:
+            raise CoordError("a drop id is dr- and 32 hex")
+        elif conn.execute("SELECT 1 FROM drops WHERE drop_id = ?", (drop_id,)).fetchone() is not None:
+            raise DropConflict(f"drop {drop_id} is already stored; nothing was written")
+        if envelope_id is not None and (not isinstance(envelope_id, str)
+                                        or re.fullmatch(r"ev-[0-9a-f]{32}", envelope_id) is None):
+            raise CoordError("an envelope id is ev- and 32 hex")
+        conn.execute(
+            "INSERT INTO drops (drop_id, surface, outbox_id, words, words_sha256, sent_at, received_at, "
+            "source_repo, source_ref, source_head, source_how, envelope_id, prior_envelope_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            (drop_id, surface, outbox_id, words, sha, sent_at, now, source.repo, source.ref, source.head,
+             source.how, envelope_id))
+        self._reply(conn, None, "drop_receipt", "drops", drop_id,
+                    {"stage": "delivered", "drop_id": drop_id, "outbox_id": outbox_id, **(receipt or {})}, now)
+        from levain.coordinator.lease import wake
+
+        # a drop with no coordinator asks for one, in its own transaction (C0 §6). A wake that fails rolls back to
+        # here and the drop is kept: your words are never lost to the coordinator's bookkeeping
+        conn.execute("SAVEPOINT coord_wake")
+        woke = None
+        try:
+            woke = wake(conn, now)
+        except Exception:  # noqa: BLE001 - any wake failure, never the drop: the words are kept
+            conn.execute("ROLLBACK TO coord_wake")
+        conn.execute("RELEASE coord_wake")
+        if woke is not None:
+            self._woken[drop_id] = woke.launch_id
+        return self._drop(conn, drop_id)
 
     # --- threads -------------------------------------------------------------------------------------------------
-    def split(self, drop_id: str, parts: Sequence[Part], *, by: str = "coordinator") -> list[Thread]:
+    def split(self, drop_id: str, parts: Sequence[Part], *, by: str = "operator", token: object = None) -> list[Thread]:
         """The drop's first split (T1): each part a new thread holding it, or the drop attached to an existing open
         thread. One transaction; writes the drop's ``split`` drop receipt. A drop already split is regrouped with
         :meth:`add`, :meth:`merge` or :meth:`detach` instead."""
         by = self._actor(by, ("coordinator", "operator"))
         if not parts:
             raise CoordError("a split names at least one thread")
-        with self._write() as (conn, now):
+        with self._write(by, token) as (conn, now):
             self._must_drop(conn, drop_id)
             if self._receipts(conn, drop_id, "split"):
                 raise CoordError(f"drop {drop_id} is already split; regroup it with add, merge or detach")
@@ -407,14 +479,15 @@ class CoordStore:
             if len(set(touched)) != len(touched):
                 raise CoordError("a split names the same thread twice")
             self._drop_receipt(conn, drop_id, "split", now)
+            self._split_done(conn, drop_id, touched, now)
             return [self._thread(conn, t) for t in touched]
 
-    def add(self, drop_id: str, part: Part, *, by: str = "operator") -> Thread:
+    def add(self, drop_id: str, part: Part, *, by: str = "operator", token: object = None) -> Thread:
         """Put an already-split drop into one more thread (a new one, or an existing open one): the receipt's one-tap
         fix for a split that missed an intent, and how a later drop joins work in flight. Writes a ``resplit``
         drop receipt."""
         by = self._actor(by, ("coordinator", "operator"))
-        with self._write() as (conn, now):
+        with self._write(by, token) as (conn, now):
             self._must_drop(conn, drop_id)
             if not self._receipts(conn, drop_id, "split"):
                 raise CoordError(f"drop {drop_id} has not been split yet; split it first")
@@ -424,7 +497,7 @@ class CoordStore:
             self._drop_receipt(conn, drop_id, "resplit", now)
             return self._thread(conn, thread_id)
 
-    def merge(self, into: str, other: str, *, by: str = "operator") -> Thread:
+    def merge(self, into: str, other: str, *, by: str = "operator", token: object = None) -> Thread:
         """Fold ``other`` into ``into`` (the receipt's one-tap fix for a split that cut one intent in two): ``into``
         gets the union of both memberships as a new revision, ``other`` a new, empty revision and is closed by the
         service, its cause naming ``into`` and who merged. Neither may be done or closed; they must share a kind and an
@@ -432,7 +505,7 @@ class CoordStore:
         by = self._actor(by, ("coordinator", "operator"))
         if into == other:
             raise CoordError("a thread cannot merge into itself")
-        with self._write() as (conn, now):
+        with self._write(by, token) as (conn, now):
             a, b = self._must_thread(conn, into), self._must_thread(conn, other)
             for t in (a, b):
                 if t.state in ("done", "closed"):
@@ -457,12 +530,12 @@ class CoordStore:
                 self._drop_receipt(conn, d, "resplit", now)
             return self._thread(conn, into)
 
-    def detach(self, thread_id: str, drop_id: str, *, by: str = "operator") -> Thread:
+    def detach(self, thread_id: str, drop_id: str, *, by: str = "operator", token: object = None) -> Thread:
         """Take one drop out of a thread (a new revision without it). A thread left with no drops is closed by the
         service, its cause naming who emptied it. The drop must stay in at least one other open or working thread: a
         drop is never left only in finished ones."""
         by = self._actor(by, ("coordinator", "operator"))
-        with self._write() as (conn, now):
+        with self._write(by, token) as (conn, now):
             self._must_drop(conn, drop_id)
             t = self._must_thread(conn, thread_id)
             if t.state in ("done", "closed"):
@@ -479,7 +552,7 @@ class CoordStore:
             self._drop_receipt(conn, drop_id, "resplit", now)
             return self._thread(conn, thread_id)
 
-    def set_state(self, thread_id: str, state: str, *, by: str, cause: str = "") -> Thread:
+    def set_state(self, thread_id: str, state: str, *, by: str, cause: str = "", token: object = None) -> Thread:
         """One T7 step, if :data:`_EDGES` lets ``by`` take it from the state read in this transaction. A thread that
         is not work closes itself (by the service) once done; a thread that holds no drops cannot be reopened."""
         if state not in STATES:
@@ -488,7 +561,7 @@ class CoordStore:
         # closing itself) are taken only inside the store's own operations
         by = self._actor(by, ("operator", "coordinator"))
         cause = self._cause(cause)
-        with self._write() as (conn, now):
+        with self._write(by, token) as (conn, now):
             t = self._must_thread(conn, thread_id)
             allowed = _EDGES.get((t.state, state))
             if allowed is None:
@@ -504,11 +577,14 @@ class CoordStore:
                 self._close(conn, thread_id, cause or state, by, now)
             else:
                 self._event(conn, thread_id, "state", state, cause or state, by, now)
+                if state == "done":
+                    self._ended(conn, thread_id, now)
             if state == "done" and t.kind != "work":
                 self._close(conn, thread_id, f"{t.kind} closes itself once done", "service", now)
             return self._thread(conn, thread_id)
 
-    def set_field(self, thread_id: str, field: str, value: str, *, by: str = "coordinator", cause: str = "") -> Thread:
+    def set_field(self, thread_id: str, field: str, value: str, *, by: str = "operator", cause: str = "",
+                  token: object = None) -> Thread:
         """Re-kind, re-title or re-scope (repo) a thread, recorded as an event; a done or closed thread is reopened first.
         A re-kind never crosses the work boundary (work stays work; ask, note and relay move among themselves): an
         intent that was misread is a new split, never a relabel. A kind or repo change also writes a new revision
@@ -517,7 +593,7 @@ class CoordStore:
             raise CoordError("set_field changes kind, title or repo")
         by = self._actor(by, ("coordinator", "operator"))
         cause = self._cause(cause)
-        with self._write() as (conn, now):
+        with self._write(by, token) as (conn, now):
             t = self._must_thread(conn, thread_id)
             if t.state in ("done", "closed"):
                 raise CoordError(f"thread {thread_id} is {t.state}; reopen it first")
@@ -537,10 +613,170 @@ class CoordStore:
                 self._revise(conn, thread_id, t.members, "rescope", now)
             return self._thread(conn, thread_id)
 
+    # --- the lease and launches (C3a; levain.coordinator.lease holds the rules) -----------------------------------
+    def coord_status(self) -> dict[str, Any]:
+        """Who holds the coordinator lease, what the next drop would do, and the latest launches. Writes the lapse
+        of a lease past its until, so what it shows is what the store holds."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            lease._lapse_if_past(conn, now)
+            lease._expire_pending(conn, now)
+            return lease.status(conn, now)
+
+    def coord_take(self, hold: timedelta | None = None) -> int:
+        """You take the coordinator role: every pending launch is voided and you hold the lease. Your token."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.take(conn, now, hold=lease.LEASE_TTL if hold is None else hold)
+
+    def coord_release(self, token: int | None = None, *, by: str = "operator") -> Any:
+        """End the lease: you end whatever is held; the holder ends its own with its token."""
+        from levain.coordinator import lease
+
+        by = self._actor(by, ("operator", "coordinator"))
+        with self._write() as (conn, now):
+            return lease.release(conn, now, token, by=by)
+
+    def coord_beat(self, token: int, *, by: str = "coordinator") -> Any:
+        from levain.coordinator import lease
+
+        by = self._actor(by, ("coordinator", "service"))
+        with self._write() as (conn, now):
+            return lease.beat(conn, now, token, by=by)
+
+    def coord_service_beat(self, token: int) -> Any:
+        """The watcher's beat (:func:`levain.coordinator.lease.service_beat`): None when the holder has not written
+        as coordinator recently enough to earn one."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.service_beat(conn, now, token)
+
+    def coord_claim(self, launch_id: str, session_key: str) -> int:
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.claim(conn, now, launch_id, session_key)
+
+    def coord_wake(self) -> Any:
+        """A wake with no drop (a retry after a backoff): the same rules a drop's transaction runs."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.wake(conn, now)
+
+    def coord_set_agent(self, agent: str, *, model: str | None = None, cwd: str | None = None) -> Any:
+        """Your coordinator setting: the agent a wake launches, its model, the (resolved) directory it runs in."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.set_agent(conn, now, agent, model=model, cwd=cwd)
+
+    def coord_setting(self) -> Any:
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.setting(conn)
+
+    def pending_coordinator(self) -> Any:
+        """The newest coordinator launch still pending (whatever its until), or None."""
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            pending = lease._in_state(conn, "pending", "coordinator")
+            return pending[-1] if pending else None
+
+    def woken_launch(self, drop_id: str) -> str | None:
+        """The coordinator launch ``drop_id``'s own transaction asked for, when this store object accepted it. Read
+        once: the entry is popped, so a long-lived store holds none it no longer needs (L3 r1 G8)."""
+        return self._woken.pop(drop_id, None)
+
+    def launch_claim_spawn(self, launch_id: str, pid: int) -> Any:
+        """The one-spawner compare-and-set (:func:`levain.coordinator.lease.claim_spawn`), one transaction."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.claim_spawn(conn, now, launch_id, pid)
+
+    def launch_request(self, token: int, *, harness: str, role: str = "worker", threads: Sequence[str] = (),
+                       model: str | None = None, cwd: str | None = None) -> Any:
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.request_launch(conn, now, token, harness=harness, role=role, threads=threads, model=model,
+                                        cwd=cwd)
+
+    def launch_activate(self, launch_id: str, *, harness_session_id: str, argv_sha256: str | None = None) -> Any:
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.activate(conn, now, launch_id, harness_session_id=harness_session_id,
+                                  argv_sha256=argv_sha256)
+
+    def launch_end(self, launch_id: str, kind: str, cause: str) -> Any:
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.end_launch(conn, now, launch_id, kind, cause)
+
+    def launch(self, launch_id: str) -> Any:
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.launch(conn, launch_id)
+
+    # --- what the watcher reads and writes (levain coord watch) --------------------------------------------------
+    def launches_unspawned(self) -> list[Any]:
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.unspawned(conn)
+
+    def launches_active(self) -> list[Any]:
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease._in_state(conn, "active")
+
+    def launch_dirs(self) -> list[str]:
+        """Every directory a launch of this store was asked to run in (where its briefs sit)."""
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.launch_dirs(conn)
+
+    def launch_by_harness_session(self, harness_session_id: str) -> Any:
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.by_harness_session(conn, harness_session_id)
+
+    def launch_end_unlisted(self, launch_id: str) -> Any:
+        """``launch_id``'s session is gone from its harness's list (:func:`levain.coordinator.lease.end_unlisted`)."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.end_unlisted(conn, now, launch_id)
+
+    def coord_lease(self) -> Any:
+        """The lease as it stands (live or past its until), or None; nothing written."""
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.lease(conn, self._stamp())
+
     # --- reading -------------------------------------------------------------------------------------------------
     def drop(self, drop_id: str) -> Drop:
         with read_transaction(self._connect) as conn:
             return self._must_drop(conn, drop_id)
+
+    def drop_by_outbox(self, outbox_id: str) -> Drop | None:
+        """The drop stored under ``outbox_id``, or None."""
+        with read_transaction(self._connect) as conn:
+            row = conn.execute("SELECT drop_id FROM drops WHERE outbox_id = ?", (outbox_id,)).fetchone()
+            return None if row is None else self._drop(conn, row[0])
 
     def drops(self, limit: int = 50) -> list[Drop]:
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
@@ -714,9 +950,22 @@ class CoordStore:
         has nothing left to concern (``about`` never changes, and a closed thread is reopened only by you). Every close
         goes through here, so no path leaves an open thread pointing at a closed one."""
         self._event(conn, thread_id, "state", "closed", cause, by, now)
+        self._ended(conn, thread_id, now)
         for dependent in self._dependents(conn, thread_id):
             if self._thread(conn, dependent).state != "closed":
                 self._close(conn, dependent, f"the thread it is about ({thread_id}) closed", "service", now)
+
+    def _ended(self, conn: sqlite3.Connection, thread_id: str, now: str) -> None:
+        # T7, done kills its envelope: on every path that ends a thread, whichever class opened the file
+        from levain.coordinator.envelopes import EnvelopeStore
+
+        EnvelopeStore.end_thread(conn, thread_id, now)
+
+    def _split_done(self, conn: sqlite3.Connection, drop_id: str, thread_ids: list[str], now: str) -> None:
+        # a structured envelope the drop carried binds at its first split, whichever class opened the file
+        from levain.coordinator.envelopes import EnvelopeStore
+
+        EnvelopeStore.bind_on_split(conn, drop_id, thread_ids, now)
 
     @staticmethod
     def _dependents(conn: sqlite3.Connection, thread_id: str) -> list[str]:

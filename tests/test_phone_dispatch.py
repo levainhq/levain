@@ -102,13 +102,15 @@ def test_every_dispatch_route_is_503_unless_one_cockpit_is_named(world, tmp_path
         assert row["signers"] == [] and "names no cockpit" in row["signer_note"]
 
 
-def test_the_dispatch_dir_defaults_to_the_dispatch_stores_own_default(tmp_path: Path, monkeypatch) -> None:
-    from levain.dispatch.jobs import default_dispatch_dir
-
+def test_the_dispatch_dir_defaults_to_the_queue_dir(tmp_path: Path, monkeypatch) -> None:
+    # L3 r1 C: the dispatch directory IS the consent directory, so the keys a card offers and the keys its land
+    # verifies come from one directory's consent settings (`levain consent phone --queue-dir X` included)
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "home"))
-    srv = make_phone_server(tmp_path, "localhost", port=0)
+    qdir = tmp_path / "queue"
+    qdir.mkdir()
+    srv = make_phone_server(qdir, "localhost", port=0)
     try:
-        assert srv.dispatch_dir == default_dispatch_dir() == (tmp_path / "home" / "consent").resolve()
+        assert srv.dispatch_dir == qdir
     finally:
         srv.server_close()
 
@@ -186,3 +188,18 @@ def test_a_faulting_keys_source_keeps_the_consent_cards_and_lists_the_jobs_unsig
     assert row["id"] == job.id and row["signers"] == [] and "keys db" in row["signer_note"]
     assert row["can_sign"] is False and row["can_cancel"] is True          # no signer: nothing offers to sign
     assert body["dispatch_overflow"] == 0
+
+
+def test_the_authorise_routes_are_served_behind_the_same_gates(world) -> None:
+    # F11-s2b §5: authorise-challenge and authorise reach DispatchPhone.step; a filed job has no card to authorise
+    job = file_job(world)
+    key = world["phone"]
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        assert _call(base + f"/dispatch/{job.id}/authorise-challenge", {"signer_fp": key.fp}, token=None)[0] == 403
+        status, body = _call(base + f"/dispatch/{job.id}/authorise-challenge", {"signer_fp": key.fp})
+        assert (status, body["error"]) == (409, "conflict") and "from the laptop" in body["message"]
+        status, body = _call(base + f"/dispatch/{job.id}/authorise", {"payload": {}})
+        assert (status, body["error"]) == (400, "bad_request")
+        (row,) = _call(base + "/consent.json")[1]["dispatch_pending"]
+        assert row["authorise"] is None
+    assert JobStore(world["qdir"]).get(job.id).state == "filed"

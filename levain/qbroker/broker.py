@@ -6,20 +6,47 @@ so its id is the sealed id; the row takes ``session``, ``slot``, ``kind`` and ``
 Filing the same sealed request again returns the row already there (before the clock and hold checks, which bound
 new rows only); a new row is refused ``queue-busy`` past :data:`PENDING_PER_SESSION` and ``quota-exhausted`` past
 the lifetime quota. ``ANSWER? {cap, request_id}`` reads the answer row for a request this session filed and returns
-``{decision}`` only when :func:`levain.qbroker.seam.answer_refusal` accepts it, else ``{pending}`` while nothing is
+``{decision}`` only when :func:`levain.qbroker.seam.answer_refusal` accepts it (one signed in time, even when read after
+the hold ended), else ``{pending}`` while nothing is
 there and the hold runs; polls past :data:`ANSWER_RATE` per slot are refused ``rate-limited`` (a REQUEST too, for about one token interval
 after polls drain the bucket: the consent hook treats ``rate-limited`` as pending and retries). A verdict is reused
 while the answer file and the signer snapshot are unchanged, and a resolve for :data:`RESOLVE_TTL` seconds, so a
 serial poll storm costs one verify and one CONTROL round trip; concurrent misses on a cold cache may each make
 the trip, bounded by the slot's rate (a REQUEST whose resolve misses the cache is charged to it too). One filing
 per request id runs at a time, so identical REQUESTs on several connections link one row and charge it once.
-No verb accepts an answer, a grant answer or a row from a hook. Every other op is ``verb-not-allowed``. The cap is hashed on arrival and never logged or
-written. Stdlib only.
+No verb accepts an answer, a grant answer or a row from a hook. Every other op is ``verb-not-allowed``.
+
+THE TYPED CONTRACT GRANT (F4, W2-c2; W2C_DESIGN §1, §3, §4, §8). A REQUEST may carry, beside ``request``, a ``grant``
+member ``{paths, input}``. The broker recomputes the request's ``pb1:`` digest from it and refuses
+``grant-digest-mismatch`` (nothing written) when it is not the sealed ``tool_input_digest``. A NEW row whose member
+binds is then decided by :func:`levain.qbroker.grants.decide` (a dispatch session, the operator-signed contract the
+run names, its expiry, the signature against the snapshot's contract signers, the paths under the run's
+``repo_root`` and inside the signed write list with no link on the way): when it holds, the request row is written
+as always and beside it the broker's own ``levain-queue-grant-allow/1`` row, and ``ANSWER?`` returns ``allow`` from
+that row unless the operator's verified answer is there, which is read first and outranks it (his deny wins); such a
+row is not pending (it waits on no one), but it is charged to the quota like any other. Anything the grant cannot
+decide files the request as today, for the operator; a run CONTROL names without ``repo_root`` resolves as before
+and never takes a grant. A replay never re-decides.
+
+UNGATED CALLS (W2-c3, head ruling 1020+49). The slot hook's gate files only agent config; a grantable call it does not
+gate (a Write inside the repository) is sent with its member and ``"ungated": true`` so a dispatch run can grant it.
+Outside a dispatch session such a REQUEST is answered ``{"go": true}`` and NOTHING is written (no row, no quota): GO IS
+NOT ALLOW. It means "the session's own permission mode decides, as before the broker was asked", so a frame Bash forges
+with the flag gains no write authority, only what its shell already has. A frame with no member (a file write the hook
+could not bind to paths: a MultiEdit, a relative path; L3 r1 triage R1) is answered the same way; in a dispatch session
+it is filed pending for the operator, never granted (nothing to bind a grant to). ``ungated`` is ignored (the call is
+filed as any other) when the broker's own reading (:func:`levain.qbroker.grants.agent_config_path`) says a path is
+agent config, or that reading raises (R4): gated wins. GO is decided inside the request id's filing flight and only
+when no row exists for that id (R2): a row already filed, pending or answered, is answered exactly as without the
+flag, so resending a filed request with the flag never steps past it or past the operator's signed deny. In a
+dispatch session the flag changes nothing: granted, or filed pending.
+The cap is hashed on arrival and never logged or written. Stdlib only.
 """
 from __future__ import annotations
 
 import hashlib
 import logging
+import posixpath
 import re
 import threading
 import time
@@ -34,19 +61,23 @@ from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.cockpit.firejournal import _TIER_NEEDS
 from levain.consent.away import MAX_HOLD
 from levain.consent.record import ExternalGateRequest
-from levain.qbroker import wire
-from levain.qbroker.seam import answer_refusal, request_of
+from levain.qbroker import grants, wire
+from levain.qbroker.seam import answer_refusal, grant_allow_refusal, request_of
 from levain.qbroker.signers import SignersSnapshot, SignersSource
 from levain.qbroker.store import ANSWER_ROW_FORMAT, REQUEST_ROW_FORMAT, QueueStore, valid_request_id
 
 __all__ = ["ANSWER_BURST", "ANSWER_RATE", "CAP_MAX", "KINDS", "PENDING_PER_SESSION", "QUOTA_PER_RUN",
-           "RECEIVED_SKEW", "RESOLVE_TTL", "RUN_KEYS", "SLOT_CLASS", "Broker", "Resolved", "Resolver", "resolved_from",
-           "slot_ref"]
+           "RECEIVED_SKEW", "RESOLVE_TTL", "RUN_KEYS", "RUN_OPTIONAL_KEYS", "SLOT_CLASS", "Broker", "Resolved",
+           "Resolver", "resolved_from", "slot_ref"]
 
 log = logging.getLogger("levain.qbroker")
 
 KINDS = ("dispatch", "interactive")
 RUN_KEYS = frozenset({"run_id", "job_id", "run_index", "contract_digest", "model_requested"})
+# CONTRACT §26 S1-c: repo_root = STORE/live/<session>/repo, the run's worktree, DERIVED by CONTROL (never the hook's
+# cwd). Optional on the wire: a run without it resolves and files as before, and only the grant needs it (absent,
+# every call queues)
+RUN_OPTIONAL_KEYS = frozenset({"repo_root"})
 # requests one run (a dispatch run's run_id) or one interactive session may file. A hook files one request per
 # permission prompt it does not settle itself; past this many, the agent is looping on a gate, and every row is a
 # file the operator's cockpit lists, so the run is refused rather than allowed to bury the queue.
@@ -55,10 +86,9 @@ QUOTA_PER_RUN = 200
 # One past it is refused `queue-busy` until one is answered or its hold ends
 PENDING_PER_SESSION = 4
 # ANSWER? polls a slot may make per second, and the burst it may save up (a REQUEST whose resolve misses the
-# cache draws on the same bucket). The consent hooks poll every GATE_POLL
-# (levain.consent.adapters.claude_code, 0.25 s), so a session with PENDING_PER_SESSION rows waiting polls 16 times
-# a second; past the rate a poll is refused `rate-limited`, which a hook must treat as no answer yet (pending, and
-# deny when its hold ends)
+# cache draws on the same bucket). Set above what PENDING_PER_SESSION rows polled at the hooks' fastest interval
+# (GATE_POLL) need; past the rate a poll is refused `rate-limited`, which a hook must treat as no answer yet (pending,
+# and deny when its hold ends)
 ANSWER_RATE = 20.0
 ANSWER_BURST = 40
 # how long a QUEUE-RESOLVE answer (a refusal too) is reused for one (slot, cap digest): a revoked cap is served
@@ -102,13 +132,20 @@ def resolved_from(answer: Any) -> Resolved | None:
     if not isinstance(session, str) or not session or kind not in KINDS:
         return None
     if kind == "dispatch":
-        if not isinstance(run, Mapping) or set(run) != RUN_KEYS or not isinstance(run["run_id"], str) \
-                or not run["run_id"] or not isinstance(run["contract_digest"], str) \
-                or _DIGEST.fullmatch(run["contract_digest"]) is None:
+        if not isinstance(run, Mapping) or not RUN_KEYS <= set(run) <= RUN_KEYS | RUN_OPTIONAL_KEYS \
+                or not isinstance(run["run_id"], str) or not run["run_id"] \
+                or not isinstance(run["contract_digest"], str) or _DIGEST.fullmatch(run["contract_digest"]) is None \
+                or ("repo_root" in run and not _root_ok(run["repo_root"])):
             return None
     elif run is not None:
         return None
     return Resolved(session=session, kind=kind, run=None if run is None else dict(run))
+
+
+def _root_ok(root: Any) -> bool:
+    """An absolute, normalised directory path that is not ``/`` and holds no NUL."""
+    return (isinstance(root, str) and root.startswith("/") and root != "/" and "\0" not in root
+            and posixpath.normpath(root) == root)
 
 
 def slot_ref(index: int) -> dict[str, Any]:
@@ -133,8 +170,13 @@ class Broker:
                  monotonic: Callable[[], float] = time.monotonic,
                  ssh_keygen: Path | str | None = None, quota: int = QUOTA_PER_RUN,
                  pending_cap: int = PENDING_PER_SESSION, answer_rate: float = ANSWER_RATE,
-                 answer_burst: int = ANSWER_BURST, resolve_ttl: float = RESOLVE_TTL) -> None:
+                 answer_burst: int = ANSWER_BURST, resolve_ttl: float = RESOLVE_TTL,
+                 contracts: Path | str | None = None, contracts_owner: int | None = None) -> None:
+        """``contracts``: the directory dispatch publishes signed contracts in (``L/contracts/``, CONTRACT §26 S1-b),
+        whose files must be owned by ``contracts_owner`` (dispatch's uid); without both, no grant ever applies."""
         self._store = store
+        self._contracts = None if contracts is None else Path(contracts)
+        self._contracts_owner = contracts_owner
         self._resolver = resolver
         self._signers = signers
         self._clock = clock
@@ -164,8 +206,15 @@ class Broker:
             self._counts[key] = self._counts.get(key, 0) + 1
             request = row.get("request")
             expires = request.get("expires_at") if isinstance(request, Mapping) else None
-            if isinstance(expires, str) and expires > now and isinstance(request.get("id"), str):
+            if isinstance(expires, str) and expires > now and isinstance(request.get("id"), str) \
+                    and not self._granted(request["id"]):
                 self._pending.setdefault(session, {})[request["id"]] = expires
+
+    def _granted(self, request_id: str) -> bool:
+        try:
+            return self._store.has_grant(request_id)
+        except (ValueError, OSError):
+            return False
 
     def handle(self, slot: int, message: Mapping[str, Any]) -> dict[str, Any]:
         """The one answer to ``message`` from the hook on ``slot``'s socket."""
@@ -239,6 +288,16 @@ class Broker:
             return wire.refusal(rid, "request-malformed")
         if request.tier not in _TIER_NEEDS:
             return wire.refusal(rid, "request-malformed")
+        member = message.get("grant") if "grant" in message else None
+        if "grant" in message:
+            why = grants.grant_member_refusal(request, member)
+            if why is not None:
+                log.info("qbroker: grant member refused on slot %d: %s", slot, why)
+                return wire.refusal(rid, "grant-digest-mismatch")
+        if "ungated" in message and message["ungated"] is not True:
+            return wire.refusal(rid, "request-malformed")
+        if message.get("ungated") is True and who.kind != "dispatch" and self._ungated_go(slot, request, member):
+            return wire.answer(rid, go=True)   # go is not allow: the mode decides; nothing is written
         row: dict[str, Any] = {"format": REQUEST_ROW_FORMAT, "queue_id": self._store.queue_id,
                                "request": request.fields(), "session": who.session, "slot": slot_ref(slot), "kind": who.kind}
         if who.run is not None:
@@ -252,8 +311,11 @@ class Broker:
                 return wire.refusal(rid, "request-clock")
             if expires <= now or expires - received > timedelta(seconds=MAX_HOLD):
                 return wire.refusal(rid, "request-hold")
-            refused = self._file(row, who, request, utc_stamp(now))
+            granted = self._decide_grant(who, request, member, now) if member is not None else None
+            refused = self._file(row, who, request, utc_stamp(now), granted=granted is not None)
             if refused is None:
+                if granted is not None:
+                    self._write_grant(who, request, granted, now)
                 return wire.answer(rid, request_id=request.id, queue_id=self._store.queue_id)
             if refused != "request-exists":
                 return wire.refusal(rid, refused)
@@ -262,48 +324,110 @@ class Broker:
             return wire.refusal(rid, "request-exists")
         return wire.answer(rid, request_id=request.id, queue_id=self._store.queue_id)
 
-    def _file(self, row: dict[str, Any], who: Resolved, request: ExternalGateRequest, now: str) -> str | None:
+    def _ungated_go(self, slot: int, request: ExternalGateRequest, member: Mapping[str, Any] | None) -> bool:
+        """Whether an ungated REQUEST outside a dispatch session is answered GO: not when a path of its member is
+        agent config, or reading that raises (filed as gated, never GO); else only when no row exists for its
+        request id, read inside the id's filing flight, so GO and filing are one door per request id."""
+        if member is not None:
+            try:
+                if grants.agent_config_path(member["paths"], request.cwd, request.agent) is not None:
+                    return False
+            except Exception:   # noqa: BLE001 - unreadable is agent config: filed as gated
+                log.exception("qbroker: the agent-config reading of %s on slot %d failed; filed as gated",
+                              request.id, slot)
+                return False
+        flight = self._enter_flight(request.id)
+        try:
+            return self._store.read_request(request.id) is None
+        finally:
+            self._leave_flight(request.id, flight)
+
+    def _decide_grant(self, who: Resolved, request: ExternalGateRequest, member: Mapping[str, Any],
+                      now: datetime) -> grants.Granted | None:
+        """The grant when the signed contract covers this call, else ``None`` (the request is filed for the
+        operator); the reason is logged."""
+        try:
+            snapshot = self._signers.current()
+        except Exception as exc:   # noqa: BLE001 - an unreadable snapshot is a queued call, never a refusal
+            log.info("qbroker: %s goes to the queue: the signer snapshot could not be read (%s)", request.id,
+                     type(exc).__name__)
+            return None
+        got = grants.decide(kind=who.kind, run=who.run, request=request, paths=member["paths"],
+                            directory=self._contracts, owner_uid=self._contracts_owner, snapshot=snapshot,
+                            now=now, ssh_keygen=self._ssh_keygen)
+        if isinstance(got, grants.Granted):
+            return got
+        log.info("qbroker: %s goes to the queue: %s", request.id, got.reason)
+        return None
+
+    def _write_grant(self, who: Resolved, request: ExternalGateRequest, granted: grants.Granted,
+                     now: datetime) -> None:
+        """The grant-allow row beside the request row just linked. A row that cannot be written leaves the request
+        pending for the operator (it is entered as pending here, past the cap it was not checked against).
+
+        Known edge (G, the L3 r1 triage): a disk that fills between the request row and this row lets a presumed
+        grant enter the pending set past :data:`PENDING_PER_SESSION`. A full disk under ``L/queue`` is the machine's
+        failure, and the broker is not reachable by an untrusted writer of that disk, so no reservation was added."""
+        try:
+            self._store.write_grant(grants.grant_row(request.id, granted, now))
+            return
+        except (OSError, ValueError):
+            log.exception("qbroker: the grant row for %s could not be written; it waits for the operator", request.id)
+        with self._mutex:
+            self._pending.setdefault(who.session, {})[request.id] = request.expires_at
+
+    def _file(self, row: dict[str, Any], who: Resolved, request: ExternalGateRequest, now: str, *,
+              granted: bool = False) -> str | None:
         """Link ``row`` as a new row, charged to its session's pending cap and its quota; ``None`` when this call
         linked it, else the refusal name (``request-exists`` when another connection linked it first)."""
         # single flight per request id: a second filing waits for the first, then finds its row (or, when that
         # one failed, files it itself), so only the filing that links a row ever holds its charge
-        while True:
-            with self._mutex:
-                flight = self._filing.get(request.id)
-                if flight is None:
-                    flight = self._filing[request.id] = threading.Event()
-                    break
-            flight.wait()
-            if self._store.read_request(request.id) is not None:
-                return "request-exists"
+        flight = self._enter_flight(request.id)
         try:
             # the row may have been linked between the caller's replay check and this flight
             if self._store.read_request(request.id) is not None:
                 return "request-exists"
-            return self._file_new(row, who, request, now)
+            return self._file_new(row, who, request, now, granted=granted)
         finally:
-            with self._mutex:
-                del self._filing[request.id]
-            flight.set()
+            self._leave_flight(request.id, flight)
 
-    def _file_new(self, row: dict[str, Any], who: Resolved, request: ExternalGateRequest, now: str) -> str | None:
-        """:meth:`_file` inside its flight: no other filing of ``request.id`` runs, and its row is not linked."""
+    def _enter_flight(self, request_id: str) -> threading.Event:
+        """Take ``request_id``'s single flight (a filing, or an ungated GO's row check), waiting out any other."""
+        while True:
+            with self._mutex:
+                flight = self._filing.get(request_id)
+                if flight is None:
+                    flight = self._filing[request_id] = threading.Event()
+                    return flight
+            flight.wait()
+
+    def _leave_flight(self, request_id: str, flight: threading.Event) -> None:
+        with self._mutex:
+            del self._filing[request_id]
+        flight.set()
+
+    def _file_new(self, row: dict[str, Any], who: Resolved, request: ExternalGateRequest, now: str, *,
+                  granted: bool = False) -> str | None:
+        """:meth:`_file` inside its flight: no other filing of ``request.id`` runs, and its row is not linked.
+        ``granted``: the row is allowed by the contract grant, so it waits on no one: it is charged to the quota and
+        neither checked against nor entered in the pending cap."""
         with self._mutex:
             held = dict(self._pending.get(who.session, {}))
         # pending = unexpired with no answer file: once the operator has written one, the row has had his
         # attention, whatever the file proves
-        settled = {i for i, exp in held.items() if exp <= now or self._store.has_answer(i)}
+        settled = {i for i, exp in held.items() if exp <= now or self._store.has_answer(i) or self._granted(i)}
         key = _quota_key(who.session, who.run)
         with self._mutex:
             mine = self._pending.setdefault(who.session, {})
             for i in settled:
                 mine.pop(i, None)
-            if len(mine) >= self._pending_cap:
+            if not granted and len(mine) >= self._pending_cap:
                 return "queue-busy"
             if self._counts.get(key, 0) >= self._quota:
                 return "quota-exhausted"
             self._counts[key] = self._counts.get(key, 0) + 1
-            mine[request.id] = request.expires_at
+            if not granted:
+                mine[request.id] = request.expires_at
         linked = False
         try:
             linked = self._store.write_request(row)
@@ -344,21 +468,49 @@ class Broker:
         if request is None or row.get("queue_id") != self._store.queue_id:
             return wire.refusal(rid, "no-such-request")
         now = self._clock()
+        # the operator's verified answer first, before the hold: one signed in time is his decision whenever it is
+        # read, and it outranks the contract's grant (his deny wins). Only with none does the hold end the request,
+        # and then the broker's own grant row answer (in the directory only the broker writes, read as its format)
+        decision, answer_bad = self._answered(row, request_id, now)
+        if decision is not None:
+            return wire.answer(rid, decision=decision)
         if request.expires_at <= utc_stamp(now):
             return wire.refusal(rid, "request-expired")
+        try:
+            grant = self._store.read_grant(request_id)
+        except (ValueError, OSError) as exc:
+            log.warning("qbroker: grant row for %s refused: %s", request_id, exc)
+            return wire.refusal(rid, "answer-refused")
+        if grant is not None:
+            why = grant_allow_refusal(row, grant, now)
+            if why is not None:
+                log.warning("qbroker: grant row for %s refused: %s", request_id, why)
+                return wire.refusal(rid, "answer-refused")
+            return wire.answer(rid, decision="allow")
+        if answer_bad:
+            return wire.refusal(rid, "answer-refused")
+        return wire.answer(rid, pending=True)
+
+    def _answered(self, row: Mapping[str, Any], request_id: str, now: datetime) -> tuple[str | None, bool]:
+        """``(decision, False)`` for a verified answer row, ``(None, False)`` when there is none, ``(None, True)``
+        when the row there is not authority (the reason is logged)."""
         try:
             got = self._store.read_answer_stamped(request_id)
         except (ValueError, OSError) as exc:
             log.warning("qbroker: answer row for %s refused: %s", request_id, exc)
-            return wire.refusal(rid, "answer-refused")
+            return None, True
         if got is None:
-            return wire.answer(rid, pending=True)
+            return None, False
         answer, identity = got
-        snapshot = self._signers.current()
+        try:
+            snapshot = self._signers.current()
+        except Exception as exc:                      # a snapshot that cannot be read verifies nothing
+            log.warning("qbroker: signers snapshot unreadable for %s: %s", request_id, exc)
+            return None, True
         with self._mutex:
             hit = self._verdicts.get(request_id)
-        # the verdict holds while the answer file and the snapshot are the ones it was reached on; the hold was
-        # checked above, and every other input is the sealed row, which never changes
+        # the verdict holds while the answer file and the snapshot are the ones it was reached on; it reads no clock
+        # (the hold is the answer's signed_at), and every other input is the sealed row, which never changes
         if hit is not None and hit[0] == identity and hit[1] is snapshot:
             decision = hit[2]
         else:
@@ -368,9 +520,7 @@ class Broker:
                 self._verdicts.move_to_end(request_id)
                 while len(self._verdicts) > VERDICT_CACHE_MAX:
                     self._verdicts.popitem(last=False)
-        if decision is None:
-            return wire.refusal(rid, "answer-refused")
-        return wire.answer(rid, decision=decision)
+        return decision, decision is None
 
     def _verdict(self, row: Mapping[str, Any], request_id: str, answer: Mapping[str, Any],
                  snapshot: SignersSnapshot | None, now: datetime) -> str | None:

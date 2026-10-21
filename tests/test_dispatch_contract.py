@@ -22,6 +22,7 @@ from levain.dispatch.contract import (
     GOAL_MAX_BYTES, MAX_LIFETIME, NEW, ResolvedContract, ResolvedTemplate, parse_contract, resolve_contract,
 )
 from levain.dispatch.policy import ProviderPolicy
+from tests.test_dispatch_verifier_report import ENTRY as VERIFIER_ENTRY
 
 NOW = datetime(2026, 10, 19, 20, 0, tzinfo=timezone.utc)
 
@@ -71,7 +72,8 @@ WRITE_SET = frozenset({"src/a.py", "src/b.py", "src/new.py", "src/sub/deep.py", 
 
 def template(**over) -> ResolvedTemplate:
     fields = dict(template_id="fix-lint", content_hash="sha256:" + "a" * 64, tier="R0", executor="codex",
-                  models=("glm-5", "kimi-k2"), k=2, verifier_id="pytest-bb", verifier_hash="sha256:" + "b" * 64,
+                  models=("glm-5", "kimi-k2"), k=2, verifier_id="pytest-bb",
+                  verifier_hash=VERIFIER_ENTRY["verifier_artifact_digest"],
                   verifier_kind="black-box", write_paths=WRITE_SET, provider="openrouter", route="openrouter/glm",
                   tool_versions=(("codex", "0.50.0"), ("levain", "1.0.0")))
     fields.update(over)

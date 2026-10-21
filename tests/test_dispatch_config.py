@@ -17,7 +17,7 @@ from levain.dispatch import control as ctl
 from levain.dispatch.contract import ResolvedTemplate
 from levain.dispatch.jobs import JobStore
 from tests.test_dispatch_contract import POLICY, make_repo, submission
-from tests.test_dispatch_control import VERIFIERS, tmpl
+from tests.test_dispatch_control import BB_ENTRY, VERIFIERS, tmpl, vbody
 from tests.test_dispatch_sign import keys, log  # noqa: F401  (module fixtures)
 
 
@@ -71,7 +71,7 @@ def sign(capsys, ddir, root, keys, tmp_path, kind, body, *extra, key="laptop"):
 
 def configure(capsys, ddir, root, keys, tmp_path):
     init(capsys, ddir, root, keys)
-    for kind, body in (("verifiers", VERIFIERS), ("templates", [tmpl()]), ("provider_policy", POLICY.to_mapping())):
+    for kind, body in (("verifier", VERIFIERS), ("templates", [tmpl()]), ("provider_policy", POLICY.to_mapping())):
         code, out, _ = sign(capsys, ddir, root, keys, tmp_path, kind, body, "--yes")
         assert code == 0, out
 
@@ -135,7 +135,8 @@ def test_show_summarises_every_active_kind(capsys, ddir, root, keys, tmp_path):
     configure(capsys, ddir, root, keys, tmp_path)
     code, out, _ = run(capsys, "config", "show", "--dispatch-dir", str(ddir), "--data-root", root)
     assert code == 0, out
-    for want in ("generation 3", "templates", "fix-lint", "pytest-bb (black-box)", "pytest-ip (in-process)",
+    for want in ("generation 3", "templates", "fix-lint", "pytest-bb (black-box, driver output_compare)",
+                 "pytest-ip (in-process, driver output_compare; forgeable by the code under test)",
                  "anthropic, openrouter"):
         assert want in out, want
     code, out, _ = run(capsys, "config", "show", "--dispatch-dir", str(ddir), "--data-root", root, "--json")
@@ -173,10 +174,10 @@ def test_show_of_a_store_that_cannot_be_trusted_is_exit_3(capsys, ddir, root, ke
 def test_sign_shows_the_item_then_accepts_it(capsys, ddir, root, keys, tmp_path):
     init(capsys, ddir, root, keys)
     sid = store(ddir, root).store_id()
-    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS, "--yes")
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifier", VERIFIERS, "--yes")
     assert code == 0, out
-    for want in ("kind        verifiers", "generation  1", f"store       {sid}", "prev        (none: the first item)",
-                 "new kind", '+  "pytest-bb": {'):
+    for want in ("kind        verifier", "generation  1", f"store       {sid}", "prev        (none: the first item)",
+                 "new kind", '"verifier_id": "pytest-bb"'):
         assert want in out, want
     assert out.index("new kind") < out.index("accepted generation 1")
     assert store(ddir, root).generation() == 1
@@ -184,12 +185,11 @@ def test_sign_shows_the_item_then_accepts_it(capsys, ddir, root, keys, tmp_path)
 
 def test_sign_diffs_against_the_active_body_of_its_kind(capsys, ddir, root, keys, tmp_path):
     configure(capsys, ddir, root, keys, tmp_path)
-    changed = dict(VERIFIERS)
-    del changed["pytest-ip"]
-    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", changed, "--yes")
+    changed = vbody(BB_ENTRY)
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifier", changed, "--yes")
     assert code == 0, out
-    assert "--- verifiers, active (generation 1)" in out and "+++ verifiers, generation 4" in out
-    assert '-  "pytest-ip": {' in out and "new kind" not in out
+    assert "--- verifier, active (generation 1)" in out and "+++ verifier, generation 4" in out
+    assert '-      "verifier_id": "pytest-ip"' in out and "new kind" not in out
     top, head = store(ddir, root).head()
     assert top == 4
 
@@ -209,35 +209,35 @@ def test_a_body_that_is_not_leaf_json_is_refused_before_any_key_touch(capsys, dd
     init(capsys, ddir, root, keys)
     f = tmp_path / "float.json"
     f.write_text('{"pytest-bb": {"artifact_hash": "x", "kind": 1.5}}')
-    code, out, _ = run(capsys, "config", "sign", "verifiers", str(f), "--dispatch-dir", str(ddir), "--data-root",
+    code, out, _ = run(capsys, "config", "sign", "verifier", str(f), "--dispatch-dir", str(ddir), "--data-root",
                        root, "--signing-key", str(keys["laptop"].path), "--yes")
     assert code == 2 and "body" in out and no_touch.calls == 0
 
 
 def test_sign_with_a_key_that_is_not_the_root_is_refused_before_the_touch(capsys, ddir, root, keys, tmp_path):
     init(capsys, ddir, root, keys)
-    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS, "--yes", key="phone")
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifier", VERIFIERS, "--yes", key="phone")
     assert code == 2 and "is not the pinned trust root" in out
     assert store(ddir, root).generation() == 0
 
 
 def test_sign_with_no_store_points_at_init(capsys, ddir, root, keys, tmp_path, no_touch):
-    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS, "--yes")
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifier", VERIFIERS, "--yes")
     assert code == 2 and "levain dispatch config init" in out and no_touch.calls == 0
 
 
 def test_sign_without_a_tty_refuses_and_asks_on_one(capsys, ddir, root, keys, tmp_path, monkeypatch):
     init(capsys, ddir, root, keys)
     monkeypatch.setattr(dcli, "_is_tty", lambda: False)
-    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifier", VERIFIERS)
     assert code == 2 and "in your own terminal" in out and "--yes" not in out.splitlines()[-1]
     monkeypatch.setattr(dcli, "_is_tty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _prompt: "n")
-    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifier", VERIFIERS)
     assert code == 2 and "not confirmed; nothing was signed" in out
     prompts = []
     monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt) or "y")
-    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifier", VERIFIERS)
     assert code == 0, out
     assert prompts and "generation 1" in prompts[0]
     assert store(ddir, root).generation() == 1
@@ -250,7 +250,7 @@ def test_a_store_fault_after_the_touch_says_what_was_not_accepted(capsys, ddir, 
         raise ctl.ControlStateUnavailable("the control store cannot be read: disk I/O error")
 
     monkeypatch.setattr(ctl.ControlStore, "accept", faulted)
-    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS, "--yes")
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifier", VERIFIERS, "--yes")
     assert code == 3 and "nothing was accepted; generation is still 3" in out
 
 
@@ -258,7 +258,7 @@ def test_a_store_fault_after_the_touch_says_what_was_not_accepted(capsys, ddir, 
 def test_an_agent_cannot_init_sign_or_accept(capsys, ddir, root, keys, tmp_path, monkeypatch, verb, no_touch):
     monkeypatch.setattr(dcli, "agent_caller", lambda: "claude_code")
     argv = {"init": ["init", "--trust-root", keys["laptop"].fp],
-            "sign": ["sign", "verifiers", body_file(tmp_path, "v", VERIFIERS), "--signing-key",
+            "sign": ["sign", "verifier", body_file(tmp_path, "v", VERIFIERS), "--signing-key",
                      str(keys["laptop"].path), "--yes"],
             "accept": ["accept", body_file(tmp_path, "i", {}), body_file(tmp_path, "s", {}), "--yes"]}[verb]
     code, out, _ = run(capsys, "config", *argv, "--dispatch-dir", str(ddir), "--data-root", root)
@@ -288,22 +288,22 @@ def _elsewhere(ddir, root, keys, tmp_path, kind, body, *, generation=None, prev=
 
 def test_accept_takes_an_item_signed_elsewhere(capsys, ddir, root, keys, tmp_path, monkeypatch):
     init(capsys, ddir, root, keys)
-    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifier", VERIFIERS)
     code, out, _ = run(capsys, "config", "accept", item, sig, "--dispatch-dir", str(ddir), "--data-root", root,
                        "--yes")
     assert code == 0, out
-    assert "kind        verifiers" in out and "new kind" in out and "accepted generation 1" in out
+    assert "kind        verifier" in out and "new kind" in out and "accepted generation 1" in out
     assert store(ddir, root).generation() == 1
 
 
 def test_accept_of_an_older_generation_or_a_wrong_prev_is_refused(capsys, ddir, root, keys, tmp_path):
     configure(capsys, ddir, root, keys, tmp_path)
-    old, old_sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers", VERIFIERS, generation=2,
+    old, old_sig = _elsewhere(ddir, root, keys, tmp_path, "verifier", VERIFIERS, generation=2,
                               prev=store(ddir, root).head()[1])
     code, out, _ = run(capsys, "config", "accept", old, old_sig, "--dispatch-dir", str(ddir), "--data-root", root,
                        "--yes")
     assert code == 2 and "not above the highest accepted (3)" in out
-    bad, bad_sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers", VERIFIERS, prev="sha256:" + "0" * 64)
+    bad, bad_sig = _elsewhere(ddir, root, keys, tmp_path, "verifier", VERIFIERS, prev="sha256:" + "0" * 64)
     code, out, _ = run(capsys, "config", "accept", bad, bad_sig, "--dispatch-dir", str(ddir), "--data-root", root,
                        "--yes")
     assert code == 2 and "does not chain to the head" in out
@@ -312,7 +312,7 @@ def test_accept_of_an_older_generation_or_a_wrong_prev_is_refused(capsys, ddir, 
 
 def test_accept_of_a_signature_that_does_not_verify_is_refused(capsys, ddir, root, keys, tmp_path):
     init(capsys, ddir, root, keys)
-    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifier", VERIFIERS)
     with open(item, "rb") as fh:
         raw = fh.read()
     (tmp_path / "item.sig").write_text(keys["phone"].sign(raw, ctl.CONFIG_NAMESPACE))
@@ -376,7 +376,7 @@ def test_file_with_a_store_that_cannot_be_trusted_is_exit_3(capsys, ddir, root, 
 
 def test_file_with_templates_but_no_policy_is_refused(capsys, ddir, root, keys, tmp_path, repo):
     init(capsys, ddir, root, keys)
-    for kind, body in (("verifiers", VERIFIERS), ("templates", [tmpl()])):
+    for kind, body in (("verifier", VERIFIERS), ("templates", [tmpl()])):
         assert sign(capsys, ddir, root, keys, tmp_path, kind, body, "--yes")[0] == 0
     code, out, _ = run(capsys, "file", _contract(tmp_path, repo), "--dispatch-dir", str(ddir), "--data-root", root,
                        "--agent", "codex")
@@ -414,7 +414,7 @@ def accept_cli(capsys, ddir, root, item, sig, *extra):
 
 def test_accept_refuses_a_bad_signature_before_it_asks(capsys, ddir, root, keys, tmp_path, monkeypatch):
     init(capsys, ddir, root, keys)
-    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifier", VERIFIERS)
     with open(item, "rb") as fh:
         raw = fh.read()
     (tmp_path / "item.sig").write_text(keys["phone"].sign(raw, ctl.CONFIG_NAMESPACE))
@@ -427,7 +427,7 @@ def test_accept_refuses_a_bad_signature_before_it_asks(capsys, ddir, root, keys,
 
 def test_accept_refuses_an_item_for_another_store(capsys, ddir, root, keys, tmp_path, monkeypatch):
     init(capsys, ddir, root, keys)
-    item = ctl.item_bytes("verifiers", 1, VERIFIERS, datetime.now(timezone.utc), prev="", store_id="0" * 32)
+    item = ctl.item_bytes("verifier", 1, VERIFIERS, datetime.now(timezone.utc), prev="", store_id="0" * 32)
     (tmp_path / "item.json").write_bytes(item)
     (tmp_path / "item.sig").write_text(keys["laptop"].sign(item, ctl.CONFIG_NAMESPACE))
     prompts = _tty(monkeypatch)
@@ -448,7 +448,7 @@ def test_accept_refuses_a_body_its_kind_refuses_before_it_asks(capsys, ddir, roo
 
 def test_accept_declined_on_the_terminal_accepts_nothing(capsys, ddir, root, keys, tmp_path, monkeypatch):
     configure(capsys, ddir, root, keys, tmp_path)
-    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifier", VERIFIERS)
     prompts = _tty(monkeypatch, answer="n")
     code, out, _ = accept_cli(capsys, ddir, root, item, sig)
     assert code == 2 and "not confirmed; nothing was accepted" in out and len(prompts) == 1
@@ -459,7 +459,7 @@ def test_a_verifier_that_cannot_run_at_accept_is_a_fault(capsys, ddir, root, key
     from levain.authority import VerifierUnavailable
 
     init(capsys, ddir, root, keys)
-    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifier", VERIFIERS)
 
     def cannot_run(*a, **k):
         raise VerifierUnavailable("ssh-keygen could not run")
@@ -489,9 +489,8 @@ def test_a_fault_after_the_item_committed_says_the_store_moved(capsys, ddir, roo
         raise ctl.ControlStateUnavailable("the control store cannot be read: disk I/O error")
 
     monkeypatch.setattr(ctl.ControlStore, "accept", committed_then_faulted)
-    changed = dict(VERIFIERS)
-    del changed["pytest-ip"]
-    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", changed, "--yes")
+    changed = vbody(BB_ENTRY)
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifier", changed, "--yes")
     assert code == 3 and "is now generation 4 (was 3)" in out, out
     assert "nothing was accepted" not in out
     assert store(ddir, root).generation() == 4
@@ -500,10 +499,10 @@ def test_a_fault_after_the_item_committed_says_the_store_moved(capsys, ddir, roo
 def test_a_store_fault_before_the_touch_says_nothing_was_signed(capsys, ddir, root, keys, tmp_path, no_touch):
     init(capsys, ddir, root, keys)
     (ddir / ctl.DB_NAME).write_bytes(b"this is not a database" * 100)
-    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS, "--yes")
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifier", VERIFIERS, "--yes")
     assert code == 3 and "ControlStateUnavailable" in out and "nothing was signed" in out, out
     assert no_touch.calls == 0
-    item =ctl.item_bytes("verifiers", 1, VERIFIERS, datetime.now(timezone.utc), prev="", store_id="0" * 32)
+    item =ctl.item_bytes("verifier", 1, VERIFIERS, datetime.now(timezone.utc), prev="", store_id="0" * 32)
     (tmp_path / "item.json").write_bytes(item)
     (tmp_path / "item.sig").write_text("x")
     code, out, _ = accept_cli(capsys, ddir, root, str(tmp_path / "item.json"), str(tmp_path / "item.sig"), "--yes")
@@ -517,7 +516,8 @@ def test_resolvers_says_nothing_was_filed_for_every_store_fault(capsys, ddir, ro
     def faulted(self):
         raise fault
 
-    monkeypatch.setattr(ctl.ControlStore, "active", faulted)
+    # the one verified read (ControlStore._read) under every reader: resolvers reads the store once, every kind
+    monkeypatch.setattr(ctl.ControlStore, "_read", faulted)
     with pytest.raises(ctl.ControlStateUnavailable, match="nothing was filed"):
         dcli.resolvers(ddir, root)
 
@@ -560,14 +560,13 @@ def test_the_confirm_summary_shows_the_head_it_builds_on(capsys, ddir, root, key
     configure(capsys, ddir, root, keys, tmp_path)
     top, head = store(ddir, root).head()
     _tty(monkeypatch)
-    changed = dict(VERIFIERS)
-    del changed["pytest-ip"]
-    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", changed)
+    changed = vbody(BB_ENTRY)
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifier", changed)
     assert code == 0, out
     summary = out[out.index("---- you are about to sign"):]
     assert f"builds on   generation {top}, {head}" in summary, summary
     top, head = store(ddir, root).head()
-    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifier", VERIFIERS)
     code, out, _ = accept_cli(capsys, ddir, root, item, sig)
     assert code == 0, out
     summary = out[out.index("---- you are about to accept"):]
@@ -580,9 +579,8 @@ def _move(ddir, root, keys, tmp_path, name="moved"):
     """Another item accepted into the store, as a second terminal would: the head moves by one."""
     d = tmp_path / name
     d.mkdir()
-    changed = dict(VERIFIERS)
-    changed.pop("pytest-ip", None)
-    item, sig = _elsewhere(ddir, root, keys, d, "verifiers", changed)
+    changed = vbody(BB_ENTRY)
+    item, sig = _elsewhere(ddir, root, keys, d, "verifier", changed)
     with open(item, "rb") as fh:
         raw = fh.read()
     with open(sig) as fh:
@@ -607,14 +605,14 @@ def test_sign_refuses_before_the_touch_when_the_store_moved_during_the_question(
     touches = _touches(monkeypatch)
     monkeypatch.setattr(dcli, "_is_tty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda prompt: _move(ddir, root, keys, tmp_path) or "y")
-    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifier", VERIFIERS)
     assert code == 2 and "the store moved to generation 4 while you were confirming; nothing was signed" in out, out
     assert touches == [] and store(ddir, root).generation() == 4
 
 
 def test_accept_refuses_when_the_store_moved_during_the_question(capsys, ddir, root, keys, tmp_path, monkeypatch):
     configure(capsys, ddir, root, keys, tmp_path)
-    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifier", VERIFIERS)
     monkeypatch.setattr(dcli, "_is_tty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda prompt: _move(ddir, root, keys, tmp_path) or "y")
     code, out, _ = accept_cli(capsys, ddir, root, item, sig)
@@ -630,7 +628,7 @@ def test_a_refusal_at_accept_after_the_touch_says_the_signature_is_spent(capsys,
         raise ctl.ConfigRefused("the head moved under the item")
 
     monkeypatch.setattr(ctl.ControlStore, "accept", refused)
-    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS, "--yes")
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifier", VERIFIERS, "--yes")
     assert code == 2, out
     assert ("signed but not accepted: the head moved under the item; this signature cannot be used, re-run config "
             "sign") in out, out
@@ -644,7 +642,7 @@ def test_a_signer_fault_reads_the_generation_again(capsys, ddir, root, keys, tmp
         raise dcli.SignerUnavailable("ssh-keygen timed out")
 
     monkeypatch.setattr(dcli, "_sign_bytes", moved_then_faulted)
-    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS, "--yes")
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifier", VERIFIERS, "--yes")
     assert code == 3 and "the store is now generation 4 (was 3)" in out, out
     assert "still 3" not in out
 
@@ -653,14 +651,14 @@ def test_a_signer_fault_reads_the_generation_again(capsys, ddir, root, keys, tmp
         raise dcli.SignerUnavailable("ssh-keygen timed out")
 
     monkeypatch.setattr(dcli, "_sign_bytes", unreadable_then_faulted)
-    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS, "--yes")
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifier", VERIFIERS, "--yes")
     assert code == 3 and "nothing was signed" in out and "could not be read again" in out, out
     assert "still" not in out
 
 
 def test_accept_shows_the_head_check_judged(capsys, ddir, root, keys, tmp_path, monkeypatch):
     configure(capsys, ddir, root, keys, tmp_path)
-    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifier", VERIFIERS)
     real = ctl.ControlStore.check
 
     def checked_then_moved(self, item_, signature):
@@ -707,7 +705,7 @@ def test_json_with_a_terminal_keeps_the_prompt_off_stdout(capsys, ddir, root, ke
         return "y"
 
     monkeypatch.setattr("builtins.input", real_input)
-    code, out, err = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS, "--json")
+    code, out, err = sign(capsys, ddir, root, keys, tmp_path, "verifier", VERIFIERS, "--json")
     assert code == 0, out
     assert json.loads(out)["generation"] == 1
     assert "[y/N]" in err
@@ -718,3 +716,53 @@ def test_the_item_view_escapes_every_field_as_the_body_is_escaped():
     text = "\n".join(lines)
     assert text.isascii(), text
     assert "verifiers\\u043c" in text and "abc\\u043c" in text and "sha256:\\u043c" in text
+
+
+# --- W2-b: the verifier kind ---------------------------------------------------------------------------------------
+
+def test_show_says_a_0_11_verifiers_item_is_no_longer_read(capsys, ddir, root, keys, tmp_path, monkeypatch):
+    from levain.dispatch import registry
+
+    init(capsys, ddir, root, keys)
+    # a Levain 0.11 store: accepted under 0.11's body judge (this code refuses the kind)
+    with monkeypatch.context() as m:
+        m.setattr(registry, "body_refusal", lambda kind, body, active: None)
+        item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers",
+                               {"pytest-bb": {"artifact_hash": "sha256:" + "b" * 64, "kind": "black-box"}})
+        with open(item, "rb") as fh, open(sig) as sh:
+            store(ddir, root).accept(fh.read(), sh.read())
+    code, out, _ = run(capsys, "config", "show", "--dispatch-dir", str(ddir), "--data-root", root)
+    assert code == 0, out
+    assert "verifier         (none accepted)" in out
+    assert "verifiers        NO LONGER READ: the verifiers item at generation 1 is Levain 0.11's shape" in out
+    assert "levain dispatch config sign verifier <body.json>" in out
+    code, out, _ = run(capsys, "config", "show", "--dispatch-dir", str(ddir), "--data-root", root, "--json")
+    got = json.loads(out)
+    assert got["no_longer_read"]["verifiers"]["generation"] == 1 and "verifier" not in got["kinds"]
+    # the CLI cannot sign the old kind
+    with pytest.raises(SystemExit) as exc:
+        sign(capsys, ddir, root, keys, tmp_path, "verifiers", {}, "--yes")
+    assert exc.value.code == 2 and "invalid choice: 'verifiers'" in capsys.readouterr().err
+
+
+def test_show_says_a_0_11_verifiers_item_is_superseded_once_a_verifier_item_is_active(capsys, ddir, root, keys,
+                                                                                       tmp_path, monkeypatch):
+    from levain.dispatch import registry
+
+    init(capsys, ddir, root, keys)
+    with monkeypatch.context() as m:
+        m.setattr(registry, "body_refusal", lambda kind, body, active: None)
+        item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers",
+                               {"pytest-bb": {"artifact_hash": "sha256:" + "b" * 64, "kind": "black-box"}})
+        with open(item, "rb") as fh, open(sig) as sh:
+            store(ddir, root).accept(fh.read(), sh.read())
+    code, out, err = sign(capsys, ddir, root, keys, tmp_path, "verifier", VERIFIERS, "--yes")
+    assert code == 0, out + err
+    code, out, _ = run(capsys, "config", "show", "--dispatch-dir", str(ddir), "--data-root", root)
+    assert code == 0, out
+    assert ("verifiers        SUPERSEDED by the active verifier item (generation 2): the 0.11 verifiers item at "
+            "generation 1 is no longer read") in out
+    assert "NO LONGER READ" not in out
+    code, out, _ = run(capsys, "config", "show", "--dispatch-dir", str(ddir), "--data-root", root, "--json")
+    got = json.loads(out)["no_longer_read"]["verifiers"]
+    assert got["generation"] == 1 and got["superseded_by"] == 2

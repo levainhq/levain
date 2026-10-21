@@ -7,15 +7,85 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **Choice sign requests.** A caller can file one card with 2-8 options (`levain-sign-choice/1`). You tap one on the phone and sign it with your passkey; the signature covers the message with your choice as its last line, so a verifier reads the decision from the signed bytes, checked with stock `ssh-keygen -Y verify`.
+- **A link straight onto one card.** `#sign=<id>` on the phone page opens it on that request. `levain consent phone --link-file` writes the page and token for a caller building such a link; `--token-file` keeps the token across restarts, so links you already hold keep working.
+- **Opt out of signed answers.** `levain consent signed-answers --set off|authority-only|all` (default authority-only) is read by a caller before it files: off files nothing; authority-only signs only answers that authorise an act.
+- **`levain coord`: one coordinator at a time.** A drop that arrives while nobody holds the coordinator role asks for
+  a coordinator session; drops after it wait for that one. `levain coord status` shows who holds the role and what the
+  next drop would do, `levain coord take` holds it yourself, and `levain coord release` ends it. A session that lost
+  the role (it went quiet past its time, or you took over) has its thread changes refused. Splitting or re-titling by
+  hand now records you: `--by operator` is the default for `levain drops split` and `levain thread set`.
+- **`levain coord agent`: choose the coordinator your drops start.** `levain coord agent claude` makes
+  `~/.levain/coordinator` (or `--cwd DIR`) a Levain install for Claude Code when it is not one, records the choice, and
+  prints the one line that trusts that directory in Claude Code, which you run once. `levain coord agent none` (and
+  no choice at all) means drops only queue for you.
+- **`levain coord launch`: start the coordinator a drop asked for.** It starts a Claude Code session in the background
+  in the coordinator's directory, only when that install's consent hook is wired, and prints the `claude attach` line,
+  or why it did not start. `levain drop` and `levain coord wake` now do this themselves when they are the ones that
+  asked.
+- **`levain coord watch`: keep the coordinator's sessions honest.** Leave it running (`--every S`, or `--once` for one
+  pass): it starts any coordinator a drop from the phone or the cockpit asked for, ends a launch whose session is
+  gone, keeps the role with a coordinator that is still working and wrote in the last hour, and stops a session whose
+  launch is over (you took over, it lost the role, or it failed to start), and deletes that launch's brief, which
+  quotes your drops. It touches only the sessions Levain started, in the directory it started them in.
+- **Verifiers are signed, one per check, and Levain runs the checker itself.** Each verifier you sign names the checker
+  Levain ships (`output_compare` is the first: it runs the template's steps and compares what each one printed to what you
+  pinned) and the exact steps and inputs it checks. A report only counts if it comes from that checker, on those steps and
+  inputs, so a changed checker or a changed step list is refused rather than read as a pass.
+
+### Changed
+- **Re-sign your verifiers after upgrading.** The old `verifiers` configuration item is no longer read; `levain dispatch
+  config show` marks it SUPERSEDED once you have signed the new kind, and `levain doctor` warns while only the old item is signed.
+  A template whose verifier id 0.11 accepted but this version does not (uppercase, `.`, `_`, `@`, `:`, `/`, `+`, or over 48
+  characters) is refused by name until it is re-signed.
+  - A control store holding the new `verifier` item cannot be read by Levain 0.11.x, so do not downgrade after signing one.
+
+### Known edges
+- A coordinator launch that fails (an untrusted directory, a session that never appears) counts against the
+  coordinator: after three in a row Levain stops starting them until you run `levain coord take` or
+  `levain coord release`.
+- A drop from the phone or the cockpit asks for a coordinator without starting it: with no `levain coord watch`
+  running, run `levain coord launch` within 5 minutes, or the request lapses (a lapse nobody tried to start does not
+  count as one of those three).
+- A coordinator that finished its turn still holds the role until its lease runs out: drops sent meanwhile wait up to
+  an hour for the next coordinator. A new drop is not handed into a session that is already running.
+
+## [0.11.13] — 2026-10-20
+
+### Security
+- **A Codex patch could write a different file from the one Levain checked (0.11.0 to 0.11.12; upgrade to fix).**
+  Levain read the file names in a Codex `apply_patch` differently from Codex itself when a header line held an unusual
+  whitespace or line-break character: a tab, a carriage return inside the line, a form feed, U+2028 and a few others.
+  Codex then wrote to a file whose name Levain never saw, so a standing consent grant on one file could cover a write to
+  another, and with a tab, to a file outside the workspace (reproduced against Codex 0.162.1's own patch tool: it deleted
+  a file one directory up). Levain now reads those headers the way Codex does, and a patch whose header holds any such
+  character comes to you as an ordinary consent request. Reading a very long header line also no longer stalls the hook.
+
+### Added
 - **`levain drop`: leave a message for your coordinator and go.** Your words are kept exactly as you typed them and
   authorise nothing. Each drop gets a drop receipt: one when it arrives, and one naming the threads it became (one
   intent per thread: work, ask, note or relay). Typed inside a git checkout, a drop records the repo and branch you
   were on. `levain drops list|show` reads them back; `levain thread list|show` shows the threads, and `merge`,
   `detach`, `add` and `state` fix a split or close a thread.
+- **`levain envelope`: sign what a piece of work may do, once.** An envelope names where the work may happen (repos
+  and paths), which lasting steps it may take (land onto a branch, push, publish), a budget and a stop time, and you
+  sign it with an enrolled key. `levain envelope echo` writes one for threads you name and shows it in plain words;
+  `levain envelope sign` shows it again in full, asks y/N, and signs it. `levain drop --envelope SPEC "words"` signs one
+  as you send the drop. You can narrow or kill an envelope at any time without signing (`levain envelope kill`,
+  `levain envelope narrow`); only a wider one needs a new signature.
+- **Dispatch keeps one record per verified run.** When a verifier finishes a run, Levain checks its report against what
+  that run was set up to check and keeps one record of the result. Landing a job reads only these records. A verifier that
+  could not run at all (it timed out, or its report was missing or damaged) fails the job with its own cause,
+  `verifier_refused`, so it never reads as the verifier saying no.
+  - **The dispatch job store moves to format 3** the first time this version opens it. Your jobs are kept. After that,
+    Levain 0.11.12 refuses to open the store, so do not downgrade.
 
 ### Known edges
 - The coordinator session that reads drops and splits them comes later; until then a thread is named with
   `levain drops split`. The phone drop sheet comes later too.
+- Nothing acts on an envelope yet: until Levain's separate-user setup is in place, every step that needs your say
+  still asks you each time, and `levain envelope show` says so. Signing from the phone comes later.
+- The verifier sessions that write these records come with the slot work; until then no run produces one.
 
 ## [0.11.12] — 2026-10-20
 

@@ -92,6 +92,8 @@ from levain.consent.adapters.claude_code import (  # noqa: F401 - GATE_TIMEOUT i
     RULING_TEXT, UNCONFINED_ENV, U_IRR, U_REV, _pre, _what, floor_text, notify, send_repings, unconfined,
     unconfined_state,
 )
+from levain.consent.adapters.claude_code import DEFAULT_GATE_HOLD, SLOT_HOW, queue_socket_planted
+from levain.consent.broker_client import in_slot
 from levain.consent.adapters.claude_code import targets_agent_config as _claude_targets_agent_config
 from levain.consent.policy import AGENT_CONFIG_TIER
 from levain.consent.queue import DB_NAME as QUEUE_DB_NAME
@@ -105,7 +107,7 @@ HOOK_SCRIPT_NAME = "levain_consent.py"
 PATCH_TOOL = "apply_patch"
 # The file headers of Codex's patch format; their paths are the files a patch touches. Indentation is allowed, in
 # case Codex's parser trims it: any other line starting ``***`` that is not a patch marker makes the patch unreadable.
-_PATCH_HEADER = re.compile(r"\s*\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*")
+_PATCH_HEADERS = ("*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: ")
 _PATCH_MARKERS = frozenset({"*** Begin Patch", "*** End Patch", "*** End of File"})
 CODEX_DIR_NAME = ".codex"
 CODEX_CONFIG_NAMES = ("hooks.json", "config.toml")
@@ -130,16 +132,27 @@ def codex_home(environ: Mapping[str, str] | None = None) -> Path:
 
 def patch_targets(patch: Any) -> list[str] | None:
     """The file paths a Codex ``apply_patch`` names in its headers (``*** Add File:``, ``Update File:``,
-    ``Delete File:``, ``Move to:``), or ``None`` when ``patch`` is not a string, names no file, or has a line starting
-    ``***`` (indented or not) that is neither a header nor a patch marker: what it names cannot be told."""
+    ``Delete File:``, ``Move to:``), or ``None`` when ``patch`` is not a string, names no file, has a line starting
+    ``***`` (indented or not) that is neither a header nor a patch marker, or has a line holding ``***`` and any
+    whitespace character but a space: what it names cannot be told. Lines are read as Codex reads them, split on
+    ``\n`` alone with one trailing ``\r`` dropped, so only a line holding ``***`` can be a header to either. On such a
+    line every other whitespace character is one the two parsers trim, split or resolve differently (Codex drops a tab
+    inside a path, so ``.<tab>./x`` is ``../x`` to it), so the patch names nothing. A header is read by its literal
+    prefix, never a regular expression, so a long line costs linear time (a hook that stalls fails open on Codex)."""
     if not isinstance(patch, str):
         return None
     found: list[str] = []
-    for line in patch.splitlines():
-        m = _PATCH_HEADER.fullmatch(line)
-        if m:
-            found.append(m.group(1))
-        elif line.strip().startswith("***") and line.strip() not in _PATCH_MARKERS:
+    for raw in patch.split("\n"):
+        line = raw[:-1] if raw.endswith("\r") else raw
+        if "***" not in line:
+            continue
+        if any(c.isspace() and c != " " for c in line):
+            return None
+        text = line.strip(" ")
+        head = next((h for h in _PATCH_HEADERS if text.startswith(h)), None)
+        if head is not None and text[len(head):]:
+            found.append(text[len(head):])      # the line's ends are trimmed, never the path's own leading space
+        elif text.startswith("***") and text not in _PATCH_MARKERS:
             return None
     return found or None
 
@@ -382,7 +395,12 @@ def gate_output(decision: Decision) -> dict[str, Any]:
         how = f"your standing consent grant {decision.grant_id}"
     else:
         how = f"a signed levain answer (key {decision.signer_fp})"
-    if decision.decision == "allow":
+    return decision_output(decision.decision, how)
+
+
+def decision_output(decision: str, how: str) -> dict[str, Any]:
+    """:func:`gate_output`'s words for ``decision`` (``allow`` or ``deny``) by the authority ``how`` names."""
+    if decision == "allow":
         return {"hookSpecificOutput": {"hookEventName": GATE_EVENT,
                                        "additionalContext": f"levain: this call is allowed by {how}."}}
     return _deny(f"levain: denied by {how}. Do not retry it and do not achieve it another way.")
@@ -390,8 +408,8 @@ def gate_output(decision: Decision) -> dict[str, Any]:
 
 def undecided_output(tier: str | None, what: str, gap: int) -> dict[str, Any]:
     """The deny at D: U-IRR for the irreversible tier (the latch is the stop, never ``continue: false``), U-REV
-    for the reversible one. The U-REV branch is UNEXECUTED: no reversible gated class exists in the product as of
-    main 5d330ec8 (it mirrors the Claude Code adapter's)."""
+    for the reversible one: a slot's ungated grantable call that a dispatch run queued and nobody answered
+    (:func:`_slot_ungated`, W2-c3)."""
     return _deny((U_IRR if tier == "irreversible" else U_REV).format(x=what, n=gap))
 
 
@@ -498,12 +516,9 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
             _ledger_note(Path(queue.directory), event, session, str(tool_name), tool_input,
                          cwd if isinstance(cwd, str) else "", refused="halted")
             return _with_rulings(_deny(HALT_TEXT.format(n=halted)), queue, session)
-    missing = [k for k, v in (("session_id", session), ("tool_name", tool_name),
-                              ("cwd", cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None))
-               if not isinstance(v, str) or not v]
+    missing = _missing_of(event)
     if missing:
-        return _deny(f"levain: the hook event has no valid {', '.join(missing)}, so the action was NOT taken. Do not "
-                     "retry it and do not achieve it another way.")
+        return _missing_output(missing)
     if tool_input is None:
         tool_input = {}
     limited = _limits(event, queue, settings, session, tool_name, tool_input, cwd, home=home, codex_dir=codex_dir)
@@ -518,6 +533,19 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     out = _gate_call(event, queue, settings, tool_name, tool_input, cwd, session, home=home, codex_dir=codex_dir,
                      sleep=sleep, still_away=still_away)
     return _with_rulings(out, queue, session)
+
+
+def _missing_of(event: Mapping[str, Any]) -> list[str]:
+    session, tool_name, cwd = event.get("session_id"), event.get("tool_name"), event.get("cwd")
+    return [k for k, v in (("session_id", session), ("tool_name", tool_name),
+                           ("cwd", cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None))
+            if not isinstance(v, str) or not v]
+
+
+def _missing_output(missing: list[str]) -> dict[str, Any]:
+    """The deny for an event missing a required field (:func:`gate`'s, and the slot gate's)."""
+    return _deny(f"levain: the hook event has no valid {', '.join(missing)}, so the action was NOT taken. Do not "
+                 "retry it and do not achieve it another way.")
 
 
 def _limits(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, session: str, tool_name: str,
@@ -693,8 +721,137 @@ def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[
         tier, what = "irreversible", "this call"
     if tier is None and not os.path.lexists(queue_dir / QUEUE_DB_NAME):
         return None
+    return could_not_run(what)
+
+
+def could_not_run(what: str) -> dict[str, Any]:
+    """:func:`gate_failed`'s deny (no hard stop: on Codex the latch is the stop); the slot gate's too."""
     return _deny(f"levain: the gate could not run, so the action was NOT taken: {what}. Do not retry it and do "
                  "not achieve it another way.")
+
+
+# --- the slot gate (F10 S2a): Claude Code's (:func:`levain.consent.adapters.claude_code.slot_gate`), in Codex's
+# words. A slot has no local queue, so it has no halt latch either: an undecided irreversible call is denied with
+# U-IRR's words, and nothing denies the session's later calls (the operator side holds the gap).
+#
+# KNOWN EDGE until F10 S2b (L3 r1 B): after an undecided irreversible call in a slot, Codex's later UNGATED calls
+# proceed (on the local path the halt latch denies them). The undecided call itself stays denied, and every later
+# gated call still goes to the broker; the latch is operator-side state the broker does not hold yet. S2b adds a
+# broker-side halt this gate reads before it classifies the call. (L3 r1 C, consent limits not enforced in a slot,
+# is stated at claude_code's slot gate and holds here too.)
+
+def slot_gate(event: Any, *, home: Path | None = None, codex_dir: Path | None = None, client: Any = None,
+              hold: float = DEFAULT_GATE_HOLD, expected_uid: int | None = None,
+              sleep: Callable[[float], None] = time.sleep,
+              monotonic: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
+    """The slot's gate output for one Codex ``PreToolUse`` event, or ``None`` (the call goes on). An event missing
+    a required field is denied (:func:`_missing_output`); a call :func:`gate_class` does not gate (protected paths:
+    none) is :func:`_slot_ungated`'s (``None`` unless a dispatch run's grant or queue decides it); a gated call is filed with the broker (``client``, default
+    :meth:`~levain.consent.broker_client.BrokerClient.from_env`), held up to ``hold`` for a decision the broker
+    verified (:func:`decision_output`), and at the end of the hold denied with :func:`undecided_output`, its gap
+    named by the request id. Anything else once the call is gated (a settings file naming the socket variable,
+    :func:`queue_socket_planted`; no socket or cap; no broker account, or a socket whose peer is not it; the broker
+    unreachable, refusing or out of shape) is :func:`could_not_run`'s deny. ``expected_uid``: as Claude Code's."""
+    from levain.consent import broker_client
+
+    if not isinstance(event, Mapping) or event.get("hook_event_name") != GATE_EVENT:
+        return None
+    missing = _missing_of(event)
+    if missing:
+        return _missing_output(missing)
+    tool_name, tool_input, cwd, session = event["tool_name"], event.get("tool_input", {}), event["cwd"], \
+        event["session_id"]
+    if tool_input is None:
+        tool_input = {}
+    try:
+        git_cache: dict[Any, Any] = {}   # one git budget for the call, its description included
+        tier = gate_class(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, git_cache=git_cache)
+        if tier is None:
+            return _slot_ungated(event, session, tool_name, tool_input, cwd, home=home, codex_dir=codex_dir,
+                                 git_cache=git_cache, client=client, hold=hold, expected_uid=expected_uid,
+                                 sleep=sleep, monotonic=monotonic)
+        what = _call_what(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, git_cache=git_cache)
+    except Exception:  # noqa: BLE001 - a call that cannot be classified is denied
+        return could_not_run("this call")
+    try:
+        if queue_socket_planted(cwd, home=home, codex_home=codex_dir):
+            return could_not_run(what)
+        client = client if client is not None else broker_client.BrokerClient.from_env(expected_uid=expected_uid)
+        tool_use_id = event.get("tool_use_id")
+        request = broker_client.gate_request(
+            agent=AGENT, session=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
+            event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None,
+            tier=AGENT_CONFIG_TIER, hold=hold)
+        decision = broker_client.file_and_hold(client, request, hold, poll=GATE_POLL, sleep=sleep,
+                                               monotonic=monotonic)
+    except Exception:  # noqa: BLE001 - fail closed: the broker down, refusing or malformed is a deny
+        return could_not_run(what)
+    if decision is None:
+        return undecided_output(tier, what, request.id)
+    return decision_output(decision, SLOT_HOW)
+
+
+def _slot_ungated(event: Mapping[str, Any], session: str, tool_name: str, tool_input: Any, cwd: str, *,
+                  home: Path | None, codex_dir: Path | None, git_cache: dict[Any, Any], client: Any, hold: float,
+                  expected_uid: int | None, sleep: Callable[[float], None],
+                  monotonic: Callable[[], float]) -> dict[str, Any] | None:
+    """Claude Code's :func:`levain.consent.adapters.claude_code._slot_ungated`, in Codex's words: a file write
+    (:data:`PATCH_TOOL`) is sent with its member or with none; ``None`` (the mode decides) for any other call or on
+    GO only; any failure, the member that cannot be read included, is :func:`could_not_run`'s deny."""
+    from levain.consent import broker_client
+
+    def what() -> str:
+        try:
+            return _call_what(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, git_cache=git_cache)
+        except Exception:  # noqa: BLE001 - a call that cannot be described is still denied
+            return "this call"
+
+    try:
+        member = broker_client.grant_member(AGENT, tool_name, tool_input, cwd)
+        if member is None and tool_name != PATCH_TOOL:
+            return None
+        if queue_socket_planted(cwd, home=home, codex_home=codex_dir):
+            return could_not_run(what())
+        tool_use_id = event.get("tool_use_id")
+        got = broker_client.file_ungated(
+            client, member=member, agent=AGENT, session=session, tool_name=tool_name, tool_input=tool_input,
+            cwd=cwd, event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None, hold=hold,
+            poll=GATE_POLL, expected_uid=expected_uid, sleep=sleep, monotonic=monotonic)
+        if got[0] == broker_client.GO:
+            return None
+        decision, request_id = got
+    except Exception:  # noqa: BLE001 - fail closed, as a gated call: the broker down, refusing or malformed
+        return could_not_run(what())
+    if decision is None:
+        return undecided_output("reversible", what(), request_id)
+    return decision_output(decision, SLOT_HOW)
+
+
+def _slot_main(stdin: IO[str], stdout: IO[str], *, expected_uid: int | None = None) -> int:
+    """:func:`main` in a slot session: no ConsentQueue, no settings file, no ledger. Always exits 0. A stdin that
+    is not a JSON object is :func:`could_not_run`'s deny (Claude Code's :func:`_slot_main` says why)."""
+    event: Any = None
+    try:
+        event = json.loads(stdin.read())
+        if not isinstance(event, Mapping):
+            raise ValueError("the hook event is not a JSON object")
+        out = slot_gate(event, expected_uid=expected_uid) if event.get("hook_event_name") == GATE_EVENT \
+            else None   # a PermissionRequest in a slot: no decision
+        if out is not None:
+            stdout.write(json.dumps(out) + "\n")
+            stdout.flush()
+    except BaseException as exc:  # noqa: BLE001 - every failure is no decision, never allow; a gated one a deny
+        if not isinstance(event, Mapping) or event.get("hook_event_name") == GATE_EVENT:
+            try:
+                stdout.write(json.dumps(could_not_run("this call")) + "\n")
+                stdout.flush()
+            except BaseException:
+                pass
+        try:
+            print(f"levain consent hook: no decision ({type(exc).__name__}: {exc})"[:500], file=sys.stderr)
+        except Exception:
+            pass
+    return 0
 
 
 def _queue_for(queue_dir: Path, settings: AdapterSettings) -> ConsentQueue:
@@ -709,12 +866,16 @@ def _queue_for(queue_dir: Path, settings: AdapterSettings) -> ConsentQueue:
 def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO[str] | None = None) -> int:
     """The hook entry point, for both events the one script is wired to: ``PermissionRequest`` (:func:`decide`)
     and ``PreToolUse`` (:func:`gate`). Always exits 0 (any other exit fails open on Codex). A PermissionRequest
-    prints a decision only when the core verified one; a PreToolUse whose gate raised prints :func:`gate_failed`."""
+    prints a decision only when the core verified one; a PreToolUse whose gate raised prints :func:`gate_failed`. In
+    a slot session (:func:`levain.consent.broker_client.in_slot`) it is :func:`_slot_main` instead, and opens no
+    queue."""
     stdin = stdin if stdin is not None else sys.stdin
     stdout = stdout if stdout is not None else sys.stdout
     event: Any = None
     queue_dir: Path | None = None
     settings = AdapterSettings()
+    if in_slot():
+        return _slot_main(stdin, stdout)
     try:
         parser = argparse.ArgumentParser(prog="levain-consent-codex")
         parser.add_argument("--queue-dir", default=None)
