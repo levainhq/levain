@@ -21,7 +21,7 @@ from levain.slot import runtime_helper as RH
 from levain.slot import stage as ST
 from levain.slot import supervisor as SV
 from tests.test_slot_s2fx3_supervisor import rig
-from tests.test_slot_s2s_supervisor import bounded
+from tests.test_slot_s2s_supervisor import bounded, isolated_git  # noqa: F401 - autouse: CI has no ~/.gitconfig identity
 
 REPO = Path(__file__).resolve().parents[1]
 SECRETS = {"GH_TOKEN": "ghp_secret", "AWS_SECRET_ACCESS_KEY": "aws", "ANTHROPIC_API_KEY": "sk", "FOO_BAR": "x"}
