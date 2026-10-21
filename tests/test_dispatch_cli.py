@@ -1019,12 +1019,12 @@ def test_a_dash_leading_capability_is_never_minted_and_an_old_one_parses_with_eq
     monkeypatch.setattr(djobs.secrets, "token_urlsafe", lambda n=None: next(minted, None) or real(n))
     job, cap = lw.verified()
     assert cap == "B" * 43
-    old = "-" + "C" * 42                    # the shape 0.11.12/0.11.13 could have minted and kept
+    old = "-" + "C" * 42                    # the shape 0.11.10-0.11.13 could have minted and kept
     with pytest.raises(SystemExit):
         run(capsys, "recommend", job.id, "--capability", old, "--dispatch-dir", str(lw.ddir))
     assert "expected one argument" in capsys.readouterr().err
     # the = form reaches the store's own check (this one is not the job's, so it is refused there, by name)
     code, out, err = run(capsys, "recommend", job.id, f"--capability={old}", "--dispatch-dir", str(lw.ddir))
-    assert code == 2 and "expected one argument" not in err and "capability" in (out + err).lower(), (out, err)
+    assert code == 2 and f"that capability is not job {job.id}'s" in out + err, (out, err)
     code, out, _ = run(capsys, "recommend", job.id, f"--capability={cap}", "--dispatch-dir", str(lw.ddir))
     assert code == 0, out

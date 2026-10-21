@@ -894,7 +894,7 @@ class JobStore:
             capability = secrets.token_urlsafe(32)
             while capability.startswith("-"):
                 # a value that starts with "-" reads as an option to argparse, so `--capability <it>` would be
-                # refused; a capability 0.11.12/0.11.13 minted that way is reached with `--capability=<it>`
+                # refused; a capability 0.11.10-0.11.13 minted that way is reached with `--capability=<it>`
                 capability = secrets.token_urlsafe(32)
             conn.execute(f"INSERT INTO jobs ({_JOB_COLS}, capability_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                          (job_id, digest, text, stamp, filer_session, idem_key, parsed.repo, parsed.expires_at,

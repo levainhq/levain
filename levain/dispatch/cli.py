@@ -276,12 +276,12 @@ def planner_session(agent: str | None, session: str | None) -> tuple[str | None,
         if agent is not None and agent != detected_agent:
             raise InputRefused(f"--agent {_safe(agent)[:40]!r} is not the agent this process runs under "
                                f"({detected_agent}, from its process or environment); a job filed by another agent "
-                               "is reached with --capability")
+                               "is reached with --capability=<capability>")
         if session is not None and session != detected_session:
             shown = "none" if detected_session is None else repr(_safe(detected_session)[:80])
             raise InputRefused(f"--session {_safe(session)[:80]!r} is not this session ({shown}, from "
                                f"{detected_agent}'s environment); a job filed in another session is reached with "
-                               "--capability")
+                               "--capability=<capability>")
         agent, session = detected_agent, detected_session
     session = caps.NO_SESSION if session is None else session
     return agent, session if caps.session_problem(session) is None else caps.NO_SESSION

@@ -43,7 +43,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   Levain 0.11.13 refuses to open the store, so do not downgrade.
 
 ### Fixed
-- **A job's capability no longer starts with `-`.** About one in 64 capabilities that 0.11.12 and 0.11.13 handed a
+- **A job's capability no longer starts with `-`.** About one in 64 capabilities that 0.11.10 to 0.11.13 handed a
   planner began with a dash, and `--capability <it>` was refused as a missing value. New ones never do. A job filed
   before you upgrade is still reached with `--capability=<it>`, which the refusals and `--help` now show.
 
