@@ -166,7 +166,7 @@ def test_wire_args_checked(env, args, name):
 @pytest.mark.xfail(not hasattr(__import__("levain.qbroker.broker", fromlist=["x"]), "RUN_OPTIONAL_KEYS"),
                    strict=True, raises=AssertionError, reason="LAND ORDER (L3 r1 codex HIGH): this tree's broker takes exactly five run keys and reads a "
                            "repo_root answer as resolve-malformed; W2-c2 (seat/1020-44-w2c2) adds repo_root as optional. "
-                           "Unreachable on main: the default run_facts refuses run-unknown first.")
+                           "(This test seeds run_facts; in real use on main the default seam refuses run-unknown first.)")
 def test_dispatch_answer_resolves_through_the_brokers_own_client(env, resolver):
     to_rendered(env, S2)
     as_dispatch(env, S2)
