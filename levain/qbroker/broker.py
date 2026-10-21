@@ -26,8 +26,16 @@ as always and beside it the broker's own ``levain-queue-grant-allow/1`` row, and
 that row unless the operator's verified answer is there, which is read first and outranks it (his deny wins); such a
 row is not pending (it waits on no one), but it is charged to the quota like any other. Anything the grant cannot
 decide files the request as today, for the operator; a run CONTROL names without ``repo_root`` resolves as before
-and never takes a grant. A replay never re-decides. The cap is hashed on arrival and never logged or
-written. Stdlib only.
+and never takes a grant. A replay never re-decides.
+
+UNGATED CALLS (W2-c3, head ruling 1020+49). The slot hook's gate files only agent config; a grantable call it does not
+gate (a Write inside the repository) is sent with its member and ``"ungated": true`` so a dispatch run can grant it.
+Outside a dispatch session such a REQUEST is answered ``{"go": true}`` and NOTHING is written (no row, no quota): GO IS
+NOT ALLOW. It means "the session's own permission mode decides, as before the broker was asked", so a frame Bash forges
+with the flag gains no write authority, only what its shell already has. ``ungated`` is ignored (the call is filed as
+any other) when the frame has no member or the broker's own reading (:func:`levain.qbroker.grants.agent_config_path`)
+says a path is agent config: gated wins. In a dispatch session the flag changes nothing: granted, or filed pending.
+The cap is hashed on arrival and never logged or written. Stdlib only.
 """
 from __future__ import annotations
 
@@ -281,6 +289,11 @@ class Broker:
             if why is not None:
                 log.info("qbroker: grant member refused on slot %d: %s", slot, why)
                 return wire.refusal(rid, "grant-digest-mismatch")
+        if "ungated" in message and message["ungated"] is not True:
+            return wire.refusal(rid, "request-malformed")
+        if message.get("ungated") is True and member is not None and who.kind != "dispatch" \
+                and grants.agent_config_path(member["paths"], request.cwd) is None:
+            return wire.answer(rid, go=True)   # go is not allow: the mode decides; nothing is written
         row: dict[str, Any] = {"format": REQUEST_ROW_FORMAT, "queue_id": self._store.queue_id,
                                "request": request.fields(), "session": who.session, "slot": slot_ref(slot), "kind": who.kind}
         if who.run is not None:

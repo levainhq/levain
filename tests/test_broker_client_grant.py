@@ -9,12 +9,14 @@ run's ``repo_root``, and a real Broker behind real SlotListeners (the real peer-
 dispatch session, slot 2 an interactive one. The hook is the adapters' ``slot_gate``, in process. Holds are short
 here; the run held the real DEFAULT_GATE_HOLD.
 
-The slot gate files only the calls ``gate_class`` gates (agent config and hooks), so the write list here names
-agent-config files, as the run's does.
+The head ruling 1020+49 (A'): a grantable call the gate does not gate is sent ``ungated`` with its member; the
+broker answers GO outside a dispatch session (nothing written; GO is not allow), grants or queues it inside one; agent
+config is never granted, and a forged ungated frame for one is filed as gated.
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -44,11 +46,11 @@ from tests.test_qbroker import bound_gid, write_answer
 ME = os.getuid()
 CAP = "cap-w2c3"
 HOLD = 1.5
-WRITE = [".claude/agents/helper.md", ".claude/agents/old.md", ".codex/hooks.json", "src/a.py"]
+WRITE = [".claude/agents/helper.md", ".claude/settings.json", "src/a.py", "src/new.py"]
 # the recorded Claude Code Write input (1019-dispatch legB) and a Codex apply_patch (the run's)
 CC_CONTENT = "probe two"
-CX_ADD = "*** Begin Patch\n*** Add File: .codex/hooks.json\n+{}\n*** End Patch\n"
-CX_NOT_TOTAL = "*** Begin Patch\n*** Add File: .codex/hooks.json\n+{}\n*** Frobnicate: x\n*** End Patch\n"
+CX_ADD = "*** Begin Patch\n*** Add File: src/new.py\n+x = 1\n*** End Patch\n"
+CX_NOT_TOTAL = "*** Begin Patch\n*** Add File: src/new.py\n+{}\n*** Frobnicate: x\n*** End Patch\n"
 
 
 class Clock:
@@ -102,12 +104,7 @@ def world(tmp_path_factory):
     body = canonical_bytes(snap)
     (L / "policy" / "allowed_signers.json").write_bytes(body)
     (L / "policy" / "allowed_signers.json.sig").write_text(keys["trust"].sign(body, "levain-allowed-signers"))
-    repo, _ = make_repo(tmp / "src")
-    (repo / ".claude" / "agents").mkdir(parents=True)
-    (repo / ".claude" / "agents" / "old.md").write_text("old agent\n")
-    git(repo, "add", ".claude/agents/old.md")
-    git(repo, "commit", "-q", "-m", "an agent file")
-    base = git(repo, "rev-parse", "HEAD")
+    repo, base = make_repo(tmp / "src")
     clock = Clock(now - timedelta(minutes=2))
     store = JobStore(_mk(tmp / "dispatch", 0o700), clock=clock, published_dir=L / "contracts")
     # provider anthropic: the test policy lets it read ** (openrouter may not read .claude/)
@@ -203,12 +200,12 @@ ALLOW = {"cc": cc._pre("allow", f"levain: allowed by {cc.SLOT_HOW}."),
 
 def test_the_member_is_grant_pys_paths_and_the_input_hash(world):
     root = world["root"]
-    ti = {"file_path": f"{root}/.claude/agents/helper.md", "content": CC_CONTENT}
+    ti = {"file_path": f"{root}/src/a.py", "content": CC_CONTENT}
     assert broker_client.grant_member("claude_code", "Write", ti, root) == {
-        "paths": [f"{root}/.claude/agents/helper.md"], "input": value_sha256(ti)}
+        "paths": [f"{root}/src/a.py"], "input": value_sha256(ti)}
     patch = {"command": CX_ADD}
     assert broker_client.grant_member("codex", "apply_patch", patch, root) == {
-        "paths": [f"{root}/.codex/hooks.json"], "input": value_sha256(patch)}
+        "paths": [f"{root}/src/new.py"], "input": value_sha256(patch)}
 
 
 @pytest.mark.parametrize("agent,tool,tool_input", [
@@ -236,7 +233,7 @@ def test_a_member_that_cannot_be_computed_is_no_member(monkeypatch):
 
 def test_the_sealed_digest_is_the_one_the_broker_recomputes(world):
     root = world["root"]
-    ti = {"file_path": f"{root}/.claude/agents/helper.md", "content": CC_CONTENT}
+    ti = {"file_path": f"{root}/src/a.py", "content": CC_CONTENT}
     member = broker_client.grant_member("claude_code", "Write", ti, root)
     req = broker_client.gate_request(agent="claude_code", session="s", tool_name="Write", tool_input=ti, cwd=root,
                                      event_id="e", tier="T3", hold=5, grant=member)
@@ -268,71 +265,162 @@ def test_the_member_rides_beside_request_and_only_when_there_is_one(monkeypatch)
 
 # --- the run's cases, through the slot gate ----------------------------------------------------------------------
 
+def no_rows(q):
+    return rows(q) == [] and not list((q / "requests").glob("grant-*.json"))
+
+
+@pytest.mark.parametrize("adapter", ["cc", "codex"])
+def test_an_ungated_write_in_an_interactive_session_gets_go_and_nothing_is_written(adapter, world, slots):
+    slots["use"](2)
+    root = world["root"]
+    event = cc_write(root, "src/a.py") if adapter == "cc" else cx_patch(root, CX_ADD)
+    assert gate(adapter, event, slots) is None
+    assert no_rows(slots["q"])
+
+
 @pytest.mark.parametrize("adapter", ["cc", "codex"])
 def test_a_write_list_file_in_a_dispatch_session_is_allowed_with_no_answer(adapter, world, slots):
     root = world["root"]
-    event = cc_write(root, ".claude/agents/helper.md") if adapter == "cc" else cx_patch(root, CX_ADD)
+    event = cc_write(root, "src/a.py") if adapter == "cc" else cx_patch(root, CX_ADD)
     sleeps = []
     assert gate(adapter, event, slots, sleep=sleeps.append) == ALLOW[adapter]
     rid, row = only_row(slots["q"])
     assert row["kind"] == "dispatch" and row["request"]["tool_input_digest"].startswith("pb1:")
+    assert row["request"]["tier"] == broker_client.UNGATED_TIER
     assert granted(slots["q"], rid) and not (slots["q"] / "answers" / f"{rid}.json").exists()
     assert sleeps == []   # the first ANSWER? answered: no poll waited
 
 
-def test_an_edit_of_a_write_list_file_at_base_is_allowed(world, slots):
+def test_an_edit_of_a_write_list_file_is_allowed(world, slots):
     root = world["root"]
-    event = cc_write(root, ".claude/agents/old.md")
-    event.update(tool_name="Edit", tool_input={"file_path": f"{root}/.claude/agents/old.md", "old_string": "old",
-                                               "new_string": "new"})
+    event = cc_write(root, "src/a.py")
+    event.update(tool_name="Edit", tool_input={"file_path": f"{root}/src/a.py", "old_string": "a = 1",
+                                               "new_string": "a = 2"})
     assert gate("cc", event, slots) == ALLOW["cc"]
     rid, _ = only_row(slots["q"])
     assert granted(slots["q"], rid)
 
 
-def test_a_file_outside_the_write_list_is_pending_then_undecided_at_the_hold(world, slots):
-    out = gate("cc", cc_write(world["root"], ".claude/agents/other.md"), slots)
+def test_a_file_outside_the_write_list_is_pending_then_undecided_reversible(world, slots):
+    out = gate("cc", cc_write(world["root"], "src/b.py"), slots)
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert "UNDECIDED" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "continue" not in out    # the reversible tier: no hard stop
     rid, row = only_row(slots["q"])
     assert row["request"]["tool_input_digest"].startswith("pb1:") and not granted(slots["q"], rid)
 
 
-def test_an_interactive_session_files_the_member_as_a_pending_request(world, slots):
-    slots["use"](2)
-    out = gate("cc", cc_write(world["root"], ".claude/agents/helper.md"), slots)
-    assert "UNDECIDED" in out["hookSpecificOutput"]["permissionDecisionReason"]
+def test_agent_config_in_the_write_list_is_gated_and_never_granted(world, slots):
+    out = gate("cc", cc_write(world["root"], ".claude/settings.json"), slots)
+    assert "UNDECIDED" in out["hookSpecificOutput"]["permissionDecisionReason"] and out.get("continue") is False
     rid, row = only_row(slots["q"])
-    assert row["kind"] == "interactive" and row["request"]["tool_input_digest"].startswith("pb1:")
+    # the gated path: today's digest at the agent-config tier, no member
+    assert row["request"]["tool_input_digest"].startswith("jcs:") and row["request"]["tier"] == "T3"
     assert not granted(slots["q"], rid)
 
 
-def test_the_operators_answer_still_decides_a_pb1_request(world, slots):
-    """An interactive slot's request sealed with a pb1 digest is answered as any other: the answer binds the sealed
-    request, whatever its digest's scheme."""
-    slots["use"](2)
+def test_the_operators_answer_decides_a_queued_ungated_call(world, slots):
     state = {"done": False}
 
     def sleep(s):
         if not state["done"]:
             state["done"] = True
             rid, _ = only_row(slots["q"])
-            write_answer(slots["q"].parent, rid, world["keys"]["laptop"], decision="allow",
+            # write_answer writes under <its L>/queue: this fixture's queue is <tmp>/queue
+            write_answer(slots["q"].parent, rid, world["keys"]["laptop"], decision="deny",
                          signed_at=datetime.now(timezone.utc))
         time.sleep(s)
-    # write_answer writes under <L>/queue: this fixture's queue is <tmp>/queue
-    assert gate("cc", cc_write(world["root"], ".claude/agents/helper.md"), slots, hold=10.0,
-                sleep=sleep) == ALLOW["cc"]
+    out = gate("cc", cc_write(world["root"], "src/b.py"), slots, hold=10.0, sleep=sleep)
+    assert out == cc.decision_output("deny", cc.SLOT_HOW)
 
 
-def test_a_patch_not_read_whole_is_sealed_as_today_with_no_member(world, slots):
+def test_a_write_not_read_whole_is_not_sent(world, slots):
+    event = cc_write(world["root"], "src/a.py")
+    event["tool_input"]["mode"] = 1     # a key Write does not have
+    assert gate("cc", event, slots) is None
+    assert no_rows(slots["q"])
+
+
+def test_a_patch_not_read_whole_stays_gated_as_today_with_no_member(world, slots):
+    """Codex's gate tags a patch it cannot read whole (fail closed), so it is filed at the agent-config tier with
+    today's digest: never a member, never granted."""
     out = gate("codex", cx_patch(world["root"], CX_NOT_TOTAL), slots)
     assert "UNDECIDED" in out["hookSpecificOutput"]["permissionDecisionReason"]
     rid, row = only_row(slots["q"])
     assert row["request"]["tool_input_digest"] == "jcs:" + value_sha256({"command": CX_NOT_TOTAL})
+    assert row["request"]["tier"] == "T3" and not granted(slots["q"], rid)
+
+
+@pytest.mark.parametrize("adapter", ["cc", "codex"])
+def test_an_ungated_grantable_call_with_the_broker_down_is_denied(adapter, world, slots, monkeypatch):
+    """Fail closed (head ruling 1020+49): only an explicit GO lets the mode decide."""
+    monkeypatch.setenv(broker_client.SOCKET_ENV, "/tmp/levain-no-such-broker.sock")
+    root = world["root"]
+    event = cc_write(root, "src/a.py") if adapter == "cc" else cx_patch(root, CX_ADD)
+    out = gate(adapter, event, slots)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and "could not run" in json.dumps(out)
+
+
+def test_a_forged_t2_frame_for_agent_config_by_path_gets_no_grant(world, slots):
+    """B' by PATH: sealed T2 for a .claude/agents/ file the signed write list names, the broker still refuses the grant."""
+    got = forge(world, slots, 1, ".claude/agents/helper.md")
+    rid, row = only_row(slots["q"])
+    assert got["request_id"] == rid and row["request"]["tier"] == "T2" and not granted(slots["q"], rid)
+
+
+def test_a_frame_sealed_at_the_agent_config_tier_gets_no_grant(world, slots):
+    got = forge(world, slots, 1, "src/a.py", tier="T3")
+    rid, _ = only_row(slots["q"])
+    assert got["request_id"] == rid and not granted(slots["q"], rid)
+
+
+# --- forged frames: what Bash holding the cap can get ------------------------------------------------------------
+
+_ABSENT = object()
+
+
+def forge(world, slots, slot, rel, *, member=True, ungated=True, tier="T2"):
+    slots["use"](slot)
+    root = world["root"]
+    ti = {"file_path": f"{root}/{rel}", "content": "forged"}
+    m = broker_client.grant_member("claude_code", "Write", ti, root)
+    req = broker_client.gate_request(agent="claude_code", session="forger", tool_name="Write", tool_input=ti,
+                                     cwd=root, event_id=None, tier=tier, hold=60, grant=m if member else None)
+    fields = req.fields()
+    fields.pop("id")
+    extra = {"grant": m} if member else {}
+    if ungated is not _ABSENT:
+        extra["ungated"] = ungated
+    return broker_client.BrokerClient.from_env(expected_uid=ME).call("REQUEST", request=fields, **extra)
+
+
+def test_a_forged_ungated_frame_gets_go_at_worst_and_writes_nothing(world, slots):
+    got = forge(world, slots, 2, "src/b.py")
+    assert set(got) == {"id", "ok", "go"} and got["go"] is True
+    assert no_rows(slots["q"])
+
+
+def test_a_forged_ungated_frame_for_agent_config_is_filed_as_gated(world, slots):
+    got = forge(world, slots, 2, ".claude/settings.json")
+    assert "request_id" in got and "go" not in got
+    rid, _ = only_row(slots["q"])
     assert not granted(slots["q"], rid)
 
 
-def test_an_ordinary_write_list_file_is_ungated_in_a_slot_and_files_nothing(world, slots):
-    assert gate("cc", cc_write(world["root"], "src/a.py"), slots) is None
-    assert rows(slots["q"]) == []
+def test_a_forged_ungated_frame_for_listed_agent_config_in_dispatch_is_never_granted(world, slots):
+    got = forge(world, slots, 1, ".claude/settings.json")
+    rid, row = only_row(slots["q"])
+    assert got["request_id"] == rid and row["kind"] == "dispatch" and not granted(slots["q"], rid)
+
+
+def test_ungated_without_a_member_is_ignored_and_filed(world, slots):
+    got = forge(world, slots, 2, "src/b.py", member=False)
+    assert "request_id" in got and len(rows(slots["q"])) == 1
+
+
+@pytest.mark.parametrize("value", [False, 1, "true", None])
+def test_an_ungated_flag_that_is_not_true_is_malformed(world, slots, value):
+    with pytest.raises(broker_client.BrokerError) as e:
+        forge(world, slots, 2, "src/b.py", ungated=value)
+    assert e.value.name == "request-malformed"
+    assert no_rows(slots["q"])
