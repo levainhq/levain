@@ -28,7 +28,7 @@ from levain.contracts.grammar import JSON_INT_MAX
 from levain.slot import Refused, write_all
 from levain.slot.grammar import SESSION_RE
 from levain.slot.ids import SlotId
-from levain.slot.render import DISCOVERY
+from levain.slot.render import _VAR_FOLDERS_RE, DISCOVERY
 from levain.slot.runtime_grammar import (AUTHS, HOOKS, KINDS, MAX_ROUTES, VENDORS, VerifierStep,
                                          _MODEL_RE, _ROUTE_ID_RE, _handle, _keys, _verifier_steps)
 
@@ -277,8 +277,9 @@ def has_mint_claims(claims: Mapping[str, object]) -> bool:
 ALLOC_IDENTITY_KEYS = frozenset({"format", "session", "slot", "lease_seq", "slot_rev", "slot_uid", "slot_gid",
                                  "child_uid", "class", "kind", "vendor", "auth", "operator_uid",
                                  "supervisor_uid", "staging_uid", "ticket", "ticket_facts", "netns",
-                                 "cgroup", "created_at", "boot_id"})
-ALLOC_IDENTITY_REQUIRED = ALLOC_IDENTITY_KEYS - {"child_uid", "ticket", "ticket_facts", "netns", "cgroup"}
+                                 "cgroup", "var_folders", "created_at", "boot_id"})
+ALLOC_IDENTITY_REQUIRED = ALLOC_IDENTITY_KEYS - {"child_uid", "ticket", "ticket_facts", "netns", "cgroup",
+                                                 "var_folders"}
 ALLOC_POLICY_KEYS = frozenset({"routes", "egress_routes", "model", "queue_grant", "hooks", "verifier_steps",
                                "front", "incarnation"})
 #: DECISION: render writes these together (step (2)), so an alloc holds all of them or none.
@@ -380,6 +381,9 @@ class Alloc:
     ticket_facts: Mapping[str, object] | None = None
     netns: str | None = None
     cgroup: str | None = None
+    #: macOS: the session's /private/var/folders paths (egress: the slot's; none class: the child's, then the
+    #: driver's), read once at prepare; every later phase reads them here (getconf AS the uid would re-create one).
+    var_folders: tuple[str, ...] | None = None
     policy: AllocPolicy | None = None
 
     def __post_init__(self) -> None:
@@ -404,6 +408,8 @@ def alloc_record(a: Alloc, *, check: bool = True) -> dict[str, object]:
             rec[k] = getattr(a, k)
     if a.ticket_facts is not None:
         rec["ticket_facts"] = dict(a.ticket_facts)
+    if a.var_folders is not None:
+        rec["var_folders"] = list(a.var_folders)
     p = a.policy
     if p is not None:
         rec.update(routes=list(p.routes), egress_routes=list(p.egress_routes), queue_grant=p.queue_grant,
@@ -458,6 +464,11 @@ def check_alloc(obj: object) -> Alloc:
     cgroup = obj.get("cgroup")
     if cgroup is not None and _match(cgroup, "alloc.cgroup", _ANY_RE) != cgroup_path(slot, session):
         raise Refused("bad-value", "alloc.cgroup is not the session's")
+    var_folders = None
+    if "var_folders" in obj:
+        var_folders = _str_list(obj["var_folders"], "alloc.var_folders", _VAR_FOLDERS_RE, 2)
+        if len(var_folders) != (2 if slot.slot_class == "none" else 1):
+            raise Refused("bad-value", "alloc.var_folders: one per uid the session runs")
     created_at = check_timestamp(obj["created_at"], "alloc.created_at")
     boot_id = _match(obj["boot_id"], "alloc.boot_id", _BOOT_ID_RE)
     policy = None
@@ -497,7 +508,8 @@ def check_alloc(obj: object) -> Alloc:
             verifier_steps=steps, front=front)
     return _alloc_unchecked(session=session, slot=slot, kind=kind, vendor=vendor, auth=auth,
                             created_at=created_at, boot_id=boot_id, child_uid=child_uid, ticket=ticket,
-                            ticket_facts=facts, netns=netns, cgroup=cgroup, policy=policy, **ints)
+                            ticket_facts=facts, netns=netns, cgroup=cgroup, var_folders=var_folders, policy=policy,
+                            **ints)
 
 
 def _alloc_unchecked(**kw) -> Alloc:

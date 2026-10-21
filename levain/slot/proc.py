@@ -39,12 +39,14 @@ import errno
 import os
 import signal
 import struct
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 from levain.firing.hands import HostOS
+from levain.launch import child_env
 from levain.slot import Refused, write_all
 from levain.slot.wall import CGROUP_ROOT, drop_and_assert
 
@@ -124,6 +126,8 @@ class ProcSeams:
     sleep: Callable[[float], None] = time.sleep
     self_uids: Callable[[], tuple[int, ...]] = _self_uids
     self_pid: Callable[[], int] = os.getpid
+    #: macOS: end the uid's per-user launchd domain (:func:`darwin_bootout`); ``None`` elsewhere.
+    domain_out: Callable[[int], None] | None = None
 
 
 def check_target(uid: object, seams: ProcSeams) -> int:
@@ -327,11 +331,16 @@ def end_seams(host: HostOS, cgroup: str | None = None, seams: ProcSeams | None =
 def scrub(slot_uid: int, gw_uid: int, child_uid: int | None = None, *, seams: ProcSeams | None = None,
           bound_s: float = V12_SECONDS) -> None:
     """§7.3 SCRUBBED: ``SIGKILL`` every process of ``gw_uid`` (one front per slot, so the uid alone names
-    it), then require that none of ``slot_uid``, ``gw_uid`` and ``child_uid`` owns a process; else
-    ``Refused("scrub-processes-remain:<uid>")`` naming the first that does, and the slot stays leased."""
+    it), then (macOS) end each uid's launchd domain, then require that none of ``slot_uid``, ``gw_uid`` and
+    ``child_uid`` owns a process; else ``Refused("scrub-processes-remain:<uid>")`` naming the first that does,
+    and the slot stays leased. The domain goes after END's kill, so it also takes the per-user agents launchd
+    started for the uid while END ran."""
     u = UidProcs(seams)
     uids = [check_target(x, u.seams) for x in (slot_uid, gw_uid) + ((child_uid,) if child_uid is not None else ())]
     u.kill(gw_uid, bound_s)        # its answer is the proof below, not this sweep's bool
+    if u.seams.domain_out is not None:
+        for x in uids:
+            u.seams.domain_out(x)
     for x in uids:
         if not u.no_process(x):
             raise Refused(f"scrub-processes-remain:{x}", "a process of the uid survived")
@@ -526,7 +535,22 @@ def darwin_seams() -> ProcSeams:
     named is not narrowed, it is gone)."""
     lp = _LibProc()
     return ProcSeams(listing=lp.listing, probe=lp.probe, pin=_never_pin, send=_never_send,
-                     signal_uid=signal_as_uid)
+                     signal_uid=signal_as_uid, domain_out=darwin_bootout)
+
+
+def darwin_bootout(uid: int) -> None:
+    """``launchctl bootout user/<uid>``, as root: ends the uid's per-user launchd domain and every agent in it
+    (lsd, trustd, distnoted, secd), which launchd otherwise keeps for the uid after END's kill
+    [measured: levain-memory runs/s2-macos/RESULT_D1D2.md X2 + X6, 2026-10-20]. It answers nothing: the process
+    scan after it is the proof, so a failed or timed-out bootout only leaves that scan to refuse. Never use
+    ``launchctl print user/<uid>`` as a check: it re-creates an empty domain (same file, X3)."""
+    if type(uid) is not int or uid <= 0:
+        raise Refused("bad-target-uid", repr(uid))
+    try:
+        subprocess.run(["/bin/launchctl", "bootout", f"user/{uid}"], capture_output=True, cwd="/", env=child_env(),
+                       timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def default_seams(host: HostOS | None = None) -> ProcSeams:
@@ -537,4 +561,4 @@ def default_seams(host: HostOS | None = None) -> ProcSeams:
 __all__ = ["CgroupProcs", "POLL_FIRST_S", "POLL_MAX_S", "Proc", "ProcSeams", "RUN", "SIGNAL_SENT", "STOP", "UNKNOWN",
            "UidProcs", "V12_SECONDS", "ZOMBIE", "check_target", "darwin_seams", "default_seams", "end_seams",
            "linux_listing", "linux_probe", "linux_seams", "parse_bsdinfo", "parse_linux_proc", "scrub",
-           "signal_as_uid", "signal_checked", "signal_child"]
+           "signal_as_uid", "signal_checked", "signal_child", "darwin_bootout"]

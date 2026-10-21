@@ -391,12 +391,13 @@ def _note(msg: str) -> None:
 
 def end_facts(ctx: H.Ctx, a: R.Alloc) -> E.EndFacts:
     """END's facts from alloc. DECISION (macOS): the ``/var/folders`` END retains is the session owner's (egress:
-    the slot; verifier: the child, who owns its work)."""
+    the slot; verifier: the child, who owns its work), alloc's first ``var_folders`` path, read at prepare: END
+    never asks getconf, which runs as the uid and would re-create a dir END already moved (D1)."""
     var = None
     if ctx.seams.host == "darwin":
-        owner = a.slot_uid if a.slot.slot_class == "egress" else a.child_uid
-        assert owner is not None
-        var = Path(ctx.seams.var_folders(owner, owner))
+        if a.var_folders is None:
+            raise Refused("var-folders-unknown", a.session)
+        var = Path(a.var_folders[0])
     return E.facts_from_alloc(R.alloc_record(a), store=ctx.store.path, var_folders=var)
 
 
