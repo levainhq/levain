@@ -272,3 +272,63 @@ def test_a_regenesis_keeps_the_teams_presence_rule(tmp_path) -> None:
                                cwd=tmp_path / "origin.git").split() if b.startswith("levain-team-ledger-")]
     assert len(branches) == 1
     assert "allow_file_keys = false" in git("show", f"{branches[0]}:team.toml", cwd=tmp_path / "origin.git")
+
+
+def _held_ruling_behind_an_ack(tmp_path, monkeypatch, *, mixed: bool) -> Path:
+    """ana's file-key team refuses file keys; offline: a ruling with no presence, then an ack (in ONE commit with
+    `member remove ben` when ``mixed``), then a second ack; synced once with the rule on."""
+    from levain.team import entry as E
+    from levain.team import transport as TR
+    from levain.team.ledger_api import open_ledger
+    for k in ("k", "kb"):
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"{k}@test", "-f", str(tmp_path / k)],
+                       check=True, capture_output=True)
+    ana = project(tmp_path)
+    assert team("init", "--project", "p", "--owner", "ana", "--member", "ana=ana@ex.com", "--member",
+                f"ben=ben@ex.com={tmp_path / 'kb.pub'}", "--allow-file-keys", "--signing-key", str(tmp_path / "k.pub"),
+                repo=ana) == 0
+    assert record(ana, "first") == 0
+    assert team("file-keys", "refuse", repo=ana) == 0
+    rid = open_ledger(TR.Repo.discover(ana)).ledger().in_force[0]["id"]
+    for e in (E.build("ana", "decision", kind="ruling", owner="ana", paths=["a.py"], words="bypassed", agent="human"),
+              E.build("ana", "ack", refs=[rid], session="s", agent="claude-code", summary="ack one")):
+        gl = open_ledger(TR.Repo.discover(ana))
+        gl.append(e, push=False)       # the writer's check off, as the suite runs
+    if mixed:
+        # the ack's line left staged and committed WITH the team change: one own signed commit holding both
+        git("reset", "-q", "--soft", "HEAD^", cwd=gl.wt)
+        with monkeypatch.context() as m:
+            m.setattr(TR.GitLedger, "_recover_dirty", lambda self: None)
+            assert team("member", "remove", "ben", "--no-push", repo=ana) == 0
+        assert "team.toml" in git("show", "--name-only", "--format=", "HEAD", cwd=gl.wt)
+    open_ledger(TR.Repo.discover(ana)).append(
+        E.build("ana", "ack", refs=[rid], session="s", agent="claude-code", summary="ack two"), push=False)
+    monkeypatch.setattr(tenure, "_REQUIRE_PRESENCE", True)
+    assert team("sync", repo=ana) == 0
+    return ana
+
+
+def test_a_commit_with_a_team_change_and_an_entry_behind_a_held_entry_loses_neither(tmp_path, monkeypatch) -> None:
+    # reproduced on db17b607 (teampres/fix3/repro_before.txt (M)): the mixed commit was stripped to its team change
+    # when the branch moved back past the held ruling, and its ack was on no branch and under no ref
+    ana = _held_ruling_behind_an_ack(tmp_path, monkeypatch, mixed=True)
+    published = git("log", "-p", "levain-team-ledger", cwd=tmp_path / "origin.git")
+    assert "ack one" in published and "ack two" in published and "bypassed" not in published
+    assert "ben" not in git("show", "levain-team-ledger:team.toml", cwd=tmp_path / "origin.git").split("[members]")[-1]
+    assert "bypassed" in git("log", "-p", "--all", "--not", "levain-team-ledger", cwd=ana)
+    assert team("verify", repo=ana) == 0
+
+
+def test_a_held_entry_publishes_once_it_counts_after_a_later_entry_went_out_past_it(tmp_path, monkeypatch,
+                                                                                    capsys) -> None:
+    # reproduced on db17b607 (teampres/fix3/repro_before.txt (A)): ack two was re-sealed and published past the held
+    # ruling, so once the ruling counted its plain pick conflicted, and every sync kept it held with "could not be
+    # replayed"
+    ana = _held_ruling_behind_an_ack(tmp_path, monkeypatch, mixed=False)
+    monkeypatch.setattr(tenure, "_REQUIRE_PRESENCE", False)      # the policy now lets it count
+    capsys.readouterr()
+    assert team("sync", repo=ana) == 0
+    assert "could not be" not in capsys.readouterr().err
+    assert "bypassed" in git("log", "-p", "levain-team-ledger", cwd=tmp_path / "origin.git")
+    assert not git("for-each-ref", "refs/levain/held/", cwd=ana).strip()
+    assert team("verify", repo=ana) == 0
