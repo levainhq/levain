@@ -84,8 +84,9 @@
     // said once: after the linked card is signed or denied here the link goes without a note; otherwise it is let go
     // after three listings without it (a passing sign-side fault gets two more). A link opened mid-ceremony reloads
     // the page and the result shows on the reload
+    if (linked.length) focusMisses = 0;                                    // consecutive listings without it
     if (focus && !linked.length && !busy && (focusDone || ++focusMisses >= 3)) {
-      if (!focusDone)
+      if (!focusDone && !data.sign_note)
         $("status").textContent += " \u00b7 the linked sign request " + focus + " is not open here (signed, denied, expired or not filed)";
       focus = "";
     }
