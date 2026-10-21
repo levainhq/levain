@@ -163,10 +163,10 @@ def test_wire_args_checked(env, args, name):
         assert ans["refused"] == name
 
 
-@pytest.mark.skipif(not hasattr(__import__("levain.qbroker.broker", fromlist=["x"]), "RUN_OPTIONAL_KEYS"),
-                    reason="LAND ORDER (L3 r1 codex HIGH): this tree's broker takes exactly five run keys and reads a "
+@pytest.mark.xfail(not hasattr(__import__("levain.qbroker.broker", fromlist=["x"]), "RUN_OPTIONAL_KEYS"),
+                   strict=True, raises=AssertionError, reason="LAND ORDER (L3 r1 codex HIGH): this tree's broker takes exactly five run keys and reads a "
                            "repo_root answer as resolve-malformed; W2-c2 (seat/1020-44-w2c2) adds repo_root as optional. "
-                           "Runs once both are on one tree.")
+                           "Unreachable on main: the default run_facts refuses run-unknown first.")
 def test_dispatch_answer_resolves_through_the_brokers_own_client(env, resolver):
     to_rendered(env, S2)
     as_dispatch(env, S2)
@@ -194,7 +194,7 @@ def test_run_facts_are_relayed_from_one_snapshot(env):
     assert ans["ok"] and ans["run"]["contract_digest"] == FACTS["contract_digest"]
 
 
-@pytest.mark.parametrize("kw", [{"qbroker_uid": -5}, {"host": "freebsd"}])
+@pytest.mark.parametrize("kw", [{"qbroker_uid": -5}, {"host": "freebsd"}, {"host": []}])
 def test_bad_construction_refused(kw, tmp_path):
     with pytest.raises(C.Refused) as e:
         C.Control(C.StateStore(tmp_path), ROLE_UID["op"], **kw)
