@@ -25,8 +25,8 @@ What it enforces, in order, before any upstream byte:
    TLS session, and a later hello (after a HelloRetryRequest, or a renegotiation), are not seen (closing those
    needs interception).
 Only then does the front forward the hello and relay bytes both ways without reading them (end-to-end TLS). Each
-tunnel is logged at its close as host, address, route, whether the route is `subscription_passthrough`, and byte counts:
-never a request line, a header or a payload byte.
+tunnel is logged at its close as host, address, route, whether the route is `subscription_passthrough`, byte counts
+and how it ended: never a request line, a header or a payload byte.
 
 Why the address check lives here and not in the vendor sandbox: srt skips its resolved-address check on a
 parentProxy hop (plan §2b R-C(3)), so this proxy is the only place it can hold.
@@ -224,6 +224,8 @@ _REFUSED_NETS = tuple(ipaddress.ip_network(n) for n in (
     # translation, discard, Teredo, documentation, 6to4, ULA, link-local, site-local, multicast.
     "::/96", "::ffff:0:0/96", "::ffff:0:0:0/96", "64:ff9b:1::/48", "100::/64", "2001::/32", "2001:db8::/32",
     "2002::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
+    # IPv6 documentation (RFC 9637) and segment-routing SIDs (RFC 9602): not global on every Python's table.
+    "3fff::/20", "5f00::/16",
 ))
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 
@@ -582,7 +584,7 @@ class Front:
         _keepalive(writer)
         _keepalive(uwriter)
         self.live.add(uwriter)
-        counts = {"up": 0, "down": 0}
+        counts: dict = {"up": 0, "down": 0}   # byte counts, plus "end" once the relay has finished
         relaying = False
         try:
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -609,9 +611,13 @@ class Front:
             uwriter.close()
             self.live.discard(uwriter)
             if relaying:   # also on cancellation (shutdown): a tunnel that carried bytes is never left out of the log
+                # end: how the relay ended; "aborted" = the relay never reported an end (this task was cancelled,
+                # or forwarding the hello failed). Shutdown closes the streams first, so a tunnel open then
+                # usually ends "broken".
                 self._log({"event": "tunnel", "route": route.route, "passthrough": route.passthrough,
                            "host": route.host, "port": port, "address": addr,
-                           "bytes_up": counts["up"], "bytes_down": counts["down"]})
+                           "bytes_up": counts["up"], "bytes_down": counts["down"],
+                           "end": counts.get("end", "aborted")})
 
     async def _open_upstream(self, route: ConnectRoute, port: int):
         try:
@@ -649,12 +655,14 @@ class Front:
         loop = asyncio.get_running_loop()
         last = [loop.time()]
 
-        async def pump(src: asyncio.StreamReader, dst: asyncio.StreamWriter, key: str) -> bool:
+        async def pump(src: asyncio.StreamReader, dst: asyncio.StreamWriter, key: str) -> str:
+            """-> how this direction ended: "eof" (cleanly), "idle", "broken" (an OSError), or "error:<type>" for
+            anything else raised while copying, which is recorded instead of escaping as an unhandled exception."""
             try:
                 while True:
                     left = last[0] + IDLE_S - loop.time()
                     if left <= 0:
-                        return False   # the whole tunnel has been quiet for IDLE_S
+                        return "idle"   # the whole tunnel has been quiet for IDLE_S
                     try:
                         chunk = await asyncio.wait_for(src.read(_CHUNK), left)
                     except asyncio.TimeoutError:
@@ -667,16 +675,22 @@ class Front:
                     await dst.drain()
                 if dst.can_write_eof():
                     dst.write_eof()   # half-close: the other direction keeps flowing
-                return True
+                return "eof"
             except (OSError, asyncio.IncompleteReadError):
-                return False
+                return "broken"
+            except Exception as e:   # noqa: BLE001 - see the docstring
+                return f"error:{type(e).__name__}"
 
         tasks = {asyncio.ensure_future(pump(creader, uwriter, "up")),
                  asyncio.ensure_future(pump(ureader, cwriter, "down"))}
         try:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            if pending and all(t.result() for t in done):
+            ends = [t.result() for t in done]
+            if pending and all(e == "eof" for e in ends):
                 done, pending = await asyncio.wait(pending, timeout=HALF_CLOSE_S)
+                ends += [t.result() for t in done]
+            bad = [e for e in ends if e != "eof"]
+            counts["end"] = bad[0] if bad else ("half-close-timeout" if pending else "eof")
         finally:
             cwriter.close()
             uwriter.close()
@@ -697,7 +711,7 @@ class Front:
         deadline, drained = loop.time() + _DRAIN_S, 0
         try:
             while drained < _DRAIN_CAP and (left := deadline - loop.time()) > 0:
-                chunk = await asyncio.wait_for(reader.read(_CHUNK), timeout=left)
+                chunk = await asyncio.wait_for(reader.read(min(_CHUNK, _DRAIN_CAP - drained)), timeout=left)
                 if not chunk:
                     break
                 drained += len(chunk)
