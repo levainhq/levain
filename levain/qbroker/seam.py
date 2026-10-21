@@ -11,9 +11,10 @@ around that call, and nothing else:
 - namespaces: a snapshot signer lists the namespaces it may sign in; one that may not sign in
   ``levain-consent-answer`` is refused here, before the shared check (which has no such step).
 
-The receipts head: a broker request has no receipt log, so the head is checked for its shape only (what the
-shared check does; the apply-time ``head_refusal`` has no log to read here). The unchained answer format is never
-accepted (``unchained_ok`` stays off).
+The receipts head: the shared check reads its shape; a head of size 0 is refused here (it attests nothing: the
+empty tree's root is fixed). Whether it is a head of the broker's own receipts log is the apply-time
+``head_refusal``, run inside the write that records the decision (:meth:`levain.qbroker.receipts.Receipts.decided`).
+The unchained answer format is never accepted (``unchained_ok`` stays off).
 
 Stdlib only.
 """
@@ -60,5 +61,8 @@ def answer_refusal(row: Mapping[str, Any], payload: Any, signature: Any, signers
         signer = signers.key(payload.get("signer_fp"))
         if signer is not None and ANSWER_NAMESPACE not in signer.namespaces:
             return f"the signer may not sign in {ANSWER_NAMESPACE}"
-    return consent_queue.answer_refusal(request, row.get("queue_id"), payload, signature, signers,
-                                        ssh_keygen=ssh_keygen)
+    why = consent_queue.answer_refusal(request, row.get("queue_id"), payload, signature, signers,
+                                       ssh_keygen=ssh_keygen)
+    if why is None and payload["receipts_head"]["size"] == 0:
+        return "the answer's receipts head is of size 0: it attests nothing"
+    return why

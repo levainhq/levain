@@ -6,14 +6,17 @@ so its id is the sealed id; the row takes ``session``, ``slot``, ``kind`` and ``
 Filing the same sealed request again returns the row already there (before the clock and hold checks, which bound
 new rows only); a new row is refused ``queue-busy`` past :data:`PENDING_PER_SESSION` and ``quota-exhausted`` past
 the lifetime quota. ``ANSWER? {cap, request_id}`` reads the answer row for a request this session filed and returns
-``{decision}`` only when :func:`levain.qbroker.seam.answer_refusal` accepts it, else ``{pending}`` while nothing is
+``{decision}`` only when :func:`levain.qbroker.seam.answer_refusal` accepts it and the broker's own receipts
+(:mod:`levain.qbroker.receipts`) record the decision against the head the answer signed, else ``{pending}`` while nothing is
 there and the hold runs; polls past :data:`ANSWER_RATE` per slot are refused ``rate-limited`` (a REQUEST too, for about one token interval
 after polls drain the bucket: the consent hook treats ``rate-limited`` as pending and retries). A verdict is reused
 while the answer file and the signer snapshot are unchanged, and a resolve for :data:`RESOLVE_TTL` seconds, so a
 serial poll storm costs one verify and one CONTROL round trip; concurrent misses on a cold cache may each make
 the trip, bounded by the slot's rate (a REQUEST whose resolve misses the cache is charged to it too). One filing
 per request id runs at a time, so identical REQUESTs on several connections link one row and charge it once.
-No verb accepts an answer, a grant answer or a row from a hook. Every other op is ``verb-not-allowed``. The cap is hashed on arrival and never logged or
+Every transition the broker makes leaves one receipt in those receipts: filed (a new row), decided (the
+first accepted answer), expired (an ANSWER? past the hold with nothing decided). No verb accepts an answer, a grant
+answer or a row from a hook. Every other op is ``verb-not-allowed``. The cap is hashed on arrival and never logged or
 written. Stdlib only.
 """
 from __future__ import annotations
@@ -35,6 +38,7 @@ from levain.cockpit.firejournal import _TIER_NEEDS
 from levain.consent.away import MAX_HOLD
 from levain.consent.record import ExternalGateRequest
 from levain.qbroker import wire
+from levain.qbroker.receipts import Receipts
 from levain.qbroker.seam import answer_refusal, request_of
 from levain.qbroker.signers import SignersSnapshot, SignersSource
 from levain.qbroker.store import ANSWER_ROW_FORMAT, REQUEST_ROW_FORMAT, QueueStore, valid_request_id
@@ -133,8 +137,10 @@ class Broker:
                  monotonic: Callable[[], float] = time.monotonic,
                  ssh_keygen: Path | str | None = None, quota: int = QUOTA_PER_RUN,
                  pending_cap: int = PENDING_PER_SESSION, answer_rate: float = ANSWER_RATE,
-                 answer_burst: int = ANSWER_BURST, resolve_ttl: float = RESOLVE_TTL) -> None:
+                 answer_burst: int = ANSWER_BURST, resolve_ttl: float = RESOLVE_TTL,
+                 receipts: Receipts | None = None) -> None:
         self._store = store
+        self._receipts = receipts if receipts is not None else Receipts(store.root)
         self._resolver = resolver
         self._signers = signers
         self._clock = clock
@@ -260,6 +266,8 @@ class Broker:
             existing = self._store.read_request(request.id)
         if existing != row:
             return wire.refusal(rid, "request-exists")
+        if self._receipts.state(request.id) is None:      # the filing's receipt write failed: the re-file writes it
+            self._receipts.filed(request, utc_stamp(self._clock()))
         return wire.answer(rid, request_id=request.id, queue_id=self._store.queue_id)
 
     def _file(self, row: dict[str, Any], who: Resolved, request: ExternalGateRequest, now: str) -> str | None:
@@ -316,6 +324,8 @@ class Broker:
                 with self._mutex:
                     self._counts[key] -= 1
                     self._pending.get(who.session, {}).pop(request.id, None)
+        if linked:
+            self._receipts.filed(request, now)
         return None if linked else "request-exists"
 
     def _linked(self, row: dict[str, Any]) -> bool:
@@ -345,6 +355,8 @@ class Broker:
             return wire.refusal(rid, "no-such-request")
         now = self._clock()
         if request.expires_at <= utc_stamp(now):
+            if self._receipts.state(request_id) in (None, "pending"):
+                self._receipts.expired(request, utc_stamp(now))
             return wire.refusal(rid, "request-expired")
         try:
             got = self._store.read_answer_stamped(request_id)
@@ -362,7 +374,7 @@ class Broker:
         if hit is not None and hit[0] == identity and hit[1] is snapshot:
             decision = hit[2]
         else:
-            decision = self._verdict(row, request_id, answer, snapshot, now)
+            decision = self._verdict(row, request, answer, snapshot, now)
             with self._mutex:
                 self._verdicts[request_id] = (identity, snapshot, decision)
                 self._verdicts.move_to_end(request_id)
@@ -372,14 +384,22 @@ class Broker:
             return wire.refusal(rid, "answer-refused")
         return wire.answer(rid, decision=decision)
 
-    def _verdict(self, row: Mapping[str, Any], request_id: str, answer: Mapping[str, Any],
+    def _verdict(self, row: Mapping[str, Any], request: ExternalGateRequest, answer: Mapping[str, Any],
                  snapshot: SignersSnapshot | None, now: datetime) -> str | None:
-        """The verified decision ``answer`` carries, or ``None`` when it is not authority."""
+        """The verified decision ``answer`` carries, recorded in the broker's receipts (or recorded there already),
+        or ``None`` when it is not authority."""
+        request_id = request.id
         if set(answer) != _ANSWER_ROW_KEYS or answer["format"] != ANSWER_ROW_FORMAT:
             log.warning("qbroker: answer row for %s is not a %s row", request_id, ANSWER_ROW_FORMAT)
             return None
-        why = answer_refusal(row, answer["payload"], answer["signature"], snapshot, now, ssh_keygen=self._ssh_keygen)
+        payload = answer["payload"]
+        why = answer_refusal(row, payload, answer["signature"], snapshot, now, ssh_keygen=self._ssh_keygen)
+        if why is None:
+            # the apply: the head it signed must be a head of the broker's own receipts, inside the write that
+            # records the decision (a write failure raises: the poll is refused broker-error, nothing cached)
+            why = self._receipts.decided(request, payload["decision"], payload["signer_fp"],
+                                         payload["receipts_head"], utc_stamp(now))
         if why is not None:
             log.warning("qbroker: answer for %s refused: %s", request_id, why)
             return None
-        return answer["payload"]["decision"]
+        return payload["decision"]
