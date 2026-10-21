@@ -35,7 +35,7 @@ token (:func:`claim_spawn`); the primary key is the compare-and-set, so a second
 the service; an operator ``take`` holds the lease for ``LEASE_TTL`` unless told otherwise; your take or release is what
 "until you look" reads. (C3b, 1020+50): ``unset`` is checked after a live lease, a running coordinator and a pending
 launch (those still say what a drop would do), before the death count; a setting is a whole row, never a field
-update; codex is a value the table holds but :func:`set_agent` refuses until a codex launch is built. (C3b fix 1): a thread
+update. (C3c, 1021+18): :func:`set_agent` takes codex now that a codex launch is built. (C3b fix 1): a thread
 or drop write the fence lets through is recorded as a ``beat`` row by coordinator that moves nothing
 (:func:`record_write`), so "it wrote as coordinator" is one question over ``lease_events``. Stdlib only.
 """
@@ -58,8 +58,8 @@ __all__ = [
     "BACKOFF", "HARNESSES", "LAUNCH_KINDS", "LAUNCH_TTL", "LEASE_KINDS", "LEASE_SCHEMA", "LEASE_TTL", "MAX_DEATHS",
     "ROLES", "SERVICE_BEAT_WINDOW", "SETTING_AGENTS", "Launch", "Lease", "LeaseRefused", "Setting", "activate", "beat",
     "check_model", "claim", "by_harness_session", "claim_spawn", "end_launch", "end_unlisted", "fence", "launch",
-    "lease", "launches", "record_write", "release", "request_launch", "service_beat", "set_agent", "setting",
-    "status", "take", "unspawned", "wake", "wake_state",
+    "lease", "launches", "over_with_session", "record_write", "release", "request_launch", "service_beat",
+    "set_agent", "setting", "status", "take", "unspawned", "wake", "wake_state",
 ]
 
 LEASE_KINDS = ("claim", "beat", "release", "lapse", "takeover")
@@ -555,6 +555,17 @@ def _in_state(conn: sqlite3.Connection, state: str, role: str | None = None) -> 
     return [_launch_row(conn, "launch_id", r[0]) for r in rows.fetchall()]
 
 
+def over_with_session(conn: sqlite3.Connection, harness: str, *, limit: int = 20) -> list[Launch]:
+    """The newest ``limit`` launches of ``harness`` that went ``active`` (so recorded a harness session) and are over
+    (ended, failed, expired), newest first: what the watcher checks for a session still running."""
+    rows = conn.execute(
+        "SELECT l.launch_id FROM launches l WHERE l.harness = ? AND EXISTS (SELECT 1 FROM launch_events a WHERE "
+        "a.launch_id = l.launch_id AND a.kind = 'active') AND (SELECT e.kind FROM launch_events e WHERE e.launch_id = "
+        "l.launch_id ORDER BY e.seq DESC LIMIT 1) IN ('ended', 'failed', 'expired') ORDER BY l.gseq DESC LIMIT ?",
+        (harness, limit))
+    return [_launch_row(conn, "launch_id", r[0]) for r in rows.fetchall()]
+
+
 def _end_coordinators(conn: sqlite3.Connection, now: str, cause: str) -> None:
     for ln in _in_state(conn, "active", "coordinator"):
         _launch_event(conn, now, ln.launch_id, "ended", cause)
@@ -615,8 +626,6 @@ def set_agent(conn: sqlite3.Connection, now: str, agent: str, *, model: str | No
     (Claude Code keys a directory's trust on its real path); agent ``none`` takes neither model nor directory."""
     if agent not in SETTING_AGENTS:
         raise _refused(f"the coordinator agent is one of {', '.join(SETTING_AGENTS)}")
-    if agent == "codex":
-        raise _refused("a codex coordinator cannot be launched yet (only claude is built); set claude or none")
     if agent == "none":
         if model is not None or cwd is not None:
             raise _refused("agent none takes no --model and no --cwd")

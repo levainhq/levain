@@ -26,7 +26,8 @@ A launch row (:mod:`levain.coordinator.lease`) is what was asked for; this modul
   6. activation (:func:`levain.coordinator.lease.activate`). Refused (the lease was lost while it started): the
      session is stopped and the refusal returned.
 
-Only a coordinator launch is started (a worker's brief is not built). Once ``claude --bg`` returned 0, every way out
+A ``codex`` launch is started by :func:`levain.coordinator.codex_launch.launch` instead, the same shape over the user's
+Codex app-server daemon (C3c). Only a coordinator launch is started (a worker's brief is not built). Once ``claude --bg`` returned 0, every way out
 of 5-6 that does not leave the launch active stops the sessions listed under its name in its directory, a Ctrl-C
 included; a process killed outright leaves its launch to expire, and the watcher stops the session by name then. Only
 the spawn runs in the launch's directory: ``claude agents`` and ``claude stop`` run in the store's.
@@ -89,7 +90,7 @@ from levain.coordinator import lease as lease_mod
 from levain.coordinator.lease import LEASE_TTL, LeaseRefused
 from levain.coordinator.store import CoordError, CoordStore
 
-__all__ = ["BRIEF_DROPS", "HOOK_ROW", "READBACK_DELAY", "READBACK_TRIES", "UNLISTED_RECHECK", "Outcome", "brief_path",
+__all__ = ["BRIEF_DROPS", "WORKER_KINDS", "worker_kind", "HOOK_ROW", "READBACK_DELAY", "READBACK_TRIES", "UNLISTED_RECHECK", "Outcome", "brief_path",
            "default_coordinator_dir", "hook_live", "launch_session", "session_name", "setup_install", "trust_remedy",
            "watch", "watch_once"]
 
@@ -117,6 +118,22 @@ class Outcome:
     refusal: str | None = None
     remedy: str | None = None        # a command for you to run (the trust prompt), when one fixes the refusal
     harness_session_id: str | None = None
+
+
+WORKER_KINDS = ("dispatch", "session")
+
+
+def worker_kind(kind: str, requested: str | None = None) -> str | None:
+    """Which worker a thread of ``kind`` gets (RULED 5b: DISPATCH executors and full attachable sessions, chosen per
+    thread): None for a thread that is not WORK (T2: only WORK stays open, so nothing works it); else the kind you or
+    the coordinator asked for, ``session`` (a full attachable session, :func:`launch_session`'s shape) or
+    ``dispatch``; asked for nothing, ``dispatch``. [seat, C3c] the default is the executor: a full session is for a
+    thread you mean to open and type into, so it is asked for, never assumed."""
+    if requested is not None and requested not in WORKER_KINDS:
+        raise CoordError(f"a worker is one of {', '.join(WORKER_KINDS)}")
+    if kind != "work":
+        return None
+    return requested or "dispatch"
 
 
 def default_coordinator_dir() -> Path:
@@ -406,13 +423,18 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
     ln = store.launch(launch_id)
     if ln is None:
         return Outcome(str(launch_id)[:40], False, refusal=f"no launch {str(launch_id)[:40]!r}")
-    if ln.harness != "claude":
-        return Outcome(launch_id, False, refusal=f"launch {launch_id} is a {ln.harness} launch; only claude is built")
+    if ln.harness not in ("claude", "codex"):
+        return Outcome(launch_id, False, refusal=f"launch {launch_id} is a {ln.harness} launch; only claude and codex "
+                                                 "are built")
     if ln.role != "coordinator":
         return Outcome(launch_id, False, refusal=f"launch {launch_id} is a {ln.role} launch; the worker brief is not "
                                                  "built")
     if ln.state != "pending":
         return Outcome(launch_id, False, refusal=f"launch {launch_id} is {ln.state}, not pending")
+    if ln.harness == "codex":
+        from levain.coordinator import codex_launch
+
+        return codex_launch.launch(store, ln)
 
     def left(cause: str) -> Outcome:
         return Outcome(launch_id, False, refusal=_plain(f"{cause} (launch {launch_id} left pending, until {ln.until})"))
@@ -579,6 +601,8 @@ def watch_once(store: CoordStore) -> list[str]:
       (d) every listed session of a launch of THIS store that has ended, failed or expired is stopped,
           ``claude stop <id>``: matched by the ``sessionId`` its ``active`` row recorded, or by its name
           ``levain-<role>-<launch hex>`` naming such a launch (a session a failed or interrupted start left running).
+          The Codex launches get the same (b)-(d) through the Codex daemon
+          (:func:`levain.coordinator.codex_launch.watch_once`), run before this list is read;
           A pending launch's session is never stopped: its start may be in flight in another process. A session
           matched by name alone is stopped only when its row's ``cwd`` is that launch's realpath directory (a name is
           a string anyone can choose); every ``agents`` and ``stop`` call runs in the store's directory;
@@ -592,8 +616,9 @@ def watch_once(store: CoordStore) -> list[str]:
     # writes it expired, and only then does (d) stop the session it left
     store.coord_status()
     for ln in store.launches_unspawned():
-        if ln.harness != "claude":
-            lines.append(f"launch {ln.launch_id}: a {ln.harness} launch; only claude is built, left pending")
+        if ln.harness not in ("claude", "codex"):
+            lines.append(f"launch {ln.launch_id}: a {ln.harness} launch; only claude and codex are built, left "
+                         "pending")
             continue
         if ln.role != "coordinator":
             lines.append(f"launch {ln.launch_id}: a {ln.role} launch; the worker brief is not built, left pending")
@@ -603,6 +628,10 @@ def watch_once(store: CoordStore) -> list[str]:
                      else f"launch {got.launch_id} not started: {got.refusal}"
                           + (f" (run once: {got.remedy})" if got.remedy else ""))
     lines.extend(_remove_briefs(store))
+    from levain.coordinator import codex_launch
+
+    # the Codex launches are watched through the user's Codex daemon, before (and whatever) claude's list reads
+    lines.extend(codex_launch.watch_once(store))
     # the active launches are read BEFORE the list: a launch is active only after its read back saw it listed, so
     # every one read here was listed before the list below was taken, and a launch activated meanwhile is not judged
     active = [ln for ln in store.launches_active() if ln.harness == "claude" and ln.harness_session_id]

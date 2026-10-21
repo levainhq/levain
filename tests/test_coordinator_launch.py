@@ -354,8 +354,8 @@ def test_with_no_setting_a_drop_only_queues(qdir, fake):
 
 def test_the_setting_is_yours_and_append_only(qdir, workdir):
     store = CoordStore(qdir)
-    with pytest.raises(lease.LeaseRefused, match="only claude is built"):
-        store.coord_set_agent("codex", cwd=str(workdir))
+    with pytest.raises(lease.LeaseRefused, match="absolute path"):          # codex runs in a directory too (C3c)
+        store.coord_set_agent("codex", cwd="relative")
     with pytest.raises(lease.LeaseRefused, match="absolute path"):
         store.coord_set_agent("claude", cwd="relative")
     with pytest.raises(lease.LeaseRefused, match="no --model"):
