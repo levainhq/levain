@@ -175,6 +175,21 @@ def test_an_unusable_limits_directory_fails_closed_and_logs_once(L, resolver, cl
     assert [gate(make_broker(L, resolver, clock))["gate"]] == ["go"]   # no limits configured: never asked
 
 
+def test_a_counter_past_its_failure_bound_is_limits_failed_not_over_limit(L, resolver, clock):
+    # F3: the counter's fail_deny (kind None) was sent over-limit and rendered as a budget "reached its a limit"
+    from levain.consent import limits as consent_limits
+    d = L / "queue" / "requests" / qbroker.LIMITS_DIR
+    d.mkdir(mode=0o700)
+    (d / consent_limits.DB_NAME).mkdir()                 # a store that can never open
+    b = limited(L, resolver, clock, {"calls": 100})
+    got = [gate(b) for _ in range(consent_limits.FAIL_DENY_AFTER)]
+    assert [g["gate"] for g in got[:-1]] == ["go"] * (consent_limits.FAIL_DENY_AFTER - 1)   # bounded fail-open
+    assert got[-1]["gate"] == "limits-failed" and "limits store" in got[-1]["reason"]
+    text = broker_client.gate_check(Scripted([{"gate": "limits-failed", "reason": got[-1]["reason"]}]),
+                                    agent="claude_code", tool_name="Read", tool_input={}, tool_use_id=None)
+    assert "not a budget" in text and "limits.db" in text and "reached its" not in text
+
+
 def test_parallel_gates_draw_their_own_bucket_never_answer_s(L, resolver, clock):
     # F5 (s2b2_fix1_run/RUN_before.txt: a parallel batch past ANSWER_BURST was refused rate-limited and denied)
     import threading

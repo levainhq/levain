@@ -48,8 +48,9 @@ session is the resolve's, never the frame's.
   runs first) fed this call, kept in ``requests/limits/limits.db`` (:meth:`Broker._limits_dir`), keyed by the
   resolved session and the agent the frame names (its own hook's: it selects a count, never a lower one); the
   limits in force are ``limits(agent, session)``, the Broker's settings callable (default: none configured, every
-  call GO, nothing counted). A ``crossed``, ``halted`` or ``fail_deny`` verdict answers over-limit; ``ok`` and
-  ``not_counting`` (the counter's own bounded fail-open) answer GO. A counter directory that cannot be established
+  call GO, nothing counted). A ``crossed`` or ``halted`` verdict answers over-limit, ``fail_deny`` answers
+  ``limits-failed`` with the counter's reason (the store failed, not a budget: the operator repairs or moves the
+  limits database); ``ok`` and ``not_counting`` (the counter's own bounded fail-open) answer GO. A counter directory that cannot be established
   as the broker's own 0700 one answers ``limits-failed`` on every limited call (the counter could not even persist
   its failure count, so its fail-open would never end). Tokens are not counted in a slot (the frame
   carries no transcript path, and the broker reads none of the session's files). KNOWN EDGE: the Extend / End hold
@@ -171,7 +172,7 @@ _ANSWER_ROW_KEYS = frozenset({"format", "payload", "signature"})
 # here (claude_code / codex slot_gate, tier=AGENT_CONFIG_TIER), every reversible one at broker_client.UNGATED_TIER
 HALT_TIER = AGENT_CONFIG_TIER
 GATE_VERDICTS = ("go", "halted", "over-limit", "limits-failed")
-_GATE_OVER = frozenset({"crossed", "halted", "fail_deny"})
+_GATE_OVER = frozenset({"crossed", "halted"})
 _GATE_KEYS = frozenset({"v", "op", "id", "cap", "agent", "tool_name", "input_digest", "tool_use_id"})
 _GATE_REQUIRED = _GATE_KEYS - {"tool_use_id"}
 # the limits in force for (agent, resolved session), or None when none are configured (every call GO)
@@ -724,6 +725,8 @@ class Broker:
                                             tool_input=digest, limits=full)
         if verdict.state in _GATE_OVER:
             return wire.answer(rid, gate="over-limit", kind=verdict.kind)
+        if verdict.state == "fail_deny":
+            return wire.answer(rid, gate="limits-failed", reason=str(verdict.reason or "the limits store failed")[:512])
         return wire.answer(rid, gate="go")
 
     def _limits_dir(self) -> Path | None:
