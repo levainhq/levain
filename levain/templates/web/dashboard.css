@@ -49,8 +49,13 @@
     --ctl-row: 24px; --ctl-md: 28px; --hit-min: 44px;   /* --hit-min: the touch hit area (Apple HIG 44pt) */
     /* motion */
     --dur-micro: 120ms; --dur-expand: 160ms; --ease-out: cubic-bezier(0, 0, 0.38, 0.9);
-    /* ONE shadow, overlays only (modal, popover) */
+    /* ONE overlay shadow (modal, popover); controls and the glance take the material tokens below, never a second overlay shadow */
     --shadow-overlay: 0 12px 32px -8px rgb(0 0 0 / .6);
+    /* KN finish: the control material. A track is recessed (inner shade), a key is raised (lit top edge + a short cast shadow). */
+    --edge-hi: inset 0 1px 0 rgb(255 255 255 / .07); --recess: inset 0 1px 2px rgb(0 0 0 / .45);
+    --lift: 0 1px 2px rgb(0 0 0 / .45), 0 0 0 1px var(--hair-2);
+    --key-bg: linear-gradient(to bottom, color-mix(in oklch, var(--card-2), var(--contrast) 5%), var(--card-2));
+    --track-bg: color-mix(in oklch, var(--base), #000 18%);
     /* status: one each, none of them is the accent. A status shows as a dot plus neutral words. */
     --ok: oklch(0.78 0.14 155); --warn: oklch(0.84 0.13 90); --bad: oklch(0.70 0.17 25);
     /* AQI ramp (EPA bands) in the same system */
@@ -102,6 +107,8 @@
       --hue-7: oklch(0.629 0.2 300); --hue-8: oklch(0.555 0.179 32);
       --tag-mix: 45%; --glow-a: 0; --sky-star-a: .45; --sky-line-a: .10;
       --shadow-overlay: 0 12px 32px -8px rgb(20 30 60 / .25);
+      --edge-hi: inset 0 1px 0 rgb(255 255 255 / .9); --recess: inset 0 1px 2px rgb(20 30 60 / .10);
+      --lift: 0 1px 2px rgb(20 30 60 / .14), 0 0 0 1px var(--hair); --key-bg: var(--base); --track-bg: var(--card-2);
       color-scheme: light;
     }
   }
@@ -126,6 +133,8 @@
     --hue-7: oklch(0.629 0.2 300); --hue-8: oklch(0.555 0.179 32);
     --tag-mix: 45%; --glow-a: 0; --sky-star-a: .45; --sky-line-a: .10;
     --shadow-overlay: 0 12px 32px -8px rgb(20 30 60 / .25);
+    --edge-hi: inset 0 1px 0 rgb(255 255 255 / .9); --recess: inset 0 1px 2px rgb(20 30 60 / .10);
+    --lift: 0 1px 2px rgb(20 30 60 / .14), 0 0 0 1px var(--hair); --key-bg: var(--base); --track-bg: var(--card-2);
     color-scheme: light;
   }
 
@@ -1127,9 +1136,32 @@ body.ke .band-meta b { color: var(--label); font-weight: var(--fw-semibold); }
 body.ke .band-meta .events { font-size: var(--fs-meta); line-height: 1.6; color: var(--meta); margin: 0; }
 body.ke .band-meta .events:empty { display: none; }
 body.ke .band-meta .events .bad { color: var(--accent); }
-body.ke .band-meta .wx { padding: var(--sp-2) 0 0; display: flex; flex-flow: row wrap; gap: var(--sp-2) var(--sp-5); min-width: 0; align-items: center; justify-content: flex-end; }
-body.ke .band-meta .wx .xbody { display: flex; flex-flow: row wrap; gap: var(--sp-2) var(--sp-5); align-items: center; justify-content: flex-end; }
-body.ke .band-meta .wx-refresh { padding: var(--sp-1) var(--sp-3); }
+/* N5 the hero weather: one small instrument under the wrap line. Left, the sky: glyph, the temperature, the condition under it and
+   the feels / high / low column; right of a hairline, the banded readings (air, pollen) as a table: name, a tabular figure, the band in
+   words, each source line under its row; along the foot, how old the read is and the re-read key. Lit like the page's other keys
+   (the top edge catches the light). With no banded reading the right half is simply not there; the instrument closes around the sky. */
+body.ke .band-meta .wx { margin-top: var(--sp-4); padding: var(--sp-4) var(--sp-5) var(--sp-3); display: grid; grid-template-columns: auto auto; grid-template-areas: "main air" "foot foot";
+  column-gap: var(--sp-6); row-gap: var(--sp-3); align-items: center; min-width: 0; text-align: left; color: var(--label);
+  background: linear-gradient(to bottom, color-mix(in oklch, var(--card), var(--contrast) 2%), var(--card)); border: 1px solid var(--hair); border-radius: var(--r-lg); box-shadow: var(--edge-hi); }
+body.ke .band-meta .wx .xbody { display: contents; }
+body.ke .band-meta:has(.wx-air) { max-width: 600px; }   /* room for the readings table beside the sky, so a pill never meets the edge */
+body.ke .band-meta .wx:not(:has(.wx-air)) { grid-template-columns: auto; grid-template-areas: "main" "foot"; }
+body.ke .band-meta .wx .wx-main { grid-area: main; gap: var(--sp-4); }
+body.ke .band-meta .wx .wx-air { grid-area: air; align-self: stretch; padding-left: var(--sp-6); border-left: 1px solid var(--hair); }
+body.ke .band-meta .wx .wx-age { grid-area: foot; justify-self: start; align-self: end; margin: 0; padding-top: var(--sp-3); }
+/* the foot's hairline is the instrument's own line across its full width; the read age sits under it at the left, the re-read key at the right */
+body.ke .band-meta .wx::before { content: ""; grid-area: foot; align-self: start; height: 1px; background: var(--hair); }
+body.ke .band-meta .wx-refresh { grid-area: foot; justify-self: end; align-self: end; margin: var(--sp-3) 0 0; padding: 0; width: var(--ctl-row); height: var(--ctl-row);
+  display: grid; place-items: center; border-radius: var(--r-sm); background: var(--key-bg); border: 0; box-shadow: var(--edge-hi), var(--lift); font-size: var(--fs-meta); }
+body.ke .band-meta .wx-refresh:hover { color: var(--text); }
+body.ke .band-meta .wx-refresh:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; }
+body.ke .band-meta .wx .wx-side { margin-left: var(--sp-2); text-align: left; }
+/* narrow: the readings stack under the sky, divided by a hairline across instead of down */
+@media (max-width: 560px) {
+  body.ke .band-meta .wx { grid-template-columns: minmax(0, 1fr); grid-template-areas: "main" "air" "foot"; width: 100%; box-sizing: border-box; }
+  body.ke .band-meta .wx .wx-air { padding: var(--sp-3) 0 0; border-left: 0; border-top: 1px solid var(--hair); }
+}
+body.ke .band-meta .wx .wx-t .rd-n, body.ke .band-meta .wx b { color: var(--text); }
 .wx-main { display: flex; align-items: center; gap: var(--sp-4); flex-wrap: nowrap; }
 .wx-icon { flex: none; }
 .wx-t { display: flex; align-items: baseline; gap: var(--sp-2); }
@@ -1140,6 +1172,15 @@ body.ke .band-meta .wx-refresh { padding: var(--sp-1) var(--sp-3); }
 .wx-side b { color: var(--text); font-weight: var(--fw-semibold); }
 .wx-side > * { overflow: hidden; text-overflow: ellipsis; }
 .wx-side .rd-sub, .wx-side .rd-b { display: block; margin: 0; padding: 0; border: 0; font-size: var(--fs-meta); color: var(--label); }
+/* the banded readings' table: glyph | name | figure (right-aligned, tabular) | band pill; a source line spans name..pill under its row */
+.wx-air { display: grid; grid-template-columns: auto auto auto 1fr; column-gap: var(--sp-3); row-gap: var(--sp-1); align-content: center; align-items: center; justify-content: start; }
+.wx-air > .aqi { display: contents; }
+.wx-air > .aqi > svg { grid-column: 1; }
+.wx-air .aqi-l { grid-column: 2; font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); }
+.wx-air .aqi-v { grid-column: 3; justify-self: end; min-width: 2ch; text-align: right; font: var(--fw-bold) var(--fs-lead)/1 var(--round); color: var(--text); font-variant-numeric: tabular-nums lining-nums; }
+.wx-air .aqi .pill { grid-column: 4; justify-self: start; }
+.wx-air > .aqi-d { grid-column: 2 / -1; margin: 0 0 var(--sp-2); max-width: 26ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wx-air > .aqi-d:last-child { margin-bottom: 0; }
 .aqi { display: flex; align-items: center; gap: var(--sp-3); font-size: var(--fs-body); flex-wrap: wrap; }
 .aqi b { font-weight: var(--fw-semibold); }
 .aqi .pill { margin-left: 0; }
@@ -1159,7 +1200,10 @@ body.ke .band-meta .wx-refresh { padding: var(--sp-1) var(--sp-3); }
 body.ke .masthead { padding-block: 0; min-height: 60px; gap: var(--sp-6); flex-wrap: nowrap; align-items: center; }
 body.ke .masthead .seg { height: var(--ctl-md); padding: var(--sp-1); border-radius: var(--r-md); align-items: stretch; flex: none; }
 body.ke .masthead .mode { display: inline-flex; align-items: center; gap: var(--sp-3); padding: 0 var(--sp-4); font-size: var(--fs-body); font-weight: var(--fw-semibold); border-radius: var(--r-sm); white-space: nowrap; }
-body.ke .masthead .mode[aria-selected="true"] { box-shadow: inset 0 -2px 0 var(--accent); }
+/* the page's switches (tabs, theme, the lens switch) are one material: a recessed track, the chosen key raised and lit */
+body.ke .masthead .seg, body.ke .themesw { background: var(--track-bg); border-color: var(--hair); box-shadow: var(--recess); }
+body.ke .masthead .mode[aria-selected="true"], body.ke .themesw button[aria-pressed="true"] { background: var(--key-bg); color: var(--text); box-shadow: var(--edge-hi), var(--lift); }
+body.ke .masthead .mode:not([aria-selected="true"]):hover { color: var(--text); }
 body.ke .masthead .readout { gap: var(--sp-4); flex: 1; justify-content: flex-end; flex-wrap: nowrap; min-width: 0; font-variant-numeric: tabular-nums; }
 body.ke .masthead .unit { gap: 0; flex: 0 1 auto; }
 body.ke .masthead .unit-label { display: none; }
@@ -1230,6 +1274,9 @@ body.ke .ck-briefcard .ck-brief-body:has(.brief-card) { margin-top: 0; }
 .brief-card .brief-overnight { margin-top: var(--sp-4); display: flex; gap: var(--sp-4); align-items: baseline; flex-wrap: wrap; font-size: var(--fs-meta); color: var(--meta); }
 .brief-card .brief-overnight .mono { font-family: var(--mono); font-size: var(--fs-micro); color: var(--label); }
 .brief-card .brief-threads .k { margin-bottom: var(--sp-3); }
+/* F3 one rail: the levain column carries the same divider and inset as the flow brief's side column above it, so both right
+   columns start their text on one x and read as one rail down the card */
+@media (min-width: 721px) { .brief-card .brief-cols.has-threads > .brief-threads { border-left: 1px solid var(--hair); padding-left: var(--sp-6); } }
 .brief-card .thread { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-2) 0; }
 .brief-card .thread .t { flex: 1; min-width: 0; font-size: var(--fs-body); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .brief-card .thread .pill { flex: none; color: var(--meta); font: var(--fw-regular) var(--fs-micro) var(--mono); }
@@ -1569,10 +1616,13 @@ html :is(.ck-card.w, .ck-zgrid .panel):is([data-ck-panel]) { position: relative;
 /* a card alone in a column takes the column's width even when empty (the empty rule above sets align-self: start for the grid) */
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col > .panel.ck-is-empty { align-self: stretch; }
 
-/* the Decisions tile carries a soft halo only while something waits on the operator; calm otherwise */
-html .ck-card.w[data-ck-panel="decisions"][data-signal="on"] {
-  border-color: color-mix(in oklch, var(--accent) 55%, var(--hair));
-  box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 28%, transparent), 0 0 30px color-mix(in oklch, var(--accent) 24%, transparent); }
+/* N2 "waits on you": ONE closed shape. A tile that waits is ringed on all four sides by one even accent line that follows its own
+   corners, lit from the top by a faint accent wash; the subsystem stripe steps aside (the ring is the signal, two top edges in two
+   oranges read as a seam). In the strip the ring is drawn inside the segment (inset), so the bar's dividers and its outer radius
+   never clip it; as a separate tile it is the card's own border, doubled by a hairline of shadow and a low glow in dark. */
+html { --wait-ring: color-mix(in srgb, var(--accent) 78%, transparent); --wait-wash: color-mix(in srgb, var(--accent) 10%, var(--card)); }   /* mixed in srgb: an oklch mix of the orange with the blue-grey card swings through pink */
+html body.ke .ck-card.w[data-signal="on"]::before { background: transparent; }
+html body.ke .ck-card.w[data-signal="on"] { background: linear-gradient(to bottom, var(--wait-wash), var(--card) 75%); }
 
 
 /* ═══════════════════════════ THE FOUR TABS (F3, K2 r2): what each one shows, in what widths ═══════════════════════════
@@ -1688,8 +1738,33 @@ body.ke .ck-widgets .w .op .v { margin-left: var(--sp-3); }
 body.ke .ck-widgets .w .op { flex-wrap: wrap; row-gap: 0; min-width: 0; }
 body.ke .ck-widgets .w .op .op-l { min-width: 0; overflow-wrap: anywhere; }
 body.ke .ck-widgets .w .op .v { max-width: 100%; overflow-wrap: anywhere; }
+/* N3 the glance figures: every figure is tabular and lining (a column of counts does not shimmy as digits change), a figure and its
+   label share one baseline, and a tile's secondary figures are a glance row, never a list row (the list row's top rule and rounded
+   hover box are what drew a stray pill around "18 today" in the strip). */
+.w .big, .w .bigrow, .w .row b, .w .num { font-variant-numeric: tabular-nums lining-nums; }
+body.ke .w .row, body.ke .w .xbody .row { border-top: 0; border-radius: 0; padding: 0; align-items: baseline; font-size: var(--fs-meta); }
+body.ke .w .row > span { display: inline-flex; align-items: baseline; white-space: nowrap; }
+body.ke .w .row b { font-size: var(--fs-lead); line-height: 1; }
+/* in a tile the headline figure and the secondary row are divided by one hairline the tile's full width, on the spacing scale */
+body.ke .ck-widgets[data-shape="tiles"] .w .bigrow + .row { margin-top: var(--sp-2); padding-top: var(--sp-3); border-top: 1px solid var(--hair); }
+/* in the strip every part of a segment, the caps label included, sits on ONE baseline: label, figure, its unit, the row's figures */
+@media (min-width: 721px) {
+  body.ke .ck-widgets:not([data-shape="tiles"]) > .ck-card.w { align-items: baseline; }
+  body.ke .ck-widgets:not([data-shape="tiles"]) .w .bigrow { gap: var(--sp-2); }
+  body.ke .ck-widgets:not([data-shape="tiles"]) .w .big { line-height: 1; }
+  /* the open glyph sits centred at the segment's right edge, in room the segment keeps for it, never over the text */
+  body.ke .ck-widgets:not([data-shape="tiles"]) > .ck-card.w.w-open { padding-right: calc(var(--sp-5) + 20px); }
+  body.ke .ck-widgets:not([data-shape="tiles"]) > .ck-card.w.w-open::after { top: 50%; right: var(--sp-4); transform: translateY(-50%); font-size: var(--fs-body); }
+}
 body.ke .ck-card.w[data-signal="on"] .big { color: var(--accent); }
-body.ke .ck-widgets > .ck-card.w[data-signal="on"] { box-shadow: inset 3px 0 0 var(--accent); }
+body.ke .ck-widgets > .ck-card.w[data-signal="on"] { box-shadow: inset 0 0 0 1px var(--wait-ring), var(--edge-hi); }
+body.ke .ck-widgets > .ck-card.w[data-signal="on"]:hover { background: linear-gradient(to bottom, var(--wait-wash), var(--card-2) 75%); }
+/* a segment at either end of the strip takes the strip's outer corner, so its ring and its hover follow the bar's own shape */
+@media (min-width: 721px) {
+  body.ke .ck-widgets:not([data-shape="tiles"]) > .ck-card.w:first-child { border-radius: calc(var(--r-lg) - 1px) 0 0 calc(var(--r-lg) - 1px); }
+  body.ke .ck-widgets:not([data-shape="tiles"]) > .ck-card.w:last-child { border-radius: 0 calc(var(--r-lg) - 1px) calc(var(--r-lg) - 1px) 0; }
+  body.ke .ck-widgets:not([data-shape="tiles"]) > .ck-card.w:only-child { border-radius: calc(var(--r-lg) - 1px); }
+}
 body.ke .ck-widgets[data-shape="tiles"] { display: grid; grid-template-columns: repeat(var(--ck-n, 4), minmax(0, 1fr)); gap: var(--gap); background: none; border: 0; border-radius: 0; overflow: visible; }
 body.ke .ck-widgets[data-shape="tiles"] > .ck-card.w { flex-direction: column; align-items: stretch; gap: var(--sp-2); padding: var(--sp-5) var(--sp-6); border: 1px solid var(--hair); border-radius: var(--r-lg); }
 body.ke .ck-widgets[data-shape="tiles"] .wbody, body.ke .ck-widgets[data-shape="tiles"] .w .xbody, body.ke .ck-widgets[data-shape="tiles"] .w .dots { flex-direction: column; align-items: stretch; gap: var(--sp-2); }
@@ -1697,7 +1772,8 @@ body.ke .ck-widgets[data-shape="tiles"] .w .big { font-size: var(--fs-figure); }
 body.ke .ck-widgets[data-shape="tiles"] .w .sub { white-space: normal; }
 body.ke .ck-widgets[data-shape="tiles"] .w .sub ~ .sub, body.ke .ck-widgets[data-shape="tiles"] .w .xnote { display: block; }
 body.ke .ck-widgets[data-shape="tiles"] .w .row { flex-wrap: wrap; white-space: normal; }
-body.ke .ck-widgets[data-shape="tiles"] > .ck-card.w[data-signal="on"] { box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 28%, transparent), 0 0 30px color-mix(in oklch, var(--accent) 24%, transparent); border-color: color-mix(in oklch, var(--accent) 55%, var(--hair)); }
+body.ke .ck-widgets[data-shape="tiles"] > .ck-card.w[data-signal="on"] { border-color: var(--wait-ring);
+  box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 22%, transparent), var(--edge-hi), 0 8px 28px -12px color-mix(in oklch, var(--accent) calc(var(--glow-a) * 100%), transparent); }
 body.ke[data-mode="build"] .ck-widgets > .ck-card.w[data-modes]:not([data-modes~="build"]),
 body.ke[data-mode="memory"] .ck-widgets > .ck-card.w[data-modes]:not([data-modes~="memory"]) { display: none; }
 
@@ -1882,8 +1958,9 @@ body.ke .tray-dump:not(.text-editor):not(.action-bare):has(.tray-dump-ta:not(:pl
   body.ke .ck-widgets > .ck-card.w { padding-right: var(--sp-6); }
   body.ke .ck-widgets .w .sub { white-space: normal; }
   body.ke .ck-widgets .w .row { flex-wrap: wrap; white-space: normal; }
-  body.ke .ck-widgets .w .big { font-size: 24px; }
-  body.ke .ck-widgets > .ck-card.w[data-signal="on"] { box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 28%, transparent); border-color: color-mix(in oklch, var(--accent) 55%, var(--hair)); }
+  body.ke .ck-widgets .w .big, body.ke .ck-widgets[data-shape="tiles"] .w .big { font-size: 28px; }
+  body.ke .ck-widgets .w .bigrow { flex-wrap: wrap; row-gap: 0; }   /* a wide figure keeps its unit: the unit drops under it instead of being cut */
+  body.ke .ck-widgets > .ck-card.w[data-signal="on"] { border-color: var(--wait-ring); box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 22%, transparent), var(--edge-hi); }
   body.ke[data-mode="board"] .ck-zgrid.ck-twocol, body.ke[data-mode="board"] .ck-zgrid.ck-twocol[data-cols="1"] { grid-template-columns: minmax(0, 1fr); }
 }
 
@@ -1951,8 +2028,12 @@ body.ke .ck-mem-n { font: var(--fw-bold) var(--fs-meta)/1.5 var(--mono); color: 
 body.ke .ck-mem-t { display: flex; flex-direction: column; min-width: 0; }
 body.ke .ck-mem-name { font: var(--fw-regular) var(--fs-meta)/1.5 var(--mono); overflow-wrap: anywhere; }
 body.ke .ck-mem-rest, body.ke .ck-mem-cite { color: var(--label); font-size: var(--fs-micro, var(--fs-meta)); line-height: 1.4; overflow-wrap: anywhere; }
-body.ke .ck-mem-group { font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); padding-top: var(--sp-3); }
-body.ke .ck-mem-group:first-child { padding-top: 0; }
+/* N4 a `{group}` line heads a band of patterns: the label, then a hairline running to the edge, with real air below it before the
+   first pattern and more above it than between two patterns, so the band reads as a band (same rhythm wherever a group recurs) */
+body.ke p.md-p.ck-mem-group, body.ke .ck-mem-group { display: flex; align-items: center; gap: var(--sp-3); font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps);
+  text-transform: uppercase; color: var(--label); padding: 0; margin: var(--sp-6) 0 var(--sp-4); }
+body.ke .ck-mem-group::after { content: ""; flex: 1 1 auto; height: 1px; background: var(--hair); }
+body.ke p.md-p.ck-mem-group:first-child, body.ke .ck-mem-group:first-child { margin-top: 0; }
 body.ke .ck-zgrid .panel.ck-mem-slim { display: flex; flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: var(--sp-3); }
 body.ke .ck-zgrid .ck-mem-slim > .phead { padding: 0; }
 body.ke .ck-zgrid .ck-mem-slim .edit-trigger-row { margin: 0; }
@@ -2052,11 +2133,32 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
    Sessions draws it. State colour is the page's: orange only for waiting on you, amber stuck, red failed, green running, quiet done. */
 .panel.k-topology:not(.ck-faulted), [data-ck-panel="topology"]:not([data-ck-external]):not(.ck-faulted) { display: none !important; }   /* a faulted panel is the one error panel: cockpit_view.js marks it, and it stays */
 .tv { container-type: inline-size; padding: 0 var(--sp-6) var(--sp-6); min-width: 0; }
-.tv-seg { display: inline-flex; border: 1px solid var(--hair-2); border-radius: var(--r-md); overflow: hidden; }
-.tv-seg-b { border: 0; background: none; color: var(--label); padding: var(--sp-1) var(--sp-4); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
-.tv-seg-b:hover { color: var(--text); }
-.tv-seg-b[aria-pressed="true"] { background: var(--card-2); color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
-.tv-bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3) var(--sp-5); margin: 0 0 var(--sp-5); }
+/* N1 the lens switch: a recessed track holding three keys; the chosen one is a raised, lit key (its top edge catches the light,
+   a short shadow sets it on the track). Quiet by design: the accent stays reserved for what waits on the operator. */
+.tv-seg { display: inline-flex; flex: none; align-items: stretch; gap: var(--sp-1); height: 34px; padding: 3px; box-sizing: border-box;
+  background: var(--track-bg); border: 1px solid var(--hair); border-radius: calc(var(--r-md) + 3px); box-shadow: var(--recess); }
+.tv-seg-b { border: 0; background: none; color: var(--label); padding: 0 var(--sp-5); border-radius: var(--r-md); white-space: nowrap;
+  font: var(--fw-semibold) var(--fs-meta)/1 var(--round); letter-spacing: .01em; cursor: pointer;
+  transition: color var(--dur-micro) var(--ease-out), background-color var(--dur-micro) var(--ease-out), box-shadow var(--dur-micro) var(--ease-out); }
+.tv-seg-b:hover:not([aria-pressed="true"]) { color: var(--text); background: color-mix(in oklch, var(--card-2) 55%, transparent); }
+.tv-seg-b[aria-pressed="true"] { background: var(--key-bg); color: var(--text); box-shadow: var(--edge-hi), var(--lift); }
+.tv-seg-b:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; }
+@media (prefers-reduced-motion: reduce) { .tv-seg-b { transition: none; } }
+.tv-bar { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--sp-4) var(--sp-6); margin: 0 0 var(--sp-5); }
+/* the switch sits level with the figures it heads (centred on the figure + caps label pair), and a hairline divides the control
+   from the readout */
+.tv-bar > .tv-seg { margin-top: 5px; }
+.tv-bar > .tv-seg + .tv-metrics, .tv-bar > .tv-seg + .tv-strip { padding-left: var(--sp-6); border-left: 1px solid var(--hair); min-height: 44px; }
+/* narrow: the switch takes the full row as three equal keys, the readout wraps under it with no divider */
+@container (max-width: 560px) {
+  .tv-bar > .tv-seg { width: 100%; margin-top: 0; }
+  .tv-bar > .tv-seg > .tv-seg-b { flex: 1 1 0; padding-inline: var(--sp-3); }
+  .tv-bar > .tv-seg + .tv-metrics, .tv-bar > .tv-seg + .tv-strip { padding-left: 0; border-left: 0; min-height: 0; }
+}
+@media (max-width: 560px) {
+  .hl-bar > .tv-seg { width: 100%; }
+  .hl-bar > .tv-seg > .tv-seg-b { flex: 1 1 0; padding-inline: var(--sp-3); }
+}
 .tv-strip { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-5); flex: 1 1 320px; min-width: 0; font-size: var(--fs-meta); color: var(--label); }
 .tv-metrics { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--sp-3) var(--sp-6); flex: 1 1 320px; min-width: 0; }
 .tv-m { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
@@ -2313,5 +2415,11 @@ body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col > .panel[data-stack-cap
 .grp-col { display: contents; }
 body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--sp-8, 32px); align-items: start; }
 body.ke[data-mode="morning"] [data-ck-panel="tray"] .grp-col { display: block; min-width: 0; }
-@media (max-width: 900px) { body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results { display: block; } }
+/* L3 a Tray with ONE group (flow's "Also pending") would fill the left column and leave the right one empty: the lone group takes
+   both columns and its rows run down two columns under one heading, so it reads like the two-group Tray beside it */
+body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col { grid-column: 1 / -1; columns: 2; column-gap: var(--sp-8, 32px); }
+body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col > .grp-head { column-span: all; }
+body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col > .row { break-inside: avoid; }
+@media (max-width: 900px) { body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results { display: block; }
+  body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col { columns: auto; } }
 body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_descend"] { order: -1; }

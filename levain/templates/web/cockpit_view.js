@@ -1093,22 +1093,27 @@
     }
     if (side.childNodes.length) top.appendChild(side);
     host.appendChild(top);
+    // the banded sub-readings (air, pollen, any other) are one small table beside the figure: a band glyph, the name, the figure on a
+    // tabular column, the band in words; each source line sits under its own row. An absent reading draws nothing, never a placeholder.
+    const air = el("div", "wx-air");
     for (const sub of subs) {
       if (!(typeof sub.band === "string" && sub.band)) continue;
       if (drawn++ >= cap) continue;
       const token = bandOf(sub.band);
       const row = el("div", "aqi band-" + (token || "other"));
       row.appendChild(bars());
-      row.appendChild(el("b", "num", sub.label.charAt(0).toUpperCase() + sub.label.slice(1) + (sub.value == null ? "" : " " + sub.value)));
+      row.appendChild(el("span", "aqi-l", sub.label.charAt(0).toUpperCase() + sub.label.slice(1)));
+      row.appendChild(el("b", "num aqi-v", sub.value == null ? "" : String(sub.value)));
       // the pill carries the band in words; `good` is calm, any other named band is hot, an unknown one neutral
       const pill = el("span", "pill" + (token && token !== "good" ? " hot" : ""), token ? BAND_WORDS[token] : sub.band);
       pill.setAttribute("data-ck-weather", "aqi");
       row.appendChild(pill);
-      host.appendChild(row);
-      if (typeof sub.detail === "string" && sub.detail) host.appendChild(el("div", "wx-src", sub.detail));
+      air.appendChild(row);
+      if (typeof sub.detail === "string" && sub.detail) { row.title = sub.detail; air.appendChild(el("div", "wx-src aqi-d", sub.detail)); }
     }
+    if (air.childNodes.length) host.appendChild(air);
     const age = typeof v.as_of === "string" ? ago(v.as_of) : "";
-    if (age && !(opts && opts.age === false)) host.appendChild(el("div", "wx-src", "read " + age));
+    if (age && !(opts && opts.age === false)) host.appendChild(el("div", "wx-src wx-age", "read " + age));
   }
 
   // ---- the widget faces: one answer each, never a row (cockpit contract, widgets region) ----
