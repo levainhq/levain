@@ -256,7 +256,7 @@ def remove_tree_at(parent: int, name: str) -> None:
 
 
 def _fresh_repo(ctx: H.Ctx, a: R.Alloc, sfd: int) -> None:
-    """``<S>/repo`` empty, slot-owned, 0700: whatever a failed or interrupted clone left there is removed first, by
+    """``<S>/repo`` empty, slot-owned, 0700 (dispatch: 0711): whatever a failed or interrupted clone left there is removed first, by
     dirfd and never following a link (:func:`remove_tree_at`; ``<S>`` is root's: the slot can fill ``repo`` but
     never replace it)."""
     try:
@@ -265,7 +265,9 @@ def _fresh_repo(ctx: H.Ctx, a: R.Alloc, sfd: int) -> None:
         pass
     else:
         remove_tree_at(sfd, "repo")
-    ctx.store.mkdir(sfd, "repo", a.slot_uid, a.slot_gid, 0o700, f"live/{a.session}/repo")
+    # §26 S1-c: a dispatch session's repo is 0711, so the broker (search on <S> by its ACL) can walk into it.
+    mode = 0o711 if a.kind == "dispatch" else 0o700
+    ctx.store.mkdir(sfd, "repo", a.slot_uid, a.slot_gid, mode, f"live/{a.session}/repo")
     ctx.seams.fsync(sfd)
 
 
@@ -391,12 +393,13 @@ def _note(msg: str) -> None:
 
 def end_facts(ctx: H.Ctx, a: R.Alloc) -> E.EndFacts:
     """END's facts from alloc. DECISION (macOS): the ``/var/folders`` END retains is the session owner's (egress:
-    the slot; verifier: the child, who owns its work)."""
+    the slot; verifier: the child, who owns its work), alloc's first ``var_folders`` path, read at prepare: END
+    never asks getconf, which runs as the uid and would re-create a dir END already moved (D1)."""
     var = None
     if ctx.seams.host == "darwin":
-        owner = a.slot_uid if a.slot.slot_class == "egress" else a.child_uid
-        assert owner is not None
-        var = Path(ctx.seams.var_folders(owner, owner))
+        if a.var_folders is None:
+            raise Refused("var-folders-unknown", a.session)
+        var = Path(a.var_folders[0])
     return E.facts_from_alloc(R.alloc_record(a), store=ctx.store.path, var_folders=var)
 
 
@@ -442,6 +445,24 @@ def revoke(ctx: H.Ctx, session: str) -> None:
         raise Refused("revoke-raced", session)
 
 
+def _drop_unretained_live(ctx: H.Ctx, session: str) -> None:
+    """``L/live/<session>`` left after END reached RETAINED: a session that never cloned retains nothing (END
+    renames a cloned ``<S>`` into the retained tree), so what is still there is the rendered layer and the slot's
+    empty dirs [measured: Linux L62 (20+ such dirs) and macOS M69 left it]. Removed by dirfd, never following a
+    link, once every process of the slot is proven gone and before the slot is reusable. Only with no retained tree
+    for the session: END's rename moves all of ``<S>``, so ``<S>`` beside a tree is not this case and is kept."""
+    with ctx.store.dir("live") as live:
+        try:
+            os.stat(session, dir_fd=live, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if os.path.lexists(ctx.store.path / "retained" / session / "tree"):
+            _note(f"scrub {session}: L/live/{session} kept beside its retained tree")
+            return
+        remove_tree_at(live, session)
+        ctx.seams.fsync(live)
+
+
 def scrub_and_release(ctx: H.Ctx, a: R.Alloc) -> bool:
     """§7.3 ``slot: LEASED -> SCRUBBED -> REUSABLE``, under the pool lock then the slot lock (§3.5 order): only
     while root's slot state file shows this slot leased to THIS session at alloc's ``lease_seq``, proc.scrub
@@ -467,6 +488,7 @@ def scrub_and_release(ctx: H.Ctx, a: R.Alloc) -> bool:
                     return False
                 seams.at("scrubbed")
                 PR.scrub(ids[first], ids[second], seams=seams.proc_seams)   # type: ignore[arg-type]
+                _drop_unretained_live(ctx, a.session)
                 new = replace(st, rev=st.rev + 1, state="reusable", session=None,
                               changed_at=R.timestamp(seams.clock()))
                 seams.at("reusable")

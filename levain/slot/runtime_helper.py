@@ -99,6 +99,44 @@ def _free_bytes(store_fd: int) -> int:
     return st.f_bavail * st.f_frsize
 
 
+#: <linux/posix_acl_xattr.h>: the xattr's version and each entry's tag; an entry is (u16 tag, u16 perm, u32 id), LE.
+_ACL_XATTR = "system.posix_acl_access"
+_ACL_VERSION = 2
+_ACL_USER_OBJ, _ACL_USER, _ACL_GROUP_OBJ, _ACL_MASK, _ACL_OTHER = 0x01, 0x02, 0x04, 0x10, 0x20
+_ACL_UNDEFINED_ID = 0xFFFFFFFF
+_SEARCH = 1
+QBROKER = "_levain_qbroker"
+
+
+def linux_search_acl(mode: int, uid: int) -> bytes:
+    """``system.posix_acl_access`` for a directory of ``mode`` plus one named-user entry granting ``uid`` search only.
+    The mask is the group bits plus search, so the mode the kernel shows keeps its group bits whenever they already
+    hold search (``<S>``'s 0750 stays 0750)."""
+    import struct
+
+    u, g, o = (mode >> 6) & 7, (mode >> 3) & 7, mode & 7
+    entries = [(_ACL_USER_OBJ, u, _ACL_UNDEFINED_ID), (_ACL_USER, _SEARCH, uid), (_ACL_GROUP_OBJ, g, _ACL_UNDEFINED_ID),
+               (_ACL_MASK, g | _SEARCH, _ACL_UNDEFINED_ID), (_ACL_OTHER, o, _ACL_UNDEFINED_ID)]
+    return struct.pack("<I", _ACL_VERSION) + b"".join(struct.pack("<HHI", *e) for e in entries)
+
+
+def grant_broker_search(host: str, fd: int, path: Path, broker: str, broker_uid: int) -> None:
+    """§26 S1-c: ONE ACL entry on a dispatch session's ``<S>`` giving the queue broker search and nothing else.
+    Linux: the xattr on the fd (never the ``setfacl`` binary, which the Linux VM lacks). macOS: ``chmod +a`` by
+    name on ``<S>``'s path, whose every parent is root's (``L/live`` 0711), so the path names exactly this dir.
+    Any failure: ``grant-reach-unset`` (a dispatch session is never started without the reach)."""
+    try:
+        if host == "linux":
+            os.setxattr(fd, _ACL_XATTR, linux_search_acl(stat.S_IMODE(os.fstat(fd).st_mode), broker_uid))
+            return
+        r = subprocess.run(["/bin/chmod", "+a", f"user:{broker} allow search", str(path)], capture_output=True,
+                           cwd="/", env={"PATH": "/usr/bin:/bin"}, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise Refused("grant-reach-unset", str(e)[:120]) from None
+    if r.returncode != 0:
+        raise Refused("grant-reach-unset", (r.stderr or r.stdout).decode("utf-8", "replace").strip()[:120])
+
+
 def _account_uid(name: str) -> int:
     import pwd
 
@@ -178,8 +216,9 @@ def _sigkill_and_reap(pid: int) -> None:
 
 
 def darwin_user_dir(uid: int, gid: int) -> str:
-    """macOS: ``uid``'s ``/private/var/folders/<a>/<b>`` (render's ``var_folders``), from ``getconf
-    DARWIN_USER_DIR`` run AS that uid (``/var/folders/<a>/<b>/0/``). [not run: a 2g row]"""
+    """macOS: ``uid``'s ``/private/var/folders/<a>/<b>`` (alloc's ``var_folders``, read at prepare), from ``getconf
+    DARWIN_USER_DIR`` run AS that uid (``/var/folders/<a>/<b>/0/``); it CREATES the dir when absent [measured:
+    levain-memory runs/s2-macos/RESULT_D1D2.md X9, 2026-10-20], so it runs at prepare only."""
     r = subprocess.run(["/usr/bin/getconf", "DARWIN_USER_DIR"], capture_output=True, text=True, timeout=10,
                        env={}, user=uid, group=gid, extra_groups=[])
     parts = [p for p in r.stdout.strip().split("/") if p] if r.returncode == 0 else []
@@ -387,6 +426,7 @@ class Seams:
     proc_identity: Callable[[int], Optional[Tuple[int, int]]] = proc_identity
     kill: Callable[[int], None] = _sigkill_and_reap
     var_folders: Callable[[int, int], str] = darwin_user_dir
+    grant_search: Callable[[str, int, Path, str, int], None] = grant_broker_search
     wake_reaper: Optional[Callable[[], None]] = None
     hook_templates: Mapping[str, RD.HookTemplate] = field(default_factory=dict)
     front_module: str = FRONT_MODULE
@@ -1052,12 +1092,19 @@ def session_dir_rows(slot: SlotId, ids: Mapping[str, int]) -> List[DirRow]:
     return rows
 
 
-def make_session_dirs(ctx: Ctx, session: str, rows: Sequence[DirRow]) -> None:
+def make_session_dirs(ctx: Ctx, session: str, rows: Sequence[DirRow], *, broker_uid: Optional[int] = None) -> None:
+    """The rows under ``<S>``; with ``broker_uid`` (a ``dispatch`` session, looked up by ``prepare`` before ATTACH)
+    ``<S>`` also gets the queue broker's search entry (§26 S1-c), so the broker can reach ``<S>/repo`` (0711 at
+    start) and nothing else under ``<S>`` by mode."""
     with ctx.store.dir("live") as live:
         for row in rows:
             parts = [p for p in row.rel.split("/") if p]
             if not parts:
                 ctx.store.mkdir(live, session, row.uid, row.gid, row.mode, f"live/{session}")
+                if broker_uid is not None:
+                    with ctx.store.dir("live", session) as sfd:
+                        ctx.seams.grant_search(ctx.seams.host, sfd, ctx.store.path / "live" / session,
+                                               QBROKER, broker_uid)
                 continue
             with ctx.store.dir("live", session, *parts[:-1]) as parent:
                 ctx.store.mkdir(parent, parts[-1], row.uid, row.gid, row.mode, f"live/{session}/{row.rel}")
@@ -1095,13 +1142,22 @@ def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, obje
         ids = slot_ids(ctx, slot)
         first, second = slot.accounts
         linux = seams.host == "linux"
+        # A missing broker account refuses here, where the lease is still given back (§26 S1-c).
+        broker_uid = seams.account_uid(QBROKER) if req.kind == "dispatch" else None
+        folders = None
+        if seams.host == "darwin":
+            # Read ONCE, here, while the uid holds no session: getconf runs AS the uid and creates the dir when it
+            # is absent, so a later read (a re-run END after the dir moved) would re-create it (D1).
+            folders = (seams.var_folders(ids[first], ids[first]),) if slot.slot_class == "egress" else \
+                (seams.var_folders(ids[second], ids[second]), seams.var_folders(ids[first], ids[first]))
         alloc = R.Alloc(
             session=session, slot=slot, lease_seq=leased.state.lease_seq, slot_rev=leased.state.rev,
             slot_uid=ids[first], slot_gid=ids[first], kind=req.kind, vendor=req.vendor, auth=req.auth,
             operator_uid=ctx.operator_uid, supervisor_uid=ctx.sudo_uid, staging_uid=ctx.sudo_uid,
             created_at=R.timestamp(seams.clock()), boot_id=seams.boot_id(),
             child_uid=ids[second] if slot.slot_class == "none" else None,
-            netns=slot.netns if linux else None, cgroup=R.cgroup_path(slot, session) if linux else None)
+            netns=slot.netns if linux else None, cgroup=R.cgroup_path(slot, session) if linux else None,
+            var_folders=folders)
         seams.at("alloc")
         try:
             create_alloc(ctx, alloc)
@@ -1134,7 +1190,7 @@ def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, obje
     else:
         wake_reaper(seams.R)
     seams.at("session-dirs")
-    make_session_dirs(ctx, session, session_dir_rows(slot, ids))
+    make_session_dirs(ctx, session, session_dir_rows(slot, ids), broker_uid=broker_uid)
     staging = make_staging(ctx, session)
     out: Dict[str, object] = {"format": PREPARE_RESULT_FORMAT, "session": session, "slot": R.slot_obj(slot),
                               "staging": str(staging)}
@@ -1194,8 +1250,9 @@ def render_facts(ctx: Ctx, alloc: R.Alloc, blob: RenderBlob) -> RD.RenderFacts:
     assert owner is not None
     folders: Tuple[str, ...] = ()
     if seams.host == "darwin":
-        folders = (seams.var_folders(owner, owner),) if egress else \
-            (seams.var_folders(owner, owner), seams.var_folders(alloc.slot_uid, alloc.slot_gid))
+        if alloc.var_folders is None:
+            raise Refused("var-folders-unknown", alloc.session)
+        folders = tuple(alloc.var_folders)
     term = ctx.env.get("TERM")
     if term is not None and not RD._TERM_RE.fullmatch(term):
         term = None

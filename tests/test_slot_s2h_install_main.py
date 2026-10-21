@@ -511,3 +511,60 @@ def test_a_directory_with_no_root_refuses():
     with pytest.raises(Refused) as ei:
         IH.read_directory("linux", run=run)
     assert ei.value.name == "host-read-failed"
+
+
+def test_live_lease_refusal_names_the_sessions(tmp_path):
+    """VM-Y Y7a (levain-memory 1019-s1design/runs/s3-macos-d1d2/raw/Y7_undo_orphan.txt): undo met a lease whose
+    holder had died and refused live-lease naming no session. The refusal now names what it counted."""
+    d = tmp_path / "sessions"
+    d.mkdir()
+    (d / f"{S1}.json").write_bytes(_session_record(True))
+    (d / "s-2222222222222222.json").write_text("garbage")
+    assert IH.live_lease_sessions(d) == (S1, "s-2222222222222222")
+    assert IH.count_live_leases(d) == 2
+    facts = IH.HostFacts(host="linux", caller_uid=501, live_leases=2, live_sessions=IH.live_lease_sessions(d))
+    with pytest.raises(IH.Refused) as e:
+        IH.preflight(IH.parse_install_argv(["undo"]), facts)
+    assert e.value.name == "live-lease"
+    assert S1 in str(e.value) and "s-2222222222222222" in str(e.value)
+
+
+def test_lease_list_tells_sessions_from_busy_slots():
+    """L3 r1 (complement): a busy slot is a prepare or END in flight, not a session to end."""
+    assert IH._lease_list((S1,)) == f"session(s) {S1} (end each first)"
+    assert IH._lease_list(("slot e0",)) == "slot e0 busy (a prepare or END in flight; retry)"
+    assert IH._lease_list((S1, "slot e0")) == (f"session(s) {S1} (end each first); "
+                                               "slot e0 busy (a prepare or END in flight; retry)")
+
+
+def test_quiesce_reads_session_records_before_slot_locks(tmp_path, monkeypatch):
+    """L3 r1 (codex HIGH): a session going from its live record to END's slot lock must be seen at one end."""
+    order = []
+    monkeypatch.setattr(IH, "live_lease_sessions", lambda d: order.append("sessions") or ())
+    q = IH.Quiesce(tmp_path)
+    monkeypatch.setattr(IH.Quiesce, "held", property(lambda self: True))
+    monkeypatch.setattr(IH.Quiesce, "leased_slots", lambda self: order.append("states") or {})
+    monkeypatch.setattr(IH.Quiesce, "busy_slots", lambda self: order.append("slots") or [])
+    assert q.live() == ()
+    assert order == ["sessions", "states", "slots"]
+
+
+def test_a_leased_slot_counts_with_no_live_record_and_no_lock(tmp_path, monkeypatch):
+    """L3 r2 (codex HIGH): prepare's ATTACH can land and its slot lock drop between the record read and the lock
+    probe (and END's record clear comes before its lock). Under the pool lock the slot state cannot move, so a
+    slot whose state is leased is counted by its session; an unreadable state counts as live."""
+    from levain.slot.records import SlotId
+    from tests.test_slot_s2f2_runtime_helper import _slot_state
+    L = tmp_path
+    (L / "sessions").mkdir()
+    for tag, data in (("e0", _slot_state(SlotId("egress", 0), "leased", rev=1, seq=1, session=S1)),
+                      ("e1", _slot_state(SlotId("egress", 1))), ("e2", b"not a state")):
+        (L / "slots" / tag).mkdir(parents=True)
+        (L / "slots" / tag / "state").write_bytes(data)
+        (L / "slots" / tag / "lock").write_bytes(b"")
+    q = IH.Quiesce(L)
+    monkeypatch.setattr(IH.Quiesce, "held", property(lambda self: True))
+    assert q.live() == (S1, "slot e2")
+    assert q.live_leases() == 2
+    assert IH._lease_list(q.live()) == (f"session(s) {S1} (end each first); "
+                                        "slot e2 busy (a prepare or END in flight; retry)")

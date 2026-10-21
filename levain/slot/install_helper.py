@@ -27,6 +27,7 @@ from levain.contracts import canon
 from levain.firing.hands import OPERATOR_RE, HandsSetupError, HostOS, Step, _abs, _kill_all, host_os, run_plan
 from levain.launch import child_env
 from levain.slot import Refused, bwrap, netns, pf, root_tree, units
+from levain.slot import proc as PR
 from levain.slot import records as R
 from levain.slot import runtime_helper as RH
 from levain.slot.intent import INTENT_PATH, Intent, install_lock, intent_remove_step, intent_write_step, read_intent
@@ -89,6 +90,8 @@ class HostFacts:
     #: For each name the journal lists that is present on the host, the id it holds there (the uid of
     #: an account, the gid of a group): a journaled name at its journaled id is Levain's (§25).
     host_ids: Mapping[str, int] = field(default_factory=dict)
+    #: What ``live_leases`` counts (the refusal names them); last, so positional construction keeps its meaning.
+    live_sessions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -138,7 +141,7 @@ def parse_operator_record(data: bytes) -> dict[str, object]:
 def preflight(cmd: InstallCommand, facts: HostFacts) -> None:
     """Live lease first, then the one-operator rule (CONTRACT header, §5.2)."""
     if cmd.verb not in LEASE_EXEMPT and facts.live_leases > 0:
-        raise Refused("live-lease", f"{cmd.verb} refuses while {facts.live_leases} lease(s) are live")
+        raise Refused("live-lease", _live_lease_why(cmd.verb, facts))
     rec = facts.operator_record
     if cmd.verb == "setup":
         if facts.operator_uid is None:
@@ -282,9 +285,47 @@ class Quiesce:
                 os.close(lock)             # closing the only descriptor drops the flock it took
         return busy
 
+    def live(self) -> tuple[str, ...]:
+        """What the live-lease count counts: the sessions whose record is ``lease_live``; when held, also the session
+        of every slot whose state is ``leased`` and ``slot <name>`` per :meth:`busy_slots` not already named. Under the
+        hold a slot's state cannot change (prepare leases and SCRUB releases under ``pool.lock``, runtime_helper
+        "state=\"leased\"" and start "state=\"reusable\""), so ``leased`` covers every lease from prepare to its
+        release, including the two moments neither a record nor a slot lock shows it (L3 r2, codex)."""
+        sessions = list(live_lease_sessions(self.store / "sessions"))
+        if not self.held:
+            return tuple(sessions)
+        leased = self.leased_slots()
+        for sess in leased.values():
+            if sess not in sessions:
+                sessions.append(sess)
+        return tuple(sessions) + tuple(f"slot {b}" for b in self.busy_slots() if leased.get(b) not in sessions)
+
+    def leased_slots(self) -> dict[str, str]:
+        """Under the hold: slot name -> what holds it, for every slot whose state file says ``leased`` (its session),
+        or cannot be read or parsed (``slot <name>``: counted live, so an install verb refuses rather than act)."""
+        assert self.held
+        out: dict[str, str] = {}
+        slots = self.store / "slots"
+        for name in sorted(os.listdir(slots)):
+            try:
+                fd = os.open(slots / name / "state", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                out[name] = f"slot {name}"
+                continue
+            try:
+                with os.fdopen(fd, "rb") as fh:
+                    st = R.parse_slot_state(fh.read(1 << 16))
+            except (OSError, Refused):
+                out[name] = f"slot {name}"
+                continue
+            if st.state == "leased" and st.session is not None:
+                out[name] = st.session
+        return out
+
     def live_leases(self) -> int:
-        """The live-lease count: the session records, plus :meth:`busy_slots` when held."""
-        return count_live_leases(self.store / "sessions") + (len(self.busy_slots()) if self.held else 0)
+        return len(self.live())
 
     def release(self) -> None:
         if _QUIESCING.get(_store_key(self.store)) is self:
@@ -306,9 +347,9 @@ def quiesce_step(host: HostOS, *, store: Path | None = None) -> Step:
             return True, "no install run is quiescing this store"
         if not q.hold():
             return False, f"{L / 'slots' / 'pool.lock'} is missing after the rows that make it"
-        n = q.live_leases()
-        if n:   # nothing can lease before the runtime rule exists; a lease here is one this setup cannot see past
-            return False, f"live-lease: {n} lease(s) are live"
+        leased = q.live()
+        if leased:   # nothing can lease before the runtime rule exists; a lease here is one this setup cannot see past
+            return False, f"live-lease: {_lease_list(leased)}"
         return True, ""
 
     return Step(f"hold {L / 'slots' / 'pool.lock'} to the end of this run (no prepare leases beneath it)", call=take)
@@ -636,10 +677,27 @@ def _abandoned_setup(facts: HostFacts) -> Intent | None:
     if facts.operator_record is not None or j is None or j.verb != "setup":
         return None
     if facts.live_leases > 0:
-        raise Refused("live-lease", f"undo refuses while {facts.live_leases} lease(s) are live")
+        raise Refused("live-lease", _live_lease_why("undo", facts))
     if facts.caller_uid == 0 or facts.caller_name != j.operator:
         raise Refused("operator-mismatch", f"the interrupted setup was for {j.operator!r}")
     return j
+
+
+def _end_processes(host: HostOS, uid: int, name: str, *, bootout: Callable[..., bool] = PR.darwin_bootout,
+                   kill_all: Callable[[int], tuple[bool, str]] = _kill_all,
+                   none_left: Callable[[int], bool] = lambda u: PR.UidProcs().no_process(u)) -> tuple[bool, str]:
+    """macOS first ends the uid's launchd domain, so no agent is respawned for it after the kill (an undo once
+    left a slot's distnoted running past rc 0: levain-memory runs/s2-macos/raw_d/998_undo.txt); then every
+    process is killed, and the proof (two scans, no process of the uid) refuses by the account's name. A bootout
+    launchctl did not report done refuses ``domain-remains:<name>`` (the account is never removed under it)."""
+    if host == "darwin" and not bootout(uid):
+        return False, f"domain-remains:{name}: launchctl did not report uid {uid}'s domain booted out"
+    ok, why = kill_all(uid)
+    if not ok:
+        return False, why
+    if not none_left(uid):
+        return False, f"processes-remain:{name}: a process of uid {uid} is running after the kill"
+    return True, ""
 
 
 def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, int],
@@ -698,7 +756,8 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         Step("retire every account id so none is reissued", write=(path, retired_ids_text(retired_after), 0o644)),
     ]
     for name, uid in sorted(accounts.items()):
-        steps.append(Step(f"stop every process of {name}, and check they are gone", call=lambda u=uid: _kill_all(u)))
+        steps.append(Step(f"stop every process of {name}, and check they are gone",
+                          call=lambda u=uid, n=name: _end_processes(host, u, n)))
     for name in sorted(accounts):
         steps += tombstone_steps(host, name)
     steps += ungroup_steps(host, operator)
@@ -870,24 +929,45 @@ def read_directory(host: HostOS, *, run: Callable[..., object] = subprocess.run)
     return Directory(users, groups, ulab, glab)
 
 
-def count_live_leases(sessions: Path) -> int:
-    """Root's read of §3.1: the state records CONTROL marks ``lease_live``. DECISION: a record that does not parse
-    counts as live, so an install verb refuses rather than act beside a session it cannot read."""
+def live_lease_sessions(sessions: Path) -> tuple[str, ...]:
+    """Root's read of §3.1: the sessions whose state record CONTROL marks ``lease_live``. DECISION: a record that
+    does not parse counts as live, so an install verb refuses rather than act beside a session it cannot read."""
     try:
         names = os.listdir(sessions)
     except FileNotFoundError:
-        return 0
-    live = 0
+        return ()
+    live = []
     for name in sorted(names):
         if not name.endswith(".json") or not SESSION_RE.fullmatch(name[:-len(".json")]):
             continue
         try:
             raw = R.read_record(Path(sessions) / name)
             if raw is not None and R.parse_state(raw).lease_live:
-                live += 1
+                live.append(name[:-len(".json")])
         except (Refused, OSError):
-            live += 1
-    return live
+            live.append(name[:-len(".json")])
+    return tuple(live)
+
+
+def count_live_leases(sessions: Path) -> int:
+    """How many leases :func:`live_lease_sessions` finds."""
+    return len(live_lease_sessions(sessions))
+
+
+def _live_lease_why(verb: str, facts: HostFacts) -> str:
+    """The refusal names the sessions (VM-Y Y7a: an operator met ``live-lease`` with no session named; a lease
+    stays live until that session's END, even when its holder has died)."""
+    return f"{verb} refuses while {facts.live_leases} lease(s) are live" + (
+        f": {_lease_list(facts.live_sessions)}" if facts.live_sessions else "")
+
+
+def _lease_list(leased: Sequence[str]) -> str:
+    """Sessions are named for the operator to end; a ``slot <name>`` is a prepare or END in flight, to wait out."""
+    sessions = [x for x in leased if not x.startswith("slot ")]
+    slots = [x for x in leased if x.startswith("slot ")]
+    parts = ([f"session(s) {', '.join(sessions)} (end each first)"] if sessions else []) + (
+        [f"{', '.join(slots)} busy (a prepare or END in flight; retry)"] if slots else [])
+    return "; ".join(parts)
 
 
 def slots_in_service(store: RH.Store) -> dict[str, tuple[int, ...]]:
@@ -1003,10 +1083,11 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
     if journal is not None:
         host_ids.update((n, d.users[n]) for n in journal.accounts if n in d.users)
         host_ids.update((g, d.groups[g]) for g in journal.groups if g in d.groups)
+    leased = q.live() if q is not None else live_lease_sessions(L / "sessions")
     facts = HostFacts(
         host=host, caller_uid=caller_uid, caller_name=user_name(caller_uid),
         operator_uid=d.users.get(cmd.operator) if cmd.operator else None, operator_record=orec,
-        live_leases=q.live_leases() if q is not None else count_live_leases(L / "sessions"),
+        live_leases=len(leased), live_sessions=leased,
         used_ids=frozenset(d.users.values()) | frozenset(d.groups.values()),
         existing_names=frozenset(d.users) | frozenset(d.groups), retired=read_retired_ids(retired_path),
         levain_tombstones=tombs, levain_live=live, intent=journal, host_ids=host_ids)
@@ -1128,7 +1209,7 @@ INSTALL_ENTRY_ENV = ("SUDO_UID",)
 
 
 __all__ = ["BUILT_VERBS", "INSTALL_ENTRY_ENV", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
-           "apply_steps", "check_account_ids", "check_tools", "count_live_leases", "extra_tools", "gather_facts",
+           "apply_steps", "check_account_ids", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",
            "plan_for", "plan_replenish", "plan_setup", "plan_tools", "plan_undo", "pool_lock", "preflight", "Quiesce",
            "quiesce_step",

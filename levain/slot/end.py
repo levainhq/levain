@@ -207,8 +207,8 @@ class Caps:
 @dataclass(frozen=True)
 class EndFacts:
     """Everything END needs about a session, from its alloc record (CONTRACT §7.1) and the store root.
-    ``var_folders``: macOS ``/private/var/folders/<slot>`` as the caller derives it from the slot uid
-    (the alloc record does not carry it), ``None`` on Linux. ``lease_seq``: the lease root's slot state
+    ``var_folders``: macOS ``/private/var/folders/<slot>``, the session owner's path from alloc, ``None`` on
+    Linux. ``lease_seq``: the lease root's slot state
     file must still show (§3.5 Pool). ``child_uid``: a verifier pair's child (§1, §5.6), frozen, killed and
     proven gone with the slot uid. ``vendor`` + ``auth``: a credential is parked on a passthrough session
     only. The defaults fail closed: no ``lease_seq`` = ``slot-not-ours``, no ``auth`` = nothing parked."""
@@ -1019,6 +1019,12 @@ def _clear_setid(fd: int, e: Entry) -> None:
         os.fchmod(fd, stat.S_IMODE(m) & ~_SETID)
 
 
+#: SIP's marker on the system-made var-folders dirs: root cannot remove it (EPERM on every END [measured:
+#: levain-memory runs/s2-macos/RESULT_D1D2.md, NEW findings, macOS 26.6.2]) and it grants the slot nothing, so
+#: the strip skips this one name rather than note its failure every time.
+_ROOTLESS_XATTR = b"com.apple.rootless"
+
+
 def darwin_strip(e: Entry, note: Callable[[str], None]) -> None:
     """Flags first (``uchg`` blocks the rest), then setuid / setgid (a gate: raises), then the ACL (an
     empty one set), then each xattr, all on an fd of the entry. A flag, ACL or xattr failure is noted and
@@ -1048,6 +1054,8 @@ def darwin_strip(e: Entry, note: Callable[[str], None]) -> None:
             note(f"strip {where}: xattrs unlistable ({err.strerror or err})")
             return
         for nm in names:
+            if nm == _ROOTLESS_XATTR:
+                continue
             if c.fremovexattr(fd, nm, 0) != 0:
                 note(f"strip {where}: xattr {nm!r} not removed ({_oserr('fremovexattr').strerror})")
     finally:
