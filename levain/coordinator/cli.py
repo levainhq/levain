@@ -79,47 +79,9 @@ def cwd_source(cwd: str | None = None) -> Source:
         return Source()          # a path the store cannot hold (not UTF-8, a hidden character) is recorded as none
 
 
-# np-6843ca07 (a), signed: a coordinator's own install runs `levain coord`, `levain drops` and `levain thread` without
-# asking, on the premise that they grant nothing. Inside a session Levain launched (Claude Code's own session id names a
-# launch), those trees take only the coordinator's own verbs, and every write goes --by coordinator under its lease
-# token: an operator write is unfenced, so a session that lost its lease could otherwise still write. A verb not
-# listed here is refused there until it is listed.
-_DOOR_VERBS = frozenset({("coord", "status"), ("coord", "claim"), ("coord", "beat"), ("coord", "release"),
-                         ("drops", "list"), ("drops", "show"), ("drops", "split"),
-                         ("thread", "list"), ("thread", "show"), ("thread", "state"), ("thread", "merge"),
-                         ("thread", "detach"), ("thread", "add"), ("thread", "set")})
-
-
-def _tree_verb(args: argparse.Namespace) -> tuple[str, str] | None:
-    for tree, dest in (("coord", "coord_cmd"), ("drops", "drops_cmd"), ("thread", "thread_cmd")):
-        verb = getattr(args, dest, None)
-        if isinstance(verb, str):
-            return tree, verb
-    return None
-
-
-def _keep_to_the_coordinators_door(args: argparse.Namespace, store: EnvelopeStore) -> None:
-    tree_verb = _tree_verb(args)
-    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
-    if tree_verb is None or not sid:
-        return
-    launch = store.launch_by_harness_session(sid)
-    if launch is None:
-        return
-    tree, verb = tree_verb
-    if tree_verb not in _DOOR_VERBS:
-        raise CoordError(f"`levain {tree} {verb}` is the operator's, and this is a session Levain launched "
-                         f"(launch {launch.launch_id}); run it from your own terminal")
-    if getattr(args, "by", "coordinator") != "coordinator":
-        raise CoordError(f"a session Levain launched (launch {launch.launch_id}) writes --by coordinator --token N, "
-                         "never as the operator")
-
-
 def _store(args: argparse.Namespace) -> EnvelopeStore:
     d = args.queue_dir.expanduser() if args.queue_dir is not None else None
-    store = EnvelopeStore(d)
-    _keep_to_the_coordinators_door(args, store)
-    return store
+    return EnvelopeStore(d)
 
 
 def _drop_row(d: Drop) -> dict[str, Any]:

@@ -56,7 +56,7 @@ def test_a_draft_reaches_the_ledger_only_by_the_operators_promote(world, monkeyp
     before = git("rev-parse", "levain-team-ledger", cwd=ana)
     args = ["team", "draft", "promote", d["draft_id"], "--yes", "--no-push", "--repo", str(ana), "--queue-dir", str(qdir)]
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-1")      # a session Levain launched
-    assert levain_main(args) == 2
+    assert levain_main(args) == 1                               # the coordinator's door refuses it
     assert git("rev-parse", "levain-team-ledger", cwd=ana) == before and T.get_draft(store, d["draft_id"])["state"] == "drafted"
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")                # the operator's own terminal
     assert levain_main(args) == 0
@@ -81,3 +81,26 @@ def test_draft_rows_are_append_only_and_final(world):
     c = sqlite3.connect(qdir / "dispatch.db")
     with pytest.raises(sqlite3.DatabaseError):
         c.execute("UPDATE team_drafts SET body = '{}'")
+
+
+def test_a_launched_session_keeps_to_the_door_in_every_tree(world, tmp_path, monkeypatch, capsys):
+    """Reproduced (door/door_probe_BEFORE.txt): a launched session's `team record` signed into the ledger as the
+    human, and `coord take --queue-dir <empty dir>` took the role, because the door looked at three trees only and
+    only in the store the command named. Default-deny now, read from the default store too."""
+    ana, qdir, store, token = world
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path))            # qdir is the default consent dir, as installed
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-1")
+    before = git("rev-parse", "levain-team-ledger", cwd=ana)
+    for argv in (["team", "record", "decision", "--kind", "practice", "--words", "w", "--repo", str(ana), "--no-push"],
+                 ["envelope", "list", "--thread", "th-x"],
+                 ["coord", "take", "--queue-dir", str(tmp_path / "empty")],
+                 ["team", "draft", "add", "finding", "--summary", "s", "--by", "operator"]):
+        assert levain_main(argv) == 1, argv
+        assert "session Levain launched" in capsys.readouterr().err, argv
+    assert git("rev-parse", "levain-team-ledger", cwd=ana) == before
+    assert levain_main(["thread", "list"]) == 0
+    assert levain_main(["team", "draft", "add", "finding", "--summary", "s", "--token", str(token)]) == 0
+    assert levain_main(["team", "status", "--repo", str(ana)]) == 0
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")                # the operator: the same record runs
+    assert levain_main(["team", "record", "decision", "--kind", "practice", "--words", "w", "--repo", str(ana),
+                        "--no-push"]) == 0

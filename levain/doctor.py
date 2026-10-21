@@ -323,19 +323,19 @@ def _check_consent_limits() -> list[CheckResult]:
 
 def _check_host_awake() -> list[CheckResult]:
     """Why this host will or will not sleep (C7): whether the idle-sleep assertion is held for a working work thread.
-    Advisory: no row until a coordinator store exists; never a failure, because sleeping with nothing working is the
-    machine's own setting."""
+    Advisory: no row until a coordinator store exists (read only, never created here); never a failure, because
+    sleeping with nothing working is the machine's own setting."""
     from levain.install import _consent_queue_dir
 
     name = "host sleep"
     qdir = _consent_queue_dir()
-    if not (qdir / "dispatch.db").is_file():
-        return []
     try:
         from levain.coordinator import awake
-        from levain.coordinator.store import CoordStore
+        from levain.coordinator.door import readonly_store
 
-        store = CoordStore(qdir)
+        store = readonly_store(qdir)          # a doctor reads: it never creates the store or its tables
+        if store is None:
+            return []
         n = len(awake.working(store))
         ok, line = awake.describe(qdir, working_count=n)
     except Exception as exc:      # noqa: BLE001 - a doctor row never crashes the run

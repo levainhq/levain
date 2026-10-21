@@ -1,14 +1,13 @@
 """``levain team draft ...``: the coordinator drafts team-ledger entries, the operator signs (C8).
 
 ``add`` is the coordinator's (or yours); ``promote`` is the one step that signs, and it runs the ordinary record path
-under THIS clone's key after showing the whole draft. A session Levain launched is refused at ``promote`` and at
-``withdraw`` as the operator, the same test the coordinator's door applies to its own trees. That refusal keeps the
-draft path honest; it is not a lock on the key (the record verb itself is not behind this test).
+under THIS clone's key after showing the whole draft. Inside a session Levain launched, only ``add`` (as the
+coordinator), ``list`` and ``show`` run: the coordinator's door refuses the rest before this module is reached. That
+keeps the draft path honest; it is not a lock on the key, which any process of the same user can still use.
 """
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -21,13 +20,6 @@ def _store(args):
     from levain.coordinator.store import CoordStore
 
     return CoordStore(args.queue_dir.expanduser() if args.queue_dir is not None else None)
-
-
-def _refuse_launched_session(store) -> None:
-    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
-    if sid and store.launch_by_harness_session(sid) is not None:
-        raise TeamError("this is a session Levain launched: promoting a draft is the operator's; run it from your "
-                        "own terminal")
 
 
 def _show(v: dict) -> str:
@@ -68,11 +60,8 @@ def cmd_draft(args) -> int:
                 raise TeamError(f"no team draft {args.draft_id}")
             print(json.dumps(v, ensure_ascii=False, indent=2) if args.json else _show(v))
         elif verb == "withdraw":
-            if args.by == "operator":
-                _refuse_launched_session(store)
             print(_show(T.withdraw_draft(store, args.draft_id, by=args.by, token=args.token)))
         elif verb == "promote":
-            _refuse_launched_session(store)
             v = T.get_draft(store, args.draft_id)
             if v is None:
                 raise TeamError(f"no team draft {args.draft_id}")
