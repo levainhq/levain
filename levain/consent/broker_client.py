@@ -69,7 +69,8 @@ from levain.qbroker import wire
 
 __all__ = ["BROKER_ACCOUNT", "CAP_ENV", "FAST_POLLS", "GO", "IO_TIMEOUT", "PENDING_REFUSALS", "REQUEST_RETRY",
            "SLOW_POLL", "SOCKET_ENV", "BrokerClient", "BrokerError", "UNGATED_TIER", "broker_uid", "file_and_hold",
-           "file_ungated", "gate_request", "grant_member", "hold_for_decision", "in_slot"]
+           "GATE_GO", "GATE_HALTED", "GATE_OVER", "SLOT_HALT_TEXT", "file_ungated", "gate_check", "gate_request",
+           "grant_member", "hold_for_decision", "in_slot"]
 
 SOCKET_ENV = "LEVAIN_QUEUE_SOCKET"
 CAP_ENV = "LEVAIN_QUEUE_CAP"
@@ -234,6 +235,56 @@ class BrokerClient:
         if keys == {"decision"} and got["decision"] in DECISIONS:
             return got["decision"]
         raise BrokerError("malformed", "ANSWER? answered neither a decision nor pending")
+
+    def gate(self, *, agent: str, tool_name: str, tool_input: Any, tool_use_id: str | None,
+             timeout: float | None = None) -> tuple[str, str | None]:
+        """``GATE`` (F10 S2b-2, :mod:`levain.qbroker.broker`): ``("go", None)``, ``("halted", request_id)`` or
+        ``("over-limit", kind)``. Any refusal, or an answer of any other shape, raises :class:`BrokerError`
+        (the gate denies). GO is not allow: the caller's gate still runs."""
+        fields: dict[str, Any] = {"agent": agent, "tool_name": tool_name,
+                                  "input_digest": tool_input_digest(tool_input)}
+        if tool_use_id is not None:
+            fields["tool_use_id"] = tool_use_id
+        got = self.call("GATE", timeout=timeout, **fields)
+        keys, verdict = set(got) - {"id", "ok"}, got.get("gate")
+        if verdict == GATE_GO and keys == {"gate"}:
+            return GATE_GO, None
+        if verdict == GATE_HALTED and keys == {"gate", "request_id"} and isinstance(got["request_id"], str):
+            return GATE_HALTED, got["request_id"]
+        if verdict == GATE_OVER and keys == {"gate", "kind"} and (got["kind"] is None or isinstance(got["kind"], str)):
+            return GATE_OVER, got["kind"]
+        raise BrokerError("malformed", "GATE answered none of go, halted, over-limit")
+
+
+# GATE's three answers (levain.qbroker.broker.GATE_VERDICTS)
+GATE_GO, GATE_HALTED, GATE_OVER = "go", "halted", "over-limit"
+# the slot's halt words: the operator side numbers gaps, the hook names the halting request
+SLOT_HALT_TEXT = ("levain: this session is halted on request {r}: an irreversible call's hold ended with no answer. "
+                  "No further tool calls are allowed. Write a short summary of what is done and end your turn.")
+
+
+def gate_check(client: BrokerClient, *, agent: str, tool_name: str, tool_input: Any, tool_use_id: str | None,
+               sleep: Callable[[float], None] = time.sleep) -> str | None:
+    """The slot gate's first step on EVERY PreToolUse, before the call is classified: ``None`` on the broker's GO
+    (the gate goes on), else the deny text (:data:`SLOT_HALT_TEXT`, or Q13's stop words for over-limit). A
+    ``rate-limited`` GATE is sent once more after :data:`REQUEST_RETRY`; a second refusal, or any other failure,
+    raises :class:`BrokerError` (the caller denies: fail closed)."""
+    from levain.consent import limits
+
+    try:
+        verdict, detail = client.gate(agent=agent, tool_name=tool_name, tool_input=tool_input,
+                                      tool_use_id=tool_use_id)
+    except BrokerError as exc:
+        if exc.name != "rate-limited":
+            raise
+        sleep(REQUEST_RETRY)
+        verdict, detail = client.gate(agent=agent, tool_name=tool_name, tool_input=tool_input,
+                                      tool_use_id=tool_use_id)
+    if verdict == GATE_GO:
+        return None
+    if verdict == GATE_HALTED:
+        return SLOT_HALT_TEXT.format(r=detail)
+    return limits.stop_text(detail)
 
 
 def grant_member(agent: str, tool_name: str, tool_input: Any, root: str) -> dict[str, Any] | None:

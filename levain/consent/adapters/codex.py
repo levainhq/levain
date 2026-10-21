@@ -731,14 +731,11 @@ def could_not_run(what: str) -> dict[str, Any]:
 
 
 # --- the slot gate (F10 S2a): Claude Code's (:func:`levain.consent.adapters.claude_code.slot_gate`), in Codex's
-# words. A slot has no local queue, so it has no halt latch either: an undecided irreversible call is denied with
-# U-IRR's words, and nothing denies the session's later calls (the operator side holds the gap).
-#
-# KNOWN EDGE until F10 S2b (L3 r1 B): after an undecided irreversible call in a slot, Codex's later UNGATED calls
-# proceed (on the local path the halt latch denies them). The undecided call itself stays denied, and every later
-# gated call still goes to the broker; the latch is operator-side state the broker does not hold yet. S2b adds a
-# broker-side halt this gate reads before it classifies the call. (L3 r1 C, consent limits not enforced in a slot,
-# is stated at claude_code's slot gate and holds here too.)
+# words. A slot has no local queue: an undecided irreversible call is denied with U-IRR's words, and the halt that
+# follows it is the broker's (F10 S2b-2): every PreToolUse first asks ``GATE``
+# (:func:`levain.consent.broker_client.gate_check`), before it is classified, and a session halted on such a call,
+# or over a limit the operator set, is denied; GO lets the rest of this gate run (never an allow); the broker down,
+# refusing or out of shape denies.
 
 def slot_gate(event: Any, *, home: Path | None = None, codex_dir: Path | None = None, client: Any = None,
               hold: float = DEFAULT_GATE_HOLD, expected_uid: int | None = None,
@@ -763,6 +760,19 @@ def slot_gate(event: Any, *, home: Path | None = None, codex_dir: Path | None = 
         event["session_id"]
     if tool_input is None:
         tool_input = {}
+    # GATE first, before the call is classified (F10 S2b-2): the session's halt and its limits, every call
+    try:
+        if queue_socket_planted(cwd, home=home, codex_home=codex_dir):
+            return could_not_run("this call")
+        client = client if client is not None else broker_client.BrokerClient.from_env(expected_uid=expected_uid)
+        tool_use_id = event.get("tool_use_id")
+        stopped = broker_client.gate_check(
+            client, agent=AGENT, tool_name=tool_name, tool_input=tool_input,
+            tool_use_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None, sleep=sleep)
+    except Exception:  # noqa: BLE001 - fail closed: the broker down, refusing or malformed is a deny
+        return could_not_run("this call")
+    if stopped is not None:
+        return _deny(stopped)
     try:
         git_cache: dict[Any, Any] = {}   # one git budget for the call, its description included
         tier = gate_class(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, git_cache=git_cache)

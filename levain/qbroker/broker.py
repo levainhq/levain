@@ -28,6 +28,33 @@ grant whose receipts raise files that row ``pending`` too, never stopping the st
 Known edge: each ANSWER? past the hold opens the receipts once to read the state; the slot's rate bounds it.
 No verb accepts an answer, a grant answer or a row from a hook. Every other op is ``verb-not-allowed``.
 
+THE GATE VERB (F10 S2b-2). ``GATE {cap, agent, tool_name, input_digest, tool_use_id?}`` is asked by both adapters'
+slot gate on EVERY PreToolUse, before the call is classified, and answered ``{"gate": "halted", "request_id"}``,
+``{"gate": "over-limit", "kind"}`` or ``{"gate": "go"}``. GO IS NOT ALLOW: the rest of the slot gate still runs. The
+session is the resolve's, never the frame's.
+
+- Halted is DERIVED, no new mutable state: the session (the resolved one) has a row filed at :data:`HALT_TIER` (the
+  tier the slot gate files every irreversible-class call at, :data:`levain.consent.policy.AGENT_CONFIG_TIER`) whose
+  hold ended with no accepted answer: its last receipt is ``expired``, or it is still ``pending`` past its hold, in
+  which case GATE runs ANSWER?'s own step first (a verified answer there in time decides it; else the ``expired``
+  receipt is written, :meth:`Receipts.expired`). A row with no receipt past its hold reads halted too (the stricter
+  side). The local latch's release rule is a late ruling on the halting request (:meth:`ConsentQueue.answer_late`,
+  the release in the ruling's transaction); here that is a decided receipt after the ``expired`` one, and since
+  :meth:`Receipts.state` reads the LAST state, such a receipt releases the halt with no change here. KNOWN EDGE until
+  the operator side has a late-ruling path: nothing writes that receipt yet (:meth:`Receipts.decided` refuses an
+  expired request), so a slot halt is released only by a new session.
+- Over-limit: Q13's counter (:func:`levain.consent.limits.count_call`, the counter :func:`levain.consent.limits.check`
+  runs first) fed this call, kept in ``requests/limits/limits.db`` (:meth:`Broker._limits_dir`), keyed by the
+  resolved session and the agent the frame names (its own hook's: it selects a count, never a lower one); the
+  limits in force are ``limits(agent, session)``, the Broker's settings callable (default: none configured, every
+  call GO, nothing counted). A ``crossed``, ``halted`` or ``fail_deny`` verdict answers over-limit; ``ok`` and
+  ``not_counting`` (the counter's own bounded fail-open) answer GO. Tokens are not counted in a slot (the frame
+  carries no transcript path, and the broker reads none of the session's files). KNOWN EDGE: the Extend / End hold
+  of :func:`~levain.consent.limits.check` needs a ConsentQueue the broker does not have, so over-limit stands until
+  the operator changes the limits the callable returns.
+- Halt is read before the count (a halted call counts nothing), as Codex's local gate reads its halt first. GATE
+  takes a token from the slot's ANSWER? bucket.
+
 THE TYPED CONTRACT GRANT (F4, W2-c2; W2C_DESIGN §1, §3, §4, §8). A REQUEST may carry, beside ``request``, a ``grant``
 member ``{paths, input}``. The broker recomputes the request's ``pb1:`` digest from it and refuses
 ``grant-digest-mismatch`` (nothing written) when it is not the sealed ``tool_input_digest``. A NEW row whose member
@@ -77,7 +104,9 @@ from typing import Any, Protocol
 
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.cockpit.firejournal import _TIER_NEEDS
+from levain.consent import limits as consent_limits
 from levain.consent.away import MAX_HOLD
+from levain.consent.policy import AGENT_CONFIG_TIER
 from levain.consent.record import ExternalGateRequest
 from levain.qbroker import grants, wire
 from levain.qbroker.receipts import Receipts
@@ -128,6 +157,17 @@ SLOT_CLASS = "egress"
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _HOOK_REQUEST_KEYS = frozenset(ExternalGateRequest.__dataclass_fields__) - {"id"}
 _ANSWER_ROW_KEYS = frozenset({"format", "payload", "signature"})
+# the tier whose undecided row halts its session (the GATE verb): the slot gate files every irreversible-class call
+# here (claude_code / codex slot_gate, tier=AGENT_CONFIG_TIER), every reversible one at broker_client.UNGATED_TIER
+HALT_TIER = AGENT_CONFIG_TIER
+GATE_VERDICTS = ("go", "halted", "over-limit")
+_GATE_OVER = frozenset({"crossed", "halted", "fail_deny"})
+_GATE_KEYS = frozenset({"v", "op", "id", "cap", "agent", "tool_name", "input_digest", "tool_use_id"})
+_GATE_REQUIRED = _GATE_KEYS - {"tool_use_id"}
+# the limits in force for (agent, resolved session), or None when none are configured (every call GO)
+LimitsSource = Callable[[str, str], "Mapping[str, float] | None"]
+# the counter's directory under requests/ (limits.db and its failure files)
+LIMITS_DIR = "limits"
 
 
 @dataclass(frozen=True)
@@ -215,10 +255,12 @@ class Broker:
                  pending_cap: int = PENDING_PER_SESSION, answer_rate: float = ANSWER_RATE,
                  answer_burst: int = ANSWER_BURST, resolve_ttl: float = RESOLVE_TTL,
                  receipts: Receipts | None = None, contracts: Path | str | None = None,
-                 contracts_owner: int | None = None) -> None:
+                 contracts_owner: int | None = None, limits: LimitsSource | None = None) -> None:
         """``contracts``: the directory dispatch publishes signed contracts in (``L/contracts/``, CONTRACT §26 S1-b),
-        whose files must be owned by ``contracts_owner`` (dispatch's uid); without both, no grant ever applies."""
+        whose files must be owned by ``contracts_owner`` (dispatch's uid); without both, no grant ever applies.
+        ``limits``: the GATE verb's settings callable (module docstring); ``None``, no limits configured."""
         self._store = store
+        self._limits = limits
         self._receipts = receipts if receipts is not None else Receipts(store.root)
         self._contracts = None if contracts is None else Path(contracts)
         self._contracts_owner = contracts_owner
@@ -240,6 +282,8 @@ class Broker:
         self._resolved: OrderedDict[tuple[int, str], tuple[float, Resolved | str]] = OrderedDict()
         self._refused: OrderedDict[tuple[int, str], tuple[float, Resolved | str]] = OrderedDict()
         self._verdicts: OrderedDict[str, tuple[tuple[int, ...], SignersSnapshot | None, str | None]] = OrderedDict()
+        # session -> its rows' request ids at HALT_TIER (an index of the rows, read back from them at every GATE)
+        self._halting: dict[str, set[str]] = {}
         started = clock()
         now = utc_stamp(started)
         filed = []
@@ -247,6 +291,8 @@ class Broker:
             request = stored_request(row, store.queue_id)
             if request is not None:
                 filed.append((row, request))
+                if request.tier == HALT_TIER:
+                    self._halting.setdefault(row["session"], set()).add(request.id)
             # counted even when stored_request refused the row: a malformed row that names a session still holds its
             # quota and a pending place until its hold ends (it is never filed or answered), the cautious side
             session, run = row.get("session"), row.get("run")
@@ -337,6 +383,8 @@ class Broker:
                 return self._request(slot, rid, message)
             if op == "ANSWER?":
                 return self._answer(slot, rid, message)
+            if op == "GATE":
+                return self._gate(slot, rid, message)
         except Exception:   # noqa: BLE001 - one request's failure is its refusal, never the listener's
             log.exception("qbroker: %s on slot %d failed", op, slot)
             return wire.refusal(rid, "broker-error")
@@ -500,6 +548,9 @@ class Broker:
                 return "request-exists"
             refused = self._file_new(row, who, request, utc_stamp(now), granted=granted is not None)
             if refused is None:
+                if request.tier == HALT_TIER:
+                    with self._mutex:
+                        self._halting.setdefault(who.session, set()).add(request.id)
                 if granted is not None:
                     self._write_grant(who, request, granted, now)
                 self._file_receipts(row, request, now)
@@ -621,6 +672,80 @@ class Broker:
         if answer_bad:
             return wire.refusal(rid, "answer-refused")
         return wire.answer(rid, pending=True)
+
+    def _gate(self, slot: int, rid: int, message: Mapping[str, Any]) -> dict[str, Any]:
+        """The GATE verb (module docstring): halted, over-limit or go for the resolved session's next call."""
+        if not self._take_token(slot):
+            return wire.refusal(rid, "rate-limited")
+        who = self._resolve(slot, message.get("cap"))
+        if isinstance(who, str):
+            return wire.refusal(rid, who)
+        agent, tool_name, digest = message.get("agent"), message.get("tool_name"), message.get("input_digest")
+        tid = message.get("tool_use_id")
+        if not _GATE_REQUIRED <= set(message) <= _GATE_KEYS or agent not in consent_limits.AGENTS \
+                or not isinstance(tool_name, str) or not tool_name or len(tool_name) > 256 \
+                or not isinstance(digest, str) or not digest or len(digest) > 256 \
+                or (tid is not None and not isinstance(tid, str)):
+            return wire.refusal(rid, "frame-malformed")
+        halting = self._halted_on(who.session)
+        if halting is not None:
+            return wire.answer(rid, gate="halted", request_id=halting)
+        if self._limits is None:
+            return wire.answer(rid, gate="go")
+        in_force = self._limits(agent, who.session)
+        if in_force is None:
+            return wire.answer(rid, gate="go")
+        # every kind the callable leaves out is unlimited (count_call reads all of KINDS)
+        full = {k: float(in_force.get(k, float("inf"))) for k in consent_limits.KINDS}
+        event = {"tool_use_id": tid} if isinstance(tid, str) else {}
+        verdict = consent_limits.count_call(self._limits_dir(), agent, who.session, event, tool_name=tool_name,
+                                            tool_input=digest, limits=full)
+        if verdict.state in _GATE_OVER:
+            return wire.answer(rid, gate="over-limit", kind=verdict.kind)
+        return wire.answer(rid, gate="go")
+
+    def _limits_dir(self) -> Path:
+        """Where the counter keeps ``limits.db``: :data:`LIMITS_DIR` under ``requests/`` (the broker's own directory;
+        ``L/queue`` itself is root's), a 0700 directory of the broker's uid as the counter requires. One that cannot
+        be made is left to the counter, which fails as it does on any store failure."""
+        path = self._store.requests / LIMITS_DIR
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        except OSError:
+            log.exception("qbroker: the limits directory %s could not be made", path)
+        return path
+
+    def _halted_on(self, session: str) -> str | None:
+        """The request id the session is halted on (module docstring, GATE), or ``None``. A receipts read that
+        fails raises (the GATE is refused broker-error: the hook denies)."""
+        with self._mutex:
+            ids = sorted(self._halting.get(session, ()))
+        now = self._clock()
+        stamp = utc_stamp(now)
+        for request_id in ids:
+            try:
+                row = self._store.read_request(request_id)
+            except ValueError:
+                row = None
+            request = stored_request(row, self._store.queue_id, request_id)
+            if request is None or row.get("session") != session:
+                return request_id         # a halting row that no longer reads is halted (the stricter side)
+            state = self._receipts.state(request_id)
+            if state == "expired":
+                return request_id
+            if request.expires_at > stamp:
+                continue                  # still held: the call itself waits; the session's others go on
+            if state is None:
+                return request_id
+            if state == "pending":
+                # ANSWER?'s own step past the hold: an answer there in time decides it, else it is recorded expired
+                decision, _ = self._answered(row, request, now)
+                if decision is None:
+                    self._receipts.expired(request, stamp)
+                    return request_id
+        return None
 
     def _answered(self, row: Mapping[str, Any], request: ExternalGateRequest,
                   now: datetime) -> tuple[str | None, bool]:
