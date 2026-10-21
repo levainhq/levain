@@ -35,7 +35,7 @@
   // carries (an event's or a row's `repo`), noted as they are read; the package knows none. Slots go to the known repos in
   // name order, each to its name's hash slot or the next free one, so up to HUE_SLOTS repos never share a hue; past that a
   // repo takes its hash slot. A repo not noted yet gets its hash slot.
-  var HUE_SLOTS = 5;   // --hue-1 .. --hue-5 in dashboard.css
+  var HUE_SLOTS = 8;   // --hue-1 .. --hue-8 in dashboard.css (a stylesheet without 6-8 shows slot k as k mod 5)
   var MAX_KNOWN = 64;
   var known = Object.create(null), nKnown = 0, slotOf = null;
   function slotHash(r) {
@@ -312,7 +312,7 @@
       return { base: css('--base', '#060912'), accent: css('--accent', '#ff8a3d'), contrast: css('--contrast', css('--text', '#f3f5f9')),
         label: css('--label', '#9ba6ba'), meta: css('--meta', '#7d889c'), hair: css('--hair', '#1c2435'), hair2: css('--hair-2', '#121a2a'),
         bad: css('--bad', '#e5484d'), ok: css('--ok', '#3ecf8e'), info: css('--info', '#5aa9ff'), violet: css('--violet', '#b48cff'),
-        hues: (function () { var o = {}; for (var i = 1; i <= HUE_SLOTS; i++) o[String(i)] = css('--hue-' + i, ''); return o; })() };
+        hues: (function () { var o = {}; for (var i = 1; i <= HUE_SLOTS; i++) o[String(i)] = css('--hue-' + i, i > 5 ? css('--hue-' + (((i - 1) % 5) + 1), '') : ''); return o; })() };
     }
 
     function setToggle() {

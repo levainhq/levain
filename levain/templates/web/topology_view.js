@@ -58,7 +58,14 @@
 
   // ---- what persists: the header lens (agents graph | event graph | work). A cold open, or a store that throws or holds anything else, is the Agents graph ----
   const HEADER_LENSES = [["agents", "Agents graph"], ["events", "Event graph"], ["work", "Work"]];
-  function headerLens() { const v = stored(HEADER_KEY); return v === "events" || v === "work" ? v : "agents"; }
+  // A phone-width card with no stored choice opens on Work: the graph draws at a fraction of its scale there, its text unreadable. An explicit
+  // pick (including "agents") is kept; the graph stays one tap away.
+  const NARROW_PX = 560;
+  function headerLens() {
+    const v = stored(HEADER_KEY);
+    if (v === "events" || v === "work" || v === "agents") return v;
+    return typeof root.innerWidth === "number" && root.innerWidth > 0 && root.innerWidth < NARROW_PX ? "work" : "agents";
+  }
   function setHeaderLens(id) { keep(HEADER_KEY, id); }
 
   function seg(name, items, current, onPick) {
@@ -500,6 +507,9 @@
     return f;
   }
   // the geometry of the graph (pure: positions only, no DOM). `measure(text, font)` returns a pixel width.
+  // A seat with more than ROW_CAP lanes wraps into two ranks (row-major in document order, so a subagent stays beside or under its
+  // parent) when the card has the room; a narrow card keeps today's single column.
+  const ROW_CAP = 7;
   function layoutGraph(v, LW, measure) {
     const nodes = arr(v.nodes), groups = arr(v.groups).slice();
     const gids = new Set(groups.map((g) => g.id));
@@ -507,42 +517,75 @@
     const groupOf = (n) => (gids.has(n.group) ? n.group : null);
     const mineOf = (g) => nodes.filter((n) => groupOf(n) === g.id);
     const live = groups.filter((g) => mineOf(g).length);
-    const rowsOf = (g) => mineOf(g).length;
+    // each face's width, measured once: the ranks need the widest face of a column before anything is placed
+    const tws = new Map();
+    for (const n of nodes) {
+      const f = faceOf(n, v.as_of);
+      let w = Math.max(measure(f.l1, "l1"), measure(f.l2, "l2"), measure(f.l3, "l2"));
+      if (f.tag) w = Math.max(w, measure(f.tag, "tag") + 16);
+      tws.set(n.id, w + 6);
+    }
+    const hubX = LW / 2;
+    // the widest face in a seat's first rank (the first of each pair in document order), and whether a second rank fits beside it
+    const faceWOf = (g, rk) => mineOf(g).reduce((m, n, i) => (i % 2 === rk ? Math.max(m, tws.get(n.id) || 0) : m), 0);
+    // room for a second rank: its faces must still end inside the graph. The seat nodes' column draws in toward the hub, as far as 76, to make it.
+    const RANK_GAP = 52, EDGE_PAD = 12;
+    const roomFor = (g, col) => hubX - col - (faceWOf(g, 0) + RANK_GAP) - faceWOf(g, 1) - EDGE_PAD >= 0;
+    const gxFull = Math.max(76, Math.min(190, LW / 2 - 262 - 120));
+    const tall = live.filter((g) => mineOf(g).length > ROW_CAP);
+    let gx0 = gxFull;
+    if (tall.length && !tall.every((g) => roomFor(g, gxFull + 120))) {
+      const need = Math.max(...tall.map((g) => faceWOf(g, 0) + faceWOf(g, 1)));
+      const tight = Math.max(76, Math.min(gxFull, Math.floor(hubX - need - RANK_GAP - EDGE_PAD - 120)));
+      if (tall.every((g) => roomFor(g, tight + 120))) gx0 = tight;
+    }
+    const col0 = gx0 + 120;
+    const ranksOf = (g) => (mineOf(g).length <= ROW_CAP ? 1 : roomFor(g, col0) ? 2 : 1);
+    const rowsOf = (g) => Math.ceil(mineOf(g).length / ranksOf(g));
     const order = live.slice().sort((a, b) => rowsOf(b) - rowsOf(a));
     const side = { L: [], R: [] }, load = { L: 0, R: 0 };
     for (const g of order) { const s = load.L <= load.R ? "L" : "R"; side[s].push(g); load[s] += rowsOf(g); }
     const gapOf = (l) => Math.max(0, l.length - 1) * 26;
-    const need = (s) => load[s] * 64 + gapOf(side[s]);
+    // a second rank sits half a pitch lower, so its last row hangs half a pitch below the first rank's
+    const halfOf = (l) => (l.some((g) => ranksOf(g) === 2) ? 32 : 0);
+    const need = (s) => load[s] * 64 + gapOf(side[s]) + halfOf(side[s]);
     const H = Math.max(MIN_H, Math.round(70 + Math.max(need("L"), need("R"))));
-    const hub = { x: LW / 2, y: H / 2 + 6, r: 30 };
-    const gx0 = Math.max(76, Math.min(190, LW / 2 - 262 - 120));
+    const hub = { x: hubX, y: H / 2 + 6, r: 30 };
+    const hubName = isObj(v.hub) && typeof v.hub.label === "string" ? v.hub.label : "";
+    const hubHalf = Math.max(measure(hubName, "group"), measure(nodes.length + " sessions \u00b7 " + nodes.length + " running", "l2"), 70) / 2 + 7;
     const pos = new Map(), gpos = new Map();               // keyed by wire id in a Map: an id such as "__proto__" is an id
     const placed = new Set();
     for (const sd of ["L", "R"]) {
-      const dir = sd === "L" ? -1 : 1, list = side[sd], gaps = gapOf(list);
-      const pitch = Math.max(64, Math.min(86, (H - 70 - gaps) / Math.max(1, load[sd])));
-      let y = hub.y - (load[sd] * pitch + gaps) / 2 + pitch / 2;
+      const dir = sd === "L" ? -1 : 1, list = side[sd], gaps = gapOf(list), half = halfOf(list);
+      const pitch = Math.max(64, Math.min(86, (H - 70 - gaps - half) / Math.max(1, load[sd])));
+      let y = hub.y - (load[sd] * pitch + gaps + half) / 2 + pitch / 2;
       for (const g of list) {
         const mine = mineOf(g), ids = new Set(mine.map((n) => n.id)), ys = [];
+        const ranks = ranksOf(g), rank1 = hub.x + dir * col0 + dir * (faceWOf(g, 0) + RANK_GAP);
+        let i = 0;
         const put = (n, depth) => {
           if (placed.has(n.id)) return;
           placed.add(n.id);
-          const x = hub.x + dir * (gx0 + 120) - dir * Math.min(30 * depth, 90);
-          pos.set(n.id, { id: n.id, x, y, side: dir, depth }); ys.push(y); y += pitch;
+          const rk = ranks === 2 ? i % 2 : 0, row = ranks === 2 ? Math.floor(i / 2) : i;
+          i++;
+          const base = rk === 1 ? rank1 : hub.x + dir * col0;
+          const x = base - dir * (rk === 1 ? 0 : Math.min(30 * depth, 90)), ny = y + row * pitch + (rk === 1 ? pitch / 2 : 0);
+          pos.set(n.id, { id: n.id, x, y: ny, side: dir, depth, rank: rk, tw: tws.get(n.id) }); ys.push(ny);
           for (const k of mine) if (k.parent === n.id) put(k, depth + 1);
         };
         for (const n of mine) if (!n.parent || !ids.has(n.parent)) put(n, 0);
         for (const n of mine) put(n, 0);                 // a parent cycle has no root: the rest sit at the column's own level
-        const gy = ys.reduce((s, q) => s + q, 0) / (ys.length || 1);
-        gpos.set(g.id === null ? "" : g.id, { id: g.id, label: g.label, x: hub.x + dir * gx0, y: gy, r: 16 });
-        y += 26;
+        let gy = ys.reduce((s, q) => s + q, 0) / (ys.length || 1);
+        // a seat drawn close to the hub (the second rank took the room) must not sit on the hub's own label: it steps clear of it, to the nearer side
+        const lw = Math.max(measure(g.label, "group") + 16, measure("00 agents \u00b7 00 running", "l2")) / 2 + 7;
+        const clashX = Math.abs(hub.x + dir * gx0 - hub.x) < hubHalf + lw;
+        if (clashX && gy + 56 > hub.y - 76 && gy - 16 < hub.y + hub.r + 8) {
+          const up = hub.y - 76 - 56 - 2, down = hub.y + hub.r + 8 + 16 + 4;
+          gy = gy - up < down - gy && up >= 24 ? up : down;
+        }
+        gpos.set(g.id === null ? "" : g.id, { id: g.id, label: g.label, repo: g.repo, x: hub.x + dir * gx0, y: gy, r: 16, ranks });
+        y += Math.ceil(mine.length / ranks) * pitch + 26;
       }
-    }
-    for (const n of nodes) {
-      const f = faceOf(n, v.as_of), p = pos.get(n.id);
-      let w = Math.max(measure(f.l1, "l1"), measure(f.l2, "l2"), measure(f.l3, "l2"));
-      if (f.tag) w = Math.max(w, measure(f.tag, "tag") + 16);
-      p.tw = w + 6;
     }
     return { LW, H, hub, gpos, pos, gkey: (n) => (gids.has(n.group) ? n.group : "") };
   }
@@ -565,11 +608,11 @@
     const out = [];
     let i = 0;
     for (const [k, gp] of L.gpos) {
-      out.push({ kind: "hub", id: k, rate: gRate.get(k) || 0, state: null, e: mkEdge({ x: gp.x, y: gp.y }, { x: L.hub.x, y: L.hub.y }, (gp.x < L.hub.x ? -1 : 1) * 0.1 * (i++ % 2 ? 1 : -1)) });
+      out.push({ kind: "hub", id: k, seat: gp.seat || 0, rate: gRate.get(k) || 0, state: null, e: mkEdge({ x: gp.x, y: gp.y }, { x: L.hub.x, y: L.hub.y }, (gp.x < L.hub.x ? -1 : 1) * 0.1 * (i++ % 2 ? 1 : -1)) });
     }
     for (const n of arr(v.nodes)) {
       const a = L.pos.get(n.id), to = n.parent && L.pos.has(n.parent) && byId.has(n.parent) ? L.pos.get(n.parent) : L.gpos.get(L.gkey(n));
-      out.push({ kind: "node", id: n.id, rate: streams(n) ? n.rate : 0, state: n.state, e: mkEdge({ x: a.x, y: a.y }, { x: to.x, y: to.y }, 0.12 * (a.y < to.y ? 1 : -1)) });
+      out.push({ kind: "node", id: n.id, seat: (L.gpos.get(L.gkey(n)) || {}).seat || 0, rate: streams(n) ? n.rate : 0, state: n.state, e: mkEdge({ x: a.x, y: a.y }, { x: to.x, y: to.y }, 0.12 * (a.y < to.y ? 1 : -1)) });
     }
     return out;
   }
@@ -584,12 +627,12 @@
     for (const [k, gp] of L.gpos) {
       const mem = nodes.filter((n) => L.gkey(n) === k), run = mem.filter((n) => n.state === "running").length;
       const sub = mem.length + (mem.length === 1 ? " agent" : " agents") + " \u00b7 " + run + " running";
-      const lw = Math.max(measure(gp.label, "group"), measure(sub, "l2")), ly = gp.y + gp.r + 18;
+      const lw = Math.max(measure(gp.label, "group") + (gp.seat ? 16 : 0), measure(sub, "l2")), ly = gp.y + gp.r + 18;
       out.groups.set(k, { sub, ly, rect: box(gp.x - lw / 2 - 7, ly - 14, lw + 14, 36) });
     }
     for (const n of nodes) {
       const P = L.pos.get(n.id), f = faceOf(n, v.as_of), dir = P.side, wait = n.state === "waiting";
-      const tx = P.x + dir * (wait ? 26 : 17), bw = P.tw + 8, bh = f.tag ? 66 : 50, bx = dir === 1 ? tx - 5 : tx - P.tw - 3;
+      const tx = P.x + dir * (wait ? 26 : 17), bw = P.tw + 8, bh = f.tag ? 64 : 46, bx = dir === 1 ? tx - 5 : tx - P.tw - 3;
       out.faces.set(n.id, box(bx, P.y - (f.tag ? 30 : 13), bw, bh));
       out.rings.push(box(P.x - 17, P.y - 17, 34, 34));
     }
@@ -642,16 +685,129 @@
     return out;
   }
 
+  // ---- seat colour: one hue per seat, carried by the group node, its sessions' cores, its edges, its streams and its constellation ----
+  // A seat's slot comes from the page's one repo-hue table (sky.js hueKey, the same slot the row tags use). Slots 6-8 are tokens a
+  // stylesheet may not carry yet: a slot past 5 with no --hue-N falls back to its slot mod 5, so a missing token is a shared hue and
+  // never a missing one. A group with no repo of its own (the loose "ungrouped" block) has no seat and stays neutral.
+  const HUE_SLOTS = 8, HUE_BASE = 5;
+  const hueName = (slot, have8) => "--hue-" + (have8 || slot <= HUE_BASE ? slot : ((slot - 1) % HUE_BASE) + 1);
+  function seatSlot(gp) {
+    const S = root.LevainSky;
+    const key = gp && gp.id !== null && gp.id !== undefined ? (gp.repo || gp.label) : "";
+    if (!key || !S || typeof S.hueKey !== "function") return 0;
+    if (typeof S.noteRepo === "function") S.noteRepo(key);
+    const k = parseInt(S.hueKey(key), 10);
+    return k >= 1 && k <= HUE_SLOTS ? k : 0;
+  }
+  // the attribute that hands an element its seat hue (the rules below turn it into a custom property); none for a neutral one
+  function seatAttrs(slot) { return slot ? { "data-seat": String(slot) } : null; }
+  // These rules belong to the graph's drawing, so they travel with it, adopted once as a constructable stylesheet: the page's policy
+  // (style-src 'self') refuses an inline <style> and a style="" attribute, and a stylesheet built here is neither.
+  const GRAPH_CSS = [
+    '[data-seat="1"] { --seat: var(--hue-1); } [data-seat="2"] { --seat: var(--hue-2); } [data-seat="3"] { --seat: var(--hue-3); } [data-seat="4"] { --seat: var(--hue-4); }',
+    '[data-seat="5"] { --seat: var(--hue-5); } [data-seat="6"] { --seat: var(--hue-6, var(--hue-1)); } [data-seat="7"] { --seat: var(--hue-7, var(--hue-2)); } [data-seat="8"] { --seat: var(--hue-8, var(--hue-3)); }',
+    ".tv-graph .tv-edge[data-seat]:not(.waiting) { stroke: color-mix(in oklch, var(--seat) 35%, transparent); stroke-width: 1px; opacity: 1; }",
+    ".tv-graph .tv-ggroup[data-seat] .tv-gbody { fill: color-mix(in oklch, var(--seat) 22%, var(--base)); stroke: var(--seat); stroke-width: 1.5px; }",
+    ".tv-graph .tv-ggroup[data-seat].waiting .tv-gbody { stroke: var(--accent-line); }",
+    ".tv-graph .tv-gdot { fill: var(--seat); }",
+    ".tv-graph .tv-gnode[data-seat]:not(.waiting) .tv-core { fill: var(--seat); opacity: 1; }",
+    ".tv-graph .tv-face1, .tv-graph .tv-face2, .tv-graph .tv-face3, .tv-graph .tv-gname, .tv-graph .tv-gsub, .tv-graph .tv-gnode:not(.waiting) .tv-facetag { paint-order: stroke; stroke: var(--base); stroke-width: 3px; stroke-linejoin: round; }",
+    ".tv-graph .tv-gnode:focus-visible .tv-facebg { stroke: var(--accent); stroke-width: 2; }",
+    ".tv-graph .tv-gnode[aria-pressed=\"true\"] .tv-ring { stroke-width: 2.6; }",
+    ".tv-graph .tv-gring { opacity: .5; }",
+    ".tv-sky { --_sa: var(--sky-star-a, .35); --_la: var(--sky-line-a, .12); pointer-events: none; }",
+    ":root[data-theme=\"light\"] .tv-sky { --_sa: var(--sky-star-a, .45); --_la: var(--sky-line-a, .10); }",
+    "@media (prefers-color-scheme: light) { :root:not([data-theme=\"dark\"]) .tv-sky { --_sa: var(--sky-star-a, .45); --_la: var(--sky-line-a, .10); } }",
+    ".tv-sky .tv-star { fill: var(--seat, var(--meta)); fill-opacity: var(--_sa); }",
+    ".tv-sky .tv-sline { fill: none; stroke: var(--seat, var(--meta)); stroke-opacity: var(--_la); stroke-width: .5px; }",
+    "@media (prefers-reduced-motion: no-preference) { .tv-sky .tv-twk { animation: tv-twinkle 5s ease-in-out 0s 3; }",
+    '  .tv-sky .tv-twk[data-t="1"] { animation-duration: 4s; animation-delay: .7s; } .tv-sky .tv-twk[data-t="2"] { animation-duration: 6s; animation-delay: 1.9s; }',
+    '  .tv-sky .tv-twk[data-t="3"] { animation-duration: 7s; animation-delay: 3.1s; } .tv-sky .tv-twk[data-t="4"] { animation-duration: 4.5s; animation-delay: 2.4s; } }',
+    "@keyframes tv-twinkle { 0%, 100% { fill-opacity: var(--_sa); } 50% { fill-opacity: .8; } }",
+    "@media (prefers-reduced-motion: reduce) { .tv-graph .tv-edge.live { stroke-dasharray: 5 4; stroke-linecap: round; opacity: 1; }",
+    "  .tv-graph .tv-edge.live[data-seat]:not(.waiting) { stroke: var(--seat); stroke-opacity: .8; } }",
+  ].join("\n");
+  let graphSheet = null;
+  function ensureGraphCss() {
+    const d = root.document;
+    if (!d || graphSheet || typeof root.CSSStyleSheet !== "function" || !("adoptedStyleSheets" in d)) return;
+    try {
+      const sh = new root.CSSStyleSheet();
+      sh.replaceSync(GRAPH_CSS);
+      d.adoptedStyleSheets = Array.from(d.adoptedStyleSheets).concat([sh]);
+      graphSheet = sh;
+    } catch (_) { /* no constructable sheets: the graph is drawn with the page's own rules, seat hue left out */ }
+  }
+
+  // ---- the constellation: stars behind the graph, generated from the topology value alone ----
+  // Deterministic (the group's id seeds a small generator; nothing here calls Math.random), so a refresh never moves a star. One figure
+  // per seat: 3 + min(nodes, 9) stars in a band outside that seat's side of the rings, each star's size from a node's token count,
+  // joined in angle order by hairlines. Drawn once per layout (zero per-frame cost); a few stars twinkle, and only where motion is welcome.
+  const STAR_CAP = 160, SLINE_CAP = 120, TWINKLE_CAP = 12;
+  function fnv1a(str) {
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+    return h >>> 0;
+  }
+  function lcg(seed) {
+    let s = (seed >>> 0) || 1;
+    return () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 4294967296; };
+  }
+  function drawSky(v, L) {
+    const g = sv("g", { "aria-hidden": "true" }, "tv-sky");
+    const nodes = arr(v.nodes), hub = L.hub;
+    const rx = L.LW * RING_H[1] * 1.15, ry = L.H * RING_H[1] * 1.05;
+    let stars = 0, lines = 0, twinkle = 0;
+    // the farthest a ray from the hub can run before it leaves the graph, in units of the outer ring
+    const reach = (a) => {
+      const c = Math.cos(a), s = Math.sin(a);
+      const tx = Math.abs(c) < 1e-6 ? Infinity : (c > 0 ? L.LW - 6 - hub.x : hub.x - 6) / (Math.abs(c) * rx);
+      const ty = Math.abs(s) < 1e-6 ? Infinity : (s > 0 ? L.H - 6 - hub.y : hub.y - 6) / (Math.abs(s) * ry);
+      return Math.min(tx, ty);
+    };
+    const figure = (key, count, centre, spread, tokens, seat) => {
+      const rand = lcg(fnv1a(key)), pts = [];
+      for (let i = 0; i < count && stars + pts.length < STAR_CAP; i++) {
+        const a = centre + (rand() - 0.5) * 2 * spread, far = reach(a);
+        const rho = far > 1.04 ? 1.02 + rand() * (far - 1.02) : far * (0.9 + 0.1 * rand());
+        const tk = tokens.length ? tokens[i % tokens.length] : null;
+        const r = isNum(tk) && tk > 0 ? 0.6 + 1.2 * Math.min(1, Math.log10(tk + 1) / 7) : 0.8;
+        pts.push({ a, r, x: hub.x + Math.cos(a) * rx * rho, y: hub.y + Math.sin(a) * ry * rho, tw: rand() });
+      }
+      pts.sort((p, q) => p.a - q.a);
+      const fig = sv("g", seatAttrs(seat));
+      for (let i = 1; i < pts.length && lines < SLINE_CAP; i++, lines++) {
+        fig.appendChild(sv("line", { x1: num(pts[i - 1].x), y1: num(pts[i - 1].y), x2: num(pts[i].x), y2: num(pts[i].y) }, "tv-sline"));
+      }
+      for (const p of pts) {
+        const tw = twinkle < TWINKLE_CAP && p.tw < 0.5;
+        const c = sv("circle", { cx: num(p.x), cy: num(p.y), r: num(p.r) }, "tv-star" + (tw ? " tv-twk" : ""));
+        if (tw) { c.setAttribute("data-t", String(twinkle % 5)); twinkle++; }
+        fig.appendChild(c);
+        stars++;
+      }
+      g.appendChild(fig);
+    };
+    for (const [k, gp] of L.gpos) {
+      const mine = nodes.filter((n) => L.gkey(n) === k);
+      const dir = gp.x < hub.x ? -1 : 1, ny = (gp.y - hub.y) / ry;
+      figure("g:" + k, 3 + Math.min(mine.length, 9), Math.atan2(ny, dir), 0.5, mine.map((n) => n.tokens), gp.seat || 0);
+    }
+    figure("hub", 5, Math.PI / 2, Math.PI, [], 0);        // the hub's five neutral stars, anywhere round it
+    return g;
+  }
+
   // ---- the SVG ----
   function drawGraph(v, L, edges, measure, opts) {
     const svg = sv("svg", { viewBox: "0 0 " + L.LW + " " + L.H, role: "group", "aria-label": "Agents graph", preserveAspectRatio: "xMidYMid meet" }, "tv-graph");
     const nodes = arr(v.nodes), byId = new Map(nodes.map((n) => [n.id, n]));
     const lost = lostMap(v), bxs = graphBoxes(v, L, measure);
+    svg.appendChild(drawSky(v, L));
     for (const k of RING_H) svg.appendChild(sv("ellipse", { cx: num(L.hub.x), cy: num(L.hub.y), rx: num(L.LW * k * 1.15), ry: num(L.H * k * 1.05) }, "tv-gring"));
     const eg = sv("g", null, "tv-edges");
     for (const ed of edges) {
       const live = ed.rate > 0, waiting = ed.kind === "node" && ed.state === "waiting";
-      const p = sv("path", { d: edgePath(ed.e), "data-edge": ed.kind + ":" + ed.id, "data-rate": live ? String(ed.rate) : "none" }, "tv-edge" + (live ? " live" : "") + (ed.kind === "hub" ? " hub" : "") + (waiting ? " waiting" : "") + (!live && !waiting ? " still" : ""));
+      const p = sv("path", Object.assign({ d: edgePath(ed.e), "data-edge": ed.kind + ":" + ed.id, "data-rate": live ? String(ed.rate) : "none" }, seatAttrs(ed.seat)), "tv-edge" + (live ? " live" : "") + (ed.kind === "hub" ? " hub" : "") + (waiting ? " waiting" : "") + (!live && !waiting ? " still" : ""));
       eg.appendChild(p);
     }
     svg.appendChild(eg);
@@ -683,12 +839,13 @@
     for (const [k, gp] of L.gpos) {
       const mem = nodes.filter((n) => L.gkey(n) === k);
       const run = mem.filter((n) => n.state === "running").length, wait = mem.some((n) => n.state === "waiting");
-      const gg = sv("g", { "data-group": k }, "tv-ggroup" + (wait ? " waiting" : ""));
+      const gg = sv("g", Object.assign({ "data-group": k }, seatAttrs(gp.seat)), "tv-ggroup" + (wait ? " waiting" : ""));
       gg.appendChild(sv("circle", { cx: num(gp.x), cy: num(gp.y), r: gp.r }, "tv-gbody"));
       gg.appendChild(sv("circle", { cx: num(gp.x), cy: num(gp.y), r: 4 }, "tv-gcore" + (run ? " run" : "")));
       const bg = bxs.groups.get(k), sub = bg.sub, ly = bg.ly, gr = bg.rect;
       gg.appendChild(sv("rect", { x: num(gr.x), y: num(gr.y), width: num(gr.w), height: gr.h, rx: 7 }, "tv-lblbg"));
       gg.appendChild(sv("text", { x: num(gp.x), y: num(ly), "text-anchor": "middle" }, "tv-gname", gp.label));
+      if (gp.seat) gg.appendChild(sv("circle", { cx: num(gp.x - measure(gp.label, "group") / 2 - 8), cy: num(ly - 4), r: 3 }, "tv-gdot"));
       gg.appendChild(sv("text", { x: num(gp.x), y: num(ly + 15), "text-anchor": "middle" }, "tv-gsub", sub));
       svg.appendChild(gg);
     }
@@ -696,7 +853,7 @@
     const tickers = [];
     for (const n of nodes) {
       const P = L.pos.get(n.id), f = faceOf(n, v.as_of), dir = P.side, wait = n.state === "waiting", r = wait ? 11 : 9;
-      const g = sv("g", { "data-node": n.id, "data-state": n.state }, "tv-gnode " + n.state);
+      const g = sv("g", Object.assign({ "data-node": n.id, "data-state": n.state }, seatAttrs((L.gpos.get(L.gkey(n)) || {}).seat)), "tv-gnode " + n.state);
       g.appendChild(sv("circle", { cx: num(P.x), cy: num(P.y), r: 17 }, "tv-hit"));
       if (wait) {
         for (let i = 6; i >= 1; i--) g.appendChild(sv("circle", { cx: num(P.x), cy: num(P.y), r: r + i * 6, "fill-opacity": num((0.05 + 0.03 * 0.5) * (7 - i) / 6) }, "tv-glow"));
@@ -724,10 +881,13 @@
       const risk = riskTitle(lost.get(n.id));
       if (risk) g.appendChild(sv("circle", { cx: num(P.x + dir * 12), cy: num(P.y - 12), r: 3.5 }, "tv-gnode-risk"));
       g.dataset.face = [f.tag, f.l1, f.l2, f.l3].filter(Boolean).join(" | ");
+      // every node is a keyboard stop: Enter or Space pins its card as a click does, Esc lets go (agentsLens binds the keys)
+      g.setAttribute("role", "button");
+      g.setAttribute("tabindex", "0");
+      g.setAttribute("aria-pressed", pinned && pinned.id === n.id ? "true" : "false");
+      g.setAttribute("aria-label", n.label + ", " + (NODE_WORDS[n.state] || n.state) + ": pin its card");
       if (wait && typeof n.card === "string" && n.card && opts && typeof opts.openCard === "function") {
         g.classList.add("tv-open");
-        g.setAttribute("role", "button");
-        g.setAttribute("tabindex", "0");
         g.setAttribute("aria-label", n.label + ", waiting on you: open its card");
         g.dataset.card = n.card;
         const go = () => opts.openCard(n.card);
@@ -751,6 +911,37 @@
   }
 
   // ---- the particles: a canvas under the graph, drawn only while some edge streams ----
+  // Each particle wears its edge's seat hue. On a dark stage a particle is a pre-rendered glow sprite drawn additively
+  // ("lighter" sums colour: light that glows); on a light stage additive light washes out, so it is a solid dot drawn plainly.
+  // The sprites are built per hue and rebuilt only when the theme or a hue token changes (no shadowBlur: that costs per draw).
+  let probeCtx = null;
+  function cssRGB(str) {                                                  // any CSS colour the browser reads -> [r, g, b]
+    if (!probeCtx) { const c = document.createElement("canvas"); c.width = c.height = 1; probeCtx = c.getContext("2d", { willReadFrequently: true }); }
+    if (!probeCtx) return [153, 153, 153];
+    probeCtx.clearRect(0, 0, 1, 1);
+    probeCtx.fillStyle = "#999";
+    probeCtx.fillStyle = String(str);
+    probeCtx.fillRect(0, 0, 1, 1);
+    const d = probeCtx.getImageData(0, 0, 1, 1).data;
+    return [d[0], d[1], d[2]];
+  }
+  function mkSprite(rgb, dark, glowA) {
+    const m = 2, c = document.createElement("canvas");                    // a 16-unit box at 2x, so a particle stays sharp on a dense screen
+    c.width = c.height = 16 * m;
+    const x = c.getContext("2d");
+    if (!x) return c;
+    const col = (a) => "rgba(" + rgb[0] + "," + rgb[1] + "," + rgb[2] + "," + a + ")";
+    if (dark) {
+      const gr = x.createRadialGradient(8 * m, 8 * m, 0, 8 * m, 8 * m, 8 * m);
+      gr.addColorStop(0, col(1)); gr.addColorStop(1.5 / 8, col(1)); gr.addColorStop(3 / 8, col(glowA)); gr.addColorStop(1, col(0));
+      x.fillStyle = gr;
+      x.fillRect(0, 0, 16 * m, 16 * m);
+    } else {
+      x.fillStyle = col(0.9);
+      x.beginPath(); x.arc(8 * m, 8 * m, 1.6 * m, 0, Math.PI * 2); x.fill();
+    }
+    return c;
+  }
   function startStreams(canvas, stage, edges, getScale, still) {
     const reduced = !!(root.matchMedia && root.matchMedia("(prefers-reduced-motion: reduce)").matches);
     const live = still ? [] : edges.filter((e) => e.rate > 0);        // a frame from the ledger draws no stream
@@ -761,13 +952,27 @@
     const ctx = canvas.getContext("2d");
     if (!ctx) return null;
     const PART = [];
-    let quality = 1, ema = 16.7, last = 0, n = 0, stopped = false, raf = 0, color = "";
+    let quality = 1, ema = 16.7, last = 0, n = 0, stopped = false, raf = 0;
+    let sprites = new Map(), spriteKey = "", dark = true;
+    const refresh = () => {                                               // theme and hue tokens, re-read now and then: the toggle has no event for the canvas
+      const cs = root.getComputedStyle(canvas);
+      const base = cssRGB(cs.getPropertyValue("--base") || "#000");
+      const isDark = (0.2126 * base[0] + 0.7152 * base[1] + 0.0722 * base[2]) / 255 < 0.5;
+      const have8 = cs.getPropertyValue("--hue-6").trim() !== "";
+      const glowRaw = parseFloat(cs.getPropertyValue("--glow-a")), glowA = Number.isFinite(glowRaw) && glowRaw > 0 ? glowRaw : 0.35;
+      const names = new Map();
+      for (const e of live) names.set(e.seat || 0, e.seat ? cs.getPropertyValue(hueName(e.seat, have8)).trim() : cs.color);
+      const key = [isDark, glowA, ...Array.from(names.entries()).map((kv) => kv.join("="))].join("|");
+      if (key === spriteKey) return;
+      spriteKey = key; dark = isDark; sprites = new Map();
+      for (const [slot, str] of names) sprites.set(slot, mkSprite(cssRGB(str || "#999"), isDark, glowA));
+    };
     const step = (dt) => {
       for (const ed of live) {
         // bounded BEFORE it accumulates: a finite wire rate can scale to Infinity, and an unbounded accumulator is an unbounded loop
         const inc = ed.rate * (ed.kind === "hub" ? 5 : 10) * quality * dt;
         ed.acc = Math.min(EDGE_STEP_MAX, (ed.acc || 0) + (Number.isFinite(inc) ? Math.max(0, inc) : EDGE_STEP_MAX));
-        for (let spawned = 0; ed.acc >= 1 && spawned < EDGE_STEP_MAX; spawned++) { ed.acc -= 1; PART.push({ ed, t: 0, sp: 0.22 + Math.random() * 0.22, off: Math.random() + Math.random() - 1, sz: 1.3 + Math.random() * 1.3, hub: ed.kind === "hub" }); }
+        for (let spawned = 0; ed.acc >= 1 && spawned < EDGE_STEP_MAX; spawned++) { ed.acc -= 1; PART.push({ ed, t: 0, sp: 0.22 + Math.random() * 0.22, off: Math.random() + Math.random() - 1, k: Math.random(), hub: ed.kind === "hub" }); }
       }
       for (let i = PART.length - 1; i >= 0; i--) { const p = PART[i]; p.t += p.sp * dt * (p.ed.e.len > 200 ? 0.8 : 1.15); if (p.t >= 1) PART.splice(i, 1); }
       const cap = Math.round(PARTICLE_CAP * quality);
@@ -776,14 +981,20 @@
     const draw = () => {
       const s = getScale(), dpr = canvas.width / Math.max(1, canvas.clientWidth || canvas.width);
       ctx.setTransform(dpr * s, 0, 0, dpr * s, 0, 0);
+      ctx.globalCompositeOperation = "source-over";
       ctx.clearRect(0, 0, canvas.width / (dpr * s) + 1, canvas.height / (dpr * s) + 1);
-      ctx.fillStyle = color || "#999";
+      if (dark) ctx.globalCompositeOperation = "lighter";
       for (const p of PART) {
         const e = p.ed.e, pt = bez(e, p.t), spread = (p.hub ? 7 : 4.2) * (0.25 + p.t) * p.off;
+        const sp = sprites.get(p.ed.seat || 0);
+        if (!sp) continue;
+        const d = dark ? 1.6 + 1.4 * p.k : 2.0 + 1.2 * p.k;                // the core's diameter: dark 1.6-3.0, light 2.0-3.2
+        const w = 16 * d / (dark ? 3.0 : 3.2);
         ctx.globalAlpha = Math.pow(Math.sin(Math.PI * Math.min(1, p.t)), 0.7) * (p.hub ? 0.62 : 0.8);
-        ctx.fillRect(pt.x + e.nx * spread - p.sz / 2, pt.y + e.ny * spread - p.sz / 2, p.sz, p.sz);
+        ctx.drawImage(sp, pt.x + e.nx * spread - w / 2, pt.y + e.ny * spread - w / 2, w, w);
       }
       ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = "source-over";
     };
     const loop = (ts) => {
       if (stopped) return;
@@ -792,12 +1003,13 @@
       last = ts;
       ema = ema * 0.9 + dt * 1000 * 0.1;                                  // frame-time adaptive: long frames thin the stream
       if (ema > 24) quality = Math.max(0.15, quality * 0.93); else if (ema < 18) quality = Math.min(1, quality * 1.01);
-      if (n % 60 === 0) color = root.getComputedStyle(canvas).color;
+      if (n % 60 === 0) refresh();
       step(dt);
       draw();
       if (++n % 20 === 0) { stage.dataset.particles = String(PART.length); stage.dataset.quality = quality.toFixed(2); }
       raf = root.requestAnimationFrame(loop);
     };
+    refresh();
     for (let i = 0; i < 260; i++) step(0.03);                             // the stream is already flowing when the lens opens
     stage.dataset.particles = String(PART.length);
     raf = root.requestAnimationFrame(loop);
@@ -805,11 +1017,13 @@
   }
 
   let pinned = null;                                                      // the node whose card a click pinned: {id, x, y} in stage px
+  let kbFocus = null;                                                     // the node id the keyboard focus sits on, kept across a redraw
   function agentsLens(v, opts) {
     release();
     const wrap = el("div", "tv-agents");
     const stage = el("div", "tv-stage");
-    stage.appendChild(el("span", "tv-hint", "Click a node for its card. Hover for the face."));
+    const hint = el("span", "tv-hint", "Click a node for its card. Hover for the face.");
+    stage.appendChild(hint);
     const canvas = el("canvas", "tv-particles");
     canvas.setAttribute("aria-hidden", "true");
     stage.appendChild(canvas);
@@ -827,8 +1041,11 @@
       const measure = (text, k) => { if (mctx) { mctx.font = fonts[k]; return mctx.measureText(String(text)).width; } return String(text).length * 6.4; };
       LW = Math.max(MIN_LW, Math.round(W));
       scale = Math.min(1, W / LW);
+      ensureGraphCss();
       const L = layoutGraph(v, LW, measure);
+      for (const gp of L.gpos.values()) gp.seat = seatSlot(gp);
       const edges = graphEdges(v, L);
+      hint.hidden = W < NARROW_PX;                                    // a phone has no hover, and the hint is a mouse's
       if (streamStop) { streamStop(); streamStop = null; }
       if (svgNode) svgNode.remove();
       const g = drawGraph(v, L, edges, measure, opts);
@@ -887,15 +1104,45 @@
       showTip(n, ev.clientX - box.left, ev.clientY - box.top);
     });
     stage.addEventListener("pointerleave", () => { if (!pinned) hideTip(); });
+    const syncPins = () => {
+      if (!svgNode) return;
+      for (const g of svgNode.querySelectorAll("[data-node]")) g.setAttribute("aria-pressed", pinned && pinned.id === g.dataset.node ? "true" : "false");
+    };
+    // the one pin/let-go move, for a click and for a key: the same node again, or no node, lets go
+    const toggle = (n, x, y) => {
+      if (!n || (pinned && pinned.id === n.id)) { pinned = null; hideTip(); }
+      else { pinned = { id: n.id, x, y }; showTip(n, x, y); }
+      syncPins();
+    };
     stage.addEventListener("click", (ev) => {
       const g = nodeOf(ev.target), n = g ? byId.get(g.dataset.node) : null;
-      if (!n || (pinned && pinned.id === n.id)) { pinned = null; hideTip(); return; }
       const box = stage.getBoundingClientRect();
-      pinned = { id: n.id, x: ev.clientX - box.left, y: ev.clientY - box.top };
-      showTip(n, pinned.x, pinned.y);
+      toggle(n, ev.clientX - box.left, ev.clientY - box.top);
     });
+    // keyboard: a focused node pins on Enter or Space as a click does (a waiting node also opens its card, as its click does); Esc lets go
+    stage.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape") { if (pinned) { ev.preventDefault(); toggle(null); } return; }
+      if (ev.key !== "Enter" && ev.key !== " ") return;
+      const g = nodeOf(ev.target), n = g ? byId.get(g.dataset.node) : null;
+      if (!n) return;
+      ev.preventDefault();
+      const ring = g.querySelector(".tv-ring") || g, rc = ring.getBoundingClientRect(), box = stage.getBoundingClientRect();
+      toggle(n, rc.left + rc.width / 2 - box.left, rc.top + rc.height / 2 - box.top);
+    });
+    // a redraw replaces the focused node: keyboard focus follows the id to its new element (focus that leaves while the node is still there clears it)
+    stage.addEventListener("focusin", (ev) => { const g = nodeOf(ev.target); if (g) kbFocus = g.dataset.node; });
+    stage.addEventListener("focusout", (ev) => { const t = ev.target; root.setTimeout(() => { if (t.isConnected) kbFocus = null; }, 0); });
     stage.appendChild(tip);
     if (pinned && byId.has(pinned.id)) { showTip(byId.get(pinned.id), pinned.x, pinned.y); } else pinned = null;
+    if (kbFocus && byId.has(kbFocus) && typeof root.requestAnimationFrame === "function") {
+      const want = kbFocus;
+      root.requestAnimationFrame(() => {
+        const d = root.document;
+        if (!stage.isConnected || (d.activeElement && d.activeElement !== d.body)) return;
+        const g = svgNode && Array.from(svgNode.querySelectorAll("[data-node]")).find((x) => x.dataset.node === want);
+        if (g && g.focus) g.focus({ preventScroll: true });
+      });
+    }
     return wrap;
   }
 
