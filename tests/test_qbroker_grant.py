@@ -875,6 +875,8 @@ def test_t1_a_replay_after_the_hold_ended_repairs_a_granted_request_from_its_gra
     # past the hold ANSWER? answers expired for any request (a granted one too); the operator's deny never decides
     # it and nothing is recorded over the grant's allow
     got = ask(b, rid)
+    # KNOWN EDGE, pinned until it is ruled: past the hold a
+    # grant-settled request is answered request-expired while its receipts read allowed.
     assert "decision" not in got and got["refused"] == "request-expired"
     assert [s for s, _ in _receipts(world, rid)] == ["pending", "allowed"]
 

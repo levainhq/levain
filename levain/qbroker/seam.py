@@ -85,8 +85,9 @@ def answer_refusal(row: Mapping[str, Any], payload: Any, signature: Any, signers
 
 def grant_allow_refusal(row: Mapping[str, Any], grant: Any, now: datetime, *, check_hold: bool = True) -> str | None:
     """Why ``grant`` is not the broker's allow for the request ``row`` holds; ``None`` when it is. The one judge of a
-    grant row: ANSWER?, the filing's receipts and the start-time reconcile all ask it. ``check_hold=False`` (the
-    reconcile only) skips the hold-time check, so a row whose hold ended before the broker restarted is judged on the
+    grant row: ANSWER?, the filing's receipts, the replay repair and the start-time reconcile all ask it. ``check_hold=False``
+    (the start-time reconcile and the replay repair) skips the hold-time check, so a row whose hold ended before the broker
+    restarted or the repair ran is judged on the
     rest; ``now`` is then not read."""
     if not isinstance(grant, Mapping) or set(grant) != GRANT_ROW_KEYS or grant.get("format") != GRANT_ROW_FORMAT:
         return f"the grant row is not a {GRANT_ROW_FORMAT} record"
