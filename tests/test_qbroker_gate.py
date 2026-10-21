@@ -86,6 +86,21 @@ def test_an_irreversible_row_answered_in_time_does_not_halt(L, broker, keys, clo
     clock["now"] = NOW + timedelta(minutes=5, seconds=1)
     assert gate(broker)["gate"] == "go"                        # read past the hold, as ANSWER? reads it
     assert states(L, rid) == ["pending", "denied"]
+    assert broker._halting["sess-a"] == {rid}                  # decided on this GATE: read again on the next
+    assert gate(broker)["gate"] == "go"
+    assert "sess-a" not in broker._halting                     # F4: settled, it leaves the index
+
+
+def test_the_halting_index_keeps_pending_and_expired_and_drops_settled(L, broker, keys, clock):
+    write_signers(L, keys, 2, [keys["operator"].signer(key_class="laptop-presence", custody="passphrase")])
+    settled, held = t3(broker, "s1"), t3(broker, "s2")
+    write_answer(L, settled, keys["operator"], decision="allow", signed_at=NOW + timedelta(minutes=1))
+    base.ask(broker, settled)                                  # decided in its hold: the receipt says allowed
+    assert gate(broker)["gate"] == "go"
+    assert broker._halting["sess-a"] == {held}                 # the pending one stays
+    clock["now"] = NOW + timedelta(minutes=6)
+    assert gate(broker)["request_id"] == held
+    assert broker._halting["sess-a"] == {held}                 # expired stays: it halts
 
 
 def test_a_late_answer_is_refused_and_the_halt_stands(L, broker, keys, clock):

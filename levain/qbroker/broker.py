@@ -39,7 +39,9 @@ session is the resolve's, never the frame's.
   hold ended with no accepted answer: its last receipt is ``expired``, or it is still ``pending`` past its hold, in
   which case GATE runs ANSWER?'s own step first (a verified answer there in time decides it; else the ``expired``
   receipt is written, :meth:`Receipts.expired`). A row with no receipt past its hold reads halted too (the stricter
-  side). The local latch's release rule is a late ruling on the halting request (:meth:`ConsentQueue.answer_late`,
+  side). The broker indexes each session's :data:`HALT_TIER` request ids to read; one whose last receipt is settled
+  (``allowed`` / ``denied``) leaves the index at the GATE that reads it, pending and expired ones stay. The local
+  latch's release rule is a late ruling on the halting request (:meth:`ConsentQueue.answer_late`,
   the release in the ruling's transaction); here that is a decided receipt after the ``expired`` one, and since
   :meth:`Receipts.state` reads the LAST state, such a receipt releases the halt with no change here. KNOWN EDGE until
   the operator side has a late-ruling path: nothing writes that receipt yet (:meth:`Receipts.decided` refuses an
@@ -174,6 +176,8 @@ _ANSWER_ROW_KEYS = frozenset({"format", "payload", "signature"})
 HALT_TIER = AGENT_CONFIG_TIER
 GATE_VERDICTS = ("go", "halted", "over-limit", "limits-failed")
 _GATE_OVER = frozenset({"crossed", "halted"})
+# a halting-index row whose last receipt is one of these is settled and leaves the index (Broker._halted_on)
+_SETTLED = frozenset({"allowed", "denied"})
 _GATE_KEYS = frozenset({"v", "op", "id", "cap", "agent", "tool_name", "input_digest", "tool_use_id"})
 _GATE_REQUIRED = _GATE_KEYS - {"tool_use_id"}
 # the limits in force for (agent, resolved session), or None when none are configured (every call GO)
@@ -770,6 +774,15 @@ class Broker:
             state = self._receipts.state(request_id)
             if state == "expired":
                 return request_id
+            if state in _SETTLED:
+                # settled: it can never halt again, so it leaves the index (pending and expired ones stay)
+                with self._mutex:
+                    held = self._halting.get(session)
+                    if held is not None:
+                        held.discard(request_id)
+                        if not held:
+                            del self._halting[session]
+                continue
             if request.expires_at > stamp:
                 continue                  # still held: the call itself waits; the session's others go on
             if state is None:
