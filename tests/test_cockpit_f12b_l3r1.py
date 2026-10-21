@@ -49,7 +49,7 @@ def test_a_topology_provider_faulted_at_load_is_said_in_the_sessions_card_in_eit
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     import levain.cockpit.topology as topo
     monkeypatch.setattr(topo, "topology_reader", lambda **kw: (lambda ctx: Fault("the session records are gone")))
-    probe = ("JSON.stringify({line: [...document.querySelectorAll('#k7-sessions .k7-none.err, #k7-sessions .tv-fault')].map(n => n.textContent), "
+    probe = ("JSON.stringify({line: [...document.querySelectorAll('#ck-hlens .k7-none.err, #ck-hlens .tv-fault')].map(n => n.textContent), "
              "rows: document.querySelectorAll('#k7-sessions .k7-srow').length})")
     out = _run(tmp_path, src, [{"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": "new Promise(r => setTimeout(r, 600))"}, {"eval": probe}], first=MID)
     got = json.loads(out[-1])
@@ -123,9 +123,10 @@ def test_a_renderer_that_throws_leaves_the_list_and_one_line_not_a_dead_card(tmp
     root, src = _sessions_fixture(tmp_path, monkeypatch)
     _spore(root)
     probe = ("JSON.stringify({rows: document.querySelectorAll('#k7-sessions .k7-srow').length, tv: !!%s, "
-             "text: document.querySelector('#k7-sessions').innerText.replace(/\\s+/g, ' ')})") % TV
-    out = _run(tmp_path, src, [{"until": TV + " && " + TV + ".querySelector('.tv-task')"},
-                               {"eval": "window.LevainTopologyView.render = () => { throw new Error('boom'); }; document.querySelector('#k7-sessions [data-tv=agents]').click(); 1"},
+             "text: document.querySelector('#ck-hlens').innerText.replace(/\\s+/g, ' ')})") % TV
+    out = _run(tmp_path, src, [{"until": TV + " && " + TV + ".querySelector('.tv-task')"}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
+                               {"until": TV + ".querySelector('.tv-task')"},
+                               {"eval": "window.LevainTopologyView.render = () => { throw new Error('boom'); }; document.querySelector('#ck-hlens [data-tv=agents]').click(); 1"},
                                {"eval": "new Promise(r => setTimeout(r, 400))"}, {"eval": probe}])
     got = json.loads(out[-1])
     assert got["tv"] is False and got["rows"] == 3 and "topology could not be drawn" in got["text"], got

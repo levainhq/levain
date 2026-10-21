@@ -1,19 +1,19 @@
-// levain topology_view.js — the live work view (F12b): the `topology` panel value drawn in the Build tab's Sessions card.
+// levain topology_view.js — the live work view (F12b): the `topology` panel value drawn in the page header (the Activity slot).
 //
 // It is a renderer and nothing else. cockpit_view.js parses the panel value (the one shape check) and hands it here with a
-// repaint hook and a card opener; this file draws two lenses over the same value and owns the `list | topology` switch (the
-// slot K7 left in the Sessions card head) and the choices that persist. Nothing here assumes Levain's own ids or words: the
+// repaint hook and a card opener; this file draws two lenses over the same value and owns the header's three-way switch
+// [Agents graph | Event graph | Work] and the choice that persists (the Event graph is the page's Activity band, drawn by sky.js, not here). Nothing here assumes Levain's own ids or words: the
 // hub is whatever the provider names (Levain: the install; flow: the desk), groups are repos or seats, nodes are sessions or
 // lanes. Everything is built with textContent: a wire string never reaches an HTML sink.
 //
-//   Work lens (the default): three columns as drawn. LEFT, the waiting records (one per pending consent / question, plus a
+//   Work lens: three columns as drawn. LEFT, the waiting records (one per pending consent / question, plus a
 //   dispatch contract waiting on a signature). CENTRE, the tasks as compact cards, loudest state first; waiting-orange is a
 //   border and a tag, stuck is dashed amber, done is quiet. RIGHT, each task's outcomes on the task's own row. A line joins a
 //   record to the task that waits on it and a task to its outcomes (the lines are ornament: the columns are the grammar).
 //   Agents are small chips on the task they work. A session with no task object sits in an "unattached work" block, never a
 //   guessed task. Waiting (a pending record the operator can answer) and stuck (silence, no record) never merge. In a
 //   narrow card the columns stack: records, tasks, each task's outcomes beneath it.
-//   Agents lens: the graph as the F12 mock draws it. One hub (the install), the groups on its two sides, each group's sessions beside it
+//   Agents lens (the header's default on a cold open): the graph as the F12 mock draws it. One hub (the install), the groups on its two sides, each group's sessions beside it
 //   with a subagent under its parent, every node with its face and a state ring, edges hub -> group -> node -> child that carry particle
 //   streams whose density is the node's rate. A file conflict is the file's name on a chip between its nodes.
 //
@@ -23,9 +23,7 @@
 (function (root) {
   "use strict";
 
-  const MODE_KEY = "levain_cockpit_topology_mode";
-  const LENS_KEY = "levain_cockpit_topology_lens";
-  const WIDE_PX = 1440;                    // the width from which the topology is the default view on Build
+  const HEADER_KEY = "levain_cockpit_header_lens";      // the header's three-way choice: agents | events | work (a view preference, never data)
   // the order the Work lens lists its groups in (K10: what needs you, what is moving, what went quiet, the open loops, then what ended)
   const TASK_ORDER = ["waiting", "failed", "stuck", "running", "open", "done"];
   const HEAT_ORDER = ["hot", "warm", "cold", "parked"];      // an open loop's heat, hottest first; none last
@@ -58,13 +56,10 @@
   function stored(key) { try { return root.localStorage.getItem(key); } catch (_) { return null; } }
   function keep(key, val) { try { root.localStorage.setItem(key, val); } catch (_) { /* no storage: the choice lasts until the page does */ } }
 
-  // ---- what persists: the view (list | topology) and the lens (work | agents) ----
-  function mode(width) {
-    const m = stored(MODE_KEY);
-    if (m === "list" || m === "topology") return m;
-    return isNum(width) && width >= WIDE_PX ? "topology" : "list";
-  }
-  function lens() { return stored(LENS_KEY) === "agents" ? "agents" : "work"; }
+  // ---- what persists: the header lens (agents graph | event graph | work). A cold open, or a store that throws or holds anything else, is the Agents graph ----
+  const HEADER_LENSES = [["agents", "Agents graph"], ["events", "Event graph"], ["work", "Work"]];
+  function headerLens() { const v = stored(HEADER_KEY); return v === "events" || v === "work" ? v : "agents"; }
+  function setHeaderLens(id) { keep(HEADER_KEY, id); }
 
   function seg(name, items, current, onPick) {
     const g = el("span", "tv-seg");
@@ -80,9 +75,10 @@
     }
     return g;
   }
-  // the `list | topology` switch, for the slot in the Sessions card head
-  function switchNode(current, onChange) {
-    return seg("Sessions view", [["list", "list"], ["topology", "topology"]], current, (id) => { keep(MODE_KEY, id); onChange(id); });
+  // the header's lens switch: buttons with aria-pressed, as the page's other toggles. The Agents and Work lenses carry it in their own bar (render's
+  // `lensSeg`), the Event graph (the page's Activity band) under it; the click changes the view only, never what is read.
+  function headerToggle(current, onPick) {
+    return seg("Header view", HEADER_LENSES, current, (id) => { setHeaderLens(id); onPick(id); });
   }
 
   // does the value hold anything to draw? Sessions or any task, an open loop included (it is a task with an age, as the flow cockpit
@@ -1212,7 +1208,7 @@
   function render(v, opts) {
     const o0 = opts || {};
     R.opts = o0;
-    const which = lens();
+    const which = o0.lens === "work" ? "work" : "agents";       // the header's choice, handed in; the Event graph is not drawn here
     // a frame from the ledger: a value the server marked `replay`, or the value this module committed. It is STILL (no stream, no ticker, no breathe)
     // and, when it is drawn through the strip, it carries its badge.
     const past = isObj(v) && (v.replay === true || (R.value !== null && v === R.value));
@@ -1223,7 +1219,7 @@
     if (o.replay && R.at !== null) w.dataset.rat = isoMin(R.at);
     if (o.replay && replaying()) w.dataset.rshown = past && R.cat !== null ? isoMin(R.cat) : "live";
     const bar = el("div", "tv-bar");
-    bar.append(seg("Lens", [["work", "Work"], ["agents", "Agents"]], which, (id) => { keep(LENS_KEY, id); if (id !== which && replaying()) returnToLive(); if (o.repaint) o.repaint(); }), which === "agents" ? strip(v, which) : stripWork(v));
+    bar.append(o0.lensSeg || el("span"), which === "agents" ? strip(v, which) : stripWork(v));
     w.appendChild(bar);
     const conf = conflictList(v);
     if (conf) w.appendChild(conf);
@@ -1263,6 +1259,6 @@
     return w;
   }
 
-  root.LevainTopologyView = { WIDE_PX, mode, lens, switchNode, hasWork, quietLine, signature, release, render, renderLost, renderLostFault, paused, replaying, replayValue, returnToLive, leaveReplay, hourMarks };
+  root.LevainTopologyView = { headerLens, setHeaderLens, headerToggle, hasWork, quietLine, signature, release, render, renderLost, renderLostFault, paused, replaying, replayValue, returnToLive, leaveReplay, hourMarks };
   if (typeof module !== "undefined" && module.exports) module.exports = root.LevainTopologyView;
 })(typeof globalThis !== "undefined" ? globalThis : this);

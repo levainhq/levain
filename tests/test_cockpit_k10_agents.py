@@ -24,7 +24,7 @@ def _graph_value(rates: bool = True) -> dict:
 
 
 # the page repaints once when the lens changes (its signature moves): switch to Agents on the page first, so the literal value painted next is not replaced
-PRIME = [{"eval": "document.querySelector('#k7-sessions [data-tv=agents]').click(); 1"}, {"until": TV + ".dataset.lens == 'agents'"}]
+PRIME = [{"eval": "document.querySelector('#ck-hlens [data-tv=agents]').click(); 1"}, {"until": TV + ".dataset.lens == 'agents'"}]
 
 
 def _probe() -> str:

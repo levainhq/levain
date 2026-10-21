@@ -1173,7 +1173,7 @@ body.ke .sky-toggle[aria-pressed="true"] { background: var(--card-2); color: var
 /* the sky: a card under the band, its key as the card's footer (the sky's own bar and plot are sky.js's) */
 body.ke .skycol { padding-bottom: var(--sp-2); }
 body.ke .skycard { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); min-width: 0; overflow: hidden; }
-body.ke .skycard:not(:has(#ck-sky > *)) { display: none; }
+body.ke .skycard:not(:has(#ck-sky > *)):not(:has(#ck-hlens > *)) { display: none; }
 #ck-sky { padding: 0 var(--sp-6); min-width: 0; }
 body.ke .ck-sky { min-width: 0; }
 body.ke .sky-hero { display: block; border: 0; }
@@ -1185,6 +1185,14 @@ body.ke[data-mode="build"] .skycard .ck-legend { display: none; }
 body.ke[data-mode="build"] #ck-sky { padding: 0 var(--sp-6) var(--sp-3); }
 body.ke[data-mode="build"] .sky-hero .plot { min-height: 0; }
 body.ke .skycard .ck-legend .legendbar { padding: var(--sp-3) var(--sp-6); }
+/* the header lens (the Activity slot): [Agents graph | Event graph | Work]. The Event graph is the sky as it was; the other two are the topology renderer
+   drawn into #ck-hlens, whose bar carries the switch. The sky and its key are not shown while a topology lens is (their mounts stay, so a repaint is not lost). */
+.ck-hlens { min-width: 0; }
+.ck-hlens .tv { padding-top: var(--sp-5); }
+.ck-hlens .hl-bar { padding: var(--sp-5) var(--sp-6) var(--sp-2); margin: 0; }
+.ck-hlens > .k7-none { padding: var(--sp-4) var(--sp-6) var(--sp-5); margin: 0; }
+body.ke .skycard[data-hlens="agents"] #ck-sky, body.ke .skycard[data-hlens="work"] #ck-sky,
+body.ke .skycard[data-hlens="agents"] .ck-legend, body.ke .skycard[data-hlens="work"] .ck-legend { display: none; }
 /* a tab with no sky (Memory) or no band content draws no hole */
 body.ke[data-mode="memory"] .skycol { display: none; }
 
@@ -1707,7 +1715,6 @@ body.ke[data-mode="build"] .k7-sess:not([hidden]) { display: block; margin-top: 
 .k7-card-h .ck-count { margin: 0; }
 .k7-sum, .k7-stats { font-size: var(--fs-meta); color: var(--meta); white-space: nowrap; }
 .k7-sp { flex: 1 1 0; }
-.k7-mode-slot:empty { display: none; }
 .k7-card-h .k7-open { display: inline-flex; border: 1px solid var(--hair-2); background: none; color: var(--label); border-radius: var(--r-md); padding: var(--sp-1) var(--sp-3); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
 .k7-card-h .k7-open:hover { background: var(--card-2); color: var(--text); }
 .k7-none { margin: 0; padding: 0 var(--sp-6) var(--sp-5); color: var(--label); font-size: var(--fs-body); }
@@ -1974,7 +1981,6 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 /* F12b: the work view (topology_view.js) inside the Build tab's Sessions card. The topology panel is the feed, not a card of its own:
    Sessions draws it. State colour is the page's: orange only for waiting on you, amber stuck, red failed, green running, quiet done. */
 .panel.k-topology:not(.ck-faulted), [data-ck-panel="topology"]:not([data-ck-external]):not(.ck-faulted) { display: none !important; }   /* a faulted panel is the one error panel: cockpit_view.js marks it, and it stays */
-.k7-mode-slot .tv-seg { margin: 0; }
 .tv { container-type: inline-size; padding: 0 var(--sp-6) var(--sp-6); min-width: 0; }
 .tv-seg { display: inline-flex; border: 1px solid var(--hair-2); border-radius: var(--r-md); overflow: hidden; }
 .tv-seg-b { border: 0; background: none; color: var(--label); padding: var(--sp-1) var(--sp-4); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }

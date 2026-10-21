@@ -391,7 +391,7 @@
       const tasks = Array.isArray(v.tasks) ? v.tasks : [];
       const waiting = isNum(v.waiting) ? v.waiting : tasks.filter((t) => isObj(t) && t.state === "waiting").length;
       out.lines = [{ meta: "topology", text: n(v.nodes, v.nodes) + " sessions \u00b7 " + n(v.tasks, v.tasks) + " tasks \u00b7 " + waiting + " waiting on you" }];
-      if (Array.isArray(v.nodes) && Array.isArray(v.tasks) && Array.isArray(v.groups) && isObj(v.hub)) { out.topology = v; out.typed = true; out.replay = head.replay === true || panel.replay === true; }   // typed: the page keeps a live state for it (Build's Sessions card reads it)
+      if (Array.isArray(v.nodes) && Array.isArray(v.tasks) && Array.isArray(v.groups) && isObj(v.hub)) { out.topology = v; out.typed = true; out.replay = head.replay === true || panel.replay === true; }   // typed: the page keeps a live state for it (the header lens and Build's Lost-if-closed read it)
     } else if (kind === "form") {
       need(Array.isArray(v.fields) && v.fields.length && v.fields.every((f) => isObj(f) && typeof f.name === "string"), "form fields");
       out.form = { fields: v.fields, verb: typeof v.verb === "string" ? v.verb : "" };
@@ -1997,8 +1997,8 @@
     for (const b of document.querySelectorAll("[data-mode-tab]")) b.setAttribute("aria-selected", b.dataset.modeTab === m ? "true" : "false");
     resizeSkies();
     fillGrids();
-    // the Sessions card is on Build only: leaving Build ends its replay and stops its stream loop, coming back draws it again
-    try { paintBuildSessions(); } catch (_) { /* the card repaints on the next poll */ }
+    // the header lens is on every tab but Memory (going to Memory ends its replay and stops its stream loop), the Sessions card on Build only
+    try { paintHeaderLens(); paintBuildSessions(); } catch (_) { /* the card repaints on the next poll */ }
     // the layout controls read what the tab shows: any tab change, by click, key, address or reveal, asks them to refresh
     if (typeof document.dispatchEvent === "function") document.dispatchEvent(new Event("ck-layout-refresh"));
   }
@@ -2230,40 +2230,86 @@
     if (N && N.history()) mark(12);
     else applyMode("board", true);
   }
+  // The topology panel's state, read once for the header lens and the Sessions card alike. The panel is hidden on the page (the header draws it), so a
+  // fault is the header's to say, three ways: a failed fetch (ts.fault), an error record the kernel sent (data.error), or the page's own
+  // "unavailable" card (an external panel, no state of its own).
+  function topoInfo() {
+    const TV = root.LevainTopologyView;
+    if (!TV) return { TV: null };
+    const ts = Array.from(states).find((o) => o.pid === "topology" && o.p && o.p.isConnected) || null;
+    const ep = !ts ? document.querySelector('[data-ck-panel="topology"][data-ck-external]') : null;
+    const epErr = ep ? ep.querySelector(".err") : null;
+    const tfault = ts ? (ts.fault || (ts.data && typeof ts.data.error === "string" ? ts.data.error : "")) : (epErr ? epErr.textContent : "");
+    const tvLive = ts && !tfault && ts.data && ts.data.topology && TV.hasWork(ts.data.topology) ? ts.data.topology : null;
+    // the lens in force: the stored choice, but an install with no topology to draw has only its Event graph
+    const lens = tvLive || tfault ? TV.headerLens() : "events";
+    // the header is on every tab but Memory; replay lives only while a topology lens is on screen with a replay path (the head's flag and the page's transport)
+    const shown = !!(tvLive || tfault) && lens !== "events" && !!document.body && document.body.dataset.mode !== "memory";
+    const canReplay = !!(shown && tvLive && ts && ts.data && ts.data.replay === true && root.LevainCockpitTransport);
+    if (TV.replaying && TV.replaying() && !canReplay) TV.leaveReplay(true);   // on any other exit it ends BEFORE a value is read, so nothing is drawn from the past without its badge
+    // a scrubbed past is drawn in place of the live value (the read behind it may hold no work: an empty past is still the past)
+    const tv = tvLive && TV.replaying && TV.replaying() ? (TV.replayValue() || tvLive) : tvLive;
+    return { TV, ts, ep, tfault, tvLive, tv, lens, shown, canReplay };
+  }
+  // ---- the header lens: the Activity slot's three views [Agents graph | Event graph | Work] ----
+  // The Event graph is the page's Activity band (#ck-sky, sky.js), unchanged; the other two are topology_view.js's renderer drawn into #ck-hlens
+  // above it. The choice is a view preference (stored per browser by topology_view.js): it never changes what is read.
+  let hSig = "";
+  function paintHeaderLens() {
+    const host = document.getElementById("ck-hlens"), card = document.getElementById("ck-skycard");
+    if (!host || !card) return;
+    const I = topoInfo();
+    const TV = I.TV;
+    if (!TV) return;
+    const lens = I.lens;
+    card.dataset.hlens = lens;
+    const fp = I.ts && I.ts.p ? I.ts.p : I.ep;
+    if (fp) fp.classList.toggle("ck-faulted", !!I.tfault);       // a faulted topology panel is the one error panel: the page's hide rule leaves it alone
+    const has = !!(I.tvLive || I.tfault);
+    if (!has) { if (!host.hidden || host.firstChild) { TV.release(); host.replaceChildren(); host.hidden = true; } hSig = ""; return; }
+    if (document.body.dataset.mode === "memory") { TV.release(); hSig = ""; return; }      // the header is not on Memory: nothing runs behind it
+    const sig = JSON.stringify([lens, I.tfault, I.tv ? TV.signature(I.tv, lens) : "", I.canReplay]);
+    if (sig === hSig && !host.hidden) return;
+    hSig = sig;
+    host.hidden = false;
+    TV.release();                 // the old body's resize observer and stream go with it
+    const repaint = () => { hSig = ""; k7Sig = ""; paintHeaderLens(); paintBuildSessions(); };
+    const toggle = TV.headerToggle(lens, () => { if (TV.replaying && TV.replaying()) TV.returnToLive(); repaint(); });
+    if (lens === "events") {
+      const bar = el("div", "tv-bar hl-bar");
+      bar.appendChild(toggle);
+      host.replaceChildren(bar);
+      return;
+    }
+    let body = null, fail = false;
+    if (I.tv) {
+      // the Replay strip rides the page's own read path (LevainCockpitTransport.readJson: its auth headers and token handling); resume re-reads the live topology
+      const replay = I.canReplay ? { readJson: root.LevainCockpitTransport.readJson, resume: () => refetchPanel("topology") } : undefined;
+      try { body = TV.render(I.tv, { lens, lensSeg: toggle, repaint, openCard: openNeedsYouCard, replay }); } catch (e) { fail = true; }
+    }
+    if (body) { host.replaceChildren(body); return; }
+    // a fault, or a throw while drawing: said in words with the switch beside it, so the Event graph is one click away
+    const bar = el("div", "tv-bar hl-bar");
+    bar.appendChild(toggle);
+    host.replaceChildren(bar, el("p", "k7-none err", I.tfault ? "Topology unavailable: " + I.tfault : "The topology could not be drawn."));
+    if (fail) hSig = "";
+  }
   function paintBuildSessions() {
     const sec = k7Host();
     if (!sec) return;
     const s = Array.from(states).find((o) => o.pid === "sessions" && o.ctx && o.ctx.widget && o.p && o.p.isConnected);
     if (!s || document.body.dataset.mode !== "build") {
-      // the card is not on screen (another tab, no Sessions card): its replay ends, its stream loop and tickers stop, and the live read is not left paused;
-      // the signature is cleared so coming back draws the card (and its stream) again
-      const T = root.LevainTopologyView;
-      if (T) { if (T.replaying && T.replaying()) T.leaveReplay(true); T.release(); k7Sig = ""; }
-      if (!s) { sec.hidden = true; k7Sig = ""; }
+      k7Sig = "";            // coming back to Build draws the card again
+      if (!s) sec.hidden = true;
       return;
     }
     const lines = (s.data.lines || []).filter((l) => l && isObj(l.sess));
     const now = Date.now();
-    // the work view (topology_view.js): the topology panel's value, when the page has it and it holds anything to draw
-    const TV = root.LevainTopologyView;
-    const ts = TV ? Array.from(states).find((o) => o.pid === "topology" && o.p && o.p.isConnected) : null;
-    // a topology panel that failed says so three ways: a failed fetch (s.fault), an error record the kernel sent (data.error), or the page's
-    // own "unavailable" card (an external panel, no state of its own): the Sessions card says whichever it is
-    const ep = TV && !ts ? document.querySelector('[data-ck-panel="topology"][data-ck-external]') : null;
-    const epErr = ep ? ep.querySelector(".err") : null;
-    const tfault = !TV ? "" : ts ? (ts.fault || (ts.data && typeof ts.data.error === "string" ? ts.data.error : "")) : (epErr ? epErr.textContent : "");
-    const tvLive = ts && !tfault && ts.data && ts.data.topology && TV.hasWork(ts.data.topology) ? ts.data.topology : null;
-    // replay lives only while the topology is on screen with a replay path (the head's flag and the page's transport); on any other exit it ends BEFORE
-    // anything below reads a value, so nothing is drawn from the past without its badge (the list, the Lost panel) and the live read is not left paused
-    const topoLive = !!(tvLive || tfault) && TV.mode(root.innerWidth) === "topology";
-    const canReplay = !!(topoLive && tvLive && ts && ts.data && ts.data.replay === true && root.LevainCockpitTransport);
-    if (TV && TV.replaying && TV.replaying() && !canReplay) TV.leaveReplay(true);
-    // a scrubbed past is drawn in place of the live value (the read behind it may hold no work: an empty past is still the past)
-    const tv = tvLive && TV.replaying && TV.replaying() ? (TV.replayValue() || tvLive) : tvLive;
-    const topo = !!(tv || tfault) && TV.mode(root.innerWidth) === "topology";
+    const I = topoInfo();
+    const TV = I.TV, ts = I.ts, tfault = I.tfault || "", tv = I.tv;
     // the signature is content only: the clock does not repaint the card (a focused button would lose focus), it moves the "ago" words
-    const sig = JSON.stringify([s.fault || "", lines.map((l) => [l.sess, l.repo]), s.data.empty || "", topo, tfault,
-                                tv ? TV.signature(tv, TV.lens()) : (ts && ts.data && ts.data.topology ? TV.signature({ e: ts.data.topology.errors, u: ts.data.topology.unreadable }, "") : "")]);
+    const sig = JSON.stringify([s.fault || "", lines.map((l) => [l.sess, l.repo]), s.data.empty || "", I.lens, I.lens === "events" ? tfault : "",
+                                tv ? TV.signature(tv, "agents") : (TV && ts && ts.data && ts.data.topology ? TV.signature({ e: ts.data.topology.errors, u: ts.data.topology.unreadable }, "") : "")]);
     if (sig === k7Sig && !sec.hidden) {
       for (const t of sec.querySelectorAll(".k7-tool[data-k7-at]")) {
         const w = t.dataset.k7Pre + k7Ago(t.dataset.k7At, now);
@@ -2283,11 +2329,6 @@
       head.append(pill, el("span", "k7-sum", live + " live · " + (lines.length - live) + " quiet"));
     }
     head.appendChild(el("span", "k7-sp"));
-    // the `list | topology` switch (topology_view.js owns the control and what persists); drawn only when there is work to show
-    const slot = el("span", "k7-mode-slot");
-    slot.dataset.k7Slot = "mode";
-    if (tv || tfault) slot.appendChild(TV.switchNode(topo ? "topology" : "list", () => { k7Sig = ""; paintBuildSessions(); }));
-    head.appendChild(slot);
     if (lines.length) {
       const day = new Date(now).toDateString();
       const today = lines.filter((l) => { const t = parseIso(l.sess.first_seen); return !isNaN(t) && new Date(t).toDateString() === day; }).length;
@@ -2299,30 +2340,16 @@
       head.appendChild(open);
     }
     card.appendChild(head);
-    // the topology panel is hidden on the page (the card draws it), so its fault is the card's to say; a throw while drawing falls back to the list
-    let tbody = null, tfail = false;
-    if (TV) TV.release();           // the old body's resize observer goes with it, even when the list replaces the topology
-    if (topo && !tfault) {
-      // the Replay strip rides the page's own read path (LevainCockpitTransport.readJson: its auth headers and token handling); resume re-reads the live topology
-      const replay = canReplay ? { readJson: root.LevainCockpitTransport.readJson, resume: () => refetchPanel("topology") } : undefined;
-      try { tbody = TV.render(tv, { repaint: () => { k7Sig = ""; paintBuildSessions(); }, openCard: openNeedsYouCard, replay }); } catch (e) { tfail = true; }
-    }
-    if (topo && tfault) card.appendChild(el("p", "k7-none err", "Topology unavailable: " + tfault));
-    else if (tbody) card.appendChild(tbody);
-    else {
-      if (tfault) card.appendChild(el("p", "k7-none err", "Topology unavailable: " + tfault));
-      if (tfail) card.appendChild(el("p", "k7-none err", "The topology could not be drawn, so the sessions are listed."));
-      if (s.fault) card.appendChild(el("p", "k7-none err", "Sessions unavailable: " + s.fault));
-      else if (!lines.length) {
-        card.appendChild(el("p", "k7-none", K7_NONE_SESSIONS));
-        // an empty graph that could not read a source says so beside the empty line, never in place of it
-        const q = TV && ts && ts.data && ts.data.topology ? TV.quietLine(ts.data.topology) : null;
-        if (q) card.appendChild(q);
-        card.classList.add("k7-lone");
-      } else { const body = el("div", "k7-srows"); for (const ln of lines) body.appendChild(k7Row(ln, now)); card.appendChild(body); }
-    }
-    const fp = ts && ts.p ? ts.p : ep;
-    if (fp) fp.classList.toggle("ck-faulted", !!tfault);       // a faulted topology panel is the one error panel: the page's hide rule leaves it alone
+    // the topology is the header's: this card is the session list, with the topology fault said here only while the Event graph is the header's view
+    if (tfault && I.lens === "events") card.appendChild(el("p", "k7-none err", "Topology unavailable: " + tfault));
+    if (s.fault) card.appendChild(el("p", "k7-none err", "Sessions unavailable: " + s.fault));
+    else if (!lines.length) {
+      card.appendChild(el("p", "k7-none", K7_NONE_SESSIONS));
+      // an empty graph that could not read a source says so beside the empty line, never in place of it
+      const q = TV && ts && ts.data && ts.data.topology ? TV.quietLine(ts.data.topology) : null;
+      if (q) card.appendChild(q);
+      card.classList.add("k7-lone");
+    } else { const body = el("div", "k7-srows"); for (const ln of lines) body.appendChild(k7Row(ln, now)); card.appendChild(body); }
     // Lost if closed (F12c): its own panel, right of the card from 1440 px, below it under that; drawn whenever the topology feed is
     let lost = null;
     try { if (TV && TV.renderLost) lost = tfault ? TV.renderLostFault(tfault) : tv ? TV.renderLost(tv) : null; } catch (e) { lost = null; }
@@ -2356,7 +2383,7 @@
     }
   }
   function paintBuild() {
-    try { paintBuildSessions(); paintBuildZone(); } catch (e) { /* a Build tab that cannot paint leaves the page as the tiles drew it */ }
+    try { paintHeaderLens(); paintBuildSessions(); paintBuildZone(); } catch (e) { /* a Build tab that cannot paint leaves the page as the tiles drew it */ }
   }
 
   // The glance is a compact strip (one bordered row of equal tiles) on Board and whenever fewer than four tiles show; four or more are full
@@ -2551,7 +2578,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
+  Object.assign(K, { paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

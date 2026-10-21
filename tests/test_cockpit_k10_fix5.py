@@ -19,12 +19,12 @@ from tests.test_cockpit_k10_agents import PRIME, _graph_value
 from tests.test_cockpit_k7_build import _sessions_fixture
 from tests.test_cockpit_s8b_replay_page import SPY, STRIP, _ats, _key, _scrub
 
-WAIT_BADGE = {"until": "document.querySelector('#k7-sessions .tv-rbadge')"}
+WAIT_BADGE = {"until": "document.querySelector('#ck-hlens .tv-rbadge')"}
 SLEEP = lambda ms: {"eval": "new Promise(r => setTimeout(r, %d))" % ms}  # noqa: E731
-INFO = ("JSON.stringify({badge: (document.querySelector('#k7-sessions .tv-rbadge') || {}).textContent || null, "
+INFO = ("JSON.stringify({badge: (document.querySelector('#ck-hlens .tv-rbadge') || {}).textContent || null, "
         "rat: (%s || {dataset: {}}).dataset.rat || null, rshown: (%s || {dataset: {}}).dataset.rshown || null, "
         "replaying: window.LevainTopologyView.replaying(), paused: window.LevainTopologyView.paused(), "
-        "err: (document.querySelector('#k7-sessions .tv-rerr') || {}).textContent || null, urls: (window.__urls || []).filter(u => u.includes('topology.json'))})") % (TV, TV)
+        "err: (document.querySelector('#ck-hlens .tv-rerr') || {}).textContent || null, urls: (window.__urls || []).filter(u => u.includes('topology.json'))})") % (TV, TV)
 
 
 def _delay(pred: str, ms: int) -> str:
@@ -40,7 +40,7 @@ def _delay(pred: str, ms: int) -> str:
 def test_a_scrub_in_flight_says_loading_over_the_live_value_and_live_paused_only_over_the_value_that_is_t(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _delay("s.includes('at=')", 1200)}, {"eval": _scrub(0.5)}, SLEEP(300), {"eval": INFO},
-                               {"until": "(document.querySelector('#k7-sessions .tv-rbadge') || {textContent: ''}).textContent.includes('live paused')", "ms": 8000}, {"eval": INFO}])
+                               {"until": "(document.querySelector('#ck-hlens .tv-rbadge') || {textContent: ''}).textContent.includes('live paused')", "ms": 8000}, {"eval": INFO}])
     mid, done = json.loads(out[-3]), json.loads(out[-1])
     assert mid["badge"] and mid["badge"].startswith("loading replay ") and "live paused" not in mid["badge"] and "showing live" in mid["badge"], mid
     assert mid["rshown"] == "live", mid                                                                       # the live value is what is drawn, and it says so
@@ -51,9 +51,9 @@ def test_a_scrub_in_flight_says_loading_over_the_live_value_and_live_paused_only
 @needs_browser
 def test_a_second_scrub_keeps_the_first_frame_labelled_while_it_loads(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _scrub(0.3)}, {"until": "(document.querySelector('#k7-sessions .tv-rbadge') || {textContent: ''}).textContent.includes('live paused')"},
+    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _scrub(0.3)}, {"until": "(document.querySelector('#ck-hlens .tv-rbadge') || {textContent: ''}).textContent.includes('live paused')"},
                                {"eval": INFO}, {"eval": _delay("s.includes('at=')", 1200)}, {"eval": _scrub(0.6)}, SLEEP(300), {"eval": INFO},
-                               {"until": "(document.querySelector('#k7-sessions .tv-rbadge') || {textContent: ''}).textContent.includes('live paused')", "ms": 8000}, {"eval": INFO}])
+                               {"until": "(document.querySelector('#ck-hlens .tv-rbadge') || {textContent: ''}).textContent.includes('live paused')", "ms": 8000}, {"eval": INFO}])
     first, mid, last = json.loads(out[-7]), json.loads(out[-3]), json.loads(out[-1])
     assert mid["badge"].startswith("loading replay ") and "live paused" not in mid["badge"], mid
     assert mid["rshown"] == first["rat"] and mid["rat"] != first["rat"], (first, mid)                         # T1's frame, labelled as T1, while T2 loads
@@ -121,20 +121,20 @@ def test_a_past_frame_has_no_streams_no_tickers_and_no_breathing_while_the_live_
 
 
 @needs_browser
-def test_leaving_the_build_tab_stops_the_stream_loop_and_leaves_replay(tmp_path, monkeypatch):
+def test_leaving_for_the_memory_tab_stops_the_stream_loop_and_leaves_replay(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     raf = "(() => { window.__raf = 0; const r = window.requestAnimationFrame.bind(window); window.requestAnimationFrame = (f) => { window.__raf++; return r(f); }; return 1; })()"
     out = _run(tmp_path, src, [*PRIME, {"eval": raf}, {"eval": _paint(_streaming(), "agents")}, SLEEP(200), {"eval": "(window.__raf = 0, 1)"},
-                               {"eval": "document.querySelector('[data-mode-tab=board]').click(); 1"}, SLEEP(400), {"eval": "window.__raf"}])
+                               {"eval": "document.querySelector('[data-mode-tab=memory]').click(); 1"}, SLEEP(400), {"eval": "window.__raf"}])
     assert out[-1] <= 2, out[-1]                                                                                # one frame already queued at most; the loop is stopped
 
 
 @needs_browser
-def test_a_tab_switch_away_from_build_drops_replay_and_the_topology_polls_again(tmp_path, monkeypatch):
+def test_a_tab_switch_to_memory_drops_replay_and_the_topology_polls_again(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     refetch = "window.LevainCockpitView.refetchPanel('topology').then(r => String(r))"
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _scrub(0.4)}, WAIT_BADGE, {"eval": "(window.__urls = [], 1)"},
-                               {"eval": "document.querySelector('[data-mode-tab=board]').click(); 1"}, SLEEP(300), {"eval": INFO}, {"eval": refetch}, {"eval": INFO},
+                               {"eval": "document.querySelector('[data-mode-tab=memory]').click(); 1"}, SLEEP(300), {"eval": INFO}, {"eval": refetch}, {"eval": INFO},
                                {"eval": "document.querySelector('[data-mode-tab=build]').click(); 1"}, {"until": STRIP}, SLEEP(300), {"eval": INFO}])
     after_tab, after_refetch, back = json.loads(out[-7]), json.loads(out[-5]), json.loads(out[-1])
     assert after_tab["replaying"] is False and after_tab["paused"] is False, after_tab
@@ -153,12 +153,12 @@ def test_replay_ends_when_the_page_loses_its_replay_path_while_scrubbing(tmp_pat
 
 
 @needs_browser
-def test_switching_to_the_list_while_replaying_draws_nothing_from_the_past(tmp_path, monkeypatch):
+def test_switching_to_the_event_graph_while_replaying_draws_nothing_from_the_past(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     spy = ("(() => { window.__lost = []; const f = window.LevainTopologyView.renderLost; window.LevainTopologyView.renderLost = (v) => { window.__lost.push(v.replay === true); return f(v); }; return 1; })()")
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _scrub(0.4)}, {"until": "window.LevainTopologyView.replayValue() !== null"}, {"eval": spy},
-                               {"eval": "document.querySelector('#k7-sessions [data-tv=list]').click(); 1"}, {"until": "document.querySelector('#k7-sessions .k7-srows')"}, SLEEP(300),
-                               {"eval": "JSON.stringify({lost: window.__lost, replaying: window.LevainTopologyView.replaying(), badge: !!document.querySelector('#k7-sessions .tv-rbadge')})"}])
+                               {"eval": "document.querySelector('#ck-hlens [data-tv=events]').click(); 1"}, {"until": "document.getElementById('ck-skycard').dataset.hlens == 'events'"}, SLEEP(300),
+                               {"eval": "JSON.stringify({lost: window.__lost, replaying: window.LevainTopologyView.replaying(), badge: !!document.querySelector('#ck-hlens .tv-rbadge')})"}])
     got = json.loads(out[-1])
     assert got["replaying"] is False and got["badge"] is False and True not in got["lost"], got
 
@@ -187,7 +187,7 @@ def test_a_400_that_names_the_window_re_anchors_once_and_retries(tmp_path, monke
             "if (s.includes('topology.json') && s.includes('at=') && window.__bad++ === 0) return f(s.replace(/at=[^&]+/, 'at=' + encodeURIComponent("
             "new Date(Math.floor((Date.now() - 15 * 3600e3) / 60000) * 60000).toISOString().replace('.000Z', 'Z'))), o); return f(u, o); }; return 1; })()")
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": once}, {"eval": _scrub(0.3)},
-                               {"until": "(document.querySelector('#k7-sessions .tv-rbadge') || {textContent: ''}).textContent.includes('live paused')", "ms": 8000}, {"eval": INFO}])
+                               {"until": "(document.querySelector('#ck-hlens .tv-rbadge') || {textContent: ''}).textContent.includes('live paused')", "ms": 8000}, {"eval": INFO}])
     got = json.loads(out[-1])
     assert got["err"] is None and got["badge"].endswith(" — live paused"), got
     assert len(_ats(got)) == 2, got                                                                              # the refused read and exactly one retry
@@ -242,10 +242,10 @@ def test_hour_marks_are_the_local_even_hours_in_zones_off_utc_by_an_hour_a_half_
 def test_live_keeps_the_replay_frame_labelled_until_the_live_read_lands(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _scrub(0.4)},
-                               {"until": "(document.querySelector('#k7-sessions .tv-rbadge') || {textContent: ''}).textContent.includes('live paused')"},
+                               {"until": "(document.querySelector('#ck-hlens .tv-rbadge') || {textContent: ''}).textContent.includes('live paused')"},
                                {"eval": _delay("s.includes('topology.json') && !s.includes('at=')", 1200)},
-                               {"eval": "document.querySelector('#k7-sessions .tv-live').click(); 1"}, SLEEP(300), {"eval": INFO},
-                               {"until": "!document.querySelector('#k7-sessions .tv-rbadge')", "ms": 8000}, {"eval": INFO}])
+                               {"eval": "document.querySelector('#ck-hlens .tv-live').click(); 1"}, SLEEP(300), {"eval": INFO},
+                               {"until": "!document.querySelector('#ck-hlens .tv-rbadge')", "ms": 8000}, {"eval": INFO}])
     mid, done = json.loads(out[-3]), json.loads(out[-1])
     assert mid["badge"] == "returning to live…" and mid["rshown"] not in (None, "live"), mid                     # the frame stays, labelled
     assert done["badge"] is None and done["rshown"] is None and done["replaying"] is False, done
@@ -262,7 +262,7 @@ def test_escape_with_a_dialog_open_elsewhere_does_not_end_replay_but_inside_the_
     editable = "(() => { const d = document.createElement('div'); d.contentEditable = 'true'; d.id = 'ce'; document.body.appendChild(d); return 1; })()"
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _scrub(0.4)}, WAIT_BADGE, {"eval": overlay}, {"eval": esc % "document.body"},
                                {"eval": editable}, {"eval": esc % "document.getElementById('ce')"},
-                               {"eval": esc % "document.querySelector('#k7-sessions .tv-rtrack')"},
+                               {"eval": esc % "document.querySelector('#ck-hlens .tv-rtrack')"},
                                {"until": "!window.LevainTopologyView.replaying()"}, {"eval": "window.LevainTopologyView.replaying()"}])
     assert out[-6] is True and out[-4] is True, out                                                              # a dialog is open / an editable is typing: replay stays
     assert out[-1] is False, out                                                                                 # Esc inside the card ends it, dialog or not
@@ -282,7 +282,7 @@ def test_the_histogram_is_not_read_for_a_strip_that_is_not_connected_or_not_visi
     shown = ("(() => { const d = document.createElement('div'); document.body.appendChild(d); "
              "d.appendChild(window.LevainTopologyView.render(%s, %s)); return 1; })()") % (json.dumps(_value()), opts)
     count = "(window.__urls || []).filter(u => u.includes('activity.json')).length"
-    out = _run(tmp_path, src, [{"until": STRIP}, {"until": "document.querySelectorAll('#k7-sessions .tv-rbars i').length > 10"}, SLEEP(500), {"eval": SPY}, {"eval": skew},
+    out = _run(tmp_path, src, [{"until": STRIP}, {"until": "document.querySelectorAll('#ck-hlens .tv-rbars i').length > 10"}, SLEEP(500), {"eval": SPY}, {"eval": skew},
                                {"eval": detached}, SLEEP(400), {"eval": count}, {"eval": hidden}, SLEEP(400), {"eval": count}, {"eval": shown}, SLEEP(600), {"eval": count}])
     assert out[-7] == 0 and out[-4] == 0, out                                                                    # nothing for a detached or a display:none strip
     assert out[-1] == 1, out                                                                                     # the one on screen, stale, is read once
@@ -295,7 +295,7 @@ def test_the_histogram_is_not_read_for_a_strip_that_is_not_connected_or_not_visi
 def test_a_key_that_ends_live_sets_no_refocus_for_the_next_repaint(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _key("ArrowRight")}, SLEEP(500),
-                               {"eval": "document.querySelector('#k7-sessions [data-tv=agents]').click(); 1"}, {"until": "document.querySelector('#k7-sessions .tv.tv-replaying, #k7-sessions .tv[data-lens=agents]')"},
+                               {"eval": "document.querySelector('#ck-hlens [data-tv=agents]').click(); 1"}, {"until": "document.querySelector('#ck-hlens .tv.tv-replaying, #ck-hlens .tv[data-lens=agents]')"},
                                SLEEP(300), {"eval": "document.activeElement && document.activeElement.classList.contains('tv-rtrack')"}])
     assert out[-1] is False, out
 
@@ -311,13 +311,13 @@ HOST = ("""(async () => { const V = window.LevainTopologyView; const host = docu
     if (m === 'reject') return Promise.reject(new Error('boom')); if (m === 'false') return Promise.resolve(false);
     if (m === 'hang') return new Promise(() => {}); if (m === 'sup') return Promise.resolve('superseded');
     if (m === 'sup-once') return Promise.resolve(window.__sup++ === 0 ? 'superseded' : 'applied'); return Promise.resolve('applied'); }},
-    repaint: () => { host.replaceChildren(V.render(V.replayValue() || window.__live, opts)); }};
+    repaint: () => { host.replaceChildren(V.render(V.replayValue() || window.__live, Object.assign({}, opts, {lens: 'agents', lensSeg: V.headerToggle('agents', () => { if (V.replaying()) V.returnToLive(); opts.repaint(); })}))); }};
   const pl = await window.LevainCockpitTransport.readJson('/cockpit/panel/topology.json?profile=full'); window.__live = pl.value; window.__opts = opts; opts.repaint(); return 1; })()""")
 H_INFO = ("JSON.stringify({badge: (%s || {}).textContent || null, err: (%s || {}).textContent || null, replaying: window.LevainTopologyView.replaying(), "
           "rshown: (%s || {dataset: {}}).dataset.rshown || null, max: +%s.getAttribute('aria-valuemax'), resumes: window.__resumes, "
           "urls: (window.__urls || []).filter(u => u.includes('at=')).length})") % (
     _H % ".tv-rbadge", _H % ".tv-rerr", _H % ".tv", _H % ".tv-rtrack")
-H_SCRUB = _scrub(0.4).replace("#k7-sessions .tv-rtrack", "#h6 .tv-rtrack")
+H_SCRUB = _scrub(0.4).replace("#ck-hlens .tv-rtrack", "#h6 .tv-rtrack")
 H_LIVE = "document.querySelector('#h6 .tv-live').click(); 1"
 H_PAUSED = {"until": "((document.querySelector('#h6 .tv-rbadge') || {textContent: ''}).textContent).includes('live paused')", "ms": 8000}
 
@@ -376,8 +376,8 @@ def test_escape_outside_the_card_ignores_a_hidden_dialog_but_not_a_visible_one(t
 @needs_browser
 def test_switching_lens_while_replaying_leaves_replay_and_the_strip_is_live_in_the_new_lens(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _scrub(0.4)}, WAIT_BADGE, {"eval": "document.querySelector('#k7-sessions [data-tv=agents]').click(); 1"},
-                               {"until": "document.querySelector('#k7-sessions .tv[data-lens=agents]')"}, SLEEP(300), {"eval": INFO}])
+    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _scrub(0.4)}, WAIT_BADGE, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
+                               {"until": "document.querySelector('#ck-hlens .tv[data-lens=work]')"}, SLEEP(300), {"eval": INFO}])
     got = json.loads(out[-1])
     assert got["replaying"] is False and got["paused"] is False and got["badge"] is None and got["rat"] is None, got
 
@@ -399,7 +399,7 @@ def test_the_live_retry_after_a_failure_issues_a_new_read_and_never_shows_the_un
 @needs_browser
 def test_a_lens_switch_keeps_the_labelled_frame_until_the_live_read_applies(tmp_path, monkeypatch):
     out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'hang'; 1"},
-                                            {"eval": "document.querySelector('#h6 [data-tv=agents]').click(); 1"}, SLEEP(300), {"eval": H_INFO},
+                                            {"eval": "document.querySelector('#h6 [data-tv=work]').click(); 1"}, SLEEP(300), {"eval": H_INFO},
                                             {"eval": "window.__mode = 'applied'; 1"}, {"eval": H_LIVE}, {"until": "!window.LevainTopologyView.replaying()", "ms": 8000}, {"eval": H_INFO}])
     mid, done = json.loads(out[-5]), json.loads(out[-1])
     assert mid["replaying"] is True and mid["badge"] == "returning to live…" and mid["rshown"] not in (None, "live") and mid["resumes"] == 1, mid

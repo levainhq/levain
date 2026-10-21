@@ -14,29 +14,29 @@ from tests.test_cockpit_flip_parity import needs_browser
 from tests.test_cockpit_k10_agents import PRIME
 from tests.test_cockpit_k7_build import _sessions_fixture
 
-STRIP = "document.querySelector('#k7-sessions .tv-replay')"
+STRIP = "document.querySelector('#ck-hlens .tv-replay')"
 SPY = ("(() => { window.__urls = []; const f = window.fetch.bind(window); window.fetch = (u, o) => { const s = String(u); window.__urls.push(s); "
        "return f(window.__rewrite ? window.__rewrite(s) : u, o); }; return 1; })()")
 
 
 def _scrub(frac: float) -> str:
     """A press, a move and a release on the track at `frac` of its width (what a click or a short drag does)."""
-    return ("(() => { const t = document.querySelector('#k7-sessions .tv-rtrack'); const r = t.getBoundingClientRect(); const x = r.left + r.width * %s; "
+    return ("(() => { const t = document.querySelector('#ck-hlens .tv-rtrack'); const r = t.getBoundingClientRect(); const x = r.left + r.width * %s; "
             "const ev = (n) => new PointerEvent(n, {bubbles: true, clientX: x, clientY: r.top + 5, pointerId: 1}); "
             "t.dispatchEvent(ev('pointerdown')); t.dispatchEvent(ev('pointermove')); t.dispatchEvent(ev('pointerup')); return 1; })()") % frac
 
 
-def _key(key: str, on: str = "document.querySelector('#k7-sessions .tv-rtrack')") -> str:
+def _key(key: str, on: str = "document.querySelector('#ck-hlens .tv-rtrack')") -> str:
     return "(() => { %s.dispatchEvent(new KeyboardEvent('keydown', {key: %s, bubbles: true})); return 1; })()" % (on, json.dumps(key))
 
 
 PROBE = ("JSON.stringify({strip: !!%s, label: (%s || {querySelector: () => null}).querySelector('.tv-rcap b') && %s.querySelector('.tv-rcap b').textContent, "
-         "sub: %s && %s.querySelector('.tv-rcap span').textContent, badge: (document.querySelector('#k7-sessions .tv-rbadge') || {}).textContent || null, "
-         "pressed: %s && document.querySelector('#k7-sessions .tv-live').getAttribute('aria-pressed'), "
-         "err: (document.querySelector('#k7-sessions .tv-rerr') || {}).textContent || null, "
-         "unk: [...document.querySelectorAll('#k7-sessions .tv-unk')].map(n => n.textContent), "
+         "sub: %s && %s.querySelector('.tv-rcap span').textContent, badge: (document.querySelector('#ck-hlens .tv-rbadge') || {}).textContent || null, "
+         "pressed: %s && document.querySelector('#ck-hlens .tv-live').getAttribute('aria-pressed'), "
+         "err: (document.querySelector('#ck-hlens .tv-rerr') || {}).textContent || null, "
+         "unk: [...document.querySelectorAll('#ck-hlens .tv-unk')].map(n => n.textContent), "
          "urls: (window.__urls || []).filter(u => u.includes('topology.json')), "
-         "bars: document.querySelectorAll('#k7-sessions .tv-rbars i').length, hours: [...document.querySelectorAll('#k7-sessions .tv-rhr')].map(n => n.textContent)})") % (
+         "bars: document.querySelectorAll('#ck-hlens .tv-rbars i').length, hours: [...document.querySelectorAll('#ck-hlens .tv-rhr')].map(n => n.textContent)})") % (
     STRIP, STRIP, STRIP, STRIP, STRIP, STRIP)
 AT = "u => decodeURIComponent((u.match(/[?&]at=([^&]+)/) || [])[1] || '')"
 
@@ -53,7 +53,7 @@ def _ats(got: dict) -> list[str]:
 @needs_browser
 def test_the_strip_is_drawn_under_the_topology_with_its_label_sub_bars_hours_and_a_live_pill(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    out = _run(tmp_path, src, [{"until": STRIP}, {"until": "document.querySelectorAll('#k7-sessions .tv-rbars i').length > 10"}, {"eval": PROBE}])
+    out = _run(tmp_path, src, [{"until": STRIP}, {"until": "document.querySelectorAll('#ck-hlens .tv-rbars i').length > 10"}, {"eval": PROBE}])
     got = json.loads(out[-1])
     assert got["strip"] is True and got["label"] == "Replay" and got["sub"] == "last 14 h, from the ledger", got
     assert got["pressed"] == "true" and got["badge"] is None and got["err"] is None, got      # Live is the default
@@ -61,17 +61,17 @@ def test_the_strip_is_drawn_under_the_topology_with_its_label_sub_bars_hours_and
 
 
 @needs_browser
-def test_no_strip_without_the_replay_flag_and_none_below_1440(tmp_path, monkeypatch):
+def test_no_strip_without_the_replay_flag_and_the_header_carries_it_at_every_width(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     # a value handed to the renderer with no `replay` option (a head without `replay: true`) draws no strip, in either lens
-    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _paint(_value(), "work")}, {"eval": "!!document.querySelector('#k7-sessions .tv-replay')"},
-                               {"eval": _paint(_value(), "agents")}, {"eval": "!!document.querySelector('#k7-sessions .tv-replay')"}])
+    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _paint(_value(), "work")}, {"eval": "!!document.querySelector('#ck-hlens .tv-replay')"},
+                               {"eval": _paint(_value(), "agents")}, {"eval": "!!document.querySelector('#ck-hlens .tv-replay')"}])
     assert out[-3] is False and out[-1] is False, out
-    # below 1440 the list is the default: no topology, so no replay
+    # K11: the header draws the topology at every width (the list|topology switch is gone), so the strip is there below 1440 too
     from tests.test_cockpit_f12b_topology_view import MID, NARROW
     for dev in (MID, NARROW):
-        o = _run(tmp_path, src, [{"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": "!!document.querySelector('#k7-sessions .tv-replay')"}], first=dev)
-        assert o[-1] is False, (dev, o)
+        o = _run(tmp_path, src, [{"until": STRIP}, {"eval": "!!document.querySelector('#ck-hlens .tv-replay')"}], first=dev)
+        assert o[-1] is True, (dev, o)
 
 
 # --- a scrub ----------------------------------------------------------------------------------------------
@@ -83,7 +83,7 @@ def test_a_scrub_asks_a_whole_minute_from_the_live_as_of_not_the_browser_clock_p
     live_asof = "window.LevainCockpitTransport.readJson('/cockpit/panel/topology.json?profile=full').then(p => p.value.as_of)"
     skew = "(() => { const n = Date.now.bind(Date); Date.now = () => n() + 3 * 86400000; return 1; })()"        # a browser clock three days off
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": skew}, {"eval": live_asof}, {"eval": _scrub(0.5)},
-                               {"until": "(document.querySelector('#k7-sessions .tv-rbadge') || {textContent: ''}).textContent.includes('live paused')"}, {"eval": PROBE}])
+                               {"until": "(document.querySelector('#ck-hlens .tv-rbadge') || {textContent: ''}).textContent.includes('live paused')"}, {"eval": PROBE}])
     asof, got = out[-4], json.loads(out[-1])
     ats = _ats(got)
     assert len(ats) == 1, got
@@ -100,10 +100,10 @@ def test_a_scrub_asks_a_whole_minute_from_the_live_as_of_not_the_browser_clock_p
 def test_scrubbing_pauses_the_topologys_live_refetch_and_live_resumes_it(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     refetch = "window.LevainCockpitView.refetchPanel('topology').then(r => String(r))"
-    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _scrub(0.4)}, {"until": "document.querySelector('#k7-sessions .tv-rbadge')"},
+    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _scrub(0.4)}, {"until": "document.querySelector('#ck-hlens .tv-rbadge')"},
                                {"eval": "(window.__urls = [], 1)"}, {"eval": refetch}, {"eval": PROBE},
-                               {"eval": "document.querySelector('#k7-sessions .tv-live').click(); 1"},
-                               {"until": "!document.querySelector('#k7-sessions .tv-rbadge')"}, {"until": "(window.__urls || []).some(u => u.includes('topology.json') && !u.includes('at='))"},
+                               {"eval": "document.querySelector('#ck-hlens .tv-live').click(); 1"},
+                               {"until": "!document.querySelector('#ck-hlens .tv-rbadge')"}, {"until": "(window.__urls || []).some(u => u.includes('topology.json') && !u.includes('at='))"},
                                {"eval": PROBE}])
     paused, live = json.loads(out[-5]), json.loads(out[-1])
     assert out[-6] == "applied", out                                                                         # answered without a read
@@ -114,9 +114,9 @@ def test_scrubbing_pauses_the_topologys_live_refetch_and_live_resumes_it(tmp_pat
 @needs_browser
 def test_escape_returns_to_live_and_the_arrows_step_one_bucket(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _key("ArrowLeft")}, {"until": "document.querySelector('#k7-sessions .tv-rbadge')"},
+    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _key("ArrowLeft")}, {"until": "document.querySelector('#ck-hlens .tv-rbadge')"},
                                {"eval": _key("ArrowLeft")}, {"until": "(window.__urls || []).filter(u => u.includes('at=')).length >= 2"}, {"eval": PROBE},
-                               {"eval": _key("Escape", "document")}, {"until": "!document.querySelector('#k7-sessions .tv-rbadge')"}, {"eval": PROBE}])
+                               {"eval": _key("Escape", "document")}, {"until": "!document.querySelector('#ck-hlens .tv-rbadge')"}, {"eval": PROBE}])
     stepped, back = json.loads(out[-4]), json.loads(out[-1])
     from datetime import datetime
     ats = [datetime.strptime(x, "%Y-%m-%dT%H:%M:%SZ") for x in _ats(stepped)]
@@ -130,8 +130,8 @@ def test_escape_returns_to_live_and_the_arrows_step_one_bucket(tmp_path, monkeyp
 @needs_browser
 def test_a_source_the_past_read_could_not_rebuild_is_drawn_as_unknown_never_as_none(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _scrub(0.4)}, {"until": "document.querySelector('#k7-sessions .tv-rbadge')"},
-                               {"until": "document.querySelector('#k7-sessions .tv-unk')"}, {"eval": PROBE}])
+    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _scrub(0.4)}, {"until": "document.querySelector('#ck-hlens .tv-rbadge')"},
+                               {"until": "document.querySelector('#ck-hlens .tv-unk')"}, {"eval": PROBE}])
     got = json.loads(out[-1])
     assert any(u.startswith("open loops: not kept for the past") for u in got["unk"]), got
     # a literal replay value: every unreadable name is said, in words, with the same reason
@@ -151,7 +151,7 @@ def test_a_refusal_is_said_plainly_and_the_page_stays_live(tmp_path, monkeypatch
     rewrite = ("window.__rewrite = (s) => (s.includes('topology.json') && s.includes('at=') ? s.replace(/at=[^&]+/, 'at=' + encodeURIComponent("
                "new Date(Math.floor((Date.now() - 15 * 3600e3) / 60000) * 60000).toISOString().replace('.000Z', 'Z'))) : s); 1")
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": rewrite}, {"eval": _scrub(0.3)},
-                               {"until": "document.querySelector('#k7-sessions .tv-rerr')"}, {"eval": PROBE},
+                               {"until": "document.querySelector('#ck-hlens .tv-rerr')"}, {"eval": PROBE},
                                {"eval": "(window.__urls = [], window.LevainCockpitView.refetchPanel('topology').then(r => String(r)))"}, {"eval": PROBE}])
     got, after = json.loads(out[-3]), json.loads(out[-1])
     assert got["err"] and got["err"].lower().startswith("replay refused"), got
@@ -163,17 +163,17 @@ def test_a_refusal_is_said_plainly_and_the_page_stays_live(tmp_path, monkeypatch
 def test_the_repaint_signature_carries_the_replay_time(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     sig = "window.LevainTopologyView.signature(%s, 'work')" % json.dumps(_value())
-    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": sig}, {"eval": _scrub(0.4)}, {"until": "document.querySelector('#k7-sessions .tv-rbadge')"}, {"eval": sig},
-                               {"eval": _scrub(0.6)}, {"until": "document.querySelector('#k7-sessions .tv-rbadge')"}, {"eval": sig}])
+    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": sig}, {"eval": _scrub(0.4)}, {"until": "document.querySelector('#ck-hlens .tv-rbadge')"}, {"eval": sig},
+                               {"eval": _scrub(0.6)}, {"until": "document.querySelector('#ck-hlens .tv-rbadge')"}, {"eval": sig}])
     assert len({out[2], out[5], out[8]}) == 3, out[2:]                                                       # live, T1, T2 all repaint
 
 
 # --- the conflict chip never covers a label --------------------------------------------------------------
 
 
-CHIP_PROBE = ("JSON.stringify((() => { const c = document.querySelector('#k7-sessions .tv-confchip').getBoundingClientRect(); "
+CHIP_PROBE = ("JSON.stringify((() => { const c = document.querySelector('#ck-hlens .tv-confchip').getBoundingClientRect(); "
               "const hit = (n) => { const r = n.getBoundingClientRect(); return !(r.right <= c.left || r.left >= c.right || r.bottom <= c.top || r.top >= c.bottom); }; "
-              "return {labels: [...document.querySelectorAll('#k7-sessions .tv-lblbg')].filter(hit).length, faces: [...document.querySelectorAll('#k7-sessions .tv-facebg')].filter(hit).length, "
+              "return {labels: [...document.querySelectorAll('#ck-hlens .tv-lblbg')].filter(hit).length, faces: [...document.querySelectorAll('#ck-hlens .tv-facebg')].filter(hit).length, "
               "w: c.width}; })())")
 
 
@@ -196,7 +196,7 @@ def test_the_conflict_chip_covers_no_group_label_hub_label_or_face(tmp_path, mon
 
 
 def _drag(steps: int) -> str:
-    return ("(() => { const t = document.querySelector('#k7-sessions .tv-rtrack'); const r = t.getBoundingClientRect(); "
+    return ("(() => { const t = document.querySelector('#ck-hlens .tv-rtrack'); const r = t.getBoundingClientRect(); "
             "const ev = (n, k) => new PointerEvent(n, {bubbles: true, clientX: r.left + r.width * k, clientY: r.top + 5, pointerId: 1}); "
             "t.dispatchEvent(ev('pointerdown', 0.2)); for (let i = 1; i <= %d; i++) t.dispatchEvent(ev('pointermove', 0.2 + 0.5 * i / %d)); "
             "t.dispatchEvent(ev('pointerup', 0.7)); return 1; })()") % (steps, steps)
@@ -205,7 +205,7 @@ def _drag(steps: int) -> str:
 @needs_browser
 def test_a_drag_across_many_buckets_issues_one_request_on_release_and_never_an_empty_at(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _drag(60)}, {"until": "document.querySelector('#k7-sessions .tv-rbadge')"},
+    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _drag(60)}, {"until": "document.querySelector('#ck-hlens .tv-rbadge')"},
                                {"eval": "new Promise(r => setTimeout(r, 600))"}, {"eval": PROBE}])
     got = json.loads(out[-1])
     ats = _ats(got)
@@ -225,7 +225,7 @@ def test_keyboard_steps_coalesce_and_a_newer_read_aborts_the_older_in_flight_one
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _key("ArrowLeft")}, {"eval": _key("ArrowLeft")}, {"eval": _key("ArrowLeft")},
                                {"eval": "new Promise(r => setTimeout(r, 900))"}, {"eval": PROBE},
                                {"eval": slow}, {"eval": _scrub(0.3)}, {"eval": "new Promise(r => setTimeout(r, 100))"}, {"eval": _scrub(0.5)},
-                               {"until": "!document.querySelector('#k7-sessions .tv-rcap span').textContent.includes('reading')", "ms": 10000},
+                               {"until": "!document.querySelector('#ck-hlens .tv-rcap span').textContent.includes('reading')", "ms": 10000},
                                {"eval": "JSON.stringify([window.__aborted, window.__max])"}])
     keys = json.loads(out[-7])
     assert len(_ats(keys)) == 1, keys

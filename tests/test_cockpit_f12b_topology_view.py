@@ -16,7 +16,7 @@ from tests.test_cockpit_k7_build import BUILD, DESKTOP, _sessions_fixture
 
 NARROW = {"emulate": {"w": 390, "h": 800, "dpr": 1, "mobile": True}}
 MID = {"emulate": {"w": 1200, "h": 900, "dpr": 1}}
-TV = "document.querySelector('#k7-sessions .tv')"
+TV = "document.querySelector('#ck-hlens .tv')"
 
 
 def _spore(root: Path) -> None:
@@ -57,13 +57,12 @@ def _value() -> dict:
 
 
 def _paint(value: dict, lens: str = "work") -> str:
-    """Replace the real body with the renderer's own output for a literal value (the page's repaint leaves it: the signature is unchanged)."""
-    return ("(() => { try { localStorage.setItem('levain_cockpit_topology_lens', %s); } catch (_) {} const c = document.querySelector('#k7-sessions .k7-card'); "
-            "for (const o of c.querySelectorAll('.tv, .k7-srows, .k7-none')) o.remove(); "
-            "c.appendChild(window.LevainTopologyView.render(%s, {openCard: (id) => { window.__opened = id; }})); return 1; })()") % (json.dumps(lens), json.dumps(value))
+    """Replace the header's body with the renderer's own output for a literal value (the page's repaint leaves it: the signature is unchanged)."""
+    return ("(() => { const h = document.getElementById('ck-hlens'); h.hidden = false; "
+            "h.replaceChildren(window.LevainTopologyView.render(%s, {lens: %s, openCard: (id) => { window.__opened = id; }})); return 1; })()") % (json.dumps(value), json.dumps(lens))
 
 
-def _run(tmp_path, src, steps, first=DESKTOP, until="document.querySelector('#k7-sessions .k7-card')"):
+def _run(tmp_path, src, steps, first=DESKTOP, until="document.querySelector('#k7-sessions .k7-card') && document.querySelector('#ck-hlens .tv')"):
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         return _drive(tmp_path, f"{url}/{BUILD}", [first, {"until": until}, *steps])["values"]
 
@@ -72,7 +71,7 @@ def _run(tmp_path, src, steps, first=DESKTOP, until="document.querySelector('#k7
 
 
 @needs_browser
-def test_the_work_lens_is_the_default_at_1440_and_draws_the_providers_own_nulls_as_not_tracked(tmp_path, monkeypatch):
+def test_the_work_lens_draws_the_providers_own_nulls_as_not_tracked(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
     _spore(root)
     probe = ("JSON.stringify({lens: %s.dataset.lens, recs: %s.querySelectorAll('.tv-wl .tv-rec').length, "
@@ -80,11 +79,12 @@ def test_the_work_lens_is_the_default_at_1440_and_draws_the_providers_own_nulls_
              "cols: %s.querySelectorAll('.tv-col').length, "
              "tasks: [...%s.querySelectorAll('.tv-task')].map(t => [t.dataset.state, t.dataset.kind, "
              "(t.querySelector('.tv-cost') || {textContent: ''}).textContent, [...t.querySelectorAll('.tv-chip')].map(c => c.textContent)]), "
-             "pressed: [...document.querySelectorAll('#k7-sessions .k7-mode-slot [aria-pressed=true]')].map(b => b.textContent)})") % ((TV,) * 5)
-    out = _run(tmp_path, src, [{"until": TV + " && " + TV + ".querySelector('.tv-task')"}, {"eval": probe}])
+             "pressed: [...document.querySelectorAll('#ck-hlens .tv-seg [aria-pressed=true]')].map(b => b.textContent)})") % ((TV,) * 5)
+    out = _run(tmp_path, src, [{"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
+                               {"until": TV + " && " + TV + ".querySelector('.tv-task')"}, {"eval": probe}])
     got = json.loads(out[-1])
     assert got["lens"] == "work" and got["cols"] == 0, got                              # Work, not Agents
-    assert got["pressed"] == ["topology"], got                                          # topology is the default view at 1440
+    assert got["pressed"] == ["Work"], got                                              # the header's switch says so
     assert got["recs"] >= 1, got                                                        # the pending consents are records in the left column
     assert not any(t[1] in ("consent", "question") for t in got["tasks"]), got          # ... and not centre cards
     by = {t[1]: t for t in got["tasks"]}
@@ -98,37 +98,35 @@ def test_the_work_lens_is_the_default_at_1440_and_draws_the_providers_own_nulls_
 
 
 @needs_browser
-def test_below_1440_the_list_is_the_default_and_the_switch_reaches_the_topology(tmp_path, monkeypatch):
+def test_a_cold_open_draws_the_header_on_the_agents_graph_lens(tmp_path, monkeypatch):
+    """K11: no stored choice -> the header's default lens is the Agents graph, with the three-way switch in its order."""
     root, src = _sessions_fixture(tmp_path, monkeypatch)
     _spore(root)
-    probe = ("JSON.stringify({tv: !!%s, rows: document.querySelectorAll('#k7-sessions .k7-srow').length, "
-             "pressed: [...document.querySelectorAll('#k7-sessions .k7-mode-slot [aria-pressed=true]')].map(b => b.textContent)})") % TV
-    out = _run(tmp_path, src, [{"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": probe},
-                               {"eval": "document.querySelector('#k7-sessions [data-tv=topology]').click(); 1"},
-                               {"until": TV}, {"eval": probe}], first=MID)
-    before, after = json.loads(out[-4]), json.loads(out[-1])
-    assert before == {"tv": False, "rows": 3, "pressed": ["list"]}, before
-    assert after["tv"] is True and after["rows"] == 0 and after["pressed"] == ["topology"], after
+    probe = ("JSON.stringify({lens: %s && %s.dataset.lens, hl: document.getElementById('ck-skycard').dataset.hlens, graph: !!%s.querySelector('svg.tv-graph'), "
+             "stored: localStorage.getItem('levain_cockpit_header_lens'), "
+             "buttons: [...document.querySelectorAll('#ck-hlens .tv-seg-b')].map(b => [b.textContent, b.getAttribute('aria-pressed')])})") % (TV, TV, TV)
+    out = _run(tmp_path, src, [{"until": TV + " && " + TV + ".querySelector('svg.tv-graph')"}, {"eval": probe}])
+    got = json.loads(out[-1])
+    assert got["lens"] == "agents" and got["hl"] == "agents" and got["graph"] is True and got["stored"] is None, got
+    assert got["buttons"] == [["Agents graph", "true"], ["Event graph", "false"], ["Work", "false"]], got
 
 
 @needs_browser
-def test_the_view_and_the_lens_persist_across_a_reload_in_the_same_browser(tmp_path, monkeypatch):
+def test_choosing_the_event_graph_survives_a_reload(tmp_path, monkeypatch):
+    """K11: the header's choice is a per-browser view preference: Event graph, reload, still Event graph (the Activity band shown, no topology drawn)."""
     root, src = _sessions_fixture(tmp_path, monkeypatch)
     _spore(root)
-    probe = ("JSON.stringify({tv: !!%s, rows: document.querySelectorAll('#k7-sessions .k7-srow').length, "
-             "lens: %s && %s.dataset.lens})") % (TV, TV, TV)
+    probe = ("JSON.stringify({hl: document.getElementById('ck-skycard').dataset.hlens, tv: !!%s, "
+             "pressed: [...document.querySelectorAll('#ck-hlens .tv-seg [aria-pressed=true]')].map(b => b.textContent), "
+             "sky: getComputedStyle(document.getElementById('ck-sky')).display})") % TV
     out = _run(tmp_path, src, [
-        {"until": TV}, {"eval": "document.querySelector('#k7-sessions [data-tv=list]').click(); 1"},
-        {"until": "document.querySelector('#k7-sessions .k7-srow')"},
+        {"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=events]').click(); 1"},
+        {"until": "document.getElementById('ck-skycard').dataset.hlens == 'events'"}, {"eval": probe},
         {"eval": "location.reload(); 1"}, {"eval": "new Promise(r => setTimeout(r, 1500))"},
-        {"until": "document.querySelector('#k7-sessions .k7-card')"}, {"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": probe},
-        {"eval": "document.querySelector('#k7-sessions [data-tv=topology]').click(); 1"}, {"until": TV},
-        {"eval": "document.querySelector('#k7-sessions [data-tv=agents]').click(); 1"}, {"until": TV + ".dataset.lens == 'agents'"},
-        {"eval": "location.reload(); 1"}, {"eval": "new Promise(r => setTimeout(r, 1500))"},
-        {"until": TV + " && " + TV + ".querySelector('.tv-col')"}, {"eval": probe}])
-    first, second = json.loads(out[-9]), json.loads(out[-1])
-    assert first == {"tv": False, "rows": 3, "lens": None}, first                      # list survives a reload, at 1440
-    assert second["tv"] is True and second["lens"] == "agents", second                  # topology and Agents survive one
+        {"until": "document.querySelector('#ck-hlens .tv-seg-b')"}, {"eval": probe}])
+    before, after = json.loads(out[-5]), json.loads(out[-1])
+    assert before["hl"] == "events" and before["tv"] is False and before["pressed"] == ["Event graph"], before
+    assert after == before and after["sky"] != "none", after
 
 
 @needs_browser
@@ -136,8 +134,8 @@ def test_a_bare_install_draws_no_switch_no_topology_and_keeps_the_one_line(tmp_p
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "levain_home"))
     _root, src, _ids = _install(tmp_path)
     src.anneal.spores_json.unlink(missing_ok=True)                  # K10: an open loop is work, so "bare" means no loop either
-    probe = ("JSON.stringify({tv: !!%s, switch: document.querySelectorAll('#k7-sessions [data-tv]').length, "
-             "quiet: !!document.querySelector('#k7-sessions .tv-quiet'), text: document.querySelector('#k7-sessions').innerText.replace(/\\s+/g, ' ')})") % TV
+    probe = ("JSON.stringify({tv: !!%s, switch: document.querySelectorAll('#ck-hlens [data-tv]').length, "
+             "quiet: !!document.querySelector('#ck-hlens .tv-quiet'), text: document.querySelector('#k7-sessions').innerText.replace(/\\s+/g, ' ')})") % TV
     out = _run(tmp_path, src, [{"until": "document.querySelector('#k7-sessions .k7-none')"}, {"eval": probe}])
     got = json.loads(out[-1])
     assert got["tv"] is False and got["switch"] == 0, got
@@ -152,6 +150,7 @@ def test_a_bare_install_draws_no_switch_no_topology_and_keeps_the_one_line(tmp_p
 def test_a_click_on_a_waiting_record_opens_the_card_it_waits_on(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
     out = _run(tmp_path, src, [
+        {"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
         {"until": TV + " && " + TV + ".querySelector('.tv-rec.tv-open')"},
         {"eval": TV + ".querySelector('.tv-rec.tv-open').click(); 1"},
         {"until": "document.querySelector('#ck-needs .needs-lit[data-needs-id^=consent]')"},      # K10 S3: the strip's card (Build: its chip) is lit, no modal

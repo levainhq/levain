@@ -248,7 +248,6 @@ def test_build_draws_sessions_large_with_who_what_context_and_since(tmp_path, mo
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     probe = ("JSON.stringify({head: document.querySelector('#k7-sessions .k7-card-h').innerText.replace(/\\s+/g, ' '), "
              "gloss: document.querySelector('#k7-sessions .k7-head').innerText.replace(/\\s+/g, ' '), "
-             "slot: !!document.querySelector('#k7-sessions .k7-card-h [data-k7-slot=mode]'), "
              "rows: " + ROWS + ".map(r => ({live: r.classList.contains('live'), waiting: r.classList.contains('waiting'), agent: r.querySelector('.k7-agent').textContent, "
              "repo: (r.querySelector('.k7-repo') || {}).textContent, cwd: r.querySelector('.k7-cwd').textContent, said: r.querySelector('.k7-tool').textContent, "
              "meter: r.querySelector('.k7-meter-v').textContent, fill: r.querySelector('.k7-bar > i').style.width, when: r.querySelector('.k7-when').textContent}))})")
@@ -257,7 +256,6 @@ def test_build_draws_sessions_large_with_who_what_context_and_since(tmp_path, mo
     got = json.loads(out[-1])
     assert got["head"].startswith("Sessions 3 2 live · 1 quiet"), got
     assert "Who is working right now, and how much room they have left." in got["gloss"], got
-    assert got["slot"] is True, got                         # the hook a later `list | topology` switch renders into
     by = {r["agent"] + ("-" + ("live" if r["live"] else "quiet")): r for r in got["rows"]}
     cx, cc, q = by["codex-live"], by["claude_code-live"], by["claude_code-quiet"]
     assert re.fullmatch(r"Edit money\.py · \d+ s ago", cx["said"]), cx

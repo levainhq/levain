@@ -56,7 +56,7 @@ def test_through_the_real_provider_each_live_session_is_a_line_and_an_unread_tre
     probe = ("JSON.stringify({head: %s.querySelector('.lc-h').innerText.replace(/\\s+/g, ' '), lines: [...%s.querySelectorAll('.lc-line')].map(l => l.innerText.replace(/\\s+/g, ' ')), "
              "foot: (%s.querySelector('.lc-foot') || {textContent: ''}).textContent})") % (LC, LC, LC)
     out = _run(tmp_path, src, [{"until": LC}, {"eval": probe},
-                               {"eval": "document.querySelector('#k7-sessions [data-tv=agents]').click(); 1"}, {"until": TV + ".dataset.lens == 'agents'"}, {"eval": probe}])
+                               {"eval": "document.querySelector('#ck-hlens [data-tv=agents]').click(); 1"}, {"until": TV + ".dataset.lens == 'agents'"}, {"eval": probe}])
     first, second = json.loads(out[-4]), json.loads(out[-1])
     assert first["head"].startswith("Lost if closed 2") and "0 would lose work" in first["head"], first
     assert len(first["lines"]) == 2 and all("git state not read" in l and "nothing at risk" not in l for l in first["lines"]), first   # the fixture's cwds are no git tree
