@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -602,33 +603,90 @@ def test_end_inode_and_time_caps_refused(tmp_path):
                        caps=Caps(inodes=n)) == RETAINED   # exactly at the cap ends normally
 
 
-def test_end_deep_chain_holds_bounded_fds_and_refuses_past_depth_cap(world):
-    """A slot-built directory chain deeper than the fd limit (reproduced on main 42585459: a 2000-deep chain at
-    RLIMIT_NOFILE 1024, and a 300-deep one at macOS's default 256, made the manifest walk raise EMFILE, so END
-    landed HELD at the bare ``manifest`` phase and failed the same way on every pass). The walk now holds a
-    bounded number of fds, so the chain is retained under a low limit; past the depth cap it is a budget
-    refusal (HELD ``manifest_budget``, nothing mutated), whose exit is END again with a larger cap. The chain is
-    under ``.levain-var-folders``, whose own frame is opened by path, not from the root's fd."""
-    fd = os.open(world.vf / "T", os.O_RDONLY | os.O_DIRECTORY)
-    for name in ["deep"] + ["d"] * 149:            # openat all the way down: PATH_MAX never limits it
+def _chain(base: Path, depth: int) -> None:
+    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    for name in ["deep"] + ["d"] * (depth - 1):    # openat all the way down: PATH_MAX never limits it
         os.mkdir(name, dir_fd=fd)
         nfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
         os.close(fd)
         fd = nfd
     os.close(fd)
+
+
+def _fd_limit(free: int) -> int:
+    """The soft RLIMIT_NOFILE that leaves exactly ``free`` fd numbers open to new fds: the open fds counted from
+    /dev/fd (each confirmed by fstat, so the listing's own fd is not counted); skipped past the hard limit."""
+    used = set()
+    for n in os.listdir("/dev/fd"):
+        try:
+            os.fstat(int(n))
+            used.add(int(n))
+        except OSError:
+            pass
+    lim = got = 0
+    while got < free:
+        if lim not in used:
+            got += 1
+        lim += 1
+    hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+    if hard != resource.RLIM_INFINITY and hard < lim:
+        pytest.skip(f"RLIMIT_NOFILE hard {hard} < {lim}")
+    return lim
+
+
+@contextmanager
+def _nofile(free: int):
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (_fd_limit(free), hard))
+    try:
+        yield
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+def test_walk_fd_peak_is_bounded(world):
+    """Reproduced red on the r1 tip fa9251c0 (codex r1 MED): the walk pruned an ancestor only after opening and
+    listing the child, so its peak was two past WALK_OPEN_DIRS, and with exactly WALK_PEAK_FDS fds free it raised
+    EMFILE part-way down a chain. It now prunes first, so the whole tree walks with that many free."""
+    _chain(world.S / "repo", 150)
+    _chain(world.vf / "T", 150)                     # under .levain-var-folders, the frame opened by path
+    expected = len(list(end_mod.walk(world.S, world.extra)))
+    with _nofile(end_mod.WALK_PEAK_FDS):
+        assert len(list(end_mod.walk(world.S, world.extra))) == expected
+
+
+# DECISION: room for END's own fds beside the walk's, with some to spare; the chain is far deeper than the limit
+# this leaves, so it still proves the walk's bound.
+END_OWN_FDS = 8
+
+
+def test_end_deep_chain_holds_bounded_fds_and_refuses_past_depth_cap(world):
+    """A slot-built directory chain deeper than the fd limit (reproduced on main 42585459: a 2000-deep chain at
+    RLIMIT_NOFILE 1024, and a 300-deep one at macOS's default 256, made the manifest walk raise EMFILE, so END
+    landed HELD at the bare ``manifest`` phase and failed the same way on every pass). The walk now holds a
+    bounded number of fds, so the chain is retained under a low limit; past the depth cap it is a budget
+    refusal (HELD ``manifest_budget``, nothing mutated), whose exit is END again with a larger cap. That pass
+    failing after the rename, then a pass at a cap SMALLER than the chain, still retains it (reproduced on the
+    r1 tip fa9251c0, complement r1 MED 1: the second pass refused ``manifest-depth-cap`` on the renamed tree):
+    every walk after the manifest takes the depth the manifest accepted. The chain is under
+    ``.levain-var-folders``, whose own frame is opened by path, not from the root's fd."""
+    _chain(world.vf / "T", 150)
     pre_live = {k: v for k, v in snapshot(world.S).items() if k != "config/claude/.credentials.json"}
     pre, pre_manifest = world.pre(), world.pre_manifest()
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     ctl = Control()
-    resource.setrlimit(resource.RLIMIT_NOFILE, (96, hard))
-    try:
+
+    def fault(p):
+        if p == "retain:tree:renamed":
+            raise OSError(errno.EIO, "a transient failure after the rename")
+    with _nofile(end_mod.WALK_PEAK_FDS + END_OWN_FDS):
         assert end_session(world.facts, world.seams(ctl), record_state=REVOKED, caps=Caps(depth=100)) == HELD
         assert ctl.failed_step == "manifest_budget" and any("manifest-depth-cap" in n for n in world.notes)
         _untouched(world, pre_live)
-        assert end_session(world.facts, world.seams(ctl), record_state=HELD, failed_step="manifest_budget",
-                           held_attempts=1) == RETAINED
-    finally:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+        assert end_session(world.facts, world.seams(ctl, fault=fault), record_state=HELD,
+                           failed_step="manifest_budget", held_attempts=1, caps=Caps(depth=200)) == HELD
+        assert ctl.failed_step == "tree" and world.facts.tree.exists() and not world.S.exists()
+        assert end_session(world.facts, world.seams(ctl), record_state=HELD, failed_step="tree", held_attempts=2,
+                           caps=Caps(depth=100)) == RETAINED
     ctl.history = [h for h in ctl.history if h[0] != HELD]
     _assert_retained(world, pre, pre_manifest, ctl)
 

@@ -88,9 +88,12 @@ LINK_COPY_BYTES = 2 << 30
 # WALK_OPEN_DIRS, below the smallest default RLIMIT_NOFILE).
 MANIFEST_DEPTH = 1024
 # DECISION: the most directory fds one walk holds open at a time (its root's included). An ancestor past it is
-# closed when the walk descends and reopened through the child's ``..`` when the walk climbs back, checked to be
-# the same directory, so a deep chain costs reopens, not fds.
+# closed before the walk opens a child and reopened through the child's ``..`` when the walk climbs back, checked
+# to be the same directory, so a deep chain costs reopens, not fds.
 WALK_OPEN_DIRS = 32
+# The most fds one walk has open at any instant: WALK_OPEN_DIRS plus one reserved for enumeration (listing a
+# directory by its fd duplicates the fd for as long as the listing runs).
+WALK_PEAK_FDS = WALK_OPEN_DIRS + 1
 # DECISION: how long END keeps retrying a CAS CONTROL did not take (``locked``, CONTROL down) before it
 # leaves the record for the next pass: V12's order, so one END never outlives a reaper pass by much.
 CAS_RETRY_SECONDS = V12_SECONDS
@@ -366,9 +369,12 @@ def _reopen_parent(child_fd: int, frame: list) -> None:
     """Reopen a closed ancestor ``frame`` through its child's ``..`` (never a link), checked to be the
     directory the walk opened before; anything else refuses ``tree-changed``."""
     fd = os.open(b"..", _DIR_FLAGS, dir_fd=child_fd)
-    if not _same(os.fstat(fd), frame[7]):
+    try:
+        if not _same(os.fstat(fd), frame[7]):
+            raise Refused("tree-changed", f"{frame[2]!r} changed under the walk")
+    except BaseException:
         os.close(fd)
-        raise Refused("tree-changed", f"{frame[2]!r} changed under the walk")
+        raise
     frame[0] = fd
 
 
@@ -384,8 +390,9 @@ def walk(root: Path, extra: Mapping[bytes, Path] | None = None, *,
 
     An entry more than ``depth_cap`` levels below ``root`` (a root child is level 1) refuses
     ``manifest-depth-cap``. At most :data:`WALK_OPEN_DIRS` directory fds are held: the root's always, and
-    the deepest ones; an ancestor closed on the way down is reopened from its child's ``..`` on the way back
-    up (:func:`_reopen_parent`). Only the directory of the entry yielded is guaranteed open."""
+    the deepest ones; an ancestor is closed before a child would pass that, and reopened from its child's ``..``
+    on the way back up (:func:`_reopen_parent`). The walk never has more than :data:`WALK_PEAK_FDS` open at
+    once. Only the directory of the entry yielded is guaranteed open."""
     extra = dict(extra or {})
     root_b = os.fsencode(root)
     root_fd = os.open(root_b, _DIR_FLAGS)
@@ -431,7 +438,6 @@ def walk(root: Path, extra: Mapping[bytes, Path] | None = None, *,
             if name in fextra:
                 absp, st = fextra[name]
                 yield Entry(path, st, -1, name, absp)
-                child = _open_dir_at(absp, -1, st)
             else:
                 st = os.stat(name, dir_fd=fd, follow_symlinks=False)
                 if st.st_dev != dev:
@@ -440,17 +446,19 @@ def walk(root: Path, extra: Mapping[bytes, Path] | None = None, *,
                 yield Entry(path, st, fd, name, absp)
                 if not stat.S_ISDIR(st.st_mode):
                     continue
-                child = _open_dir_at(name, fd, st)
+            # The open frames are the root's and stack[low:]; the child makes one more, so the shallowest goes
+            # first (never the current frame: WALK_OPEN_DIRS is far above two).
+            if 1 + len(stack) - low >= WALK_OPEN_DIRS:
+                os.close(stack[low][0])
+                stack[low][0] = -1
+                low += 1
+            child = _open_dir_at(absp, -1, st) if name in fextra else _open_dir_at(name, fd, st)
             try:
-                cnames = sorted(os.fsencode(n) for n in os.listdir(child))
+                cnames = sorted(os.fsencode(n) for n in os.listdir(child))   # the reserved fd: a dup of child
             except BaseException:
                 os.close(child)
                 raise
             stack.append([child, path + b"/", absp, cnames, 0, {}, st.st_dev, st])
-            if len(stack) - low > WALK_OPEN_DIRS - 1:   # the open frames are the root's and stack[low:]
-                os.close(stack[low][0])
-                stack[low][0] = -1
-                low += 1
     finally:
         for frame in stack:
             if frame[0] >= 0:
@@ -652,28 +660,46 @@ def classify(root: Path, extra: Mapping[bytes, Path] | None, uids: Collection[in
     return classes, outside
 
 
-def _write_classes(path: Path, classes: Mapping[tuple[int, int], str], cap: int) -> None:
-    """DECISION: under V17's meta cap (a budget refusal, ``meta-byte-cap``): it is metadata about the tree."""
-    _stream_jsonl(path, ({"dev": k[0], "ino": k[1], "class": c} for k, c in sorted(classes.items())), cap,
-                  "meta-byte-cap")
+def _write_classes(path: Path, classes: Mapping[tuple[int, int], str], cap: int, depth: int) -> None:
+    """DECISION: under V17's meta cap (a budget refusal, ``meta-byte-cap``): it is metadata about the tree. The
+    first line is the depth cap the manifest walk accepted the tree under (:func:`stored_classification`)."""
+    def records() -> Iterator[dict]:
+        yield {"depth": depth}
+        yield from ({"dev": k[0], "ino": k[1], "class": c} for k, c in sorted(classes.items()))
+    _stream_jsonl(path, records(), cap, "meta-byte-cap")
 
 
-def read_classes(facts: "EndFacts") -> dict[tuple[int, int], str]:
-    """The manifest step's classification, as stored; absent or not one = ``classes-missing`` (HELD at the
-    phase that needed it), never a recompute."""
+def stored_classification(facts: "EndFacts") -> tuple[dict[tuple[int, int], str], int]:
+    """The manifest step's classification, as stored, and the depth cap its walk accepted the tree under:
+    every later walk of the tree (meta, tree) takes that depth, never the pass's ``Caps.depth``, so a pass
+    with a smaller cap cannot refuse a tree the manifest already accepted (and the tree step may already have
+    renamed). Absent or not one = ``classes-missing`` (HELD at the phase that needed it), never a recompute.
+    DECISION: a classification with no depth line (written before the cap existed) caps nothing: the walk
+    that accepted it had none, and the walk's fds are bounded whatever the depth."""
     p = facts.retained / CLASSES
     try:
         data = _read_durable(p)
         out: dict[tuple[int, int], str] = {}
-        for line in data.splitlines():
+        depth = sys.maxsize
+        for n, line in enumerate(data.splitlines()):
             rec = canon.parse(line)
+            if n == 0 and isinstance(rec, dict) and set(rec) == {"depth"}:
+                if not isinstance(rec["depth"], int) or isinstance(rec["depth"], bool) or rec["depth"] < 1:
+                    raise ValueError(line[:80])
+                depth = rec["depth"]
+                continue
             if (not isinstance(rec, dict) or set(rec) != {"dev", "ino", "class"}
                     or rec["class"] not in (OUTSIDE, UNOWNED)):
                 raise ValueError(line[:80])
             out[(int(rec["dev"]), int(rec["ino"]))] = rec["class"]   # type: ignore[arg-type]
     except (OSError, ValueError) as e:
         raise Refused("classes-missing", f"{p}: {e}") from None
-    return out
+    return out, depth
+
+
+def read_classes(facts: "EndFacts") -> dict[tuple[int, int], str]:
+    """The manifest step's classification, as stored (:func:`stored_classification`)."""
+    return stored_classification(facts)[0]
 
 
 def _stream_jsonl(path: Path, records: Iterator[dict], cap: int, cap_name: str) -> None:
@@ -1403,7 +1429,7 @@ def _manifest_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
     if copy > caps.link_copy_bytes:
         raise Refused("link-copy-cap", f"{copy} bytes hard-linked outside the tree > {caps.link_copy_bytes}")
     _clear_linkcopy(facts, seams)
-    _write_classes(facts.retained / CLASSES, classes, caps.meta_bytes)
+    _write_classes(facts.retained / CLASSES, classes, caps.meta_bytes, caps.depth)
     sfd = -1
     if outside:
         os.mkdir(facts.retained / LINKCOPY, 0o700)
@@ -1452,10 +1478,12 @@ def _manifest_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
 
 def _meta_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
     """The metadata of every entry the manifest step's classification left to root: the STORED one, never a
-    recompute (codex r1 4: an outside link removed between the two steps cannot hand root the inode)."""
+    recompute (codex r1 4: an outside link removed between the two steps cannot hand root the inode), walked
+    under the depth the manifest step accepted."""
+    classes, depth = stored_classification(facts)
     _stream_jsonl(facts.retained / "meta.jsonl",
                   iter_meta(facts.live, extra=facts.extra, reader=seams.meta_reader, note=seams.note,
-                            skip=read_classes(facts), depth_cap=caps.depth),
+                            skip=classes, depth_cap=depth),
                   caps.meta_bytes, "meta-byte-cap")
 
 
@@ -1490,7 +1518,7 @@ def _rename_durable(src: Path, dst: Path) -> None:
     fsync_dir(dst.parent)
 
 
-def _tree_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
+def _tree_step(facts: EndFacts, seams: EndSeams) -> None:
     """Rename the session's work into ``tree/`` (and macOS ``/var/folders/<slot>`` into
     ``tree/.levain-var-folders/``), link the staged copies over the outside-linked files, strip (setuid /
     setgid included), then chown root, then flush it all (:attr:`EndSeams.sync`) before the journal may
@@ -1499,7 +1527,10 @@ def _tree_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
     under the walks, and every call is on a walk dirfd or an fd of the entry (L2 M2). An inode a path outside
     the tree still shares (a copy that could not be placed) is never stripped or chowned, and a shared
     non-regular one refuses ``tree-shared-special`` (comp r1 4). An :data:`UNOWNED` inode has only its
-    setuid / setgid cleared, by fd: root reads none of its metadata (codex r1 4)."""
+    setuid / setgid cleared, by fd: root reads none of its metadata (codex r1 4). Every walk takes the depth the
+    manifest step accepted, so no depth refusal can land on a renamed tree; the classification is read before
+    the rename, so a missing one refuses with nothing moved."""
+    classes, depth = stored_classification(facts)
     tree = facts.tree
     if os.path.lexists(facts.live):
         if os.path.lexists(tree):
@@ -1532,15 +1563,14 @@ def _tree_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
 
     # DECISION: the outside-link copies are placed before the strip (§7.4 names rename, strip, fchown),
     # so the strip never clears flags or xattrs on an inode a path outside the tree still shares.
-    _place_link_copies(facts, tree, seams.note, caps.depth)
+    _place_link_copies(facts, tree, seams.note, depth)
     seams.fault("retain:tree:links")
 
-    classes = read_classes(facts)
-    shared = foreign_links(tree, depth_cap=caps.depth)
+    shared = foreign_links(tree, depth_cap=depth)
     special = [k for k, lc in shared.items() if not lc.regular]
     if special:
         raise Refused("tree-shared-special", f"inode {special[0][0]}-{special[0][1]} is linked outside the tree")
-    for e in walk(tree, depth_cap=caps.depth):
+    for e in walk(tree, depth_cap=depth):
         key = (e.st.st_dev, e.st.st_ino)
         if key in shared:
             continue
@@ -1555,7 +1585,7 @@ def _tree_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
         seams.chown(rfd, b"tree", seams.root_uid, seams.root_gid)
     finally:
         os.close(rfd)
-    for e in walk(tree, depth_cap=caps.depth):
+    for e in walk(tree, depth_cap=depth):
         if (e.st.st_dev, e.st.st_ino) not in shared:
             seams.chown(e.dirfd, e.name, seams.root_uid, seams.root_gid)
     fsync_dir(tree)
@@ -1604,7 +1634,7 @@ def retain_plan(facts: EndFacts, seams: EndSeams, ri: RootIntent | None = None, 
         Phase("manifest", lambda: _manifest_step(facts, seams, caps)),
         Phase("meta", lambda: _meta_step(facts, seams, caps)),
         Phase("object", lambda: _object_step(facts, created)),
-        Phase("tree", lambda: _tree_step(facts, seams, caps)),
+        Phase("tree", lambda: _tree_step(facts, seams)),
         Phase("commit", lambda: _commit_step(facts, seams)),
     ), fields)
 
@@ -1917,10 +1947,15 @@ _RESUME = {"slot-not-ours": 0, "freeze": 0, "kill": 1, "park": 2, "manifest_budg
            **{p: 3 for p in INTENT_PHASES["retain"]}}
 
 
+#: The retain phases that run before root's first act on the tree: only a budget refusal raised in one of them
+#: is ``manifest_budget``, whose exit (END again with larger caps) assumes the tree as the session left it.
+_BUDGET_PHASES = frozenset({"manifest", "meta"})
+
+
 def _held_name(intent: str, e: PhaseFailed) -> str:
     if intent == "park":
         return "park"
-    if isinstance(e.cause, Refused) and e.cause.name in BUDGET_REFUSALS:
+    if isinstance(e.cause, Refused) and e.cause.name in BUDGET_REFUSALS and e.phase in _BUDGET_PHASES:
         return "manifest_budget"
     return e.phase
 
@@ -2097,7 +2132,8 @@ def _end_locked(facts: EndFacts, seams: EndSeams, start: int, attempts: int, cap
 
 __all__ = ["BUDGET_REFUSALS", "CAS_RETRY_SECONDS", "CLASSES", "CREDENTIALS", "CREDENTIAL_FILES", "CREDENTIAL_PARKED",
            "Caps", "HASH_ONLY_CAP", "LINK_UNREADABLE", "OUTSIDE", "PROVEN_PHASES", "SLOT_LOCK_WAIT_S", "UNOWNED",
-           "UNREAD_ANSWERS", "classify", "read_classes", "retained_whole", "session_reader", "slot_lock", "sync_tree",
+           "UNREAD_ANSWERS", "WALK_OPEN_DIRS", "WALK_PEAK_FDS", "classify", "read_classes", "retained_whole",
+           "stored_classification", "session_reader", "slot_lock", "sync_tree",
            "CasNotSent", "DEAD", "END_STEPS", "EndFacts", "EndSeams", "Entry", "FROZEN", "HELD", "LINKCOPY",
            "LINK_COPY_BYTES", "MANIFEST_FORMAT", "META_FORMAT", "OBJECT_FORMAT", "REVOKED", "RETAINED", "Reserve",
            "UNREAD", "V12_SECONDS", "V14_BYTES", "V17_MANIFEST_BYTES", "V17_META_BYTES", "V1_INODES", "V2_SECONDS",
