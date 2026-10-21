@@ -17,8 +17,9 @@ it serves only these:
   - ``POST /sign/<id>/challenge``, ``.../answer`` and ``.../deny``: a statement a caller filed for the operator's
     passkey to sign, in a namespace the command was started with (``--sign-namespace``), listed in ``consent.json``
     as ``sign_pending``, with ``sign_overflow`` the request files past the listing's cap (:mod:`levain.consent.sign`).
-  - ``POST /dispatch/<job>/challenge``, ``.../answer``, ``.../cancel-challenge`` and ``.../cancel``: a filed dispatch
-    job's contract signed, or a live one cancelled, with a passkey, verified by the job store against the same one
+  - ``POST /dispatch/<job>/challenge``, ``.../answer``, ``.../cancel-challenge``, ``.../cancel``,
+    ``.../authorise-challenge`` and ``.../authorise``: a filed dispatch job's contract signed, a live one
+    cancelled, or a recommended one's run authorised and landed, with a passkey, verified by the job store against the same one
     cockpit as the sign requests; ``consent.json`` lists the live jobs as ``dispatch_pending``, with ``dispatch_note``
     (why the store could not be read) and ``dispatch_overflow`` (:mod:`levain.dispatch.phone`).
   - ``GET /consent.json`` also lists ``questions`` (the open ones an agent filed, :mod:`levain.consent.questions`) and
@@ -74,7 +75,8 @@ _QUESTION_ROUTE = re.compile(r"/question/([0-9]{1,12})/(answer|rule)")
 _KEY_LINE = "/passkey/key-line"
 _SIGN_PREFIX = "/sign/"
 _SIGN_ACTIONS = ("challenge", "answer", "deny")
-_DISPATCH_ROUTE = re.compile(r"/dispatch/(dj-[0-9a-f]{32})/(challenge|answer|cancel-challenge|cancel)")
+_DISPATCH_ROUTE = re.compile(
+    r"/dispatch/(dj-[0-9a-f]{32})/(challenge|answer|cancel-challenge|cancel|authorise-challenge|authorise)")
 _MAX_BODY = 16 * 1024          # an assertion is well under 2 KB, an answer record under 1 KB
 _MAX_INFLIGHT = 4              # each answer replays the authority log; past this a caller gets 503, never a queue
 # how long a ruling's response waits for its delivery, which runs on its own thread holding no request slot (a
@@ -321,7 +323,7 @@ class _PhoneHandler(GuardedHandler):
         # throw that ceremony away; everything else answers busy at once
         waits = ((consent is not None and consent[1] in ("answer", "rule")) or (sign is not None and sign[1] == "answer")
                  or (question is not None and question.group(2) == "rule")
-                 or (dispatch is not None and dispatch.group(2) in ("answer", "cancel")))
+                 or (dispatch is not None and dispatch.group(2) in ("answer", "cancel", "authorise")))
         if not (self.server.request_gate.acquire(timeout=5) if waits else self.server.request_gate.acquire(blocking=False)):
             self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503)
             return

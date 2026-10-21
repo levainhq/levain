@@ -28,6 +28,7 @@ from levain.consent.answering import passkey_keys
 from levain.consent.passkey import public_key_line
 from levain.consent.queue import authority_source
 from levain.dispatch import sign as dsign
+from levain.dispatch.adopt import artifact_digest
 from levain.dispatch.jobs import DB_NAME, JobStore
 from levain.dispatch.phone import DispatchPhone, DispatchRefused
 from tests.test_dispatch_contract import POLICY, make_repo, registry, submission
@@ -467,3 +468,107 @@ def test_a_keys_db_fault_is_a_signer_note_and_the_consent_cards_stay(world) -> N
     assert note is None or isinstance(note, str)
     assert overflow == 0
     assert records and records[0]["signers"] == [] and "keys db" in records[0]["signer_note"]
+
+
+# --- F11-s2b: the authorise card --------------------------------------------------------------------------------------
+
+@pytest.fixture
+def lwp(tmp_path: Path):
+    """tests/test_dispatch_adopt.py's LandWorld (real cockpit, control store, rule, repo, job store) with a software
+    passkey enrolled as display-phone, and the phone's dispatch routes over its consent directory."""
+    from tests.test_dispatch_adopt import LandWorld
+
+    lw = LandWorld(tmp_path)
+    lw.passkey = SoftPasskey()
+    lw.log.link({"op": "enrol", "fingerprint": lw.passkey.fp, "public_key": lw.passkey.line,
+                 "class": "display-phone", "custody": "passkey"})
+    src = lw.log.source
+    lw.dp = DispatchPhone(lw.ddir, RP, ORIGIN, lambda: {k.fingerprint: k for k in passkey_keys(src(), RP)},
+                          lambda: src)
+    return lw
+
+
+def recommended(lw, change=None, **proposal):
+    job, cap = lw.verified(change)
+    return lw.jstore.recommend(job.id, cap, **proposal)
+
+
+def card(lw, job_id):
+    (row,) = [r for r in lw.dp.pending()[0] if r["id"] == job_id]
+    return row["authorise"]
+
+
+def test_a_recommended_job_with_a_branch_carries_the_authorise_card(lwp) -> None:
+    job = recommended(lwp, {"src/a.py": b"a = 2\n", "src/new.py": b"n = 1\nm = 2\n"}, onto="main")
+    got = card(lwp, job.id)
+    assert (got["onto"], got["run"], got["tier"], got["problem"]) == ("main", 0, "T2", None)
+    assert got["signers"] == [lwp.passkey.fp] and got["note"] == ""
+    assert got["files"] == 2 and got["changed_lines"] == 4 and got["change_overflow"] == 0
+    assert got["changes"] == [
+        {"path": "src/a.py", "status": "M", "added": 1, "deleted": 1, "binary": False, "gitlink": False},
+        {"path": "src/new.py", "status": "A", "added": 2, "deleted": 0, "binary": False, "gitlink": False}]
+    assert got["staged"] == lwp.jstore.run_record(job.id, 0).staged_commit
+
+
+def test_no_branch_proposed_or_not_recommended_is_no_card(lwp) -> None:
+    job = recommended(lwp)
+    assert card(lwp, job.id) is None
+    err = refused(lwp.dp.step, job.id, "authorise-challenge", {"signer_fp": lwp.passkey.fp})
+    assert (err.status, err.error) == (409, "conflict") and "from the laptop" in err.message
+
+
+def test_a_passkey_authorises_the_cards_run_and_it_lands(lwp) -> None:
+    job = recommended(lwp, onto="main", run=1)
+    c = lwp.dp.step(job.id, "authorise-challenge", {"signer_fp": lwp.passkey.fp})
+    assert (c["payload"]["run"], c["payload"]["onto"], c["tier"]) == ("1", "main", "T2")
+    assert c["payload"]["artifact_digest"] == artifact_digest(lwp.jstore.run_record(job.id, 1))
+    done = lwp.dp.step(job.id, "authorise", {"payload": c["payload"], **lwp.passkey.assertion(c["challenge"])})
+    assert (done["outcome"], done["state"], done["moved"]) == ("adopted", "adopted", True), done
+    assert lwp.main() == lwp.jstore.run_record(job.id, 1).staged_commit
+    assert lwp.jstore.get(job.id).history[-2].cause == "human_authorises"
+
+
+@pytest.mark.parametrize("field, value", [("onto", "work"), ("run", "0"), ("artifact_digest", "sha256:" + "0" * 64)])
+def test_a_payload_the_server_did_not_build_is_refused(lwp, field, value) -> None:
+    job = recommended(lwp, onto="main", run=1)
+    c = lwp.dp.step(job.id, "authorise-challenge", {"signer_fp": lwp.passkey.fp})
+    forged = {**c["payload"], field: value}
+    err = refused(lwp.dp.step, job.id, "authorise", {"payload": forged, **lwp.passkey.assertion(c["challenge"])})
+    assert err.status == 422 and "not the one this server built" in err.message
+    assert lwp.jstore.get(job.id).state == "recommended" and lwp.main() != lwp.jstore.run_record(job.id, 1).staged_commit
+
+
+def test_an_assertion_over_another_challenge_is_a_refused_land(lwp) -> None:
+    job = recommended(lwp, onto="main")
+    c = lwp.dp.step(job.id, "authorise-challenge", {"signer_fp": lwp.passkey.fp})
+    other = lwp.dp.step(job.id, "authorise-challenge", {"signer_fp": lwp.passkey.fp})
+    err = refused(lwp.dp.step, job.id, "authorise", {"payload": other["payload"],
+                                                     **lwp.passkey.assertion(c["challenge"])})
+    assert err.status == 422 and lwp.jstore.get(job.id).state == "recommended"
+
+
+def test_a_t3_change_needs_the_laptop_key(lwp, monkeypatch) -> None:
+    from levain.dispatch import cli as dcli
+
+    job = recommended(lwp, onto="main")
+    monkeypatch.setattr(dcli, "_landing_tier", lambda directory: (lambda repo, paths: "T3"))
+    got = card(lwp, job.id)
+    assert got["tier"] == "T3" and got["signers"] == [] and got["note"].startswith("needs your laptop key")
+    err = refused(lwp.dp.step, job.id, "authorise-challenge", {"signer_fp": lwp.passkey.fp})
+    assert err.status == 422 and "needs your laptop key" in err.message
+    assert lwp.jstore.get(job.id).state == "recommended"
+
+
+def test_a_card_that_cannot_be_read_is_its_problem_never_the_listings(lwp, monkeypatch) -> None:
+    from levain.dispatch import adopt
+
+    job = recommended(lwp, onto="main")
+
+    def gone(*a, **k):
+        raise adopt.GitFault("git is gone")
+
+    monkeypatch.setattr(adopt, "change_set", gone)
+    got = card(lwp, job.id)
+    assert got["signers"] == [] and "git is gone" in got["problem"]
+    err = refused(lwp.dp.step, job.id, "authorise-challenge", {"signer_fp": lwp.passkey.fp})
+    assert (err.status, err.error) == (503, "unavailable") and "nothing was landed" in err.message

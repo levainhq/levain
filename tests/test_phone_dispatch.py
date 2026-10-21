@@ -186,3 +186,18 @@ def test_a_faulting_keys_source_keeps_the_consent_cards_and_lists_the_jobs_unsig
     assert row["id"] == job.id and row["signers"] == [] and "keys db" in row["signer_note"]
     assert row["can_sign"] is False and row["can_cancel"] is True          # no signer: nothing offers to sign
     assert body["dispatch_overflow"] == 0
+
+
+def test_the_authorise_routes_are_served_behind_the_same_gates(world) -> None:
+    # F11-s2b §5: authorise-challenge and authorise reach DispatchPhone.step; a filed job has no card to authorise
+    job = file_job(world)
+    key = world["phone"]
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        assert _call(base + f"/dispatch/{job.id}/authorise-challenge", {"signer_fp": key.fp}, token=None)[0] == 403
+        status, body = _call(base + f"/dispatch/{job.id}/authorise-challenge", {"signer_fp": key.fp})
+        assert (status, body["error"]) == (409, "conflict") and "from the laptop" in body["message"]
+        status, body = _call(base + f"/dispatch/{job.id}/authorise", {"payload": {}})
+        assert (status, body["error"]) == (400, "bad_request")
+        (row,) = _call(base + "/consent.json")[1]["dispatch_pending"]
+        assert row["authorise"] is None
+    assert JobStore(world["qdir"]).get(job.id).state == "filed"
