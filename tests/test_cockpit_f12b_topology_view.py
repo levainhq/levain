@@ -93,7 +93,7 @@ def test_the_work_lens_draws_the_providers_own_nulls_as_not_tracked(tmp_path, mo
     strip = dict(s.split("=", 1) for s in got["strip"])
     # K10 S5 item 2 (67d28166): both live sessions have a readable tool log and no path is shared, so the provider OBSERVED no conflict and
     # says 0; "not tracked" is the null it sends only when live nodes exist and none has a log (test_conflicts_are_null_when_no_live_node_has_a_log)
-    assert strip["conflicts"] == "0 conflicts" and strip["tokens"] == "tokens today not tracked", got
+    assert strip["conflicts"] == "0 conflicts" and strip["tokens"] == "0 tokens today", got   # the fixture transcripts spent nothing today: a real zero
     assert list(strip) == ["tasks", "waiting", "stuck", "open", "done", "conflicts", "tokens"] and strip["tasks"].endswith(" tasks") and strip["open"] == "2 open", got
 
 
@@ -241,9 +241,12 @@ def test_the_header_strip_counts_and_a_conflict_lists_its_file_and_both_sessions
     got = json.loads(out[-1])["strip"]
     assert got == {"tasks": "6 tasks", "waiting": "2 waiting on you", "failed": "1 failed", "stuck": "1 stuck", "done": "1 done",
                    "conflicts": "1 file conflict", "tokens": "2.4M tokens today"}, got                  # the tasks lead, as drawn
-    out = _run(tmp_path, src, [{"eval": _paint(_value(), "agents")}, {"eval": probe}])
-    assert json.loads(out[-1])["strip"]["nodes"] == "5 nodes", out                                       # the Agents lens keeps its own strip
-    assert "money.py" in json.loads(out[-1])["conf"] and "claude_code · ledgerline" in json.loads(out[-1])["conf"] and "codex · tally" in json.loads(out[-1])["conf"]
+    metrics = "JSON.stringify([...%s.querySelectorAll('.tv-metrics .tv-m')].map(m => m.dataset.k + '=' + m.firstChild.textContent))" % TV
+    out = _run(tmp_path, src, [{"eval": _paint(_value(), "agents")}, {"eval": probe}, {"eval": metrics}])
+    figs = json.loads(out[-1])
+    assert figs[0].startswith("sessions=") and "tokens=2.4M" in figs, figs                               # the Agents lens draws the metrics block, not the count row
+    conf = json.loads(out[-2])["conf"]
+    assert "money.py" in conf and "claude_code · ledgerline" in conf and "codex · tally" in conf
 
 
 @needs_browser

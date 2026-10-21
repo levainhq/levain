@@ -214,6 +214,23 @@ def _log_signal(install_root: Path, stem: str, now: datetime, *, past: bool = Fa
     return last_at, last_kind, round(recent / (RATE_WINDOW_S / 60), 2)
 
 
+def _events_since(install_root: Path, stem: str, since: datetime, now: datetime) -> tuple[int, bool] | None:
+    """Logged events at or after ``since`` (and not after ``now``) in the session's kept log, and whether that count is
+    the whole of it (False: the log was rotated past ``since``, so it is a floor). None when there is no log."""
+    from levain.cockpit.session_log import _event, _tail
+
+    raw = _tail(install_root / ".levain" / "sessions" / f"{stem}.log.jsonl")
+    if not raw:
+        return None
+    n = 0
+    for line in raw.split(b"\n"):
+        ev = _event(line) if line.strip() else None
+        at = act._parse(ev["at"]) if ev is not None else None
+        if at is not None and since <= at <= now + timedelta(seconds=300):
+            n += 1
+    return n, _log_reaches(install_root, stem, since) is not False
+
+
 def _log_reaches(install_root: Path, stem: str, since: datetime) -> bool | None:
     """Whether the session's kept log still holds every event from ``since`` on (a past read's window): a log the
     hooks never rotated (smaller than half their rotation size, less one line) holds all of them, and a rotated one
@@ -580,6 +597,47 @@ def _spore_tasks(spores: list[Any], now: datetime | None = None) -> list[dict[st
     return tasks
 
 
+def _transcript_rate(rec: dict[str, Any], now: datetime) -> float | None:
+    """A node's rate from its transcript's message stamps (events per minute over ``RATE_WINDOW_S``), for a session whose
+    hooks wrote no log. None when the transcript cannot be found or read: unknown, never a zero."""
+    from levain.cockpit.session_context import find_transcript, recent_rate
+
+    try:
+        path, _why = find_transcript(rec)
+        return recent_rate(path, rec["agent"], now, RATE_WINDOW_S) if path is not None else None
+    except Exception:  # noqa: BLE001 - a transcript that will not read is an unknown rate
+        return None
+
+
+def _today_counts(install_root: Path, recs: list[dict[str, Any]], now: datetime) -> dict[str, Any]:
+    """The header's day figures. ``tokens_today``: fresh tokens (input + output + cache write; Codex input - cached +
+    output) the sessions' transcripts spent since LOCAL midnight, by each record's own timestamp, summed over the
+    transcripts that read; ``tokens_unread`` names how many did not (null total when none read). ``events_today``:
+    logged hook events since local midnight (``events_partial``: a log rotated past midnight, so a floor)."""
+    from levain.cockpit.session_context import find_transcript, tokens_since
+
+    midnight = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    total, read, unread = 0, 0, 0
+    events, logs, partial = 0, 0, False
+    for rec in recs:
+        try:
+            path, _why = find_transcript(rec)
+            got, _why = tokens_since(path, rec["agent"], midnight) if path is not None else (None, "no transcript")
+        except Exception:  # noqa: BLE001
+            got = None
+        if got is None:
+            unread += 1
+        else:
+            total, read = total + got, read + 1
+        stem = rec.get("_stem")
+        if isinstance(stem, str) and _STEM.fullmatch(stem):
+            ev = _events_since(install_root, stem, midnight, now)
+            if ev is not None:
+                events, logs, partial = events + ev[0], logs + 1, partial or not ev[1]
+    return {"tokens_today": total if read else None, "tokens_read": read, "tokens_unread": unread,
+            "events_today": events if logs else None, "events_partial": partial}
+
+
 # --- the read --------------------------------------------------------------------------------------------------
 
 def topology_reader(*, install_root: Path | None,
@@ -692,14 +750,21 @@ def topology_reader(*, install_root: Path | None,
                 if seen > now:
                     seen = first                   # its last_seen is after T: the record's only stamp at T is its first
             last_log, last_kind, rate = (None, None, None)
+            rate_source = None
             # a past read always reads the log: the record's stamp at T may be its first, older than its activity at T
             if past or (now - seen).total_seconds() < SESSION_ACTIVE_S:
                 last_log, last_kind, rate = _log_signal(install_root, stem, now, past=past)
+                if rate is None and not past:
+                    # no hook log: the rate from the transcript's own message stamps over the same window; a log's rate wins
+                    rate = _transcript_rate(rec, now)
+                    rate_source = "transcript" if rate is not None else None
+                else:
+                    rate_source = "log" if rate is not None else None
             rotated = past and _log_reaches(install_root, stem, now - timedelta(seconds=SESSION_ACTIVE_S)) is False
             if rotated:
                 # rotated past T's window: its kind and rate at T are not kept (its newest event at or before T, when
                 # one survived, is still a real event); the node is drawn from the record, as one with no log is
-                last_kind, rate = None, None
+                last_kind, rate, rate_source = None, None, None
             # no log: the record alone, which a turn's end never updates (so it never reads STALLED)
             last = max(t for t in (seen, last_log) if t is not None)
             if past and (now - last).total_seconds() > SESSION_LISTED_S:
@@ -730,7 +795,7 @@ def topology_reader(*, install_root: Path | None,
             nodes.append({"id": nid, "group": gid, "parent": None,
                           "label": _wire(f"{agent} · {act._base(cwd) or '/'}"), "agent": _wire(agent),
                           "model": model, "state": state, "tool": None, "tokens": tokens,
-                          "started": _iso(first), "last_event": _iso(last), "rate": rate,
+                          "started": _iso(first), "last_event": _iso(last), "rate": rate, "rate_source": rate_source,
                           "card": card})
             by_session[(agent, sid)] = nid
             if (now - last).total_seconds() < SESSION_ACTIVE_S:
@@ -845,7 +910,7 @@ def topology_reader(*, install_root: Path | None,
             "hub": {"id": HUB_ID, "label": _wire(hub_label(ctx) or "Levain")},
             "groups": list(groups.values()), "nodes": nodes, "conflicts": conflicts,
             "conflicts_total": conflicts_total,
-            "counts": {"tokens_today": None},
+            "counts": ({"tokens_today": None} if past else _today_counts(install_root, recs, now)),
             # the minute, not the instant: a value stamped per read would change on every poll of an idle install
             "as_of": _iso(now.replace(second=0, microsecond=0)),
             "tasks": tasks, "lost_if_closed": lost, "errors": errors, "unreadable": list(dict.fromkeys(unreadable)),

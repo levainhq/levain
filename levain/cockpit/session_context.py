@@ -32,11 +32,12 @@ import os
 import re
 import stat
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, NamedTuple
 
 __all__ = ["CONTEXT_WARN_TOKENS", "Context", "find_transcript", "last_context", "iter_usage", "spend_step",
-           "context_chip"]
+           "context_chip", "tokens_since", "recent_rate"]
 
 # The operator's rotation line for a lane, not any model's window: past it a session is dearer per turn than it is worth.
 CONTEXT_WARN_TOKENS = 200_000
@@ -459,6 +460,168 @@ def spend_step(path: Path | str, agent: str = "claude_code", state: dict[str, An
     st_.update(files=files, recent=recent, fresh=fresh, cache_read=cache_read,
                behind=behind)
     return st_
+
+
+def _stamp(v: Any) -> datetime | None:
+    """A transcript record's ISO ``timestamp`` as an aware UTC time, else None."""
+    if not isinstance(v, str) or len(v) > 40:
+        return None
+    try:
+        t = datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t.astimezone(timezone.utc)
+
+
+_day_cache: dict[tuple[str, str, int, int, str], tuple[int | None, str]] = {}
+
+
+def tokens_since(path: Path | str, agent: str, since: datetime) -> tuple[int | None, str]:
+    """Fresh tokens a transcript spent at or after ``since`` (an aware time), by each record's own ``timestamp``:
+    ``(tokens, "")``, or ``(None, why)`` when it cannot be told (unreadable, oversized, or a usage record with no stamp).
+    The unit is the one :func:`spend_step` counts: Claude Code input + output + cache write (each message id at the MAX
+    across its records, subagent transcripts included); Codex input - cached input + output (its cumulative
+    ``total_token_usage`` now, less its value at the last record before ``since``). A transcript last written before
+    ``since`` spent nothing since, and is not opened."""
+    p = Path(path)
+    opened = _open_regular(p)
+    if opened is None:
+        return None, "unreadable"
+    fd, st = opened
+    os.close(fd)
+    key = (str(p), agent, st.st_mtime_ns, st.st_size, since.isoformat())
+    if key in _day_cache:
+        return _day_cache[key]
+    if st.st_mtime < since.timestamp():
+        got: tuple[int | None, str] = (0, "")
+    else:
+        try:
+            got = _codex_since(p, since) if agent == "codex" else _claude_since(p, since)
+        except OSError:
+            got = (None, "unreadable")
+    if len(_day_cache) >= _CACHE_MAX:
+        _day_cache.pop(next(iter(_day_cache)))
+    _day_cache[key] = got
+    return got
+
+
+def _lines_of(f: Path, budget: int) -> Iterator[bytes]:
+    """The lines of one regular file, up to the size it had when opened; an over-long line is skipped."""
+    opened = _open_regular(f)
+    if opened is None:
+        raise OSError("unreadable")
+    fd, st = opened
+    try:
+        if st.st_size > budget:
+            raise OSError("oversized")
+        with os.fdopen(os.dup(fd), "rb") as fh:
+            seen = 0
+            while seen < st.st_size:
+                line = fh.readline(min(_LINE_CAP + 1, st.st_size - seen))
+                if not line:
+                    break
+                seen += len(line)
+                if len(line) > _LINE_CAP and not line.endswith(b"\n"):
+                    while seen < st.st_size:
+                        rest = fh.readline(min(_LINE_CAP, st.st_size - seen))
+                        seen += len(rest)
+                        if not rest or rest.endswith(b"\n"):
+                            break
+                    continue
+                yield line
+    finally:
+        os.close(fd)
+
+
+def _claude_since(p: Path, since: datetime) -> tuple[int | None, str]:
+    files = [p]
+    try:
+        files += sorted((p.with_suffix("") / "subagents").glob("*.jsonl"))[:_SUBAGENT_FILES]
+    except (OSError, ValueError):
+        pass
+    best: dict[str, list[Any]] = {}       # message id -> [first stamp, input, cache write, output]
+    budget = _SPEND_CAP
+    for f in files:
+        try:
+            budget -= f.stat().st_size
+        except OSError:
+            if f is p:
+                return None, "unreadable"
+            continue
+        try:
+            for line in _lines_of(f, _SPEND_CAP):
+                if b'"usage"' not in line:
+                    continue
+                d = _json(line)
+                m = d.get("message") if d else None
+                if not (d and d.get("type") == "assistant" and isinstance(m, dict) and isinstance(m.get("usage"), dict)):
+                    continue
+                at = _stamp(d.get("timestamp"))
+                if at is None:
+                    return None, "a usage record has no timestamp"
+                u = m["usage"]
+                mid = m["id"] if isinstance(m.get("id"), str) else f"{f.name}:{d.get('uuid') or len(best)}"
+                row = [at, _num(u.get("input_tokens")), _num(u.get("cache_creation_input_tokens")), _num(u.get("output_tokens"))]
+                old = best.get(mid)
+                if old:
+                    row = [min(old[0], at)] + [max(a, b) for a, b in zip(old[1:], row[1:])]
+                best[mid] = row
+        except OSError as exc:
+            if f is p:
+                return None, str(exc)
+            continue                     # a subagent file that cannot be read is left out, as spend_step leaves it
+    return sum(r[1] + r[2] + r[3] for r in best.values() if r[0] >= since), ""
+
+
+def _codex_since(p: Path, since: datetime) -> tuple[int | None, str]:
+    before = latest = 0
+    stamped = False
+    for line in _lines_of(p, _SPEND_CAP):
+        if b'"token_count"' not in line:
+            continue
+        d = _json(line)
+        pl = d.get("payload") if d else None
+        info = pl.get("info") if isinstance(pl, dict) and pl.get("type") == "token_count" else None
+        tot = info.get("total_token_usage") if isinstance(info, dict) else None
+        if not isinstance(tot, dict):
+            continue
+        at = _stamp(d.get("timestamp"))
+        if at is None:
+            return None, "a token record has no timestamp"
+        stamped = True
+        v = max(_num(tot.get("input_tokens")) - _num(tot.get("cached_input_tokens")), 0) + _num(tot.get("output_tokens"))
+        latest = max(latest, v)
+        if at < since:
+            before = max(before, v)
+    return (max(latest - before, 0), "") if stamped else (0, "")
+
+
+def recent_rate(path: Path | str, agent: str, now: datetime, window_s: float) -> float | None:
+    """Messages per minute a transcript wrote in the ``window_s`` seconds before ``now``, from its records' own
+    ``timestamp`` (the tail only: the window is recent). Claude Code counts user and assistant records, Codex its
+    response items. None when the transcript cannot be read; a readable one with no message in the window is 0.0."""
+    opened = _open_regular(path)
+    if opened is None:
+        return None
+    fd, st = opened
+    try:
+        lines = _tail_lines(fd, st.st_size, 512 * 1024)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    kinds = (b'"response_item"',) if agent == "codex" else (b'"user"', b'"assistant"')
+    n = 0
+    for line in lines:
+        if not any(k in line for k in kinds):
+            continue
+        d = _json(line)
+        if not d or d.get("type") not in (("response_item",) if agent == "codex" else ("user", "assistant")):
+            continue
+        at = _stamp(d.get("timestamp"))
+        if at is not None and 0 <= (now - at).total_seconds() <= window_s:
+            n += 1
+    return round(n / (window_s / 60), 2)
 
 
 def _k(n: int) -> str:

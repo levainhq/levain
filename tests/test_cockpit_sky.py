@@ -324,7 +324,7 @@ def test_the_strip_builds_no_summary_hides_the_bar_inline_and_says_nothing_yet_w
 @pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_an_empty_window_is_text_only_with_no_box_over_the_grid(tmp_path: Path) -> None:
     on = _fake(tmp_path, SKY, [[]])
-    assert "Nothing yet in the last 14 h" in on["fillText"]
+    assert "No activity in the last 14 h" in on["fillText"]
     # hairlines are fillRects too: the same empty feed drew 3 of them (rows) + the hour ticks + the now line, and no wider box
     boxes = [l for l in on["log"] if l[0] == "fillRect" and l[3] > 20 and l[4] == 20]
     assert boxes == []

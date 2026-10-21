@@ -207,8 +207,44 @@
     const tk = v.counts && isNum(v.counts.tokens_today) ? fmtTokens(v.counts.tokens_today) : null;
     const t = el("span", "tv-stat tv-right" + (tk === null ? " dim" : ""));
     t.dataset.k = "tokens";
-    if (tk === null) t.textContent = "tokens today not tracked"; else t.append(el("b", null, tk), " tokens today");
+    if (tk === null) { t.textContent = "tokens today \u2014"; t.title = "no session transcript could be read"; } else t.append(el("b", null, tk), " tokens today");
     row.appendChild(t);
+    return row;
+  }
+  // The Agents lens's metrics block (the reference's top-left): a big figure over a small-caps label. A figure with no data is an em dash and
+  // one line of why in its title, never a word that reads like a bug. It replaces the inline count row (strip) on this lens; the Work lens keeps its own.
+  function metricsStrip(v) {
+    const nodes = arr(v.nodes), counts = isObj(v.counts) ? v.counts : {};
+    const live = nodes.filter((n) => n.state !== "idle").length;
+    const running = nodes.filter((n) => n.state === "running").length, waiting = nodes.filter((n) => n.state === "waiting").length;
+    const row = el("div", "tv-metrics");
+    row.setAttribute("role", "group");
+    row.setAttribute("aria-label", "Header figures");
+    const past = v.replay === true;
+    const m = (k, label, fig, why, cls, sub) => {
+      const c = el("div", "tv-m" + (cls ? " " + cls : "") + (fig === null ? " dim" : ""));
+      c.dataset.k = k;
+      c.title = why;
+      c.append(el("b", null, fig === null ? "\u2014" : fig), el("span", "tv-ml", label));
+      if (sub) c.appendChild(el("i", "tv-msub", sub));
+      return c;
+    };
+    const evN = isNum(counts.events_today) ? counts.events_today : null;
+    const tkN = fmtTokens(counts.tokens_today), unread = isNum(counts.tokens_unread) ? counts.tokens_unread : 0;
+    const noTk = past ? "not kept for the past: a session's tokens are read from its transcript as it is now"
+      : "no session transcript could be read" + (unread ? " (" + unread + " not read)" : "");
+    row.append(
+      m("sessions", "sessions", live + " / " + nodes.length, live + " live of " + nodes.length + " sessions listed (live = not idle)"),
+      m("events", "events", evN === null ? null : fmtTokens(evN) + (counts.events_partial ? "+" : ""),
+        evN === null ? (past ? "not kept for the past" : "no session has an event log")
+          : "hook events logged since local midnight" + (counts.events_partial ? " (a log was rotated past midnight, so at least this many)" : "")),
+      m("running", "running", String(running), "sessions running now"),
+      m("waiting", "waiting on you", String(waiting), "sessions waiting on a decision or an answer from you", waiting ? "hot" : ""),
+      m("tokens", "tokens today", tkN, tkN === null ? noTk
+        : "Fresh tokens since local midnight, from the message timestamps in " + (isNum(counts.tokens_read) ? counts.tokens_read : "the") + " session transcripts: input + output + cache writes (Codex: input - cached + output). Cache reads are not counted.",
+        "", unread ? unread + " not read" : ""));
+    const conflicts = Array.isArray(v.conflicts) ? v.conflicts : null;
+    if (conflicts && conflicts.length) { const n = conflictCount(v); row.appendChild(m("conflicts", n === 1 ? "file conflict" : "file conflicts", String(n), "files two live sessions are both writing", "warn")); }
     return row;
   }
   // the Work lens's strip, as drawn: the tasks lead, then the loud states, then conflicts and tokens
@@ -456,7 +492,7 @@
       const at = clock(n.last_event);
       f.l3 = (tool || "tool") + " · failed" + (at ? " " + at : "");
     } else {
-      f.l3 = tool || "no tool";
+      f.l3 = (tool || "no tool") + (n.rate_source === "transcript" ? " · rate from transcript" : "");
       if (run !== null) { f.l3Dur = run; f.l3 += " · " + fmtDur(run); }
     }
     f.tag = { waiting: "WAITING ON YOU", errored: "ERRORED", stalled: "STALLED", idle: "IDLE", running: null }[n.state] || null;
@@ -709,7 +745,7 @@
     const rows = [["state", NODE_WORDS[n.state] || n.state], ["agent", n.agent || "unknown"], ["model", n.model || "model unknown"],
                   ["tokens", tk === null ? "tokens unknown" : tk + " tok"], ["tool", typeof n.tool === "string" && n.tool ? n.tool : "none"],
                   ["run time", run || "unknown"], ["last event", clock(n.last_event) || "unknown"],
-                  ["rate", isNum(n.rate) ? n.rate.toFixed(1) + " events/min" : "rate not tracked"]];
+                  ["rate", isNum(n.rate) ? n.rate.toFixed(1) + " events/min" + (n.rate_source === "transcript" ? " (from the transcript)" : "") : "rate unknown (no event log, no readable transcript)"]];
     if (typeof n.card === "string" && n.card) rows.push(["waiting on", n.card]);
     return rows;
   }
@@ -1219,7 +1255,7 @@
     if (o.replay && R.at !== null) w.dataset.rat = isoMin(R.at);
     if (o.replay && replaying()) w.dataset.rshown = past && R.cat !== null ? isoMin(R.cat) : "live";
     const bar = el("div", "tv-bar");
-    bar.append(o0.lensSeg || el("span"), which === "agents" ? strip(v, which) : stripWork(v));
+    bar.append(o0.lensSeg || el("span"), which === "agents" ? metricsStrip(v) : stripWork(v));
     w.appendChild(bar);
     const conf = conflictList(v);
     if (conf) w.appendChild(conf);

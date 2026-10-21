@@ -510,7 +510,7 @@
       if (late.length) { late.forEach(function (f) { f(); }); g.globalAlpha = 1; }
       if (!model.lev && !strip && !model.empty && !model.hasDecisions && model.rows.some(function (r) { return r.id === 'decisions'; })) { g.fillStyle = P.meta; g.textAlign = 'left'; g.fillText('none in this window', gutter + 8, rowY('decisions') + 4); }
       if (model.empty) {   // the lanes stay (a bare frame reads as broken) and one line says why they are bare
-        var msg = strip ? 'Nothing yet' : 'Nothing yet in the last ' + opts.windowHours + ' h', mx = gutter + (W - gutter - padR) / 2, my = padT + (H - padT - padB) / 2;
+        var msg = strip ? 'Nothing yet' : 'No activity in the last ' + opts.windowHours + ' h', mx = gutter + (W - gutter - padR) / 2, my = padT + (H - padT - padB) / 2;
         g.font = FONT_MONO; g.textAlign = 'center';
         g.globalAlpha = 1; g.fillStyle = P.label; g.fillText(msg, mx, my + 4);   // text only: no box over the grid
       }
