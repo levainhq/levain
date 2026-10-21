@@ -13,9 +13,10 @@ git work. A contract value edited after filing therefore no longer builds, whate
 
 The commit is a pure function of the contract: a fixed identity, a fixed date, no parent, and a message naming the
 contract's digest. Two builds of one contract name one sha, so a later stage compares a sha and builds nothing to
-trust. The scratch lives under a directory the caller owns and is never the operator's repo; the operator's repo is
-only read, under :func:`levain.dispatch.contract.git_env` with no user or system git config added on top (the
-scratch's own environment, ``_scratch_env``) and lazy fetch off.
+trust. The scratch is a directory this call creates (it must not exist yet) and is never inside the operator's repo,
+judged by directory identity, not spelling; the operator's repo is only read, under
+:func:`levain.dispatch.contract.git_env` with no user or system git config added on top (the scratch's own
+environment, ``_scratch_env``), lazy fetch off and no transport allowed.
 
 A write path that exists at base is in the read set only when the contract also names it as a read: the contract
 binds each list on its own and this module follows it. A write path that is new is created by the executor.
@@ -26,6 +27,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass
 
@@ -85,24 +87,29 @@ def _scratch_env() -> dict[str, str]:
     return env
 
 
-def _empty(dest_dir: str) -> None:
-    # dest_dir was required empty, so everything in it is this call's: a refusal leaves it empty again for a retry
-    for name in os.listdir(dest_dir):
-        p = os.path.join(dest_dir, name)
-        if os.path.isdir(p) and not os.path.islink(p):
-            shutil.rmtree(p)
-        else:
-            os.unlink(p)
+def _remove(dest_dir: str, made: tuple[int, int]) -> None:
+    # only the directory this call made is removed: a path that is now a symlink, or another directory, is left alone
+    try:
+        st = os.lstat(dest_dir)
+        if stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) == made:
+            shutil.rmtree(dest_dir)
+    except OSError:
+        pass    # the refusal stands; a dest_dir left behind fails the must-not-exist check on any retry
 
 
 def build_readset(repo: str, contract: ResolvedContract, dest_dir: str, *, contract_digest: str) -> ReadSet:
     """Build the read set of ``contract`` (read from ``repo``, which must be the contract's own) as a bare scratch repo
-    in ``dest_dir`` (an existing, empty directory the caller owns), or raise :class:`ReadSetRefused`.
+    in ``dest_dir`` (a real absolute path that must NOT exist yet; this call creates it, mode 0700), or raise
+    :class:`ReadSetRefused`.
 
     ``contract_digest`` is the digest the job store recorded when the contract was filed (``Job.digest``, the one the
     human signs); ``contract`` is refused (``readset-digest-mismatch``) unless its own digest is that one. A refusal
-    after the scratch was begun empties ``dest_dir`` again. A source repo owned by another uid is refused
-    (``readset-git-failed``): no user git config is read, so a ``safe.directory`` entry there does not apply."""
+    after ``dest_dir`` was created removes it again, only while it is still the directory this call made (same
+    device and inode, not a symlink); otherwise it is left and the refusal stands. A ``dest_dir`` with the operator's
+    repo among its ancestors (compared by device and inode, so another letter case or a symlink does not hide it) is
+    refused (``readset-dest``). A source repo owned by another uid is refused (``readset-git-failed``): no user git
+    config is read, so a ``safe.directory`` entry there does not apply. A blob missing from a partial clone is
+    refused (``readset-git-failed``), never fetched."""
     if not isinstance(contract, ResolvedContract):
         raise ReadSetRefused("readset-contract", "not a ResolvedContract")
     if not isinstance(contract_digest, str) or contract.digest != contract_digest:
@@ -116,25 +123,48 @@ def build_readset(repo: str, contract: ResolvedContract, dest_dir: str, *, contr
     if not isinstance(repo, str) or repo != parsed.repo:
         raise ReadSetRefused("readset-repo", "the repo is not the contract's own")
     try:
-        usable = (isinstance(dest_dir, str) and os.path.isabs(dest_dir) and os.path.realpath(dest_dir) == dest_dir
-                  and os.path.isdir(dest_dir) and not os.listdir(dest_dir))
-    except OSError as exc:
+        usable = (isinstance(dest_dir, str) and os.path.isabs(dest_dir) and os.path.realpath(dest_dir) == dest_dir)
+    except (OSError, ValueError) as exc:
         raise ReadSetRefused("readset-dest", f"dest_dir cannot be read ({type(exc).__name__})") from None
     if not usable:
-        raise ReadSetRefused("readset-dest", "dest_dir must be an existing, empty directory (real absolute path)")
-    real_repo = os.path.realpath(repo).rstrip("/")
-    if dest_dir == real_repo or dest_dir.startswith(real_repo + "/"):
-        raise ReadSetRefused("readset-dest", "dest_dir is inside the operator's repo")
+        raise ReadSetRefused("readset-dest", "dest_dir must be a real absolute path")
     for e in parsed.read:
         if e.mode not in _REGULAR or _SHA1.fullmatch(e.blob) is None:
             raise ReadSetRefused("readset-entry", f"read path {e.path[:120]} is not a regular blob entry")
+    try:
+        rst = os.stat(repo)
+    except (OSError, ValueError) as exc:
+        raise ReadSetRefused("readset-repo", f"the repo cannot be read ({type(exc).__name__})") from None
+    repo_id = (rst.st_dev, rst.st_ino)
+    try:
+        os.mkdir(dest_dir, 0o700)    # exclusive: a path that exists already is never taken over
+        dst = os.lstat(dest_dir)
+    except FileExistsError:
+        raise ReadSetRefused("readset-dest", "dest_dir must not exist yet: build_readset creates it") from None
+    except OSError as exc:
+        raise ReadSetRefused("readset-dest", f"dest_dir cannot be created ({type(exc).__name__})") from None
+    made = (dst.st_dev, dst.st_ino)
 
     env = _scratch_env()
-    # a partial clone's missing blob is a refusal, never a network fetch run under the source repo's own config
-    source_env = {**env, "GIT_NO_LAZY_FETCH": "1"}
+    # a partial clone's missing blob is a refusal, never a fetch run under the source repo's own config:
+    # GIT_NO_LAZY_FETCH is read from git 2.44 only, so no transport is allowed at all (an empty allow list)
+    source_env = {**env, "GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": "", "GIT_PROTOCOL_FROM_USER": "0"}
     index = os.path.join(dest_dir, _INDEX)
     ienv = {**env, "GIT_INDEX_FILE": index}
     try:
+        p = os.path.realpath(dest_dir)
+        while True:
+            try:
+                ast = os.stat(p)
+            except OSError as exc:
+                raise ReadSetRefused("readset-dest", f"an ancestor of dest_dir cannot be read "
+                                     f"({type(exc).__name__})") from None
+            if (ast.st_dev, ast.st_ino) == repo_id:
+                raise ReadSetRefused("readset-dest", "dest_dir is inside the operator's repo")
+            parent = os.path.dirname(p)
+            if parent == p:
+                break
+            p = parent
         _git(dest_dir, "init", "--bare", "-q", "--template=", f"--initial-branch={BRANCH}", ".", env=env)
         try:
             for e in parsed.read:
@@ -154,9 +184,6 @@ def build_readset(repo: str, contract: ResolvedContract, dest_dir: str, *, contr
                       env=env).decode("ascii").strip()
         _git(dest_dir, "update-ref", f"refs/heads/{BRANCH}", commit, env=env)
     except BaseException:
-        try:
-            _empty(dest_dir)
-        except OSError:
-            pass    # the refusal stands; a dest_dir left non-empty fails the empty check on any retry
+        _remove(dest_dir, made)
         raise
     return ReadSet(repo_dir=dest_dir, branch=BRANCH, commit=commit, tree=tree)

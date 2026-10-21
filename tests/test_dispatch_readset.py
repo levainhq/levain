@@ -69,8 +69,9 @@ def world(tmp_path_factory):
 
 
 def dest(root: Path, name: str) -> str:
+    # a path that does not exist yet: build_readset creates it (R2)
     d = root / name
-    d.mkdir()
+    assert not d.exists()
     return str(d)
 
 
@@ -154,7 +155,7 @@ def test_a_damaged_object_store_refuses_and_hands_nothing_on(tmp_path):
     d = dest(tmp_path, "damaged")
     assert refusal(build_readset, str(repo), contract, d, contract_digest=contract.digest).name == \
         "readset-blob-mismatch"
-    assert os.listdir(d) == []          # the partial scratch is removed: dest_dir is empty again for a retry
+    assert not os.path.exists(d)        # the partial scratch is removed: the same dest_dir works on a retry
 
 
 def test_a_contract_edited_after_filing_refuses_on_the_filed_digest(world):
@@ -166,7 +167,7 @@ def test_a_contract_edited_after_filing_refuses_on_the_filed_digest(world):
     d = dest(root, "forged")
     assert refusal(build_readset, str(repo), forged, d, contract_digest=contract.digest).name == \
         "readset-digest-mismatch"
-    assert os.listdir(d) == []                                             # refused before any git work
+    assert not os.path.exists(d)                                    # refused before any git or filesystem work
     assert refusal(build_readset, str(repo), {"read": []}, dest(root, "notc"),
                    contract_digest=contract.digest).name == "readset-contract"
 
@@ -186,14 +187,19 @@ def test_the_repo_and_the_destination_are_checked(world):
     root, repo, _, _, contract = world
     kw = {"contract_digest": contract.digest}
     assert refusal(build_readset, str(root), contract, dest(root, "wrongrepo"), **kw).name == "readset-repo"
-    full = dest(root, "full")
-    Path(full, "x").write_text("x")
-    assert refusal(build_readset, str(repo), contract, full, **kw).name == "readset-dest"
-    assert refusal(build_readset, str(repo), contract, str(root / "missing"), **kw).name == "readset-dest"
+    full = root / "full"
+    full.mkdir()
+    (full / "x").write_text("x")
+    assert refusal(build_readset, str(repo), contract, str(full), **kw).name == "readset-dest"
+    assert os.listdir(full) == ["x"]                                       # an existing dir is never taken over
+    empty = root / "empty"
+    empty.mkdir()                                                          # an existing EMPTY dir too (R2)
+    assert refusal(build_readset, str(repo), contract, str(empty), **kw).name == "readset-dest"
+    assert refusal(build_readset, str(repo), contract, str(root / "missing" / "d"), **kw).name == "readset-dest"
     assert refusal(build_readset, str(repo), contract, "relative", **kw).name == "readset-dest"
     inside = repo / "scratch"
-    inside.mkdir()
     assert refusal(build_readset, str(repo), contract, str(inside), **kw).name == "readset-dest"
+    assert not inside.exists()                                             # created, judged, removed
     assert not (repo / ".git/refs/heads/readset").exists()                 # the operator's repo is untouched
 
 
@@ -216,20 +222,124 @@ def test_a_destination_inside_the_repo_by_a_symlinked_repo_path_refuses(tmp_path
     repo.rename(moved)
     repo.symlink_to(moved)
     inside = moved / "scratch"
-    inside.mkdir()
     assert refusal(build_readset, str(repo), contract, str(inside), contract_digest=contract.digest).name == \
         "readset-dest"
-    assert os.listdir(inside) == []
+    assert not inside.exists()
 
 
-def test_an_unreadable_destination_is_a_refusal(world, monkeypatch):
+def test_a_destination_that_cannot_be_created_is_a_refusal(world):
     root, repo, _, _, contract = world
-    d = dest(root, "unreadable")
+    locked = root / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        assert refusal(build_readset, str(repo), contract, str(locked / "d"),
+                       contract_digest=contract.digest).name == "readset-dest"
+    finally:
+        locked.chmod(0o700)
 
-    def denied(path):
-        raise PermissionError(13, "denied", path)
-    monkeypatch.setattr("levain.dispatch.readset.os.listdir", denied)
-    assert refusal(build_readset, str(repo), contract, d, contract_digest=contract.digest).name == "readset-dest"
+
+def test_the_destination_is_created_private(world):
+    root, repo, _, _, contract = world
+    d = dest(root, "private")
+    build_readset(str(repo), contract, d, contract_digest=contract.digest)
+    assert os.stat(d).st_mode & 0o777 == 0o700
+
+
+def failing_cat_file(monkeypatch, before=lambda: None):
+    import levain.dispatch.readset as rs_mod
+    real = rs_mod._git
+
+    def fake(cwd, *args, env, data=None):
+        if args[0] == "cat-file":
+            before()
+            raise ReadSetRefused("readset-git-failed", "injected")
+        return real(cwd, *args, env=env, data=data)
+    monkeypatch.setattr(rs_mod, "_git", fake)
+
+
+def test_a_failure_after_init_removes_the_destination_it_made(world, monkeypatch):
+    root, repo, _, _, contract = world
+    d = dest(root, "fail-after-init")
+    failing_cat_file(monkeypatch)
+    assert refusal(build_readset, str(repo), contract, d, contract_digest=contract.digest).name == "readset-git-failed"
+    assert not os.path.exists(d)
+
+
+def test_a_destination_swapped_for_a_symlink_is_not_followed_on_cleanup(world, monkeypatch):
+    # codex r1 MED 3: the run showed 3aa2f740 emptied the symlink's target; only the directory this call made is removed
+    root, repo, _, _, contract = world
+    victim = root / "victim"
+    victim.mkdir()
+    (victim / "precious.txt").write_text("not the scratch's\n")
+    d = dest(root, "swapped")
+
+    def swap():
+        os.rename(d, str(root / "swapped.moved"))
+        os.symlink(victim, d)
+    failing_cat_file(monkeypatch, swap)
+    assert refusal(build_readset, str(repo), contract, d, contract_digest=contract.digest).name == "readset-git-failed"
+    assert (victim / "precious.txt").read_text() == "not the scratch's\n"
+    assert os.path.islink(d)                                               # left; the refusal stands
+
+
+def test_a_destination_under_the_repo_by_another_letter_case_refuses(world):
+    # codex r1 MED 4: on a case-insensitive volume /x/Repo and /x/rEPO are one directory; identity, not spelling, decides
+    root, repo, _, _, contract = world
+    other = root / (repo.name.swapcase())
+    if not other.exists():
+        pytest.skip("case-sensitive filesystem")
+    d = other / "scratch"
+    assert refusal(build_readset, str(repo), contract, str(d), contract_digest=contract.digest).name == "readset-dest"
+    assert not (repo / "scratch").exists()
+
+
+def test_a_partial_clone_missing_a_read_blob_refuses_and_fetches_nothing(tmp_path, monkeypatch):
+    # codex r1 HIGH 1: GIT_NO_LAZY_FETCH is read from git 2.44 only; with it removed (what older git does), the run showed
+    # 3aa2f740 fetched the blob from the promisor remote. The empty GIT_ALLOW_PROTOCOL is the bound that refuses it.
+    import levain.dispatch.readset as rs_mod
+    top = Path(os.path.realpath(tmp_path))
+    origin = top / "origin"
+    origin.mkdir()
+    git(origin, "init", "-q", "-b", "main")
+    (origin / "src").mkdir()
+    (origin / "src/a.py").write_text("a = 1\n")
+    git(origin, "add", "-A")
+    git(origin, "commit", "-q", "-m", "c")
+    git(origin, "config", "uploadpack.allowFilter", "true")
+    blob = git(origin, "rev-parse", "HEAD:src/a.py").strip()
+    clone = top / "clone"
+    git(top, "clone", "-q", "--filter=blob:none", "--no-checkout", f"file://{origin}", str(clone))
+    sub = {"template": "fix-lint", "goal": "g", "read": ["src/a.py"], "write": ["src/a.py"],
+           "base": git(clone, "rev-parse", "HEAD").strip(), "budget": {"tool_calls": 1, "tokens": 1, "dollars_cents": 1},
+           "grant": ["Edit"], "expires_at": utc_stamp(NOW + timedelta(hours=1)), "repo": str(clone)}
+    contract = resolve_contract(sub, resolve_template=lambda t: TEMPLATE, policy=POLICY, now=NOW)
+
+    def present() -> bool:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env["GIT_NO_LAZY_FETCH"] = "1"
+        return subprocess.run(["git", "-C", str(clone), "cat-file", "-e", blob], env=env,
+                              capture_output=True).returncode == 0
+    assert not present()
+    real = rs_mod._git
+    seen = []
+
+    def older_git(cwd, *args, env, data=None):
+        if cwd == str(clone):
+            env = {k: v for k, v in env.items() if k != "GIT_NO_LAZY_FETCH"}
+            seen.append((env.get("GIT_ALLOW_PROTOCOL"), env.get("GIT_PROTOCOL_FROM_USER")))
+        return real(cwd, *args, env=env, data=data)
+    monkeypatch.setattr(rs_mod, "_git", older_git)
+    d = dest(top, "d")
+    assert refusal(build_readset, str(clone), contract, d, contract_digest=contract.digest).name == \
+        "readset-git-failed"
+    assert seen == [("", "0")]
+    assert not present()                                                   # nothing was fetched
+    assert not os.path.exists(d)
+    monkeypatch.setattr(rs_mod, "_git", real)                              # as-is git (2.44+) refuses too
+    assert refusal(build_readset, str(clone), contract, d, contract_digest=contract.digest).name == \
+        "readset-git-failed"
+    assert not present()
 
 
 def test_the_dispatch_session_env_has_no_operator_key_and_roots_under_the_slot():
