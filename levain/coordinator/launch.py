@@ -245,7 +245,7 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
     tail = f"--queue-dir {q}"
     # the spelling the coordinator install's own allow rule names, so a session that runs these as written is not
     # asked; an install with no such rule (a reused live install) gets this interpreter's, and its commands ask
-    lv = installed_coordinator_levain(Path(launch.cwd)) or coordinator_levain(sys.executable)
+    lv = installed_coordinator_levain(Path(launch.cwd), sys.executable) or coordinator_levain(sys.executable)
     lines = [
         f"# Levain {launch.role} brief: launch {launch.launch_id}",
         "",

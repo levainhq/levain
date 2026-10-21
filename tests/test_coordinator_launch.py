@@ -478,7 +478,7 @@ def test_the_coordinator_install_pre_approves_its_own_three_verbs_and_a_reused_i
     assert bash == [f"Bash({lv} coord:*)", f"Bash({lv} drops:*)", f"Bash({lv} thread:*)"]
     # the brief reads the spelling back from the install itself (a launch from another interpreter tells the session
     # what THIS install allows), and an install from before the interpreter was named keeps its bare levain
-    assert inst.installed_coordinator_levain(target) == lv
+    assert inst.installed_coordinator_levain(target, sys.executable) == lv
     # np-be8ebe0a (a): Levain's own project MCP servers, and only those, are approved for the background session
     settings = json.loads((target / ".claude" / "settings.json").read_text())
     mcp = json.loads((target / ".mcp.json").read_text())["mcpServers"]
@@ -495,7 +495,7 @@ def test_the_coordinator_install_pre_approves_its_own_three_verbs_and_a_reused_i
     assert not [r for r in allow(plain.resolve()) if r.startswith("Bash(")]
     assert "enabledMcpjsonServers" not in json.loads((plain.resolve() / ".claude" / "settings.json").read_text())
     assert inst.persisted_role(plain.resolve()) is None
-    assert inst.installed_coordinator_levain(plain.resolve()) is None
+    assert inst.installed_coordinator_levain(plain.resolve(), sys.executable) is None
     capsys.readouterr()
     # a damaged or hand-edited record never reads as the role
     config = target / ".levain" / "config.json"
@@ -1156,37 +1156,24 @@ def test_a_store_without_envelopes_pins_nothing(qdir, tmp_path):
     assert refused is None and got.pinned_envelope_id is None
 
 
-def test_an_install_rule_from_another_interpreter_or_release_and_a_narrowed_one(tmp_path):
-    # the brief takes what the install allows: an older install's bare rule stays bare
+def test_the_brief_spelling_is_looked_up_as_exact_rules_never_parsed(tmp_path):
+    # what the install allows, found as exact strings: this interpreter's rules, else an older install's bare ones;
+    # anything else (no role, another interpreter's rules, a look-alike) is None and the caller's commands ask
     from levain import install as inst
-    old = tmp_path / "old"
-    (old / ".claude").mkdir(parents=True)
-    (old / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": ["Bash(levain coord:*)"]}}))
-    assert inst.installed_coordinator_levain(old) is None          # no recorded role: the operator's rules
-    (old / ".levain").mkdir()
-    (old / ".levain" / "config.json").write_text(json.dumps({"role": "coordinator"}))
-    assert inst.installed_coordinator_levain(old) == "levain"
-    # a rule that names something else is not a levain (L3 r2 codex): `make coord`, a wrapper
-    for other in ("Bash(make coord:*)", f"Bash(nice {inst.coordinator_levain('/v/bin/python')} coord:*)"):
-        (old / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": [other]}}))
-        assert inst.installed_coordinator_levain(old) is None, other
-    # a rule leaf is levain's under another interpreter, never once its other text is edited (L3 r1 codex MED)
-    variant = f"Bash({inst.coordinator_levain(inst._VARIABLE)} coord:*)"
-    assert inst._fits_variant(f"Bash({inst.coordinator_levain('/other venv/bin/python')} coord:*)", variant)
-    assert not inst._fits_variant(f"Bash({inst.coordinator_levain('/v/bin/python')} coord status:*)", variant)
-    assert not inst._fits_variant(f"Bash({inst.coordinator_levain('/v/bin/python')} doctor:*)", variant)
-    assert not inst._fits_variant(f"Bash(wrapper {inst.coordinator_levain('/v/bin/python')} coord:*)", variant)
+    here, other = "/venv-a/bin/python", "/venv b/bin/python"
+    d = tmp_path / "install"
+    (d / ".claude").mkdir(parents=True)
 
+    def rules(allow, role="coordinator"):
+        (d / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": allow}}))
+        (d / ".levain").mkdir(exist_ok=True)
+        (d / ".levain" / "config.json").write_text(json.dumps({"role": role} if role else {}))
+        return inst.installed_coordinator_levain(d, here)
 
-def test_a_settings_file_with_a_narrowed_coordinator_rule_is_not_levains_render(tmp_path):
-    # through the matcher `levain update` uses, not the helper alone (a mutation that unhooked the helper passed)
-    from levain import install as inst
-
-    def doc(python):
-        return json.dumps({"permissions": {"allow": list(inst.coordinator_allow(python))}})
-
-    want, variant = doc("/venv-a/bin/python"), doc(inst._VARIABLE)
-    assert inst._levain_render_variant(doc("/venv b/bin/python"), want, variant, install=tmp_path)
-    narrowed = json.loads(want)
-    narrowed["permissions"]["allow"][0] = narrowed["permissions"]["allow"][0].replace(" coord:*)", " coord status:*)")
-    assert not inst._levain_render_variant(json.dumps(narrowed), want, variant, install=tmp_path)
+    assert rules(list(inst.coordinator_allow(here))) == inst.coordinator_levain(here)
+    assert rules(["Bash(levain coord:*)", "Bash(levain drops:*)", "Bash(levain thread:*)"]) == "levain"
+    assert rules(list(inst.coordinator_allow(other))) is None          # another interpreter's install: asks
+    assert rules(list(inst.coordinator_allow(here)), role=None) is None  # a reused install: the operator's rules
+    for partial in (["Bash(make coord:*)", "Bash(make drops:*)", "Bash(make thread:*)"],
+                    list(inst.coordinator_allow(here))[:2]):
+        assert rules(partial) is None, partial

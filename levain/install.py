@@ -2757,8 +2757,6 @@ def persisted_consent_hook(install: Path) -> str:
 # live install it reuses (tests/test_coordinator_launch.py "a_reused_install_gets_none" pins that).
 ROLE_CHOICES = ("coordinator",)
 COORDINATOR_VERBS = ("coord", "drops", "thread")
-# one shell word as shlex.quote or a hook template writes a path: single-quoted, double-quoted, or bare
-_SHELL_WORD = r"""(?:'[^']*'|"(?:[^"\\]|\\.)*"|[^\s'"]+)"""
 # Levain's own project MCP servers, the names its .mcp.json render writes (BAND_SERVER and DISPATCH_SERVER are
 # defined with that render; the test pins this tuple against a real coordinator install's .mcp.json keys)
 COORDINATOR_MCP_SERVERS = ("anneal_memory", "levain_band", "levain_dispatch")
@@ -2779,25 +2777,23 @@ def coordinator_allow(python_path: str) -> tuple[str, ...]:
     return tuple(f"Bash({command} {verb}:*)" for verb in COORDINATOR_VERBS)
 
 
-def installed_coordinator_levain(install: Path) -> str | None:
-    """The levain command ``install``'s own ``coord`` allow rule names, read from its ``.claude/settings.json``, or
-    None (no such rule, or settings that cannot be read). A brief built from it tells the session exactly what this
-    install pre-approves, whichever interpreter wrote the rule (an install from before the interpreter was named
-    keeps its bare ``levain``) and whichever one is launching now (1021+11 L3 r1 codex HIGH)."""
+def installed_coordinator_levain(install: Path, python_path: str) -> str | None:
+    """The spelling ``install``'s own allow rules pre-approve for a coordinator launched from ``python_path``, or None.
+    Never parsed out of the file (Levain never parses a shell command): the rules this interpreter would render are
+    looked for as exact strings, then the bare ``levain`` rules an install from before the interpreter was named
+    carries. None (a reused install with no recorded role, rules another interpreter wrote, unreadable settings)
+    leaves the caller its own spelling, whose commands are asked about, never let through (1021+11 L3 r1-r3)."""
     if persisted_role(install) != "coordinator":
         return None              # a reused live install: its rules are the operator's, never read as Levain's
     try:
-        doc = json.loads((install / ".claude" / "settings.json").read_text(encoding="utf-8"))
-        allow = doc["permissions"]["allow"]
+        allow = json.loads((install / ".claude" / "settings.json").read_text(encoding="utf-8"))["permissions"]["allow"]
     except (OSError, ValueError, KeyError, TypeError):
         return None
     if not isinstance(allow, list):
         return None
-    for rule in allow:
-        m = re.fullmatch(r"Bash\((.+) coord:\*\)", rule) if isinstance(rule, str) else None
-        # only a spelling Levain writes (L3 r2 codex: `Bash(make coord:*)` is not a levain)
-        if m is not None and (m.group(1) == "levain" or re.fullmatch(_SHELL_WORD + r" -P -m levain", m.group(1))):
-            return m.group(1)
+    for command in (coordinator_levain(python_path), "levain"):
+        if all(f"Bash({command} {verb}:*)" in allow for verb in COORDINATOR_VERBS):
+            return command
     return None
 
 
@@ -4530,22 +4526,9 @@ def _levain_render_variant(
             return len(a) == len(b) == len(c) and all(map(same, a, b, c))
         if any(isinstance(t, (dict, list)) for t in (a, b, c)):
             return False
-        return a == b or (isinstance(c, str) and _VARIABLE in c and _fits_variant(a, c))
+        return a == b or (isinstance(c, str) and _VARIABLE in c)
 
     return same(x, y, v)
-
-
-def _fits_variant(here: object, variant: str) -> bool:
-    """Whether ``here`` is ``variant`` with only its sentinel spans (and the shell quotes around them) replaced: a
-    leaf whose per-machine part differs, never one whose other text was edited (1021+11 L3 r1 codex: a whole leaf
-    taken as variable let an operator's narrowed coordinator rule read as Levain's and be widened back)."""
-    if not isinstance(here, str):
-        return False
-    parts = variant.split(_VARIABLE)
-    parts = [p.rstrip("'\"") if i < len(parts) - 1 else p for i, p in enumerate(parts)]
-    parts = [p.lstrip("'\"") if i > 0 else p for i, p in enumerate(parts)]
-    # each span is one shell word, never a wrapper or extra arguments (L3 r2 codex)
-    return re.fullmatch(_SHELL_WORD.join(re.escape(p) for p in parts), here, flags=re.S) is not None
 
 
 # The base seed files a release adds to installs that never had them. Only these are written on
