@@ -39,7 +39,7 @@ def _dirs(world: World, kind: str):
     world.seams.account_uid = lambda name: {"_levain_qbroker": 3701}[name]
     ctx = H.Ctx(world.seams, H.Store(world.seams), OP_UID, "operator", OP_UID, {})
     H.make_session_dirs(ctx, s, H.session_dir_rows(SlotId("egress", 0), {"_levain_s0": 3999, "_levain_gw0": 3998}),
-                        kind=kind)
+                        broker_uid=world.seams.account_uid("_levain_qbroker") if kind == "dispatch" else None)
     return s, granted
 
 
@@ -63,7 +63,7 @@ def test_a_grant_that_cannot_be_set_refuses_the_session(tmp_path):
     with pytest.raises(Refused) as e:
         H.make_session_dirs(ctx, "s-00000000000000ab",
                             H.session_dir_rows(SlotId("egress", 0), {"_levain_s0": 3999, "_levain_gw0": 3998}),
-                            kind="dispatch")
+                            broker_uid=3701)
     assert e.value.name == "grant-reach-unset"
 
 

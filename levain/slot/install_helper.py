@@ -643,14 +643,15 @@ def _abandoned_setup(facts: HostFacts) -> Intent | None:
     return j
 
 
-def _end_processes(host: HostOS, uid: int, name: str, *, bootout: Callable[[int], None] = PR.darwin_bootout,
+def _end_processes(host: HostOS, uid: int, name: str, *, bootout: Callable[[int], bool] = PR.darwin_bootout,
                    kill_all: Callable[[int], tuple[bool, str]] = _kill_all,
                    none_left: Callable[[int], bool] = lambda u: PR.UidProcs().no_process(u)) -> tuple[bool, str]:
     """macOS first ends the uid's launchd domain, so no agent is respawned for it after the kill (an undo once
     left a slot's distnoted running past rc 0: levain-memory runs/s2-macos/raw_d/998_undo.txt); then every
-    process is killed, and the proof (two scans, no process of the uid) refuses by the account's name."""
-    if host == "darwin":
-        bootout(uid)
+    process is killed, and the proof (two scans, no process of the uid) refuses by the account's name. A bootout
+    launchctl did not report done refuses ``domain-remains:<name>`` (the account is never removed under it)."""
+    if host == "darwin" and not bootout(uid):
+        return False, f"domain-remains:{name}: launchctl did not report uid {uid}'s domain booted out"
     ok, why = kill_all(uid)
     if not ok:
         return False, why

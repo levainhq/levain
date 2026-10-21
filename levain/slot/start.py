@@ -449,11 +449,15 @@ def _drop_unretained_live(ctx: H.Ctx, session: str) -> None:
     """``L/live/<session>`` left after END reached RETAINED: a session that never cloned retains nothing (END
     renames a cloned ``<S>`` into the retained tree), so what is still there is the rendered layer and the slot's
     empty dirs [measured: Linux L62 (20+ such dirs) and macOS M69 left it]. Removed by dirfd, never following a
-    link, once every process of the slot is proven gone and before the slot is reusable."""
+    link, once every process of the slot is proven gone and before the slot is reusable. Only with no retained tree
+    for the session: END's rename moves all of ``<S>``, so ``<S>`` beside a tree is not this case and is kept."""
     with ctx.store.dir("live") as live:
         try:
             os.stat(session, dir_fd=live, follow_symlinks=False)
         except FileNotFoundError:
+            return
+        if os.path.lexists(ctx.store.path / "retained" / session / "tree"):
+            _note(f"scrub {session}: L/live/{session} kept beside its retained tree")
             return
         remove_tree_at(live, session)
         ctx.seams.fsync(live)
