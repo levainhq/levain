@@ -4,6 +4,7 @@ queue tests' ``Key`` and ``Log``), the store is real SQLite in tmp, and the end-
 tests' real git repo."""
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
@@ -19,17 +20,41 @@ from levain.dispatch import ContractRefused, DispatchError
 from levain.dispatch import control as ctl
 from levain.dispatch.contract import ResolvedTemplate
 from levain.dispatch.jobs import JobStore
-from levain.dispatch.registry import active_policy, resolver, template_content_hash, template_from_mapping
+from levain.dispatch.registry import (
+    VERIFIER_FORMAT, active_policy, driver_template_digest, resolver, template_content_hash, template_from_mapping,
+    verifier_artifact_digest,
+)
 from levain.dispatch.sign import DISPATCH_SIGN_NAMESPACE
 from tests.test_consent_queue import Key, Log
 from tests.test_dispatch_contract import NOW, POLICY, make_repo, submission, template
 from tests.test_dispatch_sign import passkey_line
 
 NS = ctl.CONFIG_NAMESPACE
-BB = "sha256:" + "b" * 64
-IP = "sha256:" + "c" * 64
-VERIFIERS = {"pytest-bb": {"artifact_hash": BB, "kind": "black-box"},
-             "pytest-ip": {"artifact_hash": IP, "kind": "in-process"}}
+
+
+def ventry(vid: str, kind: str, *, argv=("python3", "-m", "pytest", "-q"), expect_exit: int = 0, **over) -> dict:
+    """A verifier entry on the shipped output_compare template, every digest computed (``over`` applied before the
+    artifact digest, so a changed field is a consistent new entry)."""
+    steps = [{"argv": list(argv), "wall_s": 300}]
+    driver_input = {"steps": [{"exit": expect_exit}]}
+    e = {"verifier_id": vid, "declared_kind": kind, "driver_template": "output_compare",
+         "driver_template_digest": driver_template_digest("output_compare"), "steps": steps,
+         "steps_digest": "sha256:" + hashlib.sha256(canonical_bytes(steps)).hexdigest(), "driver_input": driver_input,
+         "driver_input_digest": "sha256:" + hashlib.sha256(canonical_bytes(driver_input)).hexdigest()}
+    e.update(over)
+    e["verifier_artifact_digest"] = verifier_artifact_digest(e)
+    return e
+
+
+def vbody(*entries) -> dict:
+    return {"format": VERIFIER_FORMAT, "verifiers": list(entries)}
+
+
+BB_ENTRY = ventry("pytest-bb", "black-box")
+IP_ENTRY = ventry("pytest-ip", "in-process")
+BB = BB_ENTRY["verifier_artifact_digest"]
+IP = IP_ENTRY["verifier_artifact_digest"]
+VERIFIERS = vbody(BB_ENTRY, IP_ENTRY)
 WRITE_SET = ("src/a.py", "src/b.py", "src/new.py", "src/sub/deep.py")
 
 
@@ -110,13 +135,13 @@ def accept(store, log, keys, kind, gen, body, key="laptop", **kw):
 def raw_item(**over) -> bytes:
     """Item bytes in canonical key order, built without the canon module so a malformed value can be written."""
     obj = {"format": ctl.FORMAT, "store_id": "0" * 32, "generation": 1, "prev": "",
-           "issued_at": "2026-10-19T19:59:00.000000Z", "kind": "verifiers", "body": {}}
+           "issued_at": "2026-10-19T19:59:00.000000Z", "kind": "verifier", "body": {}}
     obj.update(over)
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
 
 
 def base_config(store, log, keys):
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     accept(store, log, keys, "templates", 2, [tmpl()])
     accept(store, log, keys, "provider_policy", 3, POLICY.to_mapping())
 
@@ -126,7 +151,7 @@ def base_config(store, log, keys):
 def test_accept_and_resolve_round_trip(store, log, keys):
     base_config(store, log, keys)
     active = store.active()
-    assert set(active) == {"verifiers", "templates", "provider_policy"} and store.generation() == 3
+    assert set(active) == {"verifier", "templates", "provider_policy"} and store.generation() == 3
     assert active["templates"].generation == 2 and active["templates"].kind == "templates"
     resolve = resolver(store)
     got = resolve("fix-lint")
@@ -145,25 +170,25 @@ def test_the_active_item_is_the_latest_of_its_kind(store, log, keys):
 
 
 def test_item_text_and_bytes_both_accepted(store, log, keys):
-    item, sig = signed(store, "verifiers", 1, VERIFIERS, keys["laptop"])
+    item, sig = signed(store, "verifier", 1, VERIFIERS, keys["laptop"])
     assert store.accept(item.decode("utf-8"), sig).generation == 1
 
 
 # --- generation and the chain --------------------------------------------------------------------------------------
 
 def test_a_replayed_older_item_is_refused(store, log, keys):
-    old, old_sig = signed(store, "verifiers", 1, VERIFIERS, keys["laptop"])
+    old, old_sig = signed(store, "verifier", 1, VERIFIERS, keys["laptop"])
     store.accept(old, old_sig)
-    accept(store, log, keys, "verifiers", 2, {"pytest-bb": VERIFIERS["pytest-bb"]})
+    accept(store, log, keys, "verifier", 2, vbody(BB_ENTRY))
     with pytest.raises(ctl.ConfigRefused, match="not above the highest accepted"):
         store.accept(old, old_sig)
-    assert store.active()["verifiers"].generation == 2
+    assert store.active()["verifier"].generation == 2
 
 
 def test_the_generation_spans_every_kind(store, log, keys):
     # a policy item signed at generation 1 and held back is refused once ANY kind has passed it
     held, held_sig = signed(store, "provider_policy", 1, POLICY.to_mapping(), keys["laptop"])
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     with pytest.raises(ctl.ConfigRefused, match=r"generation 1 is not above the highest accepted \(1\)"):
         store.accept(held, held_sig)
     with pytest.raises(ctl.ConfigRefused, match="not above"):
@@ -173,18 +198,18 @@ def test_the_generation_spans_every_kind(store, log, keys):
 
 
 def test_a_generation_gap_is_refused(store, log, keys):
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     with pytest.raises(ctl.ConfigRefused, match="the next is 2"):
         accept(store, log, keys, "templates", 7, [tmpl()])
     assert store.generation() == 1
 
 
 def test_an_item_not_chained_to_the_head_is_refused(store, log, keys):
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     with pytest.raises(ctl.ConfigRefused, match="does not chain to the head"):
         accept(store, log, keys, "templates", 2, [tmpl()], prev=OTHER_PREV)
     _top, head = store.head()
-    assert head == store.active()["verifiers"].digest and head.startswith("sha256:")
+    assert head == store.active()["verifier"].digest and head.startswith("sha256:")
 
 
 @pytest.mark.parametrize("gen, prev", [(1, OTHER_PREV), (2, ""), (2, "sha256:xyz")])
@@ -212,13 +237,13 @@ def test_a_deleted_middle_item_fails_every_read_closed(store, log, keys, cdir):
         with pytest.raises(DispatchError, match="no item 4"):
             read()
     with pytest.raises(ctl.ControlStateUnavailable, match="no item 4"):
-        accept(store, log, keys, "verifiers", 6, VERIFIERS, prev=OTHER_PREV)
+        accept(store, log, keys, "verifier", 6, VERIFIERS, prev=OTHER_PREV)
 
 
 def test_a_middle_item_swapped_for_another_signed_one_fails_closed(store, log, keys, cdir):
     # a validly signed item for the same store and generation, but not the one the head chains to
     base_config(store, log, keys)
-    accept(store, log, keys, "verifiers", 4, VERIFIERS)
+    accept(store, log, keys, "verifier", 4, VERIFIERS)
     swap, swap_sig = signed(store, "provider_policy", 3, POLICY.to_mapping(), keys["laptop"],
                             at=NOW - timedelta(minutes=5), prev=store.active()["templates"].digest)
     conn = _raw(cdir)
@@ -255,7 +280,7 @@ def test_generation_reads_the_verified_head(store, log, keys, cdir):
 
 def test_an_item_signed_for_another_store_is_refused(store, log, keys, tmp_path):
     # the L2 probe: the same signed items replayed into a fresh store pinned to the same root
-    items = [signed(store, "verifiers", 1, VERIFIERS, keys["laptop"])]
+    items = [signed(store, "verifier", 1, VERIFIERS, keys["laptop"])]
     store.accept(*items[0])
     items.append(signed(store, "templates", 2, [tmpl()], keys["laptop"]))
     store.accept(*items[1])
@@ -288,7 +313,7 @@ def test_the_store_id_is_drawn_once(cdir, log, keys):
 def test_a_non_pinned_signer_is_refused_even_at_t3(store, log, keys):
     for name in ("other", "phone", "stranger"):
         with pytest.raises(ctl.ConfigRefused, match="does not verify as the pinned trust root's"):
-            accept(store, log, keys, "verifiers", 1, VERIFIERS, key=name)
+            accept(store, log, keys, "verifier", 1, VERIFIERS, key=name)
     assert store.generation() == 0
 
 
@@ -332,7 +357,7 @@ def test_a_passkey_root_is_refused_at_init_and_at_verify(tmp_path, tmp_path_fact
     d = _dir(tmp_path, "fido-root")
     ctl.ControlStore.init(d, fingerprint_of(pk), authority=fido.source)
     store = ctl.ControlStore(d, authority=log.source, clock=Clock(NOW))
-    item = ctl.item_bytes("verifiers", 1, VERIFIERS, NOW, prev="", store_id=store.store_id())
+    item = ctl.item_bytes("verifier", 1, VERIFIERS, NOW, prev="", store_id=store.store_id())
     with pytest.raises(ctl.ConfigRefused, match="passkey"):
         store.accept(item, "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n")
 
@@ -346,12 +371,12 @@ def test_an_unstated_custody_root_is_refused_at_init_and_at_verify(tmp_path, tmp
     d = _dir(tmp_path, "u2")
     ctl.ControlStore.init(d, ks["root"].fp, authority=stated.source)
     store = ctl.ControlStore(d, authority=stated.source, clock=Clock(NOW))
-    accept(store, stated, ks, "verifiers", 1, VERIFIERS, key="root")
+    accept(store, stated, ks, "verifier", 1, VERIFIERS, key="root")
     read_unstated = ctl.ControlStore(d, authority=unstated.source, clock=Clock(NOW))
     with pytest.raises(ctl.ControlStateUnavailable, match="unstated"):
         read_unstated.active()
     with pytest.raises(ctl.ConfigRefused, match="unstated"):
-        read_unstated.accept(*signed(store, "verifiers", 2, VERIFIERS, ks["root"]))
+        read_unstated.accept(*signed(store, "verifier", 2, VERIFIERS, ks["root"]))
 
 
 def test_init_refuses_an_unenrolled_or_revoked_root(tmp_path, tmp_path_factory, log, keys):
@@ -387,19 +412,19 @@ def test_init_refuses_a_symlinked_store(tmp_path, log, keys):
 def test_the_wrong_namespace_is_refused(store, log, keys):
     # a contract-sign signature over the very same bytes
     with pytest.raises(ctl.ConfigRefused, match="does not verify"):
-        accept(store, log, keys, "verifiers", 1, VERIFIERS, ns=DISPATCH_SIGN_NAMESPACE)
+        accept(store, log, keys, "verifier", 1, VERIFIERS, ns=DISPATCH_SIGN_NAMESPACE)
 
 
 def test_a_tampered_body_is_refused(store, log, keys):
-    item, sig = signed(store, "verifiers", 1, VERIFIERS, keys["laptop"])
+    item, sig = signed(store, "verifier", 1, VERIFIERS, keys["laptop"])
     obj = parse(item)
-    obj["body"]["pytest-bb"]["artifact_hash"] = "sha256:" + "d" * 64
+    obj["body"]["verifiers"][0]["verifier_artifact_digest"] = "sha256:" + "d" * 64
     with pytest.raises(ctl.ConfigRefused, match="does not verify"):
         store.accept(canonical_bytes(obj), sig)
 
 
 def test_a_non_canonical_item_is_refused(store, log, keys):
-    item, sig = signed(store, "verifiers", 1, VERIFIERS, keys["laptop"])
+    item, sig = signed(store, "verifier", 1, VERIFIERS, keys["laptop"])
     loose = item.replace(b'"format":', b'"format": ')
     with pytest.raises(ctl.ConfigRefused, match="canonical"):
         store.accept(loose, keys["laptop"].sign(loose, NS))
@@ -430,7 +455,7 @@ def test_the_store_takes_the_authority_source_never_a_snapshot(cdir, log):
 
 
 def test_an_empty_or_oversized_signature_is_refused(store, log, keys):
-    item, _sig = signed(store, "verifiers", 1, VERIFIERS, keys["laptop"])
+    item, _sig = signed(store, "verifier", 1, VERIFIERS, keys["laptop"])
     with pytest.raises(ctl.ConfigRefused, match="empty"):
         store.accept(item, "")
     with pytest.raises(ctl.ConfigRefused, match="over"):
@@ -458,14 +483,14 @@ def test_a_revoked_root_fails_every_read_closed(tmp_path, tmp_path_factory):
     d = _dir(tmp_path)
     ctl.ControlStore.init(d, ks["root"].fp, authority=lg.source)
     store = ctl.ControlStore(d, authority=lg.source, clock=Clock(NOW))
-    accept(store, lg, ks, "verifiers", 1, VERIFIERS, key="root")
-    assert store.active()["verifiers"].generation == 1
+    accept(store, lg, ks, "verifier", 1, VERIFIERS, key="root")
+    assert store.active()["verifier"].generation == 1
     _top, head = store.head()
     lg.revoke("root")
     with pytest.raises(ctl.ControlStateUnavailable, match="revoked"):
         store.active()
     with pytest.raises(ctl.ConfigRefused, match="revoked"):
-        accept(store, lg, ks, "verifiers", 2, VERIFIERS, key="root", prev=head)
+        accept(store, lg, ks, "verifier", 2, VERIFIERS, key="root", prev=head)
 
 
 def test_an_empty_store_under_a_revoked_root_reads_closed(tmp_path, tmp_path_factory):
@@ -501,7 +526,7 @@ def _raw(cdir):
     "INSERT OR REPLACE INTO meta (key, value) VALUES ('trust_root', 'x')",
 ])
 def test_the_tables_are_append_only(store, log, keys, cdir, sql):
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     conn = _raw(cdir)
     try:
         with pytest.raises(sqlite3.IntegrityError):
@@ -517,7 +542,7 @@ def test_a_forged_middle_row_fails_every_read_closed(store, log, keys, cdir):
     try:
         conn.execute("DROP TRIGGER items_frozen")
         forged = tmpl(write_paths=["src/a.py", "src/b.py", "src/new.py", "src/c.py"])
-        text = ctl.item_bytes("templates", 2, [forged], NOW, prev=store.active()["verifiers"].digest,
+        text = ctl.item_bytes("templates", 2, [forged], NOW, prev=store.active()["verifier"].digest,
                               store_id=store.store_id()).decode()
         conn.execute("UPDATE items SET item = ? WHERE generation = 2", (text,))
     finally:
@@ -560,7 +585,7 @@ def test_no_store_and_no_pin_refuse(tmp_path, log):
 def test_an_unreadable_authority_fails_reads_closed(cdir, store, log, keys, tmp_path):
     from levain.consent.queue import authority_source
 
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     blind = ctl.ControlStore(cdir, authority=authority_source(tmp_path / "missing" / "cockpit.db", anchor=None))
     with pytest.raises(ctl.ControlStateUnavailable, match="authority log"):
         blind.active()
@@ -576,7 +601,7 @@ def test_a_directory_others_can_reach_is_refused(cdir, log):
 
 
 def test_no_policy_is_never_an_empty_one(store, log, keys):
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     with pytest.raises(DispatchError, match="no provider policy"):
         active_policy(store)
 

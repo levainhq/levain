@@ -227,6 +227,58 @@ def roots_steps(host: HostOS, roots: Iterable[str]) -> list[Step]:
                  write=(roots_path(host), roots_record_text(roots), 0o644))]
 
 
+# --- the configured pool (SESSION2_PLAN head ruling 8; contract c7.8 line owed) ---------------------------------
+
+POOL_CONFIG_FORMAT = "levain-pool-config/1"
+
+
+def pool_config_path(host: HostOS) -> Path:
+    return STORE[host] / "policy" / "pool"
+
+
+def pool_config_row(host: HostOS) -> Row:
+    """``L/policy/pool``: root 0644, written by ``setup``, read by ``replenish``, removed by ``undo``."""
+    return _root(host, pool_config_path(host), 0o644, "file")
+
+
+def pool_config_text(slots: int, verifier_slots: int) -> str:
+    from levain.contracts import canon
+
+    return canon.canonical({"format": POOL_CONFIG_FORMAT, "slots": slots, "verifier_slots": verifier_slots})
+
+
+def parse_pool_config(data: bytes) -> tuple[int, int]:
+    """``(slots, verifier_slots)``, or ``pool-config-malformed``: canonical JSON, exactly the three keys, each
+    count a non-negative int."""
+    from levain.contracts import canon
+
+    try:
+        obj = canon.parse(data)
+    except canon.ContractError as e:
+        raise Refused("pool-config-malformed", str(e)) from None
+    if not isinstance(obj, dict) or set(obj) != {"format", "slots", "verifier_slots"} \
+            or obj["format"] != POOL_CONFIG_FORMAT:
+        raise Refused("pool-config-malformed", f"not a {POOL_CONFIG_FORMAT} record")
+    for k in ("slots", "verifier_slots"):
+        if type(obj[k]) is not int or obj[k] < 0:
+            raise Refused("pool-config-malformed", k)
+    return obj["slots"], obj["verifier_slots"]
+
+
+def pool_config_steps(host: HostOS, slots: int, verifier_slots: int) -> list[Step]:
+    """Setup's ``--slots`` / ``--verifier-slots``, the counts ``replenish`` fills back to. Written by every setup
+    run: a re-run is planned at its journal's counts (§25), so it writes the same record."""
+    r = pool_config_row(host)
+    return [Step(f"record the configured pool ({slots} egress, {verifier_slots} verifier) in {r.path}",
+                 write=(r.path, pool_config_text(slots, verifier_slots), r.mode))]
+
+
+def pool_config_undo_steps(host: HostOS) -> list[Step]:
+    rm = "/bin/rm" if host == "darwin" else _abs("rm")
+    p = str(pool_config_path(host))
+    return [Step(f"remove {p}", (rm, "-f", p))]
+
+
 # --- one filesystem (CONTRACT §2.1) -----------------------------------------------------------------------
 
 
@@ -287,6 +339,15 @@ def tmpfiles_steps(host: HostOS, slots: Iterable[SlotId]) -> list[Step]:
 
 def tmpfiles_undo_steps() -> list[Step]:
     return [Step(f"remove {TMPFILES_CONF}", (_abs("rm"), "-f", str(TMPFILES_CONF)))]
+
+
+def run_dir_undo_steps(host: HostOS) -> list[Step]:
+    """Linux: remove ``R`` (§2.2). It is tmpfs, so with the tmpfiles conf gone it would not come back at boot, but
+    until then its dirs name tombstoned owners (the 1d VM run). ``--one-file-system``: a mount found below it
+    fails the step instead of being walked into. Run after every slot process is stopped."""
+    if host != "linux":
+        raise Refused("unsupported-host", f"{host}: only Linux's R is removed by undo")
+    return [Step(f"remove {RUN[host]} (the run dirs)", (_abs("rm"), "-rf", "--one-file-system", "--", str(RUN[host])))]
 
 
 # --- undo: no shared gid left on a dir (CONTRACT §23) --------------------------------------------------------

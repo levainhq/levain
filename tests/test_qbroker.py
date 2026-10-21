@@ -107,7 +107,7 @@ def clock():
 SESSION_A = Resolved(session="sess-a", kind="interactive", run=None)
 SESSION_B = Resolved(session="sess-b", kind="interactive", run=None)
 RUN = {"run_id": "run-1", "job_id": "job-1", "run_index": 0, "contract_digest": "sha256:" + "c" * 64,
-       "model_requested": "sonnet"}
+       "model_requested": "sonnet", "repo_root": "/private/var/levain/live/sess-2/repo"}
 
 
 @pytest.fixture
@@ -308,9 +308,18 @@ def test_an_expired_answer_is_refused(L, broker, keys, clock):
     rid = filed(broker)
     write_answer(L, rid, keys["operator"], signed_at=NOW + timedelta(minutes=6))   # after the 5-minute hold
     assert ask(broker, rid)["refused"] == "answer-refused"
-    write_answer(L, rid, keys["operator"])                                         # in time, read too late
     clock["now"] = NOW + timedelta(minutes=5)
-    assert ask(broker, rid)["refused"] == "request-expired"
+    assert ask(broker, rid)["refused"] == "request-expired"                        # not authority; the hold ended
+    os.unlink(L / "queue" / "answers" / f"{rid}.json")
+    assert ask(broker, rid)["refused"] == "request-expired"                        # no answer, the hold ended
+
+
+def test_an_answer_signed_in_time_is_returned_when_read_after_the_hold(L, broker, keys, clock):
+    """Head ruling (F10 S2a review): the verified answer is read before the request-expiry check."""
+    rid = filed(broker)
+    write_answer(L, rid, keys["operator"], decision="deny", signed_at=NOW + timedelta(minutes=4, seconds=59))
+    clock["now"] = NOW + timedelta(minutes=5, seconds=1)
+    assert ask(broker, rid)["decision"] == "deny"
 
 
 def test_an_answer_for_another_sessions_request_is_refused(L, broker, keys):
@@ -397,7 +406,7 @@ def test_answer_refusal_names_why(L, broker, keys):
     later = NOW + timedelta(seconds=10)
     assert answer_refusal(row, payload, sig, snap, later) is None
     assert "missing or unverifiable" in answer_refusal(row, payload, sig, None, later)
-    assert "hold ended" in answer_refusal(row, payload, sig, snap, NOW + timedelta(minutes=5))
+    assert answer_refusal(row, payload, sig, snap, NOW + timedelta(minutes=5)) is None      # signed in time, read late
     assert "does not verify" in answer_refusal(row, {**payload, "decision": "deny"}, sig, snap, later)
     tampered = {**row, "request": {**row["request"], "tool_name": "Write"}}
     assert "seal" in answer_refusal(tampered, payload, sig, snap, later)

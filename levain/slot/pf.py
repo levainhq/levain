@@ -30,6 +30,8 @@ ANCHOR = "com.apple/levain"
 ANCHOR_FILE = Path("/etc/pf.anchors/levain")
 PF_TOKEN = Path("/var/db/levain/pf.token")
 PFCTL = "/sbin/pfctl"
+#: The optimizer flag every load and check of the anchor carries (see :func:`load_steps`).
+PF_OPTIMIZE = ("-o", "none")
 
 #: The front port of egress slot n (CONTRACT §2.2, V9).
 GWPORT_BASE = 47100
@@ -211,12 +213,20 @@ def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run
 def load_steps(slots: Iterable[SlotId], ids: Mapping[str, int]) -> list[Step]:
     """Write the sub-anchor's file (checked with ``pfctl -n``), load it into ``com.apple/levain``, and
     take pf's enable reference. Idempotent: setup and replenish run the same steps with the slots then
-    configured. Never touches ``/etc/pf.conf``."""
+    configured. Never touches ``/etc/pf.conf``.
+
+    Both the check and the load run with the optimizer OFF (:data:`PF_OPTIMIZE`): the default ``-o basic``
+    folds the per-user rules into ``<__automatic…>`` tables (runs/s2-macos raw/M01c_pf_slots: 8 egress slots,
+    2 tables), and :func:`levain.slot.wall.check_egress_ready` refuses a folded anchor, so every slot would be
+    refused at start. With ``-o none`` the live anchor prints the rules as written (raw/W12: 0 tables, 8
+    READY), and the rules' order, which §24 measured (every rule is ``quick``), is kept as written."""
     slots = tuple(slots)
     return [
         Step(f"write the pf rules {ANCHOR_FILE} (checked with pfctl -n)",
-             write=(ANCHOR_FILE, anchor_text(slots, ids), 0o644), validate=(PFCTL, "-n", "-a", ANCHOR, "-f")),
-        Step(f"load the rules into the pf anchor {ANCHOR}", (PFCTL, "-a", ANCHOR, "-f", str(ANCHOR_FILE))),
+             write=(ANCHOR_FILE, anchor_text(slots, ids), 0o644),
+             validate=(PFCTL, "-n", *PF_OPTIMIZE, "-a", ANCHOR, "-f")),
+        Step(f"load the rules into the pf anchor {ANCHOR}",
+             (PFCTL, *PF_OPTIMIZE, "-a", ANCHOR, "-f", str(ANCHOR_FILE))),
         Step(f"create {PF_TOKEN.parent}", ("/bin/mkdir", "-p", "-m", "755", str(PF_TOKEN.parent))),
         Step(f"take pf's enable reference, its token kept in {PF_TOKEN}", call=lambda: take_enable_reference()),
     ]
@@ -271,6 +281,6 @@ def unload_steps() -> list[Step]:
     ]
 
 
-__all__ = ["ANCHOR", "ANCHOR_FILE", "GWPORT_BASE", "IFCONFIG", "PFCTL", "PF_TOKEN", "PF_TOKEN_GONE", "alias_absent", "alias_present",
+__all__ = ["ANCHOR", "ANCHOR_FILE", "GWPORT_BASE", "IFCONFIG", "PFCTL", "PF_OPTIMIZE", "PF_TOKEN", "PF_TOKEN_GONE", "alias_absent", "alias_present",
            "alias_steps", "alias_undo_steps", "anchor_rules", "anchor_text", "gwport", "load_steps",
            "release_enable_reference", "take_enable_reference", "unload_steps"]
