@@ -132,6 +132,9 @@
   let modalKey = null;
   let modalGlance = false;   // the open view came from a glance tile: it shows that tile's own typed panel, whatever the entry's kind
   let modalReturnFocus = null;
+  // a focus view that is not a layout entry (a Needs-you card): { id, title, build() -> element }. One slot, so the dialog,
+  // its Esc, its Tab trap and its focus return are the one implementation every focus view uses.
+  let modalCustom = null;
   let modalEpisodeQuery = "";
   // Open-Loops filter query — CLIENT-side (the loops all ride the wire), persisted across
   // re-renders (a verb fires → the board rebuilds → you stay in your filter) and into the
@@ -467,6 +470,10 @@
     // a folded card still scrolls when the reader's open row is taller than it: it keeps the keyboard affordance below,
     // and only the "more below" fade is skipped (the "N more" link is its cue)
     body.classList.toggle("has-overflow", over && !folded);
+    // the fade and the "Read all" foot key off this one class: set here for every bounded body, cleared when the content fits again
+    body.classList.toggle("is-clipped", over && !folded);
+    const memPanel = body.closest && !body.closest(".modal") ? body.closest(".ck-mem-nest, .ck-mem-row > .panel") : null;
+    if (memPanel) memFoot(memPanel);
     // Keyboard access (codex L3): make the scroll region focusable + named so arrow-keys
     // scroll a text-only panel (no focusable child) — the affordance the expander gave.
     if (over) {
@@ -930,8 +937,11 @@
     stackColumns(grid);
     sec.appendChild(grid);
     board.appendChild(sec);
-    dashPass(grid);
-    if (typeof MutationObserver === "function") new MutationObserver(() => { dashPass(grid); scheduleLayout(); }).observe(grid, { childList: true, subtree: true });
+    dashPass(grid); pairBoard(grid); memClips(grid);
+    if (typeof MutationObserver === "function") new MutationObserver(() => { dashPass(grid); pairBoard(grid); memClips(grid); scheduleLayout(); }).observe(grid, { childList: true, subtree: true });
+    // a card folds or empties by a class set after the draw (markEmptyCards), which no childList mutation reports: the pairs and the
+    // "Read all" feet follow it. Both write only on a change, so this cannot feed itself.
+    if (typeof MutationObserver === "function") new MutationObserver(() => { pairBoard(grid); memClips(grid); }).observe(grid, { attributes: true, attributeFilter: ["class"], subtree: true });
   }
 
   // A panel's count ("Tray (2)" in the kernel's title) is a pill beside the title, hidden at 0: the title says what the card is, the
@@ -1149,6 +1159,63 @@
     grid.classList.add("ck-twocol");
   }
 
+  // F4: below the two stacks the Board's full-width cards sit two to a row (Inbox | Fleet, Stream | Recent episodes). A card is marked
+  // data-ck-pair = "l" | "r" in the order it is drawn (Recent episodes is pinned last by CSS, so it is last here), an odd one out is
+  // "solo" and keeps its full row. A folded or empty card keeps the full row it already has and is no partner. Re-runnable: it is
+  // asked again whenever a card folds, empties or appears, and it writes an attribute only when the value changed.
+  const CK_PAIR_SKIP = ["ck-fold", "ck-dash", "ck-is-empty", "ck-tab-off"];
+  function pairBoard(grid) {
+    if (!grid.classList.contains("ck-twocol")) return;
+    const direct = Array.from(grid.children).filter((n) => n.classList.contains("panel"));
+    const set = (n, v) => { if (v === null) { if (n.hasAttribute("data-ck-pair")) n.removeAttribute("data-ck-pair"); } else if (n.getAttribute("data-ck-pair") !== v) n.setAttribute("data-ck-pair", v); };
+    const ok = direct.filter((n) => !CK_PAIR_SKIP.some((c) => n.classList.contains(c)));
+    for (const n of direct) if (!ok.includes(n)) set(n, null);
+    const pinnedLast = (n) => (CK_PIN_BOARD.has(n.dataset.ckPanel) ? 1 : 0);
+    const seq = ok.slice().sort((a, b) => pinnedLast(a) - pinnedLast(b));   // stable
+    seq.forEach((n, i) => set(n, i === seq.length - 1 && seq.length % 2 === 1 ? "solo" : (i % 2 === 0 ? "l" : "r")));
+  }
+
+  // F6: a card the page caps (a neocortex section, a panel of the Crystallized | Cognition row) that clips its content ends in a
+  // "Read all" foot that opens that card's focus view. The foot is built once and shown only while the card clips, so a card that
+  // fits shows nothing. Which element clips (the card or its body) depends on the style, so both are measured, with the foot hidden
+  // so it cannot be what makes the card clip.
+  function memFoot(panel) {
+    let foot = panel.querySelector(":scope > .more-foot[data-readall]");
+    const body = panel.querySelector(":scope > .pbody");
+    const cut = (n) => !!n && n.scrollHeight > n.clientHeight + 1;
+    if (foot) foot.hidden = true;
+    const clipped = panel.offsetParent !== null && (cut(panel) || cut(body));
+    panel.classList.toggle("is-clipped", clipped);
+    if (body && clipped) body.classList.add("is-clipped");
+    if (!clipped) { if (foot) foot.hidden = true; return; }
+    if (!foot) {
+      foot = el("button", "more-foot", "Read all");
+      foot.type = "button";
+      foot.dataset.readall = "1";
+      foot.setAttribute("aria-label", "Read all of " + ((panel.querySelector(":scope > .phead h2") || {}).textContent || "this card") + ": open the focus view");
+      foot.addEventListener("click", () => {
+        const x = panel.querySelector(".pexpand");
+        if (x) x.click(); else if (panel._ckEntry) openModal(panel._ckEntry, foot);
+      });
+      panel.appendChild(foot);
+    }
+    foot.hidden = false;
+  }
+  let memResizeWired = false;
+  function wireMemResize() {
+    if (memResizeWired || typeof window.addEventListener !== "function") return;
+    memResizeWired = true;
+    let t = null;
+    window.addEventListener("resize", () => { window.clearTimeout(t); t = window.setTimeout(() => { for (const g of document.querySelectorAll(".ck-zgrid")) memClips(g); }, 150); });
+  }
+  function memClips(grid) {
+    wireMemResize();
+    for (const p of grid.querySelectorAll(".ck-mem-nest, .ck-mem-row > .panel")) {
+      const body = p.querySelector(":scope > .pbody");
+      if (body) measureOverflow(body); else memFoot(p);
+    }
+  }
+
   // F7, the empty provider: an external panel that reports empty and says how to fix it collapses to ONE dashed line (its title, the
   // sentence, the fix), never a card with a body gap. An empty provider is an external panel with no rows, or one row that is the
   // provider's own report (a `no_` state key; its words are never read). Team without a ledger and an Inbox with no source
@@ -1305,7 +1372,7 @@
     if (!full.length) card.appendChild(el("p", "empty", "No wrap yet: the first consolidation writes this."));
     else {
       const left = el("div", "ck-mem-col"), right = el("div", "ck-mem-col");
-      for (const n of full) (RIGHT.test(String((entryOf.get(n) || {}).heading || "").trim()) ? right : left).appendChild(memNest(n));
+      for (const n of full) { n._ckEntry = entryOf.get(n); (RIGHT.test(String((entryOf.get(n) || {}).heading || "").trim()) ? right : left).appendChild(memNest(n)); }
       const cols = el("div", "ck-mem-cols");
       cols.appendChild(left);
       if (right.children.length) cols.appendChild(right); else cols.classList.add("ck-mem-one");
@@ -1324,6 +1391,7 @@
         chead.appendChild(el("span", "ck-mem-meta", lo === hi ? "level " + lo : "levels " + lo + " to " + hi));
       }
       crystals.classList.add("ck-mem-crys");
+      crystals._ckEntry = entryOf.get(crystals);
       crystals.classList.remove("ck-fold");   // the kernel's dashed one-liner spans its grid; here it keeps its side of the row
       row.appendChild(crystals);
     }
@@ -1339,7 +1407,7 @@
       // the figures ride the header of every Cognition tab, so whichever is showing carries them
       if (bits.length) for (const n of cog) { const gh = n.querySelector(".phead"); const t = gh && (gh.querySelector(".ck-card-title") || gh.querySelector("h2")); if (t) t.after(el("span", "ck-mem-meta", bits.join(" · "))); }
       graph.classList.add("ck-mem-cog");
-      for (const n of cog) row.appendChild(n);
+      for (const n of cog) { n._ckEntry = entryOf.get(n); row.appendChild(n); }
     }
     if (row.children.length) grid.insertBefore(row, card.nextSibling);
   }
@@ -4173,20 +4241,66 @@
     if (tail) head.appendChild(tail);
     card.appendChild(head);
   }
-  // an answer-on-your-phone note, and the CLI route behind "details" (the digests, the note and the two commands)
-  function needsDetails(parts, note) {
-    const d = el("details", "needs-details");
-    const sum = el("summary", null);
-    sum.appendChild(el("span", "needs-details-toggle", "details"));
-    if (note) sum.appendChild(el("span", "needs-phone ext-meta", note));
-    d.appendChild(sum);
-    d.append(...parts);
+  const needsIdOf = (it) => (it.kind === "consent" ? (it.c.id ? "consent:" + it.c.id : "") : (it.q.id ? String(it.q.id) : ""));
+  // The strip's card carries one "Open" row: it opens the focus view, where the SAME card is drawn unclamped (`is-full`) and the CLI
+  // route (the digests, the note and the commands) sits under "Answer from a terminal". There is no second renderer: the full card is
+  // the strip card built again with `full` set.
+  function needsDetails(parts, note, card) {
+    if (card && card.classList.contains("is-full")) {
+      const t = el("div", "needs-terminal");
+      t.appendChild(el("div", "needs-sec-label", "Answer from a terminal"));
+      if (note) t.appendChild(el("span", "needs-phone ext-meta", note));
+      t.append(...parts);
+      return t;
+    }
+    const d = el("div", "needs-details needs-open-row");
+    const btn = el("button", "needs-open", "Open");
+    btn.type = "button";
+    btn.title = "open the whole request";
+    btn.setAttribute("aria-haspopup", "dialog");
+    btn.addEventListener("click", () => { if (card && card._needsItem) openNeedsFocus(card._needsItem, btn); });
+    d.appendChild(btn);
+    if (note) d.appendChild(el("span", "needs-phone ext-meta", note));
     return d;
+  }
+  // The focus view of one waiting item: the card built again, unclamped. Closes when the item is answered (refreshModal).
+  function openNeedsFocus(it, opener) {
+    const id = needsIdOf(it);
+    modalCustom = {
+      id,
+      title: it.kind === "consent" ? (it.c.tool || "request") + " · " + (it.c.agent || "agent") : "Question #" + it.q.n + " · " + (it.q.agent || "agent"),
+      build: () => (it.kind === "consent" ? consentCard(it.c, true) : questionCard(it.q, true)),
+    };
+    modalGlance = false;
+    modalKey = "needs:" + id;
+    modalReturnFocus = opener || null;
+    modalEpisodeQuery = "";
+    buildModal(null);
+  }
+  // A JSON payload (a tool's input) as a key/value list: command, description, file_path. Anything else stays the verbatim text.
+  function consentRequest(display, tool) {
+    let t = String(display || "");
+    const head = tool && t.replace(/^\s+/, "").startsWith(tool) ? t.replace(/^\s+/, "").slice(tool.length) : t;
+    try {
+      const o = JSON.parse(head.trim());
+      if (o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).length) {
+        const dl = el("dl", "consent-kv");
+        for (const [k, v] of Object.entries(o)) {
+          dl.appendChild(el("dt", null, k));
+          dl.appendChild(el("dd", null, typeof v === "string" ? v : JSON.stringify(v)));
+        }
+        return dl;
+      }
+    } catch (e) { /* not a JSON payload: the text below */ }
+    return el("pre", "consent-display", t);
   }
   function drawConsentCard(card, slot, b) {
     const sv = (x) => (typeof x === "string" ? x : "");
     if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
-    const parts = [el("pre", "consent-display", sv(b.display))];
+    const full = card.classList.contains("is-full");
+    const label = (t) => el("div", "needs-sec-label", t);
+    const parts = full ? [label("Request"), consentRequest(sv(b.display), card._needsItem && card._needsItem.c.tool)] : [el("pre", "consent-display", sv(b.display))];
+    if (full) parts.push(label("Where"));
     const facts = el("div", "consent-facts");
     // the server's home shortens a path under it to ~/..., the full path stays as the title (never the browser's home)
     const where = el("span", "ext-meta", "in " + (sv(b.cwd_short) || sv(b.cwd)) + " \u00b7 targets " + sv(b.targets));
@@ -4194,7 +4308,10 @@
     facts.appendChild(where);
     parts.push(facts);
     const hintBox = consentHintBox(b);
-    if (hintBox) parts.push(hintBox);
+    if (hintBox) { if (full) parts.push(label("Hint")); parts.push(hintBox); }
+    if (full && card._needsItem && Number.isFinite(Date.parse(card._needsItem.c.expiresAt))) {
+      parts.push(label("Expires"), el("div", "ext-meta needs-expires", new Date(card._needsItem.c.expiresAt).toLocaleString()));
+    }
     // Allow and Deny are one component at one weight: neither is filled, neither leads. This page signs nothing, so each
     // copies the terminal command that answers; the phone is where the answer is signed.
     const acts = el("div", "needs-actions");
@@ -4218,12 +4335,13 @@
     slot.replaceChildren(...parts);
     // the actions and the one-line footer are the card's own rows, pinned below the body so cards in a row end alike
     if (acts.childElementCount) card.appendChild(acts);
-    card.appendChild(needsDetails(more, "signs on your phone"));
+    card.appendChild(needsDetails(more, "signs on your phone", card));
   }
-  function consentCard(c) {
-    const card = el("div", "needs-card needs-consent");
+  function consentCard(c, full) {
+    const card = el("div", "needs-card needs-consent" + (full ? " is-full" : ""));
     card.dataset.needsCard = "consent";
-    if (c.id) card.dataset.needsId = "consent:" + c.id;
+    card._needsItem = { kind: "consent", c };
+    if (c.id && !full) card.dataset.needsId = "consent:" + c.id;
     card.dataset.needsExpires = String(c.expiresAt);
     card.dataset.needsState = String(c.state);
     needsHead(card, el("b", "consent-tool", c.tool), c.agent, (() => {
@@ -4239,16 +4357,17 @@
     else slot.textContent = "this request has no id";
     return card;
   }
-  function questionCard(q) {
-    const card = el("div", "needs-card needs-question");
+  function questionCard(q, full) {
+    const card = el("div", "needs-card needs-question" + (full ? " is-full" : ""));
     card.dataset.needsCard = "question";
-    if (q.id) card.dataset.needsId = String(q.id);
+    card._needsItem = { kind: "question", q };
+    if (q.id && !full) card.dataset.needsId = String(q.id);
     needsHead(card, el("span", "needs-chip", "question"), q.agent, q.age ? el("span", "ext-meta needs-left", "asked " + q.age) : null);
     const slot = el("div", "needs-body ext-meta", "reading the question…");
     card.appendChild(slot);
     questionBody(q, card).then((b) => {
       drawQuestionBody(q, slot, b, card);
-      if (!b.error) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")]));
+      if (!b.error) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")], "", card));
     });
     return card;
   }
@@ -4866,6 +4985,16 @@
     return { host, zone: p.dataset.zone || "", title: entry.title || "", editClass: entry.edit_class || "" };
   }
 
+  function customModalContent(c) {
+    const card = c.build();
+    if (!card) return null;
+    const host = el("div", "modal-panel");
+    const body = el("div", "pbody modal-pbody");
+    body.appendChild(card);
+    host.appendChild(body);
+    return { host, zone: "", title: c.title, editClass: "" };
+  }
+
   function buildModal(entry) {
     const gen = ++modalGen;
     modalAwaiting = false;
@@ -4874,7 +5003,7 @@
     const openBody = document.querySelector("#levain-modal .modal-body");
     const modalKept = modalPending || captureKept(openBody);
     buildKept = modalKept;   // a typed panel filled in this build may owe the reader a later repaint of it
-    const content = currentView ? modalContent(entry, currentView) : null;
+    const content = modalCustom ? customModalContent(modalCustom) : (currentView ? modalContent(entry, currentView) : null);
     if (!content) { buildKept = null; closeModal(); return; }
 
     let overlay = document.getElementById("levain-modal");
@@ -4948,6 +5077,11 @@
 
   function refreshModal() {
     if (!modalKey) return;
+    // a Needs-you card keeps its place (and any words typed into it) while the item still waits; it closes when the item is answered
+    if (modalCustom) {
+      if (!needsItems(((currentView && currentView.extra_panels || {}).decisions || {}).lines).some((it) => needsIdOf(it) === modalCustom.id)) closeModal();
+      return;
+    }
     const entry = findEntry(currentView, modalKey);
     if (!entry) { closeModal(); return; }  // the panel vanished from the view → close
     buildModal(entry);
@@ -4969,6 +5103,7 @@
     pruneModalKinds();
     document.body.classList.remove("modal-open");
     modalKey = null;
+    modalCustom = null;
     modalGlance = false;
     modalPending = null;
     modalAwaiting = false;
