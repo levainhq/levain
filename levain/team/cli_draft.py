@@ -8,7 +8,6 @@ keeps the draft path honest; it is not a lock on the key, which any process of t
 from __future__ import annotations
 
 import json
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -21,6 +20,21 @@ def _store(args):
     from levain.coordinator.store import CoordStore
 
     return CoordStore(args.queue_dir.expanduser() if args.queue_dir is not None else None)
+
+
+def _show(v: dict) -> str:
+    e = v["entry"]
+    lines = [f"draft {v['draft_id']}  [{v['state']}]  drafted by {v['drafted_by']} at {v['drafted_at']}",
+             f"  {v['type']}" + (f" . {e['kind']}" if e.get("kind") else "") +
+             (f"  owner {e['owner']}" if e.get("owner") else "")]
+    for k in ("words", "summary", "reason", "recheck"):
+        if e.get(k):
+            lines.append(f"  {k}: {json.dumps(e[k], ensure_ascii=False)}")
+    if e.get("paths"):
+        lines.append("  governs: " + ", ".join(e["paths"]))
+    if v.get("ledger_id"):
+        lines.append(f"  signed as ledger entry {v['ledger_id']}")
+    return "\n".join(lines)
 
 
 # a test seam: called with the draft id once a promote has reserved it, before it reads or signs the ledger
@@ -49,23 +63,10 @@ def _words(args) -> str | None:
     return args.words
 
 
-def _show(v: dict) -> str:
-    e = v["entry"]
-    lines = [f"draft {v['draft_id']}  [{v['state']}]  drafted by {v['drafted_by']} at {v['drafted_at']}",
-             f"  {v['type']}" + (f" . {e['kind']}" if e.get("kind") else "") +
-             (f"  owner {e['owner']}" if e.get("owner") else "")]
-    for k in ("words", "summary", "reason", "recheck"):
-        if e.get(k):
-            lines.append(f"  {k}: {json.dumps(e[k], ensure_ascii=False)}")
-    if e.get("paths"):
-        lines.append("  governs: " + ", ".join(e["paths"]))
-    if v.get("ledger_id"):
-        lines.append(f"  signed as ledger entry {v['ledger_id']}")
-    return "\n".join(lines)
-
-
 def cmd_draft(args) -> int:
     from levain.coordinator import teamdrafts as T
+    import sqlite3
+
     from levain.coordinator.store import CoordError
 
     store = _store(args)
@@ -88,18 +89,18 @@ def cmd_draft(args) -> int:
         elif verb == "withdraw":
             print(_show(T.withdraw_draft(store, args.draft_id, by=args.by, token=args.token)))
         elif verb == "promote":
-            _promote(args, store)
+            v = T.get_draft(store, args.draft_id)
+            if v is None:
+                raise TeamError(f"no team draft {args.draft_id}")
+            _promote(args, store, v)
     except (CoordError, sqlite3.Error) as exc:
         raise TeamError(str(exc)) from None
     return 0
 
 
-def _promote(args, store) -> None:
+def _promote(args, store, v: dict) -> None:
     from levain.coordinator import teamdrafts as T
 
-    v = T.get_draft(store, args.draft_id)
-    if v is None:
-        raise TeamError(f"no team draft {args.draft_id}")
     if v["state"] not in ("drafted", "promoting"):
         raise TeamError(f"draft {args.draft_id} is already {v['state']}")
     e = v["entry"]
