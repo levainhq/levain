@@ -34,3 +34,21 @@ def test_codex_payload_model_is_recorded_beside_the_request_in_a_store_made_befo
     got = reopened.get(filed[1])
     assert got is not None and "glm" not in json.dumps(got[0].fields())
     assert all("glm" not in json.dumps(r["face"]) for r in reopened.receipts(filed[1]))
+
+
+import pytest
+
+
+@pytest.mark.parametrize("raw_model", ['"\\ud800"', '"claude‮evil"'], ids=["lone-surrogate", "bidi-override"])
+def test_a_model_outside_the_id_alphabet_files_and_records_unknown(tmp_path, raw_model):
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    (q / cx.SETTINGS_NAME).write_text(json.dumps({"away_mode": True, "away_hold_seconds": 0}))
+    # the payload is parsed from JSON TEXT, so an escaped lone surrogate reaches the adapter as the agent sent it
+    text = ('{"hook_event_name": "%s", "session_id": "s", "cwd": %s, "tool_name": "Bash", "tool_input": {"command": "git push"}, '
+            '"model": %s, "permission_mode": "default"}' % (cx.EVENT, json.dumps(str(tmp_path)), raw_model))
+    assert cx.main(["--max-hold", "0", "--queue-dir", str(q)], stdin=io.StringIO(text), stdout=io.StringIO()) == 0
+    queue = ConsentQueue(q, authority=authority_source(q / "cockpit.db", anchor=None))
+    filed = [r[0] for r in sqlite3.connect(q / "queue.db").execute("SELECT id FROM requests ORDER BY rowid")]
+    assert len(filed) == 1
+    assert queue.model(filed[0])["requested"] == MODEL_UNKNOWN

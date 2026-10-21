@@ -120,6 +120,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 import warnings
@@ -192,9 +193,10 @@ RULING_SKEW = timedelta(minutes=2)
 SNOOZE_MAX_MINUTES = 7 * 24 * 60
 # how the agent's session was invoked, recorded for a later resume (``claude -p``, a terminal, ``claude --bg``)
 INVOCATIONS: tuple[str, ...] = ("-p", "interactive", "bg")
-#: The longest model string a request records; a longer, empty or control-character one is recorded as unknown (it is
-#: agent-controlled text a reader shows).
+#: The longest model string a request records. A model id is agent-controlled text a reader shows, so only the
+#: ASCII alphabet real ids use is recorded (see :func:`_model_of`); anything else is recorded as unknown.
 MODEL_MAX = 200
+_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,%d}" % (MODEL_MAX - 1), re.ASCII)
 #: What :meth:`ConsentQueue.model` reports for a model no source has given (DISPATCH F5: never inferred, never copied).
 MODEL_UNKNOWN = "unknown"
 _RESUME_KEYS = frozenset({"permission_mode", "invocation", "codex_pid", "cwd", "config_dir", "claude_pid",
@@ -449,13 +451,10 @@ def _migrate_from_prior(conn: sqlite3.Connection) -> None:
 
 
 def _model_of(value: Any) -> str | None:
-    """``value`` as a model string to record, or ``None``: a non-empty string of at most :data:`MODEL_MAX`
-    characters, none of them a control character."""
-    if not isinstance(value, str) or not value or len(value) > MODEL_MAX:
-        return None
-    if any(ord(c) < 0x20 or 0x7f <= ord(c) < 0xa0 for c in value):
-        return None
-    return value
+    """``value`` as a model string to record, or ``None``: a string that is wholly a model id in the ASCII alphabet
+    of :data:`_MODEL_RE` (so at most :data:`MODEL_MAX` characters, and no control, bidirectional or unpaired-surrogate
+    character can pass)."""
+    return value if isinstance(value, str) and _MODEL_RE.fullmatch(value) else None
 
 
 # how deep a signed record may nest when it is copied: an answer or ruling nests one level (``receipts_head``), so
