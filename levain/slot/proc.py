@@ -229,8 +229,25 @@ class UidProcs:
         return _sweep(uid, signal.SIGSTOP, _frozen, lambda p: p.state == RUN, bound_s, self.seams)
 
     def kill(self, uid: int, bound_s: float) -> bool:
+        """END's kill: on macOS the uid's launchd domain is booted out first (``domain_out``), then :meth:`sweep_kill`
+        has what is left of ``bound_s``; ``False`` if launchctl did not report the domain done. Without the bootout
+        launchd starts an agent again between the sweep's last scan and END's proof: a 300k-file END went HELD
+        ``kill-unproven``, distnoted 2913 killed and 2942 there at the proof [measured: levain-memory
+        1019-s1design/runs/s3-macos-2f-final/raw/Z5b_300k.txt, 2026-10-21]. The order is undo's (install_helper
+        ``_end_processes``): domain, kill, proof."""
+        uid = check_target(uid, self.seams)
+        if self.seams.domain_out is not None:
+            deadline = self.seams.clock() + bound_s
+            if not self.seams.domain_out(uid, bound_s):
+                return False
+            bound_s = max(deadline - self.seams.clock(), 0.0)
+        return self.sweep_kill(uid, bound_s)
+
+    def sweep_kill(self, uid: int, bound_s: float) -> bool:
         """``SIGKILL`` every process of ``uid`` until two scans find none (zombies aside) within
-        ``bound_s``. A stopped process dies of ``SIGKILL`` without being continued."""
+        ``bound_s``. A stopped process dies of ``SIGKILL`` without being continued. No bootout: SCRUB, which
+        boots out each uid itself after this, uses it, so no domain is booted out twice back to back (the second
+        answers rc 124 ``Domain is tearing down``: runs/s3-macos-2f-final/raw/Z1_Z2.txt)."""
         uid = check_target(uid, self.seams)
         return _sweep(uid, signal.SIGKILL, _gone, lambda p: p.state in (RUN, STOP), bound_s, self.seams)
 
@@ -341,7 +358,7 @@ def scrub(slot_uid: int, gw_uid: int, child_uid: int | None = None, *, seams: Pr
     appeared after END's own proof had passed and only SCRUB refused (levain-memory runs/s2-macos/RESULT_D1D2.md X1, X6), which is why the bootout is here and not in END."""
     u = UidProcs(seams)
     uids = [check_target(x, u.seams) for x in (slot_uid, gw_uid) + ((child_uid,) if child_uid is not None else ())]
-    u.kill(gw_uid, bound_s)        # its answer is the proof below, not this sweep's bool
+    u.sweep_kill(gw_uid, bound_s)  # its answer is the proof below, not this sweep's bool
     if u.seams.domain_out is not None:
         deadline = u.seams.clock() + bound_s
         for x in uids:
@@ -545,12 +562,19 @@ def darwin_seams() -> ProcSeams:
                      signal_uid=signal_as_uid, domain_out=darwin_bootout)
 
 
+#: ``launchctl bootout``'s exit while the domain's bootout is already under way (stderr ``Domain is tearing down``).
+BOOTOUT_TEARING_DOWN = 124
+
+
 def darwin_bootout(uid: int, timeout: float = V12_SECONDS) -> bool:
     """``launchctl bootout user/<uid>``, as root: ends the uid's per-user launchd domain and every agent in it
     (lsd, trustd, distnoted, secd), which launchd otherwise keeps for the uid after END's kill
-    [measured: levain-memory runs/s2-macos/RESULT_D1D2.md X2 + X6, 2026-10-20]. ``True`` only on exit 0, which it
-    gives on an already-empty domain too (same file, X3); an error or ``timeout`` is ``False``. The process scan
-    after it is still the proof of no process. Never use ``launchctl print user/<uid>`` as a check: it re-creates
+    [measured: levain-memory runs/s2-macos/RESULT_D1D2.md X2 + X6, 2026-10-20]. ``True`` on exit 0, which it
+    gives on an already-empty and on a never-created domain too (same file, X3; runs/s3-macos-2f-final Z2b), and on
+    124 ``Domain is tearing down``: a bootout of the domain is already under way (END's kill boots out the slot uid
+    and SCRUB boots it out again right after a short END; runs/s3-macos-2f-final/raw/Z1_Z2.txt measured 124 on a
+    bootout right after one). Any other exit, an error or ``timeout`` is ``False``. The process scan after it is
+    still the proof of no process. Never use ``launchctl print user/<uid>`` as a check: it re-creates
     an empty domain (X3)."""
     if type(uid) is not int or uid <= 0:
         raise Refused("bad-target-uid", repr(uid))
@@ -559,7 +583,7 @@ def darwin_bootout(uid: int, timeout: float = V12_SECONDS) -> bool:
                            env=child_env(), timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return False
-    return r.returncode == 0
+    return r.returncode in (0, BOOTOUT_TEARING_DOWN)
 
 
 def default_seams(host: HostOS | None = None) -> ProcSeams:
