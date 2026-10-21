@@ -51,7 +51,8 @@
   let focusDone = false;      // the deep link's card was signed or denied here
   let focusMisses = 0;        // listings the linked card was not in: three, and the link is let go
   const notes = new Map();    // request id -> [text, kind], kept across redraws
-  const writeIns = new Map(); // sign request id -> the write-in words being typed, kept across redraws
+  const writeIns = new Map(); // sign request id -> {sha256, words}: the write-in being typed, kept across redraws
+                              // for the version it was typed on only
 
   function draw(data) {
     rpId = data.rp_id || rpId;
@@ -66,6 +67,8 @@
     const asks = Array.isArray(data.questions) ? data.questions : [];
     // dispatch jobs a planner filed (levain dispatch): a contract to sign with a passkey, or a live job to cancel
     const jobs = Array.isArray(data.dispatch_pending) ? data.dispatch_pending : [];
+    // words typed for a request no longer listed (signed, denied, expired) go with it, so a reused id starts empty
+    for (const id of writeIns.keys()) if (!signs.some((r) => r.id === id)) writeIns.delete(id);
     const waiting = rows.length + gaps.length + signs.length + asks.length + jobs.length;
     const unread = (Number(data.sign_overflow) > 0 ? " \u00b7 " + Number(data.sign_overflow) + " more sign requests not shown" : "")
       + (Number(data.questions_overflow) > 0 ? " \u00b7 " + Number(data.questions_overflow) + " more questions not shown" : "")
@@ -418,7 +421,10 @@
     const wi = options.length && r.write_in && typeof r.write_in === "object" ? r.write_in : null;
     if (!r.refused) {
       if (!signers.length && !kept) show(signNote || "no passkey is enrolled for this name");
-      const go = (choice) => () => signWith(r, signers, say, show, actions, choice);
+      // release unfreezes a write-in frozen for signing: an option's tap at its passkey picker drops that ceremony;
+      // a tap while a ceremony runs does nothing (signAnswer refuses it too), so the frozen words stay frozen
+      let release = () => {};
+      const go = (choice) => () => { if (busy) return; release(); signWith(r, signers, say, show, actions, choice); };
       if (!options.length) {
         const b = el("button", "allow", "sign with Face ID");
         b.type = "button";
@@ -442,14 +448,26 @@
         box.maxLength = Number(wi.max) || 200;
         box.placeholder = "or write your own answer";
         box.setAttribute("aria-label", "your own answer to " + (r.title || r.id));
-        box.value = writeIns.get(r.id) || "";
-        box.addEventListener("input", () => writeIns.set(r.id, box.value));
+        const draft = writeIns.get(r.id);
+        if (draft && draft.sha256 !== (r.sha256 || "")) writeIns.delete(r.id);   // typed on a replaced version
+        box.value = writeIns.has(r.id) ? writeIns.get(r.id).words : "";
+        box.addEventListener("input", () => writeIns.set(r.id, { sha256: r.sha256 || "", words: box.value }));
         const b = el("button", "allow option", "(" + wi.key + ") sign my words");
         b.type = "button";
         b.disabled = !usable || !signers.length;
+        const frozen = el("div", "line frozen");
+        // the tap freezes the words until the ceremony ends (a passkey picker included): what is sent is the line
+        // shown here, never the box as edited later. Trimmed, since autocorrect's trailing space is refused
         b.addEventListener("click", () => {
-          if (!box.value) return show("type your answer first", "bad");
-          signWith(r, signers, say, show, actions, wi.key, box.value);
+          const w = box.value.trim();
+          if (!w) return show("type your answer first", "bad");
+          box.value = w;
+          box.readOnly = box.disabled = b.disabled = true;
+          frozen.textContent = "signing: " + wi.line + w;
+          box.after(frozen);
+          release = () => { box.readOnly = box.disabled = false; b.disabled = !usable || !signers.length;
+                            frozen.remove(); release = () => {}; };
+          signWith(r, signers, say, show, actions, wi.key, w, () => release());
         });
         actions.append(box, b);
       }
@@ -469,25 +487,27 @@
     return card;
   }
 
-  function signWith(r, signers, say, show, actions, choice, words) {
+  // release (a write-in's): unfreezes its words when the ceremony ends without a signature
+  function signWith(r, signers, say, show, actions, choice, words, release) {
     const local = mine();
     const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
-    if (known.length === 1) return signAnswer(r, known[0], local[known[0]], say, choice, words);
-    if (!known.length && signers.length === 1) return signAnswer(r, signers[0], null, say, choice, words);
+    if (known.length === 1) return signAnswer(r, known[0], local[known[0]], say, choice, words, release);
+    if (!known.length && signers.length === 1) return signAnswer(r, signers[0], null, say, choice, words, release);
     const choices = known.length ? known : signers;
     show("more than one passkey is enrolled for this name; pick the one this phone holds:");
     for (const old of actions.querySelectorAll(".pick")) old.remove();
     for (const fp of choices) {
       const p = el("button", "quiet pick", fp.slice(0, 18) + "…");
       p.type = "button";
-      p.addEventListener("click", () => signAnswer(r, fp, known.length ? local[fp] : null, say, choice, words));
+      p.addEventListener("click", () => signAnswer(r, fp, known.length ? local[fp] : null, say, choice, words, release));
       actions.appendChild(p);
     }
   }
 
-  function signAnswer(r, fp, rawId, say, choice, words) {
-    if (busy) return;
+  function signAnswer(r, fp, rawId, say, choice, words, release) {
+    if (busy) { if (release) release(); return; }
     busy++;
+    let signed = false;
     const base = "/sign/" + encodeURIComponent(r.id) + "/";
     const body = { signer_fp: fp, request_sha256: r.sha256 };
     if (choice !== undefined) body.choice = choice;
@@ -509,6 +529,7 @@
           if (!a.ok) return say("not signed: " + why(a), "bad");
           last = "signed " + (a.body.choice ? "(" + a.body.choice + ") " : "") + (r.title || r.id);
           if (r.id === focus) focusDone = true;
+          signed = true;
           writeIns.delete(r.id);
           say("signed" + (a.body.choice ? " (" + a.body.choice + ")" : "") + " · by " + a.body.signer_fp + " in "
               + a.body.namespace, "ok");
@@ -518,7 +539,7 @@
         say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was signed", "bad");
       });
     }).catch((e) => say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
-      .finally(() => { busy--; setTimeout(load, 1500); });
+      .finally(() => { busy--; if (!signed && release) release(); setTimeout(load, 1500); });
   }
 
   function signDeny(r, say) {

@@ -277,3 +277,16 @@ def test_a_write_in_signs_as_the_reserved_key_and_bad_words_are_refused(tmp_path
         parse_choice(signed)
     with pytest.raises(ValueError, match="U\\+200B"):
         parse_choice((MESSAGE + "\n" + choice_line("*", "ship\u200bit")).encode(), write_in=True)
+
+
+def test_the_page_keeps_write_in_words_for_their_version_only_and_sends_them_trimmed() -> None:
+    """Typed words belong to the version of the request they were typed on: a replaced file (same id, new sha256)
+    or a request gone from the listing drops them. The page sends the words trimmed (autocorrect's trailing space
+    is not his answer), and the server's no-edge-space rule stays as strict."""
+    js = (Path(__file__).parents[1] / "levain" / "templates" / "web" / "phone.js").read_text()
+    card = js[js.index("function signCard("):js.index("function signWith(")]
+    assert 'writeIns.set(r.id, { sha256: r.sha256 || "", words: box.value })' in card
+    assert 'draft.sha256 !== (r.sha256 || "")) writeIns.delete(r.id)' in card
+    assert "const w = box.value.trim();" in card and "wi.key, w, " in card
+    draw = js[js.index("function draw("):js.index("function questionCard(")]
+    assert "if (!signs.some((r) => r.id === id)) writeIns.delete(id)" in draw

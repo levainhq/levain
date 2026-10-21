@@ -116,6 +116,7 @@ textarea.words { width: 100%; box-sizing: border-box; margin-top: var(--sp-4); f
 .req.sign.linked { outline: 2px solid currentColor; outline-offset: 2px; }   /* the card a #sign=<id> link opened on */
 .req.sign .actions .option { flex: 1 1 100%; text-align: left; white-space: pre-wrap; }   /* a choice: one option per row, read whole, spaces as signed */
 .req.sign .lines .line { white-space: pre-wrap; overflow-wrap: anywhere; }              /* each appended line exactly as signed */
+.req.sign .actions .frozen { flex-basis: 100%; white-space: pre-wrap; overflow-wrap: anywhere; }  /* the write-in line being signed, frozen */
 .req.sign .actions .option.recommended { box-shadow: 0 0 0 3px var(--accent); }        /* the requester's suggestion: marked, never selected */
 .req.sign .actions .option .rec { display: block; margin-top: var(--sp-2); font-size: 12px; font-weight: 700;
                                   letter-spacing: 0.04em; text-transform: uppercase; }
