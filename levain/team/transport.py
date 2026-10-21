@@ -265,6 +265,7 @@ class GitLedger:
     def __init__(self, repo: Repo):
         self.warnings = WARNINGS
         self._dcache: tuple[str, object] | None = None
+        self._acache: dict[str, tuple[list[tuple[str, str]], dict[str, str]]] | None = None   # `_appended`, per sync
         self.repo = repo
         self.base = repo.base
         self.wt = repo.worktree
@@ -1718,8 +1719,12 @@ class GitLedger:
         diff text (file content ``++ b/<path>`` renders as a ``+++ b/`` header, and a parser of the text then files the
         lines after it under a path of the author's choosing: code L3 r5). Returns ([(path, line)], {path: why}): a path
         is in the first only when it stays a regular file whose new bytes start with every byte of its old ones and add
-        a non-empty suffix of exactly as many lines as git counts added, with none removed; any other path is in the
-        second, with the reason."""
+        a non-empty suffix of exactly as many lines as git counts added, with none removed (or, after a last line left
+        without its newline, a suffix that starts by closing it, which git counts as that one line removed and added);
+        any other path is in the second, with the reason. A commit id names fixed content, so within one sync each id
+        is read once."""
+        if self._acache is not None and c in self._acache:
+            return self._acache[c]
         rows = git(["diff-tree", "-r", "-z", "--raw", "--no-abbrev", "--no-renames", "--no-commit-id", c],
                    self.wt).stdout.split("\0")
         counts: dict[str, tuple[str, str]] = {}
@@ -1728,7 +1733,8 @@ class GitLedger:
             parts = row.split("\t", 2)
             if len(parts) == 3:
                 counts[parts[2]] = (parts[0], parts[1])
-        zero = "0" * 40
+        def absent(oid: str) -> bool:     # the all-zero id at whatever width the repository hashes (SHA-1 or SHA-256)
+            return not oid.strip("0")
         lines: list[tuple[str, str]] = []
         bad: dict[str, str] = {}
         changes = []
@@ -1741,24 +1747,48 @@ class GitLedger:
             else:
                 changes.append((meta, path))
         # only regular files' objects are read, so a submodule's commit id is never asked for as a blob
-        blobs = _blobs(self.wt, list(dict.fromkeys(s for meta, _p in changes for s in meta[2:4] if s != zero)))
+        blobs = _blobs(self.wt, list(dict.fromkeys(s for meta, _p in changes for s in meta[2:4] if not absent(s))))
         for meta, path in changes:
-            old = blobs[meta[2]] if meta[2] != zero else b""
+            old = blobs[meta[2]] if not absent(meta[2]) else b""
             new = blobs[meta[3]]
             suffix = new[len(old):]
-            n = suffix.count(b"\n") + (0 if suffix.endswith(b"\n") else 1)
-            if not new.startswith(old) or not suffix:
+            # a last line left without its newline (a torn write) is closed by the append's leading newline, which git
+            # counts as that line removed and added again; any other first byte would change that line
+            torn = bool(old) and not old.endswith(b"\n")
+            body = suffix[1:] if torn else suffix
+            n = body.count(b"\n") + (0 if body.endswith(b"\n") else 1)
+            if not new.startswith(old) or not body or (torn and not suffix.startswith(b"\n")):
                 bad[path] = "changes or removes bytes already in the file"
-            elif counts.get(path) != (str(n), "0"):
+            elif counts.get(path) != ((str(n + 1), "1") if torn else (str(n), "0")):
                 bad[path] = f"appends {n} line(s) where git counts {'/'.join(counts.get(path, ('?', '?')))}"
             else:
                 try:
-                    texts = suffix.decode("utf-8").split("\n")
+                    texts = body.decode("utf-8").split("\n")
                 except UnicodeDecodeError:
                     bad[path] = "appends bytes that are not UTF-8"
                     continue
                 lines.extend((path, t) for t in (texts[:-1] if texts[-1] == "" else texts))
+        if self._acache is not None and len(c) >= 40 and not c.strip("0123456789abcdef"):     # an id, not a ref name
+            self._acache[c] = (lines, bad)
         return lines, bad
+
+    def _ledger_wrong(self, c: str, *, entries: bool) -> dict[str, str]:
+        """{ledger path: why} for every ledger path commit ``c`` does anything to but append: the ONE test of whether
+        sync may act on ``c`` at all. Every place that moves, re-signs or replays a commit asks it first, so no reader of
+        ``_added_lines`` takes a commit it refuses as one that appends nothing (code L3 r6 codex MED: a held commit that
+        replaced a line was cherry-picked and published). With ``entries``, also every ledger path whose appended lines
+        are not all valid entries of the folder they are filed under: what a re-seal needs, since it writes each line
+        as an entry (a pick carries the bytes as they are, and levain's own recovery commits a torn line)."""
+        lines, bad = self._appended(c)
+        wrong = {p: why for p, why in bad.items() if p.startswith("ledger/")}
+        if entries:
+            added: dict[str, list[str]] = {}
+            for path, text in lines:
+                added.setdefault(path, []).append(text)
+            for p, texts in added.items():
+                if p.startswith("ledger/") and not self._entry_lines_ok(p, texts):
+                    wrong[p] = "appends a line that is not a valid entry of the folder it is filed under"
+        return wrong
 
     def _held_why(self, why: str, d) -> str:
         """The hold message for the reason ``_pick_why`` (or the replay's own read-back) gave."""
@@ -1786,11 +1816,9 @@ class GitLedger:
         throw after earlier lines were written. PROJECT.md is passed over: it is regenerated, never carried."""
         from . import tenure as T
         lines, bad = self._appended(c)
-        added: dict[str, list[str]] = {}
-        for path, text in lines:
-            added.setdefault(path, []).append(text)
-        other = [p for p in [*bad, *added] if p not in (T.TEAM_FILE, T.TENURE_FILE, CANON_FILE)
-                 and (p in bad or not self._entry_lines_ok(p, added[p]))]
+        wrong = self._ledger_wrong(c, entries=True)
+        other = [p for p in dict.fromkeys([*bad, *(p for p, _t in lines)])
+                 if p not in (T.TEAM_FILE, T.TENURE_FILE, CANON_FILE) and (p in wrong or not p.startswith("ledger/"))]
         return ", ".join(other[:5])
 
     @staticmethod
@@ -1811,7 +1839,8 @@ class GitLedger:
 
     def _refuse_unsplittable(self, commits: list[str]) -> None:
         """Before any ref moves: an own commit mixing a team change with anything but appended ledger lines cannot be
-        split without losing a half, so the sync stops by name (levain never writes one; it was made by hand)."""
+        split without losing a half, and one that changes a ledger file other than by appending to it is never
+        published (``_ledger_wrong``), so the sync stops by name (levain writes neither; it was made by hand)."""
         from . import tenure as T
         for c in commits:
             touched = set(git(["diff-tree", "--no-commit-id", "--name-only", "-r", c], self.wt).stdout.split())
@@ -1821,6 +1850,13 @@ class GitLedger:
                                 "split it without losing one half; nothing was changed. See it with "
                                 f"`git -C {self.wt} show {c[:10]}`; make each change again with the levain CLI, then "
                                 "take that commit off the branch with git")
+            wrong = self._ledger_wrong(c, entries=False) if any(p.startswith("ledger/") for p in touched) else {}
+            if wrong:
+                p, why = next(iter(wrong.items()))
+                raise TeamError(f"not pushed: the local commit {c[:10]} changes {', '.join(list(wrong)[:5])} other "
+                                f"than by appending lines ({p}: {why}), and sync never publishes that; "
+                                f"nothing was changed. See it with `git -C {self.wt} show {c[:10]}`; make each entry "
+                                "again with the levain CLI, then take that commit off the branch with git")
 
     def _strip_team(self, c: str, root: str | None, pending: list[dict]) -> bool:
         """Queue own team/tenure commit ``c``'s change as a pending op (re-landed from the counted state, never replayed
@@ -1846,16 +1882,11 @@ class GitLedger:
         half as an op, never as its text. The lines are what ``c`` appends, read from its blobs; a ledger path it does
         anything else to, or an appended line that is not a valid entry of the folder it is filed under, fails the
         re-seal by name before any file is written."""
-        lines, bad = self._appended(c)
-        added: dict[str, list[str]] = {}
-        for path, text in lines:
-            added.setdefault(path, []).append(text)
-        wrong = [p for p in [*bad, *added] if p.startswith("ledger/") and (p in bad or not self._entry_lines_ok(
-            p, added[p]))]
+        wrong = self._ledger_wrong(c, entries=True)
         if wrong:
-            return subprocess.CompletedProcess([], 1, "", f"{c[:10]} changes {', '.join(wrong[:5])} other than by "
-                                                          "appending valid entry lines")
-        lines = [(p, t) for p, t in lines if p.startswith("ledger/")]
+            return subprocess.CompletedProcess([], 1, "", f"{c[:10]} changes {', '.join(list(wrong)[:5])} other than "
+                                                          "by appending valid entry lines")
+        lines = self._added_lines(c)
         self._dcache = None
         tips = {f.rel: f.last_hash for f in self.ledger().files}
         sealed_lines = []
@@ -1910,10 +1941,27 @@ class GitLedger:
             # onto the published chain, and one that supersedes or refers to a held entry waits with it
             kept: dict[str, list[str]] = {}
             kept_ids: set[str] = set()
+
+            def refuse(c: str, ids: set[str], wrong: dict[str, str]) -> None:
+                # it stays held, named with the one remedy, and later entries still replay (no `break`)
+                p, w = next(iter(wrong.items()))
+                self.warnings.append(
+                    f"a held commit {c[:10]} ({', '.join(sorted(ids)[:5]) or 'no entry id'}) changes "
+                    f"{', '.join(list(wrong)[:5])} other than by appending valid entry lines ({p}: {w}), so sync never "
+                    f"publishes it. See it with `git -C {self.wt} show {c[:10]}`; record each entry again with the "
+                    f"levain CLI, then drop it with `git -C {self.wt} update-ref -d {self._held_ref(root, c)}`")
+                kept_ids.update(ids)
+
             for c in order:
                 lines = self._added_lines(c)
                 objs = [T._parsed(text) for _p, text in lines]
                 ids = {str(o.get("id")) for o in objs if o.get("id")}
+                # asked before anything reads its lines as all it changes: a commit held by an earlier build that
+                # replaces, removes or forges a ledger line is never picked or re-sealed (code L3 r6 codex MED)
+                wrong = self._ledger_wrong(c, entries=False)
+                if wrong:
+                    refuse(c, ids, wrong)
+                    continue
                 why = self._pick_why(d, c)
                 if why is None and any((set(o.get("supersedes") or []) | set(o.get("refs") or [])) & kept_ids
                                        for o in objs):
@@ -1940,6 +1988,12 @@ class GitLedger:
                         if ids and ids <= set(self.ledger().by_id):
                             # replayed by a sync that died before deleting the ref: already on the branch
                             git(["update-ref", "-d", self._held_ref(root, c)], self.wt, check=False)
+                            continue
+                        # what the re-seal would refuse is refused here, before a touch is asked for, so no sync asks
+                        # for a touch it cannot use (code L3 r6 complement LOW)
+                        wrong = self._ledger_wrong(c, entries=True)
+                        if wrong:
+                            refuse(c, ids, wrong)
                             continue
                     if named:
                         for o in objs:
@@ -2330,6 +2384,17 @@ class GitLedger:
 
     def _sync_in_op(self, *, push: bool, timeout: float, net_timeout: float, lock_timeout: float,
                     retries: int = _PUSH_RETRIES) -> str:
+        """One sync, with ``_appended`` read once per commit id for its lifetime (code L3 r6 complement LOW: each
+        caller re-read the same commit's blobs)."""
+        self._acache = {}
+        try:
+            return self._sync_body(push=push, timeout=timeout, net_timeout=net_timeout, lock_timeout=lock_timeout,
+                                   retries=retries)
+        finally:
+            self._acache = None
+
+    def _sync_body(self, *, push: bool, timeout: float, net_timeout: float, lock_timeout: float,
+                   retries: int) -> str:
         """Fetch, rebase, optionally push. Must be called WITHOUT the worktree lock held.
 
         Network I/O runs under a separate ``net`` lock, so a hook reading the worktree never waits on a

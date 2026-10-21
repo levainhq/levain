@@ -6,6 +6,7 @@ PROTOCOL.u2f), with the flags byte read from a file, used by git through ``gpg.s
 them; no hardware is touched, so what a real touch adds (the person at the key) is outside this test.
 """
 import base64
+import json
 import os
 import shutil
 import struct
@@ -60,8 +61,8 @@ def team(*args, repo: Path) -> int:
     return levain_main(["team", *args, "--repo", str(repo)])
 
 
-def project(tmp: Path) -> Path:
-    git("init", "-q", "--bare", "--initial-branch=main", "origin.git", cwd=tmp)
+def project(tmp: Path, *init_args: str) -> Path:
+    git("init", "-q", "--bare", "--initial-branch=main", *init_args, "origin.git", cwd=tmp)
     git("clone", "-q", str(tmp / "origin.git"), "ana", cwd=tmp)
     ana = tmp / "ana"
     git("config", "user.email", "ana@ex.com", cwd=ana)
@@ -426,3 +427,59 @@ def test_a_team_change_committed_with_a_forged_diff_header_in_an_entry_file_refu
     assert "AND ledger/ana/forge.jsonl" in capsys.readouterr().err
     assert git("rev-parse", "HEAD", cwd=wt) == head and not git("status", "--porcelain", cwd=wt).strip()
     assert ledger_tip(tmp_path) == tip
+
+
+def test_a_first_entry_in_a_sha256_repository_syncs_and_is_held_by_name(tmp_path, monkeypatch, capsys) -> None:
+    # reproduced on 1583696f (teampres/fix6/repro_before.txt (S)): a new ledger file's old id is 64 zeroes, which was not
+    # read as "no file", so the sync asked git for that object and stopped on "missing"
+    from levain.team import entry as E
+    from levain.team.ledger_api import open_ledger
+    from levain.team.transport import Repo
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "ana@test", "-f", str(tmp_path / "k")],
+                   check=True, capture_output=True)
+    ana = project(tmp_path, "--object-format=sha256")
+    assert team("init", "--project", "p", "--owner", "ana", "--member", "ana=ana@ex.com", "--allow-file-keys",
+                "--signing-key", str(tmp_path / "k.pub"), repo=ana) == 0
+    assert team("file-keys", "refuse", repo=ana) == 0
+    open_ledger(Repo.discover(ana)).append(E.build("ana", "decision", kind="ruling", owner="ana", paths=["a.py"],
+                                                   words="first ever", agent="human"), push=False)
+    monkeypatch.setattr(tenure, "_REQUIRE_PRESENCE", True)
+    capsys.readouterr()
+    assert team("sync", repo=ana) == 0
+    out = capsys.readouterr()
+    assert "missing" not in out.err and "kept back under refs/levain/held/ (" in out.err + out.out
+
+
+def test_a_held_commit_that_replaces_a_ledger_line_stays_held_by_name(tmp_path, monkeypatch, capsys) -> None:
+    # reproduced on 1583696f (teampres/fix6/repro_before.txt (X)): a held commit (the shape an earlier build could leave)
+    # that replaced the one line of an entry file with a ruling read as "appends nothing", skipped every check, and the
+    # replay cherry-picked and published it
+    from levain.team import entry as E
+    from levain.team.ledger_api import open_ledger
+    from levain.team.transport import Repo
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "ana@test", "-f", str(tmp_path / "k")],
+                   check=True, capture_output=True)
+    ana = project(tmp_path)
+    assert team("init", "--project", "p", "--owner", "ana", "--member", "ana=ana@ex.com", "--allow-file-keys",
+                "--signing-key", str(tmp_path / "k.pub"), repo=ana) == 0
+    assert record(ana, "first") == 0
+    assert team("file-keys", "refuse", repo=ana) == 0
+    gl = open_ledger(Repo.discover(ana))
+    f = next((gl.wt / "ledger" / "ana").glob("*.jsonl"))
+    o = E.seal(E.build("ana", "decision", kind="ruling", owner="ana", paths=["a.py"], words="replaced",
+                       agent="human"), "")
+    f.write_text(json.dumps(o, sort_keys=True) + "\n")
+    git("add", "-A", cwd=gl.wt)
+    before = git("rev-parse", "HEAD", cwd=gl.wt).strip()
+    gl._commit("levain team: decision")
+    c = git("rev-parse", "HEAD", cwd=gl.wt).strip()
+    ref = gl._held_ref(gl.pinned_root, c)
+    git("update-ref", ref, c, cwd=gl.wt)
+    git("reset", "-q", "--hard", before, cwd=gl.wt)
+    monkeypatch.setattr(tenure, "_REQUIRE_PRESENCE", True)
+    capsys.readouterr()
+    assert team("sync", repo=ana) == 0
+    out = capsys.readouterr()
+    assert f"update-ref -d {ref}" in out.err + out.out
+    assert "replaced" not in git("log", "-p", "levain-team-ledger", cwd=tmp_path / "origin.git")
+    assert git("rev-parse", ref, cwd=gl.wt).strip() == c
