@@ -70,8 +70,9 @@ __all__ = [
     "AUTHORISE_FORMAT", "AUTHORISE_KEYS", "DISPATCH_AUTHORISE_NAMESPACE", "MAX_BLOB_BYTES", "MAX_ENTRIES",
     "MAX_TOTAL_BYTES", "ArtifactRecord", "Change", "ChangeSet", "Floor", "GitFault", "Landing", "artifact_digest",
     "artifact_problem",
-    "authorise_message", "authorise_payload", "authorise_refusal", "branch_problem", "change_set",
-    "criteria_failure", "floor", "land", "revalidation_problem", "stage_commit", "staged_ref",
+    "authorise_message", "authorise_payload", "authorise_payload_for", "authorise_refusal", "branch_problem",
+    "change_set",
+    "criteria_failure", "floor", "land", "revalidation_problem", "stage_commit", "staged_ref", "sweep_staged",
 ]
 
 DISPATCH_AUTHORISE_NAMESPACE = "levain-dispatch-authorise"
@@ -443,6 +444,28 @@ def authorise_payload(job: Job, record: ArtifactRecord, *, onto: str, signer_fp:
 
 def authorise_message(payload: Mapping[str, Any]) -> bytes:
     return canonical_bytes(dict(payload))
+
+
+def authorise_payload_for(store: JobStore, job_id: str, *, run: int, onto: str, signer_fp: str) -> dict[str, str]:
+    """The authorise payload for run ``run`` of job ``job_id`` onto ``onto``, built by the SERVER from the job
+    store's own record of that run (:meth:`JobStore.run_record`) and dated on the store's clock
+    (:meth:`JobStore.stamp`): a client signs what this returns and never supplies an artifact or contract digest. A
+    job that is not verified or recommended, a run with no passing record, or a branch :func:`branch_problem` refuses
+    is a :class:`DispatchError`, before anything is signed. Raises :class:`GitFault` when git cannot run."""
+    job = store.get(job_id)
+    if job is None:
+        raise TransitionRefused(f"no dispatch job {str(job_id)[:40]!r}")
+    if job.state not in ("verified", "recommended"):
+        raise TransitionRefused(f"job {job.id} is {job.state}; only a verified or recommended job is authorised")
+    if type(run) is not int or not 0 <= run < 64:
+        raise DispatchError("the run is an integer from 0 to 63")
+    record = store.run_record(job.id, run)
+    if record is None or record.verifier.get("result") != "pass":
+        raise DispatchError(f"run {run} of job {job.id} has no verified record")
+    problem = branch_problem(job.repo, onto)
+    if problem is not None:
+        raise DispatchError(problem)
+    return authorise_payload(job, record, onto=onto, signer_fp=signer_fp, signed_at=parse_stamp(store.stamp()))
 
 
 def authorise_refusal(payload: Any, signature: Any, authority: AuthoritySnapshot, job: Job, *, run: int,
@@ -845,6 +868,38 @@ def _delete_staged(repo: str, job_id: str) -> list[str]:
         ref, _, sha = line.rpartition(" ")
         if _git(repo, "update-ref", "--no-deref", "-d", ref, sha).returncode != 0:
             kept.append(ref)
+    return kept
+
+
+_STAGED_PREFIX = "refs/heads/levain/dispatch/"
+
+
+def sweep_staged(store: JobStore, repo: str) -> list[str]:
+    """Delete the staged refs of every job of ``repo`` that ended without an adoption (``failed`` or ``cancelled``,
+    by any writer: a lapse, a cancel, a verifier failure); returns a line for each ref git would not delete, and one
+    when git cannot run here, never a raise (a ref left behind is clutter, nothing worse). One listing of the
+    repository's staged refs; a ref of a job this store does not hold, or of a live or adopted job, is left. A
+    repository that is no longer a directory has no refs to sweep. Runs when a verb runs, never on its own."""
+    if not os.path.isdir(repo):
+        return []
+    ended = {j.id for j in store.list(repo=repo) if j.state in ("failed", "cancelled")}
+    if not ended:
+        return []
+    try:
+        out = _git_ok(repo, "for-each-ref", "--format=%(refname) %(objectname)", _STAGED_PREFIX)
+    except GitFault as exc:
+        return [f"the staged refs in {repo} could not be swept: {exc}"]
+    kept = []
+    for line in out.decode("utf-8", "surrogateescape").splitlines():
+        ref, _, sha = line.rpartition(" ")
+        if ref[len(_STAGED_PREFIX):].partition("/")[0] not in ended:
+            continue
+        try:
+            deleted = _git(repo, "update-ref", "--no-deref", "-d", ref, sha).returncode == 0
+        except GitFault:
+            deleted = False
+        if not deleted:
+            kept.append(f"a staged ref git would not delete: {ref}")
     return kept
 
 

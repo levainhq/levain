@@ -713,23 +713,57 @@ class JobStore:
         assert out is not None
         return out
 
-    def _planner(self, job_id: Any, capability: Any, to_state: str, cause: str) -> Job:
+    @staticmethod
+    def _capability_problem(conn: sqlite3.Connection, job: Job, capability: Any) -> None:
+        stored = conn.execute("SELECT capability_sha256 FROM jobs WHERE id = ?", (job.id,)).fetchone()[0]
+        if not hmac.compare_digest(_capability_sha(capability), stored):
+            raise CapabilityRefused(f"that capability is not job {job.id}'s")
+
+    def _planner(self, job_id: Any, capability: Any, to_state: str, cause: str, evidence: str = "") -> Job:
         with self._swept() as (conn, stamp):
             job = self._must_load(conn, job_id)
-            stored = conn.execute("SELECT capability_sha256 FROM jobs WHERE id = ?", (job.id,)).fetchone()[0]
-            if not hmac.compare_digest(_capability_sha(capability), stored):
-                raise CapabilityRefused(f"that capability is not job {job.id}'s")
+            self._capability_problem(conn, job, capability)
             if to_state == "recommended" and job.state != "verified":
                 raise TransitionRefused(f"recommend is only for a verified job (job is {job.state})")
-            self._apply(conn, job.id, to_state, cause, stamp)
+            self._apply(conn, job.id, to_state, cause, stamp, evidence)
             out = self._load(conn, job.id)
         assert out is not None
         return out
 
-    def recommend(self, job_id: str, capability: str) -> Job:
+    def check_capability(self, job_id: str, capability: str) -> Job:
+        """Job ``job_id`` when ``capability`` is its filing planner's, else :class:`CapabilityRefused`; writes no
+        transition. The planner door's check for a verb that moves the job by another authority (a land)."""
+        with self._swept() as (conn, _stamp):
+            job = self._must_load(conn, job_id)
+            self._capability_problem(conn, job, capability)
+        return job
+
+    def recommend(self, job_id: str, capability: str, *, onto: str | None = None, run: int | None = None) -> Job:
         """The planner's RECOMMENDED label on a verified job, on the planner channel (its capability). Advisory: it
-        confers no authority; only a human signature or a human-signed adoption rule authorises a result."""
-        return self._planner(job_id, capability, "recommended", "planner_recommends")
+        confers no authority; only a human signature or a human-signed adoption rule authorises a result. ``onto``
+        and ``run`` are the planner's PROPOSAL of the branch and the run a human authorises, kept as the
+        transition's evidence (``{"onto", "run"}``, each only when given): the human's signature then binds them,
+        and a rule land ignores them. A branch :func:`levain.dispatch.adopt.branch_problem` refuses, or a run outside
+        the template's 0..k-1, is refused here, before anything is written; :class:`levain.dispatch.adopt.GitFault`
+        when git cannot run."""
+        proposal: dict[str, Any] = {}
+        if onto is not None or run is not None:
+            from levain.dispatch import adopt
+
+            job = self.get(job_id)
+            if job is not None:
+                if run is not None:
+                    k = job.contract.template.k
+                    if type(run) is not int or not 0 <= run < k:
+                        raise TransitionRefused(f"run {str(run)[:8]} is not one of the template's runs 0..{k - 1}")
+                    proposal["run"] = run
+                if onto is not None:
+                    problem = adopt.branch_problem(job.repo, onto)
+                    if problem is not None:
+                        raise TransitionRefused(problem)
+                    proposal["onto"] = onto
+        evidence = json.dumps(proposal, sort_keys=True) if proposal else ""
+        return self._planner(job_id, capability, "recommended", "planner_recommends", evidence)
 
     def cancel_by_planner(self, job_id: str, capability: str) -> Job:
         """The filing planner cancels its job (its capability), at any state before authorised: cancelling only
@@ -925,9 +959,9 @@ class JobStore:
         if out.state == "failed" and (lost is None or record is not None):
             # a failed job can never land, so its staged refs (this run's and every run that passed before it) are
             # clutter in the operator's repo. This covers the failures this writer makes, and a job this writer staged
-            # for and then found failed by another; a job that ends by lapse or cancel is swept by F11-s2's land verb.
-            # Deleted once the failure is durable; a record keeps its sha, and only ever is read. A ref git keeps, or
-            # git not answering, leaves clutter and nothing worse, so it never raises
+            # for and then found failed by another; a job that ends by lapse or cancel is swept when a land or a
+            # list runs (adopt.sweep_staged). Deleted once the failure is durable; a record keeps its sha, and only
+            # ever is read. A ref git keeps, or git not answering, leaves clutter and nothing worse, so it never raises
             try:
                 adopt._delete_staged(repo, job.id)
             except adopt.GitFault:

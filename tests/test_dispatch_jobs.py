@@ -278,6 +278,39 @@ def test_recommend_with_a_wrong_capability_is_a_capability_refusal_first(store, 
         store.recommend(job.id, "not-the-capability")
 
 
+def test_recommend_keeps_the_proposed_branch_and_run_as_its_evidence(store, repo):
+    import json
+
+    job, cap = at_state(store, repo, "verified")
+    out = store.recommend(job.id, cap, onto="main", run=1)
+    assert (out.history[-1].to_state, json.loads(out.history[-1].evidence)) == ("recommended", {"onto": "main",
+                                                                                               "run": 1})
+
+
+def test_a_recommend_with_no_proposal_writes_no_evidence(store, repo):
+    job, cap = at_state(store, repo, "verified")
+    assert store.recommend(job.id, cap).history[-1].evidence == ""
+
+
+@pytest.mark.parametrize("over, match", [
+    ({"onto": "refs/heads/main"}, "bare name"), ({"onto": "levain/x"}, "under levain/"),
+    ({"onto": "no-such-branch"}, "not a branch here"), ({"run": 2}, r"runs 0\.\.1"), ({"run": True}, r"runs 0\.\.1"),
+])
+def test_a_bad_proposal_is_refused_at_recommend_and_nothing_is_written(store, repo, over, match):
+    job, cap = at_state(store, repo, "verified")
+    with pytest.raises(TransitionRefused, match=match):
+        store.recommend(job.id, cap, **over)
+    assert store.get(job.id).state == "verified"
+
+
+def test_check_capability_reads_and_writes_nothing(store, repo):
+    job, cap = at_state(store, repo, "verified")
+    assert store.check_capability(job.id, cap).id == job.id
+    with pytest.raises(CapabilityRefused):
+        store.check_capability(job.id, cap + "x")
+    assert store.get(job.id).history == job.history
+
+
 def test_another_jobs_capability_is_refused(store, repo):
     one, cap1 = file_job(store, repo)
     two, _cap2 = file_job(store, repo, write=["src/b.py"])
