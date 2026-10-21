@@ -8,7 +8,6 @@ keeps the draft path honest; it is not a lock on the key, which any process of t
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -101,6 +100,8 @@ def cmd_draft(args) -> int:
 
 
 def _promote(args, store, v: dict) -> None:
+    import os
+
     from levain.coordinator import teamdrafts as T
 
     if v["state"] not in ("drafted", "promoting"):
