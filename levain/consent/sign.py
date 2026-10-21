@@ -53,7 +53,8 @@ The rules, each a refusal before anything is signed:
     private-use or unassigned code point is listed as refused and never signed, since each can render differently
     from its bytes; no message holds :data:`CHOICE_MARK` (only levain writes the choice line, so a plain statement
     can never verify as a choice); a choice request has 2 to :data:`OPTIONS_MAX` options, each key
-    ``[a-z0-9]{1,8}`` and each text one line (no newline or tab) of at most 200 characters, keys and texts distinct;
+    ``[a-z0-9]{1,8}`` and each text one line (no newline or tab, no space at either end) of at most 200 characters,
+    keys and texts distinct;
   - the operator signs the option tapped: the challenge names the option's key, and the challenge, the answer and the
     files written are bound to that key; a challenge for a key the request does not offer, or a choice request's
     challenge naming none, is refused;
@@ -82,7 +83,12 @@ Known edges:
   - two phone servers on one queue dir can race a deny against a sign (the lock is per process): one server per
     queue is the supported shape;
   - identical messages in one namespace share a challenge and so a signature: the caller embeds a unique id (a
-    report id, a period) in the message, and its verifier checks it;
+    report id, a period) in the message, and its verifier checks it. A choice is no exception: "release 1.0?" with
+    "(a): yes" signed once verifies on every later request with the same message;
+  - a choice's verifier compares the whole message AND the chosen option's key and text with its own copy: a
+    same-uid writer can reorder or swap option texts before the listing, and the signature is then real over the
+    text the operator tapped, under a key the caller filed for another text;
+  - the title and requester are shown on the card but are not signed: the page says so;
   - look-alike letters and NFC vs NFD forms are not refused: a caller ships the exact message bytes as a file, never
     re-typed or normalised.
 """
@@ -200,6 +206,8 @@ def _options_problem(options: object) -> "tuple[tuple[tuple[str, str], ...], str
             return (), f"option key {key[:20]!r} is not [a-z0-9]{{1,8}}"
         if not text or len(text) > _TEXT_MAX:
             return (), f"option {key}'s text is empty or over {_TEXT_MAX} characters"
+        if text != text.strip(" "):
+            return (), f"option {key}'s text begins or ends with a space, which a button does not show"
         hidden = unshowable.first_hidden(text, allow="")
         if hidden is not None:
             return (), (f"option {key}'s text holds U+{ord(hidden[1]):04X} "

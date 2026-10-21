@@ -107,6 +107,9 @@ def _cmd(args: argparse.Namespace) -> int:
     from levain.consent.queue import default_queue_dir
 
     qdir = args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
+    if not qdir.is_dir():
+        print(f"levain consent signed-answers: no queue directory at {qdir}; pass --queue-dir", file=sys.stderr)
+        return 1
     if args.value is not None:
         try:
             write_setting(qdir, args.value)
