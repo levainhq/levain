@@ -1570,14 +1570,18 @@ def could_not_run(tier: str | None, what: str) -> dict[str, Any]:
 # limits. Its PreToolUse goes to :func:`slot_gate`, its PermissionRequest gets no decision (Claude Code's dialog,
 # or the session's mode, answers it). :func:`main` opens no ConsentQueue, reads no settings file and writes no ledger
 # row in a slot. The hold is :data:`DEFAULT_GATE_HOLD` (the settings file that could change it is the operator's,
-# outside the slot); the broker is polled every :data:`GATE_POLL`.
+# outside the slot); the broker is polled every :data:`GATE_POLL`, then every broker_client.SLOW_POLL.
+#
+# KNOWN EDGE until F10 S2b (L3 r1 C): a slot session's consent limits are NOT enforced. Q13's limits are read from
+# the local queue, which a slot does not have, and an ungated call never reaches the broker, so nothing counts it;
+# the broker has no limit verb yet. S2b adds one, asked on every PreToolUse. Any public word about slots says so.
 
 # who decided, in the gate's words, when the broker verified the answer (the hook never sees the signer's key)
 SLOT_HOW = "a signed levain answer the queue broker verified"
 
 
 def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold: float = DEFAULT_GATE_HOLD,
-              sleep: Callable[[float], None] = time.sleep,
+              expected_uid: int | None = None, sleep: Callable[[float], None] = time.sleep,
               monotonic: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
     """The slot's gate output for one ``PreToolUse`` event, or ``None`` (the call goes on as the mode says). A
     malformed event is :func:`_malformed`'s; a call :func:`gate_class` does not gate (protected paths: none) gets
@@ -1586,8 +1590,10 @@ def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold:
     verified, delivered as :func:`decision_output` names it; at the end of the hold it is denied with
     :func:`undecided_output`, its gap named by the request id (the operator side numbers gaps; the hook does not).
     Anything else once the call is gated (a settings file that names the socket variable,
-    :func:`queue_socket_planted`; no socket or cap; the broker unreachable, refusing or answering out of shape) is
-    :func:`could_not_run`'s deny with the hard stop."""
+    :func:`queue_socket_planted`; no socket or cap; no broker account, or a socket whose peer is not it; the
+    broker unreachable, refusing or answering out of shape) is :func:`could_not_run`'s deny with the hard stop.
+    ``expected_uid`` is the broker's uid for a caller that is not the hook (a test, a run); the hook passes none,
+    and the client looks the broker account up (:func:`levain.consent.broker_client.broker_uid`)."""
     from levain.consent import broker_client
 
     if not isinstance(event, Mapping) or event.get("hook_event_name") != GATE_EVENT:
@@ -1609,15 +1615,14 @@ def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold:
     try:
         if queue_socket_planted(cwd, home=home):
             return could_not_run(tier, what)
-        client = client if client is not None else broker_client.BrokerClient.from_env()
+        client = client if client is not None else broker_client.BrokerClient.from_env(expected_uid=expected_uid)
         tool_use_id = event.get("tool_use_id")
         request = broker_client.gate_request(
             agent=AGENT, session=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
             event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None,
             tier=AGENT_CONFIG_TIER, hold=hold)
-        client.request(request)
-        decision = broker_client.hold_for_decision(client, request.id, hold, poll=GATE_POLL, sleep=sleep,
-                                                   monotonic=monotonic)
+        decision = broker_client.file_and_hold(client, request, hold, poll=GATE_POLL, sleep=sleep,
+                                               monotonic=monotonic)
     except Exception:  # noqa: BLE001 - fail closed: the broker down, refusing or malformed is a deny
         return could_not_run(tier, what)
     if decision is None:
@@ -1625,18 +1630,22 @@ def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold:
     return decision_output(decision, SLOT_HOW)
 
 
-def _slot_main(stdin: IO[str], stdout: IO[str]) -> int:
-    """:func:`main` in a slot session: no ConsentQueue, no settings file, no ledger. Always exits 0."""
+def _slot_main(stdin: IO[str], stdout: IO[str], *, expected_uid: int | None = None) -> int:
+    """:func:`main` in a slot session: no ConsentQueue, no settings file, no ledger. Always exits 0. A stdin that
+    is not a JSON object (truncated, garbled, an array) is :func:`could_not_run`'s deny: the event cannot be told
+    from a PreToolUse, and a PermissionRequest ignores a PreToolUse's deny. ``expected_uid``: :func:`slot_gate`'s."""
     event: Any = None
     try:
         event = json.loads(stdin.read())
-        out = slot_gate(event) if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT \
+        if not isinstance(event, Mapping):
+            raise ValueError("the hook event is not a JSON object")
+        out = slot_gate(event, expected_uid=expected_uid) if event.get("hook_event_name") == GATE_EVENT \
             else None   # a PermissionRequest in a slot: no decision
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()
     except BaseException as exc:  # noqa: BLE001 - every failure is no decision, never allow; a gated one a deny
-        if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
+        if not isinstance(event, Mapping) or event.get("hook_event_name") == GATE_EVENT:
             try:
                 stdout.write(json.dumps(could_not_run("irreversible", "this call")) + "\n")
                 stdout.flush()

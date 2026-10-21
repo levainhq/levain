@@ -30,6 +30,7 @@ from tests.test_qbroker import FakeResolver, Key, bound_gid, write_answer, write
 CAP = "cap-slot-1"
 SESSION = Resolved(session="slot1-session", kind="interactive", run=None)
 HOLD = 1.5
+ME = os.getuid()   # the broker in these tests runs as this uid: the expected peer uid, injected by parameter only
 
 
 @pytest.fixture(scope="module")
@@ -125,8 +126,8 @@ def event_of(adapter, ws, **kw):
 
 
 def kw_of(adapter, tmp_path):
-    return {"home": tmp_path / "home"} if adapter == "cc" else {"home": tmp_path / "home",
-                                                                 "codex_dir": tmp_path / "home" / ".codex"}
+    kw = {"home": tmp_path / "home", "expected_uid": ME}
+    return kw if adapter == "cc" else {**kw, "codex_dir": tmp_path / "home" / ".codex"}
 
 
 # --- the run's cases -------------------------------------------------------------------------------------------
@@ -275,7 +276,7 @@ def test_a_slot_with_no_cap_denies(adapter, L, slot, ws, tmp_path, monkeypatch):
 
 def test_a_cap_the_broker_does_not_know_is_refused_and_denies(L, slot, ws, tmp_path):
     out = cc.slot_gate(cc_event(ws), hold=HOLD, home=tmp_path / "home",
-                       client=BrokerClient(str(slot.path), "cap-unknown-to-control"))
+                       client=BrokerClient(str(slot.path), "cap-unknown-to-control", expected_uid=ME))
     assert out["continue"] is False and "the gate could not run" in out["hookSpecificOutput"][
         "permissionDecisionReason"]
 
@@ -337,7 +338,7 @@ def test_a_frame_answering_another_id_is_malformed(L, slot):
     t.start()
     try:
         with pytest.raises(BrokerError) as exc:
-            BrokerClient(str(path), "cap").answer("pend-x")
+            BrokerClient(str(path), "cap", expected_uid=ME).answer("pend-x")
         assert exc.value.name == "malformed"
     finally:
         t.join(5)
@@ -355,7 +356,7 @@ def test_a_silent_broker_times_out_and_is_unreachable():
     try:
         started = time.monotonic()
         with pytest.raises(BrokerError) as exc:
-            BrokerClient(str(path), "cap", timeout=0.3).answer("pend-x")
+            BrokerClient(str(path), "cap", timeout=0.3, expected_uid=ME).answer("pend-x")
         assert exc.value.name == "unreachable" and time.monotonic() - started < 3
     finally:
         srv.close()
@@ -369,3 +370,253 @@ def test_a_malformed_event_in_a_slot_is_denied_as_the_local_gate_denies_it(adapt
     out = gate_of(adapter)(ev, hold=HOLD, **kw_of(adapter, tmp_path))
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert "has no valid cwd" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+# --- L3 r1 A: the client authenticates the server by its peer uid --------------------------------------------------
+
+class FakeServer:
+    """A socket THIS uid listens on (not the broker account), answering every frame as an allowing broker would:
+    REQUEST with the id sealed from the fields it got, ANSWER? with allow. ``frames`` counts frames it read."""
+
+    def __init__(self, *, rate_limit_first=False):
+        import socket
+        import threading
+
+        from levain.consent.record import ExternalGateRequest
+        from levain.qbroker import wire
+
+        self.dir = Path(tempfile.mkdtemp(prefix="bcf", dir="/tmp"))
+        self.path = self.dir / "q.sock"
+        self.frames, self.requests, self.rate_limit_first = 0, 0, rate_limit_first
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(str(self.path))
+        self.sock.listen(8)
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = self.sock.accept()
+                except OSError:
+                    return
+                with conn:
+                    try:
+                        msg = wire.read_frame(conn, timeout=2)
+                    except Exception:   # noqa: BLE001 - the client hung up unsent
+                        continue
+                    if msg is None:
+                        continue
+                    self.frames += 1
+                    if msg["op"] == "REQUEST":
+                        self.requests += 1
+                        if self.rate_limit_first and self.requests == 1:
+                            wire.write_frame(conn, {"id": msg["id"], "ok": False, "refused": "rate-limited"})
+                            continue
+                        wire.write_frame(conn, {"id": msg["id"], "ok": True, "queue_id": "q",
+                                                "request_id": ExternalGateRequest.create(**msg["request"]).id})
+                    else:
+                        wire.write_frame(conn, {"id": msg["id"], "ok": True, "decision": "allow"})
+        self.thread = threading.Thread(target=serve, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.sock.close()
+        self.thread.join(5)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+@pytest.fixture
+def fake(monkeypatch, tmp_path):
+    srv = FakeServer()
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "CLAUDE_PROJECT_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv(broker_client.SOCKET_ENV, str(srv.path))   # named only by the variable: no settings file
+    monkeypatch.setenv(broker_client.CAP_ENV, CAP)
+    try:
+        yield srv
+    finally:
+        srv.close()
+
+
+def no_account(monkeypatch):
+    def getpwnam(name):
+        raise KeyError(name)
+    monkeypatch.setattr(broker_client.pwd, "getpwnam", getpwnam)
+
+
+def test_the_broker_account_is_a_slot_singleton():
+    from levain.slot.ids import SINGLETONS
+
+    assert broker_client.BROKER_ACCOUNT in SINGLETONS
+
+
+@pytest.mark.parametrize("adapter", ["cc", "codex"])
+def test_a_fake_broker_run_by_another_uid_is_refused_before_a_frame(adapter, fake, ws, tmp_path):
+    kw = {**kw_of(adapter, tmp_path), "expected_uid": ME + 1}
+    out = gate_of(adapter)(event_of(adapter, ws), hold=HOLD, **kw)
+    assert "the gate could not run" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert fake.frames == 0   # the cap and the request never reached it
+
+
+@pytest.mark.parametrize("adapter", ["cc", "codex"])
+def test_the_same_fake_with_its_own_uid_expected_is_answered(adapter, fake, ws, tmp_path):
+    """The control for the case above: the refusal is the uid check, nothing else about the fake."""
+    out = gate_of(adapter)(event_of(adapter, ws), hold=HOLD, **kw_of(adapter, tmp_path))
+    assert "allowed by a signed levain answer the queue broker verified" in json.dumps(out)
+    assert fake.frames == 2
+
+
+@pytest.mark.parametrize("module", [cc, cx])
+def test_the_hook_with_no_broker_account_on_the_machine_reaches_no_broker(module, fake, ws, monkeypatch):
+    no_account(monkeypatch)
+    got = json.loads(run_main(module, cc_event(ws) if module is cc else cx_event(ws)))
+    assert got["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "the gate could not run" in got["hookSpecificOutput"]["permissionDecisionReason"]
+    assert fake.frames == 0
+    with pytest.raises(BrokerError) as exc:
+        BrokerClient(str(fake.path), CAP).answer("pend-x")
+    assert exc.value.name == "no-broker-account"
+
+
+@pytest.mark.parametrize("adapter", ["cc", "codex"])
+def test_the_hook_looks_the_broker_account_up_by_name(adapter, L, slot, ws, keys, tmp_path, monkeypatch):
+    """No ``expected_uid`` (the hook's path): the uid is the account database's for BROKER_ACCOUNT."""
+    asked = []
+
+    def getpwnam(name):
+        asked.append(name)
+        return type("pw", (), {"pw_uid": ME})()
+    monkeypatch.setattr(broker_client.pwd, "getpwnam", getpwnam)
+    kw = {k: v for k, v in kw_of(adapter, tmp_path).items() if k != "expected_uid"}
+    out = gate_of(adapter)(event_of(adapter, ws), hold=HOLD, sleep=answering(L, keys["operator"]), **kw)
+    assert "allowed by a signed levain answer the queue broker verified" in json.dumps(out)
+    assert asked == [broker_client.BROKER_ACCOUNT]   # once per client, not per call
+
+
+@pytest.mark.parametrize("adapter", ["cc", "codex"])
+def test_the_real_listener_with_another_uid_expected_is_refused(adapter, L, slot, ws, tmp_path):
+    kw = {**kw_of(adapter, tmp_path), "expected_uid": ME + 1}
+    out = gate_of(adapter)(event_of(adapter, ws), hold=HOLD, **kw)
+    assert "the gate could not run" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert rows(L) == []
+
+
+# --- L3 r1 E: stdin that is not a JSON object denies in a slot --------------------------------------------------
+
+@pytest.mark.parametrize("module", [cc, cx])
+@pytest.mark.parametrize("raw", ['{"hook_event_name": "PreToolUse", "tool_name": "Wri', "[1, 2]", '"PreToolUse"',
+                                 "", "null"])
+def test_a_stdin_that_is_not_a_json_object_is_denied_in_a_slot(module, raw, fake):
+    out = io.StringIO()
+    assert module.main([], stdin=io.StringIO(raw), stdout=out) == 0
+    got = json.loads(out.getvalue())
+    assert got["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "the gate could not run" in got["hookSpecificOutput"]["permissionDecisionReason"]
+    if module is cc:
+        assert got["continue"] is False
+    assert fake.frames == 0
+
+
+# --- L3 r1 F and H: the hold's bound, the poll's back-off, the REQUEST's retry ---------------------------------
+
+class Clock:
+    def __init__(self):
+        self.t = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, s):
+        self.sleeps.append(s)
+        self.t += s
+
+
+class Recording(Scripted):
+    """Scripted answers; each call's timeout recorded with the time left when it was made; each call costs
+    ``cost`` seconds on the clock."""
+
+    def __init__(self, answers, clock, deadline, cost=0.0):
+        super().__init__(answers)
+        self.clock, self.deadline, self.cost, self.seen = clock, deadline, cost, []
+
+    def call(self, op, **fields):
+        self.seen.append((op, fields.pop("timeout", None), self.deadline - self.clock.t))
+        self.clock.t += self.cost
+        return super().call(op, **fields)
+
+
+def a_request(ws):
+    return broker_client.gate_request(agent="claude_code", session="s", tool_name="Write", tool_input={},
+                                      cwd=str(ws), event_id="e", tier="T3", hold=5)
+
+
+def test_every_call_is_capped_at_the_time_left_in_the_hold(ws):
+    clock, req = Clock(), a_request(ws)
+    client = Recording([{"request_id": req.id, "queue_id": "q"}] + [{"pending": True}] * 50, clock, 10.0, cost=0.7)
+    assert broker_client.file_and_hold(client, req, 10.0, poll=0.25, sleep=clock.sleep,
+                                       monotonic=clock.monotonic) is None
+    assert all(timeout is not None and timeout <= left for _, timeout, left in client.seen)
+    assert client.seen[-1][1] < broker_client.IO_TIMEOUT
+    assert clock.t <= 10.0 + 0.7   # the last call began inside the hold and is bounded by what was left
+
+
+def test_a_silent_broker_cannot_stretch_the_hold_past_it(ws):
+    import socket
+
+    path = Path(tempfile.mkdtemp(prefix="bcq", dir="/tmp")) / "s.sock"
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(path))
+    srv.listen(4)
+    try:
+        started = time.monotonic()
+        with pytest.raises(BrokerError):
+            broker_client.file_and_hold(BrokerClient(str(path), "cap", expected_uid=ME), a_request(ws), 0.4,
+                                        poll=0.05)
+        assert time.monotonic() - started < 1.5   # IO_TIMEOUT is 5 s: the hold's 0.4 s bounded the REQUEST
+    finally:
+        srv.close()
+        shutil.rmtree(path.parent, ignore_errors=True)
+
+
+def test_the_poll_backs_off_after_the_first_few():
+    clock = Clock()
+    client = Recording([{"pending": True}] * 20 + [{"decision": "allow"}], clock, 100.0)
+    assert broker_client.hold_for_decision(client, "pend-x", 100.0, poll=0.25, sleep=clock.sleep,
+                                           monotonic=clock.monotonic) == "allow"
+    fast = broker_client.FAST_POLLS
+    assert clock.sleeps[:fast] == [0.25] * fast
+    assert set(clock.sleeps[fast:]) == {broker_client.SLOW_POLL}
+
+
+def test_a_rate_limited_request_is_retried_once_and_filed(ws):
+    clock, req = Clock(), a_request(ws)
+    client = Recording(["rate-limited", {"request_id": req.id, "queue_id": "q"}, {"decision": "allow"}], clock, 10)
+    assert broker_client.file_and_hold(client, req, 10.0, poll=0.25, sleep=clock.sleep,
+                                       monotonic=clock.monotonic) == "allow"
+    assert [op for op, _, _ in client.seen] == ["REQUEST", "REQUEST", "ANSWER?"]
+    assert clock.sleeps[0] == broker_client.REQUEST_RETRY
+
+
+def test_a_request_rate_limited_twice_raises(ws):
+    clock, req = Clock(), a_request(ws)
+    client = Recording(["rate-limited", "rate-limited"], clock, 10)
+    with pytest.raises(BrokerError) as exc:
+        broker_client.file_and_hold(client, req, 10.0, poll=0.25, sleep=clock.sleep, monotonic=clock.monotonic)
+    assert exc.value.name == "rate-limited"
+
+
+@pytest.mark.parametrize("adapter", ["cc", "codex"])
+def test_a_broker_rate_limiting_the_first_request_files_it_on_the_retry(adapter, ws, tmp_path, monkeypatch):
+    srv = FakeServer(rate_limit_first=True)
+    monkeypatch.setenv(broker_client.SOCKET_ENV, str(srv.path))
+    monkeypatch.setenv(broker_client.CAP_ENV, CAP)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "CLAUDE_PROJECT_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    try:
+        out = gate_of(adapter)(event_of(adapter, ws), hold=HOLD, sleep=lambda s: None, **kw_of(adapter, tmp_path))
+        assert "allowed by a signed levain answer the queue broker verified" in json.dumps(out)
+        assert srv.requests == 2
+    finally:
+        srv.close()
