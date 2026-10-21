@@ -330,12 +330,13 @@ class CoordStore:
         conn = self._jobs._connect()
         if not self._ready:
             from levain.coordinator.lease import LEASE_SCHEMA
+            from levain.coordinator.teamdrafts import DRAFT_SCHEMA
 
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     # the lease is checked by every opener's coordinator writes, so its tables are every opener's
-                    for stmt in (*self._SCHEMA, *LEASE_SCHEMA):
+                    for stmt in (*self._SCHEMA, *LEASE_SCHEMA, *DRAFT_SCHEMA):
                         conn.execute(stmt)
                     conn.execute("COMMIT")
                 except BaseException:
@@ -350,7 +351,10 @@ class CoordStore:
     @contextmanager
     def _write(self, by: str | None = None, token: object = None) -> Iterator[tuple[sqlite3.Connection, str]]:
         """One write transaction. A write ``by`` the coordinator is fenced here, inside it: refused unless ``token``
-        is the live lease's (C0 §6). Your writes and the service's carry no token."""
+        is the live lease's (C0 §6). Your writes and the service's carry no token.
+
+        Every write that commits is followed, outside its transaction, by the ONE awake reconcile (C7), whatever the
+        write moved (a thread's state, a detach, a beat of either kind). A write that rolls back reconciles nothing."""
         if by != "coordinator" and token is not None:
             raise CoordError("a lease token is the coordinator's; your own writes carry none")
         with write_transaction(self._connect) as conn:
@@ -361,6 +365,17 @@ class CoordStore:
                 # the write and its record commit together: a write that rolls back leaves no "it wrote" behind
                 record_write(conn, now, fence(conn, now, token))
             yield conn, now
+        self._keep_awake()
+
+    def _keep_awake(self) -> None:
+        """After a committed write: hold the host awake exactly while a work thread works (C7). Run outside the write
+        transaction, and never raises: the write has committed, and a caller told otherwise might write it again."""
+        try:
+            from levain.coordinator import awake
+
+            awake.sync(self)
+        except Exception:      # noqa: BLE001 - see the docstring; `levain doctor` reports the host's sleep state
+            pass
 
     def _stamp(self) -> str:
         now = self._clock()
@@ -581,7 +596,8 @@ class CoordStore:
                     self._ended(conn, thread_id, now)
             if state == "done" and t.kind != "work":
                 self._close(conn, thread_id, f"{t.kind} closes itself once done", "service", now)
-            return self._thread(conn, thread_id)
+            result = self._thread(conn, thread_id)
+        return result
 
     def set_field(self, thread_id: str, field: str, value: str, *, by: str = "operator", cause: str = "",
                   token: object = None) -> Thread:
