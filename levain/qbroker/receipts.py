@@ -36,6 +36,7 @@ read access only, and a WAL reader must write the ``-shm`` file. Stdlib only.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import stat
@@ -51,6 +52,8 @@ from levain.consent.receipt_log import LogUnreadable, head, head_refusal
 from levain.consent.record import ExternalGateRequest
 
 __all__ = ["CONTRACT_GRANTOR", "DB_MODE", "DB_NAME", "Receipts", "ReceiptsError"]
+
+log = logging.getLogger("levain.qbroker")
 
 #: the grantor a contract grant's ``allowed`` receipt names (the receipt vocabulary's word for an authority that is
 #: not a person's answer)
@@ -217,23 +220,40 @@ class Receipts:
             return False
         return isinstance(gate, Mapping) and gate.get("by") == CONTRACT_GRANTOR
 
+    @staticmethod
+    def _allowed_by(conn: sqlite3.Connection, request_id: str, face: Mapping[str, Any]) -> bool:
+        """Whether the request's ``allowed`` receipt names the same authority as ``face`` (its gate and authority
+        scope: this grant row as the binding, the same contract digest and signer)."""
+        row = conn.execute("SELECT face FROM receipts WHERE request_id = ? AND state = 'allowed'",
+                           (request_id,)).fetchone()
+        try:
+            stored = json.loads(row[0])
+        except (ValueError, TypeError):
+            return False
+        return isinstance(stored, Mapping) and stored.get("gate") == face["gate"] \
+            and stored.get("authority_scope") == face["authority_scope"]
+
     def _grant_in(self, conn: sqlite3.Connection, request: ExternalGateRequest, grant: Mapping[str, Any],
                   stamp: str) -> bool:
+        # the face first: a grant row it cannot be built from raises before anything is written
+        face = self._contract_face(request, grant)
         states = self._states(conn, request.id)
+        if "allowed" in states:
+            return self._allowed_by(conn, request.id, face)
         if any(s in _DECIDED for s in states) or "expired" in states:
             return False
         if not states:
             self._append(conn, request, "pending", stamp)
-        face = self._contract_face(request, grant)
         conn.execute("INSERT INTO receipts (request_id, state, created_at, face) VALUES (?, ?, ?, ?)",
                      (request.id, "allowed", stamp, json.dumps(face, ensure_ascii=False, sort_keys=True)))
         return True
 
     def granted(self, request: ExternalGateRequest, grant: Mapping[str, Any], stamp: str) -> bool:
         """Record that the broker's grant row ``grant`` (a ``levain-queue-grant-allow/1`` row, its shape the
-        caller's to have read) allowed ``request``: its ``pending`` filing when it has no receipt, then the
-        contract-grant ``allowed`` receipt, in one write. True when written; False (nothing written) when the request
-        is already decided or expired. :class:`ReceiptsError` when the write fails."""
+        caller's to have judged) allowed ``request``: its ``pending`` filing when it has no receipt, then the
+        contract-grant ``allowed`` receipt, in one write. True when written, and when the request is already allowed
+        by this same grant (nothing written: a second recovery of one grant is success); False (nothing written) when
+        it is allowed by anything else, or denied or expired. :class:`ReceiptsError` when the write fails."""
         try:
             with self._write() as conn:
                 return self._grant_in(conn, request, grant, stamp)
@@ -292,17 +312,26 @@ class Receipts:
         """The ``pending`` receipt of every request in ``requests`` (the stored rows) that has none, in one write;
         how many were written. The broker runs it before it listens: a row linked before a crash or an upgrade, whose
         filing receipt was never written, gets one before any answer for it is read. A request with a grant row in
-        ``grants`` (request id -> the row) gets its grant's receipts instead (:meth:`granted`), never a bare
-        ``pending`` the operator could answer."""
+        ``grants`` (request id -> the row, judged by the caller) gets its grant's receipts instead (:meth:`granted`),
+        never a bare ``pending`` the operator could answer. A grant whose receipts raise anything but a database error
+        is logged and that request reconciles as a plain ``pending`` (nothing of the grant is written first): one row
+        never stops the broker from starting."""
         grants = grants or {}
         written = 0
         with self._write() as conn:
             for request in sorted(requests, key=lambda r: (r.received_at, r.id)):
                 if not self._states(conn, request.id):
                     grant = grants.get(request.id)
+                    done = False
                     if grant is not None:
-                        self._grant_in(conn, request, grant, stamp)
-                    else:
+                        try:
+                            done = self._grant_in(conn, request, grant, stamp)
+                        except sqlite3.Error:
+                            raise
+                        except Exception:   # noqa: BLE001 - one row's grant is that row's plain pending
+                            log.exception("qbroker: the grant receipts of %s could not be built; it is filed "
+                                          "pending for the operator", request.id)
+                    if not done:
                         self._append(conn, request, "pending", stamp)
                     written += 1
         return written

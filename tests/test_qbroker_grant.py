@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 from datetime import timedelta
 from pathlib import Path
 
@@ -31,7 +32,7 @@ from levain.qbroker import grants
 from levain.qbroker import operator as qoperator
 from levain.qbroker.broker import Broker, Resolved, resolved_from
 from levain.qbroker.grants import contract_authority
-from levain.qbroker.receipts import Receipts
+from levain.qbroker.receipts import Receipts, ReceiptsError
 from levain.qbroker.seam import answer_refusal, grant_allow_refusal, request_of
 from levain.qbroker.signers import SignersSource
 from levain.qbroker.store import ANSWER_ROW_FORMAT, GRANT_ROW_FORMAT, QueueStore
@@ -674,3 +675,183 @@ def test_a_store_logs_a_record_it_will_not_publish_and_withdraws_it(world, monke
     world["store"].get(world["job"].id)
     assert not world["contract"].exists()
     assert "not published, so its calls queue" in caplog.text
+
+
+# --- S2b-1 merge L3 r1 (S2B1_MERGE_L3_r1_TRIAGE.md S1-S3; the s2b1_fix1_run cases) -----------------------------------
+
+def _rids(w):
+    return sorted(r["request"]["id"] for r in QueueStore(w["L"] / "queue").rows())
+
+
+def _pause_in(obj, name, thread_name):
+    """``obj.name`` waits, in the thread called ``thread_name`` only, until released; (paused, release)."""
+    paused, release = threading.Event(), threading.Event()
+    real = getattr(obj, name)
+
+    def hooked(*a, **k):
+        if threading.current_thread().name == thread_name:
+            paused.set()
+            release.wait(20)
+        return real(*a, **k)
+    setattr(obj, name, hooked)
+    return paused, release
+
+
+def _filed_without_receipts(w, b, label):
+    """A granted request whose receipt write failed at its filing: its row and its grant row, no receipt."""
+    def boom(*a, **k):
+        raise ReceiptsError("injected")
+    b._receipts.granted = b._receipts.filed = boom
+    assert b.handle(1, frame(w, label, "Write", cc(w, "src/a.py")))["refused"] == "broker-error"
+    del b._receipts.granted, b._receipts.filed
+    (rid,) = _rids(w)
+    assert QueueStore(w["L"] / "queue").has_grant(rid) and _receipts(w, rid) == []
+    return rid
+
+
+def test_s1_a_replay_waits_out_the_filing_in_flight_and_never_files_a_granted_request_pending(world):
+    """S1: thread A has linked the row and not yet written its grant row; the replay (B) waits on A's flight, so
+    nothing is pending in between, an operator deny is never recorded, and the grant settles it."""
+    b = broker(world)
+    msg = frame(world, "s1", "Write", cc(world, "src/a.py"))
+    paused, release = _pause_in(b, "_write_grant", "A")
+    out = {}
+    a = threading.Thread(name="A", target=lambda: out.__setitem__("A", b.handle(1, msg)))
+    a.start()
+    assert paused.wait(20)
+    (rid,) = _rids(world)
+    replay = threading.Thread(name="B", target=lambda: out.__setitem__("B", b.handle(1, dict(msg, id=next(_ids)))))
+    replay.start()
+    replay.join(1.0)
+    try:
+        assert replay.is_alive() and _receipts(world, rid) == []
+        listed = {r.request_id: r for r in qoperator.rows(world["L"] / "queue", now=world["clock"].now)}
+        assert listed[rid].state == "filing" and not listed[rid].settled
+        _operator_answer(world, rid, "deny")
+        assert "decision" not in ask(b, rid)
+    finally:
+        release.set()
+        a.join(20)
+        replay.join(20)
+    assert out["A"]["request_id"] == out["B"]["request_id"] == rid
+    assert [s for s, _ in _receipts(world, rid)] == ["pending", "allowed"]
+    assert ask(b, rid)["decision"] == "allow"
+
+
+def test_s1_a_replay_after_a_failed_receipt_write_repairs_it_from_the_grant_row(world):
+    b = broker(world)
+    rid = _filed_without_receipts(world, b, "s1-rep")
+    msg = frame(world, "s1-rep", "Write", cc(world, "src/a.py"))
+    assert b.handle(1, msg)["request_id"] == rid
+    assert [s for s, _ in _receipts(world, rid)] == ["pending", "allowed"]
+
+
+def test_s2_two_polls_recovering_one_grant_both_answer_allow(world):
+    """S2: poll A stops at its receipts write; poll B records the grant whole; A's write then finds the request
+    allowed by this same grant and succeeds (it was answer-refused)."""
+    b = broker(world)
+    rid = _filed_without_receipts(world, b, "s2")
+    paused, release = _pause_in(b._receipts, "granted", "A")
+    out = {}
+    a = threading.Thread(name="A", target=lambda: out.__setitem__("A", ask(b, rid)))
+    a.start()
+    try:
+        assert paused.wait(20)
+        assert ask(b, rid)["decision"] == "allow"
+    finally:
+        release.set()
+        a.join(20)
+    assert out["A"]["decision"] == "allow"
+    assert [s for s, _ in _receipts(world, rid)] == ["pending", "allowed"]
+
+
+def test_s2_a_grant_row_does_not_answer_for_a_request_allowed_by_anything_else(world):
+    b = broker(world)
+    rid = _filed_without_receipts(world, b, "s2o")
+    q = QueueStore(world["L"] / "queue")
+    request = request_of(q.read_request(rid)["request"])
+    stamp = utc_stamp(world["clock"].now)
+    with b._receipts._write() as conn:
+        Receipts._append(conn, request, "pending", stamp)
+        Receipts._append(conn, request, "allowed", stamp, world["keys"]["laptop"].fp)
+    assert ask(b, rid)["refused"] == "answer-refused"
+    assert b._receipts.granted(request, q.read_grant(rid), stamp) is False
+    # the same grant again is success, and writes nothing; another grant's binding is not
+    rid2 = b.handle(1, frame(world, "s2-same", "Write", cc(world, "src/new.py")))["request_id"]
+    request2, grant2 = request_of(q.read_request(rid2)["request"]), q.read_grant(rid2)
+    before = _receipts(world, rid2)
+    assert b._receipts.granted(request2, grant2, stamp) is True and _receipts(world, rid2) == before
+    assert b._receipts.granted(request2, dict(grant2, signer_fp="SHA256:other"), stamp) is False
+    assert _receipts(world, rid2) == before
+
+
+def _forge_grant(w, rid, change):
+    path = w["L"] / "queue" / "requests" / f"grant-{rid}.json"
+    row = json.loads(path.read_bytes())
+    change(row)
+    path.unlink()
+    path.write_bytes(canonical_bytes(row))
+
+
+_OTHER = "pend-2026-10-19T20:02:00.000000Z-0000000000000000"
+_FORGERIES = [
+    pytest.param(lambda r: r.__setitem__("request_id", _OTHER), "names another request", id="another-request"),
+    pytest.param(lambda r: r.pop("signer_fp"), "not a levain-queue-grant-allow/1", id="no-signer-fp"),
+    pytest.param(lambda r: r.__setitem__("contract_digest", "sha256:" + "0" * 64), "another contract",
+                 id="another-contract"),
+]
+
+
+@pytest.mark.parametrize("change, why", _FORGERIES)
+def test_s3_a_refused_grant_row_at_filing_files_plain_pending_and_is_logged(world, caplog, change, why):
+    b = broker(world)
+    real = b._write_grant
+
+    def forging(who, request, granted, now):
+        real(who, request, granted, now)
+        _forge_grant(world, request.id, change)
+    b._write_grant = forging
+    caplog.set_level("WARNING", logger="levain.qbroker")
+    got = b.handle(1, frame(world, f"s3f-{why}", "Write", cc(world, "src/a.py")))
+    assert got["ok"] is True
+    rid = got["request_id"]
+    assert [s for s, _ in _receipts(world, rid)] == ["pending"]
+    listed = {r.request_id: r for r in qoperator.rows(world["L"] / "queue", now=world["clock"].now)}
+    assert listed[rid].state == "pending" and not listed[rid].settled
+    assert f"grant row for {rid} refused, filed as no grant: " in caplog.text and why in caplog.text
+
+
+@pytest.mark.parametrize("change, why", _FORGERIES)
+def test_s3_a_refused_grant_row_at_start_reconciles_plain_pending_and_the_broker_starts(world, caplog, change, why):
+    b = broker(world)
+    rid = _filed_without_receipts(world, b, f"s3s-{why}")
+    _forge_grant(world, rid, change)
+    caplog.set_level("WARNING", logger="levain.qbroker")
+    b2 = broker(world)
+    assert [s for s, _ in _receipts(world, rid)] == ["pending"]
+    assert f"grant row for {rid} refused, filed as no grant: " in caplog.text and why in caplog.text
+    assert ask(b2, rid)["refused"] == "answer-refused"      # the client reads it as pending: the operator decides
+
+
+def test_s3_the_start_reconciles_a_valid_grant_whose_hold_ended(world):
+    b = broker(world)
+    rid = _filed_without_receipts(world, b, "s3-late")
+    world["clock"].now = BNOW + timedelta(minutes=10)
+    broker(world)
+    assert [s for s, _ in _receipts(world, rid)] == ["pending", "allowed"]
+    q = QueueStore(world["L"] / "queue")
+    row, grant = q.read_request(rid), q.read_grant(rid)
+    assert "hold ended" in grant_allow_refusal(row, grant, world["clock"].now)
+    assert grant_allow_refusal(row, grant, world["clock"].now, check_hold=False) is None
+
+
+def test_s3_a_grant_whose_receipts_raise_in_reconcile_is_that_rows_plain_pending(world, caplog):
+    b = broker(world)
+    rid = _filed_without_receipts(world, b, "s3-raise")
+    q = QueueStore(world["L"] / "queue")
+    request = request_of(q.read_request(rid)["request"])
+    caplog.set_level("ERROR", logger="levain.qbroker")
+    bad = {k: v for k, v in q.read_grant(rid).items() if k != "contract_digest"}
+    assert b._receipts.reconcile([request], utc_stamp(world["clock"].now), grants={rid: bad}) == 1
+    assert [s for s, _ in _receipts(world, rid)] == ["pending"]
+    assert f"the grant receipts of {rid} could not be built" in caplog.text

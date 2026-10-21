@@ -6,19 +6,23 @@ so its id is the sealed id; the row takes ``session``, ``slot``, ``kind`` and ``
 Filing the same sealed request again returns the row already there (before the clock and hold checks, which bound
 new rows only); a new row is refused ``queue-busy`` past :data:`PENDING_PER_SESSION` and ``quota-exhausted`` past
 the lifetime quota. ``ANSWER? {cap, request_id}`` reads the answer row for a request this session filed and returns
-``{decision}`` only when :func:`levain.qbroker.seam.answer_refusal` accepts it (one signed in time, even when read after
-the hold ended) and the broker's own receipts (:mod:`levain.qbroker.receipts`) record the decision against the head
+``{decision}`` only when :func:`levain.qbroker.seam.answer_refusal` accepts it (one signed in time; read after the
+hold ended it still decides when its file was there before the first poll past the hold, which, finding none, records
+the request ``expired``, and an answer file written after that poll is refused) and the broker's own receipts (:mod:`levain.qbroker.receipts`) record the decision against the head
 the answer signed, else ``{pending}`` while nothing is
 there and the hold runs; polls past :data:`ANSWER_RATE` per slot are refused ``rate-limited`` (a REQUEST too, for about one token interval
 after polls drain the bucket: the consent hook treats ``rate-limited`` as pending and retries). A verdict is reused
 while the answer file and the signer snapshot are unchanged, and a resolve for :data:`RESOLVE_TTL` seconds, so a
 serial poll storm costs one verify and one CONTROL round trip; concurrent misses on a cold cache may each make
 the trip, bounded by the slot's rate (a REQUEST whose resolve misses the cache is charged to it too). One filing
-per request id runs at a time, so identical REQUESTs on several connections link one row and charge it once.
+per request id runs at a time, so identical REQUESTs on several connections link one row and charge it once; a
+replay that finds a row with no receipt writes them in that same flight, after any filing still in it.
 Every transition the broker makes leaves one receipt in those receipts: filed (a new row), decided (the
 first accepted answer), granted (a contract grant, below), expired (an ANSWER? past the hold with nothing decided).
 Before it listens, the broker files the ``pending`` receipt of every stored row that has none (a row linked before a
-crash or an upgrade; one with a grant row beside it gets its grant's receipts), and a decision for a row with no
+crash or an upgrade; one with a grant row beside it that :func:`levain.qbroker.seam.grant_allow_refusal` accepts, the
+hold not checked, gets its grant's receipts; a refused grant row is logged and the row filed plain ``pending``, and a
+grant whose receipts raise files that row ``pending`` too, never stopping the start), and a decision for a row with no
 ``pending`` receipt is refused ``broker-error``, nothing cached; an ANSWER? past the hold of such a row answers
 ``request-expired`` and records nothing. Every reader of a stored row takes it through :func:`stored_request`.
 Known edge: each ANSWER? past the hold opens the receipts once to read the state; the slot's rate bounds it.
@@ -36,8 +40,9 @@ that row; such a row is not pending (it waits on no one), but it is charged to t
 ``pending`` filing and the ``allowed`` grant, whose face names the grant row as the authority (grantor ``binding``)
 and carries no signed head (:meth:`levain.qbroker.receipts.Receipts.granted`). Until both are written the row has no
 receipt (the operator lists it ``filing``, never answerable); once they are, the operator lists it settled and an
-answer to it is refused (:meth:`~levain.qbroker.receipts.Receipts.decided`). A grant row that cannot be written leaves
-the row filed ``pending`` for the operator, whose verified answer then decides it. Anything the grant cannot
+answer to it is refused (:meth:`~levain.qbroker.receipts.Receipts.decided`). A grant row that cannot be written, or
+one :func:`~levain.qbroker.seam.grant_allow_refusal` refuses when the receipts are written (logged), leaves the row
+filed ``pending`` for the operator, whose verified answer then decides it. Anything the grant cannot
 decide files the request as today, for the operator; a run CONTROL names without ``repo_root`` resolves as before
 and never takes a grant. A replay never re-decides.
 
@@ -235,12 +240,13 @@ class Broker:
         self._resolved: OrderedDict[tuple[int, str], tuple[float, Resolved | str]] = OrderedDict()
         self._refused: OrderedDict[tuple[int, str], tuple[float, Resolved | str]] = OrderedDict()
         self._verdicts: OrderedDict[str, tuple[tuple[int, ...], SignersSnapshot | None, str | None]] = OrderedDict()
-        now = utc_stamp(clock())
+        started = clock()
+        now = utc_stamp(started)
         filed = []
         for row in store.rows():
             request = stored_request(row, store.queue_id)
             if request is not None:
-                filed.append(request)
+                filed.append((row, request))
             # counted even when stored_request refused the row: a malformed row that names a session still holds its
             # quota and a pending place until its hold ends (it is never filed or answered), the cautious side
             session, run = row.get("session"), row.get("run")
@@ -255,8 +261,11 @@ class Broker:
             if isinstance(expires, str) and expires > now and isinstance(request.get("id"), str) \
                     and not self._granted(request["id"]):
                 self._pending.setdefault(session, {})[request["id"]] = expires
-        reconciled = self._receipts.reconcile(filed, now, grants={r.id: g for r in filed
-                                                                  if (g := self._grant_row(r.id)) is not None})
+        # a grant row is judged as ANSWER? judges it, the hold aside: one whose hold ended before this start still
+        # gets its grant's receipts
+        grants_of = {r.id: g for row, r in filed
+                     if (g := self._grant_row(row, r, started, check_hold=False)) is not None}
+        reconciled = self._receipts.reconcile([r for _, r in filed], now, grants=grants_of)
         if reconciled:
             log.warning("qbroker: %d stored row(s) had no filing receipt; their pending receipts are filed now",
                         reconciled)
@@ -267,22 +276,47 @@ class Broker:
         except (ValueError, OSError):
             return False
 
-    def _grant_row(self, request_id: str) -> dict[str, Any] | None:
-        """The broker's grant row for ``request_id`` when one reads as its format, else ``None`` (none there, or
-        one that does not read: such a request's receipts are an ordinary filing, and ANSWER? refuses that row)."""
+    def _grant_row(self, row: Mapping[str, Any], request: ExternalGateRequest, now: datetime, *,
+                   check_hold: bool = True) -> dict[str, Any] | None:
+        """The broker's grant row for the request ``row`` holds when one is there and
+        :func:`~levain.qbroker.seam.grant_allow_refusal` accepts it (``check_hold`` passed on), else ``None``: none
+        there, or one that does not read or is refused (logged). Such a request is treated as having NO grant: its
+        receipts are an ordinary ``pending`` filing, the operator's to decide (ANSWER? refuses that row too)."""
         try:
-            return self._store.read_grant(request_id)
-        except (ValueError, OSError):
+            grant = self._store.read_grant(request.id)
+        except (ValueError, OSError) as exc:
+            log.warning("qbroker: grant row for %s refused, filed as no grant: %s", request.id, exc)
             return None
+        if grant is None:
+            return None
+        why = grant_allow_refusal(row, grant, now, check_hold=check_hold)
+        if why is not None:
+            log.warning("qbroker: grant row for %s refused, filed as no grant: %s", request.id, why)
+            return None
+        return grant
 
-    def _file_receipts(self, request: ExternalGateRequest, stamp: str) -> None:
-        """The receipts of a row just linked (or re-filed with none): its grant's (``pending`` then ``allowed``,
-        one write) when a grant row is beside it, else its ``pending`` filing."""
-        grant = self._grant_row(request.id)
+    def _file_receipts(self, row: Mapping[str, Any], request: ExternalGateRequest, now: datetime) -> None:
+        """The receipts of a row just linked (or re-filed with none), inside the request id's flight: its grant's
+        (``pending`` then ``allowed``, one write) when a grant row :meth:`_grant_row` accepts is beside it, else its
+        ``pending`` filing."""
+        stamp = utc_stamp(now)
+        grant = self._grant_row(row, request, now)
         if grant is not None:
             self._receipts.granted(request, grant, stamp)
         else:
             self._receipts.filed(request, stamp)
+
+    def _repair_receipts(self, row: Mapping[str, Any], request: ExternalGateRequest) -> None:
+        """A replay's receipt repair for a row whose filing wrote none, inside the request id's flight (the one door
+        that writes a request's first receipts, :meth:`_file`'s), the row and its receipts re-read once it is held:
+        a filing still in flight is waited out, and its receipts are never written twice or ahead of its grant row."""
+        flight = self._enter_flight(request.id)
+        try:
+            if self._store.read_request(request.id) != row or self._receipts.state(request.id) is not None:
+                return
+            self._file_receipts(row, request, self._clock())
+        finally:
+            self._leave_flight(request.id, flight)
 
     def handle(self, slot: int, message: Mapping[str, Any]) -> dict[str, Any]:
         """The one answer to ``message`` from the hook on ``slot``'s socket."""
@@ -388,8 +422,8 @@ class Broker:
             existing = self._store.read_request(request.id)
         if existing != row:
             return wire.refusal(rid, "request-exists")
-        if self._receipts.state(request.id) is None:      # the filing's receipt write failed: the re-file writes it
-            self._file_receipts(request, utc_stamp(self._clock()))
+        if self._receipts.state(request.id) is None:      # the filing's receipt write failed, or is still in flight
+            self._repair_receipts(row, request)
         return wire.answer(rid, request_id=request.id, queue_id=self._store.queue_id)
 
     def _ungated_go(self, slot: int, request: ExternalGateRequest, member: Mapping[str, Any] | None) -> bool:
@@ -461,7 +495,7 @@ class Broker:
             if refused is None:
                 if granted is not None:
                     self._write_grant(who, request, granted, now)
-                self._file_receipts(request, utc_stamp(now))
+                self._file_receipts(row, request, now)
             return refused
         finally:
             self._leave_flight(request.id, flight)
@@ -542,8 +576,8 @@ class Broker:
         if request is None or row.get("session") != who.session or row.get("slot") != slot_ref(slot):
             return wire.refusal(rid, "no-such-request")
         now = self._clock()
-        # the operator's verified answer first, before the hold: one signed in time is his decision whenever it is
-        # read. A request its grant's receipts settled takes no answer (Receipts.decided refuses it); one filed as a
+        # the operator's verified answer first, before the hold: one signed in time is his decision when read after
+        # the hold too, as long as no poll past the hold found no answer file and recorded it expired. A request its grant's receipts settled takes no answer (Receipts.decided refuses it); one filed as a
         # plain ``pending`` (no grant row could be written or read at its filing) is his to decide. Only with no
         # decision does the hold end the request, and then the broker's own grant row answer (in the directory only
         # the broker writes, read as its format)
@@ -570,10 +604,10 @@ class Broker:
                 log.warning("qbroker: grant row for %s refused: %s", request_id, why)
                 return wire.refusal(rid, "answer-refused")
             # the grant's receipts not written at its filing are written now, before the allow is answered (a write
-            # that fails raises: the poll is refused broker-error); a request the log holds otherwise settled is not
+            # that fails raises: the poll is refused broker-error). One write decides: already allowed by this same
+            # grant is success (a second poll recovering it), allowed by anything else, denied or expired is not
             # allowed by its grant row
-            if self._receipts.state(request_id) != "allowed" \
-                    and not self._receipts.granted(request, grant, utc_stamp(now)):
+            if not self._receipts.granted(request, grant, utc_stamp(now)):
                 log.warning("qbroker: grant row for %s refused: the receipts record it settled otherwise", request_id)
                 return wire.refusal(rid, "answer-refused")
             return wire.answer(rid, decision="allow")
