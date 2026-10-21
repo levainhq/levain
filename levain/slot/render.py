@@ -694,6 +694,14 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
             continue
         if "disableAllHooks" in doc and doc["disableAllHooks"] is not False:
             out.append(_refused("loosening", "disableAllHooks", f"{path}: not false"))
+        env = doc.get("env", {})
+        if not isinstance(env, Mapping):
+            out.append(Refused("repo-settings-malformed", f"{path}: env"))
+        else:
+            # The queue's env reaches the agent through the process env only (§3.2); the consent hook denies every
+            # gated call when a settings layer names one, so the session is refused here, by name, instead.
+            for name in sorted(n for n in env if n in (QUEUE_CAP_ENV, QUEUE_SOCKET_ENV)):
+                out.append(_refused("loosening", f"env.{name}", f"{path}: the queue's env is set by levain only"))
         sb = doc.get("sandbox", {})
         if not isinstance(sb, Mapping):
             out.append(Refused("repo-settings-malformed", f"{path}: sandbox"))

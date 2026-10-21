@@ -444,6 +444,17 @@ def test_loosening_repo_layer_refused_by_key():
     assert [x.name for x in rd.repo_loosening_refusals({"a": {"sandbox": 1}})] == ["repo-settings-malformed"]
 
 
+def test_repo_settings_env_naming_the_queue_refused():
+    """From the run (levain-memory 1019-s1design/runs/s3-queue-env/RUN.txt): a committed settings ``env`` naming the
+    queue's socket or cap launched, and the consent hook then denies every gated call; now refused by name."""
+    f = ".claude/settings.json"
+    got = rd.repo_loosening_refusals({f: {"env": {rd.QUEUE_SOCKET_ENV: "/tmp/x.sock", "FOO": "1"}},
+                                      ".claude/settings.local.json": {"env": {rd.QUEUE_CAP_ENV: "x"}}})
+    assert [x.name for x in got] == ["loosening:env-levain-queue-socket", "loosening:env-levain-queue-cap"]   # by file
+    assert rd.repo_loosening_refusals({f: {"env": {"FOO": "1", "LEVAIN_QUEUEX": "y"}}}) == []
+    assert [x.name for x in rd.repo_loosening_refusals({f: {"env": ["x"]}})] == ["repo-settings-malformed"]
+
+
 def test_levain_repo_settings_pass():
     """The negative control. ``.claude/settings.json`` is absent from this repo, so the control is (a) a hooks-only
     settings file and (b) the Claude Code settings template Levain ships (hooks + permissions)."""
