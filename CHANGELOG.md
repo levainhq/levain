@@ -6,6 +6,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **`levain coord`: one coordinator at a time.** A drop that arrives while nobody holds the coordinator role asks for
+  a coordinator session; drops after it wait for that one. `levain coord status` shows who holds the role and what the
+  next drop would do, `levain coord take` holds it yourself, and `levain coord release` ends it. A session that lost
+  the role (it went quiet past its time, or you took over) has its thread changes refused. Splitting or re-titling by
+  hand now records you: `--by operator` is the default for `levain drops split` and `levain thread set`.
+
+### Known edges
+- Nothing answers a drop's request for a coordinator yet: each request waits 5 minutes, and after three unanswered
+  ones Levain stops asking until you run `levain coord take` or `levain coord release`.
+
 ## [0.11.13] — 2026-10-20
 
 ### Security
@@ -36,17 +47,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   - **The dispatch job store moves to format 3** the first time this version opens it. Your jobs are kept. After that,
     Levain 0.11.12 refuses to open the store, so do not downgrade.
 
-- **`levain coord`: one coordinator at a time.** A drop that arrives while nobody holds the coordinator role asks for
-  a coordinator session; drops after it wait for that one. `levain coord status` shows who holds the role and what the
-  next drop would do, `levain coord take` holds it yourself, and `levain coord release` ends it. A session that lost
-  the role (it went quiet past its time, or you took over) has its thread changes refused. Splitting or re-titling by
-  hand now records you: `--by operator` is the default for `levain drops split` and `levain thread set`.
-
 ### Known edges
 - The coordinator session that reads drops and splits them comes later; until then a thread is named with
-  `levain drops split`. The phone drop sheet comes later too. Until it comes, nothing answers a drop's request for a
-  coordinator: each request waits 5 minutes, and after three unanswered ones Levain stops asking until you run
-  `levain coord take` or `levain coord release`.
+  `levain drops split`. The phone drop sheet comes later too.
 - Nothing acts on an envelope yet: until Levain's separate-user setup is in place, every step that needs your say
   still asks you each time, and `levain envelope show` says so. Signing from the phone comes later.
 - The verifier sessions that write these records come with the slot work; until then no run produces one.
