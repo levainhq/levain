@@ -656,6 +656,19 @@ def test_a_driver_input_whose_step_count_is_not_the_steps_is_refused_at_accept(s
             f"{why}\\(s\\) for 2 step\\(s\\); the output_compare template reads one per step")
 
 
+# reproduced by Diogenes 2026-10-21 (diogenes-20261021-020528): each was accepted, signed, then refused by the driver
+# on every run (driver exit 2 -> verifier_refused)
+@pytest.mark.parametrize("bad", [
+    {"exit": 0, "stderr_emtpy": True},
+    {"exit": 0, "stderr_empty": "true"},
+    {"exit": 300},
+    {"stdout_equals": "ok\n"},
+])
+def test_a_driver_input_the_driver_would_refuse_is_refused_at_accept(store, log, keys, bad):
+    refused(store, log, keys, "verifier", 1, vbody(_with_input(TWO_STEPS, {"steps": [{"exit": 0}, bad]})),
+            "would be refused by the output_compare template on every run: expectation 1")
+
+
 def test_a_driver_input_of_one_expectation_per_step_is_accepted(store, log, keys):
     accept(store, log, keys, "verifier", 1, vbody(_with_input(TWO_STEPS, {"steps": [{"exit": 0}, {"exit": 0}]})))
 

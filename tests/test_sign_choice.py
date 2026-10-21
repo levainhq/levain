@@ -30,13 +30,14 @@ def _b64u(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 
-def _file(qdir: Path, rid: str, *, message: str = MESSAGE, options: object = OPTIONS, ns: str = NS) -> None:
+def _file(qdir: Path, rid: str, *, message: str = MESSAGE, options: object = OPTIONS, ns: str = NS,
+          **extra: object) -> None:
     sign = qdir / "sign"
     sign.mkdir(exist_ok=True)
     body = {"format": "levain-sign-request/1", "id": rid, "namespace": ns, "message": message, "title": "choice",
             "requester": "test", "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()}
     if options is not None:
-        body.update(format="levain-sign-choice/1", options=options)
+        body.update(format="levain-sign-choice/1", options=options, **extra)
     (sign / f".{rid}.tmp").write_text(json.dumps(body))
     os.replace(sign / f".{rid}.tmp", sign / f"{rid}.json")
 
@@ -57,11 +58,13 @@ def passkey(tmp_path: Path):
         der = priv.sign(auth + hashlib.sha256(cdj).digest(), ec.ECDSA(hashes.SHA256()))
         return {"authenticator_data": _b64u(auth), "client_data_json": _b64u(cdj), "signature": _b64u(der)}
 
-    def sign(rid: str, choice: "str | None") -> dict:
+    def sign(rid: str, choice: "str | None", words: "str | None" = None) -> dict:
         row = next(r for r in signer.listing([key.fingerprint]) if r["id"] == rid)
         req = {"signer_fp": key.fingerprint, "request_sha256": row["sha256"]}
         if choice is not None:
             req["choice"] = choice
+        if words is not None:
+            req["write_in"] = words
         return signer.answer(rid, assertion(signer.challenge(rid, req)["challenge"]))
 
     sign.assertion = assertion
@@ -228,3 +231,82 @@ def test_the_link_file_goes_when_its_run_stops(tmp_path: Path) -> None:
     _drop_link_file(mine)
     _drop_link_file(theirs)
     assert not mine.exists() and theirs.exists()
+
+
+def test_the_recommended_option_is_marked_never_selected(tmp_path: Path, passkey) -> None:
+    """Phill 6a: the card shows the requester's recommendation. The phone gets the key to mark and nothing that
+    selects it (no selected or default field, and the card's code neither focuses nor checks a button); a
+    recommended key the request does not offer refuses the request by name."""
+    signer, key, sign = passkey
+    _file(tmp_path, "np-rec00001-aaaa", recommended="b")
+    _file(tmp_path, "np-rec00002-aaaa", recommended="z")
+    rows = {r["id"]: r for r in signer.listing([key.fingerprint])}
+    row = rows["np-rec00001-aaaa"]
+    assert row["recommended"] == "b" and "write_in" not in row
+    assert not {"selected", "default", "choice"} & set(row) and all(set(o) == {"key", "text", "line"}
+                                                                    for o in row["options"])
+    assert "recommended 'z' is not one of the request's option keys" in rows["np-rec00002-aaaa"]["refused"]
+    js = (Path(__file__).parents[1] / "levain" / "templates" / "web" / "phone.js").read_text()
+    card = js[js.index("function signCard("):js.index("function signWith(")]
+    assert 'o.key === r.recommended' in card and '" recommended"' in card and 'el("span", "rec", "recommended")' in card
+    assert not any(w in card for w in (".focus(", "autofocus", ".checked", ".click()", ".selected", "aria-pressed"))
+    rec = sign("np-rec00001-aaaa", "a")     # the recommendation is not signed: the bytes are option (a)'s alone
+    signed = json.loads((tmp_path / "sign" / "np-rec00001-aaaa.signed.json").read_text())["signed_message"]
+    assert rec["choice"] == "a" and signed == MESSAGE + "\n" + choice_line("a", "keep it")
+
+
+def test_a_write_in_signs_as_the_reserved_key_and_bad_words_are_refused(tmp_path: Path, passkey) -> None:
+    """Phill 7a: his own words, signed as (*), verify under stock ssh-keygen and parse as the write-in, never as an
+    option. Words holding an unshowable character are refused at the challenge, and in hand-built bytes at parse;
+    a write-in line on a request that offered none does not parse."""
+    signer, key, sign = passkey
+    words = "ship it friday, not before"
+    _file(tmp_path, "np-wi000001-aaaa", write_in=True)
+    [row] = signer.listing([key.fingerprint])
+    assert row["write_in"] == {"key": "*", "line": CHOICE_MARK + "(*): ", "max": 200}
+    with pytest.raises(SignRefused, match="U\\+200B") as refused:
+        signer.challenge("np-wi000001-aaaa", {"signer_fp": key.fingerprint, "request_sha256": row["sha256"],
+                                              "choice": "*", "write_in": "ship\u200bit"})
+    assert refused.value.status == 400 and signer._challenged == {}
+    assert sign("np-wi000001-aaaa", "*", words)["choice"] == "*"
+    signed = json.loads((tmp_path / "sign" / "np-wi000001-aaaa.signed.json").read_text())["signed_message"].encode()
+    assert signed == (MESSAGE + "\n" + CHOICE_MARK + "(*): " + words).encode()
+    assert _verify(tmp_path, "np-wi000001-aaaa", signed) == 0
+    assert parse_choice(signed, write_in=True) == (MESSAGE, "*", words)
+    with pytest.raises(ValueError, match="offered no write-in"):
+        parse_choice(signed)
+    with pytest.raises(ValueError, match="U\\+200B"):
+        parse_choice((MESSAGE + "\n" + choice_line("*", "ship\u200bit")).encode(), write_in=True)
+
+
+def test_the_page_keeps_write_in_words_for_their_version_only_and_sends_them_trimmed() -> None:
+    """Typed words belong to the version of the request they were typed on: a replaced file (same id, new sha256)
+    or a request gone from the listing drops them. The page sends the words trimmed (autocorrect's trailing space
+    is not his answer), and the server's no-edge-space rule stays as strict."""
+    js = (Path(__file__).parents[1] / "levain" / "templates" / "web" / "phone.js").read_text()
+    card = js[js.index("function signCard("):js.index("function signWith(")]
+    assert 'writeIns.set(r.id, { sha256: r.sha256 || "", words: box.value })' in card
+    assert 'draft.sha256 !== (r.sha256 || "")) writeIns.delete(r.id)' in card
+    assert "const w = box.value.trim();" in card and "wi.key, freeze)" in card
+    draw = js[js.index("function draw("):js.index("function questionCard(")]
+    assert "if (!signs.some((r) => r.id === id)) writeIns.delete(id)" in draw
+
+
+def test_the_challenge_carries_the_exact_line_the_signature_appends(tmp_path: Path, passkey) -> None:
+    """CHOICE L3 r2 (What You See Is What You Sign): the page shows the line the server will sign, never its own copy.
+    The challenge reply's ``line`` is the last line of the bytes signed, for an option and for a write-in, and a plain
+    request's reply carries none."""
+    signer, key, sign = passkey
+    words = "ship it friday, not before"
+    _file(tmp_path, "np-ln000001-aaaa", write_in=True)
+    _file(tmp_path, "np-ln000002-aaaa", options=None)
+    rows = {r["id"]: r for r in signer.listing([key.fingerprint])}
+    base = {"signer_fp": key.fingerprint, "request_sha256": rows["np-ln000001-aaaa"]["sha256"]}
+    assert signer.challenge("np-ln000001-aaaa", {**base, "choice": "b"})["line"] == choice_line("b", "drop it")
+    c = signer.challenge("np-ln000001-aaaa", {**base, "choice": "*", "write_in": words})
+    assert c["line"] == CHOICE_MARK + "(*): " + words
+    assert signer.answer("np-ln000001-aaaa", sign.assertion(c["challenge"]))["choice"] == "*"
+    signed = json.loads((tmp_path / "sign" / "np-ln000001-aaaa.signed.json").read_text())["signed_message"]
+    assert signed.split("\n")[-1] == c["line"] and signed == MESSAGE + "\n" + c["line"]
+    plain = {"signer_fp": key.fingerprint, "request_sha256": rows["np-ln000002-aaaa"]["sha256"]}
+    assert "line" not in signer.challenge("np-ln000002-aaaa", plain)

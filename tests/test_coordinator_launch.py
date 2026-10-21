@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import sqlite3
 import stat
 import sys
@@ -192,8 +194,17 @@ def test_a_woken_launch_starts_and_reads_its_ids_back_by_name(store, fake, live_
     assert stat.S_IMODE(brief.stat().st_mode) == 0o600
     text = brief.read_text()
     assert launch_id in text and ln.session_key in text and '"please fix the flaky test"' in text
-    assert f"levain coord claim --launch {launch_id} --session {ln.session_key}" in text
+    from levain import install as inst
+    lv = inst.coordinator_levain(sys.executable)
+    assert f"`{lv} coord claim --launch {launch_id} --session {ln.session_key}" in text
     assert "--by coordinator --token N" in text and "DATA" in text
+    # every levain command the brief gives is one the coordinator install's allow rules match as written (Claude Code
+    # matches a rule against the command's own spelling: a bare `levain` would be asked about, 1021+11's real launch)
+    prefixes = [r.removeprefix("Bash(").removesuffix(":*)") for r in inst.coordinator_allow(sys.executable)]
+    commands = [c for c in re.findall(r"`([^`]+)`", text) if "-m levain" in c or c.startswith("levain")]
+    assert len(commands) >= 8 and "levain coord" not in text.replace(f"{lv} coord", "")
+    for command in commands:
+        assert any(command.startswith(p + " ") for p in prefixes), command
     # the active session holds the bootstrap lease for a full TTL, and claims it as the brief says
     assert store.coord_claim(launch_id, ln.session_key) == store.coord_status()["lease"]["token"]
 
@@ -448,6 +459,68 @@ def test_coord_agent_sets_up_the_install(tmp_home, qdir, fake, capsys):
     got = cl.launch_session(CoordStore(qdir), CoordStore(qdir).pending_coordinator().launch_id)
     assert got.started, got
     assert next(c for c in fake.calls() if c["argv"][:1] == ["--bg"])["cwd"] == str(target)
+
+
+def test_the_coordinator_install_pre_approves_its_own_three_verbs_and_a_reused_install_gets_none(
+        tmp_home, qdir, tmp_path, capsys):
+    # np-6843ca07 (a), signed: the coordinator's own install pre-approves only levain coord / drops / thread
+    from levain import install as inst
+    from levain.cli import main as levain_main
+
+    def allow(d):
+        return json.loads((d / ".claude" / "settings.json").read_text())["permissions"]["allow"]
+
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    bash = [r for r in allow(target) if r.startswith("Bash(")]
+    lv = inst.coordinator_levain(sys.executable)
+    assert lv == f"{shlex.quote(sys.executable)} -P -m levain"
+    assert bash == [f"Bash({lv} coord:*)", f"Bash({lv} drops:*)", f"Bash({lv} thread:*)"]
+    # the brief reads the spelling back from the install itself (a launch from another interpreter tells the session
+    # what THIS install allows), and an install from before the interpreter was named keeps its bare levain
+    assert inst.installed_coordinator_levain(target, sys.executable) == lv
+    # np-be8ebe0a (a): Levain's own project MCP servers, and only those, are approved for the background session
+    settings = json.loads((target / ".claude" / "settings.json").read_text())
+    mcp = json.loads((target / ".mcp.json").read_text())["mcpServers"]
+    assert settings["enabledMcpjsonServers"] == list(inst.COORDINATOR_MCP_SERVERS) == sorted(mcp)
+    assert inst.persisted_role(target) == "coordinator"
+    assert levain_main(["update", "--path", str(target)]) == 0      # a re-render keeps them
+    assert [r for r in allow(target) if r.startswith("Bash(")] == bash
+    # a live install made by plain init and then named as the coordinator's is used as is: nothing pre-approved
+    plain = tmp_path / "plain"
+    answers = tmp_path / "answers.json"
+    answers.write_text(json.dumps(cl._install_answers()))
+    assert inst.run_init(plain, "claude-code", force=False, answers_file=answers, default_grants="no") == 0
+    _main(qdir, capsys, "coord", "agent", "claude", "--cwd", str(plain))
+    assert not [r for r in allow(plain.resolve()) if r.startswith("Bash(")]
+    assert "enabledMcpjsonServers" not in json.loads((plain.resolve() / ".claude" / "settings.json").read_text())
+    assert inst.persisted_role(plain.resolve()) is None
+    assert inst.installed_coordinator_levain(plain.resolve(), sys.executable) is None
+    capsys.readouterr()
+    # a damaged or hand-edited record never reads as the role
+    config = target / ".levain" / "config.json"
+    for body in ("{not json", '["coordinator"]', '{"role": "Coordinator"}'):
+        config.write_text(body)
+        assert inst.persisted_role(target) is None, body
+
+
+def test_a_session_levain_launched_keeps_to_the_coordinators_door(store, qdir, capsys, monkeypatch):
+    # the pre-approved trees grant nothing only if a launched session cannot write as the operator (L3 r1 codex HIGH)
+    launch_id = woken(store)
+    _, why = store.launch_activate(launch_id, harness_session_id="sess-coord")
+    assert why is None
+    key = store.launch_by_harness_session("sess-coord").session_key
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-coord")
+    tok = json.loads(_main(qdir, capsys, "coord", "claim", "--launch", launch_id, "--session", key, "--json").out)
+    _main(qdir, capsys, "thread", "list")
+    for argv in (("coord", "take"), ("coord", "wake"), ("coord", "agent", "none"),
+                 ("coord", "release", "--token", str(tok["token"]))):
+        out = _main(qdir, capsys, *argv, rc=1)
+        assert "session Levain launched" in out.err, (argv, out.err)
+    _main(qdir, capsys, "coord", "release", "--by", "coordinator", "--token", str(tok["token"]))
+    # the operator's own session is not a launch: its take stands
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-operator")
+    _main(qdir, capsys, "coord", "take")
 
 
 def test_coord_agent_never_installs_over_a_directory_with_files(tmp_home, qdir, tmp_path, capsys):
@@ -1081,3 +1154,26 @@ def test_a_store_without_envelopes_pins_nothing(qdir, tmp_path):
     ln = s.launch_request(token, harness="claude", threads=[t.thread_id])
     got, refused = s.launch_activate(ln.launch_id, harness_session_id="sid-x")
     assert refused is None and got.pinned_envelope_id is None
+
+
+def test_the_brief_spelling_is_looked_up_as_exact_rules_never_parsed(tmp_path):
+    # what the install allows, found as exact strings: this interpreter's rules, else an older install's bare ones;
+    # anything else (no role, another interpreter's rules, a look-alike) is None and the caller's commands ask
+    from levain import install as inst
+    here, other = "/venv-a/bin/python", "/venv b/bin/python"
+    d = tmp_path / "install"
+    (d / ".claude").mkdir(parents=True)
+
+    def rules(allow, role="coordinator"):
+        (d / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": allow}}))
+        (d / ".levain").mkdir(exist_ok=True)
+        (d / ".levain" / "config.json").write_text(json.dumps({"role": role} if role else {}))
+        return inst.installed_coordinator_levain(d, here)
+
+    assert rules(list(inst.coordinator_allow(here))) == inst.coordinator_levain(here)
+    assert rules(["Bash(levain coord:*)", "Bash(levain drops:*)", "Bash(levain thread:*)"]) == "levain"
+    assert rules(list(inst.coordinator_allow(other))) is None          # another interpreter's install: asks
+    assert rules(list(inst.coordinator_allow(here)), role=None) is None  # a reused install: the operator's rules
+    for partial in (["Bash(make coord:*)", "Bash(make drops:*)", "Bash(make thread:*)"],
+                    list(inst.coordinator_allow(here))[:2]):
+        assert rules(partial) is None, partial

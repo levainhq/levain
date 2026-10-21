@@ -828,7 +828,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
                          hold=max(timedelta(seconds=hold), MIN_FILE_HOLD),
                          tier=AGENT_CONFIG_TIER if agent_config else DEFAULT_TIER,
                          event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None,
-                         resume=resume_meta_of(event))
+                         resume=resume_meta_of(event), model=event.get("model"))
     settled = False
     try:
         got: Decision | None = None
@@ -1487,7 +1487,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)  # the installed timeout - the margin
         request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input,
                              cwd=cwd, hold=timedelta(seconds=hold), tier=AGENT_CONFIG_TIER, event_id=event_id,
-                             resume=resume_meta_of(event))
+                             resume=resume_meta_of(event), model=event.get("model"))
     except Exception as exc:
         note(refused="failed")
         return _pre("deny", f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
@@ -1572,10 +1572,14 @@ def could_not_run(tier: str | None, what: str) -> dict[str, Any]:
 # row in a slot. The hold is :data:`DEFAULT_GATE_HOLD` (the settings file that could change it is the operator's,
 # outside the slot); the broker is polled every :data:`GATE_POLL`, then every broker_client.SLOW_POLL.
 #
-# KNOWN EDGE until F10 S2b (L3 r1 C): a slot session's consent limits are NOT enforced. Q13's limits are read from
-# the local queue, which a slot does not have, and an ungated call reaches the broker only when it is a file write
-# (W2-c3), where nothing counts it either; the broker has no limit verb yet. S2b adds one, asked on every PreToolUse.
-# Any public word about slots says so.
+# Every PreToolUse in a slot first asks the broker ``GATE`` (F10 S2b-2,
+# :func:`levain.consent.broker_client.gate_check`), before the call is classified: a session halted on an
+# irreversible call whose hold ended unanswered, or over a limit the operator set (limits apply when the broker has a
+# limits source: the production broker has none yet), is denied and its turn ended; GO lets the rest of this gate
+# run (GO is never an allow); the broker down, refusing or out of shape denies. A halt's release and a raised limit
+# are the operator side's (levain.qbroker.broker, GATE); a slot has no Extend.
+
+SLOT_STOP_REASON = "levain: stopped by the consent broker (a halt or a limit the operator set)."
 
 # who decided, in the gate's words, when the broker verified the decision (the hook never sees the signer's key, and
 # cannot tell an operator's signed answer from an allow the run's signed contract grant gave)
@@ -1586,9 +1590,12 @@ def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold:
               expected_uid: int | None = None, sleep: Callable[[float], None] = time.sleep,
               monotonic: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
     """The slot's gate output for one ``PreToolUse`` event, or ``None`` (the call goes on as the mode says). A
-    malformed event is :func:`_malformed`'s; a call :func:`gate_class` does not gate (protected paths: none) is
-    :func:`_slot_ungated`'s (``None`` unless a dispatch run's grant or queue decides it); a gated call is filed with the broker (``client``, default
-    :meth:`~levain.consent.broker_client.BrokerClient.from_env`) and held up to ``hold`` for a decision the broker
+    malformed event is :func:`_malformed`'s. Then, on EVERY call and before it is classified, the broker is asked
+    ``GATE`` (:func:`levain.consent.broker_client.gate_check`; ``client``, default
+    :meth:`~levain.consent.broker_client.BrokerClient.from_env`): halted, over a limit or the limits gate failed is
+    denied with the turn ended, and the broker down, refusing or out of shape denies every call, ungated ones too.
+    Past a GO, a call :func:`gate_class` does not gate (protected paths: none) is :func:`_slot_ungated`'s (``None``
+    unless a dispatch run's grant or queue decides it); a gated call is filed with the broker and held up to ``hold`` for a decision the broker
     verified, delivered as :func:`decision_output` names it; at the end of the hold it is denied with
     :func:`undecided_output`, its gap named by the request id (the operator side numbers gaps; the hook does not).
     Anything else once the call is gated (a settings file that names the socket variable,
@@ -1607,6 +1614,20 @@ def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold:
         return _malformed(event, None, AdapterSettings(), home=home)
     if tool_input is None:
         tool_input = {}
+    # GATE first, before the call is classified (F10 S2b-2): the session's halt and its limits, every call
+    try:
+        if queue_socket_planted(cwd, home=home):
+            return could_not_run("irreversible", "this call")
+        client = client if client is not None else broker_client.BrokerClient.from_env(expected_uid=expected_uid)
+        tool_use_id = event.get("tool_use_id")
+        stopped = broker_client.gate_check(
+            client, agent=AGENT, tool_name=tool_name, tool_input=tool_input,
+            tool_use_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None, sleep=sleep)
+    except Exception:  # noqa: BLE001 - fail closed: the broker down, refusing or malformed is a deny
+        return could_not_run("irreversible", "this call")
+    if stopped is not None:
+        # a halt or a limit ends the turn, as on the local path (_limits; the irreversible tier's _stop)
+        return _pre("deny", stopped, **{"continue": False, "stopReason": SLOT_STOP_REASON})
     try:
         tier = gate_class(tool_name, tool_input, cwd, home=home)
         if tier is None:

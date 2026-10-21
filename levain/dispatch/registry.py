@@ -309,8 +309,9 @@ def driver_template_digest(name: str) -> str | None:
 verifier_artifact_digest = artifact_digest
 
 
-# the shipped templates whose driver_input is {"steps": [one expectation per ticket step]}: the count is checked at accept,
-# so a mismatch is never found first by a run. A new template of that shape is added here, or its count goes unchecked.
+# the shipped templates whose driver_input is {"steps": [one expectation per ticket step]}: the count and
+# the driver's own reading of each expectation are checked at accept, so a mismatch is never found first by a run.
+# A new template of that shape is added here, or its count goes unchecked.
 _STEP_INDEXED_INPUT = frozenset({"output_compare"})
 
 
@@ -352,6 +353,14 @@ def _verifier_entry_problem(e: Any) -> str | None:
     driver_input = canonical_bytes(e["driver_input"])
     if len(driver_input) > MAX_DRIVER_INPUT_BYTES:
         return f"verifier {vid}'s driver_input is over {MAX_DRIVER_INPUT_BYTES} bytes as canonical JSON"
+    if tname in _STEP_INDEXED_INPUT:
+        # the driver's own reader, so what accept takes is exactly what a run reads (one rule, never a copy)
+        from levain.verifier_drivers import output_compare
+
+        try:
+            output_compare.expectations(driver_input)
+        except output_compare.Infrastructure as exc:
+            return f"verifier {vid}'s driver_input would be refused by the {tname} template on every run: {exc}"
     if e["driver_input_digest"] != _sha256(driver_input):
         return f"verifier {vid}'s driver_input_digest is not the digest of its driver_input"
     if e["verifier_artifact_digest"] != verifier_artifact_digest(e):

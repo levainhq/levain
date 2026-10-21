@@ -124,20 +124,23 @@ def replace_file(path: Path, data: bytes, mode: int = ROW_MODE) -> None:
 
 
 class QueueStore:
-    """``L/queue``: both directories must exist (setup makes them); nothing here creates them."""
+    """``L/queue``: both directories must exist (setup makes them); nothing here creates them. ``create`` false
+    (a reader that is not the broker): the queue id must already be there, and nothing is written."""
 
-    def __init__(self, root: Path | str) -> None:
+    def __init__(self, root: Path | str, *, create: bool = True) -> None:
         self.root = Path(root)
         self.requests = self.root / "requests"
         self.answers = self.root / "answers"
         for d in (self.requests, self.answers):
             if not d.is_dir() or d.is_symlink():
                 raise FileNotFoundError(f"{d} is not a directory (setup makes it)")
-        self.queue_id = self._queue_id()
+        self.queue_id = self._queue_id(create)
 
-    def _queue_id(self) -> str:
+    def _queue_id(self, create: bool = True) -> str:
         path = self.requests / _QUEUE_ID
         data = _read_untrusted(path)
+        if data is None and not create:
+            raise FileNotFoundError(f"{path} does not exist (the broker makes it)")
         if data is None:
             fresh = "qb-" + os.urandom(16).hex()
             try:

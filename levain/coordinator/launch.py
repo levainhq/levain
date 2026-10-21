@@ -211,7 +211,7 @@ def setup_install(directory: Path, *, emit: Callable[[str], None] = print) -> tu
         emit(f"setting up {target} as a Levain install for Claude Code (levain init, non-interactive)")
         with contextlib.redirect_stdout(sys.stderr):
             code = inst.run_init(target, "claude-code", force=False, answers_file=answers_file,
-                                 default_grants="no")
+                                 default_grants="no", role="coordinator")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     target = target.resolve()
@@ -239,8 +239,13 @@ def _queued(store: CoordStore) -> list[Any]:
 
 
 def _brief_text(store: CoordStore, launch: Any) -> str:
+    from levain.install import coordinator_levain, installed_coordinator_levain
+
     q = shlex.quote(str(store.directory))
     tail = f"--queue-dir {q}"
+    # the spelling the coordinator install's own allow rule names, so a session that runs these as written is not
+    # asked; an install with no such rule (a reused live install) gets this interpreter's, and its commands ask
+    lv = installed_coordinator_levain(Path(launch.cwd), sys.executable) or coordinator_levain(sys.executable)
     lines = [
         f"# Levain {launch.role} brief: launch {launch.launch_id}",
         "",
@@ -252,21 +257,21 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "One session holds the coordinator role at a time. Every thread write you make carries the lease token, and is "
         "refused once the lease is lost or past its until.",
         "",
-        f"- Claim it first: `levain coord claim --launch {launch.launch_id} --session {launch.session_key} {tail}`. "
+        f"- Claim it first: `{lv} coord claim --launch {launch.launch_id} --session {launch.session_key} {tail}`. "
         "It prints your token N.",
-        f"- Keep it while you work: `levain coord beat --token N {tail}` (each beat holds it "
+        f"- Keep it while you work: `{lv} coord beat --token N {tail}` (each beat holds it "
         f"{int(LEASE_TTL.total_seconds() // 60)} more minutes).",
-        f"- See it: `levain coord status {tail}`.",
-        f"- Hand it back when you stop: `levain coord release --by coordinator --token N {tail}`.",
+        f"- See it: `{lv} coord status {tail}`.",
+        f"- Hand it back when you stop: `{lv} coord release --by coordinator --token N {tail}`.",
         "",
         "## Your writes",
         "",
         f"Every write goes `--by coordinator --token N {tail}`:",
         "",
-        f"- split a drop into threads: `levain drops split DROP_ID --thread KIND:TITLE --by coordinator --token N "
+        f"- split a drop into threads: `{lv} drops split DROP_ID --thread KIND:TITLE --by coordinator --token N "
         f"{tail}` (KIND is work, ask, note or relay; one intent per thread);",
-        f"- move or fix a thread: `levain thread state|set|merge|detach|add ... --by coordinator --token N {tail}`;",
-        f"- read: `levain drops list {tail}`, `levain drops show DROP_ID {tail}`, `levain thread list {tail}`.",
+        f"- move or fix a thread: `{lv} thread state|set|merge|detach|add ... --by coordinator --token N {tail}`;",
+        f"- read: `{lv} drops list {tail}`, `{lv} drops show DROP_ID {tail}`, `{lv} thread list {tail}`.",
         "",
         "## The drops waiting",
         "",
@@ -283,7 +288,7 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         words = json.dumps(unshowable.mark(d.words), ensure_ascii=False)
         lines.append(f"- `{d.drop_id}` ({d.surface}, {d.received_at}, {where}): {words}")
     lines.append("")
-    lines.append(f"More: `levain drops list {tail}`.")
+    lines.append(f"More: `{lv} drops list {tail}`.")
     return "\n".join(lines) + "\n"
 
 

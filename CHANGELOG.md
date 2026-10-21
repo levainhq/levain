@@ -6,8 +6,31 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+- **The coordinator `levain coord agent` sets up runs `levain coord`, `levain drops` and `levain thread` without
+  asking, and nothing else.** Those commands grant no authority (a signed envelope still does), and every other
+  command asks you as it does in any install. Claude Code applies this only once you have trusted the directory. A
+  live install you point it at with `--cwd` is used as is, with nothing pre-approved.
+  - Those commands name the Python that set the install up (`<python> -P -m levain coord ...`), because a background
+    session does not reliably have `levain` on its PATH.
+  - Levain's own MCP servers (anneal_memory, levain_band, levain_dispatch) are approved in that install, so a
+    coordinator starting in the background no longer waits on Claude Code's "new MCP servers found" dialog, which
+    nobody can answer there. A server you add yourself still asks.
+
+### Known edges
+- A coordinator started by a different Levain than the one that set up `~/.levain/coordinator` asks before each of
+  its commands; run `levain update --path ~/.levain/coordinator` from the Levain that starts it.
+
+## [0.11.14] — 2026-10-21
+
 ### Added
 - **Choice sign requests.** A caller can file one card with 2-8 options (`levain-sign-choice/1`). You tap one on the phone and sign it with your passkey; the signature covers the message with your choice as its last line, so a verifier reads the decision from the signed bytes, checked with stock `ssh-keygen -Y verify`.
+  - A card can carry the caller's recommendation (`recommended`, one of its option keys). The phone marks it and never
+    selects it, and it is not signed: you still tap your choice.
+  - A card can take your own words (`write_in: true`): type an answer and it signs as the choice line
+    `(*): <your words>`, held to the same rules as an option's text (one line, 200 characters, nothing hidden). The
+    words are frozen and the exact line is shown from the moment you tap until the signing ends. A verifier reads a
+    write-in only when it asks for one (`parse_choice(..., write_in=True)`).
 - **A link straight onto one card.** `#sign=<id>` on the phone page opens it on that request. `levain consent phone --link-file` writes the page and token for a caller building such a link; `--token-file` keeps the token across restarts, so links you already hold keep working.
 - **Opt out of signed answers.** `levain consent signed-answers --set off|authority-only|all` (default authority-only) is read by a caller before it files: off files nothing; authority-only signs only answers that authorise an act.
 - **`levain coord`: one coordinator at a time.** A drop that arrives while nobody holds the coordinator role asks for
@@ -39,6 +62,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   A template whose verifier id 0.11 accepted but this version does not (uppercase, `.`, `_`, `@`, `:`, `/`, `+`, or over 48
   characters) is refused by name until it is re-signed.
   - A control store holding the new `verifier` item cannot be read by Levain 0.11.x, so do not downgrade after signing one.
+- **The dispatch job store moves to format 4** the first time this version opens it. Your jobs are kept. After that,
+  Levain 0.11.13 refuses to open the store, so do not downgrade.
+
+### Fixed
+- **A job's capability no longer starts with `-`.** About one in 64 capabilities that 0.11.10 to 0.11.13 handed a
+  planner began with a dash, and `--capability <it>` was refused as a missing value. New ones never do. A job filed
+  before you upgrade is still reached with `--capability=<it>`, which the refusals and `--help` now show.
 
 ### Known edges
 - A coordinator launch that fails (an untrusted directory, a session that never appears) counts against the

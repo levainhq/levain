@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "levain"
-version = "0.11.14.dev0"
+version = "0.11.15.dev0"
 description = "A consent queue and memory harness for Claude Code and Codex: permission prompts answered by signed standing grants or signed human answers, with an audit trail, plus memory that persists across sessions."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -162,7 +162,10 @@ app = ["mcp>=1.27,<2"]
 # [openhands] and [app] one after the other left one of them broken, in either order, with no
 # warning from pip or uv (measured 2026-10-02, macOS + Linux, pip + uv).
 openhands = ["openhands-sdk==1.26.0", "openhands-tools==1.26.0", "mcp>=1.27,<2"]
-dev = ["pytest>=7.4", "mcp>=1.27,<2"]
+# The S1 gateway's HTTP parser (`levain.broker.front`): h11, strict and sans-IO; 0.16.0 is the release that
+# fixes CVE-2025-43859, its one advisory. Only an isolation install runs the gateway.
+isolation = ["h11>=0.16.0"]
+dev = ["pytest>=7.4", "mcp>=1.27,<2", "h11>=0.16.0"]
 
 [project.scripts]
 levain = "levain.launch:main"

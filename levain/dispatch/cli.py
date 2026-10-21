@@ -276,12 +276,12 @@ def planner_session(agent: str | None, session: str | None) -> tuple[str | None,
         if agent is not None and agent != detected_agent:
             raise InputRefused(f"--agent {_safe(agent)[:40]!r} is not the agent this process runs under "
                                f"({detected_agent}, from its process or environment); a job filed by another agent "
-                               "is reached with --capability")
+                               "is reached with --capability=<capability>")
         if session is not None and session != detected_session:
             shown = "none" if detected_session is None else repr(_safe(detected_session)[:80])
             raise InputRefused(f"--session {_safe(session)[:80]!r} is not this session ({shown}, from "
                                f"{detected_agent}'s environment); a job filed in another session is reached with "
-                               "--capability")
+                               "--capability=<capability>")
         agent, session = detected_agent, detected_session
     session = caps.NO_SESSION if session is None else session
     return agent, session if caps.session_problem(session) is None else caps.NO_SESSION
@@ -1101,7 +1101,7 @@ def _run(args: argparse.Namespace, out: Any) -> int:
         cap = planner_capability(store.directory, agent, session, args.job, args.capability)
         if cap is None:
             raise CapabilityRefused("recommend is the filing planner's alone: this session's record holds no "
-                                    f"capability for {str(args.job)[:40]!r}; pass --capability")
+                                    f"capability for {str(args.job)[:40]!r}; pass --capability=<capability>")
         job = store.recommend(args.job, cap, onto=args.onto, run=args.run)
         proposal = "" if args.onto is None and args.run is None else (
             " Proposed for the operator's authorise: " + ", ".join(
@@ -1138,7 +1138,7 @@ def _run(args: argparse.Namespace, out: Any) -> int:
             cap = planner_capability(store.directory, agent, session, args.job, args.capability)
             if cap is None:
                 raise CapabilityRefused("an agent lands only a job it filed: this session's record holds no "
-                                        f"capability for {str(args.job)[:40]!r}; pass --capability")
+                                        f"capability for {str(args.job)[:40]!r}; pass --capability=<capability>")
             store.check_capability(args.job, cap)
 
         def land_it(seen: dict[str, Job]) -> dadopt.Landing:
@@ -1263,14 +1263,16 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     cn = sub.add_parser("cancel", help="Cancel a job: as its planner (capability), else as the operator (signed).")
     cn.add_argument("job")
     cn.add_argument("--reason", default="", help="One line kept with a signed cancel (may be empty).")
-    cn.add_argument("--capability", default=None, help="The job's capability (default: this session's record).")
+    cn.add_argument("--capability", default=None,
+                    help="The job's capability, as --capability=<it> (default: this session's record).")
     cn.add_argument("--human", action="store_true",
                     help="Cancel as the operator (signed) even when this session's record holds the capability.")
     planner(cn)
     signer(cn)
     rc = sub.add_parser("recommend", help="Mark a verified job recommended (planner; advisory, authorises nothing).")
     rc.add_argument("job")
-    rc.add_argument("--capability", default=None, help="The job's capability (default: this session's record).")
+    rc.add_argument("--capability", default=None,
+                    help="The job's capability, as --capability=<it> (default: this session's record).")
     rc.add_argument("--onto", default=None,
                     help="The branch you propose the operator authorise this onto (advisory; the phone's card).")
     rc.add_argument("--run", type=int, default=None,
@@ -1289,7 +1291,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ld.add_argument("job")
     ld.add_argument("--onto", default=None, help="The branch a land by rule lands on (an authorised job's is fixed).")
     ld.add_argument("--capability", default=None,
-                    help="The job's capability, for a planner (default: this session's record).")
+                    help="The job's capability, for a planner, as --capability=<it> (default: this session's record).")
     data_root(ld)
     planner(ld)
     cf = sub.add_parser(

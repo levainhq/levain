@@ -67,9 +67,12 @@ from levain.cockpit.consent import utc_stamp
 from levain.consent.record import ExternalGateRequest, redact_display, tool_input_digest
 from levain.qbroker import wire
 
-__all__ = ["BROKER_ACCOUNT", "CAP_ENV", "FAST_POLLS", "GO", "IO_TIMEOUT", "PENDING_REFUSALS", "REQUEST_RETRY",
-           "SLOW_POLL", "SOCKET_ENV", "BrokerClient", "BrokerError", "UNGATED_TIER", "broker_uid", "file_and_hold",
-           "file_ungated", "gate_request", "grant_member", "hold_for_decision", "in_slot"]
+__all__ = ["BROKER_ACCOUNT", "CAP_ENV", "FAST_POLLS", "GATE_BACKOFF", "GATE_TOOL_USE_ID_MAX", "GO",
+           "IO_TIMEOUT", "PENDING_REFUSALS", "REQUEST_RETRY", "SLOW_POLL", "SOCKET_ENV",
+           "BrokerClient", "BrokerError", "UNGATED_TIER", "broker_uid",
+           "file_and_hold", "GATE_FAILED", "GATE_GO", "GATE_HALTED", "GATE_OVER", "SLOT_HALT_TEXT",
+           "SLOT_LIMITS_FAILED_TEXT", "SLOT_OVER_TEXT", "file_ungated", "gate_check", "gate_request",
+           "grant_member", "hold_for_decision", "in_slot"]
 
 SOCKET_ENV = "LEVAIN_QUEUE_SOCKET"
 CAP_ENV = "LEVAIN_QUEUE_CAP"
@@ -94,6 +97,11 @@ FAST_POLLS = 8
 SLOW_POLL = 1.0
 # a REQUEST refused rate-limited is sent once more after this long (well past the broker's token interval)
 REQUEST_RETRY = 1.0
+# the pauses before re-sending a rate-limited GATE (gate_check): short, bounded, about 1.5 s in all; GATE has its own
+# per-slot bucket at the broker (levain.qbroker.broker.GATE_BURST), so this only spreads a parallel batch past it
+GATE_BACKOFF = (0.05, 0.1, 0.2, 0.4, 0.8)
+# the longest tool_use_id a GATE carries (levain.qbroker.broker.TOOL_USE_ID_MAX)
+GATE_TOOL_USE_ID_MAX = 256
 # a socket timeout and time.monotonic read different clocks: a call that ran out this close to the hold's end ended
 # the hold (undecided), it did not fail to run
 DEADLINE_SLOP = 0.05
@@ -234,6 +242,75 @@ class BrokerClient:
         if keys == {"decision"} and got["decision"] in DECISIONS:
             return got["decision"]
         raise BrokerError("malformed", "ANSWER? answered neither a decision nor pending")
+
+    def gate(self, *, agent: str, tool_name: str, tool_input: Any, tool_use_id: str | None,
+             timeout: float | None = None) -> tuple[str, str | None]:
+        """``GATE`` (F10 S2b-2, :mod:`levain.qbroker.broker`): ``("go", None)``, ``("halted", request_id)``,
+        ``("over-limit", kind)`` or ``("limits-failed", reason)``. Any refusal, or an answer of any other shape,
+        raises :class:`BrokerError` (the gate denies). GO is not allow: the caller's gate still runs. A
+        ``tool_use_id`` is sent only when it is a string of 1 to :data:`GATE_TOOL_USE_ID_MAX` characters (the
+        broker's bound); any other is left out, so the call is counted with no repeat key (never fewer)."""
+        fields: dict[str, Any] = {"agent": agent, "tool_name": tool_name,
+                                  "input_digest": tool_input_digest(tool_input)}
+        if isinstance(tool_use_id, str) and 0 < len(tool_use_id) <= GATE_TOOL_USE_ID_MAX:
+            fields["tool_use_id"] = tool_use_id
+        got = self.call("GATE", timeout=timeout, **fields)
+        keys, verdict = set(got) - {"id", "ok"}, got.get("gate")
+        if verdict == GATE_GO and keys == {"gate"}:
+            return GATE_GO, None
+        if verdict == GATE_HALTED and keys == {"gate", "request_id"} and isinstance(got["request_id"], str):
+            return GATE_HALTED, got["request_id"]
+        if verdict == GATE_OVER and keys == {"gate", "kind"} and (got["kind"] is None or isinstance(got["kind"], str)):
+            return GATE_OVER, got["kind"]
+        if verdict == GATE_FAILED and keys == {"gate", "reason"} and isinstance(got["reason"], str):
+            return GATE_FAILED, got["reason"]
+        raise BrokerError("malformed", "GATE answered none of go, halted, over-limit, limits-failed")
+
+
+# GATE's four answers (levain.qbroker.broker.GATE_VERDICTS)
+GATE_GO, GATE_HALTED, GATE_OVER, GATE_FAILED = "go", "halted", "over-limit", "limits-failed"
+# the slot's halt words: the operator side numbers gaps, the hook names the halting request
+SLOT_HALT_TEXT = ("levain: this session is halted on request {r}: an irreversible call's hold ended with no answer. "
+                  "No further tool calls are allowed. Write a short summary of what is done and end your turn.")
+# an over-limit GATE: Q13's budget words, with what the operator can do for a slot (the local
+# ``levain limits extend`` is not a slot's: the broker reads its limits from its own settings, and has no Extend hold)
+SLOT_OVER_TEXT = ("levain: STOPPED by a budget the operator set: this session reached {limit}. This is not "
+                  "a fault and not a denial of the work. Do not try to continue it another way; the session goes on "
+                  "only when the operator raises that limit in the queue broker's limits settings, or starts a new "
+                  "session.")
+# a limits-failed GATE: the gate itself failed, not a budget; the operator repairs or moves the limits database
+SLOT_LIMITS_FAILED_TEXT = ("levain: the limits gate could not run, so the action was NOT taken: {why}. This is a fault "
+                           "of the limits store, not a budget. The operator repairs or moves aside the broker's limits "
+                           "database (requests/limits/limits.db under the queue); do not retry this call and do not "
+                           "achieve it another way.")
+
+
+def gate_check(client: BrokerClient, *, agent: str, tool_name: str, tool_input: Any, tool_use_id: str | None,
+               sleep: Callable[[float], None] = time.sleep) -> str | None:
+    """The slot gate's first step on EVERY PreToolUse, before the call is classified: ``None`` on the broker's GO
+    (the gate goes on), else the deny text (:data:`SLOT_HALT_TEXT`, :data:`SLOT_OVER_TEXT` or
+    :data:`SLOT_LIMITS_FAILED_TEXT`). A ``rate-limited`` GATE is sent again after each pause of :data:`GATE_BACKOFF`
+    (bounded); a refusal past the last, or any other failure, raises :class:`BrokerError` (the caller denies: fail closed)."""
+    from levain.consent import limits
+
+    for pause in (*GATE_BACKOFF, None):
+        try:
+            verdict, detail = client.gate(agent=agent, tool_name=tool_name, tool_input=tool_input,
+                                          tool_use_id=tool_use_id)
+            break
+        except BrokerError as exc:
+            if exc.name != "rate-limited" or pause is None:
+                raise
+            sleep(pause)
+    if verdict == GATE_GO:
+        return None
+    if verdict == GATE_HALTED:
+        return SLOT_HALT_TEXT.format(r=detail)
+    if verdict == GATE_FAILED:
+        return SLOT_LIMITS_FAILED_TEXT.format(why=detail)
+    label = limits.LABELS.get(detail) if isinstance(detail, str) else None
+    # an unknown or missing kind names no budget it cannot name (L3 r2 complement LOW 1: "reached its a limit")
+    return SLOT_OVER_TEXT.format(limit=f"its {label} limit" if label else "a configured limit")
 
 
 def grant_member(agent: str, tool_name: str, tool_input: Any, root: str) -> dict[str, Any] | None:
