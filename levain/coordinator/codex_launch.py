@@ -534,8 +534,8 @@ def launch(store: CoordStore, ln: Any) -> Any:
         status = th.get("status") if isinstance(th.get("status"), dict) else {}
         if status.get("type") != "active":
             # an idle thread runs no prompt: activating it would record a coordinator that is not running
-            return fail(f"thread {tid} reads back {str(status.get('type') or 'with no status')[:60]}, with no turn "
-                        f"running; {stop_ours()}")
+            return fail(f"turn {turn_id} read back {str(status.get('type') or 'no status')[:60]} on thread {tid}, "
+                        f"not active (a turn that ended before the read back, or never ran); {stop_ours()}")
         try:
             _active, refused = store.launch_activate(launch_id, harness_session_id=tid, argv_sha256=argv_sha)
         except LeaseRefused as exc:

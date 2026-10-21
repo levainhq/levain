@@ -138,7 +138,8 @@ def test_a_record_inside_a_workspace_or_under_a_file_shuts_the_door_for_every_co
         monkeypatch.chdir(here)
         assert main(["thread", "list", "--queue-dir", str(q)]) == 1     # a DOOR verb too
         err = capsys.readouterr().err
-        assert "lies inside a coordinator's workspace" in err and "repair or delete" in err, err
+        assert "lies inside a coordinator's workspace" in err and "point LEVAIN_HOME outside it" in err, err
+        assert "repair or delete" not in err, err
     with pytest.raises(OSError):
         door.record(tmp_path / "coordinator")     # never recorded while a record lies inside it
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "flat"))
@@ -147,6 +148,38 @@ def test_a_record_inside_a_workspace_or_under_a_file_shuts_the_door_for_every_co
     assert main(["coord", "take", "--queue-dir", str(q)]) == 1
     err = capsys.readouterr().err
     assert "Not a directory" in err and str(tmp_path / "flat" / "consent" / door.RECORD_NAME) in err, err
+
+
+def test_a_record_inside_a_hint_only_workspace_off_the_cwd_chain_shuts_the_door(tmp_path, monkeypatch, capsys):
+    """Reproduced (coordint/fix3/repro_before.txt, FIX 1): with the record inside a legacy workspace that carries only
+    the role hint and is not on the working directory's chain, recorded() trusted it; once that coordinator emptied it
+    and the recorded workspace's hint was gone, `coord take` ran there."""
+    from levain.cli import main
+    from levain.coordinator import door
+
+    legacy = tmp_path / "legacy"
+    (legacy / ".levain").mkdir(parents=True)
+    (legacy / ".levain" / "config.json").write_text('{"role": "coordinator"}\n')
+    monkeypatch.setenv("LEVAIN_HOME", str(legacy / "home"))
+    monkeypatch.setattr(door, "_own_home", lambda: legacy / "home2")
+    ws = _workspace(tmp_path)
+    with pytest.raises(door.RecordUnreadable) as got:
+        door.record(ws)
+    assert got.value.inside == legacy
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    for here in (ws / "sub", tmp_path):
+        monkeypatch.chdir(here)
+        assert main(["coord", "take", "--queue-dir", str(q)]) == 1
+        err = capsys.readouterr().err
+        assert f"lies inside a coordinator's workspace ({legacy})" in err, err
+    # a hint above the record that cannot be looked in fails closed too: the coordinator can make its own unreadable
+    (legacy / ".levain" / "config.json").chmod(0)
+    try:
+        with pytest.raises(door.RecordUnreadable, match="cannot be read"):
+            door.recorded()
+    finally:
+        (legacy / ".levain" / "config.json").chmod(0o600)
 
 
 def test_a_codex_coordinator_workspace_is_marked_by_the_one_role_render(tmp_path, capsys, monkeypatch):

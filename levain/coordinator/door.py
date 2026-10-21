@@ -19,7 +19,8 @@ spelling (a case-insensitive volume has many spellings of one). The workspace's 
 stays a HINT: it also makes a directory the coordinator's (so a workspace rendered before the record existed is still
 doored), but its absence or damage never makes one outside, since the coordinator can write that file. A record that
 exists and cannot be read, whose directory is not one, or that lies inside a recorded or hinted coordinator workspace
-fails CLOSED, for every command: the door cannot tell any directory is not the coordinator's. No database is read, so
+(the record file's own ancestors are walked for the hint, as the working directory's are) fails CLOSED, for every
+command: the door cannot tell any directory is not the coordinator's. No database is read, so
 no store state (locked,
 corrupt, another store) can open the door. Consequences, accepted: the operator running ``levain`` from inside that
 workspace is doored too (it is Levain's directory, not his), and an agent that changes directory out of it leaves the
@@ -61,11 +62,13 @@ _RECORD_MAX = 1024 * 1024
 
 class RecordUnreadable(Exception):
     """The coordinator record exists and cannot be read as one, or lies where a coordinator could write it: the door
-    fails closed on it. ``path`` is the record file the operator repairs or deletes by hand."""
+    fails closed on it. ``path`` is the record file; ``inside`` is the coordinator workspace it lies in, when that is
+    the cause (the operator moves the record out; repairing or deleting the file would change nothing)."""
 
-    def __init__(self, message: str, path: Path | None = None) -> None:
+    def __init__(self, message: str, path: Path | None = None, inside: Path | None = None) -> None:
         super().__init__(message)
         self.path = path
+        self.inside = inside
 
 
 def _own_home() -> Path | None:
@@ -119,9 +122,11 @@ def _idents(dirs: frozenset[str] | set[str]) -> set[tuple[int, int]]:
     return {i for i in map(_ident, dirs) if i is not None}
 
 
-def _inside(path: Path, dirs: set[tuple[int, int]]) -> bool:
-    """Whether ``path`` or one of its parents is one of the directories ``dirs`` identifies."""
-    return bool(dirs) and any(_ident(d) in dirs for d in (path, *path.parents))
+def _inside(path: Path, dirs: set[tuple[int, int]]) -> Path | None:
+    """The nearest of ``path`` and its parents that is one of the directories ``dirs`` identifies, or None."""
+    if not dirs:
+        return None
+    return next((d for d in (path, *path.parents) if _ident(d) in dirs), None)
 
 
 def _read_record(path: Path) -> frozenset[str]:
@@ -154,21 +159,52 @@ def _read_record(path: Path) -> frozenset[str]:
     return frozenset(dirs)
 
 
+def _lies_inside(path: Path, ws: Path) -> RecordUnreadable:
+    return RecordUnreadable(f"{path} lies inside a coordinator's workspace ({ws}), where that coordinator could "
+                            "rewrite it", path, inside=ws)
+
+
 def _refuse_inside(paths: list[Path], dirs: set[tuple[int, int]]) -> None:
     """Raise :class:`RecordUnreadable` when a record file lies in one of the coordinator workspaces ``dirs``
     identifies: that coordinator could rewrite it, so it is no evidence of anything."""
     for path in paths:
-        if _inside(path, dirs):
-            raise RecordUnreadable(f"{path} lies inside a coordinator's workspace, where that coordinator could "
-                                   "rewrite it", path)
+        ws = _inside(path, dirs)
+        if ws is not None:
+            raise _lies_inside(path, ws)
+
+
+def _hint_walk(start: Path) -> tuple[Path | None, OSError | None]:
+    """The nearest of ``start`` and its parents whose own hint records the coordinator role, or None; with the
+    ``OSError`` that stopped the walk at a directory whose hint could not be looked in (then no directory)."""
+    for d in (start, *start.parents):
+        try:
+            if _marked(d):
+                return d, None
+        except OSError as exc:
+            return None, exc
+    return None, None
+
+
+def _refuse_hinted(path: Path) -> None:
+    """Raise :class:`RecordUnreadable` when an ancestor of the record file ``path`` carries the coordinator role hint,
+    or has a hint that cannot be looked in: that may be a workspace no record names yet (one from before the record),
+    whose coordinator could rewrite the file. Unlike the working directory's walk, an unreadable hint here fails
+    closed, since the coordinator can make its own hint unreadable."""
+    ws, err = _hint_walk(path.parent)
+    if ws is not None:
+        raise _lies_inside(path, ws)
+    if err is not None:
+        raise RecordUnreadable(f"{path}: a coordinator role hint above it cannot be read ({err.strerror or err})",
+                               path)
 
 
 def recorded() -> frozenset[str]:
     """Every coordinator workspace a record names (real paths). Raises :class:`RecordUnreadable` when a record cannot
-    be read, or when a record file lies inside a workspace a record names."""
+    be read, or when a record file lies inside a workspace a record names or a role hint marks."""
     paths = _record_paths()
     out: frozenset[str] = frozenset()
     for path in paths:
+        _refuse_hinted(path)
         out |= _read_record(path)
     _refuse_inside(paths, _idents(out))
     return out
@@ -297,7 +333,7 @@ def workspace(cwd: str | None = None) -> Path | None:
     directory) and its parents that the coordinator record names (checked first, by real path as well), else the
     nearest whose own ``.levain/config.json`` hint records the coordinator role, or None. A directory whose hint
     cannot be looked in stops the hint walk and counts as not inside; so does a working directory that cannot be
-    read. Raises :class:`RecordUnreadable` when the record exists and cannot be read."""
+    read. Raises :class:`RecordUnreadable` as :func:`recorded` does."""
     try:
         here = Path(cwd if cwd is not None else os.getcwd())
     except OSError:
@@ -307,16 +343,8 @@ def workspace(cwd: str | None = None) -> Path | None:
     for d in _chain(here):
         if str(d) in names or (ids and _ident(d) in ids):
             return d
-    for d in (here, *here.parents):
-        try:
-            hinted = _marked(d)
-        except OSError:
-            return None
-        if hinted:
-            ident = _ident(d)
-            _refuse_inside(_record_paths(), {ident} if ident is not None else set())
-            return d
-    return None
+    # a record lying inside the hinted directory found here was already refused by recorded()'s own walk
+    return _hint_walk(here)[0]
 
 
 def marked(directory: Path) -> bool:
@@ -332,7 +360,12 @@ def marked(directory: Path) -> bool:
 
 def unreadable(exc: RecordUnreadable) -> str:
     """The operator's words for a record the door cannot trust: every levain command is refused until he repairs or
-    deletes that file by hand (no levain command can, since the door refuses them all)."""
+    deletes that file by hand, or, for one lying inside a coordinator's workspace, moves it out (no levain command
+    can, since the door refuses them all)."""
+    if exc.inside is not None:
+        return (f"the coordinator record {exc.path} lies inside a coordinator's workspace ({exc.inside}), where that "
+                "coordinator could rewrite it, so every levain command is refused; point LEVAIN_HOME outside it, "
+                "or move the consent directory out")
     where = f" {exc.path}" if exc.path is not None else " that file"
     return (f"the coordinator record cannot be trusted ({exc}), so no directory can be shown not to be a "
             f"coordinator's workspace and every levain command is refused; repair or delete{where} by hand")
