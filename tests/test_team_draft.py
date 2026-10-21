@@ -63,8 +63,10 @@ def test_a_draft_reaches_the_ledger_only_by_the_operators_promote(world, monkeyp
     v = T.get_draft(store, d["draft_id"])
     assert v["state"] == "promoted" and v["ledger_id"]
     assert v["ledger_id"] in git("show", "levain-team-ledger:" + _ledger_file(ana), cwd=ana)
-    with pytest.raises(CoordError):          # promoted once
-        T.mark_promoted(store, d["draft_id"], v["ledger_id"], {v["ledger_id"]: {"agent": T.draft_agent(d["draft_id"])}})
+    agent = {"agent": T.draft_agent(d["draft_id"])}
+    assert T.mark_promoted(store, d["draft_id"], v["ledger_id"], {v["ledger_id"]: agent}) == v   # the same entry again
+    with pytest.raises(CoordError):          # promoted once: never as another entry
+        T.mark_promoted(store, d["draft_id"], "x-1", {"x-1": agent})
 
 
 def _ledger_file(ana):
