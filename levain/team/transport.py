@@ -160,8 +160,7 @@ def ledger_env(**extra: str) -> dict[str, str]:
     return env
 
 
-def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
-        input_text: str | None = None, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+def _git_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
     # The allowlist plus what a fetch or push needs: proxies and CA bundles, git's own settings,
     # and the tokens gh's credential helper reads (levain.launch: never a copy of os.environ).
     env = child_env(*NETWORK, "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
@@ -173,6 +172,37 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
                GIT_GRAFT_FILE="/dev/null")
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never prompt on /dev/tty from a hook
     env.update(extra_env or {})     # a signing call's environment (the FIDO provider, no passphrase prompt)
+    return env
+
+
+def _blobs(cwd: Path, shas: list[str], timeout: float = 120) -> dict[str, bytes]:
+    """The exact bytes of each blob, through one ``cat-file --batch`` (text mode would rewrite line endings)."""
+    if not shas:
+        return {}
+    try:
+        cp = subprocess.run(["git", *_NO_HOOKS, "cat-file", "--batch"], cwd=str(cwd), env=_git_env(),
+                            capture_output=True, input="\n".join(shas).encode() + b"\n", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise TeamError(f"git cat-file timed out after {timeout:.0f}s") from None
+    except FileNotFoundError:
+        raise TeamError("git is not on PATH") from None
+    if cp.returncode != 0:
+        raise TeamError(f"git cat-file failed: {cp.stderr.decode('utf-8', 'replace').strip()[-200:]}")
+    data, out, pos = cp.stdout, {}, 0
+    for sha in shas:
+        nl = data.index(b"\n", pos)
+        head = data[pos:nl].decode("utf-8", "replace").split()
+        pos = nl + 1
+        if len(head) != 3 or head[0] != sha or head[1] != "blob":
+            raise TeamError(f"git cat-file returned {' '.join(head)!r} for {sha[:10]}")
+        out[sha] = data[pos:pos + int(head[2])]
+        pos += int(head[2]) + 1
+    return out
+
+
+def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
+        input_text: str | None = None, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    env = _git_env(extra_env)
     try:
         cp = subprocess.run(["git", *_NO_HOOKS, *args], cwd=str(cwd), env=env, capture_output=True, text=True,
                             timeout=timeout, input=input_text,
@@ -1680,15 +1710,55 @@ class GitLedger:
         return None
 
     def _added_lines(self, c: str) -> list[tuple[str, str]]:
-        """(path, text) of every ledger line commit ``c`` adds, in file order."""
-        out: list[tuple[str, str]] = []
-        path = ""
-        for ln in git(["diff-tree", "-p", "--no-commit-id", "-r", c, "--", "ledger/"], self.wt).stdout.splitlines():
-            if ln.startswith("+++ "):
-                path = ln[6:] if ln.startswith("+++ b/") else ""
-            elif ln.startswith("+") and path:
-                out.append((path, ln[1:]))
-        return out
+        """(path, text) of every ledger line commit ``c`` appends, in file order (see ``_appended``)."""
+        return [(p, t) for p, t in self._appended(c)[0] if p.startswith("ledger/")]
+
+    def _appended(self, c: str) -> tuple[list[tuple[str, str]], dict[str, str]]:
+        """What commit ``c`` appends to each path it changes, read from the parent's and the child's blobs, never from
+        diff text (file content ``++ b/<path>`` renders as a ``+++ b/`` header, and a parser of the text then files the
+        lines after it under a path of the author's choosing: code L3 r5). Returns ([(path, line)], {path: why}): a path
+        is in the first only when it stays a regular file whose new bytes start with every byte of its old ones and add
+        a non-empty suffix of exactly as many lines as git counts added, with none removed; any other path is in the
+        second, with the reason."""
+        rows = git(["diff-tree", "-r", "-z", "--raw", "--no-abbrev", "--no-renames", "--no-commit-id", c],
+                   self.wt).stdout.split("\0")
+        counts: dict[str, tuple[str, str]] = {}
+        for row in git(["diff-tree", "-r", "-z", "--numstat", "--no-renames", "--no-commit-id", c],
+                       self.wt).stdout.split("\0"):
+            parts = row.split("\t", 2)
+            if len(parts) == 3:
+                counts[parts[2]] = (parts[0], parts[1])
+        zero = "0" * 40
+        lines: list[tuple[str, str]] = []
+        bad: dict[str, str] = {}
+        changes = []
+        for i in range(0, len(rows) - 1, 2):
+            meta, path = rows[i][1:].split(" "), rows[i + 1]
+            if not rows[i].startswith(":"):
+                continue
+            if len(meta) != 5 or meta[1] not in ("100644", "100755") or meta[0] not in ("000000", meta[1]):
+                bad[path] = "not an append to a regular file (removed, a link, or a mode change)"
+            else:
+                changes.append((meta, path))
+        # only regular files' objects are read, so a submodule's commit id is never asked for as a blob
+        blobs = _blobs(self.wt, list(dict.fromkeys(s for meta, _p in changes for s in meta[2:4] if s != zero)))
+        for meta, path in changes:
+            old = blobs[meta[2]] if meta[2] != zero else b""
+            new = blobs[meta[3]]
+            suffix = new[len(old):]
+            n = suffix.count(b"\n") + (0 if suffix.endswith(b"\n") else 1)
+            if not new.startswith(old) or not suffix:
+                bad[path] = "changes or removes bytes already in the file"
+            elif counts.get(path) != (str(n), "0"):
+                bad[path] = f"appends {n} line(s) where git counts {'/'.join(counts.get(path, ('?', '?')))}"
+            else:
+                try:
+                    texts = suffix.decode("utf-8").split("\n")
+                except UnicodeDecodeError:
+                    bad[path] = "appends bytes that are not UTF-8"
+                    continue
+                lines.extend((path, t) for t in (texts[:-1] if texts[-1] == "" else texts))
+        return lines, bad
 
     def _held_why(self, why: str, d) -> str:
         """The hold message for the reason ``_pick_why`` (or the replay's own read-back) gave."""
@@ -1715,16 +1785,12 @@ class GitLedger:
         parses and validates as its author's entry: anything else would be re-sealed into content no reader counts, or
         throw after earlier lines were written. PROJECT.md is passed over: it is regenerated, never carried."""
         from . import tenure as T
+        lines, bad = self._appended(c)
         added: dict[str, list[str]] = {}
-        for path, text in self._added_lines(c):
+        for path, text in lines:
             added.setdefault(path, []).append(text)
-        other = []
-        for ln in git(["diff-tree", "--no-commit-id", "--numstat", "-r", c], self.wt).stdout.splitlines():
-            parts = ln.split("\t")
-            if len(parts) < 3 or parts[2] in (T.TEAM_FILE, T.TENURE_FILE, CANON_FILE):
-                continue
-            if not (parts[1] == "0" and self._entry_lines_ok(parts[2], added.get(parts[2], []))):
-                other.append(parts[2])
+        other = [p for p in [*bad, *added] if p not in (T.TEAM_FILE, T.TENURE_FILE, CANON_FILE)
+                 and (p in bad or not self._entry_lines_ok(p, added[p]))]
         return ", ".join(other[:5])
 
     @staticmethod
@@ -1772,13 +1838,24 @@ class GitLedger:
             pending.append({**op, "root": root})
         return bool(self._added_lines(c))
 
-    def _reseal(self, c: str, lines: list[tuple[str, str]], timeout: float,
-                message: str | None = None) -> subprocess.CompletedProcess:
+    def _reseal(self, c: str, timeout: float, message: str | None = None) -> subprocess.CompletedProcess:
         """Re-seal commit ``c``'s lines onto the current tip of their files and commit them with ``c``'s message (or
         ``message``), signed by this clone's key: an entry kept back earlier in the same file, or published past since,
         left the line's ``prev`` pointing at a line that is not the tip, so a plain cherry-pick would publish a broken
         chain (or conflict). Only the ledger lines are written, so a commit that also changed the team re-lands that
-        half as an op, never as its text."""
+        half as an op, never as its text. The lines are what ``c`` appends, read from its blobs; a ledger path it does
+        anything else to, or an appended line that is not a valid entry of the folder it is filed under, fails the
+        re-seal by name before any file is written."""
+        lines, bad = self._appended(c)
+        added: dict[str, list[str]] = {}
+        for path, text in lines:
+            added.setdefault(path, []).append(text)
+        wrong = [p for p in [*bad, *added] if p.startswith("ledger/") and (p in bad or not self._entry_lines_ok(
+            p, added[p]))]
+        if wrong:
+            return subprocess.CompletedProcess([], 1, "", f"{c[:10]} changes {', '.join(wrong[:5])} other than by "
+                                                          "appending valid entry lines")
+        lines = [(p, t) for p, t in lines if p.startswith("ledger/")]
         self._dcache = None
         tips = {f.rel: f.last_hash for f in self.ledger().files}
         sealed_lines = []
@@ -1873,7 +1950,7 @@ class GitLedger:
                         msg = None if not mixed else (
                             f"levain team: {' '.join(sorted({str(o.get('type')) for o in objs}))} "
                             f"{' '.join(sorted(ids))}\n\n{T.DEVICE_TRAILER}: {self.device}")
-                        cp = self._reseal(c, lines, timeout, msg)
+                        cp = self._reseal(c, timeout, msg)
                     else:
                         cp = git([*_REPLAY_CONFIG, *self._sign_cfg(), "cherry-pick", "--allow-empty", c], self.wt,
                                  check=False, timeout=timeout, extra_env=self._sign_env())

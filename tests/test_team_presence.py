@@ -399,3 +399,30 @@ def test_a_team_change_committed_with_a_line_outside_an_entry_file_refuses_by_na
     assert "AND ledger/junk" in capsys.readouterr().err
     assert git("rev-parse", "HEAD", cwd=wt) == head and not git("status", "--porcelain", cwd=wt).strip()
     assert ledger_tip(tmp_path) == tip
+
+
+def test_a_team_change_committed_with_a_forged_diff_header_in_an_entry_file_refuses_by_name(tmp_path, monkeypatch,
+                                                                                         capsys) -> None:
+    # reproduced on ca00689c (teampres/fix5/repro_before.txt (F1)): an entry file holding the text `++ b/ledger/junk`,
+    # which git renders as a `+++ b/` header, hid its lines from the check, and sync published the commit
+    from levain.team import transport as TR
+    from levain.team.ledger_api import open_ledger
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "k@test", "-f", str(tmp_path / "k")],
+                   check=True, capture_output=True)
+    ana = project(tmp_path)
+    assert team("init", "--project", "p", "--owner", "ana", "--member", "ana=ana@ex.com", "--member", "ben=ben@ex.com",
+                "--signing-key", str(tmp_path / "k.pub"), "--allow-file-keys", repo=ana) == 0
+    assert record(ana, "first") == 0
+    wt = open_ledger(TR.Repo.discover(ana)).wt
+    line = next((wt / "ledger").rglob("*.jsonl")).read_text().splitlines()[0]
+    (wt / "ledger" / "ana" / "forge.jsonl").write_text(f"{line}\n++ b/ledger/junk\n{line}\n")
+    git("add", "ledger/ana/forge.jsonl", cwd=wt)
+    with monkeypatch.context() as m:
+        m.setattr(TR.GitLedger, "_recover_dirty", lambda self: None)
+        assert team("member", "remove", "ben", "--no-push", repo=ana) == 0
+    head, tip = git("rev-parse", "HEAD", cwd=wt), ledger_tip(tmp_path)
+    capsys.readouterr()
+    assert team("sync", repo=ana) != 0
+    assert "AND ledger/ana/forge.jsonl" in capsys.readouterr().err
+    assert git("rev-parse", "HEAD", cwd=wt) == head and not git("status", "--porcelain", cwd=wt).strip()
+    assert ledger_tip(tmp_path) == tip
