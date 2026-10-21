@@ -719,8 +719,8 @@ def test_walk_fd_peak_is_bounded(world, monkeypatch):
         try:
             got = len(list(end_mod.walk(world.S, world.extra)))
         except OSError as e:
-            err = e
-    assert err is None, f"{err} with {free} fds free (measured peak {count.peak}); {_fd_users()}"
+            err = f"{e}; {_fd_users()}"      # while the limit is still squeezed
+    assert err is None, f"{err} with {free} fds free (measured peak {count.peak})"
     assert got == expected
 
 
@@ -742,18 +742,17 @@ def test_end_deep_chain_holds_bounded_fds_and_refuses_past_depth_cap(world):
     def fault(p):
         if p == "retain:tree:renamed":
             raise OSError(errno.EIO, "a transient failure after the rename")
-    free = end_mod.WALK_PEAK_FDS + FD_SPARE
-    assert CHAIN > free
-    with _nofile(free):
-        assert end_session(world.facts, world.seams(ctl), record_state=REVOKED, caps=Caps(depth=100)) == HELD
-        assert ctl.failed_step == "manifest_budget" and any("manifest-depth-cap" in n for n in world.notes), \
-            f"{ctl.failed_step} with {free} fds free; notes {world.notes[-3:]}; {_fd_users()}"
-        _untouched(world, pre_live)
-        assert end_session(world.facts, world.seams(ctl, fault=fault), record_state=HELD,
-                           failed_step="manifest_budget", held_attempts=1, caps=Caps(depth=200)) == HELD
-        assert ctl.failed_step == "tree" and world.facts.tree.exists() and not world.S.exists()
-        assert end_session(world.facts, world.seams(ctl), record_state=HELD, failed_step="tree", held_attempts=2,
-                           caps=Caps(depth=100)) == RETAINED
+    # No fd squeeze here: the fd bound is proven by the measurement in test_walk_fd_peak_is_bounded; this test
+    # proves only the depth-cap refusal and the retained exit.
+    assert end_session(world.facts, world.seams(ctl), record_state=REVOKED, caps=Caps(depth=100)) == HELD
+    assert ctl.failed_step == "manifest_budget" and any("manifest-depth-cap" in n for n in world.notes), \
+        f"{ctl.failed_step}; notes {world.notes[-3:]}"
+    _untouched(world, pre_live)
+    assert end_session(world.facts, world.seams(ctl, fault=fault), record_state=HELD,
+                       failed_step="manifest_budget", held_attempts=1, caps=Caps(depth=200)) == HELD
+    assert ctl.failed_step == "tree" and world.facts.tree.exists() and not world.S.exists()
+    assert end_session(world.facts, world.seams(ctl), record_state=HELD, failed_step="tree", held_attempts=2,
+                       caps=Caps(depth=100)) == RETAINED
     ctl.history = [h for h in ctl.history if h[0] != HELD]
     _assert_retained(world, pre, pre_manifest, ctl)
 
