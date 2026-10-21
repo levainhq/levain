@@ -97,7 +97,7 @@ def _parse_obj(obj: dict) -> R.Alloc:
 
 
 @pytest.mark.parametrize("key", sorted(R.ALLOC_IDENTITY_KEYS - {"child_uid", "ticket", "ticket_facts",
-                                                                 "netns", "cgroup"}))
+                                                                 "netns", "cgroup", "var_folders"}))
 def test_alloc_missing_identity_key_refused_by_name(key):
     obj = _alloc_obj()
     del obj[key]
