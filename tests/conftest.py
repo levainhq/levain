@@ -210,6 +210,17 @@ def _isolate_consent_hook_wiring(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _test_team_keys_may_be_file_keys():
+    """TEST ONLY: the team tests sign with throwaway passphrase-less ed25519 keys, where a deployment's `levain team
+    record` needs a FIDO key's touch unless the team allows file keys (``levain.team.transport._REQUIRE_PRESENCE``).
+    The tests of the presence rule itself set it back."""
+    import levain.team.transport as transport
+    with pytest.MonkeyPatch.context() as own:   # its own, so a test's ``monkeypatch.undo()`` keeps it
+        own.setattr(transport, "_REQUIRE_PRESENCE", False)
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_entity_process_latch():
     """`$LEVAIN_ENTITY_PROCESS` is a one-way latch by design (spore-438): opening an entity sets it
     and nothing in levain clears it, because nothing should. A test process opens many entities, so

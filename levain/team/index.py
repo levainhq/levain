@@ -142,6 +142,12 @@ class Ledger:
     owner: str | None = None       # team.toml owner: the one author whose links cross authors
     # tenure: did this linker hold owner authority at its own line? (replaces the ``owner`` test when set)
     authority: Callable[[dict], bool] | None = None
+    # hashes of entries whose commit was signed with no user presence (a file or agent key): shown, never hidden
+    no_presence: frozenset[str] = frozenset()
+
+    def presence_note(self, e: dict) -> str:
+        """The note a reader sees beside who recorded ``e``: empty unless its commit carried no user presence."""
+        return NO_PRESENCE_NOTE if e.get("hash") in self.no_presence else ""
 
     @functools.cached_property
     def by_id(self) -> dict[str, dict]:
@@ -219,7 +225,7 @@ class Ledger:
 
 def build(files: list[tuple[str, list[str]]], owner: str | None = None,
           problems: list[str] | None = None, *, unenforced: dict[str, set[str]] | None = None,
-          authority: Callable[[dict], bool] | None = None) -> Ledger:
+          authority: Callable[[dict], bool] | None = None, no_presence: frozenset[str] = frozenset()) -> Ledger:
     """A ledger from (rel path under ledger/, lines) pairs. Callers split on "\\n" only:
     ``str.splitlines()`` also splits on U+2028/U+2029/U+0085, which JSON written with ensure_ascii=False
     carries unescaped inside a string.
@@ -258,7 +264,7 @@ def build(files: list[tuple[str, list[str]]], owner: str | None = None,
         seen.add(e["id"])
         uniq.append(e)
     uniq.sort(key=lambda e: (e.get("ts", ""), e.get("id", "")))
-    return Ledger(uniq, problems, out_files, owner, authority)
+    return Ledger(uniq, problems, out_files, owner, authority, frozenset(no_presence))
 
 
 def load_dir(ledger_dir: Path, owner: str | None = None) -> Ledger:
@@ -299,8 +305,12 @@ def oneline(text: str) -> str:
     return text
 
 
-def render(e: dict) -> str:
-    """One entry as an agent or a person reads it: the decider's words first, then who owns the call."""
+NO_PRESENCE_NOTE = "file key, no presence"
+
+
+def render(e: dict, presence_note: str = "") -> str:
+    """One entry as an agent or a person reads it: the decider's words first, then who owns the call.
+    ``presence_note`` (:meth:`Ledger.presence_note`) is added to who recorded it."""
     label = f"{e.get('type')} · {e['kind']}" if e.get("kind") else str(e.get("type"))
     bits = [f"[{label}] {e['id']}"]
     if e.get("words"):
@@ -308,7 +318,8 @@ def render(e: dict) -> str:
     if e.get("owner"):
         bits.append(f"  owner of the call: {oneline(e['owner'])}")
     src = f"pack {oneline(e['pack'])}" if e.get("pack") else (e.get("agent") or "human")
-    bits.append(f"  recorded by {oneline(str(e.get('author')))} ({src}), {age(e.get('ts', ''))}")
+    note = f" ({presence_note})" if presence_note else ""
+    bits.append(f"  recorded by {oneline(str(e.get('author')))} ({src}){note}, {age(e.get('ts', ''))}")
     if e.get("summary"):
         bits.append(f"  summary by {oneline(str(e.get('author')))}: {oneline(e['summary'])}")
     if e.get("reason"):

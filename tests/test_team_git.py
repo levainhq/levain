@@ -145,6 +145,9 @@ def test_init_join_record_reaches_the_other_clone(two):
 
 def test_concurrent_writers_in_both_clones_converge(two):
     tmp, ana, ben = two
+    # the writers are subprocesses, outside conftest's file-key seam: this team allows file keys, as one using them must
+    assert team("file-keys", "allow", repo=ana) == 0
+    assert team("sync", repo=ben) == 0
     jobs = [(ana if i % 2 else ben, f"src/f{i}.py") for i in range(8)]
     with ThreadPoolExecutor(8) as ex:
         results = list(ex.map(lambda j: subprocess.run(

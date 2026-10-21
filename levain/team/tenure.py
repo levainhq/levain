@@ -126,6 +126,8 @@ def flat(team: R.Team | None, ten: Tenure | None) -> dict[tuple, object]:
         out[("owner",)] = team.owner
         out[("mode",)] = team.mode
         out[("fetch_interval",)] = int(team.fetch_interval)
+        if team.allow_file_keys:        # absent when off, so a ledger from before the field derives the same state
+            out[("allow_file_keys",)] = True
         for c in team.client_owners:
             out[("client_owner", c)] = True
         for h, mail in team.members.items():
@@ -152,7 +154,8 @@ def unflat(f: dict[tuple, object]) -> tuple[R.Team, Tenure]:
     members = {k[1]: str(v) for k, v in f.items() if k[0] == "member"}
     team = R.Team(project=str(f.get(("project",), "")), owner=str(f.get(("owner",), "")), members=members,
                   client_owners=sorted(k[1] for k in f if k[0] == "client_owner"), mode=str(f.get(("mode",), "ask-once")),
-                  fetch_interval=int(f.get(("fetch_interval",), 300)))
+                  fetch_interval=int(f.get(("fetch_interval",), 300)),
+                  allow_file_keys=bool(f.get(("allow_file_keys",), False)))
     ten = Tenure(rules=int(f.get(("rules",), RULES)), past_owner_links=bool(f.get(("past_owner_links",), True)))
     if ("offer",) in f:
         ten.offer = json.loads(str(f[("offer",)]))
@@ -394,6 +397,8 @@ class Derivation:
     canon_sha: str | None = None                    # the last PROJECT.md commit signed by the owner in force
     state: dict[tuple, object] = field(default_factory=dict)  # the counted flat state at the tip
     ever_keyed: set[str] = field(default_factory=set)         # handles that have held a key in force, at any point
+    # entry hash -> whether the commit that added it was signed with user presence (a FIDO key's touch); display only
+    line_presence: dict[str, bool] = field(default_factory=dict)
 
     def retired(self, handle: str) -> bool:
         """A handle whose membership ended is never a member again: a re-invite takes a new handle."""
@@ -520,15 +525,18 @@ def parents_of_safe(top: Path, sha: str) -> dict[str, list[str]]:
         return {}
 
 
-def _signers(top: Path, shas: list[str], cache: S.SigCache) -> dict[str, str | None]:
+def _signers(top: Path, shas: list[str], cache: S.SigCache) -> tuple[dict[str, str | None], dict[str, bool]]:
+    """(signer fingerprint or None, signed with user presence) per commit."""
     verdicts = cache.verify(top, shas)
     out: dict[str, str | None] = {}
+    presence: dict[str, bool] = {}
     for sha in shas:
         v = verdicts[sha]
         if v.kind == "indeterminate":
             raise Unjudgeable(f"cannot verify the signature of {sha[:10]}: {v.reason}")
         out[sha] = v.fingerprint if v.kind == "signed" else None
-    return out
+        presence[sha] = bool(v.kind == "signed" and v.presence)
+    return out, presence
 
 
 def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[str]], freeze_end: int,
@@ -537,7 +545,7 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
     where = {s: i for i, s in enumerate(walk)}
     ch = changes(top, walk)
     meta = metas(top, live)
-    signer = _signers(top, live, cache)
+    signer, presence = _signers(top, live, cache)
     problems: list[str] = []
     touching = [sha for sha in live if ch.get(sha) and ch[sha].files & {TEAM_FILE, TENURE_FILE}]
     texts = file_texts(top, [f"{sha}:{name}" for sha in touching for name in (TEAM_FILE, TENURE_FILE)])
@@ -759,7 +767,8 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
     return Derivation(tip=tip, walk=walk, team=t, tenure=n, counted_head=base, files=lines, unenforced=unenforced,
                       line_pos=line_pos, spells=spells, problems=problems, role_changes=role_changes,
                       waiting=sum(len(ch.get(s, Change()).added) for s in walk[freeze_end:]), void=new_void,
-                      touched=touched, state=dict(state), canon_sha=canon_sha, ever_keyed=set(ever_keyed))
+                      touched=touched, state=dict(state), canon_sha=canon_sha, ever_keyed=set(ever_keyed),
+                      line_presence={h: presence.get(walk[p], False) for h, p in line_pos.items()})
 
 
 def _hash_of(text: str) -> str | None:
@@ -802,7 +811,7 @@ def _apply(state: dict, before: dict, after: dict, changed: set, fp: str, sha: s
             continue      # a no-op against the counted state (a restore, an ignored field)
         kind = k[0]
         allowed = False
-        if kind in ("project", "mode", "fetch_interval", "client_owner", "past_owner_links", "veto"):
+        if kind in ("project", "mode", "fetch_interval", "allow_file_keys", "client_owner", "past_owner_links", "veto"):
             allowed = is_owner
         elif kind == "member":
             h = k[1]

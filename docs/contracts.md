@@ -232,7 +232,7 @@ builds or accepts them.
 
 **C4, the first thing P1 must settle: three authority-signature formats.** TS §1.4 asks for one signed envelope for
 every authority signature. Shipped 0.8.0 has `levain-authority/1` links (`authority.py`) with their own verifier and a
-key-class floor that requires `sk-*` keys for laptop presence; T's `fingerprint()` refuses `sk-*`; and the fleet
+key-class floor that requires `sk-*` keys for laptop presence; T's `fingerprint()` refused `sk-*` until team entries came to need a presence key, and now accepts the two FIDO types; and the fleet
 design's laptop root is a Secure Enclave `ecdsa-sha2-nistp256` key. S1 does not unify them: it freezes only the
 fingerprint formula (F7) and the namespace registry (F11). The envelope (P1) waits on the trust-fold ruling, which
 must reconcile these three before any envelope-carrying leaf is frozen.

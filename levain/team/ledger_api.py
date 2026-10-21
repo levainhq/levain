@@ -82,8 +82,9 @@ class LedgerTransport(Protocol):
         ...
 
     # ---- writes -----------------------------------------------------------------------------------------------
-    def append(self, entry: dict, *, push: bool = True, lock_timeout: float = 30.0) -> dict:
-        """Seal one entry into this clone's own chain and publish it when asked; returns the entry as written."""
+    def append(self, entry: dict, *, push: bool = True, lock_timeout: float = 30.0, presence: bool = True) -> dict:
+        """Seal one entry into this clone's own chain and publish it when asked; returns the entry as written.
+        ``presence`` (default): refuse unless the commit is signed with user presence or the team allows file keys."""
         ...
 
     def write_canon(self, text: str, *, push: bool = True) -> str:

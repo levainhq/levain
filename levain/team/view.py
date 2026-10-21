@@ -49,14 +49,15 @@ def _days(ts: str, now: datetime) -> int | None:
     return max(0, (now - then).days)
 
 
-def _card(e: dict, now: datetime) -> dict:
-    """The fields a pane shows for one entry. No counts, nothing keyed by person."""
+def _card(e: dict, now: datetime, presence: str = "") -> dict:
+    """The fields a pane shows for one entry. No counts, nothing keyed by person. ``presence``: the ledger's note for
+    an entry signed with no user presence (:meth:`levain.team.index.Ledger.presence_note`), shown beside its author."""
     return {"id": e["id"], "type": e.get("type"), "kind": e.get("kind"), "owner": e.get("owner") or "",
             "words": I.oneline(e.get("words") or ""), "summary": I.oneline(e.get("summary") or ""),
             "reason": I.oneline(e.get("reason") or ""), "recheck": I.oneline(e.get("recheck") or ""),
             "paths": list(dict.fromkeys(e.get("paths") or [])), "recorded_by": e.get("author", "?"),
             "age": I.age(e.get("ts", ""), now), "age_days": _days(e.get("ts", ""), now),
-            "pack": e.get("pack") or ""}
+            "pack": e.get("pack") or "", "presence": presence}
 
 
 def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: str | None, state: str, *,
@@ -80,7 +81,7 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
     live = [e for e in ledger.in_force if keep(e)]
 
     # 1. waiting on the viewer: open questions and tensions they own
-    waiting = [_card(e, now) for e in live
+    waiting = [_card(e, now, ledger.presence_note(e)) for e in live
                if e.get("type") in ("question", "tension") and team.owns(handle, e.get("owner", ""))]
     # Pane 1 is only this. There is deliberately no "replacement awaiting your words" half: the ledger cannot express a
     # wordless replacement, and a supersede refused by authority (index.may_link) leaves BOTH entries in force, which
@@ -128,7 +129,7 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
         if e.get("recheck") and (_days(e.get("ts", ""), now) or 0) > recheck_days:
             why.append(f"recheck is {_days(e.get('ts', ''), now)} days old")
         if why:
-            held_by[e["id"]] = dict(_card(e, now), why="; ".join(why))
+            held_by[e["id"]] = dict(_card(e, now, ledger.presence_note(e)), why="; ".join(why))
     held = list(held_by.values())
 
     # 4. in force: the canon by path
@@ -136,10 +137,11 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
     for e in live:
         for g in dict.fromkeys(e.get("paths") or ["(project-wide)"]):
             if not pf or hit(g):
-                paths[g].append(_card(e, now))
+                paths[g].append(_card(e, now, ledger.presence_note(e)))
     canon = [{"path": g, "entries": paths[g]} for g in sorted(paths)]
 
     return {"project": team.project, "owner": team.owner, "mode": team.mode, "you": handle,
+            "allow_file_keys": team.allow_file_keys,
             "canon_status": C.staleness(canon_text, state), "problems": len(ledger.problems),
             "recheck_days": recheck_days, "ack_flag": ack_flag,
             "waiting": waiting, "stopped": stopped,
@@ -180,7 +182,8 @@ def _row(c: dict, why: str = "", paths: bool = True) -> str:
     if c["recheck"]:
         note.append(f"re-check: <code>{_e(c['recheck'])}</code>")
     src = f"pack {c['pack']}" if c["pack"] else c["recorded_by"]
-    note.append(f"recorded by {_e(src)} · {_e(c['age'])}")
+    note.append(f"recorded by {_e(src)}" + (f" ({_e(c['presence'])})" if c.get("presence") else "")
+                + f" · {_e(c['age'])}")
     return (f'<div class="row" data-q="{_attr(q)}"><span class="etype">{_e(label)}</span>'
             f'<span class="sid">{_e(c["id"])}</span>'
             + (f'<span class="tier">owner {_e(c["owner"])}</span>' if c["owner"] else "")
@@ -272,6 +275,8 @@ def render_html(m: dict, cockpit_url: str = DEFAULT_COCKPIT_URL) -> str:
             "</div></div></header>"
             f"<p class=\"sub teamline\">{who} · canon owner {_e(m['owner'])} · mode {_e(m['mode'])} · "
             f"{_e(m['canon_status'])}"
+            + (" · <span class=\"warn\">file keys allowed (entries need no touch)</span>"
+               if m.get("allow_file_keys") else "")
             + (f" · <span class=\"warn\">{m['problems']} integrity problem(s): run levain team verify</span>"
                if m["problems"] else "")
             + (f" · <span class=\"warn\">{_e(m['partial'])}</span>" if m.get("partial") else "") + "</p>"

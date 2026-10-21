@@ -63,7 +63,7 @@ def decide(team: R.Team, ledger: I.Ledger, handle: str | None, rel: str, session
     seen = denied_before | acked
     pending = [e for e in once if e["id"] not in seen]
     owners = sorted({I.oneline(e["owner"]) for e in tensions + foreign if e.get("owner")})
-    blocks = "\n\n".join(I.render(e) for e in matched)
+    blocks = "\n\n".join(I.render(e, ledger.presence_note(e)) for e in matched)
     head = (f"{TAG} {rel} is governed by {len(matched)} recorded entr{'y' if len(matched) == 1 else 'ies'} in "
             f"the {I.oneline(team.project)} team ledger.")
     if always or pending:
@@ -240,7 +240,8 @@ def pretooluse(payload: dict) -> None:
         try:
             gl.append(E.build(handle, "ack", refs=d.ack, session=session, agent="claude-code",
                               summary=f"proceeded with an edit of {rel} after the ruling was shown"),
-                      push=False, lock_timeout=0.5)     # a short try; busy -> the note below, retried next edit
+                      push=False, lock_timeout=0.5,     # a short try; busy -> the note below, retried next edit
+                      presence=False)   # the agent's own receipt, labelled claude-code: never a touch per edit
         except (TeamError, E.EntryError) as exc:
             text += f"\n\n[team] acknowledgement not recorded: {I.oneline(str(exc))}"
     _out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}})

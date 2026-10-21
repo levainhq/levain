@@ -105,8 +105,9 @@ def _ed_blob(keys) -> bytes:
 
 
 @pytest.mark.parametrize("line_fn, needle", [
+    # a FIDO key is accepted (team entries need one's presence flag), but only with its application string
     (lambda k: "sk-ssh-ed25519@openssh.com " + base64.b64encode(
-        sstr(b"sk-ssh-ed25519@openssh.com") + sstr(b"\x01" * 32) + sstr(b"ssh:")).decode(), "security-key"),
+        sstr(b"sk-ssh-ed25519@openssh.com") + sstr(b"\x01" * 32)).decode(), "application"),
     (lambda k: "ssh-ed25519-cert-v01@openssh.com " + pub_line(k["ed25519"]).split()[1], "certificates"),
     (lambda k: "ssh-dss " + pub_line(k["ed25519"]).split()[1], "unknown"),
     (lambda k: "ssh-ed25519 AAAA!!!!", "base64"),
@@ -336,7 +337,8 @@ def test_no_ssh_keygen_is_indeterminate_and_never_cached(repo, keys, tmp_path, m
     monkeypatch.undo()
     got2 = S.SigCache(cache_path).verify(repo, [sha])
     assert got2[sha].kind == "signed" and got2[sha].fingerprint == S.fingerprint(pub_line(keys["ed25519"]))
-    assert json.loads(cache_path.read_text())["entries"][sha] == {"kind": "signed", "fp": got2[sha].fingerprint}
+    assert json.loads(cache_path.read_text())["entries"][sha] == {"kind": "signed", "fp": got2[sha].fingerprint,
+                                                                 "presence": False}
     assert leftovers == []
 
 
@@ -474,7 +476,7 @@ def test_cache_drops_malformed_and_indeterminate_entries(tmp_path):
     path.write_text(json.dumps({"schema": S.CACHE_SCHEMA, "entries": {
         a: {"kind": "indeterminate", "fp": None},
         b: {"kind": "signed", "fp": None},
-        c: {"kind": "signed", "fp": "SHA256:abc/+9"},
+        c: {"kind": "signed", "fp": "SHA256:abc/+9", "presence": False},
         d: {"kind": "unsigned", "fp": None},
         "HEAD": {"kind": "unsigned", "fp": None},
     }}))

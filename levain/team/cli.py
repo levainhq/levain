@@ -255,12 +255,13 @@ def cmd_status(args) -> int:
     from .cli_tenure import status_lines
     for line in status_lines(gl):
         print(line)
+    print(_file_keys_line(team))
     print(C.staleness(canon_text, state))
     if ledger.problems:
         print(f"{len(ledger.problems)} integrity problem(s): run `levain team verify`")
     for e in ledger.in_force:
         print()
-        print(I.render(e))
+        print(I.render(e, ledger.presence_note(e)))
     if not ledger.in_force:
         print("nothing in force yet")
     return 0
@@ -280,6 +281,12 @@ def cmd_verify(args) -> int:
             problems.append(f"{e['id']}: owner {e['owner']!r} is not allowed by team.toml")
     files = len(ledger.files)
     print(f"{len(ledger.entries)} entries in {files} file(s); {len(ledger.in_force)} in force")
+    bare = [e for e in ledger.entries if ledger.presence_note(e)]
+    if bare:
+        # shown, never a problem: a line written before the presence rule, by a team that allows file keys, or by the
+        # edit hook's ack is still enforced as it always was
+        print(f"{len(bare)} entr{'y' if len(bare) == 1 else 'ies'} signed with no user presence ({I.NO_PRESENCE_NOTE}): "
+              + ", ".join(e["id"] for e in bare[:5]) + (" ..." if len(bare) > 5 else ""))
     print(C.staleness(canon_text, gl.state_hash(ledger, team)))
     for p in problems:
         print(f"PROBLEM: {p}")
@@ -373,6 +380,30 @@ def cmd_member_add(args) -> int:
     return 0
 
 
+def _file_keys_line(team: R.Team) -> str:
+    if team.allow_file_keys:
+        return ("file keys: ALLOWED for this team (allow_file_keys = true): an entry may be signed by a key any program "
+                "running as its member can use; `levain team file-keys refuse` (owner) turns the touch rule back on")
+    return ("file keys: refused: `levain team record` needs a Touch ID or security-key (sk-*) signature with a touch "
+            "(`levain team file-keys allow`, the owner's, opts the team out)")
+
+
+def cmd_file_keys(args) -> int:
+    """Owner only: the team's one presence switch, a counted line in team.toml every clone derives."""
+    gl = open_ledger(_repo(args))
+    gl.require_joined()
+    team, handle = _actor(gl)
+    if handle != team.owner:
+        raise TeamError(f"only the owner ({team.owner}) allows or refuses file keys for the team")
+    want = args.choice == "allow"
+
+    def change(t, _ten) -> None:
+        t.allow_file_keys = want
+    print(gl.update_counted(change, f"levain team: {'allow' if want else 'refuse'} file keys", push=not args.no_push))
+    print(_file_keys_line(gl.team()))
+    return 0
+
+
 def cmd_pack_sync(args) -> int:
     gl = open_ledger(_repo(args))
     gl.require_joined()
@@ -406,6 +437,10 @@ def cmd_doctor(args) -> int:
     py_ok, py_line = _hook_import_check(repo)
     rows.append((py_ok, py_line))
     rows.append(_anneal_row(gl))
+    try:
+        rows.append((True, _file_keys_line(gl.team())))
+    except R.RolesError:
+        pass        # team.toml's own row above already failed
     bad = 0
     for ok, line in rows:
         print(f"{'ok  ' if ok else 'FAIL'}  {line}")
@@ -563,6 +598,10 @@ def register(subparsers) -> None:
     mr.set_defaults(func=_guarded(lambda a: cli_tenure.cmd_member_remove(open_ledger(_repo(a)), a)))
     cli_tenure.register(sub, add)
 
+    p = add("file-keys", cmd_file_keys, "Owner only: allow or refuse entries signed with no user presence (a file or "
+            "agent key) for the whole team; refused by default (Touch ID or a security key).")
+    p.add_argument("choice", choices=("allow", "refuse"))
+    p.add_argument("--no-push", action="store_true")
     p = add("pack-sync", cmd_pack_sync, "Owner only: seed or upgrade a pack's judgment.toml rules into the ledger.")
     p.add_argument("pack_dir")
     p.add_argument("--no-push", action="store_true")
