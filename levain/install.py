@@ -294,9 +294,10 @@ def run_init(
     # expanduser first: argparse's `type=Path` does not expand `~`, but operators
     # passing `--path ~/levain-install` reasonably expect shell semantics.
     install = Path(str(path)).expanduser().resolve()
-    if role is not None and (role not in ROLE_CHOICES or adapter != "claude-code"):
+    if role is not None and (role not in ROLE_CHOICES or adapter not in ROLE_ADAPTERS):
         # refused before anything is written, so a bad role never leaves a half-made install behind
-        print(f"FAIL: install role {role!r} is one of {', '.join(ROLE_CHOICES)}, for the claude-code adapter only.")
+        print(f"FAIL: install role {role!r} is one of {', '.join(ROLE_CHOICES)}, for the "
+              f"{' or '.join(ROLE_ADAPTERS)} adapter only.")
         return 1
     # Pack-layers compose ON TOP of the base templates (base = pack #0). Resolved
     # the same way as --path; a bad pack dir / missing pack.toml fails loud below.
@@ -815,9 +816,10 @@ def _apply_init(
     if consent_hook is not None and chosen in CONSENT_HOOK_SCRIPTS:
         # Recorded BEFORE the render: every render (init's, the receipt's, update's) reads the recorded choice.
         _write_consent_hook_choice(install, consent_hook, emit)
-    if role is not None and chosen == "claude-code":
-        # recorded BEFORE the render, as the consent hook choice is: every render reads the recorded role
-        _write_role(install, role, python_path, emit)
+    if role is not None and chosen in ROLE_ADAPTERS:
+        # recorded BEFORE the render, as the consent hook choice is: every render reads the recorded role, and the
+        # record is the coordinator's door for either harness
+        _write_role(install, role, python_path, emit, adapter=chosen)
     review = _install_adapter(
         chosen, install, templates_root, python_path, anneal_path, import_seed,
         on_demand_seed, activation_roots=roots, emit=emit, messaging=messaging,
@@ -2754,8 +2756,11 @@ def persisted_consent_hook(install: Path) -> str:
 # The coordinator's own install (np-6843ca07 (a), signed by the operator 2026-10-21): Claude Code runs its own
 # coordinator verbs without asking, and only those; they grant nothing (a signed envelope still does), and every
 # other command asks as in any install. The role is meant for an install `levain coord agent` made itself, never a
-# live install it reuses (tests/test_coordinator_launch.py "a_reused_install_gets_none" pins that).
+# live install of the operator's: `coord agent` refuses one rather than marking it (marking it would door his own
+# sessions there). The record is also what marks the coordinator's workspace for its door, so it is written for a Codex
+# coordinator workspace as for a Claude Code one; only Claude Code's settings carry the pre-approved verbs.
 ROLE_CHOICES = ("coordinator",)
+ROLE_ADAPTERS = ("claude-code", "codex")
 COORDINATOR_VERBS = ("coord", "drops", "thread")
 # Levain's own project MCP servers, the names its .mcp.json render writes (BAND_SERVER and DISPATCH_SERVER are
 # defined with that render; the test pins this tuple against a real coordinator install's .mcp.json keys)
@@ -2816,7 +2821,8 @@ def persisted_role(install: Path) -> str | None:
     return value if value in ROLE_CHOICES else None
 
 
-def _write_role(install: Path, role: str, python_path: str, emit: Callable[[str], None]) -> None:
+def _write_role(install: Path, role: str, python_path: str, emit: Callable[[str], None], *,
+                adapter: str = "claude-code") -> None:
     """Record ``role`` in ``.levain/config.json``, so `levain update` and `init --force` render it again. Raises
     InitError when it cannot be recorded."""
     from levain.dashboard import LEVAIN_CONFIG_REL
@@ -2841,8 +2847,11 @@ def _write_role(install: Path, role: str, python_path: str, emit: Callable[[str]
         _atomic_write_text(config_path, json.dumps({**existing, "role": role}, indent=2, ensure_ascii=False) + "\n")
     except OSError as e:
         raise InitError(f"could not record the install role in .levain/config.json ({e}).") from e
-    emit(f"  role: {role} → .levain/config.json (Claude Code runs {', '.join(coordinator_allow(python_path))} "
-         "without asking)")
+    if adapter == "claude-code":
+        emit(f"  role: {role} → .levain/config.json (Claude Code runs {', '.join(coordinator_allow(python_path))} "
+             "without asking)")
+    else:
+        emit(f"  role: {role} → .levain/config.json")
 
 
 def _apply_role(settings_text: str, role: str | None, python_path: str) -> str:
