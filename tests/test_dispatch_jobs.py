@@ -3,6 +3,7 @@ is walked (every allowed edge taken, every other (state, cause) pair refused), l
 clock, and the append-only triggers are hit with raw SQL."""
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from datetime import timedelta
@@ -170,13 +171,23 @@ def test_the_unsigned_lease_never_outlives_the_expiry(store, repo, clock):
     assert store.sweep() == [job.id]
 
 
-@pytest.mark.parametrize("state", ["signed", "queued", "running", "verifying", "verified", "recommended"])
+@pytest.mark.parametrize("state", ["signed", "queued", "verifying", "verified", "recommended"])
 def test_a_signed_job_lapses_at_its_expiry_until_authorised(store, repo, clock, state):
     job, _ = at_state(store, repo, state)
     clock.now = NOW + UNSIGNED_LEASE + timedelta(minutes=1)                  # past the unsigned lease: no matter
     assert store.get(job.id).state == state
     clock.now = NOW + timedelta(hours=2)
     assert store.get(job.id).state == "failed"
+
+
+def test_a_running_job_is_never_swept_and_is_named_overdue_for_the_supervisor(store, repo, clock):
+    job, _ = at_state(store, repo, "running")
+    assert store.overdue_running() == []
+    clock.now = NOW + timedelta(hours=2)
+    assert store.sweep() == [] and store.get(job.id).state == "running"
+    assert store.overdue_running() == [job.id]
+    assert store.stop_recorded(job.id, "lease_lapsed").state == "failed"
+    assert store.overdue_running() == []
 
 
 @pytest.mark.parametrize("state", ["authorised", "adopted", "cancelled"])
@@ -200,6 +211,9 @@ def test_every_operation_sweeps_first(store, repo, clock):
 # tests/test_dispatch_envelope.py walks each); the private walk refuses them
 ENVELOPE_CAUSES = {"envelope", "envelope_rule", "envelope_ended"}
 EDGE_CASES = sorted((f, t, c) for (f, t), causes in EDGES.items() for c in causes if c not in ENVELOPE_CAUSES)
+# out of running, every edge but runs_exited is stop_recorded's alone (the supervisor stopped the process first)
+STOP_CASES = [e for e in EDGE_CASES if e[0] == "running" and e[1] != "verifying"]
+WALK_CASES = [e for e in EDGE_CASES if e not in STOP_CASES]
 
 
 @pytest.mark.parametrize("from_state, to_state, cause",
@@ -212,13 +226,27 @@ def test_the_private_walk_refuses_every_envelope_cause(tmp_path, clock, repo, fr
     assert store.get(job.id).history == job.history
 
 
-@pytest.mark.parametrize("from_state, to_state, cause", EDGE_CASES)
+@pytest.mark.parametrize("from_state, to_state, cause", WALK_CASES)
 def test_every_allowed_edge_is_taken(tmp_path, clock, repo, from_state, to_state, cause):
     store = new_store(tmp_path, clock)
     job, _ = at_state(store, repo, from_state)
     moved = store._transition(job.id, to_state, cause, evidence="e")
     assert moved.state == to_state and moved.history[-1].cause == cause and moved.history[-1].evidence == "e"
     assert [t.seq for t in moved.history] == list(range(1, len(moved.history) + 1))
+
+
+@pytest.mark.parametrize("from_state, to_state, cause", STOP_CASES)
+def test_every_edge_out_of_running_but_runs_exited_is_stop_recorded_alone(tmp_path, clock, repo, from_state, to_state,
+                                                                          cause):
+    store = new_store(tmp_path, clock)
+    job, _ = at_state(store, repo, from_state)
+    clock.now = NOW + timedelta(hours=2)                                     # past the lease: lease_lapsed holds
+    with pytest.raises(TransitionRefused, match="stop_recorded"):
+        store._transition(job.id, to_state, cause, evidence="e")
+    assert store.get(job.id).state == "running"
+    moved = store.stop_recorded(job.id, cause, why="reaped")
+    assert (moved.state, moved.history[-1].cause) == (to_state, cause)
+    assert json.loads(moved.history[-1].evidence) == {"stopped": True, "why": "reaped"}
 
 
 @pytest.mark.parametrize("from_state", STATES)
@@ -746,7 +774,7 @@ def cancel_item(job, key, at=None, reason="not this one", ns=CNS, **over):
     return payload, key.sign(dsign.sign_message(payload), ns)
 
 
-@pytest.mark.parametrize("state", ["filed", "signed", "queued", "running", "verified", "recommended", "authorised"])
+@pytest.mark.parametrize("state", ["filed", "signed", "queued", "verified", "recommended", "authorised"])
 def test_the_human_cancels_any_live_job(tmp_path, clock, repo, keys, log, state):
     store = new_store(tmp_path, clock)
     job, _cap = at_state(store, repo, state)
@@ -759,6 +787,20 @@ def test_the_human_cancels_any_live_job(tmp_path, clock, repo, keys, log, state)
         assert conn.execute("SELECT payload, signature, signer_fp FROM cancel_signatures").fetchall() == [
             (dsign.sign_message(payload).decode(), sig, keys["laptop"].fp)]
         assert conn.execute("SELECT COUNT(*) FROM signatures WHERE payload LIKE '%dispatch-cancel%'").fetchone() == (0,)
+
+
+def test_a_running_job_is_not_cancelled_by_the_human_door_but_by_the_supervisor(tmp_path, clock, repo, keys, log):
+    store = new_store(tmp_path, clock)
+    job, cap = at_state(store, repo, "running")
+    clock.now = NOW + timedelta(minutes=2)
+    payload, sig = cancel_item(job, keys["laptop"])
+    with pytest.raises(TransitionRefused, match="stop_recorded"):
+        store.cancel_by_human(job.id, payload, sig, log.source)
+    with pytest.raises(TransitionRefused, match="stop_recorded"):
+        store.cancel_by_planner(job.id, cap)
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cancel_signatures").fetchone() == (0,)
+    assert store.get(job.id).state == "running"
 
 
 @pytest.mark.parametrize("state", ["adopted", "failed", "cancelled"])

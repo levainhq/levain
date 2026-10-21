@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from levain.cockpit.consent import utc_stamp
+from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.contracts.canon import canonical
 from levain.dispatch import ContractRefused
 from levain.dispatch.adopt import ArtifactRecord, Envelope, artifact_digest, floor, land, stage_commit
@@ -443,16 +443,28 @@ def test_a_moved_base_under_the_jobs_own_envelope_fails_the_job(store, repo, env
     assert (failed.state, failed.history[-1].cause) == ("failed", "base_moved")
 
 
-@pytest.mark.parametrize("which", ["other", "refusing"])
-def test_a_moved_base_without_the_c_authority_is_refused_and_the_job_kept(store, repo, env, tmp_path, which):
+def test_a_moved_base_under_an_envelope_not_the_jobs_own_is_refused_and_the_job_kept(store, repo, env, tmp_path):
     job = verified(store, repo, env, tmp_path)
     move(repo)
-    if which == "other":
-        authority = FakeEnvelope("env-OTHER", str(repo[0]))
-    else:
-        authority, env.refuse_line = env, "criterion max_changed_lines: 1 changed lines is over 0"
-    out = by_envelope(store, job, authority)
+    out = by_envelope(store, job, FakeEnvelope("env-OTHER", str(repo[0])))
     assert out.outcome == "refused" and "MOVED BASE" in out.message and store.get(job.id).state == "verified"
+
+
+@pytest.mark.parametrize("line", ["envelope env-1 is not live",
+                                  "criterion max_changed_lines: 1 changed lines is over 0"])
+def test_a_moved_base_under_the_jobs_own_envelope_that_refuses_still_fails_the_job(store, repo, env, tmp_path, line):
+    """Head, F11-C r2 H: a dead (or refusing) envelope the job is bound to meets MOVED BASE: the job fails, cause
+    base_moved, and its write files are released; it never stays held."""
+    job = verified(store, repo, env, tmp_path)
+    move(repo)
+    env.live, env.refuse_line = False, line
+    out = by_envelope(store, job, env)
+    assert out.outcome == "failed" and "MOVED BASE" in out.message
+    failed = store.get(job.id)
+    assert (failed.state, failed.history[-1].cause) == ("failed", "base_moved")
+    later = utc_stamp(store._clock.now + timedelta(hours=2))
+    assert store.file(submission(*repo, expires_at=later), resolve_template=registry(), policy=POLICY,
+                      filer_session="coord-2")[0].state == "filed"
 
 
 def test_authorise_envelope_rule_takes_one_object_and_the_binding(store, repo, env, tmp_path):
@@ -496,34 +508,112 @@ def test_an_ended_envelope_fails_its_jobs_not_yet_running_or_authorised(store, r
 
 def test_an_ended_envelope_leaves_a_running_job_running_until_the_supervisor_stops_it(store, repo, env):
     """L3 r1 codex 1: a running job's process may still write, so end_envelope never fails it (its write files stay
-    held); the supervisor stops it, then stopped_by_envelope fails it."""
+    held); the supervisor stops it, then stop_recorded fails it."""
     job, _ = file_env(store, repo, env)
     store.take_slot(job.id, envelope=env)
     assert store.end_envelope("env-1") == EnvelopeEnd(failed=(), to_stop=(job.id,))
     assert store.get(job.id).state == "running"
     with pytest.raises(ContractRefused, match="already writes"):
         store.file(submission(*repo), resolve_template=registry(), policy=POLICY, filer_session="rival")
-    stopped = store.stopped_by_envelope(job.id, why="killed")
+    stopped = store.stop_recorded(job.id, "envelope_ended", why="killed")
     assert (stopped.state, stopped.history[-1].cause) == ("failed", "envelope_ended")
     assert json.loads(stopped.history[-1].evidence) == {"envelope_id": "env-1", "stopped": True, "why": "killed"}
     with pytest.raises(TransitionRefused, match="only a running job"):
-        store.stopped_by_envelope(job.id)
+        store.stop_recorded(job.id, "envelope_ended")
     assert store.file(submission(*repo), resolve_template=registry(), policy=POLICY,
                       filer_session="rival")[0].state == "filed"
 
 
-def test_stopped_by_envelope_refuses_an_unbound_or_not_running_job(store, repo, env):
+def test_stop_recorded_envelope_ended_refuses_an_unbound_or_not_running_job(store, repo, env):
     job, _ = file_env(store, repo, env)
     with pytest.raises(TransitionRefused, match="only a running job"):
-        store.stopped_by_envelope(job.id)
+        store.stop_recorded(job.id, "envelope_ended")
     plain, _ = store.file(submission(repo[0], repo[1], write=["src/sub/deep.py"]), resolve_template=registry(),
                           policy=POLICY, filer_session="s")
     store._transition(plain.id, "signed", "signature")
     store.take_slot(plain.id)
     with pytest.raises(TransitionRefused, match="not filed inside an envelope"):
-        store.stopped_by_envelope(plain.id)
+        store.stop_recorded(plain.id, "envelope_ended")
     with pytest.raises(TransitionRefused, match="by its own envelope method"):
         store._transition(plain.id, "failed", "envelope_ended")
+
+
+# --- one door out of running (F11-C r2 B) ---------------------------------------------------------------------------
+
+def running_job(store, repo, env):
+    job, cap = file_env(store, repo, env)
+    store.take_slot(job.id, envelope=env)
+    return job, cap
+
+
+def test_end_envelope_on_an_expired_running_job_returns_it_to_stop_with_its_files_held(store, repo, env):
+    """L3 r2 codex HIGH: the sweep inside end_envelope used to lapse the running job first, releasing its files
+    while its process could still write; now no sweep touches a running job."""
+    job, _ = running_job(store, repo, env)
+    store._clock.now = parse_stamp(job.expires_at) + timedelta(minutes=1)
+    assert store.end_envelope("env-1") == EnvelopeEnd(failed=(), to_stop=(job.id,))
+    assert store.sweep() == []
+    held = store.get(job.id)
+    assert (held.state, held.history[-1].cause) == ("running", "slot_taken")
+    assert store.overdue_running() == [job.id]
+    later = utc_stamp(store._clock.now + timedelta(hours=2))
+    with pytest.raises(ContractRefused, match="already writes"):
+        store.file(submission(*repo, expires_at=later), resolve_template=registry(), policy=POLICY,
+                   filer_session="rival")
+
+
+def test_every_door_but_stop_recorded_refuses_to_end_a_running_job(store, repo, env):
+    job, cap = running_job(store, repo, env)
+    with pytest.raises(TransitionRefused, match="stop_recorded"):
+        store.cancel_by_planner(job.id, cap)
+    for to, cause in (("failed", "lease_lapsed"), ("failed", "budget_cap"), ("failed", "floor_refused"),
+                      ("cancelled", "planner_cancel"), ("cancelled", "human_cancel")):
+        with pytest.raises(TransitionRefused, match="stop_recorded"):
+            store._transition(job.id, to, cause)
+    with pytest.raises(TransitionRefused, match="by its own envelope method"):
+        store._transition(job.id, "failed", "envelope_ended")
+    assert not hasattr(store, "stopped_by_envelope")
+    assert store.get(job.id).state == "running"
+    # the lease has not lapsed, so the store refuses that cause; a cause outside the stop set refuses too
+    with pytest.raises(TransitionRefused, match="has not lapsed"):
+        store.stop_recorded(job.id, "lease_lapsed")
+    with pytest.raises(TransitionRefused, match="not a cause that stops"):
+        store.stop_recorded(job.id, "verifier_fail")
+    out = store.stop_recorded(job.id, "budget_cap", why="killed at the cap")
+    assert (out.state, out.history[-1].cause) == ("failed", "budget_cap")
+    assert json.loads(out.history[-1].evidence) == {"stopped": True, "why": "killed at the cap"}
+
+
+@pytest.mark.parametrize("cause", ["planner_cancel", "human_cancel"])
+def test_stop_recorded_records_a_cancel_as_cancelled(store, repo, env, cause):
+    job, _ = running_job(store, repo, env)
+    out = store.stop_recorded(job.id, cause)
+    assert (out.state, out.history[-1].cause) == ("cancelled", cause)
+
+
+def test_stop_recorded_lease_lapsed_past_the_lease(store, repo, env):
+    job, _ = running_job(store, repo, env)
+    store._clock.now = parse_stamp(job.expires_at)
+    out = store.stop_recorded(job.id, "lease_lapsed")
+    assert (out.state, out.history[-1].cause) == ("failed", "lease_lapsed")
+    assert store.overdue_running() == []
+
+
+def test_runs_exited_still_leaves_running(store, repo, env):
+    job, _ = running_job(store, repo, env)
+    assert store._transition(job.id, "verifying", "runs_exited").state == "verifying"
+
+
+# --- ids an end can name -------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("env_id,thread", [("a\nb", "thread-1"), ("env-1", "thr\u200bead")])
+def test_evidence_with_unshowable_ids_refuses_a_filing_and_writes_nothing(store, repo, env_id, thread):
+    """L3 r2 complement MED: filing accepts only the ids end_envelope can name."""
+    env = FakeEnvelope(env_id, str(repo[0]), thread=thread)
+    with pytest.raises(EnvelopeRefused, match="one line of plain text"):
+        file_env(store, repo, env)
+    assert rows(store, "jobs") == rows(store, "job_envelopes") == rows(store, "transitions") == 0
+    assert env.calls == []
 
 
 def test_end_envelope_with_a_thread_fails_only_that_threads_jobs(store, repo):
@@ -554,5 +644,6 @@ def test_no_cli_mcp_or_phone_door_files_or_lands_by_envelope():
     root = Path(__file__).resolve().parent.parent / "levain" / "dispatch"
     for name in ("cli.py", "mcp.py", "phone.py"):
         text = (root / name).read_text()
-        for word in ("file_in_envelope", "envelope=", "end_envelope", "take_slot", "stopped_by_envelope"):
+        for word in ("file_in_envelope", "envelope=", "end_envelope", "take_slot", "stop_recorded",
+                     "overdue_running"):
             assert word not in text, (name, word)

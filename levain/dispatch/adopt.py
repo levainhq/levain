@@ -648,7 +648,8 @@ class Floor:
     target checks passed, which a human SIGN can supply, never an integrity or floor failure. On a pass,
     ``record``/``changes``/``tier`` are the run to land, its change set and its landing tier, ``rule`` the
     (generation, index) of a rule that held, ``evidence`` the envelope's intent fields; on a MOVED BASE under (C),
-    ``evidence`` is set only when step 6 held."""
+    ``evidence`` is set only when step 6 held. ``bound`` is True when the envelope given is the job's own (its filing
+    binding names it), whether or not its :meth:`Envelope.refusal` passed: a MOVED BASE then fails the job."""
     failure: str | None
     moved: bool = False
     record: ArtifactRecord | None = None
@@ -657,6 +658,7 @@ class Floor:
     rule: tuple[int, int] | None = None
     needs_sign: bool = False
     evidence: dict[str, Any] | None = None
+    bound: bool = False
 
 
 def _refuse(line: str) -> Floor:
@@ -858,6 +860,7 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
         rule_ref = (generation, index)
     evidence: dict[str, Any] | None = None
     unsigned: str | None = None          # step 6's missing (C) authority, said only once step 7 passes
+    bound = False
     if envelope is not None:
         # 6. the envelope: resolved only through the job's filing binding, never from what the object says alone
         shaped = _envelope_evidence(envelope)
@@ -869,6 +872,7 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
             unsigned = (f"the envelope is not the one job {job.id} was bound to at filing ({job.envelope_id}, "
                         f"thread {job.thread_id}); landing it needs a signature")
         else:
+            bound = True
             line = envelope.refusal(job, onto, changes, tier)
             if line is not None:
                 unsigned = str(line)[:500] or "the envelope refused this land"
@@ -888,9 +892,11 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
             return _refuse(f"{onto} already contains run {r.run}'s staged commit, a merge Levain did not make "
                            "under an authority; it is not an adoption")
     if tip != record.base:
-        # under (C), ``evidence`` is set only when step 6 held: land fails the job then, and refuses otherwise
+        # under (C), land fails the job when the envelope is the job's own (``bound``), even one whose refusal()
+        # refuses (dead, or past its criteria): the result was judged on a base the target no longer reads, so it
+        # is invalid under any authority, and holding it would keep its write files from the coordinator's re-file
         return Floor(failure=f"MOVED BASE: {onto} is at {tip}, not the contract's base {record.base}", moved=True,
-                     record=record, changes=changes, tier=tier, evidence=evidence)
+                     record=record, changes=changes, tier=tier, evidence=evidence, bound=bound)
     if unsigned is not None:
         return Floor(failure=unsigned, needs_sign=True)
     return Floor(failure=None, record=record, changes=changes, tier=tier, rule=rule_ref, evidence=evidence)
@@ -1147,9 +1153,10 @@ def land(store: JobStore, job_id: str, *,
     ``envelope_rule``, and :meth:`Envelope.precondition` runs inside the authorise transaction; a missing (C)
     authority, at the floor or in that transaction, is a ``needs_sign`` landing, said only when the target passed
     (a target the floor refuses is ``refused``: a SIGN cannot fix it). The object itself, never a separate hook, is
-    what :meth:`JobStore.authorise` judges. A MOVED BASE under the job's own envelope (floor step 6 held: the binding
-    names it and :meth:`Envelope.refusal` passes) FAILS the job, cause ``base_moved`` (C0 §5: the coordinator then
-    re-files); under an envelope that is not that authority it is refused and the job kept, as under a rule."""
+    what :meth:`JobStore.authorise` judges. A MOVED BASE under the job's own envelope (its filing binding names it,
+    whether or not :meth:`Envelope.refusal` passes: a dead bound envelope fails it too) FAILS the job, cause
+    ``base_moved``, releasing its write files (C0 §5: the coordinator then re-files); under an envelope that is not
+    the job's own it is refused and the job kept, as under a rule."""
     job = store.get(job_id)
     if job is None:
         raise TransitionRefused(f"no dispatch job {str(job_id)[:40]!r}")
@@ -1173,8 +1180,8 @@ def land(store: JobStore, job_id: str, *,
         if human is not None and verdict.record is not None and verdict.tier is not None and \
                 _human_refusal(store, job, human, verdict.record, verdict.tier) is None:
             return _fail_moved(store, job, line)
-        if envelope is not None and verdict.evidence is not None:
-            # the job's own envelope held at step 6: the result was judged on a base the target no longer reads
+        if envelope is not None and verdict.bound:
+            # the job's own envelope, live or not: the result was judged on a base the target no longer reads
             return _fail_moved(store, job, line)
         return Landing(outcome="refused", job=job, message=f"{line}; nothing was failed or deleted (only a verified "
                                                             "authorisation or the job's own envelope fails a job on "
