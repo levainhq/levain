@@ -419,6 +419,10 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
         _brief_dir(ln)
     except (CoordError, OSError) as exc:
         return left(f"the launch's briefs directory refused ({type(exc).__name__}: {str(exc)[:300]})")
+    from levain.launch import child_env
+
+    if shutil.which("claude", path=child_env().get("PATH")) is None:
+        return left("claude is not on PATH")
     got, why = store.launch_claim_spawn(launch_id, os.getpid())
     if why is not None:
         return Outcome(launch_id, False, refusal=why)
@@ -661,6 +665,8 @@ def watch_once(store: CoordStore) -> list[str]:
         stopped.add(hid)
         lines.append(f"launch {ln.launch_id} {ln.state} ({ln.cause}): "
                      f"{_stop(exe, hid, cwd=str(store.directory), env=env)}")
+    # again after this pass's own ends, so a session found gone above loses its brief in the same pass (L3 r2)
+    lines.extend(_remove_briefs(store))
     return lines
 
 

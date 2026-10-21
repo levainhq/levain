@@ -875,6 +875,29 @@ def test_a_multi_line_cause_is_written_as_one_line(store, fake, live_hook, monke
     assert "first line second line" in ln.cause and "‮" not in ln.cause
 
 
+def test_claude_not_on_path_refuses_before_the_spawn_claim(store, fake, live_hook, monkeypatch, qdir):
+    # L3 r2: a local refusal like the hook's: nothing written, the launch left pending (an unspawned expiry is no death)
+    monkeypatch.setattr(cl.shutil, "which", lambda *a, **k: None)
+    launch_id = woken(store)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "claude is not on PATH" in got.refusal and "left pending" in got.refusal
+    assert store.launch(launch_id).state == "pending"
+    assert rows(qdir, "SELECT COUNT(*) FROM launch_spawns") == [(0,)]
+
+
+def test_a_session_found_gone_loses_its_brief_in_the_same_pass(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    brief = cl.brief_path(ln)
+    assert brief.is_file()
+    (fake.dir / "state.json").unlink()
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert f"launch {ln.launch_id} ended: 0 turns (its session is no longer listed)" in lines
+    assert not brief.exists()
+
+
 def test_a_refusal_before_the_spawn_claim_is_one_line_too(store, fake, monkeypatch):
     monkeypatch.setattr(cl, "hook_live", lambda d: (False, "first line\nsecond\tline ‮"))
     got = cl.launch_session(store, woken(store))
