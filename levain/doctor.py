@@ -373,6 +373,19 @@ def _check_dispatch_verifiers() -> list[CheckResult]:
         active = dctl.ControlStore(qdir, authority=_authority_source(qdir, None)).active()
         gen, entries = active_verifier_entries(active)
         legacy = legacy_verifiers_problem(active)
+        stale, unreadable = [], []
+        for e in entries:
+            try:
+                shipped = driver_template_digest(e["driver_template"])
+            except OSError as exc:
+                # an installed template that cannot be read: its row is red and names it, the doctor goes on
+                unreadable.append(f"{e['verifier_id']} (driver {e['driver_template']}: the installed template "
+                                  f"cannot be read, {type(exc).__name__})")
+                continue
+            if shipped != e["driver_template_digest"]:
+                stale.append(f"{e['verifier_id']} (driver {e['driver_template']}: "
+                             + ("not shipped by this levain)" if shipped is None
+                                else "the installed template differs)"))
     except dctl.ControlStateUnavailable as exc:
         return [CheckResult(name, True, f"could not be read ({str(exc)[:300]})",
                             "`levain dispatch config show` says what the control store holds.", warn=True)]
@@ -384,12 +397,10 @@ def _check_dispatch_verifiers() -> list[CheckResult]:
             return [CheckResult(name, True, f"{legacy[:600]} (no verifier runs until one is signed)", None,
                                 warn=True)]
         return [CheckResult(name, True, "no verifier item is accepted")]
-    stale = []
-    for e in entries:
-        shipped = driver_template_digest(e["driver_template"])
-        if shipped != e["driver_template_digest"]:
-            stale.append(f"{e['verifier_id']} (driver {e['driver_template']}: "
-                         + ("not shipped by this levain)" if shipped is None else "the installed template differs)"))
+    if unreadable:
+        return [CheckResult(name, False, f"generation {gen}: {', '.join(unreadable + stale)[:600]}; every run of "
+                            "these verifiers is refused", "Reinstall levain so its driver templates are readable; "
+                            f"if a template changed, {RESIGN_VERIFIERS}.")]
     if stale:
         return [CheckResult(name, False, f"generation {gen}: {', '.join(stale)[:600]}; every run of these verifiers "
                             "is refused", f"The installed levain changed a driver template; {RESIGN_VERIFIERS}.")]

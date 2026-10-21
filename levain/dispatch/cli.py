@@ -767,15 +767,24 @@ def _run_config(args: argparse.Namespace, out: Any, emit: Callable[[Any, str], N
         legacy = dregistry.legacy_verifiers_problem(items)
         data = {"configured": True, "store": str(path), "store_id": store.store_id(), "trust_root": store.trust_root(),
                 "generation": top, "head": head, "kinds": {k: v[0] for k, v in kinds.items()}}
+        legacy_line = None
         if legacy is not None:
             data["no_longer_read"] = {"verifiers": {"generation": items["verifiers"].generation, "why": legacy}}
+            current = items.get("verifier")
+            if current is not None:
+                # re-signed: the old item stays in the append-only chain, superseded, and nothing is owed
+                data["no_longer_read"]["verifiers"]["superseded_by"] = current.generation
+                legacy_line = (f"SUPERSEDED by the active verifier item (generation {current.generation}): the 0.11 "
+                               f"verifiers item at generation {items['verifiers'].generation} is no longer read")
+            else:
+                legacy_line = f"NO LONGER READ: {legacy}"
         emit(data,
              "\n".join(_ascii(line) for line in [
                  f"levain dispatch config: store {store.store_id()}, generation {top}, head {head or '(none)'}",
                  f"  trust root       {store.trust_root()}",
                  *[f"  {k:<16} " + (f"(generation {kinds[k][0]['generation']})  {kinds[k][1]}" if k in kinds
                                     else "(none accepted)") for k in dctl.KINDS],
-                 *([f"  {'verifiers':<16} NO LONGER READ: {legacy}"] if legacy is not None else [])]))
+                 *([f"  {'verifiers':<16} {legacy_line}"] if legacy_line is not None else [])]))
         return EXIT_OK
     _refuse_an_agent(f"config {cmd}")
     try:

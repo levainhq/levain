@@ -55,7 +55,7 @@ def test_the_template_imports_only_the_standard_library():
     tree = ast.parse(TEMPLATE.read_bytes())
     names = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     names |= {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
-    assert names == {"__future__", "hashlib", "json", "os", "re", "sys"}
+    assert names == {"__future__", "hashlib", "json", "os", "re", "stat", "sys"}
 
 
 def test_a_passing_run_reads_as_pass_through_the_envelope(store, log, keys, tmp_path):
@@ -146,3 +146,85 @@ def test_the_report_constants_mirror_dispatch():
     assert oc.REPORT_FORMAT == vr.REPORT_FORMAT and oc.MAX_STEPS == vr.MAX_STEPS == rg.MAX_STEPS
     assert oc.MAX_CAPTURE_BYTES == vr.MAX_REPORT_BYTES and oc.MAX_INPUT_BYTES == registry.MAX_DRIVER_INPUT_BYTES
     assert oc.EXIT_KEYS == vr.EXIT_KEYS
+
+
+# --- W2-b L3 r1 C, D, ruling (3) -----------------------------------------------------------------------------------
+
+def test_the_docstring_says_step_numbering_is_0_based():
+    assert "0-BASED" in oc.__doc__ and "step0.exit" in oc.__doc__
+
+
+def test_a_capture_that_is_a_directory_is_infrastructure(tmp_path):
+    inp = tmp_path / "input.json"
+    inp.write_bytes(canonical_bytes({"steps": [{"exit": 0}]}))
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "step0.exit").write_text(json.dumps(OK))
+    (run / "step0.out").mkdir()
+    (run / "step0.err").write_bytes(b"")
+    p = subprocess.run([sys.executable, "-I", "-S", str(TEMPLATE), str(inp), str(run)], capture_output=True,
+                       timeout=60)
+    assert p.returncode == 2 and p.stdout == b"" and "step0.out is not a regular file" in p.stderr.decode()
+
+
+def test_a_capture_that_is_a_fifo_neither_blocks_nor_is_read(tmp_path):
+    import os
+
+    inp = tmp_path / "input.json"
+    inp.write_bytes(canonical_bytes({"steps": [{"exit": 0}]}))
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "step0.exit").write_text(json.dumps(OK))
+    os.mkfifo(run / "step0.out")             # no writer: a blocking open would hang here until the timeout
+    (run / "step0.err").write_bytes(b"")
+    p = subprocess.run([sys.executable, "-I", "-S", str(TEMPLATE), str(inp), str(run)], capture_output=True,
+                       timeout=30)
+    assert p.returncode == 2 and p.stdout == b"" and "step0.out is not a regular file" in p.stderr.decode()
+
+
+def test_a_read_fault_is_infrastructure_and_closes_the_fd(tmp_path, monkeypatch):
+    import os
+
+    f = tmp_path / "x"
+    f.write_bytes(b"abc")
+    closed = []
+    real_close = os.close
+
+    def bad_read(fd, n):
+        raise OSError(5, "Input/output error")
+
+    def spy_close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(oc.os, "read", bad_read)
+    monkeypatch.setattr(oc.os, "close", spy_close)
+    with pytest.raises(oc.Infrastructure, match=r"x cannot be read \(OSError\)"):
+        oc._read(str(f), 10, "x")
+    assert len(closed) == 1
+
+
+def test_a_non_regular_file_closes_the_fd(tmp_path, monkeypatch):
+    import os
+
+    closed = []
+    real_close = os.close
+    monkeypatch.setattr(oc.os, "close", lambda fd: (closed.append(fd), real_close(fd)))
+    with pytest.raises(oc.Infrastructure, match="is not a regular file"):
+        oc._read(str(tmp_path), 10, "dir")
+    assert len(closed) == 1
+
+
+def test_a_stdout_equals_that_is_not_utf8_encodable_is_infrastructure(tmp_path):
+    raw = b'{"steps":[{"exit":0,"stdout_equals":"\\ud800"}]}'
+    with pytest.raises(oc.Infrastructure, match="not encodable as UTF-8"):
+        oc.expectations(raw)
+    p = drive(tmp_path, [(OK, b"", b"")], raw_input=raw)
+    assert p.returncode == 2 and p.stdout == b"" and "stdout_equals is not encodable" in p.stderr.decode()
+
+
+def test_expectations_hand_judge_the_encoded_bytes():
+    (e,) = oc.expectations(b'{"steps":[{"exit":0,"stdout_equals":"caf\\u00e9\\n"}]}')
+    assert e["stdout_equals"] == "café\n".encode("utf-8")
+    assert oc.judge(e, OK, "café\n".encode("utf-8"), b"")[0] == "pass"
+    assert oc.judge(e, OK, b"cafe\n", b"")[0] == "fail"

@@ -7,9 +7,10 @@ driver template a signed ``verifier`` item pins by the SHA-256 of these bytes, a
 ``input.json`` is the entry's ``driver_input``, exactly ``{"steps": [expectation, ...]}``, one expectation per ticket
 step in order, each ``{"exit": int}`` plus any of ``"stdout_sha256": "sha256:<64 hex>"`` (of the captured stdout
 bytes), ``"stdout_equals": str`` (the captured stdout is exactly its UTF-8 bytes) and ``"stderr_empty": bool`` (true:
-nothing on stderr). ``<run_dir>`` holds what root wrote for each step ``k`` (0-based, the report's numbering):
-``step<k>.exit`` (``{exit, signal, wall_s, timed_out, truncated_bytes, lingering_killed}``), ``step<k>.out`` and
-``step<k>.err``. A step passes when it was not timed out or signalled, exited with the pinned code, and every pinned
+nothing on stderr). ``<run_dir>`` holds what root wrote for each step ``k``: ``step<k>.exit`` (``{exit, signal,
+wall_s, timed_out, truncated_bytes, lingering_killed}``), ``step<k>.out`` and ``step<k>.err``, where ``k`` is 0-BASED,
+the report's numbering: the first ticket step's files are ``step0.exit``, ``step0.out``, ``step0.err``. Each is a
+regular file; anything else (a directory, a FIFO, a symlink) is not a capture root wrote. A step passes when it was not timed out or signalled, exited with the pinned code, and every pinned
 output check holds; an output check on a capture root truncated fails, since the bytes compared are not all of them.
 
 Stdout carries the ``levain-dispatch-verifier-report/1`` body as canonical JSON (keys sorted, no whitespace, UTF-8,
@@ -23,6 +24,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 
 REPORT_FORMAT = "levain-dispatch-verifier-report/1"
@@ -70,12 +72,30 @@ def _json(raw: bytes, what: str) -> object:
 
 
 def _read(path: str, cap: int, what: str) -> bytes:
+    # open, fstat, read and close are ONE guarded unit: any fault is Infrastructure (exit 2), never a traceback.
+    # O_NONBLOCK so a FIFO cannot block the open; the fstat refuses anything but a regular file before a read.
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
     except OSError as exc:
         raise Infrastructure(f"{what} cannot be opened ({type(exc).__name__})") from None
-    with os.fdopen(fd, "rb") as f:
-        data = f.read(cap + 1)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Infrastructure(f"{what} is not a regular file")
+        chunks, left = [], cap + 1
+        while left > 0:
+            chunk = os.read(fd, left)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            left -= len(chunk)
+        data = b"".join(chunks)
+    except OSError as exc:
+        raise Infrastructure(f"{what} cannot be read ({type(exc).__name__})") from None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
     if len(data) > cap:
         raise Infrastructure(f"{what} is over {cap} bytes")
     return data
@@ -86,7 +106,8 @@ def _int(v: object, *, nullable: bool = False) -> bool:
 
 
 def expectations(raw: bytes) -> list:
-    """The pinned expectations ``input.json`` holds, checked whole; raises :class:`Infrastructure`."""
+    """The pinned expectations ``input.json`` holds, checked whole, each ``stdout_equals`` already encoded to the UTF-8
+    bytes :func:`judge` compares; raises :class:`Infrastructure`."""
     if len(raw) > MAX_INPUT_BYTES:
         raise Infrastructure(f"input.json is over {MAX_INPUT_BYTES} bytes")
     obj = _json(raw, "input.json")
@@ -103,8 +124,13 @@ def expectations(raw: bytes) -> list:
         if "stdout_sha256" in e and (not isinstance(e["stdout_sha256"], str)
                                      or _DIGEST.fullmatch(e["stdout_sha256"]) is None):
             raise Infrastructure(f"expectation {k}'s stdout_sha256 is sha256:<64 hex>")
-        if "stdout_equals" in e and not isinstance(e["stdout_equals"], str):
-            raise Infrastructure(f"expectation {k}'s stdout_equals is text")
+        if "stdout_equals" in e:
+            if not isinstance(e["stdout_equals"], str):
+                raise Infrastructure(f"expectation {k}'s stdout_equals is text")
+            try:
+                e["stdout_equals"] = e["stdout_equals"].encode("utf-8")
+            except UnicodeEncodeError:
+                raise Infrastructure(f"expectation {k}'s stdout_equals is not encodable as UTF-8") from None
         if "stderr_empty" in e and type(e["stderr_empty"]) is not bool:
             raise Infrastructure(f"expectation {k}'s stderr_empty is true or false")
     return steps
@@ -134,7 +160,7 @@ def judge(expect: dict, rec: dict, out: bytes, err: bytes) -> tuple[str, str]:
         return "fail", f"output truncated by {rec['truncated_bytes']} bytes; the pinned output checks cannot hold"
     if "stdout_sha256" in expect and "sha256:" + hashlib.sha256(out).hexdigest() != expect["stdout_sha256"]:
         return "fail", "stdout is not the pinned sha256"
-    if "stdout_equals" in expect and out != expect["stdout_equals"].encode("utf-8"):
+    if "stdout_equals" in expect and out != expect["stdout_equals"]:
         return "fail", "stdout is not the pinned text"
     if "stderr_empty" in checks and err:
         return "fail", f"stderr is not empty ({len(err)} bytes)"

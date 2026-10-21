@@ -72,7 +72,7 @@ from levain.contracts.canon import canonical_bytes, parse
 from levain.dispatch import DispatchError
 from levain.dispatch.contract import ResolvedTemplate
 from levain.dispatch.policy import PolicyError, ProviderPolicy, match, path_text_problem
-from levain.dispatch.verifier_report import _steps_problem
+from levain.dispatch.verifier_report import _steps_problem, artifact_digest
 
 __all__ = [
     "ADOPTION_RULE_KEYS", "CRITERION_BOUNDS", "CRITERION_INT_MAX", "CRITERION_KEYS", "EXECUTION_BEARING_DIRS",
@@ -304,11 +304,14 @@ def driver_template_digest(name: str) -> str | None:
     return None if path is None else _sha256(path.read_bytes())
 
 
-def verifier_artifact_digest(entry: Mapping[str, Any]) -> str:
-    """The verifier ARTIFACT's digest: exactly what runs, the canonical ``{driver_template, driver_template_digest,
-    steps_digest, driver_input_digest, declared_kind}``, so a template's ``verifier_hash`` pins all of it."""
-    return _sha256(canonical_bytes({k: entry[k] for k in ("driver_template", "driver_template_digest", "steps_digest",
-                                                          "driver_input_digest", "declared_kind")}))
+# the verifier ARTIFACT's digest, exactly what runs; one formula, shared with the minted run's check
+# (levain.dispatch.verifier_report.artifact_digest, which imports nothing from this module)
+verifier_artifact_digest = artifact_digest
+
+
+# the shipped templates whose driver_input is {"steps": [one expectation per ticket step]}: the count is checked at accept,
+# so a mismatch is never found first by a run
+_STEP_INDEXED_INPUT = frozenset({"output_compare"})
 
 
 def _verifier_entry_problem(e: Any) -> str | None:
@@ -341,6 +344,11 @@ def _verifier_entry_problem(e: Any) -> str | None:
         return f"verifier {vid}'s steps_digest is not the digest of its steps"
     if not isinstance(e["driver_input"], dict):
         return f"verifier {vid}'s driver_input is an object"
+    if tname in _STEP_INDEXED_INPUT:
+        pinned = e["driver_input"].get("steps")
+        if not isinstance(pinned, list) or len(pinned) != len(e["steps"]):
+            return (f"verifier {vid}'s driver_input pins {len(pinned) if isinstance(pinned, list) else 'no'} "
+                    f"step expectation(s) for {len(e['steps'])} step(s); the {tname} template reads one per step")
     driver_input = canonical_bytes(e["driver_input"])
     if len(driver_input) > MAX_DRIVER_INPUT_BYTES:
         return f"verifier {vid}'s driver_input is over {MAX_DRIVER_INPUT_BYTES} bytes as canonical JSON"
@@ -613,7 +621,7 @@ def verifier_ticket(items: Mapping[str, Any], *, verifier_id: str) -> dict[str, 
     its item): ``{verifier_generation, verifier_id, verifier_steps, driver_input_digest, entry}``, the generation
     the item's, the steps and the driver input digest copied from its entry, ``entry`` the whole activated entry (a
     copy). Nothing a planner or a job supplies reaches them. Raises :class:`DispatchError` when no verifier item is
-    active or it has no such id."""
+    active, it has no such id, or the installed driver template is not the one the entry pins (or cannot be read)."""
     item = items.get("verifier")
     if item is None:
         legacy = legacy_verifiers_problem(items)
@@ -622,6 +630,17 @@ def verifier_ticket(items: Mapping[str, Any], *, verifier_id: str) -> dict[str, 
     if entry is None:
         raise DispatchError(f"verifier {str(verifier_id)[:64]!r} is not in the active verifier item (generation "
                             f"{item.generation})")
+    # the installed template must still be the one the entry pins: an upgrade that changed it mints no ticket
+    try:
+        shipped = driver_template_digest(entry["driver_template"])
+    except OSError as exc:
+        raise DispatchError(f"verifier {entry['verifier_id']}'s driver template {entry['driver_template']} cannot "
+                            f"be read ({type(exc).__name__})") from None
+    if shipped != entry["driver_template_digest"]:
+        raise DispatchError(f"verifier {entry['verifier_id']}'s driver template {entry['driver_template']} "
+                            + ("is not shipped by this levain" if shipped is None else
+                               "installed is not the one the active verifier item pins")
+                            + f"; {RESIGN_VERIFIERS}")
     entry = parse(canonical_bytes(entry))         # a copy: the stored item's body is never handed out
     return {"verifier_generation": item.generation, "verifier_id": entry["verifier_id"],
             "verifier_steps": entry["steps"], "driver_input_digest": entry["driver_input_digest"], "entry": entry}

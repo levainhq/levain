@@ -742,3 +742,26 @@ def test_show_says_a_0_11_verifiers_item_is_no_longer_read(capsys, ddir, root, k
     with pytest.raises(SystemExit) as exc:
         sign(capsys, ddir, root, keys, tmp_path, "verifiers", {}, "--yes")
     assert exc.value.code == 2 and "invalid choice: 'verifiers'" in capsys.readouterr().err
+
+
+def test_show_says_a_0_11_verifiers_item_is_superseded_once_a_verifier_item_is_active(capsys, ddir, root, keys,
+                                                                                       tmp_path, monkeypatch):
+    from levain.dispatch import registry
+
+    init(capsys, ddir, root, keys)
+    with monkeypatch.context() as m:
+        m.setattr(registry, "body_refusal", lambda kind, body, active: None)
+        item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers",
+                               {"pytest-bb": {"artifact_hash": "sha256:" + "b" * 64, "kind": "black-box"}})
+        with open(item, "rb") as fh, open(sig) as sh:
+            store(ddir, root).accept(fh.read(), sh.read())
+    code, out, err = sign(capsys, ddir, root, keys, tmp_path, "verifier", VERIFIERS, "--yes")
+    assert code == 0, out + err
+    code, out, _ = run(capsys, "config", "show", "--dispatch-dir", str(ddir), "--data-root", root)
+    assert code == 0, out
+    assert ("verifiers        SUPERSEDED by the active verifier item (generation 2): the 0.11 verifiers item at "
+            "generation 1 is no longer read") in out
+    assert "NO LONGER READ" not in out
+    code, out, _ = run(capsys, "config", "show", "--dispatch-dir", str(ddir), "--data-root", root, "--json")
+    got = json.loads(out)["no_longer_read"]["verifiers"]
+    assert got["generation"] == 1 and got["superseded_by"] == 2

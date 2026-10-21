@@ -630,3 +630,62 @@ def test_doctor_has_no_verifier_row_without_a_control_store(tmp_path, monkeypatc
 
     monkeypatch.setattr(install, "_consent_queue_dir", lambda: tmp_path)
     assert doctor._check_dispatch_verifiers() == []
+
+
+# --- W2-b L3 r1 B and head rulings (1), (2) ------------------------------------------------------------------------
+
+def _with_input(entry_steps, driver_input):
+    return ventry("pytest-bb", "black-box", steps=entry_steps,
+                  steps_digest="sha256:" + hashlib.sha256(canonical_bytes(entry_steps)).hexdigest(),
+                  driver_input=driver_input,
+                  driver_input_digest="sha256:" + hashlib.sha256(canonical_bytes(driver_input)).hexdigest())
+
+
+TWO_STEPS = [{"argv": ["python3", "-m", "pytest", "-q"], "wall_s": 300}, {"argv": ["ruff", "check"], "wall_s": 60}]
+
+
+@pytest.mark.parametrize("driver_input, why", [
+    ({"steps": [{"exit": 0}]}, "pins 1 step expectation"),
+    ({"steps": [{"exit": 0}] * 3}, "pins 3 step expectation"),
+    ({}, "pins no step expectation"),
+    ({"steps": {"exit": 0}}, "pins no step expectation"),
+])
+def test_a_driver_input_whose_step_count_is_not_the_steps_is_refused_at_accept(store, log, keys, driver_input,
+                                                                                why):
+    refused(store, log, keys, "verifier", 1, vbody(_with_input(TWO_STEPS, driver_input)),
+            f"{why}\\(s\\) for 2 step\\(s\\); the output_compare template reads one per step")
+
+
+def test_a_driver_input_of_one_expectation_per_step_is_accepted(store, log, keys):
+    accept(store, log, keys, "verifier", 1, vbody(_with_input(TWO_STEPS, {"steps": [{"exit": 0}, {"exit": 0}]})))
+
+
+def test_the_ticket_rechecks_the_installed_driver_template(store, log, keys, monkeypatch):
+    base_config(store, log, keys)
+    assert verifier_ticket(store.active(), verifier_id="pytest-bb")["verifier_generation"] == 1
+    monkeypatch.setattr(registry, "driver_template_digest", lambda name: "sha256:" + "f" * 64)
+    with pytest.raises(DispatchError, match="output_compare installed is not the one the active verifier item pins"):
+        verifier_ticket(store.active(), verifier_id="pytest-bb")
+    monkeypatch.setattr(registry, "driver_template_digest", lambda name: None)
+    with pytest.raises(DispatchError, match="is not shipped by this levain; sign a new verifier item"):
+        verifier_ticket(store.active(), verifier_id="pytest-bb")
+
+    def unreadable(name):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(registry, "driver_template_digest", unreadable)
+    with pytest.raises(DispatchError, match=r"output_compare cannot be read \(PermissionError\)"):
+        verifier_ticket(store.active(), verifier_id="pytest-bb")
+
+
+def test_doctor_names_an_unreadable_driver_template_and_does_not_abort(store, log, keys, monkeypatch):
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
+
+    def unreadable(name):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(registry, "driver_template_digest", unreadable)
+    (row,) = doctor_rows(store, monkeypatch)
+    assert not row.ok and row.name == "dispatch verifiers"
+    assert "pytest-bb (driver output_compare: the installed template cannot be read, PermissionError)" in row.detail
+    assert "Reinstall levain" in row.hint
