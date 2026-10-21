@@ -10,11 +10,14 @@ from __future__ import annotations
 import errno
 import itertools
 import os
+import resource
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -599,6 +602,159 @@ def test_end_inode_and_time_caps_refused(tmp_path):
     _untouched(w, pre_live)
     assert end_session(w.facts, w.seams(ctl), record_state=HELD, failed_step="manifest_budget",
                        caps=Caps(inodes=n)) == RETAINED   # exactly at the cap ends normally
+
+
+def _chain(base: Path, depth: int) -> None:
+    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    for name in ["deep"] + ["d"] * (depth - 1):    # openat all the way down: PATH_MAX never limits it
+        os.mkdir(name, dir_fd=fd)
+        nfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+        os.close(fd)
+        fd = nfd
+    os.close(fd)
+
+
+def _open_fds() -> set[int]:
+    """The process's open fds from /dev/fd, each confirmed by fstat (so the listing's own fd is not counted)."""
+    used = set()
+    for n in os.listdir("/dev/fd"):
+        try:
+            os.fstat(int(n))
+            used.add(int(n))
+        except OSError:
+            pass
+    return used
+
+
+def _fd_users() -> str:
+    """What else holds or takes fds in this process, for a failure message under a squeezed limit."""
+    try:
+        fds = sorted(_open_fds())
+    except OSError as e:
+        fds = [f"unlistable: {e}"]
+    others = sorted(t.name for t in threading.enumerate() if t is not threading.main_thread())
+    return f"other threads alive: {others}; open fds: {fds}"
+
+
+def _fd_limit(free: int) -> int:
+    """The soft RLIMIT_NOFILE that leaves exactly ``free`` fd numbers open to new fds at the moment it is
+    computed (the open fds counted by :func:`_open_fds`); skipped past the hard limit."""
+    used = _open_fds()
+    lim = got = 0
+    while got < free:
+        if lim not in used:
+            got += 1
+        lim += 1
+    hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+    if hard != resource.RLIM_INFINITY and hard < lim:
+        pytest.skip(f"RLIMIT_NOFILE hard {hard} < {lim}")
+    return lim
+
+
+@contextmanager
+def _nofile(free: int):
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (_fd_limit(free), hard))
+    try:
+        yield
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+class _WalkFds:
+    """``end_mod.os`` for one walk, counting the fds END's own code holds: each ``os.open``'s fd until its
+    ``os.close``, plus the one ``os.listdir(fd)`` duplicates for as long as the listing runs. Only END's calls are
+    counted, so another thread's fds in the same process never enter the peak."""
+
+    def __init__(self) -> None:
+        self.held: set[int] = set()
+        self.peak = 0
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def open(self, *a, **k):
+        fd = os.open(*a, **k)
+        self.held.add(fd)
+        self.peak = max(self.peak, len(self.held))
+        return fd
+
+    def close(self, fd):
+        os.close(fd)
+        self.held.discard(fd)
+
+    def listdir(self, path):
+        if isinstance(path, int):
+            self.peak = max(self.peak, len(self.held) + 1)
+        return os.listdir(path)
+
+
+# DECISION: free fd numbers left beside a measured need under a squeezed RLIMIT_NOFILE, for what else the process
+# opens meanwhile (END's own fds outside the walk, and whatever else a full suite's process holds or takes: on
+# Linux CI the walk with zero to spare raised EMFILE, and END with eight to spare failed at ``manifest``). The
+# exact bound is the measured peak's assertion, not this; the squeezed limit proves only that the walk does not
+# grow with depth, so each chain below is asserted deeper than the limit it runs under.
+FD_SPARE = 32
+CHAIN = 150
+
+
+def test_walk_fd_peak_is_bounded(world, monkeypatch):
+    """Reproduced red on the r1 tip fa9251c0 (codex r1 MED): the walk pruned an ancestor only after opening and
+    listing the child, so its peak was two past WALK_OPEN_DIRS, and with exactly WALK_PEAK_FDS fds free it raised
+    EMFILE part-way down a chain. It now prunes first. The peak is MEASURED (END's own opens, closes and
+    listings, counted) and must not pass WALK_PEAK_FDS; then the whole tree walks under a real limit far below the
+    chain's depth."""
+    _chain(world.S / "repo", CHAIN)
+    _chain(world.vf / "T", CHAIN)                   # under .levain-var-folders, the frame opened by path
+    count = _WalkFds()
+    with monkeypatch.context() as m:
+        m.setattr(end_mod, "os", count)
+        expected = len(list(end_mod.walk(world.S, world.extra)))
+    assert not count.held, f"the walk left {sorted(count.held)} open"
+    assert count.peak <= end_mod.WALK_PEAK_FDS, f"measured peak {count.peak} > WALK_PEAK_FDS"
+    free = end_mod.WALK_PEAK_FDS + FD_SPARE
+    assert CHAIN > free
+    err = None
+    with _nofile(free):
+        try:
+            got = len(list(end_mod.walk(world.S, world.extra)))
+        except OSError as e:
+            err = f"{e}; {_fd_users()}"      # while the limit is still squeezed
+    assert err is None, f"{err} with {free} fds free (measured peak {count.peak})"
+    assert got == expected
+
+
+def test_end_deep_chain_holds_bounded_fds_and_refuses_past_depth_cap(world):
+    """A slot-built directory chain deeper than the fd limit (reproduced on main 42585459: a 2000-deep chain at
+    RLIMIT_NOFILE 1024, and a 300-deep one at macOS's default 256, made the manifest walk raise EMFILE, so END
+    landed HELD at the bare ``manifest`` phase and failed the same way on every pass). The walk now holds a
+    bounded number of fds, so the chain is retained under a low limit; past the depth cap it is a budget
+    refusal (HELD ``manifest_budget``, nothing mutated), whose exit is END again with a larger cap. That pass
+    failing after the rename, then a pass at a cap SMALLER than the chain, still retains it (reproduced on the
+    r1 tip fa9251c0, complement r1 MED 1: the second pass refused ``manifest-depth-cap`` on the renamed tree):
+    every walk after the manifest takes the depth the manifest accepted. The chain is under
+    ``.levain-var-folders``, whose own frame is opened by path, not from the root's fd."""
+    _chain(world.vf / "T", CHAIN)
+    pre_live = {k: v for k, v in snapshot(world.S).items() if k != "config/claude/.credentials.json"}
+    pre, pre_manifest = world.pre(), world.pre_manifest()
+    ctl = Control()
+
+    def fault(p):
+        if p == "retain:tree:renamed":
+            raise OSError(errno.EIO, "a transient failure after the rename")
+    # No fd squeeze here: the fd bound is proven by the measurement in test_walk_fd_peak_is_bounded; this test
+    # proves only the depth-cap refusal and the retained exit.
+    assert end_session(world.facts, world.seams(ctl), record_state=REVOKED, caps=Caps(depth=100)) == HELD
+    assert ctl.failed_step == "manifest_budget" and any("manifest-depth-cap" in n for n in world.notes), \
+        f"{ctl.failed_step}; notes {world.notes[-3:]}"
+    _untouched(world, pre_live)
+    assert end_session(world.facts, world.seams(ctl, fault=fault), record_state=HELD,
+                       failed_step="manifest_budget", held_attempts=1, caps=Caps(depth=200)) == HELD
+    assert ctl.failed_step == "tree" and world.facts.tree.exists() and not world.S.exists()
+    assert end_session(world.facts, world.seams(ctl), record_state=HELD, failed_step="tree", held_attempts=2,
+                       caps=Caps(depth=100)) == RETAINED
+    ctl.history = [h for h in ctl.history if h[0] != HELD]
+    _assert_retained(world, pre, pre_manifest, ctl)
 
 
 def _node_modules_tree(root: Path, packages: int, targets: int) -> None:

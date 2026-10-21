@@ -133,11 +133,27 @@ def qdir(tmp_path):
     return d
 
 
+@pytest.fixture(autouse=True)
+def _levain_home(tmp_path, monkeypatch):
+    """The coordinator record a launch reads and writes is this test's own."""
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "levain-home"))
+
+
+def _coordinator_dir(d):
+    """``d`` as `levain coord agent` leaves it: the role hint in its own config, and in the coordinator record."""
+    from levain.coordinator import door
+
+    (d / ".levain").mkdir(parents=True, exist_ok=True)
+    (d / ".levain" / "config.json").write_text('{"role": "coordinator"}\n')
+    door.record(d)
+    return d
+
+
 @pytest.fixture
 def workdir(tmp_path):
     d = tmp_path / "coord-install"
     d.mkdir()
-    return d
+    return _coordinator_dir(d)
 
 
 @pytest.fixture
@@ -220,6 +236,7 @@ def test_the_first_agents_row_has_no_pid_and_is_enough(store, fake, live_hook):
 def test_an_untrusted_directory_fails_with_its_realpath_and_the_remedy(qdir, tmp_path, fake, live_hook):
     real = tmp_path / "real-dir"
     real.mkdir()
+    _coordinator_dir(real)
     link = tmp_path / "linked-dir"
     link.symlink_to(real)
     store = CoordStore(qdir)
@@ -325,6 +342,7 @@ def test_a_launch_no_longer_pending_spawns_nothing(store, fake, live_hook):
 def test_a_directory_whose_hook_is_not_live_refuses(qdir, tmp_path, fake, monkeypatch):
     plain = tmp_path / "plain"
     plain.mkdir()
+    _coordinator_dir(plain)
     store = CoordStore(qdir)
     store.coord_set_agent("claude", cwd=str(plain.resolve()))
     launch_id = woken(store)
@@ -337,6 +355,27 @@ def test_a_directory_whose_hook_is_not_live_refuses(qdir, tmp_path, fake, monkey
     # fixed while it is still pending, the same launch starts
     monkeypatch.setattr(cl, "hook_live", lambda d: (True, "wired to this install"))
     assert cl.launch_session(store, launch_id).started
+
+
+def test_a_coordinator_is_never_launched_into_an_unmarked_reused_install(qdir, tmp_path, fake, live_hook):
+    """Reproduced (coordint/tests_new_on_merged.txt): a setting naming a live install with no coordinator record and
+    no role (written before `coord agent` refused one, or straight into the store) started a coordinator there, where
+    the door is open."""
+    own = tmp_path / "own-install"
+    own.mkdir()
+    store = CoordStore(qdir)
+    store.coord_set_agent("claude", cwd=str(own.resolve()))
+    launch_id = woken(store)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and got.refusal.startswith("review item: ") and "not a coordinator's workspace" in got.refusal
+    assert f"launch {launch_id} left pending" in got.refusal
+    assert fake.spawns() == [] and store.launch(launch_id).state == "pending"
+    # a workspace rendered before the record (the role hint only) is recorded at its launch and starts
+    (own / ".levain").mkdir()
+    (own / ".levain" / "config.json").write_text('{"role": "coordinator"}\n')
+    assert cl.launch_session(store, launch_id).started
+    from levain.coordinator import door
+    assert str(own.resolve()) in door.recorded()
 
 
 # --- the setting -----------------------------------------------------------------------------------------------
@@ -354,8 +393,8 @@ def test_with_no_setting_a_drop_only_queues(qdir, fake):
 
 def test_the_setting_is_yours_and_append_only(qdir, workdir):
     store = CoordStore(qdir)
-    with pytest.raises(lease.LeaseRefused, match="only claude is built"):
-        store.coord_set_agent("codex", cwd=str(workdir))
+    with pytest.raises(lease.LeaseRefused, match="absolute path"):          # codex runs in a directory too (C3c)
+        store.coord_set_agent("codex", cwd="relative")
     with pytest.raises(lease.LeaseRefused, match="absolute path"):
         store.coord_set_agent("claude", cwd="relative")
     with pytest.raises(lease.LeaseRefused, match="no --model"):
@@ -486,12 +525,19 @@ def test_the_coordinator_install_pre_approves_its_own_three_verbs_and_a_reused_i
     assert inst.persisted_role(target) == "coordinator"
     assert levain_main(["update", "--path", str(target)]) == 0      # a re-render keeps them
     assert [r for r in allow(target) if r.startswith("Bash(")] == bash
-    # a live install made by plain init and then named as the coordinator's is used as is: nothing pre-approved
+    # a live install made by plain init and then named as the coordinator's is REFUSED, never marked (door r2 (a)):
+    # the door is open in an unmarked directory, and marking the operator's install would door his own sessions
     plain = tmp_path / "plain"
     answers = tmp_path / "answers.json"
     answers.write_text(json.dumps(cl._install_answers()))
     assert inst.run_init(plain, "claude-code", force=False, answers_file=answers, default_grants="no") == 0
-    _main(qdir, capsys, "coord", "agent", "claude", "--cwd", str(plain))
+    before = CoordStore(qdir).coord_setting()
+    out = _main(qdir, capsys, "coord", "agent", "claude", "--cwd", str(plain), rc=1)
+    assert "not a coordinator's own" in out.err and "leave out --cwd" in out.err
+    assert CoordStore(qdir).coord_setting() == before                  # nothing recorded
+    # the workspace that already has the role is reused as is
+    _main(qdir, capsys, "coord", "agent", "claude", "--cwd", str(target))
+    assert CoordStore(qdir).coord_setting().cwd == str(target)
     assert not [r for r in allow(plain.resolve()) if r.startswith("Bash(")]
     assert "enabledMcpjsonServers" not in json.loads((plain.resolve() / ".claude" / "settings.json").read_text())
     assert inst.persisted_role(plain.resolve()) is None
@@ -504,22 +550,25 @@ def test_the_coordinator_install_pre_approves_its_own_three_verbs_and_a_reused_i
         assert inst.persisted_role(target) is None, body
 
 
-def test_a_session_levain_launched_keeps_to_the_coordinators_door(store, qdir, capsys, monkeypatch):
-    # the pre-approved trees grant nothing only if a launched session cannot write as the operator (L3 r1 codex HIGH)
+def test_a_session_levain_launched_keeps_to_the_coordinators_door(store, qdir, workdir, capsys, monkeypatch):
+    # the pre-approved trees grant nothing only if a launched session cannot write as the operator (L3 r1 codex HIGH);
+    # the session runs in the launch's directory, the coordinator's workspace, and that is what the door reads
     launch_id = woken(store)
     _, why = store.launch_activate(launch_id, harness_session_id="sess-coord")
     assert why is None
     key = store.launch_by_harness_session("sess-coord").session_key
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-coord")
+    (workdir / ".levain").mkdir(exist_ok=True)
+    (workdir / ".levain" / "config.json").write_text('{"role": "coordinator"}\n')
+    monkeypatch.chdir(workdir)
     tok = json.loads(_main(qdir, capsys, "coord", "claim", "--launch", launch_id, "--session", key, "--json").out)
     _main(qdir, capsys, "thread", "list")
     for argv in (("coord", "take"), ("coord", "wake"), ("coord", "agent", "none"),
                  ("coord", "release", "--token", str(tok["token"]))):
         out = _main(qdir, capsys, *argv, rc=1)
-        assert "session Levain launched" in out.err, (argv, out.err)
+        assert "the coordinator's workspace" in out.err, (argv, out.err)
     _main(qdir, capsys, "coord", "release", "--by", "coordinator", "--token", str(tok["token"]))
-    # the operator's own session is not a launch: its take stands
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-operator")
+    # the operator, outside that workspace: his take stands
+    monkeypatch.chdir(workdir.parent)
     _main(qdir, capsys, "coord", "take")
 
 
@@ -532,18 +581,20 @@ def test_coord_agent_never_installs_over_a_directory_with_files(tmp_home, qdir, 
     assert sorted(p.name for p in busy.iterdir()) == ["notes.txt"]
 
 
-def test_coord_agent_none_and_codex(qdir, capsys):
+def test_coord_agent_none_and_codex(qdir, capsys, tmp_path, monkeypatch):
     _main(qdir, capsys, "coord", "agent", "none")
     assert CoordStore(qdir).coord_setting().agent == "none"
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))      # a Codex with no Levain hook
     out = _main(qdir, capsys, "coord", "agent", "codex", rc=1)
-    assert "only claude is built" in out.err
+    assert "not set: Codex's consent hook is not live" in out.err
+    assert CoordStore(qdir).coord_setting().agent == "none"
 
 
 # --- the brief's directory (R2) --------------------------------------------------------------------------------
 def test_a_linked_briefs_directory_refuses_the_launch(store, fake, live_hook, workdir, tmp_path):
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir(mode=0o700)
-    (workdir / ".levain").mkdir()
+    (workdir / ".levain").mkdir(exist_ok=True)
     (workdir / ".levain" / "briefs").symlink_to(elsewhere)
     launch_id = woken(store)
     got = cl.launch_session(store, launch_id)
@@ -927,7 +978,7 @@ def test_a_worker_launch_is_never_started(qdir, store, fake, live_hook):
 
 
 def test_the_briefs_directory_is_gitignored(store, fake, live_hook, workdir):
-    (workdir / ".levain").mkdir()
+    (workdir / ".levain").mkdir(exist_ok=True)
     (workdir / ".levain" / ".gitignore").write_text("answers.json\n")
     assert cl.launch_session(store, woken(store)).started
     lines = (workdir / ".levain" / ".gitignore").read_text().splitlines()
@@ -1177,3 +1228,16 @@ def test_the_brief_spelling_is_looked_up_as_exact_rules_never_parsed(tmp_path):
     for partial in (["Bash(make coord:*)", "Bash(make drops:*)", "Bash(make thread:*)"],
                     list(inst.coordinator_allow(here))[:2]):
         assert rules(partial) is None, partial
+
+
+def test_a_claude_coordinator_may_not_edit_its_own_record(tmp_path, monkeypatch):
+    # reproduced: the rendered coordinator settings carried allow rules only, so Claude's Write/Edit tools could
+    # rewrite the record that marks its workspace. Claude Code consults Edit(path) rules for every editing tool.
+    from levain import install as inst
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    doc = json.loads(inst._apply_role(json.dumps({"permissions": {"allow": []}}), "coordinator", "/venv/bin/python"))
+    record = (tmp_path / "lh").resolve() / "consent" / "coordinator_workspaces.json"
+    assert f"Edit(/{record})" in doc["permissions"]["deny"]
+    assert f"Edit(/{record}.lock)" in doc["permissions"]["deny"]
+    assert all(r.startswith("Edit(//") for r in doc["permissions"]["deny"])
+    assert "deny" not in json.loads(inst._apply_role(json.dumps({"permissions": {}}), None, "/venv/bin/python"))["permissions"]

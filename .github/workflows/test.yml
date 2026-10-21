@@ -20,7 +20,9 @@ jobs:
   test:
     name: pytest (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # Raised from 40 on 10-21: green runs had reached 29-37 min and two land branches were cut at the cap
+    # mid-suite (not hung). A hang still ends here; splitting the suite is the durable fix.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

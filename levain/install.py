@@ -294,9 +294,10 @@ def run_init(
     # expanduser first: argparse's `type=Path` does not expand `~`, but operators
     # passing `--path ~/levain-install` reasonably expect shell semantics.
     install = Path(str(path)).expanduser().resolve()
-    if role is not None and (role not in ROLE_CHOICES or adapter != "claude-code"):
+    if role is not None and (role not in ROLE_CHOICES or adapter not in ROLE_ADAPTERS):
         # refused before anything is written, so a bad role never leaves a half-made install behind
-        print(f"FAIL: install role {role!r} is one of {', '.join(ROLE_CHOICES)}, for the claude-code adapter only.")
+        print(f"FAIL: install role {role!r} is one of {', '.join(ROLE_CHOICES)}, for the "
+              f"{' or '.join(ROLE_ADAPTERS)} adapter only.")
         return 1
     # Pack-layers compose ON TOP of the base templates (base = pack #0). Resolved
     # the same way as --path; a bad pack dir / missing pack.toml fails loud below.
@@ -815,9 +816,10 @@ def _apply_init(
     if consent_hook is not None and chosen in CONSENT_HOOK_SCRIPTS:
         # Recorded BEFORE the render: every render (init's, the receipt's, update's) reads the recorded choice.
         _write_consent_hook_choice(install, consent_hook, emit)
-    if role is not None and chosen == "claude-code":
-        # recorded BEFORE the render, as the consent hook choice is: every render reads the recorded role
-        _write_role(install, role, python_path, emit)
+    if role is not None and chosen in ROLE_ADAPTERS:
+        # recorded BEFORE the render, as the consent hook choice is: every render reads the recorded role, and the
+        # record is the coordinator's door for either harness
+        _write_role(install, role, python_path, emit, adapter=chosen)
     review = _install_adapter(
         chosen, install, templates_root, python_path, anneal_path, import_seed,
         on_demand_seed, activation_roots=roots, emit=emit, messaging=messaging,
@@ -2754,8 +2756,11 @@ def persisted_consent_hook(install: Path) -> str:
 # The coordinator's own install (np-6843ca07 (a), signed by the operator 2026-10-21): Claude Code runs its own
 # coordinator verbs without asking, and only those; they grant nothing (a signed envelope still does), and every
 # other command asks as in any install. The role is meant for an install `levain coord agent` made itself, never a
-# live install it reuses (tests/test_coordinator_launch.py "a_reused_install_gets_none" pins that).
+# live install of the operator's: `coord agent` refuses one rather than marking it (marking it would door his own
+# sessions there). The record is also what marks the coordinator's workspace for its door, so it is written for a Codex
+# coordinator workspace as for a Claude Code one; only Claude Code's settings carry the pre-approved verbs.
 ROLE_CHOICES = ("coordinator",)
+ROLE_ADAPTERS = ("claude-code", "codex")
 COORDINATOR_VERBS = ("coord", "drops", "thread")
 # Levain's own project MCP servers, the names its .mcp.json render writes (BAND_SERVER and DISPATCH_SERVER are
 # defined with that render; the test pins this tuple against a real coordinator install's .mcp.json keys)
@@ -2775,6 +2780,20 @@ def coordinator_allow(python_path: str) -> tuple[str, ...]:
     """The coordinator's allow rules, one per verb, each naming :func:`coordinator_levain`."""
     command = coordinator_levain(python_path)
     return tuple(f"Bash({command} {verb}:*)" for verb in COORDINATOR_VERBS)
+
+
+def coordinator_deny() -> tuple[str, ...]:
+    """The coordinator's Claude Code deny rules: no edit of its own record (the file that marks its workspace for
+    the door) or that file's lock, wherever the door reads one. Claude Code consults ``Edit(path)`` rules for every
+    built-in file-editing tool (a ``Write(path)`` rule is accepted and never consulted; code.claude.com/docs/en/permissions,
+    "Read and Edit"), and ``//path`` is the absolute-path spelling. A Bash command can still write the file: Claude
+    has no OS sandbox here, so this closes the editing tools only."""
+    from levain.coordinator import door
+
+    files: list[str] = []
+    for record in door._record_paths():
+        files += [str(record), str(record) + ".lock"]
+    return tuple(f"Edit(/{f})" for f in dict.fromkeys(files))
 
 
 def installed_coordinator_levain(install: Path, python_path: str) -> str | None:
@@ -2797,6 +2816,75 @@ def installed_coordinator_levain(install: Path, python_path: str) -> str | None:
     return None
 
 
+# The same door for a Codex coordinator (np-6843ca07 (a)): Codex's own exec policy, a `prefix_rule` in a `.rules` file
+# under the project's `.codex/rules/`, which Codex loads only while the operator trusts that project (OpenAI's Codex
+# docs, "Rules" and "Config basics"). A rule matches the command's argv as an exact prefix, so it names the same
+# spelling the brief uses, word for word, and Levain parses no shell. Codex runs an allowed command outside its sandbox
+# without asking: these three verbs only, which grant nothing. The coordinator cannot widen the rule from inside its
+# turn: Codex's workspace-write sandbox keeps a `.codex/` that exists as a directory read-only inside the workspace
+# (OpenAI's Codex docs, "Sandboxing": protected paths), measured on codex-cli 0.162.1 with a turn's own create,
+# append and rename under it each refused "Operation not permitted" while a plain workspace write went through. So
+# the directory is made before any thread starts in it.
+CODEX_COORDINATOR_RULES_REL = (".codex", "rules", "levain-coordinator.rules")
+
+
+def codex_coordinator_rules(python_path: str) -> str:
+    """The rules file that lets a Codex coordinator launched from ``python_path`` run ``python_path -P -m levain``
+    coord / drops / thread without asking, and nothing else. Its ``match`` / ``not_match`` examples are checked by
+    Codex itself when it loads the file."""
+    if not python_path or any(not ch.isprintable() for ch in python_path):
+        raise InitError(f"the interpreter path {python_path!r} cannot be written into a Codex rule")
+    base = [python_path, "-P", "-m", "levain"]
+
+    def lit(value: object) -> str:
+        return json.dumps(value, ensure_ascii=False)
+
+    return (
+        "# Written by Levain for its coordinator (np-6843ca07 (a)). Codex runs exactly these commands without asking:\n"
+        f"# {coordinator_levain(python_path)} {' | '.join(COORDINATOR_VERBS)} ...\n"
+        "# Every other command is decided as before. Codex loads this file only while you trust this directory.\n"
+        "prefix_rule(\n"
+        f"    pattern = {lit([*base, list(COORDINATOR_VERBS)])},\n"
+        '    decision = "allow",\n'
+        '    justification = "Levain coordinator verbs: they grant nothing (a signed envelope still does)",\n'
+        f"    match = {lit([[*base, verb, 'status'] for verb in COORDINATOR_VERBS])},\n"
+        f"    not_match = {lit([[*base, 'team', 'record'], [*base, 'coordinator'], ['levain', 'coord']])},\n"
+        ")\n"
+    )
+
+
+def write_codex_coordinator_rules(install: Path, python_path: str) -> tuple[bool, str]:
+    """Write :func:`codex_coordinator_rules` into ``install``'s ``.codex/rules/``. ``(True, detail)`` when the file now
+    holds exactly that render (written, or already there); ``(False, why)`` otherwise. A file of that name holding
+    anything else is left as it is (its commands ask or not as it says, never widened back), and nothing is written
+    through a symlink."""
+    path = install.joinpath(*CODEX_COORDINATOR_RULES_REL)
+    try:
+        text = codex_coordinator_rules(python_path)
+    except InitError as e:
+        return False, str(e)
+    for d in (path.parent.parent, path.parent):
+        if os.path.islink(d) or (os.path.lexists(d) and not d.is_dir()):
+            return False, f"{d} is not a plain directory; no coordinator rule was written"
+    if os.path.lexists(path):
+        try:
+            same = not os.path.islink(path) and path.read_text(encoding="utf-8") == text
+        except (OSError, UnicodeDecodeError):
+            same = False
+        if same:
+            return True, f"{path} already pre-approves {coordinator_levain(python_path)} coord / drops / thread"
+        return False, (f"{path} holds something other than this levain's rule, left as it is: the coordinator's "
+                       "commands ask unless it allows them")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except OSError as e:
+        return False, f"{path} could not be written ({e})"
+    return True, f"{path} written: Codex runs {coordinator_levain(python_path)} coord / drops / thread without asking"
+
+
 def persisted_role(install: Path) -> str | None:
     """The role ``.levain/config.json`` records (``role``), else ``None``. A file that cannot be read as a JSON
     object, or a value that is not a role (a hand edit), is ``None``: what may hold a role is never read as one
@@ -2816,7 +2904,8 @@ def persisted_role(install: Path) -> str | None:
     return value if value in ROLE_CHOICES else None
 
 
-def _write_role(install: Path, role: str, python_path: str, emit: Callable[[str], None]) -> None:
+def _write_role(install: Path, role: str, python_path: str, emit: Callable[[str], None], *,
+                adapter: str = "claude-code") -> None:
     """Record ``role`` in ``.levain/config.json``, so `levain update` and `init --force` render it again. Raises
     InitError when it cannot be recorded."""
     from levain.dashboard import LEVAIN_CONFIG_REL
@@ -2841,8 +2930,11 @@ def _write_role(install: Path, role: str, python_path: str, emit: Callable[[str]
         _atomic_write_text(config_path, json.dumps({**existing, "role": role}, indent=2, ensure_ascii=False) + "\n")
     except OSError as e:
         raise InitError(f"could not record the install role in .levain/config.json ({e}).") from e
-    emit(f"  role: {role} → .levain/config.json (Claude Code runs {', '.join(coordinator_allow(python_path))} "
-         "without asking)")
+    if adapter == "claude-code":
+        emit(f"  role: {role} → .levain/config.json (Claude Code runs {', '.join(coordinator_allow(python_path))} "
+             "without asking)")
+    else:
+        emit(f"  role: {role} → .levain/config.json")
 
 
 def _apply_role(settings_text: str, role: str | None, python_path: str) -> str:
@@ -2862,6 +2954,10 @@ def _apply_role(settings_text: str, role: str | None, python_path: str) -> str:
     if not isinstance(allow, list):
         raise InitError("the rendered Claude Code settings carry a permissions.allow that is not a list")
     allow.extend(rule for rule in coordinator_allow(python_path) if rule not in allow)
+    deny = perms.setdefault("deny", [])
+    if not isinstance(deny, list):
+        raise InitError("the rendered Claude Code settings carry a permissions.deny that is not a list")
+    deny.extend(rule for rule in coordinator_deny() if rule not in deny)
     enabled = doc.setdefault("enabledMcpjsonServers", [])
     if not isinstance(enabled, list):
         raise InitError("the rendered Claude Code settings carry an enabledMcpjsonServers that is not a list")
