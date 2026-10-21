@@ -425,9 +425,15 @@
     let hidden = 0;
     for (const list of buckets.values()) {
       let cut = false;
-      for (const n of list) {
+      // a row the reader opened is the one thing they are reading: it and every row above it stay, however tall it
+      // grew (the body then scrolls inside the card); only the rows after it fold. A fold that took the open row
+      // away closed it under the reader on the click and again on every redraw.
+      let pin = -1;
+      list.forEach((n, i) => { if (n.classList.contains("row-expanded")) pin = i; });
+      for (const [i, n] of list.entries()) {
         const r = n.getBoundingClientRect();
-        if (!cut && r.bottom - top > limit) cut = true;
+        // rects are measured against where the body is scrolled to: add the scroll back, or a scrolled body folds too few rows
+        if (!cut && i > pin && r.bottom - top + body.scrollTop > limit) cut = true;
         if (cut) { n.style.display = "none"; n.dataset.folded = "1"; if (n.classList.contains("row")) hidden++; }
       }
       // a heading left with no row under it goes too
@@ -1677,6 +1683,8 @@
     const bodies = Array.from(root.querySelectorAll(".pbody.clamped"));
     if (root.matches && root.matches(".pbody.clamped")) bodies.push(root);
     for (const b of bodies) measureOverflow(b);
+    // the fold and the cue change how tall a body is, and a body shorter than the scroll it was given clamps it: put it back once more
+    restoreKeptScroll(root, kept);
   }
 
   // Append a clause + its per-item expand toggle (shared by spore + episode rows). The
