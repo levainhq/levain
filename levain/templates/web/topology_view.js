@@ -529,7 +529,9 @@
     // the widest face in a seat's first rank (the first of each pair in document order), and whether a second rank fits beside it
     const faceWOf = (g, rk) => mineOf(g).reduce((m, n, i) => (i % 2 === rk ? Math.max(m, tws.get(n.id) || 0) : m), 0);
     // room for a second rank: its faces must still end inside the graph. The seat nodes' column draws in toward the hub, as far as 76, to make it.
-    const RANK_GAP = 52, EDGE_PAD = 12;
+    // EDGE_PAD is what a face's box runs past its measured text: the offset from its node, the box's own padding, a waiting node's wider
+    // offset and a margin to the graph's edge.
+    const RANK_GAP = 52, EDGE_PAD = 36;
     const roomFor = (g, col) => hubX - col - (faceWOf(g, 0) + RANK_GAP) - faceWOf(g, 1) - EDGE_PAD >= 0;
     const gxFull = Math.max(76, Math.min(190, LW / 2 - 262 - 120));
     const tall = live.filter((g) => mineOf(g).length > ROW_CAP);
@@ -691,13 +693,28 @@
   // never a missing one. A group with no repo of its own (the loose "ungrouped" block) has no seat and stays neutral.
   const HUE_SLOTS = 8, HUE_BASE = 5;
   const hueName = (slot, have8) => "--hue-" + (have8 || slot <= HUE_BASE ? slot : ((slot - 1) % HUE_BASE) + 1);
-  function seatSlot(gp) {
-    const S = root.LevainSky;
-    const key = gp && gp.id !== null && gp.id !== undefined ? (gp.repo || gp.label) : "";
-    if (!key || !S || typeof S.hueKey !== "function") return 0;
-    if (typeof S.noteRepo === "function") S.noteRepo(key);
-    const k = parseInt(S.hueKey(key), 10);
-    return k >= 1 && k <= HUE_SLOTS ? k : 0;
+  // Every seat in one graph gets its own slot (up to HUE_SLOTS seats; past that slots repeat). A seat's preferred slot is its repo's
+  // (the slot the row tags use, so a repo-per-seat graph matches its tags) or, with no repo, its label's hash. Several seats on one repo
+  // (flow's lanes on levain) all prefer the same slot: the first, in group-id order, keeps it and the rest take the next free one.
+  // Only real repos are noted into the page's repo table, all before any slot is read: a slot read mid-noting can move.
+  function assignSeats(L) {
+    const S = root.LevainSky, sky = !!(S && typeof S.hueKey === "function");
+    const gps = Array.from(L.gpos.values()).filter((gp) => gp.id !== null && gp.id !== undefined);
+    if (sky && typeof S.noteRepo === "function") for (const gp of gps) if (gp.repo) S.noteRepo(gp.repo);
+    const pref = (gp) => {
+      const k = sky && gp.repo ? parseInt(S.hueKey(gp.repo), 10) : 0;
+      return k >= 1 && k <= HUE_SLOTS ? k : (fnv1a(String(gp.label || gp.id)) % HUE_SLOTS) + 1;
+    };
+    gps.sort((a, b) => (String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0));
+    const used = new Set(), rest = [];
+    for (const gp of L.gpos.values()) gp.seat = 0;
+    for (const gp of gps) { const k = pref(gp); if (used.has(k)) rest.push(gp); else { used.add(k); gp.seat = k; } }
+    for (const gp of rest) {
+      let k = pref(gp);
+      for (let t = 0; t < HUE_SLOTS && used.has(k); t++) k = (k % HUE_SLOTS) + 1;
+      used.add(k); gp.seat = k;
+      if (used.size >= HUE_SLOTS) used.clear();                     // past HUE_SLOTS seats the slots go round again
+    }
   }
   // the attribute that hands an element its seat hue (the rules below turn it into a custom property); none for a neutral one
   function seatAttrs(slot) { return slot ? { "data-seat": String(slot) } : null; }
@@ -712,14 +729,18 @@
     ".tv-graph .tv-gdot { fill: var(--seat); }",
     ".tv-graph .tv-gnode[data-seat]:not(.waiting) .tv-core { fill: var(--seat); opacity: 1; }",
     ".tv-graph .tv-face1, .tv-graph .tv-face2, .tv-graph .tv-face3, .tv-graph .tv-gname, .tv-graph .tv-gsub, .tv-graph .tv-gnode:not(.waiting) .tv-facetag { paint-order: stroke; stroke: var(--base); stroke-width: 3px; stroke-linejoin: round; }",
+    // the face text carries its own halo, so its box only softens what lies under it: a solid box reads as a block over the nebula
+    ".tv-graph .tv-facebg { fill-opacity: .38; } .tv-graph .tv-lblbg { fill-opacity: .5; }",
     ".tv-graph .tv-gnode:focus-visible .tv-facebg { stroke: var(--accent); stroke-width: 2; }",
     ".tv-graph .tv-gnode[aria-pressed=\"true\"] .tv-ring { stroke-width: 2.6; }",
     ".tv-graph .tv-gring { opacity: .5; }",
-    ".tv-sky { --_sa: var(--sky-star-a, .35); --_la: var(--sky-line-a, .12); pointer-events: none; }",
-    ":root[data-theme=\"light\"] .tv-sky { --_sa: var(--sky-star-a, .45); --_la: var(--sky-line-a, .10); }",
-    "@media (prefers-color-scheme: light) { :root:not([data-theme=\"dark\"]) .tv-sky { --_sa: var(--sky-star-a, .45); --_la: var(--sky-line-a, .10); } }",
+    // the theme tokens set the sky's base alphas (a light stage takes less glow); the graph draws its stars at about twice them, read on a real
+    // stage the token values alone left the constellation all but invisible
+    ".tv-sky { --_sa: calc(var(--sky-star-a, .35) * 1.9); --_la: calc(var(--sky-line-a, .12) * 2.2); --_na: calc(var(--glow-a, .35) * .4 + .07); pointer-events: none; }",
     ".tv-sky .tv-star { fill: var(--seat, var(--meta)); fill-opacity: var(--_sa); }",
-    ".tv-sky .tv-sline { fill: none; stroke: var(--seat, var(--meta)); stroke-opacity: var(--_la); stroke-width: .5px; }",
+    ".tv-sky .tv-sline { fill: none; stroke: var(--seat, var(--meta)); stroke-opacity: var(--_la); stroke-width: .7px; }",
+    ".tv-sky .tv-neb stop { stop-color: var(--seat, var(--meta)); stop-opacity: 0; } .tv-sky .tv-neb stop.c { stop-opacity: var(--_na); }",
+    ".tv-sky .tv-neb stop.m { stop-opacity: calc(var(--_na) * .35); }",
     "@media (prefers-reduced-motion: no-preference) { .tv-sky .tv-twk { animation: tv-twinkle 5s ease-in-out 0s 3; }",
     '  .tv-sky .tv-twk[data-t="1"] { animation-duration: 4s; animation-delay: .7s; } .tv-sky .tv-twk[data-t="2"] { animation-duration: 6s; animation-delay: 1.9s; }',
     '  .tv-sky .tv-twk[data-t="3"] { animation-duration: 7s; animation-delay: 3.1s; } .tv-sky .tv-twk[data-t="4"] { animation-duration: 4.5s; animation-delay: 2.4s; } }',
@@ -741,9 +762,11 @@
 
   // ---- the constellation: stars behind the graph, generated from the topology value alone ----
   // Deterministic (the group's id seeds a small generator; nothing here calls Math.random), so a refresh never moves a star. One figure
-  // per seat: 3 + min(nodes, 9) stars in a band outside that seat's side of the rings, each star's size from a node's token count,
-  // joined in angle order by hairlines. Drawn once per layout (zero per-frame cost); a few stars twinkle, and only where motion is welcome.
+  // per seat: 5 + min(2 x lanes, 14) stars across that seat's side of the stage, from the inner ring out to the edge, each star's size from a
+  // lane's token count, joined in angle order by hairlines; behind each seat's lanes a faint nebula in its hue. Drawn once per layout (zero
+  // per-frame cost); a few stars twinkle, and only where motion is welcome.
   const STAR_CAP = 160, SLINE_CAP = 120, TWINKLE_CAP = 12;
+  let skySeq = 0;                                                         // gradient ids stay unique across redraws
   function fnv1a(str) {
     let h = 2166136261;
     for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
@@ -769,9 +792,9 @@
       const rand = lcg(fnv1a(key)), pts = [];
       for (let i = 0; i < count && stars + pts.length < STAR_CAP; i++) {
         const a = centre + (rand() - 0.5) * 2 * spread, far = reach(a);
-        const rho = far > 1.04 ? 1.02 + rand() * (far - 1.02) : far * (0.9 + 0.1 * rand());
+        const rho = far > 0.6 ? 0.55 + rand() * (far - 0.55) : far * (0.9 + 0.1 * rand());
         const tk = tokens.length ? tokens[i % tokens.length] : null;
-        const r = isNum(tk) && tk > 0 ? 0.6 + 1.2 * Math.min(1, Math.log10(tk + 1) / 7) : 0.8;
+        const r = isNum(tk) && tk > 0 ? 0.9 + 1.7 * Math.min(1, Math.log10(tk + 1) / 6) : 1.1;
         pts.push({ a, r, x: hub.x + Math.cos(a) * rx * rho, y: hub.y + Math.sin(a) * ry * rho, tw: rand() });
       }
       pts.sort((p, q) => p.a - q.a);
@@ -788,10 +811,29 @@
       }
       g.appendChild(fig);
     };
+    // the nebulae first, under the stars: one soft ellipse per coloured seat over the box its node and lanes span
+    const defs = sv("defs"), nebs = sv("g");
+    const seq = ++skySeq;
+    let gi = 0;
+    for (const [k, gp] of L.gpos) {
+      if (!gp.seat) continue;
+      gi++;
+      const ps = [gp].concat(nodes.filter((n) => L.gkey(n) === k).map((n) => L.pos.get(n.id)).filter(Boolean));
+      const x0 = Math.min(...ps.map((p) => p.x)), x1 = Math.max(...ps.map((p) => p.x)), y0 = Math.min(...ps.map((p) => p.y)), y1 = Math.max(...ps.map((p) => p.y));
+      const gid = "tvneb-" + seq + "-" + gi;
+      const gr = sv("radialGradient", Object.assign({ id: gid }, seatAttrs(gp.seat)), "tv-neb");
+      gr.appendChild(sv("stop", { offset: "0" }, "c"));
+      gr.appendChild(sv("stop", { offset: "0.55" }, "m"));
+      gr.appendChild(sv("stop", { offset: "1" }));
+      defs.appendChild(gr);
+      nebs.appendChild(sv("ellipse", { cx: num((x0 + x1) / 2), cy: num((y0 + y1) / 2), rx: num((x1 - x0) / 2 + 150), ry: num((y1 - y0) / 2 + 90), fill: "url(#" + gid + ")" }));
+    }
+    g.appendChild(defs);
+    g.appendChild(nebs);
     for (const [k, gp] of L.gpos) {
       const mine = nodes.filter((n) => L.gkey(n) === k);
       const dir = gp.x < hub.x ? -1 : 1, ny = (gp.y - hub.y) / ry;
-      figure("g:" + k, 3 + Math.min(mine.length, 9), Math.atan2(ny, dir), 0.5, mine.map((n) => n.tokens), gp.seat || 0);
+      figure("g:" + k, 5 + Math.min(mine.length * 2, 14), Math.atan2(ny, dir), 0.6, mine.map((n) => n.tokens), gp.seat || 0);
     }
     figure("hub", 5, Math.PI / 2, Math.PI, [], 0);        // the hub's five neutral stars, anywhere round it
     return g;
@@ -990,7 +1032,8 @@
         if (!sp) continue;
         const d = dark ? 1.6 + 1.4 * p.k : 2.0 + 1.2 * p.k;                // the core's diameter: dark 1.6-3.0, light 2.0-3.2
         const w = 16 * d / (dark ? 3.0 : 3.2);
-        ctx.globalAlpha = Math.pow(Math.sin(Math.PI * Math.min(1, p.t)), 0.7) * (p.hub ? 0.62 : 0.8);
+        // additive light sums: a dense edge at full alpha burns to a white bar, so a dark stage draws each particle at about half
+        ctx.globalAlpha = Math.pow(Math.sin(Math.PI * Math.min(1, p.t)), 0.7) * (dark ? (p.hub ? 0.36 : 0.5) : (p.hub ? 0.62 : 0.8));
         ctx.drawImage(sp, pt.x + e.nx * spread - w / 2, pt.y + e.ny * spread - w / 2, w, w);
       }
       ctx.globalAlpha = 1;
@@ -1043,7 +1086,7 @@
       scale = Math.min(1, W / LW);
       ensureGraphCss();
       const L = layoutGraph(v, LW, measure);
-      for (const gp of L.gpos.values()) gp.seat = seatSlot(gp);
+      assignSeats(L);
       const edges = graphEdges(v, L);
       hint.hidden = W < NARROW_PX;                                    // a phone has no hover, and the hint is a mouse's
       if (streamStop) { streamStop(); streamStop = null; }
@@ -1091,9 +1134,15 @@
         for (const [k, val] of tipRows(n, v.as_of)) { const r = el("div"); r.append(el("span", "tv-tl", k), val); tip.appendChild(r); }
       }
       tip.hidden = false;
-      const box = stage.getBoundingClientRect();
-      tip.style.left = Math.max(4, Math.min(box.width - tip.offsetWidth - 4, x + 16)) + "px";
-      tip.style.top = Math.max(4, Math.min(box.height - tip.offsetHeight - 4, y + 14)) + "px";
+      const place = () => {
+        const box = stage.getBoundingClientRect();
+        tip.style.left = Math.max(4, Math.min(box.width - tip.offsetWidth - 4, x + 16)) + "px";
+        tip.style.top = Math.max(4, Math.min(box.height - tip.offsetHeight - 4, y + 14)) + "px";
+      };
+      // a pin restored by the live redraw runs before the new stage is in the page: measured then, the card clamps to the corner,
+      // so it is placed on the next frame, once the stage has its size
+      if (stage.isConnected || typeof root.requestAnimationFrame !== "function") place();
+      else root.requestAnimationFrame(() => { if (stage.isConnected && tip.dataset.node === n.id && !tip.hidden) place(); });
     };
     const hideTip = () => { tip.hidden = true; tip.dataset.node = ""; };
     stage.addEventListener("pointermove", (ev) => {
