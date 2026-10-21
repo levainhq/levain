@@ -12,7 +12,8 @@ What it enforces, in order, before any upstream byte:
 3. the target: `CONNECT <host>:443` only. The host must be a name on the session's CONNECT set (the `egress` and
    `subscription_passthrough` routes of the front's policy file); an address literal, any other port, or an
    off-list name is `host-not-allowed`.
-4. the address: the name is resolved ONCE; if any answer is loopback, private (RFC1918, CGNAT, ULA), link-local
+4. the address: the name is resolved ONCE, as an absolute name (no search-list expansion), with a bounded number
+   of resolutions in flight; if any answer is loopback, private (RFC1918, CGNAT, ULA), link-local
    (incl. the 169.254.169.254 metadata address), IPv4-mapped / IPv4-compatible / 6to4 / Teredo, multicast,
    reserved, documentation-range or otherwise not globally reachable, the whole CONNECT is `address-refused`.
    The upstream socket is then opened to one of THOSE validated addresses, never by name, so a resolver that
@@ -38,6 +39,7 @@ import re
 import signal
 import socket
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -251,9 +253,54 @@ Resolver = Callable[[str, int], Awaitable[Sequence[str]]]
 Connector = Callable[[str, int], Awaitable[tuple[asyncio.StreamReader, asyncio.StreamWriter]]]
 
 
+#: DECISION: system resolutions in flight at once. A slot is held until the resolver call itself returns, not until
+#: the CONNECT that asked gives up, so a hung resolver cannot gather threads past this; a CONNECT that finds none
+#: free is refused at once.
+RESOLVE_CAP = 32
+_RESOLVE_SLOTS = threading.BoundedSemaphore(RESOLVE_CAP)
+
+
 async def system_resolve(host: str, port: int) -> list[str]:
-    infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM,
-                                                         proto=socket.IPPROTO_TCP)
+    """Resolve `host` with the system resolver, as an ABSOLUTE name (`host.`): a dotless query would let the
+    resolver's search list and ndots turn an allowed name into a name under another domain. The CONNECT and SNI
+    checks keep the original spelling; only the query gains the dot.
+
+    Each call runs on its own daemon thread, not the loop's default executor: getaddrinfo cannot be cancelled, so a
+    timed-out call keeps its thread until the resolver returns, and a daemon thread never holds up the front's exit.
+    `_RESOLVE_SLOTS` bounds how many such threads can exist; over it the CONNECT is refused `upstream-error`."""
+    slots = _RESOLVE_SLOTS
+    if not slots.acquire(blocking=False):
+        raise Refused("upstream-error", "resolver-busy")
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+
+    def deliver(result, error) -> None:
+        if fut.done():   # the CONNECT gave up (timeout, shutdown): the answer is dropped
+            return
+        if error is not None:
+            fut.set_exception(error)
+        else:
+            fut.set_result(result)
+
+    def work() -> None:
+        result = error = None
+        try:
+            result = socket.getaddrinfo(host + ".", port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+        except BaseException as e:   # noqa: BLE001 - handed to the awaiting CONNECT
+            error = e
+        finally:
+            slots.release()
+        try:
+            loop.call_soon_threadsafe(deliver, result, error)
+        except RuntimeError:   # the loop is closed: nobody is waiting
+            pass
+
+    try:
+        threading.Thread(target=work, name="levain-gw-resolve", daemon=True).start()
+    except RuntimeError:   # no thread could be started: the slot was never handed to one
+        slots.release()
+        raise Refused("upstream-error", "resolver-busy") from None
+    infos = await fut
     return list(dict.fromkeys(info[4][0] for info in infos))
 
 
