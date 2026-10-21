@@ -1,7 +1,9 @@
 """The dispatch MCP door: a stdio MCP server for a planner that reaches tools more readily than its shell. Its tools
-file a contract, read jobs, recommend and cancel exactly as ``levain dispatch`` does (:mod:`levain.dispatch.cli`),
-for the PLANNER only: an MCP door never signs, so it has no sign tool and no human cancel; those are the operator's,
-on their own device. Stdlib only: JSON-RPC 2.0, one JSON message per line. Run as
+file a contract, read jobs, recommend, cancel and land exactly as ``levain dispatch`` does
+(:mod:`levain.dispatch.cli`), for the PLANNER only: an MCP door never signs, so it has no sign tool, no human cancel
+and no authorise; those are the operator's, on their own device. ``dispatch_land`` is the standing-rule path (or the
+finish of a job the operator authorised) through :func:`levain.dispatch.cli.land_job`, with no data root: it takes no
+human item and none can be added (an answer never authorises). Stdlib only: JSON-RPC 2.0, one JSON message per line. Run as
 ``<python> -P -m levain.dispatch.mcp --agent <claude_code|codex>``.
 
 The session is read per call, as the question band's door reads it (:mod:`levain.consent.band_mcp`): the
@@ -29,7 +31,8 @@ from levain.authority import VerifierUnavailable
 from levain.consent.band_mcp import _meta_session
 from levain.dispatch import ContractRefused, DispatchError
 from levain.dispatch import capability as caps
-from levain.dispatch.cli import CockpitUnnamed, file_job, job_view, planner_capability, render
+from levain.dispatch.adopt import GitFault
+from levain.dispatch.cli import CockpitUnnamed, file_job, job_view, land_job, planner_capability, render
 from levain.dispatch.contract import GitUnavailable
 from levain.dispatch.control import ControlStateUnavailable
 from levain.dispatch.jobs import (
@@ -71,9 +74,25 @@ TOOLS: list[dict[str, Any]] = [
                      "additionalProperties": False}},
     {"name": "dispatch_recommend",
      "description": "Mark a VERIFIED job you filed as recommended. Advisory: a recommend confers no authority; only the "
-                    "operator's signature authorises a result.",
-     "inputSchema": {"type": "object", "properties": {"job": _JOB, "capability": _CAPABILITY}, "required": ["job"],
-                     "additionalProperties": False}},
+                    "operator's signature authorises a result. onto and run PROPOSE the branch and the run the "
+                    "operator then reviews and signs (on the phone's card); they authorise nothing.",
+     "inputSchema": {"type": "object",
+                     "properties": {"job": _JOB, "capability": _CAPABILITY,
+                                    "onto": {"type": "string", "description": "The branch you propose (a bare "
+                                             "name, outside levain/)."},
+                                    "run": {"type": "integer", "description": "The run you propose (0..k-1; "
+                                            "default: the lowest passing run)."}},
+                     "required": ["job"], "additionalProperties": False}},
+    {"name": "dispatch_land",
+     "description": "Land a job you filed by the operator's standing adoption rule, or finish one the operator "
+                    "authorised. The rule or the operator's signature is the authority, never this call: a job no "
+                    "rule covers is refused. When the branch is checked out, Levain never touches the worktree: "
+                    "the result names the merge the OPERATOR runs.",
+     "inputSchema": {"type": "object",
+                     "properties": {"job": _JOB, "capability": _CAPABILITY,
+                                    "onto": {"type": "string", "description": "The branch a land by rule lands on "
+                                             "(an authorised job's branch is fixed)."}},
+                     "required": ["job"], "additionalProperties": False}},
     {"name": "dispatch_cancel",
      "description": "Cancel a job you filed, at any state before the operator authorises it (it only removes "
                     "authority). The planner's cancel only: after authorisation, only the operator can cancel.",
@@ -81,7 +100,7 @@ TOOLS: list[dict[str, Any]] = [
                      "additionalProperties": False}},
 ]
 _NAMES = {t["name"]: t for t in TOOLS}
-_FAULTS = (GitUnavailable, JobStoreError, ControlStateUnavailable, caps.CapabilityRecordError, VerifierUnavailable,
+_FAULTS = (GitUnavailable, GitFault, JobStoreError, ControlStateUnavailable, caps.CapabilityRecordError, VerifierUnavailable,
            sqlite3.Error, OSError, ValueError)
 _REFUSALS = (ContractRefused, TransitionRefused, SignatureRefused, CapabilityRefused, DispatchError)
 
@@ -105,10 +124,12 @@ def _arguments(name: str, raw: Any) -> dict[str, Any]:
     missing = [k for k in schema.get("required", ()) if k not in raw]
     if missing:
         raise _RpcError(INVALID_PARAMS, f"missing arguments: {', '.join(missing)}")
-    kinds = {"string": str, "object": dict, "boolean": bool}
+    kinds = {"string": str, "object": dict, "boolean": bool, "integer": int}
     for k, v in raw.items():
-        if not isinstance(v, kinds[props[k]["type"]]):
-            raise _RpcError(INVALID_PARAMS, f"{k} must be a {props[k]['type']}")
+        want = props[k]["type"]
+        # a JSON true is a Python int: an integer is never a boolean
+        if not isinstance(v, kinds[want]) or (want == "integer" and isinstance(v, bool)):
+            raise _RpcError(INVALID_PARAMS, f"{k} must be {'an' if want[0] in 'aeiou' else 'a'} {want}")
     return raw
 
 
@@ -156,9 +177,23 @@ def _call(agent: str, directory: Path | None, params: dict[str, Any], data_root:
             raise CapabilityRefused(f"this session's record holds no capability for {args['job'][:40]!r}; pass "
                                     "capability as filing returned it")
         if name == "dispatch_recommend":
-            job = store.recommend(args["job"], cap)
+            job = store.recommend(args["job"], cap, onto=args.get("onto"), run=args.get("run"))
             return _text(f"Job {job.id} is recommended. It authorises nothing: the operator still decides.",
-                         {"id": job.id, "state": job.state})
+                         {"id": job.id, "state": job.state, "onto": args.get("onto"), "run": args.get("run")})
+        if name == "dispatch_land":
+            store.check_capability(args["job"], cap)
+            # the (B) path: no human item can be passed here, and the configuration and cockpit are the dispatch
+            # directory's own, never this caller's
+            landing = land_job(store, args["job"], onto=args.get("onto"), data_root=None)
+            data = {"id": landing.job.id, "state": landing.job.state, "outcome": landing.outcome,
+                    "moved": landing.moved, "message": landing.message, "command": landing.command or None}
+            if landing.outcome == "merge":
+                return _text(f"Job {landing.job.id} is authorised; {landing.message}. The OPERATOR runs that merge "
+                             "(it is in the result as data); this door never runs it.", data)
+            if landing.outcome == "adopted":
+                return _text(f"Job {landing.job.id} is adopted: {landing.message}", data)
+            word = "Failed (its branch moved off the base)" if landing.outcome == "failed" else "Not landed, refused"
+            return _text(f"{word}: {landing.message}", data, error=True)
         job = store.cancel_by_planner(args["job"], cap)
         return _text(f"Cancelled job {job.id} as its planner.", {"id": job.id, "state": job.state})
     except CockpitUnnamed as exc:
