@@ -96,6 +96,7 @@ def test_a_store_write_keeps_a_tall_open_spore_and_its_scroll(tmp_path: Path) ->
                 {"until": f"{PANEL} && {GIANT_ROW} && {GIANT_ROW}.classList.contains('has-more') && 1", "ms": 30000},
                 {"eval": COUNT_RENDERS},
                 {"eval": OPEN_AND_SCROLL},
+                {"eval": "window.__r = 0; 1"},   # only a draw AFTER the row was opened and scrolled counts
                 {"until": "window.__r >= 1 && 1", "ms": 40000},
                 {"eval": "new Promise(r => setTimeout(r, 800))"},
                 {"eval": STATE},
@@ -104,5 +105,65 @@ def test_a_store_write_keeps_a_tall_open_spore_and_its_scroll(tmp_path: Path) ->
             stop.set()
             t.join(timeout=5)
     v = out["values"]
-    assert v[3] is True or v[3] == 1, f"the board was never drawn again: {v}"
+    assert v[4] is True or v[4] == 1, f"the board was never drawn again: {v}"
     _assert_held(v[2], v[-1], "a store write")
+
+
+AFFORD = (f"(() => {{ const b = {BODY}; return {{tab: b.getAttribute('tabindex'), role: b.getAttribute('role'),"
+          " label: b.getAttribute('aria-label') || '', room: b.scrollHeight - b.clientHeight}; })()")
+# every other fold trigger the page has: a measure of the body (a card resize, fonts settling, a search, another row opening)
+REMEASURE = (f"(async () => {{ const b = {BODY}; window.LevainDashboard.measureOverflow(b);"
+             " await new Promise(r => setTimeout(r, 300)); return Math.round(b.scrollTop); })()")
+
+
+@needs_browser
+def test_a_folded_card_whose_open_row_scrolls_stays_keyboard_reachable(tmp_path: Path) -> None:
+    """K1: the fold returned early and left the scrolling body with no tabindex, role or name: a keyboard reader could not scroll it."""
+    _root, src = _long_keep(tmp_path)
+    with _serve_plain(src) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            DESKTOP,
+            {"until": f"{PANEL} && {GIANT_ROW} && {GIANT_ROW}.classList.contains('has-more') && 1", "ms": 30000},
+            {"eval": OPEN_AND_SCROLL},
+            {"eval": AFFORD},
+        ])
+    a = out["values"][-1]
+    assert a["room"] > 100, f"the card's body does not scroll: {a}"
+    assert a["tab"] == "0" and a["role"] == "region" and "scrollable" in a["label"], f"a scrolling folded body is not focusable: {a}"
+
+
+@needs_browser
+def test_any_remeasure_keeps_the_reading_place(tmp_path: Path) -> None:
+    """K2: a search, another row opening or fonts settling re-fold the card; the reading place must not jump."""
+    _root, src = _long_keep(tmp_path)
+    with _serve_plain(src) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            DESKTOP,
+            {"until": f"{PANEL} && {GIANT_ROW} && {GIANT_ROW}.classList.contains('has-more') && 1", "ms": 30000},
+            {"eval": OPEN_AND_SCROLL},
+            {"eval": REMEASURE},
+        ])
+    v = out["values"]
+    assert v[1]["scrolled"] > 100
+    assert abs(v[-1] - v[1]["scrolled"]) <= 3, f"the reading place moved from {v[1]['scrolled']} to {v[-1]}"
+
+
+@needs_browser
+def test_opening_another_row_keeps_the_reading_place(tmp_path: Path) -> None:
+    """K2: a row above the open one opening re-folds the card (the click path); the scroll must stay where the reader put it."""
+    root, src = _long_keep(tmp_path)
+    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store.add(type="task", text="ABOVEKEEP " + PARA, disposition="note", today=TODAY + timedelta(days=3))   # newest: above the tall one
+    above = f"[...{PANEL}.querySelectorAll('.row')].find(r => r.textContent.indexOf('ABOVEKEEP') >= 0)"
+    click = (f"(async () => {{ const b = {BODY}; {above}.querySelector(':scope > .clause-toggle').click();"
+             " await new Promise(r => setTimeout(r, 400)); return Math.round(b.scrollTop); })()")
+    with _serve_plain(src) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            DESKTOP,
+            {"until": f"{PANEL} && {GIANT_ROW} && {GIANT_ROW}.classList.contains('has-more') && 1", "ms": 30000},
+            {"eval": OPEN_AND_SCROLL},
+            {"eval": click},
+        ])
+    v = out["values"]
+    assert v[1]["scrolled"] > 100
+    assert abs(v[-1] - v[1]["scrolled"]) <= 3, f"the reading place moved from {v[1]['scrolled']} to {v[-1]}"

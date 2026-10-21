@@ -410,6 +410,12 @@
   function foldRows(body) {
     const panel = body.closest && body.closest(".panel[data-ck-panel]");
     if (!panel || FOLD_PANELS.indexOf(panel.dataset.ckPanel) < 0 || panel.closest(".modal")) return false;
+    // the reading place survives every fold trigger (a row opening, a search, fonts settling): unfolding and folding again
+    // changes the body's height, and the browser clamps or anchors the scroll under the reader
+    const place = body.scrollTop;
+    try { return foldRowsAt(body, panel); } finally { if (body.scrollTop !== place) body.scrollTop = place; }
+  }
+  function foldRowsAt(body, panel) {
     for (const n of body.querySelectorAll("[data-folded]")) { n.style.display = ""; delete n.dataset.folded; }
     const old = panel.querySelector(":scope > .more-foot"); if (old) old.remove();
     if (!(body.scrollHeight > body.clientHeight + 1)) return false;
@@ -455,10 +461,12 @@
   }
 
   function measureOverflow(body) {
-    if (foldRows(body)) { body.classList.remove("has-overflow", "at-end"); return; }
+    const folded = foldRows(body);
     const atEnd = () => body.scrollTop + body.clientHeight >= body.scrollHeight - 1;
     const over = body.scrollHeight > body.clientHeight + 1;
-    body.classList.toggle("has-overflow", over);
+    // a folded card still scrolls when the reader's open row is taller than it: it keeps the keyboard affordance below,
+    // and only the "more below" fade is skipped (the "N more" link is its cue)
+    body.classList.toggle("has-overflow", over && !folded);
     // Keyboard access (codex L3): make the scroll region focusable + named so arrow-keys
     // scroll a text-only panel (no focusable child) — the affordance the expander gave.
     if (over) {
@@ -473,7 +481,7 @@
         body.dataset.scrollWired = "1";
         body.addEventListener("scroll", () => { body.classList.toggle("at-end", atEnd()); }, { passive: true });
       }
-      body.classList.toggle("at-end", atEnd());  // recompute now (content size may have changed)
+      body.classList.toggle("at-end", !folded && atEnd());  // recompute now (content size may have changed)
     } else {
       body.removeAttribute("tabindex");
       body.removeAttribute("role");
@@ -491,6 +499,7 @@
     for (const clause of root.querySelectorAll(".clause.clampable")) {
       const row = clause.closest(".row");
       if (!row || row.classList.contains("row-expanded")) continue;
+      if (row.dataset.folded) continue;   // display:none reads 0 high: leave a folded row's toggle as it was measured
       // No +1 tolerance: the harm is asymmetric — a false NEGATIVE hides the tail with no
       // toggle (the bug this slice fixes), a false positive is a harmless toggle on a 2-line
       // row. Line-clamp overflow is full-line-granular + heights are integers, so an exactly-
@@ -1709,10 +1718,11 @@
     toggle.setAttribute("aria-label", "expand full text");
     toggle.addEventListener("click", (ev) => {
       ev.stopPropagation();  // don't trip a row/modal handler
+      const body = row.closest(".pbody, .modal-body");
+      const place = body ? body.scrollTop : 0;   // the browser's scroll anchoring shifts it when a row above the reader grows
       const open = setExpanded(row, !row.classList.contains("row-expanded"));
       // expanding changes the panel's content height → refresh its overflow scent
-      const body = row.closest(".pbody, .modal-body");
-      if (body && body.classList.contains("pbody")) measureOverflow(body);
+      if (body && body.classList.contains("pbody")) { measureOverflow(body); if (body.scrollTop !== place) body.scrollTop = place; }
     });
     row.appendChild(toggle);
     return clause;
