@@ -142,7 +142,7 @@ def test_a_holder_past_its_until_is_refused_and_the_lapse_is_written(store, cloc
     clock.advance(minutes=31)
     with pytest.raises(CoordError, match="past its until"):
         store.split(d.drop_id, [Part("work", "x")], by="coordinator", token=token)
-    assert store.coord_status()["lease"] is None
+    assert store.coord_status()["lease"] is None          # the partial write rolled back with the wake
     assert rows(qdir, "SELECT kind, token FROM lease_events ORDER BY seq DESC LIMIT 1") == [("lapse", token)]
     drop(store, "the coordinator is still running: no second one beside it")
     st = store.coord_status()
@@ -344,7 +344,8 @@ def test_a_holder_whose_launch_ended_does_not_hold_up_the_wakes(store, clock, qd
 
 def test_a_wake_that_fails_never_loses_the_drop(store, clock, monkeypatch):
     def broken(conn, now):
-        conn.execute("INSERT INTO lease_events (seq) VALUES (NULL)")      # a NOT NULL violation mid-wake
+        lease._event(conn, now, "claim", "s-" + "0" * 16, token=None, until=now, cause="half", by="service")
+        raise RuntimeError("a wake bug that is not a store error")       # after a partial write
     monkeypatch.setattr(lease, "wake", broken)
     d = drop(store, "keep these words")
     assert store.drop(d.drop_id).words == "keep these words"
