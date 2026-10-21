@@ -294,6 +294,10 @@ def run_init(
     # expanduser first: argparse's `type=Path` does not expand `~`, but operators
     # passing `--path ~/levain-install` reasonably expect shell semantics.
     install = Path(str(path)).expanduser().resolve()
+    if role is not None and (role not in ROLE_CHOICES or adapter != "claude-code"):
+        # refused before anything is written, so a bad role never leaves a half-made install behind
+        print(f"FAIL: install role {role!r} is one of {', '.join(ROLE_CHOICES)}, for the claude-code adapter only.")
+        return 1
     # Pack-layers compose ON TOP of the base templates (base = pack #0). Resolved
     # the same way as --path; a bad pack dir / missing pack.toml fails loud below.
     pack_dirs = [Path(str(p)).expanduser().resolve() for p in (packs or [])]
