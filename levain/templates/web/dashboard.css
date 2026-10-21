@@ -31,7 +31,8 @@
     --gutter: var(--sp-7);
     /* the KE page: its own gutter, gap and widest page, and the three card heights (one token each) */
     --gutter-ke: 64px; --gap: var(--sp-6); --page-max: 1640px;
-    --card-tall: 540px; --card-medium: 460px; --card-short: 190px;
+    --card-tall: 540px; --card-medium: 460px; --card-short: 190px; --card-section: 380px; --fade-h: 40px;
+    --glow-a: .35; --sky-star-a: .35; --sky-line-a: .12; --tag-mix: 70%;
     --sec: var(--sp-7);   /* the one space above a section heading; --gap is the one space between cards and between blocks */
 
     --round: ui-rounded, "SF Pro Rounded", -apple-system, system-ui, sans-serif;
@@ -96,8 +97,10 @@
       --info: oklch(0.5 0.12 245); --violet: oklch(0.5 0.15 305);
       --aqi-moderate: oklch(0.55 0.12 90); --aqi-sensitive: oklch(0.55 0.15 55); --aqi-unhealthy: oklch(0.5 0.17 25);
       --aqi-very: oklch(0.45 0.17 320); --aqi-hazard: oklch(0.4 0.15 10);
-      --hue-1: oklch(0.55 0.14 75); --hue-2: oklch(0.5 0.14 255); --hue-3: oklch(0.52 0.19 350);
-      --hue-4: oklch(0.55 0.12 105); --hue-5: oklch(0.48 0.11 165);
+      --hue-1: oklch(0.609 0.129 72); --hue-2: oklch(0.532 0.171 258); --hue-3: oklch(0.536 0.171 352);
+      --hue-4: oklch(0.511 0.09 110); --hue-5: oklch(0.581 0.121 165); --hue-6: oklch(0.481 0.067 210);
+      --hue-7: oklch(0.629 0.2 300); --hue-8: oklch(0.555 0.179 32);
+      --tag-mix: 45%; --glow-a: 0; --sky-star-a: .45; --sky-line-a: .10;
       --shadow-overlay: 0 12px 32px -8px rgb(20 30 60 / .25);
       color-scheme: light;
     }
@@ -118,8 +121,10 @@
     --info: oklch(0.5 0.12 245); --violet: oklch(0.5 0.15 305);
     --aqi-moderate: oklch(0.55 0.12 90); --aqi-sensitive: oklch(0.55 0.15 55); --aqi-unhealthy: oklch(0.5 0.17 25);
     --aqi-very: oklch(0.45 0.17 320); --aqi-hazard: oklch(0.4 0.15 10);
-    --hue-1: oklch(0.55 0.14 75); --hue-2: oklch(0.5 0.14 255); --hue-3: oklch(0.52 0.19 350);
-    --hue-4: oklch(0.55 0.12 105); --hue-5: oklch(0.48 0.11 165);
+    --hue-1: oklch(0.609 0.129 72); --hue-2: oklch(0.532 0.171 258); --hue-3: oklch(0.536 0.171 352);
+    --hue-4: oklch(0.511 0.09 110); --hue-5: oklch(0.581 0.121 165); --hue-6: oklch(0.481 0.067 210);
+    --hue-7: oklch(0.629 0.2 300); --hue-8: oklch(0.555 0.179 32);
+    --tag-mix: 45%; --glow-a: 0; --sky-star-a: .45; --sky-line-a: .10;
     --shadow-overlay: 0 12px 32px -8px rgb(20 30 60 / .25);
     color-scheme: light;
   }
@@ -1202,7 +1207,7 @@ body.ke .ck-briefcard, body.ke .ck-card { background: var(--card); border: 1px s
 body.ke .ck-briefcard { padding: var(--sp-6); }
 .ck-brief-body { margin-top: var(--sp-5); }
 .ck-brief-body .brief-line:first-child { margin-top: 0; }
-.ck-brief-body .xbody.has-side { display: grid; grid-template-columns: minmax(0, 1fr) 300px; column-gap: var(--sp-7); }
+.ck-brief-body .xbody.has-side { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 360px); column-gap: var(--sp-7); }
 .ck-brief-body .xbody.has-side .brief-line { grid-column: 1; }
 .brief-side { grid-column: 2; grid-row: 1 / span 6; border-left: 1px solid var(--hair); padding-left: var(--sp-6); display: flex; flex-direction: column; gap: var(--sp-3); align-self: start; }
 .brief-side .side-line { margin: 0; font-size: var(--fs-body); line-height: var(--lh-list); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
@@ -1215,7 +1220,7 @@ body.ke .ck-briefcard .ck-brief-body:has(.brief-card) { margin-top: 0; }
 .brief-card .brief-head .sp { flex: 1; }
 .brief-card .brief-head .stamp { color: var(--meta); font-size: var(--fs-micro); }
 .brief-card .brief-cols { display: grid; grid-template-columns: minmax(0, 1fr); column-gap: var(--sp-7); }
-.brief-card .brief-cols.has-threads { grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr); }
+.brief-card .brief-cols.has-threads { grid-template-columns: minmax(0, 1fr) minmax(280px, 360px); }
 .brief-card .lead-first { margin: 0; font: var(--fw-bold) 17px/1.4 var(--round); letter-spacing: var(--track-tight); overflow-wrap: anywhere; }
 .brief-card .lead-then { margin: var(--sp-3) 0 0; font-size: var(--fs-body); line-height: var(--lh-list); color: var(--label); }
 .brief-card .lead-then .k { margin-right: var(--sp-2); }
@@ -1348,6 +1353,7 @@ body.ke .ck-zgrid .panel > .xbody { flex: 1; min-height: 0; overflow: auto; padd
   body.ke .panel .phead .src.fresh { display: none; }   /* "read 0s ago" pushed the expand control onto a line of its own at this width */
   body.ke .ck-brief-body .xbody.has-side { display: block; }
   .brief-side { border-left: 0; padding-left: 0; margin-top: var(--sp-6); }
+  .brief-side .xnote { margin-bottom: var(--sp-5); }
 }
 
 /* THE ORANGE BUDGET (KE page). Accent only where attention goes: the now-line, a failed review, "N failed", an overdue tag,
@@ -1425,6 +1431,9 @@ body.ke .undo-btn::before { content: none; }
 body.ke .undo-btn:hover { color: var(--text); background: none; border-color: var(--label); }
 body.ke .verb-btn:hover { color: var(--text); background: var(--card-2); }
 body.ke .verb-btn:focus-visible, body.ke .undo-btn:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
+body.ke [data-ck-panel="tray"] .row:not(.row-expanded) .clause.clampable { -webkit-line-clamp: 1; line-clamp: 1; }
+@media (max-width: 720px) { body.ke [data-ck-panel="tray"] .row:not(.row-expanded) .clause.clampable { -webkit-line-clamp: 2; line-clamp: 2; } }
+body.ke .row:has(> .clause.clampable) > [data-ck-tag] { justify-self: start; }
 body.ke [data-ck-tag] { color: var(--meta); font: var(--fw-medium) var(--fs-micro)/var(--lh-list) var(--sans); letter-spacing: 0; text-transform: none;
   background: none; border: 0; padding: 0; border-radius: 0; opacity: 1; }
 body.ke [data-ck-tag][data-ck-tag-state="overdue"] { color: var(--accent); }
@@ -1537,12 +1546,15 @@ body.ke .tray-dump:not(.text-editor) .tray-dump-ta { min-height: 32px; max-heigh
    and a failed review glowing red. */
 html {
   --hue-1: oklch(0.82 0.15 75); --hue-2: oklch(0.68 0.14 255); --hue-3: oklch(0.66 0.21 350);
-  --hue-4: oklch(0.94 0.17 105); --hue-5: oklch(0.76 0.13 165);
+  --hue-4: oklch(0.94 0.17 105); --hue-5: oklch(0.76 0.13 165); --hue-6: oklch(0.907 0.079 210);
+  --hue-7: oklch(0.793 0.111 300); --hue-8: oklch(0.713 0.143 32);
 }
 .rp-tag { display: inline-block; margin-right: var(--sp-3); padding: 0 var(--sp-3); border-radius: var(--r-pill); vertical-align: 1px; letter-spacing: 0; text-transform: none;
-  font: var(--fw-semibold) var(--fs-micro)/1.6 var(--sans); color: var(--tag); background: color-mix(in oklch, var(--tag) 15%, transparent); }
+  font: var(--fw-semibold) var(--fs-micro)/1.6 var(--sans); color: var(--tag-ink); background: color-mix(in oklch, var(--tag) 15%, transparent); }
+.rp-tag { --tag-ink: color-mix(in oklch, var(--tag) var(--tag-mix), var(--text)); }
 .rp-tag[data-repo="1"] { --tag: var(--hue-1); } .rp-tag[data-repo="2"] { --tag: var(--hue-2); } .rp-tag[data-repo="3"] { --tag: var(--hue-3); }
-.rp-tag[data-repo="4"] { --tag: var(--hue-4); } .rp-tag[data-repo="5"] { --tag: var(--hue-5); }
+.rp-tag[data-repo="4"] { --tag: var(--hue-4); } .rp-tag[data-repo="5"] { --tag: var(--hue-5); } .rp-tag[data-repo="6"] { --tag: var(--hue-6); }
+.rp-tag[data-repo="7"] { --tag: var(--hue-7); } .rp-tag[data-repo="8"] { --tag: var(--hue-8); }
 
 /* variant B (Phill 10-14, restored 10-20): a 2px stripe across the top of a panel, by the levain subsystem it belongs to, as flow's cockpit
    draws it: memory (blue), decisions (amber), the work lists (pink). Inside the card's own radius (the panel clips its overflow). */
@@ -1551,7 +1563,7 @@ html :is([data-ck-panel="memory_glance"], [data-ck-panel="health"], [data-ck-pan
 html :is([data-ck-panel="decisions"], [data-ck-panel="edits"])::before { background: var(--stripe-decisions); }
 html :is([data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"])::before { background: var(--stripe-work); }
 html :is(.ck-card.w, .ck-zgrid .panel:not(.ck-dash), .ck-mem-row > .panel:not(.ck-dash)):is([data-ck-panel="memory_glance"], [data-ck-panel="health"], [data-ck-panel="doctor"], [data-ck-panel="crystals"], [data-ck-panel="graph"], [data-ck-panel="episodes"],
-  [data-ck-panel="decisions"], [data-ck-panel="edits"], [data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"], [data-ck-panel^="section:"])::before {
+  [data-ck-panel="decisions"], [data-ck-panel="edits"], [data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"], [data-ck-panel^="section:"]):not(.ck-mem-nest)::before {
   content: ""; position: absolute; inset: 0 0 auto 0; height: 2px; pointer-events: none; z-index: 1; }
 html :is(.ck-card.w, .ck-zgrid .panel):is([data-ck-panel]) { position: relative; }
 /* a card alone in a column takes the column's width even when empty (the empty rule above sets align-self: start for the grid) */
@@ -1592,6 +1604,13 @@ body.ke .needs-head { align-items: center; }
 body.ke .needs-chip { font: var(--fw-medium) var(--fs-micro)/1.4 var(--mono); color: var(--label); border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: 0 var(--sp-2); }
 body.ke .needs-body { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; flex: 1 1 auto; }
 body.ke .needs-body .consent-display { margin-top: 0; }
+/* fixed slots, so the actions sit on one baseline across a row whatever the request says; the focus view (is-full) shows it whole */
+body.ke .needs-card:not(.is-full) .needs-q-title { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; line-clamp: 4; overflow: hidden; }
+body.ke .needs-card:not(.is-full) .consent-display { max-height: calc(7.5em + var(--sp-3) * 2); overflow-y: auto; -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-now)), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-now)), transparent); animation: edge-fade linear both; animation-timeline: scroll(self); }
+@supports (animation-timeline: scroll()) { body.ke .needs-card:not(.is-full) .consent-display { scrollbar-width: none; } body.ke .needs-card:not(.is-full) .consent-display::-webkit-scrollbar { display: none; } }
+body.ke .needs-card:not(.is-full) .consent-facts > .ext-meta:not(.needs-keep), body.ke .needs-card:not(.is-full) .consent-hint .consent-dgtext { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
+body.ke .needs-card.is-full { max-width: 720px; width: 100%; }
 body.ke .needs-actions { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-3); margin-top: auto; }
 body.ke .needs-btn, body.ke .needs-card .question-option { min-height: 38px; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); color: var(--text); background: none; border: 1px solid var(--label); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-4); cursor: pointer; text-align: center; margin: 0; }
 body.ke .needs-btn:hover, body.ke .needs-card .question-option:hover { border-color: var(--text); background: var(--card-2); }
@@ -1691,6 +1710,7 @@ body.ke .ck-zgrid .panel.ck-dash { order: 95; }
 body.ke[data-mode="morning"] .ck-zgrid .panel[data-ck-panel="tray"] { grid-column: 1 / -1; }
 body.ke[data-mode="memory"] .ck-zgrid [data-ck-panel^="section:"] { grid-column: 1 / -1; }
 body.ke[data-mode="memory"] .ck-zgrid [data-ck-panel="graph"], body.ke[data-mode="memory"] .ck-zgrid [data-ck-panel="wraps"] { align-self: start; }
+body.ke[data-mode="memory"] .ck-zgrid .ck-mem-row > [data-ck-panel="graph"], body.ke[data-mode="memory"] .ck-zgrid .ck-mem-row > [data-ck-panel="wraps"] { align-self: stretch; }   /* beside Crystallized patterns the pair is one height */
 body.ke .ck-zgrid[data-ck-zone="identity"] { align-items: stretch; }
 body.ke .ck-zgrid[data-ck-zone="identity"] .panel:last-child:nth-child(odd) { grid-column: 1 / -1; }
 /* the Board: two independent stacks. Left: Tray, Now. Right: Open loops, Keep. Each is as tall as its own cards. */
@@ -1699,7 +1719,12 @@ body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col.ck-col-off { display: n
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol[data-cols="1"] { grid-template-columns: minmax(0, 1fr); }
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .panel { grid-column: 1 / -1; }
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col > .panel { grid-column: auto; }
-body.ke[data-mode="board"] .ck-zgrid [data-ck-panel="episodes"] { order: 5; grid-column: 1 / -1; }
+body.ke[data-mode="board"] .ck-zgrid [data-ck-panel="episodes"] { order: 5; }
+/* panels below the two stacks pair up (dashboard_core.js marks data-ck-pair l / r / solo): one fixed height so a pair is even; a solo keeps the row */
+@media (min-width: 1200px) {
+  body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .panel[data-ck-pair="l"], body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .panel[data-ck-pair="r"] { grid-column: auto; height: var(--card-medium); max-height: var(--card-medium); }
+  body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .panel[data-ck-pair="solo"] { grid-column: 1 / -1; }
+}
 /* the order inside a stack is the DOM's (dashboard_core.js ckArrange: Tray over Now, Open loops over Keep until a saved layout says otherwise) */
 
 /* K7: the Build tab. Sessions is a large card of its own (cockpit_view.js paintBuildSessions into #k7-sessions); Results sits left and
@@ -1730,7 +1755,7 @@ body.ke[data-mode="build"] .k7-sess:not([hidden]) { display: block; margin-top: 
 .k7-who-t { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
 .k7-agent { font: var(--fw-bold) var(--fs-body) var(--round); color: var(--text); }
 .k7-repo { display: inline-block; padding: 0 var(--sp-3); border-radius: var(--r-pill); font: var(--fw-semibold) var(--fs-micro)/1.6 var(--sans); color: var(--label); background: var(--card-2); }
-.k7-repo.rp-tag { margin-right: 0; vertical-align: baseline; color: var(--tag); background: color-mix(in oklch, var(--tag) 15%, transparent); }
+.k7-repo.rp-tag { margin-right: 0; vertical-align: baseline; color: var(--tag-ink); background: color-mix(in oklch, var(--tag) 15%, transparent); }
 .k7-cwd { color: var(--meta); font-size: var(--fs-meta); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .k7-now { min-width: 0; color: var(--text); font-size: var(--fs-body); }
 .k7-srow.quiet .k7-now .k7-tool { color: var(--label); }
@@ -1858,18 +1883,44 @@ body.ke .ck-mem-card > .phead { display: flex; align-items: baseline; gap: var(-
 body.ke .ck-mem-card > .phead .ck-count { margin-left: 0; }
 body.ke .ck-mem-meta { font: var(--fw-regular) var(--fs-meta)/1.3 var(--sans); color: var(--label); }
 body.ke .ck-mem-card > .pbody { max-height: none; overflow: visible; }
-body.ke .ck-mem-cols { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: var(--sp-8, 40px); align-items: start; }
+body.ke .ck-mem-cols { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 0 var(--sp-8, 40px); align-items: start; }
+/* ONE grid, no holes: the columns dissolve, the left sections take column 1 (each capped), and the right sections span two left rows each,
+   sized by the left alone (contain: size), so Patterns ends where State + Threads end and Decisions where Context + Understanding end */
+@media (min-width: 1101px) {
+  body.ke .ck-mem-cols:not(.ck-mem-one) { align-items: stretch; }
+  body.ke .ck-mem-cols:not(.ck-mem-one) > .ck-mem-col { display: contents; }
+  body.ke .ck-mem-cols:not(.ck-mem-one) > .ck-mem-col:first-child > .ck-mem-nest { grid-column: 1; }
+  body.ke .ck-zgrid .ck-mem-cols:not(.ck-mem-one) > .ck-mem-col:nth-child(2) > .ck-mem-nest { grid-column: 2; contain: size; min-height: 240px; max-height: none; overflow: hidden; }
+  body.ke .ck-mem-cols:not(.ck-mem-one) > .ck-mem-col:nth-child(2) > .ck-mem-nest:nth-child(1) { grid-row: 1 / span 2; }
+  body.ke .ck-mem-cols:not(.ck-mem-one) > .ck-mem-col:nth-child(2) > .ck-mem-nest:nth-child(2) { grid-row: 3 / span 2; }
+}
+@media (max-width: 1100px) {
+  body.ke .ck-mem-cols { grid-template-columns: minmax(0, 1fr); }
+  body.ke .ck-zgrid .ck-mem-cols > .ck-mem-col:nth-child(2) > .ck-mem-nest:first-child { border-top: 1px solid var(--hair); padding-top: var(--sp-6); margin-top: var(--sp-5); }
+}
+body.ke .ck-zgrid .ck-mem-cols > .ck-mem-col > .panel.ck-mem-nest { max-height: var(--card-section); }
 body.ke .ck-mem-cols.ck-mem-one { grid-template-columns: minmax(0, 1fr); }
 body.ke .ck-mem-col { display: flex; flex-direction: column; min-width: 0; }
 body.ke .ck-zgrid .panel.ck-mem-nest { height: auto; max-height: none; border: 0; border-radius: 0; background: none; overflow: visible; padding: 0; margin: 0; }
 /* the size classes cap a card's height; a nested section is never cut, so its cap is lifted at their specificity (heights only) */
 body.ke .ck-zgrid .panel.ck-mem-nest.ck-h-short, body.ke .ck-zgrid .panel.ck-mem-nest.ck-h-medium, body.ke .ck-zgrid .panel.ck-mem-nest.ck-h-tall { height: auto; max-height: none; }
-body.ke .ck-zgrid .ck-mem-col > .ck-mem-nest { padding: var(--sp-5) 0 0; margin-top: var(--sp-5); border-top: 1px solid var(--hair); }
-body.ke .ck-zgrid .ck-mem-col > .ck-mem-nest:first-child { border-top: 0; padding-top: 0; margin-top: 0; }
+body.ke .ck-zgrid .ck-mem-cols:not(.ck-mem-one) > .ck-mem-col:first-child > .panel.ck-mem-nest.ck-h-short, body.ke .ck-zgrid .ck-mem-cols:not(.ck-mem-one) > .ck-mem-col:first-child > .panel.ck-mem-nest.ck-h-medium,
+body.ke .ck-zgrid .ck-mem-cols:not(.ck-mem-one) > .ck-mem-col:first-child > .panel.ck-mem-nest.ck-h-tall { max-height: var(--card-section); }
+body.ke .ck-zgrid .ck-mem-col > .ck-mem-nest { padding: var(--sp-6) 0 0; margin-top: var(--sp-5); border-top: 1px solid var(--hair); }
+body.ke .ck-zgrid .ck-mem-col > .ck-mem-nest:first-child { border-top: 0; padding-top: var(--sp-5); margin-top: 0; }
+/* a section the cap clips: its body is cut, the last --fade-h fades (scroll-driven, so it needs no script and shows only where the body overflows),
+   and the foot (dashboard_core.js) opens the section whole */
+@property --fade-now { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@keyframes edge-fade { from, 92% { --fade-now: var(--fade-h); } to { --fade-now: 0px; } }
+body.ke .ck-zgrid .ck-mem-nest { display: flex; flex-direction: column; }
+body.ke .ck-zgrid .ck-mem-nest > .pbody { flex: 1 1 auto; min-height: 0; overflow-y: hidden; overflow-x: hidden; -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-now)), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-now)), transparent); animation: edge-fade linear both; animation-timeline: scroll(self); }
+body.ke .ck-zgrid .ck-mem-nest > .pbody.is-clipped { -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-h)), transparent); mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-h)), transparent); animation: none; }
+body.ke .ck-mem-nest > .more-foot, body.ke .ck-mem-row > .panel > .more-foot { align-self: flex-start; padding-inline: 0; margin: var(--sp-2) 0 0; min-height: var(--ctl-md); }
 body.ke .ck-zgrid .ck-mem-nest > .phead { padding: 0 0 var(--sp-3); }
 body.ke .ck-zgrid .ck-mem-nest > .phead h2 { font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); }
 body.ke .ck-mem-nest > .phead > :not(h2) { display: none; }
-body.ke .ck-zgrid .ck-mem-nest > .pbody { padding: 0; max-height: none; overflow: visible; }
+body.ke .ck-zgrid .ck-mem-nest > .pbody { padding: 0; max-height: none; }
 body.ke .ck-mem-nest .edit-trigger-row { margin-top: var(--sp-2); }
 body.ke .ck-mem-pats .md-ul, body.ke .ck-mem-pats .md-ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-2); }
 body.ke .ck-mem-pats .md-li::before, body.ke .ck-mem-pats .md-li::marker { content: none; display: none; }
@@ -1896,10 +1947,13 @@ body.ke .ck-mem-when { font: var(--fw-regular) var(--fs-meta)/1.5 var(--mono); c
 body.ke .ck-mem-text { overflow-wrap: anywhere; min-width: 0; }
 body.ke .ck-mem-text .ck-mem-when { margin-right: var(--sp-2); }
 /* crystals beside cognition */
-body.ke .ck-mem-row { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: var(--gap); align-items: start; }
-body.ke .ck-zgrid .ck-mem-row > .panel { height: auto; min-height: 0; max-height: none; min-width: 0; }
+body.ke .ck-mem-row { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: var(--gap); align-items: stretch; }
+body.ke .ck-zgrid .ck-mem-row > .panel { height: auto; min-height: 0; max-height: var(--card-tall); min-width: 0; }
 body.ke .ck-mem-row > .panel > .phead { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; }
-body.ke .ck-zgrid .ck-mem-row .pbody { max-height: none; overflow: visible; }
+body.ke .ck-zgrid .ck-mem-row .pbody { flex: 1 1 auto; min-height: 0; max-height: none; overflow: visible; }
+body.ke .ck-zgrid .ck-mem-row > .ck-mem-crys > .pbody { overflow-y: hidden; -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-now)), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-now)), transparent); animation: edge-fade linear both; animation-timeline: scroll(self); }
+body.ke .ck-zgrid .ck-mem-row > .ck-mem-crys > .pbody.is-clipped { -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-h)), transparent); mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-h)), transparent); animation: none; }
 body.ke .ck-crys { align-content: start; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 var(--sp-8, 40px); }
 body.ke .ck-crys .row { display: flex; flex-wrap: nowrap; gap: var(--sp-4); align-items: baseline; padding: var(--sp-3) 0; border-bottom: 1px solid var(--hair); }
 body.ke .ck-crys .lvl { color: var(--accent); font: var(--fw-bold) var(--fs-lead)/1 var(--round); min-width: 2rem; }
@@ -1908,10 +1962,10 @@ body.ke .ck-crys-t { display: flex; flex-direction: column; gap: 2px; flex: 1 1 
 body.ke .ck-crys .name { font: var(--fw-regular) var(--fs-meta)/1.4 var(--mono); overflow-wrap: break-word; word-break: normal; min-width: 0; }
 body.ke .ck-crys .ck-crys-meta { color: var(--label); font-size: var(--fs-micro, var(--fs-meta)); line-height: 1.3; overflow-wrap: anywhere; }
 body.ke .ck-crys .clause { flex: none; color: var(--label); font-size: var(--fs-meta); }
-body.ke .ck-mem-cog .scope-wrap { display: flex; flex-direction: column; gap: var(--sp-2); }
-body.ke .ck-mem-cog .scope-plot { display: flex; gap: var(--sp-6); align-items: center; }
+body.ke .ck-mem-cog .scope-wrap { display: flex; flex-direction: column; gap: var(--sp-2); flex: 1 1 auto; min-height: 0; }
+body.ke .ck-mem-cog .scope-plot { display: flex; gap: var(--sp-6); align-items: stretch; flex: 1 1 auto; min-height: 0; }
 body.ke .ck-mem-cog .scope-box { flex: 1 1 0; min-width: 0; min-height: 0; }
-body.ke .ck-mem-cog .scope-box svg.scope { height: 150px; border: 0; background: none; }
+body.ke .ck-mem-cog .scope-box svg.scope { height: 100%; min-height: 150px; max-height: 360px; border: 0; background: none; }
 body.ke .ck-mem-cog .scope-legend { flex: 0 0 auto; flex-direction: column; gap: var(--sp-3); margin: 0; }
 body.ke .ck-mem-cog .scope-ch { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 0 var(--sp-2); text-align: left; }
 body.ke .ck-mem-cog .scope-ch::before { content: ""; display: block; width: 10px; height: 2px; background: currentColor; margin-bottom: 2px; }
