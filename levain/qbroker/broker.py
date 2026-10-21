@@ -280,7 +280,7 @@ class Broker:
                    check_hold: bool = True) -> dict[str, Any] | None:
         """The broker's grant row for the request ``row`` holds when one is there and
         :func:`~levain.qbroker.seam.grant_allow_refusal` accepts it (``check_hold`` passed on), else ``None``: none
-        there, or one that does not read or is refused (logged). Such a request is treated as having NO grant: its
+        there, or one that does not read, is refused, or whose check raises (logged). Such a request is treated as having NO grant: its
         receipts are an ordinary ``pending`` filing, the operator's to decide (ANSWER? refuses that row too)."""
         try:
             grant = self._store.read_grant(request.id)
@@ -289,18 +289,25 @@ class Broker:
             return None
         if grant is None:
             return None
-        why = grant_allow_refusal(row, grant, now, check_hold=check_hold)
+        try:
+            why = grant_allow_refusal(row, grant, now, check_hold=check_hold)
+        except Exception as exc:   # noqa: BLE001 - one row never stops the broker: a raise is a refusal
+            log.exception("qbroker: grant row for %s refused (its check raised), filed as no grant", request.id)
+            why = f"its check raised {type(exc).__name__}"
         if why is not None:
             log.warning("qbroker: grant row for %s refused, filed as no grant: %s", request.id, why)
             return None
         return grant
 
-    def _file_receipts(self, row: Mapping[str, Any], request: ExternalGateRequest, now: datetime) -> None:
+    def _file_receipts(self, row: Mapping[str, Any], request: ExternalGateRequest, now: datetime, *,
+                       check_hold: bool = True) -> None:
         """The receipts of a row just linked (or re-filed with none), inside the request id's flight: its grant's
         (``pending`` then ``allowed``, one write) when a grant row :meth:`_grant_row` accepts is beside it, else its
-        ``pending`` filing."""
+        ``pending`` filing. ``check_hold`` is passed on: True at the first filing (whose hold :meth:`_request` has
+        just checked open), False for a replay's repair, as at start, since a grant written in time stands after
+        the hold ends."""
         stamp = utc_stamp(now)
-        grant = self._grant_row(row, request, now)
+        grant = self._grant_row(row, request, now, check_hold=check_hold)
         if grant is not None:
             self._receipts.granted(request, grant, stamp)
         else:
@@ -314,7 +321,7 @@ class Broker:
         try:
             if self._store.read_request(request.id) != row or self._receipts.state(request.id) is not None:
                 return
-            self._file_receipts(row, request, self._clock())
+            self._file_receipts(row, request, self._clock(), check_hold=False)
         finally:
             self._leave_flight(request.id, flight)
 

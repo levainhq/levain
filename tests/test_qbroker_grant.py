@@ -855,3 +855,43 @@ def test_s3_a_grant_whose_receipts_raise_in_reconcile_is_that_rows_plain_pending
     assert b._receipts.reconcile([request], utc_stamp(world["clock"].now), grants={rid: bad}) == 1
     assert [s for s, _ in _receipts(world, rid)] == ["pending"]
     assert f"the grant receipts of {rid} could not be built" in caplog.text
+
+
+def test_t1_a_replay_after_the_hold_ended_repairs_a_granted_request_from_its_grant_row(world, caplog):
+    """T1: the grant row was written in time and the receipt write failed; the REQUEST is replayed only after the
+    hold ended. The repair judges the grant as the start does (the hold aside), so the request is the grant's
+    allowed one, never a plain pending the operator could answer."""
+    b = broker(world)
+    msg = frame(world, "t1", "Write", cc(world, "src/a.py"))
+    rid = _filed_without_receipts(world, b, "t1")
+    world["clock"].now = BNOW + timedelta(minutes=10)
+    caplog.set_level("WARNING", logger="levain.qbroker")
+    assert b.handle(1, dict(msg, id=next(_ids)))["request_id"] == rid
+    assert [s for s, _ in _receipts(world, rid)] == ["pending", "allowed"]
+    assert "refused, filed as no grant" not in caplog.text
+    listed = {r.request_id: r for r in qoperator.rows(world["L"] / "queue", now=world["clock"].now)}
+    assert listed[rid].settled
+    _operator_answer(world, rid, "deny")
+    # past the hold ANSWER? answers expired for any request (a granted one too); the operator's deny never decides
+    # it and nothing is recorded over the grant's allow
+    got = ask(b, rid)
+    assert "decision" not in got and got["refused"] == "request-expired"
+    assert [s for s, _ in _receipts(world, rid)] == ["pending", "allowed"]
+
+
+def test_t2_a_grant_check_that_raises_is_a_refusal_and_the_broker_starts(world, caplog, monkeypatch):
+    """T2: an unexpected raise from grant_allow_refusal for one row is logged and treated as a refusal (no grant):
+    the broker starts and that row reconciles plain pending."""
+    b = broker(world)
+    rid = _filed_without_receipts(world, b, "t2")
+
+    def raising(*a, **k):
+        raise RuntimeError("injected: the grant check raised")
+    monkeypatch.setattr("levain.qbroker.broker.grant_allow_refusal", raising)
+    caplog.set_level("WARNING", logger="levain.qbroker")
+    b2 = broker(world)
+    assert [s for s, _ in _receipts(world, rid)] == ["pending"]
+    assert f"grant row for {rid} refused (its check raised)" in caplog.text
+    assert "RuntimeError" in caplog.text
+    listed = {r.request_id: r for r in qoperator.rows(world["L"] / "queue", now=world["clock"].now)}
+    assert listed[rid].state == "pending" and not listed[rid].settled
