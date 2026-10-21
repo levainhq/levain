@@ -160,7 +160,7 @@ def test_the_bootouts_share_one_deadline():
     seams.domain_out = slow
     with pytest.raises(Refused) as e:
         P.scrub(SLOT, GW, CHILD, seams=seams, bound_s=1.0)
-    assert e.value.name == f"scrub-domain-remains:{GW}" or e.value.name == f"scrub-domain-remains:{CHILD}"
+    assert e.value.name == f"scrub-domain-remains:{CHILD}"      # 0.6 + 0.6 passes the 1.0 s deadline before the third
     assert given[0] <= 1.0 and all(b < a for a, b in zip(given, given[1:]))
 
 

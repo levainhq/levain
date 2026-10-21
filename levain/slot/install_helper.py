@@ -643,7 +643,7 @@ def _abandoned_setup(facts: HostFacts) -> Intent | None:
     return j
 
 
-def _end_processes(host: HostOS, uid: int, name: str, *, bootout: Callable[[int], bool] = PR.darwin_bootout,
+def _end_processes(host: HostOS, uid: int, name: str, *, bootout: Callable[..., bool] = PR.darwin_bootout,
                    kill_all: Callable[[int], tuple[bool, str]] = _kill_all,
                    none_left: Callable[[int], bool] = lambda u: PR.UidProcs().no_process(u)) -> tuple[bool, str]:
     """macOS first ends the uid's launchd domain, so no agent is respawned for it after the kill (an undo once
