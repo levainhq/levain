@@ -52,11 +52,11 @@ def test_a_draft_reaches_the_ledger_only_by_the_operators_promote(world, monkeyp
                     token=token)
     assert d["state"] == "drafted" and d["drafted_by"] == "coordinator"
     with pytest.raises(CoordError):          # the lease fences a coordinator's draft
-        T.add_draft(store, "decision", words="x", by="coordinator", token=token + 1)
+        T.add_draft(store, "decision", words="x", kind="practice", by="coordinator", token=token + 1)
     before = git("rev-parse", "levain-team-ledger", cwd=ana)
     args = ["team", "draft", "promote", d["draft_id"], "--yes", "--no-push", "--repo", str(ana), "--queue-dir", str(qdir)]
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-1")      # a session Levain launched
-    assert levain_main(args) == 2
+    assert levain_main(args) == 1                               # the coordinator's door refuses it
     assert git("rev-parse", "levain-team-ledger", cwd=ana) == before and T.get_draft(store, d["draft_id"])["state"] == "drafted"
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")                # the operator's own terminal
     assert levain_main(args) == 0
@@ -64,7 +64,7 @@ def test_a_draft_reaches_the_ledger_only_by_the_operators_promote(world, monkeyp
     assert v["state"] == "promoted" and v["ledger_id"]
     assert v["ledger_id"] in git("show", "levain-team-ledger:" + _ledger_file(ana), cwd=ana)
     with pytest.raises(CoordError):          # promoted once
-        T.mark_promoted(store, d["draft_id"], "x-1")
+        T.mark_promoted(store, d["draft_id"], v["ledger_id"], {v["ledger_id"]: {"agent": T.draft_agent(d["draft_id"])}})
 
 
 def _ledger_file(ana):
@@ -77,7 +77,7 @@ def test_draft_rows_are_append_only_and_final(world):
     d = T.add_draft(store, "finding", summary="s", by="operator")
     T.withdraw_draft(store, d["draft_id"])
     with pytest.raises(CoordError):
-        T.mark_promoted(store, d["draft_id"], "x-1")
+        T.mark_promoted(store, d["draft_id"], "x-1", {"x-1": {"agent": T.draft_agent(d["draft_id"])}})
     c = sqlite3.connect(qdir / "dispatch.db")
     with pytest.raises(sqlite3.DatabaseError):
         c.execute("UPDATE team_drafts SET body = '{}'")
