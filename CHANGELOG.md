@@ -15,6 +15,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   next drop would do, `levain coord take` holds it yourself, and `levain coord release` ends it. A session that lost
   the role (it went quiet past its time, or you took over) has its thread changes refused. Splitting or re-titling by
   hand now records you: `--by operator` is the default for `levain drops split` and `levain thread set`.
+- **Verifiers are signed, one per check, and Levain runs the checker itself.** Each verifier you sign names the checker
+  Levain ships (`output_compare` is the first: it runs the template's steps and compares what each one printed to what you
+  pinned) and the exact steps and inputs it checks. A report only counts if it comes from that checker, on those steps and
+  inputs, so a changed checker or a changed step list is refused rather than read as a pass.
+
+### Changed
+- **Re-sign your verifiers after upgrading.** The old `verifiers` configuration item is no longer read; `levain dispatch
+  config show` marks it SUPERSEDED once you have signed the new kind, and `levain doctor` warns while only the old item is signed.
+  A template whose verifier id 0.11 accepted but this version does not (uppercase, `.`, `_`, `@`, `:`, `/`, `+`, or over 48
+  characters) is refused by name until it is re-signed.
+  - A control store holding the new `verifier` item cannot be read by Levain 0.11.x, so do not downgrade after signing one.
 
 ### Known edges
 - Nothing answers a drop's request for a coordinator yet: each request waits 5 minutes, and after three unanswered
