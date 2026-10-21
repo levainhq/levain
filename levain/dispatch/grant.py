@@ -8,18 +8,17 @@ the operator's signature over the contract, which the caller has verified; no an
 
 The paths come from a TOTAL parse (:func:`grant_paths`): Claude Code's ``Write``/``Edit`` name one absolute
 ``file_path`` (:func:`levain.consent.policy.targets`); a Codex ``apply_patch`` names its header paths
-(:func:`levain.consent.adapters.codex.patch_targets`), each joined to the worktree root, ``Move to`` giving both.
-A patch is read only when no line Codex's own parser could take for a header can be read otherwise here: a
-character Python splits lines on but Codex does not (``\\r`` outside ``\\r\\n``, ``\\v``, ``\\f``, ``\\x1c``-``\\x1e``,
-``\\x85``, U+2028, U+2029), or one Python strips as whitespace but Codex does not (``\\x1c``-``\\x1f``), makes it
-unreadable. Anything not read whole is ``None``, never a partial list: what it touches cannot be told.
+(:func:`levain.consent.adapters.codex.patch_targets`, which reads the lines as Codex's own parser does: that rule
+has one copy), each joined to the worktree root, ``Move to`` giving both. Anything not read whole is ``None``, never a
+partial list: what it touches cannot be told.
 
 :func:`path_bound_digest` is the ``pb1:`` request digest: the tool, those paths and the sha256 of the input's JCS
 bytes, under one canonical encoding, so a request filed with other paths than its input names has another digest.
 
-Each path is checked at approval time (:func:`no_follow_check`, Phill's ruling 10-20): from a directory fd on the
-root, each intermediate component is opened ``O_DIRECTORY|O_NOFOLLOW`` relative to the last, and the final one is
-``lstat``ed: absent only when the entry is NEW or the tool is ``Write``, else a regular file with one link.
+Each path is checked at approval time (:func:`no_follow_check`, Phill's ruling 10-20): from a directory fd on ``/``,
+every component of the root and then each intermediate component of the path is opened ``O_DIRECTORY|O_NOFOLLOW``
+relative to the last, and the final one is ``lstat``ed: absent only when the entry is NEW or the tool is ``Write``,
+else a regular file with one link. :func:`grant_decision` never raises: what it cannot read queues.
 
 Known edge (the same ruling): a symlink swapped in after the check and before the tool's write is not caught here;
 Bash already runs free inside the sandbox, so the race buys nothing Bash cannot do, and the floor (the final diff
@@ -47,9 +46,6 @@ __all__ = ["Allow", "DIGEST_PREFIX", "Queue", "grant_decision", "grant_paths", "
            "write_list_match"]
 
 DIGEST_PREFIX = "pb1:"
-# characters on which Python's str.splitlines breaks a line and Codex's parser (Rust str::lines, '\n' only) does
-# not, and the ones Python's str.strip and re's \s take for whitespace and Rust's trim does not; '\r' is read apart
-_PATCH_UNREADABLE = frozenset("\v\f\x1c\x1d\x1e\x1f\x85  ")
 # the input keys a grantable call may carry; any other key is a field whose meaning this parse cannot tell
 _INPUT_KEYS = {"Write": frozenset({"file_path", "content"}),
                "Edit": frozenset({"file_path", "old_string", "new_string", "replace_all"}),
@@ -80,28 +76,23 @@ def path_bound_digest(tool_name: str, paths: Sequence[str], tool_input: Any) -> 
     return DIGEST_PREFIX + hashlib.sha256(canonical_bytes(body)).hexdigest()
 
 
-def _patch_readable(patch: str) -> bool:
-    return not any(c in _PATCH_UNREADABLE for c in patch) and "\r" not in patch.replace("\r\n", "")
-
-
 def grant_paths(agent: str, tool_name: str, tool_input: Any, root: str) -> tuple[str, ...] | None:
     """The absolute paths a grantable call of ``agent`` touches, sorted, each once; ``None`` when the call is not a
     grantable file tool of that agent or its input is not read whole (an unknown input key, a relative
-    ``file_path``, a patch :func:`patch_targets` cannot read or holds a character the two parsers split or strip
-    differently, an input outside JCS). ``root`` is the worktree root, absolute, that patch paths join to."""
+    ``file_path``, a patch :func:`patch_targets` cannot read, an input outside JCS, nested past the recursion limit or
+    holding a lone surrogate). ``root`` is the worktree root, absolute, that patch paths join to."""
+    if not isinstance(agent, str) or not isinstance(tool_name, str):
+        return None
     if tool_name not in GRANTABLE or tool_name not in AGENT_FILE_TOOLS.get(agent, frozenset()):
         return None
     if not isinstance(tool_input, Mapping) or not set(tool_input) <= _INPUT_KEYS[tool_name]:
         return None
     try:
         value_sha256(tool_input)
-    except ConsentError:
+    except (ConsentError, ValueError, RecursionError):     # UnicodeEncodeError is a ValueError
         return None
     if tool_name == PATCH_TOOL:
-        patch = tool_input.get("command")
-        if not isinstance(patch, str) or not _patch_readable(patch):
-            return None
-        headers = patch_targets(patch)
+        headers = patch_targets(tool_input.get("command"))
         if headers is None or not isinstance(root, str) or not posixpath.isabs(root):
             return None
         found = [posixpath.join(root, h) for h in headers]
@@ -121,16 +112,32 @@ def write_list_match(rel: str, write_entries: Iterable[PathEntry]) -> PathEntry 
 
 
 def no_follow_check(root: str, rel: str, *, new_ok: bool) -> str | None:
-    """``None`` when ``rel`` under ``root`` is reached with no symlink: ``root`` and each intermediate component
-    opened ``O_DIRECTORY|O_NOFOLLOW`` from the last, the final component ``lstat``ed and either absent (only when
-    ``new_ok``; an absent intermediate directory counts as absent) or a regular file with ``st_nlink == 1``. Else the
-    refusal line. Every fd opened is closed."""
+    """``None`` when ``rel`` under ``root`` is reached with no symlink: ``root`` canonical (absolute, normalised, its
+    own realpath), each of its components and then each intermediate component of ``rel`` opened
+    ``O_DIRECTORY|O_NOFOLLOW`` from the last, starting at ``/``, the final component ``lstat``ed and either absent
+    (only when ``new_ok``; an absent intermediate directory counts as absent) or a regular file with
+    ``st_nlink == 1``. Else the refusal line. A NUL in either is refused before any I/O. Every fd opened is closed."""
+    if not isinstance(root, str) or not isinstance(rel, str):
+        return "the worktree root or the path is not a string"
+    if "\0" in root or "\0" in rel:
+        return "the worktree root or the path holds a NUL"
+    if not posixpath.isabs(root) or posixpath.normpath(root) != root or os.path.realpath(root) != root:
+        return "the worktree root is not canonical (absolute, normalised, its own realpath)"
     parts = rel.split("/")
     try:
-        fd = os.open(root, _DIR_FLAGS)
+        fd = os.open("/", _DIR_FLAGS)
     except OSError as exc:
-        return f"the worktree root cannot be opened without following a link ({errno.errorcode.get(exc.errno, exc)})"
+        return f"the filesystem root cannot be opened ({errno.errorcode.get(exc.errno, exc)})"
     try:
+        for i, part in enumerate(c for c in root.split("/") if c):
+            try:
+                nxt = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            except OSError as exc:
+                return (f"the worktree root cannot be reached without following a link: "
+                        f"{'/' + '/'.join(root.split('/')[1:i + 2])} is not a plain directory "
+                        f"({errno.errorcode.get(exc.errno, exc)})")
+            os.close(fd)
+            fd = nxt
         for i, part in enumerate(parts[:-1]):
             try:
                 nxt = os.open(part, _DIR_FLAGS, dir_fd=fd)
@@ -163,12 +170,23 @@ def grant_decision(contract: ResolvedContract, agent: str, tool_name: str, tool_
     """:class:`Allow` when ``tool_name`` is in the contract's ``grant`` and every path of :func:`grant_paths` is,
     in order: under ``root`` with a normalised relative part; spelled exactly as one entry of the signed ``write``
     list (a case or Unicode-form variant of an entry queues: on a case-sensitive disk it is another file); and
-    clean under :func:`no_follow_check`. Else :class:`Queue` naming the first path that fails and why."""
+    clean under :func:`no_follow_check`. Else :class:`Queue` naming the first path that fails and why. Never raises:
+    an exception from any step queues, naming its type."""
+    try:
+        return _decide(contract, agent, tool_name, tool_input, root)
+    except Exception as exc:        # the caller's fallback is the queue, never a crashed hook
+        return Queue(f"the call could not be read: {type(exc).__name__}")
+
+
+def _decide(contract: Any, agent: Any, tool_name: Any, tool_input: Any, root: Any) -> Allow | Queue:
     if not isinstance(contract, ResolvedContract):
         return Queue("the contract is not a resolved dispatch contract")
+    if not isinstance(agent, str) or not isinstance(tool_name, str):
+        return Queue("the agent and tool name must be strings")
     if tool_name not in contract.grant:
-        return Queue(f"the contract does not grant {str(tool_name)[:40]}")
-    if not isinstance(root, str) or not posixpath.isabs(root) or posixpath.normpath(root) != root or root == "/":
+        return Queue(f"the contract does not grant {tool_name[:40]}")
+    if (not isinstance(root, str) or "\0" in root or not posixpath.isabs(root) or posixpath.normpath(root) != root
+            or root == "/"):
         return Queue("the worktree root is not an absolute, normalised directory path")
     paths = grant_paths(agent, tool_name, tool_input, root)
     if paths is None:

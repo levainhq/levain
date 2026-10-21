@@ -143,6 +143,11 @@ B, E = "*** Begin Patch", "*** End Patch"
     f"{B}\n*** Add File:\tn6.txt\n+hi\n{E}\n",
     f"{B}\n*** Update File: a.txt\n***\tMove to: m.txt\n@@\n-old a\n+new a\n{E}\n",
     f"{B}\n*** add file: lc.txt\n+hi\n{E}\n",
+    # any whitespace but a space on a line holding *** (patch_targets's rule, the one copy)
+    f"{B}\n\t*** Add File: n4.txt\n+hi\n{E}\n",
+    f"{B}\n *** Add File: n8.txt\n+hi\n{E}\n",
+    f"{B}\n　*** Add File: n9.txt\n+hi\n{E}\n",
+    f"{B}\n*** Delete File: .\t./outside.txt\n{E}\n",                  # Codex drops the tab: ../outside.txt
 ])
 def test_a_patch_the_two_parsers_could_read_differently_is_refused(patch):
     assert grant_paths("codex", "apply_patch", {"command": patch}, "/w") is None
@@ -151,10 +156,7 @@ def test_a_patch_the_two_parsers_could_read_differently_is_refused(patch):
 @pytest.mark.parametrize("patch,want", [
     (f"{B}\n   *** Add File: n2.txt\n+hi\n{E}\n", ["n2.txt"]),
     (f"{B}\n*** Add File: n3.txt   \n+hi\n{E}\n", ["n3.txt"]),
-    (f"{B}\n\t*** Add File: n4.txt\n+hi\n{E}\n", ["n4.txt"]),
     (f"{B}\n*** Add File:  n7.txt\n+hi\n{E}\n", [" n7.txt"]),          # Codex wrote ' n7.txt' too
-    (f"{B}\n *** Add File: n8.txt\n+hi\n{E}\n", ["n8.txt"]),
-    (f"{B}\n　*** Add File: n9.txt\n+hi\n{E}\n", ["n9.txt"]),
     (f"{B}\r\n*** Add File: crlf.txt\r\n+hi\r\n{E}\r\n", ["crlf.txt"]),
     (f"<<'EOF'\n{B}\n*** Add File: hd.txt\n+hi\n{E}\nEOF\n", ["hd.txt"]),
     (f"{B}\n*** Add File: h1.txt\n+hi\n  *** Add File: h2.txt\n+x\n{E}\n", ["h1.txt", "h2.txt"]),
@@ -310,3 +312,75 @@ def test_an_unreadable_patch_queues_even_inside_the_write_list(world):
     contract, root = world
     d = grant_decision(contract, "codex", "apply_patch", cx("src/a.py x"), root=root)
     assert isinstance(d, Queue) and "not read whole" in d.reason
+
+
+# --- L3 r1 (W2C1_L3_r1_TRIAGE.md A-E) ----------------------------------------------------------------------------
+
+def test_e_the_patch_rule_has_one_copy():
+    from levain.dispatch import grant
+    assert not hasattr(grant, "_patch_readable") and not hasattr(grant, "_PATCH_UNREADABLE")
+
+
+def test_a_an_ancestor_of_the_root_swapped_for_a_symlink_is_refused(world, tmp_path, monkeypatch):
+    contract, root = world
+    base = os.path.realpath(tmp_path)
+    os.symlink(os.path.dirname(root), os.path.join(base, "alias"))
+    aliased = os.path.join(base, "alias", os.path.basename(root))
+    assert os.path.isfile(os.path.join(aliased, "src/a.py"))         # the alias reaches the very file
+    assert "worktree root" in no_follow_check(aliased, "src/a.py", new_ok=False)
+    d = grant_decision(contract, "claude_code", "Write", cc(aliased, "src/a.py"), root=aliased)
+    assert isinstance(d, Queue) and "worktree root" in d.reason
+    # the walk from "/" refuses it on its own, without the canonical-root precheck
+    monkeypatch.setattr(os.path, "realpath", lambda p, **_: p)
+    assert "alias is not a plain directory" in no_follow_check(aliased, "src/a.py", new_ok=False)
+
+
+@pytest.mark.parametrize("bad_root", ["relative/root", "/a/../b", "/a/b/", "", 7])
+def test_a_the_walk_takes_only_a_canonical_root(world, bad_root):
+    assert "worktree root" in no_follow_check(bad_root, "src/a.py", new_ok=True)
+
+
+def test_b_deep_nesting_and_a_lone_surrogate_are_not_read(world):
+    contract, root = world
+    deep: list = []
+    for _ in range(100_000):
+        deep = [deep]
+    for content in (deep, "\ud800"):
+        assert grant_paths("claude_code", "Write", {"file_path": "/w/a", "content": content}, "/w") is None
+        d = grant_decision(contract, "claude_code", "Write", {**cc(root, "src/a.py"), "content": content}, root=root)
+        assert isinstance(d, Queue) and "not read whole" in d.reason
+
+
+class _Hostile(dict):
+    def __iter__(self):
+        raise RuntimeError("no keys")
+
+
+def test_b_any_exception_from_a_pure_step_queues(world):
+    contract, root = world
+    d = grant_decision(contract, "claude_code", "Write", _Hostile(cc(root, "src/a.py")), root=root)
+    assert d == Queue("the call could not be read: RuntimeError")
+
+
+@pytest.mark.parametrize("agent,tool", [(["codex"], "apply_patch"), ("codex", ["apply_patch"]), ({"codex"}, "Write"),
+                                        ("codex", {"Write"}), (None, "Write"), ("codex", 7)])
+def test_c_a_non_string_agent_or_tool_queues(world, agent, tool):
+    contract, root = world
+    d = grant_decision(contract, agent, tool, cx("src/a.py"), root=root)
+    assert isinstance(d, Queue) and "agent and tool name" in d.reason
+    assert grant_paths(agent, tool, cx("src/a.py"), root) is None
+
+
+def test_d_a_nul_is_refused_before_any_io(world, monkeypatch):
+    contract, root = world
+    assert "NUL" in no_follow_check(root, "src/a\x00.py", new_ok=True)
+    assert "NUL" in no_follow_check(root + "\x00x", "src/a.py", new_ok=True)
+    d = grant_decision(contract, "claude_code", "Write", cc(root + "\x00x", "src/a.py"), root=root + "\x00x")
+    assert isinstance(d, Queue) and "worktree root" in d.reason
+
+    def no_io(*_a, **_k):
+        raise AssertionError("I/O before the NUL check")
+    monkeypatch.setattr(os, "open", no_io)
+    monkeypatch.setattr(os, "stat", no_io)
+    monkeypatch.setattr(os.path, "realpath", no_io)
+    assert "NUL" in no_follow_check(root, "src/\x00", new_ok=True)
