@@ -630,3 +630,72 @@ def test_a_broker_rate_limiting_the_first_request_files_it_on_the_retry(adapter,
         assert srv.requests == 2
     finally:
         srv.close()
+
+
+# --- F9: halted and over-limit driven through slot_gate, both adapters, a real broker on a real socket -----------
+
+def _ungated(adapter, ws, n=0):
+    return cc_event(ws, path="notes.txt", tool_use_id=f"u{n}") if adapter == "cc" \
+        else cx_event(ws, gated=False, tool_use_id=f"u{n}")
+
+
+def _denied_with(adapter, out, words):
+    hook = out["hookSpecificOutput"]
+    assert hook["permissionDecision"] == "deny" and words in hook["permissionDecisionReason"]
+    if adapter == "cc":                                         # Claude Code: the turn ends too
+        assert out["continue"] is False and out["stopReason"] == cc.SLOT_STOP_REASON
+
+
+@pytest.mark.parametrize("adapter", ["cc", "codex"])
+def test_slot_gate_denies_every_call_of_a_session_halted_on_an_unanswered_irreversible_call(adapter, L, slot, ws,
+                                                                                            tmp_path):
+    kw = kw_of(adapter, tmp_path)
+    out = gate_of(adapter)(event_of(adapter, ws), hold=0.6, **kw)    # filed at the halt tier, no answer
+    assert "UNDECIDED" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    (rid,) = rows(L)
+    time.sleep(0.2)                                                   # past the row's own hold
+    _denied_with(adapter, gate_of(adapter)(_ungated(adapter, ws), hold=HOLD, **kw), f"halted on request {rid}")
+    before = rows(L)
+    _denied_with(adapter, gate_of(adapter)(event_of(adapter, ws, tool_use_id="g2"), hold=HOLD, **kw), "halted")
+    assert rows(L) == before                                          # denied before it is filed
+
+
+@pytest.fixture
+def limited_slot(L, monkeypatch, tmp_path):
+    """``slot`` with a limits source: calls 2 for every agent."""
+    run_dir = Path(tempfile.mkdtemp(prefix="bl", dir="/tmp"))
+    resolver = FakeResolver()
+    resolver.add(1, CAP, SESSION)
+    broker = Broker(QueueStore(L / "queue"), resolver, SignersSource(L / "policy", L / "routes" / "trust.pub"),
+                    limits=lambda agent, session: {"calls": 2})
+    lst = SlotListener(broker, 1, run_dir / "q.sock", os.getuid(), expected_gid=bound_gid(run_dir))
+    lst.start()
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "CLAUDE_PROJECT_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "home" / ".levain"))
+    monkeypatch.setenv(broker_client.SOCKET_ENV, str(lst.path))
+    monkeypatch.setenv(broker_client.CAP_ENV, CAP)
+    try:
+        yield lst
+    finally:
+        lst.stop()
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("adapter", ["cc", "codex"])
+def test_slot_gate_denies_a_call_over_the_limit_with_the_slot_words(adapter, L, limited_slot, ws, tmp_path):
+    kw = kw_of(adapter, tmp_path)
+    assert [gate_of(adapter)(_ungated(adapter, ws, n), hold=HOLD, **kw) for n in range(2)] == [None, None]
+    out = gate_of(adapter)(_ungated(adapter, ws, 3), hold=HOLD, **kw)
+    _denied_with(adapter, out, "reached its tool calls limit")
+    assert "limits settings" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "levain limits extend" not in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert rows(L) == []
+
+
+@pytest.mark.parametrize("adapter", ["cc", "codex"])
+def test_slot_gate_denies_when_the_limits_gate_failed(adapter, L, limited_slot, ws, tmp_path):
+    (L / "queue" / "requests" / "limits").write_text("not a dir\n")
+    out = gate_of(adapter)(_ungated(adapter, ws), hold=HOLD, **kw_of(adapter, tmp_path))
+    _denied_with(adapter, out, "the limits gate could not run")
