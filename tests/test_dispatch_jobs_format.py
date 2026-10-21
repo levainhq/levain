@@ -1,11 +1,13 @@
-"""The dispatch job store's format: a store written by Levain 0.11.10 (format /1) or 0.11.12 (format /2) is migrated
-in place to /3 when this code opens it, keeping its jobs, and a Levain that knows only an older format refuses a newer
-store.
+"""The dispatch job store's format: a store written by Levain 0.11.10 (format /1), 0.11.12 (format /2) or 0.11.13
+(format /3) is migrated in place to /4 when this code opens it, keeping its jobs, and a Levain that knows only an older
+format refuses a newer store.
 
 The /1 store is made by this module's own schema with F11's and W2-a's statements left out, which is 0.11.10's schema
 exactly (`diff <(git show v0.11.10:levain/dispatch/jobs.py | sed -n '/^_SCHEMA = (/,/^)/p') <(sed -n
 '/^_SCHEMA = (/,/^)/p' levain/dispatch/jobs.py)` prints only the authorise_signatures and run_records lines); the /2
-store leaves out W2-a's alone, 0.11.12's schema (the same diff against v0.11.12 prints only the run_records lines).
+store leaves out W2-a's alone, 0.11.12's schema (the same diff against v0.11.12 prints only the run_records lines);
+the /3 store leaves out only F11-C's envelope tables, 0.11.13's schema (the same diff against v0.11.13 prints only the
+job_envelopes and job_threads lines).
 A real 0.11.12 store opened by this code, and refused by 0.11.12 once migrated, is the W2-a run
 (project_memory/1020-f11/w2a_run/RUN.txt)."""
 from __future__ import annotations
@@ -20,10 +22,11 @@ from tests.test_dispatch_jobs import at_state, clock, new_store, repo  # noqa: F
 
 V1 = "levain-dispatch-jobs/1"
 V2 = "levain-dispatch-jobs/2"
-# the envelope binding (F11-C) joined /3 unreleased: neither 0.11.10 nor 0.11.12 had it
+V3 = "levain-dispatch-jobs/3"
+# the envelope binding (F11-C) is /4's: 0.11.10, 0.11.12 and 0.11.13 had none of it
 F11C = ("job_envelopes", "job_threads")
-V3_PRE_F11C_SCHEMA = tuple(s for s in djobs._SCHEMA if not any(t in s for t in F11C))
-V2_SCHEMA = tuple(s for s in V3_PRE_F11C_SCHEMA if "run_records" not in s)
+V3_SCHEMA = tuple(s for s in djobs._SCHEMA if not any(t in s for t in F11C))
+V2_SCHEMA = tuple(s for s in V3_SCHEMA if "run_records" not in s)
 V1_SCHEMA = tuple(s for s in V2_SCHEMA if "authorise_signatures" not in s)
 
 
@@ -71,7 +74,7 @@ def test_a_0_11_10_store_is_migrated_in_place_and_keeps_its_jobs(tmp_path, clock
     again = store.get(job.id)
     assert again is not None and again.state == "verified" and again.digest == job.digest
     names, fmt = tables(path)
-    assert fmt == djobs.FORMAT == "levain-dispatch-jobs/3" and {"authorise_signatures", "run_records"} <= names
+    assert fmt == djobs.FORMAT == "levain-dispatch-jobs/4" and {"authorise_signatures", "run_records"} <= names
     # the migrated job takes /2's edges
     assert store._transition(job.id, "failed", "base_moved").state == "failed"
     # and opening it again changes nothing
@@ -98,11 +101,11 @@ def test_a_0_11_12_store_is_migrated_in_place_and_its_verifying_job_records_its_
     assert len(store.run_records(job.id)) == 1
 
 
-def test_a_v3_store_made_before_f11c_gains_the_envelope_binding_in_place(tmp_path, clock, monkeypatch, repo):
-    d, job = old_store(tmp_path, clock, monkeypatch, repo, djobs.FORMAT, V3_PRE_F11C_SCHEMA)
+def test_a_0_11_13_store_is_migrated_in_place_and_gains_the_envelope_binding(tmp_path, clock, monkeypatch, repo):
+    d, job = old_store(tmp_path, clock, monkeypatch, repo, V3, V3_SCHEMA)
     path = d / djobs.DB_NAME
     names, fmt = tables(path)
-    assert fmt == djobs.FORMAT and not set(F11C) & names
+    assert fmt == V3 and not set(F11C) & names
     store = JobStore(d, clock=clock)
     again = store.get(job.id)
     assert again is not None and again.history == job.history and again.envelope_id is None
@@ -123,16 +126,16 @@ def test_the_migration_leaves_meta_written_once(tmp_path, clock, monkeypatch, re
         conn.close()
 
 
-@pytest.mark.parametrize("known, migrates", [(V1, frozenset()), (V2, frozenset({V1}))])
-def test_a_levain_that_knows_only_an_older_format_refuses_a_v3_store(tmp_path, clock, monkeypatch, repo, known,
+@pytest.mark.parametrize("known, migrates", [(V1, frozenset()), (V2, frozenset({V1})), (V3, frozenset({V1, V2}))])
+def test_a_levain_that_knows_only_an_older_format_refuses_a_v4_store(tmp_path, clock, monkeypatch, repo, known,
                                                                      migrates):
     store = new_store(tmp_path, clock)
     at_state(store, repo, "verified")
-    # 0.11.10's and 0.11.12's check, verbatim in effect: a marker that is not its FORMAT and not one it migrates from
+    # 0.11.10's, 0.11.12's and 0.11.13's check, verbatim in effect: a marker that is not its FORMAT and not one it migrates from
     # is refused, naming both
     monkeypatch.setattr(djobs, "FORMAT", known)
     monkeypatch.setattr(djobs, "_MIGRATES_FROM", migrates)
-    with pytest.raises(JobStoreError, match=rf"store format 'levain-dispatch-jobs/3' is not '{known}'"):
+    with pytest.raises(JobStoreError, match=rf"store format 'levain-dispatch-jobs/4' is not '{known}'"):
         JobStore(store.directory, clock=clock).list()
 
 

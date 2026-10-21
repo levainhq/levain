@@ -102,15 +102,17 @@ __all__ = [
 ]
 
 DB_NAME = "dispatch.db"
-FORMAT = "levain-dispatch-jobs/3"
+FORMAT = "levain-dispatch-jobs/4"
 # the formats a store is migrated from IN PLACE when this code opens it, each by tables and triggers added beside
 # the old ones (CREATE ... IF NOT EXISTS) and its marker rewritten in the same transaction; no row is rewritten.
 # /2 added the human authorise item and the base_moved edges (F11), so a Levain that knows only /1 refuses the
 # store instead of misreading a job it cannot transition. /3 added the run records and the verifier_refused cause
-# (W2-a), so a Levain that knows only /2 refuses the store instead of misreading a run it has no table for. The
-# envelope binding (job_envelopes, job_threads and the envelope causes, F11-C) joined /3 before any release carried
-# /3, so no binary that knows /3 lacks them and the marker did not move again
-_MIGRATES_FROM = frozenset({"levain-dispatch-jobs/1", "levain-dispatch-jobs/2"})
+# (W2-a), so a Levain that knows only /2 refuses the store instead of misreading a run it has no table for. /4 added
+# the envelope binding (job_envelopes, job_threads and the envelope causes, F11-C): 0.11.13 shipped /3 without it
+# and, run against a store holding an envelope job, read that job as a plain signed one and let its own private
+# edge walk take it to running with no envelope check (measured on 0.11.13 from PyPI), so a Levain
+# that knows only /3 now refuses the store instead
+_MIGRATES_FROM = frozenset({"levain-dispatch-jobs/1", "levain-dispatch-jobs/2", "levain-dispatch-jobs/3"})
 # how long an unsigned contract holds its write files before it lapses
 UNSIGNED_LEASE = timedelta(minutes=30)
 # how far a signature's signed_at may run ahead of the store's clock (the signer's clock is its own)
