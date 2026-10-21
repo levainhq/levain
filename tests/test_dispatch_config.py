@@ -516,7 +516,8 @@ def test_resolvers_says_nothing_was_filed_for_every_store_fault(capsys, ddir, ro
     def faulted(self):
         raise fault
 
-    monkeypatch.setattr(ctl.ControlStore, "active", faulted)
+    # the one verified read (ControlStore._read) under every reader: resolvers reads the store once, every kind
+    monkeypatch.setattr(ctl.ControlStore, "_read", faulted)
     with pytest.raises(ctl.ControlStateUnavailable, match="nothing was filed"):
         dcli.resolvers(ddir, root)
 

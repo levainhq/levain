@@ -2504,7 +2504,9 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
                                "`tailscale serve` line. Changes nothing in Tailscale itself.")
     cs_phone.add_argument("--port", type=int, default=None,
                           help=f"The loopback port (default {_phone_port_default()}).")
-    cs_phone.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, help=queue_help)
+    cs_phone.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
+                          help=queue_help + " Dispatch jobs are read from the same directory: file them with "
+                          "`levain dispatch --dispatch-dir` set to it.")
     cs_phone.add_argument("--sign-namespace", dest="sign_namespaces", action="append", default=None,
                           type=_sign_namespace, metavar="NS",
                           help="Also list the sign requests filed in the queue's sign/ directory in namespace NS "

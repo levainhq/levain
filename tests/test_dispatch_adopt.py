@@ -3,7 +3,9 @@ records on REAL git repositories in tmp (real keys in a real authority log, a re
 Every git fact is read back from the repository, never assumed."""
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 import subprocess
 from datetime import timedelta
 from pathlib import Path
@@ -950,6 +952,224 @@ def test_a_job_that_ends_during_a_land_is_refused_never_raised(when, jstore, cst
                onto="main", rules=lambda: adoption_rules_at(cstore))
     assert out.outcome == "refused", out.message
     assert git(repo[0], "rev-parse", "main") == repo[1]
+
+
+# --- F11-s2b: the world the verbs land in -----------------------------------------------------------------------
+
+class LandWorld:
+    """What the land verbs bind from (F11-s2b §0), all real: a cockpit authority log with an ssh laptop key
+    (laptop-presence), a consent directory 0700 whose claude_code.json names that cockpit and which holds the
+    dispatch store, a signed control store there (verifiers, template, policy, one adoption rule onto main), and a git
+    repo whose ``work`` is checked out (main is not). Jobs are filed on the store's real clock, walked to
+    ``verifying`` by the private edge writer (no public writer yet) and verified through the REAL
+    :meth:`JobStore.record_verification` (fixture envelope bytes, as the verifier-report tests build them)."""
+
+    def __init__(self, tmp: Path, *, rule: bool = True) -> None:
+        import json
+
+        from tests.test_consent_queue import Key, Log
+        from tests.test_dispatch_contract import POLICY
+        from tests.test_dispatch_control import VERIFIERS, tmpl
+
+        tmp = Path(os.path.realpath(tmp))
+        self.tmp = tmp
+        self.keys = {"laptop": Key(tmp, "laptop")}
+        self.root = tmp / "cockpit"
+        self.root.mkdir()
+        self.log = Log(self.root, self.keys)
+        self.log.enrol("laptop", "laptop-presence")
+        self.ddir = tmp / "consent"
+        self.ddir.mkdir(mode=0o700)
+        os.chmod(self.ddir, 0o700)
+        (self.ddir / "claude_code.json").write_text(json.dumps({"cockpit_data_root": str(self.root),
+                                                                "away_mode": False, "away_hold_seconds": 0}))
+        self.repo = tmp / "repo"
+        self.repo.mkdir()
+        git(self.repo, "init", "-q", "-b", "main")
+        git(self.repo, "config", "commit.gpgsign", "false")
+        (self.repo / "src").mkdir()
+        (self.repo / "src/a.py").write_text("a = 1\n")
+        (self.repo / "src/b.py").write_text("b = 2\nc = 3\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "base")
+        git(self.repo, "checkout", "-q", "-b", "work")
+        ctl.ControlStore.init(self.ddir, self.keys["laptop"].fp, authority=self.log.source)
+        self.cstore = ctl.ControlStore(self.ddir, authority=self.log.source)
+        accept(self.cstore, self.log, self.keys, "verifier", 1, VERIFIERS)
+        accept(self.cstore, self.log, self.keys, "templates", 2, [tmpl()])
+        accept(self.cstore, self.log, self.keys, "provider_policy", 3, POLICY.to_mapping())
+        if rule:
+            accept(self.cstore, self.log, self.keys, "adoption_rules", 4, [rule_body(self.repo)])
+        self.jstore = JobStore(self.ddir)
+
+    def main(self) -> str:
+        return git(self.repo, "rev-parse", "main")
+
+    def refs(self, job_id: str = "") -> list[str]:
+        return git(self.repo, "for-each-ref", "--format=%(refname)",
+                   f"refs/heads/levain/dispatch/{job_id + '/' if job_id else ''}").split()
+
+    def file(self, *, write=("src/a.py", "src/b.py", "src/new.py"), session="sess-1", agent="claude_code"):
+        from datetime import datetime, timezone
+
+        sub = {"template": "fix-lint", "goal": "Fix a.", "read": ["src/a.py", "src/b.py"], "write": list(write),
+               "base": self.main(), "budget": {"tool_calls": 40, "tokens": 200000, "dollars_cents": 150},
+               "grant": ["Edit", "Write"], "expires_at": utc_stamp(datetime.now(timezone.utc) + timedelta(hours=2)),
+               "repo": str(self.repo)}
+        return self.jstore.file(sub, resolve_template=resolver(self.cstore), policy=active_policy(self.cstore),
+                                filer_session=session, filer_agent=agent)
+
+    def verify(self, job_id: str, change: dict, *, results=("pass", "pass")):
+        from datetime import datetime, timezone
+
+        from tests import test_dispatch_verifier_report as tvr
+
+        job = self.jstore.get(job_id)
+        for to, cause in (("signed", "signature"), ("running", "slot_taken"), ("verifying", "runs_exited")):
+            job = self.jstore._transition(job.id, to, cause)
+        tree = make_tree(self.repo, job.contract.base, change, self.tmp)
+        for run, result in enumerate(results):
+            from levain.dispatch.verifier_report import VerifierRun
+            from tests import test_dispatch_control as tc
+
+            # the template signs control's BB_ENTRY (one step), so the run carries that entry without the registry-only fields
+            e = {k: v for k, v in tc.BB_ENTRY.items() if k not in ("steps", "driver_input")}
+            r = VerifierRun(job_id=job.id, run=run, session=f"v-{run}", ticket=f"t-{run}", verifier=e,
+                            steps=tuple(tc.BB_ENTRY["steps"]), driver_input_digest=e["driver_input_digest"],
+                            input_bundle_digest="sha256:" + "e" * 64)
+            raw, digest = tvr.envelope(r, tvr.body((result,)))
+            job = self.jstore.record_verification(
+                r, envelope=raw, event=tvr.event(r, at=utc_stamp(datetime.now(timezone.utc)),
+                                                 verifier_report_digest=digest),
+                repo=str(self.repo), tree=tree,
+                model={"requested": "glm-5", "answered": "glm-5", "backend_identity": f"backend-{run}"})
+        return job
+
+    def verified(self, change=None, **kw):
+        job, cap = self.file(**kw)
+        return self.verify(job.id, change or A_FIX), cap
+
+
+@pytest.fixture
+def world(tmp_path):
+    return LandWorld(tmp_path)
+
+
+def test_the_authorise_payload_is_built_from_the_stores_own_record(world):
+    job, _cap = world.verified()
+    fp = world.keys["laptop"].fp
+    payload = adopt.authorise_payload_for(world.jstore, job.id, run=1, onto="main", signer_fp=fp)
+    record = world.jstore.run_record(job.id, 1)
+    assert payload["artifact_digest"] == artifact_digest(record) and payload["run"] == "1"
+    assert payload["contract_digest"] == job.digest and payload["onto"] == "main" and payload["signer_fp"] == fp
+    assert payload["store_id"] == job.store_id and payload["job_id"] == job.id
+    assert set(payload) == adopt.AUTHORISE_KEYS
+
+
+@pytest.mark.parametrize("run, onto, match", [
+    (2, "main", "has no verified record"), (-1, "main", "integer from 0 to 63"), (True, "main", "integer"),
+    (0, "refs/heads/main", "bare name"), (0, "levain/x", "under levain/"), (0, "nope", "not a branch here"),
+])
+def test_the_authorise_payload_is_refused_before_anything_is_signed(world, run, onto, match):
+    from levain.dispatch import DispatchError
+
+    job, _cap = world.verified()
+    with pytest.raises(DispatchError, match=match):
+        adopt.authorise_payload_for(world.jstore, job.id, run=run, onto=onto, signer_fp=world.keys["laptop"].fp)
+
+
+def test_the_authorise_payload_needs_a_verified_job(world):
+    from levain.dispatch.jobs import TransitionRefused
+
+    job, _cap = world.file()
+    with pytest.raises(TransitionRefused, match="only a verified or recommended job"):
+        adopt.authorise_payload_for(world.jstore, job.id, run=0, onto="main", signer_fp=world.keys["laptop"].fp)
+
+
+def test_the_sweep_deletes_the_staged_refs_of_jobs_that_ended_without_an_adoption(world):
+    cancelled, cap = world.verified()
+    world.jstore.cancel_by_planner(cancelled.id, cap)
+    live, _ = world.verified({"src/b.py": b"b = 9\nc = 3\n"}, write=("src/b.py",))
+    assert len(world.refs(cancelled.id)) == 2 and len(world.refs(live.id)) == 2
+    assert adopt.sweep_staged(world.jstore, str(world.repo)) == []
+    assert world.refs(cancelled.id) == [] and len(world.refs(live.id)) == 2        # a live job keeps its refs
+    git(world.repo, "update-ref", "refs/heads/levain/dispatch/dj-" + "0" * 32 + "/r0", world.main())
+    assert adopt.sweep_staged(world.jstore, str(world.repo)) == []
+    assert world.refs("dj-" + "0" * 32) != []                                     # a job this store does not hold
+
+
+def test_the_sweep_reports_a_ref_git_keeps_and_never_raises(world, monkeypatch):
+    cancelled, cap = world.verified()
+    world.jstore.cancel_by_planner(cancelled.id, cap)
+    real = adopt._git
+
+    def refusing(repo, *args, **kw):
+        if args[:1] == ("update-ref",):
+            return subprocess.CompletedProcess(args, 1, b"", b"no")
+        return real(repo, *args, **kw)
+
+    monkeypatch.setattr(adopt, "_git", refusing)
+    kept = adopt.sweep_staged(world.jstore, str(world.repo))
+    assert len(kept) == 2 and all("would not delete" in k for k in kept)
+    monkeypatch.setattr(adopt, "_git", lambda *a, **k: (_ for _ in ()).throw(adopt.GitFault("git is gone")))
+    assert adopt.sweep_staged(world.jstore, str(world.repo)) == [
+        f"the staged refs in {world.repo} could not be swept: git is gone"]
+    assert adopt.sweep_staged(world.jstore, str(world.tmp / "no-such-repo")) == []
+
+
+@pytest.mark.parametrize("fault", [sqlite3.OperationalError("database is locked"), OSError("disk I/O error")])
+def test_the_sweep_says_a_store_it_cannot_read_and_never_raises(world, monkeypatch, fault):
+    # L3 r1 B (complement + codex + glm): the sweep runs after an adoption is durable, so its own read never raises
+    from levain.dispatch.jobs import JobStoreError
+
+    cancelled, cap = world.verified()
+    world.jstore.cancel_by_planner(cancelled.id, cap)
+    for exc in (fault, JobStoreError("a stored row does not match its digest")):
+        monkeypatch.setattr(world.jstore, "list", lambda *a, _e=exc, **k: (_ for _ in ()).throw(_e))
+        (line,) = adopt.sweep_staged(world.jstore, str(world.repo))
+        assert line.startswith(f"the ended jobs in {world.repo} could not be read") and type(exc).__name__ in line
+    assert len(world.refs(cancelled.id)) == 2                                    # nothing was deleted blind
+
+
+def _land_by_rule(world, job):
+    return land(world.jstore, job.id, landing_tier=T2, resolve_template=resolver(world.cstore),
+                policy=active_policy(world.cstore), onto="main", rules=lambda: adoption_rules_at(world.cstore))
+
+
+def test_the_sweep_deletes_an_adopted_jobs_refs_once_its_branch_contains_the_landed_commit(world):
+    # F11-s2b §9(3): the landed commit is kept by the branch; the staged refs are clutter once it holds it
+    job, _cap = world.verified()
+    base = world.main()
+    out = _land_by_rule(world, job)
+    assert out.outcome == "adopted" and len(world.refs(job.id)) == 2           # land itself sweeps nothing
+    git(world.repo, "update-ref", "refs/heads/main", base)                       # the branch no longer holds it
+    assert adopt.sweep_staged(world.jstore, str(world.repo)) == []
+    assert len(world.refs(job.id)) == 2                                          # kept: the refs still hold it
+    git(world.repo, "update-ref", "refs/heads/main", json.loads(out.job.history[-1].evidence)["landed"])
+    assert adopt.sweep_staged(world.jstore, str(world.repo)) == []
+    assert world.refs(job.id) == []
+
+
+def test_a_control_store_that_cannot_be_read_during_a_rule_land_is_a_fault(world):
+    # F11-s2b §9(2): ControlStateUnavailable is a DispatchError, and the floor's refusal must not swallow it
+    from levain.dispatch import DispatchError
+
+    job, _cap = world.verified()
+    put_rules = dict(landing_tier=T2, resolve_template=resolver(world.cstore), policy=active_policy(world.cstore),
+                     onto="main")
+
+    def unreadable():
+        raise ctl.ControlStateUnavailable("the control store cannot be read: disk I/O error")
+
+    with pytest.raises(ctl.ControlStateUnavailable, match="disk I/O error"):
+        land(world.jstore, job.id, rules=unreadable, **put_rules)
+    assert world.jstore.get(job.id).state == "verified"
+
+    def no_longer_holding():
+        raise DispatchError("the active adoption rules no longer hold: a template is gone")
+
+    out = land(world.jstore, job.id, rules=no_longer_holding, **put_rules)
+    assert out.outcome == "refused" and "the adoption rules cannot be read: the active adoption rules" in out.message
 
 
 @pytest.mark.parametrize("winner", ["authorised", "adopted", "base_moved"])
