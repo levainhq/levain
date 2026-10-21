@@ -6,12 +6,18 @@ them) and writes only ``answers/<request_id>.json``:
 - :func:`rows`: every ``pend-*.json`` request row whose seal holds (any other name, a ``grant-*.json`` among them,
   is skipped). A row is labelled by its ``session`` / ``slot`` / ``kind`` / ``run``, which the broker took from
   CONTROL; the request's ``agent``, ``agent_session_id``, ``cwd`` and ``display`` are the hook's own claims and are
-  returned under ``claims``, never as identity. Its state is the last one the broker's receipts record for it
-  (a decision the broker accepted reads settled), ``expired`` once the hold has ended with none.
-- :func:`answer_payload`: the record to sign, over the broker's current receipts head (never one of size 0).
-- :func:`write_answer`: the signed answer row, checked first with :func:`levain.qbroker.seam.answer_refusal` and the
-  head against the receipts as they stand, then linked no-replace, mode 0640: an answer that fails either check is
-  never written, since nothing can replace it once it is there.
+  returned under ``claims``, never as identity. A row whose broker labels are not the shape the broker writes is
+  skipped. Its state is the last one the broker's receipts record for it (a decision the broker accepted reads
+  settled), ``expired`` once the hold has ended with none, and ``filing`` while it has no receipt at all: such a row
+  is not answerable (the broker records no decision without the filing).
+- :func:`answer_payload`: the record to sign, over the broker's current receipts head (never one of size 0), for a
+  ``pending`` request only.
+- :func:`write_answer`: the signed answer row, for a ``pending`` request only, checked first with
+  :func:`levain.qbroker.seam.answer_refusal` and the head against the receipts as they stand (reaching the request's
+  filing receipt), then linked no-replace, mode 0640: an answer that fails any check is never written, since nothing
+  can replace it once it is there.
+
+A receipts log that cannot be read is :class:`OperatorError`.
 
 Stdlib only.
 """
@@ -27,6 +33,7 @@ from levain.cockpit.consent import ConsentError, utc_stamp
 from levain.consent import record
 from levain.contracts import ContractError
 from levain.contracts.canon import canonical_bytes, parse
+from levain.qbroker.broker import SLOT_CLASS, resolved_from
 from levain.qbroker.receipts import Receipts, ReceiptsError
 from levain.qbroker.seam import answer_refusal, request_of
 from levain.qbroker.signers import SignersSnapshot
@@ -72,14 +79,39 @@ def _open(root: Path | str) -> tuple[QueueStore, Receipts]:
 
 
 def _state(recorded: str | None, expires_at: str, stamp: str) -> str:
-    state = recorded or "pending"
-    return "expired" if state == "pending" and expires_at <= stamp else state
+    if recorded is None:
+        return "filing"
+    return "expired" if recorded == "pending" and expires_at <= stamp else recorded
+
+
+def _recorded(receipts: Receipts, request_id: str | None = None) -> Any:
+    try:
+        return receipts.states() if request_id is None else receipts.state(request_id)
+    except ReceiptsError as exc:
+        raise OperatorError(str(exc)) from None
+
+
+def _labelled(row: Mapping[str, Any]) -> bool:
+    """Whether the row's broker labels are the shape the broker writes (``slot`` a ``{class, index}``)."""
+    slot = row.get("slot")
+    if not isinstance(slot, Mapping) or set(slot) != {"class", "index"} or slot["class"] != SLOT_CLASS \
+            or type(slot["index"]) is not int:
+        return False
+    return resolved_from({"session": row.get("session"), "kind": row.get("kind"), "run": row.get("run")}) is not None
+
+
+def _pending(receipts: Receipts, request: record.ExternalGateRequest, stamp: str) -> None:
+    state = _state(_recorded(receipts, request.id), request.expires_at, stamp)
+    if state == "filing":
+        raise OperatorError(f"request {request.id} has no filing receipt yet: the broker records no answer for it")
+    if state != "pending":
+        raise OperatorError(f"request {request.id} is already {state}")
 
 
 def rows(root: Path | str, *, now: datetime | None = None) -> list[Listed]:
     """Every request row in the broker's queue at ``root`` (``L/queue``), oldest first."""
     store, receipts = _open(root)
-    recorded = receipts.states()
+    recorded = _recorded(receipts)
     stamp = utc_stamp(_now(now))
     out = []
     for path in store.requests.iterdir():
@@ -92,8 +124,7 @@ def rows(root: Path | str, *, now: datetime | None = None) -> list[Listed]:
         except (ValueError, OSError):
             continue
         request = None if row is None else request_of(row.get("request"))
-        if request is None or request.id != rid or row.get("queue_id") != store.queue_id \
-                or not isinstance(row.get("session"), str) or not isinstance(row.get("slot"), Mapping):
+        if request is None or request.id != rid or row.get("queue_id") != store.queue_id or not _labelled(row):
             continue
         out.append(Listed(
             request_id=rid, session=row["session"], slot=dict(row["slot"]), kind=row.get("kind"),
@@ -123,9 +154,7 @@ def answer_payload(root: Path | str, request_id: str, decision: str, signer_fp: 
     store, receipts = _open(root)
     _, request = _request(store, request_id)
     stamp = utc_stamp(_now(now))
-    state = _state(receipts.state(request_id), request.expires_at, stamp)
-    if state != "pending":
-        raise OperatorError(f"request {request_id} is already {state}")
+    _pending(receipts, request, stamp)
     try:
         head = receipts.head()
     except ReceiptsError as exc:
@@ -144,14 +173,15 @@ def write_answer(root: Path | str, request_id: str, payload: Mapping[str, Any], 
                  ssh_keygen: Path | str | None = None) -> Path:
     """Write the signed answer row for ``request_id`` once the broker would accept it now; its path."""
     store, receipts = _open(root)
-    row, _ = _request(store, request_id)
+    row, request = _request(store, request_id)
+    _pending(receipts, request, utc_stamp(_now(now)))
     try:
         payload = parse(canonical_bytes(dict(payload)))   # one detached copy: checked and written alike
     except (ContractError, TypeError, ValueError) as exc:
         raise OperatorError(f"the answer is not a record ({exc})") from None
     why = answer_refusal(row, payload, signature, signers, _now(now), ssh_keygen=ssh_keygen)
     if why is None:
-        why = receipts.head_refusal(payload["receipts_head"])
+        why = receipts.head_refusal(payload["receipts_head"], request_id)
     if why is not None:
         raise OperatorError(why)
     data = canonical_bytes({"format": ANSWER_ROW_FORMAT, "payload": payload, "signature": signature})

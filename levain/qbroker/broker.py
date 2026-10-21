@@ -15,7 +15,10 @@ serial poll storm costs one verify and one CONTROL round trip; concurrent misses
 the trip, bounded by the slot's rate (a REQUEST whose resolve misses the cache is charged to it too). One filing
 per request id runs at a time, so identical REQUESTs on several connections link one row and charge it once.
 Every transition the broker makes leaves one receipt in those receipts: filed (a new row), decided (the
-first accepted answer), expired (an ANSWER? past the hold with nothing decided). No verb accepts an answer, a grant
+first accepted answer), expired (an ANSWER? past the hold with nothing decided). Before it listens, the broker files
+the ``pending`` receipt of every stored row that has none (a row linked before a crash or an upgrade), and a decision
+or expiry for a row with no ``pending`` receipt is refused ``broker-error``, nothing cached. Known edge: each
+ANSWER? past the hold opens the receipts once to read the state; the slot's rate bounds it. No verb accepts an answer, a grant
 answer or a row from a hook. Every other op is ``verb-not-allowed``. The cap is hashed on arrival and never logged or
 written. Stdlib only.
 """
@@ -160,7 +163,11 @@ class Broker:
         self._refused: OrderedDict[tuple[int, str], tuple[float, Resolved | str]] = OrderedDict()
         self._verdicts: OrderedDict[str, tuple[tuple[int, ...], SignersSnapshot | None, str | None]] = OrderedDict()
         now = utc_stamp(clock())
+        filed = []
         for row in store.rows():
+            request = request_of(row.get("request"))
+            if request is not None and row.get("queue_id") == store.queue_id:
+                filed.append(request)
             session, run = row.get("session"), row.get("run")
             if not isinstance(session, str) or (run is not None and not (
                     isinstance(run, Mapping) and isinstance(run.get("run_id"), str))):
@@ -172,6 +179,10 @@ class Broker:
             expires = request.get("expires_at") if isinstance(request, Mapping) else None
             if isinstance(expires, str) and expires > now and isinstance(request.get("id"), str):
                 self._pending.setdefault(session, {})[request["id"]] = expires
+        reconciled = self._receipts.reconcile(filed, now)
+        if reconciled:
+            log.warning("qbroker: %d stored row(s) had no filing receipt; their pending receipts are filed now",
+                        reconciled)
 
     def handle(self, slot: int, message: Mapping[str, Any]) -> dict[str, Any]:
         """The one answer to ``message`` from the hook on ``slot``'s socket."""
