@@ -747,6 +747,11 @@ class Request:
     auth: str = "brokered"       # brokered | passthrough
     kind: str = "interactive"    # interactive | login
     slot: Optional[int] = None
+    # A dispatch session's read set (a :class:`levain.dispatch.readset.ReadSet`, duck-typed here so the slot package
+    # takes no dispatch import): when given, the bundle is made from its ``repo_dir`` / ``branch``, never from the
+    # operator's repo clone. DECISION: the operator repo steps before the lease still run, so a dispatch caller names
+    # the repo it dispatches from; they gate the session and are not what the slot reads.
+    readset: Optional[Any] = None
 
 
 @dataclass
@@ -1149,7 +1154,9 @@ class Supervisor:
             self._check()
             from levain.slot.stage import make_bundle
 
-            make_bundle(clone, branch, staging / "repo.bundle", git=self.s.git, run=self.s.run,
+            rs = self.req.readset
+            src, src_branch = (clone, branch) if rs is None else (Path(rs.repo_dir), rs.branch)
+            make_bundle(src, src_branch, staging / "repo.bundle", git=self.s.git, run=self.s.run,
                         tmp_parent=self.s.tmp_parent)
             self._check()
             self.helper("render", session, stdin=blob)

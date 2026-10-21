@@ -352,3 +352,33 @@ def test_the_dispatch_session_env_has_no_operator_key_and_roots_under_the_slot()
     assert env["HOME"] == S or env["HOME"].startswith(S + "/")
     for k in ("TMPDIR", "XDG_DATA_HOME", "XDG_CACHE_HOME", "CODEX_HOME", "GIT_CONFIG_GLOBAL"):
         assert env[k].startswith(S)
+
+
+def test_a_dispatch_session_bundles_its_read_set_and_never_the_operators_repo(world, built, tmp_path, monkeypatch):
+    # Reproduced first: before the wiring Request had no read set, so the supervisor's bundle was the operator's
+    # clone (its README and whole history) whatever read set was built.
+    from levain.slot import stage
+    from tests.test_slot_s2s_supervisor import Rig
+
+    rs, _ = built
+    seen = []
+    real = stage.make_bundle
+
+    def spy(repo, branch, out, **kw):
+        seen.append((os.fspath(repo), branch))
+        real(repo, branch, out, **kw)
+        kept = tmp_path / "seen.bundle"
+        kept.write_bytes(Path(out).read_bytes())
+        return out
+
+    monkeypatch.setattr(stage, "make_bundle", spy)
+    rig = Rig(tmp_path, monkeypatch)
+    assert rig.run(readset=rs) == 0, rig.stderr()
+    assert seen == [(rs.repo_dir, rs.branch)]
+    clone = tmp_path / "slot"
+    subprocess.run(["git", "clone", "-q", str(tmp_path / "seen.bundle"), str(clone)], check=True, capture_output=True)
+    listed = git(clone, "rev-list", "--objects", "--all").splitlines()
+    paths = sorted(ln.split(" ", 1)[1] for ln in listed if " " in ln)
+    assert paths == ["", "src", "src/a.py", "src/run.sh"]                     # root tree, src, the two read blobs
+    assert len(listed) == 5                                                   # + the one commit; no README
+    assert git(clone, "log", "--format=%H").split() == [rs.commit]
