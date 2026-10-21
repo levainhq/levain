@@ -142,13 +142,14 @@ def home(monkeypatch):
 def store(tmp_path, monkeypatch):
     q = tmp_path / "consent"
     q.mkdir(mode=0o700)
-    work = tmp_path / "codex-install"
-    work.mkdir()
-    monkeypatch.setattr(cx, "hook_live", lambda d: (True, "wired to this install"))
+    monkeypatch.setattr(cx, "global_hook_live", lambda d: (True, "wired to this install"))
     monkeypatch.setattr(cx, "UNLISTED_RECHECK", 0.0)
+    # the coordinator's workspace, a directory Levain makes (head ruling 13): never the operator's own install
+    work, ready, detail = cx.setup(tmp_path / "coordinator-codex")
+    assert ready, detail
     s = CoordStore(q)
     # main refused this outright ("only claude is built"): C3c's reproduced failure (repro_main.txt)
-    s.coord_set_agent("codex", cwd=str(work.resolve()))
+    s.coord_set_agent("codex", cwd=str(work))
     return s
 
 
@@ -214,7 +215,7 @@ def test_setup_writes_the_codex_rule_the_briefs_own_commands_match_and_nothing_e
     work = Path(ln.cwd)
     target, live, detail = cx.setup(work)
     rules = work.joinpath(*inst.CODEX_COORDINATOR_RULES_REL)
-    assert live and rules.is_file() and "written" in detail, detail
+    assert live and rules.is_file() and inst.persisted_role(work) == "coordinator", detail
     pattern = json.loads(re.search(r"^    pattern = (.*),$", rules.read_text(encoding="utf-8"), re.M).group(1))
     *prefix, verbs = pattern
     commands = [shlex.split(c) for c in re.findall(r"`([^`]*-m levain [^`]*)`", brief)]
@@ -223,4 +224,62 @@ def test_setup_writes_the_codex_rule_the_briefs_own_commands_match_and_nothing_e
         assert argv[:len(prefix)] == prefix and argv[len(prefix)] in verbs, argv
     assert sorted(verbs) == sorted(inst.COORDINATOR_VERBS) and "drop" not in verbs
     rules.write_text("# the operator's own narrower rule\n", encoding="utf-8")
-    assert cx.setup(work)[1] and rules.read_text(encoding="utf-8") == "# the operator's own narrower rule\n"
+    assert not cx.setup(work)[1] and rules.read_text(encoding="utf-8") == "# the operator's own narrower rule\n"
+
+
+def test_a_starter_killed_between_turn_start_and_activation_leaves_a_turn_the_watcher_interrupts(home, store,
+                                                                                                monkeypatch):
+    # L3 r1 codex HIGH 2, reproduced: the starter SIGKILLed after turn/start and before activation left a running
+    # turn whose thread no row named, so nothing ever stopped it. A real SIGKILL, in a forked child: no finally runs.
+    import os
+    import signal
+    from datetime import datetime, timedelta, timezone
+
+    from levain.coordinator import lease
+
+    clock = [datetime.now(timezone.utc)]
+    monkeypatch.setattr(store, "_clock", lambda: clock[0])
+    daemon = FakeDaemon(home)
+    try:
+        launch_id = _woken(store)
+        pid = os.fork()
+        if pid == 0:                                     # the starter: killed outright as it would activate
+            try:
+                store.launch_activate = lambda *a, **k: os.kill(os.getpid(), signal.SIGKILL)
+                cl.launch_session(store, launch_id)
+            finally:
+                os._exit(3)
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL, status
+        (tid, th), = daemon.threads.items()
+        assert th["turns"][0]["status"] == "inProgress" and store.launch(launch_id).state == "pending"
+        assert cx.watch_once(store) == [] or th["turns"][0]["status"] == "inProgress"   # in flight: never stopped
+        clock[0] += lease.LAUNCH_TTL + timedelta(seconds=1)
+        store.coord_status()                             # the watcher's pass writes the expiry first
+        lines = cx.watch_once(store)
+        assert store.launch(launch_id).state == "expired"
+        assert th["turns"][0]["status"] == "interrupted", (lines, th)
+        assert any(launch_id in line and "interrupted" in line for line in lines), lines
+    finally:
+        daemon.close()
+
+
+def test_the_twenty_first_oldest_over_launch_is_still_inspected(home, store):
+    # L3 r1 codex HIGH 3, reproduced: the watcher read the newest 20 over launches every pass, so with 21 the oldest,
+    # its turn still running, was never inspected; a launch whose thread is seen finished leaves that list for good
+    daemon = FakeDaemon(home)
+    try:
+        ids = []
+        for _ in range(21):
+            launch_id = _woken(store)
+            assert cl.launch_session(store, launch_id).started
+            store.launch_end(launch_id, "ended", "done")
+            ids.append(launch_id)
+        for launch_id in ids[1:]:
+            daemon.threads[store.launch(launch_id).harness_session_id]["status"] = {"type": "idle"}
+        oldest = daemon.threads[store.launch(ids[0]).harness_session_id]
+        assert oldest["status"]["type"] == "active"
+        lines = cx.watch_once(store) + cx.watch_once(store)
+        assert oldest["turns"][0]["status"] == "interrupted", lines
+    finally:
+        daemon.close()

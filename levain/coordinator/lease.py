@@ -58,8 +58,9 @@ __all__ = [
     "BACKOFF", "HARNESSES", "LAUNCH_KINDS", "LAUNCH_TTL", "LEASE_KINDS", "LEASE_SCHEMA", "LEASE_TTL", "MAX_DEATHS",
     "ROLES", "SERVICE_BEAT_WINDOW", "SETTING_AGENTS", "Launch", "Lease", "LeaseRefused", "Setting", "activate", "beat",
     "check_model", "claim", "by_harness_session", "claim_spawn", "end_launch", "end_unlisted", "fence", "launch",
-    "lease", "launches", "over_with_session", "record_write", "release", "request_launch", "service_beat",
-    "set_agent", "setting", "status", "take", "unspawned", "wake", "wake_state",
+    "lease", "launches", "LaunchThread", "mark_swept", "over_unswept", "record_thread", "record_write", "release",
+    "request_launch", "service_beat", "set_agent", "setting", "status", "take", "thread_of", "unspawned", "wake",
+    "wake_state",
 ]
 
 LEASE_KINDS = ("claim", "beat", "release", "lapse", "takeover")
@@ -122,6 +123,24 @@ LEASE_SCHEMA: tuple[str, ...] = (
     # pid: the levain process that won the spawn (the session's own process is the harness's, known only after)
     "CREATE TABLE IF NOT EXISTS launch_spawns (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), "
     "gseq INTEGER NOT NULL UNIQUE, pid INTEGER NOT NULL, at TEXT NOT NULL)",
+    # a Codex start's thread, written by the process that won its spawn BEFORE the start counts as accepted (before
+    # its turn starts, and again with the turn's id once it has), with the daemon it runs on: a starter that dies
+    # before activation leaves a row that still names what to interrupt, and every later read or interrupt goes to
+    # the daemon recorded here, never to whatever CODEX_HOME a later process has
+    "CREATE TABLE IF NOT EXISTS launch_threads (seq INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "launch_id TEXT NOT NULL REFERENCES launches(launch_id), gseq INTEGER NOT NULL UNIQUE, thread_id TEXT NOT NULL, "
+    "turn_id TEXT, codex_home TEXT NOT NULL, socket TEXT NOT NULL, at TEXT NOT NULL)",
+    # a launch that is over whose session the watcher saw not running: it leaves the watcher's over list for good
+    "CREATE TABLE IF NOT EXISTS launch_sweeps (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), "
+    "gseq INTEGER NOT NULL UNIQUE, cause TEXT NOT NULL, at TEXT NOT NULL)",
+    *_append_only("launch_threads", "a launch thread"),
+    *_append_only("launch_sweeps", "a launch sweep"),
+    "CREATE TRIGGER IF NOT EXISTS launch_threads_no_replace BEFORE INSERT ON launch_threads WHEN EXISTS (SELECT 1 "
+    "FROM launch_threads WHERE seq = NEW.seq OR gseq = NEW.gseq) "
+    "BEGIN SELECT RAISE(ABORT, 'a launch thread is never replaced'); END",
+    "CREATE TRIGGER IF NOT EXISTS launch_sweeps_no_replace BEFORE INSERT ON launch_sweeps WHEN EXISTS (SELECT 1 "
+    "FROM launch_sweeps WHERE launch_id = NEW.launch_id OR gseq = NEW.gseq OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a launch is swept once'); END",
     *_append_only("coord_settings", "a coordinator setting"),
     *_append_only("launch_spawns", "a launch spawn"),
     "CREATE TRIGGER IF NOT EXISTS coord_settings_no_replace BEFORE INSERT ON coord_settings WHEN EXISTS (SELECT 1 "
@@ -194,6 +213,15 @@ class Launch:
     cause: str
     at: str
     pinned_envelope_id: str | None = None   # the envelope a one-thread worker was activated under (§3.4)
+
+
+@dataclass(frozen=True)
+class LaunchThread:
+    """A Codex launch's thread as its starter recorded it (:func:`record_thread`)."""
+    thread_id: str
+    turn_id: str | None
+    codex_home: str      # the daemon's own codexHome, as it answered initialize
+    socket: str          # its control socket
 
 
 @dataclass(frozen=True)
@@ -555,15 +583,69 @@ def _in_state(conn: sqlite3.Connection, state: str, role: str | None = None) -> 
     return [_launch_row(conn, "launch_id", r[0]) for r in rows.fetchall()]
 
 
-def over_with_session(conn: sqlite3.Connection, harness: str, *, limit: int = 20) -> list[Launch]:
-    """The newest ``limit`` launches of ``harness`` that went ``active`` (so recorded a harness session) and are over
-    (ended, failed, expired), newest first: what the watcher checks for a session still running."""
+def record_thread(conn: sqlite3.Connection, now: str, launch_id: str, pid: int, *, thread_id: str,
+                  turn_id: str | None, codex_home: str, socket: str) -> str | None:
+    """Record the thread (and, once started, the turn) the process ``pid`` started for ``launch_id``, inside the
+    caller's ``BEGIN IMMEDIATE``. Fenced as the spawn is: written only while the launch is ``pending``, before its
+    ``until``, under the live lease's token, with its spawn claimed by ``pid``, and only for the thread an earlier row
+    of this launch named. ``None`` once written, else why (and nothing written: the caller starts no turn)."""
+    ln = _must_launch(conn, launch_id)
+    for name, value in (("thread id", thread_id), ("codex home", codex_home), ("socket", socket)):
+        if _line(name, value) is None:
+            raise _refused(f"a launch thread records its {name}")
+    _line("turn id", turn_id)
+    if ln.state != "pending":
+        return f"launch {launch_id} is {ln.state}, not pending"
+    row = conn.execute("SELECT pid FROM launch_spawns WHERE launch_id = ?", (launch_id,)).fetchone()
+    if row is None or row[0] != pid:
+        return f"launch {launch_id}'s spawn is not this process's"
+    if now >= ln.until:
+        return f"launch {launch_id} was pending past {ln.until}"
+    held = _lapse_if_past(conn, now)
+    if held is None or held.token != ln.token:
+        return f"launch {launch_id} was asked for under lease token {ln.token}, which is no longer live"
+    had = thread_of(conn, launch_id)
+    if had is not None and (had.thread_id, had.codex_home, had.socket) != (thread_id, codex_home, socket):
+        return f"launch {launch_id} already recorded thread {had.thread_id}"
+    conn.execute("INSERT INTO launch_threads (launch_id, gseq, thread_id, turn_id, codex_home, socket, at) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 (launch_id, next_gseq(conn, now), thread_id, turn_id, codex_home, socket, now))
+    return None
+
+
+def thread_of(conn: sqlite3.Connection, launch_id: str) -> LaunchThread | None:
+    """The latest :func:`record_thread` row of ``launch_id``, or None."""
+    row = conn.execute("SELECT thread_id, turn_id, codex_home, socket FROM launch_threads WHERE launch_id = ? "
+                       "ORDER BY seq DESC LIMIT 1", (launch_id,)).fetchone()
+    return None if row is None else LaunchThread(*row)
+
+
+def over_unswept(conn: sqlite3.Connection, harness: str, *, limit: int = 20
+                 ) -> list[tuple[Launch, LaunchThread | None]]:
+    """Up to ``limit`` launches of ``harness`` that are over (ended, failed, expired), recorded a session (an
+    ``active`` row, or a thread its starter recorded before activation) and were not yet seen finished
+    (:func:`mark_swept`), oldest first, each with its recorded thread: what the watcher checks for a turn still
+    running. A launch leaves this list once marked, so the bound never hides an older one behind finished ones."""
     rows = conn.execute(
-        "SELECT l.launch_id FROM launches l WHERE l.harness = ? AND EXISTS (SELECT 1 FROM launch_events a WHERE "
-        "a.launch_id = l.launch_id AND a.kind = 'active') AND (SELECT e.kind FROM launch_events e WHERE e.launch_id = "
-        "l.launch_id ORDER BY e.seq DESC LIMIT 1) IN ('ended', 'failed', 'expired') ORDER BY l.gseq DESC LIMIT ?",
-        (harness, limit))
-    return [_launch_row(conn, "launch_id", r[0]) for r in rows.fetchall()]
+        "SELECT l.launch_id FROM launches l WHERE l.harness = ? AND (EXISTS (SELECT 1 FROM launch_events a WHERE "
+        "a.launch_id = l.launch_id AND a.kind = 'active') OR EXISTS (SELECT 1 FROM launch_threads t WHERE "
+        "t.launch_id = l.launch_id)) AND NOT EXISTS (SELECT 1 FROM launch_sweeps w WHERE w.launch_id = l.launch_id) "
+        "AND (SELECT e.kind FROM launch_events e WHERE e.launch_id = l.launch_id ORDER BY e.seq DESC LIMIT 1) "
+        "IN ('ended', 'failed', 'expired') ORDER BY l.gseq LIMIT ?", (harness, limit))
+    return [(_launch_row(conn, "launch_id", r[0]), thread_of(conn, r[0])) for r in rows.fetchall()]
+
+
+def mark_swept(conn: sqlite3.Connection, now: str, launch_id: str, cause: str) -> bool:
+    """Record that ``launch_id``, over, has no session left running (``cause`` says what was seen); False when it is
+    not over or was marked before."""
+    ln = _must_launch(conn, launch_id)
+    if ln.state not in ("ended", "failed", "expired"):
+        return False
+    if conn.execute("SELECT 1 FROM launch_sweeps WHERE launch_id = ?", (launch_id,)).fetchone() is not None:
+        return False
+    conn.execute("INSERT INTO launch_sweeps (launch_id, gseq, cause, at) VALUES (?, ?, ?, ?)",
+                 (launch_id, next_gseq(conn, now), _line("cause", cause) or "swept", now))
+    return True
 
 
 def _end_coordinators(conn: sqlite3.Connection, now: str, cause: str) -> None:

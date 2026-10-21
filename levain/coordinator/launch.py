@@ -27,10 +27,10 @@ A launch row (:mod:`levain.coordinator.lease`) is what was asked for; this modul
      session is stopped and the refusal returned.
 
 A ``codex`` launch is started by :func:`levain.coordinator.codex_launch.launch` instead, the same shape over the user's
-Codex app-server daemon (C3c). Only a coordinator launch is started (a worker's brief is not built). Once ``claude --bg`` returned 0, every way out
-of 5-6 that does not leave the launch active stops the sessions listed under its name in its directory, a Ctrl-C
-included; a process killed outright leaves its launch to expire, and the watcher stops the session by name then. Only
-the spawn runs in the launch's directory: ``claude agents`` and ``claude stop`` run in the store's.
+Codex app-server daemon (C3c). Only a coordinator launch is started (a worker's brief is not built). Once
+``claude --bg`` returned 0, every way out of 5-6 that does not leave the launch active stops the sessions listed under
+its name in its directory, a Ctrl-C included; a process killed outright leaves its launch to expire, and the watcher
+stops the session by name then. Only the spawn runs in the launch's directory: ``claude agents`` and ``claude stop`` run in the store's.
 
 :func:`setup_install` makes the coordinator's directory (by default ``<levain home>/coordinator``) a Levain install
 for Claude Code when it is not one, by running ``levain init --adapter claude-code`` non-interactively in this process.
@@ -90,9 +90,9 @@ from levain.coordinator import lease as lease_mod
 from levain.coordinator.lease import LEASE_TTL, LeaseRefused
 from levain.coordinator.store import CoordError, CoordStore
 
-__all__ = ["BRIEF_DROPS", "WORKER_KINDS", "worker_kind", "HOOK_ROW", "READBACK_DELAY", "READBACK_TRIES", "UNLISTED_RECHECK", "Outcome", "brief_path",
-           "default_coordinator_dir", "hook_live", "launch_session", "session_name", "setup_install", "trust_remedy",
-           "watch", "watch_once"]
+__all__ = ["BRIEF_DROPS", "HOOK_ROW", "READBACK_DELAY", "READBACK_TRIES", "UNLISTED_RECHECK", "WORKER_KINDS", "Outcome",
+           "brief_path", "default_coordinator_dir", "hook_live", "launch_session", "session_name", "setup_install",
+           "trust_remedy", "watch", "watch_once", "worker_kind"]
 
 HOOK_ROW = "Claude Code consent hook"
 _HOOK_LIVE = "wired to this install"
@@ -630,8 +630,13 @@ def watch_once(store: CoordStore) -> list[str]:
     lines.extend(_remove_briefs(store))
     from levain.coordinator import codex_launch
 
-    # the Codex launches are watched through the user's Codex daemon, before (and whatever) claude's list reads
-    lines.extend(codex_launch.watch_once(store))
+    # the Codex launches are watched through the user's Codex daemon, before (and whatever) claude's list reads: a
+    # fault there is a line, never the end of this pass's claude half
+    try:
+        lines.extend(codex_launch.watch_once(store))
+    except Exception as exc:  # noqa: BLE001 - the claude half still runs whatever the Codex half raised
+        lines.append(f"the Codex half of this pass faulted ({type(exc).__name__}: {str(exc)[:300]}); no Codex "
+                     "session observed")
     # the active launches are read BEFORE the list: a launch is active only after its read back saw it listed, so
     # every one read here was listed before the list below was taken, and a launch activated meanwhile is not judged
     active = [ln for ln in store.launches_active() if ln.harness == "claude" and ln.harness_session_id]

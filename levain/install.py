@@ -2801,7 +2801,11 @@ def installed_coordinator_levain(install: Path, python_path: str) -> str | None:
 # under the project's `.codex/rules/`, which Codex loads only while the operator trusts that project (OpenAI's Codex
 # docs, "Rules" and "Config basics"). A rule matches the command's argv as an exact prefix, so it names the same
 # spelling the brief uses, word for word, and Levain parses no shell. Codex runs an allowed command outside its sandbox
-# without asking: these three verbs only, which grant nothing.
+# without asking: these three verbs only, which grant nothing. The coordinator cannot widen the rule from inside its
+# turn: Codex's workspace-write sandbox keeps a `.codex/` that exists as a directory read-only inside the workspace
+# (OpenAI's Codex docs, "Sandboxing": protected paths), measured on codex-cli 0.162.1 with a turn's own create,
+# append and rename under it each refused "Operation not permitted" while a plain workspace write went through. So
+# the directory is made before any thread starts in it.
 CODEX_COORDINATOR_RULES_REL = (".codex", "rules", "levain-coordinator.rules")
 
 
