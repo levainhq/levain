@@ -22,9 +22,10 @@ shape C3b gives Claude Code:
      so the user's own Codex config decides), then the thread recorded under the launch (the spawn claim and the
      lease token re-checked in that write, :func:`levain.coordinator.lease.record_thread`, with the daemon's own
      codexHome and its socket) BEFORE ``thread/name/set`` and ``turn/start`` with the prompt naming the brief, and
-     again with the turn's id once it is accepted; the client then disconnects. A refused record starts no turn;
+     again with the turn's id once it is accepted; the client then disconnects. A refused record starts no turn; a
+     ``turn/start`` answered without a turn id fails the launch, its thread's turn in progress interrupted;
   5. the read back: a fresh connection's ``thread/read``, which must list the thread under our name in the launch's
-     realpath directory. The thread id is the harness session id the launch records;
+     realpath directory, ``active`` (a turn running). The thread id is the harness session id the launch records;
   6. activation, the token re-checked (:func:`levain.coordinator.lease.activate`). Refused: the session is stopped.
 
 "Stop" is ``turn/interrupt`` of the thread's turn in progress; Levain never archives or deletes a thread (its rollout
@@ -513,10 +514,11 @@ def launch(store: CoordStore, ln: Any) -> Any:
                 c.call("thread/name/set", {"threadId": tid, "name": name})
                 begun = c.call("turn/start", {"threadId": tid, **turn})
                 turn_id = ((begun or {}).get("turn") or {}).get("id") if isinstance(begun, dict) else None
-                if isinstance(turn_id, str):
-                    why = record(turn_id)
-                    if why is not None:
-                        return fail(f"its turn could not be recorded: {why}; {stop_ours()}")
+                if not isinstance(turn_id, str):
+                    return fail(f"turn/start answered without a turn id; {stop_ours()}")
+                why = record(turn_id)
+                if why is not None:
+                    return fail(f"its turn could not be recorded: {why}; {stop_ours()}")
         except CodexError as exc:
             return fail(f"the Codex launch failed ({exc}); {stop_ours()}")
         try:
@@ -529,6 +531,11 @@ def launch(store: CoordStore, ln: Any) -> Any:
             return fail(f"thread {tid} reads back named {str(th.get('name'))[:120]!r}, not {name}; {stop_ours()}")
         if not _same(th.get("cwd"), Path(real)):
             return fail(f"thread {tid} reads back in {str(th.get('cwd'))[:300]!r}, not {real}; {stop_ours()}")
+        status = th.get("status") if isinstance(th.get("status"), dict) else {}
+        if status.get("type") != "active":
+            # an idle thread runs no prompt: activating it would record a coordinator that is not running
+            return fail(f"thread {tid} reads back {str(status.get('type') or 'with no status')[:60]}, with no turn "
+                        f"running; {stop_ours()}")
         try:
             _active, refused = store.launch_activate(launch_id, harness_session_id=tid, argv_sha256=argv_sha)
         except LeaseRefused as exc:

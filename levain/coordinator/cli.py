@@ -1029,10 +1029,10 @@ def run_coord(args: argparse.Namespace, out: Any = None) -> int:
                                        if ln is not None else f"no launch asked for: {st['why']}"))
             return 0 if got is None or got.started else 1
         if cmd == "watch":
-            from levain.coordinator.launch import watch, watch_once
+            from levain.coordinator.launch import migrate_setting, watch, watch_once
 
             if args.once:
-                lines = watch_once(store)
+                lines = migrate_setting(store) + watch_once(store)
                 _emit(out, args.json, {"lines": lines}, "\n".join(lines) or "nothing to do")
                 return 0
             if args.every < 1:

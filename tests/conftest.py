@@ -214,8 +214,12 @@ def _isolate_levain_home(monkeypatch, tmp_path_factory):
     """TEST ONLY: every place levain resolves "its home" (`default_queue_dir`, the key dir, the autonomic store, the
     coordinator record) reads `$LEVAIN_HOME` first and falls back to `~/.levain`, so a test that reached one without
     setting it wrote the operator's REAL home (the coordinator launch tests did, 10-21). Every test gets its own
-    `$LEVAIN_HOME`, replacing whatever the reviewer's shell holds; a test that means another sets it itself."""
+    `$LEVAIN_HOME`, replacing whatever the reviewer's shell holds; a test that means another sets it itself. The
+    coordinator record is also read and written under the account's home from the password database (never
+    `$HOME`), so that lookup is pointed at a per-test directory too."""
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path_factory.mktemp("levain-home")))
+    own = tmp_path_factory.mktemp("account-home")
+    monkeypatch.setattr("levain.coordinator.door._own_home", lambda: own)
 
 
 @pytest.fixture(autouse=True)

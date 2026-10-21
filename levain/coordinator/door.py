@@ -11,13 +11,16 @@ filesystem root, is inside a coordinator's workspace or is not. Both harnesses' 
 directory the session was launched in (measured, for ``claude -p`` and a Codex thread).
 
 A directory is a coordinator's workspace when the COORDINATOR RECORD names it (head ruling R1, 1021+19): a file in the
-default consent directory, outside every root a coordinator's turn can write (a Codex coordinator's sandbox writes its
-workspace, never the consent directory), written by ``levain coord agent`` before it records a setting and only ever
-added to. The record names real paths, so the walk checks the working directory's real path and its parents as well as
-the spelled ones. The workspace's own ``.levain/config.json`` role line stays a HINT: it also makes a directory the
-coordinator's (so a workspace rendered before the record existed is still doored), but its absence or damage never
-makes one outside, since the coordinator can write that file. A record that exists and cannot be read fails CLOSED:
-the door cannot tell any directory is not the coordinator's. No database is read, so no store state (locked,
+default consent directory and the same file under the account's own home (from the password database), both outside
+every root a coordinator's turn can write (a Codex coordinator's sandbox writes its workspace, never the consent
+directory), written by ``levain coord agent`` before it records a setting and only ever added to; either naming a
+directory is enough. The record names real paths; directories are compared by device and inode as well as by
+spelling (a case-insensitive volume has many spellings of one). The workspace's own ``.levain/config.json`` role line
+stays a HINT: it also makes a directory the coordinator's (so a workspace rendered before the record existed is still
+doored), but its absence or damage never makes one outside, since the coordinator can write that file. A record that
+exists and cannot be read, whose directory is not one, or that lies inside a recorded or hinted coordinator workspace
+fails CLOSED, for every command: the door cannot tell any directory is not the coordinator's. No database is read, so
+no store state (locked,
 corrupt, another store) can open the door. Consequences, accepted: the operator running ``levain`` from inside that
 workspace is doored too (it is Levain's directory, not his), and an agent that changes directory out of it leaves the
 door (the door is fencing for an honest coordinator; the lease token still fences every write).
@@ -57,80 +60,121 @@ _RECORD_MAX = 1024 * 1024
 
 
 class RecordUnreadable(Exception):
-    """The coordinator record exists and cannot be read as one: the door fails closed on it."""
+    """The coordinator record exists and cannot be read as one, or lies where a coordinator could write it: the door
+    fails closed on it. ``path`` is the record file the operator repairs or deletes by hand."""
+
+    def __init__(self, message: str, path: Path | None = None) -> None:
+        super().__init__(message)
+        self.path = path
 
 
-def record_path() -> Path:
-    """``<levain home>/consent/coordinator_workspaces.json``: the coordinator record, in the default consent
-    directory (the one ``$LEVAIN_HOME`` names, else ``~/.levain``)."""
-    from levain.consent.queue import default_queue_dir
-
-    return default_queue_dir() / RECORD_NAME
-
-
-def _record_paths() -> list[Path]:
-    """Where the door reads records: :func:`record_path`, and the same file under the account's own home from the
-    password database, so a command that sets ``$LEVAIN_HOME`` or ``$HOME`` for itself reads its real record too
-    (an extra record only ever adds workspaces)."""
-    paths = [record_path()]
+def _own_home() -> Path | None:
+    """The account's home from the password database (never ``$HOME``), or None where there is none."""
     try:
         import pwd
 
-        own = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".levain" / "consent" / RECORD_NAME
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
     except (ImportError, KeyError, OSError):
-        return paths
-    if os.path.realpath(own) != os.path.realpath(paths[0]):
-        paths.append(own)
+        return None
+
+
+def _resolved(path: Path) -> Path:
+    """``path`` with its directory resolved through every symlink; the file name itself is kept, so a record file
+    that is a link is still refused by the read (``O_NOFOLLOW``)."""
+    return Path(os.path.realpath(path.parent)) / path.name
+
+
+def record_path() -> Path:
+    """``<levain home>/consent/coordinator_workspaces.json``, its directory resolved: the coordinator record, in the
+    default consent directory (the one ``$LEVAIN_HOME`` names, else ``~/.levain``)."""
+    from levain.consent.queue import default_queue_dir
+
+    return _resolved(default_queue_dir() / RECORD_NAME)
+
+
+def _record_paths() -> list[Path]:
+    """Where the door reads records and :func:`record` writes them: :func:`record_path`, and the same file under the
+    account's own home from the password database, so a process started with another ``$LEVAIN_HOME`` or ``$HOME``
+    (or none) reads the same record (a workspace is recorded when either names it)."""
+    paths = [record_path()]
+    own = _own_home()
+    if own is not None:
+        other = _resolved(own / ".levain" / "consent" / RECORD_NAME)
+        if other != paths[0]:
+            paths.append(other)
     return paths
+
+
+def _ident(path: str | Path) -> tuple[int, int] | None:
+    """(device, inode) of the directory or file at ``path``, or None when it cannot be looked at. Directories are
+    compared by this, never by spelling: on a case-insensitive volume two spellings name one directory."""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return st.st_dev, st.st_ino
+
+
+def _idents(dirs: frozenset[str] | set[str]) -> set[tuple[int, int]]:
+    return {i for i in map(_ident, dirs) if i is not None}
+
+
+def _inside(path: Path, dirs: set[tuple[int, int]]) -> bool:
+    """Whether ``path`` or one of its parents is one of the directories ``dirs`` identifies."""
+    return bool(dirs) and any(_ident(d) in dirs for d in (path, *path.parents))
 
 
 def _read_record(path: Path) -> frozenset[str]:
     """The real paths ``path`` records; empty when there is no such file. Raises :class:`RecordUnreadable` for one
-    that exists and is not a plain readable file holding ``{"coordinator_workspaces": [absolute paths]}``."""
+    that exists and is not a plain readable file holding ``{"coordinator_workspaces": [absolute paths]}``, and for a
+    path whose directory is not one (that is damage, not an absent record)."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return frozenset()
-    except NotADirectoryError:
-        return frozenset()
     except OSError as exc:
-        raise RecordUnreadable(f"{path}: {exc.strerror or exc}") from exc
+        raise RecordUnreadable(f"{path}: {exc.strerror or exc}", path) from exc
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise RecordUnreadable(f"{path} is not a plain file")
+            raise RecordUnreadable(f"{path} is not a plain file", path)
         data = os.read(fd, _RECORD_MAX + 1)
     except OSError as exc:
-        raise RecordUnreadable(f"{path}: {exc.strerror or exc}") from exc
+        raise RecordUnreadable(f"{path}: {exc.strerror or exc}", path) from exc
     finally:
         os.close(fd)
     if len(data) > _RECORD_MAX:
-        raise RecordUnreadable(f"{path} is larger than a coordinator record")
+        raise RecordUnreadable(f"{path} is larger than a coordinator record", path)
     try:
         got = json.loads(data.decode("utf-8"))
     except (ValueError, RecursionError) as exc:
-        raise RecordUnreadable(f"{path} is not JSON ({exc})") from exc
+        raise RecordUnreadable(f"{path} is not JSON ({exc})", path) from exc
     dirs = got.get(_RECORD_KEY) if isinstance(got, dict) else None
     if not isinstance(dirs, list) or not all(isinstance(d, str) and d.startswith("/") for d in dirs):
-        raise RecordUnreadable(f"{path} holds no list of absolute paths under {_RECORD_KEY!r}")
+        raise RecordUnreadable(f"{path} holds no list of absolute paths under {_RECORD_KEY!r}", path)
     return frozenset(dirs)
 
 
+def _refuse_inside(paths: list[Path], dirs: set[tuple[int, int]]) -> None:
+    """Raise :class:`RecordUnreadable` when a record file lies in one of the coordinator workspaces ``dirs``
+    identifies: that coordinator could rewrite it, so it is no evidence of anything."""
+    for path in paths:
+        if _inside(path, dirs):
+            raise RecordUnreadable(f"{path} lies inside a coordinator's workspace, where that coordinator could "
+                                   "rewrite it", path)
+
+
 def recorded() -> frozenset[str]:
-    """Every coordinator workspace the record names (real paths). Raises :class:`RecordUnreadable`."""
+    """Every coordinator workspace a record names (real paths). Raises :class:`RecordUnreadable` when a record cannot
+    be read, or when a record file lies inside a workspace a record names."""
+    paths = _record_paths()
     out: frozenset[str] = frozenset()
-    for path in _record_paths():
+    for path in paths:
         out |= _read_record(path)
+    _refuse_inside(paths, _idents(out))
     return out
 
 
-def record(directory: Path) -> Path:
-    """Add ``directory``'s real path to the coordinator record (once; nothing is ever taken out) and return that real
-    path. Called by ``levain coord agent`` before it records a setting. Refuses a directory that holds the record
-    itself, which the coordinator's own turn could then write. Raises ``OSError`` or :class:`RecordUnreadable`."""
-    real = Path(os.path.realpath(directory))
-    path = record_path()
-    if path == real or real in path.parents:
-        raise OSError(f"{real} holds Levain's consent directory; a coordinator workspace never does")
+def _add(path: Path, real: Path, ident: tuple[int, int] | None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock_fd = os.open(path.parent / (RECORD_NAME + ".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
@@ -141,7 +185,7 @@ def record(directory: Path) -> Path:
         if fcntl is not None:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
         have = _read_record(path)
-        if str(real) not in have:
+        if str(real) not in have and (ident is None or ident not in _idents(have)):
             from levain.install import _atomic_write_text
 
             body = {_RECORD_KEY: sorted(have | {str(real)})}
@@ -149,6 +193,23 @@ def record(directory: Path) -> Path:
             os.chmod(path, 0o600)
     finally:
         os.close(lock_fd)
+
+
+def record(directory: Path) -> Path:
+    """Add ``directory``'s real path to every coordinator record (once; nothing is ever taken out) and return that
+    real path. Called by ``levain coord agent`` before it records a setting. Refuses a directory that holds a record
+    file (compared by resolved path and by identity), which the coordinator's own turn could then write, and refuses
+    while any record cannot be read. Raises ``OSError`` or :class:`RecordUnreadable`."""
+    real = Path(os.path.realpath(directory))
+    ident = _ident(real)
+    paths = _record_paths()
+    for path in paths:
+        if path == real or real in path.parents or (ident is not None and _inside(path, {ident})):
+            raise OSError(f"{real} holds Levain's consent directory ({path.parent}); a coordinator workspace "
+                          "never does")
+    recorded()
+    for path in paths:
+        _add(path, real, ident)
     return real
 
 
@@ -242,15 +303,19 @@ def workspace(cwd: str | None = None) -> Path | None:
     except OSError:
         return None
     names = recorded()
+    ids = _idents(names)
     for d in _chain(here):
-        if str(d) in names:
+        if str(d) in names or (ids and _ident(d) in ids):
             return d
     for d in (here, *here.parents):
         try:
-            if _marked(d):
-                return d
+            hinted = _marked(d)
         except OSError:
             return None
+        if hinted:
+            ident = _ident(d)
+            _refuse_inside(_record_paths(), {ident} if ident is not None else set())
+            return d
     return None
 
 
@@ -265,34 +330,50 @@ def marked(directory: Path) -> bool:
         return False
 
 
-def launch_refusal(directory: str | Path) -> str | None:
-    """Why a coordinator may not be launched in ``directory`` (None: it may). It may only where the coordinator record
-    names its real path (head rulings door r2 (b) and R1: the launcher verifies confinement before the spawn). A
-    workspace from before the record, which carries the role hint today, is recorded here once (MIGRATED: recording
-    only ever adds a doored directory) and may launch. A record that cannot be read refuses."""
+def unreadable(exc: RecordUnreadable) -> str:
+    """The operator's words for a record the door cannot trust: every levain command is refused until he repairs or
+    deletes that file by hand (no levain command can, since the door refuses them all)."""
+    where = f" {exc.path}" if exc.path is not None else " that file"
+    return (f"the coordinator record cannot be trusted ({exc}), so no directory can be shown not to be a "
+            f"coordinator's workspace and every levain command is refused; repair or delete{where} by hand")
+
+
+def admit(directory: str | Path) -> tuple[str | None, bool]:
+    """``(why a coordinator may not be launched in directory or None, whether it was just recorded)``. It may only
+    where a coordinator record names it (head rulings door r2 (b) and R1: the launcher verifies confinement before
+    the spawn). A workspace from before the record, which carries the role hint today, is recorded here once
+    (MIGRATED: recording only ever adds a doored directory). A record that cannot be read or written refuses."""
     real = os.path.realpath(directory)
     try:
-        if real in recorded():
-            return None
+        names = recorded()
+        ident = _ident(real)
+        if real in names or (ident is not None and ident in _idents(names)):
+            return None, False
         if not marked(Path(real)):
             return (f"{real} is not a coordinator's workspace (Levain's coordinator record does not name it); "
-                    "`levain coord agent claude` or `levain coord agent codex` makes and records one")
+                    "`levain coord agent claude` or `levain coord agent codex` makes and records one"), False
         record(Path(real))
-    except (RecordUnreadable, OSError) as exc:
-        return f"the coordinator record could not be read or written ({exc}); nothing was started"
-    return None
+    except RecordUnreadable as exc:
+        return unreadable(exc), False
+    except OSError as exc:
+        return f"the coordinator record could not be written ({exc})", False
+    return None, True
+
+
+def launch_refusal(directory: str | Path) -> str | None:
+    """Why a coordinator may not be launched in ``directory`` (None: it may); see :func:`admit`."""
+    return admit(directory)[0]
 
 
 def refusal(parser: argparse.ArgumentParser, args: argparse.Namespace) -> str | None:
-    """Why this command is refused here (the message, with its ``levain <path>:`` prefix), or None to run it."""
+    """Why this command is refused here (the message, with its ``levain <path>:`` prefix), or None to run it. A
+    record that cannot be trusted refuses every command, the coordinator's own verbs included."""
     path = command_path(parser, args)
     words = " ".join(("levain", *path))
     try:
-        ws: Path | str | None = workspace()
+        ws: Path | None = workspace()
     except RecordUnreadable as exc:
-        # fail closed: with no readable record, no directory can be shown not to be the coordinator's
-        ws = (f"unknown: the coordinator record cannot be read ({exc}); repair or delete that file, then run "
-              "`levain coord agent` again")
+        return f"{words}: {unreadable(exc)}"
     if ws is None:
         return None
     if path not in DOOR:

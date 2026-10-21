@@ -264,6 +264,24 @@ def test_a_starter_killed_between_turn_start_and_activation_leaves_a_turn_the_wa
         daemon.close()
 
 
+def test_a_turn_start_without_a_turn_id_fails_the_launch_and_interrupts_its_turn(home, store):
+    # coordland L3 r1 codex MED, reproduced (coordint/fix2/repro_before.txt, FIX 3): turn/start answered with a turn
+    # in progress but no id, and the launch still activated, recording a coordinator nothing could name the turn of
+    daemon = FakeDaemon(home)
+    orig = daemon._answer
+    daemon._answer = lambda m, p: ({"result": {"turn": {"status": "inProgress"}}} if m == "turn/start" and
+                                   orig(m, p) else orig(m, p))
+    try:
+        launch_id = _woken(store)
+        got = cl.launch_session(store, launch_id)
+        assert not got.started and "without a turn id" in got.refusal, got.refusal
+        assert store.launch(launch_id).state == "failed"
+        (th,) = daemon.threads.values()
+        assert [t["status"] for t in th["turns"]] == ["interrupted"]
+    finally:
+        daemon.close()
+
+
 def test_the_twenty_first_oldest_over_launch_is_still_inspected(home, store):
     # L3 r1 codex HIGH 3, reproduced: the watcher read the newest 20 over launches every pass, so with 21 the oldest,
     # its turn still running, was never inspected; a launch whose thread is seen finished leaves that list for good

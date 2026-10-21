@@ -189,7 +189,11 @@ def _reconcile(store: Any, path: Path) -> dict[str, Any]:
             pass
         return {"held": False, "why": f"could not sync: the new holder (pid {pid}) could not be identified by ps"}
     rec = {"pid": pid, "started": ident[0], "argv": argv, "until": time.time() + HOLD_SECONDS, "threads": ids}
-    _write(path, rec)
+    try:
+        _write(path, rec)
+    except BaseException:
+        _stop(rec)              # an unrecorded holder could never be stopped or recognised by a later sync
+        raise
     _stop(cur)                  # the old holder goes only once the new one is recorded
     return {"held": True, "pid": pid, "threads": ids, "why": "a work thread is working"}
 

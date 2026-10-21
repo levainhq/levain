@@ -594,8 +594,25 @@ def _by_session(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {r["sessionId"]: r for r in rows if isinstance(r.get("sessionId"), str)}
 
 
+def migrate_setting(store: CoordStore) -> list[str]:
+    """The first ``coord watch`` pass's step: the coordinator SETTING's directory, when it is not recorded and carries
+    the role hint today, is put in the coordinator record (the launch migration's rule,
+    :func:`levain.coordinator.door.admit`), so a coordinator already running there from before the record is doored
+    by the record without a relaunch. Only the setting's own directory: a doored session cannot write the setting."""
+    from levain.coordinator import door
+
+    got = store.coord_setting()
+    if got is None or got.agent not in ("claude", "codex") or not got.cwd:
+        return []
+    why, migrated = door.admit(got.cwd)
+    if migrated:
+        return [f"coordinator workspace {os.path.realpath(got.cwd)} recorded (it carried the role hint only)"]
+    return [] if why is None else [f"coordinator workspace {got.cwd} not recorded: {why}"]
+
+
 def watch_once(store: CoordStore) -> list[str]:
-    """One pass of ``levain coord watch``; the lines say what it did. In order:
+    """One pass of ``levain coord watch``; the lines say what it did (the watch's first pass is preceded by
+    :func:`migrate_setting`). In order:
 
       (a) every pending coordinator launch no process has claimed the spawn of is started (:func:`launch_session`;
           its one-spawner compare-and-set makes a double start impossible), so a drop written from the phone or the
@@ -732,6 +749,11 @@ def watch(store: CoordStore, *, every: float, emit: Callable[[str], None] = prin
     tests). A pass that faults, whatever it raised, says so and the next one runs (L3 r1 G5: a ``JobStoreError`` from
     the shared ``dispatch.db`` is no ``CoordError``); a Ctrl-C or SystemExit still ends the watch."""
     done = 0
+    try:
+        for line in migrate_setting(store):
+            emit(line)
+    except Exception as exc:  # noqa: BLE001 - the watch still runs; the launch re-checks the record anyway
+        emit(f"the coordinator setting's workspace could not be checked ({type(exc).__name__}: {str(exc)[:300]})")
     while passes is None or done < passes:
         try:
             for line in watch_once(store):

@@ -1,6 +1,8 @@
 """The coordinator store is only READ by those who only read it (lane door, 1021-18)."""
 import sqlite3
 
+import pytest
+
 from levain.dispatch.jobs import JobStore
 
 
@@ -112,7 +114,39 @@ def test_a_recorded_workspace_stays_doored_when_its_own_config_is_gone_or_garble
     monkeypatch.chdir(tmp_path)
     door.record_path().write_text("{")
     assert main(["coord", "take", "--queue-dir", str(q)]) == 1
-    assert "the coordinator record cannot be read" in capsys.readouterr().err
+    assert "repair or delete" in capsys.readouterr().err
+
+
+def test_a_record_inside_a_workspace_or_under_a_file_shuts_the_door_for_every_command(tmp_path, monkeypatch, capsys):
+    """Reproduced (coordint/fix2/repro_before.txt, FIX 1 f1b and FIX 2): with LEVAIN_HOME re-pointed into a recorded
+    workspace holding an empty record and the hint gone, `thread list` ran there and the workspace read as outside;
+    with the consent directory a file, the record read as absent and `coord take` ran."""
+    from levain.cli import main
+    from levain.coordinator import door
+
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    ws = _workspace(tmp_path)
+    door.record(ws)                                   # also under the account's own home (the conftest's)
+    (tmp_path / "in").symlink_to(ws / "sub")
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "in"))
+    (ws / "sub" / "consent").mkdir()
+    (ws / "sub" / "consent" / door.RECORD_NAME).write_text('{"coordinator_workspaces": []}')
+    (ws / ".levain" / "config.json").unlink()
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    for here in (ws, tmp_path):
+        monkeypatch.chdir(here)
+        assert main(["thread", "list", "--queue-dir", str(q)]) == 1     # a DOOR verb too
+        err = capsys.readouterr().err
+        assert "lies inside a coordinator's workspace" in err and "repair or delete" in err, err
+    with pytest.raises(OSError):
+        door.record(tmp_path / "coordinator")     # never recorded while a record lies inside it
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "flat"))
+    (tmp_path / "flat").mkdir()
+    (tmp_path / "flat" / "consent").write_text("a file\n")
+    assert main(["coord", "take", "--queue-dir", str(q)]) == 1
+    err = capsys.readouterr().err
+    assert "Not a directory" in err and str(tmp_path / "flat" / "consent" / door.RECORD_NAME) in err, err
 
 
 def test_a_codex_coordinator_workspace_is_marked_by_the_one_role_render(tmp_path, capsys, monkeypatch):
