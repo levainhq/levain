@@ -42,7 +42,7 @@ from levain.consent.queue import RULING_SKEW
 from levain.contracts.canon import canonical
 from levain.coordinator import envelope as env
 from levain.coordinator.store import (
-    SCHEMA, CoordError, CoordStore, Drop, Source, _append_only, _in, members_sha256,
+    SCHEMA, CoordError, CoordStore, Drop, Source, _append_only, _in, members_sha256, next_gseq,
 )
 from levain.dispatch.adopt import GitFault, branch_problem
 from levain.dispatch.contract import MAX_LIFETIME, git_env
@@ -56,8 +56,7 @@ NOT_IN_FORCE = ("before S1 places the control principal the coordinator grants n
 SIGN_SKEW: timedelta = RULING_SKEW
 
 ENVELOPE_SCHEMA: tuple[str, ...] = (
-    # one store-wide order for every authority row: never wall-clock (C0 §3.4)
-    "CREATE TABLE IF NOT EXISTS gseq (gseq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL)",
+    # the gseq table, one store-wide order for every authority row, is the base SCHEMA's (C0 §3.4)
     "CREATE TABLE IF NOT EXISTS envelopes (envelope_id TEXT PRIMARY KEY, gseq INTEGER NOT NULL UNIQUE, "
     "origin TEXT NOT NULL CHECK (origin IN ('structured', 'worded')), drop_id TEXT NOT NULL REFERENCES drops(drop_id), "
     "body TEXT NOT NULL, digest TEXT NOT NULL, payload TEXT NOT NULL, signature TEXT NOT NULL, "
@@ -70,13 +69,10 @@ ENVELOPE_SCHEMA: tuple[str, ...] = (
     f"thread_id TEXT REFERENCES threads(thread_id), kind TEXT NOT NULL CHECK ({_in('kind', ATTENUATIONS)}), "
     "value TEXT NOT NULL, by TEXT NOT NULL CHECK (by IN ('operator', 'service')), gseq INTEGER NOT NULL UNIQUE, "
     "at TEXT NOT NULL, PRIMARY KEY (envelope_id, gseq))",
-    *_append_only("gseq", "the sequence"),
     *_append_only("envelopes", "an envelope"),
     *_append_only("envelope_binds", "an envelope bind"),
     *_append_only("envelope_attenuations", "an attenuation"),
     # INSERT OR REPLACE deletes the old row without firing a delete trigger: refuse a new row reusing any key
-    "CREATE TRIGGER IF NOT EXISTS gseq_no_replace BEFORE INSERT ON gseq WHEN EXISTS (SELECT 1 FROM gseq WHERE "
-    "gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'the sequence is never replaced'); END",
     "CREATE TRIGGER IF NOT EXISTS envelopes_no_replace BEFORE INSERT ON envelopes WHEN EXISTS (SELECT 1 FROM "
     "envelopes WHERE envelope_id = NEW.envelope_id OR gseq = NEW.gseq OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'an envelope is never replaced'); END",
@@ -176,7 +172,7 @@ class EnvelopeStore(CoordStore):
 
     @staticmethod
     def _next_gseq(conn: sqlite3.Connection, now: str) -> int:
-        return conn.execute("INSERT INTO gseq (at) VALUES (?)", (now,)).lastrowid
+        return next_gseq(conn, now)
 
     def _same_or_conflict(self, conn: sqlite3.Connection, body: Mapping[str, Any], payload: Mapping[str, Any],
                           signature: str) -> Envelope | None:
