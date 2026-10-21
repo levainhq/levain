@@ -55,7 +55,8 @@ from levain.dispatch.jobs import JobStore
 
 __all__ = [
     "ACTORS", "KINDS", "REPLY_KINDS", "SCHEMA", "SOURCE_HOW", "STATES", "SURFACES", "CoordError", "CoordStore",
-    "Drop", "DropConflict", "Part", "Reply", "Source", "Thread", "check_source", "members_sha256",
+    "Drop", "DropConflict", "Part", "Reply", "Source", "Thread", "check_source", "check_words", "members_sha256",
+    "words_sha256",
 ]
 
 SURFACES = ("cli", "phone", "cockpit")
@@ -166,8 +167,12 @@ def members_sha256(members: Iterable[str]) -> str:
     return "sha256:" + hashlib.sha256(canonical_bytes(sorted(members))).hexdigest()
 
 
-def _words_sha256(words: str) -> str:
+def words_sha256(words: str) -> str:
+    """``sha256:<hex>`` of a drop's exact words, as stored and as an envelope body names them."""
     return "sha256:" + hashlib.sha256(words.encode("utf-8")).hexdigest()
+
+
+_words_sha256 = words_sha256
 
 
 @dataclass(frozen=True)
@@ -249,6 +254,11 @@ def _one_line(name: str, value: Any, high: int) -> str:
     return value
 
 
+def check_words(words: Any) -> str:
+    """The words, if a drop can hold them; raises CoordError saying why not (checked before anything is signed)."""
+    return _check_words(words)
+
+
 def _check_words(words: Any) -> str:
     if not isinstance(words, str) or not words.strip():
         raise CoordError("a drop needs words")
@@ -291,6 +301,9 @@ class CoordStore:
     """The coordinator's tables in ``<directory>/dispatch.db`` (the consent directory by default). Every write is one
     ``BEGIN IMMEDIATE``; the clock is read only once the write lock is held."""
 
+    # a subclass that adds tables (the envelope store, C2) extends this; every statement is IF NOT EXISTS
+    _SCHEMA: tuple[str, ...] = SCHEMA
+
     def __init__(self, directory: Path | str | None = None, *,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
         # the file, its format marker, its store_id and its directory rule are the dispatch store's: one owner
@@ -307,7 +320,7 @@ class CoordStore:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
-                    for stmt in SCHEMA:
+                    for stmt in self._SCHEMA:
                         conn.execute(stmt)
                     conn.execute("COMMIT")
                 except BaseException:
@@ -332,7 +345,7 @@ class CoordStore:
 
     # --- drops ---------------------------------------------------------------------------------------------------
     def accept_drop(self, words: str, *, surface: str, outbox_id: str | None = None, sent_at: str | None = None,
-                    source: Source = Source()) -> tuple[Drop, bool]:
+                    source: Source = Source(), _carry: Callable[..., Drop] | None = None) -> tuple[Drop, bool]:
         """Store a drop and its ``delivered`` drop receipt in one transaction; ``(drop, True)``. A resend of a stored
         ``outbox_id`` with the same words from the same surface writes nothing: ``(stored drop, False)``."""
         words = _check_words(words)
@@ -361,16 +374,37 @@ class CoordStore:
                     raise CoordError(f"sent_at: {exc}") from None
                 if sent > parse_stamp(now) + _SENT_SKEW:
                     raise CoordError(f"sent_at {sent_at} is ahead of the store's clock ({now})")
+            if _carry is not None:
+                # a drop carrying an envelope (C2): the carrier inserts it, after its own checks, in this transaction
+                return _carry(conn, now, words=words, sha=sha, surface=surface, outbox_id=outbox_id, sent_at=sent_at,
+                              source=source), True
+            return self._insert_drop(conn, now, words=words, sha=sha, surface=surface, outbox_id=outbox_id,
+                                     sent_at=sent_at, source=source), True
+
+    def _insert_drop(self, conn: sqlite3.Connection, now: str, *, words: str, sha: str, surface: str,
+                     outbox_id: str, sent_at: str, source: Source, drop_id: str | None = None,
+                     envelope_id: str | None = None, receipt: dict[str, Any] | None = None) -> Drop:
+        """Insert a checked drop and its ``delivered`` drop receipt inside the caller's write transaction.
+        ``drop_id`` and ``envelope_id`` are given only by a drop that carries a structured envelope (C2), whose body
+        names the drop id it was signed for; ``envelope_id`` is written in the insert, never set later."""
+        if drop_id is None:
             drop_id = "dr-" + secrets.token_hex(16)
-            conn.execute(
-                "INSERT INTO drops (drop_id, surface, outbox_id, words, words_sha256, sent_at, received_at, "
-                "source_repo, source_ref, source_head, source_how, envelope_id, prior_envelope_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
-                (drop_id, surface, outbox_id, words, sha, sent_at, now, source.repo, source.ref, source.head,
-                 source.how))
-            self._reply(conn, None, "drop_receipt", "drops", drop_id,
-                        {"stage": "delivered", "drop_id": drop_id, "outbox_id": outbox_id}, now)
-            return self._drop(conn, drop_id), True
+        elif not isinstance(drop_id, str) or _DROP_ID.fullmatch(drop_id) is None:
+            raise CoordError("a drop id is dr- and 32 hex")
+        elif conn.execute("SELECT 1 FROM drops WHERE drop_id = ?", (drop_id,)).fetchone() is not None:
+            raise DropConflict(f"drop {drop_id} is already stored; nothing was written")
+        if envelope_id is not None and (not isinstance(envelope_id, str)
+                                        or re.fullmatch(r"ev-[0-9a-f]{32}", envelope_id) is None):
+            raise CoordError("an envelope id is ev- and 32 hex")
+        conn.execute(
+            "INSERT INTO drops (drop_id, surface, outbox_id, words, words_sha256, sent_at, received_at, "
+            "source_repo, source_ref, source_head, source_how, envelope_id, prior_envelope_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            (drop_id, surface, outbox_id, words, sha, sent_at, now, source.repo, source.ref, source.head,
+             source.how, envelope_id))
+        self._reply(conn, None, "drop_receipt", "drops", drop_id,
+                    {"stage": "delivered", "drop_id": drop_id, "outbox_id": outbox_id, **(receipt or {})}, now)
+        return self._drop(conn, drop_id)
 
     # --- threads -------------------------------------------------------------------------------------------------
     def split(self, drop_id: str, parts: Sequence[Part], *, by: str = "coordinator") -> list[Thread]:
@@ -407,6 +441,7 @@ class CoordStore:
             if len(set(touched)) != len(touched):
                 raise CoordError("a split names the same thread twice")
             self._drop_receipt(conn, drop_id, "split", now)
+            self._split_done(conn, drop_id, touched, now)
             return [self._thread(conn, t) for t in touched]
 
     def add(self, drop_id: str, part: Part, *, by: str = "operator") -> Thread:
@@ -504,6 +539,8 @@ class CoordStore:
                 self._close(conn, thread_id, cause or state, by, now)
             else:
                 self._event(conn, thread_id, "state", state, cause or state, by, now)
+                if state == "done":
+                    self._ended(conn, thread_id, now)
             if state == "done" and t.kind != "work":
                 self._close(conn, thread_id, f"{t.kind} closes itself once done", "service", now)
             return self._thread(conn, thread_id)
@@ -541,6 +578,12 @@ class CoordStore:
     def drop(self, drop_id: str) -> Drop:
         with read_transaction(self._connect) as conn:
             return self._must_drop(conn, drop_id)
+
+    def drop_by_outbox(self, outbox_id: str) -> Drop | None:
+        """The drop stored under ``outbox_id``, or None."""
+        with read_transaction(self._connect) as conn:
+            row = conn.execute("SELECT drop_id FROM drops WHERE outbox_id = ?", (outbox_id,)).fetchone()
+            return None if row is None else self._drop(conn, row[0])
 
     def drops(self, limit: int = 50) -> list[Drop]:
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
@@ -714,9 +757,22 @@ class CoordStore:
         has nothing left to concern (``about`` never changes, and a closed thread is reopened only by you). Every close
         goes through here, so no path leaves an open thread pointing at a closed one."""
         self._event(conn, thread_id, "state", "closed", cause, by, now)
+        self._ended(conn, thread_id, now)
         for dependent in self._dependents(conn, thread_id):
             if self._thread(conn, dependent).state != "closed":
                 self._close(conn, dependent, f"the thread it is about ({thread_id}) closed", "service", now)
+
+    def _ended(self, conn: sqlite3.Connection, thread_id: str, now: str) -> None:
+        # T7, done kills its envelope: on every path that ends a thread, whichever class opened the file
+        from levain.coordinator.envelopes import EnvelopeStore
+
+        EnvelopeStore.end_thread(conn, thread_id, now)
+
+    def _split_done(self, conn: sqlite3.Connection, drop_id: str, thread_ids: list[str], now: str) -> None:
+        # a structured envelope the drop carried binds at its first split, whichever class opened the file
+        from levain.coordinator.envelopes import EnvelopeStore
+
+        EnvelopeStore.bind_on_split(conn, drop_id, thread_ids, now)
 
     @staticmethod
     def _dependents(conn: sqlite3.Connection, thread_id: str) -> list[str]:

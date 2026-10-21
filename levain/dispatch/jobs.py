@@ -13,9 +13,18 @@ any state before authorised, or by the human at any non-terminal state. Adopted,
 
 :data:`EDGES` is the one table of allowed transitions: (from, to) -> the causes that may take it. Every transition is
 checked against it inside its write transaction, against the current state read in that same transaction, so two
-writers can never both move a job from one state. Runs and the verifier have no public method yet (later
-slices); authorisation is :meth:`JobStore.authorise`, which :func:`levain.dispatch.adopt.land` calls. The table names
-every cause.
+writers can never both move a job from one state. Runs have no public method yet (later slices); the verifier's
+result is :meth:`JobStore.record_verification`, and authorisation is :meth:`JobStore.authorise`, which
+:func:`levain.dispatch.adopt.land` calls. The table names every cause.
+
+A verifying job's verifier sessions end on :meth:`JobStore.record_verification`, one call per run, with the session's
+terminal event and the report envelope it names (:mod:`levain.dispatch.verifier_report`). A run the verifier passed
+or failed is a RUN RECORD (:class:`levain.dispatch.adopt.ArtifactRecord`, its staged commit made first), written once;
+every run passing moves the job to ``verified`` (``verifier_pass``), one failing to ``failed`` (``verifier_fail``). An
+infrastructure failure (no report, a refused envelope, a verifier entry that is not the template's) writes no record
+and fails the job with its own cause, ``verifier_refused``, so "the verifier said fail" is never confused with "the
+verifier could not say". There is no retry: the operator files again. :meth:`JobStore.run_records` reads the records
+back, each re-checked against its digest, and is what a land reads.
 
 Every filed job holds a LEASE: an unsigned contract lapses :data:`UNSIGNED_LEASE` after filing (or at its expiry, if
 sooner), a signed one at the expiry its digest binds. Every read and every write first sweeps (:meth:`JobStore.sweep`)
@@ -63,23 +72,28 @@ import os
 import re
 import secrets
 import sqlite3
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from levain import unshowable
 from levain.authority import AuthorityError, VerifierUnavailable
 from levain.autonomic.durable_sqlite import open_durable, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
+from levain.contracts.canon import canonical
 from levain.consent.queue import AuthoritySource
 from levain.dispatch import ContractRefused, DispatchError
 from levain.dispatch import sign as dsign
 from levain.dispatch.contract import ResolvedContract, ResolvedTemplate, parse_contract, resolve_contract
 from levain.dispatch.policy import ProviderPolicy
+from levain.dispatch.verifier_report import ReportRefused, VerifierRun, check_envelope, run_problem
+
+if TYPE_CHECKING:
+    from levain.dispatch.adopt import ArtifactRecord
 
 __all__ = [
     "CAUSES", "DB_NAME", "EDGES", "FORMAT", "STATES", "TERMINAL", "UNSIGNED_LEASE", "CapabilityRefused", "Job",
@@ -87,12 +101,13 @@ __all__ = [
 ]
 
 DB_NAME = "dispatch.db"
-FORMAT = "levain-dispatch-jobs/2"
+FORMAT = "levain-dispatch-jobs/3"
 # the formats a store is migrated from IN PLACE when this code opens it, each by tables and triggers added beside
 # the old ones (CREATE ... IF NOT EXISTS) and its marker rewritten in the same transaction; no row is rewritten.
 # /2 added the human authorise item and the base_moved edges (F11), so a Levain that knows only /1 refuses the
-# store instead of misreading a job it cannot transition
-_MIGRATES_FROM = frozenset({"levain-dispatch-jobs/1"})
+# store instead of misreading a job it cannot transition. /3 added the run records and the verifier_refused cause
+# (W2-a), so a Levain that knows only /2 refuses the store instead of misreading a run it has no table for
+_MIGRATES_FROM = frozenset({"levain-dispatch-jobs/1", "levain-dispatch-jobs/2"})
 # how long an unsigned contract holds its write files before it lapses
 UNSIGNED_LEASE = timedelta(minutes=30)
 # how far a signature's signed_at may run ahead of the store's clock (the signer's clock is its own)
@@ -106,6 +121,15 @@ _SESSION_MAX = 256
 _IDEM_MAX = 128
 _EVIDENCE_MAX = 4000
 _JOB_ID = re.compile(r"dj-[0-9a-f]{32}")
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_EVENT_NAME_MAX = 256
+_SESSION_TERMINAL = ("RETAINED", "HELD")
+# the verifier_refused evidence when the minted verifier entry is not the template's: the ticket can only name the
+# template's verifier at mint, and the writer still does not trust that
+NOT_THE_TEMPLATES = "verifier-not-the-template's"
+# the verifier_refused evidence when the minted run is not a contract entry and its steps (the envelope check's own
+# refusal name, so one cause reads the same from either place)
+ENTRY_REFUSED = "verifier-entry"
 _STORE_ID = re.compile(r"[0-9a-f]{32}")
 
 STATES = ("filed", "signed", "queued", "running", "verifying", "verified", "recommended", "authorised", "adopted",
@@ -125,7 +149,8 @@ def _edges() -> dict[tuple[str, str], frozenset[str]]:
         ("queued", "running"): {"slot_taken"},
         ("running", "verifying"): {"runs_exited"},
         ("verifying", "verified"): {"verifier_pass"},
-        ("verifying", "failed"): {"verifier_fail"},
+        # the verifier said fail, or its infrastructure did (no report, or one refused): two causes, never one
+        ("verifying", "failed"): {"verifier_fail", "verifier_refused"},
         ("verified", "recommended"): {"planner_recommends"},
         ("verified", "authorised"): {"human_authorises", "human_adoption_rule"},
         ("recommended", "authorised"): {"human_authorises", "human_adoption_rule"},
@@ -261,6 +286,16 @@ _SCHEMA = (
     "CREATE TRIGGER IF NOT EXISTS job_filers_no_replace BEFORE INSERT ON job_filers "
     "WHEN EXISTS (SELECT 1 FROM job_filers WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a job filer is never replaced'); END",
+    # one verified (or failed) RUN's artifact record (F11 §7), written by the verifier writer alone: the record's
+    # canonical bytes, its artifact digest, and the digest of the verifier envelope it was read from; a run is
+    # recorded once
+    "CREATE TABLE IF NOT EXISTS run_records (job_id TEXT NOT NULL REFERENCES jobs(id), run INTEGER NOT NULL, "
+    "record TEXT NOT NULL, digest TEXT NOT NULL, envelope_digest TEXT NOT NULL, at TEXT NOT NULL, "
+    "PRIMARY KEY (job_id, run))",
+    *_append_only("run_records", "a run record is written once"),
+    "CREATE TRIGGER IF NOT EXISTS run_records_no_replace BEFORE INSERT ON run_records "
+    "WHEN EXISTS (SELECT 1 FROM run_records WHERE (job_id = NEW.job_id AND run = NEW.run) OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a run record is never replaced'); END",
     "CREATE TRIGGER IF NOT EXISTS cancel_signatures_no_replace BEFORE INSERT ON cancel_signatures "
     "WHEN EXISTS (SELECT 1 FROM cancel_signatures WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a cancel is never replaced'); END",
@@ -336,6 +371,49 @@ def _replay(authority: AuthoritySource) -> Any:
         raise                   # an AuthorityError subclass, so it must leave before the refusal clause
     except AuthorityError as exc:
         raise SignatureRefused(f"the authority log is refused: {str(exc)[:200]}") from None
+
+
+def _terminal_event(event: Any, run: VerifierRun) -> tuple[str | None, str | None]:
+    """``(refusal name, None)`` or ``(None, envelope digest)`` from the session's terminal ``state`` event; an event
+    that is not this run's session and ticket, or carries neither or both, is a :class:`DispatchError`."""
+    if not isinstance(event, Mapping) or event.get("kind") != "state":
+        raise DispatchError("the verifier's terminal event is a session state event")
+    if event.get("session") != run.session or event.get("ticket") != run.ticket:
+        raise DispatchError("the session event is another session's or another ticket's")
+    # the report rides only the transition into a terminal session state; any other state reaching here is a
+    # supervisor bug, never a verifier outcome
+    if event.get("state") not in _SESSION_TERMINAL:
+        raise DispatchError(f"the session event's state is not {' or '.join(_SESSION_TERMINAL)}")
+    if not isinstance(event.get("at"), str):
+        raise DispatchError("the session event carries no at stamp")
+    has_digest, has_refused = "verifier_report_digest" in event, "verifier_report_refused" in event
+    if has_digest == has_refused:
+        raise DispatchError("the session event carries exactly one of verifier_report_digest and "
+                            "verifier_report_refused")
+    if has_refused:
+        return _label("verifier_report_refused", event["verifier_report_refused"], _EVENT_NAME_MAX), None
+    digest = event["verifier_report_digest"]
+    if not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None:
+        raise DispatchError("the session event's verifier_report_digest is not sha256:<64 hex>")
+    return None, digest
+
+
+def _stored_record(job_id: str, run: Any, text: Any, digest: Any) -> ArtifactRecord:
+    """The run record one ``run_records`` row holds, or :class:`JobStoreError`: the row parses to a record of the
+    record's own shape, for this job and run, in its canonical bytes, under the digest stored beside it. The one check
+    every reader of a stored row uses, so the pass count never trusts a row a land would refuse."""
+    from levain.dispatch.adopt import ArtifactRecord, artifact_digest
+
+    try:
+        fields = json.loads(text)
+        rec = ArtifactRecord(**fields) if isinstance(fields, dict) else None
+    except (TypeError, ValueError):
+        rec = None
+    if rec is None or rec.problem() is not None or rec.job_id != job_id or rec.run != run or \
+            canonical(rec.to_mapping()) != text or artifact_digest(rec) != digest:
+        raise JobStoreError(f"run {run} of job {job_id} holds a record that does not match its digest; the dispatch "
+                            "store is damaged")
+    return rec
 
 
 def _label(name: str, value: Any, high: int) -> str:
@@ -428,6 +506,10 @@ class JobStore:
 
     def _stamp(self) -> str:
         return utc_stamp(_now_utc(self._clock))
+
+    def stamp(self) -> str:
+        """Now, on the store's own clock: the one clock a land judges expiry and record age by."""
+        return self._stamp()
 
     @contextmanager
     def _swept(self) -> Iterator[tuple[sqlite3.Connection, str]]:
@@ -726,6 +808,152 @@ class JobStore:
             out = self._load(conn, job.id)
         assert out is not None
         return out
+
+    def record_verification(self, run: VerifierRun, *, envelope: bytes | None, event: Mapping[str, Any], repo: str,
+                            tree: str, model: Mapping[str, str]) -> Job:
+        """Record the end of run ``run.run``'s verifier session on its verifying job. ``event`` is the session's
+        terminal ``state`` event (``session``, ``ticket``, ``at`` and one of ``verifier_report_digest`` /
+        ``verifier_report_refused``), ``envelope`` the report envelope file's bytes (``None`` when none was read),
+        ``tree`` the run's artifact tree, ``model`` the run's ``{requested, answered, backend_identity}``.
+
+        A refused event, a minted run that is not a contract entry and its steps (:data:`ENTRY_REFUSED`), a minted
+        verifier entry that is not the template's (:data:`NOT_THE_TEMPLATES`), both checked before anything is
+        staged, or an envelope :func:`levain.dispatch.verifier_report.check_envelope` refuses fails
+        the job with cause ``verifier_refused``, the evidence the refusal's name, and writes no record. A report that
+        checks: the run's commit is staged (:func:`levain.dispatch.adopt.stage_commit`, ``verified_at`` the event's
+        ``at``, so the staged sha re-derives from the record alone), its record built and judged by
+        :func:`levain.dispatch.adopt.artifact_problem`, then written; a ``fail`` result fails the job
+        (``verifier_fail``, the evidence the first failing step and its note), and once every run 0..k-1 has a
+        passing record the job is ``verified`` (``verifier_pass``). The record and the transition are one write
+        transaction, the state re-read inside it. A job that is not verifying, or a run already recorded, is a
+        :class:`TransitionRefused` and nothing is written; an event that is not this run's, another repository, a
+        run outside 0..k-1, or a record the artifact check refuses is a :class:`DispatchError` and nothing is written
+        (a commit already staged is kept, and a retry finds it). Raises
+        :class:`levain.dispatch.adopt.GitFault` when git cannot run."""
+        from levain.dispatch import adopt
+
+        if not isinstance(run, VerifierRun):
+            raise DispatchError("run must be the VerifierRun the supervisor minted")
+        refused, report_digest = _terminal_event(event, run)
+        with self._swept() as (conn, _stamp):
+            job = self._must_load(conn, run.job_id)
+            recorded = conn.execute("SELECT 1 FROM run_records WHERE job_id = ? AND run = ?",
+                                    (job.id, run.run)).fetchone() is not None
+        if job.state != "verifying":
+            raise TransitionRefused(f"job {job.id} is {job.state}; only a verifying job records its verifier")
+        if recorded:
+            raise TransitionRefused(f"run {run.run} of job {job.id} is already recorded; a run record is never "
+                                    "replaced")
+        if repo != job.repo:
+            raise DispatchError(f"the verifier ran for another repository than job {job.id}'s")
+        contract = job.contract
+        template = contract.template
+        if type(run.run) is not int or not 0 <= run.run < template.k:
+            raise DispatchError(f"run {str(run.run)[:8]} is not one of the template's runs 0..{template.k - 1}")
+        entry = run.verifier if isinstance(run.verifier, Mapping) else {}
+        name: str | None = None
+        # the minted entry and steps are judged before anything else reads them: an entry that is not the contract's
+        # seven fields, or steps its steps_digest does not bind, is the supervisor's infrastructure failing
+        if run_problem(run) is not None:
+            name = ENTRY_REFUSED
+        elif (entry.get("verifier_id"), entry.get("verifier_artifact_digest"), entry.get("declared_kind")) != (
+                template.verifier_id, template.verifier_hash, template.verifier_kind):
+            name = NOT_THE_TEMPLATES
+        elif refused is not None:
+            name = refused
+        else:
+            assert report_digest is not None
+            try:
+                report = check_envelope(envelope, expected=run, event_digest=report_digest)
+            except ReportRefused as exc:
+                name = exc.name
+        record: ArtifactRecord | None = None
+        if name is None:
+            verified_at = event["at"]
+            fields = dict(job_id=job.id, run=run.run, contract_digest=job.digest, base=contract.base, tree=tree,
+                          verifier={"id": entry["verifier_id"], "hash": entry["verifier_artifact_digest"],
+                                    "kind": entry["declared_kind"], "result": report.result},
+                          model=dict(model) if isinstance(model, Mapping) else model, verified_at=verified_at)
+            # the record judged on its own fields before anything is staged, the base standing in for the commit
+            # not yet made (a malformed tree, model or stamp never reaches git)
+            problem = adopt.ArtifactRecord(staged_commit=contract.base, **fields).problem()
+            if problem is not None:
+                raise DispatchError(problem)
+            staged = adopt.stage_commit(repo, job_id=job.id, run=run.run, contract_digest=job.digest,
+                                        base=contract.base, tree=tree, verified_at=verified_at)
+            record = adopt.ArtifactRecord(staged_commit=staged, **fields)
+            problem = adopt.artifact_problem(repo, job, record)
+            if problem is not None:
+                raise DispatchError(problem)
+        lost: str | None = None
+        with self._swept() as (conn, stamp):
+            current = self._must_load(conn, job.id)
+            if current.state != "verifying":
+                lost = current.state
+            elif record is None:
+                assert name is not None
+                # another writer may have recorded this run since the pre-read: its record stands, and this
+                # writer's infrastructure failure is refused rather than failing a job that holds it
+                if conn.execute("SELECT 1 FROM run_records WHERE job_id = ? AND run = ?",
+                                (job.id, run.run)).fetchone() is not None:
+                    raise TransitionRefused(f"run {run.run} of job {job.id} is already recorded; a run record is "
+                                            "never replaced")
+                self._apply(conn, job.id, "failed", "verifier_refused", stamp, name)
+            else:
+                try:
+                    conn.execute("INSERT INTO run_records (job_id, run, record, digest, envelope_digest, at) "
+                                 "VALUES (?, ?, ?, ?, ?, ?)",
+                                 (job.id, record.run, canonical(record.to_mapping()), adopt.artifact_digest(record),
+                                  report.digest, stamp))
+                except sqlite3.IntegrityError:
+                    raise TransitionRefused(f"run {record.run} of job {job.id} is already recorded; a run record "
+                                            "is never replaced") from None
+                failure = report.first_failure
+                if failure is not None:
+                    self._apply(conn, job.id, "failed", "verifier_fail", stamp,
+                                json.dumps({"run": record.run, "step": failure.step, "note": failure.note},
+                                           sort_keys=True))
+                else:
+                    passed = {r for r, text, digest in conn.execute(
+                        "SELECT run, record, digest FROM run_records WHERE job_id = ?", (job.id,))
+                        if _stored_record(job.id, r, text, digest).verifier["result"] == "pass"}
+                    if passed == set(range(template.k)):
+                        self._apply(conn, job.id, "verified", "verifier_pass", stamp,
+                                    json.dumps({"runs": template.k}, sort_keys=True))
+            out = self._load(conn, job.id)
+        assert out is not None
+        if out.state == "failed" and (lost is None or record is not None):
+            # a failed job can never land, so its staged refs (this run's and every run that passed before it) are
+            # clutter in the operator's repo. This covers the failures this writer makes, and a job this writer staged
+            # for and then found failed by another; a job that ends by lapse or cancel is swept by F11-s2's land verb.
+            # Deleted once the failure is durable; a record keeps its sha, and only ever is read. A ref git keeps, or
+            # git not answering, leaves clutter and nothing worse, so it never raises
+            try:
+                adopt._delete_staged(repo, job.id)
+            except adopt.GitFault:
+                pass
+        if lost is not None:
+            raise TransitionRefused(f"job {job.id} is {lost}; only a verifying job records its verifier")
+        return out
+
+    def run_records(self, job_id: str) -> list[ArtifactRecord]:
+        """Job ``job_id``'s run records, by run, each re-checked against the digest written beside it: a record whose
+        bytes are not its canonical form, or whose digest is not the one stored, is a :class:`JobStoreError`, never
+        skipped. The one source of the records a land reads."""
+        with self._swept() as (conn, _stamp):
+            job = self._must_load(conn, job_id)
+            rows = conn.execute("SELECT run, record, digest FROM run_records WHERE job_id = ? ORDER BY run",
+                                (job.id,)).fetchall()
+        return [_stored_record(job.id, run, text, digest) for run, text, digest in rows]
+
+    def run_record(self, job_id: str, run: int) -> ArtifactRecord | None:
+        """Run ``run``'s record of job ``job_id`` checked as :meth:`run_records` checks every row, or ``None`` when that
+        run has none. Reads that one row only, so an authorised job's finish never depends on its other runs' rows."""
+        with self._swept() as (conn, _stamp):
+            job = self._must_load(conn, job_id)
+            row = conn.execute("SELECT run, record, digest FROM run_records WHERE job_id = ? AND run = ?",
+                               (job.id, run)).fetchone()
+        return None if row is None else _stored_record(job.id, *row)
 
     def get(self, job_id: str) -> Job | None:
         """The job ``job_id`` after a sweep, or ``None``."""

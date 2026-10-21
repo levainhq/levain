@@ -6,11 +6,16 @@ needs). LAND (E1, "adopted"): one ``update-ref`` compare-and-swap moves a branch
 contract's ``base`` to a staged commit. A land is authorised by (A) the operator's signed authorise item over the
 run's ARTIFACT digest and the branch (:func:`authorise_payload`, its own namespace), or (B) a standing adoption rule
 whose typed criteria hold (:func:`levain.dispatch.registry.active_adoption_rules`); (C), the envelope, comes with the
-coordinator build. Every authority passes ONE floor (:func:`floor`, F11 §4), whose first failure decides.
+coordinator build. Every authority passes ONE floor (:func:`floor`, F11 §4), whose first failure decides. The run
+records a land judges are the job store's own (:meth:`levain.dispatch.jobs.JobStore.run_records`, as
+:meth:`~levain.dispatch.jobs.JobStore.record_verification` wrote them); :func:`land` takes none from its caller,
+so a record built over another staged tree has no way to land. Nor does it take a clock: expiry and record age
+are judged on the store's (:meth:`levain.dispatch.jobs.JobStore.stamp`).
 
 :func:`land` is F11 §6: on a verified or recommended job the floor runs in full and only then is ``authorised``
 written, its evidence the INTENT (authority, run, branch, staged commit, base, tree, artifact digest). That write is
-the linearisation point: an ``authorised`` job never re-enters the floor and reads nothing mutable again. From the
+the linearisation point: an ``authorised`` job never re-enters the floor and reads nothing mutable again (its run
+record is an append-only row, re-checked against its digest). From the
 intent: a branch that already contains the staged commit records ``adopted`` and moves nothing (a crash after the
 swap, or the operator's own merge with his commits on top); a branch still at ``base`` is checked out somewhere ->
 Levain prints the operator's own ``git -C <worktree> merge --ff-only <sha>`` and stops (it never touches a
@@ -30,7 +35,9 @@ classifiers. It is INJECTED (``landing_tier(repo, paths)``) and there is no defa
 it returns but ``"T2"``/``"T3"``, and any exception from it, refuses the land.
 
 Known edge (F11 §8): until S1 places principals, every actor is the operator's uid, so a planner can merge a staged
-ref itself and skip all of this; F11 is the path Levain records, not a boundary, until then. Stdlib only.
+ref itself and skip all of this; F11 is the path Levain records, not a boundary, until then. Known edge (F11 §10): the
+contract's expiry and a ``max_age_hours`` criterion are judged at the land's one stamp, taken before the floor, so a
+land that straddles the bound by its own duration authorises once. Stdlib only.
 """
 from __future__ import annotations
 
@@ -62,6 +69,7 @@ from levain.dispatch.sign import FIELD_MAX, SIGNATURE_MAX
 __all__ = [
     "AUTHORISE_FORMAT", "AUTHORISE_KEYS", "DISPATCH_AUTHORISE_NAMESPACE", "MAX_BLOB_BYTES", "MAX_ENTRIES",
     "MAX_TOTAL_BYTES", "ArtifactRecord", "Change", "ChangeSet", "Floor", "GitFault", "Landing", "artifact_digest",
+    "artifact_problem",
     "authorise_message", "authorise_payload", "authorise_refusal", "branch_problem", "change_set",
     "criteria_failure", "floor", "land", "revalidation_problem", "stage_commit", "staged_ref",
 ]
@@ -597,7 +605,10 @@ def _tier(landing_tier: Callable[[str, tuple[str, ...]], str], repo: str, paths:
     return tier if isinstance(tier, str) and tier in TIERS else None
 
 
-def _artifact_problem(repo: str, job: Job, record: ArtifactRecord) -> str | None:
+def artifact_problem(repo: str, job: Job, record: ArtifactRecord) -> str | None:
+    """Why ``record`` is not a run of ``job`` whose staged commit this repository holds as recorded (its own
+    fields, the job, contract, base and template verifier it names, a commit whose one parent is the base and whose
+    tree is the recorded tree); ``None`` when it is. Raises :class:`GitFault` when git cannot run."""
     problem = record.problem()
     if problem is not None:
         return problem
@@ -729,7 +740,7 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
         if not candidates:
             return _refuse("no verified run to land")
     for r in candidates:
-        problem = _artifact_problem(repo, job, r)
+        problem = artifact_problem(repo, job, r)
         if problem is not None:
             return _refuse(problem)
     record = candidates[0]
@@ -880,8 +891,9 @@ def _fail_moved(store: JobStore, job: Job, line: str) -> Landing:
     return Landing(outcome="failed", job=out, message=line + note)
 
 
-def _finish(store: JobStore, job: Job, records: Sequence[ArtifactRecord]) -> Landing:
-    """An authorised job: decide on ``onto`` alone, from the intent (F11 §6); nothing mutable is read."""
+def _finish(store: JobStore, job: Job) -> Landing:
+    """An authorised job: decide on ``onto`` alone, from the intent (F11 §6); nothing mutable is read. The intent's
+    run record (that run's append-only row alone) must still be the one authorised."""
     intent = _intent(job)
     repo, onto, staged, base = job.repo, intent["onto"], intent["staged"], intent["base"]
     tip = _read_branch(repo, onto)
@@ -897,8 +909,8 @@ def _finish(store: JobStore, job: Job, records: Sequence[ArtifactRecord]) -> Lan
     shape = _commit_shape(repo, staged)
     if shape is None or shape[0] != [base] or shape[1] != intent["tree"]:
         return Landing(outcome="refused", job=job, message="the staged commit is no longer the one authorised")
-    mine = [r for r in records if r.problem() is None and r.run == intent["run"]]
-    if mine and artifact_digest(mine[0]) != intent["artifact_digest"]:
+    mine = store.run_record(job.id, intent["run"])
+    if mine is None or artifact_digest(mine) != intent["artifact_digest"]:
         return Landing(outcome="refused", job=job, message="the run's record is no longer the one authorised")
     if _symbolic(repo, onto):
         return Landing(outcome="refused", job=job, message=f"refs/heads/{onto} is a symbolic ref")
@@ -923,25 +935,46 @@ def _finish(store: JobStore, job: Job, records: Sequence[ArtifactRecord]) -> Lan
     return Landing(outcome="adopted", job=out, moved=True, message=f"{onto} -> {staged}")
 
 
-def land(store: JobStore, job_id: str, records: Sequence[ArtifactRecord], *,
+def _taken(store: JobStore, job: Job) -> Landing | None:
+    """A ``job`` already past the floor (another land took it, or it was settled before this land ran), as this land
+    reports it: an ``authorised`` job is finished from ITS intent (the authorisation written first is the authority),
+    ``adopted`` and a ``base_moved`` failure are said as they are; anything else is ``None``. The one classification
+    for every point a land can find its job moved."""
+    if job.state == "authorised":
+        return _finish(store, job)
+    if job.state == "adopted":
+        return Landing(outcome="adopted", job=job, message="the job is already adopted")
+    if job.state == "failed" and job.history[-1].cause == "base_moved":
+        return Landing(outcome="failed", job=job, message="the job failed: its base moved")
+    return None
+
+
+def land(store: JobStore, job_id: str, *,
          landing_tier: Callable[[str, tuple[str, ...]], str],
          resolve_template: Callable[[str], ResolvedTemplate | None], policy: ProviderPolicy,
          onto: str | None = None, human: tuple[Any, Any, Any] | None = None,
-         rules: Callable[[], tuple[int, Sequence[dregistry.AdoptionRule]]] | None = None,
-         now: str | None = None) -> Landing:
-    """F11 §6 for job ``job_id``. ``human`` is ``(payload, signature, authority)`` for (A); ``rules`` returns the
-    active adoption rules and their generation for (B) (``lambda: adoption_rules_at(control_store)``). A MOVED BASE
-    before authorisation fails the job only under an (A) item whose signature verifies (the human named that run and branch);
-    an unverified item or a rule land is refused and the job and its staged refs are kept. ``landing_tier`` has no
-    default. A verified/recommended job passes the floor and is authorised (the INTENT) before anything moves; an
-    authorised job goes straight to :func:`_finish`. A refused signature is a ``refused`` landing; a verifier that
-    cannot run (:class:`levain.authority.VerifierUnavailable`) and a git that cannot run (:class:`GitFault`) raise."""
+         rules: Callable[[], tuple[int, Sequence[dregistry.AdoptionRule]]] | None = None) -> Landing:
+    """F11 §6 for job ``job_id``, over the job's own run records (:meth:`JobStore.run_records`; a stored row that
+    does not match its digest raises :class:`levain.dispatch.jobs.JobStoreError`). ``human`` is ``(payload, signature,
+    authority)`` for (A); ``rules`` returns the active adoption rules and their generation for (B) (``lambda:
+    adoption_rules_at(control_store)``). A MOVED BASE before authorisation fails the job only under an (A) item
+    whose signature verifies (the human named that run and branch); an unverified item or a rule land is refused and
+    the job and its staged refs are kept. ``landing_tier`` has no default. A verified/recommended job passes the
+    floor and is authorised (the INTENT) before anything moves; an authorised job goes straight to :func:`_finish`.
+    A refused signature is a ``refused`` landing; a verifier that cannot run
+    (:class:`levain.authority.VerifierUnavailable`) and a git that cannot run (:class:`GitFault`) raise."""
     job = store.get(job_id)
     if job is None:
         raise TransitionRefused(f"no dispatch job {str(job_id)[:40]!r}")
     if job.state == "authorised":
-        return _finish(store, job, records)
-    stamp = now or utc_stamp(store._clock())
+        return _finish(store, job)
+    # the records first, then the job read again: a lease the records' sweep lapsed is the state the floor judges
+    records = store.run_records(job.id)
+    job = store.get(job.id) or job
+    taken = _taken(store, job)
+    if taken is not None:
+        return taken
+    stamp = store.stamp()
     payload = human[0] if human is not None else None
     verdict = floor(job, records, onto=onto, landing_tier=landing_tier, resolve_template=resolve_template,
                     policy=policy, now=stamp, human=payload if isinstance(payload, Mapping) else
@@ -982,14 +1015,10 @@ def land(store: JobStore, job_id: str, records: Sequence[ArtifactRecord], *,
         again = store.get(job.id)
         if again is None:
             raise
-        if again.state == "adopted":
-            return Landing(outcome="adopted", job=again, message="another land adopted this job")
-        if again.state == "failed" and again.history[-1].cause == "base_moved":
-            return Landing(outcome="failed", job=again, message="another land found the base moved")
-        if again.state != "authorised":
-            raise
-        job = again
-    return _finish(store, job, records)
+        return _taken(store, again) or Landing(outcome="refused", job=again, message=f"job {again.id} became "
+                                                                                     f"{again.state} during this "
+                                                                                     "land; nothing moved")
+    return _finish(store, job)
 
 
 def _human_refusal(store: JobStore, job: Job, human: tuple[Any, Any, Any], record: ArtifactRecord,
@@ -1021,13 +1050,53 @@ def stage_commit(repo: str, *, job_id: str, run: int, contract_digest: str, base
                  verified_at: str) -> str:
     """Make the deterministic staged commit of one run (parent ``base``, ``tree``, author and committer
     ``levain dispatch`` dated ``verified_at``, a message naming the job, the run, the contract digest and the tree)
-    and point :func:`staged_ref` at it (created, never moved); returns its sha. The same inputs make the same sha."""
+    and point :func:`staged_ref` at it (created, never moved); returns its sha. The same inputs make the same sha, so
+    a call whose ref already points at exactly that sha returns it (a crash between the ref and the record it was made
+    for must not wedge the retry); a ref that points anywhere else, or is symbolic, is a :class:`DispatchError`, and a
+    create that fails with no ref after it is a :class:`GitFault` carrying git's words."""
     when = f"{int(parse_stamp(verified_at).timestamp())} +0000"
     env = {"GIT_AUTHOR_NAME": _STAGE_NAME, "GIT_AUTHOR_EMAIL": _STAGE_EMAIL, "GIT_AUTHOR_DATE": when,
            "GIT_COMMITTER_NAME": _STAGE_NAME, "GIT_COMMITTER_EMAIL": _STAGE_EMAIL, "GIT_COMMITTER_DATE": when}
     message = (f"levain dispatch {job_id} run {run}\n\ncontract {contract_digest}\ntree {tree}\n").encode("utf-8")
     sha = _git_ok(repo, "commit-tree", "--no-gpg-sign", tree, "-p", base, feed=message,
                   extra_env=env).decode("ascii").strip()
-    zero = "0" * len(sha)
-    _git_ok(repo, "update-ref", "--no-deref", staged_ref(job_id, run), sha, zero)
+    ref = staged_ref(job_id, run)
+    held = _staged_held(repo, ref)
+    if held is None:
+        cp = _git(repo, "update-ref", "--no-deref", ref, sha, "0" * len(sha))
+        if cp.returncode == 0:
+            return sha
+        # another writer created it between the read and the create: judge what it holds; no ref at all means the
+        # create failed for its own reason, which git's words say
+        held = _staged_held(repo, ref)
+        if held is None:
+            detail = cp.stderr.decode("utf-8", "replace").strip().splitlines()
+            raise GitFault(f"git update-ref could not create {ref}: "
+                           f"{detail[-1][:200] if detail else cp.returncode}")
+    if held != sha:
+        raise DispatchError(f"{ref} already points at {held[:64]}, not this run's staged commit {sha}; a staged "
+                            "ref is never moved, and the staged commit is dated by the event, so a retry carries the "
+                            "event that staged it")
     return sha
+
+
+def _staged_held(repo: str, ref: str) -> str | None:
+    """The object the staged ``ref`` names, or ``None`` when it does not exist; a symbolic ref is refused, never
+    followed (its target can move, and the staged ref would move with it)."""
+    cp = _git(repo, "symbolic-ref", "-q", ref)
+    if cp.returncode == 0:
+        raise DispatchError(f"{ref} is a symbolic ref; a staged ref is a direct ref, never followed")
+    if cp.returncode != 1:
+        raise GitFault(f"git symbolic-ref failed in {repo} (exit {cp.returncode})")
+    return _read_ref(repo, ref)
+
+
+def _read_ref(repo: str, ref: str) -> str | None:
+    """The object ``ref`` names, or ``None`` when it does not exist (rev-parse --quiet exit 1); any other failure
+    raises."""
+    cp = _git(repo, "rev-parse", "--verify", "--quiet", "--end-of-options", ref)
+    if cp.returncode == 1:
+        return None
+    if cp.returncode != 0:
+        raise GitFault(f"git rev-parse failed in {repo} (exit {cp.returncode})")
+    return cp.stdout.decode("ascii").strip()

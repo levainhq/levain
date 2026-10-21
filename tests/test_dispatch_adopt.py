@@ -139,13 +139,40 @@ def human(job, rec, keys, log, *, onto="main", key="laptop"):
     return payload, keys[key].sign(authorise_message(payload), DISPATCH_AUTHORISE_NAMESPACE), log.source
 
 
+def put(jstore, recs) -> None:
+    """``recs`` into the job store's ``run_records``, the one source a land reads, as the verifier writer would write
+    them (its canonical bytes and artifact digest; the envelope digest a placeholder). A run already stored with the
+    same bytes is left; another record for a stored run fails the test, as the store's append-only trigger would."""
+    import sqlite3
+
+    from levain.contracts.canon import canonical
+
+    conn = sqlite3.connect(jstore.directory / "dispatch.db")
+    try:
+        with conn:
+            for r in recs:
+                text = canonical(r.to_mapping())
+                row = conn.execute("SELECT record FROM run_records WHERE job_id = ? AND run = ?",
+                                   (r.job_id, r.run)).fetchone()
+                if row is not None:
+                    assert row[0] == text, f"run {r.run} is already stored with another record"
+                    continue
+                conn.execute("INSERT INTO run_records (job_id, run, record, digest, envelope_digest, at) "
+                             "VALUES (?, ?, ?, ?, ?, ?)",
+                             (r.job_id, r.run, text, artifact_digest(r), "sha256:" + "e" * 64, VERIFIED_AT))
+    finally:
+        conn.close()
+
+
 def by_rule(jstore, cstore, job, recs, *, onto="main", tier=T2, **kw):
-    return land(jstore, job.id, recs, landing_tier=tier, resolve_template=resolver(cstore),
+    put(jstore, recs)
+    return land(jstore, job.id, landing_tier=tier, resolve_template=resolver(cstore),
                 policy=active_policy(cstore), onto=onto, rules=lambda: adoption_rules_at(cstore), **kw)
 
 
 def by_human(jstore, cstore, job, recs, h, *, tier=T2, **kw):
-    return land(jstore, job.id, recs, landing_tier=tier, resolve_template=resolver(cstore),
+    put(jstore, recs)
+    return land(jstore, job.id, landing_tier=tier, resolve_template=resolver(cstore),
                 policy=active_policy(cstore), human=h, **kw)
 
 
@@ -191,6 +218,51 @@ def test_the_staged_commit_is_deterministic(repo, jstore, cstore, tmp_path):
     assert a == b and shown == f"levain dispatch|levain dispatch|{repo[1]}"
 
 
+def test_staging_again_returns_the_held_commit_and_never_moves_a_ref(repo, jstore, cstore, tmp_path):
+    from levain.dispatch import DispatchError
+
+    job = verified_job(jstore, cstore, repo)
+    tree = make_tree(repo[0], repo[1], A_FIX, tmp_path)
+    kw = dict(job_id=job.id, run=0, contract_digest=job.digest, base=repo[1], tree=tree)
+    a = stage_commit(str(repo[0]), verified_at=VERIFIED_AT, **kw)
+    assert stage_commit(str(repo[0]), verified_at=VERIFIED_AT, **kw) == a
+    later = utc_stamp(NOW + timedelta(minutes=7))
+    with pytest.raises(DispatchError, match="never moved"):
+        stage_commit(str(repo[0]), verified_at=later, **kw)
+    with pytest.raises(DispatchError, match="dated by the event"):
+        stage_commit(str(repo[0]), verified_at=later, **kw)
+    assert git(repo[0], "rev-parse", staged_ref(job.id, 0)) == a
+
+
+def test_a_symbolic_staged_ref_is_refused_never_followed(repo, jstore, cstore, tmp_path):
+    from levain.dispatch import DispatchError
+
+    job = verified_job(jstore, cstore, repo)
+    tree = make_tree(repo[0], repo[1], A_FIX, tmp_path)
+    kw = dict(job_id=job.id, run=0, contract_digest=job.digest, base=repo[1], tree=tree, verified_at=VERIFIED_AT)
+    sha = stage_commit(str(repo[0]), **kw)
+    git(repo[0], "update-ref", "-d", staged_ref(job.id, 0))
+    # a branch at exactly the staged sha, and the staged name a symref to it: following it would accept a ref that
+    # moves when the branch does
+    git(repo[0], "update-ref", "refs/heads/elsewhere", sha)
+    git(repo[0], "symbolic-ref", staged_ref(job.id, 0), "refs/heads/elsewhere")
+    with pytest.raises(DispatchError, match="symbolic ref"):
+        stage_commit(str(repo[0]), **kw)
+
+
+def test_a_create_that_fails_with_no_ref_after_is_a_git_fault_carrying_gits_words(repo, jstore, cstore, tmp_path):
+    from levain.dispatch.adopt import GitFault
+
+    job = verified_job(jstore, cstore, repo)
+    tree = make_tree(repo[0], repo[1], A_FIX, tmp_path)
+    # a ref beneath the staged name: the staged ref cannot be created and does not exist
+    git(repo[0], "update-ref", staged_ref(job.id, 0) + "/x", repo[1])
+    with pytest.raises(GitFault) as exc:
+        stage_commit(str(repo[0]), job_id=job.id, run=0, contract_digest=job.digest, base=repo[1], tree=tree,
+                     verified_at=VERIFIED_AT)
+    assert "None" not in str(exc.value) and staged_ref(job.id, 0) in str(exc.value)
+
+
 # --- (a) crash after the swap, before adopted ----------------------------------------------------------------------
 
 def test_a_crash_after_the_swap_recovers_to_adopted_moving_nothing(jstore, cstore, repo, log, keys, tmp_path,
@@ -208,7 +280,7 @@ def test_a_crash_after_the_swap_recovers_to_adopted_moving_nothing(jstore, cstor
     assert git(repo[0], "rev-parse", "main") == recs[0].staged_commit
     monkeypatch.undo()
     # the retry reads nothing mutable: rules that now raise and a tier that raises change nothing
-    out = land(jstore, job.id, recs, landing_tier=lambda r, p: 1 / 0, resolve_template=lambda t: 1 / 0,
+    out = land(jstore, job.id, landing_tier=lambda r, p: 1 / 0, resolve_template=lambda t: 1 / 0,
                policy=active_policy(cstore), rules=lambda: 1 / 0)
     assert out.outcome == "adopted" and not out.moved
     assert git(repo[0], "rev-parse", "main") == recs[0].staged_commit
@@ -444,7 +516,7 @@ def test_a_landing_tier_that_is_not_t2_or_t3_fails_closed(tier, jstore, cstore, 
 
 def test_the_landing_tier_has_no_default():
     with pytest.raises(TypeError):
-        land(None, "dj-x", [], resolve_template=None, policy=None)            # type: ignore[call-arg, arg-type]
+        land(None, "dj-x", resolve_template=None, policy=None)            # type: ignore[call-arg, arg-type]
 
 
 # --- (j) the contrast ----------------------------------------------------------------------------------------------
@@ -460,16 +532,17 @@ def test_unequal_staged_trees_refuse_a_rule_and_a_human_picks_one(jstore, cstore
     assert out.outcome == "adopted" and git(repo[0], "rev-parse", "main") == r1.staged_commit
 
 
-def test_a_rule_needs_distinct_backends_and_black_box_passes(jstore, cstore, repo, log, keys, tmp_path):
+@pytest.mark.parametrize("backends, kinds, why", [
+    (("b", "b"), ("black-box", "black-box"), "same backend identity"),
+    ((None, None), ("black-box", "in-process"), "another verifier than the signed template"),
+])
+def test_a_rule_needs_distinct_backends_and_black_box_passes(backends, kinds, why, jstore, cstore, repo, log, keys,
+                                                             tmp_path):
     with_rule(cstore, log, keys, repo)
     job = verified_job(jstore, cstore, repo)
     tree = make_tree(repo[0], repo[1], A_FIX, tmp_path)
-    same = [record(repo, job, 0, tree, backend="b"), record(repo, job, 1, tree, backend="b")]
-    assert "same backend identity" in by_rule(jstore, cstore, job, same).message
-    for i in (0, 1):
-        git(repo[0], "update-ref", "-d", staged_ref(job.id, i))
-    inproc = [record(repo, job, 0, tree), record(repo, job, 1, tree, kind="in-process")]
-    assert "another verifier than the signed template" in by_rule(jstore, cstore, job, inproc).message
+    recs = [record(repo, job, i, tree, backend=backends[i], kind=kinds[i]) for i in (0, 1)]
+    assert why in by_rule(jstore, cstore, job, recs).message
 
 
 # --- revalidation and the artifact ---------------------------------------------------------------------------------
@@ -478,12 +551,13 @@ def test_a_changed_template_or_policy_refuses(jstore, cstore, repo, log, keys, t
     job = verified_job(jstore, cstore, repo)
     recs = runs(repo, job, tmp_path, A_FIX)
     h = human(job, recs[0], keys, log)
-    out = land(jstore, job.id, recs, landing_tier=T2, resolve_template=lambda t: None, policy=active_policy(cstore),
+    put(jstore, recs)
+    out = land(jstore, job.id, landing_tier=T2, resolve_template=lambda t: None, policy=active_policy(cstore),
                human=h)
     assert out.outcome == "refused" and "no longer registered" in out.message
     from levain.dispatch.policy import ProviderPolicy
     other = ProviderPolicy.from_mapping({"never": [], "providers": {"openrouter": {"read": ["**"]}}})
-    out = land(jstore, job.id, recs, landing_tier=T2, resolve_template=resolver(cstore), policy=other, human=h)
+    out = land(jstore, job.id, landing_tier=T2, resolve_template=resolver(cstore), policy=other, human=h)
     assert out.outcome == "refused" and "provider policy" in out.message
 
 
@@ -723,11 +797,12 @@ def test_a_finisher_that_loses_to_another_reports_the_adoption(jstore, cstore, r
     with_rule(cstore, log, keys, repo)
     job = verified_job(jstore, cstore, repo)
     recs = runs(repo, job, tmp_path, A_FIX)
+    put(jstore, recs)
     stale = jstore.authorise(job.id, cause="human_adoption_rule", evidence=__import__("json").dumps(
         {"authority": "B", "run": 0, "onto": "main", "staged": recs[0].staged_commit, "base": repo[1],
          "tree": recs[0].tree, "artifact_digest": adopt.artifact_digest(recs[0]), "tier": "T2", "rule": None}))
-    assert adopt._finish(jstore, stale, recs).outcome == "adopted"           # the first finisher lands
-    again = adopt._finish(jstore, stale, recs)                               # the second read it as authorised
+    assert adopt._finish(jstore, stale).outcome == "adopted"           # the first finisher lands
+    again = adopt._finish(jstore, stale)                               # the second read it as authorised
     assert again.outcome == "adopted" and again.job.state == "adopted"
 
 
@@ -750,11 +825,12 @@ def test_a_finisher_whose_cas_moved_the_branch_says_so_when_another_recorded_it(
     with_rule(cstore, log, keys, repo)
     job = verified_job(jstore, cstore, repo)
     recs = runs(repo, job, tmp_path, A_FIX)
+    put(jstore, recs)
     stale = jstore.authorise(job.id, cause="human_adoption_rule", evidence=__import__("json").dumps(
         {"authority": "B", "run": 0, "onto": "main", "staged": recs[0].staged_commit, "base": repo[1],
          "tree": recs[0].tree, "artifact_digest": adopt.artifact_digest(recs[0]), "tier": "T2", "rule": None}))
-    monkeypatch.setattr(adopt, "_after_cas", lambda: adopt._finish(jstore, stale, recs))   # B, inside A's window
-    out = adopt._finish(jstore, stale, recs)
+    monkeypatch.setattr(adopt, "_after_cas", lambda: adopt._finish(jstore, stale))   # B, inside A's window
+    out = adopt._finish(jstore, stale)
     assert out.outcome == "adopted" and out.moved and recs[0].staged_commit in out.message
 
 
@@ -763,10 +839,143 @@ def test_a_cancel_after_this_lands_cas_reports_the_move(jstore, cstore, repo, lo
     with_rule(cstore, log, keys, repo)
     job = verified_job(jstore, cstore, repo)
     recs = runs(repo, job, tmp_path, A_FIX)
+    put(jstore, recs)
     stale = jstore.authorise(job.id, cause="human_adoption_rule", evidence=__import__("json").dumps(
         {"authority": "B", "run": 0, "onto": "main", "staged": recs[0].staged_commit, "base": repo[1],
          "tree": recs[0].tree, "artifact_digest": adopt.artifact_digest(recs[0]), "tier": "T2", "rule": None}))
     monkeypatch.setattr(adopt, "_after_cas", lambda: jstore._transition(job.id, "cancelled", "human_cancel"))
-    out = adopt._finish(jstore, stale, recs)
+    out = adopt._finish(jstore, stale)
     assert out.outcome == "refused" and out.moved and "git revert" in out.message
     assert git(repo[0], "rev-parse", "main") == recs[0].staged_commit
+
+
+def test_a_land_reads_the_records_the_verifier_wrote_and_takes_none_from_its_caller(jstore, cstore, repo, log, keys,
+                                                                                     tmp_path):
+    # the F11-s2a run (levain-memory 1020-f11/f11s2a_run): on main 087c2bf5 a caller's record over a forged staged
+    # commit (another tree, parent base, never verified) landed under a standing rule. Now land() has no way to take it
+    import inspect
+
+    from tests import test_dispatch_verifier_report as tvr
+
+    with_rule(cstore, log, keys, repo)
+    assert {"records", "now"}.isdisjoint(inspect.signature(land).parameters)   # no caller records, no caller clock
+    path, base = repo
+    # a job walked to verifying, then both runs through the verifier writer itself
+    sub = {"template": "fix-lint", "goal": "Fix a.", "read": ["src/a.py"], "write": WRITES, "base": base,
+           "budget": {"tool_calls": 40, "tokens": 200000, "dollars_cents": 150}, "grant": ["Edit"],
+           "expires_at": utc_stamp(NOW + timedelta(hours=2)), "repo": str(path)}
+    j, _cap = jstore.file(sub, resolve_template=resolver(cstore), policy=active_policy(cstore), filer_session="s")
+    for to, cause in (("signed", "signature"), ("running", "slot_taken"), ("verifying", "runs_exited")):
+        j = jstore._transition(j.id, to, cause)
+    tree = make_tree(path, base, A_FIX, tmp_path)
+    for i in (0, 1):
+        r = tvr.vrun(j.id, i)
+        raw, digest = tvr.envelope(r, tvr.body(("pass", "pass")))
+        j = jstore.record_verification(r, envelope=raw, event=tvr.event(r, at=VERIFIED_AT,
+                                                                         verifier_report_digest=digest),
+                                        repo=str(path), tree=tree,
+                                        model={"requested": "glm-5", "answered": "glm-5", "backend_identity": f"b{i}"})
+    assert j.state == "verified"
+    stored = jstore.run_records(j.id)
+    jstore._clock.now = NOW + timedelta(minutes=10)
+    kw = dict(landing_tier=T2, resolve_template=resolver(cstore), policy=active_policy(cstore), onto="main",
+              rules=lambda: adoption_rules_at(cstore))
+    with pytest.raises(TypeError):
+        land(jstore, j.id, stored, **kw)                                  # type: ignore[call-arg, misc]
+    out = land(jstore, j.id, **kw)
+    assert out.outcome == "adopted", out.message
+    assert git(path, "rev-parse", "main") == stored[0].staged_commit
+    assert git(path, "rev-parse", "main^{tree}") == tree
+
+
+@pytest.mark.parametrize("stored", ["absent", "another"])
+def test_an_authorised_job_whose_run_record_is_not_the_authorised_one_refuses(stored, jstore, cstore, repo, log, keys,
+                                                                             tmp_path, monkeypatch):
+    # only store damage reaches this: the finish reads the intent's run row alone, and moves nothing without it
+    with_rule(cstore, log, keys, repo)
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    put(jstore, recs)
+    stale = jstore.authorise(job.id, cause="human_adoption_rule", evidence=__import__("json").dumps(
+        {"authority": "B", "run": 0, "onto": "main", "staged": recs[0].staged_commit, "base": repo[1],
+         "tree": recs[0].tree, "artifact_digest": adopt.artifact_digest(recs[0]), "tier": "T2", "rule": None}))
+    other = ArtifactRecord(**{**recs[0].__dict__, "verified_at": utc_stamp(NOW)})
+    monkeypatch.setattr(jstore, "run_record", lambda job_id, run: None if stored == "absent" else other)
+    out = adopt._finish(jstore, stale)
+    assert out.outcome == "refused" and "no longer the one authorised" in out.message
+    assert git(repo[0], "rev-parse", "main") == repo[1]                       # nothing moved
+
+
+def test_the_finish_reads_only_the_authorised_runs_row(jstore, cstore, repo, log, keys, tmp_path, monkeypatch):
+    with_rule(cstore, log, keys, repo)
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    put(jstore, recs)
+    stale = jstore.authorise(job.id, cause="human_adoption_rule", evidence=__import__("json").dumps(
+        {"authority": "B", "run": 0, "onto": "main", "staged": recs[0].staged_commit, "base": repo[1],
+         "tree": recs[0].tree, "artifact_digest": adopt.artifact_digest(recs[0]), "tier": "T2", "rule": None}))
+    monkeypatch.setattr(jstore, "run_records", lambda job_id: 1 / 0)        # every-row read: never on this path
+    assert adopt._finish(jstore, stale).outcome == "adopted"
+
+
+@pytest.mark.parametrize("when", ["records", "authorise"])
+def test_a_job_that_ends_during_a_land_is_refused_never_raised(when, jstore, cstore, repo, log, keys, tmp_path,
+                                                               monkeypatch):
+    # L3 r1 codex 3 + complement 1: the lease lapsing inside the land's own reads raised TransitionRefused
+    with_rule(cstore, log, keys, repo)
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    put(jstore, recs)
+    real_records, real_authorise = JobStore.run_records, JobStore.authorise
+
+    def records(self, job_id):
+        out = real_records(self, job_id)
+        if when == "records" and self.get(job_id).state == "verified":
+            self._transition(job_id, "failed", "lease_lapsed")
+        return out
+
+    def authorise(self, job_id, **kw):
+        if when == "authorise":
+            self._transition(job_id, "cancelled", "human_cancel")
+        return real_authorise(self, job_id, **kw)
+
+    monkeypatch.setattr(JobStore, "run_records", records)
+    monkeypatch.setattr(JobStore, "authorise", authorise)
+    out = land(jstore, job.id, landing_tier=T2, resolve_template=resolver(cstore), policy=active_policy(cstore),
+               onto="main", rules=lambda: adoption_rules_at(cstore))
+    assert out.outcome == "refused", out.message
+    assert git(repo[0], "rev-parse", "main") == repo[1]
+
+
+@pytest.mark.parametrize("winner", ["authorised", "adopted", "base_moved"])
+def test_a_job_another_land_took_during_the_records_read_is_reported_as_that_land_left_it(winner, jstore, cstore,
+                                                                                         repo, log, keys, tmp_path,
+                                                                                         monkeypatch):
+    # L3 r2 codex MED + complement LOW: the job read again after the records could already be another land's
+    path, base = repo
+    with_rule(cstore, log, keys, repo)
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    put(jstore, recs)
+    real_records = JobStore.run_records
+    intent = __import__("json").dumps(
+        {"authority": "B", "run": 0, "onto": "main", "staged": recs[0].staged_commit, "base": base,
+         "tree": recs[0].tree, "artifact_digest": adopt.artifact_digest(recs[0]), "tier": "T2",
+         "rule": {"generation": 4, "index": 0}})
+
+    def records(self, job_id):
+        out = real_records(self, job_id)
+        if self.get(job_id).state == "verified":
+            JobStore.authorise(self, job_id, cause="human_adoption_rule", evidence=intent)
+            if winner == "adopted":
+                git(path, "update-ref", "refs/heads/main", recs[0].staged_commit)
+                self._transition(job_id, "adopted", "adopted", evidence="{}")
+            elif winner == "base_moved":
+                self._transition(job_id, "failed", "base_moved", evidence="{}")
+        return out
+
+    monkeypatch.setattr(JobStore, "run_records", records)
+    out = land(jstore, job.id, landing_tier=T2, resolve_template=resolver(cstore), policy=active_policy(cstore),
+               onto="main", rules=lambda: adoption_rules_at(cstore))
+    expect = {"authorised": "adopted", "adopted": "adopted", "base_moved": "failed"}[winner]
+    assert out.outcome == expect and out.job.state == expect, out.message

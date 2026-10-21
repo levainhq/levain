@@ -84,6 +84,11 @@
    "owner": "levain/dispatch/adopt.py"
   },
   {
+   "namespace": "levain-thread-envelope",
+   "status": "reserved",
+   "owner": "levain/coordinator/envelope.py"
+  },
+  {
    "namespace": "levain-allowed-signers",
    "status": "reserved",
    "owner": "levain/qbroker/signers.py"

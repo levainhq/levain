@@ -377,7 +377,8 @@ def _verifier_steps(value: object) -> tuple[VerifierStep, ...]:
         if type(wall) is not int:
             raise Refused("wrong-type", "verifier_steps[].wall_s is an integer")
         if not 1 <= wall <= MAX_STEP_WALL_S:
-            raise Refused("out-of-range", f"verifier_steps[].wall_s {wall}")
+            # the bound, never the raw int: str() of a >4300-digit int raises ValueError
+            raise Refused("out-of-range", f"verifier_steps[].wall_s is not in 1..{MAX_STEP_WALL_S}")
         steps.append(VerifierStep(tuple(argv), wall))
     return tuple(steps)
 
