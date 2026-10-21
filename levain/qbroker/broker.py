@@ -184,6 +184,8 @@ _GATE_REQUIRED = _GATE_KEYS - {"tool_use_id"}
 LimitsSource = Callable[[str, str], "Mapping[str, float] | None"]
 # the counter's directory under requests/ (limits.db and its failure files)
 LIMITS_DIR = "limits"
+# the longest tool_use_id a GATE frame may carry (the counter keys a repeat by it; levain.consent.limits takes the same)
+TOOL_USE_ID_MAX = 256
 # GATE's limits-failed reason when that directory cannot be used (Broker._limits_dir)
 LIMITS_DIR_FAILED = "the limits directory requests/limits could not be used as the broker's own 0700 directory"
 
@@ -310,11 +312,16 @@ class Broker:
         now = utc_stamp(started)
         filed = []
         for row in store.rows():
+            # indexed by its RAW tier, session and id, before stored_request: a malformed HALT_TIER row is indexed too,
+            # and _halted_on reads a row that does not read back as halted (the stricter side)
+            raw = row.get("request") if isinstance(row, Mapping) else None
+            raw_session = row.get("session") if isinstance(row, Mapping) else None
+            if isinstance(raw, Mapping) and raw.get("tier") == HALT_TIER and isinstance(raw_session, str) \
+                    and isinstance(raw.get("id"), str) and valid_request_id(raw["id"]):
+                self._halting.setdefault(raw_session, set()).add(raw["id"])
             request = stored_request(row, store.queue_id)
             if request is not None:
                 filed.append((row, request))
-                if request.tier == HALT_TIER:
-                    self._halting.setdefault(row["session"], set()).add(request.id)
             # counted even when stored_request refused the row: a malformed row that names a session still holds its
             # quota and a pending place until its hold ends (it is never filed or answered), the cautious side
             session, run = row.get("session"), row.get("run")
@@ -710,7 +717,7 @@ class Broker:
         if not _GATE_REQUIRED <= set(message) <= _GATE_KEYS or agent not in consent_limits.AGENTS \
                 or not isinstance(tool_name, str) or not tool_name or len(tool_name) > 256 \
                 or not isinstance(digest, str) or not digest or len(digest) > 256 \
-                or (tid is not None and not isinstance(tid, str)):
+                or (tid is not None and not (isinstance(tid, str) and 0 < len(tid) <= TOOL_USE_ID_MAX)):
             return wire.refusal(rid, "frame-malformed")
         halting = self._halted_on(who.session)
         if halting is not None:

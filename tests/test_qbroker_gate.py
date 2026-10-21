@@ -73,6 +73,49 @@ def test_the_halt_is_derived_from_the_rows_and_survives_a_restart(L, broker, res
     assert got["gate"] == "halted" and got["request_id"] == rid
 
 
+def test_a_malformed_halt_tier_row_is_indexed_at_start_and_halts(L, broker, resolver, clock):
+    # F8: indexed by its raw tier / session before stored_request, so a row that no longer reads halts (stricter)
+    import json
+    rid = t3(broker)
+    path = L / "queue" / "requests" / f"{rid}.json"
+    row = json.loads(path.read_text())
+    row["extra"] = 1                                           # stored_request refuses it now
+    path.write_text(json.dumps(row))
+    assert qbroker.stored_request(row, broker._store.queue_id) is None
+    again = make_broker(L, resolver, clock)
+    assert again._halting == {"sess-a": {rid}}
+    got = gate(again)
+    assert got["gate"] == "halted" and got["request_id"] == rid
+
+
+def test_a_row_without_a_string_session_is_not_indexed(L, broker, resolver, clock):
+    import json
+    rid = t3(broker)
+    path = L / "queue" / "requests" / f"{rid}.json"
+    row = json.loads(path.read_text())
+    del row["session"]
+    path.write_text(json.dumps(row))
+    assert make_broker(L, resolver, clock)._halting == {}      # no KeyError at start; nothing to key it by
+
+
+@pytest.mark.parametrize("tid,ok", [("", False), ("x" * 257, False), ("x" * 256, True), ("t", True)])
+def test_the_tool_use_id_is_bounded_at_the_broker(broker, tid, ok):
+    got = gate(broker, tool_use_id=tid)
+    assert (got.get("gate") == "go") if ok else (got["refused"] == "frame-malformed")
+
+
+def test_the_client_sends_only_a_bounded_tool_use_id():
+    sent = []
+
+    class Rec(Scripted):
+        def call(self, op, **fields):
+            sent.append(fields.get("tool_use_id"))
+            return {"id": 1, "ok": True, "gate": "go"}
+    for tid in ("", "x" * 257, "x" * 256, None):
+        Rec([]).gate(agent="codex", tool_name="Bash", tool_input={}, tool_use_id=tid)
+    assert sent == [None, None, "x" * 256, None]
+
+
 def test_a_reversible_row_never_halts(L, broker, clock):
     filed(broker, fields=hook_fields(event="t2", tier="T2"))
     clock["now"] = NOW + timedelta(minutes=6)

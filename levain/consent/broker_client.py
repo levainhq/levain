@@ -67,8 +67,9 @@ from levain.cockpit.consent import utc_stamp
 from levain.consent.record import ExternalGateRequest, redact_display, tool_input_digest
 from levain.qbroker import wire
 
-__all__ = ["BROKER_ACCOUNT", "CAP_ENV", "FAST_POLLS", "GATE_BACKOFF", "GO", "IO_TIMEOUT", "PENDING_REFUSALS",
-           "REQUEST_RETRY", "SLOW_POLL", "SOCKET_ENV", "BrokerClient", "BrokerError", "UNGATED_TIER", "broker_uid",
+__all__ = ["BROKER_ACCOUNT", "CAP_ENV", "FAST_POLLS", "GATE_BACKOFF", "GATE_TOOL_USE_ID_MAX", "GO",
+           "IO_TIMEOUT", "PENDING_REFUSALS", "REQUEST_RETRY", "SLOW_POLL", "SOCKET_ENV",
+           "BrokerClient", "BrokerError", "UNGATED_TIER", "broker_uid",
            "file_and_hold", "GATE_FAILED", "GATE_GO", "GATE_HALTED", "GATE_OVER", "SLOT_HALT_TEXT",
            "SLOT_LIMITS_FAILED_TEXT", "SLOT_OVER_TEXT", "file_ungated", "gate_check", "gate_request",
            "grant_member", "hold_for_decision", "in_slot"]
@@ -99,6 +100,8 @@ REQUEST_RETRY = 1.0
 # the pauses before re-sending a rate-limited GATE (gate_check): short, bounded, about 1.5 s in all; GATE has its own
 # per-slot bucket at the broker (levain.qbroker.broker.GATE_BURST), so this only spreads a parallel batch past it
 GATE_BACKOFF = (0.05, 0.1, 0.2, 0.4, 0.8)
+# the longest tool_use_id a GATE carries (levain.qbroker.broker.TOOL_USE_ID_MAX)
+GATE_TOOL_USE_ID_MAX = 256
 # a socket timeout and time.monotonic read different clocks: a call that ran out this close to the hold's end ended
 # the hold (undecided), it did not fail to run
 DEADLINE_SLOP = 0.05
@@ -243,11 +246,13 @@ class BrokerClient:
     def gate(self, *, agent: str, tool_name: str, tool_input: Any, tool_use_id: str | None,
              timeout: float | None = None) -> tuple[str, str | None]:
         """``GATE`` (F10 S2b-2, :mod:`levain.qbroker.broker`): ``("go", None)``, ``("halted", request_id)``,
-        ``("over-limit", kind)`` or ``("limits-failed", reason)``. Any refusal, or an answer of any other shape, raises :class:`BrokerError`
-        (the gate denies). GO is not allow: the caller's gate still runs."""
+        ``("over-limit", kind)`` or ``("limits-failed", reason)``. Any refusal, or an answer of any other shape,
+        raises :class:`BrokerError` (the gate denies). GO is not allow: the caller's gate still runs. A
+        ``tool_use_id`` is sent only when it is a string of 1 to :data:`GATE_TOOL_USE_ID_MAX` characters (the
+        broker's bound); any other is left out, so the call is counted with no repeat key (never fewer)."""
         fields: dict[str, Any] = {"agent": agent, "tool_name": tool_name,
                                   "input_digest": tool_input_digest(tool_input)}
-        if tool_use_id is not None:
+        if isinstance(tool_use_id, str) and 0 < len(tool_use_id) <= GATE_TOOL_USE_ID_MAX:
             fields["tool_use_id"] = tool_use_id
         got = self.call("GATE", timeout=timeout, **fields)
         keys, verdict = set(got) - {"id", "ok"}, got.get("gate")
