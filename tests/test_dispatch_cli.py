@@ -697,3 +697,203 @@ def test_a_cancel_of_an_unknown_job_refuses_before_saying_how_it_would_cancel(ca
                        str(log.path.parent), "--yes")
     assert code == 2 and "no dispatch job" in out, out
     assert "cancelling as the operator" not in out
+
+
+# --- F11-s2b: authorise | land, every authority bound by land_job ----------------------------------------------------
+
+@pytest.fixture
+def lw(tmp_path, monkeypatch):
+    """The landing world (tests/test_dispatch_adopt.py's LandWorld: real cockpit, control store, rule, repo, job
+    store), at the operator's terminal: no agent ancestor or environment, and nothing injected."""
+    from tests.test_dispatch_adopt import LandWorld
+
+    for var in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDECODE", "CODEX_SANDBOX"):
+        monkeypatch.delenv(var, raising=False)
+    from levain.consent import band
+    monkeypatch.setattr(band, "_ancestors", lambda: iter([]))
+    monkeypatch.setattr(dcli, "agent_caller", lambda: None, raising=False)
+    return LandWorld(tmp_path)
+
+
+def _authorise_argv(lw, job_id, *extra, run_="0", onto="main"):
+    return ("authorise", job_id, "--run", run_, "--onto", onto, "--dispatch-dir", str(lw.ddir), "--signing-key",
+            str(lw.keys["laptop"].path), *extra)
+
+
+def test_land_job_takes_no_authority_from_its_caller():
+    # F11-s2b §0 (the ruling): the tier, the registry, the policy, the rules and the human's authority source are
+    # bound inside land_job; a verb passes the job, the branch, the signed item and the operator's data root alone
+    import inspect
+
+    assert list(inspect.signature(dcli.land_job).parameters) == ["store", "job_id", "onto", "signed", "data_root"]
+
+
+def test_land_by_the_standing_rule_adopts_and_exits_0(capsys, lw):
+    job, _cap = lw.verified()
+    staged = lw.jstore.run_record(job.id, 0).staged_commit
+    code, out, _ = run(capsys, "land", job.id, "--onto", "main", "--dispatch-dir", str(lw.ddir))
+    assert code == 0 and f"job {job.id} is adopted (Levain moved the branch)" in out, out
+    assert lw.main() == staged
+    assert [(h.to_state, h.cause) for h in lw.jstore.get(job.id).history[-2:]] == [
+        ("authorised", "human_adoption_rule"), ("adopted", "adopted")]
+
+
+def test_a_land_no_rule_covers_is_exit_2_and_moves_nothing(capsys, lw):
+    job, _cap = lw.verified()
+    code, out, _ = run(capsys, "land", job.id, "--onto", "work", "--dispatch-dir", str(lw.ddir), "--json")
+    data = json.loads(out)
+    assert code == 2 and data["outcome"] == "refused" and "criterion onto" in data["message"], out
+    assert lw.jstore.get(job.id).state == "verified"
+
+
+def test_authorise_shows_the_change_set_and_tier_then_signs_and_lands(capsys, lw):
+    job, _cap = lw.verified({"src/b.py": b"b = 3\nc = 3\n", "src/new.py": b"n = 1\n"})
+    staged = lw.jstore.run_record(job.id, 1).staged_commit
+    code, out, _ = run(capsys, *_authorise_argv(lw, job.id, "--yes", run_="1"))
+    assert code == 0 and f"job {job.id} is adopted" in out, out
+    assert "M  src/b.py  +1 -1" in out and "A  src/new.py  +1 -0 (new file)" in out and "landing tier T2" in out
+    assert out.index(f"job {job.id}  [verified]") < out.index("the change the floor judges")
+    assert lw.main() == staged
+    last = lw.jstore.get(job.id).history
+    assert [(h.to_state, h.cause) for h in last[-2:]] == [("authorised", "human_authorises"), ("adopted", "adopted")]
+    assert json.loads(last[-2].evidence)["run"] == 1
+
+
+def test_authorise_asks_on_a_tty_under_a_fixed_summary_and_no_is_no(capsys, lw, monkeypatch):
+    job, _cap = lw.verified()
+    monkeypatch.setattr(dcli, "_is_tty", lambda: True)
+    asked: list[str] = []
+    monkeypatch.setattr("builtins.input", lambda prompt: asked.append(prompt) or "n")
+    code, out, _ = run(capsys, *_authorise_argv(lw, job.id))
+    assert code == 2 and "not confirmed" in out and asked == ["authorise this job? [y/N] "], out
+    summary = out[out.index("---- you are about to authorise"):]
+    assert "  run       0  (sha256:" in summary and "  onto      main, signed by SHA256:" in summary
+    assert lw.jstore.get(job.id).state == "verified" and lw.main() != lw.jstore.run_record(job.id, 0).staged_commit
+
+
+def test_authorise_without_a_tty_refuses_before_anything_is_signed(capsys, lw, monkeypatch):
+    job, _cap = lw.verified()
+    monkeypatch.setattr(dcli, "_is_tty", lambda: False)
+    code, out, _ = run(capsys, *_authorise_argv(lw, job.id))
+    assert code == 2 and "asks y/N" in out, out
+    assert lw.jstore.get(job.id).state == "verified"
+
+
+@pytest.mark.parametrize("argv, match", [
+    (("--run", "5"), "has no verified record"), (("--onto", "refs/heads/main"), "bare name"),
+])
+def test_authorise_refuses_a_run_or_branch_before_the_touch(capsys, lw, argv, match):
+    job, _cap = lw.verified()
+    base = list(_authorise_argv(lw, job.id, "--yes"))
+    for flag, value in zip(argv[::2], argv[1::2]):
+        base[base.index(flag) + 1] = value
+    code, out, _ = run(capsys, *base)
+    assert code == 2 and match in out, out
+    assert lw.jstore.get(job.id).state == "verified"
+
+
+def test_an_agent_never_authorises(capsys, lw, monkeypatch):
+    job, _cap = lw.verified()
+    monkeypatch.setattr(dcli, "agent_caller", lambda: "claude_code")
+    code, out, _ = run(capsys, *_authorise_argv(lw, job.id, "--yes"))
+    assert code == 2 and "runs under claude_code" in out, out
+    assert lw.jstore.get(job.id).state == "verified"
+
+
+def test_an_agent_lands_only_its_own_job_and_never_names_the_gate(capsys, lw, monkeypatch):
+    job, cap = lw.verified()
+    monkeypatch.setattr(dcli, "agent_caller", lambda: "claude_code")
+    monkeypatch.setattr(dcli, "_detected", lambda: ("claude_code", "sess-other"))
+    code, out, _ = run(capsys, "land", job.id, "--onto", "main", "--dispatch-dir", str(lw.ddir))
+    assert code == 2 and "--dispatch-dir is refused to a planner" in out, out
+    monkeypatch.setattr(dcli, "_store", lambda args: lw.jstore)
+    code, out, _ = run(capsys, "land", job.id, "--onto", "main", "--data-root", str(lw.root))
+    assert code == 2 and "--data-root is refused to a planner" in out, out
+    code, out, _ = run(capsys, "land", job.id, "--onto", "main")
+    assert code == 2 and "an agent lands only a job it filed" in out, out
+    code, out, _ = run(capsys, "land", job.id, "--onto", "main", "--capability", cap + "x")
+    assert code == 2 and "not job" in out, out
+    assert lw.jstore.get(job.id).state == "verified"
+    code, out, _ = run(capsys, "land", job.id, "--onto", "main", "--capability", cap)
+    assert code == 0 and "is adopted" in out, out
+
+
+def test_a_land_onto_a_checked_out_branch_prints_the_merge_alone_last_then_finishes(capsys, lw, tmp_path):
+    import shlex
+    import subprocess
+
+    from tests.test_dispatch_adopt import env, git
+
+    job, _cap = lw.verified()
+    staged = lw.jstore.run_record(job.id, 0).staged_commit
+    wt = tmp_path / "main-wt"
+    git(lw.repo, "worktree", "add", "-q", str(wt), "main")
+    code, out, _ = run(capsys, "land", job.id, "--onto", "main", "--dispatch-dir", str(lw.ddir))
+    assert code == 0 and "Levain never touches a worktree" in out, out
+    command = out.strip().splitlines()[-1]
+    assert command == f"git -C {shlex.quote(str(wt))} merge --ff-only {staged}"
+    assert lw.jstore.get(job.id).state == "authorised" and lw.main() != staged
+    subprocess.run(shlex.split(command), check=True, capture_output=True, env=env(), timeout=60)
+    code, out, _ = run(capsys, "land", job.id, "--dispatch-dir", str(lw.ddir), "--json")
+    data = json.loads(out)
+    assert code == 0 and (data["outcome"], data["moved"], data["state"]) == ("adopted", False, "adopted"), out
+
+
+def test_an_authorise_on_a_moved_base_fails_the_job_exit_1(capsys, lw):
+    from tests.test_dispatch_adopt import git
+
+    job, _cap = lw.verified()
+    (lw.repo / "src/a.py").write_text("a = 'moved'\n")
+    git(lw.repo, "commit", "-q", "-am", "work moves")
+    git(lw.repo, "update-ref", "refs/heads/main", git(lw.repo, "rev-parse", "work"))
+    code, out, _ = run(capsys, *_authorise_argv(lw, job.id, "--yes"))
+    assert code == 1 and "FAILED (base_moved)" in out, out
+    got = lw.jstore.get(job.id)
+    assert (got.state, got.history[-1].cause) == ("failed", "base_moved") and lw.refs(job.id) == []
+
+
+def test_a_land_with_no_configuration_refuses(capsys, ddir, contract_file, monkeypatch):
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    monkeypatch.setattr(dcli, "resolvers", lambda *a, **k: None)
+    code, out, _ = run(capsys, "land", job_id, "--onto", "main", "--dispatch-dir", str(ddir))
+    assert code == 2 and "nothing can land" in out, out
+
+
+def test_a_git_that_cannot_run_during_a_land_is_exit_3_and_says_nothing_landed(capsys, lw, monkeypatch):
+    from levain.dispatch import adopt
+
+    job, _cap = lw.verified()
+
+    def gone(*a, **k):
+        raise adopt.GitFault("git is gone")
+
+    monkeypatch.setattr(adopt, "change_set", gone)
+    code, out, _ = run(capsys, "land", job.id, "--onto", "main", "--dispatch-dir", str(lw.ddir))
+    assert code == 3 and "(GitFault)" in out and f"nothing was landed; job {job.id} is still verified" in out, out
+
+
+def test_list_sweeps_the_staged_refs_of_a_cancelled_job(capsys, lw):
+    # W2-a's known edge: a job that ends by cancel or lapse kept its levain/dispatch/<job>/r<i> refs
+    job, cap = lw.verified()
+    lw.jstore.cancel_by_planner(job.id, cap)
+    assert len(lw.refs(job.id)) == 2
+    code, out, _ = run(capsys, "list", "--dispatch-dir", str(lw.ddir))
+    assert code == 0, out
+    assert lw.refs(job.id) == []
+
+
+def test_a_land_sweeps_the_staged_refs_of_the_repos_ended_jobs(capsys, lw):
+    old, cap = lw.verified()
+    lw.jstore.cancel_by_planner(old.id, cap)
+    job, _cap = lw.verified({"src/b.py": b"b = 4\nc = 3\n"})
+    code, out, _ = run(capsys, "land", job.id, "--onto", "main", "--dispatch-dir", str(lw.ddir))
+    assert code == 0, out
+    assert lw.refs(old.id) == [] and len(lw.refs(job.id)) == 2          # an adopted job's refs are kept
+
+
+def test_recommend_proposes_a_branch_and_a_run(capsys, lw):
+    job, cap = lw.verified()
+    code, out, _ = run(capsys, "recommend", job.id, "--capability", cap, "--onto", "main", "--run", "1",
+                       "--dispatch-dir", str(lw.ddir))
+    assert code == 0 and "Proposed for the operator's authorise: onto main, run 1." in out, out
+    assert json.loads(lw.jstore.get(job.id).history[-1].evidence) == {"onto": "main", "run": 1}

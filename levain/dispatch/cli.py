@@ -1,5 +1,5 @@
-"""levain.dispatch.cli — ``levain dispatch file|show|list|sign|cancel|recommend``: the planner's door and the
-operator's.
+"""levain.dispatch.cli — ``levain dispatch file|show|list|sign|cancel|recommend|authorise|land``: the planner's
+door and the operator's.
 
 A planner files a contract (``file``) and gets the job's capability once; the door keeps it in the planner session's
 own record (:mod:`levain.dispatch.capability`) so a restarted session can still ``recommend`` or ``cancel``. The
@@ -19,9 +19,24 @@ question band's walk and checks, :func:`agent_caller`). This is a check of INTEN
 run ssh-keygen over the payload itself, so until S1 places the control principal, a laptop signature an agent can
 reach is gated only by the custody of the signing key (a touch, a passphrase, a key no agent can read).
 
-Exit codes: 0 done; 2 the input or a refusal (the contract, the transition, the signature, the capability or the
+LANDING is :func:`land_job`, the ONE place the land's authorities are bound (F11-s2b §0): the landing tier
+(:func:`levain.consent.landing.landing_tier` over the dispatch directory's consent settings), the template registry
+and the provider policy (:func:`resolvers`), the adoption rules (the control store, read at the land) and the
+authority source a human authorise item is verified against all come from the production stores, and a verb passes
+only the job, the branch, the operator's signed item and the operator's ``--data-root``. ``authorise`` is the
+operator's (refused to an agent, as ``sign`` is): the job, the change set the floor will judge and the landing tier,
+then y/N, then a signature in :data:`levain.dispatch.adopt.DISPATCH_AUTHORISE_NAMESPACE` over the payload the server
+built from the store's own run record (:func:`levain.dispatch.adopt.authorise_payload_for`), then the land. ``land``
+lands by a standing rule, or finishes an authorised job (a retry, or after the operator's own printed merge); an agent
+may run it only with the capability of a job it filed, and never with ``--data-root`` or ``--dispatch-dir``. A land
+and ``list`` sweep the staged refs of the jobs of that repository that ended without an adoption
+(:func:`levain.dispatch.adopt.sweep_staged`). A land's outcome is its exit: adopted 0; a merge for the operator to
+run 0, the command alone on the last line; refused 2; failed (MOVED BASE) 1.
+
+Exit codes: 0 done; 1 a land that FAILED its job (MOVED BASE); 2 the input or a refusal (the contract, the transition, the signature, the capability or the
 command line was refused: the message says why, and nothing changed); 3 a fault on this machine, told apart by its
-CLASS, never by its text: git could not run (:class:`levain.dispatch.contract.GitUnavailable`), a store, record or
+CLASS, never by its text: git could not run (:class:`levain.dispatch.contract.GitUnavailable`,
+:class:`levain.dispatch.adopt.GitFault`), a store, record or
 log that cannot be read or trusted (:class:`levain.dispatch.jobs.JobStoreError`,
 :class:`levain.dispatch.capability.CapabilityRecordError`, an operating system or database error, a ``ValueError``
 from below), a signature verifier that cannot run (:class:`levain.authority.VerifierUnavailable`) or an ssh-keygen
@@ -71,6 +86,7 @@ from typing import Any, TypeVar
 from levain import unshowable
 from levain.authority import VerifierUnavailable
 from levain.dispatch import ContractRefused, DispatchError
+from levain.dispatch import adopt as dadopt
 from levain.dispatch import capability as caps
 from levain.dispatch import control as dctl
 from levain.dispatch import registry as dregistry
@@ -81,13 +97,15 @@ from levain.dispatch.jobs import (
 )
 from levain.dispatch.policy import ProviderPolicy
 
-__all__ = ["EXIT_FAULT", "EXIT_OK", "EXIT_REFUSED", "CockpitUnnamed", "InputRefused", "SignerUnavailable",
-           "add_parsers", "agent_caller", "confirm_summary", "file_job", "job_view", "planner_capability", "render", "resolvers", "run_dispatch"]
+__all__ = ["EXIT_FAILED", "EXIT_FAULT", "EXIT_OK", "EXIT_REFUSED", "CockpitUnnamed", "InputRefused",
+           "SignerUnavailable", "add_parsers", "agent_caller", "confirm_summary", "file_job", "job_view", "land_job",
+           "planner_capability", "render", "resolvers", "run_dispatch"]
 
-EXIT_OK, EXIT_REFUSED, EXIT_FAULT = 0, 2, 3
+EXIT_OK, EXIT_FAILED, EXIT_REFUSED, EXIT_FAULT = 0, 1, 2, 3
 # a contract is a few kilobytes; the bound only stops a stray file from being read whole
 _CONTRACT_MAX = 1024 * 1024
 NO_REGISTRY = "no template registry is set up; every contract is R2, which is never dispatched"
+NO_LAND = "no dispatch configuration is set up, so nothing can land"
 
 
 class InputRefused(DispatchError):
@@ -118,10 +136,10 @@ class _NotDone(Exception):
         self.fault, self.not_done = fault, not_done
 
 
-# machine faults first: GitUnavailable is a ContractRefused, and JobStoreError and ControlStateUnavailable are
-# DispatchErrors, and each must be read as the fault it is; a ValueError raised below the command line is a fault too
-# (its own refusals are InputRefused)
-_FAULTS = (GitUnavailable, JobStoreError, dctl.ControlStateUnavailable, caps.CapabilityRecordError,
+# machine faults first: GitUnavailable is a ContractRefused, and GitFault, JobStoreError and ControlStateUnavailable
+# are DispatchErrors, and each must be read as the fault it is; a ValueError raised below the command line is a fault
+# too (its own refusals are InputRefused)
+_FAULTS = (GitUnavailable, dadopt.GitFault, JobStoreError, dctl.ControlStateUnavailable, caps.CapabilityRecordError,
            VerifierUnavailable, SignerUnavailable, sqlite3.Error, OSError, ValueError)
 _REFUSALS = (ContractRefused, TransitionRefused, SignatureRefused, CapabilityRefused, DispatchError)
 
@@ -206,19 +224,19 @@ def _refuse_an_agent(verb: str) -> None:
                            "operator. Run it from your own terminal.")
 
 
-def _refuse_gate_flags(args: argparse.Namespace) -> None:
-    """Under a detected agent, ``file`` takes no ``--data-root`` or ``--dispatch-dir``: either would let the planner
-    name the store or the cockpit its own filing is verified against, so choose its own gate. An intent check, as
-    :func:`_refuse_an_agent` is."""
+def _refuse_gate_flags(args: argparse.Namespace, verb: str = "file") -> None:
+    """Under a detected agent, ``file`` and ``land`` take no ``--data-root`` or ``--dispatch-dir``: either would let
+    the planner name the store or the cockpit its own filing (or land) is verified against, so choose its own gate.
+    An intent check, as :func:`_refuse_an_agent` is."""
     agent = agent_caller()
     if agent is None:
         return
     for flag, value in (("--data-root", args.data_root), ("--dispatch-dir", args.dispatch_dir)):
         if value is not None:
             raise InputRefused(f"{flag} is refused to a planner, and this process runs under {agent} (an agent's "
-                               "process or environment): a filing resolves through the configuration in the "
-                               "dispatch directory, verified against the cockpit its consent hooks name. File "
-                               "without it.")
+                               f"process or environment): a {verb} resolves through the configuration in the "
+                               "dispatch directory, verified against the cockpit its consent hooks name. Run "
+                               f"`levain dispatch {verb}` without it.")
 
 
 def planner_session(agent: str | None, session: str | None) -> tuple[str | None, str]:
@@ -300,6 +318,120 @@ def planner_capability(directory: Path, agent: str | None, session: str, job_id:
     if agent is None:
         return None
     return caps.recall(directory, agent, session, job_id)
+
+
+# --- the land (F11 §6), its authorities bound here and nowhere else ---------------------------------------------------
+
+def _landing_tier(directory: Path) -> Callable[[str, tuple[str, ...]], str]:
+    """The landing tier over the consent settings in ``directory`` (the dispatch directory, which is the consent
+    directory by default): what the floor judges a change's paths by."""
+    from functools import partial
+
+    from levain.consent.landing import landing_tier
+
+    return partial(landing_tier, queue_dir=directory)
+
+
+def land_job(store: JobStore, job_id: str, *, onto: str | None = None, signed: tuple[Any, Any] | None = None,
+             data_root: Path | None = None) -> dadopt.Landing:
+    """:func:`levain.dispatch.adopt.land` for ``job_id``, every authority it takes bound from the production stores
+    (F11-s2b §0): the landing tier over the dispatch directory's consent settings, the registry and the policy
+    (:func:`resolvers`), and either the operator's ``signed`` item ``(payload, signature)``, verified against the
+    authority source :func:`_authority_source` picks, or the adoption rules read from the control store at the land.
+    ``data_root`` is the operator's ``--data-root`` alone (the MCP door and the phone pass ``None``). No control
+    store refuses (nothing configured lands). The staged refs of the repository's jobs that ended without an
+    adoption are swept after the land (:func:`levain.dispatch.adopt.sweep_staged`); a ref git kept is added to the
+    landing's message."""
+    from dataclasses import replace
+
+    from levain.dispatch.registry import adoption_rules_at
+
+    resolved = resolvers(store.directory, data_root)
+    if resolved is None:
+        raise ContractRefused(NO_LAND)
+    resolve_template, policy = resolved
+    human: tuple[Any, Any, Any] | None = None
+    rules: Callable[[], Any] | None = None
+    if signed is not None:
+        human = (signed[0], signed[1], _authority_source(store.directory, data_root))
+    else:
+        def rules() -> Any:
+            return adoption_rules_at(dctl.ControlStore(store.directory,
+                                                       authority=_authority_source(store.directory, data_root)))
+    landing = dadopt.land(store, job_id, landing_tier=_landing_tier(store.directory),
+                          resolve_template=resolve_template, policy=policy, onto=onto, human=human, rules=rules)
+    kept = dadopt.sweep_staged(store, landing.job.repo)
+    return replace(landing, message="; ".join([landing.message, *kept])) if kept else landing
+
+
+def _change_view(store: JobStore, job: Job, run: int) -> tuple[list[str], list[str]]:
+    """What ``authorise`` shows before the touch: run ``run``'s change set as the floor will judge it (each path,
+    +/- lines, new, deleted, binary or gitlink named) and its landing tier, and the fixed-height lines for the summary
+    above the prompt. A change set over a cap, or a tier that cannot be read, refuses before anything is signed."""
+    record = store.run_record(job.id, run)
+    if record is None:
+        raise DispatchError(f"run {run} of job {job.id} has no verified record")
+    changes = dadopt.change_set(job.repo, record.base, record.staged_commit)
+    if isinstance(changes, str):
+        raise DispatchError(f"{changes}; nothing was signed")
+    tier = dadopt._tier(_landing_tier(store.directory), job.repo, changes.paths)
+    if tier is None:
+        raise DispatchError("the landing tier could not be read; nothing was signed")
+    lines = [f"  the change the floor judges, run {run} (staged {record.staged_commit}, base {record.base}):"]
+    for c in changes.entries:
+        what = ("gitlink" if c.non_blob else "binary" if c.binary
+                else f"+{c.added} -{c.deleted}" + (" (new file)" if c.status == "A" else
+                                                   " (deleted)" if c.status == "D" else ""))
+        lines.append(f"    {c.status}  {_safe(c.path)}  {what}")
+    lines.append(f"  landing tier {tier}: only a key whose class covers {tier} may authorise it")
+    counted = changes.changed_lines
+    summary = [f"  run       {run}  ({dadopt.artifact_digest(record)})",
+               f"  change    {len(changes.entries)} file{'s' if len(changes.entries) != 1 else ''}, "
+               + (f"{counted} changed lines" if counted is not None else "binary or gitlink entries")
+               + f", landing tier {tier}"]
+    return [_safe(line) for line in lines], [_safe(line) for line in summary]
+
+
+def _landed(args: argparse.Namespace, landing: dadopt.Landing, emit: Callable[[Any, str], None]) -> int:
+    """A land's outcome as its exit: adopted 0, merge 0 (the operator's command alone on the last line), refused 2,
+    failed 1."""
+    job = landing.job
+    message = _safe(landing.message)
+    data = {"id": job.id, "state": job.state, "outcome": landing.outcome, "moved": landing.moved,
+            "message": landing.message, "command": landing.command or None}
+    if landing.outcome == "adopted":
+        emit(data, f"levain dispatch: job {job.id} is adopted ("
+                   f"{'Levain moved the branch' if landing.moved else 'Levain moved nothing'}): {message}")
+        return EXIT_OK
+    if landing.outcome == "merge":
+        emit(data, "\n".join([f"levain dispatch: job {job.id} is {job.state}; {message}",
+                              f"After the merge, `levain dispatch land {job.id}` records the adoption. The merge:",
+                              landing.command]))
+        return EXIT_OK
+    if landing.outcome == "failed":
+        emit(data, f"levain dispatch: job {job.id} FAILED (base_moved), its write files released for a new filing: "
+                   f"{message}")
+        return EXIT_FAILED
+    emit(data, f"levain dispatch: not landed, refused: {message}")
+    return EXIT_REFUSED
+
+
+def _land_not_done(store: JobStore, job_id: str, last: Job | None) -> str:
+    """What a faulted ``authorise`` / ``land`` of ``job_id`` did NOT do, with the job read again when the store
+    answers: an authorised job may already have moved its branch, so it says to run the land again."""
+    try:
+        now = store.get(job_id)
+    except (*_FAULTS, DispatchError):
+        now = None
+    shown = _safe(job_id)[:40]
+    if now is None:
+        return f"whether job {shown} landed is not known (the store could not be read): read it with `levain " \
+               "dispatch show`"
+    if now.state == "authorised":
+        return f"job {shown} is authorised and not yet adopted: run `levain dispatch land {shown}` again to finish it"
+    if last is not None and now.state == last.state:
+        return f"nothing was landed; job {shown} is still {now.state}"
+    return f"job {shown} is now {now.state}: read it with `levain dispatch show`"
 
 
 # --- the view a signer reads ------------------------------------------------------------------------------------------
@@ -428,15 +560,15 @@ def _is_tty() -> bool:
         return False
 
 
-def _confirm(args: argparse.Namespace, job: Job, what: str, out: Any) -> None:
-    """Ask y/N on the terminal, right below :func:`confirm_summary`; refuse without a terminal unless ``--yes``.
-    The caller has printed the whole view."""
+def _confirm(args: argparse.Namespace, job: Job, what: str, out: Any, extra: tuple[str, ...] = ()) -> None:
+    """Ask y/N on the terminal, right below :func:`confirm_summary` and the verb's own fixed-height ``extra`` lines;
+    refuse without a terminal unless ``--yes``. The caller has printed the whole view."""
     if args.yes:
         return
     if not _is_tty():
         raise InputRefused(f"{what} asks y/N on the operator's terminal and this process has none; run "
                            f"`levain dispatch {what} {job.id}` in your own terminal")
-    print("\n".join(confirm_summary(job, what)), file=sys.stderr if args.json else out, flush=True)
+    print("\n".join([*confirm_summary(job, what), *extra]), file=sys.stderr if args.json else out, flush=True)
     try:
         answer = _ask(args, f"{what} this job? [y/N] ")
     except EOFError:
@@ -560,6 +692,8 @@ def _guarded(store: JobStore, job_id: str, verb: str, act: Callable[[dict[str, J
     try:
         return act(seen)
     except _FAULTS as exc:
+        if verb in ("authorise", "land"):
+            raise _NotDone(exc, _land_not_done(store, job_id, seen.get("job"))) from exc
         raise _NotDone(exc, _not_done(store, job_id, seen.get("job"), verb)) from exc
 
 
@@ -862,8 +996,8 @@ def _run(args: argparse.Namespace, out: Any) -> int:
 
     if cmd == "config":
         return _run_config(args, out, emit)
-    if cmd == "file":
-        _refuse_gate_flags(args)
+    if cmd in ("file", "land"):
+        _refuse_gate_flags(args, cmd)
     store = _store(args)
     if cmd == "file":
         submission = _read_contract(args.contract)
@@ -885,12 +1019,17 @@ def _run(args: argparse.Namespace, out: Any) -> int:
         emit(job_view(job), render(job))
         return EXIT_OK
     if cmd == "list":
-        jobs = [j for j in store.list(repo=args.repo) if args.all or j.state not in TERMINAL]
+        every = store.list(repo=args.repo)
+        jobs = [j for j in every if args.all or j.state not in TERMINAL]
         emit([{"id": j.id, "state": j.state, "repo": j.repo, "filed_at": j.filed_at, "lease_end": j.lease_end,
                "template": j.contract.template.template_id, "digest": j.digest} for j in jobs],
              "\n".join(_safe(f"{j.id}  {j.state:<12} {j.contract.template.template_id:<16} lease {j.lease_end}  "
                              f"{j.repo}") for j in jobs)
              or ("levain dispatch: no jobs." if args.all else "levain dispatch: no live jobs (--all for every job)."))
+        # the staged refs of the jobs that ended without an adoption, swept when a verb runs; what git kept is said
+        for repo in sorted({j.repo for j in every}):
+            for line in dadopt.sweep_staged(store, repo):
+                print(f"levain dispatch: {_safe(line)}", file=sys.stderr if args.json else out, flush=True)
         return EXIT_OK
     if cmd == "sign":
         _refuse_an_agent("sign")
@@ -916,10 +1055,50 @@ def _run(args: argparse.Namespace, out: Any) -> int:
         if cap is None:
             raise CapabilityRefused("recommend is the filing planner's alone: this session's record holds no "
                                     f"capability for {str(args.job)[:40]!r}; pass --capability")
-        job = store.recommend(args.job, cap)
-        emit({"id": job.id, "state": job.state, "as": "planner"},
-             f"levain dispatch: job {job.id} is recommended (advisory: it authorises nothing).")
+        job = store.recommend(args.job, cap, onto=args.onto, run=args.run)
+        proposal = "" if args.onto is None and args.run is None else (
+            " Proposed for the operator's authorise: " + ", ".join(
+                p for p in (None if args.onto is None else f"onto {_safe(args.onto)}",
+                            None if args.run is None else f"run {args.run}") if p) + ".")
+        emit({"id": job.id, "state": job.state, "as": "planner", "onto": args.onto, "run": args.run},
+             f"levain dispatch: job {job.id} is recommended (advisory: it authorises nothing).{proposal}")
         return EXIT_OK
+    if cmd == "authorise":
+        _refuse_an_agent("authorise")
+
+        def authorise_it(seen: dict[str, Job]) -> dadopt.Landing:
+            job = seen["job"] = _must_get(store, args.job)
+            if job.state not in ("verified", "recommended"):
+                raise TransitionRefused(f"job {job.id} is {job.state}; only a verified or recommended job is "
+                                        "authorised")
+            _show_first(args, job, out)
+            signer_fp, sign = _signer(args, dadopt.DISPATCH_AUTHORISE_NAMESPACE, "authorise")
+            payload = dadopt.authorise_payload_for(store, job.id, run=args.run, onto=args.onto, signer_fp=signer_fp)
+            view, summary = _change_view(store, job, args.run)
+            print("\n".join(view), file=sys.stderr if args.json else out, flush=True)
+            _confirm(args, job, "authorise", out,
+                     (*summary, _safe(f"  onto      {args.onto}, signed by {signer_fp}")))
+            signature = _sign_bytes(sign, dadopt.authorise_message(payload))
+            return land_job(store, job.id, onto=args.onto, signed=(payload, signature), data_root=args.data_root)
+
+        return _landed(args, _guarded(store, args.job, "authorise", authorise_it), emit)
+    if cmd == "land":
+        agent = agent_caller()
+        if agent is not None or args.capability is not None:
+            # an agent lands only a job it filed (its capability), as it recommends one; the authority is still
+            # the rule or the operator's earlier authorisation, never the capability
+            agent, session = planner_session(args.agent, args.session)
+            cap = planner_capability(store.directory, agent, session, args.job, args.capability)
+            if cap is None:
+                raise CapabilityRefused("an agent lands only a job it filed: this session's record holds no "
+                                        f"capability for {str(args.job)[:40]!r}; pass --capability")
+            store.check_capability(args.job, cap)
+
+        def land_it(seen: dict[str, Job]) -> dadopt.Landing:
+            seen["job"] = _must_get(store, args.job)
+            return land_job(store, args.job, onto=args.onto, data_root=args.data_root)
+
+        return _landed(args, _guarded(store, args.job, "land", land_it), emit)
     if cmd == "cancel":
         agent, session = planner_session(args.agent, args.session)
 
@@ -1045,7 +1224,27 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     rc = sub.add_parser("recommend", help="Mark a verified job recommended (planner; advisory, authorises nothing).")
     rc.add_argument("job")
     rc.add_argument("--capability", default=None, help="The job's capability (default: this session's record).")
+    rc.add_argument("--onto", default=None,
+                    help="The branch you propose the operator authorise this onto (advisory; the phone's card).")
+    rc.add_argument("--run", type=int, default=None,
+                    help="The run you propose (advisory; default on the phone: the lowest passing run).")
     planner(rc)
+    au = sub.add_parser("authorise", help="Authorise a verified run to land on a branch (the operator), signed.",
+                        description="Shows the job, the change set the floor will judge and its landing tier, asks "
+                                    "y/N, signs the authorise item for the run and branch, then lands it.")
+    au.add_argument("job")
+    au.add_argument("--run", type=int, required=True, help="The verified run to land (0..k-1).")
+    au.add_argument("--onto", required=True, help="The branch to land on (a bare name, outside levain/).")
+    signer(au)
+    ld = sub.add_parser("land", help="Land a job by a standing adoption rule, or finish an authorised one.",
+                        description="Exit 0 adopted, or a merge for you to run (its command alone on the last line); "
+                                    "2 refused; 1 the job failed (its branch moved off the contract's base).")
+    ld.add_argument("job")
+    ld.add_argument("--onto", default=None, help="The branch a land by rule lands on (an authorised job's is fixed).")
+    ld.add_argument("--capability", default=None,
+                    help="The job's capability, for a planner (default: this session's record).")
+    data_root(ld)
+    planner(ld)
     cf = sub.add_parser(
         "config", help="The dispatch configuration (the operator): init the store, show it, sign or accept an item.",
         description="Templates, verifiers, the provider policy, the route map and the adoption rules are signed "
@@ -1069,5 +1268,5 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ca.add_argument("signature", help="Its SSHSIG signature, as a file.")
     data_root(ca)
     yes(ca)
-    for p in (f, sh, ls, sg, cn, rc, ci, cs, cg, ca):
+    for p in (f, sh, ls, sg, cn, rc, au, ld, ci, cs, cg, ca):
         common(p)
