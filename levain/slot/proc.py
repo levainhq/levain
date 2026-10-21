@@ -334,7 +334,8 @@ def scrub(slot_uid: int, gw_uid: int, child_uid: int | None = None, *, seams: Pr
     it), then (macOS) end each uid's launchd domain, then require that none of ``slot_uid``, ``gw_uid`` and
     ``child_uid`` owns a process; else ``Refused("scrub-processes-remain:<uid>")`` naming the first that does,
     and the slot stays leased. The domain goes after END's kill, so it also takes the per-user agents launchd
-    started for the uid while END ran."""
+    started for the uid while END ran: on a long END they appeared after END's own proof had passed and only SCRUB
+    refused (levain-memory runs/s2-macos/RESULT_D1D2.md X1, X6), which is why the bootout is here and not in END."""
     u = UidProcs(seams)
     uids = [check_target(x, u.seams) for x in (slot_uid, gw_uid) + ((child_uid,) if child_uid is not None else ())]
     u.kill(gw_uid, bound_s)        # its answer is the proof below, not this sweep's bool
