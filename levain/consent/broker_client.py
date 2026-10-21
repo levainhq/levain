@@ -69,8 +69,8 @@ from levain.qbroker import wire
 
 __all__ = ["BROKER_ACCOUNT", "CAP_ENV", "FAST_POLLS", "GO", "IO_TIMEOUT", "PENDING_REFUSALS", "REQUEST_RETRY",
            "SLOW_POLL", "SOCKET_ENV", "BrokerClient", "BrokerError", "UNGATED_TIER", "broker_uid", "file_and_hold",
-           "GATE_GO", "GATE_HALTED", "GATE_OVER", "SLOT_HALT_TEXT", "file_ungated", "gate_check", "gate_request",
-           "grant_member", "hold_for_decision", "in_slot"]
+           "GATE_FAILED", "GATE_GO", "GATE_HALTED", "GATE_OVER", "SLOT_HALT_TEXT", "SLOT_LIMITS_FAILED_TEXT",
+           "file_ungated", "gate_check", "gate_request", "grant_member", "hold_for_decision", "in_slot"]
 
 SOCKET_ENV = "LEVAIN_QUEUE_SOCKET"
 CAP_ENV = "LEVAIN_QUEUE_CAP"
@@ -238,8 +238,8 @@ class BrokerClient:
 
     def gate(self, *, agent: str, tool_name: str, tool_input: Any, tool_use_id: str | None,
              timeout: float | None = None) -> tuple[str, str | None]:
-        """``GATE`` (F10 S2b-2, :mod:`levain.qbroker.broker`): ``("go", None)``, ``("halted", request_id)`` or
-        ``("over-limit", kind)``. Any refusal, or an answer of any other shape, raises :class:`BrokerError`
+        """``GATE`` (F10 S2b-2, :mod:`levain.qbroker.broker`): ``("go", None)``, ``("halted", request_id)``,
+        ``("over-limit", kind)`` or ``("limits-failed", reason)``. Any refusal, or an answer of any other shape, raises :class:`BrokerError`
         (the gate denies). GO is not allow: the caller's gate still runs."""
         fields: dict[str, Any] = {"agent": agent, "tool_name": tool_name,
                                   "input_digest": tool_input_digest(tool_input)}
@@ -253,14 +253,21 @@ class BrokerClient:
             return GATE_HALTED, got["request_id"]
         if verdict == GATE_OVER and keys == {"gate", "kind"} and (got["kind"] is None or isinstance(got["kind"], str)):
             return GATE_OVER, got["kind"]
-        raise BrokerError("malformed", "GATE answered none of go, halted, over-limit")
+        if verdict == GATE_FAILED and keys == {"gate", "reason"} and isinstance(got["reason"], str):
+            return GATE_FAILED, got["reason"]
+        raise BrokerError("malformed", "GATE answered none of go, halted, over-limit, limits-failed")
 
 
-# GATE's three answers (levain.qbroker.broker.GATE_VERDICTS)
-GATE_GO, GATE_HALTED, GATE_OVER = "go", "halted", "over-limit"
+# GATE's four answers (levain.qbroker.broker.GATE_VERDICTS)
+GATE_GO, GATE_HALTED, GATE_OVER, GATE_FAILED = "go", "halted", "over-limit", "limits-failed"
 # the slot's halt words: the operator side numbers gaps, the hook names the halting request
 SLOT_HALT_TEXT = ("levain: this session is halted on request {r}: an irreversible call's hold ended with no answer. "
                   "No further tool calls are allowed. Write a short summary of what is done and end your turn.")
+# a limits-failed GATE: the gate itself failed, not a budget; the operator repairs or moves the limits database
+SLOT_LIMITS_FAILED_TEXT = ("levain: the limits gate could not run, so the action was NOT taken: {why}. This is a fault "
+                           "of the limits store, not a budget. The operator repairs or moves aside the broker's limits "
+                           "database (requests/limits/limits.db under the queue); do not retry this call and do not "
+                           "achieve it another way.")
 
 
 def gate_check(client: BrokerClient, *, agent: str, tool_name: str, tool_input: Any, tool_use_id: str | None,
@@ -284,6 +291,8 @@ def gate_check(client: BrokerClient, *, agent: str, tool_name: str, tool_input: 
         return None
     if verdict == GATE_HALTED:
         return SLOT_HALT_TEXT.format(r=detail)
+    if verdict == GATE_FAILED:
+        return SLOT_LIMITS_FAILED_TEXT.format(why=detail)
     return limits.stop_text(detail)
 
 

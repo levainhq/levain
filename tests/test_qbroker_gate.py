@@ -155,6 +155,26 @@ def test_the_halt_is_read_before_the_count(L, resolver, clock):
     assert not (L / "queue" / "requests" / qbroker.LIMITS_DIR / "limits.db").exists()
 
 
+@pytest.mark.parametrize("spoil", ["file", "symlink", "wide"])
+def test_an_unusable_limits_directory_fails_closed_and_logs_once(L, resolver, clock, caplog, tmp_path, spoil):
+    # F2 (s2b2_fix1_run/RUN_before.txt: a file at requests/limits answered go on every call, counting nothing)
+    d = L / "queue" / "requests" / qbroker.LIMITS_DIR
+    if spoil == "file":
+        d.write_text("not a dir\n")
+    elif spoil == "symlink":
+        (tmp_path / "elsewhere").mkdir(mode=0o700)
+        d.symlink_to(tmp_path / "elsewhere")
+    else:
+        d.mkdir(mode=0o700)
+        d.chmod(0o755)
+    b = limited(L, resolver, clock, {"calls": 2})
+    got = [gate(b) for _ in range(4)]
+    assert [g["gate"] for g in got] == ["limits-failed"] * 4
+    assert set(got[0]) == {"id", "ok", "gate", "reason"} and got[0]["reason"] == qbroker.LIMITS_DIR_FAILED
+    assert sum("limits directory" in r.getMessage() for r in caplog.records) == 1
+    assert [gate(make_broker(L, resolver, clock))["gate"]] == ["go"]   # no limits configured: never asked
+
+
 def test_a_receipts_read_that_fails_is_a_broker_error(L, broker, clock):
     t3(broker)
     clock["now"] = NOW + timedelta(minutes=6)
@@ -169,13 +189,15 @@ def test_a_receipts_read_that_fails_is_a_broker_error(L, broker, clock):
 
 @pytest.mark.parametrize("answer,want", [({"gate": "go"}, ("go", None)),
                                          ({"gate": "halted", "request_id": "pend-x"}, ("halted", "pend-x")),
-                                         ({"gate": "over-limit", "kind": "calls"}, ("over-limit", "calls"))])
-def test_the_client_reads_the_three_answers(answer, want):
+                                         ({"gate": "over-limit", "kind": "calls"}, ("over-limit", "calls")),
+                                         ({"gate": "limits-failed", "reason": "r"}, ("limits-failed", "r"))])
+def test_the_client_reads_the_four_answers(answer, want):
     assert Scripted([answer]).gate(agent="claude_code", tool_name="Read", tool_input={}, tool_use_id=None) == want
 
 
 @pytest.mark.parametrize("answer", [{}, {"gate": "allow"}, {"gate": "go", "x": 1}, {"gate": "halted"},
-                                    {"gate": "over-limit"}, {"gate": "halted", "request_id": 1}, "broker-error"])
+                                    {"gate": "over-limit"}, {"gate": "halted", "request_id": 1}, "broker-error",
+                                    {"gate": "limits-failed"}, {"gate": "limits-failed", "reason": 3}])
 def test_any_other_gate_answer_raises(answer):
     with pytest.raises(BrokerError):
         Scripted([answer]).gate(agent="claude_code", tool_name="Read", tool_input={}, tool_use_id=None)
@@ -187,6 +209,8 @@ def test_gate_check_texts_and_one_retry():
     assert "halted on request pend-x" in broker_client.gate_check(
         Scripted([{"gate": "halted", "request_id": "pend-x"}]), **kw)
     assert "tool calls limit" in broker_client.gate_check(Scripted([{"gate": "over-limit", "kind": "calls"}]), **kw)
+    failed = broker_client.gate_check(Scripted([{"gate": "limits-failed", "reason": "disk full"}]), **kw)
+    assert "disk full" in failed and "limits.db" in failed and "not a budget" in failed
     sleeps = []
     assert broker_client.gate_check(Scripted(["rate-limited", {"gate": "go"}]), sleep=sleeps.append, **kw) is None
     assert sleeps == [broker_client.REQUEST_RETRY]

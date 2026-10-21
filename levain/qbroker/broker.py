@@ -30,7 +30,8 @@ No verb accepts an answer, a grant answer or a row from a hook. Every other op i
 
 THE GATE VERB (F10 S2b-2). ``GATE {cap, agent, tool_name, input_digest, tool_use_id?}`` is asked by both adapters'
 slot gate on EVERY PreToolUse, before the call is classified, and answered ``{"gate": "halted", "request_id"}``,
-``{"gate": "over-limit", "kind"}`` or ``{"gate": "go"}``. GO IS NOT ALLOW: the rest of the slot gate still runs. The
+``{"gate": "over-limit", "kind"}``, ``{"gate": "limits-failed", "reason"}`` (the limits gate itself failed) or
+``{"gate": "go"}``. GO IS NOT ALLOW: the rest of the slot gate still runs. The
 session is the resolve's, never the frame's.
 
 - Halted is DERIVED, no new mutable state: the session (the resolved one) has a row filed at :data:`HALT_TIER` (the
@@ -48,7 +49,9 @@ session is the resolve's, never the frame's.
   resolved session and the agent the frame names (its own hook's: it selects a count, never a lower one); the
   limits in force are ``limits(agent, session)``, the Broker's settings callable (default: none configured, every
   call GO, nothing counted). A ``crossed``, ``halted`` or ``fail_deny`` verdict answers over-limit; ``ok`` and
-  ``not_counting`` (the counter's own bounded fail-open) answer GO. Tokens are not counted in a slot (the frame
+  ``not_counting`` (the counter's own bounded fail-open) answer GO. A counter directory that cannot be established
+  as the broker's own 0700 one answers ``limits-failed`` on every limited call (the counter could not even persist
+  its failure count, so its fail-open would never end). Tokens are not counted in a slot (the frame
   carries no transcript path, and the broker reads none of the session's files). KNOWN EDGE: the Extend / End hold
   of :func:`~levain.consent.limits.check` needs a ConsentQueue the broker does not have, so over-limit stands until
   the operator changes the limits the callable returns.
@@ -91,8 +94,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import posixpath
 import re
+import stat
 import threading
 import time
 from collections import OrderedDict
@@ -160,7 +165,7 @@ _ANSWER_ROW_KEYS = frozenset({"format", "payload", "signature"})
 # the tier whose undecided row halts its session (the GATE verb): the slot gate files every irreversible-class call
 # here (claude_code / codex slot_gate, tier=AGENT_CONFIG_TIER), every reversible one at broker_client.UNGATED_TIER
 HALT_TIER = AGENT_CONFIG_TIER
-GATE_VERDICTS = ("go", "halted", "over-limit")
+GATE_VERDICTS = ("go", "halted", "over-limit", "limits-failed")
 _GATE_OVER = frozenset({"crossed", "halted", "fail_deny"})
 _GATE_KEYS = frozenset({"v", "op", "id", "cap", "agent", "tool_name", "input_digest", "tool_use_id"})
 _GATE_REQUIRED = _GATE_KEYS - {"tool_use_id"}
@@ -168,6 +173,8 @@ _GATE_REQUIRED = _GATE_KEYS - {"tool_use_id"}
 LimitsSource = Callable[[str, str], "Mapping[str, float] | None"]
 # the counter's directory under requests/ (limits.db and its failure files)
 LIMITS_DIR = "limits"
+# GATE's limits-failed reason when that directory cannot be used (Broker._limits_dir)
+LIMITS_DIR_FAILED = "the limits directory requests/limits could not be used as the broker's own 0700 directory"
 
 
 @dataclass(frozen=True)
@@ -261,6 +268,7 @@ class Broker:
         ``limits``: the GATE verb's settings callable (module docstring); ``None``, no limits configured."""
         self._store = store
         self._limits = limits
+        self._limits_dir_logged = False
         self._receipts = receipts if receipts is not None else Receipts(store.root)
         self._contracts = None if contracts is None else Path(contracts)
         self._contracts_owner = contracts_owner
@@ -698,23 +706,35 @@ class Broker:
         # every kind the callable leaves out is unlimited (count_call reads all of KINDS)
         full = {k: float(in_force.get(k, float("inf"))) for k in consent_limits.KINDS}
         event = {"tool_use_id": tid} if isinstance(tid, str) else {}
-        verdict = consent_limits.count_call(self._limits_dir(), agent, who.session, event, tool_name=tool_name,
+        qdir = self._limits_dir()
+        if qdir is None:
+            return wire.answer(rid, gate="limits-failed", reason=LIMITS_DIR_FAILED)
+        verdict = consent_limits.count_call(qdir, agent, who.session, event, tool_name=tool_name,
                                             tool_input=digest, limits=full)
         if verdict.state in _GATE_OVER:
             return wire.answer(rid, gate="over-limit", kind=verdict.kind)
         return wire.answer(rid, gate="go")
 
-    def _limits_dir(self) -> Path:
+    def _limits_dir(self) -> Path | None:
         """Where the counter keeps ``limits.db``: :data:`LIMITS_DIR` under ``requests/`` (the broker's own directory;
-        ``L/queue`` itself is root's), a 0700 directory of the broker's uid as the counter requires. One that cannot
-        be made is left to the counter, which fails as it does on any store failure."""
+        ``L/queue`` itself is root's), a 0700 directory of the broker's uid as the counter requires; ``None`` when it
+        cannot be established as one (a file there, a symlink, another owner, wider mode, a mkdir that fails): GATE
+        then fails closed ``limits-failed``, since a counter with no directory cannot persist even its own failure
+        count and would answer ``not_counting`` (go) forever. Logged once per broker."""
         path = self._store.requests / LIMITS_DIR
         try:
-            path.mkdir(mode=0o700)
-        except FileExistsError:
-            pass
+            try:
+                path.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            st = os.lstat(path)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o700:
+                raise OSError(f"{path} is not a 0700 directory of uid {os.geteuid()}")
         except OSError:
-            log.exception("qbroker: the limits directory %s could not be made", path)
+            if not self._limits_dir_logged:
+                self._limits_dir_logged = True
+                log.exception("qbroker: the limits directory %s cannot be used; every limited GATE fails closed", path)
+            return None
         return path
 
     def _halted_on(self, session: str) -> str | None:
