@@ -1164,12 +1164,20 @@
       glanceFace(d, n, glance);
       const glanced = glance.childNodes.length > 0;
       if (!n && !s.ctx.alerted && d.clean !== false) { const e = String(d.empty || ""); if (e) host.appendChild(el("div", "sub", sentence(e))); }
+      else if (d.note) {
+        // the provider's note is its word on what the read covers ("no cockpit broker: decisions waiting on a signature are
+        // not shown"), so it stays the first line whenever it is given: a strip tile draws only its first sub line, and a
+        // count with its caveat dropped reads as the whole answer. The top item follows it.
+        host.appendChild(el("div", "sub", d.note));
+        if (!glanced && n && !s.ctx.alerted && Array.isArray(d.lines) && d.lines[0] && typeof d.lines[0].text === "string") {
+          host.appendChild(el("div", "sub", d.lines[0].text + (n > 1 ? " +" + (n - 1) + " more" : "")));
+        }
+      }
       else if (glanced) { /* the glance lines below are the answer */ }
       else if (n && Array.isArray(d.lines) && d.lines.length && d.lines[0] && typeof d.lines[0].text === "string" && !s.ctx.alerted) {
         // the face names the top item and counts the rest ("backfill +3 more"), so the tile reads as an answer, not a bare number
         host.appendChild(el("div", "sub", d.lines[0].text + (n > 1 ? " +" + (n - 1) + " more" : "")));
       }
-      else if (d.note) host.appendChild(el("div", "sub", d.note));
       while (glance.firstChild) host.appendChild(glance.firstChild);
       return;
     }
