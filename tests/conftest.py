@@ -210,6 +210,15 @@ def _isolate_consent_hook_wiring(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_levain_home(monkeypatch, tmp_path_factory):
+    """TEST ONLY: every place levain resolves "its home" (`default_queue_dir`, the key dir, the autonomic store, the
+    coordinator record) reads `$LEVAIN_HOME` first and falls back to `~/.levain`, so a test that reached one without
+    setting it wrote the operator's REAL home (the coordinator launch tests did, 10-21). Every test gets its own
+    `$LEVAIN_HOME`, replacing whatever the reviewer's shell holds; a test that means another sets it itself."""
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path_factory.mktemp("levain-home")))
+
+
+@pytest.fixture(autouse=True)
 def _reset_entity_process_latch():
     """`$LEVAIN_ENTITY_PROCESS` is a one-way latch by design (spore-438): opening an entity sets it
     and nothing in levain clears it, because nothing should. A test process opens many entities, so

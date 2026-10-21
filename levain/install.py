@@ -2782,6 +2782,20 @@ def coordinator_allow(python_path: str) -> tuple[str, ...]:
     return tuple(f"Bash({command} {verb}:*)" for verb in COORDINATOR_VERBS)
 
 
+def coordinator_deny() -> tuple[str, ...]:
+    """The coordinator's Claude Code deny rules: no edit of its own record (the file that marks its workspace for
+    the door) or that file's lock, wherever the door reads one. Claude Code consults ``Edit(path)`` rules for every
+    built-in file-editing tool (a ``Write(path)`` rule is accepted and never consulted; code.claude.com/docs/en/permissions,
+    "Read and Edit"), and ``//path`` is the absolute-path spelling. A Bash command can still write the file: Claude
+    has no OS sandbox here, so this closes the editing tools only."""
+    from levain.coordinator import door
+
+    files: list[str] = []
+    for record in door._record_paths():
+        files += [str(record), str(record) + ".lock"]
+    return tuple(f"Edit(/{f})" for f in dict.fromkeys(files))
+
+
 def installed_coordinator_levain(install: Path, python_path: str) -> str | None:
     """The spelling ``install``'s own allow rules pre-approve for a coordinator launched from ``python_path``, or None.
     Never parsed out of the file (Levain never parses a shell command): the rules this interpreter would render are
@@ -2940,6 +2954,10 @@ def _apply_role(settings_text: str, role: str | None, python_path: str) -> str:
     if not isinstance(allow, list):
         raise InitError("the rendered Claude Code settings carry a permissions.allow that is not a list")
     allow.extend(rule for rule in coordinator_allow(python_path) if rule not in allow)
+    deny = perms.setdefault("deny", [])
+    if not isinstance(deny, list):
+        raise InitError("the rendered Claude Code settings carry a permissions.deny that is not a list")
+    deny.extend(rule for rule in coordinator_deny() if rule not in deny)
     enabled = doc.setdefault("enabledMcpjsonServers", [])
     if not isinstance(enabled, list):
         raise InitError("the rendered Claude Code settings carry an enabledMcpjsonServers that is not a list")

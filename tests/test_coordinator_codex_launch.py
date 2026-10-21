@@ -129,12 +129,6 @@ class FakeDaemon:
         return {"error": {"code": -32601, "message": f"unknown method {method}"}}
 
 
-@pytest.fixture(autouse=True)
-def _levain_home(tmp_path, monkeypatch):
-    """The coordinator record a launch reads and writes is this test's own, never the operator's."""
-    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "levain-home"))
-
-
 @pytest.fixture
 def home(monkeypatch):
     # a short path: a unix socket path is capped near 104 bytes on macOS, which pytest's tmp_path can pass

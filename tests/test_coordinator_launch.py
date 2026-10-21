@@ -1228,3 +1228,16 @@ def test_the_brief_spelling_is_looked_up_as_exact_rules_never_parsed(tmp_path):
     for partial in (["Bash(make coord:*)", "Bash(make drops:*)", "Bash(make thread:*)"],
                     list(inst.coordinator_allow(here))[:2]):
         assert rules(partial) is None, partial
+
+
+def test_a_claude_coordinator_may_not_edit_its_own_record(tmp_path, monkeypatch):
+    # reproduced: the rendered coordinator settings carried allow rules only, so Claude's Write/Edit tools could
+    # rewrite the record that marks its workspace. Claude Code consults Edit(path) rules for every editing tool.
+    from levain import install as inst
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    doc = json.loads(inst._apply_role(json.dumps({"permissions": {"allow": []}}), "coordinator", "/venv/bin/python"))
+    record = (tmp_path / "lh").resolve() / "consent" / "coordinator_workspaces.json"
+    assert f"Edit(/{record})" in doc["permissions"]["deny"]
+    assert f"Edit(/{record}.lock)" in doc["permissions"]["deny"]
+    assert all(r.startswith("Edit(//") for r in doc["permissions"]["deny"])
+    assert "deny" not in json.loads(inst._apply_role(json.dumps({"permissions": {}}), None, "/venv/bin/python"))["permissions"]
