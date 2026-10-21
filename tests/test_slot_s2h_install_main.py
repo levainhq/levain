@@ -543,6 +543,28 @@ def test_quiesce_reads_session_records_before_slot_locks(tmp_path, monkeypatch):
     monkeypatch.setattr(IH, "live_lease_sessions", lambda d: order.append("sessions") or ())
     q = IH.Quiesce(tmp_path)
     monkeypatch.setattr(IH.Quiesce, "held", property(lambda self: True))
+    monkeypatch.setattr(IH.Quiesce, "leased_slots", lambda self: order.append("states") or {})
     monkeypatch.setattr(IH.Quiesce, "busy_slots", lambda self: order.append("slots") or [])
     assert q.live() == ()
-    assert order == ["sessions", "slots"]
+    assert order == ["sessions", "states", "slots"]
+
+
+def test_a_leased_slot_counts_with_no_live_record_and_no_lock(tmp_path, monkeypatch):
+    """L3 r2 (codex HIGH): prepare's ATTACH can land and its slot lock drop between the record read and the lock
+    probe (and END's record clear comes before its lock). Under the pool lock the slot state cannot move, so a
+    slot whose state is leased is counted by its session; an unreadable state counts as live."""
+    from levain.slot.records import SlotId
+    from tests.test_slot_s2f2_runtime_helper import _slot_state
+    L = tmp_path
+    (L / "sessions").mkdir()
+    for tag, data in (("e0", _slot_state(SlotId("egress", 0), "leased", rev=1, seq=1, session=S1)),
+                      ("e1", _slot_state(SlotId("egress", 1))), ("e2", b"not a state")):
+        (L / "slots" / tag).mkdir(parents=True)
+        (L / "slots" / tag / "state").write_bytes(data)
+        (L / "slots" / tag / "lock").write_bytes(b"")
+    q = IH.Quiesce(L)
+    monkeypatch.setattr(IH.Quiesce, "held", property(lambda self: True))
+    assert q.live() == (S1, "slot e2")
+    assert q.live_leases() == 2
+    assert IH._lease_list(q.live()) == (f"session(s) {S1} (end each first); "
+                                        "slot e2 busy (a prepare or END in flight; retry)")

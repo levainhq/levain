@@ -286,10 +286,43 @@ class Quiesce:
         return busy
 
     def live(self) -> tuple[str, ...]:
-        """What the live-lease count counts: the live sessions, plus ``slot <name>`` per :meth:`busy_slots` when held."""
-        sessions = live_lease_sessions(self.store / "sessions")   # first, as before: a session's live record is
-        # read before the slot locks, so one going from its record to END's lock is seen at one end or the other
-        return sessions + (tuple(f"slot {b}" for b in self.busy_slots()) if self.held else ())
+        """What the live-lease count counts: the sessions whose record is ``lease_live``; when held, also the session
+        of every slot whose state is ``leased`` and ``slot <name>`` per :meth:`busy_slots` not already named. Under the
+        hold a slot's state cannot change (prepare leases and SCRUB releases under ``pool.lock``, runtime_helper
+        "state=\"leased\"" and start "state=\"reusable\""), so ``leased`` covers every lease from prepare to its
+        release, including the two moments neither a record nor a slot lock shows it (L3 r2, codex)."""
+        sessions = list(live_lease_sessions(self.store / "sessions"))
+        if not self.held:
+            return tuple(sessions)
+        leased = self.leased_slots()
+        for sess in leased.values():
+            if sess not in sessions:
+                sessions.append(sess)
+        return tuple(sessions) + tuple(f"slot {b}" for b in self.busy_slots() if leased.get(b) not in sessions)
+
+    def leased_slots(self) -> dict[str, str]:
+        """Under the hold: slot name -> what holds it, for every slot whose state file says ``leased`` (its session),
+        or cannot be read or parsed (``slot <name>``: counted live, so an install verb refuses rather than act)."""
+        assert self.held
+        out: dict[str, str] = {}
+        slots = self.store / "slots"
+        for name in sorted(os.listdir(slots)):
+            try:
+                fd = os.open(slots / name / "state", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                out[name] = f"slot {name}"
+                continue
+            try:
+                with os.fdopen(fd, "rb") as fh:
+                    st = R.parse_slot_state(fh.read(1 << 16))
+            except (OSError, Refused):
+                out[name] = f"slot {name}"
+                continue
+            if st.state == "leased" and st.session is not None:
+                out[name] = st.session
+        return out
 
     def live_leases(self) -> int:
         return len(self.live())
