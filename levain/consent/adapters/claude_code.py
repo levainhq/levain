@@ -1576,8 +1576,9 @@ def could_not_run(tier: str | None, what: str) -> dict[str, Any]:
 # the local queue, which a slot does not have, and an ungated call never reaches the broker, so nothing counts it;
 # the broker has no limit verb yet. S2b adds one, asked on every PreToolUse. Any public word about slots says so.
 
-# who decided, in the gate's words, when the broker verified the answer (the hook never sees the signer's key)
-SLOT_HOW = "a signed levain answer the queue broker verified"
+# who decided, in the gate's words, when the broker verified the decision (the hook never sees the signer's key, and
+# cannot tell an operator's signed answer from an allow the run's signed contract grant gave)
+SLOT_HOW = "a levain decision the queue broker verified against an operator's signature"
 
 
 def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold: float = DEFAULT_GATE_HOLD,
@@ -1617,12 +1618,14 @@ def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold:
             return could_not_run(tier, what)
         client = client if client is not None else broker_client.BrokerClient.from_env(expected_uid=expected_uid)
         tool_use_id = event.get("tool_use_id")
+        # a call a dispatch contract may grant carries its paths (W2-c3); the broker decides whether they grant it
+        member = broker_client.grant_member(AGENT, tool_name, tool_input, cwd)
         request = broker_client.gate_request(
             agent=AGENT, session=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
             event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None,
-            tier=AGENT_CONFIG_TIER, hold=hold)
+            tier=AGENT_CONFIG_TIER, hold=hold, grant=member)
         decision = broker_client.file_and_hold(client, request, hold, poll=GATE_POLL, sleep=sleep,
-                                               monotonic=monotonic)
+                                               monotonic=monotonic, grant=member)
     except Exception:  # noqa: BLE001 - fail closed: the broker down, refusing or malformed is a deny
         return could_not_run(tier, what)
     if decision is None:

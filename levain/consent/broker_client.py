@@ -29,6 +29,18 @@ about 300 connections, not 1,200, well under the broker's per-slot rate). Anythi
 environment, an unreachable socket, a peer that is not the broker, a refusal of any other name, an answer that is
 not exactly one of the shapes above) raises :class:`BrokerError`, and the adapters deny on it (fail closed).
 
+THE TYPED CONTRACT GRANT (F4, W2-c3; W2C_DESIGN §1, §4). For a call a dispatch contract may grant,
+:func:`grant_member` reads the paths it touches with :func:`levain.dispatch.grant.grant_paths` and returns the
+REQUEST's ``grant`` member ``{paths, input}``; :func:`gate_request` given that member seals the request with the
+``pb1:`` digest of the same paths and input (:func:`levain.dispatch.grant.input_bound_digest`: one function for the
+digest, so the hook and the broker cannot compute it two ways), and :meth:`BrokerClient.request` sends the member
+beside ``request``. A call that is not grantable, or whose parse is not total, is sealed with
+:func:`levain.consent.record.tool_input_digest` and sends no member. The hook does not know its session's kind and
+does not need to: by the design, whether a member grants anything is the broker's decision, from CONTROL's word on
+the session and the run's worktree root. The root a Codex patch's paths join to is the hook's ``cwd`` (Claude
+Code's paths are absolute), which is where Codex itself resolves them; by the design (W2C_DESIGN §7) a Codex call
+whose cwd is not the run's worktree root goes to the queue.
+
 Known edge (L3 r1 D): the same hook event delivered twice files two requests (the event id is sealed into the
 request, but this client keeps no record between hook processes). The harness delivers one PreToolUse per call; a
 duplicate costs one extra pending row, which expires. Stdlib only.
@@ -50,7 +62,7 @@ from levain.qbroker import wire
 
 __all__ = ["BROKER_ACCOUNT", "CAP_ENV", "FAST_POLLS", "IO_TIMEOUT", "PENDING_REFUSALS", "REQUEST_RETRY",
            "SLOW_POLL", "SOCKET_ENV", "BrokerClient", "BrokerError", "broker_uid", "file_and_hold", "gate_request",
-           "hold_for_decision", "in_slot"]
+           "grant_member", "hold_for_decision", "in_slot"]
 
 SOCKET_ENV = "LEVAIN_QUEUE_SOCKET"
 CAP_ENV = "LEVAIN_QUEUE_CAP"
@@ -177,12 +189,15 @@ class BrokerClient:
             raise BrokerError(name if isinstance(name, str) and name else "malformed", "refused")
         return got
 
-    def request(self, request: ExternalGateRequest, *, timeout: float | None = None) -> str:
+    def request(self, request: ExternalGateRequest, *, timeout: float | None = None,
+                grant: Mapping[str, Any] | None = None) -> str:
         """File ``request``; its request id, which must be the id this client sealed (the broker re-seals the
-        same fields, so any other id is not an answer about this request)."""
+        same fields, so any other id is not an answer about this request). ``grant``: :func:`grant_member`'s
+        member, sent beside ``request`` (``request`` must be sealed with it, :func:`gate_request`)."""
         fields = request.fields()
         fields.pop("id")
-        got = self.call("REQUEST", timeout=timeout, request=fields)
+        extra = {} if grant is None else {"grant": dict(grant)}
+        got = self.call("REQUEST", timeout=timeout, request=fields, **extra)
         if got.get("request_id") != request.id or not isinstance(got.get("queue_id"), str):
             raise BrokerError("malformed", "REQUEST answered for another request")
         return request.id
@@ -204,29 +219,57 @@ class BrokerClient:
         raise BrokerError("malformed", "ANSWER? answered neither a decision nor pending")
 
 
+def grant_member(agent: str, tool_name: str, tool_input: Any, root: str) -> dict[str, Any] | None:
+    """The REQUEST's ``grant`` member ``{"paths", "input"}`` for a call a dispatch contract may grant: ``paths``
+    from :func:`levain.dispatch.grant.grant_paths` (``root``: the patch paths' base, the hook's ``cwd``), ``input``
+    the :func:`levain.cockpit.consent.value_sha256` of ``tool_input``. ``None`` when the call is not grantable or its
+    parse is not total. Never raises: a call it cannot read sends no member."""
+    try:
+        # here, not at import: an import cycle (levain.dispatch.grant -> the Codex adapter -> this module)
+        from levain.cockpit.consent import value_sha256
+        from levain.dispatch.grant import grant_paths
+
+        paths = grant_paths(agent, tool_name, tool_input, root)
+        if paths is None:
+            return None
+        return {"paths": list(paths), "input": value_sha256(tool_input)}
+    except Exception:  # noqa: BLE001 - no member is today's request, never a failed gate
+        return None
+
+
 def gate_request(*, agent: str, session: str, tool_name: str, tool_input: Any, cwd: str, event_id: str | None,
-                 tier: str, hold: float, now: datetime | None = None) -> ExternalGateRequest:
+                 tier: str, hold: float, now: datetime | None = None,
+                 grant: Mapping[str, Any] | None = None) -> ExternalGateRequest:
     """The request a slot's gate files: the fields :meth:`ConsentQueue.file` would seal for the same call (its
     tool input digest and redacted display, ``hook:<event id>`` or an unpredictable ``rand:`` one, the hold as
-    ``expires_at``)."""
+    ``expires_at``). With ``grant`` (:func:`grant_member`'s member for this call), the digest is instead the
+    ``pb1:`` digest of the member's paths and input hash (:func:`levain.dispatch.grant.input_bound_digest`)."""
     now = now if now is not None else datetime.now(timezone.utc)
     event = f"hook:{event_id}" if event_id else "rand:" + os.urandom(16).hex()
+    if grant is None:
+        digest = tool_input_digest(tool_input)
+    else:
+        from levain.dispatch.grant import input_bound_digest
+
+        digest = input_bound_digest(tool_name, grant["paths"], grant["input"])
     return ExternalGateRequest.create(
         agent=agent, agent_session_id=session, event_id=event, tool_name=tool_name,
-        tool_input_digest=tool_input_digest(tool_input), display=redact_display(tool_name, tool_input), cwd=cwd,
+        tool_input_digest=digest, display=redact_display(tool_name, tool_input), cwd=cwd,
         tier=tier, received_at=utc_stamp(now), expires_at=utc_stamp(now + timedelta(seconds=hold)))
 
 
 def file_and_hold(client: BrokerClient, request: ExternalGateRequest, hold: float, *, poll: float,
                   sleep: Callable[[float], None] = time.sleep,
-                  monotonic: Callable[[], float] = time.monotonic) -> str | None:
-    """File ``request`` and hold for its decision, all of it within ``hold`` (the REQUEST included, each socket
-    operation capped at the time left): the verified decision, or ``None`` when the hold ended with none. A
-    ``rate-limited`` REQUEST is sent once more after :data:`REQUEST_RETRY`; a second refusal, or any other
-    failure, raises :class:`BrokerError`."""
+                  monotonic: Callable[[], float] = time.monotonic,
+                  grant: Mapping[str, Any] | None = None) -> str | None:
+    """File ``request`` (with its ``grant`` member, when it was sealed with one) and hold for its decision, all of
+    it within ``hold`` (the REQUEST included, each socket operation capped at the time left): the verified
+    decision, or ``None`` when the hold ended with none. A ``rate-limited`` REQUEST is sent once more after
+    :data:`REQUEST_RETRY`; a second refusal, or any other failure, raises :class:`BrokerError`."""
     deadline = monotonic() + hold
+    extra = {} if grant is None else {"grant": grant}
     try:
-        client.request(request, timeout=max(deadline - monotonic(), 0.001))
+        client.request(request, timeout=max(deadline - monotonic(), 0.001), **extra)
     except BrokerError as exc:
         if exc.name != "rate-limited":
             raise
@@ -234,7 +277,7 @@ def file_and_hold(client: BrokerClient, request: ExternalGateRequest, hold: floa
         if left <= REQUEST_RETRY:
             raise
         sleep(REQUEST_RETRY)
-        client.request(request, timeout=max(deadline - monotonic(), 0.001))
+        client.request(request, timeout=max(deadline - monotonic(), 0.001), **extra)
     return _hold(client, request.id, deadline, poll=poll, sleep=sleep, monotonic=monotonic)
 
 

@@ -462,7 +462,7 @@ def test_a_fake_broker_run_by_another_uid_is_refused_before_a_frame(adapter, fak
 def test_the_same_fake_with_its_own_uid_expected_is_answered(adapter, fake, ws, tmp_path):
     """The control for the case above: the refusal is the uid check, nothing else about the fake."""
     out = gate_of(adapter)(event_of(adapter, ws), hold=HOLD, **kw_of(adapter, tmp_path))
-    assert "allowed by a signed levain answer the queue broker verified" in json.dumps(out)
+    assert f"allowed by {cc.SLOT_HOW}" in json.dumps(out)
     assert fake.frames == 2
 
 
@@ -489,7 +489,7 @@ def test_the_hook_looks_the_broker_account_up_by_name(adapter, L, slot, ws, keys
     monkeypatch.setattr(broker_client.pwd, "getpwnam", getpwnam)
     kw = {k: v for k, v in kw_of(adapter, tmp_path).items() if k != "expected_uid"}
     out = gate_of(adapter)(event_of(adapter, ws), hold=HOLD, sleep=answering(L, keys["operator"]), **kw)
-    assert "allowed by a signed levain answer the queue broker verified" in json.dumps(out)
+    assert f"allowed by {cc.SLOT_HOW}" in json.dumps(out)
     assert asked == [broker_client.BROKER_ACCOUNT]   # once per client, not per call
 
 
@@ -616,7 +616,7 @@ def test_a_broker_rate_limiting_the_first_request_files_it_on_the_retry(adapter,
         monkeypatch.delenv(name, raising=False)
     try:
         out = gate_of(adapter)(event_of(adapter, ws), hold=HOLD, sleep=lambda s: None, **kw_of(adapter, tmp_path))
-        assert "allowed by a signed levain answer the queue broker verified" in json.dumps(out)
+        assert f"allowed by {cc.SLOT_HOW}" in json.dumps(out)
         assert srv.requests == 2
     finally:
         srv.close()
