@@ -10,8 +10,9 @@ bytes), ``"stdout_equals": str`` (the captured stdout is exactly its UTF-8 bytes
 nothing on stderr). ``<run_dir>`` holds what root wrote for each step ``k``: ``step<k>.exit`` (``{exit, signal,
 wall_s, timed_out, truncated_bytes, lingering_killed}``), ``step<k>.out`` and ``step<k>.err``, where ``k`` is 0-BASED,
 the report's numbering: the first ticket step's files are ``step0.exit``, ``step0.out``, ``step0.err``. Each is a
-regular file; anything else (a directory, a FIFO, a symlink) is not a capture root wrote. A step passes when it was not timed out or signalled, exited with the pinned code, and every pinned
-output check holds; an output check on a capture root truncated fails, since the bytes compared are not all of them.
+regular file; anything else (a directory, a FIFO, a symlink) is not a capture root wrote. A step passes when it
+was not timed out or signalled, exited with the pinned code, and every pinned output check holds; an output check on a
+capture root truncated fails, since the bytes compared are not all of them.
 
 Stdout carries the ``levain-dispatch-verifier-report/1`` body as canonical JSON (keys sorted, no whitespace, UTF-8,
 no trailing newline) and nothing else. Black-box by construction: it reads only root-written files, never the repo.
@@ -78,6 +79,7 @@ def _read(path: str, cap: int, what: str) -> bytes:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
     except OSError as exc:
         raise Infrastructure(f"{what} cannot be opened ({type(exc).__name__})") from None
+    read = False
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise Infrastructure(f"{what} is not a regular file")
@@ -89,13 +91,15 @@ def _read(path: str, cap: int, what: str) -> bytes:
             chunks.append(chunk)
             left -= len(chunk)
         data = b"".join(chunks)
+        read = True
     except OSError as exc:
         raise Infrastructure(f"{what} cannot be read ({type(exc).__name__})") from None
     finally:
         try:
             os.close(fd)
-        except OSError:
-            pass
+        except OSError as exc:
+            if read:  # a failed close after a whole read is a fault too; on an error path the first fault stands
+                raise Infrastructure(f"{what} cannot be closed ({type(exc).__name__})") from None
     if len(data) > cap:
         raise Infrastructure(f"{what} is over {cap} bytes")
     return data

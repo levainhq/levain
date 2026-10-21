@@ -310,7 +310,7 @@ verifier_artifact_digest = artifact_digest
 
 
 # the shipped templates whose driver_input is {"steps": [one expectation per ticket step]}: the count is checked at accept,
-# so a mismatch is never found first by a run
+# so a mismatch is never found first by a run. A new template of that shape is added here, or its count goes unchecked.
 _STEP_INDEXED_INPUT = frozenset({"output_compare"})
 
 
