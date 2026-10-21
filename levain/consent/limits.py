@@ -292,9 +292,11 @@ def _open_halt(conn: sqlite3.Connection, agent: str, root: str) -> dict[str, Any
 
 def count_call(queue_dir: Path | str, agent: str, session: str, event: Mapping[str, Any], *,
                tool_name: str, tool_input: Any, now: float | None = None,
-               limits: Mapping[str, float] | None = None) -> Verdict:
+               limits: Mapping[str, float] | None = None, count_crossed: bool = True) -> Verdict:
     """Count one ``PreToolUse`` call of ``session`` (Claude Code's subagent key included) and say whether it may go on.
-    Never raises: a failure is ``not_counting`` (proceed) or, past :data:`FAIL_DENY_AFTER`, ``fail_deny``."""
+    Never raises: a failure is ``not_counting`` (proceed) or, past :data:`FAIL_DENY_AFTER`, ``fail_deny``.
+    ``count_crossed=False``: a call answered ``crossed`` is not counted (nothing written), for a caller that denies
+    it with no halt (the queue broker's GATE), so a limit the operator raises later is not found already spent."""
     qdir = Path(queue_dir)
     root = session_root(session)
     fail = _fail_path(qdir, agent, root)
@@ -303,7 +305,7 @@ def count_call(queue_dir: Path | str, agent: str, session: str, event: Mapping[s
             raise ValueError(f"unknown agent {agent!r}")
         in_force = dict(limits) if limits is not None else _limits_or_defaults(qdir, agent)
         verdict = _count(qdir, agent, root, event, tool_name, tool_input,
-                         time.time() if now is None else now, in_force)
+                         time.time() if now is None else now, in_force, count_crossed)
     except Exception as exc:  # noqa: BLE001 - a brake never stops work on its own failure, until it is a runaway's
         halt = _halt_read_only(qdir, agent, root)
         if halt is not None:            # a halt is never lifted by the store failing to take the count
@@ -406,7 +408,7 @@ def _limits_or_defaults(qdir: Path, agent: str) -> dict[str, float]:
 
 
 def _count(qdir: Path, agent: str, root: str, event: Mapping[str, Any], tool_name: str, tool_input: Any,
-           now: float, in_force: Mapping[str, float]) -> Verdict:
+           now: float, in_force: Mapping[str, float], count_crossed: bool = True) -> Verdict:
     from levain.cockpit.session_context import spend_step
 
     digest = hashlib.sha256(f"{tool_name}\0{tool_input_digest(tool_input)}".encode()).hexdigest()[:16]
@@ -458,16 +460,18 @@ def _count(qdir: Path, agent: str, root: str, event: Mapping[str, Any], tool_nam
             fresh = _num0(spend.get("gone_fresh")) + sum(_num0(s.get("fresh")) for s in by.values())
             cache_read = _num0(spend.get("gone_cache_read")) + sum(_num0(s.get("cache_read")) for s in by.values())
             stored = transcript
-        conn.execute("UPDATE sessions SET calls = ?, active_s = ?, first_at = ?, last_at = ?, fresh = ?, "
-                     "cache_read = ?, window = ?, recent_ids = ?, spend = ?, transcript = ? "
-                     "WHERE agent = ? AND root = ?",
-                     (calls, active_s, first_at, last_at, fresh, cache_read, json.dumps(window), json.dumps(recent),
-                      json.dumps(spend, separators=(",", ":")), stored, agent, root))
-    counts = _counts(calls, active_s, fresh, cache_read, window, win, digest if counted else None)
-    for kind in KINDS:
-        if counts[kind] > lim[kind] or (kind == "repeat" and counts[kind] >= lim[kind]):
-            return Verdict("crossed", kind=kind, count=counts[kind], limit=lim[kind], counts=counts, limits=lim,
-                           mark=mark)
+        counts = _counts(calls, active_s, fresh, cache_read, window, win, digest if counted else None)
+        crossed = next((kind for kind in KINDS
+                        if counts[kind] > lim[kind] or (kind == "repeat" and counts[kind] >= lim[kind])), None)
+        if crossed is None or count_crossed:
+            conn.execute("UPDATE sessions SET calls = ?, active_s = ?, first_at = ?, last_at = ?, fresh = ?, "
+                         "cache_read = ?, window = ?, recent_ids = ?, spend = ?, transcript = ? "
+                         "WHERE agent = ? AND root = ?",
+                         (calls, active_s, first_at, last_at, fresh, cache_read, json.dumps(window),
+                          json.dumps(recent), json.dumps(spend, separators=(",", ":")), stored, agent, root))
+    if crossed is not None:
+        return Verdict("crossed", kind=crossed, count=counts[crossed], limit=lim[crossed], counts=counts, limits=lim,
+                       mark=mark)
     return Verdict("ok", counts=counts, limits=lim)
 
 

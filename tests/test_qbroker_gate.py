@@ -141,6 +141,27 @@ def test_a_session_over_its_limit_is_over_limit(L, resolver, clock):
     assert (d.stat().st_mode & 0o777) == 0o700 and (d / "limits.db").is_file()
 
 
+def test_calls_denied_over_limit_are_not_counted_so_a_raised_limit_is_not_spent(L, resolver, clock):
+    # F6 (s2b2_fix1_run/RUN_before.txt: calls=2, 3 denied, raised to 3, the next call still denied)
+    lim = {"calls": 2}
+    b = make_broker(L, resolver, clock, limits=lambda a, s: dict(lim))
+    assert [gate(b)["gate"] for _ in range(5)] == ["go", "go"] + ["over-limit"] * 3
+    lim["calls"] = 3
+    assert [gate(b)["gate"] for _ in range(2)] == ["go", "over-limit"]   # the third fits, the fourth crosses
+
+
+def test_the_local_counter_still_counts_the_crossing_call(tmp_path):
+    # count_call's default is unchanged: the local gate's crossing call is counted (it halts there, then holds)
+    from levain.consent import limits as consent_limits
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    full = {k: float("inf") for k in consent_limits.KINDS} | {"calls": 1.0}
+    kw = {"tool_name": "Read", "tool_input": {}, "limits": full}
+    assert consent_limits.count_call(q, "codex", "s", {}, **kw).state == "ok"
+    got = consent_limits.count_call(q, "codex", "s", {}, **kw)
+    assert got.state == "crossed" and got.count == 2
+
+
 def test_a_repeated_tool_use_id_counts_once(L, resolver, clock):
     b = limited(L, resolver, clock, {"calls": 1})
     assert [gate(b, tool_use_id="call-1")["gate"] for _ in range(3)] == ["go"] * 3

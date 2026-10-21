@@ -45,7 +45,8 @@ session is the resolve's, never the frame's.
   the operator side has a late-ruling path: nothing writes that receipt yet (:meth:`Receipts.decided` refuses an
   expired request), so a slot halt is released only by a new session.
 - Over-limit: Q13's counter (:func:`levain.consent.limits.count_call`, the counter :func:`levain.consent.limits.check`
-  runs first) fed this call, kept in ``requests/limits/limits.db`` (:meth:`Broker._limits_dir`), keyed by the
+  runs first) fed this call, with ``count_crossed=False`` (a call answered over-limit is not counted, so a limit the
+  operator raises later is not found spent by the calls it denied), kept in ``requests/limits/limits.db`` (:meth:`Broker._limits_dir`), keyed by the
   resolved session and the agent the frame names (its own hook's: it selects a count, never a lower one); the
   limits in force are ``limits(agent, session)``, the Broker's settings callable (default: none configured, every
   call GO, nothing counted). A ``crossed`` or ``halted`` verdict answers over-limit, ``fail_deny`` answers
@@ -722,7 +723,7 @@ class Broker:
         if qdir is None:
             return wire.answer(rid, gate="limits-failed", reason=LIMITS_DIR_FAILED)
         verdict = consent_limits.count_call(qdir, agent, who.session, event, tool_name=tool_name,
-                                            tool_input=digest, limits=full)
+                                            tool_input=digest, limits=full, count_crossed=False)
         if verdict.state in _GATE_OVER:
             return wire.answer(rid, gate="over-limit", kind=verdict.kind)
         if verdict.state == "fail_deny":
