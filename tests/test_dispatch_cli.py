@@ -1007,3 +1007,24 @@ def test_recommend_proposes_a_branch_and_a_run(capsys, lw):
                        "--dispatch-dir", str(lw.ddir))
     assert code == 0 and "Proposed for the operator's authorise: onto main, run 1." in out, out
     assert json.loads(lw.jstore.get(job.id).history[-1].evidence) == {"onto": "main", "run": 1}
+
+
+def test_a_dash_leading_capability_is_never_minted_and_an_old_one_parses_with_equals(capsys, lw, monkeypatch):
+    # reproduced in CI (candidate L attempt 1, py3.12): token_urlsafe began with "-" and argparse refused
+    # `--capability <it>` as "expected one argument"
+    from levain.dispatch import jobs as djobs
+
+    minted = iter(["-" + "A" * 42, "B" * 43])
+    real = djobs.secrets.token_urlsafe
+    monkeypatch.setattr(djobs.secrets, "token_urlsafe", lambda n=None: next(minted, None) or real(n))
+    job, cap = lw.verified()
+    assert cap == "B" * 43
+    old = "-" + "C" * 42                    # the shape 0.11.12/0.11.13 could have minted and kept
+    with pytest.raises(SystemExit):
+        run(capsys, "recommend", job.id, "--capability", old, "--dispatch-dir", str(lw.ddir))
+    assert "expected one argument" in capsys.readouterr().err
+    # the = form reaches the store's own check (this one is not the job's, so it is refused there, by name)
+    code, out, err = run(capsys, "recommend", job.id, f"--capability={old}", "--dispatch-dir", str(lw.ddir))
+    assert code == 2 and "expected one argument" not in err and "capability" in (out + err).lower(), (out, err)
+    code, out, _ = run(capsys, "recommend", job.id, f"--capability={cap}", "--dispatch-dir", str(lw.ddir))
+    assert code == 0, out

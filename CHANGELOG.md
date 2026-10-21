@@ -39,6 +39,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   A template whose verifier id 0.11 accepted but this version does not (uppercase, `.`, `_`, `@`, `:`, `/`, `+`, or over 48
   characters) is refused by name until it is re-signed.
   - A control store holding the new `verifier` item cannot be read by Levain 0.11.x, so do not downgrade after signing one.
+- **The dispatch job store moves to format 4** the first time this version opens it. Your jobs are kept. After that,
+  Levain 0.11.13 refuses to open the store, so do not downgrade.
+
+### Fixed
+- **A job's capability no longer starts with `-`.** About one in 64 capabilities that 0.11.12 and 0.11.13 handed a
+  planner began with a dash, and `--capability <it>` was refused as a missing value. New ones never do. A job filed
+  before you upgrade is still reached with `--capability=<it>`, which the refusals and `--help` now show.
 
 ### Known edges
 - A coordinator launch that fails (an untrusted directory, a session that never appears) counts against the
