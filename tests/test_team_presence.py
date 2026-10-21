@@ -188,10 +188,11 @@ def test_an_entry_without_presence_is_not_in_force_and_not_published_where_the_t
     capsys.readouterr()
     assert team("verify", repo=ana) != 0
     assert "signed with no user presence while the team refuses file keys; not in force" in capsys.readouterr().out
-    assert team("sync", repo=ana) != 0
+    assert team("sync", repo=ana) == 0
     err = capsys.readouterr()
-    assert "not pushed: 1 unpublished entry carries no user presence" in err.err + err.out
+    assert "kept back under refs/levain/held/" in err.err + err.out and "reset" not in err.err + err.out
     assert ledger_tip(tmp_path) == tip
+    assert "bypassed" in git("log", "-p", "--all", "--not", "levain-team-ledger", cwd=ana)
 
 
 def test_a_file_key_entry_made_while_allowed_is_held_not_published_after_the_owner_refuses(tmp_path, monkeypatch,
@@ -219,6 +220,55 @@ def test_a_file_key_entry_made_while_allowed_is_held_not_published_after_the_own
     capsys.readouterr()
     assert team("sync", repo=ben) == 0
     err = capsys.readouterr()
-    assert "kept back under refs/levain/held/: the team now refuses file keys" in err.err + err.out
+    assert "kept back under refs/levain/held/ (" in err.err + err.out
+    assert "the team refuses file keys and they are signed with no user presence" in err.err + err.out
     assert ledger_tip(tmp_path) == tip
     assert "ben offline" not in git("log", "-p", "levain-team-ledger", cwd=tmp_path / "origin.git")
+
+
+def test_sync_holds_from_the_first_entry_without_presence_and_publishes_the_rest(tmp_path, monkeypatch,
+                                                                                 capsys) -> None:
+    # reproduced on c2d6fbeb (teampres/fix2/repro_before.txt (P)): an ack, a ruling with no presence, an ack, all
+    # unpublished; sync refused all three and named a hard reset that dropped them. Now the ruling is held, the first
+    # ack publishes, and the second is re-sealed onto the published chain and publishes too
+    from levain.team import entry as E
+    from levain.team.ledger_api import open_ledger
+    from levain.team.transport import Repo
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "ana@test", "-f", str(tmp_path / "k")],
+                   check=True, capture_output=True)
+    ana = project(tmp_path)
+    assert team("init", "--project", "p", "--owner", "ana", "--member", "ana=ana@ex.com", "--allow-file-keys",
+                "--signing-key", str(tmp_path / "k.pub"), repo=ana) == 0
+    assert record(ana, "first") == 0
+    assert team("file-keys", "refuse", repo=ana) == 0
+    gl = open_ledger(Repo.discover(ana))
+    rid = gl.ledger().in_force[0]["id"]
+    for e in (E.build("ana", "ack", refs=[rid], session="s", agent="claude-code", summary="ack one"),
+              E.build("ana", "decision", kind="ruling", owner="ana", paths=["a.py"], words="bypassed", agent="human"),
+              E.build("ana", "ack", refs=[rid], session="s", agent="claude-code", summary="ack two")):
+        open_ledger(Repo.discover(ana)).append(e, push=False)       # the writer's check off, as the suite runs
+    monkeypatch.setattr(tenure, "_REQUIRE_PRESENCE", True)
+    capsys.readouterr()
+    assert team("sync", repo=ana) == 0
+    err = capsys.readouterr()
+    assert "kept back under refs/levain/held/ (" in err.err + err.out and "reset" not in err.err + err.out
+    published = git("log", "-p", "levain-team-ledger", cwd=tmp_path / "origin.git")
+    assert "ack one" in published and "ack two" in published and "bypassed" not in published
+    assert "bypassed" in git("log", "-p", "--all", "--not", "levain-team-ledger", cwd=ana)
+    assert team("verify", repo=ana) == 0
+
+
+def test_a_regenesis_keeps_the_teams_presence_rule(tmp_path) -> None:
+    # reproduced on c2d6fbeb (teampres/fix2/repro_before.txt (G)): a refusing team's re-genesis had no allow_file_keys
+    # line, so the new ledger read as a team that has not chosen, where an entry with no presence counts
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "ana@test", "-f", str(tmp_path / "k")],
+                   check=True, capture_output=True)
+    ana = project(tmp_path)
+    assert team("init", "--project", "p", "--owner", "ana", "--member", "ana=ana@ex.com",
+                "--signing-key", str(tmp_path / "k.pub"), repo=ana) == 0
+    tip = ledger_tip(tmp_path)
+    assert team("regenesis", "--from", tip, "--owner", "ana", "--member", "ana=ana@ex.com", repo=ana) == 0
+    branches = [b for b in git("for-each-ref", "--format=%(refname:short)", "refs/heads/",
+                               cwd=tmp_path / "origin.git").split() if b.startswith("levain-team-ledger-")]
+    assert len(branches) == 1
+    assert "allow_file_keys = false" in git("show", f"{branches[0]}:team.toml", cwd=tmp_path / "origin.git")

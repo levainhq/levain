@@ -1574,7 +1574,12 @@ class GitLedger:
         self._replay_held(timeout, lock_timeout)
 
     def _pick_counts(self, d, c: str) -> bool:
-        """Re-signed by this clone's key, would commit ``c`` count in ``d``? The key must be in force for every folder
+        """Re-signed by this clone's key, would commit ``c`` count in ``d``? (``_pick_why`` says why not.)"""
+        return self._pick_why(d, c) is None
+
+    def _pick_why(self, d, c: str) -> str | None:
+        """Why commit ``c``, re-signed by this clone's key, would NOT count in ``d`` (``"frozen"``, ``"key"`` or
+        ``"presence"``), or None when it would. The key must be in force for every folder
         it writes, by the derivation's own rule (the owner for ``pack-*`` lines and PROJECT.md, else the member whose
         folder it is), not merely for some member (docs L3 r1 anansi: a held pack line replayed after this clone
         stopped being owner published without counting). A frozen ``d`` answers with the anchor's tenure, so it is
@@ -1592,9 +1597,9 @@ class GitLedger:
                                                                     distrust=c0.distrust),
                                  S.SigCache(self.base / "sigcache.json"))
             except T.Unjudgeable:
-                return False
+                return "frozen"
             if fresh.judged != "full":
-                return False
+                return "frozen"
             views.append(fresh)
         fp = self.own_fingerprint()
         files = git(["diff-tree", "--no-commit-id", "--name-only", "-r", c], self.wt).stdout.split()
@@ -1609,22 +1614,72 @@ class GitLedger:
                 elif f == CANON_FILE:
                     holders.add(v.team.owner)
             if not all(h is not None and fp in T.key_fps(v.tenure, h) for h in holders):
-                return False
+                return "frozen" if d.judged != "full" else "key"
         # re-signed with a key that can never touch, a line the policy at the new parent refuses without presence would
         # publish without counting (codex HIGH 3): the same rule the derivation applies, asked before the re-sign
         if self._presence_key_problem() is not None:
-            added = git(["diff-tree", "-p", "--no-commit-id", "-r", c, "--", "ledger/"], self.wt).stdout.splitlines()
-            types = {T._parsed(ln[1:]).get("type") for ln in added if ln.startswith("+") and not ln.startswith("+++")}
+            types = {T._parsed(text).get("type") for _rel, text in self._added_lines(c)}
             if any(T.presence_required(v.team.allow_file_keys, t) for v in views for t in types):
-                return False
-        return True
+                return "presence"
+        return None
+
+    def _added_lines(self, c: str) -> list[tuple[str, str]]:
+        """(path, text) of every ledger line commit ``c`` adds, in file order."""
+        out: list[tuple[str, str]] = []
+        path = ""
+        for ln in git(["diff-tree", "-p", "--no-commit-id", "-r", c, "--", "ledger/"], self.wt).stdout.splitlines():
+            if ln.startswith("+++ "):
+                path = ln[6:] if ln.startswith("+++ b/") else ""
+            elif ln.startswith("+") and path:
+                out.append((path, ln[1:]))
+        return out
+
+    def _held_why(self, why: str, d) -> str:
+        """The hold message for the reason ``_pick_why`` (or the replay's own read-back) gave."""
+        return {
+            "frozen": f"the ledger is frozen ({d.frozen_why}) and, replayed now, they would not count on the published "
+                      "history (this machine's key is not in force there, or it cannot be judged); the next sync "
+                      "retries them",
+            "key": "replayed now they would be re-signed with this machine's key, which is not in force for the folder "
+                   "they are filed under, and publish without counting. Confirm the key (`levain team key confirm`) "
+                   "from this machine, then `levain team sync`",
+            "presence": "the team refuses file keys and they are signed with no user presence, so they would publish "
+                        "without counting; the owner runs `levain team file-keys allow`, or record them again with a "
+                        "Touch ID or security key",
+            "depends": "they supersede or refer to an entry kept back above, so they wait for it",
+        }[why]
+
+    def _reseal(self, c: str, lines: list[tuple[str, str]], timeout: float) -> subprocess.CompletedProcess:
+        """Re-seal commit ``c``'s lines onto the current tip of their files and commit them with ``c``'s message,
+        signed by this clone's key: an entry kept back earlier in the same file left the line's ``prev`` pointing at
+        a line that is not published, so a plain cherry-pick would publish a broken chain (or conflict)."""
+        self._dcache = None
+        tips = {f.rel: f.last_hash for f in self.ledger().files}
+        paths = []
+        for path, text in lines:
+            rel = path.split("/", 1)[1]
+            obj = {k: v for k, v in json.loads(text).items() if k not in ("prev", "hash")}
+            sealed = E.seal(obj, tips.get(rel, ""))
+            tips[rel] = sealed["hash"]
+            with os.fdopen(self._open_ledger_file(self.wt / path), "a+b") as fh:
+                fh.seek(0, os.SEEK_END)
+                if fh.tell() > 0:
+                    fh.seek(-1, os.SEEK_END)
+                    if fh.read(1) != b"\n":
+                        fh.write(b"\n")
+                fh.write((json.dumps(sealed, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+            paths.append(path)
+        git(["add", "--", *dict.fromkeys(paths)], self.wt)
+        return git([*_REPLAY_CONFIG, *self._sign_cfg(), "commit", "-q", "--no-verify", "-C", c], self.wt,
+                   check=False, timeout=timeout, extra_env=self._sign_env())
 
     def _replay_held(self, timeout: float, lock_timeout: float) -> None:
-        """Replay entries held back by ``_rebase_moves`` (T42) once this machine's key is IN FORCE at the tip, so the
-        re-signed copies count. Each held ref is deleted only after its commit is on the branch; a crash leaves the
-        ref, and the next sync retries it (an already-applied pick comes out empty and is skipped). The root is read
-        ONCE, first under the worktree lock (which `join` holds while it moves the pin and the worktree): every held ref
-        this call lists or deletes is under that root (code L3 r5 codex 1)."""
+        """Replay entries held back by ``_rebase_moves`` (T42) or ``_hold_unpresent`` once they would count at the tip,
+        so the re-signed copies count; one that would not stays held, and the later ones still replay. Each held ref
+        is deleted only after its commit is on the branch; a crash leaves the ref, and the next sync retries it (an
+        already-applied pick comes out empty, and an already re-sealed entry is found by id, and is skipped). The root
+        is read ONCE, first under the worktree lock (which `join` holds while it moves the pin and the worktree):
+        every held ref this call lists or deletes is under that root (code L3 r5 codex 1)."""
         with self.lock(timeout=lock_timeout):
             root = self.pinned_root
             held = git(["for-each-ref", "--format=%(objectname)", self._held_ref(root)], self.wt,
@@ -1642,37 +1697,68 @@ class GitLedger:
                                      "nothing was replayed")
                 return
             order = [c for c in cp.stdout.split() if c in want]
-            for n, c in enumerate(order):
-                if not self._pick_counts(d, c):
-                    # in order: a later entry may supersede an earlier one, so nothing is replayed past the first
-                    # that would not count
-                    why = (f"the ledger is frozen ({d.frozen_why}) and, replayed now, they would not count on the "
-                           "published history (this machine's key is not in force there, or it cannot be judged); "
-                           "the next sync retries them" if d.judged != "full" else
-                           "replayed now they would be re-signed with this machine's key, which is not in force for "
-                           "the folder they are filed under, and publish without counting. Confirm the key (`levain "
-                           "team key confirm`) from this machine, then `levain team sync`"
-                           if self._presence_key_problem() is None or d.team.allow_file_keys is not False else
-                           "the team now refuses file keys and they are signed with no user presence, so they would "
-                           "publish without counting; the owner runs `levain team file-keys allow`, or record them "
-                           "again with a Touch ID or security key")
-                    self.warnings.append(f"{len(order) - n} unpublished entr(y/ies) kept back under refs/levain/held/: "
-                                         + why)
-                    return
-                cp = git([*_REPLAY_CONFIG, *self._sign_cfg(), "cherry-pick", "--allow-empty", c], self.wt,
-                         check=False, timeout=timeout, extra_env=self._sign_env())
-                if cp.returncode != 0:
-                    if cp.returncode == 1 and not git(["diff", "--name-only", "--diff-filter=U"], self.wt,
-                                                      check=False).stdout.split() and \
+            from . import tenure as T
+            # in order, and past an entry that stays held (codex MED, r2): a later entry in the same file is re-sealed
+            # onto the published chain, and one that supersedes or refers to a held entry waits with it
+            kept: dict[str, list[str]] = {}
+            kept_files: set[str] = set()
+            kept_ids: set[str] = set()
+            for c in order:
+                lines = self._added_lines(c)
+                objs = [T._parsed(text) for _p, text in lines]
+                ids = {str(o.get("id")) for o in objs if o.get("id")}
+                why = self._pick_why(d, c)
+                if why is None and any((set(o.get("supersedes") or []) | set(o.get("refs") or [])) & kept_ids
+                                       for o in objs):
+                    why = "depends"
+                if why is None:
+                    before = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
+                    reseal = bool(kept_files & {p for p, _t in lines})
+                    if reseal:
+                        self._dcache = None
+                        if ids and ids <= set(self.ledger().by_id):
+                            # re-sealed by a sync that died before deleting the ref: already on the branch
+                            git(["update-ref", "-d", self._held_ref(root, c)], self.wt, check=False)
+                            continue
+                        cp = self._reseal(c, lines, timeout)
+                    else:
+                        cp = git([*_REPLAY_CONFIG, *self._sign_cfg(), "cherry-pick", "--allow-empty", c], self.wt,
+                                 check=False, timeout=timeout, extra_env=self._sign_env())
+                    if cp.returncode == 0:
+                        # read back as every clone will: a FIDO re-sign that came out with no presence stays held
+                        self._dcache = None
+                        refused = self.derivation().presence_refused
+                        if any(T._parsed(text).get("hash") in refused for _p, text in self._added_lines("HEAD")):
+                            git(["reset", "-q", "--hard", before], self.wt)
+                            self._dcache = None
+                            why = "presence"
+                    elif reseal:
+                        git(["reset", "-q", "--hard", before], self.wt, check=False)
+                        self.warnings.append(f"a held entry {c[:10]} could not be re-sealed ({_tail(cp)}); it stays "
+                                             "under refs/levain/held/ and the next sync retries it")
+                        break
+                    elif cp.returncode == 1 and not git(["diff", "--name-only", "--diff-filter=U"], self.wt,
+                                                        check=False).stdout.split() and \
                             git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode == 0:
                         git(["cherry-pick", "--skip"], self.wt, timeout=60)     # already on the branch
                     else:
                         git(["cherry-pick", "--abort"], self.wt, check=False)
                         self.warnings.append(f"a held entry {c[:10]} could not be replayed ({_tail(cp)}); it stays "
                                              "under refs/levain/held/ and the next sync retries it")
-                        return
+                        break
+                if why is not None:
+                    kept.setdefault(why, []).append(c)
+                    kept_files |= {p for p, _t in lines}
+                    kept_ids |= ids
+                    continue
                 git(["update-ref", "-d", self._held_ref(root, c)], self.wt, check=False)
             self._dcache = None
+            for why, cs in kept.items():
+                named = [i for c in cs for _p, t in self._added_lines(c) for i in [str(T._parsed(t).get("id") or "")]
+                         if i]
+                self.warnings.append(f"{len(cs)} unpublished entr(y/ies) kept back under refs/levain/held/ ("
+                                     + ", ".join(named[:5]) + (" ..." if len(named) > 5 else "") + "): "
+                                     + self._held_why(why, d))
 
     def _rebase_moves(self, rref: str, timeout: float, lock_timeout: float) -> None:
         """Put this clone's OWN unpublished commits on top of the remote, under the worktree lock.
@@ -1952,38 +2038,61 @@ class GitLedger:
         with self.op(timeout=net_timeout):
             return self._sync_in_op(push=push, timeout=timeout, net_timeout=net_timeout, lock_timeout=lock_timeout)
 
-    def _refuse_unpresent(self, rref: str, local: str) -> None:
+    def _hold_unpresent(self, rref: str, timeout: float, lock_timeout: float) -> None:
         """The one publish gate for the presence rule (codex HIGH 2 + 3): an unpublished entry the derivation does not
         count for want of user presence (a kill between its commit and the writer's check, or a pick re-signed onto a
-        parent that refuses file keys) is never pushed. Nothing is pushed while one is there."""
+        parent that refuses file keys) is never pushed, and nothing is dropped (r2 H-5: a refusal whose remedy was a
+        hard reset lost every unpublished entry). From the FIRST such commit on, this clone's own entries are held
+        under refs/levain/held/ (one file's lines are one chain, so a later line cannot go out before the one it is
+        sealed over) and its team changes are stripped into pending ops; the branch goes back to that commit's parent,
+        the ops re-land, and the replay puts back every later entry that counts (re-sealed where its file kept an
+        earlier line back). The countable prefix then publishes."""
         if not self.pinned_root:
             return
         d = self.derivation()
         if not d.presence_refused:
             return
-        rng = [f"{rref}..{local}"] if self._has(rref) else [local]
-        fresh = set(git(["rev-list", *rng], self.wt).stdout.split())
-        ids = sorted(self._ids_of(d, {h for h in d.presence_refused if d.walk[d.line_pos[h]] in fresh}))
-        if ids:
-            drop = f"git -C {shlex.quote(str(self.wt))} reset -q --hard {shlex.quote(rref)}" if self._has(rref) else None
-            n = f"{len(ids)} unpublished entr{'y carries' if len(ids) == 1 else 'ies carry'}"
-            raise TeamError(f"not pushed: {n} no user presence and the team refuses file keys where they sit ("
-                            + ", ".join(ids[:5]) + (" ..." if len(ids) > 5 else "")
-                            + "), so they would publish without counting. Fix: the "
-                            "owner runs `levain team file-keys allow`; or drop this clone's unpublished entries"
-                            + (f" (`{drop}`; it drops every one of them)" if drop else "")
-                            + " and record them again with a Touch ID or security key")
-
-    @staticmethod
-    def _ids_of(d, hashes: set[str]) -> list[str]:
-        from . import tenure as T
-        out = []
-        for lines in d.files.values():
-            for text in lines:
-                obj = T._parsed(text)
-                if obj.get("hash") in hashes:
-                    out.append(str(obj.get("id") or obj.get("hash"))[:40])
-        return out
+        with self.lock(timeout=lock_timeout):
+            root = self.pinned_root
+            self._recover_dirty()
+            orig = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
+            fresh = git(["rev-list", "--reverse", "--topo-order", f"{rref}..{orig}" if self._has(rref) else orig],
+                        self.wt).stdout.split()
+            bad = {d.walk[d.line_pos[h]] for h in d.presence_refused if h in d.line_pos}
+            first = next((c for c in fresh if c in bad), None)
+            if first is None:
+                return
+            suffix = fresh[fresh.index(first):]
+            own, _foreign = self._movable(orig)
+            if not set(suffix) <= set(own):
+                # held refs are re-signed with this clone's key on replay, so only its own commits may be held
+                raise TeamError("not pushed: an unpublished entry carries no user presence and the team refuses file "
+                                "keys where it sits, and commits this clone did not write sit after it; nothing was "
+                                "changed. Run `levain team doctor`")
+            pending: list[dict] = []
+            for c in suffix:
+                touched = set(git(["diff-tree", "--no-commit-id", "--name-only", "-r", c], self.wt).stdout.split())
+                if touched & {"team.toml", "tenure.toml"}:
+                    op = self._delta(c)
+                    if op is None:
+                        self.warnings.append(f"a local team change {c[:10]} could not be re-applied (no levain "
+                                             "trailer, or its parent cannot be judged here) and was dropped; re-run "
+                                             "it with the levain CLI")
+                    elif not op.get("restore"):
+                        pending.append({**op, "root": root})
+                else:
+                    git(["update-ref", self._held_ref(root, c), c], self.wt)
+            self._add_pending(pending)
+            try:
+                git(["update-ref", "-m", "levain team: hold entries that would not count", self.ref, f"{first}^",
+                     orig], self.wt)
+            except TeamError:
+                self._drop_pending(pending)
+                raise
+            git(["checkout", "-q", "-f", self.branch], self.wt, timeout=60)
+            self._dcache = None
+        self._reland()
+        self._replay_held(timeout, lock_timeout)
 
     def _sync_in_op(self, *, push: bool, timeout: float, net_timeout: float, lock_timeout: float,
                     retries: int = _PUSH_RETRIES) -> str:
@@ -2030,7 +2139,7 @@ class GitLedger:
                         return "up to date"
                     if git(["rev-list", "--merges", f"{rref}..{local}"], self.wt).stdout.strip():
                         raise TeamError("refusing to push a merge to the team ledger (it must stay linear)")
-                self._refuse_unpresent(rref, local)
+                self._hold_unpresent(rref, timeout, lock_timeout)
                 cp = git(["push", "-q", "--no-verify", remote, f"{local}:{local}"], self.repo.toplevel,
                          check=False, timeout=timeout)
                 if cp.returncode == 0:

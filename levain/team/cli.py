@@ -239,12 +239,17 @@ def cmd_status(args) -> int:
     handle = gl.handle(team)
     state = gl.state_hash(ledger, team)
     canon_text = gl.read_canon(sha)
+    unchosen = FILE_KEYS_UNCHOSEN if team.allow_file_keys is None else None
+    if unchosen and (args.path or args.json):
+        # the forms below return before the full listing's line, so the warning reaches them here (r2 codex OPEN)
+        print(f"levain team: {unchosen}", file=sys.stderr)
+    keys_json = {"allow_file_keys": team.allow_file_keys, "file_keys_warning": unchosen}
     if args.path:
         rel = _repo_paths(repo, [args.path])[0]
         d = decide(team, ledger, handle, rel, "", set())
         if args.json:
             print(json.dumps({"path": rel, "deny": bool(d and d.deny), "text": d.text if d else "",
-                              "entries": [e["id"] for e in ledger.applying_to(rel)]}))
+                              "entries": [e["id"] for e in ledger.applying_to(rel)], **keys_json}))
         else:
             print(d.text if d else f"nothing in the ledger governs {rel}")
             if d:
@@ -252,7 +257,7 @@ def cmd_status(args) -> int:
         return 0
     if args.json:
         print(json.dumps({"project": team.project, "you": handle, "in_force": ledger.in_force,
-                          "problems": ledger.problems, "canon": C.staleness(canon_text, state)},
+                          "problems": ledger.problems, "canon": C.staleness(canon_text, state), **keys_json},
                          ensure_ascii=False))
         return 0
     print(f"{team.project}: owner {team.owner}, you are {handle or 'NOT a member'}, mode {team.mode}")
@@ -431,10 +436,13 @@ def cmd_pack_sync(args) -> int:
     return 0
 
 
+_WARN = object()     # a doctor row's third state: shown, not a failure
+
+
 def cmd_doctor(args) -> int:
     repo = _repo(args)
     gl = open_ledger(repo)
-    rows: list[tuple[bool, str]] = []
+    rows: list[tuple[object, str]] = []
     if not gl.joined():
         print(f"FAIL  this clone has not joined a team ledger ({repo.toplevel})")
         return 1
@@ -457,14 +465,15 @@ def cmd_doctor(args) -> int:
     rows.append(_anneal_row(gl))
     try:
         team = gl.team()
-        # None: a WARN row, never a failure (a team from before the rule still works as it always did)
-        rows.append((None if team.allow_file_keys is None else True, _file_keys_line(team)))
+        # a WARN row, never a failure (a team from before the rule still works as it always did)
+        rows.append((_WARN if team.allow_file_keys is None else True, _file_keys_line(team)))
     except R.RolesError:
         pass        # team.toml's own row above already failed
     bad = 0
     for ok, line in rows:
-        print(f"{'WARN' if ok is None else 'ok  ' if ok else 'FAIL'}  {line}")
-        bad += ok is False
+        # WARN is its own state; every other falsy row is a failure and counted as one (r2 complement LOW 5)
+        print(f"{'WARN' if ok is _WARN else 'ok  ' if ok else 'FAIL'}  {line}")
+        bad += ok is not _WARN and not ok
     print("All team checks passed." if not bad else f"{bad} check(s) failed.")
     return 0 if not bad else 1
 
