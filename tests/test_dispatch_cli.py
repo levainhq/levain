@@ -1014,11 +1014,21 @@ def test_a_dash_leading_capability_is_never_minted_and_an_old_one_parses_with_eq
     # `--capability <it>` as "expected one argument"
     from levain.dispatch import jobs as djobs
 
-    minted = iter(["-" + "A" * 42, "B" * 43])
-    real = djobs.secrets.token_urlsafe
-    monkeypatch.setattr(djobs.secrets, "token_urlsafe", lambda n=None: next(minted, None) or real(n))
+    import secrets
+    import types
+
+    drawn = []
+    script = ["-" + "A" * 42, "B" * 43]
+
+    def token_urlsafe(n=None):
+        drawn.append(n)
+        return script[len(drawn) - 1]
+
+    # jobs.py's own name only, so no other caller can draw the dash value and leave the re-draw untested
+    monkeypatch.setattr(djobs, "secrets", types.SimpleNamespace(token_hex=secrets.token_hex,
+                                                                 token_urlsafe=token_urlsafe))
     job, cap = lw.verified()
-    assert cap == "B" * 43
+    assert cap == "B" * 43 and drawn == [32, 32]
     old = "-" + "C" * 42                    # the shape 0.11.10-0.11.13 could have minted and kept
     with pytest.raises(SystemExit):
         run(capsys, "recommend", job.id, "--capability", old, "--dispatch-dir", str(lw.ddir))
