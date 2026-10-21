@@ -433,7 +433,7 @@ class CoordStore:
         conn.execute("SAVEPOINT coord_wake")
         try:
             wake(conn, now)
-        except (CoordError, sqlite3.Error):
+        except Exception:  # noqa: BLE001 - any wake failure, never the drop: the words are kept
             conn.execute("ROLLBACK TO coord_wake")
         conn.execute("RELEASE coord_wake")
         return self._drop(conn, drop_id)
@@ -623,7 +623,7 @@ class CoordStore:
         from levain.coordinator import lease
 
         with self._write() as (conn, now):
-            return lease.take(conn, now, hold=hold or lease.LEASE_TTL)
+            return lease.take(conn, now, hold=lease.LEASE_TTL if hold is None else hold)
 
     def coord_release(self, token: int | None = None, *, by: str = "operator") -> Any:
         """End the lease: you end whatever is held; the holder ends its own with its token."""

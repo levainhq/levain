@@ -408,7 +408,7 @@ def test_m8_a_done_thread_ends_its_envelope(run, repo, tmp_path, monkeypatch):
     _drop, thread = make_thread(run, repo, monkeypatch)
     f, got = echo(run, repo, thread, tmp_path)
     run(*run.signed("envelope", "sign", str(f), "--yes"))
-    token = run.json("coord", "take")["lease"]["token"]
+    token = run.json("coord", "take")["token"]
     run("thread", "state", thread, "working", "--by", "coordinator", "--token", str(token))
     run("thread", "state", thread, "done", "--by", "coordinator", "--token", str(token))
     shown = run("envelope", "show", got["body"]["envelope_id"], "--data-root", run.root).out

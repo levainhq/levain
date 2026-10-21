@@ -179,9 +179,9 @@ def lease(conn: sqlite3.Connection, now: str) -> Lease | None:
     if conn.execute("SELECT 1 FROM lease_events WHERE seq > ? AND kind IN ('release', 'lapse', 'takeover')",
                     (seq,)).fetchone() is not None:
         return None
-    beat = conn.execute("SELECT until FROM lease_events WHERE kind = 'beat' AND token = ? ORDER BY seq DESC LIMIT 1",
-                        (seq,)).fetchone()
-    if beat is not None and beat[0] > until:        # fixed-width UTC stamps order as text
+    # the furthest until any beat gave, never the latest beat's: a clock stepped back never shortens a lease
+    beat = conn.execute("SELECT MAX(until) FROM lease_events WHERE kind = 'beat' AND token = ?", (seq,)).fetchone()
+    if beat[0] is not None and beat[0] > until:     # fixed-width UTC stamps order as text
         until = beat[0]
     return Lease(seq, holder, until, cause, now < until)
 
@@ -228,6 +228,12 @@ def claim(conn: sqlite3.Connection, now: str, launch_id: str, session_key: str) 
     if held is not None and held.holder == session_key:
         beat(conn, now, held.token, by="coordinator")
         return held.token
+    holder = None if held is None or held.holder == "operator" else _launch_by_key(conn, held.holder)
+    if holder is not None and holder.state != "active":
+        # a holder whose launch is not running holds nothing a claimant must wait out (wake reads it the same way)
+        _event(conn, now, "release", held.holder, token=held.token, until=None, cause=f"holder {holder.state}",
+               by="service")
+        held = None
     if held is not None:
         raise _refused(f"the lease is held by {held.holder} until {held.until}; nothing was written")
     return _event(conn, now, "claim", session_key, token=None, until=_plus(now, LEASE_TTL), cause="claim",
@@ -440,9 +446,10 @@ def _expire_pending(conn: sqlite3.Connection, now: str) -> None:
 
 def _idle_until(conn: sqlite3.Connection, ln: Launch) -> str:
     """When a running coordinator without the lease stops being waited for: IDLE_GRACE after the later of its
-    activation and its last lease row."""
-    last = conn.execute("SELECT MAX(at) FROM (SELECT at FROM launch_events WHERE launch_id = ? AND kind = 'active' "
-                        "UNION ALL SELECT at FROM lease_events WHERE holder = ?)",
+    activation and the furthest ``until`` its claims and beats reached. Never a row's ``at``: a lapse is written
+    whenever someone looks, and a late look must not restart the wait."""
+    last = conn.execute("SELECT MAX(t) FROM (SELECT at AS t FROM launch_events WHERE launch_id = ? AND kind = 'active' "
+                        "UNION ALL SELECT until AS t FROM lease_events WHERE holder = ? AND kind IN ('claim', 'beat'))",
                         (ln.launch_id, ln.session_key)).fetchone()[0]
     return _plus(last, IDLE_GRACE)
 
@@ -470,19 +477,24 @@ def _deaths(conn: sqlite3.Connection) -> tuple[int, str | None]:
     ``(count, at of the latest)``."""
     looked = _looked(conn)
     count, latest = 0, None
-    for (launch_id,) in conn.execute("SELECT launch_id FROM launches WHERE role = 'coordinator' AND gseq > ? "
-                                     "ORDER BY gseq DESC", (looked,)).fetchall():
+    # in the order the launches ENDED (their latest event), not the order they were asked for
+    for (launch_id,) in conn.execute(
+            "SELECT l.launch_id FROM launches l WHERE l.role = 'coordinator' AND l.gseq > ? ORDER BY "
+            "(SELECT MAX(e.gseq) FROM launch_events e WHERE e.launch_id = l.launch_id) DESC", (looked,)).fetchall():
         ln = _launch_row(conn, "launch_id", launch_id)
         # a launch voided by your take or release is older than your look; one asked for under a lease its asker
-        # lost is not the launch's fault
+        # lost is not the launch's fault; one that lost the lease without ever writing as coordinator died idle
+        wrote = conn.execute("SELECT 1 FROM lease_events WHERE holder = ? AND by = 'coordinator'",
+                             (ln.session_key,)).fetchone() is not None
         died = ln.state in ("failed", "expired") and ln.cause != "lease lost before active" \
-            or ln.state == "ended" and ln.cause == "0 turns"
+            or ln.state == "ended" and (ln.cause == "0 turns" or ln.cause == "lost the lease" and not wrote)
         if not died:
             break
         count += 1
         if latest is None:
             # the death's own time: an expiry happened at its until, whenever it was noticed
-            latest = ln.until if ln.state == "expired" else conn.execute(
+            latest = ln.until if ln.state == "expired" else _idle_until(conn, ln) if ln.cause == "lost the lease" \
+                else conn.execute(
                 "SELECT at FROM launch_events WHERE launch_id = ? ORDER BY seq DESC LIMIT 1", (launch_id,)).fetchone()[0]
     return count, latest
 
@@ -507,10 +519,8 @@ def wake_state(conn: sqlite3.Connection, now: str) -> tuple[str, str]:
         return "idle", (f"coordinator launch {waited.launch_id} is running without the lease; it claims again "
                         f"(levain coord claim) by {_idle_until(conn, waited)}, or the next drop after that ends it "
                         "and asks for a fresh coordinator")
-    for (launch_id,) in conn.execute("SELECT launch_id FROM launches WHERE role = 'coordinator' "
-                                     "ORDER BY gseq DESC").fetchall():
-        ln = _launch_row(conn, "launch_id", launch_id)
-        if ln.state == "pending" and now < ln.until:
+    for ln in _in_state(conn, "pending", "coordinator"):
+        if now < ln.until:
             return "launching", f"coordinator launch {ln.launch_id} is pending until {ln.until}"
     count, latest = _deaths(conn)
     if count >= MAX_DEATHS:

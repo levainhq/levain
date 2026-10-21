@@ -951,8 +951,7 @@ def run_coord(args: argparse.Namespace, out: Any = None) -> int:
                     raise CoordError(f"--for is a duration like 30m or 2h (got {args.hold[:40]!r})")
                 hold = timedelta(hours=int(m.group(1) or 0), minutes=int(m.group(2) or 0))
             tok = store.coord_take(hold)
-            st = store.coord_status()
-            _emit(out, args.json, st, f"you hold the coordinator role, token {tok}\n{_lease_line(st['lease'])}")
+            _emit(out, args.json, {"token": tok}, f"you hold the coordinator role, token {tok}")
             return 0
         if cmd == "release":
             ended = store.coord_release(args.token, by=args.by)

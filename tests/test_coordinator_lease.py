@@ -307,7 +307,7 @@ def test_levain_coord_cli(qdir, capsys):
     assert "launching" in run("coord", "status").out
     assert "carries the lease token" in run("drops", "split", did, "--thread", "work:x", "--by", "coordinator",
                                             rc=1).err
-    tok = json.loads(run("coord", "take", "--for", "1h", "--json").out)["lease"]["token"]
+    tok = json.loads(run("coord", "take", "--for", "1h", "--json").out)["token"]
     run("drops", "split", did, "--thread", "work:x", "--by", "coordinator", "--token", str(tok))
     assert f"released token {tok}" in run("coord", "release").out
     assert "--for is a duration" in run("coord", "take", "--for", "soon", rc=1).err
@@ -390,3 +390,52 @@ def test_no_caller_writes_a_cause_the_store_keeps_for_itself(store, clock):
         store.launch_end(ln["launch_id"], "failed", "takeover")
     with pytest.raises(CoordError, match="takes no token"):
         store.coord_release(5)
+
+
+def test_a_late_look_never_restarts_the_idle_wait(store, clock):
+    ln = boot(store)
+    clock.advance(hours=10)                                        # crashed; nobody looked for ten hours
+    drop(store, "the first look is long past the grace")
+    assert store.coord_status()["wake"] == "launching"
+    assert store.launch(ln.launch_id).cause == "lost the lease"
+
+
+def test_a_beat_under_a_clock_stepped_back_never_shortens_the_lease(store, clock):
+    boot(store)
+    token = store.coord_status()["lease"]["token"]
+    clock.advance(minutes=20)
+    far = store.coord_beat(token).until
+    clock.advance(minutes=-15)                                     # the clock is corrected backward
+    store.coord_beat(token)
+    assert store.coord_status()["lease"]["until"] == far
+
+
+def test_deaths_count_in_the_order_launches_ended(store, clock, qdir):
+    ln = boot(store)                                               # A: active, never writes as coordinator
+    clock.advance(seconds=(lease.LEASE_TTL + lease.IDLE_GRACE + lease.BACKOFF[0]).total_seconds())
+    drop(store, "A died idle (one death, its backoff past); B is asked for")
+    assert store.launch(ln.launch_id).cause == "lost the lease"
+    st = store.coord_status()
+    assert st["wake"] == "launching"
+    clock.advance(seconds=lease.LAUNCH_TTL.total_seconds())
+    drop(store, "B expired: two deaths in a row")
+    assert store.coord_status()["wake"] == "backoff" and "2 coordinator" in store.coord_status()["why"]
+
+
+def test_a_vacant_lease_whose_holder_died_is_claimable(store, clock, qdir):
+    first = boot(store)
+    token = store.coord_status()["lease"]["token"]
+    rot = store.launch_request(token, harness="claude", role="coordinator")
+    store.launch_activate(rot.launch_id, harness_session_id="probe-B")
+    c = sqlite3.connect(qdir / "dispatch.db")
+    c.execute("INSERT INTO gseq (at) VALUES ('x')")
+    c.execute("INSERT INTO launch_events (launch_id, seq, gseq, kind, cause, at) VALUES (?, 3, "
+              "(SELECT MAX(gseq) FROM gseq), 'ended', 'gone', 'x')", (first.launch_id,))
+    c.commit()
+    c.close()
+    assert store.coord_claim(rot.launch_id, rot.session_key) != token
+
+
+def test_a_take_of_zero_is_refused(store, clock):
+    with pytest.raises(CoordError, match="1 minute to 7 days"):
+        store.coord_take(timedelta(0))
