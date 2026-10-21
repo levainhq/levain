@@ -32,6 +32,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from levain.launch import child_env
+
 __all__ = ["HOLD_SECONDS", "describe", "holder_command", "process_started", "sync"]
 
 HOLD_SECONDS = 1800
@@ -64,7 +66,7 @@ def holder_command(seconds: int | None = None, *, platform: str | None = None) -
 def _ps(pid: int, field: str) -> str | None:
     try:
         cp = subprocess.run(["ps", "-ww", "-p", str(pid), "-o", f"{field}="], capture_output=True, text=True,
-                            timeout=10)
+                            timeout=10, env=child_env())
     except (OSError, subprocess.SubprocessError):
         return None
     return cp.stdout.strip() if cp.returncode == 0 and cp.stdout.strip() else None
@@ -124,7 +126,7 @@ def _stop(rec: dict[str, Any]) -> None:
 def _spawn(argv: list[str]) -> int:
     """Start a holder through the intermediate and return its pid; the intermediate is waited for here."""
     cp = subprocess.run([sys.executable, "-I", "-c", _LAUNCH, *argv], stdin=subprocess.DEVNULL, capture_output=True,
-                        text=True, timeout=10)
+                        text=True, timeout=10, env=child_env())
     pid = cp.stdout.strip()
     if cp.returncode != 0 or not pid.isdigit():
         raise OSError(f"the holder did not start ({(cp.stderr or '').strip()[-200:] or 'no pid'})")
