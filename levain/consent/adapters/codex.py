@@ -280,7 +280,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     hold = min(away_hold(settings, AGENT, idle), max(0.0, deadline - clock()))
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
                          hold=max(timedelta(seconds=hold), MIN_FILE_HOLD),
-                         tier=AGENT_CONFIG_TIER if agent_config else DEFAULT_TIER)
+                         tier=AGENT_CONFIG_TIER if agent_config else DEFAULT_TIER, model=event.get("model"))
     settled = False
     try:
         got: Decision | None = None
@@ -656,7 +656,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)  # the installed timeout - the margin
         request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input,
                              cwd=cwd, hold=timedelta(seconds=hold), tier=AGENT_CONFIG_TIER, event_id=event_id,
-                             resume=resume_meta_of(event))
+                             resume=resume_meta_of(event), model=event.get("model"))
     except Exception as exc:
         note(refused="failed")
         return _deny(f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "

@@ -813,6 +813,21 @@ def test_a_dialog_outcome_time_is_parsed_only_where_it_is_used(tmp_path):
     assert ab.export(queue.directory, now=later(queue)).receipts == clean.receipts
 
 
+@pytest.mark.parametrize("gap", [timedelta(0), ab.SETTLE * 2])  # inside SETTLE, and past it
+def test_an_outcome_the_queue_never_writes_is_ignored_and_reaches_no_receipt(tmp_path, gap):
+    queue, ids = build_scratch(tmp_path)
+    clean = ab.export(queue.directory, now=later(queue))
+    conn = sqlite3.connect(queue.path, isolation_level=None)
+    try:
+        conn.execute("PRAGMA ignore_check_constraints = ON")         # a raw writer, past the queue's CHECK
+        decided = conn.execute("SELECT decided_at FROM requests WHERE id = ?", (ids["withdrawn"],)).fetchone()[0]
+        conn.execute("INSERT INTO dialog_outcomes (request_id, outcome, closed_at, event) VALUES (?, 'bogus', ?, 'PostToolUse')",
+                     (ids["withdrawn"], utc_stamp(parse_stamp(decided) + gap)))
+    finally:
+        conn.close()
+    assert ab.export(queue.directory, now=later(queue)).receipts == clean.receipts
+
+
 @pytest.mark.parametrize("score", ["0.5", True, [1], float("nan"), float("inf")])
 def test_a_score_that_is_not_a_number_is_an_export_error(score):
     with pytest.raises(ab.ExportError, match="not a number"):
