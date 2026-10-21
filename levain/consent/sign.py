@@ -602,7 +602,8 @@ class Signer:
         """``{signer_fp, request_sha256}`` (and for a choice request ``choice``, the option's key, or
         :data:`WRITE_IN_KEY` with ``write_in``, the operator's words, when the request offers a write-in) -> the
         WebAuthn challenge for the bytes signed (:func:`signed_bytes`), bound to the file as it is now and to that
-        option (and those words).
+        option (and those words). A choice request's reply also carries ``line``, the exact line the signature
+        appends, cut from those bytes, so the page shows what is signed rather than its own copy of it.
         ``request_sha256`` is the listing's ``sha256`` for the request the page showed: a file that changed since it
         was listed is refused (409), so the operator never signs bytes the page did not show."""
         from levain.consent.passkey import challenge
@@ -624,7 +625,10 @@ class Signer:
             raise SignRefused(f"{str(fp)[:80]} is not an active passkey enrolled for {self.rp_id}")
         with self._lock:
             self._challenged[request_id] = (request.sha256, fp, req.get("choice"), req.get("write_in"))
-        return {"challenge": _b64u(challenge(message, request.namespace)), "rp_id": self.rp_id}
+        reply = {"challenge": _b64u(challenge(message, request.namespace)), "rp_id": self.rp_id}
+        if request.options:   # the bytes are the message, a newline, then the choice line (signed_bytes)
+            reply["line"] = message[len(request.message.encode("utf-8")) + 1:].decode("utf-8")
+        return reply
 
     def answer(self, request_id: str, req: Any) -> dict[str, Any]:
         """``{authenticator_data, client_data_json, signature}`` (base64url) -> the signature verified and recorded:

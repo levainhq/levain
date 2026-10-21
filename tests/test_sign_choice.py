@@ -287,6 +287,26 @@ def test_the_page_keeps_write_in_words_for_their_version_only_and_sends_them_tri
     card = js[js.index("function signCard("):js.index("function signWith(")]
     assert 'writeIns.set(r.id, { sha256: r.sha256 || "", words: box.value })' in card
     assert 'draft.sha256 !== (r.sha256 || "")) writeIns.delete(r.id)' in card
-    assert "const w = box.value.trim();" in card and "wi.key, w, " in card
+    assert "const w = box.value.trim();" in card and "wi.key, freeze)" in card
     draw = js[js.index("function draw("):js.index("function questionCard(")]
     assert "if (!signs.some((r) => r.id === id)) writeIns.delete(id)" in draw
+
+
+def test_the_challenge_carries_the_exact_line_the_signature_appends(tmp_path: Path, passkey) -> None:
+    """CHOICE L3 r2 (What You See Is What You Sign): the page shows the line the server will sign, never its own copy.
+    The challenge reply's ``line`` is the last line of the bytes signed, for an option and for a write-in, and a plain
+    request's reply carries none."""
+    signer, key, sign = passkey
+    words = "ship it friday, not before"
+    _file(tmp_path, "np-ln000001-aaaa", write_in=True)
+    _file(tmp_path, "np-ln000002-aaaa", options=None)
+    rows = {r["id"]: r for r in signer.listing([key.fingerprint])}
+    base = {"signer_fp": key.fingerprint, "request_sha256": rows["np-ln000001-aaaa"]["sha256"]}
+    assert signer.challenge("np-ln000001-aaaa", {**base, "choice": "b"})["line"] == choice_line("b", "drop it")
+    c = signer.challenge("np-ln000001-aaaa", {**base, "choice": "*", "write_in": words})
+    assert c["line"] == CHOICE_MARK + "(*): " + words
+    assert signer.answer("np-ln000001-aaaa", sign.assertion(c["challenge"]))["choice"] == "*"
+    signed = json.loads((tmp_path / "sign" / "np-ln000001-aaaa.signed.json").read_text())["signed_message"]
+    assert signed.split("\n")[-1] == c["line"] and signed == MESSAGE + "\n" + c["line"]
+    plain = {"signer_fp": key.fingerprint, "request_sha256": rows["np-ln000002-aaaa"]["sha256"]}
+    assert "line" not in signer.challenge("np-ln000002-aaaa", plain)

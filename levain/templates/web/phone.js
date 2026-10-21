@@ -421,10 +421,14 @@
     const wi = options.length && r.write_in && typeof r.write_in === "object" ? r.write_in : null;
     if (!r.refused) {
       if (!signers.length && !kept) show(signNote || "no passkey is enrolled for this name");
-      // release unfreezes a write-in frozen for signing: an option's tap at its passkey picker drops that ceremony;
-      // a tap while a ceremony runs does nothing (signAnswer refuses it too), so the frozen words stay frozen
-      let release = () => {};
-      const go = (choice) => () => { if (busy) return; release(); signWith(r, signers, say, show, actions, choice); };
+      // the card's one frozen write-in (set below when it offers one): an option's tap at the write-in's passkey
+      // picker releases it, picker and all; a tap while a ceremony runs does nothing, so frozen words stay frozen
+      let freeze = null;
+      const go = (choice) => () => {
+        if (busy) return;
+        if (freeze) freeze.release();
+        signWith(r, signers, say, show, actions, choice);
+      };
       if (!options.length) {
         const b = el("button", "allow", "sign with Face ID");
         b.type = "button";
@@ -455,19 +459,34 @@
         const b = el("button", "allow option", "(" + wi.key + ") sign my words");
         b.type = "button";
         b.disabled = !usable || !signers.length;
-        const frozen = el("div", "line frozen");
-        // the tap freezes the words until the ceremony ends (a passkey picker included): what is sent is the line
-        // shown here, never the box as edited later. Trimmed, since autocorrect's trailing space is refused
+        const shown = el("div", "line frozen");
+        // the ONE copy of the words being signed: the passkey picker and the sign read `freeze.words` when they run,
+        // and the line shown is the server's own (`line`, from the challenge) as soon as it answers. The tap freezes
+        // the box until the ceremony ends; release() removes the picker whole, then unlocks the box, so a retry is a
+        // new tap that freezes the box's words again. Trimmed, since autocorrect's trailing space is refused
+        freeze = {
+          words: null,
+          signing: (line) => { shown.textContent = "signing: " + line; },
+          unsure: () => { shown.textContent = "not sure this was signed: check the list"; },
+          release: () => {
+            for (const p of actions.querySelectorAll(".pick")) p.remove();
+            freeze.words = null;
+            box.readOnly = box.disabled = false;
+            b.disabled = !usable || !signers.length;
+            shown.remove();
+          },
+        };
         b.addEventListener("click", () => {
+          if (busy) return;
           const w = box.value.trim();
           if (!w) return show("type your answer first", "bad");
           box.value = w;
+          writeIns.set(r.id, { sha256: r.sha256 || "", words: w });
+          freeze.words = w;
           box.readOnly = box.disabled = b.disabled = true;
-          frozen.textContent = "signing: " + wi.line + w;
-          box.after(frozen);
-          release = () => { box.readOnly = box.disabled = false; b.disabled = !usable || !signers.length;
-                            frozen.remove(); release = () => {}; };
-          signWith(r, signers, say, show, actions, wi.key, w, () => release());
+          freeze.signing(wi.line + w);
+          box.after(shown);
+          signWith(r, signers, say, show, actions, wi.key, freeze);
         });
         actions.append(box, b);
       }
@@ -487,49 +506,57 @@
     return card;
   }
 
-  // release (a write-in's): unfreezes its words when the ceremony ends without a signature
-  function signWith(r, signers, say, show, actions, choice, words, release) {
+  // freeze (a write-in's, else none): the card's one frozen state, read by the picker and the sign when they run
+  function signWith(r, signers, say, show, actions, choice, freeze) {
+    for (const old of actions.querySelectorAll(".pick")) old.remove();   // a new tap replaces any earlier picker
     const local = mine();
     const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
-    if (known.length === 1) return signAnswer(r, known[0], local[known[0]], say, choice, words, release);
-    if (!known.length && signers.length === 1) return signAnswer(r, signers[0], null, say, choice, words, release);
+    if (known.length === 1) return signAnswer(r, known[0], local[known[0]], say, choice, freeze);
+    if (!known.length && signers.length === 1) return signAnswer(r, signers[0], null, say, choice, freeze);
     const choices = known.length ? known : signers;
     show("more than one passkey is enrolled for this name; pick the one this phone holds:");
-    for (const old of actions.querySelectorAll(".pick")) old.remove();
     for (const fp of choices) {
       const p = el("button", "quiet pick", fp.slice(0, 18) + "…");
       p.type = "button";
-      p.addEventListener("click", () => signAnswer(r, fp, known.length ? local[fp] : null, say, choice, words, release));
+      p.addEventListener("click", () => signAnswer(r, fp, known.length ? local[fp] : null, say, choice, freeze));
       actions.appendChild(p);
     }
   }
 
-  function signAnswer(r, fp, rawId, say, choice, words, release) {
-    if (busy) { if (release) release(); return; }
+  // only a definite "nothing was signed" releases a frozen write-in: a 4xx from /challenge or /answer, any failure
+  // before /answer is sent (no challenge, the passkey cancelled or failed). After the assertion is sent, no reply,
+  // a reply that is not JSON or a 5xx may follow a signature the server already wrote: the words stay frozen and
+  // the next redraw, built from the server's list, says where it stands
+  function signAnswer(r, fp, rawId, say, choice, freeze) {
+    if (busy) return;   // a second activation while a ceremony runs is ignored; it never unfreezes the first's words
     busy++;
-    let signed = false;
+    let keep = false;   // signed, or not knowable: the frozen words stay frozen
+    let sent = false;   // the assertion went to /answer
+    const unsure = (text) => { keep = true; if (freeze) freeze.unsure(); say(text, "bad"); };
     const base = "/sign/" + encodeURIComponent(r.id) + "/";
     const body = { signer_fp: fp, request_sha256: r.sha256 };
     if (choice !== undefined) body.choice = choice;
-    if (words !== undefined) body.write_in = words;
+    if (freeze) body.write_in = freeze.words;
     say(choice !== undefined ? "asking for the challenge for (" + choice + ")…" : "asking for the challenge…");
     call("POST", base + "challenge", body).then((c) => {
       if (!c.ok) return say(why(c), "bad");
+      // the exact line the signature appends, from the server's bytes: what is shown is what is signed
+      if (freeze && typeof c.body.line === "string") freeze.signing(c.body.line);
       say("confirm with your passkey to sign…");
       const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
       if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
       return navigator.credentials.get({ publicKey: pk }).then((cred) => {
         say("verifying the signature…");
+        sent = true;
         return call("POST", base + "answer", {
           authenticator_data: b64u(cred.response.authenticatorData), client_data_json: b64u(cred.response.clientDataJSON),
           signature: b64u(cred.response.signature) }).then((a) => {
-          // the passkey signed: once the answer is sent, only the server's own refusal (a 4xx) says nothing was
-          // signed; no reply, a proxy error or any 5xx may follow a signature the server already wrote
-          if (!a.ok && (a.status === 0 || a.status >= 500)) return say("result unknown (" + why(a) + "): reload to see whether it was signed", "bad");
-          if (!a.ok) return say("not signed: " + why(a), "bad");
+          // only the server's own refusal (a 4xx) says nothing was signed
+          if (!a.ok && a.status >= 400 && a.status < 500) return say("not signed: " + why(a), "bad");
+          if (!a.ok) return unsure("not sure this was signed (" + why(a) + "): check the list");
           last = "signed " + (a.body.choice ? "(" + a.body.choice + ") " : "") + (r.title || r.id);
           if (r.id === focus) focusDone = true;
-          signed = true;
+          keep = true;
           writeIns.delete(r.id);
           say("signed" + (a.body.choice ? " (" + a.body.choice + ")" : "") + " · by " + a.body.signer_fp + " in "
               + a.body.namespace, "ok");
@@ -538,8 +565,11 @@
         if (rawId && e && e.name === "NotAllowedError") forget(fp);
         say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was signed", "bad");
       });
-    }).catch((e) => say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
-      .finally(() => { busy--; if (!signed && release) release(); setTimeout(load, 1500); });
+    }).catch((e) => {
+      const name = (e && e.name) || "error";
+      if (sent) return unsure("not sure this was signed (the page failed: " + name + "): check the list");
+      say("the page failed (" + name + "); it re-reads the queue to show where this stands", "bad");
+    }).finally(() => { busy--; if (!keep && freeze) freeze.release(); setTimeout(load, 1500); });
   }
 
   function signDeny(r, say) {
@@ -750,8 +780,10 @@
       .finally(() => { busy--; });
   }
 
-  // what holds the list still: a ceremony or an open picker (busy), words being typed into a question's box, or a
-  // focused cancel reason (a redraw would wipe the words and dismiss the keyboard)
+  // what holds the list still: a ceremony or a consent or dispatch passkey picker (busy), words being typed into a
+  // question's box, or a focused cancel reason (a redraw would wipe the words and dismiss the keyboard). A sign
+  // request's passkey picker takes no busy: a redraw while it is up rebuilds the card unfrozen, picker gone, with
+  // nothing signed
   function held() {
     if (busy) return true;
     if (Array.from(document.querySelectorAll("textarea.words:not(:disabled)")).some((t) => t.value.trim() !== "")) return true;
