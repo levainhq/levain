@@ -25,6 +25,9 @@ REPRODUCED = [
     ("VT inside a path", patch("*** Add File: u3\x0bx.txt", "+hi"), "u3\x0bx.txt", ["u3"]),
     ("FF inside a path", patch("*** Add File: u4\x0cx.txt", "+hi"), "u4\x0cx.txt", ["u4"]),
     ("unit separator after a path", patch("*** Add File: u5.txt\x1f", "+hi"), "u5.txt\x1f", ["u5.txt"]),
+    # Codex drops a tab inside a path: it deleted ../outside.txt, a file outside the workspace (L3 r1 codex)
+    ("tab inside a Delete path", patch("*** Delete File: .\t./outside.txt"), "../outside.txt", [".\t./outside.txt"]),
+    ("tab inside an Add path", patch("*** Add File: sub/.\t./t1.txt", "+hi"), "t1.txt", ["sub/.\t./t1.txt"]),
 ]
 
 
@@ -42,6 +45,47 @@ def test_a_header_codex_reads_as_another_name_names_nothing(shape, text, written
     (patch("*** Update File: a.txt", "@@", "-a", "+ nbsp\x0cff\tand sep"), ["a.txt"]),  # content lines
     (patch("*** Update File: a.txt", "*** Move to: b/c.txt", "@@", "-a", "+b"), ["a.txt", "b/c.txt"]),
     (patch("  *** Add File: d.txt  ", "+hi"), ["d.txt"]),                                   # spaces trim alike
+    (patch("*** Add File:  n7.txt", "+hi"), [" n7.txt"]),            # Codex keeps the path's own leading space
 ])
 def test_ordinary_patches_are_still_read(text, names):
     assert patch_targets(text) == names
+
+
+# every character Python takes for whitespace but a space or the "\n" lines are split on: a superset of the White_Space
+# Rust's trim strips, with the tab Codex drops inside a path, so every place the two read a header apart names nothing
+OTHER_WHITESPACE = [chr(i) for i in range(0x110000) if chr(i).isspace() and chr(i) not in " \n"]
+HEADERS = ["*** Add File: {p}", "*** Delete File: {p}", "*** Update File: {p}",
+           "*** Update File: a.txt\n*** Move to: {p}"]
+
+
+@pytest.mark.parametrize("header", HEADERS)
+@pytest.mark.parametrize("where", ["inside", "after", "before"])
+def test_any_other_whitespace_on_a_header_line_names_nothing(header, where):
+    for ch in OTHER_WHITESPACE:
+        if where == "after" and ch == "\r":
+            ch = "\r\r"                      # one trailing \r is the line's CRLF ending, dropped by both parsers
+        path = {"inside": f"x{ch}y.txt", "after": f"xy.txt{ch}", "before": "xy.txt"}[where]
+        line = header.format(p=path)
+        if where == "before":
+            line = ch + line
+        assert patch_targets(patch(line, "+hi")) is None, (header, where, hex(ord(ch)))
+
+
+def test_a_content_line_holding_asterisks_and_other_whitespace_names_nothing():
+    # deliberate: any line holding "***" is read as Codex could read a header, so the whole patch queues
+    assert patch_targets(patch("*** Update File: a.txt", "@@", "-a", "+***bold*** text")) is None
+
+
+def test_a_long_header_line_is_read_in_linear_time():
+    # the regular expression this replaced backtracked quadratically: 50,000 spaces took 7.35 s, and a Codex hook that
+    # stalls past its timeout fails open
+    import time
+
+    text = patch("*** Add File: a" + " " * 200_000 + "b", "+hi")
+    start = time.perf_counter()
+    assert patch_targets(text) == ["a" + " " * 200_000 + "b"]
+    assert time.perf_counter() - start < 0.5
+
+
+def test_a_marker_line_with_other_whitespace_names_nothing():
+    assert patch_targets(BEGIN + "\n*** Add File: a.txt\n+hi\n*** End Patch\x0c\n") is None

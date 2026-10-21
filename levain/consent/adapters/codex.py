@@ -105,7 +105,7 @@ HOOK_SCRIPT_NAME = "levain_consent.py"
 PATCH_TOOL = "apply_patch"
 # The file headers of Codex's patch format; their paths are the files a patch touches. Indentation is allowed, in
 # case Codex's parser trims it: any other line starting ``***`` that is not a patch marker makes the patch unreadable.
-_PATCH_HEADER = re.compile(r"\s*\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*")
+_PATCH_HEADERS = ("*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: ")
 _PATCH_MARKERS = frozenset({"*** Begin Patch", "*** End Patch", "*** End of File"})
 CODEX_DIR_NAME = ".codex"
 CODEX_CONFIG_NAMES = ("hooks.json", "config.toml")
@@ -131,22 +131,26 @@ def codex_home(environ: Mapping[str, str] | None = None) -> Path:
 def patch_targets(patch: Any) -> list[str] | None:
     """The file paths a Codex ``apply_patch`` names in its headers (``*** Add File:``, ``Update File:``,
     ``Delete File:``, ``Move to:``), or ``None`` when ``patch`` is not a string, names no file, has a line starting
-    ``***`` (indented or not) that is neither a header nor a patch marker, or has a line holding ``***`` and a
-    whitespace character other than a space or a tab: what it names cannot be told. Lines are read as Codex reads them,
-    split on ``\n`` alone with one trailing ``\r`` dropped, so only a line holding ``***`` can be a header to either;
-    on such a line every other whitespace character is one Python and Codex's parser trim differently (a path could be
-    written that the header here does not name), so the patch names nothing."""
+    ``***`` (indented or not) that is neither a header nor a patch marker, or has a line holding ``***`` and any
+    whitespace character but a space: what it names cannot be told. Lines are read as Codex reads them, split on
+    ``\n`` alone with one trailing ``\r`` dropped, so only a line holding ``***`` can be a header to either. On such a
+    line every other whitespace character is one the two parsers trim, split or resolve differently (Codex drops a tab
+    inside a path, so ``.<tab>./x`` is ``../x`` to it), so the patch names nothing. A header is read by its literal
+    prefix, never a regular expression, so a long line costs linear time (a hook that stalls fails open on Codex)."""
     if not isinstance(patch, str):
         return None
     found: list[str] = []
     for raw in patch.split("\n"):
         line = raw[:-1] if raw.endswith("\r") else raw
-        if "***" in line and any(c.isspace() and c not in " \t" for c in line):
+        if "***" not in line:
+            continue
+        if any(c.isspace() and c != " " for c in line):
             return None
-        m = _PATCH_HEADER.fullmatch(line)
-        if m:
-            found.append(m.group(1))
-        elif line.strip().startswith("***") and line.strip() not in _PATCH_MARKERS:
+        text = line.strip(" ")
+        head = next((h for h in _PATCH_HEADERS if text.startswith(h)), None)
+        if head is not None and text[len(head):]:
+            found.append(text[len(head):])      # the line's ends are trimmed, never the path's own leading space
+        elif text.startswith("***") and text not in _PATCH_MARKERS:
             return None
     return found or None
 
