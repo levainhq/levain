@@ -1158,26 +1158,27 @@
       // failed read, so the provider's note stays the line. The sentence is the panel's own: only a plain lowercase
       // English word at its head is capitalised (an identifier or a path is left as written).
       const sentence = (e) => /^[a-z]+ /.test(e) ? e.charAt(0).toUpperCase() + e.slice(1) : e;
-      // a tile whose glance face draws it (Decisions names the top item, Sessions says live and quiet) is drawn by that face alone: the
-      // generic first line + count would be a second, lesser answer ahead of it, and a strip tile shows only its first sub line
+      // a tile whose glance face draws it (Decisions names the top item, Sessions says live and quiet) is drawn by that face, after
+      // the provider's note when there is one: the generic first line + count would be a second, lesser answer ahead of it, and a
+      // strip tile shows only its first sub line
       const glance = el("div");
       glanceFace(d, n, glance);
       const glanced = glance.childNodes.length > 0;
-      if (!n && !s.ctx.alerted && d.clean !== false) { const e = String(d.empty || ""); if (e) host.appendChild(el("div", "sub", sentence(e))); }
-      else if (d.note) {
-        // the provider's note is its word on what the read covers ("no cockpit broker: decisions waiting on a signature are
-        // not shown"), so it stays the first line whenever it is given: a strip tile draws only its first sub line, and a
-        // count with its caveat dropped reads as the whole answer. The top item follows it.
-        host.appendChild(el("div", "sub", d.note));
-        if (!glanced && n && !s.ctx.alerted && Array.isArray(d.lines) && d.lines[0] && typeof d.lines[0].text === "string") {
-          host.appendChild(el("div", "sub", d.lines[0].text + (n > 1 ? " +" + (n - 1) + " more" : "")));
-        }
-      }
-      else if (glanced) { /* the glance lines below are the answer */ }
-      else if (n && Array.isArray(d.lines) && d.lines.length && d.lines[0] && typeof d.lines[0].text === "string" && !s.ctx.alerted) {
-        // the face names the top item and counts the rest ("backfill +3 more"), so the tile reads as an answer, not a bare number
+      const note = typeof d.note === "string" ? d.note.trim() : "";
+      // the face names the top item and counts the rest ("backfill +3 more"), so the tile reads as an answer, not a bare number
+      const topItem = () => {
+        if (glanced || !n || s.ctx.alerted || !Array.isArray(d.lines) || !d.lines[0] || typeof d.lines[0].text !== "string") return;
         host.appendChild(el("div", "sub", d.lines[0].text + (n > 1 ? " +" + (n - 1) + " more" : "")));
+      };
+      if (!n && !s.ctx.alerted && d.clean !== false) { const e = String(d.empty || ""); if (e) host.appendChild(el("div", "sub", sentence(e))); }
+      else if (note) {
+        // with something waiting (or a degraded zero), the provider's note is its word on what the read covers ("no cockpit
+        // broker: decisions waiting on a signature are not shown"), so it is the first line: a strip tile draws only its first
+        // sub line, and a count with its caveat dropped reads as the whole answer. The top item follows it.
+        host.appendChild(el("div", "sub", note));
+        topItem();
       }
+      else topItem();
       while (glance.firstChild) host.appendChild(glance.firstChild);
       return;
     }
