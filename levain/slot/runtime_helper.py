@@ -1092,18 +1092,19 @@ def session_dir_rows(slot: SlotId, ids: Mapping[str, int]) -> List[DirRow]:
     return rows
 
 
-def make_session_dirs(ctx: Ctx, session: str, rows: Sequence[DirRow], *, kind: str = "interactive") -> None:
-    """The rows under ``<S>``; a ``dispatch`` session's ``<S>`` also gets the queue broker's search entry (§26
-    S1-c), so the broker can reach ``<S>/repo`` (0711 at start) and nothing else under ``<S>`` by mode."""
+def make_session_dirs(ctx: Ctx, session: str, rows: Sequence[DirRow], *, broker_uid: Optional[int] = None) -> None:
+    """The rows under ``<S>``; with ``broker_uid`` (a ``dispatch`` session, looked up by ``prepare`` before ATTACH)
+    ``<S>`` also gets the queue broker's search entry (§26 S1-c), so the broker can reach ``<S>/repo`` (0711 at
+    start) and nothing else under ``<S>`` by mode."""
     with ctx.store.dir("live") as live:
         for row in rows:
             parts = [p for p in row.rel.split("/") if p]
             if not parts:
                 ctx.store.mkdir(live, session, row.uid, row.gid, row.mode, f"live/{session}")
-                if kind == "dispatch":
+                if broker_uid is not None:
                     with ctx.store.dir("live", session) as sfd:
                         ctx.seams.grant_search(ctx.seams.host, sfd, ctx.store.path / "live" / session,
-                                               QBROKER, ctx.seams.account_uid(QBROKER))
+                                               QBROKER, broker_uid)
                 continue
             with ctx.store.dir("live", session, *parts[:-1]) as parent:
                 ctx.store.mkdir(parent, parts[-1], row.uid, row.gid, row.mode, f"live/{session}/{row.rel}")
@@ -1141,6 +1142,8 @@ def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, obje
         ids = slot_ids(ctx, slot)
         first, second = slot.accounts
         linux = seams.host == "linux"
+        # A missing broker account refuses here, where the lease is still given back (§26 S1-c).
+        broker_uid = seams.account_uid(QBROKER) if req.kind == "dispatch" else None
         folders = None
         if seams.host == "darwin":
             # Read ONCE, here, while the uid holds no session: getconf runs AS the uid and creates the dir when it
@@ -1187,7 +1190,7 @@ def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, obje
     else:
         wake_reaper(seams.R)
     seams.at("session-dirs")
-    make_session_dirs(ctx, session, session_dir_rows(slot, ids), kind=req.kind)
+    make_session_dirs(ctx, session, session_dir_rows(slot, ids), broker_uid=broker_uid)
     staging = make_staging(ctx, session)
     out: Dict[str, object] = {"format": PREPARE_RESULT_FORMAT, "session": session, "slot": R.slot_obj(slot),
                               "staging": str(staging)}
