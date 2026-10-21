@@ -38,10 +38,18 @@ archive or delete; ``levain coord agent codex`` never runs ``levain init`` (it w
 hooks file); the timeouts below; "active" (a turn in progress) is what earns a service beat, as a Claude Code row that
 is not ``done`` does. Stdlib only.
 
-Known edges: a Codex coordinator runs under the user's own approval and sandbox settings, so a command outside its
-workspace (its own ``levain coord claim`` writes the consent directory) may ask for approval, and an approval request
-waits until someone opens the thread (measured: it never fails the turn). Such a thread reads ``active`` with no flag
-to a client that has not resumed it, so the watcher cannot tell it from one working. The watcher reads threads only by
+The coordinator's door (np-6843ca07 (a)): :func:`setup` writes Codex's own rule file into the directory's
+``.codex/rules/``, which lets exactly ``<this interpreter> -P -m levain`` coord / drops / thread run without asking
+(Codex runs an allowed command outside its sandbox: its own ``coord claim`` writes the consent directory). Measured on
+codex-cli 0.162.1 (1021+18 lane c3cpre): with the rule in a trusted directory the first ``coord claim`` ran unasked;
+without it the same claim failed in the sandbox and then waited on approval; ``touch`` outside the workspace and
+``levain drop`` by the same spelling still asked.
+
+Known edges: Codex loads the rule only while the operator trusts the directory (Levain never writes that trust), and
+it names the interpreter :func:`setup` ran under, so a coordinator launched from another levain asks. Outside the
+door, a coordinator runs under the user's own approval and sandbox settings: a command that needs approval waits until
+someone opens the thread (measured: it never fails the turn), and such a thread reads ``active`` with no flag to a
+client that has not resumed it, so the watcher cannot tell it from one working. The watcher reads threads only by
 the id an ``active`` row recorded: a thread a killed starter left before activation is not swept by its name (the
 daemon's ``thread/list`` can find it by name; that sweep is not built), and its one turn ends on its own.
 """
@@ -55,6 +63,7 @@ import os
 import socket
 import sqlite3
 import struct
+import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -262,13 +271,21 @@ def hook_live(directory: Path) -> tuple[bool, str]:
 def setup(directory: Path) -> tuple[Path, bool, str]:
     """``levain coord agent codex``'s check: ``(resolved directory, hook live, detail)``. Never installs: ``levain init
     --adapter codex`` rewires the machine's one Codex hooks file, so the directory must already be your live Codex
-    install."""
+    install. A live one gets the coordinator's pre-approval (np-6843ca07 (a)): Codex's own rule file in the
+    directory's ``.codex/rules/`` (:func:`levain.install.write_codex_coordinator_rules`), naming this interpreter, the
+    spelling the brief gives the coordinator, so its coord / drops / thread commands run without asking and nothing
+    else does. Codex loads it only while the operator trusts the directory, which stays the operator's step."""
     target = Path(directory).expanduser().resolve()
     live, detail = hook_live(target)
     if not live:
         detail += ("; a Codex coordinator runs in your Codex install (Codex has one per machine), which Levain never "
                    "makes for you: `levain init --adapter codex` there first")
-    return target, live, detail
+        return target, live, detail
+    from levain.install import write_codex_coordinator_rules
+
+    _ok, rules = write_codex_coordinator_rules(target, sys.executable)
+    return target, live, (f"{detail}; {rules}. Codex reads it only in a directory you trust: run `codex` there once "
+                          "and trust it")
 
 
 # --- reading and stopping a thread -------------------------------------------------------------------------------

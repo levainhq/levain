@@ -2797,6 +2797,71 @@ def installed_coordinator_levain(install: Path, python_path: str) -> str | None:
     return None
 
 
+# The same door for a Codex coordinator (np-6843ca07 (a)): Codex's own exec policy, a `prefix_rule` in a `.rules` file
+# under the project's `.codex/rules/`, which Codex loads only while the operator trusts that project (OpenAI's Codex
+# docs, "Rules" and "Config basics"). A rule matches the command's argv as an exact prefix, so it names the same
+# spelling the brief uses, word for word, and Levain parses no shell. Codex runs an allowed command outside its sandbox
+# without asking: these three verbs only, which grant nothing.
+CODEX_COORDINATOR_RULES_REL = (".codex", "rules", "levain-coordinator.rules")
+
+
+def codex_coordinator_rules(python_path: str) -> str:
+    """The rules file that lets a Codex coordinator launched from ``python_path`` run ``python_path -P -m levain``
+    coord / drops / thread without asking, and nothing else. Its ``match`` / ``not_match`` examples are checked by
+    Codex itself when it loads the file."""
+    if not python_path or any(not ch.isprintable() for ch in python_path):
+        raise InitError(f"the interpreter path {python_path!r} cannot be written into a Codex rule")
+    base = [python_path, "-P", "-m", "levain"]
+
+    def lit(value: object) -> str:
+        return json.dumps(value, ensure_ascii=False)
+
+    return (
+        "# Written by Levain for its coordinator (np-6843ca07 (a)). Codex runs exactly these commands without asking:\n"
+        f"# {coordinator_levain(python_path)} {' | '.join(COORDINATOR_VERBS)} ...\n"
+        "# Every other command is decided as before. Codex loads this file only while you trust this directory.\n"
+        "prefix_rule(\n"
+        f"    pattern = {lit([*base, list(COORDINATOR_VERBS)])},\n"
+        '    decision = "allow",\n'
+        '    justification = "Levain coordinator verbs: they grant nothing (a signed envelope still does)",\n'
+        f"    match = {lit([[*base, verb, 'status'] for verb in COORDINATOR_VERBS])},\n"
+        f"    not_match = {lit([[*base, 'team', 'record'], [*base, 'coordinator'], ['levain', 'coord']])},\n"
+        ")\n"
+    )
+
+
+def write_codex_coordinator_rules(install: Path, python_path: str) -> tuple[bool, str]:
+    """Write :func:`codex_coordinator_rules` into ``install``'s ``.codex/rules/``. ``(True, detail)`` when the file now
+    holds exactly that render (written, or already there); ``(False, why)`` otherwise. A file of that name holding
+    anything else is left as it is (its commands ask or not as it says, never widened back), and nothing is written
+    through a symlink."""
+    path = install.joinpath(*CODEX_COORDINATOR_RULES_REL)
+    try:
+        text = codex_coordinator_rules(python_path)
+    except InitError as e:
+        return False, str(e)
+    for d in (path.parent.parent, path.parent):
+        if os.path.islink(d) or (os.path.lexists(d) and not d.is_dir()):
+            return False, f"{d} is not a plain directory; no coordinator rule was written"
+    if os.path.lexists(path):
+        try:
+            same = not os.path.islink(path) and path.read_text(encoding="utf-8") == text
+        except (OSError, UnicodeDecodeError):
+            same = False
+        if same:
+            return True, f"{path} already pre-approves {coordinator_levain(python_path)} coord / drops / thread"
+        return False, (f"{path} holds something other than this levain's rule, left as it is: the coordinator's "
+                       "commands ask unless it allows them")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except OSError as e:
+        return False, f"{path} could not be written ({e})"
+    return True, f"{path} written: Codex runs {coordinator_levain(python_path)} coord / drops / thread without asking"
+
+
 def persisted_role(install: Path) -> str | None:
     """The role ``.levain/config.json`` records (``role``), else ``None``. A file that cannot be read as a JSON
     object, or a value that is not a role (a hand edit), is ``None``: what may hold a role is never read as one

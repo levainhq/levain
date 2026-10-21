@@ -192,3 +192,35 @@ def test_no_daemon_refuses_before_the_spawn_claim_with_the_remedy(home, store, t
         assert c.execute("SELECT COUNT(*) FROM launch_spawns").fetchone()[0] == 0
     finally:
         c.close()
+
+
+def test_setup_writes_the_codex_rule_the_briefs_own_commands_match_and_nothing_else(home, store):
+    # the reproduced failure (c3c run_done.txt): a real Codex coordinator's first `coord claim` waited on an approval
+    # request nobody answers. The rule setup writes must admit the brief's own spelling, word for word (Codex matches
+    # argv as an exact prefix), and no other levain verb; a file of that name holding anything else is left alone.
+    import re
+    import shlex
+
+    from levain import install as inst
+
+    daemon = FakeDaemon(home)
+    try:
+        launch_id = _woken(store)
+        assert cl.launch_session(store, launch_id).started
+        ln = store.launch(launch_id)
+        brief = (cl._brief_dir(ln) / f"{launch_id}.md").read_text(encoding="utf-8")
+    finally:
+        daemon.close()
+    work = Path(ln.cwd)
+    target, live, detail = cx.setup(work)
+    rules = work.joinpath(*inst.CODEX_COORDINATOR_RULES_REL)
+    assert live and rules.is_file() and "written" in detail, detail
+    pattern = json.loads(re.search(r"^    pattern = (.*),$", rules.read_text(encoding="utf-8"), re.M).group(1))
+    *prefix, verbs = pattern
+    commands = [shlex.split(c) for c in re.findall(r"`([^`]*-m levain [^`]*)`", brief)]
+    assert commands and any(c[len(prefix)] == "coord" and c[len(prefix) + 1] == "claim" for c in commands)
+    for argv in commands:                        # every levain command the brief gives runs unasked
+        assert argv[:len(prefix)] == prefix and argv[len(prefix)] in verbs, argv
+    assert sorted(verbs) == sorted(inst.COORDINATOR_VERBS) and "drop" not in verbs
+    rules.write_text("# the operator's own narrower rule\n", encoding="utf-8")
+    assert cx.setup(work)[1] and rules.read_text(encoding="utf-8") == "# the operator's own narrower rule\n"
