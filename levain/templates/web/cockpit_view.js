@@ -1396,7 +1396,7 @@
     const groups = Array.isArray(b.threads) ? groupThreads(b.threads) : [];
     if (groups.length) {
       const col = el("div", "brief-threads");
-      col.appendChild(el("div", "k", "Threads"));
+      col.appendChild(el("div", "k", "Loops by thread"));
       for (const g of groups.slice(0, THREADS_SHOWN)) {
         const row = el("div", "thread");
         row.appendChild(el("span", "t", g.repo ? g.top : g.label));
@@ -2428,7 +2428,18 @@
       w.dataset.shape = shape;   // before the gap is read: only the tiles shape is a grid with a gap
       // the grid's column gap is room no tile gets: c columns need c * MIN_TILE_PX + (c - 1) * gap
       const gap = parseFloat(getComputedStyle(w).columnGap) || 0;
-      if (shape === "tiles" && room > 0) cols = Math.max(2, Math.min(cols, Math.floor((room + gap) / (MIN_TILE_PX + gap))));
+      if (shape === "tiles" && room > 0) {
+        const fit = Math.max(2, Math.floor((room + gap) / (MIN_TILE_PX + gap)));
+        cols = Math.max(2, Math.min(cols, fit));
+        // P1: never leave a lone tile in the last row (n % cols === 1): take an exact divisor of n in 5..3 that fits, else the
+        // largest column count in 5..2 that fits and leaves no lone tile (5 tiles -> one row of 5, 6 -> 3 x 2, 7 -> 4 + 3)
+        if (n > 4) {
+          let pick = 0;
+          for (let c = Math.min(5, fit); c >= 3 && !pick; c--) if (n % c === 0) pick = c;
+          for (let c = Math.min(5, fit); c >= 2 && !pick; c--) if (n % c !== 1) pick = c;
+          if (pick) cols = pick;
+        }
+      }
       w.style.setProperty("--ck-n", String(cols));
       w.dataset.shape = shape;
       w.dataset.n = String(n);
