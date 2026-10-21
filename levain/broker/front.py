@@ -206,22 +206,26 @@ _REFUSED_NETS = tuple(ipaddress.ip_network(n) for n in (
     "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
     "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
     "224.0.0.0/4", "240.0.0.0/4",
-    # IPv6: IPv4-compatible (incl. :: and ::1), IPv4-mapped, IPv4/IPv6 local-use translation, discard,
-    # Teredo, documentation, 6to4, ULA, link-local, site-local, multicast.
-    "::/96", "::ffff:0:0/96", "64:ff9b:1::/48", "100::/64", "2001::/32", "2001:db8::/32", "2002::/16",
-    "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
+    # IPv6: IPv4-compatible (incl. :: and ::1), IPv4-mapped, IPv4-translated (SIIT), IPv4/IPv6 local-use
+    # translation, discard, Teredo, documentation, 6to4, ULA, link-local, site-local, multicast.
+    "::/96", "::ffff:0:0/96", "::ffff:0:0:0/96", "64:ff9b:1::/48", "100::/64", "2001::/32", "2001:db8::/32",
+    "2002::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
 ))
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 
 
 def refused_address(addr: str) -> Optional[str]:
-    """Why `addr` may not be an upstream, or None. The named networks are checked first so the answer does not
-    depend on the running Python's `is_global` table; `is_global` is then a catch-all for anything newer. A NAT64
-    address (64:ff9b::/96) is judged by the IPv4 address it embeds."""
+    """Why `addr` may not be an upstream, or None. Any address carrying a scope id (`%`, e.g. "fe80::1%en0") is
+    refused whatever its prefix: `ipaddress` parses a scoped address, and a scope pins the connect to one local
+    interface. The named networks are checked next so the answer does not depend on the running Python's
+    `is_global` table; `is_global` is then a catch-all for anything newer. A NAT64 address (64:ff9b::/96) is
+    judged by the IPv4 address it embeds."""
+    if "%" in addr:
+        return "scoped"
     try:
         ip = ipaddress.ip_address(addr)
     except ValueError:
-        return "unparseable"   # incl. a scoped IPv6 address ("fe80::1%en0")
+        return "unparseable"
     if ip.version == 6 and ip in _NAT64:
         inner = refused_address(str(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)))
         return f"nat64:{inner}" if inner else None
@@ -284,7 +288,7 @@ def parse_head(head: bytes) -> h11.Request:
     try:
         event = conn.next_event()
     except h11.RemoteProtocolError as e:
-        raise Refused("malformed", f"h11: {e}") from None
+        raise Refused("malformed", f"h11:{type(e).__name__}") from None   # never the message: it quotes client bytes
     if not isinstance(event, h11.Request):
         raise Refused("malformed", "no request")
     names = [n for n, _ in event.headers]
@@ -309,7 +313,7 @@ def connect_target(policy: FrontPolicy, target: bytes) -> tuple[ConnectRoute, in
         raise Refused("host-not-allowed", "authority")   # incl. a bracketed IPv6 literal
     host, port = m.group(1).decode("ascii").lower(), int(m.group(2))
     if port != CONNECT_PORT:
-        raise Refused("host-not-allowed", f"port {port}")
+        raise Refused("host-not-allowed", "port")
     route = policy.connect.get(host)
     if route is None:
         raise Refused("host-not-allowed", "off-list")
