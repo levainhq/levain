@@ -21,9 +21,11 @@ WAKES (:func:`wake`, run inside every new drop's transaction): with no live leas
 the drop's transaction writes a ``pending`` coordinator launch and a ``bootstrap`` claim held by its ``session_key``,
 whose token the launch is then activated against; otherwise the drop only queues. The launch is the one the COORDINATOR
 SETTING names (``coord_settings``, yours only: the agent, its model, the directory it runs in, set by ``levain coord
-agent``); with no setting, or agent ``none``, a drop only queues (``unset``): no launch is asked for and none can die. A coordinator launch that dies
-before ``active`` (failed, expired) or ends at 0 turns is a DEATH: the next wake waits out :data:`BACKOFF`, and after
-:data:`MAX_DEATHS` deaths in a row nothing launches until you look (``levain coord take`` or ``release``).
+agent``); with no setting, or agent ``none``, a drop only queues (``unset``): no launch is asked for and none can die. A
+coordinator launch that dies before ``active`` (failed, expired) after a process claimed its spawn, or ends at 0 turns,
+is a DEATH (one that expired or failed with no spawn claimed, nobody having tried to start it, is none): the next wake
+waits out :data:`BACKOFF`, and after :data:`MAX_DEATHS` deaths in a row nothing launches until you look (``levain coord
+take`` or ``release``).
 
 ``launch_spawns`` is the one-spawner rule (C3b): a process that means to start a launch's session first inserts the
 launch's row there, in the transaction that checks the launch is still pending, in time and under the live lease's
@@ -531,6 +533,12 @@ def unspawned(conn: sqlite3.Connection) -> list[Launch]:
         "SELECT 1 FROM launch_spawns WHERE launch_id = ?", (ln.launch_id,)).fetchone() is None]
 
 
+def launch_dirs(conn: sqlite3.Connection) -> list[str]:
+    """The distinct directories launches were asked to run in, in the order first asked for."""
+    return [r[0] for r in conn.execute(
+        "SELECT cwd FROM launches WHERE cwd IS NOT NULL GROUP BY cwd ORDER BY MIN(gseq)").fetchall()]
+
+
 def by_harness_session(conn: sqlite3.Connection, harness_session_id: str) -> Launch | None:
     """The launch whose ``active`` row recorded ``harness_session_id`` (a session Levain started), or None."""
     row = conn.execute("SELECT launch_id FROM launch_events WHERE kind = 'active' AND harness_session_id = ? "
@@ -667,6 +675,12 @@ def _deaths(conn: sqlite3.Connection) -> tuple[int, str | None]:
             or ln.state == "ended" and (ln.cause == "0 turns" or ln.cause == "lost the lease" and not wrote)
         if not died:
             break
+        if ln.state in ("failed", "expired") and conn.execute(
+                "SELECT 1 FROM launch_spawns WHERE launch_id = ?", (launch_id,)).fetchone() is None:
+            # ruled (L3 r1 G6): nobody tried to start it (a watcher down, a refusal before the spawn claim), so it
+            # says nothing of whether a coordinator dies. [seat] it is passed over, neither a death nor a run: the
+            # deaths either side of it still count in a row
+            continue
         count += 1
         if latest is None:
             # the death's own time: an expiry happened at its until, whenever it was noticed

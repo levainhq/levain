@@ -689,8 +689,9 @@ class CoordStore:
             return pending[-1] if pending else None
 
     def woken_launch(self, drop_id: str) -> str | None:
-        """The coordinator launch ``drop_id``'s own transaction asked for, when this store object accepted it."""
-        return self._woken.get(drop_id)
+        """The coordinator launch ``drop_id``'s own transaction asked for, when this store object accepted it. Read
+        once: the entry is popped, so a long-lived store holds none it no longer needs (L3 r1 G8)."""
+        return self._woken.pop(drop_id, None)
 
     def launch_claim_spawn(self, launch_id: str, pid: int) -> Any:
         """The one-spawner compare-and-set (:func:`levain.coordinator.lease.claim_spawn`), one transaction."""
@@ -738,6 +739,13 @@ class CoordStore:
 
         with read_transaction(self._connect) as conn:
             return lease._in_state(conn, "active")
+
+    def launch_dirs(self) -> list[str]:
+        """Every directory a launch of this store was asked to run in (where its briefs sit)."""
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.launch_dirs(conn)
 
     def launch_by_harness_session(self, harness_session_id: str) -> Any:
         from levain.coordinator import lease

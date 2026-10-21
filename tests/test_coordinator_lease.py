@@ -54,6 +54,14 @@ def drop(store, words="fix the build"):
     return store.accept_drop(words, surface="cli")[0]
 
 
+def claimed(store):
+    """The pending coordinator launch's spawn claimed by a starter that then died (C3b fix 2 G6: a launch nobody tried
+    to start is no death when it expires)."""
+    ln = store.pending_coordinator()
+    assert store.launch_claim_spawn(ln.launch_id, 1)[1] is None
+    return ln
+
+
 def boot(store):
     """A drop with no lease: its pending coordinator launch, activated."""
     drop(store)
@@ -219,7 +227,8 @@ def test_three_coordinator_deaths_stop_the_wakes_until_you_look(store, clock):
             clock.advance(seconds=wait.total_seconds())
         drop(store, f"drop {n}")
         assert store.coord_status()["wake"] == "launching"
-        clock.advance(seconds=lease.LAUNCH_TTL.total_seconds())   # nobody spawned it: it expires
+        claimed(store)
+        clock.advance(seconds=lease.LAUNCH_TTL.total_seconds())   # its starter died: it expires
     drop(store, "after three deaths")
     st = store.coord_status()
     assert st["wake"] == "stopped" and "until you look" in st["why"]
@@ -374,6 +383,7 @@ def test_a_coordinator_running_without_the_lease_is_waited_for_only_so_long(stor
 
 def test_your_take_and_release_reset_the_deaths(store, clock):
     drop(store)
+    claimed(store)
     clock.advance(seconds=lease.LAUNCH_TTL.total_seconds())
     drop(store, "one death: backoff")
     assert store.coord_status()["wake"] == "backoff"
@@ -385,6 +395,7 @@ def test_your_take_and_release_reset_the_deaths(store, clock):
 
 def test_the_backoff_runs_from_the_death_not_from_when_it_was_noticed(store, clock):
     drop(store)
+    claimed(store)
     clock.advance(seconds=(lease.LAUNCH_TTL + lease.BACKOFF[0] + timedelta(seconds=1)).total_seconds())
     drop(store, "the expiry is noticed only now, past its backoff already")
     assert store.coord_status()["wake"] == "launching"
@@ -424,6 +435,7 @@ def test_deaths_count_in_the_order_launches_ended(store, clock, qdir):
     assert store.launch(ln.launch_id).cause == "lost the lease"
     st = store.coord_status()
     assert st["wake"] == "launching"
+    claimed(store)
     clock.advance(seconds=lease.LAUNCH_TTL.total_seconds())
     drop(store, "B expired: two deaths in a row")
     assert store.coord_status()["wake"] == "backoff" and "2 coordinator" in store.coord_status()["why"]

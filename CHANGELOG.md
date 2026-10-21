@@ -26,15 +26,16 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **`levain coord watch`: keep the coordinator's sessions honest.** Leave it running (`--every S`, or `--once` for one
   pass): it starts any coordinator a drop from the phone or the cockpit asked for, ends a launch whose session is
   gone, keeps the role with a coordinator that is still working and wrote in the last hour, and stops a session whose
-  launch is over (you took over, it lost the role, or it failed to start). It touches only the sessions Levain
-  started.
+  launch is over (you took over, it lost the role, or it failed to start), and deletes that launch's brief, which
+  quotes your drops. It touches only the sessions Levain started, in the directory it started them in.
 
 ### Known edges
 - A coordinator launch that fails (an untrusted directory, a session that never appears) counts against the
   coordinator: after three in a row Levain stops starting them until you run `levain coord take` or
   `levain coord release`.
 - A drop from the phone or the cockpit asks for a coordinator without starting it: with no `levain coord watch`
-  running, run `levain coord launch` within 5 minutes, or the request lapses and counts as one of those three.
+  running, run `levain coord launch` within 5 minutes, or the request lapses (a lapse nobody tried to start does not
+  count as one of those three).
 - A coordinator that finished its turn still holds the role until its lease runs out: drops sent meanwhile wait up to
   an hour for the next coordinator. A new drop is not handed into a session that is already running.
 

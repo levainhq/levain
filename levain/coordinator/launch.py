@@ -6,8 +6,10 @@ A launch row (:mod:`levain.coordinator.lease`) is what was asked for; this modul
   1. the one-spawner compare-and-set (:func:`levain.coordinator.lease.claim_spawn`): still pending, in time, under the
      live lease's token, and nobody else started it. A loser spawns nothing;
   2. the hook check (L2): doctor's own Claude Code check of the launch's directory must report the consent hook
-     "wired to this install". Anything else (not wired, off, no install) refuses: a session there would run with no
-     consent hook between it and your machine;
+     "wired to this install", and no row of that check may report the hooks turned off (``disableAllHooks`` in any
+     settings file a session there loads). Anything else (not wired, off, no install) refuses: a session there would
+     run with no consent hook between it and your machine. Steps 2 and 3's checks run before step 1's claim, so a
+     refusal there leaves the launch pending (it expires unspawned, which is no death);
   3. the brief file (L8), ``<launch directory>/.levain/briefs/<launch id>.md`` (directories 0700, the file 0600,
      created exclusively, never through a link): the role, the launch id and session key, how to claim, beat and
      write, and the queued drops QUOTED AS DATA. It sits inside the directory Claude Code was trusted for, so the
@@ -25,8 +27,9 @@ A launch row (:mod:`levain.coordinator.lease`) is what was asked for; this modul
      session is stopped and the refusal returned.
 
 Only a coordinator launch is started (a worker's brief is not built). Once ``claude --bg`` returned 0, every way out
-of 5-6 that does not leave the launch active stops the sessions listed under its name, a Ctrl-C included; a process
-killed outright leaves its launch to expire, and the watcher stops the session by name then.
+of 5-6 that does not leave the launch active stops the sessions listed under its name in its directory, a Ctrl-C
+included; a process killed outright leaves its launch to expire, and the watcher stops the session by name then. Only
+the spawn runs in the launch's directory: ``claude agents`` and ``claude stop`` run in the store's.
 
 :func:`setup_install` makes the coordinator's directory (by default ``<levain home>/coordinator``) a Levain install
 for Claude Code when it is not one, by running ``levain init --adapter claude-code`` non-interactively in this process.
@@ -46,14 +49,16 @@ so its end is always ``gone``); a list that cannot be read observes nothing; ``l
 launch it asked for did not start. Stdlib only.
 
 Known edges: a trust refusal or a session never listed is a death, so three in a row stop the wakes until you take
-or release (the first real run will likely meet it). The consent queue's settings file is created once: when your
-main install made it, the coordinator's install keeps it, and its grants verify against that install's cockpit (init
-warns and continues). Your user-scope Claude Code settings, hooks and CLAUDE.md imports load into the coordinator's
-session too (doctor checks the install's wiring, not the effective settings). Drops that arrive while a done
-coordinator still holds the lease wait up to LEASE_TTL + IDLE_GRACE; handing a new drop into a running session is not
-built. A crashed spawn winner is not retried: its launch expires at LAUNCH_TTL and counts as a death. A list with no
-row at all observes nothing, so a coordinator that dies as the only listed session ends by its lease lapsing (the
-IDLE_GRACE path), not by the watcher.
+or release (the first real run will likely meet it). A refusal before the spawn claim (the hook not live, the briefs
+directory refused) is no death: the launch stays pending, each start says why, and it expires unspawned. The consent
+queue's settings file is created once: when your main install made it, the coordinator's install keeps it, and its
+grants verify against that install's cockpit (init warns and continues). Your user-scope Claude Code settings, hooks
+and CLAUDE.md imports load into the coordinator's session too (doctor checks the install's wiring and that no settings
+file turns hooks off, not the rest of the effective settings). Drops that arrive while a done coordinator still holds
+the lease wait up to LEASE_TTL + IDLE_GRACE; handing a new drop into a running session is not built. A crashed spawn
+winner is not retried: its launch expires at LAUNCH_TTL and counts as a death. A session the read back listed in
+another directory than the launch's is not stopped (a name alone is not Levain's evidence); the launch fails and that
+session is yours to look at.
 """
 from __future__ import annotations
 
@@ -88,6 +93,8 @@ __all__ = ["BRIEF_DROPS", "HOOK_ROW", "READBACK_DELAY", "READBACK_TRIES", "UNLIS
 
 HOOK_ROW = "Claude Code consent hook"
 _HOOK_LIVE = "wired to this install"
+_HOOKS_ROW = "Claude Code hooks"            # doctor's _check_hooks_off row, failing when the hooks are turned off
+_HOOKS_OFF = "turned off by"
 READBACK_TRIES = 10
 READBACK_DELAY = 0.5          # seconds: the row is listed at once in the run, its pid a moment later
 _SPAWN_TIMEOUT = 60
@@ -97,6 +104,7 @@ _TRUST_REFUSAL = "Workspace not trusted"
 UNLISTED_RECHECK = 2.0        # seconds: a launch ends unlisted only when two reads this far apart both miss it
 _OURS = re.compile(r"levain-(coordinator|worker)-([0-9a-f]{32})")      # session_name's shape
 _OVER = ("ended", "failed", "expired")
+_BRIEF = re.compile(r"(ln-[0-9a-f]{32})\.md")                          # brief_path's file name
 
 
 @dataclass(frozen=True)
@@ -128,7 +136,8 @@ def brief_path(launch: Any) -> Path:
 # --- the hook check (L2) and the install -------------------------------------------------------------------------
 def hook_live(directory: Path) -> tuple[bool, str]:
     """Doctor's own Claude Code check of ``directory`` (never a re-derivation): ``(True, detail)`` when its
-    ``Claude Code consent hook`` row reads "wired to this install"; else ``(False, why)``."""
+    ``Claude Code consent hook`` row reads "wired to this install" AND no ``Claude Code hooks`` row of the same check
+    fails "turned off by" (``disableAllHooks``); else ``(False, why)``."""
     from levain import doctor
 
     if not (Path(directory) / "CLAUDE.md").is_file():
@@ -137,11 +146,16 @@ def hook_live(directory: Path) -> tuple[bool, str]:
         rows = doctor._check_claude_code(Path(directory))
     except Exception as exc:  # noqa: BLE001 - a check that cannot run is a refusal, never a pass
         return False, f"doctor could not check {directory} ({type(exc).__name__}: {str(exc)[:200]})"
+    # ruled (L3 r1 G1): a wired hook is not a running one. doctor reports an effective `disableAllHooks: true` (any
+    # settings file a session there loads) as a later failing "Claude Code hooks" row, "turned off by ..."
+    off = next((r for r in rows if r.name == _HOOKS_ROW and not r.ok and r.detail.startswith(_HOOKS_OFF)), None)
     for row in rows:
         if row.name == HOOK_ROW:
-            if row.detail.startswith(_HOOK_LIVE):
-                return True, row.detail
-            return False, f"{HOOK_ROW}: {row.detail}"
+            if not row.detail.startswith(_HOOK_LIVE):
+                return False, f"{HOOK_ROW}: {row.detail}"
+            if off is not None:
+                return False, f"{HOOK_ROW}: {row.detail}, but {_HOOKS_ROW}: {off.detail}"
+            return True, row.detail
     failed = next((r for r in rows if not r.ok), None)
     why = f"{failed.name}: {failed.detail}" if failed is not None else "doctor reports no consent hook row"
     return False, f"{directory}: the consent hook is not checked ({why})"
@@ -271,7 +285,8 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _write_brief(store: CoordStore, launch: Any) -> Path:
+def _brief_dir(launch: Any) -> Path:
+    """The launch's briefs directory, made and checked private (and gitignored); refused when it is not."""
     path = brief_path(launch)
     for d in (path.parent.parent, path.parent):
         d.mkdir(mode=0o700, exist_ok=True)
@@ -284,6 +299,11 @@ def _write_brief(store: CoordStore, launch: Any) -> Path:
 
     # a brief quotes drops verbatim: a `git add -A` in a repo directory must not commit them (install's own helper)
     _ensure_gitignored(path.parent.parent, "briefs/")
+    return path.parent
+
+
+def _write_brief(store: CoordStore, launch: Any) -> Path:
+    path = _brief_dir(launch) / brief_path(launch).name          # checked again: it is checked before the spawn claim
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(_brief_text(store, launch))
@@ -314,7 +334,7 @@ def _agents(exe: str, *, cwd: str, env: dict[str, str]) -> list[dict[str, Any]] 
 
 
 def _listed(exe: str, name: str, *, cwd: str, env: dict[str, str]) -> list[dict[str, Any]]:
-    """The ``claude agents --json`` rows whose ``name`` is ``name`` (matched by name only)."""
+    """The ``claude agents --json`` rows whose ``name`` is ``name`` (by name only; an unread list lists none)."""
     return [r for r in _agents(exe, cwd=cwd, env=env) or [] if r.get("name") == name]
 
 
@@ -336,10 +356,19 @@ def _stop(exe: str, harness_id: str, *, cwd: str, env: dict[str, str]) -> str:
     return f"claude stop {harness_id}: " + ((cp.stdout or cp.stderr).strip().splitlines() or [f"exit {cp.returncode}"])[0]
 
 
-def _stop_named(exe: str, name: str, *, cwd: str, env: dict[str, str]) -> str:
-    """Stop every listed session named ``name`` (ours: the name carries the launch id), and say what happened."""
-    stopped = [_stop(exe, h, cwd=cwd, env=env) for r in _listed(exe, name, cwd=cwd, env=env) if (h := _harness_id(r))]
-    return "; ".join(stopped) if stopped else f"no session named {name} was listed to stop"
+def _stop_named(exe: str, name: str, where: str, *, cwd: str, env: dict[str, str]) -> str:
+    """Stop every listed session named ``name`` whose ``cwd`` is ``where`` (the launch's realpath directory: a name
+    alone is a string anyone can choose, L3 r1 G4), and say what happened."""
+    rows = _agents(exe, cwd=cwd, env=env)
+    if rows is None:
+        return f"`claude agents` could not be read, so no session named {name} was stopped"
+    named = [r for r in rows if r.get("name") == name]
+    stopped = [_stop(exe, h, cwd=cwd, env=env) for r in named if r.get("cwd") == where and (h := _harness_id(r))]
+    if stopped:
+        return "; ".join(stopped)
+    if named:
+        return f"no session named {name} in {where} was listed to stop (one elsewhere is not Levain's to stop)"
+    return f"no session named {name} was listed to stop"
 
 
 def _plain(cause: str) -> str:
@@ -363,8 +392,10 @@ def _harness_id(row: dict[str, Any]) -> str | None:
 def launch_session(store: CoordStore, launch_id: str) -> Outcome:
     """Start launch ``launch_id``'s session (see the module docstring for the steps). Every way it does not start is
     an :class:`Outcome` with ``started`` False and the refusal; the launch is written ``failed`` with that cause
-    whenever this call held the spawn. A Ctrl-C after the spawn stops the session and propagates, leaving the launch
-    pending until it expires at LAUNCH_TTL."""
+    whenever this call held the spawn. The checks that need no spawn (its directory, the hook, the briefs directory)
+    run BEFORE the spawn claim: a refusal there writes nothing and leaves the launch pending, to be started once it is
+    fixed or to expire unspawned, which is no death (L3 r1 G7). A Ctrl-C after the spawn stops the session and
+    propagates, leaving the launch pending until it expires at LAUNCH_TTL."""
     ln = store.launch(launch_id)
     if ln is None:
         return Outcome(str(launch_id)[:40], False, refusal=f"no launch {str(launch_id)[:40]!r}")
@@ -373,6 +404,21 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
     if ln.role != "coordinator":
         return Outcome(launch_id, False, refusal=f"launch {launch_id} is a {ln.role} launch; the worker brief is not "
                                                  "built")
+    if ln.state != "pending":
+        return Outcome(launch_id, False, refusal=f"launch {launch_id} is {ln.state}, not pending")
+
+    def left(cause: str) -> Outcome:
+        return Outcome(launch_id, False, refusal=_plain(f"{cause} (launch {launch_id} left pending, until {ln.until})"))
+
+    if not ln.cwd or not Path(ln.cwd).is_dir():
+        return left(f"the launch's directory {ln.cwd!r} is not a directory")
+    live, detail = hook_live(Path(ln.cwd))
+    if not live:
+        return left(f"the consent hook is not live in {ln.cwd}: {detail}")
+    try:
+        _brief_dir(ln)
+    except (CoordError, OSError) as exc:
+        return left(f"the launch's briefs directory refused ({type(exc).__name__}: {str(exc)[:300]})")
     got, why = store.launch_claim_spawn(launch_id, os.getpid())
     if why is not None:
         return Outcome(launch_id, False, refusal=why)
@@ -389,21 +435,20 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
     # active stops it by that name, a Ctrl-C included (the finally below). A SIGTERM or SIGKILL runs no finally: the
     # launch stays pending, expires at LAUNCH_TTL, and the watcher's name sweep stops the session then
     spawned = settled = False
-    exe = name = cwd = ""
+    exe = name = ""
+    cwd = got.cwd
+    real = os.path.realpath(cwd)
+    # ruled (L3 r1 G3): only the spawn runs in the launch's directory; listing and stopping run in the store's own,
+    # so a launch directory renamed or deleted since never blocks a stop
+    mgmt = str(store.directory)
     env: dict[str, str] = {}
 
     def stop_ours() -> str:
         nonlocal settled
         settled = True
-        return _stop_named(exe, name, cwd=cwd, env=env)
+        return _stop_named(exe, name, real, cwd=mgmt, env=env)
 
     try:
-        cwd = got.cwd
-        if not cwd or not Path(cwd).is_dir():
-            return fail(f"the launch's directory {cwd!r} is not a directory")
-        live, detail = hook_live(Path(cwd))
-        if not live:
-            return fail(f"the consent hook is not live in {cwd}: {detail}")
         from levain.launch import child_env
 
         env = child_env()
@@ -424,11 +469,10 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
         output = f"{cp.stdout}\n{cp.stderr}"
         if cp.returncode != 0:
             if _TRUST_REFUSAL in output:
-                real = os.path.realpath(cwd)
                 return fail(f"workspace not trusted: {real}", trust_remedy(real))
             return fail(f"claude --bg exited {cp.returncode}: {_first_line(output) or '(no output)'}")
         spawned = True
-        rows = _read_back(exe, name, cwd=cwd, env=env)
+        rows = _read_back(exe, name, cwd=mgmt, env=env)
         if not rows:
             # it may be listed later: stopped now if it is, and the watcher stops it by name if it shows up after
             return fail(f"claude --bg started no session listed by `claude agents` as {name}; {stop_ours()}")
@@ -438,7 +482,6 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
         hid, sid = _harness_id(row), row.get("sessionId")
         if hid is None or not isinstance(sid, str):
             return fail(f"`claude agents` lists {name} without a usable id and sessionId; {stop_ours()}")
-        real = os.path.realpath(cwd)
         if row.get("cwd") != real:
             return fail(f"`claude agents` lists {name} in {str(row.get('cwd'))[:300]!r}, not {real}; {stop_ours()}")
         try:
@@ -467,9 +510,40 @@ def _harness() -> tuple[str | None, dict[str, str]]:
 
 
 def _observed(exe: str, env: dict[str, str], cwd: str) -> list[dict[str, Any]] | None:
-    """The list, or None when it cannot be read OR holds no row at all: an empty list (a daemon restarting) is no
-    evidence that every session is gone."""
-    return _agents(exe, cwd=cwd, env=env) or None
+    """The list, or None when it cannot be read (an error, a timeout, output that is not a JSON list). Ruled (L3 r1
+    G2): a list read successfully with no row is a VALID listing (the coordinator may be the only session), so it is
+    returned as ``[]``; what guards a death is the second read, never the list's length."""
+    return _agents(exe, cwd=cwd, env=env)
+
+
+def _remove_briefs(store: CoordStore) -> list[str]:
+    """Delete the brief of every launch of this store that is over (ended, failed, expired): a brief quotes your drops
+    verbatim and has no reader once its launch is over (L3 r1 G9). Only a regular file named ``ln-<hex>.md`` in a
+    briefs directory that is a real directory of yours, naming a launch asked to run in that very directory."""
+    lines: list[str] = []
+    for d in store.launch_dirs():
+        briefs = Path(d) / ".levain" / "briefs"
+        try:
+            st = os.lstat(briefs)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+                continue
+            entries = list(os.scandir(briefs))
+        except OSError:
+            continue
+        for e in entries:
+            m = _BRIEF.fullmatch(e.name)
+            if m is None or not e.is_file(follow_symlinks=False):
+                continue
+            ln = store.launch(m.group(1))
+            if ln is None or ln.cwd != d or ln.state not in _OVER:
+                continue
+            try:
+                os.unlink(e.path)
+            except OSError as exc:
+                lines.append(f"launch {ln.launch_id} {ln.state}: its brief could not be removed ({exc})")
+                continue
+            lines.append(f"launch {ln.launch_id} {ln.state}: its brief removed")
+    return lines
 
 
 def _by_session(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -494,10 +568,14 @@ def watch_once(store: CoordStore) -> list[str]:
       (d) every listed session of a launch of THIS store that has ended, failed or expired is stopped,
           ``claude stop <id>``: matched by the ``sessionId`` its ``active`` row recorded, or by its name
           ``levain-<role>-<launch hex>`` naming such a launch (a session a failed or interrupted start left running).
-          A pending launch's session is never stopped: its start may be in flight in another process.
+          A pending launch's session is never stopped: its start may be in flight in another process. A session
+          matched by name alone is stopped only when its row's ``cwd`` is that launch's realpath directory (a name is
+          a string anyone can choose); every ``agents`` and ``stop`` call runs in the store's directory;
+      (e) the brief of every launch that is over is deleted (:func:`_remove_briefs`).
 
-    Any other row in the list is never read further. When the list cannot be read or holds no row, (b)-(d) do
-    nothing: an unread list is no evidence of anything."""
+    Any other row in the list is never read further. When the list cannot be read, (b)-(d) do nothing: an unread list
+    is no evidence of anything. A list read with no row is a listing like any other (L3 r1 G2): an active launch
+    missing from it, and from a second read UNLISTED_RECHECK seconds later, ends."""
     lines: list[str] = []
     # lapses and expiries are written first: a launch whose starter was killed outright stays pending until someone
     # writes it expired, and only then does (d) stop the session it left
@@ -513,6 +591,7 @@ def watch_once(store: CoordStore) -> list[str]:
         lines.append(f"launch {got.launch_id} started: {got.attach}" if got.started
                      else f"launch {got.launch_id} not started: {got.refusal}"
                           + (f" (run once: {got.remedy})" if got.remedy else ""))
+    lines.extend(_remove_briefs(store))
     # the active launches are read BEFORE the list: a launch is active only after its read back saw it listed, so
     # every one read here was listed before the list below was taken, and a launch activated meanwhile is not judged
     active = [ln for ln in store.launches_active() if ln.harness == "claude" and ln.harness_session_id]
@@ -522,7 +601,7 @@ def watch_once(store: CoordStore) -> list[str]:
         return lines
     rows = _observed(exe, env, str(store.directory))
     if rows is None:
-        lines.append("claude agents --json could not be read or listed no session: no session observed")
+        lines.append("claude agents --json could not be read: no session observed")
         return lines
     missing = [ln for ln in active if ln.harness_session_id not in _by_session(rows)]
     if missing:
@@ -530,7 +609,7 @@ def watch_once(store: CoordStore) -> list[str]:
         time.sleep(UNLISTED_RECHECK)
         again = _observed(exe, env, str(store.directory))
         if again is None:
-            lines.append("claude agents --json could not be read again or listed no session: no launch ended")
+            lines.append("claude agents --json could not be read again: no launch ended")
             missing = []
         else:
             rows = again
@@ -568,7 +647,9 @@ def watch_once(store: CoordStore) -> list[str]:
             ln = store.launch_by_harness_session(row["sessionId"])
         if ln is None and isinstance(row.get("name"), str) and (m := _OURS.fullmatch(row["name"])):
             ln = store.launch("ln-" + m.group(2))
-            ln = ln if ln is not None and ln.role == m.group(1) else None
+            # by name, only in the launch's own directory (L3 r1 G4)
+            ln = ln if ln is not None and ln.role == m.group(1) and ln.cwd \
+                and row.get("cwd") == os.path.realpath(ln.cwd) else None
         if ln is None or ln.state not in _OVER:
             continue
         hid = _harness_id(row)
@@ -579,7 +660,7 @@ def watch_once(store: CoordStore) -> list[str]:
             continue
         stopped.add(hid)
         lines.append(f"launch {ln.launch_id} {ln.state} ({ln.cause}): "
-                     f"{_stop(exe, hid, cwd=ln.cwd or str(store.directory), env=env)}")
+                     f"{_stop(exe, hid, cwd=str(store.directory), env=env)}")
     return lines
 
 
@@ -590,13 +671,14 @@ def _minutes(delta: Any) -> int:
 def watch(store: CoordStore, *, every: float, emit: Callable[[str], None] = print,
           passes: int | None = None) -> None:
     """``watch_once`` every ``every`` seconds, its lines emitted, until interrupted (or ``passes`` passes, for
-    tests). A pass that faults says so and the next one runs."""
+    tests). A pass that faults, whatever it raised, says so and the next one runs (L3 r1 G5: a ``JobStoreError`` from
+    the shared ``dispatch.db`` is no ``CoordError``); a Ctrl-C or SystemExit still ends the watch."""
     done = 0
     while passes is None or done < passes:
         try:
             for line in watch_once(store):
                 emit(line)
-        except (CoordError, OSError, sqlite3.Error) as exc:
+        except Exception as exc:  # noqa: BLE001 - one bad pass never ends the watch (KeyboardInterrupt still does)
             emit(f"watch pass faulted ({type(exc).__name__}: {str(exc)[:300]}); next pass in {every:g}s")
         done += 1
         if passes is None or done < passes:

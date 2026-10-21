@@ -311,15 +311,21 @@ def test_a_launch_no_longer_pending_spawns_nothing(store, fake, live_hook):
     assert fake.spawns() == []
 
 
-def test_a_directory_whose_hook_is_not_live_refuses(qdir, tmp_path, fake):
+def test_a_directory_whose_hook_is_not_live_refuses(qdir, tmp_path, fake, monkeypatch):
     plain = tmp_path / "plain"
     plain.mkdir()
     store = CoordStore(qdir)
-    store.coord_set_agent("claude", cwd=str(plain))
+    store.coord_set_agent("claude", cwd=str(plain.resolve()))
     launch_id = woken(store)
     got = cl.launch_session(store, launch_id)
     assert not got.started and "the consent hook is not live" in got.refusal and "no CLAUDE.md" in got.refusal
-    assert fake.spawns() == [] and store.launch(launch_id).state == "failed"
+    # G7: checked before the spawn claim, so nothing is written: the launch stays pending, unclaimed
+    assert f"launch {launch_id} left pending" in got.refusal
+    assert fake.spawns() == [] and store.launch(launch_id).state == "pending"
+    assert rows(qdir, "SELECT count(*) FROM launch_spawns") == [(0,)]
+    # fixed while it is still pending, the same launch starts
+    monkeypatch.setattr(cl, "hook_live", lambda d: (True, "wired to this install"))
+    assert cl.launch_session(store, launch_id).started
 
 
 # --- the setting -----------------------------------------------------------------------------------------------
@@ -470,6 +476,7 @@ def test_a_linked_briefs_directory_refuses_the_launch(store, fake, live_hook, wo
     got = cl.launch_session(store, launch_id)
     assert not got.started and "not a private directory" in got.refusal
     assert fake.spawns() == [] and list(elsewhere.iterdir()) == []
+    assert store.launch(launch_id).state == "pending"           # G7: refused before the spawn claim
 
 
 # --- the watcher (levain coord watch) --------------------------------------------------------------------------
@@ -643,7 +650,7 @@ def test_an_unreadable_list_ends_nothing(store, fake, live_hook, clock):
     (fake.dir / "agents_fail").write_text("")
     clock[0] += timedelta(minutes=1)
     lines = cl.watch_once(store)
-    assert "claude agents --json could not be read or listed no session: no session observed" in lines
+    assert "claude agents --json could not be read: no session observed" in lines
     assert store.launch(ln.launch_id).state == "active" and fake.stops() == []
 
 
@@ -733,48 +740,56 @@ def test_a_row_without_a_usable_id_is_stopped_by_name(store, fake, live_hook, mo
     assert fake.stops() == [["stop", HID]] and store.launch(launch_id).state == "failed"
 
 
-def test_a_row_in_another_directory_is_stopped_and_fails(store, fake, live_hook, workdir):
+def test_a_row_in_another_directory_fails_and_is_never_stopped(store, fake, live_hook, workdir):
+    # G4: a name is a string anyone can choose; a row elsewhere is not shown to be Levain's
     fake.flag("row_cwd", "/somewhere/else")
     launch_id = woken(store)
     got = cl.launch_session(store, launch_id)
     assert not got.started and f"not {os.path.realpath(workdir)}" in got.refusal
-    assert fake.stops() == [["stop", HID]] and store.launch(launch_id).state == "failed"
+    assert "not Levain's to stop" in got.refusal
+    assert fake.stops() == [] and store.launch(launch_id).state == "failed"
 
 
-def test_the_watcher_stops_a_session_a_failed_launch_left_by_name(store, fake, live_hook, clock):
+def test_the_watcher_stops_a_session_a_failed_launch_left_by_name(store, fake, live_hook, clock, workdir):
     from datetime import timedelta
 
     fake.mode("never")                                   # listed only after the read back gave up
     launch_id = woken(store)
     assert not cl.launch_session(store, launch_id).started
     name = f"levain-coordinator-{launch_id.removeprefix('ln-')}"
+    # G4: our name in ANOTHER directory is never stopped by name
     (fake.dir / "state.json").write_text(json.dumps({"name": name, "cwd": "/x", "reads": 1}))
     stranger = {"id": "5e5e5e5e", "sessionId": "5e5e5e5e-0000-4000-8000-000000000000",
                 "name": "levain-coordinator-" + "ab" * 16, "cwd": "/y", "state": "working"}  # another store's
     fake.others([OTHER, stranger])
     clock[0] += timedelta(minutes=1)
+    cl.watch_once(store)
+    assert fake.stops() == []
+    # in the launch's own directory it is
+    (fake.dir / "state.json").write_text(json.dumps({"name": name, "cwd": str(workdir.resolve()), "reads": 1}))
     lines = cl.watch_once(store)
     assert any(line.startswith(f"launch {launch_id} failed (") and f"stopped {HID}" in line for line in lines), lines
     assert fake.stops() == [["stop", HID]]
 
 
-def test_the_watcher_never_stops_a_pending_launchs_session(store, fake, live_hook, clock):
+def test_the_watcher_never_stops_a_pending_launchs_session(store, fake, live_hook, clock, workdir):
     launch_id = woken(store)
     assert store.launch_claim_spawn(launch_id, 1)[1] is None   # another process is starting it right now
     name = f"levain-coordinator-{launch_id.removeprefix('ln-')}"
-    (fake.dir / "state.json").write_text(json.dumps({"name": name, "cwd": "/x", "reads": 1}))
+    (fake.dir / "state.json").write_text(json.dumps({"name": name, "cwd": str(workdir.resolve()), "reads": 1}))
     cl.watch_once(store)
     assert fake.stops() == [] and store.launch(launch_id).state == "pending"
 
 
-def test_a_starter_killed_outright_leaves_a_session_the_watcher_stops_after_launch_ttl(store, fake, live_hook, clock):
+def test_a_starter_killed_outright_leaves_a_session_the_watcher_stops_after_launch_ttl(store, fake, live_hook, clock,
+                                                                                      workdir):
     # SIGTERM / SIGKILL run no finally: the spawn row stands, the launch stays pending, its session runs
     from datetime import timedelta
 
     launch_id = woken(store)
     assert store.launch_claim_spawn(launch_id, 1)[1] is None
     name = f"levain-coordinator-{launch_id.removeprefix('ln-')}"
-    (fake.dir / "state.json").write_text(json.dumps({"name": name, "cwd": "/x", "reads": 1}))
+    (fake.dir / "state.json").write_text(json.dumps({"name": name, "cwd": str(workdir.resolve()), "reads": 1}))
     cl.watch_once(store)
     assert fake.stops() == []                           # in flight: never stopped
     clock[0] += lease.LAUNCH_TTL + timedelta(seconds=1)
@@ -784,15 +799,30 @@ def test_a_starter_killed_outright_leaves_a_session_the_watcher_stops_after_laun
     assert fake.stops() == [["stop", HID]]
 
 
-def test_an_empty_list_observes_nothing(store, fake, live_hook, clock):
+def test_an_empty_list_is_a_listing_and_two_of_them_end_the_launch(store, fake, live_hook, clock):
+    # G2: a list read successfully with no row is valid (the coordinator may be the only session); the two reads
+    # UNLISTED_RECHECK apart are what guard a death, never the list's length
     from datetime import timedelta
 
     ln = started(store)
     fake.gone()
-    fake.others([])                                      # a daemon restarting lists nothing at all
+    fake.others([])
     clock[0] += timedelta(minutes=1)
     lines = cl.watch_once(store)
-    assert any("listed no session" in line for line in lines), lines
+    assert f"launch {ln.launch_id} ended: 0 turns (its session is no longer listed)" in lines, lines
+    assert store.launch(ln.launch_id).state == "ended"
+    agents = [c for c in fake.calls() if c["argv"] == ["agents", "--json"]]
+    assert len(agents) == 3                              # the read back, then the two reads of this pass
+
+
+def test_one_empty_read_then_a_listing_ends_nothing(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    fake.others([])
+    fake.flag("miss_once")                               # the first read lists nothing at all, the second lists it
+    clock[0] += timedelta(minutes=1)
+    cl.watch_once(store)
     assert store.launch(ln.launch_id).state == "active"
 
 
@@ -831,13 +861,24 @@ def test_the_briefs_directory_is_gitignored(store, fake, live_hook, workdir):
     assert [x for x in lines if x] == ["answers.json", "briefs/"]          # the install's own helper wrote it
 
 
-def test_a_multi_line_cause_is_written_as_one_line(store, fake, monkeypatch):
-    monkeypatch.setattr(cl, "hook_live", lambda d: (False, "first line\nsecond\tline ‮"))
+def test_a_multi_line_cause_is_written_as_one_line(store, fake, live_hook, monkeypatch):
+    from levain.coordinator.store import CoordError
+
+    def boom(*a, **kw):
+        raise CoordError("first line\nsecond\tline ‮")
+
+    monkeypatch.setattr(cl, "_read_back", boom)
     launch_id = woken(store)
     got = cl.launch_session(store, launch_id)
     ln = store.launch(launch_id)
     assert ln.state == "failed" and ln.cause == got.refusal and "\n" not in ln.cause
     assert "first line second line" in ln.cause and "‮" not in ln.cause
+
+
+def test_a_refusal_before_the_spawn_claim_is_one_line_too(store, fake, monkeypatch):
+    monkeypatch.setattr(cl, "hook_live", lambda d: (False, "first line\nsecond\tline ‮"))
+    got = cl.launch_session(store, woken(store))
+    assert "\n" not in got.refusal and "first line second line" in got.refusal and "‮" not in got.refusal
 
 
 @pytest.mark.parametrize("model", ["--dangerously-skip-permissions", "-x", "haiku sonnet", "a;b", ""])
@@ -854,6 +895,134 @@ def test_a_model_name_the_harness_takes_is_kept(qdir, workdir):
 def test_coord_agent_refuses_a_bad_model_before_any_install(tmp_home, qdir, capsys):
     out = _main(qdir, capsys, "coord", "agent", "claude", "--model=--bad", rc=1)
     assert "never starting with -" in out.err and not (tmp_home / ".levain" / "coordinator").exists()
+
+
+# --- C3b fix 2 (L3 r1) -----------------------------------------------------------------------------------------
+@pytest.mark.parametrize("scope", ["user", "workspace"])
+def test_hooks_turned_off_by_a_settings_file_refuse_the_launch(tmp_home, qdir, fake, capsys, scope):
+    # G1: doctor's real check of a real install; the consent hook row still reads "wired", a later row says off
+    from levain import doctor
+
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    assert cl.hook_live(target)[0]
+    f = tmp_home / ".claude" / "settings.json" if scope == "user" else target / ".claude" / "settings.local.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    data = json.loads(f.read_text()) if f.is_file() else {}
+    f.write_text(json.dumps({**data, "disableAllHooks": True}))
+    checked = doctor._check_claude_code(target)
+    (hook,) = [r for r in checked if r.name == cl.HOOK_ROW]
+    assert hook.detail.startswith("wired to this install")          # the trap: wired, and still not running
+    live, why = cl.hook_live(target)
+    assert not live and "turned off by" in why and str(f) in why
+    store = CoordStore(qdir)
+    d, _ = store.accept_drop("hooks are off", surface="cli")
+    launch_id = store.woken_launch(d.drop_id)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "turned off by" in got.refusal
+    assert fake.spawns() == [] and store.launch(launch_id).state == "pending"
+
+
+def test_agents_and_stop_run_in_the_store_directory_and_a_missing_launch_directory_blocks_no_stop(
+        store, fake, live_hook, clock, qdir, workdir):
+    # G3: only the spawn runs in the launch's directory
+    import shutil
+    from datetime import timedelta
+
+    ln = started(store)
+    spawn = next(c for c in fake.calls() if c["argv"][:1] == ["--bg"])
+    assert spawn["cwd"] == os.path.realpath(workdir)
+    store.coord_take()                                   # its launch is over, its session still listed
+    shutil.rmtree(workdir)                               # and its directory is gone
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert any(line.startswith(f"launch {ln.launch_id} ended (takeover)") and f"stopped {HID}" in line
+               for line in lines), lines
+    assert fake.stops() == [["stop", HID]]
+    mgmt = [c["cwd"] for c in fake.calls() if c["argv"][:1] != ["--bg"]]
+    assert mgmt and set(mgmt) == {os.path.realpath(store.directory)}
+
+
+def test_a_watch_pass_that_raises_anything_is_reported_and_the_next_runs(store, monkeypatch):
+    # G5: a JobStoreError from the shared dispatch.db is no CoordError
+    from levain.dispatch.jobs import JobStoreError
+
+    monkeypatch.setattr(cl.time, "sleep", lambda s: None)
+    calls = []
+
+    def once(s):
+        calls.append(1)
+        if len(calls) == 1:
+            raise JobStoreError("dispatch.db said no")
+        return ["fine"]
+
+    monkeypatch.setattr(cl, "watch_once", once)
+    out: list[str] = []
+    cl.watch(store, every=5, emit=out.append, passes=2)
+    assert len(calls) == 2 and out[-1] == "fine"
+    assert out[0].startswith("watch pass faulted (JobStoreError: dispatch.db said no)")
+
+    def interrupted(s):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cl, "watch_once", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        cl.watch(store, every=5, emit=out.append, passes=2)
+
+
+def test_launches_that_expire_unspawned_are_no_deaths(store, clock):
+    # G6: nobody tried to start them (no watcher ran): three in a row neither stop the wakes nor back them off
+    from datetime import timedelta
+
+    gap = max(lease.LAUNCH_TTL, lease.LEASE_TTL) + timedelta(seconds=1)
+    ids = []
+    for i in range(lease.MAX_DEATHS):
+        ids.append(woken(store, f"drop {i}"))
+        clock[0] += gap
+        assert store.coord_status()["wake"] == "wake"
+    assert [store.launch(x).state for x in ids] == ["expired"] * lease.MAX_DEATHS
+
+
+def test_spawned_expiries_still_count_in_a_row_across_unspawned_ones(store, clock):
+    # [seat] an unspawned lapse is passed over, neither a death nor a run: it never resets the count either
+    from datetime import timedelta
+
+    gap = max(lease.LAUNCH_TTL, lease.LEASE_TTL) + timedelta(seconds=1)
+    for i in range(lease.MAX_DEATHS):
+        launch_id = woken(store, f"spawned {i}")
+        assert store.launch_claim_spawn(launch_id, 1)[1] is None      # a starter claimed it, then died
+        clock[0] += gap + timedelta(days=1)                           # it expires; any backoff passes
+        store.coord_status()
+        if i + 1 < lease.MAX_DEATHS:
+            woken(store, f"unspawned {i}")                            # asked for, nobody tried
+            clock[0] += gap
+    st = store.coord_status()
+    assert st["wake"] == "stopped" and f"{lease.MAX_DEATHS} coordinator launches in a row died" in st["why"]
+
+
+def test_the_woken_entry_is_read_once(store):
+    # G8
+    d, _ = store.accept_drop("once", surface="cli")
+    assert store.woken_launch(d.drop_id) is not None
+    assert store.woken_launch(d.drop_id) is None and store._woken == {}
+
+
+def test_the_watcher_removes_the_brief_once_its_launch_is_over(store, fake, live_hook, clock, workdir):
+    # G9: a brief quotes the drops verbatim; once its launch is over nothing reads it
+    from datetime import timedelta
+
+    ln = started(store)
+    brief = cl.brief_path(ln)
+    keep = brief.parent / "notes.md"
+    keep.write_text("not a brief")
+    cl.watch_once(store)
+    assert brief.is_file()                               # active: kept
+    store.coord_take()
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert f"launch {ln.launch_id} ended: its brief removed" in lines
+    assert not brief.exists() and keep.read_text() == "not a brief"
+    assert not any("brief removed" in line for line in cl.watch_once(store))
 
 
 # --- the pin (C0 §3.4) -----------------------------------------------------------------------------------------
