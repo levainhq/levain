@@ -182,22 +182,17 @@ def test_no_answer_at_all_is_undecided_at_the_hold(adapter, L, slot, ws, tmp_pat
 @pytest.mark.parametrize("adapter", ["cc", "codex"])
 def test_the_broker_stopped_denies_a_gated_call_and_a_grantable_one_and_passes_bash(adapter, L, slot, ws, tmp_path):
     slot.stop()
+    # F10 S2b-2: EVERY call asks GATE first, before it is classified, so a broker that is down denies them all
+    # (fail closed), with the irreversible tier's hard stop on Claude Code (the call is not yet classified)
+    down = cc.could_not_run("irreversible", "this call") if adapter == "cc" else cx.could_not_run("this call")
     out = gate_of(adapter)(event_of(adapter, ws), hold=HOLD, **kw_of(adapter, tmp_path))
-    if adapter == "cc":
-        what = cc._what("Write", {"file_path": str(ws / ".claude/agents/probe2.md"), "content": "probe two"})
-        assert out == cc.could_not_run("irreversible", what) and out["continue"] is False
-    else:
-        assert out == cx.could_not_run("apply_patch of .codex/hooks.json")
-    # an ungated call no contract can grant (Bash) never asks the broker: the mode decides
+    assert out == down
     ungated = cc_event(ws, tool_name="Bash", tool_input={"command": "ls"}) if adapter == "cc" \
         else cx_event(ws, gated=False)
-    assert gate_of(adapter)(ungated, hold=HOLD, **kw_of(adapter, tmp_path)) is None
+    assert gate_of(adapter)(ungated, hold=HOLD, **kw_of(adapter, tmp_path)) == down
     if adapter == "cc":
-        # a grantable ungated call asks it (W2-c3), and a broker that is down denies it (fail closed, head ruling
-        # 1020+49), with no hard stop: it is the reversible tier
         notes = cc_event(ws, path="notes.txt")
-        out = gate_of(adapter)(notes, hold=HOLD, **kw_of(adapter, tmp_path))
-        assert out == cc.could_not_run("reversible", cc._what("Write", notes["tool_input"])) and "continue" not in out
+        assert gate_of(adapter)(notes, hold=HOLD, **kw_of(adapter, tmp_path)) == down
 
 
 @pytest.mark.parametrize("adapter", ["cc", "codex"])
@@ -218,9 +213,12 @@ def run_main(module, event):
 @pytest.mark.parametrize("module", [cc, cx])
 def test_main_in_a_slot_opens_no_local_queue(module, L, slot, ws, tmp_path, monkeypatch):
     monkeypatch.setattr(module, "_queue_for", lambda *a: pytest.fail("a local ConsentQueue in a slot"))
-    # an ungated call no contract can grant: main never reaches the broker (no broker account on a test machine)
+    # every call asks GATE (F10 S2b-2): the hook finds no broker account on a test machine and denies, with no local
+    # queue on the way
     ev = cc_event(ws, tool_name="Bash", tool_input={"command": "ls"}) if module is cc else cx_event(ws, gated=False)
-    assert run_main(module, ev) == ""
+    out = json.loads(run_main(module, ev))
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "the gate could not run" in out["hookSpecificOutput"]["permissionDecisionReason"]
     assert not (tmp_path / "home" / ".levain" / "consent").exists()
 
 
@@ -396,7 +394,7 @@ class FakeServer:
 
         self.dir = Path(tempfile.mkdtemp(prefix="bcf", dir="/tmp"))
         self.path = self.dir / "q.sock"
-        self.frames, self.requests, self.rate_limit_first = 0, 0, rate_limit_first
+        self.frames, self.requests, self.gates, self.rate_limit_first = 0, 0, 0, rate_limit_first
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.bind(str(self.path))
         self.sock.listen(8)
@@ -415,7 +413,10 @@ class FakeServer:
                     if msg is None:
                         continue
                     self.frames += 1
-                    if msg["op"] == "REQUEST":
+                    if msg["op"] == "GATE":
+                        self.gates += 1
+                        wire.write_frame(conn, {"id": msg["id"], "ok": True, "gate": "go"})
+                    elif msg["op"] == "REQUEST":
                         self.requests += 1
                         if self.rate_limit_first and self.requests == 1:
                             wire.write_frame(conn, {"id": msg["id"], "ok": False, "refused": "rate-limited"})
@@ -472,7 +473,7 @@ def test_the_same_fake_with_its_own_uid_expected_is_answered(adapter, fake, ws, 
     """The control for the case above: the refusal is the uid check, nothing else about the fake."""
     out = gate_of(adapter)(event_of(adapter, ws), hold=HOLD, **kw_of(adapter, tmp_path))
     assert f"allowed by {cc.SLOT_HOW}" in json.dumps(out)
-    assert fake.frames == 2
+    assert fake.frames == 3 and fake.gates == 1   # GATE (go), REQUEST, ANSWER?
 
 
 @pytest.mark.parametrize("module", [cc, cx])
