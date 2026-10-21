@@ -8,6 +8,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Added
 - **Choice sign requests.** A caller can file one card with 2-8 options (`levain-sign-choice/1`). You tap one on the phone and sign it with your passkey; the signature covers the message with your choice as its last line, so a verifier reads the decision from the signed bytes, checked with stock `ssh-keygen -Y verify`.
+  - A card can carry the caller's recommendation (`recommended`, one of its option keys). The phone marks it and never
+    selects it, and it is not signed: you still tap your choice.
+  - A card can take your own words (`write_in: true`): type an answer and it signs as the choice line
+    `(*): <your words>`, held to the same rules as an option's text (one line, 200 characters, nothing hidden). The
+    words are frozen and the exact line is shown from the moment you tap until the signing ends. A verifier reads a
+    write-in only when it asks for one (`parse_choice(..., write_in=True)`).
 - **A link straight onto one card.** `#sign=<id>` on the phone page opens it on that request. `levain consent phone --link-file` writes the page and token for a caller building such a link; `--token-file` keeps the token across restarts, so links you already hold keep working.
 - **Opt out of signed answers.** `levain consent signed-answers --set off|authority-only|all` (default authority-only) is read by a caller before it files: off files nothing; authority-only signs only answers that authorise an act.
 - **`levain coord`: one coordinator at a time.** A drop that arrives while nobody holds the coordinator role asks for
