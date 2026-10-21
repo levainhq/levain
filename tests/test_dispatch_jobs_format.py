@@ -20,18 +20,31 @@ from tests.test_dispatch_jobs import at_state, clock, new_store, repo  # noqa: F
 
 V1 = "levain-dispatch-jobs/1"
 V2 = "levain-dispatch-jobs/2"
-V2_SCHEMA = tuple(s for s in djobs._SCHEMA if "run_records" not in s)
+# the envelope binding (F11-C) joined /3 unreleased: neither 0.11.10 nor 0.11.12 had it
+F11C = ("job_envelopes", "job_threads")
+V3_PRE_F11C_SCHEMA = tuple(s for s in djobs._SCHEMA if not any(t in s for t in F11C))
+V2_SCHEMA = tuple(s for s in V3_PRE_F11C_SCHEMA if "run_records" not in s)
 V1_SCHEMA = tuple(s for s in V2_SCHEMA if "authorise_signatures" not in s)
 
 
 def old_store(tmp_path, clock, monkeypatch, repo, fmt, schema, state="verified"):
     """A store of format ``fmt`` holding one job at ``state``, written as the Levain of that format wrote it."""
+    # this code reads the envelope binding on every job load, so the job is walked with those tables present and
+    # they are dropped after, leaving the older Levain's tables exactly
+    f11c = tuple(s for s in djobs._SCHEMA if any(t in s for t in F11C))
     with monkeypatch.context() as m:
         m.setattr(djobs, "FORMAT", fmt)
-        m.setattr(djobs, "_SCHEMA", schema)
+        m.setattr(djobs, "_SCHEMA", schema + f11c)
         m.setattr(djobs, "_MIGRATES_FROM", frozenset())
         store = new_store(tmp_path, clock)
         job, _cap = at_state(store, repo, state)
+    conn = sqlite3.connect(store.directory / djobs.DB_NAME)
+    try:
+        for t in F11C:
+            conn.execute(f"DROP TABLE {t}")
+        conn.commit()
+    finally:
+        conn.close()
     return store.directory, job
 
 
@@ -83,6 +96,18 @@ def test_a_0_11_12_store_is_migrated_in_place_and_its_verifying_job_records_its_
     verify(store, repo, job, 0)
     assert store._transition(job.id, "failed", "verifier_refused", evidence="driver-timeout").state == "failed"
     assert len(store.run_records(job.id)) == 1
+
+
+def test_a_v3_store_made_before_f11c_gains_the_envelope_binding_in_place(tmp_path, clock, monkeypatch, repo):
+    d, job = old_store(tmp_path, clock, monkeypatch, repo, djobs.FORMAT, V3_PRE_F11C_SCHEMA)
+    path = d / djobs.DB_NAME
+    names, fmt = tables(path)
+    assert fmt == djobs.FORMAT and not set(F11C) & names
+    store = JobStore(d, clock=clock)
+    again = store.get(job.id)
+    assert again is not None and again.history == job.history and again.envelope_id is None
+    names, fmt = tables(path)
+    assert fmt == djobs.FORMAT and set(F11C) <= names
 
 
 def test_the_migration_leaves_meta_written_once(tmp_path, clock, monkeypatch, repo):

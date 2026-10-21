@@ -96,7 +96,8 @@ if TYPE_CHECKING:
     from levain.dispatch.adopt import ArtifactRecord
 
 __all__ = [
-    "CAUSES", "DB_NAME", "EDGES", "FORMAT", "STATES", "TERMINAL", "UNSIGNED_LEASE", "CapabilityRefused", "Job",
+    "CAUSES", "DB_NAME", "EDGES", "FORMAT", "STATES", "TERMINAL", "UNSIGNED_LEASE", "CapabilityRefused",
+    "EnvelopeRefused", "Job", "JobPrecondition", "Precondition",
     "JobStore", "JobStoreError", "SignatureRefused", "Transition", "TransitionRefused", "default_dispatch_dir",
 ]
 
@@ -106,7 +107,9 @@ FORMAT = "levain-dispatch-jobs/3"
 # the old ones (CREATE ... IF NOT EXISTS) and its marker rewritten in the same transaction; no row is rewritten.
 # /2 added the human authorise item and the base_moved edges (F11), so a Levain that knows only /1 refuses the
 # store instead of misreading a job it cannot transition. /3 added the run records and the verifier_refused cause
-# (W2-a), so a Levain that knows only /2 refuses the store instead of misreading a run it has no table for
+# (W2-a), so a Levain that knows only /2 refuses the store instead of misreading a run it has no table for. The
+# envelope binding (job_envelopes, job_threads and the envelope causes, F11-C) joined /3 before any release carried
+# /3, so no binary that knows /3 lacks them and the marker did not move again
 _MIGRATES_FROM = frozenset({"levain-dispatch-jobs/1", "levain-dispatch-jobs/2"})
 # how long an unsigned contract holds its write files before it lapses
 UNSIGNED_LEASE = timedelta(minutes=30)
@@ -141,9 +144,17 @@ _SERVICE_FAILURES = frozenset({"lease_lapsed", "budget_cap", "floor_refused"})
 _FILED = "filed"
 
 
+# the envelope causes (F11 §12, C0 §5): each is written ONLY by the method that runs the envelope's precondition in
+# the same transaction and writes its binding rows (``envelope`` by :meth:`JobStore.file_in_envelope`,
+# ``envelope_rule`` by :meth:`JobStore.authorise` with a precondition, ``envelope_ended`` by
+# :meth:`JobStore.end_envelope`), never by the private walk of the edge table
+_ENVELOPE_CAUSES = frozenset({"envelope", "envelope_rule", "envelope_ended"})
+
+
 def _edges() -> dict[tuple[str, str], frozenset[str]]:
     edges: dict[tuple[str, str], set[str]] = {
-        ("filed", "signed"): {"signature"},
+        # a contract filed inside a live envelope is a KNOW: the envelope's signature is its (C0 §5)
+        ("filed", "signed"): {"signature", "envelope"},
         ("signed", "queued"): {"slot_wait"},
         ("signed", "running"): {"slot_taken"},
         ("queued", "running"): {"slot_taken"},
@@ -152,8 +163,8 @@ def _edges() -> dict[tuple[str, str], frozenset[str]]:
         # the verifier said fail, or its infrastructure did (no report, or one refused): two causes, never one
         ("verifying", "failed"): {"verifier_fail", "verifier_refused"},
         ("verified", "recommended"): {"planner_recommends"},
-        ("verified", "authorised"): {"human_authorises", "human_adoption_rule"},
-        ("recommended", "authorised"): {"human_authorises", "human_adoption_rule"},
+        ("verified", "authorised"): {"human_authorises", "human_adoption_rule", "envelope_rule"},
+        ("recommended", "authorised"): {"human_authorises", "human_adoption_rule", "envelope_rule"},
         ("authorised", "adopted"): {"adopted"},
         ("authorised", "cancelled"): {"human_cancel"},
         # the verifier ran on the contract's base; a target that no longer reads it fails the result (F11 §6)
@@ -162,7 +173,8 @@ def _edges() -> dict[tuple[str, str], frozenset[str]]:
         ("authorised", "failed"): {"base_moved"},
     }
     for state in BEFORE_AUTHORISED:
-        edges.setdefault((state, "failed"), set()).update(_SERVICE_FAILURES)
+        # an ended envelope stops every job bound to it that is not yet authorised (C0 §5)
+        edges.setdefault((state, "failed"), set()).update(_SERVICE_FAILURES | {"envelope_ended"})
         edges.setdefault((state, "cancelled"), set()).update({"planner_cancel", "human_cancel"})
     return {k: frozenset(v) for k, v in edges.items()}
 
@@ -186,6 +198,29 @@ class SignatureRefused(DispatchError):
 
 class CapabilityRefused(DispatchError):
     """A planner-channel call whose capability is not the one the job was filed with."""
+
+
+class EnvelopeRefused(DispatchError):
+    """An envelope write its precondition (or its launch pin, or its binding) refused, inside the write's own
+    transaction: the message is the failing line, and nothing was written."""
+
+
+# the precondition the envelope object answers inside an authorise transaction: (that transaction's connection, its
+# stamp) -> the failing line, or None (C0 §9 item 2)
+Precondition = Callable[[sqlite3.Connection, str], "str | None"]
+# the filing and slot hooks also get the job as that transaction reads it (its contract's repo and write list, its
+# bound envelope and thread), so they judge "inside where" and "the same thread" without a second read
+JobPrecondition = Callable[[sqlite3.Connection, str, "Job"], "str | None"]
+
+
+def _hook(precondition: Callable[..., Any], *args: Any) -> None:
+    """Run an envelope hook in the caller's write transaction; anything but ``None`` refuses (nothing is written,
+    the transaction rolls back). An exception propagates as the fault it is."""
+    if not callable(precondition):
+        raise EnvelopeRefused("an envelope write needs its precondition")
+    problem = precondition(*args)
+    if problem is not None:
+        raise EnvelopeRefused(str(problem)[:500] or "the envelope's precondition refused")
 
 
 @dataclass(frozen=True)
@@ -214,6 +249,10 @@ class Job:
     store_id: str
     # the agent the filing door named (``claude_code`` / ``codex``), or None when it named none; never proven
     filer_agent: str | None = None
+    # the envelope a cause-envelope job was bound to AT FILING (the filer launch's pin) and the filer's thread; None
+    # for every other job. An envelope's LandGrant is resolved only through this binding (F11 §3 (C))
+    envelope_id: str | None = None
+    thread_id: str | None = None
 
     @property
     def state(self) -> str:
@@ -296,6 +335,20 @@ _SCHEMA = (
     "CREATE TRIGGER IF NOT EXISTS run_records_no_replace BEFORE INSERT ON run_records "
     "WHEN EXISTS (SELECT 1 FROM run_records WHERE (job_id = NEW.job_id AND run = NEW.run) OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a run record is never replaced'); END",
+    # a cause-envelope job's binding (F11 §12, C0 §9 item 6): the envelope the filer launch was PINNED to, never the
+    # envelope's current head, and the filer's thread, written in the filing transaction; once, never replaced
+    "CREATE TABLE IF NOT EXISTS job_envelopes (job_id TEXT PRIMARY KEY REFERENCES jobs(id), envelope_id TEXT NOT NULL, "
+    "thread_id TEXT NOT NULL, bound_at TEXT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS job_envelopes_envelope ON job_envelopes (envelope_id)",
+    *_append_only("job_envelopes", "a job envelope is bound once"),
+    "CREATE TRIGGER IF NOT EXISTS job_envelopes_no_replace BEFORE INSERT ON job_envelopes "
+    "WHEN EXISTS (SELECT 1 FROM job_envelopes WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a job envelope is never replaced'); END",
+    "CREATE TABLE IF NOT EXISTS job_threads (job_id TEXT PRIMARY KEY REFERENCES jobs(id), thread_id TEXT NOT NULL)",
+    *_append_only("job_threads", "a job thread is recorded once"),
+    "CREATE TRIGGER IF NOT EXISTS job_threads_no_replace BEFORE INSERT ON job_threads "
+    "WHEN EXISTS (SELECT 1 FROM job_threads WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a job thread is never replaced'); END",
     "CREATE TRIGGER IF NOT EXISTS cancel_signatures_no_replace BEFORE INSERT ON cancel_signatures "
     "WHEN EXISTS (SELECT 1 FROM cancel_signatures WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a cancel is never replaced'); END",
@@ -414,6 +467,25 @@ def _stored_record(job_id: str, run: Any, text: Any, digest: Any) -> ArtifactRec
         raise JobStoreError(f"run {run} of job {job_id} holds a record that does not match its digest; the dispatch "
                             "store is damaged")
     return rec
+
+
+def _binding_problem(job: Job, evidence: str) -> str | None:
+    """Why the intent ``evidence`` of an ``envelope_rule`` authorisation does not name ``job``'s own binding (the
+    envelope its filer launch was pinned to and the filer's thread); ``None`` when it does. A LandGrant is resolved
+    only through the filing's binding, never from what a caller says (F11 §3 (C))."""
+    if job.envelope_id is None:
+        return f"job {job.id} was not filed inside an envelope; an envelope cannot authorise it"
+    try:
+        intent = json.loads(evidence)
+    except ValueError:
+        intent = None
+    named = intent.get("envelope") if isinstance(intent, dict) else None
+    if not isinstance(named, dict):
+        return "the intent names no envelope"
+    if named.get("envelope_id") != job.envelope_id or named.get("thread_id") != job.thread_id:
+        return (f"the envelope is not the one job {job.id} was bound to at filing ({job.envelope_id}, thread "
+                f"{job.thread_id})")
+    return None
 
 
 def _label(name: str, value: Any, high: int) -> str:
@@ -541,10 +613,13 @@ class JobStore:
             "SELECT seq, to_state, cause, at, evidence FROM transitions WHERE job_id = ? ORDER BY seq", (job_id,)))
         signer = conn.execute("SELECT signer_fp FROM signatures WHERE job_id = ?", (job_id,)).fetchone()
         filer = conn.execute("SELECT agent FROM job_filers WHERE job_id = ?", (job_id,)).fetchone()
+        bound = conn.execute("SELECT envelope_id, thread_id FROM job_envelopes WHERE job_id = ?",
+                             (job_id,)).fetchone()
         return Job(id=row[0], digest=row[1], contract_text=row[2], filed_at=row[3], filer_session=row[4],
                    idem_key=row[5], repo=row[6], expires_at=row[7], unsigned_until=row[8], history=history,
                    signer_fp=None if signer is None else signer[0], store_id=cls._store_id(conn),
-                   filer_agent=None if filer is None else filer[0])
+                   filer_agent=None if filer is None else filer[0],
+                   envelope_id=None if bound is None else bound[0], thread_id=None if bound is None else bound[1])
 
     def _must_load(self, conn: sqlite3.Connection, job_id: Any) -> Job:
         job = self._load(conn, job_id) if isinstance(job_id, str) and _JOB_ID.fullmatch(job_id) else None
@@ -614,6 +689,36 @@ class JobStore:
         resolved at its job's own filing time, so a replay after the contract expired still returns that job (in
         whatever state it is now). The same key with another digest is refused. Filing is refused while another live
         job in the same repo writes the same path or an ancestor or descendant of one, compared without case."""
+        return self._file(submission, resolve_template=resolve_template, policy=policy, filer_session=filer_session,
+                          idem_key=idem_key, filer_agent=filer_agent, envelope=None)
+
+    def file_in_envelope(self, submission: Any, *, resolve_template: Callable[[str], ResolvedTemplate | None],
+                         policy: ProviderPolicy, filer_session: str, pin: str | None, thread_id: str,
+                         precondition: JobPrecondition, idem_key: str | None = None,
+                         filer_agent: str | None = None) -> tuple[Job, str | None]:
+        """File ``submission`` as :meth:`file` does and take it ``filed -> signed`` with cause ``envelope`` in the SAME
+        write transaction (a contract inside an envelope is a KNOW: the envelope's signature is its, C0 §5),
+        writing ``job_envelopes(job_id, envelope_id=pin, thread_id, bound_at)`` and ``job_threads(job_id,
+        thread_id)`` beside it. ``pin`` is the envelope the filer LAUNCH is pinned to, never the envelope's current
+        head; a filing with no pin is an :class:`EnvelopeRefused`. ``precondition(conn, stamp, job)`` runs in that
+        transaction, on its connection and clock, with the job as filed and bound there; it re-checks the envelope is
+        live, the contract's repo and write list lie inside its ``where`` and the thread is the launch's, and any
+        line it returns refuses the filing with nothing written. A replay of the same ``(filer_session, idem_key)``
+        returns the job only when it is bound to this pin and thread. Python API only: no CLI, MCP or phone verb
+        files a cause-envelope job (F11 §12: refused until S1 and the run supervisor exist)."""
+        if not isinstance(pin, str) or not pin:
+            raise EnvelopeRefused("a filing with cause envelope names its launch's pinned envelope; this launch has "
+                                  "no pin")
+        pin = _label("pin", pin, _SESSION_MAX)
+        thread_id = _label("thread_id", thread_id, _SESSION_MAX)
+        if not callable(precondition):
+            raise EnvelopeRefused("a filing with cause envelope needs its precondition")
+        return self._file(submission, resolve_template=resolve_template, policy=policy, filer_session=filer_session,
+                          idem_key=idem_key, filer_agent=filer_agent, envelope=(pin, thread_id, precondition))
+
+    def _file(self, submission: Any, *, resolve_template: Callable[[str], ResolvedTemplate | None],
+              policy: ProviderPolicy, filer_session: str, idem_key: str | None, filer_agent: str | None,
+              envelope: tuple[str, str, JobPrecondition] | None) -> tuple[Job, str | None]:
         filer_session = _label("filer_session", filer_session, _SESSION_MAX)
         if filer_agent is not None:
             filer_agent = _label("filer_agent", filer_agent, _AGENT_MAX)
@@ -638,6 +743,10 @@ class JobStore:
                             "lost capability cannot be re-issued")
                     job = self._load(conn, row[0])
                     assert job is not None
+                    bound = None if envelope is None else envelope[:2]
+                    if (job.envelope_id, job.thread_id) != (bound or (None, None)):
+                        raise ContractRefused(f"idem_key {idem_key!r} already filed job {row[0]} under another "
+                                              "envelope binding (or none); a replay resends the same filing")
                     return job, None
                 if prior is not None:
                     # the row read before resolving is gone: the store is append-only, so this is not a replay
@@ -679,6 +788,17 @@ class JobStore:
                          (job_id, stamp, json.dumps({"filer_session": filer_session}, sort_keys=True)))
             if filer_agent is not None:
                 conn.execute("INSERT INTO job_filers (job_id, agent) VALUES (?, ?)", (job_id, filer_agent))
+            if envelope is not None:
+                pin, thread_id, precondition = envelope
+                conn.execute("INSERT INTO job_envelopes (job_id, envelope_id, thread_id, bound_at) "
+                             "VALUES (?, ?, ?, ?)", (job_id, pin, thread_id, stamp))
+                conn.execute("INSERT INTO job_threads (job_id, thread_id) VALUES (?, ?)", (job_id, thread_id))
+                as_filed = self._load(conn, job_id)
+                assert as_filed is not None
+                # the whole predicate, on this transaction's connection and clock: a refusal rolls the filing back
+                _hook(precondition, conn, stamp, as_filed)
+                self._apply(conn, job_id, "signed", "envelope", stamp,
+                            json.dumps({"envelope_id": pin, "thread_id": thread_id}, sort_keys=True))
             job = self._load(conn, job_id)
         assert job is not None
         return job, capability
@@ -812,20 +932,34 @@ class JobStore:
         return out
 
     def authorise(self, job_id: str, *, cause: str, evidence: str,
-                  human: tuple[Any, Any, AuthoritySource, Callable[..., str | None]] | None = None) -> Job:
+                  human: tuple[Any, Any, AuthoritySource, Callable[..., str | None]] | None = None,
+                  precondition: Precondition | None = None) -> Job:
         """``verified``/``recommended`` -> ``authorised`` for ``cause`` with the INTENT ``evidence`` (F11 §6 step 1),
         in one write transaction. ``human`` is ``(payload, signature, authority, refusal)`` for the human authorise
         item: ``authority`` is replayed afresh inside the transaction, ``refusal(payload, signature, snapshot, job,
         ssh_keygen=...)`` judges it (``levain.dispatch.adopt.authorise_refusal``), and the signed item is stored in
         ``authorise_signatures`` with the transition; refusals and machine faults are told apart as :meth:`sign`
-        tells them. Without ``human`` the cause must not be ``human_authorises``."""
+        tells them. Without ``human`` the cause must not be ``human_authorises``.
+
+        ``precondition(conn, stamp)`` (the envelope object's, F11 §12) runs inside this transaction, on its connection
+        and clock, after the state check and before anything is written; a line it returns is an
+        :class:`EnvelopeRefused` and nothing is written. Cause ``envelope_rule`` needs it, and needs the job bound to
+        an envelope at filing with the intent's ``envelope.envelope_id`` and ``envelope.thread_id`` that binding's."""
         if (cause == "human_authorises") != (human is not None):
             raise TransitionRefused("human_authorises is written with the human's signed item, and only it")
+        if cause == "envelope_rule" and precondition is None:
+            raise EnvelopeRefused("envelope_rule is written with the envelope's precondition, and only with it")
         with self._swept() as (conn, stamp):
             job = self._must_load(conn, job_id)
             if job.state not in ("verified", "recommended"):
                 raise TransitionRefused(f"job {job.id} is {job.state}; only a verified or recommended job is "
                                         "authorised")
+            if cause == "envelope_rule":
+                problem = _binding_problem(job, evidence)
+                if problem is not None:
+                    raise EnvelopeRefused(problem)
+            if precondition is not None:
+                _hook(precondition, conn, stamp)
             if human is not None:
                 payload, signature, authority, refusal = human
                 if type(authority) is not AuthoritySource:
@@ -1005,15 +1139,60 @@ class JobStore:
                 "SELECT id FROM jobs WHERE (? IS NULL OR repo = ?) ORDER BY filed_at, id", (repo, repo))]
             return [job for job in (self._load(conn, i) for i in ids) if job is not None]
 
+    def take_slot(self, job_id: str, *, precondition: JobPrecondition | None = None) -> Job:
+        """``signed``/``queued`` -> ``running`` (cause ``slot_taken``) in one write transaction. A job filed inside an
+        envelope goes ``-> running`` only here, and only with ``precondition(conn, stamp, job)``, run in that
+        transaction on its connection and clock (C0 §5: §4.5 liveness and the whole predicate at every leg); a line it
+        returns is an :class:`EnvelopeRefused` and nothing is written. For any other job a precondition, when given,
+        runs the same way. The run supervisor (S1 + C-sessions) is its one caller to be; none exists yet."""
+        with self._swept() as (conn, stamp):
+            job = self._must_load(conn, job_id)
+            if job.envelope_id is not None and precondition is None:
+                raise EnvelopeRefused(f"job {job.id} was filed inside an envelope; it runs only with the envelope's "
+                                      "precondition, checked as it starts")
+            if job.state not in ("signed", "queued"):
+                raise TransitionRefused(f"job {job.id} is {job.state}; only a signed or queued job takes a slot")
+            if precondition is not None:
+                _hook(precondition, conn, stamp, job)
+            self._apply(conn, job.id, "running", "slot_taken", stamp)
+            out = self._load(conn, job.id)
+        assert out is not None
+        return out
+
+    def end_envelope(self, envelope_id: str, *, why: str = "") -> tuple[str, ...]:
+        """Envelope ``envelope_id`` ended (an attenuation, a supersede that no longer covers, a revision, its stop, a
+        revoked key, C0 §5): every job bound to it at filing that is not yet authorised goes ``failed`` with cause
+        ``envelope_ended``, in one write transaction, releasing its write files; returns their ids. An authorised
+        job keeps its intent (F11 §6's linearisation point): only a human cancel undoes it. Killing the processes
+        of a running job is the run supervisor's (an interface it owes), not this store's."""
+        envelope_id = _label("envelope_id", envelope_id, _SESSION_MAX)
+        evidence = json.dumps({"envelope_id": envelope_id, "why": str(why)[:500]}, sort_keys=True)
+        placeholders = ",".join("?" * len(BEFORE_AUTHORISED))
+        with self._swept() as (conn, stamp):
+            rows = conn.execute(
+                f"SELECT e.job_id FROM job_envelopes e JOIN ({_CURRENT}) c ON c.job_id = e.job_id "
+                f"WHERE e.envelope_id = ? AND c.to_state IN ({placeholders}) ORDER BY e.job_id",
+                (envelope_id, *BEFORE_AUTHORISED)).fetchall()
+            for (job_id,) in rows:
+                self._apply(conn, job_id, "failed", "envelope_ended", stamp, evidence)
+        return tuple(r[0] for r in rows)
+
     def _transition(self, job_id: str, to_state: str, cause: str, *, evidence: str = "",
                     expect: str | None = None) -> Job:
         """Any edge of :data:`EDGES`, for the slices that own its cause (runs, the verifier, adoption) and for the
         tests that walk the table; no public caller exists in this slice. ``expect``: the state the caller read the job
-        in; another state now (another writer moved it) refuses, even where the edge itself is allowed from both."""
+        in; another state now (another writer moved it) refuses, even where the edge itself is allowed from both.
+        The envelope causes are refused here (each is written only by its own method, with its binding and its
+        precondition), and so is ``-> running`` for a job filed inside an envelope (:meth:`take_slot`)."""
+        if cause in _ENVELOPE_CAUSES:
+            raise TransitionRefused(f"{cause!r} is written only with its envelope's binding and precondition")
         with self._swept() as (conn, stamp):
             job = self._must_load(conn, job_id)
             if expect is not None and job.state != expect:
                 raise TransitionRefused(f"job {job.id} is {job.state}, not the {expect} it was read as")
+            if to_state == "running" and job.envelope_id is not None:
+                raise TransitionRefused(f"job {job.id} was filed inside an envelope; it runs only through take_slot "
+                                        "with the envelope's precondition")
             self._apply(conn, job.id, to_state, cause, stamp, evidence)
             out = self._load(conn, job.id)
         assert out is not None

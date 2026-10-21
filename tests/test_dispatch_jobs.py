@@ -196,7 +196,20 @@ def test_every_operation_sweeps_first(store, repo, clock):
 
 # --- the edge table ------------------------------------------------------------------------------------------------
 
-EDGE_CASES = sorted((f, t, c) for (f, t), causes in EDGES.items() for c in causes)
+# the envelope causes are taken only by their own methods, with their binding and precondition (F11-C:
+# tests/test_dispatch_envelope.py walks each); the private walk refuses them
+ENVELOPE_CAUSES = {"envelope", "envelope_rule", "envelope_ended"}
+EDGE_CASES = sorted((f, t, c) for (f, t), causes in EDGES.items() for c in causes if c not in ENVELOPE_CAUSES)
+
+
+@pytest.mark.parametrize("from_state, to_state, cause",
+                         sorted((f, t, c) for (f, t), cs in EDGES.items() for c in cs if c in ENVELOPE_CAUSES))
+def test_the_private_walk_refuses_every_envelope_cause(tmp_path, clock, repo, from_state, to_state, cause):
+    store = new_store(tmp_path, clock)
+    job, _ = at_state(store, repo, from_state)
+    with pytest.raises(TransitionRefused, match="written only with its envelope"):
+        store._transition(job.id, to_state, cause)
+    assert store.get(job.id).history == job.history
 
 
 @pytest.mark.parametrize("from_state, to_state, cause", EDGE_CASES)
@@ -231,7 +244,11 @@ def test_the_table_has_the_specified_shape():
     assert EDGES[("authorised", "failed")] == {"base_moved"}
     assert "base_moved" in EDGES[("verified", "failed")] and "base_moved" in EDGES[("recommended", "failed")]
     assert EDGES[("verified", "authorised")] == EDGES[("recommended", "authorised")] == {
-        "human_authorises", "human_adoption_rule"}
+        "human_authorises", "human_adoption_rule", "envelope_rule"}
+    assert EDGES[("filed", "signed")] == {"signature", "envelope"}
+    for f in ("filed", "signed", "queued", "running", "verifying", "verified", "recommended"):
+        assert "envelope_ended" in EDGES[(f, "failed")]
+    assert "envelope_ended" not in EDGES[("authorised", "failed")]
 
 
 def test_an_unknown_job_is_refused(store):
