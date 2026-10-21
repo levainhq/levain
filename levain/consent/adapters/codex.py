@@ -92,6 +92,8 @@ from levain.consent.adapters.claude_code import (  # noqa: F401 - GATE_TIMEOUT i
     RULING_TEXT, UNCONFINED_ENV, U_IRR, U_REV, _pre, _what, floor_text, notify, send_repings, unconfined,
     unconfined_state,
 )
+from levain.consent.adapters.claude_code import DEFAULT_GATE_HOLD, SLOT_HOW, queue_socket_planted
+from levain.consent.broker_client import in_slot
 from levain.consent.adapters.claude_code import targets_agent_config as _claude_targets_agent_config
 from levain.consent.policy import AGENT_CONFIG_TIER
 from levain.consent.queue import DB_NAME as QUEUE_DB_NAME
@@ -393,7 +395,12 @@ def gate_output(decision: Decision) -> dict[str, Any]:
         how = f"your standing consent grant {decision.grant_id}"
     else:
         how = f"a signed levain answer (key {decision.signer_fp})"
-    if decision.decision == "allow":
+    return decision_output(decision.decision, how)
+
+
+def decision_output(decision: str, how: str) -> dict[str, Any]:
+    """:func:`gate_output`'s words for ``decision`` (``allow`` or ``deny``) by the authority ``how`` names."""
+    if decision == "allow":
         return {"hookSpecificOutput": {"hookEventName": GATE_EVENT,
                                        "additionalContext": f"levain: this call is allowed by {how}."}}
     return _deny(f"levain: denied by {how}. Do not retry it and do not achieve it another way.")
@@ -509,12 +516,9 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
             _ledger_note(Path(queue.directory), event, session, str(tool_name), tool_input,
                          cwd if isinstance(cwd, str) else "", refused="halted")
             return _with_rulings(_deny(HALT_TEXT.format(n=halted)), queue, session)
-    missing = [k for k, v in (("session_id", session), ("tool_name", tool_name),
-                              ("cwd", cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None))
-               if not isinstance(v, str) or not v]
+    missing = _missing_of(event)
     if missing:
-        return _deny(f"levain: the hook event has no valid {', '.join(missing)}, so the action was NOT taken. Do not "
-                     "retry it and do not achieve it another way.")
+        return _missing_output(missing)
     if tool_input is None:
         tool_input = {}
     limited = _limits(event, queue, settings, session, tool_name, tool_input, cwd, home=home, codex_dir=codex_dir)
@@ -529,6 +533,19 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     out = _gate_call(event, queue, settings, tool_name, tool_input, cwd, session, home=home, codex_dir=codex_dir,
                      sleep=sleep, still_away=still_away)
     return _with_rulings(out, queue, session)
+
+
+def _missing_of(event: Mapping[str, Any]) -> list[str]:
+    session, tool_name, cwd = event.get("session_id"), event.get("tool_name"), event.get("cwd")
+    return [k for k, v in (("session_id", session), ("tool_name", tool_name),
+                           ("cwd", cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None))
+            if not isinstance(v, str) or not v]
+
+
+def _missing_output(missing: list[str]) -> dict[str, Any]:
+    """The deny for an event missing a required field (:func:`gate`'s, and the slot gate's)."""
+    return _deny(f"levain: the hook event has no valid {', '.join(missing)}, so the action was NOT taken. Do not "
+                 "retry it and do not achieve it another way.")
 
 
 def _limits(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, session: str, tool_name: str,
@@ -704,8 +721,90 @@ def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[
         tier, what = "irreversible", "this call"
     if tier is None and not os.path.lexists(queue_dir / QUEUE_DB_NAME):
         return None
+    return could_not_run(what)
+
+
+def could_not_run(what: str) -> dict[str, Any]:
+    """:func:`gate_failed`'s deny (no hard stop: on Codex the latch is the stop); the slot gate's too."""
     return _deny(f"levain: the gate could not run, so the action was NOT taken: {what}. Do not retry it and do "
                  "not achieve it another way.")
+
+
+# --- the slot gate (F10 S2a): Claude Code's (:func:`levain.consent.adapters.claude_code.slot_gate`), in Codex's
+# words. A slot has no local queue, so it has no halt latch either: an undecided irreversible call is denied with
+# U-IRR's words, and nothing denies the session's later calls (the operator side holds the gap)
+
+def slot_gate(event: Any, *, home: Path | None = None, codex_dir: Path | None = None, client: Any = None,
+              hold: float = DEFAULT_GATE_HOLD, sleep: Callable[[float], None] = time.sleep,
+              monotonic: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
+    """The slot's gate output for one Codex ``PreToolUse`` event, or ``None`` (the call goes on). An event missing
+    a required field is denied (:func:`_missing_output`); a call :func:`gate_class` does not gate (protected paths:
+    none) gets ``None``; a gated call is filed with the broker (``client``, default
+    :meth:`~levain.consent.broker_client.BrokerClient.from_env`), held up to ``hold`` for a decision the broker
+    verified (:func:`decision_output`), and at the end of the hold denied with :func:`undecided_output`, its gap
+    named by the request id. Anything else once the call is gated (a settings file naming the socket variable,
+    :func:`queue_socket_planted`; no socket or cap; the broker unreachable, refusing or out of shape) is
+    :func:`could_not_run`'s deny."""
+    from levain.consent import broker_client
+
+    if not isinstance(event, Mapping) or event.get("hook_event_name") != GATE_EVENT:
+        return None
+    missing = _missing_of(event)
+    if missing:
+        return _missing_output(missing)
+    tool_name, tool_input, cwd, session = event["tool_name"], event.get("tool_input", {}), event["cwd"], \
+        event["session_id"]
+    if tool_input is None:
+        tool_input = {}
+    try:
+        git_cache: dict[Any, Any] = {}   # one git budget for the call, its description included
+        tier = gate_class(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, git_cache=git_cache)
+        if tier is None:
+            return None
+        what = _call_what(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, git_cache=git_cache)
+    except Exception:  # noqa: BLE001 - a call that cannot be classified is denied
+        return could_not_run("this call")
+    try:
+        if queue_socket_planted(cwd, home=home, codex_home=codex_dir):
+            return could_not_run(what)
+        client = client if client is not None else broker_client.BrokerClient.from_env()
+        tool_use_id = event.get("tool_use_id")
+        request = broker_client.gate_request(
+            agent=AGENT, session=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
+            event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None,
+            tier=AGENT_CONFIG_TIER, hold=hold)
+        client.request(request)
+        decision = broker_client.hold_for_decision(client, request.id, hold, poll=GATE_POLL, sleep=sleep,
+                                                   monotonic=monotonic)
+    except Exception:  # noqa: BLE001 - fail closed: the broker down, refusing or malformed is a deny
+        return could_not_run(what)
+    if decision is None:
+        return undecided_output(tier, what, request.id)
+    return decision_output(decision, SLOT_HOW)
+
+
+def _slot_main(stdin: IO[str], stdout: IO[str]) -> int:
+    """:func:`main` in a slot session: no ConsentQueue, no settings file, no ledger. Always exits 0."""
+    event: Any = None
+    try:
+        event = json.loads(stdin.read())
+        out = slot_gate(event) if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT \
+            else None   # a PermissionRequest in a slot: no decision
+        if out is not None:
+            stdout.write(json.dumps(out) + "\n")
+            stdout.flush()
+    except BaseException as exc:  # noqa: BLE001 - every failure is no decision, never allow; a gated one a deny
+        if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
+            try:
+                stdout.write(json.dumps(could_not_run("this call")) + "\n")
+                stdout.flush()
+            except BaseException:
+                pass
+        try:
+            print(f"levain consent hook: no decision ({type(exc).__name__}: {exc})"[:500], file=sys.stderr)
+        except Exception:
+            pass
+    return 0
 
 
 def _queue_for(queue_dir: Path, settings: AdapterSettings) -> ConsentQueue:
@@ -720,12 +819,16 @@ def _queue_for(queue_dir: Path, settings: AdapterSettings) -> ConsentQueue:
 def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO[str] | None = None) -> int:
     """The hook entry point, for both events the one script is wired to: ``PermissionRequest`` (:func:`decide`)
     and ``PreToolUse`` (:func:`gate`). Always exits 0 (any other exit fails open on Codex). A PermissionRequest
-    prints a decision only when the core verified one; a PreToolUse whose gate raised prints :func:`gate_failed`."""
+    prints a decision only when the core verified one; a PreToolUse whose gate raised prints :func:`gate_failed`. In
+    a slot session (:func:`levain.consent.broker_client.in_slot`) it is :func:`_slot_main` instead, and opens no
+    queue."""
     stdin = stdin if stdin is not None else sys.stdin
     stdout = stdout if stdout is not None else sys.stdout
     event: Any = None
     queue_dir: Path | None = None
     settings = AdapterSettings()
+    if in_slot():
+        return _slot_main(stdin, stdout)
     try:
         parser = argparse.ArgumentParser(prog="levain-consent-codex")
         parser.add_argument("--queue-dir", default=None)
