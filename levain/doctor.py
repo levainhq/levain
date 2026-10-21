@@ -138,6 +138,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_floor_placeholders())
     core.extend(_check_store(install))
     core.extend(_check_baton(install))
+    core.extend(_check_host_awake())
     core.extend(_check_cockpit_authority(install))
     core.extend(_check_continuity_headroom(install))
     core.extend(_check_compat_set(install))
@@ -318,6 +319,28 @@ def _check_consent_limits() -> list[CheckResult]:
                             f"Look at {qdir / limits.DB_NAME}: a full disk, a store of another levain version or a "
                             "corrupt file. The next call is counted once it can be written.", warn=True)]
     return [CheckResult(name, True, detail)]
+
+
+def _check_host_awake() -> list[CheckResult]:
+    """Why this host will or will not sleep (C7): whether the idle-sleep assertion is held for a working work thread.
+    Advisory: no row until a coordinator store exists; never a failure, because sleeping with nothing working is the
+    machine's own setting."""
+    from levain.install import _consent_queue_dir
+
+    name = "host sleep"
+    qdir = _consent_queue_dir()
+    if not (qdir / "dispatch.db").is_file():
+        return []
+    try:
+        from levain.coordinator import awake
+        from levain.coordinator.store import CoordStore
+
+        store = CoordStore(qdir)
+        n = len(awake.working(store))
+        ok, line = awake.describe(qdir, working_count=n)
+    except Exception as exc:      # noqa: BLE001 - a doctor row never crashes the run
+        return [CheckResult(name, True, f"not read: {exc}", warn=True)]
+    return [CheckResult(name, True, line, warn=not ok)]
 
 
 def _check_dispatch_adoption_rules() -> list[CheckResult]:
