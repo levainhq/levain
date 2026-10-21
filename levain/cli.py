@@ -2512,7 +2512,8 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
                                "refused.")
     cs_phone.add_argument("--link-file", dest="link_file", type=Path, default=None,
                           help="Also write this run's page link and phone token to FILE (JSON, mode 0600), for a "
-                               "caller that builds a link straight onto one sign request's card (#sign=<id>).")
+                               "caller that builds a link straight onto one sign request's card (#sign=<id>); removed "
+                               "when this run stops. Its token changes every run unless --token-file keeps it.")
     cs_phone.add_argument("--token-file", dest="token_file", type=Path, default=None,
                           help="Keep the phone token in FILE (mode 0600): read it from there when FILE exists, else "
                                "make one and write it, so a restart keeps the links the phone already holds.")

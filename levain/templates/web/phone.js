@@ -77,8 +77,12 @@
     list.replaceChildren(...linked.map((r) => signCard(r, data.sign_note, true)), ...asks.map(questionCard),
                          ...rest.map((r) => signCard(r, data.sign_note)), ...jobs.map(dispatchCard),
                          ...rows.map((r) => row(r, false)), ...gaps.map((r) => row(r, true)));
-    if (focus && !linked.length && !busy)
-      $("status").textContent += " \u00b7 the linked sign request " + focus + " is not open here (signed, denied, expired or not filed)";
+    // said once: after the linked card is signed or denied here, the next redraw drops the link without a note
+    if (focus && !linked.length && !busy) {
+      if (!/^(signed|denied) /.test(last))
+        $("status").textContent += " \u00b7 the linked sign request " + focus + " is not open here (signed, denied, expired or not filed)";
+      focus = "";
+    }
     if (linked.length && !draw.scrolled) { draw.scrolled = true; list.firstChild.scrollIntoView({ block: "start" }); }
     const enrolled = Array.isArray(data.enrolled) ? data.enrolled : [];
     const local = mine();
@@ -419,8 +423,12 @@
         b.addEventListener("click", go(o.key));
         actions.appendChild(b);
       }
-      if (options.length) card.appendChild(el("div", "where", "an option signs the message with its line appended: "
-        + options.map((o) => o.line).join(" | ")));
+      if (options.length) {
+        const lines = el("div", "where lines", "an option signs the boxed message with its line appended (the title "
+          + "and sender above are not signed):");
+        for (const o of options) lines.appendChild(el("div", "line", o.line));
+        card.appendChild(lines);
+      }
     }
     const d = el("button", "deny", options.length ? "deny all" : "deny");
     d.type = "button";
