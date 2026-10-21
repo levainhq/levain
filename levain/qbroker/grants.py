@@ -109,21 +109,26 @@ def grant_member_refusal(request: ExternalGateRequest, member: Any) -> str | Non
     return None
 
 
-def agent_config_path(paths: Any, cwd: str) -> str | None:
-    """The first of ``paths`` that is agent config or hooks by its PATH, read with the consent adapters' own
-    path predicates (Claude Code's config-path test, Codex's ``.codex`` test; imported, one rule each), else
-    ``None``. Path-only on purpose: the broker runs no git (git's ``core.hooksPath`` answer is the hook's, and a
-    hooks path the hook gates never reaches this as an ungated call). A path that cannot be read, or a check that
-    raises, counts as agent config (fail closed: gated)."""
+def agent_config_path(paths: Any, cwd: str, agent: str) -> str | None:
+    """The first of ``paths`` that is agent config or hooks by its PATH for a request of ``agent``, read with the
+    consent adapters' own path predicates (imported, one rule each) as that agent's own classifier reads them
+    (L3 r1 triage R3): Claude Code's config-path test for both agents (Codex's classifier applies it too), Codex's
+    "anything beneath ``.codex``" test for a Codex request only, so a Claude Code write to ``.codex/notes.md`` is not
+    agent config here, as it is not to its hook. A request of any other agent gets both (gated wins). Else ``None``.
+    Path-only on purpose: the broker runs no git (git's ``core.hooksPath`` answer is the hook's, and a hooks path the
+    hook gates never reaches this as an ungated call). A path that cannot be read, or a check that raises, counts as
+    agent config (fail closed: gated)."""
+    from levain.consent.adapters.claude_code import AGENT as CLAUDE_AGENT
     from levain.consent.adapters.claude_code import _is_config_path
     from levain.consent.adapters.codex import CODEX_DIR_NAME, _in_codex_config
 
     if not isinstance(paths, (list, tuple)) or not paths or not isinstance(cwd, str):
         return "<no paths>"
+    codex_rule = agent != CLAUDE_AGENT
     for p in paths:
         try:
             if not isinstance(p, str) or _is_config_path(Path(p)) or _is_config_path(Path(os.path.realpath(p))) \
-                    or _in_codex_config(p, cwd, Path("/"), Path(cwd) / CODEX_DIR_NAME):
+                    or (codex_rule and _in_codex_config(p, cwd, Path("/"), Path(cwd) / CODEX_DIR_NAME)):
                 return str(p)
         except Exception:  # noqa: BLE001 - unreadable is gated
             return str(p)
@@ -241,7 +246,7 @@ def decide(*, kind: str, run: Mapping[str, Any] | None, request: ExternalGateReq
             return Queue("the session is not a dispatch session")
         if request.tier == AGENT_CONFIG_TIER:
             return Queue("the request is sealed at the agent-config tier: never granted, the operator answers it")
-        config = agent_config_path(paths, request.cwd)
+        config = agent_config_path(paths, request.cwd, request.agent)
         if config is not None:
             return Queue(f"{config[:120]} is agent config or hooks: never granted, the operator answers it")
         if directory is None or owner_uid is None:

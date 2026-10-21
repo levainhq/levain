@@ -37,7 +37,10 @@ member and ``"ungated": true``, so a dispatch run's signed contract can allow it
 broker answers :data:`GO`, and GO IS NOT ALLOW: the adapter gives no decision and the session's own mode decides,
 exactly as before the broker was asked. Only an explicit GO does that: a failure is a deny, as for a gated call.
 :func:`grant_member` reads the paths with :func:`levain.dispatch.grant.grant_paths`; a call that is not
-grantable, or whose parse is not total, gets no member and is not sent. :func:`gate_request` given the member seals
+grantable, or whose parse is not total, gets no member, and a failure to read it raises (the adapter denies). A file
+write with no member (a MultiEdit, a relative path, an extra key) is still sent ``ungated``, with no ``grant``
+(L3 r1 triage R1): outside a dispatch session the broker answers GO, inside one it files the call for the operator
+(nothing to bind a grant to). :func:`gate_request` given the member seals
 the request with the ``pb1:`` digest of the same paths and input (:func:`levain.dispatch.grant.input_bound_digest`:
 one function for the digest, so the hook and the broker cannot compute it two ways). The hook does not know its
 session's kind and does not need to: whether a member grants anything is the broker's decision, from CONTROL's word
@@ -65,8 +68,8 @@ from levain.consent.record import ExternalGateRequest, redact_display, tool_inpu
 from levain.qbroker import wire
 
 __all__ = ["BROKER_ACCOUNT", "CAP_ENV", "FAST_POLLS", "GO", "IO_TIMEOUT", "PENDING_REFUSALS", "REQUEST_RETRY",
-           "SLOW_POLL", "SOCKET_ENV", "BrokerClient", "BrokerError", "UNGATED_TIER", "broker_uid", "file_and_hold", "file_ungated", "gate_request",
-           "grant_member", "hold_for_decision", "in_slot"]
+           "SLOW_POLL", "SOCKET_ENV", "BrokerClient", "BrokerError", "UNGATED_TIER", "broker_uid", "file_and_hold",
+           "file_ungated", "gate_request", "grant_member", "hold_for_decision", "in_slot"]
 
 SOCKET_ENV = "LEVAIN_QUEUE_SOCKET"
 CAP_ENV = "LEVAIN_QUEUE_CAP"
@@ -203,13 +206,11 @@ class BrokerClient:
         """File ``request``; its request id, which must be the id this client sealed (the broker re-seals the
         same fields, so any other id is not an answer about this request). ``grant``: :func:`grant_member`'s
         member, sent beside ``request`` (``request`` must be sealed with it, :func:`gate_request`). ``ungated``
-        (with a member only): the call is one the gate does not gate; then :data:`GO` is an answer too."""
+        (with or without a member): the call is one the gate does not gate; then :data:`GO` is an answer too."""
         fields = request.fields()
         fields.pop("id")
         extra: dict[str, Any] = {} if grant is None else {"grant": dict(grant)}
         if ungated:
-            if grant is None:
-                raise ValueError("an ungated request carries its grant member")
             extra["ungated"] = True
         got = self.call("REQUEST", timeout=timeout, request=fields, **extra)
         if ungated and set(got) - {"id", "ok"} == {"go"} and got["go"] is True:
@@ -238,19 +239,18 @@ class BrokerClient:
 def grant_member(agent: str, tool_name: str, tool_input: Any, root: str) -> dict[str, Any] | None:
     """The REQUEST's ``grant`` member ``{"paths", "input"}`` for a call a dispatch contract may grant: ``paths``
     from :func:`levain.dispatch.grant.grant_paths` (``root``: the patch paths' base, the hook's ``cwd``), ``input``
-    the :func:`levain.cockpit.consent.value_sha256` of ``tool_input``. ``None`` when the call is not grantable or its
-    parse is not total. Never raises: a call it cannot read sends no member."""
-    try:
-        # here, not at import: an import cycle (levain.dispatch.grant -> the Codex adapter -> this module)
-        from levain.cockpit.consent import value_sha256
-        from levain.dispatch.grant import grant_paths
+    the :func:`levain.cockpit.consent.value_sha256` of ``tool_input``. ``None`` only when a parse that completed shows
+    the call has no path-bound member (not a grantable tool of ``agent``, an unknown key, a relative path, a value
+    outside JCS). Anything else raises, and the adapters deny on it (L3 r1 triage R1): a failure is never read as
+    "not grantable"."""
+    # here, not at import: an import cycle (levain.dispatch.grant -> the Codex adapter -> this module)
+    from levain.cockpit.consent import value_sha256
+    from levain.dispatch.grant import grant_paths
 
-        paths = grant_paths(agent, tool_name, tool_input, root)
-        if paths is None:
-            return None
-        return {"paths": list(paths), "input": value_sha256(tool_input)}
-    except Exception:  # noqa: BLE001 - no member is today's request, never a failed gate
+    paths = grant_paths(agent, tool_name, tool_input, root)
+    if paths is None:
         return None
+    return {"paths": list(paths), "input": value_sha256(tool_input)}
 
 
 def gate_request(*, agent: str, session: str, tool_name: str, tool_input: Any, cwd: str, event_id: str | None,
@@ -274,17 +274,15 @@ def gate_request(*, agent: str, session: str, tool_name: str, tool_input: Any, c
         tier=tier, received_at=utc_stamp(now), expires_at=utc_stamp(now + timedelta(seconds=hold)))
 
 
-def file_ungated(client: BrokerClient | None, *, agent: str, session: str, tool_name: str, tool_input: Any, cwd: str,
-                 event_id: str | None, hold: float, poll: float, expected_uid: int | None = None,
-                 sleep: Callable[[float], None] = time.sleep,
-                 monotonic: Callable[[], float] = time.monotonic) -> tuple[str | None, str] | None:
-    """A call the gate does not gate, sent to the broker when a dispatch contract may grant it: ``None`` (nothing
-    sent) when :func:`grant_member` gives no member; else ``(outcome, request id)``, the outcome :data:`GO`, a
-    verified decision, or ``None`` when the hold ended with none. Filed at :data:`UNGATED_TIER`; ``client``
-    defaults to :meth:`BrokerClient.from_env`. Failures raise as :func:`file_and_hold`'s do."""
-    member = grant_member(agent, tool_name, tool_input, cwd)
-    if member is None:
-        return None
+def file_ungated(client: BrokerClient | None, *, member: Mapping[str, Any] | None, agent: str, session: str,
+                 tool_name: str, tool_input: Any, cwd: str, event_id: str | None, hold: float, poll: float,
+                 expected_uid: int | None = None, sleep: Callable[[float], None] = time.sleep,
+                 monotonic: Callable[[], float] = time.monotonic) -> tuple[str | None, str]:
+    """A file write the gate does not gate, sent to the broker ``ungated``: ``member`` is the adapter's
+    :func:`grant_member` for the call (computed once there), or ``None`` for a file write with no member, which is
+    sent with no ``grant`` and today's digest. ``(outcome, request id)``, the outcome :data:`GO`, a verified
+    decision, or ``None`` when the hold ended with none. Filed at :data:`UNGATED_TIER`; ``client`` defaults to
+    :meth:`BrokerClient.from_env`. Failures raise as :func:`file_and_hold`'s do."""
     client = client if client is not None else BrokerClient.from_env(expected_uid=expected_uid)
     request = gate_request(agent=agent, session=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
                            event_id=event_id, tier=UNGATED_TIER, hold=hold, grant=member)

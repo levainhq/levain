@@ -795,31 +795,35 @@ def _slot_ungated(event: Mapping[str, Any], session: str, tool_name: str, tool_i
                   home: Path | None, codex_dir: Path | None, git_cache: dict[Any, Any], client: Any, hold: float,
                   expected_uid: int | None, sleep: Callable[[float], None],
                   monotonic: Callable[[], float]) -> dict[str, Any] | None:
-    """Claude Code's :func:`levain.consent.adapters.claude_code._slot_ungated`, in Codex's words: ``None`` (the
-    mode decides) when nothing is sent or on GO only; any failure once sent is :func:`could_not_run`'s deny."""
+    """Claude Code's :func:`levain.consent.adapters.claude_code._slot_ungated`, in Codex's words: a file write
+    (:data:`PATCH_TOOL`) is sent with its member or with none; ``None`` (the mode decides) for any other call or on
+    GO only; any failure, the member that cannot be read included, is :func:`could_not_run`'s deny."""
     from levain.consent import broker_client
 
-    if broker_client.grant_member(AGENT, tool_name, tool_input, cwd) is None:
-        return None
+    def what() -> str:
+        try:
+            return _call_what(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, git_cache=git_cache)
+        except Exception:  # noqa: BLE001 - a call that cannot be described is still denied
+            return "this call"
+
     try:
-        what = _call_what(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, git_cache=git_cache)
-    except Exception:  # noqa: BLE001 - a call that cannot be described is still denied
-        what = "this call"
-    try:
+        member = broker_client.grant_member(AGENT, tool_name, tool_input, cwd)
+        if member is None and tool_name != PATCH_TOOL:
+            return None
         if queue_socket_planted(cwd, home=home, codex_home=codex_dir):
-            return could_not_run(what)
+            return could_not_run(what())
         tool_use_id = event.get("tool_use_id")
         got = broker_client.file_ungated(
-            client, agent=AGENT, session=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
-            event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None, hold=hold,
+            client, member=member, agent=AGENT, session=session, tool_name=tool_name, tool_input=tool_input,
+            cwd=cwd, event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None, hold=hold,
             poll=GATE_POLL, expected_uid=expected_uid, sleep=sleep, monotonic=monotonic)
-        if got is None or got[0] == broker_client.GO:
+        if got[0] == broker_client.GO:
             return None
         decision, request_id = got
     except Exception:  # noqa: BLE001 - fail closed, as a gated call: the broker down, refusing or malformed
-        return could_not_run(what)
+        return could_not_run(what())
     if decision is None:
-        return undecided_output("reversible", what, request_id)
+        return undecided_output("reversible", what(), request_id)
     return decision_output(decision, SLOT_HOW)
 
 
