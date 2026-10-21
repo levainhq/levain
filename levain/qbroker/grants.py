@@ -6,7 +6,9 @@ the call touches and the sha256 of its input. :func:`grant_member_refusal` recom
 ``tool_input_digest``, so paths a request did not bind are never read. Then :func:`decide`, in this order, any
 failure being a :class:`~levain.dispatch.grant.Queue` (the request is filed as any other, never an error):
 
-1. the session is ``dispatch`` (CONTROL's word, never the hook's);
+1. the session is ``dispatch`` (CONTROL's word, never the hook's); the request is not sealed at the agent-config tier
+   and no path is agent config or hooks (:func:`agent_config_path`): the irreversible tier stays the operator's,
+   whatever a contract lists and whatever tier a frame claims (W2-c3, head ruling 1020+49);
 2. the signed contract dispatch published (:mod:`levain.dispatch.published`) at ``<contracts>/<digest hex>.json`` is
    read as a file the suspect principal wrote (:func:`read_published`: no symlink through a directory fd, a regular
    file owned by dispatch's uid, at most :data:`PUBLISHED_MAX` bytes, canonical JSON of that format);
@@ -39,6 +41,7 @@ from typing import Any
 
 from levain.authority import AuthorityKey, AuthoritySnapshot, StandingPolicy, VerifierUnavailable
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
+from levain.consent.policy import AGENT_CONFIG_TIER
 from levain.consent.record import ExternalGateRequest
 from levain.contracts import ContractError
 from levain.contracts.canon import canonical_bytes, parse
@@ -50,8 +53,8 @@ from levain.dispatch.contract import ResolvedContract, parse_contract
 from levain.dispatch.grant import DIGEST_PREFIX, Allow, Queue, input_bound_digest, paths_decision
 from levain.qbroker.signers import SignersSnapshot
 
-__all__ = ["CONTRACT_NAMESPACE", "GRANT_KEYS", "PUBLISHED_MAX", "Granted", "contract_authority", "decide",
-           "grant_member_refusal", "read_published", "verified_contract"]
+__all__ = ["CONTRACT_NAMESPACE", "GRANT_KEYS", "PUBLISHED_MAX", "Granted", "agent_config_path", "contract_authority",
+           "decide", "grant_member_refusal", "read_published", "verified_contract"]
 
 CONTRACT_NAMESPACE = dsign.DISPATCH_SIGN_NAMESPACE
 # CONTRACT §26 S1-b: the contract text is at most what the dispatch door accepts; 64 KiB more holds the payload, the
@@ -103,6 +106,32 @@ def grant_member_refusal(request: ExternalGateRequest, member: Any) -> str | Non
         return f"the grant member does not bind: {exc}"
     if digest != request.tool_input_digest:
         return "the grant member's digest is not the request's"
+    return None
+
+
+def agent_config_path(paths: Any, cwd: str, agent: str) -> str | None:
+    """The first of ``paths`` that is agent config or hooks by its PATH for a request of ``agent``, read with the
+    consent adapters' own path predicates (imported, one rule each) as that agent's own classifier reads them
+    (L3 r1 triage R3): Claude Code's config-path test for both agents (Codex's classifier applies it too), Codex's
+    "anything beneath ``.codex``" test for a Codex request only, so a Claude Code write to ``.codex/notes.md`` is not
+    agent config here, as it is not to its hook. A request of any other agent gets both (gated wins). Else ``None``.
+    Path-only on purpose: the broker runs no git (git's ``core.hooksPath`` answer is the hook's, and a hooks path the
+    hook gates never reaches this as an ungated call). A path that cannot be read, or a check that raises, counts as
+    agent config (fail closed: gated)."""
+    from levain.consent.adapters.claude_code import AGENT as CLAUDE_AGENT
+    from levain.consent.adapters.claude_code import _is_config_path
+    from levain.consent.adapters.codex import CODEX_DIR_NAME, _in_codex_config
+
+    if not isinstance(paths, (list, tuple)) or not paths or not isinstance(cwd, str):
+        return "<no paths>"
+    codex_rule = agent != CLAUDE_AGENT
+    for p in paths:
+        try:
+            if not isinstance(p, str) or _is_config_path(Path(p)) or _is_config_path(Path(os.path.realpath(p))) \
+                    or (codex_rule and _in_codex_config(p, cwd, Path("/"), Path(cwd) / CODEX_DIR_NAME)):
+                return str(p)
+        except Exception:  # noqa: BLE001 - unreadable is gated
+            return str(p)
     return None
 
 
@@ -215,6 +244,11 @@ def decide(*, kind: str, run: Mapping[str, Any] | None, request: ExternalGateReq
     try:
         if kind != "dispatch" or not isinstance(run, Mapping):
             return Queue("the session is not a dispatch session")
+        if request.tier == AGENT_CONFIG_TIER:
+            return Queue("the request is sealed at the agent-config tier: never granted, the operator answers it")
+        config = agent_config_path(paths, request.cwd, request.agent)
+        if config is not None:
+            return Queue(f"{config[:120]} is agent config or hooks: never granted, the operator answers it")
         if directory is None or owner_uid is None:
             return Queue("this broker reads no published contracts")
         got = verified_contract(directory, run, snapshot, now, owner_uid=owner_uid, ssh_keygen=ssh_keygen)

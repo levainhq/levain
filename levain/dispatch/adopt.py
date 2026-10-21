@@ -5,8 +5,9 @@ Adoption is two effects (F11 §2). STAGE (E0): each verified run is a determinis
 needs). LAND (E1, "adopted"): one ``update-ref`` compare-and-swap moves a branch outside ``levain/`` from the
 contract's ``base`` to a staged commit. A land is authorised by (A) the operator's signed authorise item over the
 run's ARTIFACT digest and the branch (:func:`authorise_payload`, its own namespace), or (B) a standing adoption rule
-whose typed criteria hold (:func:`levain.dispatch.registry.active_adoption_rules`); (C), the envelope, comes with the
-coordinator build. Every authority passes ONE floor (:func:`floor`, F11 §4), whose first failure decides. The run
+whose typed criteria hold (:func:`levain.dispatch.registry.active_adoption_rules`), or (C) the envelope the job was
+bound to at filing (:class:`Envelope`, a protocol the coordinator implements; Python API only until S1 and the run
+supervisor). Every authority passes ONE floor (:func:`floor`, F11 §4), whose first failure decides. The run
 records a land judges are the job store's own (:meth:`levain.dispatch.jobs.JobStore.run_records`, as
 :meth:`~levain.dispatch.jobs.JobStore.record_verification` wrote them); :func:`land` takes none from its caller,
 so a record built over another staged tree has no way to land. Nor does it take a clock: expiry and record age
@@ -52,7 +53,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from levain.authority import PASSKEY, AuthoritySnapshot, verify_link_sig
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
@@ -62,16 +63,19 @@ from levain.contracts.canon import canonical_bytes
 from levain.dispatch import DispatchError
 from levain.dispatch import registry as dregistry
 from levain.dispatch.contract import _NO_GRAFT_FILE, ResolvedTemplate
-from levain.dispatch.jobs import Job, JobStore, SignatureRefused, TransitionRefused
+from levain.dispatch.jobs import (EnvelopeRefused, Job, JobStore, SignatureRefused, TransitionRefused,
+                                  envelope_evidence)
 from levain.dispatch.policy import ProviderPolicy
 from levain.dispatch.sign import FIELD_MAX, SIGNATURE_MAX
 
 __all__ = [
     "AUTHORISE_FORMAT", "AUTHORISE_KEYS", "DISPATCH_AUTHORISE_NAMESPACE", "MAX_BLOB_BYTES", "MAX_ENTRIES",
-    "MAX_TOTAL_BYTES", "ArtifactRecord", "Change", "ChangeSet", "Floor", "GitFault", "Landing", "artifact_digest",
+    "MAX_TOTAL_BYTES", "ArtifactRecord", "Change", "ChangeSet", "Envelope", "Floor", "GitFault", "Landing",
+    "artifact_digest",
     "artifact_problem",
-    "authorise_message", "authorise_payload", "authorise_refusal", "branch_problem", "change_set",
-    "criteria_failure", "floor", "land", "revalidation_problem", "stage_commit", "staged_ref",
+    "authorise_message", "authorise_payload", "authorise_payload_for", "authorise_refusal", "branch_problem",
+    "change_set",
+    "criteria_failure", "floor", "land", "revalidation_problem", "stage_commit", "staged_ref", "sweep_staged",
 ]
 
 DISPATCH_AUTHORISE_NAMESPACE = "levain-dispatch-authorise"
@@ -445,6 +449,28 @@ def authorise_message(payload: Mapping[str, Any]) -> bytes:
     return canonical_bytes(dict(payload))
 
 
+def authorise_payload_for(store: JobStore, job_id: str, *, run: int, onto: str, signer_fp: str) -> dict[str, str]:
+    """The authorise payload for run ``run`` of job ``job_id`` onto ``onto``, built by the SERVER from the job
+    store's own record of that run (:meth:`JobStore.run_record`) and dated on the store's clock
+    (:meth:`JobStore.stamp`): a client signs what this returns and never supplies an artifact or contract digest. A
+    job that is not verified or recommended, a run with no passing record, or a branch :func:`branch_problem` refuses
+    is a :class:`DispatchError`, before anything is signed. Raises :class:`GitFault` when git cannot run."""
+    job = store.get(job_id)
+    if job is None:
+        raise TransitionRefused(f"no dispatch job {str(job_id)[:40]!r}")
+    if job.state not in ("verified", "recommended"):
+        raise TransitionRefused(f"job {job.id} is {job.state}; only a verified or recommended job is authorised")
+    if type(run) is not int or not 0 <= run < 64:
+        raise DispatchError("the run is an integer from 0 to 63")
+    record = store.run_record(job.id, run)
+    if record is None or record.verifier.get("result") != "pass":
+        raise DispatchError(f"run {run} of job {job.id} has no verified record")
+    problem = branch_problem(job.repo, onto)
+    if problem is not None:
+        raise DispatchError(problem)
+    return authorise_payload(job, record, onto=onto, signer_fp=signer_fp, signed_at=parse_stamp(store.stamp()))
+
+
 def authorise_refusal(payload: Any, signature: Any, authority: AuthoritySnapshot, job: Job, *, run: int,
                       artifact: str, onto: str, tier: str, ssh_keygen: Path | str | None = None) -> str | None:
     """Why ``payload``/``signature`` is not the operator's authorisation to land run ``run`` (digest ``artifact``)
@@ -575,19 +601,64 @@ def criteria_failure(criteria: Iterable[tuple[str, Any]], changes: ChangeSet, *,
     return None
 
 
+# --- (C) the envelope (F11 §12, C0 §9) -----------------------------------------------------------------------------
+
+@runtime_checkable
+class Envelope(Protocol):
+    """Authority (C): the coordinator's envelope object (C0 implements it; dispatch never imports the coordinator).
+    It is the ONE input every envelope write takes (L3 r1 codex 3): :meth:`JobStore.file_in_envelope`,
+    :meth:`JobStore.take_slot` and :meth:`JobStore.authorise` read the binding from :meth:`evidence` inside their own
+    transaction, compare it to the job's filing binding, and run THIS object's :meth:`precondition` on that
+    transaction's connection and clock, so no second caller input can stand in for the pin or the check.
+    :func:`floor` asks :meth:`refusal` at step 6 with the change set it computed and the landing tier it read (the
+    tier check is the object's: the signer-class ceiling, C0 §5 C3); :func:`land` writes :meth:`evidence` into the
+    intent and hands the object itself to :meth:`JobStore.authorise`, so the WHOLE predicate is judged at the
+    linearisation point, never only liveness."""
+
+    def refusal(self, job: Job, onto: str, changes: ChangeSet, landing_tier: str) -> str | None:
+        """The line saying why this envelope does not authorise landing ``changes`` of ``job`` on ``onto`` at
+        ``landing_tier``; ``None`` when it does."""
+        ...
+
+    def evidence(self) -> dict[str, Any]:
+        """Exactly the intent's envelope fields: ``envelope_id`` (the filer launch's pin), ``envelope_digest``
+        (``sha256:`` + 64 lowercase hex), ``thread_id``, ``grant`` (``"source"``/``"named"``)
+        (:func:`levain.dispatch.jobs.envelope_evidence` checks the shape; anything else refuses)."""
+        ...
+
+    def precondition(self, conn: Any, now: str, job: Job) -> str | None:
+        """The whole predicate again, on the write transaction's connection and clock, for ``job`` as that
+        transaction reads it (its repo and write list, its bound envelope and thread): liveness, inside ``where``,
+        the same thread, the criteria now. ``None`` when it holds."""
+        ...
+
+
+def _envelope_evidence(envelope: Envelope) -> dict[str, Any] | str:
+    """The envelope's evidence checked to its shape, or the line saying why it is not that shape (one checker, the
+    store's: :func:`levain.dispatch.jobs.envelope_evidence`)."""
+    return envelope_evidence(envelope)
+
 # --- the floor (F11 §4) --------------------------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Floor:
     """What the floor decided. ``failure`` is the first failing line (None when it passed); ``moved`` is True when
-    that failure is MOVED BASE (the job then fails ``base_moved``). On a pass, ``record``/``changes``/``tier`` are
-    the run to land, its change set and its landing tier, ``rule`` the (generation, index) of a rule that held."""
+    that failure is MOVED BASE (the job then fails ``base_moved``); ``needs_sign`` is True when that failure is the
+    (C) authority missing (step 6: the job is not bound to this envelope, or the envelope refused) AND step 7's
+    target checks passed, which a human SIGN can supply, never an integrity or floor failure. On a pass,
+    ``record``/``changes``/``tier`` are the run to land, its change set and its landing tier, ``rule`` the
+    (generation, index) of a rule that held, ``evidence`` the envelope's intent fields; on a MOVED BASE under (C),
+    ``evidence`` is set only when step 6 held. ``bound`` is True when the envelope given is the job's own (its filing
+    binding names it), whether or not its :meth:`Envelope.refusal` passed: a MOVED BASE then fails the job."""
     failure: str | None
     moved: bool = False
     record: ArtifactRecord | None = None
     changes: ChangeSet | None = None
     tier: str | None = None
     rule: tuple[int, int] | None = None
+    needs_sign: bool = False
+    evidence: dict[str, Any] | None = None
+    bound: bool = False
 
 
 def _refuse(line: str) -> Floor:
@@ -702,16 +773,25 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
           landing_tier: Callable[[str, tuple[str, ...]], str],
           resolve_template: Callable[[str], ResolvedTemplate | None], policy: ProviderPolicy, now: str,
           human: Mapping[str, Any] | None = None,
-          rules: Callable[[], tuple[int, Sequence[dregistry.AdoptionRule]]] | None = None) -> Floor:
-    """F11 §4 for (A) (``human`` is the signed payload) or (B) (``rules`` returns the active adoption rules and
-    their generation from one read, :func:`levain.dispatch.registry.adoption_rules_at`). The first failure decides.
-    Raises :class:`GitFault` when git cannot run."""
+          rules: Callable[[], tuple[int, Sequence[dregistry.AdoptionRule]]] | None = None,
+          envelope: Envelope | None = None) -> Floor:
+    """F11 §4 for (A) (``human`` is the signed payload), (B) (``rules`` returns the active adoption rules and
+    their generation from one read, :func:`levain.dispatch.registry.adoption_rules_at`) or (C) (``envelope``, the
+    coordinator's :class:`Envelope` object; exactly one of the three). The first failure decides. For (C) step 5
+    (R0, contrast, entries) never runs and the tier is the object's to judge (F11 §12, C0 §5 C3); step 6 is the job's
+    filing binding naming this envelope and :meth:`Envelope.refusal` passing, and a failure there is ``needs_sign``
+    once step 7 passes (a target step 7 refuses is refused instead: a SIGN cannot fix it).
+    Raises :class:`GitFault` when git cannot run, and :class:`levain.dispatch.control.ControlStateUnavailable` when
+    ``rules`` cannot read the control store (a fault, never a refusal); whatever the envelope object raises
+    propagates as the fault it is, before anything is written."""
     repo = job.repo
     # 1. state, and the branch the authority names
     if job.state not in ("verified", "recommended"):
         return _refuse(f"job {job.id} is {job.state}; the floor judges a verified or recommended job")
-    if (human is None) == (rules is None):
-        return _refuse("one authority: a human authorise item or the adoption rules")
+    if sum(a is not None for a in (human, rules, envelope)) != 1:
+        return _refuse("one authority: a human authorise item, the adoption rules or an envelope")
+    if envelope is not None and not isinstance(envelope, Envelope):
+        return _refuse("the envelope authority is not an envelope object (refusal, evidence, precondition)")
     if human is not None:
         named = human.get("onto") if isinstance(human, Mapping) else None
         if not isinstance(named, str):
@@ -720,7 +800,7 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
             return _refuse(f"--onto {onto} is not the branch the authorisation names ({named})")
         onto = named
     if onto is None:
-        return _refuse("a land by rule names its branch (--onto)")
+        return _refuse("a land by rule or envelope names its branch (--onto)")
     # 2. revalidation
     problem = revalidation_problem(job, resolve_template=resolve_template, policy=policy, now=now)
     if problem is not None:
@@ -764,16 +844,42 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
         if problem is not None:
             return _refuse(problem)
         # 6. the rule
+        # rules that no longer hold refuse; a control store that cannot be read is a FAULT, raised (F11-s2b 9(2))
+        from levain.dispatch.control import ControlStateUnavailable
+
         try:
             generation, listed = rules()
             active = tuple(listed)
+        except ControlStateUnavailable:
+            raise
         except DispatchError as exc:
             return _refuse(f"the adoption rules cannot be read: {str(exc)[:200]}")
         index, failure = _rule_for(active, job, onto, changes, record, now)
         if failure is not None:
             return _refuse(failure)
         rule_ref = (generation, index)
-    # 7. the target
+    evidence: dict[str, Any] | None = None
+    unsigned: str | None = None          # step 6's missing (C) authority, said only once step 7 passes
+    bound = False
+    if envelope is not None:
+        # 6. the envelope: resolved only through the job's filing binding, never from what the object says alone
+        shaped = _envelope_evidence(envelope)
+        if isinstance(shaped, str):
+            return _refuse(shaped)
+        if job.envelope_id is None:
+            unsigned = f"job {job.id} was not filed inside an envelope; landing it needs a signature"
+        elif (shaped["envelope_id"], shaped["thread_id"]) != (job.envelope_id, job.thread_id):
+            unsigned = (f"the envelope is not the one job {job.id} was bound to at filing ({job.envelope_id}, "
+                        f"thread {job.thread_id}); landing it needs a signature")
+        else:
+            bound = True
+            line = envelope.refusal(job, onto, changes, tier)
+            if line is not None:
+                unsigned = str(line)[:500] or "the envelope refused this land"
+            else:
+                evidence = shaped
+    # 7. the target. It runs even when step 6 found the (C) authority missing: a SIGN cannot fix a target this
+    # refuses, so its failure is returned instead of a needs_sign (L3 r1 complement 1, C0 §9 item 5)
     problem = branch_problem(repo, onto)
     if problem is not None:
         return _refuse(problem)
@@ -786,9 +892,14 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
             return _refuse(f"{onto} already contains run {r.run}'s staged commit, a merge Levain did not make "
                            "under an authority; it is not an adoption")
     if tip != record.base:
+        # under (C), land fails the job when the envelope is the job's own (``bound``), even one whose refusal()
+        # refuses (dead, or past its criteria): the result was judged on a base the target no longer reads, so it
+        # is invalid under any authority, and holding it would keep its write files from the coordinator's re-file
         return Floor(failure=f"MOVED BASE: {onto} is at {tip}, not the contract's base {record.base}", moved=True,
-                     record=record, changes=changes, tier=tier)
-    return Floor(failure=None, record=record, changes=changes, tier=tier, rule=rule_ref)
+                     record=record, changes=changes, tier=tier, evidence=evidence, bound=bound)
+    if unsigned is not None:
+        return Floor(failure=unsigned, needs_sign=True)
+    return Floor(failure=None, record=record, changes=changes, tier=tier, rule=rule_ref, evidence=evidence)
 
 
 # --- land (F11 §6) -------------------------------------------------------------------------------------------------
@@ -796,8 +907,10 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
 @dataclass(frozen=True)
 class Landing:
     """What :func:`land` did. ``outcome``: ``adopted`` (``moved`` says whether Levain moved the branch),
-    ``merge`` (``command`` is the operator's own merge to run; the job stays authorised), ``refused`` (nothing
-    written; ``message`` is the failing line), ``failed`` (MOVED BASE: the job is failed ``base_moved``)."""
+    ``merge`` (``command`` is the operator's own merge to run; the job stays authorised), ``needs_sign`` (the (C)
+    authority is missing: nothing written, ``message`` is the failing line, which becomes the SIGN's text; a human
+    authorise item (A) can land it), ``refused`` (nothing written; ``message`` is the failing line, an integrity or
+    floor failure no SIGN fixes), ``failed`` (MOVED BASE: the job is failed ``base_moved``)."""
     outcome: str
     job: Job
     message: str = ""
@@ -845,6 +958,76 @@ def _delete_staged(repo: str, job_id: str) -> list[str]:
         ref, _, sha = line.rpartition(" ")
         if _git(repo, "update-ref", "--no-deref", "-d", ref, sha).returncode != 0:
             kept.append(ref)
+    return kept
+
+
+_STAGED_PREFIX = "refs/heads/levain/dispatch/"
+
+
+def _landed_in(repo: str, job: Job) -> bool:
+    """Whether the branch an ``adopted`` job landed on (its ``adopted`` transition's evidence: ``onto``, ``landed``)
+    contains the landed commit now. Evidence it cannot read is ``False``: the refs are kept."""
+    rows = [h for h in job.history if h.to_state == "adopted"]
+    try:
+        evidence = json.loads(rows[-1].evidence) if rows and rows[-1].evidence else None
+    except ValueError:
+        return False
+    if not isinstance(evidence, dict):
+        return False
+    onto, landed = evidence.get("onto"), evidence.get("landed")
+    if not (isinstance(onto, str) and isinstance(landed, str)) or branch_problem(repo, onto) is not None:
+        return False
+    tip = _read_branch(repo, onto)
+    return tip is not None and _object_type(repo, landed) == "commit" and _is_ancestor(repo, landed, tip)
+
+
+def sweep_staged(store: JobStore, repo: str) -> list[str]:
+    """Delete the staged refs of every job of ``repo`` that ended: ``failed`` or ``cancelled`` (by any writer: a
+    lapse, a cancel, a verifier failure), or ``adopted`` once the branch it landed on contains the landed commit (the
+    commit is kept by the branch; the refs are clutter). Returns a line for each ref git would not delete, and one
+    when the store or git cannot be read here, never a raise (a ref left behind is clutter, nothing worse; a sweep
+    runs after a land whose adoption is already durable). One listing of the repository's staged refs; a ref of a job
+    this store does not hold, of a live job, or of an adopted job whose branch does not contain its commit, is left.
+    A repository that is no longer a directory has no refs to sweep. Runs when a verb runs, never on its own."""
+    import sqlite3
+
+    from levain.dispatch.jobs import JobStoreError
+
+    if not os.path.isdir(repo):
+        return []
+    try:
+        jobs = {j.id: j for j in store.list(repo=repo) if j.state in ("failed", "cancelled", "adopted")}
+    except (JobStoreError, sqlite3.Error, OSError) as exc:
+        return [f"the ended jobs in {repo} could not be read to sweep their staged refs "
+                f"({type(exc).__name__}: {str(exc)[:200]})"]
+    if not jobs:
+        return []
+    try:
+        out = _git_ok(repo, "for-each-ref", "--format=%(refname) %(objectname)", _STAGED_PREFIX)
+    except GitFault as exc:
+        return [f"the staged refs in {repo} could not be swept: {exc}"]
+    kept: list[str] = []
+    landed: dict[str, bool] = {}            # adopted job -> its branch contains its commit (asked once per job)
+    for line in out.decode("utf-8", "surrogateescape").splitlines():
+        ref, _, sha = line.rpartition(" ")
+        job = jobs.get(ref[len(_STAGED_PREFIX):].partition("/")[0])
+        if job is None:
+            continue
+        if job.state == "adopted":
+            if job.id not in landed:
+                try:
+                    landed[job.id] = _landed_in(repo, job)
+                except GitFault as exc:
+                    kept.append(f"the staged refs of adopted job {job.id} were kept: {exc}")
+                    landed[job.id] = False
+            if not landed[job.id]:
+                continue
+        try:
+            deleted = _git(repo, "update-ref", "--no-deref", "-d", ref, sha).returncode == 0
+        except GitFault:
+            deleted = False
+        if not deleted:
+            kept.append(f"a staged ref git would not delete: {ref}")
     return kept
 
 
@@ -953,7 +1136,8 @@ def land(store: JobStore, job_id: str, *,
          landing_tier: Callable[[str, tuple[str, ...]], str],
          resolve_template: Callable[[str], ResolvedTemplate | None], policy: ProviderPolicy,
          onto: str | None = None, human: tuple[Any, Any, Any] | None = None,
-         rules: Callable[[], tuple[int, Sequence[dregistry.AdoptionRule]]] | None = None) -> Landing:
+         rules: Callable[[], tuple[int, Sequence[dregistry.AdoptionRule]]] | None = None,
+         envelope: Envelope | None = None) -> Landing:
     """F11 §6 for job ``job_id``, over the job's own run records (:meth:`JobStore.run_records`; a stored row that
     does not match its digest raises :class:`levain.dispatch.jobs.JobStoreError`). ``human`` is ``(payload, signature,
     authority)`` for (A); ``rules`` returns the active adoption rules and their generation for (B) (``lambda:
@@ -962,7 +1146,17 @@ def land(store: JobStore, job_id: str, *,
     the job and its staged refs are kept. ``landing_tier`` has no default. A verified/recommended job passes the
     floor and is authorised (the INTENT) before anything moves; an authorised job goes straight to :func:`_finish`.
     A refused signature is a ``refused`` landing; a verifier that cannot run
-    (:class:`levain.authority.VerifierUnavailable`) and a git that cannot run (:class:`GitFault`) raise."""
+    (:class:`levain.authority.VerifierUnavailable`) and a git that cannot run (:class:`GitFault`) raise.
+
+    ``envelope`` is (C), the coordinator's :class:`Envelope` for this job (Python API only: no CLI, MCP or phone verb
+    passes one, F11 §12). Its intent is ``authority: "C"`` with the object's evidence under ``envelope``, cause
+    ``envelope_rule``, and :meth:`Envelope.precondition` runs inside the authorise transaction; a missing (C)
+    authority, at the floor or in that transaction, is a ``needs_sign`` landing, said only when the target passed
+    (a target the floor refuses is ``refused``: a SIGN cannot fix it). The object itself, never a separate hook, is
+    what :meth:`JobStore.authorise` judges. A MOVED BASE under the job's own envelope (its filing binding names it,
+    whether or not :meth:`Envelope.refusal` passes: a dead bound envelope fails it too) FAILS the job, cause
+    ``base_moved``, releasing its write files (C0 §5: the coordinator then re-files); under an envelope that is not
+    the job's own it is refused and the job kept, as under a rule."""
     job = store.get(job_id)
     if job is None:
         raise TransitionRefused(f"no dispatch job {str(job_id)[:40]!r}")
@@ -978,25 +1172,40 @@ def land(store: JobStore, job_id: str, *,
     payload = human[0] if human is not None else None
     verdict = floor(job, records, onto=onto, landing_tier=landing_tier, resolve_template=resolve_template,
                     policy=policy, now=stamp, human=payload if isinstance(payload, Mapping) else
-                    ({} if human is not None else None), rules=rules)
+                    ({} if human is not None else None), rules=rules, envelope=envelope)
+    if verdict.needs_sign:
+        return Landing(outcome="needs_sign", job=job, message=verdict.failure or "this land needs a signature")
     if verdict.moved:
         line = verdict.failure or "MOVED BASE"
         if human is not None and verdict.record is not None and verdict.tier is not None and \
                 _human_refusal(store, job, human, verdict.record, verdict.tier) is None:
             return _fail_moved(store, job, line)
+        if envelope is not None and verdict.bound:
+            # the job's own envelope, live or not: the result was judged on a base the target no longer reads
+            return _fail_moved(store, job, line)
         return Landing(outcome="refused", job=job, message=f"{line}; nothing was failed or deleted (only a verified "
-                                                            "authorisation fails a job on a moved base)")
+                                                            "authorisation or the job's own envelope fails a job on "
+                                                            "a moved base)")
     if verdict.failure is not None:
         return Landing(outcome="refused", job=job, message=verdict.failure)
     record, changes = verdict.record, verdict.changes
     assert record is not None and changes is not None
     target = onto if human is None else payload["onto"]           # type: ignore[index]
     assert isinstance(target, str)                                 # the floor passed only with a named branch
-    intent: dict[str, Any] = {"authority": "A" if human is not None else "B", "run": record.run, "onto": target,
+    who = "A" if human is not None else "C" if envelope is not None else "B"
+    intent: dict[str, Any] = {"authority": who, "run": record.run, "onto": target,
                               "staged": record.staged_commit, "base": record.base, "tree": record.tree,
                               "artifact_digest": artifact_digest(record), "tier": verdict.tier}
     try:
-        if human is not None:
+        if envelope is not None:
+            assert verdict.evidence is not None
+            intent["envelope"] = verdict.evidence
+            try:
+                job = store.authorise(job.id, cause="envelope_rule", evidence=json.dumps(intent, sort_keys=True),
+                                      envelope=envelope)
+            except EnvelopeRefused as exc:
+                return Landing(outcome="needs_sign", job=job, message=str(exc))
+        elif human is not None:
             sig, authority = human[1], human[2]
             intent["signer_fp"] = payload["signer_fp"]                 # type: ignore[index]
             refusal = _bound_refusal(run=record.run, artifact=intent["artifact_digest"], onto=target,

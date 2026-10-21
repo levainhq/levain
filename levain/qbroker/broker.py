@@ -26,8 +26,21 @@ as always and beside it the broker's own ``levain-queue-grant-allow/1`` row, and
 that row unless the operator's verified answer is there, which is read first and outranks it (his deny wins); such a
 row is not pending (it waits on no one), but it is charged to the quota like any other. Anything the grant cannot
 decide files the request as today, for the operator; a run CONTROL names without ``repo_root`` resolves as before
-and never takes a grant. A replay never re-decides. The cap is hashed on arrival and never logged or
-written. Stdlib only.
+and never takes a grant. A replay never re-decides.
+
+UNGATED CALLS (W2-c3, head ruling 1020+49). The slot hook's gate files only agent config; a grantable call it does not
+gate (a Write inside the repository) is sent with its member and ``"ungated": true`` so a dispatch run can grant it.
+Outside a dispatch session such a REQUEST is answered ``{"go": true}`` and NOTHING is written (no row, no quota): GO IS
+NOT ALLOW. It means "the session's own permission mode decides, as before the broker was asked", so a frame Bash forges
+with the flag gains no write authority, only what its shell already has. A frame with no member (a file write the hook
+could not bind to paths: a MultiEdit, a relative path; L3 r1 triage R1) is answered the same way; in a dispatch session
+it is filed pending for the operator, never granted (nothing to bind a grant to). ``ungated`` is ignored (the call is
+filed as any other) when the broker's own reading (:func:`levain.qbroker.grants.agent_config_path`) says a path is
+agent config, or that reading raises (R4): gated wins. GO is decided inside the request id's filing flight and only
+when no row exists for that id (R2): a row already filed, pending or answered, is answered exactly as without the
+flag, so resending a filed request with the flag never steps past it or past the operator's signed deny. In a
+dispatch session the flag changes nothing: granted, or filed pending.
+The cap is hashed on arrival and never logged or written. Stdlib only.
 """
 from __future__ import annotations
 
@@ -281,6 +294,10 @@ class Broker:
             if why is not None:
                 log.info("qbroker: grant member refused on slot %d: %s", slot, why)
                 return wire.refusal(rid, "grant-digest-mismatch")
+        if "ungated" in message and message["ungated"] is not True:
+            return wire.refusal(rid, "request-malformed")
+        if message.get("ungated") is True and who.kind != "dispatch" and self._ungated_go(slot, request, member):
+            return wire.answer(rid, go=True)   # go is not allow: the mode decides; nothing is written
         row: dict[str, Any] = {"format": REQUEST_ROW_FORMAT, "queue_id": self._store.queue_id,
                                "request": request.fields(), "session": who.session, "slot": slot_ref(slot), "kind": who.kind}
         if who.run is not None:
@@ -306,6 +323,24 @@ class Broker:
         if existing != row:
             return wire.refusal(rid, "request-exists")
         return wire.answer(rid, request_id=request.id, queue_id=self._store.queue_id)
+
+    def _ungated_go(self, slot: int, request: ExternalGateRequest, member: Mapping[str, Any] | None) -> bool:
+        """Whether an ungated REQUEST outside a dispatch session is answered GO: not when a path of its member is
+        agent config, or reading that raises (filed as gated, never GO); else only when no row exists for its
+        request id, read inside the id's filing flight, so GO and filing are one door per request id."""
+        if member is not None:
+            try:
+                if grants.agent_config_path(member["paths"], request.cwd, request.agent) is not None:
+                    return False
+            except Exception:   # noqa: BLE001 - unreadable is agent config: filed as gated
+                log.exception("qbroker: the agent-config reading of %s on slot %d failed; filed as gated",
+                              request.id, slot)
+                return False
+        flight = self._enter_flight(request.id)
+        try:
+            return self._store.read_request(request.id) is None
+        finally:
+            self._leave_flight(request.id, flight)
 
     def _decide_grant(self, who: Resolved, request: ExternalGateRequest, member: Mapping[str, Any],
                       now: datetime) -> grants.Granted | None:
@@ -347,24 +382,29 @@ class Broker:
         linked it, else the refusal name (``request-exists`` when another connection linked it first)."""
         # single flight per request id: a second filing waits for the first, then finds its row (or, when that
         # one failed, files it itself), so only the filing that links a row ever holds its charge
-        while True:
-            with self._mutex:
-                flight = self._filing.get(request.id)
-                if flight is None:
-                    flight = self._filing[request.id] = threading.Event()
-                    break
-            flight.wait()
-            if self._store.read_request(request.id) is not None:
-                return "request-exists"
+        flight = self._enter_flight(request.id)
         try:
             # the row may have been linked between the caller's replay check and this flight
             if self._store.read_request(request.id) is not None:
                 return "request-exists"
             return self._file_new(row, who, request, now, granted=granted)
         finally:
+            self._leave_flight(request.id, flight)
+
+    def _enter_flight(self, request_id: str) -> threading.Event:
+        """Take ``request_id``'s single flight (a filing, or an ungated GO's row check), waiting out any other."""
+        while True:
             with self._mutex:
-                del self._filing[request.id]
-            flight.set()
+                flight = self._filing.get(request_id)
+                if flight is None:
+                    flight = self._filing[request_id] = threading.Event()
+                    return flight
+            flight.wait()
+
+    def _leave_flight(self, request_id: str, flight: threading.Event) -> None:
+        with self._mutex:
+            del self._filing[request_id]
+        flight.set()
 
     def _file_new(self, row: dict[str, Any], who: Resolved, request: ExternalGateRequest, now: str, *,
                   granted: bool = False) -> str | None:

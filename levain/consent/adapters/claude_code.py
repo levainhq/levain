@@ -1573,19 +1573,21 @@ def could_not_run(tier: str | None, what: str) -> dict[str, Any]:
 # outside the slot); the broker is polled every :data:`GATE_POLL`, then every broker_client.SLOW_POLL.
 #
 # KNOWN EDGE until F10 S2b (L3 r1 C): a slot session's consent limits are NOT enforced. Q13's limits are read from
-# the local queue, which a slot does not have, and an ungated call never reaches the broker, so nothing counts it;
-# the broker has no limit verb yet. S2b adds one, asked on every PreToolUse. Any public word about slots says so.
+# the local queue, which a slot does not have, and an ungated call reaches the broker only when it is a file write
+# (W2-c3), where nothing counts it either; the broker has no limit verb yet. S2b adds one, asked on every PreToolUse.
+# Any public word about slots says so.
 
-# who decided, in the gate's words, when the broker verified the answer (the hook never sees the signer's key)
-SLOT_HOW = "a signed levain answer the queue broker verified"
+# who decided, in the gate's words, when the broker verified the decision (the hook never sees the signer's key, and
+# cannot tell an operator's signed answer from an allow the run's signed contract grant gave)
+SLOT_HOW = "a levain decision the queue broker verified against an operator's signature"
 
 
 def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold: float = DEFAULT_GATE_HOLD,
               expected_uid: int | None = None, sleep: Callable[[float], None] = time.sleep,
               monotonic: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
     """The slot's gate output for one ``PreToolUse`` event, or ``None`` (the call goes on as the mode says). A
-    malformed event is :func:`_malformed`'s; a call :func:`gate_class` does not gate (protected paths: none) gets
-    ``None``; a gated call is filed with the broker (``client``, default
+    malformed event is :func:`_malformed`'s; a call :func:`gate_class` does not gate (protected paths: none) is
+    :func:`_slot_ungated`'s (``None`` unless a dispatch run's grant or queue decides it); a gated call is filed with the broker (``client``, default
     :meth:`~levain.consent.broker_client.BrokerClient.from_env`) and held up to ``hold`` for a decision the broker
     verified, delivered as :func:`decision_output` names it; at the end of the hold it is denied with
     :func:`undecided_output`, its gap named by the request id (the operator side numbers gaps; the hook does not).
@@ -1608,7 +1610,8 @@ def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold:
     try:
         tier = gate_class(tool_name, tool_input, cwd, home=home)
         if tier is None:
-            return None
+            return _slot_ungated(event, session, tool_name, tool_input, cwd, home=home, client=client, hold=hold,
+                                 expected_uid=expected_uid, sleep=sleep, monotonic=monotonic)
         what = _what(tool_name, tool_input)
     except Exception:  # noqa: BLE001 - a call that cannot be classified is denied as the irreversible tier
         return could_not_run("irreversible", "this call")
@@ -1627,6 +1630,49 @@ def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold:
         return could_not_run(tier, what)
     if decision is None:
         return undecided_output(tier, what, request.id)
+    return decision_output(decision, SLOT_HOW)
+
+
+def _slot_ungated(event: Mapping[str, Any], session: str, tool_name: str, tool_input: Any, cwd: str, *,
+                  home: Path | None, client: Any, hold: float, expected_uid: int | None,
+                  sleep: Callable[[float], None], monotonic: Callable[[], float]) -> dict[str, Any] | None:
+    """:func:`slot_gate` for a call :func:`gate_class` does not gate (W2-c3, head ruling 1020+49): a file write
+    (:data:`FILE_TOOLS`) goes to the broker (:func:`levain.consent.broker_client.file_ungated`), with its grant member
+    when :func:`~levain.consent.broker_client.grant_member` reads one, so a dispatch run's signed contract can allow
+    it; with no member (a MultiEdit, a relative path) it is sent all the same, and a dispatch run files it for the
+    operator (L3 r1 triage R1). At the end of the hold a call the run queued is denied as the reversible tier.
+    ``None`` (the mode decides, as for any ungated call) only for a call that is not a file write or on the broker's
+    GO; GO is not allow. Any failure (the member that cannot be read, a planted socket variable, no socket or cap,
+    the broker unreachable, refusing, out of shape, or not the broker) is :func:`could_not_run`'s deny: broker down
+    means the hooks fail CLOSED (BUILD_F10), so a dispatch run's write outside its list never goes through on an
+    outage. The price: an interactive slot loses its ordinary writes while its broker is down (head ruling
+    1020+49)."""
+    from levain.consent import broker_client
+
+    def what() -> str:
+        try:
+            return _what(tool_name, tool_input)
+        except Exception:  # noqa: BLE001 - a call that cannot be described is still denied
+            return "this call"
+
+    try:
+        member = broker_client.grant_member(AGENT, tool_name, tool_input, cwd)
+        if member is None and tool_name not in FILE_TOOLS:
+            return None
+        if queue_socket_planted(cwd, home=home):
+            return could_not_run("reversible", what())
+        tool_use_id = event.get("tool_use_id")
+        got = broker_client.file_ungated(
+            client, member=member, agent=AGENT, session=session, tool_name=tool_name, tool_input=tool_input,
+            cwd=cwd, event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None, hold=hold,
+            poll=GATE_POLL, expected_uid=expected_uid, sleep=sleep, monotonic=monotonic)
+        if got[0] == broker_client.GO:
+            return None
+        decision, request_id = got
+    except Exception:  # noqa: BLE001 - see the docstring: fail closed
+        return could_not_run("reversible", what())
+    if decision is None:
+        return undecided_output("reversible", what(), request_id)
     return decision_output(decision, SLOT_HOW)
 
 

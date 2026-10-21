@@ -180,7 +180,7 @@ def test_no_answer_at_all_is_undecided_at_the_hold(adapter, L, slot, ws, tmp_pat
 
 
 @pytest.mark.parametrize("adapter", ["cc", "codex"])
-def test_the_broker_stopped_denies_a_gated_call_and_passes_an_ungated_one(adapter, L, slot, ws, tmp_path):
+def test_the_broker_stopped_denies_a_gated_call_and_a_grantable_one_and_passes_bash(adapter, L, slot, ws, tmp_path):
     slot.stop()
     out = gate_of(adapter)(event_of(adapter, ws), hold=HOLD, **kw_of(adapter, tmp_path))
     if adapter == "cc":
@@ -188,8 +188,16 @@ def test_the_broker_stopped_denies_a_gated_call_and_passes_an_ungated_one(adapte
         assert out == cc.could_not_run("irreversible", what) and out["continue"] is False
     else:
         assert out == cx.could_not_run("apply_patch of .codex/hooks.json")
-    ungated = cc_event(ws, path="notes.txt") if adapter == "cc" else cx_event(ws, gated=False)
+    # an ungated call no contract can grant (Bash) never asks the broker: the mode decides
+    ungated = cc_event(ws, tool_name="Bash", tool_input={"command": "ls"}) if adapter == "cc" \
+        else cx_event(ws, gated=False)
     assert gate_of(adapter)(ungated, hold=HOLD, **kw_of(adapter, tmp_path)) is None
+    if adapter == "cc":
+        # a grantable ungated call asks it (W2-c3), and a broker that is down denies it (fail closed, head ruling
+        # 1020+49), with no hard stop: it is the reversible tier
+        notes = cc_event(ws, path="notes.txt")
+        out = gate_of(adapter)(notes, hold=HOLD, **kw_of(adapter, tmp_path))
+        assert out == cc.could_not_run("reversible", cc._what("Write", notes["tool_input"])) and "continue" not in out
 
 
 @pytest.mark.parametrize("adapter", ["cc", "codex"])
@@ -210,7 +218,8 @@ def run_main(module, event):
 @pytest.mark.parametrize("module", [cc, cx])
 def test_main_in_a_slot_opens_no_local_queue(module, L, slot, ws, tmp_path, monkeypatch):
     monkeypatch.setattr(module, "_queue_for", lambda *a: pytest.fail("a local ConsentQueue in a slot"))
-    ev =cc_event(ws, path="notes.txt") if module is cc else cx_event(ws, gated=False)
+    # an ungated call no contract can grant: main never reaches the broker (no broker account on a test machine)
+    ev = cc_event(ws, tool_name="Bash", tool_input={"command": "ls"}) if module is cc else cx_event(ws, gated=False)
     assert run_main(module, ev) == ""
     assert not (tmp_path / "home" / ".levain" / "consent").exists()
 
@@ -462,7 +471,7 @@ def test_a_fake_broker_run_by_another_uid_is_refused_before_a_frame(adapter, fak
 def test_the_same_fake_with_its_own_uid_expected_is_answered(adapter, fake, ws, tmp_path):
     """The control for the case above: the refusal is the uid check, nothing else about the fake."""
     out = gate_of(adapter)(event_of(adapter, ws), hold=HOLD, **kw_of(adapter, tmp_path))
-    assert "allowed by a signed levain answer the queue broker verified" in json.dumps(out)
+    assert f"allowed by {cc.SLOT_HOW}" in json.dumps(out)
     assert fake.frames == 2
 
 
@@ -489,7 +498,7 @@ def test_the_hook_looks_the_broker_account_up_by_name(adapter, L, slot, ws, keys
     monkeypatch.setattr(broker_client.pwd, "getpwnam", getpwnam)
     kw = {k: v for k, v in kw_of(adapter, tmp_path).items() if k != "expected_uid"}
     out = gate_of(adapter)(event_of(adapter, ws), hold=HOLD, sleep=answering(L, keys["operator"]), **kw)
-    assert "allowed by a signed levain answer the queue broker verified" in json.dumps(out)
+    assert f"allowed by {cc.SLOT_HOW}" in json.dumps(out)
     assert asked == [broker_client.BROKER_ACCOUNT]   # once per client, not per call
 
 
@@ -616,7 +625,7 @@ def test_a_broker_rate_limiting_the_first_request_files_it_on_the_retry(adapter,
         monkeypatch.delenv(name, raising=False)
     try:
         out = gate_of(adapter)(event_of(adapter, ws), hold=HOLD, sleep=lambda s: None, **kw_of(adapter, tmp_path))
-        assert "allowed by a signed levain answer the queue broker verified" in json.dumps(out)
+        assert f"allowed by {cc.SLOT_HOW}" in json.dumps(out)
         assert srv.requests == 2
     finally:
         srv.close()
