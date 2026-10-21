@@ -182,22 +182,17 @@ def test_no_answer_at_all_is_undecided_at_the_hold(adapter, L, slot, ws, tmp_pat
 @pytest.mark.parametrize("adapter", ["cc", "codex"])
 def test_the_broker_stopped_denies_a_gated_call_and_a_grantable_one_and_passes_bash(adapter, L, slot, ws, tmp_path):
     slot.stop()
+    # F10 S2b-2: EVERY call asks GATE first, before it is classified, so a broker that is down denies them all
+    # (fail closed), with the irreversible tier's hard stop on Claude Code (the call is not yet classified)
+    down = cc.could_not_run("irreversible", "this call") if adapter == "cc" else cx.could_not_run("this call")
     out = gate_of(adapter)(event_of(adapter, ws), hold=HOLD, **kw_of(adapter, tmp_path))
-    if adapter == "cc":
-        what = cc._what("Write", {"file_path": str(ws / ".claude/agents/probe2.md"), "content": "probe two"})
-        assert out == cc.could_not_run("irreversible", what) and out["continue"] is False
-    else:
-        assert out == cx.could_not_run("apply_patch of .codex/hooks.json")
-    # an ungated call no contract can grant (Bash) never asks the broker: the mode decides
+    assert out == down
     ungated = cc_event(ws, tool_name="Bash", tool_input={"command": "ls"}) if adapter == "cc" \
         else cx_event(ws, gated=False)
-    assert gate_of(adapter)(ungated, hold=HOLD, **kw_of(adapter, tmp_path)) is None
+    assert gate_of(adapter)(ungated, hold=HOLD, **kw_of(adapter, tmp_path)) == down
     if adapter == "cc":
-        # a grantable ungated call asks it (W2-c3), and a broker that is down denies it (fail closed, head ruling
-        # 1020+49), with no hard stop: it is the reversible tier
         notes = cc_event(ws, path="notes.txt")
-        out = gate_of(adapter)(notes, hold=HOLD, **kw_of(adapter, tmp_path))
-        assert out == cc.could_not_run("reversible", cc._what("Write", notes["tool_input"])) and "continue" not in out
+        assert gate_of(adapter)(notes, hold=HOLD, **kw_of(adapter, tmp_path)) == down
 
 
 @pytest.mark.parametrize("adapter", ["cc", "codex"])
@@ -218,9 +213,12 @@ def run_main(module, event):
 @pytest.mark.parametrize("module", [cc, cx])
 def test_main_in_a_slot_opens_no_local_queue(module, L, slot, ws, tmp_path, monkeypatch):
     monkeypatch.setattr(module, "_queue_for", lambda *a: pytest.fail("a local ConsentQueue in a slot"))
-    # an ungated call no contract can grant: main never reaches the broker (no broker account on a test machine)
+    # every call asks GATE (F10 S2b-2): the hook finds no broker account on a test machine and denies, with no local
+    # queue on the way
     ev = cc_event(ws, tool_name="Bash", tool_input={"command": "ls"}) if module is cc else cx_event(ws, gated=False)
-    assert run_main(module, ev) == ""
+    out = json.loads(run_main(module, ev))
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "the gate could not run" in out["hookSpecificOutput"]["permissionDecisionReason"]
     assert not (tmp_path / "home" / ".levain" / "consent").exists()
 
 
@@ -396,7 +394,7 @@ class FakeServer:
 
         self.dir = Path(tempfile.mkdtemp(prefix="bcf", dir="/tmp"))
         self.path = self.dir / "q.sock"
-        self.frames, self.requests, self.rate_limit_first = 0, 0, rate_limit_first
+        self.frames, self.requests, self.gates, self.rate_limit_first = 0, 0, 0, rate_limit_first
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.bind(str(self.path))
         self.sock.listen(8)
@@ -415,7 +413,10 @@ class FakeServer:
                     if msg is None:
                         continue
                     self.frames += 1
-                    if msg["op"] == "REQUEST":
+                    if msg["op"] == "GATE":
+                        self.gates += 1
+                        wire.write_frame(conn, {"id": msg["id"], "ok": True, "gate": "go"})
+                    elif msg["op"] == "REQUEST":
                         self.requests += 1
                         if self.rate_limit_first and self.requests == 1:
                             wire.write_frame(conn, {"id": msg["id"], "ok": False, "refused": "rate-limited"})
@@ -472,7 +473,7 @@ def test_the_same_fake_with_its_own_uid_expected_is_answered(adapter, fake, ws, 
     """The control for the case above: the refusal is the uid check, nothing else about the fake."""
     out = gate_of(adapter)(event_of(adapter, ws), hold=HOLD, **kw_of(adapter, tmp_path))
     assert f"allowed by {cc.SLOT_HOW}" in json.dumps(out)
-    assert fake.frames == 2
+    assert fake.frames == 3 and fake.gates == 1   # GATE (go), REQUEST, ANSWER?
 
 
 @pytest.mark.parametrize("module", [cc, cx])
@@ -629,3 +630,72 @@ def test_a_broker_rate_limiting_the_first_request_files_it_on_the_retry(adapter,
         assert srv.requests == 2
     finally:
         srv.close()
+
+
+# --- F9: halted and over-limit driven through slot_gate, both adapters, a real broker on a real socket -----------
+
+def _ungated(adapter, ws, n=0):
+    return cc_event(ws, path="notes.txt", tool_use_id=f"u{n}") if adapter == "cc" \
+        else cx_event(ws, gated=False, tool_use_id=f"u{n}")
+
+
+def _denied_with(adapter, out, words):
+    hook = out["hookSpecificOutput"]
+    assert hook["permissionDecision"] == "deny" and words in hook["permissionDecisionReason"]
+    if adapter == "cc":                                         # Claude Code: the turn ends too
+        assert out["continue"] is False and out["stopReason"] == cc.SLOT_STOP_REASON
+
+
+@pytest.mark.parametrize("adapter", ["cc", "codex"])
+def test_slot_gate_denies_every_call_of_a_session_halted_on_an_unanswered_irreversible_call(adapter, L, slot, ws,
+                                                                                            tmp_path):
+    kw = kw_of(adapter, tmp_path)
+    out = gate_of(adapter)(event_of(adapter, ws), hold=0.6, **kw)    # filed at the halt tier, no answer
+    assert "UNDECIDED" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    (rid,) = rows(L)
+    time.sleep(0.2)                                                   # past the row's own hold
+    _denied_with(adapter, gate_of(adapter)(_ungated(adapter, ws), hold=HOLD, **kw), f"halted on request {rid}")
+    before = rows(L)
+    _denied_with(adapter, gate_of(adapter)(event_of(adapter, ws, tool_use_id="g2"), hold=HOLD, **kw), "halted")
+    assert rows(L) == before                                          # denied before it is filed
+
+
+@pytest.fixture
+def limited_slot(L, monkeypatch, tmp_path):
+    """``slot`` with a limits source: calls 2 for every agent."""
+    run_dir = Path(tempfile.mkdtemp(prefix="bl", dir="/tmp"))
+    resolver = FakeResolver()
+    resolver.add(1, CAP, SESSION)
+    broker = Broker(QueueStore(L / "queue"), resolver, SignersSource(L / "policy", L / "routes" / "trust.pub"),
+                    limits=lambda agent, session: {"calls": 2})
+    lst = SlotListener(broker, 1, run_dir / "q.sock", os.getuid(), expected_gid=bound_gid(run_dir))
+    lst.start()
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "CLAUDE_PROJECT_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "home" / ".levain"))
+    monkeypatch.setenv(broker_client.SOCKET_ENV, str(lst.path))
+    monkeypatch.setenv(broker_client.CAP_ENV, CAP)
+    try:
+        yield lst
+    finally:
+        lst.stop()
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("adapter", ["cc", "codex"])
+def test_slot_gate_denies_a_call_over_the_limit_with_the_slot_words(adapter, L, limited_slot, ws, tmp_path):
+    kw = kw_of(adapter, tmp_path)
+    assert [gate_of(adapter)(_ungated(adapter, ws, n), hold=HOLD, **kw) for n in range(2)] == [None, None]
+    out = gate_of(adapter)(_ungated(adapter, ws, 3), hold=HOLD, **kw)
+    _denied_with(adapter, out, "reached its tool calls limit")
+    assert "limits settings" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "levain limits extend" not in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert rows(L) == []
+
+
+@pytest.mark.parametrize("adapter", ["cc", "codex"])
+def test_slot_gate_denies_when_the_limits_gate_failed(adapter, L, limited_slot, ws, tmp_path):
+    (L / "queue" / "requests" / "limits").write_text("not a dir\n")
+    out = gate_of(adapter)(_ungated(adapter, ws), hold=HOLD, **kw_of(adapter, tmp_path))
+    _denied_with(adapter, out, "the limits gate could not run")

@@ -380,12 +380,18 @@ def test_a_file_write_with_no_member_and_the_broker_down_is_denied(world, slots,
     monkeypatch.setenv(broker_client.SOCKET_ENV, "/tmp/levain-no-such-broker.sock")
     tool, tool_input = _no_member_writes(world["root"])["MultiEdit (in the write list, not grantable)"]
     out = gate("cc", _event(world["root"], tool, tool_input), slots)
-    assert out == cc.could_not_run("reversible", cc._what(tool, tool_input))
+    # F10 S2b-2: the GATE asked first, before the call is classified, is what fails
+    assert out == cc.could_not_run("irreversible", "this call")
 
 
-def test_a_call_that_is_not_a_file_write_is_not_sent(world, slots, monkeypatch):
-    monkeypatch.setenv(broker_client.SOCKET_ENV, "/tmp/levain-no-such-broker.sock")
+def test_a_call_that_is_not_a_file_write_asks_only_gate(world, slots, monkeypatch):
+    slots["use"](2)
     assert gate("cc", _event(world["root"], "Bash", {"command": "ls"}), slots) is None
+    assert no_rows(slots["q"])
+    # and with the broker down, the GATE fails closed (every call asks it)
+    monkeypatch.setenv(broker_client.SOCKET_ENV, "/tmp/levain-no-such-broker.sock")
+    assert gate("cc", _event(world["root"], "Bash", {"command": "ls"}), slots) == \
+        cc.could_not_run("irreversible", "this call")
 
 
 @pytest.mark.parametrize("adapter,slot", [("cc", 1), ("cc", 2), ("codex", 1), ("codex", 2)])

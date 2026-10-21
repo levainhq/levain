@@ -122,6 +122,19 @@ def test_store_failure_fails_open_then_denies(tmp_path, monkeypatch):
     assert L._fail_read(fail) == 0
 
 
+def test_store_failure_whose_count_cannot_be_written_denies_at_once(tmp_path, monkeypatch):
+    # L3 r2 codex F2: ENOSPC / a read-only fs under a valid 0700 dir; the count read 1 forever and failed open forever
+    q = _qdir(tmp_path)
+
+    def boom(*a, **k):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(L, "_count", boom)
+    monkeypatch.setattr(L, "_fail_write", lambda *a, **k: False)
+    got = [_count(q, i) for i in range(3)]
+    assert [v.state for v in got] == ["fail_deny"] * 3
+    assert "could not be written" in got[0].reason
+
+
 def test_limits_json_overlays_and_bad_file_keeps_defaults(tmp_path):
     q = _qdir(tmp_path)
     assert L.load_limits(q, "codex") == (L.DEFAULTS, "defaults")
