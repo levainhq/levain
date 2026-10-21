@@ -219,9 +219,9 @@ def answer_signature_problem(signature: str, public_key: str, page_origin: "str 
     Touch ID or the device passcode, as the authenticator reports it), and come from a page whose origin is exactly
     the key's own ``https://<host>`` (:func:`_client_origin`, which ``page_origin`` pins on ``localhost``). Among
     levain's own verifiers, the consent queue accepts a passkey's signature only in its answer, ruling and away-leave
-    namespaces (it runs this check for all three), and the authority replay and the broker refuse it for anything
-    else. The phone port's sign requests (:mod:`levain.consent.sign`) also run this check, for a caller outside
-    levain, in namespaces levain never verifies; so does dispatch (:mod:`levain.dispatch.sign`), for the operator's
+    namespaces (it runs this check for all three), the authority replay accepts it on a ``revoke_grant`` link only
+    (and runs this check on it at every replay), and the broker refuses it for anything. The phone port's sign
+    requests (:mod:`levain.consent.sign`) also run this check, for a caller outside levain, in namespaces levain never verifies; so does dispatch (:mod:`levain.dispatch.sign`), for the operator's
     signatures in its own namespaces (each one a ``levain-dispatch-`` row of ``levain/contracts/namespaces.py``). Its
     refusals therefore name a signature, never an answer."""
     try:

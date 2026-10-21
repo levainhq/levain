@@ -1003,7 +1003,7 @@ class Broker:
         """The verified signer's fingerprint (§6.5), against a signers file generated from the
         request's authority snapshot (its unrevoked keys) for this verification into a fresh
         ``mkstemp`` file in the data root."""
-        # a passkey signs consent answers only: it is never a signer of a pending
+        # a passkey is never a signer of a pending (it signs consent answers, and in the authority log a revoke)
         keys = sorted((k.principal, k.public_key) for k in authority.active_keys() if k.custody != PASSKEY)
         fd, path = tempfile.mkstemp(prefix=".signers-", dir=self.data_root)
         try:

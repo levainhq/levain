@@ -22,6 +22,10 @@ it serves only these:
     cancelled, or a recommended one's run authorised and landed, with a passkey, verified by the job store against the same one
     cockpit as the sign requests; ``consent.json`` lists the live jobs as ``dispatch_pending``, with ``dispatch_note``
     (why the store could not be read) and ``dispatch_overflow`` (:mod:`levain.dispatch.phone`).
+  - ``POST /grant/<id>/revoke-challenge`` and ``.../revoke``: a standing grant revoked with a passkey (the one
+    authority link a passkey may sign), the link built and held here and verified by the authority log itself;
+    ``consent.json`` lists the grants as ``grants``, with ``grants_note`` and ``inert_note``
+    (:mod:`levain.consent.grant_phone`).
   - ``GET /consent.json`` also lists ``questions`` (the open ones an agent filed, :mod:`levain.consent.questions`) and
     ``POST /question/<n>/answer`` answers one by an option key or free text, once. An answer is UNSIGNED (no
     passkey) and authorises NOTHING: it is words the agent is told; it is then delivered to the agent's session
@@ -80,6 +84,8 @@ _SIGN_PREFIX = "/sign/"
 _SIGN_ACTIONS = ("challenge", "answer", "deny")
 _DISPATCH_ROUTE = re.compile(
     r"/dispatch/(dj-[0-9a-f]{32})/(challenge|answer|cancel-challenge|cancel|authorise-challenge|authorise)")
+_GRANT_PREFIX = "/grant/"
+_GRANT_ACTIONS = ("revoke-challenge", "revoke")
 _MAX_BODY = 16 * 1024          # an assertion is well under 2 KB, an answer record under 1 KB
 _MAX_INFLIGHT = 4              # each answer replays the authority log; past this a caller gets 503, never a queue
 # how long a ruling's response waits for its delivery, which runs on its own thread holding no request slot (a
@@ -118,6 +124,20 @@ def _sign_route(route: str) -> "tuple[str, str] | None":
     if not sep or re.fullmatch(r"[A-Za-z0-9_-]{8,64}", rid) is None or action not in _SIGN_ACTIONS:
         return None
     return rid, action
+
+
+def _grant_route(route: str) -> "tuple[str, str] | None":
+    """``(grant_id, action)`` for ``/grant/<id>/<action>``, else None. A grant's id is its creator's choice, so the
+    page sends encodeURIComponent(id); the decoded id is looked up in the log, never trusted further."""
+    if not route.startswith(_GRANT_PREFIX):
+        return None
+    from urllib.parse import unquote
+
+    quoted, sep, action = route[len(_GRANT_PREFIX):].partition("/")
+    gid = unquote(quoted)
+    if not sep or not gid or len(gid) > 200 or action not in _GRANT_ACTIONS:
+        return None
+    return gid, action
 
 
 # the phone app's own routes (levain.phone_app), each with the one method it answers
@@ -299,7 +319,9 @@ class _PhoneHandler(GuardedHandler):
         sign = _sign_route(route)
         question = _QUESTION_ROUTE.fullmatch(route)
         dispatch = _DISPATCH_ROUTE.fullmatch(route)
-        if consent is None and sign is None and question is None and dispatch is None and route != _KEY_LINE:
+        grant = _grant_route(route)
+        if (consent is None and sign is None and question is None and dispatch is None and grant is None
+                and route != _KEY_LINE):
             if not self._app_post(route):
                 self._reject(404, "not_found", "no such route")
             return
@@ -326,7 +348,8 @@ class _PhoneHandler(GuardedHandler):
         # throw that ceremony away; everything else answers busy at once
         waits = ((consent is not None and consent[1] in ("answer", "rule")) or (sign is not None and sign[1] == "answer")
                  or (question is not None and question.group(2) == "rule")
-                 or (dispatch is not None and dispatch.group(2) in ("answer", "cancel", "authorise")))
+                 or (dispatch is not None and dispatch.group(2) in ("answer", "cancel", "authorise"))
+                 or (grant is not None and grant[1] == "revoke"))
         if not (self.server.request_gate.acquire(timeout=5) if waits else self.server.request_gate.acquire(blocking=False)):
             self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503)
             return
@@ -337,6 +360,8 @@ class _PhoneHandler(GuardedHandler):
                 result = self.server.sign_step(sign[0], sign[1], req)
             elif dispatch is not None:
                 result = self.server.dispatch_step(dispatch.group(1), dispatch.group(2), req)
+            elif grant is not None:
+                result = self.server.grant_step(grant[0], grant[1], req)
             elif question is not None and question.group(2) == "rule":
                 result = self.server.question_rule(int(question.group(1)), req)
             elif question is not None:
@@ -386,6 +411,9 @@ class _PhoneServer(ThreadingHTTPServer):
 
         self.dispatch_dir = dispatch_dir
         self.dispatch = DispatchPhone(dispatch_dir, rp_id, self.page_origin, self._sign_keys, self._sign_authority)
+        from levain.consent.grant_phone import GrantPhone
+
+        self.grants = GrantPhone(queue_dir, rp_id, self.page_origin, self._sign_keys, self._sign_root)
         self._phone_app: Any = None
         self._app_lock = threading.Lock()
         self._redeems: list[float] = []
@@ -535,7 +563,7 @@ class _PhoneServer(ThreadingHTTPServer):
                 "pending": rows, "undecided": undecided, "overflow": listing.overflow,
                 "enrolled": self._enrolled(memo), "sign_pending": sign_pending, "sign_note": sign_note,
                 "sign_overflow": sign_overflow, "dispatch_pending": dispatch_pending, "dispatch_note": dispatch_note,
-                "dispatch_overflow": dispatch_overflow}
+                "dispatch_overflow": dispatch_overflow, **self.grants.listing()}
 
     def _questions(self) -> "tuple[list[dict[str, Any]], int, str]":
         """The open questions (oldest first, capped like the pending list), how many were left out, and a note when
@@ -718,6 +746,15 @@ class _PhoneServer(ThreadingHTTPServer):
             word = {400: "bad_request", 404: "not_found", 409: "conflict", 503: "unavailable"}.get(exc.status,
                                                                                                    "sign_refused")
             raise PhoneError(exc.status, word, str(exc)) from None
+
+    def grant_step(self, grant_id: str, action: str, req: Any) -> dict[str, Any]:
+        """``/grant/<id>/<action>`` (:meth:`levain.consent.grant_phone.GrantPhone.step`)."""
+        from levain.consent.grant_phone import GrantRefused
+
+        try:
+            return self.grants.step(grant_id, action, req)
+        except GrantRefused as exc:
+            raise PhoneError(exc.status, exc.error, exc.message) from None
 
     def dispatch_step(self, job_id: str, action: str, req: Any) -> dict[str, Any]:
         """``/dispatch/<job>/<action>`` (:meth:`levain.dispatch.phone.DispatchPhone.step`)."""

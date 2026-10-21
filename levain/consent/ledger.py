@@ -470,6 +470,19 @@ class Ledger:
         return self._select(f"received_at >= ? AND received_at <= ? AND stamp IN ({marks})", (lo, hi, *DIGEST_STAMPS),
                             per_call=True)
 
+    def for_requests(self, request_ids: "list[str]") -> dict[str, str]:
+        """``{queue request id: outcome}`` for the calls levain answered at the gate with those requests (their ``pre``
+        rows, one per call, ``window``'s rule): what each authorised call then did. A request with no row is absent."""
+        ids = sorted(set(request_ids))
+        out: dict[str, str] = {}
+        with self._read() as conn:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                out.update(conn.execute(
+                    f"SELECT request_id, outcome FROM {_PER_CALL} WHERE phase = 'pre' AND request_id IN "
+                    f"({', '.join('?' for _ in chunk)})", chunk).fetchall())
+        return out
+
     def counts(self, since: str | datetime | None = None, until: str | datetime | None = None
                ) -> list[tuple[str, str, str, int]]:
         """``(agent, stamp, outcome, calls)`` over the window, sorted, one per call (``window``'s rule). No

@@ -1260,9 +1260,11 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             signer = found
             if not signer.active:
                 raise AuthorityError(f"signer {row.signer_fp} was revoked at seq {signer.revoked_seq}")
-            if signer.custody == PASSKEY:
-                # a passkey signs consent answers only (its own namespace, the consent queue's check); a link it
-                # signed is refused whatever its class's rank would allow
+            if signer.custody == PASSKEY and op != "revoke_grant":
+                # a passkey signs consent answers (its own namespace, the consent queue's check) and, in this log,
+                # one op: the removal of a standing grant, which only ever narrows what an agent may do (a synced
+                # passkey stolen with its account can cost the operator prompts, never widen anything). Every
+                # other link it signed is refused whatever its class's rank would allow
                 raise AuthorityError(f"a {PASSKEY} key signs consent answers only, never an authority link")
             need = _apply_op(rec, seq, state, keys, ssh_keygen)
             if isinstance(need, StandingPolicy):
@@ -1293,7 +1295,15 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                              fingerprint=signer.fingerprint, ssh_keygen=ssh_keygen)
         if not ok:
             raise ReplayError(seq, f"the signature does not verify as {signer.fingerprint}")
-    hashes = (() if state is None else state._hashes) + (row.hash,)
+        if signer.custody == PASSKEY:
+            # the three checks ssh-keygen does not make on a WebAuthn signature (user verification, an origin that is
+            # the key's own, not cross-origin), run at every replay as the consent queue runs them on every delivery
+            from levain.consent.passkey import answer_signature_problem
+
+            problem = answer_signature_problem(row.signature, signer.public_key)
+            if problem is not None:
+                raise ReplayError(seq, f"the passkey signature is refused: {problem}")
+    hashes =(() if state is None else state._hashes) + (row.hash,)
     return AuthoritySnapshot(rec["store_id"], seq, row.hash, MappingProxyType(keys), policy, hashes, head_at=at,
                              grant_seqs=MappingProxyType(grant_seqs))
 
