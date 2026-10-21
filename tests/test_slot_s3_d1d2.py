@@ -244,7 +244,22 @@ def test_a_bootout_launchctl_did_not_report_done_fails_the_kill():
     seams = t.seams()
     seams.domain_out = lambda uid, timeout: False
     assert P.UidProcs(seams).kill(SLOT, 1.0) is False
-    assert pids_sent(t, 9) == set()                        # nothing signalled under a domain launchd still runs
+    assert pids_sent(t, 9) == {2913}                       # L2: the sweep still runs, the workload never outlives it
+
+
+def test_the_bootout_gets_half_the_bound_and_the_sweep_the_rest():
+    """L2 (launchd lens): a bootout that takes its whole timeout leaves the sweep at least half the bound."""
+    t, _booted, domain_out = _respawning_table()
+    seams = t.seams()
+    given = []
+
+    def slow(uid, timeout):
+        given.append(timeout)
+        t.t += timeout
+        return False
+    seams.domain_out = slow
+    assert P.UidProcs(seams).kill(SLOT, 1.0) is False
+    assert given == [0.5] and pids_sent(t, 9) == {2913}
 
 
 def test_scrub_boots_each_uid_out_once():
@@ -256,8 +271,10 @@ def test_scrub_boots_each_uid_out_once():
     assert [c[1] for c in calls] == [SLOT, GW, CHILD]
 
 
-@pytest.mark.parametrize("rc,ok", [(0, True), (124, True), (1, False), (3, False), (113, False)])
-def test_darwin_bootout_reads_tearing_down_as_under_way(monkeypatch, rc, ok):
+@pytest.mark.parametrize("rc,err,ok", [(0, b"", True), (124, b"Boot-out failed: 124: Domain is tearing down\n", True),
+                                       (124, b"Boot-out failed: 124: something else\n", False), (1, b"", False),
+                                       (3, b"", False), (113, b"", False)])
+def test_darwin_bootout_reads_tearing_down_as_under_way(monkeypatch, rc, err, ok):
     """124 'Domain is tearing down' answered a bootout right after one (runs/s3-macos-2f-final/raw/Z1_Z2.txt)."""
-    monkeypatch.setattr(P.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=rc, stdout=b"", stderr=b""))
+    monkeypatch.setattr(P.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=rc, stdout=b"", stderr=err))
     assert P.darwin_bootout(4000, 1.0) is ok
