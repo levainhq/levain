@@ -89,11 +89,11 @@ def add_parser(cs_sub: argparse._SubParsersAction) -> None:
     """``levain consent signed-answers`` under the ``consent`` subparsers ``cs_sub``."""
     p = cs_sub.add_parser(
         "signed-answers", help="Show or set whether answers are filed as passkey sign requests.",
-        description="off: nothing is filed, answers stay plain taps. authority-only (the default): only an answer "
+        description=f"off: nothing is filed, answers stay plain taps. authority-only: only an answer "
                     "that authorises an act (a release, a merge, a security claim's words, an outward act) is "
                     "filed as a sign request, signed on the phone with the passkey. all: every answer with options "
-                    "is. A caller reads this before filing; levain files nothing itself. Kept in the queue dir's "
-                    f"{SETTING_NAME}.")
+                    f"is. Default: {DEFAULT}. A caller reads this before filing; levain files nothing itself. Kept "
+                    f"in the queue dir's {SETTING_NAME}.")
     p.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
                    help="The consent queue's directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent).")
     p.add_argument("--set", dest="value", choices=VALUES, default=None, help="Set it (else it is shown).")
