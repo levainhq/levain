@@ -22,7 +22,8 @@ from tests.test_slot_s2a_records import CONTRACT_EDGES
 
 OP_UID = os.getuid() if os.getuid() != 0 else 501
 FOREIGN_UID = OP_UID + 1000
-ROLE_UID = {"root": 0, "op": OP_UID, "foreign": FOREIGN_UID}
+QB_UID = OP_UID + 2000
+ROLE_UID = {"root": 0, "op": OP_UID, "foreign": FOREIGN_UID, "qbroker": QB_UID}
 
 S1, S2, S3, S4 = (f"s-{i:016x}" for i in range(1, 5))
 
@@ -32,7 +33,8 @@ ALL_VERBS = ("LEASE-OPEN", "STATUS", "ATTACH", "CAS", "MINT", "FRONT-ARM", "SECR
              "RUN-TICKET-CANCEL", "ROUTE-SUBMIT", "CONFIG-SUBMIT", "SESSION-EVENTS", "ARTIFACT-ACK", "POOL",
              "NOT-A-VERB")
 SESSION2 = {"operator": {"LEASE-OPEN", "STATUS"},
-            "root": {"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET"}}
+            "root": {"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET"},
+            "qbroker": {"QUEUE-RESOLVE"}}
 
 
 def attach_claims(**kw) -> dict:
@@ -125,7 +127,7 @@ class Env:
 
     def start(self) -> None:
         self.store = C.StateStore(self.store_dir)
-        kw = {**self.seams.kw(), **self.control_kw}
+        kw = {"qbroker_uid": QB_UID, **self.seams.kw(), **self.control_kw}
         self.control = C.Control(self.store, OP_UID, **kw)
         self.server = C.ControlServer(self.control, self.sock_path, peer_uid=self.peer)
         self.server.start()
@@ -253,7 +255,7 @@ def test_malformed_frame_on_lease_is_its_eof(env):
 
 # --- the verb matrix ---------------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("role,kind", [("op", "operator"), ("root", "root"), ("foreign", None)])
+@pytest.mark.parametrize("role,kind", [("op", "operator"), ("root", "root"), ("qbroker", "qbroker"), ("foreign", None)])
 def test_verb_not_allowed_for_peer_matrix(env, role, kind):
     c = env.client(role)
     for verb in ALL_VERBS:
