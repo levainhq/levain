@@ -195,7 +195,7 @@ def await_exec(fd: int, *, bound_s: float, clock: Callable[[], float] = time.mon
 
 def kill_domain(ctx: H.Ctx, a: R.Alloc) -> bool:
     """Every process of the session's kill domain, by proc.py's END kill (Linux: ``cgroup.kill`` on alloc's cgroup,
-    proven by ``populated 0``; macOS: the slot uid's launchd domain booted out, then SIGKILL sweeps). Never only one pid: on Linux the pid the
+    proven by ``populated 0``; macOS: SIGKILL sweeps of the slot uid). Never only one pid: on Linux the pid the
     helper holds is bwrap's monitor, and the vendor is another process in the session's PID namespace."""
     seams = ctx.seams
     _, kill, _ = PR.end_seams(seams.host, a.cgroup if seams.host == "linux" else None,
