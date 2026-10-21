@@ -50,7 +50,7 @@ launch it asked for did not start. Stdlib only.
 
 Known edges: a trust refusal or a session never listed is a death, so three in a row stop the wakes until you take
 or release (the first real run will likely meet it). A refusal before the spawn claim (the hook not live, the briefs
-directory refused) is no death: the launch stays pending, each start says why, and it expires unspawned. The consent
+directory refused, claude not on PATH) is no death: the launch stays pending, each start says why, and it expires unspawned. The consent
 queue's settings file is created once: when your main install made it, the coordinator's install keeps it, and its
 grants verify against that install's cockpit (init warns and continues). Your user-scope Claude Code settings, hooks
 and CLAUDE.md imports load into the coordinator's session too (doctor checks the install's wiring and that no settings
@@ -58,7 +58,9 @@ file turns hooks off, not the rest of the effective settings). Drops that arrive
 the lease wait up to LEASE_TTL + IDLE_GRACE; handing a new drop into a running session is not built. A crashed spawn
 winner is not retried: its launch expires at LAUNCH_TTL and counts as a death. A session the read back listed in
 another directory than the launch's is not stopped (a name alone is not Levain's evidence); the launch fails and that
-session is yours to look at.
+session is yours to look at. The coordinator's directory under the levain home is one the hands floor denies by name
+(``levain.firing.confinement.LEVAIN_HOME_STATE_DIRS``) when it cannot deny the home whole, so a firing OF the
+coordinator's own install there refuses its floor (fail-closed).
 """
 from __future__ import annotations
 
