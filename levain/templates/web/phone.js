@@ -51,6 +51,7 @@
   let focusDone = false;      // the deep link's card was signed or denied here
   let focusMisses = 0;        // listings the linked card was not in: three, and the link is let go
   const notes = new Map();    // request id -> [text, kind], kept across redraws
+  const writeIns = new Map(); // sign request id -> the write-in words being typed, kept across redraws
 
   function draw(data) {
     rpId = data.rp_id || rpId;
@@ -411,8 +412,10 @@
     const actions = el("div", "actions");
     const signers = Array.isArray(r.signers) ? r.signers : [];
     // a choice request: one button per option; the tap signs the message with that option's line appended (the
-    // server's `line`, shown under the options, is exactly what is appended)
+    // server's `line`, shown under the options, is exactly what is appended). The requester's recommended option is
+    // marked, never selected: every option, the recommended one too, signs only on its own tap
     const options = !r.refused && Array.isArray(r.options) ? r.options : [];
+    const wi = options.length && r.write_in && typeof r.write_in === "object" ? r.write_in : null;
     if (!r.refused) {
       if (!signers.length && !kept) show(signNote || "no passkey is enrolled for this name");
       const go = (choice) => () => signWith(r, signers, say, show, actions, choice);
@@ -424,16 +427,37 @@
         actions.appendChild(b);
       }
       for (const o of options) {
-        const b = el("button", "allow option", "(" + o.key + ") " + o.text);
+        const rec = o.key === r.recommended;
+        const b = el("button", "allow option" + (rec ? " recommended" : ""), "(" + o.key + ") " + o.text);
+        if (rec) b.appendChild(el("span", "rec", "recommended"));
         b.type = "button";
         b.disabled = !usable || !signers.length;
         b.addEventListener("click", go(o.key));
         actions.appendChild(b);
       }
+      // a write-in: his own words, signed as the line with the reserved key (*) when he taps its button
+      if (wi) {
+        const box = el("input", "reason write-in");
+        box.type = "text";
+        box.maxLength = Number(wi.max) || 200;
+        box.placeholder = "or write your own answer";
+        box.setAttribute("aria-label", "your own answer to " + (r.title || r.id));
+        box.value = writeIns.get(r.id) || "";
+        box.addEventListener("input", () => writeIns.set(r.id, box.value));
+        const b = el("button", "allow option", "(" + wi.key + ") sign my words");
+        b.type = "button";
+        b.disabled = !usable || !signers.length;
+        b.addEventListener("click", () => {
+          if (!box.value) return show("type your answer first", "bad");
+          signWith(r, signers, say, show, actions, wi.key, box.value);
+        });
+        actions.append(box, b);
+      }
       if (options.length) {
         const lines = el("div", "where lines", "an option signs the boxed message with its line appended (the title "
-          + "and sender above are not signed):");
+          + "and sender above are not signed" + (r.recommended ? ", nor is the recommendation" : "") + "):");
         for (const o of options) lines.appendChild(el("div", "line", o.line));
+        if (wi) lines.appendChild(el("div", "line", wi.line + "<your words>"));
         card.appendChild(lines);
       }
     }
@@ -445,28 +469,29 @@
     return card;
   }
 
-  function signWith(r, signers, say, show, actions, choice) {
+  function signWith(r, signers, say, show, actions, choice, words) {
     const local = mine();
     const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
-    if (known.length === 1) return signAnswer(r, known[0], local[known[0]], say, choice);
-    if (!known.length && signers.length === 1) return signAnswer(r, signers[0], null, say, choice);
+    if (known.length === 1) return signAnswer(r, known[0], local[known[0]], say, choice, words);
+    if (!known.length && signers.length === 1) return signAnswer(r, signers[0], null, say, choice, words);
     const choices = known.length ? known : signers;
     show("more than one passkey is enrolled for this name; pick the one this phone holds:");
     for (const old of actions.querySelectorAll(".pick")) old.remove();
     for (const fp of choices) {
       const p = el("button", "quiet pick", fp.slice(0, 18) + "…");
       p.type = "button";
-      p.addEventListener("click", () => signAnswer(r, fp, known.length ? local[fp] : null, say, choice));
+      p.addEventListener("click", () => signAnswer(r, fp, known.length ? local[fp] : null, say, choice, words));
       actions.appendChild(p);
     }
   }
 
-  function signAnswer(r, fp, rawId, say, choice) {
+  function signAnswer(r, fp, rawId, say, choice, words) {
     if (busy) return;
     busy++;
     const base = "/sign/" + encodeURIComponent(r.id) + "/";
     const body = { signer_fp: fp, request_sha256: r.sha256 };
     if (choice !== undefined) body.choice = choice;
+    if (words !== undefined) body.write_in = words;
     say(choice !== undefined ? "asking for the challenge for (" + choice + ")…" : "asking for the challenge…");
     call("POST", base + "challenge", body).then((c) => {
       if (!c.ok) return say(why(c), "bad");
@@ -484,6 +509,7 @@
           if (!a.ok) return say("not signed: " + why(a), "bad");
           last = "signed " + (a.body.choice ? "(" + a.body.choice + ") " : "") + (r.title || r.id);
           if (r.id === focus) focusDone = true;
+          writeIns.delete(r.id);
           say("signed" + (a.body.choice ? " (" + a.body.choice + ")" : "") + " · by " + a.body.signer_fp + " in "
               + a.body.namespace, "ok");
         });
