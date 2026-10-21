@@ -73,10 +73,9 @@ QUOTA_PER_RUN = 200
 # One past it is refused `queue-busy` until one is answered or its hold ends
 PENDING_PER_SESSION = 4
 # ANSWER? polls a slot may make per second, and the burst it may save up (a REQUEST whose resolve misses the
-# cache draws on the same bucket). The consent hooks poll every GATE_POLL
-# (levain.consent.adapters.claude_code, 0.25 s), so a session with PENDING_PER_SESSION rows waiting polls 16 times
-# a second; past the rate a poll is refused `rate-limited`, which a hook must treat as no answer yet (pending, and
-# deny when its hold ends)
+# cache draws on the same bucket). Set above what PENDING_PER_SESSION rows polled at the hooks' fastest interval
+# (GATE_POLL) need; past the rate a poll is refused `rate-limited`, which a hook must treat as no answer yet (pending,
+# and deny when its hold ends)
 ANSWER_RATE = 20.0
 ANSWER_BURST = 40
 # how long a QUEUE-RESOLVE answer (a refusal too) is reused for one (slot, cap digest): a revoked cap is served
@@ -463,7 +462,11 @@ class Broker:
         if got is None:
             return None, False
         answer, identity = got
-        snapshot = self._signers.current()
+        try:
+            snapshot = self._signers.current()
+        except Exception as exc:                      # a snapshot that cannot be read verifies nothing
+            log.warning("qbroker: signers snapshot unreadable for %s: %s", request_id, exc)
+            return None, True
         with self._mutex:
             hit = self._verdicts.get(request_id)
         # the verdict holds while the answer file and the snapshot are the ones it was reached on; it reads no clock
