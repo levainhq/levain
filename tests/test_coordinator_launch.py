@@ -133,11 +133,27 @@ def qdir(tmp_path):
     return d
 
 
+@pytest.fixture(autouse=True)
+def _levain_home(tmp_path, monkeypatch):
+    """The coordinator record a launch reads and writes is this test's own."""
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "levain-home"))
+
+
+def _coordinator_dir(d):
+    """``d`` as `levain coord agent` leaves it: the role hint in its own config, and in the coordinator record."""
+    from levain.coordinator import door
+
+    (d / ".levain").mkdir(parents=True, exist_ok=True)
+    (d / ".levain" / "config.json").write_text('{"role": "coordinator"}\n')
+    door.record(d)
+    return d
+
+
 @pytest.fixture
 def workdir(tmp_path):
     d = tmp_path / "coord-install"
     d.mkdir()
-    return d
+    return _coordinator_dir(d)
 
 
 @pytest.fixture
@@ -220,6 +236,7 @@ def test_the_first_agents_row_has_no_pid_and_is_enough(store, fake, live_hook):
 def test_an_untrusted_directory_fails_with_its_realpath_and_the_remedy(qdir, tmp_path, fake, live_hook):
     real = tmp_path / "real-dir"
     real.mkdir()
+    _coordinator_dir(real)
     link = tmp_path / "linked-dir"
     link.symlink_to(real)
     store = CoordStore(qdir)
@@ -325,6 +342,7 @@ def test_a_launch_no_longer_pending_spawns_nothing(store, fake, live_hook):
 def test_a_directory_whose_hook_is_not_live_refuses(qdir, tmp_path, fake, monkeypatch):
     plain = tmp_path / "plain"
     plain.mkdir()
+    _coordinator_dir(plain)
     store = CoordStore(qdir)
     store.coord_set_agent("claude", cwd=str(plain.resolve()))
     launch_id = woken(store)
@@ -337,6 +355,27 @@ def test_a_directory_whose_hook_is_not_live_refuses(qdir, tmp_path, fake, monkey
     # fixed while it is still pending, the same launch starts
     monkeypatch.setattr(cl, "hook_live", lambda d: (True, "wired to this install"))
     assert cl.launch_session(store, launch_id).started
+
+
+def test_a_coordinator_is_never_launched_into_an_unmarked_reused_install(qdir, tmp_path, fake, live_hook):
+    """Reproduced (coordint/tests_new_on_merged.txt): a setting naming a live install with no coordinator record and
+    no role (written before `coord agent` refused one, or straight into the store) started a coordinator there, where
+    the door is open."""
+    own = tmp_path / "own-install"
+    own.mkdir()
+    store = CoordStore(qdir)
+    store.coord_set_agent("claude", cwd=str(own.resolve()))
+    launch_id = woken(store)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and got.refusal.startswith("review item: ") and "not a coordinator's workspace" in got.refusal
+    assert f"launch {launch_id} left pending" in got.refusal
+    assert fake.spawns() == [] and store.launch(launch_id).state == "pending"
+    # a workspace rendered before the record (the role hint only) is recorded at its launch and starts
+    (own / ".levain").mkdir()
+    (own / ".levain" / "config.json").write_text('{"role": "coordinator"}\n')
+    assert cl.launch_session(store, launch_id).started
+    from levain.coordinator import door
+    assert str(own.resolve()) in door.recorded()
 
 
 # --- the setting -----------------------------------------------------------------------------------------------
@@ -518,7 +557,7 @@ def test_a_session_levain_launched_keeps_to_the_coordinators_door(store, qdir, w
     _, why = store.launch_activate(launch_id, harness_session_id="sess-coord")
     assert why is None
     key = store.launch_by_harness_session("sess-coord").session_key
-    (workdir / ".levain").mkdir()
+    (workdir / ".levain").mkdir(exist_ok=True)
     (workdir / ".levain" / "config.json").write_text('{"role": "coordinator"}\n')
     monkeypatch.chdir(workdir)
     tok = json.loads(_main(qdir, capsys, "coord", "claim", "--launch", launch_id, "--session", key, "--json").out)
@@ -542,18 +581,20 @@ def test_coord_agent_never_installs_over_a_directory_with_files(tmp_home, qdir, 
     assert sorted(p.name for p in busy.iterdir()) == ["notes.txt"]
 
 
-def test_coord_agent_none_and_codex(qdir, capsys):
+def test_coord_agent_none_and_codex(qdir, capsys, tmp_path, monkeypatch):
     _main(qdir, capsys, "coord", "agent", "none")
     assert CoordStore(qdir).coord_setting().agent == "none"
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))      # a Codex with no Levain hook
     out = _main(qdir, capsys, "coord", "agent", "codex", rc=1)
-    assert "only claude is built" in out.err
+    assert "not set: Codex's consent hook is not live" in out.err
+    assert CoordStore(qdir).coord_setting().agent == "none"
 
 
 # --- the brief's directory (R2) --------------------------------------------------------------------------------
 def test_a_linked_briefs_directory_refuses_the_launch(store, fake, live_hook, workdir, tmp_path):
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir(mode=0o700)
-    (workdir / ".levain").mkdir()
+    (workdir / ".levain").mkdir(exist_ok=True)
     (workdir / ".levain" / "briefs").symlink_to(elsewhere)
     launch_id = woken(store)
     got = cl.launch_session(store, launch_id)
@@ -937,7 +978,7 @@ def test_a_worker_launch_is_never_started(qdir, store, fake, live_hook):
 
 
 def test_the_briefs_directory_is_gitignored(store, fake, live_hook, workdir):
-    (workdir / ".levain").mkdir()
+    (workdir / ".levain").mkdir(exist_ok=True)
     (workdir / ".levain" / ".gitignore").write_text("answers.json\n")
     assert cl.launch_session(store, woken(store)).started
     lines = (workdir / ".levain" / ".gitignore").read_text().splitlines()

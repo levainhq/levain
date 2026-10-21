@@ -44,8 +44,8 @@ hooks file); the timeouts below; "active" (a turn in progress) is what earns a s
 is not ``done`` does. Stdlib only.
 
 The coordinator's workspace (np-6843ca07 (a)): a directory Levain owns (by default :func:`default_directory`), never
-the operator's own Codex install. :func:`setup` records the coordinator role in it, which is what the door reads
-(:mod:`levain.coordinator.door`), and writes Codex's own rule file into its ``.codex/rules/``, which lets exactly ``<this interpreter> -P -m levain`` coord / drops / thread run without asking
+the operator's own Codex install. :func:`setup` writes the coordinator role hint in it (``levain coord agent`` then
+puts it in the coordinator record the door reads, :mod:`levain.coordinator.door`), and writes Codex's own rule file into its ``.codex/rules/``, which lets exactly ``<this interpreter> -P -m levain`` coord / drops / thread run without asking
 (Codex runs an allowed command outside its sandbox: its own ``coord claim`` writes the consent directory). Measured on
 codex-cli 0.162.1 (1021+18 lane c3cpre): with the rule in a trusted directory the first ``coord claim`` ran unasked;
 without it the same claim failed in the sandbox and then waited on approval; ``touch`` outside the workspace and
@@ -302,15 +302,11 @@ def global_hook_live(workspace: Path) -> tuple[bool, str]:
 
 
 def _workspace_ready(directory: Path) -> tuple[bool, str]:
-    """The launch's directory is a coordinator's workspace as the door reads one (its own ``.levain/config.json``
-    records the coordinator role) and holds the coordinator's rule (written again if it was removed, never over a
-    file that says anything else), so ``.codex/`` exists before the thread starts and Codex keeps it read-only."""
+    """The launch's directory holds the coordinator's rule (written again if it was removed, never over a file that
+    says anything else), so ``.codex/`` exists before the thread starts and Codex keeps it read-only. That it is a
+    coordinator's workspace at all is checked before, by the launch's one confinement check for both harnesses."""
     from levain import install as inst
-    from levain.coordinator import door
 
-    if door.workspace(str(directory)) != directory:
-        return False, (f"{directory} is not a coordinator's workspace (no coordinator role in its own "
-                       ".levain/config.json): `levain coord agent codex` makes one")
     ok, detail = inst.write_codex_coordinator_rules(directory, sys.executable)
     return ok, (detail if ok else f"{detail}; a coordinator there would wait on approvals (remove the file)")
 

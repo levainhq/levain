@@ -1,7 +1,9 @@
 """levain.coordinator.launch — start a launch's session (coordinator C3b; C0 §3.4, §7 L2 L8).
 
-A launch row (:mod:`levain.coordinator.lease`) is what was asked for; this module starts it. For harness ``claude``,
-:func:`launch_session` does, in order:
+A launch row (:mod:`levain.coordinator.lease`) is what was asked for; this module starts it. For either harness,
+:func:`launch_session` first checks the launch's directory is one the coordinator record names
+(:func:`levain.coordinator.door.launch_refusal`; a refusal leaves the launch pending). For harness ``claude`` it then
+does, in order:
 
   1. the one-spawner compare-and-set (:func:`levain.coordinator.lease.claim_spawn`): still pending, in time, under the
      live lease's token, and nobody else started it. A loser spawns nothing;
@@ -431,6 +433,15 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
                                                  "built")
     if ln.state != "pending":
         return Outcome(launch_id, False, refusal=f"launch {launch_id} is {ln.state}, not pending")
+    # the launcher verifies confinement before the spawn, for both harnesses in one place (head rulings door r2 (b)
+    # and R1): a coordinator starts only in a directory the coordinator record names, so the door is shut there
+    # whatever the coordinator later does to its own workspace
+    from levain.coordinator import door
+
+    why = door.launch_refusal(ln.cwd) if ln.cwd else "the launch names no directory"
+    if why is not None:
+        return Outcome(launch_id, False, refusal=_plain(f"review item: {why}; nothing was started (launch {launch_id} "
+                                                         f"left pending, until {ln.until})"))
     if ln.harness == "codex":
         from levain.coordinator import codex_launch
 

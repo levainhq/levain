@@ -89,6 +89,32 @@ def test_a_launch_in_another_store_is_doored_by_where_it_runs(tmp_path, monkeypa
     assert "levain team record: `levain team record` is the operator's" in capsys.readouterr().err
 
 
+def test_a_recorded_workspace_stays_doored_when_its_own_config_is_gone_or_garbled(tmp_path, monkeypatch, capsys):
+    """Reproduced (coordint/repro_r1_BEFORE.txt): a coordinator that deleted or garbled its own .levain/config.json
+    (writable from inside a Codex turn) left the door: `coord take` ran and `team record` passed it."""
+    from levain.cli import main
+    from levain.coordinator import door
+
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    ws = _workspace(tmp_path)
+    door.record(ws)
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    monkeypatch.chdir(ws / "sub")
+    config = ws / ".levain" / "config.json"
+    for damage in (config.unlink, lambda: config.write_text('{"role": "coordi')):
+        damage()
+        assert main(["coord", "take", "--queue-dir", str(q)]) == 1
+        assert main(_RECORD) == 1
+        err = capsys.readouterr().err
+        assert err.count("is the operator's, and this is the coordinator's workspace") == 2, err
+    # a record that cannot be read shuts the door everywhere, the operator's own directories included
+    monkeypatch.chdir(tmp_path)
+    door.record_path().write_text("{")
+    assert main(["coord", "take", "--queue-dir", str(q)]) == 1
+    assert "the coordinator record cannot be read" in capsys.readouterr().err
+
+
 def test_a_codex_coordinator_workspace_is_marked_by_the_one_role_render(tmp_path, capsys, monkeypatch):
     """Reproduced (door/repro_fix2_BEFORE.txt case 2): the install render refused the coordinator role for codex
     ("for the claude-code adapter only"), so a Codex coordinator's workspace carried no record and the door was open."""
