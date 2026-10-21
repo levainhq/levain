@@ -817,7 +817,7 @@ def _apply_init(
         _write_consent_hook_choice(install, consent_hook, emit)
     if role is not None and chosen == "claude-code":
         # recorded BEFORE the render, as the consent hook choice is: every render reads the recorded role
-        _write_role(install, role, emit)
+        _write_role(install, role, python_path, emit)
     review = _install_adapter(
         chosen, install, templates_root, python_path, anneal_path, import_seed,
         on_demand_seed, activation_roots=roots, emit=emit, messaging=messaging,
@@ -2757,6 +2757,9 @@ def persisted_consent_hook(install: Path) -> str:
 # live install it reuses (tests/test_coordinator_launch.py "a_reused_install_gets_none" pins that).
 ROLE_CHOICES = ("coordinator",)
 COORDINATOR_VERBS = ("coord", "drops", "thread")
+# Levain's own project MCP servers, the names its .mcp.json render writes (BAND_SERVER and DISPATCH_SERVER are
+# defined with that render; the test pins this tuple against a real coordinator install's .mcp.json keys)
+COORDINATOR_MCP_SERVERS = ("anneal_memory", "levain_band", "levain_dispatch")
 
 
 def coordinator_levain(python_path: str) -> str:
@@ -2772,6 +2775,25 @@ def coordinator_allow(python_path: str) -> tuple[str, ...]:
     """The coordinator's allow rules, one per verb, each naming :func:`coordinator_levain`."""
     command = coordinator_levain(python_path)
     return tuple(f"Bash({command} {verb}:*)" for verb in COORDINATOR_VERBS)
+
+
+def installed_coordinator_levain(install: Path) -> str | None:
+    """The levain command ``install``'s own ``coord`` allow rule names, read from its ``.claude/settings.json``, or
+    None (no such rule, or settings that cannot be read). A brief built from it tells the session exactly what this
+    install pre-approves, whichever interpreter wrote the rule (an install from before the interpreter was named
+    keeps its bare ``levain``) and whichever one is launching now (1021+11 L3 r1 codex HIGH)."""
+    try:
+        doc = json.loads((install / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        allow = doc["permissions"]["allow"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(allow, list):
+        return None
+    for rule in allow:
+        m = re.fullmatch(r"Bash\((.+) coord:\*\)", rule) if isinstance(rule, str) else None
+        if m is not None:
+            return m.group(1)
+    return None
 
 
 def persisted_role(install: Path) -> str | None:
@@ -2793,7 +2815,7 @@ def persisted_role(install: Path) -> str | None:
     return value if value in ROLE_CHOICES else None
 
 
-def _write_role(install: Path, role: str, emit: Callable[[str], None]) -> None:
+def _write_role(install: Path, role: str, python_path: str, emit: Callable[[str], None]) -> None:
     """Record ``role`` in ``.levain/config.json``, so `levain update` and `init --force` render it again. Raises
     InitError when it cannot be recorded."""
     from levain.dashboard import LEVAIN_CONFIG_REL
@@ -2818,13 +2840,19 @@ def _write_role(install: Path, role: str, emit: Callable[[str], None]) -> None:
         _atomic_write_text(config_path, json.dumps({**existing, "role": role}, indent=2, ensure_ascii=False) + "\n")
     except OSError as e:
         raise InitError(f"could not record the install role in .levain/config.json ({e}).") from e
-    emit(f"  role: {role} → .levain/config.json (Claude Code runs {', '.join(coordinator_allow(sys.executable))} "
+    emit(f"  role: {role} → .levain/config.json (Claude Code runs {', '.join(coordinator_allow(python_path))} "
          "without asking)")
 
 
 def _apply_role(settings_text: str, role: str | None, python_path: str) -> str:
-    """``settings_text`` (a rendered Claude Code settings.json) with the coordinator's allow rules for
-    ``python_path`` appended to ``permissions.allow`` when ``role`` is ``coordinator``; unchanged otherwise."""
+    """``settings_text`` (a rendered Claude Code settings.json) with, when ``role`` is ``coordinator``, the
+    coordinator's allow rules for ``python_path`` appended to ``permissions.allow`` and Levain's own MCP servers
+    named in ``enabledMcpjsonServers``; unchanged otherwise.
+
+    The servers (np-be8ebe0a (a), Phill 2026-10-21 "5a"): a coordinator starts in the background, where Claude Code's
+    "new MCP servers found" dialog has nobody to answer it, so the session hangs before its brief. Only Levain's own
+    servers are named (an operator's server still asks), and Claude Code applies a project's approvals only after the
+    directory is trusted, which stays the operator's step."""
     if role != "coordinator":
         return settings_text
     doc = json.loads(settings_text)
@@ -2833,6 +2861,10 @@ def _apply_role(settings_text: str, role: str | None, python_path: str) -> str:
     if not isinstance(allow, list):
         raise InitError("the rendered Claude Code settings carry a permissions.allow that is not a list")
     allow.extend(rule for rule in coordinator_allow(python_path) if rule not in allow)
+    enabled = doc.setdefault("enabledMcpjsonServers", [])
+    if not isinstance(enabled, list):
+        raise InitError("the rendered Claude Code settings carry an enabledMcpjsonServers that is not a list")
+    enabled.extend(name for name in COORDINATOR_MCP_SERVERS if name not in enabled)
     return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
 
 
@@ -4493,9 +4525,21 @@ def _levain_render_variant(
             return len(a) == len(b) == len(c) and all(map(same, a, b, c))
         if any(isinstance(t, (dict, list)) for t in (a, b, c)):
             return False
-        return a == b or (isinstance(c, str) and _VARIABLE in c)
+        return a == b or (isinstance(c, str) and _VARIABLE in c and _fits_variant(a, c))
 
     return same(x, y, v)
+
+
+def _fits_variant(here: object, variant: str) -> bool:
+    """Whether ``here`` is ``variant`` with only its sentinel spans (and the shell quotes around them) replaced: a
+    leaf whose per-machine part differs, never one whose other text was edited (1021+11 L3 r1 codex: a whole leaf
+    taken as variable let an operator's narrowed coordinator rule read as Levain's and be widened back)."""
+    if not isinstance(here, str):
+        return False
+    parts = variant.split(_VARIABLE)
+    parts = [p.rstrip("'\"") if i < len(parts) - 1 else p for i, p in enumerate(parts)]
+    parts = [p.lstrip("'\"") if i > 0 else p for i, p in enumerate(parts)]
+    return re.fullmatch(".+".join(re.escape(p) for p in parts), here, flags=re.S) is not None
 
 
 # The base seed files a release adds to installs that never had them. Only these are written on

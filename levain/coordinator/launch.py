@@ -239,13 +239,13 @@ def _queued(store: CoordStore) -> list[Any]:
 
 
 def _brief_text(store: CoordStore, launch: Any) -> str:
-    from levain.install import coordinator_levain
+    from levain.install import coordinator_levain, installed_coordinator_levain
 
     q = shlex.quote(str(store.directory))
     tail = f"--queue-dir {q}"
-    # the one spelling the coordinator install's allow rules name (install.coordinator_levain): a session that runs
-    # these exactly as written is not asked, and a bare `levain` is neither pre-approved nor sure to be on its PATH
-    lv = coordinator_levain(sys.executable)
+    # the spelling the coordinator install's own allow rule names, so a session that runs these as written is not
+    # asked; an install with no such rule (a reused live install) gets this interpreter's, and its commands ask
+    lv = installed_coordinator_levain(Path(launch.cwd)) or coordinator_levain(sys.executable)
     lines = [
         f"# Levain {launch.role} brief: launch {launch.launch_id}",
         "",
