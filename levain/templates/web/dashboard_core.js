@@ -420,7 +420,7 @@
   }
   function foldRowsAt(body, panel) {
     for (const n of body.querySelectorAll("[data-folded]")) { n.style.display = ""; delete n.dataset.folded; }
-    const old = panel.querySelector(":scope > .more-foot"); if (old) old.remove();
+    const old = panel.querySelector(":scope > .more-foot:not([data-readall])"); if (old) old.remove();   // the "Read all" foot is memFoot's: removing it here made memFoot re-add it, a childList change that re-ran this, without end
     if (!(body.scrollHeight > body.clientHeight + 1)) return false;
     const top = body.getBoundingClientRect().top;
     const heldLine = body.querySelector(":scope > .held-line, .held-line");
@@ -940,8 +940,14 @@
     dashPass(grid); pairBoard(grid); memClips(grid);
     if (typeof MutationObserver === "function") new MutationObserver(() => { dashPass(grid); pairBoard(grid); memClips(grid); scheduleLayout(); }).observe(grid, { childList: true, subtree: true });
     // a card folds or empties by a class set after the draw (markEmptyCards), which no childList mutation reports: the pairs and the
-    // "Read all" feet follow it. Both write only on a change, so this cannot feed itself.
-    if (typeof MutationObserver === "function") new MutationObserver(() => { pairBoard(grid); memClips(grid); }).observe(grid, { attributes: true, attributeFilter: ["class"], subtree: true });
+    // "Read all" feet follow it. Only a change to the classes pairBoard reads wakes it: the classes these passes write are not among them.
+    if (typeof MutationObserver === "function") {
+      const watched = (v) => CK_PAIR_SKIP.filter((c) => (" " + (v || "") + " ").indexOf(" " + c + " ") >= 0).join(" ");
+      new MutationObserver((recs) => {
+        // measureOverflow and memFoot toggle is-clipped / has-overflow on cards inside the grid: reacting to those would feed this observer forever
+        if (recs.some((r) => watched(r.oldValue) !== watched(r.target.getAttribute("class")))) { pairBoard(grid); memClips(grid); }
+      }).observe(grid, { attributes: true, attributeFilter: ["class"], attributeOldValue: true, subtree: true });
+    }
   }
 
   // A panel's count ("Tray (2)" in the kernel's title) is a pill beside the title, hidden at 0: the title says what the card is, the
@@ -1186,7 +1192,6 @@
     if (foot) foot.hidden = true;
     const clipped = panel.offsetParent !== null && (cut(panel) || cut(body));
     panel.classList.toggle("is-clipped", clipped);
-    if (body && clipped) body.classList.add("is-clipped");
     if (!clipped) { if (foot) foot.hidden = true; return; }
     if (!foot) {
       foot = el("button", "more-foot", "Read all");
