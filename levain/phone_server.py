@@ -1031,33 +1031,35 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
     lives = (f"it is kept in {token_file} across restarts: delete that file to make a new one" if token_file is not None
              else "it dies when this stops")
     print(f"  open on the phone (a secret; {lives}): {page}#phone_token={httpd.phone_token}", flush=True)
-    if link_file is not None:
-        # for a caller that links straight onto one sign request's card (levain.consent.sign.deep_link)
-        from levain.consent.sign import _write_over
-
-        try:
-            _write_over(link_file, json.dumps({"page": page, "phone_token": httpd.phone_token, "pid": os.getpid()}) + "\n")
-        except OSError as exc:
-            print(f"--link-file: cannot write {link_file}: {exc.strerror or exc}", file=sys.stderr)
-            httpd.server_close()
-            return 1
     import signal
 
     def _stop(signum: int, frame: Any) -> None:
-        raise KeyboardInterrupt        # a service stop (TERM, HUP) unwinds like Ctrl+C, so the link file goes
+        raise KeyboardInterrupt        # a service stop (TERM) unwinds like Ctrl+C, so the link file goes
 
-    main = threading.current_thread() is threading.main_thread()      # signal handlers are the main thread's only
-    before = {s: signal.signal(s, _stop) for s in (signal.SIGTERM, signal.SIGHUP)} if main else {}
+    # TERM only, and only on the main thread (the only one signal handlers run on); HUP is left as inherited, so a
+    # server started under nohup keeps running when its terminal closes. Installed before the link file is written.
+    before = (signal.signal(signal.SIGTERM, _stop)
+              if link_file is not None and threading.current_thread() is threading.main_thread() else None)
     try:
+        if link_file is not None:
+            # for a caller that links straight onto one sign request's card (levain.consent.sign.deep_link)
+            from levain.consent.sign import _write_over
+
+            try:
+                _write_over(link_file, json.dumps({"page": page, "phone_token": httpd.phone_token,
+                                                   "pid": os.getpid()}) + "\n")
+            except OSError as exc:
+                print(f"--link-file: cannot write {link_file}: {exc.strerror or exc}", file=sys.stderr)
+                return 1
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        for s, h in before.items():
-            signal.signal(s, h)
         httpd.server_close()
         if link_file is not None:
             _drop_link_file(link_file)
+        if before is not None:
+            signal.signal(signal.SIGTERM, before)
     return 0
 
 
