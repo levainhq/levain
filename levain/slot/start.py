@@ -445,6 +445,20 @@ def revoke(ctx: H.Ctx, session: str) -> None:
         raise Refused("revoke-raced", session)
 
 
+def _drop_unretained_live(ctx: H.Ctx, session: str) -> None:
+    """``L/live/<session>`` left after END reached RETAINED: a session that never cloned retains nothing (END
+    renames a cloned ``<S>`` into the retained tree), so what is still there is the rendered layer and the slot's
+    empty dirs [measured: Linux L62 (20+ such dirs) and macOS M69 left it]. Removed by dirfd, never following a
+    link, once every process of the slot is proven gone and before the slot is reusable."""
+    with ctx.store.dir("live") as live:
+        try:
+            os.stat(session, dir_fd=live, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        remove_tree_at(live, session)
+        ctx.seams.fsync(live)
+
+
 def scrub_and_release(ctx: H.Ctx, a: R.Alloc) -> bool:
     """§7.3 ``slot: LEASED -> SCRUBBED -> REUSABLE``, under the pool lock then the slot lock (§3.5 order): only
     while root's slot state file shows this slot leased to THIS session at alloc's ``lease_seq``, proc.scrub
@@ -470,6 +484,7 @@ def scrub_and_release(ctx: H.Ctx, a: R.Alloc) -> bool:
                     return False
                 seams.at("scrubbed")
                 PR.scrub(ids[first], ids[second], seams=seams.proc_seams)   # type: ignore[arg-type]
+                _drop_unretained_live(ctx, a.session)
                 new = replace(st, rev=st.rev + 1, state="reusable", session=None,
                               changed_at=R.timestamp(seams.clock()))
                 seams.at("reusable")

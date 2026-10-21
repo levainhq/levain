@@ -606,6 +606,7 @@ def test_teardown_of_a_never_started_session_retains_nothing(env):
         table.add(pid, GW0)
     assert w.main(["teardown", s])[1] == {"ok": True, "state": R.RETAINED}
     assert not (w.L / "retained" / s / "tree").exists()
+    assert not (w.L / "live" / s).exists()       # L62 / M69: an unretained <S> is dropped at SCRUB, not left
     assert w.slot_state(E0).state == "reusable"
 
 
