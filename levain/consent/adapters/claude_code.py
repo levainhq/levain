@@ -1574,9 +1574,10 @@ def could_not_run(tier: str | None, what: str) -> dict[str, Any]:
 #
 # Every PreToolUse in a slot first asks the broker ``GATE`` (F10 S2b-2,
 # :func:`levain.consent.broker_client.gate_check`), before the call is classified: a session halted on an
-# irreversible call whose hold ended unanswered, or over a limit the operator set, is denied and its turn ended; GO
-# lets the rest of this gate run (GO is never an allow); the broker down, refusing or out of shape denies. The
-# halt's release and the limits' Extend are the operator side's (levain.qbroker.broker, GATE).
+# irreversible call whose hold ended unanswered, or over a limit the operator set (limits apply when the broker has a
+# limits source: the production broker has none yet), is denied and its turn ended; GO lets the rest of this gate
+# run (GO is never an allow); the broker down, refusing or out of shape denies. A halt's release and a raised limit
+# are the operator side's (levain.qbroker.broker, GATE); a slot has no Extend.
 
 SLOT_STOP_REASON = "levain: stopped by the consent broker (a halt or a limit the operator set)."
 
@@ -1589,9 +1590,12 @@ def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold:
               expected_uid: int | None = None, sleep: Callable[[float], None] = time.sleep,
               monotonic: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
     """The slot's gate output for one ``PreToolUse`` event, or ``None`` (the call goes on as the mode says). A
-    malformed event is :func:`_malformed`'s; a call :func:`gate_class` does not gate (protected paths: none) is
-    :func:`_slot_ungated`'s (``None`` unless a dispatch run's grant or queue decides it); a gated call is filed with the broker (``client``, default
-    :meth:`~levain.consent.broker_client.BrokerClient.from_env`) and held up to ``hold`` for a decision the broker
+    malformed event is :func:`_malformed`'s. Then, on EVERY call and before it is classified, the broker is asked
+    ``GATE`` (:func:`levain.consent.broker_client.gate_check`; ``client``, default
+    :meth:`~levain.consent.broker_client.BrokerClient.from_env`): halted, over a limit or the limits gate failed is
+    denied with the turn ended, and the broker down, refusing or out of shape denies every call, ungated ones too.
+    Past a GO, a call :func:`gate_class` does not gate (protected paths: none) is :func:`_slot_ungated`'s (``None``
+    unless a dispatch run's grant or queue decides it); a gated call is filed with the broker and held up to ``hold`` for a decision the broker
     verified, delivered as :func:`decision_output` names it; at the end of the hold it is denied with
     :func:`undecided_output`, its gap named by the request id (the operator side numbers gaps; the hook does not).
     Anything else once the call is gated (a settings file that names the socket variable,

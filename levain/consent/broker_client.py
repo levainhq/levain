@@ -70,8 +70,8 @@ from levain.qbroker import wire
 __all__ = ["BROKER_ACCOUNT", "CAP_ENV", "FAST_POLLS", "GATE_BACKOFF", "GO", "IO_TIMEOUT", "PENDING_REFUSALS",
            "REQUEST_RETRY", "SLOW_POLL", "SOCKET_ENV", "BrokerClient", "BrokerError", "UNGATED_TIER", "broker_uid",
            "file_and_hold", "GATE_FAILED", "GATE_GO", "GATE_HALTED", "GATE_OVER", "SLOT_HALT_TEXT",
-           "SLOT_LIMITS_FAILED_TEXT", "file_ungated", "gate_check", "gate_request", "grant_member",
-           "hold_for_decision", "in_slot"]
+           "SLOT_LIMITS_FAILED_TEXT", "SLOT_OVER_TEXT", "file_ungated", "gate_check", "gate_request",
+           "grant_member", "hold_for_decision", "in_slot"]
 
 SOCKET_ENV = "LEVAIN_QUEUE_SOCKET"
 CAP_ENV = "LEVAIN_QUEUE_CAP"
@@ -267,6 +267,12 @@ GATE_GO, GATE_HALTED, GATE_OVER, GATE_FAILED = "go", "halted", "over-limit", "li
 # the slot's halt words: the operator side numbers gaps, the hook names the halting request
 SLOT_HALT_TEXT = ("levain: this session is halted on request {r}: an irreversible call's hold ended with no answer. "
                   "No further tool calls are allowed. Write a short summary of what is done and end your turn.")
+# an over-limit GATE: Q13's budget words, with what the operator can do for a slot (the local
+# ``levain limits extend`` is not a slot's: the broker reads its limits from its own settings, and has no Extend hold)
+SLOT_OVER_TEXT = ("levain: STOPPED by a budget the operator set: this session reached its {label} limit. This is not "
+                  "a fault and not a denial of the work. Do not try to continue it another way; the session goes on "
+                  "only when the operator raises that limit in the queue broker's limits settings, or starts a new "
+                  "session.")
 # a limits-failed GATE: the gate itself failed, not a budget; the operator repairs or moves the limits database
 SLOT_LIMITS_FAILED_TEXT = ("levain: the limits gate could not run, so the action was NOT taken: {why}. This is a fault "
                            "of the limits store, not a budget. The operator repairs or moves aside the broker's limits "
@@ -277,9 +283,9 @@ SLOT_LIMITS_FAILED_TEXT = ("levain: the limits gate could not run, so the action
 def gate_check(client: BrokerClient, *, agent: str, tool_name: str, tool_input: Any, tool_use_id: str | None,
                sleep: Callable[[float], None] = time.sleep) -> str | None:
     """The slot gate's first step on EVERY PreToolUse, before the call is classified: ``None`` on the broker's GO
-    (the gate goes on), else the deny text (:data:`SLOT_HALT_TEXT`, or Q13's stop words for over-limit). A
-    ``rate-limited`` GATE is sent again after each pause of :data:`GATE_BACKOFF` (bounded); a refusal past the last,
-    or any other failure, raises :class:`BrokerError` (the caller denies: fail closed)."""
+    (the gate goes on), else the deny text (:data:`SLOT_HALT_TEXT`, :data:`SLOT_OVER_TEXT` or
+    :data:`SLOT_LIMITS_FAILED_TEXT`). A ``rate-limited`` GATE is sent again after each pause of :data:`GATE_BACKOFF`
+    (bounded); a refusal past the last, or any other failure, raises :class:`BrokerError` (the caller denies: fail closed)."""
     from levain.consent import limits
 
     for pause in (*GATE_BACKOFF, None):
@@ -297,7 +303,7 @@ def gate_check(client: BrokerClient, *, agent: str, tool_name: str, tool_input: 
         return SLOT_HALT_TEXT.format(r=detail)
     if verdict == GATE_FAILED:
         return SLOT_LIMITS_FAILED_TEXT.format(why=detail)
-    return limits.stop_text(detail)
+    return SLOT_OVER_TEXT.format(label=limits.LABELS.get(detail or "", "a"))
 
 
 def grant_member(agent: str, tool_name: str, tool_input: Any, root: str) -> dict[str, Any] | None:

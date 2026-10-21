@@ -734,17 +734,21 @@ def could_not_run(what: str) -> dict[str, Any]:
 # words. A slot has no local queue: an undecided irreversible call is denied with U-IRR's words, and the halt that
 # follows it is the broker's (F10 S2b-2): every PreToolUse first asks ``GATE``
 # (:func:`levain.consent.broker_client.gate_check`), before it is classified, and a session halted on such a call,
-# or over a limit the operator set, is denied; GO lets the rest of this gate run (never an allow); the broker down,
-# refusing or out of shape denies.
+# or over a limit the operator set (limits apply when the broker has a limits source: the production broker has none
+# yet), is denied; GO lets the rest of this gate run (never an allow); the broker down, refusing or out of shape
+# denies.
 
 def slot_gate(event: Any, *, home: Path | None = None, codex_dir: Path | None = None, client: Any = None,
               hold: float = DEFAULT_GATE_HOLD, expected_uid: int | None = None,
               sleep: Callable[[float], None] = time.sleep,
               monotonic: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
     """The slot's gate output for one Codex ``PreToolUse`` event, or ``None`` (the call goes on). An event missing
-    a required field is denied (:func:`_missing_output`); a call :func:`gate_class` does not gate (protected paths:
-    none) is :func:`_slot_ungated`'s (``None`` unless a dispatch run's grant or queue decides it); a gated call is filed with the broker (``client``, default
-    :meth:`~levain.consent.broker_client.BrokerClient.from_env`), held up to ``hold`` for a decision the broker
+    a required field is denied (:func:`_missing_output`). Then, on EVERY call and before it is classified, the broker
+    is asked ``GATE`` (:func:`levain.consent.broker_client.gate_check`; ``client``, default
+    :meth:`~levain.consent.broker_client.BrokerClient.from_env`): halted, over a limit or the limits gate failed is
+    denied, and the broker down, refusing or out of shape denies every call, ungated ones too. Past a GO, a call
+    :func:`gate_class` does not gate (protected paths: none) is :func:`_slot_ungated`'s (``None`` unless a dispatch
+    run's grant or queue decides it); a gated call is filed with the broker, held up to ``hold`` for a decision the broker
     verified (:func:`decision_output`), and at the end of the hold denied with :func:`undecided_output`, its gap
     named by the request id. Anything else once the call is gated (a settings file naming the socket variable,
     :func:`queue_socket_planted`; no socket or cap; no broker account, or a socket whose peer is not it; the broker

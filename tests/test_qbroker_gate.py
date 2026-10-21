@@ -281,7 +281,9 @@ def test_gate_check_texts_and_one_retry():
     assert broker_client.gate_check(Scripted([{"gate": "go"}]), **kw) is None
     assert "halted on request pend-x" in broker_client.gate_check(
         Scripted([{"gate": "halted", "request_id": "pend-x"}]), **kw)
-    assert "tool calls limit" in broker_client.gate_check(Scripted([{"gate": "over-limit", "kind": "calls"}]), **kw)
+    over = broker_client.gate_check(Scripted([{"gate": "over-limit", "kind": "calls"}]), **kw)
+    assert "tool calls limit" in over and "limits settings" in over
+    assert "levain limits extend" not in over                  # F7: a slot has no Extend
     failed = broker_client.gate_check(Scripted([{"gate": "limits-failed", "reason": "disk full"}]), **kw)
     assert "disk full" in failed and "limits.db" in failed and "not a budget" in failed
     sleeps = []
