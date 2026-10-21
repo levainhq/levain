@@ -19,16 +19,20 @@ Three layers, each testable on its own:
   bound to that connection; its EOF revokes the session ``ATTACH`` bound to it.
 
 Session 2 builds the operator verbs (``LEASE-OPEN``, ``STATUS``) and root's (``ATTACH``, ``CAS``,
-``MINT``, ``FRONT-ARM``, ``SECRETS``, ``REVOKE``, ``REVOKED-SET``). Root's ``SLOT-SYNC`` and every
-dispatch / keys / qbroker verb (§3.3, §3.5, §3.6) are session 3c's: until then every peer but root and the
-operator is refused ``verb-not-allowed-for-peer`` (see :data:`PEER_VERBS`). Every act on keys (``DROP-SESSION``,
+``MINT``, ``FRONT-ARM``, ``SECRETS``, ``REVOKE``, ``REVOKED-SET``); session 3 the queue broker's
+``QUEUE-RESOLVE`` (§3.3, §26 S1-c). Root's ``SLOT-SYNC`` and every dispatch / keys verb (§3.3, §3.5, §3.6)
+are session 3c's: until then every other peer is refused ``verb-not-allowed-for-peer`` (see :data:`PEER_VERBS`). Every act on keys (``DROP-SESSION``,
 ``FRONT-REGISTER``, ``FRONT-ARM`` on §4.9's wire) and the reaper wake are injected seams.
 """
 from __future__ import annotations
 
 import base64
 import collections
+import hashlib
+import hmac
 import os
+import re
+import sys
 import socket
 import struct
 import threading
@@ -44,6 +48,7 @@ from levain.broker.stub import peer_uid as kernel_peer_uid
 from levain.contracts import ContractError, canon
 from levain.slot import Refused
 from levain.slot import records as R
+from levain.slot.layout import session_repo
 from levain.slot.runtime_grammar import HANDLE_BYTES, _handle, _keys
 
 CONTROL_FORMAT = "levain-control/1"
@@ -52,12 +57,13 @@ _LEN = struct.Struct(">I")
 
 ROOT_UID = 0
 
-#: §3.3's verbs per peer, as built in session 2. Session 3c adds root's ``SLOT-SYNC`` and the
-#: ``_levain_keys`` / ``_levain_qbroker`` / ``_levain_dispatch`` rows (each a peer kind that
-#: :meth:`Control.peer_kind` learns from its uid); until then those peers are ``foreign``.
+#: §3.3's verbs per peer, as built so far. Session 3c adds root's ``SLOT-SYNC`` and the ``_levain_keys`` /
+#: ``_levain_dispatch`` rows (each a peer kind that :meth:`Control.peer_kind` learns from its uid); until then
+#: those peers are ``foreign``.
 PEER_VERBS: Mapping[str, frozenset[str]] = {
     "operator": frozenset({"LEASE-OPEN", "STATUS"}),
     "root": frozenset({"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET"}),
+    "qbroker": frozenset({"QUEUE-RESOLVE"}),
     "foreign": frozenset(),
 }
 
@@ -72,7 +78,13 @@ _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "SECRETS": (frozenset({"session"}),) * 2,
     "REVOKE": (frozenset({"session"}),) * 2,
     "REVOKED-SET": (frozenset(), frozenset()),
+    "QUEUE-RESOLVE": (frozenset({"slot", "cap_digest"}),) * 2,
 }
+
+#: §3.3 / c6: a ``*_digest`` on the wire, the form the broker sends a queue cap's digest in.
+_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+#: The run fields ``QUEUE-RESOLVE`` copies from the session's bound ticket (§3.3); ``repo_root`` is added by CONTROL.
+QUEUE_RUN_KEYS = frozenset({"run_id", "job_id", "run_index", "contract_digest", "model_requested"})
 
 #: DECISION: the backoff of the lease-EOF revoke's lock retry (§3.1 step 3 fixes only "with backoff
 #: until it is taken, never dropped").
@@ -342,6 +354,13 @@ class Handles:
     token: str | None = None
     queue_cap: str | None = None
 
+    @property
+    def queue_cap_digest(self) -> str | None:
+        """The digest the broker resolves the cap by (c6: ``sha256:`` + hex over its UTF-8 bytes)."""
+        if self.queue_cap is None:
+            return None
+        return "sha256:" + hashlib.sha256(self.queue_cap.encode("utf-8")).hexdigest()
+
 
 def _default_is_brokered(claims: Mapping[str, object]) -> bool:
     # DECISION: §3.2 mints a token "only if the registered claims carry a `brokered` route"; a route's type
@@ -369,9 +388,16 @@ class Control:
     ``slot_reusable(class, index, session) -> bool`` (the §3.5 mirror; default ``False``, which keeps a
     RETAINED session in ``REVOKED-SET``: the revoker's kill is uid + start checked, so over-inclusion is
     safe and under-inclusion is not) · ``is_brokered(claims) -> bool`` · ``clock() -> epoch seconds`` ·
-    ``sleep(seconds)`` (the EOF retry's backoff)."""
+    ``sleep(seconds)`` (the EOF retry's backoff) · ``qbroker_uid`` (the ``_levain_qbroker`` peer; ``None``: no
+    peer is the broker) · ``run_facts(session) -> {run_id, job_id, run_index, contract_digest, model_requested} |
+    None`` (the run a dispatch session's bound ticket names; session 3c's ticket records supply it, and the default
+    knows none, so a dispatch session's ``QUEUE-RESOLVE`` is refused ``run-unknown``) · ``host`` (whose store
+    ``repo_root`` names)."""
 
     def __init__(self, store: StateStore, operator_uid: int, *,
+                 qbroker_uid: int | None = None,
+                 run_facts: Callable[[str], Mapping[str, object] | None] = lambda s: None,
+                 host: str = "darwin" if sys.platform == "darwin" else "linux",
                  drop_session: Callable[[str], object] = _nothing,
                  wake_reaper: Callable[[], object] = _nothing,
                  keys_front_register: Callable[..., object] = _keys_unavailable,
@@ -382,7 +408,12 @@ class Control:
                  sleep: Callable[[float], None] = time.sleep) -> None:
         if type(operator_uid) is not int or operator_uid <= ROOT_UID:
             raise Refused("bad-config", f"operator uid {operator_uid!r}")
+        if qbroker_uid is not None and (type(qbroker_uid) is not int or qbroker_uid in (ROOT_UID, operator_uid)):
+            raise Refused("bad-config", f"qbroker uid {qbroker_uid!r}")
         self.store = store
+        self.qbroker_uid = qbroker_uid
+        self._run_facts = run_facts
+        self._host = host
         self.operator_uid = operator_uid
         self._drop_session = drop_session
         self._wake_reaper = wake_reaper
@@ -412,6 +443,8 @@ class Control:
             return "root"
         if uid == self.operator_uid:
             return "operator"
+        if uid is not None and uid == self.qbroker_uid:
+            return "qbroker"
         return "foreign"
 
     # -- start pass (§1 CONTROL row, §1.3) ---------------------------------------------------------------
@@ -907,6 +940,46 @@ class Control:
                 if not isinstance(slot, dict) or not self._slot_reusable(slot["class"], slot["index"], r.session):
                     out.append(r.session)
         return {"sessions": sorted(out)}
+
+    # -- the queue broker's verb ------------------------------------------------------------------------------
+
+    def _op_queue_resolve(self, conn: Conn, args: dict) -> dict[str, object]:
+        """§3.3 ``QUEUE-RESOLVE``: the session whose queue cap has digest ``cap_digest`` and was minted for a
+        session on ``slot``. A cap lives only while its session's lease does (dropped at EOF and at REVOKED), so
+        a cap found is a live session's. DECISION: one refusal, ``cap-unknown``, for no such cap, a cap minted on
+        another slot, and a session past the live states, so the broker learns nothing of another slot's caps.
+        An interactive session answers ``{session, kind}``; a dispatch session adds ``run``: its bound ticket's
+        fields (``run_facts``) plus ``repo_root``, which CONTROL derives from the session name, never from the
+        caller (§26 S1-c). Any other kind holds no queue (``kind-not-queued``)."""
+        slot = R.slot_obj(R._slot(args["slot"], "slot"))
+        digest = args["cap_digest"]
+        if type(digest) is not str or _DIGEST_RE.fullmatch(digest) is None:
+            raise Refused("bad-token", "cap_digest")
+        with self._mu:
+            found = [(s, h) for s, h in self._handles.items()
+                     if h.queue_cap is not None and hmac.compare_digest(h.queue_cap_digest, digest)]
+        if len(found) != 1:
+            raise Refused("cap-unknown")
+        session, handles = found[0]
+        rec = self.store.get(session)
+        if rec is None or rec.state not in R.LIVE_STATES or rec.claims.get("slot") != slot:
+            raise Refused("cap-unknown")
+        with self._mu:
+            if self._handles.get(session) is not handles:
+                raise Refused("cap-unknown")           # its lease ended while the record was read
+        kind = rec.claims.get("kind")
+        if kind == "interactive":
+            return {"session": session, "kind": kind}
+        if kind != "dispatch":
+            raise Refused("kind-not-queued")
+        facts = self._run_facts(session)
+        if facts is None:
+            raise Refused("run-unknown")
+        if set(facts) != QUEUE_RUN_KEYS:
+            raise Refused("run-malformed")
+        run: dict[str, object] = {k: facts[k] for k in sorted(QUEUE_RUN_KEYS)}
+        run["repo_root"] = str(session_repo(self._host, session))
+        return {"session": session, "kind": kind, "run": run}
 
     # -- test / service views --------------------------------------------------------------------------------
 

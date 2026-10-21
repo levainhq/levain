@@ -41,6 +41,11 @@ def service_entry_path(host: HostOS) -> Path:
     return HELPER_DIR[host] / "service-entry"
 
 
+def session_repo(host: HostOS, session: str) -> Path:
+    """``<S>/repo``, the session's worktree, as a real path (§26 S1-c: a walk from ``/`` meets no link)."""
+    return STORE[host] / "live" / session / "repo"
+
+
 def operator_record_path(host: HostOS) -> Path:
     return STORE[host] / "policy" / "operator"   # CONTRACT header scope line
 
@@ -84,6 +89,9 @@ def base_store_rows(host: HostOS, operator: str) -> list[Row]:
         _root(host, L / "queue", 0o755),
         Row(L / "queue" / "requests", "_levain_qbroker", "levain-queue", 0o750),
         Row(L / "queue" / "answers", operator, "levain-queue", 0o770),
+        # §26 S1-b: dispatch publishes each contract the operator signed here; setgid, so every file takes
+        # levain-queue and the broker (a member) reads it; slots are not members.
+        Row(L / "contracts", "_levain_dispatch", "levain-queue", 0o2750),
         _root(host, L / "policy", 0o755),
         Row(L / "lineage", "_levain_control", "levain-lineage", 0o750),
         Row(L / "keys", "_levain_keys", "_levain_keys", 0o700),
