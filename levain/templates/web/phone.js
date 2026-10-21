@@ -48,7 +48,8 @@
 
   let busy = 0;               // a ceremony in progress holds the list still
   let last = "";              // the last answer given here: an answered request leaves the list, its result stays
-  let lastId = "";            // the sign request that answer was for (the deep link's card, once answered here)
+  let focusDone = false;      // the deep link's card was signed or denied here
+  let focusMisses = 0;        // listings the linked card was not in: three, and the link is let go
   const notes = new Map();    // request id -> [text, kind], kept across redraws
 
   function draw(data) {
@@ -80,10 +81,11 @@
     list.replaceChildren(...linked.map((r) => signCard(r, data.sign_note, true)), ...asks.map(questionCard),
                          ...rest.map((r) => signCard(r, data.sign_note)), ...jobs.map(dispatchCard),
                          ...rows.map((r) => row(r, false)), ...gaps.map((r) => row(r, true)));
-    // said once: after the linked card is signed or denied here, the next redraw drops the link without a note; a
-    // listing the sign side could not give (a sign_note) keeps the link for the next one
-    if (focus && !linked.length && !busy && !data.sign_note) {
-      if (lastId !== focus)
+    // said once: after the linked card is signed or denied here the link goes without a note; otherwise it is let go
+    // after three listings without it (a passing sign-side fault gets two more). A link opened mid-ceremony reloads
+    // the page and the result shows on the reload
+    if (focus && !linked.length && !busy && (focusDone || ++focusMisses >= 3)) {
+      if (!focusDone)
         $("status").textContent += " \u00b7 the linked sign request " + focus + " is not open here (signed, denied, expired or not filed)";
       focus = "";
     }
@@ -480,7 +482,7 @@
           if (!a.ok && (a.status === 0 || a.status >= 500)) return say("result unknown (" + why(a) + "): reload to see whether it was signed", "bad");
           if (!a.ok) return say("not signed: " + why(a), "bad");
           last = "signed " + (a.body.choice ? "(" + a.body.choice + ") " : "") + (r.title || r.id);
-          lastId = r.id;
+          if (r.id === focus) focusDone = true;
           say("signed" + (a.body.choice ? " (" + a.body.choice + ")" : "") + " · by " + a.body.signer_fp + " in "
               + a.body.namespace, "ok");
         });
@@ -498,7 +500,7 @@
     call("POST", "/sign/" + encodeURIComponent(r.id) + "/deny", { request_sha256: r.sha256 || "" }).then((a) => {
       if (!a.ok) return say("not denied: " + why(a), "bad");
       last = "denied " + (r.title || r.id);
-      lastId = r.id;
+      if (r.id === focus) focusDone = true;
       say("denied", "ok");
     }).catch((e) => say("the deny failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
       .finally(() => { busy--; setTimeout(load, 1500); });
