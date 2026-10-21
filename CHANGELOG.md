@@ -28,6 +28,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   gone, keeps the role with a coordinator that is still working and wrote in the last hour, and stops a session whose
   launch is over (you took over, it lost the role, or it failed to start), and deletes that launch's brief, which
   quotes your drops. It touches only the sessions Levain started, in the directory it started them in.
+- **Verifiers are signed, one per check, and Levain runs the checker itself.** Each verifier you sign names the checker
+  Levain ships (`output_compare` is the first: it runs the template's steps and compares what each one printed to what you
+  pinned) and the exact steps and inputs it checks. A report only counts if it comes from that checker, on those steps and
+  inputs, so a changed checker or a changed step list is refused rather than read as a pass.
+
+### Changed
+- **Re-sign your verifiers after upgrading.** The old `verifiers` configuration item is no longer read; `levain dispatch
+  config show` marks it SUPERSEDED once you have signed the new kind, and `levain doctor` warns while only the old item is signed.
+  A template whose verifier id 0.11 accepted but this version does not (uppercase, `.`, `_`, `@`, `:`, `/`, `+`, or over 48
+  characters) is refused by name until it is re-signed.
+  - A control store holding the new `verifier` item cannot be read by Levain 0.11.x, so do not downgrade after signing one.
 
 ### Known edges
 - A coordinator launch that fails (an untrusted directory, a session that never appears) counts against the
