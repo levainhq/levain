@@ -119,7 +119,8 @@ def test_linux_has_no_profile():
 
 BASE_KEYS = {"HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "CLAUDE_CODE_TMPDIR", "TMPPREFIX", "XDG_DATA_HOME",
              "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "npm_config_cache", "CLAUDE_CONFIG_DIR",
-             "CODEX_HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "DISABLE_AUTOUPDATER", "TERM"}
+             "CODEX_HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_ATTR_NOSYSTEM", "DISABLE_AUTOUPDATER",
+             "TERM"}
 PROXY_KEYS = {"HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"}
 
 
@@ -562,14 +563,14 @@ def _digest(r) -> str:
 #: Every file (path, owner, mode, bytes) of each (OS x vendor x class) render, pinned. The full text of each was
 #: read once when these were taken; a change here is a change to what a confined session loads.
 GOLD_DIGESTS = {
-    ("darwin", "claude", "egress"): "bf42bb6cf0c3e771",
-    ("darwin", "claude", "none"): "426d64fd3fd0cb0a",
-    ("darwin", "codex", "egress"): "d49a946ae050aab9",
-    ("darwin", "codex", "none"): "3655d3d012d8b3c3",
-    ("linux", "claude", "egress"): "d3cf73a3ae08a1ac",
-    ("linux", "claude", "none"): "fad7bf3ef1d223be",
-    ("linux", "codex", "egress"): "cdd9de6f8218df27",
-    ("linux", "codex", "none"): "7d99c71911832dd8",
+    ("darwin", "claude", "egress"): "24c289333f977f99",
+    ("darwin", "claude", "none"): "3ef89c7358a401ec",
+    ("darwin", "codex", "egress"): "cd24c1b8e030351d",
+    ("darwin", "codex", "none"): "309384e358924b92",
+    ("linux", "claude", "egress"): "98ce399830ec8e9e",
+    ("linux", "claude", "none"): "c5ec670282a4d84a",
+    ("linux", "codex", "egress"): "7bbc08bc23292e46",
+    ("linux", "codex", "none"): "81b2599fe7f67fb5",
 }
 
 

@@ -13,6 +13,8 @@ What it renders, per (host, vendor, class):
 - ``<S>/root/gitconfig`` (``GIT_CONFIG_GLOBAL``), ``<S>/root/env`` (§3.4, exactly), ``<S>/root/profile.sb`` (macOS,
   §8.1 + §24). ⛔ A profile never holds a ``syscall`` operation (trg-069): :func:`render_profile` refuses its own
   output if the word appears anywhere in it.
+- ``<S>/root/readset-template/info/attributes`` (kind ``dispatch|planner|verifier``, §5.4 step 3): the clone's
+  template, exactly :data:`READSET_ATTRIBUTES`.
 - the vendors' onboarding pre-seed under ``<S>/config/`` so the TUI starts with no dialog.
 
 Plus the checks: the effective-config read-back (:func:`readback_refusals`, refused ``config-readback:<key>``) and
@@ -59,6 +61,15 @@ DRIVER_WRITABLE = ("driver",)
 
 #: §5.3 + §24: the kinds for which an egress session gets its own loopback alias on macOS.
 LOOPBACK_KINDS = frozenset({"interactive", "login"})
+#: §5.4 step 3: the alloc kinds whose clone takes the read-set template (``--template=<S>/root/readset-template``);
+#: ``interactive`` and ``login`` clone with ``--template=`` and run no post-clone check.
+READSET_KINDS = frozenset({"dispatch", "planner", "verifier"})
+#: The template's one file below ``<S>``, and its one line: every checkout conversion off, so worktree bytes equal
+#: the bundle's blobs whatever ``.gitattributes`` the tree holds (``$GIT_DIR/info/attributes`` outranks it). The
+#: line's one home: the clone's post-clone check compares the clone's copy against these bytes.
+READSET_TEMPLATE = "root/readset-template"
+READSET_ATTRIBUTES_PATH = f"{READSET_TEMPLATE}/info/attributes"
+READSET_ATTRIBUTES = b"* -text -eol -crlf -ident -filter -working-tree-encoding\n"
 #: The env var each brokered vendor reads its session token from (§3.2; Codex the ``env_key`` of its rendered
 #: provider block). The token is never rendered: ``start`` adds it at exec (§3.2). Claude Code's is
 #: ``ANTHROPIC_AUTH_TOKEN`` (head ruling 1020+28, N1: CC sends it as ``Authorization: Bearer``, the header the 3b
@@ -303,7 +314,8 @@ def _base_env(facts: RenderFacts, home: PurePosixPath, user: str) -> dict[str, s
         "XDG_CONFIG_HOME": f"{S}/xdg/config", "XDG_STATE_HOME": f"{S}/xdg/state",
         "npm_config_cache": f"{S}/xdg/cache/npm",
         "CLAUDE_CONFIG_DIR": f"{S}/config/claude", "CODEX_HOME": f"{S}/config/codex",
-        "GIT_CONFIG_GLOBAL": f"{S}/root/gitconfig", "GIT_CONFIG_NOSYSTEM": "1", "DISABLE_AUTOUPDATER": "1",
+        "GIT_CONFIG_GLOBAL": f"{S}/root/gitconfig", "GIT_CONFIG_NOSYSTEM": "1", "GIT_ATTR_NOSYSTEM": "1",
+        "DISABLE_AUTOUPDATER": "1",
     }
     if facts.term is not None:
         env["TERM"] = facts.term
@@ -588,6 +600,9 @@ def render(blob: RenderBlob, facts: RenderFacts) -> Rendered:
         files.append(RenderedFile("root/driver.env", env_text(envs["driver"]), 0, rgid, fmode))
     if facts.host == "darwin":
         files.append(RenderedFile("root/profile.sb", render_profile(blob, facts), 0, rgid, fmode))
+    if facts.kind in READSET_KINDS:
+        # §2.1: root : root 0644 whatever the class, so the slot can read it and no slot group can change it.
+        files.append(RenderedFile(READSET_ATTRIBUTES_PATH, READSET_ATTRIBUTES, 0, 0, 0o644))
     for name in sorted(blob.hooks):
         files.append(RenderedFile(f"root/hooks/{name}", facts.hook_templates[name].body, 0, rgid, xmode))
     # The onboarding pre-seed is the session vendor's only: a Codex session's CLAUDE_CONFIG_DIR stays empty, and a
@@ -800,7 +815,8 @@ def parse_driver_input(raw: bytes) -> object:
 
 
 __all__ = [
-    "VENDOR_PREFIX", "HookTemplate", "RenderFacts", "RenderedFile", "Rendered", "Contains", "DISCOVERY",
+    "VENDOR_PREFIX", "READSET_ATTRIBUTES", "READSET_ATTRIBUTES_PATH", "READSET_KINDS", "READSET_TEMPLATE",
+    "HookTemplate", "RenderFacts", "RenderedFile", "Rendered", "Contains", "DISCOVERY",
     "REPO_DISCOVERY", "wire_name", "gwport_for", "own_loopback", "check_facts", "render_env", "secret_env_names",
     "TOKEN_ENV", "ABSENT_ENV", "check_env_absent",
     "env_text", "render_cc_settings", "render_cc_onboarding", "codex_config", "codex_toml", "gitconfig_text",

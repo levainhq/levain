@@ -18,8 +18,13 @@ CONTROL checks, never as a fact root acts on.
    existence), ``not-rendered`` when it is not RENDERED; else root makes ``<S>/repo`` empty (a dir a failed or
    interrupted clone left is removed first), slot-owned, 0700 (the slot cannot create it in a root-owned ``<S>``).
 5. ``clone``: ``git clone`` from ``<S>/in/repo.bundle`` AS THE SLOT through wall's clone target (the same path as
-   the vendor); a non-zero exit = ``clone-failed``, state unchanged, the session's kill domain killed and then
-   ``<S>/repo`` emptied again, so the start can be retried. Success = end's ``mark_cloned``.
+   the vendor), with the read-set template for alloc kind ``dispatch|planner|verifier``; a non-zero exit =
+   ``clone-failed``, state unchanged, the session's kill domain killed and then ``<S>/repo`` emptied again, so the
+   start can be retried. For those three kinds a zero exit is not success until ``clone-check`` passes
+   (:func:`clone_check`, §5.4 step 3: (a) the clone's attributes file is render's line; kind ``dispatch`` also
+   (b), every index entry's worktree bytes hashed with no filter equal to its blob, inside a window no other
+   slot-uid process may be alive in); a failed check goes down the same ``clone-failed`` path. Success = end's
+   ``mark_cloned``, written only after the check.
 6. ``forwarder`` (Linux egress): the slot's TCP -> ``gw.sock`` relay in the netns, detached (§9.1); the helper
    waits (bounded) for its ready byte, written after bind + listen, and refuses ``forwarder-not-ready`` without it.
 7. ``secrets``: ``SECRETS`` from CONTROL (refused ``not-rendered`` unless RENDERED); the handles go ONLY into the
@@ -41,10 +46,12 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import select
+import stat
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -149,7 +156,7 @@ def launch(ctx: H.Ctx, a: R.Alloc, spec: wall.Spec) -> Tuple[Tuple[str, ...], Op
 def _spec(ctx: H.Ctx, a: R.Alloc, target: str, **kw) -> wall.Spec:
     seams = ctx.seams
     return wall.launch_spec(seams.host, target, slot=a.slot, session=a.session, ids=H.slot_ids(ctx, a.slot),
-                            shared={"levain-slots": seams.group_gid("levain-slots")}, **kw)
+                            shared={"levain-slots": seams.group_gid("levain-slots")}, kind=a.kind, **kw)
 
 
 def secret_env(ctx: H.Ctx, a: R.Alloc) -> Dict[str, str]:
@@ -280,6 +287,246 @@ def _kill_quiet(ctx: H.Ctx, a: R.Alloc, what: str) -> None:
         _note(f"{a.session}: {what}: kill domain failed: {type(e).__name__}")
 
 
+# --- the post-clone check (§5.4 step 3) --------------------------------------------------------------------------------
+
+class CheckFailed(Exception):
+    """A post-clone check that did not pass; the message names the half ((a), (b), the window) and the entry."""
+
+
+#: DECISION: the read set's caps (§5.4, a ticket's read set: at most 512 paths of at most 1024 bytes each), restated
+#: here because the root interpreter cannot import the dispatch package. A clone holding more fails the check.
+READSET_PATHS_MAX, READSET_PATH_BYTES = 512, 1024
+#: One ``ls-files -s -z`` record's fixed bytes: ``<mode 6> SP <sha 40> SP <stage 1> TAB`` and the closing NUL.
+_LS_FIXED = 6 + 1 + 40 + 1 + 1 + 1 + 1
+#: V9: the bound on ``ls-files``' stdout: the read set's caps, each path with its record's fixed fields.
+LS_FILES_BOUND = READSET_PATHS_MAX * (READSET_PATH_BYTES + _LS_FIXED)
+#: V9: ``hash-object`` prints one 40-hex id and a newline per path.
+ID_LINE_BYTES = 41
+#: The two index modes a read set holds, each with the owner execute bit its worktree file must carry.
+_MODES = {"100644": False, "100755": True}
+_LS_RECORD = re.compile(rb"([0-7]{6}) ([0-9a-f]{40}) ([0-3])\t(.+)", re.S)
+_ID_LINE = re.compile(rb"[0-9a-f]{40}\n")
+_O_FILE = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+
+
+@dataclass(frozen=True)
+class IndexEntry:
+    mode: str
+    sha: str
+    stage: int
+    path: str
+
+
+@dataclass(frozen=True)
+class CheckStats:
+    """What a passed check covered (U6: the run records the bytes hashed and the batches)."""
+
+    entries: int
+    batches: int
+    bytes_hashed: int
+
+
+def _name(path: str) -> str:
+    return repr(path if len(path) <= 96 else path[:96] + "...")
+
+
+def parse_ls_files(out: bytes) -> List[IndexEntry]:
+    """``git ls-files -s -z`` parsed by root: NUL-terminated ``<mode> SP <sha> SP <stage> TAB <path>`` records, so
+    no git path quoting is ever read. A record of any other shape, or a path that is not UTF-8, fails."""
+    if out and not out.endswith(b"\0"):
+        raise CheckFailed("(b) ls-files: the output does not end in NUL")
+    entries = []
+    for rec in out.split(b"\0")[:-1]:
+        m = _LS_RECORD.fullmatch(rec)
+        if m is None:
+            raise CheckFailed(f"(b) ls-files: a malformed record {rec[:96]!r}")
+        try:
+            path = m.group(4).decode("utf-8")
+        except UnicodeDecodeError:
+            raise CheckFailed(f"(b) ls-files: a path that is not UTF-8 {m.group(4)[:96]!r}") from None
+        entries.append(IndexEntry(m.group(1).decode(), m.group(2).decode(), int(m.group(3)), path))
+    return entries
+
+
+def check_index(entries: Sequence[IndexEntry]) -> None:
+    """Every entry at stage 0 with mode ``100644`` or ``100755``: no symlink (120000), no gitlink (160000), no
+    conflict stage."""
+    for e in entries:
+        if e.stage != 0 or e.mode not in _MODES:
+            raise CheckFailed(f"(b) {_name(e.path)}: index mode {e.mode} stage {e.stage}")
+
+
+def _lstat_beneath(repo_fd: int, path: str) -> os.stat_result:
+    """``path`` lstat'ed from ``repo_fd``: every parent opened ``O_DIRECTORY|O_NOFOLLOW`` (no symlink parent), the
+    entry itself never followed."""
+    parts = path.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        raise CheckFailed(f"(b) {_name(path)}: not a plain relative path")
+    fd = os.dup(repo_fd)
+    try:
+        for comp in parts[:-1]:
+            try:
+                nfd = os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            except OSError as e:
+                raise CheckFailed(f"(b) {_name(path)}: parent {comp!r} is not a plain directory "
+                                  f"(errno {e.errno})") from None
+            os.close(fd)
+            fd = nfd
+        try:
+            return os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+        except OSError as e:
+            raise CheckFailed(f"(b) {_name(path)}: no worktree entry (errno {e.errno})") from None
+    finally:
+        os.close(fd)
+
+
+def check_worktree(repo_fd: int, entries: Sequence[IndexEntry]) -> int:
+    """Each entry's worktree path, lstat'ed fd-relative: a regular file whose owner execute bit equals its index
+    mode's. Returns the bytes the hash will read."""
+    total = 0
+    for e in entries:
+        st = _lstat_beneath(repo_fd, e.path)
+        if not stat.S_ISREG(st.st_mode):
+            raise CheckFailed(f"(b) {_name(e.path)}: the worktree entry is not a regular file "
+                              f"(mode {stat.S_IFMT(st.st_mode):o})")
+        if bool(st.st_mode & stat.S_IXUSR) != _MODES[e.mode]:
+            raise CheckFailed(f"(b) {_name(e.path)}: exec bit {stat.S_IMODE(st.st_mode):o} vs index {e.mode}")
+        total += st.st_size
+    return total
+
+
+def hash_batches(paths: Sequence[str], cap: int = wall.HASH_ARGV_CAP) -> List[List[str]]:
+    """``paths`` in order, cut into ``hash-object`` batches whose whole argv is at most ``cap`` bytes (V9: a fixed
+    cap, never sysconf arithmetic)."""
+    base = wall.argv_bytes(wall.HASH_OBJECT_PREFIX)
+    out: List[List[str]] = []
+    cur: List[str] = []
+    size = base
+    for p in paths:
+        n = wall.argv_bytes((p,))
+        if base + n > cap:
+            raise CheckFailed(f"(b) {_name(p)}: one path past the {cap}-byte argv cap")
+        if cur and size + n > cap:
+            out.append(cur)
+            cur, size = [], base
+        cur.append(p)
+        size += n
+    if cur:
+        out.append(cur)
+    return out
+
+
+def check_attributes(sfd: int) -> None:
+    """(a): ``repo/.git/info/attributes`` opened fd-relative from the session dir fd, each directory
+    ``O_NOFOLLOW``, the file ``O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_NOCTTY`` (a FIFO never blocks), then ``fstat``: a
+    regular file whose bytes are render's line, exactly. A missing template clones with exit 0 and no such file."""
+    want = RD.READSET_ATTRIBUTES
+    fds = [sfd]
+    try:
+        for comp in ("repo", ".git", "info"):
+            try:
+                fds.append(os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fds[-1]))
+            except OSError as e:
+                raise CheckFailed(f"(a) {comp}: not a plain directory (errno {e.errno})") from None
+        try:
+            fd = os.open("attributes", _O_FILE, dir_fd=fds[-1])
+        except OSError as e:
+            raise CheckFailed(f"(a) info/attributes: absent or not a plain file (errno {e.errno})") from None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise CheckFailed("(a) info/attributes: not a regular file")
+            got = os.read(fd, len(want) + 1)
+        finally:
+            os.close(fd)
+        if got != want:
+            raise CheckFailed(f"(a) info/attributes: {got[:96]!r} is not the template's line")
+    finally:
+        for fd in fds[1:]:
+            os.close(fd)
+
+
+def _hash_ids(out: bytes, n: int) -> List[str]:
+    if len(out) != ID_LINE_BYTES * n:
+        raise CheckFailed(f"(b) hash-object: {len(out)} bytes for {n} paths")
+    lines = [out[i:i + ID_LINE_BYTES] for i in range(0, len(out), ID_LINE_BYTES)]
+    if not all(_ID_LINE.fullmatch(x) for x in lines):
+        raise CheckFailed("(b) hash-object: a line that is not one id")
+    return [x[:-1].decode() for x in lines]
+
+
+def clone_check(sfd: int, kind: str, run: Callable[[Tuple[str, ...], int], bytes], no_process: Callable[[], bool],
+                *, cap: int = wall.HASH_ARGV_CAP) -> Optional[CheckStats]:
+    """§5.4 step 3 after a zero clone exit, in order: for kind ``dispatch`` the slot uid has no process (V4); for
+    ``dispatch|planner|verifier`` (a) :func:`check_attributes`; for ``dispatch`` only (V3) (b): ``ls-files -s -z``
+    run as the slot (``run(argv, bound)`` returns its stdout or raises :class:`CheckFailed`), parsed and checked
+    here, every worktree entry lstat'ed fd-relative, then ``hash-object --no-filters`` in batches of at most
+    ``cap`` argv bytes, every id equal to its entry's blob, in order; then no slot-uid process again (V4). Any
+    failure raises :class:`CheckFailed`. ``interactive|login``: no check (None)."""
+    if kind not in RD.READSET_KINDS:
+        return None
+    window = kind == "dispatch"
+    if window and not no_process():
+        raise CheckFailed("window: a slot-uid process is alive after the clone, before the check")
+    check_attributes(sfd)
+    if not window:
+        return CheckStats(0, 0, 0)
+    entries = parse_ls_files(run(wall.ls_files_argv(), LS_FILES_BOUND))
+    if len(entries) > READSET_PATHS_MAX:
+        raise CheckFailed(f"(b) ls-files: {len(entries)} entries, past the read set's {READSET_PATHS_MAX}")
+    check_index(entries)
+    try:
+        repo = os.open("repo", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=sfd)
+    except OSError as e:
+        raise CheckFailed(f"(b) repo: not a plain directory (errno {e.errno})") from None
+    try:
+        size = check_worktree(repo, entries)
+    finally:
+        os.close(repo)
+    batches = hash_batches([ent.path for ent in entries], cap)
+    got: List[str] = []
+    for batch in batches:
+        got += _hash_ids(run(wall.hash_object_argv(batch), ID_LINE_BYTES * len(batch)), len(batch))
+    for ent, h in zip(entries, got):
+        if ent.sha != h:
+            raise CheckFailed(f"(b) {_name(ent.path)}: blob {ent.sha[:12]} != worktree --no-filters {h[:12]}")
+    if not no_process():
+        raise CheckFailed("window: a slot-uid process is alive after the last check child")
+    return CheckStats(len(entries), len(batches), size)
+
+
+def _run_check(ctx: H.Ctx, a: R.Alloc, argv: Tuple[str, ...], bound: int) -> bytes:
+    """One check child as the slot, by the clone's own launch path (wall's ``clone-check`` target), its stdout
+    drained by root within ``bound``."""
+    what = "ls-files" if argv == wall.ls_files_argv() else "hash-object"
+    spec = _spec(ctx, a, "clone-check", argv=argv)
+    largv, cgroup = launch(ctx, a, spec)
+    try:
+        code, out = ctx.seams.capture(largv, spec.to_json(), cgroup, bound)
+    except Refused as e:
+        raise CheckFailed(f"(b) {what}: {e.name}" + (f" ({e.detail})" if e.detail else "")) from None
+    if code != 0:
+        raise CheckFailed(f"(b) {what}: exit {code}")
+    return out
+
+
+def _no_slot_process(ctx: H.Ctx, a: R.Alloc) -> bool:
+    """proc.py's END proof, unchanged (Linux the session cgroup; macOS the uid sweep): no process of the slot uid."""
+    seams = ctx.seams
+    host = seams.host
+    _, _, no_process = PR.end_seams(host, a.cgroup if host == "linux" else None,  # type: ignore[arg-type]
+                                    seams.proc_seams)   # type: ignore[arg-type]
+    return no_process(a.slot_uid)
+
+
+def _clone_failed(ctx: H.Ctx, a: R.Alloc, detail: str) -> None:
+    """The ``clone-failed`` path: the kill domain killed, ``<S>/repo`` emptied (so the start can be retried), no
+    clone marker; then the refusal."""
+    _kill_quiet(ctx, a, "clone-failed")   # macOS: a stray slot-uid process could still write into repo
+    with ctx.store.dir("live", a.session) as sfd:
+        _fresh_repo(ctx, a, sfd)
+    raise Refused("clone-failed", detail)
+
+
 # --- start (§5.1) ------------------------------------------------------------------------------------------------------
 
 def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
@@ -318,10 +565,23 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         seams.make_cgroup(cgroup)
     code = seams.wait(seams.spawn(argv, spec.to_json(), cgroup, None, False))
     if code != 0:
-        _kill_quiet(ctx, a, "clone-failed")   # macOS: a stray slot-uid process could still write into repo
-        with ctx.store.dir("live", a.session) as sfd:
-            _fresh_repo(ctx, a, sfd)          # emptied, so the start can be retried
-        raise Refused("clone-failed", f"exit {code}")
+        _clone_failed(ctx, a, f"exit {code}")
+    if a.kind in RD.READSET_KINDS:
+        seams.at("clone-check")
+        try:
+            with ctx.store.dir("live", a.session) as sfd:
+                clone_check(sfd, a.kind, lambda av, bound: _run_check(ctx, a, av, bound),
+                            lambda: _no_slot_process(ctx, a))
+        except (CheckFailed, Refused, OSError) as err:
+            # A listing or launch refusal inside the check is a failed check too: the clone is never kept unproven.
+            detail = str(err) if isinstance(err, CheckFailed) else (
+                f"check: {err.name}" if isinstance(err, Refused) else f"check: {type(err).__name__} errno {err.errno}")
+            _clone_failed(ctx, a, detail[:512])
+        except BaseException:
+            _kill_quiet(ctx, a, "clone-check")
+            with ctx.store.dir("live", a.session) as sfd:
+                _fresh_repo(ctx, a, sfd)
+            raise
     E.mark_cloned(ctx.store.path, a.session)
 
     if egress and seams.host == "linux":
@@ -531,6 +791,9 @@ def teardown(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     return {"state": R.RETAINED}
 
 
-__all__ = ["EXEC_MARKER_S", "FORWARDER_READY_S", "await_exec", "check_discovery", "discovery_listings", "end_facts",
-           "end_seams", "kill_domain", "launch", "read_record", "remove_tree_at", "revoke", "scrub_and_release",
+__all__ = ["CheckFailed", "CheckStats", "EXEC_MARKER_S", "FORWARDER_READY_S", "ID_LINE_BYTES", "IndexEntry",
+           "LS_FILES_BOUND", "READSET_PATHS_MAX", "READSET_PATH_BYTES", "await_exec", "check_attributes",
+           "check_discovery", "check_index", "check_worktree", "clone_check", "discovery_listings", "end_facts",
+           "end_seams", "hash_batches", "kill_domain", "launch", "parse_ls_files", "read_record", "remove_tree_at",
+           "revoke", "scrub_and_release",
            "secret_env", "start", "teardown", "vendor_argv"]

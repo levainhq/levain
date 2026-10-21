@@ -262,8 +262,9 @@ def test_slot_clones_from_bundle(env):
     assert w.main(["start", s])[1]["ok"]
     (c,) = la.of("clone")
     S = PurePosixPath(str(STORE["linux"])) / "live" / s
-    assert tuple(c["spec"]["argv"]) == wall.clone_argv(S) == (
-        "/usr/bin/git", "-c", "core.hooksPath=/dev/null", "clone", "--template=", f"{S}/in/repo.bundle", f"{S}/repo")
+    assert tuple(c["spec"]["argv"]) == wall.clone_argv(S, "interactive") == (
+        "/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0", "-c", "maintenance.auto=false", "clone",
+        "--template=", f"{S}/in/repo.bundle", f"{S}/repo")
     assert (c["spec"]["uid"], c["spec"]["gid"], c["spec"]["cwd"]) == (S0, S0, f"{S}/repo")
     assert c["spec"]["extra_env"] == {} and c["spec"]["exec_fd"] is None and c["spec"]["keep_fds"] == []
     assert c["argv"][:2] == (wall.NSENTER, "--net=/run/netns/levain-e0")
@@ -304,7 +305,7 @@ def test_exact_clone_command_against_a_real_bundle(tmp_path):
     (S / "in").mkdir(parents=True)
     git("-c", "core.hooksPath=/dev/null", "bundle", "create", str(S / "in" / "repo.bundle"), "HEAD", "main")
     (S / "repo").mkdir(mode=0o700)                                  # root's empty dir
-    argv = wall.clone_argv(PurePosixPath(str(S)))
+    argv = wall.clone_argv(PurePosixPath(str(S)), "interactive")
     r = subprocess.run(list(argv), cwd=S / "repo", env=genv, capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     assert (S / "repo" / "README").read_text() == "hello\n"
@@ -419,6 +420,7 @@ def test_exec_fd_only_the_vendors(bad):
     target = bad.pop("target", "vendor")
     if target == "clone":
         kw.pop("argv")
+        kw["kind"] = "interactive"
     kw.update(bad)
     with pytest.raises(Refused) as e:
         wall.launch_spec("linux", target, slot=E0, session="s-00000000000000aa", ids={"_levain_s0": S0},

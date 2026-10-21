@@ -27,8 +27,9 @@ That is R-L1's measured view (``vm/n3.sh``:
 ro ``/usr`` ``/etc``, ``bin``/``sbin``/``lib`` links into ``/usr``, a fresh ``/proc``, rbind ``/dev`` with a
 fresh ``/dev/shm``, tmpfs, the session dir and the socket dirs) built by bwrap instead of hand mounts.
 
-Targets: ``vendor``, ``clone`` (§5.4 step 3: by the SAME path as the vendor), ``step`` (a verifier step,
-§5.6 step 2), ``driver`` (§5.6 step 3), ``forwarder`` (Linux egress, §9.1) and ``front`` (§5.1 render (4)).
+Targets: ``vendor``, ``clone`` (§5.4 step 3: by the SAME path as the vendor), ``clone-check`` (the post-clone
+check's ``git`` children, §5.4 step 3 (b), by that same path), ``step`` (a verifier step, §5.6 step 2), ``driver``
+(§5.6 step 3), ``forwarder`` (Linux egress, §9.1) and ``front`` (§5.1 render (4)).
 
 ⛔ Nothing here is ever run on the host by a test: every OS act is a seam (:class:`OsCalls`) and every
 argv is asserted as text. No ``syscall`` operation may reach a profile (trg-069, §8).
@@ -80,7 +81,7 @@ SPEC_CAP = 64 * 1024
 ENV_CAP = 64 * 1024
 PROFILE_CAP = 1024 * 1024
 
-TARGETS = ("vendor", "clone", "step", "driver", "forwarder", "front")
+TARGETS = ("vendor", "clone", "clone-check", "step", "driver", "forwarder", "front")
 #: §3.1 step 4: a slot child holds 0, 1, 2 + its pty; the front 0, 1, 2 + its GO pipe (§5.1 render (4)); the
 #: forwarder 0, 1, 2 + its readiness pipe.
 _ONE_EXTRA_FD = frozenset({"vendor", "front", "forwarder"})
@@ -138,9 +139,9 @@ def target_account(slot, target: str) -> str:
     ``_levain_c<n>``, its driver as ``_levain_v<n>``. Any other pairing is refused."""
     first, second = slot.accounts
     if slot.slot_class == "egress":
-        table = {"vendor": first, "clone": first, "forwarder": first, "front": second}
+        table = {"vendor": first, "clone": first, "clone-check": first, "forwarder": first, "front": second}
     else:
-        table = {"clone": second, "step": second, "driver": first}
+        table = {"clone": second, "clone-check": second, "step": second, "driver": first}
     if target not in table:
         raise Refused("bad-token", f"target {target!r} does not run in a {slot.slot_class} slot")
     return table[target]
@@ -278,12 +279,63 @@ def module_argv(host: str, module: str, *args: str) -> Tuple[str, ...]:
     return (ROOT_PYTHON[host], PY_FLAGS, "-c", boot, module) + tuple(args)
 
 
-def clone_argv(session_dir: PurePosixPath) -> Tuple[str, ...]:
+#: §5.4 step 3 (V4): every clone and check argv runs no hook and no automatic gc or maintenance, so no git
+#: process outlives the one root waits for.
+_GIT_PREFIX = (GIT, "-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0", "-c", "maintenance.auto=false")
+#: §5.4 step 3 (b): every ``hash-object`` batch's argv up to its first path.
+HASH_OBJECT_PREFIX = _GIT_PREFIX + ("hash-object", "--no-filters", "--")
+#: §5.4 step 3 (V9): a fixed cap on one ``hash-object`` batch's argv bytes (every string plus its NUL).
+HASH_ARGV_CAP = 128 * 1024
+
+
+def clone_argv(session_dir: PurePosixPath, kind: str) -> Tuple[str, ...]:
     """§5.4 step 3: the slot (verifier: the child) clones its repo from the bundle into the empty dir root
-    made. No hooks, no template; ``GIT_CONFIG_NOSYSTEM=1`` and the rendered global config come from the env
-    file (§3.4)."""
-    return (GIT, "-c", "core.hooksPath=/dev/null", "clone", "--template=", str(session_dir / "in" / "repo.bundle"),
-            str(session_dir / "repo"))
+    made. Alloc kind ``dispatch|planner|verifier`` clones with ``--template=<S>/root/readset-template`` (render's,
+    whose one ``info/attributes`` line turns every checkout conversion off); ``interactive|login`` with
+    ``--template=`` (no template). A kind outside the five is refused, never defaulted to either form.
+    ``GIT_CONFIG_NOSYSTEM=1``, ``GIT_ATTR_NOSYSTEM=1`` and the rendered global config come from the env file
+    (§3.4)."""
+    from levain.slot.render import READSET_KINDS, READSET_TEMPLATE
+    from levain.slot.runtime_grammar import KINDS
+
+    if not isinstance(kind, str) or kind not in KINDS:
+        raise Refused("bad-token", f"kind {kind!r}")
+    template = str(session_dir / READSET_TEMPLATE) if kind in READSET_KINDS else ""
+    return _GIT_PREFIX + ("clone", f"--template={template}", str(session_dir / "in" / "repo.bundle"),
+                          str(session_dir / "repo"))
+
+
+def ls_files_argv() -> Tuple[str, ...]:
+    """§5.4 step 3 (b): the index as NUL-separated ``<mode> SP <sha> SP <stage> TAB <path>`` records, which root
+    parses itself (no git path quoting is read)."""
+    return _GIT_PREFIX + ("ls-files", "-s", "-z")
+
+
+def hash_object_argv(paths: Sequence[str]) -> Tuple[str, ...]:
+    """§5.4 step 3 (b): the worktree bytes of ``paths`` hashed with no attribute applied, the paths as argv after
+    ``--`` (no ``--stdin-paths``, so no quoting protocol). At least one path, no NUL, the whole argv within
+    :data:`HASH_ARGV_CAP`."""
+    argv = HASH_OBJECT_PREFIX + tuple(paths)
+    if not paths or not all(isinstance(p, str) and p and "\x00" not in p for p in paths) \
+            or argv_bytes(argv) > HASH_ARGV_CAP:
+        raise Refused("spec-malformed", f"hash-object batch of {len(paths)} paths")
+    return argv
+
+
+def argv_bytes(argv: Sequence[str]) -> int:
+    """An argv's size as the kernel counts its strings: each one's bytes plus its NUL."""
+    return sum(len(a.encode("utf-8", "surrogateescape")) + 1 for a in argv)
+
+
+def _check_clone_check_argv(argv: Sequence[str]) -> None:
+    """The ``clone-check`` target runs exactly :func:`ls_files_argv` or a :func:`hash_object_argv` batch."""
+    n = len(HASH_OBJECT_PREFIX)
+    if tuple(argv) == ls_files_argv():
+        return
+    if tuple(argv[:n]) == HASH_OBJECT_PREFIX:
+        hash_object_argv(tuple(argv[n:]))
+        return
+    raise Refused("target-off-list", "clone-check runs git ls-files -s -z or git hash-object --no-filters -- only")
 
 
 def _check_step_argv(argv: Sequence[str]) -> None:
@@ -296,14 +348,19 @@ def _check_step_argv(argv: Sequence[str]) -> None:
 def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str, int], shared: Mapping[str, int],
                 argv: Sequence[str] = (), env_file: Optional[str] = None, profile: Optional[str] = None,
                 extra_env: Optional[Mapping[str, str]] = None, keep_fds: Iterable[int] = (),
-                front_module: Optional[str] = None, exec_fd: Optional[int] = None) -> Spec:
+                front_module: Optional[str] = None, exec_fd: Optional[int] = None,
+                kind: Optional[str] = None) -> Spec:
     """The stage's spec for ``target`` of ``slot``'s ``session``. Every path is derived from the session id
     (§5: no argv token or stdin field is a path); ``env_file`` / ``profile`` may only name a file in the
     rendered layer ``<S>/root/`` (lane B renders them; this module takes their paths, never their text).
 
     * ``vendor``: ``argv[0]`` under the vendor prefix (§2.1), cwd ``<S>/repo`` (claude fails in an
       unreadable cwd, 1c C15), one extra fd (its pty), the handles in ``extra_env``.
-    * ``clone``: :func:`clone_argv`, cwd ``<S>/repo`` (root made it empty, slot-owned, §5.4 step 3).
+    * ``clone``: :func:`clone_argv` for the alloc ``kind`` (required: never defaulted), cwd ``<S>/repo`` (root
+      made it empty, slot-owned, §5.4 step 3).
+    * ``clone-check``: the post-clone check's child (§5.4 step 3 (b)), the clone's principal, cwd and env file;
+      ``argv`` is exactly :func:`ls_files_argv` or one :func:`hash_object_argv` batch. Its stdout is root's to
+      drain (the runtime helper's capture), never the helper's own.
     * ``step``: the ticket's argv, resolved on the env's PATH as the child, cwd ``<S>/repo`` (§5.6 step 2).
     * ``driver``: a template argv (the root interpreter or the import tree), cwd ``<S>/driver``; ``<S>/repo``
       is child 0700, unreadable to it by design (§5.6 step 3).
@@ -335,7 +392,12 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
     elif target == "clone":
         if argv:
             raise Refused("spec-malformed", "clone builds its own argv")
-        argv, cwd = clone_argv(S), S / "repo"
+        if kind is None:
+            raise Refused("bad-token", "clone takes the alloc kind (never defaulted)")
+        argv, cwd = clone_argv(S, kind), S / "repo"
+    elif target == "clone-check":
+        _check_clone_check_argv(argv)
+        cwd = S / "repo"
     elif target == "step":
         _check_step_argv(argv)
         cwd, resolve = S / "repo", True
@@ -363,7 +425,7 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
         cwd = PurePosixPath("/")
 
     slot_target = target != "front"
-    if env_file is None and target in ("vendor", "clone", "step", "driver"):
+    if env_file is None and target in ("vendor", "clone", "clone-check", "step", "driver"):
         # A verifier renders two env files (§3.4: the driver's HOME is <S>/driver, the child's <S>).
         env_file = str(root_layer / ("driver.env" if target == "driver" else "env"))
     if env_file is not None and (target in ("front", "forwarder") or not _under(env_file, root_layer)):
@@ -1250,10 +1312,11 @@ if __name__ == "__main__":
     os._exit(main(sys.argv[1:]))
 
 
-__all__ = ["EXEC_FD", "EXEC_OK", "EXEC_REFUSED", "FORWARDER_PORT", "LinuxLaunch", "NPROC", "OsCalls", "Principal",
-           "READY_FD", "SPEC_FD", "SPEC_FORMAT", "STAGE_EXIT",
-           "Spec", "TARGETS", "cgroup_dir", "check_egress_ready", "check_profile_text", "clone_argv",
-           "drop_and_assert", "exec_launch", "expected_slot_rules", "launch_spec", "linux_launch_argv",
-           "linux_view_args", "macos_egress_ready", "macos_launch_argv", "module_argv", "parse_env", "parse_spec",
-           "pf_printed", "principal", "read_host_links", "read_netns_names", "real_os_calls", "require_netns",
+__all__ = ["EXEC_FD", "EXEC_OK", "EXEC_REFUSED", "FORWARDER_PORT", "HASH_ARGV_CAP", "HASH_OBJECT_PREFIX",
+           "LinuxLaunch", "NPROC", "OsCalls", "Principal", "READY_FD", "SPEC_FD", "SPEC_FORMAT", "STAGE_EXIT",
+           "Spec", "TARGETS", "argv_bytes", "cgroup_dir", "check_egress_ready", "check_profile_text", "clone_argv",
+           "drop_and_assert", "exec_launch", "expected_slot_rules", "hash_object_argv", "launch_spec",
+           "linux_launch_argv", "linux_view_args", "ls_files_argv", "macos_egress_ready", "macos_launch_argv",
+           "module_argv", "parse_env", "parse_spec", "pf_printed", "principal", "read_host_links", "read_netns_names",
+           "real_os_calls", "require_netns",
            "set_no_new_privs", "stage_argv", "stage_main", "target_account", "trampoline_argv", "trampoline_main"]

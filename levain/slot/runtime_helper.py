@@ -25,6 +25,7 @@ import errno
 import fcntl
 import os
 import re
+import select
 import signal
 import stat
 import subprocess
@@ -278,14 +279,16 @@ def _child_refused(marker: Optional[int], write: Callable[[int, bytes], int] = o
 
 
 def spawn_target(argv: Sequence[str], spec_json: bytes, cgroup: Optional[str], exec_w: Optional[int],
-                 detach: bool) -> int:
+                 detach: bool, *, stdout_w: Optional[int] = None) -> int:
     """``start``'s fork through the wall (§5.1 start, §5.4 step 3, §9.1): the child keeps fds 0/1/2 (the helper's
     own stdio, sudo's pty; ``detach``: ``/dev/null`` + ``setsid``, the forwarder), the spec pipe (moved to
     ``SPEC_FD`` by :func:`wall.exec_launch`) and, when ``exec_w`` is given, that pipe's write end on
     :data:`wall.EXEC_FD`: the vendor's exec marker (the last hop writes ``+`` just before the vendor's execve) or
     the forwarder's readiness pipe (:data:`wall.READY_FD`, the same fd). Every other fd is closed. A child that
     fails before its exec writes ``!`` on whichever fd holds the pipe at that moment (``exec_w`` itself until
-    the dup2 onto ``EXEC_FD`` succeeded), so its failure is never only an EOF. Only root can run it (a VM row)."""
+    the dup2 onto ``EXEC_FD`` succeeded), so its failure is never only an EOF. ``stdout_w``: a pipe's write end put
+    on the child's fd 1 instead of the helper's (a post-clone check child, :func:`capture_target`). Only root can
+    run it (a VM row)."""
     spec_r, spec_w = os.pipe()
     pid = os.fork()
     if pid == 0:   # pragma: no cover - the root child; exercised only in the VM (2g)
@@ -298,6 +301,8 @@ def spawn_target(argv: Sequence[str], spec_json: bytes, cgroup: Optional[str], e
                     os.dup2(null, fd)
                 if null > 2:
                     os.close(null)
+            if stdout_w is not None:
+                os.dup2(stdout_w, 1)
             hi_spec = fcntl.fcntl(spec_r, fcntl.F_DUPFD, 32)
             keep = [hi_spec]
             if exec_w is not None:
@@ -337,6 +342,55 @@ def wait_child(pid: int) -> int:
     if os.WIFSIGNALED(status):
         return 128 + os.WTERMSIG(status)
     return os.WEXITSTATUS(status)
+
+
+#: DECISION: the bound on one post-clone check child (``ls-files`` or one ``hash-object`` batch), from its spawn to
+#: its stdout's EOF. Past it the child is killed and the check fails: a stdout another process still holds open
+#: never stalls ``start``.
+CHECK_S = 300.0
+
+
+def drain(fd: int, bound: int, *, deadline_s: float = CHECK_S,
+          monotonic: Callable[[], float] = time.monotonic) -> bytes:
+    """Everything a check child prints on the pipe's read end ``fd``, read WHILE it runs (a full pipe never stalls
+    it), until EOF. More than ``bound`` bytes = ``check-output-over-bound`` (refused, never truncated: the read
+    stops at the first byte past it); no EOF within ``deadline_s`` = ``check-timeout``."""
+    end = monotonic() + deadline_s
+    chunks: List[bytes] = []
+    size = 0
+    while True:
+        left = end - monotonic()
+        if left <= 0 or not select.select([fd], [], [], left)[0]:
+            raise Refused("check-timeout", f"no EOF within {deadline_s:g}s")
+        b = os.read(fd, min(65536, bound - size + 1))
+        if not b:
+            return b"".join(chunks)
+        size += len(b)
+        if size > bound:
+            raise Refused("check-output-over-bound", f"more than {bound} bytes")
+        chunks.append(b)
+
+
+def capture_target(argv: Sequence[str], spec_json: bytes, cgroup: Optional[str], bound: int) -> Tuple[int, bytes]:
+    """A post-clone check child (§5.4 step 3, wall's ``clone-check`` target) by :func:`spawn_target`'s path, its
+    stdout on a pipe root drains while it runs (:func:`drain`); its exit status and that output. A drain that
+    refuses kills and reaps the child first, then raises. Only root can run it (a VM row)."""
+    out_r, out_w = os.pipe()
+    try:
+        pid = spawn_target(argv, spec_json, cgroup, None, False, stdout_w=out_w)
+    except BaseException:
+        os.close(out_r)
+        raise
+    finally:
+        os.close(out_w)
+    try:
+        data = drain(out_r, bound)
+    except BaseException:
+        os.close(out_r)
+        _sigkill_and_reap(pid)
+        raise
+    os.close(out_r)
+    return wait_child(pid), data
 
 
 def make_cgroup(path: str, *, mkdir: Callable[[str, int], None] = os.mkdir,
@@ -436,6 +490,8 @@ class Seams:
     # start / teardown (levain.slot.start):
     spawn: Callable[[Sequence[str], bytes, Optional[str], Optional[int], bool], int] = spawn_target
     wait: Callable[[int], int] = wait_child
+    #: a post-clone check child: ``(argv, spec_json, cgroup, bound) -> (exit, stdout)`` (:func:`capture_target`)
+    capture: Callable[[Sequence[str], bytes, Optional[str], int], Tuple[int, bytes]] = capture_target
     egress_ready: Callable[[SlotId, Mapping[str, int]], None] = wall.macos_egress_ready
     netns_names: Callable[[], Iterable[str]] = wall.read_netns_names
     host_links: Callable[[], Mapping[str, Optional[str]]] = wall.read_host_links
@@ -1291,15 +1347,19 @@ def render_step2_policy(run: RenderRun) -> None:
     write_alloc(ctx, run.alloc)
 
 
-def render_layer_rows(slot: SlotId, owner_gid: int) -> List[DirRow]:
+def render_layer_rows(slot: SlotId, owner_gid: int, kind: str) -> List[DirRow]:
     """§2.1 rows ``render`` makes: ``<S>/in/`` root : the slot (verifier: the child) 0750; ``<S>/root/`` root : the
     slot 0750 (verifier root : root 0755, as a none-class layer is world-readable, §2.1). DECISION: ``root/hooks/``
-    takes ``root/``'s row."""
+    takes ``root/``'s row. Kind ``dispatch|planner|verifier`` adds the clone template's two dirs,
+    ``root/readset-template/`` and its ``info/``, root : root 0755 (§2.1, §5.4 step 3)."""
     if slot.slot_class == "egress":
         layer = (0, owner_gid, 0o750)
     else:
         layer = (0, 0, 0o755)
-    return [DirRow("in", 0, owner_gid, 0o750), DirRow("root", *layer), DirRow("root/hooks", *layer)]
+    rows = [DirRow("in", 0, owner_gid, 0o750), DirRow("root", *layer), DirRow("root/hooks", *layer)]
+    if kind in RD.READSET_KINDS:
+        rows += [DirRow(RD.READSET_TEMPLATE, 0, 0, 0o755), DirRow(f"{RD.READSET_TEMPLATE}/info", 0, 0, 0o755)]
+    return rows
 
 
 #: The §2.1 dirs ``prepare`` makes owned by the SESSION OWNER (egress: the slot; verifier: the child) that ``render``
@@ -1345,7 +1405,7 @@ def render_step3_files(run: RenderRun) -> None:
     assert facts is not None
     rendered = RD.render(run.blob, facts)
     S = ("live", a.session)
-    for row in render_layer_rows(a.slot, facts.slot_gid):
+    for row in render_layer_rows(a.slot, facts.slot_gid, a.kind):
         *parent, name = row.rel.split("/")
         with ctx.store.dir(*S, *parent) as pfd:
             ctx.store.mkdir(pfd, name, row.uid, row.gid, row.mode, f"live/{a.session}/{row.rel}")
@@ -1671,7 +1731,7 @@ def _read_stdin() -> bytes:
 __all__ = ["BASE_ROUTES_FORMAT", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED",
            "FRONT_MODULE", "GO_BYTE", "GO_FD", "GO_FD_ENV", "Leased", "LinkedNotDurable", "PREPARE_RESULT_FORMAT",
            "RENDER_STEPS", "RenderRun", "SLOT_OWNED_RENDER_DIRS", "Seams", "SlotView", "Store", "VERB_HANDLERS",
-           "configured_slots", "ENTRY_ENV", "entry_env",
+           "CHECK_S", "capture_target", "configured_slots", "drain", "ENTRY_ENV", "entry_env",
            "create_alloc", "create_at", "kill_front", "lease_slot", "main", "make_cgroup", "open_slot_owned_dir",
            "parse_slot_state_of", "pick_slot", "prepare", "proc_identity", "read_view", "render",
            "render_layer_rows", "resume", "revert_lease", "run", "session_dir_rows", "session_lock",

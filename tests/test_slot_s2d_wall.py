@@ -39,6 +39,8 @@ def spec(host, target, slot=E0, **kw):
                    else "/usr/local/lib/levain-root/drv.py"] if target == "driver" else [])
     if target == "front":
         kw.setdefault("front_module", "levain.broker.front")
+    if target == "clone":
+        kw.setdefault("kind", "verifier" if slot is V0 else "interactive")
     return wall.launch_spec(host, target, slot=slot, session=kw.pop("session", SESSION), ids=IDS[host],
                             shared=SHARED[host], **kw)
 
@@ -234,7 +236,8 @@ def test_launch_spec_paths_derived_from_session(darwin):
     assert sp.cwd == S["darwin"] + "/repo" and sp.env_file == S["darwin"] + "/root/env"
     assert sp.argv == (VENDOR["darwin"], "--resume") and not sp.resolve
     assert "tok" not in " ".join(wall.macos_launch_argv(sp))          # a handle never rides argv (§3.2)
-    assert spec("darwin", "clone").argv == ("/usr/bin/git", "-c", "core.hooksPath=/dev/null", "clone", "--template=",
+    assert spec("darwin", "clone").argv == ("/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0",
+                                            "-c", "maintenance.auto=false", "clone", "--template=",
                                             S["darwin"] + "/in/repo.bundle", S["darwin"] + "/repo")
     drv = spec("darwin", "driver", V0)
     assert drv.cwd == S["darwin"] + "/driver" and drv.env_file == S["darwin"] + "/root/driver.env"
