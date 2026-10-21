@@ -322,6 +322,8 @@ class CoordStore:
         self.path = self._jobs.path
         self._clock = clock
         self._ready = False
+        # drop id -> the coordinator launch its own transaction asked for (read by woken_launch, this process only)
+        self._woken: dict[str, str] = {}
 
     # --- store ---------------------------------------------------------------------------------------------------
     def _connect(self) -> sqlite3.Connection:
@@ -354,9 +356,10 @@ class CoordStore:
         with write_transaction(self._connect) as conn:
             now = self._stamp()
             if by == "coordinator":
-                from levain.coordinator.lease import fence
+                from levain.coordinator.lease import fence, record_write
 
-                fence(conn, now, token)
+                # the write and its record commit together: a write that rolls back leaves no "it wrote" behind
+                record_write(conn, now, fence(conn, now, token))
             yield conn, now
 
     def _stamp(self) -> str:
@@ -431,11 +434,14 @@ class CoordStore:
         # a drop with no coordinator asks for one, in its own transaction (C0 §6). A wake that fails rolls back to
         # here and the drop is kept: your words are never lost to the coordinator's bookkeeping
         conn.execute("SAVEPOINT coord_wake")
+        woke = None
         try:
-            wake(conn, now)
+            woke = wake(conn, now)
         except Exception:  # noqa: BLE001 - any wake failure, never the drop: the words are kept
             conn.execute("ROLLBACK TO coord_wake")
         conn.execute("RELEASE coord_wake")
+        if woke is not None:
+            self._woken[drop_id] = woke.launch_id
         return self._drop(conn, drop_id)
 
     # --- threads -------------------------------------------------------------------------------------------------
@@ -640,6 +646,14 @@ class CoordStore:
         with self._write() as (conn, now):
             return lease.beat(conn, now, token, by=by)
 
+    def coord_service_beat(self, token: int) -> Any:
+        """The watcher's beat (:func:`levain.coordinator.lease.service_beat`): None when the holder has not written
+        as coordinator recently enough to earn one."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.service_beat(conn, now, token)
+
     def coord_claim(self, launch_id: str, session_key: str) -> int:
         from levain.coordinator import lease
 
@@ -652,6 +666,39 @@ class CoordStore:
 
         with self._write() as (conn, now):
             return lease.wake(conn, now)
+
+    def coord_set_agent(self, agent: str, *, model: str | None = None, cwd: str | None = None) -> Any:
+        """Your coordinator setting: the agent a wake launches, its model, the (resolved) directory it runs in."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.set_agent(conn, now, agent, model=model, cwd=cwd)
+
+    def coord_setting(self) -> Any:
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.setting(conn)
+
+    def pending_coordinator(self) -> Any:
+        """The newest coordinator launch still pending (whatever its until), or None."""
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            pending = lease._in_state(conn, "pending", "coordinator")
+            return pending[-1] if pending else None
+
+    def woken_launch(self, drop_id: str) -> str | None:
+        """The coordinator launch ``drop_id``'s own transaction asked for, when this store object accepted it. Read
+        once: the entry is popped, so a long-lived store holds none it no longer needs (L3 r1 G8)."""
+        return self._woken.pop(drop_id, None)
+
+    def launch_claim_spawn(self, launch_id: str, pid: int) -> Any:
+        """The one-spawner compare-and-set (:func:`levain.coordinator.lease.claim_spawn`), one transaction."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.claim_spawn(conn, now, launch_id, pid)
 
     def launch_request(self, token: int, *, harness: str, role: str = "worker", threads: Sequence[str] = (),
                        model: str | None = None, cwd: str | None = None) -> Any:
@@ -679,6 +726,46 @@ class CoordStore:
 
         with read_transaction(self._connect) as conn:
             return lease.launch(conn, launch_id)
+
+    # --- what the watcher reads and writes (levain coord watch) --------------------------------------------------
+    def launches_unspawned(self) -> list[Any]:
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.unspawned(conn)
+
+    def launches_active(self) -> list[Any]:
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease._in_state(conn, "active")
+
+    def launch_dirs(self) -> list[str]:
+        """Every directory a launch of this store was asked to run in (where its briefs sit)."""
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.launch_dirs(conn)
+
+    def launch_by_harness_session(self, harness_session_id: str) -> Any:
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.by_harness_session(conn, harness_session_id)
+
+    def launch_end_unlisted(self, launch_id: str) -> Any:
+        """``launch_id``'s session is gone from its harness's list (:func:`levain.coordinator.lease.end_unlisted`)."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.end_unlisted(conn, now, launch_id)
+
+    def coord_lease(self) -> Any:
+        """The lease as it stands (live or past its until), or None; nothing written."""
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.lease(conn, self._stamp())
 
     # --- reading -------------------------------------------------------------------------------------------------
     def drop(self, drop_id: str) -> Drop:

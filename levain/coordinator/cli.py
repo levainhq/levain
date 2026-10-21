@@ -148,7 +148,34 @@ def run_drop(args: argparse.Namespace, out: Any = None) -> int:
     state = "delivered" if created else "already delivered (resend, nothing written)"
     _emit(out, args.json, {**_drop_row(drop), "created": created},
           f"drop receipt: {drop.drop_id} {state} at {drop.received_at}, {_where(drop)}")
+    _launch_woken(store, drop)
     return 0
+
+
+def _launch_woken(store: EnvelopeStore, drop: Drop) -> None:
+    """Start the coordinator launch this drop's own transaction asked for, if it asked for one, and say how it went on
+    stderr. The drop's exit is never changed by it: the drop was delivered either way."""
+    launch_id = store.woken_launch(drop.drop_id)
+    if launch_id is None:
+        return
+    from levain.coordinator.launch import launch_session
+
+    try:
+        got = launch_session(store, launch_id)
+    except _REFUSED as exc:
+        print(f"coordinator launch {launch_id}: not started ({exc})", file=sys.stderr)
+        return
+    print(_outcome_text(got), file=sys.stderr)
+
+
+def _outcome_text(got: Any) -> str:
+    if got.started:
+        return f"coordinator launch {got.launch_id} started: {got.attach}"
+    text = f"coordinator launch {got.launch_id}: not started: {got.refusal}"
+    if got.remedy:
+        text += (f"\nrun this once and accept the trust prompt:\n  {got.remedy}\nthen the next drop starts a "
+                 "coordinator, or levain coord wake starts one, once the wait levain coord status shows is over")
+    return text
 
 
 # --- thread envelopes (C2b): the operator's own door to the one authority the coordinator adds -----------------------
@@ -696,6 +723,7 @@ def _drop_with_envelope(args: argparse.Namespace, out: Any, store: EnvelopeStore
                            "envelope": {"taken": drop.envelope_id is not None, "envelope_id": drop.envelope_id,
                                         "refused": refused}},
           f"drop receipt: {drop.drop_id} {state} at {drop.received_at}, {_where(drop)}\n{line}")
+    _launch_woken(store, drop)
     return 0 if drop.envelope_id else 1
 
 
@@ -968,11 +996,51 @@ def run_coord(args: argparse.Namespace, out: Any = None) -> int:
             tok = store.coord_claim(args.launch, args.session)
             _emit(out, args.json, {"token": tok}, f"claimed: token {tok}")
             return 0
+        if cmd == "agent":
+            return _coord_agent(args, out, store)
+        if cmd == "launch":
+            from levain.coordinator.launch import launch_session
+
+            launch_id = args.launch_id
+            if launch_id is None:
+                pending = store.pending_coordinator()
+                if pending is None:
+                    raise CoordError("no coordinator launch is pending (levain coord status says why; "
+                                     "levain coord wake asks for one)")
+                launch_id = pending.launch_id
+            got = launch_session(store, launch_id)
+            _emit(out, args.json, {"launch_id": got.launch_id, "started": got.started, "attach": got.attach,
+                                   "refusal": got.refusal, "remedy": got.remedy,
+                                   "harness_session_id": got.harness_session_id},
+                  got.attach if got.started else _outcome_text(got))
+            return 0 if got.started else 1
         if cmd == "wake":
+            # a pending launch has a starter wherever it is written: the wake starts the one it wrote, as a drop does
             ln = store.coord_wake()
+            got = None
+            if ln is not None:
+                from levain.coordinator.launch import launch_session
+
+                got = launch_session(store, ln.launch_id)
             st = store.coord_status()
-            _emit(out, args.json, st, (f"asked for coordinator launch {ln.launch_id}" if ln is not None
-                                       else f"no launch asked for: {st['why']}"))
+            st["started"] = None if got is None else {"started": got.started, "attach": got.attach,
+                                                      "refusal": got.refusal, "remedy": got.remedy}
+            _emit(out, args.json, st, (f"asked for coordinator launch {ln.launch_id}\n{_outcome_text(got)}"
+                                       if ln is not None else f"no launch asked for: {st['why']}"))
+            return 0 if got is None or got.started else 1
+        if cmd == "watch":
+            from levain.coordinator.launch import watch, watch_once
+
+            if args.once:
+                lines = watch_once(store)
+                _emit(out, args.json, {"lines": lines}, "\n".join(lines) or "nothing to do")
+                return 0
+            if args.every < 1:
+                raise CoordError("--every is at least 1 second")
+            try:
+                watch(store, every=args.every, emit=lambda line: print(line, file=out, flush=True))
+            except KeyboardInterrupt:
+                return 0
             return 0
         st = store.coord_status()
     except _REFUSED as exc:
@@ -983,6 +1051,36 @@ def run_coord(args: argparse.Namespace, out: Any = None) -> int:
         lines.append(f"  {ln['launch_id']}  {ln['role']}  {ln['harness']}  {ln['state']} ({ln['cause']})  "
                      f"session {ln['session_key']}  asked {ln['at']}")
     _emit(out, args.json, st, "\n".join(lines))
+    return 0
+
+
+def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
+    """``levain coord agent``: for claude, the directory is made a Levain install for Claude Code first when it is not
+    one (``levain init``, non-interactive), and the setting is recorded only once its consent hook is live."""
+    if args.agent == "none":
+        if args.cwd is not None or args.model is not None:
+            raise CoordError("agent none takes no --model and no --cwd")
+        store.coord_set_agent("none")
+        _emit(out, args.json, {"agent": "none"}, "coordinator agent: none (drops queue for you; nothing launches)")
+        return 0
+    if args.agent != "claude":
+        raise CoordError(f"a {args.agent} coordinator cannot be launched yet (only claude is built); set claude or "
+                         "none")
+    from levain.coordinator.launch import default_coordinator_dir, setup_install, trust_remedy
+    from levain.coordinator.lease import check_model
+
+    check_model(args.model)          # before any install is made for it (the setting checks it again as it is written)
+    log = sys.stderr if args.json else out
+    target, live, detail = setup_install(args.cwd or default_coordinator_dir(),
+                                         emit=lambda line: print(line, file=log, flush=True))
+    if not live:
+        raise CoordError(f"not set: the consent hook is not live in {target}: {detail}")
+    got = store.coord_set_agent("claude", model=args.model, cwd=str(target))
+    remedy = trust_remedy(target)
+    _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "trust": remedy},
+          f"coordinator agent: claude{f' ({got.model})' if got.model else ''} in {got.cwd}\n"
+          "Claude Code starts a session only in a directory you trusted; run this once and accept the trust prompt:\n"
+          f"{remedy}")
     return 0
 
 
@@ -1113,7 +1211,28 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     cc.add_argument("--launch", required=True, metavar="LAUNCH_ID")
     cc.add_argument("--session", required=True, metavar="SESSION_KEY")
     cw = c_sub.add_parser("wake", help="Ask for a coordinator now, by the rules a drop runs (after a backoff).")
-    for p in (cs, ct, cr, cb, cc, cw):
+    ca = c_sub.add_parser(
+        "agent", help="Choose the coordinator a drop launches: claude (in its own Levain install), or none.",
+        description="claude: drops with no coordinator start a Claude Code session in DIR (default "
+                    "<levain home>/coordinator), which is made a Levain install for Claude Code first when it is not "
+                    "one. An existing live Levain install in DIR is used as is: the coordinator then shares that "
+                    "entity's memory and grants. none: drops only queue for you. Levain never edits Claude Code's "
+                    "trust list: run the printed line once and accept the prompt.")
+    ca.add_argument("agent", choices=("claude", "codex", "none"))
+    ca.add_argument("--cwd", type=Path, default=None, metavar="DIR",
+                    help="The directory the coordinator runs in (default: <levain home>/coordinator).")
+    ca.add_argument("--model", default=None, help="The model the session runs (default: Claude Code's own).")
+    cl = c_sub.add_parser("launch", help="Start a pending launch's session now (default: the pending coordinator's).")
+    cl.add_argument("launch_id", nargs="?", default=None, metavar="LAUNCH_ID")
+    cwa = c_sub.add_parser(
+        "watch", help="Keep the coordinator's sessions honest: start pending launches, end the gone, beat the live.",
+        description="Each pass starts every pending launch nobody started (a drop from the phone or the cockpit), "
+                    "ends a launch whose Claude Code session is no longer listed, beats the lease of the coordinator "
+                    "whose session is listed, not done and writing as coordinator, and stops a session whose launch "
+                    "is over. Only sessions Levain started.")
+    cwa.add_argument("--every", type=float, default=30.0, metavar="S", help="Seconds between passes (default 30).")
+    cwa.add_argument("--once", action="store_true", help="One pass, then exit.")
+    for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa):
         common(p)
         p.set_defaults(func=run_coord)
 

@@ -15,6 +15,19 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   next drop would do, `levain coord take` holds it yourself, and `levain coord release` ends it. A session that lost
   the role (it went quiet past its time, or you took over) has its thread changes refused. Splitting or re-titling by
   hand now records you: `--by operator` is the default for `levain drops split` and `levain thread set`.
+- **`levain coord agent`: choose the coordinator your drops start.** `levain coord agent claude` makes
+  `~/.levain/coordinator` (or `--cwd DIR`) a Levain install for Claude Code when it is not one, records the choice, and
+  prints the one line that trusts that directory in Claude Code, which you run once. `levain coord agent none` (and
+  no choice at all) means drops only queue for you.
+- **`levain coord launch`: start the coordinator a drop asked for.** It starts a Claude Code session in the background
+  in the coordinator's directory, only when that install's consent hook is wired, and prints the `claude attach` line,
+  or why it did not start. `levain drop` and `levain coord wake` now do this themselves when they are the ones that
+  asked.
+- **`levain coord watch`: keep the coordinator's sessions honest.** Leave it running (`--every S`, or `--once` for one
+  pass): it starts any coordinator a drop from the phone or the cockpit asked for, ends a launch whose session is
+  gone, keeps the role with a coordinator that is still working and wrote in the last hour, and stops a session whose
+  launch is over (you took over, it lost the role, or it failed to start), and deletes that launch's brief, which
+  quotes your drops. It touches only the sessions Levain started, in the directory it started them in.
 - **Verifiers are signed, one per check, and Levain runs the checker itself.** Each verifier you sign names the checker
   Levain ships (`output_compare` is the first: it runs the template's steps and compares what each one printed to what you
   pinned) and the exact steps and inputs it checks. A report only counts if it comes from that checker, on those steps and
@@ -28,8 +41,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   - A control store holding the new `verifier` item cannot be read by Levain 0.11.x, so do not downgrade after signing one.
 
 ### Known edges
-- Nothing answers a drop's request for a coordinator yet: each request waits 5 minutes, and after three unanswered
-  ones Levain stops asking until you run `levain coord take` or `levain coord release`.
+- A coordinator launch that fails (an untrusted directory, a session that never appears) counts against the
+  coordinator: after three in a row Levain stops starting them until you run `levain coord take` or
+  `levain coord release`.
+- A drop from the phone or the cockpit asks for a coordinator without starting it: with no `levain coord watch`
+  running, run `levain coord launch` within 5 minutes, or the request lapses (a lapse nobody tried to start does not
+  count as one of those three).
+- A coordinator that finished its turn still holds the role until its lease runs out: drops sent meanwhile wait up to
+  an hour for the next coordinator. A new drop is not handed into a session that is already running.
 
 ## [0.11.13] — 2026-10-20
 

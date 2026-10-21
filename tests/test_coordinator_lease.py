@@ -44,11 +44,22 @@ def qdir(tmp_path):
 
 @pytest.fixture
 def store(qdir, clock):
-    return CoordStore(qdir, clock=clock)
+    # a wake launches only the coordinator you set (C3b): every test here sets one first, as you would
+    s = CoordStore(qdir, clock=clock)
+    s.coord_set_agent("claude", cwd=str(qdir.parent))
+    return s
 
 
 def drop(store, words="fix the build"):
     return store.accept_drop(words, surface="cli")[0]
+
+
+def claimed(store):
+    """The pending coordinator launch's spawn claimed by a starter that then died (C3b fix 2 G6: a launch nobody tried
+    to start is no death when it expires)."""
+    ln = store.pending_coordinator()
+    assert store.launch_claim_spawn(ln.launch_id, 1)[1] is None
+    return ln
 
 
 def boot(store):
@@ -81,7 +92,8 @@ print(json.dumps(d.drop_id))
 
 def test_two_processes_dropping_at_once_ask_for_one_coordinator(qdir, tmp_path):
     # run phase 1: two real processes, one instant, no lease -> one pending launch and one bootstrap claim
-    CoordStore(qdir).coord_status()          # the store exists already, as on any install past its first use
+    # the store exists already, as on any install past its first use, with a coordinator set (C3b)
+    CoordStore(qdir).coord_set_agent("claude", cwd=str(tmp_path))
     script = tmp_path / "racer.py"
     script.write_text(_RACER)
     tree = str(Path(lease.__file__).resolve().parents[2])
@@ -142,7 +154,7 @@ def test_a_holder_past_its_until_is_refused_and_the_lapse_is_written(store, cloc
     clock.advance(minutes=31)
     with pytest.raises(CoordError, match="past its until"):
         store.split(d.drop_id, [Part("work", "x")], by="coordinator", token=token)
-    assert store.coord_status()["lease"] is None
+    assert store.coord_status()["lease"] is None          # the partial write rolled back with the wake
     assert rows(qdir, "SELECT kind, token FROM lease_events ORDER BY seq DESC LIMIT 1") == [("lapse", token)]
     drop(store, "the coordinator is still running: no second one beside it")
     st = store.coord_status()
@@ -215,7 +227,8 @@ def test_three_coordinator_deaths_stop_the_wakes_until_you_look(store, clock):
             clock.advance(seconds=wait.total_seconds())
         drop(store, f"drop {n}")
         assert store.coord_status()["wake"] == "launching"
-        clock.advance(seconds=lease.LAUNCH_TTL.total_seconds())   # nobody spawned it: it expires
+        claimed(store)
+        clock.advance(seconds=lease.LAUNCH_TTL.total_seconds())   # its starter died: it expires
     drop(store, "after three deaths")
     st = store.coord_status()
     assert st["wake"] == "stopped" and "until you look" in st["why"]
@@ -304,7 +317,9 @@ def test_levain_coord_cli(qdir, capsys):
 
     assert "nobody holds" in run("coord", "status").out
     did = json.loads(run("drop", "hello", "--json").out)["drop_id"]
-    assert "launching" in run("coord", "status").out
+    # no coordinator agent set (C3b): the drop only queued, nothing was asked for (test_coordinator_launch drives a
+    # drop that launches)
+    assert "next drop: unset" in run("coord", "status").out
     assert "carries the lease token" in run("drops", "split", did, "--thread", "work:x", "--by", "coordinator",
                                             rc=1).err
     tok = json.loads(run("coord", "take", "--for", "1h", "--json").out)["token"]
@@ -344,7 +359,8 @@ def test_a_holder_whose_launch_ended_does_not_hold_up_the_wakes(store, clock, qd
 
 def test_a_wake_that_fails_never_loses_the_drop(store, clock, monkeypatch):
     def broken(conn, now):
-        conn.execute("INSERT INTO lease_events (seq) VALUES (NULL)")      # a NOT NULL violation mid-wake
+        lease._event(conn, now, "claim", "s-" + "0" * 16, token=None, until=now, cause="half", by="service")
+        raise RuntimeError("a wake bug that is not a store error")       # after a partial write
     monkeypatch.setattr(lease, "wake", broken)
     d = drop(store, "keep these words")
     assert store.drop(d.drop_id).words == "keep these words"
@@ -367,6 +383,7 @@ def test_a_coordinator_running_without_the_lease_is_waited_for_only_so_long(stor
 
 def test_your_take_and_release_reset_the_deaths(store, clock):
     drop(store)
+    claimed(store)
     clock.advance(seconds=lease.LAUNCH_TTL.total_seconds())
     drop(store, "one death: backoff")
     assert store.coord_status()["wake"] == "backoff"
@@ -378,6 +395,7 @@ def test_your_take_and_release_reset_the_deaths(store, clock):
 
 def test_the_backoff_runs_from_the_death_not_from_when_it_was_noticed(store, clock):
     drop(store)
+    claimed(store)
     clock.advance(seconds=(lease.LAUNCH_TTL + lease.BACKOFF[0] + timedelta(seconds=1)).total_seconds())
     drop(store, "the expiry is noticed only now, past its backoff already")
     assert store.coord_status()["wake"] == "launching"
@@ -417,6 +435,7 @@ def test_deaths_count_in_the_order_launches_ended(store, clock, qdir):
     assert store.launch(ln.launch_id).cause == "lost the lease"
     st = store.coord_status()
     assert st["wake"] == "launching"
+    claimed(store)
     clock.advance(seconds=lease.LAUNCH_TTL.total_seconds())
     drop(store, "B expired: two deaths in a row")
     assert store.coord_status()["wake"] == "backoff" and "2 coordinator" in store.coord_status()["why"]
