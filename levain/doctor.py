@@ -144,6 +144,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_consent_hooks(install))
     core.extend(_check_consent_limits())
     core.extend(_check_dispatch_adoption_rules())
+    core.extend(_check_dispatch_verifiers())
     for r in core:
         _emit(r)
 
@@ -349,6 +350,67 @@ def _check_dispatch_adoption_rules() -> list[CheckResult]:
         return [CheckResult(name, True, f"could not be read ({type(exc).__name__}: {str(exc)[:300]})",
                             "`levain dispatch config show` says what the control store holds.", warn=True)]
     return [CheckResult(name, True, f"{len(rules)} active rule(s), each with typed criteria")]
+
+
+def _check_dispatch_verifiers() -> list[CheckResult]:
+    """The active dispatch verifier item (CONTRACT §3.5): every entry's ``driver_template_digest`` against the
+    template the installed levain ships, so an upgrade that changed a template is red BEFORE a run refuses it
+    (re-sign the item). No row without a dispatch control store; a WARN when the store holds only Levain 0.11's
+    ``verifiers`` item, which is no longer read."""
+    from levain.dispatch import control as dctl
+    from levain.dispatch.registry import (
+        RESIGN_VERIFIERS, active_verifier_entries, driver_template_digest, legacy_verifiers_problem,
+    )
+    from levain.install import _consent_queue_dir
+
+    name = "dispatch verifiers"
+    qdir = _consent_queue_dir()
+    if not (qdir / dctl.DB_NAME).is_file():
+        return []
+    try:
+        from levain.dispatch.cli import _authority_source
+
+        active = dctl.ControlStore(qdir, authority=_authority_source(qdir, None)).active()
+        gen, entries = active_verifier_entries(active)
+        legacy = legacy_verifiers_problem(active)
+        stale, unreadable = [], []
+        for e in entries:
+            try:
+                shipped = driver_template_digest(e["driver_template"])
+            except OSError as exc:
+                # an installed template that cannot be read: its row is red and names it, the doctor goes on
+                unreadable.append(f"{e['verifier_id']} (driver {e['driver_template']}: the installed template "
+                                  f"cannot be read, {type(exc).__name__})")
+                continue
+            if shipped != e["driver_template_digest"]:
+                stale.append(f"{e['verifier_id']} (driver {e['driver_template']}: "
+                             + ("not shipped by this levain)" if shipped is None
+                                else "the installed template differs)"))
+    except dctl.ControlStateUnavailable as exc:
+        return [CheckResult(name, True, f"could not be read ({str(exc)[:300]})",
+                            "`levain dispatch config show` says what the control store holds.", warn=True)]
+    except Exception as exc:  # noqa: BLE001 - a row that cannot be built is said, never a crash
+        return [CheckResult(name, True, f"could not be read ({type(exc).__name__}: {str(exc)[:300]})",
+                            "`levain dispatch config show` says what the control store holds.", warn=True)]
+    if not gen:
+        if legacy is not None:
+            return [CheckResult(name, True, f"{legacy[:600]} (no verifier runs until one is signed)", None,
+                                warn=True)]
+        return [CheckResult(name, True, "no verifier item is accepted")]
+    if unreadable:
+        return [CheckResult(name, False, f"generation {gen}: {', '.join(unreadable + stale)[:600]}; every run of "
+                            "these verifiers is refused", "Reinstall levain so its driver templates are readable; "
+                            f"if a template changed, {RESIGN_VERIFIERS}.")]
+    if stale:
+        return [CheckResult(name, False, f"generation {gen}: {', '.join(stale)[:600]}; every run of these verifiers "
+                            "is refused", f"The installed levain changed a driver template; {RESIGN_VERIFIERS}.")]
+    in_process = [e["verifier_id"] for e in entries if e["declared_kind"] == "in-process"]
+    detail = f"generation {gen}: {len(entries)} verifier(s), every driver template matches the installed levain"
+    if in_process:
+        detail += f"; in-process, forgeable by the code under test: {', '.join(in_process)[:300]}"
+    if legacy is not None:
+        detail += "; the 0.11 verifiers item is no longer read"
+    return [CheckResult(name, True, detail)]
 
 
 def _check_seed_content(install: Path) -> list[CheckResult]:

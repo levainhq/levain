@@ -69,6 +69,7 @@ from levain.consent.auto_away import DEFAULT_HOLDS, IDLE_THRESHOLD, WORDS, away_
 from levain.consent.queue import (
     DB_NAME, AwayMark, ConsentQueue, Decision, authority_source, default_queue_dir, gap_label,
 )
+from levain.consent.broker_client import in_slot
 from levain.consent.record import ExternalGateRequest
 
 AGENT = "claude_code"
@@ -975,19 +976,19 @@ def _settings_files(cwd: str | None, home: Path | None, codex_home: Path | None)
     return [(k, p) for k, p in out if not (p in seen or seen.add(p))]
 
 
-def _key_anywhere(value: Any) -> bool:
-    """:data:`UNCONFINED_ENV` inside any key or string value, at any depth."""
+def _key_anywhere(value: Any, name: str = UNCONFINED_ENV) -> bool:
+    """``name`` (default :data:`UNCONFINED_ENV`) inside any key or string value, at any depth."""
     if isinstance(value, str):
-        return UNCONFINED_ENV in value
+        return name in value
     if isinstance(value, Mapping):
-        return any(_key_anywhere(k) or _key_anywhere(v) for k, v in value.items())
+        return any(_key_anywhere(k, name) or _key_anywhere(v, name) for k, v in value.items())
     if isinstance(value, list):
-        return any(_key_anywhere(v) for v in value)
+        return any(_key_anywhere(v, name) for v in value)
     return False
 
 
-def _sets_unconfined(kind: str, path: Path) -> bool:
-    """True when the settings file mentions :data:`UNCONFINED_ENV` anywhere (L3 r1 G3: in its raw text, or, once
+def _sets_unconfined(kind: str, path: Path, name: str = UNCONFINED_ENV) -> bool:
+    """True when the settings file mentions ``name`` (default :data:`UNCONFINED_ENV`) anywhere (L3 r1 G3: in its raw text, or, once
     parsed, in any key or string value at any depth, which also catches an escaped spelling; JSON or TOML alike,
     an ``env`` block or not) or that cannot be ruled out: an unreadable file, one that does not parse, a JSON file
     that is not an object, a Claude Code ``env`` that is not an object. A missing file sets nothing."""
@@ -997,18 +998,18 @@ def _sets_unconfined(kind: str, path: Path) -> bool:
         return False
     except Exception:  # noqa: BLE001 - unreadable: it cannot be ruled out
         return True
-    if UNCONFINED_ENV.encode() in raw:
+    if name.encode() in raw:
         return True
     try:
         if kind == "toml":
             import tomllib
 
-            return _key_anywhere(tomllib.loads(raw.decode("utf-8")))
+            return _key_anywhere(tomllib.loads(raw.decode("utf-8")), name)
         data = json.loads(raw)
         if not isinstance(data, Mapping):
             return True
         env = data.get("env")
-        return (env is not None and not isinstance(env, Mapping)) or _key_anywhere(data)
+        return (env is not None and not isinstance(env, Mapping)) or _key_anywhere(data, name)
     except Exception:  # noqa: BLE001 - a file that does not parse cannot be ruled out
         return True
 
@@ -1028,6 +1029,18 @@ def unconfined_state(cwd: str | None, *, home: Path | None = None, codex_home: P
 def unconfined(cwd: str | None, *, home: Path | None = None, codex_home: Path | None = None) -> bool:
     """Whether the operator started this session unconfined (:func:`unconfined_state` is ``"on"``)."""
     return unconfined_state(cwd, home=home, codex_home=codex_home) == "on"
+
+
+def queue_socket_planted(cwd: str | None, *, home: Path | None = None, codex_home: Path | None = None) -> bool:
+    """True when a settings file this session can load (:func:`_settings_files`) mentions the slot's broker socket
+    variable (:data:`levain.consent.broker_client.SOCKET_ENV`), or that cannot be ruled out (:func:`_sets_unconfined`'s
+    rules). A slot's launcher sets it in the agent's environment, never in a settings file, and a hook cannot tell a
+    variable a settings file's ``env`` put there from the launcher's: a cloned repository's ``.claude/settings.json``
+    could otherwise point the gate at a socket of its own that answers ``allow``. The slot gate denies a gated call
+    then (:func:`slot_gate`)."""
+    from levain.consent.broker_client import SOCKET_ENV
+
+    return any(_sets_unconfined(kind, path, SOCKET_ENV) for kind, path in _settings_files(cwd, home, codex_home))
 
 
 def floor_text(what: str, state: str | None) -> str:
@@ -1204,7 +1217,12 @@ def gate_output(decision: Decision) -> dict[str, Any]:
         how = f"your standing consent grant {decision.grant_id}"
     else:
         how = f"a signed levain answer (key {decision.signer_fp})"
-    if decision.decision == "allow":
+    return decision_output(decision.decision, how)
+
+
+def decision_output(decision: str, how: str) -> dict[str, Any]:
+    """:func:`gate_output`'s words for ``decision`` (``allow`` or ``deny``) by the authority ``how`` names."""
+    if decision == "allow":
         return _pre("allow", f"levain: allowed by {how}.")
     return _pre("deny", f"levain: denied by {how}. Do not retry it and do not achieve it another way.")
 
@@ -1536,8 +1554,108 @@ def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[
     if session is not None:
         _ledger_note(queue_dir, event, session, str(event.get("tool_name")), event.get("tool_input") or {},
                      str(event.get("cwd") or ""), refused="failed")
+    return could_not_run(tier, what)
+
+
+def could_not_run(tier: str | None, what: str) -> dict[str, Any]:
+    """:func:`gate_failed`'s deny (the hard stop for the irreversible tier); the slot gate's too (:func:`slot_gate`)."""
     return _pre("deny", f"levain: the gate could not run, so the action was NOT taken: {what}. Do not retry it "
                 "and do not achieve it another way.", **_stop(tier, what, "the gate could not run."))
+
+
+# --- the slot gate (F10 S2a) ---------------------------------------------------------------------------------
+#
+# A slot session (its environment names a broker socket, :func:`levain.consent.broker_client.in_slot`) has no local
+# queue: the slot's floor keeps it out of Levain's files, and the operator side owns rulings, re-pings, away and
+# limits. Its PreToolUse goes to :func:`slot_gate`, its PermissionRequest gets no decision (Claude Code's dialog,
+# or the session's mode, answers it). :func:`main` opens no ConsentQueue, reads no settings file and writes no ledger
+# row in a slot. The hold is :data:`DEFAULT_GATE_HOLD` (the settings file that could change it is the operator's,
+# outside the slot); the broker is polled every :data:`GATE_POLL`, then every broker_client.SLOW_POLL.
+#
+# KNOWN EDGE until F10 S2b (L3 r1 C): a slot session's consent limits are NOT enforced. Q13's limits are read from
+# the local queue, which a slot does not have, and an ungated call never reaches the broker, so nothing counts it;
+# the broker has no limit verb yet. S2b adds one, asked on every PreToolUse. Any public word about slots says so.
+
+# who decided, in the gate's words, when the broker verified the answer (the hook never sees the signer's key)
+SLOT_HOW = "a signed levain answer the queue broker verified"
+
+
+def slot_gate(event: Any, *, home: Path | None = None, client: Any = None, hold: float = DEFAULT_GATE_HOLD,
+              expected_uid: int | None = None, sleep: Callable[[float], None] = time.sleep,
+              monotonic: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
+    """The slot's gate output for one ``PreToolUse`` event, or ``None`` (the call goes on as the mode says). A
+    malformed event is :func:`_malformed`'s; a call :func:`gate_class` does not gate (protected paths: none) gets
+    ``None``; a gated call is filed with the broker (``client``, default
+    :meth:`~levain.consent.broker_client.BrokerClient.from_env`) and held up to ``hold`` for a decision the broker
+    verified, delivered as :func:`decision_output` names it; at the end of the hold it is denied with
+    :func:`undecided_output`, its gap named by the request id (the operator side numbers gaps; the hook does not).
+    Anything else once the call is gated (a settings file that names the socket variable,
+    :func:`queue_socket_planted`; no socket or cap; no broker account, or a socket whose peer is not it; the
+    broker unreachable, refusing or answering out of shape) is :func:`could_not_run`'s deny with the hard stop.
+    ``expected_uid`` is the broker's uid for a caller that is not the hook (a test, a run); the hook passes none,
+    and the client looks the broker account up (:func:`levain.consent.broker_client.broker_uid`)."""
+    from levain.consent import broker_client
+
+    if not isinstance(event, Mapping) or event.get("hook_event_name") != GATE_EVENT:
+        return None
+    tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input", {}), event.get("cwd")
+    session = _session_of(event)
+    if not isinstance(tool_name, str) or not tool_name or not isinstance(cwd, str) or not os.path.isabs(cwd) \
+            or session is None:
+        return _malformed(event, None, AdapterSettings(), home=home)
+    if tool_input is None:
+        tool_input = {}
+    try:
+        tier = gate_class(tool_name, tool_input, cwd, home=home)
+        if tier is None:
+            return None
+        what = _what(tool_name, tool_input)
+    except Exception:  # noqa: BLE001 - a call that cannot be classified is denied as the irreversible tier
+        return could_not_run("irreversible", "this call")
+    try:
+        if queue_socket_planted(cwd, home=home):
+            return could_not_run(tier, what)
+        client = client if client is not None else broker_client.BrokerClient.from_env(expected_uid=expected_uid)
+        tool_use_id = event.get("tool_use_id")
+        request = broker_client.gate_request(
+            agent=AGENT, session=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
+            event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None,
+            tier=AGENT_CONFIG_TIER, hold=hold)
+        decision = broker_client.file_and_hold(client, request, hold, poll=GATE_POLL, sleep=sleep,
+                                               monotonic=monotonic)
+    except Exception:  # noqa: BLE001 - fail closed: the broker down, refusing or malformed is a deny
+        return could_not_run(tier, what)
+    if decision is None:
+        return undecided_output(tier, what, request.id)
+    return decision_output(decision, SLOT_HOW)
+
+
+def _slot_main(stdin: IO[str], stdout: IO[str], *, expected_uid: int | None = None) -> int:
+    """:func:`main` in a slot session: no ConsentQueue, no settings file, no ledger. Always exits 0. A stdin that
+    is not a JSON object (truncated, garbled, an array) is :func:`could_not_run`'s deny: the event cannot be told
+    from a PreToolUse, and a PermissionRequest ignores a PreToolUse's deny. ``expected_uid``: :func:`slot_gate`'s."""
+    event: Any = None
+    try:
+        event = json.loads(stdin.read())
+        if not isinstance(event, Mapping):
+            raise ValueError("the hook event is not a JSON object")
+        out = slot_gate(event, expected_uid=expected_uid) if event.get("hook_event_name") == GATE_EVENT \
+            else None   # a PermissionRequest in a slot: no decision
+        if out is not None:
+            stdout.write(json.dumps(out) + "\n")
+            stdout.flush()
+    except BaseException as exc:  # noqa: BLE001 - every failure is no decision, never allow; a gated one a deny
+        if not isinstance(event, Mapping) or event.get("hook_event_name") == GATE_EVENT:
+            try:
+                stdout.write(json.dumps(could_not_run("irreversible", "this call")) + "\n")
+                stdout.flush()
+            except BaseException:
+                pass
+        try:
+            print(f"levain consent hook: no decision ({type(exc).__name__}: {exc})"[:500], file=sys.stderr)
+        except Exception:
+            pass
+    return 0
 
 
 def _queue_for(queue_dir: Path, settings: AdapterSettings) -> ConsentQueue:
@@ -1554,13 +1672,16 @@ def _queue_for(queue_dir: Path, settings: AdapterSettings) -> ConsentQueue:
 def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO[str] | None = None) -> int:
     """The hook entry point, for both events the one script is wired to: ``PermissionRequest`` (:func:`decide`)
     and ``PreToolUse`` (:func:`gate`). Always exits 0. A PermissionRequest prints a decision only when the core
-    verified one; a PreToolUse whose gate raised prints :func:`gate_failed` (a deny for a gated call)."""
+    verified one; a PreToolUse whose gate raised prints :func:`gate_failed` (a deny for a gated call). In a slot
+    session (:func:`levain.consent.broker_client.in_slot`) it is :func:`_slot_main` instead, and opens no queue."""
     stdin = stdin if stdin is not None else sys.stdin
     stdout = stdout if stdout is not None else sys.stdout
     event: Any = None
     queue_dir: Path | None = None
     settings = AdapterSettings()
     started = time.monotonic()
+    if in_slot():
+        return _slot_main(stdin, stdout)
     try:
         parser = argparse.ArgumentParser(prog="levain-consent-claude-code")
         parser.add_argument("--queue-dir", default=None)
