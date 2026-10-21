@@ -256,7 +256,7 @@ def remove_tree_at(parent: int, name: str) -> None:
 
 
 def _fresh_repo(ctx: H.Ctx, a: R.Alloc, sfd: int) -> None:
-    """``<S>/repo`` empty, slot-owned, 0700: whatever a failed or interrupted clone left there is removed first, by
+    """``<S>/repo`` empty, slot-owned, 0700 (dispatch: 0711): whatever a failed or interrupted clone left there is removed first, by
     dirfd and never following a link (:func:`remove_tree_at`; ``<S>`` is root's: the slot can fill ``repo`` but
     never replace it)."""
     try:
@@ -265,7 +265,9 @@ def _fresh_repo(ctx: H.Ctx, a: R.Alloc, sfd: int) -> None:
         pass
     else:
         remove_tree_at(sfd, "repo")
-    ctx.store.mkdir(sfd, "repo", a.slot_uid, a.slot_gid, 0o700, f"live/{a.session}/repo")
+    # §26 S1-c: a dispatch session's repo is 0711, so the broker (search on <S> by its ACL) can walk into it.
+    mode = 0o711 if a.kind == "dispatch" else 0o700
+    ctx.store.mkdir(sfd, "repo", a.slot_uid, a.slot_gid, mode, f"live/{a.session}/repo")
     ctx.seams.fsync(sfd)
 
 
