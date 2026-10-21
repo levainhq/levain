@@ -511,3 +511,19 @@ def test_a_directory_with_no_root_refuses():
     with pytest.raises(Refused) as ei:
         IH.read_directory("linux", run=run)
     assert ei.value.name == "host-read-failed"
+
+
+def test_live_lease_refusal_names_the_sessions(tmp_path):
+    """VM-Y Y7a (levain-memory 1019-s1design/runs/s3-macos-d1d2/raw/Y7_undo_orphan.txt): undo met a lease whose
+    holder had died and refused live-lease naming no session. The refusal now names what it counted."""
+    d = tmp_path / "sessions"
+    d.mkdir()
+    (d / f"{S1}.json").write_bytes(_session_record(True))
+    (d / "s-2222222222222222.json").write_text("garbage")
+    assert IH.live_lease_sessions(d) == (S1, "s-2222222222222222")
+    assert IH.count_live_leases(d) == 2
+    facts = IH.HostFacts(host="linux", caller_uid=501, live_leases=2, live_sessions=IH.live_lease_sessions(d))
+    with pytest.raises(IH.Refused) as e:
+        IH.preflight(IH.parse_install_argv(["undo"]), facts)
+    assert e.value.name == "live-lease"
+    assert S1 in str(e.value) and "s-2222222222222222" in str(e.value)

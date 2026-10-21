@@ -73,6 +73,7 @@ class HostFacts:
     operator_uid: int | None = None                   # setup: the uid ``--operator`` resolves to
     operator_record: Mapping[str, object] | None = None   # parsed ``L/policy/operator``, or None
     live_leases: int = 0
+    live_sessions: tuple[str, ...] = ()                # what ``live_leases`` counts (the refusal names them)
     used_ids: frozenset[int] = frozenset()            # every uid and gid in use on the host
     existing_names: frozenset[str] = frozenset()      # every user and group name on the host
     retired: frozenset[int] = frozenset()             # the retired-ids file
@@ -139,7 +140,7 @@ def parse_operator_record(data: bytes) -> dict[str, object]:
 def preflight(cmd: InstallCommand, facts: HostFacts) -> None:
     """Live lease first, then the one-operator rule (CONTRACT header, §5.2)."""
     if cmd.verb not in LEASE_EXEMPT and facts.live_leases > 0:
-        raise Refused("live-lease", f"{cmd.verb} refuses while {facts.live_leases} lease(s) are live")
+        raise Refused("live-lease", _live_lease_why(cmd.verb, facts))
     rec = facts.operator_record
     if cmd.verb == "setup":
         if facts.operator_uid is None:
@@ -283,9 +284,13 @@ class Quiesce:
                 os.close(lock)             # closing the only descriptor drops the flock it took
         return busy
 
+    def live(self) -> tuple[str, ...]:
+        """What the live-lease count counts: the live sessions, plus ``slot <name>`` per :meth:`busy_slots` when held."""
+        busy = tuple(f"slot {b}" for b in self.busy_slots()) if self.held else ()
+        return live_lease_sessions(self.store / "sessions") + busy
+
     def live_leases(self) -> int:
-        """The live-lease count: the session records, plus :meth:`busy_slots` when held."""
-        return count_live_leases(self.store / "sessions") + (len(self.busy_slots()) if self.held else 0)
+        return len(self.live())
 
     def release(self) -> None:
         if _QUIESCING.get(_store_key(self.store)) is self:
@@ -637,7 +642,7 @@ def _abandoned_setup(facts: HostFacts) -> Intent | None:
     if facts.operator_record is not None or j is None or j.verb != "setup":
         return None
     if facts.live_leases > 0:
-        raise Refused("live-lease", f"undo refuses while {facts.live_leases} lease(s) are live")
+        raise Refused("live-lease", _live_lease_why("undo", facts))
     if facts.caller_uid == 0 or facts.caller_name != j.operator:
         raise Refused("operator-mismatch", f"the interrupted setup was for {j.operator!r}")
     return j
@@ -889,24 +894,35 @@ def read_directory(host: HostOS, *, run: Callable[..., object] = subprocess.run)
     return Directory(users, groups, ulab, glab)
 
 
-def count_live_leases(sessions: Path) -> int:
-    """Root's read of §3.1: the state records CONTROL marks ``lease_live``. DECISION: a record that does not parse
-    counts as live, so an install verb refuses rather than act beside a session it cannot read."""
+def live_lease_sessions(sessions: Path) -> tuple[str, ...]:
+    """Root's read of §3.1: the sessions whose state record CONTROL marks ``lease_live``. DECISION: a record that
+    does not parse counts as live, so an install verb refuses rather than act beside a session it cannot read."""
     try:
         names = os.listdir(sessions)
     except FileNotFoundError:
-        return 0
-    live = 0
+        return ()
+    live = []
     for name in sorted(names):
         if not name.endswith(".json") or not SESSION_RE.fullmatch(name[:-len(".json")]):
             continue
         try:
             raw = R.read_record(Path(sessions) / name)
             if raw is not None and R.parse_state(raw).lease_live:
-                live += 1
+                live.append(name[:-len(".json")])
         except (Refused, OSError):
-            live += 1
-    return live
+            live.append(name[:-len(".json")])
+    return tuple(live)
+
+
+def count_live_leases(sessions: Path) -> int:
+    return len(live_lease_sessions(sessions))
+
+
+def _live_lease_why(verb: str, facts: HostFacts) -> str:
+    """The refusal names the sessions (VM-Y Y7a: an operator met ``live-lease`` with no session named; a lease
+    stays live until that session's END, even when its holder has died)."""
+    names = f": {', '.join(facts.live_sessions)}" if facts.live_sessions else ""
+    return f"{verb} refuses while {facts.live_leases} lease(s) are live{names}; end each session first"
 
 
 def slots_in_service(store: RH.Store) -> dict[str, tuple[int, ...]]:
@@ -1022,10 +1038,11 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
     if journal is not None:
         host_ids.update((n, d.users[n]) for n in journal.accounts if n in d.users)
         host_ids.update((g, d.groups[g]) for g in journal.groups if g in d.groups)
+    leased = q.live() if q is not None else live_lease_sessions(L / "sessions")
     facts = HostFacts(
         host=host, caller_uid=caller_uid, caller_name=user_name(caller_uid),
         operator_uid=d.users.get(cmd.operator) if cmd.operator else None, operator_record=orec,
-        live_leases=q.live_leases() if q is not None else count_live_leases(L / "sessions"),
+        live_leases=len(leased), live_sessions=leased,
         used_ids=frozenset(d.users.values()) | frozenset(d.groups.values()),
         existing_names=frozenset(d.users) | frozenset(d.groups), retired=read_retired_ids(retired_path),
         levain_tombstones=tombs, levain_live=live, intent=journal, host_ids=host_ids)
@@ -1147,7 +1164,7 @@ INSTALL_ENTRY_ENV = ("SUDO_UID",)
 
 
 __all__ = ["BUILT_VERBS", "INSTALL_ENTRY_ENV", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
-           "apply_steps", "check_account_ids", "check_tools", "count_live_leases", "extra_tools", "gather_facts",
+           "apply_steps", "check_account_ids", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",
            "plan_for", "plan_replenish", "plan_setup", "plan_tools", "plan_undo", "pool_lock", "preflight", "Quiesce",
            "quiesce_step",
