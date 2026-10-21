@@ -1,0 +1,559 @@
+"""The gateway front's EGRESS PROXY (S1 session 3a; CONTRACT §4.1 `egress` + `subscription_passthrough`, §4.4, §4.7;
+plan §2c 8, §2d 9, §2f 5). One front process per egress-slot session, run as that slot's `_levain_gw<n>`, holding no
+credential. This module is the CONNECT half: the brokered data plane (3b) and the keys / control wires (3b, 3c) are
+not here.
+
+What it enforces, in order, before any upstream byte:
+1. the peer (unix shape): the connecting uid must be the slot's (the slot's forwarder, inside its netns). The TCP
+   shape (macOS, `127.0.0.1:<gwport_n>`) has no peer check: pf and the slot profile decide who reaches the port.
+2. the head: at most HEAD_CAP bytes, CRLF only, no obs-fold, no control or non-ASCII bytes; then h11 parses it
+   (a maintained parser, CONTRACT §4.4). Both Content-Length and Transfer-Encoding, a duplicate Host, an
+   absolute-form or asterisk-form target, and a CONNECT carrying a body are refused as `malformed`.
+3. the target: `CONNECT <host>:443` only. The host must be a name on the session's CONNECT set (the `egress` and
+   `subscription_passthrough` routes of the front's policy file); an address literal, any other port, or an
+   off-list name is `host-not-allowed`.
+4. the address: the name is resolved ONCE; if any answer is loopback, private (RFC1918, CGNAT, ULA), link-local
+   (incl. the 169.254.169.254 metadata address), IPv4-mapped / IPv4-compatible / 6to4 / Teredo, multicast,
+   reserved, documentation-range or otherwise not globally reachable, the whole CONNECT is `address-refused`.
+   The upstream socket is then opened to one of THOSE validated addresses, never by name, so a resolver that
+   answers differently a second time (DNS rebinding) never chooses where the bytes go.
+Only then does the front answer 200 and relay bytes both ways without reading them (end-to-end TLS). Each tunnel
+is logged at its close as host, address, route, whether the route is `subscription_passthrough`, and byte counts:
+never a request line, a header or a payload byte.
+
+Why the address check lives here and not in the vendor sandbox: srt skips its resolved-address check on a
+parentProxy hop (plan §2b R-C(3)), so this proxy is the only place it can hold.
+"""
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+import json
+import os
+import re
+import signal
+import socket
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Awaitable, Callable, Mapping, Optional, Sequence
+
+import h11
+
+from levain.broker.stub import GWPORT_BASE, SLOTS, clear_stale_socket, peer_uid
+
+POLICY_FORMAT = "levain-front-session/1"
+CONNECT_PORT = 443
+#: V10's head cap (CONTRACT §11).
+HEAD_CAP = 64 * 1024
+#: DECISION: a client that has not finished its request head by then is closed (it holds only its own slot's front).
+HEAD_TIMEOUT_S = 10.0
+RESOLVE_TIMEOUT_S = 10.0
+CONNECT_TIMEOUT_S = 10.0
+#: DECISION: more answers than this from one resolution is refused rather than validated in part.
+MAX_ADDRESSES = 16
+#: DECISION: connections past this are closed at accept (a slot cannot pin unbounded tasks on its front).
+MAX_CONNS = 256
+#: DECISION: once one direction of a tunnel has ended cleanly, the other has this long to end before both close.
+HALF_CLOSE_S = 30.0
+_CHUNK = 65536
+#: after a refusal the front reads (and drops) at most this much, for at most DRAIN_S, so the close is not an RST
+#: that destroys the status line the client has not read yet.
+_DRAIN_CAP = 1024 * 1024
+_DRAIN_S = 1.0
+
+ROUTE_TYPES = ("egress", "subscription_passthrough", "brokered")
+CONNECT_TYPES = ("egress", "subscription_passthrough")
+_ROUTE_ID = re.compile(r"^[a-z0-9-]{1,48}\Z")
+_LABEL = r"(?!-)[a-z0-9-]{1,63}(?<!-)"
+#: lowercase IDNA A-label host names with at least two labels; the last label is not all digits (no address literals).
+_HOSTNAME = re.compile(rf"^(?=.{{1,253}}\Z){_LABEL}(?:\.{_LABEL})+\Z")
+_POLICY_KEYS = frozenset({"route", "type", "hosts", "upstream", "requests", "responses",
+                          "max_call_microdollars", "max_session_microdollars"})
+
+#: refusal name -> HTTP status (CONTRACT §4.7's table, the names this half can produce).
+STATUS = {"host-not-allowed": 403, "address-refused": 403, "malformed": 400, "template-miss": 404,
+          "upstream-error": 502, "upstream-timeout": 504, "keys-unavailable": 503}
+_REASON = {400: b"Bad Request", 403: b"Forbidden", 404: b"Not Found", 502: b"Bad Gateway",
+           503: b"Service Unavailable", 504: b"Gateway Timeout"}
+
+
+class PolicyError(ValueError):
+    """The front's policy file is unusable: the front does not start."""
+
+
+class Refused(Exception):
+    def __init__(self, name: str, detail: str = "") -> None:
+        super().__init__(name)
+        self.name = name
+        self.detail = detail
+
+    @property
+    def status(self) -> int:
+        return STATUS[self.name]
+
+
+# --- policy ---------------------------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ConnectRoute:
+    route: str
+    host: str
+    passthrough: bool
+
+
+@dataclass(frozen=True)
+class FrontPolicy:
+    session: str
+    connect: Mapping[str, ConnectRoute]   # host -> the one route that admits it
+
+    def passthrough_hosts(self) -> frozenset[str]:
+        return frozenset(h for h, r in self.connect.items() if r.passthrough)
+
+
+def _hosts(route: str, raw: object) -> list[str]:
+    if not isinstance(raw, list) or not raw:
+        raise PolicyError(f"route {route}: hosts must be a non-empty list")
+    out = []
+    for h in raw:
+        if not isinstance(h, str) or not _HOSTNAME.match(h) or h.rsplit(".", 1)[1].isdigit():
+            raise PolicyError(f"route {route}: host {h!r} is not a lowercase A-label host name")
+        out.append(h)
+    return out
+
+
+def load_policy(data: bytes) -> FrontPolicy:
+    """Parse the front's policy file (render's `R/gw/slot<n>/session.json`, CONTRACT §4.3 "the front's view").
+    Refuses: an unknown key, any `credential` field (the front holds no key), a duplicate route id, a host admitted
+    by two CONNECT routes (so whether a tunnel is passthrough is never ambiguous), and a CONNECT host that is also a
+    brokered route's host (a brokered session's vendor API traffic must go through the data plane, never a tunnel)."""
+    try:
+        doc = json.loads(data)
+    except (ValueError, UnicodeDecodeError) as e:
+        raise PolicyError(f"not JSON: {e}") from None
+    if not isinstance(doc, dict) or set(doc) != {"format", "session", "routes"}:
+        raise PolicyError("top level must be exactly {format, session, routes}")
+    if doc["format"] != POLICY_FORMAT:
+        raise PolicyError(f"format must be {POLICY_FORMAT}")
+    if not isinstance(doc["session"], str) or not doc["session"]:
+        raise PolicyError("session must be a non-empty string")
+    if not isinstance(doc["routes"], list):
+        raise PolicyError("routes must be a list")
+    seen: set[str] = set()
+    connect: dict[str, ConnectRoute] = {}
+    brokered_hosts: set[str] = set()
+    for pol in doc["routes"]:
+        if not isinstance(pol, dict):
+            raise PolicyError("a route must be an object")
+        route = pol.get("route")
+        if not isinstance(route, str) or not _ROUTE_ID.match(route):
+            raise PolicyError(f"bad route id {route!r}")
+        if "credential" in pol:
+            raise PolicyError(f"route {route}: the front's policy carries no credential field")
+        unknown = set(pol) - _POLICY_KEYS
+        if unknown:
+            raise PolicyError(f"route {route}: unknown keys {sorted(unknown)}")
+        if route in seen:
+            raise PolicyError(f"route {route} twice")
+        seen.add(route)
+        typ = pol.get("type")
+        if typ not in ROUTE_TYPES:
+            raise PolicyError(f"route {route}: type {typ!r} not in {ROUTE_TYPES}")
+        if typ == "brokered":
+            if "hosts" in pol:
+                brokered_hosts.update(_hosts(route, pol["hosts"]))
+            up = pol.get("upstream")
+            if isinstance(up, dict) and isinstance(up.get("host"), str):
+                brokered_hosts.add(up["host"].lower())
+            continue
+        for h in _hosts(route, pol.get("hosts")):
+            if h in connect:
+                raise PolicyError(f"host {h} admitted by two routes ({connect[h].route}, {route})")
+            connect[h] = ConnectRoute(route, h, typ == "subscription_passthrough")
+    both = sorted(brokered_hosts & set(connect))
+    if both:
+        raise PolicyError(f"CONNECT routes admit brokered hosts {both}")
+    return FrontPolicy(doc["session"], connect)
+
+
+# --- addresses ------------------------------------------------------------------------------------------------
+
+_REFUSED_NETS = tuple(ipaddress.ip_network(n) for n in (
+    # IPv4: this-network, RFC1918, CGNAT, loopback, link-local (metadata), IETF protocol, documentation,
+    # benchmarking, multicast, reserved + broadcast.
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+    "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
+    "224.0.0.0/4", "240.0.0.0/4",
+    # IPv6: IPv4-compatible (incl. :: and ::1), IPv4-mapped, IPv4/IPv6 local-use translation, discard,
+    # Teredo, documentation, 6to4, ULA, link-local, site-local, multicast.
+    "::/96", "::ffff:0:0/96", "64:ff9b:1::/48", "100::/64", "2001::/32", "2001:db8::/32", "2002::/16",
+    "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
+))
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+
+
+def refused_address(addr: str) -> Optional[str]:
+    """Why `addr` may not be an upstream, or None. The named networks are checked first so the answer does not
+    depend on the running Python's `is_global` table; `is_global` is then a catch-all for anything newer. A NAT64
+    address (64:ff9b::/96) is judged by the IPv4 address it embeds."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return "unparseable"   # incl. a scoped IPv6 address ("fe80::1%en0")
+    if ip.version == 6 and ip in _NAT64:
+        inner = refused_address(str(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)))
+        return f"nat64:{inner}" if inner else None
+    for net in _REFUSED_NETS:
+        if ip.version == net.version and ip in net:
+            return str(net)
+    if not ip.is_global or ip.is_multicast:
+        return "not-global"
+    return None
+
+
+Resolver = Callable[[str, int], Awaitable[Sequence[str]]]
+Connector = Callable[[str, int], Awaitable[tuple[asyncio.StreamReader, asyncio.StreamWriter]]]
+
+
+async def system_resolve(host: str, port: int) -> list[str]:
+    infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM,
+                                                         proto=socket.IPPROTO_TCP)
+    return list(dict.fromkeys(info[4][0] for info in infos))
+
+
+async def open_by_address(addr: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Open TCP to an address literal; AI_NUMERICHOST makes a name here an error instead of a lookup."""
+    infos = await asyncio.get_running_loop().getaddrinfo(addr, port, type=socket.SOCK_STREAM,
+                                                         flags=socket.AI_NUMERICHOST)
+    family, typ, proto, _, sockaddr = infos[0]
+    sock = socket.socket(family, typ, proto)
+    try:
+        sock.setblocking(False)
+        await asyncio.get_running_loop().sock_connect(sock, sockaddr)
+        return await asyncio.open_connection(sock=sock, limit=_CHUNK)
+    except BaseException:
+        sock.close()
+        raise
+
+
+# --- the request head -----------------------------------------------------------------------------------------
+
+def prescan_head(head: bytes) -> None:
+    """The byte-level refusals made BEFORE h11 sees the head (CONTRACT §4.4)."""
+    if len(head) > HEAD_CAP:
+        raise Refused("malformed", "head-cap")
+    body = head[:-4]  # the head ends CRLF CRLF (the reader stops there)
+    for b in body:
+        if b >= 0x80 or b == 0x7F or (b < 0x20 and b not in (0x09, 0x0D, 0x0A)):
+            raise Refused("malformed", "head-byte")
+    lines = body.split(b"\r\n")
+    for line in lines:
+        if b"\r" in line or b"\n" in line:
+            raise Refused("malformed", "bare-cr-or-lf")
+    for line in lines[1:]:
+        if line[:1] in (b" ", b"\t"):
+            raise Refused("malformed", "obs-fold")
+
+
+def parse_head(head: bytes) -> h11.Request:
+    prescan_head(head)
+    conn = h11.Connection(h11.SERVER, max_incomplete_event_size=HEAD_CAP)
+    conn.receive_data(head)
+    try:
+        event = conn.next_event()
+    except h11.RemoteProtocolError as e:
+        raise Refused("malformed", f"h11: {e}") from None
+    if not isinstance(event, h11.Request):
+        raise Refused("malformed", "no request")
+    names = [n for n, _ in event.headers]
+    if names.count(b"host") > 1:   # h11 refuses this itself; kept so the rule does not rest on its version
+        raise Refused("malformed", "duplicate-host")
+    if b"content-length" in names and b"transfer-encoding" in names:
+        raise Refused("malformed", "cl-and-te")
+    if event.method == b"CONNECT":
+        if b"content-length" in names or b"transfer-encoding" in names:
+            raise Refused("malformed", "connect-with-body")
+    elif not event.target.startswith(b"/"):
+        raise Refused("malformed", "absolute-or-asterisk-form")
+    return event
+
+
+_AUTHORITY = re.compile(rb"^([^:\[\]]+):([0-9]{1,5})\Z")
+
+
+def connect_target(policy: FrontPolicy, target: bytes) -> tuple[ConnectRoute, int]:
+    m = _AUTHORITY.match(target)
+    if not m:
+        raise Refused("host-not-allowed", "authority")   # incl. a bracketed IPv6 literal
+    host, port = m.group(1).decode("ascii").lower(), int(m.group(2))
+    if port != CONNECT_PORT:
+        raise Refused("host-not-allowed", f"port {port}")
+    route = policy.connect.get(host)
+    if route is None:
+        raise Refused("host-not-allowed", "off-list")
+    return route, port
+
+
+# --- the server -----------------------------------------------------------------------------------------------
+
+class Front:
+    def __init__(self, policy: FrontPolicy, *, log_path: Optional[Path | str] = None,
+                 slot_uid: Optional[int] = None, resolve: Resolver = system_resolve,
+                 connect: Connector = open_by_address) -> None:
+        self.policy = policy
+        self.log_path = Path(log_path) if log_path is not None else None
+        self.slot_uid = slot_uid
+        self._resolve = resolve
+        self._connect = connect
+        self.live: set[asyncio.StreamWriter] = set()
+        self.bound: Optional[tuple[str, int]] = None
+        #: upstream connect attempts made (the contract rows' "upstream connections").
+        self.upstream_attempts = 0
+
+    def _log(self, rec: dict) -> None:
+        rec = {"at": round(time.time(), 3), "session": self.policy.session, **rec}
+        line = json.dumps(rec, sort_keys=True) + "\n"
+        try:
+            if self.log_path is None:
+                sys.stderr.write(line)
+            else:
+                with self.log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line)
+        except OSError as e:
+            print(f"levain gw-front: log write failed ({e}): {line}", file=sys.stderr, end="")
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if len(self.live) >= MAX_CONNS:
+            writer.close()
+            return
+        self.live.add(writer)
+        try:
+            await self._serve(reader, writer)
+        except (OSError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            self.live.discard(writer)
+            writer.close()
+
+    async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        sock = writer.get_extra_info("socket")
+        if sock is not None and sock.family == socket.AF_UNIX:
+            uid = peer_uid(sock)
+            if self.slot_uid is None or uid != self.slot_uid:
+                self._log({"event": "refused", "refused": "peer", "peer_uid": uid})
+                return   # no answer: an unexpected peer learns nothing
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), HEAD_TIMEOUT_S)
+        except asyncio.LimitOverrunError:
+            await self._refuse(reader, writer, Refused("malformed", "head-cap"))
+            return
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+            return
+        try:
+            req = parse_head(head)
+            if req.method != b"CONNECT":
+                # The brokered data plane is session 3b's; until it exists a route path has no keys to reach.
+                raise Refused("keys-unavailable" if req.target.startswith(b"/r/") else "template-miss")
+            route, port = connect_target(self.policy, req.target)
+            ureader, uwriter, addr = await self._open_upstream(route, port)
+        except Refused as r:
+            await self._refuse(reader, writer, r)
+            return
+        counts = {"up": 0, "down": 0}
+        try:
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
+            await self._relay(reader, writer, ureader, uwriter, counts)
+        finally:   # also on cancellation (shutdown): a tunnel that carried bytes is never left out of the log
+            uwriter.close()
+            self._log({"event": "tunnel", "route": route.route, "passthrough": route.passthrough,
+                       "host": route.host, "port": port, "address": addr,
+                       "bytes_up": counts["up"], "bytes_down": counts["down"]})
+
+    async def _open_upstream(self, route: ConnectRoute, port: int):
+        try:
+            addrs = list(await asyncio.wait_for(self._resolve(route.host, port), RESOLVE_TIMEOUT_S))
+        except asyncio.TimeoutError:
+            raise Refused("upstream-timeout", "resolve") from None
+        except OSError as e:
+            raise Refused("upstream-error", f"resolve: {e}") from None
+        addrs = list(dict.fromkeys(addrs))
+        if not addrs:
+            raise Refused("upstream-error", "no address")
+        if len(addrs) > MAX_ADDRESSES:
+            raise Refused("address-refused", "too many answers")
+        bad = [(a, why) for a in addrs if (why := refused_address(a))]
+        if bad:
+            # all-or-nothing: an answer set that mixes a public address with a refused one is refused whole
+            raise Refused("address-refused", "; ".join(f"{a} {w}" for a, w in bad))
+        timed_out = 0
+        for addr in addrs:   # the validated addresses, never the name again
+            self.upstream_attempts += 1
+            try:
+                ur, uw = await asyncio.wait_for(self._connect(addr, port), CONNECT_TIMEOUT_S)
+                return ur, uw, addr
+            except asyncio.TimeoutError:
+                timed_out += 1
+            except OSError:
+                pass
+        raise Refused("upstream-timeout" if timed_out == len(addrs) else "upstream-error", "connect")
+
+    async def _relay(self, creader, cwriter, ureader, uwriter, counts: dict) -> None:
+        """Copy both ways until both ends are done. A broken direction ends both; after one direction ends cleanly
+        the other gets HALF_CLOSE_S to finish (a client that fully closed looks like a half-close from here, and an
+        upstream that never answers the FIN would otherwise hold the tunnel open)."""
+        async def pump(src: asyncio.StreamReader, dst: asyncio.StreamWriter, key: str) -> bool:
+            try:
+                while chunk := await src.read(_CHUNK):
+                    counts[key] += len(chunk)
+                    dst.write(chunk)
+                    await dst.drain()
+                if dst.can_write_eof():
+                    dst.write_eof()   # half-close: the other direction keeps flowing
+                return True
+            except (OSError, asyncio.IncompleteReadError):
+                return False
+
+        self.live.add(uwriter)
+        tasks = {asyncio.ensure_future(pump(creader, uwriter, "up")),
+                 asyncio.ensure_future(pump(ureader, cwriter, "down"))}
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if pending and all(t.result() for t in done):
+                done, pending = await asyncio.wait(pending, timeout=HALF_CLOSE_S)
+        finally:
+            cwriter.close()
+            uwriter.close()
+            self.live.discard(uwriter)
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _refuse(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, r: Refused) -> None:
+        self._log({"event": "refused", "refused": r.name, "detail": r.detail})
+        body = r.name.encode() + b"\n"
+        writer.write(b"HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
+                     b"X-Levain-Refused: %s\r\nConnection: close\r\n\r\n%s"
+                     % (r.status, _REASON[r.status], len(body), r.name.encode(), body))
+        await writer.drain()
+        if writer.can_write_eof():
+            writer.write_eof()
+        loop = asyncio.get_running_loop()
+        deadline, drained = loop.time() + _DRAIN_S, 0
+        try:
+            while drained < _DRAIN_CAP and (left := deadline - loop.time()) > 0:
+                chunk = await asyncio.wait_for(reader.read(_CHUNK), timeout=left)
+                if not chunk:
+                    break
+                drained += len(chunk)
+        except (asyncio.TimeoutError, OSError):
+            pass
+
+    def close_live(self) -> None:
+        for w in list(self.live):
+            w.close()
+
+    async def serve_unix(self, path: Path | str) -> asyncio.base_events.Server:
+        """The Linux shape: `R/gw/slot<n>/gw.sock`, mode 0660 (the slot reaches it through the socket's group,
+        CONTRACT §2.2), peer uid == the slot's."""
+        if self.slot_uid is None:
+            raise ValueError("the unix shape needs the slot uid (its peer check)")
+        path = str(path)
+        clear_stale_socket(path)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.bind(path)
+            self.bound = (path, os.lstat(path).st_ino)
+            os.chmod(path, 0o660)
+            return await asyncio.start_unix_server(self._handle, sock=s, limit=HEAD_CAP)
+        except BaseException:
+            s.close()
+            self.unbind()
+            raise
+
+    def unbind(self) -> None:
+        if self.bound is None:
+            return
+        path, ino = self.bound
+        self.bound = None
+        try:
+            if os.lstat(path).st_ino == ino:
+                os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+    async def serve_tcp(self, port: int, host: str = "127.0.0.1") -> asyncio.base_events.Server:
+        """The macOS shape: `127.0.0.1:<gwport_n>` (V9)."""
+        if not GWPORT_BASE <= port < GWPORT_BASE + SLOTS:
+            raise ValueError(f"the TCP shape serves only the gateway range {GWPORT_BASE}..{GWPORT_BASE + SLOTS - 1}")
+        return await asyncio.start_server(self._handle, host=host, port=port, limit=HEAD_CAP)
+
+
+async def run_front(front: Front, *, unix: Optional[str] = None, port: Optional[int] = None,
+                    ready: Optional[Callable[[], None]] = None) -> None:
+    """Serve until SIGTERM / SIGINT, then close every tunnel and the listener."""
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+    server = await (front.serve_unix(unix) if unix is not None else front.serve_tcp(port))  # type: ignore[arg-type]
+    try:
+        if ready is not None:
+            ready()
+        await stop.wait()
+    finally:
+        server.close()
+        front.close_live()
+        try:
+            await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        if unix is not None:
+            front.unbind()
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="python -m levain.broker.front")
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--unix", help="socket path, the Linux shape (R/gw/slot<n>/gw.sock); needs --slot-uid")
+    g.add_argument("--port", type=int, help=f"TCP port on 127.0.0.1, the macOS shape ({GWPORT_BASE} + slot)")
+    ap.add_argument("--slot-uid", type=int, help="the only peer uid the unix shape serves")
+    ap.add_argument("--policy", required=True, help="the front's policy file (R/gw/slot<n>/session.json)")
+    ap.add_argument("--log", help="JSON-lines tunnel log (default: stderr)")
+    ap.add_argument("--go-fd", type=int, help="render's GO pipe: serve only after one byte arrives on it; EOF = exit "
+                                              "without serving (CONTRACT §5.1 render (4)-(5b))")
+    a = ap.parse_args(argv)
+    if a.unix is not None and a.slot_uid is None:
+        ap.error("--unix needs --slot-uid")
+    if os.geteuid() == 0:
+        print("levain gw-front: refusing to run as root (it runs as the slot's _levain_gw<n>)", file=sys.stderr)
+        return 2
+    try:
+        policy = load_policy(Path(a.policy).read_bytes())
+    except (OSError, PolicyError) as e:
+        print(f"levain gw-front: policy refused: {e}", file=sys.stderr)
+        return 2
+    if a.go_fd is not None:
+        # The policy is read first (render writes it before it starts the front); nothing is bound until GO.
+        try:
+            go = os.read(a.go_fd, 1)
+        except OSError as e:
+            print(f"levain gw-front: GO pipe unreadable ({e})", file=sys.stderr)
+            return 3
+        finally:
+            try:
+                os.close(a.go_fd)
+            except OSError:
+                pass
+        if not go:
+            return 3   # EOF before GO: render refused or died, so this front never serves
+    front = Front(policy, log_path=a.log, slot_uid=a.slot_uid)
+    asyncio.run(run_front(front, unix=a.unix, port=a.port))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

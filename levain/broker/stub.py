@@ -57,6 +57,25 @@ def peer_uid(sock: socket.socket) -> int | None:
     return None
 
 
+def clear_stale_socket(path: str) -> None:
+    """Make `path` bindable without ever binding over a live server or a non-socket: a stale SOCKET (connect
+    refused) is unlinked; any other file, or a socket that might be live, raises FileExistsError."""
+    try:
+        if not stat.S_ISSOCK(os.lstat(path).st_mode):
+            raise FileExistsError(path)
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.setblocking(False)  # a full backlog must not block the event loop
+        try:
+            err = probe.connect_ex(path)
+        finally:
+            probe.close()
+        if err != errno.ECONNREFUSED:  # only a refused connect proves nobody listens; anything else may be live
+            raise FileExistsError(f"{path}: in use or unprobeable ({errno.errorcode.get(err, err) if err else 'listening'})")
+        os.unlink(path)  # stale
+    except FileNotFoundError:
+        pass
+
+
 class Stub:
     def __init__(self, log_path: Path | str, slot: int | None = None) -> None:
         self.log_path = Path(log_path)
@@ -165,20 +184,7 @@ class Stub:
         if self.slot is None or not 0 <= self.slot < SLOTS:
             raise ValueError(f"the unix shape needs a slot index in 0..{SLOTS - 1}")
         path = str(path)
-        try:
-            if not stat.S_ISSOCK(os.lstat(path).st_mode):
-                raise FileExistsError(path)
-            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            probe.setblocking(False)  # a full backlog must not block the event loop
-            try:
-                err = probe.connect_ex(path)
-            finally:
-                probe.close()
-            if err != errno.ECONNREFUSED:  # only a refused connect proves nobody listens; anything else may be live
-                raise FileExistsError(f"{path}: in use or unprobeable ({errno.errorcode.get(err, err) if err else 'listening'})")
-            os.unlink(path)  # stale
-        except FileNotFoundError:
-            pass
+        clear_stale_socket(path)
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             s.bind(path)
