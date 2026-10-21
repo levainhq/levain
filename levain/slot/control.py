@@ -425,7 +425,7 @@ class Control:
         if qbroker_uid is not None and (type(qbroker_uid) is not int or qbroker_uid <= ROOT_UID
                                         or qbroker_uid == operator_uid):
             raise Refused("bad-config", f"qbroker uid {qbroker_uid!r}")
-        if host not in STORE:
+        if type(host) is not str or host not in STORE:
             raise Refused("bad-config", f"host {host!r}")
         self.store = store
         self.qbroker_uid = qbroker_uid
