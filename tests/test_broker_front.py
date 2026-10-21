@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import ssl
 import tempfile
 from pathlib import Path
@@ -13,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from levain.broker.front import (Front, PolicyError, Refused, connect_target, load_policy, parse_head,
-                                 refused_address)
+                                 refused_address, system_resolve)
 
 PUBLIC = "93.184.215.14"
 PUBLIC6 = "2606:2800:21f:cb07:6820:80da:af6b:8b2c"
@@ -69,9 +70,10 @@ async def _with_front(fn) -> None:
         path = str(Path(tmp) / "gw.sock")
         server = await front.serve_unix(path)
 
-        async def ask(raw: bytes, sni: str | None = "") -> tuple[bytes, int, bytes]:
-            """Send `raw`; on a 200 send a ClientHello (SNI = the CONNECT host unless `sni` names another) and read
-            what comes back. Returns (status, upstream connections, bytes echoed back through the tunnel)."""
+        async def ask(raw: bytes, sni: str | None = "", hello: bytes | None = None) -> tuple[bytes, int, bytes]:
+            """Send `raw`; on a 200 send a ClientHello (SNI = the CONNECT host unless `sni` names another; `hello`
+            replaces it whole) and read what comes back. Returns (status, upstream connections, bytes echoed back
+            through the tunnel)."""
             before = len(calls)
             r, w = await asyncio.open_unix_connection(path)
             w.write(raw)
@@ -79,7 +81,8 @@ async def _with_front(fn) -> None:
             head = await r.readuntil(b"\r\n\r\n")
             back = b""
             if head.startswith(b"HTTP/1.1 200"):
-                hello = client_hello(raw.split(b" ")[1].rsplit(b":", 1)[0].decode() if sni == "" else sni)
+                if hello is None:
+                    hello = client_hello(raw.split(b" ")[1].rsplit(b":", 1)[0].decode() if sni == "" else sni)
                 w.write(hello)
                 await w.drain()
                 while len(back) < len(hello) and (chunk := await r.read(65536)):
@@ -164,6 +167,45 @@ def test_brokered_upstream_host_trailing_dot_refused():
         {"route": "br", "type": "brokered", "upstream": {"scheme": "https", "host": "ok.example.", "base_path": "/"}}]}
     with pytest.raises(PolicyError, match="not a lowercase A-label host name"):
         load_policy(json.dumps(doc).encode())
+
+
+def test_system_resolve_queries_the_absolute_name(monkeypatch):
+    """Reproduced (L3 r1, codex HIGH 1): with `search attacker.example` + `ndots:5` a dotless query for the allowed
+    api.vendor.com resolved as api.vendor.com.attacker.example and the front used that host's address."""
+    queries: list[str] = []
+
+    def search_list(host, port, family=0, type=0, proto=0, flags=0):
+        queries.append(host)
+        if not host.endswith(".") and host.count(".") < 5:   # the search suffix is tried first
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.99", port))]
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (PUBLIC, port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", search_list)
+    assert asyncio.run(system_resolve("api.vendor.com", 443)) == [PUBLIC]
+    assert queries == ["api.vendor.com."]
+
+
+def _hello(record_ver: int, suites: bytes, comp: bytes, sni: str) -> bytes:
+    name = sni.encode()
+    lst = b"\x00" + len(name).to_bytes(2, "big") + name
+    ext = b"\x00\x00" + (len(lst) + 2).to_bytes(2, "big") + len(lst).to_bytes(2, "big") + lst
+    body = (b"\x03\x03" + b"\x11" * 32 + b"\x00" + len(suites).to_bytes(2, "big") + suites
+            + len(comp).to_bytes(1, "big") + comp + len(ext).to_bytes(2, "big") + ext)
+    hs = b"\x01" + len(body).to_bytes(3, "big") + body
+    return b"\x16" + record_ver.to_bytes(2, "big") + len(hs).to_bytes(2, "big") + hs
+
+
+def test_invalid_hello_with_matching_sni_reaches_no_upstream_byte():
+    """Reproduced (L3 r1, codex MED 4 / complement MED 1): a hello with record version 0x03ff and empty cipher-suite
+    and compression vectors, naming the CONNECT host, was accepted and forwarded, opening the unread relay."""
+    async def body(ask, log: Path, front: Front, up_bytes) -> None:
+        status, conns, back = await ask(_connect("ok.example:443"), hello=_hello(0x03FF, b"", b"", "ok.example"))
+        assert (status, conns, back, up_bytes[0]) == (b"200", 1, b"", 0)
+        valid = _hello(0x0301, b"\x13\x01", b"\x00", "ok.example")             # the same hello made valid
+        status, conns, back = await ask(_connect("ok.example:443"), hello=valid)
+        assert (status, back, up_bytes[0]) == (b"200", valid, len(valid))
+
+    asyncio.run(_with_front(body))
 
 
 # --- the pure functions, row by row: the rows the s3a DONE harness ran through a front process ----------------------

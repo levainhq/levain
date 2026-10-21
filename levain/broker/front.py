@@ -19,9 +19,11 @@ What it enforces, in order, before any upstream byte:
    The upstream socket is then opened to one of THOSE validated addresses, never by name, so a resolver that
    answers differently a second time (DNS rebinding) never chooses where the bytes go.
 5. the TLS ClientHello, which the client sends after the 200: its SNI must be the CONNECT host, and a hello with
-   no SNI, with an encrypted (ECH / ESNI) name, or that does not parse is refused by closing the tunnel with no
-   byte sent upstream. This stops domain fronting at the SNI; an HTTP Host header inside the TLS session is not
-   seen (closing that needs interception).
+   no SNI, with an encrypted (ECH / ESNI) name, or that does not parse or is not a hello a TLS server could accept
+   (record and legacy versions, cipher-suite and compression vectors) is refused by closing the tunnel with no
+   byte sent upstream. This stops domain fronting at the SNI of the FIRST hello; an HTTP Host header inside the
+   TLS session, and a later hello (after a HelloRetryRequest, or a renegotiation), are not seen (closing those
+   needs interception).
 Only then does the front forward the hello and relay bytes both ways without reading them (end-to-end TLS). Each
 tunnel is logged at its close as host, address, route, whether the route is `subscription_passthrough`, and byte counts:
 never a request line, a header or a payload byte.
@@ -392,6 +394,11 @@ _EXT_SERVER_NAME = 0x0000
 _EXT_HIDDEN_NAME = (0xFE0D, 0xFFCE)
 #: DECISION: a ClientHello (all of its records) larger than this is refused rather than buffered.
 HELLO_CAP = 64 * 1024
+#: the record-layer versions a ClientHello record may carry (TLS 1.0 .. 1.2; TLS 1.3 keeps a legacy value here).
+_RECORD_VERSIONS = (0x0301, 0x0303)
+#: the ClientHello's legacy_version field: SSL 3.0 .. TLS 1.2 (TLS 1.3 sends 0x0303 here and its real version in an
+#: extension).
+_CLIENT_VERSIONS = (0x0300, 0x0303)
 
 
 def _bad_hello() -> Refused:
@@ -427,7 +434,9 @@ async def read_client_hello(reader: asyncio.StreamReader) -> tuple[bytes, bytes]
     while True:
         hdr = await reader.readexactly(5)
         length = int.from_bytes(hdr[3:5], "big")
-        if hdr[0] != _TLS_HANDSHAKE or hdr[1] != 3 or not 0 < length <= _TLS_RECORD_MAX:
+        version = int.from_bytes(hdr[1:3], "big")
+        if (hdr[0] != _TLS_HANDSHAKE or not _RECORD_VERSIONS[0] <= version <= _RECORD_VERSIONS[1]
+                or not 0 < length <= _TLS_RECORD_MAX):
             raise _bad_hello()
         if len(raw) + 5 + length > HELLO_CAP:
             raise _bad_hello()
@@ -449,12 +458,19 @@ async def read_client_hello(reader: asyncio.StreamReader) -> tuple[bytes, bytes]
 def client_hello_sni(body: bytes) -> str:
     """The ClientHello's one host_name, lowercased. Refuses (host-not-allowed) a hello with no server_name and one
     carrying an encrypted / hidden name extension; refuses (malformed) anything that does not parse, a repeated
-    extension, and a server_name list that is not exactly one host_name of printable ASCII."""
+    extension, and a server_name list that is not exactly one host_name of printable ASCII. Also malformed: a
+    legacy_version outside SSL 3.0 .. TLS 1.2, an empty or odd-length cipher_suites vector, and a compression vector
+    that is empty or lacks the null method; a hello no TLS server could accept is not evidence of a TLS session."""
     c = _Cursor(body)
-    c.take(2 + 32)    # legacy_version, random
+    if not _CLIENT_VERSIONS[0] <= c.uint(2) <= _CLIENT_VERSIONS[1]:
+        raise _bad_hello()
+    c.take(32)        # random
     c.vec(1)          # legacy_session_id
-    c.vec(2)          # cipher_suites
-    c.vec(1)          # legacy_compression_methods
+    suites = c.vec(2)
+    if not suites or len(suites) % 2:
+        raise _bad_hello()
+    if 0 not in c.vec(1):   # legacy_compression_methods: non-empty, offering null
+        raise _bad_hello()
     if c.done():
         raise Refused("host-not-allowed", "sni-missing")   # no extensions at all
     exts = _Cursor(c.vec(2))
