@@ -10,7 +10,9 @@ them) and writes only ``answers/<request_id>.json``:
   :func:`levain.qbroker.broker.stored_request` (its broker labels not the shape the broker writes among them) is
   skipped here and refused by :func:`answer_payload` and :func:`write_answer`. Its state is the last one the
   broker's receipts record for it (a decision the broker accepted reads settled), ``expired`` once the hold has ended with none, and ``filing`` while it has no receipt at all: such a row
-  is not answerable (the broker records no decision without the filing).
+  is not answerable (the broker records no decision without the filing). A request the broker granted under its
+  run's signed contract reads ``allowed`` from its grant's own receipt (head ruling 1020+49): settled, never offered
+  as a question, and refused by :func:`answer_payload` and :func:`write_answer` like any settled request.
 - :func:`answer_payload`: the record to sign, over the broker's current receipts head (never one of size 0), for a
   ``pending`` request only.
 - :func:`write_answer`: the signed answer row, for a ``pending`` request only, checked first with

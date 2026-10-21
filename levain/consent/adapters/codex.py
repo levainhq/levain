@@ -408,8 +408,8 @@ def decision_output(decision: str, how: str) -> dict[str, Any]:
 
 def undecided_output(tier: str | None, what: str, gap: int) -> dict[str, Any]:
     """The deny at D: U-IRR for the irreversible tier (the latch is the stop, never ``continue: false``), U-REV
-    for the reversible one. The U-REV branch is UNEXECUTED: no reversible gated class exists in the product as of
-    main 5d330ec8 (it mirrors the Claude Code adapter's)."""
+    for the reversible one: a slot's ungated grantable call that a dispatch run queued and nobody answered
+    (:func:`_slot_ungated`, W2-c3)."""
     return _deny((U_IRR if tier == "irreversible" else U_REV).format(x=what, n=gap))
 
 
@@ -746,7 +746,7 @@ def slot_gate(event: Any, *, home: Path | None = None, codex_dir: Path | None = 
               monotonic: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
     """The slot's gate output for one Codex ``PreToolUse`` event, or ``None`` (the call goes on). An event missing
     a required field is denied (:func:`_missing_output`); a call :func:`gate_class` does not gate (protected paths:
-    none) gets ``None``; a gated call is filed with the broker (``client``, default
+    none) is :func:`_slot_ungated`'s (``None`` unless a dispatch run's grant or queue decides it); a gated call is filed with the broker (``client``, default
     :meth:`~levain.consent.broker_client.BrokerClient.from_env`), held up to ``hold`` for a decision the broker
     verified (:func:`decision_output`), and at the end of the hold denied with :func:`undecided_output`, its gap
     named by the request id. Anything else once the call is gated (a settings file naming the socket variable,
@@ -767,7 +767,9 @@ def slot_gate(event: Any, *, home: Path | None = None, codex_dir: Path | None = 
         git_cache: dict[Any, Any] = {}   # one git budget for the call, its description included
         tier = gate_class(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, git_cache=git_cache)
         if tier is None:
-            return None
+            return _slot_ungated(event, session, tool_name, tool_input, cwd, home=home, codex_dir=codex_dir,
+                                 git_cache=git_cache, client=client, hold=hold, expected_uid=expected_uid,
+                                 sleep=sleep, monotonic=monotonic)
         what = _call_what(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, git_cache=git_cache)
     except Exception:  # noqa: BLE001 - a call that cannot be classified is denied
         return could_not_run("this call")
@@ -786,6 +788,42 @@ def slot_gate(event: Any, *, home: Path | None = None, codex_dir: Path | None = 
         return could_not_run(what)
     if decision is None:
         return undecided_output(tier, what, request.id)
+    return decision_output(decision, SLOT_HOW)
+
+
+def _slot_ungated(event: Mapping[str, Any], session: str, tool_name: str, tool_input: Any, cwd: str, *,
+                  home: Path | None, codex_dir: Path | None, git_cache: dict[Any, Any], client: Any, hold: float,
+                  expected_uid: int | None, sleep: Callable[[float], None],
+                  monotonic: Callable[[], float]) -> dict[str, Any] | None:
+    """Claude Code's :func:`levain.consent.adapters.claude_code._slot_ungated`, in Codex's words: a file write
+    (:data:`PATCH_TOOL`) is sent with its member or with none; ``None`` (the mode decides) for any other call or on
+    GO only; any failure, the member that cannot be read included, is :func:`could_not_run`'s deny."""
+    from levain.consent import broker_client
+
+    def what() -> str:
+        try:
+            return _call_what(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, git_cache=git_cache)
+        except Exception:  # noqa: BLE001 - a call that cannot be described is still denied
+            return "this call"
+
+    try:
+        member = broker_client.grant_member(AGENT, tool_name, tool_input, cwd)
+        if member is None and tool_name != PATCH_TOOL:
+            return None
+        if queue_socket_planted(cwd, home=home, codex_home=codex_dir):
+            return could_not_run(what())
+        tool_use_id = event.get("tool_use_id")
+        got = broker_client.file_ungated(
+            client, member=member, agent=AGENT, session=session, tool_name=tool_name, tool_input=tool_input,
+            cwd=cwd, event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None, hold=hold,
+            poll=GATE_POLL, expected_uid=expected_uid, sleep=sleep, monotonic=monotonic)
+        if got[0] == broker_client.GO:
+            return None
+        decision, request_id = got
+    except Exception:  # noqa: BLE001 - fail closed, as a gated call: the broker down, refusing or malformed
+        return could_not_run(what())
+    if decision is None:
+        return undecided_output("reversible", what(), request_id)
     return decision_output(decision, SLOT_HOW)
 
 

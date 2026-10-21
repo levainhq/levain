@@ -18,7 +18,7 @@ from levain.slot import runtime_grammar as rg
 from levain.slot.accounts import SLOT_MARKER, SLOT_RETIRED_MARKER, Account
 from levain.slot.grammar import parse_install_argv
 from levain.slot.ids import SHARED_GROUPS
-from levain.slot.install_helper import EXIT_NOT_BUILT, HostFacts, extra_tools, operator_record, plan_setup, plan_undo
+from levain.slot.install_helper import HostFacts, extra_tools, operator_record, plan_setup, plan_undo
 
 HOSTS = ("linux", "darwin")
 OP, OP_UID = "alice", 501
@@ -235,10 +235,12 @@ def test_install_steps_take_any_iterable(host):
     assert len([s for s in got if s.write]) == len(units.services_for(host))
 
 
-# --- F8: the install-helper entry refuses until the apply layer exists ---------------------------------
+# --- F8: the install-helper entry never reads as an install that worked when it did nothing -------------
 
 
 def test_install_helper_entry_exits_non_zero(tmp_path):
+    """S1 2e built the entry: run as a non-root user it refuses ``not-root`` (exit 1) with one JSON line, before
+    it reads the host."""
     tree = tmp_path / "tree"
     shutil.copytree(Path(levain.__file__).parent, tree / "levain", ignore=shutil.ignore_patterns("__pycache__"))
     entry = tmp_path / "install-helper"
@@ -246,8 +248,9 @@ def test_install_helper_entry_exits_non_zero(tmp_path):
                                           tree=tree))
     r = subprocess.run([sys.executable, "-IS", str(entry), "setup"], capture_output=True, text=True, cwd=tmp_path,
                        env={"PATH": "/usr/bin:/bin"})
-    assert r.returncode == EXIT_NOT_BUILT == 2, r.stderr
-    assert "levain install helper: apply layer not built (S1 session 2)" in r.stderr
+    assert os.geteuid() != 0
+    assert r.returncode == 1, r.stderr
+    assert r.stdout == '{"ok":false,"refused":"not-root"}\n'
 
 
 # --- F9: a failing `ip netns list` is neither present nor absent -----------------------------------------

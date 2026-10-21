@@ -566,9 +566,9 @@ def test_pf_anchor_plan_and_undo():
     plan = _plan("darwin", 2, 1)
     w = [s for s in plan.steps if s.write and s.write[0] == pf.ANCHOR_FILE]
     assert len(w) == 1 and w[0].write[1] == pf.anchor_text(plan.allocation.slots, plan.allocation.ids)
-    assert w[0].validate == ("/sbin/pfctl", "-n", "-a", "com.apple/levain", "-f")
+    assert w[0].validate == ("/sbin/pfctl", "-n", "-o", "none", "-a", "com.apple/levain", "-f")
     argvs = [s.argv for s in plan.steps if s.argv]
-    load = argvs.index(("/sbin/pfctl", "-a", "com.apple/levain", "-f", "/etc/pf.anchors/levain"))
+    load = argvs.index(("/sbin/pfctl", "-o", "none", "-a", "com.apple/levain", "-f", "/etc/pf.anchors/levain"))
     enable = next(i for i, s in enumerate(plan.steps) if s.call and "enable reference" in s.why)
     assert plan.steps.index(w[0]) < plan.steps.index(next(s for s in plan.steps if s.argv == argvs[load])) < enable
     # the rules load after every slot account exists
@@ -613,7 +613,7 @@ def test_pf_never_touches_pf_conf():
             blob = " ".join([s.why, *s.argv, *s.skip_if, *s.validate, str(s.write[0]) if s.write else ""])
             assert "/etc/pf.conf" not in blob, s.why
             if s.argv[:1] == ("/sbin/pfctl",) and "-f" in s.argv:
-                assert s.argv[1:3] == ("-a", "com.apple/levain"), s.argv
+                assert s.argv[1:5] == ("-o", "none", "-a", "com.apple/levain"), s.argv
             if s.argv[:1] == ("/sbin/pfctl",) and "-F" in s.argv:
                 assert s.argv[1:3] == ("-a", "com.apple/levain"), s.argv
     assert pf.ANCHOR == "com.apple/levain"
@@ -784,4 +784,14 @@ def test_helper_imports_root_tree_only(host):
     assert any(f"above {tree} is root's alone" in w for w in checks)
     assert _refusal(root_tree.helper_entry_text, host, "other-helper") == "bad-token"
     assert _refusal(root_tree.tree_steps, host, Path("/tmp/notlevain")) == "bad-root"
-    assert any("runtime_helper does not exist yet" in p for p in plan.pending)
+    # The pending lines are derived from the helpers (S1 2e): the runtime helper exists, so nothing says it does
+    # not; each helper's line names exactly its verbs with no handler.
+    assert not any("does not exist" in p or "apply layer is not built" in p for p in plan.pending)
+    from levain.slot import install_helper, runtime_helper
+    from levain.slot.grammar import VERBS as INSTALL_VERBS
+    from levain.slot.runtime_grammar import VERBS as RUNTIME_VERBS
+    lines = {p.split(" answers ")[0]: p.split(": ", 1)[1].split(", ") for p in plan.pending if " answers verb-unbuilt" in p}
+    assert lines.get("levain.slot.install_helper") == [v for v in INSTALL_VERBS if v not in install_helper.BUILT_VERBS]
+    assert lines.get("levain.slot.runtime_helper", []) == [v for v in RUNTIME_VERBS
+                                                           if v not in runtime_helper.VERB_HANDLERS]
+    assert "setup" not in lines["levain.slot.install_helper"] and "prepare" not in lines["levain.slot.runtime_helper"]

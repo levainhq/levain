@@ -22,6 +22,14 @@ ASK = "please send a quick report on the status of the build fix"
 NOTE = "note: stepping away for the night, I won't answer pings"
 
 
+def _lease(store):
+    """The coordinator lease token for a test's coordinator steps: the operator takes the role (C3a), and holds it."""
+    held = store.coord_status()["lease"]
+    if held is not None and held["live"] and held["holder"] == "operator":
+        return held["token"]
+    return store.coord_take()
+
+
 @pytest.fixture
 def store(tmp_path):
     d = tmp_path / "consent"
@@ -132,13 +140,13 @@ def test_merge_refuses_threads_of_different_kinds(store):
 def test_state_grammar(store):
     note, _ = store.accept_drop(NOTE, surface="cli")
     (n,) = store.split(note.drop_id, [Part(kind="note", title="stepping away")])
-    done = store.set_state(n.thread_id, "done", by="coordinator")
+    done = store.set_state(n.thread_id, "done", by="coordinator", token=_lease(store))
     assert done.state == "closed" and store.events(n.thread_id)[-1][4] == "service"
 
     drop, (a, b, _c) = split_copy(store)
-    assert store.set_state(a.thread_id, "done", by="coordinator").state == "done"
+    assert store.set_state(a.thread_id, "done", by="coordinator", token=_lease(store)).state == "done"
     with pytest.raises(CoordError, match="only operator"):
-        store.set_state(a.thread_id, "closed", by="coordinator")
+        store.set_state(a.thread_id, "closed", by="coordinator", token=_lease(store))
     assert store.thread(a.thread_id).state == "done"
 
     assert store.set_state(done.thread_id, "open", by="operator").state == "open"
@@ -353,7 +361,7 @@ def test_no_path_leaves_an_open_ask_about_a_closed_thread(store):
 def test_detach_refuses_a_done_or_closed_thread(store):
     d, _ = store.accept_drop(TWO, surface="cli")
     x, y = store.split(d.drop_id, [work("x"), work("y")])
-    store.set_state(x.thread_id, "done", by="coordinator")
+    store.set_state(x.thread_id, "done", by="coordinator", token=_lease(store))
     with pytest.raises(CoordError, match="reopen it first"):
         store.detach(x.thread_id, d.drop_id)
 
@@ -361,7 +369,7 @@ def test_detach_refuses_a_done_or_closed_thread(store):
 def test_merge_carries_a_working_claim(store):
     d, _ = store.accept_drop(COPY, surface="cli")
     x, y = store.split(d.drop_id, [work("x"), work("y")])
-    store.set_state(y.thread_id, "working", by="coordinator")
+    store.set_state(y.thread_id, "working", by="coordinator", token=_lease(store))
     assert store.merge(x.thread_id, y.thread_id).state == "working"
 
 
@@ -401,7 +409,7 @@ def test_final_round_bounds(store, monkeypatch, tmp_path, capsys):
     with pytest.raises(CoordError, match="refs/heads/<name>"):
         store.accept_drop("no branch name", surface="cli", source=Source("cwd", "/tmp/r", "refs/heads/", "a" * 40))
     x, y = store.split(d.drop_id, [work("x"), work("y")])
-    store.set_state(y.thread_id, "done", by="coordinator")
+    store.set_state(y.thread_id, "done", by="coordinator", token=_lease(store))
     with pytest.raises(CoordError, match="no other open thread"):
         store.detach(x.thread_id, d.drop_id)
     assert ccli._shown("a‮b") == '"a⟨U+202E⟩b"'

@@ -18,8 +18,10 @@ event's digest and the :class:`VerifierRun` the supervisor minted, and returns t
 
 The minted run is not trusted as given either (:func:`run_problem`, refusal ``verifier-entry``): its entry is exactly
 the contract's seven fields in their syntax, its steps the ticket steps S1's runtime grammar accepts, the entry's
-``steps_digest`` is recomputed over those steps and its ``driver_input_digest`` is the run's, so an envelope that
-echoes the entry back is bound to the steps and the driver input it claims.
+``steps_digest`` is recomputed over those steps, its ``driver_input_digest`` is the run's and its
+``verifier_artifact_digest`` is recomputed over the five fields it pins (:func:`artifact_digest`, the one formula the
+registry's accept also uses), so an envelope that echoes the entry back is bound to the steps, the driver input and the
+artifact the signed template's ``verifier_hash`` names.
 
 Known edge: no S1 code writes the envelope yet, so this is checked against fixture bytes that follow the contract's
 envelope field for field; the ``.exit`` member types are this module's reading of the contract, which names the
@@ -43,7 +45,7 @@ from levain.slot.runtime_grammar import _verifier_steps
 __all__ = [
     "ENVELOPE_FORMAT_NAME", "EXIT_KEYS", "MAX_ENVELOPE_BYTES", "MAX_REPORT_BYTES", "MAX_STEPS", "NOTE_MAX",
     "REFUSALS", "REPORT_FORMAT", "VERIFIER_KEYS", "ReportRefused", "StepVerdict", "VerifierReport", "VerifierRun",
-    "body_problem", "check_envelope", "run_problem",
+    "ARTIFACT_FIELDS", "artifact_digest", "body_problem", "check_envelope", "contract_entry", "run_problem",
 ]
 
 REPORT_FORMAT = "levain-dispatch-verifier-report/1"
@@ -69,6 +71,8 @@ _VERIFIER_ID = re.compile(r"[a-z0-9-]{1,48}")
 _DRIVER_TEMPLATE = re.compile(r"[a-z0-9_]{1,48}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _KINDS = ("black-box", "in-process")
+# what the verifier ARTIFACT digest is over: exactly what decides what runs
+ARTIFACT_FIELDS = ("driver_template", "driver_template_digest", "steps_digest", "driver_input_digest", "declared_kind")
 
 # every name check_envelope refuses with, closed: the minted run is not the contract's entry and steps; no envelope
 # bytes to read; the event's digest is not the file's; the file is over the cap; it does not parse or is not canonical;
@@ -156,6 +160,21 @@ def _steps_problem(steps: Any) -> str | None:
     return None
 
 
+def artifact_digest(entry: Mapping[str, Any]) -> str:
+    """The verifier ARTIFACT's digest: SHA-256 over the canonical ``{driver_template, driver_template_digest,
+    steps_digest, driver_input_digest, declared_kind}`` of ``entry`` (:data:`ARTIFACT_FIELDS`), so a template's
+    ``verifier_hash`` pins all of it. The one formula: the registry's accept and :func:`run_problem` both call it.
+    Raises :class:`KeyError` when a field is missing."""
+    return "sha256:" + hashlib.sha256(canonical_bytes({k: entry[k] for k in ARTIFACT_FIELDS})).hexdigest()
+
+
+def contract_entry(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """The contract's seven-field verifier object (:data:`VERIFIER_KEYS`) projected from an activated registry
+    entry, which also holds the ``steps`` and ``driver_input`` the digests are over: what ``VerifierRun.verifier``
+    and the envelope's ``verifier`` carry. Raises :class:`KeyError` when a field is missing."""
+    return {k: entry[k] for k in sorted(VERIFIER_KEYS)}
+
+
 def run_problem(run: VerifierRun) -> str | None:
     """Why the minted ``run`` is not a contract verifier entry and its ticket steps (module docstring), or ``None``."""
     entry, steps = run.verifier, run.steps
@@ -180,6 +199,8 @@ def run_problem(run: VerifierRun) -> str | None:
         return "the entry's steps_digest is not the digest of the ticket's steps"
     if entry["driver_input_digest"] != run.driver_input_digest:
         return "the entry's driver_input_digest is not the run's"
+    if entry["verifier_artifact_digest"] != artifact_digest(entry):
+        return "the entry's verifier_artifact_digest is not the digest of what runs"
     return None
 
 

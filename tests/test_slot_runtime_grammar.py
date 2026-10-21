@@ -344,6 +344,13 @@ def test_render_blob_refusals(patch, name):
     assert refused_stdin("render", cj(dict(RENDER, **patch))) == name
 
 
+def test_verifier_steps_huge_wall_s_is_refused_not_valueerror():
+    # reproduced: a >4300-digit wall_s made the refusal detail raise ValueError
+    with pytest.raises(rg.Refused) as e:
+        rg._verifier_steps([{"argv": ["x"], "wall_s": 10 ** 5000}])
+    assert e.value.name == "out-of-range"
+
+
 def test_render_required_keys():
     for k in ("format", "vendor", "routes"):
         assert refused_stdin("render", cj({x: v for x, v in RENDER.items() if x != k})) == "missing-key"

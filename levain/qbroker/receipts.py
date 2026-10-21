@@ -19,7 +19,13 @@ broker makes, each face from ``ConsentQueue._face``. The transitions:
   request's ``pending`` receipt, so the answer attests the filing (:meth:`Receipts.decided`). The first decision
   stands: a later answer row naming another decision is refused, never recorded, and one naming the same decision is
   checked the same way;
-- ``expired`` when an ANSWER? finds the hold ended with no decision recorded (:meth:`Receipts.expired`).
+- ``expired`` when an ANSWER? finds the hold ended with no decision recorded (:meth:`Receipts.expired`);
+- ``allowed`` by a CONTRACT GRANT (head ruling 1020+49): a request the broker granted under its run's signed contract
+  (:mod:`levain.qbroker.grants`) gets its own transition, ``pending`` then ``allowed`` in one write
+  (:meth:`Receipts.granted`), whose face names the broker's grant row as the authority (``gate.by`` and
+  ``authority_scope.grantor`` ``binding``, ``binding_id`` the grant row's name, the contract digest and its signer in
+  ``grant``). It carries no signed head: no answer was signed. Such a request is SETTLED, and every answer to it is
+  refused (:meth:`Receipts.decided`), whatever it decides.
 
 No transition is recorded for a request without its ``pending`` receipt: :meth:`Receipts.decided` and
 :meth:`Receipts.expired` raise :class:`ReceiptsError` for one.
@@ -38,11 +44,17 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from levain.autonomic.authority import AuthorityScope
+from levain.autonomic.receipt import build_gate_face, build_gate_verdict
 from levain.consent import queue as consent_queue
 from levain.consent.receipt_log import LogUnreadable, head, head_refusal
 from levain.consent.record import ExternalGateRequest
 
-__all__ = ["DB_MODE", "DB_NAME", "Receipts", "ReceiptsError"]
+__all__ = ["CONTRACT_GRANTOR", "DB_MODE", "DB_NAME", "Receipts", "ReceiptsError"]
+
+#: the grantor a contract grant's ``allowed`` receipt names (the receipt vocabulary's word for an authority that is
+#: not a person's answer)
+CONTRACT_GRANTOR = "binding"
 
 DB_NAME = "receipts.db"
 # the operator's cockpit reads it through levain-queue, the group of requests/
@@ -180,6 +192,54 @@ class Receipts:
         conn.execute("INSERT INTO receipts (request_id, state, created_at, face) VALUES (?, ?, ?, ?)",
                      (request.id, state, stamp, json.dumps(face, ensure_ascii=False, sort_keys=True)))
 
+    @staticmethod
+    def _contract_face(request: ExternalGateRequest, grant: Mapping[str, Any]) -> dict[str, Any]:
+        # ConsentQueue._face's grant branch is a STANDING grant's (grant_seq / grant_hash / posture), which a contract
+        # grant has none of: the same builders, the same common fields, the broker's grant row named as the binding
+        binding_id = f"grant-{request.id}"
+        return build_gate_face(
+            context_id=request.id, query_text=request.display, query_date=request.received_at[:10],
+            producers=[request.agent],
+            gate=build_gate_verdict(verdict="approved", by=CONTRACT_GRANTOR, binding_id=binding_id),
+            authority=AuthorityScope(grantor=CONTRACT_GRANTOR, binding_id=binding_id,
+                                     grant=f"contract-grant:{grant['contract_digest']} signer={grant['signer_fp']}"),
+            terminal_state="fired", downstream_id=request.id)
+
+    @staticmethod
+    def _contract_settled(conn: sqlite3.Connection, request_id: str) -> bool:
+        row = conn.execute("SELECT face FROM receipts WHERE request_id = ? AND state = 'allowed'",
+                           (request_id,)).fetchone()
+        if row is None:
+            return False
+        try:
+            gate = json.loads(row[0]).get("gate")
+        except (ValueError, AttributeError):
+            return False
+        return isinstance(gate, Mapping) and gate.get("by") == CONTRACT_GRANTOR
+
+    def _grant_in(self, conn: sqlite3.Connection, request: ExternalGateRequest, grant: Mapping[str, Any],
+                  stamp: str) -> bool:
+        states = self._states(conn, request.id)
+        if any(s in _DECIDED for s in states) or "expired" in states:
+            return False
+        if not states:
+            self._append(conn, request, "pending", stamp)
+        face = self._contract_face(request, grant)
+        conn.execute("INSERT INTO receipts (request_id, state, created_at, face) VALUES (?, ?, ?, ?)",
+                     (request.id, "allowed", stamp, json.dumps(face, ensure_ascii=False, sort_keys=True)))
+        return True
+
+    def granted(self, request: ExternalGateRequest, grant: Mapping[str, Any], stamp: str) -> bool:
+        """Record that the broker's grant row ``grant`` (a ``levain-queue-grant-allow/1`` row, its shape the
+        caller's to have read) allowed ``request``: its ``pending`` filing when it has no receipt, then the
+        contract-grant ``allowed`` receipt, in one write. True when written; False (nothing written) when the request
+        is already decided or expired. :class:`ReceiptsError` when the write fails."""
+        try:
+            with self._write() as conn:
+                return self._grant_in(conn, request, grant, stamp)
+        except sqlite3.Error as exc:
+            raise ReceiptsError(f"the grant could not be recorded ({exc})") from None
+
     def head(self) -> dict[str, Any]:
         """The head of every receipt, in one read; :class:`ReceiptsError` when the log cannot be read as one."""
         try:
@@ -227,15 +287,23 @@ class Receipts:
             if not self._states(conn, request.id):
                 self._append(conn, request, "pending", stamp)
 
-    def reconcile(self, requests: Iterable[ExternalGateRequest], stamp: str) -> int:
+    def reconcile(self, requests: Iterable[ExternalGateRequest], stamp: str, *,
+                  grants: Mapping[str, Mapping[str, Any]] | None = None) -> int:
         """The ``pending`` receipt of every request in ``requests`` (the stored rows) that has none, in one write;
         how many were written. The broker runs it before it listens: a row linked before a crash or an upgrade, whose
-        filing receipt was never written, gets one before any answer for it is read."""
+        filing receipt was never written, gets one before any answer for it is read. A request with a grant row in
+        ``grants`` (request id -> the row) gets its grant's receipts instead (:meth:`granted`), never a bare
+        ``pending`` the operator could answer."""
+        grants = grants or {}
         written = 0
         with self._write() as conn:
             for request in sorted(requests, key=lambda r: (r.received_at, r.id)):
                 if not self._states(conn, request.id):
-                    self._append(conn, request, "pending", stamp)
+                    grant = grants.get(request.id)
+                    if grant is not None:
+                        self._grant_in(conn, request, grant, stamp)
+                    else:
+                        self._append(conn, request, "pending", stamp)
                     written += 1
         return written
 
@@ -253,6 +321,8 @@ class Receipts:
                 seq = self._filing_seq(conn, request.id)
                 if seq is None:
                     raise ReceiptsError(f"request {request.id} has no filing receipt: no decision is recorded for it")
+                if self._contract_settled(conn, request.id):
+                    return f"request {request.id} is settled by its contract grant: it takes no answer"
                 states = self._states(conn, request.id)
                 done = [s for s in states if s in _DECIDED]
                 if done and done[0] != state:

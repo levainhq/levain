@@ -2,7 +2,10 @@
 
 ``requests/<request_id>.json`` is written by the broker only: a temp file in the same directory, fsynced, mode
 0640, then hard-linked to its name (never replacing an existing row: a second writer finds the first one's row)
-and the directory fsynced. ``requests/queue-id`` holds the queue's random id, made once. ``answers/<id>.json`` is
+and the directory fsynced. ``requests/grant-<request_id>.json`` is the broker's own allow for a request the
+signed dispatch contract's typed grant covers (:data:`GRANT_ROW_FORMAT`, W2C_DESIGN §4), written the same way beside
+the request row: in the directory only the broker writes, never in ``answers/``, which any member of
+``levain-queue`` (dispatch, the suspect principal, included) can create files in. ``requests/queue-id`` holds the queue's random id, made once. ``answers/<id>.json`` is
 written by the operator's cockpit / phone server; any member of ``levain-queue`` can create a file there, so the
 broker reads it as untrusted bytes (no symlink, a regular file, bounded) and trusts only its signature.
 Stdlib only.
@@ -19,10 +22,14 @@ from typing import Any
 from levain.contracts import ContractError
 from levain.contracts.canon import canonical_bytes, parse
 
-__all__ = ["ANSWER_ROW_FORMAT", "REQUEST_ROW_FORMAT", "ROW_MAX", "QueueStore", "valid_request_id"]
+__all__ = ["ANSWER_ROW_FORMAT", "GRANT_ROW_FORMAT", "REQUEST_ROW_FORMAT", "ROW_MAX", "QueueStore", "fsync_dir",
+           "replace_file", "valid_request_id"]
 
 REQUEST_ROW_FORMAT = "levain-queue-request/1"
 ANSWER_ROW_FORMAT = "levain-queue-answer/1"
+# the broker's allow under a signed contract's typed grant: never an answer row, never a consent grant answer
+GRANT_ROW_FORMAT = "levain-queue-grant-allow/1"
+_GRANT_PREFIX = "grant-"
 # a row holds one request (its display is bounded by levain.consent.record.DISPLAY_MAX) or one signed answer
 ROW_MAX = 64 * 1024
 ROW_MODE = 0o640
@@ -75,12 +82,45 @@ def _parsed(data: bytes) -> dict[str, Any]:
     return obj
 
 
-def _fsync_dir(path: Path) -> None:
+def fsync_dir(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+_fsync_dir = fsync_dir
+
+
+def _write_tmp(directory: Path, data: bytes, mode: int) -> Path:
+    """A new temp file in ``directory`` holding ``data``, fsynced, mode ``mode`` (never through a symlink)."""
+    tmp = directory / f".tmp-{os.getpid()}-{os.urandom(8).hex()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        try:
+            os.fchmod(fd, mode)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+    return tmp
+
+
+def replace_file(path: Path, data: bytes, mode: int = ROW_MODE) -> None:
+    """``data`` at ``path``, whole or not at all: temp + fsync + rename over whatever is there + directory fsync."""
+    tmp = _write_tmp(path.parent, data, mode)
+    try:
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+    fsync_dir(path.parent)
 
 
 class QueueStore:
@@ -115,17 +155,8 @@ class QueueStore:
 
     def _link_new(self, path: Path, data: bytes) -> None:
         """Write ``data`` at ``path`` only if nothing is there: temp + fsync + link (FileExistsError if taken)."""
-        tmp = path.parent / f".tmp-{os.getpid()}-{os.urandom(8).hex()}"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, ROW_MODE)
+        tmp = _write_tmp(path.parent, data, ROW_MODE)
         try:
-            try:
-                os.fchmod(fd, ROW_MODE)
-                view = memoryview(data)
-                while view:
-                    view = view[os.write(fd, view):]
-                os.fsync(fd)
-            finally:
-                os.close(fd)
             os.link(tmp, path, follow_symlinks=False)
         finally:
             os.unlink(tmp)
@@ -150,6 +181,40 @@ class QueueStore:
         try:
             self._link_new(self.request_path(row["request"]["id"]), canonical_bytes(row))
         except FileExistsError:
+            return False
+        return True
+
+    def grant_path(self, request_id: str) -> Path:
+        if not valid_request_id(request_id):
+            raise ValueError("not a request id")
+        return self.requests / f"{_GRANT_PREFIX}{request_id}.json"
+
+    def write_grant(self, row: dict[str, Any]) -> bool:
+        """The broker's grant-allow row for ``row["request_id"]``; True when this call wrote it, False when one was
+        already there (never replaced)."""
+        if row.get("format") != GRANT_ROW_FORMAT:
+            raise ValueError(f"not a {GRANT_ROW_FORMAT} row")
+        try:
+            self._link_new(self.grant_path(row["request_id"]), canonical_bytes(row))
+        except FileExistsError:
+            return False
+        return True
+
+    def read_grant(self, request_id: str) -> dict[str, Any] | None:
+        """The grant-allow row for ``request_id``, ``None`` when there is none; ``ValueError`` for a file at that
+        name that is not one (another format included: a row is read only as its own format)."""
+        data = _read_untrusted(self.grant_path(request_id))
+        if data is None:
+            return None
+        row = _parsed(data)
+        if row.get("format") != GRANT_ROW_FORMAT:
+            raise ValueError(f"not a {GRANT_ROW_FORMAT} row")
+        return row
+
+    def has_grant(self, request_id: str) -> bool:
+        try:
+            os.lstat(self.grant_path(request_id))
+        except FileNotFoundError:
             return False
         return True
 
