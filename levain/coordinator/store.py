@@ -369,10 +369,13 @@ class CoordStore:
 
     def _keep_awake(self) -> None:
         """After a committed write: hold the host awake exactly while a work thread works (C7). Run outside the write
-        transaction, and never raises."""
-        from levain.coordinator import awake
+        transaction, and never raises: the write has committed, and a caller told otherwise might write it again."""
+        try:
+            from levain.coordinator import awake
 
-        awake.sync(self)
+            awake.sync(self)
+        except Exception:      # noqa: BLE001 - see the docstring; `levain doctor` reports the host's sleep state
+            pass
 
     def _stamp(self) -> str:
         now = self._clock()

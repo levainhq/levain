@@ -5,15 +5,22 @@ none is. It is an IDLE-sleep assertion only (macOS ``caffeinate -i``, Linux ``sy
 never writes the machine's power settings and never uses sudo. Whether it keeps a closed lid awake on battery is a
 separate claim that this module does not make (C0 §10, run owed).
 
-The holder is a child process that expires by itself (``-t``), so a Levain that dies releases the host within
-:data:`HOLD_SECONDS` with no cleanup. :func:`sync` is the one reconcile, meant to follow every committed store write:
+The holder is a process that expires by itself (``-t``), so a Levain that dies releases the host within
+:data:`HOLD_SECONDS` with no cleanup. It is started through a short-lived intermediate that exits at once, so the
+holder belongs to the system's init, never to the Levain process that asked for it: a long-lived Levain process never
+carries a finished holder as a zombie. :func:`sync` is the one reconcile, meant to follow every committed store write:
 it runs under an exclusive lock beside the store, reads the working set under that lock, and renews a holder that is
 running low. The holder is recorded in ``awake.json`` by pid, start time and exact argv, and is signalled only
 when a process matches all three: a pid the system has since given to something else is never ours to stop.
+
+A host without ``fcntl`` file locks gets no assertion: :func:`sync` says so and :func:`describe` names it.
 """
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:          # a platform without POSIX file locks: no assertion, and no write is failed by it
+    fcntl = None  # type: ignore[assignment]
 import json
 import os
 import shutil
@@ -25,15 +32,19 @@ import time
 from pathlib import Path
 from typing import Any
 
-__all__ = ["HOLD_SECONDS", "describe", "holder_command", "sync"]
+__all__ = ["HOLD_SECONDS", "describe", "holder_command", "process_started", "sync"]
 
 HOLD_SECONDS = 1800
 FILE = "awake.json"
 LOCK = "awake.lock"
 # a test seam: a test run never holds the host unless a test turns this on (and points the holder at a harmless argv)
 _IN_TESTS = False
-# the holders this process spawned, reaped on every sync so a long-lived process leaves no zombie behind
-_children: list[subprocess.Popen] = []
+_NO_LOCKS = "this host has no POSIX file locks (fcntl), so Levain does not hold it awake"
+# the intermediate: starts the holder in its own session, prints its pid, and exits, so the holder is never our child
+_LAUNCH = ("import subprocess, sys; p = subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL, "
+           "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True); print(p.pid)")
+# how long a just-started holder may take to show up in ps before the sync gives it up
+_IDENTIFY_TRIES, _IDENTIFY_GAP = 20, 0.05
 
 
 def holder_command(seconds: int | None = None, *, platform: str | None = None) -> list[str] | None:
@@ -57,6 +68,12 @@ def _ps(pid: int, field: str) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return cp.stdout.strip() if cp.returncode == 0 and cp.stdout.strip() else None
+
+
+def process_started(pid: int) -> str | None:
+    """The start time ``ps`` gives a live process, or None when it is gone or cannot be read. A pid and this together
+    name one process: a pid the system hands out again starts at another time."""
+    return _ps(pid, "lstart")
 
 
 def _identity(pid: int) -> tuple[str, str] | None:
@@ -94,23 +111,34 @@ def _write(path: Path, rec: dict[str, Any]) -> None:
 
 
 def _stop(rec: dict[str, Any]) -> None:
-    """Signal the recorded holder, only if it is still the very process we started, and reap it if it is our child."""
+    """Signal the recorded holder, only if it is still the very process we started (it is init's child, not ours, so
+    there is nothing to reap)."""
     if not _ours(rec):
         return
     try:
         os.kill(rec["pid"], signal.SIGTERM)
     except OSError:
         return
-    for proc in _children:
-        if proc.pid == rec["pid"]:
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
 
 
-def _reap() -> None:
-    _children[:] = [p for p in _children if p.poll() is None]
+def _spawn(argv: list[str]) -> int:
+    """Start a holder through the intermediate and return its pid; the intermediate is waited for here."""
+    cp = subprocess.run([sys.executable, "-I", "-c", _LAUNCH, *argv], stdin=subprocess.DEVNULL, capture_output=True,
+                        text=True, timeout=10)
+    pid = cp.stdout.strip()
+    if cp.returncode != 0 or not pid.isdigit():
+        raise OSError(f"the holder did not start ({(cp.stderr or '').strip()[-200:] or 'no pid'})")
+    return int(pid)
+
+
+def _identify(pid: int) -> tuple[str, str] | None:
+    """The identity of a holder just started: ps may not list it at once, so it is asked again for a short while."""
+    for _ in range(_IDENTIFY_TRIES):
+        got = _identity(pid)
+        if got is not None:
+            return got
+        time.sleep(_IDENTIFY_GAP)
+    return None
 
 
 def working(store: Any) -> list[str]:
@@ -124,8 +152,9 @@ def sync(store: Any) -> dict[str, Any]:
     if os.environ.get("LEVAIN_NO_IDLE_ASSERTION") or (os.environ.get("PYTEST_CURRENT_TEST") and not _IN_TESTS):
         # a test run that moves threads must not leave a real holder on the developer's machine
         return {"held": False, "why": "disabled by the environment (LEVAIN_NO_IDLE_ASSERTION or a test run)"}
+    if fcntl is None:
+        return {"held": False, "why": _NO_LOCKS}
     try:
-        _reap()
         directory = Path(store.directory)
         fd = os.open(directory / LOCK, os.O_RDWR | os.O_CREAT, 0o600)
         try:
@@ -150,15 +179,19 @@ def _reconcile(store: Any, path: Path) -> dict[str, Any]:
         return {"held": False, "why": "this host has no idle-sleep tool (caffeinate / systemd-inhibit)"}
     if _ours(cur) and cur.get("until", 0) - time.time() > HOLD_SECONDS / 2:
         return {"held": True, "pid": cur["pid"], "threads": ids, "why": "a work thread is working"}
-    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            start_new_session=True)
-    _children.append(proc)
-    ident = _identity(proc.pid)
-    rec = {"pid": proc.pid, "started": ident[0] if ident else None, "argv": argv,
-           "until": time.time() + HOLD_SECONDS, "threads": ids}
+    pid = _spawn(argv)
+    ident = _identify(pid)
+    if ident is None:
+        # a holder we cannot name is one we could never stop or recognise again: give it up, keep the old record
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        return {"held": False, "why": f"could not sync: the new holder (pid {pid}) could not be identified by ps"}
+    rec = {"pid": pid, "started": ident[0], "argv": argv, "until": time.time() + HOLD_SECONDS, "threads": ids}
     _write(path, rec)
     _stop(cur)                  # the old holder goes only once the new one is recorded
-    return {"held": True, "pid": proc.pid, "threads": ids, "why": "a work thread is working"}
+    return {"held": True, "pid": pid, "threads": ids, "why": "a work thread is working"}
 
 
 def describe(directory: Path | str, *, working_count: int | None = None) -> tuple[bool, str]:
@@ -171,6 +204,8 @@ def describe(directory: Path | str, *, working_count: int | None = None) -> tupl
         return True, (f"idle sleep is held off (pid {pid}, {n} work thread(s) working at its last sync); it "
                       f"releases when none works, and by itself within {HOLD_SECONDS // 60} minutes if Levain stops")
     if working_count:
+        if fcntl is None:
+            return False, f"{working_count} work thread(s) are working but {_NO_LOCKS}; it may sleep under them"
         if holder_command() is None:
             return False, (f"{working_count} work thread(s) are working but this host has no idle-sleep tool, so it "
                            "may sleep under them (macOS: caffeinate; Linux: systemd-inhibit)")

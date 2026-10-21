@@ -2,7 +2,8 @@
 
 Each test replays a failure reproduced in project_memory 1021-18/coord/fix_r1_awake_BEFORE.txt: (a) a work thread kept
 working only by the watcher's service beats lost its holder when the holder's lifetime ran out; (c) a process whose
-pid matched the record and whose argv said "caffeinate" was sent SIGTERM though it was not the holder."""
+pid matched the record and whose argv said "caffeinate" was sent SIGTERM though it was not the holder; and in
+fix_r2_awake_BEFORE.txt: (4) a holder that ran out its own life stayed a zombie child of the long-lived process."""
 import json
 import os
 import shutil
@@ -28,12 +29,13 @@ def held(tmp_path, monkeypatch):
         monkeypatch.setattr(awake, "holder_command", lambda *a, **k: [shutil.which("sleep"), str(seconds)])
         q = tmp_path / "consent"
         q.mkdir(mode=0o700)
+        made.append(q)
         return q, CoordStore(q)
+    made: list = []
     yield make
-    for proc in awake._children:
-        proc.kill()
-        proc.wait()
-    awake._children.clear()
+    for q in made:                                       # a holder left by a test goes with it
+        if (q / "awake.json").exists():
+            awake._stop(json.loads((q / "awake.json").read_text()))
 
 
 def test_service_beats_alone_keep_the_holder_renewed(held, tmp_path):
@@ -71,3 +73,18 @@ def test_a_reused_pid_is_never_signalled(held):
     finally:
         other.kill()
         other.wait()
+
+
+def test_a_holder_that_runs_out_is_never_our_zombie(held, tmp_path):
+    q, s = held(1)
+    s.coord_set_agent("claude", cwd=str(tmp_path))
+    d, _ = s.accept_drop("w", surface="cli")
+    ln = s.coord_status()["launches"][0]
+    s.launch_activate(ln["launch_id"], harness_session_id="az")
+    tok = s.coord_claim(ln["launch_id"], s.launch(ln["launch_id"]).session_key)
+    t, _ = s.split(d.drop_id, [Part(kind="work", title="w"), Part(kind="note", title="n")], by="coordinator", token=tok)
+    s.set_state(t.thread_id, "working", by="coordinator", token=tok)
+    pid = json.loads((q / "awake.json").read_text())["pid"]
+    time.sleep(2)                                # past its own life, with no store write after it
+    row = subprocess.run(["ps", "-o", "ppid=,stat=", "-p", str(pid)], capture_output=True, text=True).stdout.split()
+    assert not row or row[0] != str(os.getpid()), row     # gone, or init's: never a zombie child of this process
