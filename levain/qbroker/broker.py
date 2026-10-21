@@ -17,10 +17,11 @@ per request id runs at a time, so identical REQUESTs on several connections link
 Every transition the broker makes leaves one receipt in those receipts: filed (a new row), decided (the
 first accepted answer), expired (an ANSWER? past the hold with nothing decided). Before it listens, the broker files
 the ``pending`` receipt of every stored row that has none (a row linked before a crash or an upgrade), and a decision
-or expiry for a row with no ``pending`` receipt is refused ``broker-error``, nothing cached. Known edge: each
-ANSWER? past the hold opens the receipts once to read the state; the slot's rate bounds it. No verb accepts an answer, a grant
-answer or a row from a hook. Every other op is ``verb-not-allowed``. The cap is hashed on arrival and never logged or
-written. Stdlib only.
+for a row with no ``pending`` receipt is refused ``broker-error``, nothing cached; an ANSWER? past the hold of such
+a row answers ``request-expired`` and records nothing. Every reader of a stored row takes it through
+:func:`stored_request`. Known edge: each ANSWER? past the hold opens the receipts once to read the state; the
+slot's rate bounds it. No verb accepts an answer, a grant answer or a row from a hook. Every other op is
+``verb-not-allowed``. The cap is hashed on arrival and never logged or written. Stdlib only.
 """
 from __future__ import annotations
 
@@ -48,6 +49,7 @@ from levain.qbroker.store import ANSWER_ROW_FORMAT, REQUEST_ROW_FORMAT, QueueSto
 
 __all__ = ["ANSWER_BURST", "ANSWER_RATE", "CAP_MAX", "KINDS", "PENDING_PER_SESSION", "QUOTA_PER_RUN",
            "RECEIVED_SKEW", "RESOLVE_TTL", "RUN_KEYS", "SLOT_CLASS", "Broker", "Resolved", "Resolver", "resolved_from",
+           "stored_request",
            "slot_ref"]
 
 log = logging.getLogger("levain.qbroker")
@@ -123,6 +125,30 @@ def slot_ref(index: int) -> dict[str, Any]:
     return {"class": SLOT_CLASS, "index": index}
 
 
+_ROW_KEYS = frozenset({"format", "queue_id", "request", "session", "slot", "kind"})
+
+
+def stored_request(row: Any, queue_id: str, request_id: str | None = None) -> ExternalGateRequest | None:
+    """The sealed request a stored row holds, only when the whole row is one :meth:`Broker._request` writes: this
+    queue's, its seal holding (under ``request_id`` when the row was read by that id), ``slot`` a :func:`slot_ref`,
+    ``session`` / ``kind`` / ``run`` a :class:`Resolved`, no other key; else ``None``. The one check every reader
+    of a row makes (the operator's listing and answer, the broker's start and ANSWER?), so a row none of them would
+    list is one none of them answers, reconciles or decides."""
+    if not isinstance(row, Mapping) or row.get("queue_id") != queue_id \
+            or set(row) != _ROW_KEYS | ({"run"} if row.get("kind") == "dispatch" else set()):
+        return None
+    request = request_of(row.get("request"))
+    if request is None or (request_id is not None and request.id != request_id):
+        return None
+    slot = row["slot"]
+    if not isinstance(slot, Mapping) or set(slot) != {"class", "index"} or slot["class"] != SLOT_CLASS \
+            or type(slot["index"]) is not int:
+        return None
+    if resolved_from({"session": row["session"], "kind": row["kind"], "run": row.get("run")}) is None:
+        return None
+    return request
+
+
 def cap_digest(cap: Any) -> str | None:
     """``sha256:`` + 64 lowercase hex over the cap's UTF-8 bytes (CONTRACT c6: every ``*_digest`` on the wire)."""
     if not isinstance(cap, str) or not cap or len(cap) > CAP_MAX:
@@ -165,8 +191,8 @@ class Broker:
         now = utc_stamp(clock())
         filed = []
         for row in store.rows():
-            request = request_of(row.get("request"))
-            if request is not None and row.get("queue_id") == store.queue_id:
+            request = stored_request(row, store.queue_id)
+            if request is not None:
                 filed.append(request)
             session, run = row.get("session"), row.get("run")
             if not isinstance(session, str) or (run is not None and not (
@@ -358,15 +384,14 @@ class Broker:
             row = self._store.read_request(request_id)
         except ValueError:
             row = None
+        request = stored_request(row, self._store.queue_id, request_id)
         # one name for "no row" and "another session's row": a hook learns nothing about other sessions' ids
-        if row is None or row.get("session") != who.session or row.get("slot") != slot_ref(slot):
-            return wire.refusal(rid, "no-such-request")
-        request = request_of(row.get("request"))
-        if request is None or row.get("queue_id") != self._store.queue_id:
+        if request is None or row.get("session") != who.session or row.get("slot") != slot_ref(slot):
             return wire.refusal(rid, "no-such-request")
         now = self._clock()
         if request.expires_at <= utc_stamp(now):
-            if self._receipts.state(request_id) in (None, "pending"):
+            # a row with no receipt has no filing for an expiry to follow: it answers expired and records nothing
+            if self._receipts.state(request_id) == "pending":
                 self._receipts.expired(request, utc_stamp(now))
             return wire.refusal(rid, "request-expired")
         try:

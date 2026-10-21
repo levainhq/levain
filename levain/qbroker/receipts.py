@@ -3,8 +3,8 @@
 
 It lives in ``requests/`` because that is the one queue directory the broker owns (CONTRACT c3 §2.1:
 ``_levain_qbroker:levain-queue 0750``): ``L/queue`` itself is root's, and a rollback journal is a file sqlite creates
-beside the database at every write. The operator reads it through the group. The database is made mode 0640, and
-sqlite gives its journal the database's mode.
+beside the database at every write. The operator reads it through the group. The database is held at mode 0640 in
+that group on every start, and sqlite gives its journal the database's mode.
 
 The table and its append-only triggers are taken from :mod:`levain.consent.queue` at import (never restated here),
 so that :func:`levain.consent.receipt_log.head` and :func:`~levain.consent.receipt_log.head_refusal` read this log as
@@ -81,26 +81,34 @@ class Receipts:
             raise FileNotFoundError(f"{self.path} is not the broker's receipts log")
 
     def _make_file(self) -> None:
-        """The database file, a regular file of mode :data:`DB_MODE`, made here when absent: sqlite's own create
-        would follow a symlink and take its mode from the umask."""
+        """The database file, made here when absent, and on every start held to the broker's own state: a regular
+        file owned by the broker's uid, mode :data:`DB_MODE`, in the group of ``requests/``. sqlite's own create
+        would follow a symlink and take its mode from the umask; a start that stopped between the create and the
+        chown, or a mode or group changed since, is repaired here. Any failure is :class:`ReceiptsError`."""
         try:
-            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, DB_MODE)
-        except FileExistsError:
-            pass
-        else:
-            try:
-                os.fchmod(fd, DB_MODE)
-                # Linux gives a new file its creator's primary group unless the directory is setgid; the operator
-                # reads through the group of requests/, which the broker is a member of
-                os.fchown(fd, -1, os.stat(self.path.parent).st_gid)
-            finally:
-                os.close(fd)
-        try:
-            st = os.lstat(self.path)
+            # O_NONBLOCK: a FIFO planted at the path opens at once and is refused below, never waited on
+            fd = os.open(self.path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, DB_MODE)
         except OSError as exc:
-            raise ReceiptsError(f"{self.path} cannot be made ({exc})") from None
-        if not stat.S_ISREG(st.st_mode):
-            raise ReceiptsError(f"{self.path} is not a regular file (a symlink is refused)")
+            raise ReceiptsError(f"{self.path} cannot be opened as a regular file (a symlink is refused: {exc})") \
+                from None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise ReceiptsError(f"{self.path} is not a regular file")
+            if st.st_uid != os.geteuid():
+                raise ReceiptsError(f"{self.path} is owned by uid {st.st_uid}, not the broker's {os.geteuid()}")
+            if stat.S_IMODE(st.st_mode) != DB_MODE:
+                os.fchmod(fd, DB_MODE)
+            # Linux gives a new file its creator's primary group unless the directory is setgid; the operator
+            # reads through the group of requests/, which the broker is a member of
+            gid = os.stat(self.path.parent).st_gid
+            if st.st_gid != gid:
+                os.fchown(fd, -1, gid)
+        except OSError as exc:
+            raise ReceiptsError(f"{self.path} cannot be held at mode {DB_MODE:o} in the group of "
+                                f"{self.path.parent.name}/ ({exc})") from None
+        finally:
+            os.close(fd)
 
     def _connect(self) -> sqlite3.Connection:
         if self._create:

@@ -6,8 +6,9 @@ them) and writes only ``answers/<request_id>.json``:
 - :func:`rows`: every ``pend-*.json`` request row whose seal holds (any other name, a ``grant-*.json`` among them,
   is skipped). A row is labelled by its ``session`` / ``slot`` / ``kind`` / ``run``, which the broker took from
   CONTROL; the request's ``agent``, ``agent_session_id``, ``cwd`` and ``display`` are the hook's own claims and are
-  returned under ``claims``, never as identity. A row whose broker labels are not the shape the broker writes is
-  skipped. Its state is the last one the broker's receipts record for it (a decision the broker accepted reads
+  returned under ``claims``, never as identity. A row that is not whole by
+  :func:`levain.qbroker.broker.stored_request` (its broker labels not the shape the broker writes among them) is
+  skipped here and refused by :func:`answer_payload` and :func:`write_answer`. Its state is the last one the broker's receipts record for it (a decision the broker accepted reads
   settled), ``expired`` once the hold has ended with none, and ``filing`` while it has no receipt at all: such a row
   is not answerable (the broker records no decision without the filing).
 - :func:`answer_payload`: the record to sign, over the broker's current receipts head (never one of size 0), for a
@@ -33,9 +34,9 @@ from levain.cockpit.consent import ConsentError, utc_stamp
 from levain.consent import record
 from levain.contracts import ContractError
 from levain.contracts.canon import canonical_bytes, parse
-from levain.qbroker.broker import SLOT_CLASS, resolved_from
+from levain.qbroker.broker import stored_request
 from levain.qbroker.receipts import Receipts, ReceiptsError
-from levain.qbroker.seam import answer_refusal, request_of
+from levain.qbroker.seam import answer_refusal
 from levain.qbroker.signers import SignersSnapshot
 from levain.qbroker.store import ANSWER_ROW_FORMAT, ROW_MAX, QueueStore, valid_request_id
 
@@ -91,15 +92,6 @@ def _recorded(receipts: Receipts, request_id: str | None = None) -> Any:
         raise OperatorError(str(exc)) from None
 
 
-def _labelled(row: Mapping[str, Any]) -> bool:
-    """Whether the row's broker labels are the shape the broker writes (``slot`` a ``{class, index}``)."""
-    slot = row.get("slot")
-    if not isinstance(slot, Mapping) or set(slot) != {"class", "index"} or slot["class"] != SLOT_CLASS \
-            or type(slot["index"]) is not int:
-        return False
-    return resolved_from({"session": row.get("session"), "kind": row.get("kind"), "run": row.get("run")}) is not None
-
-
 def _pending(receipts: Receipts, request: record.ExternalGateRequest, stamp: str) -> None:
     state = _state(_recorded(receipts, request.id), request.expires_at, stamp)
     if state == "filing":
@@ -123,8 +115,8 @@ def rows(root: Path | str, *, now: datetime | None = None) -> list[Listed]:
             row = store.read_request(rid)
         except (ValueError, OSError):
             continue
-        request = None if row is None else request_of(row.get("request"))
-        if request is None or request.id != rid or row.get("queue_id") != store.queue_id or not _labelled(row):
+        request = stored_request(row, store.queue_id, rid)
+        if request is None:
             continue
         out.append(Listed(
             request_id=rid, session=row["session"], slot=dict(row["slot"]), kind=row.get("kind"),
@@ -142,8 +134,8 @@ def _request(store: QueueStore, request_id: str) -> tuple[dict[str, Any], record
         row = store.read_request(request_id)
     except (ValueError, OSError) as exc:
         raise OperatorError(f"the row for {request_id} cannot be read ({exc})") from None
-    request = None if row is None else request_of(row.get("request"))
-    if request is None or row.get("queue_id") != store.queue_id:
+    request = stored_request(row, store.queue_id, request_id)
+    if request is None:
         raise OperatorError(f"no sealed request {request_id!r} in this queue")
     return row, request
 

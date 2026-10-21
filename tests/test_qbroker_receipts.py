@@ -198,7 +198,9 @@ def test_rows_lists_pend_rows_only_labelled_by_control_with_the_hooks_fields_as_
     assert got[c].session == "sess-a" and got[c].slot == {"class": "egress", "index": 1} and got[c].kind == "interactive"
     assert dict(got[c].claims) == {"agent": "claude_code", "agent_session_id": "cc-1", "cwd": "/w",
                                    "display": 'Bash {"command": "ls"}'}
-    assert operator.rows(L / "queue", now=NOW + timedelta(minutes=5))[-1].state == "expired"
+    # rows sort by (received_at, id) and these share received_at: the id order is the seal's, so read c by id
+    later = {r.request_id: r.state for r in operator.rows(L / "queue", now=NOW + timedelta(minutes=5))}
+    assert later[c] == "expired"
 
 
 def test_answer_payload_is_over_the_brokers_current_head_and_refuses_a_settled_request(L, broker, keys):
@@ -322,7 +324,9 @@ def test_no_decision_or_expiry_is_recorded_without_the_filing_and_none_is_cached
     assert ask(broker, rid)["refused"] == "broker-error"
     assert states(L, rid) == [] and rid not in broker._verdicts
     clock["now"] = NOW + timedelta(minutes=5)
-    assert ask(broker, rid)["refused"] == "broker-error"
+    # the hold ended with no filing to follow: expired, written nowhere, every poll alike
+    assert ask(broker, rid)["refused"] == "request-expired"
+    assert ask(broker, rid)["refused"] == "request-expired"
     assert states(L, rid) == []
 
 
@@ -416,3 +420,71 @@ def test_rows_skips_a_row_whose_broker_metadata_is_malformed(L, broker, field, v
     path.unlink()
     path.write_bytes(canonical_bytes(row))
     assert [r.request_id for r in operator.rows(L / "queue", now=LATER)] == [good]
+
+
+def malformed(L, rid, field, value):
+    path = L / "queue" / "requests" / f"{rid}.json"
+    row = json.loads(path.read_bytes())
+    row[field] = value
+    path.unlink()
+    path.write_bytes(canonical_bytes(row))
+
+
+@pytest.mark.parametrize("field,value", [("run", 1), ("kind", "other"), ("slot", {"index": 1}), ("extra", 1)])
+def test_a_malformed_row_is_neither_answered_reconciled_nor_decided(L, broker, keys, resolver, clock, monkeypatch,
+                                                                    field, value):
+    rid = filed(broker)
+    lost = unfiled(broker, monkeypatch, fields=hook_fields("e2"))
+    payload, sig = signed(L, rid, keys["operator"])
+    malformed(L, rid, field, value)
+    malformed(L, lost, field, value)
+    with pytest.raises(operator.OperatorError, match="no sealed request"):
+        operator.answer_payload(L / "queue", rid, "allow", keys["operator"].fp, now=LATER)
+    with pytest.raises(operator.OperatorError, match="no sealed request"):
+        operator.write_answer(L / "queue", rid, payload, sig, snapshot(L), now=LATER)
+    assert not (L / "queue" / "answers" / f"{rid}.json").exists()
+    b = make_broker(L, resolver, clock)
+    assert states(L, lost) == []
+    raw(L, rid, payload, sig)
+    assert ask(b, rid)["refused"] == "no-such-request"
+    assert states(L, rid) == ["pending"]
+
+
+def test_every_start_holds_the_log_at_0640_in_the_group_of_requests(L, broker, resolver, clock):
+    db = broker._receipts.path
+    os.chmod(db, 0o600)
+    other = next((g for g in os.getgroups() if g != os.stat(db).st_gid), None)
+    if other is not None:
+        os.chown(db.parent, -1, other)
+    make_broker(L, resolver, clock)
+    assert stat.S_IMODE(os.stat(db).st_mode) == 0o640
+    assert os.stat(db).st_gid == os.stat(db.parent).st_gid
+
+
+def test_a_log_owned_by_another_uid_is_refused(L, broker, monkeypatch):
+    uid = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: uid + 1)
+    with pytest.raises(ReceiptsError, match="owned by uid"):
+        Receipts(L / "queue")
+
+
+def test_a_failed_chown_is_a_receipts_error(L, broker, monkeypatch):
+    db = broker._receipts.path
+    other = next((g for g in os.getgroups() if g != os.stat(db).st_gid), None)
+    if other is None:
+        pytest.skip("this uid has one group only")
+    os.chown(db.parent, -1, other)
+
+    def denied(*a):
+        raise PermissionError(1, "Operation not permitted")
+    monkeypatch.setattr(os, "fchown", denied)
+    with pytest.raises(ReceiptsError, match="Operation not permitted"):
+        Receipts(L / "queue")
+
+
+def test_a_fifo_at_the_log_is_refused_without_blocking(tmp_path):
+    q = tmp_path / "queue"
+    (q / "requests").mkdir(parents=True)
+    os.mkfifo(q / "requests" / DB_NAME)
+    with pytest.raises(ReceiptsError, match="not a regular file"):
+        Receipts(q)
