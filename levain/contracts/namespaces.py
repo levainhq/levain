@@ -42,6 +42,8 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
     "levain-dispatch-authorise": ("reserved", "levain/dispatch/adopt.py",
                                   "the operator's signed authorisation to land one verified dispatch run on one "
                                   "branch (F11 (A))"),
+    "levain-thread-envelope": ("reserved", "levain/coordinator/envelope.py",
+                               "the operator's signature over a coordinator thread envelope's digest (C0 §4.2)"),
     "levain-allowed-signers": ("reserved", "levain/qbroker/signers.py",
                                "the dispatch trust root's signature over the answer-signer snapshot "
                                "(CONTRACT c6 §3.7)"),

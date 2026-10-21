@@ -507,6 +507,10 @@ class JobStore:
     def _stamp(self) -> str:
         return utc_stamp(_now_utc(self._clock))
 
+    def stamp(self) -> str:
+        """Now, on the store's own clock: the one clock a land judges expiry and record age by."""
+        return self._stamp()
+
     @contextmanager
     def _swept(self) -> Iterator[tuple[sqlite3.Connection, str]]:
         """The sweep committed in its own write transaction, then the operation's write transaction, swept again so
@@ -941,6 +945,15 @@ class JobStore:
             rows = conn.execute("SELECT run, record, digest FROM run_records WHERE job_id = ? ORDER BY run",
                                 (job.id,)).fetchall()
         return [_stored_record(job.id, run, text, digest) for run, text, digest in rows]
+
+    def run_record(self, job_id: str, run: int) -> ArtifactRecord | None:
+        """Run ``run``'s record of job ``job_id`` checked as :meth:`run_records` checks every row, or ``None`` when that
+        run has none. Reads that one row only, so an authorised job's finish never depends on its other runs' rows."""
+        with self._swept() as (conn, _stamp):
+            job = self._must_load(conn, job_id)
+            row = conn.execute("SELECT run, record, digest FROM run_records WHERE job_id = ? AND run = ?",
+                               (job.id, run)).fetchone()
+        return None if row is None else _stored_record(job.id, *row)
 
     def get(self, job_id: str) -> Job | None:
         """The job ``job_id`` after a sweep, or ``None``."""
