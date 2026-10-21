@@ -247,7 +247,7 @@
     const label = new Map();
     for (const n of arr(v.nodes)) label.set(n.id, n.label);
     const d = el("details", "tv-conf");
-    d.appendChild(el("summary", null, (total === 1 ? "1 file" : total + " files") + " live sessions are both writing" + (total > list.length ? " (showing " + list.length + ")" : "")));
+    d.appendChild(el("summary", null, (total === 1 ? "1 file" : total + " files") + " that live sessions are both writing" + (total > list.length ? " (showing " + list.length + ")" : "")));
     // one file, every session on it: "a and b", "a, b and c"
     const names = (c) => { const w = arr(c.nodes).map((id) => label.get(id) || id); return w.length > 2 ? w.slice(0, -1).join(", ") + " and " + w[w.length - 1] : w.join(" and "); };
     for (const c of list) d.appendChild(el("div", "tv-conf-row", c.path + " — " + names(c)));
