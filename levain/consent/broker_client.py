@@ -67,10 +67,11 @@ from levain.cockpit.consent import utc_stamp
 from levain.consent.record import ExternalGateRequest, redact_display, tool_input_digest
 from levain.qbroker import wire
 
-__all__ = ["BROKER_ACCOUNT", "CAP_ENV", "FAST_POLLS", "GO", "IO_TIMEOUT", "PENDING_REFUSALS", "REQUEST_RETRY",
-           "SLOW_POLL", "SOCKET_ENV", "BrokerClient", "BrokerError", "UNGATED_TIER", "broker_uid", "file_and_hold",
-           "GATE_FAILED", "GATE_GO", "GATE_HALTED", "GATE_OVER", "SLOT_HALT_TEXT", "SLOT_LIMITS_FAILED_TEXT",
-           "file_ungated", "gate_check", "gate_request", "grant_member", "hold_for_decision", "in_slot"]
+__all__ = ["BROKER_ACCOUNT", "CAP_ENV", "FAST_POLLS", "GATE_BACKOFF", "GO", "IO_TIMEOUT", "PENDING_REFUSALS",
+           "REQUEST_RETRY", "SLOW_POLL", "SOCKET_ENV", "BrokerClient", "BrokerError", "UNGATED_TIER", "broker_uid",
+           "file_and_hold", "GATE_FAILED", "GATE_GO", "GATE_HALTED", "GATE_OVER", "SLOT_HALT_TEXT",
+           "SLOT_LIMITS_FAILED_TEXT", "file_ungated", "gate_check", "gate_request", "grant_member",
+           "hold_for_decision", "in_slot"]
 
 SOCKET_ENV = "LEVAIN_QUEUE_SOCKET"
 CAP_ENV = "LEVAIN_QUEUE_CAP"
@@ -95,6 +96,9 @@ FAST_POLLS = 8
 SLOW_POLL = 1.0
 # a REQUEST refused rate-limited is sent once more after this long (well past the broker's token interval)
 REQUEST_RETRY = 1.0
+# the pauses before re-sending a rate-limited GATE (gate_check): short, bounded, about 1.5 s in all; GATE has its own
+# per-slot bucket at the broker (levain.qbroker.broker.GATE_BURST), so this only spreads a parallel batch past it
+GATE_BACKOFF = (0.05, 0.1, 0.2, 0.4, 0.8)
 # a socket timeout and time.monotonic read different clocks: a call that ran out this close to the hold's end ended
 # the hold (undecided), it did not fail to run
 DEADLINE_SLOP = 0.05
@@ -274,19 +278,19 @@ def gate_check(client: BrokerClient, *, agent: str, tool_name: str, tool_input: 
                sleep: Callable[[float], None] = time.sleep) -> str | None:
     """The slot gate's first step on EVERY PreToolUse, before the call is classified: ``None`` on the broker's GO
     (the gate goes on), else the deny text (:data:`SLOT_HALT_TEXT`, or Q13's stop words for over-limit). A
-    ``rate-limited`` GATE is sent once more after :data:`REQUEST_RETRY`; a second refusal, or any other failure,
-    raises :class:`BrokerError` (the caller denies: fail closed)."""
+    ``rate-limited`` GATE is sent again after each pause of :data:`GATE_BACKOFF` (bounded); a refusal past the last,
+    or any other failure, raises :class:`BrokerError` (the caller denies: fail closed)."""
     from levain.consent import limits
 
-    try:
-        verdict, detail = client.gate(agent=agent, tool_name=tool_name, tool_input=tool_input,
-                                      tool_use_id=tool_use_id)
-    except BrokerError as exc:
-        if exc.name != "rate-limited":
-            raise
-        sleep(REQUEST_RETRY)
-        verdict, detail = client.gate(agent=agent, tool_name=tool_name, tool_input=tool_input,
-                                      tool_use_id=tool_use_id)
+    for pause in (*GATE_BACKOFF, None):
+        try:
+            verdict, detail = client.gate(agent=agent, tool_name=tool_name, tool_input=tool_input,
+                                          tool_use_id=tool_use_id)
+            break
+        except BrokerError as exc:
+            if exc.name != "rate-limited" or pause is None:
+                raise
+            sleep(pause)
     if verdict == GATE_GO:
         return None
     if verdict == GATE_HALTED:

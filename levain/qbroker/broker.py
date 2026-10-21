@@ -56,7 +56,7 @@ session is the resolve's, never the frame's.
   of :func:`~levain.consent.limits.check` needs a ConsentQueue the broker does not have, so over-limit stands until
   the operator changes the limits the callable returns.
 - Halt is read before the count (a halted call counts nothing), as Codex's local gate reads its halt first. GATE
-  takes a token from the slot's ANSWER? bucket.
+  takes a token from the slot's own GATE bucket (:data:`GATE_RATE`, :data:`GATE_BURST`), never ANSWER?'s.
 
 THE TYPED CONTRACT GRANT (F4, W2-c2; W2C_DESIGN §1, §3, §4, §8). A REQUEST may carry, beside ``request``, a ``grant``
 member ``{paths, input}``. The broker recomputes the request's ``pb1:`` digest from it and refuses
@@ -119,7 +119,8 @@ from levain.qbroker.seam import answer_refusal, grant_allow_refusal, request_of
 from levain.qbroker.signers import SignersSnapshot, SignersSource
 from levain.qbroker.store import ANSWER_ROW_FORMAT, REQUEST_ROW_FORMAT, QueueStore, valid_request_id
 
-__all__ = ["ANSWER_BURST", "ANSWER_RATE", "CAP_MAX", "KINDS", "PENDING_PER_SESSION", "QUOTA_PER_RUN",
+__all__ = ["ANSWER_BURST", "ANSWER_RATE", "CAP_MAX", "GATE_BURST", "GATE_RATE",
+           "KINDS", "PENDING_PER_SESSION", "QUOTA_PER_RUN",
            "RECEIVED_SKEW", "RESOLVE_TTL", "RUN_KEYS", "RUN_OPTIONAL_KEYS", "SLOT_CLASS", "Broker", "Resolved",
            "Resolver", "resolved_from", "slot_ref", "stored_request"]
 
@@ -144,6 +145,10 @@ PENDING_PER_SESSION = 4
 # and deny when its hold ends)
 ANSWER_RATE = 20.0
 ANSWER_BURST = 40
+# the GATE verb's own per-slot bucket: GATE runs on every PreToolUse and Claude Code issues tool calls in parallel, so
+# it never shares ANSWER?'s; a larger burst for a parallel batch (the client retries a rate-limited GATE, bounded)
+GATE_RATE = 50.0
+GATE_BURST = 120
 # how long a QUEUE-RESOLVE answer (a refusal too) is reused for one (slot, cap digest): a revoked cap is served
 # for at most this long after CONTROL revokes it
 RESOLVE_TTL = 2.0
@@ -260,7 +265,8 @@ class Broker:
                  monotonic: Callable[[], float] = time.monotonic,
                  ssh_keygen: Path | str | None = None, quota: int = QUOTA_PER_RUN,
                  pending_cap: int = PENDING_PER_SESSION, answer_rate: float = ANSWER_RATE,
-                 answer_burst: int = ANSWER_BURST, resolve_ttl: float = RESOLVE_TTL,
+                 answer_burst: int = ANSWER_BURST, gate_rate: float = GATE_RATE, gate_burst: int = GATE_BURST,
+                 resolve_ttl: float = RESOLVE_TTL,
                  receipts: Receipts | None = None, contracts: Path | str | None = None,
                  contracts_owner: int | None = None, limits: LimitsSource | None = None) -> None:
         """``contracts``: the directory dispatch publishes signed contracts in (``L/contracts/``, CONTRACT §26 S1-b),
@@ -280,12 +286,14 @@ class Broker:
         self._quota = quota
         self._pending_cap = pending_cap
         self._rate, self._burst = answer_rate, answer_burst
+        self._gate_rate, self._gate_burst = gate_rate, gate_burst
         self._resolve_ttl = resolve_ttl
         # every dict below is touched under this mutex, for the update only, never across I/O
         self._mutex = threading.Lock()
         self._counts: dict[str, int] = {}
         self._pending: dict[str, dict[str, str]] = {}           # session -> {request_id: expires_at}
         self._buckets: dict[int, tuple[float, float]] = {}      # slot -> (tokens, at)
+        self._gate_buckets: dict[int, tuple[float, float]] = {}  # slot -> (tokens, at): GATE's own
         self._filing: dict[str, threading.Event] = {}          # request_id -> set when its filing ends
         self._resolved: OrderedDict[tuple[int, str], tuple[float, Resolved | str]] = OrderedDict()
         self._refused: OrderedDict[tuple[int, str], tuple[float, Resolved | str]] = OrderedDict()
@@ -428,15 +436,18 @@ class Broker:
                 cache.popitem(last=False)
         return got
 
-    def _take_token(self, slot: int) -> bool:
+    def _take_token(self, slot: int, *, gate: bool = False) -> bool:
+        """One token from the slot's ANSWER? bucket, or (``gate``) its own GATE bucket (:data:`GATE_RATE`)."""
         now = self._monotonic()
+        buckets, rate, burst = ((self._gate_buckets, self._gate_rate, self._gate_burst) if gate
+                                else (self._buckets, self._rate, self._burst))
         with self._mutex:
-            tokens, at = self._buckets.get(slot, (float(self._burst), now))
-            tokens = min(float(self._burst), tokens + (now - at) * self._rate)
+            tokens, at = buckets.get(slot, (float(burst), now))
+            tokens = min(float(burst), tokens + (now - at) * rate)
             if tokens < 1.0:
-                self._buckets[slot] = (tokens, now)
+                buckets[slot] = (tokens, now)
                 return False
-            self._buckets[slot] = (tokens - 1.0, now)
+            buckets[slot] = (tokens - 1.0, now)
             return True
 
     def _request(self, slot: int, rid: int, message: Mapping[str, Any]) -> dict[str, Any]:
@@ -683,7 +694,7 @@ class Broker:
 
     def _gate(self, slot: int, rid: int, message: Mapping[str, Any]) -> dict[str, Any]:
         """The GATE verb (module docstring): halted, over-limit or go for the resolved session's next call."""
-        if not self._take_token(slot):
+        if not self._take_token(slot, gate=True):
             return wire.refusal(rid, "rate-limited")
         who = self._resolve(slot, message.get("cap"))
         if isinstance(who, str):

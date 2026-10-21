@@ -175,6 +175,28 @@ def test_an_unusable_limits_directory_fails_closed_and_logs_once(L, resolver, cl
     assert [gate(make_broker(L, resolver, clock))["gate"]] == ["go"]   # no limits configured: never asked
 
 
+def test_parallel_gates_draw_their_own_bucket_never_answer_s(L, resolver, clock):
+    # F5 (s2b2_fix1_run/RUN_before.txt: a parallel batch past ANSWER_BURST was refused rate-limited and denied)
+    import threading
+    b = make_broker(L, resolver, clock, monotonic=lambda: 0.0)        # no refill: the burst is all there is
+    n = qbroker.ANSWER_BURST * 2
+    assert n <= qbroker.GATE_BURST
+    outs, barrier = [None] * n, threading.Barrier(n)
+
+    def one(i):
+        barrier.wait()
+        outs[i] = gate(b)
+    ts = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert [o.get("gate") for o in outs] == ["go"] * n
+    assert base.ask(b, "pend-none")["refused"] != "rate-limited"     # ANSWER?'s bucket was not drawn
+    rest = [gate(b) for _ in range(qbroker.GATE_BURST - n + 1)]
+    assert rest[-1]["refused"] == "rate-limited" and all(r["gate"] == "go" for r in rest[:-1])
+
+
 def test_a_receipts_read_that_fails_is_a_broker_error(L, broker, clock):
     t3(broker)
     clock["now"] = NOW + timedelta(minutes=6)
@@ -212,7 +234,13 @@ def test_gate_check_texts_and_one_retry():
     failed = broker_client.gate_check(Scripted([{"gate": "limits-failed", "reason": "disk full"}]), **kw)
     assert "disk full" in failed and "limits.db" in failed and "not a budget" in failed
     sleeps = []
-    assert broker_client.gate_check(Scripted(["rate-limited", {"gate": "go"}]), sleep=sleeps.append, **kw) is None
-    assert sleeps == [broker_client.REQUEST_RETRY]
-    with pytest.raises(BrokerError):
-        broker_client.gate_check(Scripted(["rate-limited", "rate-limited"]), sleep=lambda s: None, **kw)
+    assert broker_client.gate_check(Scripted(["rate-limited", "rate-limited", {"gate": "go"}]),
+                                    sleep=sleeps.append, **kw) is None
+    assert sleeps == list(broker_client.GATE_BACKOFF[:2])
+    sleeps.clear()
+    n = len(broker_client.GATE_BACKOFF)
+    with pytest.raises(BrokerError):     # bounded: one more refusal than there are pauses denies
+        broker_client.gate_check(Scripted(["rate-limited"] * (n + 1)), sleep=sleeps.append, **kw)
+    assert sleeps == list(broker_client.GATE_BACKOFF) and sum(sleeps) < 2.0
+    with pytest.raises(BrokerError):     # only rate-limited is retried
+        broker_client.gate_check(Scripted(["broker-error", {"gate": "go"}]), sleep=sleeps.append, **kw)
