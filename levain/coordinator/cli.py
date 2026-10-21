@@ -174,7 +174,7 @@ def _outcome_text(got: Any) -> str:
     text = f"coordinator launch {got.launch_id}: not started: {got.refusal}"
     if got.remedy:
         text += (f"\nrun this once and accept the trust prompt:\n  {got.remedy}\nthen the next drop starts a "
-                 "coordinator (or levain coord wake, then levain coord launch)")
+                 "coordinator, or levain coord wake starts one, once the wait levain coord status shows is over")
     return text
 
 
