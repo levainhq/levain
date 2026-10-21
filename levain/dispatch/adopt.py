@@ -63,7 +63,8 @@ from levain.contracts.canon import canonical_bytes
 from levain.dispatch import DispatchError
 from levain.dispatch import registry as dregistry
 from levain.dispatch.contract import _NO_GRAFT_FILE, ResolvedTemplate
-from levain.dispatch.jobs import EnvelopeRefused, Job, JobStore, SignatureRefused, TransitionRefused
+from levain.dispatch.jobs import (EnvelopeRefused, Job, JobStore, SignatureRefused, TransitionRefused,
+                                  envelope_evidence)
 from levain.dispatch.policy import ProviderPolicy
 from levain.dispatch.sign import FIELD_MAX, SIGNATURE_MAX
 
@@ -602,18 +603,16 @@ def criteria_failure(criteria: Iterable[tuple[str, Any]], changes: ChangeSet, *,
 
 # --- (C) the envelope (F11 §12, C0 §9) -----------------------------------------------------------------------------
 
-# the intent fields an envelope's evidence() returns (C0 §9 item 4)
-ENVELOPE_EVIDENCE_KEYS = frozenset({"envelope_id", "envelope_digest", "thread_id", "grant"})
-_GRANTS = ("source", "named")
-
-
 @runtime_checkable
 class Envelope(Protocol):
-    """Authority (C): the coordinator's envelope object for ONE job's land (C0 implements it; dispatch never imports
-    the coordinator). :func:`floor` asks :meth:`refusal` at step 6 with the change set it computed and the landing
-    tier it read (the tier check is the object's: the signer-class ceiling, C0 §5 C3); :func:`land` writes
-    :meth:`evidence` into the intent and hands :meth:`precondition` to :meth:`JobStore.authorise`, which runs it inside
-    its own ``BEGIN IMMEDIATE`` on that transaction's connection and clock, so the WHOLE predicate is judged at the
+    """Authority (C): the coordinator's envelope object (C0 implements it; dispatch never imports the coordinator).
+    It is the ONE input every envelope write takes (L3 r1 codex 3): :meth:`JobStore.file_in_envelope`,
+    :meth:`JobStore.take_slot` and :meth:`JobStore.authorise` read the binding from :meth:`evidence` inside their own
+    transaction, compare it to the job's filing binding, and run THIS object's :meth:`precondition` on that
+    transaction's connection and clock, so no second caller input can stand in for the pin or the check.
+    :func:`floor` asks :meth:`refusal` at step 6 with the change set it computed and the landing tier it read (the
+    tier check is the object's: the signer-class ceiling, C0 §5 C3); :func:`land` writes :meth:`evidence` into the
+    intent and hands the object itself to :meth:`JobStore.authorise`, so the WHOLE predicate is judged at the
     linearisation point, never only liveness."""
 
     def refusal(self, job: Job, onto: str, changes: ChangeSet, landing_tier: str) -> str | None:
@@ -622,26 +621,22 @@ class Envelope(Protocol):
         ...
 
     def evidence(self) -> dict[str, Any]:
-        """The intent's envelope fields: ``envelope_id``, ``envelope_digest``, ``thread_id``, ``grant``
-        (``"source"``/``"named"``)."""
+        """Exactly the intent's envelope fields: ``envelope_id`` (the filer launch's pin), ``envelope_digest``
+        (``sha256:`` + 64 lowercase hex), ``thread_id``, ``grant`` (``"source"``/``"named"``)
+        (:func:`levain.dispatch.jobs.envelope_evidence` checks the shape; anything else refuses)."""
         ...
 
-    def precondition(self, conn: Any, now: str) -> str | None:
-        """The whole predicate again, on the authorise transaction's connection and clock; ``None`` when it holds."""
+    def precondition(self, conn: Any, now: str, job: Job) -> str | None:
+        """The whole predicate again, on the write transaction's connection and clock, for ``job`` as that
+        transaction reads it (its repo and write list, its bound envelope and thread): liveness, inside ``where``,
+        the same thread, the criteria now. ``None`` when it holds."""
         ...
 
 
 def _envelope_evidence(envelope: Envelope) -> dict[str, Any] | str:
-    """The envelope's evidence checked to its shape, or the line saying why it is not that shape."""
-    ev = envelope.evidence()
-    if not isinstance(ev, dict) or set(ev) != ENVELOPE_EVIDENCE_KEYS:
-        return f"the envelope's evidence is not exactly {sorted(ENVELOPE_EVIDENCE_KEYS)}"
-    if not all(isinstance(ev[k], str) and ev[k] and len(ev[k]) <= FIELD_MAX for k in ENVELOPE_EVIDENCE_KEYS):
-        return f"every field of the envelope's evidence is 1 to {FIELD_MAX} characters of text"
-    if ev["grant"] not in _GRANTS:
-        return f"the envelope's grant is one of {list(_GRANTS)}"
-    return dict(ev)
-
+    """The envelope's evidence checked to its shape, or the line saying why it is not that shape (one checker, the
+    store's: :func:`levain.dispatch.jobs.envelope_evidence`)."""
+    return envelope_evidence(envelope)
 
 # --- the floor (F11 §4) --------------------------------------------------------------------------------------------
 
@@ -649,10 +644,11 @@ def _envelope_evidence(envelope: Envelope) -> dict[str, Any] | str:
 class Floor:
     """What the floor decided. ``failure`` is the first failing line (None when it passed); ``moved`` is True when
     that failure is MOVED BASE (the job then fails ``base_moved``); ``needs_sign`` is True when that failure is the
-    (C) authority missing (step 6: the job is not bound to this envelope, or the envelope refused), which a human
-    SIGN can supply, never an integrity or floor failure. On a pass, ``record``/``changes``/``tier`` are the run to
-    land, its change set and its landing tier, ``rule`` the (generation, index) of a rule that held, ``evidence``
-    the envelope's intent fields."""
+    (C) authority missing (step 6: the job is not bound to this envelope, or the envelope refused) AND step 7's
+    target checks passed, which a human SIGN can supply, never an integrity or floor failure. On a pass,
+    ``record``/``changes``/``tier`` are the run to land, its change set and its landing tier, ``rule`` the
+    (generation, index) of a rule that held, ``evidence`` the envelope's intent fields; on a MOVED BASE under (C),
+    ``evidence`` is set only when step 6 held."""
     failure: str | None
     moved: bool = False
     record: ArtifactRecord | None = None
@@ -781,7 +777,8 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
     their generation from one read, :func:`levain.dispatch.registry.adoption_rules_at`) or (C) (``envelope``, the
     coordinator's :class:`Envelope` object; exactly one of the three). The first failure decides. For (C) step 5
     (R0, contrast, entries) never runs and the tier is the object's to judge (F11 §12, C0 §5 C3); step 6 is the job's
-    filing binding naming this envelope and :meth:`Envelope.refusal` passing, and a failure there is ``needs_sign``.
+    filing binding naming this envelope and :meth:`Envelope.refusal` passing, and a failure there is ``needs_sign``
+    once step 7 passes (a target step 7 refuses is refused instead: a SIGN cannot fix it).
     Raises :class:`GitFault` when git cannot run, and :class:`levain.dispatch.control.ControlStateUnavailable` when
     ``rules`` cannot read the control store (a fault, never a refusal); whatever the envelope object raises
     propagates as the fault it is, before anything is written."""
@@ -860,23 +857,25 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
             return _refuse(failure)
         rule_ref = (generation, index)
     evidence: dict[str, Any] | None = None
+    unsigned: str | None = None          # step 6's missing (C) authority, said only once step 7 passes
     if envelope is not None:
         # 6. the envelope: resolved only through the job's filing binding, never from what the object says alone
         shaped = _envelope_evidence(envelope)
         if isinstance(shaped, str):
             return _refuse(shaped)
         if job.envelope_id is None:
-            return Floor(failure=f"job {job.id} was not filed inside an envelope; landing it needs a signature",
-                         needs_sign=True)
-        if (shaped["envelope_id"], shaped["thread_id"]) != (job.envelope_id, job.thread_id):
-            return Floor(failure=f"the envelope is not the one job {job.id} was bound to at filing "
-                                 f"({job.envelope_id}, thread {job.thread_id}); landing it needs a signature",
-                         needs_sign=True)
-        line = envelope.refusal(job, onto, changes, tier)
-        if line is not None:
-            return Floor(failure=str(line)[:500] or "the envelope refused this land", needs_sign=True)
-        evidence = shaped
-    # 7. the target
+            unsigned = f"job {job.id} was not filed inside an envelope; landing it needs a signature"
+        elif (shaped["envelope_id"], shaped["thread_id"]) != (job.envelope_id, job.thread_id):
+            unsigned = (f"the envelope is not the one job {job.id} was bound to at filing ({job.envelope_id}, "
+                        f"thread {job.thread_id}); landing it needs a signature")
+        else:
+            line = envelope.refusal(job, onto, changes, tier)
+            if line is not None:
+                unsigned = str(line)[:500] or "the envelope refused this land"
+            else:
+                evidence = shaped
+    # 7. the target. It runs even when step 6 found the (C) authority missing: a SIGN cannot fix a target this
+    # refuses, so its failure is returned instead of a needs_sign (L3 r1 complement 1, C0 §9 item 5)
     problem = branch_problem(repo, onto)
     if problem is not None:
         return _refuse(problem)
@@ -889,8 +888,11 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
             return _refuse(f"{onto} already contains run {r.run}'s staged commit, a merge Levain did not make "
                            "under an authority; it is not an adoption")
     if tip != record.base:
+        # under (C), ``evidence`` is set only when step 6 held: land fails the job then, and refuses otherwise
         return Floor(failure=f"MOVED BASE: {onto} is at {tip}, not the contract's base {record.base}", moved=True,
-                     record=record, changes=changes, tier=tier)
+                     record=record, changes=changes, tier=tier, evidence=evidence)
+    if unsigned is not None:
+        return Floor(failure=unsigned, needs_sign=True)
     return Floor(failure=None, record=record, changes=changes, tier=tier, rule=rule_ref, evidence=evidence)
 
 
@@ -1143,8 +1145,11 @@ def land(store: JobStore, job_id: str, *,
     ``envelope`` is (C), the coordinator's :class:`Envelope` for this job (Python API only: no CLI, MCP or phone verb
     passes one, F11 §12). Its intent is ``authority: "C"`` with the object's evidence under ``envelope``, cause
     ``envelope_rule``, and :meth:`Envelope.precondition` runs inside the authorise transaction; a missing (C)
-    authority, at the floor or in that transaction, is a ``needs_sign`` landing. A MOVED BASE under an envelope is
-    refused, the job kept, as under a rule."""
+    authority, at the floor or in that transaction, is a ``needs_sign`` landing, said only when the target passed
+    (a target the floor refuses is ``refused``: a SIGN cannot fix it). The object itself, never a separate hook, is
+    what :meth:`JobStore.authorise` judges. A MOVED BASE under the job's own envelope (floor step 6 held: the binding
+    names it and :meth:`Envelope.refusal` passes) FAILS the job, cause ``base_moved`` (C0 §5: the coordinator then
+    re-files); under an envelope that is not that authority it is refused and the job kept, as under a rule."""
     job = store.get(job_id)
     if job is None:
         raise TransitionRefused(f"no dispatch job {str(job_id)[:40]!r}")
@@ -1168,8 +1173,12 @@ def land(store: JobStore, job_id: str, *,
         if human is not None and verdict.record is not None and verdict.tier is not None and \
                 _human_refusal(store, job, human, verdict.record, verdict.tier) is None:
             return _fail_moved(store, job, line)
+        if envelope is not None and verdict.evidence is not None:
+            # the job's own envelope held at step 6: the result was judged on a base the target no longer reads
+            return _fail_moved(store, job, line)
         return Landing(outcome="refused", job=job, message=f"{line}; nothing was failed or deleted (only a verified "
-                                                            "authorisation fails a job on a moved base)")
+                                                            "authorisation or the job's own envelope fails a job on "
+                                                            "a moved base)")
     if verdict.failure is not None:
         return Landing(outcome="refused", job=job, message=verdict.failure)
     record, changes = verdict.record, verdict.changes
@@ -1186,7 +1195,7 @@ def land(store: JobStore, job_id: str, *,
             intent["envelope"] = verdict.evidence
             try:
                 job = store.authorise(job.id, cause="envelope_rule", evidence=json.dumps(intent, sort_keys=True),
-                                      precondition=envelope.precondition)
+                                      envelope=envelope)
             except EnvelopeRefused as exc:
                 return Landing(outcome="needs_sign", job=job, message=str(exc))
         elif human is not None:
