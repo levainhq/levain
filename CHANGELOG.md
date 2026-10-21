@@ -7,6 +7,31 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **Choice sign requests.** A caller can file one card with 2-8 options (`levain-sign-choice/1`). You tap one on the phone and sign it with your passkey; the signature covers the message with your choice as its last line, so a verifier reads the decision from the signed bytes, checked with stock `ssh-keygen -Y verify`.
+- **A link straight onto one card.** `#sign=<id>` on the phone page opens it on that request. `levain consent phone --link-file` writes the page and token for a caller building such a link; `--token-file` keeps the token across restarts, so links you already hold keep working.
+- **Opt out of signed answers.** `levain consent signed-answers --set off|authority-only|all` (default authority-only) is read by a caller before it files: off files nothing; authority-only signs only answers that authorise an act.
+- **`levain coord`: one coordinator at a time.** A drop that arrives while nobody holds the coordinator role asks for
+  a coordinator session; drops after it wait for that one. `levain coord status` shows who holds the role and what the
+  next drop would do, `levain coord take` holds it yourself, and `levain coord release` ends it. A session that lost
+  the role (it went quiet past its time, or you took over) has its thread changes refused. Splitting or re-titling by
+  hand now records you: `--by operator` is the default for `levain drops split` and `levain thread set`.
+
+### Known edges
+- Nothing answers a drop's request for a coordinator yet: each request waits 5 minutes, and after three unanswered
+  ones Levain stops asking until you run `levain coord take` or `levain coord release`.
+
+## [0.11.13] — 2026-10-20
+
+### Security
+- **A Codex patch could write a different file from the one Levain checked (0.11.0 to 0.11.12; upgrade to fix).**
+  Levain read the file names in a Codex `apply_patch` differently from Codex itself when a header line held an unusual
+  whitespace or line-break character: a tab, a carriage return inside the line, a form feed, U+2028 and a few others.
+  Codex then wrote to a file whose name Levain never saw, so a standing consent grant on one file could cover a write to
+  another, and with a tab, to a file outside the workspace (reproduced against Codex 0.162.1's own patch tool: it deleted
+  a file one directory up). Levain now reads those headers the way Codex does, and a patch whose header holds any such
+  character comes to you as an ordinary consent request. Reading a very long header line also no longer stalls the hook.
+
+### Added
 - **`levain drop`: leave a message for your coordinator and go.** Your words are kept exactly as you typed them and
   authorise nothing. Each drop gets a drop receipt: one when it arrives, and one naming the threads it became (one
   intent per thread: work, ask, note or relay). Typed inside a git checkout, a drop records the repo and branch you

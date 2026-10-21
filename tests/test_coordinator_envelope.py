@@ -25,6 +25,14 @@ HOUR = timedelta(hours=1)
 BUDGET = {"tool_calls": 200, "tokens": 2_000_000, "dollars_cents": 500, "hours": 2}
 
 
+
+def _lease(store):
+    """The coordinator lease token for a test's coordinator steps: the operator takes the role (C3a), and holds it."""
+    held = store.coord_status()["lease"]
+    if held is not None and held["live"] and held["holder"] == "operator":
+        return held["token"]
+    return store.coord_take()
+
 def _git(*a: str) -> str:
     cp = subprocess.run(["git", "-c", "user.email=r@x", "-c", "user.name=r", *a], capture_output=True, text=True,
                         check=True)
@@ -239,8 +247,8 @@ def test_kill_is_written_once_and_ends_liveness(ctx, structured_thread):
 
 def test_thread_done_writes_a_service_attenuation_and_ends_liveness(ctx, structured_thread):
     _d, b, t = structured_thread
-    ctx.store.set_state(t.thread_id, "working", by="coordinator")
-    ctx.store.set_state(t.thread_id, "done", by="coordinator")
+    ctx.store.set_state(t.thread_id, "working", by="coordinator", token=_lease(ctx.store))
+    ctx.store.set_state(t.thread_id, "done", by="coordinator", token=_lease(ctx.store))
     assert ctx.rows("SELECT kind, by FROM envelope_attenuations") == [("thread_done", "service")]
     msg = ctx.live(b["envelope_id"], t)
     assert msg is not None and "is done, which ended envelope" in msg
@@ -460,8 +468,9 @@ def test_a_worded_envelope_never_binds_an_ended_thread(ctx, state):
     # L1 HIGH 1: a bind after the end would never get a thread_done row, and a reopen would revive it
     d, t = ctx.plain_thread("tidy the docs")
     if state == "done":
-        ctx.store.set_state(t.thread_id, "working", by="coordinator")
-    ctx.store.set_state(t.thread_id, state, by="coordinator" if state == "done" else "operator")
+        ctx.store.set_state(t.thread_id, "working", by="coordinator", token=_lease(ctx.store))
+    ctx.store.set_state(t.thread_id, state, by="coordinator" if state == "done" else "operator",
+                        token=_lease(ctx.store) if state == "done" else None)
     t = ctx.store.thread(t.thread_id)
     _b, signed = ctx.worded(d, t, lands=[ctx.land("main")])
     with pytest.raises(CoordError, match="reopen it before signing"):

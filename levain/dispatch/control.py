@@ -5,8 +5,12 @@ rules are dispatch control state, and ONE rule covers all of it. Each change is 
 (:func:`levain.contracts.canon.canonical`)::
 
     {"format": "levain-dispatch-config/1", "store_id": "<32 hex>", "generation": <int>, "prev": "sha256:<hex>" | "",
-     "issued_at": "<UTC stamp>", "kind": "templates" | "verifiers" | "provider_policy" | "routemap" |
+     "issued_at": "<UTC stamp>", "kind": "templates" | "verifier" | "provider_policy" | "routemap" |
      "adoption_rules", "body": {...}}
+
+A stored item may also carry a kind of :data:`levain.dispatch.registry.LEGACY_KINDS` (Levain 0.11's ``verifiers``):
+it still parses, chains and verifies, so a store that holds one stays readable, but a new item of that kind is
+refused at accept and the registry reads nothing from it.
 
 signed by the operator in its own SSHSIG namespace (:data:`CONFIG_NAMESPACE`), so a configuration signature verifies
 as nothing else and nothing else verifies as one. The items form ONE chain over every kind (the authority log's
@@ -195,7 +199,7 @@ def parse_item(raw: Any) -> ConfigItem:
         parse_stamp(obj["issued_at"])
     except ConsentError:
         raise ConfigRefused("issued_at is a UTC stamp") from None
-    if obj["kind"] not in KINDS:
+    if obj["kind"] not in KINDS and obj["kind"] not in registry.LEGACY_KINDS:
         raise ConfigRefused(f"kind {str(obj['kind'])[:64]!r} is not one of {KINDS}")
     if canonical_bytes(obj) != raw:
         raise ConfigRefused("the configuration item is not in its canonical form")

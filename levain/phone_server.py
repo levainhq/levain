@@ -27,7 +27,8 @@ it serves only these:
     on its own thread (:func:`levain.consent.band.deliver_answer`), as a ruling is.
 
 A proxy the operator runs (``tailscale serve``) puts it on an https name. Every data route needs this server's own
-token (``X-Levain-Phone-Token``), printed once in the phone link's fragment; it is not the cockpit's write token and
+token (``X-Levain-Phone-Token``), printed in the phone link's fragment (new each run, unless ``--token-file`` keeps
+it; delete that file to make a new one); it is not the cockpit's write token and
 opens nothing on the cockpit. The https name is configured, never read from a request: it is the WebAuthn rpId, and a
 passkey enrolled on it signs that name's hash, which ssh-keygen checks against the key's application.
 
@@ -41,11 +42,13 @@ import base64
 import hashlib
 import hmac
 import ipaddress
+import os
 import json
 import re
 import secrets
 import shlex
 import sqlite3
+import stat
 import sys
 import threading
 from datetime import datetime, timezone
@@ -971,8 +974,33 @@ def tailscale_name(timeout: float = 5.0) -> "tuple[str | None, str]":
     return None, why
 
 
+def _kept_token(path: Path) -> str:
+    """``--token-file``: the token kept in ``path`` (a regular file, never through a symlink), else a new one written
+    there (0600, whole, never over a file that appeared meanwhile). :class:`ValueError` for a file holding no
+    usable token."""
+    from levain.consent.sign import _read_bytes, _write_new
+
+    try:
+        st = os.lstat(path)
+        if stat.S_ISREG(st.st_mode) and st.st_mode & 0o077:
+            raise ValueError(f"--token-file: {path} is readable by others (mode {st.st_mode & 0o777:o}): chmod 600 it")
+        token = _read_bytes(path).decode("utf-8").strip()
+    except FileNotFoundError:
+        token = secrets.token_urlsafe(32)
+        _write_new(path, token + "\n")
+        return token
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"--token-file: cannot read {path}: {exc}") from None
+    if re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token) is None:
+        raise ValueError(f"--token-file: {path} holds no token (32-128 of [A-Za-z0-9_-])")
+    return token
+
+
 def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port: int,
-                     sign_namespaces: "tuple[str, ...]" = ()) -> int:
+                     sign_namespaces: "tuple[str, ...]" = (), link_file: Path | None = None,
+                     token_file: Path | None = None) -> int:
     """``levain consent phone``: serve the phone port until interrupted."""
     if name is None:
         if not tailscale:
@@ -982,8 +1010,12 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
         if name is None:
             print(f"--tailscale: {why}", file=sys.stderr)
             return 2
+    if link_file is not None and token_file is not None and link_file.resolve() == token_file.resolve():
+        print("--link-file and --token-file are one file: the link would overwrite the kept token", file=sys.stderr)
+        return 2
     try:
-        httpd = make_phone_server(queue_dir, name, port=port, sign_namespaces=sign_namespaces)
+        token = _kept_token(token_file) if token_file is not None else None
+        httpd = make_phone_server(queue_dir, name, port=port, token=token, sign_namespaces=sign_namespaces)
     except (ValueError, OSError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -996,11 +1028,46 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
 
         print(f"  signs requests in {sign_dir(queue_dir)} in namespace(s) {', '.join(sign_namespaces)}", flush=True)
     page = f"http://localhost:{bound}/" if name == "localhost" else f"https://{name}/"
-    print(f"  open on the phone (a secret; it dies when this stops): {page}#phone_token={httpd.phone_token}", flush=True)
+    lives = (f"it is kept in {token_file} across restarts: delete that file to make a new one" if token_file is not None
+             else "it dies when this stops")
+    print(f"  open on the phone (a secret; {lives}): {page}#phone_token={httpd.phone_token}", flush=True)
+    import signal
+
+    def _stop(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt        # a service stop (TERM) unwinds like Ctrl+C, so the link file goes
+
+    # TERM only, and only on the main thread (the only one signal handlers run on); HUP is left as inherited, so a
+    # server started under nohup keeps running when its terminal closes. Installed before the link file is written.
+    before = (signal.signal(signal.SIGTERM, _stop)
+              if link_file is not None and threading.current_thread() is threading.main_thread() else None)
     try:
+        if link_file is not None:
+            # for a caller that links straight onto one sign request's card (levain.consent.sign.deep_link)
+            from levain.consent.sign import _write_over
+
+            try:
+                _write_over(link_file, json.dumps({"page": page, "phone_token": httpd.phone_token,
+                                                   "pid": os.getpid()}) + "\n")
+            except OSError as exc:
+                print(f"--link-file: cannot write {link_file}: {exc.strerror or exc}", file=sys.stderr)
+                return 1
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         httpd.server_close()
+        if link_file is not None:
+            _drop_link_file(link_file)
+        if before is not None:
+            signal.signal(signal.SIGTERM, before)
     return 0
+
+
+def _drop_link_file(path: Path) -> None:
+    """``--link-file`` removed when this run stops, so no caller builds a link to a server that is gone; left alone
+    when it names another run (a later server wrote it). A kill -9 or a crash leaves it: a caller checks its pid."""
+    try:
+        if json.loads(path.read_text(encoding="utf-8")).get("pid") == os.getpid():
+            path.unlink()
+    except (OSError, ValueError, AttributeError):
+        pass
