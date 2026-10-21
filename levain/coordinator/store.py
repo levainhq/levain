@@ -330,12 +330,13 @@ class CoordStore:
         conn = self._jobs._connect()
         if not self._ready:
             from levain.coordinator.lease import LEASE_SCHEMA
+            from levain.coordinator.teamdrafts import DRAFT_SCHEMA
 
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     # the lease is checked by every opener's coordinator writes, so its tables are every opener's
-                    for stmt in (*self._SCHEMA, *LEASE_SCHEMA):
+                    for stmt in (*self._SCHEMA, *LEASE_SCHEMA, *DRAFT_SCHEMA):
                         conn.execute(stmt)
                     conn.execute("COMMIT")
                 except BaseException:
@@ -361,6 +362,13 @@ class CoordStore:
                 # the write and its record commit together: a write that rolls back leaves no "it wrote" behind
                 record_write(conn, now, fence(conn, now, token))
             yield conn, now
+
+    def _keep_awake(self) -> None:
+        """After a thread's state or the lease moves: hold the host awake exactly while a work thread works (C7). Run
+        outside the write transaction, and never raises."""
+        from levain.coordinator import awake
+
+        awake.sync(self)
 
     def _stamp(self) -> str:
         now = self._clock()
@@ -581,7 +589,9 @@ class CoordStore:
                     self._ended(conn, thread_id, now)
             if state == "done" and t.kind != "work":
                 self._close(conn, thread_id, f"{t.kind} closes itself once done", "service", now)
-            return self._thread(conn, thread_id)
+            result = self._thread(conn, thread_id)
+        self._keep_awake()
+        return result
 
     def set_field(self, thread_id: str, field: str, value: str, *, by: str = "operator", cause: str = "",
                   token: object = None) -> Thread:
@@ -644,7 +654,9 @@ class CoordStore:
 
         by = self._actor(by, ("coordinator", "service"))
         with self._write() as (conn, now):
-            return lease.beat(conn, now, token, by=by)
+            held = lease.beat(conn, now, token, by=by)
+        self._keep_awake()
+        return held
 
     def coord_service_beat(self, token: int) -> Any:
         """The watcher's beat (:func:`levain.coordinator.lease.service_beat`): None when the holder has not written

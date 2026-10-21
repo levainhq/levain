@@ -504,22 +504,25 @@ def test_the_coordinator_install_pre_approves_its_own_three_verbs_and_a_reused_i
         assert inst.persisted_role(target) is None, body
 
 
-def test_a_session_levain_launched_keeps_to_the_coordinators_door(store, qdir, capsys, monkeypatch):
-    # the pre-approved trees grant nothing only if a launched session cannot write as the operator (L3 r1 codex HIGH)
+def test_a_session_levain_launched_keeps_to_the_coordinators_door(store, qdir, workdir, capsys, monkeypatch):
+    # the pre-approved trees grant nothing only if a launched session cannot write as the operator (L3 r1 codex HIGH);
+    # the session runs in the launch's directory, the coordinator's workspace, and that is what the door reads
     launch_id = woken(store)
     _, why = store.launch_activate(launch_id, harness_session_id="sess-coord")
     assert why is None
     key = store.launch_by_harness_session("sess-coord").session_key
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-coord")
+    (workdir / ".levain").mkdir()
+    (workdir / ".levain" / "config.json").write_text('{"role": "coordinator"}\n')
+    monkeypatch.chdir(workdir)
     tok = json.loads(_main(qdir, capsys, "coord", "claim", "--launch", launch_id, "--session", key, "--json").out)
     _main(qdir, capsys, "thread", "list")
     for argv in (("coord", "take"), ("coord", "wake"), ("coord", "agent", "none"),
                  ("coord", "release", "--token", str(tok["token"]))):
         out = _main(qdir, capsys, *argv, rc=1)
-        assert "session Levain launched" in out.err, (argv, out.err)
+        assert "the coordinator's workspace" in out.err, (argv, out.err)
     _main(qdir, capsys, "coord", "release", "--by", "coordinator", "--token", str(tok["token"]))
-    # the operator's own session is not a launch: its take stands
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-operator")
+    # the operator, outside that workspace: his take stands
+    monkeypatch.chdir(workdir.parent)
     _main(qdir, capsys, "coord", "take")
 
 
