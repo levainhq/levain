@@ -163,6 +163,44 @@ def test_wire_args_checked(env, args, name):
         assert ans["refused"] == name
 
 
+@pytest.mark.skipif(not hasattr(__import__("levain.qbroker.broker", fromlist=["x"]), "RUN_OPTIONAL_KEYS"),
+                    reason="LAND ORDER (L3 r1 codex HIGH): this tree's broker takes exactly five run keys and reads a "
+                           "repo_root answer as resolve-malformed; W2-c2 (seat/1020-44-w2c2) adds repo_root as optional. "
+                           "Runs once both are on one tree.")
+def test_dispatch_answer_resolves_through_the_brokers_own_client(env, resolver):
+    to_rendered(env, S2)
+    as_dispatch(env, S2)
+    env.facts[S2] = dict(FACTS)
+    got = resolver.queue_resolve(slot_ref(0), cap_digest(cap_of(env, S2)))
+    assert got == Resolved(session=S2, kind="dispatch", run={**FACTS, "repo_root": f"/var/levain/live/{S2}/repo"})
+
+
+def test_run_facts_are_relayed_from_one_snapshot(env):
+    """L3 r1 (codex MED): a seam handing back a live mapping that changes after the check must not get the change
+    relayed; CONTROL copies once, checks the copy, answers from the copy."""
+    to_rendered(env, S2)
+    as_dispatch(env, S2)
+
+    class Shifty(dict):
+        reads = 0
+
+        def __getitem__(self, k):
+            Shifty.reads += 1
+            if Shifty.reads > len(FACTS) and k == "contract_digest":
+                return "not-a-digest"
+            return super().__getitem__(k)
+    env.facts[S2] = Shifty(FACTS)
+    ans = env.client("qbroker").ask("QUEUE-RESOLVE", slot=slot_ref(0), cap_digest=cap_digest(cap_of(env, S2)))
+    assert ans["ok"] and ans["run"]["contract_digest"] == FACTS["contract_digest"]
+
+
+@pytest.mark.parametrize("kw", [{"qbroker_uid": -5}, {"host": "freebsd"}])
+def test_bad_construction_refused(kw, tmp_path):
+    with pytest.raises(C.Refused) as e:
+        C.Control(C.StateStore(tmp_path), ROLE_UID["op"], **kw)
+    assert e.value.name == "bad-config"
+
+
 def test_cap_dies_with_the_lease(env, resolver):
     op, _root = to_rendered(env, S1)
     digest = cap_digest(cap_of(env, S1))
