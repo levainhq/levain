@@ -845,7 +845,7 @@ def run_split(args: argparse.Namespace, out: Any = None) -> int:
                 raise CoordError("--about applies to a new ask, note or relay thread; this split names none")
             parts = [Part(p.kind, p.title, about=None if p.kind == "work" else args.about) for p in parts]
         parts += [_parse_attach(a) for a in args.attach]
-        threads = store.split(args.drop_id, parts, by=args.by)
+        threads = store.split(args.drop_id, parts, by=args.by, token=args.token)
     except _REFUSED as exc:
         print(f"levain drops split: {exc}", file=sys.stderr)
         return 1
@@ -909,24 +909,80 @@ def run_thread(args: argparse.Namespace, out: Any = None) -> int:
             _emit(out, args.json, obj, text)
             return 0
         if cmd == "state":
-            t = store.set_state(args.thread_id, args.state, by=args.by, cause=args.cause)
+            t = store.set_state(args.thread_id, args.state, by=args.by, cause=args.cause, token=args.token)
         elif cmd == "merge":
-            t = store.merge(args.into, args.other, by=args.by)
+            t = store.merge(args.into, args.other, by=args.by, token=args.token)
         elif cmd == "detach":
-            t = store.detach(args.thread_id, args.drop_id, by=args.by)
+            t = store.detach(args.thread_id, args.drop_id, by=args.by, token=args.token)
         elif cmd == "add":
             if args.about is not None and args.attach:
                 raise CoordError("--about names what a NEW thread concerns; an attach joins an existing one")
             part = _parse_attach(args.attach) if args.attach else _parse_part(args.thread)
             if args.about is not None:
                 part = Part(part.kind, part.title, about=args.about)
-            t = store.add(args.drop_id, part, by=args.by)
+            t = store.add(args.drop_id, part, by=args.by, token=args.token)
         else:   # set
-            t = store.set_field(args.thread_id, args.field, args.value, by=args.by, cause=args.cause)
+            t = store.set_field(args.thread_id, args.field, args.value, by=args.by, cause=args.cause,
+                                token=args.token)
     except _REFUSED as exc:
         print(f"levain thread {args.thread_cmd}: {exc}", file=sys.stderr)
         return 1
     _emit(out, args.json, _thread_row(t), _thread_line(t))
+    return 0
+
+
+def _lease_line(lease: Any) -> str:
+    if lease is None:
+        return "lease: nobody holds the coordinator role"
+    live = "live" if lease["live"] else "past its until"
+    return f"lease: {lease['holder']} holds it until {lease['until']} ({live}), token {lease['token']}"
+
+
+def run_coord(args: argparse.Namespace, out: Any = None) -> int:
+    out = out or sys.stdout
+    cmd = args.coord_cmd
+    try:
+        store = _store(args)
+        if cmd == "take":
+            hold = None
+            if args.hold is not None:
+                m = _DURATION.fullmatch(args.hold.strip())
+                if m is None or not (m.group(1) or m.group(2)):
+                    raise CoordError(f"--for is a duration like 30m or 2h (got {args.hold[:40]!r})")
+                hold = timedelta(hours=int(m.group(1) or 0), minutes=int(m.group(2) or 0))
+            tok = store.coord_take(hold)
+            _emit(out, args.json, {"token": tok}, f"you hold the coordinator role, token {tok}")
+            return 0
+        if cmd == "release":
+            ended = store.coord_release(args.token, by=args.by)
+            _emit(out, args.json, {"ended": None if ended is None else ended.token},
+                  "nobody held the lease; recorded that you looked" if ended is None
+                  else f"released token {ended.token} ({ended.holder})")
+            return 0
+        if cmd == "beat":
+            held = store.coord_beat(args.token)
+            _emit(out, args.json, {"token": held.token, "until": held.until},
+                  f"token {held.token} held until {held.until}")
+            return 0
+        if cmd == "claim":
+            tok = store.coord_claim(args.launch, args.session)
+            _emit(out, args.json, {"token": tok}, f"claimed: token {tok}")
+            return 0
+        if cmd == "wake":
+            ln = store.coord_wake()
+            st = store.coord_status()
+            _emit(out, args.json, st, (f"asked for coordinator launch {ln.launch_id}" if ln is not None
+                                       else f"no launch asked for: {st['why']}"))
+            return 0
+        st = store.coord_status()
+    except _REFUSED as exc:
+        print(f"levain coord {cmd}: {exc}", file=sys.stderr)
+        return 1
+    lines = [_lease_line(st["lease"]), f"next drop: {st['wake']} ({st['why']})"]
+    for ln in st["launches"]:
+        lines.append(f"  {ln['launch_id']}  {ln['role']}  {ln['harness']}  {ln['state']} ({ln['cause']})  "
+                     f"session {ln['session_key']}  asked {ln['at']}")
+    _emit(out, args.json, st, "\n".join(lines))
     return 0
 
 
@@ -936,6 +992,11 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     def common(p: argparse.ArgumentParser) -> None:
         p.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, help=qdir_help)
         p.add_argument("--json", action="store_true", help="Machine-readable output.")
+
+    def token(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--token", type=int, default=None,
+                       help="With --by coordinator: the coordinator lease's token (levain coord status shows it); "
+                            "the write is refused unless that token is the live lease's.")
 
     d = subparsers.add_parser(
         "drop", help="Drop words for the coordinator and go (kept verbatim; never authority).", allow_abbrev=False,
@@ -971,7 +1032,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     sp.add_argument("--about", default=None, metavar="THREAD",
                     help="The work thread each new ask/note/relay thread here concerns, or @N for this split's own "
                          "N-th --thread.")
-    sp.add_argument("--by", default="coordinator", choices=("coordinator", "operator"))
+    sp.add_argument("--by", default="operator", choices=("operator", "coordinator"))
+    token(sp)
     common(sp)
     sp.set_defaults(func=run_split)
 
@@ -997,17 +1059,20 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     tst.add_argument("thread_id")
     tst.add_argument("state", choices=STATES)
     tst.add_argument("--by", default="operator", choices=("operator", "coordinator"))
+    token(tst)
     tst.add_argument("--cause", default="")
     common(tst)
     tm = t_sub.add_parser("merge", help="Fold OTHER into INTO (one intent the split cut in two).")
     tm.add_argument("into")
     tm.add_argument("other")
     tm.add_argument("--by", default="operator", choices=("operator", "coordinator"))
+    token(tm)
     common(tm)
     td = t_sub.add_parser("detach", help="Take a drop out of a thread (it must stay in another).")
     td.add_argument("thread_id")
     td.add_argument("drop_id")
     td.add_argument("--by", default="operator", choices=("operator", "coordinator"))
+    token(td)
     common(td)
     ta = t_sub.add_parser("add", help="Put an already-split drop into one more thread.")
     ta.add_argument("drop_id")
@@ -1016,16 +1081,41 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     g.add_argument("--attach", metavar="KIND:THREAD")
     ta.add_argument("--about", default=None, metavar="THREAD")
     ta.add_argument("--by", default="operator", choices=("operator", "coordinator"))
+    token(ta)
     common(ta)
     tf = t_sub.add_parser("set", help="Re-kind, re-title or set the repo of a thread.")
     tf.add_argument("thread_id")
     tf.add_argument("field", choices=("kind", "title", "repo"))
     tf.add_argument("value")
-    tf.add_argument("--by", default="coordinator", choices=("coordinator", "operator"))
+    tf.add_argument("--by", default="operator", choices=("operator", "coordinator"))
+    token(tf)
     tf.add_argument("--cause", default="")
     common(tf)
     for p in (tl, ts, tst, tm, td, ta, tf):
         p.set_defaults(func=run_thread)
+
+    c = subparsers.add_parser(
+        "coord", help="The coordinator lease: who holds the coordinator role, and the sessions launched for it.",
+        description="One session holds the coordinator role at a time, or you do. Its writes carry the lease token "
+                    "and are refused once the lease is lost or past its until. A drop with no holder asks for a "
+                    "coordinator launch. Before S1 the lease is not authority: it decides whose thread writes count.")
+    c_sub = c.add_subparsers(dest="coord_cmd", required=True)
+    cs = c_sub.add_parser("status", help="Who holds the lease, what the next drop would do, the latest launches.")
+    ct = c_sub.add_parser("take", help="Hold the coordinator role yourself (voids every pending launch).")
+    ct.add_argument("--for", dest="hold", default=None, metavar="DURATION",
+                    help="How long you hold it (like 30m or 2h; default 30m).")
+    cr = c_sub.add_parser("release", help="End the lease (yours, or a session's: you looking after it).")
+    cr.add_argument("--by", default="operator", choices=("operator", "coordinator"))
+    token(cr)
+    cb = c_sub.add_parser("beat", help="The holder keeps the lease (moves its until on).")
+    cb.add_argument("--token", type=int, required=True)
+    cc = c_sub.add_parser("claim", help="An active coordinator session claims a lease nobody holds.")
+    cc.add_argument("--launch", required=True, metavar="LAUNCH_ID")
+    cc.add_argument("--session", required=True, metavar="SESSION_KEY")
+    cw = c_sub.add_parser("wake", help="Ask for a coordinator now, by the rules a drop runs (after a backoff).")
+    for p in (cs, ct, cr, cb, cc, cw):
+        common(p)
+        p.set_defaults(func=run_coord)
 
     e = subparsers.add_parser(
         "envelope", help="Thread envelopes: what the coordinator may do for a thread, signed by you.",

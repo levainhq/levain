@@ -12,10 +12,12 @@ from levain.dispatch import verifier_report as vr
 from levain.dispatch.verifier_report import REFUSALS, ReportRefused, VerifierRun, body_problem, check_envelope
 
 STEPS = ({"argv": ["python", "-m", "pytest", "-q"], "wall_s": 300}, {"argv": ["ruff", "check"], "wall_s": 60})
-ENTRY = {"verifier_id": "pytest-bb", "verifier_artifact_digest": "sha256:" + "b" * 64, "declared_kind": "black-box",
+ENTRY = {"verifier_id": "pytest-bb", "declared_kind": "black-box",
          "driver_template": "pytest_bb", "driver_template_digest": "sha256:" + "c" * 64,
          "steps_digest": "sha256:" + hashlib.sha256(canonical_bytes(list(STEPS))).hexdigest(),
          "driver_input_digest": "sha256:" + "d" * 64}
+# the artifact digest is the one formula's over the five fields (L3 r1 A): a fixture entry is a consistent one
+ENTRY["verifier_artifact_digest"] = vr.artifact_digest(ENTRY)
 EXIT = {"exit": 0, "signal": None, "wall_s": 12, "timed_out": False, "truncated_bytes": 0, "lingering_killed": 0}
 
 
@@ -209,6 +211,9 @@ def minted(steps=STEPS, *, digest=None, **over) -> VerifierRun:
     ``digest`` is given), so a case isolates the one thing it breaks."""
     entry = {**ENTRY, "steps_digest": digest or steps_digest(steps), **over}
     entry = {k: v for k, v in entry.items() if v is not ...}
+    if "verifier_artifact_digest" not in over and all(k in entry for k in vr.ARTIFACT_FIELDS):
+        # consistent with the changed fields, so the case breaks only what it names
+        entry["verifier_artifact_digest"] = vr.artifact_digest(entry)
     return VerifierRun(job_id="dj-" + "0" * 32, run=0, session="v-0", ticket="t-0", verifier=entry, steps=steps,
                        driver_input_digest=ENTRY["driver_input_digest"], input_bundle_digest="sha256:" + "e" * 64)
 
@@ -257,3 +262,47 @@ def test_a_minted_run_of_the_contracts_shape_has_no_problem():
 @pytest.mark.parametrize("note", ["passed\nFAIL: forged", "a\x00b", "ok ‮deliaf", "a\tb"])
 def test_a_note_that_cannot_show_as_itself_is_refused(note):
     assert (body_problem(body(steps=[{"step": 0, "verdict": "pass", "note": note}])) or (None,))[0] == "report-body"
+
+
+# --- W2-b L3 r1 A: the minted run's artifact digest is recomputed -------------------------------------------------
+
+def _forged(field: str) -> VerifierRun:
+    """A run that keeps ENTRY's verifier_artifact_digest while changing one field it is over; every other digest is
+    kept consistent (steps -> steps_digest; driver_input_digest -> the run's), so only the artifact digest can catch
+    it."""
+    entry, steps, did = dict(ENTRY), STEPS, ENTRY["driver_input_digest"]
+    if field == "driver_template":
+        entry["driver_template"] = "evil"
+    elif field == "driver_template_digest":
+        entry["driver_template_digest"] = "sha256:" + "a" * 64
+    elif field == "steps":
+        steps = ({"argv": ["true"], "wall_s": 1}, {"argv": ["true"], "wall_s": 1})
+        entry["steps_digest"] = steps_digest(steps)
+    elif field == "driver_input_digest":
+        did = entry["driver_input_digest"] = "sha256:" + "7" * 64
+    elif field == "declared_kind":
+        entry["declared_kind"] = "in-process"
+    assert entry["verifier_artifact_digest"] == ENTRY["verifier_artifact_digest"]
+    return VerifierRun(job_id="dj-" + "0" * 32, run=0, session="v-0", ticket="t-0", verifier=entry, steps=steps,
+                       driver_input_digest=did, input_bundle_digest="sha256:" + "e" * 64)
+
+
+@pytest.mark.parametrize("field", ["driver_template", "driver_template_digest", "steps", "driver_input_digest",
+                                   "declared_kind"])
+def test_a_run_that_keeps_the_artifact_digest_while_changing_what_it_pins_is_refused(field):
+    assert set(vr.ARTIFACT_FIELDS) == {"driver_template", "driver_template_digest", "steps_digest",
+                                       "driver_input_digest", "declared_kind"}
+    run = _forged(field)
+    assert vr.run_problem(run) == "the entry's verifier_artifact_digest is not the digest of what runs"
+    raw, digest = envelope(run)           # an envelope that echoes the forged entry back, with a pass body
+    assert refused_name(raw, digest, run) == "verifier-entry"
+
+
+def test_the_registry_and_the_run_check_share_one_formula():
+    from levain.dispatch import registry
+
+    assert registry.verifier_artifact_digest is vr.artifact_digest
+    five = {k: ENTRY[k] for k in vr.ARTIFACT_FIELDS}
+    assert vr.artifact_digest(ENTRY) == "sha256:" + hashlib.sha256(canonical_bytes(five)).hexdigest()
+    with pytest.raises(KeyError):
+        vr.artifact_digest({k: ENTRY[k] for k in vr.ARTIFACT_FIELDS[1:]})

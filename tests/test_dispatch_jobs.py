@@ -1025,6 +1025,7 @@ def staged_refs(repo, job) -> list[str]:
 
 def test_every_run_passing_verifies_the_job_and_the_records_read_back(store, repo):
     from levain.dispatch.adopt import artifact_digest, artifact_problem, staged_ref
+    from tests import test_dispatch_verifier_report as tvr
     from tests.test_dispatch_contract import git
 
     job, _ = at_state(store, repo, "verifying")
@@ -1035,7 +1036,8 @@ def test_every_run_passing_verifies_the_job_and_the_records_read_back(store, rep
     recs = store.run_records(job.id)
     assert [r.run for r in recs] == [0, 1]
     for r in recs:
-        assert r.verifier == {"id": "pytest-bb", "hash": "sha256:" + "b" * 64, "kind": "black-box", "result": "pass"}
+        assert r.verifier == {"id": "pytest-bb", "hash": tvr.ENTRY["verifier_artifact_digest"], "kind": "black-box",
+                              "result": "pass"}
         assert r.verified_at == VERIFIED_AT and r.model == model(r.run)
         assert artifact_problem(str(repo[0]), done, r) is None
         assert git(repo[0], "rev-parse", staged_ref(job.id, r.run)) == r.staged_commit
@@ -1103,11 +1105,15 @@ def test_an_envelope_named_but_not_read_is_report_missing(store, repo):
 
 
 def test_a_minted_verifier_that_is_not_the_templates_is_refused_before_staging(store, repo):
+    from levain.dispatch import verifier_report as vr
     from levain.dispatch.jobs import NOT_THE_TEMPLATES
     from tests import test_dispatch_verifier_report as tvr
 
     job, _ = at_state(store, repo, "verifying")
-    out = verify(store, repo, job, 0, entry={**tvr.ENTRY, "verifier_artifact_digest": "sha256:" + "f" * 64})
+    # a consistent entry (its artifact digest recomputed) for another artifact than the template pins
+    other = {**tvr.ENTRY, "driver_template_digest": "sha256:" + "f" * 64}
+    other["verifier_artifact_digest"] = tvr.vr.artifact_digest(other)
+    out = verify(store, repo, job, 0, entry=other)
     assert (out.state, out.history[-1].cause, out.history[-1].evidence) == ("failed", "verifier_refused",
                                                                              NOT_THE_TEMPLATES)
     assert staged_refs(repo, job) == [] and store.run_records(job.id) == []
@@ -1120,7 +1126,9 @@ def test_each_identity_field_of_the_entry_is_checked(tmp_path, clock, repo, fiel
 
     store = new_store(tmp_path, clock)
     job, _ = at_state(store, repo, "verifying")
-    out = verify(store, repo, job, 0, entry={**tvr.ENTRY, field: value})
+    entry = {**tvr.ENTRY, field: value}
+    entry["verifier_artifact_digest"] = tvr.vr.artifact_digest(entry)     # consistent: only the identity differs
+    out = verify(store, repo, job, 0, entry=entry)
     assert out.history[-1].evidence == NOT_THE_TEMPLATES
 
 

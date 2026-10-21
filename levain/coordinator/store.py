@@ -115,6 +115,11 @@ def _in(column: str, values: Sequence[str]) -> str:
 
 
 SCHEMA: tuple[str, ...] = (
+    # one store-wide order for every authority and event row: never wall-clock (C0 §3.4)
+    "CREATE TABLE IF NOT EXISTS gseq (gseq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL)",
+    *_append_only("gseq", "the sequence"),
+    "CREATE TRIGGER IF NOT EXISTS gseq_no_replace BEFORE INSERT ON gseq WHEN EXISTS (SELECT 1 FROM gseq WHERE "
+    "gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'the sequence is never replaced'); END",
     # a drop: your words verbatim; envelope_id arrives only with a structured envelope signed at send (C2), and
     # prior_envelope_id is written only by the S1 copy, as history
     "CREATE TABLE IF NOT EXISTS drops (drop_id TEXT PRIMARY KEY, "
@@ -160,6 +165,11 @@ SCHEMA: tuple[str, ...] = (
     "OR EXISTS (SELECT 1 FROM thread_events WHERE rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'an event is the next seq of its thread'); END",
 )
+
+
+def next_gseq(conn: sqlite3.Connection, now: str) -> int:
+    """The next number of the store-wide sequence, taken inside the caller's writing transaction."""
+    return conn.execute("INSERT INTO gseq (at) VALUES (?)", (now,)).lastrowid
 
 
 def members_sha256(members: Iterable[str]) -> str:
@@ -317,10 +327,13 @@ class CoordStore:
     def _connect(self) -> sqlite3.Connection:
         conn = self._jobs._connect()
         if not self._ready:
+            from levain.coordinator.lease import LEASE_SCHEMA
+
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
-                    for stmt in self._SCHEMA:
+                    # the lease is checked by every opener's coordinator writes, so its tables are every opener's
+                    for stmt in (*self._SCHEMA, *LEASE_SCHEMA):
                         conn.execute(stmt)
                     conn.execute("COMMIT")
                 except BaseException:
@@ -333,9 +346,18 @@ class CoordStore:
         return conn
 
     @contextmanager
-    def _write(self) -> Iterator[tuple[sqlite3.Connection, str]]:
+    def _write(self, by: str | None = None, token: object = None) -> Iterator[tuple[sqlite3.Connection, str]]:
+        """One write transaction. A write ``by`` the coordinator is fenced here, inside it: refused unless ``token``
+        is the live lease's (C0 §6). Your writes and the service's carry no token."""
+        if by != "coordinator" and token is not None:
+            raise CoordError("a lease token is the coordinator's; your own writes carry none")
         with write_transaction(self._connect) as conn:
-            yield conn, self._stamp()
+            now = self._stamp()
+            if by == "coordinator":
+                from levain.coordinator.lease import fence
+
+                fence(conn, now, token)
+            yield conn, now
 
     def _stamp(self) -> str:
         now = self._clock()
@@ -404,17 +426,27 @@ class CoordStore:
              source.how, envelope_id))
         self._reply(conn, None, "drop_receipt", "drops", drop_id,
                     {"stage": "delivered", "drop_id": drop_id, "outbox_id": outbox_id, **(receipt or {})}, now)
+        from levain.coordinator.lease import wake
+
+        # a drop with no coordinator asks for one, in its own transaction (C0 §6). A wake that fails rolls back to
+        # here and the drop is kept: your words are never lost to the coordinator's bookkeeping
+        conn.execute("SAVEPOINT coord_wake")
+        try:
+            wake(conn, now)
+        except Exception:  # noqa: BLE001 - any wake failure, never the drop: the words are kept
+            conn.execute("ROLLBACK TO coord_wake")
+        conn.execute("RELEASE coord_wake")
         return self._drop(conn, drop_id)
 
     # --- threads -------------------------------------------------------------------------------------------------
-    def split(self, drop_id: str, parts: Sequence[Part], *, by: str = "coordinator") -> list[Thread]:
+    def split(self, drop_id: str, parts: Sequence[Part], *, by: str = "operator", token: object = None) -> list[Thread]:
         """The drop's first split (T1): each part a new thread holding it, or the drop attached to an existing open
         thread. One transaction; writes the drop's ``split`` drop receipt. A drop already split is regrouped with
         :meth:`add`, :meth:`merge` or :meth:`detach` instead."""
         by = self._actor(by, ("coordinator", "operator"))
         if not parts:
             raise CoordError("a split names at least one thread")
-        with self._write() as (conn, now):
+        with self._write(by, token) as (conn, now):
             self._must_drop(conn, drop_id)
             if self._receipts(conn, drop_id, "split"):
                 raise CoordError(f"drop {drop_id} is already split; regroup it with add, merge or detach")
@@ -444,12 +476,12 @@ class CoordStore:
             self._split_done(conn, drop_id, touched, now)
             return [self._thread(conn, t) for t in touched]
 
-    def add(self, drop_id: str, part: Part, *, by: str = "operator") -> Thread:
+    def add(self, drop_id: str, part: Part, *, by: str = "operator", token: object = None) -> Thread:
         """Put an already-split drop into one more thread (a new one, or an existing open one): the receipt's one-tap
         fix for a split that missed an intent, and how a later drop joins work in flight. Writes a ``resplit``
         drop receipt."""
         by = self._actor(by, ("coordinator", "operator"))
-        with self._write() as (conn, now):
+        with self._write(by, token) as (conn, now):
             self._must_drop(conn, drop_id)
             if not self._receipts(conn, drop_id, "split"):
                 raise CoordError(f"drop {drop_id} has not been split yet; split it first")
@@ -459,7 +491,7 @@ class CoordStore:
             self._drop_receipt(conn, drop_id, "resplit", now)
             return self._thread(conn, thread_id)
 
-    def merge(self, into: str, other: str, *, by: str = "operator") -> Thread:
+    def merge(self, into: str, other: str, *, by: str = "operator", token: object = None) -> Thread:
         """Fold ``other`` into ``into`` (the receipt's one-tap fix for a split that cut one intent in two): ``into``
         gets the union of both memberships as a new revision, ``other`` a new, empty revision and is closed by the
         service, its cause naming ``into`` and who merged. Neither may be done or closed; they must share a kind and an
@@ -467,7 +499,7 @@ class CoordStore:
         by = self._actor(by, ("coordinator", "operator"))
         if into == other:
             raise CoordError("a thread cannot merge into itself")
-        with self._write() as (conn, now):
+        with self._write(by, token) as (conn, now):
             a, b = self._must_thread(conn, into), self._must_thread(conn, other)
             for t in (a, b):
                 if t.state in ("done", "closed"):
@@ -492,12 +524,12 @@ class CoordStore:
                 self._drop_receipt(conn, d, "resplit", now)
             return self._thread(conn, into)
 
-    def detach(self, thread_id: str, drop_id: str, *, by: str = "operator") -> Thread:
+    def detach(self, thread_id: str, drop_id: str, *, by: str = "operator", token: object = None) -> Thread:
         """Take one drop out of a thread (a new revision without it). A thread left with no drops is closed by the
         service, its cause naming who emptied it. The drop must stay in at least one other open or working thread: a
         drop is never left only in finished ones."""
         by = self._actor(by, ("coordinator", "operator"))
-        with self._write() as (conn, now):
+        with self._write(by, token) as (conn, now):
             self._must_drop(conn, drop_id)
             t = self._must_thread(conn, thread_id)
             if t.state in ("done", "closed"):
@@ -514,7 +546,7 @@ class CoordStore:
             self._drop_receipt(conn, drop_id, "resplit", now)
             return self._thread(conn, thread_id)
 
-    def set_state(self, thread_id: str, state: str, *, by: str, cause: str = "") -> Thread:
+    def set_state(self, thread_id: str, state: str, *, by: str, cause: str = "", token: object = None) -> Thread:
         """One T7 step, if :data:`_EDGES` lets ``by`` take it from the state read in this transaction. A thread that
         is not work closes itself (by the service) once done; a thread that holds no drops cannot be reopened."""
         if state not in STATES:
@@ -523,7 +555,7 @@ class CoordStore:
         # closing itself) are taken only inside the store's own operations
         by = self._actor(by, ("operator", "coordinator"))
         cause = self._cause(cause)
-        with self._write() as (conn, now):
+        with self._write(by, token) as (conn, now):
             t = self._must_thread(conn, thread_id)
             allowed = _EDGES.get((t.state, state))
             if allowed is None:
@@ -545,7 +577,8 @@ class CoordStore:
                 self._close(conn, thread_id, f"{t.kind} closes itself once done", "service", now)
             return self._thread(conn, thread_id)
 
-    def set_field(self, thread_id: str, field: str, value: str, *, by: str = "coordinator", cause: str = "") -> Thread:
+    def set_field(self, thread_id: str, field: str, value: str, *, by: str = "operator", cause: str = "",
+                  token: object = None) -> Thread:
         """Re-kind, re-title or re-scope (repo) a thread, recorded as an event; a done or closed thread is reopened first.
         A re-kind never crosses the work boundary (work stays work; ask, note and relay move among themselves): an
         intent that was misread is a new split, never a relabel. A kind or repo change also writes a new revision
@@ -554,7 +587,7 @@ class CoordStore:
             raise CoordError("set_field changes kind, title or repo")
         by = self._actor(by, ("coordinator", "operator"))
         cause = self._cause(cause)
-        with self._write() as (conn, now):
+        with self._write(by, token) as (conn, now):
             t = self._must_thread(conn, thread_id)
             if t.state in ("done", "closed"):
                 raise CoordError(f"thread {thread_id} is {t.state}; reopen it first")
@@ -573,6 +606,79 @@ class CoordStore:
             if field in ("kind", "repo"):
                 self._revise(conn, thread_id, t.members, "rescope", now)
             return self._thread(conn, thread_id)
+
+    # --- the lease and launches (C3a; levain.coordinator.lease holds the rules) -----------------------------------
+    def coord_status(self) -> dict[str, Any]:
+        """Who holds the coordinator lease, what the next drop would do, and the latest launches. Writes the lapse
+        of a lease past its until, so what it shows is what the store holds."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            lease._lapse_if_past(conn, now)
+            lease._expire_pending(conn, now)
+            return lease.status(conn, now)
+
+    def coord_take(self, hold: timedelta | None = None) -> int:
+        """You take the coordinator role: every pending launch is voided and you hold the lease. Your token."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.take(conn, now, hold=lease.LEASE_TTL if hold is None else hold)
+
+    def coord_release(self, token: int | None = None, *, by: str = "operator") -> Any:
+        """End the lease: you end whatever is held; the holder ends its own with its token."""
+        from levain.coordinator import lease
+
+        by = self._actor(by, ("operator", "coordinator"))
+        with self._write() as (conn, now):
+            return lease.release(conn, now, token, by=by)
+
+    def coord_beat(self, token: int, *, by: str = "coordinator") -> Any:
+        from levain.coordinator import lease
+
+        by = self._actor(by, ("coordinator", "service"))
+        with self._write() as (conn, now):
+            return lease.beat(conn, now, token, by=by)
+
+    def coord_claim(self, launch_id: str, session_key: str) -> int:
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.claim(conn, now, launch_id, session_key)
+
+    def coord_wake(self) -> Any:
+        """A wake with no drop (a retry after a backoff): the same rules a drop's transaction runs."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.wake(conn, now)
+
+    def launch_request(self, token: int, *, harness: str, role: str = "worker", threads: Sequence[str] = (),
+                       model: str | None = None, cwd: str | None = None) -> Any:
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.request_launch(conn, now, token, harness=harness, role=role, threads=threads, model=model,
+                                        cwd=cwd)
+
+    def launch_activate(self, launch_id: str, *, harness_session_id: str, argv_sha256: str | None = None) -> Any:
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.activate(conn, now, launch_id, harness_session_id=harness_session_id,
+                                  argv_sha256=argv_sha256)
+
+    def launch_end(self, launch_id: str, kind: str, cause: str) -> Any:
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.end_launch(conn, now, launch_id, kind, cause)
+
+    def launch(self, launch_id: str) -> Any:
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.launch(conn, launch_id)
 
     # --- reading -------------------------------------------------------------------------------------------------
     def drop(self, drop_id: str) -> Drop:
