@@ -107,6 +107,62 @@ def test_dispatch_run_seam_with_other_fields_refused(env):
     assert ans["refused"] == "run-malformed"
 
 
+@pytest.mark.parametrize("bad", [
+    {"run_index": True}, {"run_index": -1}, {"run_index": "0"}, {"run_id": ""}, {"job_id": 7},
+    {"contract_digest": "sha256:" + "A" * 64}, {"model_requested": 3},
+])
+def test_dispatch_run_values_checked(env, bad):
+    to_rendered(env, S2)
+    as_dispatch(env, S2)
+    env.facts[S2] = {**FACTS, **bad}
+    ans = env.client("qbroker").ask("QUEUE-RESOLVE", slot=slot_ref(0), cap_digest=cap_digest(cap_of(env, S2)))
+    assert ans["refused"] == "run-malformed"
+
+
+def test_dispatch_cap_on_another_slot_is_unknown_before_its_run_is_read(env):
+    """The slot check comes first: another slot's broker learns neither the kind nor whether a run is known."""
+    to_rendered(env, S2)
+    as_dispatch(env, S2)
+    asked = []
+    env.control._run_facts = lambda s: asked.append(s) or FACTS
+    ans = env.client("qbroker").ask("QUEUE-RESOLVE", slot=slot_ref(1), cap_digest=cap_digest(cap_of(env, S2)))
+    assert ans["refused"] == "cap-unknown" and asked == []
+    ans = env.client("qbroker").ask("QUEUE-RESOLVE", slot=slot_ref(0), cap_digest=cap_digest(cap_of(env, S2)))
+    assert ans["ok"] and asked == [S2]
+
+
+def test_a_kind_with_no_queue_refused(env):
+    to_rendered(env, S1)
+    rec = env.store.get(S1)
+    with env.store.lock(S1):
+        env.store.put(replace(rec, claims={**rec.claims, "kind": "login"}, generation=rec.generation + 1))
+    ans = env.client("qbroker").ask("QUEUE-RESOLVE", slot=slot_ref(0), cap_digest=cap_digest(cap_of(env, S1)))
+    assert ans["refused"] == "kind-not-queued"
+
+
+def test_a_record_past_the_live_states_is_unknown(env):
+    to_rendered(env, S1)
+    digest = cap_digest(cap_of(env, S1))
+    rec = env.store.get(S1)
+    with env.store.lock(S1):          # the record moved on while the handle was still held
+        env.store.put(replace(rec, state="REVOKED", generation=rec.generation + 1))
+    ans = env.client("qbroker").ask("QUEUE-RESOLVE", slot=slot_ref(0), cap_digest=digest)
+    assert ans["refused"] == "cap-unknown"
+
+
+@pytest.mark.parametrize("args,name", [
+    ({"slot": {"class": "egress", "index": True}, "cap_digest": "sha256:" + "0" * 64}, "wrong-type"),
+    ({"slot": {"class": "egress", "index": 0}, "cap_digest": 5}, "wrong-type"),
+    ({"slot": {"class": "egress", "index": 0}}, None),
+    ({"slot": {"class": "egress", "index": 0}, "cap_digest": "sha256:" + "0" * 64, "session": S1}, None),
+])
+def test_wire_args_checked(env, args, name):
+    ans = env.client("qbroker").ask("QUEUE-RESOLVE", **args)
+    assert ans["ok"] is False
+    if name is not None:
+        assert ans["refused"] == name
+
+
 def test_cap_dies_with_the_lease(env, resolver):
     op, _root = to_rendered(env, S1)
     digest = cap_digest(cap_of(env, S1))

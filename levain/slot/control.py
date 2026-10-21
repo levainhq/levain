@@ -32,9 +32,9 @@ import hashlib
 import hmac
 import os
 import re
-import sys
 import socket
 import struct
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -367,6 +367,19 @@ def _default_is_brokered(claims: Mapping[str, object]) -> bool:
     # lives in the route maps (§4.3), which CONTROL loads in session 3c. Until then the session's
     # registered `auth` stands for it: a brokered session's vendor route is its brokered route.
     return claims.get("auth") == "brokered"
+
+
+def _run_facts_ok(facts: object) -> bool:
+    """The run fields a seam hands ``QUEUE-RESOLVE``, exactly :data:`QUEUE_RUN_KEYS` with their §3.3 types: CONTROL
+    is the one author of what the broker is told, so it checks the values too, not only the names."""
+    if not isinstance(facts, Mapping) or set(facts) != QUEUE_RUN_KEYS:
+        return False
+    run_id, job_id, idx = facts["run_id"], facts["job_id"], facts["run_index"]
+    model, digest = facts["model_requested"], facts["contract_digest"]
+    return (type(run_id) is str and bool(run_id) and type(job_id) is str and bool(job_id)
+            and type(idx) is int and 0 <= idx <= R.JSON_INT_MAX
+            and type(digest) is str and _DIGEST_RE.fullmatch(digest) is not None
+            and (model is None or type(model) is str))
 
 
 def _keys_unavailable(*_a: object) -> None:
@@ -945,15 +958,19 @@ class Control:
 
     def _op_queue_resolve(self, conn: Conn, args: dict) -> dict[str, object]:
         """§3.3 ``QUEUE-RESOLVE``: the session whose queue cap has digest ``cap_digest`` and was minted for a
-        session on ``slot``. A cap lives only while its session's lease does (dropped at EOF and at REVOKED), so
-        a cap found is a live session's. DECISION: one refusal, ``cap-unknown``, for no such cap, a cap minted on
-        another slot, and a session past the live states, so the broker learns nothing of another slot's caps.
+        session on ``slot``. A cap is dropped at the lease's EOF and after a REVOKED write, so a cap found is a
+        session that was live when its record was read (a revoke landing during this verb can still be answered
+        once; the broker serves any answer up to its RESOLVE_TTL anyway). DECISION: one refusal, ``cap-unknown``,
+        for no such cap, a cap minted on another slot, and a session past the live states, so the broker learns
+        nothing of another slot's caps; every later refusal is reached only through this slot's own live cap.
         An interactive session answers ``{session, kind}``; a dispatch session adds ``run``: its bound ticket's
         fields (``run_facts``) plus ``repo_root``, which CONTROL derives from the session name, never from the
         caller (§26 S1-c). Any other kind holds no queue (``kind-not-queued``)."""
         slot = R.slot_obj(R._slot(args["slot"], "slot"))
         digest = args["cap_digest"]
-        if type(digest) is not str or _DIGEST_RE.fullmatch(digest) is None:
+        if type(digest) is not str:
+            raise Refused("wrong-type", "cap_digest is a string")
+        if _DIGEST_RE.fullmatch(digest) is None:
             raise Refused("bad-token", "cap_digest")
         with self._mu:
             found = [(s, h) for s, h in self._handles.items()
@@ -975,7 +992,7 @@ class Control:
         facts = self._run_facts(session)
         if facts is None:
             raise Refused("run-unknown")
-        if set(facts) != QUEUE_RUN_KEYS:
+        if not _run_facts_ok(facts):
             raise Refused("run-malformed")
         run: dict[str, object] = {k: facts[k] for k in sorted(QUEUE_RUN_KEYS)}
         run["repo_root"] = str(session_repo(self._host, session))
