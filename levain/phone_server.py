@@ -972,8 +972,28 @@ def tailscale_name(timeout: float = 5.0) -> "tuple[str | None, str]":
     return None, why
 
 
+def _kept_token(path: Path) -> str:
+    """``--token-file``: the token kept in ``path`` (a regular file, never through a symlink), else a new one written
+    there (0600, whole, never over a file that appeared meanwhile). :class:`ValueError` for a file holding no
+    usable token."""
+    from levain.consent.sign import _read_bytes, _write_new
+
+    try:
+        token = _read_bytes(path).decode("utf-8").strip()
+    except FileNotFoundError:
+        token = secrets.token_urlsafe(32)
+        _write_new(path, token + "\n")
+        return token
+    except Exception as exc:
+        raise ValueError(f"--token-file: cannot read {path}: {exc}") from None
+    if re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token) is None:
+        raise ValueError(f"--token-file: {path} holds no token (32-128 of [A-Za-z0-9_-])")
+    return token
+
+
 def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port: int,
-                     sign_namespaces: "tuple[str, ...]" = (), link_file: Path | None = None) -> int:
+                     sign_namespaces: "tuple[str, ...]" = (), link_file: Path | None = None,
+                     token_file: Path | None = None) -> int:
     """``levain consent phone``: serve the phone port until interrupted."""
     if name is None:
         if not tailscale:
@@ -984,7 +1004,8 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
             print(f"--tailscale: {why}", file=sys.stderr)
             return 2
     try:
-        httpd = make_phone_server(queue_dir, name, port=port, sign_namespaces=sign_namespaces)
+        token = _kept_token(token_file) if token_file is not None else None
+        httpd = make_phone_server(queue_dir, name, port=port, token=token, sign_namespaces=sign_namespaces)
     except (ValueError, OSError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
