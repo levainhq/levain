@@ -232,6 +232,28 @@ def test_dispatch_land_lands_a_planners_job_by_the_rule(lw):
     assert lw.main() == staged
 
 
+def test_dispatch_land_resolves_through_the_servers_launch_data_root(lw, monkeypatch):
+    # F11-s2b §9(1): the one dispatch_file uses, never a tool argument (the schema has none)
+    from levain.dispatch.adopt import Landing
+
+    job, cap = lw.verified()
+    seen: dict = {}
+
+    def fake(store, job_id, **kw):
+        seen.update(kw)
+        failed = lw.jstore._transition(job_id, "failed", "lease_lapsed")
+        return Landing(outcome="failed", job=failed, message="m")
+
+    monkeypatch.setattr(mcp, "land_job", fake)
+    out = mcp.handle("claude_code", {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                     "params": {"name": "dispatch_land",
+                                                "arguments": {"job": job.id, "onto": "main", "capability": cap}}},
+                     directory=lw.ddir, data_root=lw.root)["result"]
+    assert seen == {"onto": "main", "data_root": lw.root}
+    # L3 r1 F: the job's own cause, never "its branch moved off the base"
+    assert out["isError"] is True and out["content"][0]["text"] == "Failed (lease_lapsed): m"
+
+
 def test_dispatch_land_refused_by_the_floor_is_the_tools_error(lw):
     job, cap = lw.verified()
     out = call(lw.ddir, "dispatch_land", {"job": job.id, "onto": "work", "capability": cap}, agent="claude_code")[

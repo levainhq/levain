@@ -187,14 +187,15 @@ class DispatchPhone:
 
         if job.state != "recommended":
             return None
+        # bound before the try: every failure below returns this card with its problem set, onto and run kept
+        card: dict[str, Any] = {"onto": None, "run": None, "tier": None, "changes": [], "change_overflow": 0,
+                                "files": 0, "changed_lines": None, "signers": [], "note": "", "problem": None}
         try:
             store = self._store()
             proposal = None if store is None else self._proposal(store, job)
             if proposal is None:
                 return None
-            onto, run = proposal
-            card: dict[str, Any] = {"onto": onto, "run": run, "tier": None, "changes": [], "change_overflow": 0,
-                                    "files": 0, "changed_lines": None, "signers": [], "note": "", "problem": None}
+            card["onto"], card["run"] = onto, run = proposal
             record, changes, tier = self._judged(store, job, run)
             entries = [{"path": c.path, "status": c.status, "added": c.added, "deleted": c.deleted,
                         "binary": c.binary, "gitlink": c.non_blob} for c in changes.entries]
@@ -207,10 +208,9 @@ class DispatchPhone:
                                 f"(levain dispatch authorise {job.id} --run {run} --onto {onto})")
             return card
         except DispatchRefused as exc:
-            return {**card, "problem": exc.message}
+            return {**card, "signers": [], "problem": exc.message}
         except (DispatchError, SignRefused, AuthorityError, OSError, sqlite3.Error) as exc:
-            return {"onto": None, "run": None, "tier": None, "changes": [], "change_overflow": 0, "files": 0,
-                    "changed_lines": None, "signers": [], "note": "",
+            return {**card, "signers": [],
                     "problem": f"the authorise card cannot be read now ({type(exc).__name__}: {str(exc)[:200]})"}
 
     def pending(self) -> tuple[list[dict[str, Any]], str | None, int]:

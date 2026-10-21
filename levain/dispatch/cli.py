@@ -29,9 +29,9 @@ then y/N, then a signature in :data:`levain.dispatch.adopt.DISPATCH_AUTHORISE_NA
 built from the store's own run record (:func:`levain.dispatch.adopt.authorise_payload_for`), then the land. ``land``
 lands by a standing rule, or finishes an authorised job (a retry, or after the operator's own printed merge); an agent
 may run it only with the capability of a job it filed, and never with ``--data-root`` or ``--dispatch-dir``. A land
-and ``list`` sweep the staged refs of the jobs of that repository that ended without an adoption
-(:func:`levain.dispatch.adopt.sweep_staged`). A land's outcome is its exit: adopted 0; a merge for the operator to
-run 0, the command alone on the last line; refused 2; failed (MOVED BASE) 1.
+and ``list`` sweep the staged refs of the jobs of that repository that ended (failed, cancelled, or adopted onto a
+branch that contains the landed commit; :func:`levain.dispatch.adopt.sweep_staged`). A land's outcome is its exit:
+adopted 0; a merge for the operator to run 0, the command alone on the last line; refused 2; failed (MOVED BASE) 1.
 
 Exit codes: 0 done; 1 a land that FAILED its job (MOVED BASE); 2 the input or a refusal (the contract, the transition, the signature, the capability or the
 command line was refused: the message says why, and nothing changed); 3 a fault on this machine, told apart by its
@@ -81,6 +81,7 @@ import sys
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, TypeVar
 
 from levain import unshowable
@@ -146,13 +147,38 @@ _REFUSALS = (ContractRefused, TransitionRefused, SignatureRefused, CapabilityRef
 
 class _ActiveConfiguration:
     """One verified read of the active configuration, answering the registry's readers (:func:`registry.resolver`,
-    :func:`registry.active_policy`) from it: the template and the policy a filing binds come from one generation."""
+    :func:`registry.active_policy`, and a land's :func:`registry.adoption_rules_at`) from it: the template, the
+    policy and the rules a filing or a land is judged by come from one generation."""
 
-    def __init__(self, active: Any) -> None:
-        self._active = active
+    def __init__(self, items: Any) -> None:
+        # every verified kind, the adoption rules included (``_verified_items``); ``active`` leaves them out, as
+        # ControlStore.active does
+        self._items = items
 
     def active(self) -> Any:
-        return self._active
+        return MappingProxyType({k: v for k, v in self._items.items() if k != "adoption_rules"})
+
+    def _verified_items(self) -> Any:
+        return self._items
+
+
+def _control_read(directory: Path | None, data_root: Path | None, *, nothing: str) -> _ActiveConfiguration | None:
+    """ONE verified read of the control store in ``directory`` (default: the dispatch directory), every kind with
+    the adoption rules, against the cockpit ``data_root`` names (default: the one the consent hooks there name).
+    ``None`` when there is no control store. A store that cannot be trusted or read raises
+    :class:`levain.dispatch.control.ControlStateUnavailable` saying ``nothing was <nothing>``."""
+    from levain.dispatch.jobs import default_dispatch_dir
+
+    d = Path(directory) if directory is not None else default_dispatch_dir()
+    if not os.path.lexists(d / dctl.DB_NAME):
+        return None
+    root = Path(data_root) if data_root is not None else None
+    try:
+        items = dctl.ControlStore(d, authority=_authority_source(d, root))._verified_items()
+    except (dctl.ControlStateUnavailable, sqlite3.Error, OSError, ValueError) as exc:
+        raise dctl.ControlStateUnavailable(f"the configuration could not be read ({type(exc).__name__}: "
+                                           f"{str(exc)[:200]}); nothing was {nothing}") from None
+    return _ActiveConfiguration(items)
 
 
 def resolvers(directory: Path | None = None, data_root: Path | None = None,
@@ -164,18 +190,9 @@ def resolvers(directory: Path | None = None, data_root: Path | None = None,
     :class:`levain.dispatch.control.ControlStateUnavailable` (a fault: nothing was filed), whatever the error below
     it; no single cockpit named is :class:`CockpitUnnamed`; a store with no provider policy accepted refuses
     (:class:`DispatchError`)."""
-    from levain.dispatch.jobs import default_dispatch_dir
-
-    d = Path(directory) if directory is not None else default_dispatch_dir()
-    if not os.path.lexists(d / dctl.DB_NAME):
+    config = _control_read(directory, data_root, nothing="filed")
+    if config is None:
         return None
-    root = Path(data_root) if data_root is not None else None
-    try:
-        active = dctl.ControlStore(d, authority=_authority_source(d, root)).active()
-    except (dctl.ControlStateUnavailable, sqlite3.Error, OSError, ValueError) as exc:
-        raise dctl.ControlStateUnavailable(f"the configuration could not be read ({type(exc).__name__}: "
-                                           f"{str(exc)[:200]}); nothing was filed") from None
-    config = _ActiveConfiguration(active)
     return dregistry.resolver(config), dregistry.active_policy(config)
 
 
@@ -335,29 +352,32 @@ def _landing_tier(directory: Path) -> Callable[[str, tuple[str, ...]], str]:
 def land_job(store: JobStore, job_id: str, *, onto: str | None = None, signed: tuple[Any, Any] | None = None,
              data_root: Path | None = None) -> dadopt.Landing:
     """:func:`levain.dispatch.adopt.land` for ``job_id``, every authority it takes bound from the production stores
-    (F11-s2b §0): the landing tier over the dispatch directory's consent settings, the registry and the policy
-    (:func:`resolvers`), and either the operator's ``signed`` item ``(payload, signature)``, verified against the
-    authority source :func:`_authority_source` picks, or the adoption rules read from the control store at the land.
-    ``data_root`` is the operator's ``--data-root`` alone (the MCP door and the phone pass ``None``). No control
-    store refuses (nothing configured lands). The staged refs of the repository's jobs that ended without an
-    adoption are swept after the land (:func:`levain.dispatch.adopt.sweep_staged`); a ref git kept is added to the
-    landing's message."""
+    (F11-s2b §0): the landing tier over the dispatch directory's consent settings, the registry and the policy,
+    and either the operator's ``signed`` item ``(payload, signature)``, verified against the
+    authority source :func:`_authority_source` picks, or the adoption rules. The registry, the policy and (on the
+    rule path) the adoption rules come from ONE verified read of the control store (:func:`_control_read`), so a
+    land is never judged by two generations (L3 r1 A); a store that cannot be read is
+    :class:`levain.dispatch.control.ControlStateUnavailable`, a fault. ``data_root`` is the operator's
+    ``--data-root``, or the MCP server's own launch ``--data-root`` (the one its filing uses), never a tool argument;
+    the phone passes ``None``. No control store refuses (nothing configured lands). The staged refs of the
+    repository's ended jobs are swept after the land (:func:`levain.dispatch.adopt.sweep_staged`, which never
+    raises); what it could not delete is added to the landing's message."""
     from dataclasses import replace
 
     from levain.dispatch.registry import adoption_rules_at
 
-    resolved = resolvers(store.directory, data_root)
-    if resolved is None:
+    config = _control_read(store.directory, data_root, nothing="landed")
+    if config is None:
         raise ContractRefused(NO_LAND)
-    resolve_template, policy = resolved
+    resolve_template, policy = dregistry.resolver(config), dregistry.active_policy(config)
     human: tuple[Any, Any, Any] | None = None
     rules: Callable[[], Any] | None = None
     if signed is not None:
         human = (signed[0], signed[1], _authority_source(store.directory, data_root))
     else:
         def rules() -> Any:
-            return adoption_rules_at(dctl.ControlStore(store.directory,
-                                                       authority=_authority_source(store.directory, data_root)))
+            # judged from the same read as the registry and the policy: no second read of the store
+            return adoption_rules_at(config)
     landing = dadopt.land(store, job_id, landing_tier=_landing_tier(store.directory),
                           resolve_template=resolve_template, policy=policy, onto=onto, human=human, rules=rules)
     kept = dadopt.sweep_staged(store, landing.job.repo)
@@ -392,6 +412,12 @@ def _change_view(store: JobStore, job: Job, run: int) -> tuple[list[str], list[s
     return [_safe(line) for line in lines], [_safe(line) for line in summary]
 
 
+def _last_cause(job: Job) -> str:
+    """The cause of the job's last transition (what failed it: ``base_moved``, a verifier's, a lapse's), never a
+    cause assumed from the outcome."""
+    return job.history[-1].cause if job.history else "unknown cause"
+
+
 def _landed(args: argparse.Namespace, landing: dadopt.Landing, emit: Callable[[Any, str], None]) -> int:
     """A land's outcome as its exit: adopted 0, merge 0 (the operator's command alone on the last line), refused 2,
     failed 1."""
@@ -409,8 +435,8 @@ def _landed(args: argparse.Namespace, landing: dadopt.Landing, emit: Callable[[A
                               landing.command]))
         return EXIT_OK
     if landing.outcome == "failed":
-        emit(data, f"levain dispatch: job {job.id} FAILED (base_moved), its write files released for a new filing: "
-                   f"{message}")
+        emit(data, f"levain dispatch: job {job.id} FAILED ({_safe(_last_cause(job))}), its write files released for "
+                   f"a new filing: {message}")
         return EXIT_FAILED
     emit(data, f"levain dispatch: not landed, refused: {message}")
     return EXIT_REFUSED
@@ -1021,15 +1047,17 @@ def _run(args: argparse.Namespace, out: Any) -> int:
     if cmd == "list":
         every = store.list(repo=args.repo)
         jobs = [j for j in every if args.all or j.state not in TERMINAL]
+        # the staged refs of the ended jobs, swept when a verb runs (only --repo's when it is given), BEFORE the
+        # listing is emitted, so nothing follows a --json document on stdout; the sweep never raises, and what it
+        # could not delete is said (stderr under --json)
+        for repo in ([args.repo] if args.repo is not None else sorted({j.repo for j in every})):
+            for line in dadopt.sweep_staged(store, repo):
+                print(f"levain dispatch: {_safe(line)}", file=sys.stderr if args.json else out, flush=True)
         emit([{"id": j.id, "state": j.state, "repo": j.repo, "filed_at": j.filed_at, "lease_end": j.lease_end,
                "template": j.contract.template.template_id, "digest": j.digest} for j in jobs],
              "\n".join(_safe(f"{j.id}  {j.state:<12} {j.contract.template.template_id:<16} lease {j.lease_end}  "
                              f"{j.repo}") for j in jobs)
              or ("levain dispatch: no jobs." if args.all else "levain dispatch: no live jobs (--all for every job)."))
-        # the staged refs of the jobs that ended without an adoption, swept when a verb runs; what git kept is said
-        for repo in sorted({j.repo for j in every}):
-            for line in dadopt.sweep_staged(store, repo):
-                print(f"levain dispatch: {_safe(line)}", file=sys.stderr if args.json else out, flush=True)
         return EXIT_OK
     if cmd == "sign":
         _refuse_an_agent("sign")

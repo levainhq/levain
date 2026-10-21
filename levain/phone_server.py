@@ -914,11 +914,11 @@ def make_phone_server(queue_dir: Path, rp_id: str, *, host: str = "127.0.0.1", p
                       token: str | None = None, sign_namespaces: "tuple[str, ...]" = (),
                       dispatch_dir: Path | None = None) -> _PhoneServer:
     """A bound (not yet serving) phone port over the consent queue at ``queue_dir``, answering for the https name
-    ``rp_id``, and over the dispatch store in ``dispatch_dir`` (default: where ``levain dispatch`` keeps it,
-    :func:`levain.dispatch.jobs.default_dispatch_dir`). Loopback only: the proxy in front of it is what reaches the
-    phone."""
+    ``rp_id``, and over the dispatch store in ``dispatch_dir`` (default: ``queue_dir`` itself, since the dispatch
+    directory IS the consent directory, :func:`levain.dispatch.jobs.default_dispatch_dir`; so the keys an authorise
+    card offers and the keys its land verifies come from one directory's consent settings). Loopback only: the proxy
+    in front of it is what reaches the phone."""
     from levain.consent.passkey import is_host_name
-    from levain.dispatch.jobs import default_dispatch_dir
 
     if host != "localhost" and not _is_loopback_address(host):
         raise ValueError(f"the phone port binds loopback only (a proxy you run puts it on https), not {host!r}")
@@ -928,7 +928,7 @@ def make_phone_server(queue_dir: Path, rp_id: str, *, host: str = "127.0.0.1", p
                          "machine's own browser")
     return _PhoneServer((host, port), queue_dir=Path(queue_dir), rp_id=rp_id, token=token or secrets.token_urlsafe(32),
                         sign_namespaces=tuple(sign_namespaces),
-                        dispatch_dir=Path(dispatch_dir) if dispatch_dir is not None else default_dispatch_dir())
+                        dispatch_dir=Path(dispatch_dir) if dispatch_dir is not None else Path(queue_dir))
 
 
 def _is_loopback_address(host: str) -> bool:

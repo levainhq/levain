@@ -728,7 +728,8 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
           rules: Callable[[], tuple[int, Sequence[dregistry.AdoptionRule]]] | None = None) -> Floor:
     """F11 §4 for (A) (``human`` is the signed payload) or (B) (``rules`` returns the active adoption rules and
     their generation from one read, :func:`levain.dispatch.registry.adoption_rules_at`). The first failure decides.
-    Raises :class:`GitFault` when git cannot run."""
+    Raises :class:`GitFault` when git cannot run, and :class:`levain.dispatch.control.ControlStateUnavailable` when
+    ``rules`` cannot read the control store (a fault, never a refusal)."""
     repo = job.repo
     # 1. state, and the branch the authority names
     if job.state not in ("verified", "recommended"):
@@ -787,9 +788,14 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
         if problem is not None:
             return _refuse(problem)
         # 6. the rule
+        # rules that no longer hold refuse; a control store that cannot be read is a FAULT, raised (F11-s2b 9(2))
+        from levain.dispatch.control import ControlStateUnavailable
+
         try:
             generation, listed = rules()
             active = tuple(listed)
+        except ControlStateUnavailable:
+            raise
         except DispatchError as exc:
             return _refuse(f"the adoption rules cannot be read: {str(exc)[:200]}")
         index, failure = _rule_for(active, job, onto, changes, record, now)
@@ -874,26 +880,64 @@ def _delete_staged(repo: str, job_id: str) -> list[str]:
 _STAGED_PREFIX = "refs/heads/levain/dispatch/"
 
 
+def _landed_in(repo: str, job: Job) -> bool:
+    """Whether the branch an ``adopted`` job landed on (its ``adopted`` transition's evidence: ``onto``, ``landed``)
+    contains the landed commit now. Evidence it cannot read is ``False``: the refs are kept."""
+    rows = [h for h in job.history if h.to_state == "adopted"]
+    try:
+        evidence = json.loads(rows[-1].evidence) if rows and rows[-1].evidence else None
+    except ValueError:
+        return False
+    if not isinstance(evidence, dict):
+        return False
+    onto, landed = evidence.get("onto"), evidence.get("landed")
+    if not (isinstance(onto, str) and isinstance(landed, str)) or branch_problem(repo, onto) is not None:
+        return False
+    tip = _read_branch(repo, onto)
+    return tip is not None and _object_type(repo, landed) == "commit" and _is_ancestor(repo, landed, tip)
+
+
 def sweep_staged(store: JobStore, repo: str) -> list[str]:
-    """Delete the staged refs of every job of ``repo`` that ended without an adoption (``failed`` or ``cancelled``,
-    by any writer: a lapse, a cancel, a verifier failure); returns a line for each ref git would not delete, and one
-    when git cannot run here, never a raise (a ref left behind is clutter, nothing worse). One listing of the
-    repository's staged refs; a ref of a job this store does not hold, or of a live or adopted job, is left. A
-    repository that is no longer a directory has no refs to sweep. Runs when a verb runs, never on its own."""
+    """Delete the staged refs of every job of ``repo`` that ended: ``failed`` or ``cancelled`` (by any writer: a
+    lapse, a cancel, a verifier failure), or ``adopted`` once the branch it landed on contains the landed commit (the
+    commit is kept by the branch; the refs are clutter). Returns a line for each ref git would not delete, and one
+    when the store or git cannot be read here, never a raise (a ref left behind is clutter, nothing worse; a sweep
+    runs after a land whose adoption is already durable). One listing of the repository's staged refs; a ref of a job
+    this store does not hold, of a live job, or of an adopted job whose branch does not contain its commit, is left.
+    A repository that is no longer a directory has no refs to sweep. Runs when a verb runs, never on its own."""
+    import sqlite3
+
+    from levain.dispatch.jobs import JobStoreError
+
     if not os.path.isdir(repo):
         return []
-    ended = {j.id for j in store.list(repo=repo) if j.state in ("failed", "cancelled")}
-    if not ended:
+    try:
+        jobs = {j.id: j for j in store.list(repo=repo) if j.state in ("failed", "cancelled", "adopted")}
+    except (JobStoreError, sqlite3.Error, OSError) as exc:
+        return [f"the ended jobs in {repo} could not be read to sweep their staged refs "
+                f"({type(exc).__name__}: {str(exc)[:200]})"]
+    if not jobs:
         return []
     try:
         out = _git_ok(repo, "for-each-ref", "--format=%(refname) %(objectname)", _STAGED_PREFIX)
     except GitFault as exc:
         return [f"the staged refs in {repo} could not be swept: {exc}"]
-    kept = []
+    kept: list[str] = []
+    landed: dict[str, bool] = {}            # adopted job -> its branch contains its commit (asked once per job)
     for line in out.decode("utf-8", "surrogateescape").splitlines():
         ref, _, sha = line.rpartition(" ")
-        if ref[len(_STAGED_PREFIX):].partition("/")[0] not in ended:
+        job = jobs.get(ref[len(_STAGED_PREFIX):].partition("/")[0])
+        if job is None:
             continue
+        if job.state == "adopted":
+            if job.id not in landed:
+                try:
+                    landed[job.id] = _landed_in(repo, job)
+                except GitFault as exc:
+                    kept.append(f"the staged refs of adopted job {job.id} were kept: {exc}")
+                    landed[job.id] = False
+            if not landed[job.id]:
+                continue
         try:
             deleted = _git(repo, "update-ref", "--no-deref", "-d", ref, sha).returncode == 0
         except GitFault:

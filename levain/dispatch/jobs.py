@@ -750,7 +750,9 @@ class JobStore:
         if onto is not None or run is not None:
             from levain.dispatch import adopt
 
-            job = self.get(job_id)
+            # the capability first, as every planner transition checks it: a wrong one learns nothing of the
+            # job's repository (no branch probe, no git fault); _planner checks it again in its own transaction
+            job = self.check_capability(job_id, capability)
             if job is not None:
                 if run is not None:
                     k = job.contract.template.k

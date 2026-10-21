@@ -510,6 +510,18 @@ def test_a_recommended_job_with_a_branch_carries_the_authorise_card(lwp) -> None
     assert got["staged"] == lwp.jstore.run_record(job.id, 0).staged_commit
 
 
+@pytest.mark.parametrize("where", ["_judged", "_covering"])
+def test_a_card_that_cannot_be_read_keeps_its_branch_and_run(lwp, monkeypatch, where) -> None:
+    # L3 r1 G: the card is bound before the try; a failure sets its problem and keeps onto/run, never an unbound name
+    import sqlite3
+
+    job = recommended(lwp, onto="main", run=1)
+    monkeypatch.setattr(lwp.dp, where, lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("locked")))
+    got = card(lwp, job.id)
+    assert (got["onto"], got["run"], got["signers"]) == ("main", 1, [])
+    assert got["problem"] == "the authorise card cannot be read now (OperationalError: locked)"
+
+
 def test_no_branch_proposed_or_not_recommended_is_no_card(lwp) -> None:
     job = recommended(lwp)
     assert card(lwp, job.id) is None

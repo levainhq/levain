@@ -2,8 +2,8 @@
 file a contract, read jobs, recommend, cancel and land exactly as ``levain dispatch`` does
 (:mod:`levain.dispatch.cli`), for the PLANNER only: an MCP door never signs, so it has no sign tool, no human cancel
 and no authorise; those are the operator's, on their own device. ``dispatch_land`` is the standing-rule path (or the
-finish of a job the operator authorised) through :func:`levain.dispatch.cli.land_job`, with no data root: it takes no
-human item and none can be added (an answer never authorises). Stdlib only: JSON-RPC 2.0, one JSON message per line. Run as
+finish of a job the operator authorised) through :func:`levain.dispatch.cli.land_job`, with the server's own launch
+``--data-root`` (the one filing uses; never a tool argument): it takes no human item and none can be added (an answer never authorises). Stdlib only: JSON-RPC 2.0, one JSON message per line. Run as
 ``<python> -P -m levain.dispatch.mcp --agent <claude_code|codex>``.
 
 The session is read per call, as the question band's door reads it (:mod:`levain.consent.band_mcp`): the
@@ -182,9 +182,9 @@ def _call(agent: str, directory: Path | None, params: dict[str, Any], data_root:
                          {"id": job.id, "state": job.state, "onto": args.get("onto"), "run": args.get("run")})
         if name == "dispatch_land":
             store.check_capability(args["job"], cap)
-            # the (B) path: no human item can be passed here, and the configuration and cockpit are the dispatch
-            # directory's own, never this caller's
-            landing = land_job(store, args["job"], onto=args.get("onto"), data_root=None)
+            # the (B) path: no human item can be passed here; the configuration is the dispatch directory's own,
+            # verified against this server's launch --data-root (the one dispatch_file uses), never a tool argument
+            landing = land_job(store, args["job"], onto=args.get("onto"), data_root=data_root)
             data = {"id": landing.job.id, "state": landing.job.state, "outcome": landing.outcome,
                     "moved": landing.moved, "message": landing.message, "command": landing.command or None}
             if landing.outcome == "merge":
@@ -192,7 +192,8 @@ def _call(agent: str, directory: Path | None, params: dict[str, Any], data_root:
                              "(it is in the result as data); this door never runs it.", data)
             if landing.outcome == "adopted":
                 return _text(f"Job {landing.job.id} is adopted: {landing.message}", data)
-            word = "Failed (its branch moved off the base)" if landing.outcome == "failed" else "Not landed, refused"
+            word = (f"Failed ({landing.job.history[-1].cause if landing.job.history else 'unknown cause'})"
+                    if landing.outcome == "failed" else "Not landed, refused")
             return _text(f"{word}: {landing.message}", data, error=True)
         job = store.cancel_by_planner(args["job"], cap)
         return _text(f"Cancelled job {job.id} as its planner.", {"id": job.id, "state": job.state})

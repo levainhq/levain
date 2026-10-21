@@ -3,7 +3,9 @@ records on REAL git repositories in tmp (real keys in a real authority log, a re
 Every git fact is read back from the repository, never assumed."""
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 import subprocess
 from datetime import timedelta
 from pathlib import Path
@@ -1101,6 +1103,61 @@ def test_the_sweep_reports_a_ref_git_keeps_and_never_raises(world, monkeypatch):
     assert adopt.sweep_staged(world.jstore, str(world.repo)) == [
         f"the staged refs in {world.repo} could not be swept: git is gone"]
     assert adopt.sweep_staged(world.jstore, str(world.tmp / "no-such-repo")) == []
+
+
+@pytest.mark.parametrize("fault", [sqlite3.OperationalError("database is locked"), OSError("disk I/O error")])
+def test_the_sweep_says_a_store_it_cannot_read_and_never_raises(world, monkeypatch, fault):
+    # L3 r1 B (complement + codex + glm): the sweep runs after an adoption is durable, so its own read never raises
+    from levain.dispatch.jobs import JobStoreError
+
+    cancelled, cap = world.verified()
+    world.jstore.cancel_by_planner(cancelled.id, cap)
+    for exc in (fault, JobStoreError("a stored row does not match its digest")):
+        monkeypatch.setattr(world.jstore, "list", lambda *a, _e=exc, **k: (_ for _ in ()).throw(_e))
+        (line,) = adopt.sweep_staged(world.jstore, str(world.repo))
+        assert line.startswith(f"the ended jobs in {world.repo} could not be read") and type(exc).__name__ in line
+    assert len(world.refs(cancelled.id)) == 2                                    # nothing was deleted blind
+
+
+def _land_by_rule(world, job):
+    return land(world.jstore, job.id, landing_tier=T2, resolve_template=resolver(world.cstore),
+                policy=active_policy(world.cstore), onto="main", rules=lambda: adoption_rules_at(world.cstore))
+
+
+def test_the_sweep_deletes_an_adopted_jobs_refs_once_its_branch_contains_the_landed_commit(world):
+    # F11-s2b §9(3): the landed commit is kept by the branch; the staged refs are clutter once it holds it
+    job, _cap = world.verified()
+    base = world.main()
+    out = _land_by_rule(world, job)
+    assert out.outcome == "adopted" and len(world.refs(job.id)) == 2           # land itself sweeps nothing
+    git(world.repo, "update-ref", "refs/heads/main", base)                       # the branch no longer holds it
+    assert adopt.sweep_staged(world.jstore, str(world.repo)) == []
+    assert len(world.refs(job.id)) == 2                                          # kept: the refs still hold it
+    git(world.repo, "update-ref", "refs/heads/main", json.loads(out.job.history[-1].evidence)["landed"])
+    assert adopt.sweep_staged(world.jstore, str(world.repo)) == []
+    assert world.refs(job.id) == []
+
+
+def test_a_control_store_that_cannot_be_read_during_a_rule_land_is_a_fault(world):
+    # F11-s2b §9(2): ControlStateUnavailable is a DispatchError, and the floor's refusal must not swallow it
+    from levain.dispatch import DispatchError
+
+    job, _cap = world.verified()
+    put_rules = dict(landing_tier=T2, resolve_template=resolver(world.cstore), policy=active_policy(world.cstore),
+                     onto="main")
+
+    def unreadable():
+        raise ctl.ControlStateUnavailable("the control store cannot be read: disk I/O error")
+
+    with pytest.raises(ctl.ControlStateUnavailable, match="disk I/O error"):
+        land(world.jstore, job.id, rules=unreadable, **put_rules)
+    assert world.jstore.get(job.id).state == "verified"
+
+    def no_longer_holding():
+        raise DispatchError("the active adoption rules no longer hold: a template is gone")
+
+    out = land(world.jstore, job.id, rules=no_longer_holding, **put_rules)
+    assert out.outcome == "refused" and "the adoption rules cannot be read: the active adoption rules" in out.message
 
 
 @pytest.mark.parametrize("winner", ["authorised", "adopted", "base_moved"])

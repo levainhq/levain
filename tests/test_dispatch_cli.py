@@ -888,7 +888,117 @@ def test_a_land_sweeps_the_staged_refs_of_the_repos_ended_jobs(capsys, lw):
     job, _cap = lw.verified({"src/b.py": b"b = 4\nc = 3\n"})
     code, out, _ = run(capsys, "land", job.id, "--onto", "main", "--dispatch-dir", str(lw.ddir))
     assert code == 0, out
-    assert lw.refs(old.id) == [] and len(lw.refs(job.id)) == 2          # an adopted job's refs are kept
+    # §9(3): the adopted job's refs go too, its branch now holding the landed commit
+    assert lw.refs(old.id) == [] and lw.refs(job.id) == []
+
+
+def test_a_rule_land_reads_the_control_store_once(capsys, lw, monkeypatch):
+    # L3 r1 A (codex HIGH): the registry, the policy and the adoption rules come from ONE verified read
+    from levain.dispatch import control as ctl
+
+    reads: list[str] = []
+    real = ctl.ControlStore._read
+
+    def counted(self, *a, **k):
+        reads.append("read")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(ctl.ControlStore, "_read", counted)
+    job, _cap = lw.verified()
+    reads.clear()
+    code, out, _ = run(capsys, "land", job.id, "--onto", "main", "--dispatch-dir", str(lw.ddir))
+    assert code == 0 and "is adopted" in out, out
+    assert reads == ["read"]
+
+
+def test_a_control_store_unreadable_at_a_rule_land_is_exit_3(capsys, lw, monkeypatch):
+    # §9(2): a store that cannot be read is a fault, never a refusal
+    from levain.dispatch import control as ctl
+
+    job, _cap = lw.verified()
+
+    def unreadable(self, *a, **k):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(ctl.ControlStore, "_read", unreadable)
+    code, out, _ = run(capsys, "land", job.id, "--onto", "main", "--dispatch-dir", str(lw.ddir))
+    assert code == 3 and "ControlStateUnavailable" in out and "nothing was landed" in out, out
+    assert lw.jstore.get(job.id).state == "verified"
+
+
+def _list_faults_after_the_first(monkeypatch):
+    # the verb's own read answers; the sweep's read (the next one) faults
+    from levain.dispatch.jobs import JobStore
+
+    real, calls = JobStore.list, []
+
+    def flaky(self, *a, **k):
+        calls.append(1)
+        if len(calls) > 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(JobStore, "list", flaky)
+
+
+def test_a_sweep_that_cannot_read_the_store_after_an_adoption_is_not_a_fault(capsys, lw, monkeypatch):
+    # L3 r1 B: the adoption is durable before the sweep; its fault is a line in the message, exit 0
+    from levain.dispatch.jobs import JobStore
+
+    job, _cap = lw.verified()
+    # a land reads no list of its own: the only store.list is the sweep's, after the adoption
+    monkeypatch.setattr(JobStore, "list", lambda self, *a, **k: (_ for _ in ()).throw(
+        sqlite3.OperationalError("database is locked")))
+    code, out, _ = run(capsys, "land", job.id, "--onto", "main", "--dispatch-dir", str(lw.ddir), "--json")
+    data = json.loads(out)
+    assert code == 0 and data["outcome"] == "adopted", out
+    assert "could not be read to sweep their staged refs (OperationalError: database is locked)" in data["message"]
+
+
+def test_list_json_sweeps_before_it_emits_and_a_sweep_fault_never_corrupts_stdout(capsys, lw, monkeypatch):
+    job, cap = lw.verified()
+    lw.jstore.cancel_by_planner(job.id, cap)
+    _list_faults_after_the_first(monkeypatch)
+    code, out, err = run(capsys, "list", "--all", "--json", "--dispatch-dir", str(lw.ddir))
+    assert code == 0 and [r["id"] for r in json.loads(out)] == [job.id], out
+    assert "could not be read to sweep" in err and len(lw.refs(job.id)) == 2
+
+
+def test_list_with_repo_sweeps_only_that_repo(capsys, lw, tmp_path):
+    # L3 r1 H
+    job, cap = lw.verified()
+    lw.jstore.cancel_by_planner(job.id, cap)
+    other = tmp_path / "other"
+    other.mkdir()
+    code, out, _ = run(capsys, "list", "--repo", str(other), "--dispatch-dir", str(lw.ddir))
+    assert code == 0, out
+    assert len(lw.refs(job.id)) == 2
+    code, out, _ = run(capsys, "list", "--repo", str(lw.repo), "--dispatch-dir", str(lw.ddir))
+    assert code == 0 and lw.refs(job.id) == [], out
+
+
+@pytest.mark.parametrize("cause", ["base_moved", "lease_lapsed"])
+def test_a_failed_land_says_the_jobs_own_cause(cause):
+    # L3 r1 F: the cause is the job's last transition's, never a hardcoded base_moved
+    from types import SimpleNamespace
+
+    from levain.dispatch import adopt as dadopt
+
+    job = SimpleNamespace(id="dj-x", state="failed", history=[SimpleNamespace(cause=cause)])
+    said: list[str] = []
+    code = dcli._landed(None, dadopt.Landing(outcome="failed", job=job, message="m"),
+                        lambda data, text: said.append(text))
+    assert code == dcli.EXIT_FAILED and said == [
+        f"levain dispatch: job dj-x FAILED ({cause}), its write files released for a new filing: m"]
+
+
+def test_recommend_checks_the_capability_before_the_proposal(capsys, lw):
+    # L3 r1 I: a wrong capability learns nothing of the repository (no branch probe)
+    job, cap = lw.verified()
+    code, out, _ = run(capsys, "recommend", job.id, "--capability", cap + "x", "--onto", "refs/heads/main",
+                       "--dispatch-dir", str(lw.ddir))
+    assert code == 2 and "not job" in out and "bare name" not in out, out
+    assert lw.jstore.get(job.id).state == "verified"
 
 
 def test_recommend_proposes_a_branch_and_a_run(capsys, lw):
