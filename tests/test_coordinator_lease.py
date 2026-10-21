@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from levain.cockpit.consent import utc_stamp
 from levain.coordinator import lease
-from levain.coordinator.envelopes import EnvelopeStore
 from levain.coordinator.store import CoordError, CoordStore, Part
 
 T0 = datetime(2026, 10, 20, 20, 0, tzinfo=timezone.utc)
@@ -109,7 +109,7 @@ def test_activation_gives_the_holder_a_full_ttl_and_its_writes_count(store, cloc
     ln = boot(store)
     held = store.coord_status()["lease"]
     assert held["holder"] == ln.session_key
-    assert held["until"] == (T0 + lease.LEASE_TTL).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    assert held["until"] == utc_stamp(T0 + lease.LEASE_TTL)
     d = drop(store, "split me")
     t = store.split(d.drop_id, [Part("work", "x")], by="coordinator", token=held["token"])[0]
     assert store.set_state(t.thread_id, "working", by="coordinator", token=held["token"]).state == "working"
@@ -144,8 +144,11 @@ def test_a_holder_past_its_until_is_refused_and_the_lapse_is_written(store, cloc
         store.split(d.drop_id, [Part("work", "x")], by="coordinator", token=token)
     assert store.coord_status()["lease"] is None
     assert rows(qdir, "SELECT kind, token FROM lease_events ORDER BY seq DESC LIMIT 1") == [("lapse", token)]
-    drop(store, "the next drop wakes a new coordinator")
-    assert store.coord_status()["wake"] == "launching"
+    drop(store, "the coordinator is still running: no second one beside it")
+    st = store.coord_status()
+    assert st["wake"] == "idle" and len(st["launches"]) == 1
+    ln = st["launches"][0]
+    assert store.coord_claim(ln["launch_id"], ln["session_key"]) > token
 
 
 def test_a_beat_keeps_the_lease_and_never_changes_the_token(store, clock):
@@ -237,7 +240,7 @@ def test_only_an_active_coordinator_with_its_own_session_key_claims(store, clock
     t = store.split(d.drop_id, [Part("work", "x")], by="coordinator", token=token)[0]
     worker = store.launch_request(token, harness="claude", threads=[t.thread_id])
     store.launch_activate(worker.launch_id, harness_session_id="w")
-    store.coord_release()
+    store.coord_release(token, by="coordinator")                   # the holder hands off; its launch keeps running
     with pytest.raises(CoordError, match="only an active coordinator"):
         store.coord_claim(worker.launch_id, worker.session_key)
     with pytest.raises(CoordError, match="is not session"):
@@ -272,6 +275,11 @@ def test_lease_and_launch_rows_are_append_only(store, clock, qdir):
     boot(store)
     c = sqlite3.connect(qdir / "dispatch.db")
     try:
+        c.execute("INSERT INTO gseq (at) VALUES ('x')")
+        active = c.execute("SELECT launch_id FROM launches").fetchone()[0]
+        with pytest.raises(sqlite3.DatabaseError, match="pending -> active"):
+            c.execute("INSERT INTO launch_events (launch_id, seq, gseq, kind, cause, at) "
+                      "VALUES (?, 3, (SELECT MAX(gseq) FROM gseq), 'failed', 'x', 'x')", (active,))
         for sql in ("UPDATE lease_events SET until = 'x'", "DELETE FROM lease_events",
                     "UPDATE launches SET token = 99", "DELETE FROM launch_events",
                     "INSERT OR REPLACE INTO launches SELECT * FROM launches"):
@@ -283,15 +291,6 @@ def test_lease_and_launch_rows_are_append_only(store, clock, qdir):
                       "VALUES (?, 3, 9999, 'active', 'again', 'x')", (last,))
     finally:
         c.close()
-
-
-def test_the_envelope_store_and_a_plain_store_share_one_sequence(qdir, clock):
-    plain = CoordStore(qdir, clock=clock)
-    boot(plain)
-    EnvelopeStore(qdir, clock=clock).coord_status()
-    gseqs = [r[0] for r in rows(qdir, "SELECT gseq FROM lease_events UNION ALL SELECT gseq FROM launches "
-                                     "UNION ALL SELECT gseq FROM launch_events")]
-    assert len(gseqs) == len(set(gseqs))
 
 
 def test_levain_coord_cli(qdir, capsys):
@@ -312,3 +311,82 @@ def test_levain_coord_cli(qdir, capsys):
     run("drops", "split", did, "--thread", "work:x", "--by", "coordinator", "--token", str(tok))
     assert f"released token {tok}" in run("coord", "release").out
     assert "--for is a duration" in run("coord", "take", "--for", "soon", rc=1).err
+
+
+def test_your_take_ends_the_running_coordinator_so_it_never_claims_back(store, clock):
+    ln = boot(store)
+    store.coord_take(timedelta(minutes=5))
+    clock.advance(minutes=6)                                       # your hold runs out
+    with pytest.raises(CoordError, match="is a ended coordinator"):
+        store.coord_claim(ln.launch_id, ln.session_key)
+    assert store.launch(ln.launch_id).cause == "takeover"
+    drop(store, "your hold ran out: the next drop asks for a fresh coordinator")
+    assert store.coord_status()["wake"] == "launching"
+
+
+def test_a_holder_whose_launch_ended_does_not_hold_up_the_wakes(store, clock, qdir):
+    ln = boot(store)
+    token = store.coord_status()["lease"]["token"]
+    # an end recorded without its release (a writer that died between the two): the claim still stands
+    c = sqlite3.connect(qdir / "dispatch.db")
+    c.execute("INSERT INTO gseq (at) VALUES ('x')")
+    c.execute("INSERT INTO launch_events (launch_id, seq, gseq, kind, cause, at) VALUES (?, 3, "
+              "(SELECT MAX(gseq) FROM gseq), 'ended', 'gone', 'x')", (ln.launch_id,))
+    c.commit()
+    c.close()
+    assert store.coord_status()["lease"]["token"] == token
+    assert store.coord_status()["wake"] == "wake"
+    d = drop(store, "wakes a new coordinator")
+    assert store.coord_status()["lease"]["cause"] == "bootstrap"
+    with pytest.raises(CoordError, match="not the live lease's"):
+        store.split(d.drop_id, [Part("work", "x")], by="coordinator", token=token)
+
+
+def test_a_wake_that_fails_never_loses_the_drop(store, clock, monkeypatch):
+    def broken(conn, now):
+        conn.execute("INSERT INTO lease_events (seq) VALUES (NULL)")      # a NOT NULL violation mid-wake
+    monkeypatch.setattr(lease, "wake", broken)
+    d = drop(store, "keep these words")
+    assert store.drop(d.drop_id).words == "keep these words"
+    assert store.coord_status()["lease"] is None
+
+
+def test_a_coordinator_running_without_the_lease_is_waited_for_only_so_long(store, clock):
+    ln = boot(store)
+    clock.advance(seconds=(lease.LEASE_TTL + timedelta(minutes=1)).total_seconds())
+    drop(store, "it may still claim again")
+    assert store.coord_status()["wake"] == "idle"
+    clock.advance(seconds=lease.IDLE_GRACE.total_seconds())
+    drop(store, "it never did: a fresh coordinator")
+    st = store.coord_status()
+    assert st["wake"] == "launching"
+    assert store.launch(ln.launch_id).state == "ended" and store.launch(ln.launch_id).cause == "lost the lease"
+    with pytest.raises(CoordError, match="only an active coordinator"):
+        store.coord_claim(ln.launch_id, ln.session_key)
+
+
+def test_your_take_and_release_reset_the_deaths(store, clock):
+    drop(store)
+    clock.advance(seconds=lease.LAUNCH_TTL.total_seconds())
+    drop(store, "one death: backoff")
+    assert store.coord_status()["wake"] == "backoff"
+    store.coord_take()
+    store.coord_release()
+    drop(store, "you looked: no backoff")
+    assert store.coord_status()["wake"] == "launching"
+
+
+def test_the_backoff_runs_from_the_death_not_from_when_it_was_noticed(store, clock):
+    drop(store)
+    clock.advance(seconds=(lease.LAUNCH_TTL + lease.BACKOFF[0] + timedelta(seconds=1)).total_seconds())
+    drop(store, "the expiry is noticed only now, past its backoff already")
+    assert store.coord_status()["wake"] == "launching"
+
+
+def test_no_caller_writes_a_cause_the_store_keeps_for_itself(store, clock):
+    drop(store)
+    ln = store.coord_status()["launches"][0]
+    with pytest.raises(CoordError, match="the store writes itself"):
+        store.launch_end(ln["launch_id"], "failed", "takeover")
+    with pytest.raises(CoordError, match="takes no token"):
+        store.coord_release(5)

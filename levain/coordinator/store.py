@@ -428,7 +428,14 @@ class CoordStore:
                     {"stage": "delivered", "drop_id": drop_id, "outbox_id": outbox_id, **(receipt or {})}, now)
         from levain.coordinator.lease import wake
 
-        wake(conn, now)          # a drop with no coordinator asks for one, in its own transaction (C0 §6)
+        # a drop with no coordinator asks for one, in its own transaction (C0 §6). A wake that fails rolls back to
+        # here and the drop is kept: your words are never lost to the coordinator's bookkeeping
+        conn.execute("SAVEPOINT coord_wake")
+        try:
+            wake(conn, now)
+        except (CoordError, sqlite3.Error):
+            conn.execute("ROLLBACK TO coord_wake")
+        conn.execute("RELEASE coord_wake")
         return self._drop(conn, drop_id)
 
     # --- threads -------------------------------------------------------------------------------------------------
