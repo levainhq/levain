@@ -19,13 +19,21 @@ the live lease's, all in one transaction (:func:`activate`); a takeover voids ev
 
 WAKES (:func:`wake`, run inside every new drop's transaction): with no live lease and no pending coordinator launch,
 the drop's transaction writes a ``pending`` coordinator launch and a ``bootstrap`` claim held by its ``session_key``,
-whose token the launch is then activated against; otherwise the drop only queues. A coordinator launch that dies
+whose token the launch is then activated against; otherwise the drop only queues. The launch is the one the COORDINATOR
+SETTING names (``coord_settings``, yours only: the agent, its model, the directory it runs in, set by ``levain coord
+agent``); with no setting, or agent ``none``, a drop only queues (``unset``): no launch is asked for and none can die. A coordinator launch that dies
 before ``active`` (failed, expired) or ends at 0 turns is a DEATH: the next wake waits out :data:`BACKOFF`, and after
 :data:`MAX_DEATHS` deaths in a row nothing launches until you look (``levain coord take`` or ``release``).
 
+``launch_spawns`` is the one-spawner rule (C3b): a process that means to start a launch's session first inserts the
+launch's row there, in the transaction that checks the launch is still pending, in time and under the live lease's
+token (:func:`claim_spawn`); the primary key is the compare-and-set, so a second process spawns nothing.
+
 [seat] choices C0 leaves open (C3a, 1020+35): the TTLs and backoff below; a beat comes from the holder (its token) or
 the service; an operator ``take`` holds the lease for ``LEASE_TTL`` unless told otherwise; your take or release is what
-"until you look" reads. Stdlib only.
+"until you look" reads. (C3b, 1020+50): ``unset`` is checked after a live lease, a running coordinator and a pending
+launch (those still say what a drop would do), before the death count; a setting is a whole row, never a field
+update; codex is a value the table holds but :func:`set_agent` refuses until a codex launch is built. Stdlib only.
 """
 from __future__ import annotations
 
@@ -44,14 +52,16 @@ from levain.coordinator.store import CoordError, _append_only, next_gseq
 
 __all__ = [
     "BACKOFF", "HARNESSES", "LAUNCH_KINDS", "LAUNCH_TTL", "LEASE_KINDS", "LEASE_SCHEMA", "LEASE_TTL", "MAX_DEATHS",
-    "ROLES", "Launch", "Lease", "LeaseRefused", "activate", "beat", "claim", "end_launch", "fence", "launch", "lease",
-    "launches", "release", "request_launch", "status", "take", "wake", "wake_state",
+    "ROLES", "SETTING_AGENTS", "Launch", "Lease", "LeaseRefused", "Setting", "activate", "beat", "claim",
+    "claim_spawn", "end_launch", "fence", "launch", "lease", "launches", "release", "request_launch", "set_agent",
+    "setting", "status", "take", "wake", "wake_state",
 ]
 
 LEASE_KINDS = ("claim", "beat", "release", "lapse", "takeover")
 LAUNCH_KINDS = ("pending", "active", "failed", "expired", "ended")
 HARNESSES = ("claude", "codex")
 ROLES = ("coordinator", "worker")
+SETTING_AGENTS = (*HARNESSES, "none")
 _LEASE_BY = ("operator", "coordinator", "service")
 
 # [seat, judged by 1020+35 at C3a against no measured turn lengths] C0 §6 put 10 min and asked for it to be
@@ -93,6 +103,24 @@ LEASE_SCHEMA: tuple[str, ...] = (
     f"seq INTEGER NOT NULL, gseq INTEGER NOT NULL UNIQUE, kind TEXT NOT NULL CHECK ({_in('kind', LAUNCH_KINDS)}), "
     "until TEXT, harness_session_id TEXT, argv_sha256 TEXT, pinned_envelope_id TEXT, cause TEXT NOT NULL, "
     "at TEXT NOT NULL, PRIMARY KEY (launch_id, seq))",
+    # the coordinator setting: yours only, a whole row each time (the latest row is the setting); agent none holds no
+    # model and no directory, a harness always a directory
+    "CREATE TABLE IF NOT EXISTS coord_settings (seq INTEGER PRIMARY KEY AUTOINCREMENT, gseq INTEGER NOT NULL UNIQUE, "
+    f"agent TEXT NOT NULL CHECK ({_in('agent', SETTING_AGENTS)}), model TEXT, cwd TEXT, "
+    "by TEXT NOT NULL CHECK (by = 'operator'), at TEXT NOT NULL, "
+    "CHECK ((agent = 'none' AND model IS NULL AND cwd IS NULL) OR (agent != 'none' AND cwd IS NOT NULL)))",
+    # pid: the levain process that won the spawn (the session's own process is the harness's, known only after)
+    "CREATE TABLE IF NOT EXISTS launch_spawns (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), "
+    "gseq INTEGER NOT NULL UNIQUE, pid INTEGER NOT NULL, at TEXT NOT NULL)",
+    *_append_only("coord_settings", "a coordinator setting"),
+    *_append_only("launch_spawns", "a launch spawn"),
+    "CREATE TRIGGER IF NOT EXISTS coord_settings_no_replace BEFORE INSERT ON coord_settings WHEN EXISTS (SELECT 1 "
+    "FROM coord_settings WHERE seq = NEW.seq OR gseq = NEW.gseq) "
+    "BEGIN SELECT RAISE(ABORT, 'a coordinator setting is never replaced'); END",
+    # INSERT OR REPLACE would let a second spawner take the row: the CAS is a plain INSERT, and a replace is refused
+    "CREATE TRIGGER IF NOT EXISTS launch_spawns_no_replace BEFORE INSERT ON launch_spawns WHEN EXISTS (SELECT 1 "
+    "FROM launch_spawns WHERE launch_id = NEW.launch_id OR gseq = NEW.gseq OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a launch is spawned once'); END",
     *_append_only("lease_events", "a lease event"),
     *_append_only("launches", "a launch"),
     *_append_only("launch_events", "a launch event"),
@@ -154,6 +182,14 @@ class Launch:
     until: str | None    # the pending row's until
     harness_session_id: str | None
     cause: str
+    at: str
+
+
+@dataclass(frozen=True)
+class Setting:
+    agent: str           # claude, codex or none
+    model: str | None
+    cwd: str | None      # resolved: the directory a coordinator session runs in
     at: str
 
 
@@ -465,6 +501,55 @@ def _idle(conn: sqlite3.Connection, now: str) -> tuple[Launch | None, list[Launc
     return waited, stale
 
 
+# --- the coordinator setting and the spawn ----------------------------------------------------------------------
+def setting(conn: sqlite3.Connection) -> Setting | None:
+    """The latest coordinator setting, or None when you never set one."""
+    r = conn.execute("SELECT agent, model, cwd, at FROM coord_settings ORDER BY seq DESC LIMIT 1").fetchone()
+    return None if r is None else Setting(*r)
+
+
+def set_agent(conn: sqlite3.Connection, now: str, agent: str, *, model: str | None = None,
+              cwd: str | None = None) -> Setting:
+    """Record your coordinator setting (writer: you only). ``cwd`` is stored as given, which the caller has resolved
+    (Claude Code keys a directory's trust on its real path); agent ``none`` takes neither model nor directory."""
+    if agent not in SETTING_AGENTS:
+        raise _refused(f"the coordinator agent is one of {', '.join(SETTING_AGENTS)}")
+    if agent == "codex":
+        raise _refused("a codex coordinator cannot be launched yet (only claude is built); set claude or none")
+    if agent == "none":
+        if model is not None or cwd is not None:
+            raise _refused("agent none takes no --model and no --cwd")
+    elif not isinstance(cwd, str) or not cwd.startswith("/"):
+        raise _refused("a coordinator agent runs in a directory: an absolute path")
+    conn.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, by, at) VALUES (?, ?, ?, ?, 'operator', ?)",
+                 (next_gseq(conn, now), agent, _line("model", model), _line("cwd", cwd), now))
+    return setting(conn)
+
+
+def claim_spawn(conn: sqlite3.Connection, now: str, launch_id: str, pid: int) -> tuple[Launch, str | None]:
+    """The one-spawner compare-and-set, inside the caller's ``BEGIN IMMEDIATE``: ``(launch, None)`` when this process
+    may start the launch's session (its latest event is ``pending``, ``now`` is before its ``until``, its token is
+    still the live lease's, and nobody claimed the spawn before), else ``(launch, why)`` and nothing to spawn. A launch
+    past its until is written ``expired`` and one whose lease is gone ``failed``, as :func:`activate` would."""
+    ln = _must_launch(conn, launch_id)
+    if ln.state != "pending":
+        return ln, f"launch {launch_id} is {ln.state}, not pending"
+    row = conn.execute("SELECT pid, at FROM launch_spawns WHERE launch_id = ?", (launch_id,)).fetchone()
+    if row is not None:
+        return ln, f"launch {launch_id} is already being started (by pid {row[0]} at {row[1]})"
+    if now >= ln.until:
+        _launch_event(conn, now, launch_id, "expired", "pending past until")
+        return _launch_row(conn, "launch_id", launch_id), f"launch {launch_id} was pending past {ln.until}"
+    held = _lapse_if_past(conn, now)
+    if held is None or held.token != ln.token:
+        _launch_event(conn, now, launch_id, "failed", "lease lost before active")
+        return _launch_row(conn, "launch_id", launch_id), (f"launch {launch_id} was asked for under lease token "
+                                                           f"{ln.token}, which is no longer live")
+    conn.execute("INSERT INTO launch_spawns (launch_id, gseq, pid, at) VALUES (?, ?, ?, ?)",
+                 (launch_id, next_gseq(conn, now), pid, now))
+    return ln, None
+
+
 # --- wakes ---------------------------------------------------------------------------------------------------------
 def _looked(conn: sqlite3.Connection) -> int:
     """The gseq of your latest take or release: what "until you look" reads."""
@@ -502,7 +587,8 @@ def _deaths(conn: sqlite3.Connection) -> tuple[int, str | None]:
 def wake_state(conn: sqlite3.Connection, now: str) -> tuple[str, str]:
     """What a drop arriving now would do, without writing: ``(state, why)``, state one of ``held`` (a live lease),
     ``launching`` (a pending coordinator launch), ``idle`` (a coordinator still running without the lease),
-    ``backoff``, ``stopped`` (you look), or ``wake``."""
+    ``unset`` (no coordinator setting, or agent none: a drop only queues), ``backoff``, ``stopped`` (you look), or
+    ``wake``."""
     held = lease(conn, now)
     if held is not None and held.live:
         holder = None if held.holder == "operator" else _launch_by_key(conn, held.holder)
@@ -522,6 +608,10 @@ def wake_state(conn: sqlite3.Connection, now: str) -> tuple[str, str]:
     for ln in _in_state(conn, "pending", "coordinator"):
         if now < ln.until:
             return "launching", f"coordinator launch {ln.launch_id} is pending until {ln.until}"
+    chosen = setting(conn)
+    if chosen is None or chosen.agent == "none":
+        how = "no coordinator agent is set" if chosen is None else "the coordinator agent is none"
+        return "unset", f"{how}; drops queue for you (levain coord agent claude sets one)"
     count, latest = _deaths(conn)
     if count >= MAX_DEATHS:
         return "stopped", (f"{count} coordinator launches in a row died; nothing launches until you look "
@@ -549,8 +639,9 @@ def wake(conn: sqlite3.Connection, now: str) -> Launch | None:
     session_key = "s-" + secrets.token_hex(8)
     token = _event(conn, now, "claim", session_key, token=None, until=_plus(now, LAUNCH_TTL), cause="bootstrap",
                    by="service")
-    return _pending(conn, now, token=token, harness="claude", role="coordinator", threads=(), model=None, cwd=None,
-                    cause="wake", session_key=session_key)
+    chosen = setting(conn)          # wake_state answered wake: a harness is set
+    return _pending(conn, now, token=token, harness=chosen.agent, role="coordinator", threads=(), model=chosen.model,
+                    cwd=chosen.cwd, cause="wake", session_key=session_key)
 
 
 def status(conn: sqlite3.Connection, now: str) -> dict[str, object]:
@@ -558,4 +649,5 @@ def status(conn: sqlite3.Connection, now: str) -> dict[str, object]:
     state, why = wake_state(conn, now)
     return {"lease": None if held is None else {"token": held.token, "holder": held.holder, "until": held.until,
                                                 "cause": held.cause, "live": held.live},
-            "wake": state, "why": why, "launches": [asdict(ln) for ln in launches(conn, limit=10)]}
+            "wake": state, "why": why, "setting": None if (s := setting(conn)) is None else asdict(s),
+            "launches": [asdict(ln) for ln in launches(conn, limit=10)]}

@@ -322,6 +322,8 @@ class CoordStore:
         self.path = self._jobs.path
         self._clock = clock
         self._ready = False
+        # drop id -> the coordinator launch its own transaction asked for (read by woken_launch, this process only)
+        self._woken: dict[str, str] = {}
 
     # --- store ---------------------------------------------------------------------------------------------------
     def _connect(self) -> sqlite3.Connection:
@@ -431,11 +433,14 @@ class CoordStore:
         # a drop with no coordinator asks for one, in its own transaction (C0 §6). A wake that fails rolls back to
         # here and the drop is kept: your words are never lost to the coordinator's bookkeeping
         conn.execute("SAVEPOINT coord_wake")
+        woke = None
         try:
-            wake(conn, now)
+            woke = wake(conn, now)
         except Exception:  # noqa: BLE001 - any wake failure, never the drop: the words are kept
             conn.execute("ROLLBACK TO coord_wake")
         conn.execute("RELEASE coord_wake")
+        if woke is not None:
+            self._woken[drop_id] = woke.launch_id
         return self._drop(conn, drop_id)
 
     # --- threads -------------------------------------------------------------------------------------------------
@@ -652,6 +657,38 @@ class CoordStore:
 
         with self._write() as (conn, now):
             return lease.wake(conn, now)
+
+    def coord_set_agent(self, agent: str, *, model: str | None = None, cwd: str | None = None) -> Any:
+        """Your coordinator setting: the agent a wake launches, its model, the (resolved) directory it runs in."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.set_agent(conn, now, agent, model=model, cwd=cwd)
+
+    def coord_setting(self) -> Any:
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.setting(conn)
+
+    def pending_coordinator(self) -> Any:
+        """The newest coordinator launch still pending (whatever its until), or None."""
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            pending = lease._in_state(conn, "pending", "coordinator")
+            return pending[-1] if pending else None
+
+    def woken_launch(self, drop_id: str) -> str | None:
+        """The coordinator launch ``drop_id``'s own transaction asked for, when this store object accepted it."""
+        return self._woken.get(drop_id)
+
+    def launch_claim_spawn(self, launch_id: str, pid: int) -> Any:
+        """The one-spawner compare-and-set (:func:`levain.coordinator.lease.claim_spawn`), one transaction."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.claim_spawn(conn, now, launch_id, pid)
 
     def launch_request(self, token: int, *, harness: str, role: str = "worker", threads: Sequence[str] = (),
                        model: str | None = None, cwd: str | None = None) -> Any:

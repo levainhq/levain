@@ -12,10 +12,20 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   next drop would do, `levain coord take` holds it yourself, and `levain coord release` ends it. A session that lost
   the role (it went quiet past its time, or you took over) has its thread changes refused. Splitting or re-titling by
   hand now records you: `--by operator` is the default for `levain drops split` and `levain thread set`.
+- **`levain coord agent`: choose the coordinator your drops start.** `levain coord agent claude` makes
+  `~/.levain/coordinator` (or `--cwd DIR`) a Levain install for Claude Code when it is not one, records the choice, and
+  prints the one line that trusts that directory in Claude Code, which you run once. `levain coord agent none` (and
+  no choice at all) means drops only queue for you.
+- **`levain coord launch`: start the coordinator a drop asked for.** It starts a Claude Code session in the background
+  in the coordinator's directory, only when that install's consent hook is wired, and prints the `claude attach` line,
+  or why it did not start. `levain drop` now does this itself when its drop is the one that asked.
 
 ### Known edges
-- Nothing answers a drop's request for a coordinator yet: each request waits 5 minutes, and after three unanswered
-  ones Levain stops asking until you run `levain coord take` or `levain coord release`.
+- A coordinator launch that fails (an untrusted directory, a session that never appears) counts against the
+  coordinator: after three in a row Levain stops starting them until you run `levain coord take` or
+  `levain coord release`.
+- `levain coord wake` asks for a coordinator without starting it: run `levain coord launch` within 5 minutes, or
+  the request lapses and counts as one of those three.
 
 ## [0.11.13] — 2026-10-20
 

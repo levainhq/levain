@@ -44,7 +44,10 @@ def qdir(tmp_path):
 
 @pytest.fixture
 def store(qdir, clock):
-    return CoordStore(qdir, clock=clock)
+    # a wake launches only the coordinator you set (C3b): every test here sets one first, as you would
+    s = CoordStore(qdir, clock=clock)
+    s.coord_set_agent("claude", cwd=str(qdir.parent))
+    return s
 
 
 def drop(store, words="fix the build"):
@@ -81,7 +84,8 @@ print(json.dumps(d.drop_id))
 
 def test_two_processes_dropping_at_once_ask_for_one_coordinator(qdir, tmp_path):
     # run phase 1: two real processes, one instant, no lease -> one pending launch and one bootstrap claim
-    CoordStore(qdir).coord_status()          # the store exists already, as on any install past its first use
+    # the store exists already, as on any install past its first use, with a coordinator set (C3b)
+    CoordStore(qdir).coord_set_agent("claude", cwd=str(tmp_path))
     script = tmp_path / "racer.py"
     script.write_text(_RACER)
     tree = str(Path(lease.__file__).resolve().parents[2])
@@ -304,7 +308,9 @@ def test_levain_coord_cli(qdir, capsys):
 
     assert "nobody holds" in run("coord", "status").out
     did = json.loads(run("drop", "hello", "--json").out)["drop_id"]
-    assert "launching" in run("coord", "status").out
+    # no coordinator agent set (C3b): the drop only queued, nothing was asked for (test_coordinator_launch drives a
+    # drop that launches)
+    assert "next drop: unset" in run("coord", "status").out
     assert "carries the lease token" in run("drops", "split", did, "--thread", "work:x", "--by", "coordinator",
                                             rc=1).err
     tok = json.loads(run("coord", "take", "--for", "1h", "--json").out)["token"]
