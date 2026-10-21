@@ -6,6 +6,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.13] — 2026-10-20
+
+### Security
+- **A Codex patch could write a different file from the one Levain checked (0.11.0 to 0.11.12; upgrade to fix).**
+  Levain read the file names in a Codex `apply_patch` differently from Codex itself when a header line held an unusual
+  whitespace or line-break character: a tab, a carriage return inside the line, a form feed, U+2028 and a few others.
+  Codex then wrote to a file whose name Levain never saw, so a standing consent grant on one file could cover a write to
+  another, and with a tab, to a file outside the workspace (reproduced against Codex 0.162.1's own patch tool: it deleted
+  a file one directory up). Levain now reads those headers the way Codex does, and a patch whose header holds any such
+  character comes to you as an ordinary consent request. Reading a very long header line also no longer stalls the hook.
+
 ### Added
 - **`levain drop`: leave a message for your coordinator and go.** Your words are kept exactly as you typed them and
   authorise nothing. Each drop gets a drop receipt: one when it arrives, and one naming the threads it became (one
