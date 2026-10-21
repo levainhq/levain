@@ -356,9 +356,10 @@ class CoordStore:
         with write_transaction(self._connect) as conn:
             now = self._stamp()
             if by == "coordinator":
-                from levain.coordinator.lease import fence
+                from levain.coordinator.lease import fence, record_write
 
-                fence(conn, now, token)
+                # the write and its record commit together: a write that rolls back leaves no "it wrote" behind
+                record_write(conn, now, fence(conn, now, token))
             yield conn, now
 
     def _stamp(self) -> str:
@@ -644,6 +645,14 @@ class CoordStore:
         by = self._actor(by, ("coordinator", "service"))
         with self._write() as (conn, now):
             return lease.beat(conn, now, token, by=by)
+
+    def coord_service_beat(self, token: int) -> Any:
+        """The watcher's beat (:func:`levain.coordinator.lease.service_beat`): None when the holder has not written
+        as coordinator recently enough to earn one."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.service_beat(conn, now, token)
 
     def coord_claim(self, launch_id: str, session_key: str) -> int:
         from levain.coordinator import lease

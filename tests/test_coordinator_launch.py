@@ -55,11 +55,17 @@ if args == ["agents", "--json"]:
     extra = json.loads((here / "others.json").read_text()) if (here / "others.json").exists() else []
     if not state.exists():
         print(json.dumps(extra)); sys.exit(0)
+    if (here / "miss_once").exists():             # one partial list: our row missing from this read only
+        (here / "miss_once").unlink()
+        print(json.dumps(extra)); sys.exit(0)
     s = json.loads(state.read_text())
-    row = {{"id": "{HID}", "cwd": s["cwd"], "kind": "background", "startedAt": 1792552347854,
+    cwd = (here / "row_cwd").read_text() if (here / "row_cwd").exists() else s["cwd"]
+    row = {{"id": "{HID}", "cwd": cwd, "kind": "background", "startedAt": 1792552347854,
            "sessionId": "{SID}", "name": s["name"], "state": "working"}}
     if s["reads"]:
         row.update(pid=54960, status="busy")      # the first row right after the spawn has neither
+    if (here / "done").exists():                  # a finished turn stays listed (run_c3b_first_b)
+        row.update(pid=54960, status="idle", state="done")
     s["reads"] += 1
     state.write_text(json.dumps(s))
     print(json.dumps(extra + [row], indent=2)); sys.exit(0)
@@ -87,6 +93,20 @@ class Fake:
     def stops(self) -> list[list[str]]:
         return [c["argv"] for c in self.calls() if c["argv"][:1] == ["stop"]]
 
+    def others(self, rows: list[dict]) -> None:
+        (self.dir / "others.json").write_text(json.dumps(rows))
+
+    def flag(self, name: str, text: str = "") -> None:
+        (self.dir / name).write_text(text)
+
+    def gone(self) -> None:
+        (self.dir / "state.json").unlink()
+
+
+# a session of yours Levain did not start: the list is never empty unless a test empties it
+OTHER = {"id": "77aa0011", "sessionId": "77aa0011-0000-4000-8000-000000000000", "name": "my own session",
+         "cwd": "/elsewhere", "kind": "interactive", "state": "working", "status": "busy"}
+
 
 @pytest.fixture
 def fake(tmp_path, monkeypatch):
@@ -97,8 +117,10 @@ def fake(tmp_path, monkeypatch):
     exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
     monkeypatch.setenv("PATH", f"{d}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setattr(cl, "READBACK_DELAY", 0.0)
+    monkeypatch.setattr(cl, "UNLISTED_RECHECK", 0.0)
     f = Fake(d)
     f.mode("ok")
+    f.others([OTHER])
     return f
 
 
@@ -216,7 +238,9 @@ def test_a_session_never_listed_fails(store, fake, live_hook):
     launch_id = woken(store)
     got = cl.launch_session(store, launch_id)
     assert not got.started and "started no session listed" in got.refusal
-    assert len([c for c in fake.calls() if c["argv"] == ["agents", "--json"]]) == cl.READBACK_TRIES
+    # the read back's tries, then one more list to stop anything under its name (nothing was listed)
+    assert len([c for c in fake.calls() if c["argv"] == ["agents", "--json"]]) == cl.READBACK_TRIES + 1
+    assert "no session named" in got.refusal and fake.stops() == []
     assert store.launch(launch_id).state == "failed"
 
 
@@ -481,19 +505,105 @@ def test_watch_leaves_a_launch_another_process_is_starting(store, fake, live_hoo
     assert fake.spawns() == [] and store.launch(launch_id).state == "pending"
 
 
-def test_a_listed_silent_holder_keeps_the_lease_across_a_ttl(store, fake, live_hook, clock):
+def test_a_listed_working_holder_that_writes_keeps_the_lease(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    from levain.coordinator.store import Part
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    for i in range(4):                                  # 4 x 20 min: well past one LEASE_TTL with no beat of its own
+        clock[0] += timedelta(minutes=20)
+        d, _ = store.accept_drop(f"drop {i}", surface="cli")
+        store.split(d.drop_id, [Part("work", f"w{i}")], by="coordinator", token=token)    # a write, not a beat
+        lines = cl.watch_once(store)
+        assert any(line.startswith(f"lease {token} held by {ln.launch_id}: beat") for line in lines), lines
+    held = store.coord_status()["lease"]
+    assert held["token"] == token and held["live"] and held["holder"] == ln.session_key
+    assert store.launch(ln.launch_id).state == "active"
+
+
+def test_a_listed_done_holder_gets_no_beat_and_its_launch_ends(store, fake, live_hook, clock):
+    # run_c3b_first_b: a finished turn stays listed, status idle, state done
     from datetime import timedelta
 
     ln = started(store)
-    first = store.coord_status()["lease"]
-    assert first["holder"] == ln.session_key and first["live"]
-    for _ in range(4):                                  # 4 x 20 min: well past one LEASE_TTL with no beat of its own
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=10)
+    lines = cl.watch_once(store)
+    assert any("its session is done, not beaten" in line for line in lines), lines
+    clock[0] += lease.LEASE_TTL
+    assert not store.coord_lease().live and store.coord_status()["lease"] is None      # lapsed, never beaten
+    # C3a's IDLE_GRACE path: the next drop past it ends the launch (it wrote, so no death) and asks for a fresh one
+    clock[0] += lease.IDLE_GRACE
+    store.accept_drop("a later drop", surface="cli")
+    got = store.launch(ln.launch_id)
+    assert got.state == "ended" and got.cause == "lost the lease"
+    assert store.coord_status()["wake"] == "launching" and token != store.coord_status()["lease"]["token"]
+    # and the watcher stops the done session it left (the fresh launch's spawn lists nothing here: the fake has one
+    # sessionId, which the fresh launch would otherwise take over)
+    fake.mode("never")
+    lines = cl.watch_once(store)
+    assert any(line.startswith(f"launch {ln.launch_id} ended (lost the lease): claude stop {HID}") for line in lines)
+
+
+def test_a_listed_working_holder_silent_past_two_ttls_lapses(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)             # its last write
+    for _ in range(3):                                  # t+20, t+40, t+60: the claim is within 2 x TTL
         clock[0] += timedelta(minutes=20)
-        lines = cl.watch_once(store)
-        assert any(line.startswith(f"lease {first['token']} held by {ln.launch_id}: beat") for line in lines), lines
-    held = store.coord_status()["lease"]
-    assert held["token"] == first["token"] and held["live"] and held["holder"] == ln.session_key
-    assert store.launch(ln.launch_id).state == "active"
+        assert any(line.startswith(f"lease {token} held by {ln.launch_id}: beat") for line in cl.watch_once(store))
+    clock[0] += timedelta(minutes=20)                   # t+80: silent 80 min, listed and working all along
+    lines = cl.watch_once(store)
+    assert any("it wrote nothing as coordinator in 60 min, not beaten" in line for line in lines), lines
+    clock[0] += timedelta(minutes=20)                   # past the until the t+60 beat gave
+    assert not store.coord_lease().live
+    assert not any("beat to" in line for line in cl.watch_once(store))
+
+
+def test_a_launch_just_started_that_never_wrote_gets_no_beat(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert any(f"held by {ln.launch_id}: it wrote nothing" in line for line in lines), lines
+
+
+def test_a_holder_that_only_split_under_its_token_ends_gone_not_0_turns(store, fake, live_hook, clock):
+    # L2 MED-3: a fenced thread write counts as a turn, not only a lease row
+    from datetime import timedelta
+
+    from levain.coordinator.store import Part
+
+    ln = started(store)
+    token = store.coord_status()["lease"]["token"]      # the bootstrap token its brief names; it never claimed
+    d, _ = store.accept_drop("split me", surface="cli")
+    store.split(d.drop_id, [Part("work", "w")], by="coordinator", token=token)
+    fake.gone()
+    clock[0] += timedelta(minutes=1)
+    cl.watch_once(store)
+    got = store.launch(ln.launch_id)
+    assert got.state == "ended" and got.cause == "gone"
+    assert store.coord_status()["wake"] == "wake"
+
+
+def test_a_refused_fenced_write_records_nothing(store, fake, live_hook, qdir):
+    from levain.coordinator.store import CoordError, Part
+
+    ln = started(store)
+    token = store.coord_status()["lease"]["token"]
+    d, _ = store.accept_drop("split me", surface="cli")
+    store.split(d.drop_id, [Part("work", "w")], by="coordinator", token=token)
+    before = rows(qdir, "SELECT count(*) FROM lease_events")
+    with pytest.raises(CoordError):                     # already split: the write rolls back, and its record with it
+        store.split(d.drop_id, [Part("work", "w2")], by="coordinator", token=token)
+    assert rows(qdir, "SELECT count(*) FROM lease_events") == before
+    assert rows(qdir, "SELECT kind, cause, by, holder FROM lease_events ORDER BY seq DESC LIMIT 1") == [
+        ("beat", "write", "coordinator", ln.session_key)]
 
 
 def test_an_unlisted_holder_loses_the_lease_and_dies_at_0_turns(store, fake, live_hook, clock, qdir):
@@ -533,7 +643,7 @@ def test_an_unreadable_list_ends_nothing(store, fake, live_hook, clock):
     (fake.dir / "agents_fail").write_text("")
     clock[0] += timedelta(minutes=1)
     lines = cl.watch_once(store)
-    assert "claude agents --json could not be read: no session observed" in lines
+    assert "claude agents --json could not be read or listed no session: no session observed" in lines
     assert store.launch(ln.launch_id).state == "active" and fake.stops() == []
 
 
@@ -571,6 +681,10 @@ def test_levain_coord_watch_once_and_wake(store, qdir, fake, live_hook, capsys):
     assert "asked for coordinator launch" in out.out and f"started: claude attach {HID}" in out.out
     assert len(fake.spawns()) == 1
     out = _main(qdir, capsys, "coord", "watch", "--once")
+    assert "it wrote nothing as coordinator" in out.out and "beat to" not in out.out
+    ln = next(x for x in CoordStore(qdir).launches_active() if x.role == "coordinator")
+    CoordStore(qdir).coord_claim(ln.launch_id, ln.session_key)
+    out = _main(qdir, capsys, "coord", "watch", "--once")
     assert "beat to" in out.out
 
 
@@ -578,6 +692,168 @@ def test_levain_coord_wake_exits_1_when_its_launch_is_refused(store, qdir, fake,
     fake.mode("trust")
     out = _main(qdir, capsys, "coord", "wake", rc=1)
     assert "not started: workspace not trusted" in out.out and "&& claude" in out.out
+
+
+# --- C3b fix 1: no session left running without a row; the list's evidence ------------------------------------
+def test_an_interrupt_after_the_spawn_stops_the_session_and_reraises(store, fake, live_hook, monkeypatch):
+    launch_id = woken(store)
+    real = cl._read_back
+
+    def read_back_then_ctrl_c(*a, **kw):
+        real(*a, **kw)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cl, "_read_back", read_back_then_ctrl_c)
+    with pytest.raises(KeyboardInterrupt):
+        cl.launch_session(store, launch_id)
+    assert fake.stops() == [["stop", HID]]
+    assert store.launch(launch_id).state == "pending"           # it expires at LAUNCH_TTL; nothing runs under it
+
+
+def test_a_fault_in_activation_stops_the_session(store, fake, live_hook, monkeypatch):
+    import sqlite3 as sq
+
+    launch_id = woken(store)
+
+    def boom(*a, **kw):
+        raise sq.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "launch_activate", boom)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "the launch faulted" in got.refusal and f"stopped {HID}" in got.refusal
+    assert fake.stops() == [["stop", HID]] and store.launch(launch_id).state == "failed"
+
+
+def test_a_row_without_a_usable_id_is_stopped_by_name(store, fake, live_hook, monkeypatch):
+    launch_id = woken(store)
+    real = cl._read_back
+    monkeypatch.setattr(cl, "_read_back", lambda *a, **kw: [dict(real(*a, **kw)[0], sessionId=None)])
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "without a usable id" in got.refusal
+    assert fake.stops() == [["stop", HID]] and store.launch(launch_id).state == "failed"
+
+
+def test_a_row_in_another_directory_is_stopped_and_fails(store, fake, live_hook, workdir):
+    fake.flag("row_cwd", "/somewhere/else")
+    launch_id = woken(store)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and f"not {os.path.realpath(workdir)}" in got.refusal
+    assert fake.stops() == [["stop", HID]] and store.launch(launch_id).state == "failed"
+
+
+def test_the_watcher_stops_a_session_a_failed_launch_left_by_name(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    fake.mode("never")                                   # listed only after the read back gave up
+    launch_id = woken(store)
+    assert not cl.launch_session(store, launch_id).started
+    name = f"levain-coordinator-{launch_id.removeprefix('ln-')}"
+    (fake.dir / "state.json").write_text(json.dumps({"name": name, "cwd": "/x", "reads": 1}))
+    stranger = {"id": "5e5e5e5e", "sessionId": "5e5e5e5e-0000-4000-8000-000000000000",
+                "name": "levain-coordinator-" + "ab" * 16, "cwd": "/y", "state": "working"}  # another store's
+    fake.others([OTHER, stranger])
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert any(line.startswith(f"launch {launch_id} failed (") and f"stopped {HID}" in line for line in lines), lines
+    assert fake.stops() == [["stop", HID]]
+
+
+def test_the_watcher_never_stops_a_pending_launchs_session(store, fake, live_hook, clock):
+    launch_id = woken(store)
+    assert store.launch_claim_spawn(launch_id, 1)[1] is None   # another process is starting it right now
+    name = f"levain-coordinator-{launch_id.removeprefix('ln-')}"
+    (fake.dir / "state.json").write_text(json.dumps({"name": name, "cwd": "/x", "reads": 1}))
+    cl.watch_once(store)
+    assert fake.stops() == [] and store.launch(launch_id).state == "pending"
+
+
+def test_a_starter_killed_outright_leaves_a_session_the_watcher_stops_after_launch_ttl(store, fake, live_hook, clock):
+    # SIGTERM / SIGKILL run no finally: the spawn row stands, the launch stays pending, its session runs
+    from datetime import timedelta
+
+    launch_id = woken(store)
+    assert store.launch_claim_spawn(launch_id, 1)[1] is None
+    name = f"levain-coordinator-{launch_id.removeprefix('ln-')}"
+    (fake.dir / "state.json").write_text(json.dumps({"name": name, "cwd": "/x", "reads": 1}))
+    cl.watch_once(store)
+    assert fake.stops() == []                           # in flight: never stopped
+    clock[0] += lease.LAUNCH_TTL + timedelta(seconds=1)
+    lines = cl.watch_once(store)
+    assert store.launch(launch_id).state == "expired"
+    assert any(line.startswith(f"launch {launch_id} expired (") for line in lines), lines
+    assert fake.stops() == [["stop", HID]]
+
+
+def test_an_empty_list_observes_nothing(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    fake.gone()
+    fake.others([])                                      # a daemon restarting lists nothing at all
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert any("listed no session" in line for line in lines), lines
+    assert store.launch(ln.launch_id).state == "active"
+
+
+def test_one_missed_read_ends_nothing(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    fake.flag("miss_once")                               # a partial first list; the second read lists it again
+    clock[0] += timedelta(minutes=1)
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "active"
+    agents = [c for c in fake.calls() if c["argv"] == ["agents", "--json"]]
+    assert len(agents) == 3                              # the read back, then the two reads of this pass
+
+
+def test_a_worker_launch_is_never_started(qdir, store, fake, live_hook):
+    from levain.coordinator.store import Part
+
+    d, _ = store.accept_drop("work for a worker", surface="cli")
+    token = store.coord_take()
+    (t,) = store.split(d.drop_id, [Part("work", "w")], by="operator")
+    ln = store.launch_request(token, harness="claude", threads=[t.thread_id])
+    got = cl.launch_session(store, ln.launch_id)
+    assert not got.started and "the worker brief is not built" in got.refusal
+    lines = cl.watch_once(store)
+    assert f"launch {ln.launch_id}: a worker launch; the worker brief is not built, left pending" in lines
+    assert fake.spawns() == [] and store.launch(ln.launch_id).state == "pending"
+    assert rows(qdir, "SELECT count(*) FROM launch_spawns") == [(0,)]
+
+
+def test_the_briefs_directory_is_gitignored(store, fake, live_hook, workdir):
+    (workdir / ".levain").mkdir()
+    (workdir / ".levain" / ".gitignore").write_text("answers.json\n")
+    assert cl.launch_session(store, woken(store)).started
+    lines = (workdir / ".levain" / ".gitignore").read_text().splitlines()
+    assert [x for x in lines if x] == ["answers.json", "briefs/"]          # the install's own helper wrote it
+
+
+def test_a_multi_line_cause_is_written_as_one_line(store, fake, monkeypatch):
+    monkeypatch.setattr(cl, "hook_live", lambda d: (False, "first line\nsecond\tline ‮"))
+    launch_id = woken(store)
+    got = cl.launch_session(store, launch_id)
+    ln = store.launch(launch_id)
+    assert ln.state == "failed" and ln.cause == got.refusal and "\n" not in ln.cause
+    assert "first line second line" in ln.cause and "‮" not in ln.cause
+
+
+@pytest.mark.parametrize("model", ["--dangerously-skip-permissions", "-x", "haiku sonnet", "a;b", ""])
+def test_a_model_is_checked_where_the_setting_is_written(qdir, workdir, model):
+    with pytest.raises(lease.LeaseRefused, match="never starting with -"):
+        CoordStore(qdir).coord_set_agent("claude", model=model, cwd=str(workdir))
+
+
+def test_a_model_name_the_harness_takes_is_kept(qdir, workdir):
+    for model in ("haiku", "claude-opus-5-5", "claude-sonnet-5-5[1m]", "us.anthropic.x_1"):
+        assert CoordStore(qdir).coord_set_agent("claude", model=model, cwd=str(workdir)).model == model
+
+
+def test_coord_agent_refuses_a_bad_model_before_any_install(tmp_home, qdir, capsys):
+    out = _main(qdir, capsys, "coord", "agent", "claude", "--model=--bad", rc=1)
+    assert "never starting with -" in out.err and not (tmp_home / ".levain" / "coordinator").exists()
 
 
 # --- the pin (C0 §3.4) -----------------------------------------------------------------------------------------

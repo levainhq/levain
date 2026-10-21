@@ -17,11 +17,16 @@ A launch row (:mod:`levain.coordinator.lease`) is what was asked for; this modul
      :func:`levain.launch.child_env`. Never ``--bare``, never a bypass mode; never ``--session-id`` (``--bg`` ignores
      it, measured by the same run). An untrusted directory exits 1 with "Workspace not trusted. Run `claude` in
      <realpath> once": the launch fails with that cause, and the remedy line is returned for you to run;
-  5. the read back: ``claude agents --json``, the one row whose ``name`` is ours. ``sessionId`` is the harness
-     session id the launch records; ``id`` is what ``claude attach`` and ``claude stop`` take (read, never derived).
-     The first row may carry no pid and no status yet, so neither is required. Not listed: the launch fails;
+  5. the read back: ``claude agents --json``, the one row whose ``name`` is ours and whose ``cwd`` is the launch
+     directory's realpath. ``sessionId`` is the harness session id the launch records; ``id`` is what ``claude
+     attach`` and ``claude stop`` take (read, never derived). The first row may carry no pid and no status yet, so
+     neither is required. Not listed: the launch fails;
   6. activation (:func:`levain.coordinator.lease.activate`). Refused (the lease was lost while it started): the
-     session is stopped (``claude stop <id>``) and the refusal returned.
+     session is stopped and the refusal returned.
+
+Only a coordinator launch is started (a worker's brief is not built). Once ``claude --bg`` returned 0, every way out
+of 5-6 that does not leave the launch active stops the sessions listed under its name, a Ctrl-C included; a process
+killed outright leaves its launch to expire, and the watcher stops the session by name then.
 
 :func:`setup_install` makes the coordinator's directory (by default ``<levain home>/coordinator``) a Levain install
 for Claude Code when it is not one, by running ``levain init --adapter claude-code`` non-interactively in this process.
@@ -29,8 +34,8 @@ Claude Code's own trust prompt is yours: Levain never reads or writes ``~/.claud
 
 :func:`watch_once` is one pass of ``levain coord watch`` (C0 §7 L9: activation and death are visible): it starts the
 pending launches nobody started, ends the launches whose sessions are gone, beats the lease of the coordinator whose
-session is still listed, and stops the sessions of launches that ended. A pending launch so has a starter wherever it
-is written: ``levain drop`` and ``levain coord wake`` start their own, the watcher every other.
+session is listed, not done and writing, and stops the sessions of launches that are over. A pending launch so has a
+starter wherever it is written: ``levain drop`` and ``levain coord wake`` start their own, the watcher every other.
 
 [seat] choices (C3b, 1020+50): the session name ``levain-<role>-<launch hex>``; the retry of the read back
 (:data:`READBACK_TRIES` x :data:`READBACK_DELAY`); the spawn and agents-call timeouts; the brief quotes at most
@@ -43,7 +48,12 @@ launch it asked for did not start. Stdlib only.
 Known edges: a trust refusal or a session never listed is a death, so three in a row stop the wakes until you take
 or release (the first real run will likely meet it). The consent queue's settings file is created once: when your
 main install made it, the coordinator's install keeps it, and its grants verify against that install's cockpit (init
-warns and continues).
+warns and continues). Your user-scope Claude Code settings, hooks and CLAUDE.md imports load into the coordinator's
+session too (doctor checks the install's wiring, not the effective settings). Drops that arrive while a done
+coordinator still holds the lease wait up to LEASE_TTL + IDLE_GRACE; handing a new drop into a running session is not
+built. A crashed spawn winner is not retried: its launch expires at LAUNCH_TTL and counts as a death. A list with no
+row at all observes nothing, so a coordinator that dies as the only listed session ends by its lease lapsing (the
+IDLE_GRACE path), not by the watcher.
 """
 from __future__ import annotations
 
@@ -52,6 +62,7 @@ import hashlib
 import json
 import os
 import pwd
+import re
 import shlex
 import shutil
 import sqlite3
@@ -67,10 +78,11 @@ from typing import Any
 
 from levain import unshowable
 from levain.contracts.canon import canonical_bytes
+from levain.coordinator import lease as lease_mod
 from levain.coordinator.lease import LEASE_TTL, LeaseRefused
 from levain.coordinator.store import CoordError, CoordStore
 
-__all__ = ["BRIEF_DROPS", "HOOK_ROW", "READBACK_DELAY", "READBACK_TRIES", "Outcome", "brief_path",
+__all__ = ["BRIEF_DROPS", "HOOK_ROW", "READBACK_DELAY", "READBACK_TRIES", "UNLISTED_RECHECK", "Outcome", "brief_path",
            "default_coordinator_dir", "hook_live", "launch_session", "session_name", "setup_install", "trust_remedy",
            "watch", "watch_once"]
 
@@ -82,6 +94,9 @@ _SPAWN_TIMEOUT = 60
 _CALL_TIMEOUT = 30
 BRIEF_DROPS = 20
 _TRUST_REFUSAL = "Workspace not trusted"
+UNLISTED_RECHECK = 2.0        # seconds: a launch ends unlisted only when two reads this far apart both miss it
+_OURS = re.compile(r"levain-(coordinator|worker)-([0-9a-f]{32})")      # session_name's shape
+_OVER = ("ended", "failed", "expired")
 
 
 @dataclass(frozen=True)
@@ -265,6 +280,10 @@ def _write_brief(store: CoordStore, launch: Any) -> Path:
         if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() \
                 or d == path.parent and stat.S_IMODE(st.st_mode) & 0o077:
             raise CoordError(f"{d} is not a private directory of yours (a link, another owner, or open to others)")
+    from levain.install import _ensure_gitignored
+
+    # a brief quotes drops verbatim: a `git add -A` in a repo directory must not commit them (install's own helper)
+    _ensure_gitignored(path.parent.parent, "briefs/")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(_brief_text(store, launch))
@@ -317,6 +336,18 @@ def _stop(exe: str, harness_id: str, *, cwd: str, env: dict[str, str]) -> str:
     return f"claude stop {harness_id}: " + ((cp.stdout or cp.stderr).strip().splitlines() or [f"exit {cp.returncode}"])[0]
 
 
+def _stop_named(exe: str, name: str, *, cwd: str, env: dict[str, str]) -> str:
+    """Stop every listed session named ``name`` (ours: the name carries the launch id), and say what happened."""
+    stopped = [_stop(exe, h, cwd=cwd, env=env) for r in _listed(exe, name, cwd=cwd, env=env) if (h := _harness_id(r))]
+    return "; ".join(stopped) if stopped else f"no session named {name} was listed to stop"
+
+
+def _plain(cause: str) -> str:
+    """``cause`` as the one plain line ``launch_end`` takes (never refused there for its shape)."""
+    flat = " ".join(unshowable.mark(" ".join(str(cause).split()), allow="").split())
+    return flat[:4000] or "failed"
+
+
 def _first_line(text: str) -> str:
     line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
     return unshowable.mark(line[:300], allow="")
@@ -332,22 +363,39 @@ def _harness_id(row: dict[str, Any]) -> str | None:
 def launch_session(store: CoordStore, launch_id: str) -> Outcome:
     """Start launch ``launch_id``'s session (see the module docstring for the steps). Every way it does not start is
     an :class:`Outcome` with ``started`` False and the refusal; the launch is written ``failed`` with that cause
-    whenever this call held the spawn."""
+    whenever this call held the spawn. A Ctrl-C after the spawn stops the session and propagates, leaving the launch
+    pending until it expires at LAUNCH_TTL."""
     ln = store.launch(launch_id)
     if ln is None:
         return Outcome(str(launch_id)[:40], False, refusal=f"no launch {str(launch_id)[:40]!r}")
     if ln.harness != "claude":
         return Outcome(launch_id, False, refusal=f"launch {launch_id} is a {ln.harness} launch; only claude is built")
+    if ln.role != "coordinator":
+        return Outcome(launch_id, False, refusal=f"launch {launch_id} is a {ln.role} launch; the worker brief is not "
+                                                 "built")
     got, why = store.launch_claim_spawn(launch_id, os.getpid())
     if why is not None:
         return Outcome(launch_id, False, refusal=why)
 
     def fail(cause: str, remedy: str | None = None) -> Outcome:
+        cause = _plain(cause)
         try:
-            store.launch_end(launch_id, "failed", cause[:4000])
+            store.launch_end(launch_id, "failed", cause)
         except (CoordError, OSError, sqlite3.Error) as exc:          # it moved on meanwhile (a takeover voided it): say so
-            cause = f"{cause} (and the launch could not be written failed: {exc})"
+            cause = _plain(f"{cause} (and the launch could not be written failed: {exc})")
         return Outcome(launch_id, False, refusal=cause, remedy=remedy)
+
+    # once `claude --bg` returned 0 a session may run under our name: every way out that does not end with the launch
+    # active stops it by that name, a Ctrl-C included (the finally below). A SIGTERM or SIGKILL runs no finally: the
+    # launch stays pending, expires at LAUNCH_TTL, and the watcher's name sweep stops the session then
+    spawned = settled = False
+    exe = name = cwd = ""
+    env: dict[str, str] = {}
+
+    def stop_ours() -> str:
+        nonlocal settled
+        settled = True
+        return _stop_named(exe, name, cwd=cwd, env=env)
 
     try:
         cwd = got.cwd
@@ -370,10 +418,7 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
         try:
             cp = _run(argv, cwd=cwd, env=env, timeout=_SPAWN_TIMEOUT)
         except subprocess.TimeoutExpired:
-            stopped = [_stop(exe, h, cwd=cwd, env=env) for r in _listed(exe, name, cwd=cwd, env=env)
-                       if (h := _harness_id(r))]
-            return fail(f"claude --bg did not return in {_SPAWN_TIMEOUT}s" + (f"; {'; '.join(stopped)}"
-                                                                           if stopped else ""))
+            return fail(f"claude --bg did not return in {_SPAWN_TIMEOUT}s; {stop_ours()}")
         except OSError as exc:
             return fail(f"claude could not be run ({type(exc).__name__}: {str(exc)[:200]})")
         output = f"{cp.stdout}\n{cp.stderr}"
@@ -382,27 +427,35 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
                 real = os.path.realpath(cwd)
                 return fail(f"workspace not trusted: {real}", trust_remedy(real))
             return fail(f"claude --bg exited {cp.returncode}: {_first_line(output) or '(no output)'}")
+        spawned = True
         rows = _read_back(exe, name, cwd=cwd, env=env)
         if not rows:
-            return fail(f"claude --bg started no session listed by `claude agents` as {name}")
+            # it may be listed later: stopped now if it is, and the watcher stops it by name if it shows up after
+            return fail(f"claude --bg started no session listed by `claude agents` as {name}; {stop_ours()}")
         if len(rows) > 1:
-            stopped = [_stop(exe, h, cwd=cwd, env=env) for r in rows if (h := _harness_id(r))]
-            return fail(f"{len(rows)} sessions are named {name}; {'; '.join(stopped)}")
+            return fail(f"{len(rows)} sessions are named {name}; {stop_ours()}")
         row = rows[0]
         hid, sid = _harness_id(row), row.get("sessionId")
         if hid is None or not isinstance(sid, str):
-            return fail(f"`claude agents` lists {name} without a usable id and sessionId")
+            return fail(f"`claude agents` lists {name} without a usable id and sessionId; {stop_ours()}")
+        real = os.path.realpath(cwd)
+        if row.get("cwd") != real:
+            return fail(f"`claude agents` lists {name} in {str(row.get('cwd'))[:300]!r}, not {real}; {stop_ours()}")
         try:
             active, refused = store.launch_activate(launch_id, harness_session_id=sid, argv_sha256=argv_sha)
         except LeaseRefused as exc:
-            stop = _stop(exe, hid, cwd=cwd, env=env)
-            return fail(f"activation refused ({exc}); {stop}")
+            return fail(f"activation refused ({exc}); {stop_ours()}")
         if refused is not None:
             # activate wrote the launch expired or failed itself: the session it started holds nothing, so it stops
-            return Outcome(launch_id, False, refusal=f"{refused}; {_stop(exe, hid, cwd=cwd, env=env)}")
+            return Outcome(launch_id, False, refusal=_plain(f"{refused}; {stop_ours()}"))
+        settled = True
         return Outcome(launch_id, True, attach=f"claude attach {hid}", harness_session_id=sid)
     except (CoordError, OSError, sqlite3.Error) as exc:
-        return fail(f"the launch faulted ({type(exc).__name__}: {str(exc)[:300]})")
+        return fail(f"the launch faulted ({type(exc).__name__}: {str(exc)[:300]})"
+                    + (f"; {stop_ours()}" if spawned and not settled else ""))
+    finally:
+        if spawned and not settled:         # a BaseException on the way out (KeyboardInterrupt, SystemExit)
+            stop_ours()
 
 
 # --- the watcher (levain coord watch) ----------------------------------------------------------------------------
@@ -413,28 +466,48 @@ def _harness() -> tuple[str | None, dict[str, str]]:
     return shutil.which("claude", path=env.get("PATH")), env
 
 
+def _observed(exe: str, env: dict[str, str], cwd: str) -> list[dict[str, Any]] | None:
+    """The list, or None when it cannot be read OR holds no row at all: an empty list (a daemon restarting) is no
+    evidence that every session is gone."""
+    return _agents(exe, cwd=cwd, env=env) or None
+
+
+def _by_session(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {r["sessionId"]: r for r in rows if isinstance(r.get("sessionId"), str)}
+
+
 def watch_once(store: CoordStore) -> list[str]:
     """One pass of ``levain coord watch``; the lines say what it did. In order:
 
-      (a) every pending launch no process has claimed the spawn of is started (:func:`launch_session`; its one-spawner
-          compare-and-set makes a double start impossible), so a drop written from the phone or the cockpit, which
-          start nothing themselves, still gets its coordinator;
-      (b) an ``active`` claude launch whose session ``claude agents --json`` no longer lists is written ``ended``:
-          ``0 turns`` for a coordinator that wrote no lease row as coordinator since it went active (a death), else
-          ``gone``;
-      (c) the coordinator holding the live lease, while its session is listed, gets a SERVICE beat. This is what
-          makes LEASE_TTL a liveness bound rather than a turn-length bound: a holder busy in one long turn never
-          beats, and its lease stays only because its session is still there;
-      (d) an ``ended`` launch whose session is still listed (a takeover, a release of yours, a lost lease) is
-          stopped, ``claude stop <id>``.
+      (a) every pending coordinator launch no process has claimed the spawn of is started (:func:`launch_session`;
+          its one-spawner compare-and-set makes a double start impossible), so a drop written from the phone or the
+          cockpit, which start nothing themselves, still gets its coordinator. A worker launch is left pending (the
+          worker brief is not built);
+      (b) an ``active`` claude launch whose session ``claude agents --json`` lists in neither of two reads
+          :data:`UNLISTED_RECHECK` seconds apart is written ``ended``: ``0 turns`` for a coordinator that wrote
+          nothing as coordinator since it went active (a death), else ``gone``;
+      (c) the coordinator holding the live lease gets a SERVICE beat only while its session is listed, its row's
+          ``state`` is not ``done`` (a finished turn stays listed, idle and done, until stopped), and it wrote as
+          coordinator within ``SERVICE_BEAT_WINDOW`` (the store checks that in the beat's transaction). Listed is
+          not alive: a done or silent holder gets no beat, its lease lapses at its until, and C3a's IDLE_GRACE path
+          ends its launch. A holder busy in one long turn that wrote recently keeps the lease without beating;
+      (d) every listed session of a launch of THIS store that has ended, failed or expired is stopped,
+          ``claude stop <id>``: matched by the ``sessionId`` its ``active`` row recorded, or by its name
+          ``levain-<role>-<launch hex>`` naming such a launch (a session a failed or interrupted start left running).
+          A pending launch's session is never stopped: its start may be in flight in another process.
 
-    Only sessions Levain started are touched, matched by the ``sessionId`` its ``active`` row recorded; any other
-    row in the list is never read further. When the list cannot be read, (b)-(d) do nothing: an unread list is no
-    evidence of anything."""
+    Any other row in the list is never read further. When the list cannot be read or holds no row, (b)-(d) do
+    nothing: an unread list is no evidence of anything."""
     lines: list[str] = []
+    # lapses and expiries are written first: a launch whose starter was killed outright stays pending until someone
+    # writes it expired, and only then does (d) stop the session it left
+    store.coord_status()
     for ln in store.launches_unspawned():
         if ln.harness != "claude":
             lines.append(f"launch {ln.launch_id}: a {ln.harness} launch; only claude is built, left pending")
+            continue
+        if ln.role != "coordinator":
+            lines.append(f"launch {ln.launch_id}: a {ln.role} launch; the worker brief is not built, left pending")
             continue
         got = launch_session(store, ln.launch_id)
         lines.append(f"launch {got.launch_id} started: {got.attach}" if got.started
@@ -447,14 +520,23 @@ def watch_once(store: CoordStore) -> list[str]:
     if exe is None:
         lines.append("claude is not on PATH: no session observed")
         return lines
-    rows = _agents(exe, cwd=str(store.directory), env=env)
+    rows = _observed(exe, env, str(store.directory))
     if rows is None:
-        lines.append("claude agents --json could not be read: no session observed")
+        lines.append("claude agents --json could not be read or listed no session: no session observed")
         return lines
-    listed = {r["sessionId"]: r for r in rows if isinstance(r.get("sessionId"), str)}
-    for ln in active:
-        if ln.harness_session_id in listed:
-            continue
+    missing = [ln for ln in active if ln.harness_session_id not in _by_session(rows)]
+    if missing:
+        # one read that misses a row is not enough to call a death: a launch ends only when a second read agrees
+        time.sleep(UNLISTED_RECHECK)
+        again = _observed(exe, env, str(store.directory))
+        if again is None:
+            lines.append("claude agents --json could not be read again or listed no session: no launch ended")
+            missing = []
+        else:
+            rows = again
+            missing = [ln for ln in missing if ln.harness_session_id not in _by_session(rows)]
+    listed = _by_session(rows)
+    for ln in missing:
         try:
             ended = store.launch_end_unlisted(ln.launch_id)
         except (CoordError, sqlite3.Error) as exc:
@@ -465,23 +547,44 @@ def watch_once(store: CoordStore) -> list[str]:
     held = store.coord_lease()
     if held is not None and held.live and held.holder != "operator":
         holder = next((ln for ln in active if ln.session_key == held.holder), None)
-        if holder is not None and holder.role == "coordinator" and holder.harness_session_id in listed:
-            try:
-                got = store.coord_beat(held.token, by="service")
-                lines.append(f"lease {held.token} held by {holder.launch_id}: beat to {got.until}")
-            except (CoordError, sqlite3.Error) as exc:          # it moved on since it was read: nothing to keep
-                lines.append(f"lease {held.token}: not beaten ({exc})")
-    for sid, row in listed.items():
-        ln = store.launch_by_harness_session(sid)
-        if ln is None or ln.state != "ended":
+        row = None if holder is None else listed.get(holder.harness_session_id)
+        if holder is not None and holder.role == "coordinator" and row is not None:
+            if row.get("state") == "done":
+                lines.append(f"lease {held.token} held by {holder.launch_id}: its session is done, not beaten "
+                             f"(the lease lapses at {held.until})")
+            else:
+                try:
+                    got = store.coord_service_beat(held.token)
+                    lines.append(f"lease {held.token} held by {holder.launch_id}: beat to {got.until}" if got else
+                                 f"lease {held.token} held by {holder.launch_id}: it wrote nothing as coordinator "
+                                 f"in {_minutes(lease_mod.SERVICE_BEAT_WINDOW)} min, not beaten (the lease lapses "
+                                 f"at {held.until})")
+                except (CoordError, sqlite3.Error) as exc:          # it moved on since it was read: nothing to keep
+                    lines.append(f"lease {held.token}: not beaten ({exc})")
+    stopped: set[str] = set()
+    for row in rows:
+        ln = None
+        if isinstance(row.get("sessionId"), str):
+            ln = store.launch_by_harness_session(row["sessionId"])
+        if ln is None and isinstance(row.get("name"), str) and (m := _OURS.fullmatch(row["name"])):
+            ln = store.launch("ln-" + m.group(2))
+            ln = ln if ln is not None and ln.role == m.group(1) else None
+        if ln is None or ln.state not in _OVER:
             continue
         hid = _harness_id(row)
         if hid is None:
-            lines.append(f"launch {ln.launch_id} ended but its session is listed without a usable id")
+            lines.append(f"launch {ln.launch_id} {ln.state} but its session is listed without a usable id")
             continue
-        lines.append(f"launch {ln.launch_id} ended ({ln.cause}): {_stop(exe, hid, cwd=ln.cwd or str(store.directory),
-                                                                          env=env)}")
+        if hid in stopped:
+            continue
+        stopped.add(hid)
+        lines.append(f"launch {ln.launch_id} {ln.state} ({ln.cause}): "
+                     f"{_stop(exe, hid, cwd=ln.cwd or str(store.directory), env=env)}")
     return lines
+
+
+def _minutes(delta: Any) -> int:
+    return int(delta.total_seconds() // 60)
 
 
 def watch(store: CoordStore, *, every: float, emit: Callable[[str], None] = print,

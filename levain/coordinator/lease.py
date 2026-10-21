@@ -33,7 +33,9 @@ token (:func:`claim_spawn`); the primary key is the compare-and-set, so a second
 the service; an operator ``take`` holds the lease for ``LEASE_TTL`` unless told otherwise; your take or release is what
 "until you look" reads. (C3b, 1020+50): ``unset`` is checked after a live lease, a running coordinator and a pending
 launch (those still say what a drop would do), before the death count; a setting is a whole row, never a field
-update; codex is a value the table holds but :func:`set_agent` refuses until a codex launch is built. Stdlib only.
+update; codex is a value the table holds but :func:`set_agent` refuses until a codex launch is built. (C3b fix 1): a thread
+or drop write the fence lets through is recorded as a ``beat`` row by coordinator that moves nothing
+(:func:`record_write`), so "it wrote as coordinator" is one question over ``lease_events``. Stdlib only.
 """
 from __future__ import annotations
 
@@ -52,9 +54,10 @@ from levain.coordinator.store import CoordError, _append_only, next_gseq
 
 __all__ = [
     "BACKOFF", "HARNESSES", "LAUNCH_KINDS", "LAUNCH_TTL", "LEASE_KINDS", "LEASE_SCHEMA", "LEASE_TTL", "MAX_DEATHS",
-    "ROLES", "SETTING_AGENTS", "Launch", "Lease", "LeaseRefused", "Setting", "activate", "beat", "claim",
-    "by_harness_session", "claim_spawn", "end_launch", "end_unlisted", "fence", "launch", "lease", "launches",
-    "release", "request_launch", "set_agent", "setting", "status", "take", "unspawned", "wake", "wake_state",
+    "ROLES", "SERVICE_BEAT_WINDOW", "SETTING_AGENTS", "Launch", "Lease", "LeaseRefused", "Setting", "activate", "beat",
+    "check_model", "claim", "by_harness_session", "claim_spawn", "end_launch", "end_unlisted", "fence", "launch",
+    "lease", "launches", "record_write", "release", "request_launch", "service_beat", "set_agent", "setting",
+    "status", "take", "unspawned", "wake", "wake_state",
 ]
 
 LEASE_KINDS = ("claim", "beat", "release", "lapse", "takeover")
@@ -74,6 +77,11 @@ BACKOFF = (timedelta(minutes=1), timedelta(minutes=5), timedelta(minutes=30))
 # its launch and asks for a fresh one: a crashed session leaves its launch active, and waiting on it unbounded would
 # read as health
 IDLE_GRACE = LEASE_TTL
+# ruled (C3b fix 1, 1020+50): the watcher's service beat goes only to a holder that wrote as coordinator (a lease row
+# of its own, or a thread or drop write under its token) this recently; a holder silent longer lapses
+SERVICE_BEAT_WINDOW = 2 * LEASE_TTL
+# a model name as the harness takes it: never a leading dash (argv would read it as a flag)
+_MODEL = re.compile(r"[A-Za-z0-9._\[\]][A-Za-z0-9._\[\]-]*")
 # causes the store writes itself; a caller's end_launch never takes one, so no caller can relabel a death
 _SERVICE_CAUSES = ("takeover", "operator release", "lease lost before active", "pending past until",
                    "lost the lease")
@@ -284,6 +292,33 @@ def beat(conn: sqlite3.Connection, now: str, token: object, *, by: str = "coordi
     return lease(conn, now)
 
 
+def record_write(conn: sqlite3.Connection, now: str, held: Lease) -> None:
+    """A thread or drop write the fence let through, recorded as the holder's own ``beat`` row (cause ``write``,
+    by coordinator) that moves ``until`` nowhere: what "it wrote as coordinator" reads (the service beat, ``0
+    turns``, a death) is then one query over ``lease_events``, whatever the write was."""
+    if held.holder != "operator":
+        _event(conn, now, "beat", held.holder, token=held.token, until=held.until, cause="write", by="coordinator")
+
+
+def _wrote_since(conn: sqlite3.Connection, session_key: str, *, gseq: int = 0, at: str = "") -> bool:
+    """Did ``session_key`` write as coordinator (a claim, beat or release of its own, or a fenced write) after
+    ``gseq`` and at or after ``at``?"""
+    return conn.execute("SELECT 1 FROM lease_events WHERE holder = ? AND by = 'coordinator' AND gseq > ? AND at >= ?",
+                        (session_key, gseq, at)).fetchone() is not None
+
+
+def service_beat(conn: sqlite3.Connection, now: str, token: object) -> Lease | None:
+    """The watcher's beat for a holder whose session is listed and not done: given only while that holder wrote as
+    coordinator within :data:`SERVICE_BEAT_WINDOW` (checked here, in the beat's own transaction). None, and nothing
+    written, when it did not: a session that is listed but silent is no evidence it is working, so its lease lapses
+    at its until and C3a's IDLE_GRACE path ends its launch."""
+    held = fence(conn, now, token)
+    if held.holder == "operator" or not _wrote_since(conn, held.holder, at=_plus(now, -SERVICE_BEAT_WINDOW)):
+        return None
+    _event(conn, now, "beat", held.holder, token=held.token, until=_plus(now, LEASE_TTL), cause="beat", by="service")
+    return lease(conn, now)
+
+
 def release(conn: sqlite3.Connection, now: str, token: int | None, *, by: str) -> Lease | None:
     """End the lease. The holder releases with its token (handing off: its launch keeps running); you release whatever
     is held (``token`` None), which also voids pending launches, ends every running coordinator launch, and is you
@@ -485,9 +520,8 @@ def end_unlisted(conn: sqlite3.Connection, now: str, launch_id: str) -> Launch |
     if ln.role == "coordinator":
         active_gseq = conn.execute("SELECT gseq FROM launch_events WHERE launch_id = ? AND kind = 'active'",
                                    (launch_id,)).fetchone()[0]
-        wrote = conn.execute("SELECT 1 FROM lease_events WHERE holder = ? AND by = 'coordinator' AND gseq > ?",
-                             (ln.session_key, active_gseq)).fetchone() is not None
-        cause = "gone" if wrote else "0 turns"
+        # a fenced thread or drop write is a lease row too (record_write): a coordinator that split but never beat
+        cause = "gone" if _wrote_since(conn, ln.session_key, gseq=active_gseq) else "0 turns"
     return end_launch(conn, now, launch_id, "ended", cause)
 
 
@@ -557,6 +591,16 @@ def setting(conn: sqlite3.Connection) -> Setting | None:
     return None if r is None else Setting(*r)
 
 
+def check_model(model: object) -> str | None:
+    """``model`` when it is a model name the spawn's argv can carry (letters, digits, ``. _ [ ] -``, never a leading
+    dash), None for none; refused otherwise."""
+    if model is None:
+        return None
+    if not isinstance(model, str) or len(model) > 200 or _MODEL.fullmatch(model) is None:
+        raise _refused("a model is letters, digits and . _ [ ] - (never starting with -)")
+    return model
+
+
 def set_agent(conn: sqlite3.Connection, now: str, agent: str, *, model: str | None = None,
               cwd: str | None = None) -> Setting:
     """Record your coordinator setting (writer: you only). ``cwd`` is stored as given, which the caller has resolved
@@ -571,7 +615,7 @@ def set_agent(conn: sqlite3.Connection, now: str, agent: str, *, model: str | No
     elif not isinstance(cwd, str) or not cwd.startswith("/"):
         raise _refused("a coordinator agent runs in a directory: an absolute path")
     conn.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, by, at) VALUES (?, ?, ?, ?, 'operator', ?)",
-                 (next_gseq(conn, now), agent, _line("model", model), _line("cwd", cwd), now))
+                 (next_gseq(conn, now), agent, check_model(model), _line("cwd", cwd), now))
     return setting(conn)
 
 
@@ -618,8 +662,7 @@ def _deaths(conn: sqlite3.Connection) -> tuple[int, str | None]:
         ln = _launch_row(conn, "launch_id", launch_id)
         # a launch voided by your take or release is older than your look; one asked for under a lease its asker
         # lost is not the launch's fault; one that lost the lease without ever writing as coordinator died idle
-        wrote = conn.execute("SELECT 1 FROM lease_events WHERE holder = ? AND by = 'coordinator'",
-                             (ln.session_key,)).fetchone() is not None
+        wrote = _wrote_since(conn, ln.session_key)
         died = ln.state in ("failed", "expired") and ln.cause != "lease lost before active" \
             or ln.state == "ended" and (ln.cause == "0 turns" or ln.cause == "lost the lease" and not wrote)
         if not died:

@@ -1067,7 +1067,9 @@ def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
         raise CoordError(f"a {args.agent} coordinator cannot be launched yet (only claude is built); set claude or "
                          "none")
     from levain.coordinator.launch import default_coordinator_dir, setup_install, trust_remedy
+    from levain.coordinator.lease import check_model
 
+    check_model(args.model)          # before any install is made for it (the setting checks it again as it is written)
     log = sys.stderr if args.json else out
     target, live, detail = setup_install(args.cwd or default_coordinator_dir(),
                                          emit=lambda line: print(line, file=log, flush=True))
@@ -1213,8 +1215,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         "agent", help="Choose the coordinator a drop launches: claude (in its own Levain install), or none.",
         description="claude: drops with no coordinator start a Claude Code session in DIR (default "
                     "<levain home>/coordinator), which is made a Levain install for Claude Code first when it is not "
-                    "one. none: drops only queue for you. Levain never edits Claude Code's trust list: run the "
-                    "printed line once and accept the prompt.")
+                    "one. An existing live Levain install in DIR is used as is: the coordinator then shares that "
+                    "entity's memory and grants. none: drops only queue for you. Levain never edits Claude Code's "
+                    "trust list: run the printed line once and accept the prompt.")
     ca.add_argument("agent", choices=("claude", "codex", "none"))
     ca.add_argument("--cwd", type=Path, default=None, metavar="DIR",
                     help="The directory the coordinator runs in (default: <levain home>/coordinator).")
@@ -1225,7 +1228,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         "watch", help="Keep the coordinator's sessions honest: start pending launches, end the gone, beat the live.",
         description="Each pass starts every pending launch nobody started (a drop from the phone or the cockpit), "
                     "ends a launch whose Claude Code session is no longer listed, beats the lease of the coordinator "
-                    "whose session is, and stops a session whose launch ended. Only sessions Levain started.")
+                    "whose session is listed, not done and writing as coordinator, and stops a session whose launch "
+                    "is over. Only sessions Levain started.")
     cwa.add_argument("--every", type=float, default=30.0, metavar="S", help="Seconds between passes (default 30).")
     cwa.add_argument("--once", action="store_true", help="One pass, then exit.")
     for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa):
