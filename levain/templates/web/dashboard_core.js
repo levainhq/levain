@@ -409,7 +409,9 @@
   // The work lists draw whole rows and say how many they leave out: a list that does not fit its card folds the rows below the fold
   // (display none, never a half row) and ends in an "N more" link that opens the panel's focus view. Re-runnable: a redraw, a filter
   // or a resize unfolds first and measures again.
-  const FOLD_PANELS = ["tray", "loops", "keep", "episodes", "now"];
+  const FOLD_PANELS = ["tray", "loops", "keep", "episodes", "now", "inbox", "roster", "stream", "flow-episodes", "flow-spores"];
+  // what a folding list is made of: its rows (a work row, a roster row, a log line) and the headings that group them
+  const FOLD_ROW = ".row, .rrow, .lrow", FOLD_HEAD = ".grp-head, .grp-h";
   function foldRows(body) {
     const panel = body.closest && body.closest(".panel[data-ck-panel]");
     if (!panel || FOLD_PANELS.indexOf(panel.dataset.ckPanel) < 0 || panel.closest(".modal")) return false;
@@ -425,7 +427,8 @@
     const top = body.getBoundingClientRect().top;
     const heldLine = body.querySelector(":scope > .held-line, .held-line");
     const limit = body.clientHeight - 34 - (heldLine ? heldLine.offsetHeight : 0);   // room kept for the link and the held-back line
-    const items = Array.prototype.filter.call(body.querySelectorAll(".row, .grp-head"), (n) => !n.parentElement.closest(".row"));
+    const isRow = (n) => n.matches(FOLD_ROW), isHead = (n) => n.matches(FOLD_HEAD);
+    const items = Array.prototype.filter.call(body.querySelectorAll(FOLD_ROW + ", " + FOLD_HEAD), (n) => !n.parentElement.closest(FOLD_ROW));
     // where bands sit side by side (Morning's Tray: Overdue | Today) each column has its own fold, since a column that overflows says
     // nothing about the one beside it; a band laid in the same flow (`display: contents`) shares the one
     const colOf = (n) => { const c = n.closest(".grp-col"); return c && body.contains(c) && window.getComputedStyle(c).display !== "contents" ? c : null; };
@@ -443,21 +446,25 @@
         const r = n.getBoundingClientRect();
         // rects are measured against where the body is scrolled to: add the scroll back, or a scrolled body folds too few rows
         if (!cut && i > pin && r.bottom - top + body.scrollTop > limit) cut = true;
-        if (cut) { n.style.display = "none"; n.dataset.folded = "1"; if (n.classList.contains("row")) hidden++; }
+        if (cut) { n.style.display = "none"; n.dataset.folded = "1"; if (isRow(n)) hidden++; }
       }
       // a heading left with no row under it goes too
       for (let i = 0; i < list.length; i++) {
-        if (!list[i].classList.contains("grp-head") || list[i].dataset.folded) continue;
-        const next = list.slice(i + 1).find((n) => !n.dataset.folded && n.classList.contains("row"));
-        const nextHead = list.slice(i + 1).findIndex((n) => n.classList.contains("grp-head") && !n.dataset.folded);
+        if (!isHead(list[i]) || list[i].dataset.folded) continue;
+        const next = list.slice(i + 1).find((n) => !n.dataset.folded && isRow(n));
+        const nextHead = list.slice(i + 1).findIndex((n) => isHead(n) && !n.dataset.folded);
         const nextRow = next ? list.indexOf(next) : -1;
         if (nextRow < 0 || (nextHead >= 0 && i + 1 + nextHead < nextRow)) { list[i].style.display = "none"; list[i].dataset.folded = "1"; }
       }
     }
     if (!hidden) return false;
-    const more = el("button", "more-foot", hidden + " more");
+    // a list that has more rows than it first draws ends in its own "show all N" link; once the card folds, two links to the same rest would
+    // disagree on the count, so the card keeps one: the foot, saying how many the focus view holds
+    const xm = body.querySelector(".xmore"), total = xm ? parseInt((/\d+/.exec(xm.textContent) || [])[0], 10) : NaN;
+    if (xm) { xm.style.display = "none"; xm.dataset.folded = "1"; }
+    const more = el("button", "more-foot", Number.isFinite(total) && total > hidden ? "Read all " + total : hidden + " more");
     more.type = "button";
-    more.setAttribute("aria-label", hidden + " more rows: open the full list");
+    more.setAttribute("aria-label", (Number.isFinite(total) && total > hidden ? "Read all " + total + " rows" : hidden + " more rows") + ": open the full list");
     more.addEventListener("click", () => { const x = panel.querySelector(".pexpand"); if (x) x.click(); });
     panel.appendChild(more);
     return true;

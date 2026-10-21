@@ -103,8 +103,8 @@
       --aqi-moderate: oklch(0.55 0.12 90); --aqi-sensitive: oklch(0.55 0.15 55); --aqi-unhealthy: oklch(0.5 0.17 25);
       --aqi-very: oklch(0.45 0.17 320); --aqi-hazard: oklch(0.4 0.15 10);
       --hue-1: oklch(0.609 0.129 72); --hue-2: oklch(0.532 0.171 258); --hue-3: oklch(0.536 0.171 352);
-      --hue-4: oklch(0.511 0.09 110); --hue-5: oklch(0.581 0.121 165); --hue-6: oklch(0.481 0.067 210);
-      --hue-7: oklch(0.629 0.2 300); --hue-8: oklch(0.555 0.179 32);
+      --hue-4: oklch(0.511 0.1 135); --hue-5: oklch(0.581 0.121 165); --hue-6: oklch(0.481 0.067 210);
+      --hue-7: oklch(0.629 0.2 300); --hue-8: oklch(0.555 0.17 325);
       --tag-mix: 45%; --glow-a: 0; --sky-star-a: .45; --sky-line-a: .10;
       --shadow-overlay: 0 12px 32px -8px rgb(20 30 60 / .25);
       --edge-hi: inset 0 1px 0 rgb(255 255 255 / .9); --recess: inset 0 1px 2px rgb(20 30 60 / .10);
@@ -129,8 +129,8 @@
     --aqi-moderate: oklch(0.55 0.12 90); --aqi-sensitive: oklch(0.55 0.15 55); --aqi-unhealthy: oklch(0.5 0.17 25);
     --aqi-very: oklch(0.45 0.17 320); --aqi-hazard: oklch(0.4 0.15 10);
     --hue-1: oklch(0.609 0.129 72); --hue-2: oklch(0.532 0.171 258); --hue-3: oklch(0.536 0.171 352);
-    --hue-4: oklch(0.511 0.09 110); --hue-5: oklch(0.581 0.121 165); --hue-6: oklch(0.481 0.067 210);
-    --hue-7: oklch(0.629 0.2 300); --hue-8: oklch(0.555 0.179 32);
+    --hue-4: oklch(0.511 0.1 135); --hue-5: oklch(0.581 0.121 165); --hue-6: oklch(0.481 0.067 210);
+    --hue-7: oklch(0.629 0.2 300); --hue-8: oklch(0.555 0.17 325);
     --tag-mix: 45%; --glow-a: 0; --sky-star-a: .45; --sky-line-a: .10;
     --shadow-overlay: 0 12px 32px -8px rgb(20 30 60 / .25);
     --edge-hi: inset 0 1px 0 rgb(255 255 255 / .9); --recess: inset 0 1px 2px rgb(20 30 60 / .10);
@@ -253,9 +253,9 @@
   .pbody.clamped::-webkit-scrollbar-thumb { background: var(--line-hot); border-radius: var(--r-sm);
     border: 2px solid var(--panel); }
   .pbody.clamped::-webkit-scrollbar-track { background: transparent; }
-  /* "more below" cue: the last 24px of a bounded body fades out while there is more to scroll. A mask, so nothing is painted
+  /* "more below" cue: the last --fade-h (40px) of a bounded body fades out while there is more to scroll. A mask, so nothing is painted
      over the text; .at-end (set by measureOverflow) drops it at the bottom. */
-  .pbody.clamped.has-overflow:not(.at-end) { -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 24px), transparent); mask-image: linear-gradient(to bottom, #000 calc(100% - 24px), transparent); }
+  .pbody.clamped.has-overflow:not(.at-end) { -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-h, 24px)), transparent); mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-h, 24px)), transparent); }
 
   /* edit-class chip — a recessed status LED (armed/locked; lights up in Slice 2) */
   .chip {
@@ -1179,7 +1179,7 @@ body.ke .band-meta .wx .wx-t .rd-n, body.ke .band-meta .wx b { color: var(--text
 .wx-air .aqi-l { grid-column: 2; font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); }
 .wx-air .aqi-v { grid-column: 3; justify-self: end; min-width: 2ch; text-align: right; font: var(--fw-bold) var(--fs-lead)/1 var(--round); color: var(--text); font-variant-numeric: tabular-nums lining-nums; }
 .wx-air .aqi .pill { grid-column: 4; justify-self: start; }
-.wx-air > .aqi-d { grid-column: 2 / -1; margin: 0 0 var(--sp-2); max-width: 26ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wx-air > .aqi-d { grid-column: 2 / -1; margin: 0 0 var(--sp-2); max-width: none; white-space: normal; }   /* the source line reads whole: it wraps inside the readings column, never cut */
 .wx-air > .aqi-d:last-child { margin-bottom: 0; }
 .aqi { display: flex; align-items: center; gap: var(--sp-3); font-size: var(--fs-body); flex-wrap: wrap; }
 .aqi b { font-weight: var(--fw-semibold); }
@@ -1345,6 +1345,8 @@ body.ke[data-mode="memory"] .ck-secthead:not(:has(+ section > :is(:not([data-mod
 body.ke .ck-secthead h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); letter-spacing: -.02em; color: var(--text); }
 body.ke .ck-secthead span { font-size: var(--fs-meta); color: var(--meta); }
 body.ke .ck-secthead + .ck-brief, body.ke .ck-secthead + .ck-widgets { margin-top: var(--sp-4); }
+/* the strip stands clear of the Needs-you cards above it, not 12px off their ring */
+body.ke .ck-needs ~ .ck-widgets { margin-top: var(--sp-6); }
 /* The mode filter for the KE page. The page-wide rule near the top loses to KE card rules that set display (a widget card
    is display:flex); this one carries body.ke so a Morning/Build mode hides a card the manifest did not give that mode. */
 body.ke[data-mode="morning"] [data-modes]:not([data-modes~="morning"]),
@@ -1465,6 +1467,15 @@ body.ke .panel:hover .phead .pexpand, body.ke .panel:focus-within .phead .pexpan
 @media (hover: none) { body.ke .panel .phead .pexpand { opacity: 1; } }
 /* the edit class (A / B / C) and a panel's source id ("section:state") are the kernel's bookkeeping, not something a person reads */
 body.ke .panel .phead .chip, body.ke .modal .chip, body.ke .panel .phead .src:not(.fresh) { display: none; }
+/* the freshness stamp rides right beside the always-visible fold chevron; the controls that only show on hover sit to ITS left, so the stamp
+   never floats mid-header and never moves when they appear. One spacer takes the free width (a single margin:auto, not two). */
+body.ke .panel .phead:has(> .src.fresh)::after { content: ""; flex: 1 1 0; min-width: 0; }
+body.ke .panel .phead:has(> .src.fresh) > .ck-lay { display: contents; }
+body.ke .panel .phead:has(> .src.fresh) > .pexpand { order: 1; margin-left: 0; }
+body.ke .panel .phead:has(> .src.fresh) .ck-lay-up { order: 2; margin-left: calc(var(--sp-1) - var(--sp-3)); }
+body.ke .panel .phead:has(> .src.fresh) .ck-lay-down { order: 3; margin-left: calc(var(--sp-1) - var(--sp-3)); }
+body.ke .panel .phead:has(> .src.fresh) > .src.fresh { order: 4; margin-left: 0; }
+body.ke .panel .phead:has(> .src.fresh) .ck-lay-fold { order: 5; margin-left: calc(var(--sp-1) - var(--sp-3)); }
 body.ke .row:focus-visible { outline: 1px solid var(--hair-2); outline-offset: -1px; border-radius: var(--r-md); }
 body.ke .undo-btn {
   font: var(--fw-medium) var(--fs-meta)/var(--lh-list) var(--sans); letter-spacing: 0; text-transform: none; color: var(--label); background: none;
@@ -1593,8 +1604,8 @@ body.ke .tray-dump:not(.text-editor) .tray-dump-ta { min-height: 32px; max-heigh
    and a failed review glowing red. */
 html {
   --hue-1: oklch(0.82 0.15 75); --hue-2: oklch(0.68 0.14 255); --hue-3: oklch(0.66 0.21 350);
-  --hue-4: oklch(0.94 0.17 105); --hue-5: oklch(0.76 0.13 165); --hue-6: oklch(0.907 0.079 210);
-  --hue-7: oklch(0.793 0.111 300); --hue-8: oklch(0.713 0.143 32);
+  --hue-4: oklch(0.9 0.16 135); --hue-5: oklch(0.76 0.13 165); --hue-6: oklch(0.907 0.079 210);
+  --hue-7: oklch(0.793 0.111 300); --hue-8: oklch(0.72 0.15 325);
 }
 .rp-tag { display: inline-block; margin-right: var(--sp-3); padding: 0 var(--sp-3); border-radius: var(--r-pill); vertical-align: 1px; letter-spacing: 0; text-transform: none;
   font: var(--fw-semibold) var(--fs-micro)/1.6 var(--sans); color: var(--tag-ink); background: color-mix(in oklch, var(--tag) 15%, transparent); }
@@ -1747,9 +1758,13 @@ body.ke .w .row > span { display: inline-flex; align-items: baseline; white-spac
 body.ke .w .row b { font-size: var(--fs-lead); line-height: 1; }
 /* in a tile the headline figure and the secondary row are divided by one hairline the tile's full width, on the spacing scale */
 body.ke .ck-widgets[data-shape="tiles"] .w .bigrow + .row { margin-top: var(--sp-2); padding-top: var(--sp-3); border-top: 1px solid var(--hair); }
-/* in the strip every part of a segment, the caps label included, sits on ONE baseline: label, figure, its unit, the row's figures */
+/* in the strip every part of a segment sits on ONE centre line: the caps label, the figure, its unit, the sub-line and the row's figures
+   (a shared line-height makes each text box's middle the middle of its glyphs, so centring the boxes centres the text) */
 @media (min-width: 721px) {
-  body.ke .ck-widgets:not([data-shape="tiles"]) > .ck-card.w { align-items: baseline; }
+  body.ke .ck-widgets:not([data-shape="tiles"]) > .ck-card.w { align-items: center; }
+  body.ke .ck-widgets:not([data-shape="tiles"]) .w .wbody, body.ke .ck-widgets:not([data-shape="tiles"]) .w .xbody,
+  body.ke .ck-widgets:not([data-shape="tiles"]) .w .bigrow, body.ke .ck-widgets:not([data-shape="tiles"]) .w .row { align-items: center; }
+  body.ke .ck-widgets:not([data-shape="tiles"]) .w :is(.k, .bl, .sub, .row, .row > *, .op, .op-l, .v) { line-height: 1.25; }
   body.ke .ck-widgets:not([data-shape="tiles"]) .w .bigrow { gap: var(--sp-2); }
   body.ke .ck-widgets:not([data-shape="tiles"]) .w .big { line-height: 1; }
   /* the open glyph sits centred at the segment's right edge, in room the segment keeps for it, never over the text */
@@ -2281,6 +2296,7 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-rbars i.on { background: var(--hair-2); }
 .tv-rbars.unk i { background-image: repeating-linear-gradient(135deg, var(--hair-2) 0 2px, transparent 2px 4px); background-color: transparent; }
 .tv-rhr { position: absolute; top: 32px; transform: translateX(-50%); font: 500 10px var(--mono); color: var(--meta); }
+@media (max-width: 560px) { .tv-rhr-alt { display: none; } }   /* ~200px of track holds four labels, not seven */
 .tv-rhead { position: absolute; top: 0; bottom: 14px; width: 2px; background: var(--text); border-radius: 2px; transform: translateX(-1px); pointer-events: none; }
 .tv-rhead::before { content: ""; position: absolute; left: -5px; top: -3px; width: 12px; height: 12px; border-radius: 99px; background: var(--text); border: 2px solid var(--base); }
 .tv-rhead.live, .tv-rhead.live::before { background: var(--ok); }
@@ -2403,6 +2419,8 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn:not(.verb-more) { 
 /* the "N more" foot of a work list that folds its lower rows (dashboard_core.js foldRows) */
 body.ke .panel > .more-foot { align-self: center; flex: none; margin: 0 0 var(--sp-4); padding: var(--sp-1) var(--sp-5); border: 0; background: none; color: var(--label); font: var(--fw-medium) var(--fs-meta)/1.4 var(--sans); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
 body.ke .panel > .more-foot:hover, body.ke .panel > .more-foot:focus-visible { color: var(--text); }
+/* the Crystallized panel's "Read all" starts where its content does */
+body.ke .ck-zgrid .ck-mem-crys > .more-foot { padding-inline: var(--sp-6); margin-bottom: var(--sp-4); }
 
 /* Board work lists: the repo chip sits in the meta line (the mock), its held-back line closes the list (every long panel keeps its filter box: Phill 10-11) */
 body.ke [data-ck-panel="tray"] .row > .k7-repo, body.ke [data-ck-panel="loops"] .row > .k7-repo, body.ke [data-ck-panel="keep"] .row > .k7-repo { display: inline-block; }

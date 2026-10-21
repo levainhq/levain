@@ -389,7 +389,7 @@
       // compact profile carries numbers where the full one carries arrays, and has nothing to draw
       const n = (x, c) => (Array.isArray(x) ? x.length : isNum(c) ? c : 0);
       const tasks = Array.isArray(v.tasks) ? v.tasks : [];
-      const waiting = isNum(v.waiting) ? v.waiting : tasks.filter((t) => isObj(t) && t.state === "waiting").length;
+      const waiting = isNum(v.waiting) ? v.waiting : (Array.isArray(v.nodes) ? v.nodes : []).filter((x) => isObj(x) && x.state === "waiting").length;   // sessions waiting: the one meaning of "waiting on you"
       out.lines = [{ meta: "topology", text: n(v.nodes, v.nodes) + " sessions \u00b7 " + n(v.tasks, v.tasks) + " tasks \u00b7 " + waiting + " waiting on you" }];
       if (Array.isArray(v.nodes) && Array.isArray(v.tasks) && Array.isArray(v.groups) && isObj(v.hub)) { out.topology = v; out.typed = true; out.replay = head.replay === true || panel.replay === true; }   // typed: the page keeps a live state for it (the header lens and Build's Lost-if-closed read it)
     } else if (kind === "form") {

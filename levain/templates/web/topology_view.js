@@ -191,10 +191,13 @@
   }
 
   // ---- the header strip ----
+  // "waiting on you" is ONE figure from ONE function: the sessions that wait on a decision or an answer. Every lens's headline figure, and the
+  // empty sentence of the Work lens, read it; the Work lens's own count of task records says "tasks waiting" and is never the headline.
+  const waitingOnYou = (v) => arr(v.nodes).filter((n) => n.state === "waiting").length;
   function strip(v, which) {
-    const nodes = arr(v.nodes), tasks = arr(v.tasks);
+    const nodes = arr(v.nodes);
     const running = nodes.filter((n) => n.state === "running").length;
-    const waiting = which === "agents" ? nodes.filter((n) => n.state === "waiting").length : tasks.filter((t) => t.state === "waiting").length;
+    const waiting = waitingOnYou(v);
     const row = el("div", "tv-strip");
     const stat = (k, n, word, cls) => {
       const s = el("span", "tv-stat" + (cls ? " " + cls : ""));
@@ -223,7 +226,7 @@
   function metricsStrip(v) {
     const nodes = arr(v.nodes), counts = isObj(v.counts) ? v.counts : {};
     const live = nodes.filter((n) => n.state !== "idle").length;
-    const running = nodes.filter((n) => n.state === "running").length, waiting = nodes.filter((n) => n.state === "waiting").length;
+    const running = nodes.filter((n) => n.state === "running").length, waiting = waitingOnYou(v);
     const row = el("div", "tv-metrics");
     row.setAttribute("role", "group");
     row.setAttribute("aria-label", "Header figures");
@@ -265,7 +268,7 @@
       s.append(el("b", null, num), " " + word);
       return s;
     };
-    row.append(stat("tasks", tasks.length, tasks.length === 1 ? "task" : "tasks"), stat("waiting", n("waiting"), "waiting on you", n("waiting") ? "hot" : ""));
+    row.append(stat("tasks", tasks.length, tasks.length === 1 ? "task" : "tasks"), stat("waiting", waitingOnYou(v), "waiting on you", waitingOnYou(v) ? "hot" : ""), stat("tasks-waiting", n("waiting"), "tasks waiting"));
     if (n("failed")) row.appendChild(stat("failed", n("failed"), "failed", "bad"));
     row.append(stat("stuck", n("stuck"), "stuck"));
     if (n("open")) row.appendChild(stat("open", n("open"), "open"));
@@ -396,7 +399,8 @@
       recBy.set(t.id, r);
       if (typeof t.card === "string" && t.card) recBy.set(t.card, r);
     }
-    if (!recs.length) left.appendChild(el("p", "tv-none", "nothing is waiting on you"));
+    const sessWait = waitingOnYou(v);
+    if (!recs.length) left.appendChild(el("p", "tv-none", sessWait ? "no record is waiting \u00b7 " + sessWait + (sessWait === 1 ? " session is" : " sessions are") + " waiting on you" : "nothing is waiting on you"));
     wrap.appendChild(left);
     // the centre: every other task, loudest state first; the right: its outcomes, on the same row
     const centre = [];
@@ -510,7 +514,13 @@
   // A seat with more than ROW_CAP lanes wraps into two ranks (row-major in document order, so a subagent stays beside or under its
   // parent) when the card has the room; a narrow card keeps today's single column.
   const ROW_CAP = 7;
+  // A seat's block that finds no free row at this height asks for more: the graph is laid out again, taller, until every block has its place.
   function layoutGraph(v, LW, measure) {
+    let L = layoutOnce(v, LW, measure, 0);
+    for (let i = 0; i < 6 && L.short > 0; i++) L = layoutOnce(v, LW, measure, L.H + L.short);
+    return L;
+  }
+  function layoutOnce(v, LW, measure, hFloor) {
     const nodes = arr(v.nodes), groups = arr(v.groups).slice();
     const gids = new Set(groups.map((g) => g.id));
     if (nodes.some((n) => !gids.has(n.group))) groups.push({ id: null, label: "ungrouped", repo: null, loose: true });   // a node with no group of its own is still drawn
@@ -533,15 +543,20 @@
     // offset and a margin to the graph's edge.
     const RANK_GAP = 52, EDGE_PAD = 36;
     const roomFor = (g, col) => hubX - col - (faceWOf(g, 0) + RANK_GAP) - faceWOf(g, 1) - EDGE_PAD >= 0;
-    const gxFull = Math.max(76, Math.min(190, LW / 2 - 262 - 120));
+    // a seat's lanes stand COL_GAP outward of its node. A subagent steps back toward the node (30 a depth), and its ring must still clear the
+    // seat's label plate (half-width + the ring's 17 + 6 of air), so the gap grows with the widest label and the step is capped per seat.
+    const lwOf = (g) => Math.max(measure(g.label, "group") + 16, measure("00 agents \u00b7 00 running", "l2")) / 2 + 7;
+    // (never past what lets the widest face still end inside the graph beside the nearest column; 120 is the floor)
+    const COL_GAP = Math.max(120, Math.min(Math.ceil(Math.max(0, ...live.map(lwOf))) + 23 + 30, Math.floor(hubX - 76 - Math.max(0, ...Array.from(tws.values())) - 36)));
+    const gxFull = Math.max(76, Math.min(190, LW / 2 - 262 - COL_GAP));
     const tall = live.filter((g) => mineOf(g).length > ROW_CAP);
     let gx0 = gxFull;
-    if (tall.length && !tall.every((g) => roomFor(g, gxFull + 120))) {
+    if (tall.length && !tall.every((g) => roomFor(g, gxFull + COL_GAP))) {
       const need = Math.max(...tall.map((g) => faceWOf(g, 0) + faceWOf(g, 1)));
-      const tight = Math.max(76, Math.min(gxFull, Math.floor(hubX - need - RANK_GAP - EDGE_PAD - 120)));
-      if (tall.every((g) => roomFor(g, tight + 120))) gx0 = tight;
+      const tight = Math.max(76, Math.min(gxFull, Math.floor(hubX - need - RANK_GAP - EDGE_PAD - COL_GAP)));
+      if (tall.every((g) => roomFor(g, tight + COL_GAP))) gx0 = tight;
     }
-    const col0 = gx0 + 120;
+    const col0 = gx0 + COL_GAP;
     const ranksOf = (g) => (mineOf(g).length <= ROW_CAP ? 1 : roomFor(g, col0) ? 2 : 1);
     const rowsOf = (g) => Math.ceil(mineOf(g).length / ranksOf(g));
     const order = live.slice().sort((a, b) => rowsOf(b) - rowsOf(a));
@@ -551,7 +566,7 @@
     // a second rank sits half a pitch lower, so its last row hangs half a pitch below the first rank's
     const halfOf = (l) => (l.some((g) => ranksOf(g) === 2) ? 32 : 0);
     const need = (s) => load[s] * 64 + gapOf(side[s]) + halfOf(side[s]);
-    const H = Math.max(MIN_H, Math.round(70 + Math.max(need("L"), need("R"))));
+    const H = Math.max(MIN_H, hFloor, Math.round(70 + Math.max(need("L"), need("R"))));
     const hub = { x: hubX, y: H / 2 + 6, r: 30 };
     const hubName = isObj(v.hub) && typeof v.hub.label === "string" ? v.hub.label : "";
     const hubHalf = Math.max(measure(hubName, "group"), measure(nodes.length + " sessions \u00b7 " + nodes.length + " running", "l2"), 70) / 2 + 7;
@@ -571,25 +586,46 @@
           const rk = ranks === 2 ? i % 2 : 0, row = ranks === 2 ? Math.floor(i / 2) : i;
           i++;
           const base = rk === 1 ? rank1 : hub.x + dir * col0;
-          const x = base - dir * (rk === 1 ? 0 : Math.min(30 * depth, 90)), ny = y + row * pitch + (rk === 1 ? pitch / 2 : 0);
+          const x = base - dir * (rk === 1 ? 0 : Math.min(30 * depth, 90, Math.max(0, COL_GAP - lwOf(g) - 23))), ny = y + row * pitch + (rk === 1 ? pitch / 2 : 0);
           pos.set(n.id, { id: n.id, x, y: ny, side: dir, depth, rank: rk, tw: tws.get(n.id) }); ys.push(ny);
           for (const k of mine) if (k.parent === n.id) put(k, depth + 1);
         };
         for (const n of mine) if (!n.parent || !ids.has(n.parent)) put(n, 0);
         for (const n of mine) put(n, 0);                 // a parent cycle has no root: the rest sit at the column's own level
-        let gy = ys.reduce((s, q) => s + q, 0) / (ys.length || 1);
-        // a seat drawn close to the hub (the second rank took the room) must not sit on the hub's own label: it steps clear of it, to the nearer side
-        const lw = Math.max(measure(g.label, "group") + 16, measure("00 agents \u00b7 00 running", "l2")) / 2 + 7;
-        const clashX = Math.abs(hub.x + dir * gx0 - hub.x) < hubHalf + lw;
-        if (clashX && gy + 56 > hub.y - 76 && gy - 16 < hub.y + hub.r + 8) {
-          const up = hub.y - 76 - 56 - 2, down = hub.y + hub.r + 8 + 16 + 4;
-          gy = gy - up < down - gy && up >= 24 ? up : down;
-        }
-        gpos.set(g.id === null ? "" : g.id, { id: g.id, label: g.label, repo: g.repo, x: hub.x + dir * gx0, y: gy, r: 16, ranks });
+        const gy = ys.reduce((s, q) => s + q, 0) / (ys.length || 1);
+        const lw = lwOf(g);
+        gpos.set(g.id === null ? "" : g.id, { id: g.id, label: g.label, repo: g.repo, x: hub.x + dir * gx0, y: gy, r: 16, ranks, hw: lw, size: mine.length });
         y += Math.ceil(mine.length / ranks) * pitch + 26;
       }
     }
-    return { LW, H, hub, gpos, pos, gkey: (n) => (gids.has(n.group) ? n.group : "") };
+    const short = settleGroups(gpos, hub, hubHalf, H);
+    return { LW, H, hub, gpos, pos, short, gkey: (n) => (gids.has(n.group) ? n.group : "") };
+  }
+  // A seat's node sits at the middle of its lanes, but its block (the node, then its two label lines) is 72 tall and must not lie on another
+  // seat's block, on the hub's label or on the hub: where the middle is taken it slides along its own column to the nearest free row. The
+  // biggest seats keep their middle (they have the most lanes tied to it); the smaller ones give way.
+  const GROUP_BLOCK_H = 72, BLOCK_GAP = 6;
+  function settleGroups(gpos, hub, hubHalf, H) {
+    const blockOf = (gp, y) => ({ x: gp.x - gp.hw, y: y - gp.r, w: 2 * gp.hw, h: GROUP_BLOCK_H });
+    const hubBlock = { x: hub.x - hubHalf, y: hub.y - hub.r - 44, w: 2 * hubHalf, h: 44 + 2 * hub.r + 16 };
+    const clear = (b, others) => others.every((o) => !(b.x < o.x + o.w + BLOCK_GAP && o.x < b.x + b.w + BLOCK_GAP && b.y < o.y + o.h + BLOCK_GAP && o.y < b.y + b.h + BLOCK_GAP));
+    const placed = [hubBlock];
+    const lo = 24, hi = Math.max(lo, H - GROUP_BLOCK_H - 8);
+    let short = 0;
+    for (const gp of Array.from(gpos.values()).sort((a, b) => b.size - a.size || a.y - b.y)) {
+      const want = Math.min(hi, Math.max(lo, gp.y));
+      let best = null;
+      for (let k = 0; k <= Math.ceil(H / 8) && best === null; k++) {
+        for (const y of k === 0 ? [want] : [want - k * 8, want + k * 8]) {
+          if (y < lo || y > hi) continue;
+          if (clear(blockOf(gp, y), placed)) { best = y; break; }
+        }
+      }
+      if (best === null) short += GROUP_BLOCK_H + BLOCK_GAP;
+      gp.y = best === null ? want : best;
+      placed.push(blockOf(gp, gp.y));
+    }
+    return short;
   }
   // an edge: far end `a` (the event source) to near end `b` (its parent), as the mock bends it
   function mkEdge(a, b, bend) {
@@ -687,33 +723,72 @@
     return out;
   }
 
-  // ---- seat colour: one hue per seat, carried by the group node, its sessions' cores, its edges, its streams and its constellation ----
+  // ---- seat colour: one hue per seat, carried by the group node, its sessions' cores, its edges, and its streams ----
   // A seat's slot comes from the page's one repo-hue table (sky.js hueKey, the same slot the row tags use). Slots 6-8 are tokens a
   // stylesheet may not carry yet: a slot past 5 with no --hue-N falls back to its slot mod 5, so a missing token is a shared hue and
   // never a missing one. A group with no repo of its own (the loose "ungrouped" block) has no seat and stays neutral.
   const HUE_SLOTS = 8, HUE_BASE = 5;
   const hueName = (slot, have8) => "--hue-" + (have8 || slot <= HUE_BASE ? slot : ((slot - 1) % HUE_BASE) + 1);
-  // Every seat in one graph gets its own slot (up to HUE_SLOTS seats; past that slots repeat). A seat's preferred slot is its repo's
-  // (the slot the row tags use, so a repo-per-seat graph matches its tags) or, with no repo, its label's hash. Several seats on one repo
-  // (flow's lanes on levain) all prefer the same slot: the first, in group-id order, keeps it and the rest take the next free one.
-  // Only real repos are noted into the page's repo table, all before any slot is read: a slot read mid-noting can move.
+  // A seat's colour must never read as a state: a slot whose hue lies within SEAT_CLEAR degrees of the waiting, stalled or errored hue (the
+  // tokens' own, read here, so a retuned theme is followed) is not given to a seat, and the two biggest seats sit at least BIG_APART apart.
+  // A hue the browser cannot report (no oklch) is taken as clear: the colour is then the stylesheet's alone.
+  const SEAT_CLEAR = 25, BIG_APART = 40;
+  const hueGap = (a, b) => { const d = Math.abs(a - b) % 360; return d > 180 ? 360 - d : d; };
+  function tokenHue(name) {
+    let raw = "";
+    try { raw = root.getComputedStyle(root.document.documentElement).getPropertyValue(name); } catch (_) { return null; }
+    const m = /oklch\(\s*[\d.]+%?\s+[\d.]+\s+([\d.]+)/.exec(raw || "");
+    return m ? parseFloat(m[1]) : null;
+  }
+  function seatSlots() {
+    const states = ["--accent", "--warn", "--bad"].map(tokenHue).filter((h) => h !== null);
+    const hues = new Map();
+    const open = [];
+    for (let k = 1; k <= HUE_SLOTS; k++) {
+      const h = tokenHue("--hue-" + k);
+      hues.set(k, h);
+      if (h === null || states.every((sh) => hueGap(h, sh) >= SEAT_CLEAR)) open.push(k);
+    }
+    return { hues, open: open.length >= 2 ? open : Array.from(hues.keys()) };
+  }
+  // Every seat in one graph gets its own slot (up to the slots open to a seat; past that slots repeat). A seat's preferred slot is its repo's
+  // (the slot the row tags use, so a repo-per-seat graph matches its tags) or, with no repo, its label's hash; a preferred slot that reads as
+  // a state gives way to the nearest open one. Several seats on one repo (flow's lanes on levain) all prefer the same slot: the first, in
+  // group-id order, keeps it and the rest take the next free one. Only real repos are noted into the page's repo table, all before any slot
+  // is read: a slot read mid-noting can move.
   function assignSeats(L) {
     const S = root.LevainSky, sky = !!(S && typeof S.hueKey === "function");
     const gps = Array.from(L.gpos.values()).filter((gp) => gp.id !== null && gp.id !== undefined);
     if (sky && typeof S.noteRepo === "function") for (const gp of gps) if (gp.repo) S.noteRepo(gp.repo);
+    const { hues, open } = seatSlots();
     const pref = (gp) => {
       const k = sky && gp.repo ? parseInt(S.hueKey(gp.repo), 10) : 0;
-      return k >= 1 && k <= HUE_SLOTS ? k : (fnv1a(String(gp.label || gp.id)) % HUE_SLOTS) + 1;
+      const want = k >= 1 && k <= HUE_SLOTS ? k : (fnv1a(String(gp.label || gp.id)) % HUE_SLOTS) + 1;
+      if (open.includes(want)) return want;
+      return open.slice().sort((a, b) => ((a - want + HUE_SLOTS) % HUE_SLOTS) - ((b - want + HUE_SLOTS) % HUE_SLOTS))[0];
     };
+    const next = (k) => { const i = open.indexOf(k); return open[(i + 1) % open.length]; };
     gps.sort((a, b) => (String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0));
     const used = new Set(), rest = [];
     for (const gp of L.gpos.values()) gp.seat = 0;
     for (const gp of gps) { const k = pref(gp); if (used.has(k)) rest.push(gp); else { used.add(k); gp.seat = k; } }
     for (const gp of rest) {
       let k = pref(gp);
-      for (let t = 0; t < HUE_SLOTS && used.has(k); t++) k = (k % HUE_SLOTS) + 1;
+      for (let t = 0; t < open.length && used.has(k); t++) k = next(k);
       used.add(k); gp.seat = k;
-      if (used.size >= HUE_SLOTS) used.clear();                     // past HUE_SLOTS seats the slots go round again
+      if (used.size >= open.length) used.clear();                   // past the open slots they go round again
+    }
+    // the two biggest seats are the two the eye compares first: if their hues sit closer than BIG_APART, the second takes the first open
+    // slot that clears the gap (a free one first), keeping every other seat where it is
+    const big = gps.slice().sort((a, b) => b.size - a.size).slice(0, 2);
+    if (big.length === 2) {
+      const [a, b] = big, ha = hues.get(a.seat), hb = hues.get(b.seat);
+      if (ha !== null && ha !== undefined && hb !== null && hb !== undefined && hueGap(ha, hb) < BIG_APART) {
+        const taken = new Set(gps.filter((g) => g !== b).map((g) => g.seat));
+        const fits = (k) => { const h = hues.get(k); return h === null || h === undefined || hueGap(h, ha) >= BIG_APART; };
+        const pick = open.filter((k) => fits(k) && !taken.has(k))[0] || open.filter(fits)[0];
+        if (pick) b.seat = pick;
+      }
     }
   }
   // the attribute that hands an element its seat hue (the rules below turn it into a custom property); none for a neutral one
@@ -729,22 +804,17 @@
     ".tv-graph .tv-gdot { fill: var(--seat); }",
     ".tv-graph .tv-gnode[data-seat]:not(.waiting) .tv-core { fill: var(--seat); opacity: 1; }",
     ".tv-graph .tv-face1, .tv-graph .tv-face2, .tv-graph .tv-face3, .tv-graph .tv-gname, .tv-graph .tv-gsub, .tv-graph .tv-gnode:not(.waiting) .tv-facetag { paint-order: stroke; stroke: var(--base); stroke-width: 3px; stroke-linejoin: round; }",
-    // the face text carries its own halo, so its box only softens what lies under it: a solid box reads as a block over the nebula
-    ".tv-graph .tv-facebg { fill-opacity: .38; } .tv-graph .tv-lblbg { fill-opacity: .5; }",
+    // a label's plate stands over the streams and the other seats' edges that run beneath it, so no line is drawn through
+    // text; its edge is feathered by a soft shadow of the same base colour, so it reads as a pool of quiet, not a block
+    ".tv-graph .tv-facebg { fill-opacity: .84; } .tv-graph .tv-lblbg { fill-opacity: .88; }",
+    ".tv-graph .tv-facebg, .tv-graph .tv-lblbg { filter: drop-shadow(0 0 6px var(--base)); }",
     ".tv-graph .tv-gnode:focus-visible .tv-facebg { stroke: var(--accent); stroke-width: 2; }",
     ".tv-graph .tv-gnode[aria-pressed=\"true\"] .tv-ring { stroke-width: 2.6; }",
     ".tv-graph .tv-gring { opacity: .5; }",
-    // the theme tokens set the sky's base alphas (a light stage takes less glow); the graph draws its stars at about twice them, read on a real
-    // stage the token values alone left the constellation all but invisible
-    ".tv-sky { --_sa: calc(var(--sky-star-a, .35) * 1.9); --_la: calc(var(--sky-line-a, .12) * 2.2); --_na: calc(var(--glow-a, .35) * .4 + .07); pointer-events: none; }",
-    ".tv-sky .tv-star { fill: var(--seat, var(--meta)); fill-opacity: var(--_sa); }",
-    ".tv-sky .tv-sline { fill: none; stroke: var(--seat, var(--meta)); stroke-opacity: var(--_la); stroke-width: .7px; }",
-    ".tv-sky .tv-neb stop { stop-color: var(--seat, var(--meta)); stop-opacity: 0; } .tv-sky .tv-neb stop.c { stop-opacity: var(--_na); }",
-    ".tv-sky .tv-neb stop.m { stop-opacity: calc(var(--_na) * .35); }",
-    "@media (prefers-reduced-motion: no-preference) { .tv-sky .tv-twk { animation: tv-twinkle 5s ease-in-out 0s 3; }",
-    '  .tv-sky .tv-twk[data-t="1"] { animation-duration: 4s; animation-delay: .7s; } .tv-sky .tv-twk[data-t="2"] { animation-duration: 6s; animation-delay: 1.9s; }',
-    '  .tv-sky .tv-twk[data-t="3"] { animation-duration: 7s; animation-delay: 3.1s; } .tv-sky .tv-twk[data-t="4"] { animation-duration: 4.5s; animation-delay: 2.4s; } }',
-    "@keyframes tv-twinkle { 0%, 100% { fill-opacity: var(--_sa); } 50% { fill-opacity: .8; } }",
+    // the theme token sets the seat glow's strength (a light stage takes less)
+    ".tv-glow { --_na: calc(var(--glow-a, .35) * .4 + .07); pointer-events: none; }",
+    ".tv-glow .tv-neb stop { stop-color: var(--seat, var(--meta)); stop-opacity: 0; } .tv-glow .tv-neb stop.c { stop-opacity: var(--_na); }",
+    ".tv-glow .tv-neb stop.m { stop-opacity: calc(var(--_na) * .35); }",
     "@media (prefers-reduced-motion: reduce) { .tv-graph .tv-edge.live { stroke-dasharray: 5 4; stroke-linecap: round; opacity: 1; }",
     "  .tv-graph .tv-edge.live[data-seat]:not(.waiting) { stroke: var(--seat); stroke-opacity: .8; } }",
   ].join("\n");
@@ -760,58 +830,17 @@
     } catch (_) { /* no constructable sheets: the graph is drawn with the page's own rules, seat hue left out */ }
   }
 
-  // ---- the constellation: stars behind the graph, generated from the topology value alone ----
-  // Deterministic (the group's id seeds a small generator; nothing here calls Math.random), so a refresh never moves a star. One figure
-  // per seat: 5 + min(2 x lanes, 14) stars across that seat's side of the stage, from the inner ring out to the edge, each star's size from a
-  // lane's token count, joined in angle order by hairlines; behind each seat's lanes a faint nebula in its hue. Drawn once per layout (zero
-  // per-frame cost); a few stars twinkle, and only where motion is welcome.
-  const STAR_CAP = 160, SLINE_CAP = 120, TWINKLE_CAP = 12;
+  // ---- the seat glow: a faint pool of each seat's hue behind its lanes, generated from the topology value alone ----
+  // Drawn once per layout (zero per-frame cost). It carries no stars and no lines: nothing behind the graph may run through a label.
   let skySeq = 0;                                                         // gradient ids stay unique across redraws
   function fnv1a(str) {
     let h = 2166136261;
     for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
     return h >>> 0;
   }
-  function lcg(seed) {
-    let s = (seed >>> 0) || 1;
-    return () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 4294967296; };
-  }
-  function drawSky(v, L) {
-    const g = sv("g", { "aria-hidden": "true" }, "tv-sky");
-    const nodes = arr(v.nodes), hub = L.hub;
-    const rx = L.LW * RING_H[1] * 1.15, ry = L.H * RING_H[1] * 1.05;
-    let stars = 0, lines = 0, twinkle = 0;
-    // the farthest a ray from the hub can run before it leaves the graph, in units of the outer ring
-    const reach = (a) => {
-      const c = Math.cos(a), s = Math.sin(a);
-      const tx = Math.abs(c) < 1e-6 ? Infinity : (c > 0 ? L.LW - 6 - hub.x : hub.x - 6) / (Math.abs(c) * rx);
-      const ty = Math.abs(s) < 1e-6 ? Infinity : (s > 0 ? L.H - 6 - hub.y : hub.y - 6) / (Math.abs(s) * ry);
-      return Math.min(tx, ty);
-    };
-    const figure = (key, count, centre, spread, tokens, seat) => {
-      const rand = lcg(fnv1a(key)), pts = [];
-      for (let i = 0; i < count && stars + pts.length < STAR_CAP; i++) {
-        const a = centre + (rand() - 0.5) * 2 * spread, far = reach(a);
-        const rho = far > 0.6 ? 0.55 + rand() * (far - 0.55) : far * (0.9 + 0.1 * rand());
-        const tk = tokens.length ? tokens[i % tokens.length] : null;
-        const r = isNum(tk) && tk > 0 ? 0.9 + 1.7 * Math.min(1, Math.log10(tk + 1) / 6) : 1.1;
-        pts.push({ a, r, x: hub.x + Math.cos(a) * rx * rho, y: hub.y + Math.sin(a) * ry * rho, tw: rand() });
-      }
-      pts.sort((p, q) => p.a - q.a);
-      const fig = sv("g", seatAttrs(seat));
-      for (let i = 1; i < pts.length && lines < SLINE_CAP; i++, lines++) {
-        fig.appendChild(sv("line", { x1: num(pts[i - 1].x), y1: num(pts[i - 1].y), x2: num(pts[i].x), y2: num(pts[i].y) }, "tv-sline"));
-      }
-      for (const p of pts) {
-        const tw = twinkle < TWINKLE_CAP && p.tw < 0.5;
-        const c = sv("circle", { cx: num(p.x), cy: num(p.y), r: num(p.r) }, "tv-star" + (tw ? " tv-twk" : ""));
-        if (tw) { c.setAttribute("data-t", String(twinkle % 5)); twinkle++; }
-        fig.appendChild(c);
-        stars++;
-      }
-      g.appendChild(fig);
-    };
-    // the nebulae first, under the stars: one soft ellipse per coloured seat over the box its node and lanes span
+  function drawGlow(v, L) {
+    const g = sv("g", { "aria-hidden": "true" }, "tv-glow");
+    const nodes = arr(v.nodes);
     const defs = sv("defs"), nebs = sv("g");
     const seq = ++skySeq;
     let gi = 0;
@@ -830,12 +859,6 @@
     }
     g.appendChild(defs);
     g.appendChild(nebs);
-    for (const [k, gp] of L.gpos) {
-      const mine = nodes.filter((n) => L.gkey(n) === k);
-      const dir = gp.x < hub.x ? -1 : 1, ny = (gp.y - hub.y) / ry;
-      figure("g:" + k, 5 + Math.min(mine.length * 2, 14), Math.atan2(ny, dir), 0.6, mine.map((n) => n.tokens), gp.seat || 0);
-    }
-    figure("hub", 5, Math.PI / 2, Math.PI, [], 0);        // the hub's five neutral stars, anywhere round it
     return g;
   }
 
@@ -844,7 +867,7 @@
     const svg = sv("svg", { viewBox: "0 0 " + L.LW + " " + L.H, role: "group", "aria-label": "Agents graph", preserveAspectRatio: "xMidYMid meet" }, "tv-graph");
     const nodes = arr(v.nodes), byId = new Map(nodes.map((n) => [n.id, n]));
     const lost = lostMap(v), bxs = graphBoxes(v, L, measure);
-    svg.appendChild(drawSky(v, L));
+    svg.appendChild(drawGlow(v, L));
     for (const k of RING_H) svg.appendChild(sv("ellipse", { cx: num(L.hub.x), cy: num(L.hub.y), rx: num(L.LW * k * 1.15), ry: num(L.H * k * 1.05) }, "tv-gring"));
     const eg = sv("g", null, "tv-edges");
     for (const ed of edges) {
@@ -1500,11 +1523,11 @@
     const bars = el("div", "tv-rbars");
     for (let i = 0; i < 168; i++) bars.appendChild(el("i"));
     track.appendChild(bars);
-    for (const m of hourMarks(lo0, hi)) {
-      const h = el("span", "tv-rhr", m.label);
+    hourMarks(lo0, hi).forEach((m, i) => {
+      const h = el("span", "tv-rhr" + (i % 2 ? " tv-rhr-alt" : ""), m.label);   // a narrow strip keeps every other label (the stylesheet hides the alternates)
       h.style.left = ((m.ms - lo0) / WINDOW_MS * 100) + "%";
       track.appendChild(h);
-    }
+    });
     const head = el("div", "tv-rhead" + (R.at === null ? " live" : ""));
     const tlabel = el("span", "tv-rtime");
     head.appendChild(tlabel);
