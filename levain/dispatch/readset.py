@@ -99,7 +99,7 @@ def _remove(dest_dir: str, made: tuple[int, int]) -> None:
 
 def build_readset(repo: str, contract: ResolvedContract, dest_dir: str, *, contract_digest: str) -> ReadSet:
     """Build the read set of ``contract`` (read from ``repo``, which must be the contract's own) as a bare scratch repo
-    in ``dest_dir`` (a real absolute path that must NOT exist yet; this call creates it, mode 0700), or raise
+    in ``dest_dir`` (a real absolute path that must NOT exist yet; this call creates it, mode 0700 less the process umask), or raise
     :class:`ReadSetRefused`.
 
     ``contract_digest`` is the digest the job store recorded when the contract was filed (``Job.digest``, the one the

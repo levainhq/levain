@@ -317,7 +317,7 @@ def test_a_partial_clone_missing_a_read_blob_refuses_and_fetches_nothing(tmp_pat
 
     def present() -> bool:
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-        env["GIT_NO_LAZY_FETCH"] = "1"
+        env.update(GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL="", GIT_PROTOCOL_FROM_USER="0")  # never fetches on any git
         return subprocess.run(["git", "-C", str(clone), "cat-file", "-e", blob], env=env,
                               capture_output=True).returncode == 0
     assert not present()
