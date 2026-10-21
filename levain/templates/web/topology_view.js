@@ -804,6 +804,7 @@
     return () => { stopped = true; if (raf && root.cancelAnimationFrame) root.cancelAnimationFrame(raf); PART.length = 0; };
   }
 
+  let pinned = null;                                                      // the node whose card a click pinned: {id, x, y} in stage px
   function agentsLens(v, opts) {
     release();
     const wrap = el("div", "tv-agents");
@@ -863,9 +864,9 @@
     // the hover card follows the pointer over a node, inside the stage
     const nodeOf = (t) => (t && t.closest ? t.closest("[data-node]") : null);
     const byId = new Map(arr(v.nodes).map((n) => [n.id, n]));
-    stage.addEventListener("pointermove", (ev) => {
-      const g = nodeOf(ev.target), n = g ? byId.get(g.dataset.node) : null;
-      if (!n) { tip.hidden = true; return; }
+    // a click pins the card on its node (a touch screen has no hover; a mouse user wants it to stay still to read), a click
+    // elsewhere in the graph lets go. The pin survives the live redraw, which rebuilds this lens.
+    const showTip = (n, x, y) => {
       if (tip.dataset.node !== n.id) {
         tip.dataset.node = n.id;
         while (tip.firstChild) tip.removeChild(tip.firstChild);
@@ -873,12 +874,28 @@
         for (const [k, val] of tipRows(n, v.as_of)) { const r = el("div"); r.append(el("span", "tv-tl", k), val); tip.appendChild(r); }
       }
       tip.hidden = false;
-      const box = stage.getBoundingClientRect(), x = ev.clientX - box.left, y = ev.clientY - box.top;
+      const box = stage.getBoundingClientRect();
       tip.style.left = Math.max(4, Math.min(box.width - tip.offsetWidth - 4, x + 16)) + "px";
       tip.style.top = Math.max(4, Math.min(box.height - tip.offsetHeight - 4, y + 14)) + "px";
+    };
+    const hideTip = () => { tip.hidden = true; tip.dataset.node = ""; };
+    stage.addEventListener("pointermove", (ev) => {
+      if (pinned) return;
+      const g = nodeOf(ev.target), n = g ? byId.get(g.dataset.node) : null;
+      if (!n) { tip.hidden = true; return; }
+      const box = stage.getBoundingClientRect();
+      showTip(n, ev.clientX - box.left, ev.clientY - box.top);
     });
-    stage.addEventListener("pointerleave", () => { tip.hidden = true; tip.dataset.node = ""; });
+    stage.addEventListener("pointerleave", () => { if (!pinned) hideTip(); });
+    stage.addEventListener("click", (ev) => {
+      const g = nodeOf(ev.target), n = g ? byId.get(g.dataset.node) : null;
+      if (!n || (pinned && pinned.id === n.id)) { pinned = null; hideTip(); return; }
+      const box = stage.getBoundingClientRect();
+      pinned = { id: n.id, x: ev.clientX - box.left, y: ev.clientY - box.top };
+      showTip(n, pinned.x, pinned.y);
+    });
     stage.appendChild(tip);
+    if (pinned && byId.has(pinned.id)) { showTip(byId.get(pinned.id), pinned.x, pinned.y); } else pinned = null;
     return wrap;
   }
 
