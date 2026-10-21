@@ -20,7 +20,7 @@ from levain.contracts.canon import canonical
 from levain.dispatch import ContractRefused
 from levain.dispatch.adopt import ArtifactRecord, Envelope, artifact_digest, floor, land, stage_commit
 from levain.dispatch.jobs import EnvelopeEnd, EnvelopeRefused, JobStore, TransitionRefused
-from tests.test_dispatch_contract import NOW, POLICY, make_repo, registry, submission
+from tests.test_dispatch_contract import NOW, POLICY, VERIFIER_ENTRY, make_repo, registry, submission
 
 VERIFIED_AT = utc_stamp(NOW + timedelta(minutes=5))
 PATHS = ("src/a.py", "src/new.py", "src/b.py")
@@ -142,7 +142,7 @@ def put_records(store, repo, job, tmp_path):
                                       tree=tree, verified_at=VERIFIED_AT)
                 rec = ArtifactRecord(job_id=job.id, run=run, contract_digest=job.digest, base=base,
                                      staged_commit=staged, tree=tree,
-                                     verifier={"id": "pytest-bb", "hash": "sha256:" + "b" * 64,
+                                     verifier={"id": "pytest-bb", "hash": VERIFIER_ENTRY["verifier_artifact_digest"],
                                                "kind": "black-box", "result": "pass"},
                                      model={"requested": "glm-5", "answered": "glm-5",
                                             "backend_identity": f"backend-{run}"}, verified_at=VERIFIED_AT)

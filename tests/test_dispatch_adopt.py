@@ -995,7 +995,7 @@ class LandWorld:
         git(self.repo, "checkout", "-q", "-b", "work")
         ctl.ControlStore.init(self.ddir, self.keys["laptop"].fp, authority=self.log.source)
         self.cstore = ctl.ControlStore(self.ddir, authority=self.log.source)
-        accept(self.cstore, self.log, self.keys, "verifiers", 1, VERIFIERS)
+        accept(self.cstore, self.log, self.keys, "verifier", 1, VERIFIERS)
         accept(self.cstore, self.log, self.keys, "templates", 2, [tmpl()])
         accept(self.cstore, self.log, self.keys, "provider_policy", 3, POLICY.to_mapping())
         if rule:
@@ -1029,8 +1029,15 @@ class LandWorld:
             job = self.jstore._transition(job.id, to, cause)
         tree = make_tree(self.repo, job.contract.base, change, self.tmp)
         for run, result in enumerate(results):
-            r = tvr.vrun(job.id, run)
-            raw, digest = tvr.envelope(r, tvr.body((result,) * 2))
+            from levain.dispatch.verifier_report import VerifierRun
+            from tests import test_dispatch_control as tc
+
+            # the template signs control's BB_ENTRY (one step), so the run carries that entry without the registry-only fields
+            e = {k: v for k, v in tc.BB_ENTRY.items() if k not in ("steps", "driver_input")}
+            r = VerifierRun(job_id=job.id, run=run, session=f"v-{run}", ticket=f"t-{run}", verifier=e,
+                            steps=tuple(tc.BB_ENTRY["steps"]), driver_input_digest=e["driver_input_digest"],
+                            input_bundle_digest="sha256:" + "e" * 64)
+            raw, digest = tvr.envelope(r, tvr.body((result,)))
             job = self.jstore.record_verification(
                 r, envelope=raw, event=tvr.event(r, at=utc_stamp(datetime.now(timezone.utc)),
                                                  verifier_report_digest=digest),
