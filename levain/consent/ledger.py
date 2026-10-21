@@ -69,7 +69,7 @@ from levain.consent.record import AGENTS, tool_input_digest
 
 __all__ = ["DB_NAME", "DIGEST_STAMPS", "HOOK_BUSY_SECONDS", "HOOK_FILL_BUDGET", "PHASES", "STORE_FORMAT",
            "SUBAGENT_MARK", "WINDOW_SCOPE", "Call", "Ledger", "LedgerStoreError",
-           "clean_detail", "gate_row", "hook_fill", "hook_record", "parse_when", "reconcile"]
+           "clean_detail", "gate_row", "hook_fill", "hook_record", "parse_when", "reconcile", "request_outcomes"]
 
 DB_NAME = "ledger.db"
 STORE_FORMAT = "levain-authority-ledger/1"
@@ -542,6 +542,42 @@ def _codex_resolution(call: Call, policies: Mapping[str, Mapping[str, Any] | Non
         return _wait("turn_not_written")
     stamp = _stamps.codex_stamp(policy)
     return _final(stamp, policy, "unknown" if stamp in ("pending", "unknown") else "accepted")
+
+
+def request_outcomes(directory: Path | str, request_ids: "list[str]") -> dict[str, str]:
+    """``{queue request id: outcome}`` for the calls levain answered at the gate with those requests (their ``pre``
+    rows, one per call, ``window``'s rule): what each authorised call then did. A request with no row is absent.
+    A true read: the ledger in ``directory`` is opened read-only (no schema, no permission change, no lock taken
+    for writing), and none there is no outcome at all. The read waits a short, bounded time for a writer; a ledger
+    still locked after that answers ``{}`` (an outcome is decoration, so a hook holding the write lock costs the
+    caller the outcomes, never the read). A ledger of another format raises :class:`LedgerStoreError`."""
+    path = Path(directory) / DB_NAME
+    ids = sorted(set(request_ids))
+    if not ids or not path.is_file():
+        return {}
+    # a short busy wait, then give up: a page's read does not hang on a hook holding the database
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=0.25)
+    try:
+        conn.execute("BEGIN")
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        fmt = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if "meta" in tables else None
+        if fmt is None or fmt[0] != STORE_FORMAT or "calls" not in tables or "outcome" not in {
+                r[1] for r in conn.execute("PRAGMA table_info(calls)")}:
+            raise LedgerStoreError(f"store format {None if fmt is None else fmt[0]!r} is not {STORE_FORMAT!r}")
+        out: dict[str, str] = {}
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            out.update(conn.execute(
+                f"SELECT request_id, outcome FROM {_PER_CALL} WHERE phase = 'pre' AND request_id IN "
+                f"({', '.join('?' for _ in chunk)})", chunk).fetchall())
+        conn.execute("COMMIT")
+        return out
+    except sqlite3.OperationalError as exc:
+        if "locked" in str(exc) or "busy" in str(exc):
+            return {}
+        raise
+    finally:
+        conn.close()
 
 
 def reconcile(ledger: Ledger, *, give_up_after: timedelta | None = timedelta(hours=1),

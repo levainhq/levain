@@ -651,19 +651,50 @@ def test_the_fence_sees_a_planted_snapshot_call(tmp_path):
 
 
 def test_every_appender_is_the_short_lived_cli_path():
-    """S3a-2 MUST (a): a long-lived appender would have to go through the broker or hold cockpit.lock
-    (an anchor reset refuses only while a live broker holds it). The only appenders are the key acts in
-    levain.cockpit.keys, and their only callers are the CLI's commands."""
+    """S3a-2 MUST (a): a long-lived process may append only by opening the journal by path for that one
+    act, holding nothing across calls; any other long-lived appender goes through the broker or holds
+    cockpit.lock (an anchor reset refuses only while a live broker holds it). The appenders are the key
+    acts in levain.cockpit.keys (callers: the CLI's commands) and the phone revoke, which builds its
+    journal inside the function and whose one caller keeps no journal."""
     appenders = []
     for path in sorted(LEVAIN.rglob("*.py")):
         if path == LEVAIN / "authority.py":
             continue
         for name, fn, _line in _uses(path, ("append", "sign_and_append", "prepare")):
             appenders.append((str(path.relative_to(LEVAIN)), fn, name))
-    assert appenders == [("cockpit/keys.py", "_append", "sign_and_append")]
+    assert sorted(appenders) == [("cockpit/keys.py", "_append", "sign_and_append"),
+                                 ("consent/grants.py", "append_revoke", "append"),
+                                 ("consent/grants.py", "prepare_revoke", "prepare")]
     callers = [str(path.relative_to(LEVAIN)) for path in sorted(LEVAIN.rglob("*.py"))
                if _key_act_callers(ast.parse(path.read_text(encoding="utf-8")))]
     assert callers == ["cli.py"]
+
+    holders = ("_journal", "CockpitDB")
+
+    def builds_journal(node: ast.AST) -> bool:
+        return any(isinstance(n, ast.Call) and _dotted(n.func) is not None
+                   and _dotted(n.func).split(".")[-1] in holders for n in ast.walk(node))
+    # append_revoke's only caller in the package is the phone grant surface
+    revoke_callers = sorted(
+        str(p.relative_to(LEVAIN)) for p in LEVAIN.rglob("*.py") if p != LEVAIN / "consent" / "grants.py"
+        and any(isinstance(n, ast.Name) and n.id == "append_revoke"
+                or isinstance(n, ast.Attribute) and n.attr == "append_revoke"
+                or isinstance(n, ast.alias) and n.name == "append_revoke"
+                for n in ast.walk(ast.parse(p.read_text(encoding="utf-8")))))
+    assert revoke_callers == ["consent/grant_phone.py"]
+    # the journal is built inside append_revoke's body, and grants.py builds none at module level
+    grants = ast.parse((LEVAIN / "consent" / "grants.py").read_text(encoding="utf-8"))
+    fn = next(n for n in grants.body if isinstance(n, ast.FunctionDef) and n.name == "append_revoke")
+    assert any(isinstance(n, ast.Call) and _dotted(n.func) == "_journal" for n in ast.walk(fn))
+    module_level = [n for n in grants.body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                    and builds_journal(n)]
+    assert module_level == []
+    # and the phone surface keeps no journal on itself between requests
+    phone = ast.parse((LEVAIN / "consent" / "grant_phone.py").read_text(encoding="utf-8"))
+    kept = [n.lineno for n in ast.walk(phone) if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+            and builds_journal(n.value if n.value is not None else n)
+            and any(isinstance(t, ast.Attribute) for t in (n.targets if isinstance(n, ast.Assign) else [n.target]))]
+    assert kept == []
 
 
 def test_the_fences_see_a_nested_module_call_and_a_module_import_of_keys():

@@ -141,6 +141,7 @@ _CONSENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")
 _QUESTION_BODY_PREFIX = "/cockpit/question/"
 _QUESTION_ID = re.compile(r"[1-9][0-9]{0,11}")
 PROPOSALS_ID = "proposals"      # GET /cockpit/consent/proposals.json: the standing-rule proposals, same token gate
+GRANTS_ID = "grants"            # GET /cockpit/consent/grants.json: the standing grants and revoke lines, same gate
 # One agent session's transcript (Q8): GET /cockpit/session/<stem>.json. It names the session id and full cwd and
 # carries the operator's prompts, so it rides the consent body's gate: a surface token on EVERY bind, loopback included.
 _SESSION_LOG_PREFIX = "/cockpit/session/"
@@ -875,12 +876,22 @@ class _Handler(GuardedHandler):
                     from levain.consent.policy import AGENT_CONFIG_TIER
 
                     reader = self.server.consent_reader
-                    if not hasattr(reader, "directory"):     # a reader that names no queue: nothing, never the default one
+                    if not hasattr(reader, "directory"):     # a reader naming no queue: nothing, never the default
                         status, payload = 200, {"proposals": []}
                     else:
                         found = read_evidence(reader.directory, now=datetime.now(timezone.utc),
                                               exclude_tier=AGENT_CONFIG_TIER, min_hand=MIN_HAND_ALLOWS)
                         status, payload = 200, {"proposals": [p.as_dict() for p in propose(found)]}
+                elif request_id == GRANTS_ID:       # the standing grants, what each answered, each revoke line
+                    from levain.consent.grants import INERT_NOTE, grant_view
+                    from levain.consent.queue import default_queue_dir
+
+                    reader = self.server.consent_reader
+                    if not hasattr(reader, "directory"):     # a reader naming no queue: nothing, never the default
+                        status, payload = 200, {"root": "", "note": "", "grants": [], "inert_note": INERT_NOTE}
+                    else:
+                        status, payload = 200, grant_view(reader.directory if reader.directory is not None
+                                                          else default_queue_dir(), now=datetime.now(timezone.utc))
                 else:
                     entry = find_entry(self.server.consent_reader(datetime.now(timezone.utc)), request_id)
                     if entry is not None:

@@ -51,7 +51,9 @@ __all__ = [
     "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify",
-    "consent_grant", "consent_grant_tool_problem", "consent_tool_shape_problem", "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem", "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_problem",
+    "consent_grant", "consent_grant_tool_problem", "consent_revocable", "consent_tool_shape_problem",
+    "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem",
+    "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_problem",
     "genesis_policy", "inert_grant", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
     "presence_missing", "snapshot", "sshsig_public_key", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
 ]
@@ -1102,6 +1104,12 @@ def inert_grant(grant: Any) -> bool:
     return isinstance(grant, Mapping) and _grant_kind(grant) is _INERT_KIND
 
 
+def consent_revocable(grant: Any) -> bool:
+    """Whether ``grant`` is a consent grant or an inert one: what a consent revoke removes, and the only kinds a
+    passkey may revoke. An egress grant is neither."""
+    return consent_grant(grant) or inert_grant(grant)
+
+
 def classify(old: StandingPolicy, new: StandingPolicy) -> str:
     """The kind of the difference from ``old`` to ``new``, computed from the two policies alone (§4.3).
     :data:`NOOP` when nothing changes in effect (a missing floor and a floor at the lowest tier are the
@@ -1261,9 +1269,19 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             if not signer.active:
                 raise AuthorityError(f"signer {row.signer_fp} was revoked at seq {signer.revoked_seq}")
             if signer.custody == PASSKEY:
-                # a passkey signs consent answers only (its own namespace, the consent queue's check); a link it
-                # signed is refused whatever its class's rank would allow
-                raise AuthorityError(f"a {PASSKEY} key signs consent answers only, never an authority link")
+                # a passkey signs consent answers (its own namespace, the consent queue's check) and, in this log,
+                # one op: the removal of a consent or inert grant, which only ever narrows what an agent may do (a
+                # synced passkey stolen with its account can cost the operator prompts, never widen anything). Every
+                # other link it signed is refused whatever its class's rank would allow, and so is a revoke of any
+                # other kind of grant: the rule is the replay's, so a link built past the revoke command is held to it
+                if op != "revoke_grant":
+                    raise AuthorityError(f"a {PASSKEY} key signs consent answers and grant revokes only, never "
+                                         "another authority link")
+                gid = rec["grant_id"]
+                target = policy.grants.get(gid) if isinstance(gid, str) else None
+                if target is not None and not consent_revocable(target):
+                    raise AuthorityError(f"a {PASSKEY} key revokes a consent grant or an inert one only, never "
+                                         f"grant {gid[:80]!r}")
             need = _apply_op(rec, seq, state, keys, ssh_keygen)
             if isinstance(need, StandingPolicy):
                 delta = classify(policy, need)
@@ -1293,6 +1311,14 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                              fingerprint=signer.fingerprint, ssh_keygen=ssh_keygen)
         if not ok:
             raise ReplayError(seq, f"the signature does not verify as {signer.fingerprint}")
+        if signer.custody == PASSKEY:
+            # the checks ssh-keygen does not make on a WebAuthn signature (user verification, an origin that is
+            # exactly the key's own https name, not cross-origin), run at every replay
+            from levain.consent.passkey import authority_signature_problem
+
+            problem = authority_signature_problem(row.signature, signer.public_key)
+            if problem is not None:
+                raise ReplayError(seq, f"the passkey signature is refused: {problem}")
     hashes = (() if state is None else state._hashes) + (row.hash,)
     return AuthoritySnapshot(rec["store_id"], seq, row.hash, MappingProxyType(keys), policy, hashes, head_at=at,
                              grant_seqs=MappingProxyType(grant_seqs))

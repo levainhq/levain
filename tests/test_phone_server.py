@@ -208,11 +208,11 @@ def test_the_phone_port_binds_loopback_and_takes_only_a_dns_name(tmp_path: Path)
             make_phone_server(tmp_path, bad, port=0)
 
 
-def test_a_passkey_key_never_signs_an_authority_link(world) -> None:
-    # L3 r2 HIGH: a display-phone key's rank covers a renew or a tighten; a passkey's custody still refuses every link
+def test_a_passkey_key_signs_no_authority_link_but_a_revoke(world) -> None:
+    # L3 r2 HIGH: a display-phone key's rank covers a renew or a tighten; its passkey custody refuses all but a revoke
     conn = sqlite3.connect(world["root"] / "cockpit.db", isolation_level=None)
     try:
-        with pytest.raises(auth.AuthorityError, match="consent answers only"):
+        with pytest.raises(auth.AuthorityError, match="consent answers and grant revokes only, never another"):
             auth.sign_and_append(conn, {"op": "raise", "verb": "spore_touch", "tier": "T3"},
                                  signer_fp=world["passkey_fp"], sign=lambda m: "not a signature",
                                  clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(),
