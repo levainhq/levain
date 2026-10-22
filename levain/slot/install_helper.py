@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, ContextManager, Iterable, Iterator, Mapping, Optional, Sequence, TextIO
 
@@ -27,19 +27,21 @@ from levain.contracts import canon
 from levain.firing.hands import OPERATOR_RE, HandsSetupError, HostOS, Step, _abs, _kill_all, host_os, run_plan
 from levain.launch import child_env
 from levain.slot import Refused, bwrap, netns, pf, root_tree, units
+from levain.slot import generation as gen_mod
 from levain.slot import proc as PR
 from levain.slot import records as R
 from levain.slot import runtime_helper as RH
 from levain.slot import store_verbs as SV
 from levain.slot.root_intent import PhaseFailed
-from levain.slot.intent import INTENT_PATH, Intent, install_lock, intent_remove_step, intent_write_step, read_intent
+from levain.slot.intent import (INTENT_PATH, Intent, install_lock, intent_remove_step, intent_text, intent_write_step,
+                                read_intent, write_intent_atomically)
 from levain.slot.accounts import (SLOT_MARKER, SLOT_RETIRED_MARKER, Account, Group, account_steps, accounts_of,
                                   delete_group_steps, membership_pairs, membership_steps, revive_steps,
                                   shared_group_steps, shared_groups_of, tombstone_steps)
 from levain.slot.grammar import LEASE_EXEMPT, SESSION_RE, VERBS, InstallCommand, check_roots, parse_install_argv
 from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS, SLOT_NAME_RE, Allocation,
                              SlotClass, SlotId, allocate, check_capacity, choose_indices, in_own_range,
-                             is_levain_account, read_retired_ids, retired_ids_text, spent_indices)
+                             is_levain_account, loopback_alias, read_retired_ids, retired_ids_text, spent_indices)
 from levain.slot.runtime_grammar import VERBS as RUNTIME_VERBS
 from levain.slot.runtime_grammar import ok_line, refusal_line
 from levain.slot.layout import (STORE, Row, base_routes_steps, base_run_rows, base_store_rows, operator_record_path,
@@ -47,7 +49,7 @@ from levain.slot.layout import (STORE, Row, base_routes_steps, base_run_rows, ba
                                 pool_config_undo_steps, reserve_row, reserve_steps, roots_steps, row_steps,
                                 run_dir_undo_steps, single_filesystem_steps, slot_rows, tmpfiles_steps,
                                 tmpfiles_undo_steps, ungroup_steps)
-from levain.slot.sudoers import remove_install_sudoers_steps, remove_runtime_sudoers_steps, sudoers_steps
+from levain.slot.sudoers import remove_install_sudoers_steps, remove_runtime_sudoers_steps, sudoers_paths, sudoers_steps
 
 OPERATOR_FORMAT = "levain-operator/1"
 
@@ -94,6 +96,8 @@ class HostFacts:
     host_ids: Mapping[str, int] = field(default_factory=dict)
     #: What ``live_leases`` counts (the refusal names them); last, so positional construction keeps its meaning.
     live_sessions: tuple[str, ...] = ()
+    #: ``L/policy/install-shape`` parsed (row 33), or None: a host set up before it, or never set up.
+    install_shape: gen_mod.InstallShape | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +116,8 @@ class InstallPlan:
     pending: tuple[str, ...] = ()        # programs the plan points at that are not built yet
     services: tuple[str, ...] = ()       # the §1.3 services whose units this plan installs
     intent: Intent | None = None         # what the plan's first step journals (§25)
+    generation: str | None = None        # the generation the plan makes current (row 33)
+    generation_change: bool = False      # repair: the record is absent or names another generation (§2.3)
 
 
 # --- the operator record ---------------------------------------------------------------------------
@@ -178,7 +184,7 @@ def extra_tools(host: HostOS, verb: str) -> tuple[str, ...]:
     if host == "darwin":
         return ("/usr/sbin/dseditgroup", "/usr/bin/pkill", "/usr/bin/pgrep")
     if host == "linux":
-        copies = (bwrap.system_bwrap(),) if verb in ("setup", "replenish") else ()
+        copies = (bwrap.system_bwrap(),) if verb in ("setup", "replenish", "repair") else ()
         return (*copies, _abs("pkill"), _abs("pgrep"))
     raise Refused("unsupported-host", repr(host))
 
@@ -544,7 +550,7 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
                realpath: Callable[[str], str] = os.path.realpath,
                lstat: Callable[[str], os.stat_result] = os.lstat,
                read_sysctl: Callable[[str], str] | None = None,
-               source: Path | None = None,
+               source: Path | None = None, h11: Path | None = None,
                program_exists: Callable[[Path], bool] = Path.is_file) -> InstallPlan:
     """``read_sysctl``: reads a ``/proc/sys`` path (Linux, the AppArmor userns check); ``source``: the
     ``levain`` package copied into the root import tree (default: the one running);
@@ -607,7 +613,27 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         # Each egress slot's lo0 alias (§24) before the rules that name it.
         confinement = [*pf.alias_steps(alloc.slots), *pf.load_steps(alloc.slots, alloc.ids)]
         boot_dirs = []
-    intent = Intent("setup", cmd.operator, dict(alloc.ids), dict(alloc.shared))
+    txn = journal.txn if journal is not None and journal.txn else gen_mod.new_txn()
+    intent = Intent("setup", cmd.operator, dict(alloc.ids), dict(alloc.shared), txn)
+    h11_dir = root_tree.h11_source() if h11 is None else h11
+    root_tree.check_sources(package, h11_dir)
+    target = gen_mod.generation_id(package, h11_dir)
+    versions = (gen_mod.read_version_text(package / "__init__.py"), root_tree.h11_floor(h11_dir))
+    restricted_aa = host == "linux" and restricted
+    desired = desired_managed(host, accounts=alloc.ids, shared=alloc.shared, operator=cmd.operator,
+                              services=[s.name for s in services], slots=alloc.slots, apparmor=restricted_aa)
+    noted: dict[str, int] = {}
+    shape_path = install_shape_path(host)
+
+    def note() -> tuple[bool, str]:
+        now = int(time.time())
+        noted.update((s.name, now) for s in services)
+        return True, ""
+
+    def record() -> tuple[bool, str]:
+        new = gen_mod.InstallShape(target, versions[0], versions[1], txn, dict(noted), _shape_of(desired))
+        return gen_mod.write_record_durably(shape_path, gen_mod.shape_text(new))
+
     steps: list[Step] = [
         # FIRST (§25): the exact allocation, before anything is made, so an interrupted run re-plans it.
         intent_write_step(host, intent),
@@ -623,8 +649,10 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         *base_routes_steps(host),
         *roots_steps(host, roots),
         *pool_config_steps(host, cmd.slots, cmd.verifier_slots),
-        *root_tree.tree_steps(host, package),
+        *root_tree.tree_steps(host, package, h11_dir=h11_dir, generation=target),
         *confinement,
+        # Before the first start: each service's started_after threshold (row 33 §2.5).
+        Step("note each service's started_after threshold (before the first start)", call=note),
         *units.install_steps(host, services),
         # The quiesce, if the pool lock was not there to take at the live-lease check (a fresh setup).
         quiesce_step(host),
@@ -632,6 +660,8 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         # prepare run (prepare picks only from these).
         *slot_state_steps(host, alloc.slots),
         *sudoers_steps(host, cmd.operator),
+        # Row 33 §2.5: the install record before the operator record; setup's completion is still the latter.
+        Step(f"write the install record {shape_path} (completed_txn {txn})", call=record),
         # LAST (§23): only a complete install is `already-set-up`; until this, setup re-runs.
         Step(f"record {cmd.operator} as this machine's one operator (last)",
              write=(operator_record_path(host), operator_record_text(cmd.operator, facts.operator_uid), 0o644)),
@@ -645,7 +675,7 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
                        tuple(early + rows + [reserve_row(host), pool_config_row(host)]), roots, facts.retired,
                        revived=tuple(a.name for a in revived), kept=kept,
                        pending=helper_pending() + skipped, services=tuple(s.name for s in services),
-                       intent=intent)
+                       intent=intent, generation=target, generation_change=True)
 
 
 # --- undo ------------------------------------------------------------------------------------------
@@ -782,6 +812,7 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
     # Just before the record (§25): until undo is complete a re-run still reads what the journal names.
     steps.append(intent_remove_step(host))
     if abandoned is None:
+        steps.append(Step("remove the install record", (rm, "-f", str(install_shape_path(host)))))
         steps.append(Step("remove the operator record (last)", (rm, "-f", str(operator_record_path(host)))))
     check_tools(facts, steps, verb="undo")
     return InstallPlan("undo", host, tuple(steps), retired_after=retired_after)
@@ -812,6 +843,12 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
     check_account_ids(host, accounts)
     check_capacity(host, slots, verifier_slots, facts.retired)
     journal = facts.intent
+    if journal is not None and journal.verb == "repair":
+        # Row 33 (§8 N1/N1a): the ONLY proof a repair finished is install-shape's completed_txn == its txn.
+        shape = facts.install_shape
+        if shape is None or journal.txn != shape.completed_txn:
+            raise Refused("install-interrupted:repair", "re-run repair to finish it")
+        journal = None    # finished: this run's journal write replaces it
     new: dict[SlotClass, tuple[SlotId, ...]] = {}
     if journal is not None and journal.verb == "replenish":
         # §25: an interrupted replenish is resumed at the slots, indices and ids it journaled, and no new
@@ -847,7 +884,8 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
         # without its pf rules; every egress slot's alias (§24) added where lo0 lacks it.
         confinement = [*pf.alias_steps(in_service + alloc.slots),
                        *pf.load_steps(in_service + alloc.slots, {**accounts, **alloc.ids})]
-    intent = Intent("replenish", str(rec.get("name")), dict(alloc.ids))
+    txn = journal.txn if journal is not None and journal.txn else gen_mod.new_txn()
+    intent = Intent("replenish", str(rec.get("name")), dict(alloc.ids), {}, txn)
     steps = [
         # FIRST (§25): the slots this run makes, so a run that dies part-way resumes them, never spends more.
         intent_write_step(host, intent),
@@ -864,6 +902,300 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
                        intent=intent)
 
 
+# --- repair (row 33; DESIGN 1022-8/upgrade §2.3) ----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RepairFacts:
+    """What a repair reads beyond :class:`HostFacts`, under the install lock (§2.3 R0)."""
+
+    #: Every live Levain account (Levain's live label), name -> uid (== gid).
+    accounts: Mapping[str, int] = field(default_factory=dict)
+    #: Every group whose name passes ``group/1``'s bound (``levain-*``), name -> gid: the candidates §3 recognises.
+    groups: Mapping[str, int] = field(default_factory=dict)
+    #: For each of those groups, its members as the directory lists them (§3: read_directory gains membership).
+    members: Mapping[str, frozenset] = field(default_factory=dict)
+    #: The slots in service, by class (``L/slots/``, retired ones dropped).
+    egress: tuple[int, ...] = ()
+    verifier: tuple[int, ...] = ()
+    #: ``readlink(<tree>/current)``; None on a pre-generation install (or a lost flip).
+    current: str | None = None
+    #: A pre-generation install's top-level ``<tree>/levain`` is present (R13 removes it).
+    legacy: bool = False
+    #: ``--source``: the RESOLVED levain package dir and its sibling ``h11`` (§2.1 (e)); None without ``--source``.
+    source: Path | None = None
+    h11: Path | None = None
+
+
+def install_shape_path(host: HostOS) -> Path:
+    return operator_record_path(host).parent / "install-shape"
+
+
+def desired_managed(host: HostOS, *, accounts: Mapping[str, int], shared: Mapping[str, int], operator: str,
+                    services: Iterable[str], slots: Iterable[SlotId], apparmor: bool = False) -> frozenset:
+    """§1.1 ``managed``: what an install with these accounts, shared groups, services and slots manages, typed, one
+    record per resource, derived from the plan (never typed by hand)."""
+    accts = accounts_of(Allocation(host, (), (), dict(accounts), {}))
+    out: set = {("unit/1", s) for s in services}
+    out |= {("sudoers/1", p.name) for p in sudoers_paths()}
+    out |= {("group/1", (g, gid)) for g, gid in shared.items()}
+    out |= {("account/1", (a.name, a.uid)) for a in accts}
+    out |= {("member/1", (a, g, shared[g])) for a, g in membership_pairs(accts, operator)}
+    out |= {("entry/1", e) for e in root_tree.ENTRY_MODULES}
+    slots = tuple(slots)
+    if host == "darwin":
+        out |= {("pf-alias/1", loopback_alias(s)) for s in slots if s.slot_class == "egress"}
+        out |= {("pf-anchor/1", (pf.ANCHOR, str(pf.ANCHOR_FILE))), ("pf-enable/1", str(pf.PF_TOKEN))}
+    else:
+        out |= {("bwrap-copy/1", (str(bwrap.LEVAIN_BWRAP), str(bwrap.BWRAP_DIGEST)))}
+        out |= {("netns/1", s.netns) for s in slots}
+        if apparmor:
+            out.add(("apparmor/1", bwrap.APPARMOR_PROFILE_NAME))
+    return frozenset(out)
+
+
+def _shape_of(records: Iterable) -> tuple:
+    return tuple(sorted(records, key=lambda r: (r[0], canon.canonical(gen_mod.managed_json([r])))))
+
+
+def _journal_step(host: HostOS, why: str, intent: Intent) -> Step:
+    path, text = INTENT_PATH[host], intent_text(intent)
+    return Step(why, call=lambda: write_intent_atomically(path, text))
+
+
+def _stop_steps(host: HostOS, services: Sequence[units.Service], noted: dict[str, int],
+                clock: Callable[[], float]) -> list[Step]:
+    """§2.3 R5: stop ``services`` in reverse start order, noting ``floor(now)`` for each just BEFORE its stop (R14
+    writes it to ``started_after``)."""
+    def note_then(name: str, act: Callable[[], tuple[bool, str]]) -> Callable[[], tuple[bool, str]]:
+        def go() -> tuple[bool, str]:
+            noted[name] = int(clock())
+            return act()
+        return go
+
+    def run_argv(argv: tuple[str, ...]) -> tuple[bool, str]:
+        r = subprocess.run(list(argv), capture_output=True, text=True, cwd="/", env=child_env())
+        return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+    steps: list[Step] = []
+    for s in reversed([x for x in units.services_for(host) if x in services]):
+        if host == "darwin":
+            label = units.launchd_label(s)
+
+            def bootout(lb: str = label) -> tuple[bool, str]:
+                run_argv(("/bin/launchctl", "bootout", f"system/{lb}"))   # not loaded answers non-zero: checked next
+                return units._launchd_job_absent(lb)
+
+            steps.append(Step(f"stop {label}", call=note_then(s.name, bootout)))
+        else:
+            name = units.systemd_name(s)
+            steps.append(Step(f"stop {name}", call=note_then(s.name, lambda n=name: run_argv((_abs("systemctl"), "stop", n)))))
+    return steps
+
+
+def _recognised_groups(host: HostOS, facts: HostFacts, rf: RepairFacts, journaled: Mapping[str, int]) -> dict[str, int]:
+    """§3: the shared groups present that are Levain's: macOS by the live label; any host by ``group/1`` in the record
+    at its recorded gid, or journaled at its gid; with NO record (the pre-row-33 hosts, Q3), by name AND gid in the
+    shared range. A same-name group anywhere else refuses ``account-exists``, never claimed."""
+    shape = facts.install_shape
+    recorded = {i for k, i in (shape.managed if shape else ()) if k == "group/1"}
+    ours: dict[str, int] = {}
+    foreign: list[str] = []
+    for g in SHARED_GROUPS:
+        gid = rf.groups.get(g)
+        if gid is None:
+            continue
+        if ((host == "darwin" and facts.levain_live.get(g) == gid) or (g, gid) in recorded
+                or journaled.get(g) == gid or (shape is None and gid in RANGES[host].shared)):
+            ours[g] = gid
+        else:
+            foreign.append(f"{g} (at {gid})")
+    if foreign:
+        raise Refused("account-exists", ", ".join(foreign))
+    return ours
+
+
+def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
+                txn: Callable[[], str] = gen_mod.new_txn, clock: Callable[[], float] = time.time,
+                read_sysctl: Callable[[str], str] | None = None,
+                program_exists: Callable[[Path], bool] = Path.is_file) -> InstallPlan:
+    """``repair [--source PATH]`` (§2.1, §2.3), the ADDITION path: setup's own plan re-applied against what is
+    installed, every step idempotent, the levain + h11 pair staged as ONE generation behind one flip of ``current``.
+    Order: the journal (a finished repair journal, ``txn == record.completed_txn``, is removed first and a fresh
+    ``txn`` minted; an unfinished one is resumed at its ``txn``, gids and write-ahead ``managed``); the stage (R2-R3);
+    the gids and write-ahead ``managed`` journaled (R4b); every affected service STOPPED (R5); new shared groups (R6);
+    the missing memberships (R7); rows and confinement (R8); THE FLIP (R9); entries (R10); sudoers (R11); units and
+    every start (R12); GC (R13); ``install-shape`` (R14, the completion commit); the journal removed (R15).
+
+    The removal path (a recorded resource the code no longer desires) is R1b's: until it lands such a plan refuses
+    ``removal-unbuilt:<kind>`` before any act. The phase A / phase B handover (probe, exec) is R2's."""
+    if cmd.verb != "repair":
+        raise Refused("wrong-verb", cmd.verb)
+    host = facts.host
+    shape = facts.install_shape
+    journal = facts.intent
+    finished: Intent | None = None
+    if journal is not None and journal.verb == "replenish":
+        raise Refused("install-interrupted:replenish", "finish the replenish first")
+    if journal is not None and journal.verb == "setup":
+        journal = None    # stale: the operator record proves that setup finished (preflight refuses without one)
+    if journal is not None and shape is not None and journal.txn == shape.completed_txn:
+        finished, journal = journal, None    # R1 [F2]: that run reached R14; never resume it
+    preflight(cmd, facts)
+    rec = facts.operator_record
+    assert rec is not None
+    operator = str(rec["name"])
+    previous = frozenset(shape.managed) if shape is not None else frozenset()
+    journaled = frozenset(journal.managed) if journal is not None else frozenset()
+    gen_mod.check_managed(host, [*sorted(previous, key=repr), *sorted(journaled, key=repr)], operator=operator)
+    if journal is not None:
+        _, foreign = _journal_presence(facts)
+        if foreign:
+            raise Refused("account-exists", ", ".join(foreign))
+    run_txn = journal.txn if journal is not None and journal.txn else txn()
+
+    # The target generation (R2): the --source package's id, else the journal's or the record's.
+    if rf.source is not None:
+        if rf.h11 is None:
+            raise Refused("bad-source", "no h11 beside the levain package")
+        root_tree.check_sources(rf.source, rf.h11)
+        target = gen_mod.generation_id(rf.source, rf.h11)
+        versions = (gen_mod.read_version_text(rf.source / "__init__.py"), root_tree.h11_floor(rf.h11))
+        package = rf.source
+    else:
+        target = (journal.generation if journal is not None and journal.generation else
+                  shape.generation if shape is not None else None)
+        if target is None or target != rf.current:
+            raise Refused(f"source-required:{target or 'none'}", "this host needs repair --source <levain package>")
+        assert shape is not None
+        versions = (shape.levain, shape.h11)
+        package = root_tree.current_path(host) / "levain"
+    gen_change = shape is None or shape.generation != target or rf.current != target
+
+    # R4b: the shared groups, kept at the gids they hold (or were journaled at); only the missing ones allocated.
+    jgroups = dict(journal.groups) if journal is not None else {}
+    present = _recognised_groups(host, facts, rf, jgroups)
+    keep_shared = {**{g: i for g, i in jgroups.items() if g in SHARED_GROUPS}, **present}
+    alloc = allocate(host, egress=(), verifier=(), used=facts.used_ids, retired=facts.retired, shared=True,
+                     keep_shared=keep_shared)
+    check_account_ids(host, rf.accounts)
+    slots = tuple(SlotId("egress", i) for i in rf.egress) + tuple(SlotId("none", i) for i in rf.verifier)
+    services, skipped = units.built_services(host, package, exists=program_exists)
+    restricted = False
+    if host == "linux":
+        restricted = bwrap.userns_restricted() if read_sysctl is None else bwrap.userns_restricted(read_sysctl)
+    desired = desired_managed(host, accounts=rf.accounts, shared=alloc.shared, operator=operator,
+                              services=[s.name for s in services], slots=slots, apparmor=restricted)
+    reconcile = previous | journaled | desired
+    remove = reconcile - desired
+    if remove:
+        raise Refused(f"removal-unbuilt:{sorted(remove, key=repr)[0][0]}",
+                      "removing a recorded resource is row 33 R1b; this code only adds")
+    accts = accounts_of(Allocation(host, (), (), dict(rf.accounts), {}))
+    missing_groups = [Group(g, gid, ()) for g, gid in alloc.shared.items() if g not in present]
+    missing_pairs = [(a, g) for a, g in membership_pairs(accts, operator) if a not in rf.members.get(g, frozenset())]
+    changed = {a for a, _ in missing_pairs}
+    stop = list(services) if gen_change else [s for s in services if s.user in changed]
+
+    first = Intent("repair", operator, {}, jgroups, run_txn, journal.generation if journal else None,
+                   tuple(journal.managed) if journal else ())
+    staged = replace(first, generation=target)
+    final = replace(staged, groups=dict(alloc.shared), managed=_shape_of(reconcile))
+    noted: dict[str, int] = {}
+    carried = dict(shape.started_after) if shape is not None else {}
+    keep = {target} | ({shape.generation} if shape is not None else set())
+    shape_path = install_shape_path(host)
+
+    def record() -> tuple[bool, str]:
+        new = gen_mod.InstallShape(target, versions[0], versions[1], run_txn, {**carried, **noted},
+                                   _shape_of(desired))
+        return gen_mod.write_record_durably(shape_path, gen_mod.shape_text(new))
+
+    rows = base_store_rows(host, operator) + base_run_rows(host) + slot_rows(host, slots)
+    ids = {a.name: a.uid for a in accts}
+    if host == "darwin":
+        confinement = [*pf.alias_steps(slots), *pf.load_steps(slots, ids)]
+    else:
+        confinement = [*bwrap.bwrap_steps(apparmor_userns_restricted=restricted), *netns.netns_steps(slots),
+                       *tmpfiles_steps(host, slots)]
+    steps: list[Step] = []
+    if finished is not None:
+        steps.append(Step(f"remove the finished repair journal {INTENT_PATH[host]} (its txn is install-shape's "
+                          "completed_txn)", (root_tree._tools(host)["rm"], "-f", str(INTENT_PATH[host]))))
+    steps.append(intent_write_step(host, first))                                                  # R1
+    if rf.source is not None:
+        steps += root_tree.stage_steps(host, rf.source, rf.h11, target, current=rf.current)   # type: ignore[arg-type]
+    steps.append(_journal_step(host, f"journal the generation {target} (same txn)", staged))      # R3
+    steps.append(_journal_step(host, "journal the shared-group gids and the write-ahead managed set (same txn)",
+                               final))                                                            # R4b
+    steps += _stop_steps(host, stop, noted, clock)                                                # R5
+    steps += shared_group_steps(host, missing_groups)                                             # R6
+    steps += membership_steps(host, missing_pairs)                                                # R7
+    steps += [*row_steps(host, rows), *reserve_steps(host), *base_routes_steps(host),             # R8
+              *single_filesystem_steps(host, slots), *confinement]
+    if rf.current != target:
+        steps.append(root_tree.flip_step(host, target))                                          # R9
+    steps += root_tree.entry_steps(host)                                                          # R10
+    steps += sudoers_steps(host, operator)                                                        # R11
+    steps += units.install_steps(host, services)                                                  # R12
+    if rf.legacy or gen_change:
+        steps.append(root_tree.gc_step(host, keep))                                               # R13
+    steps.append(Step(f"write the install record {shape_path} (completed_txn {run_txn}, last host act)",
+                      call=record))                                                               # R14
+    steps.append(intent_remove_step(host))                                                        # R15
+    check_tools(facts, steps, verb="repair", python=True)
+    return InstallPlan("repair", host, tuple(steps), alloc, accts, tuple(missing_groups), tuple(rows),
+                       retired_after=facts.retired, pending=helper_pending() + skipped,
+                       services=tuple(s.name for s in services), intent=final, generation=target,
+                       generation_change=gen_change)
+
+
+def _act(step: Step, *, run: Callable[..., object] = subprocess.run) -> bool:
+    """Whether ``step`` would act on this host, read without acting (the staged-tree launcher's ``--plan-only``):
+    a ``skip_if`` probe that exits 0 means no; a ``chown``/``chmod`` whose path already has that owner/mode means no;
+    a ``write`` whose file already holds that text at that mode means no; anything else would act."""
+    import grp
+    import pwd
+
+    if step.skip_if:
+        try:
+            if run(list(step.skip_if), capture_output=True, cwd="/", env=child_env()).returncode == 0:   # type: ignore[attr-defined]
+                return False
+        except OSError:
+            return True
+    if step.write is not None:
+        path, text, mode = step.write
+        try:
+            st = os.lstat(path)
+            with open(path, "rb") as fh:
+                return not (stat.S_ISREG(st.st_mode) and stat.S_IMODE(st.st_mode) == mode
+                            and fh.read() == text.encode("utf-8"))
+        except OSError:
+            return True
+    argv = step.argv
+    if len(argv) == 3 and argv[0].endswith(("/chown", "/chmod")):
+        try:
+            st = os.lstat(argv[2])
+        except OSError:
+            return True
+        if argv[0].endswith("/chmod"):
+            return stat.S_IMODE(st.st_mode) != int(argv[1], 8)
+        owner, _, group = argv[1].partition(":")
+        try:
+            return (pwd.getpwuid(st.st_uid).pw_name, grp.getgrgid(st.st_gid).gr_name) != (owner, group)
+        except KeyError:
+            return True
+    return True
+
+
+def plan_only_report(plan: InstallPlan, err: TextIO, *, act: Callable[[Step], bool] = _act) -> str | None:
+    """The staged-tree launcher's ``--plan-only`` apply (a launcher seam, never a grammar flag): each step printed
+    ``ACT`` or ``----`` (already so) and NOTHING applied. Every read it makes is a probe (``skip_if``) or an lstat."""
+    for i, step in enumerate(plan.steps, 1):
+        err.write(f"{'ACT ' if act(step) else '----'} [{i}/{len(plan.steps)}] {step.why}\n")
+    return None
+
+
 # --- the apply layer: ``__main__`` (CONTRACT §5 preamble, §5.2, §25) --------------------------------------
 
 
@@ -876,6 +1208,8 @@ class Directory:
     groups: Mapping[str, int]
     user_labels: Mapping[str, str] = field(default_factory=dict)
     group_labels: Mapping[str, str] = field(default_factory=dict)
+    #: Each group's listed members (macOS ``GroupMembership``; Linux ``getent group`` field 4). Row 33 §3.
+    group_members: Mapping[str, frozenset] = field(default_factory=dict)
 
 
 def _lines(run: Callable[..., object], argv: Sequence[str]) -> list[str]:
@@ -899,6 +1233,7 @@ def read_directory(host: HostOS, *, run: Callable[..., object] = subprocess.run)
     groups: dict[str, int] = {}
     ulab: dict[str, str] = {}
     glab: dict[str, str] = {}
+    gmem: dict[str, frozenset] = {}
     if host == "darwin":
         dscl = "/usr/bin/dscl"
         for kind, key, into in (("/Users", "UniqueID", users), ("/Groups", "PrimaryGroupID", groups)):
@@ -914,6 +1249,10 @@ def read_directory(host: HostOS, *, run: Callable[..., object] = subprocess.run)
                 p = ln.split(None, 1)
                 if p:
                     into[p[0]] = " ".join(p[1].split()) if len(p) > 1 else ""
+        for ln in _lines(run, (dscl, ".", "-list", "/Groups", "GroupMembership")):
+            p = ln.split()
+            if p:
+                gmem[p[0]] = frozenset(p[1:])
     elif host == "linux":
         getent = _abs("getent")
         for ln in _lines(run, (getent, "passwd")):
@@ -931,11 +1270,12 @@ def read_directory(host: HostOS, *, run: Callable[..., object] = subprocess.run)
             if len(p) != 4:
                 raise Refused("host-read-failed", f"getent group: {ln[:120]!r}")
             groups[p[0]] = _id(p[2], ln)
+            gmem[p[0]] = frozenset(m for m in p[3].split(",") if m)
     else:
         raise Refused("unsupported-host", repr(host))
     if users.get("root") != 0:
         raise Refused("host-read-failed", "the directory service lists no root at uid 0")
-    return Directory(users, groups, ulab, glab)
+    return Directory(users, groups, ulab, glab, gmem)
 
 
 def live_lease_sessions(sessions: Path) -> tuple[str, ...]:
@@ -1009,6 +1349,8 @@ class Gathered:
     pool: tuple[int, int] | None = None
     #: replenish: every index ``L/slots/`` holds, by class, retired ones included.
     configured: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
+    #: repair: what :func:`plan_repair` reads beyond the facts (row 33).
+    repair: RepairFacts | None = None
 
 
 def _operator_of(store: RH.Store) -> Mapping[str, object] | None:
@@ -1060,13 +1402,15 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
         q.hold()        # before the live-lease count below, so the count is one no prepare can change
     retired_path = Path(state_dir) / RETIRED_IDS_PATH[host].name if state_dir else RETIRED_IDS_PATH[host]
     intent_path = Path(state_dir) / INTENT_PATH[host].name if state_dir else INTENT_PATH[host]
-    orec, in_service, pool, configured = None, None, None, {}
+    orec, in_service, pool, configured, shape = None, None, None, {}, None
     if os.path.lexists(L):
         # Read as the runtime helper reads the store: one dirfd, every component O_NOFOLLOW, root's dirs only.
         store = RH.Store(rs)
         try:
             orec = _operator_of(store)
-            if cmd.verb == "replenish" and orec is not None:
+            raw_shape = store.read(("policy",), "install-shape") if orec is not None else None
+            shape = gen_mod.parse_shape(raw_shape) if raw_shape is not None else None
+            if cmd.verb in ("replenish", "repair") and orec is not None:
                 in_service = slots_in_service(store)
                 configured = {cls: tuple(sorted(i)) for cls, i in RH.configured_slots(store).items()}
                 raw = store.read(("policy",), "pool")
@@ -1099,7 +1443,9 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
         live_leases=len(leased), live_sessions=leased,
         used_ids=frozenset(d.users.values()) | frozenset(d.groups.values()),
         existing_names=frozenset(d.users) | frozenset(d.groups), retired=read_retired_ids(retired_path),
-        levain_tombstones=tombs, levain_live=live, intent=journal, host_ids=host_ids)
+        levain_tombstones=tombs, levain_live=live, intent=journal, host_ids=host_ids, install_shape=shape)
+    if cmd.verb == "repair":
+        return Gathered(facts, accounts, quiesce=q, repair=_repair_facts(cmd, host, d, accounts, in_service or {}))
     if cmd.verb == "undo":
         return Gathered(facts, accounts, shared, quiesce=q)
     if in_service is not None:
@@ -1107,6 +1453,29 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
         return Gathered(facts, {n: u for n, u in accounts.items() if n in wanted}, live=in_service, quiesce=q,
                         pool=pool, configured=configured)
     return Gathered(facts, quiesce=q)
+
+
+def _repair_facts(cmd: InstallCommand, host: HostOS, d: Directory, accounts: Mapping[str, int],
+                  in_service: Mapping[str, tuple[int, ...]]) -> RepairFacts:
+    """Row 33 §2.3 R0: the directory's ``levain-*`` groups and their members, the slots in service, what
+    ``<tree>/current`` names, whether the legacy tree is there, and ``--source`` RESOLVED (§2.1 (e): every later read
+    names the resolved parent). The source-ownership check on that chain is R2's (phase A)."""
+    from levain.slot.intent import GROUP_RE
+
+    groups = {g: i for g, i in d.groups.items() if GROUP_RE.fullmatch(g)}
+    tree = root_tree.current_path(host).parent
+    try:
+        current: str | None = os.readlink(tree / root_tree.CURRENT)
+    except OSError:
+        current = None
+    source = h11 = None
+    if cmd.source is not None:
+        parent = Path(os.path.realpath(os.path.dirname(cmd.source)))
+        source, h11 = parent / os.path.basename(cmd.source), parent / "h11"
+    return RepairFacts(accounts=dict(accounts), groups=groups, members={g: d.group_members.get(g, frozenset())
+                                                                        for g in groups},
+                       egress=tuple(in_service.get("egress", ())), verifier=tuple(in_service.get("none", ())),
+                       current=current, legacy=os.path.isdir(tree / "levain"), source=source, h11=h11)
 
 
 def plan_for(cmd: InstallCommand, g: Gathered, **setup_kw) -> InstallPlan:
@@ -1120,6 +1489,8 @@ def plan_for(cmd: InstallCommand, g: Gathered, **setup_kw) -> InstallPlan:
         slots, verifier_slots = g.pool if g.pool is not None else (None, None)
         return plan_replenish(cmd, g.facts, slots=slots, verifier_slots=verifier_slots, live=g.live,
                               accounts=g.accounts, configured=g.configured)
+    if cmd.verb == "repair" and g.repair is not None:
+        return plan_repair(cmd, g.facts, g.repair)
     raise Refused(f"verb-unbuilt:{cmd.verb}", cmd.verb)
 
 
@@ -1254,7 +1625,7 @@ def main(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams | None = N
 INSTALL_ENTRY_ENV = ("SUDO_UID",)
 
 
-__all__ = ["BUILT_VERBS", "INSTALL_ENTRY_ENV", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
+__all__ = ["RepairFacts", "desired_managed", "install_shape_path", "plan_only_report", "plan_repair", "BUILT_VERBS", "INSTALL_ENTRY_ENV", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
            "apply_steps", "check_account_ids", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",
            "plan_for", "plan_replenish", "plan_setup", "plan_tools", "plan_undo", "pool_lock", "preflight", "Quiesce",

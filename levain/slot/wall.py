@@ -321,12 +321,12 @@ def _under(path: str, root: PurePosixPath) -> bool:
 def module_argv(host: str, module: str, *args: str) -> Tuple[str, ...]:
     """Run a Levain module from the root-owned import tree, the way the entry scripts do (§23): the
     interpreter isolated (``-IS``), the tree the ONE path added, the module run as ``__main__``."""
-    from levain.slot.layout import IMPORT_TREE
-    from levain.slot.root_tree import PY_FLAGS, ROOT_PYTHON
+    from levain.slot.root_tree import PY_FLAGS, ROOT_PYTHON, boot_path_code
 
     if not _MODULE.fullmatch(module):
         raise Refused("bad-token", f"module {module!r}")
-    boot = (f"import sys; sys.path.insert(0, {str(IMPORT_TREE[host])!r}); import runpy; m = sys.argv.pop(1); "
+    # The entry scripts' own boot line (row 33: one boot text), then the module as __main__.
+    boot = (f"{boot_path_code(host)}; import runpy; m = sys.argv.pop(1); "
             "runpy.run_module(m, run_name='__main__', alter_sys=True)")
     return (ROOT_PYTHON[host], PY_FLAGS, "-c", boot, module) + tuple(args)
 

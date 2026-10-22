@@ -16,7 +16,7 @@ import os
 import re
 import stat
 from pathlib import Path
-from typing import Callable, Iterator, Mapping
+from typing import Callable, Iterable, Iterator, Mapping
 
 from levain.firing.hands import HostOS, Step, _abs
 from levain.slot import Refused
@@ -38,19 +38,34 @@ ENTRY_MODULES = {"install-helper": "levain.slot.install_helper", "runtime-helper
 HELPER_MODULES = {k: v for k, v in ENTRY_MODULES.items() if k != "service-entry"}
 
 
+#: The one link in the import tree (row 33, DESIGN 1022-8/upgrade §2.3): ``<tree>/current -> gen-<id>``, a RELATIVE
+#: link, so it resolves inside the Linux wall's read-only bind of the tree too.
+CURRENT = "current"
+STAGING = "staging.partial"
+
+
+def current_path(host: HostOS, *, tree: Path | None = None) -> Path:
+    return (tree if tree is not None else IMPORT_TREE[host]) / CURRENT
+
+
+def boot_path_code(host: HostOS, *, tree: Path | None = None) -> str:
+    """The ONE boot line every root-run Levain program starts with (the entry scripts and ``wall.module_argv``):
+    ``sys.path`` gets ``realpath(<tree>/current)``, resolved ONCE at process start, so a running process keeps
+    importing from its own generation after a flip (Nix's store-path behaviour)."""
+    return f"import os, sys; sys.path.insert(0, os.path.realpath({str(current_path(host, tree=tree))!r}))"
+
+
 def entry_text(host: HostOS, entry: str, *, tree: Path | None = None) -> str:
-    """The entry script ``entry``: the interpreter isolated, ``sys.path`` = the import tree (``tree``,
-    default the host's) + the interpreter's own standard library, then the entry's module run as
-    ``__main__`` (its argv is the script's)."""
+    """The entry script ``entry``: the interpreter isolated, ``sys.path`` = the import tree's CURRENT generation
+    (``tree``, default the host's; :func:`boot_path_code`) + the interpreter's own standard library, then the
+    entry's module run as ``__main__`` (its argv is the script's)."""
     if entry not in ENTRY_MODULES:
         raise Refused("bad-token", f"entry: {entry!r}")
-    t = str(tree if tree is not None else IMPORT_TREE[host])
     return (
         f"#!{ROOT_PYTHON[host]} {PY_FLAGS}\n"
         f"# Levain {entry} (CONTRACT §2.1, §5, §23). Written by the install helper. Imports only from the\n"
-        "# root-owned import tree and the interpreter's standard library.\n"
-        "import sys\n"
-        f"sys.path.insert(0, {t!r})\n"
+        "# root-owned import tree's current generation and the interpreter's standard library.\n"
+        f"{boot_path_code(host, tree=tree)}\n"
         "import runpy\n"
         f"runpy.run_module({ENTRY_MODULES[entry]!r}, run_name=\"__main__\", alter_sys=True)\n"
     )
@@ -207,69 +222,210 @@ def h11_source() -> Path:
     if not f or Path(f).name != "__init__.py" or not Path(f).parent.is_dir():
         raise Refused("bad-root", f"h11 is not a package directory ({f!r}); nothing to vendor")
     _refuse_link(Path(f).parent, "h11")
-    try:
-        have = _release(str(h11.__version__))
-    except (AttributeError, ValueError):
-        raise Refused("bad-root", f"h11 has no readable version ({getattr(h11, '__version__', None)!r})")
-    if have < H11_MIN:
-        raise Refused("bad-root", f"h11 {h11.__version__} is older than {'.'.join(map(str, H11_MIN))}")
+    h11_floor(Path(f).parent)
     return Path(f).parent
 
 
-def _package_steps(t: dict[str, str], owner: str, tree: Path, source: Path) -> list[Step]:
-    """Stage ``source`` (a package directory) into ``tree``, check it, and swap it in (CONTRACT §23):
-    the copy is staged beside the live package; links are refused (by lstat) before any chown or chmod;
-    the live package is renamed aside, the staged one renamed into place, the old one removed."""
-    pkg, staged, old = tree / source.name, tree / f"{source.name}.new", tree / f"{source.name}.old"
-    return [
-        Step(f"clear {staged} and {old} (left by an interrupted run)", (t["rm"], "-rf", str(staged), str(old))),
-        Step(f"copy the {source.name} package to {staged} (symlinks copied as links, then refused)",
-             (t["cp"], "-R", "-P", str(source), str(staged))),
-        Step(f"drop compiled files copied from {source}",
-             (t["find"], str(staged), "-name", "__pycache__", "-prune", "-exec", t["rm"], "-rf", "{}", "+")),
-        Step(f"check {staged} holds no link (before any chown or chmod)", call=lambda: _no_links(staged)),
-        Step(f"own {staged} as root", (t["chown"], "-R", owner, str(staged))),
-        Step(f"make {staged} writable by root alone", (t["chmod"], "-R", "u=rwX,go=rX", str(staged))),
-        Step(f"check {staged} holds only root's plain files and directories",
-             call=lambda: _no_foreign_entries(staged)),
-        Step(f"rename the previous {pkg} aside to {old}", (t["mv"], str(pkg), str(old)),
-             skip_if=(t["test"], "!", "-e", str(pkg))),
-        Step(f"rename {staged} into place at {pkg}", (t["mv"], str(staged), str(pkg))),
-        Step(f"remove {old}", (t["rm"], "-rf", str(old))),
+def h11_floor(h11_dir: Path) -> str:
+    """h11's version read as TEXT from ``h11_dir/_version.py`` (row 33: root never imports a package to learn its
+    version), refused ``bad-root`` below :data:`H11_MIN`."""
+    from levain.slot.generation import read_version_text
+
+    try:
+        version = read_version_text(h11_dir / "_version.py")
+        have = _release(version)
+    except (Refused, ValueError):
+        raise Refused("bad-root", f"h11 at {h11_dir} has no readable version") from None
+    if have < H11_MIN:
+        raise Refused("bad-root", f"h11 {version} is older than {'.'.join(map(str, H11_MIN))}")
+    return version
+
+
+def _fsync_generation(gen: Path, tree: Path) -> tuple[bool, str]:
+    """§2.3 R3: every file of ``gen``, then every directory bottom-up, then ``tree``; macOS one ``F_FULLFSYNC``. So a
+    power loss after the flip can never leave ``current`` naming a generation whose data never reached the disk."""
+    import fcntl
+    import sys
+
+    def sync(p: str, flags: int) -> None:
+        fd = os.open(p, flags | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    try:
+        for dirpath, dirnames, filenames in os.walk(gen, topdown=False):
+            for name in filenames:
+                sync(os.path.join(dirpath, name), os.O_RDONLY)
+            sync(dirpath, os.O_RDONLY | os.O_DIRECTORY)
+        sync(str(tree), os.O_RDONLY | os.O_DIRECTORY)
+        if sys.platform == "darwin":
+            fd = os.open(str(tree), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            finally:
+                os.close(fd)
+    except OSError as e:
+        return False, f"could not make {gen} durable: {e.strerror or e}"
+    return True, ""
+
+
+def _staged_is(target: str, staged: Path) -> tuple[bool, str]:
+    """§2.3 R2: the id hashed over the root-owned STAGED copy must be the one planned (the package changed during
+    the copy otherwise: ``source-changed``)."""
+    from levain.slot.generation import generation_id
+
+    got = generation_id(staged / "levain", staged / "h11")
+    if got != target:
+        return False, f"source-changed: the staged copy hashes to {got}, the package planned was {target}"
+    return True, ""
+
+
+def _rename(src: Path, dst: Path) -> tuple[bool, str]:
+    os.rename(src, dst)
+    return True, ""
+
+
+def stage_steps(host: HostOS, source: Path, h11_dir: Path, target: str, *, current: str | None) -> list[Step]:
+    """§2.3 R2 + R3: stage ``source`` (a ``levain`` package dir) and ``h11_dir`` together into
+    ``<tree>/staging.partial``, check it (no link before any chown or chmod; root's plain files after; h11's floor read
+    as text; the id recomputed over the staged copy equals ``target``), then rename it to ``<tree>/<target>`` and make
+    it durable. Both packages live in ONE generation, so levain and h11 are never swapped separately. When
+    ``target`` is already ``current`` the partial copy is dropped instead (a no-op repair)."""
+    t = _tools(host)
+    tree = IMPORT_TREE[host]
+    owner = f"root:{ROOT_GROUP[host]}"
+    partial, gen = tree / STAGING, tree / target
+    steps = [
+        Step(f"clear {partial} (left by an interrupted run)", (t["rm"], "-rf", str(partial))),
+        Step(f"create {partial}", (t["mkdir"], "-m", "700", str(partial))),
+        Step(f"copy the levain package to {partial / 'levain'} (symlinks copied as links, then refused)",
+             (t["cp"], "-R", "-P", str(source), str(partial / "levain"))),
+        Step(f"copy the h11 package to {partial / 'h11'} (symlinks copied as links, then refused)",
+             (t["cp"], "-R", "-P", str(h11_dir), str(partial / "h11"))),
+        Step(f"drop compiled files copied into {partial}",
+             (t["find"], str(partial), "-name", "__pycache__", "-prune", "-exec", t["rm"], "-rf", "{}", "+")),
+        Step(f"check {partial} holds no link (before any chown or chmod)", call=lambda: _no_links(partial)),
+        Step(f"own {partial} as root", (t["chown"], "-R", owner, str(partial))),
+        Step(f"make {partial} writable by root alone", (t["chmod"], "-R", "u=rwX,go=rX", str(partial))),
+        Step(f"check {partial} holds only root's plain files and directories",
+             call=lambda: _no_foreign_entries(partial)),
+        Step(f"check the staged h11 is at least {'.'.join(map(str, H11_MIN))} (its version read as text)",
+             call=lambda: (True, h11_floor(partial / "h11"))),
+        Step(f"check the staged copy hashes to {target}", call=lambda: _staged_is(target, partial)),
+    ]
+    if current == target:
+        return steps + [Step(f"drop {partial}: {target} is already current", (t["rm"], "-rf", str(partial)))]
+    return steps + [
+        Step(f"clear {gen} (a copy an interrupted run left)", (t["rm"], "-rf", str(gen))),
+        Step(f"rename {partial} to {gen}", call=lambda: _rename(partial, gen)),
+        Step(f"make {gen} durable (every file, every directory, the tree)", call=lambda: _fsync_generation(gen, tree)),
     ]
 
 
-def tree_steps(host: HostOS, source: Path, *, h11_dir: Path | None = None) -> list[Step]:
-    """Copy the ``levain`` package at ``source`` and the h11 package (``h11_dir``, default the installing
-    Levain's own, :func:`h11_source`) into the import tree and write the entry scripts. ``source`` is the
-    package directory itself. Each package goes through the same staged copy and checks.
+def _flip(tree: Path, target: str) -> tuple[bool, str]:
+    """§2.3 R9: ``current.new`` -> ``target``, renamed over ``current`` (rename(2) replaces it atomically: there is
+    no instant at which ``current`` names a mixed pair or nothing), then the tree fsynced. Never ``mv``: BSD ``mv``
+    onto a link to a directory moves the source INTO it."""
+    new, cur = tree / f"{CURRENT}.new", tree / CURRENT
+    try:
+        st = os.lstat(new)
+    except FileNotFoundError:
+        st = None
+    if st is not None:
+        if not stat.S_ISLNK(st.st_mode):
+            return False, f"bad-root: {new} is not a link"
+        os.unlink(new)
+    try:
+        cst = os.lstat(cur)
+        if not stat.S_ISLNK(cst.st_mode):
+            return False, f"bad-root: {cur} is not a link"
+    except FileNotFoundError:
+        pass
+    os.symlink(target, new)
+    os.replace(new, cur)
+    fd = os.open(str(tree), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return True, ""
 
-    Every step is safe to re-run after a failure at any point (CONTRACT §23)."""
-    if source.name != "levain":
-        raise Refused("bad-root", f"{source} is not a levain package directory")
-    _refuse_link(source, "levain")
-    h11_dir = h11_dir if h11_dir is not None else h11_source()
-    if h11_dir.name != "h11":
-        raise Refused("bad-root", f"{h11_dir} is not an h11 package directory")
-    _refuse_link(h11_dir, "h11")
+
+def flip_step(host: HostOS, target: str) -> Step:
+    tree = IMPORT_TREE[host]
+    return Step(f"flip {current_path(host)} -> {target}", call=lambda: _flip(tree, target))
+
+
+def entry_steps(host: HostOS) -> list[Step]:
+    """The three entry scripts (§2.3 R10: written AFTER the flip, so none ever names a ``current`` not there yet)."""
+    return [Step(f"write the {entry} entry script {path}", write=(path, entry_text(host, entry), 0o755))
+            for entry, path in (("install-helper", install_helper_path(host)),
+                                ("runtime-helper", runtime_helper_path(host)),
+                                ("service-entry", service_entry_path(host)))]
+
+
+def _gc(tree: Path, keep: frozenset[str], rm: str) -> tuple[bool, str]:
+    import subprocess
+
+    gone = sorted(n for n in os.listdir(tree) if (n.startswith("gen-") and n not in keep) or n in ("levain", "h11"))
+    for n in gone:
+        r = subprocess.run([rm, "-rf", str(tree / n)], capture_output=True, text=True, cwd="/")
+        if r.returncode != 0:
+            return False, (r.stderr or r.stdout).strip()
+    return True, ", ".join(gone)
+
+
+def gc_step(host: HostOS, keep: Iterable[str]) -> Step:
+    """§2.3 R13: every ``gen-*`` but ``keep`` (``current`` and the one it replaced), and the legacy top-level
+    ``levain``/``h11`` a pre-generation install left."""
+    tree, keep = IMPORT_TREE[host], frozenset(keep)
+    return Step(f"remove old generations and the legacy tree from {tree} (keep {', '.join(sorted(keep))})",
+                call=lambda: _gc(tree, keep, _tools(host)["rm"]))
+
+
+def dir_steps(host: HostOS) -> list[Step]:
     t = _tools(host)
-    tree, helpers, vendor = IMPORT_TREE[host], HELPER_DIR[host], VENDOR_PREFIX[host]
     owner = f"root:{ROOT_GROUP[host]}"
     steps: list[Step] = []
-    for d in (tree, helpers, vendor):
+    for d in (IMPORT_TREE[host], HELPER_DIR[host], VENDOR_PREFIX[host]):
         steps += [
             Step(f"check every directory above {d} is root's alone (links resolved), and {d} is no link", call=lambda p=d: _root_owned_ancestors(p)),
             Step(f"create {d}", (t["mkdir"], "-p", "-m", "755", str(d))),
             Step(f"own {d} as root", (t["chown"], owner, str(d))),
             Step(f"set {d} to 0755", (t["chmod"], "0755", str(d))),
         ]
-    steps += _package_steps(t, owner, tree, source)
-    steps += _package_steps(t, owner, tree, h11_dir)
-    for entry, path in (("install-helper", install_helper_path(host)), ("runtime-helper", runtime_helper_path(host)),
-                        ("service-entry", service_entry_path(host))):
-        steps.append(Step(f"write the {entry} entry script {path}", write=(path, entry_text(host, entry), 0o755)))
     return steps
 
 
-__all__ = ["ENTRY_MODULES", "H11_MIN", "HELPER_MODULES", "PY_FLAGS", "ROOT_PYTHON", "VENDOR_PREFIX", "entry_text",
-           "h11_source", "helper_entry_text", "tree_steps"]
+def check_sources(source: Path, h11_dir: Path) -> None:
+    if source.name != "levain":
+        raise Refused("bad-root", f"{source} is not a levain package directory")
+    _refuse_link(source, "levain")
+    if h11_dir.name != "h11":
+        raise Refused("bad-root", f"{h11_dir} is not an h11 package directory")
+    _refuse_link(h11_dir, "h11")
+
+
+def tree_steps(host: HostOS, source: Path, *, h11_dir: Path | None = None, generation: str | None = None,
+               current: str | None = None) -> list[Step]:
+    """Setup (§2.5): stage the ``levain`` package at ``source`` and h11 (``h11_dir``, default the installing Levain's
+    own, :func:`h11_source`) as ONE generation ``gen-<id>`` in the import tree, flip ``current`` to it, write the entry
+    scripts. ``generation``: the id planned (default: computed over ``source`` and ``h11_dir`` now); ``current``: what
+    ``current`` names already (a re-run).
+
+    Every step is safe to re-run after a failure at any point (CONTRACT §23)."""
+    from levain.slot.generation import generation_id
+
+    h11_dir = h11_dir if h11_dir is not None else h11_source()
+    check_sources(source, h11_dir)
+    target = generation if generation is not None else generation_id(source, h11_dir)
+    return [*dir_steps(host), *stage_steps(host, source, h11_dir, target, current=current), flip_step(host, target),
+            *entry_steps(host)]
+
+
+__all__ = ["CURRENT", "ENTRY_MODULES", "H11_MIN", "HELPER_MODULES", "PY_FLAGS", "ROOT_PYTHON", "STAGING",
+           "VENDOR_PREFIX", "boot_path_code", "check_sources", "current_path", "dir_steps", "entry_steps",
+           "entry_text", "flip_step", "gc_step", "h11_floor", "h11_source", "helper_entry_text", "stage_steps",
+           "tree_steps"]

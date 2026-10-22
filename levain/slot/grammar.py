@@ -63,6 +63,7 @@ class InstallCommand:
     index: int | None = None
     max_inodes: int | None = None
     max_seconds: int | None = None
+    source: str | None = None             # repair --source PATH (row 33, head ruling Q1)
 
 
 def _uint(token: str, field: str, lo: int, hi: int) -> int:
@@ -191,6 +192,13 @@ def parse_install_argv(argv: Sequence[str]) -> InstallCommand:
         if not SESSION_RE.fullmatch(rest[0]):
             raise Refused("bad-token", f"session: {rest[0]!r}")
         return InstallCommand(verb, session=rest[0])
+    if verb == "repair" and rest:
+        # Row 33 (head ruling Q1, a §5.2 amendment): ``repair --source PATH``, the operator's installed levain
+        # package dir, checked as ``--root`` is. The helper checks ownership, the final component and links.
+        if rest[0] != "--source":
+            raise Refused("extra-argv", repr(rest[0]))
+        _exact(verb, rest, 2)
+        return InstallCommand(verb, source=_root_syntax(rest[1]))
     _exact(verb, rest, 0)   # repair, undo, replenish, set-ceiling, set-signers: stdin only
     return InstallCommand(verb)
 

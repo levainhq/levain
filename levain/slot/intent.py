@@ -15,6 +15,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
+import re
 import stat
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -24,11 +25,14 @@ from typing import Callable, Iterator, Mapping
 from levain.contracts import canon
 from levain.firing.hands import OPERATOR_RE, HostOS, Step, _abs
 from levain.slot import Refused, write_all
-from levain.slot.ids import RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, in_own_range, is_levain_account
+from levain.slot.generation import GEN_RE, TXN_RE, Record, managed_json, parse_managed
+from levain.slot.ids import RANGES, RETIRED_IDS_PATH, in_own_range, is_levain_account
 
-INTENT_FORMAT = "levain-intent/1"
+INTENT_FORMAT = "levain-intent/2"
+#: Still read (a journal an older generation wrote): no ``txn``, no ``generation``, no ``managed``.
+INTENT_FORMAT_V1 = "levain-intent/1"
 #: The verbs that journal; ``undo`` reads a journal but never writes one.
-INTENT_VERBS = ("setup", "replenish")
+INTENT_VERBS = ("setup", "replenish", "repair")
 
 STATE_DIR: Mapping[str, Path] = {h: p.parent for h, p in RETIRED_IDS_PATH.items()}
 INSTALL_LOCK: Mapping[str, Path] = {h: d / "install.lock" for h, d in STATE_DIR.items()}
@@ -90,13 +94,19 @@ def install_lock(host: HostOS | None = None, *, path: Path | None = None,
 
 @dataclass(frozen=True)
 class Intent:
-    """What a ``setup`` or ``replenish`` is about to create: its accounts (name -> uid == gid) and its
-    shared groups (name -> gid)."""
+    """What a ``setup``, ``replenish`` or ``repair`` is about to create: its accounts (name -> uid == gid) and its
+    shared groups (name -> gid). ``levain-intent/2`` (row 33) adds the run's ``txn`` (a fresh 128-bit id; repair's
+    completion proof is ``install-shape``'s ``completed_txn == txn``), the ``generation`` a repair is moving to (None
+    until its staged copy is hashed, §2.3 R3) and the write-ahead ``managed`` (R4b). A ``/1`` journal reads with
+    ``txn`` None."""
 
     verb: str
     operator: str
     accounts: Mapping[str, int] = field(default_factory=dict)
     groups: Mapping[str, int] = field(default_factory=dict)
+    txn: str | None = None
+    generation: str | None = None
+    managed: tuple[Record, ...] = ()
 
     @property
     def names(self) -> dict[str, int]:
@@ -104,12 +114,19 @@ class Intent:
 
 
 def intent_record(intent: Intent) -> dict[str, object]:
-    return {"format": INTENT_FORMAT, "verb": intent.verb, "operator": intent.operator,
-            "accounts": dict(intent.accounts), "groups": dict(intent.groups)}
+    if intent.txn is None or not TXN_RE.fullmatch(intent.txn):
+        raise Refused("intent-malformed", "a levain-intent/2 journal carries a txn")
+    return {"format": INTENT_FORMAT, "verb": intent.verb, "operator": intent.operator, "txn": intent.txn,
+            "generation": intent.generation, "accounts": dict(intent.accounts), "groups": dict(intent.groups),
+            "managed": managed_json(intent.managed)}
 
 
 def intent_text(intent: Intent) -> str:
     return canon.canonical(intent_record(intent))
+
+
+#: §1.1 rule f: a shared group's name by the bound (``group/1``'s), never by membership of ``SHARED_GROUPS``.
+GROUP_RE = re.compile(r"levain-[a-z0-9-]{1,24}")
 
 
 def _is_id(x: object) -> bool:
@@ -118,16 +135,28 @@ def _is_id(x: object) -> bool:
 
 def parse_intent(data: bytes, host: HostOS) -> Intent:
     """Strict: exactly the record's keys, a journaling verb, an operator name, Levain account names at
-    ids in their §1.1 range, shared-group names at ids in the shared range, no id twice."""
+    ids in their §1.1 range, shared-group names at ids in the shared range, no id twice. A group is judged by
+    the BOUND (a ``levain-`` name at a gid in the shared range), never by this code's own ``SHARED_GROUPS``, so a
+    package can read a journal naming a group it does not know (DESIGN 1022-8/upgrade §1.1 rule f)."""
     try:
         obj = canon.parse(data)
     except canon.ContractError as e:
         raise Refused("intent-malformed", str(e)) from None
     if host not in RANGES:
         raise Refused("unsupported-host", repr(host))
-    bad = Refused("intent-malformed", f"not a {INTENT_FORMAT} record")
-    if (not isinstance(obj, dict) or set(obj) != {"format", "verb", "operator", "accounts", "groups"}
-            or obj["format"] != INTENT_FORMAT or obj["verb"] not in INTENT_VERBS
+    bad = Refused("intent-malformed", f"not a {INTENT_FORMAT} or {INTENT_FORMAT_V1} record")
+    v1 = {"format", "verb", "operator", "accounts", "groups"}
+    v2 = v1 | {"txn", "generation", "managed"}
+    if not isinstance(obj, dict) or (set(obj), obj.get("format")) not in ((v1, INTENT_FORMAT_V1), (v2, INTENT_FORMAT)):
+        raise bad
+    if obj["format"] == INTENT_FORMAT_V1 and obj["verb"] == "repair":
+        raise bad
+    if obj["format"] == INTENT_FORMAT and (
+            not isinstance(obj["txn"], str) or not TXN_RE.fullmatch(obj["txn"])
+            or not (obj["generation"] is None or (isinstance(obj["generation"], str) and GEN_RE.fullmatch(obj["generation"])))
+            or (obj["verb"] != "repair" and (obj["generation"] is not None or obj["managed"]))):
+        raise bad
+    if (obj["verb"] not in INTENT_VERBS
             or not isinstance(obj["operator"], str) or not OPERATOR_RE.fullmatch(obj["operator"])
             or not isinstance(obj["accounts"], dict) or not isinstance(obj["groups"], dict)):
         raise bad
@@ -136,14 +165,16 @@ def parse_intent(data: bytes, host: HostOS) -> Intent:
         if not is_levain_account(name) or not in_own_range(host, name, uid):
             raise bad
     for name, gid in groups.items():
-        if name not in SHARED_GROUPS or not _is_id(gid) or gid not in RANGES[host].shared:
+        if not GROUP_RE.fullmatch(name) or not _is_id(gid) or gid not in RANGES[host].shared:
             raise bad
     if obj["verb"] == "replenish" and groups:
         raise bad
     ids = [*accounts.values(), *groups.values()]
     if len(set(ids)) != len(ids):
         raise bad
-    return Intent(obj["verb"], obj["operator"], dict(accounts), dict(groups))
+    managed = parse_managed(obj["managed"], what="intent") if obj["format"] == INTENT_FORMAT else ()
+    return Intent(obj["verb"], obj["operator"], dict(accounts), dict(groups), obj.get("txn"), obj.get("generation"),
+                  managed)
 
 
 def read_intent(host: HostOS, *, path: Path | None = None) -> Intent | None:
@@ -203,7 +234,7 @@ def write_intent_atomically(path: Path, text: str) -> tuple[bool, str]:
 def intent_write_step(host: HostOS, intent: Intent, *, path: Path | None = None) -> Step:
     target = Path(path or INTENT_PATH[host])
     text = intent_text(intent)
-    return Step(f"journal what this {intent.verb} will create in {target} (first)",
+    return Step(f"journal what this {intent.verb} will create in {target} (txn {intent.txn})",
                 call=lambda: write_intent_atomically(target, text))
 
 
@@ -213,6 +244,6 @@ def intent_remove_step(host: HostOS, *, path: Path | None = None) -> Step:
     return Step(f"remove the intent journal {target}", (rm, "-f", str(target)))
 
 
-__all__ = ["INSTALL_LOCK", "INTENT_FORMAT", "INTENT_PATH", "INTENT_VERBS", "Intent", "STATE_DIR",
+__all__ = ["GROUP_RE", "INSTALL_LOCK", "INTENT_FORMAT", "INTENT_FORMAT_V1", "INTENT_PATH", "INTENT_VERBS", "Intent", "STATE_DIR",
            "install_lock", "intent_record", "intent_remove_step", "intent_text", "intent_write_step",
            "parse_intent", "read_intent", "write_intent_atomically"]
