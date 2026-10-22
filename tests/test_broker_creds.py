@@ -355,3 +355,27 @@ def test_keys_main_builds_the_real_credwriter_as_cred_lifecycle(monkeypatch, tmp
     assert w.cred_dir == os.path.join(str(tmp_path), "keys", "cred")
     assert w._closing is True                 # the latch called begin_closing on the real writer
     assert w._executor._shutdown is True      # main() shut its executor at exit
+
+
+def test_keys_reader_does_not_follow_a_linked_cred_dir(tmp_path):
+    # HEAD_1022-12 H7: design 1.8's "every path below a dirfd of L/keys/cred opened O_DIRECTORY|O_NOFOLLOW" holds for
+    # the reader's own dirfd too: a `cred` that is a link is refused, never followed.
+    from levain.broker import keys as K
+
+    real = tmp_path / "elsewhere"
+    real.mkdir(mode=0o700)
+    (real / f"{NAME}.json").write_bytes(C.render(_fields(), NAME)[0])
+    (tmp_path / "keys").mkdir(mode=0o700)
+    (tmp_path / "keys" / "cred").symlink_to(real)
+    k = K.Keys(unmetered=True, lib_root=str(tmp_path))
+    with pytest.raises(Refused) as e:
+        k._cred_store()
+    assert e.value.name == "credential-unavailable"
+    assert k.creds is None
+    os.unlink(tmp_path / "keys" / "cred")
+    os.rename(real, tmp_path / "keys" / "cred")
+    store = k._cred_store()
+    try:
+        assert store.observe(NAME).secret == "sk-test-one"
+    finally:
+        os.close(store.dir_fd)

@@ -1528,7 +1528,7 @@ class Keys:
             if self.lib_root is None:
                 raise norm.Refused("credential-unavailable", "no lib root")
             try:
-                fd = os.open(os.path.join(self.lib_root, "keys", "cred"), os.O_RDONLY | os.O_DIRECTORY)
+                fd = os.open(os.path.join(self.lib_root, "keys", "cred"), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             except OSError as e:
                 _note(logging.WARNING, "levain gw-keys: the credential directory is unreadable (%s)", type(e).__name__)
                 raise norm.Refused("credential-unavailable", "no credential directory") from None
