@@ -21,6 +21,9 @@ CARDS = "[...document.querySelectorAll('#ck-needs .needs-card')]"
 # the one consent card that carries its Open row, picked the same way for the wait, the read and the click
 CARD = "[...document.querySelectorAll('#ck-needs .needs-consent')].find(c => c.querySelector('.needs-open'))"
 READY = "document.querySelector('#ck-needs .needs-card .consent-display') && document.querySelector('#ck-needs .needs-question .question-option')"
+# a consent chip is drawn as its tool and gains its first words when the request body loads (async): wait for every one
+CHIPS_FILLED = ("[...document.querySelectorAll('#ck-needs .needs-chip-btn[data-needs-id^=\"consent:\"]')]"
+                ".every(b => b.textContent.includes(' '))")
 
 
 def _waiting(tmp_path: Path, monkeypatch) -> Path:
@@ -55,7 +58,7 @@ def test_the_strip_lists_what_waits_loudest_first_and_a_bare_install_has_no_stri
     _waiting(tmp2, monkeypatch)
     _root, src, _ids = _install(tmp2)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        got = _drive(tmp2, f"{url}/#write_token=T", [DESKTOP, {"until": READY},
+        got = _drive(tmp2, f"{url}/#write_token=T", [DESKTOP, {"until": READY}, {"until": CHIPS_FILLED},
             {"eval": f"JSON.stringify({{kinds: {CARDS}.map(c => c.dataset.needsCard), tools: {CARDS}.map(c => (c.querySelector('.consent-tool')||{{}}).textContent),"
                      " head: document.querySelector('#ck-needs').innerText.slice(0, 40),"
                      " order: (document.querySelector('#ck-needs .needs-order') || {textContent: ''}).textContent,"
