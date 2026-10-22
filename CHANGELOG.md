@@ -6,7 +6,63 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.15] — 2026-10-22
+
+### Added
+- **The cockpit's header is now a graph of your agents.** The header lens switches between **Agents graph**, **Event
+  graph** and **Work**; the Agents graph is where a fresh browser opens, and your choice is kept per browser. The graph
+  draws one hub, your agents grouped around it with a face and a state ring each, and moving streams for the ones that
+  are working (none for an idle or unread one, and none if your system asks for reduced motion). A metrics strip counts
+  sessions, events, running, waiting on you and tokens today (a figure with no data shows a dash, and its tooltip says
+  why). Clicking a node opens that agent's page with its facts and the session transcript, newest entry first.
+  - **Replay.** A strip under the graph scrubs back up to 14 hours: it redraws what was known at that minute, and what
+    was not kept for the past shows as unknown, never as empty. Live updates pause while you look; Esc or Live returns.
+  - **The Work lens** shows the live work in three columns (records, tasks, outcomes), loudest first: waiting, failed,
+    stuck, running, open, done. **Lost if closed** is its own panel.
+- **The cockpit page is rebuilt around four tabs.** Morning, Board, Build and Memory sit under a header with a
+  light/dark switch that follows your system's setting. The Memory tab shows the neocortex as one card; Build
+  has a large Sessions card and Results beside edits and loops; the Needs-you strip leads with open questions and
+  clocked requests. Panels can be collapsed and reordered within a zone (saved in the browser; Reset layout beside the
+  theme switch). A fresh install's empty panels say what fills them. The page also now reads your repos' recent commits,
+  with a hostile `.git/config` neutralised, into the activity band.
+- **Standing grants can be read and revoked from the cockpit and the phone (the routes; the buttons are not on the
+  pages yet).** `GET /cockpit/consent/grants.json` (behind the write-token gate) lists every grant the consent hooks
+  name, live, expired and inert, with what each answered and the exact line that revokes it. The phone page's
+  `consent.json` lists the same grants, and `POST /grant/<id>/revoke-challenge` then `/grant/<id>/revoke` revoke one
+  with a passkey. A grant that changed since the phone listed it is refused (`grant_changed`) before anything is signed.
+- **`levain team draft`: the coordinator drafts ledger entries, you sign them.** `add`, `list`, `show`, `withdraw`
+  and `promote`; only `promote` signs, under your key, after showing the whole draft. Two promotes of one draft sign one
+  entry, and a ruling is signed only with the words you give (`--words` / `--words-file`), never the coordinator's.
+- **`levain coord agent codex`: a Codex coordinator.** Drops can start a thread on your own Codex app-server daemon,
+  named `levain-coordinator-<id>`, in a workspace Levain sets up (default `<levain home>/coordinator-codex`); the launch
+  prints `codex resume --remote unix://<socket> <thread id>`. Levain never starts or stops the daemon: with none
+  running, the launch waits and names `codex app-server daemon start`. `levain coord watch` ends a launch whose thread
+  the daemon no longer has. Codex's consent hook must already be live (`levain init --adapter codex`), and you trust
+  the workspace in Codex once.
+- **`levain doctor` has a host-sleep row.** While a coordinator's work thread is working, Levain holds an idle-sleep
+  assertion (`caffeinate -i`, or `systemd-inhibit --what=idle`) and the row says whether it is held. On macOS it says
+  the hold does not stop the lid closing from sleeping the Mac. No power setting is written.
+- **Dispatch files a job and its read set together.** `levain dispatch file` (and the MCP door) builds the contract's
+  read set and exports its bundle before anything reaches the store, then publishes the job and the bundle together. A
+  filing process that opened the store before a newer Levain migrated it is refused (`store-format`) instead of
+  filing a job with no handoff. Nothing launches from the bundle yet. The job store moves to format 5 (see the upgrade
+  note under Changed).
+- **The consent hooks' version pin takes Claude Code 2.1.306 and 2.1.308.** `levain consent canary --agent claude_code`
+  passed on 2.1.306 and on 2.1.308 (each time the hook fired, the agent reported the denial, the sentinel was not
+  written). The pin is now Claude Code 2.1.300, 2.1.301, 2.1.306 and 2.1.308, and Codex 0.162.1.
+- **Each consent request records the model the agent named.** Codex's hook payload names it; Claude Code's does not
+  (2.1.306), so its requests read `unknown`. It is kept beside the request, never in what you sign. An older store
+  gains it on its next open.
+- **CI runs the cockpit's browser tests.** They had been skipped in CI, because it had no Chrome. A browser job now
+  installs a pinned Chrome and fails on any skip.
+
 ### Changed
+- **Upgrade note: the dispatch job store moves to format 5 the first time this version opens it, and Levain
+  0.11.14 and earlier then refuse it. Do not downgrade after upgrading.** Your jobs are kept.
+- **`levain team record`, `retire` and `draft` accept Windows line ends (CRLF) in prose fields.** They are read as
+  ordinary line breaks. A lone carriage return is still refused.
+- **The cockpit's dark theme lifts its panels and rules, and the Board's glance is separate cards again.** Light is
+  unchanged.
 - **The coordinator `levain coord agent` sets up runs `levain coord`, `levain drops` and `levain thread` without
   asking, and nothing else.** Those commands grant no authority (a signed envelope still does), and every other
   command asks you as it does in any install. Claude Code applies this only once you have trusted the directory. A
@@ -17,7 +73,54 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
     coordinator starting in the background no longer waits on Claude Code's "new MCP servers found" dialog, which
     nobody can answer there. A server you add yourself still asks.
 
+### Fixed
+- **The phone page's top bar holds on a narrow phone.** On a narrow phone, or a wider font, the theme switch could
+  wrap onto a row of its own. The bar now stays one row from 320 to 430 px wide, and a long white-label name is cut
+  with an ellipsis, its full text in the tooltip.
+- **The cockpit's phone-width tiles no longer clip.** The Ops tile's reading wraps onto the line under its name, and four
+  tiles never leave a lone tile on a half-screen laptop.
+- **The macOS persistence scan no longer refuses on a very deep tree.** The scan of the agent roots held absolute
+  paths, so one entry deeper than the path limit refused the whole confinement floor. It now walks by directory
+  descriptor. A re-read it cannot inspect refuses rather than reading as absent.
+
+### Security
+- **A team-ledger line could carry text a reader cannot see into every teammate's agent.** Levain now refuses hidden
+  characters (TAG characters, bidi overrides, zero-width text) in a ruling's words, summary, reason, re-check and paths
+  when you record or draft one. A line it reads without that check (one recorded before this release, or one a
+  teammate wrote with another client) is now shown with each such character written as `⟨U+XXXX⟩` in the edit hook, session start, the canon and the
+  team view.
+- **A passkey may now sign one authority link: revoking a consent grant.** A revoke only takes authority away, so a
+  stolen passkey can cost you prompts, never widen what an agent may do. Every other link (an enrolment, a grant, a
+  policy change, a revoke of an egress grant) is refused for a passkey, and a passkey made on `localhost` signs no
+  authority link: a phone page on localhost lists grants and says to revoke from the laptop.
+- **The coordinator keeps to its door.** Inside the coordinator's workspace every `levain` command other than the
+  coordinator's own verbs, `team draft add --by coordinator` and the team and draft read verbs is refused ("run it from your own
+  terminal, outside it"). The workspace is read from a record Levain keeps outside every workspace
+  (`<levain home>/consent/coordinator_workspaces.json`), so a coordinator that deletes or damages its own marker is still
+  doored. This fences an honest coordinator; it is not a sandbox (see Known edges). `levain coord agent claude --cwd
+  DIR` refuses a directory that is your own Levain install.
+
+### Groundwork for isolation (nothing here is reachable from a `levain` command yet)
+- **The isolation gateway and its session store are being built; the install step that would run them is not built
+  yet.** No command starts any of it, and it needs the extra `levain[isolation]` (h11 >= 0.16.0). What has landed: the egress
+  proxy (`CONNECT <host>:443` to an allow-listed host only, address validated once and connected to directly, TLS
+  `ClientHello` must name the same host); the brokered front and the admission half of its keys service (who may
+  connect); a reaper service that sweeps dead sessions and revokes the sessions
+  whose holder is gone; render refusing to start a front a revoke has already ended; END (a session's close) walking a
+  tree with a bounded number of descriptors and refusing one deeper than 1024 levels by name (`manifest-depth-cap`);
+  session adopt's walker, and the discard, restore and purge verbs.
+  - A session's base (its `HEAD` commit, branch and bundle hash) is recorded at render; a session rendered before this
+    has none, and adopt will refuse it (`base-unrecorded`).
+
 ### Known edges
+- A Claude Code coordinator runs with no OS sandbox, so its own shell can rewrite the coordinator record; the door
+  fences an honest coordinator there, and the lease token still fences every write.
+- A Codex coordinator runs under your own Codex approval and sandbox settings, so its first `levain coord claim` asks for
+  your approval and waits until you open the thread. OpenAI marks Codex's app-server and its WebSocket transport
+  experimental and not supported for production workloads; the Codex coordinator rests on it.
+- A pre-rule team-ledger draft with CRLF in its summary still refuses at promote.
+- `levain team` re-genesis lists the old ledger's in-force rulings without marking hidden characters (your terminal
+  only; nothing reaches an agent).
 - A coordinator started by a different Levain than the one that set up `~/.levain/coordinator` asks before each of
   its commands; run `levain update --path ~/.levain/coordinator` from the Levain that starts it.
 
