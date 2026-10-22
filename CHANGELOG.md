@@ -6,6 +6,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Groundwork for isolation (nothing here is reachable from a `levain` command yet)
+- **The keys service gains its request path.** A brokered request is admitted, checked against the route's
+  policy and the session's budget, and forwarded; a refused one is answered by name (`keys-unavailable`,
+  `upstream-error`, `upstream-timeout`) instead of a closed connection, and a session's revoked token cannot come
+  back from a resolve that was in flight when it was dropped. A route map with any entry that fails to parse refuses
+  every route.
+- **Session adopt's importer takes in a session's objects** and checks them with `git fsck` before anything else
+  happens.
+
 ## [0.11.15] — 2026-10-22
 
 ### Added
