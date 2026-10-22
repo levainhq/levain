@@ -4,12 +4,14 @@ resolver and the upstream's address are fixtures (never the internet)."""
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import socket
 import ssl
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -351,9 +353,9 @@ _EX_POLICY = {"format": "levain-front-session/1", "kind": "interactive", "sessio
      "max_call_microdollars": 1}]}
 
 
-async def _answering_keys(path: str, seen: list):
-    """keys' front.sock for one exchange: records `Q`, answers `A`, `R 200`, one `b`, `e` at once, then reads
-    whatever the front still sends until its `E` / `X` / EOF."""
+async def _answering_keys(path: str, seen: list, answer: Optional[list] = None):
+    """keys' front.sock for one exchange: records `Q`, answers `answer` (default `A`, `R 200`, one `b`, `e`) at once,
+    then reads whatever the front still sends until its `E` / `X` / EOF."""
     from levain.broker import gwwire
 
     async def frame(r):
@@ -366,8 +368,10 @@ async def _answering_keys(path: str, seen: list):
     async def serve(r, w):
         first = await frame(r)
         seen.append(json.loads(first[1]))
-        for f in (gwwire.encode(b"A", {}), gwwire.encode(b"R", {"v": 1, "status": 200, "headers": []}),
-                  gwwire.encode(b"b", b"early-ok"), gwwire.encode(b"e")):
+        frames = answer if answer is not None else [
+            gwwire.encode(b"A", {}), gwwire.encode(b"R", {"v": 1, "status": 200, "headers": []}),
+            gwwire.encode(b"b", b"early-ok"), gwwire.encode(b"e")]
+        for f in frames:
             w.write(f)
         await w.drain()
         while (fr := await frame(r)) is not None and fr[0] not in (b"E", b"X"):
@@ -377,14 +381,15 @@ async def _answering_keys(path: str, seen: list):
     return await asyncio.start_unix_server(serve, path)
 
 
-async def _exchange(slot_pair, head: bytes, body: bytes) -> tuple[dict, bytes, list]:
+async def _exchange(slot_pair, head: bytes, body: bytes, answer: Optional[list] = None,
+                    policy: Optional[dict] = None) -> tuple[dict, bytes, list]:
     """One brokered exchange, the front's side driven directly; the slot writes its whole body BEFORE it reads."""
     from levain.broker.front import BrokeredExchange, parse_head_conn
 
     seen: list = []
     with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
-        keys = await _answering_keys(os.path.join(tmp, "k.sock"), seen)
-        front = Front(load_policy(json.dumps(_EX_POLICY).encode()), log_path=os.path.join(tmp, "f.log"),
+        keys = await _answering_keys(os.path.join(tmp, "k.sock"), seen, answer)
+        front = Front(load_policy(json.dumps(policy or _EX_POLICY).encode()), log_path=os.path.join(tmp, "f.log"),
                       keys_path=os.path.join(tmp, "k.sock"))
         fr, fw, sr, sw = await slot_pair()
 
@@ -435,6 +440,26 @@ def test_early_response_is_not_reset_by_the_unread_body():
     rec, got, _ = asyncio.run(_exchange(_tcp_slot_pair, head, body))
     assert got.startswith(b"HTTP/1.1 200 OK\r\n") and b"early-ok" in got, got[:200]
     assert rec["end"] == "ok" and rec["discarded"] > 0, rec
+
+
+@pytest.mark.parametrize("method,status", [("HEAD", 200), ("POST", 204), ("POST", 304)])
+def test_a_no_body_response_cut_before_its_end_is_not_success(method, status):
+    """Reproduced (3b4fix, codex r1 HIGH 4): for HEAD, 204 and 304 the head IS the whole response, and the front
+    wrote it at `R`; a keys connection that ended before `e` (a cancel, a preemption mid-drain) still read as a
+    complete answer to the slot. The front now holds a no-body `R` until `e`, and a keys EOF before it is
+    `keys-unavailable`."""
+    from levain.broker import gwwire
+    head = (b"%s /r/vendor/v1/messages HTTP/1.1\r\nHost: gw\r\nAuthorization: Bearer %s\r\n"
+            b"Content-Length: 0\r\n\r\n" % (method.encode(), _TOKEN.encode()))
+    cut = [gwwire.encode(b"A", {}), gwwire.encode(b"R", {"v": 1, "status": status, "headers": []})]
+    pol = copy.deepcopy(_EX_POLICY)
+    pol["routes"][0]["requests"]["templates"].append({"method": "HEAD", "path": "/v1/messages"})
+    rec, got, _ = asyncio.run(_exchange(_unix_slot_pair, head, b"", cut, pol))
+    assert got.startswith(b"HTTP/1.1 503 "), got[:200]
+    assert rec["refused"] == "keys-unavailable", rec
+    rec, got, _ = asyncio.run(_exchange(_unix_slot_pair, head, b"", cut + [gwwire.encode(b"e")], pol))
+    assert got.startswith(b"HTTP/1.1 %d " % status) and b"transfer-encoding" not in got, got[:200]
+    assert rec["end"] == "ok", rec
 
 
 def test_connection_keep_alive_is_dropped_not_refused():

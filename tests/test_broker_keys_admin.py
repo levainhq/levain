@@ -22,6 +22,23 @@ from levain.slot import control as C
 pytestmark = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="unix sockets")
 
 
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    """keys resolves a route's host before it connects: no test here reaches a real resolver or a real address. The
+    resolver answers one global address; the plain-TCP seam refuses (a test that needs a connection fakes the
+    handshake above it)."""
+    from levain.broker import upstream as U
+
+    async def resolve(host: str, port: int) -> list:
+        return ["93.184.216.34"]
+
+    async def connect(addr: str, port: int):
+        raise ConnectionRefusedError("no network in unit tests")
+
+    monkeypatch.setattr(U, "_resolve", resolve)
+    monkeypatch.setattr(U, "_connect", connect)
+
+
 def _hold(monkeypatch, holds: dict, entered: dict, cancels: list) -> None:
     """FRONT-REGISTER for a session in `holds` waits for that event first; with `swallow`, a cancel delivered while
     it waits is recorded and ignored, so the task outlives preemption's cancel and its bounded await."""
@@ -376,10 +393,17 @@ class _FakeControl:
 
     def __init__(self, answers: dict, held: set) -> None:
         self.answers, self.held = answers, held
-        self.release = asyncio.Event()
+        self._release = None
         self.seen: list = []
         self.inflight = 0
         self.peak = 0
+
+    @property
+    def release(self) -> asyncio.Event:
+        # built on first use, inside the running loop: on 3.9 an Event binds get_event_loop() at construction
+        if self._release is None:
+            self._release = asyncio.Event()
+        return self._release
 
     async def handle(self, reader, writer) -> None:
         try:
@@ -707,14 +731,14 @@ def test_revoke_at_every_suspension(monkeypatch, transition, delivery, cached):
         st["transports"] += [raw.transport, plain.transport]
         return object(), raw, plain
 
-    async def read_response(up):
+    async def read_response(up, *rest):
         await asyncio.sleep(0)   # the response wait
         raise NotImplementedError
 
     monkeypatch.setattr(U.Upstream, "write", counting_write)
     monkeypatch.setattr(K.Keys, "_detach", spy_detach)
     monkeypatch.setattr(U, "_handshake", handshake)
-    monkeypatch.setattr(U, "_read_response", read_response)
+    monkeypatch.setattr(U, "read_head", read_response)   # the exchange's response wait
 
     async def one(pause_at: int) -> dict:
         st.clear()
@@ -890,7 +914,7 @@ def test_upstream_failure_answers_f_and_releases_the_budget(monkeypatch, fault):
     async def handshake(addr, port, host):
         if fault in raises:
             raise raises[fault]
-        return object(), _Failing(st), _Plain()
+        return asyncio.StreamReader(), _Failing(st), _Plain()   # the head is read while the body goes: none comes
 
     if fault != "unbuilt":
         monkeypatch.setattr(U, "_handshake", handshake)
@@ -909,8 +933,9 @@ def test_upstream_failure_answers_f_and_releases_the_budget(monkeypatch, fault):
     finally:
         shutil.rmtree(d, ignore_errors=True)
     name = "upstream-timeout" if fault == "timeout" else "upstream-error"
-    want = (gwwire.encode(b"A") if fault == "body-drain" else b"") + gwwire.encode(b"F", {"refused": name})
-    assert got == (b"" if fault == "head-stale" else want)
+    # `A` answers the accepted `Q` before the upstream opens (design 1.3), so every failure is `A` then `F`
+    want = gwwire.encode(b"A") + gwwire.encode(b"F", {"refused": name})
+    assert got == (gwwire.encode(b"A") if fault == "head-stale" else want)
     assert st["raw"] == [] or fault not in ("head-write", "head-stale")   # the gate refused: nothing written
     assert ledger.held == 0 and len(ledger.sent) == 1
     assert ledger.sent == [fault in ("head-drain", "body-drain")]   # `sent` once the head was handed upstream
@@ -958,7 +983,7 @@ def test_preemption_fences_old_exchanges_before_its_bounded_await(monkeypatch):
     st = {"after": False, "raw": []}
 
     async def handshake(addr, port, host):
-        return object(), _RawTLS(st), _Plain()
+        return asyncio.StreamReader(), _RawTLS(st), _Plain()   # the head is read while the body goes: none comes
 
     async def run() -> dict:
         cred_fd = os.open(os.path.join(d, "keys", "cred"), os.O_RDONLY | os.O_DIRECTORY)

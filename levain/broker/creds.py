@@ -23,6 +23,7 @@ import stat
 from typing import Dict, List, Optional, Protocol, Set, Tuple
 
 from levain.broker.norm import Refused
+from levain.broker.redact import unsafe_with_marker
 from levain.broker.upstream import _note
 
 FORMAT = "levain-keys-credential/1"
@@ -174,6 +175,10 @@ def _parse(raw: bytes, expect_name: str) -> Credential:
             raise Unparseable("refresh.token_url host")
     if not all(0x20 <= ord(c) < 0x7f for c in secret):   # printable ASCII: the value goes into a header
         raise Unparseable("secret charset")
+    # the scanner's secret set (design 1.7): a member the marker could hold or rebuild would survive the redaction
+    for v in [secret] + ([d["refresh"]["refresh_token"]] if kind == "oauth2-refresh" else []):
+        if unsafe_with_marker(v.encode("utf-8")):
+            raise Unparseable("secret marker")
     return Credential(d["name"], d["rev"], frozenset(hosts), inj["header"], inj["scheme"], kind, secret)
 
 

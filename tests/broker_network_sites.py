@@ -31,4 +31,10 @@ NETWORK_SITES = (
     ("keys.py", "Keys.start", "start_unix_server", "asyncio.start_unix_server", 1),
     # keys' TOKEN-RESOLVE client: one connection to CONTROL's socket per resolve.
     ("keys.py", "Keys._token_resolve", "open_unix_connection", "asyncio.open_unix_connection", 1),
+    # keys' upstream client: plain TCP to the validated address (the one connect seam), and TLS on that connection.
+    ("upstream.py", "_connect", "open_connection", "asyncio.open_connection", 1),
+    ("upstream.py", "_handshake", "start_tls", "loop.start_tls", 1),
+    # NOT a network call: h11's serializer (`Connection.send` returns bytes and does no I/O) matches the API name
+    # `send`; keys writes what it returns through `Upstream.write`. Every serialization goes through this one helper.
+    ("upstream.py", "h11_bytes", "send", "conn.send", 1),
 )

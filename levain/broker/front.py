@@ -856,6 +856,7 @@ class BrokeredExchange:
     async def _relay_events(self, kw: asyncio.StreamWriter, events: asyncio.Queue, expect: bool,
                             writer: asyncio.Future) -> None:
         started = False
+        held: Optional[dict] = None   # a no-body response's `R`, until its `e`
         while True:
             kind, payload = await self._next(events)
             if kind == "body":
@@ -894,6 +895,11 @@ class BrokeredExchange:
                 await self.refuse(Refused(payload["refused"], "keys"), discard=True)  # type: ignore[index]
                 return
             if kind == b"R":
+                if self.nobody or payload["status"] in (204, 304):  # type: ignore[index]
+                    # the head is the whole response: written at keys' `e`, so a keys connection that ends before it
+                    # is answered keys-unavailable, never a complete response the exchange did not finish
+                    held = payload
+                    continue
                 started = self.answered = True
                 self._write_response_head(payload)  # type: ignore[arg-type]
                 await self.swriter.drain()
@@ -903,6 +909,10 @@ class BrokeredExchange:
                 await self.swriter.drain()
                 continue
             if kind == b"e":
+                if held is not None:
+                    started = self.answered = True
+                    self._write_response_head(held)
+                    await self.swriter.drain()
                 if not self.nobody_response:
                     self.swriter.write(b"0\r\n\r\n")
                     await self.swriter.drain()
