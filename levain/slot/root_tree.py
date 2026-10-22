@@ -144,30 +144,39 @@ def _tools(host: HostOS) -> dict[str, str]:
     return {k: _abs(k) for k in ("mkdir", "rm", "cp", "chown", "chmod", "find", "mv", "test")}
 
 
-def tree_steps(host: HostOS, source: Path) -> list[Step]:
-    """Copy the ``levain`` package at ``source`` into the import tree and write the entry scripts.
-    ``source`` is the package directory itself.
+#: The one third-party package the root-run gateway front imports (3b-8a0, CONTRACT c7.4's note): vendored
+#: beside ``levain`` so the isolated root interpreter (``-IS``, no site-packages) finds it in the import tree.
+H11_MIN = (0, 16, 0)
 
-    The copy is staged beside the live package; links are refused (by lstat) before any chown or
-    chmod; the live package is renamed aside, the staged one renamed into place, the old one removed.
-    Every step is safe to re-run after a failure at any point (CONTRACT §23)."""
-    if source.name != "levain":
-        raise Refused("bad-root", f"{source} is not a levain package directory")
-    t = _tools(host)
-    tree, helpers, vendor = IMPORT_TREE[host], HELPER_DIR[host], VENDOR_PREFIX[host]
-    owner = f"root:{ROOT_GROUP[host]}"
-    pkg, staged, old = tree / "levain", tree / "levain.new", tree / "levain.old"
-    steps: list[Step] = []
-    for d in (tree, helpers, vendor):
-        steps += [
-            Step(f"check every directory above {d} is root's alone (links resolved), and {d} is no link", call=lambda p=d: _root_owned_ancestors(p)),
-            Step(f"create {d}", (t["mkdir"], "-p", "-m", "755", str(d))),
-            Step(f"own {d} as root", (t["chown"], owner, str(d))),
-            Step(f"set {d} to 0755", (t["chmod"], "0755", str(d))),
-        ]
-    steps += [
+
+def h11_source() -> Path:
+    """The package directory of the h11 the installing Levain itself imports (pure Python, so the copy is
+    interpreter-neutral), checked ``>= 0.16.0`` from its ``__version__``. Refuses an h11 that is not an
+    ordinary package directory (a zipped or single-file install has nothing to copy) or is too old."""
+    try:
+        import h11
+    except ImportError as e:
+        raise Refused("bad-root", f"h11 is not importable by the installing Levain ({e}); install levain[isolation]")
+    f = getattr(h11, "__file__", None)
+    if not f or Path(f).name != "__init__.py" or not Path(f).parent.is_dir():
+        raise Refused("bad-root", f"h11 is not a package directory ({f!r}); nothing to vendor")
+    try:
+        have = tuple(int(x) for x in str(h11.__version__).split(".")[:3])
+    except (AttributeError, ValueError):
+        raise Refused("bad-root", f"h11 has no readable version ({getattr(h11, '__version__', None)!r})")
+    if have < H11_MIN:
+        raise Refused("bad-root", f"h11 {h11.__version__} is older than {'.'.join(map(str, H11_MIN))}")
+    return Path(f).parent
+
+
+def _package_steps(t: dict[str, str], owner: str, tree: Path, source: Path) -> list[Step]:
+    """Stage ``source`` (a package directory) into ``tree``, check it, and swap it in (CONTRACT §23):
+    the copy is staged beside the live package; links are refused (by lstat) before any chown or chmod;
+    the live package is renamed aside, the staged one renamed into place, the old one removed."""
+    pkg, staged, old = tree / source.name, tree / f"{source.name}.new", tree / f"{source.name}.old"
+    return [
         Step(f"clear {staged} and {old} (left by an interrupted run)", (t["rm"], "-rf", str(staged), str(old))),
-        Step(f"copy the levain package to {staged} (symlinks copied as links, then refused)",
+        Step(f"copy the {source.name} package to {staged} (symlinks copied as links, then refused)",
              (t["cp"], "-R", "-P", str(source), str(staged))),
         Step(f"drop compiled files copied from {source}",
              (t["find"], str(staged), "-name", "__pycache__", "-prune", "-exec", t["rm"], "-rf", "{}", "+")),
@@ -181,11 +190,37 @@ def tree_steps(host: HostOS, source: Path) -> list[Step]:
         Step(f"rename {staged} into place at {pkg}", (t["mv"], str(staged), str(pkg))),
         Step(f"remove {old}", (t["rm"], "-rf", str(old))),
     ]
+
+
+def tree_steps(host: HostOS, source: Path, *, h11_dir: Path | None = None) -> list[Step]:
+    """Copy the ``levain`` package at ``source`` and the h11 package (``h11_dir``, default the installing
+    Levain's own, :func:`h11_source`) into the import tree and write the entry scripts. ``source`` is the
+    package directory itself. Each package goes through the same staged copy and checks.
+
+    Every step is safe to re-run after a failure at any point (CONTRACT §23)."""
+    if source.name != "levain":
+        raise Refused("bad-root", f"{source} is not a levain package directory")
+    h11_dir = h11_dir if h11_dir is not None else h11_source()
+    if h11_dir.name != "h11":
+        raise Refused("bad-root", f"{h11_dir} is not an h11 package directory")
+    t = _tools(host)
+    tree, helpers, vendor = IMPORT_TREE[host], HELPER_DIR[host], VENDOR_PREFIX[host]
+    owner = f"root:{ROOT_GROUP[host]}"
+    steps: list[Step] = []
+    for d in (tree, helpers, vendor):
+        steps += [
+            Step(f"check every directory above {d} is root's alone (links resolved), and {d} is no link", call=lambda p=d: _root_owned_ancestors(p)),
+            Step(f"create {d}", (t["mkdir"], "-p", "-m", "755", str(d))),
+            Step(f"own {d} as root", (t["chown"], owner, str(d))),
+            Step(f"set {d} to 0755", (t["chmod"], "0755", str(d))),
+        ]
+    steps += _package_steps(t, owner, tree, source)
+    steps += _package_steps(t, owner, tree, h11_dir)
     for entry, path in (("install-helper", install_helper_path(host)), ("runtime-helper", runtime_helper_path(host)),
                         ("service-entry", service_entry_path(host))):
         steps.append(Step(f"write the {entry} entry script {path}", write=(path, entry_text(host, entry), 0o755)))
     return steps
 
 
-__all__ = ["ENTRY_MODULES", "HELPER_MODULES", "PY_FLAGS", "ROOT_PYTHON", "VENDOR_PREFIX", "entry_text",
-           "helper_entry_text", "tree_steps"]
+__all__ = ["ENTRY_MODULES", "H11_MIN", "HELPER_MODULES", "PY_FLAGS", "ROOT_PYTHON", "VENDOR_PREFIX", "entry_text",
+           "h11_source", "helper_entry_text", "tree_steps"]

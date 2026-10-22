@@ -22,7 +22,7 @@ NO_HOME = {"darwin": "/var/empty", "linux": "/nonexistent"}
 
 #: CONTRACT §1.2: the shared groups each singleton is in.
 _SINGLETON_GROUPS: Mapping[str, tuple[str, ...]] = {
-    "_levain_keys": ("levain-control",),
+    "_levain_keys": ("levain-control", "levain-gwfronts"),
     "_levain_export": (),
     "_levain_control": ("levain-wake",),
     "_levain_qbroker": ("levain-control", "levain-queue"),
