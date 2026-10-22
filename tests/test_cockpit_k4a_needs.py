@@ -18,6 +18,8 @@ DESKTOP = {"emulate": {"w": 1440, "h": 900, "dpr": 1}}
 TILE = "[...document.querySelectorAll('.ck-widgets .ck-card.w')].find(c => /^Decisions waiting/i.test(c.innerText))"
 SESS_TILE = "[...document.querySelectorAll('.ck-widgets .ck-card.w')].find(c => /^Sessions/i.test(c.innerText))"
 CARDS = "[...document.querySelectorAll('#ck-needs .needs-card')]"
+# the one consent card that carries its Open row, picked the same way for the wait, the read and the click
+CARD = "[...document.querySelectorAll('#ck-needs .needs-consent')].find(c => c.querySelector('.needs-open'))"
 READY = "document.querySelector('#ck-needs .needs-card .consent-display') && document.querySelector('#ck-needs .needs-question .question-option')"
 
 
@@ -94,12 +96,12 @@ def test_a_question_card_keeps_its_rec_and_its_cli_line_sits_behind_details(tmp_
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": READY},
-            {"until": "document.querySelector('#ck-needs .needs-consent .needs-open') && document.querySelector('#ck-needs .needs-question .question-option')"},
+            {"until": CARD + " && document.querySelector('#ck-needs .needs-question .question-option')"},
             {"eval": "(() => { const q = document.querySelector('#ck-needs .needs-question'); return JSON.stringify({"
                      " recText: /REC\\s+hold\\./.test(q.innerText), title: (q.querySelector('.needs-q-title')||{}).textContent, recBtn: [...q.querySelectorAll('.question-option')].map(b => [b.textContent, b.classList.contains('question-rec')]),"
                      " words: !!q.querySelector('.question-words')}); })()"},
-            {"eval": "(() => { const c = document.querySelector('#ck-needs .needs-consent'); return JSON.stringify({hasOpen: !!c.querySelector('.needs-open'), inlineCmd: !!c.querySelector('.consent-code')}); })()"},
-            {"eval": "document.querySelector('#ck-needs .needs-consent .needs-open').click(); 1"},
+            {"eval": "(() => { const c = " + CARD + "; return JSON.stringify({hasOpen: !!c.querySelector('.needs-open'), inlineCmd: !!c.querySelector('.consent-code')}); })()"},
+            {"eval": CARD + ".querySelector('.needs-open').click(); 1"},
             {"until": "document.querySelector('#levain-modal .needs-terminal .consent-code')"},
             {"eval": "JSON.stringify({cmd: document.querySelector('#levain-modal .needs-terminal .consent-code').textContent})"}])["values"]
     q, before, after = json.loads(out[-5]), json.loads(out[-4]), json.loads(out[-1])

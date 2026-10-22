@@ -148,7 +148,14 @@ TILE = "[...document.querySelectorAll('.ck-widgets .ck-card.w')].find(c => /^Dec
 # K4 moved the premise on purpose: while something waits, the Decisions tile takes the reader to the Needs-you strip and opens no
 # modal (test_cockpit_k4a_needs pins that). The history modal is then one click further, on the strip's "all decisions" button;
 # with nothing waiting there is no strip and the tile itself opens it.
-OPEN_DECISIONS = ("(() => { const h = document.querySelector('#ck-needs:not([hidden]) .needs-history'); (h || " + TILE + ").click(); return 1; })()")
+# The strip and the tile render on separate passes, so the helper first waits for the state to settle: the strip's button exists, or
+# the tile shows a zero count (nothing waits, so the tile itself opens the modal). The wait is bounded; a timeout falls through to
+# the click and the step after it fails on its own.
+OPEN_DECISIONS = ("(async () => { const find = () => document.querySelector('#ck-needs:not([hidden]) .needs-history');"
+                  " const tile = () => " + TILE + ";"
+                  " const settled = () => { const t = tile(); return !!find() || (!!t && /(^|\\D)0(\\D|$)/.test(t.innerText)); };"
+                  " for (let i = 0; i < 100 && !settled(); i++) await new Promise(r => setTimeout(r, 100));"
+                  " (find() || tile()).click(); return 1; })()")
 MARK_CMD, MARK_CWD = "zq-cmd-marker-7731", "/w/zq-cwd-marker-4419"
 
 
@@ -256,29 +263,38 @@ def test_a_decided_row_has_a_details_button_and_a_malformed_body_releases_its_sl
     for n in ("p1", "p2"):
         q.file(agent="claude_code", agent_session_id="s", tool_name="Bash", tool_input={"command": "echo " + n},
                cwd="/w", hold=timedelta(minutes=5), event_id=n)
-    gone = q.file(agent="codex", agent_session_id="s", tool_name="Bash", tool_input={"command": "echo zq-decided-marker"},
-                  cwd="/w", hold=timedelta(minutes=5), event_id="p3")
-    q.withdraw(gone.id)
+    gone = []
+    for n in ("p3", "p4"):
+        g = q.file(agent="codex", agent_session_id="s", tool_name="Bash", tool_input={"command": "echo zq-decided-marker-" + n},
+                   cwd="/w", hold=timedelta(minutes=5), event_id=n)
+        q.withdraw(g.id)
+        gone.append(g.id)
     _root, src, _ids = _install(tmp_path)
-    # The Needs-you strip already read the two waiting bodies and the modal reuses them, so the decided row's own fetches are the
-    # ones to spoil: its first answers 200 with an unreadable body, and a freed slot lets the retry through.
-    stub = ("(() => { const real = window.fetch.bind(window); let n = 0; window.fetch = (u, o) => String(u).includes('/cockpit/consent/" + gone.id + "') && n++ < 1"
-            " ? Promise.resolve({ ok: true, status: 200, json: () => Promise.reject(new Error('bad json')) }) : real(u, o); return 1; })()")
+    # The Needs-you strip already read the two waiting bodies and the modal reuses them, so the decided rows' own fetches are the
+    # ones to spoil: each answers its FIRST read with a 200 and an unreadable body. Both are triggered before either is retried, so a
+    # leaked slot would saturate the two-slot queue and the third read could never run. The page encodes the id in the route
+    # (the colons of a timestamp id), so the stub matches the encoded form.
+    stub = ("(() => { const real = window.fetch.bind(window); const ids = " + json.dumps(gone) + "; const seen = new Set();"
+            " window.fetch = (u, o) => { const id = ids.find(i => String(u).includes('/cockpit/consent/' + encodeURIComponent(i)));"
+            " if (id && !seen.has(id)) { seen.add(id); return Promise.resolve({ ok: true, status: 200, json: () => Promise.reject(new Error('bad json')) }); }"
+            " return real(u, o); }; return 1; })()")
+    rows = "[...document.querySelectorAll('#levain-modal .consent-row')].filter(x => x.querySelector('.consent-details'))"
+    tagged = "[...document.querySelectorAll('#levain-modal .consent-row[data-zq]')]"     # a read that succeeds removes its button
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /2/.test({TILE}.innerText)"},
             {"eval": stub},
             {"eval": OPEN_DECISIONS},
-            {"until": "[...document.querySelectorAll('#levain-modal .consent-row')].some(x => x.querySelector('.consent-details'))"},
-            {"eval": "(() => { const r = [...document.querySelectorAll('#levain-modal .consent-row')].find(x => x.querySelector('.consent-details'));"
-                     " const before = !!r.querySelector('.consent-display'); r.querySelector('.consent-details').click(); return before; })()"},
-            {"until": "[...document.querySelectorAll('#levain-modal .consent-row')].some(x => x.querySelector('.consent-details') && x.querySelector('.consent-note'))"},
-            {"eval": "(() => { const r = [...document.querySelectorAll('#levain-modal .consent-row')].find(x => x.querySelector('.consent-details')); r.querySelector('.consent-details').click(); return 1; })()"},
-            {"until": "[...document.querySelectorAll('#levain-modal .consent-row')].some(r => r.querySelector('.consent-display'))"},
-            {"eval": "[...document.querySelectorAll('#levain-modal .consent-row')].filter(r => r.querySelector('.consent-display')).map(r => r.querySelector('.consent-display').textContent)"},
+            {"until": f"{rows}.length === 2"},
+            {"eval": f"(() => {{ const rs = {rows}; const before = rs.map(r => !!r.querySelector('.consent-display')); rs.forEach(r => {{ r.dataset.zq = '1'; r.querySelector('.consent-details').click(); }}); return before; }})()"},
+            {"until": f"{tagged}.length === 2 && {tagged}.every(x => x.querySelector('.consent-note') && x.querySelector('.consent-details') && !x.querySelector('.consent-details').disabled)"},
+            {"eval": f"(() => {{ {tagged}.forEach(r => r.querySelector('.consent-details').click()); return 1; }})()"},
+            {"until": f"{tagged}.length === 2 && {tagged}.every(r => r.querySelector('.consent-display'))"},
+            {"eval": f"{tagged}.map(r => r.querySelector('.consent-display').textContent)"},
         ])["values"]
-    assert out[-5] is False, out        # before the click the decided row had no body
-    assert any("zq-decided-marker" in t for t in out[-1])
+    assert out[-5] == [False, False], out        # before the click neither decided row had a body
+    assert not isinstance(out[-4], dict), out    # a timeout is a value, not a failure: both spoiled reads really drew their note
+    assert len(out[-1]) == 2 and all("zq-decided-marker" in t for t in out[-1]), out
 
 
 @needs_browser

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime as d
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -118,12 +119,12 @@ def test_project_colour_is_the_product_with_no_variant_switch_and_no_repo_of_its
       const root = getComputedStyle(document.documentElement);
       const stripe = document.querySelector('.ck-card.w[data-ck-panel="decisions"], .ck-card.w[data-ck-panel="memory"]');
       const k = window.LevainSky ? window.LevainSky.hueKey : null;
-      return { variantAttr: document.documentElement.dataset.variant || '', slots: [1, 2, 3, 4, 5].map(i => !!root.getPropertyValue('--hue-' + i).trim()),
+      return { variantAttr: document.documentElement.dataset.variant || '', slots: [1, 2, 3, 4, 5, 6, 7, 8].map(i => !!root.getPropertyValue('--hue-' + i).trim()),
         stripe: stripe ? getComputedStyle(stripe, '::before').content : '', tags: document.querySelectorAll('.rp-tag').length,
         hues: k ? ['alpha', 'Alpha', 'my-app', 'x'.repeat(300), '', null].map(k) : [] }; })()"""}])
     got = vals[2]
     assert got["variantAttr"] == "" and all(got["slots"]) and got["stripe"] == '""' and got["tags"] == 0, got
-    assert got["hues"][0] == got["hues"][1] and all(h in "12345678" and h for h in got["hues"][:4]) and got["hues"][4:] == ["", ""], got
+    assert got["hues"][0] == got["hues"][1] and all(isinstance(h, str) and re.fullmatch(r"[1-8]", h) for h in got["hues"][:4]) and got["hues"][4:] == ["", ""], got
 
 
 # Phill 10-15: "there is no reason a public package should have my personal dealings in it". The names are held as hash
