@@ -172,8 +172,10 @@ def worker_loop(reaper: RP.Reaper, wake_fd: int, *, passes: Optional[int] = None
 def revoker_loop(revoker: RP.Revoker, wake_fd: int, *, wakes: Optional[int] = None, tick_s: float = RP.V11_S,
                  log: Callable[[str], None] = _log) -> int:
     log(f"revoker pid {os.getpid()} parent {os.getppid()}")
+    mono = revoker.seams.monotonic
     n = 0
     fail_s = 0.0                  # the backoff after consecutive failed wakes; 0 after a clean one
+    fail_due: Optional[float] = None   # while wakes fail: wake() is not called again before this
     failed, repeats = None, 0     # the failure last logged, and how often it repeated since
     summary = None                # the last wake summary logged
     while True:
@@ -191,11 +193,12 @@ def revoker_loop(revoker: RP.Revoker, wake_fd: int, *, wakes: Optional[int] = No
                 failed, repeats = msg, 0
             summary = None
             fail_s = min(fail_s * 2, tick_s) if fail_s else RP.REVOKER_RETRY_S
+            fail_due = mono() + fail_s
             wait = fail_s
         else:
             if repeats:
                 log(f"revoker wake failed {repeats} more times: {failed}")
-            failed, repeats, fail_s = None, 0, 0.0
+            failed, repeats, fail_s, fail_due = None, 0, 0.0, None
             line = f"control {out['control']} outcomes {out['outcomes']}"
             if line != summary:
                 log(f"revoker wake {n}: {line}")
@@ -207,10 +210,14 @@ def revoker_loop(revoker: RP.Revoker, wake_fd: int, *, wakes: Optional[int] = No
                 wait = tick_s if due is None else min(due, tick_s)
         if wakes is not None and n >= wakes:
             return 0
-        _wait(wake_fd, wait)
-        if not _drain(wake_fd):
-            log("revoker: the main process is gone; exiting")
-            return 0
+        while True:   # while wakes fail, a datagram is drained (and EOF checked) but does not retry before the deadline
+            _wait(wake_fd, wait)
+            if not _drain(wake_fd):
+                log("revoker: the main process is gone; exiting")
+                return 0
+            wait = fail_due - mono() if fail_due is not None else 0.0
+            if wait <= 0:
+                break
 
 
 class _Child:

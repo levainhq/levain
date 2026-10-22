@@ -214,3 +214,95 @@ def test_a_stuck_retry_and_a_raising_wake_back_off_to_the_tick(tmp_path, monkeyp
     waits, logs = run(rv, clk)
     assert waits == doubling
     assert sum("failed" in x for x in logs) == 1
+
+
+def test_one_retry_per_session_backs_off_and_a_re_lease_is_tried_at_once(tmp_path, monkeypatch):
+    # Reproduced on 86ef5b73: the lease's own retry stayed due once its alloc went unread, pinning retry_in at
+    # REVOKER_RETRY_S (2400 wakes over 600 s); and the re-leased session's new revoke was not tried on the datagram
+    # wake, waiting out the old unread backoff (59.9 s).
+    """CONTROL down: the first kill errors, then the alloc never reads. The one retry doubles to the tick and the
+    summary does not change between due wakes. Then the session is re-leased (its alloc rewritten, readable): the
+    next wake, before the old retry is due, tries the new lease."""
+    import dataclasses
+    from pathlib import Path
+
+    from levain.slot import reaper as RP
+    from levain.slot import records as R
+    from levain.slot import runtime_helper as H
+
+    w, la, table = _world(tmp_path)
+    s = _started(w, la, table)
+
+    def down(path):
+        raise Refused("control-down", str(path))
+    w.seams.client_factory = down
+    real_kill, real_read = SS.revoke_front, H.Store.read
+    kills, unreadable = [], {"on": False}
+
+    def flaky_kill(ctx, a):
+        kills.append(a.lease_seq)
+        if len(kills) == 1:
+            raise OSError(5, "Input/output error")
+        return real_kill(ctx, a)
+
+    def flaky_read(self, parts, name, **kw):
+        if tuple(parts) == ("alloc",) and unreadable["on"]:
+            raise OSError(5, "Input/output error")
+        return real_read(self, parts, name, **kw)
+    monkeypatch.setattr(SS, "revoke_front", flaky_kill)
+    monkeypatch.setattr(H.Store, "read", flaky_read)
+
+    clk = _clock(w)
+    rv = RP.Revoker(w.seams)
+    assert rv.wake()["outcomes"] == {s: "error:OSError"}
+    unreadable["on"] = True
+    summaries = set()
+    for _ in range(10):
+        clk[0] += rv.retry_in()
+        summaries.add(str(rv.wake()["outcomes"]))
+        clk[0] += 0.1                                     # an early wake between retries
+        summaries.add(str(rv.wake()["outcomes"]))
+    assert list(rv.retry) == [s] and rv.retry[s].delay == RP.V11_S
+    assert summaries == {str({s: "alloc:OSError"})}
+
+    p = Path(w.seams.store) / "alloc" / f"{s}.json"
+    a = R.parse_alloc(p.read_bytes())
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_bytes(R.alloc_bytes(dataclasses.replace(a, lease_seq=a.lease_seq + 1)))
+    os.chmod(tmp, os.stat(p).st_mode & 0o7777)
+    os.replace(tmp, p)
+    unreadable["on"] = False
+    clk[0] += 0.1
+    rv.wake()
+    assert kills == [a.lease_seq, a.lease_seq + 1]
+
+
+def test_a_failing_wake_is_not_retried_at_the_datagram_rate(tmp_path, monkeypatch):
+    # Reproduced on 86ef5b73: with a datagram every 0.01 s, a wake() that always raised was called 6001 times in 60 s.
+    """While wakes fail, a readable wake pipe is drained but wake() is not called again before its backoff."""
+    from levain.slot import reaper as RP
+    from levain.slot.services import reaper as SR
+
+    w, la, table = _world(tmp_path)
+    clk = _clock(w)
+    rv = RP.Revoker(w.seams)
+    calls = []
+
+    def boom():
+        calls.append(clk[0])
+        raise OSError(13, "Permission denied")
+    rv.wake = boom
+    r, wfd = os.pipe()
+    os.set_blocking(r, False)
+
+    def fake_wait(fd, timeout):                           # a datagram arrives 0.01 s into every wait
+        os.write(wfd, b"x")
+        clk[0] += min(max(timeout, 0.0), 0.01)
+    monkeypatch.setattr(SR, "_wait", fake_wait)
+    try:
+        SR.revoker_loop(rv, r, wakes=6, tick_s=RP.V11_S, log=lambda m: None)
+    finally:
+        os.close(r)
+        os.close(wfd)
+    gaps = [round(b - a, 6) for a, b in zip(calls, calls[1:])]
+    assert gaps == [0.25, 0.5, 1.0, 2.0, 4.0]
