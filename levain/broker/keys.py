@@ -1,8 +1,22 @@
 """gw-keys (S1 session 3b): the credential side of the gateway, run as `_levain_keys`. This tip holds WHO MAY CONNECT
 (design 1.5, session 3b-3a): keys' `R/keys/front.sock` server, the registration table, the two admission pools, the
-`F` path, the NOFILE floor, the process entry and its one shutdown trigger. The admin server, the token states, the
-upstream and the credentials are later sessions'; until the real `Q` handler exists every `Q` is answered
-`F keys-unavailable`.
+`F` path, the NOFILE floor, the process entry and its one shutdown trigger; and WHO MAY ASK (session 3b-3b): the admin
+server on `R/keys/admin.sock`. The token states, the upstream and the credentials are later parts'; until the real `Q`
+handler exists every `Q` is answered `F keys-unavailable`.
+
+The admin server (design 1.5 "The admin connection", "Fencing", "Order inside one connection"):
+- a connection is accepted only from the `_levain_control` uid, read from the kernel; any other peer is closed unread.
+- framing and answer shape are `levain-control/1`'s: a 4-byte big-endian length and one canonical JSON object,
+  `{"v":1,"op","id",...}` in, `{"id","ok":true,...}` or `{"id","ok":false,"refused",...}` out. A frame that is not
+  one closes the connection, which is its EOF.
+- each request runs as its own task carrying the admin epoch of its connection, so answers go out in any order; two
+  requests naming one session run in frame order, the order assigned in the read loop with no `await` between the
+  read and the append to that session's chain.
+- FRONT-REGISTER / FRONT-ARM / DROP-SESSION are the fenced table calls; RELOAD is refused until a dispatch map exists.
+- a newer connection PREEMPTS in five steps: bump the epoch and stop reading the old one; cancel its request tasks and
+  await them, bounded; the fail-closed clear in two phases (`reg_high` kept); close the old connection; adopt.
+- the adopted connection's EOF fails closed: the epoch is bumped (its in-flight tasks are stale from that instant) and
+  every registration is detached, `K` sent on each STATUS connection.
 
 Who may connect, decided at accept, after `peer.peer_of` and before the first frame:
 1. the peer's uid must be a `_levain_gw<n>` uid and its `(uid, pid, start)` must name a registration, else the
@@ -29,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import functools
 import logging
 import os
 import pwd
@@ -42,8 +57,10 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 from levain.broker import gwwire
 from levain.broker.creds import CredLifecycle, FakeCredLifecycle
 from levain.broker.gwwire import FrameReader, KeysSide, WireError
-from levain.broker.peer import PeerUnknown, peer_of
+from levain.broker.peer import PeerUnknown, peer_of, peer_uid
 from levain.broker.upstream import Upstream, _note
+from levain.contracts import ContractError, canon
+from levain.contracts.grammar import JSON_INT_MAX
 
 # --- the admission values (DECISION, judged against the 8-slot default; one constant each) ------------------------
 FIRST_FRAME_S = 5.0
@@ -89,8 +106,27 @@ ABORT_AFTER_S = 2.0
 #: shutdown's awaits (the listeners' closure, later the exchange tasks) share ONE deadline.
 SHUTDOWN_WAIT_S = 3.0
 
+#: preemption's step (2): the old connection's request tasks are awaited this long after their cancel (DECISION,
+#: judged: a task's work is memory operations plus closing sockets); one still running is left to its epoch check.
+PREEMPT_WAIT_S = 2.0
+#: `levain-control/1`'s frame cap, which the admin wire shares.
+ADMIN_FRAME_MAX = 64 * 1024
+#: once an admin frame's length is in, its body must arrive within this (the connection idles legitimately only
+#: BETWEEN frames).
+ADMIN_FRAME_S = 10.0
+#: the admin verbs and their argument keys, exactly; every argument but `session` is an unsigned integer.
+ADMIN_VERBS = {
+    "FRONT-REGISTER": frozenset({"session", "front_uid", "pid", "start", "incarnation", "reg_token"}),
+    "FRONT-ARM": frozenset({"session", "reg_token"}),
+    "DROP-SESSION": frozenset({"session"}),
+    "RELOAD": frozenset({"generation"}),
+}
+#: RELOAD's answer until keys serves a dispatch map: there is no generation it could now serve.
+RELOAD_REFUSED = "reload-unsupported"
+
 GW_ACCOUNT = "_levain_gw{}"
 KEYS_ACCOUNT = "_levain_keys"
+CONTROL_ACCOUNT = "_levain_control"
 FRONTS_GROUP = "levain-gwfronts"
 
 _K = gwwire.encode(b"K")
@@ -142,14 +178,89 @@ class Conn:
 Victim = Union[Conn, Upstream]
 
 
+class AdminConn:
+    """One accepted admin connection: the epoch it was adopted on, its read loop's task, its request tasks, and per
+    session the last request task read for that session (the tail of that session's chain)."""
+
+    __slots__ = ("reader", "writer", "epoch", "task", "tasks", "last", "preempted")
+
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, epoch: int) -> None:
+        self.reader, self.writer, self.epoch = reader, writer, epoch
+        self.task: Optional[asyncio.Task] = asyncio.current_task()
+        self.tasks: Set[asyncio.Task] = set()
+        self.last: Dict[str, asyncio.Task] = {}
+        #: set by the preemption that replaces this connection, before it cancels the read loop: the EOF path then
+        #: does nothing, and the preemption closes the connection itself, after its clear.
+        self.preempted = False
+
+
+class AdminMalformed(Exception):
+    """An admin frame that is not a `levain-control/1` request: the connection is closed, which is its EOF."""
+
+
+async def read_admin_frame(reader: asyncio.StreamReader) -> Optional[Tuple[int, str, dict]]:
+    """The next request as `(id, op, args)`, or None at a clean EOF between frames; anything else that is not a
+    canonical `{"v":1,"op":<string>,"id":<uint>,...}` object within ADMIN_FRAME_MAX raises AdminMalformed."""
+    try:
+        head = await reader.readexactly(4)
+    except asyncio.IncompleteReadError as e:
+        if not e.partial:
+            return None
+        raise AdminMalformed("EOF inside a frame") from None
+    n = int.from_bytes(head, "big")
+    if n == 0 or n > ADMIN_FRAME_MAX:
+        raise AdminMalformed(f"frame length {n}")
+    try:
+        data = await asyncio.wait_for(reader.readexactly(n), ADMIN_FRAME_S)
+    except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+        raise AdminMalformed("a frame cut short or stalled") from None
+    try:
+        obj = canon.parse(data)
+    except ContractError as e:
+        raise AdminMalformed(str(e)) from None
+    if type(obj) is not dict or canon.canonical_bytes(obj) != data:
+        raise AdminMalformed("not a canonical JSON object")
+    v, op, rid = obj.get("v"), obj.get("op"), obj.get("id")
+    if type(v) is not int or v != 1 or type(op) is not str or not op:
+        raise AdminMalformed("v is 1 and op is a string")
+    if type(rid) is not int or not 0 <= rid <= JSON_INT_MAX:
+        raise AdminMalformed("id is an unsigned integer")
+    return rid, op, {k: x for k, x in obj.items() if k not in ("v", "op", "id")}
+
+
+def encode_admin(answer: dict) -> bytes:
+    data = canon.canonical_bytes(answer)
+    return len(data).to_bytes(4, "big") + data
+
+
+def check_admin_args(op: str, args: dict) -> Optional[str]:
+    """The refusal name for `op`'s arguments, or None when they are exactly its keys with the right types."""
+    want = ADMIN_VERBS.get(op)
+    if want is None:
+        return "verb-not-allowed-for-peer"
+    if any(k not in want for k in args):
+        return "unknown-key"
+    if any(k not in args for k in want):
+        return "missing-key"
+    for k, x in args.items():
+        if k == "session":
+            if type(x) is not str or not x:
+                return "wrong-type"
+        elif type(x) is not int or not 0 <= x <= JSON_INT_MAX:
+            return "wrong-type"
+    return None
+
+
 # --- the listeners --------------------------------------------------------------------------------------------------
 
 def bind_listeners(specs: Sequence[Tuple[str, Optional[int]]]) -> List[socket.socket]:
     """Create, bind and listen keys' listening sockets, one per `(path, gid)`, WITHOUT registering them with the loop
     (the NOFILE count comes between this and the first accept). Each is created 0660, then given `gid` when it is
     not None. A path that exists is replaced only when it is a socket that REFUSES a connect (stale: nobody listens);
-    any other file, or a socket that may be live, raises FileExistsError."""
+    any other file, or a socket that may be live, raises FileExistsError. On any failure every socket made here is
+    closed and every path bound here is unlinked, so a failed start leaves no listener path behind."""
     out: List[socket.socket] = []
+    bound: List[str] = []
     try:
         for path, gid in specs:
             try:
@@ -176,12 +287,18 @@ def bind_listeners(specs: Sequence[Tuple[str, Optional[int]]]) -> List[socket.so
                 s.bind(path)
             finally:
                 os.umask(old)
+            bound.append(path)
             if gid is not None:
                 os.chown(path, -1, gid)
             s.listen(ACCEPT_BACKLOG)
     except BaseException:
         for s in out:
             s.close()
+        for path in bound:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
         raise
     return out
 
@@ -217,7 +334,12 @@ class Keys:
 
     def __init__(self, *, gw_uids: frozenset = frozenset(), single_uid: Optional[int] = None,
                  control_path: Optional[str] = None, lib_root: Optional[str] = None,
-                 cred_lifecycle: Optional[CredLifecycle] = None) -> None:
+                 cred_lifecycle: Optional[CredLifecycle] = None, control_uid: Optional[int] = None) -> None:
+        #: the one uid admitted on the admin socket (the `_levain_control` account); None admits nobody.
+        self.control_uid = control_uid
+        #: the adopted admin connection, None between its EOF and the next adoption.
+        self.admin: Optional[AdminConn] = None
+        self.admin_lock: Optional[asyncio.Lock] = None    # one adoption (and so one preemption) at a time
         #: the credential layer's lifecycle seam, which shutdown calls; the stand-in until the real writer is passed.
         self.cred_lifecycle: CredLifecycle = cred_lifecycle if cred_lifecycle is not None else FakeCredLifecycle()
         #: uids admitted at accept: the `_levain_gw<n>` accounts.
@@ -246,26 +368,38 @@ class Keys:
     # -- start / stop --
 
     def _in_loop(self) -> None:
-        """The lock and the latch's event, made once, inside the running loop (3.9 binds them to the loop)."""
+        """The locks and the latch's event, made once, inside the running loop (3.9 binds them to the loop)."""
         if self.state_lock is None:
             self.state_lock = asyncio.Lock()
+            self.admin_lock = asyncio.Lock()
             self._done = asyncio.Event()
 
-    async def start(self, socks: Sequence[socket.socket]) -> None:
-        """Serve `socks` (bind_listeners' output). start() alone creates servers, and the shutdown's close waits for
-        start() to return before it closes `servers`; so a trigger before or during start never leaves a listener.
-        Once `closing` is set no further server is created and the rest of `socks` is closed unserved; a server whose
-        creation was in flight at the trigger is in `servers` by the time the close runs, and is closed there (until
-        then admission refuses every connection it accepts)."""
+    async def start(self, socks: Sequence[socket.socket], admin: Optional[socket.socket] = None) -> None:
+        """Serve `socks` as front listeners and `admin` as the admin listener (bind_listeners' output). start() alone
+        creates servers, and the shutdown's close waits for start() to return before it closes `servers`; so a trigger
+        before or during start never leaves a listener. Once `closing` is set no further server is created and the
+        rest of the sockets are closed unserved; a server whose creation was in flight at the trigger is in `servers`
+        by the time the close runs, and is closed there (until then admission refuses every connection it accepts). A
+        server creation that FAILS closes the servers already made (never their raw sockets, which the loop watches)
+        and the sockets not yet served, then raises."""
         self._in_loop()
         self._starting = asyncio.Event()
+        plan = [(s, self._on_conn) for s in socks] + ([(admin, self._on_admin)] if admin is not None else [])
+        made = 0
         try:
-            for i, s in enumerate(socks):
+            for i, (s, handler) in enumerate(plan):
                 if self.closing:
-                    for rest in socks[i:]:
+                    for rest, _h in plan[i:]:
                         rest.close()
                     return
-                self.servers.append(await asyncio.start_unix_server(self._on_conn, sock=s, backlog=ACCEPT_BACKLOG))
+                self.servers.append(await asyncio.start_unix_server(handler, sock=s, backlog=ACCEPT_BACKLOG))
+                made += 1
+        except BaseException:
+            for srv in self.servers:
+                srv.close()
+            for rest, _h in plan[made:]:
+                rest.close()
+            raise
         finally:
             self._starting.set()
 
@@ -410,6 +544,15 @@ class Keys:
                 c.task.cancel()
         return ups + victims
 
+    def _detach_all(self) -> List[Victim]:
+        """Phase 1 of the fail-closed clear (caller holds state_lock; no await): every registration detached, every
+        `Upstream` ahead of every connection. `reg_high` is kept: a clear never lowers a fence."""
+        regs = {id(r): r for r in list(self.regs.values()) + list(self.by_session.values())}
+        got: List[Victim] = []
+        for reg in regs.values():
+            got += self._detach(reg)
+        return [v for v in got if isinstance(v, Upstream)] + [v for v in got if not isinstance(v, Upstream)]
+
     def _effects(self, victims: List[Victim]) -> None:
         """Phase 2: run right after phase 1 released the lock, synchronously. An `Upstream` is aborted (never closed;
         its abort never raises). Each connection in its own try: `K` if it is a claimed STATUS connection, then close,
@@ -433,6 +576,148 @@ class Keys:
                     t.abort()
                 except Exception:
                     pass
+
+    # -- the admin server --
+
+    async def _on_admin(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """One admin connection: the uid check, the adoption (a preemption when one is adopted already), the read
+        loop, and, unless a preemption replaced it, its EOF's fail-closed clear."""
+        conn: Optional[AdminConn] = None
+        try:
+            try:
+                uid = peer_uid(writer.get_extra_info("socket"))
+            except PeerUnknown:
+                return
+            if self.control_uid is None or uid != self.control_uid or self.closing:
+                return
+            conn = await self._adopt(reader, writer)
+            if conn is None:
+                return
+            await self._admin_read(conn)
+        except (OSError, EOFError, AdminMalformed):
+            pass   # CONTROL went away or sent what the wire does not allow: either way, this connection's EOF
+        except asyncio.CancelledError:
+            if conn is None or not conn.preempted:
+                raise
+        except Exception as e:
+            _note(logging.WARNING, "levain gw-keys: admin connection handler failed (%s)", type(e).__name__)
+        finally:
+            if conn is None:
+                writer.close()
+            elif not conn.preempted:
+                try:
+                    await self._admin_eof(conn)
+                finally:
+                    if not conn.preempted:
+                        writer.close()
+
+    async def _adopt(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> Optional[AdminConn]:
+        """Adopt a new admin connection; with one adopted already, preempt it first, in the design's five steps."""
+        assert self.admin_lock is not None and self.state_lock is not None
+        async with self.admin_lock:
+            if self.closing:
+                return None
+            old = self.admin
+            self.admin_epoch += 1                    # (1) every task of the old connection is stale from here
+            epoch = self.admin_epoch
+            if old is not None:
+                old.preempted = True
+                wait: Set[asyncio.Task] = set(old.tasks)
+                if old.task is not None:
+                    old.task.cancel()                # (1) stop reading it
+                    wait.add(old.task)
+                for t in old.tasks:                  # (2) cancel its request tasks, then await them, bounded
+                    t.cancel()
+                if wait:
+                    await asyncio.wait(wait, timeout=PREEMPT_WAIT_S)
+                async with self.state_lock:          # (3) the fail-closed clear, phase 1
+                    victims = self._detach_all()
+                self._effects(victims)               # (3) phase 2
+                try:
+                    old.writer.close()               # (4)
+                except Exception as e:
+                    _note(logging.WARNING, "levain gw-keys: closing a preempted admin connection failed (%s)",
+                          type(e).__name__)
+            if self.closing:
+                return None
+            conn = AdminConn(reader, writer, epoch)  # (5) adopt; it starts against an empty table
+            self.admin = conn
+            return conn
+
+    async def _admin_eof(self, conn: AdminConn) -> None:
+        """The adopted connection ended: fail closed. The epoch is bumped in the same mutation section as the clear,
+        so a request task of this connection still in flight changes nothing after it."""
+        assert self.state_lock is not None
+        async with self.state_lock:
+            if self.admin is not conn or conn.epoch != self.admin_epoch:
+                return
+            self.admin_epoch += 1
+            self.admin = None
+            victims = self._detach_all()
+        for t in list(conn.tasks):
+            t.cancel()
+        self._effects(victims)
+
+    async def _admin_read(self, conn: AdminConn) -> None:
+        """The read loop. Each request's place in its session's chain is taken HERE, between the read and the spawn,
+        with no `await` in between, so two requests naming one session run in frame order."""
+        while True:
+            got = await read_admin_frame(conn.reader)
+            if got is None:
+                return
+            rid, op, args = got
+            session = args.get("session") if type(args.get("session")) is str else None
+            prev = conn.last.get(session) if session is not None else None
+            t = asyncio.ensure_future(self._admin_request(conn, rid, op, args, prev))
+            conn.tasks.add(t)
+            if session is not None:
+                conn.last[session] = t
+            t.add_done_callback(functools.partial(self._admin_task_done, conn, session))
+
+    def _admin_task_done(self, conn: AdminConn, session: Optional[str], t: asyncio.Task) -> None:
+        conn.tasks.discard(t)
+        if session is not None and conn.last.get(session) is t:
+            del conn.last[session]
+        if t.cancelled():
+            return
+        e = t.exception()
+        if e is not None:
+            _note(logging.WARNING, "levain gw-keys: admin request failed (%s)", type(e).__name__)
+
+    async def _admin_request(self, conn: AdminConn, rid: int, op: str, args: dict,
+                             prev: Optional[asyncio.Task]) -> None:
+        """One request: wait for the previous request of its session (its outcome is not this one's), answer it,
+        and write the answer only while its connection's epoch is current. A failure inside keys' own call closes
+        the connection: its EOF clears everything, never a table left as the failure left it."""
+        if prev is not None and not prev.done():
+            await asyncio.wait({prev})
+        try:
+            answer = await self._admin_answer(conn.epoch, rid, op, args)
+        except Exception:
+            conn.writer.close()
+            raise
+        if answer is None or conn.epoch != self.admin_epoch:
+            return   # stale, or refused by the shutdown latch: no answer
+        conn.writer.write(encode_admin(answer))
+
+    async def _admin_answer(self, epoch: int, rid: int, op: str, args: dict) -> Optional[dict]:
+        bad = check_admin_args(op, args)
+        if bad is not None:
+            return {"id": rid, "ok": False, "refused": bad}
+        if op == "FRONT-REGISTER":
+            out = await self.front_register(epoch, args["session"], args["front_uid"], args["pid"], args["start"],
+                                            args["incarnation"], args["reg_token"])
+        elif op == "FRONT-ARM":
+            out = await self.front_arm(epoch, args["session"], args["reg_token"])
+        elif op == "DROP-SESSION":
+            out = await self.drop_session(epoch, args["session"])
+        else:
+            out = {"refused": RELOAD_REFUSED}
+        if out is None:
+            return None
+        if "refused" in out:
+            return {"id": rid, "ok": False, **out}
+        return {"id": rid, "ok": True, **out}
 
     # -- admission --
 
@@ -605,8 +890,8 @@ def single_uid_refusal(keys_uid: Optional[int], ids: Sequence[int]) -> Optional[
     return None
 
 
-async def _serve(keys: Keys, front_path: str, gid: Optional[int]) -> int:
-    socks = bind_listeners([(front_path, gid)])
+async def _serve(keys: Keys, front_path: str, gid: Optional[int], admin_path: str, admin_gid: Optional[int]) -> int:
+    socks = bind_listeners([(front_path, gid), (admin_path, admin_gid)])
     started = False
     try:
         keys.arm_triggers()
@@ -619,10 +904,10 @@ async def _serve(keys: Keys, front_path: str, gid: Optional[int]) -> int:
             print(f"levain gw-keys: refused nofile-low (soft {soft} < fixed_measured {fixed} + bounded {bounded()})",
                   file=sys.stderr, flush=True)
             return 3
-        await keys.start(socks)
-        started = True
+        started = True   # from here start() owns the sockets: it closes what it does not serve, even on a failure
+        await keys.start(socks[:1], admin=socks[1])
         if keys.servers and not keys.closing:   # a trigger before or during start: nothing is served
-            print(f"levain gw-keys: ready front={front_path}", file=sys.stderr, flush=True)
+            print(f"levain gw-keys: ready front={front_path} admin={admin_path}", file=sys.stderr, flush=True)
         await keys.wait_done()
         print("levain gw-keys: stopped", file=sys.stderr, flush=True)
         return 0
@@ -636,7 +921,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     import argparse
 
     ap = argparse.ArgumentParser(prog="python -m levain.broker.keys")
-    ap.add_argument("--runtime-root", required=True, help="R: keys serves R/keys/front.sock")
+    ap.add_argument("--runtime-root", required=True, help="R: keys serves R/keys/front.sock and R/keys/admin.sock")
     ap.add_argument("--lib-root", required=True, help="L: the route policy and the credentials live under it")
     ap.add_argument("--control", required=True, help="CONTROL's socket, which TOKEN-RESOLVE opens")
     ap.add_argument("--test-single-uid", action="store_true",
@@ -651,29 +936,43 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     single_uid: Optional[int] = None
     gid: Optional[int] = None
+    admin_gid: Optional[int] = None
     if a.test_single_uid:
         why = single_uid_refusal(_account_uid(KEYS_ACCOUNT), _process_uids())
         if why is not None:
             print(f"levain gw-keys: --test-single-uid refused: {why}", file=sys.stderr)
             return 2
-        # the effective uid: the one the kernel reports to this process's peers, and the one its own fronts carry
+        # the effective uid: the one the kernel reports to this process's peers, and the one its own fronts carry;
+        # the fixture's CONTROL runs as it too
         single_uid, gw_uids = os.geteuid(), frozenset()
+        control_uid: Optional[int] = single_uid
     else:
         import grp
         gw_uids = _gw_uids()
         if not gw_uids:
             print("levain gw-keys: no _levain_gw<n> account exists; nothing may connect", file=sys.stderr)
             return 2
-        try:
-            gid = grp.getgrnam(FRONTS_GROUP).gr_gid
-        except KeyError:
-            print(f"levain gw-keys: the {FRONTS_GROUP} group does not exist", file=sys.stderr)
+        control_uid = _account_uid(CONTROL_ACCOUNT)
+        if control_uid is None:
+            print(f"levain gw-keys: no {CONTROL_ACCOUNT} account exists; nothing may administer keys", file=sys.stderr)
             return 2
+        for group in (FRONTS_GROUP, CONTROL_ACCOUNT):
+            try:
+                g = grp.getgrnam(group).gr_gid
+            except KeyError:
+                print(f"levain gw-keys: the {group} group does not exist", file=sys.stderr)
+                return 2
+            if group == FRONTS_GROUP:
+                gid = g
+            else:
+                admin_gid = g
     raise_nofile()
-    keys = Keys(gw_uids=gw_uids, single_uid=single_uid, control_path=a.control, lib_root=a.lib_root)
+    keys = Keys(gw_uids=gw_uids, single_uid=single_uid, control_path=a.control, lib_root=a.lib_root,
+                control_uid=control_uid)
     front_path = os.path.join(a.runtime_root, "keys", "front.sock")
+    admin_path = os.path.join(a.runtime_root, "keys", "admin.sock")
     try:
-        return asyncio.run(_serve(keys, front_path, gid))
+        return asyncio.run(_serve(keys, front_path, gid, admin_path, admin_gid))
     except FileExistsError as e:
         print(f"levain gw-keys: {e}", file=sys.stderr)
         return 3
