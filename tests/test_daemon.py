@@ -85,7 +85,11 @@ def test_render_unit_is_per_user_never_system_scope() -> None:
     xml = LaunchdProvider().render_unit(build_spec(install_path=Path("/tmp/inst")))
     assert "LaunchDaemon" not in xml
     assert "RU SYSTEM" not in xml
-    assert LaunchdProvider()._plist_path("com.x") == Path.home() / "Library" / "LaunchAgents" / "com.x.plist"
+    # UNIT_DIR is the user's home as it was when levain.daemon was imported (the suite gives each test its own
+    # HOME after that), so check the shape: <a home>/Library/LaunchAgents, never /Library/LaunchDaemons
+    unit = LaunchdProvider()._plist_path("com.x")
+    assert unit == LaunchdProvider.UNIT_DIR / "com.x.plist" and unit.parts[-3:-1] == ("Library", "LaunchAgents")
+    assert not str(unit).startswith(("/Library/", "/System/"))
 
 
 # --- select_provider -------------------------------------------------------------------------
