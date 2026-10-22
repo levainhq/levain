@@ -342,7 +342,9 @@ def cmd_regenesis(gl: LedgerTransport, args) -> int:
         members[parts[0]] = parts[1]
         if len(parts) == 3 and parts[2]:
             keys[parts[0]] = _key_line(parts[2])
-    team = R.Team(project=args.project or "", owner=args.owner, members=members)
+    # the presence rule carries over: a re-genesis never turns a refusing team back to unchosen (r2 complement MED 1)
+    team = R.Team(project=args.project or "", owner=args.owner, members=members,
+                  allow_file_keys=d_old.team.allow_file_keys)
     R.validate_team(team)
     # the new genesis lists the RUNNER's key as the owner's (it signs it): naming someone else as owner filed the
     # runner's key under their handle, and an owner pubkey given here was dropped without a word (docs L3 r2 anansi)

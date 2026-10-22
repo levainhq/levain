@@ -39,14 +39,18 @@ from ..launch import child_env
 from .transport import _NO_HOOKS, ledger_env
 
 SSH_SIG_BEGIN = "-----BEGIN SSH SIGNATURE-----"
-CACHE_SCHEMA = "sigcache-v2"   # bump whenever a verdict rule or the accepted key set changes
+CACHE_SCHEMA = "sigcache-v3"   # bump whenever a verdict rule or the accepted key set changes (v3: presence)
 # key type -> the curve name an ecdsa blob must carry (None for the non-ecdsa types)
 KEY_TYPES = {
     "ssh-ed25519": None,
     "ecdsa-sha2-nistp256": "nistp256",
     "ecdsa-sha2-nistp384": "nistp384",
     "ecdsa-sha2-nistp521": "nistp521",
+    # FIDO keys (a security key, or Touch ID through an sk provider): the key a signature with presence comes from
+    "sk-ssh-ed25519@openssh.com": None,
+    "sk-ecdsa-sha2-nistp256@openssh.com": "nistp256",
 }
+_SK_TYPES = frozenset({"sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"})
 # uncompressed point length (0x04 || X || Y) per curve; OpenSSH accepts only uncompressed points
 _EC_POINT_LEN = {"nistp256": 65, "nistp384": 97, "nistp521": 133}
 _ED25519_LEN = 32
@@ -81,7 +85,7 @@ def _check_blob(declared: str, blob: bytes) -> None:
     if embedded != declared.encode():
         raise SigningError(f"the key says {declared} but its blob says {embedded.decode('ascii', 'replace')!r}")
     curve = KEY_TYPES[declared]
-    if declared == "ssh-ed25519":
+    if declared in ("ssh-ed25519", "sk-ssh-ed25519@openssh.com"):
         key, off = _read_string(blob, off, "public key")
         if len(key) != _ED25519_LEN:
             raise SigningError(f"an ed25519 public key is {_ED25519_LEN} bytes, this one is {len(key)}")
@@ -92,6 +96,8 @@ def _check_blob(declared: str, blob: bytes) -> None:
         point, off = _read_string(blob, off, "public point")
         if len(point) != _EC_POINT_LEN[curve] or point[:1] != b"\x04":
             raise SigningError(f"the {curve} public point is not an uncompressed point of the curve's size")
+    if declared in _SK_TYPES:
+        _app, off = _read_string(blob, off, "application")
     if off != len(blob):
         raise SigningError(f"the key blob has {len(blob) - off} unexpected trailing bytes")
 
@@ -99,18 +105,17 @@ def _check_blob(declared: str, blob: bytes) -> None:
 def fingerprint(pubkey_line: str) -> str:
     """The ``SHA256:...`` fingerprint ``ssh-keygen -lf`` prints for one OpenSSH public key line.
 
-    Accepts ``ssh-ed25519`` and ``ecdsa-sha2-nistp{256,384,521}`` only. ``ssh-rsa`` is refused: whether an RSA
-    signature verifies depends on the OpenSSH build (SHA-1 RSA signatures are disabled in newer ones), so two clones
-    could disagree about the same commit. Hardware-backed ``sk-*`` keys
-    and ``*-cert-v01@openssh.com`` certificates are refused on purpose: a member is one plain key, and a
+    Accepts ``ssh-ed25519``, ``ecdsa-sha2-nistp{256,384,521}`` and the two FIDO types
+    ``sk-ssh-ed25519@openssh.com`` / ``sk-ecdsa-sha2-nistp256@openssh.com`` (the only keys whose signatures carry
+    user presence, which ``levain team record`` requires). ``ssh-rsa`` is refused: whether an RSA signature verifies
+    depends on the OpenSSH build (SHA-1 RSA signatures are disabled in newer ones), so two clones could disagree about
+    the same commit. ``*-cert-v01@openssh.com`` certificates are refused on purpose: a member is one key, and a
     certificate would make the verdict depend on a CA this module does not judge.
     """
     fields = pubkey_line.strip().split()
     if len(fields) < 2:
         raise SigningError("a public key line is '<type> <base64> [comment]'")
     declared, b64 = fields[0], fields[1]
-    if declared.startswith("sk-"):
-        raise SigningError(f"security-key types ({declared}) are not accepted")
     if declared.endswith("-cert-v01@openssh.com"):
         raise SigningError(f"certificates ({declared}) are not accepted; use the plain public key")
     if declared not in KEY_TYPES:
@@ -178,6 +183,8 @@ class Verdict:
     kind: str
     fingerprint: str | None
     reason: str
+    # for "signed": whether the signature carries user presence (a FIDO key's touch, see ``has_presence``)
+    presence: bool | None = None
 
     @property
     def definitive(self) -> bool:
@@ -185,8 +192,23 @@ class Verdict:
         return self.kind in ("signed", "unsigned")
 
 
-def _signed(fp: str, reason: str = "good signature") -> Verdict:
-    return Verdict("signed", fp, reason)
+def _signed(fp: str, reason: str = "good signature", presence: bool | None = None) -> Verdict:
+    return Verdict("signed", fp, reason, presence)
+
+
+def has_presence(sig: bytes | str) -> bool:
+    """True only if ``sig`` (an armored SSHSIG) was made by a FIDO key (``sk-*``) or a passkey (webauthn-sk) AND
+    carries the user-presence flag. The flag rule is levain's one presence check
+    (:func:`levain.authority.presence_missing`); this adds only that a non-FIDO signature never has presence."""
+    from levain.authority import presence_missing, sshsig_public_key
+    text = sig.decode("ascii", "replace") if isinstance(sig, bytes) else sig
+    try:
+        public_key, _fp, _sig_type = sshsig_public_key(text)
+    except ValueError:
+        return False
+    if not public_key.split()[0].startswith("sk-"):
+        return False
+    return not presence_missing(text, public_key)
 
 
 def _unsigned(reason: str) -> Verdict:
@@ -258,7 +280,7 @@ def verify_commit(repo_dir: Path, sha: str, *, timeout: float = 10.0) -> Verdict
         for line in out.splitlines():
             m = _GOOD.match(line.strip())
             if m:
-                return _signed(m.group(1))
+                return _signed(m.group(1), presence=has_presence(sig))
     elif cp.returncode == 255:
         # 255 is ssh-keygen's fatal(): a rejected signature, but ALSO this machine failing (a signature file it could
         # not read prints the same "Could not verify signature." as a garbled blob; measured, OpenSSH 10.3). The
@@ -332,6 +354,11 @@ _CANARIES: dict[str, tuple[str, bytes]] = {
 }
 
 
+# a FIDO signature verifies with the same primitive as its plain twin, so the plain twin's canary judges the machine
+_CANARY_ALIAS = {"sk-ssh-ed25519@openssh.com": "ssh-ed25519",
+                 "sk-ecdsa-sha2-nistp256@openssh.com": "ecdsa-sha2-nistp256"}
+
+
 def _sig_keytype(sig: bytes) -> str | None:
     """The key type inside an armored SSHSIG blob (``SSHSIG``, uint32 version, string publickey, ...)."""
     try:
@@ -349,6 +376,7 @@ def _sig_keytype(sig: bytes) -> str | None:
 def _canary_verifies(timeout: float, keytype: str | None = None) -> bool:
     """Run every time it is asked (never memoised): the question is whether THIS check environment works NOW, for the
     signature's own key type (ed25519 when the type is not one levain accepts)."""
+    keytype = _CANARY_ALIAS.get(keytype or "", keytype)
     fp_want, sig = _CANARIES.get(keytype or "", _CANARIES["ssh-ed25519"])
     cp = _check_novalidate(sig, _CANARY_PAYLOAD, timeout)
     if isinstance(cp, Verdict) or cp.returncode != 0:
@@ -384,9 +412,9 @@ class SigCache:
         for sha, rec in data["entries"].items():
             if not isinstance(sha, str) or not _OID.match(sha) or not isinstance(rec, dict):
                 continue
-            kind, fp = rec.get("kind"), rec.get("fp")
-            if kind == "signed" and isinstance(fp, str) and _FP.match(fp):
-                good[sha] = {"kind": kind, "fp": fp}
+            kind, fp, pres = rec.get("kind"), rec.get("fp"), rec.get("presence")
+            if kind == "signed" and isinstance(fp, str) and _FP.match(fp) and isinstance(pres, bool):
+                good[sha] = {"kind": kind, "fp": fp, "presence": pres}
             elif kind == "unsigned" and fp is None:
                 good[sha] = {"kind": kind, "fp": None}
         return good
@@ -401,7 +429,7 @@ class SigCache:
         rec = self.entries.get(sha)
         if rec is None:
             return None
-        return Verdict(rec["kind"], rec["fp"], "cached")
+        return Verdict(rec["kind"], rec["fp"], "cached", rec.get("presence"))
 
     def _write(self, new: dict[str, dict]) -> None:
         merged = self._load()
@@ -435,6 +463,8 @@ class SigCache:
             out[sha] = v
             if v.definitive:
                 new[sha] = {"kind": v.kind, "fp": v.fingerprint}
+                if v.kind == "signed":
+                    new[sha]["presence"] = bool(v.presence)
         if new:
             self._write(new)
         return out
@@ -471,7 +501,7 @@ def prove_can_sign(key: str, pubkey_line: str, *, timeout: float = 15.0) -> None
             args += ["-f", os.path.expanduser(key)]
         try:
             cp = subprocess.run([*args, str(msg)], capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL,
-                                env=_ssh_env(**signing_env()))
+                                env=_ssh_env(**signing_env(key)))
         except FileNotFoundError:
             raise SigningError("ssh-keygen is not on PATH") from None
         except subprocess.TimeoutExpired:
@@ -490,6 +520,23 @@ def prove_can_sign(key: str, pubkey_line: str, *, timeout: float = 15.0) -> None
         raise SigningError(f"its test signature is not a good signature by {want} ({_output_tail(check)})")
 
 
-def signing_env() -> dict[str, str]:
-    """Environment additions so signing fails instead of prompting: a passphrase is asked of ``false``, not a tty."""
-    return {"SSH_ASKPASS_REQUIRE": "force", "SSH_ASKPASS": shutil.which("false") or "/usr/bin/false"}
+def signing_env(key: str | None = None) -> dict[str, str]:
+    """Environment additions so signing fails instead of prompting: a passphrase is asked of ``false``, not a tty.
+
+    For a FIDO key, the provider ssh-keygen signs through, by the cockpit signer's rule
+    (:func:`levain.cockpit.keys.ssh_signer`): ``SSH_SK_PROVIDER`` from the environment wins, else the one the key's
+    sidecar names (a Touch ID key made by ``levain cockpit key create`` signs through the Secure Enclave provider).
+    The launch allowlist drops ``SSH_SK_PROVIDER``, so without this a Touch ID key could not sign a ledger commit."""
+    env = {"SSH_ASKPASS_REQUIRE": "force", "SSH_ASKPASS": shutil.which("false") or "/usr/bin/false"}
+    provider = child_env("SSH_SK_PROVIDER").get("SSH_SK_PROVIDER")
+    if provider is None and key and not key.startswith("key::"):
+        from levain.cockpit.custody import read_sidecar
+        from levain.cockpit.keys import KeyError_
+        try:
+            sidecar = read_sidecar(Path(os.path.expanduser(key)))
+        except KeyError_:       # a malformed sidecar is the cockpit's to refuse; here it names no provider
+            sidecar = None
+        provider = sidecar.provider if sidecar is not None else None
+    if provider:
+        env["SSH_SK_PROVIDER"] = provider
+    return env

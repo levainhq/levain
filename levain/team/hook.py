@@ -63,7 +63,7 @@ def decide(team: R.Team, ledger: I.Ledger, handle: str | None, rel: str, session
     seen = denied_before | acked
     pending = [e for e in once if e["id"] not in seen]
     owners = sorted({I.oneline(e["owner"], ident=True) for e in tensions + foreign if e.get("owner")})
-    blocks = "\n\n".join(I.render(e) for e in matched)
+    blocks = "\n\n".join(I.render(e, ledger.presence_note(e)) for e in matched)
     head = (f"{TAG} {rel} is governed by {len(matched)} recorded entr{'y' if len(matched) == 1 else 'ies'} in "
             f"the {I.oneline(team.project)} team ledger.")
     if always or pending:
