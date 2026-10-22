@@ -1864,10 +1864,19 @@ class GitLedger:
         or all of them when the remote has no branch yet) goes through the own-commit refusal, and the id it checked
         is returned for the push, so a ref that moves afterwards cannot send an unchecked commit. The earlier calls
         stop refs moving; this one is the gate no push path can go around (code L3 r7 codex MED: with no remote
-        branch the rebase that runs the refusal was skipped, and a commit that replaced a ledger line published)."""
+        branch the rebase that runs the refusal was skipped, and a commit that replaced a ledger line published).
+        A merge in that list is refused here, on both ranges: the own-commit refusal reads a merge's paths with
+        ``diff-tree``, which lists none for a merge, so a merge whose own tree rewrote a ledger line went out unread
+        (code L3 r8 codex)."""
         tip = git(["rev-parse", "--verify", f"{ref}^{{commit}}"], self.wt).stdout.strip()
-        self._refuse_unsplittable(git(["rev-list", "--reverse", "--topo-order", tip, *([f"^{base}"] if base else [])],
-                                      self.wt).stdout.split())
+        rows = [r.split() for r in git(["rev-list", "--reverse", "--topo-order", "--parents", tip,
+                                        *([f"^{base}"] if base else [])], self.wt).stdout.splitlines() if r.strip()]
+        merge = next((r[0] for r in rows if len(r) > 2), None)
+        if merge:
+            raise TeamError(f"not pushed: the local commit {merge[:10]} is a merge; refusing to push a merge to the "
+                            f"team ledger (it must stay linear); nothing was changed. See it with "
+                            f"`git -C {self.wt} show {merge[:10]}`")
+        self._refuse_unsplittable([r[0] for r in rows])
         return tip
 
     def _strip_team(self, c: str, root: str | None, pending: list[dict]) -> bool:
@@ -2453,8 +2462,9 @@ class GitLedger:
                     ahead = git(["rev-list", "--count", f"{rref}..{local}"], self.wt).stdout.strip()
                     if ahead == "0":
                         return "up to date"
-                    if git(["rev-list", "--merges", f"{rref}..{local}"], self.wt).stdout.strip():
-                        raise TeamError("refusing to push a merge to the team ledger (it must stay linear)")
+                # once before the hold too: it moves the branch, and a commit the push would refuse (a merge, a
+                # replaced ledger line) is refused while nothing has moved
+                self._refuse_outgoing(rref if fetched else None, local)
                 self._hold_unpresent(rref, timeout, lock_timeout)
                 tip = self._refuse_outgoing(rref if fetched else None, local)
                 cp = git(["push", "-q", "--no-verify", remote, f"{tip}:{local}"], self.repo.toplevel,

@@ -513,6 +513,41 @@ def test_a_first_push_refuses_a_local_commit_that_replaces_a_ledger_line(tmp_pat
     assert not git("ls-remote", "--heads", str(tmp_path / "origin.git"), "levain-team-ledger", cwd=tmp_path).strip()
 
 
+def test_a_first_push_refuses_a_merge_whose_tree_replaces_a_ledger_line(tmp_path, capsys) -> None:
+    # reproduced on 52ae0229 (teampres-fix8/repro_before.txt (Q)): with no ledger branch on the remote yet, a merge was
+    # refused only on the fetched path, and the own-commit refusal lists no paths for a merge, so a merge whose own
+    # tree replaced a line was pushed
+    from levain.team import entry as E
+    from levain.team.ledger_api import open_ledger
+    from levain.team.transport import Repo
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "ana@test", "-f", str(tmp_path / "k")],
+                   check=True, capture_output=True)
+    ana = project(tmp_path)
+    assert team("init", "--project", "p", "--owner", "ana", "--member", "ana=ana@ex.com", "--allow-file-keys",
+                "--signing-key", str(tmp_path / "k.pub"), "--no-push", repo=ana) == 0
+    assert team("record", "decision", "--kind", "ruling", "--owner", "ana", "--paths", "a.py", "--words", "first",
+                "--no-push", repo=ana) == 0
+    gl = open_ledger(Repo.discover(ana))
+    git("checkout", "-q", "-b", "side", cwd=gl.wt)
+    (gl.wt / "side.txt").write_text("side\n")
+    git("add", "side.txt", cwd=gl.wt)
+    gl._commit("side")
+    git("checkout", "-q", gl.branch, cwd=gl.wt)
+    git("merge", "-q", "--no-ff", "--no-commit", "side", cwd=gl.wt)
+    f = next((gl.wt / "ledger" / "ana").glob("*.jsonl"))
+    o = E.seal(E.build("ana", "decision", kind="ruling", owner="ana", paths=["a.py"], words="replaced",
+                       agent="human"), "")
+    f.write_text(json.dumps(o, sort_keys=True) + "\n")
+    git("add", "-A", cwd=gl.wt)
+    gl._commit("levain team: decision")
+    m = git("rev-parse", "HEAD", cwd=gl.wt).strip()
+    capsys.readouterr()
+    assert team("sync", repo=ana) != 0
+    out = capsys.readouterr()
+    assert f"the local commit {m[:10]} is a merge" in out.err + out.out
+    assert not git("ls-remote", "--heads", str(tmp_path / "origin.git"), "levain-team-ledger", cwd=tmp_path).strip()
+
+
 def test_a_held_entry_naming_a_refused_one_waits_and_an_independent_one_replays(tmp_path, capsys) -> None:
     # reproduced on 1e63e50d (teampres-fix7/repro_before.txt (D)): a held commit that replaced a line was refused, but it
     # gave no ids to wait on, so a later held ack naming its entry replayed and published a reference to nothing
