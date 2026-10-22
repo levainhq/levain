@@ -1005,7 +1005,13 @@ class Control:
         t = threading.Thread(target=run, daemon=True, name=name)
         with self._mu:
             self._eof_threads.append(t)
-        t.start()
+        try:
+            t.start()
+        except BaseException:
+            with self._mu:
+                if t in self._eof_threads:
+                    self._eof_threads.remove(t)
+            raise
         return t
 
     def _revoke_after_eof(self, session: str, *, lease_eof: bool = True) -> None:
@@ -1043,10 +1049,13 @@ class Control:
                     # The handles are gone already; keys must not keep the token cached while the revoke waits, so
                     # it hears the drop now, on its own thread (the reaper wake never waits on keys). Idempotent: the
                     # drop after the durable REVOKED still runs.
-                    dropped_early = True
                     with self._mu:
                         epoch = self._reg_epoch.get(session)
-                    self._spawn(lambda s, ep=epoch: self._drop(s, ep), session, name=f"control-eofdrop-{session}")
+                    try:
+                        self._spawn(lambda s, ep=epoch: self._drop(s, ep), session, name=f"control-eofdrop-{session}")
+                        dropped_early = True
+                    except RuntimeError as spawn_err:  # no thread to be had: the revoke keeps retrying, and so does this
+                        self.seam_errors.append(("eofdrop", session, spawn_err))
                 self._sleep(delay)
                 delay = min(delay * 2, EOF_RETRY_MAX_S)
         if revoked:

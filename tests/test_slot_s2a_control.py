@@ -780,3 +780,40 @@ def test_lease_eof_drops_at_keys_while_the_revoke_cannot_land(env):
     failing.clear()
     rec = settle(env, S1, "REVOKED")
     assert env.seams.calls[-2:] == [("wake",), ("drop", S1)]           # the durable path's own drop still runs
+
+
+def test_lease_eof_revoke_survives_a_thread_that_cannot_start(env):
+    """Group L3 r2 (codex MED): the early drop's thread failing to start (thread exhaustion) raised out of the durable
+    revoke's retry loop, so the revoke worker died, REVOKED never landed and keys was never told. Now the spawn failure
+    is recorded, the loop keeps retrying (and retries the early drop), and the durable path still revokes and drops."""
+    op, root = to_rendered(env)
+    real_put = env.store.put
+    real_start = threading.Thread.start
+    failing = threading.Event()
+    failing.set()
+
+    def put(rec):
+        if failing.is_set():
+            raise OSError(28, "No space left on device")
+        real_put(rec)
+
+    def start(self):
+        if self.name.startswith("control-eofdrop-"):
+            raise RuntimeError("can't start new thread")
+        return real_start(self)
+
+    env.store.put = put
+    threading.Thread.start = start
+    try:
+        env.seams.calls.clear()
+        op.close()
+        deadline = time.time() + 3
+        while time.time() < deadline and not any(e[0] == "eofdrop" for e in env.control.seam_errors):
+            time.sleep(0.01)
+        assert any(e[0] == "eofdrop" and e[1] == S1 for e in env.control.seam_errors)
+        assert not any(t.name.startswith("control-eofdrop-") for t in env.control._eof_threads)
+        failing.clear()
+        settle(env, S1, "REVOKED")                                     # the revoke worker is still alive
+    finally:
+        threading.Thread.start = real_start
+    assert env.seams.calls[-1] == ("drop", S1)                         # keys hears it on the durable path
