@@ -562,7 +562,7 @@ def probe_enospc(work: Path) -> bool:
 def result_line(progress: Progress, *, refused: str | None, detail: str, enospc: bool) -> bytes:
     """The one result line: canonical JSON, newline-terminated, within :data:`RESULT_CAP`."""
     body = {"v": 1, "terminal": progress.terminal, "enospc": enospc, "refused": refused,
-            "detail": detail[:_DETAIL_MAX], "walk": {"entries": progress.entries, "bytes": progress.bytes},
+            "detail": detail[:_DETAIL_MAX].encode("utf-8", "replace").decode("utf-8"), "walk": {"entries": progress.entries, "bytes": progress.bytes},
             "ignored_git_paths": progress.ignored_git_paths}
     data = canon.canonical_bytes(body) + b"\n"
     if len(data) > RESULT_CAP:
@@ -628,18 +628,30 @@ def run(argv: Sequence[str], *, stdin: BinaryIO, result_fd: int, work: Path,
                                                     cap=a.max_input_size)
     except Fatal as f:
         # The decision point: enospc from what THIS path saw, never from an earlier handled failure.
-        rc, line = 1, result_line(progress, refused=f.name, detail=f.detail,
-                                  enospc=f.own_enospc or probe_enospc(work))
+        rc, refused, detail = 1, f.name, f.detail
+        enospc = f.own_enospc or probe_enospc(work)
     except Exception as e:  # noqa: BLE001 - every failure answers one line
-        rc, line = 1, result_line(progress, refused=None, detail=f"{type(e).__name__}: {e}",
-                                  enospc=probe_enospc(work))
+        rc, refused, detail = 1, None, f"{type(e).__name__}: {e}"
+        enospc = probe_enospc(work)
     else:
-        rc, line = 0, result_line(progress, refused=None, detail="", enospc=False)
-    finally:
-        if spool is not None:
-            spool.close()
-        if log is not None:
-            log.close()
+        rc, refused, detail, enospc = 0, None, "", False
+    # Cleanup can fail too (a buffered log's flush on close, the spool's close): that error folds into the pending
+    # outcome, and the one result line is built and written regardless.
+    for closer in (spool.close if spool is not None else None, log.close if log is not None else None):
+        if closer is None:
+            continue
+        try:
+            closer()
+        except OSError as e:
+            note = f"cleanup close: {errno.errorcode.get(e.errno or 0, e.errno)}"
+            rc = 1
+            detail = f"{detail}; {note}" if detail else note
+            enospc = enospc or e.errno in _ENOSPC_ERRNOS
+    try:
+        line = result_line(progress, refused=refused, detail=detail, enospc=enospc)
+    except Exception:  # noqa: BLE001 - the line is owed on every exit
+        line = result_line(progress, refused=None, detail="", enospc=enospc)
+        rc = 1
     try:
         write_all(result_fd, line)
     except OSError:
@@ -649,8 +661,17 @@ def run(argv: Sequence[str], *, stdin: BinaryIO, result_fd: int, work: Path,
 
 def main() -> int:
     # fd 0 unbuffered: no read-ahead hides bytes from the trailing check's readiness wait.
-    stdin = open(0, "rb", buffering=0, closefd=False)
-    return run(sys.argv[1:], stdin=stdin, result_fd=4, work=Path(os.getcwd()))
+    try:
+        stdin = open(0, "rb", buffering=0, closefd=False)
+        work = Path(os.getcwd())
+    except OSError as e:  # fd 0 closed, or the cwd gone: still one result line
+        try:
+            write_all(4, result_line(Progress(), refused=None, detail=f"startup: {errno.errorcode.get(e.errno or 0, e.errno)}",
+                                     enospc=e.errno in _ENOSPC_ERRNOS))
+        except OSError:
+            pass
+        return 1
+    return run(sys.argv[1:], stdin=stdin, result_fd=4, work=work)
 
 
 if __name__ == "__main__":
