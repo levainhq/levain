@@ -80,9 +80,12 @@ class Scanner:
 
 
 #: FrameScanner.feed's end reasons: a secret matched in a frame's payload (the frame is cut where it began), and a
-#: server frame keys does not relay (masked, a reserved bit set, or a 64-bit length with its top bit set).
+#: server frame keys does not relay (masked, a reserved bit set, a reserved opcode, or a 64-bit length with its top bit
+#: set).
 REDACTED = "redacted"
 BAD_FRAME = "bad-frame"
+#: RFC 6455 §5.2's defined opcodes: continuation, text, binary, close, ping, pong
+_OPCODES = frozenset({0x0, 0x1, 0x2, 0x8, 0x9, 0xA})
 
 
 class FrameScanner:
@@ -117,6 +120,8 @@ an unfinished frame and are never emitted."""
         """The complete header's payload length, or None when the frame is one keys does not relay."""
         b0, b1 = self._head[0], self._head[1]
         if b0 & 0x70 or b1 & 0x80:   # a reserved bit (no extension was negotiated), or a masked server frame
+            return None
+        if b0 & 0x0F not in _OPCODES:   # RFC 6455 §5.2: an unknown opcode MUST fail the connection (ruling W2)
             return None
         n = b1 & 0x7F
         if n == 126:

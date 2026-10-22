@@ -330,6 +330,19 @@ def test_a_frame_keys_does_not_relay_ends_the_stream_before_its_header(frame):
     assert sc.count == 0
 
 
+@pytest.mark.parametrize("opcode", [3, 4, 5, 6, 7, 0xB, 0xC, 0xD, 0xE, 0xF])
+def test_a_reserved_server_opcode_is_a_bad_frame(opcode):
+    """T5 (ruling W2, RFC 6455 §5.2: an unknown opcode MUST fail the connection): the frame's header never goes."""
+    out, end = _fs().feed(_frame(1, b"ok") + _frame(opcode, b"x"))
+    assert (out, end) == (_frame(1, b"ok"), RD.BAD_FRAME)
+
+
+@pytest.mark.parametrize("opcode", [0, 1, 2, 8, 9, 0xA])
+def test_a_defined_server_opcode_passes(opcode):
+    f = _frame(opcode, b"x")
+    assert _fs().feed(f) == (f, None)
+
+
 def test_a_match_counts_in_the_owning_scanner():
     sc = RD.Scanner([S])
     fs = sc.frames()
