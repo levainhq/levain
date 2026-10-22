@@ -46,15 +46,15 @@
     /* radii: 4 steps. 6 chips + verb hover box, 8 controls, 18 cards and overlays, pill for counts and dots */
     --r-sm: 6px; --r-md: 8px; --r-lg: 18px; --r-pill: 999px;
     /* controls: two heights. 24 row verbs (WCAG 2.5.8), 28 everything else */
-    --ctl-row: 24px; --ctl-md: 28px; --hit-min: 44px;   /* --hit-min: the touch hit area (Apple HIG 44pt) */
+    --ctl-row: 24px; --ctl-md: 28px; --seg-h: 32px; --hit-min: 44px;   /* --hit-min: the touch hit area (Apple HIG 44pt) */
     /* motion */
     --dur-micro: 120ms; --dur-expand: 160ms; --ease-out: cubic-bezier(0, 0, 0.38, 0.9);
     /* ONE overlay shadow (modal, popover); controls and the glance take the material tokens below, never a second overlay shadow */
     --shadow-overlay: 0 12px 32px -8px rgb(0 0 0 / .6);
     /* KN finish: the control material. A track is recessed (inner shade), a key is raised (lit top edge + a short cast shadow). */
-    --edge-hi: inset 0 1px 0 rgb(255 255 255 / .07); --recess: inset 0 1px 2px rgb(0 0 0 / .45);
+    --edge-hi: inset 0 1px 0 rgb(255 255 255 / .12); --key-ring: 0 0 0 1px rgb(255 255 255 / .06); --recess: inset 0 1px 2px rgb(0 0 0 / .45);
     --lift: 0 1px 2px rgb(0 0 0 / .45), 0 0 0 1px var(--hair-2);
-    --key-bg: linear-gradient(to bottom, color-mix(in oklch, var(--card-2), var(--contrast) 5%), var(--card-2));
+    --key-bg: linear-gradient(to bottom, color-mix(in oklch, var(--card-2), var(--contrast) 10%), color-mix(in oklch, var(--card-2), var(--contrast) 3%));
     --track-bg: color-mix(in oklch, var(--base), #000 18%);
     /* status: one each, none of them is the accent. A status shows as a dot plus neutral words. */
     --ok: oklch(0.78 0.14 155); --warn: oklch(0.84 0.13 90); --bad: oklch(0.70 0.17 25);
@@ -108,7 +108,7 @@
       --tag-mix: 45%; --glow-a: 0; --sky-star-a: .45; --sky-line-a: .10;
       --shadow-overlay: 0 12px 32px -8px rgb(20 30 60 / .25);
       --edge-hi: inset 0 1px 0 rgb(255 255 255 / .9); --recess: inset 0 1px 2px rgb(20 30 60 / .10);
-      --lift: 0 1px 2px rgb(20 30 60 / .14), 0 0 0 1px var(--hair); --key-bg: var(--base); --track-bg: var(--card-2);
+      --lift: 0 1px 2px rgb(20 30 60 / .14), 0 0 0 1px var(--hair); --key-ring: 0 0 0 0 transparent; --key-bg: var(--base); --track-bg: var(--card-2);
       color-scheme: light;
     }
   }
@@ -134,7 +134,7 @@
     --tag-mix: 45%; --glow-a: 0; --sky-star-a: .45; --sky-line-a: .10;
     --shadow-overlay: 0 12px 32px -8px rgb(20 30 60 / .25);
     --edge-hi: inset 0 1px 0 rgb(255 255 255 / .9); --recess: inset 0 1px 2px rgb(20 30 60 / .10);
-    --lift: 0 1px 2px rgb(20 30 60 / .14), 0 0 0 1px var(--hair); --key-bg: var(--base); --track-bg: var(--card-2);
+    --lift: 0 1px 2px rgb(20 30 60 / .14), 0 0 0 1px var(--hair); --key-ring: 0 0 0 0 transparent; --key-bg: var(--base); --track-bg: var(--card-2);
     color-scheme: light;
   }
 
@@ -1198,11 +1198,14 @@ body.ke .band-meta .wx .wx-t .rd-n, body.ke .band-meta .wx b { color: var(--text
 
 /* THE BAR (F6): brand, the four tabs, the status cluster, Sync / Jump, the theme switch. ONE control row at --ctl-md. */
 body.ke .masthead { padding-block: 0; min-height: 60px; gap: var(--sp-6); flex-wrap: nowrap; align-items: center; }
-body.ke .masthead .seg { height: var(--ctl-md); padding: var(--sp-1); border-radius: var(--r-md); align-items: stretch; flex: none; }
+body.ke .masthead .seg { height: var(--seg-h); box-sizing: border-box; padding: 3px; border-radius: var(--r-md); align-items: stretch; flex: none; }
 body.ke .masthead .mode { display: inline-flex; align-items: center; gap: var(--sp-3); padding: 0 var(--sp-4); font-size: var(--fs-body); font-weight: var(--fw-semibold); border-radius: var(--r-sm); white-space: nowrap; }
 /* the page's switches (tabs, theme, the lens switch) are one material: a recessed track, the chosen key raised and lit */
 body.ke .masthead .seg, body.ke .themesw { background: var(--track-bg); border-color: var(--hair); box-shadow: var(--recess); }
-body.ke .masthead .mode[aria-selected="true"], body.ke .themesw button[aria-pressed="true"] { background: var(--key-bg); color: var(--text); box-shadow: var(--edge-hi), var(--lift); }
+body.ke .masthead .mode[aria-selected="true"], body.ke .themesw button[aria-pressed="true"] { background: var(--key-bg); color: var(--text); box-shadow: var(--edge-hi), var(--key-ring), var(--lift); }
+/* one control height across the bar: the tab track, the theme track and the Sync / Jump keys share --seg-h with the lens switch */
+body.ke .masthead .themesw { height: var(--seg-h); box-sizing: border-box; padding: 3px; align-items: stretch; }
+body.ke .masthead .themesw button { height: auto; }
 body.ke .masthead .mode:not([aria-selected="true"]):hover { color: var(--text); }
 body.ke .masthead .readout { gap: var(--sp-4); flex: 1; justify-content: flex-end; flex-wrap: nowrap; min-width: 0; font-variant-numeric: tabular-nums; }
 body.ke .masthead .unit { gap: 0; flex: 0 1 auto; }
@@ -1213,7 +1216,7 @@ body.ke .masthead .jar svg { width: 16px; height: 20px; flex: none; }
 body.ke .masthead .jar-label { font-size: var(--fs-meta); overflow: hidden; text-overflow: ellipsis; }
 body.ke .masthead .indicators { flex-wrap: nowrap; gap: var(--sp-3); flex: none; display: flex; align-items: center; }
 body.ke .masthead .stamp, body.ke .masthead .livechip { font: var(--fw-regular) var(--fs-meta) var(--sans); font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--label); }
-body.ke .masthead .indicators button { height: var(--ctl-md); padding: 0 var(--sp-4); display: inline-flex; align-items: center; gap: var(--sp-2); border-radius: var(--r-md); font: var(--fw-medium) var(--fs-meta) var(--sans); white-space: nowrap; flex: none; }
+body.ke .masthead .indicators button { height: var(--seg-h); padding: 0 var(--sp-4); display: inline-flex; align-items: center; gap: var(--sp-2); border-radius: var(--r-md); font: var(--fw-medium) var(--fs-meta) var(--sans); white-space: nowrap; flex: none; }
 .themesw { display: flex; flex: none; border: 1px solid var(--hair); border-radius: var(--r-md); padding: var(--sp-1); background: var(--card); gap: var(--sp-1); }
 .themesw button { border: 0; background: none; width: 28px; height: 24px; border-radius: var(--r-sm); color: var(--label); cursor: pointer; display: grid; place-items: center; font-size: var(--fs-body); line-height: 1; padding: 0; }
 .themesw button:hover { color: var(--text); }
@@ -2150,13 +2153,13 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv { container-type: inline-size; padding: 0 var(--sp-6) var(--sp-6); min-width: 0; }
 /* N1 the lens switch: a recessed track holding three keys; the chosen one is a raised, lit key (its top edge catches the light,
    a short shadow sets it on the track). Quiet by design: the accent stays reserved for what waits on the operator. */
-.tv-seg { display: inline-flex; flex: none; align-items: stretch; gap: var(--sp-1); height: 34px; padding: 3px; box-sizing: border-box;
+.tv-seg { display: inline-flex; flex: none; align-items: stretch; gap: var(--sp-1); height: var(--seg-h); padding: 3px; box-sizing: border-box;
   background: var(--track-bg); border: 1px solid var(--hair); border-radius: calc(var(--r-md) + 3px); box-shadow: var(--recess); }
 .tv-seg-b { border: 0; background: none; color: var(--label); padding: 0 var(--sp-5); border-radius: var(--r-md); white-space: nowrap;
   font: var(--fw-semibold) var(--fs-meta)/1 var(--round); letter-spacing: .01em; cursor: pointer;
   transition: color var(--dur-micro) var(--ease-out), background-color var(--dur-micro) var(--ease-out), box-shadow var(--dur-micro) var(--ease-out); }
 .tv-seg-b:hover:not([aria-pressed="true"]) { color: var(--text); background: color-mix(in oklch, var(--card-2) 55%, transparent); }
-.tv-seg-b[aria-pressed="true"] { background: var(--key-bg); color: var(--text); box-shadow: var(--edge-hi), var(--lift); }
+.tv-seg-b[aria-pressed="true"] { background: var(--key-bg); color: var(--text); box-shadow: var(--edge-hi), var(--key-ring), var(--lift); }
 .tv-seg-b:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; }
 @media (prefers-reduced-motion: reduce) { .tv-seg-b { transition: none; } }
 .tv-bar { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--sp-4) var(--sp-6); margin: 0 0 var(--sp-5); }
