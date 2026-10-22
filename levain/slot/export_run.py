@@ -17,6 +17,11 @@ then delete the older tree (now at ``<s>.new``). The exchange is the only commit
 the no-replace call) fails CLOSED as ``<role>-failed:publish`` with detail ``exchange-unsupported``; there is no
 plain-rename fallback. Any OSError before the commit removes ``<s>.new`` and leaves ``<s>`` as it was.
 
+Known edge (L3 r1 F8): on darwin these are plain ``fsync``s, not ``F_FULLFSYNC``, so a power loss can still drop
+writes in the drive's cache. DESIGN r12 S15-3 rules ``F_FULLFSYNC`` NOT required here: a torn tree is caught by the
+pinned digest (``export-changed``) and the adopt is re-run. (The s3b credential writer flushes fully because a lost
+credential has no such re-run.)
+
 Root code: runs under ``/usr/bin/python3 -IS`` (3.9). Seams are injected parameters (:class:`PublishSeams`), never
 env flags. The image, the leaf, the watchdog and the domain proof are piece 5c-ii-b; the wiring into adopt-open is
 5c-ii-c.
@@ -120,6 +125,48 @@ RESULTS = frozenset({"delta", "unrelated", "adopt-nothing-new"})
 #: An importer refusal name root surfaces verbatim as ``importer-failed:<name>`` (5b1 carry 1): printable ASCII, no
 #: space, so a hostile importer cannot put a control byte into the operator's terminal through it.
 _NAME = re.compile(r"[a-z][a-z0-9-]*(?::[\x21-\x7e]{1,512})?")
+#: The line's nesting is two (the line, then ``walk``); deeper is malformed BEFORE any decode (L3 r1 F3: a ~60K-deep
+#: line under :data:`RESULT_CAP` made ``json.loads`` raise ``RecursionError``).
+LINE_MAX_DEPTH = 4
+#: Ruling A1b (L3 r1 F2): the refusal line carries ``<role>-failed:<base>``, the base being the importer's refusal up
+#: to its first ``:``; the whole refusal rides in the answer's detail. ``runtime_grammar.refusal_line`` turns any name
+#: off its charset (``[a-z0-9]+(-[a-z0-9]+)*``, one optional ``:`` part, <= 64 chars) into ``internal``, so a base
+#: that cannot ride is spelled by this ONE table, and one off the table by :data:`WIRE_FALLBACK`.
+WIRE_BASES: Mapping[str, str] = {}
+WIRE_FALLBACK = "refused"
+_WIRE_BASE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*", re.ASCII)
+_WIRE_MAX = 64
+
+
+def wire_reason(role_failed: str, refused: str) -> str:
+    """The grammar-safe reason for an importer (or verifier) refusal ``refused`` (ruling A1b)."""
+    base = refused.split(":", 1)[0]
+    base = WIRE_BASES.get(base, base)
+    if not _WIRE_BASE.fullmatch(base) or len(role_failed) + 1 + len(base) > _WIRE_MAX:
+        return WIRE_FALLBACK
+    return base
+
+
+def _depth_over(raw: bytes, bound: int) -> bool:
+    """True when ``raw``'s JSON nesting (brackets outside strings) passes ``bound``; iterative, no decode."""
+    depth, in_str, esc = 0, False, False
+    for c in raw:
+        if in_str:
+            if esc:
+                esc = False
+            elif c == 0x5C:
+                esc = True
+            elif c == 0x22:
+                in_str = False
+        elif c == 0x22:
+            in_str = True
+        elif c in (0x5B, 0x7B):
+            depth += 1
+            if depth > bound:
+                return True
+        elif c in (0x5D, 0x7D):
+            depth -= 1
+    return False
 
 
 class LineBad(Exception):
@@ -165,11 +212,13 @@ def parse_importer_line(raw: Optional[bytes]) -> Line:
         raise LineBad("result-oversize", f"more than {RESULT_CAP} bytes")
     if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
         raise LineBad("result-malformed", "not one newline-terminated line")
+    if _depth_over(raw, LINE_MAX_DEPTH):
+        raise LineBad("result-malformed", f"nested deeper than {LINE_MAX_DEPTH}")
     try:
         obj = json.loads(raw[:-1].decode("utf-8"), object_pairs_hook=_no_dup, parse_constant=_no_constant)
         if not isinstance(obj, dict) or canon.canonical_bytes(obj) + b"\n" != raw:
             raise ValueError("not canonical JSON")
-    except (ValueError, UnicodeDecodeError, ContractError, TypeError) as e:
+    except (ValueError, UnicodeDecodeError, ContractError, TypeError, RecursionError, MemoryError) as e:
         raise LineBad("result-malformed", f"{type(e).__name__}: {e}"[:200]) from None
     if set(obj) != LINE_KEYS:
         raise LineBad("result-malformed", "the key set")
@@ -222,7 +271,8 @@ def classify(obs: RunObservation, role: Role = IMPORTER,
     unreadable leaf, then ``role.memory``; SUCCESS or not; (2) ``role.space`` on a short host reading; (3)
     ``role.work_cap`` only on a plain non-zero exit with a valid line carrying ``enospc: true``; (4)
     ``role.failed:<reason>``, reason ``signal``/``time`` > ``result-oversize`` > ``result-malformed`` >
-    ``role.missing`` > the importer's own refusal name > ``exit``."""
+    ``role.missing`` > the importer's refusal (its base, :func:`wire_reason`; the whole refusal in the detail, A1b)
+    > ``exit``."""
     if obs.memory_unreadable:
         return Outcome(False, "export-image-unavailable", "the run leaf's memory.events.local could not be read", None)
     if obs.memory_killed:
@@ -255,7 +305,7 @@ def classify(obs: RunObservation, role: Role = IMPORTER,
     elif line is not None and not line.terminal:
         reason, detail = role.missing, line.refused or ""
     elif line is not None and line.refused:
-        reason, detail = line.refused, ""
+        reason, detail = wire_reason(role.failed, line.refused), line.refused     # A1b
     else:
         reason, detail = "exit", f"status {obs.code}"
     return Outcome(False, f"{role.failed}:{reason}", detail, line)
@@ -330,8 +380,13 @@ def probe_exchange(class_dfd: int, role: Role, seams: PublishSeams) -> None:
     whatever the result. A refusal = ``<role>-failed:publish`` / ``exchange-unsupported`` before the import."""
     a, b = PROBE_NAMES
     for n in PROBE_NAMES:
-        if seams.delete(class_dfd, n):
-            seams.log(f"probe residue deleted {n}")
+        try:
+            if seams.delete(class_dfd, n):
+                seams.log(f"probe residue deleted {n}")
+        except (OSError, Refused) as e:          # L3 r1 F6: clear_staging's mapping
+            raise _publish_refusal(role, "stale-staging") from Refused(
+                "stale-staging", f"the probe residue L/export/<class>/{n} could not be deleted ({e}); purge the "
+                f"session, or clear the fault at that path as root")
     try:
         os.mkdir(a, 0o700, dir_fd=class_dfd)
         os.mkdir(b, 0o700, dir_fd=class_dfd)
@@ -348,6 +403,20 @@ def probe_exchange(class_dfd: int, role: Role, seams: PublishSeams) -> None:
                 seams.delete(class_dfd, n)
             except (OSError, Refused):
                 pass
+    # L3 r1 F6: fail closed unless both names are gone (on the success path; a refusal above already stands)
+    left = [n for n in PROBE_NAMES if _lexists_at(class_dfd, n)]
+    if left:
+        raise _publish_refusal(role, "stale-staging") from Refused(
+            "stale-staging", f"the probe left {', '.join(left)} in L/export/<class>/; purge the session, or clear the "
+            f"fault at that path as root")
+
+
+def _lexists_at(dfd: int, name: str) -> bool:
+    try:
+        os.lstat(name, dir_fd=dfd)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 # --- the outputs ------------------------------------------------------------------------------------------------
@@ -384,8 +453,16 @@ def check_outputs(work_dfd: int, names: Sequence[str], absent_ok: Sequence[str],
                     continue
                 if e.errno == errno.ENOENT:
                     raise Refused("export-result-mismatch", f"out/{name} missing") from None
-                if e.errno == errno.ELOOP:
+                # L3 r1 F4: a socket (ENXIO on Linux, EOPNOTSUPP on darwin), a symlink (ELOOP) or any other entry
+                # that would not open is named by lstat; only an entry that IS a regular file re-raises
+                try:
+                    st = os.lstat(name, dir_fd=out)
+                except OSError:
+                    raise e from None
+                if stat.S_ISLNK(st.st_mode):
                     raise shape("symlink", name) from None
+                if not stat.S_ISREG(st.st_mode):
+                    raise shape("type", name) from None
                 raise
             fds[name] = fd
             if name in absent_ok:
@@ -399,7 +476,7 @@ def check_outputs(work_dfd: int, names: Sequence[str], absent_ok: Sequence[str],
                 raise shape("owner", name)
             if st.st_size > caps[name]:
                 raise shape("size", name)
-    except Refused:
+    except BaseException:
         for fd in fds.values():
             os.close(fd)
         fds.clear()
@@ -463,12 +540,14 @@ def transact(class_dfd: int, session: str, sources: Sequence[Tuple[str, int]], r
         new_dfd = os.open(staged, _DIR_OPEN, dir_fd=class_dfd)
         if gid is not None:
             os.fchown(new_dfd, 0, gid)
+        os.fchmod(new_dfd, 0o750)               # L3 r1 F1: never root's umask (sudoers does not pin it)
         for name, src in sources:
             seams.fault(f"copy:{name}")
             dst = os.open(name, _NEW_FILE, 0o640, dir_fd=new_dfd)
             try:
                 if gid is not None:
                     os.fchown(dst, 0, gid)
+                os.fchmod(dst, 0o640)           # L3 r1 F1
                 h = hashlib.sha256()
                 obs = BF.HeaderObserver(bundle_check) if name == "bundle" else None
                 while True:
@@ -490,6 +569,8 @@ def transact(class_dfd: int, session: str, sources: Sequence[Tuple[str, int]], r
         seams.fault("fsync:staged")
         seams.fsync(new_dfd)
         seams.log("fsync staged")
+        fd, new_dfd = new_dfd, -1
+        os.close(fd)                            # L3 r1 F5: closed BEFORE the commit, never after it
         if before_commit is not None:
             before_commit()
         stage = "commit"
@@ -500,12 +581,10 @@ def transact(class_dfd: int, session: str, sources: Sequence[Tuple[str, int]], r
             older = None
         if older is None:
             seams.rename2(class_dfd, staged, class_dfd, session, NOREPLACE)
-            seams.log("noreplace")
         else:
             seams.rename2(class_dfd, staged, class_dfd, session, EXCHANGE)
             exchanged = True
-            seams.log("exchange")
-        stage = "committed"
+        stage = "committed"                     # L3 r1 F5: from here nothing deletes or fails the answer
     except ExchangeUnsupported as e:
         _remove_staged(class_dfd, staged, made, seams)
         raise _publish_refusal(role, "exchange-unsupported") from Refused(
@@ -523,24 +602,35 @@ def transact(class_dfd: int, session: str, sources: Sequence[Tuple[str, int]], r
     finally:
         if new_dfd >= 0:
             os.close(new_dfd)
-    warnings: Tuple[str, ...] = ()
+    # COMMITTED. Every step below is caught whole (Exception, a seam's included): a failure is logged and becomes a
+    # warning at most, never a failed answer and never a delete of the tree that just went live (L3 r1 F5, A2).
+    warnings: list = []
+
+    def after(event: str) -> None:
+        try:
+            seams.log(event)
+        except Exception as e:      # noqa: BLE001
+            warnings.append(f"a step after the commit failed ({event}: {type(e).__name__}); the publish stands")
+
+    after("exchange" if exchanged else "noreplace")
     try:
         seams.fault("fsync:class")
         seams.fsync(class_dfd)
-        seams.log("fsync class")
-    except OSError as e:
+        after("fsync class")
+    except Exception as e:          # noqa: BLE001
         # A2: the rename is the commit point, so ok: true stands; the operator is told it is not yet durable.
-        seams.log(f"fsync class failed {_errname(e)}")
-        warnings = (f"the published export's directory entry could not be synced ({_errname(e)}): a crash may undo "
-                    f"the publish",)
+        what = _errname(e) if isinstance(e, OSError) else type(e).__name__
+        after(f"fsync class failed {what}")
+        warnings.append(f"the published export's directory entry could not be synced ({what}): a crash may undo "
+                        f"the publish")
     if exchanged:
         try:
             seams.fault("delete-older")
             seams.delete(class_dfd, staged)
-            seams.log("delete older")
-        except (OSError, Refused) as e:
-            seams.log(f"delete older failed {e}")
-    return Published(digests, header, exchanged, warnings)
+            after("delete older")
+        except Exception as e:      # noqa: BLE001
+            after(f"delete older failed {e}")
+    return Published(digests, header, exchanged, tuple(warnings))
 
 
 def _remove_staged(class_dfd: int, staged: str, made: bool, seams: PublishSeams) -> None:
@@ -555,18 +645,19 @@ def _remove_staged(class_dfd: int, staged: str, made: bool, seams: PublishSeams)
 
 def publish_if_success(outcome: Outcome, work_dfd: int, class_dfd: int, session: str, *, object_format: str,
                        owner_uid: int, caps: Mapping[str, int], seams: PublishSeams, gid: Optional[int] = None,
-                       before_commit: Optional[Callable[[], None]] = None) -> Tuple[str, Published]:
+                       before_commit: Optional[Callable[[], None]] = None,
+                       role: Role = IMPORTER) -> Tuple[str, Published]:
     """Seal-out's ONE gate into the publish (DESIGN §1 step 11, r10 S13-1): a DENIAL raises its name and touches
     nothing in the class dir; SUCCESS runs the output checks and the transaction. Returns ``(result, published)``,
     ``result`` derived from the copied header (prerequisites = ``delta``, none = ``unrelated``; root never
     evaluates ancestry) or ``adopt-nothing-new``."""
     if not outcome.success or outcome.line is None:
-        raise Refused(outcome.name or f"{IMPORTER.failed}:exit", outcome.detail)
+        raise Refused(outcome.name or f"{role.failed}:exit", outcome.detail)
     nothing_new = outcome.line.result == "adopt-nothing-new"
     names = ("report.json",) if nothing_new else ("bundle", "report.json")
     fds = check_outputs(work_dfd, names, ("bundle",) if nothing_new else (), owner_uid=owner_uid, caps=caps)
     try:
-        pub = transact(class_dfd, session, [(n, fds[n]) for n in names], IMPORTER, seams, gid=gid,
+        pub = transact(class_dfd, session, [(n, fds[n]) for n in names], role, seams, gid=gid,
                        bundle_check=importer_bundle_check(session, object_format), before_commit=before_commit)
     finally:
         for fd in fds.values():
