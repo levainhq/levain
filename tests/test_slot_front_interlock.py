@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -63,7 +64,10 @@ class Interlock:
         return self.inner_revoked(ctx, a)
 
     def watch(self, monkeypatch) -> None:
-        """Record the helper's pool / slot lock primitives (render's path takes none of them)."""
+        """Record the helper's own pool / slot lock primitives (``_open_lock``, ``wait_flock``) used while the front
+        lock is held. What this proves: render opens no pool or slot lock of the helper's while holding front.lock.
+        It does not see a lock taken through any other path; the mutation that opens a slot lock under front.lock
+        (``e1_mutation_slot_lock_under_front.txt``) is the proof the watch can fail."""
         for name in ("_open_lock", "wait_flock"):
             real = getattr(H, name)
 
@@ -82,7 +86,7 @@ def test_render_front_interlock(tmp_path, monkeypatch, mode, whose):
     world = World(tmp_path)
     s = _prepared(world)
     a = world.alloc(s)
-    marked = a if whose == "this" else SimpleNamespace(session="s-00000000000000ff", lease_seq=a.lease_seq - 1)
+    marked = a if whose == "this" else SimpleNamespace(session="s-00000000000000ff", lease_seq=a.lease_seq + 1)
     if mode == "fake":
         rec = Interlock(world, lambda ctx, slot: nullcontext(),
                         lambda ctx, alloc: (alloc.session, alloc.lease_seq) == (marked.session, marked.lease_seq))
@@ -140,8 +144,11 @@ sys.exit(pytest.main([sys.argv[1], "-q", "-p", "no:cacheprovider", "--rootdir", 
 def test_interlock_without_the_reaper_module(tmp_path):
     """Reproduced by a mutation: with the default's import of the reaper's module moved to module load, the
     helper does not import here (``e2_mutation_eager_import.txt``)."""
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT), os.environ.get("PYTHONPATH", "")])}
+    inherited = os.environ.get("PYTHONPATH")
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT)] + ([inherited] if inherited else []))}
     r = subprocess.run([sys.executable, "-c", _ABSENT, __file__, str(ROOT)], cwd=tmp_path, env=env,
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "DEFAULTS-REFUSE" in r.stdout and "2 passed" in r.stdout, r.stdout
+    assert "DEFAULTS-REFUSE" in r.stdout, r.stdout
+    counted = re.search(r"(\d+) passed", r.stdout)
+    assert counted and int(counted.group(1)) >= 2 and "failed" not in r.stdout, r.stdout
