@@ -1309,47 +1309,47 @@ class Front:
 
 async def run_front(front: Front, *, unix: Optional[str] = None, port: Optional[int] = None,
                     keys: Optional[str] = None) -> int:
-    """With `keys`: open the STATUS connection first and bind ONLY after keys' `A` (else return 3, never having
-    bound); then serve until SIGTERM / SIGINT, or keys' `K` / EOF on STATUS, then close every stream and the
-    listener and return 0. The keys socket has ONE source: `keys` here, else the front's own `keys_path`; the front's
-    brokered exchanges use the same path, and two different paths are refused."""
+    """Open the STATUS connection first and bind ONLY after keys' `A` (else return 3, never having bound); then serve
+    until SIGTERM / SIGINT, or keys' `K` / EOF on STATUS, then close every stream and the listener and return 0. The
+    keys socket has ONE source: `keys` here, else the front's own `keys_path`; the front's brokered exchanges use the
+    same path, and two different paths are refused. A front with no keys socket, or a policy with no incarnation, is
+    refused before anything is bound: with no STATUS connection no `K` could ever end it."""
     if keys is None:
         keys = front.keys_path
     elif front.keys_path is not None and front.keys_path != keys:
         raise ValueError(f"run_front(keys={keys!r}) and Front(keys_path={front.keys_path!r}) disagree")
+    if keys is None or front.policy.incarnation is None:
+        raise ValueError("run_front serves only with keys' socket and the session's incarnation (STATUS)")
     front.keys_path = keys
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
-    watch: Optional[asyncio.Future] = None
-    if keys is not None:
+    try:
+        frames, kw = await open_status(keys, front.policy.session, front.policy.incarnation)
+    except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, WireError, ConnectionError) as e:
+        print(f"levain gw-front: keys did not accept the STATUS hello ({type(e).__name__}); not serving",
+              file=sys.stderr)
+        return 3
+    front.live.add(kw)
+
+    async def status_watch() -> None:
         try:
-            frames, kw = await open_status(keys, front.policy.session, front.policy.incarnation or 0)
-        except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, WireError, ConnectionError) as e:
-            print(f"levain gw-front: keys did not accept the STATUS hello ({type(e).__name__}); not serving",
-                  file=sys.stderr)
-            return 3
-        front.live.add(kw)
+            await frames.read(frozenset({b"K"}))   # K, EOF, or anything else: keys is gone for this front
+        except (OSError, asyncio.IncompleteReadError, WireError):
+            pass
+        finally:   # every exit ends the front, an unforeseen raise included; shutdown's own cancel finds it set
+            if not stop.is_set():
+                front._log({"event": "status-end"})
+                stop.set()
 
-        async def status_watch() -> None:
-            try:
-                await frames.read(frozenset({b"K"}))   # K, EOF, or anything else: keys is gone for this front
-            except (OSError, asyncio.IncompleteReadError, WireError):
-                pass
-            finally:   # every exit ends the front, an unforeseen raise included; shutdown's own cancel finds it set
-                if not stop.is_set():
-                    front._log({"event": "status-end"})
-                    stop.set()
-
-        watch = asyncio.ensure_future(status_watch())
+    watch = asyncio.ensure_future(status_watch())
     server = await (front.serve_unix(unix) if unix is not None else front.serve_tcp(port))  # type: ignore[arg-type]
     try:
         await stop.wait()
     finally:
-        if watch is not None:
-            watch.cancel()
-            await asyncio.gather(watch, return_exceptions=True)   # retrieves an unforeseen raise that ended the front
+        watch.cancel()
+        await asyncio.gather(watch, return_exceptions=True)   # retrieves an unforeseen raise that ended the front
         server.close()
         front.close_live()
         try:
@@ -1371,10 +1371,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--slot-uid", type=int, help="the only peer uid the unix shape serves")
     ap.add_argument("--policy", required=True, help="the front's policy file (R/gw/slot<n>/session.json)")
     ap.add_argument("--log", help="JSON-lines tunnel log (default: stderr)")
-    ap.add_argument("--go-fd", type=int, help="render's GO pipe: serve only after one byte arrives on it; EOF = exit "
-                                              "without serving (CONTRACT §5.1 render (4)-(5b))")
-    ap.add_argument("--keys", help="keys' R/keys/front.sock: the STATUS connection is opened after GO and the "
-                                   "listener bound only after keys' A; brokered exchanges go there")
+    # Both are required: a front with no STATUS connection could never be revoked (no `K` reaches it), and one with
+    # no GO pipe would serve before render's interlock. The standalone shape is in-process construction only.
+    ap.add_argument("--go-fd", type=int, required=True,
+                    help="render's GO pipe: serve only after one byte arrives on it; EOF = exit without serving "
+                         "(CONTRACT §5.1 render (4)-(5b))")
+    ap.add_argument("--keys", required=True,
+                    help="keys' R/keys/front.sock: the STATUS connection is opened after GO and the listener bound "
+                         "only after keys' A; brokered exchanges go there")
     a = ap.parse_args(argv)
     # every argument is checked before the GO fd is read: a bad one exits at once instead of after render's byte
     if a.unix is not None and a.slot_uid is None:
@@ -1394,24 +1398,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     except (OSError, PolicyError) as e:
         print(f"levain gw-front: policy refused: {e}", file=sys.stderr)
         return 2
-    if a.keys is not None and policy.incarnation is None:
+    if policy.incarnation is None:
         print("levain gw-front: policy refused: --keys needs the session's incarnation", file=sys.stderr)
         return 2
-    if a.go_fd is not None:
-        # The policy is read first: render is to write it before it starts the front (CONTRACT §4.3). Nothing is
-        # bound until GO.
+    # The policy is read first: render is to write it before it starts the front (CONTRACT §4.3). Nothing is bound
+    # until GO.
+    try:
+        go = os.read(a.go_fd, 1)
+    except OSError as e:
+        print(f"levain gw-front: GO pipe unreadable ({e})", file=sys.stderr)
+        return 3
+    finally:
         try:
-            go = os.read(a.go_fd, 1)
-        except OSError as e:
-            print(f"levain gw-front: GO pipe unreadable ({e})", file=sys.stderr)
-            return 3
-        finally:
-            try:
-                os.close(a.go_fd)
-            except OSError:
-                pass
-        if not go:
-            return 3   # EOF before GO: render refused or died, so this front never serves
+            os.close(a.go_fd)
+        except OSError:
+            pass
+    if not go:
+        return 3   # EOF before GO: render refused or died, so this front never serves
     front = Front(policy, log_path=a.log, slot_uid=a.slot_uid, keys_path=a.keys)
     return asyncio.run(run_front(front, unix=a.unix, port=a.port, keys=a.keys))
 

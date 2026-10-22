@@ -1005,17 +1005,27 @@ class Control:
         t = threading.Thread(target=run, daemon=True, name=name)
         with self._mu:
             self._eof_threads.append(t)
-        t.start()
+        try:
+            t.start()
+        except BaseException:
+            with self._mu:
+                if t in self._eof_threads:
+                    self._eof_threads.remove(t)
+            raise
         return t
 
     def _revoke_after_eof(self, session: str, *, lease_eof: bool = True) -> None:
         """``lease_live:false`` first (its own generation), then live state -> REVOKED, retrying the lock
         with backoff until it is taken: never dropped on ``locked``. A failed write (``OSError``) is retried
         the same way, and so is any other refusal (recorded once in :attr:`seam_errors`): a revoke owed is
-        never given up. Then the keys drop and the reaper wake. ``lease_eof=False`` (keys' admin EOF, §4.5): the
+        never given up. Then the keys drop and the reaper wake. A lease EOF whose first attempt fails also sends the
+        keys drop at once, so keys' token cache follows the handles already dropped. ``lease_eof=False`` (keys' admin
+        EOF, §4.5): the
         lease is not what ended, so the REVOKED write keeps ``lease_live`` as the ``REVOKE`` verb does."""
         delay = EOF_RETRY_FIRST_S
         noted = False
+        dropped_early = False
+        spawn_noted = False
         while True:
             try:
                 revoked = False
@@ -1036,6 +1046,19 @@ class Control:
                     noted = True
                 if self._stopping.is_set():
                     return
+                if lease_eof and not dropped_early:
+                    # The handles are gone already; keys must not keep the token cached while the revoke waits, so
+                    # it hears the drop now, on its own thread (the reaper wake never waits on keys). Idempotent: the
+                    # drop after the durable REVOKED still runs.
+                    with self._mu:
+                        epoch = self._reg_epoch.get(session)
+                    try:
+                        self._spawn(lambda s, ep=epoch: self._drop(s, ep), session, name=f"control-eofdrop-{session}")
+                        dropped_early = True
+                    except RuntimeError as spawn_err:  # no thread to be had: the revoke keeps retrying, and so does this
+                        if not spawn_noted:
+                            self.seam_errors.append(("eofdrop", session, spawn_err))
+                            spawn_noted = True
                 self._sleep(delay)
                 delay = min(delay * 2, EOF_RETRY_MAX_S)
         if revoked:
