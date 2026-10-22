@@ -14,7 +14,8 @@ The path to a vendor: `pick_address` resolves the route's host ONCE and passes e
 `refused_address` (all or nothing); `_connect` opens plain TCP to that address literal; `_handshake` runs TLS on that
 connection with `loop.start_tls` (the one construction the root interpreter supports: 3.9 has no
 `StreamWriter.start_tls`), the route's host as SNI and for the hostname check. The response is read with an h11
-client: `read_head` consumes every informational response but 101 (bounded), `read_body` yields the body.
+client: `read_head` consumes every informational response but 101 (bounded), `read_body` yields the body; after an
+accepted websocket upgrade keys reads the raw bytes with `Upstream.read`.
 
 Ownership: whoever holds an `Upstream`, or a transport no `Upstream` holds yet, releases it in a `finally` (or, where
 ownership passes on success, an `except BaseException`) with `abort()`, which is idempotent, best-effort and never
@@ -333,17 +334,22 @@ async def _next_event(up: Upstream, conn: "h11.Connection", wait: Optional[float
             raise BadResponse("protocol") from None
 
 
-async def read_head(up: Upstream, conn: "h11.Connection", deadline: Optional[float]) -> "h11.Response":
+async def read_head(up: Upstream, conn: "h11.Connection", deadline: Optional[float], *,
+                    upgrade: bool = False) -> Any:
     """The FINAL response head, by the absolute `deadline` (loop time) fixed when the request's last byte was sent: an
     informational response never extends it. None: no deadline here, the caller bounds the wait (keys reads the head
     while the body is still going up, and fixes the deadline when its last byte is sent). Every 1xx but 101 is
-    consumed; more than MAX_INFORMATIONAL of them, or a 101 (keys asks for no upgrade at this tip), is BadResponse."""
+    consumed; more than MAX_INFORMATIONAL of them is BadResponse. A 101 is the head returned (an
+    `h11.InformationalResponse`; h11 then holds the bytes after it in `trailing_data`) when `upgrade` (the request
+    asked for a websocket, design 1.6), and BadResponse ("unsolicited-upgrade") when not."""
     loop = asyncio.get_running_loop()
     seen = 0
     while True:
         ev = await _next_event(up, conn, None if deadline is None else max(0.0, deadline - loop.time()))
         if isinstance(ev, h11.InformationalResponse):
             if ev.status_code == 101:
+                if upgrade:
+                    return ev
                 raise BadResponse("unsolicited-upgrade")
             seen += 1
             if seen > MAX_INFORMATIONAL:
