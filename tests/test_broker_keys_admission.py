@@ -1,5 +1,6 @@
 """keys' process entry and its one shutdown trigger (S1 session 3b-3a). The admission pools, the fencing and the `F`
-path are proven by the session's fixture run against the real front process; these two pin the trigger's edges."""
+path are proven by the session's fixture run against the real front process; these pin the trigger's edges and an
+exchange's custody of its `Upstream`."""
 from __future__ import annotations
 
 import asyncio
@@ -136,3 +137,64 @@ def test_admin_calls_after_the_latch_change_nothing():
     reg, arm, drop, uids, state = asyncio.run(run())
     assert (reg, arm, drop) == (None, None, None)
     assert uids == [70000] and state == "registered"
+
+
+class _T:
+    def __init__(self) -> None:
+        self.aborts = self.closes = 0
+
+    def abort(self) -> None:
+        self.aborts += 1
+
+    def close(self) -> None:
+        self.closes += 1
+
+    def write(self, data: bytes) -> None:
+        pass
+
+
+class _W:
+    def __init__(self) -> None:
+        self.transport = _T()
+
+
+def test_a_real_conn_holds_its_exchange_upstream(monkeypatch):
+    # reproduced (L3 r1 codex HIGH 1): `open_exchange` stored the Upstream on a keys.Conn, whose __slots__ had no
+    # `upstream`, so every exchange aborted its new connection with AttributeError
+    from levain.broker import upstream as U
+    tls, plain = _W(), _W()
+
+    async def handshake(addr: str, port: int, host: str) -> tuple:
+        return None, tls, plain
+
+    monkeypatch.setattr(U, "_handshake", handshake)
+
+    async def run() -> tuple:
+        conn = K.Conn(_W(), K.Registration("s1", 70000, 123, 456, 1, 1), "exchange")
+        up = await U.open_exchange("192.0.2.1", 443, "api.example.com", conn)
+        return conn.upstream is up, tls.transport.aborts
+
+    assert asyncio.run(run()) == (True, 0)
+
+
+def test_detach_aborts_the_exchange_upstream():
+    # reproduced (L3 r1 codex HIGH 2): DROP-SESSION detached an exchange and closed its front side but never aborted
+    # its Upstream, so credential-bearing bytes buffered there could still flush
+    from levain.broker.upstream import Upstream
+
+    async def run() -> tuple:
+        k = K.Keys(single_uid=os.getuid())
+        k._in_loop()
+        await k.front_register(0, "s1", 70000, 123, 456, 1, 1)
+        reg = k.regs[70000]
+        front, tls, plain = _W(), _W(), _W()
+        conn = K.Conn(front, reg, "exchange")
+        conn.task = None   # the conn captured this test's own task, which the detach must not cancel
+        reg.exchanges.add(conn)
+        conn.upstream = Upstream(None, tls, conn, _keepalive=plain)
+        await k.drop_session(0, "s1")
+        return conn.detached, front.transport.closes, tls.transport.aborts, plain.transport.aborts
+
+    detached, closes, tls_aborts, plain_aborts = asyncio.run(run())
+    assert detached and closes == 1
+    assert tls_aborts == 1 and plain_aborts == 1

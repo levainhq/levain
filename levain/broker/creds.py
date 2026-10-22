@@ -1,8 +1,10 @@
 """keys' credentials (S1 session 3b, design 1.8): the credential file, its per-exchange observation, the host binding,
 the injected header, and the credential-lifecycle seam keys' shutdown calls.
 
-A credential file `L/keys/cred/<name>.json` is OBSERVED on every exchange that needs it: opened `O_NOFOLLOW` under the
-credential directory's fd, read to at most FILE_CAP, its `rev` extracted and validated. The cached parse is used when
+A credential file `L/keys/cred/<name>.json` is OBSERVED on every exchange that needs it: opened `O_NOFOLLOW |
+O_NONBLOCK` under the credential directory's fd, refused unless it is a regular file, read to at most FILE_CAP, its
+`rev` extracted and validated. Bytes that do not parse, whatever the decode or a check raises on them, refuse the
+exchange `credential-unavailable` and evict the cached parse. The cached parse is used when
 its `rev` equals the file's, else the file is parsed and the cache replaced; ENOENT evicts at once, so a removed
 credential stops working on the next exchange. `rev` is compared for equality only, never ordered.
 
@@ -16,6 +18,7 @@ import json
 import logging
 import os
 import re
+import stat
 from typing import Dict, List, Optional, Protocol, Set
 
 from levain.broker.norm import Refused
@@ -25,9 +28,9 @@ FORMAT = "levain-keys-credential/1"
 FILE_CAP = 64 * 1024
 VALUE_CAP = 8 * 1024
 MAX_HOSTS = 8
-NAME_RE = re.compile(r"^[a-z0-9-]{1,48}$")
-REV_RE = re.compile(r"^[0-9a-f]{32}$")
-_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+NAME_RE = re.compile(r"[a-z0-9-]{1,48}")   # every use is a fullmatch: a `$` would admit a trailing newline
+REV_RE = re.compile(r"[0-9a-f]{32}")
+_LABEL_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 INJECT_HEADERS = ("x-api-key", "authorization")
 INJECT_SCHEMES = ("", "Bearer")
 _COMMON = {"format", "name", "rev", "hosts", "inject", "kind"}
@@ -77,7 +80,7 @@ def is_a_label(host: object) -> bool:
     """A lowercase IDNA A-label host name (ASCII letters, digits and hyphens, dot-separated)."""
     if not isinstance(host, str) or not host or len(host) > 253 or host != host.lower():
         return False
-    return all(_LABEL_RE.match(lab) for lab in host.split("."))
+    return all(_LABEL_RE.fullmatch(lab) for lab in host.split("."))
 
 
 class Credential:
@@ -111,8 +114,23 @@ def _value(v: object, what: str) -> str:
     return v
 
 
+#: what a file's bytes can raise out of the decode and the checks besides `Unparseable`: nesting past the recursion
+#: limit, a value of the wrong type meeting an operation (an unhashable `kind`), a lone surrogate meeting an encode.
+_INPUT_ERRORS = (ValueError, RecursionError, TypeError, UnicodeError)
+
+
 def parse(raw: bytes, expect_name: str) -> Credential:
-    """Validate one credential file's bytes; raise `Unparseable` naming the field (never echoing a value)."""
+    """Validate one credential file's bytes; raise `Unparseable` naming the field (never echoing a value). This is the
+    parse boundary: anything the bytes can make the decode or a check raise leaves as `Unparseable`."""
+    try:
+        return _parse(raw, expect_name)
+    except Unparseable:
+        raise
+    except _INPUT_ERRORS as e:
+        raise Unparseable(type(e).__name__) from None
+
+
+def _parse(raw: bytes, expect_name: str) -> Credential:
     try:
         d = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_dup)
     except (UnicodeDecodeError, ValueError) as e:
@@ -120,13 +138,13 @@ def parse(raw: bytes, expect_name: str) -> Credential:
     if not isinstance(d, dict) or d.get("format") != FORMAT:
         raise Unparseable("format")
     kind = d.get("kind")
-    if kind not in _KEYS:
+    if not isinstance(kind, str) or kind not in _KEYS:
         raise Unparseable("kind")
     if set(d) != _KEYS[kind]:
         raise Unparseable("keys")
-    if d["name"] != expect_name or not isinstance(d["name"], str) or not NAME_RE.match(d["name"]):
+    if d["name"] != expect_name or not isinstance(d["name"], str) or not NAME_RE.fullmatch(d["name"]):
         raise Unparseable("name")
-    if not isinstance(d["rev"], str) or not REV_RE.match(d["rev"]):
+    if not isinstance(d["rev"], str) or not REV_RE.fullmatch(d["rev"]):
         raise Unparseable("rev")
     hosts = d["hosts"]
     if (not isinstance(hosts, list) or not 1 <= len(hosts) <= MAX_HOSTS or not all(is_a_label(h) for h in hosts)
@@ -171,10 +189,10 @@ def _rev_of(raw: bytes) -> Optional[str]:
     """The file's `rev`, read with the full parse's JSON decoder (cheap at this size); None if absent or invalid."""
     try:
         d = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_dup)
-    except (UnicodeDecodeError, ValueError):
+    except _INPUT_ERRORS:
         return None
     rev = d.get("rev") if isinstance(d, dict) else None
-    return rev if isinstance(rev, str) and REV_RE.match(rev) else None
+    return rev if isinstance(rev, str) and REV_RE.fullmatch(rev) else None
 
 
 class CredStore:
@@ -185,13 +203,18 @@ class CredStore:
         self.cache: Dict[str, Credential] = {}
 
     def _read(self, name: str) -> Optional[bytes]:
+        # O_NONBLOCK: opening a FIFO with no writer would otherwise block keys' one loop; the fstat then refuses
+        # anything but a regular file before a byte is read (O_NONBLOCK changes nothing for a regular file's read).
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
         try:
-            fd = os.open(name + ".json", os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=self.dir_fd)
+            fd = os.open(name + ".json", flags, dir_fd=self.dir_fd)
         except OSError as e:
             if e.errno == errno.ENOENT:
                 return None
             raise
         try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise Unparseable("not a regular file")
             chunks, got = [], 0
             while got <= FILE_CAP:
                 b = os.read(fd, FILE_CAP + 1 - got)
@@ -208,7 +231,7 @@ class CredStore:
 
     def observe(self, name: str) -> Credential:
         """The credential `name` as the file holds it NOW, or `Refused("credential-unavailable")`."""
-        if not NAME_RE.match(name):
+        if not isinstance(name, str) or not NAME_RE.fullmatch(name):
             raise Refused("credential-unavailable")
         try:
             raw = self._read(name)

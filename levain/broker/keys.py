@@ -37,13 +37,13 @@ import signal
 import socket
 import stat
 import sys
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from levain.broker import gwwire
 from levain.broker.creds import CredLifecycle, FakeCredLifecycle
 from levain.broker.gwwire import FrameReader, KeysSide, WireError
 from levain.broker.peer import PeerUnknown, peer_of
-from levain.broker.upstream import _note
+from levain.broker.upstream import Upstream, _note
 
 # --- the admission values (DECISION, judged against the 8-slot default; one constant each) ------------------------
 FIRST_FRAME_S = 5.0
@@ -124,14 +124,22 @@ class Registration:
 
 
 class Conn:
-    """One accepted connection attributed to a registration."""
+    """One accepted connection attributed to a registration. A connection past `Q` IS the exchange (design 1.2's
+    `exchange`, 1.5's member of a registration's exchange set): `reg` is the sketch's `exchange.registration`, and
+    `upstream` holds the exchange's `Upstream` from `open_exchange`'s store until the release drops it, so a phase 1
+    always finds what it must abort."""
 
-    __slots__ = ("writer", "reg", "kind", "task", "detached")
+    __slots__ = ("writer", "reg", "kind", "task", "detached", "upstream")
 
     def __init__(self, writer: asyncio.StreamWriter, reg: Registration, kind: str) -> None:
         self.writer, self.reg, self.kind = writer, reg, kind   # kind: candidate | status | pending | exchange
         self.task: Optional[asyncio.Task] = asyncio.current_task()
         self.detached = False
+        self.upstream: Optional[Upstream] = None
+
+
+#: one entry of a phase 1's detached-objects list: a connection to close, or a detached exchange's `Upstream` to abort
+Victim = Union[Conn, Upstream]
 
 
 # --- the listeners --------------------------------------------------------------------------------------------------
@@ -330,7 +338,7 @@ class Keys:
     async def front_register(self, epoch: int, session: str, front_uid: int, pid: int, start: int, incarnation: int,
                              reg_token: int) -> Optional[dict]:
         assert self.state_lock is not None
-        victims: List[Conn] = []
+        victims: List[Victim] = []
         async with self.state_lock:
             if epoch != self.admin_epoch or self.closing:
                 return None
@@ -367,7 +375,7 @@ class Keys:
 
     async def drop_session(self, epoch: int, session: str) -> Optional[dict]:
         assert self.state_lock is not None
-        victims: List[Conn] = []
+        victims: List[Victim] = []
         async with self.state_lock:
             if epoch != self.admin_epoch or self.closing:
                 return None
@@ -379,9 +387,11 @@ class Keys:
 
     # -- transitions --
 
-    def _detach(self, reg: Registration) -> List[Conn]:
+    def _detach(self, reg: Registration) -> List[Victim]:
         """Phase 1 (caller holds state_lock; no await): take `reg` out of every table and return every connection
-        attributed to it, each marked detached; an exchange's task is cancelled (delivery only, never the guarantee)."""
+        attributed to it, each marked detached, preceded by the `Upstream` OBJECT of each detached exchange that holds
+        one (phase 2 aborts it: an abort drops the transport's buffer, where a close would flush credential-bearing
+        bytes); an exchange's task is cancelled (delivery only, never the guarantee)."""
         if self.regs.get(reg.front_uid) is reg:
             del self.regs[reg.front_uid]
         if self.by_session.get(reg.session) is reg:
@@ -391,19 +401,26 @@ class Keys:
         reg.status = None
         reg.pending.clear()
         reg.exchanges.clear()
+        ups: List[Victim] = []
         for c in victims:
             c.detached = True
+            if c.upstream is not None:
+                ups.append(c.upstream)
             if c.kind == "exchange" and c.task is not None:
                 c.task.cancel()
-        return victims
+        return ups + victims
 
-    def _effects(self, victims: List[Conn]) -> None:
-        """Phase 2: run right after phase 1 released the lock, synchronously. Each victim in its own try: `K` on a
-        claimed STATUS connection, close, abort ABORT_AFTER_S later; any failure aborts that one and goes on."""
+    def _effects(self, victims: List[Victim]) -> None:
+        """Phase 2: run right after phase 1 released the lock, synchronously. An `Upstream` is aborted (never closed;
+        its abort never raises). Each connection in its own try: `K` if it is a claimed STATUS connection, then close,
+        then abort ABORT_AFTER_S later; any failure aborts that one and goes on."""
         if not victims:
             return
         loop = asyncio.get_running_loop()
         for c in victims:
+            if isinstance(c, Upstream):
+                c.abort()   # never raises an Exception, and notes its own failures
+                continue
             t = c.writer.transport
             try:
                 if c.kind == "status":
