@@ -94,7 +94,7 @@ def test_the_work_lens_draws_the_providers_own_nulls_as_not_tracked(tmp_path, mo
     # K10 S5 item 2 (67d28166): both live sessions have a readable tool log and no path is shared, so the provider OBSERVED no conflict and
     # says 0; "not tracked" is the null it sends only when live nodes exist and none has a log (test_conflicts_are_null_when_no_live_node_has_a_log)
     assert strip["conflicts"] == "0 conflicts" and strip["tokens"] == "0 tokens today", got   # the fixture transcripts spent nothing today: a real zero
-    assert list(strip) == ["tasks", "waiting", "stuck", "open", "done", "conflicts", "tokens"] and strip["tasks"].endswith(" tasks") and strip["open"] == "2 open", got
+    assert list(strip) == ["tasks", "waiting", "tasks-waiting", "stuck", "open", "done", "conflicts", "tokens"] and strip["tasks"].endswith(" tasks") and strip["open"] == "2 open", got
 
 
 @needs_browser
@@ -239,8 +239,8 @@ def test_the_header_strip_counts_and_a_conflict_lists_its_file_and_both_sessions
              "conf: (%s.querySelector('.tv-conf') || {innerText: ''}).textContent})") % (TV, TV)
     out = _run(tmp_path, src, [{"eval": _paint(_value())}, {"eval": probe}])
     got = json.loads(out[-1])["strip"]
-    assert got == {"tasks": "6 tasks", "waiting": "2 waiting on you", "failed": "1 failed", "stuck": "1 stuck", "done": "1 done",
-                   "conflicts": "1 file conflict", "tokens": "2.4M tokens today"}, got                  # the tasks lead, as drawn
+    assert got == {"tasks": "6 tasks", "waiting": "1 waiting on you", "tasks-waiting": "2 tasks waiting", "failed": "1 failed", "stuck": "1 stuck", "done": "1 done",
+                   "conflicts": "1 file conflict", "tokens": "2.4M tokens today"}, got                  # the tasks lead; "waiting on you" is the sessions, as the Agents lens counts it
     metrics = "JSON.stringify([...%s.querySelectorAll('.tv-metrics .tv-m')].map(m => m.dataset.k + '=' + m.firstChild.textContent))" % TV
     out = _run(tmp_path, src, [{"eval": _paint(_value(), "agents")}, {"eval": probe}, {"eval": metrics}])
     figs = json.loads(out[-1])

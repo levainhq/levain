@@ -547,7 +547,9 @@
     // seat's label plate (half-width + the ring's 17 + 6 of air), so the gap grows with the widest label and the step is capped per seat.
     const lwOf = (g) => Math.max(measure(g.label, "group") + 16, measure("00 agents \u00b7 00 running", "l2")) / 2 + 7;
     // (never past what lets the widest face still end inside the graph beside the nearest column; 120 is the floor)
-    const COL_GAP = Math.max(120, Math.min(Math.ceil(Math.max(0, ...live.map(lwOf))) + 23 + 30, Math.floor(hubX - 76 - Math.max(0, ...Array.from(tws.values())) - 36)));
+    // and never past what keeps a seat of more than ROW_CAP lanes in two ranks: that fold is worth more than a wider gap
+    const twoRankRoom = live.filter((g) => mineOf(g).length > ROW_CAP).map((g) => Math.floor(hubX - 76 - (faceWOf(g, 0) + faceWOf(g, 1)) - RANK_GAP - EDGE_PAD));
+    const COL_GAP = Math.max(120, Math.min(Math.ceil(Math.max(0, ...live.map(lwOf))) + 23 + 30, Math.floor(hubX - 76 - Math.max(0, ...Array.from(tws.values())) - 36), ...twoRankRoom));
     const gxFull = Math.max(76, Math.min(190, LW / 2 - 262 - COL_GAP));
     const tall = live.filter((g) => mineOf(g).length > ROW_CAP);
     let gx0 = gxFull;
@@ -876,17 +878,18 @@
       eg.appendChild(p);
     }
     svg.appendChild(eg);
-    // file conflicts: the file on the arc
+    // file conflicts: the arc runs under the plates, but its chip (the file's name) is drawn after the nodes, so a plate never hides it
+    const chips = [];
     for (const a of conflictArcs(v, L, measure, bxs)) {
-      const g = sv("g", { "data-conflict": a.path, "data-nodes": a.ids.join(",") }, "tv-gconf");
-      g.appendChild(sv("path", { d: "M" + num(a.A.x) + " " + num(a.A.y) + " Q" + num(a.cx) + " " + num(a.cy) + " " + num(a.B.x) + " " + num(a.B.y) }, "tv-confline"));
+      svg.appendChild(sv("path", { d: "M" + num(a.A.x) + " " + num(a.A.y) + " Q" + num(a.cx) + " " + num(a.cy) + " " + num(a.B.x) + " " + num(a.B.y), "data-conflict": a.path }, "tv-confline"));
       if (a.chip) {
+        const g = sv("g", { "data-conflict": a.path, "data-nodes": a.ids.join(",") }, "tv-gconf");
         const label = chipText(a.path, measure), w = measure(label, "chip") + 16;
         g.appendChild(sv("rect", { x: num(a.lx - w / 2), y: num(a.ly - 10), width: num(w), height: 20, rx: 6 }, "tv-confchip"));
         g.appendChild(sv("text", { x: num(a.lx), y: num(a.ly + 4), "text-anchor": "middle" }, "tv-conftext", label));
         if (label !== a.path) g.appendChild(sv("title", null, null, a.path));
+        chips.push(g);
       }
-      svg.appendChild(g);
     }
     // the hub: the install, "N sessions · M running"
     const running = nodes.filter((n) => n.state === "running").length, h = L.hub;
@@ -961,6 +964,7 @@
       }
       svg.appendChild(g);
     }
+    for (const g of chips) svg.appendChild(g);
     return { svg, tickers };
   }
 

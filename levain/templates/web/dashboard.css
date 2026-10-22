@@ -1781,7 +1781,7 @@ body.ke .ck-widgets > .ck-card.w[data-signal="on"]:hover { background: linear-gr
   body.ke .ck-widgets:not([data-shape="tiles"]) > .ck-card.w:only-child { border-radius: calc(var(--r-lg) - 1px); }
 }
 body.ke .ck-widgets[data-shape="tiles"] { display: grid; grid-template-columns: repeat(var(--ck-n, 4), minmax(0, 1fr)); gap: var(--gap); background: none; border: 0; border-radius: 0; overflow: visible; }
-body.ke .ck-widgets[data-shape="tiles"] > .ck-card.w { flex-direction: column; align-items: stretch; gap: var(--sp-2); padding: var(--sp-5) var(--sp-6); border: 1px solid var(--hair); border-radius: var(--r-lg); }
+body.ke .ck-widgets[data-shape="tiles"] > .ck-card.w { flex-direction: column; justify-content: center; align-items: stretch; gap: var(--sp-2); padding: var(--sp-5) var(--sp-6); border: 1px solid var(--hair); border-radius: var(--r-lg); }
 body.ke .ck-widgets[data-shape="tiles"] .wbody, body.ke .ck-widgets[data-shape="tiles"] .w .xbody, body.ke .ck-widgets[data-shape="tiles"] .w .dots { flex-direction: column; align-items: stretch; gap: var(--sp-2); }
 body.ke .ck-widgets[data-shape="tiles"] .w .big { font-size: var(--fs-figure); }
 body.ke .ck-widgets[data-shape="tiles"] .w .sub { white-space: normal; }
