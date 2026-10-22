@@ -20,9 +20,12 @@ Three layers, each testable on its own:
 
 Session 2 builds the operator verbs (``LEASE-OPEN``, ``STATUS``) and root's (``ATTACH``, ``CAS``,
 ``MINT``, ``FRONT-ARM``, ``SECRETS``, ``REVOKE``, ``REVOKED-SET``); session 3 the queue broker's
-``QUEUE-RESOLVE`` (§3.3, §26 S1-c). Root's ``SLOT-SYNC`` and every dispatch / keys verb (§3.3, §3.5, §3.6)
-are session 3c's: until then every other peer is refused ``verb-not-allowed-for-peer`` (see :data:`PEER_VERBS`). Every act on keys (``DROP-SESSION``,
-``FRONT-REGISTER``, ``FRONT-ARM`` on §4.9's wire) and the reaper wake are injected seams.
+``QUEUE-RESOLVE`` (§3.3, §26 S1-c); S1 session 3b the keys peer's ``TOKEN-RESOLVE`` and CONTROL's side of keys'
+admin wire (:class:`KeysAdmin`, §4.9: ``FRONT-REGISTER`` fenced by the per-``front_uid`` registration counter in
+``L/sessions/front-reg/``, ``FRONT-ARM``, ``DROP-SESSION``). Root's ``SLOT-SYNC`` and keys' ``KEYS-ATTACH`` /
+``LINEAGE-APPEND`` and every dispatch verb (§3.3, §3.5, §3.6) are session 3c's: until then every other peer, and
+every other verb of a known one, is refused ``verb-not-allowed-for-peer`` (see :data:`PEER_VERBS`). Every act on
+keys and the reaper wake are seams: :class:`KeysAdmin` supplies the keys ones when CONTROL is given one.
 """
 from __future__ import annotations
 
@@ -57,13 +60,14 @@ _LEN = struct.Struct(">I")
 
 ROOT_UID = 0
 
-#: §3.3's verbs per peer, as built so far. Session 3c adds root's ``SLOT-SYNC`` and the ``_levain_keys`` /
-#: ``_levain_dispatch`` rows (each a peer kind that :meth:`Control.peer_kind` learns from its uid); until then
-#: those peers are ``foreign``.
+#: §3.3's verbs per peer, as built so far. Session 3c adds root's ``SLOT-SYNC``, the rest of ``_levain_keys``' row
+#: (``KEYS-ATTACH``, ``LINEAGE-APPEND``) and the ``_levain_dispatch`` row (a peer kind that :meth:`Control.peer_kind`
+#: learns from its uid); until then that peer is ``foreign``.
 PEER_VERBS: Mapping[str, frozenset[str]] = {
     "operator": frozenset({"LEASE-OPEN", "STATUS"}),
     "root": frozenset({"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET"}),
     "qbroker": frozenset({"QUEUE-RESOLVE"}),
+    "keys": frozenset({"TOKEN-RESOLVE"}),
     "foreign": frozenset(),
 }
 
@@ -79,6 +83,7 @@ _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "REVOKE": (frozenset({"session"}),) * 2,
     "REVOKED-SET": (frozenset(), frozenset()),
     "QUEUE-RESOLVE": (frozenset({"slot", "cap_digest"}),) * 2,
+    "TOKEN-RESOLVE": (frozenset({"token_digest"}),) * 2,
 }
 
 #: §3.3 / c6: a ``*_digest`` on the wire, the form the broker sends a queue cap's digest in.
@@ -100,6 +105,18 @@ MAX_CONNECTIONS = 256
 #: DECISION: dead leases kept to answer ``lease-dead`` (§3.3) once nothing else needs them; past this many the
 #: oldest is forgotten and its nonce answers ``nonce-unknown``, which refuses a replay just as surely.
 RETIRED_LEASES_MAX = 1024
+#: DECISION: the digests of dropped session tokens kept to answer ``TOKEN-RESOLVE`` ``token-revoked``; past this
+#: many the oldest is forgotten and answers ``token-unknown``, which keys refuses just as surely (``token-invalid``).
+REVOKED_TOKENS_MAX = 4096
+
+#: §4.9: each admin request's answer deadline per attempt; a missed one is sent again on the same connection.
+KEYS_ANSWER_S = 2.0
+#: DECISION (complement r2 2): after a failed connect to keys' admin socket the next verb that needs keys tries again
+#: only once this backoff has passed, doubling from the first value to the cap; until then it is ``keys-unavailable``.
+KEYS_RECONNECT_FIRST_S = 0.25
+KEYS_RECONNECT_MAX_S = 5.0
+#: §3.3 / §4.9 / E23 (a): the per-``front_uid`` registration counters live in this subdirectory of the session store.
+FRONT_REG_DIR = "front-reg"
 
 
 # --- framing --------------------------------------------------------------------------------------------
@@ -190,6 +207,25 @@ def new_handle() -> str:
 
 # --- the store ------------------------------------------------------------------------------------------
 
+@contextmanager
+def try_lock(path: Path, what: str) -> Iterator[None]:
+    """An exclusive ``flock`` on ``path``, TRY-locked only (§3.3): another holder = ``Refused("locked")``, never a
+    wait. The file is opened per section and never cached, so two threads hold two open file descriptions and the
+    flock excludes them; it is never removed (unlinking a lock file lets two holders lock two inodes)."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as e:
+        raise Refused("bad-root", f"{path}: {e.strerror}") from None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refused("locked", what) from None
+        yield
+    finally:
+        os.close(fd)   # closing the only descriptor releases the flock
+
+
 class StateStore:
     """``L/sessions/`` (§2.1): ``<session>.json`` + ``<session>.lock``, CONTROL the only writer.
 
@@ -217,23 +253,9 @@ class StateStore:
     def _path(self, session: str, suffix: str) -> Path:
         return self.dir / f"{R.check_session(session)}{suffix}"
 
-    @contextmanager
-    def lock(self, session: str) -> Iterator[None]:
-        """The session lock, TRY-locked only (§3.3): another holder = ``Refused("locked")``, never a wait.
-        The lock file is never removed (unlinking a lock file lets two holders lock two inodes)."""
-        path = self._path(session, ".lock")
-        try:
-            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-        except OSError as e:
-            raise Refused("bad-root", f"{path}: {e.strerror}") from None
-        try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise Refused("locked", session) from None
-            yield
-        finally:
-            os.close(fd)   # closing the only descriptor releases the flock
+    def lock(self, session: str):
+        """The session lock, TRY-locked only (§3.3): another holder = ``Refused("locked")``, never a wait."""
+        return try_lock(self._path(session, ".lock"), session)
 
     def load(self) -> dict[str, R.SessionState]:
         """Read every record (CONTROL's start). A record that does not parse is refused loudly: CONTROL
@@ -356,11 +378,19 @@ class Handles:
     queue_cap: str | None = None
     #: the digest the broker resolves the cap by (c6: ``sha256:`` + hex over its UTF-8 bytes).
     queue_cap_digest: str | None = field(default=None, init=False, compare=False, repr=False)
+    #: the digest keys resolves the session token by (``TOKEN-RESOLVE {token_digest}``, the same form).
+    token_digest: str | None = field(default=None, init=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.queue_cap is not None:
-            object.__setattr__(self, "queue_cap_digest",
-                               "sha256:" + hashlib.sha256(self.queue_cap.encode("utf-8")).hexdigest())
+            object.__setattr__(self, "queue_cap_digest", digest_of(self.queue_cap))
+        if self.token is not None:
+            object.__setattr__(self, "token_digest", digest_of(self.token))
+
+
+def digest_of(handle: str) -> str:
+    """A handle's digest on the wire: ``sha256:`` + hex over its UTF-8 bytes (c6; keys' ``token_digest``)."""
+    return "sha256:" + hashlib.sha256(handle.encode("utf-8")).hexdigest()
 
 
 def _default_is_brokered(claims: Mapping[str, object]) -> bool:
@@ -392,13 +422,215 @@ def _nothing(*_a: object) -> None:
     return None
 
 
+class AdminRefused(Refused):
+    """keys answered an admin request ``{"ok":false,"refused":<name>}``; ``answer`` is the whole answer (a
+    FRONT-REGISTER ``registration-stale`` carries ``reg_high`` there)."""
+
+    def __init__(self, name: str, answer: Mapping[str, object]) -> None:
+        super().__init__(name, "keys refused an admin request")
+        self.answer = dict(answer)
+
+
+@dataclass(eq=False)
+class _Pending:
+    conn: int                                     # the connection the request went out on (KeysAdmin._conn_no)
+    done: threading.Event = field(default_factory=threading.Event)
+    answer: dict | None = None
+
+
+class KeysAdmin:
+    """CONTROL's ONE long-lived connection to keys' admin socket (§4.9, ``R/keys/admin.sock``), multiplexed by ``id``:
+    a write lock, an answer table per ``id`` and a reader thread, so MINT's FRONT-REGISTER, root's FRONT-ARM and a
+    background DROP-SESSION share it and are answered in any order.
+
+    - Each attempt waits :data:`KEYS_ANSWER_S` for its answer; a missed one is sent again, byte for byte, ON THE SAME
+      CONNECTION (an answer to any attempt answers the request) until V23 has passed since the first, and then CONTROL
+      closes the connection: that is §4.5's EOF, never a retry. The request refuses ``keys-unavailable``.
+    - The connection's EOF (keys went away, or CONTROL closed it at V23 or on a malformed answer) wakes every request
+      waiting on it with ``keys-unavailable`` and calls ``on_eof`` (CONTROL revokes every live egress session); keys,
+      on its side, clears every registration that connection made.
+    - There is no connection until a verb needs keys: the next one connects. After a failed connect, verbs refuse
+      ``keys-unavailable`` without trying until :data:`KEYS_RECONNECT_FIRST_S` has passed, doubling to
+      :data:`KEYS_RECONNECT_MAX_S`; a connect that succeeds resets it.
+
+    ``answer_s``, ``window_s`` (V23) and ``clock`` are parameters so a test can shorten the clocks."""
+
+    def __init__(self, path: Path | str, *, answer_s: float = KEYS_ANSWER_S, window_s: float | None = None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        from levain.slot.control_client import V23_SECONDS   # lazy: a module-level import would be circular
+        self.path = Path(path)
+        self.answer_s = answer_s
+        self.window_s = V23_SECONDS if window_s is None else window_s
+        self._clock = clock
+        self.on_eof: Callable[[], None] = lambda: None
+        self._mu = threading.Lock()
+        self._wmu = threading.Lock()
+        self._sock: socket.socket | None = None
+        self._conn_no = 0
+        self._next_id = 0
+        self._pending: dict[int, _Pending] = {}
+        self._retry_at = 0.0
+        self._backoff = KEYS_RECONNECT_FIRST_S
+        self._closed = False
+        self._readers: list[threading.Thread] = []
+
+    # -- the connection --------------------------------------------------------------------------------------
+
+    def connected(self) -> bool:
+        with self._mu:
+            return self._sock is not None
+
+    def _connection(self, connect: bool) -> tuple[socket.socket, int]:
+        with self._mu:
+            if self._closed:
+                raise Refused("keys-unavailable", "the keys admin client is closed")
+            if self._sock is not None:
+                return self._sock, self._conn_no
+            if not connect:
+                raise Refused("keys-unavailable", "no keys admin connection")
+            now = self._clock()
+            if now < self._retry_at:
+                raise Refused("keys-unavailable", "keys admin connect backing off")
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                s.settimeout(self.answer_s)
+                s.connect(str(self.path))
+                s.settimeout(None)
+            except OSError as e:
+                s.close()
+                self._retry_at = now + self._backoff
+                self._backoff = min(self._backoff * 2, KEYS_RECONNECT_MAX_S)
+                raise Refused("keys-unavailable", f"{self.path}: {e.strerror or e}") from None
+            self._retry_at, self._backoff = 0.0, KEYS_RECONNECT_FIRST_S
+            self._conn_no += 1
+            self._sock = s
+            no = self._conn_no
+            t = threading.Thread(target=self._read_loop, args=(s, no), daemon=True, name=f"control-keys-admin-{no}")
+            self._readers = [r for r in self._readers if r.is_alive()] + [t]
+        t.start()
+        return s, no
+
+    def _read_loop(self, sock: socket.socket, no: int) -> None:
+        try:
+            while True:
+                ans = read_frame(sock, frame_timeout=FRAME_READ_S)
+                if ans is None:
+                    return
+                rid = ans.get("id")
+                if type(rid) is not int or type(ans.get("ok")) is not bool:
+                    return                                   # off the wire's shape: the stream is lost
+                if ans["ok"] is False and type(ans.get("refused")) is not str:
+                    return
+                with self._mu:
+                    p = self._pending.get(rid)
+                    if p is None or p.conn != no or p.done.is_set():
+                        continue                             # a late answer to an attempt already answered
+                    p.answer = ans
+                p.done.set()
+        except (FrameMalformed, FrameTooLarge, OSError):
+            return
+        finally:
+            self._lost(sock, no, notify=True)
+
+    def _lost(self, sock: socket.socket, no: int, *, notify: bool) -> None:
+        """Connection ``no`` is over: every request waiting on it is woken (no answer = ``keys-unavailable``) and,
+        unless CONTROL itself is closing the client, ``on_eof`` runs once."""
+        with self._mu:
+            if self._sock is not sock:
+                return                                       # already handled
+            self._sock = None
+            waiting = [p for p in self._pending.values() if p.conn == no]
+            closing = self._closed
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
+        for p in waiting:
+            p.done.set()
+        if notify and not closing:
+            self.on_eof()
+
+    def close(self) -> None:
+        """Close for good (CONTROL stopping): no ``on_eof``, every waiter answered ``keys-unavailable``."""
+        with self._mu:
+            self._closed = True
+            sock, no = self._sock, self._conn_no
+        if sock is not None:
+            self._lost(sock, no, notify=False)
+        for t in list(self._readers):
+            if t is not threading.current_thread():
+                t.join(2)
+
+    # -- one request -----------------------------------------------------------------------------------------
+
+    def call(self, op: str, *, connect: bool = True, **args: object) -> dict[str, object]:
+        """Send ``op`` and return the answer's fields (without ``id`` / ``ok``); a refusal raises
+        :class:`AdminRefused`; no connection, an EOF or V23 with no answer raise ``Refused("keys-unavailable")``.
+        ``connect=False``: no new connection is made for this request (it refuses instead)."""
+        sock, no = self._connection(connect)
+        with self._mu:
+            self._next_id += 1
+            rid = self._next_id
+            p = self._pending[rid] = _Pending(no)
+        frame = encode_frame({"v": 1, "op": op, "id": rid, **args})
+        first = self._clock()
+        try:
+            while True:
+                try:
+                    with self._wmu:
+                        sock.sendall(frame)
+                except OSError:
+                    self._lost(sock, no, notify=True)
+                    raise Refused("keys-unavailable", f"{op}: the keys admin connection broke") from None
+                if p.done.wait(self.answer_s):
+                    break
+                if self._clock() - first >= self.window_s:
+                    self._lost(sock, no, notify=True)       # V23 with no ack: CONTROL closes the wire (§4.5)
+                    raise Refused("keys-unavailable", f"{op}: no answer from keys within V23")
+        finally:
+            with self._mu:
+                self._pending.pop(rid, None)
+        ans = p.answer
+        if ans is None:
+            raise Refused("keys-unavailable", f"{op}: the keys admin connection ended")
+        if ans["ok"] is False:
+            raise AdminRefused(ans["refused"], ans)
+        return {k: v for k, v in ans.items() if k not in ("id", "ok")}
+
+    # -- §4.9's verbs, as CONTROL's seams --------------------------------------------------------------------
+
+    def front_register(self, session: str, front_uid: int, pid: int, start: int, incarnation: int,
+                       reg_token: int) -> None:
+        self.call("FRONT-REGISTER", session=session, front_uid=front_uid, pid=pid, start=start,
+                  incarnation=incarnation, reg_token=reg_token)
+
+    def front_arm(self, session: str, reg_token: int) -> None:
+        self.call("FRONT-ARM", session=session, reg_token=reg_token)
+
+    def drop_session(self, session: str) -> None:
+        """DROP-SESSION on the live connection. With none, or once that connection ends unanswered (EOF, or closed at
+        V23), there is nothing to drop: keys cleared every registration of a connection when it ended, and a new
+        connection starts against an empty table. So a drop is never retried past its connection."""
+        try:
+            self.call("DROP-SESSION", connect=False, session=session)
+        except AdminRefused:
+            raise
+        except Refused as e:
+            if e.name != "keys-unavailable":
+                raise
+
+
 class Control:
     """CONTROL's verbs over a :class:`StateStore`.
 
-    Seams (each a callable; production wires session 3c's keys admin client and the reaper wake socket):
-    ``drop_session(session)`` (§4.9 ``DROP-SESSION``, acked; the default does nothing, which is true while
-    no keys process holds anything) · ``wake_reaper()`` · ``keys_front_register(session, front_uid, pid,
-    start, incarnation)`` and ``keys_front_arm(session)`` (default: refused ``keys-unavailable``) ·
+    Seams (each a callable; ``keys_admin``, a :class:`KeysAdmin`, supplies the three keys ones and CONTROL learns its
+    EOF; production wires the reaper wake socket): ``drop_session(session)`` (§4.9 ``DROP-SESSION``, acked; the
+    default does nothing, which is true while no keys process holds anything) · ``wake_reaper()`` ·
+    ``keys_front_register(session, front_uid, pid, start, incarnation, reg_token)`` and
+    ``keys_front_arm(session, reg_token)`` (default: refused ``keys-unavailable``; keys' ``registration-stale``
+    arrives as an :class:`AdminRefused`) · ``keys_uid`` (the ``_levain_keys`` peer, whose verb is
+    ``TOKEN-RESOLVE``; ``None``: no peer is keys) ·
     ``slot_reusable(class, index, session) -> bool`` (the §3.5 mirror; default ``False``, which keeps a
     RETAINED session in ``REVOKED-SET``: the revoker's kill is uid + start checked, so over-inclusion is
     safe and under-inclusion is not) · ``is_brokered(claims) -> bool`` · ``clock() -> epoch seconds`` ·
@@ -410,6 +642,8 @@ class Control:
 
     def __init__(self, store: StateStore, operator_uid: int, *,
                  qbroker_uid: int | None = None,
+                 keys_uid: int | None = None,
+                 keys_admin: KeysAdmin | None = None,
                  run_facts: Callable[[str], Mapping[str, object] | None] = lambda s: None,
                  host: str = "darwin" if sys.platform == "darwin" else "linux",
                  drop_session: Callable[[str], object] = _nothing,
@@ -425,10 +659,19 @@ class Control:
         if qbroker_uid is not None and (type(qbroker_uid) is not int or qbroker_uid <= ROOT_UID
                                         or qbroker_uid == operator_uid):
             raise Refused("bad-config", f"qbroker uid {qbroker_uid!r}")
+        if keys_uid is not None and (type(keys_uid) is not int or keys_uid <= ROOT_UID
+                                     or keys_uid in (operator_uid, qbroker_uid)):
+            raise Refused("bad-config", f"keys uid {keys_uid!r}")
         if type(host) is not str or host not in STORE:
             raise Refused("bad-config", f"host {host!r}")
+        if keys_admin is not None:
+            drop_session, keys_front_register, keys_front_arm = (
+                keys_admin.drop_session, keys_admin.front_register, keys_admin.front_arm)
+            keys_admin.on_eof = self._keys_eof
+        self.keys_admin = keys_admin
         self.store = store
         self.qbroker_uid = qbroker_uid
+        self.keys_uid = keys_uid
         self._run_facts = run_facts
         self._host = host
         self.operator_uid = operator_uid
@@ -444,6 +687,8 @@ class Control:
         self._leases: dict[str, Lease] = {}            # nonce -> lease (a dead one kept, bounded: _retire)
         self._session_lease: dict[str, Lease] = {}
         self._handles: dict[str, Handles] = {}
+        #: token digests whose handles were dropped (oldest first, bounded): TOKEN-RESOLVE answers them token-revoked.
+        self._revoked_tokens: collections.OrderedDict[str, None] = collections.OrderedDict()
         self._drops_owed: set[str] = set()
         self._retired: collections.deque[str] = collections.deque()   # dead lease nonces, oldest first
         self._stopping = threading.Event()
@@ -462,6 +707,8 @@ class Control:
             return "operator"
         if uid is not None and uid == self.qbroker_uid:
             return "qbroker"
+        if uid is not None and uid == self.keys_uid:
+            return "keys"
         return "foreign"
 
     # -- start pass (§1 CONTROL row, §1.3) ---------------------------------------------------------------
@@ -491,8 +738,11 @@ class Control:
 
     def stop(self) -> None:
         """Stop serving WITHOUT revoking: the records stay as they are, and the next :meth:`start` revokes
-        them (a stop is a restart, as far as any session can tell)."""
+        them (a stop is a restart, as far as any session can tell). The keys admin connection is closed with no
+        revoke: keys reads its EOF and clears what it made."""
         self._stopping.set()
+        if self.keys_admin is not None:
+            self.keys_admin.close()
 
     # -- the write primitive -------------------------------------------------------------------------------
 
@@ -511,10 +761,19 @@ class Control:
         """§4.5: CONTROL at REVOKED drops the session's handles, sends ``DROP-SESSION`` to keys, wakes the
         reaper. Called after the REVOKED write is durable and the session lock released."""
         with self._mu:
-            self._handles.pop(session, None)
+            self._drop_handles(session)
         self._drop(session)
         self._wake()
         self._prune(session)
+
+    def _drop_handles(self, session: str) -> None:
+        """Forget a session's handles (caller holds ``_mu``); its token's digest is remembered, bounded, so
+        ``TOKEN-RESOLVE`` answers it ``token-revoked``."""
+        h = self._handles.pop(session, None)
+        if h is not None and h.token_digest is not None:
+            self._revoked_tokens[h.token_digest] = None
+            while len(self._revoked_tokens) > REVOKED_TOKENS_MAX:
+                self._revoked_tokens.popitem(last=False)
 
     def _wake(self) -> None:
         try:
@@ -523,8 +782,11 @@ class Control:
             self.seam_errors.append(("wake_reaper", "", e))
 
     def _drop(self, session: str) -> None:
-        """``DROP-SESSION`` once now; a failure is never taken as done: it is retried with backoff on a
-        background thread until keys acks it (or CONTROL stops, whose next start re-issues it)."""
+        """``DROP-SESSION`` once now; a failure is retried with backoff on a background thread until keys acks it,
+        CONTROL stops (whose next start re-issues it) or V23 has passed since the first try (§4.9). :class:`KeysAdmin`'s
+        drop never fails for want of keys: it holds its own V23 rule and closes the connection at it, and keys clears
+        every registration of a connection that ends, so a drop owed on it is moot. Only another seam reaches the retry,
+        and it is bounded the same way rather than kept forever."""
         with self._mu:
             if session in self._drops_owed:
                 return                                   # a retry is already running
@@ -540,9 +802,14 @@ class Control:
         self._spawn(self._drop_until_acked, session, name=f"control-drop-{session}")
 
     def _drop_until_acked(self, session: str) -> None:
+        from levain.slot.control_client import V23_SECONDS   # lazy: a module-level import would be circular
         delay = EOF_RETRY_FIRST_S
+        until = time.monotonic() + V23_SECONDS
         try:
             while not self._stopping.is_set():
+                if time.monotonic() >= until:
+                    self.seam_errors.append(("drop_session", session, TimeoutError("no ack within V23")))
+                    return
                 self._sleep(delay)
                 delay = min(delay * 2, EOF_RETRY_MAX_S)
                 try:
@@ -567,7 +834,7 @@ class Control:
             return
         if new.state not in R.LIVE_STATES and (old is None or old.state in R.LIVE_STATES):
             with self._mu:
-                self._handles.pop(new.session, None)
+                self._drop_handles(new.session)
             self._spawn(self._after_revoke, new.session, name=f"control-settled-{new.session}")
         elif new.state in R.LIVE_STATES and not self._lease_live(new.session):
             self._spawn_revoke(new.session)
@@ -612,7 +879,7 @@ class Control:
             lease.live = False
             session = lease.session
             if session is not None:
-                self._handles.pop(session, None)
+                self._drop_handles(session)
             elif not lease.used and self._leases.get(lease.nonce) is lease:
                 self._retire(lease)                      # bound nothing and never will
         if session is None or self._stopping.is_set():
@@ -637,11 +904,12 @@ class Control:
         t.start()
         return t
 
-    def _revoke_after_eof(self, session: str) -> None:
+    def _revoke_after_eof(self, session: str, *, lease_eof: bool = True) -> None:
         """``lease_live:false`` first (its own generation), then live state -> REVOKED, retrying the lock
         with backoff until it is taken: never dropped on ``locked``. A failed write (``OSError``) is retried
         the same way, and so is any other refusal (recorded once in :attr:`seam_errors`): a revoke owed is
-        never given up. Then the keys drop and the reaper wake."""
+        never given up. Then the keys drop and the reaper wake. ``lease_eof=False`` (keys' admin EOF, §4.5): the
+        lease is not what ended, so the REVOKED write keeps ``lease_live`` as the ``REVOKE`` verb does."""
         delay = EOF_RETRY_FIRST_S
         noted = False
         while True:
@@ -651,10 +919,11 @@ class Control:
                     rec = self.store.get(session)
                     if rec is None:
                         return
-                    if rec.lease_live:
+                    if lease_eof and rec.lease_live:
                         rec = self._write(rec, lease_live=False, event_kind="none")
                     if rec.state in R.LIVE_STATES:
-                        rec = self._write(rec, state=R.REVOKED, event_kind="state")
+                        rec = self._write(rec, state=R.REVOKED, event_kind="state",
+                                          lease_live=rec.lease_live and self._lease_live(session))
                         revoked = True
                 break
             except (Refused, OSError) as e:
@@ -669,6 +938,25 @@ class Control:
             self._after_revoke(session)
         else:
             self._prune(session)
+
+    def _keys_eof(self) -> None:
+        """keys' admin connection ended (§4.5, :class:`KeysAdmin`): keys cleared every registration and cached token
+        it held for CONTROL, so every live egress-class session is REVOKED, each on a thread that retries its session
+        lock (a MINT waiting on that connection holds one until it refuses ``keys-unavailable``). Their handles go at
+        once, before any write, as at a lease EOF."""
+        if self._stopping.is_set():
+            return
+        try:
+            recs = self.store.all()
+        except Refused as e:
+            self.seam_errors.append(("keys_eof", "", e))
+            recs = []
+        victims = sorted(r.session for r in recs if r.state in R.LIVE_STATES and r.claims.get("class") == "egress")
+        with self._mu:
+            for session in victims:
+                self._drop_handles(session)
+        for session in victims:
+            self._spawn(lambda s: self._revoke_after_eof(s, lease_eof=False), session, name=f"control-keys-eof-{session}")
 
     def join_eof(self, timeout: float | None = None) -> None:
         """Join the background threads, including any started while joining."""
@@ -839,7 +1127,19 @@ class Control:
         """§3.3 MINT, §5.1 render (5): only in RENDERING with the lease live. Merges the MINT claims into
         the record (``event_kind: none``, §3.6) and mints the §3.2 handles: a session token only if the
         claims carry a brokered route, a queue cap only if ``queue_grant``. A front is registered with keys
-        before MINT answers (§4.2)."""
+        before MINT answers (§4.2), fenced by its ``reg_token`` (§4.9, E23):
+
+        1. the ``front_uid``'s counter is bumped (:meth:`_bump_reg_token`, its own lock, synchronous);
+        2. the token is written ALONE into the session's claims (the TOKEN-ONLY state, a generation of its own,
+           ``event_kind`` none), and the record that write returns is the one every later step builds on;
+        3. FRONT-REGISTER carries it; only once keys acks it are the MINT claims merged and written.
+
+        keys' ``registration-stale {reg_high}`` steps down unless CONTROL's counter was behind: then the counter is
+        raised to ``reg_high``, bumped, prewritten as in 2, and the register retried ONCE. Every other end past the
+        first prewrite refuses (``front-registration-stale``, or ``keys-unavailable`` when keys is unavailable or
+        refusing) and leaves the record TOKEN-ONLY, authorising nothing, until the lease's EOF revokes it. A
+        ``locked`` uid lock after the first prewrite is ``front-registration-stale``, never ``locked``: the caller
+        would retry it at a generation the prewrite made stale."""
         session = R.check_session(args["session"])
         generation = R._uint(args["generation"], "generation")
         claims = R.parse_mint_claims(args["claims"])
@@ -860,10 +1160,9 @@ class Control:
             # DECISION: an egress session has exactly one front (§1 gw-front), a none class none (§5.1 5b).
             if ("front" in claims) != (rec.claims.get("class") == "egress"):
                 raise Refused("claims-mismatch")
-            merged = {**rec.claims, **claims}
             if "front" in claims:
-                f = claims["front"]
-                self._keys_front_register(session, f["uid"], f["pid"], f["start"], claims["incarnation"])
+                rec = self._register_front(rec, claims)
+            merged = {**rec.claims, **claims}
             h = Handles(token=new_handle() if self._is_brokered(merged) else None,
                         queue_cap=new_handle() if claims["queue_grant"] else None)
             new = self._write(rec, claims=merged, event_kind="none")
@@ -875,9 +1174,76 @@ class Control:
                 self._handles[session] = h
         return {"generation": new.generation}
 
+    def _register_front(self, rec: R.SessionState, claims: Mapping[str, object]) -> R.SessionState:
+        """MINT's steps 1-3 for a session with a front (caller holds the session lock); returns the TOKEN-ONLY
+        record keys acked the registration of, which MINT's final write builds on."""
+        front = claims["front"]
+        assert isinstance(front, Mapping)
+        uid = front["uid"]
+        token = self._bump_reg_token(uid)                      # a `locked` here passes through: nothing written yet
+        for retried in (False, True):
+            rec = self._write(rec, claims={**rec.claims, R.REG_TOKEN: token}, event_kind="none")
+            try:
+                self._keys_front_register(rec.session, uid, front["pid"], front["start"], claims["incarnation"], token)
+                return rec
+            except AdminRefused as e:
+                if e.name != "registration-stale":
+                    raise Refused("keys-unavailable", f"keys refused FRONT-REGISTER: {e.name}") from None
+                reg_high = e.answer.get("reg_high")
+                if retried or type(reg_high) is not int or not 0 <= reg_high < R.JSON_INT_MAX:
+                    raise Refused("front-registration-stale", f"front uid {uid}") from None
+            except Refused as e:
+                raise Refused("keys-unavailable", e.detail or e.name) from None
+            try:
+                stepped = self._bump_reg_token(uid, floor=reg_high)
+            except Refused as e:
+                if e.name == "locked":
+                    raise Refused("front-registration-stale", f"front uid {uid} counter locked") from None
+                raise
+            if stepped is None:                                # not behind: a newer registration stands (step down)
+                raise Refused("front-registration-stale", f"front uid {uid}")
+            token = stepped
+        raise AssertionError("unreachable")
+
+    def _front_reg_dir(self) -> Path:
+        """``L/sessions/front-reg/`` (E23 (a)). The install makes it; CONTROL, its sole writer, makes it 0700 if absent."""
+        d = self.store.dir / FRONT_REG_DIR
+        try:
+            os.mkdir(d, 0o700)
+        except FileExistsError:
+            pass
+        except OSError as e:
+            raise Refused("bad-root", f"{d}: {e.strerror}") from None
+        if os.path.islink(d) or not os.path.isdir(d):
+            raise Refused("bad-root", f"{d} is not a directory")
+        return d
+
+    def _bump_reg_token(self, front_uid: int, *, floor: int | None = None) -> int | None:
+        """The registration counter's section (E23 (a)), under ``<front_uid>.lock`` taken exactly like the session
+        lock and with nothing awaited while it is held: read the counter (absent = 0), +1, ``write_durably``, return
+        the new token. ``floor`` (keys' ``reg_high``): only a counter BELOW it is raised to it and bumped; a counter at
+        or above it is left as it is and ``None`` returned (step down). A record that does not parse refuses
+        ``front-registration-corrupt`` and is never reset."""
+        d = self._front_reg_dir()
+        path = d / f"{front_uid}.json"
+        with try_lock(d / f"{front_uid}.lock", f"front uid {front_uid}"):
+            data = R.read_record(path)
+            current = 0 if data is None else R.parse_front_reg(data, front_uid).reg_token
+            if floor is not None:
+                if current >= floor:
+                    return None
+                current = floor
+            if current >= R.JSON_INT_MAX:
+                raise Refused("front-registration-corrupt", f"front uid {front_uid}: the counter is at its maximum")
+            token = current + 1
+            R.write_durably(path, R.front_reg_bytes(R.FrontReg(front_uid, token)), fsync=self.store._fsync)
+        return token
+
     def _op_front_arm(self, conn: Conn, args: dict) -> dict[str, object]:
-        """§3.3 FRONT-ARM, §5.1 render (5b): relayed to keys as §4.9's ``FRONT-ARM {session}``; CONTROL
-        answers only after keys' ack. The session lock is not held across the relay."""
+        """§3.3 FRONT-ARM, §5.1 render (5b): relayed to keys as §4.9's ``FRONT-ARM {session, reg_token}``, the token
+        read from the session's OWN claims (never the uid's current counter); CONTROL answers only after keys' ack.
+        No ``reg_token`` in the claims, or keys' ``registration-stale``, refuses ``front-registration-stale`` with no
+        retry (the session's front was replaced). The session lock is not held across the relay."""
         session = R.check_session(args["session"])
         generation = R._uint(args["generation"], "generation")
         with self.store.lock(session):
@@ -890,9 +1256,17 @@ class Control:
                 raise Refused("not-rendering")
             if generation != rec.generation:
                 raise Refused("stale-generation")
+            token = rec.claims.get(R.REG_TOKEN)
+            if type(token) is not int:
+                raise Refused("front-registration-stale", f"{session} holds no reg_token")
             with self._mu:
                 lease = self._session_lease.get(session)
-        self._keys_front_arm(session)
+        try:
+            self._keys_front_arm(session, token)
+        except AdminRefused as e:
+            if e.name == "registration-stale":
+                raise Refused("front-registration-stale", session) from None
+            raise Refused("keys-unavailable", f"keys refused FRONT-ARM: {e.name}") from None
         # The lock is not held across the relay, so the session can move under it: re-check both before root is
         # told it may write the go byte.
         with self._mu:
@@ -1002,6 +1376,33 @@ class Control:
         run: dict[str, object] = {k: facts[k] for k in sorted(QUEUE_RUN_KEYS)}
         run["repo_root"] = str(session_repo(self._host, session))
         return {"session": session, "kind": kind, "run": run}
+
+    # -- keys' verb -------------------------------------------------------------------------------------------
+
+    def _op_token_resolve(self, conn: Conn, args: dict) -> dict[str, object]:
+        """§1.5 / E23 (d) ``TOKEN-RESOLVE {token_digest}``: the session a live session token belongs to and its
+        PERSISTED claims WITHOUT ``reg_token`` (keys learns a token only from FRONT-REGISTER). ``token-unknown`` for a
+        digest CONTROL never minted (or has forgotten, :data:`REVOKED_TOKENS_MAX`); ``token-revoked`` for a token
+        whose handles were dropped (lease EOF, REVOKED, keys' admin EOF) or whose session is past live."""
+        digest = args["token_digest"]
+        if type(digest) is not str:
+            raise Refused("wrong-type", "token_digest is a string")
+        if _DIGEST_RE.fullmatch(digest) is None:
+            raise Refused("bad-token", "token_digest")
+        with self._mu:
+            found = [(s, h) for s, h in self._handles.items()
+                     if h.token_digest is not None and hmac.compare_digest(h.token_digest, digest)]
+            revoked = digest in self._revoked_tokens
+        if len(found) != 1:
+            raise Refused("token-revoked" if revoked else "token-unknown")
+        session, handles = found[0]
+        rec = self.store.get(session)
+        if rec is None or rec.state not in R.LIVE_STATES:
+            raise Refused("token-revoked")
+        with self._mu:
+            if self._handles.get(session) is not handles:
+                raise Refused("token-revoked")         # dropped while the record was read
+        return {"session": session, "claims": {k: v for k, v in rec.claims.items() if k != R.REG_TOKEN}}
 
     # -- test / service views --------------------------------------------------------------------------------
 
@@ -1140,6 +1541,8 @@ class ControlServer:
             t.join(2)
 
 
-__all__ = ["CONTROL_FORMAT", "Conn", "Control", "ControlServer", "FRAME_MAX", "FRAME_READ_S", "FrameMalformed",
-           "FrameTooLarge", "Handles", "Lease", "MAX_CONNECTIONS", "PEER_VERBS", "RETIRED_LEASES_MAX", "StateStore",
-           "check_request", "encode_frame", "new_handle", "ok", "read_frame", "refused"]
+__all__ = ["AdminRefused", "CONTROL_FORMAT", "Conn", "Control", "ControlServer", "FRAME_MAX", "FRAME_READ_S",
+           "FRONT_REG_DIR", "FrameMalformed", "FrameTooLarge", "Handles", "KEYS_ANSWER_S", "KEYS_RECONNECT_FIRST_S",
+           "KEYS_RECONNECT_MAX_S", "KeysAdmin", "Lease", "MAX_CONNECTIONS", "PEER_VERBS", "RETIRED_LEASES_MAX",
+           "REVOKED_TOKENS_MAX", "StateStore", "check_request", "digest_of", "encode_frame", "new_handle", "ok",
+           "read_frame", "refused", "try_lock"]
