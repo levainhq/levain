@@ -6,6 +6,24 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **Notes: an agent can send you a reply that needs no answer.** Through the band's tools an agent files a note: one
+  line, with optional detail. It shows in the cockpit's Notes strip under Needs you and on the phone page below your
+  questions, and you dismiss it with one tap. A note has no options and no recommendation, and dismissing it answers
+  nothing, approves nothing and starts no agent. An agent that keeps filing is refused once too many notes are open
+  (100 in total, and 25 per agent session when the session is known). The cockpit and phone show the oldest notes
+  first and say how many they are not showing.
+
+### Groundwork for isolation (no `levain` subcommand calls these yet)
+- **The install helper can set and remove a credential.** `set-credential <name>` takes the credential on stdin and
+  checks it before the install lock is taken or anything is written; `remove-credential <name>` removes it. Each write
+  runs in a child that has dropped to the keys service's own account (`_levain_keys`) before it touches the
+  credential directory. The write is atomic, gets a fresh revision, and waits at most 10 seconds for the credential
+  lock. If the file is in place but its directory entry cannot be synced, the write succeeds with a warning that a
+  crash may undo it (a removal warns that the credential may come back). The command gives up after 30 seconds,
+  stops the child and refuses `credential-child-timeout`. The keys service uses a new credential on its next exchange,
+  and has its own one-thread writer for the token refresh that comes later; nothing calls that writer yet.
+
 ## [0.11.16] — 2026-10-22
 
 ### Fixed
