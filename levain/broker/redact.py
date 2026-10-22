@@ -13,6 +13,18 @@ from typing import Iterable, List, Tuple
 MARKER = b"[levain-redacted]"
 
 
+def unsafe_with_marker(secret: bytes) -> bool:
+    """True iff MARKER could hold `secret` or rebuild it with the bytes around it: the secret is inside MARKER,
+    contains it, begins with one of its non-empty suffixes, or ends with one of its non-empty prefixes. Those are the
+    four ways an occurrence in the output can overlap an inserted MARKER, and an occurrence that overlaps none lies in
+    the input outside every replaced span, where the scan has already replaced it; so a secret set none of whose
+    members is unsafe leaves no secret in the output. The credential load refuses an unsafe secret."""
+    if secret in MARKER or MARKER in secret:
+        return True
+    n = len(MARKER)
+    return any(secret.startswith(MARKER[i:]) or secret.endswith(MARKER[:n - i]) for i in range(1, n))
+
+
 class Scanner:
     __slots__ = ("_secrets", "_held", "count")
 

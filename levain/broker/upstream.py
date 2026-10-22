@@ -68,12 +68,20 @@ class StaleExchange(Exception):
     exception, so the exchange's own `finally` (its release) still runs."""
 
 
+#: every `BadResponse.detail`, each a fixed token: the detail is logged (gw.jsonl, stderr), and a text built from the
+#: response (h11's refusal quotes the offending bytes) could carry an echoed credential into the log unscanned.
+BAD_RESPONSE_DETAILS = frozenset({"protocol", "unsolicited-upgrade", "informational", "unexpected-event",
+                                  "refresh-body-cap"})
+
+
 class BadResponse(EOFError):
     """The upstream's response is one keys does not relay (h11 refused it, an unsolicited 101, a run of informational
-    responses past MAX_INFORMATIONAL, a refresh body past its cap). `detail` names which, for the note only. An
+    responses past MAX_INFORMATIONAL, a refresh body past its cap). `detail` names which, for the note only, and is
+    always one of BAD_RESPONSE_DETAILS (anything else becomes "protocol"), never text derived from the response. An
     EOFError, so keys answers it `upstream-error` like any other upstream failure."""
 
     def __init__(self, detail: str) -> None:
+        detail = detail if detail in BAD_RESPONSE_DETAILS else "protocol"
         super().__init__(detail)
         self.detail = detail
 
@@ -234,6 +242,38 @@ async def _handshake(addr: str, port: int, host: str) -> Tuple[Any, Any, Any]:
     return reader, writer, plain_writer
 
 
+async def _await_handshake(task: "asyncio.Future", timeout: float) -> Tuple[Any, Any, Any]:
+    """A `_handshake` task's result, bounded by `timeout` (asyncio.TimeoutError past it), for the refresh, which has
+    no exchange to store a late result on. Unlike 3.9's `wait_for`, a handshake that completes as the wait ends (the
+    deadline, or a cancel of the caller) is not dropped: its transports are aborted here before the exit."""
+    try:
+        await asyncio.wait({task}, timeout=timeout)
+    except BaseException:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        _abort_handshake(task)
+        raise
+    if not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if _abort_handshake(task) or task.cancelled():
+            raise asyncio.TimeoutError()
+    return task.result()
+
+
+def _abort_handshake(task: "asyncio.Future") -> bool:
+    """Abort the transports of a `_handshake` that completed; True iff there was one. Never raises an `Exception`."""
+    if not task.done() or task.cancelled() or task.exception() is not None:
+        return False
+    _reader, writer, plain_writer = task.result()
+    for tr in (writer.transport, plain_writer.transport):
+        try:
+            tr.abort()
+        except Exception as e:
+            _note(logging.WARNING, "levain gw-keys: upstream abort failed (%s)", type(e).__name__)
+    return True
+
+
 async def open_exchange(addr: str, port: int, host: str, exchange: Any) -> Upstream:
     """The only way to an exchange's `Upstream`. The exchange is mandatory and holds ONE: a second call for it is
     refused (the new `Upstream` aborted, the one it holds kept, so no transport is left in no registry). The `Upstream`
@@ -257,33 +297,36 @@ async def open_exchange(addr: str, port: int, host: str, exchange: Any) -> Upstr
 
 # --- the response (h11 client) ----------------------------------------------------------------------------------
 
-async def _next_event(up: Upstream, conn: "h11.Connection", wait: float) -> Any:
+async def _next_event(up: Upstream, conn: "h11.Connection", wait: Optional[float]) -> Any:
     """The next h11 event, reading from `up` while h11 needs data; each read waits at most `wait` (a timeout raises
-    asyncio.TimeoutError). h11's refusal of the bytes is BadResponse."""
+    asyncio.TimeoutError; None waits as long as the caller does). h11's refusal of the bytes is BadResponse, its text
+    dropped (it quotes the bytes)."""
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + wait
+    deadline = None if wait is None else loop.time() + wait
     while True:
         try:
             ev = conn.next_event()
-        except h11.RemoteProtocolError as e:
-            raise BadResponse(f"protocol: {e}") from None
+        except h11.RemoteProtocolError:
+            raise BadResponse("protocol") from None
         if ev is not h11.NEED_DATA:
             return ev
-        data = await asyncio.wait_for(up.read(READ_CHUNK), max(0.0, deadline - loop.time()))
+        left = None if deadline is None else max(0.0, deadline - loop.time())
+        data = await asyncio.wait_for(up.read(READ_CHUNK), left)
         try:
             conn.receive_data(data)
-        except h11.RemoteProtocolError as e:
-            raise BadResponse(f"protocol: {e}") from None
+        except h11.RemoteProtocolError:
+            raise BadResponse("protocol") from None
 
 
-async def read_head(up: Upstream, conn: "h11.Connection", deadline: float) -> "h11.Response":
+async def read_head(up: Upstream, conn: "h11.Connection", deadline: Optional[float]) -> "h11.Response":
     """The FINAL response head, by the absolute `deadline` (loop time) fixed when the request's last byte was sent: an
-    informational response never extends it. Every 1xx but 101 is consumed; more than MAX_INFORMATIONAL of them, or a
-    101 (keys asks for no upgrade at this tip), is BadResponse."""
+    informational response never extends it. None: no deadline here, the caller bounds the wait (keys reads the head
+    while the body is still going up, and fixes the deadline when its last byte is sent). Every 1xx but 101 is
+    consumed; more than MAX_INFORMATIONAL of them, or a 101 (keys asks for no upgrade at this tip), is BadResponse."""
     loop = asyncio.get_running_loop()
     seen = 0
     while True:
-        ev = await _next_event(up, conn, max(0.0, deadline - loop.time()))
+        ev = await _next_event(up, conn, None if deadline is None else max(0.0, deadline - loop.time()))
         if isinstance(ev, h11.InformationalResponse):
             if ev.status_code == 101:
                 raise BadResponse("unsolicited-upgrade")
@@ -293,7 +336,7 @@ async def read_head(up: Upstream, conn: "h11.Connection", deadline: float) -> "h
             continue
         if isinstance(ev, h11.Response):
             return ev
-        raise BadResponse(f"unexpected {type(ev).__name__}")
+        raise BadResponse("unexpected-event")
 
 
 async def read_body(up: Upstream, conn: "h11.Connection", idle_s: float) -> Optional[bytes]:
@@ -307,7 +350,7 @@ async def read_body(up: Upstream, conn: "h11.Connection", idle_s: float) -> Opti
             continue
         if isinstance(ev, h11.EndOfMessage):
             return None
-        raise BadResponse(f"unexpected {type(ev).__name__}")
+        raise BadResponse("unexpected-event")
 
 
 def h11_bytes(conn: "h11.Connection", event: Any) -> bytes:
@@ -339,14 +382,16 @@ async def _read_response(up: Upstream) -> RefreshResponse:
             break
         body += part
         if len(body) > REFRESH_BODY_CAP:
-            raise BadResponse("refresh body cap")
+            raise BadResponse("refresh-body-cap")
     return RefreshResponse(head.status_code, [(bytes(n), bytes(v)) for n, v in head.headers], body)
 
 
 async def refresh_post(request: RefreshRequest) -> Any:
     """The refresh's entry point: build the maintenance `Upstream` here, send THIS request, read its response, close,
-    and return the response only. The `Upstream` never leaves this function; every exit aborts it."""
-    reader, writer, plain_writer = await _handshake(request.addr, request.port, request.host)
+    and return the response only. The `Upstream` never leaves this function; every exit aborts it. The connect and the
+    TLS handshake share one CONNECT_TIMEOUT_S deadline (a cancel inside `_handshake` aborts what it holds)."""
+    reader, writer, plain_writer = await _await_handshake(
+        asyncio.ensure_future(_handshake(request.addr, request.port, request.host)), CONNECT_TIMEOUT_S)
     up = Upstream.maintenance(reader, writer, _keepalive=plain_writer)
     try:
         up.write(request.head)
