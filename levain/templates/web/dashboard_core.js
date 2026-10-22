@@ -61,7 +61,7 @@
     return p;
   };
   function appendBanner(host, entry) {
-    for (const b of entry.banner || []) host.appendChild(el("div", "ext-note" + (b.tone === "stale" ? " stale" : ""), b.text));
+    for (const b of entry.banner || []) host.appendChild(richEl("div", "ext-note" + (b.tone === "stale" ? " stale" : ""), b.text));
   }
   const kv = (parent, k, v) => {
     const row = el("div", "kv");
@@ -611,18 +611,47 @@
   // one bare node (no panel header): the hero's weather and sky, the brief, the widgets. It draws what a zone card draws
   // for the same panel: the banner (stale / partial / held back / an alert), the note, then the content in whichever
   // shape the contract allows (markdown, a typed face, or lines). An alert is content, so it suppresses the empty message.
+  // An error sentence from a provider may carry a raw ISO timestamp ("failing since 2026-10-21T22:37:12.126051+00:00"): shown as the local clock
+  // ("6:37 PM", with the day when it is not today), the exact stamp kept in the element's title. The text sits in ONE span so the dot beside it
+  // stays a single flex sibling of a wrapping line.
+  const ISO_AT = /\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:?\d\d)/g;
+  function humanTimesIn(text) {
+    const out = [];
+    let at = 0, m;
+    ISO_AT.lastIndex = 0;
+    while ((m = ISO_AT.exec(text)) !== null) {
+      const d = new Date(m[0]);
+      if (Number.isNaN(d.getTime())) continue;
+      if (m.index > at) out.push(text.slice(at, m.index));
+      const same = d.toDateString() === new Date().toDateString();
+      const clock = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+      const t = el("time", null, same ? clock : d.toLocaleDateString([], { month: "short", day: "numeric" }) + ", " + clock);
+      t.title = m[0];
+      t.dateTime = m[0];
+      out.push(t);
+      at = m.index + m[0].length;
+    }
+    if (at < text.length) out.push(text.slice(at));
+    return out;
+  }
+  function errorLine(text) {
+    const p = el("p", "err"), span = el("span");
+    span.append(...humanTimesIn(String(text)));
+    p.appendChild(span);
+    return p;
+  }
   function bareNode(entry, view, cls, ctx) {
     const data = (view.extra_panels || {})[entry.id] || {};
     const node = el("div", cls);
     ckAttrs(node, entry, ckKindOf(entry, data));
     const K = window.LevainCockpitKinds;
-    if (data.error) { node.appendChild(el("p", "err", "unavailable — " + data.error)); return node; }
+    if (data.error) { node.appendChild(errorLine("unavailable \u2014 " + data.error)); return node; }
     appendBanner(node, entry);
-    if (data.note && !(ctx && ctx.widget && data.face === "count")) node.appendChild(el("div", "ext-note", data.note));
+    if (data.note && !(ctx && ctx.widget && data.face === "count")) node.appendChild(richEl("div", "ext-note", data.note));
     const alerted = (entry.banner || []).some((b) => b.alert);
     if (data.markdown != null) {
       const md = String(data.markdown);
-      if (md.trim() === "") { if (!alerted) node.appendChild(el("p", "empty", data.empty || "nothing here")); }
+      if (md.trim() === "") { if (!alerted) node.appendChild(richEl("p", "empty", data.empty || "nothing here")); }
       else node.appendChild(renderMarkdown(md));
       return node;
     }
@@ -633,7 +662,7 @@
     }
     if (!Array.isArray(data.lines)) { node.appendChild(el("p", "err", "unavailable — this panel cannot be drawn here")); return node; }
     if (data.lines.length) appendExternalLines(node, data.lines);
-    else if (!alerted) node.appendChild(el("p", "empty", data.empty || "nothing here"));
+    else if (!alerted) node.appendChild(richEl("p", "empty", data.empty || "nothing here"));
     return node;
   }
 
@@ -705,11 +734,13 @@
     const stamp = el("div", "clockbox");
     stamp.append(clock, date);
     whenKids.push(stamp);
-    metaKids.push(wrapLineOf(view));
+    const lastWrap = wrapLineOf(view);
+    if (!wx) metaKids.push(lastWrap);   // with a weather card the wrap line rides the card's foot row instead (no dead band under it)
     metaKids.push(events);
     if (wx) {
       const node = bareNode(wx, view, "wx");
       node.dataset.ckHero = "weather";
+      lastWrap.classList.add("wx-wrap");
       const V = window.LevainCockpitView;
       if (V && typeof V.refetchPanel === "function") {
         // re-reads this panel's source now; the source decides how fresh that is (the read age under the figure says)
@@ -731,8 +762,8 @@
             return r;
           }).catch(() => "fault").finally(() => { busy = false; again.removeAttribute("aria-busy"); });
         });
-        node.appendChild(again);
-      }
+        node.append(lastWrap, again);
+      } else node.appendChild(lastWrap);
       metaKids.push(node);
     }
     if (sky) skyKids.push(bareNode(sky, view, "ck-sky", { hero: { events: events, place: legendHook.place, hide: legendHook.hide } }));
@@ -1805,6 +1836,17 @@
   // so expand is instant and any edit reads the whole thing — no truncation, no data loss.
   // CSS clamps the clause to 3 lines; measureClauses reveals the toggle only when it
   // overflows; the toggle flips .row-expanded to show all of it inline.
+  // Text that carries `code` spans is drawn through the same inline renderer the neocortex panel uses (mdInline), so a command or a path
+  // reads as code and not as raw backticks; text without a backtick stays a plain text node (no other markdown is opened up).
+  function codeSpansInto(parent, text) {
+    if (String(text).indexOf("`") === -1) { parent.appendChild(document.createTextNode(text)); return; }
+    mdInline(String(text), parent, 0);
+  }
+  function richEl(tag, cls, text) {
+    const n = el(tag, cls);
+    codeSpansInto(n, String(text != null ? text : ""));
+    return n;
+  }
   function appendClause(row, text) {
     // .clampable is what the CSS clamps + measureClauses targets — bare .clause (crystals,
     // wrap/edit labels) stays full so it never clamps without this expand affordance.
@@ -1813,7 +1855,7 @@
     const parts = String(text != null ? text : "").split(/(\b\d{4}-\d{2}-\d{2}\b)/);   // nullish text draws an empty clause, as el() does
     parts.forEach((part, i) => {
       if (i % 2) clause.appendChild(el("span", "nowrap", part));
-      else if (part) clause.appendChild(document.createTextNode(part));
+      else if (part) codeSpansInto(clause, part);
     });
     row.appendChild(clause);
     const toggle = el("button", "clause-toggle", "⌄");  // caret only; the action lives in aria-label
@@ -2679,7 +2721,11 @@
   const MEM_COUNT = /\|\s*(\d+)x\b/;
   function memDecoratePatterns(root) {
     for (const p of root.querySelectorAll("p.md-p")) {
-      if (/^\s*\{[^}]*\}\s*$/.test(p.textContent)) p.classList.add("ck-mem-group");
+      if (/^\s*\{[^}]*\}\s*$/.test(p.textContent)) {
+        p.classList.add("ck-mem-group");
+        // the FlowScript braces are the file's notation, not the page's: the head reads "Today · 2026-10-21" (the stored text is untouched)
+        if (!p.children.length) p.textContent = p.textContent.trim().slice(1, -1).trim().replace(/\s+\u2014\s+/, " \u00b7 ");
+      }
     }
     for (const li of root.querySelectorAll("li.md-li")) {
       let at = null, m = null;
@@ -3824,7 +3870,7 @@
       if (textEdit) mountTextEditor(p, act, spec, String(data.markdown));
       else if (spec) mountCaptureBox(p, buildActionBox(act, spec));
     }
-    if (data.note) p.appendChild(el("div", "ext-note", data.note));
+    if (data.note) p.appendChild(richEl("div", "ext-note", data.note));
     // the Decisions panel carries proposal cards whatever rows it holds (three old hand-allows make a card on a panel with
     // nothing pending): decided by panel id, never by the presence of a consent row. The cards lead the rows when there are
     // any (appendExternalLines mounts them); a panel that drew none gets them after the body (renderExternal, below)
