@@ -13,8 +13,10 @@ Also here: the root-written ``repo.git`` config for both object formats (:func:`
 makes at seal-in (:func:`make_skeleton`), and the environment and argv every importer git runs under.
 
 The result line (:func:`result_line`) carries ``enospc`` SOURCE-SIDE: computed only on the fatal path, at the point
-the importer decides to exit non-zero, from what that path saw (its own failing write, the failing git child's stderr,
-one probe write); exit 0 therefore always carries ``enospc: false``.
+the importer decides to exit non-zero, from the importer's OWN readings (an errno of its own failing write, one probe
+write, one ``statvfs``); exit 0 therefore always carries ``enospc: false``. A git child's stderr never sets it: that
+text can carry bytes of the hostile objects, so a child that failed on a full disk is the generic failure unless the
+importer's own probe sees the disk full too. Every exit path, a usage error included, answers exactly one result line.
 """
 from __future__ import annotations
 
@@ -22,11 +24,14 @@ import argparse
 import base64
 import errno
 import hashlib
+import io
 import os
 import re
+import select
 import subprocess
 import sys
 import threading
+import time
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,12 +42,16 @@ from levain.slot import Refused, bundlefmt, fsck_ids, walkframe, write_all
 
 #: Hex length and hash constructor of each object format.
 FORMATS = {"sha1": (40, hashlib.sha1), "sha256": (64, hashlib.sha256)}
-#: ``repo.git/HEAD`` as root writes it: a ref that never exists, so nothing resolves through HEAD by accident.
-HEAD_TEXT = b"ref: refs/levain/none\n"
+#: ``repo.git/HEAD`` as root writes it: an unborn branch. ``git fsck`` refuses a symbolic HEAD outside ``refs/heads/``,
+#: so the name is a branch name; the refs step (5b2, not built yet) owes the refusal of any imported ref of exactly
+#: that name (``ref-reserved:refs/heads/levain-none``), so that HEAD never resolves to slot-supplied content.
+HEAD_TEXT = b"ref: refs/heads/levain-none\n"
 #: The most bytes the result line may take, newline included.
 RESULT_CAP = 64 << 10
-#: The C-locale text a git child prints for ENOSPC.
-ENOSPC_TEXT = "No space left on device"
+#: How long the importer waits, after the terminal frame, for the frame pipe's end of stream. The contract is that
+#: root closes its write end right after the terminal frame; this bounds a root that does not: past it the run
+#: refuses ``frame-bad:trailing`` rather than hang while root waits on fd 4.
+TRAILING_WAIT = 5.0
 #: The base bundle's frame path.
 BASE_BUNDLE = b"in/repo.bundle"
 #: Where the session's git directory sits in frame paths.
@@ -74,22 +83,39 @@ def render_config(object_format: str) -> bytes:
     return ("\n".join(lines) + "\n").encode("ascii")
 
 
+def _mkdir_exact(path: Path, mode: int) -> None:
+    """``mkdir`` then ``fchmod`` to ``mode``: the final mode never depends on the caller's umask."""
+    path.mkdir(mode=0o700)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
+def _create_exact(path: Path, mode: int, data: bytes = b"") -> None:
+    """A new file (``O_EXCL``, no symlink followed), ``fchmod`` to ``mode`` whatever the umask, then ``data``."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        os.fchmod(fd, mode)
+        write_all(fd, data)
+    finally:
+        os.close(fd)
+
+
 def make_skeleton(work: Path, object_format: str) -> None:
     """The ``.work/`` skeleton root makes at seal-in, owners aside (root chowns): ``repo.git/`` with ``config`` and
     ``HEAD`` (the importer cannot replace them, nor add ``hooks/`` or ``info/``), its ``objects/`` and ``refs/``, and
-    ``spool/``, ``out/``, ``log/`` with the two log files."""
+    ``spool/``, ``out/``, ``log/`` with the two log files. Every mode is set explicitly, never left to the umask: a
+    root umask of ``0077`` would otherwise leave root's ``repo.git`` unreadable to the importer."""
     repo = work / "repo.git"
-    repo.mkdir(mode=0o755)
-    for name, data in (("config", render_config(object_format)), ("HEAD", HEAD_TEXT)):
-        fd = os.open(repo / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-        try:
-            write_all(fd, data)
-        finally:
-            os.close(fd)
+    _mkdir_exact(repo, 0o755)
+    _create_exact(repo / "config", 0o644, render_config(object_format))
+    _create_exact(repo / "HEAD", 0o644, HEAD_TEXT)
     for d in (repo / "objects", repo / "refs", work / "spool", work / "out", work / "log"):
-        d.mkdir(mode=0o700)
+        _mkdir_exact(d, 0o700)
     for name in ("stdout", "stderr"):
-        os.close(os.open(work / "log" / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+        _create_exact(work / "log" / name, 0o600)
 
 
 def git_env(work: Path) -> dict[str, str]:
@@ -108,15 +134,13 @@ def git_argv(git: str, work: Path, *args: str) -> list[str]:
 
 class Fatal(Exception):
     """The importer's decision to exit non-zero. ``name`` is an adopt refusal name or ``None`` (a failure with no
-    adopt name; root names the run). ``own_enospc``: one of the importer's own writes saw ENOSPC or EDQUOT.
-    ``child_stderr``: the captured stderr of a git child that itself exited non-zero."""
+    adopt name; root names the run). ``own_enospc``: one of the importer's own writes saw ENOSPC or EDQUOT."""
 
-    def __init__(self, name: str | None, detail: str, *, own_enospc: bool = False, child_stderr: str = "") -> None:
+    def __init__(self, name: str | None, detail: str, *, own_enospc: bool = False) -> None:
         super().__init__(f"{name}: {detail}" if name else detail)
         self.name = name
         self.detail = detail
         self.own_enospc = own_enospc
-        self.child_stderr = child_stderr
 
 
 def _oserror(err: OSError, what: str) -> Fatal:
@@ -174,9 +198,32 @@ class Progress:
     ignored_git_paths: int | None = None
 
 
-def spool_frames(fh: BinaryIO, spool: Spool, progress: Progress, *, payload_cap: int) -> list[Frame]:
+def _nothing_after(fh: BinaryIO, wait: float) -> None:
+    """The stream must END after the terminal frame. On a raw fd (the importer's fd 0), wait at most ``wait`` seconds
+    for it to turn readable, then read at most ONE byte: end of stream passes, a byte or a pipe still open at the
+    deadline is ``frame-bad:trailing``. Any other stream (an in-memory one) is read for one byte."""
+    fd = fh.fileno() if isinstance(fh, io.RawIOBase) else None
+    if fd is not None:
+        deadline = time.monotonic() + wait
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise Fatal("frame-bad:trailing", f"the frame pipe was still open {wait:g} s after the terminal frame")
+            try:
+                ready, _, _ = select.select([fd], [], [], left)
+            except InterruptedError:
+                continue
+            if ready:
+                break
+    if fh.read(1):
+        raise Fatal("frame-bad:trailing", "bytes after the terminal frame")
+
+
+def spool_frames(fh: BinaryIO, spool: Spool, progress: Progress, *, payload_cap: int,
+                 trailing_wait: float = TRAILING_WAIT) -> list[Frame]:
     """Step 0: every frame into the spool, decoded by the shared codec, then the terminal frame, whose ``count`` and
-    ``bytes`` must equal what arrived, with nothing after it. No git runs before this returns."""
+    ``bytes`` must equal what arrived, with nothing after it (:func:`_nothing_after`, bounded by ``trailing_wait``).
+    No git runs before this returns."""
     frames: list[Frame] = []
     seen: set[bytes] = set()
     total = 0
@@ -191,8 +238,7 @@ def spool_frames(fh: BinaryIO, spool: Spool, progress: Progress, *, payload_cap:
             if header["count"] != len(frames) or header["bytes"] != total:
                 raise Fatal("frame-bad:terminal",
                             f"says {header['count']}/{header['bytes']}, saw {len(frames)}/{total}")
-            if fh.read(1):
-                raise Fatal("frame-bad:trailing", "bytes after the terminal frame")
+            _nothing_after(fh, trailing_wait)
             progress.terminal = True
             progress.entries, progress.bytes = len(frames), total
             return frames
@@ -237,39 +283,60 @@ class GitRunner:
                              stderr=subprocess.PIPE, env=git_env(self.work), cwd=str(self.work), close_fds=True)
         out: list[bytes] = []
         err: list[bytes] = []
-        readers = [threading.Thread(target=_drain, args=(p.stdout, out), daemon=True),
-                   threading.Thread(target=_drain, args=(p.stderr, err), daemon=True)]
-        for t in readers:
-            t.start()
-        if stdin is not None:
-            spool, offset, size = stdin
-            try:
-                for chunk in spool.chunks(offset, size):
-                    p.stdin.write(chunk)
-            except BrokenPipeError:
-                pass
-            finally:
+        started: list[threading.Thread] = []
+        try:
+            for pipe, keep in ((p.stdout, out), (p.stderr, err)):
+                t = threading.Thread(target=_drain, args=(pipe, keep), daemon=True)
+                t.start()
+                started.append(t)
+            if stdin is not None:
+                spool, offset, size = stdin
                 try:
-                    p.stdin.close()
+                    for chunk in spool.chunks(offset, size):
+                        p.stdin.write(chunk)
                 except BrokenPipeError:
                     pass
-        rc = p.wait()
-        for t in readers:
-            t.join()
+                finally:
+                    _close_quietly(p.stdin)
+            rc = p.wait()
+        except BaseException:
+            # No child outlives a failure after its spawn: kill it, reap it, close what no reader owns.
+            _close_quietly(p.stdin)
+            try:
+                p.kill()
+            except OSError:
+                pass
+            p.wait()
+            for pipe in (p.stdout, p.stderr)[len(started):]:
+                _close_quietly(pipe)
+            raise
+        finally:
+            for t in started:
+                t.join()
         return rc, b"".join(out).decode("utf-8", "replace"), b"".join(err).decode("utf-8", "replace")
 
     def must(self, *args: str, stdin: tuple[Spool, int, int] | None = None) -> str:
         rc, out, err = self.run(*args, stdin=stdin)
         if rc != 0:
             last = (err.strip().splitlines() or [""])[-1]
-            raise Fatal(None, f"git {args[0]} rc {rc}: {last[:300]}", child_stderr=err)
+            raise Fatal(None, f"git {args[0]} rc {rc}: {last[:300]}")
         return out
 
 
+def _close_quietly(f: BinaryIO | None) -> None:
+    if f is not None:
+        try:
+            f.close()
+        except OSError:
+            pass
+
+
 def _drain(pipe: BinaryIO, keep: list[bytes]) -> None:
-    """Read ``pipe`` to its end, keeping its first and last :data:`_CAPTURE` bytes."""
+    """Read ``pipe`` to its end, keeping its first and last :data:`_CAPTURE` bytes; the elision marker only where
+    bytes were dropped."""
     head = bytearray()
     tail = bytearray()
+    dropped = False
     while True:
         data = pipe.read(_CHUNK)
         if not data:
@@ -281,8 +348,9 @@ def _drain(pipe: BinaryIO, keep: list[bytes]) -> None:
         tail += data
         if len(tail) > _CAPTURE:
             del tail[:-_CAPTURE]
+            dropped = True
     pipe.close()
-    keep.append(bytes(head) + (b"\n...\n" if tail else b"") + bytes(tail))
+    keep.append(bytes(head) + (b"\n...\n" if dropped else b"") + bytes(tail))
 
 
 # --- step 1: the base -------------------------------------------------------------------------------------------
@@ -304,12 +372,14 @@ def ingest_base(runner: GitRunner, spool: Spool, frames: Sequence[Frame], *, obj
     head = spool.read(b.offset, min(b.size, bundlefmt.HEADER_MAX))
     end = head.find(b"\n\n")
     if end < 0:
-        raise Fatal(bundlefmt.MISMATCH, "the base bundle has no blank line in its header")
+        raise Fatal("base-bundle-mismatch", "the base bundle has no blank line in its header")
     try:
         h = bundlefmt.parse(head[:end + 2])
         oid, _ref = bundlefmt.base_of(h)
     except Refused as r:
         raise Fatal("base-bundle-mismatch", f"{r.name}: {r.detail}") from None
+    except Exception as e:  # noqa: BLE001 - a header the grammar did not foresee is still this name
+        raise Fatal("base-bundle-mismatch", f"the base bundle header: {type(e).__name__}") from None
     if h.object_format != object_format:
         raise Fatal("base-bundle-mismatch", f"a {h.object_format} bundle for a {object_format} base")
     if oid != base_oid:
@@ -463,7 +533,13 @@ def ingest_objects(runner: GitRunner, spool: Spool, frames: Sequence[Frame], *, 
 # --- the result line and the run ----------------------------------------------------------------------------------
 
 def probe_enospc(work: Path) -> bool:
-    """The fatal path's one probe: create and write one block in ``.work/``; ENOSPC or EDQUOT there says so."""
+    """The fatal path's own readings: ``statvfs`` of ``.work/spool`` showing no block available to the importer, or
+    one block created and written there failing ENOSPC or EDQUOT."""
+    try:
+        if os.statvfs(work / "spool").f_bavail == 0:
+            return True
+    except OSError:
+        pass
     p = work / "spool" / f".probe-{os.getpid()}"
     try:
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -495,8 +571,22 @@ def result_line(progress: Progress, *, refused: str | None, detail: str, enospc:
     return data
 
 
-def run(argv: Sequence[str], *, stdin: BinaryIO, result_fd: int, work: Path) -> int:
-    ap = argparse.ArgumentParser(prog="export-importer")
+class _Usage(Exception):
+    pass
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse that raises instead of printing and exiting, so a usage error still answers one result line."""
+
+    def error(self, message: str):  # type: ignore[override]
+        raise _Usage(message)
+
+    def exit(self, status: int = 0, message: str | None = None):  # type: ignore[override]
+        raise _Usage(message or f"exit {status}")
+
+
+def _parser() -> _Parser:
+    ap = _Parser(prog="export-importer", add_help=False)
     ap.add_argument("--git", required=True)
     ap.add_argument("--object-format", required=True, choices=sorted(FORMATS))
     ap.add_argument("--base-oid", required=True)
@@ -504,43 +594,63 @@ def run(argv: Sequence[str], *, stdin: BinaryIO, result_fd: int, work: Path) -> 
     ap.add_argument("--max-input-size", required=True, type=int,
                     help="index-pack's input cap and one loose object's size cap (V7 bytes)")
     ap.add_argument("--git-log")
-    a = ap.parse_args(list(argv))
-    if not re.fullmatch(r"[0-9a-f]{%d}" % FORMATS[a.object_format][0], a.base_oid):
-        ap.error("--base-oid is not an oid of the object format")
+    return ap
+
+
+def run(argv: Sequence[str], *, stdin: BinaryIO, result_fd: int, work: Path,
+        trailing_wait: float = TRAILING_WAIT) -> int:
+    """The importer: exactly one result line on ``result_fd`` on every exit path (a usage error, a log that cannot
+    be opened, any failure), then the exit code; a result line that cannot be written exits 1."""
     progress = Progress()
-    log = open(a.git_log, "ab") if a.git_log else None
-    runner = GitRunner(a.git, work, log)
+    log: BinaryIO | None = None
     spool: Spool | None = None
     try:
+        try:
+            a = _parser().parse_args(list(argv))
+        except _Usage as u:
+            raise Fatal(None, f"usage: {u}") from None
+        if not re.fullmatch(r"[0-9a-f]{%d}" % FORMATS[a.object_format][0], a.base_oid):
+            raise Fatal(None, "usage: --base-oid is not an oid of the object format")
+        if a.git_log:
+            try:
+                log = open(a.git_log, "ab")
+            except OSError as e:
+                raise _oserror(e, "--git-log open") from None
+        runner = GitRunner(a.git, work, log)
         try:
             spool = Spool(work / "spool" / "frames")
         except OSError as e:
             raise _oserror(e, "spool create") from None
-        frames = spool_frames(stdin, spool, progress, payload_cap=a.max_bytes)
+        frames = spool_frames(stdin, spool, progress, payload_cap=a.max_bytes, trailing_wait=trailing_wait)
         ingest_base(runner, spool, frames, object_format=a.object_format, base_oid=a.base_oid,
                     cap=a.max_input_size)
         progress.ignored_git_paths = ingest_objects(runner, spool, frames, object_format=a.object_format,
                                                     cap=a.max_input_size)
     except Fatal as f:
         # The decision point: enospc from what THIS path saw, never from an earlier handled failure.
-        enospc = f.own_enospc or ENOSPC_TEXT in f.child_stderr or probe_enospc(work)
-        write_all(result_fd, result_line(progress, refused=f.name, detail=f.detail, enospc=enospc))
-        return 1
+        rc, line = 1, result_line(progress, refused=f.name, detail=f.detail,
+                                  enospc=f.own_enospc or probe_enospc(work))
     except Exception as e:  # noqa: BLE001 - every failure answers one line
-        write_all(result_fd, result_line(progress, refused=None, detail=f"{type(e).__name__}: {e}",
-                                         enospc=probe_enospc(work)))
-        return 1
+        rc, line = 1, result_line(progress, refused=None, detail=f"{type(e).__name__}: {e}",
+                                  enospc=probe_enospc(work))
+    else:
+        rc, line = 0, result_line(progress, refused=None, detail="", enospc=False)
     finally:
         if spool is not None:
             spool.close()
         if log is not None:
             log.close()
-    write_all(result_fd, result_line(progress, refused=None, detail="", enospc=False))
-    return 0
+    try:
+        write_all(result_fd, line)
+    except OSError:
+        return 1
+    return rc
 
 
 def main() -> int:
-    return run(sys.argv[1:], stdin=sys.stdin.buffer, result_fd=4, work=Path(os.getcwd()))
+    # fd 0 unbuffered: no read-ahead hides bytes from the trailing check's readiness wait.
+    stdin = open(0, "rb", buffering=0, closefd=False)
+    return run(sys.argv[1:], stdin=stdin, result_fd=4, work=Path(os.getcwd()))
 
 
 if __name__ == "__main__":

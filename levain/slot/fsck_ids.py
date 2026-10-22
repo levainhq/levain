@@ -5,16 +5,22 @@ Two lists, one rule between them:
 - :data:`CONFIG_IDS`: the ids the importer's root-written config promotes to ``error`` (``fsck.<id>=error``). Only ids
   the floor's git knows; seal-in and doctor check each against the resolved git (:func:`check_config_ids`), an
   unknown one refusing ``git-fsck-id-unknown:<id>`` by name, never dropped.
-- :func:`reader_ids`: the ids Levain's own tree-entry reader checks in the verifier, because bare
-  ``index-pack --fsck-objects`` (the ERROR-default ids only) refuses none of them. DERIVED, never recalled: every
+- :func:`reader_ids`: the ids Levain's own tree-entry reader checks in the verifier. DERIVED, never recalled: every
   CONFIG id whose default severity at the floor tag is below ERROR, plus :data:`LARGE_PATHNAME`, which the floor's git
-  does not know at all.
+  does not know at all. The measured premise (5b1 session 2, on the floor git 2.39.4 and a 2.50.1 host): index-pack's
+  object checks run strict, so a bare ``index-pack --fsck-objects`` refuses every WARN-default id here (``hasDotgit``,
+  ``hasDotdot``, ``nullSha1``, ``zeroPaddedFilemode``, ``fullPathname``; the newer git ``largePathname`` too) and
+  passes the INFO-default ones (``badFilemode``, ``gitattributesSymlink``). The reader keeps the whole derived list
+  anyway: a superset never loosens a check, and the git that runs index-pack can change.
 
 :data:`FLOOR_SEVERITIES` is the floor tag's own table for the CONFIG ids, copied from git's ``fsck.h`` at
 :data:`FLOOR_TAG` (``FOREACH_FSCK_MSG_ID``); its pin is the sha256 of that file, so a re-check is one download.
 
 The adopt floor IS the maintenance floor (S4): :data:`FLOOR`, one table, read by adopt-open's and adopt-verify's
-seal-in and by doctor, with one name, ``git-below-floor:<version>``.
+seal-in and by doctor, with one name, ``git-below-floor:<version>``. Every git probe here is bounded by a timeout and
+answers a named refusal, never a traceback: a git that cannot be run, hangs, exits non-zero or prints a version off
+git's grammar is ``git-below-floor:unparsed``; a fsck-id probe that fails for any reason other than git's own
+"Unhandled message id" for that id is :data:`FSCK_PROBE_FAILED`.
 """
 from __future__ import annotations
 
@@ -22,7 +28,7 @@ import os
 import re
 import subprocess
 import tempfile
-from typing import Callable, Sequence
+from typing import Callable, NamedTuple, Sequence
 
 from levain.slot import Refused
 
@@ -84,25 +90,51 @@ def closed_ids() -> tuple[str, ...]:
     return tuple(out)
 
 
-_VERSION = re.compile(r"^git version (\d+)\.(\d+)\.(\d+)")
+#: ``git version <v>``, ``<v>`` by git's own version grammar (``GIT-VERSION-GEN`` turns ``git describe``'s dashes
+#: into dots): a three- or four-number release; a prerelease ``.rc<N>``; a development build ``.<commits>.g<hex>``;
+#: ``.dirty``; Git for Windows' ``.windows.<N>``; and Apple's `` (Apple Git-<N>)``. Anything else does not parse.
+_VERSION = re.compile(r"git version (?P<v>(?P<rel>\d+\.\d+\.\d+(?:\.\d+)?)(?:\.rc(?P<rc>\d+))?"
+                      r"(?:\.(?P<dev>\d+)\.g[0-9a-f]+)?(?:\.dirty)?(?:\.windows\.\d+)?)"
+                      r"(?: \(Apple Git-\d+\))?")
+UNPARSED = "git-below-floor:unparsed"
+#: The refusal of a fsck-id probe that failed for any reason but git not knowing the id.
+FSCK_PROBE_FAILED = "git-fsck-probe-failed"
+#: Seconds each probe may take.
+VERSION_TIMEOUT = 10.0
+FSCK_TIMEOUT = 30.0
 
 
-def parse_version(text: str) -> tuple[int, int, int] | None:
-    m = _VERSION.match(text.strip())
-    return None if m is None else (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+class GitVersion(NamedTuple):
+    text: str                   # the version as git printed it, without ``git version`` or Apple's suffix
+    release: tuple[int, ...]    # three numbers, or four
+    rc: int | None              # the prerelease number; None for a release
+    dev: int                    # commits past the tag of a development build; 0 otherwise
+
+    def key(self) -> tuple:
+        """Ordering: by release, a prerelease below its release, then a development build after its tag."""
+        return ((*self.release, 0)[:4], (0, self.rc) if self.rc is not None else (1, 0), self.dev)
+
+
+def parse_version(text: str) -> GitVersion | None:
+    """``git --version``'s whole output by the grammar above, or None."""
+    m = _VERSION.fullmatch(text.strip())
+    if m is None:
+        return None
+    return GitVersion(m.group("v"), tuple(int(x) for x in m.group("rel").split(".")),
+                      None if m.group("rc") is None else int(m.group("rc")), int(m.group("dev") or 0))
 
 
 def check_floor(version_text: str) -> tuple[int, int, int]:
-    """``git --version``'s text against :data:`FLOOR`: the parsed version, or ``git-below-floor:<version>``. A text
-    that does not parse refuses as ``git-below-floor:unparsed`` (a git that cannot say its version is not trusted to
-    be above the floor)."""
+    """``git --version``'s text against :data:`FLOOR`: the release's three numbers, or ``git-below-floor:<version>``
+    (a prerelease of the floor release is below it). A text off the grammar refuses as ``git-below-floor:unparsed``
+    (a git that cannot say its version is not trusted to be above the floor)."""
     v = parse_version(version_text)
     if v is None:
-        raise Refused("git-below-floor:unparsed", version_text.strip()[:120])
-    if v < FLOOR:
-        raise Refused(f"git-below-floor:{'.'.join(map(str, v))}",
+        raise Refused(UNPARSED, version_text.strip()[:120])
+    if v.key() < GitVersion("", FLOOR, None, 0).key():
+        raise Refused(f"git-below-floor:{v.text}",
                       f"the resolved git is below the floor {'.'.join(map(str, FLOOR))}")
-    return v
+    return v.release[0], v.release[1], v.release[2]
 
 
 #: The scrubbed environment every check here runs git under: no system or global config, no home.
@@ -112,28 +144,54 @@ SCRUBBED_ENV = {"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG
 Run = Callable[..., subprocess.CompletedProcess]
 
 
-def git_version_text(git: str, *, run: Run = subprocess.run) -> str:
-    return run([git, "--version"], capture_output=True, text=True, env=SCRUBBED_ENV, cwd="/").stdout
+def _probe(run: Run, argv: list[str], timeout: float, name: str, what: str) -> subprocess.CompletedProcess:
+    """One bounded git probe: a git that cannot run or does not answer within ``timeout`` refuses ``name``."""
+    try:
+        return run(argv, capture_output=True, text=True, errors="replace", env=SCRUBBED_ENV, cwd="/",
+                   timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise Refused(name, f"{what}: no answer within {timeout:g} s") from None
+    except (OSError, ValueError) as e:
+        raise Refused(name, f"{what}: {type(e).__name__}: {e}"[:200]) from None
+
+
+def git_version_text(git: str, *, run: Run = subprocess.run, timeout: float = VERSION_TIMEOUT) -> str:
+    """``git --version``'s output, from a run that exited 0 within ``timeout``; otherwise ``git-below-floor:unparsed``."""
+    r = _probe(run, [git, "--version"], timeout, UNPARSED, "git --version")
+    if r.returncode != 0:
+        raise Refused(UNPARSED, f"git --version exited {r.returncode}")
+    return r.stdout
 
 
 def check_config_ids(git: str, ids: Sequence[str] = CONFIG_IDS, *, run: Run = subprocess.run,
-                     scratch_parent: str | None = None) -> None:
+                     scratch_parent: str | None = None, timeout: float = FSCK_TIMEOUT) -> None:
     """Each id in ``ids`` against ``git`` on an empty scratch repository: ``git -c fsck.<id>=error fsck`` must exit 0.
-    git dies on an id it does not know (``Unhandled message id``); any failure refuses ``git-fsck-id-unknown:<id>``
-    for the first such id, git's own line in the detail."""
-    with tempfile.TemporaryDirectory(prefix="levain-fsckids-", dir=scratch_parent) as d:
-        repo = os.path.join(d, "e.git")
-        r = run([git, "init", "-q", "--bare", repo], capture_output=True, text=True, env=SCRUBBED_ENV, cwd="/")
-        if r.returncode != 0:
-            raise Refused("git-fsck-id-unknown:" + (ids[0] if ids else "none"), "a scratch repository could not be made")
-        for i in ids:
-            r = run([git, f"--git-dir={repo}", "-c", f"fsck.{i}=error", "fsck", "--no-progress"],
-                    capture_output=True, text=True, env=SCRUBBED_ENV, cwd="/")
+    git dies on an id it does not know (``fatal: Unhandled message id: <id lowercased>``): that, and only that, refuses
+    ``git-fsck-id-unknown:<id>`` for the first such id. Every other failure (the scratch repository not made, a fsck
+    killed, timed out or failing otherwise) is :data:`FSCK_PROBE_FAILED`, git's own line in the detail."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="levain-fsckids-", dir=scratch_parent) as d:
+            repo = os.path.join(d, "e.git")
+            r = _probe(run, [git, "init", "-q", "--bare", repo], timeout, FSCK_PROBE_FAILED, "scratch git init")
             if r.returncode != 0:
-                line = (r.stderr.strip().splitlines() or [""])[-1]
-                raise Refused(f"git-fsck-id-unknown:{i}", f"rc {r.returncode}: {line[:200]}")
+                raise Refused(FSCK_PROBE_FAILED, f"scratch git init rc {r.returncode}: {_last(r.stderr)}")
+            for i in ids:
+                r = _probe(run, [git, f"--git-dir={repo}", "-c", f"fsck.{i}=error", "fsck", "--no-progress"],
+                           timeout, FSCK_PROBE_FAILED, f"fsck under fsck.{i}=error")
+                if r.returncode == 0:
+                    continue
+                if f"fatal: Unhandled message id: {i.lower()}" in r.stderr.splitlines():
+                    raise Refused(f"git-fsck-id-unknown:{i}", f"rc {r.returncode}: {_last(r.stderr)}")
+                raise Refused(FSCK_PROBE_FAILED, f"fsck under fsck.{i}=error rc {r.returncode}: {_last(r.stderr)}")
+    except OSError as e:
+        raise Refused(FSCK_PROBE_FAILED, f"the scratch directory: {type(e).__name__}: {e}"[:200]) from None
+
+
+def _last(stderr: str) -> str:
+    return (stderr.strip().splitlines() or [""])[-1][:200]
 
 
 __all__ = ["CONFIG_IDS", "DEFAULT_ERROR_NAMED", "FLOOR", "FLOOR_FSCK_H_SHA256", "FLOOR_SEVERITIES", "FLOOR_TAG",
-           "LARGE_PATHNAME", "SCRUBBED_ENV", "check_config_ids", "check_floor", "closed_ids", "git_version_text",
-           "parse_fsck_h", "parse_version", "reader_ids", "snake_to_id"]
+           "FSCK_PROBE_FAILED", "FSCK_TIMEOUT", "GitVersion", "LARGE_PATHNAME", "SCRUBBED_ENV", "UNPARSED",
+           "VERSION_TIMEOUT", "check_config_ids", "check_floor", "closed_ids", "git_version_text", "parse_fsck_h",
+           "parse_version", "reader_ids", "snake_to_id"]
