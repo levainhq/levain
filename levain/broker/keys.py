@@ -131,9 +131,10 @@ GW_ACCOUNT = "_levain_gw{}"
 KEYS_ACCOUNT = "_levain_keys"
 CONTROL_ACCOUNT = "_levain_control"
 FRONTS_GROUP = "levain-gwfronts"
-#: admin.sock's group: CONTROL's own primary group, so no account but CONTROL (and keys, its owner) can connect.
-#: keys binds the socket as itself, so its account must be a member of this group for the chown to succeed.
-ADMIN_GROUP = CONTROL_ACCOUNT
+#: admin.sock's group: a shared group whose only members are keys and CONTROL, so no other account can connect (and
+#: the peer uid check admits CONTROL alone). keys binds the socket as itself, so it must be a member for the chown to
+#: succeed; a primary group stays its own account's only, hence a shared group and not CONTROL's.
+ADMIN_GROUP = "levain-keysadmin"
 
 _K = gwwire.encode(b"K")
 _A = gwwire.encode(b"A")

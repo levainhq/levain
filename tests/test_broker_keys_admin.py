@@ -230,12 +230,15 @@ def test_admin_eof_kills_cached_tokens_and_fronts(monkeypatch):
 def test_admin_socket_group_admits_keys_and_control():
     """keys binds admin.sock as itself and gives it ADMIN_GROUP: a non-root process may only do that for a group it
     is in, so the install's membership table must put keys in it (else keys exits at startup), and CONTROL, the
-    one admitted peer, must reach the socket through it."""
-    from levain.slot.accounts import supplementary_groups
-    keys_groups = {K.KEYS_ACCOUNT, *supplementary_groups(K.KEYS_ACCOUNT)}   # its own primary group, and the rest
-    assert K.ADMIN_GROUP in keys_groups
-    assert K.FRONTS_GROUP in keys_groups
-    assert K.ADMIN_GROUP in {K.CONTROL_ACCOUNT, *supplementary_groups(K.CONTROL_ACCOUNT)}
+    one admitted peer, must reach the socket through it. It is a shared group the install makes, never an
+    account's own primary group, and nobody else is in it."""
+    from levain.slot.accounts import OPERATOR_GROUPS, supplementary_groups
+    from levain.slot.ids import SHARED_GROUPS, SINGLETONS
+    assert K.ADMIN_GROUP == "levain-keysadmin" and K.ADMIN_GROUP in SHARED_GROUPS
+    assert K.FRONTS_GROUP in supplementary_groups(K.KEYS_ACCOUNT)
+    everyone = (*SINGLETONS, *(f"_levain_{p}{i}" for p in ("s", "gw", "v", "c") for i in (0, 1)))
+    assert {n for n in everyone if K.ADMIN_GROUP in supplementary_groups(n)} == {K.KEYS_ACCOUNT, K.CONTROL_ACCOUNT}
+    assert K.ADMIN_GROUP not in OPERATOR_GROUPS
 
 
 def test_admin_stalled_peer_closed_within_bound(monkeypatch):
