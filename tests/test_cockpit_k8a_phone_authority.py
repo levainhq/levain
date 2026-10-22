@@ -785,3 +785,62 @@ def test_a_retried_signature_after_a_revoke_answers_the_persisted_outcome(instal
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_concurrent_signatures_never_take_the_read_slots(install, monkeypatch):
+    # K-3 (codex MED, complement LOW 4): signatures for several pendings at once each held a read slot while waiting on
+    # the write lock, so the board answered 503 for as long as ssh-keygen ran. A cockpit write now runs one at a time on
+    # its own gate, never a read slot, and a queued writer waits a bounded time, then answers busy (503)
+    import time
+
+    import levain.cockpit.broker as broker_mod
+    import levain.phone_server as ps
+
+    monkeypatch.setattr(ps, "_WRITE_WAIT", 1.0)
+    w = install
+    entered, release = threading.Event(), threading.Event()
+    real = broker_mod.verify_cockpit_signature
+
+    def slow(*a: Any, **kw: Any) -> Any:
+        entered.set()
+        release.wait(20)
+        return real(*a, **kw)
+
+    base, httpd = _serve(w.qdir)
+    try:
+        bodies = []
+        for i in range(ps._MAX_INFLIGHT + 1):
+            row = _tray_row(base)
+            status, out = _fire(base, {"fingerprint": w.phone.fingerprint, "verb": "spore_update", "panel_id": "tray",
+                                       "row_id": row["id"], "row_version": row["version"], "params": {"text": f"c{i}"}})
+            assert status == 200, out
+            pend = _call(base, f"/cockpit/pending/{out['pending_id']}")[1]
+            ad, cdj, der = w.phone.assertion(_unb64u(pend["challenge"]), origin=base)
+            bodies.append((out["pending_id"], {"fingerprint": w.phone.fingerprint, "authenticator_data": _b64u(ad),
+                                               "client_data_json": _b64u(cdj), "signature": _b64u(der)}))
+        monkeypatch.setattr(broker_mod, "verify_cockpit_signature", slow)
+        got: dict = {}
+        threads = [threading.Thread(target=lambda p=p, b=b: got.update({p: _call(base, f"/cockpit/pending/{p}/signature",
+                                                                                     b)})) for p, b in bodies]
+        for t in threads:
+            t.start()
+        try:
+            assert entered.wait(20)
+            time.sleep(0.3)                    # the other signatures reach their wait
+            for _ in range(3):
+                status, board = _call(base, "/app/board.json", timeout=3)
+                assert status == 200, board
+            # each queued writer is answered busy within its bound while the first still verifies
+            deadline = time.monotonic() + 10
+            while len(got) < len(bodies) - 1 and time.monotonic() < deadline:
+                time.sleep(0.1)
+            busy = [r for r in got.values() if r[0] == 503]
+            assert len(busy) == len(bodies) - 1 and all(r[1]["error"] == "busy" for r in busy), got
+        finally:
+            release.set()
+            for t in threads:
+                t.join(30)
+        assert sum(1 for r in got.values() if r[0] == 200 and r[1]["state"] == "COMMITTED") == 1, got
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

@@ -99,6 +99,10 @@ _GRANT_PREFIX = "/grant/"
 _GRANT_ACTIONS = ("revoke-challenge", "revoke")
 _MAX_BODY = 16 * 1024          # an assertion is well under 2 KB, an answer record under 1 KB
 _MAX_INFLIGHT = 4              # each answer replays the authority log; past this a caller gets 503, never a queue
+# a cockpit write (a verb, a signature, a cancel) runs one at a time on its own gate, never a read slot: a signature's
+# check is two ssh-keygen runs of 10 s each at most. A queued writer waits this long at most, then answers busy (503);
+# past _MAX_INFLIGHT writers (the running one included) one is busy at once, so waiting threads stay bounded
+_WRITE_WAIT = 5.0
 # how long a ruling's response waits for its delivery, which runs on its own thread holding no request slot (a
 # listing and a resume's settle each take seconds to tens of seconds); past this the page says it is still running
 _DELIVERY_WAIT = 45.0
@@ -351,15 +355,34 @@ class _PhoneHandler(GuardedHandler):
         if clen is None or self._refuse_oversize(clen, _MAX_BODY, _MAX_BODY * 4):
             return True
         body = self.rfile.read(clen)
-        # a cockpit signature carries a passkey ceremony the person just made: it waits a moment for a slot
-        waits = route.endswith("/signature")
-        if not (self.server.request_gate.acquire(timeout=5) if waits else self.server.request_gate.acquire(blocking=False)):
+        if _cockpit_route("POST", route) is not None:
+            return self._cockpit_write(route, body)
+        if not self.server.request_gate.acquire(blocking=False):
             self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503)
             return True
         try:
             return self._app_route("POST", route, body)
         finally:
             self.server.request_gate.release()
+
+    def _cockpit_write(self, route: str, body: bytes) -> bool:
+        """A cockpit write on the write gate (``_WRITE_WAIT``): it takes no read slot, so the board and pending reads
+        answer while a signature's ssh-keygen runs; a signature carries a passkey ceremony the person just made, so a
+        writer waits a bounded moment for the gate rather than throw it away, then hears busy."""
+        busy = {"error": "busy", "message": "the phone port is busy with another write; try again"}
+        if not self.server.write_waiters.acquire(blocking=False):
+            self._json(busy, 503)
+            return True
+        try:
+            if not self.server.write_gate.acquire(timeout=_WRITE_WAIT):
+                self._json(busy, 503)
+                return True
+            try:
+                return self._app_route("POST", route, body)
+            finally:
+                self.server.write_gate.release()
+        finally:
+            self.server.write_waiters.release()
 
     # -- writes ------------------------------------------------------------------------------------------
 
@@ -454,6 +477,9 @@ class _PhoneServer(ThreadingHTTPServer):
         self.phone_token = token
         self.allowed_hosts = _LOOPBACK_HOSTS | {str(self.server_address[0]).lower(), rp_id}
         self.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
+        # the cockpit writes' own gate (one at a time) and the bound on writers holding or waiting for it (K8a K-3)
+        self.write_gate = threading.BoundedSemaphore(1)
+        self.write_waiters = threading.BoundedSemaphore(_MAX_INFLIGHT)
         # one replay cache for every request this server answers: a replay re-verifies only the links past what it
         # already holds, so a page that asks again costs one ssh-keygen run per new link, not one per link
         self.replay_cache = ReplayCache()
