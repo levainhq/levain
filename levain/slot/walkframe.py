@@ -186,13 +186,19 @@ def read_header(fh: BinaryIO) -> dict | None:
     if "end" in header:
         check_terminal(header)
     else:
-        parts = check_entry(header).split(b"/")
-        # The decoder's bound is the format's: a path no deeper than MAX_DEPTH, no component past NAME_MAX.
-        if len(parts) > MAX_DEPTH:
-            raise _bad("path_b64", f"{len(parts)} components > {MAX_DEPTH}")
-        if any(len(p) > NAME_MAX for p in parts):
-            raise _bad("path_b64", f"a component past {NAME_MAX} bytes")
+        check_path_bound(check_entry(header))
     return header
+
+
+def check_path_bound(path: bytes) -> None:
+    """The decoder's bound, which is the format's: a path no deeper than :data:`MAX_DEPTH`, no component past
+    :data:`NAME_MAX`. Not in :func:`check_entry` (step 3's depth scan and the manifest reader share that and
+    must see deeper paths); the walker preflights every path it will frame with this before its first frame."""
+    parts = path.split(b"/")
+    if len(parts) > MAX_DEPTH:
+        raise _bad("path_b64", f"{len(parts)} components > {MAX_DEPTH}")
+    if any(len(p) > NAME_MAX for p in parts):
+        raise _bad("path_b64", f"a component past {NAME_MAX} bytes")
 
 
 def iter_frames(fh: BinaryIO, *, payload_cap: int = _INT_MAX) -> Iterator[tuple[dict, bytes]]:

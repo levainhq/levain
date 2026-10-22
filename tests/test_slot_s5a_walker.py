@@ -26,7 +26,8 @@ def _retained(tmp_path: Path) -> tuple[Path, Path]:
     return t, mf
 
 
-def _walk(tree: Path, mf: Path, *, deadline: float, seams: walker.WalkSeams) -> tuple[Exception | None, bytes]:
+def _walk(tree: Path, mf: Path, *, deadline: float, seams: walker.WalkSeams,
+          depth: int = end.MANIFEST_DEPTH) -> tuple[Exception | None, bytes]:
     r, w = os.pipe()
     got = bytearray()
 
@@ -38,7 +39,7 @@ def _walk(tree: Path, mf: Path, *, deadline: float, seams: walker.WalkSeams) -> 
     th.start()
     err = None
     try:
-        walker.walk_frames(tree, mf, w, depth=end.MANIFEST_DEPTH,
+        walker.walk_frames(tree, mf, w, depth=depth,
                            caps=walker.WalkCaps(bytes=1 << 30, entries=1000, deadline=deadline),
                            base_bundle_sha256="sha256:" + hashlib.sha256(BUNDLE).hexdigest(), seams=seams)
     except Refused as e:
@@ -95,3 +96,48 @@ def test_the_opened_file_is_checked_against_the_manifest(tmp_path: Path, change:
     err, got = _walk(tree, mf, deadline=time.monotonic() + 60, seams=seams)
     assert err is not None and err.name == "walk-manifest-mismatch"
     assert not _has_terminal(got)
+
+
+def test_a_path_past_the_decoders_bound_refuses_before_the_first_frame(tmp_path: Path) -> None:
+    # Reproduced on eb6931ea (s5-5a-fix2 fail_before.txt item 2): a directory MAX_DEPTH + 1 components deep was
+    # framed after the earlier frames went out, and only the decoder refused it (frame-bad:path_b64).
+    tree, _ = _retained(tmp_path)
+    fd = os.open(tree / "repo", os.O_RDONLY | os.O_DIRECTORY)
+    for _ in range(walkframe.MAX_DEPTH):
+        os.mkdir("d", dir_fd=fd)
+        nfd = os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+        os.close(fd)
+        fd = nfd
+    os.close(fd)
+    depth = walkframe.MAX_DEPTH + 8
+    mf = tmp_path / "deep.jsonl"
+    end._stream_jsonl(mf, end.iter_manifest(tree, caps=end.Caps(depth=depth)), 1 << 40, "x")
+    err, got = _walk(tree, mf, deadline=time.monotonic() + 60, seams=walker.WalkSeams(owner_uid=os.getuid()),
+                     depth=depth)
+    assert err is not None and err.name == "frame-bad:path_b64"
+    assert got == b""
+
+
+def test_a_lock_taken_past_the_deadline_is_released_and_refused(tmp_path: Path) -> None:
+    # Reproduced on eb6931ea (s5-5a-fix2 fail_before.txt item 1): a sleep that overshot V7's deadline while the
+    # holder released let flock_until take the adopt lock late and return True.
+    import fcntl
+    import types
+
+    from levain.slot import runtime_helper as RH
+
+    holder = os.open(tmp_path / "adopt.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    fd = os.open(tmp_path / "adopt.lock", os.O_RDWR)
+    now = [100.0]
+
+    def sleep(s: float) -> None:
+        now[0] += s + 1.0
+        fcntl.flock(holder, fcntl.LOCK_UN)
+
+    try:
+        assert RH.flock_until(fd, 100.05, types.SimpleNamespace(monotonic=lambda: now[0], sleep=sleep)) is False
+        assert RH.try_flock(holder)   # the late acquisition was let go
+    finally:
+        os.close(fd)
+        os.close(holder)

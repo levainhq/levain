@@ -166,13 +166,13 @@ _REF_BAD = re.compile(rb"[\x00-\x20\x7f~^:?*\[\\]")
 
 def branch_ref_ok(name: bytes) -> bool:
     """``refs/heads/<name>`` with ``<name>`` a valid ref name by git's ``check-ref-format`` rules: no control
-    byte, space or ``~^:?*[\\``, no ``..`` or ``@{``, not ``@``, no empty component, none starting with ``.`` or
+    byte, space or ``~^:?*[\\``, no ``..`` or ``@{``, no empty component, none starting with ``.`` or
     ending ``.lock``, and not ending ``/`` or ``.``."""
     prefix = b"refs/heads/"
     if not name.startswith(prefix) or len(name) == len(prefix):
         return False
     rest = name[len(prefix):]
-    if _REF_BAD.search(rest) or b".." in rest or b"@{" in rest or rest == b"@" or rest.endswith((b"/", b".")):
+    if _REF_BAD.search(rest) or b".." in rest or b"@{" in rest or rest.endswith((b"/", b".")):
         return False
     return all(c and not c.startswith(b".") and not c.endswith(b".lock") for c in rest.split(b"/"))
 

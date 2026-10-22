@@ -1932,14 +1932,22 @@ os.register_at_fork(after_in_child=_close_adopt_locks_in_child)
 def flock_until(fd: int, deadline: float, seams: Seams) -> bool:
     """``LOCK_EX`` by ``LOCK_NB`` retries until the absolute ``deadline`` (``seams.monotonic`` value): the backoff
     of :func:`wait_flock` (which takes a duration), each sleep cut to what is left. Touches no signal state.
-    False at the deadline."""
+    False at the deadline: the clock is read before every try and after a success, and a lock taken at or past the
+    deadline (a sleep that overshot it while the holder released) is unlocked and refused."""
     delay = LOCK_SLICE_S
-    while not try_flock(fd):
+    while True:
+        if deadline - seams.monotonic() <= 0:
+            return False
+        if try_flock(fd):
+            break
         left = deadline - seams.monotonic()
         if left <= 0:
             return False
         seams.sleep(min(delay, left))
         delay = min(delay * 2, 0.5)
+    if seams.monotonic() >= deadline:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
     return True
 
 

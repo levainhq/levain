@@ -34,3 +34,9 @@ def test_a_refused_header_leaves_no_staged_bundle(tmp_path, data, name):
         _stage(tmp_path, data)
     assert e.value.name == name
     assert not (tmp_path / "dest" / st.BUNDLE_NAME).exists()
+
+
+@pytest.mark.parametrize("name, ok", [(b"refs/heads/@", True), (b"refs/heads/a/@", True), (b"refs/heads/a@{b", False)])
+def test_branch_ref_ok_follows_check_ref_format(name, ok):
+    # Reproduced on eb6931ea: refs/heads/@ was refused, though `git check-ref-format refs/heads/@` exits 0.
+    assert BF.branch_ref_ok(name) is ok

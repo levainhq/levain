@@ -332,6 +332,24 @@ def _link_target(e: Entry, rec: dict) -> bytes:
     return target
 
 
+def _preflight(manifest: Path) -> None:
+    """Before the first frame: every manifest path the walk will frame (the walk is merged against the manifest
+    path for path, so these are the framed paths) is within the decoder's bound,
+    :func:`walkframe.check_path_bound`, else its ``frame-bad:path_b64`` refuses with nothing written. The same
+    pruning as the walk: an ``OUT`` path is not framed, and nothing below a directory adopt does not descend."""
+    mf = _Manifest(manifest)
+    try:
+        while (rec := mf.take()) is not None:
+            path = rec["_path"]
+            where = scope(path)
+            if where != FRAME and rec["type"] == "dir":
+                mf.skip_under(path)
+            if where != OUT:
+                walkframe.check_path_bound(path)
+    finally:
+        mf.close()
+
+
 def walk_frames(tree: Path, manifest: Path, out_fd: int, *, depth: int, caps: WalkCaps,
                 base_bundle_sha256: str, seams: WalkSeams | None = None) -> WalkResult:
     """Stream ``tree`` (the retained ``tree/``) to ``out_fd`` as ``levain-walk/1`` frames, merged against
@@ -340,6 +358,7 @@ def walk_frames(tree: Path, manifest: Path, out_fd: int, *, depth: int, caps: Wa
     (``base-bundle-mismatch``; absent, not a file, or ``unread`` the same). Raises :class:`Refused` by name with no
     terminal frame written."""
     seams = seams or WalkSeams()
+    _preflight(manifest)
     pipe = _Pipe(out_fd, caps.deadline, seams.clock)
     mf = _Manifest(manifest)
     it = seams.walk(tree, depth_cap=depth, prune=adopt_prune)
