@@ -7,17 +7,23 @@ ce447bf7 (raw: levain-memory 1021-32/r1a-fix2/):
 2. G2: a child that will not die after its SIGKILL (uninterruptible sleep on a wedged volume). ``reap_within``, past
    its deadline, waited on it with a blocking ``waitpid(pid, 0)``: the clone's bound held START under the session
    lock forever.
+3. G2, fix round 3 (reproduced on fix 2's tip 58f20980, raw: levain-memory 1021-35/r1a-fix3/): the same child as
+   END's or stage's reader, killed on a deadline (``manifest-time-cap``, any refusal). Its ``wait()`` was a blocking
+   ``waitpid(pid, 0)``, so END's budget held nothing.
 """
 from __future__ import annotations
 
 import os
 import signal
+import time
 
 import pytest
 
 from levain.slot import Refused
+from levain.slot import end as E
 from levain.slot import proc as P
 from levain.slot import runtime_helper as H
+from levain.slot import stage as S
 from tests.test_slot_r1a_fix1 import Loopers
 
 SLOT = 5001
@@ -68,3 +74,28 @@ def test_a_child_that_will_not_die_cannot_hold_the_bound(monkeypatch):
     finally:
         if CHILD in P._LEFTOVER:
             P._LEFTOVER.remove(CHILD)
+
+
+@pytest.mark.parametrize("cls", [S._Forked, E._Forked], ids=["stage", "end"])
+def test_a_killed_reader_that_will_not_die_cannot_hold_the_budget(monkeypatch, cls):
+    killed: list[int] = []
+
+    def waitpid(pid: int, flags: int) -> tuple[int, int]:
+        if not flags & os.WNOHANG:
+            raise AssertionError("a blocking waitpid on a killed reader that will not die: END hangs forever")
+        return 0, 0
+
+    def kill(pid: int, sig: int) -> None:
+        assert sig == signal.SIGKILL
+        killed.append(pid)
+    monkeypatch.setattr(os, "waitpid", waitpid)
+    monkeypatch.setattr(os, "kill", kill)
+    monkeypatch.setattr(P, "_LEFTOVER", set())
+    reader = cls(CHILD)
+    reader.kill()                                                 # the deadline path: kill, then the finally's wait
+    t0 = time.monotonic()
+    code = reader.wait()
+    assert time.monotonic() - t0 <= P.REAP_GRACE_S + 0.5
+    assert CHILD in P._LEFTOVER and set(killed) == {CHILD}
+    assert code is None                                           # END's code: a killed reader failed
+    assert reader.wait() is None and P._LEFTOVER == {CHILD}       # once: the leftover set owns it now

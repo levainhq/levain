@@ -675,12 +675,15 @@ SessionRunAs = Callable[[int, int, Callable[[int], None], int, Sequence[int]], "
 
 
 class _Forked(stage._Forked):
-    """stage's forked reader, whose ``wait()`` also returns the exit status (a signal = 128 + its number)."""
+    """stage's forked reader, whose ``wait()`` also returns the exit status (a signal = 128 + its number). A killed
+    reader's is ``None`` (failed): stage's bounded reap takes it, and one that will not die is never waited on."""
 
     code: int | None = None
 
     def wait(self) -> int | None:   # type: ignore[override]
-        if not self._reaped:
+        if self._killed:
+            super().wait()
+        elif not self._reaped:
             _, status = os.waitpid(self.pid, 0)
             self._reaped = True
             self.code = os.waitstatus_to_exitcode(status)

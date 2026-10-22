@@ -733,10 +733,15 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc) -> int:
 
 
 def _wake(seams: H.Seams) -> None:
-    if seams.wake_reaper is not None:
-        seams.wake_reaper()
-    else:
-        H.wake_reaper(seams.R)
+    """Best-effort: a wake that fails is noted, never the verb's answer (it runs in a ``finally``, so raising would
+    mask an exception already leaving the lock, or fail a start whose vendor already runs)."""
+    try:
+        if seams.wake_reaper is not None:
+            seams.wake_reaper()
+        else:
+            H.wake_reaper(seams.R)
+    except Exception as e:   # noqa: BLE001 - a wake never changes the verb's answer
+        _note(f"reaper wake failed: {type(e).__name__}")
 
 
 # --- teardown (§7.4 END, §7.3 SCRUBBED) ----------------------------------------------------------------------------

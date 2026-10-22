@@ -38,6 +38,7 @@ from typing import Callable, Mapping, Protocol, Sequence
 
 from levain.launch import allowed_env
 from levain.slot import Refused, wall, write_all
+from levain.slot import proc as PR
 from levain.slot.render import parse_driver_input
 
 BUNDLE_CAP = 8 * 1024 ** 3          # §11 V19
@@ -104,9 +105,11 @@ class _Forked:
     def __init__(self, pid: int) -> None:
         self.pid = pid
         self._reaped = False
+        self._killed = False
 
     def kill(self) -> None:
         if not self._reaped:
+            self._killed = True
             try:
                 os.kill(self.pid, 9)
             except ProcessLookupError:
@@ -114,7 +117,10 @@ class _Forked:
 
     def wait(self) -> None:
         if not self._reaped:
-            os.waitpid(self.pid, 0)
+            if self._killed:   # a deadline's kill: never a blocking wait (one that will not die joins the leftovers)
+                PR.kill_and_reap(self.pid)
+            else:
+                os.waitpid(self.pid, 0)
             self._reaped = True
 
 

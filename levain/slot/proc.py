@@ -834,13 +834,18 @@ def _poll_wait(pid: int, flags: int, deadline: float, waitpid: Callable[[int, in
         delay = min(delay * 2, POLL_MAX_S)
 
 
-def kill_and_reap(pid: int, kill: Callable[[int, int], None] = os.kill,
-                  waitpid: Callable[[int, int], tuple[int, int]] = os.waitpid,
-                  clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> None:
+def kill_and_reap(pid: int, kill: Callable[[int, int], None] | None = None,
+                  waitpid: Callable[[int, int], tuple[int, int]] | None = None,
+                  clock: Callable[[], float] | None = None, sleep: Callable[[float], None] | None = None) -> None:
     """SIGKILL the caller's own child ``pid`` and poll its reap (``WNOHANG``) for at most :data:`REAP_GRACE_S`; a
     child still unreaped then (stuck in an uninterruptible kernel state: a wedged disk or network volume) joins the
     leftover set for :func:`reap_leftovers`, and the call returns. Never a blocking wait: a caller past its deadline
-    gets its answer within the grace, whatever the child does."""
+    gets its answer within the grace, whatever the child does. An omitted seam is the ``os`` / ``time`` one, looked up
+    at the call (a patched ``os`` is honoured)."""
+    kill = os.kill if kill is None else kill
+    waitpid = os.waitpid if waitpid is None else waitpid
+    clock = time.monotonic if clock is None else clock
+    sleep = time.sleep if sleep is None else sleep
     try:
         kill(pid, signal.SIGKILL)
     except ProcessLookupError:   # already dead: still ours to reap
