@@ -142,17 +142,22 @@ async def _read_response(up: Upstream) -> Any:
 
 
 async def open_exchange(addr: str, port: int, host: str, exchange: Any) -> Upstream:
-    """The only way to an exchange's `Upstream`. The exchange is mandatory. The `Upstream` is stored on the exchange
-    with no await between its construction and the store, so a phase 1 either finds it (and phase 2 aborts it) or ran
-    before it existed (and this function sees `detached` and aborts it)."""
+    """The only way to an exchange's `Upstream`. The exchange is mandatory and holds ONE: a second call for it is
+    refused (the new `Upstream` aborted, the one it holds kept, so no transport is left in no registry). The `Upstream`
+    is stored on the exchange with no await between its construction and the store, so a phase 1 either finds it (and
+    phase 2 aborts it) or ran before it existed (and this function sees `detached`, aborts it and clears the store)."""
     reader, writer, plain_writer = await _handshake(addr, port, host)
     up = Upstream(reader, writer, exchange, _keepalive=plain_writer)
     try:
+        if exchange.upstream is not None:
+            raise ValueError("this exchange holds an Upstream already")
         exchange.upstream = up
         if exchange.detached:
             raise StaleExchange()
     except BaseException:
         up.abort()   # never raises, so the propagating exception is the original
+        if exchange.upstream is up:
+            exchange.upstream = None
         raise
     return up
 

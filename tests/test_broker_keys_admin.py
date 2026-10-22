@@ -503,3 +503,266 @@ def test_resolve_fenced_across_preemption_then_shutdown_order(monkeypatch):
     assert [x.get("dropped") for x in out["dropped"]] == [True, False]
     assert out["calls"] == ["begin_closing", "cancel_detached"]
     assert out["took"] < K.SHUTDOWN_WAIT_S and out["admin"] is None
+
+
+# --- P4b: THE FRAME, at every suspension (design 1.5 "test_revoke_at_every_suspension") ------------------------------
+
+_SECRET = "sk-frame-test-SECRET"
+_FRAME_TOKEN = "F" * 43
+_FRAME_CLAIMS = {"routes": ["r"], "front": {"uid": 70000, "pid": 1, "start": 1}, "incarnation": 1}
+_FRAME_Q = {"v": 1, "token": _FRAME_TOKEN, "route": "r", "method": "POST", "path": "/v1/messages", "query": "",
+            "headers": [["content-type", "application/json"]], "body": "length:5", "upgrade": "none"}
+
+
+def _frame_lib(d: str) -> None:
+    """L: a base map with one brokered route `r` naming the static credential `c1`, and that credential."""
+    os.makedirs(os.path.join(d, "routes"))
+    os.makedirs(os.path.join(d, "keys", "cred"))
+    route = {"route": "r", "type": "brokered",
+             "upstream": {"scheme": "https", "host": "api.example.com", "base_path": ""}, "credential": "c1",
+             "requests": {"templates": [{"method": "POST", "path": "/v1/messages"}],
+                          "headers": {"content-type": "application/json"}, "body_cap": 1024, "body_codec": "none"},
+             "max_call_microdollars": 1000, "max_session_microdollars": 100000}
+    with open(os.path.join(d, "routes", "base.json"), "wb") as f:
+        f.write(canon.canonical_bytes({"format": K.BASE_MAP_FORMAT, "routes": [route]}))
+    with open(os.path.join(d, "keys", "cred", "c1.json"), "w") as f:
+        f.write('{"format": "levain-keys-credential/1", "name": "c1", "rev": "%s", "hosts": ["api.example.com"], '
+                '"inject": {"header": "x-api-key", "scheme": ""}, "kind": "static", "secret": "%s"}'
+                % ("0" * 32, _SECRET))
+
+
+class _Tr:
+    def __init__(self) -> None:
+        self.aborted = False
+
+    def abort(self) -> None:
+        self.aborted = True
+
+    def close(self) -> None:
+        pass
+
+
+class _RawTLS:
+    """The raw TLS writer under an exchange's `Upstream`: every `write` is recorded as before or after the detach."""
+
+    def __init__(self, st: dict) -> None:
+        self.st, self.transport = st, _Tr()
+
+    def write(self, data: bytes) -> None:
+        self.st["raw"].append((self.st["after"], bytes(data)))
+
+    async def drain(self) -> None:
+        await asyncio.sleep(0)   # flow control: one suspension between the head and the body
+
+    def close(self) -> None:
+        pass
+
+    async def wait_closed(self) -> None:
+        await asyncio.sleep(0)
+
+
+class _Plain:
+    def __init__(self) -> None:
+        self.transport = _Tr()
+
+
+class _AdminW:
+    def __init__(self) -> None:
+        self.transport = _Tr()
+
+    def close(self) -> None:
+        pass
+
+
+class _TaskStub:
+    """The exchange's `task` as phase 1 sees it: `cancel()` is recorded, never delivered (the stepper delivers it)."""
+
+    def __init__(self) -> None:
+        self.cancels = 0
+
+    def cancel(self) -> None:
+        self.cancels += 1
+
+    def done(self) -> bool:
+        return True   # shutdown's wait never waits on the paused coroutine the stepper itself holds
+
+
+class _CountingCache(dict):
+    def __init__(self, st: dict) -> None:
+        super().__init__()
+        self.st = st
+
+    def __setitem__(self, k, v) -> None:
+        if self.st["after"]:
+            self.st["inserts_after"] += 1
+        super().__setitem__(k, v)
+
+
+async def _step(coro, pause_at: int, at_pause) -> tuple:
+    """Drive `coro` by `send`/`throw` alone. Every suspension (each value it yields) is TWO pause slots: with the
+    awaited future still pending, then with it done and the coroutine not yet resumed. At slot `pause_at` the driver
+    runs `at_pause()`; when it returns True a `CancelledError` is thrown in at that suspension. Returns (outcome,
+    paused, slots)."""
+    slot, exc, paused = 0, None, False
+    while True:
+        try:
+            y = coro.throw(exc) if exc is not None else coro.send(None)
+        except StopIteration:
+            return "done", paused, slot
+        except asyncio.CancelledError:
+            return "cancelled", paused, slot
+        exc = None
+        for late in (False, True):
+            slot += 1
+            if late:
+                if y is None:
+                    await asyncio.sleep(0)
+                else:
+                    y._asyncio_future_blocking = False
+                    await asyncio.wait({y})
+            if slot == pause_at:
+                paused = True
+                if await at_pause():
+                    exc = asyncio.CancelledError()
+                    break
+
+
+def _transition(name: str):
+    async def run(k) -> None:
+        if name == "drop":
+            await k.drop_session(k.admin_epoch, "s1")
+        elif name == "preempt":
+            await k._adopt(None, _AdminW())
+        elif name == "replace":
+            await k.front_register(k.admin_epoch, "s1", 70000, 1, 1, 1, 2)
+        elif name == "eof":
+            await k._admin_eof(k.admin)
+        else:
+            await k.shutdown()
+    return run
+
+
+@pytest.mark.parametrize("cached", [True, False], ids=["cached", "uncached"])
+@pytest.mark.parametrize("delivery", ["cancel-delivered", "cancel-lost"])
+@pytest.mark.parametrize("transition", ["drop", "preempt", "replace", "eof", "shutdown"])
+def test_revoke_at_every_suspension(monkeypatch, transition, delivery, cached):
+    # Design 1.5, the ONE test of the frame (r7 R36, r8 R43, r9 R46-R48, r10 R50): at every suspension of the
+    # exchange coroutine, enumerated by the runtime, a detaching transition's phase 1 + phase 2 run, then the
+    # exchange resumes (cancel delivered by `throw`, or lost). ORACLE per run: zero raw TLS writes and zero token-cache
+    # inserts after the detach, the shared detach ran and `exchange.detached`, the exchange ended, no transport left
+    # open, the exchange out of its set. Reproduced first: P4a's mutation run found NO test that fails when only the
+    # cache-insert fence is deleted (`3b-3b-p4/p4_mutations.txt`); this test's mutation run must.
+    from levain.broker import upstream as U
+    from levain.broker.creds import CredStore
+    from levain.broker.norm import digest_of_token
+    d = tempfile.mkdtemp(prefix="lf", dir="/tmp")
+    _frame_lib(d)
+    st: dict = {}
+    orig_write, orig_detach = U.Upstream.write, K.Keys._detach
+
+    def counting_write(self, data):
+        try:
+            return orig_write(self, data)
+        except U.StaleExchange:
+            st["refused"] += 1
+            raise
+
+    def spy_detach(self, reg, revoke=False):
+        st["detached"].append(reg)
+        return orig_detach(self, reg, revoke)
+
+    async def handshake(addr, port, host):
+        await asyncio.sleep(0)   # the connect, held open across one suspension
+        raw, plain = _RawTLS(st), _Plain()
+        st["transports"] += [raw.transport, plain.transport]
+        return object(), raw, plain
+
+    async def read_response(up):
+        await asyncio.sleep(0)   # the response wait
+        raise NotImplementedError
+
+    monkeypatch.setattr(U.Upstream, "write", counting_write)
+    monkeypatch.setattr(K.Keys, "_detach", spy_detach)
+    monkeypatch.setattr(U, "_handshake", handshake)
+    monkeypatch.setattr(U, "_read_response", read_response)
+
+    async def one(pause_at: int) -> dict:
+        st.clear()
+        st.update(after=False, raw=[], inserts_after=0, refused=0, detached=[], transports=[])
+        cred_fd = os.open(os.path.join(d, "keys", "cred"), os.O_RDONLY | os.O_DIRECTORY)
+        a, b = socket.socketpair()
+        try:
+            k = K.Keys(unmetered=True, lib_root=d, creds=CredStore(cred_fd))
+            k._in_loop()
+            k.cache = _CountingCache(st)
+            k.admin = K.AdminConn(None, _AdminW(), k.admin_epoch)
+            k.admin.task = None
+            await k.front_register(k.admin_epoch, "s1", 70000, 1, 1, 1, 1)
+            await k.front_arm(k.admin_epoch, "s1", 1)
+            reg = k.regs[70000]
+            reg.state = "claimed"
+            answer = {"session": "s1", "claims": dict(_FRAME_CLAIMS)}
+            if cached:
+                dict.__setitem__(k.cache, digest_of_token(_FRAME_TOKEN), answer)
+            else:
+                async def resolve(digest):
+                    await asyncio.sleep(0)
+                    return ("answer", answer)
+                k._token_resolve = resolve
+            _r, w = await asyncio.open_unix_connection(sock=a)
+            fr = asyncio.StreamReader()
+            fr.feed_data(gwwire.encode(b"B", b"hello") + gwwire.encode(b"E"))
+            fr.feed_eof()
+            side = gwwire.KeysSide()
+            side.got(b"Q")
+            conn = K.Conn(w, reg, "pending")
+            conn.task = stub = _TaskStub()
+            reg.pending.add(conn)
+            k.pool.add(conn)
+
+            async def at_pause() -> bool:
+                before = stub.cancels
+                await _transition(transition)(k)
+                st["after"] = True
+                st["ran_detach"] = any(r is reg for r in st["detached"])
+                st["detached_flag"] = conn.detached
+                return delivery == "cancel-delivered" and stub.cancels > before
+
+            outcome, paused, slots = await _step(k._exchange(conn, gwwire.FrameReader(fr), side, dict(_FRAME_Q)),
+                                                 pause_at, at_pause)
+            return dict(st, outcome=outcome, paused=paused, slots=slots, in_set=conn in reg.exchanges,
+                        held=conn.upstream)
+        finally:
+            a.close()
+            b.close()
+            os.close(cred_fd)
+
+    async def all_runs() -> list:
+        runs, n = [], 1
+        while True:
+            r = await one(n)
+            runs.append(r)
+            if not r["paused"] or n > 200:
+                return runs
+            n += 1
+
+    try:
+        runs = asyncio.run(all_runs())
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    last, paused = runs[-1], runs[:-1]
+    print(transition, delivery, "cached" if cached else "uncached", "slots", last["slots"],
+          "refused", sum(r["refused"] for r in paused))
+    assert not last["paused"] and last["outcome"] == "done"
+    assert any(_SECRET.encode() in data for _a, data in last["raw"])   # unrevoked, the credential does go out
+    assert len(paused) >= 8                                             # the enumeration is not vacuous
+    for i, r in enumerate(paused, 1):
+        where = f"slot {i}"
+        assert r["ran_detach"] and r["detached_flag"], where
+        assert [x for x in r["raw"] if x[0]] == [], where                # no raw TLS write after the detach
+        assert r["inserts_after"] == 0, where                            # no token-cache insert after the detach
+        assert r["outcome"] in ("done", "cancelled"), where
+        assert all(t.aborted for t in r["transports"]), where            # no open transport left
+        assert not r["in_set"] and r["held"] is None, where
+    if cached and delivery == "cancel-lost":
+        assert sum(r["refused"] for r in paused) >= 1                   # the gate itself refused, not only the cancel

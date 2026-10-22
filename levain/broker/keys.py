@@ -1,9 +1,10 @@
 """gw-keys (S1 session 3b): the credential side of the gateway, run as `_levain_keys`. This tip holds WHO MAY CONNECT
 (design 1.5, session 3b-3a): keys' `R/keys/front.sock` server, the registration table, the two admission pools, the
 `F` path, the NOFILE floor, the process entry and its one shutdown trigger; and WHO MAY ASK (session 3b-3b): the admin
-server on `R/keys/admin.sock`; and the `Q` handler's frame and token states. The request path, the upstream and the
-credentials are later parts': until the request path exists a `Q` whose token resolves is answered
-`F keys-unavailable`.
+server on `R/keys/admin.sock`; and the `Q` handler: its frame, token states and request path (the route against the
+token's claims, keys' own policy load, the re-checks, the 3c seams at their refusing defaults, the credential, and the
+request through `Upstream.write`). The upstream client itself (the address check, TLS, the response relay) is a later
+session's: until it exists an exchange that reached the upstream is answered `F upstream-error`.
 
 The admin server (design 1.5 "The admin connection", "Fencing", "Order inside one connection"):
 - a connection is accepted only from the `_levain_control` uid, read from the kernel; any other peer is closed unread.
@@ -57,11 +58,12 @@ import sys
 from collections import OrderedDict
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
-from levain.broker import gwwire, norm
-from levain.broker.creds import CredLifecycle, FakeCredLifecycle
+from levain.broker import gwwire, norm, upstream
+from levain.broker.creds import CredLifecycle, CredStore, FakeCredLifecycle, check_host
 from levain.broker.gwwire import FrameReader, KeysSide, WireError
 from levain.broker.peer import PeerUnknown, peer_of, peer_uid
-from levain.broker.upstream import GRACE, Upstream, _note
+from levain.broker.policy import PolicyError, RoutePolicy, parse_route
+from levain.broker.upstream import GRACE, StaleExchange, Upstream, _note, open_exchange
 from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
 
@@ -153,6 +155,45 @@ ADMIN_GROUP = "levain-keysadmin"
 
 _K = gwwire.encode(b"K")
 _A = gwwire.encode(b"A")
+
+#: a brokered route's upstream is `https` (policy refuses any other scheme) and names no port
+UPSTREAM_PORT = 443
+#: CONTRACT §4.3's base route map, `L/routes/base.json`: its format, and the size keys reads at most (DECISION: far
+#: above a real map; a larger file is refused unread past the cap)
+BASE_MAP_FORMAT = "levain-routes-base/1"
+BASE_MAP_CAP = 1024 * 1024
+
+
+# --- the seams 3c fills (design 1.11), with their refusing production defaults ------------------------------------
+
+class RefusingBudget:
+    """`budget`'s production default until 3c's ledger: every reservation is refused `budget-exhausted`."""
+
+    def reserve(self, session: str, route: str, max_call_microdollars: Optional[int]) -> None:
+        raise norm.Refused("budget-exhausted", "no ledger")
+
+
+class UnmeteredBudget:
+    """`--unmetered` (3b's fixture and VM runs only; 3c deletes the flag): every reservation is admitted."""
+
+    def reserve(self, session: str, route: str, max_call_microdollars: Optional[int]) -> None:
+        return None
+
+
+def no_dispatch_route(route: str) -> Optional[RoutePolicy]:
+    """`dispatch_policy`'s production default until 3c: no dispatch map is loaded (RELOAD is refused), so it knows
+    no route, and a dispatch-map id is `route-not-allowed`."""
+    return None
+
+
+class NoCodec:
+    """`codec`'s production default until 3c: no codec exists, so a body passes through untouched and a ticketed
+    session's `Q` (its claims carry a `ticket`, a run) is refused `model-not-allowed`: no run goes out with an
+    unchecked model."""
+
+    def check(self, run: object, route: RoutePolicy) -> None:
+        if run is not None:
+            raise norm.Refused("model-not-allowed", "no codec")
 
 
 def bounded() -> int:
@@ -401,7 +442,16 @@ class Keys:
 
     def __init__(self, *, gw_uids: frozenset = frozenset(), single_uid: Optional[int] = None,
                  control_path: Optional[str] = None, lib_root: Optional[str] = None,
-                 cred_lifecycle: Optional[CredLifecycle] = None, control_uid: Optional[int] = None) -> None:
+                 cred_lifecycle: Optional[CredLifecycle] = None, control_uid: Optional[int] = None,
+                 unmetered: bool = False, budget: object = None, dispatch_policy: object = None,
+                 codec: object = None, creds: Optional[CredStore] = None) -> None:
+        #: the seams 3c fills; each defaults to its refusing production default (`--unmetered` admits the budget)
+        self.unmetered = unmetered
+        self.budget = budget if budget is not None else (UnmeteredBudget() if unmetered else RefusingBudget())
+        self.dispatch_policy = dispatch_policy if dispatch_policy is not None else no_dispatch_route
+        self.codec = codec if codec is not None else NoCodec()
+        #: the credentials under `L/keys/cred`, opened at the first exchange that names one
+        self.creds = creds
         #: the one uid admitted on the admin socket (the `_levain_control` account); None admits nobody.
         self.control_uid = control_uid
         #: the adopted admin connection, None between its EOF and the next adoption.
@@ -989,6 +1039,8 @@ class Keys:
             return
         try:
             await self._serve_q(conn, frames, side, q)
+        except StaleExchange:
+            pass   # detached: nothing more went upstream, and no answer (phase 2 closes the front connection)
         finally:
             await release_exchange(conn)
 
@@ -1000,17 +1052,160 @@ class Keys:
                 and self.regs.get(reg.front_uid) is reg and self.by_session.get(reg.session) is reg)
 
     async def _serve_q(self, conn: Conn, frames: FrameReader, side: KeysSide, q: dict) -> None:
-        """The `Q` handler: the token state first. A stale or detached exchange ends with NO answer (its front
-        connection is one of phase 1's victims, which phase 2 closes)."""
+        """The `Q` handler: the token state, then the route against the token's claims and keys' OWN policy, the
+        request re-checked against that policy, the seams and the credential, then the request through the
+        exchange's `Upstream.write`. A stale or detached exchange ends with NO answer (its front connection is one of
+        phase 1's victims, which phase 2 closes)."""
         out = await self._token_state(conn, q["token"])
         if out is None or conn.detached:
             return
         if "refused" in out:
             await self._refuse(conn, frames, side, out["refused"], UNTRUSTED_DRAIN_CAP)
             return
-        # The request path (the route against the claims, keys' own policy, the upstream) is the next part's; until
-        # it exists a resolved `Q` is answered `keys-unavailable`.
-        await self._refuse(conn, frames, side, "keys-unavailable", UNTRUSTED_DRAIN_CAP)
+        claims = out["answer"]["claims"]
+        try:
+            pol = self._route_policy(claims, q["route"])
+        except norm.Refused as r:
+            await self._refuse(conn, frames, side, r.name, UNTRUSTED_DRAIN_CAP)
+            return
+        try:
+            head = self._check_request(conn.reg, claims, pol, q)
+        except norm.Refused as r:
+            await self._refuse(conn, frames, side, r.name, pol.body_cap)
+            return
+        assert pol.upstream is not None   # a brokered route always names one
+        host = pol.upstream.host
+        # 3b-4 resolves `host` and passes a validated address; at this tip the handshake seam is the fixture's
+        up = await open_exchange(host, UPSTREAM_PORT, host, conn)
+        up.write(head)
+        await up.drain()
+        if not conn.detached:   # a detached exchange answers nothing; its next upstream write is refused by the gate
+            conn.writer.write(_A)
+            await conn.writer.drain()
+        try:
+            ended = await self._forward_body(frames, side, up, q["body"], pol.body_cap)
+        except norm.Refused as r:
+            await self._refuse(conn, frames, side, r.name, pol.body_cap)
+            return
+        if not ended:
+            return   # the front aborted (`X`) or went away before `E`: nothing to answer
+        try:
+            await upstream._read_response(up)
+        except NotImplementedError:
+            pass
+        # The response relay (`R` `b`* `e`) is 3b-4's; until it exists an exchange that reached the upstream is
+        # answered `upstream-error`.
+        await self._refuse(conn, frames, side, "upstream-error", pol.body_cap)
+
+    def _route_policy(self, claims: dict, route: str) -> RoutePolicy:
+        """keys' OWN policy for `route`: it must be one of the token's `routes`, and the object comes from keys' load
+        of the base map (then the dispatch seam), never from the front or session.json. A route that is not brokered
+        is no `Q` route."""
+        routes = claims.get("routes")
+        if type(routes) is not list or route not in routes:
+            raise norm.Refused("route-not-allowed", "not in the token's routes")
+        pol = self._base_route(route)
+        if pol is None:
+            pol = self.dispatch_policy(route)
+        if pol is None or pol.type != "brokered" or pol.upstream is None:
+            raise norm.Refused("route-not-allowed", "no brokered route")
+        return pol
+
+    def _base_route(self, route: str) -> Optional[RoutePolicy]:
+        """`route`'s object in `L/routes/base.json`, read and parsed (`policy.parse_route`, source `base`) at every
+        `Q`, or None when the map has none. A map keys cannot read or parse, or one naming the route twice, refuses
+        `keys-unavailable` (logged), never a pass."""
+        if self.lib_root is None:
+            raise norm.Refused("keys-unavailable", "no lib root")
+        path = os.path.join(self.lib_root, "routes", "base.json")
+        try:
+            with open(path, "rb") as f:
+                data = f.read(BASE_MAP_CAP + 1)
+            if len(data) > BASE_MAP_CAP:
+                raise PolicyError("over the size cap")
+            doc = canon.parse(data)
+            if type(doc) is not dict or doc.get("format") != BASE_MAP_FORMAT or type(doc.get("routes")) is not list:
+                raise PolicyError("format or routes")
+            hits = [r for r in doc["routes"] if type(r) is dict and r.get("route") == route]
+            if len(hits) > 1:
+                raise PolicyError("a route named twice")
+            return parse_route(hits[0], source="base") if hits else None
+        except (OSError, ValueError, ContractError, RecursionError) as e:
+            _note(logging.WARNING, "levain gw-keys: the base route map is unusable (%s)", type(e).__name__)
+            raise norm.Refused("keys-unavailable", "base map") from None
+
+    def _cred_store(self) -> CredStore:
+        if self.creds is None:
+            if self.lib_root is None:
+                raise norm.Refused("credential-unavailable", "no lib root")
+            try:
+                fd = os.open(os.path.join(self.lib_root, "keys", "cred"), os.O_RDONLY | os.O_DIRECTORY)
+            except OSError as e:
+                _note(logging.WARNING, "levain gw-keys: the credential directory is unreadable (%s)", type(e).__name__)
+                raise norm.Refused("credential-unavailable", "no credential directory") from None
+            self.creds = CredStore(fd)
+        return self.creds
+
+    def _check_request(self, reg: Registration, claims: dict, pol: RoutePolicy, q: dict) -> bytes:
+        """keys' own re-check of the `Q` against ITS policy (the front's verdict is never taken), then the seams and
+        the credential; returns the request head. Order: target and template, headers (strict: a forbidden, consumed
+        or off-list name is `policy-header`), the declared length against `body_cap`, the codec, the credential and
+        its host binding, the budget last (a reservation is made only for a request that goes out)."""
+        try:
+            method, path = q["method"].encode("ascii"), q["path"].encode("ascii")
+            query = q["query"].encode("ascii") or None
+        except UnicodeEncodeError:
+            raise norm.Refused("malformed", "target") from None
+        tpl = norm.match_template(pol.templates, method, path, query)
+        if q["upgrade"] != "none":
+            if tpl.upgrade is None:
+                raise norm.Refused("malformed", "upgrade")
+            raise norm.Refused("keys-unavailable", "websocket")   # the brokered websocket is a later session's
+        fwd = norm.check_headers([(n, v) for n, v in q["headers"]], pol.headers or {}, upgrade_ok=False, strict=True)
+        body = q["body"]
+        if body.startswith("length:") and int(body[len("length:"):]) > pol.body_cap:
+            raise norm.Refused("body-cap", "length")
+        self.codec.check(claims.get("ticket"), pol)
+        cred = None
+        if pol.credential is not None:
+            cred = self._cred_store().observe(pol.credential)
+            assert pol.upstream is not None
+            check_host(cred, pol.upstream.host, pol.route)
+            if any(n == cred.header for n, _ in fwd):
+                raise norm.Refused("policy-header", cred.header)
+        self.budget.reserve(reg.session, pol.route, pol.max_call_microdollars)
+        return request_head(pol, method, path, query, fwd, body, cred)
+
+    async def _forward_body(self, frames: FrameReader, side: KeysSide, up: Upstream, body: str, cap: int) -> bool:
+        """The front's `B` frames through `up.write`, framed as the head declared, until `E` (True) or `X` / EOF
+        (False). keys counts the bytes itself: past `cap` is `body-cap`, a `length:n` body of any other size, or any
+        body on a `none` request, is `malformed`."""
+        want = int(body[len("length:"):]) if body.startswith("length:") else None
+        got = 0
+        while True:
+            fr = await frames.read(side.allowed())
+            if fr is None:
+                return False
+            ftype, payload = fr
+            side.got(ftype)
+            if ftype == b"X":
+                return False
+            if ftype == b"E":
+                break
+            assert isinstance(payload, bytes)
+            got += len(payload)
+            if body == "none" or (want is not None and got > want):
+                raise norm.Refused("malformed", "body length")
+            if got > cap:
+                raise norm.Refused("body-cap", "body")
+            up.write(b"%x\r\n" % len(payload) + payload + b"\r\n" if body == "chunked" else payload)
+            await up.drain()
+        if want is not None and got != want:
+            raise norm.Refused("malformed", "body length")
+        if body == "chunked":
+            up.write(b"0\r\n\r\n")
+            await up.drain()
+        return True
 
     async def _token_state(self, conn: Conn, token: str) -> Optional[dict]:
         """`{"answer": {"session", "claims"}}`, `{"refused": name}`, or None for a stale exchange (no answer). A
@@ -1110,7 +1305,10 @@ class Keys:
 
     async def _refuse(self, conn: Conn, frames: FrameReader, side: KeysSide, name: str, cap: int) -> None:
         """The `F` path: `F`, SHUT_WR, then read and discard the front's frames until `E`, `X`, EOF, `cap` body bytes
-        read after the `F`, or DRAIN_S; the caller closes. So `F` is never cut off by a close with unread bytes."""
+        read after the `F`, or DRAIN_S; the caller closes. So `F` is never cut off by a close with unread bytes. A
+        detached exchange is answered nothing (phase 2 closes its connection)."""
+        if conn.detached:
+            return
         w = conn.writer
         w.write(gwwire.encode(b"F", {"refused": name}))
         if w.can_write_eof():
@@ -1129,6 +1327,27 @@ class Keys:
             if ftype in (b"E", b"X"):
                 return
             got += len(payload)
+
+
+def request_head(pol: RoutePolicy, method: bytes, path: bytes, query: Optional[bytes], fwd: Sequence[Tuple[str, str]],
+                 body: str, cred: object) -> bytes:
+    """The request head keys writes through `Upstream.write`, built from keys' own policy (a PLACEHOLDER of the
+    shape h11 will write once the upstream client exists): target = `upstream.base_path` + path (+ `?query`),
+    `host`, the re-checked headers, `accept-encoding: identity`, the framing the `Q` declared, then the ONE
+    credential header. Header values are visible ASCII and tab (the wire's grammar), so nothing here splits a line."""
+    assert pol.upstream is not None
+    target = pol.upstream.base_path.encode("ascii") + path + (b"?" + query if query is not None else b"")
+    lines = [method + b" " + target + b" HTTP/1.1", b"host: " + pol.upstream.host.encode("ascii")]
+    lines += [n.encode("ascii") + b": " + v.encode("ascii") for n, v in fwd]
+    lines.append(b"accept-encoding: identity")
+    if body.startswith("length:"):
+        lines.append(b"content-length: " + body[len("length:"):].encode("ascii"))
+    elif body == "chunked":
+        lines.append(b"transfer-encoding: chunked")
+    if cred is not None:
+        name, value = cred.header_pair()   # type: ignore[attr-defined]
+        lines.append(name + b": " + value)
+    return b"\r\n".join(lines) + b"\r\n\r\n"
 
 
 async def release_exchange(exchange: Conn) -> None:
@@ -1202,6 +1421,9 @@ async def _serve(keys: Keys, front_path: str, gid: Optional[int], admin_path: st
         need = fixed + bounded()
         print(f"levain gw-keys: start pid={os.getpid()} nofile_soft={soft} nofile_hard={hard} "
               f"fixed_measured={fixed} bounded={bounded()} need={need}", file=sys.stderr, flush=True)
+        if keys.unmetered:
+            print("levain gw-keys: --unmetered is set: every budget reservation is admitted (no ledger)",
+                  file=sys.stderr, flush=True)
         if soft != resource.RLIM_INFINITY and soft < need:
             print(f"levain gw-keys: refused nofile-low (soft {soft} < fixed_measured {fixed} + bounded {bounded()})",
                   file=sys.stderr, flush=True)
@@ -1229,6 +1451,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--test-single-uid", action="store_true",
                     help="TEST ONLY: admit peers of keys' own uid, matched to a registration by (pid, start); "
                          "refused as root or as " + KEYS_ACCOUNT)
+    ap.add_argument("--unmetered", action="store_true",
+                    help="3b's fixture and VM runs only: admit every budget reservation (no ledger exists yet)")
     a = ap.parse_args(argv)
     for name, v in (("--runtime-root", a.runtime_root), ("--lib-root", a.lib_root), ("--control", a.control)):
         if not os.path.isabs(v):
@@ -1270,7 +1494,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 admin_gid = g
     raise_nofile()
     keys = Keys(gw_uids=gw_uids, single_uid=single_uid, control_path=a.control, lib_root=a.lib_root,
-                control_uid=control_uid)
+                control_uid=control_uid, unmetered=a.unmetered)
     front_path = os.path.join(a.runtime_root, "keys", "front.sock")
     admin_path = os.path.join(a.runtime_root, "keys", "admin.sock")
     try:
