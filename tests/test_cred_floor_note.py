@@ -13,10 +13,16 @@ from tests.test_session import _Binding, _Event
 
 GIT = "fatal: could not read Username for 'https://github.com': Device not configured"
 GIT_USER_IN_URL = "fatal: could not read Password for 'https://x-access-token@github.com': terminal prompts disabled"
-HOME = os.path.expanduser("~")
+
+
+def _home():
+    """Read per call: the suite runs under a scratch $HOME (conftest), set after this module is imported."""
+    return os.path.expanduser("~")
+
+
 # what each runtime prints for the sandbox's EPERM on a denied store (Go: gh/docker/kubectl; Python: aws/twine; Node: npm)
-GH = f"failed to read configuration: open {HOME}/.config/gh/config.yml: operation not permitted"
-AWS = f"PermissionError: [Errno 1] Operation not permitted: '{HOME}/.aws/credentials'"
+GH = "failed to read configuration: open @HOME@/.config/gh/config.yml: operation not permitted"
+AWS = "PermissionError: [Errno 1] Operation not permitted: '@HOME@/.aws/credentials'"
 STORE = "fatal: unable to open ~/.git-credentials: Operation not permitted"
 
 
@@ -35,6 +41,7 @@ def _turn(*events):
 
 @pytest.mark.parametrize("text", [GIT, GIT_USER_IN_URL, GH, AWS, STORE])
 def test_a_credential_failure_ends_the_activity_with_one_note(tmp_path, text):
+    text = text.replace("@HOME@", _home())
     events = _turn(_shell("git push"), _output(text), _shell("git push"), _output(text))
     assert turn_tool_activity(events, tmp_path, cred_floor=True) == [
         "⚙ terminal: git push", "⚙ terminal: git push", CRED_FLOOR_NOTE]
@@ -53,18 +60,18 @@ def test_no_note_without_the_floor_or_the_signature(tmp_path):
         tmp_path, cred_floor=True)
     # EPERM on a path that is not a credential store, and a store named without EPERM
     assert CRED_FLOOR_NOTE not in turn_tool_activity(
-        _turn(_output(f"open {HOME}/Library/x: operation not permitted")), tmp_path, cred_floor=True)
+        _turn(_output(f"open {_home()}/Library/x: operation not permitted")), tmp_path, cred_floor=True)
     assert CRED_FLOOR_NOTE not in turn_tool_activity(
-        _turn(_output(f"{HOME}/.netrc\nchmod: operation not permitted")), tmp_path, cred_floor=True)
+        _turn(_output(f"{_home()}/.netrc\nchmod: operation not permitted")), tmp_path, cred_floor=True)
     assert CRED_FLOOR_NOTE not in turn_tool_activity(
-        _turn(_output(f"chmod: operation not permitted\n{HOME}/.netrc")), tmp_path, cred_floor=True)
+        _turn(_output(f"chmod: operation not permitted\n{_home()}/.netrc")), tmp_path, cred_floor=True)
     # a longer name that starts like a store, and a non-negative "failed to get" (an HTTP status, say)
-    for text in (f"open {HOME}/.config/ghostty/config: operation not permitted",
-                 f"open {HOME}/.netrc.bak: operation not permitted", "fetch: failed to get: 404"):
+    for text in (f"open {_home()}/.config/ghostty/config: operation not permitted",
+                 f"open {_home()}/.netrc.bak: operation not permitted", "fetch: failed to get: 404"):
         assert CRED_FLOOR_NOTE not in turn_tool_activity(_turn(_output(text)), tmp_path, cred_floor=True)
     # a store under a denied subtree, mid-output among long lines
     long = "x" * 10_000
-    assert turn_tool_activity(_turn(_output(f"{long}\nopen {HOME}/.config/gh/hosts.yml: operation not permitted\n{long}")),
+    assert turn_tool_activity(_turn(_output(f"{long}\nopen {_home()}/.config/gh/hosts.yml: operation not permitted\n{long}")),
                               tmp_path, cred_floor=True) == [CRED_FLOOR_NOTE]
     # a failure in an earlier turn is not this turn's
     events = [_Event("user", ["a"]), _shell("git push"), _output(GIT), _Event("user", ["b"]), _shell("ls")]
@@ -74,8 +81,8 @@ def test_no_note_without_the_floor_or_the_signature(tmp_path):
 def test_the_streamed_activity_carries_the_note_once_a_turn(tmp_path):
     lines = []
     cb = _activity_callback(lines.append, tmp_path, cred_floor=True)
-    for e in [_Event("user", ["a"]), _shell("git push"), _output(GIT), _output(GH),
-              _Event("user", ["b"]), _output(GH)]:
+    for e in [_Event("user", ["a"]), _shell("git push"), _output(GIT), _output(GH.replace("@HOME@", _home())),
+              _Event("user", ["b"]), _output(GH.replace("@HOME@", _home()))]:
         cb(e)
     assert lines == ["⚙ terminal: git push", CRED_FLOOR_NOTE, CRED_FLOOR_NOTE]
     # a synthetic nudge is not a new turn, so the note is not repeated after it
@@ -135,8 +142,8 @@ def test_a_store_named_by_a_command_that_succeeded_is_not_a_denial(tmp_path):
         return ObservationEvent(observation=TerminalObservation.from_text(text, command="c", exit_code=code),
                                 action_id="a1", tool_name="terminal", tool_call_id="c1")
 
-    assert turn_tool_activity(_turn(obs(AWS, 0)), tmp_path, cred_floor=True) == []
-    assert turn_tool_activity(_turn(obs(AWS, 255)), tmp_path, cred_floor=True) == [CRED_FLOOR_NOTE]
+    assert turn_tool_activity(_turn(obs(AWS.replace("@HOME@", _home()), 0)), tmp_path, cred_floor=True) == []
+    assert turn_tool_activity(_turn(obs(AWS.replace("@HOME@", _home()), 255)), tmp_path, cred_floor=True) == [CRED_FLOOR_NOTE]
     assert turn_tool_activity(_turn(obs(GIT, 0)), tmp_path, cred_floor=True) == [CRED_FLOOR_NOTE]
 
 
