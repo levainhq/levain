@@ -141,3 +141,39 @@ def test_a_lock_taken_past_the_deadline_is_released_and_refused(tmp_path: Path) 
     finally:
         os.close(fd)
         os.close(holder)
+
+
+def test_the_preflight_refuses_at_its_first_clock_read_past_the_deadline(tmp_path: Path, monkeypatch) -> None:
+    # Reproduced on afbcd383 (s5-5a-fix3 fail_before.txt item 1): with the deadline passed after the first clock
+    # read, the preflight checked all 5006 manifest records without reading the clock again.
+    tree, _ = _retained(tmp_path)
+    (tree / "repo" / "many").mkdir()
+    for i in range(5000):
+        (tree / "repo" / "many" / f"f{i:05d}").write_bytes(b"")
+    mf = tmp_path / "many.jsonl"
+    end._stream_jsonl(mf, end.iter_manifest(tree, caps=end.Caps(depth=end.MANIFEST_DEPTH)), 1 << 40, "x")
+    reads, checked = [0], [0]
+
+    def clock() -> float:
+        reads[0] += 1
+        return 0.0 if reads[0] == 1 else 100.0
+
+    real = walkframe.check_path_bound
+    monkeypatch.setattr(walkframe, "check_path_bound", lambda p: (checked.__setitem__(0, checked[0] + 1), real(p)))
+    err, got = _walk(tree, mf, deadline=10.0, seams=walker.WalkSeams(owner_uid=os.getuid(), clock=clock))
+    assert err is not None and err.name == "walker-cap:time"
+    assert checked[0] == walker._PREFLIGHT_CLOCK_EVERY and reads[0] == 2
+    assert got == b""
+
+
+def test_the_encoder_refuses_a_path_its_decoder_refuses() -> None:
+    # Reproduced on afbcd383 (s5-5a-fix3 fail_before.txt item 2): encode_header emitted a frame for a
+    # MAX_DEPTH + 1 component path that read_header refused as frame-bad:path_b64.
+    import io
+    path = b"/".join([b"d"] * (walkframe.MAX_DEPTH + 1))
+    with pytest.raises(Refused) as enc:
+        walkframe.encode_header(path, "dir", 0o755, 0, "")
+    header = {"v": 1, "path_b64": walkframe.b64(path), "type": "dir", "mode": 0o755, "size": 0, "digest": ""}
+    with pytest.raises(Refused) as dec:
+        walkframe.read_header(io.BytesIO(walkframe._header_bytes(header)))
+    assert enc.value.name == dec.value.name == "frame-bad:path_b64"

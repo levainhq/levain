@@ -41,6 +41,8 @@ SF_DATALESS = 0x40000000
 UNREAD_PLACEHOLDER_MODE = 0o600
 
 _CHUNK = 1 << 20
+#: The preflight reads the walk's clock once before its first record and again every this many records.
+_PREFLIGHT_CLOCK_EVERY = 4096
 _O_FILE = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
 _SETID = stat.S_ISUID | stat.S_ISGID
 _FD_ERRNOS = frozenset({errno.EMFILE, errno.ENFILE})
@@ -332,14 +334,22 @@ def _link_target(e: Entry, rec: dict) -> bytes:
     return target
 
 
-def _preflight(manifest: Path) -> None:
+def _preflight(manifest: Path, deadline: float, clock: Callable[[], float]) -> None:
     """Before the first frame: every manifest path the walk will frame (the walk is merged against the manifest
     path for path, so these are the framed paths) is within the decoder's bound,
     :func:`walkframe.check_path_bound`, else its ``frame-bad:path_b64`` refuses with nothing written. The same
-    pruning as the walk: an ``OUT`` path is not framed, and nothing below a directory adopt does not descend."""
+    pruning as the walk: an ``OUT`` path is not framed, and nothing below a directory adopt does not descend.
+    V7's wall holds here too: the clock is read before the first record and every
+    :data:`_PREFLIGHT_CLOCK_EVERY` records, and past ``deadline`` it refuses ``walker-cap:time``."""
     mf = _Manifest(manifest)
+    n = 0
     try:
-        while (rec := mf.take()) is not None:
+        while True:
+            if n % _PREFLIGHT_CLOCK_EVERY == 0 and clock() > deadline:
+                raise Refused("walker-cap:time", f"preflighting the manifest at record {n}")
+            if (rec := mf.take()) is None:
+                break
+            n += 1
             path = rec["_path"]
             where = scope(path)
             if where != FRAME and rec["type"] == "dir":
@@ -358,7 +368,7 @@ def walk_frames(tree: Path, manifest: Path, out_fd: int, *, depth: int, caps: Wa
     (``base-bundle-mismatch``; absent, not a file, or ``unread`` the same). Raises :class:`Refused` by name with no
     terminal frame written."""
     seams = seams or WalkSeams()
-    _preflight(manifest)
+    _preflight(manifest, caps.deadline, seams.clock)
     pipe = _Pipe(out_fd, caps.deadline, seams.clock)
     mf = _Manifest(manifest)
     it = seams.walk(tree, depth_cap=depth, prune=adopt_prune)

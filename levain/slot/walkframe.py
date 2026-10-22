@@ -81,7 +81,7 @@ def _header_bytes(header: dict) -> bytes:
 def encode_header(path: bytes, type_: str, mode: int, size: int, digest: str) -> bytes:
     """One entry header, length-prefixed, validated by the same rules the decoder applies."""
     header = {"v": 1, "path_b64": b64(path), "type": type_, "mode": mode, "size": size, "digest": digest}
-    check_entry(header)
+    check_path_bound(check_entry(header))
     return _header_bytes(header)
 
 
@@ -193,7 +193,8 @@ def read_header(fh: BinaryIO) -> dict | None:
 def check_path_bound(path: bytes) -> None:
     """The decoder's bound, which is the format's: a path no deeper than :data:`MAX_DEPTH`, no component past
     :data:`NAME_MAX`. Not in :func:`check_entry` (step 3's depth scan and the manifest reader share that and
-    must see deeper paths); the walker preflights every path it will frame with this before its first frame."""
+    must see deeper paths); :func:`encode_header` applies it, and the walker preflights every path it will frame
+    with it before its first frame."""
     parts = path.split(b"/")
     if len(parts) > MAX_DEPTH:
         raise _bad("path_b64", f"{len(parts)} components > {MAX_DEPTH}")
