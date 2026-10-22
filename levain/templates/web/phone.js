@@ -840,10 +840,12 @@
   // K8: a cockpit write signed by this phone's passkey. issue(fp) files the write as a pending under that passkey (the
   // phone app's POST /cockpit/verb, or a cancel) and resolves to the server's answer; the challenge then comes from the
   // server's STORED record, fetched by the pending's id (GET /cockpit/pending/<id>), never from bytes this page holds;
-  // review(pending, sign) shows that same record and calls sign() from its own Sign tap (a fresh gesture for the passkey
-  // prompt), and is required: there is no signing without it. A pending the server no longer holds WAITING (expired,
-  // or decided elsewhere) gets no sheet and no prompt. The broker verifies the signature over its own copy and decides;
-  // the outcome names the signer the server persisted. done(answer) gets every outcome. This page decides nothing:
+  // review(pending, sign, dismiss) shows that same record and calls sign() from its own Sign tap (a fresh gesture for the
+  // passkey prompt), and is required: there is no signing without it. The page stays held (busy) while the sheet is up,
+  // until sign() settles or the sheet calls dismiss(), so a refresh never redraws it away; sign() runs one ceremony at
+  // a time (a second tap does nothing; a failure lets the sheet sign again). A pending the server no longer holds
+  // WAITING (expired, or decided elsewhere) gets no sheet and no prompt. The broker verifies the signature over its own
+  // copy and decides; the outcome names the signer the server persisted. done(answer) gets every outcome. This page decides nothing:
   // what it shows is the server's words.
   function signPending(issue, fp, rawId, say, review, done) {
     if (busy) return;
@@ -862,28 +864,46 @@
           finish(c);
           return say("the write is " + c.body.state + (c.body.reason ? " (" + c.body.reason + ")" : "") + "; nothing to sign", "bad");
         }
-        const sign = () => {
-          busy++;
-          say("confirm with your passkey to apply " + c.body.verb + " (" + c.body.tier + ")…");
-          const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
-          if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
-          return navigator.credentials.get({ publicKey: pk }).then((cred) => call("POST", base + "/signature", {
-            fingerprint: fp, authenticator_data: b64u(cred.response.authenticatorData),
-            client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) }).then((a) => {
-            finish(a);
-            // the passkey signed: once it is sent, only the server's own refusal (a 4xx) says nothing was applied
-            if (!a.ok && (a.status === 0 || a.status >= 500)) return say("result unknown (" + why(a) + "): reload to see whether it applied", "bad");
-            if (!a.ok) return say("not applied: " + why(a), "bad");
-            // the signer named is the one the server persisted, never the fingerprint this page sent
-            say(a.body.state + (a.body.reason ? " (" + a.body.reason + ")" : "") + (a.body.signer_fp ? " · signed by " + a.body.signer_fp : ""),
-                a.body.state === "COMMITTED" ? "ok" : "bad");
-          }), (e) => {
-            if (rawId && e && e.name === "NotAllowedError") forget(fp);
-            finish(failed(e));
-            say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was applied", "bad");
-          }).finally(() => { busy--; });
-        };
-        return review(c.body, sign);
+        return new Promise((settle, fail) => {
+          let signing = false;
+          const sign = () => {
+            if (signing) return;
+            signing = true;
+            // sent: the signature has gone to the server, so only its own answer says what happened; told: done() has
+            // this attempt's answer
+            let sent = false, told = false;
+            say("confirm with your passkey to apply " + c.body.verb + " (" + c.body.tier + ")…");
+            const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+            if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
+            return navigator.credentials.get({ publicKey: pk }).then((cred) => {
+              const assertion = { fingerprint: fp, authenticator_data: b64u(cred.response.authenticatorData),
+                                  client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
+              sent = true;
+              return call("POST", base + "/signature", assertion);
+            }).then((a) => {
+              if (!a.ok) signing = false;
+              told = true;
+              finish(a);
+              // the passkey signed: once it is sent, only the server's own refusal (a 4xx) says nothing was applied
+              if (!a.ok && (a.status === 0 || a.status >= 500)) return say("result unknown (" + why(a) + "): reload to see whether it applied", "bad");
+              if (!a.ok) return say("not applied: " + why(a), "bad");
+              // the signer named is the one the server persisted, never the fingerprint this page sent
+              say(a.body.state + (a.body.reason ? " (" + a.body.reason + ")" : "") + (a.body.signer_fp ? " · signed by " + a.body.signer_fp : ""),
+                  a.body.state === "COMMITTED" ? "ok" : "bad");
+            }).catch((e) => {
+              signing = false;
+              if (!sent) {
+                if (rawId && e && e.name === "NotAllowedError") forget(fp);
+                finish(failed(e));
+                return say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was applied", "bad");
+              }
+              // a fault after the send: the server may have applied it, so this page never says it did not
+              say("result unknown (the page failed: " + ((e && e.name) || "error") + "): reload to see whether it applied", "bad");
+              if (!told) finish(failed(e));
+            }).finally(settle);
+          };
+          try { review(c.body, sign, settle); } catch (e) { fail(e); }
+        });
       });
     }).catch((e) => { finish(failed(e)); say("the page failed (" + ((e && e.name) || "error") + ")", "bad"); })
       .finally(() => { busy--; });

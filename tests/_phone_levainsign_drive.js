@@ -76,7 +76,68 @@ async function main() {
     await tick();
     out.signed = p.log;
   }
+  // K-5: a double tap on Sign runs one ceremony and tells one outcome
+  {
+    const p = page(WAITING, { state: "COMMITTED", signer_fp: "SHA256:a" });
+    const review = (_body, sign) => { p.log.reviewed++; sign(); sign(); };
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, (a) => p.log.done.push(a));
+    await tick();
+    out.double_tap = p.log;
+  }
+  // K-6: a failure after the signature was sent (here the caller's done throws) says the result is unknown, never
+  // "not applied", and leaves no unhandled rejection
+  {
+    const p = page(WAITING, { state: "COMMITTED", signer_fp: "SHA256:a" });
+    const review = (_body, sign) => { p.log.reviewed++; sign(); };
+    let first = true;
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, (a) => {
+      p.log.done.push(a);
+      if (first) { first = false; throw new TypeError("caller fault"); }
+    });
+    await tick();
+    out.after_send = p.log;
+  }
+  // K-7: an event-driven review (the Sign tap comes later) keeps the page held until sign settles: a second write
+  // started meanwhile files nothing; once signed, the next one files
+  {
+    const p = page(WAITING, { state: "COMMITTED", signer_fp: "SHA256:a" });
+    const held = {};
+    const review = (_body, sign, dismiss) => { p.log.reviewed++; held.sign = sign; held.dismiss = dismiss; };
+    const done = (a) => p.log.done.push(a);
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, done);
+    await tick();
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, done);
+    await tick();
+    p.log.issued_while_open = p.log.issued;
+    held.sign();
+    await tick();
+    p.log.webauthn_after_tap = p.log.webauthn;
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, done);
+    await tick();
+    out.async_review = p.log;
+  }
+  // K-7: a review dismissed without signing releases the page, with no passkey prompt
+  {
+    const p = page(WAITING, { state: "COMMITTED", signer_fp: "SHA256:a" });
+    const held = {};
+    const review = (_body, sign, dismiss) => { p.log.reviewed++; held.dismiss = dismiss; };
+    const done = (a) => p.log.done.push(a);
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, done);
+    await tick();
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, done);
+    await tick();
+    p.log.issued_while_open = p.log.issued;
+    held.dismiss();
+    await tick();
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, done);
+    await tick();
+    out.dismissed = p.log;
+  }
+  out.unhandled = unhandled;
   process.stdout.write(JSON.stringify(out));
 }
+
+const unhandled = [];
+process.on("unhandledRejection", (e) => { unhandled.push(String((e && e.message) || e)); });
 
 main().catch((e) => { process.stderr.write(String((e && e.stack) || e)); process.exit(1); });

@@ -844,3 +844,21 @@ def test_concurrent_signatures_never_take_the_read_slots(install, monkeypatch):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_levainsign_signs_once_tells_unknown_after_a_send_and_holds_an_open_review():
+    got = _drive_levainsign()
+    assert got["unhandled"] == [], got["unhandled"]
+    # K-5: a double tap on Sign is one passkey ceremony and one outcome
+    dt = got["double_tap"]
+    assert dt["webauthn"] == 1 and len(dt["done"]) == 1 and dt["said"][-1][1] == "ok", dt
+    # K-6: a fault after the signature was sent says the result is unknown, never "not applied"
+    s = got["after_send"]
+    assert s["webauthn"] == 1 and "unknown" in s["said"][-1][0] and "not applied" not in s["said"][-1][0], s
+    # K-7: an event-driven review holds the page until its Sign tap settles: a second write started meanwhile files
+    # nothing, the tap signs, and the next write files
+    ar = got["async_review"]
+    assert ar["issued_while_open"] == 1 and ar["webauthn_after_tap"] == 1 and ar["issued"] == 2, ar
+    # K-7: a review dismissed without signing releases the page, with no passkey prompt
+    d = got["dismissed"]
+    assert d["issued_while_open"] == 1 and d["issued"] == 2 and d["webauthn"] == 0, d
