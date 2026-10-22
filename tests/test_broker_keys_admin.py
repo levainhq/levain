@@ -166,11 +166,16 @@ def test_admin_eof_kills_cached_tokens_and_fronts(monkeypatch):
         k, front, admin = await _serve(d)
         out: dict = {}
         try:
-            # a peer that is not `_levain_control` is closed unread
+            # a peer that is not `_levain_control` is closed unread and unanswered. Closed unread, its frame can still
+            # sit in keys' receive queue at the close: Linux then resets the peer, macOS gives it EOF. Either is
+            # "closed"; an answer, or the connection staying open, is not.
             k.control_uid = os.getuid() + 1
             r, w = await asyncio.open_unix_connection(admin)
             await _send(w, 1, "DROP-SESSION", session="s-x")
-            out["foreign"] = await asyncio.wait_for(r.read(), 5)
+            try:
+                out["foreign"] = await asyncio.wait_for(r.read(), 5)
+            except ConnectionResetError:
+                out["foreign"] = b""
             w.close()
             k.control_uid = os.getuid()
 
