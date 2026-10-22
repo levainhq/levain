@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from levain.contracts import canon
+from levain.launch import child_env
 from levain.slot import Refused
 from levain.slot import end as E
 from levain.slot import proc as PR
@@ -898,10 +899,10 @@ def ensure_netns(slots: Sequence[SlotId]) -> None:
     from levain.slot.netns import netns_steps
 
     for step in netns_steps(slots):
-        if step.skip_if and subprocess.run(step.skip_if, timeout=NETNS_STEP_S).returncode == 0:
+        if step.skip_if and subprocess.run(step.skip_if, timeout=NETNS_STEP_S, env=child_env()).returncode == 0:
             continue
         if step.argv:
-            rc = subprocess.run(step.argv, timeout=NETNS_STEP_S).returncode
+            rc = subprocess.run(step.argv, timeout=NETNS_STEP_S, env=child_env()).returncode
             if rc != 0 and not step.allow_fail:
                 raise RuntimeError(f"{step.why}: exit {rc}")
 
