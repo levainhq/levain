@@ -28,6 +28,11 @@ from levain.daemon import (
     select_provider,
 )
 
+# The home `levain.daemon` bound its `UNIT_DIR` from: conftest's pytest_configure sets the session HOME before any
+# module is collected and nothing imports the daemon before that, so this is the HOME the import saw. (The suite gives
+# each test its own HOME afterwards, so `Path.home()` inside a test is not it.)
+_IMPORT_HOME = Path.home()
+
 
 # --- build_spec (pure resolution) ------------------------------------------------------------
 
@@ -85,10 +90,10 @@ def test_render_unit_is_per_user_never_system_scope() -> None:
     xml = LaunchdProvider().render_unit(build_spec(install_path=Path("/tmp/inst")))
     assert "LaunchDaemon" not in xml
     assert "RU SYSTEM" not in xml
-    # UNIT_DIR is the user's home as it was when levain.daemon was imported (the suite gives each test its own
-    # HOME after that), so check the shape: <a home>/Library/LaunchAgents, never /Library/LaunchDaemons
+    # an absolute <the home the daemon was imported under>/Library/LaunchAgents, never /Library/LaunchDaemons: the
+    # expected path is built here, not from UNIT_DIR, so a UNIT_DIR that went relative or moved fails
     unit = LaunchdProvider()._plist_path("com.x")
-    assert unit == LaunchdProvider.UNIT_DIR / "com.x.plist" and unit.parts[-3:-1] == ("Library", "LaunchAgents")
+    assert unit == _IMPORT_HOME / "Library" / "LaunchAgents" / "com.x.plist"
     assert not str(unit).startswith(("/Library/", "/System/"))
 
 
