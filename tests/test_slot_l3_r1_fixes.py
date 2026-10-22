@@ -242,7 +242,8 @@ def test_install_helper_entry_exits_non_zero(tmp_path):
     """S1 2e built the entry: run as a non-root user it refuses ``not-root`` (exit 1) with one JSON line, before
     it reads the host."""
     tree = tmp_path / "tree"
-    shutil.copytree(Path(levain.__file__).parent, tree / "levain", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(Path(levain.__file__).parent, tree / "gen-0" / "levain", ignore=shutil.ignore_patterns("__pycache__"))
+    (tree / "current").symlink_to("gen-0")     # row 33: the entry imports from realpath(<tree>/current)
     entry = tmp_path / "install-helper"
     entry.write_text(root_tree.entry_text("darwin" if sys.platform == "darwin" else "linux", "install-helper",
                                           tree=tree))

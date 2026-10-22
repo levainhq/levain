@@ -418,6 +418,7 @@ def _darwin_fixture(tmp_path):
         ". -list /Users RealName": f"root System  Administrator\n{OP} Alice\n_levain_s3 Levain session account\n"
                                    "_levain_s1 Levain session account (retired)\n",
         ". -list /Groups RealName": "wheel\nlevain-slots Levain session account\n",
+        ". -list /Groups GroupMembership": "wheel root\nlevain-slots _levain_s3\n",   # row 33 §3: membership read
     })
     L = tmp_path / "L"
     (L / "policy").mkdir(parents=True)
@@ -428,7 +429,7 @@ def _darwin_fixture(tmp_path):
     state.mkdir()
     (state / RETIRED_IDS_PATH["darwin"].name).write_text("7\n")
     (state / "install-intent").write_text(intent_text(Intent("setup", OP, {"_levain_keys": keys},
-                                                             {"levain-slots": slots_gid})))
+                                                             {"levain-slots": slots_gid}, "0" * 32)))
     return run, L, state, dict(s3=s3, s1=s1, gid=slots_gid)
 
 

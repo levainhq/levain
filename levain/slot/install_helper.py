@@ -808,11 +808,12 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
     else:
         # The slots' lo0 aliases go before the rules guarding them are flushed (§24).
         steps += pf.alias_undo_steps(slots_of(accounts)) + pf.unload_steps()
+    # Row 33 §1.1: the install record goes before the last three acts (the install rule, the journal, the record).
+    steps.append(Step("remove the install record", (rm, "-f", str(install_shape_path(host)))))
     steps += remove_install_sudoers_steps(host)
     # Just before the record (§25): until undo is complete a re-run still reads what the journal names.
     steps.append(intent_remove_step(host))
     if abandoned is None:
-        steps.append(Step("remove the install record", (rm, "-f", str(install_shape_path(host)))))
         steps.append(Step("remove the operator record (last)", (rm, "-f", str(operator_record_path(host)))))
     check_tools(facts, steps, verb="undo")
     return InstallPlan("undo", host, tuple(steps), retired_after=retired_after)
