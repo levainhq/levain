@@ -6,8 +6,8 @@ line on fd 4.
 
 Steps built here (5b1): 0, spool every frame into one append-only file and validate the terminal frame before any git
 command runs; 1, the base objects from ``in/repo.bundle``; 2, the session's own objects, loose ones name-verified and
-packs re-indexed by ``index-pack``, every other ``.git/`` path ignored and counted. Steps 3-6 (refs, the WIP commit,
-``fsck``, the bundle) are not built yet.
+packs re-indexed by ``index-pack``, every other ``.git/`` path ignored and counted. Step 3 (5b2): the session's refs,
+parsed as data, under ``refs/levain/<s>/``. Steps 4-6 (the WIP commit, ``fsck``, the bundle) are not built yet.
 
 Also here: the root-written ``repo.git`` config for both object formats (:func:`render_config`), the skeleton root
 makes at seal-in (:func:`make_skeleton`), and the environment and argv every importer git runs under.
@@ -38,13 +38,14 @@ from pathlib import Path
 from typing import BinaryIO, Iterator, Sequence
 
 from levain.contracts import canon
-from levain.slot import Refused, bundlefmt, fsck_ids, walkframe, write_all
+from levain.slot import Refused, bundlefmt, fsck_ids, walker, walkframe, write_all
+from levain.slot.grammar import SESSION_RE
 
 #: Hex length and hash constructor of each object format.
 FORMATS = {"sha1": (40, hashlib.sha1), "sha256": (64, hashlib.sha256)}
 #: ``repo.git/HEAD`` as root writes it: an unborn branch. ``git fsck`` refuses a symbolic HEAD outside ``refs/heads/``,
-#: so the name is a branch name; the refs step (5b2, not built yet) owes the refusal of any imported ref of exactly
-#: that name (``ref-reserved:refs/heads/levain-none``), so that HEAD never resolves to slot-supplied content.
+#: so the name is a branch name; the refs step refuses any imported ref of exactly that name
+#: (``ref-reserved:refs/heads/levain-none``), so that HEAD never resolves to slot-supplied content.
 HEAD_TEXT = b"ref: refs/heads/levain-none\n"
 #: The most bytes the result line may take, newline included.
 RESULT_CAP = 64 << 10
@@ -273,7 +274,8 @@ class GitRunner:
     log: BinaryIO | None = None
     started: list[list[str]] = field(default_factory=list)
 
-    def run(self, *args: str, stdin: tuple[Spool, int, int] | None = None) -> tuple[int, str, str]:
+    def run(self, *args: str, stdin: tuple[Spool, int, int] | bytes | None = None) -> tuple[int, str, str]:
+        """``stdin``: a spool slice streamed in chunks, or bytes the importer itself built (never session bytes)."""
         argv = git_argv(self.git, self.work, *args)
         self.started.append(argv)
         if self.log is not None:
@@ -290,10 +292,13 @@ class GitRunner:
                 t.start()
                 started.append(t)
             if stdin is not None:
-                spool, offset, size = stdin
                 try:
-                    for chunk in spool.chunks(offset, size):
-                        p.stdin.write(chunk)
+                    if isinstance(stdin, bytes):
+                        p.stdin.write(stdin)
+                    else:
+                        spool, offset, size = stdin
+                        for chunk in spool.chunks(offset, size):
+                            p.stdin.write(chunk)
                 except BrokenPipeError:
                     pass
                 finally:
@@ -315,7 +320,7 @@ class GitRunner:
                 t.join()
         return rc, b"".join(out).decode("utf-8", "replace"), b"".join(err).decode("utf-8", "replace")
 
-    def must(self, *args: str, stdin: tuple[Spool, int, int] | None = None) -> str:
+    def must(self, *args: str, stdin: tuple[Spool, int, int] | bytes | None = None) -> str:
         rc, out, err = self.run(*args, stdin=stdin)
         if rc != 0:
             last = (err.strip().splitlines() or [""])[-1]
@@ -530,6 +535,177 @@ def ingest_objects(runner: GitRunner, spool: Spool, frames: Sequence[Frame], *, 
     return ignored
 
 
+# --- step 3: refs -------------------------------------------------------------------------------------------------
+
+#: The most branch refs one session may carry (T14): past it the run refuses ``refs-cap`` before any ref is checked.
+REFS_CAP = 4096
+#: The branch root's HEAD names (:data:`HEAD_TEXT`). A session ref of that exact name is refused, so ``repo.git``'s
+#: HEAD can never resolve to slot-supplied content.
+RESERVED_REF = HEAD_TEXT[len(b"ref: "):].rstrip(b"\n")
+#: The largest loose ref file or ``packed-refs`` line read as a ref; anything longer is not one.
+_REF_TEXT_MAX = 4096
+_HEADS = b"refs/heads/"
+
+
+def _ref_bad(name: bytes, why: str) -> Fatal:
+    return Fatal(f"ref-name-bad:{walker.escape(name)}", why)
+
+
+@dataclass(frozen=True)
+class RefValue:
+    """One parsed ref: ``oid`` (hex) or ``target`` (a symbolic ``refs/heads/`` name), never both."""
+    oid: str | None = None
+    target: bytes | None = None
+
+
+def parse_ref_text(data: bytes, object_format: str) -> RefValue | None:
+    """A loose ref's or HEAD's bytes as data: ``<hex>`` of the format's length or ``ref: refs/heads/<name>``, one
+    optional trailing newline. Anything else is ``None``."""
+    n = FORMATS[object_format][0]
+    m = re.fullmatch(rb"([0-9a-f]{%d})\n?" % n, data)
+    if m is not None:
+        return RefValue(oid=m.group(1).decode("ascii"))
+    m = re.fullmatch(rb"ref: (refs/heads/[^\n\0]+)\n?", data)
+    if m is not None:
+        return RefValue(target=m.group(1))
+    return None
+
+
+def _packed_lines(spool: Spool, f: Frame) -> Iterator[bytes]:
+    """``packed-refs`` line by line from the spool, each without its newline, none longer than
+    :data:`_REF_TEXT_MAX` (a longer one refuses): memory stays bounded whatever the file's size."""
+    buf = bytearray()
+    for chunk in spool.chunks(f.offset, f.size):
+        buf += chunk
+        while (nl := buf.find(b"\n")) >= 0:
+            if nl > _REF_TEXT_MAX:
+                break
+            yield bytes(buf[:nl])
+            del buf[:nl + 1]
+        if len(buf) > _REF_TEXT_MAX:
+            raise _ref_bad(b"packed-refs", f"a line longer than {_REF_TEXT_MAX} bytes")
+    if buf:
+        yield bytes(buf)
+
+
+def parse_packed_refs(spool: Spool, f: Frame, object_format: str) -> dict[bytes, str]:
+    """``packed-refs`` as data: a ``#`` header on the first line only, peel lines (``^...``) skipped whatever they
+    hold, ``<hex> <refname>`` kept when ``refname`` is under ``refs/heads/`` and skipped otherwise (tags, remotes).
+    Any other line, or a branch listed twice, refuses. Past :data:`REFS_CAP` branches = ``refs-cap``, at once."""
+    n = FORMATS[object_format][0]
+    line_re = re.compile(rb"([0-9a-f]{%d}) ([^\n\0]+)" % n)
+    out: dict[bytes, str] = {}
+    for i, line in enumerate(_packed_lines(spool, f)):
+        if line.startswith(b"^") or (i == 0 and line.startswith(b"#")):
+            continue
+        m = line_re.fullmatch(line)
+        if m is None:
+            raise _ref_bad(b"packed-refs", f"line {i + 1} is not '<oid> <refname>'")
+        name = m.group(2)
+        if not name.startswith(_HEADS):
+            continue
+        if name in out:
+            raise _ref_bad(name, "listed twice in packed-refs")
+        out[name] = m.group(1).decode("ascii")
+        if len(out) > REFS_CAP:
+            raise Fatal("refs-cap", f"packed-refs lists more than {REFS_CAP} branches")
+    return out
+
+
+def _resolve_head(head: RefValue | None, refs: dict[bytes, RefValue]) -> str | None:
+    """HEAD's oid: its own (detached), or the branch it names followed through symbolic branches. A branch that is
+    not there (unborn) is no head. A chain that comes back to a name it passed is ``ref-head-loop``."""
+    if head is None:
+        return None
+    seen: set[bytes] = set()
+    cur = head
+    while cur.oid is None:
+        assert cur.target is not None
+        if cur.target in seen:
+            raise Fatal("ref-head-loop", f"HEAD's chain returns to {walker.escape(cur.target)}")
+        seen.add(cur.target)
+        nxt = refs.get(cur.target)
+        if nxt is None:
+            return None
+        cur = nxt
+    return cur.oid
+
+
+def import_refs(runner: GitRunner, spool: Spool, frames: Sequence[Frame], *, object_format: str,
+                session: str) -> None:
+    """Step 3: the session's ``HEAD``, loose ``refs/heads/**`` and ``packed-refs``, parsed as data (never by a git
+    reading the session's ``.git``). A reftable store (any ``reftable`` path) is ``refs-format-unsupported``: its refs
+    are not in these files. A loose ref overrides a packed one of the same name, as in git. Then, in this order: more
+    than :data:`REFS_CAP` branches = ``refs-cap``; the reserved name = ``ref-reserved:<name>``; a HEAD loop =
+    ``ref-head-loop``; each name through ``check-ref-format`` (``ref-name-bad:<escaped>``); every oid in the store
+    (``ref-object-missing``); then ONE ``update-ref --stdin -z`` transaction creating ``refs/levain/<s>/heads/<name>``
+    for each branch holding an oid and ``refs/levain/<s>/head`` for HEAD's oid. A symbolic branch is followed for HEAD
+    only, never imported as a ref of its own."""
+    loose: dict[bytes, RefValue] = {}
+    packed: dict[bytes, str] = {}
+    head: RefValue | None = None
+    for f in frames:
+        if not f.path.startswith(GIT_PREFIX):
+            continue
+        rel = f.path[len(GIT_PREFIX):]
+        if rel == b"reftable" or rel.startswith(b"reftable/"):
+            raise Fatal("refs-format-unsupported", "the session's refs are in a reftable store")
+    for f in frames:
+        if not f.path.startswith(GIT_PREFIX) or f.type != "file":
+            continue
+        rel = f.path[len(GIT_PREFIX):]
+        if rel == b"packed-refs":
+            packed = parse_packed_refs(spool, f, object_format)
+            continue
+        if rel != b"HEAD" and not rel.startswith(_HEADS):
+            continue
+        if f.size > _REF_TEXT_MAX:
+            raise _ref_bad(rel, f"a ref file of {f.size} bytes")
+        value = parse_ref_text(spool.read(f.offset, f.size), object_format)
+        if value is None:
+            raise _ref_bad(rel, "its content is neither an oid nor 'ref: refs/heads/<name>'")
+        if rel == b"HEAD":
+            head = value
+        else:
+            loose[rel] = value
+            if len(loose) > REFS_CAP:
+                raise Fatal("refs-cap", f"more than {REFS_CAP} loose branches")
+    refs: dict[bytes, RefValue] = {name: RefValue(oid=oid) for name, oid in packed.items()}
+    refs.update(loose)
+    if len(refs) > REFS_CAP:
+        raise Fatal("refs-cap", f"{len(refs)} branches, more than {REFS_CAP}")
+    if RESERVED_REF in refs:
+        raise Fatal(f"ref-reserved:{RESERVED_REF.decode('ascii')}", "the session carries the reserved branch name")
+    head_oid = _resolve_head(head, refs)
+    for name in sorted(refs):
+        rc, _out, _err = runner.run("check-ref-format", os.fsdecode(name))
+        if rc != 0:
+            raise _ref_bad(name, "refused by check-ref-format")
+    want = [(name, v.oid) for name, v in sorted(refs.items()) if v.oid is not None]
+    if head_oid is not None:
+        want.append((b"HEAD", head_oid))
+    oids = sorted({oid for _name, oid in want})
+    if not oids:
+        return
+    # One type per line: a present object answers at most 7 bytes, so the whole answer stays inside the reader's
+    # kept head, and the first missing line is always read whole.
+    out = runner.must("cat-file", "--batch-check=%(objecttype)", stdin="".join(o + "\n" for o in oids).encode())
+    answers = out.split("\n")
+    # A missing object's line carries its own oid: attribution never depends on line positions.
+    missing = {a.split(" ")[0] for a in answers if a.endswith(" missing")} & set(oids)
+    if not missing and len(answers) != len(oids) + 1:
+        raise Fatal(None, f"cat-file answered {len(answers) - 1} lines for {len(oids)} objects")
+    for name, oid in want:
+        if oid in missing:
+            raise Fatal("ref-object-missing", f"{walker.escape(name)} names {oid}, not in the store")
+    base = f"refs/levain/{session}/".encode("ascii")
+    txn = b"".join(b"create " + base + b"heads/" + name[len(_HEADS):] + b"\0" + oid.encode("ascii") + b"\0"
+                   for name, oid in want if name != b"HEAD")
+    if head_oid is not None:
+        txn += b"create " + base + b"head\0" + head_oid.encode("ascii") + b"\0"
+    runner.must("update-ref", "--stdin", "-z", stdin=txn)
+
+
 # --- the result line and the run ----------------------------------------------------------------------------------
 
 def probe_enospc(work: Path) -> bool:
@@ -600,6 +776,7 @@ class _Parser(argparse.ArgumentParser):
 def _parser() -> _Parser:
     ap = _Parser(prog="export-importer", add_help=False)
     ap.add_argument("--git", required=True)
+    ap.add_argument("--session", required=True, help="the session id, `s-<16 hex>`; names refs/levain/<s>/")
     ap.add_argument("--object-format", required=True, choices=sorted(FORMATS))
     ap.add_argument("--base-oid", required=True)
     ap.add_argument("--max-bytes", required=True, type=int, help="the spool's payload total (V7 bytes)")
@@ -641,6 +818,8 @@ def run(argv: Sequence[str], *, stdin: BinaryIO | None, result_fd: int, work: Pa
                 raise Fatal(None, f"usage: {u}") from None
             if not re.fullmatch(r"[0-9a-f]{%d}" % FORMATS[a.object_format][0], a.base_oid):
                 raise Fatal(None, "usage: --base-oid is not an oid of the object format")
+            if not SESSION_RE.fullmatch(a.session):
+                raise Fatal(None, "usage: --session is not a session id")
             if a.git_log:
                 try:
                     log = open(a.git_log, "ab")
@@ -656,6 +835,7 @@ def run(argv: Sequence[str], *, stdin: BinaryIO | None, result_fd: int, work: Pa
                         cap=a.max_input_size)
             progress.ignored_git_paths = ingest_objects(runner, spool, frames, object_format=a.object_format,
                                                         cap=a.max_input_size)
+            import_refs(runner, spool, frames, object_format=a.object_format, session=a.session)
             out.update(rc=0, refused=None, detail="", enospc=False)
         except Fatal as f:
             out.update(rc=1, refused=f.name, detail=f.detail,
