@@ -157,10 +157,12 @@ class Reaper:
     service start: a restart retries every HELD once at once, then backs off; DESIGN Q6) and the pass counter."""
 
     def __init__(self, seams: H.Seams, *, tuning: Tuning = Tuning(),
-                 log: Callable[[str], None] = _log_to_stderr) -> None:
+                 log: Callable[[str], None] = _log_to_stderr,
+                 netns: Optional[Callable[[Sequence[SlotId]], None]] = None) -> None:
         self.seams = seams
         self.tuning = tuning
         self.log = log
+        self.netns = netns or ensure_netns
         self.pass_seq = 0
         self.next_try: Dict[str, float] = {}
 
@@ -184,14 +186,14 @@ class Reaper:
 
     # -- boot (§4.2) --------------------------------------------------------------------------------------------------
 
-    def boot_steps(self, *, netns: Optional[Callable[[Sequence[SlotId]], None]] = None) -> None:
+    def boot_steps(self) -> None:
         """§4.2 steps 2-4, in the worker before its first pass: Linux namespaces, the reserve, then CONTROL with
         retry. Step 1 (``R/`` and ``wake.sock``) is the main process's (:func:`boot_dirs`)."""
         store = H.Store(self.seams)
         try:
             if self.seams.host == "linux":
                 try:
-                    (netns or ensure_netns)(_slots(store))
+                    self.netns(_slots(store))
                 except Exception as e:   # noqa: BLE001 - start refuses netns-missing; the pass goes on
                     self.log(f"boot: netns: {type(e).__name__}: {e}")
             self._refill(store)
