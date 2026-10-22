@@ -393,10 +393,17 @@ class _FakeControl:
 
     def __init__(self, answers: dict, held: set) -> None:
         self.answers, self.held = answers, held
-        self.release = asyncio.Event()
+        self._release = None
         self.seen: list = []
         self.inflight = 0
         self.peak = 0
+
+    @property
+    def release(self) -> asyncio.Event:
+        # built on first use, inside the running loop: on 3.9 an Event binds get_event_loop() at construction
+        if self._release is None:
+            self._release = asyncio.Event()
+        return self._release
 
     async def handle(self, reader, writer) -> None:
         try:

@@ -75,9 +75,22 @@ class _Up:
         self.writes: list = []
         self.drains = 0
         self.stall_at = stall_at
-        self.q: asyncio.Queue = asyncio.Queue()
+        self._q = None
         self.reads = 0
-        self.read_called = asyncio.Event()
+        self._read_called = None
+
+    # built on first use, inside the running loop: on 3.9 an Event/Queue binds get_event_loop() at construction
+    @property
+    def q(self) -> asyncio.Queue:
+        if self._q is None:
+            self._q = asyncio.Queue()
+        return self._q
+
+    @property
+    def read_called(self) -> asyncio.Event:
+        if self._read_called is None:
+            self._read_called = asyncio.Event()
+        return self._read_called
 
     def feed(self, data: bytes) -> None:
         self.q.put_nowait(data)
