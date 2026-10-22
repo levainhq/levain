@@ -140,7 +140,7 @@ class World:
         self.armed: list[str] = []
         self.control = C.Control(C.StateStore(L / "sessions"), OP_UID,
                                  keys_front_register=lambda *a: self.registered.append(a),
-                                 keys_front_arm=lambda s: self.armed.append(s))
+                                 keys_front_arm=lambda s, t: self.armed.append(s))
         self.run_as_uids: list[int] = []
         n = iter(range(1, 1 << 30))
         self.seams = H.Seams(
@@ -542,7 +542,7 @@ def test_render_order_observed(world):
     (pid,) = world.fronts.procs
     assert go_at_arm == [None]                                          # no go byte before FRONT-ARM answers
     assert world.fronts.go_bytes(pid) == H.GO_BYTE and world.fronts.go_bytes(pid) == b""   # then the byte, EOF
-    assert world.registered == [(s, 898, pid, 7000 + pid, 1)] and world.armed == [s]
+    assert world.registered == [(s, 898, pid, 7000 + pid, 1, 1)] and world.armed == [s]
     mint = dict(world.calls[1][1]["claims"])
     assert mint == {"routes": ["anthropic", "github"], "queue_grant": False, "incarnation": 1,
                     "egress_routes": ["github"], "front": {"uid": 898, "pid": pid, "start": 7000 + pid}}

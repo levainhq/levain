@@ -216,7 +216,10 @@ _HARNESS_A = {"format": "levain-front-session/1", "kind": "interactive", "sessio
 _HARNESS_B = {"format": "levain-front-session/1", "kind": "interactive", "session": "s-fixture-brokered", "routes": [
     {"route": "egress-fixture", "type": "egress", "hosts": ["allowed.example", "github.com"]},
     {"route": "anthropic", "type": "brokered", "hosts": ["api.anthropic.com"],
-     "upstream": {"scheme": "https", "host": "api.anthropic.com", "base_path": "/"}}]}
+     "upstream": {"scheme": "https", "host": "api.anthropic.com", "base_path": ""},
+     "requests": {"templates": [{"method": "POST", "path": "/v1/messages?*"}], "headers": {},
+                  "body_cap": 1048576, "body_codec": "anthropic-messages"},
+     "max_call_microdollars": 2000000}]}
 _POL = {"A": load_policy(json.dumps(_HARNESS_A).encode()), "B": load_policy(json.dumps(_HARNESS_B).encode())}
 
 
@@ -286,3 +289,348 @@ PURE_ROWS = [
 @pytest.mark.parametrize("fn,arg,want", PURE_ROWS, ids=[f"{r[0]}-{i}" for i, r in enumerate(PURE_ROWS)])
 def test_pure_function_rows(fn, arg, want):
     assert _call(fn, arg) == want
+
+
+# --- the R15 gate script, under the root interpreter ----------------------------------------------------------------
+
+_ROOT_PYTHON = "/usr/bin/python3"
+
+
+def test_refusal_survives_streaming_body_gates(tmp_path):
+    """Reproduced (3b-1a, probe (b)'s write-then-read shape, the script's case R): a front whose keys reader resumes
+    only after its body writer failed answered 503, never the 401 keys sent, though the `F` had already arrived
+    (3b-1a-fix1: the whole frame sat in the reader's buffer). The gate script proves the `F` is kept under both
+    gates and in case R; it runs as the root interpreter runs the gateway, isolated, from a launcher."""
+    import shutil
+    import subprocess
+    import sys
+
+    import h11
+
+    if not os.path.exists(_ROOT_PYTHON):
+        pytest.skip(f"no {_ROOT_PYTHON} on this host")
+    h11_tree = tmp_path / "h11-only"
+    shutil.copytree(Path(h11.__file__).parent, h11_tree / "h11", ignore=shutil.ignore_patterns("__pycache__"))
+    here = Path(__file__).resolve().parent
+    trees = [here, here.parent, h11_tree]
+    launcher = tmp_path / "gate_launcher.py"
+    launcher.write_text("import sys\n" + "".join(f"sys.path.insert(0, {str(t)!r})\n" for t in trees)
+                        + "import runpy\nrunpy.run_module('broker_gate_script', run_name='__main__', alter_sys=True)\n")
+    probe = subprocess.run([_ROOT_PYTHON, "-IS", "-c", "import sys; print(sys.version_info >= (3, 9))"],
+                           capture_output=True, text=True, timeout=30)
+    if probe.stdout.strip() != "True":
+        pytest.skip(f"{_ROOT_PYTHON} is older than the gateway's 3.9 floor")
+    out = subprocess.run([_ROOT_PYTHON, "-IS", str(launcher)], capture_output=True, text=True, timeout=120)
+    sys.stdout.write(out.stdout + out.stderr)
+    assert out.returncode == 0 and out.stdout.strip().endswith("GATE PASS"), out.stdout + out.stderr
+
+
+# --- the brokered exchange against a stand-in keys -------------------------------------------------------------------
+
+_TOKEN = "A" * 43
+_EX_POLICY = {"format": "levain-front-session/1", "kind": "interactive", "session": "s-ex", "routes": [
+    {"route": "vendor", "type": "brokered", "upstream": {"scheme": "https", "host": "api.vendor.example",
+                                                         "base_path": ""},
+     "requests": {"templates": [{"method": "POST", "path": "/v1/messages"}], "headers": {"content-type": ".*"},
+                  "body_cap": 32 * 1024 * 1024, "body_codec": "none"},
+     "max_call_microdollars": 1}]}
+
+
+async def _answering_keys(path: str, seen: list):
+    """keys' front.sock for one exchange: records `Q`, answers `A`, `R 200`, one `b`, `e` at once, then reads
+    whatever the front still sends until its `E` / `X` / EOF."""
+    from levain.broker import gwwire
+
+    async def frame(r):
+        try:
+            hdr = await r.readexactly(5)
+            return hdr[:1], await r.readexactly(int.from_bytes(hdr[1:], "big"))
+        except (asyncio.IncompleteReadError, ConnectionError):
+            return None
+
+    async def serve(r, w):
+        first = await frame(r)
+        seen.append(json.loads(first[1]))
+        for f in (gwwire.encode(b"A", {}), gwwire.encode(b"R", {"v": 1, "status": 200, "headers": []}),
+                  gwwire.encode(b"b", b"early-ok"), gwwire.encode(b"e")):
+            w.write(f)
+        await w.drain()
+        while (fr := await frame(r)) is not None and fr[0] not in (b"E", b"X"):
+            pass
+        w.close()
+
+    return await asyncio.start_unix_server(serve, path)
+
+
+async def _exchange(slot_pair, head: bytes, body: bytes) -> tuple[dict, bytes, list]:
+    """One brokered exchange, the front's side driven directly; the slot writes its whole body BEFORE it reads."""
+    from levain.broker.front import BrokeredExchange, parse_head_conn
+
+    seen: list = []
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        keys = await _answering_keys(os.path.join(tmp, "k.sock"), seen)
+        front = Front(load_policy(json.dumps(_EX_POLICY).encode()), log_path=os.path.join(tmp, "f.log"),
+                      keys_path=os.path.join(tmp, "k.sock"))
+        fr, fw, sr, sw = await slot_pair()
+
+        async def slot() -> bytes:
+            sw.write(head)
+            try:
+                for i in range(0, len(body), 65536):
+                    sw.write(body[i:i + 65536])
+                    await sw.drain()
+                return await asyncio.wait_for(sr.read(), 20)
+            except OSError as e:
+                return type(e).__name__.encode()
+
+        s = asyncio.ensure_future(slot())
+        conn, req = parse_head_conn(await fr.readuntil(b"\r\n\r\n"))
+        ex = BrokeredExchange(front, front.policy.brokered["vendor"], conn, req, req.target[9:], None, fr, fw)
+        await asyncio.wait_for(ex.run(), 30)
+        fw.close()   # as Front._handle does once the exchange returns
+        got = await asyncio.wait_for(s, 30)
+        sw.close()
+        keys.close()
+    return ex.rec, got, seen
+
+
+async def _tcp_slot_pair():
+    accepted: asyncio.Future = asyncio.get_running_loop().create_future()
+    server = await asyncio.start_server(lambda r, w: accepted.set_result((r, w)), "127.0.0.1", 0)
+    sr, sw = await asyncio.open_connection("127.0.0.1", server.sockets[0].getsockname()[1])
+    fr, fw = await accepted
+    server.close()
+    return fr, fw, sr, sw
+
+
+async def _unix_slot_pair():
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    fr, fw = await asyncio.open_unix_connection(sock=a)
+    sr, sw = await asyncio.open_unix_connection(sock=b)
+    return fr, fw, sr, sw
+
+
+def test_early_response_is_not_reset_by_the_unread_body():
+    """Reproduced (3b-1a-fix1, codex r1 HIGH 2): keys answers `R 200 ... e` while a 5 MiB body is still arriving; the
+    front used to close over the unread body, and a TCP slot that uploads before it reads got a broken pipe and no
+    response. Now the front discards the rest of the body after the response, then closes."""
+    body = b"x" * (5 * 1024 * 1024)
+    head = (b"POST /r/vendor/v1/messages HTTP/1.1\r\nHost: gw\r\nAuthorization: Bearer %s\r\n"
+            b"Content-Length: %d\r\n\r\n" % (_TOKEN.encode(), len(body)))
+    rec, got, _ = asyncio.run(_exchange(_tcp_slot_pair, head, body))
+    assert got.startswith(b"HTTP/1.1 200 OK\r\n") and b"early-ok" in got, got[:200]
+    assert rec["end"] == "ok" and rec["discarded"] > 0, rec
+
+
+def test_connection_keep_alive_is_dropped_not_refused():
+    """Reproduced (3b-1a-fix1, complement r1 9): `Connection: keep-alive`, which common clients send, was refused 400
+    `malformed`. It is a connection option: dropped, never forwarded, the request served."""
+    head = (b"POST /r/vendor/v1/messages HTTP/1.1\r\nHost: gw\r\nAuthorization: Bearer %s\r\n"
+            b"Connection: keep-alive\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n" % _TOKEN.encode())
+    rec, got, seen = asyncio.run(_exchange(_unix_slot_pair, head, b"{}"))
+    assert got.startswith(b"HTTP/1.1 200 OK\r\n"), got[:200]
+    assert [q["headers"] for q in seen] == [[["content-type", "application/json"]]], seen
+    assert "refused" not in rec and "connection" not in rec["dropped"], rec
+
+
+_WS_POLICY = {"format": "levain-front-session/1", "kind": "interactive", "session": "s-ws", "routes": [
+    {"route": "ws", "type": "brokered", "upstream": {"scheme": "https", "host": "ws.vendor.example", "base_path": ""},
+     "requests": {"templates": [{"method": "GET", "path": "/v1/live", "upgrade": "websocket"}],
+                  "headers": {"sec-websocket-key": ".*", "sec-websocket-version": ".*"},
+                  "body_cap": 1024, "body_codec": "none"},
+     "max_call_microdollars": 1}]}
+
+
+#: every slot-side task the exchange starts (the body writer, the websocket pump) x every way it can end while keys is
+#: silent: the slot resets, the slot closes cleanly, and the task raises after it wrote to keys (injected).
+_SLOT_EXITS = [("body", "rst"), ("body", "fin"), ("body", "raise"),
+               ("ws", "rst"), ("ws", "fin"), ("ws", "raise")]
+
+
+@pytest.mark.parametrize("site,fault", _SLOT_EXITS, ids=[f"{s}-{f}" for s, f in _SLOT_EXITS])
+def test_slot_task_exit_ends_the_exchange_and_tells_keys(site, fault):
+    """A slot-side task that ends, by any path, ends the exchange within the bound while keys stays silent, and keys
+    hears the slot's end (`X` mid-body, `E` on a websocket). Reproduced, one site per round: the body writer on a slot
+    reset (3b-1a-fix2), the pump on a reset (fix3) and on a clean close (fix4); each waited on keys with no bound.
+    Reproduced (3b-1a-class, injected): a body writer or pump raising anything but an OSError after writing to keys
+    hung the same way."""
+    import base64
+    import struct
+
+    from levain.broker import gwwire
+    from levain.broker.front import BrokeredExchange, parse_head_conn
+
+    async def raising(*a, **k):
+        raise RuntimeError("injected")
+
+    async def go() -> tuple[dict, list]:
+        got: list = []
+
+        async def serve(r, w):   # keys: (for a websocket `A`, `U`), then silent; records every frame type until EOF
+            if site == "ws":
+                w.write(gwwire.encode(b"A", {}) + gwwire.encode(b"U", {"v": 1, "headers": []}))
+            while True:
+                try:
+                    hdr = await r.readexactly(5)
+                    await r.readexactly(int.from_bytes(hdr[1:], "big"))
+                except (asyncio.IncompleteReadError, ConnectionError):
+                    break
+                got.append(hdr[:1])
+            w.close()
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            path = os.path.join(tmp, "k.sock")
+            keys = await asyncio.start_unix_server(serve, path)
+            pol = _WS_POLICY if site == "ws" else _EX_POLICY
+            front = Front(load_policy(json.dumps(pol).encode()), log_path=os.path.join(tmp, "f.log"), keys_path=path)
+            fr, fw, sr, sw = await _tcp_slot_pair()
+            if site == "ws":
+                sw.write(b"GET /r/ws/v1/live HTTP/1.1\r\nHost: gw\r\nAuthorization: Bearer %s\r\nConnection: Upgrade"
+                         b"\r\nUpgrade: websocket\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                         % (_TOKEN.encode(), base64.b64encode(b"k" * 16)))
+            else:
+                sw.write(b"POST /r/vendor/v1/messages HTTP/1.1\r\nHost: gw\r\nAuthorization: Bearer %s\r\n"
+                         b"Content-Length: %d\r\n\r\n" % (_TOKEN.encode(), 5 * 1024 * 1024) + b"x" * 65536)
+            await sw.drain()
+            conn, req = parse_head_conn(await fr.readuntil(b"\r\n\r\n"))
+            route, upath = ("ws", b"/v1/live") if site == "ws" else ("vendor", b"/v1/messages")
+            ex = BrokeredExchange(front, front.policy.brokered[route], conn, req, upath, None, fr, fw)
+            run = asyncio.ensure_future(ex.run())
+            if site == "ws":
+                assert (await asyncio.wait_for(sr.readuntil(b"\r\n\r\n"), 10)).startswith(b"HTTP/1.1 101 ")
+                sw.write(b"\x81\x05hello")
+                await sw.drain()
+            await asyncio.sleep(0.3)   # the task has written to keys and is parked in its next read of the slot
+            if fault == "raise":   # the task's NEXT read of the slot raises; the parked read returns the bytes below
+                if site == "ws":
+                    fr.read = raising
+                else:
+                    ex.body.next = raising
+                sw.write(b"\x81\x05again" if site == "ws" else b"y" * 65536)
+                await sw.drain()
+            elif fault == "rst":
+                sw.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                sw.transport.abort()   # an RST, not a FIN
+            else:
+                sw.write_eof()         # a FIN
+            await asyncio.wait_for(run, 5)
+            fw.close()
+            sw.close()
+            await asyncio.sleep(0.1)
+            keys.close()
+        return ex.rec, got
+
+    rec, got = asyncio.run(go())
+    if fault == "fin":
+        assert rec["end"] == "slot-eof" and "slot_error" not in rec, rec
+    else:
+        assert rec["end"] == "slot-gone" and rec.get("slot_error"), rec
+        if fault == "raise":
+            assert rec["slot_error"] == "RuntimeError", rec
+    if site == "ws":
+        assert b"D" in got and got[-1] == b"E", got
+    else:
+        assert b"B" in got and got[-1] == b"X", got
+
+
+def test_a_decided_keys_answer_is_not_lost_to_a_later_slot_exit():
+    """Reproduced (3b-1a-class-fix1, codex r6 B): with the events queue full of keys' `b` frames and keys' `e` already
+    decoded but blocked putting the next one, the slot closed mid-body; the exit was ordered by the queue's size, so it
+    was reported ahead of the `e` and the exchange ended `slot-eof` with the response cut short. A keys frame decoded
+    before a slot task's exit is relayed before that exit."""
+    from levain.broker import gwwire
+    from levain.broker.front import _EVENTS_MAX, BrokeredExchange, parse_head_conn
+
+    chunks = [b"part-%d" % i for i in range(_EVENTS_MAX)]
+
+    async def go() -> tuple[dict, bytes]:
+        async def serve(r, w):   # keys: `A`, `R`, enough `b` to fill the queue, `e`; then reads until X / E / EOF
+            await r.readexactly(int.from_bytes((await r.readexactly(5))[1:], "big"))   # the `Q`
+            w.write(gwwire.encode(b"A", {}) + gwwire.encode(b"R", {"v": 1, "status": 200, "headers": []})
+                    + b"".join(gwwire.encode(b"b", c) for c in chunks) + gwwire.encode(b"e"))
+            await w.drain()
+            while True:
+                try:
+                    hdr = await r.readexactly(5)
+                    await r.readexactly(int.from_bytes(hdr[1:], "big"))
+                except (asyncio.IncompleteReadError, ConnectionError):
+                    break
+                if hdr[:1] in (b"E", b"X"):
+                    break
+            w.close()
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            path = os.path.join(tmp, "k.sock")
+            keys = await asyncio.start_unix_server(serve, path)
+            front = Front(load_policy(json.dumps(_EX_POLICY).encode()), log_path=os.path.join(tmp, "f.log"),
+                          keys_path=path)
+            fr, fw, sr, sw = await _tcp_slot_pair()
+            sw.write(b"POST /r/vendor/v1/messages HTTP/1.1\r\nHost: gw\r\nAuthorization: Bearer %s\r\n"
+                     b"Content-Length: %d\r\n\r\n" % (_TOKEN.encode(), 5 * 1024 * 1024) + b"x" * 65536)
+            await sw.drain()
+            conn, req = parse_head_conn(await fr.readuntil(b"\r\n\r\n"))
+            ex = BrokeredExchange(front, front.policy.brokered["vendor"], conn, req, b"/v1/messages", None, fr, fw)
+            gate, drain = asyncio.Event(), fw.drain
+
+            async def held_drain():   # the relay parks on its first write to the slot (the `R`) until the gate opens
+                await gate.wait()
+                await drain()
+
+            fw.drain = held_drain
+            run = asyncio.ensure_future(ex.run())
+            async def until(cond, what):   # a bounded wait on a stated condition; the failure says what it saw
+                loop = asyncio.get_running_loop()
+                end = loop.time() + 10
+                while not cond():
+                    if loop.time() > end:
+                        raise AssertionError(f"timed out waiting for {what}: decoded={ex._decoded} taken={ex._taken} "
+                                             f"slot_done={[t.done() for t in ex._slot]}")
+                    await asyncio.sleep(0.01)
+
+            # the relay holds `R`; the queue is full of `b`; keys' reader has decoded the `e` and is blocked putting it
+            # (`A`, `R`, every `b` and the `e`: the count the reader decoded)
+            await until(lambda: ex._decoded >= len(chunks) + 3, "keys' `e` to be decoded")
+            sw.write_eof()             # the slot closes mid-body: the body writer ends "slot-eof"
+            await until(lambda: ex._slot and all(t.done() for t in ex._slot), "the slot task to exit")
+            gate.set()
+            await asyncio.wait_for(run, 5)
+            fw.close()
+            got = await asyncio.wait_for(sr.read(), 5)
+            sw.close()
+            keys.close()
+        return ex.rec, got
+
+    rec, got = asyncio.run(go())
+    assert rec["end"] == "ok" and rec["status"] == 200, rec
+    assert got.startswith(b"HTTP/1.1 200 OK\r\n") and got.endswith(b"0\r\n\r\n"), got[-80:]
+    assert all(c in got for c in chunks), got
+
+
+def test_websocket_handshake_over_http_1_0_is_malformed():
+    """Reproduced (3b-1a-fix2, codex r2 6): a complete websocket handshake sent as HTTP/1.0 was forwarded as
+    `upgrade: websocket`. RFC 6455 §4.1 requires HTTP/1.1 or later: refused `malformed` before keys."""
+    import base64
+
+    from levain.broker.front import BrokeredExchange, parse_head_conn
+
+    async def go() -> tuple[dict, bytes]:
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            # no keys listens here: a request that reached keys would be refused 503, not 400
+            front = Front(load_policy(json.dumps(_WS_POLICY).encode()), log_path=os.path.join(tmp, "f.log"),
+                          keys_path=os.path.join(tmp, "absent.sock"))
+            fr, fw, sr, sw = await _unix_slot_pair()
+            sw.write(b"GET /r/ws/v1/live HTTP/1.0\r\nHost: gw\r\nAuthorization: Bearer %s\r\nConnection: Upgrade\r\n"
+                     b"Upgrade: websocket\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                     % (_TOKEN.encode(), base64.b64encode(b"k" * 16)))
+            await sw.drain()
+            conn, req = parse_head_conn(await fr.readuntil(b"\r\n\r\n"))
+            ex = BrokeredExchange(front, front.policy.brokered["ws"], conn, req, b"/v1/live", None, fr, fw)
+            await asyncio.wait_for(ex.run(), 10)
+            fw.close()
+            got = await asyncio.wait_for(sr.read(), 10)
+            sw.close()
+        return ex.rec, got
+
+    rec, got = asyncio.run(go())
+    assert got.startswith(b"HTTP/1.1 400 "), got[:200]
+    assert rec["refused"] == "malformed" and rec["detail"] == "websocket-version", rec

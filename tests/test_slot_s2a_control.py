@@ -34,7 +34,7 @@ ALL_VERBS = ("LEASE-OPEN", "STATUS", "ATTACH", "CAS", "MINT", "FRONT-ARM", "SECR
              "NOT-A-VERB")
 SESSION2 = {"operator": {"LEASE-OPEN", "STATUS"},
             "root": {"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET"},
-            "qbroker": {"QUEUE-RESOLVE"}}
+            "qbroker": {"QUEUE-RESOLVE"}, "keys": {"TOKEN-RESOLVE"}}
 
 
 def attach_claims(**kw) -> dict:
@@ -66,7 +66,7 @@ class Seams:
     def front_register(self, *a):
         self.calls.append(("register",) + a)
 
-    def front_arm(self, session):
+    def front_arm(self, session, reg_token):
         if self.arm_refuse:
             raise Refused(self.arm_refuse)
         self.calls.append(("arm", session))
@@ -197,9 +197,9 @@ def to_rendering(env: Env, session: str = S1, **claims_kw) -> tuple[Client, Clie
 
 def to_rendered(env: Env, session: str = S1, **mint_kw) -> tuple[Client, Client]:
     op, root = to_rendering(env, session)
-    assert root.ask("MINT", session=session, generation=1, claims=mint_claims(**mint_kw))["ok"]
-    assert root.ask("FRONT-ARM", session=session, generation=2)["ok"]
-    assert cas(root, session, 2, "RENDERING", "RENDERED")["ok"]
+    gen = root.ask("MINT", session=session, generation=1, claims=mint_claims(**mint_kw))["generation"]
+    assert root.ask("FRONT-ARM", session=session, generation=gen)["ok"]
+    assert cas(root, session, gen, "RENDERING", "RENDERED")["ok"]
     return op, root
 
 
@@ -521,7 +521,7 @@ def test_lease_eof_revokes_lease_live_first(env):
     op.close()
     settle(env, S1, "REVOKED")
     assert writes == [(2, "RENDERING", False, "none"), (3, "REVOKED", False, "state")]
-    assert env.seams.calls[-2:] == [("drop", S1), ("wake",)]
+    assert env.seams.calls[-2:] == [("wake",), ("drop", S1)]          # the reaper first, never behind keys
 
 
 def test_lease_eof_meets_held_lock(env):
@@ -578,10 +578,10 @@ def test_lease_eof_drops_handles(env):
 def test_mint_registers_front_then_mints(env):
     op, root = to_rendering(env)
     ans = root.ask("MINT", session=S1, generation=1, claims=mint_claims())
-    assert ans["generation"] == 2
-    assert ("register", S1, 3989, 4242, 1700000000, 1) in env.seams.calls
+    assert ans["generation"] == 3                                   # the token-only prewrite is a generation of its own
+    assert ("register", S1, 3989, 4242, 1700000000, 1, 1) in env.seams.calls
     rec = env.record(S1)
-    assert rec.claims == {**attach_claims(), **mint_claims()} and rec.event_kind == "none"
+    assert rec.claims == {**attach_claims(), **mint_claims(), "reg_token": 1} and rec.event_kind == "none"
     h = env.control.handles(S1)
     assert len(h.token) == 43 and len(h.queue_cap) == 43 and h.token != h.queue_cap
     for k in ("token", "queue_cap", "lease_nonce"):
@@ -604,7 +604,7 @@ def test_mint_refusals(env):
     del c["front"]
     assert root.ask("MINT", session=S1, generation=1, claims=c)["refused"] == "claims-mismatch"
     assert root.ask("MINT", session=S1, generation=1, claims=mint_claims())["ok"]
-    assert root.ask("MINT", session=S1, generation=2, claims=mint_claims())["refused"] == "already-minted"
+    assert root.ask("MINT", session=S1, generation=3, claims=mint_claims())["refused"] == "already-minted"
     assert root.ask("MINT", session=S2, generation=0, claims=mint_claims())["refused"] == "no-session"
 
 
@@ -622,7 +622,9 @@ def test_mint_fails_closed_without_keys():
     try:
         op, root = to_rendering(e)
         assert root.ask("MINT", session=S1, generation=1, claims=mint_claims())["refused"] == "keys-unavailable"
-        assert e.record(S1).generation == 1 and e.control.handles(S1) is None
+        rec = e.record(S1)                                          # TOKEN-ONLY: authorises nothing
+        assert rec.generation == 2 and rec.claims == {**attach_claims(), "reg_token": 1}
+        assert e.control.handles(S1) is None
     finally:
         e.close()
 
@@ -632,24 +634,24 @@ def test_front_arm_relays_and_answers_after(env):
     assert root.ask("FRONT-ARM", session=S1, generation=1)["refused"] == "not-rendering"   # before MINT
     root.ask("MINT", session=S1, generation=1, claims=mint_claims())
     assert root.ask("FRONT-ARM", session=S1, generation=1)["refused"] == "stale-generation"
-    assert root.ask("FRONT-ARM", session=S1, generation=2) == {"id": root.next_id, "ok": True, "generation": 2}
+    assert root.ask("FRONT-ARM", session=S1, generation=3) == {"id": root.next_id, "ok": True, "generation": 3}
     assert env.seams.calls[-1] == ("arm", S1)
     env.seams.arm_refuse = "keys-unavailable"
-    assert root.ask("FRONT-ARM", session=S1, generation=2)["refused"] == "keys-unavailable"
+    assert root.ask("FRONT-ARM", session=S1, generation=3)["refused"] == "keys-unavailable"
 
 
 def test_secrets_before_rendered_refused(env):
     op, root = attach(env)
     assert root.ask("SECRETS", session=S1)["refused"] == "not-rendered"
     cas(root, S1, 0, "ALLOCATED", "RENDERING")
-    root.ask("MINT", session=S1, generation=1, claims=mint_claims())
+    gen = root.ask("MINT", session=S1, generation=1, claims=mint_claims())["generation"]
     assert root.ask("SECRETS", session=S1)["refused"] == "not-rendered"
-    root.ask("FRONT-ARM", session=S1, generation=2)
-    cas(root, S1, 2, "RENDERING", "RENDERED")
+    root.ask("FRONT-ARM", session=S1, generation=gen)
+    cas(root, S1, gen, "RENDERING", "RENDERED")
     ans = root.ask("SECRETS", session=S1)
     h = env.control.handles(S1)
     assert ans == {"id": ans["id"], "ok": True, "token": h.token, "queue_cap": h.queue_cap}
-    cas(root, S1, 3, "RENDERED", "ACTIVE")
+    cas(root, S1, gen + 1, "RENDERED", "ACTIVE")
     assert root.ask("SECRETS", session=S1)["refused"] == "not-rendered"
     assert op.ask("SECRETS", session=S1)["refused"] == "verb-not-allowed-for-peer"
 
@@ -662,18 +664,18 @@ def test_alloc_only_orphan_reclaimed(env):
     assert root.ask("REVOKE", session=S3)["generation"] == 0
     rec = env.record(S3)
     assert (rec.state, rec.generation, rec.claims, rec.lease_live, rec.event_kind) == ("REVOKED", 0, {}, False, "state")
-    assert env.seams.calls == [("drop", S3), ("wake",)]
+    assert env.seams.calls == [("wake",), ("drop", S3)]
     assert root.ask("REVOKE", session=S3)["generation"] == 0          # a no-op answering its generation
-    assert env.seams.calls == [("drop", S3), ("wake",)]
+    assert env.seams.calls == [("wake",), ("drop", S3)]
     assert S3 in root.ask("REVOKED-SET")["sessions"]
     assert cas(root, S3, 0, "REVOKED", "FROZEN")["generation"] == 1    # END runs from alloc as usual
 
 
 def test_revoke_live_and_past_live(env):
     op, root = to_rendered(env)
-    assert root.ask("REVOKE", session=S1)["generation"] == 4
+    assert root.ask("REVOKE", session=S1)["generation"] == 5
     assert env.record(S1).state == "REVOKED"
-    g = 4
+    g = 5
     for frm, to in (("REVOKED", "FROZEN"), ("FROZEN", "DEAD"), ("DEAD", "CREDENTIAL_PARKED"),
                     ("CREDENTIAL_PARKED", "RETAINED")):
         g = cas(root, S1, g, frm, to)["generation"]
