@@ -21,8 +21,10 @@ import os
 import stat
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from levain.contracts import canon
 from levain.slot import Refused
@@ -34,7 +36,7 @@ from levain.slot import start as SS
 from levain.slot.grammar import SESSION_RE
 from levain.slot.ids import SlotId
 from levain.slot.layout import RESERVE_BYTES, RUN, Row, base_run_rows, slot_run_rows
-from levain.slot.root_intent import pending_sessions
+from levain.slot.root_intent import fsync_dir, pending_sessions
 
 #: CONTRACT §11 V11: the pass worker's tick, and the revoker's when no front kill is pending.
 V11_S = 60.0
@@ -146,6 +148,44 @@ class _PoolLock(_SlotLock):
             raise
 
 
+@contextmanager
+def _reserve_lock(path: Path) -> Iterator[bool]:
+    """The reserve's own lock, TRIED (False = busy: skip the refill this pass): ``flock`` on ``L/reserve`` itself, so
+    a release serializes with one ``flock`` on the file it already opens, and no module is shared.
+    Held across the refill's fstat, write and fsync. A reserve not yet there is made here, its name made durable,
+    so the file the lock names is the one the refill writes."""
+    created = not os.path.lexists(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        if created:
+            fsync_dir(path.parent)
+        yield H.try_flock(fd)
+    finally:
+        os.close(fd)
+
+
+def _name(e: BaseException) -> str:
+    return e.name if isinstance(e, Refused) else type(e).__name__
+
+
+class _Item:
+    """One per-item loop body (the module's rule): an exception is logged and named in the report's ``skipped`` as
+    ``<what>:<name>``, and the loop goes on to the next item."""
+
+    def __init__(self, log: Callable[[str], None], rep: Dict[str, object], what: str) -> None:
+        self.log, self.rep, self.what = log, rep, what
+
+    def __enter__(self) -> "_Item":
+        return self
+
+    def __exit__(self, et: object, e: Optional[BaseException], _tb: object) -> bool:
+        if not isinstance(e, Exception):
+            return False
+        self.log(f"{self.what}: {type(e).__name__}: {e}")
+        self.rep["skipped"].append(f"{self.what}:{_name(e)}")          # type: ignore[union-attr]
+        return True
+
+
 def _new_report(boot_id: str, seq: int, started: float) -> Dict[str, object]:
     return {"boot_id": boot_id, "pass_seq": seq, "started_at": R.timestamp(started), "control": "up",
             "swept": [], "revoked": [], "reconciled": [], "ended": [], "scrubbed": [], "reverted": [], "braked": [],
@@ -173,16 +213,19 @@ class Reaper:
         return H.Ctx(seams=self.seams, store=H.Store(self.seams), sudo_uid=0, caller="reaper", operator_uid=-1,
                      env={})
 
-    @staticmethod
-    def control_up(ctx: H.Ctx) -> bool:
-        """CONTROL down = connect refused or the socket absent (§4.1)."""
+    def item(self, rep: Dict[str, object], what: str) -> _Item:
+        return _Item(self.log, rep, what)
+
+    def control_up(self, ctx: H.Ctx) -> bool:
+        """CONTROL down = connect refused or the socket absent (§4.1). Any other refusal or OS error from the connect
+        is logged and taken as down too: the pass runs its local steps, never nothing."""
         try:
             ctx.client
             return True
-        except Refused as e:
-            if e.name == "control-down":
-                return False
-            raise
+        except (Refused, OSError) as e:
+            if not (isinstance(e, Refused) and e.name == "control-down"):
+                self.log(f"CONTROL connect: {type(e).__name__}: {e}; taken as down")
+            return False
 
     # -- boot (§4.2) --------------------------------------------------------------------------------------------------
 
@@ -245,13 +288,16 @@ class Reaper:
                     self.log(f"pass {self.pass_seq} step {name}: {type(e).__name__}: {e}")
                     rep["skipped"].append(f"step{name}:{type(e).__name__}")   # type: ignore[union-attr]
         finally:
-            ctx.close()
-            rep["ended_at"] = R.timestamp(seams.clock())
             try:
-                self.write_heartbeat(rep)
-            except Exception as e:   # noqa: BLE001 - doctor reads the heartbeat's age; a miss shows there
-                self.log(f"heartbeat: {type(e).__name__}: {e}")
-            ctx.store.close()
+                ctx.close()
+            finally:
+                try:
+                    rep["ended_at"] = R.timestamp(seams.clock())
+                    self.write_heartbeat(rep)
+                except Exception as e:   # noqa: BLE001 - doctor reads the heartbeat's age; a miss shows there
+                    self.log(f"heartbeat: {type(e).__name__}: {e}")
+                finally:
+                    ctx.store.close()
         return rep
 
     # -- reads ---------------------------------------------------------------------------------------------------------
@@ -313,15 +359,16 @@ class Reaper:
         with ctx.store.dir("alloc") as fd:
             temps = [(n, s) for n in sorted(os.listdir(fd)) for s in (temp_session(n),) if s is not None]
         for name, session in temps:
-            slot = self._leased_to(ctx, session)
-            if slot is None:
-                self._unlink_temp(ctx, name, rep)
-                continue
-            with _SlotLock(ctx.store, slot) as lk:
-                if not lk.held:
-                    rep["skipped"].append(f"swept:{name}:slot-busy")   # type: ignore[union-attr]
+            with self.item(rep, f"swept:{name}"):
+                slot = self._leased_to(ctx, session)
+                if slot is None:
+                    self._unlink_temp(ctx, name, rep)
                     continue
-                self._unlink_temp(ctx, name, rep)
+                with _SlotLock(ctx.store, slot) as lk:
+                    if not lk.held:
+                        rep["skipped"].append(f"swept:{name}:slot-busy")   # type: ignore[union-attr]
+                        continue
+                    self._unlink_temp(ctx, name, rep)
 
     def _unlink_temp(self, ctx: H.Ctx, name: str, rep: Dict[str, object]) -> None:
         with ctx.store.dir("alloc") as fd:
@@ -346,17 +393,18 @@ class Reaper:
         boot = self.seams.boot_id()
         records = self._records(ctx)
         for s, a in self._allocs(ctx).items():
-            rec = records.get(s)
-            if rec is None:
-                with _SlotLock(ctx.store, a.slot) as lk:
-                    if not lk.held:
-                        rep["skipped"].append(f"revoke:{s}:slot-busy")   # type: ignore[union-attr]
-                        continue
-                    if not _exists(ctx.store, ("sessions",), f"{s}.json", trusted=False):
-                        self._revoke(ctx, s, rep)
-                continue
-            if rec.state in R.LIVE_STATES and (a.boot_id != boot or not rec.lease_live):
-                self._revoke(ctx, s, rep)
+            with self.item(rep, f"revoke:{s}"):
+                rec = records.get(s)
+                if rec is None:
+                    with _SlotLock(ctx.store, a.slot) as lk:
+                        if not lk.held:
+                            rep["skipped"].append(f"revoke:{s}:slot-busy")   # type: ignore[union-attr]
+                            continue
+                        if not _exists(ctx.store, ("sessions",), f"{s}.json", trusted=False):
+                            self._revoke(ctx, s, rep)
+                    continue
+                if rec.state in R.LIVE_STATES and (a.boot_id != boot or not rec.lease_live):
+                    self._revoke(ctx, s, rep)
 
     def _revoke(self, ctx: H.Ctx, s: str, rep: Dict[str, object]) -> None:
         try:
@@ -377,14 +425,20 @@ class Reaper:
                 continue
             rec = records.get(s)
             try:
-                E.reconcile_session(SS.end_facts(ctx, a), SS.end_seams(ctx, a),
-                                    held_attempts=rec.fields.get("held_attempts") if rec else None)  # type: ignore
-                rep["reconciled"].append(s)                             # type: ignore[union-attr]
-            except Refused as e:
-                rep["skipped"].append(f"reconcile:{s}:{e.name}")       # type: ignore[union-attr]
-            except Exception as e:   # noqa: BLE001 - the journal stays at its phase for the next pass
-                self.log(f"reconcile {s}: {type(e).__name__}: {e}")
-                rep["skipped"].append(f"reconcile:{s}:{type(e).__name__}")   # type: ignore[union-attr]
+                with self.item(rep, f"reconcile:{s}"):   # the journal stays at its phase for the next pass
+                    E.reconcile_session(SS.end_facts(ctx, a), SS.end_seams(ctx, a),
+                                        held_attempts=rec.fields.get("held_attempts") if rec else None)  # type: ignore
+                    rep["reconciled"].append(s)                         # type: ignore[union-attr]
+            finally:
+                with self.item(rep, f"reconcile:{s}:after"):
+                    self._held_by_reconcile(ctx, s, rec)
+
+    def _held_by_reconcile(self, ctx: H.Ctx, s: str, before: Optional[R.SessionState]) -> None:
+        """A reconcile whose proof failed CASed the record HELD: its backoff starts now, as END's does, so step 3
+        of the same pass does not run END on it again."""
+        after = SS.read_record(ctx, s)
+        if after is not None and after.state == R.HELD and (before is None or after.generation != before.generation):
+            self._back_off(s, after.fields.get("held_attempts"))
 
     # -- step 3: END, the HELD retry, SCRUB again (§7.3, §7.7 3, RH5) --------------------------------------------------
 
@@ -404,51 +458,61 @@ class Reaper:
         ``end-busy`` (or ``slot-locked``) refusal is not an attempt: no record change, no backoff (DESIGN r5 F5)."""
         allocs = self._allocs(ctx)
         live: set = set()
+        held: Dict[str, None] = {}      # the sessions still HELD when step 3 ends, in pass order
         for s, rec in self._records(ctx).items():
-            a = allocs.get(s)
-            if rec.state == R.RETAINED:
-                if a is not None and SS._names_lease(_slot_state(ctx.store, a.slot), a):
-                    self._scrub(ctx, a, rep)
-                continue
-            if rec.state not in R.END_FROM_STATES and rec.state != R.HELD:
-                continue
-            if rec.state == R.HELD:
-                live.add(s)
-                rep["held"].append(s)                                   # type: ignore[union-attr]
-                if not self._held_due(s):
-                    continue
-            if a is None:
-                rep["skipped"].append(f"end:{s}:no-alloc")              # type: ignore[union-attr]
-                continue
-            try:
-                out = E.end_session(SS.end_facts(ctx, a), SS.end_seams(ctx, a), record_state=rec.state,
-                                    failed_step=rec.fields.get("failed_step"),          # type: ignore[arg-type]
-                                    held_attempts=rec.fields.get("held_attempts"))      # type: ignore[arg-type]
-            except Refused as e:
-                rep["skipped"].append(f"end:{s}:{e.name}")              # type: ignore[union-attr]
-                if e.name not in ("end-busy", "slot-locked") and rec.state == R.HELD:
-                    self._back_off(s, rec.fields.get("held_attempts"))
-                continue
-            except Exception as e:   # noqa: BLE001 - CasNotSent and the like: the next pass tries again
-                self.log(f"END {s}: {type(e).__name__}: {e}")
-                rep["skipped"].append(f"end:{s}:{type(e).__name__}")    # type: ignore[union-attr]
-                continue
-            rep["ended"].append(f"{s}:{out}")                           # type: ignore[union-attr]
-            if out == R.RETAINED:
-                self.next_try.pop(s, None)
-                self._scrub(ctx, a, rep)
-            elif out == R.HELD:
-                live.add(s)
-                after = SS.read_record(ctx, s)
-                self._back_off(s, after.fields.get("held_attempts") if after is not None else None)
+            with self.item(rep, f"end:{s}"):
+                self._end_one(ctx, s, rec, allocs.get(s), live, held, rep)
         for s in [s for s in self.next_try if s not in live]:
             del self.next_try[s]
+        rep["held"].extend(held)                                        # type: ignore[union-attr]
+
+    def _end_one(self, ctx: H.Ctx, s: str, rec: R.SessionState, a: Optional[R.Alloc], live: set,
+                 held: Dict[str, None], rep: Dict[str, object]) -> None:
+        if rec.state == R.RETAINED:
+            if a is not None and SS._names_lease(_slot_state(ctx.store, a.slot), a):
+                self._scrub(ctx, a, rep)
+            return
+        if rec.state not in R.END_FROM_STATES and rec.state != R.HELD:
+            return
+        if rec.state == R.HELD:
+            live.add(s)
+            held[s] = None
+            if not self._held_due(s):
+                return
+        if a is None:
+            rep["skipped"].append(f"end:{s}:no-alloc")                  # type: ignore[union-attr]
+            return
+        try:
+            out = E.end_session(SS.end_facts(ctx, a), SS.end_seams(ctx, a), record_state=rec.state,
+                                failed_step=rec.fields.get("failed_step"),              # type: ignore[arg-type]
+                                held_attempts=rec.fields.get("held_attempts"))          # type: ignore[arg-type]
+        except Refused as e:
+            rep["skipped"].append(f"end:{s}:{e.name}")                  # type: ignore[union-attr]
+            if e.name not in ("end-busy", "slot-locked") and rec.state == R.HELD:
+                self._back_off(s, rec.fields.get("held_attempts"))
+            return
+        except Exception as e:   # noqa: BLE001 - CasNotSent and the like: the next pass tries again
+            self.log(f"END {s}: {type(e).__name__}: {e}")
+            rep["skipped"].append(f"end:{s}:{type(e).__name__}")        # type: ignore[union-attr]
+            return
+        rep["ended"].append(f"{s}:{out}")                               # type: ignore[union-attr]
+        if out == R.RETAINED:
+            self.next_try.pop(s, None)
+            held.pop(s, None)
+            self._scrub(ctx, a, rep)
+        elif out == R.HELD:
+            live.add(s)
+            held[s] = None
+            after = SS.read_record(ctx, s)
+            self._back_off(s, after.fields.get("held_attempts") if after is not None else None)
 
     def _scrub(self, ctx: H.Ctx, a: R.Alloc, rep: Dict[str, object]) -> None:
         try:
             done = SS.scrub_and_release(ctx, a)
-        except Refused as e:
-            rep["skipped"].append(f"scrub:{a.session}:{e.name}")        # type: ignore[union-attr]
+        except Exception as e:   # noqa: BLE001 - an Unproven sweep or an OS error: the next pass scrubs again
+            if not isinstance(e, Refused):
+                self.log(f"SCRUB {a.session}: {type(e).__name__}: {e}")
+            rep["skipped"].append(f"scrub:{a.session}:{_name(e)}")      # type: ignore[union-attr]
             return
         if done:
             rep["scrubbed"].append(a.session)                           # type: ignore[union-attr]
@@ -469,39 +533,41 @@ class Reaper:
             if not pool.held:
                 rep["skipped"].append("orphan:pool-busy")               # type: ignore[union-attr]
                 return
-            snap = {slot: _slot_state(ctx.store, slot) for slot in _slots(ctx.store)}
+            snap: Dict[SlotId, Optional[R.SlotState]] = {}
+            for slot in _slots(ctx.store):
+                with self.item(rep, f"orphan:{slot.tag}"):
+                    snap[slot] = _slot_state(ctx.store, slot)
         for slot, st in snap.items():
             if st is None or st.state != "leased" or st.session is None:
                 continue
-            s = st.session
-            if _exists(ctx.store, ("alloc",), f"{s}.json") or _exists(ctx.store, ("sessions",), f"{s}.json",
-                                                                         trusted=False):
-                continue
-            with _SlotLock(ctx.store, slot) as lk:
-                if not lk.held:
-                    rep["skipped"].append(f"orphan:{slot.tag}:slot-busy")    # type: ignore[union-attr]
-                    continue
-                if _slot_state(ctx.store, slot) != st or _exists(ctx.store, ("alloc",), f"{s}.json") \
-                        or _exists(ctx.store, ("sessions",), f"{s}.json", trusted=False):
-                    continue
-                ids = H.slot_ids(ctx, slot)
-                first, second = slot.accounts
-                try:
-                    PR.scrub(ids[first], ids[second], seams=self.seams.proc_seams)   # type: ignore[arg-type]
-                except Refused as e:
-                    rep["skipped"].append(f"orphan:{slot.tag}:{e.name}")     # type: ignore[union-attr]
-                    continue
-                with _PoolLock(ctx.store) as pool:
-                    if not pool.held:
-                        rep["skipped"].append(f"orphan:{slot.tag}:pool-busy")    # type: ignore[union-attr]
-                        continue
-                    if _slot_state(ctx.store, slot) != st:
-                        continue
-                    to = "retired" if _exists(ctx.store, ("slots", slot.tag), SPENT) else "reusable"
-                    new = replace(st, rev=st.rev + 1, state=to, session=None,
-                                  changed_at=R.timestamp(self.seams.clock()))
-                    ctx.store.replace(("slots", slot.tag), "state", R.slot_state_bytes(new), mode=0o644)
-                rep["reverted"].append(f"{slot.tag}:{s}:{to}")             # type: ignore[union-attr]
+            with self.item(rep, f"orphan:{slot.tag}"):
+                self._revert_one(ctx, slot, st, rep)
+
+    def _revert_one(self, ctx: H.Ctx, slot: SlotId, st: R.SlotState, rep: Dict[str, object]) -> None:
+        s = st.session
+        if _exists(ctx.store, ("alloc",), f"{s}.json") or _exists(ctx.store, ("sessions",), f"{s}.json",
+                                                                     trusted=False):
+            return
+        with _SlotLock(ctx.store, slot) as lk:
+            if not lk.held:
+                rep["skipped"].append(f"orphan:{slot.tag}:slot-busy")        # type: ignore[union-attr]
+                return
+            if _slot_state(ctx.store, slot) != st or _exists(ctx.store, ("alloc",), f"{s}.json") \
+                    or _exists(ctx.store, ("sessions",), f"{s}.json", trusted=False):
+                return
+            ids = H.slot_ids(ctx, slot)
+            first, second = slot.accounts
+            PR.scrub(ids[first], ids[second], seams=self.seams.proc_seams)   # type: ignore[arg-type]
+            with _PoolLock(ctx.store) as pool:
+                if not pool.held:
+                    rep["skipped"].append(f"orphan:{slot.tag}:pool-busy")    # type: ignore[union-attr]
+                    return
+                if _slot_state(ctx.store, slot) != st:
+                    return
+                to = "retired" if _exists(ctx.store, ("slots", slot.tag), SPENT) else "reusable"
+                new = replace(st, rev=st.rev + 1, state=to, session=None, changed_at=R.timestamp(self.seams.clock()))
+                ctx.store.replace(("slots", slot.tag), "state", R.slot_state_bytes(new), mode=0o644)
+        rep["reverted"].append(f"{slot.tag}:{s}:{to}")                     # type: ignore[union-attr]
 
     # -- step 4: BRAKE below V5 (§7.7 4) -------------------------------------------------------------------------------
 
@@ -511,22 +577,27 @@ class Reaper:
         for s, rec in self._records(ctx).items():
             if rec.state != R.ACTIVE:
                 continue
-            try:
+            with self.item(rep, f"brake:{s}"):
                 ctx.call("CAS", session=s, generation=rec.generation, **{"from": R.ACTIVE, "to": R.BRAKED},
                          fields={"brake_reason": "below-floor"})
                 rep["braked"].append(s)                                 # type: ignore[union-attr]
-            except Refused as e:
-                rep["skipped"].append(f"brake:{s}:{e.name}")            # type: ignore[union-attr]
 
     # -- step 6: reserve refill (§7.5) ---------------------------------------------------------------------------------
 
     def refill_reserve(self, ctx: H.Ctx, rep: Dict[str, object]) -> None:
-        if not self._refill(ctx.store):
+        full = self._refill(ctx.store)
+        if full is None:
+            rep["skipped"].append("reserve:busy")                       # type: ignore[union-attr]
+        elif not full:
             rep["skipped"].append("reserve:below-floor")                # type: ignore[union-attr]
 
-    def _refill(self, store: H.Store) -> bool:
+    def _refill(self, store: H.Store) -> Optional[bool]:
+        """Whether the reserve is full, or None when its lock is busy (a release is truncating it)."""
         reserve = E.Reserve(store.path / "reserve", self.tuning.reserve_bytes)
-        return reserve.refill(lambda: self.seams.free_bytes(store.fd), floor=self.tuning.floor_bytes)
+        with _reserve_lock(reserve.path) as held:
+            if not held:
+                return None
+            return reserve.refill(lambda: self.seams.free_bytes(store.fd), floor=self.tuning.floor_bytes)
 
     # -- step 7: pool health (§3.5) ------------------------------------------------------------------------------------
 
@@ -542,7 +613,7 @@ class Reaper:
                 rep["skipped"].append("pool-health:pool-busy")          # type: ignore[union-attr]
                 return
             for slot in _slots(ctx.store):
-                with _SlotLock(ctx.store, slot) as lk:
+                with self.item(rep, f"pool-health:{slot.tag}"), _SlotLock(ctx.store, slot) as lk:
                     if not lk.held:
                         continue
                     st = _slot_state(ctx.store, slot)
@@ -576,9 +647,15 @@ class Revoker:
     datagram or a tick): reap leftover signalling children; ask CONTROL for ``REVOKED-SET``; for every session in it
     whose alloc names an egress slot, :func:`start.revoke_front`. CONTROL DOWN (connect refused or the socket absent; or
     an answer slow past V23): every egress alloc's front is ended, since no session can be confirmed live (CONTRACT
-    §4.5). A ``front-busy`` is retried on the next wake until the revoker's bound has passed since the lease was first
-    seen, then recorded; ``front-ended``, ``front-lease-moved`` and an Unproven sweep are final (SCRUB ends the gateway
-    uid again either way)."""
+    §4.5). Only an outcome that proves this lease's front cannot run is final: ``front-ended``, and
+    ``front-lease-moved`` (the slot no longer names this lease: its uids are SCRUB's, not this lease's). Anything
+    else (an error, ``front-unproven:*``, ``front-busy``) stays pending and is retried on every wake while the lease
+    is a target. A REVOKED-SET answer of the wrong shape is a protocol failure: CONTROL is down. While CONTROL is slow (under
+    V23 since the first slow attempt began), the leases already confirmed and still pending are retried and nothing
+    is forgotten."""
+
+    #: The outcomes that prove a lease's front cannot run (the only ones kept in ``done``).
+    FINAL = frozenset({"front-ended", "front-lease-moved"})
 
     def __init__(self, seams: H.Seams, *, log: Callable[[str], None] = _log_to_stderr) -> None:
         self.seams = seams
@@ -597,20 +674,23 @@ class Revoker:
         out: Dict[str, object] = {"control": "up", "ended": [], "outcomes": {}}
         try:
             targets = self._targets(ctx, out)
-            if targets is None:
-                return out
+            slow = targets is None
+            if slow:   # only the leases CONTROL already confirmed, still pending
+                targets = sorted({k[0] for k in self.first_seen if k not in self.done})
             allocs = {}
-            for s in targets:
-                raw = ctx.store.read(("alloc",), f"{s}.json")
-                if raw is None:
-                    continue
+            for s in targets:   # type: ignore[union-attr]
                 try:
+                    raw = ctx.store.read(("alloc",), f"{s}.json")
+                    if raw is None:
+                        continue
                     a = R.parse_alloc(raw)
-                except Exception as e:   # noqa: BLE001
+                except Exception as e:   # noqa: BLE001 - this alloc is named; the other targets go on
                     self.log(f"revoker: alloc {s}: {type(e).__name__}: {e}")
+                    out["outcomes"][s] = f"alloc:{_name(e)}"            # type: ignore[index]
                     continue
-                if a.session == s and a.slot.slot_class == "egress":
-                    allocs[(s, a.lease_seq)] = a
+                key = (s, a.lease_seq)
+                if a.session == s and a.slot.slot_class == "egress" and (not slow or key in self.first_seen):
+                    allocs[key] = a
             now = seams.monotonic()
             for key, a in allocs.items():
                 if key in self.done:
@@ -618,53 +698,65 @@ class Revoker:
                 self.first_seen.setdefault(key, now)
                 try:
                     res = SS.revoke_front(ctx, a)
-                except Refused as e:
-                    res = e.name
-                    if res == "front-busy" and now - self.first_seen[key] < SS.REVOKE_FRONT_S:
-                        out["outcomes"][a.session] = res                # type: ignore[index]
-                        continue
-                except Exception as e:   # noqa: BLE001 - recorded; SCRUB still ends the gateway uid
-                    res = f"error:{type(e).__name__}"
-                    self.log(f"revoker: {a.session}: {type(e).__name__}: {e}")
-                self.done[key] = res
+                except Exception as e:   # noqa: BLE001 - not proven; retried on the next wake
+                    res = e.name if isinstance(e, Refused) else f"error:{type(e).__name__}"
+                    if not isinstance(e, Refused):
+                        self.log(f"revoker: {a.session}: {type(e).__name__}: {e}")
                 out["outcomes"][a.session] = res                        # type: ignore[index]
                 if res == "front-ended":
                     out["ended"].append(a.session)                      # type: ignore[union-attr]
-                else:
-                    self.log(f"revoker: {a.session} lease {a.lease_seq}: {res}")
-            for key in [k for k in self.first_seen if k not in allocs]:
-                self.first_seen.pop(key, None)
-                self.done.pop(key, None)
+                if res in self.FINAL:
+                    self.done[key] = res
+                    if res != "front-ended":
+                        self.log(f"revoker: {a.session} lease {a.lease_seq}: {res}")
+                elif not (res == "front-busy" and now - self.first_seen[key] < SS.REVOKE_FRONT_S):
+                    self.log(f"revoker: {a.session} lease {a.lease_seq}: {res}; retried on the next wake")
+            if not slow:
+                for key in [k for k in self.first_seen if k not in allocs]:
+                    self.first_seen.pop(key, None)
+                    self.done.pop(key, None)
         finally:
-            ctx.close()
-            ctx.store.close()
+            try:
+                ctx.close()
+            finally:
+                ctx.store.close()
         return out
 
     def _targets(self, ctx: H.Ctx, out: Dict[str, object]) -> Optional[List[str]]:
+        """The sessions whose fronts are ended this wake: REVOKED-SET's, every egress alloc's with CONTROL down, or
+        None while CONTROL is slow. The V23 window opens when the first slow attempt STARTS and closes on any other
+        outcome."""
         try:
             ctx.client
-        except Refused as e:
-            if e.name != "control-down":
-                raise
-            out["control"] = "down"
-            return self._all_egress(ctx)
+        except (Refused, OSError) as e:
+            if not (isinstance(e, Refused) and e.name == "control-down"):
+                self.log(f"revoker: CONTROL connect: {type(e).__name__}: {e}; taken as down")
+            return self._down(ctx, out)
+        t0 = self.seams.monotonic()
         try:
             ans = ctx.call("REVOKED-SET")
-        except Refused as e:
-            if e.name != "control-down":
-                raise
-            now = self.seams.monotonic()
+        except (Refused, OSError) as e:
+            if not (isinstance(e, Refused) and e.name == "control-down"):
+                self.log(f"revoker: REVOKED-SET: {type(e).__name__}: {e}; taken as down")
+                return self._down(ctx, out)
             if self.slow_since is None:
-                self.slow_since = now
-            if now - self.slow_since < V23_S:
+                self.slow_since = t0
+            if self.seams.monotonic() - self.slow_since < V23_S:
                 out["control"] = "slow"
                 return None
             out["control"] = "down"
             return self._all_egress(ctx)
+        sessions = ans.get("sessions") if isinstance(ans, dict) else None
+        if not isinstance(sessions, list) or not all(isinstance(s, str) and SESSION_RE.fullmatch(s) for s in sessions):
+            self.log(f"revoker: REVOKED-SET answered off its shape: {ans!r:.200}; taken as down")
+            return self._down(ctx, out)
         self.slow_since = None
-        sessions = ans.get("sessions")
-        return [s for s in sessions if isinstance(s, str) and SESSION_RE.fullmatch(s)] \
-            if isinstance(sessions, list) else []
+        return list(sessions)
+
+    def _down(self, ctx: H.Ctx, out: Dict[str, object]) -> List[str]:
+        self.slow_since = None
+        out["control"] = "down"
+        return self._all_egress(ctx)
 
     @staticmethod
     def _all_egress(ctx: H.Ctx) -> List[str]:
