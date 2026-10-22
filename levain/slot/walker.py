@@ -20,6 +20,7 @@ import os
 import select
 import stat
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
@@ -32,8 +33,6 @@ from levain.slot.end import Entry, entry_type
 SCOPE_ROOTS = (walkframe.PRUNE_SCOPE_PREFIX[0], b"in")
 #: The one ``in/`` child adopt reads: the base bundle render staged.
 BASE_BUNDLE = b"in/repo.bundle"
-#: The repository's own git directory, walked; any other ``.git`` below ``repo/`` is ``skipped-git``.
-REPO_GIT = b"repo/.git"
 
 #: ``st_flags`` bit of a macOS dataless file (``<sys/stat.h>`` ``SF_DATALESS``): its bytes are not local and a read
 #: would fetch them, so it is refused, never read.
@@ -53,18 +52,31 @@ OUT = "out"                # outside adopt's scope: no frame, not descended
 SKIPPED_GIT = "skipped-git"
 
 
+def is_git_name(name: bytes) -> bool:
+    """A path component that IS ``.git`` to a case-insensitive or normalising filesystem: equal to ``.git`` after
+    NFC and casefold (``.GIT``, ``.Git``). A name that is not UTF-8 never folds to it."""
+    if name == b".git":
+        return True
+    try:
+        text = name.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return unicodedata.normalize("NFC", text).casefold() == ".git"
+
+
 def scope(path: bytes) -> str:
     """Where one tree path stands for adopt: :data:`FRAME`, :data:`OUT` or :data:`SKIPPED_GIT`. ``in`` itself is
-    framed (as a ``dir``) so the importer sees the base bundle's parent as it sees ``repo/``'s directories."""
+    framed (as a ``dir``) so the importer sees the base bundle's parent as it sees ``repo/``'s directories. Every
+    ``.git`` test is :func:`is_git_name`."""
     parts = path.split(b"/")
     top = parts[0]
     if top not in SCOPE_ROOTS:
         return OUT
     if top == b"in":
         return FRAME if len(parts) == 1 or path == BASE_BUNDLE else OUT
-    if len(parts) > 2 and parts[-1] == b".git":
+    if len(parts) > 2 and is_git_name(parts[-1]):
         return SKIPPED_GIT
-    if len(parts) > 2 and b".git" in parts[1:-1] and not path.startswith(REPO_GIT + b"/"):
+    if len(parts) > 2 and any(is_git_name(p) for p in parts[1:-1]) and not is_git_name(parts[1]):
         # Below a nested .git: unreachable when the walk prunes (a skipped .git is never descended).
         return OUT
     return FRAME
@@ -183,12 +195,18 @@ class _Pipe:
     def write(self, data: bytes) -> None:
         view = memoryview(data)
         while view:
+            # The wall holds whether or not the importer drains: a reader that keeps up never reaches the poll.
+            if self.clock() > self.deadline:
+                raise Refused("walker-cap:time", "the walk ran past V7's wall")
             try:
                 n = os.write(self.fd, view)
             except BlockingIOError:
                 n = 0
             except BrokenPipeError:
                 raise Refused("importer-gone", "the importer closed its frame pipe") from None
+            except OSError as err:
+                raise Refused("importer-gone", f"{errno.errorcode.get(err.errno, err.errno)} on the frame pipe") \
+                    from None
             view = view[n:]
             if not view:
                 return
@@ -234,33 +252,58 @@ def _check_record(e: Entry, rec: dict | None, t: str) -> dict:
     return rec
 
 
+def _check_open(fd: int, e: Entry, rec: dict, owner_uid: int) -> None:
+    """The opened fd is still the manifest's file: the walk's inode, regular, root's, the manifest's mode, size
+    and link count, and not dataless (a read of a dataless file would fetch it)."""
+    st = os.fstat(fd)
+    if not end._same(st, e.st) or not stat.S_ISREG(st.st_mode):
+        raise Refused("tree-changed", f"{escape(e.path)} changed under the walk")
+    if st.st_uid != owner_uid:
+        raise Refused("walk-foreign-owner", f"{escape(e.path)} is owned by uid {st.st_uid}")
+    if getattr(st, "st_flags", 0) & SF_DATALESS:
+        raise Refused("walk-dataless", f"{escape(e.path)} is a dataless file")
+    if (stat.S_IMODE(st.st_mode) & ~_SETID) != (rec["mode"] & ~_SETID):
+        raise _mismatch(e.path, f"mode {stat.S_IMODE(st.st_mode):o} once open, manifest {rec['mode']:o}")
+    if st.st_size != rec["size"]:
+        raise _mismatch(e.path, f"size {st.st_size} once open, manifest {rec['size']}")
+    if st.st_nlink != rec["nlink"]:
+        raise _mismatch(e.path, f"nlink {st.st_nlink}, manifest {rec['nlink']!r}")
+
+
+def _check_clock(seams: WalkSeams, deadline: float, what: str, path: bytes) -> None:
+    if seams.clock() > deadline:
+        raise Refused("walker-cap:time", f"{what} {escape(path)}")
+
+
 def _stream_file(e: Entry, rec: dict, pipe: _Pipe, seams: WalkSeams, deadline: float) -> None:
-    """Hash pass, rewind, the header, then exactly ``size`` bytes streamed while hashed again."""
+    """Hash pass (at most ``size + 1`` bytes), rewind, the header, then exactly ``size`` bytes streamed while
+    hashed again. The fd's identity is checked against the manifest before the first read and again before the
+    second pass is accepted; a read, seek or stat failure is ``tree-changed``."""
     size, want = rec["size"], rec["digest"]
     try:
         fd = os.open(e.name, _O_FILE, dir_fd=e.dirfd)
     except OSError as err:
         raise _oserror(err, e.path) from None
     try:
-        if not end._same(os.fstat(fd), e.st):
-            raise Refused("tree-changed", f"{escape(e.path)} changed under the walk")
+        _check_open(fd, e, rec, seams.owner_uid)
         h, n = hashlib.sha256(), 0
-        while True:
-            chunk = os.read(fd, _CHUNK)
+        while n <= size:
+            chunk = os.read(fd, min(_CHUNK, size + 1 - n))
             if not chunk:
                 break
             h.update(chunk)
             n += len(chunk)
-            if seams.clock() > deadline:
-                raise Refused("walker-cap:time", f"hashing {escape(e.path)}")
+            _check_clock(seams, deadline, "hashing", e.path)
         if n != size or "sha256:" + h.hexdigest() != want:
             raise Refused("walk-digest-mismatch", f"{escape(e.path)}: the file is not the manifest's")
         if seams.between_passes is not None:
             seams.between_passes(e, fd)
+        _check_clock(seams, deadline, "after the first pass of", e.path)
         os.lseek(fd, 0, os.SEEK_SET)
         pipe.write(walkframe.encode_header(e.path, "file", rec["mode"], size, want))
         h, left = hashlib.sha256(), size
         while left:
+            _check_clock(seams, deadline, "streaming", e.path)
             chunk = os.read(fd, min(_CHUNK, left))
             if not chunk:
                 raise Refused("walk-digest-mismatch", f"{escape(e.path)}: short read while streaming")
@@ -269,6 +312,9 @@ def _stream_file(e: Entry, rec: dict, pipe: _Pipe, seams: WalkSeams, deadline: f
             pipe.write(chunk)
         if "sha256:" + h.hexdigest() != want:
             raise Refused("walk-digest-mismatch", f"{escape(e.path)}: changed between the two passes")
+        _check_open(fd, e, rec, seams.owner_uid)
+    except OSError as err:
+        raise Refused("tree-changed", f"{errno.errorcode.get(err.errno, err.errno)} at {escape(e.path)}") from None
     finally:
         os.close(fd)
 
@@ -360,6 +406,7 @@ def walk_frames(tree: Path, manifest: Path, out_fd: int, *, depth: int, caps: Wa
             raise _mismatch(left["_path"], "the manifest holds an entry the walk did not find")
         if not base_digest:
             raise Refused("base-bundle-mismatch", "no in/repo.bundle in the retained tree")
+        _check_clock(seams, caps.deadline, "before the terminal frame of", b"")
         pipe.write(walkframe.encode_terminal(count, total))
     finally:
         it.close()
