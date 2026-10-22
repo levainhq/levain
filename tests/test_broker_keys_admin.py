@@ -1037,3 +1037,43 @@ def test_preemption_fences_old_exchanges_before_its_bounded_await(monkeypatch):
     assert out["pre_done"] is False                 # the window is real: the clear has not run yet
     assert out["raw_after"] == []                   # nothing reached the upstream after the bump
     assert out["q2_admitted"] is False              # and no new exchange was admitted on the old registration
+
+
+def test_base_map_parsed_once_per_file_and_refused_when_it_changes_badly(monkeypatch):
+    # group L3 r1 (complement MED 2), measured first (`1022-8/g1fix/item5_measure.txt`: ~38 ms per `Q` on keys' one
+    # loop for a map near the cap) and reproduced (`item5_repro_before.txt`: every `Q` re-parsed the map). Now the
+    # parse is reused while the opened file's (dev, ino, mtime_ns, size) is unchanged; a replaced map is parsed
+    # again, and one that does not parse is still refused, whatever was cached.
+    from levain.broker import norm
+    d = tempfile.mkdtemp(prefix="lc", dir="/tmp")
+    _frame_lib(d)
+    parses: list = []
+    real = K.parse_route
+
+    def counting(entry, source):
+        parses.append(entry.get("route"))
+        return real(entry, source=source)
+
+    monkeypatch.setattr(K, "parse_route", counting)
+    path = os.path.join(d, "routes", "base.json")
+    try:
+        k = K.Keys(unmetered=True, lib_root=d)
+        assert k._base_route("r").route == "r" and k._base_route("r").route == "r"
+        assert parses == ["r"]                                   # one parse for two `Q`s
+        with open(path, "rb") as f:
+            doc = canon.parse(f.read())
+        good = dict(doc, routes=doc["routes"] + [dict(doc["routes"][0], route="z")])
+        tmp = path + ".new"
+        with open(tmp, "wb") as f:
+            f.write(canon.canonical_bytes(good))
+        os.replace(tmp, path)
+        assert k._base_route("z").route == "z" and parses == ["r", "r", "z"]   # a replaced map is read again
+        with open(tmp, "wb") as f:
+            f.write(canon.canonical_bytes(dict(doc, routes=doc["routes"] + [{"route": "y", "type": "brokered"}])))
+        os.replace(tmp, path)
+        for _ in range(2):
+            with pytest.raises(norm.Refused) as e:
+                k._base_route("r")
+            assert e.value.name == "keys-unavailable"            # never the cached parse of the earlier map
+    finally:
+        shutil.rmtree(d, ignore_errors=True)

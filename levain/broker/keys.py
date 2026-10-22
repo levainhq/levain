@@ -517,6 +517,8 @@ class Keys:
         self.single_uid = single_uid
         self.control_path = control_path   # CONTROL's socket: the real TOKEN-RESOLVE client's
         self.lib_root = lib_root
+        #: the last base map that parsed whole: its file's (st_dev, st_ino, st_mtime_ns, st_size), and its routes
+        self._base: Optional[Tuple[Tuple[int, int, int, int], Dict[str, RoutePolicy]]] = None
         self.first_frame_s = FIRST_FRAME_S
         self.pending_per_peer = PENDING_PER_PEER
         self.exchanges_per_session = EXCHANGES_PER_SESSION
@@ -1190,15 +1192,20 @@ class Keys:
         return pol
 
     def _base_route(self, route: str) -> Optional[RoutePolicy]:
-        """`route`'s object in `L/routes/base.json`, read and parsed (`policy.parse_route`, source `base`) at every
-        `Q`, or None when the map has none. EVERY entry is parsed before one is selected: a map keys cannot read, any
-        entry that does not parse, or any route id named twice anywhere in the map refuses `keys-unavailable`
-        (logged), never a pass for the route asked about."""
+        """`route`'s object in `L/routes/base.json`, opened at every `Q` and parsed (`policy.parse_route`, source
+        `base`) whenever the opened file's (st_dev, st_ino, st_mtime_ns, st_size) differs from the last map that
+        parsed whole, or None when the map has none. EVERY entry is parsed before one is selected: a map keys cannot
+        read, any entry that does not parse, or any route id named twice anywhere in the map refuses
+        `keys-unavailable` (logged), never a pass for the route asked about; a refused map is never cached."""
         if self.lib_root is None:
             raise norm.Refused("keys-unavailable", "no lib root")
         path = os.path.join(self.lib_root, "routes", "base.json")
         try:
             with open(path, "rb") as f:
+                st = os.fstat(f.fileno())
+                key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+                if self._base is not None and self._base[0] == key:
+                    return self._base[1].get(route)
                 data = f.read(BASE_MAP_CAP + 1)
             if len(data) > BASE_MAP_CAP:
                 raise PolicyError("over the size cap")
@@ -1214,6 +1221,7 @@ class Keys:
                 if pol.route in parsed:
                     raise PolicyError("a route named twice")
                 parsed[pol.route] = pol
+            self._base = (key, parsed)
             return parsed.get(route)
         except (OSError, ValueError, ContractError, RecursionError) as e:
             _note(logging.WARNING, "levain gw-keys: the base route map is unusable (%s)", type(e).__name__)
