@@ -634,9 +634,11 @@ class BrokeredExchange:
 
     def _check_websocket_handshake(self, fwd: list, body: str) -> None:
         """A request on a websocket template that asks to upgrade must carry the whole RFC 6455 §4.1 client
-        handshake, else `malformed`: `upgrade` among its Connection options, `Upgrade: websocket`, version 13, no
-        body, and one `Sec-WebSocket-Key` that is the canonical base64 of 16 bytes and is among the forwarded
-        headers (the 101 is computed from it). Only then may keys' `U` become a 101."""
+        handshake, else `malformed`: HTTP/1.1 or later, `upgrade` among its Connection options, `Upgrade:
+        websocket`, version 13, no body, and one `Sec-WebSocket-Key` that is the canonical base64 of 16 bytes and is
+        among the forwarded headers (the 101 is computed from it). Only then may keys' `U` become a 101."""
+        if self.req.http_version < b"1.1":   # h11 gives "d.d", so a bytes comparison orders it
+            raise Refused("malformed", "websocket-version")
         conn = [t for n, v in self.pairs if n == "connection" for t in norm.connection_tokens(v)]
         ups = [v.strip().lower() for n, v in self.pairs if n == "upgrade"]
         vers = [v.strip() for n, v in self.pairs if n == "sec-websocket-version"]
@@ -754,8 +756,9 @@ class BrokeredExchange:
             await asyncio.gather(task, return_exceptions=True)
 
     async def _write_body(self, kw: asyncio.StreamWriter, events: asyncio.Queue) -> None:
-        """Forward the slot's body as `B` frames, then `E`. Posts how it ended: "end", "write-error", "slot-eof"
-        (an `X` was sent), "body-cap" (chunked past the cap; `X` sent), or "malformed"."""
+        """Forward the slot's body as `B` frames, then `E`. Posts how it ended: "end", "write-error" (a write to
+        keys failed), "slot-eof" / "slot-gone" (the slot closed or failed mid-body; an `X` was sent), "body-cap"
+        (chunked past the cap; `X` sent), or "malformed"."""
         cap, sent = self.route.body_cap, 0
         await self.parked.wait()
         self.parked_before_first_write = self.parked.is_set()
@@ -767,6 +770,11 @@ class BrokeredExchange:
                 except _SlotGone:
                     kw.write(gwwire.encode(b"X"))
                     await events.put(("body", "slot-eof"))
+                    return
+                except OSError as e:   # a read error on the SLOT (a reset mid-upload): the slot is gone, keys hears X
+                    self.rec["slot_error"] = type(e).__name__
+                    kw.write(gwwire.encode(b"X"))
+                    await events.put(("body", "slot-gone"))
                     return
                 except Refused:
                     kw.write(gwwire.encode(b"X"))
@@ -810,8 +818,8 @@ class BrokeredExchange:
                     continue
                 if payload == "write-error":
                     continue   # the reader's verdict decides: the F it already holds, or keys-unavailable
-                if payload == "slot-eof":
-                    self.rec["end"] = "slot-eof"
+                if payload in ("slot-eof", "slot-gone"):
+                    self.rec["end"] = payload
                     return
                 if not started:   # the writer has returned: nothing else reads the slot
                     await self.refuse(Refused("body-cap" if payload == "body-cap" else "malformed", "body"),
@@ -853,12 +861,15 @@ class BrokeredExchange:
                     self.swriter.write(b"0\r\n\r\n")
                     await self.swriter.drain()
                 self.rec["status"] = self.status
-                self.rec["end"] = "ok"
                 # keys may answer before the request body has all arrived: stop forwarding it, half-close, and
                 # discard the rest as a refusal does, so the close is not a reset over the response just written
                 await self._stop(writer)
                 if self.swriter.can_write_eof():
-                    self.swriter.write_eof()
+                    try:
+                        self.swriter.write_eof()
+                    except OSError:   # the slot closed after the whole response: still delivered
+                        pass
+                self.rec["end"] = "ok"
                 if not self.body.done:
                     await self._discard()
                 return
@@ -936,7 +947,9 @@ class BrokeredExchange:
             await self.swriter.drain()
             if self.swriter.can_write_eof():
                 self.swriter.write_eof()
-        except OSError:
+        except OSError as e:
+            self.rec["end"] = "slot-gone"
+            self.rec["slot_error"] = type(e).__name__
             return
         if discard:
             await self._discard()

@@ -157,7 +157,7 @@ class HoldingReader(asyncio.StreamReader):
         super().feed_eof()
 
     def set_exception(self, exc: BaseException) -> None:
-        if self.terminal is not None:
+        if self.terminal is not None or self._ended:   # a clean EOF already seen stays a clean EOF
             return
         got = 0
         while self.sock is not None and not self._ended and got < self.SALVAGE_CAP:

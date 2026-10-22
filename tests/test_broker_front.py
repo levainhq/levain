@@ -431,3 +431,90 @@ def test_connection_keep_alive_is_dropped_not_refused():
     assert got.startswith(b"HTTP/1.1 200 OK\r\n"), got[:200]
     assert [q["headers"] for q in seen] == [[["content-type", "application/json"]]], seen
     assert "refused" not in rec and "connection" not in rec["dropped"], rec
+
+
+def test_slot_reset_mid_body_ends_the_exchange_and_tells_keys():
+    """Reproduced (3b-1a-fix2, complement r2 MED): the slot RESETS mid-upload while keys holds the request open
+    without answering. The slot's read error was taken for a keys write error and the front waited on keys with no
+    bound. Now it is the slot gone: keys gets `X` and the exchange ends `slot-gone`."""
+    import struct
+
+    from levain.broker.front import BrokeredExchange, parse_head_conn
+
+    async def go() -> tuple[dict, list]:
+        got: list = []
+
+        async def serve(r, w):   # keys that never answers: reads frames until `X` / `E` / EOF
+            while True:
+                try:
+                    hdr = await r.readexactly(5)
+                    await r.readexactly(int.from_bytes(hdr[1:], "big"))
+                except (asyncio.IncompleteReadError, ConnectionError):
+                    break
+                got.append(hdr[:1])
+                if hdr[:1] in (b"E", b"X"):
+                    break
+            w.close()
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            path = os.path.join(tmp, "k.sock")
+            keys = await asyncio.start_unix_server(serve, path)
+            front = Front(load_policy(json.dumps(_EX_POLICY).encode()), log_path=os.path.join(tmp, "f.log"),
+                          keys_path=path)
+            fr, fw, sr, sw = await _tcp_slot_pair()
+            sw.write(b"POST /r/vendor/v1/messages HTTP/1.1\r\nHost: gw\r\nAuthorization: Bearer %s\r\n"
+                     b"Content-Length: %d\r\n\r\n" % (_TOKEN.encode(), 5 * 1024 * 1024) + b"x" * 65536)
+            await sw.drain()
+            conn, req = parse_head_conn(await fr.readuntil(b"\r\n\r\n"))
+            ex = BrokeredExchange(front, front.policy.brokered["vendor"], conn, req, req.target[9:], None, fr, fw)
+            run = asyncio.ensure_future(ex.run())
+            await asyncio.sleep(0.3)
+            sw.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            sw.transport.abort()   # an RST, not a FIN
+            await asyncio.wait_for(run, 10)
+            fw.close()
+            await asyncio.sleep(0.1)
+            keys.close()
+        return ex.rec, got
+
+    rec, got = asyncio.run(go())
+    assert rec["end"] == "slot-gone" and rec.get("slot_error"), rec
+    assert got and got[-1] == b"X", got
+
+
+def test_websocket_handshake_over_http_1_0_is_malformed():
+    """Reproduced (3b-1a-fix2, codex r2 6): a complete websocket handshake sent as HTTP/1.0 was forwarded as
+    `upgrade: websocket`. RFC 6455 §4.1 requires HTTP/1.1 or later: refused `malformed` before keys."""
+    import base64
+
+    from levain.broker.front import BrokeredExchange, parse_head_conn
+
+    policy = {"format": "levain-front-session/1", "kind": "interactive", "session": "s-ws", "routes": [
+        {"route": "ws", "type": "brokered", "upstream": {"scheme": "https", "host": "ws.vendor.example",
+                                                         "base_path": ""},
+         "requests": {"templates": [{"method": "GET", "path": "/v1/live", "upgrade": "websocket"}],
+                      "headers": {"sec-websocket-key": ".*", "sec-websocket-version": ".*"},
+                      "body_cap": 1024, "body_codec": "none"},
+         "max_call_microdollars": 1}]}
+
+    async def go() -> tuple[dict, bytes]:
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            # no keys listens here: a request that reached keys would be refused 503, not 400
+            front = Front(load_policy(json.dumps(policy).encode()), log_path=os.path.join(tmp, "f.log"),
+                          keys_path=os.path.join(tmp, "absent.sock"))
+            fr, fw, sr, sw = await _unix_slot_pair()
+            sw.write(b"GET /r/ws/v1/live HTTP/1.0\r\nHost: gw\r\nAuthorization: Bearer %s\r\nConnection: Upgrade\r\n"
+                     b"Upgrade: websocket\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                     % (_TOKEN.encode(), base64.b64encode(b"k" * 16)))
+            await sw.drain()
+            conn, req = parse_head_conn(await fr.readuntil(b"\r\n\r\n"))
+            ex = BrokeredExchange(front, front.policy.brokered["ws"], conn, req, b"/v1/live", None, fr, fw)
+            await asyncio.wait_for(ex.run(), 10)
+            fw.close()
+            got = await asyncio.wait_for(sr.read(), 10)
+            sw.close()
+        return ex.rec, got
+
+    rec, got = asyncio.run(go())
+    assert got.startswith(b"HTTP/1.1 400 "), got[:200]
+    assert rec["refused"] == "malformed" and rec["detail"] == "websocket-version", rec
