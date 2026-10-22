@@ -28,8 +28,8 @@ _LOCAL_PEERPID = 2
 _XUCRED_VERSION = 0
 #: macOS `struct xucred`: cr_version, cr_uid, cr_ngroups, cr_groups[16].
 _XUCRED = struct.Struct("@IIh16I")
-#: Linux `struct ucred`: pid, uid, gid.
-_UCRED = struct.Struct("3i")
+#: Linux `struct ucred`: pid (`pid_t`, signed), uid and gid (`uid_t` / `gid_t`, unsigned).
+_UCRED = struct.Struct("=iII")
 _CTL_KERN, _KERN_PROC, _KERN_PROC_PID = 1, 14, 1
 #: `struct kinfo_proc` opens with `struct extern_proc`, whose first member is `p_un`, a union whose first member is
 #: `p_starttime`, a `struct timeval` (64-bit seconds, 32-bit microseconds).

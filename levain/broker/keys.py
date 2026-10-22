@@ -208,7 +208,11 @@ def raise_nofile() -> Tuple[int, int]:
 class Keys:
     """keys' connection half. The in-process API (`front_register`, `front_arm`, `drop_session`) is what the admin
     server's request tasks call, each passing the admin epoch its connection was adopted on; a call from a stale
-    epoch, or one refused by the shutdown latch, returns None and changes nothing (no answer is sent)."""
+    epoch, or one made after the shutdown latch (`closing`) is set, returns None and changes nothing (no answer is
+    sent).
+
+    `closing` is the ONE shutdown state: set synchronously by the trigger, never cleared. From that instant admission
+    refuses at accept, at the STATUS claim (`H`) and at `Q`, and every in-process API call refuses."""
 
     def __init__(self, *, gw_uids: frozenset = frozenset(), single_uid: Optional[int] = None,
                  control_path: Optional[str] = None, lib_root: Optional[str] = None) -> None:
@@ -231,9 +235,9 @@ class Keys:
         self.pool: Set[Conn] = set()                     # every exchange-pool connection still open, detached or not
         self.servers: list = []
         self.state_lock: Optional[asyncio.Lock] = None
-        self._latched = False
         self._done: Optional[asyncio.Event] = None
-        self._triggers: Set[asyncio.Future] = set()
+        self._closer: Optional[asyncio.Future] = None     # the one run of _close, made by the first trigger
+        self._starting: Optional[asyncio.Event] = None    # made by start(), set when start() has returned
 
     # -- start / stop --
 
@@ -244,15 +248,22 @@ class Keys:
             self._done = asyncio.Event()
 
     async def start(self, socks: Sequence[socket.socket]) -> None:
-        """Serve `socks` (bind_listeners' output). A shutdown that latched before this (a trigger during start) has
-        already finished: the sockets are closed unserved."""
+        """Serve `socks` (bind_listeners' output). start() alone creates servers, and the shutdown's close waits for
+        start() to return before it closes `servers`; so a trigger before or during start never leaves a listener.
+        Once `closing` is set no further server is created and the rest of `socks` is closed unserved; a server whose
+        creation was in flight at the trigger is in `servers` by the time the close runs, and is closed there (until
+        then admission refuses every connection it accepts)."""
         self._in_loop()
-        if self._latched:
-            for s in socks:
-                s.close()
-            return
-        for s in socks:
-            self.servers.append(await asyncio.start_unix_server(self._on_conn, sock=s, backlog=ACCEPT_BACKLOG))
+        self._starting = asyncio.Event()
+        try:
+            for i, s in enumerate(socks):
+                if self.closing:
+                    for rest in socks[i:]:
+                        rest.close()
+                    return
+                self.servers.append(await asyncio.start_unix_server(self._on_conn, sock=s, backlog=ACCEPT_BACKLOG))
+        finally:
+            self._starting.set()
 
     def arm_triggers(self) -> None:
         """The ONE shutdown trigger: SIGTERM, and EOF on stdin when stdin is a pipe (the launcher's), both setting the
@@ -283,20 +294,27 @@ class Keys:
             self.trigger()
 
     def trigger(self) -> None:
-        fut = asyncio.ensure_future(self.shutdown())
-        self._triggers.add(fut)
-        fut.add_done_callback(self._triggers.discard)
+        """The latch: `closing` is set here, synchronously, so admission and the admin calls refuse from this instant
+        (no table mutation awaits inside its lock, so none can be half-done when it is set). The close runs once, as
+        a task; a later trigger is a no-op."""
+        self._in_loop()
+        self.closing = True
+        if self._closer is None:
+            self._closer = asyncio.ensure_future(self._close())
 
     async def shutdown(self) -> None:
-        """Run once: stop accepting and close the listeners, then await their closure (bounded). A later call awaits
-        the first one's completion and returns."""
-        self._in_loop()
+        """Trigger, then await the one close's completion (a later call awaits the same completion and returns)."""
+        self.trigger()
         assert self._done is not None
-        if self._latched:
-            await self._done.wait()
-            return
-        self._latched = True
+        await self._done.wait()
+
+    async def _close(self) -> None:
+        """Wait for a start() in progress to return (its only awaits are its server creations), then stop accepting
+        and close the listeners, then await their closure (bounded)."""
+        assert self._done is not None
         try:
+            if self._starting is not None:
+                await self._starting.wait()
             for s in self.servers:          # (1) the listeners' synchronous close: no accept after this
                 s.close()
             closures = {asyncio.ensure_future(s.wait_closed()) for s in self.servers}
@@ -341,7 +359,7 @@ class Keys:
     async def front_arm(self, epoch: int, session: str, reg_token: int) -> Optional[dict]:
         assert self.state_lock is not None
         async with self.state_lock:
-            if epoch != self.admin_epoch:
+            if epoch != self.admin_epoch or self.closing:
                 return None
             reg = self.by_session.get(session)
             if reg is None or reg.reg_token != reg_token or self.regs.get(reg.front_uid) is not reg:
@@ -355,7 +373,7 @@ class Keys:
         assert self.state_lock is not None
         victims: List[Conn] = []
         async with self.state_lock:
-            if epoch != self.admin_epoch:
+            if epoch != self.admin_epoch or self.closing:
                 return None
             reg = self.by_session.get(session)
             if reg is not None:
@@ -484,7 +502,7 @@ class Keys:
         reg = conn.reg
         assert self.state_lock is not None
         async with self.state_lock:
-            ok = (not conn.detached and self.regs.get(reg.front_uid) is reg and reg.state == "armed"
+            ok = (not conn.detached and not self.closing and self.regs.get(reg.front_uid) is reg and reg.state == "armed"
                   and reg.status is conn and h["session"] == reg.session and h["incarnation"] == reg.incarnation)
             if ok:
                 reg.state = "claimed"
@@ -555,6 +573,25 @@ def _account_uid(name: str) -> Optional[int]:
         return None
 
 
+def _process_uids() -> Tuple[int, ...]:
+    """(real, effective, saved) where `getresuid` exists; macOS has none, so (real, effective) there: its saved uid
+    is not readable from Python."""
+    if hasattr(os, "getresuid"):
+        return tuple(os.getresuid())
+    return (os.getuid(), os.geteuid())
+
+
+def single_uid_refusal(keys_uid: Optional[int], ids: Sequence[int]) -> Optional[str]:
+    """Why `--test-single-uid` is refused for a process whose uids are `ids` ((real, effective[, saved])), or None.
+    Refused when the `_levain_keys` account's uid is ANY of them (a setuid or `sudo -u` launch holds that authority
+    whichever slot it sits in), and when the effective uid is 0."""
+    if ids[1] == 0:
+        return "the effective uid is root"
+    if keys_uid is not None and keys_uid in ids:
+        return "this process holds a real install's keys account uid"
+    return None
+
+
 async def _serve(keys: Keys, front_path: str, gid: Optional[int]) -> int:
     socks = bind_listeners([(front_path, gid)])
     started = False
@@ -571,7 +608,7 @@ async def _serve(keys: Keys, front_path: str, gid: Optional[int]) -> int:
             return 3
         await keys.start(socks)
         started = True
-        if keys.servers:   # none when a trigger latched during start: nothing was served
+        if keys.servers and not keys.closing:   # a trigger before or during start: nothing is served
             print(f"levain gw-keys: ready front={front_path}", file=sys.stderr, flush=True)
         await keys.wait_done()
         print("levain gw-keys: stopped", file=sys.stderr, flush=True)
@@ -602,10 +639,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     single_uid: Optional[int] = None
     gid: Optional[int] = None
     if a.test_single_uid:
-        if _account_uid(KEYS_ACCOUNT) == os.getuid():
-            print("levain gw-keys: --test-single-uid refused: this is a real install's keys account", file=sys.stderr)
+        why = single_uid_refusal(_account_uid(KEYS_ACCOUNT), _process_uids())
+        if why is not None:
+            print(f"levain gw-keys: --test-single-uid refused: {why}", file=sys.stderr)
             return 2
-        single_uid, gw_uids = os.getuid(), frozenset()
+        # the effective uid: the one the kernel reports to this process's peers, and the one its own fronts carry
+        single_uid, gw_uids = os.geteuid(), frozenset()
     else:
         import grp
         gw_uids = _gw_uids()

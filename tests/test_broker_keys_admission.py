@@ -81,3 +81,54 @@ def test_shutdown_triggered_during_start_ends_keys():
         assert serving == [] and fds == [-1]
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_trigger_while_start_creates_its_server_leaves_no_listener(monkeypatch):
+    # a SIGTERM while start() is suspended inside its server creation: the server it was creating is closed too
+    d = tempfile.mkdtemp(prefix="lk", dir="/tmp")
+    path = os.path.join(d, "f.sock")
+    real = asyncio.start_unix_server
+
+    async def run() -> tuple:
+        k = K.Keys(single_uid=os.getuid())
+        socks = K.bind_listeners([(path, None)])
+        entered, gate = asyncio.Event(), asyncio.Event()
+
+        async def gated(*a, **kw):
+            entered.set()
+            await gate.wait()
+            return await real(*a, **kw)
+
+        monkeypatch.setattr(asyncio, "start_unix_server", gated)
+        st = asyncio.ensure_future(k.start(socks))
+        await asyncio.wait_for(entered.wait(), 5)
+        k.trigger()
+        await asyncio.sleep(0.05)
+        gate.set()
+        await asyncio.wait_for(st, 5)
+        await asyncio.wait_for(k.wait_done(), 5)
+        conn = await asyncio.get_running_loop().run_in_executor(None, _connect, path)
+        return [s.is_serving() for s in k.servers], conn
+
+    try:
+        serving, conn = asyncio.run(run())
+        assert serving == [False] and conn == "ConnectionRefusedError", (serving, conn)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_admin_calls_after_the_latch_change_nothing():
+    # `closing` is the one shutdown state: after it, FRONT-REGISTER / FRONT-ARM / DROP-SESSION answer nothing
+    async def run() -> tuple:
+        k = K.Keys(single_uid=os.getuid())
+        k._in_loop()
+        await k.front_register(0, "s1", 70000, 123, 456, 1, 1)
+        await asyncio.wait_for(k.shutdown(), 5)
+        reg = await k.front_register(0, "s2", 70001, 124, 457, 1, 1)
+        arm = await k.front_arm(0, "s1", 1)
+        drop = await k.drop_session(0, "s1")
+        return reg, arm, drop, sorted(k.regs), k.regs[70000].state
+
+    reg, arm, drop, uids, state = asyncio.run(run())
+    assert (reg, arm, drop) == (None, None, None)
+    assert uids == [70000] and state == "registered"
