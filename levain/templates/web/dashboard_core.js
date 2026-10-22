@@ -585,7 +585,7 @@
     const needsHost = document.getElementById("ck-needs");
     if (needsHost && !on) clearNeeds(needsHost);   // the strip is drawn only by the KE page, and only while something waits (renderNeeds)
     const notesHost = document.getElementById("ck-notes");
-    if (notesHost && !on) clearNeeds(notesHost);   // and the notes strip, likewise (renderNotes)
+    if (notesHost && !on) { clearNeeds(notesHost); noteBodies.clear(); }   // and the notes strip, likewise (renderNotes)
     // the hero's legend follows the hero: shown by the sky's own render, hidden with the region
     const band = document.getElementById("ck-legend");
     if (band) band.hidden = true;
@@ -4293,7 +4293,13 @@
   // whether it was dismissed; the words are the agent's, fetched from /cockpit/note/<n>.json with the page's token (the question
   // body's gate). A note is drawn apart from everything that decides: no REC, no options, no words box, no "sign" line, no
   // accent; its one control is "dismiss", which tells the agent nothing. Every string is drawn with textContent, never as HTML.
+  // keyed `n|state`; renderNotes keeps only the notes the current view lists, and the strip's clearing empties it
   const noteBodies = new Map();
+  function pruneNoteBodies(lines) {
+    const listed = new Set();
+    for (const ln of lines) if (ln && ln.note) listed.add(ln.note.n + "|" + ln.note.state);
+    for (const k of Array.from(noteBodies.keys())) if (!listed.has(k)) noteBodies.delete(k);
+  }
   function noteFetch(n, headers, tryNo) {
     return fetchBounded("/cockpit/note/" + encodeURIComponent(String(n.n)) + ".json", { cache: "no-store", headers: headers },
       (res) => {
@@ -4385,13 +4391,18 @@
     const host = document.getElementById("ck-notes");
     if (!host) return;
     const lines = ((view.extra_panels || {}).decisions || {}).lines;
-    const items = (Array.isArray(lines) ? lines : []).filter((ln) => ln && ln.note && ln.note.state === "open").map((ln) => ln.note);
-    if (!items.length) { clearNeeds(host); return; }
-    const sig = items.map((n) => n.id + "|" + n.offered).join("\n");
+    const all = Array.isArray(lines) ? lines : [];
+    const items = all.filter((ln) => ln && ln.note && ln.note.state === "open").map((ln) => ln.note);
+    if (!items.length) { clearNeeds(host); noteBodies.clear(); return; }
+    pruneNoteBodies(all);
+    // the cockpit lists a page of the open notes; `total` is how many are open in all, so the strip says what it left out
+    const total = Math.max(items.length, ...items.map((n) => n.total || 0));
+    const sig = items.map((n) => n.id + "|" + n.offered).join("\n") + "\n" + total;
     if (host.dataset.sig === sig && !host.hidden) return;
     const head = el("div", "notes-headline");
-    head.append(el("h3", null, "Notes"), el("span", "notes-count", String(items.length)),
+    head.append(el("h3", null, "Notes"), el("span", "notes-count", String(total)),
                 el("span", "notes-gloss", "Agents telling you something. Nothing to answer: read it, then dismiss."));
+    if (total > items.length) head.appendChild(el("span", "notes-more ext-meta", (total - items.length) + " more not shown: the oldest are shown first"));
     const kept = new Map();
     const old = host.querySelector(".notes-grid");
     if (old) for (const c of old.children) if (c.dataset && c.dataset.noteId) kept.set(c.dataset.noteId, c);
@@ -5514,5 +5525,5 @@
 
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
-  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
+  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();

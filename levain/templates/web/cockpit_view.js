@@ -330,6 +330,7 @@
           const f = r.facets || {};
           const sv = (x) => (typeof x === "string" ? x : "");
           line.note = { id: r.id, n: isNum(f.note_n) ? f.note_n : 0, agent: sv(f.agent), state: sv(f.note_state),
+                        total: isNum(f.note_open_total) ? f.note_open_total : 0,
                         age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "",
                         decidedAge: typeof f.decided_at === "string" ? ageLabel(f.decided_at, nowMs || Date.now(), "") : "",
                         offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "note_dismiss" && a.gesture === "direct") };

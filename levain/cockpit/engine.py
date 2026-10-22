@@ -133,7 +133,8 @@ _VERB_ROW_PREFIXES = (QUESTION_ROW_PREFIX, NOTE_ROW_PREFIX)
 KERNEL_DECISION_FACETS = frozenset({"principal", "pending_tier", "expires_at", "due", "at", "outcome", "verb",
                                     "reason", "unapplied", "cancelled_by",
                                     "agent", "tool", "consent_state", "consent_tier", "decided_at",
-                                    "question_n", "question_state", "question_options", "note_n", "note_state"})
+                                    "question_n", "question_state", "question_options", "note_n", "note_state",
+                                    "note_open_total"})
 QUESTION_VERB = "question_answer"       # the cockpit verb a question row offers (verbs.py registers it)
 QUESTION_DONE_HOURS = 24                # an answered question stays listed this long, as a decided request does
 NOTE_VERB = "note_dismiss"              # the cockpit verb a note row offers (verbs.py registers it)
@@ -526,16 +527,20 @@ def _question_rows_in(store: Any, now: datetime) -> tuple[list[RowIn], int]:
     return [_question_row_in(q) for q in shown.values()], max(len(open_) - PENDING_CAP, 0)
 
 
-def _note_row_in(n: Any) -> RowIn:
+def _note_row_in(n: Any, open_total: int | None = None) -> RowIn:
     """One note (``levain.consent.notes.Note``) as a row: ``note:<n>``, carrying who filed it, when, and whether it was
     dismissed, and NOTHING the agent wrote (served to a token holder only: ``/cockpit/note/<n>.json``). Its version is
-    its number and its dismissed-ness, so a dismissal made elsewhere makes a stale row a 409."""
+    its number and its dismissed-ness, so a dismissal made elsewhere makes a stale row a 409. An open row of a listing
+    also carries ``note_open_total``, how many notes are open in all, so a surface that shows a page says how many
+    it left out (it is not versioned: the count moves with other notes, the row does not)."""
     dismissed = n.dismissed is not None
     agent = visible(n.agent)
     facets: dict[str, Any] = {"agent": agent, "at": n.filed_at, "note_n": n.n,
                               "note_state": "dismissed" if dismissed else "open"}
     if dismissed:
         facets["decided_at"] = n.dismissed.dismissed_at
+    elif open_total is not None:
+        facets["note_open_total"] = open_total
     return RowIn(id=f"{NOTE_ROW_PREFIX}{n.n}", title=f"note from {agent} #{n.n}", facets=facets,
                  stored={"n": n.n, "dismissed_at": n.dismissed.dismissed_at if dismissed else "open"})
 
@@ -545,13 +550,13 @@ def _note_rows_in(store: Any, now: datetime) -> tuple[list[RowIn], int]:
     queue with no ``notes.db`` lists nothing and creates nothing."""
     from levain.consent.listing import PENDING_CAP
 
-    open_ = store.open_notes()
+    open_, total = store.open_page(PENDING_CAP)      # never more than the page is read (NoteStore.open_page)
     since = (now - timedelta(hours=QUESTION_DONE_HOURS)).astimezone(timezone.utc)
     done = [n for n in store.recent(50) if n.dismissed is not None
             and _parse_iso(n.dismissed.dismissed_at) >= since]
-    shown = {n.n: n for n in open_[:PENDING_CAP]}
+    shown = {n.n: n for n in open_}
     shown.update((n.n, n) for n in done)
-    return [_note_row_in(n) for n in shown.values()], max(len(open_) - PENDING_CAP, 0)
+    return [_note_row_in(n, total) for n in shown.values()], max(total - len(open_), 0)
 
 
 class Cockpit:
@@ -1295,7 +1300,8 @@ class Cockpit:
                 built, left_out = _note_rows_in(dec.notes, ctx.now)
                 if left_out:
                     overflowed = True
-                    notes.append("more notes are waiting than are shown: the oldest are shown, the rest are not read")
+                    notes.append(f"{left_out} more notes are waiting than are shown: the oldest are shown, the rest "
+                                 "are not read")
                 ns = self._read_snap(self._broker_dec_spec, Read(rows=tuple(built)), ctx, now_iso)
                 rows += ns.rows or []
                 skipped += ns.skipped
@@ -1341,24 +1347,28 @@ class Cockpit:
         return Absent(f"decision {row_id!r} is gone")
 
     def _question_decision_one(self, ctx: ReadContext, row_id: str) -> Result:
+        from levain.consent.questions import QuestionStoreError
+
         store = self._dec.questions
         if store is None:
             return Absent("no question store")
         try:
             q = store.get(row_id[len(QUESTION_ROW_PREFIX):])     # also reads `#3` or `q-…`: only the canonical id is the row
-        except (OSError, sqlite3.Error) as exc:
+        except (QuestionStoreError, OSError, sqlite3.Error) as exc:
             return Fault(f"agent questions unavailable: {type(exc).__name__}: {_safe_str(exc)}")
         if q is None or row_id != f"{QUESTION_ROW_PREFIX}{q.n}":
             return Absent(f"decision {row_id!r} is gone")
         return Read(rows=(_question_row_in(q),))
 
     def _note_decision_one(self, ctx: ReadContext, row_id: str) -> Result:
+        from levain.consent.notes import NoteStoreError
+
         store = self._dec.notes
         if store is None:
             return Absent("no note store")
         try:
             n = store.get(row_id[len(NOTE_ROW_PREFIX):])
-        except (OSError, sqlite3.Error) as exc:
+        except (NoteStoreError, OSError, sqlite3.Error) as exc:
             return Fault(f"agent notes unavailable: {type(exc).__name__}: {_safe_str(exc)}")
         if n is None or row_id != f"{NOTE_ROW_PREFIX}{n.n}":
             return Absent(f"decision {row_id!r} is gone")

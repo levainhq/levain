@@ -44,9 +44,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from levain.cockpit.authority import bound, current
-from levain.cockpit.engine import VALUE_ABSENT
+from levain.cockpit.engine import DECISIONS_ID, NOTE_VERB, QUESTION_VERB, VALUE_ABSENT
 from levain.cockpit.external import ID_PREFIX as EXTERNAL_PREFIX
-from levain.cockpit.registry import parse_date
+from levain.cockpit.registry import NOTE_ROW_PREFIX, QUESTION_ROW_PREFIX, parse_date
 from levain.cockpit.results import Absent, Fault, Read
 from levain.writes import (ActionVerb, EditError, _apply_operator_state_edit, _normalize_expect_disposition,
                            apply_action, apply_edit)
@@ -308,14 +308,25 @@ _OPEN_QUESTION_ROW = lambda r: (str(r.get("id", "")).startswith("question:")   #
                                 and _facet(r, "question_state") == "open")
 
 
-def _applies_to_row(verb: "VerbSpec", row: dict[str, Any]) -> bool:
-    """Whether ``verb`` is offered on / fires against ``row``. A ``question:`` row on the composed decisions panel is
-    the kernel's: only ``question_answer`` is ever offered or dispatched on it, never a verb the attached decision
-    source declared without an ``applies_to`` (that source's verbs bind to its own rows)."""
-    if str(row.get("id", "")).startswith("question:") and verb.name != "question_answer":
-        return False
-    if str(row.get("id", "")).startswith("note:") and verb.name != "note_dismiss":
-        return False
+# the kernel's agent-text rows on the composed decisions panel: (row-id prefix, the facet only the kernel writes, the
+# one verb the row offers). Each pair binds BOTH ways: the row offers only its verb, and the verb fires only on it
+_KERNEL_ROW_VERBS = ((QUESTION_ROW_PREFIX, "question_n", QUESTION_VERB), (NOTE_ROW_PREFIX, "note_n", NOTE_VERB))
+
+
+def _applies_to_row(verb: "VerbSpec", panel_id: str, row: dict[str, Any]) -> bool:
+    """Whether ``verb`` is offered on / fires against ``row`` of panel ``panel_id``. A ``question:`` or ``note:`` row
+    on the composed decisions panel (:data:`DECISIONS_ID`) is the kernel's: only its own verb (``question_answer``,
+    ``note_dismiss``) is ever offered or dispatched on it, never a verb the attached decision source declared without
+    an ``applies_to`` (that source's verbs bind to its own rows; the engine skips a source row carrying a kernel
+    prefix). The kernel's verb, in turn, fires only on a decisions row of its prefix that carries its kernel facet.
+    Any other panel's row named ``note:…`` or ``question:…`` is that panel's own and keeps its own verbs."""
+    rid = str(row.get("id", ""))
+    for prefix, facet, owner in _KERNEL_ROW_VERBS:
+        kernel_row = panel_id == DECISIONS_ID and rid.startswith(prefix)
+        if kernel_row and verb.name != owner:
+            return False
+        if verb.name == owner and not (kernel_row and _facet(row, facet) is not None):
+            return False
     return verb.applies_to is None or bool(verb.applies_to(row))
 
 
@@ -640,7 +651,7 @@ def row_actions(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str, row: 
     out = []
     label = row_label(row)
     for v in offered(registry, cockpit, panel_id):
-        if v.binding != "row" or not _applies_to_row(v, row):
+        if v.binding != "row" or not _applies_to_row(v, panel_id, row):
             continue
         t = v.rendered_tier(row, label, today, policy=policy)
         # an escalation names the tier the fire will take, so the policy raises it as it raises the fire
@@ -831,7 +842,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     row = _read_target(cockpit, verb, panel_id, req.get("row_id"))
     label = row_label(row)
     if row is not None:
-        if not _applies_to_row(verb, row):
+        if not _applies_to_row(verb, panel_id, row):
             raise _refuse("stale", 409, f"panel {panel_id!r} no longer offers {verb.name!r} on this row")
         if req.get("row_version") != row["version"]:
             raise _refuse("stale", 409, f"row {row['id']!r} changed since it was rendered")

@@ -250,6 +250,14 @@ _MAX_READ_WAITERS = 64
 
 _log = logging.getLogger(__name__)
 
+
+def _store_fault(what: str, exc: BaseException) -> dict[str, str]:
+    """The 500 body of an agent-text route whose store could not be read: the exception's type only. Its message is
+    logged, never sent: a store error names the store's absolute path."""
+    _log.warning("cockpit: a %s body could not be read: %s: %s", what, type(exc).__name__, exc)
+    return {"error": "internal", "message": f"the {what} store could not be read ({type(exc).__name__})"}
+
+
 # The write token header. spore-129 introduced it for an off-loopback writable bind; since K2a
 # (design §4.3) every write carries a surface token in it on EVERY bind, loopback included,
 # constant-time compared against the surface tokens ``make_server`` holds. Off-box, the same
@@ -943,7 +951,7 @@ class _Handler(GuardedHandler):
                         "answer": None if a is None else {"kind": a.kind, "value": a.value, "channel": a.channel,
                                                           "answered_at": a.answered_at}}
             except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
-                status, payload = 500, {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
+                status, payload = 500, _store_fault("question", exc)
             finally:
                 self.server.request_gate.release()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
@@ -974,7 +982,7 @@ class _Handler(GuardedHandler):
                         "filed_at": note.filed_at,
                         "dismissed": None if d is None else {"channel": d.channel, "dismissed_at": d.dismissed_at}}
             except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
-                status, payload = 500, {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
+                status, payload = 500, _store_fault("note", exc)
             finally:
                 self.server.request_gate.release()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,

@@ -15,9 +15,15 @@ The question store's rules hold here: the directory is the operator's alone (070
 ``BEGIN IMMEDIATE`` through :mod:`levain.autonomic.durable_sqlite`, reads are read-only snapshots that never create the
 file, and both tables are append-only (SQL triggers refuse UPDATE, DELETE and an INSERT OR REPLACE). Agent text is
 refused at filing when it holds a character a person cannot see (:mod:`levain.unshowable`, the one rule every surface
-asks); ``detail`` may hold newlines and nothing else unshowable. Known edges, not built against:
+asks); ``detail`` may hold newlines and nothing else unshowable. The OPEN notes are bounded, checked inside the
+filing transaction: :data:`NOTE_OPEN_MAX` in all, and :data:`NOTE_OPEN_PER_SESSION_MAX` from any one agent session
+that the store records (a note filed under :data:`levain.consent.band.NO_SESSION` names no session, so only the total
+binds it); past either, :meth:`NoteStore.file` refuses with :class:`NoteCapError` and writes nothing, so an agent
+that loops cannot bury what he has not read. Readers take one page (:meth:`NoteStore.open_page`), never every open
+note. Known edges, not built against:
   - any process of the operator's uid can file or dismiss a note (the store is his own file and a note is no decision).
-  - notes are kept, never pruned: the history of what an agent told him and when he read it is the point.
+  - notes are kept, never pruned: the history of what an agent told him and when he read it is the point. The open
+    bound caps what waits on him, not the history; a dismissed note frees its place.
 Stdlib only.
 """
 from __future__ import annotations
@@ -35,11 +41,13 @@ from levain import unshowable
 from levain.autonomic.durable_sqlite import open_durable, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.cockpit.consent import ConsentError, utc_stamp
+from levain.consent.band import NO_SESSION
 from levain.consent.queue import default_queue_dir
 from levain.consent.questions import ANSWER_CHANNELS, _SESSION_MAX, _has_control, _parse_ref
 from levain.consent.record import AGENTS
 
-__all__ = ["DB_NAME", "DISMISS_CHANNELS", "FORMAT", "Dismissal", "Note", "NoteStore", "NoteStoreError"]
+__all__ = ["DB_NAME", "DISMISS_CHANNELS", "FORMAT", "NOTE_OPEN_MAX", "NOTE_OPEN_PER_SESSION_MAX", "Dismissal", "Note",
+           "NoteCapError", "NoteStore", "NoteStoreError"]
 
 DB_NAME = "notes.db"
 FORMAT = "levain-notes/1"
@@ -47,11 +55,17 @@ DISMISS_CHANNELS: tuple[str, ...] = ANSWER_CHANNELS           # cli, phone, cock
 _ACCESS_BY_OTHERS = 0o077
 WHAT_MAX = 200
 DETAIL_MAX = 4000
+NOTE_OPEN_MAX = 100              # open (undismissed) notes the store holds at once, from every agent together
+NOTE_OPEN_PER_SESSION_MAX = 25   # open notes one recorded agent session may hold at once
 _N_MAX = 2 ** 63 - 1
 
 
 class NoteStoreError(RuntimeError):
     """The store cannot be trusted: another format, a directory others can reach."""
+
+
+class NoteCapError(ConsentError):
+    """A note refused because too many are already open (:data:`NOTE_OPEN_MAX`, :data:`NOTE_OPEN_PER_SESSION_MAX`)."""
 
 
 @dataclass(frozen=True)
@@ -97,6 +111,8 @@ _SCHEMA = (
 )
 _SELECT = ("SELECT n.n, n.id, n.agent, n.agent_session_id, n.what, n.detail, n.cwd, n.filed_at, d.note_id, d.channel, "
            "d.dismissed_at FROM notes n LEFT JOIN note_dismissals d ON d.note_id = n.id")
+# the WHERE of an open note (``notes n``): no dismissal row names it
+_OPEN = "WHERE NOT EXISTS (SELECT 1 FROM note_dismissals d WHERE d.note_id = n.id)"
 
 
 def _text(name: str, value: Any, high: int, allow: str) -> str:
@@ -228,11 +244,23 @@ class NoteStore:
         return what, None if detail is None else _text("detail", detail, DETAIL_MAX, "\n")
 
     def file(self, *, agent: str, agent_session_id: str, what: str, detail: str | None, cwd: str) -> Note:
-        """File a note, refusing anything malformed with nothing written."""
+        """File a note, refusing anything malformed, or past the open bound, with nothing written."""
         what, detail = self.check(agent=agent, agent_session_id=agent_session_id, what=what, detail=detail, cwd=cwd)
         nid = "n-" + os.urandom(12).hex()
         stamp = utc_stamp(self._now())
         with self._write() as conn:
+            # counted inside the write transaction (BEGIN IMMEDIATE): two agents filing at once cannot both pass
+            (total,) = conn.execute(f"SELECT COUNT(*) FROM notes n {_OPEN}").fetchone()
+            if total >= NOTE_OPEN_MAX:
+                raise NoteCapError(f"{total} notes are already waiting unread (NOTE_OPEN_MAX is {NOTE_OPEN_MAX}); "
+                                   "file no more until they are read")
+            if agent_session_id != NO_SESSION:
+                (mine,) = conn.execute(f"SELECT COUNT(*) FROM notes n {_OPEN} AND n.agent_session_id = ?",
+                                       (agent_session_id,)).fetchone()
+                if mine >= NOTE_OPEN_PER_SESSION_MAX:
+                    raise NoteCapError(f"this session already has {mine} notes waiting unread "
+                                       f"(NOTE_OPEN_PER_SESSION_MAX is {NOTE_OPEN_PER_SESSION_MAX}); "
+                                       "file no more until they are read")
             conn.execute("INSERT INTO notes (id, agent, agent_session_id, what, detail, cwd, filed_at) "
                          "VALUES (?, ?, ?, ?, ?, ?, ?)", (nid, agent, agent_session_id, what, detail, cwd, stamp))
             made = self._by_ref(conn, nid)
@@ -244,13 +272,16 @@ class NoteStore:
         with self._peek() as conn:
             return None if conn is None else self._by_ref(conn, ref)
 
-    def open_notes(self) -> list[Note]:
-        """The notes not yet dismissed, oldest first."""
+    def open_page(self, limit: int) -> tuple[list[Note], int]:
+        """The oldest ``limit`` notes not yet dismissed, oldest first, and how many are open in all (one snapshot).
+        Never more than ``limit`` rows are read: a surface shows the page and says how many it left out."""
         with self._peek() as conn:
             if conn is None:
-                return []
-            rows = conn.execute(f"{_SELECT} WHERE d.note_id IS NULL ORDER BY n.n").fetchall()
-        return [self._note_of(r) for r in rows]
+                return [], 0
+            (total,) = conn.execute(f"SELECT COUNT(*) FROM notes n {_OPEN}").fetchone()
+            rows = conn.execute(f"{_SELECT} WHERE d.note_id IS NULL ORDER BY n.n LIMIT ?",
+                                (min(max(int(limit), 0), _N_MAX),)).fetchall()
+        return [self._note_of(r) for r in rows], total
 
     def recent(self, limit: int = 50) -> list[Note]:
         """The newest ``limit`` notes, dismissed or not, newest first."""

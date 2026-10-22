@@ -604,12 +604,12 @@ class _PhoneServer(ThreadingHTTPServer):
         from levain.consent.notes import NoteStore, NoteStoreError
 
         try:
-            open_ = NoteStore(self.queue_dir).open_notes()
+            open_, total = NoteStore(self.queue_dir).open_page(PENDING_CAP)   # never more than the page is read
         except (NoteStoreError, OSError, sqlite3.Error) as exc:
             return [], 0, f"{type(exc).__name__}: {exc}"
         rows = [{"n": n.n, "id": n.id, "agent": n.agent, "what": n.what, "detail": n.detail, "filed_at": n.filed_at}
-                for n in open_[:PENDING_CAP]]
-        return rows, max(len(open_) - PENDING_CAP, 0), ""
+                for n in open_]
+        return rows, max(total - len(open_), 0), ""
 
     def note_dismiss(self, n: int, req: Any) -> dict[str, Any]:
         """``POST /note/<n>/dismiss`` (``{}``): mark the note read, once, channel ``phone``. Unsigned, and it delivers

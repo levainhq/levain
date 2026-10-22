@@ -155,11 +155,12 @@ def _note(agent: str, params: dict[str, Any]) -> dict[str, Any]:
     if "what" not in raw or extra:
         raise _RpcError(INVALID_PARAMS, "a note takes what (required) and detail (optional) only"
                         + (f": not {', '.join(sorted(extra))}" if extra else ""))
-    if not isinstance(raw["what"], str) or not isinstance(raw.get("detail", ""), str):
+    detail = raw.get("detail")      # optional: absent and an explicit null are the same, no detail
+    if not isinstance(raw["what"], str) or not (detail is None or isinstance(detail, str)):
         raise _RpcError(INVALID_PARAMS, "what and detail must be strings")
     try:
         n = NoteStore().file(agent=agent, agent_session_id=_session(agent, params), what=raw["what"],
-                             detail=raw.get("detail"), cwd=os.path.abspath(os.getcwd()))
+                             detail=detail, cwd=os.path.abspath(os.getcwd()))
     except (ConsentError, NoteStoreError, OSError) as exc:
         return {"content": [{"type": "text", "text": f"levain note: refused, nothing was filed: {exc}"}],
                 "isError": True}
