@@ -483,3 +483,69 @@ def test_a_held_commit_that_replaces_a_ledger_line_stays_held_by_name(tmp_path, 
     assert f"update-ref -d {ref}" in out.err + out.out
     assert "replaced" not in git("log", "-p", "levain-team-ledger", cwd=tmp_path / "origin.git")
     assert git("rev-parse", ref, cwd=gl.wt).strip() == c
+
+
+def test_a_first_push_refuses_a_local_commit_that_replaces_a_ledger_line(tmp_path, capsys) -> None:
+    # reproduced on 1e63e50d (teampres-fix7/repro_before.txt (N)): with no ledger branch on the remote yet, sync skipped
+    # the rebase that runs the own-commit refusal and pushed a commit that replaced a line
+    from levain.team import entry as E
+    from levain.team.ledger_api import open_ledger
+    from levain.team.transport import Repo
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "ana@test", "-f", str(tmp_path / "k")],
+                   check=True, capture_output=True)
+    ana = project(tmp_path)
+    assert team("init", "--project", "p", "--owner", "ana", "--member", "ana=ana@ex.com", "--allow-file-keys",
+                "--signing-key", str(tmp_path / "k.pub"), "--no-push", repo=ana) == 0
+    assert team("record", "decision", "--kind", "ruling", "--owner", "ana", "--paths", "a.py", "--words", "first",
+                "--no-push", repo=ana) == 0
+    gl = open_ledger(Repo.discover(ana))
+    f = next((gl.wt / "ledger" / "ana").glob("*.jsonl"))
+    o = E.seal(E.build("ana", "decision", kind="ruling", owner="ana", paths=["a.py"], words="replaced",
+                       agent="human"), "")
+    f.write_text(json.dumps(o, sort_keys=True) + "\n")
+    git("add", "-A", cwd=gl.wt)
+    gl._commit("levain team: decision")
+    c = git("rev-parse", "HEAD", cwd=gl.wt).strip()
+    capsys.readouterr()
+    assert team("sync", repo=ana) != 0
+    out = capsys.readouterr()
+    assert f"the local commit {c[:10]} changes ledger/ana/" in out.err + out.out
+    assert not git("ls-remote", "--heads", str(tmp_path / "origin.git"), "levain-team-ledger", cwd=tmp_path).strip()
+
+
+def test_a_held_entry_naming_a_refused_one_waits_and_an_independent_one_replays(tmp_path, capsys) -> None:
+    # reproduced on 1e63e50d (teampres-fix7/repro_before.txt (D)): a held commit that replaced a line was refused, but it
+    # gave no ids to wait on, so a later held ack naming its entry replayed and published a reference to nothing
+    from levain.team import entry as E
+    from levain.team.ledger_api import open_ledger
+    from levain.team.transport import Repo
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "ana@test", "-f", str(tmp_path / "k")],
+                   check=True, capture_output=True)
+    ana = project(tmp_path)
+    assert team("init", "--project", "p", "--owner", "ana", "--member", "ana=ana@ex.com", "--allow-file-keys",
+                "--signing-key", str(tmp_path / "k.pub"), repo=ana) == 0
+    assert record(ana, "first") == 0
+    gl = open_ledger(Repo.discover(ana))
+    f = next((gl.wt / "ledger" / "ana").glob("*.jsonl"))
+    before = git("rev-parse", "HEAD", cwd=gl.wt).strip()
+    o1 = E.seal(E.build("ana", "decision", kind="ruling", owner="ana", paths=["a.py"], words="replaced",
+                        agent="human"), "")
+    o2 = E.seal(E.build("ana", "ack", refs=[o1["id"]], session="s1", agent="claude-code", summary="dependent"),
+                o1["hash"])
+    o3 = E.seal(E.build("ana", "decision", kind="ruling", owner="ana", paths=["a.py"], words="independent",
+                        agent="human"), o2["hash"])
+    refs = []
+    for i, o in enumerate((o1, o2, o3)):
+        f.write_text(("" if i == 0 else f.read_text()) + json.dumps(o, sort_keys=True) + "\n")
+        git("add", "-A", cwd=gl.wt)
+        gl._commit(f"levain team: {o['type']}")
+        refs.append(gl._held_ref(gl.pinned_root, git("rev-parse", "HEAD", cwd=gl.wt).strip()))
+        git("update-ref", refs[-1], "HEAD", cwd=gl.wt)
+    git("reset", "-q", "--hard", before, cwd=gl.wt)
+    capsys.readouterr()
+    assert team("sync", repo=ana) == 0
+    out = capsys.readouterr()
+    published = git("log", "-p", "levain-team-ledger", cwd=tmp_path / "origin.git")
+    assert "independent" in published and "dependent" not in published.replace("independent", "")
+    assert [bool(git("for-each-ref", r, cwd=gl.wt).strip()) for r in refs] == [True, True, False]
+    assert f"({o2['id']}): they supersede or refer to an entry that is not in the ledger here" in out.err + out.out

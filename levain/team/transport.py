@@ -1802,7 +1802,8 @@ class GitLedger:
             "presence": "the team refuses file keys and they are signed with no user presence, so they would publish "
                         "without counting; the owner runs `levain team file-keys allow`, or record them again with a "
                         "Touch ID or security key",
-            "depends": "they supersede or refer to an entry kept back above, so they wait for it",
+            "depends": "they supersede or refer to an entry that is not in the ledger here (one kept back or refused "
+                       "above), so they wait for it",
             "touch": "this clone signs with a Touch ID or security key and the team needs a touch for each of them, "
                      "and this sync is not interactive, so it asked for none. Run `levain team sync` in a terminal: it "
                      "names each entry and asks one touch for it",
@@ -1857,6 +1858,17 @@ class GitLedger:
                                 f"than by appending lines ({p}: {why}), and sync never publishes that; "
                                 f"nothing was changed. See it with `git -C {self.wt} show {c[:10]}`; make each entry "
                                 "again with the levain CLI, then take that commit off the branch with git")
+
+    def _refuse_outgoing(self, base: str | None, ref: str) -> str:
+        """The push is a point of use: every commit a push of ``ref`` would send (those after ``base``, the remote tip,
+        or all of them when the remote has no branch yet) goes through the own-commit refusal, and the id it checked
+        is returned for the push, so a ref that moves afterwards cannot send an unchecked commit. The earlier calls
+        stop refs moving; this one is the gate no push path can go around (code L3 r7 codex MED: with no remote
+        branch the rebase that runs the refusal was skipped, and a commit that replaced a ledger line published)."""
+        tip = git(["rev-parse", "--verify", f"{ref}^{{commit}}"], self.wt).stdout.strip()
+        self._refuse_unsplittable(git(["rev-list", "--reverse", "--topo-order", tip, *([f"^{base}"] if base else [])],
+                                      self.wt).stdout.split())
+        return tip
 
     def _strip_team(self, c: str, root: str | None, pending: list[dict]) -> bool:
         """Queue own team/tenure commit ``c``'s change as a pending op (re-landed from the counted state, never replayed
@@ -1938,9 +1950,8 @@ class GitLedger:
             from . import tenure as T
             fido = self._presence_key_problem() is None
             # in order, and past an entry that stays held (codex MED, r2): a later entry in the same file is re-sealed
-            # onto the published chain, and one that supersedes or refers to a held entry waits with it
+            # onto the published chain, and one that supersedes or refers to an entry not on the branch waits
             kept: dict[str, list[str]] = {}
-            kept_ids: set[str] = set()
 
             def refuse(c: str, ids: set[str], wrong: dict[str, str]) -> None:
                 # it stays held, named with the one remedy, and later entries still replay (no `break`)
@@ -1950,7 +1961,6 @@ class GitLedger:
                     f"{', '.join(list(wrong)[:5])} other than by appending valid entry lines ({p}: {w}), so sync never "
                     f"publishes it. See it with `git -C {self.wt} show {c[:10]}`; record each entry again with the "
                     f"levain CLI, then drop it with `git -C {self.wt} update-ref -d {self._held_ref(root, c)}`")
-                kept_ids.update(ids)
 
             for c in order:
                 lines = self._added_lines(c)
@@ -1963,9 +1973,16 @@ class GitLedger:
                     refuse(c, ids, wrong)
                     continue
                 why = self._pick_why(d, c)
-                if why is None and any((set(o.get("supersedes") or []) | set(o.get("refs") or [])) & kept_ids
-                                       for o in objs):
-                    why = "depends"
+                if why is None:
+                    # judged as `record` judges a new entry, against the entries that EXIST on the branch (replayed
+                    # ones included) plus earlier lines of this commit, never against ids read from a commit kept
+                    # back: a refused one yields none (code L3 r7 codex MED)
+                    known = set(self.ledger().by_id)
+                    for o in objs:
+                        if (set(o.get("supersedes") or []) | set(o.get("refs") or [])) - known:
+                            why = "depends"
+                            break
+                        known.add(str(o.get("id")))
                 # the re-sign is the entry's presence (H-6): a person touches for THIS entry, named first as `record`
                 # names it, or it is not re-signed at all
                 named = fido and any(T.presence_required(d.team.allow_file_keys, o.get("type")) for o in objs)
@@ -2041,7 +2058,6 @@ class GitLedger:
                         break
                 if why is not None:
                     kept.setdefault(why, []).append(c)
-                    kept_ids |= ids
                     continue
                 git(["update-ref", "-d", self._held_ref(root, c)], self.wt, check=False)
             self._dcache = None
@@ -2412,7 +2428,8 @@ class GitLedger:
             rref = f"refs/remotes/{remote}/{self.branch}"
             local = self.ref
             for attempt in range(retries):
-                if not self._fetch(remote, rref, timeout):
+                fetched = self._fetch(remote, rref, timeout)
+                if not fetched:
                     published = bool(self.state().get("anchor")) or bool(git(
                         ["for-each-ref", "--count=1", f"refs/levain/seen/{self.branch}/", f"refs/levain/gone/{self.branch}/"],
                         self.repo.toplevel, check=False).stdout.strip())
@@ -2439,7 +2456,8 @@ class GitLedger:
                     if git(["rev-list", "--merges", f"{rref}..{local}"], self.wt).stdout.strip():
                         raise TeamError("refusing to push a merge to the team ledger (it must stay linear)")
                 self._hold_unpresent(rref, timeout, lock_timeout)
-                cp = git(["push", "-q", "--no-verify", remote, f"{local}:{local}"], self.repo.toplevel,
+                tip = self._refuse_outgoing(rref if fetched else None, local)
+                cp = git(["push", "-q", "--no-verify", remote, f"{tip}:{local}"], self.repo.toplevel,
                          check=False, timeout=timeout)
                 if cp.returncode == 0:
                     try:
