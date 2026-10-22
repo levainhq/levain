@@ -667,7 +667,7 @@ def _uid_task_count() -> int:
     else:
         try:
             cp = subprocess.run(["ps", "-U", str(uid), "-o", "pid="], capture_output=True, timeout=10,
-                                stdin=subprocess.DEVNULL)
+                                stdin=subprocess.DEVNULL, env=_scratch_env())
         except (OSError, subprocess.SubprocessError) as exc:
             raise _uncountable(f"ps: {type(exc).__name__}") from None
         if cp.returncode != 0:
@@ -795,9 +795,10 @@ def _p_env() -> dict[str, str]:
 def _layer_run(argv: list[str], **kw) -> subprocess.CompletedProcess:
     # the layer check's git runs under this module's environment (no user or system git config, no transport), not
     # the one it is handed, and under this module's timeout, not the one it is handed
-    kw.update(env=_p_env(), timeout=GIT_TIMEOUT)
+    kw.pop("env", None)
+    kw.pop("timeout", None)
     try:
-        return subprocess.run(argv, stdin=subprocess.DEVNULL, **kw)
+        return subprocess.run(argv, stdin=subprocess.DEVNULL, env=_p_env(), timeout=GIT_TIMEOUT, **kw)
     except (OSError, subprocess.SubprocessError) as exc:
         raise ReadSetRefused("readset-git-unavailable", f"git could not run ({type(exc).__name__})") from None
 
