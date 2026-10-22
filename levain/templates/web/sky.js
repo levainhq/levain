@@ -283,7 +283,15 @@
     // a host that owns a control row (the hero's strip) takes the toggle there, so the row is one row
     var head = strip && !!o.head;   // the Build tab's strip: a one-row header, no toggle
     if (strip && !head) bar.style.display = 'none';   // the phone's strip is a glance: no summary line, no toggle (inline: .sky-bar's display would beat `hidden`)
-    if (head) { bar.classList.add('sky-head'); bar.append(summary); }
+    if (head) {
+      bar.classList.add('sky-head'); bar.append(summary);
+      // the strip has no Ambient key, but the masthead's row must not move when it is absent: an invisible twin holds the key's place
+      if (o.toggleHost) {
+        Array.prototype.forEach.call(o.toggleHost.querySelectorAll(':scope > .sky-toggle'), function (t) { t.remove(); });
+        toggle.classList.add('sky-toggle-ghost'); toggle.textContent = 'Ambient'; toggle.tabIndex = -1; toggle.disabled = true; toggle.setAttribute('aria-hidden', 'true');
+        o.toggleHost.insertBefore(toggle, o.toggleBefore && o.toggleBefore.parentNode === o.toggleHost ? o.toggleBefore : null);
+      }
+    }
     else if (o.toggleHost && !strip) { Array.prototype.forEach.call(o.toggleHost.querySelectorAll(':scope > .sky-toggle'), function (t) { t.remove(); }); o.toggleHost.insertBefore(toggle, o.toggleBefore && o.toggleBefore.parentNode === o.toggleHost ? o.toggleBefore : null); bar.append(summary); } else bar.append(summary, toggle);
     var plot = el('div', { class: 'sky-plot' });
     plot.style.position = 'relative';
