@@ -172,10 +172,15 @@ def test_admin_eof_kills_cached_tokens_and_fronts(monkeypatch):
             k.control_uid = os.getuid() + 1
             r, w = await asyncio.open_unix_connection(admin)
             await _send(w, 1, "DROP-SESSION", session="s-x")
+            # read in chunks so bytes that arrive before a reset are kept, not dropped with read(-1)'s buffer: an
+            # answer followed by a reset must still fail
+            got = bytearray()
             try:
-                out["foreign"] = await asyncio.wait_for(r.read(), 5)
+                while chunk := await asyncio.wait_for(r.read(4096), 5):
+                    got += chunk
             except ConnectionResetError:
-                out["foreign"] = b""
+                pass
+            out["foreign"] = bytes(got)
             w.close()
             k.control_uid = os.getuid()
 
