@@ -24,9 +24,8 @@ from levain.slot import Refused
 from levain.slot import control as C
 from levain.slot import control_client
 from levain.slot import records as R
-from tests.test_slot_s2a_control import attach_claims, mint_claims
+from tests.test_slot_s2a_control import OP_UID, attach_claims, mint_claims
 
-OP_UID = 501
 KEYS_UID = 777
 S1, S2, S3 = "s-00000000000000b1", "s-00000000000000b2", "s-00000000000000b3"
 FRONT_UID = 3989
