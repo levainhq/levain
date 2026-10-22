@@ -191,9 +191,15 @@
   }
 
   // ---- the header strip ----
-  // "waiting on you" is ONE figure from ONE function: the sessions that wait on a decision or an answer. Every lens's headline figure, and the
-  // empty sentence of the Work lens, read it; the Work lens's own count of task records says "tasks waiting" and is never the headline.
-  const waitingOnYou = (v) => arr(v.nodes).filter((n) => n.state === "waiting").length;
+  // "waiting on you" is ONE figure from ONE function: every distinct thing he can answer, counted once. A session in state waiting is one; so is
+  // a waiting task that no waiting session carries (a seat-less ask arrives as a task with no workers), while a waiting task whose worker session
+  // is itself waiting is that same ask and adds nothing. Every lens's headline figure and the Work lens's empty sentence read it; the Work lens's
+  // own count of task records says "tasks waiting" and is never the headline.
+  const waitingOnYou = (v) => {
+    const nodes = arr(v.nodes), waitingIds = new Set(nodes.filter((n) => n.state === "waiting").map((n) => n.id));
+    const alone = arr(v.tasks).filter((t) => t.kind !== "unattached" && t.state === "waiting" && !arr(t.workers).some((id) => waitingIds.has(id)));
+    return waitingIds.size + alone.length;
+  };
   function strip(v, which) {
     const nodes = arr(v.nodes);
     const running = nodes.filter((n) => n.state === "running").length;
@@ -268,7 +274,7 @@
       s.append(el("b", null, num), " " + word);
       return s;
     };
-    row.append(stat("tasks", tasks.length, tasks.length === 1 ? "task" : "tasks"), stat("waiting", waitingOnYou(v), "waiting on you", waitingOnYou(v) ? "hot" : ""), stat("tasks-waiting", n("waiting"), "tasks waiting"));
+    row.append(stat("tasks", tasks.length, tasks.length === 1 ? "task" : "tasks"), stat("waiting", waitingOnYou(v), "waiting on you", waitingOnYou(v) ? "hot" : ""), stat("tasks-waiting", n("waiting"), n("waiting") === 1 ? "task waiting" : "tasks waiting"));
     if (n("failed")) row.appendChild(stat("failed", n("failed"), "failed", "bad"));
     row.append(stat("stuck", n("stuck"), "stuck"));
     if (n("open")) row.appendChild(stat("open", n("open"), "open"));
@@ -1635,6 +1641,6 @@
     return w;
   }
 
-  root.LevainTopologyView = { headerLens, setHeaderLens, headerToggle, hasWork, quietLine, signature, release, render, renderLost, renderLostFault, paused, replaying, replayValue, returnToLive, leaveReplay, hourMarks };
+  root.LevainTopologyView = { headerLens, setHeaderLens, headerToggle, hasWork, quietLine, signature, release, render, renderLost, renderLostFault, paused, waitingOnYou, replaying, replayValue, returnToLive, leaveReplay, hourMarks };
   if (typeof module !== "undefined" && module.exports) module.exports = root.LevainTopologyView;
 })(typeof globalThis !== "undefined" ? globalThis : this);
