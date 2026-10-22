@@ -34,7 +34,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, ContextManager, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from levain.contracts import ContractError, canon
 from levain.slot import Refused, wall, write_all
@@ -481,6 +481,32 @@ def wake_reaper(run: Path) -> None:
         pass
 
 
+def _front_interlock():
+    """The reaper's ``front.lock`` primitive and ``front-revoked`` marker, resolved on the CALL, never at this
+    module's import (the module imports with the reaper's half absent). Absent or incomplete, a front start fails
+    closed ``front-interlock-unavailable``: no front is ever spawned without the lock."""
+    try:
+        from levain.slot import start as SS
+
+        return SS.front_lock, SS.FRONT_LOCK_WAIT_S, SS.FRONT_REVOKED, SS._marker
+    except (ImportError, AttributeError):
+        raise Refused("front-interlock-unavailable", "levain.slot.start") from None
+
+
+def front_lock_default(ctx: Ctx, slot: SlotId) -> ContextManager[None]:
+    """The slot's ``front.lock``, WAITED for (the reaper's own wait for it), not tried: render's front start queues
+    behind a revoker holding it and then reads the marker that revoker wrote, instead of refusing busy."""
+    lock, wait_s, _, _ = _front_interlock()
+    return lock(ctx, slot, wait_s)
+
+
+def front_revoked_default(ctx: Ctx, a: R.Alloc) -> bool:
+    """Whether the slot's durable ``front-revoked`` marker names THIS lease (session and ``lease_seq``): the bytes
+    the revoker writes for it, compared whole, so a marker of another lease or an earlier one does not refuse."""
+    _, _, name, marker = _front_interlock()
+    return ctx.store.read(("slots", a.slot.tag), name) == marker(a)
+
+
 @dataclass
 class Seams:
     """Every OS act the helper takes that a unit test cannot take as a non-root user, with its real default.
@@ -510,6 +536,10 @@ class Seams:
     client_factory: Callable[[Path], object] = _default_client
     stage_run_as: ST.RunAs = ST.fork_run_as
     spawn_front: Callable[[Sequence[str], bytes, int], int] = spawn_front
+    #: render (4)'s interlock with the revoker: the slot's ``front.lock`` (a context manager) and whether its
+    #: ``front-revoked`` marker names the lease. The defaults reach the reaper's primitive only when called.
+    front_lock: Callable[[Ctx, SlotId], ContextManager[None]] = front_lock_default
+    front_revoked: Callable[[Ctx, R.Alloc], bool] = front_revoked_default
     proc_identity: Callable[[int], Optional[Tuple[int, int]]] = proc_identity
     kill: Callable[[int], None] = PR.kill_and_reap
     var_folders: Callable[[int, int], str] = darwin_user_dir
@@ -1501,14 +1531,22 @@ def front_launch(run: RenderRun) -> Tuple[Tuple[str, ...], bytes]:
 
 
 def render_step4_front(run: RenderRun) -> None:
-    """(4) egress only: the front DETACHED, blocked reading the GO pipe; its ``pid`` + ``start`` into alloc, fsync."""
+    """(4) egress only: the front DETACHED, blocked reading the GO pipe; its ``pid`` + ``start`` into alloc, fsync.
+
+    The spawn is the revoker's interlock: the slot's ``front.lock`` taken (render holds no pool or slot lock, so the
+    order pool -> slot -> front holds), the ``front-revoked`` marker read under it, and a marker naming this lease
+    refuses ``front-revoked`` with nothing spawned; the lock is released once the spawn returns, and nothing else is
+    taken while it is held."""
     if not run.egress:
         return
     seams = run.ctx.seams
     argv, spec_json = front_launch(run)
     go_r, go_w = os.pipe()
     try:
-        run.front_pid = seams.spawn_front(argv, spec_json, go_r)
+        with seams.front_lock(run.ctx, run.alloc.slot):
+            if seams.front_revoked(run.ctx, run.alloc):
+                raise Refused("front-revoked", f"{run.alloc.slot.tag} lease {run.alloc.lease_seq}")
+            run.front_pid = seams.spawn_front(argv, spec_json, go_r)
         run.go_w = go_w
     except BaseException:
         os.close(go_w)
