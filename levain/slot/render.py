@@ -536,6 +536,8 @@ def profile_lines(facts: WallFacts) -> list[str]:
     alphabet is refused: an omission here would leave ``(allow default)`` holding the operation."""
     if not facts.network or not facts.writable or not all(facts.writable):
         raise Refused("internal", "wall facts: no network rule or an empty writable group")
+    if any(ch in facts.label for ch in "\n\r\x00"):     # the label is a comment line: a break would start a rule
+        raise Refused("internal", "wall facts: a line break or NUL in the label")
     lines = ["(version 1)", f";; {facts.label}", "(allow default)"]
     if facts.read_denied:
         lines.append("(deny file-read* " + " ".join(f"(subpath {_q(p)})" for p in facts.read_denied) + ")")

@@ -154,9 +154,9 @@ def export_principal(host: str, role: str, ids: Mapping[str, int], shared: Mappi
     ``levain-verify`` (no class). Never ``levain-slots``, never the other role's group.
 
     Refused ``export-account-missing`` when the account has no uid in ``ids``; ``export-account-bad`` when its
-    uid is not an int in §1.1's singleton range (a slot-range uid among them), equals the other role's uid, or
-    its group's gid is missing, outside the shared range or shared with ``levain-slots`` or another export
-    group."""
+    uid is not an int in §1.1's singleton range (a slot-range uid among them) or is any other account's in
+    ``ids``, or its group's gid is missing, outside the shared range, the account's own uid or any other group's
+    in ``shared``."""
     from levain.slot.ids import RANGES
 
     if host not in RANGES:
@@ -170,15 +170,17 @@ def export_principal(host: str, role: str, ids: Mapping[str, int], shared: Mappi
     r = RANGES[host]
     if not _is_int(uid) or uid in r.slots or uid not in r.singletons:
         raise Refused("export-account-bad", f"{name}: uid {uid!r} is not in the §1.1 singleton range")
-    other = EXPORT_ACCOUNT["verifier" if role == "importer" else "importer"]
-    if ids.get(other) == uid:
-        raise Refused("export-account-bad", f"{name}: uid {uid} is {other}'s")
+    # Every other account in the map, the other export role and every other singleton among them: sharing a uid
+    # would run this target as that service.
+    owner = next((n for n, v in ids.items() if n != name and v == uid), None)
+    if owner is not None:
+        raise Refused("export-account-bad", f"{name}: uid {uid} is {owner}'s")
     grp = EXPORT_GROUPS[(role, export_class)]
     sg = shared.get(grp)
     if not _is_int(sg) or sg not in r.shared:
         raise Refused("export-account-bad", f"{grp}: gid {sg!r} is not in the §1.1 shared range")
-    others = {g for g in set(EXPORT_GROUPS.values()) | {"levain-slots", "levain-gwfronts"} if g != grp}
-    if any(shared.get(g) == sg for g in others):
+    # Every other group in the map (a privileged one included), and the account's own group (gid == uid).
+    if sg == uid or any(g != grp and v == sg for g, v in shared.items()):
         raise Refused("export-account-bad", f"{grp}: gid {sg} is another group's")
     return Principal(name, uid, uid, (uid, sg))
 
@@ -536,8 +538,9 @@ EXPORT_MACH_ALLOW = ("com.apple.system.opendirectoryd.libinfo",)
 #: s5 §5b: ``--cap-drop ALL`` with only the two capabilities the stage spends on its drop added back. The stage
 #: runs as root inside bwrap and calls ``setgroups`` / ``setgid`` / ``setuid``; with no capability at all each
 #: fails EPERM and nothing starts [reasoned from bwrap's privileged path; not run on Linux, a 5g row].
-#: ``drop_and_assert`` then proves the permitted, effective and ambient sets empty, and ``no_new_privs`` keeps a
-#: setuid program from using the bounding set left behind.
+#: ``drop_and_assert`` clears the inheritable set bwrap fills with them, then proves the permitted, effective,
+#: ambient and inheritable sets empty, and ``no_new_privs`` keeps a setuid program from using the bounding set
+#: left behind.
 EXPORT_CAPS = ("CAP_SETGID", "CAP_SETUID")
 #: s5 §5b: ``RLIMIT_NPROC`` for an export target (its principal owns no other process).
 EXPORT_NPROC = 64
@@ -574,6 +577,17 @@ def export_wall_facts(host: str, role: str) -> WallFacts:
                      host_dev=False, **common)
 
 
+def _export_dir(host: str) -> PurePosixPath:
+    from levain.slot.layout import STORE
+
+    return PurePosixPath(str(STORE[host])) / "export"
+
+
+def _export_profile(role: str) -> str:
+    """macOS: the export role's profile, ``L/export/<role>.sb``."""
+    return str(_export_dir("darwin") / f"{role}.sb")
+
+
 def export_launch_spec(host: str, role: str, *, ids: Mapping[str, int], shared: Mapping[str, int],
                        args: Sequence[str] = (), export_class: Optional[str] = None) -> Spec:
     """The stage's spec for an export target (s5 §5b; build note [r6: I codex MED launch]): the same
@@ -582,7 +596,7 @@ def export_launch_spec(host: str, role: str, *, ids: Mapping[str, int], shared: 
     then ``args``, root's fixed arguments (at most :data:`_FRONT_ARGS` strings of at most 4 KiB, no NUL); cwd and
     the kept fd are the role's :func:`export_wall_facts`; ``RLIMIT_NPROC`` :data:`EXPORT_NPROC`; no env file and
     no extra env (the stage execs it with an empty env); macOS the profile ``L/export/<role>.sb``."""
-    from levain.slot.layout import HELPER_DIR, STORE
+    from levain.slot.layout import HELPER_DIR
 
     if host not in ("darwin", "linux"):
         raise Refused("unsupported-host", repr(host))
@@ -596,7 +610,7 @@ def export_launch_spec(host: str, role: str, *, ids: Mapping[str, int], shared: 
             for a in args):
         raise Refused("spec-malformed", f"an export target's fixed argv: <= {_FRONT_ARGS} strings of <= 4 KiB")
     argv = (str(PurePosixPath(str(HELPER_DIR[host])) / EXPORT_ENTRY[role]),) + args
-    profile = str(PurePosixPath(str(STORE[host])) / "export" / f"{role}.sb") if host == "darwin" else None
+    profile = _export_profile(role) if host == "darwin" else None
     spec = Spec(role, who.uid, who.gid, who.groups, EXPORT_NPROC, None, (), profile, facts.chdir, argv, False,
                 facts.keep_fds)
     _check_spec(spec)
@@ -625,6 +639,12 @@ def macos_launch_argv(spec: Spec, *, spec_fd: int = SPEC_FD) -> Tuple[str, ...]:
         return stage_argv("darwin", spec_fd)
     if spec.profile is None:
         raise Refused("spec-malformed", f"a macOS {spec.target} runs under its profile")
+    export_dir = _export_dir("darwin")
+    if spec.target in EXPORT_TARGETS:
+        if spec.profile != _export_profile(spec.target):
+            raise Refused("spec-malformed", f"the {spec.target} runs only under its own export profile")
+    elif export_dir in PurePosixPath(spec.profile).parents:
+        raise Refused("spec-malformed", f"a slot {spec.target} under an export profile")
     return (LAUNCHCTL, "asuser", str(spec.uid)) + stage_argv("darwin", spec_fd)
 
 
@@ -828,6 +848,8 @@ def linux_launch_argv(spec: Spec, *, slot, session: str, kind: str, queue_grant:
     from levain.slot.bwrap import LEVAIN_BWRAP
 
     _check_spec(spec)
+    if spec.target in EXPORT_TARGETS:      # never nsenter, the host /dev or a slot cgroup for an export target
+        raise Refused("spec-malformed", f"{spec.target} is an export target: export_linux_launch_argv launches it")
     if spec.profile is not None:
         raise Refused("spec-malformed", "Linux runs no Seatbelt profile")
     if spec.target == "front":
@@ -1189,6 +1211,32 @@ def _linux_prctl(option: int, arg: int) -> int:
     return r
 
 
+def _linux_clear_inheritable() -> None:
+    """``capget`` then ``capset`` with the inheritable set zeroed, permitted and effective as they were. Lowering
+    the inheritable set needs no capability; the kernel then drops any ambient bit no longer inheritable
+    [capabilities(7) and the kernel's capset rules; not run on Linux, a 5g row]."""
+    import ctypes
+
+    class Header(ctypes.Structure):
+        _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+    class Data(ctypes.Structure):
+        _fields_ = [("effective", ctypes.c_uint32), ("permitted", ctypes.c_uint32),
+                    ("inheritable", ctypes.c_uint32)]
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    hdr, data = Header(_LINUX_CAPABILITY_VERSION_3, 0), (Data * 2)()
+    if libc.capget(ctypes.byref(hdr), data) < 0:
+        raise OSError(ctypes.get_errno(), "capget")
+    for d in data:
+        d.inheritable = 0
+    if libc.capset(ctypes.byref(hdr), data) < 0:
+        raise OSError(ctypes.get_errno(), "capset")
+
+
+_LINUX_CAPABILITY_VERSION_3 = 0x20080522    # <linux/capability.h>: two 32-bit words per set
+
+
 def _linux_set_nnp() -> None:
     _linux_prctl(_PR_SET_NO_NEW_PRIVS, 1)
 
@@ -1219,6 +1267,7 @@ class OsCalls:
     getresuid: Optional[Callable] = None
     getresgid: Optional[Callable] = None
     capabilities: Optional[Callable] = None
+    clear_inheritable: Optional[Callable] = None
     set_nnp: Optional[Callable] = None
     get_nnp: Optional[Callable] = None
     maxprocperuid: Optional[Callable] = None
@@ -1244,6 +1293,7 @@ def real_os_calls() -> OsCalls:
         c.maxprocperuid = _darwin_maxprocperuid
     elif sys.platform.startswith("linux"):
         c.getresuid, c.getresgid, c.capabilities = os.getresuid, os.getresgid, _linux_caps
+        c.clear_inheritable = _linux_clear_inheritable
         c.set_nnp, c.get_nnp = _linux_set_nnp, _linux_get_nnp
     return c
 
@@ -1283,10 +1333,10 @@ def _nproc_target(nproc: int, c: OsCalls) -> int:
 
 
 def drop_and_assert(uid: int, gid: int, groups: Iterable[int], *, nproc: Optional[int] = NPROC,
-                    os_calls: Optional[OsCalls] = None) -> None:
+                    os_calls: Optional[OsCalls] = None, clear_inheritable: bool = False) -> None:
     """In the child, before its exec (§8.2, plan §2e 1 + §2f 8): ``setgroups`` -> ``setgid`` -> ``setuid``, each
     checked; then ASSERT real and effective uid and gid are the target's (and, on Linux, the saved ids, and
-    no capability left), the supplementary groups are EXACTLY ``groups``, the uid is not 0; PROVE
+    no permitted, effective or ambient capability left), the supplementary groups are EXACTLY ``groups``, the uid is not 0; PROVE
     ``seteuid(0)`` and ``setegid(0)`` fail (EPERM); then ``RLIMIT_NPROC`` (``None``: not set, the front).
     Raises :class:`Refused` at the first step that is not proven; the caller then exits without exec.
 
@@ -1295,13 +1345,23 @@ def drop_and_assert(uid: int, gid: int, groups: Iterable[int], *, nproc: Optiona
     (s1-1d D12, R-L2 control B). An explicit set is what R-L1's view runs used (``setpriv --groups``), and on
     macOS ``setgroups`` also opts the credential out of the directory service's dynamic membership, so the
     kernel list is the whole truth the assertion reads [not run: XNU's documented setgroups semantics; a 2g
-    row reads ``id`` and a group-only file as the dropped slot]."""
+    row reads ``id`` and a group-only file as the dropped slot].
+
+    ``clear_inheritable`` (an export target, s5 §5b): bwrap run by root with ``--cap-add`` sets the inheritable
+    set to the added caps as well as permitted and effective, and ``setuid`` away from 0 clears only permitted,
+    effective and ambient [read in bubblewrap's ``drop_all_caps``; not run, a 5g row]; so on Linux the
+    inheritable set is cleared first and asserted empty after the drop. A slot target is not asked to: its bwrap
+    runs with no ``--cap-*``, so the stage keeps whatever its root parent held, as before.
+    The bounding set keeps the added caps: lowering it needs ``CAP_SETPCAP``, which the stage was never given,
+    and ``no_new_privs`` is the guard that keeps an exec from using it."""
     c = os_calls or real_os_calls()
     groups = tuple(groups)
     if not (_is_int(uid) and _is_int(gid)) or uid == 0 or gid == 0 or 0 in groups:
         raise Refused("drop-to-root", f"uid {uid!r} gid {gid!r} groups {list(groups)!r}")
     if gid not in groups or len(set(groups)) != len(groups):
         raise Refused("drop-assert", f"groups {list(groups)!r} must hold gid {gid} once")
+    if clear_inheritable and c.clear_inheritable is not None:
+        _do("capset", c.clear_inheritable)
     _do("setgroups", c.setgroups, list(groups))
     _do("setgid", c.setgid, gid)
     _do("setuid", c.setuid, uid)
@@ -1317,7 +1377,7 @@ def drop_and_assert(uid: int, gid: int, groups: Iterable[int], *, nproc: Optiona
         raise Refused("drop-assert", f"groups {sorted(have)}, want exactly {sorted(groups)}")
     if c.capabilities is not None:
         caps = c.capabilities()
-        if any(caps.get(k, 1) for k in ("CapPrm", "CapEff", "CapAmb")):
+        if any(caps.get(k, 1) for k in ("CapPrm", "CapEff", "CapAmb") + (("CapInh",) if clear_inheritable else ())):
             raise Refused("drop-assert", f"capabilities left after the drop: {caps}")
     _proved_fail("seteuid", c.seteuid)
     _proved_fail("setegid", c.setegid)
@@ -1401,7 +1461,8 @@ def stage_main(spec_fd: int = SPEC_FD, os_calls: Optional[OsCalls] = None, *, er
     spec = None
     try:
         spec = parse_spec(c.read_fd(spec_fd, SPEC_CAP))
-        drop_and_assert(spec.uid, spec.gid, spec.groups, nproc=spec.nproc, os_calls=c)
+        drop_and_assert(spec.uid, spec.gid, spec.groups, nproc=spec.nproc, os_calls=c,
+                        clear_inheritable=spec.target in EXPORT_TARGETS)
         set_no_new_privs(c)
         env = parse_env(c.read_file(spec.env_file, ENV_CAP)) if spec.env_file else {}
         for k, v in spec.extra_env:
