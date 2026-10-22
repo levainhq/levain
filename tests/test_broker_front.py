@@ -216,7 +216,10 @@ _HARNESS_A = {"format": "levain-front-session/1", "kind": "interactive", "sessio
 _HARNESS_B = {"format": "levain-front-session/1", "kind": "interactive", "session": "s-fixture-brokered", "routes": [
     {"route": "egress-fixture", "type": "egress", "hosts": ["allowed.example", "github.com"]},
     {"route": "anthropic", "type": "brokered", "hosts": ["api.anthropic.com"],
-     "upstream": {"scheme": "https", "host": "api.anthropic.com", "base_path": "/"}}]}
+     "upstream": {"scheme": "https", "host": "api.anthropic.com", "base_path": ""},
+     "requests": {"templates": [{"method": "POST", "path": "/v1/messages?*"}], "headers": {},
+                  "body_cap": 1048576, "body_codec": "anthropic-messages"},
+     "max_call_microdollars": 2000000}]}
 _POL = {"A": load_policy(json.dumps(_HARNESS_A).encode()), "B": load_policy(json.dumps(_HARNESS_B).encode())}
 
 
@@ -286,3 +289,36 @@ PURE_ROWS = [
 @pytest.mark.parametrize("fn,arg,want", PURE_ROWS, ids=[f"{r[0]}-{i}" for i, r in enumerate(PURE_ROWS)])
 def test_pure_function_rows(fn, arg, want):
     assert _call(fn, arg) == want
+
+
+# --- the R15 gate script, under the root interpreter ----------------------------------------------------------------
+
+_ROOT_PYTHON = "/usr/bin/python3"
+
+
+def test_refusal_survives_streaming_body_gates(tmp_path):
+    """Reproduced (3b-1a, probe (b)'s write-then-read shape, the script's case R): a front whose keys reader starts
+    only after its body writer failed answers 503, never the 401 keys sent. The gate script proves the parked reader
+    keeps the F under both gates; it runs as the root interpreter runs the gateway, isolated, from a launcher."""
+    import shutil
+    import subprocess
+    import sys
+
+    import h11
+
+    if not os.path.exists(_ROOT_PYTHON):
+        pytest.skip(f"no {_ROOT_PYTHON} on this host")
+    h11_tree = tmp_path / "h11-only"
+    shutil.copytree(Path(h11.__file__).parent, h11_tree / "h11", ignore=shutil.ignore_patterns("__pycache__"))
+    here = Path(__file__).resolve().parent
+    trees = [here, here.parent, h11_tree]
+    launcher = tmp_path / "gate_launcher.py"
+    launcher.write_text("import sys\n" + "".join(f"sys.path.insert(0, {str(t)!r})\n" for t in trees)
+                        + "import runpy\nrunpy.run_module('broker_gate_script', run_name='__main__', alter_sys=True)\n")
+    probe = subprocess.run([_ROOT_PYTHON, "-IS", "-c", "import sys; print(sys.version_info >= (3, 9))"],
+                           capture_output=True, text=True, timeout=30)
+    if probe.stdout.strip() != "True":
+        pytest.skip(f"{_ROOT_PYTHON} is older than the gateway's 3.9 floor")
+    out = subprocess.run([_ROOT_PYTHON, "-IS", str(launcher)], capture_output=True, text=True, timeout=120)
+    sys.stdout.write(out.stdout + out.stderr)
+    assert out.returncode == 0 and out.stdout.strip().endswith("GATE PASS"), out.stdout + out.stderr
