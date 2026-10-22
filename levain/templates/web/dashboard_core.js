@@ -96,6 +96,8 @@
   let cancelPending = null;
   // Answer an agent's question (Q-2b, the manifest source only): `answerQuestion(rowId, {option}|{text}) → Promise<{ok}|{ok:false,...}>`.
   let answerQuestion = null;
+  // Dismiss an agent's note (the manifest source only): `dismissNote(rowId) → Promise<{ok}|{ok:false,...}>`. It tells the agent nothing.
+  let dismissNote = null;
   let pollJob = null;
   // The episode-search READ transport (GET /recall.json), injected by the boot layer so the core
   // stays token-agnostic — the boot layer attaches the off-box token (spore-220 gates /recall.json
@@ -256,6 +258,7 @@
     commitJob = opts && typeof opts.commitJob === "function" ? opts.commitJob : null;
     cancelPending = opts && typeof opts.cancelPending === "function" ? opts.cancelPending : null;
     answerQuestion = opts && typeof opts.answerQuestion === "function" ? opts.answerQuestion : null;
+    dismissNote = opts && typeof opts.dismissNote === "function" ? opts.dismissNote : null;
     pollJob = opts && typeof opts.pollJob === "function" ? opts.pollJob : null;
     onJobsIdle = opts && typeof opts.onJobsIdle === "function" ? opts.onJobsIdle : null;
     recall = opts && typeof opts.recall === "function" ? opts.recall : null;
@@ -581,6 +584,8 @@
     hero.hidden = brief.hidden = widgets.hidden = !on;
     const needsHost = document.getElementById("ck-needs");
     if (needsHost && !on) clearNeeds(needsHost);   // the strip is drawn only by the KE page, and only while something waits (renderNeeds)
+    const notesHost = document.getElementById("ck-notes");
+    if (notesHost && !on) { clearNeeds(notesHost); noteBodies.clear(); }   // and the notes strip, likewise (renderNotes)
     // the hero's legend follows the hero: shown by the sky's own render, hidden with the region
     const band = document.getElementById("ck-legend");
     if (band) band.hidden = true;
@@ -1543,6 +1548,7 @@
     guardRegion("the hero", () => renderHero(view, byId), regionErr("ck-hero", false), restoreHero);
     guardRegion("the brief", () => renderBriefRegion(view, byId), regionErr("ck-brief", true), restoreState);
     guardRegion("the needs strip", () => renderNeeds(view), regionErr("ck-needs", true));
+    guardRegion("the notes strip", () => renderNotes(view), regionErr("ck-notes", true));
     guardRegion("the widgets", () => renderWidgets(view, byId), regionErr("ck-widgets", true));
     // a zone builds its section off to the side and attaches it last, so a throw leaves nothing half-drawn behind
     for (const zone of view.ke.zones) guardRegion(zone.title, () => renderZone(zone, view, byId, board), (node) => board.appendChild(node));
@@ -4283,6 +4289,130 @@
     return row;
   }
 
+  // An agent's note: something it tells the operator that needs no answer (Phill 10-22). The row carries who filed it, when and
+  // whether it was dismissed; the words are the agent's, fetched from /cockpit/note/<n>.json with the page's token (the question
+  // body's gate). A note is drawn apart from everything that decides: no REC, no options, no words box, no "sign" line, no
+  // accent; its one control is "dismiss", which tells the agent nothing. Every string is drawn with textContent, never as HTML.
+  // keyed `n|state`; renderNotes keeps only the notes the current view lists, and the strip's clearing empties it
+  const noteBodies = new Map();
+  function pruneNoteBodies(lines) {
+    const listed = new Set();
+    for (const ln of lines) if (ln && ln.note) listed.add(ln.note.n + "|" + ln.note.state);
+    for (const k of Array.from(noteBodies.keys())) if (!listed.has(k)) noteBodies.delete(k);
+  }
+  function noteFetch(n, headers, tryNo) {
+    return fetchBounded("/cockpit/note/" + encodeURIComponent(String(n.n)) + ".json", { cache: "no-store", headers: headers },
+      (res) => {
+        if (res.status === 403) return { error: CONSENT_BAD_TOKEN };
+        if (res.status === 404) return { error: "this note is no longer listed" };
+        if (res.status === 503 && tryNo < CONSENT_TRIES) {
+          return new Promise((r) => setTimeout(r, CONSENT_RETRY_MS)).then(() => noteFetch(n, headers, tryNo + 1));
+        }
+        if (!res.ok) return { error: "the note could not be read (HTTP " + res.status + ")" };
+        return res.json().then((b) => (b && typeof b === "object" ? b : { error: "the note could not be read" }),
+                               () => ({ error: "the note could not be read" }));
+      },
+      () => ({ error: "the note could not be read (network)" }));
+  }
+  function noteBody(n, node) {
+    const key = n.n + "|" + n.state;
+    if (noteBodies.has(key)) return noteBodies.get(key);
+    const t = window.LevainCockpitTransport;
+    const headers = t && typeof t.headers === "function" ? t.headers() : {};
+    if (!headers["X-Levain-Write-Token"]) return Promise.resolve({ error: CONSENT_NO_TOKEN, noToken: true });
+    const got = consentQueued(() => noteFetch(n, headers, 1), "the note could not be read", node)
+      .then((b) => { if (b.error && noteBodies.get(key) === got) noteBodies.delete(key); return b; });
+    noteBodies.set(key, got);
+    return got;
+  }
+  function drawNoteBody(n, slot, b) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
+    const parts = [el("div", "note-what", sv(b.what))];
+    if (sv(b.detail)) parts.push(el("div", "note-detail", sv(b.detail)));
+    const d = b.dismissed && typeof b.dismissed === "object" ? b.dismissed : null;
+    if (d) {
+      parts.push(el("div", "consent-note ext-meta", "dismissed via " + sv(d.channel)));
+    } else if (n.state === "open" && n.offered && dismissNote) {
+      const bar = el("div", "note-actions");
+      const btn = el("button", "note-dismiss", "dismiss");
+      btn.type = "button";
+      btn.title = "mark it read: the agent is told nothing";
+      const msg = el("span", "edit-msg", "");
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        let res;
+        try { res = await dismissNote(n.id); } catch (e) { res = { ok: false, message: "the dismiss could not be sent" }; }
+        if (res && res.ok) return;   // the board re-reads and the note leaves the strip
+        btn.disabled = false;
+        msg.textContent = (res && (res.message || res.error)) || "failed";
+      });
+      bar.append(btn, msg);
+      parts.push(bar);
+    }
+    slot.replaceChildren(...parts);
+  }
+  function noteRow(o) {
+    const n = o.note;
+    const row = el("div", "row note-row" + (n.state === "open" ? "" : " ext-dim"));
+    if (n.id) row.dataset.card = String(n.id);
+    const head = el("div", "consent-head");
+    head.appendChild(el("span", "note-chip", "note"));
+    head.appendChild(el("span", "consent-agent", "from " + (n.agent || "agent")));
+    if (n.age) head.appendChild(el("span", "ext-meta", "filed " + n.age));
+    if (n.state !== "open") head.appendChild(el("span", "ext-meta", "dismissed" + (n.decidedAge ? " " + n.decidedAge : "")));
+    row.appendChild(head);
+    const btn = el("button", "undo-btn consent-details", n.state === "open" ? "read" : "details");
+    btn.type = "button";
+    let slot = null;
+    btn.addEventListener("click", () => {
+      btn.disabled = true;
+      if (!slot) { slot = el("div", "consent-body ext-meta"); row.appendChild(slot); }
+      slot.replaceChildren(document.createTextNode("reading the note…"));
+      noteBody(n, row).then((b) => { drawNoteBody(n, slot, b); if (b.error) btn.disabled = false; else btn.remove(); });
+    });
+    head.appendChild(btn);
+    return row;
+  }
+  function noteCard(n) {
+    const card = el("article", "note-card");
+    card.dataset.noteId = String(n.id || "") + "|" + n.offered;   // a card is kept only while what it offers is the same
+    const head = el("div", "note-head");
+    head.append(el("span", "note-chip", "note"), el("span", "note-from", "from " + (n.agent || "agent")));
+    if (n.age) head.appendChild(el("span", "ext-meta", n.age));
+    const slot = el("div", "note-body", "reading the note…");
+    card.append(head, slot);
+    noteBody(n, card).then((b) => drawNoteBody(n, slot, b));
+    return card;
+  }
+  // The Notes strip, under Needs you: the open notes, oldest first, as their own cards. Not part of the Needs-you grid, bar or
+  // count: a note waits on nothing and authorises nothing. Absent when there is none.
+  function renderNotes(view) {
+    const host = document.getElementById("ck-notes");
+    if (!host) return;
+    const lines = ((view.extra_panels || {}).decisions || {}).lines;
+    const all = Array.isArray(lines) ? lines : [];
+    const items = all.filter((ln) => ln && ln.note && ln.note.state === "open").map((ln) => ln.note);
+    if (!items.length) { clearNeeds(host); noteBodies.clear(); return; }
+    pruneNoteBodies(all);
+    // the cockpit lists a page of the open notes; `total` is how many are open in all, so the strip says what it left out
+    const total = Math.max(items.length, ...items.map((n) => n.total || 0));
+    const sig = items.map((n) => n.id + "|" + n.offered).join("\n") + "\n" + total;
+    if (host.dataset.sig === sig && !host.hidden) return;
+    const head = el("div", "notes-headline");
+    head.append(el("h3", null, "Notes"), el("span", "notes-count", String(total)),
+                el("span", "notes-gloss", "Agents telling you something. Nothing to answer: read it, then dismiss."));
+    if (total > items.length) head.appendChild(el("span", "notes-more ext-meta", (total - items.length) + " more not shown: the oldest are shown first"));
+    const kept = new Map();
+    const old = host.querySelector(".notes-grid");
+    if (old) for (const c of old.children) if (c.dataset && c.dataset.noteId) kept.set(c.dataset.noteId, c);
+    const grid = el("div", "notes-grid");
+    for (const n of items) grid.appendChild(kept.get(String(n.id) + "|" + n.offered) || noteCard(n));
+    host.replaceChildren(head, grid);
+    host.hidden = false;
+    host.dataset.sig = sig;
+  }
+
   // ---- The Needs-you strip (K4, F4 a / F11 a) ----
   // What waits on the operator, drawn as cards under the now band: each PENDING consent request and each OPEN question of the
   // Decisions panel, as the mock draws them: the open questions first (they block work and have no clock), then the requests on a
@@ -4852,6 +4982,7 @@
       }
       if (o.consent) { host.appendChild(consentRow(o)); continue; }
       if (o.question) { host.appendChild(questionRow(o)); continue; }
+      if (o.note) { host.appendChild(noteRow(o)); continue; }
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
       if (o.wrapMeta) row.classList.add("meta-wrap");   // a row whose meta line IS its content (the sessions' chips): it wraps, never ellipsises
       if (typeof o.key === "string" && o.key) row.dataset.keepKey = o.key;   // the id an expanded row is found by after a repaint
@@ -5376,7 +5507,10 @@
     for (const k of Object.keys(rows)) if (rows[k].panel_id === pid) delete rows[k];
     for (const k of Object.keys(fresh.targets.rows)) if (fresh.targets.rows[k].panel_id === pid) rows[k] = fresh.targets.rows[k];
     if (fresh.targets.panels[pid]) currentView.targets.panels[pid] = fresh.targets.panels[pid]; else delete currentView.targets.panels[pid];
-    if (pid === "decisions") { try { renderNeeds(currentView); } catch (e) { /* the strip keeps what it showed */ } }
+    if (pid === "decisions") {
+      try { renderNeeds(currentView); } catch (e) { /* the strip keeps what it showed */ }
+      try { renderNotes(currentView); } catch (e) { /* the notes strip keeps what it showed */ }
+    }
   }
   // A reload (the tab coming back, the refresh button, a stream reload) re-renders the whole board: emptying it
   // clamps the page's scroll to the top, so the reader's place is put back once the board is drawn again.
@@ -5391,5 +5525,5 @@
 
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
-  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
+  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();

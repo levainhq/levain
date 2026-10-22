@@ -383,10 +383,10 @@ def test_a_verb_without_applies_to_is_never_offered_or_fired_on_a_question_row(m
     answer = V.VerbSpec("question_answer", "answer", "e", "row", fields=("option", "text"), floor="C1",
                         tier_fn=lambda *a: "C1", applies_to=lambda r: True)
     monkeypatch.setattr(V, "offered", lambda *a, **k: [probe, answer])
-    qrow = {"id": "question:3", "version": "v", "facets": {"question_state": "open"}, "title": "t"}
+    qrow = {"id": "question:3", "version": "v", "facets": {"question_n": 3, "question_state": "open"}, "title": "t"}
     other = {"id": "np:1", "version": "v", "facets": {}, "title": "t"}
     got = V.row_actions(None, None, "decisions", qrow, "token", "local", date(2026, 10, 18), policy=genesis_policy())
     assert [a["verb"] for a in got] == ["question_answer"]
     got = V.row_actions(None, None, "decisions", other, "token", "local", date(2026, 10, 18), policy=genesis_policy())
     assert "probe" in [a["verb"] for a in got]
-    assert not V._applies_to_row(probe, qrow) and V._applies_to_row(probe, other)
+    assert not V._applies_to_row(probe, "decisions", qrow) and V._applies_to_row(probe, "decisions", other)

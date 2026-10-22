@@ -52,6 +52,7 @@ from levain.cockpit.registry import (
     CockpitRegistrationError,
     CONSENT_ROW_PREFIX,
     QUESTION_ROW_PREFIX,
+    NOTE_ROW_PREFIX,
     OUTCOME_ROW_PREFIX,
     PENDING_ROW_PREFIX,
     FacetValueError,
@@ -125,13 +126,18 @@ _STATUS_RANK = {"ok": 0, "empty": 0, "partial": 1, "stale": 2, "error": 3}
 
 DECISIONS_ID = "decisions"
 DECISION_ORDER = "decision.queue"
-KERNEL_DECISION_PREFIXES = (PENDING_ROW_PREFIX, OUTCOME_ROW_PREFIX, CONSENT_ROW_PREFIX, QUESTION_ROW_PREFIX)
+KERNEL_DECISION_PREFIXES = (PENDING_ROW_PREFIX, OUTCOME_ROW_PREFIX, CONSENT_ROW_PREFIX, QUESTION_ROW_PREFIX,
+                            NOTE_ROW_PREFIX)
+# the kernel's rows a panel verb is offered on through the ordinary row path (each verb's applies_to picks its own)
+_VERB_ROW_PREFIXES = (QUESTION_ROW_PREFIX, NOTE_ROW_PREFIX)
 KERNEL_DECISION_FACETS = frozenset({"principal", "pending_tier", "expires_at", "due", "at", "outcome", "verb",
                                     "reason", "unapplied", "cancelled_by",
                                     "agent", "tool", "consent_state", "consent_tier", "decided_at",
-                                    "question_n", "question_state", "question_options"})
+                                    "question_n", "question_state", "question_options", "note_n", "note_state",
+                                    "note_open_total"})
 QUESTION_VERB = "question_answer"       # the cockpit verb a question row offers (verbs.py registers it)
 QUESTION_DONE_HOURS = 24                # an answered question stays listed this long, as a decided request does
+NOTE_VERB = "note_dismiss"              # the cockpit verb a note row offers (verbs.py registers it)
 
 
 def _canon(obj: Any) -> bytes:
@@ -410,6 +416,7 @@ class _Decisions:
     rows: Callable[[datetime], Any] | None = None
     consent: Callable[[datetime], Any] | None = None
     questions: Any = None             # a ``levain.consent.questions.QuestionStore`` (Q-2b), read and answered at the source
+    notes: Any = None                 # a ``levain.consent.notes.NoteStore``, read and dismissed at the source
     spec: "ProviderSpec | None" = None
 
 
@@ -518,6 +525,38 @@ def _question_rows_in(store: Any, now: datetime) -> tuple[list[RowIn], int]:
     shown = {q.n: q for q in open_[:PENDING_CAP]}
     shown.update((q.n, q) for q in done)
     return [_question_row_in(q) for q in shown.values()], max(len(open_) - PENDING_CAP, 0)
+
+
+def _note_row_in(n: Any, open_total: int | None = None) -> RowIn:
+    """One note (``levain.consent.notes.Note``) as a row: ``note:<n>``, carrying who filed it, when, and whether it was
+    dismissed, and NOTHING the agent wrote (served to a token holder only: ``/cockpit/note/<n>.json``). Its version is
+    its number and its dismissed-ness, so a dismissal made elsewhere makes a stale row a 409. An open row of a listing
+    also carries ``note_open_total``, how many notes are open in all, so a surface that shows a page says how many
+    it left out (it is not versioned: the count moves with other notes, the row does not)."""
+    dismissed = n.dismissed is not None
+    agent = visible(n.agent)
+    facets: dict[str, Any] = {"agent": agent, "at": n.filed_at, "note_n": n.n,
+                              "note_state": "dismissed" if dismissed else "open"}
+    if dismissed:
+        facets["decided_at"] = n.dismissed.dismissed_at
+    elif open_total is not None:
+        facets["note_open_total"] = open_total
+    return RowIn(id=f"{NOTE_ROW_PREFIX}{n.n}", title=f"note from {agent} #{n.n}", facets=facets,
+                 stored={"n": n.n, "dismissed_at": n.dismissed.dismissed_at if dismissed else "open"})
+
+
+def _note_rows_in(store: Any, now: datetime) -> tuple[list[RowIn], int]:
+    """The open notes, and those dismissed in the last day, as rows (with the count of open ones past the cap). A
+    queue with no ``notes.db`` lists nothing and creates nothing."""
+    from levain.consent.listing import PENDING_CAP
+
+    open_, total = store.open_page(PENDING_CAP)      # never more than the page is read (NoteStore.open_page)
+    since = (now - timedelta(hours=QUESTION_DONE_HOURS)).astimezone(timezone.utc)
+    done = [n for n in store.recent(50) if n.dismissed is not None
+            and _parse_iso(n.dismissed.dismissed_at) >= since]
+    shown = {n.n: n for n in open_}
+    shown.update((n.n, n) for n in done)
+    return [_note_row_in(n, total) for n in shown.values()], max(total - len(open_), 0)
 
 
 class Cockpit:
@@ -644,6 +683,20 @@ class Cockpit:
             if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
                 self._install_decisions_locked()
 
+    def attach_note_rows(self, store: Any) -> None:
+        """The note store (``levain.consent.notes.NoteStore``): what agents told the operator, read at the source. Its
+        rows carry no words, and the panel offers ``note_dismiss`` on an open one. A read fault is a note on the
+        panel, never a dark one."""
+        with self._lock:
+            self._dec.notes = store
+            if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
+                self._install_decisions_locked()
+
+    @property
+    def note_store(self) -> Any:
+        """The store ``attach_note_rows`` was given (None before): ``note_dismiss`` writes through it."""
+        return self._dec.notes
+
     @property
     def question_store(self) -> Any:
         """The store ``attach_question_rows`` was given (None before one is attached): ``question_answer`` writes
@@ -669,14 +722,15 @@ class Cockpit:
             order=DECISION_ORDER, facets=KERNEL_DECISION_FACETS | (src.facets if src else frozenset()),
             version_fields=("*",),
             # what a decisions row shows: who asks and for which tool (the title) and its state word and tier
-            search_fields=tuple(dict.fromkeys((*((src.search_fields if src else ()) or ROW_SEARCH_DEFAULT["list"]), "consent_state", "consent_tier", "question_state"))),
+            search_fields=tuple(dict.fromkeys((*((src.search_fields if src else ()) or ROW_SEARCH_DEFAULT["list"]), "consent_state", "consent_tier", "question_state", "note_state"))),
             search_default_visible=src.search_default_visible if src else 10,
             read_one=lambda ctx, row_id: Fault("the decisions panel routes read_one by row id"),
             note=src.note if src else "", empty=src.empty if src else "Nothing is waiting on you.",
             rowset=src.rowset if src else None, edit_class=src.edit_class if src else "",
             # question_answer applies to a question row only (VerbSpec.applies_to), so a downstream row never gets it
             verbs=tuple(dict.fromkeys((*(src.verbs if src else ()),
-                                       *((QUESTION_VERB,) if self._dec.questions is not None else ())))),
+                                       *((QUESTION_VERB,) if self._dec.questions is not None else ()),
+                                       *((NOTE_VERB,) if self._dec.notes is not None else ())))),
             label_key=src.label_key if src else None)
         old = self._dec.spec
         if old is not None and self._specs.get(DECISIONS_ID) is old:
@@ -1191,7 +1245,7 @@ class Cockpit:
             skipped += out.skipped
             if mine:
                 skipped.append({"count": len(mine), "reason": "open row skipped: its id carries a broker "
-                                                               "prefix (pend:/out:/consent:/question:)"})
+                                                               "prefix (pend:/out:/consent:/question:/note:)"})
             filtered += out.filtered
             if out.note:
                 notes.append(out.note)
@@ -1241,6 +1295,18 @@ class Cockpit:
                 skipped += qs.skipped
             except Exception as exc:  # noqa: BLE001 - a question-store fault is a note, never a dark panel
                 notes.append(f"agent questions unavailable: {type(exc).__name__}: {_safe_str(exc)}")
+        if dec.notes is not None:
+            try:
+                built, left_out = _note_rows_in(dec.notes, ctx.now)
+                if left_out:
+                    overflowed = True
+                    notes.append(f"{left_out} more notes are waiting than are shown: the oldest are shown, the rest "
+                                 "are not read")
+                ns = self._read_snap(self._broker_dec_spec, Read(rows=tuple(built)), ctx, now_iso)
+                rows += ns.rows or []
+                skipped += ns.skipped
+            except Exception as exc:  # noqa: BLE001 - a note-store fault is a note on the panel, never a dark one
+                notes.append(f"agent notes unavailable: {type(exc).__name__}: {_safe_str(exc)}")
         rows = self._regroup(rows, ctx.today)
         status = "partial" if skipped or overflowed else ("empty" if not counted_rows(DECISION_ORDER, rows) else "ok")
         if stale and _STATUS_RANK["stale"] > _STATUS_RANK[status]:
@@ -1281,16 +1347,32 @@ class Cockpit:
         return Absent(f"decision {row_id!r} is gone")
 
     def _question_decision_one(self, ctx: ReadContext, row_id: str) -> Result:
+        from levain.consent.questions import QuestionStoreError
+
         store = self._dec.questions
         if store is None:
             return Absent("no question store")
         try:
             q = store.get(row_id[len(QUESTION_ROW_PREFIX):])     # also reads `#3` or `q-…`: only the canonical id is the row
-        except (OSError, sqlite3.Error) as exc:
+        except (QuestionStoreError, OSError, sqlite3.Error) as exc:
             return Fault(f"agent questions unavailable: {type(exc).__name__}: {_safe_str(exc)}")
         if q is None or row_id != f"{QUESTION_ROW_PREFIX}{q.n}":
             return Absent(f"decision {row_id!r} is gone")
         return Read(rows=(_question_row_in(q),))
+
+    def _note_decision_one(self, ctx: ReadContext, row_id: str) -> Result:
+        from levain.consent.notes import NoteStoreError
+
+        store = self._dec.notes
+        if store is None:
+            return Absent("no note store")
+        try:
+            n = store.get(row_id[len(NOTE_ROW_PREFIX):])
+        except (NoteStoreError, OSError, sqlite3.Error) as exc:
+            return Fault(f"agent notes unavailable: {type(exc).__name__}: {_safe_str(exc)}")
+        if n is None or row_id != f"{NOTE_ROW_PREFIX}{n.n}":
+            return Absent(f"decision {row_id!r} is gone")
+        return Read(rows=(_note_row_in(n),))
 
     def _book(self, spec: ProviderSpec, st: _State, out: Any, ctx: ReadContext) -> _Snap:
         """The owner's bookkeeping for one outcome: failure start, last good, presence. It reads only
@@ -2224,9 +2306,9 @@ class Cockpit:
         for r in rows:
             pid = r.get("panel_id") or panel_id
             if (self._is_composed(pid) and str(r["id"]).startswith(KERNEL_DECISION_PREFIXES)
-                    and not str(r["id"]).startswith(QUESTION_ROW_PREFIX)):
-                # a broker row offers no panel verb; a pending offers its own cancel (§3). A question row is the
-                # exception: it offers question_answer through the ordinary row path (applies_to: an open one)
+                    and not str(r["id"]).startswith(_VERB_ROW_PREFIXES)):
+                # a broker row offers no panel verb; a pending offers its own cancel (§3). A question or note row is
+                # the exception: it offers question_answer / note_dismiss through the ordinary row path (applies_to)
                 acts = (self._verb_view.pending_actions(r, cred, auth=auth)
                         if str(r["id"]).startswith(PENDING_ROW_PREFIX) else [])
             else:
@@ -2248,6 +2330,7 @@ class Cockpit:
                 spec = self._broker_dec_spec
                 reader = (self._consent_decision_one if row_id.startswith(CONSENT_ROW_PREFIX)
                           else self._question_decision_one if row_id.startswith(QUESTION_ROW_PREFIX)
+                          else self._note_decision_one if row_id.startswith(NOTE_ROW_PREFIX)
                           else self._broker_decision_one)
             else:
                 src = self._dec.source

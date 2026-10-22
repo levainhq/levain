@@ -113,6 +113,10 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "question_n": ("int", _is_int),
     "question_state": ("enum", _enum("open", "answered")),
     "question_options": ("int", _is_int),
+    # an agent's note (levain.consent.notes): its number and whether it was dismissed; its words are never a facet
+    "note_n": ("int", _is_int),
+    "note_state": ("enum", _enum("open", "dismissed")),
+    "note_open_total": ("int", _is_int),   # how many notes are open in all (a listing shows a page of them)
     "session_view": ("object", lambda v: isinstance(v, dict)),   # K7: what the Build tab's session row draws (the provider's own measures, no full cwd)
     "session_activity": ("enum", _enum("active", "quiet")),   # Q7a: how recently a session's hook last fired (the provider's measure)
 }
@@ -270,9 +274,12 @@ PENDING_ROW_PREFIX = "pend:"
 OUTCOME_ROW_PREFIX = "out:"
 CONSENT_ROW_PREFIX = "consent:"      # an external agent's consent request (Q6a): the kernel's, like the two above
 QUESTION_ROW_PREFIX = "question:"    # an agent's question to the operator (Q-2b): the kernel's too
+NOTE_ROW_PREFIX = "note:"            # an agent's note to the operator (no answer, dismissed): the kernel's too
 
 
 def _queue_group(row: RowIn, today: date) -> str:
+    if row.id.startswith(NOTE_ROW_PREFIX):
+        return "notes" if row.facets.get("note_state") == "open" else "resolved"
     if row.id.startswith(QUESTION_ROW_PREFIX):
         return "needs_input" if row.facets.get("question_state") == "open" else "resolved"
     if row.id.startswith(CONSENT_ROW_PREFIX):
@@ -291,9 +298,11 @@ def _queue_key(row: RowIn, today: date) -> tuple:
         if row.id.startswith(QUESTION_ROW_PREFIX):     # a question never expires: after the requests, oldest first
             return (0, 1, str(row.facets.get("at") or ""), row.id)
         return (0, 0, str(row.facets.get("expires_at") or ""), row.id)
+    if _queue_group(row, today) == "notes":            # an open note: oldest first
+        return (0, str(row.facets.get("at") or ""), row.id)
     if _queue_group(row, today) in ("open", "waiting"):
         return _decision_key(row, today)
-    if row.id.startswith((CONSENT_ROW_PREFIX, QUESTION_ROW_PREFIX)):   # a decided consent or answered question row: newest decision first (`at` is the filing)
+    if row.id.startswith((CONSENT_ROW_PREFIX, QUESTION_ROW_PREFIX, NOTE_ROW_PREFIX)):   # a decided consent, answered question or dismissed note: newest first (`at` is the filing)
         at = str(row.facets.get("decided_at") or row.facets.get("at") or "")
         return (0 if at else 1, tuple(-ord(c) for c in at), row.id)
     return _time_desc_key(row, today)
@@ -349,9 +358,10 @@ register_ordering(Ordering("decision.dated", _decision_key), builtin=True)
 register_ordering(
     Ordering(
         "decision.queue", _queue_key, _queue_group,
-        (("needs_input", "Agents waiting on you"), ("open", "Waiting on you"), ("waiting", "Waiting on a signature"), ("resolved", "Resolved"),
-         ("outcomes", "Outcomes")),
-        uncounted=frozenset({"resolved", "outcomes"}),
+        (("needs_input", "Agents waiting on you"), ("open", "Waiting on you"), ("waiting", "Waiting on a signature"),
+         ("notes", "Notes for you"), ("resolved", "Resolved"), ("outcomes", "Outcomes")),
+        # a note waits on nothing: it never counts as a decision waiting on him
+        uncounted=frozenset({"notes", "resolved", "outcomes"}),
     ),
     builtin=True,
 )

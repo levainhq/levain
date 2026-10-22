@@ -140,6 +140,9 @@ _CONSENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")
 # none of them and this route serves them behind EXACTLY the consent body's gate (a surface token on every bind).
 _QUESTION_BODY_PREFIX = "/cockpit/question/"
 _QUESTION_ID = re.compile(r"[1-9][0-9]{0,11}")
+# One agent note's body: GET /cockpit/note/<n>.json. Its words are the agent's, so the row carries none of them and this
+# route serves them behind the question body's gate exactly (a surface token on every bind).
+_NOTE_BODY_PREFIX = "/cockpit/note/"
 PROPOSALS_ID = "proposals"      # GET /cockpit/consent/proposals.json: the standing-rule proposals, same token gate
 GRANTS_ID = "grants"            # GET /cockpit/consent/grants.json: the standing grants and revoke lines, same gate
 # One agent session's transcript (Q8): GET /cockpit/session/<stem>.json. It names the session id and full cwd and
@@ -246,6 +249,14 @@ _READ_WAIT_SECONDS = 5.0
 _MAX_READ_WAITERS = 64
 
 _log = logging.getLogger(__name__)
+
+
+def _store_fault(what: str, exc: BaseException) -> dict[str, str]:
+    """The 500 body of an agent-text route whose store could not be read: the exception's type only. Its message is
+    logged, never sent: a store error names the store's absolute path."""
+    _log.warning("cockpit: a %s body could not be read: %s: %s", what, type(exc).__name__, exc)
+    return {"error": "internal", "message": f"the {what} store could not be read ({type(exc).__name__})"}
+
 
 # The write token header. spore-129 introduced it for an off-loopback writable bind; since K2a
 # (design §4.3) every write carries a surface token in it on EVERY bind, loopback included,
@@ -673,6 +684,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # Q-2b: the question band's store over the same queue directory, shared by the decisions panel, the body route
     # and the answer verb; a queue with no questions.db lists none and creates none
     question_store: Any
+    note_store: Any       # notes over the same queue directory: the panel's rows, the body route and note_dismiss
     verb_registry: VerbRegistry
     # Downstream-registered READ-ONLY routes (the FleetView extension point). Both
     # default to empty so the base product carries nothing extra. extra_assets are
@@ -742,6 +754,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                 built.attach_consent_rows(self.consent_reader)    # agents waiting on the operator (Q6a)
                 if getattr(self, "question_store", None) is not None:
                     built.attach_question_rows(self.question_store)   # and the questions they ask him (Q-2b)
+                if getattr(self, "note_store", None) is not None:
+                    built.attach_note_rows(self.note_store)           # and what they tell him (notes)
                 if self.extra_panels is not None:
                     # one callable call per refresh feeds the discovery and every adapted panel (design §6.2)
                     self.external_panels = ExternalPanels(self.extra_panels)
@@ -937,7 +951,38 @@ class _Handler(GuardedHandler):
                         "answer": None if a is None else {"kind": a.kind, "value": a.value, "channel": a.channel,
                                                           "answered_at": a.answered_at}}
             except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
-                status, payload = 500, {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
+                status, payload = 500, _store_fault("question", exc)
+            finally:
+                self.server.request_gate.release()
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+
+    def _serve_note_body(self, path: str, *, head: bool) -> None:
+        """``GET /cockpit/note/<n>.json``: one note's body (what, detail, agent, filed_at, and its dismissal if any),
+        behind exactly the question body's gate. Read-only: a bad id or no such note is 404, no ``notes.db`` is made."""
+        if not self._off_box_token_valid():
+            self._send(json.dumps({"error": "forbidden", "message": (
+                f"a note's words need this page's write token, sent as {_WRITE_TOKEN_HEADER}")}
+            ).encode("utf-8"), "application/json; charset=utf-8", status=403, head=head,
+                headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+            return
+        n = urllib.parse.unquote(path[len(_NOTE_BODY_PREFIX):-len(_CONSENT_BODY_SUFFIX)])
+        status, payload = 404, {"error": "not_found", "message": "no such note"}
+        store = getattr(self.server, "note_store", None)
+        if store is not None and _QUESTION_ID.fullmatch(n):
+            if not self.server.request_gate.acquire(blocking=False):
+                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+                return
+            try:
+                note = store.get(int(n))
+                if note is not None:
+                    d = note.dismissed
+                    status, payload = 200, {
+                        "n": note.n, "agent": note.agent, "what": note.what, "detail": note.detail,
+                        "filed_at": note.filed_at,
+                        "dismissed": None if d is None else {"channel": d.channel, "dismissed_at": d.dismissed_at}}
+            except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
+                status, payload = 500, _store_fault("note", exc)
             finally:
                 self.server.request_gate.release()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
@@ -1138,6 +1183,9 @@ class _Handler(GuardedHandler):
             return
         if path.startswith(_QUESTION_BODY_PREFIX) and path.endswith(_CONSENT_BODY_SUFFIX):
             self._serve_question_body(path, head=head)
+            return
+        if path.startswith(_NOTE_BODY_PREFIX) and path.endswith(_CONSENT_BODY_SUFFIX):
+            self._serve_note_body(path, head=head)
             return
         if path.startswith(_SESSION_LOG_PREFIX) and path.endswith(_SESSION_LOG_SUFFIX):
             self._serve_session_log(path, head=head)
@@ -1835,10 +1883,16 @@ def make_server(
     # question store, never the default queue's (as the proposals route, _ConsentReader)
     httpd.question_store = (QuestionStore(httpd.consent_reader.directory)
                             if hasattr(httpd.consent_reader, "directory") else None)
+    from levain.consent.notes import NoteStore
+
+    httpd.note_store = (NoteStore(httpd.consent_reader.directory)
+                        if hasattr(httpd.consent_reader, "directory") else None)
     if cockpit is not None:
         cockpit.attach_consent_rows(httpd.consent_reader)      # agents waiting on the operator (Q6a)
         if httpd.question_store is not None:
             cockpit.attach_question_rows(httpd.question_store)     # and the questions they ask him (Q-2b)
+        if httpd.note_store is not None:
+            cockpit.attach_note_rows(httpd.note_store)             # and what they tell him (notes)
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
     httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address

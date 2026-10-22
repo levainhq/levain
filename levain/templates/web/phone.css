@@ -70,6 +70,11 @@ h2 { margin: 0 0 var(--sp-3); font: 600 11px/1 var(--round); letter-spacing: var
                margin: 0 0 var(--sp-5); min-width: 0; }
 .req { border-top: 2px solid var(--accent); }   /* the one warm colour marks what is waiting on you */
 .req:has(.tier.t3) { border-top-color: var(--warn); }
+/* an agent's note: no warm colour (it waits on nothing and authorises nothing), one quiet Dismiss */
+.req.agent-note { border-top: 1px dashed var(--hair); background: none; }
+.req.agent-note .note-what { font-weight: 600; overflow-wrap: anywhere; margin-top: var(--sp-3); }
+.req.agent-note .note-detail { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--label); margin-top: var(--sp-2); }
+.notes-head { margin-top: var(--sp-6, 24px); }
 .req.sign .display { user-select: text; }   /* a statement to be signed: selectable, so it can be copied out and checked */
 .row.dispatch { border-top: 2px solid var(--accent); }   /* a dispatch job waits on you as a request does */
 .row.dispatch .display { user-select: text; }
