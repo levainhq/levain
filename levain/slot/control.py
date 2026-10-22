@@ -426,9 +426,10 @@ class AdminRefused(Refused):
     """keys answered an admin request ``{"ok":false,"refused":<name>}``; ``answer`` is the whole answer (a
     FRONT-REGISTER ``registration-stale`` carries ``reg_high`` there)."""
 
-    def __init__(self, name: str, answer: Mapping[str, object]) -> None:
+    def __init__(self, name: str, answer: Mapping[str, object], conn: int = 0) -> None:
         super().__init__(name, "keys refused an admin request")
         self.answer = dict(answer)
+        self.conn = conn                              # the connection (KeysAdmin epoch) the refusal came on
 
 
 @dataclass(eq=False)
@@ -443,15 +444,20 @@ class KeysAdmin:
     a write lock, an answer table per ``id`` and a reader thread, so MINT's FRONT-REGISTER, root's FRONT-ARM and a
     background DROP-SESSION share it and are answered in any order.
 
-    - Each attempt waits :data:`KEYS_ANSWER_S` for its answer; a missed one is sent again, byte for byte, ON THE SAME
-      CONNECTION (an answer to any attempt answers the request) until V23 has passed since the first, and then CONTROL
-      closes the connection: that is §4.5's EOF, never a retry. The request refuses ``keys-unavailable``.
-    - The connection's EOF (keys went away, or CONTROL closed it at V23 or on a malformed answer) wakes every request
-      waiting on it with ``keys-unavailable`` and calls ``on_eof`` (CONTROL revokes every live egress session); keys,
-      on its side, clears every registration that connection made.
-    - There is no connection until a verb needs keys: the next one connects. After a failed connect, verbs refuse
-      ``keys-unavailable`` without trying until :data:`KEYS_RECONNECT_FIRST_S` has passed, doubling to
-      :data:`KEYS_RECONNECT_MAX_S`; a connect that succeeds resets it.
+    - Each attempt waits :data:`KEYS_ANSWER_S` for its answer, never past what is left of V23; a missed one is sent
+      again, byte for byte, ON THE SAME CONNECTION (an answer to any attempt answers the request) until V23 has passed
+      since the first, and then CONTROL closes the connection: that is §4.5's EOF, never a retry. The request refuses
+      ``keys-unavailable``, and an answer arriving after V23 is discarded the same way. A send that cannot complete
+      within ``answer_s`` is a broken connection.
+    - Each connection is an EPOCH (its number, from 1). The verbs that register or arm return the epoch keys acked
+      them on, so CONTROL can tell a registration of a lost connection from one of its successor.
+    - The connection's EOF (keys went away, or CONTROL closed it at V23, on a malformed answer or by :meth:`abort`)
+      wakes every request waiting on it with ``keys-unavailable`` and calls ``on_eof(epoch)`` (CONTROL revokes the
+      sessions registered on that epoch); keys, on its side, clears every registration that connection made.
+    - There is no connection until a verb needs keys: the next one connects (outside the state lock, so a slow
+      connect never stalls :meth:`close`). After a failed connect, verbs refuse ``keys-unavailable`` without trying
+      until :data:`KEYS_RECONNECT_FIRST_S` has passed, doubling to :data:`KEYS_RECONNECT_MAX_S`; a connect that
+      succeeds resets it.
 
     ``answer_s``, ``window_s`` (V23) and ``clock`` are parameters so a test can shorten the clocks."""
 
@@ -462,9 +468,10 @@ class KeysAdmin:
         self.answer_s = answer_s
         self.window_s = V23_SECONDS if window_s is None else window_s
         self._clock = clock
-        self.on_eof: Callable[[], None] = lambda: None
+        self.on_eof: Callable[[int], None] = lambda epoch: None
         self._mu = threading.Lock()
         self._wmu = threading.Lock()
+        self._cmu = threading.Lock()                  # one connect at a time, never under _mu
         self._sock: socket.socket | None = None
         self._conn_no = 0
         self._next_id = 0
@@ -480,34 +487,64 @@ class KeysAdmin:
         with self._mu:
             return self._sock is not None
 
+    def current(self, epoch: int) -> bool:
+        """Is connection ``epoch`` the live one (not yet ended, not superseded)?"""
+        with self._mu:
+            return self._sock is not None and self._conn_no == epoch
+
+    def _live(self, connect: bool) -> tuple[socket.socket, int] | None:
+        """The live connection, or ``None`` when a connect may be tried now (caller holds ``_mu``)."""
+        if self._closed:
+            raise Refused("keys-unavailable", "the keys admin client is closed")
+        if self._sock is not None:
+            return self._sock, self._conn_no
+        if not connect:
+            raise Refused("keys-unavailable", "no keys admin connection")
+        if self._clock() < self._retry_at:
+            raise Refused("keys-unavailable", "keys admin connect backing off")
+        return None
+
     def _connection(self, connect: bool) -> tuple[socket.socket, int]:
         with self._mu:
-            if self._closed:
-                raise Refused("keys-unavailable", "the keys admin client is closed")
-            if self._sock is not None:
-                return self._sock, self._conn_no
-            if not connect:
-                raise Refused("keys-unavailable", "no keys admin connection")
+            live = self._live(connect)
+        if live is not None:
+            return live
+        with self._cmu:
+            with self._mu:
+                live = self._live(connect)              # another thread may have connected while this one waited
+            if live is not None:
+                return live
             now = self._clock()
-            if now < self._retry_at:
-                raise Refused("keys-unavailable", "keys admin connect backing off")
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s = None
             try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 s.settimeout(self.answer_s)
                 s.connect(str(self.path))
                 s.settimeout(None)
+                # A send keys does not drain within answer_s fails (SO_SNDTIMEO), so the write lock is never held
+                # forever and the V23 rule is always reached; the reader's blocking receive is unaffected.
+                secs = int(self.answer_s)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO,
+                             struct.pack("ll", secs, int((self.answer_s - secs) * 1_000_000)))
             except OSError as e:
-                s.close()
-                self._retry_at = now + self._backoff
-                self._backoff = min(self._backoff * 2, KEYS_RECONNECT_MAX_S)
+                if s is not None:
+                    s.close()
+                with self._mu:
+                    self._retry_at = now + self._backoff
+                    self._backoff = min(self._backoff * 2, KEYS_RECONNECT_MAX_S)
                 raise Refused("keys-unavailable", f"{self.path}: {e.strerror or e}") from None
-            self._retry_at, self._backoff = 0.0, KEYS_RECONNECT_FIRST_S
-            self._conn_no += 1
-            self._sock = s
-            no = self._conn_no
-            t = threading.Thread(target=self._read_loop, args=(s, no), daemon=True, name=f"control-keys-admin-{no}")
-            self._readers = [r for r in self._readers if r.is_alive()] + [t]
-        t.start()
+            with self._mu:
+                if self._closed:
+                    s.close()
+                    raise Refused("keys-unavailable", "the keys admin client is closed")
+                self._retry_at, self._backoff = 0.0, KEYS_RECONNECT_FIRST_S
+                self._conn_no += 1
+                self._sock = s
+                no = self._conn_no
+                t = threading.Thread(target=self._read_loop, args=(s, no), daemon=True,
+                                     name=f"control-keys-admin-{no}")
+                self._readers = [r for r in self._readers if r.is_alive()] + [t]
+                t.start()                                # under _mu: close() never meets an unstarted reader
         return s, no
 
     def _read_loop(self, sock: socket.socket, no: int) -> None:
@@ -534,7 +571,7 @@ class KeysAdmin:
 
     def _lost(self, sock: socket.socket, no: int, *, notify: bool) -> None:
         """Connection ``no`` is over: every request waiting on it is woken (no answer = ``keys-unavailable``) and,
-        unless CONTROL itself is closing the client, ``on_eof`` runs once."""
+        unless CONTROL itself is closing the client, ``on_eof(no)`` runs once."""
         with self._mu:
             if self._sock is not sock:
                 return                                       # already handled
@@ -549,17 +586,26 @@ class KeysAdmin:
         for p in waiting:
             p.done.set()
         if notify and not closing:
-            self.on_eof()
+            self.on_eof(no)
+
+    def abort(self, epoch: int | None = None) -> None:
+        """CONTROL ends connection ``epoch`` (``None``: whichever is live) through the EOF path: keys reads the close
+        and clears every registration it made, and ``on_eof`` runs. A connection already ended is left as it is."""
+        with self._mu:
+            sock, no = self._sock, self._conn_no
+        if sock is not None and (epoch is None or epoch == no):
+            self._lost(sock, no, notify=True)
 
     def close(self) -> None:
         """Close for good (CONTROL stopping): no ``on_eof``, every waiter answered ``keys-unavailable``."""
         with self._mu:
             self._closed = True
             sock, no = self._sock, self._conn_no
+            readers = list(self._readers)
         if sock is not None:
             self._lost(sock, no, notify=False)
-        for t in list(self._readers):
-            if t is not threading.current_thread():
+        for t in readers:
+            if t is not threading.current_thread() and t.ident is not None:
                 t.join(2)
 
     # -- one request -----------------------------------------------------------------------------------------
@@ -568,12 +614,19 @@ class KeysAdmin:
         """Send ``op`` and return the answer's fields (without ``id`` / ``ok``); a refusal raises
         :class:`AdminRefused`; no connection, an EOF or V23 with no answer raise ``Refused("keys-unavailable")``.
         ``connect=False``: no new connection is made for this request (it refuses instead)."""
+        return self._call(op, connect, args)[0]
+
+    def _call(self, op: str, connect: bool, args: Mapping[str, object]) -> tuple[dict[str, object], int]:
+        """:meth:`call`, also returning the epoch the answer came on."""
         sock, no = self._connection(connect)
         with self._mu:
             self._next_id += 1
             rid = self._next_id
+        frame = encode_frame({"v": 1, "op": op, "id": rid, **args})   # before the entry exists: a raise leaks none
+        with self._mu:
+            if self._closed or self._sock is not sock:    # the connection ended between the two: no wakeup would come
+                raise Refused("keys-unavailable", f"{op}: the keys admin connection ended")
             p = self._pending[rid] = _Pending(no)
-        frame = encode_frame({"v": 1, "op": op, "id": rid, **args})
         first = self._clock()
         try:
             while True:
@@ -583,7 +636,11 @@ class KeysAdmin:
                 except OSError:
                     self._lost(sock, no, notify=True)
                     raise Refused("keys-unavailable", f"{op}: the keys admin connection broke") from None
-                if p.done.wait(self.answer_s):
+                left = first + self.window_s - self._clock()
+                answered = left > 0 and p.done.wait(min(self.answer_s, left))
+                if self._clock() - first >= self.window_s and p.answer is not None:
+                    answered = False                         # it came after V23: discarded, as no answer at all
+                if answered:
                     break
                 if self._clock() - first >= self.window_s:
                     self._lost(sock, no, notify=True)       # V23 with no ack: CONTROL closes the wire (§4.5)
@@ -595,18 +652,21 @@ class KeysAdmin:
         if ans is None:
             raise Refused("keys-unavailable", f"{op}: the keys admin connection ended")
         if ans["ok"] is False:
-            raise AdminRefused(ans["refused"], ans)
-        return {k: v for k, v in ans.items() if k not in ("id", "ok")}
+            raise AdminRefused(ans["refused"], ans, no)
+        return {k: v for k, v in ans.items() if k not in ("id", "ok")}, no
 
     # -- §4.9's verbs, as CONTROL's seams --------------------------------------------------------------------
 
     def front_register(self, session: str, front_uid: int, pid: int, start: int, incarnation: int,
-                       reg_token: int) -> None:
-        self.call("FRONT-REGISTER", session=session, front_uid=front_uid, pid=pid, start=start,
-                  incarnation=incarnation, reg_token=reg_token)
+                       reg_token: int) -> int:
+        """FRONT-REGISTER; returns the epoch keys acked it on."""
+        return self._call("FRONT-REGISTER", True, {"session": session, "front_uid": front_uid, "pid": pid,
+                                                   "start": start, "incarnation": incarnation,
+                                                   "reg_token": reg_token})[1]
 
-    def front_arm(self, session: str, reg_token: int) -> None:
-        self.call("FRONT-ARM", session=session, reg_token=reg_token)
+    def front_arm(self, session: str, reg_token: int) -> int:
+        """FRONT-ARM; returns the epoch keys acked it on."""
+        return self._call("FRONT-ARM", True, {"session": session, "reg_token": reg_token})[1]
 
     def drop_session(self, session: str) -> None:
         """DROP-SESSION on the live connection. With none, or once that connection ends unanswered (EOF, or closed at
@@ -690,6 +750,10 @@ class Control:
         #: token digests whose handles were dropped (oldest first, bounded): TOKEN-RESOLVE answers them token-revoked.
         self._revoked_tokens: collections.OrderedDict[str, None] = collections.OrderedDict()
         self._drops_owed: set[str] = set()
+        #: session -> the keys admin epoch its FRONT-REGISTER was acked on (KeysAdmin only); dropped at REVOKED.
+        self._reg_epoch: dict[str, int] = {}
+        #: every keys admin epoch at or below this one has ended and had its EOF handled.
+        self._keys_lost_upto = 0
         self._retired: collections.deque[str] = collections.deque()   # dead lease nonces, oldest first
         self._stopping = threading.Event()
         #: The background threads still running (revokes, drop retries); each removes itself as it ends.
@@ -758,12 +822,13 @@ class Control:
             return lease is not None and lease.live
 
     def _after_revoke(self, session: str) -> None:
-        """§4.5: CONTROL at REVOKED drops the session's handles, sends ``DROP-SESSION`` to keys, wakes the
-        reaper. Called after the REVOKED write is durable and the session lock released."""
+        """§4.5: CONTROL at REVOKED drops the session's handles, wakes the reaper, then sends ``DROP-SESSION`` to
+        keys. Called after the REVOKED write is durable and the session lock released."""
         with self._mu:
             self._drop_handles(session)
-        self._drop(session)
-        self._wake()
+            epoch = self._reg_epoch.pop(session, None)
+        self._wake()                                     # first: the reaper's kill never waits on keys' answer
+        self._drop(session, epoch)
         self._prune(session)
 
     def _drop_handles(self, session: str) -> None:
@@ -781,40 +846,56 @@ class Control:
         except BaseException as e:   # noqa: BLE001 - the reaper also runs on its own pass; record the failure
             self.seam_errors.append(("wake_reaper", "", e))
 
-    def _drop(self, session: str) -> None:
-        """``DROP-SESSION`` once now; a failure is retried with backoff on a background thread until keys acks it,
-        CONTROL stops (whose next start re-issues it) or V23 has passed since the first try (§4.9). :class:`KeysAdmin`'s
-        drop never fails for want of keys: it holds its own V23 rule and closes the connection at it, and keys clears
-        every registration of a connection that ends, so a drop owed on it is moot. Only another seam reaches the retry,
-        and it is bounded the same way rather than kept forever."""
+    def _drop_moot(self, epoch: int | None) -> bool:
+        """keys' connection ``epoch`` has ended, so keys already cleared every registration it made: nothing to drop."""
+        return self.keys_admin is not None and epoch is not None and not self.keys_admin.current(epoch)
+
+    def _drop(self, session: str, epoch: int | None = None) -> None:
+        """``DROP-SESSION`` once now (``epoch``: the keys connection the session registered on, if known; once it has
+        ended the drop is moot). A failure is retried with backoff on a background thread, and the debt ends only by
+        an ack, by CONTROL stopping (whose next start re-issues it) or by a CONFIRMED teardown: with
+        :class:`KeysAdmin`, a drop still refused at V23 since the first try makes CONTROL close the connection that
+        refused it, through the EOF path, and keys clears every registration of a connection that ends (§4.5, §4.9).
+        Another seam has no connection to close, so it is retried until acked or stopped, never forgotten."""
         with self._mu:
             if session in self._drops_owed:
                 return                                   # a retry is already running
+        if self._drop_moot(epoch):
+            return
         try:
             self._drop_session(session)
             return
+        except AdminRefused as e:
+            self.seam_errors.append(("drop_session", session, e))
+            epoch = e.conn
         except BaseException as e:   # noqa: BLE001 - the revoke is durable; the drop is owed
             self.seam_errors.append(("drop_session", session, e))
         with self._mu:
             if session in self._drops_owed:
                 return
             self._drops_owed.add(session)
-        self._spawn(self._drop_until_acked, session, name=f"control-drop-{session}")
+        self._spawn(lambda s: self._drop_until_acked(s, epoch), session, name=f"control-drop-{session}")
 
-    def _drop_until_acked(self, session: str) -> None:
+    def _drop_until_acked(self, session: str, epoch: int | None) -> None:
         from levain.slot.control_client import V23_SECONDS   # lazy: a module-level import would be circular
         delay = EOF_RETRY_FIRST_S
-        until = time.monotonic() + V23_SECONDS
+        until = self._clock() + V23_SECONDS
         try:
             while not self._stopping.is_set():
-                if time.monotonic() >= until:
-                    self.seam_errors.append(("drop_session", session, TimeoutError("no ack within V23")))
+                if self._drop_moot(epoch):
+                    return                               # that connection ended: keys cleared what it made
+                if self.keys_admin is not None and self._clock() >= until:
+                    self.seam_errors.append(("drop_session", session, TimeoutError(
+                        "no ack within V23: CONTROL closes the keys admin connection that refused it")))
+                    self.keys_admin.abort(epoch)
                     return
                 self._sleep(delay)
                 delay = min(delay * 2, EOF_RETRY_MAX_S)
                 try:
                     self._drop_session(session)
                     return
+                except AdminRefused as e:
+                    epoch = e.conn
                 except BaseException:   # noqa: BLE001 - noted once by _drop; retried until acked
                     continue
         finally:
@@ -939,24 +1020,32 @@ class Control:
         else:
             self._prune(session)
 
-    def _keys_eof(self) -> None:
-        """keys' admin connection ended (§4.5, :class:`KeysAdmin`): keys cleared every registration and cached token
-        it held for CONTROL, so every live egress-class session is REVOKED, each on a thread that retries its session
-        lock (a MINT waiting on that connection holds one until it refuses ``keys-unavailable``). Their handles go at
-        once, before any write, as at a lease EOF."""
+    def _keys_eof(self, epoch: int) -> None:
+        """keys' admin connection ``epoch`` ended (§4.5, :class:`KeysAdmin`): keys cleared every registration and cached
+        token that connection made, so the sessions registered on it, and on any earlier one, are the victims, read
+        from memory (no store read: a record that cannot settle never hides a victim). Under one hold of ``_mu`` the
+        epoch is marked lost (a MINT or FRONT-ARM acked on it then refuses rather than publish) and every victim's
+        handles are dropped, before any write; then each victim is REVOKED on its own thread, which retries its
+        session lock and any refusal until it lands. A session registered on a LATER connection is never a victim."""
         if self._stopping.is_set():
             return
-        try:
-            recs = self.store.all()
-        except Refused as e:
-            self.seam_errors.append(("keys_eof", "", e))
-            recs = []
-        victims = sorted(r.session for r in recs if r.state in R.LIVE_STATES and r.claims.get("class") == "egress")
         with self._mu:
+            self._keys_lost_upto = max(self._keys_lost_upto, epoch)
+            victims = sorted(s for s, e in self._reg_epoch.items() if e <= epoch)
             for session in victims:
                 self._drop_handles(session)
         for session in victims:
-            self._spawn(lambda s: self._revoke_after_eof(s, lease_eof=False), session, name=f"control-keys-eof-{session}")
+            self._spawn_keys_revoke(session)
+
+    def _spawn_keys_revoke(self, session: str) -> threading.Thread:
+        return self._spawn(lambda s: self._revoke_after_eof(s, lease_eof=False), session,
+                           name=f"control-keys-eof-{session}")
+
+    def _keys_epoch_lost(self, epoch: object) -> bool:
+        """Has keys connection ``epoch`` ended (caller holds ``_mu``)? Always ``False`` with no :class:`KeysAdmin`."""
+        if self.keys_admin is None:
+            return False
+        return type(epoch) is not int or epoch <= self._keys_lost_upto or not self.keys_admin.current(epoch)
 
     def join_eof(self, timeout: float | None = None) -> None:
         """Join the background threads, including any started while joining."""
@@ -1160,23 +1249,35 @@ class Control:
             # DECISION: an egress session has exactly one front (§1 gw-front), a none class none (§5.1 5b).
             if ("front" in claims) != (rec.claims.get("class") == "egress"):
                 raise Refused("claims-mismatch")
+            epoch = None
             if "front" in claims:
-                rec = self._register_front(rec, claims)
+                rec, epoch = self._register_front(rec, claims)
+                if self.keys_admin is not None:
+                    with self._mu:
+                        self._reg_epoch[session] = epoch    # from here keys' EOF of that epoch finds it a victim
             merged = {**rec.claims, **claims}
             h = Handles(token=new_handle() if self._is_brokered(merged) else None,
                         queue_cap=new_handle() if claims["queue_grant"] else None)
             new = self._write(rec, claims=merged, event_kind="none")
             # The lease can read EOF during the keys wire or the write (lease_eof takes no session lock): the
             # handles are published only if that same lease is live NOW, under the lock lease_eof drops them under.
+            # Likewise keys' connection: published only if the epoch keys acked the register on has not ended
+            # since, under the lock _keys_eof marks it lost under; else the session is left to its revoke.
             with self._mu:
                 if self._session_lease.get(session) is not lease or not lease.live:
                     raise Refused("lease-dead")
-                self._handles[session] = h
+                lost = epoch is not None and self._keys_epoch_lost(epoch)
+                if not lost:
+                    self._handles[session] = h
+        if lost:
+            self._spawn_keys_revoke(session)             # runs once this verb releases the session lock
+            raise Refused("keys-unavailable", f"{session}: keys' connection ended after FRONT-REGISTER")
         return {"generation": new.generation}
 
-    def _register_front(self, rec: R.SessionState, claims: Mapping[str, object]) -> R.SessionState:
+    def _register_front(self, rec: R.SessionState, claims: Mapping[str, object]) -> tuple[R.SessionState, object]:
         """MINT's steps 1-3 for a session with a front (caller holds the session lock); returns the TOKEN-ONLY
-        record keys acked the registration of, which MINT's final write builds on."""
+        record keys acked the registration of, which MINT's final write builds on, and what the register seam
+        returned (with :class:`KeysAdmin`, the epoch it was acked on)."""
         front = claims["front"]
         assert isinstance(front, Mapping)
         uid = front["uid"]
@@ -1184,8 +1285,9 @@ class Control:
         for retried in (False, True):
             rec = self._write(rec, claims={**rec.claims, R.REG_TOKEN: token}, event_kind="none")
             try:
-                self._keys_front_register(rec.session, uid, front["pid"], front["start"], claims["incarnation"], token)
-                return rec
+                epoch = self._keys_front_register(rec.session, uid, front["pid"], front["start"],
+                                                  claims["incarnation"], token)
+                return rec, epoch
             except AdminRefused as e:
                 if e.name != "registration-stale":
                     raise Refused("keys-unavailable", f"keys refused FRONT-REGISTER: {e.name}") from None
@@ -1262,17 +1364,22 @@ class Control:
             with self._mu:
                 lease = self._session_lease.get(session)
         try:
-            self._keys_front_arm(session, token)
+            arm_epoch = self._keys_front_arm(session, token)
         except AdminRefused as e:
             if e.name == "registration-stale":
                 raise Refused("front-registration-stale", session) from None
             raise Refused("keys-unavailable", f"keys refused FRONT-ARM: {e.name}") from None
         # The lock is not held across the relay, so the session can move under it: re-check both before root is
-        # told it may write the go byte.
+        # told it may write the go byte. The arm counts only on the connection the session registered on, and only
+        # while that connection has not ended.
         with self._mu:
             lease_ok = self._session_lease.get(session) is lease and lease is not None and lease.live
+            keys_ok = self.keys_admin is None or (arm_epoch == self._reg_epoch.get(session)
+                                                  and not self._keys_epoch_lost(arm_epoch))
         if not lease_ok:
             raise Refused("lease-dead")
+        if not keys_ok:
+            raise Refused("keys-unavailable", f"{session}: keys' connection ended around FRONT-ARM")
         now = self.store.get(session)
         if now is None or now.state != R.RENDERING or now.generation != rec.generation:
             raise Refused("not-rendering")

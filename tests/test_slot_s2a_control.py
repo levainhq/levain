@@ -521,7 +521,7 @@ def test_lease_eof_revokes_lease_live_first(env):
     op.close()
     settle(env, S1, "REVOKED")
     assert writes == [(2, "RENDERING", False, "none"), (3, "REVOKED", False, "state")]
-    assert env.seams.calls[-2:] == [("drop", S1), ("wake",)]
+    assert env.seams.calls[-2:] == [("wake",), ("drop", S1)]          # the reaper first, never behind keys
 
 
 def test_lease_eof_meets_held_lock(env):
@@ -664,9 +664,9 @@ def test_alloc_only_orphan_reclaimed(env):
     assert root.ask("REVOKE", session=S3)["generation"] == 0
     rec = env.record(S3)
     assert (rec.state, rec.generation, rec.claims, rec.lease_live, rec.event_kind) == ("REVOKED", 0, {}, False, "state")
-    assert env.seams.calls == [("drop", S3), ("wake",)]
+    assert env.seams.calls == [("wake",), ("drop", S3)]
     assert root.ask("REVOKE", session=S3)["generation"] == 0          # a no-op answering its generation
-    assert env.seams.calls == [("drop", S3), ("wake",)]
+    assert env.seams.calls == [("wake",), ("drop", S3)]
     assert S3 in root.ask("REVOKED-SET")["sessions"]
     assert cas(root, S3, 0, "REVOKED", "FROZEN")["generation"] == 1    # END runs from alloc as usual
 
