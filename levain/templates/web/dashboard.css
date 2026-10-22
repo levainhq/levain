@@ -1584,10 +1584,12 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
   body.ke .masthead .themesw button { width: 36px; font-size: var(--fs-micro); }
   /* the brand takes what the first row leaves instead of claiming its own width, so a wider font cannot push the theme switch
      onto a row of its own (Linux Chrome's fonts did, in CI) */
-  body.ke .masthead .brand { flex: 1 1 0; min-width: 0; margin-right: 0; overflow: hidden; }
-  body.ke .masthead .brand .wordmark { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  body.ke .masthead .brand { flex: 1 1 0; min-width: 0; margin-right: 0; }
+  /* block, not flex: an ellipsis only draws on a block's own text, and a long white-label name is cut with one (its full text is the title) */
+  body.ke .masthead .brand .wordmark { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  body.ke .masthead .brand .wordmark::before { margin-right: var(--sp-3); vertical-align: middle; }
 }
-@media (max-width: 400px) { body.ke .masthead { column-gap: var(--sp-2); } }   /* a 375px phone keeps the whole wordmark */
+@media (max-width: 400px) { body.ke .masthead { column-gap: var(--sp-2); } }   /* room for the default wordmark at 375px */
 
 /* AN EMPTY CARD is a slim bar, last in its zone (a card with a list behind it keeps its place and its height). Beside a tall
    neighbour an empty card used to leave a void under it; as a bar at the end of the zone it takes one thin full-width line, and the

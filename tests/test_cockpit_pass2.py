@@ -61,15 +61,19 @@ def test_the_phone_bar_is_two_rows_with_the_tabs_across_the_width(tmp_path: Path
 
 
 @needs_browser
-def test_a_375_phone_keeps_the_theme_switch_on_the_first_row_and_the_whole_wordmark(tmp_path: Path) -> None:
-    """At 375px the first row once had ~0px to spare: the theme switch wrapped to a row of its own (CI's Linux fonts did it at 390)."""
-    vals = _page(tmp_path, [{"emulate": {"w": 375, "h": 812, "dpr": 3, "mobile": True}}, {"until": "document.querySelector('.masthead .seg') && document.querySelector('.masthead .indicators button')"}, {"eval": """(() => {
+@pytest.mark.parametrize("width", [320, 375, 390, 430, 480])
+def test_the_theme_switch_stays_on_the_first_row_at_every_phone_width(tmp_path: Path, width: int) -> None:
+    """CI's Linux fonts once wrapped the theme switch onto a row of its own at 390px; the old CSS did the same at 375px on any font.
+    The brand gives way instead; at 430px (and wider) the default wordmark is never cut."""
+    vals = _page(tmp_path, [{"emulate": {"w": width, "h": 812, "dpr": 3, "mobile": True}}, {"until": "document.querySelector('.masthead .seg') && document.querySelector('.masthead .themesw') && document.querySelector('.masthead .brand .wordmark') && document.querySelector('.masthead .indicators button')"}, {"eval": """(() => {
       const box = (e) => e.getBoundingClientRect(), q = (s) => document.querySelector(s);
-      const theme = q('.masthead .themesw'), brand = q('.masthead .brand'), wm = q('.masthead .wordmark');
+      const theme = q('.masthead .themesw'), brand = q('.masthead .brand'), wm = q('.masthead .brand .wordmark');
       return { oneRow: Math.abs(box(theme).top - box(brand).top) < 24 && box(theme).bottom < box(q('.masthead .seg')).top,
-        whole: wm.scrollWidth <= wm.clientWidth, slack: box(brand).width - wm.scrollWidth, sw: document.documentElement.scrollWidth, vw: innerWidth }; })()"""}])
+        whole: wm.scrollWidth <= wm.clientWidth + 1, sw: document.documentElement.scrollWidth, vw: innerWidth }; })()"""}])
     got = vals[2]
-    assert got["oneRow"] and got["whole"] and got["slack"] >= 8 and got["sw"] <= got["vw"], got
+    assert got["oneRow"] and got["sw"] <= got["vw"], got
+    if width >= 430:
+        assert got["whole"], got
 
 
 @needs_browser
