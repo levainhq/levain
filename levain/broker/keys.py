@@ -1404,11 +1404,17 @@ class Keys:
         body (a 401 or a 413) and stop reading, so the final head ends the upload. Returns that head (for a websocket
         request, an upstream's 101 is the head returned), or None when the front aborted before its body ended. The
         head's deadline starts at the request's last byte (design 1.6); while the body is still going up, the head
-        waits as long as the upload does."""
+        waits as long as the upload does. A 101 never ends the upload: the front's request `E` must be read first
+        (else it would be taken as the websocket's own end), within `head_timeout_s`, else `upstream-error`."""
         upload = asyncio.ensure_future(self._forward_body(ff, side, up, hconn, body, cap, rec))
         head = asyncio.ensure_future(upstream.read_head(up, hconn, None, upgrade=upgrade))
         try:
             await asyncio.wait({upload, head}, return_when=asyncio.FIRST_COMPLETED)
+            if (not upload.done() and head.done() and not head.cancelled() and head.exception() is None
+                    and isinstance(head.result(), h11.InformationalResponse)):
+                await asyncio.wait({upload}, timeout=self.head_timeout_s)   # neither cancels nor raises the upload
+                if not upload.done():
+                    raise norm.Refused("upstream-error", "upgrade before the request ended")
             if upload.done():
                 # an upstream that answers (a 413) and then resets fails the upload too; when its head has already
                 # been read, the head wins over that failure (the front's abort and keys' own refusal still stand)

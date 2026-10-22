@@ -49,7 +49,7 @@ def _frame(opcode: int, payload: bytes, *, mask: bool = False, rsv: int = 0) -> 
     return head + payload
 
 
-def _lib(d: str) -> None:
+def _lib(d: str, responses=("content-type", "sec-websocket-protocol")) -> None:
     os.makedirs(os.path.join(d, "routes"))
     os.makedirs(os.path.join(d, "keys", "cred"))
     route = {"route": "r", "type": "brokered",
@@ -59,7 +59,7 @@ def _lib(d: str) -> None:
                           "headers": {"sec-websocket-key": "[A-Za-z0-9+/]{22}==", "sec-websocket-version": "[0-9]+",
                                       "sec-websocket-protocol": "[a-z0-9.,-]+"},
                           "body_cap": 4096, "body_codec": "none"},
-             "responses": {"headers": ["content-type", "sec-websocket-protocol"]},
+             "responses": {"headers": list(responses)},
              "max_call_microdollars": 1000, "max_session_microdollars": 100000}
     with open(os.path.join(d, "routes", "base.json"), "wb") as f:
         f.write(canon.canonical_bytes({"format": K.BASE_MAP_FORMAT, "routes": [route]}))
@@ -79,18 +79,19 @@ def _h101(key: str = KEY, extra: bytes = b"") -> bytes:
             b"sec-websocket-accept: " + _accept(key).encode() + b"\r\n" + extra + b"\r\n")
 
 
-def _run(coro_fn):
+def _run(coro_fn, **lib):
     d = tempfile.mkdtemp(prefix="lws", dir="/tmp")
-    _lib(d)
+    _lib(d, **lib)
     try:
         return asyncio.run(asyncio.wait_for(coro_fn(d), 20))
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
 
-def _exchange(monkeypatch, q: dict, script, front_frames: bytes, *, eof: bool = True):
+def _exchange(monkeypatch, q: dict, script, front_frames: bytes, *, eof: bool = True, lib=None):
     """Run one exchange: `script(up)` feeds the upstream, `front_frames` are the front's frames after `Q`, then the
-    front's EOF unless `eof` is False (a front that stays open, so only the upstream can end the websocket)."""
+    front's EOF unless `eof` is False (a front that stays open, so only the upstream can end the websocket). `lib`:
+    `_lib`'s keywords (the route's response allow-list)."""
     up = _Up()
     _scripted(monkeypatch, up)
 
@@ -102,7 +103,7 @@ def _exchange(monkeypatch, q: dict, script, front_frames: bytes, *, eof: bool = 
             script(up)
             await asyncio.wait_for(rig.run(q), 10)
             return await rig.got(), b"".join(up.writes)
-    return _run(go)
+    return _run(go, **(lib or {}))
 
 
 def _gw(t: bytes, payload: bytes = b"") -> bytes:
@@ -185,6 +186,54 @@ def test_a_masked_server_frame_closes_the_websocket(monkeypatch):
     frames, _ = _exchange(monkeypatch, _q(), lambda up: up.feed(_h101() + _frame(1, b"x", mask=True)), _gw(b"E"),
                           eof=False)
     assert _types(frames) == b"AUE", frames
+
+
+# --- L3 r1 (3b7/L3_r1_TRIAGE.md T1-T4, T7) ----------------------------------------------------------------------
+
+_CHAT = [["sec-websocket-key", KEY], ["sec-websocket-version", "13"], ["sec-websocket-protocol", "chat"]]
+
+
+def test_a_101_before_the_front_E_waits_for_that_E(monkeypatch):
+    """T1 (codex HIGH = complement MED): the upstream's 101 is read BEFORE the front's request-ending `E`. The 101
+    must not cancel the upload: keys waits for that `E`, then answers `U`, and the client's next frame goes up. Before
+    the fix the request's `E` was read as the websocket's own end, and the client's frame never left keys."""
+    client = _frame(1, b"hello", mask=True)
+    up = _Up()
+    _scripted(monkeypatch, up)
+
+    async def go(d: str) -> tuple:
+        async with _Rig(d) as rig:
+            up.feed(_h101())
+            task = rig.run(_q())
+            await asyncio.wait_for(up.read_called.wait(), 5)
+            await asyncio.sleep(0.05)   # the 101 is parsed, and the exchange has moved on from it, before the `E`
+            assert not task.done()
+            rig.front.feed_data(_gw(b"E") + _gw(b"D", client) + _gw(b"E"))
+            rig.front.feed_eof()
+            await asyncio.wait_for(task, 10)
+            return await rig.got(), b"".join(up.writes)
+
+    frames, sent = _run(go)
+    assert _types(frames) == b"AU", frames
+    assert sent.partition(b"\r\n\r\n")[2] == client
+
+
+def test_a_101_whose_request_never_ends_is_refused_at_the_head_clock(monkeypatch):
+    """T1's bound: a 101 arrives and the front's `E` never does: `upstream-error` once `head_timeout_s` passes, and
+    never a `U`. The front closes only after that (a front half-closes on reading `F`, which ends keys' drain)."""
+    up = _Up()
+    _scripted(monkeypatch, up)
+
+    async def go(d: str) -> tuple:
+        async with _Rig(d, head_timeout_s=0.2) as rig:
+            up.feed(_h101())
+            asyncio.get_running_loop().call_later(0.6, rig.front.feed_eof)
+            await asyncio.wait_for(rig.run(_q()), 10)
+            return await rig.got(), b"".join(up.writes)
+
+    frames, _sent = _run(go)
+    assert _types(frames) == b"AF", frames
+    assert json.loads(frames[1][1]) == {"refused": "upstream-error"}
 
 
 @pytest.mark.parametrize("q,why", [
