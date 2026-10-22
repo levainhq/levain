@@ -77,6 +77,8 @@ def base_store_rows(host: HostOS, operator: str) -> list[Row]:
         _root(host, L / "live", 0o711),
         _root(host, L / "alloc", 0o700),
         Row(L / "sessions", "_levain_control", "_levain_control", 0o700),
+        # §2.1: the per-front_uid registration counters (§4.9), CONTROL's like the session records beside them.
+        Row(L / "sessions" / "front-reg", "_levain_control", "_levain_control", 0o700),
         _root(host, L / "slots", 0o755),
         _root(host, L / "slots" / "pool.lock", 0o600, "file"),
         _root(host, L / "retained", 0o700),

@@ -210,10 +210,15 @@ def _parse_canonical(data: bytes, what: str) -> dict:
 ATTACH_CLAIM_KEYS = frozenset({"operator_uid", "supervisor_uid", "slot", "class", "kind", "vendor", "auth",
                                "lease_seq", "slot_rev", "ticket"})
 ATTACH_CLAIM_REQUIRED = ATTACH_CLAIM_KEYS - {"ticket"}
-#: §3.3 MINT claims, exactly (``model`` and ``front`` optional).
+#: §3.3 MINT claims, exactly (``model`` and ``front`` optional): the INPUT set, what root sends.
 MINT_CLAIM_KEYS = frozenset({"routes", "model", "queue_grant", "front", "incarnation", "egress_routes"})
 MINT_CLAIM_REQUIRED = MINT_CLAIM_KEYS - {"model", "front"}
 _FRONT_CLAIM_KEYS = frozenset({"uid", "pid", "start"})
+#: §3.3 / §4.9: the fencing token CONTROL itself adds to a session's claims at MINT (root never supplies it).
+REG_TOKEN = "reg_token"
+#: §3.3: the PERSISTED claims a state record holds, which is what a restart loads: ATTACH's, MINT's and
+#: ``reg_token``. Not MINT's input set: a MINT whose claims carry ``reg_token`` is refused like any unknown key.
+PERSISTED_CLAIM_KEYS = ATTACH_CLAIM_KEYS | MINT_CLAIM_KEYS | {REG_TOKEN}
 
 
 def parse_attach_claims(value: object) -> dict[str, object]:
@@ -253,16 +258,22 @@ def parse_mint_claims(value: object) -> dict[str, object]:
 
 
 def parse_claims(value: object) -> dict[str, object]:
-    """The state record's ``claims``: ``{}`` (a record ``REVOKE`` created, §3.1: CONTROL never saw an
-    ATTACH), or the ATTACH claims, or the ATTACH claims merged with the MINT claims (§3.3)."""
+    """The state record's PERSISTED ``claims`` (§3.3): ``{}`` (a record ``REVOKE`` created, §3.1: CONTROL
+    never saw an ATTACH), or the ATTACH claims, or the ATTACH claims merged with the MINT claims; either of the
+    last two may also hold ``reg_token`` (a uint). ATTACH claims plus ``reg_token`` alone is the TOKEN-ONLY state
+    between MINT's prewrite and the acked FRONT-REGISTER: it loads, and :func:`has_mint_claims` is false on it.
+    ``reg_token`` is taken out before the ATTACH / MINT split, so neither half's exact key set sees it."""
     obj = _obj(value, "claims")
     if not obj:
         return {}
-    attach = {k: v for k, v in obj.items() if k not in MINT_CLAIM_KEYS}
-    mint = {k: v for k, v in obj.items() if k in MINT_CLAIM_KEYS}
+    rest = {k: v for k, v in obj.items() if k != REG_TOKEN}
+    attach = {k: v for k, v in rest.items() if k not in MINT_CLAIM_KEYS}
+    mint = {k: v for k, v in rest.items() if k in MINT_CLAIM_KEYS}
     out = parse_attach_claims(attach)
     if mint:
         out.update(parse_mint_claims(mint))
+    if REG_TOKEN in obj:
+        out[REG_TOKEN] = _uint(obj[REG_TOKEN], f"claims.{REG_TOKEN}")
     return out
 
 
@@ -642,6 +653,46 @@ def parse_state(data: bytes) -> SessionState:
     return check_state(_parse_canonical(data, "state"))
 
 
+# --- §2.1 / §4.9 the per-front_uid registration counter ------------------------------------------------------
+
+#: ``L/sessions/front-reg/<front_uid>.json``: ``{front_uid, reg_token}``, canonical JSON, exactly these keys.
+FRONT_REG_KEYS = frozenset({"front_uid", REG_TOKEN})
+
+
+@dataclass(frozen=True)
+class FrontReg:
+    """The registration counter of one gw front uid (§2.1 ``L/sessions/front-reg/``): the last ``reg_token``
+    CONTROL issued for it. CONTROL is its sole writer."""
+
+    front_uid: int
+    reg_token: int
+
+
+def front_reg_bytes(r: FrontReg) -> bytes:
+    data = canon.canonical_bytes({"front_uid": r.front_uid, REG_TOKEN: r.reg_token})
+    _parse_front_reg(data, r.front_uid)        # the writer refuses with the specific name
+    return data
+
+
+def parse_front_reg(data: bytes, front_uid: int) -> FrontReg:
+    """Strict parse of ``<front_uid>.json``. Every refusal is ``front-registration-corrupt`` (§3.3 MINT's name for
+    a counter record that does not parse; such a record is never reset), with the specific reason in the detail.
+    A record naming another uid than the file it was read from does not parse either."""
+    try:
+        return _parse_front_reg(data, front_uid)
+    except Refused as e:
+        raise Refused("front-registration-corrupt", f"{e.name}: {e.detail}" if e.detail else e.name) from None
+
+
+def _parse_front_reg(data: bytes, front_uid: int) -> FrontReg:
+    obj = _parse_canonical(data, "front registration")
+    _keys(obj, FRONT_REG_KEYS, FRONT_REG_KEYS, "front registration")
+    uid = _uint(obj["front_uid"], "front registration.front_uid")
+    if uid != front_uid:
+        raise Refused("bad-value", f"front registration.front_uid {uid} is not the file's {front_uid}")
+    return FrontReg(uid, _uint(obj[REG_TOKEN], f"front registration.{REG_TOKEN}"))
+
+
 # --- §3.5 Pool: root's slot state file ---------------------------------------------------------------------
 
 SLOT_STATE_FORMAT = "levain-slot-state/1"
@@ -777,11 +828,12 @@ def read_record(path: Path, *, max_bytes: int = 1 << 20) -> bytes | None:
 __all__ = [
     "ACTIVE", "ALLOCATED", "ALLOC_FORMAT", "ARTIFACT_FIELDS", "ATTACH_CLAIM_KEYS", "Alloc", "AllocPolicy",
     "BRAKED", "CAS_FIELDS", "CREDENTIAL_PARKED", "DEAD", "EDGES", "END_FROM_STATES", "END_INTO_STATES",
-    "EVENT_KINDS", "EXCLUSIVE_PAIRS", "FIELD_CHECKS", "FROZEN", "Front", "HELD", "LIVE_STATES",
-    "MINT_CLAIM_KEYS", "NotDurable", "OBSERVED_ID_RE", "PURGED", "RENDERED", "RENDERING", "RETAINED", "REVOKED",
+    "EVENT_KINDS", "EXCLUSIVE_PAIRS", "FIELD_CHECKS", "FRONT_REG_KEYS", "FROZEN", "Front", "FrontReg", "HELD",
+    "LIVE_STATES", "MINT_CLAIM_KEYS", "NotDurable", "OBSERVED_ID_RE", "PERSISTED_CLAIM_KEYS", "PURGED", "REG_TOKEN",
+    "RENDERED", "RENDERING", "RETAINED", "REVOKED",
     "REVOKED_SET_STATES", "SLOT_STATES", "SLOT_STATE_FORMAT", "STATES", "STATE_FORMAT", "SessionState", "SlotState",
     "TOUCHED_NAMES", "TRASH", "alloc_bytes", "alloc_record",
     "cgroup_path", "check_alloc", "check_exclusive", "check_session", "check_state", "check_timestamp",
-    "epoch_of", "has_mint_claims", "parse_alloc", "parse_attach_claims", "parse_claims", "parse_mint_claims",
-    "parse_slot_state", "parse_state", "read_record", "slot_obj", "slot_state_bytes", "state_bytes", "state_record", "timestamp", "write_durably",
+    "epoch_of", "front_reg_bytes", "has_mint_claims", "parse_alloc", "parse_attach_claims", "parse_claims",
+    "parse_front_reg", "parse_mint_claims", "parse_slot_state", "parse_state", "read_record", "slot_obj", "slot_state_bytes", "state_bytes", "state_record", "timestamp", "write_durably",
 ]
