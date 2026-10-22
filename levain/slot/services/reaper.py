@@ -138,7 +138,10 @@ def _wait(fd: int, timeout: float) -> None:
 def worker_loop(reaper: RP.Reaper, wake_fd: int, *, passes: Optional[int] = None, tick_s: float = RP.V11_S,
                 log: Callable[[str], None] = _log) -> int:
     log(f"worker pid {os.getpid()} parent {os.getppid()}")
-    reaper.boot_steps()
+    try:
+        reaper.boot_steps()
+    except Exception as e:   # noqa: BLE001 - a bad boot step is logged; the passes run their own steps
+        log(f"worker boot failed: {type(e).__name__}: {e}")
     mono = reaper.seams.monotonic
     last = float("-inf")
     n = 0
@@ -173,8 +176,9 @@ def revoker_loop(revoker: RP.Revoker, wake_fd: int, *, wakes: Optional[int] = No
         slow = False
         try:
             out = revoker.wake()
-        except Exception as e:   # noqa: BLE001 - one bad wake is logged; a pending kill is retried on its cadence
+        except Exception as e:   # noqa: BLE001 - one bad wake is logged and retried like a slow one
             log(f"revoker wake {n} failed: {type(e).__name__}: {e}")
+            slow = True
         else:
             log(f"revoker wake {n}: control {out['control']} outcomes {out['outcomes']}")
             slow = out["control"] == "slow"

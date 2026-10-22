@@ -57,3 +57,46 @@ def test_revoker_retries_a_front_kill_that_errored_while_control_is_down(tmp_pat
     assert calls == [s, s]
     assert second["outcomes"][s] == "front-ended"
     assert not rv.pending()
+
+
+def test_an_unreadable_alloc_keeps_its_pending_kill_and_the_fast_retry(tmp_path, monkeypatch):
+    # Reproduced on a4d011b0: the unreadable alloc's lease was evicted from first_seen and pending() went false, so
+    # the retry waited a V11 tick.
+    """CONTROL down, an ACTIVE egress session whose first front kill errored. On the next wake its alloc cannot be
+    read: the lease it already saw stays pending, and an alloc that failed on its first read is pending too."""
+    from levain.slot import reaper as RP
+    from levain.slot import runtime_helper as H
+
+    w, la, table = _world(tmp_path)
+    s = _started(w, la, table)
+
+    def down(path):
+        raise Refused("control-down", str(path))
+    w.seams.client_factory = down
+    real_kill, real_read = SS.revoke_front, H.Store.read
+    kills, unreadable = [], {"n": 0}
+
+    def flaky_kill(ctx, a):
+        kills.append(a.session)
+        if len(kills) == 1:
+            raise OSError(5, "Input/output error")
+        return real_kill(ctx, a)
+
+    def flaky_read(self, parts, name, **kw):
+        if tuple(parts) == ("alloc",) and unreadable["n"]:
+            unreadable["n"] -= 1
+            raise OSError(5, "Input/output error")
+        return real_read(self, parts, name, **kw)
+    monkeypatch.setattr(SS, "revoke_front", flaky_kill)
+    monkeypatch.setattr(H.Store, "read", flaky_read)
+
+    rv = RP.Revoker(w.seams)
+    unreadable["n"] = 1
+    assert rv.wake()["outcomes"][s] == "alloc:OSError"
+    assert rv.pending() and not kills
+    assert rv.wake()["outcomes"][s] == "error:OSError"
+    unreadable["n"] = 1
+    assert rv.wake()["outcomes"][s] == "alloc:OSError"
+    assert rv.pending() and len(rv.first_seen) == 1
+    assert rv.wake()["outcomes"][s] == "front-ended"
+    assert kills == [s, s] and not rv.pending()

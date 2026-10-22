@@ -663,9 +663,10 @@ class Revoker:
         self.done: Dict[Tuple[str, int], str] = {}
         self.first_seen: Dict[Tuple[str, int], float] = {}
         self.slow_since: Optional[float] = None
+        self.unread: frozenset = frozenset()   # the targets whose alloc the last wake could not read
 
     def pending(self) -> bool:
-        return any(k not in self.done for k in self.first_seen)
+        return bool(self.unread) or any(k not in self.done for k in self.first_seen)
 
     def wake(self) -> Dict[str, object]:
         PR.reap_leftovers()
@@ -678,15 +679,17 @@ class Revoker:
             if slow:   # only the leases CONTROL already confirmed, still pending
                 targets = sorted({k[0] for k in self.first_seen if k not in self.done})
             allocs = {}
+            unread = set()
             for s in targets:   # type: ignore[union-attr]
                 try:
                     raw = ctx.store.read(("alloc",), f"{s}.json")
                     if raw is None:
                         continue
                     a = R.parse_alloc(raw)
-                except Exception as e:   # noqa: BLE001 - this alloc is named; the other targets go on
+                except Exception as e:   # noqa: BLE001 - this alloc is named and kept pending; the other targets go on
                     self.log(f"revoker: alloc {s}: {type(e).__name__}: {e}")
                     out["outcomes"][s] = f"alloc:{_name(e)}"            # type: ignore[index]
+                    unread.add(s)
                     continue
                 key = (s, a.lease_seq)
                 if a.session == s and a.slot.slot_class == "egress" and (not slow or key in self.first_seen):
@@ -711,8 +714,9 @@ class Revoker:
                         self.log(f"revoker: {a.session} lease {a.lease_seq}: {res}")
                 elif not (res == "front-busy" and now - self.first_seen[key] < SS.REVOKE_FRONT_S):
                     self.log(f"revoker: {a.session} lease {a.lease_seq}: {res}; retried on the next wake")
-            if not slow:
-                for key in [k for k in self.first_seen if k not in allocs]:
+            self.unread = frozenset(unread)
+            if not slow:   # a lease whose alloc could not be read is not known gone: it is kept
+                for key in [k for k in self.first_seen if k not in allocs and k[0] not in unread]:
                     self.first_seen.pop(key, None)
                     self.done.pop(key, None)
         finally:

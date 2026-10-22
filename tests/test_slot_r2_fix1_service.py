@@ -22,13 +22,15 @@ class _FakeReaper:
     """With ``fail_first``, ``run_pass`` raises on its first call in each process (a restarted child starts fresh)."""
 
     fail_first = False
+    fail_boot = False
 
     def __init__(self, seams, **_kw):
         self.seams = seams
         self.calls = 0
 
     def boot_steps(self):
-        return None
+        if self.fail_boot:
+            raise OSError(40, "Too many levels of symbolic links")
 
     def run_pass(self):
         self.calls += 1
@@ -84,6 +86,18 @@ def test_one_bad_pass_never_kills_the_worker_and_one_bound_is_enough(world, monk
     assert _serve(seams, log, worker_passes=2) == 0
     text = logf.read_text()
     assert "RuntimeError: one bad pass" in text
+    assert "restarting" not in text
+    assert text.count("started worker") == 1
+
+
+def test_a_failed_boot_step_never_kills_the_worker(world, monkeypatch):
+    # Reproduced on a4d011b0: the worker died on the raised boot step and restarted into the same raise (the alarm
+    # fired with serve still looping).
+    seams, log, logf = world
+    monkeypatch.setattr(_FakeReaper, "fail_boot", True)
+    assert _serve(seams, log, worker_passes=1) == 0
+    text = logf.read_text()
+    assert "OSError: [Errno 40] Too many levels of symbolic links" in text
     assert "restarting" not in text
     assert text.count("started worker") == 1
 
