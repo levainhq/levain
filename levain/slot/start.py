@@ -229,9 +229,9 @@ def kill_domain(ctx: H.Ctx, a: R.Alloc, children: Sequence[int] = ()) -> Tuple[P
 def _abandon(ctx: H.Ctx, a: R.Alloc, pid: int, what: str) -> None:
     """A launch the start will not keep: its domain killed with ``pid`` as the kill's child (macOS reaps it before the
     proof: a zombie child of the start is a process of the uid until reaped), then ``seams.kill(pid)`` (SIGKILL +
-    waitpid) ONLY for a pid that kill did not reap: a reaped pid may already be another process's. The launched pid
-    is one process across ``launchctl asuser``'s exec, the stage's drop and its exec of the target: root until the
-    stage drops, the slot uid after. macOS: :func:`proc.end_domain` SIGKILLs it FIRST, before its freeze (still the
+    waitpid) ONLY for a pid that kill did not reap, its kill seam's own reap included: a reaped pid may already be
+    another process's. The launched pid is one process across ``launchctl asuser``'s exec, the stage's drop and its
+    exec of the target: root until the stage drops, the slot uid after. macOS: :func:`proc.end_domain` SIGKILLs it FIRST, before its freeze (still the
     start's unreaped child, so the pid cannot be reused), so a pid still root is ended before it can drop and fork,
     and the reap is never waited on to the deadline. A failure here is noted, never raised over the refusal the
     caller is about to raise.

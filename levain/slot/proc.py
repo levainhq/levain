@@ -149,19 +149,23 @@ def _reap_nohang(pid: int) -> bool:
     return got == pid
 
 
-def _sigkill_own_child(pid: int) -> None:
+def _sigkill_own_child(pid: int) -> bool:
     """SIGKILL ``pid`` only while it is the caller's own child and still unreaped (a ``WNOHANG`` wait answers 0): an
     unreaped pid cannot be reused, so the signal reaches that child and no other process. A pid that is not the
-    caller's child is never signalled."""
+    caller's child is never signalled. Returns whether the caller holds no pid it may still signal: the wait reaped
+    it (it exited after the caller's last reap), or it is no longer the caller's child at all, as
+    :func:`_reap_nohang` answers. Either way the pid may already be reused, so the caller records it as reaped."""
     try:
         got, _ = os.waitpid(pid, os.WNOHANG)
     except ChildProcessError:
-        return
-    if got == 0:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        return True
+    if got == pid:
+        return True
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    return False
 
 
 @dataclass
@@ -173,7 +177,7 @@ class ProcSeams:
     when set (macOS), a sweep signals every process of the uid at once AS the uid, never a pid, and
     returns whether the signal was sent within ``timeout`` seconds; ``pin`` / ``send`` are then never used.
     ``reap(pid)``: a non-blocking reap of the caller's own child (:func:`_reap_nohang`); ``kill_child(pid)``: SIGKILL
-    the caller's own unreaped child (:func:`_sigkill_own_child`)."""
+    the caller's own unreaped child, answering whether it reaped the pid instead (:func:`_sigkill_own_child`)."""
     listing: Callable[[], Iterable[Proc]]
     probe: Callable[[int], Proc | None]
     pin: Callable[[int], object]
@@ -190,7 +194,7 @@ class ProcSeams:
     #: timeout or a spawn error (:func:`darwin_bootout`); ``None`` elsewhere.
     domain_out: Callable[[int, float], int | None] | None = None
     reap: Callable[[int], bool] = _reap_nohang
-    kill_child: Callable[[int], None] = _sigkill_own_child
+    kill_child: Callable[[int], bool] = _sigkill_own_child
 
 
 def check_target(uid: object, seams: ProcSeams) -> int:
@@ -482,11 +486,11 @@ def end_domain(uid: int, bound_s: float = V12K_SECONDS, children: Iterable[int] 
 
 def _reap_or_kill(pid: int, seams: ProcSeams, reaped: set[int]) -> bool:
     """One non-blocking reap of the caller's child ``pid``; not reaped = SIGKILLed (it is still the caller's unreaped
-    child, so the pid is not reusable). Returns whether it is reaped."""
-    if seams.reap(pid):
+    child, so the pid is not reusable). Returns whether it is reaped: by the reap, or by the kill seam's own wait (the
+    child exited between the two), and a reaped pid enters ``reaped`` on either path."""
+    if seams.reap(pid) or seams.kill_child(pid):
         reaped.add(pid)
         return True
-    seams.kill_child(pid)
     return False
 
 
