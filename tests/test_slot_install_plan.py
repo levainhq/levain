@@ -10,7 +10,7 @@ from levain.firing import hands
 from levain.firing.hands import Step
 from levain.slot import Refused
 from levain.slot.accounts import OPERATOR_GROUPS, SLOT_MARKER, supplementary_groups
-from levain.slot.grammar import VERBS, parse_install_argv
+from levain.slot.grammar import LEASE_EXEMPT, VERBS, parse_install_argv
 from levain.slot.ids import (RANGES, SHARED_GROUPS, SINGLETONS, SlotId, read_retired_ids, retired_ids_text,
                              write_retired_ids)
 from levain.slot.install_helper import (HostFacts, operator_record, operator_record_text, parse_operator_record,
@@ -254,15 +254,18 @@ def test_egress0_and_verifier0_disjoint():
 def test_install_verbs_refuse_with_live_lease(verb):
     argv = {"setup": ["setup", "--slots", "8", "--verifier-slots", "2", "--operator", OP],
             "set-retention": ["set-retention", "30"], "set-dispatch-retain": ["set-dispatch-retain", "3"],
-            "purge": ["purge", "s-0123456789abcdef"], "force-retire": ["force-retire", "egress", "0"]}.get(verb, [verb])
+            "purge": ["purge", "s-0123456789abcdef"], "force-retire": ["force-retire", "egress", "0"],
+            "set-credential": ["set-credential", "anthropic"],
+            "remove-credential": ["remove-credential", "anthropic"]}.get(verb, [verb])
     cmd = parse_install_argv(argv)
     facts = _set_up("linux", live_leases=1) if verb != "setup" else _facts("linux", live_leases=1)
-    if verb in ("purge", "force-retire"):
-        preflight(cmd, facts)                 # the two lease-exempt verbs pass
+    assert LEASE_EXEMPT == {"purge", "force-retire", "set-credential", "remove-credential"}
+    if verb in LEASE_EXEMPT:
+        preflight(cmd, facts)                 # the lease-exempt verbs pass
     else:
         assert _refusal(preflight, cmd, facts) == "live-lease"
     # the lease refusal comes before the operator check
-    if verb not in ("purge", "force-retire"):
+    if verb not in LEASE_EXEMPT:
         assert _refusal(preflight, cmd, _facts("linux", live_leases=1, caller_uid=9)) == "live-lease"
 
 
