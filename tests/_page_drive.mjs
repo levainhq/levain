@@ -4,7 +4,9 @@
 //   {"until": "<expression>", "ms": <n>}     polled until truthy and collected; a wait that never comes true FAILS the
 //                                            drive (stderr names the step and its expression, exit 1), unless the step
 //                                            carries "may_timeout": true, which collects {"timeout": ...} instead
-//   {"posts": <n>, "ms": <n>}                waits until n POSTs have been sent
+//   {"posts": <n>, "ms": <n>}                waits until n POSTs have been sent; fewer by the deadline FAILS the drive
+//                                            (same rule and same "may_timeout": true opt-out as `until`)
+// A failing wait also saves timeout-step-<n>.png (+ .txt, the page text) beside the steps file and names it on stderr.
 //   {"emulate": {"w": <px>, "h": <px>, "dpr": <n>, "mobile": <bool>}}   a device size, applied before the page is drawn again
 //   {"scheme": "dark"|"light"}              the phone's colour-scheme setting (prefers-color-scheme), applied before the next read
 //   {"shot": "<abs path.png>", "full": <bool>}   saves a PNG screenshot there (the whole page when full); collected as {"shot": path}
@@ -76,6 +78,19 @@ for (const end = Date.now() + 15000; Date.now() < end;) {
   if (await evaluate("document.readyState") === "complete") break;
   await sleep(100);
 }
+// a wait that fails the drive leaves a PNG of what the page showed beside the steps file (the test's tmp dir),
+// and its path on stderr, so the failure can be read rather than guessed at
+const shotOnTimeout = async (n) => {
+  try {
+    const r = await send("Page.captureScreenshot", { format: "png" });
+    if (!r.result?.data) return;
+    const p = join(dirname(stepsPath), `timeout-step-${n}.png`);
+    writeFileSync(p, Buffer.from(r.result.data, "base64"));
+    console.error(`screenshot at the timeout: ${p}`);
+    const t = await evaluate("document.body.innerText");
+    if (typeof t === "string") writeFileSync(p.replace(/\.png$/, ".txt"), t);
+  } catch {}
+};
 for (const s of steps) {
   const deadline = Date.now() + (s.ms || 20000);
   if (s.authenticator !== undefined) {
@@ -107,6 +122,11 @@ for (const s of steps) {
     values.push({ shot: s.shot });
   } else if (s.posts !== undefined) {
     while (posts.length < s.posts && Date.now() < deadline) await sleep(100);
+    if (posts.length < s.posts && !s.may_timeout) {
+      console.error(`step ${steps.indexOf(s)}: posts never reached ${s.posts} within ${s.ms || 20000}ms (saw ${posts.length})`);
+      await shotOnTimeout(steps.indexOf(s));
+      done(1); await sleep(10000);
+    }
   } else if (s.until !== undefined) {
     let v = null;
     for (;;) {
@@ -116,6 +136,7 @@ for (const s of steps) {
     }
     if (!v && !s.may_timeout) {
       console.error(`step ${steps.indexOf(s)}: until never came true within ${s.ms || 20000}ms: ${s.until}`);
+      await shotOnTimeout(steps.indexOf(s));
       done(1); await sleep(10000);
     }
     values.push(v || { timeout: s.until });

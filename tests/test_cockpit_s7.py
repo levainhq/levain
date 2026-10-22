@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from levain.cockpit.providers import _where_to_begin
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
-from tests.test_cockpit_k4a_needs import DESKTOP, READY
+from tests.test_cockpit_k4a_needs import DESKTOP
 
 TODAY = date(2026, 10, 20)
 
@@ -75,7 +75,7 @@ _PROBE = r"""(() => {
 def test_the_card_groups_threads_by_repo_loudest_first(tmp_path: Path) -> None:
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": READY}, {"until": "document.querySelector('.brief-card')"},
+        out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": "document.querySelector('.brief-card')"},
                                                           {"eval": _PROBE}])["values"]
     got = json.loads(out[-1])
     assert got["card"] and got["title"] == "Next from the Tray" and got["source"] == "from the Tray and Open loops", got   # the data says "Where to begin"; the card names what it holds, and the caption sits under the loops heading
@@ -96,8 +96,11 @@ def test_build_draws_the_activity_band_as_the_compact_strip_and_board_the_full_c
     shown = {}
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         for tab in ("build", "board"):
-            shown[tab] = json.loads(_drive(tmp_path, f"{url}/#write_token=T&{tab}", [DESKTOP, {"until": READY},
-                {"until": "document.querySelector('.sky-canvas')"}, {"eval": probe}])["values"][-1])
+            # K11 (ab3e3d36): the header's cold-open lens is the Agents graph and the Activity band is its Event graph lens, so the
+            # band is looked at on that lens
+            shown[tab] = json.loads(_drive(tmp_path, f"{url}/#write_token=T&{tab}", [DESKTOP,
+                {"until": "document.querySelector('#ck-hlens [data-tv=events]')"}, {"eval": "document.querySelector('#ck-hlens [data-tv=events]').click(); 1"},
+                {"until": "document.getElementById('ck-skycard').dataset.hlens == 'events' && document.querySelector('.sky-canvas')"}, {"eval": probe}])["values"][-1])
     b, d = shown["build"], shown["board"]
     assert b["head"] == "Activity" and b["win"] == "last 14 h" and b["legend"] == "none", b
     assert b["canvas"] < 100 and b["h"] < 160, b                       # the mock's band is ~85 px

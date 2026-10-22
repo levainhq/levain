@@ -68,3 +68,19 @@ def test_an_until_that_never_comes_true_fails_the_drive_unless_it_may_time_out(t
     r = drive({"until": "document.title === 'never'", "ms": 300, "may_timeout": True})
     assert r.returncode == 0, r.stderr
     assert json.loads(r.stdout)["values"] == [{"timeout": "document.title === 'never'"}]
+
+
+@pytest.mark.skipif(not Path(CHROME).exists() or not shutil.which("node"), reason="needs Chrome and node")
+def test_a_posts_wait_that_comes_up_short_fails_the_drive_and_leaves_a_picture_of_the_page(tmp_path):
+    node = shutil.which("node")
+    steps = tmp_path / "steps.json"
+
+    def drive(step):
+        steps.write_text(json.dumps([step]))
+        return _page_drive_run.run([node, DRIVER, CHROME, "about:blank", str(steps)], timeout=60)
+
+    r = drive({"posts": 1, "ms": 300})
+    assert r.returncode != 0 and "step 0: posts never reached 1" in r.stderr, (r.returncode, r.stderr)
+    assert (tmp_path / "timeout-step-0.png").stat().st_size > 0 and "timeout-step-0.png" in r.stderr       # what the page showed
+    r = drive({"posts": 1, "ms": 300, "may_timeout": True})
+    assert r.returncode == 0, r.stderr

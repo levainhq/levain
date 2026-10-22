@@ -388,7 +388,7 @@ def test_switching_lens_while_replaying_leaves_replay_and_the_strip_is_live_in_t
 @needs_browser
 def test_the_live_retry_after_a_failure_issues_a_new_read_and_never_shows_the_unlabelled_stale_value(tmp_path, monkeypatch):
     out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'false'; 1"}, {"eval": H_LIVE},
-                                            {"until": "!!document.querySelector('#h6 .tv-rerr')", "ms": 8000}, {"eval": H_INFO},
+                                            {"until": "(window.__opts.repaint(), !!document.querySelector('#h6 .tv-rerr'))", "ms": 15000}, {"eval": H_INFO},   # (15 s as the hung-resume test waits: a loaded host) the host shares the module state with the page's own card: repaint it by hand
                                             {"eval": "window.__mode = 'hang'; 1"}, {"eval": H_LIVE}, SLEEP(200), {"eval": H_INFO}])
     failed, retry = json.loads(out[-5]), json.loads(out[-1])
     assert failed["resumes"] == 1 and "could not return to live" in failed["badge"] and "Live tries again" in failed["badge"], failed
@@ -400,7 +400,9 @@ def test_the_live_retry_after_a_failure_issues_a_new_read_and_never_shows_the_un
 def test_a_lens_switch_keeps_the_labelled_frame_until_the_live_read_applies(tmp_path, monkeypatch):
     out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'hang'; 1"},
                                             {"eval": "document.querySelector('#h6 [data-tv=work]').click(); 1"}, SLEEP(300), {"eval": H_INFO},
-                                            {"eval": "window.__mode = 'applied'; 1"}, {"eval": H_LIVE}, {"until": "!window.LevainTopologyView.replaying()", "ms": 8000}, {"eval": H_INFO}])
+                                            {"eval": "window.__mode = 'applied'; 1"}, {"eval": H_LIVE},
+                                            # the host card shares the module state with the page's own card, so it is repainted by hand (as the failed-return test does) and the wait is on both
+                                            {"until": "(window.__opts.repaint(), !window.LevainTopologyView.replaying() && !document.querySelector('#h6 .tv-rbadge'))", "ms": 8000}, {"eval": H_INFO}])
     mid, done = json.loads(out[-5]), json.loads(out[-1])
     assert mid["replaying"] is True and mid["badge"] == "returning to live…" and mid["rshown"] not in (None, "live") and mid["resumes"] == 1, mid
     assert done["replaying"] is False and done["badge"] is None, done

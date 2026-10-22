@@ -16,6 +16,10 @@ from tests.test_cockpit_k7_build import DESKTOP, _sessions_fixture
 from tests.test_cockpit_topology import _good, _panel
 
 
+# a faulted or bare topology draws the Sessions card and no .tv: the card is what such a test waits for
+CARD = "document.querySelector('#k7-sessions .k7-card')"
+
+
 def _lost(**by_node: dict[str, Any]) -> list[dict[str, Any]]:
     return [{"node": n, "dirty": 0, "dirty_names": [], "unpushed": 0, "branches": [], "uncaptured_episodes": None, "running_children": 0, **o}
             for n, o in by_node.items()]
@@ -32,13 +36,16 @@ def test_a_node_with_work_to_lose_carries_an_at_risk_mark_in_both_lenses_and_unk
                                 n3={"dirty": 0, "unpushed": 0, "running_children": 0}, n4={"dirty": None, "unpushed": None, "running_children": None})
     probe = ("JSON.stringify(Object.fromEntries([...%s.querySelectorAll('[data-node]')].map(n => [n.dataset.node, "
              "(n.querySelector('.tv-risk') || {title: null}).title])))") % TV
-    out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}, {"eval": _paint(v, "agents")}, {"eval": probe}])
+    # K10 S6 (c90269cd) drew the Agents lens as a graph: a node at risk wears a .tv-gnode-risk dot, and the words ("not tracked") live in the
+    # Work chip and in the Lost if closed panel
+    probe_g = ("JSON.stringify(Object.fromEntries([...%s.querySelectorAll('svg.tv-graph g[data-node]')].map(n => [n.dataset.node, "
+               "!!n.querySelector('.tv-gnode-risk')])))") % TV
+    out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}, {"eval": _paint(v, "agents")}, {"eval": probe_g}])
     work, agents = json.loads(out[-3]), json.loads(out[-1])
     assert work.get("n1") == "2 dirty · 1 unpushed · 3 running", work                      # the worker chip on the task it works
     assert work.get("n3") is None, work                                                    # nothing to lose: no mark
-    assert agents["n1"] == "2 dirty · 1 unpushed · 3 running", agents                      # the node face
-    assert agents["n2"] == "dirty not tracked · 4 unpushed · running not tracked", agents  # null is "not tracked", never 0
-    assert agents["n3"] is None and agents["n4"] is None, agents                           # all zero, or all unknown: no mark
+    assert agents["n1"] is True and agents["n2"] is True, agents                           # the node's dot: n2's null dirty is unknown, its 4 unpushed are not
+    assert agents["n3"] is False and agents["n4"] is False, agents                         # all zero, or all unknown: no mark
 
 
 # --- codex MED + complement MED-2: a faulted provider hidden -------------------------------------------------
@@ -51,12 +58,12 @@ def test_a_topology_provider_faulted_at_load_is_said_in_the_sessions_card_in_eit
     monkeypatch.setattr(topo, "topology_reader", lambda **kw: (lambda ctx: Fault("the session records are gone")))
     probe = ("JSON.stringify({line: [...document.querySelectorAll('#ck-hlens .k7-none.err, #ck-hlens .tv-fault')].map(n => n.textContent), "
              "rows: document.querySelectorAll('#k7-sessions .k7-srow').length})")
-    out = _run(tmp_path, src, [{"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": "new Promise(r => setTimeout(r, 600))"}, {"eval": probe}], first=MID)
+    out = _run(tmp_path, src, [{"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": "new Promise(r => setTimeout(r, 600))"}, {"eval": probe}], first=MID, until=CARD)
     got = json.loads(out[-1])
     assert any("Topology unavailable: " in t and "the session records are gone" in t for t in got["line"]), got   # the list view, not only topology
     assert got["rows"] == 3, got                                                                                  # the list still draws
     panel = ("(() => { const p = document.querySelector('[data-ck-panel=\"topology\"]'); return p ? getComputedStyle(p).display : 'absent'; })()")
-    out = _run(tmp_path, src, [{"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": "new Promise(r => setTimeout(r, 600))"}, {"eval": panel}], first=MID)
+    out = _run(tmp_path, src, [{"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": "new Promise(r => setTimeout(r, 600))"}, {"eval": panel}], first=MID, until=CARD)
     assert out[-1] != "none", out                                                                                  # a faulted panel is not hidden by a broad selector
 
 
@@ -103,9 +110,10 @@ def test_a_parent_cycle_inside_a_group_still_draws_every_node_once(tmp_path, mon
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     v = _value()
     v["nodes"][0]["parent"] = "n2"                                                                                   # n1 -> n2 -> n1
-    probe = "JSON.stringify([...%s.querySelectorAll('.tv-col[data-group=g1] .tv-node')].map(n => n.dataset.node).sort())" % TV
+    # K10 S6 (c90269cd) drew the Agents lens as a graph: every node is one g[data-node] in the svg, no longer a .tv-node in a group column
+    probe = "JSON.stringify([...%s.querySelectorAll('svg.tv-graph g[data-node]')].map(n => n.dataset.node).sort())" % TV
     out = _run(tmp_path, src, [{"eval": _paint(v, "agents")}, {"eval": probe}])
-    assert json.loads(out[-1]) == ["n1", "n2", "n3"], out
+    assert json.loads(out[-1]) == ["n1", "n2", "n3", "n4", "n5"], out
 
 
 def test_the_provider_value_is_refused_when_parents_form_a_cycle():
@@ -124,7 +132,7 @@ def test_a_renderer_that_throws_leaves_the_list_and_one_line_not_a_dead_card(tmp
     _spore(root)
     probe = ("JSON.stringify({rows: document.querySelectorAll('#k7-sessions .k7-srow').length, tv: !!%s, "
              "text: document.querySelector('#ck-hlens').innerText.replace(/\\s+/g, ' ')})") % TV
-    out = _run(tmp_path, src, [{"until": TV + " && " + TV + ".querySelector('.tv-task')"}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
+    out = _run(tmp_path, src, [{"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
                                {"until": TV + ".querySelector('.tv-task')"},
                                {"eval": "window.LevainTopologyView.render = () => { throw new Error('boom'); }; document.querySelector('#ck-hlens [data-tv=agents]').click(); 1"},
                                {"eval": "new Promise(r => setTimeout(r, 400))"}, {"eval": probe}])

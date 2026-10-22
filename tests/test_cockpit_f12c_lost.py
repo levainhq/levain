@@ -101,5 +101,5 @@ def test_a_faulted_topology_provider_leaves_the_panel_one_unavailable_line(tmp_p
     from levain.cockpit.results import Fault
     monkeypatch.setattr(topo, "topology_reader", lambda **kw: (lambda ctx: Fault("the session records are gone")))
     out = _run(tmp_path, src, [{"until": "document.querySelector('#k7-sessions .k7-srow, #k7-sessions .k7-none')"}, {"until": LC},
-                               {"eval": LC + ".innerText.replace(/\\s+/g, ' ')"}], first=MID)
+                               {"eval": LC + ".innerText.replace(/\\s+/g, ' ')"}], first=MID, until=CARD)    # a faulted topology draws no .tv: the card is the signal
     assert out[-1].startswith("Lost if closed Unavailable: ") and "the session records are gone" in out[-1], out

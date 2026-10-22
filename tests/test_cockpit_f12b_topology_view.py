@@ -136,7 +136,7 @@ def test_a_bare_install_draws_no_switch_no_topology_and_keeps_the_one_line(tmp_p
     src.anneal.spores_json.unlink(missing_ok=True)                  # K10: an open loop is work, so "bare" means no loop either
     probe = ("JSON.stringify({tv: !!%s, switch: document.querySelectorAll('#ck-hlens [data-tv]').length, "
              "quiet: !!document.querySelector('#ck-hlens .tv-quiet'), text: document.querySelector('#k7-sessions').innerText.replace(/\\s+/g, ' ')})") % TV
-    out = _run(tmp_path, src, [{"until": "document.querySelector('#k7-sessions .k7-none')"}, {"eval": probe}])
+    out = _run(tmp_path, src, [{"eval": probe}], until="document.querySelector('#k7-sessions .k7-none')")   # a bare install draws no card and no .tv: its one line is the signal
     got = json.loads(out[-1])
     assert got["tv"] is False and got["switch"] == 0, got
     assert "No agent session yet: start Claude Code or Codex in a workspace." in got["text"], got

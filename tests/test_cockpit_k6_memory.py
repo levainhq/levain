@@ -10,6 +10,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 
@@ -59,6 +61,11 @@ LONG_ROW = """(() => { const tile = [...document.querySelectorAll('.ck-widgets .
   row.querySelector('.v').textContent = 'failing,3/7'; tile.querySelector('.op').parentElement.appendChild(row); return true; })()"""
 
 
+# PREMISE MOVED (a8e55d2c, 173c00b2): the status rows (.op) draw only in the Health tile, which is Memory-only and hidden on the Memory tab
+# ("the Health strip is hidden here"); the glance tiles carry count faces, so no .op row is on screen on any tab. The clipping guard for what
+# a glance tile does draw is test_no_glance_tile_clips_its_text_at_phone_or_desktop_width. The head rules: retire this test, or re-point it
+# at the face that now carries a status word.
+@pytest.mark.skip(reason="no status row is drawn in any visible glance tile since K6 (a8e55d2c, 173c00b2); the head rules retire or re-point")
 @needs_browser
 def test_a_status_row_with_a_long_value_wraps_instead_of_clipping_in_a_narrow_tile(tmp_path: Path) -> None:
     _root, src, _ids = _install(tmp_path)
@@ -258,7 +265,9 @@ def test_an_editable_section_with_no_text_keeps_its_edit(tmp_path: Path) -> None
   if (!slim) return null;
   const mid = (n) => { const r = n.getBoundingClientRect(); return [Math.round((r.top + r.bottom) / 2), Math.round(r.left), Math.round(r.right)]; };
   const h = slim.querySelector('.phead h2'), e = slim.querySelector('.empty'), b = slim.querySelector('.edit-btn');
-  return { title: h && h.textContent, empty: e && e.textContent, edit: !!b, h: Math.round(slim.getBoundingClientRect().height),
+  // the slim row's CONTENT is one line; its box is the grid cell, stretched to sit level with the right-hand column's tall sections
+  const used = Math.round(Math.max(...[h, e, b].map((n) => n.getBoundingClientRect().bottom)) - slim.getBoundingClientRect().top);
+  return { title: h && h.textContent, empty: e && e.textContent, edit: !!b, h: used,
     mids: [h, e, b].map((n) => n && mid(n)), pats: document.querySelectorAll('.ck-mem-neo .ck-mem-pats .ck-mem-n').length, decs: document.querySelectorAll('.ck-mem-neo .ck-mem-decs .ck-mem-when').length }; })()"""},
         ])["values"]
     r = out[1]
@@ -292,12 +301,14 @@ def test_a_long_section_never_runs_over_the_one_below_it_on_a_phone(tmp_path: Pa
         out = _drive(tmp_path, f"{url}/{MEMORY}", [
             PHONE, {"until": "document.querySelector('.ck-mem-neo .ck-mem-nest')"},
             {"eval": """(async () => { await new Promise(r => setTimeout(r, 500));
-  const ns = [...document.querySelectorAll('.ck-mem-neo .ck-mem-nest')].map((n) => { const r = n.getBoundingClientRect(); return [n.dataset.ckPanel, r.top, r.bottom, n.scrollHeight, r.height]; });
+  const ns = [...document.querySelectorAll('.ck-mem-neo .ck-mem-nest')].map((n) => { const r = n.getBoundingClientRect(); return [n.dataset.ckPanel, r.top, r.bottom, n.scrollHeight, r.height, n.classList.contains('is-clipped') && /Read all/i.test(n.innerText)]; });
   return ns; })()"""},
         ])["values"]
     ns = out[1]
-    assert any(sh > 560 for _p, _t, _b, sh, _h in ns), ns                                    # the probe is real: one section is taller than the generic card cap
-    for (_p, _t, bottom, sh, h), (_p2, top2, _b2, _s2, _h2) in zip(ns, ns[1:]):
+    # the probe is real: the long section is cut at its cap on purpose and says so ("Read all"), the K6 polish premise (the section is no
+    # longer drawn whole past the cap)
+    assert any(says for *_r, says in ns), ns
+    for (_p, _t, bottom, sh, h, _s), (_p2, top2, _b2, _s2, _h2, _s3) in zip(ns, ns[1:]):
         assert sh <= h + 1 and bottom <= top2 + 1, ns                                     # no section is cut at a cap and spilled over its neighbour
 
 

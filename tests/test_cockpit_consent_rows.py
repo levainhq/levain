@@ -310,7 +310,7 @@ def test_a_details_retry_after_a_failed_read_reuses_its_slot(tmp_path, monkeypat
     row = "[...document.querySelectorAll('#levain-modal .consent-row')].find(x => x.querySelector('.consent-audit'))"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
-            {"until": f"{TILE} && /1/.test({TILE}.innerText)"},
+            {"until": TILE},                    # the one request is withdrawn, so nothing waits and the tile counts 0: it is the signal
             {"eval": stub},
             {"eval": OPEN_DECISIONS},
             {"until": f"{row} && {row}.querySelector('.consent-details')"},
