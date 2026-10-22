@@ -41,10 +41,11 @@ class PeerUnknown(Exception):
     """The peer's uid, pid or start time could not be read."""
 
 
-def peer_of(sock: socket.socket) -> Tuple[int, int, int]:
-    """`(uid, pid, start)` of the process that connected `sock`, or `PeerUnknown`."""
+def _creds(sock: socket.socket, want_pid: bool) -> Tuple[int, int]:
+    """`(uid, pid)` from the kernel; pid is 0 when not `want_pid` on macOS, where it is a second read."""
     if sock.family != socket.AF_UNIX:
         raise PeerUnknown("not a unix socket")
+    pid = 0
     try:
         if sys.platform.startswith("linux"):
             pid, uid, _gid = _UCRED.unpack(sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _UCRED.size))
@@ -53,11 +54,24 @@ def peer_of(sock: socket.socket) -> Tuple[int, int, int]:
             version, uid = _XUCRED.unpack(raw[:_XUCRED.size])[:2]
             if version != _XUCRED_VERSION:
                 raise PeerUnknown(f"xucred version {version}")
-            pid = struct.unpack("i", sock.getsockopt(_SOL_LOCAL, _LOCAL_PEERPID, struct.calcsize("i")))[0]
+            if want_pid:
+                pid = struct.unpack("i", sock.getsockopt(_SOL_LOCAL, _LOCAL_PEERPID, struct.calcsize("i")))[0]
         else:
             raise PeerUnknown(f"no peer credentials on {sys.platform}")
     except (OSError, struct.error) as e:
         raise PeerUnknown(f"{type(e).__name__}: {e}") from None
+    return uid, pid
+
+
+def peer_uid(sock: socket.socket) -> int:
+    """The uid of the process that connected `sock`, or `PeerUnknown`. The admin socket's check needs nothing else,
+    so it never fails on a pid or start time it could not read."""
+    return _creds(sock, False)[0]
+
+
+def peer_of(sock: socket.socket) -> Tuple[int, int, int]:
+    """`(uid, pid, start)` of the process that connected `sock`, or `PeerUnknown`."""
+    uid, pid = _creds(sock, True)
     if pid <= 0:
         raise PeerUnknown(f"pid {pid}")
     start = start_of(pid)
