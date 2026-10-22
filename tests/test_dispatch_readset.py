@@ -429,3 +429,57 @@ def test_verify_refuses_a_read_set_that_loosens_the_settings_by_name(tmp_path):
         os.close(fd)
     assert got.name == "loosening:disable-all-hooks"
     assert os.listdir(parent) == []                                    # the refused attempt's workdir is gone
+
+
+def test_a_read_set_over_the_handoff_cap_is_refused_at_filing(world, tmp_path, monkeypatch):
+    # reproduced (wa-fix1 repro.py R2): an over-cap read set was exported for signing and refused only at the run
+    import levain.slot.stage as stage
+    from levain.dispatch.readset import TMP_DIR, export_readset
+    _root, repo, _base, _old_a, contract = world
+    top = Path(os.path.realpath(tmp_path))
+    rs = build_readset(str(repo), contract, dest(top, "scratch"), contract_digest=contract.digest)
+    handoff = top / "handoff"
+    handoff.mkdir(mode=0o700)
+    monkeypatch.setattr(stage, "BUNDLE_CAP", 64)
+    got = refusal(export_readset, rs, contract.canonical().encode("utf-8"), contract.digest, str(handoff))
+    assert got.name == "readset-handoff"
+    assert os.listdir(handoff / TMP_DIR) == []                         # the temp was unlinked
+
+
+def test_a_failed_staging_flush_is_named_and_leaves_no_bundle(world, tmp_path, monkeypatch):
+    # reproduced (wa-fix1 repro.py R7): EIO on the staging flush escaped raw and left repo.bundle behind, so the next
+    # cut into that staging was refused readset-dest
+    import errno
+    import stat
+
+    from levain.dispatch import readset as R
+    from levain.dispatch.attempt_id import new_attempt_id
+    _root, repo, _base, _old_a, contract = world
+    top = Path(os.path.realpath(tmp_path))
+    cb, d = contract.canonical().encode("utf-8"), contract.digest
+    rs = build_readset(str(repo), contract, dest(top, "scratch"), contract_digest=d)
+    for name in ("handoff", "attempts", "staging"):
+        (top / name).mkdir(mode=0o700)
+    ex = R.export_readset(rs, cb, d, str(top / "handoff"))
+    try:
+        fd = R.open_handoff(ex.path, size=ex.size)
+    finally:
+        os.close(ex.fd)
+    try:
+        v = R.verify_readset(cb, d, fd, str(top / "attempts"), new_attempt_id())
+    finally:
+        os.close(fd)
+    real = R.full_fsync
+
+    def eio_on_dirs(f: int) -> str:
+        if stat.S_ISDIR(os.fstat(f).st_mode):
+            raise OSError(errno.EIO, "injected")
+        return real(f)
+
+    monkeypatch.setattr(R, "full_fsync", eio_on_dirs)
+    got = refusal(R.bundle_verified, v, cb, d, str(top / "staging"))
+    assert got.name == "readset-dest"
+    assert os.listdir(top / "staging") == []
+    monkeypatch.setattr(R, "full_fsync", real)
+    assert R.bundle_verified(v, cb, d, str(top / "staging")).commit == v.commit
+    R.discard(v)
