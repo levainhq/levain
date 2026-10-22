@@ -4,7 +4,9 @@ The rule: an assertion is taken when a store write finds at least one thread of 
 released by the write that finds none. It is held only as long as the holder lives (:data:`HOLD_SECONDS`) and is renewed
 only by a committed coordinator-store write that lands in the last half of that life: there is no timer, so a working
 thread whose store stays quiet for that stretch (a beat cadence longer than half the hold, with no ``levain coord
-watch`` pass writing) loses the hold until the next write, while ``levain doctor`` reports the gap honestly. It is an IDLE-sleep assertion only (macOS ``caffeinate -i``, Linux ``systemd-inhibit --what=idle``); Levain
+watch`` pass writing) loses the hold until the next write, while ``levain doctor`` reports the gap honestly.
+
+It is an IDLE-sleep assertion only (macOS ``caffeinate -i``, Linux ``systemd-inhibit --what=idle``); Levain
 never writes the machine's power settings and never uses sudo. Whether it keeps a closed lid awake on battery is a
 claim this module does not make: it does not, because an idle-sleep assertion is by Apple's own header not a hold
 against lid-close sleep (see :data:`LID_NOTE`).
