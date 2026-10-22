@@ -205,17 +205,6 @@ def proc_identity(pid: int) -> Optional[Tuple[int, int]]:
     return p.uids[0], p.start
 
 
-def _sigkill_and_reap(pid: int) -> None:
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
-    try:
-        os.waitpid(pid, 0)          # the helper is the front's parent until it exits: reap it
-    except ChildProcessError:
-        pass
-
-
 def darwin_user_dir(uid: int, gid: int) -> str:
     """macOS: ``uid``'s ``/private/var/folders/<a>/<b>`` (alloc's ``var_folders``, read at prepare), from ``getconf
     DARWIN_USER_DIR`` run AS that uid (``/var/folders/<a>/<b>/0/``); it CREATES the dir when absent [measured:
@@ -380,8 +369,10 @@ def drain(fd: int, bound: int, *, deadline_s: float = CHECK_S,
 def reap_within(pid: int, deadline_s: float, *, monotonic: Callable[[], float] = time.monotonic,
                 sleep: Callable[[float], None] = time.sleep, refusal: str = "check-timeout") -> int:
     """The helper's own child ``pid`` reaped within ``deadline_s`` (its exit status as :func:`wait_child` answers
-    it); past it the child is killed and reaped, then ``refusal`` (``check-timeout`` for a post-clone check child).
-    Polled (``WNOHANG``), as no portable call waits on one pid with a timeout."""
+    it); past it the child is SIGKILLed and its reap polled for at most ``proc.REAP_GRACE_S``
+    (:func:`levain.slot.proc.kill_and_reap`: a child that will not die joins proc's leftover set), then ``refusal``
+    (``check-timeout`` for a post-clone check child). Polled (``WNOHANG``), as no portable call waits on one pid with
+    a timeout; never a blocking wait, so a child in uninterruptible sleep cannot hold the caller past its bound."""
     end = monotonic() + deadline_s
     nap = 0.001
     while True:
@@ -392,7 +383,7 @@ def reap_within(pid: int, deadline_s: float, *, monotonic: Callable[[], float] =
         if done:
             return _exit_code(status)
         if monotonic() >= end:
-            _sigkill_and_reap(pid)
+            PR.kill_and_reap(pid, os.kill, os.waitpid, monotonic, sleep)
             raise Refused(refusal, f"the child did not exit within {deadline_s:g}s")
         sleep(nap)
         nap = min(nap * 2, 0.05)
@@ -429,7 +420,7 @@ def capture_target(argv: Sequence[str], spec_json: bytes, cgroup: Optional[str],
         data = drain(out_r, bound, deadline_s=end - time.monotonic())
     except BaseException:
         os.close(out_r)
-        _sigkill_and_reap(pid)
+        PR.kill_and_reap(pid)
         raise
     os.close(out_r)
     return reap_within(pid, end - time.monotonic()), data
@@ -520,7 +511,7 @@ class Seams:
     stage_run_as: ST.RunAs = ST.fork_run_as
     spawn_front: Callable[[Sequence[str], bytes, int], int] = spawn_front
     proc_identity: Callable[[int], Optional[Tuple[int, int]]] = proc_identity
-    kill: Callable[[int], None] = _sigkill_and_reap
+    kill: Callable[[int], None] = PR.kill_and_reap
     var_folders: Callable[[int, int], str] = darwin_user_dir
     grant_search: Callable[[str, int, Path, str, int], None] = grant_broker_search
     wake_reaper: Optional[Callable[[], None]] = None

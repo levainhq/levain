@@ -793,9 +793,9 @@ def _drop_to(uid: int) -> None:
 _STOP_SIGNALS = frozenset({signal.SIGSTOP, signal.SIGTSTP, signal.SIGTTIN, signal.SIGTTOU})
 
 
-#: Signalling children SIGKILLed at a deadline and still unreaped after :data:`REAP_GRACE_S` (a child stuck in an
-#: uninterruptible kernel state): :func:`reap_leftovers` reaps them once they die. Per process, and each process
-#: that uses it single-threaded (reaper DESIGN RH2).
+#: This process's children SIGKILLed past a deadline and still unreaped after :data:`REAP_GRACE_S` (a child stuck in
+#: an uninterruptible kernel state; :func:`kill_and_reap`): :func:`reap_leftovers` reaps them once they die. Per
+#: process, and each process that uses it single-threaded (reaper DESIGN RH2).
 _LEFTOVER: set[int] = set()
 
 
@@ -827,8 +827,13 @@ def _poll_wait(pid: int, flags: int, deadline: float, waitpid: Callable[[int, in
         delay = min(delay * 2, POLL_MAX_S)
 
 
-def _kill_and_reap(pid: int, kill: Callable[[int, int], None], waitpid: Callable[[int, int], tuple[int, int]],
-                   clock: Callable[[], float], sleep: Callable[[float], None]) -> None:
+def kill_and_reap(pid: int, kill: Callable[[int, int], None] = os.kill,
+                  waitpid: Callable[[int, int], tuple[int, int]] = os.waitpid,
+                  clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> None:
+    """SIGKILL the caller's own child ``pid`` and poll its reap (``WNOHANG``) for at most :data:`REAP_GRACE_S`; a
+    child still unreaped then (stuck in an uninterruptible kernel state: a wedged disk or network volume) joins the
+    leftover set for :func:`reap_leftovers`, and the call returns. Never a blocking wait: a caller past its deadline
+    gets its answer within the grace, whatever the child does."""
     try:
         kill(pid, signal.SIGKILL)
     except ProcessLookupError:   # already dead: still ours to reap
@@ -891,11 +896,11 @@ def signal_as_uid(uid: int, sig: int, timeout: float = V12_SECONDS, *, fork: Cal
     bound = min(SIGNAL_CHILD_S, max(end - clock(), 0.0))
     status = _poll_wait(pid, os.WUNTRACED, clock() + bound, waitpid, clock, sleep)
     if status is None:
-        _kill_and_reap(pid, kill, waitpid, clock, sleep)
+        kill_and_reap(pid, kill, waitpid, clock, sleep)
         raise Refused("signal-child-hung", f"uid {uid}: no exit or stop within {bound:g} s")
     if os.WIFSTOPPED(status):
         sent = sig in _STOP_SIGNALS and os.WSTOPSIG(status) == sig
-        _kill_and_reap(pid, kill, waitpid, clock, sleep)
+        kill_and_reap(pid, kill, waitpid, clock, sleep)
         return sent
     return os.WIFEXITED(status) and os.WEXITSTATUS(status) == SIGNAL_SENT
 
@@ -943,6 +948,6 @@ __all__ = ["BOOTOUT_RETRY_FIRST_S", "CgroupProcs", "Domain", "EDOMAIN_TEARDOWN",
            "POLL_FIRST_S", "POLL_MAX_S", "PROVEN", "SIGNAL_CHILD_S", "SIGNAL_HANGS_MAX",
            "Proc", "ProcSeams", "QUIET_S", "REAP_GRACE_S", "RUN", "SETTLE_POLL_S", "SIGNAL_SENT", "STOP", "UNKNOWN",
            "UidProcs", "V12K_SECONDS", "V12_SECONDS", "ZOMBIE", "check_target", "darwin_seams", "default_seams",
-           "end_domain", "end_seams", "linux_listing", "linux_probe", "linux_seams", "parse_bsdinfo",
-           "parse_linux_proc", "reap_leftovers", "scrub", "signal_as_uid", "signal_checked", "signal_child",
-           "darwin_bootout"]
+           "end_domain", "end_seams", "kill_and_reap", "linux_listing", "linux_probe", "linux_seams",
+           "parse_bsdinfo", "parse_linux_proc", "reap_leftovers", "scrub", "signal_as_uid", "signal_checked",
+           "signal_child", "darwin_bootout"]

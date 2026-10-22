@@ -4,10 +4,20 @@ ce447bf7 (raw: levain-memory 1021-32/r1a-fix2/):
 1. G1: the caller's child exits between ``end_domain``'s non-blocking reap and its kill seam, whose own wait reaps
    it. The domain then failed (a bootout launchd did not accept) and ``reaped`` did not name the pid, so ``start``'s
    abandon would SIGKILL it as root after it may have been reused.
+2. G2: a child that will not die after its SIGKILL (uninterruptible sleep on a wedged volume). ``reap_within``, past
+   its deadline, waited on it with a blocking ``waitpid(pid, 0)``: the clone's bound held START under the session
+   lock forever.
 """
 from __future__ import annotations
 
+import os
+import signal
+
+import pytest
+
+from levain.slot import Refused
 from levain.slot import proc as P
+from levain.slot import runtime_helper as H
 from tests.test_slot_r1a_fix1 import Loopers
 
 SLOT = 5001
@@ -29,3 +39,32 @@ def test_a_child_the_kill_seam_reaped_is_reported_reaped_when_the_domain_fails()
     assert gone == [CHILD]
     assert not res.proven and res.name == "domain-not-accepted:5"
     assert CHILD in reaped, "a pid the kill seam reaped is missing from reaped: the caller would signal it as root"
+
+
+def test_a_child_that_will_not_die_cannot_hold_the_bound(monkeypatch):
+    t = [100.0]
+    killed: list[int] = []
+
+    def waitpid(pid: int, flags: int) -> tuple[int, int]:
+        t[0] += 0.001
+        if not flags & os.WNOHANG:
+            raise AssertionError("a blocking waitpid on a child that will not die: the caller hangs forever")
+        return 0, 0
+
+    def kill(pid: int, sig: int) -> None:
+        assert sig == signal.SIGKILL
+        killed.append(pid)
+
+    def sleep(s: float) -> None:
+        t[0] += s
+    monkeypatch.setattr(os, "waitpid", waitpid)
+    monkeypatch.setattr(os, "kill", kill)
+    try:
+        with pytest.raises(Refused) as e:
+            H.reap_within(CHILD, 2.0, monotonic=lambda: t[0], sleep=sleep, refusal="child-timeout")
+        assert e.value.name == "child-timeout" and killed == [CHILD]
+        assert t[0] - 100.0 <= 2.0 + P.REAP_GRACE_S + 0.1
+        assert CHILD in P._LEFTOVER                               # reaped later, by reap_leftovers
+    finally:
+        if CHILD in P._LEFTOVER:
+            P._LEFTOVER.remove(CHILD)
