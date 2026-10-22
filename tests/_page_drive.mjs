@@ -1,7 +1,9 @@
 // Drives a served cockpit page in headless Chrome over the DevTools protocol, for tests that must
 // submit a form rather than read the DOM. argv: <chrome> <url> <steps.json>. A step is one of
 //   {"eval": "<expression>"}                 its value is collected
-//   {"until": "<expression>", "ms": <n>}     polled until truthy; collected, or {"timeout": ...}
+//   {"until": "<expression>", "ms": <n>}     polled until truthy and collected; a wait that never comes true FAILS the
+//                                            drive (stderr names the step and its expression, exit 1), unless the step
+//                                            carries "may_timeout": true, which collects {"timeout": ...} instead
 //   {"posts": <n>, "ms": <n>}                waits until n POSTs have been sent
 //   {"emulate": {"w": <px>, "h": <px>, "dpr": <n>, "mobile": <bool>}}   a device size, applied before the page is drawn again
 //   {"scheme": "dark"|"light"}              the phone's colour-scheme setting (prefers-color-scheme), applied before the next read
@@ -111,6 +113,10 @@ for (const s of steps) {
       v = await evaluate(`(() => { try { return (${s.until}); } catch (e) { return null; } })()`);
       if (v || Date.now() >= deadline) break;
       await sleep(100);
+    }
+    if (!v && !s.may_timeout) {
+      console.error(`step ${steps.indexOf(s)}: until never came true within ${s.ms || 20000}ms: ${s.until}`);
+      done(1); await sleep(10000);
     }
     values.push(v || { timeout: s.until });
   } else {

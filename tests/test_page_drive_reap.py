@@ -52,3 +52,19 @@ def test_shot_writes_png_and_a_raising_run_reaps_chrome(tmp_path):
     with pytest.raises(subprocess.TimeoutExpired):
         _page_drive_run.run([node, DRIVER, CHROME, "about:blank", str(steps)], timeout=4)
     assert _survivors(before) == set()
+
+
+@pytest.mark.skipif(not Path(CHROME).exists() or not shutil.which("node"), reason="needs Chrome and node")
+def test_an_until_that_never_comes_true_fails_the_drive_unless_it_may_time_out(tmp_path):
+    node = shutil.which("node")
+    steps = tmp_path / "steps.json"
+
+    def drive(step):
+        steps.write_text(json.dumps([step]))
+        return _page_drive_run.run([node, DRIVER, CHROME, "about:blank", str(steps)], timeout=60)
+
+    r = drive({"until": "document.title === 'never'", "ms": 300})
+    assert r.returncode != 0 and "step 0" in r.stderr and "document.title === 'never'" in r.stderr, (r.returncode, r.stderr)
+    r = drive({"until": "document.title === 'never'", "ms": 300, "may_timeout": True})
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["values"] == [{"timeout": "document.title === 'never'"}]
