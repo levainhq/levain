@@ -32,6 +32,7 @@ import os
 import re
 import stat
 import sys
+import time
 from dataclasses import dataclass
 from typing import Callable, Mapping, Optional, Sequence, Tuple
 
@@ -430,6 +431,9 @@ class Published:
     digests: Mapping[str, str]          # name -> sha256 hex of the bytes root copied
     header: Optional[BF.BundleHeader]   # the bundle's, when one was copied
     exchanged: bool                     # True = an older tree was replaced
+    #: Head ruling A2 (1022-18): what the answer must say beside ``ok: true`` (a class-dir fsync that failed after
+    #: the commit call returned: the publish stands, and a crash may undo it).
+    warnings: Tuple[str, ...] = ()
 
 
 def transact(class_dfd: int, session: str, sources: Sequence[Tuple[str, int]], role: Role, seams: PublishSeams, *,
@@ -445,7 +449,7 @@ def transact(class_dfd: int, session: str, sources: Sequence[Tuple[str, int]], r
     ``noreplace``, ``fsync class``, ``delete older``. ``before_commit`` runs between ``fsync staged`` and the commit
     (5c-ii-b's detach); the caller makes it never raise. After the commit call returns, the run is COMMITTED: a
     failed class-dir fsync or older-tree delete is logged and does not withhold the answer (an older tree left at
-    ``<s>.new`` is the next seal-in's stale delete)."""
+    ``<s>.new`` is the next seal-in's stale delete); the failed fsync also puts a warning in ``warnings`` (A2)."""
     staged = session + STAGING_SUFFIX
     stage = "staging"
     made = False
@@ -519,12 +523,16 @@ def transact(class_dfd: int, session: str, sources: Sequence[Tuple[str, int]], r
     finally:
         if new_dfd >= 0:
             os.close(new_dfd)
+    warnings: Tuple[str, ...] = ()
     try:
         seams.fault("fsync:class")
         seams.fsync(class_dfd)
         seams.log("fsync class")
     except OSError as e:
+        # A2: the rename is the commit point, so ok: true stands; the operator is told it is not yet durable.
         seams.log(f"fsync class failed {_errname(e)}")
+        warnings = (f"the published export's directory entry could not be synced ({_errname(e)}): a crash may undo "
+                    f"the publish",)
     if exchanged:
         try:
             seams.fault("delete-older")
@@ -532,7 +540,7 @@ def transact(class_dfd: int, session: str, sources: Sequence[Tuple[str, int]], r
             seams.log("delete older")
         except (OSError, Refused) as e:
             seams.log(f"delete older failed {e}")
-    return Published(digests, header, exchanged)
+    return Published(digests, header, exchanged, warnings)
 
 
 def _remove_staged(class_dfd: int, staged: str, made: bool, seams: PublishSeams) -> None:
@@ -567,3 +575,619 @@ def publish_if_success(outcome: Outcome, work_dfd: int, class_dfd: int, session:
         return "adopt-nothing-new", pub
     assert pub.header is not None
     return ("delta" if pub.header.prerequisites else "unrelated"), pub
+
+
+# =================================================================================================================
+# Piece 5c-ii-b: the per-run image, the Linux run leaf, the macOS footprint watchdog, the domain proof, SealedRun
+# (DESIGN §1 steps 6, 7, 10, 11; §4.1; §4.9 "The per-run sized image" and "Memory"; §9's 5c-ii build notes).
+# =================================================================================================================
+
+UNAVAILABLE = "export-image-unavailable"
+UNPROVEN = "export-domain-unproven"
+_IMAGE_STEM = {"importer": "work", "verifier": "verify"}
+#: The per-run image's commands, by absolute path (root code runs no PATH lookup). ``/sbin`` and ``/bin`` resolve on
+#: a merged-/usr Linux and an unmerged one alike [judged by adopt-b, 10-22, against Debian and Ubuntu layouts].
+HDIUTIL = "/usr/bin/hdiutil"
+MKFS_EXT4 = "/sbin/mkfs.ext4"
+MOUNT = "/bin/mount"
+UMOUNT = "/bin/umount"
+#: V31's RAM bound (HEAD_r7 Q-r5-4, judged): a Linux image at or under it is a tmpfs, above it always the loop image.
+TMPFS_MAX_BYTES = 256 << 20
+#: One image command's wall [judged by adopt-b, 10-22: R4 measured create + attach + detach of 8 GiB in 1.47 s].
+IMAGE_CMD_TIMEOUT_S = 120.0
+NEVER_INDEX = ".metadata_never_index"
+_MIB = 1 << 20
+
+
+def _role_key(role_key: str) -> str:
+    if role_key not in _IMAGE_STEM:
+        raise ValueError(f"role {role_key!r}")
+    return role_key
+
+
+def image_path(export_dir: str, role_key: str, host: str) -> str:
+    """The ONE path function (§4.1, r6 C complement F2) for the image's create, the stale scan and the unlink: macOS
+    ``work.sparseimage`` / ``verify.sparseimage`` (``hdiutil create -type SPARSE`` appends ``.sparseimage`` to any
+    other name), Linux ``work.img`` / ``verify.img``."""
+    stem = _IMAGE_STEM[_role_key(role_key)]
+    return os.path.join(export_dir, stem + (".sparseimage" if host == "darwin" else ".img"))
+
+
+def mount_path(export_dir: str, role_key: str) -> str:
+    """The image's mount point: the role's ONE writable path, the same constant the wall's profile and view are built
+    from (``wall.EXPORT_WRITABLE`` / ``wall.VERIFY_WRITABLE``), so the seal and the wall cannot disagree."""
+    from levain.slot import wall
+    names = {"importer": wall.EXPORT_WRITABLE, "verifier": wall.VERIFY_WRITABLE}[_role_key(role_key)]
+    assert len(names) == 1
+    return os.path.join(export_dir, names[0])
+
+
+def _run_cmd(argv: Sequence[str], umask: Optional[int]) -> Tuple[int, str]:
+    """One image command: no stdin, a fixed environment, a bounded wall; ``umask`` set for THIS child only (Popen's
+    ``umask``, 3.9+), never process-wide (r7 C' umask). Answers ``(rc, output tail)``; 124 = timeout, 127 = spawn."""
+    import subprocess
+    try:
+        p = subprocess.run(list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=IMAGE_CMD_TIMEOUT_S, close_fds=True, umask=-1 if umask is None else umask,
+                           env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"})
+    except subprocess.TimeoutExpired:
+        return 124, "timeout"
+    except OSError as e:
+        return 127, f"spawn: {e}"
+    return p.returncode, p.stdout.decode("utf-8", "replace")[-2000:]
+
+
+@dataclass(frozen=True)
+class ImageSeams:
+    """``run(argv, umask)`` -> ``(rc, output)`` (:func:`_run_cmd`); ``is_mounted(path)``; ``log(event)``."""
+
+    run: Callable[[Sequence[str], Optional[int]], Tuple[int, str]] = _run_cmd
+    is_mounted: Callable[[str], bool] = os.path.ismount
+    log: Callable[[str], None] = _no_log
+
+
+@dataclass(frozen=True)
+class Image:
+    host: str
+    path: Optional[str]     # the backing file; None = a Linux tmpfs (nothing to unlink)
+    mount: str
+    size: int               # the capacity it was created at, bytes
+
+
+class _ImageFail(Exception):
+    pass
+
+
+def _check(rc: int, out: str, what: str) -> None:
+    if rc != 0:
+        raise _ImageFail(f"{what} rc {rc}: {out.strip()[-300:]}")
+
+
+def detach_image(img: Image, seams: ImageSeams) -> bool:
+    """Force-detach (macOS ``hdiutil detach -force``; Linux ``umount``, no ``-l``: an EBUSY is the detach-failure
+    path, r6 C codex MED teardown). True when nothing is mounted at the mount point afterwards."""
+    if not seams.is_mounted(img.mount):
+        return True
+    argv = ([HDIUTIL, "detach", "-quiet", "-force", img.mount] if img.host == "darwin" else [UMOUNT, img.mount])
+    rc, out = seams.run(argv, None)
+    if rc != 0 or seams.is_mounted(img.mount):
+        seams.log(f"detach failed rc {rc}: {out.strip()[-200:]}")
+        return False
+    seams.log("image detached")
+    return True
+
+
+def _unlink_backing(img: Image, seams: ImageSeams) -> bool:
+    if img.path is None:
+        return True
+    try:
+        os.unlink(img.path)
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        seams.log(f"image unlink failed {_errname(e)}")
+        return False
+    seams.log("image unlinked")
+    return True
+
+
+def clear_stale_image(export_dir: str, role_key: str, host: str, seams: ImageSeams) -> None:
+    """Seal-in (§1 step 6, r6 C complement F2): anything attached at the mount point is force-detached and an image
+    file at the path function's name is unlinked; either failing = ``export-image-unavailable``."""
+    img = Image(host, image_path(export_dir, role_key, host), mount_path(export_dir, role_key), 0)
+    if not detach_image(img, seams):
+        raise Refused(UNAVAILABLE, f"a stale image at {img.mount} could not be detached")
+    if os.path.lexists(img.path or ""):
+        if not _unlink_backing(img, seams):
+            raise Refused(UNAVAILABLE, f"a stale image file at {img.path} could not be removed")
+        seams.log("stale image removed")
+
+
+def create_image(export_dir: str, role_key: str, host: str, *, size: int, inodes: int, owner_uid: int,
+                 seams: ImageSeams) -> Image:
+    """Seal-in (§4.9 S1): create the per-run image at V31's ``size`` (bytes; Linux ``inodes`` = ``-N``) and attach
+    it at :func:`mount_path`; then the image root is chowned to ``owner_uid`` 0700 and (macOS) root writes
+    ``.metadata_never_index`` at it. macOS: ``hdiutil create -fs APFS -type SPARSE`` under ``umask 077`` for that
+    child only, the created file's NAME and MODE (0600) asserted, then ``attach -nobrowse -owners on -mountpoint``.
+    Linux: a tmpfs (``size=``, ``nr_inodes=``) at or under :data:`TMPFS_MAX_BYTES`, else a sparse ``O_EXCL`` 0600
+    file, ``mkfs.ext4 -m 0 -O ^has_journal -I 256 -N``, ``mount -o loop,nodev,nosuid,noexec``. Any failure =
+    ``export-image-unavailable``, and what was made is detached and unlinked first."""
+    path = image_path(export_dir, role_key, host)
+    mnt = mount_path(export_dir, role_key)
+    img = Image(host, None, mnt, size)
+    try:
+        try:
+            os.mkdir(mnt, 0o700)
+        except FileExistsError:
+            if not stat.S_ISDIR(os.lstat(mnt).st_mode):
+                raise _ImageFail(f"{mnt} is not a directory") from None
+        if host == "darwin":
+            mib = -(-size // _MIB)
+            img = Image(host, path, mnt, mib * _MIB)
+            stem = _IMAGE_STEM[role_key]
+            _check(*seams.run([HDIUTIL, "create", "-quiet", "-size", f"{mib}m", "-fs", "APFS", "-type", "SPARSE",
+                               "-volname", f"levain-{stem}", path], 0o077), "hdiutil create")
+            st = os.lstat(path)
+            if not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o600 or st.st_uid != os.geteuid():
+                raise _ImageFail(f"the created image {path} is mode {stat.S_IMODE(st.st_mode):o} uid {st.st_uid}, "
+                                 f"not a 0600 file of uid {os.geteuid()}")
+            seams.log(f"image created {os.path.basename(path)} 0600")
+            _check(*seams.run([HDIUTIL, "attach", "-quiet", "-nobrowse", "-noautoopen", "-owners", "on",
+                               "-mountpoint", mnt, path], None), "hdiutil attach")
+        elif size <= TMPFS_MAX_BYTES:
+            _check(*seams.run([MOUNT, "-t", "tmpfs", "-o",
+                               f"size={size},nr_inodes={inodes},mode=0700,nodev,nosuid,noexec", "tmpfs", mnt], None),
+                   "mount tmpfs")
+        else:
+            img = Image(host, path, mnt, size)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            try:
+                os.ftruncate(fd, size)
+            finally:
+                os.close(fd)
+            seams.log(f"image created {os.path.basename(path)} 0600")
+            _check(*seams.run([MKFS_EXT4, "-q", "-F", "-m", "0", "-O", "^has_journal", "-I", "256", "-N", str(inodes),
+                               path], None), "mkfs.ext4")
+            _check(*seams.run([MOUNT, "-o", "loop,nodev,nosuid,noexec", path, mnt], None), "mount loop")
+        if not seams.is_mounted(mnt):
+            raise _ImageFail(f"nothing is mounted at {mnt} after the attach")
+        seams.log("image attached")
+        root = os.open(mnt, _DIR_OPEN)
+        try:
+            os.fchown(root, owner_uid, -1)
+            os.fchmod(root, 0o700)
+            if host == "darwin":
+                os.close(os.open(NEVER_INDEX, _NEW_FILE, 0o644, dir_fd=root))
+        finally:
+            os.close(root)
+        return img
+    except (OSError, _ImageFail) as e:
+        detached = detach_image(img, seams)
+        if detached and os.path.lexists(path) and img.path is not None:
+            _unlink_backing(img, seams)
+        what = _errname(e) if isinstance(e, OSError) else str(e)
+        raise Refused(UNAVAILABLE, f"the per-run image: {what}") from e
+
+
+def host_short(export_dir: str, img: Optional[Image], *, statvfs: Callable[[str], os.statvfs_result] = os.statvfs,
+               ) -> bool:
+    """Root's host-side reading (§4.9, r7 C' host predicate), read after the run and before the unlink: host bytes
+    ``f_bavail x f_frsize`` of the volume holding ``L/export`` below the image's unallocated remainder (its size
+    minus the backing file's ``st_blocks x 512``). A tmpfs has no backing file on the host volume: never short."""
+    if img is None or img.path is None:
+        return False
+    try:
+        allocated = os.stat(img.path).st_blocks * 512
+    except FileNotFoundError:
+        return False
+    st = statvfs(export_dir)
+    return st.f_bavail * st.f_frsize < max(img.size - allocated, 0)
+
+
+# --- the Linux run leaf (§4.9 Memory, r7 B' Q-r7-3 .. r10 S13-7) --------------------------------------------------
+
+#: The stale leaf's ``rmdir`` budget, its poll, and the attempts it makes however late it wakes (r9 S12-7, r10 S13-7).
+LEAF_RMDIR_BUDGET_S = 2.0
+LEAF_RMDIR_POLL_S = 0.25
+LEAF_RMDIR_MIN_ATTEMPTS = 3
+RUN_LEAF = "run"
+
+
+def _cg_read(path: str) -> str:
+    with open(path, encoding="ascii") as f:
+        return f.read()
+
+
+def _cg_write(path: str, text: str) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CLOEXEC)
+    try:
+        write_all(fd, text.encode("ascii"))
+    finally:
+        os.close(fd)
+
+
+def _cg_mkdir(path: str) -> None:
+    os.mkdir(path, 0o755)
+
+
+@dataclass(frozen=True)
+class LeafSeams:
+    """The cgroupfs acts, as paths: ``read`` / ``write`` (``FileNotFoundError`` when absent), ``mkdir``, ``rmdir``,
+    ``exists``; ``clock`` / ``sleep`` for the bounded ``rmdir``; ``log``."""
+
+    read: Callable[[str], str] = _cg_read
+    write: Callable[[str, str], None] = _cg_write
+    mkdir: Callable[[str], None] = _cg_mkdir
+    rmdir: Callable[[str], None] = os.rmdir
+    exists: Callable[[str], bool] = os.path.exists
+    clock: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
+    log: Callable[[str], None] = _no_log
+
+
+def scope_path(role_key: str, cgroup_root: Optional[str] = None) -> str:
+    """``levain.slice/export.scope`` (``verify.scope``): the scope the domain kill and proof run on, hierarchically."""
+    from levain.slot import wall
+    return f"{cgroup_root or wall.CGROUP_ROOT}/{wall._EXPORT_SCOPE[_role_key(role_key)]}"
+
+
+def leaf_path(role_key: str, cgroup_root: Optional[str] = None) -> str:
+    """This run's leaf, ONE fixed path per scope (r10 S13-7): the cgroup the launch joins
+    (``wall.export_linux_launch_argv``)."""
+    return f"{scope_path(role_key, cgroup_root)}/{RUN_LEAF}"
+
+
+def remove_stale_leaf(leaf: str, seams: LeafSeams) -> int:
+    """Seal-in, after the domain proof: remove a leaf a crashed helper left. The ``rmdir`` is retried under its OWN
+    budget, :data:`LEAF_RMDIR_BUDGET_S` polled every :data:`LEAF_RMDIR_POLL_S` (an EBUSY right after ``cgroup.kill``
+    is transient while the killed tasks are reaped), with at least :data:`LEAF_RMDIR_MIN_ATTEMPTS` attempts and one
+    more after the deadline, however late a loaded helper wakes. Still there = ``export-image-unavailable``, naming
+    the leaf ("stale run leaf at <path>"). Returns the attempts made (0 = no stale leaf)."""
+    if not seams.exists(leaf):
+        return 0
+    start = seams.clock()
+    deadline = start + LEAF_RMDIR_BUDGET_S
+    attempts = 0
+    while True:
+        late = seams.clock() >= deadline
+        attempts += 1
+        try:
+            seams.rmdir(leaf)
+            seams.log(f"stale leaf removed after {attempts} attempt(s)")
+            return attempts
+        except FileNotFoundError:
+            return attempts
+        except OSError as e:
+            last = _errname(e)
+            seams.log(f"stale leaf rmdir attempt {attempts} {last}")
+        if late and attempts >= LEAF_RMDIR_MIN_ATTEMPTS:
+            raise Refused(UNAVAILABLE, f"stale run leaf at {leaf}: {last} after {attempts} attempts in "
+                                       f"{seams.clock() - start:.2f} s")
+        seams.sleep(LEAF_RMDIR_POLL_S)
+
+
+def enable_controllers(role_key: str, seams: LeafSeams, cgroup_root: Optional[str] = None) -> None:
+    """Seal-in (r9 S12-7): ``+memory +pids`` written idempotently into ``cgroup.subtree_control`` along the
+    ``levain.slice`` -> scope chain (systemd may drop a slice's controllers when no unit needs them), each directory
+    made when absent; any failure = ``export-image-unavailable``."""
+    from levain.slot import wall
+    for d in (cgroup_root or wall.CGROUP_ROOT, scope_path(role_key, cgroup_root)):
+        try:
+            if not seams.exists(d):
+                seams.mkdir(d)
+            seams.write(f"{d}/cgroup.subtree_control", "+memory +pids")
+        except OSError as e:
+            raise Refused(UNAVAILABLE, f"{d}/cgroup.subtree_control: {_errname(e)}") from e
+        seams.log(f"subtree_control {d}")
+
+
+def make_leaf(leaf: str, *, memory_max: int, pids_max: int, seams: LeafSeams) -> None:
+    """Seal-in (§4.9 Memory): create this run's leaf and write, in this order, ``memory.max`` FIRST (its failure fatal
+    whatever the swap test then finds, r9 S12-7), ``memory.swap.max = 0`` (SKIPPED when the file is absent, a kernel
+    without swap accounting, r8; any other failure fatal), then ``pids.max``; all before the child joins. A failure =
+    ``export-image-unavailable``."""
+    def write(name: str, value: str) -> None:
+        try:
+            seams.write(f"{leaf}/{name}", value)
+        except OSError as e:
+            raise Refused(UNAVAILABLE, f"{leaf}/{name}: {_errname(e)}") from e
+        seams.log(f"{name}={value}")
+
+    try:
+        seams.mkdir(leaf)
+    except OSError as e:
+        raise Refused(UNAVAILABLE, f"{leaf}: {_errname(e)}") from e
+    write("memory.max", str(memory_max))
+    if seams.exists(f"{leaf}/memory.swap.max"):
+        write("memory.swap.max", "0")
+    else:
+        seams.log("memory.swap.max absent, skipped")
+    write("pids.max", str(pids_max))
+
+
+def read_oom_kill(leaf: str, seams: LeafSeams) -> Optional[int]:
+    """The leaf's ``memory.events.local`` ``oom_kill`` count, read after ``populated 0``; None when it cannot be read
+    (the file gone, or no ``oom_kill`` line): the caller's ``memory_unreadable``, never ``oom_kill 0`` (r10 S13-7)."""
+    try:
+        text = seams.read(f"{leaf}/memory.events.local")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "oom_kill" and parts[1].isdigit():
+            return int(parts[1])
+    return None
+
+
+# --- the macOS footprint watchdog (§4.9 Memory, r6 B complement F1; r7 B' complement F10) -----------------------
+
+#: V31's watchdog interval (r4's monitor value, judged by s5-fold-r5b; 5g measures overshoot at 250 ms and 50 ms).
+WATCHDOG_INTERVAL_S = 0.25
+RUSAGE_INFO_V4 = 4
+#: ``struct rusage_info_v4`` (<sys/resource.h>): ``ri_uuid[16]``, then uint64 ``ri_user_time``, ``ri_system_time``,
+#: ``ri_pkg_idle_wkups``, ``ri_interrupt_wkups``, ``ri_pageins``, ``ri_wired_size``, ``ri_resident_size``,
+#: ``ri_phys_footprint``: the footprint is the eighth uint64 after the uuid.
+_FOOTPRINT_OFFSET = 16 + 7 * 8
+_RUSAGE_BUF = 512                    # >= sizeof(struct rusage_info_v4)
+_LIBPROC: list = []
+
+
+def phys_footprint(pid: int) -> Optional[int]:
+    """``proc_pid_rusage(RUSAGE_INFO_V4)`` ``ri_phys_footprint`` (the ledger jetsam enforces; never ``ps`` text), or
+    None when the pid cannot be read (gone, or not ours to read)."""
+    if not _LIBPROC:
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        lib.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        lib.proc_pid_rusage.restype = ctypes.c_int
+        _LIBPROC.append(lib)
+    buf = ctypes.create_string_buffer(_RUSAGE_BUF)
+    if _LIBPROC[0].proc_pid_rusage(pid, RUSAGE_INFO_V4, buf) != 0:
+        return None
+    return int.from_bytes(buf.raw[_FOOTPRINT_OFFSET:_FOOTPRINT_OFFSET + 8], sys.byteorder)
+
+
+def uid_pids(uid: int) -> Sequence[int]:
+    """Every pid of ``uid`` (real, effective or saved; an unreadable pid counts as every uid's, as in the proof)."""
+    from levain.slot import proc as P
+    return [p.pid for p in P.default_seams("darwin").listing() if p.of(uid) or p.state == P.UNKNOWN]
+
+
+class FootprintWatchdog:
+    """Samples ``footprint`` of every pid ``pids(uid)`` names every ``interval`` from its OWN thread (never from
+    root's walker loop, which blocks) and calls ``end()`` (the domain kill) once a sample passes ``cap``: "a sampled
+    termination threshold with measured overshoot", never "enforced" (§8). After :meth:`stop`, ``killed`` is the kill
+    flag seal-out reads; ``blind`` is True when a sampling pass raised or the thread did not stop, so the memory
+    observation cannot be established (the macOS twin of an unreadable ``memory.events.local``) [judged by adopt-b,
+    10-22, against DESIGN §1 step 10's "(1) cannot be established" clause: a question in RETURN_B]."""
+
+    def __init__(self, uid: int, cap: int, end: Callable[[], object], *, interval: float = WATCHDOG_INTERVAL_S,
+                 pids: Callable[[int], Sequence[int]] = uid_pids,
+                 footprint: Callable[[int], Optional[int]] = phys_footprint,
+                 log: Callable[[str], None] = _no_log) -> None:
+        import threading
+        self.uid, self.cap, self._end, self.interval = uid, cap, end, interval
+        self._pids, self._footprint, self._log = pids, footprint, log
+        self.killed = False
+        self.blind = False
+        self.peak = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="levain-footprint-watchdog", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                for pid in self._pids(self.uid):
+                    fp = self._footprint(pid)
+                    if fp is None:
+                        continue
+                    self.peak = max(self.peak, fp)
+                    if fp > self.cap:
+                        self.killed = True
+                        self._log(f"watchdog: pid {pid} footprint {fp} > cap {self.cap}")
+                        self._end()
+                        return
+            except Exception as e:      # noqa: BLE001 - a blind watchdog must say so, never read as "no kill"
+                self.blind = True
+                self._log(f"watchdog blind: {type(e).__name__}: {e}"[:300])
+                return
+            self._stop.wait(self.interval)
+
+    def stop(self, timeout: float = 30.0) -> None:
+        self._stop.set()
+        if self._thread.is_alive() or self._thread.ident is not None:
+            self._thread.join(timeout)
+        if self._thread.is_alive():
+            self.blind = True
+        self._log("watchdog stopped")
+
+
+# --- the domain proof (§1 steps 6 and 11; §4.9 Mechanism) --------------------------------------------------------
+
+def export_domain_prover(host: str, role_key: str, uid: int, *, bound_s: Optional[float] = None,
+                         seams: object = None) -> Callable[[Sequence[int]], object]:
+    """``prove(children) -> proc.Domain``: kill and prove the export domain empty. macOS
+    ``end_domain(uid, V12k)`` (freeze, kill, bootout, kill, settle, proof); Linux the scope ``cgroup.freeze`` +
+    ``cgroup.kill`` + ``populated 0`` (hierarchical, so the run leaf too), then the uid sweep by ``end_domain``."""
+    from levain.slot import proc as P
+    bound = P.V12K_SECONDS if bound_s is None else bound_s
+
+    if host == "darwin":
+        def prove_darwin(children: Sequence[int]) -> object:
+            return P.end_domain(uid, bound, children, seams=seams)[0]
+        return prove_darwin
+
+    def prove_linux(children: Sequence[int]) -> object:
+        c = P.CgroupProcs(scope_path(role_key), seams)
+        c.freeze(uid, bound * P.FREEZE_SHARE)
+        if not c.kill(uid, bound):
+            return P.Domain(False, "kill-unproven", f"{c.cgroup}: populated is not 0")
+        return P.end_domain(uid, bound, children, seams=c.seams)[0]
+    return prove_linux
+
+
+# --- the sealed run ------------------------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SealFacts:
+    """One sealed run's facts. ``role_key`` ``importer`` | ``verifier``; ``uid``: the export principal
+    (``_levain_export`` / ``_levain_verify``); ``image_bytes`` / ``image_inodes``: V31's size; ``memory_cap``: the
+    Linux leaf's ``memory.max`` and the macOS watchdog's cap (V30); ``pids_max``: V31."""
+
+    host: str
+    role_key: str
+    export_dir: str
+    uid: int
+    image_bytes: int
+    image_inodes: int
+    memory_cap: int
+    pids_max: int
+
+    @property
+    def role(self) -> Role:
+        return IMPORTER if self.role_key == "importer" else VERIFIER
+
+
+@dataclass(frozen=True)
+class SealSeams:
+    """``prove(children) -> Domain`` (:func:`export_domain_prover`); the image, leaf and publish seams; ``watchdog``:
+    the factory ``(uid, cap, end, log) ->`` an object with ``start`` / ``stop`` / ``killed`` / ``blind``;
+    ``statvfs``; ``log``: the order log the DONE rows read."""
+
+    prove: Callable[[Sequence[int]], object]
+    image: ImageSeams = ImageSeams()
+    leaf: LeafSeams = LeafSeams()
+    publish: PublishSeams = PublishSeams()
+    watchdog: Callable[..., object] = None  # type: ignore[assignment]  (FootprintWatchdog when None)
+    statvfs: Callable[[str], os.statvfs_result] = os.statvfs
+    log: Callable[[str], None] = _no_log
+
+
+@dataclass(frozen=True)
+class SealReading:
+    """What seal-out read, for :class:`RunObservation`: ``memory_killed``, ``memory_unreadable``, ``host_short``."""
+
+    memory_killed: bool
+    memory_unreadable: bool
+    host_short: bool
+
+
+class SealedRun:
+    """One sealed run's OS side (§1 steps 6, 7, 10, 11). :meth:`seal_in` in step 6's order: the domain proven empty
+    (``export-domain-unproven``), a stale image detached and unlinked, (Linux) a stale leaf removed under its bound,
+    the controller chain, this run's leaf with its limits, the per-run image created and attached, a stale staged
+    name deleted (``<role>-failed:publish`` / ``stale-staging``), the early exchange probe when asked; a refusal after
+    anything was made tears it down first. :meth:`start_watchdog` (macOS, after the spawn). :meth:`seal_out`: the
+    watchdog stopped, the domain proven empty again (else ``export-domain-unproven`` and the image LEFT attached for
+    the next seal-in), then the memory observation (Linux the leaf's ``oom_kill`` after ``populated 0``; macOS the
+    watchdog's flag), the leaf removed (a failure leaves it for the next seal-in), the host reading. :meth:`teardown`:
+    the order domain empty -> fds closed -> umount -> backing unlinked (r6 build note). :meth:`release_image` is
+    idempotent and never raises, so it serves as :func:`transact`'s ``before_commit`` AND teardown's last step: a
+    detach that fails there (a Linux ``umount`` while an output fd is still open) is retried by teardown once every
+    fd is closed."""
+
+    def __init__(self, facts: SealFacts, seams: SealSeams) -> None:
+        self.f, self.s = facts, seams
+        self.image: Optional[Image] = None
+        self.leaf: Optional[str] = None
+        self.watchdog: Optional[object] = None
+        self.fds: list = []
+        self.released = False
+        self.proven_out = False
+
+    # seal-in -------------------------------------------------------------------------------------------------------
+    def seal_in(self, class_dfd: int, staged: str, *, probe: bool) -> None:
+        f, s = self.f, self.s
+        d = s.prove(())
+        if not getattr(d, "proven", False):
+            raise Refused(UNPROVEN, f"seal-in: {getattr(d, 'name', d)} {getattr(d, 'detail', '')}".strip())
+        s.log("seal-in domain proven empty")
+        clear_stale_image(f.export_dir, f.role_key, f.host, s.image)
+        try:
+            if f.host == "linux":
+                leaf = leaf_path(f.role_key)
+                remove_stale_leaf(leaf, s.leaf)
+                enable_controllers(f.role_key, s.leaf)
+                make_leaf(leaf, memory_max=f.memory_cap, pids_max=f.pids_max, seams=s.leaf)
+                self.leaf = leaf
+                s.log("leaf made")
+            self.image = create_image(f.export_dir, f.role_key, f.host, size=f.image_bytes, inodes=f.image_inodes,
+                                      owner_uid=f.uid, seams=s.image)
+            clear_staging(class_dfd, staged, f.role, s.publish)
+            if probe:
+                probe_exchange(class_dfd, f.role, s.publish)
+        except BaseException:
+            self.proven_out = True          # nothing ran in the domain: seal-in's own proof stands
+            self.teardown()
+            raise
+        s.log("seal-in done")
+
+    def start_watchdog(self) -> None:
+        if self.f.host != "darwin":
+            return
+        factory = self.s.watchdog or FootprintWatchdog
+        self.watchdog = factory(self.f.uid, self.f.memory_cap, lambda: self.s.prove(()), log=self.s.log)
+        self.watchdog.start()           # type: ignore[union-attr]
+        self.s.log("watchdog started")
+
+    # seal-out ------------------------------------------------------------------------------------------------------
+    def seal_out(self, children: Sequence[int] = ()) -> SealReading:
+        f, s = self.f, self.s
+        if self.watchdog is not None:
+            self.watchdog.stop()        # type: ignore[union-attr]
+        d = s.prove(tuple(children))
+        if not getattr(d, "proven", False):
+            raise Refused(UNPROVEN, f"seal-out: {getattr(d, 'name', d)} {getattr(d, 'detail', '')}".strip())
+        self.proven_out = True
+        s.log("seal-out domain proven empty")
+        if f.host == "linux":
+            oom = read_oom_kill(self.leaf, s.leaf) if self.leaf else None
+            killed, unreadable = bool(oom), oom is None
+            s.log(f"events read oom_kill={oom}")
+            if self.leaf is not None:
+                try:
+                    s.leaf.rmdir(self.leaf)
+                    s.log("leaf removed")
+                except OSError as e:
+                    s.log(f"leaf left {_errname(e)}")
+        else:
+            w = self.watchdog
+            killed = bool(getattr(w, "killed", False))
+            unreadable = w is None or bool(getattr(w, "blind", False))
+            s.log(f"watchdog flag killed={killed} blind={unreadable}")
+        short = host_short(f.export_dir, self.image, statvfs=s.statvfs)
+        s.log(f"host reading short={short}")
+        return SealReading(killed, unreadable, short)
+
+    # teardown ------------------------------------------------------------------------------------------------------
+    def release_image(self) -> None:
+        if self.released or self.image is None:
+            return
+        if not self.proven_out:
+            self.s.log("image left attached: the domain is not proven empty")
+            return
+        if detach_image(self.image, self.s.image) and _unlink_backing(self.image, self.s.image):
+            self.released = True
+            return
+        self.s.log("image left for the next seal-in")
+
+    def teardown(self) -> None:
+        """Domain empty (seal-out's proof, or seal-in's when nothing ran) -> the fds root holds into the image closed
+        -> umount -> backing unlinked; then a leaf seal-out did not remove (a seal-in refusal after the leaf was
+        made). Without a proof the image and the leaf are LEFT for the next seal-in."""
+        while self.fds:
+            fd = self.fds.pop()
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.s.log("fds closed")
+        self.release_image()
+        if self.leaf is not None and self.proven_out and self.s.leaf.exists(self.leaf):
+            try:
+                self.s.leaf.rmdir(self.leaf)
+                self.s.log("leaf removed")
+            except OSError as e:
+                self.s.log(f"leaf left {_errname(e)}")
