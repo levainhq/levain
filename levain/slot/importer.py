@@ -574,6 +574,15 @@ def result_line(progress: Progress, *, refused: str | None, detail: str, enospc:
     return data
 
 
+def _build_unbuildable_line() -> bytes:
+    """The line written when :func:`result_line` itself cannot be built: fixed content, built once at import."""
+    data = canon.canonical_bytes({"v": 1, "terminal": False, "enospc": False, "refused": "result-unbuildable",
+                                  "detail": "", "walk": {"entries": 0, "bytes": 0}, "ignored_git_paths": None}) + b"\n"
+    parsed = canon.parse(data[:-1])
+    assert data.count(b"\n") == 1 and len(data) <= RESULT_CAP and parsed["refused"] == "result-unbuildable"
+    return data
+
+
 class _Usage(Exception):
     pass
 
@@ -605,6 +614,9 @@ def _probe_quietly(work: Path) -> bool:
         return probe_enospc(work)
     except Exception:  # noqa: BLE001 - a probe never decides whether the line is written
         return False
+
+
+_UNBUILDABLE_LINE = _build_unbuildable_line()
 
 
 def run(argv: Sequence[str], *, stdin: BinaryIO | None, result_fd: int, work: Path | None,
@@ -664,10 +676,15 @@ def run(argv: Sequence[str], *, stdin: BinaryIO | None, result_fd: int, work: Pa
                 out["detail"] = f"{out['detail']}; {note}" if out["detail"] else note
                 out["enospc"] = bool(out["enospc"]) or en in _ENOSPC_ERRNOS
     finally:
+        exc_type = sys.exc_info()[0]
+        if exc_type is not None:  # an interrupt or exit is propagating: never a success-shaped line
+            out["rc"] = 1
+            out["refused"] = None
+            out["detail"] = f"importer interrupted: {exc_type.__name__}"
         try:
             line = result_line(progress, refused=out["refused"], detail=str(out["detail"]), enospc=bool(out["enospc"]))
-        except Exception:  # noqa: BLE001 - the line is owed on every exit
-            line = result_line(progress, refused=None, detail="", enospc=bool(out["enospc"]))
+        except Exception:  # noqa: BLE001 - the line is owed on every exit; the fallback computes nothing
+            line = _UNBUILDABLE_LINE
             out["rc"] = 1
         try:
             write_all(result_fd, line)  # THE one result-line write
