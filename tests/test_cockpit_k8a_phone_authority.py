@@ -714,3 +714,20 @@ def test_the_pending_read_keeps_one_journal_reader(install, monkeypatch):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+# --- K8a L3 round 1 fixes (k8a/L3_r1_TRIAGE.md K-1..K-7) ------------------------------------------------------------
+
+def test_a_cancel_from_another_transport_never_takes_the_reserved_slot(world):
+    # K-1 (complement): own is the same FULL principal, transport included (B5 4). A token holder claiming the phone's
+    # key on its own transport, at its own cap, files no cancel of the phone's pendings in the reserved slot
+    w = world
+    thief = {"class": "device", "fingerprint": w.phone.fingerprint, "transport": "run"}
+    phones = [_edit(w, i)["pending_id"] for i in range(2)]
+    for i in range(2, PENDING_CAP + 2):
+        _edit(w, i, cred=thief)
+    _refused("pending_cap", _edit, w, PENDING_CAP + 2, cred=thief)
+    for pid in phones:
+        _refused("pending_cap", w.b.cancel, pid, credential=thief)
+    # the phone's own transport still takes its one reserved cancel per pending
+    assert w.b.cancel(phones[0], credential=w.dev)["state"] == "WAITING"

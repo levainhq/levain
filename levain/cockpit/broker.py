@@ -978,7 +978,8 @@ class Broker:
             res = db.issue(record_bytes=raw, principal=principal,
                            idempotency_key=idempotency_key or ("auto:" + pid), now=now,
                            harness=harness, cap_exempt=intent == "reported",
-                           # a device's cancels are all of its own pendings (``cancel``): one per target is reserved
+                           # a device's cancels are all of its own phone's pendings (``cancel``); the journal reserves
+                           # one per target only when the target is this same full principal's (transport included)
                            own_cancel=verb == "pending_cancel" and credential.get("class") == "device")
         except PendingCapExceeded as exc:
             raise BrokerError("pending_cap", 429, str(exc), {"occupying": [
@@ -1245,7 +1246,9 @@ class Broker:
         DESIGN §4.1): an own cancellation the floor lifts above C1 is a pending of that tier too, and
         under an unknown policy (a refused log) every cancellation is T3 and refused for want of a fence.
         A ``device`` credential (K8) cancels only a pending its own phone issued, always as a pending its passkey
-        signs; one such cancel per target is outside the pending cap, so a device at the cap can still free a slot."""
+        signs; one such cancel per target is outside the pending cap when the target came over this same transport (the
+        same full principal, B5 condition 4), so a device at the cap can still free a slot; a cancel from another
+        transport counts against that transport's own cap."""
         with self._admitted() as db:
             auth = self._request_authority(db)
             with bound(auth):
@@ -1254,7 +1257,10 @@ class Broker:
                 if credential.get("class") == "device" \
                         and self.claimed_fingerprint(str(view.principal)) != credential.get("fingerprint"):
                     # B5 Q2, a kernel rule: a device cancels only a pending its own phone issued (any transport it
-                    # came over: the passkey that signs the cancel is the same key), never a laptop's or another's
+                    # came over: the passkey that signs the cancel is the same key), never a laptop's or another's.
+                    # Known edge: a phone-port restart makes a fresh run transport, so the phone's older pendings are
+                    # another transport's: their cancel takes the target's tier (a signature, as every device cancel
+                    # needs) and the canceller's own cap, never C1 or the reserved slot (B5 4; K8a L3 r1 K-2)
                     raise BrokerError("refused", 403, "a device cancels only a pending its own phone issued")
                 base = principal.rpartition(":")[0] if principal.startswith("token:") else principal
                 tier = self._cancel_tier(view, base, auth.policy)
