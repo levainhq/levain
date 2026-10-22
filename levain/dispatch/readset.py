@@ -30,6 +30,15 @@ compare before git parses a byte, a bare fsck'd clone under resource limits, its
 ``E`` and ``N``, and the repo-layer settings check on ``E``'s tree. :func:`bundle_verified` re-checks that verified
 record against the contract bytes and re-cuts the slot's bundle from it into staging; :func:`sweep_workdirs` removes
 the workdirs a crashed supervisor left behind. Stdlib only.
+
+Known edges (judged, no code): an existing handoff dir or ``.tmp/`` owned by another uid, or writable by one, is
+accepted; such a uid can swap or remove the temp before it is installed, which denies the filing but cannot change
+what the run accepts (the run re-verifies the content). The install that links the temp in is not in this module; its
+design says it will "full-fsync the handoff dir". The checkout-length bound (:func:`checkout_prefix`) is the length
+of the running uid's own session path, so a contract filed under one home can be refused ``readset-path-length`` under
+a longer one; it fails closed, and only for a path within a home's length of the limit. :func:`discard` removes the
+directory a :class:`VerifiedReadSet` names after checking its name and type only, not a recorded dev/ino: the record
+it trusts is :func:`verify_readset`'s own, and it is not an entry point for a record from outside.
 """
 from __future__ import annotations
 
@@ -40,6 +49,7 @@ import logging
 import os
 import re
 import secrets
+import selectors
 import shutil
 import signal
 import stat
@@ -107,6 +117,15 @@ def _git(cwd: str, *args: str, env: dict[str, str], data: bytes | None = None, l
 def _cleanup_failed(what: str, exc: OSError) -> None:
     # a cleanup step that fails leaves the refusal standing; it is never silent
     _log.warning("readset: cleanup of %r failed: %s", what, errno.errorcode.get(exc.errno, exc.errno))
+
+
+def _close_dir(fd: int, what: str) -> None:
+    # a directory fd is closed after the flushes that make the work durable, so its close error changes nothing the
+    # caller relies on: it is logged and never replaces the call's result (or its refusal)
+    try:
+        os.close(fd)
+    except OSError as exc:
+        _log.warning("readset: closing %r failed: %s", what, errno.errorcode.get(exc.errno, exc.errno))
 
 
 def _scratch_env() -> dict[str, str]:
@@ -456,7 +475,8 @@ def export_readset(rs: ReadSet, contract_bytes: bytes, D: str, handoff_dir: str)
     (``O_EXCL|O_NOFOLLOW``, 0600, exclusively locked at create and held), flush it with :func:`full_fsync`, and read it
     back: its first bytes must be exactly the bundle header for ``E`` and a pack header of ``N`` objects, else
     ``readset-commit-mismatch``; a bundle over the handoff cap is ``readset-handoff``. On either refusal the temp is
-    unlinked (and ``.tmp/`` flushed). Returns the temp UNINSTALLED; it never renames into ``handoff_dir``.
+    closed and unlinked (and ``.tmp/`` flushed), each step's error logged, and the refusal raised. A close error on a
+    directory fd is logged, never raised. Returns the temp UNINSTALLED; it never renames into ``handoff_dir``.
     ``handoff_dir`` must be a real absolute directory (``readset-dest``)."""
     E, _tree, N = readset_commit(contract_bytes, D)
     if not isinstance(rs, ReadSet):
@@ -487,10 +507,10 @@ def export_readset(rs: ReadSet, contract_bytes: bytes, D: str, handoff_dir: str)
             pass
         tfd = os.open(TMP_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=hfd)
     except OSError as exc:
-        os.close(hfd)
+        _close_dir(hfd, handoff_dir)
         raise ReadSetRefused("readset-dest", f"the handoff dir's {TMP_DIR}/ cannot be opened "
                              f"({type(exc).__name__})") from None
-    os.close(hfd)
+    _close_dir(hfd, handoff_dir)
     try:
         name = "x-" + secrets.token_hex(16)
         fd = _lock_at_create(tfd, name)
@@ -502,7 +522,11 @@ def export_readset(rs: ReadSet, contract_bytes: bytes, D: str, handoff_dir: str)
                 raise ReadSetRefused("readset-commit-mismatch", f"the bundle written has another {problem}")
             size = os.fstat(fd).st_size
         except BaseException:
-            os.close(fd)
+            # the original failure is what is raised: the close and the cleanup each log their own error
+            try:
+                os.close(fd)
+            except OSError as exc:
+                _cleanup_failed(os.path.join(handoff_dir, TMP_DIR, name), exc)
             try:
                 os.unlink(name, dir_fd=tfd)
                 full_fsync(tfd)
@@ -511,7 +535,7 @@ def export_readset(rs: ReadSet, contract_bytes: bytes, D: str, handoff_dir: str)
                 _cleanup_failed(os.path.join(handoff_dir, TMP_DIR, name), exc)
             raise
     finally:
-        os.close(tfd)
+        _close_dir(tfd, os.path.join(handoff_dir, TMP_DIR))
     return ExportedReadSet(path=os.path.join(handoff_dir, TMP_DIR, name), size=size, fd=fd, commit=E, objects=N,
                            fsync=how)
 
@@ -586,6 +610,10 @@ class VerifiedReadSet:
     limits: tuple = ()
 
 
+#: The errors that mean a task exited while it was being counted; any other error makes the count untrustworthy.
+_GONE = frozenset({errno.ENOENT, errno.ESRCH})
+
+
 def _uncountable(why: str) -> ReadSetRefused:
     return ReadSetRefused("readset-git-unavailable", f"the uid's tasks cannot be counted ({why})")
 
@@ -593,23 +621,32 @@ def _uncountable(why: str) -> ReadSetRefused:
 def _uid_task_count() -> int:
     """The real uid's count as ``RLIMIT_NPROC`` counts it: every task (thread) on Linux, each
     ``/proc/<pid>/task/<tid>`` owned by the uid; every process elsewhere, by ``ps``. A ``ps`` that cannot run, exits
-    non-zero or passes its timeout, or a count of zero (this process is one), is ``readset-git-unavailable``."""
+    non-zero or passes its timeout, a ``/proc`` entry that cannot be read for any reason but its task having exited,
+    or a count of zero (this process is one), is ``readset-git-unavailable``."""
     uid = os.getuid()
     n = 0
     if os.path.isdir("/proc/self/task"):
-        for pid in os.listdir("/proc"):
+        try:
+            pids = os.listdir("/proc")
+        except OSError as exc:
+            raise _uncountable(f"/proc: {errno.errorcode.get(exc.errno, exc.errno)}") from None
+        for pid in pids:
             if not pid.isdigit():
                 continue
             try:
                 tids = os.listdir(f"/proc/{pid}/task")
-            except OSError:
+            except OSError as exc:
+                if exc.errno not in _GONE:
+                    raise _uncountable(f"/proc/{pid}/task: {errno.errorcode.get(exc.errno, exc.errno)}") from None
                 continue        # the process exited between the two reads
             for tid in tids:
                 try:
                     if os.stat(f"/proc/{pid}/task/{tid}").st_uid == uid:
                         n += 1
-                except OSError:
-                    pass
+                except OSError as exc:
+                    if exc.errno not in _GONE:
+                        raise _uncountable(f"/proc/{pid}/task/{tid}: "
+                                           f"{errno.errorcode.get(exc.errno, exc.errno)}") from None
     else:
         try:
             cp = subprocess.run(["ps", "-U", str(uid), "-o", "pid="], capture_output=True, timeout=10,
@@ -663,30 +700,53 @@ def _rlimit_preexec(limits: tuple):
     return apply
 
 
+#: [judged] stderr kept from a bounded child: a refusal names a few hundred bytes of it, and git's own failure messages
+#: fit with room to spare, while a child that floods its stderr no longer grows this process's memory with it.
+RUN_STDERR_CAP = 64 << 10
+
+
 def _run_bounded(argv: list[str], *, env: dict[str, str], limits: tuple, stdout=subprocess.DEVNULL,
                  cwd: str | None = None) -> tuple[int, bytes]:
     """``(returncode, stderr)`` of ``argv`` run in a session of its own under ``limits``. On the timeout, or anything
     else that interrupts the wait, the whole process group is killed (``SIGKILL``) and the child reaped, so no
     grandchild left in that group (index-pack, rev-list, pack-objects) keeps writing after the call returns. A child
     that cannot start (an ``OSError``, or ``SubprocessError`` from :func:`_rlimit_preexec`) or passes
-    :data:`GIT_TIMEOUT` is ``readset-git-unavailable``."""
+    :data:`GIT_TIMEOUT` is ``readset-git-unavailable``. The first :data:`RUN_STDERR_CAP` bytes of stderr are kept; the
+    rest is read and dropped, so the child never blocks on a full pipe."""
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=stdout, stderr=subprocess.PIPE, env=env,
                                 cwd=cwd, start_new_session=True, preexec_fn=_rlimit_preexec(limits))
     except (OSError, subprocess.SubprocessError) as exc:
         raise ReadSetRefused("readset-git-unavailable", f"git could not run ({type(exc).__name__})") from None
+    err = bytearray()
     try:
-        _out, err = proc.communicate(timeout=GIT_TIMEOUT)
+        end = time.monotonic() + GIT_TIMEOUT
+        efd = proc.stderr.fileno()
+        with selectors.DefaultSelector() as sel:
+            sel.register(efd, selectors.EVENT_READ)
+            while True:
+                left = end - time.monotonic()
+                if left <= 0:
+                    raise subprocess.TimeoutExpired(argv, GIT_TIMEOUT)
+                if not sel.select(left):
+                    continue
+                chunk = os.read(efd, _CHUNK)
+                if not chunk:
+                    break
+                err += chunk[:max(0, RUN_STDERR_CAP - len(err))]
+        proc.wait(timeout=max(0.0, end - time.monotonic()))
     except BaseException as exc:
         try:
             os.killpg(proc.pid, signal.SIGKILL)     # start_new_session: the group's id is the child's pid
         except ProcessLookupError:
             pass
-        proc.communicate()      # reaps the child; the pipe closes once the group is gone
+        proc.wait()             # reaps the child
         if isinstance(exc, subprocess.TimeoutExpired):
             raise ReadSetRefused("readset-git-unavailable", f"git passed its {GIT_TIMEOUT:g}s timeout") from None
         raise
-    return proc.returncode, err or b""
+    finally:
+        proc.stderr.close()
+    return proc.returncode, bytes(err)
 
 
 #: Measured, then adopted: a blob over this size is streamed while indexing instead of inflated whole in memory. It
@@ -717,10 +777,10 @@ def _p_env() -> dict[str, str]:
 
 def _layer_run(argv: list[str], **kw) -> subprocess.CompletedProcess:
     # the layer check's git runs under this module's environment (no user or system git config, no transport), not
-    # the one it is handed, and under a timeout
-    kw["env"] = _p_env()
+    # the one it is handed, and under this module's timeout, not the one it is handed
+    kw.update(env=_p_env(), timeout=GIT_TIMEOUT)
     try:
-        return subprocess.run(argv, timeout=GIT_TIMEOUT, stdin=subprocess.DEVNULL, **kw)
+        return subprocess.run(argv, stdin=subprocess.DEVNULL, **kw)
     except (OSError, subprocess.SubprocessError) as exc:
         raise ReadSetRefused("readset-git-unavailable", f"git could not run ({type(exc).__name__})") from None
 
@@ -785,10 +845,8 @@ def _open_parent(parent: str) -> int:
 
 
 def _rmtree_at(parent_fd: int, name: str, made: tuple[int, int]) -> None:
-    # only the directory this call made, by dev/ino, never through a symlink
-    if not _rmtree_by_fd():
-        _log.warning("readset: %r left: shutil.rmtree cannot remove by fd here", name)
-        return
+    # only the directory this call made, by dev/ino, never through a symlink; verify_readset refused already where
+    # rmtree cannot remove by fd
     try:
         st = os.lstat(name, dir_fd=parent_fd)
         if stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) == made:
@@ -809,9 +867,14 @@ def verify_readset(contract_bytes: bytes, D: str, fd: int, parent: str, attempt:
     render's attributes line in ``P/info/attributes``, the origin remote removed, ``HEAD`` and ``refs/heads/readset``
     == ``E`` and no other ref (``readset-head-mismatch``), ``count-objects`` in-pack == ``N`` and no loose object
     (``readset-surplus``), and the repo-layer settings check on ``E``'s tree (refused by the loosening's own name).
-    Any refusal removes ``W`` while it is still the directory this call made. ``parent`` must be this uid's and not
+    Any refusal removes ``W`` while it is still the directory this call made; where ``shutil.rmtree`` cannot remove by
+    fd that could not be done, so the call is refused ``readset-sweep-unsafe`` first, having made nothing. ``parent``
+    must be this uid's and not
     group- or world-writable, and a write in ``W`` that fails (the copy, ``P``'s ``lstat``, the attributes line) is
     ``readset-workdir``."""
+    if not _rmtree_by_fd():
+        # asked before anything is made, so a refusal can never leave a W that nothing here could remove
+        raise ReadSetRefused("readset-sweep-unsafe", "shutil.rmtree cannot remove by fd on this Python")
     E, _tree, N = readset_commit(contract_bytes, D)
     name = workdir_name(attempt)
     cap, deadline_s = _limits()
@@ -908,6 +971,7 @@ def _verify_in(pfd: int, D: str, fd: int, parent: str, name: str, attempt: str, 
 
 def _write_attributes(p: str) -> None:
     # P is bare and checks nothing out; the line keeps every later command on P free of conversions
+    from levain.slot import write_all
     from levain.slot.render import READSET_ATTRIBUTES
 
     info = os.path.join(p, "info")
@@ -920,7 +984,7 @@ def _write_attributes(p: str) -> None:
         afd = os.open("attributes", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
                       dir_fd=ifd)
         try:
-            os.write(afd, READSET_ATTRIBUTES)
+            write_all(afd, READSET_ATTRIBUTES)
         finally:
             os.close(afd)
     finally:
@@ -974,8 +1038,8 @@ def _verified_mismatch(detail: str) -> ReadSetRefused:
     return ReadSetRefused("readset-verified-mismatch", detail)
 
 
-def _open_p(v: VerifiedReadSet) -> str:
-    # v.workdir/P must still be the directory verify made: reached fd-relative, never through a symlink, same dev/ino
+def _p_at(v: VerifiedReadSet, gone: str) -> os.stat_result:
+    # P's lstat, reached fd-relative from the workdir's parent, never through a symlink
     workdir = v.workdir
     if not (isinstance(workdir, str) and os.path.isabs(workdir) and is_attempt_id(v.attempt)):
         raise _verified_mismatch("the read set's workdir is not an attempt's")
@@ -993,20 +1057,19 @@ def _open_p(v: VerifiedReadSet) -> str:
         finally:
             os.close(wfd)
     except OSError:
-        raise _verified_mismatch("the read set's workdir or P is gone") from None
+        raise _verified_mismatch(gone) from None
     finally:
         os.close(pfd)
+    return st
+
+
+def _open_p(v: VerifiedReadSet) -> tuple[str, tuple[int, int]]:
+    """``(path, (dev, ino))`` of ``v.workdir/P``, which must still be the directory verify made (same dev/ino, read
+    through the fds). That identity is the only one later checks compare against."""
+    st = _p_at(v, "the read set's workdir or P is gone")
     if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != (v.p_dev, v.p_ino):
         raise _verified_mismatch("P is not the directory verify_readset made")
-    return os.path.join(workdir, _P)
-
-
-def _p_identity(p: str) -> tuple[int, int]:
-    try:
-        st = os.lstat(p)
-    except OSError:
-        raise _verified_mismatch("P is gone") from None
-    return st.st_dev, st.st_ino
+    return os.path.join(v.workdir, _P), (st.st_dev, st.st_ino)
 
 
 def bundle_verified(v: VerifiedReadSet, contract_bytes: bytes, D: str, staging: str) -> StagedBundle:
@@ -1022,14 +1085,14 @@ def bundle_verified(v: VerifiedReadSet, contract_bytes: bytes, D: str, staging: 
     the bundle header for ``E`` and a pack header of ``N`` objects, else ``readset-verified-mismatch``. A ``P`` that
     vanishes around the cut is ``readset-verified-mismatch``; a write, close or flush that fails is ``readset-dest``;
     a bundle over the handoff cap is ``readset-handoff``. On every refusal after the open the file is closed once,
-    unlinked and staging flushed. On success the bundle is closed, then staging flushed."""
+    unlinked and staging flushed. On success the bundle is closed, then staging flushed; a close error on staging's
+    own fd after that flush is logged and the bundle returned."""
     E, _tree, N = readset_commit(contract_bytes, D)
     if not isinstance(v, VerifiedReadSet):
         raise _verified_mismatch("not a VerifiedReadSet")
     if v.commit != E or v.digest != D or v.objects != N:
         raise _verified_mismatch("the verified read set is not this contract's")
-    p = _open_p(v)
-    pid0 = _p_identity(p)
+    p, pid0 = _open_p(v)
     env = _p_env()
     try:
         for ref in ("HEAD", f"refs/heads/{BRANCH}"):
@@ -1064,7 +1127,8 @@ def bundle_verified(v: VerifiedReadSet, contract_bytes: bytes, D: str, staging: 
             problem = _prefix_problem(fd, E, N)
             if problem is not None:
                 raise _verified_mismatch(f"the bundle written has another {problem}")
-            if _p_identity(p) != pid0:
+            now = _p_at(v, "P is gone")
+            if (now.st_dev, now.st_ino) != pid0:
                 raise _verified_mismatch("P was replaced while the bundle was cut")
             size = os.fstat(fd).st_size
             closed = True       # before the call: a close that fails has still released the fd
@@ -1087,7 +1151,7 @@ def bundle_verified(v: VerifiedReadSet, contract_bytes: bytes, D: str, staging: 
                                      f"({type(exc).__name__}: {errno.errorcode.get(exc.errno, exc.errno)})") from None
             raise
     finally:
-        os.close(sfd)
+        _close_dir(sfd, staging)
     return StagedBundle(path=os.path.join(staging, STAGED_BUNDLE), size=size, commit=E, objects=N,
                         fsync=(("bundle", how), ("staging", staged)))
 

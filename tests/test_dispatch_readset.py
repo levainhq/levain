@@ -483,3 +483,72 @@ def test_a_failed_staging_flush_is_named_and_leaves_no_bundle(world, tmp_path, m
     monkeypatch.setattr(R, "full_fsync", real)
     assert R.bundle_verified(v, cb, d, str(top / "staging")).commit == v.commit
     R.discard(v)
+
+
+def _verified(world, tmp_path):
+    from levain.dispatch import readset as R
+    from levain.dispatch.attempt_id import new_attempt_id
+    _root, repo, _base, _old_a, contract = world
+    top = Path(os.path.realpath(tmp_path))
+    cb, d = contract.canonical().encode("utf-8"), contract.digest
+    rs = build_readset(str(repo), contract, dest(top, "scratch"), contract_digest=d)
+    for name in ("handoff", "attempts", "staging"):
+        (top / name).mkdir(mode=0o700)
+    ex = R.export_readset(rs, cb, d, str(top / "handoff"))
+    try:
+        fd = R.open_handoff(ex.path, size=ex.size)
+    finally:
+        os.close(ex.fd)
+    try:
+        return R.verify_readset(cb, d, fd, str(top / "attempts"), new_attempt_id()), cb, d, top
+    finally:
+        os.close(fd)
+
+
+def test_a_p_swapped_after_it_was_checked_is_refused_at_the_cut(world, tmp_path, monkeypatch):
+    # reproduced (wa-fix2 fix2_run.py W2): P swapped for a copy right after _open_p checked it was cut and staged,
+    # because the later "P was replaced" compare used a second path read taken after the swap
+    import shutil
+
+    from levain.dispatch import readset as R
+    v, cb, d, top = _verified(world, tmp_path)
+    real = R._open_p
+
+    def swapping(vv):
+        out = real(vv)
+        p = os.path.join(vv.workdir, "P")
+        shutil.copytree(p, p + ".new", symlinks=True)
+        os.rename(p, p + ".old")
+        os.rename(p + ".new", p)
+        return out
+
+    monkeypatch.setattr(R, "_open_p", swapping)
+    got = refusal(R.bundle_verified, v, cb, d, str(top / "staging"))
+    assert (got.name, got.detail) == ("readset-verified-mismatch", "P was replaced while the bundle was cut")
+    assert os.listdir(top / "staging") == []
+    R.discard(v)
+
+
+def test_a_staging_close_error_after_the_flush_returns_the_bundle(world, tmp_path, monkeypatch):
+    # reproduced (wa-fix2 fix2_run.py W3): EIO from closing staging's fd after its flush escaped raw, so a durable
+    # repo.bundle was reported as a failure and left in staging
+    import errno
+
+    from levain.dispatch import readset as R
+    v, cb, d, top = _verified(world, tmp_path)
+    sst = os.stat(top / "staging")
+    real, hit = os.close, []
+
+    def eio_on_staging(f: int) -> None:
+        st = os.fstat(f)
+        real(f)
+        if not hit and (st.st_dev, st.st_ino) == (sst.st_dev, sst.st_ino):
+            hit.append(f)
+            raise OSError(errno.EIO, "injected")
+
+    monkeypatch.setattr(os, "close", eio_on_staging)
+    sb = R.bundle_verified(v, cb, d, str(top / "staging"))
+    monkeypatch.setattr(os, "close", real)
+    assert hit and sb.commit == v.commit
+    assert os.listdir(top / "staging") == [R.STAGED_BUNDLE] and os.path.getsize(sb.path) == sb.size
+    R.discard(v)
