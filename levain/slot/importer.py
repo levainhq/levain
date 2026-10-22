@@ -28,6 +28,7 @@ import base64
 import errno
 import hashlib
 import io
+import itertools
 import os
 import re
 import select
@@ -833,7 +834,8 @@ def worktree_entries(frames: Sequence[Frame]) -> list[tuple[bytes, int, Frame]]:
     path relative to ``repo/``, minus the session's own git directory (a first component that IS ``.git``) and minus
     every skipped nested repo whole (a directory holding a ``skipped-git`` frame: nothing below it is the session's
     worktree, as ``git add`` would not add its files). A ``link`` is 120000; a ``file`` is 100755 when the owner's
-    execute bit is set (git's own index rule; a group or other bit alone is 100644), else 100644. Directories, special files and ``unread`` placeholders carry no index entry."""
+    execute bit is set (git's own index rule; a group or other bit alone is 100644), else 100644. Directories,
+    special files and ``unread`` placeholders carry no index entry."""
     nested: dict = {}
     for f in frames:
         if f.type == "skipped-git" and f.path.startswith(_REPO):
@@ -1109,30 +1111,29 @@ def _tree_payloads(path: Path, hexlen: int) -> Iterator[bytes]:
 
 def find_specials(runner: GitRunner, *, hexlen: int, objects: Path) -> set[str]:
     """The special oids to SEND: :func:`special_paths.adopt_specials` over every tree of the object list (types by
-    ``cat-file --batch-check``, payloads by ``cat-file --batch``, both through files in ``spool/``), minus the oids
-    the list already holds. Each must be a blob in the store: step 5's fsck refuses a non-blob or an absent object at a
-    special entry (measured on both gits), so anything else here is a failure with no adopt name. A tree Levain's
-    reader refuses (git's fsck passed it) is ``fsck:other``."""
+    ``cat-file --batch-check``, the tree oids among them, and payloads by ``cat-file --batch``, all through files in
+    ``spool/``), minus the oids the list already holds. Each must be a blob in the store: step 5's fsck refuses a
+    non-blob or an absent object at a special entry (measured on both gits), so anything else here is a failure with
+    no adopt name. A tree Levain's reader refuses (git's fsck passed it) is ``fsck:other``."""
     spool_dir = runner.work / "spool"
-    types, trees = spool_dir / "types", spool_dir / "trees"
+    types, tree_list, trees = spool_dir / "types", spool_dir / "tree-oids", spool_dir / "trees"
     type_re = re.compile(rb"([0-9a-f]{%d}) (commit|tree|blob|tag)" % hexlen)
-    tree_oids = bytearray()
     try:
         fd = _new_file(types)
         try:
             runner.must("cat-file", "--batch-check=%(objectname) %(objecttype)", stdin=objects, stdout_fd=fd)
         finally:
             os.close(fd)
-        with _read_own(types) as fh:
+        with _read_own(types) as fh, os.fdopen(_new_file(tree_list), "wb") as out:
             for line in _lines(fh, "cat-file --batch-check"):
                 m = type_re.fullmatch(line)
                 if m is None:
                     raise Fatal(None, "cat-file --batch-check: an object of the list without a known type")
                 if m.group(2) == b"tree":
-                    tree_oids += m.group(1) + b"\n"
+                    out.write(m.group(1) + b"\n")
         fd = _new_file(trees)
         try:
-            runner.must("cat-file", "--batch", stdin=bytes(tree_oids), stdout_fd=fd)
+            runner.must("cat-file", "--batch", stdin=tree_list, stdout_fd=fd)
         finally:
             os.close(fd)
         try:
@@ -1152,11 +1153,60 @@ def find_specials(runner: GitRunner, *, hexlen: int, objects: Path) -> set[str]:
     return specials
 
 
+def unsent_branches(runner: GitRunner, *, session: str, base_oid: str,
+                    tips: Sequence[tuple[str, bytes]]) -> list[bytes]:
+    """The session's branches the bundle does not carry, as the session named them (``refs/heads/<name>``), in refname
+    order: every ``refs/levain/<s>/heads/*`` reachable from none of base and the tips (one ``for-each-ref`` with a
+    ``--no-merged`` per commit; git lists the refs reachable from none of them). Read from a file in ``spool/`` as
+    bytes: a ref name need not be UTF-8."""
+    prefix = f"refs/levain/{session}/heads/".encode("ascii")
+    listing = runner.work / "spool" / "unsent"
+    filters = [f"--no-merged={oid}" for oid in (base_oid, *(o for o, _n in tips))]
+    names: list[bytes] = []
+    try:
+        fd = _new_file(listing)
+        try:
+            runner.must("for-each-ref", "--format=%(refname)", *filters, prefix.decode("ascii"), stdout_fd=fd)
+        finally:
+            os.close(fd)
+        with _read_own(listing) as fh:
+            while line := fh.readline(len(prefix) + _REF_TEXT_MAX + 1):
+                if not line.endswith(b"\n") or not line.startswith(prefix):
+                    raise Fatal(None, "for-each-ref printed a line that is not one of the session's branches")
+                names.append(_HEADS + line[len(prefix):-1])
+    except OSError as e:
+        raise _oserror(e, "the unsent branches") from None
+    return names
+
+
+#: Step 6 writes each output under ``spool/`` and links it to its ``out/`` name only once both are whole.
+_OUTPUTS = (("bundle.part", "bundle"), ("report.part", "report.json"))
+
+
+def _publish(work: Path) -> None:
+    """``link()`` each written output to its ``out/`` name (the bundle only when there is one), then unlink its
+    temp: an ``out/`` name never holds a partial file."""
+    for part, final in _OUTPUTS:
+        src = work / "spool" / part
+        if not os.path.lexists(src):
+            continue
+        os.link(src, work / "out" / final, follow_symlinks=False)
+        os.unlink(src)
+
+
+def remove_outputs(work: Path) -> bool:
+    """On a failed run: unlink both ``out/`` names and both temps. True when none is left."""
+    paths = [p for part, final in _OUTPUTS for p in (work / "spool" / part, work / "out" / final)]
+    for p in paths:
+        _unlink_quietly(p)
+    return not any(os.path.lexists(p) for p in paths)
+
+
 def write_bundle(runner: GitRunner, *, object_format: str, tips: Sequence[tuple[str, bytes]],
                  prereqs: Sequence[str], objects: Path, specials: set[str]) -> None:
-    """``out/bundle``: the header by :func:`bundlefmt.write_header` (a header past its bounds is refused by the
-    grammar's own name), then ``pack-objects --stdout`` fed the object list plus the specials, in object mode and with
-    no ``--thin``, so every delta in the pack is against an object in it."""
+    """The bundle, into ``spool/bundle.part``: the header by :func:`bundlefmt.write_header` (a header past its bounds
+    is refused by the grammar's own name), then ``pack-objects --stdout`` fed the object list plus the specials, in
+    object mode and with no ``--thin``, so every delta in the pack is against an object in it."""
     try:
         header = bundlefmt.write_header(object_format, list(tips), list(prereqs))
     except Refused as r:
@@ -1167,7 +1217,7 @@ def write_bundle(runner: GitRunner, *, object_format: str, tips: Sequence[tuple[
             write_all(fd, b"".join(o.encode("ascii") + b"\n" for o in sorted(specials)))
         finally:
             os.close(fd)
-        fd = _new_file(runner.work / "out" / "bundle")
+        fd = _new_file(runner.work / "spool" / _OUTPUTS[0][0])
         try:
             write_all(fd, header)
             runner.must("pack-objects", "--stdout", "-q", "--threads=2", stdin=objects, stdout_fd=fd)
@@ -1178,31 +1228,34 @@ def write_bundle(runner: GitRunner, *, object_format: str, tips: Sequence[tuple[
         raise _oserror(e, "writing the bundle") from None
 
 
-def write_report(work: Path, frames: Sequence[Frame], progress: Progress, *, session: str, result: str) -> None:
-    """``out/report.json`` (DESIGN §4.4), canonical JSON within :data:`REPORT_CAP`: the result, the walk's counts, and
-    every frame of a :data:`NAMED_TYPES` type in frame order as ``{path_b64, type}``; ``truncated`` when the next one
-    would carry the report past the cap. No git facts (no base, refs or oids), by DESIGN §4.4."""
+def write_report(work: Path, frames: Sequence[Frame], progress: Progress, *, session: str, result: str,
+                 unsent: Sequence[bytes]) -> None:
+    """The report (DESIGN §4.4), into ``spool/report.part``, canonical JSON within :data:`REPORT_CAP`: the result, the
+    walk's counts, the unsent branches (:func:`unsent_branches`) as ``{ref_b64}``, then every frame of a
+    :data:`NAMED_TYPES` type in frame order as ``{path_b64, type}``; both lists share the cap, and ``truncated`` is
+    set when the next entry would carry the report past it (no later entry of either list follows). No base and no
+    oids; the branch names are the one git fact, so a side branch the bundle leaves behind is not silent."""
     body: dict = {"format": REPORT_FORMAT, "session": session, "result": result,
                   "walk": {"entries": progress.entries, "bytes": progress.bytes},
-                  "ignored_git_paths": progress.ignored_git_paths, "named": [], "truncated": False}
+                  "ignored_git_paths": progress.ignored_git_paths, "unsent_branches": [], "named": [],
+                  "truncated": False}
     size = len(canon.canonical_bytes(body))
-    named: list[dict] = []
-    for f in frames:
-        if f.type not in NAMED_TYPES:
-            continue
-        entry = {"path_b64": base64.b64encode(f.path).decode("ascii"), "type": f.type}
-        cost = len(canon.canonical_bytes(entry)) + 1
+    entries = itertools.chain(
+        (("unsent_branches", {"ref_b64": base64.b64encode(n).decode("ascii")}) for n in unsent),
+        (("named", {"path_b64": base64.b64encode(f.path).decode("ascii"), "type": f.type})
+         for f in frames if f.type in NAMED_TYPES))
+    for key, entry in entries:
+        cost = len(canon.canonical_bytes(entry)) + (1 if body[key] else 0)  # a comma only after an entry
         if size + cost > REPORT_CAP:
             body["truncated"] = True
             break
-        named.append(entry)
+        body[key].append(entry)
         size += cost
-    body["named"] = named
     data = canon.canonical_bytes(body)
     if len(data) > REPORT_CAP:
         raise Fatal(None, f"the report is {len(data)} bytes, past {REPORT_CAP}")
     try:
-        fd = _new_file(work / "out" / "report.json")
+        fd = _new_file(work / "spool" / _OUTPUTS[1][0])
         try:
             write_all(fd, data)
             os.fsync(fd)
@@ -1216,9 +1269,10 @@ def write_result(runner: GitRunner, frames: Sequence[Frame], progress: Progress,
                  base_oid: str) -> str:
     """Step 6. No tip (:func:`find_tips`) = ``adopt-nothing-new``: the report alone, no bundle. Else the object list
     and its boundary (:func:`list_objects`): no prerequisite = ``unrelated`` (an orphan carries its whole history),
-    some = ``delta``; the specials (:func:`find_specials`), ``out/bundle`` (:func:`write_bundle`), the report. Returns
-    the result."""
+    some = ``delta``; the specials (:func:`find_specials`), the bundle (:func:`write_bundle`), the report; then both
+    are published to ``out/`` together (:func:`_publish`). Returns the result."""
     tips = find_tips(runner, session=session, base_oid=base_oid)
+    unsent = unsent_branches(runner, session=session, base_oid=base_oid, tips=tips)
     if not tips:
         result = NOTHING_NEW
     else:
@@ -1229,7 +1283,11 @@ def write_result(runner: GitRunner, frames: Sequence[Frame], progress: Progress,
         write_bundle(runner, object_format=object_format, tips=tips, prereqs=prereqs, objects=objects,
                      specials=specials)
         result = DELTA if prereqs else UNRELATED
-    write_report(runner.work, frames, progress, session=session, result=result)
+    write_report(runner.work, frames, progress, session=session, result=result, unsent=unsent)
+    try:
+        _publish(runner.work)
+    except OSError as e:
+        raise _oserror(e, "publishing the outputs") from None
     return result
 
 
@@ -1397,6 +1455,9 @@ def run(argv: Sequence[str], *, stdin: BinaryIO | None, result_fd: int, work: Pa
             out["refused"] = None
             out["result"] = None
             out["detail"] = f"importer interrupted: {exc_type.__name__}"
+        # A failed run leaves no output: whatever step 6 or a temp got to is unlinked before the line says so.
+        if out["rc"] != 0 and work is not None and not _remove_outputs_quietly(work):
+            out["detail"] = f"{out['detail']}; an output could not be removed"
         try:
             line = result_line(progress, refused=out["refused"], detail=str(out["detail"]), enospc=bool(out["enospc"]),
                                result=out["result"] if out["rc"] == 0 else None)
@@ -1407,7 +1468,16 @@ def run(argv: Sequence[str], *, stdin: BinaryIO | None, result_fd: int, work: Pa
             write_all(result_fd, line)  # THE one result-line write
         except OSError:
             out["rc"] = 1
+            if work is not None:  # no line reached the caller: the run failed, so its outputs go too
+                _remove_outputs_quietly(work)
     return int(out["rc"])
+
+
+def _remove_outputs_quietly(work: Path) -> bool:
+    try:
+        return remove_outputs(work)
+    except Exception:  # noqa: BLE001 - removal never decides whether the line is written
+        return False
 
 
 def main() -> int:

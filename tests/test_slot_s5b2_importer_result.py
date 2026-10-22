@@ -9,9 +9,14 @@ symlink class an honest bundle's pack does not index alone on a git that checks 
 Also reproduced on 49a47242 (``s4b_repro_on_49a47242.txt``, L3 r1 of session 3): a file with a group execute bit but
 not the owner's made a spurious 100755 wip; a write failing ENOSPC left its ``tmp_*`` name in ``objects/``; and
 ``_same_object`` held and inflated a whole object (peak RSS +1.9 GB for one 128 MiB blob).
+
+And on b86fe918 (``s5c_repro_on_b86fe918.txt``, L3 r1 of session 4): a report refused past its cap, or a pack-objects
+dying midway, left ``out/bundle`` behind a failed run; a report whose one named entry lands exactly on the cap was
+truncated; and a side branch the bundle does not carry was named nowhere.
 """
 from __future__ import annotations
 
+import base64
 import errno
 import hashlib
 import io
@@ -149,7 +154,8 @@ def test_a_delta_bundle_stands_alone_with_its_symlink_targets(tmp_path):
     assert ln in held.split(), "the unchanged symlink's blob is a special and must be in the pack"
     raw = (work / "out" / "report.json").read_bytes()
     report = canon.parse(raw)
-    assert set(report) == {"format", "session", "result", "walk", "ignored_git_paths", "named", "truncated"}
+    assert set(report) == {"format", "session", "result", "walk", "ignored_git_paths", "unsent_branches", "named",
+                           "truncated"}
     assert report["format"] == "levain-adopt-report/1" and report["walk"] == result["walk"]
     assert canon.canonical_bytes(report) == raw
     assert got[f"refs/levain/{SESSION}/head"] == s.c1
@@ -200,3 +206,49 @@ def test_same_object_streams(tmp_path):
     with open(path, "ab") as fh:
         fh.write(b"x")
     assert not importer._same_object(path, oid, "sha1"), "bytes after the zlib stream are not the object"
+
+
+@pytest.mark.parametrize("seam", ["report-refused", "pack-objects-dies"])
+def test_a_failed_step_6_leaves_no_output(tmp_path, monkeypatch, seam):
+    s = _Session(tmp_path)
+    if seam == "report-refused":
+        real = importer.write_bundle
+
+        def write_bundle(*a, **k):
+            real(*a, **k)
+            monkeypatch.setattr(importer, "REPORT_CAP", 64)
+        monkeypatch.setattr(importer, "write_bundle", write_bundle)
+    else:
+        real_must = importer.GitRunner.must
+
+        def must(self, *args, **k):
+            if args[0] == "pack-objects":
+                os.write(k["stdout_fd"], b"P" * 100)
+                raise importer.Fatal(None, "seam: pack-objects died")
+            return real_must(self, *args, **k)
+        monkeypatch.setattr(importer.GitRunner, "must", must)
+    rc, result, _got, work = s.run(_main(s.c1), CLEAN + [(b"new", b"n\n", "file", 0o644)])
+    assert rc == 1 and result["result"] is None, result
+    left = [p for p in ("out/bundle", "out/report.json", "spool/bundle.part", "spool/report.part")
+            if os.path.lexists(work / p)]
+    assert left == [], "a failed run publishes nothing"
+
+
+def test_side_branches_left_behind_are_named(tmp_path):
+    s = _Session(tmp_path)
+    refs = {**_main(s.base), b"refs/heads/side": s.c1.encode() + b"\n", b"refs/heads/old": s.base.encode() + b"\n"}
+    rc, result, _got, work = s.run(refs, [CLEAN[0]])
+    assert (rc, result["result"]) == (0, "adopt-nothing-new"), result
+    report = canon.parse((work / "out" / "report.json").read_bytes())
+    assert report["unsent_branches"] == [{"ref_b64": base64.b64encode(b"refs/heads/side").decode()}]
+
+
+def test_an_entry_that_lands_exactly_on_the_cap_is_kept(tmp_path, monkeypatch):
+    wt = [CLEAN[0], (b"p", b"", "fifo", 0o644)]
+    rc, _result, _got, work = _Session(tmp_path / "a").run(None, wt)
+    size = (work / "out" / "report.json").stat().st_size
+    for cap, kept in ((size, 1), (size - 1, 0)):
+        monkeypatch.setattr(importer, "REPORT_CAP", cap)
+        rc, _result, _got, work = _Session(tmp_path / f"cap{cap}").run(None, wt)
+        report = canon.parse((work / "out" / "report.json").read_bytes())
+        assert (rc, len(report["named"]), report["truncated"]) == (0, kept, not kept), cap
