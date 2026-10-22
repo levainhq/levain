@@ -1748,8 +1748,8 @@ def _alloc_base_field(a: R.Alloc) -> Optional[Mapping[str, object]]:
 
 @dataclass
 class AdoptSeams:
-    """adopt-open's own injected facts: the alloc's ``base`` (render writes it; ``None`` = unrecorded), the adopt
-    lock's wait (V7's wall) and the walker caps."""
+    """adopt-open's own injected facts: the alloc's ``base`` (render writes it; ``None`` = unrecorded), V7's wall
+    in seconds (one absolute deadline over the adopt-lock wait and the walk) and the walker caps."""
 
     alloc_base: Callable[[R.Alloc], Optional[Mapping[str, object]]] = _alloc_base_field
     lock_wait_s: float = V7_SECONDS
@@ -1759,7 +1759,8 @@ class AdoptSeams:
 
 @dataclass(frozen=True)
 class AdoptFront:
-    """What steps 1-5 established, for the sealed run (steps 6-12)."""
+    """What steps 1-5 established, for the sealed run (steps 6-12). ``deadline`` is V7's one absolute wall
+    (``Seams.monotonic`` value), fixed before the adopt-lock wait; the walk takes the same value."""
 
     alloc: R.Alloc
     base: Mapping[str, object]
@@ -1770,6 +1771,36 @@ class AdoptFront:
     nbytes: int
     manifest_bytes: int
     deepest_git_path: int
+    deadline: float
+
+
+def adopt_walk_caps(front: AdoptFront, adopt: AdoptSeams):   # -> walker.WalkCaps
+    """The walker's caps for this run: V7's bytes and entries, and the SAME deadline the adopt-lock wait ran
+    against, so a lock taken late leaves the walk only what remains of the one wall."""
+    from levain.slot import walker as WK
+
+    return WK.WalkCaps(bytes=adopt.max_bytes, entries=adopt.max_entries, deadline=front.deadline)
+
+
+#: The keys of the ``base`` record render writes into the alloc: every one is required, or ``base-unrecorded``.
+BASE_KEYS = frozenset({"oid", "ref_b64", "object_format", "bundle_sha256", "bundle_bytes"})
+_OID_HEX = {"sha1": 40, "sha256": 64}
+_HEX_RE = re.compile(r"[0-9a-f]+")
+
+
+def _check_base(base: object, session: str) -> Mapping[str, object]:
+    """``alloc.base`` as a record: a Mapping holding every :data:`BASE_KEYS` key, each well-typed; else
+    ``base-unrecorded`` (never a default for a missing term)."""
+    if not isinstance(base, Mapping) or not BASE_KEYS <= set(base):
+        raise Refused("base-unrecorded", session)
+    fmt, oid, sha, nb, ref = (base["object_format"], base["oid"], base["bundle_sha256"], base["bundle_bytes"],
+                              base["ref_b64"])
+    if not (isinstance(fmt, str) and fmt in _OID_HEX and isinstance(oid, str) and len(oid) == _OID_HEX[fmt]
+            and _HEX_RE.fullmatch(oid) and isinstance(sha, str) and sha.startswith("sha256:") and len(sha) == 71
+            and _HEX_RE.fullmatch(sha[7:]) and isinstance(nb, int) and not isinstance(nb, bool) and nb >= 0
+            and isinstance(ref, str) and ref):
+        raise Refused("base-unrecorded", f"{session}: a base record off its schema")
+    return base
 
 
 def adopt_step1_caller(ctx: Ctx, session: str) -> R.Alloc:
@@ -1778,7 +1809,11 @@ def adopt_step1_caller(ctx: Ctx, session: str) -> R.Alloc:
     data = ctx.store.read(("alloc",), f"{session}.json")
     if data is None:
         raise Refused("no-session", session)
-    a = R.parse_alloc(data)
+    try:
+        a = R.parse_alloc(data)
+    except (ContractError, Refused) as e:
+        # Read before the operator check, so its failure names nothing about the record.
+        raise Refused("no-session", session) from e
     if a.session != session or a.operator_uid != ctx.sudo_uid:
         raise Refused("no-session", session)
     if a.kind not in ADOPT_KINDS:
@@ -1839,7 +1874,7 @@ def _manifest_depths(path: Path, cap: int) -> Tuple[int, int, int]:
     return deepest, deepest_git, size
 
 
-def adopt_step3_root_facts(ctx: Ctx, a: R.Alloc, adopt: AdoptSeams) -> AdoptFront:
+def adopt_step3_root_facts(ctx: Ctx, a: R.Alloc, adopt: AdoptSeams, *, deadline: float) -> AdoptFront:
     """(3) Root facts, its own files only: the retained object whole, no intent, not in trash, SCRUBBED, ``base``
     recorded, and the walk depth (``object.json`` ``depth``, or for a pre-upgrade object ``max(V28, the deepest
     manifest path)``)."""
@@ -1857,9 +1892,7 @@ def adopt_step3_root_facts(ctx: Ctx, a: R.Alloc, adopt: AdoptSeams) -> AdoptFron
         raise Refused("not-retained:absent", a.session)
     if not scrubbed(ctx, a):
         raise Refused("not-scrubbed", a.session)
-    base = adopt.alloc_base(a)
-    if not base:
-        raise Refused("base-unrecorded", a.session)
+    base = _check_base(adopt.alloc_base(a), a.session)
     obj = canon.parse(E._read_durable(facts.retained / "object.json"))
     assert isinstance(obj, dict)   # retained_whole parsed it as this session's object
     deepest, deepest_git, msize = _manifest_depths(facts.retained / "manifest.jsonl", WF.header_cap() + 1024)
@@ -1874,18 +1907,47 @@ def adopt_step3_root_facts(ctx: Ctx, a: R.Alloc, adopt: AdoptSeams) -> AdoptFron
         if not isinstance(v, int) or isinstance(v, bool) or v < 0:
             raise Refused("not-retained:absent", f"{a.session}: object.json entries / bytes")
     return AdoptFront(alloc=a, base=base, retained=facts.retained, depth=depth, legacy_depth=legacy,
-                      entries=entries, nbytes=nbytes, manifest_bytes=msize, deepest_git_path=deepest_git)
+                      entries=entries, nbytes=nbytes, manifest_bytes=msize, deepest_git_path=deepest_git,
+                      deadline=deadline)
 
 
-class _AdoptDeadline(Exception):
-    pass
+#: The adopt-lock fds this process holds. A forked child (the importer runs through a fork with no exec, and
+#: ``O_CLOEXEC`` never fires there) closes them in its first step after the fork, so the flock outlives the
+#: parent's release by that step at most, never by the child's lifetime.
+_ADOPT_LOCK_FDS: set = set()
+
+
+def _close_adopt_locks_in_child() -> None:
+    for fd in tuple(_ADOPT_LOCK_FDS):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    _ADOPT_LOCK_FDS.clear()
+
+
+os.register_at_fork(after_in_child=_close_adopt_locks_in_child)
+
+
+def flock_until(fd: int, deadline: float, seams: Seams) -> bool:
+    """``LOCK_EX`` by ``LOCK_NB`` retries until the absolute ``deadline`` (``seams.monotonic`` value): the backoff
+    of :func:`wait_flock` (which takes a duration), each sleep cut to what is left. Touches no signal state.
+    False at the deadline."""
+    delay = LOCK_SLICE_S
+    while not try_flock(fd):
+        left = deadline - seams.monotonic()
+        if left <= 0:
+            return False
+        seams.sleep(min(delay, left))
+        delay = min(delay * 2, 0.5)
+    return True
 
 
 @contextmanager
-def adopt_lock_wait(ctx: Ctx, adopt: AdoptSeams) -> Iterator[None]:
+def adopt_lock_wait(ctx: Ctx, deadline: float) -> Iterator[None]:
     """(4) The machine-wide adopt lock ``L/export/adopt.lock`` (root 0600, never unlinked), taken AFTER the session
-    lock: a BLOCKING ``flock`` under an alarm at ``adopt.lock_wait_s`` (``adopt-busy`` at the deadline), so an
-    operator adopt is queued in the kernel behind a running import and is woken when it releases."""
+    lock: ``LOCK_NB`` retries until V7's absolute ``deadline`` (``adopt-busy`` past it), so an operator adopt
+    waits behind a running import and takes the lock when it releases."""
     with ctx.store.dir("export") as efd:
         try:
             fd = os.open("adopt.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600,
@@ -1894,27 +1956,17 @@ def adopt_lock_wait(ctx: Ctx, adopt: AdoptSeams) -> Iterator[None]:
             if e.errno in (errno.ELOOP, errno.EMLINK, errno.ENXIO):
                 raise Refused("bad-root", "export/adopt.lock is a link or not a file") from None
             raise
+    _ADOPT_LOCK_FDS.add(fd)   # from the open: a child forked while this OFD is locked must not keep it
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or not ctx.seams.trusted(st):
             raise Refused("bad-root", "export/adopt.lock")
-        if not try_flock(fd):
-            def _expire(signum, frame):
-                raise _AdoptDeadline()
-            old = signal.signal(signal.SIGALRM, _expire)
-            try:
-                signal.setitimer(signal.ITIMER_REAL, max(adopt.lock_wait_s, 0.001))
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX)
-                finally:
-                    signal.setitimer(signal.ITIMER_REAL, 0)
-            except _AdoptDeadline:
-                raise Refused("adopt-busy", "an import or verify held the adopt lock past the wait") from None
-            finally:
-                signal.signal(signal.SIGALRM, old)
+        if not flock_until(fd, deadline, ctx.seams):
+            raise Refused("adopt-busy", "an import or verify held the adopt lock past the wait")
         yield
     finally:
-        os.close(fd)   # closing the only descriptor releases the flock
+        _ADOPT_LOCK_FDS.discard(fd)
+        os.close(fd)   # the only descriptor: a forked child closed its copy after the fork
 
 
 def adopt_step5_precaps(ctx: Ctx, front: AdoptFront, adopt: AdoptSeams) -> None:
@@ -1930,9 +1982,7 @@ def adopt_step5_precaps(ctx: Ctx, front: AdoptFront, adopt: AdoptSeams) -> None:
         raise Refused("adopt-path-too-long",
                       "this session was retained by an END that accepted any depth; Levain refuses a session tree "
                       f"deeper than {WF.MAX_DEPTH}; git itself refuses to walk one from v2.43")
-    bundle_bytes = front.base.get("bundle_bytes", 0)
-    if not isinstance(bundle_bytes, int) or isinstance(bundle_bytes, bool) or bundle_bytes < 0:
-        raise Refused("base-unrecorded", f"{front.alloc.session}: base bundle_bytes")
+    bundle_bytes = _check_base(front.base, front.alloc.session)["bundle_bytes"]
     need = adopt_peak_bytes(ctx.seams.host, entries=front.entries, nbytes=front.nbytes,
                             manifest_bytes=front.manifest_bytes, bundle_bytes=bundle_bytes)
     with ctx.store.dir("export") as efd:
@@ -1947,13 +1997,14 @@ def adopt_open_front(ctx: Ctx, session: str, adopt: Optional[AdoptSeams] = None)
     lock (bounded wait, ``adopt-busy``), the pre-caps. Both locks are held while the caller runs steps 6-12 and are
     released adopt lock first, then the session lock."""
     adopt = adopt or AdoptSeams()
+    deadline = ctx.seams.monotonic() + adopt.lock_wait_s   # V7's one wall: the lock wait and the walk
     a = adopt_step1_caller(ctx, session)
     ctx.seams.at("adopt:2")
     with session_lock(ctx, session):
         ctx.seams.at("adopt:3")
-        front = adopt_step3_root_facts(ctx, a, adopt)
+        front = adopt_step3_root_facts(ctx, a, adopt, deadline=deadline)
         ctx.seams.at("adopt:4")
-        with adopt_lock_wait(ctx, adopt):
+        with adopt_lock_wait(ctx, front.deadline):
             ctx.seams.at("adopt:5")
             adopt_step5_precaps(ctx, front, adopt)
             yield front
