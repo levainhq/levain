@@ -21,10 +21,12 @@ teardown SCRUB and release a slot whose work was never retained.
 
 Locks, always in this order (§3.5 LOCK ORDER: pool -> slot -> session END lock): :func:`end_session` and
 :func:`reconcile_session` hold the slot's ``L/slots/{e,v}<n>/lock`` (:func:`slot_lock`), then root's
-per-session try-lock ``L/alloc/<session>.lock`` (held = ``end-busy``; the reaper or helper retries). The
-slot lock is held across the slot check, every proof and every act (codex r1 2): SCRUBBED and prepare take
-the same lock, so a slot cannot be released and re-leased between END's check and its signals. A CAS
-CONTROL does not take is never a step failure (L2 M5): see :func:`send_cas`.
+per-session lock ``L/alloc/<session>.lock`` (:func:`end_lock`: a bounded wait of :data:`END_LOCK_WAIT_S`, then
+``end-busy`` with the record unchanged; the reaper or helper retries). The slot lock is held across the slot
+check, every proof and every act (codex r1 2): SCRUBBED takes the same lock FIRST and only TRIES the pool lock
+after its kills, and prepare holds the pool lock and only TRIES slot locks, so a slot cannot be released and
+re-leased between END's check and its signals and no holder ever waits slot -> pool. A CAS CONTROL does not take
+is never a step failure (L2 M5): see :func:`send_cas`.
 
 Root reads no bytes the session could not (L2 H2, codex r1 4): a file hard-linked to a path outside the
 tree, and any inode a session uid does not own whatever its link count, is hashed (and, outside-linked,
@@ -1776,8 +1778,10 @@ def check_slot_ours(facts: EndFacts, seams: EndSeams) -> None:
 def slot_lock(facts: EndFacts, seams: EndSeams) -> Iterator[bool]:
     """The slot's ``L/slots/{e,v}<n>/lock`` flock (§3.5), taken BEFORE :func:`end_lock` (the order pool ->
     slot -> session END lock; END never holds the pool lock), and held across the slot check, the freeze,
-    kill and no-process proofs and every act after them (codex r1 2). SCRUBBED takes the same lock (after the
-    pool lock) and re-checks the lease under it, so a slot END proved ours cannot be released and re-leased
+    kill and no-process proofs and every act after them (codex r1 2). SCRUBBED takes the same lock FIRST,
+    re-checks the lease under it and only TRIES the pool lock after its kills (a lost TRY releases the slot lock and
+    leaves the slot leased), never pool -> slot: a SCRUB waiting on the slot lock while holding the pool lock would
+    stall every ``prepare`` behind END (reaper DESIGN Q2). So a slot END proved ours cannot be released and re-leased
     while END signals its uids. prepare only TRIES it under the pool lock, so a slot END holds is passed over
     and prepare never waits on END. Waited for up to :data:`SLOT_LOCK_WAIT_S`, else ``slot-locked`` (raised,
     never HELD: the caller retries). Yields whether the slot exists: DECISION no slot directory means no slot
@@ -1938,7 +1942,7 @@ def reconcile_session(facts: EndFacts, seams: EndSeams, *, caps: Caps = Caps(),
                     raise Refused("slot-not-ours", f"no {facts.slot.slot_dir(facts.store)}")
                 check_slot_ours(facts, seams)
                 step = "freeze"
-                _prove_frozen(facts, seams)
+                _prove_frozen(facts, seams)     # best-effort (H1): the kill and its proof are the test
                 step = "kill"
                 _prove_dead(facts, seams)
             except Exception as e:   # noqa: BLE001 - an unproven step is HELD
@@ -1962,9 +1966,20 @@ def _prove(ok: Callable[[], bool], what: str, seams: EndSeams, bound: float | No
         raise Refused(f"{what}-unproven", f"past the {bound:g} s bound")
 
 
-def _prove_frozen(facts: EndFacts, seams: EndSeams) -> None:
+def _prove_frozen(facts: EndFacts, seams: EndSeams) -> bool:
+    """The freeze of every session uid, BEST-EFFORT (reaper H1): each bounded to a quarter of V12, and whatever it
+    answers the kill runs next. Processes of a uid can resume each other (``SIGCONT`` from the uid itself), so a
+    freeze that never proves must not be what keeps them alive; the kill and the no-process proof are END's test.
+    Returns whether every freeze proved; a freeze that did not is noted."""
+    bound = V12_SECONDS / 4
+    ok = True
     for uid in facts.uids:
-        _prove(lambda u=uid: seams.freeze(u, V12_SECONDS), "freeze", seams, V12_SECONDS)
+        try:
+            _prove(lambda u=uid: seams.freeze(u, bound), "freeze", seams, bound)
+        except Exception as e:   # noqa: BLE001 - the kill runs whatever the freeze says
+            seams.note(f"END {facts.session}: the freeze of uid {uid} did not prove ({e}); the kill runs")
+            ok = False
+    return ok
 
 
 def _prove_dead(facts: EndFacts, seams: EndSeams) -> None:
@@ -2008,11 +2023,17 @@ def _end_locked(facts: EndFacts, seams: EndSeams, start: int, attempts: int, cap
             raise Refused("slot-not-ours", f"no {facts.slot.slot_dir(facts.store)}")
         check_slot_ours(facts, seams)
         step = "freeze"
-        _prove_frozen(facts, seams)
-        if start <= 0:
+        frozen = _prove_frozen(facts, seams)
+        if frozen and start <= 0:
+            cas(FROZEN, {})
+        # H1: an unproven freeze does not stop the kill. Until FROZEN is sent a failure is still named "freeze" (the
+        # retry resumes from the FROZEN edge); once the kill and its proof pass, every process of the session is gone,
+        # which also answers what FROZEN records, so the edge goes then, before DEAD.
+        step = "kill" if frozen else "freeze"
+        _prove_dead(facts, seams)
+        if not frozen and start <= 0:
             cas(FROZEN, {})
         step = "kill"
-        _prove_dead(facts, seams)
         if start <= 1:
             cas(DEAD, {})
 

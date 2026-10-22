@@ -378,10 +378,10 @@ def drain(fd: int, bound: int, *, deadline_s: float = CHECK_S,
 
 
 def reap_within(pid: int, deadline_s: float, *, monotonic: Callable[[], float] = time.monotonic,
-                sleep: Callable[[float], None] = time.sleep) -> int:
+                sleep: Callable[[float], None] = time.sleep, refusal: str = "check-timeout") -> int:
     """The helper's own child ``pid`` reaped within ``deadline_s`` (its exit status as :func:`wait_child` answers
-    it); past it the child is killed and reaped, then ``check-timeout``. Polled (``WNOHANG``), as no portable call
-    waits on one pid with a timeout."""
+    it); past it the child is killed and reaped, then ``refusal`` (``check-timeout`` for a post-clone check child).
+    Polled (``WNOHANG``), as no portable call waits on one pid with a timeout."""
     end = monotonic() + deadline_s
     nap = 0.001
     while True:
@@ -393,9 +393,22 @@ def reap_within(pid: int, deadline_s: float, *, monotonic: Callable[[], float] =
             return _exit_code(status)
         if monotonic() >= end:
             _sigkill_and_reap(pid)
-            raise Refused("check-timeout", f"the check child did not exit within {deadline_s:g}s")
+            raise Refused(refusal, f"the child did not exit within {deadline_s:g}s")
         sleep(nap)
         nap = min(nap * 2, 0.05)
+
+
+def wait_child_within(pid: int, deadline_s: float) -> int:
+    """:func:`wait_child` bounded by ``deadline_s`` (:func:`reap_within`'s poll, SIGINT and SIGQUIT ignored while it
+    waits, as there): past it the child is SIGKILLed and reaped, then ``child-timeout``. For ``start``'s clone, which
+    runs under the session END lock: an unbounded wait there would answer every END ``end-busy`` for as long as a
+    clone hangs."""
+    old = [(sig, signal.signal(sig, signal.SIG_IGN)) for sig in (signal.SIGINT, signal.SIGQUIT)]
+    try:
+        return reap_within(pid, deadline_s, refusal="child-timeout")
+    finally:
+        for sig, h in old:
+            signal.signal(sig, h)
 
 
 def capture_target(argv: Sequence[str], spec_json: bytes, cgroup: Optional[str], bound: int) -> Tuple[int, bytes]:
@@ -519,6 +532,8 @@ class Seams:
     # start / teardown (levain.slot.start):
     spawn: Callable[[Sequence[str], bytes, Optional[str], Optional[int], bool], int] = spawn_target
     wait: Callable[[int], int] = wait_child
+    #: a child's wait bounded by its second argument, in seconds (:func:`wait_child_within`)
+    wait_within: Callable[[int, float], int] = wait_child_within
     #: a post-clone check child: ``(argv, spec_json, cgroup, bound) -> (exit, stdout)`` (:func:`capture_target`)
     capture: Callable[[Sequence[str], bytes, Optional[str], int], Tuple[int, bytes]] = capture_target
     egress_ready: Callable[[SlotId, Mapping[str, int]], None] = wall.macos_egress_ready
@@ -1017,7 +1032,12 @@ def revert_lease(store: Store, leased: Leased) -> bool:
     file is still EXACTLY the lease this ``prepare`` wrote; anything else is left as it is. §3.5 LOCK ORDER: the
     slot lock is held here, so the pool lock is only TRIED; on failure the slot lock is released, the pool lock taken,
     and the slot lock TRIED again (a holder now = someone else's: leave it). Returns whether it wrote. A slot this
-    leaves leased has no alloc: the reaper's orphan revert (§3.5) is its recovery."""
+    leaves leased has no alloc: the reaper's orphan revert (§3.5) is its recovery.
+
+    This is the one write off ``leased`` with no ``end_domain`` before it (reaper DESIGN §3.1, invariant I1's stated
+    exception, RH7), and it holds only because nothing has run in the slot: no spawn into a slot uid happens before
+    the lease commit (the front spawns in render, after ATTACH). Condition: if any spawn ever moves before the lease
+    commit, the revert must first run ``end_domain`` on the gateway uid under ``front.lock``."""
     seams = store.seams
     prior = leased.prior
     if prior is None:
@@ -1760,7 +1780,7 @@ def _read_stdin() -> bytes:
 __all__ = ["BASE_ROUTES_FORMAT", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED",
            "FRONT_MODULE", "GO_BYTE", "GO_FD", "GO_FD_ENV", "Leased", "LinkedNotDurable", "PREPARE_RESULT_FORMAT",
            "RENDER_STEPS", "RenderRun", "SLOT_OWNED_RENDER_DIRS", "Seams", "SlotView", "Store", "VERB_HANDLERS",
-           "CHECK_S", "capture_target", "configured_slots", "drain", "reap_within", "ENTRY_ENV", "entry_env",
+           "CHECK_S", "capture_target", "configured_slots", "drain", "reap_within", "wait_child_within", "ENTRY_ENV", "entry_env",
            "create_alloc", "create_at", "kill_front", "lease_slot", "main", "make_cgroup", "open_slot_owned_dir",
            "parse_slot_state_of", "pick_slot", "prepare", "proc_identity", "read_view", "render",
            "render_layer_rows", "resume", "revert_lease", "run", "session_dir_rows", "session_lock",

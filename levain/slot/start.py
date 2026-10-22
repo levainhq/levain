@@ -76,6 +76,11 @@ _SECRET_KEY = {RD.QUEUE_CAP_ENV: "queue_cap"}   # every other secret env name ca
 EXEC_MARKER_S = 60.0
 #: DECISION: the bound on the forwarder's ready byte (one interpreter start, a bind and a listen, in the netns).
 FORWARDER_READY_S = 10.0
+#: H8 (head ruling): the bound on the clone child, spawn to reap. The clone runs under the session END lock (the spawn
+#: fence), so a hung clone would hold every END at ``end-busy``; past it the child is SIGKILLed and reaped (not
+#: killpg: the clone child is not a group leader, its group is the helper's), then ``clone-failed: timeout``, whose
+#: domain kill ends whatever the clone started as the slot uid.
+CLONE_S = 600.0
 
 
 # --- small reads ------------------------------------------------------------------------------------------------------
@@ -226,8 +231,10 @@ def _abandon(ctx: H.Ctx, a: R.Alloc, pid: int, what: str) -> None:
     proof: a zombie child of the start is a process of the uid until reaped), then ``seams.kill(pid)`` (SIGKILL +
     waitpid) ONLY for a pid that kill did not reap: a reaped pid may already be another process's. The launched pid
     is one process across ``launchctl asuser``'s exec, the stage's drop and its exec of the target: root until the
-    stage drops, the slot uid after. A pid still root at the kill is not the sweep's and is not reaped, so the
-    trailing kill ends it. A failure here is noted, never raised over the refusal the caller is about to raise.
+    stage drops, the slot uid after. macOS: :func:`proc.end_domain` SIGKILLs it FIRST, before its freeze (still the
+    start's unreaped child, so the pid cannot be reused), so a pid still root is ended before it can drop and fork,
+    and the reap is never waited on to the deadline. A failure here is noted, never raised over the refusal the
+    caller is about to raise.
     Runs under the session END lock (:func:`start`)."""
     reaped: frozenset = frozenset()
     try:
@@ -637,7 +644,12 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc) -> int:
     argv, cgroup = launch(ctx, a, spec)
     if cgroup is not None:
         seams.make_cgroup(cgroup)
-    code = seams.wait(seams.spawn(argv, spec.to_json(), cgroup, None, False))
+    try:
+        code = seams.wait_within(seams.spawn(argv, spec.to_json(), cgroup, None, False), CLONE_S)
+    except Refused as e:
+        if e.name != "child-timeout":
+            raise
+        _clone_failed(ctx, a, "timeout")
     if code != 0:
         _clone_failed(ctx, a, f"exit {code}")
     if a.kind in RD.READSET_KINDS:
@@ -867,7 +879,7 @@ def _marker(a: R.Alloc) -> bytes:
     return canon.canonical_bytes({"lease_seq": a.lease_seq, "session": a.session})
 
 
-def scrub_and_release(ctx: H.Ctx, a: R.Alloc) -> bool:
+def scrub_and_release(ctx: H.Ctx, a: R.Alloc) -> Optional[bool]:
     """§7.3 ``slot: LEASED -> SCRUBBED -> REUSABLE``. Under the SLOT lock only, and only while root's slot state file
     shows this slot leased to THIS session at alloc's ``lease_seq``: proc.scrub (macOS: :func:`proc.end_domain` on
     every uid of the slot, the gateway's under ``front.lock`` waited for up to :data:`FRONT_LOCK_WAIT_S`; Linux: the
@@ -879,7 +891,7 @@ def scrub_and_release(ctx: H.Ctx, a: R.Alloc) -> bool:
     Returns whether it released the slot. A pool TRY that fails releases the slot lock and returns ``False``: the
     slot stays leased to a RETAINED session with no process, which the reaper's pass rule ("leased + RETAINED + alloc
     -> SCRUB again") owns. DECISION: a slot that has already left this lease (a second teardown, the reaper first) is
-    not touched and not refused. A verifier pair has no gateway uid: its child takes that place, with no
+    not touched and not refused, and answers ``None`` (nothing of this lease was left to release). A verifier pair has no gateway uid: its child takes that place, with no
     ``front.lock`` (it has no front)."""
     seams = ctx.seams
     slot = a.slot
@@ -892,7 +904,7 @@ def scrub_and_release(ctx: H.Ctx, a: R.Alloc) -> bool:
         H.wait_flock(lock, seams, "slot-locked")
         st = _slot_state(ctx, slot)
         if not _names_lease(st, a):
-            return False
+            return None
         seams.at("scrubbed")
         gw_lock = (lambda: front_lock(ctx, slot, FRONT_LOCK_WAIT_S)) if egress else None
         PR.scrub(ids[first], ids[second], seams=seams.proc_seams, gw_lock=gw_lock)   # type: ignore[arg-type]
@@ -952,6 +964,8 @@ def revoke_front(ctx: H.Ctx, a: R.Alloc) -> str:
 def teardown(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     """END (§7.4) then SCRUBBED. ``{ok, state}`` (§5.1's Out column) with the state END left the record in:
     ``RETAINED``, or ``HELD`` (the slot stays leased; ``failed_step`` is in the record, CONTROL's STATUS shows it).
+    A RETAINED end whose SCRUB lost the pool TRY (the slot stays leased to this session) adds ``released: false``
+    (H7); a slot that had already left this lease answers as before.
     DECISION: a HELD end answers ``ok`` with ``state:"HELD"`` (the Out column's shape carries the state for this),
     while a refusal (END busy, a CAS CONTROL never took, processes surviving SCRUBBED) answers ``ok:false``."""
     assert req.session is not None
@@ -972,7 +986,10 @@ def teardown(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     if out != R.RETAINED:
         return {"state": out}
     seams.at("scrub")
-    scrub_and_release(ctx, a)
+    if scrub_and_release(ctx, a) is False:
+        # The record is RETAINED either way; the slot stays leased to it (the pool TRY lost), and the reaper's pass
+        # owns the next SCRUB.
+        return {"state": R.RETAINED, "released": False}
     return {"state": R.RETAINED}
 
 
