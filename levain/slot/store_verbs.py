@@ -5,7 +5,7 @@ step is idempotent, and a crash anywhere is finished FORWARD by :func:`reconcile
 filesystem only, never from the CONTROL-written state record.
 
 - ``discard``: RETAINED (root's own retained object whole, no journal) -> ``rename`` (retained -> trash) ->
-  ``stamp`` (``trashed_at``, written once) -> ``commit`` (CAS TRASH).
+  ``stamp`` (a carried ``restored_at`` removed; ``trashed_at``, written once) -> ``commit`` (CAS TRASH).
 - ``restore``: TRASH (root's trash entry with its ``trashed_at``) -> ``mark`` (``restored_at`` INSIDE the trash
   entry, so the rename carries it) -> ``rename`` (trash -> retained) -> ``unstamp`` (``trashed_at`` removed) ->
   ``commit`` (CAS RETAINED). Rename only: nothing is re-applied.
@@ -14,6 +14,9 @@ filesystem only, never from the CONTROL-written state record.
   session's ``<s>`` and the publish transaction's ``<s>.new`` in its export class dir; a ``verify.new`` inside
   ``<s>`` goes with it) -> ``delete`` (the trash entry) -> ``commit`` (CAS PURGED). The reaper's aged purge is
   :func:`purge` with ``retention_days`` and no ``forced``.
+
+Each verb first finishes a store journal the session already holds (a run whose step or CAS failed), so re-running
+the verb completes it rather than refusing it.
 
 Locks (§4.7): root's per-session lock ``L/alloc/<s>.lock`` (shared with every per-session root verb), TRY, held =
 ``session-busy``; purge also TRIES the machine-wide adopt lock ``L/export/adopt.lock`` after it (order session ->
@@ -50,6 +53,11 @@ STAGING_SUFFIX = ".new"
 DAY_SECONDS = 86400
 # DECISION: a stamp is one timestamp and a newline; a file past this is not one.
 MAX_STAMP_BYTES = 64
+#: Root's own stamp files at the top of a trash entry (the only temp names swept there).
+STAMPS = ("trashed_at", "restored_at")
+# DECISION: a delete reads at most this many leaves of a directory before it unlinks them and reads on: memory per
+# directory stays bounded and each entry is read once (an unlinked leaf is not in the next read).
+DELETE_BATCH = 1024
 
 _DIR_OPEN = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _LEAF_OPEN = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
@@ -78,6 +86,14 @@ _libc = None
 _FS_IOC_GETFLAGS, _FS_IOC_SETFLAGS = 0x80086601, 0x40086602
 _FS_CLEAR = 0x00000010 | 0x00000020
 _NO_FLAG_SUPPORT = (errno.ENOTTY, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOSYS)
+# macOS: the BSD flags that refuse an unlink or a write inside a directory; any other (compressed, hidden, ...) is kept.
+_DARWIN_CLEAR = (getattr(stat, "UF_IMMUTABLE", 0) | getattr(stat, "UF_APPEND", 0) | getattr(stat, "SF_IMMUTABLE", 0)
+                 | getattr(stat, "SF_APPEND", 0))
+
+
+def refusing_flags(st: os.stat_result) -> int:
+    """The macOS flags on ``st`` that :func:`clear_flags` clears (0 elsewhere: Linux keeps them out of ``stat``)."""
+    return getattr(st, "st_flags", 0) & _DARWIN_CLEAR
 
 
 def _darwin_fchflags(fd: int, flags: int) -> None:
@@ -95,12 +111,13 @@ def _darwin_fchflags(fd: int, flags: int) -> None:
 
 
 def clear_flags(fd: int, st: os.stat_result) -> None:
-    """Clear what would refuse an unlink of the entry ``fd`` names, or of an entry inside it: every BSD flag on macOS
-    (``uchg``, ``schg``, ``uappnd``, ...; ``st_flags`` says whether any is set), the immutable and append-only bits
-    on Linux (``stat`` does not show them, so they are read). A filesystem without the call is not an error."""
+    """Clear what would refuse an unlink of the entry ``fd`` names, or of an entry inside it: the user and system
+    immutable and append-only BSD flags on macOS (``st_flags`` says whether one is set; the others are kept), the
+    immutable and append-only bits on Linux (``stat`` does not show them, so they are read). A filesystem without
+    the call is not an error."""
     if sys.platform == "darwin":
-        if getattr(st, "st_flags", 0):
-            _darwin_fchflags(fd, 0)
+        if refusing_flags(st):
+            _darwin_fchflags(fd, st.st_flags & ~_DARWIN_CLEAR)
         return
     if sys.platform.startswith("linux"):
         buf = array.array("i", [0])
@@ -232,7 +249,8 @@ def session_lock(facts: StoreFacts, seams: StoreSeams) -> Iterator[None]:
     with _try_lock(facts.lock, "session-busy", facts.session, seams.owner_ok):
         sweep_temps(facts.alloc_dir, facts.intent.name, owner_ok=seams.owner_ok)
         if _real_dir(facts.trash, seams):
-            sweep_temps(facts.trash, "", owner_ok=seams.owner_ok)
+            for base in STAMPS:
+                sweep_temps(facts.trash, base, owner_ok=seams.owner_ok)
         yield
 
 
@@ -297,23 +315,28 @@ def purge_due(facts: StoreFacts, seams: StoreSeams, retention_days: int | None) 
 
 
 def _open_store_dir(store: Path, *parts: str) -> int | None:
-    """``L/<parts>`` opened one component at a time, none followed; None when a component is absent."""
+    """``L/<parts>`` opened one component at a time, none followed; None when a component is absent. A component
+    on another device than the store root is refused (``delete-crosses-mount``)."""
     try:
         fd = os.open(store, _DIR_OPEN)
     except FileNotFoundError:
         return None
-    for part in parts:
-        try:
-            nfd = os.open(part, _DIR_OPEN, dir_fd=fd)
-        except FileNotFoundError:
+    try:
+        dev = os.fstat(fd).st_dev
+        for part in parts:
+            try:
+                nfd = os.open(part, _DIR_OPEN, dir_fd=fd)
+            except FileNotFoundError:
+                return None
             os.close(fd)
-            return None
-        except BaseException:
+            fd = nfd
+            if os.fstat(fd).st_dev != dev:
+                raise Refused("delete-crosses-mount", part)
+        out, fd = fd, -1
+        return out
+    finally:
+        if fd >= 0:
             os.close(fd)
-            raise
-        os.close(fd)
-        fd = nfd
-    return fd
 
 
 def _lstat_at(dfd: int, name: str) -> os.stat_result | None:
@@ -337,9 +360,24 @@ def _open_dir_at(dfd: int, name: str, st: os.stat_result, seams: StoreSeams) -> 
     return fd
 
 
+def _darwin_clear_at(dfd: int, name: str, st: os.stat_result) -> None:
+    """macOS, a symlink / FIFO / socket leaf: its refusing flags cleared by path (a socket has no fd to take), the
+    path being the directory fd's own plus ``name``, checked to name the inode ``st`` described first."""
+    buf = fcntl.fcntl(dfd, fcntl.F_GETPATH, bytes(1024))
+    path = os.path.join(os.fsdecode(buf.split(b"\0", 1)[0]), name)
+    pst = os.lstat(path)
+    if (pst.st_dev, pst.st_ino) != (st.st_dev, st.st_ino):
+        raise Refused("delete-moved", name)
+    os.chflags(path, pst.st_flags & ~_DARWIN_CLEAR, follow_symlinks=False)
+
+
 def _clear_leaf(dfd: int, name: str, st: os.stat_result, seams: StoreSeams) -> bool:
-    """Clear a regular file's flags through an fd of it; False when it is not one this can open."""
+    """Clear a leaf's flags: a regular file's through an fd of it, a macOS non-regular leaf's by path; False when
+    it is neither (a Linux non-regular leaf: no fd ioctl reaches it)."""
     if not stat.S_ISREG(st.st_mode):
+        if sys.platform == "darwin" and refusing_flags(st):
+            _darwin_clear_at(dfd, name, st)
+            return True
         return False
     fd = os.open(name, _LEAF_OPEN, dir_fd=dfd)
     try:
@@ -353,7 +391,7 @@ def _clear_leaf(dfd: int, name: str, st: os.stat_result, seams: StoreSeams) -> b
 
 
 def _unlink_leaf(dfd: int, name: str, st: os.stat_result, seams: StoreSeams) -> None:
-    if getattr(st, "st_flags", 0):
+    if refusing_flags(st):
         _clear_leaf(dfd, name, st, seams)
     try:
         os.unlink(name, dir_fd=dfd)
@@ -366,11 +404,30 @@ def _unlink_leaf(dfd: int, name: str, st: os.stat_result, seams: StoreSeams) -> 
         os.unlink(name, dir_fd=dfd)
 
 
+def _read_some(cur: int) -> tuple[list[tuple[str, os.stat_result]], tuple[str, os.stat_result] | None]:
+    """The leaves of ``cur`` read before its first subdirectory (at most :data:`DELETE_BATCH`), and that
+    subdirectory; the stream is closed there, never read to its end."""
+    leaves: list[tuple[str, os.stat_result]] = []
+    with os.scandir(cur) as it:
+        for e in it:
+            est = _lstat_at(cur, e.name)
+            if est is None:
+                continue
+            if stat.S_ISDIR(est.st_mode):
+                return leaves, (e.name, est)
+            leaves.append((e.name, est))
+            if len(leaves) >= DELETE_BATCH:
+                break
+    return leaves, None
+
+
 def delete_at(dfd: int, name: str, seams: StoreSeams) -> bool:
     """Delete ``name`` in the directory ``dfd`` and everything below it; False when it was absent. Iterative and by
     directory fd: one directory is open at a time, the way back up is ``..`` checked against the recorded
     (dev, inode) of the directory it must be (else ``delete-moved``), no link is followed, and a directory on
-    another device is refused (``delete-crosses-mount``), never entered. Flags are cleared before each unlink.
+    another device than ``dfd`` (``name`` itself included) is refused (``delete-crosses-mount``), never entered.
+    Flags are cleared before each unlink. Each entry is read once: a directory's stream is read only up to its
+    first subdirectory (or :data:`DELETE_BATCH` leaves), what was read is removed, and the next read starts past it.
     Idempotent: a crash part-way leaves a smaller tree that the next call deletes."""
     st = _lstat_at(dfd, name)
     if st is None:
@@ -379,24 +436,19 @@ def delete_at(dfd: int, name: str, seams: StoreSeams) -> bool:
         _unlink_leaf(dfd, name, st, seams)
         os.fsync(dfd)
         return True
-    top_dev = st.st_dev
+    top_dev = os.fstat(dfd).st_dev
+    if st.st_dev != top_dev:
+        raise Refused("delete-crosses-mount", name)
     chain = [(st.st_dev, st.st_ino)]
     names = [name]
     cur = _open_dir_at(dfd, name, st, seams)
     try:
         while True:
-            sub: tuple[str, os.stat_result] | None = None
-            with os.scandir(cur) as it:
-                entries = [e.name for e in it]
-            for n in entries:
-                est = _lstat_at(cur, n)
-                if est is None:
-                    continue
-                if stat.S_ISDIR(est.st_mode):
-                    if sub is None:
-                        sub = (n, est)
-                    continue
+            leaves, sub = _read_some(cur)
+            for n, est in leaves:
                 _unlink_leaf(cur, n, est, seams)
+            if sub is None and leaves:
+                continue
             if sub is not None:
                 n, sst = sub
                 if sst.st_dev != top_dev:
@@ -469,6 +521,13 @@ def _stamp(p: Path, seams: StoreSeams) -> None:
         fsync_dir(p.parent)
 
 
+def _discard_stamp(facts: StoreFacts, seams: StoreSeams) -> None:
+    """A previous restore's ``restored_at`` (the rename carried it in) removed, so the next restore writes its own;
+    then ``trashed_at``."""
+    unlink_durable(facts.trash / "restored_at")
+    _stamp(facts.trash / "trashed_at", seams)
+
+
 def _mark(facts: StoreFacts, seams: StoreSeams) -> None:
     if os.path.lexists(facts.trash):
         _stamp(facts.trash / "restored_at", seams)
@@ -496,7 +555,7 @@ def _delete_trash_step(facts: StoreFacts, seams: StoreSeams) -> None:
 def discard_plan(facts: StoreFacts, seams: StoreSeams) -> Plan:
     return Plan("discard", (
         Phase("rename", lambda: _move(facts.retained, facts.trash)),
-        Phase("stamp", lambda: _stamp(facts.trash / "trashed_at", seams)),
+        Phase("stamp", lambda: _discard_stamp(facts, seams)),
         Phase("commit", lambda: fsync_dir(facts.trash)),
     ))
 
@@ -536,10 +595,34 @@ def _not_due(e: PhaseFailed) -> bool:
 # --- the verbs ---------------------------------------------------------------------------------------------------
 
 
-def _no_journal(facts: StoreFacts, seams: StoreSeams) -> None:
-    if os.path.lexists(facts.intent):
-        ri = read_root_intent(facts.intent, owner_ok=seams.owner_ok)
+def _reconcile_held(facts: StoreFacts, seams: StoreSeams, retention_days: int | None) -> RootIntent | None:
+    """:func:`reconcile_store`'s body; the caller holds the session lock (and, for a purge journal, the adopt lock)."""
+    try:
+        return reconcile(facts.intent, _plan_for(facts, seams, retention_days), cas=seams.cas, fault=seams.fault,
+                         retry=seams.retry, owner_ok=seams.owner_ok, intents=STORE_INTENTS)
+    except PhaseFailed as e:
+        if _not_due(e):
+            raise e.cause from None
+        raise
+
+
+def _finish_journal(facts: StoreFacts, seams: StoreSeams, verb: str, retention_days: int | None = None) -> bool:
+    """A store journal this session already holds (a run whose step or CAS failed) is finished FORWARD before the
+    verb starts its own: True when it was this verb's and is now done. A journal this verb cannot finish (END's, an
+    unreadable one, a purge under discard / restore, which do not hold the adopt lock) refuses ``intent-in-flight``;
+    a purge journal at ``check`` that is neither forced nor due is deleted and the verb goes on."""
+    if not os.path.lexists(facts.intent):
+        return False
+    ri = read_root_intent(facts.intent, owner_ok=seams.owner_ok)
+    if ri is None or ri.intent not in STORE_INTENTS or (ri.intent == "purge" and verb != "purge"):
         raise Refused("intent-in-flight", f"{ri.intent}/{ri.phase}" if ri is not None else facts.session)
+    try:
+        _reconcile_held(facts, seams, retention_days)
+    except Refused as e:
+        if e.name == "purge-not-due":
+            return False
+        raise
+    return ri.intent == verb
 
 
 def _start(facts: StoreFacts, seams: StoreSeams, plan: Plan, forced: bool | None = None) -> None:
@@ -550,9 +633,11 @@ def _start(facts: StoreFacts, seams: StoreSeams, plan: Plan, forced: bool | None
 def discard(facts: StoreFacts, seams: StoreSeams) -> str:
     """RETAINED -> TRASH. Refuses ``session-busy``, ``intent-in-flight``, ``not-retained:trash`` (a trash entry
     exists) or ``not-retained:absent`` (no whole retained object). Raises :class:`PhaseFailed` with the journal
-    left at that phase (:func:`reconcile_store` finishes it). Returns the target state."""
+    left at that phase (the verb run again, or :func:`reconcile_store`, finishes it; ``intent-in-flight`` is a
+    journal it cannot finish). Returns the target state."""
     with session_lock(facts, seams):
-        _no_journal(facts, seams)
+        if _finish_journal(facts, seams, "discard"):
+            return R.TRASH
         if os.path.lexists(facts.trash):
             raise Refused("not-retained:trash", facts.session)
         if not retained_whole(facts, seams):
@@ -573,7 +658,8 @@ def restore(facts: StoreFacts, seams: StoreSeams) -> str:
     """TRASH -> RETAINED, rename only. Refuses ``session-busy``, ``intent-in-flight``, ``not-trash:retained`` /
     ``not-trash:absent``. Returns the target state."""
     with session_lock(facts, seams):
-        _no_journal(facts, seams)
+        if _finish_journal(facts, seams, "restore"):
+            return R.RETAINED
         _require_trash(facts, seams)
         _start(facts, seams, restore_plan(facts, seams))
     return R.RETAINED
@@ -585,9 +671,11 @@ def purge(facts: StoreFacts, seams: StoreSeams, *, forced: bool = False, retenti
     TRIES the adopt lock; refuses ``session-busy``, ``adopt-busy``, ``intent-in-flight``, ``not-trash:retained`` /
     ``not-trash:absent`` and, unforced, ``purge-not-due`` (before any journal is written). Removes
     ``L/export/<class>/<s>``, ``L/export/<class>/<s>.new`` (with any ``verify.new`` inside ``<s>``) and the
-    trash entry. Raises :class:`PhaseFailed` with the journal left at that phase. Returns the target state."""
+    trash entry. Raises :class:`PhaseFailed` with the journal left at that phase; the next purge finishes that
+    journal first and answers PURGED. Returns the target state."""
     with session_lock(facts, seams), adopt_lock(facts, seams):
-        _no_journal(facts, seams)
+        if _finish_journal(facts, seams, "purge", retention_days):
+            return R.PURGED
         _require_trash(facts, seams)
         if not forced and not purge_due(facts, seams, retention_days):
             raise Refused("purge-not-due", facts.session)
@@ -606,14 +694,7 @@ def reconcile_store(facts: StoreFacts, seams: StoreSeams, *, retention_days: int
         if ri is None:
             return None
         with adopt_lock(facts, seams) if ri.intent == "purge" else nullcontext():
-            try:
-                return reconcile(facts.intent, _plan_for(facts, seams, retention_days), cas=seams.cas,
-                                 fault=seams.fault, retry=seams.retry, owner_ok=seams.owner_ok,
-                                 intents=STORE_INTENTS)
-            except PhaseFailed as e:
-                if _not_due(e):
-                    raise e.cause from None
-                raise
+            return _reconcile_held(facts, seams, retention_days)
 
 
 __all__ = ["CAS_FROM", "EXPORT_CLASS", "STAGING_SUFFIX", "StoreFacts", "StoreSeams", "adopt_lock", "clear_flags",

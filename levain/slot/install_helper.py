@@ -1145,8 +1145,8 @@ def run_purge(session: str, caller_uid: int, host: HostOS, *, store_seams: RH.Se
     """``purge <session>`` (CONTRACT §5.2, §7.4; DESIGN §4.6): the operator's forced purge of a TRASH session, whatever
     its age. The alloc is read as the runtime helper reads the store; a caller who is not its ``operator_uid`` learns
     nothing (``no-session``). The verb is :func:`levain.slot.store_verbs.purge` with ``forced``; its CAS goes to
-    CONTROL. A purge that stops part-way keeps its journal, which the reaper finishes: refused
-    ``purge-incomplete:<phase>``. ``verb_seams``: a test's store-verb seams around the CAS (default: real ones)."""
+    CONTROL. A purge that stops part-way keeps its journal and is refused ``purge-incomplete:<phase>``; the next
+    ``purge <session>`` finishes that journal first and answers PURGED. ``verb_seams``: a test's store-verb seams around the CAS (default: real ones)."""
     rs = store_seams or RH.Seams(host=host)
     store = RH.Store(rs)
     ctx = None

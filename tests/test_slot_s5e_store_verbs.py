@@ -122,6 +122,98 @@ def test_crash_at_every_store_phase_reconciles_to_target(tmp_path, verb, point):
     assert (L / "retained" / T).exists()   # the neighbour is never touched
 
 
+def _alloc(L: Path, s: str = S) -> None:
+    a = R.Alloc(session=s, slot=SlotId("egress", 3), lease_seq=7, slot_rev=12, slot_uid=3990, slot_gid=3990,
+                kind="interactive", vendor="claude", auth="brokered", operator_uid=UID, supervisor_uid=UID,
+                staging_uid=UID, created_at="2026-10-01T00:00:00Z", boot_id="6f1c2a9e-1b2c-4d5e-8f90-0a1b2c3d4e5f")
+    (L / "alloc" / f"{s}.json").write_bytes(R.alloc_bytes(a))
+
+
+def test_purge_after_a_failed_commit_cas_is_finished_by_the_next_purge(tmp_path):
+    # Reproduced on 62859049: the second purge refused intent-in-flight purge/commit, every time after.
+    L = _store(tmp_path)
+    ctl = Ctl(R.RETAINED)
+    SV.discard(_facts(L), _seams(ctl))
+    _alloc(L)
+    down = [1]
+
+    def cas(target, fields):
+        if down[0]:
+            down[0] -= 1
+            raise OSError("CONTROL down")
+        ctl.cas(target, fields)
+    purge = functools.partial(IH.run_purge, S, UID, "darwin",
+                              store_seams=RH.Seams(host="darwin", store=L, trusted=lambda st: True),
+                              verb_seams=lambda c: SV.StoreSeams(cas=cas, owner_ok=mine))
+    with pytest.raises(Refused) as e:
+        purge()
+    assert e.value.name == "purge-incomplete:commit" and not (L / "trash" / S).exists()
+    assert purge() == {"verb": "purge", "session": S, "state": R.PURGED}
+    assert ctl.state == R.PURGED and not (L / "alloc" / f"{S}.intent.json").exists()
+
+
+class _Os:
+    """``os`` as store_verbs sees it, counting the directory entries it reads; every stat of an inode in
+    ``mounted`` reports another device (a mount there, without mounting one)."""
+
+    def __init__(self, mounted=frozenset()):
+        self.mounted, self.reads = mounted, 0
+
+    def __getattr__(self, n):
+        return getattr(os, n)
+
+    def _fake(self, st):
+        if st.st_ino not in self.mounted:
+            return st
+        return type("St", (), {"st_dev": st.st_dev + 1, "__getattr__": lambda _, n: getattr(st, n)})()
+
+    def stat(self, *a, **k):
+        return self._fake(os.stat(*a, **k))
+
+    def fstat(self, fd):
+        return self._fake(os.fstat(fd))
+
+    def scandir(self, fd):
+        outer, it = self, os.scandir(fd)
+
+        class It:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *x):
+                it.close()
+
+            def __iter__(self):
+                for e in it:
+                    outer.reads += 1
+                    yield e
+        return It()
+
+
+def test_delete_reads_each_entry_once_and_refuses_a_mounted_target(tmp_path, monkeypatch):
+    # Reproduced on 62859049: 2,000 sibling dirs cost 2,001,000 entry reads; a trash entry on another device was
+    # emptied and removed.
+    wide = tmp_path / "wide"
+    for i in range(2000):
+        (wide / f"d{i:05d}").mkdir(parents=True)
+    (wide / "d00007" / "f").write_bytes(b"x")
+    fake = _Os()
+    monkeypatch.setattr(SV, "os", fake)
+    dfd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        assert SV.delete_at(dfd, "wide", _seams(Ctl(R.TRASH)))
+    finally:
+        os.close(dfd)
+    assert not wide.exists() and fake.reads <= 2002
+    L = _store(tmp_path)
+    SV.discard(_facts(L), _seams(Ctl(R.RETAINED)))
+    top = L / "trash" / S
+    monkeypatch.setattr(SV, "os", _Os({os.lstat(p).st_ino for p in [top, *top.rglob("*")]}))
+    with pytest.raises(Refused) as e:
+        SV.delete_named(L, ("trash",), (S,), _seams(Ctl(R.TRASH)))
+    assert e.value.name == "delete-crosses-mount" and (top / "tree" / "repo" / "sub" / "a.txt").exists()
+
+
 def test_purge_verb_removes_export_staging_and_flagged_trash(tmp_path):
     L = _store(tmp_path)
     ctl = Ctl(R.RETAINED)
