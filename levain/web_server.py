@@ -145,6 +145,9 @@ PROPOSALS_ID = "proposals"      # GET /cockpit/consent/proposals.json: the stand
 # carries the operator's prompts, so it rides the consent body's gate: a surface token on EVERY bind, loopback included.
 _SESSION_LOG_PREFIX = "/cockpit/session/"
 _SESSION_LOG_SUFFIX = ".json"
+# A host session reader's stem (SubstrateSource.session_reader): a shape only, the host judges the id. No "/" by the
+# class; the route refuses ".." besides.
+_HOST_SESSION_STEM = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _WRITE_ROUTES = ("/edit", "/action", _COCKPIT_VERB_PATH)
 # The broker's pending routes (K2b design §1, §3.2, §3.5): POST /cockpit/pending/<id>/signature and
 # POST /cockpit/pending/<id>/cancel. They ride the same write gate as _WRITE_ROUTES.
@@ -942,8 +945,33 @@ class _Handler(GuardedHandler):
             return
         stem = path[len(_SESSION_LOG_PREFIX):-len(_SESSION_LOG_SUFFIX)]
         status, payload = 404, {"error": "not_found", "message": "no such session recorded"}
-        root = self.server.levain_source.install_root
-        if root is not None:     # the stem is checked by read_session (its STEM), the one place it is
+        blob: bytes | None = None     # a host reader's body, serialized once; the reader owns the object, not us
+        source = self.server.levain_source
+        root = source.install_root
+        reader = getattr(source, "session_reader", None)
+        # A host reader wins over install_root when both are set: a host that supplies one has sessions the
+        # install's own log does not hold, and one route must give one answer.
+        if reader is not None:
+            if _HOST_SESSION_STEM.fullmatch(stem) and ".." not in stem:
+                if not self.server.request_gate.acquire(blocking=False):
+                    self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+                    return
+                try:
+                    # The reader runs inside the request gate, as read_session does, so a host reader must be bounded.
+                    body = reader(stem, datetime.now(timezone.utc))
+                    if body is not None:
+                        if not isinstance(body, dict) or not isinstance(body.get("events"), list):
+                            raise TypeError("a session reader's body must be a dict whose events is a list")
+                        # These bytes are what goes out: the object may change after this, and NaN or Infinity
+                        # would make a body a browser's JSON.parse rejects. Either failure is a failed read.
+                        blob = json.dumps(body, allow_nan=False).encode("utf-8")
+                        status = 200
+                except Exception as exc:  # noqa: BLE001 - a log that cannot be read is an answer, never a dead connection
+                    _log.warning("session transcript read failed: %s: %s", type(exc).__name__, exc)
+                    status, payload = 500, {"error": "internal", "message": "the session's transcript could not be read"}
+                finally:
+                    self.server.request_gate.release()
+        elif root is not None:     # the stem is checked by read_session (its STEM), the one place it is
             if not self.server.request_gate.acquire(blocking=False):
                 self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
                 return
@@ -958,7 +986,9 @@ class _Handler(GuardedHandler):
                 status, payload = 500, {"error": "internal", "message": "the session's transcript could not be read"}
             finally:
                 self.server.request_gate.release()
-        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+        if blob is None:
+            blob = json.dumps(payload).encode("utf-8")
+        self._send(blob, "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
     def _acquire_read_slot(self) -> bool:
