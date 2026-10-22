@@ -593,9 +593,11 @@ class BrokeredExchange:
         #: True once a final answer (a refusal, keys' `R`, a 101) started on the slot; a `100 Continue` is not one.
         self.answered = False
         #: the slot-side tasks started through `_slot_task` whose exit `_next` has not yet seen, and those it has seen
-        #: but not yet reported, each with how many of keys' frames were queued ahead of it when it was seen.
+        #: but not yet reported, each with the count of keys' events decoded when it was seen.
         self._slot: set = set()
         self._ended: list = []
+        #: keys' events decoded by the reader (counted before its `put`, which a full queue blocks) and taken by `_next`.
+        self._decoded = self._taken = 0
 
     # -- the head ------------------------------------------------------------------------------------------------
 
@@ -714,7 +716,9 @@ class BrokeredExchange:
 
     async def _read_keys(self, frames: FrameReader, events: asyncio.Queue) -> None:
         """keys' frames, in order, onto `events`; however it ends, the last event says so ("eof" / "error"). It
-        awaits each `put`, so a full queue holds keys back."""
+        awaits each `put`, so a full queue holds keys back. Each event is counted in `_decoded` before its `put`, so
+        `_next` orders a slot task's exit after every event decoded ahead of it, including one still waiting on the
+        queue."""
         side = FrontSide(status=False)
         self.parked.set()   # entered the loop: the body writer may start
         if self.before_keys_read is not None:
@@ -723,6 +727,7 @@ class BrokeredExchange:
             while side.state != "done":
                 got = await frames.read(side.allowed())
                 if got is None:
+                    self._decoded += 1
                     await events.put(("eof", None))
                     return
                 ftype, payload = got
@@ -730,8 +735,10 @@ class BrokeredExchange:
                     raise WireError("U for a request that asked no upgrade")
                 nobody = ftype == b"R" and (self.nobody or payload["status"] in (204, 304))  # type: ignore[index]
                 side.got(ftype, nobody=nobody)
+                self._decoded += 1
                 await events.put((ftype, payload))
         except Exception as e:   # noqa: BLE001 - a reader that dies always tells the relay
+            self._decoded += 1
             await events.put(("error", type(e).__name__))
 
     def _slot_task(self, kw: asyncio.StreamWriter, work: Coroutine, end_frame: bytes) -> asyncio.Future:
@@ -764,22 +771,22 @@ class BrokeredExchange:
 
     async def _next(self, events: asyncio.Queue) -> tuple:
         """The next event, in arrival order: keys' frames, and each slot-side task's exit as ("body", its outcome),
-        reported once, after the keys frames already queued when the exit was seen (at most the queue's bound, so a
-        keys that keeps sending cannot hold it back); else ("error", "reader-gone") once keys' reader has ended with
-        none left. The wait races the queue, keys' reader and every live slot-side task: the relay never waits on a
-        reader or a slot task that is gone."""
+        reported once, after every keys event the reader had decoded when the exit was seen, one still blocked on the
+        full queue included (at most the queue's bound plus that one, so a keys that keeps sending cannot hold it
+        back); else ("error", "reader-gone") once keys' reader has ended with none left. The wait races the queue,
+        keys' reader and every live slot-side task: the relay never waits on a reader or a slot task that is gone."""
         while True:
             for t in list(self._slot):
                 if t.done():
                     self._slot.discard(t)
                     if not t.cancelled():
-                        self._ended.append([t, events.qsize()])
-            if self._ended and self._ended[0][1] <= 0:
-                return ("body", self._ended.pop(0)[0].result())
+                        self._ended.append((t, self._decoded))
             reader = self._reader_task
+            # a reader that ended (cancelled while blocked on a put) never delivers what it counted
+            if self._ended and (self._ended[0][1] <= self._taken or (reader.done() and events.empty())):
+                return ("body", self._ended.pop(0)[0].result())
             if not events.empty():
-                for e in self._ended:
-                    e[1] -= 1
+                self._taken += 1
                 return events.get_nowait()
             if reader.done():   # anything it put before it ended was taken above
                 return ("error", "reader-gone")
@@ -790,6 +797,7 @@ class BrokeredExchange:
                 if not get.done():
                     get.cancel()
             if get.done() and not get.cancelled():
+                self._taken += 1
                 return get.result()
             await asyncio.gather(get, return_exceptions=True)
 
@@ -1341,6 +1349,7 @@ async def run_front(front: Front, *, unix: Optional[str] = None, port: Optional[
     finally:
         if watch is not None:
             watch.cancel()
+            await asyncio.gather(watch, return_exceptions=True)   # retrieves an unforeseen raise that ended the front
         server.close()
         front.close_live()
         try:
