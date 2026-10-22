@@ -459,9 +459,26 @@ def test_the_card_marks_hidden_text_in_an_owner_and_a_path():
     def plant(e):
         e["owner"] = "ana\ufe0f"
         e["paths"] = ["a\U000e0041\u202eb.py"]
+        e["author"] = "ana\ufe0f"
+        e["pack"] = "pk\ufe0f"
     led, _ = _plus(ledger, "ana", [("decision", dict(kind="ruling", owner="ana", paths=["x.py"], words="w"), plant)])
     m = V.build_model(TEAM, led, "ana", None, "x", now=NOW)
     cards = [c for g in m["in_force"] for c in g["entries"] if "b.py" in "".join(c["paths"])]
     assert cards and cards[0]["owner"] == "ana⟨U+FE0F⟩"
     assert cards[0]["paths"] == ["a⟨U+E0041⟩⟨U+202E⟩b.py"]
     assert "a⟨U+E0041⟩⟨U+202E⟩b.py" in {g["path"] for g in m["in_force"]}
+    assert cards[0]["recorded_by"] == "ana⟨U+FE0F⟩" and cards[0]["pack"] == "pk⟨U+FE0F⟩"
+    # the class, not the sites (L3 r3): EVERY string the model emits is marked, on every pane, held reasons included
+    from levain import unshowable
+    held, _ = _plus(ledger, "ana", [("decision", dict(kind="ruling", owner="gone", paths=["y.py"], words="w"),
+                                     lambda e: e.update(owner="gone\ufe0f"))])
+    for model in (m, V.build_model(TEAM, held, "ana", None, "x", now=NOW)):
+        def walk(v, where="model"):
+            if isinstance(v, str):
+                assert unshowable.hidden(v, allow="\n\t") == [], (where, v)
+            elif isinstance(v, dict):
+                [walk(x, f"{where}.{k}") for k, x in v.items()]
+            elif isinstance(v, list):
+                [walk(x, f"{where}[]") for x in v]
+        walk(model)
+    assert any("gone⟨U+FE0F⟩ is not on team.toml" in c["why"] for c in V.build_model(TEAM, held, "ana", None, "x", now=NOW)["held"])

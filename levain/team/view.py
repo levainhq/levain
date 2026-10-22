@@ -49,12 +49,31 @@ def _days(ts: str, now: datetime) -> int | None:
     return max(0, (now - then).days)
 
 
+# Every string the model emits to a pane is marked in ONE step (`_shown`, applied to the whole model at the return of
+# build_model), so a field added to a card cannot reach the page unmarked. Cards and panes below are built from RAW
+# ledger values: matching, filtering, grouping and sorting use those. Fields named here are identifiers (an owner, a
+# path, an author, a pack, an id): the strict rule, nothing hidden and a tab marked too. Every other string is prose.
+_IDENT_FIELDS = frozenset({"id", "owner", "paths", "path", "recorded_by", "pack", "ruling_ids", "you", "project",
+                           "type", "kind", "why"})
+
+
+def _shown(v: Any, key: str = "") -> Any:
+    if isinstance(v, str):
+        return I.oneline(v, ident=key in _IDENT_FIELDS)
+    if isinstance(v, dict):
+        return {k: _shown(x, k) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_shown(x, key) for x in v]
+    return v
+
+
 def _card(e: dict, now: datetime) -> dict:
-    """The fields a pane shows for one entry. No counts, nothing keyed by person."""
-    return {"id": e["id"], "type": e.get("type"), "kind": e.get("kind"), "owner": I.oneline(e.get("owner") or "", ident=True),
-            "words": I.oneline(e.get("words") or ""), "summary": I.oneline(e.get("summary") or ""),
-            "reason": I.oneline(e.get("reason") or ""), "recheck": I.oneline(e.get("recheck") or ""),
-            "paths": [I.oneline(p, ident=True) for p in dict.fromkeys(e.get("paths") or [])], "recorded_by": e.get("author", "?"),
+    """The fields a pane shows for one entry, RAW (`build_model` marks the whole model once). No counts, nothing keyed
+    by person."""
+    return {"id": e["id"], "type": e.get("type"), "kind": e.get("kind"), "owner": e.get("owner") or "",
+            "words": e.get("words") or "", "summary": e.get("summary") or "",
+            "reason": e.get("reason") or "", "recheck": e.get("recheck") or "",
+            "paths": list(dict.fromkeys(e.get("paths") or [])), "recorded_by": e.get("author", "?"),
             "age": I.age(e.get("ts", ""), now), "age_days": _days(e.get("ts", ""), now),
             "pack": e.get("pack") or ""}
 
@@ -107,9 +126,9 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
                 if g not in seen:
                     seen.add(g)
                     slot["acks"] += 1
-                slot["rulings"][rid] = I.oneline(r.get("words") or r.get("summary") or "")
+                slot["rulings"][rid] = r.get("words") or r.get("summary") or ""
         ack_total += bool(seen)
-    stopped = [{"path": I.oneline(g, ident=True), "acks": s["acks"], "ruling_ids": sorted(s["rulings"]),
+    stopped = [{"path": g, "acks": s["acks"], "ruling_ids": sorted(s["rulings"]),
                 "ruling_words": [s["rulings"][k] for k in sorted(s["rulings"])],
                 "review": s["acks"] >= ack_flag, "in_force": any(k not in ledger.superseded for k in s["rulings"])}
                for g, s in by_path.items()]
@@ -124,7 +143,7 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
     for e in live:
         why = []
         if (e.get("kind") == "ruling" or e.get("type") in ("question", "tension")) and holder_gone(e.get("owner") or ""):
-            why.append("no owner" if not e.get("owner") else f"owner {I.oneline(e['owner'])} is not on team.toml")
+            why.append("no owner" if not e.get("owner") else f"owner {e['owner']} is not on team.toml")
         if e.get("recheck") and (_days(e.get("ts", ""), now) or 0) > recheck_days:
             why.append(f"recheck is {_days(e.get('ts', ''), now)} days old")
         if why:
@@ -137,15 +156,15 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
         for g in dict.fromkeys(e.get("paths") or ["(project-wide)"]):
             if not pf or hit(g):
                 paths[g].append(_card(e, now))
-    canon = [{"path": I.oneline(g, ident=True), "entries": paths[g]} for g in sorted(paths)]
+    canon = [{"path": g, "entries": paths[g]} for g in sorted(paths)]
 
-    return {"project": team.project, "owner": team.owner, "mode": team.mode, "you": handle,
+    return _shown({"project": team.project, "owner": team.owner, "mode": team.mode, "you": handle,
             "canon_status": C.staleness(canon_text, state), "problems": len(ledger.problems),
             "recheck_days": recheck_days, "ack_flag": ack_flag,
             "waiting": waiting, "stopped": stopped,
             "ack_total": ack_total, "held": held, "held_count": len(held), "in_force": canon,
             "in_force_count": len(live), "path_filter": pf,
-            "generated": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            "generated": now.strftime("%Y-%m-%dT%H:%M:%SZ")})
 
 
 # ---- rendering ---------------------------------------------------------------------------------------------
