@@ -203,6 +203,18 @@ class SubstrateSource:
     # N-of-1 source overrides it to wherever its own sensor app writes. None →
     # ``view.state`` is None (no live-context source).
     context_json: Path | None = None
+    # A host-supplied transcript reader for ``GET /cockpit/session/<stem>.json``, for a host whose sessions are not
+    # levain-hook records (its ids are not the install's 24-hex stems, or it has no install root). ``None`` → the
+    # route reads the install's own session log, as a bare Levain install always has. Set, it wins over
+    # ``install_root`` for that route. The contract a host implements:
+    #   ``session_reader(stem: str, now: datetime) -> dict | None``
+    # ``stem`` arrives already shape-checked by the route (``[A-Za-z0-9][A-Za-z0-9_.-]{0,127}``, never ``..``), still
+    # behind the route's token gate. Return ``None`` for a session the host does not know (the route answers 404).
+    # Otherwise return the install reader's body: ``agent``, ``workspace``, ``first_seen``, ``last_seen``, ``resume``,
+    # ``events`` (a list of ``{"at", "kind", "text", "cut"}``, ``kind`` one of prompt|reply|tool), ``consent``,
+    # ``skipped`` (and ``context`` when the host has one). ``events`` must be a list or the route treats the read as
+    # failed (500), as it does an exception. Every field is display text, never markup.
+    session_reader: Callable[[str, datetime], dict[str, Any] | None] | None = None
 
     @classmethod
     def local(cls, install_root: str | Path) -> "SubstrateSource":
