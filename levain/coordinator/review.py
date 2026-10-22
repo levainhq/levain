@@ -55,8 +55,8 @@ _KEY_MAX = 300
 _TEXT_MAX = 4000
 # a free-text field a feed copies out of another store is cut to this, so one long value cannot sink its row
 _FIELD_MAX = 500
-# the dead-seat scan reads terminal launches that have no item yet, a page at a time, at most this many pages a run:
-# what is left carries to the next run and is never dropped
+# the dead-seat scan reads terminal launches that have no item yet, oldest first from its watermark, a page at a time, at
+# most this many pages a run: the watermark moves only past launches evaluated, so what is left is the next run's
 _PAGE = 100
 _MAX_PAGES = 20
 _PUSH_KINDS = ("sign", "answer")
@@ -72,6 +72,13 @@ REVIEW_SCHEMA: tuple[str, ...] = (
     f"seq INTEGER NOT NULL, op TEXT NOT NULL CHECK (op IN ('cleared', 'reopened')), "
     f"mode TEXT NOT NULL CHECK ({_in('mode', MODES)}), by TEXT NOT NULL CHECK (by IN ('operator', 'coordinator')), "
     "at TEXT NOT NULL, PRIMARY KEY (item_id, seq))",
+    # a feed's watermark (the dead-seat scan): append-only rows, the latest is the mark, and it never moves back
+    "CREATE TABLE IF NOT EXISTS review_marks (feed TEXT NOT NULL, seq INTEGER NOT NULL, value INTEGER NOT NULL, "
+    "at TEXT NOT NULL, PRIMARY KEY (feed, seq))",
+    *_append_only("review_marks", "a review mark"),
+    "CREATE TRIGGER IF NOT EXISTS review_marks_forward BEFORE INSERT ON review_marks WHEN NEW.seq != COALESCE((SELECT "
+    "MAX(seq) FROM review_marks WHERE feed = NEW.feed), 0) + 1 OR NEW.value < COALESCE((SELECT MAX(value) FROM "
+    "review_marks WHERE feed = NEW.feed), 0) BEGIN SELECT RAISE(ABORT, 'a review mark is the next one and moves forward'); END",
     *_append_only("review_items", "a review item"),
     *_append_only("review_events", "a review event"),
     "CREATE TRIGGER IF NOT EXISTS review_items_no_replace BEFORE INSERT ON review_items WHEN EXISTS (SELECT 1 FROM "
@@ -437,46 +444,99 @@ def feed_no_split(store: CoordStore, *, after: timedelta = NO_SPLIT_AFTER, error
     return _each("receipt", _stuck_drops(store, after), make, errors)
 
 
-def _dead_launches(store: CoordStore) -> list[Any]:
-    """Terminal launches with no ``seat:<launch_id>`` item that the lease's own death rule calls dead, newest first,
-    paged to the end of the table or ``_MAX_PAGES`` pages (the rest is the next run's)."""
+def _mark(conn: sqlite3.Connection, feed: str) -> int:
+    row = conn.execute("SELECT value FROM review_marks WHERE feed = ? ORDER BY seq DESC LIMIT 1", (feed,)).fetchone()
+    return 0 if row is None else row[0]
+
+
+_TERMINAL = "('failed', 'expired', 'ended')"
+_LAST_KIND = "(SELECT kind FROM launch_events e WHERE e.launch_id = l.launch_id ORDER BY e.seq DESC LIMIT 1)"
+
+
+def _lazy_expiry(store: CoordStore) -> None:
+    """The lazy expiry the read path (coord_status) runs before it reads. A write transaction is opened only when
+    something is past its time, so a run with nothing to change writes nothing and wakes nothing."""
     from levain.coordinator import lease
 
-    with store._write() as (conn, now):          # the lazy expiry the read path (coord_status) runs before it reads
-        lease._lapse_if_past(conn, now)
-        lease._expire_pending(conn, now)
-    found: list[Any] = []
-    cursor = 2 ** 62
     with read_transaction(store._connect) as conn:
+        now = store._stamp()
+        held = lease.lease(conn, now)
+        due = (held is not None and not held.live) or any(now >= ln.until for ln in lease._in_state(conn, "pending"))
+    if due:
+        with store._write() as (conn, now):
+            lease._lapse_if_past(conn, now)
+            lease._expire_pending(conn, now)
+
+
+def _dead_launches(store: CoordStore) -> tuple[list[tuple[int, Any]], int]:
+    """``(the dead launches without an item as (gseq, launch), the watermark this scan reached)``. The watermark W means
+    every terminal launch with gseq < W was evaluated: the scan runs oldest first from the stored W, at most
+    ``_MAX_PAGES`` pages, and the new W is the last gseq evaluated, never past the lowest launch that is not terminal
+    (it can still die). A launch is read once; what the page bound leaves is the next run's."""
+    from levain.coordinator import lease
+
+    _lazy_expiry(store)
+    found: list[tuple[int, Any]] = []
+    with read_transaction(store._connect) as conn:
+        start = cursor = _mark(conn, "seat")
+        reached = None
         for _page in range(_MAX_PAGES):
             ids = conn.execute(
-                "SELECT l.launch_id, l.gseq FROM launches l WHERE l.gseq < ? AND (SELECT kind FROM launch_events e "
-                "WHERE e.launch_id = l.launch_id ORDER BY e.seq DESC LIMIT 1) IN ('failed', 'expired', 'ended') "
+                f"SELECT l.launch_id, l.gseq FROM launches l WHERE l.gseq >= ? AND {_LAST_KIND} IN {_TERMINAL} "
                 "AND NOT EXISTS (SELECT 1 FROM review_items r WHERE r.dedupe_key = 'seat:' || l.launch_id) "
-                "ORDER BY l.gseq DESC LIMIT ?", (cursor, _PAGE)).fetchall()
+                "ORDER BY l.gseq ASC LIMIT ?", (cursor, _PAGE)).fetchall()
             for launch_id, gseq in ids:
                 ln = lease.launch(conn, launch_id)
                 if ln is not None and lease.launch_death(conn, ln) is True and ln.cause not in _NOT_A_DEATH:
-                    found.append(ln)
-                cursor = gseq
+                    found.append((gseq, ln))
             if len(ids) < _PAGE:
+                top = conn.execute("SELECT MAX(gseq) FROM launches").fetchone()[0]
+                reached = start if top is None else top + 1
                 break
-    return found
+            cursor = reached = ids[-1][1] + 1
+        low = conn.execute(f"SELECT MIN(l.gseq) FROM launches l WHERE COALESCE({_LAST_KIND}, '') NOT IN {_TERMINAL}"
+                           ).fetchone()[0]
+    mark = start if reached is None else reached
+    return found, mark if low is None else min(mark, low)
 
 
 def feed_dead_seats(store: CoordStore, *, errors: list[str] | None = None) -> list[Item]:
     """A launch that died, by the lease's own rule (:func:`levain.coordinator.lease.launch_death`: failed or expired
     after a spawn was claimed, ended at ``0 turns``, a coordinator that lost the lease without ever writing). One that
-    carried an envelope-bound thread is authority-relevant."""
-    def make(ln: Any) -> Item:
+    carried an envelope-bound thread is authority-relevant. The scan keeps a persisted watermark (``_dead_launches``):
+    it advances past a launch only once its item is filed, so a row that could not be filed is tried again."""
+    found, mark = _dead_launches(store)
+    failed_at: list[int] = []
+
+    def make(row: tuple[int, Any]) -> Item:
+        gseq, ln = row
         one = ln.threads[0] if len(ln.threads) == 1 else None
-        return file_item(store, "seat", {
-            "launch_id": ln.launch_id, "harness": _clip(ln.harness), "role": _clip(ln.role), "state": ln.state,
-            "cause": _clip(ln.cause), "at": ln.at, "threads": list(ln.threads),
-            "text": _clip(f"{ln.role} launch {ln.launch_id} ({ln.harness}) {ln.state}: {ln.cause}")},
-            dedupe_key=f"seat:{ln.launch_id}", thread_id=one,
-            authority_relevant=ln.pinned_envelope_id is not None)[0]
-    return _each("seat", _dead_launches(store), make, errors)
+        try:
+            return file_item(store, "seat", {
+                "launch_id": ln.launch_id, "harness": _clip(ln.harness), "role": _clip(ln.role), "state": ln.state,
+                "cause": _clip(ln.cause), "at": ln.at, "threads": list(ln.threads),
+                "text": _clip(f"{ln.role} launch {ln.launch_id} ({ln.harness}) {ln.state}: {ln.cause}")},
+                dedupe_key=f"seat:{ln.launch_id}", thread_id=one,
+                authority_relevant=ln.pinned_envelope_id is not None)[0]
+        except Exception:
+            failed_at.append(gseq)
+            raise
+    try:
+        items = _each("seat", found, make, errors)
+    finally:
+        _advance(store, "seat", min([mark, *failed_at]))
+    return items
+
+
+def _advance(store: CoordStore, feed: str, value: int) -> None:
+    """Move a feed's watermark forward to ``value``; a mark that would not move writes nothing."""
+    with read_transaction(store._connect) as conn:
+        if value <= _mark(conn, feed):
+            return
+    with store._write() as (conn, now):
+        seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM review_marks WHERE feed = ?", (feed,)).fetchone()[0]
+        if value > _mark(conn, feed):
+            conn.execute("INSERT INTO review_marks (feed, seq, value, at) VALUES (?, ?, ?, ?)", (feed, seq, value, now))
 
 
 def _envelope_stop(conn: sqlite3.Connection, thread_id: str, envelope_id: str, errors: list[str] | None = None
@@ -520,7 +580,6 @@ def feed_envelopes(store: CoordStore, *, near: timedelta = NEAR_STOP, errors: li
             if stop is None or stop > now + near:
                 continue
             due.append((thread_id, envelope_id, stop))
-    _report(errors, bad)
 
     def make(row: tuple[str, str, datetime]) -> Item | None:
         t, e, s = row
@@ -534,7 +593,9 @@ def feed_envelopes(store: CoordStore, *, near: timedelta = NEAR_STOP, errors: li
             "envelope_id": e, "thread_id": t, "stop_at": utc_stamp(s), "lapsed": lapsed,
             "text": f"envelope {e} for thread {t} " + ("stopped at " if lapsed else "stops at ") + utc_stamp(s)},
             dedupe_key=f"envelope:{e}:{t}:{utc_stamp(s)}", thread_id=t, authority_relevant=True, still=still)
-    return _each("envelope", due, make, errors)
+    items = _each("envelope", due, make, bad)      # row errors join the stop_earlier ones; all are reported AFTER the filing
+    _report(errors, bad)
+    return items
 
 
 def feed_end(store: CoordStore, queue_dir: Path | str, *, errors: list[str] | None = None) -> list[Item]:
@@ -563,8 +624,8 @@ def feed_end(store: CoordStore, queue_dir: Path | str, *, errors: list[str] | No
 def feed_digest(store: CoordStore, queue_dir: Path | str, *, since: timedelta = timedelta(days=7),
                 until: datetime | None = None) -> Item | None:
     """Q15's unseen digest as one item: the calls a standing grant or a late ruling answered in the window, counted by
-    agent and stamp. The windows never overlap: a new one starts where the last digest item's ended (the first starts
-    ``since`` before ``until``), and its key is that exact start. None when the window is empty or no ledger exists."""
+    agent and stamp. The windows never overlap and are half-open: a new one starts where the last digest item's ended, however
+    long ago (the first starts ``since`` before ``until``), and its key is that exact start. None when the window is empty or no ledger exists."""
     from levain.consent.ledger import DB_NAME, Ledger
 
     if not (Path(queue_dir) / DB_NAME).exists():
@@ -574,10 +635,14 @@ def feed_digest(store: CoordStore, queue_dir: Path | str, *, since: timedelta = 
     with read_transaction(store._connect) as conn:
         last = conn.execute("SELECT body FROM review_items WHERE feed = 'digest' ORDER BY rowid DESC LIMIT 1").fetchone()
     if last is not None:
-        start = max(start, parse_stamp(json.loads(last[0])["until"]))
+        start = parse_stamp(json.loads(last[0])["until"])          # unconditionally: a long gap is still one window
     if start >= end:
         return None
-    calls = Ledger(Path(queue_dir)).digest(start, end)
+    # half-open [start, end): the ledger's window includes both ends, so a call on the boundary is dropped here and
+    # counted by the next window, once. KNOWN EDGES: two runs racing on one key file one item (the dedupe returns the
+    # first); a call written late with a stamp before the last digest's end is never counted.
+    hi = utc_stamp(end)
+    calls = [c for c in Ledger(Path(queue_dir)).digest(start, end) if c.received_at < hi]
     if not calls:
         return None
     counts: dict[str, int] = {}

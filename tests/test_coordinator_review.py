@@ -504,3 +504,109 @@ def test_f10_an_oversized_field_is_clipped_not_fatal(store, qdir):
     items = review.feed_end(store, qdir, errors=errors)
     assert len(items) == 2 and not errors
     assert all(len(i.body["root"]) <= review._FIELD_MAX for i in items)
+
+
+# --- L3 r2 fixes (c4fix2 lane) ---------------------------------------------------------------------------------
+def _healthy_launches(store, template_id, n, *, top):
+    """``n`` healthy ended launches above gseq ``top``, copied from a real launch row (the F6 fixture, as a helper)."""
+    c = sqlite3.connect(store.path)
+    for i in range(n):
+        lid = "launch-" + f"{top + i:032x}"
+        base = top + 10 + 10 * i
+        c.execute("INSERT INTO launches (launch_id, session_key, harness, role, threads, model, cwd, token, placement, at, gseq) "
+                  "SELECT ?, ?, harness, 'worker', '[]', model, cwd, token, placement, at, ? FROM launches WHERE launch_id = ?",
+                  (lid, "sk-" + lid, base, template_id))
+        for seq, kind, cause in ((1, "pending", "asked"), (2, "active", "started"), (3, "ended", "finished")):
+            c.execute("INSERT INTO launch_events (launch_id, seq, gseq, kind, until, harness_session_id, cause, at) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?, '2026-10-22T21:00:00.000000Z')",
+                      (lid, seq, base + seq, kind, "2026-10-22T21:05:00.000000Z" if seq == 1 else None,
+                       "hs-" + lid if seq == 2 else None, cause))
+    c.commit()
+    top_now = c.execute("SELECT MAX(gseq) FROM launch_events").fetchone()[0]
+    c.close()
+    return top_now
+
+
+def _spawned_launch(store):
+    store.coord_set_agent("claude", cwd=str(store.directory.parent))
+    store.accept_drop("fix the build", surface="cli")
+    first = store.pending_coordinator()
+    assert store.launch_claim_spawn(first.launch_id, 1)[1] is None
+    c = sqlite3.connect(store.path)
+    g = c.execute("SELECT MAX(gseq) FROM launches").fetchone()[0]
+    c.close()
+    return first, g
+
+
+def test_g1_a_death_below_more_than_two_thousand_healthy_launches_is_filed_and_every_launch_is_read_once(store, clock, monkeypatch):
+    from levain.coordinator import lease
+    first, g = _spawned_launch(store)
+    clock.advance(hours=1)
+    store.coord_status()
+    _healthy_launches(store, first.launch_id, 2100, top=g)
+    seen: dict[str, int] = {}
+    real = lease.launch
+
+    def counting(conn, launch_id):
+        seen[launch_id] = seen.get(launch_id, 0) + 1
+        return real(conn, launch_id)
+    monkeypatch.setattr(lease, "launch", counting)
+    ids: list[str] = []
+    for _run in range(4):                                       # bounded: the page bound only delays
+        ids += [i.body["launch_id"] for i in review.feed_dead_seats(store)]
+    assert ids == [first.launch_id]
+    assert max(seen.values()) == 1 and len(seen) == 2101        # each terminal launch evaluated exactly once, ever
+
+
+def test_g1_a_launch_that_is_not_terminal_yet_holds_the_watermark_below_it(store, clock):
+    first, g = _spawned_launch(store)                           # pending: it can still die
+    _healthy_launches(store, first.launch_id, 30, top=g)
+    assert review.feed_dead_seats(store) == []
+    clock.advance(hours=1)                                      # now it has expired without a start
+    assert [i.body["launch_id"] for i in review.feed_dead_seats(store)] == [first.launch_id]
+
+
+def test_g1_the_watermark_is_persisted_and_never_moves_back(store):
+    _spawned_launch(store)
+    store.accept_drop("note this", surface="cli")
+    review.feed_dead_seats(store)
+    c = sqlite3.connect(store.path)
+    value = c.execute("SELECT value FROM review_marks WHERE feed = 'seat' ORDER BY seq DESC LIMIT 1").fetchone()[0]
+    seq = c.execute("SELECT MAX(seq) FROM review_marks WHERE feed = 'seat'").fetchone()[0]
+    with pytest.raises(sqlite3.IntegrityError, match="moves forward"):
+        c.execute("INSERT INTO review_marks (feed, seq, value, at) VALUES ('seat', ?, ?, 'x')", (seq + 1, value - 1))
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        c.execute("UPDATE review_marks SET value = 0")
+    c.close()
+
+
+def test_g2_a_gap_longer_than_the_window_loses_no_calls_and_a_boundary_call_counts_once(store, qdir):
+    led = Ledger(qdir)
+    t1 = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
+    _calls(led, 1, t1 - timedelta(hours=1))
+    _calls(led, 1, t1)                                          # exactly on the first window's end
+    one = review.feed_digest(store, qdir, until=t1)
+    assert one.body["calls"] == 1                               # half-open: the boundary call is the next window's
+    _calls(led, 1, t1 + timedelta(days=1))                      # then nobody looks for twenty days (> since)
+    two = review.feed_digest(store, qdir, until=t1 + timedelta(days=20))
+    assert two.body["since"] == one.body["until"] and two.body["calls"] == 2
+
+
+def test_g3_a_bad_stop_earlier_without_an_error_sink_still_files_the_valid_envelope(ctx, structured_thread):  # noqa: F811
+    _d, b, t = structured_thread
+    c = sqlite3.connect(ctx.store.path)
+    c.execute("INSERT INTO envelope_attenuations (envelope_id, thread_id, kind, value, by, gseq, at) "
+              "VALUES (?, NULL, 'stop_earlier', 'not-a-stamp', 'operator', 99999999, 'x')", (b["envelope_id"],))
+    c.commit()
+    c.close()
+    with pytest.raises(CoordError, match="stop_earlier"):
+        review.feed_envelopes(ctx.store, near=3 * HOUR)
+    assert len(review.list_items(ctx.store, feed="envelope")) == 1
+
+
+def test_g4_a_dead_seat_run_with_nothing_to_expire_opens_no_write_transaction_for_the_expiry(store, monkeypatch):
+    opened = []
+    real = store._write
+    monkeypatch.setattr(store, "_write", lambda *a, **k: (opened.append(1), real(*a, **k))[1])
+    assert review.feed_dead_seats(store) == []
+    assert opened == []
