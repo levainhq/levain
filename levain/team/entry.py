@@ -143,6 +143,18 @@ def validate(entry: dict, known: dict[str, dict] | None = None, *, scan: bool = 
     # ruling recorded before this rule is still enforced.
     if scan and entry.get("owner") and unshowable.first_hidden(entry["owner"], allow="", selectors=False) is not None:
         raise EntryError("owner must be text that shows as itself: no hidden or invisible characters")
+    # The same write gate for the rest of what a person reads and signs: the prose fields (newline and tab are prose)
+    # and each path (the path rule: nothing hidden, no presentation selector). A path holding a zero-width space shows
+    # as the glob it is not, and hidden prose would be signed as words the signer never saw.
+    if scan:
+        for f in _SCANNED:
+            found = unshowable.describe(entry[f], allow="\n\t") if isinstance(entry.get(f), str) else None
+            if found is not None:
+                raise EntryError(f"{f} must be text that shows as itself: it holds {found}")
+        for p in entry["paths"] if isinstance(entry.get("paths"), list) else []:
+            found = unshowable.describe(p, selectors=False) if isinstance(p, str) else None
+            if found is not None:
+                raise EntryError(f"a path must show as itself: {unshowable.mark(p, selectors=False)!r} holds {found}")
     t = entry["type"]
     if t not in TYPES:
         raise EntryError(f"type must be one of {', '.join(TYPES)}")

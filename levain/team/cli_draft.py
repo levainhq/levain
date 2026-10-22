@@ -1,15 +1,21 @@
 """``levain team draft ...``: the coordinator drafts team-ledger entries, the operator signs (C8).
 
 ``add`` is the coordinator's (or yours); ``promote`` is the one step that signs, and it runs the ordinary record path
-under THIS clone's key after showing the whole draft. Inside a session Levain launched, only ``add`` (as the
-coordinator), ``list`` and ``show`` run: the coordinator's door refuses the rest before this module is reached. That
-keeps the draft path honest; it is not a lock on the key, which any process of the same user can still use.
+under THIS clone's key after showing the whole draft. Run from inside the coordinator's workspace, only ``add`` (as the
+coordinator), ``list`` and ``show`` run, for the operator too: the coordinator's door (:mod:`levain.coordinator.door`)
+refuses the rest by WHERE the command runs, so promote from your own clone. That keeps the draft path honest; it is
+not a lock on the key, which any process of the same user can still use.
+
+A draft is shown with every character a person cannot see written as ``⟨U+XXXX⟩`` (:mod:`levain.unshowable`), so a
+draft stored before the ledger refused such text shows what it holds; promote refuses to sign such text.
 """
 from __future__ import annotations
 
 import json
 import sys
 from pathlib import Path
+
+from levain import unshowable
 
 from . import entry as E
 from .ledger_api import open_ledger
@@ -26,12 +32,12 @@ def _show(v: dict) -> str:
     e = v["entry"]
     lines = [f"draft {v['draft_id']}  [{v['state']}]  drafted by {v['drafted_by']} at {v['drafted_at']}",
              f"  {v['type']}" + (f" . {e['kind']}" if e.get("kind") else "") +
-             (f"  owner {e['owner']}" if e.get("owner") else "")]
+             (f"  owner {unshowable.mark(e['owner'], allow='', selectors=False)}" if e.get("owner") else "")]
     for k in ("words", "summary", "reason", "recheck"):
         if e.get(k):
-            lines.append(f"  {k}: {json.dumps(e[k], ensure_ascii=False)}")
+            lines.append(f"  {k}: {json.dumps(unshowable.mark(e[k]), ensure_ascii=False)}")
     if e.get("paths"):
-        lines.append("  governs: " + ", ".join(e["paths"]))
+        lines.append("  governs: " + ", ".join(unshowable.mark(p, allow="", selectors=False) for p in e["paths"]))
     if v.get("ledger_id"):
         lines.append(f"  signed as ledger entry {v['ledger_id']}")
     return "\n".join(lines)
