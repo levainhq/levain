@@ -363,8 +363,10 @@ def rule_c(mods: Dict[str, Module]) -> List[str]:
                            f"refresh_post: {mod.where(n)}")
         for n in _identifier_loads(mod, "refresh_post"):
             callers += 1
-            if not (rel == CREDS and mod.is_call_func(n)):
-                out.append(f"(c) refresh_post loaded other than as a direct call in creds.py: {mod.where(n)}")
+            if not (rel == CREDS and mod.is_call_func(n) and isinstance(n, ast.Attribute)
+                    and isinstance(n.value, ast.Name) and n.value.id == "upstream"):
+                out.append(f"(c) refresh_post loaded other than as a direct upstream.refresh_post(...) call in "
+                           f"creds.py: {mod.where(n)}")
     if the_call != 1:
         out.append(f"(c) the direct Upstream.maintenance(...) call in refresh_post occurs {the_call} times, expected "
                    f"once")

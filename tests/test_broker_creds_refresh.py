@@ -973,3 +973,6 @@ def test_rule_c_passes_with_one_caller_and_fails_on_none_and_on_two():
     two = dict(src)
     two[mod.CREDS] = creds_src + "\n\nasync def _second(req):\n    return await upstream.refresh_post(req)\n"
     assert any("callers" in p for p in mod.rule_c({r: mod.Module(r, s) for r, s in two.items()}))
+    wrong = dict(src)                   # L3 r1 codex LOW 6: a call on any other receiver is not upstream.refresh_post
+    wrong[mod.CREDS] = creds_src.replace("upstream.refresh_post(", "not_upstream.refresh_post(")
+    assert any("refresh_post" in p for p in mod.rule_c({r: mod.Module(r, s) for r, s in wrong.items()}))
