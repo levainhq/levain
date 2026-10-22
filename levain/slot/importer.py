@@ -1185,7 +1185,11 @@ _OUTPUTS = (("bundle.part", "bundle"), ("report.part", "report.json"))
 
 def _publish(work: Path) -> None:
     """``link()`` each written output to its ``out/`` name (the bundle only when there is one), then unlink its
-    temp: an ``out/`` name never holds a partial file."""
+    temp: an ``out/`` name never holds a partial file. The pair is NOT atomic: a process killed between the two
+    links, or failing after them (``run``'s cleanup is best effort), can leave one or both names in ``out/``. The
+    commit point is root's, not this function's: root publishes ``out/`` only for a run it classifies SUCCESS (exit 0,
+    a fully valid result line, no failure observation of its own; CONTRACT §10.2), so ``out/`` from any other run is
+    never read."""
     for part, final in _OUTPUTS:
         src = work / "spool" / part
         if not os.path.lexists(src):
