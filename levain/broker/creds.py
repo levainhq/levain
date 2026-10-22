@@ -3,10 +3,11 @@ the injected header, and the credential-lifecycle seam keys' shutdown calls.
 
 A credential file `L/keys/cred/<name>.json` is OBSERVED on every exchange that needs it: opened `O_NOFOLLOW |
 O_NONBLOCK` under the credential directory's fd, refused unless it is a regular file, read to at most FILE_CAP, its
-`rev` extracted and validated. Bytes that do not parse, whatever the decode or a check raises on them, refuse the
-exchange `credential-unavailable` and evict the cached parse. The cached parse is used when
-its `rev` equals the file's, else the file is parsed and the cache replaced; ENOENT evicts at once, so a removed
-credential stops working on the next exchange. `rev` is compared for equality only, never ordered.
+`rev` validated by the parse. Bytes that do not parse, whatever the decode or a check raises on them, refuse the
+exchange `credential-unavailable` and evict the cached parse. The cached parse is used only when the file's bytes
+equal the bytes it was parsed from, else the file is parsed and the cache replaced, so a change under the same `rev`
+is never served from an earlier parse; ENOENT evicts at once, so a removed credential stops working on the next
+exchange. `rev` is compared for equality only, never ordered.
 
 The refresh (kind `oauth2-refresh`) and the one credential writer are not built at this tip: an upstream 401 reaches
 the credential layer through `on_upstream_401`, a no-op for the static kind.
@@ -19,7 +20,7 @@ import logging
 import os
 import re
 import stat
-from typing import Dict, List, Optional, Protocol, Set
+from typing import Dict, List, Optional, Protocol, Set, Tuple
 
 from levain.broker.norm import Refused
 from levain.broker.upstream import _note
@@ -185,22 +186,13 @@ def _no_dup(pairs: list) -> dict:
     return out
 
 
-def _rev_of(raw: bytes) -> Optional[str]:
-    """The file's `rev`, read with the full parse's JSON decoder (cheap at this size); None if absent or invalid."""
-    try:
-        d = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_dup)
-    except _INPUT_ERRORS:
-        return None
-    rev = d.get("rev") if isinstance(d, dict) else None
-    return rev if isinstance(rev, str) and REV_RE.fullmatch(rev) else None
-
-
 class CredStore:
     """Credentials observed under one directory fd. `observe(name)` is called once per exchange that needs `name`."""
 
     def __init__(self, dir_fd: int) -> None:
         self.dir_fd = dir_fd
-        self.cache: Dict[str, Credential] = {}
+        #: name -> (the bytes last parsed, their parse)
+        self.cache: Dict[str, Tuple[bytes, Credential]] = {}
 
     def _read(self, name: str) -> Optional[bytes]:
         # O_NONBLOCK: opening a FIFO with no writer would otherwise block keys' one loop; the fstat then refuses
@@ -242,17 +234,16 @@ class CredStore:
         if raw is None:
             self.cache.pop(name, None)   # ENOENT evicts at once
             raise Refused("credential-unavailable")
-        rev = _rev_of(raw)
         cur = self.cache.get(name)
-        if cur is not None and rev is not None and cur.rev == rev:
-            return cur
+        if cur is not None and cur[0] == raw:
+            return cur[1]   # the very bytes it parsed: a change under the same `rev` is parsed again
         try:
             cred = parse(raw, name)
         except Unparseable as e:
             self.cache.pop(name, None)
             _note(logging.WARNING, "levain gw-keys: credential %s unparseable (%s)", name, e)
             raise Refused("credential-unavailable") from None
-        self.cache[name] = cred
+        self.cache[name] = (raw, cred)
         return cred
 
 

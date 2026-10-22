@@ -1077,3 +1077,32 @@ def test_base_map_parsed_once_per_file_and_refused_when_it_changes_badly(monkeyp
             assert e.value.name == "keys-unavailable"            # never the cached parse of the earlier map
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_credential_reparsed_when_its_bytes_change_under_the_same_rev():
+    # group L3 r1 (complement LOW 5; head ruling: adopted), reproduced first
+    # (`1022-8/g1fix/item6_creds_repro_before.txt`): the cached parse was reused whenever `rev` matched, so a file
+    # whose secret changed under the same `rev` kept being served from the old parse, and bytes that no longer parsed
+    # were not refused. Now the cache holds the bytes it parsed, and any other bytes are parsed again.
+    from levain.broker import norm
+    from levain.broker.creds import CredStore
+    d = tempfile.mkdtemp(prefix="lr", dir="/tmp")
+    _frame_lib(d)
+    path = os.path.join(d, "keys", "cred", "c1.json")
+    fd = os.open(os.path.join(d, "keys", "cred"), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        store = CredStore(fd)
+        assert store.observe("c1").secret == _SECRET
+        with open(path) as f:
+            text = f.read()
+        with open(path, "w") as f:
+            f.write(text.replace(_SECRET, "sk-rotated-SAME-REV"))
+        assert store.observe("c1").secret == "sk-rotated-SAME-REV"
+        with open(path, "w") as f:
+            f.write(text.replace('"hosts": ["api.example.com"]', '"hosts": 7'))
+        with pytest.raises(norm.Refused) as e:
+            store.observe("c1")
+        assert e.value.name == "credential-unavailable"
+    finally:
+        os.close(fd)
+        shutil.rmtree(d, ignore_errors=True)
