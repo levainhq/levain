@@ -174,7 +174,7 @@ def _request(cq, command="touch /tmp/x"):
                    cwd="/work/proj", hold=timedelta(minutes=5), tier="T2")
 
 
-def test_waiting_on_you_is_read_from_the_queue_and_the_band_not_stored(store, qdir, cq):
+def test_waiting_on_you_is_read_from_the_queue_and_the_band_not_stored(store, qdir, cq, clock):
     _d, t = _thread(store)
     req = _request(cq)
     qs = QuestionStore(qdir)
@@ -182,7 +182,7 @@ def test_waiting_on_you_is_read_from_the_queue_and_the_band_not_stored(store, qd
                 options=[("a", "main"), ("b", "other")], rec="a", blocks="the land", cwd="/work/proj")
     review.push_sign(store, t.thread_id, req.id, "land the fix onto main", onto="main")
     review.push_answer(store, t.thread_id, q.id, "which branch?")
-    sign_open, answer_open = review.queue_request_open(qdir), review.question_open(qdir)
+    sign_open, answer_open = review.queue_request_open(qdir, clock=clock), review.question_open(qdir)
     w = review.waiting_on_you(store, sign_open=sign_open, answer_open=answer_open)
     assert sorted(r["kind"] for r in w["threads"][t.thread_id]) == ["answer", "sign"] and not w["unresolved"]
     # the queue closes the request (withdrawn) and the band gets its answer: the same records read as not waiting
@@ -192,10 +192,10 @@ def test_waiting_on_you_is_read_from_the_queue_and_the_band_not_stored(store, qd
     assert w == {"threads": {}, "loose": [], "unresolved": []}
 
 
-def test_a_record_whose_state_cannot_be_read_is_unresolved_never_closed(store, qdir):
+def test_a_record_whose_state_cannot_be_read_is_unresolved_never_closed(store, qdir, clock):
     _d, t = _thread(store)
     review.push_sign(store, t.thread_id, "no-such-request", "land it")
-    w = review.waiting_on_you(store, sign_open=review.queue_request_open(qdir),
+    w = review.waiting_on_you(store, sign_open=review.queue_request_open(qdir, clock=clock),
                               answer_open=review.question_open(qdir))
     assert [r["ref_id"] for r in w["unresolved"]] == ["no-such-request"] and w["threads"] == {}
 
@@ -208,10 +208,10 @@ def test_the_same_request_is_recorded_once(store, qdir, cq):
     assert sqlite3.connect(store.path).execute("SELECT COUNT(*) FROM replies WHERE kind = 'sign'").fetchone()[0] == 1
 
 
-def test_one_open_land_sign_per_thread_and_onto(store, qdir, cq):
+def test_one_open_land_sign_per_thread_and_onto(store, qdir, cq, clock):
     _d, t = _thread(store)
     old, new = _request(cq, "git push 1"), _request(cq, "git push 2")
-    sign_open = review.queue_request_open(qdir)
+    sign_open = review.queue_request_open(qdir, clock=clock)
     review.push_sign(store, t.thread_id, old.id, "land", onto="main", still_open=sign_open)
     with pytest.raises(CoordError, match="already has an open land SIGN"):
         review.push_sign(store, t.thread_id, new.id, "land again", onto="main", still_open=sign_open)
@@ -240,11 +240,10 @@ def test_a_dead_seat_is_an_item_and_a_launch_nobody_started_is_not(store, clock)
     ln = store.pending_coordinator()
     assert store.launch_claim_spawn(ln.launch_id, 1)[1] is None
     clock.advance(hours=1)
-    store.coord_status()                                   # a read that expires the pending launch
-    items = review.feed_dead_seats(store)
+    items = review.feed_dead_seats(store)                  # the feed runs the lazy expiry the read path runs
     assert [(i.feed, i.body["launch_id"]) for i in items] == [("seat", ln.launch_id)]
     assert items[0].body["state"] in ("expired", "failed") and not items[0].authority_relevant
-    assert review.feed_dead_seats(store)[0].item_id == items[0].item_id
+    assert review.feed_dead_seats(store) == []             # filed once: a second run files and returns nothing
 
 
 @pytest.mark.parametrize("act", ["coord_take", "coord_release"])
@@ -302,7 +301,8 @@ def test_the_unseen_digest_is_one_item_counted_by_agent_and_stamp(store, qdir):
     item = review.feed_digest(store, qdir, until=now + timedelta(minutes=1))
     assert item.feed == "digest" and item.body["calls"] == 3
     assert item.body["counts"] == {"claude_code/grant": 2, "claude_code/ruling": 1}
-    assert review.feed_digest(store, qdir, until=now + timedelta(minutes=2)).item_id == item.item_id
+    # the next window starts where this one ended: the same calls are never counted twice
+    assert review.feed_digest(store, qdir, until=now + timedelta(minutes=2)) is None
 
 
 def test_collect_feeds_reports_a_failing_feed_by_name_and_runs_the_rest(store, qdir, monkeypatch):
@@ -314,3 +314,193 @@ def test_collect_feeds_reports_a_failing_feed_by_name_and_runs_the_rest(store, q
     monkeypatch.setattr(review, "feed_end", boom)
     out = review.collect_feeds(store, queue_dir=qdir)
     assert out["end"].startswith("error: RuntimeError") and out["receipt"] == [] and out["digest"] == []
+
+
+# --- L3 r1 fixes (c4fix lane) ----------------------------------------------------------------------------------
+def _calls(led, n, at, stamp="grant"):
+    for i in range(n):
+        led.record_call(agent="claude_code", agent_session_id=f"s-{at}-{i}", tool_name="Bash", tool_input={"i": i, "at": at},
+                        cwd="/w", phase="pre", stamp=stamp, received_at=at)
+
+
+def test_f1_digest_windows_do_not_overlap_and_a_day_later_files_only_the_new_calls(store, qdir):
+    led = Ledger(qdir)
+    t1 = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
+    _calls(led, 2, t1 - timedelta(hours=1))
+    one = review.feed_digest(store, qdir, until=t1)
+    assert one.body["calls"] == 2
+    day = t1 + timedelta(days=1)
+    assert review.feed_digest(store, qdir, until=day) is None            # nothing new: no daily re-filing
+    _calls(led, 1, day - timedelta(hours=1))
+    two = review.feed_digest(store, qdir, until=day)
+    assert two.item_id != one.item_id and two.body["calls"] == 1 and two.body["since"] == one.body["until"]
+    assert len(review.list_items(store, feed="digest")) == 2
+
+
+def test_f2_a_corrupt_limits_store_is_an_error_not_no_ends(store, qdir):
+    (qdir / "limits.db").write_bytes(b"this is not a database" * 50)
+    with pytest.raises(Exception):
+        review.feed_end(store, qdir)
+    out = review.collect_feeds(store, queue_dir=qdir)
+    assert out["end"].startswith("error: ")
+
+
+def _lapse(c, hours):
+    c.store._clock = lambda: ENV_NOW + timedelta(hours=hours)
+
+
+def test_f3_a_lapsed_envelope_with_no_item_is_filed_and_a_bad_stamp_skips_only_that_row(ctx, structured_thread):  # noqa: F811
+    _d, b, t = structured_thread
+    _lapse(ctx, 3)                                           # its stop (two hours out) has passed
+    (item,) = review.feed_envelopes(ctx.store, near=timedelta(minutes=30))
+    assert item.body["envelope_id"] == b["envelope_id"] and item.authority_relevant
+    assert [i.item_id for i in review.feed_envelopes(ctx.store, near=timedelta(minutes=30))] == [item.item_id]
+    assert len(review.list_items(ctx.store, feed="envelope")) == 1
+    _lapse(ctx, 0)
+    errors: list[str] = []
+    c = sqlite3.connect(ctx.store.path)
+    c.execute("INSERT INTO envelope_attenuations (envelope_id, thread_id, kind, value, by, gseq, at) "
+              "VALUES (?, NULL, 'stop_earlier', 'not-a-stamp', 'operator', 99999999, 'x')", (b["envelope_id"],))
+    c.commit()
+    c.close()
+    got = review.feed_envelopes(ctx.store, near=3 * HOUR, errors=errors)
+    assert [i.item_id for i in got] and errors and "stop_earlier" in errors[0]
+
+
+def test_f4_a_land_sign_is_refused_unless_the_state_reader_says_closed(store, qdir, cq, clock):
+    _d, t = _thread(store)
+    old, new, third = _request(cq, "git push 1"), _request(cq, "git push 2"), _request(cq, "git push 3")
+    review.push_sign(store, t.thread_id, old.id, "land", onto="main", still_open=review.queue_request_open(qdir, clock=clock))
+    with pytest.raises(CoordError):                                     # no reader at all
+        review.push_sign(store, t.thread_id, new.id, "land again", onto="main")
+    with pytest.raises(CoordError):                                     # a reader that cannot tell
+        review.push_sign(store, t.thread_id, new.id, "land again", onto="main", still_open=lambda _r: None)
+    assert cq.withdraw(old.id)
+    assert review.push_sign(store, t.thread_id, third.id, "land", onto="main",
+                            still_open=review.queue_request_open(qdir, clock=clock))[1] is True
+
+
+def test_f4_the_reader_runs_outside_the_dispatch_write_transaction(store, qdir, cq, clock):
+    _d, t = _thread(store)
+    old, new = _request(cq, "git push 1"), _request(cq, "git push 2")
+    review.push_sign(store, t.thread_id, old.id, "land", onto="main", still_open=review.queue_request_open(qdir, clock=clock))
+    cq.withdraw(old.id)
+    seen = []
+
+    def reader(ref):
+        c = sqlite3.connect(store.path, timeout=0.2)             # a writer here would fail if the txn were open
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("ROLLBACK")
+            seen.append("free")
+        except sqlite3.OperationalError:
+            seen.append("locked")
+        finally:
+            c.close()
+        return False
+    review.push_sign(store, t.thread_id, new.id, "land", onto="main", still_open=reader)
+    assert seen == ["free"]
+
+
+def test_f5_a_coordinator_that_lost_the_lease_without_writing_is_a_dead_seat_by_the_leases_own_rule(store, clock):
+    from tests.test_coordinator_lease import boot, drop
+    from levain.coordinator import lease
+    store.coord_set_agent("claude", cwd=str(store.directory.parent))
+    ln = boot(store)
+    clock.advance(seconds=(lease.LEASE_TTL + lease.IDLE_GRACE + lease.BACKOFF[0]).total_seconds())
+    drop(store, "A died idle")
+    items = review.feed_dead_seats(store)
+    assert ln.launch_id in [i.body["launch_id"] for i in items]
+
+
+def test_f6_a_death_older_than_the_newest_five_hundred_launches_is_still_found(store, clock):
+    store.coord_set_agent("claude", cwd=str(store.directory.parent))
+    store.accept_drop("fix the build", surface="cli")
+    first = store.pending_coordinator()
+    assert store.launch_claim_spawn(first.launch_id, 1)[1] is None
+    clock.advance(hours=1)
+    store.coord_status()
+    c = sqlite3.connect(store.path)
+    g = c.execute("SELECT MAX(gseq) FROM launches").fetchone()[0]
+    for i in range(520):                                       # healthy ended launches, newer than the death
+        lid = "launch-" + f"{i:032x}"
+        base = g + 10 + 10 * i
+        c.execute("INSERT INTO launches (launch_id, session_key, harness, role, threads, model, cwd, token, placement, at, gseq) "
+                  "SELECT ?, ?, harness, 'worker', '[]', model, cwd, token, placement, at, ? FROM launches WHERE launch_id = ?",
+                  (lid, "sk-" + lid, base, first.launch_id))
+        for seq, kind, cause in ((1, "pending", "asked"), (2, "active", "started"), (3, "ended", "finished")):
+            c.execute("INSERT INTO launch_events (launch_id, seq, gseq, kind, until, harness_session_id, cause, at) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?, '2026-10-22T21:00:00.000000Z')",
+                      (lid, seq, base + seq, kind, "2026-10-22T21:05:00.000000Z" if seq == 1 else None,
+                       "hs-" + lid if seq == 2 else None, cause))
+    c.commit()
+    c.close()
+    ids = [i.body["launch_id"] for i in review.feed_dead_seats(store)]
+    assert first.launch_id in ids
+
+
+def test_f7_a_split_that_lands_between_scan_and_insert_files_nothing(store, clock, monkeypatch):
+    stuck, _ = store.accept_drop("note this and that", surface="cli")
+    clock.advance(minutes=11)
+    orig_scan = review._stuck_drops
+
+    def scan_then_split(store_, after):
+        found = orig_scan(store_, after)
+        store.split(stuck.drop_id, [Part("work", "fix")])          # the split lands after the scan
+        return found
+    monkeypatch.setattr(review, "_stuck_drops", scan_then_split)
+    assert review.feed_no_split(store) == []
+    assert review.list_items(store) == []
+
+
+def test_f8_a_bad_questions_store_leaves_the_other_sign_records_showing(store, qdir, cq, clock):
+    _d, t = _thread(store)
+    req = _request(cq)
+    review.push_sign(store, t.thread_id, req.id, "land it")
+    review.push_answer(store, t.thread_id, "q-1", "which?")
+    (qdir / "questions.db").write_bytes(b"garbage" * 200)
+    w = review.waiting_on_you(store, sign_open=review.queue_request_open(qdir, clock=clock), answer_open=review.question_open(qdir))
+    assert [r["kind"] for r in w["threads"][t.thread_id]] == ["sign"]
+    assert [r["kind"] for r in w["unresolved"]] == ["answer"]
+
+
+def test_f9_an_expired_request_is_not_waiting_on_you(store, qdir, cq, clock):
+    _d, t = _thread(store)
+    req = _request(cq)                                          # a five minute hold
+    review.push_sign(store, t.thread_id, req.id, "land it")
+    so = review.queue_request_open(qdir, clock=clock)
+    w = review.waiting_on_you(store, sign_open=so, answer_open=review.question_open(qdir))
+    assert t.thread_id in w["threads"]
+    clock.advance(minutes=5, seconds=30)                        # past the hold, inside the undecided grace: still waiting
+    assert so(req.id) is True
+    clock.advance(minutes=1)                                    # past the grace: the queue would expire it on a read
+    assert so(req.id) is False
+    w = review.waiting_on_you(store, sign_open=so, answer_open=review.question_open(qdir))
+    assert w == {"threads": {}, "loose": [], "unresolved": []}
+
+
+def test_f10_one_bad_row_files_the_rest_and_is_reported(store, clock, monkeypatch):
+    a, _ = store.accept_drop("note one", surface="cli")
+    b, _ = store.accept_drop("note two", surface="cli")
+    clock.advance(minutes=11)
+    real = review._insert
+
+    def flaky(conn, now, feed, body, **kw):
+        if kw["dedupe_key"] == f"receipt:{a.drop_id}":
+            raise CoordError("a bad row")
+        return real(conn, now, feed, body, **kw)
+    monkeypatch.setattr(review, "_insert", flaky)
+    errors: list[str] = []
+    got = review.feed_no_split(store, errors=errors)
+    assert [i.body["drop_id"] for i in got] == [b.drop_id] and len(errors) == 1 and "a bad row" in errors[0]
+    with pytest.raises(CoordError, match="a bad row"):          # without a sink the error still surfaces, after the rest
+        review.feed_no_split(store)
+
+
+def test_f10_an_oversized_field_is_clipped_not_fatal(store, qdir):
+    limits._halt_on(qdir, "claude_code", "x" * 20000, "tool_calls", "req-big", None, time.time())
+    limits._halt_on(qdir, "claude_code", "sess-ok", "tool_calls", "req-ok", None, time.time())
+    errors: list[str] = []
+    items = review.feed_end(store, qdir, errors=errors)
+    assert len(items) == 2 and not errors
+    assert all(len(i.body["root"]) <= review._FIELD_MAX for i in items)

@@ -23,6 +23,7 @@ NOTHING HERE IS AUTHORITY: an item or a reply is a record that something waits, 
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import sqlite3
@@ -47,10 +48,17 @@ MODES = ("manual", "fresh", "coordinator")
 NO_SPLIT_AFTER = timedelta(minutes=10)
 # [judged by c4, 1022+18, against nothing measured]: an envelope whose stop is this near is "near its limit"
 NEAR_STOP = timedelta(minutes=30)
-# a launch your own take or release voided, or one asked for under a lease its asker lost, is not a seat that died
-_NOT_A_DEATH = ("lease lost before active", "takeover", "operator release")
+# a launch your own take or release voided is not a seat that died (the lease's death rule, lease.launch_death, covers the
+# rest: a launch asked for under a lease its asker lost, one nobody tried to start)
+_NOT_A_DEATH = ("takeover", "operator release")
 _KEY_MAX = 300
 _TEXT_MAX = 4000
+# a free-text field a feed copies out of another store is cut to this, so one long value cannot sink its row
+_FIELD_MAX = 500
+# the dead-seat scan reads terminal launches that have no item yet, a page at a time, at most this many pages a run:
+# what is left carries to the next run and is never dropped
+_PAGE = 100
+_MAX_PAGES = 20
 _PUSH_KINDS = ("sign", "answer")
 _REF_STORE = {"sign": "queue.db", "answer": "questions.db"}
 
@@ -119,11 +127,10 @@ def _item(conn: sqlite3.Connection, row: tuple[Any, ...]) -> Item:
 _COLS = "item_id, thread_id, feed, dedupe_key, body, authority_relevant, by, at"
 
 
-def file_item(store: CoordStore, feed: str, body: Mapping[str, Any], *, dedupe_key: str,
-              thread_id: str | None = None, authority_relevant: bool = False, by: str = "service",
-              token: object = None) -> tuple[Item, bool]:
-    """File one review item, once per ``dedupe_key``: a second call with the same key returns the stored item and
-    ``False``, and writes nothing (so a feed run again, or a cleared item's condition still holding, files nothing)."""
+def _insert(conn: sqlite3.Connection, now: str, feed: str, body: Mapping[str, Any], *, dedupe_key: str,
+            thread_id: str | None = None, authority_relevant: bool = False, by: str = "service") -> tuple[Item, bool]:
+    """The one insert, inside a write transaction the caller holds: the stored item and ``False`` when the key is
+    taken, else the new item and ``True``. Nothing here opens a transaction, so a feed can revalidate and insert in one."""
     if feed not in FEEDS:
         raise CoordError(f"a review feed is one of {', '.join(FEEDS)}")
     if by not in ACTORS:
@@ -132,19 +139,39 @@ def file_item(store: CoordStore, feed: str, body: Mapping[str, Any], *, dedupe_k
     text = canonical(dict(body))
     if len(text) > 2 * _TEXT_MAX:
         raise CoordError("an item's body is too long")
+    row = conn.execute(f"SELECT {_COLS} FROM review_items WHERE dedupe_key = ?", (key,)).fetchone()
+    if row is not None:
+        return _item(conn, row), False
+    if thread_id is not None and conn.execute("SELECT 1 FROM threads WHERE thread_id = ?",
+                                              (thread_id,)).fetchone() is None:
+        raise CoordError(f"no thread {str(thread_id)[:40]}")
+    item_id = "rv-" + secrets.token_hex(16)
+    conn.execute("INSERT INTO review_items (item_id, thread_id, feed, dedupe_key, body, authority_relevant, by, at) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 (item_id, thread_id, feed, key, text, int(authority_relevant), by, now))
+    row = conn.execute(f"SELECT {_COLS} FROM review_items WHERE item_id = ?", (item_id,)).fetchone()
+    return _item(conn, row), True
+
+
+def file_item(store: CoordStore, feed: str, body: Mapping[str, Any], *, dedupe_key: str,
+              thread_id: str | None = None, authority_relevant: bool = False, by: str = "service",
+              token: object = None) -> tuple[Item, bool]:
+    """File one review item, once per ``dedupe_key``: a second call with the same key returns the stored item and
+    ``False``, and writes nothing (so a feed run again, or a cleared item's condition still holding, files nothing)."""
     with store._write(by, token) as (conn, now):
-        row = conn.execute(f"SELECT {_COLS} FROM review_items WHERE dedupe_key = ?", (key,)).fetchone()
-        if row is not None:
-            return _item(conn, row), False
-        if thread_id is not None and conn.execute("SELECT 1 FROM threads WHERE thread_id = ?",
-                                                  (thread_id,)).fetchone() is None:
-            raise CoordError(f"no thread {str(thread_id)[:40]}")
-        item_id = "rv-" + secrets.token_hex(16)
-        conn.execute("INSERT INTO review_items (item_id, thread_id, feed, dedupe_key, body, authority_relevant, by, at) "
-                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                     (item_id, thread_id, feed, key, text, int(authority_relevant), by, now))
-        row = conn.execute(f"SELECT {_COLS} FROM review_items WHERE item_id = ?", (item_id,)).fetchone()
-        return _item(conn, row), True
+        return _insert(conn, now, feed, body, dedupe_key=dedupe_key, thread_id=thread_id,
+                       authority_relevant=authority_relevant, by=by)
+
+
+def _file_checked(store: CoordStore, feed: str, body: Mapping[str, Any], *, dedupe_key: str, thread_id: str | None = None,
+                  authority_relevant: bool = False, still: Callable[[sqlite3.Connection, str], bool]) -> Item | None:
+    """File a feed's item only if ``still(conn, now)`` holds INSIDE the write transaction that inserts it: a feed's scan
+    is a read, and the world can move between that read and this write. ``None`` when it no longer holds."""
+    with store._write() as (conn, now):
+        if not still(conn, now):
+            return None
+        return _insert(conn, now, feed, body, dedupe_key=dedupe_key, thread_id=thread_id,
+                       authority_relevant=authority_relevant)[0]
 
 
 def get_item(store: CoordStore, item_id: str) -> Item:
@@ -205,6 +232,22 @@ def _push(store: CoordStore, kind: str, thread_id: str | None, ref_id: str, text
         raise CoordError(f"a record is written by one of {', '.join(ACTORS)}")
     ref = _text("a reference", ref_id, 200)
     body = {"text": _text("the text", text), **extra}
+    onto = extra.get("onto")
+    land = kind == "sign" and onto is not None and thread_id is not None
+    closed: dict[str, bool | None] = {}
+    if land:
+        # C0 §3.3: one land SIGN is open per (thread, onto). The queue reads happen HERE, before the dispatch.db write
+        # transaction opens, and are re-checked inside it; a reader is required whenever such a SIGN exists
+        with read_transaction(store._connect) as conn:
+            if conn.execute("SELECT 1 FROM replies WHERE kind = ? AND ref_store = ? AND ref_id = ?",
+                            (kind, _REF_STORE[kind], ref)).fetchone() is not None:
+                land = False
+            else:
+                for old_ref in _land_refs(conn, thread_id, onto):
+                    if still_open is None:
+                        raise CoordError(f"thread {thread_id} has a land SIGN onto {onto} ({old_ref}); a state reader "
+                                         "(still_open) is required to file another")
+                    closed[old_ref] = still_open(old_ref)
     with store._write(by, token) as (conn, now):
         if thread_id is not None and conn.execute("SELECT 1 FROM threads WHERE thread_id = ?",
                                                   (thread_id,)).fetchone() is None:
@@ -213,25 +256,27 @@ def _push(store: CoordStore, kind: str, thread_id: str | None, ref_id: str, text
                             (kind, _REF_STORE[kind], ref)).fetchone()
         if same is not None:
             return same[0], False
-        onto = extra.get("onto")
-        if kind == "sign" and onto is not None and thread_id is not None and still_open is not None:
-            # C0 §3.3: one land SIGN is open per (thread, onto); a re-file withdraws the older request first
-            for rid, old_ref, old_body in conn.execute(
-                    "SELECT reply_id, ref_id, body FROM replies WHERE kind = 'sign' AND thread_id = ?",
-                    (thread_id,)).fetchall():
-                if json.loads(old_body).get("onto") == onto and still_open(old_ref):
+        if land:
+            for old_ref in _land_refs(conn, thread_id, onto):
+                if closed.get(old_ref, None) is not False:      # open, unreadable, or filed since the read
                     raise CoordError(f"thread {thread_id} already has an open land SIGN onto {onto} ({old_ref}); "
                                      "withdraw it before filing another")
         reply_id = store._reply(conn, thread_id, kind, _REF_STORE[kind], ref, body, now)
         return reply_id, True
 
 
+def _land_refs(conn: sqlite3.Connection, thread_id: str | None, onto: object) -> list[str]:
+    return [old_ref for old_ref, old_body in conn.execute(
+        "SELECT ref_id, body FROM replies WHERE kind = 'sign' AND thread_id = ? ORDER BY rowid",
+        (thread_id,)).fetchall() if json.loads(old_body).get("onto") == onto]
+
+
 def push_sign(store: CoordStore, thread_id: str | None, request_id: str, text: str, *, onto: str | None = None,
               by: str = "service", token: object = None,
               still_open: Callable[[str], bool | None] | None = None) -> tuple[str, bool]:
     """Record a SIGN: a pointer to the consent-queue request ``request_id``. ``(reply_id, created)``; the same request
-    again returns the first record. With ``onto`` and ``still_open`` (a request id -> open?), a second open land SIGN
-    for the same (thread, onto) is refused."""
+    again returns the first record. With ``onto`` and a ``thread_id``, a second land SIGN for the same (thread, onto) needs
+    ``still_open`` (a request id -> open?) and is refused unless it says an explicit ``False`` for every earlier one."""
     extra: dict[str, Any] = {} if onto is None else {"onto": _text("onto", onto, 200)}
     return _push(store, "sign", thread_id, request_id, text, extra, by, token, still_open)
 
@@ -264,11 +309,16 @@ def file_know(store: CoordStore, thread_id: str | None, text: str, *, by: str = 
 
 
 # --- waiting on you (derived, never stored; C0 §2) ---------------------------------------------------------------
-def queue_request_open(queue_dir: Path | str) -> Callable[[str], bool | None]:
-    """A request id -> open? read from ``queue.db`` with ``mode=ro``: open while ``pending`` or ``undecided``, closed in
-    any other state, ``None`` when the store or the row cannot be read. A raw read: this is information, and the seal on
-    a row is the queue's own business (an edited row can at worst make a card show or hide)."""
+def queue_request_open(queue_dir: Path | str, *, clock: Callable[[], datetime] | None = None
+                       ) -> Callable[[str], bool | None]:
+    """A request id -> open? read from ``queue.db`` with ``mode=ro``: open while ``undecided`` or ``pending`` and not past
+    the queue's own expiry rule (:meth:`ConsentQueue._expiry_due`, the one the queue's read and sweep use: a hold's end
+    plus ``UNDECIDED_GRACE``), closed in any other state, ``None`` when the store or the row cannot be read. A raw read:
+    this is information, and the seal on a row is the queue's own business."""
+    from levain.consent.queue import ConsentQueue
+
     path = Path(queue_dir) / "queue.db"
+    now = clock if clock is not None else (lambda: datetime.now(timezone.utc))
 
     def read(request_id: str) -> bool | None:
         try:
@@ -276,24 +326,31 @@ def queue_request_open(queue_dir: Path | str) -> Callable[[str], bool | None]:
         except (OSError, sqlite3.Error):
             return None
         try:
-            row = conn.execute("SELECT state FROM requests WHERE id = ?", (request_id,)).fetchone()
+            row = conn.execute("SELECT state, expires_at FROM requests WHERE id = ?", (request_id,)).fetchone()
         except sqlite3.Error:
             return None
         finally:
             conn.close()
-        return None if row is None else row[0] in ("pending", "undecided")
+        if row is None:
+            return None
+        if row[0] == "pending" and ConsentQueue._expiry_due(row[1], utc_stamp(now())):
+            return False
+        return row[0] in ("pending", "undecided")
     return read
 
 
 def question_open(queue_dir: Path | str) -> Callable[[str], bool | None]:
     """A question id -> open? read through the band's own read-only path: open while it has no answer, ``None`` when
-    there is no such question."""
+    there is no such question or the store cannot be read (the record is then ``unresolved``, never dropped)."""
     from levain.consent.questions import QuestionStore
 
     qs = QuestionStore(Path(queue_dir))
 
     def read(question_id: str) -> bool | None:
-        q = qs.get(question_id)
+        try:
+            q = qs.get(question_id)
+        except Exception:  # noqa: BLE001 - a bad store is an unreadable record, not a crashed view
+            return None
         return None if q is None else q.answer is None
     return read
 
@@ -318,110 +375,208 @@ def waiting_on_you(store: CoordStore, *, sign_open: Callable[[str], bool | None]
 
 
 # --- the feeds ---------------------------------------------------------------------------------------------------
+# Every feed takes ``errors``: a list that collects one line per row it could not file (the feed goes on with the rest).
+# With no list, the rows that could be filed are filed and a CoordError naming the rest is raised AFTER them.
 def _now(store: CoordStore) -> datetime:
     return parse_stamp(store._stamp())
 
 
-def feed_no_split(store: CoordStore, *, after: timedelta = NO_SPLIT_AFTER) -> list[Item]:
-    """A drop the store accepted that has no ``split`` receipt after ``after`` (C0 §3.3)."""
-    now = _now(store)
-    with read_transaction(store._connect) as conn:
-        stuck = []
-        for drop_id, received in conn.execute("SELECT drop_id, received_at FROM drops ORDER BY rowid").fetchall():
-            stages = {json.loads(b).get("stage") for (b,) in conn.execute(
-                "SELECT body FROM replies WHERE kind = 'drop_receipt' AND ref_id = ?", (drop_id,)).fetchall()}
-            if "split" not in stages and now - parse_stamp(received) >= after:
-                stuck.append((drop_id, received))
-    return [file_item(store, "receipt", {"drop_id": d, "received_at": r,
-                                         "text": f"drop {d} was stored at {r} and has no split receipt"},
-                      dedupe_key=f"receipt:{d}")[0] for d, r in stuck]
+def _clip(value: Any) -> str:
+    return str(value)[:_FIELD_MAX]
 
 
-def feed_dead_seats(store: CoordStore) -> list[Item]:
-    """A launch that died: failed or expired after a spawn was claimed, or ended at ``0 turns`` (the same reading of
-    "died" the coordinator's backoff uses). One that carried an envelope-bound thread is authority-relevant."""
-    from levain.coordinator import lease
-
-    with read_transaction(store._connect) as conn:
-        found = []
-        for ln in lease.launches(conn, limit=500):
-            died = ln.state in ("failed", "expired") and ln.cause not in _NOT_A_DEATH or (
-                ln.state == "ended" and ln.cause == "0 turns")
-            if not died:
-                continue
-            if ln.state in ("failed", "expired") and conn.execute(
-                    "SELECT 1 FROM launch_spawns WHERE launch_id = ?", (ln.launch_id,)).fetchone() is None:
-                continue        # nobody tried to start it: a watcher down, not a seat that died
-            found.append(ln)
-    out = []
-    for ln in found:
-        one = ln.threads[0] if len(ln.threads) == 1 else None
-        out.append(file_item(store, "seat", {
-            "launch_id": ln.launch_id, "harness": ln.harness, "role": ln.role, "state": ln.state, "cause": ln.cause,
-            "at": ln.at, "threads": list(ln.threads),
-            "text": f"{ln.role} launch {ln.launch_id} ({ln.harness}) {ln.state}: {ln.cause}"},
-            dedupe_key=f"seat:{ln.launch_id}", thread_id=one,
-            authority_relevant=ln.pinned_envelope_id is not None)[0])
+def _each(name: str, rows: list[Any], make: Callable[[Any], Item | None], errors: list[str] | None) -> list[Item]:
+    out: list[Item] = []
+    failed: list[str] = []
+    for row in rows:
+        try:
+            item = make(row)
+        except Exception as exc:  # noqa: BLE001 - recorded under the feed's name below, never swallowed
+            failed.append(f"{name}: {type(exc).__name__}: {exc}"[:300])
+            continue
+        if item is not None:
+            out.append(item)
+    _report(errors, failed)
     return out
 
 
-def feed_envelopes(store: CoordStore, *, near: timedelta = NEAR_STOP) -> list[Item]:
-    """A live envelope whose effective stop is within ``near`` of now and still ahead. Live: bound as a thread's head,
-    not killed and its thread not done. The stop is the signed one or the earliest ``stop_earlier``. Authority-relevant."""
+def _report(errors: list[str] | None, failed: list[str]) -> None:
+    if errors is not None:
+        errors.extend(failed)
+    elif failed:
+        raise CoordError("; ".join(failed)[:600])
+
+
+def _drop_stuck(conn: sqlite3.Connection, drop_id: str, now: datetime, after: timedelta) -> bool:
+    """No ``split`` receipt for the drop and ``after`` has passed since it was stored: the one test, used by the scan
+    and again inside the insert's transaction."""
+    row = conn.execute("SELECT received_at FROM drops WHERE drop_id = ?", (drop_id,)).fetchone()
+    if row is None or now - parse_stamp(row[0]) < after:
+        return False
+    return "split" not in {json.loads(b).get("stage") for (b,) in conn.execute(
+        "SELECT body FROM replies WHERE kind = 'drop_receipt' AND ref_id = ?", (drop_id,)).fetchall()}
+
+
+def _stuck_drops(store: CoordStore, after: timedelta) -> list[tuple[str, str]]:
     now = _now(store)
+    with read_transaction(store._connect) as conn:
+        return [(d, r) for d, r in conn.execute("SELECT drop_id, received_at FROM drops ORDER BY rowid").fetchall()
+                if _drop_stuck(conn, d, now, after)]
+
+
+def feed_no_split(store: CoordStore, *, after: timedelta = NO_SPLIT_AFTER, errors: list[str] | None = None
+                  ) -> list[Item]:
+    """A drop the store accepted that has no ``split`` receipt after ``after`` (C0 §3.3). The test is run again inside
+    the transaction that files the item, so a split that lands after the scan files nothing."""
+    def make(row: tuple[str, str]) -> Item | None:
+        d, r = row
+        return _file_checked(store, "receipt", {"drop_id": d, "received_at": r,
+                                                "text": f"drop {d} was stored at {r} and has no split receipt"},
+                             dedupe_key=f"receipt:{d}",
+                             still=lambda conn, now: _drop_stuck(conn, d, parse_stamp(now), after))
+    return _each("receipt", _stuck_drops(store, after), make, errors)
+
+
+def _dead_launches(store: CoordStore) -> list[Any]:
+    """Terminal launches with no ``seat:<launch_id>`` item that the lease's own death rule calls dead, newest first,
+    paged to the end of the table or ``_MAX_PAGES`` pages (the rest is the next run's)."""
+    from levain.coordinator import lease
+
+    with store._write() as (conn, now):          # the lazy expiry the read path (coord_status) runs before it reads
+        lease._lapse_if_past(conn, now)
+        lease._expire_pending(conn, now)
+    found: list[Any] = []
+    cursor = 2 ** 62
+    with read_transaction(store._connect) as conn:
+        for _page in range(_MAX_PAGES):
+            ids = conn.execute(
+                "SELECT l.launch_id, l.gseq FROM launches l WHERE l.gseq < ? AND (SELECT kind FROM launch_events e "
+                "WHERE e.launch_id = l.launch_id ORDER BY e.seq DESC LIMIT 1) IN ('failed', 'expired', 'ended') "
+                "AND NOT EXISTS (SELECT 1 FROM review_items r WHERE r.dedupe_key = 'seat:' || l.launch_id) "
+                "ORDER BY l.gseq DESC LIMIT ?", (cursor, _PAGE)).fetchall()
+            for launch_id, gseq in ids:
+                ln = lease.launch(conn, launch_id)
+                if ln is not None and lease.launch_death(conn, ln) is True and ln.cause not in _NOT_A_DEATH:
+                    found.append(ln)
+                cursor = gseq
+            if len(ids) < _PAGE:
+                break
+    return found
+
+
+def feed_dead_seats(store: CoordStore, *, errors: list[str] | None = None) -> list[Item]:
+    """A launch that died, by the lease's own rule (:func:`levain.coordinator.lease.launch_death`: failed or expired
+    after a spawn was claimed, ended at ``0 turns``, a coordinator that lost the lease without ever writing). One that
+    carried an envelope-bound thread is authority-relevant."""
+    def make(ln: Any) -> Item:
+        one = ln.threads[0] if len(ln.threads) == 1 else None
+        return file_item(store, "seat", {
+            "launch_id": ln.launch_id, "harness": _clip(ln.harness), "role": _clip(ln.role), "state": ln.state,
+            "cause": _clip(ln.cause), "at": ln.at, "threads": list(ln.threads),
+            "text": _clip(f"{ln.role} launch {ln.launch_id} ({ln.harness}) {ln.state}: {ln.cause}")},
+            dedupe_key=f"seat:{ln.launch_id}", thread_id=one,
+            authority_relevant=ln.pinned_envelope_id is not None)[0]
+    return _each("seat", _dead_launches(store), make, errors)
+
+
+def _envelope_stop(conn: sqlite3.Connection, thread_id: str, envelope_id: str, errors: list[str] | None = None
+                   ) -> datetime | None:
+    """The effective stop of the envelope that is the thread's head, or ``None`` when it is no longer the head or was
+    killed or its thread is done. A ``stop_earlier`` row with a bad stamp is skipped and named in ``errors``."""
+    head = conn.execute("SELECT b.envelope_id, e.stop_at FROM envelope_binds b JOIN envelopes e ON e.envelope_id = "
+                        "b.envelope_id WHERE b.thread_id = ? ORDER BY b.gseq DESC LIMIT 1", (thread_id,)).fetchone()
+    if head is None or head[0] != envelope_id:
+        return None
+    rows = conn.execute("SELECT kind, value FROM envelope_attenuations WHERE envelope_id = ? AND "
+                        "(thread_id IS NULL OR thread_id IS ?)", (envelope_id, thread_id)).fetchall()
+    if any(k in ("kill", "thread_done") for k, _v in rows):
+        return None
+    stops = [parse_stamp(head[1])]
+    for k, v in rows:
+        if k != "stop_earlier":
+            continue
+        try:
+            stops.append(parse_stamp(v))
+        except Exception as exc:  # noqa: BLE001 - this row is skipped and named, the rest still count
+            if errors is not None:
+                errors.append(f"envelope {envelope_id}: stop_earlier {str(v)[:40]!r} skipped: {exc}"[:300])
+    return min(stops)
+
+
+def feed_envelopes(store: CoordStore, *, near: timedelta = NEAR_STOP, errors: list[str] | None = None) -> list[Item]:
+    """A live envelope whose effective stop is within ``near`` of now and still ahead, or has already passed with no
+    item filed for that stop (a lapse is never silent; the key holds a repeat). Live: bound as a thread's head, not
+    killed and its thread not done. The stop is the signed one or the earliest ``stop_earlier``. Authority-relevant."""
+    now = _now(store)
+    bad: list[str] = []
     with read_transaction(store._connect) as conn:
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'envelope_binds'").fetchone() is None:
             return []
         due = []
-        heads = conn.execute("SELECT b.thread_id, b.envelope_id, e.stop_at FROM envelope_binds b JOIN envelopes e "
-                             "ON e.envelope_id = b.envelope_id WHERE b.gseq = (SELECT MAX(gseq) FROM envelope_binds "
-                             "WHERE thread_id = b.thread_id)").fetchall()
-        for thread_id, envelope_id, stop_at in heads:
-            rows = conn.execute("SELECT kind, value FROM envelope_attenuations WHERE envelope_id = ? AND "
-                                "(thread_id IS NULL OR thread_id IS ?)", (envelope_id, thread_id)).fetchall()
-            if any(k in ("kill", "thread_done") for k, _v in rows):
+        heads = conn.execute("SELECT thread_id, envelope_id FROM envelope_binds b WHERE b.gseq = (SELECT MAX(gseq) "
+                             "FROM envelope_binds WHERE thread_id = b.thread_id)").fetchall()
+        for thread_id, envelope_id in heads:
+            stop = _envelope_stop(conn, thread_id, envelope_id, bad)
+            if stop is None or stop > now + near:
                 continue
-            stop = min([parse_stamp(stop_at)] + [parse_stamp(v) for k, v in rows if k == "stop_earlier"])
-            if now < stop <= now + near:
-                due.append((thread_id, envelope_id, stop))
-    return [file_item(store, "envelope", {
-        "envelope_id": e, "thread_id": t, "stop_at": utc_stamp(s),
-        "text": f"envelope {e} for thread {t} stops at {utc_stamp(s)}"},
-        dedupe_key=f"envelope:{e}:{t}:{utc_stamp(s)}", thread_id=t, authority_relevant=True)[0]
-        for t, e, s in due]
+            due.append((thread_id, envelope_id, stop))
+    _report(errors, bad)
+
+    def make(row: tuple[str, str, datetime]) -> Item | None:
+        t, e, s = row
+
+        def still(conn: sqlite3.Connection, stamp: str) -> bool:
+            now_ = parse_stamp(stamp)
+            cur = _envelope_stop(conn, t, e)
+            return cur == s and cur <= now_ + near
+        lapsed = s <= now
+        return _file_checked(store, "envelope", {
+            "envelope_id": e, "thread_id": t, "stop_at": utc_stamp(s), "lapsed": lapsed,
+            "text": f"envelope {e} for thread {t} " + ("stopped at " if lapsed else "stops at ") + utc_stamp(s)},
+            dedupe_key=f"envelope:{e}:{t}:{utc_stamp(s)}", thread_id=t, authority_relevant=True, still=still)
+    return _each("envelope", due, make, errors)
 
 
-def feed_end(store: CoordStore, queue_dir: Path | str) -> list[Item]:
+def feed_end(store: CoordStore, queue_dir: Path | str, *, errors: list[str] | None = None) -> list[Item]:
     """Every Q13 End the operator chose: an open halt in ``limits.db`` with no gap number (an undecided halt has a gap and
-    is a SIGN's business). Unreadable or absent ``limits.db`` reads as none."""
+    is a SIGN's business). An ABSENT ``limits.db`` reads as none; any error on one that exists propagates, so
+    :func:`collect_feeds` reports the feed as an error and never as "no Ends"."""
     path = Path(queue_dir) / "limits.db"
-    try:
-        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
-    except (OSError, sqlite3.Error):
+    if not path.exists():
         return []
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
     try:
         halts = conn.execute("SELECT seq, agent, root, kind, at FROM halts WHERE released_at IS NULL AND gap IS NULL "
                              "ORDER BY seq").fetchall()
-    except sqlite3.Error:
-        return []
     finally:
         conn.close()
-    return [file_item(store, "end", {
-        "agent": a, "root": r, "kind": k, "halt": s,
-        "text": f"you ended {a} session {r} at its {k} limit; it stays stopped until you extend"},
-        dedupe_key=f"end:{a}:{r}:{s}")[0] for s, a, r, k, _t in halts]
+
+    def make(row: tuple[Any, ...]) -> Item:
+        s, a, r, k, _t = row
+        return file_item(store, "end", {
+            "agent": _clip(a), "root": _clip(r), "kind": _clip(k), "halt": s,
+            "text": _clip(f"you ended {a} session {r} at its {k} limit; it stays stopped until you extend")},
+            dedupe_key=f"end:{hashlib.sha256(f'{a}\0{r}'.encode()).hexdigest()[:24]}:{s}")[0]
+    return _each("end", halts, make, errors)
 
 
 def feed_digest(store: CoordStore, queue_dir: Path | str, *, since: timedelta = timedelta(days=7),
                 until: datetime | None = None) -> Item | None:
     """Q15's unseen digest as one item: the calls a standing grant or a late ruling answered in the window, counted by
-    agent and stamp. One item per window start, none when the window is empty or no ledger exists yet."""
+    agent and stamp. The windows never overlap: a new one starts where the last digest item's ended (the first starts
+    ``since`` before ``until``), and its key is that exact start. None when the window is empty or no ledger exists."""
     from levain.consent.ledger import DB_NAME, Ledger
 
     if not (Path(queue_dir) / DB_NAME).exists():
         return None
     end = until if until is not None else datetime.now(timezone.utc)
     start = end - since
+    with read_transaction(store._connect) as conn:
+        last = conn.execute("SELECT body FROM review_items WHERE feed = 'digest' ORDER BY rowid DESC LIMIT 1").fetchone()
+    if last is not None:
+        start = max(start, parse_stamp(json.loads(last[0])["until"]))
+    if start >= end:
+        return None
     calls = Ledger(Path(queue_dir)).digest(start, end)
     if not calls:
         return None
@@ -432,18 +587,26 @@ def feed_digest(store: CoordStore, queue_dir: Path | str, *, since: timedelta = 
     item, _new = file_item(store, "digest", {
         "since": lo, "until": utc_stamp(end), "counts": counts, "calls": len(calls),
         "text": f"{len(calls)} calls ran under a standing grant or a late ruling since {lo}, and you were not asked"},
-        dedupe_key=f"digest:{lo[:10]}")
+        dedupe_key=f"digest:{lo}")
     return item
 
 
 def collect_feeds(store: CoordStore, *, queue_dir: Path | str | None = None) -> dict[str, Any]:
     """Run every mechanical feed once. ``{feed: [item ids]}``, and a feed that raised is ``{feed: "error: ..."}``: one
-    failing feed never hides the others, and is never read as an empty one. ``queue_dir`` defaults to the store's own
-    directory (the consent directory), where ``limits.db`` and ``ledger.db`` sit."""
+    failing feed never hides the others, and is never read as an empty one. A row a feed could not file is recorded
+    under ``"errors": {feed: [lines]}`` (present only when there are some) and the feed's other rows are filed.
+    ``queue_dir`` defaults to the store's own directory (the consent directory), where ``limits.db`` and ``ledger.db``
+    sit."""
     qdir = Path(queue_dir) if queue_dir is not None else store.directory
+    row_errors: dict[str, list[str]] = {}
+
+    def sink(name: str) -> list[str]:
+        return row_errors.setdefault(name, [])
     runs: dict[str, Callable[[], Any]] = {
-        "receipt": lambda: feed_no_split(store), "seat": lambda: feed_dead_seats(store),
-        "envelope": lambda: feed_envelopes(store), "end": lambda: feed_end(store, qdir),
+        "receipt": lambda: feed_no_split(store, errors=sink("receipt")),
+        "seat": lambda: feed_dead_seats(store, errors=sink("seat")),
+        "envelope": lambda: feed_envelopes(store, errors=sink("envelope")),
+        "end": lambda: feed_end(store, qdir, errors=sink("end")),
         "digest": lambda: feed_digest(store, qdir)}
     out: dict[str, Any] = {}
     for name, run in runs.items():
@@ -453,4 +616,7 @@ def collect_feeds(store: CoordStore, *, queue_dir: Path | str | None = None) -> 
             out[name] = f"error: {type(exc).__name__}: {exc}"[:300]
             continue
         out[name] = [] if got is None else [i.item_id for i in (got if isinstance(got, list) else [got])]
+    bad = {n: e for n, e in row_errors.items() if e}
+    if bad:
+        out["errors"] = bad
     return out
