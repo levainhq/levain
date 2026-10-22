@@ -21,9 +21,10 @@ CARDS = "[...document.querySelectorAll('#ck-needs .needs-card')]"
 # the one consent card that carries its Open row, picked the same way for the wait, the read and the click
 CARD = "[...document.querySelectorAll('#ck-needs .needs-consent')].find(c => c.querySelector('.needs-open'))"
 READY = "document.querySelector('#ck-needs .needs-card .consent-display') && document.querySelector('#ck-needs .needs-question .question-option')"
-# a consent chip is drawn as its tool and gains its first words when the request body loads (async): wait for every one
-CHIPS_FILLED = ("[...document.querySelectorAll('#ck-needs .needs-chip-btn[data-needs-id^=\"consent:\"]')]"
-                ".every(b => b.textContent.includes(' '))")
+# a consent chip is drawn as its tool and gains its first words when the request body loads (async): wait for both of
+# _waiting's consent chips (an empty list would pass .every before the bar is drawn)
+CHIPS_FILLED = ("(l => l.length === 2 && l.every(b => b.textContent.includes(' ')))("
+                "[...document.querySelectorAll('#ck-needs .needs-chip-btn[data-needs-id^=\"consent:\"]')])")
 
 
 def _waiting(tmp_path: Path, monkeypatch) -> Path:
