@@ -18,10 +18,15 @@ from levain.firing.hands import OPERATOR_RE
 from levain.slot import Refused
 
 VERBS = ("setup", "repair", "undo", "replenish", "set-retention", "set-dispatch-retain",
-         "set-ceiling", "set-signers", "purge", "force-retire")
+         "set-ceiling", "set-signers", "purge", "force-retire", "set-credential", "remove-credential")
 
-#: Verbs that run with a live lease (CONTRACT §5.2); every other verb refuses ``live-lease``.
-LEASE_EXEMPT = frozenset({"purge", "force-retire"})
+#: Verbs that run with a live lease (CONTRACT §5.2); every other verb refuses ``live-lease``. The credential verbs
+#: too: keys reads a credential on demand, so a rotation takes effect on the next exchange (design 1.8 Bootstrap).
+LEASE_EXEMPT = frozenset({"purge", "force-retire", "set-credential", "remove-credential"})
+
+#: A credential's name: the pattern of :data:`levain.broker.creds.NAME_RE`, written here because the broker module
+#: needs the optional h11 and this module is imported where it may be absent; a test pins the two equal.
+CREDENTIAL_NAME_RE = re.compile(r"[a-z0-9-]{1,48}")
 
 SESSION_RE = re.compile(r"s-[0-9a-f]{16}")
 SLOT_CLASSES = ("egress", "none")            # CONTRACT §5.1 class enum
@@ -63,6 +68,7 @@ class InstallCommand:
     index: int | None = None
     max_inodes: int | None = None
     max_seconds: int | None = None
+    credential: str | None = None
 
 
 def _uint(token: str, field: str, lo: int, hi: int) -> int:
@@ -191,6 +197,11 @@ def parse_install_argv(argv: Sequence[str]) -> InstallCommand:
         if not SESSION_RE.fullmatch(rest[0]):
             raise Refused("bad-token", f"session: {rest[0]!r}")
         return InstallCommand(verb, session=rest[0])
+    if verb in ("set-credential", "remove-credential"):
+        _exact(verb, rest, 1)
+        if not CREDENTIAL_NAME_RE.fullmatch(rest[0]):
+            raise Refused("bad-token", f"credential: {rest[0]!r}")
+        return InstallCommand(verb, credential=rest[0])
     _exact(verb, rest, 0)   # repair, undo, replenish, set-ceiling, set-signers: stdin only
     return InstallCommand(verb)
 

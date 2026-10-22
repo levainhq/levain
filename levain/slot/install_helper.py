@@ -10,10 +10,16 @@ and a setup that failed part-way re-runs: every step is idempotent (a ``skip_if`
 not), and what the interrupted run made is kept at the ids it holds (:attr:`HostFacts.levain_live`).
 Undo removes the runtime rule first and the install rule last, before the record, so a failed undo
 re-runs through the install helper.
+
+``purge``, ``set-credential`` and ``remove-credential`` are not plans: they act under the install lock (the
+credential verbs through a forked child that drops to keys before it opens anything below ``L/keys/``,
+:func:`run_credential`).
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -197,7 +203,7 @@ def check_tools(facts: HostFacts, steps: Sequence[Step], *, verb: str, python: b
 
 
 #: The verbs :func:`main` applies; every other verb of the §5.2 grammar answers ``verb-unbuilt:<verb>``.
-BUILT_VERBS = ("setup", "undo", "replenish", "purge")
+BUILT_VERBS = ("setup", "undo", "replenish", "purge", "set-credential", "remove-credential")
 
 
 def helper_pending() -> tuple[str, ...]:
@@ -1178,6 +1184,167 @@ def run_purge(session: str, caller_uid: int, host: HostOS, *, store_seams: RH.Se
     return {"verb": "purge", "session": session, "state": state}
 
 
+# --- set-credential / remove-credential (design 1.8 Bootstrap) ----------------------------------------------------
+
+#: The account the credential child drops to: keys' (CONTRACT §1.3), which owns ``L/keys/`` (0700).
+KEYS_ACCOUNT = "_levain_keys"
+CREDENTIAL_VERBS = ("set-credential", "remove-credential")
+_CHILD_MAX = 256                     # the child's one status line, read to EOF up to this
+_O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+#: what the child may answer, and nothing else is believed: a dropped child's bytes are not root's.
+_CHILD_OK = re.compile(r"(committed [0-9a-f]{32} (?:durable|not-durable)|removed|absent)")
+_CHILD_FAILED = re.compile(r"failed (credential-commit-failed|credential-lock-timeout|credential-drop-failed"
+                           r"|credential-dir-failed|internal) ([A-Za-z]{1,40})")
+
+
+def _field_slug(field: str) -> str:
+    """A field name as a refusal qualifier (``refresh.token_url host`` -> ``refresh-token-url-host``)."""
+    return re.sub(r"[^a-z0-9]+", "-", field.lower())[:40].strip("-") or "field"
+
+
+def _read_stdin(n: int) -> bytes:
+    return sys.stdin.buffer.read(n)
+
+
+def read_credential(name: str, read: Callable[[int], bytes]) -> dict:
+    """``set-credential``'s stdin: one ``levain-keys-credential/1`` object WITHOUT ``rev``, at most the file cap,
+    parsed with duplicate keys refused and validated in root by the credential layer's own render + parse (schema,
+    size caps, ``hosts``, ``token_url``'s host in ``hosts``, ``name`` = the argv's). Refused ``bad-credential:<field>``
+    naming the field, never a value. Nothing is forked or opened before this passes."""
+    from levain.broker import creds as C   # here, not at import: undo and purge never need the gateway's h11
+
+    raw = read(C.FILE_CAP + 1)
+    if len(raw) > C.FILE_CAP:
+        raise Refused("bad-credential:size", f"more than {C.FILE_CAP} bytes")
+    try:
+        fields = json.loads(raw.decode("utf-8"), object_pairs_hook=C._no_dup)
+    except (ValueError, RecursionError, UnicodeError):
+        raise Refused("bad-credential:json", "not one JSON object") from None
+    if not isinstance(fields, dict):
+        raise Refused("bad-credential:format", "not a JSON object")
+    try:
+        C.render(fields, name)          # the bytes a writer would write, parsed; its fresh rev is thrown away
+    except C.Unparseable as e:
+        raise Refused(f"bad-credential:{_field_slug(str(e))}", str(e)) from None
+    return fields
+
+
+def drop_to_keys(uid: int, gid: int) -> None:
+    """The child's drop (HEAD_1022-12 H5): wall's one drop, the groups EXACTLY ``{gid}`` (wall refuses an empty list,
+    s1-1d D12), no ``RLIMIT_NPROC`` (the child never forks)."""
+    from levain.slot import wall
+
+    wall.drop_and_assert(uid, gid, (gid,), nproc=None)
+
+
+def _credential_child(verb: str, name: str, fields: Optional[dict], keys_dir: str, uid: int, gid: int, w: int,
+                      drop: Callable[[int, int], None]) -> None:
+    """The forked child. Never returns: it writes one status line on ``w`` and ``os._exit``s (a return would run the
+    parent's stack a second time and write a second stdout line). Order (design 1.8, §8 known edge): close every
+    inherited fd but 0-2 and ``w``, cwd ``/``, umask 077, an empty environment, THEN the drop, and only then open
+    ``L/keys`` and below it, every component ``O_NOFOLLOW``."""
+    code, msg = 70, "failed internal Unknown"
+    try:
+        from levain.broker import creds as C
+        from levain.slot.stage import _close_fds_except
+
+        _close_fds_except((w,))
+        os.chdir("/")
+        os.umask(0o077)
+        os.environ.clear()
+        try:
+            drop(uid, gid)
+        except Refused:
+            msg = "failed credential-drop-failed Refused"
+            raise
+        try:
+            keys_fd = os.open(keys_dir, _O_DIR)
+            try:
+                os.mkdir("cred", 0o700, dir_fd=keys_fd)
+            except FileExistsError:
+                pass
+            cred_fd = os.open("cred", _O_DIR, dir_fd=keys_fd)
+        except OSError as e:
+            msg = f"failed credential-dir-failed {type(e).__name__}"
+            raise
+        try:
+            if verb == "set-credential":
+                out = C.commit(cred_fd, name, fields or {}, wait=True)   # the operator's write: no rev compare
+                msg = f"committed {out.rev} {'durable' if out.durable else 'not-durable'}"
+            else:
+                msg = "removed" if C.remove(cred_fd, name, wait=True) else "absent"
+        except C.CommitFailed as e:
+            msg = f"failed {e.name} CommitFailed"
+            raise
+        code = 0
+    except BaseException as e:   # noqa: BLE001 - the child's only way out is os._exit below
+        if msg == "failed internal Unknown":
+            msg = f"failed internal {type(e).__name__[:40]}"
+    finally:
+        try:
+            os.write(w, msg.encode("ascii") + b"\n")
+        finally:
+            os._exit(code)
+
+
+def run_credential(verb: str, name: str, fields: Optional[dict], caller_uid: int, host: HostOS, *,
+                   store_seams: RH.Seams | None = None, drop: Callable[[int, int], None] = drop_to_keys,
+                   fork: Callable[[], int] = os.fork, err: TextIO | None = None) -> dict[str, object]:
+    """``set-credential`` / ``remove-credential`` under the install lock: the operator check (as every verb's, from
+    ``L/policy/operator``), then FORK; the child (:func:`_credential_child`) drops to keys and writes, root waits. Root
+    opens, creates, writes, renames and chowns nothing below ``L/keys/`` (design 1.8, r1-14). No pool hold and no
+    live-lease count: keys reads credentials on demand. ``drop`` / ``fork``: tests run as the lane uid with a no-op
+    drop (the real drop is proven with real uids, 3b-8a)."""
+    rs = store_seams or RH.Seams(host=host)
+    store = RH.Store(rs)
+    try:
+        rec = _operator_of(store)
+    finally:
+        store.close()
+    if rec is None:
+        raise Refused("not-set-up", verb)
+    if caller_uid != rec.get("uid") or _user_name(caller_uid) != rec.get("name"):
+        raise Refused("operator-mismatch", f"configured for {rec.get('name')!r}")
+    uid, gid = rs.account_uid(KEYS_ACCOUNT), rs.group_gid(KEYS_ACCOUNT)
+    keys_dir = str(rs.L / "keys")
+    r, w = os.pipe()
+    try:
+        pid = fork()
+    except BaseException:
+        os.close(r)
+        os.close(w)
+        raise
+    if pid == 0:   # pragma: no cover - the child; covered by the tests' real fork, measured by its effects
+        os.close(r)
+        _credential_child(verb, name, fields, keys_dir, uid, gid, w, drop)
+    os.close(w)
+    try:
+        chunks, got = [], 0
+        while got <= _CHILD_MAX:
+            b = os.read(r, _CHILD_MAX + 1 - got)
+            if not b:
+                break
+            chunks.append(b)
+            got += len(b)
+    finally:
+        os.close(r)
+        _, status = os.waitpid(pid, 0)
+    line = b"".join(chunks).decode("ascii", "replace").rstrip("\n")
+    exited = os.WEXITSTATUS(status) if os.WIFEXITED(status) else None
+    if exited == 0 and _CHILD_OK.fullmatch(line):
+        if line.startswith("committed"):
+            _, rev, durable = line.split(" ")
+            if durable == "not-durable":
+                (err or sys.stderr).write(f"levain install-helper: warning: credential {name} committed but not "
+                                          f"durable (the directory fsync failed); it is in use\n")
+            return {"verb": verb, "credential": name, "rev": rev}
+        return {"verb": verb, "credential": name, "removed": line == "removed"}
+    m = _CHILD_FAILED.fullmatch(line)
+    if exited == 70 and m and m.group(1) != "internal":
+        raise Refused(m.group(1), m.group(2))
+    raise RuntimeError(f"the credential child: status {status:#x}, {line[:80]!r}")
+
+
 @dataclass
 class Seams:
     """Every act :func:`main` takes that a unit test cannot take as a non-root user, with its real default."""
@@ -1189,6 +1356,8 @@ class Seams:
     plan: Callable[[InstallCommand, Gathered], InstallPlan] = plan_for
     apply: Callable[[InstallPlan, TextIO], Optional[str]] = apply_steps
     purge: Callable[[str, int, HostOS], dict] = run_purge
+    stdin: Callable[[int], bytes] = _read_stdin
+    credential: Callable[..., dict] = run_credential
 
 
 def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextIO) -> dict[str, object]:
@@ -1208,6 +1377,12 @@ def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextI
         # install lock still keeps an undo of the store out from under it.
         with seams.lock(host):
             return seams.purge(cmd.session, caller_uid, host)   # type: ignore[arg-type]
+    if cmd.verb in CREDENTIAL_VERBS:
+        # Neither a host plan nor a pool hold (a live lease does not refuse them, §5.2); the object is refused in root
+        # before the lock and before any fork; the install lock keeps an undo of L/keys out from under the child.
+        fields = read_credential(cmd.credential, seams.stdin) if cmd.verb == "set-credential" else None  # type: ignore[arg-type]
+        with seams.lock(host):
+            return seams.credential(cmd.verb, cmd.credential, fields, caller_uid, host, err=err)
     with seams.lock(host):
         gathered = seams.gather(cmd, host, caller_uid)
         try:
@@ -1254,8 +1429,8 @@ def main(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams | None = N
 INSTALL_ENTRY_ENV = ("SUDO_UID",)
 
 
-__all__ = ["BUILT_VERBS", "INSTALL_ENTRY_ENV", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
-           "apply_steps", "check_account_ids", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
+__all__ = ["BUILT_VERBS", "CREDENTIAL_VERBS", "INSTALL_ENTRY_ENV", "KEYS_ACCOUNT", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
+           "apply_steps", "check_account_ids", "drop_to_keys", "read_credential", "run_credential", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",
            "plan_for", "plan_replenish", "plan_setup", "plan_tools", "plan_undo", "pool_lock", "preflight", "Quiesce",
            "quiesce_step",
