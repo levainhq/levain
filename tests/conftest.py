@@ -222,18 +222,44 @@ def _isolate_levain_home(monkeypatch, tmp_path_factory):
     monkeypatch.setattr("levain.coordinator.door._own_home", lambda: own)
 
 
+_SESSION_HOME: list = []
+
+
+def _install_session_home() -> None:
+    """TEST ONLY: ``$HOME`` is one scratch directory for the whole run, set before any test module is collected, so
+    a module-level constant bound from ``Path.home()`` at import (``levain.firing.anneal.DEFAULT_CRYSTAL_PATH``, a
+    test's own ``REAL_CRYSTAL``) and a module-scoped fixture see it too, and a test's ``monkeypatch.undo()``
+    restores THIS home, never the operator's. ``GIT_CONFIG_GLOBAL``, ``XDG_CONFIG_HOME`` and ``CODEX_HOME`` are
+    removed from the process environment (removed, not set: the confinement floor reads ``GIT_CONFIG_GLOBAL`` only
+    when it is set). The scratch home carries a minimal ``.gitconfig``: tests that commit need an identity. A test
+    that wants its own HOME still monkeypatches it."""
+    import tempfile
+    home = tempfile.mkdtemp(prefix="levain-test-home-")
+    Path(home, ".gitconfig").write_text("[user]\n\tname = levain test\n\temail = test@levain.invalid\n", encoding="utf-8")
+    _SESSION_HOME.append(home)
+    os.environ["HOME"] = home
+    for name in ("GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "CODEX_HOME"):
+        os.environ.pop(name, None)
+
+
+def pytest_configure(config):
+    if not _SESSION_HOME:
+        _install_session_home()
+
+
+def pytest_unconfigure(config):
+    while _SESSION_HOME:
+        shutil.rmtree(_SESSION_HOME.pop(), ignore_errors=True)
+
+
 @pytest.fixture(autouse=True)
-def _hermetic_home(monkeypatch, tmp_path_factory):
-    """TEST ONLY: ``$HOME`` is a per-test scratch directory and ``$CODEX_HOME`` is cleared, so a policy build (or
-    anything else that walks ``Path.home()``) never reads the operator's real ``~/.claude`` (hundreds of thousands
-    of entries on a working account) or ``~/.codex``. The scratch home carries a minimal ``.gitconfig``: tests that
-    commit need an identity. ``GIT_CONFIG_GLOBAL`` is deliberately NOT set, because the confinement floor reads
-    that variable. The account's home from the password database is untouched (see ``_isolate_levain_home``). This
-    fixture runs before the test body, so a test's own ``setenv("HOME", ...)`` or ``Path.home`` patch still wins."""
-    home = tmp_path_factory.mktemp("hermetic-home")
-    (home / ".gitconfig").write_text("[user]\n\tname = levain test\n\temail = test@levain.invalid\n", encoding="utf-8")
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.delenv("CODEX_HOME", raising=False)
+def _fresh_floor_path_cache():
+    """``levain.session._floor_path`` caches the expanded credential stores for the process, built from ``$HOME``;
+    a test that sets its own HOME would otherwise read a pattern built from another test's."""
+    from levain.session import _floor_path
+    _floor_path.cache_clear()
+    yield
+    _floor_path.cache_clear()
 
 
 @pytest.fixture(autouse=True)

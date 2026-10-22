@@ -26,15 +26,6 @@ AWS = "PermissionError: [Errno 1] Operation not permitted: '@HOME@/.aws/credenti
 STORE = "fatal: unable to open ~/.git-credentials: Operation not permitted"
 
 
-@pytest.fixture(autouse=True)
-def _fresh_floor_path():
-    """``_floor_path`` caches the expanded stores for the process, and each test has its own scratch $HOME."""
-    from levain.session import _floor_path
-    _floor_path.cache_clear()
-    yield
-    _floor_path.cache_clear()
-
-
 def _shell(command):
     return SimpleNamespace(source="agent", tool_name="terminal",
                            action=SimpleNamespace(kind="TerminalAction", command=command))
