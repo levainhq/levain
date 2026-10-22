@@ -38,7 +38,10 @@ design says it will "full-fsync the handoff dir". The checkout-length bound (:fu
 of the running uid's own session path, so a contract filed under one home can be refused ``readset-path-length`` under
 a longer one; it fails closed, and only for a path within a home's length of the limit. :func:`discard` removes the
 directory a :class:`VerifiedReadSet` names after checking its name and type only, not a recorded dev/ino: the record
-it trusts is :func:`verify_readset`'s own, and it is not an entry point for a record from outside.
+it trusts is :func:`verify_readset`'s own, and it is not an entry point for a record from outside. A failed ``flock``
+on a just-created local temp that is then also not closable, and a stderr-pipe close that eclipses a bounded child's
+failure, are not reachable on a local filesystem. ``/proc`` mounted ``hidepid=1`` makes the task count uncountable and
+the clone is refused: it fails closed, on hardened Linux only.
 """
 from __future__ import annotations
 
@@ -126,6 +129,15 @@ def _close_dir(fd: int, what: str) -> None:
         os.close(fd)
     except OSError as exc:
         _log.warning("readset: closing %r failed: %s", what, errno.errorcode.get(exc.errno, exc.errno))
+
+
+def _dest_refused(exc: BaseException, what: str) -> ReadSetRefused | None:
+    # a disk error (ENOSPC, EIO) while writing a bundle is a refusal the caller handles, never a raw OSError; any
+    # other exception is not ours to wrap
+    if not isinstance(exc, OSError):
+        return None
+    return ReadSetRefused("readset-dest", f"{what} cannot be written "
+                          f"({type(exc).__name__}: {errno.errorcode.get(exc.errno, exc.errno)})")
 
 
 def _scratch_env() -> dict[str, str]:
@@ -475,7 +487,8 @@ def export_readset(rs: ReadSet, contract_bytes: bytes, D: str, handoff_dir: str)
     (``O_EXCL|O_NOFOLLOW``, 0600, exclusively locked at create and held), flush it with :func:`full_fsync`, and read it
     back: its first bytes must be exactly the bundle header for ``E`` and a pack header of ``N`` objects, else
     ``readset-commit-mismatch``; a bundle over the handoff cap is ``readset-handoff``. On either refusal the temp is
-    closed and unlinked (and ``.tmp/`` flushed), each step's error logged, and the refusal raised. A close error on a
+    closed and unlinked (and ``.tmp/`` flushed), each step's error logged, and the refusal raised; a disk error
+    while the temp is written or flushed is the same cleanup, raised as ``readset-dest``. A close error on a
     directory fd is logged, never raised. Returns the temp UNINSTALLED; it never renames into ``handoff_dir``.
     ``handoff_dir`` must be a real absolute directory (``readset-dest``)."""
     E, _tree, N = readset_commit(contract_bytes, D)
@@ -521,18 +534,22 @@ def export_readset(rs: ReadSet, contract_bytes: bytes, D: str, handoff_dir: str)
             if problem is not None:
                 raise ReadSetRefused("readset-commit-mismatch", f"the bundle written has another {problem}")
             size = os.fstat(fd).st_size
-        except BaseException:
-            # the original failure is what is raised: the close and the cleanup each log their own error
+        except BaseException as exc:
+            # the original failure is what is raised (a disk error as readset-dest): the close and the cleanup each
+            # log their own error
             try:
                 os.close(fd)
-            except OSError as exc:
-                _cleanup_failed(os.path.join(handoff_dir, TMP_DIR, name), exc)
+            except OSError as exc2:
+                _cleanup_failed(os.path.join(handoff_dir, TMP_DIR, name), exc2)
             try:
                 os.unlink(name, dir_fd=tfd)
                 full_fsync(tfd)
-            except OSError as exc:
+            except OSError as exc2:
                 # the refusal stands; an unlinked-or-not temp is unlocked now, so startup GC takes it
-                _cleanup_failed(os.path.join(handoff_dir, TMP_DIR, name), exc)
+                _cleanup_failed(os.path.join(handoff_dir, TMP_DIR, name), exc2)
+            wrapped = _dest_refused(exc, "the handoff temp")
+            if wrapped is not None:
+                raise wrapped from None
             raise
     finally:
         _close_dir(tfd, os.path.join(handoff_dir, TMP_DIR))
@@ -839,7 +856,7 @@ def _open_parent(parent: str) -> int:
             raise ReadSetRefused("readset-workdir", f"the workdir parent must be this uid's and not group- or "
                                  f"world-writable (uid {st.st_uid}, mode {stat.S_IMODE(st.st_mode):o})")
     except BaseException:
-        os.close(pfd)
+        _close_dir(pfd, parent)
         raise
     return pfd
 
@@ -905,7 +922,7 @@ def verify_readset(contract_bytes: bytes, D: str, fd: int, parent: str, attempt:
             _rmtree_at(pfd, name, made)
             raise
     finally:
-        os.close(pfd)
+        _close_dir(pfd, parent)
 
 
 def _verify_in(pfd: int, D: str, fd: int, parent: str, name: str, attempt: str, E: str, N: int,
@@ -966,7 +983,7 @@ def _verify_in(pfd: int, D: str, fd: int, parent: str, name: str, attempt: str, 
         return VerifiedReadSet(attempt=attempt, workdir=workdir, p_dev=pst.st_dev, p_ino=pst.st_ino, commit=E,
                                digest=D, objects=N, limits=limits)
     finally:
-        os.close(wfd)
+        _close_dir(wfd, workdir)
 
 
 def _write_attributes(p: str) -> None:
@@ -988,7 +1005,7 @@ def _write_attributes(p: str) -> None:
         finally:
             os.close(afd)
     finally:
-        os.close(ifd)
+        _close_dir(ifd, info)
 
 
 def discard(v: VerifiedReadSet) -> None:
@@ -1014,7 +1031,7 @@ def discard(v: VerifiedReadSet) -> None:
     except OSError as exc:
         _cleanup_failed(v.workdir, exc)
     finally:
-        os.close(pfd)
+        _close_dir(pfd, parent)
 
 
 # --- R8: the slot's bundle, re-cut from P --------------------------------------------------------------------------------
@@ -1055,11 +1072,11 @@ def _p_at(v: VerifiedReadSet, gone: str) -> os.stat_result:
         try:
             st = os.lstat(_P, dir_fd=wfd)
         finally:
-            os.close(wfd)
+            _close_dir(wfd, workdir)
     except OSError:
         raise _verified_mismatch(gone) from None
     finally:
-        os.close(pfd)
+        _close_dir(pfd, parent)
     return st
 
 
@@ -1146,9 +1163,9 @@ def bundle_verified(v: VerifiedReadSet, contract_bytes: bytes, D: str, staging: 
             except OSError as exc2:
                 # the refusal stands; a file left here makes the next cut into this staging readset-dest
                 _cleanup_failed(os.path.join(staging, STAGED_BUNDLE), exc2)
-            if isinstance(exc, OSError):
-                raise ReadSetRefused("readset-dest", f"staging's {STAGED_BUNDLE} cannot be written "
-                                     f"({type(exc).__name__}: {errno.errorcode.get(exc.errno, exc.errno)})") from None
+            wrapped = _dest_refused(exc, f"staging's {STAGED_BUNDLE}")
+            if wrapped is not None:
+                raise wrapped from None
             raise
     finally:
         _close_dir(sfd, staging)
@@ -1213,7 +1230,7 @@ def sweep_workdirs(parent: str, keep: set | frozenset) -> SweepReport:
                 except OSError as exc:
                     left.append((name, f"removal failed ({type(exc).__name__})"))
     finally:
-        os.close(pfd)
+        _close_dir(pfd, parent)
     for name, why in left:
         _log.warning("readset: sweep left %r in the workdir parent: %s", name, why)
     return SweepReport(removed=tuple(removed), kept=tuple(kept), left=tuple(left))

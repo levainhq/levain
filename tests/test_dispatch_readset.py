@@ -552,3 +552,63 @@ def test_a_staging_close_error_after_the_flush_returns_the_bundle(world, tmp_pat
     assert hit and sb.commit == v.commit
     assert os.listdir(top / "staging") == [R.STAGED_BUNDLE] and os.path.getsize(sb.path) == sb.size
     R.discard(v)
+
+
+def test_a_disk_error_writing_the_handoff_temp_is_named_and_leaves_no_temp(world, tmp_path, monkeypatch):
+    # reproduced (wa-fix3 fix3_run.py X2): ENOSPC from the temp's flush escaped export_readset as a raw OSError
+    import errno
+    import stat
+
+    from levain.dispatch import readset as R
+    _root, repo, _base, _old_a, contract = world
+    top = Path(os.path.realpath(tmp_path))
+    cb, d = contract.canonical().encode("utf-8"), contract.digest
+    rs = build_readset(str(repo), contract, dest(top, "scratch"), contract_digest=d)
+    (top / "handoff").mkdir(mode=0o700)
+    real = R.full_fsync
+
+    def enospc_on_files(f: int) -> str:
+        if stat.S_ISREG(os.fstat(f).st_mode):
+            raise OSError(errno.ENOSPC, "injected")
+        return real(f)
+
+    monkeypatch.setattr(R, "full_fsync", enospc_on_files)
+    got = refusal(R.export_readset, rs, cb, d, str(top / "handoff"))
+    assert got.name == "readset-dest" and "ENOSPC" in got.detail
+    assert os.listdir(top / "handoff" / R.TMP_DIR) == []
+
+
+def test_a_parent_close_error_after_the_verify_returns_the_verified_set(world, tmp_path, monkeypatch):
+    # reproduced (wa-fix3 fix3_run.py X1): EIO from closing the workdir parent's fd replaced verify_readset's result
+    import errno
+
+    from levain.dispatch import readset as R
+    from levain.dispatch.attempt_id import new_attempt_id
+    _root, repo, _base, _old_a, contract = world
+    top = Path(os.path.realpath(tmp_path))
+    cb, d = contract.canonical().encode("utf-8"), contract.digest
+    rs = build_readset(str(repo), contract, dest(top, "scratch"), contract_digest=d)
+    for name in ("handoff", "attempts"):
+        (top / name).mkdir(mode=0o700)
+    ex = R.export_readset(rs, cb, d, str(top / "handoff"))
+    os.close(ex.fd)
+    fd = R.open_handoff(ex.path, size=ex.size)
+    pst = os.stat(top / "attempts")
+    real, hit = os.close, []
+
+    def eio_on_parent(f: int) -> None:
+        st = os.fstat(f)
+        real(f)
+        if (st.st_dev, st.st_ino) == (pst.st_dev, pst.st_ino) and not hit:
+            hit.append(f)
+            raise OSError(errno.EIO, "injected")
+
+    try:
+        monkeypatch.setattr(os, "close", eio_on_parent)
+        v = R.verify_readset(cb, d, fd, str(top / "attempts"), new_attempt_id())
+        monkeypatch.setattr(os, "close", real)
+    finally:
+        monkeypatch.setattr(os, "close", real)
+        os.close(fd)
+    assert hit and v.commit == rs.commit
+    R.discard(v)
