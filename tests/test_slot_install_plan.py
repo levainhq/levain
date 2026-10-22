@@ -206,6 +206,8 @@ TABLE = {
     "levain-dispatch-export": {"_levain_dispatch"},
     "levain-queue": {"OP", "_levain_dispatch", "_levain_qbroker"},
 }
+#: the one membership in an account's own primary group: keys in CONTROL's, so keys can give admin.sock that group.
+PRIMARY_MEMBERS = {"_levain_control": {"_levain_keys"}}
 
 
 @pytest.mark.parametrize("host", HOSTS)
@@ -229,7 +231,7 @@ def test_slot_groups_exact(host):
         pairs = {(s.argv[4], s.argv[7]) for s in plan.steps if s.argv[:1] == ("/usr/sbin/dseditgroup",)}
     else:
         pairs = {(s.argv[4], s.argv[3]) for s in plan.steps if s.argv[1:3] == ("--append", "--groups")}
-    assert pairs == {(m, g) for g, ms in members.items() for m in ms}
+    assert pairs == {(m, g) for g, ms in {**members, **PRIMARY_MEMBERS}.items() for m in ms}
     assert _refusal(supplementary_groups, "_levain_s64") == "not-levain-name"
     assert _refusal(supplementary_groups, "bob") == "not-levain-name"
 
