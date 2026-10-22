@@ -4,13 +4,17 @@ Real repo, real git, the real exporter (:func:`levain.dispatch.cli.readset_expor
 real SIGKILL of a filing process; the race is two filings of one idempotency key."""
 from __future__ import annotations
 
+import errno
 import os
 import signal
 import sqlite3
 import subprocess
 import sys
 
+import pytest
+
 from levain.dispatch import cli as dcli
+from levain.dispatch import handoff as dh
 from levain.dispatch import jobs as djobs
 from levain.dispatch.jobs import JobStore
 from tests.test_dispatch_contract import NOW, POLICY, make_repo, registry, submission
@@ -108,3 +112,57 @@ def test_an_idempotent_replay_whose_existing_job_wins_unlinks_only_its_own_bundl
     assert _live(store) == [bundle_id] and os.path.getsize(path) == size
     assert os.listdir(os.path.join(store.handoffs.path, ".tmp")) == []
     assert store.collect_handoffs().bundles == []
+
+
+def test_a_writer_that_opened_the_store_before_another_process_migrated_it_files_nothing(tmp_path):
+    # reproduced (w2dc-fix1 repro.py R1): a 0.11.14-format JobStore opened before a current Levain migrated the store
+    # kept _ready and filed a job with no handoff row, capability returned. The database now refuses the insert of a
+    # writer whose format is not the marker's, read inside the inserting transaction
+    repo, base = make_repo(tmp_path / "src")
+    store = _store(tmp_path)
+    store.sweep()                                   # this object's schema check is done; it never re-reads the marker
+    conn = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        # the older writer's insert, as /4 writes it: no writer format named
+        with pytest.raises(sqlite3.IntegrityError, match="^store-format: "):
+            conn.execute("INSERT INTO jobs (id, digest, contract, filed_at, filer_session, capability_sha256, "
+                         "idem_key, repo, expires_at, unsigned_until) VALUES ('dj-x', 'd', 'c', 't', 's', 'h', "
+                         "NULL, '/r', 'e', 'u')")
+        # another process moves the store to a newer format, as a migration does (the marker alone)
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DROP TRIGGER meta_frozen")
+        conn.execute("UPDATE meta SET value = 'levain-dispatch-jobs/6' WHERE key = 'format'")
+        conn.execute(djobs._append_only("meta", "store metadata is written once")[0])
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    with pytest.raises(djobs.JobStoreError, match="^store-format: "):
+        store.file(submission(repo, base), resolve_template=registry(), policy=POLICY, filer_session="sess-1",
+                   export=dcli.readset_export)
+    assert _count(store, "jobs") == 0 and _count(store, "handoffs") == 0
+    # nothing of the refused filing is left: no bundle, no temp
+    assert _live(store) == [] and os.listdir(os.path.join(store.handoffs.path, ".tmp")) == []
+
+
+def test_a_failed_live_dir_flush_after_the_link_leaves_no_bundle_behind(tmp_path, monkeypatch):
+    # reproduced (w2dc-fix1 repro.py R3a): the link succeeded, the live dir's flush raised EIO, and the installed
+    # bundle stayed under an id no caller held, uncollected for the life of the store object
+    repo, base = make_repo(tmp_path / "src")
+    store = _store(tmp_path)
+    store.collect_handoffs()
+    real = dh.full_fsync
+    live_dir = os.stat(store.handoffs.ensure())
+
+    def eio_on_the_live_dir(fd):
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) == (live_dir.st_dev, live_dir.st_ino):
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        return real(fd)
+
+    monkeypatch.setattr(dh, "full_fsync", eio_on_the_live_dir)
+    with pytest.raises(dh.HandoffRefused, match="handoff-install-failed: flush: EIO"):
+        store.file(submission(repo, base), resolve_template=registry(), policy=POLICY, filer_session="sess-1",
+                   export=dcli.readset_export)
+    monkeypatch.setattr(dh, "full_fsync", real)
+    assert _count(store, "jobs") == 0 and _count(store, "handoffs") == 0
+    assert _live(store) == [] and os.listdir(os.path.join(store.handoffs.path, ".tmp")) == []

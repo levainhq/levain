@@ -130,7 +130,8 @@ log = logging.getLogger("levain.dispatch.jobs")
 DB_NAME = "dispatch.db"
 FORMAT = "levain-dispatch-jobs/5"
 # the formats a store is migrated from IN PLACE when this code opens it, each by tables and triggers added beside
-# the old ones (CREATE ... IF NOT EXISTS) and its marker rewritten in the same transaction; no row is rewritten.
+# the old ones (CREATE ... IF NOT EXISTS), the one column /5 adds, and its marker rewritten in the same transaction;
+# no row is rewritten.
 # /2 added the human authorise item and the base_moved edges (F11), so a Levain that knows only /1 refuses the
 # store instead of misreading a job it cannot transition. /3 added the run records and the verifier_refused cause
 # (W2-a), so a Levain that knows only /2 refuses the store instead of misreading a run it has no table for. /4 added
@@ -139,7 +140,9 @@ FORMAT = "levain-dispatch-jobs/5"
 # edge walk take it to running with no envelope check (measured on 0.11.13 from PyPI), so a Levain
 # that knows only /3 now refuses the store instead. /5 added the handoff rows (W-C): a filed job's read-set bundle,
 # named by id and size, written in the job's own filing transaction; a Levain that knows only /4 would delete no
-# terminal job's bundle and collect no orphan, so it refuses the store instead
+# terminal job's bundle and collect no orphan, so it refuses the store instead. /5 also added the jobs' writer
+# format, so a writer that opened the store at an older format before another process migrated it is refused at its
+# insert (it never re-reads the marker)
 _MIGRATES_FROM = frozenset({"levain-dispatch-jobs/1", "levain-dispatch-jobs/2", "levain-dispatch-jobs/3",
                             "levain-dispatch-jobs/4"})
 # how long an unsigned contract holds its write files before it lapses
@@ -373,12 +376,24 @@ def _append_only(table: str, message: str) -> tuple[str, str]:
             f"BEGIN SELECT RAISE(ABORT, '{message}'); END")
 
 
+# the refusal a writer of an older format meets at its first filing after a migration (the jobs_writer_format trigger)
+_STALE_WRITER = ("store-format: another Levain moved this dispatch store to a newer format after this process opened "
+                 "it; nothing was filed (restart this process on the current Levain)")
+
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, digest TEXT NOT NULL, contract TEXT NOT NULL, "
     "filed_at TEXT NOT NULL, filer_session TEXT NOT NULL, capability_sha256 TEXT NOT NULL, idem_key TEXT, "
-    "repo TEXT NOT NULL, expires_at TEXT NOT NULL, unsigned_until TEXT NOT NULL, "
+    "repo TEXT NOT NULL, expires_at TEXT NOT NULL, unsigned_until TEXT NOT NULL, writer_format TEXT, "
     "UNIQUE (filer_session, idem_key))",
+    # a job is filed only by a writer of the store's CURRENT format: each insert names the format its writer knows,
+    # and the database compares it with the marker inside the inserting transaction. A process that opened the store
+    # before another one migrated it keeps its old schema check, and its insert names an older format (a /4 writer
+    # names none), so it files nothing here instead of a job the current format would read as damaged. A migration
+    # moves only the marker: this trigger then refuses every older writer with no edit of its own
+    "CREATE TRIGGER IF NOT EXISTS jobs_writer_format BEFORE INSERT ON jobs "
+    "WHEN NEW.writer_format IS NOT (SELECT value FROM meta WHERE key = 'format') "
+    f"BEGIN SELECT RAISE(ABORT, '{_STALE_WRITER}'); END",
     "CREATE INDEX IF NOT EXISTS jobs_repo ON jobs (repo)",
     "CREATE TABLE IF NOT EXISTS transitions (job_id TEXT NOT NULL REFERENCES jobs(id), seq INTEGER NOT NULL, "
     "to_state TEXT NOT NULL, cause TEXT NOT NULL, at TEXT NOT NULL, evidence TEXT NOT NULL, "
@@ -660,6 +675,9 @@ class JobStore:
             row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if tables else None
             if row is not None and row[0] != FORMAT and row[0] not in _MIGRATES_FROM:
                 raise JobStoreError(f"store format {row[0]!r} is not {FORMAT!r}")
+            if "jobs" in tables and "writer_format" not in {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}:
+                # a store from before /5: its rows keep no writer format (the check is on insert only)
+                conn.execute("ALTER TABLE jobs ADD COLUMN writer_format TEXT")
             for stmt in _SCHEMA:
                 conn.execute(stmt)
             if row is None:
@@ -963,34 +981,41 @@ class JobStore:
             self.collect_handoffs()
         # F2 + F3, before the lock: the read set built and checked, its bundle in a private locked temp, uninstalled
         exported = export(resolved, text, digest, self.handoffs.ensure())
-        _seam("exported")
-        with self.handoffs.locked():
-            bundle_id = self.handoffs.install(exported.path, exported.fd)       # F3'
-            _seam("installed")
-            done = False
-            adopted = False
-            try:
-                job, capability, adopted = self._commit_filing(                  # F4
-                    parsed, text, digest, filer_session=filer_session, idem_key=idem_key, filer_agent=filer_agent,
-                    envelope=envelope, prior=None, handoff=(bundle_id, exported.size))
-                _seam("committed")
-                done = True
-            finally:
-                if done:
-                    if not adopted:
-                        # an idempotent replay whose existing job won: this filing's own bundle, never the winner's
-                        self.handoffs.unlink_own(bundle_id)
-                else:
-                    # a raise does not say whether the commit happened: the row decides, read in a fresh
-                    # transaction under this same lock hold; a re-read that fails leaves the bundle for collection
-                    try:
-                        named = self._names_handoff(bundle_id)
-                    except BaseException:   # noqa: BLE001 - the original failure is what propagates
-                        log.exception("dispatch: handoff %s left for collection: its row could not be re-read",
-                                      bundle_id)
-                        named = True
-                    if not named:
-                        self.handoffs.unlink_own(bundle_id)
+        installing = False
+        try:
+            _seam("exported")
+            with self.handoffs.locked():
+                installing = True       # from the call on, the install closes the temp's fd on every path
+                bundle_id = self.handoffs.install(exported.path, exported.fd)       # F3'
+                done = False
+                adopted = False
+                try:
+                    _seam("installed")
+                    job, capability, adopted = self._commit_filing(                  # F4
+                        parsed, text, digest, filer_session=filer_session, idem_key=idem_key,
+                        filer_agent=filer_agent, envelope=envelope, prior=None, handoff=(bundle_id, exported.size))
+                    _seam("committed")
+                    done = True
+                finally:
+                    if done:
+                        if not adopted:
+                            # an idempotent replay whose existing job won: this filing's own bundle, never the winner's
+                            self.handoffs.unlink_own(bundle_id)
+                    else:
+                        # a raise does not say whether the commit happened: the row decides, read in a fresh
+                        # transaction under this same lock hold; a re-read that fails leaves the bundle for collection
+                        try:
+                            named = self._names_handoff(bundle_id)
+                        except BaseException:   # noqa: BLE001 - the original failure is what propagates
+                            log.exception("dispatch: handoff %s left for collection: its row could not be re-read",
+                                          bundle_id)
+                            named = True
+                        if not named:
+                            self.handoffs.unlink_own(bundle_id)
+        finally:
+            if not installing:
+                # refused before the install (the lock, or the seam): the temp is this filing's alone, still locked
+                self.handoffs.drop_temp(exported.path, exported.fd)
         return job, capability
 
     def _commit_filing(self, parsed: ResolvedContract, text: str, digest: str, *, filer_session: str,
@@ -1059,9 +1084,15 @@ class JobStore:
                 # a value that starts with "-" reads as an option to argparse, so `--capability <it>` would be
                 # refused; a capability 0.11.10-0.11.13 minted that way is reached with `--capability=<it>`
                 capability = secrets.token_urlsafe(32)
-            conn.execute(f"INSERT INTO jobs ({_JOB_COLS}, capability_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                         (job_id, digest, text, stamp, filer_session, idem_key, parsed.repo, parsed.expires_at,
-                          unsigned_until, _capability_sha(capability)))
+            try:
+                conn.execute(f"INSERT INTO jobs ({_JOB_COLS}, capability_sha256, writer_format) "
+                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             (job_id, digest, text, stamp, filer_session, idem_key, parsed.repo, parsed.expires_at,
+                              unsigned_until, _capability_sha(capability), FORMAT))
+            except sqlite3.IntegrityError as exc:
+                if str(exc) == _STALE_WRITER:
+                    raise JobStoreError(_STALE_WRITER) from None
+                raise
             # a job's first transition is written here alone: no edge leads INTO filed
             conn.execute("INSERT INTO transitions (job_id, seq, to_state, cause, at, evidence) "
                          "VALUES (?, 1, 'filed', 'filed', ?, ?)",

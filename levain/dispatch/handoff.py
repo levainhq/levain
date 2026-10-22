@@ -20,7 +20,9 @@ never a second time on a new fd while it holds it.
 
 THE INSTALL (:meth:`HandoffDir.install`). A no-replace claim: the temp is ``link``ed to a fresh id's name (a fresh id
 on ``EEXIST``; a file already there is never replaced), the temp unlinked, and both directories flushed. A ``link``
-failure other than ``EEXIST`` is ``handoff-install-failed`` and the temp is left to collection.
+failure other than ``EEXIST`` is ``handoff-install-failed`` and the temp is left to collection; a failed flush after
+the link is too, and the install unlinks the name it linked. A temp that never reaches the install (the lock refused)
+is its filing's to unlink (:meth:`HandoffDir.drop_temp`).
 
 THE CLEANERS. :meth:`HandoffDir.collect` (under the lock) removes every live-dir entry no row names and every
 ``.tmp/`` temp that is UNLOCKED and older than :data:`TEMP_GRACE_S` (a live filer's temp is locked, so it is
@@ -192,7 +194,9 @@ class HandoffDir:
         """F3': claim a fresh id for the exporter's temp ``temp_path`` (under this live dir's ``.tmp/``) by a no-replace
         ``link``, unlink the temp, flush both dirs, close ``temp_fd`` (its lock goes with it); returns the id. Call
         under :meth:`locked`. A ``link`` failure other than ``EEXIST`` is ``handoff-install-failed`` (the temp is left,
-        unlocked once ``temp_fd`` closes, for collection)."""
+        unlocked once ``temp_fd`` closes, for collection); so is a failed flush of the live dir after the link, and the
+        linked name is unlinked first, since no caller ever holds its id. ``temp_fd`` is closed on every path from
+        the call on."""
         try:
             tmp_dir = os.path.join(self.path, TEMP_DIR)
             if os.path.dirname(temp_path) != tmp_dir:
@@ -215,13 +219,27 @@ class HandoffDir:
                     else:
                         raise HandoffRefused("handoff-install-failed", f"no free id in {_INSTALL_TRIES} tries")
                     try:
-                        os.unlink(name, dir_fd=tfd)
-                        full_fsync(tfd)
-                    except OSError as exc:
-                        # the bundle is installed under its id; a temp left behind is a second name collection removes
-                        _log.warning("handoff: the installed temp %s was not unlinked: %s", name,
-                                     errno.errorcode.get(exc.errno, exc.errno))
-                    full_fsync(hfd)
+                        try:
+                            os.unlink(name, dir_fd=tfd)
+                            full_fsync(tfd)
+                        except OSError as exc:
+                            # the bundle is installed under its id; a temp left behind is a second name collection
+                            # removes
+                            _log.warning("handoff: the installed temp %s was not unlinked: %s", name,
+                                         errno.errorcode.get(exc.errno, exc.errno))
+                        full_fsync(hfd)
+                    except BaseException as exc:
+                        # linked but never returned: no caller holds this id and no row can name it, so the install
+                        # takes its own name back (a failure to is logged; collection takes the bundle)
+                        try:
+                            os.unlink(bundle_id, dir_fd=hfd)
+                        except OSError as uexc:
+                            _log.warning("handoff: the unreturned bundle %s was not unlinked: %s; collection takes "
+                                         "it", bundle_id, errno.errorcode.get(uexc.errno, uexc.errno))
+                        if isinstance(exc, OSError):
+                            raise HandoffRefused("handoff-install-failed", f"flush: "
+                                                 f"{errno.errorcode.get(exc.errno, exc.errno)}") from None
+                        raise
                     return bundle_id
                 finally:
                     os.close(tfd)
@@ -229,6 +247,31 @@ class HandoffDir:
                 os.close(hfd)
         finally:
             # the temp's lock goes with its fd, on every path: installed, or left unlocked for collection
+            os.close(temp_fd)
+
+    def drop_temp(self, temp_path: str, temp_fd: int) -> None:
+        """A filing's own temp that never reached :meth:`install` (a refusal between the export and the install):
+        unlink it while ``temp_fd`` still holds its lock, then close ``temp_fd``. A failure is logged; the temp,
+        unlocked once ``temp_fd`` closes, is left for collection."""
+        try:
+            tmp_dir = os.path.join(self.path, TEMP_DIR)
+            if os.path.dirname(temp_path) != tmp_dir:
+                _log.warning("handoff: a temp outside this handoff dir's .tmp/ was not unlinked")
+                return
+            try:
+                tfd = _private_dir(tmp_dir)
+                try:
+                    os.unlink(os.path.basename(temp_path), dir_fd=tfd)
+                finally:
+                    os.close(tfd)
+            except FileNotFoundError:
+                pass
+            except HandoffRefused as exc:
+                _log.warning("handoff: the uninstalled temp was not unlinked: %s; collection takes it", exc)
+            except OSError as exc:
+                _log.warning("handoff: the uninstalled temp was not unlinked: %s; collection takes it",
+                             errno.errorcode.get(exc.errno, exc.errno))
+        finally:
             os.close(temp_fd)
 
     def unlink_own(self, bundle_id: str) -> None:
@@ -244,6 +287,9 @@ class HandoffDir:
                 os.close(hfd)
         except FileNotFoundError:
             pass
+        except HandoffRefused as exc:
+            # the live dir refused (gone, or no longer this uid's alone): best effort, never the filing's result
+            _log.warning("handoff: unlinking %s failed: %s; collection takes it", name, exc)
         except OSError as exc:
             _log.warning("handoff: unlinking %s failed: %s; collection takes it", name,
                          errno.errorcode.get(exc.errno, exc.errno))
