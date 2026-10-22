@@ -89,6 +89,11 @@ SIGNAL_HANGS_MAX = 3
 #: H6: the kill after a bootout launchd did not accept runs at least this long, so it signals even when B spent the
 #: deadline (a sweep handed no time scans once and signals nothing).
 K2_FLOOR_S = 0.5
+#: DECISION: what :func:`end_seams`' macOS kill keeps back from END's bound. END reads its clock before calling the
+#: kill seam and after it returns; :func:`end_domain` takes its deadline inside, so the closure's entry and its return
+#: fall outside that deadline. Those are two Python calls (microseconds), and the margin is sized for a scheduling
+#: stall on a loaded host between them, not for them: 5% of V12, which shortens only the kill's own budget.
+END_PROVE_MARGIN_S = 0.5
 
 RUN, STOP, ZOMBIE, UNKNOWN = "run", "stop", "zombie", "unknown"
 
@@ -411,7 +416,9 @@ class CgroupProcs:
 def end_seams(host: HostOS, cgroup: str | None = None, seams: ProcSeams | None = None
               ) -> tuple[Callable[[int, float], bool], Callable[[int, float], bool], Callable[[int], bool]]:
     """``(freeze, kill, no_process)`` for :class:`levain.slot.end.EndSeams`: Linux the session cgroup
-    (alloc's ``cgroup``, required), macOS the uid sweep."""
+    (alloc's ``cgroup``, required), macOS the uid sweep. The macOS kill hands :func:`end_domain` its bound less
+    :data:`END_PROVE_MARGIN_S`: END times the kill seam from before the call to after its return, on the monotonic
+    clock the default seams carry too, so a proof that met :func:`end_domain`'s own deadline also meets END's."""
     if host == "linux":
         if cgroup is None:
             raise Refused("bad-value", "a Linux session names its cgroup")
@@ -422,7 +429,7 @@ def end_seams(host: HostOS, cgroup: str | None = None, seams: ProcSeams | None =
     u = UidProcs(seams or default_seams(host))
 
     def kill(uid: int, bound_s: float) -> bool:
-        res, _ = end_domain(uid, bound_s, seams=u.seams)
+        res, _ = end_domain(uid, max(bound_s - END_PROVE_MARGIN_S, 0.0), seams=u.seams)
         if not res.proven:
             raise Refused("kill-unproven", f"uid {uid}: {res.name}" + (f" ({res.detail})" if res.detail else ""))
         return True
@@ -944,8 +951,8 @@ def default_seams(host: HostOS | None = None) -> ProcSeams:
     return darwin_seams() if host == "darwin" else linux_seams()
 
 
-__all__ = ["BOOTOUT_RETRY_FIRST_S", "CgroupProcs", "Domain", "EDOMAIN_TEARDOWN", "FREEZE_SHARE", "K2_FLOOR_S",
-           "POLL_FIRST_S", "POLL_MAX_S", "PROVEN", "SIGNAL_CHILD_S", "SIGNAL_HANGS_MAX",
+__all__ = ["BOOTOUT_RETRY_FIRST_S", "CgroupProcs", "Domain", "EDOMAIN_TEARDOWN", "END_PROVE_MARGIN_S", "FREEZE_SHARE",
+           "K2_FLOOR_S", "POLL_FIRST_S", "POLL_MAX_S", "PROVEN", "SIGNAL_CHILD_S", "SIGNAL_HANGS_MAX",
            "Proc", "ProcSeams", "QUIET_S", "REAP_GRACE_S", "RUN", "SETTLE_POLL_S", "SIGNAL_SENT", "STOP", "UNKNOWN",
            "UidProcs", "V12K_SECONDS", "V12_SECONDS", "ZOMBIE", "check_target", "darwin_seams", "default_seams",
            "end_domain", "end_seams", "kill_and_reap", "linux_listing", "linux_probe", "linux_seams",
