@@ -103,7 +103,7 @@ def test_the_default_cockpit_in_a_browser_offers_no_rename_and_no_text_edit_on_a
         dom = _dump(f"{url}/?source=manifest#write_token=T")
     assert "plain seed" in dom and "&lt;U+200B&gt;" in dom, dom[:400]
     assert 'class="name-edit"' not in dom, "rename is not offered by the kernel"
-    assert 'placeholder="add a note' in dom, "an empty Keep still has its capture box"
+    assert 'placeholder="Add a note' in dom, "an empty Keep still has its capture box"
     edits = re.findall(r'<button[^>]*data-verb="spore_update"[^>]*>edit</button>', dom)
     locked = [b for b in edits if "hidden characters" in b]
     assert len(edits) == 2 and len(locked) == 1 and "disabled" in locked[0], edits

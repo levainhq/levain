@@ -401,8 +401,9 @@ def test_a_lens_switch_keeps_the_labelled_frame_until_the_live_read_applies(tmp_
     out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'hang'; 1"},
                                             {"eval": "document.querySelector('#h6 [data-tv=work]').click(); 1"}, SLEEP(300), {"eval": H_INFO},
                                             {"eval": "window.__mode = 'applied'; 1"}, {"eval": H_LIVE},
-                                            # the host card shares the module state with the page's own card, so it is repainted by hand (as the failed-return test does) and the wait is on both
-                                            {"until": "(window.__opts.repaint(), !window.LevainTopologyView.replaying() && !document.querySelector('#h6 .tv-rbadge'))", "ms": 8000}, {"eval": H_INFO}])
+                                            # the wait and the final read are on the PAGE's own card (#ck-hlens), which production repaints itself when the live read
+                                            # applies: the test never calls the host's repaint, so a card production fails to repaint fails this
+                                            {"until": "!window.LevainTopologyView.replaying() && !document.querySelector('#ck-hlens .tv-rbadge')", "ms": 8000}, {"eval": INFO}])
     mid, done = json.loads(out[-5]), json.loads(out[-1])
     assert mid["replaying"] is True and mid["badge"] == "returning to live…" and mid["rshown"] not in (None, "live") and mid["resumes"] == 1, mid
     assert done["replaying"] is False and done["badge"] is None, done
