@@ -1293,8 +1293,8 @@ class Keys:
                 # cancelling this exchange never cancels it); the credential `fresh` checked is the one the request
                 # is built with
                 observed = await fresh(self.cred_lifecycle, self._cred_store(), pol.credential)
-            head, hconn, cred, tpl = self._check_request(conn.reg, claims, pol, q,
-                                                         observed)   # the budget reservation is last
+            head, hconn, cred, tpl, ws = self._check_request(conn.reg, claims, pol, q,
+                                                             observed)   # the budget reservation is last
         except norm.Refused as r:
             await self._refuse(conn, frames, side, r.name, pol.body_cap)
             return
@@ -1337,7 +1337,8 @@ class Keys:
             if resp is None:
                 return   # the front aborted (`X`) or went away before `E`: nothing to answer
             if isinstance(resp, h11.InformationalResponse):   # a 101, returned only to a websocket request
-                u_frame = self._upgrade_frame(resp, pol, q, scanner)
+                assert ws is not None   # a 101 is returned only to a websocket request
+                u_frame = self._upgrade_frame(resp, pol, ws, scanner)
                 if conn.detached:
                     return
                 conn.writer.write(u_frame)
@@ -1476,14 +1477,14 @@ class Keys:
             out.append([name, text])
         return out
 
-    def _upgrade_frame(self, resp: "h11.InformationalResponse", pol: RoutePolicy, q: dict, scanner: Scanner) -> bytes:
+    def _upgrade_frame(self, resp: "h11.InformationalResponse", pol: RoutePolicy, ws: Tuple[str, List[str]],
+                       scanner: Scanner) -> bytes:
         """The `U` frame for an upstream's 101 to a websocket request, or the refusal (design 1.6): the 101 must be
         the websocket keys asked for (`ws_upgrade_refusal`: the accept against the key keys sent, no extension, a
-        protocol keys offered), else `upstream-error`. `U` carries the allow-listed response headers; the front
-        writes the slot's 101 itself (1.3 step 7)."""
-        fwd = [(n, v) for n, v in q["headers"]]
-        key = ws_client_key(fwd, q["body"])
-        offered = [t.strip() for n, v in fwd if n == "sec-websocket-protocol" for t in v.split(",") if t.strip()]
+        protocol keys offered), else `upstream-error`. `ws` is the (key, offered protocols) `_check_request` read
+        from the request it sent, never re-read from the `Q`. `U` carries the allow-listed response headers; the
+        front writes the slot's 101 itself (1.3 step 7)."""
+        key, offered = ws
         why = ws_upgrade_refusal(resp, key, offered)
         if why is not None:
             _note(logging.WARNING, "levain gw-keys: websocket upgrade refused (%s)", why)
@@ -1716,10 +1717,13 @@ class Keys:
         return self.creds is not None
 
     def _check_request(self, reg: Registration, claims: dict, pol: RoutePolicy, q: dict,
-                       observed: Optional[Credential]) -> Tuple[bytes, "h11.Connection", object, norm.Template]:
+                       observed: Optional[Credential]
+                       ) -> Tuple[bytes, "h11.Connection", object, norm.Template, Optional[Tuple[str, List[str]]]]:
         """keys' own re-check of the `Q` against ITS policy (the front's verdict is never taken), then the seams and
         the credential; returns the request head, the h11 client that wrote it (it frames the body and parses the
-        response), the credential (or None) and the matched template. Order: target and template, headers (strict: a forbidden, consumed
+        response), the credential (or None), the matched template, and for a websocket `Q` the handshake's (key,
+        offered protocols) read from the re-checked headers (`ws_handshake`; None otherwise), which the 101 is
+        checked against. Order: target and template, headers (strict: a forbidden, consumed
         or off-list name is `policy-header`), the declared length against `body_cap`, the codec, the credential and
         its host binding, the budget last (a reservation is made only for a request that goes out). The credential
         is `observed`, the one `fresh` observed and checked for the route's `credential`: it is not observed again."""
@@ -1734,8 +1738,8 @@ class Keys:
             raise norm.Refused("malformed", "upgrade")
         fwd = norm.check_headers([(n, v) for n, v in q["headers"]], pol.headers or {}, upgrade_ok=False, strict=True)
         body = q["body"]
-        if upgrade:
-            ws_client_key(fwd, body)   # keys re-checks the handshake it will send; the front's verdict is not taken
+        # keys re-checks the handshake it will send (the front's verdict is not taken), once, on the lowercased names
+        ws = ws_handshake(fwd, body) if upgrade else None
         if body.startswith("length:") and int(body[len("length:"):]) > pol.body_cap:
             raise norm.Refused("body-cap", "length")
         self.codec.check(claims.get("ticket"), pol)
@@ -1750,7 +1754,7 @@ class Keys:
                 raise norm.Refused("policy-header", cred.header)
         head, hconn = request_head(pol, method, path, query, fwd, body, cred, upgrade=upgrade)
         self.budget.reserve(reg.session, pol.route, pol.max_call_microdollars)   # the last step: see `_serve_q`
-        return head, hconn, cred, tpl
+        return head, hconn, cred, tpl, ws
 
     async def _forward_body(self, frames: "FrontFrames", side: KeysSide, up: Upstream, hconn: "h11.Connection",
                             body: str, cap: int, rec: dict) -> bool:
@@ -1911,10 +1915,11 @@ class Keys:
             got += len(payload)
 
 
-def ws_client_key(fwd: Sequence[Tuple[str, str]], body: str) -> str:
-    """keys' own check of a websocket `Q`'s handshake (RFC 6455 §4.1), on the headers it re-checked: no body, exactly
-    one `sec-websocket-version` of 13, and exactly one `sec-websocket-key` that is the canonical base64 of 16 bytes,
-    which is returned (the upstream's accept is checked against it). Anything else is `malformed`."""
+def ws_handshake(fwd: Sequence[Tuple[str, str]], body: str) -> Tuple[str, List[str]]:
+    """keys' own check of a websocket `Q`'s handshake (RFC 6455 §4.1), on the headers it re-checked (`fwd`: names
+    already lowercased by `norm.check_headers`): no body, exactly one `sec-websocket-version` of 13, and exactly one
+    `sec-websocket-key` that is the canonical base64 of 16 bytes. Returns that key and the protocols offered (the
+    upstream's 101 is checked against both); anything else is `malformed`."""
     keys = [v for n, v in fwd if n == "sec-websocket-key"]
     vers = [v for n, v in fwd if n == "sec-websocket-version"]
     if body != "none" or vers != ["13"] or len(keys) != 1:
@@ -1925,7 +1930,8 @@ def ws_client_key(fwd: Sequence[Tuple[str, str]], body: str) -> str:
         raw = b""
     if len(raw) != 16 or base64.b64encode(raw).decode("ascii") != keys[0]:
         raise norm.Refused("malformed", "websocket-key")
-    return keys[0]
+    offered = [t.strip() for n, v in fwd if n == "sec-websocket-protocol" for t in v.split(",") if t.strip()]
+    return keys[0], offered
 
 
 def ws_accept(key: str) -> str:

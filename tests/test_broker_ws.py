@@ -236,6 +236,16 @@ def test_a_101_whose_request_never_ends_is_refused_at_the_head_clock(monkeypatch
     assert json.loads(frames[1][1]) == {"refused": "upstream-error"}
 
 
+def test_mixed_case_handshake_names_upgrade(monkeypatch):
+    """T2 (complement MED-LOW): the handshake is read once from the re-checked (lowercased) headers. Before the fix a
+    `Sec-WebSocket-Key` passed keys' check, went upstream, and then the 101 was refused `malformed`."""
+    q = _q(headers=[["Sec-WebSocket-Key", KEY], ["Sec-WebSocket-Version", "13"], ["Sec-WebSocket-Protocol", "chat"]])
+    frames, _ = _exchange(monkeypatch, q, lambda up: up.feed(_h101(extra=b"sec-websocket-protocol: chat\r\n")),
+                          _gw(b"E") + _gw(b"E"))
+    assert _types(frames) == b"AU", frames
+    assert json.loads(frames[1][1])["headers"] == [["sec-websocket-protocol", "chat"]]
+
+
 @pytest.mark.parametrize("q,why", [
     (_q(path="/plain"), "upgrade on a template without upgrade"),
     (_q(headers=[["sec-websocket-version", "13"]]), "no key"),
