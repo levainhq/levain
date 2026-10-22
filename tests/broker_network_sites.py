@@ -14,4 +14,7 @@ NETWORK_SITES = (
     ("stub.py", "serve_unix", "socket"),
     # The front's keys-side client: the STATUS connection and one connection per brokered exchange.
     ("front.py", "open_keys", "create_unix_connection"),
+    # keys' listeners, built (and a stale socket probed) in the one function that creates them.
+    ("keys.py", "bind_listeners", "socket"),
+    ("keys.py", "bind_listeners", "connect_ex"),
 )
