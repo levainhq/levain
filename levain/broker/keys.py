@@ -66,8 +66,8 @@ from typing import Awaitable, Dict, List, Optional, Sequence, Set, Tuple, TypeVa
 import h11
 
 from levain.broker import gwwire, norm, upstream
-from levain.broker.creds import (COMMIT_FDS, CredLifecycle, CredStore, CredWriter, FakeCredLifecycle, check_host,
-                                 on_upstream_401)
+from levain.broker.creds import (COMMIT_FDS, REFRESH_CONNS, CredLifecycle, CredStore, Credential, CredWriter,
+                                 FakeCredLifecycle, check_host, fresh, on_upstream_401, unexpired)
 from levain.broker.gwwire import FrameReader, KeysSide, WireError
 from levain.broker.peer import PeerUnknown, peer_of, peer_uid
 from levain.broker.policy import PolicyError, RoutePolicy, parse_route
@@ -87,7 +87,7 @@ MAX_EXCHANGE_CONNS = 512
 #: the `_levain_gw<n>` index space: at most one STATUS connection per registered front.
 STATUS_CONNS = 64
 RESOLVE_CONNS = 32
-REFRESH_CONNS = 8
+# REFRESH_CONNS (imported): the refresh semaphore's size, creds.CredWriter's
 DNS_CONCURRENCY = 32
 #: fds one in-flight `getaddrinfo` of an uncached name holds [measured 2026-10-22, macOS 26.6, 32 concurrent lookups
 #: of distinct uncached names: 36 extra fds under 3.9.6, 35 under 3.12.13, so 2 per lookup rounded up]. Linux is
@@ -1281,7 +1281,14 @@ class Keys:
             await self._refuse(conn, frames, side, r.name, UNTRUSTED_DRAIN_CAP)
             return
         try:
-            head, hconn, cred, tpl = self._check_request(conn.reg, claims, pol, q)   # the budget reservation is last
+            observed = None
+            if pol.credential is not None:
+                # the ONE observation: a refresh-kind credential near its expiry waits here for its refresh (shielded:
+                # cancelling this exchange never cancels it); the credential `fresh` checked is the one the request
+                # is built with
+                observed = await fresh(self.cred_lifecycle, self._cred_store(), pol.credential)
+            head, hconn, cred, tpl = self._check_request(conn.reg, claims, pol, q,
+                                                         observed)   # the budget reservation is last
         except norm.Refused as r:
             await self._refuse(conn, frames, side, r.name, pol.body_cap)
             return
@@ -1307,6 +1314,10 @@ class Keys:
                 nonlocal sent
                 if ff.aborted():   # checked with no await before the write: an abort read by now stops the head
                     raise FrontAborted()
+                if cred is not None:
+                    # an access token that expired during the resolve, connect or TLS is never sent (no await
+                    # between this check and the write)
+                    unexpired(self.cred_lifecycle, cred)
                 up.write(head)   # the gate: a refused or failed write handed nothing upstream
                 sent = True      # from here the head may have reached the upstream
                 await up.drain()
@@ -1406,6 +1417,11 @@ class Keys:
             raise norm.Refused("upstream-redirect", str(status))
         if status > 599:
             raise norm.Refused("upstream-error", "status")
+        if status == 401 and cred is not None:
+            # before any header is processed: a refreshing credential's 401 wants its refresh whatever its headers
+            on_upstream_401(self.cred_lifecycle, self.creds, cred, cred.generation)   # type: ignore[attr-defined]
+            if getattr(cred, "kind", None) == "oauth2-refresh":
+                raise norm.Refused("credential-unavailable", "upstream 401")
         allow = set(pol.response_headers)
         out: List[List[str]] = []
         for raw_name, raw_value in resp.headers:
@@ -1421,10 +1437,6 @@ class Keys:
                       name)
                 continue
             out.append([name, text])
-        if status == 401 and cred is not None:
-            on_upstream_401(cred, cred.generation)   # type: ignore[attr-defined]
-            if getattr(cred, "kind", None) == "oauth2-refresh":
-                raise norm.Refused("credential-unavailable", "upstream 401")
         try:
             return gwwire.encode(b"R", {"v": 1, "status": status, "headers": out})
         except WireError:
@@ -1555,13 +1567,14 @@ class Keys:
                           type(e).__name__)
         return self.creds is not None
 
-    def _check_request(self, reg: Registration, claims: dict, pol: RoutePolicy,
-                       q: dict) -> Tuple[bytes, "h11.Connection", object, norm.Template]:
+    def _check_request(self, reg: Registration, claims: dict, pol: RoutePolicy, q: dict,
+                       observed: Optional[Credential]) -> Tuple[bytes, "h11.Connection", object, norm.Template]:
         """keys' own re-check of the `Q` against ITS policy (the front's verdict is never taken), then the seams and
         the credential; returns the request head, the h11 client that wrote it (it frames the body and parses the
         response), the credential (or None) and the matched template. Order: target and template, headers (strict: a forbidden, consumed
         or off-list name is `policy-header`), the declared length against `body_cap`, the codec, the credential and
-        its host binding, the budget last (a reservation is made only for a request that goes out)."""
+        its host binding, the budget last (a reservation is made only for a request that goes out). The credential
+        is `observed`, the one `fresh` observed and checked for the route's `credential`: it is not observed again."""
         try:
             method, path = q["method"].encode("ascii"), q["path"].encode("ascii")
             query = q["query"].encode("ascii") or None
@@ -1579,7 +1592,9 @@ class Keys:
         self.codec.check(claims.get("ticket"), pol)
         cred = None
         if pol.credential is not None:
-            cred = self._cred_store().observe(pol.credential)
+            if observed is None or observed.name != pol.credential:
+                raise norm.Refused("credential-unavailable", "not observed")
+            cred = observed
             assert pol.upstream is not None
             check_host(cred, pol.upstream.host, pol.route)
             if any(n == cred.header for n, _ in fwd):
