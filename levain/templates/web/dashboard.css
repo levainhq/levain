@@ -12,15 +12,19 @@
     --accent: oklch(0.76 0.165 55);
     --contrast: oklch(0.97 0.006 265);
 
-    --card: color-mix(in oklch, var(--base), var(--contrast) 5%);
-    --card-2: color-mix(in oklch, var(--base), var(--contrast) 9%);
-    --hair: color-mix(in oklch, var(--base), var(--contrast) 13%);
-    --hair-2: color-mix(in oklch, var(--base), var(--contrast) 22%);
+    /* dark: the panels lift clear of the page and the rules read (Phill 10-22: "an organized sea of text"); light sets its own */
+    --card: color-mix(in oklch, var(--base), var(--contrast) 8%);
+    --card-2: color-mix(in oklch, var(--base), var(--contrast) 12%);
+    --hair: color-mix(in oklch, var(--base), var(--contrast) 19%);
+    --hair-2: color-mix(in oklch, var(--base), var(--contrast) 28%);
     --text: var(--contrast);
     --label: color-mix(in oklch, var(--contrast) 66%, var(--base));
     --meta: color-mix(in oklch, var(--contrast) 58%, var(--base));
     --on-accent: var(--base);
-        --sky-lo: color-mix(in oklch, var(--base), var(--contrast) 7%);
+    /* two literal accent tints (the "waiting on you" halo and rule) and two cool hues the sky's mark kinds use (memory writes, questions) */
+    --accent-soft: oklch(0.25 0.045 55); --accent-line: oklch(0.52 0.11 55);
+    --info: oklch(0.78 0.10 235); --violet: oklch(0.76 0.12 305);
+    --sky-lo: color-mix(in oklch, var(--base), var(--contrast) 7%);
     --dot: color-mix(in oklch, var(--contrast) 80%, var(--base));
 
     /* space: a 4px base, 9 steps (spec D2). Components use these, never a raw px. */
@@ -28,24 +32,31 @@
     --gutter: var(--sp-7);
     /* the KE page: its own gutter, gap and widest page, and the three card heights (one token each) */
     --gutter-ke: 64px; --gap: var(--sp-6); --page-max: 1640px;
-    --card-tall: 540px; --card-medium: 460px; --card-short: 190px; --widget-h: 138px;
+    --card-tall: 540px; --card-medium: 460px; --card-short: 190px; --card-section: 380px; --fade-h: 40px;
+    --glow-a: .35; --sky-star-a: .35; --sky-line-a: .12; --tag-mix: 70%;
+    --sec: var(--sp-7);   /* the one space above a section heading; --gap is the one space between cards and between blocks */
 
     --round: ui-rounded, "SF Pro Rounded", -apple-system, system-ui, sans-serif;
     --sans: -apple-system, "SF Pro Text", ui-sans-serif, system-ui, sans-serif;
     --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     /* type: 7 sizes, 4 weights (800 only on the clock), 4 line-heights (spec D2) */
-    --fs-micro: 11px; --fs-meta: 12px; --fs-body: 13px; --fs-lead: 15px; --fs-title: 16px; --fs-figure: 34px; --fs-display: 92px;
+    --fs-micro: 11px; --fs-meta: 12px; --fs-body: 13px; --fs-lead: 15px; --fs-title: 16px; --fs-h: 20px; --fs-figure: 34px; --fs-display: 92px;
     --fw-regular: 400; --fw-medium: 500; --fw-semibold: 600; --fw-bold: 700; --fw-clock: 800;
     --lh-display: 84px; --lh-tight: 1.25; --lh-list: 1.45; --lh-prose: 1.6;
     --track-caps: .08em; --track-tight: -.03em;
     /* radii: 4 steps. 6 chips + verb hover box, 8 controls, 18 cards and overlays, pill for counts and dots */
     --r-sm: 6px; --r-md: 8px; --r-lg: 18px; --r-pill: 999px;
     /* controls: two heights. 24 row verbs (WCAG 2.5.8), 28 everything else */
-    --ctl-row: 24px; --ctl-md: 28px; --hit-min: 44px;   /* --hit-min: the touch hit area (Apple HIG 44pt) */
+    --ctl-row: 24px; --ctl-md: 28px; --seg-h: 32px; --hit-min: 44px;   /* --hit-min: the touch hit area (Apple HIG 44pt) */
     /* motion */
     --dur-micro: 120ms; --dur-expand: 160ms; --ease-out: cubic-bezier(0, 0, 0.38, 0.9);
-    /* ONE shadow, overlays only (modal, popover) */
+    /* ONE overlay shadow (modal, popover); controls and the glance take the material tokens below, never a second overlay shadow */
     --shadow-overlay: 0 12px 32px -8px rgb(0 0 0 / .6);
+    /* KN finish: the control material. A track is recessed (inner shade), a key is raised (lit top edge + a short cast shadow). */
+    --edge-hi: inset 0 1px 0 rgb(255 255 255 / .12); --key-ring: 0 0 0 1px rgb(255 255 255 / .06); --recess: inset 0 1px 2px rgb(0 0 0 / .45);
+    --lift: 0 1px 2px rgb(0 0 0 / .45), 0 0 0 1px var(--hair-2);
+    --key-bg: linear-gradient(to bottom, color-mix(in oklch, var(--card-2), var(--contrast) 10%), color-mix(in oklch, var(--card-2), var(--contrast) 3%));
+    --track-bg: color-mix(in oklch, var(--base), #000 18%);
     /* status: one each, none of them is the accent. A status shows as a dot plus neutral words. */
     --ok: oklch(0.78 0.14 155); --warn: oklch(0.84 0.13 90); --bad: oklch(0.70 0.17 25);
     /* AQI ramp (EPA bands) in the same system */
@@ -70,6 +81,62 @@
     --classC: var(--label);
     --node: var(--mind);
     --edge: var(--hair-2);
+    color-scheme: dark;   /* native form chrome follows the theme: the light blocks below set light */
+  }
+
+  /* THE THEME (F6): one token set, two themes. The tokens above are the dark set. Light is the phone's (phone.css), by system
+     preference unless the page's switch chose (html[data-theme]); every derived token recomputes from the three. */
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --base: oklch(0.975 0.006 265);
+      --accent: oklch(0.66 0.17 55);
+      --contrast: oklch(0.2 0.03 265);
+      --card: color-mix(in oklch, var(--base), var(--contrast) 3%);
+      --card-2: color-mix(in oklch, var(--base), var(--contrast) 7%);
+      --hair: color-mix(in oklch, var(--base), var(--contrast) 16%);
+      --hair-2: color-mix(in oklch, var(--base), var(--contrast) 28%);
+      --label: color-mix(in oklch, var(--contrast) 72%, var(--base));
+      --meta: color-mix(in oklch, var(--contrast) 64%, var(--base));
+      --on-accent: oklch(0.2 0.03 265);   /* dark text on the orange fill: white on it is 3.3:1 */
+      --accent-soft: oklch(0.945 0.04 65); --accent-line: oklch(0.78 0.11 60);
+      --ok: oklch(0.45 0.12 155); --warn: oklch(0.48 0.12 70); --bad: oklch(0.5 0.17 25);
+      --info: oklch(0.5 0.12 245); --violet: oklch(0.5 0.15 305);
+      --aqi-moderate: oklch(0.55 0.12 90); --aqi-sensitive: oklch(0.55 0.15 55); --aqi-unhealthy: oklch(0.5 0.17 25);
+      --aqi-very: oklch(0.45 0.17 320); --aqi-hazard: oklch(0.4 0.15 10);
+      --hue-1: oklch(0.609 0.129 72); --hue-2: oklch(0.532 0.171 258); --hue-3: oklch(0.536 0.171 352);
+      --hue-4: oklch(0.511 0.1 135); --hue-5: oklch(0.581 0.121 165); --hue-6: oklch(0.481 0.067 210);
+      --hue-7: oklch(0.629 0.2 300); --hue-8: oklch(0.555 0.17 325);
+      --tag-mix: 45%; --glow-a: 0; --sky-star-a: .45; --sky-line-a: .10;
+      --shadow-overlay: 0 12px 32px -8px rgb(20 30 60 / .25);
+      --edge-hi: inset 0 1px 0 rgb(255 255 255 / .9); --recess: inset 0 1px 2px rgb(20 30 60 / .10);
+      --lift: 0 1px 2px rgb(20 30 60 / .14), 0 0 0 1px var(--hair); --key-ring: 0 0 0 0 transparent; --key-bg: var(--base); --track-bg: var(--card-2);
+      color-scheme: light;
+    }
+  }
+  :root[data-theme="light"] {
+    --base: oklch(0.975 0.006 265);
+    --accent: oklch(0.66 0.17 55);
+    --contrast: oklch(0.2 0.03 265);
+    --card: color-mix(in oklch, var(--base), var(--contrast) 3%);
+    --card-2: color-mix(in oklch, var(--base), var(--contrast) 7%);
+    --hair: color-mix(in oklch, var(--base), var(--contrast) 16%);
+    --hair-2: color-mix(in oklch, var(--base), var(--contrast) 28%);
+    --label: color-mix(in oklch, var(--contrast) 72%, var(--base));
+    --meta: color-mix(in oklch, var(--contrast) 64%, var(--base));
+    --on-accent: oklch(0.2 0.03 265);
+    --accent-soft: oklch(0.945 0.04 65); --accent-line: oklch(0.78 0.11 60);
+    --ok: oklch(0.45 0.12 155); --warn: oklch(0.48 0.12 70); --bad: oklch(0.5 0.17 25);
+    --info: oklch(0.5 0.12 245); --violet: oklch(0.5 0.15 305);
+    --aqi-moderate: oklch(0.55 0.12 90); --aqi-sensitive: oklch(0.55 0.15 55); --aqi-unhealthy: oklch(0.5 0.17 25);
+    --aqi-very: oklch(0.45 0.17 320); --aqi-hazard: oklch(0.4 0.15 10);
+    --hue-1: oklch(0.609 0.129 72); --hue-2: oklch(0.532 0.171 258); --hue-3: oklch(0.536 0.171 352);
+    --hue-4: oklch(0.511 0.1 135); --hue-5: oklch(0.581 0.121 165); --hue-6: oklch(0.481 0.067 210);
+    --hue-7: oklch(0.629 0.2 300); --hue-8: oklch(0.555 0.17 325);
+    --tag-mix: 45%; --glow-a: 0; --sky-star-a: .45; --sky-line-a: .10;
+    --shadow-overlay: 0 12px 32px -8px rgb(20 30 60 / .25);
+    --edge-hi: inset 0 1px 0 rgb(255 255 255 / .9); --recess: inset 0 1px 2px rgb(20 30 60 / .10);
+    --lift: 0 1px 2px rgb(20 30 60 / .14), 0 0 0 1px var(--hair); --key-ring: 0 0 0 0 transparent; --key-bg: var(--base); --track-bg: var(--card-2);
+    color-scheme: light;
   }
 
   * { box-sizing: border-box; }
@@ -187,9 +254,9 @@
   .pbody.clamped::-webkit-scrollbar-thumb { background: var(--line-hot); border-radius: var(--r-sm);
     border: 2px solid var(--panel); }
   .pbody.clamped::-webkit-scrollbar-track { background: transparent; }
-  /* "more below" cue: the last 24px of a bounded body fades out while there is more to scroll. A mask, so nothing is painted
+  /* "more below" cue: the last --fade-h (40px) of a bounded body fades out while there is more to scroll. A mask, so nothing is painted
      over the text; .at-end (set by measureOverflow) drops it at the bottom. */
-  .pbody.clamped.has-overflow:not(.at-end) { -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 24px), transparent); mask-image: linear-gradient(to bottom, #000 calc(100% - 24px), transparent); }
+  .pbody.clamped.has-overflow:not(.at-end) { -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-h, 24px)), transparent); mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-h, 24px)), transparent); }
 
   /* edit-class chip — a recessed status LED (armed/locked; lights up in Slice 2) */
   .chip {
@@ -290,9 +357,9 @@
   /* ONE status line for empty / loading / unavailable (spec §3 "Card states"): a 6px dot + a
      12px sentence in --label. The dot carries the state: neutral = empty, pulsing = loading,
      --warn = unavailable. Errors take their status colour, never the accent orange. */
-  p.err, p.empty { display: flex; align-items: center; gap: var(--sp-3); margin: 0; padding: var(--sp-4) 0;
+  p.err, p.empty { display: flex; align-items: flex-start; gap: var(--sp-3); margin: 0; padding: var(--sp-4) 0;
     color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.4 var(--sans); }
-  p.err::before, p.empty::before { content: ""; width: 6px; height: 6px; flex: none; border-radius: var(--r-pill); background: var(--meta); }
+  p.err::before, p.empty::before { content: ""; width: 6px; height: 6px; flex: none; margin-top: .5em; border-radius: var(--r-pill); background: var(--meta); }
   p.err::before { background: var(--warn); }
   p.empty.loading::before { animation: statusPulse 1.2s ease-in-out 8;  /* finite, then a still dot: a panel stuck loading must not animate forever */ }
   @keyframes statusPulse { 50% { opacity: .3; } }
@@ -411,8 +478,8 @@
      clear of --accent and of the status hues (--ok, --bad), so no series reads as a status */
   .scope-wrap, svg.scope { --series-1: oklch(0.78 0.12 200); --series-2: oklch(0.74 0.15 300); }
   svg.scope .ch1 { stroke: var(--series-1); }
-  svg.scope .ch2 { stroke: var(--series-2); }
-  svg.scope .ch3 { stroke: var(--accent); }
+  svg.scope .ch2 { stroke: var(--accent); }
+  svg.scope .ch3 { stroke: var(--series-2); }
   /* read-side instrument controls — METAL (materiality rule), real verbs only:
      timebase redraws the window; a channel chip solos its trace (CSS-only). */
   .scope-bar { display: flex; gap: var(--sp-2); align-items: center; margin: 0 0 var(--sp-3); }
@@ -436,8 +503,8 @@
   .scope-ch:hover { border-color: var(--line-hot); }
   .scope-ch[aria-pressed="true"] { border-color: currentColor; }
   .scope-ch.ch1 { color: var(--series-1); }
-  .scope-ch.ch2 { color: var(--series-2); }
-  .scope-ch.ch3 { color: var(--accent); }
+  .scope-ch.ch2 { color: var(--accent); }
+  .scope-ch.ch3 { color: var(--series-2); }
   /* solo: hide the other traces (visibility, not opacity — the glow's breathe
      animation owns opacity and would override a static opacity rule) */
   .scope-wrap[data-solo="ch1"] svg.scope polyline:not(.ch1),
@@ -448,7 +515,7 @@
   .scope-wrap[data-solo="ch3"] .scope-ch:not(.ch3) { opacity: .4; }
   body[data-vital="dark"] svg.scope { filter: grayscale(.5) brightness(.65); }
 
-  .deck-foot { margin-top: var(--sp-6); text-align: center; color: var(--faint); font-size: var(--fs-micro);
+  .deck-foot { margin-top: var(--sp-6); padding-bottom: var(--sp-7); text-align: center; color: var(--faint); font-size: var(--fs-micro);
     letter-spacing: var(--track-caps); text-transform: uppercase; font-family: var(--sans); position: relative; z-index: 1; }
 
   /* ── motion ────────────────────────────────────────────────────────────── */
@@ -671,7 +738,7 @@
   }
   .verb-edit-ta { flex: 1 1 180px; }
   .tray-dump-type {
-    font: var(--fw-regular) var(--fs-meta)/var(--lh-list) var(--sans); color: var(--ink); background: var(--base); color-scheme: dark;
+    font: var(--fw-regular) var(--fs-meta)/var(--lh-list) var(--sans); color: var(--ink); background: var(--base);
     border: 1px solid var(--line-hot); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3); outline: none;
   }
   .tray-dump-type:focus {
@@ -698,7 +765,7 @@
   .action-ms-opt input { accent-color: var(--operate); cursor: pointer; }
   .action-ms-opt:has(input:disabled) { opacity: .45; cursor: default; }
   .verb-date {
-    font: var(--fw-regular) var(--fs-meta)/var(--lh-list) var(--sans); color: var(--ink); background: var(--base); color-scheme: dark;
+    font: var(--fw-regular) var(--fs-meta)/var(--lh-list) var(--sans); color: var(--ink); background: var(--base);
     border: 1px solid var(--line-hot); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3); outline: none;
   }
   .verb-date:focus {
@@ -1016,9 +1083,14 @@
   .panel-hero .legendbar { padding-inline: var(--gutter); }
   .sky-bar { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-5); flex-wrap: wrap; padding-bottom: var(--sp-5); }
   .sky-summary { font-size: var(--fs-meta); color: var(--meta); line-height: var(--lh-prose); min-width: 0; }
+  .sky-bar.sky-head { flex-wrap: nowrap; justify-content: flex-start; padding-bottom: var(--sp-3); }
+  .sky-head .sky-summary { display: flex; align-items: baseline; gap: var(--sp-4); flex: 1; }
+  .sky-head .sky-head-title { font: var(--fw-bold) var(--fs-lead)/1 var(--round); color: var(--text); letter-spacing: var(--track-tight); }
+  .sky-head .sky-head-win { margin-left: auto; font-size: var(--fs-micro); }
   .sky-summary b { color: var(--label); font-weight: var(--fw-semibold); }
   .sky-toggle { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); color: var(--label); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; flex: none; }
   .sky-toggle:hover { color: var(--text); border-color: var(--hair-2); }
+  .sky-toggle-ghost { visibility: hidden; pointer-events: none; }
   .sky-legend { padding-top: var(--sp-3); font-size: var(--fs-meta); color: var(--label); }
   @media (max-width: 720px) { .sky { grid-template-columns: 1fr; } .when { border-right: 0; } }
 
@@ -1046,22 +1118,55 @@
 body.ke { --gutter: var(--gutter-ke); }
 body.ke .deck { max-width: var(--page-max); margin: 0 auto; }
 
-/* HERO: the first block on the page. The clock column (brand, time, date, events, weather) and the sky beside it,
-   the nav bar's modes / unit / live / sync / jump as a slim strip above the sky. */
-body.ke .hero > .ck-region-err { grid-column: 1 / -1; padding: var(--sp-5) var(--gutter); }
-body.ke .hero { display: grid; grid-template-columns: 340px minmax(0, 1fr); border-bottom: 1px solid var(--hair);
-  background: var(--base); }
-body.ke .hero .when { padding: var(--sp-6) var(--sp-6) var(--sp-6) var(--gutter); border-right: 1px solid var(--hair);
-  display: flex; flex-direction: column; justify-content: flex-start; gap: var(--sp-5); }
-body.ke .hero .brand .wordmark { font: var(--fw-bold) var(--fs-lead)/16px var(--round); color: var(--label); letter-spacing: 0; gap: var(--sp-3); }
-body.ke .hero .brand .wordmark::before { width: 8px; height: 8px; }
-body.ke .hero .clock { font: var(--fw-clock) var(--fs-display)/var(--lh-display) var(--round); letter-spacing: var(--track-tight); margin-top: var(--sp-2); }
-body.ke .hero .clock small { font-size: var(--fs-title); line-height: 1; font-weight: var(--fw-bold); color: var(--label); margin-left: var(--sp-2); letter-spacing: 0; }
-body.ke .hero .date { font: var(--fw-semibold) var(--fs-title)/20px var(--round); color: var(--text); margin-top: var(--sp-3); }
-body.ke .hero .events { font-size: var(--fs-body); line-height: 20px; color: var(--label); margin-top: calc(var(--sp-2) * -1); }
-body.ke .hero .events .bad { color: var(--accent); }
-body.ke .hero .wx { border-top: 1px solid var(--hair); padding-top: var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-4); min-width: 0; }
-body.ke .hero .wx .xbody { display: flex; flex-direction: column; gap: var(--sp-4); }
+/* THE NOW BAND, then the sky as a card under it (F1). The band is one row: the clock and date, the state line verbatim with its
+   age, and at the right the last-wrap line (and the weather, when a provider supplies it). The masthead above it (brand, the four
+   tabs, the status cluster, the theme switch) is the page's bar and never moves into the hero. A bare install has no sky and no
+   weather: the band is still whole, and the sky card is simply not drawn. */
+body.ke .hero > .ck-region-err { padding: var(--sp-5) var(--gutter); }
+body.ke .hero { display: block; }
+body.ke .band { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: var(--sp-7); padding-block: var(--gap) var(--sp-5); }
+body.ke .band .when { display: flex; flex-direction: column; padding: 0; border: 0; gap: 0; }
+body.ke .band .clock { font: var(--fw-clock) 46px/1 var(--round); letter-spacing: -.04em; }
+body.ke .band .clock small { font: var(--fw-semibold) var(--fs-lead)/1 var(--round); letter-spacing: 0; color: var(--label); margin-left: var(--sp-2); }
+body.ke .band .date { font: var(--fw-regular) var(--fs-body)/1.2 var(--sans); color: var(--label); margin-top: var(--sp-3); }
+body.ke .band-state { min-width: 0; align-self: start; margin-top: 14px; padding-left: var(--sp-7); border-left: 1px solid var(--hair); }
+body.ke .band-state:not(:has(.stateline:not([hidden]))) { border-left: 0; padding-left: 0; }
+body.ke .band-state .stateline { padding: 0; margin: 0; align-items: baseline; gap: var(--sp-4); }
+body.ke .band-state .stateline .ftext { font: var(--fw-bold) var(--fs-lead)/var(--lh-tight) var(--round); }
+body.ke .band-meta { max-width: 460px; text-align: right; color: var(--meta); font-size: var(--fs-meta); line-height: 1.6; min-width: 0; display: flex; flex-direction: column; align-items: flex-end; }
+body.ke .band-meta b { color: var(--label); font-weight: var(--fw-semibold); }
+body.ke .band-meta .events { font-size: var(--fs-meta); line-height: 1.6; color: var(--meta); margin: 0; }
+body.ke .band-meta .events:empty { display: none; }
+body.ke .band-meta .events .bad { color: var(--accent); }
+/* N5 the hero weather: one small instrument under the wrap line. Left, the sky: glyph, the temperature, the condition under it and
+   the feels / high / low column; right of a hairline, the banded readings (air, pollen) as a table: name, a tabular figure, the band in
+   words, each source line under its row; along the foot, how old the read is and the re-read key. Lit like the page's other keys
+   (the top edge catches the light). With no banded reading the right half is simply not there; the instrument closes around the sky. */
+body.ke .band-meta .wx { margin-top: var(--sp-4); padding: var(--sp-4) var(--sp-5) var(--sp-3); display: grid; grid-template-columns: auto auto; grid-template-areas: "main air" "foot foot";
+  column-gap: var(--sp-6); row-gap: var(--sp-3); align-items: center; min-width: 0; text-align: left; color: var(--label);
+  background: linear-gradient(to bottom, color-mix(in oklch, var(--card), var(--contrast) 2%), var(--card)); border: 1px solid var(--hair); border-radius: var(--r-lg); box-shadow: var(--edge-hi); }
+body.ke .band-meta .wx .xbody { display: contents; }
+body.ke .band-meta:has(.wx-air) { max-width: 600px; }   /* room for the readings table beside the sky, so a pill never meets the edge */
+body.ke .band-meta .wx:not(:has(.wx-air)) { grid-template-columns: auto; grid-template-areas: "main" "foot"; }
+body.ke .band-meta .wx .wx-main { grid-area: main; gap: var(--sp-4); }
+body.ke .band-meta .wx .wx-air { grid-area: air; align-self: stretch; padding-left: var(--sp-6); border-left: 1px solid var(--hair); }
+body.ke .band-meta .wx .wx-age { grid-area: foot; justify-self: start; align-self: end; margin: 0; padding-top: var(--sp-3); }
+/* the foot's hairline is the instrument's own line across its full width; the read age sits under it at the left, the re-read key at the right */
+body.ke .band-meta .wx::before { content: ""; grid-area: foot; align-self: start; height: 1px; background: var(--hair); }
+/* the last wrap sits in the card's foot, between the read age and the re-read key, as one quiet line */
+body.ke .band-meta .wx .wx-wrap { grid-area: foot; justify-self: center; align-self: end; display: flex; gap: var(--sp-3); padding-top: var(--sp-3); font-size: var(--fs-micro); color: var(--meta); white-space: nowrap; }
+body.ke .band-meta .wx .wx-wrap > div + div::before { content: "\00b7"; margin-right: var(--sp-3); }
+body.ke .band-meta .wx-refresh { grid-area: foot; justify-self: end; align-self: end; margin: var(--sp-3) 0 0; padding: 0; width: var(--ctl-row); height: var(--ctl-row);
+  display: grid; place-items: center; border-radius: var(--r-sm); background: var(--key-bg); border: 0; box-shadow: var(--edge-hi), var(--lift); font-size: var(--fs-meta); }
+body.ke .band-meta .wx-refresh:hover { color: var(--text); }
+body.ke .band-meta .wx-refresh:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; }
+body.ke .band-meta .wx .wx-side { margin-left: var(--sp-2); text-align: left; }
+/* narrow: the readings stack under the sky, divided by a hairline across instead of down */
+@media (max-width: 560px) {
+  body.ke .band-meta .wx { grid-template-columns: minmax(0, 1fr); grid-template-areas: "main" "air" "foot"; width: 100%; box-sizing: border-box; }
+  body.ke .band-meta .wx .wx-air { padding: var(--sp-3) 0 0; border-left: 0; border-top: 1px solid var(--hair); }
+}
+body.ke .band-meta .wx .wx-t .rd-n, body.ke .band-meta .wx b { color: var(--text); }
 .wx-main { display: flex; align-items: center; gap: var(--sp-4); flex-wrap: nowrap; }
 .wx-icon { flex: none; }
 .wx-t { display: flex; align-items: baseline; gap: var(--sp-2); }
@@ -1072,6 +1177,15 @@ body.ke .hero .wx .xbody { display: flex; flex-direction: column; gap: var(--sp-
 .wx-side b { color: var(--text); font-weight: var(--fw-semibold); }
 .wx-side > * { overflow: hidden; text-overflow: ellipsis; }
 .wx-side .rd-sub, .wx-side .rd-b { display: block; margin: 0; padding: 0; border: 0; font-size: var(--fs-meta); color: var(--label); }
+/* the banded readings' table: glyph | name | figure (right-aligned, tabular) | band pill; a source line spans name..pill under its row */
+.wx-air { display: grid; grid-template-columns: auto auto auto 1fr; column-gap: var(--sp-3); row-gap: var(--sp-1); align-content: center; align-items: center; justify-content: start; }
+.wx-air > .aqi { display: contents; }
+.wx-air > .aqi > svg { grid-column: 1; }
+.wx-air .aqi-l { grid-column: 2; font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); }
+.wx-air .aqi-v { grid-column: 3; justify-self: end; min-width: 2ch; text-align: right; font: var(--fw-bold) var(--fs-lead)/1 var(--round); color: var(--text); font-variant-numeric: tabular-nums lining-nums; }
+.wx-air .aqi .pill { grid-column: 4; justify-self: start; }
+.wx-air > .aqi-d { grid-column: 2 / -1; margin: 0 0 var(--sp-2); max-width: none; white-space: normal; }   /* the source line reads whole: it wraps inside the readings column, never cut */
+.wx-air > .aqi-d:last-child { margin-bottom: 0; }
 .aqi { display: flex; align-items: center; gap: var(--sp-3); font-size: var(--fs-body); flex-wrap: wrap; }
 .aqi b { font-weight: var(--fw-semibold); }
 .aqi .pill { margin-left: 0; }
@@ -1087,62 +1201,100 @@ body.ke .hero .wx .xbody { display: flex; flex-direction: column; gap: var(--sp-
 .aqi .pill { background: color-mix(in srgb, currentColor 15%, transparent); color: inherit; }
 .aqi.band-other .pill { background: var(--card-2); color: var(--label); }
 
-body.ke .hero .skycol { min-width: 0; display: flex; flex-direction: column; }
-body.ke .hero .tools { display: flex; align-items: center; padding: var(--sp-5) var(--gutter) var(--sp-4) var(--sp-6); }
-/* ONE control row at --ctl-md: the mode segment, the status cluster (sans, tabular numerals), then Sync / Ambient / Jump.
-   Nothing wraps alone; on a narrow screen the cluster drops under the segment as a whole (see the 720px rule). */
-body.ke .hero .masthead { flex: 1; min-width: 0; padding: 0; border: 0; gap: var(--sp-3); flex-wrap: nowrap; align-items: center; }
-body.ke .hero .masthead.frame { padding-inline: 0; }
-body.ke .hero .seg { height: var(--ctl-md); padding: var(--sp-1); border-radius: var(--r-md); align-items: stretch; flex: none; }
-body.ke .hero .mode { display: inline-flex; align-items: center; padding: 0 var(--sp-3); font-size: var(--fs-meta); font-weight: var(--fw-medium); border-radius: var(--r-sm); white-space: nowrap; }
-body.ke .hero .readout { gap: var(--sp-3); flex: 1; justify-content: flex-end; flex-wrap: nowrap; min-width: 0; font-variant-numeric: tabular-nums; }
-body.ke .hero .unit { gap: 0; flex: 0 1 auto; }
-body.ke .hero .unit-label { display: none; }
-body.ke .hero .entity { font: var(--fw-medium) var(--fs-meta) var(--sans); color: var(--label); max-width: 12ch; }
-body.ke .hero .jar { gap: var(--sp-3); font: var(--fw-regular) var(--fs-meta) var(--sans); white-space: nowrap; min-width: 0; }
-body.ke .hero .jar svg { width: 16px; height: 20px; flex: none; }
-body.ke .hero .jar-label { font-size: var(--fs-meta); overflow: hidden; text-overflow: ellipsis; }
-body.ke .hero .indicators { flex-wrap: nowrap; gap: var(--sp-3); flex: none; }
-body.ke .hero .stamp, body.ke .hero .livechip { font: var(--fw-regular) var(--fs-meta) var(--sans); font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--label); }
-body.ke .hero .indicators button { height: var(--ctl-md); padding: 0 var(--sp-4); display: inline-flex; align-items: center; gap: var(--sp-2); border-radius: var(--r-md); font: var(--fw-medium) var(--fs-meta) var(--sans); white-space: nowrap; flex: none; }
-body.ke .hero .indicators button#refresh { font-family: var(--sans); }
-body.ke .hero .tools { container-type: inline-size; }
-/* where the strip cannot hold one row (a phone, a half-width window), the SAME controls regroup by role: the segment on its own
-   line, the three buttons together under it, the status cluster last. Nothing is left alone on a line it does not share. */
-@container (max-width: 880px) {
-  body.ke .hero .masthead { flex-wrap: wrap; row-gap: var(--sp-3); }
-  body.ke .hero .readout, body.ke .hero .indicators, body.ke .hero .unit { display: contents; }
-  body.ke .hero .seg { order: 1; flex: 1 1 100%; }
-  body.ke .hero .seg .mode { flex: 1 1 0; justify-content: center; }
-  body.ke .hero .indicators button { order: 2; }
-  body.ke .hero .jar, body.ke .hero .livechip, body.ke .hero .stamp { order: 3; }
-  body.ke .hero .entity { display: none; }   /* the clock column already names the unit */
-  body.ke .hero .jar { flex: 0 1 auto; }
-}
-body.ke .hero .sky-toggle[aria-pressed="true"] { background: var(--card-2); color: var(--text); }
-#ck-sky { padding: 0 var(--gutter) 0 var(--sp-6); min-width: 0; }
-body.ke .hero .ck-sky { min-width: 0; }
-body.ke .hero .sky-hero { display: block; border: 0; }
-body.ke .hero .sky-hero .plot { padding: 0; min-height: 200px; }
-body.ke .hero .ck-sky .xbody { padding: 0; }
+/* THE BAR (F6): brand, the four tabs, the status cluster, Sync / Jump, the theme switch. ONE control row at --ctl-md. */
+body.ke .masthead { padding-block: 0; min-height: 60px; gap: var(--sp-6); flex-wrap: nowrap; align-items: center; }
+body.ke .masthead .seg { height: var(--seg-h); box-sizing: border-box; padding: 3px; border-radius: var(--r-md); align-items: stretch; flex: none; }
+body.ke .masthead .mode { display: inline-flex; align-items: center; gap: var(--sp-3); padding: 0 var(--sp-4); font-size: var(--fs-body); font-weight: var(--fw-semibold); border-radius: var(--r-sm); white-space: nowrap; }
+/* the page's switches (tabs, theme, the lens switch) are one material: a recessed track, the chosen key raised and lit */
+body.ke .masthead .seg, body.ke .themesw { background: var(--track-bg); border-color: var(--hair); box-shadow: var(--recess); }
+body.ke .masthead .mode[aria-selected="true"], body.ke .themesw button[aria-pressed="true"] { background: var(--key-bg); color: var(--text); box-shadow: var(--edge-hi), var(--key-ring), var(--lift); }
+/* one control height across the bar: the tab track, the theme track and the Sync / Jump keys share --seg-h with the lens switch */
+body.ke .masthead .themesw { height: var(--seg-h); box-sizing: border-box; padding: 3px; align-items: stretch; }
+body.ke .masthead .themesw button { height: auto; }
+body.ke .masthead .mode:not([aria-selected="true"]):hover { color: var(--text); }
+body.ke .masthead .readout { gap: var(--sp-4); flex: 1; justify-content: flex-end; flex-wrap: nowrap; min-width: 0; font-variant-numeric: tabular-nums; }
+body.ke .masthead .unit { gap: 0; flex: 0 1 auto; }
+body.ke .masthead .unit-label { display: none; }
+body.ke .masthead .entity { font: var(--fw-bold) var(--fs-lead) var(--round); color: var(--text); max-width: 14ch; }
+body.ke .masthead .jar { gap: var(--sp-3); font: var(--fw-regular) var(--fs-meta) var(--sans); white-space: nowrap; min-width: 0; }
+body.ke .masthead .jar svg { width: 16px; height: 20px; flex: none; }
+body.ke .masthead .jar-label { font-size: var(--fs-meta); overflow: hidden; text-overflow: ellipsis; }
+body.ke .masthead .indicators { flex-wrap: nowrap; gap: var(--sp-3); flex: none; display: flex; align-items: center; }
+body.ke .masthead .stamp, body.ke .masthead .livechip { font: var(--fw-regular) var(--fs-meta) var(--sans); font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--label); }
+body.ke .masthead .indicators button { height: var(--seg-h); padding: 0 var(--sp-4); display: inline-flex; align-items: center; gap: var(--sp-2); border-radius: var(--r-md); font: var(--fw-medium) var(--fs-meta) var(--sans); white-space: nowrap; flex: none; }
+.themesw { display: flex; flex: none; border: 1px solid var(--hair); border-radius: var(--r-md); padding: var(--sp-1); background: var(--card); gap: var(--sp-1); }
+.themesw button { border: 0; background: none; width: 28px; height: 24px; border-radius: var(--r-sm); color: var(--label); cursor: pointer; display: grid; place-items: center; font-size: var(--fs-body); line-height: 1; padding: 0; }
+.themesw button:hover { color: var(--text); }
+.themesw button[aria-pressed="true"] { background: var(--card-2); color: var(--text); }
+body.ke .sky-toggle[aria-pressed="true"] { background: var(--card-2); color: var(--text); }
+/* the sky: a card under the band, its key as the card's footer (the sky's own bar and plot are sky.js's) */
+body.ke .skycol { padding-bottom: var(--sp-2); }
+body.ke .skycard { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); min-width: 0; overflow: hidden; }
+body.ke .skycard:not(:has(#ck-sky > *)):not(:has(#ck-hlens > *)) { display: none; }
+#ck-sky { padding: 0 var(--sp-6); min-width: 0; }
+body.ke .ck-sky { min-width: 0; }
+body.ke .sky-hero { display: block; border: 0; }
+body.ke .sky-hero .plot { padding: 0; min-height: 200px; }
+body.ke .ck-sky .xbody { padding: 0; }
+body.ke .skycard .ck-legend { border-top: 1px solid var(--hair); }
+/* the Build tab's strip is the compact band the mock draws: its key is not part of it */
+body.ke[data-mode="build"] .skycard .ck-legend { display: none; }
+body.ke[data-mode="build"] #ck-sky { padding: 0 var(--sp-6) var(--sp-3); }
+body.ke[data-mode="build"] .sky-hero .plot { min-height: 0; }
+body.ke .skycard .ck-legend .legendbar { padding: var(--sp-3) var(--sp-6); }
+/* the header lens (the Activity slot): [Agents graph | Event graph | Work]. The Event graph is the sky as it was; the other two are the topology renderer
+   drawn into #ck-hlens, whose bar carries the switch. The sky and its key are not shown while a topology lens is (their mounts stay, so a repaint is not lost). */
+.ck-hlens { min-width: 0; }
+.ck-hlens .tv { padding-top: var(--sp-5); }
+.ck-hlens .hl-bar { padding: var(--sp-5) var(--sp-6) var(--sp-2); margin: 0; }
+.ck-hlens > .k7-none { padding: var(--sp-4) var(--sp-6) var(--sp-5); margin: 0; }
+body.ke .skycard[data-hlens="agents"] #ck-sky, body.ke .skycard[data-hlens="work"] #ck-sky,
+body.ke .skycard[data-hlens="agents"] .ck-legend, body.ke .skycard[data-hlens="work"] .ck-legend { display: none; }
+/* a tab with no sky (Memory) or no band content draws no hole */
+body.ke[data-mode="memory"] .skycol { display: none; }
 
-/* BRIEF: his state line and where to begin, one wide card */
-body.ke .ck-brief { padding-top: var(--sp-6); }
+/* BRIEF: where to begin, one wide card */
+body.ke .ck-brief { margin-top: var(--sp-4); }
 body.ke .ck-briefcard, body.ke .ck-card { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); min-width: 0; position: relative; }
 body.ke .ck-briefcard { padding: var(--sp-6); }
-body.ke .ck-briefcard .stateline { padding: 0; margin: 0; }
-body.ke .ck-briefcard .stateline.frame { padding-inline: 0; }
 .ck-brief-body { margin-top: var(--sp-5); }
 .ck-brief-body .brief-line:first-child { margin-top: 0; }
-.ck-brief-body .xbody.has-side { display: grid; grid-template-columns: minmax(0, 1fr) 300px; column-gap: var(--sp-7); }
+.ck-brief-body .xbody.has-side { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 360px); column-gap: var(--sp-7); }
 .ck-brief-body .xbody.has-side .brief-line { grid-column: 1; }
 .brief-side { grid-column: 2; grid-row: 1 / span 6; border-left: 1px solid var(--hair); padding-left: var(--sp-6); display: flex; flex-direction: column; gap: var(--sp-3); align-self: start; }
 .brief-side .side-line { margin: 0; font-size: var(--fs-body); line-height: var(--lh-list); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
 
+/* Where to begin as a card with a head: the lead and what follows it on the left, the Threads column on the right */
+body.ke .ck-briefcard:has(.brief-card) { padding-top: var(--sp-5); }
+body.ke .ck-briefcard .ck-brief-body:has(.brief-card) { margin-top: 0; }
+.brief-card .brief-head { display: flex; align-items: center; gap: var(--sp-4); margin-bottom: var(--sp-5); }
+.brief-card .brief-head h3 { margin: 0; font: var(--fw-bold) var(--fs-title)/1.2 var(--round); letter-spacing: var(--track-tight); }
+.brief-card .brief-head .sp { flex: 1; }
+.brief-card .brief-head .stamp { color: var(--meta); font-size: var(--fs-micro); }
+.brief-card .brief-cols { display: grid; grid-template-columns: minmax(0, 1fr); column-gap: var(--sp-7); align-items: start; }
+.brief-card .brief-threads .brief-src { margin: calc(-1 * var(--sp-2)) 0 var(--sp-3); color: var(--meta); font-size: var(--fs-micro); }
+.brief-card .brief-cols.has-threads { grid-template-columns: minmax(0, 1fr) minmax(280px, 360px); }
+.brief-card .lead-first { margin: 0; font: var(--fw-bold) 17px/1.4 var(--round); letter-spacing: var(--track-tight); overflow-wrap: anywhere; }
+.brief-card .lead-then { margin: var(--sp-3) 0 0; font-size: var(--fs-body); line-height: var(--lh-list); color: var(--label); }
+.brief-card .lead-then .k { margin-right: var(--sp-2); }
+.brief-card .lead-more { margin-top: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); }
+.brief-card .lead-item { margin: 0; font-size: var(--fs-meta); line-height: var(--lh-list); color: var(--meta); }
+.brief-card .lead-item .k { margin-right: var(--sp-2); }
+.brief-card .brief-overnight { margin-top: var(--sp-4); display: flex; gap: var(--sp-4); align-items: baseline; flex-wrap: wrap; font-size: var(--fs-meta); color: var(--meta); }
+.brief-card .brief-overnight .mono { font-family: var(--mono); font-size: var(--fs-micro); color: var(--label); }
+.brief-card .brief-threads .k { margin-bottom: var(--sp-3); }
+/* F3 one rail: the levain column carries the same divider and inset as the flow brief's side column above it, so both right
+   columns start their text on one x and read as one rail down the card */
+@media (min-width: 721px) { .brief-card .brief-cols.has-threads > .brief-threads { border-left: 1px solid var(--hair); padding-left: var(--sp-6); } }
+.brief-card .thread { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-2) 0; }
+.brief-card .thread .t { flex: 1; min-width: 0; font-size: var(--fs-body); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.brief-card .thread .pill { flex: none; color: var(--meta); font: var(--fw-regular) var(--fs-micro) var(--mono); }
+.brief-card .thread .rp-tag { flex: none; margin-right: 0; }
+@media (max-width: 720px) { .brief-card .brief-head .stamp { display: none; } .brief-card .brief-cols.has-threads { grid-template-columns: minmax(0, 1fr); row-gap: var(--sp-5); } }
+
 /* WIDGETS: one answer each, equal widths in one row */
-body.ke .ck-widgets { display: grid; grid-template-columns: repeat(var(--ck-n, 4), minmax(0, 1fr)); gap: var(--gap); padding-top: var(--sp-7); }
 body.ke .ck-widgets[hidden] { display: none; }
-body.ke .ck-card.w { height: var(--widget-h); padding: var(--sp-5) var(--sp-6); display: flex; flex-direction: column; gap: var(--sp-2); overflow: hidden; }
+body.ke .ck-card.w { height: auto; min-height: 0; padding: var(--sp-5) var(--sp-6); display: flex; flex-direction: column; gap: var(--sp-2); overflow: hidden; }
 .w > .k { flex: none; }
 .w .wbody { min-height: 0; display: flex; flex-direction: column; gap: var(--sp-2); overflow: hidden; }
 .w .xbody { display: flex; flex-direction: column; gap: var(--sp-2); }
@@ -1181,8 +1333,7 @@ body.ke .ck-card.w.w-open:focus-visible { outline: 1px solid var(--line-hot); ou
 
 /* ZONES: a fixed 3-column grid, a row as tall as its tallest card, spans as grid-column spans */
 body.ke #board.ke { display: block; padding-block: 0; }
-body.ke main.frame { padding-block: var(--sp-5) var(--sp-8); }
-body.ke .ck-zone { margin-top: var(--sp-7); }
+body.ke main.frame { padding-block: 0 var(--sp-6); }
 .legendbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-5); }
 .legendbar .lg { display: inline-flex; align-items: center; gap: var(--sp-3); }
 .legendbar .lg-sp { flex: 1; }
@@ -1192,36 +1343,34 @@ body.ke .ck-zone { margin-top: var(--sp-7); }
 .lg-g .lg-ring.lg-bad { stroke: var(--accent); stroke-width: 2; }
 .lg-g .lg-mem { fill: var(--meta); }
 /* the sky's key: a full-width band under the hero (mock-e), aligned to the page gutter */
-body.ke .ck-legend { border-bottom: 1px solid var(--hair); }
-body.ke .ck-legend .legendbar { padding: var(--sp-4) var(--gutter); font-size: var(--fs-meta); color: var(--label); }
-body.ke .hero .ck-sky .legendbar { padding-block: var(--sp-4); font-size: var(--fs-meta); color: var(--label); }   /* a page without the mount keeps it here */
-body.ke .ck-secthead { display: flex; align-items: baseline; gap: var(--sp-4); padding-top: var(--sp-7); }
+body.ke .ck-legend .legendbar { font-size: var(--fs-meta); color: var(--label); }
+body.ke .ck-secthead { display: flex; align-items: baseline; gap: var(--sp-4); margin-top: var(--sec); }
 body.ke .ck-secthead[hidden] { display: none; }
 /* a mode that hides every card in a region hides its header too (the cards' own mode rule is near the top) */
 body.ke[data-mode="morning"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="morning"]))),
-body.ke[data-mode="build"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="build"]))) { display: none; }
-body.ke .ck-secthead h3 { margin: 0; font: var(--fw-bold) var(--fs-body) var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); }
+body.ke[data-mode="board"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="board"]))),
+body.ke[data-mode="build"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="build"]))),
+body.ke[data-mode="memory"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="memory"]))) { display: none; }
+body.ke .ck-secthead h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); letter-spacing: -.02em; color: var(--text); }
 body.ke .ck-secthead span { font-size: var(--fs-meta); color: var(--meta); }
-body.ke .ck-brief { padding-top: var(--sp-6); }
-body.ke .ck-secthead + .ck-brief, body.ke .ck-secthead + .ck-widgets { padding-top: var(--sp-4); }
+body.ke .ck-secthead + .ck-brief, body.ke .ck-secthead + .ck-widgets { margin-top: var(--sp-4); }
+/* the strip stands clear of the Needs-you cards above it, not 12px off their ring */
+body.ke .ck-needs ~ .ck-widgets { margin-top: var(--sp-6); }
 /* The mode filter for the KE page. The page-wide rule near the top loses to KE card rules that set display (a widget card
    is display:flex); this one carries body.ke so a Morning/Build mode hides a card the manifest did not give that mode. */
 body.ke[data-mode="morning"] [data-modes]:not([data-modes~="morning"]),
-body.ke[data-mode="build"] [data-modes]:not([data-modes~="build"]) { display: none; }
+body.ke[data-mode="board"] [data-modes]:not([data-modes~="board"]),
+body.ke[data-mode="build"] [data-modes]:not([data-modes~="build"]),
+body.ke[data-mode="memory"] [data-modes]:not([data-modes~="memory"]) { display: none; }
 body.ke .zone-head { display: flex; align-items: baseline; gap: var(--sp-4); margin: 0 0 var(--sp-4); }
 body.ke .zone-head .zone-title { margin: 0; }
 body.ke .zone-gloss { font-size: var(--fs-meta); color: var(--meta); }
-body.ke .zone-title { font: var(--fw-bold) var(--fs-body) var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); margin: 0 0 var(--sp-4); }
-body.ke .ck-zgrid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: var(--gap); align-items: stretch; }
-body.ke .ck-zgrid > .panel { grid-column: span 2; min-width: 0; overflow: hidden; border-radius: var(--r-lg); }
-body.ke .ck-zgrid > .panel.ck-span-2 { grid-column: span 4; }
-body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: span 6; }
-body.ke .ck-zgrid > .panel.ck-h-tall { height: var(--card-tall); }
-body.ke .ck-zgrid > .panel.ck-h-medium { height: var(--card-medium); }
-body.ke .ck-zgrid > .panel.ck-h-short { height: var(--card-short); }
-body.ke .ck-zgrid > .panel.ck-tab-off { display: none; }
-body.ke .ck-zgrid > .panel.ck-is-empty { height: auto; align-self: start; }
-body.ke .ck-zgrid > .panel.k-brief.ck-h-medium { height: auto; max-height: var(--card-medium); }   /* a prose card sizes to its text; only a long one reaches the medium height and scrolls */
+body.ke .zone-title { font: var(--fw-bold) var(--fs-h)/1.2 var(--round); letter-spacing: -.02em; color: var(--text); margin: 0; }
+body.ke .ck-zgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--gap); align-items: start; }
+body.ke .ck-zgrid .panel { min-width: 0; overflow: hidden; border-radius: var(--r-lg); }
+body.ke .ck-zgrid .panel.ck-tab-off { display: none; }
+body.ke .ck-zgrid .panel.ck-is-empty { height: auto; align-self: start; }
+body.ke .ck-zgrid .panel.k-brief.ck-h-medium { height: auto; max-height: var(--card-medium); }   /* a prose card sizes to its text; only a long one reaches the medium height and scrolls */
 /* the Team zone: panes hold a few short rows, so each card sizes to its rows (its size class is the cap, then it scrolls),
    and rows align to their top (no dense packing: the visual order stays the DOM and focus order) */
 /* (desktop widths only: one column already sizes every card to its content, under the phone's own cap below) */
@@ -1233,7 +1382,7 @@ body.ke .ck-zgrid > .panel.k-brief.ck-h-medium { height: auto; max-height: var(-
 }
 .clause .nowrap { white-space: nowrap; }
 body.ke .ck-zgrid .panel .phead { padding: var(--sp-5) var(--sp-6) var(--sp-4); flex: none; }
-body.ke .ck-zgrid .panel h2 { font: var(--fw-bold) var(--fs-title)/1 var(--round); }
+body.ke .ck-zgrid .panel h2 { font: var(--fw-bold) var(--fs-lead)/1.2 var(--round); }
 body.ke .ck-zgrid .panel .pbody { flex: 1; min-height: 0; max-height: none; overflow-y: auto; overflow-x: hidden; overscroll-behavior: auto; padding: 0 var(--sp-6) var(--sp-5); }
 body.ke .ck-zgrid .panel .pbody.clamped { max-height: none; overscroll-behavior: auto; }
 body.ke .ck-zgrid .panel > .xbody, body.ke .ck-zgrid .panel > .ext-note, body.ke .ck-zgrid .panel > .xfilter { margin-inline: var(--sp-6); }
@@ -1252,21 +1401,17 @@ body.ke .ck-zgrid .panel > .xbody { flex: 1; min-height: 0; overflow: auto; padd
 .ck-tab[aria-selected="true"] { background: var(--card-2); color: var(--text); }
 @media (max-width: 1180px) {
   body.ke { --gutter-ke: 32px; }
-  body.ke .hero { grid-template-columns: 1fr; }
-  body.ke .hero .when { border-right: 0; padding-left: var(--gutter); }
-  body.ke .ck-widgets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  body.ke .ck-zgrid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-  body.ke .ck-zgrid > .panel.ck-span-2, body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: span 4; }
+  body.ke .band { grid-template-columns: auto minmax(0, 1fr); }
+  body.ke .band-meta { grid-column: 1 / -1; align-items: flex-start; text-align: left; flex-direction: row; gap: var(--sp-5); flex-wrap: wrap; }
 }
 @media (max-width: 720px) {
   body.ke { --gutter-ke: 16px; }
-  body.ke .ck-widgets, body.ke .ck-zgrid { grid-template-columns: 1fr; }
-  body.ke .ck-zgrid > .panel, body.ke .ck-zgrid > .panel.ck-span-2, body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: auto; }
-  body.ke .ck-zgrid > .panel, body.ke .ck-zgrid > .panel.ck-h-tall, body.ke .ck-zgrid > .panel.ck-h-medium, body.ke .ck-zgrid > .panel.ck-h-short { height: auto; max-height: 560px; }   /* the desktop heights are for a grid row; one column sizes to its content */
-  body.ke .ck-card.w { height: auto; min-height: var(--widget-h); }
+  body.ke .ck-zgrid { grid-template-columns: 1fr; }
+  body.ke .ck-zgrid .panel, body.ke .ck-zgrid .panel.ck-h-tall, body.ke .ck-zgrid .panel.ck-h-medium, body.ke .ck-zgrid .panel.ck-h-short { height: auto; max-height: 560px; }   /* the desktop heights are for a grid row; one column sizes to its content */
   body.ke .panel .phead .src.fresh { display: none; }   /* "read 0s ago" pushed the expand control onto a line of its own at this width */
   body.ke .ck-brief-body .xbody.has-side { display: block; }
   .brief-side { border-left: 0; padding-left: 0; margin-top: var(--sp-6); }
+  .brief-side .xnote { margin-bottom: var(--sp-5); }
 }
 
 /* THE ORANGE BUDGET (KE page). Accent only where attention goes: the now-line, a failed review, "N failed", an overdue tag,
@@ -1331,6 +1476,15 @@ body.ke .panel:hover .phead .pexpand, body.ke .panel:focus-within .phead .pexpan
 @media (hover: none) { body.ke .panel .phead .pexpand { opacity: 1; } }
 /* the edit class (A / B / C) and a panel's source id ("section:state") are the kernel's bookkeeping, not something a person reads */
 body.ke .panel .phead .chip, body.ke .modal .chip, body.ke .panel .phead .src:not(.fresh) { display: none; }
+/* the freshness stamp rides right beside the always-visible fold chevron; the controls that only show on hover sit to ITS left, so the stamp
+   never floats mid-header and never moves when they appear. One spacer takes the free width (a single margin:auto, not two). */
+body.ke .panel .phead:has(> .src.fresh)::after { content: ""; flex: 1 1 0; min-width: 0; }
+body.ke .panel .phead:has(> .src.fresh) > .ck-lay { display: contents; }
+body.ke .panel .phead:has(> .src.fresh) > .pexpand { order: 1; margin-left: 0; }
+body.ke .panel .phead:has(> .src.fresh) .ck-lay-up { order: 2; margin-left: calc(var(--sp-1) - var(--sp-3)); }
+body.ke .panel .phead:has(> .src.fresh) .ck-lay-down { order: 3; margin-left: calc(var(--sp-1) - var(--sp-3)); }
+body.ke .panel .phead:has(> .src.fresh) > .src.fresh { order: 4; margin-left: 0; }
+body.ke .panel .phead:has(> .src.fresh) .ck-lay-fold { order: 5; margin-left: calc(var(--sp-1) - var(--sp-3)); }
 body.ke .row:focus-visible { outline: 1px solid var(--hair-2); outline-offset: -1px; border-radius: var(--r-md); }
 body.ke .undo-btn {
   font: var(--fw-medium) var(--fs-meta)/var(--lh-list) var(--sans); letter-spacing: 0; text-transform: none; color: var(--label); background: none;
@@ -1344,6 +1498,9 @@ body.ke .undo-btn::before { content: none; }
 body.ke .undo-btn:hover { color: var(--text); background: none; border-color: var(--label); }
 body.ke .verb-btn:hover { color: var(--text); background: var(--card-2); }
 body.ke .verb-btn:focus-visible, body.ke .undo-btn:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
+body.ke [data-ck-panel="tray"] .row:not(.row-expanded) .clause.clampable { -webkit-line-clamp: 1; line-clamp: 1; }
+@media (max-width: 720px) { body.ke [data-ck-panel="tray"] .row:not(.row-expanded) .clause.clampable { -webkit-line-clamp: 2; line-clamp: 2; } }
+body.ke .row:has(> .clause.clampable) > [data-ck-tag] { justify-self: start; }
 body.ke [data-ck-tag] { color: var(--meta); font: var(--fw-medium) var(--fs-micro)/var(--lh-list) var(--sans); letter-spacing: 0; text-transform: none;
   background: none; border: 0; padding: 0; border-radius: 0; opacity: 1; }
 body.ke [data-ck-tag][data-ck-tag-state="overdue"] { color: var(--accent); }
@@ -1367,8 +1524,8 @@ body.ke .tray-dump-ta { background: none; border: 0; border-radius: 0; padding: 
 body.ke .tray-dump-ta:focus { border: 0; outline: 1px solid var(--hair-2); outline-offset: 4px; border-radius: var(--r-sm); }
 body.ke .tray-dump-ta::placeholder { color: var(--meta); }
 body.ke .tray-dump-controls { gap: var(--sp-3); }
-body.ke .tray-dump-btn { margin-left: auto; font: var(--fw-semibold) var(--fs-meta) var(--sans); letter-spacing: 0; text-transform: none; color: var(--on-accent); background: var(--accent);
-  border: 0; border-radius: var(--r-md); padding: var(--sp-2) var(--sp-4); }
+body.ke .tray-dump-btn { margin-left: auto; font: var(--fw-semibold) var(--fs-meta) var(--sans); letter-spacing: 0; text-transform: none; color: var(--text); background: var(--key-bg);   /* the accent is for what waits on him; a drop key is a plain key */
+  border: 0; border-radius: var(--r-md); padding: var(--sp-2) var(--sp-4); box-shadow: var(--edge-hi), var(--key-ring), var(--lift); }
 body.ke .tray-dump-btn:hover { filter: brightness(1.08); }
 .ck-to { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; font-size: var(--fs-meta); color: var(--meta); }
 .ck-to-hint { margin-left: var(--sp-2); }
@@ -1392,45 +1549,64 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
 
 /* ═══════════════════════════ PASS 2 (10-14 ~19:2x): the phone's header, and the known gaps ═══════════════════════════ */
 
-/* PHONE HEADER (<=720px). The nav comes FIRST: the mode segment spans the width, the three buttons are one centred row under it, the
-   status line under that; then the clock and the weather; then the sky, full-bleed. The strip's own container query already
-   regroups the controls by role (the segment on its own line, the buttons together, the status last); this puts the strip first
-   and centres it. The numerals on the mode buttons and the shortcut hint on Jump are keyboard cues: a phone has no keyboard. */
+/* THE BAR ON A NARROW SCREEN. Two rows: the brand with the status dot, Sync and the theme switch; then the four tabs across the width.
+   Under 960px the read-time line and the jar sit on a third row; under 480px they go (the live dot stays), Jump becomes its icon and
+   the keyboard cues go: a phone has no keyboard. Then the band stacked (clock, date, the state line, the wrap line). */
+@media (max-width: 960px) {
+  body.ke .masthead { flex-wrap: wrap; row-gap: var(--sp-3); column-gap: var(--sp-3); padding-block: var(--sp-4); }
+  body.ke .masthead .brand { order: 0; margin-right: auto; }
+  body.ke .masthead .seg { order: 2; flex: 1 1 100%; }
+  body.ke .masthead .seg .mode { flex: 1 1 0; justify-content: center; }
+  body.ke .masthead .readout, body.ke .masthead .indicators, body.ke .masthead .unit { display: contents; }
+  body.ke .masthead .indicators button, body.ke .masthead .themesw, body.ke .masthead .livechip { order: 1; }
+  body.ke .masthead .jar, body.ke .masthead .stamp { order: 3; }
+  body.ke .masthead .entity { display: none; }
+}
 @media (max-width: 720px) {
-  body.ke .hero { display: flex; flex-direction: column; }
-  body.ke .hero .skycol { display: contents; }
-  body.ke .hero .tools { order: -2; padding: var(--sp-4) var(--gutter); border-bottom: 1px solid var(--hair); }
-  body.ke .hero .when { order: -1; padding: var(--sp-6) var(--gutter); border-right: 0; border-bottom: 1px solid var(--hair); }
-  body.ke #ck-sky { order: 0; padding: 0; }
-  body.ke .hero .masthead { justify-content: center; text-align: center; }
-  body.ke .hero .mode kbd, body.ke .hero #jumpbtn kbd { display: none; }
-  /* the status cluster is always its own line under the buttons, however short it is: a zero-height full-width item sits between */
-  body.ke .hero .masthead::after { content: ""; flex: 1 1 100%; order: 3; height: 0; margin-top: calc(var(--sp-3) * -1); }
-  /* the nav is the first thing on a phone, so its controls are touch-sized */
-  body.ke .hero .seg { height: auto; min-height: var(--hit-min); }
-  body.ke .hero .mode { min-height: calc(var(--hit-min) - var(--sp-1) * 2); }
-  body.ke .hero .indicators button { height: var(--hit-min); }
-  body.ke .hero .jar, body.ke .hero .livechip, body.ke .hero .stamp { order: 4; justify-content: center; }
-  /* the sky is full-bleed: the plot runs edge to edge, the summary line keeps the page gutter */
+  body.ke .band { grid-template-columns: 1fr; gap: var(--sp-4); }
+  body.ke .band-state { padding-left: 0; border-left: 0; }
+  body.ke .band-meta { text-align: left; align-items: flex-start; max-width: none; }
+  body.ke .masthead .mode kbd, body.ke .masthead #jumpbtn kbd { display: none; }
+  body.ke .masthead .seg { height: auto; min-height: var(--hit-min); }
+  body.ke .masthead .mode { min-height: calc(var(--hit-min) - var(--sp-1) * 2); }
+  body.ke .masthead .indicators button { height: var(--hit-min); }
+  body.ke .masthead .themesw button { width: var(--hit-min); height: calc(var(--hit-min) - var(--sp-2) * 2); }
+  body.ke .skycol { padding-inline: 0; }
+  body.ke .skycard { border-radius: 0; border-inline: 0; }
+  body.ke #ck-sky { padding: 0; }
   body.ke .hero .sky-bar { padding: var(--sp-4) var(--gutter) var(--sp-3); }
+}
+@media (max-width: 480px) {
+  body.ke .masthead .jar, body.ke .masthead .stamp, body.ke .masthead .indicators button.sky-toggle { display: none; }   /* the sky's own toggle (a provider adds it) is a desk control */
+  body.ke .masthead .livechip { font-size: 0; gap: 0; }
+  body.ke .masthead #jumpbtn { font-size: 0; width: var(--hit-min); padding: 0; justify-content: center; }
+  body.ke .masthead #jumpbtn::before { content: "\2315"; font-size: var(--fs-title); }
+  body.ke .masthead .themesw button { width: 36px; font-size: var(--fs-micro); }
 }
 
 /* AN EMPTY CARD is a slim bar, last in its zone (a card with a list behind it keeps its place and its height). Beside a tall
    neighbour an empty card used to leave a void under it; as a bar at the end of the zone it takes one thin full-width line, and the
    cards with something to show fill the rows above it. */
-body.ke .ck-zgrid > .panel.ck-fold { grid-column: 1 / -1; order: 90; flex-direction: row; flex-wrap: wrap; align-items: baseline; align-self: stretch; height: auto; max-height: none; }
-body.ke .ck-zgrid > .panel.ck-fold .phead { padding: var(--sp-4) var(--sp-4) var(--sp-4) var(--sp-6); flex: none; }
-body.ke .ck-zgrid > .panel.ck-fold .pbody { padding: var(--sp-4) var(--sp-6) var(--sp-4) 0; flex: 1 1 200px; overflow: visible; max-height: none; }
-body.ke .ck-zgrid > .panel.ck-fold .pbody { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--sp-5); }
-body.ke .ck-zgrid > .panel.ck-fold .pbody .empty, body.ke .ck-zgrid > .panel.ck-fold .pbody .ext-note { margin: 0; padding: 0; }
+body.ke .ck-zgrid .panel.ck-fold { grid-column: 1 / -1; order: 90; flex-direction: row; flex-wrap: wrap; align-items: baseline; align-self: stretch; height: auto; max-height: none; }
+body.ke .ck-zgrid .panel.ck-fold .phead { padding: var(--sp-4) var(--sp-4) var(--sp-4) var(--sp-6); flex: none; }
+body.ke .ck-zgrid .panel.ck-fold .pbody { padding: var(--sp-4) var(--sp-6) var(--sp-4) 0; flex: 1 1 200px; overflow: visible; max-height: none; }
+body.ke .ck-zgrid .panel.ck-fold .pbody { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--sp-5); }
+body.ke .ck-zgrid .panel.ck-fold .pbody .empty, body.ke .ck-zgrid .panel.ck-fold .pbody .ext-note { margin: 0; padding: 0; }
+/* an empty panel that folds keeps a head row (title, read age, the fold key at the right edge) with its one empty sentence under it, in the body,
+   never run on after the title with the key stranded between them */
+body.ke .ck-zgrid .panel.ck-fold.ck-is-empty:not(.ck-dash) { flex-direction: column; flex-wrap: nowrap; align-items: stretch; }
+body.ke .ck-zgrid .panel.ck-fold.ck-is-empty:not(.ck-dash) .phead { padding: var(--sp-4) var(--sp-5) var(--sp-2) var(--sp-6); align-items: center; }
+body.ke .ck-zgrid .panel.ck-fold.ck-is-empty:not(.ck-dash) .phead .src { margin-left: auto; }
+body.ke .ck-zgrid .panel.ck-fold.ck-is-empty:not(.ck-dash) .phead .src ~ * { margin-left: 0; }
+body.ke .ck-zgrid .panel.ck-fold.ck-is-empty:not(.ck-dash) .pbody { padding: 0 var(--sp-6) var(--sp-4); flex: none; }
 /* on a phone the body wraps below the head, so it takes the head's left inset instead of sitting at the card edge */
-@media (max-width: 720px) { body.ke .ck-zgrid > .panel.ck-fold .pbody { padding: 0 var(--sp-6) var(--sp-4) var(--sp-6); } }
+@media (max-width: 720px) { body.ke .ck-zgrid .panel.ck-fold .pbody { padding: 0 var(--sp-6) var(--sp-4) var(--sp-6); } }
 
 /* the Edit link of an identity card sits on the first line of the text, to its right, instead of on a row of its own above it */
 body.ke .ck-zgrid .pbody > .edit-trigger-row { float: right; padding: 0; margin: 0 0 var(--sp-2) var(--sp-4); }
 
 /* a section card (the Neocortex) is as tall as its text, up to the tall height, where it scrolls */
-body.ke .ck-zgrid > .panel.k-brief.ck-h-tall { height: auto; max-height: var(--card-tall); }
+body.ke .ck-zgrid .panel.k-brief.ck-h-tall { height: auto; max-height: var(--card-tall); }
 
 /* the compose box starts at one line and grows with what is typed, up to a cap; the text editor keeps its own sizing */
 body.ke .tray-dump:not(.text-editor) .tray-dump-ta { min-height: 32px; max-height: 220px; }
@@ -1440,28 +1616,862 @@ body.ke .tray-dump:not(.text-editor) .tray-dump-ta { min-height: 32px; max-heigh
    The repos are the install's own (the `repo` its rows and ambient events carry); a repo's hue is a slot picked from its name
    (sky.js `hueKey`), so the package names no repo. The five slots are checked by a script, not eyeballed (text contrast on the
    card and pair distance under simulated protanopia, deuteranopia and tritanopia). The hues show in the graph and the repo
-   tags on rows; a 2px stripe tops each panel of one levain subsystem (memory, decisions, the work lists); and two signals stand
-   out: a Decisions halo and a failed review glowing red. */
+   tags on rows; and two signals stand out: a Decisions halo
+   and a failed review glowing red. */
 html {
   --hue-1: oklch(0.82 0.15 75); --hue-2: oklch(0.68 0.14 255); --hue-3: oklch(0.66 0.21 350);
-  --hue-4: oklch(0.94 0.17 105); --hue-5: oklch(0.76 0.13 165);
-  /* the subsystem stripes: a panel's place in levain, not a repo */
-  --stripe-memory: var(--hue-2); --stripe-decisions: var(--hue-1); --stripe-work: var(--hue-3);
+  --hue-4: oklch(0.9 0.16 135); --hue-5: oklch(0.76 0.13 165); --hue-6: oklch(0.907 0.079 210);
+  --hue-7: oklch(0.793 0.111 300); --hue-8: oklch(0.72 0.15 325);
 }
 .rp-tag { display: inline-block; margin-right: var(--sp-3); padding: 0 var(--sp-3); border-radius: var(--r-pill); vertical-align: 1px; letter-spacing: 0; text-transform: none;
-  font: var(--fw-semibold) var(--fs-micro)/1.6 var(--sans); color: var(--tag); background: color-mix(in oklch, var(--tag) 15%, transparent); }
+  font: var(--fw-semibold) var(--fs-micro)/1.6 var(--sans); color: var(--tag-ink); background: color-mix(in oklch, var(--tag) 15%, transparent); }
+.rp-tag { --tag-ink: color-mix(in oklch, var(--tag) var(--tag-mix), var(--text)); }
 .rp-tag[data-repo="1"] { --tag: var(--hue-1); } .rp-tag[data-repo="2"] { --tag: var(--hue-2); } .rp-tag[data-repo="3"] { --tag: var(--hue-3); }
-.rp-tag[data-repo="4"] { --tag: var(--hue-4); } .rp-tag[data-repo="5"] { --tag: var(--hue-5); }
+.rp-tag[data-repo="4"] { --tag: var(--hue-4); } .rp-tag[data-repo="5"] { --tag: var(--hue-5); } .rp-tag[data-repo="6"] { --tag: var(--hue-6); }
+.rp-tag[data-repo="7"] { --tag: var(--hue-7); } .rp-tag[data-repo="8"] { --tag: var(--hue-8); }
 
-/* a 2px stripe across the top of a panel of one levain subsystem */
-html :is([data-ck-panel="memory"], [data-ck-panel="health"], [data-ck-panel="crystals"], [data-ck-panel="graph"], [data-ck-panel="wraps"], [data-ck-panel^="section:"])::before { background: var(--stripe-memory); }
+/* variant B (Phill 10-14, restored 10-20): a 2px stripe across the top of a panel, by the levain subsystem it belongs to, as flow's cockpit
+   draws it: memory (blue), decisions (amber), the work lists (pink). Inside the card's own radius (the panel clips its overflow). */
+html { --stripe-memory: var(--hue-2); --stripe-decisions: var(--hue-1); --stripe-work: var(--hue-3); }
+html :is([data-ck-panel="memory_glance"], [data-ck-panel="health"], [data-ck-panel="doctor"], [data-ck-panel="crystals"], [data-ck-panel="graph"], [data-ck-panel="episodes"], [data-ck-panel="wraps"], [data-ck-panel^="section:"], [data-ck-panel^="config:"])::before { background: var(--stripe-memory); }
 html :is([data-ck-panel="decisions"], [data-ck-panel="edits"])::before { background: var(--stripe-decisions); }
-html :is([data-ck-panel="ops"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="ext:inbox"])::before { background: var(--stripe-work); }
-html :is(.ck-card.w, .ck-zgrid > .panel):is([data-ck-panel="memory"], [data-ck-panel="health"], [data-ck-panel="crystals"], [data-ck-panel="decisions"], [data-ck-panel="edits"],
-  [data-ck-panel="ops"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="ext:inbox"], [data-ck-panel^="section:"])::before {
-  content: ""; position: absolute; inset: 0 0 auto 0; height: 2px; pointer-events: none; }
+html :is([data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"])::before { background: var(--stripe-work); }
+html :is(.ck-card.w, .ck-zgrid .panel:not(.ck-dash), .ck-mem-row > .panel:not(.ck-dash)):is([data-ck-panel="memory_glance"], [data-ck-panel="health"], [data-ck-panel="doctor"], [data-ck-panel="crystals"], [data-ck-panel="graph"], [data-ck-panel="episodes"],
+  [data-ck-panel="decisions"], [data-ck-panel="edits"], [data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"], [data-ck-panel^="section:"]):not(.ck-mem-nest)::before {
+  content: ""; position: absolute; inset: 0 0 auto 0; height: 2px; pointer-events: none; z-index: 1; }
+html :is(.ck-card.w, .ck-zgrid .panel):is([data-ck-panel]) { position: relative; }
+/* a card alone in a column takes the column's width even when empty (the empty rule above sets align-self: start for the grid) */
+body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col > .panel.ck-is-empty { align-self: stretch; }
 
-/* the Decisions tile carries a soft halo only while something waits on the operator; calm otherwise */
-html .ck-card.w[data-ck-panel="decisions"][data-signal="on"] {
-  border-color: color-mix(in oklch, var(--accent) 55%, var(--hair));
-  box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 28%, transparent), 0 0 30px color-mix(in oklch, var(--accent) 24%, transparent); }
+/* N2 "waits on you": ONE closed shape. A tile that waits is ringed on all four sides by one even accent line that follows its own
+   corners, lit from the top by a faint accent wash; the subsystem stripe steps aside (the ring is the signal, two top edges in two
+   oranges read as a seam). In the strip the ring is drawn inside the segment (inset), so the bar's dividers and its outer radius
+   never clip it; as a separate tile it is the card's own border, doubled by a hairline of shadow and a low glow in dark. */
+html { --wait-ring: color-mix(in srgb, var(--accent) 78%, transparent); --wait-wash: color-mix(in srgb, var(--accent) 10%, var(--card)); }   /* mixed in srgb: an oklch mix of the orange with the blue-grey card swings through pink */
+html body.ke .ck-card.w[data-signal="on"]::before { background: transparent; }
+html body.ke .ck-card.w[data-signal="on"] { background: linear-gradient(to bottom, var(--wait-wash), var(--card) 75%); }
+
+
+/* ═══════════════════════════ THE FOUR TABS (F3, K2 r2): what each one shows, in what widths ═══════════════════════════
+   Morning = intake. Board = the work. Build = the live agents. Memory = the mind. Which panel is on which tab is cockpit_view.js's
+   TABS_OF_ID / TABS_OF_REGION; this block is how each tab lays its panels out. The rules of the shape, which every tab obeys:
+   no lone tile, no hole beside a card (a card alone in its row takes the row: cockpit_view.js sets data-stretch), no empty card
+   (an empty provider is one dashed line), one gap (--gap) between cards and blocks, one space (--sec) above a section heading. */
+body.ke:not([data-mode="morning"]) #ck-h-brief, body.ke:not([data-mode="morning"]) #ck-brief { display: none; }
+body.ke:not([data-mode="morning"]) #ck-h-widgets { display: none; }
+
+/* the glance. Fewer than four tiles: one bordered strip of equal tiles that share the whole row. Four or more: full tiles
+   (cockpit_view.js sets data-shape). The tile never carries a fixed height. */
+/* K4: the Needs-you strip. Cards under the now band for what waits on the operator; absent when nothing waits. The accent is spent
+   on "waiting on you" (the card's rim), never on a consent answer: Allow and Deny are one component at one weight (F11 a), and only
+   a question's recommended option is filled, because a question's answer authorises nothing. */
+body.ke .ck-needs.frame { padding-inline: 0; margin-inline: var(--gutter-ke); margin-top: var(--sec); }
+body.ke .ck-needs[hidden] { display: none; }
+body.ke .needs-headline { display: flex; align-items: baseline; gap: var(--sp-4); flex-wrap: wrap; }
+body.ke .needs-headline h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); letter-spacing: -.02em; color: var(--text); }
+body.ke .needs-count { font: var(--fw-bold) var(--fs-meta)/1 var(--mono); color: var(--accent); background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: 999px; padding: var(--sp-1) var(--sp-3); }
+body.ke .needs-gloss { font-size: var(--fs-meta); color: var(--meta); }
+body.ke .needs-order { font-size: var(--fs-meta); color: var(--meta); text-transform: uppercase; letter-spacing: .06em; }
+body.ke .needs-history { margin-left: auto; font: var(--fw-medium) var(--fs-meta)/var(--lh-list) var(--sans); color: var(--label); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: var(--sp-1) var(--sp-3); cursor: pointer; }
+body.ke .needs-history:hover { color: var(--text); border-color: var(--label); }
+body.ke .needs-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: var(--gap); margin-top: var(--sp-4); align-items: stretch; }
+/* the waiting ring is ONE recipe with the decisions strip: a crisp 1px ring, no second border, a soft lit edge and an accent bloom below */
+body.ke .needs-card { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; padding: var(--sp-5); background: var(--card); border: 1px solid var(--wait-ring); border-radius: var(--r-lg);
+  box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 22%, transparent), var(--edge-hi), 0 10px 30px -14px color-mix(in oklch, var(--accent) 35%, transparent); }
+body.ke .needs-card:focus { outline: none; box-shadow: 0 0 0 3px var(--accent-line); }
+body.ke .needs-head { align-items: center; }
+body.ke .needs-chip { font: var(--fw-medium) var(--fs-micro)/1.4 var(--mono); color: var(--label); border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: 0 var(--sp-2); }
+body.ke .needs-body { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; flex: 1 1 auto; }
+body.ke .needs-body .consent-display { margin-top: 0; }
+/* fixed slots, so the actions sit on one baseline across a row whatever the request says; the focus view (is-full) shows it whole */
+body.ke .needs-card:not(.is-full) .needs-q-title { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; line-clamp: 4; overflow: hidden; }
+body.ke .needs-card:not(.is-full) .consent-display { max-height: calc(7.5em + var(--sp-3) * 2); overflow-y: auto; -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-now)), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-now)), transparent); animation: edge-fade linear both; animation-timeline: scroll(self); }
+@supports (animation-timeline: scroll()) { body.ke .needs-card:not(.is-full) .consent-display { scrollbar-width: none; } body.ke .needs-card:not(.is-full) .consent-display::-webkit-scrollbar { display: none; } }
+body.ke .needs-card:not(.is-full) .consent-facts > .ext-meta:not(.needs-keep), body.ke .needs-card:not(.is-full) .consent-hint .consent-dgtext { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
+body.ke .needs-card.is-full { max-width: 720px; width: 100%; }
+body.ke .needs-actions { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-3); margin-top: auto; }
+body.ke .needs-btn, body.ke .needs-card .question-option { min-height: 38px; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); color: var(--text); background: none; border: 1px solid var(--label); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-4); cursor: pointer; text-align: center; margin: 0; }
+body.ke .needs-btn:hover, body.ke .needs-card .question-option:hover { border-color: var(--text); background: var(--card-2); }
+body.ke .needs-card .question-option:disabled { opacity: .4; cursor: default; }
+body.ke .needs-card .question-rec { color: var(--base); background: var(--accent); border-color: var(--accent); }
+body.ke .needs-card .question-rec:hover { background: var(--accent); border-color: var(--text); }
+body.ke .needs-card .question-answer { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); width: 100%; margin: 0; justify-content: stretch; }
+body.ke .needs-card .question-answer .question-option:last-child:nth-child(odd) { grid-column: 1 / -1; }
+body.ke .needs-card .question-option { line-height: 1.3; }
+body.ke .needs-qa { display: flex; flex-direction: column; gap: var(--sp-2); }
+body.ke .needs-q-title { font: var(--fw-bold) var(--fs-title)/1.35 var(--round); color: var(--text); overflow-wrap: anywhere; }
+body.ke .needs-q-blocks { overflow-wrap: anywhere; }
+body.ke .needs-rec { font-size: var(--fs-meta); color: var(--text); overflow-wrap: anywhere; }
+body.ke .needs-rec-tag { font: var(--fw-bold) var(--fs-micro)/1 var(--mono); letter-spacing: .08em; color: var(--accent); margin-right: var(--sp-1); }
+body.ke .needs-card .question-words { max-width: none; }
+body.ke .needs-card .question-send { align-self: flex-start; }
+body.ke .needs-phone { font-size: var(--fs-meta); }
+body.ke .needs-details > summary { display: flex; align-items: baseline; gap: var(--sp-3); cursor: pointer; font-size: var(--fs-meta); color: var(--label); }
+body.ke .needs-details-toggle { font-weight: var(--fw-semibold); text-decoration: underline; text-underline-offset: 2px; }
+body.ke .needs-details[open] > summary { margin-bottom: var(--sp-2); }
+body.ke .needs-details .consent-cmd { margin-top: var(--sp-2); }
+/* the strip card's one "Open" row, and the focus view it opens (the same card, unclamped) */
+body.ke .needs-open-row { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
+body.ke .needs-open-row .needs-open { min-height: 32px; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); color: var(--label); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: var(--sp-1) var(--sp-4); cursor: pointer; margin: 0; }
+body.ke .needs-open-row .needs-open:hover, body.ke .needs-open-row .needs-open:focus-visible { color: var(--text); border-color: var(--label); }
+body.ke .needs-card.is-full { gap: var(--sp-4); border: 0; box-shadow: none; padding: var(--sp-6) var(--sp-6) var(--sp-6); background: none; max-width: none; }
+body.ke .needs-card.is-full .needs-head { justify-content: space-between; }
+body.ke .needs-card.is-full .needs-head > .needs-left:only-child { margin-left: 0; }
+body.ke .needs-sec-label { font: var(--fw-bold) var(--fs-micro)/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--meta); margin-top: var(--sp-2); }
+body.ke .needs-card.is-full .needs-sec-label:first-child { margin-top: 0; }
+body.ke .consent-kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: var(--sp-2) var(--sp-4); margin: 0; padding: var(--sp-3); background: var(--card-2); border: 1px solid var(--hair); border-radius: var(--r-sm); }
+body.ke .consent-kv dt { font: var(--fw-medium) var(--fs-micro)/1.6 var(--mono); color: var(--meta); }
+body.ke .consent-kv dd { margin: 0; min-width: 0; font: var(--fw-regular, 400) var(--fs-meta)/1.5 var(--mono); color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
+body.ke .needs-expires { color: var(--text); }
+body.ke .needs-terminal { display: flex; flex-direction: column; gap: var(--sp-2); margin-top: var(--sp-3); padding-top: var(--sp-4); border-top: 1px solid var(--hair); min-width: 0; }
+body.ke .needs-terminal .consent-cmd { margin-top: 0; }
+@media (max-width: 480px) { body.ke .consent-kv { grid-template-columns: minmax(0, 1fr); gap: 0; } body.ke .consent-kv dd { margin-bottom: var(--sp-2); } }
+/* the other tabs carry the header alone: one line saying how many wait */
+body.ke .needs-bar { display: none; }
+body.ke[data-mode="build"] .needs-grid, body.ke[data-mode="memory"] .needs-grid,
+body.ke[data-mode="build"] .needs-headline, body.ke[data-mode="memory"] .needs-headline { display: none; }
+body.ke[data-mode="build"] .needs-bar, body.ke[data-mode="memory"] .needs-bar { display: flex; align-items: center; gap: var(--sp-4); flex-wrap: wrap; padding: var(--sp-3) var(--sp-5);
+  background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: var(--r-lg); }
+body.ke .needs-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+body.ke .needs-bar-title { font: var(--fw-bold) var(--fs-h)/1.2 var(--round); color: var(--text); }
+body.ke .needs-chips { display: flex; align-items: center; gap: var(--sp-3); flex: 1 1 0; min-width: 0; overflow: hidden; }
+body.ke .needs-chip-btn { flex: 0 1 auto; min-width: 0; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: var(--fw-medium) var(--fs-meta)/1.4 var(--mono); color: var(--text);
+  background: var(--card); border: 1px solid var(--accent-line); border-radius: var(--r-sm); padding: var(--sp-1) var(--sp-3); cursor: pointer; }
+body.ke .needs-chip-btn:hover { border-color: var(--accent); }
+body.ke .needs-more, body.ke .needs-soonest { white-space: nowrap; flex: none; }
+body.ke .needs-open { margin-left: 0; flex: none; }
+@keyframes needs-lit { 0% { box-shadow: 0 0 0 3px var(--accent), 0 0 18px var(--accent); } 100% { box-shadow: 0 0 0 3px var(--accent-soft); } }
+body.ke .needs-card.needs-lit { animation: needs-lit 1.6s ease-out 1; }
+body.ke .needs-chip-btn.needs-lit { animation: needs-lit 1.6s ease-out 1; }
+@media (max-width: 640px) { body.ke .needs-chips { flex-basis: 100%; order: 9; } }
+body.ke .ck-widgets.frame { padding-inline: 0; margin-inline: var(--gutter-ke); }
+body.ke .ck-widgets { margin-top: var(--gap); display: flex; gap: 1px; background: var(--hair); border: 1px solid var(--hair); border-radius: var(--r-lg); overflow: hidden; }
+body.ke .ck-widgets[hidden] { display: none; }
+/* every tile hidden on this tab (cockpit_view.js sets data-n): no empty bordered strip, no margin left behind */
+body.ke .ck-widgets[data-n="0"] { display: none; }
+body.ke .ck-secthead + .ck-widgets { margin-top: var(--sp-4); }
+/* the glance strip clears the Needs-you cards by a full step (the heading rule above would otherwise win the tie and leave 12px) */
+body.ke .ck-needs ~ .ck-secthead + .ck-widgets { margin-top: var(--sp-6); }
+body.ke .ck-widgets > .ck-card.w { flex: 1 1 auto; min-width: 0; min-height: 0; height: auto; flex-direction: row; align-items: center; gap: var(--sp-4); padding: var(--sp-4) var(--sp-5);
+  background: var(--card); border: 0; border-radius: 0; overflow: hidden; }
+body.ke .ck-widgets > .ck-card.w:hover { background: var(--card-2); }
+body.ke .ck-widgets .w > .k { flex: none; }
+body.ke .ck-widgets .wbody { flex-direction: row; align-items: baseline; gap: var(--sp-4); min-width: 0; flex: 1; flex-wrap: nowrap; }
+body.ke .ck-widgets .w .big { font-size: 20px; }
+body.ke .ck-widgets .w .sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+body.ke .ck-widgets .w .sub ~ .sub, body.ke .ck-widgets .w .xnote { display: none; }
+body.ke .ck-widgets .w .row { flex-wrap: wrap; white-space: nowrap; min-width: 0; }   /* each figure stays whole; a row too wide for the strip tile wraps its figures instead of running past the edge */
+body.ke .ck-widgets .w .xbody { flex-direction: row; align-items: baseline; gap: var(--sp-2) var(--sp-5); flex-wrap: nowrap; min-width: 0; }
+body.ke .ck-widgets .w .dots { flex-direction: row; flex-wrap: wrap; min-width: 0; gap: var(--sp-1) var(--sp-5); }   /* a strip tile's dots wrap inside the box (the height fit then counts what does not fit), never run past its edge */
+body.ke .ck-widgets .w .op .v { margin-left: var(--sp-3); }
+/* a status row in a tile is ONE line: the value keeps its whole text and sits at the right edge, the name gives way (truncates) when the tile is narrow,
+   so every row's value shares the same edge instead of dropping under its label at a different place */
+body.ke .ck-widgets .w .op { flex-wrap: nowrap; row-gap: 0; min-width: 0; }
+body.ke .ck-widgets .w .op .op-l { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+body.ke .ck-widgets .w .op .v { flex: none; white-space: nowrap; font-size: var(--fs-micro); margin-left: var(--sp-2); }
+/* a phone's half-width tile has no room for the name and its reading on one line: the reading takes the line under it, inside the tile */
+@media (max-width: 720px) {
+  body.ke .ck-widgets[data-shape="tiles"] .w .op { flex-wrap: wrap; }
+  body.ke .ck-widgets[data-shape="tiles"] .w .op .v { flex: 1 0 100%; margin-left: 0; white-space: normal; overflow-wrap: anywhere; }
+}
+/* N3 the glance figures: every figure is tabular and lining (a column of counts does not shimmy as digits change), a figure and its
+   label share one baseline, and a tile's secondary figures are a glance row, never a list row (the list row's top rule and rounded
+   hover box are what drew a stray pill around "18 today" in the strip). */
+.w .big, .w .bigrow, .w .row b, .w .num { font-variant-numeric: tabular-nums lining-nums; }
+body.ke .w .row, body.ke .w .xbody .row { border-top: 0; border-radius: 0; padding: 0; align-items: baseline; font-size: var(--fs-meta); }
+body.ke .w .row > span { display: inline-flex; align-items: baseline; white-space: nowrap; }
+body.ke .w .row b { font-size: var(--fs-lead); line-height: 1; }
+/* in a tile the headline figure and the secondary row are divided by one hairline the tile's full width, on the spacing scale */
+body.ke .ck-widgets[data-shape="tiles"] .w .bigrow + .row { margin-top: var(--sp-2); padding-top: var(--sp-3); border-top: 1px solid var(--hair); }
+/* in the strip every part of a segment sits on ONE centre line: the caps label, the figure, its unit, the sub-line and the row's figures
+   (a shared line-height makes each text box's middle the middle of its glyphs, so centring the boxes centres the text) */
+@media (min-width: 721px) {
+  body.ke .ck-widgets:not([data-shape="tiles"]) > .ck-card.w { align-items: center; }
+  body.ke .ck-widgets:not([data-shape="tiles"]) .w .wbody, body.ke .ck-widgets:not([data-shape="tiles"]) .w .xbody,
+  body.ke .ck-widgets:not([data-shape="tiles"]) .w .bigrow, body.ke .ck-widgets:not([data-shape="tiles"]) .w .row { align-items: center; }
+  body.ke .ck-widgets:not([data-shape="tiles"]) .w :is(.k, .bl, .sub, .row, .row > *, .op, .op-l, .v) { line-height: 1.25; }
+  body.ke .ck-widgets:not([data-shape="tiles"]) .w .bigrow { gap: var(--sp-2); }
+  body.ke .ck-widgets:not([data-shape="tiles"]) .w .big { line-height: 1; }
+  /* the open glyph sits centred at the segment's right edge, in room the segment keeps for it, never over the text */
+  body.ke .ck-widgets:not([data-shape="tiles"]) > .ck-card.w.w-open { padding-right: calc(var(--sp-5) + 20px); }
+  body.ke .ck-widgets:not([data-shape="tiles"]) > .ck-card.w.w-open::after { top: 50%; right: var(--sp-4); transform: translateY(-50%); font-size: var(--fs-body); }
+}
+body.ke .ck-card.w[data-signal="on"] .big { color: var(--accent); }
+body.ke .ck-widgets > .ck-card.w[data-signal="on"] { box-shadow: inset 0 0 0 1px var(--wait-ring), var(--edge-hi); }
+body.ke .ck-widgets > .ck-card.w[data-signal="on"]:hover { background: linear-gradient(to bottom, var(--wait-wash), var(--card-2) 75%); }
+/* a segment at either end of the strip takes the strip's outer corner, so its ring and its hover follow the bar's own shape */
+@media (min-width: 721px) {
+  body.ke .ck-widgets:not([data-shape="tiles"]) > .ck-card.w:first-child { border-radius: calc(var(--r-lg) - 1px) 0 0 calc(var(--r-lg) - 1px); }
+  body.ke .ck-widgets:not([data-shape="tiles"]) > .ck-card.w:last-child { border-radius: 0 calc(var(--r-lg) - 1px) calc(var(--r-lg) - 1px) 0; }
+  body.ke .ck-widgets:not([data-shape="tiles"]) > .ck-card.w:only-child { border-radius: calc(var(--r-lg) - 1px); }
+}
+body.ke .ck-widgets[data-shape="tiles"] { display: grid; grid-template-columns: repeat(var(--ck-n, 4), minmax(0, 1fr)); gap: var(--gap); background: none; border: 0; border-radius: 0; overflow: visible; }
+body.ke .ck-widgets[data-shape="tiles"] > .ck-card.w { flex-direction: column; justify-content: center; align-items: stretch; gap: var(--sp-2); padding: var(--sp-5) var(--sp-6); border: 1px solid var(--hair); border-radius: var(--r-lg); }
+body.ke .ck-widgets[data-shape="tiles"] .wbody, body.ke .ck-widgets[data-shape="tiles"] .w .xbody, body.ke .ck-widgets[data-shape="tiles"] .w .dots { flex-direction: column; align-items: stretch; gap: var(--sp-2); }
+body.ke .ck-widgets[data-shape="tiles"] .w .big { font-size: var(--fs-figure); }
+body.ke .ck-widgets[data-shape="tiles"] .w .sub { white-space: normal; }
+body.ke .ck-widgets[data-shape="tiles"] .w .sub ~ .sub, body.ke .ck-widgets[data-shape="tiles"] .w .xnote { display: block; }
+body.ke .ck-widgets[data-shape="tiles"] .w .row { flex-wrap: wrap; white-space: normal; }
+body.ke .ck-widgets[data-shape="tiles"] > .ck-card.w[data-signal="on"] { border-color: var(--wait-ring);
+  box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 22%, transparent), var(--edge-hi), 0 8px 28px -12px color-mix(in oklch, var(--accent) calc(var(--glow-a) * 100%), transparent); }
+body.ke[data-mode="build"] .ck-widgets > .ck-card.w[data-modes]:not([data-modes~="build"]),
+body.ke[data-mode="memory"] .ck-widgets > .ck-card.w[data-modes]:not([data-modes~="memory"]) { display: none; }
+
+/* the cards size to what they hold (up to their size class, then they scroll) */
+body.ke .ck-zgrid .panel.ck-h-tall { height: auto; max-height: var(--card-tall); }
+body.ke .ck-zgrid .panel.ck-h-medium { height: auto; max-height: var(--card-medium); }
+body.ke .ck-zgrid .panel.ck-h-short { height: auto; max-height: var(--card-short); }
+body.ke .ck-zgrid .panel { display: flex; flex-direction: column; }
+/* a zone with no card in this tab is not drawn, and only Board's Work zone keeps its heading */
+body.ke .zone-head { display: none; }
+body.ke[data-mode="board"] .ck-zone[data-zone="operate"] { margin-top: var(--sec); }
+body.ke[data-mode="board"] .ck-zone[data-zone="operate"] .zone-head { display: flex; }
+body.ke[data-mode="morning"] .ck-zone:not(:has(.ck-zgrid .panel[data-modes~="morning"])),
+body.ke[data-mode="board"] .ck-zone:not(:has(.ck-zgrid .panel[data-modes~="board"])),
+body.ke[data-mode="build"] .ck-zone:not(:has(.ck-zgrid .panel[data-modes~="build"])),
+body.ke[data-mode="memory"] .ck-zone:not(:has(.ck-zgrid .panel[data-modes~="memory"])) { display: none; }
+
+/* two columns of cards on every tab; a card that stands for the whole row (Tray on Morning, a section, an empty line, a card alone in its
+   row) takes both */
+body.ke .ck-zone { margin-top: var(--gap); }
+body.ke .ck-zgrid .panel { grid-column: auto; }   /* the old 12-column spans (.span2, .k-brief) have no meaning on this grid */
+body.ke .ck-col { display: contents; }
+body.ke .ck-zgrid .panel[data-stretch], body.ke .ck-zgrid .panel.ck-fold, body.ke .ck-zgrid .panel.ck-dash { grid-column: 1 / -1; }
+body.ke .ck-zgrid .panel.ck-fold { order: 90; }
+body.ke .ck-zgrid .panel.ck-dash { order: 95; }
+body.ke[data-mode="morning"] .ck-zgrid .panel[data-ck-panel="tray"] { grid-column: 1 / -1; }
+body.ke[data-mode="memory"] .ck-zgrid [data-ck-panel^="section:"] { grid-column: 1 / -1; }
+body.ke[data-mode="memory"] .ck-zgrid [data-ck-panel="graph"], body.ke[data-mode="memory"] .ck-zgrid [data-ck-panel="wraps"] { align-self: start; }
+body.ke[data-mode="memory"] .ck-zgrid .ck-mem-row > [data-ck-panel="graph"], body.ke[data-mode="memory"] .ck-zgrid .ck-mem-row > [data-ck-panel="wraps"] { align-self: stretch; }   /* beside Crystallized patterns the pair is one height */
+body.ke .ck-zgrid[data-ck-zone="identity"] { align-items: stretch; }
+body.ke .ck-zgrid[data-ck-zone="identity"] .panel:last-child:nth-child(odd) { grid-column: 1 / -1; }
+/* the Board: two independent stacks. Left: Tray, Now. Right: Open loops, Keep. Each is as tall as its own cards. */
+body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col { display: flex; flex-direction: column; gap: var(--gap); min-width: 0; align-self: start; }
+body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col.ck-col-off { display: none; }
+body.ke[data-mode="board"] .ck-zgrid.ck-twocol[data-cols="1"] { grid-template-columns: minmax(0, 1fr); }
+body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .panel { grid-column: 1 / -1; }
+body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col > .panel { grid-column: auto; }
+body.ke[data-mode="board"] .ck-zgrid [data-ck-panel="episodes"] { order: 5; }
+/* panels below the two stacks pair up (dashboard_core.js marks data-ck-pair l / r / solo): one fixed height so a pair is even; a solo keeps the row */
+@media (min-width: 1200px) {
+  body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .panel[data-ck-pair="l"], body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .panel[data-ck-pair="r"] { grid-column: auto; height: var(--card-medium); max-height: var(--card-medium); }
+  body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .panel[data-ck-pair="solo"] { grid-column: 1 / -1; }
+}
+/* the order inside a stack is the DOM's (dashboard_core.js ckArrange: Tray over Now, Open loops over Keep until a saved layout says otherwise) */
+
+/* K7: the Build tab. Sessions is a large card of its own (cockpit_view.js paintBuildSessions into #k7-sessions); Results sits left and
+   Recent edits over Open loops right. The headings are Build's own: the Work zone's heading is shown here only. */
+.k7-sess, .k7-zt, .k7-zg, .k7-opend, .row > .k7-repo { display: none; }
+body.ke[data-mode="build"] .k7-sess:not([hidden]) { display: block; margin-top: var(--sec); }
+.k7-head { display: flex; align-items: baseline; gap: var(--sp-4); margin: 0 0 var(--sp-4); }
+.k7-head h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); letter-spacing: -.02em; color: var(--text); }
+.k7-head span { font-size: var(--fs-meta); color: var(--meta); }
+.k7-card { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); overflow: hidden; min-width: 0; }
+.k7-card-h { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-3) var(--sp-4); padding: var(--sp-5) var(--sp-6) var(--sp-4); }
+.k7-card-h h2 { margin: 0; font: var(--fw-bold) var(--fs-lead)/1.2 var(--round); }
+.k7-card-h .ck-count { margin: 0; }
+.k7-sum, .k7-stats { font-size: var(--fs-meta); color: var(--meta); white-space: nowrap; }
+.k7-sp { flex: 1 1 0; }
+.k7-card-h .k7-open { display: inline-flex; border: 1px solid var(--hair-2); background: none; color: var(--label); border-radius: var(--r-md); padding: var(--sp-1) var(--sp-3); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
+.k7-card-h .k7-open:hover { background: var(--card-2); color: var(--text); }
+.k7-none { margin: 0; padding: 0 var(--sp-6) var(--sp-5); color: var(--label); font-size: var(--fs-body); }
+.k7-card.k7-lone { display: flex; flex-direction: row; flex-wrap: wrap; align-items: baseline; text-align: left; border-style: dashed; border-color: var(--hair-2); background: none; }
+.k7-card.k7-lone .k7-card-h { padding: var(--sp-4) var(--sp-5); flex: none; }
+.k7-card.k7-lone .k7-none { padding: var(--sp-4) var(--sp-5) var(--sp-4) 0; flex: 1 1 240px; }
+.k7-none.err { color: var(--bad); }
+.k7-srow { display: grid; grid-template-columns: 14px minmax(170px, 1.1fr) minmax(220px, 1.6fr) minmax(190px, 1fr) minmax(96px, auto); align-items: center; gap: var(--sp-4) var(--sp-6);
+  padding: var(--sp-4) var(--sp-6); border-top: 1px solid var(--hair); }
+.k7-sdot { width: 8px; height: 8px; border-radius: 50%; background: var(--meta); justify-self: center; }
+.k7-sdot.live { background: var(--ok); }
+.k7-who { min-width: 0; }
+.k7-who-t { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
+.k7-agent { font: var(--fw-bold) var(--fs-body) var(--round); color: var(--text); }
+.k7-repo { display: inline-block; padding: 0 var(--sp-3); border-radius: var(--r-pill); font: var(--fw-semibold) var(--fs-micro)/1.6 var(--sans); color: var(--label); background: var(--card-2); }
+.k7-repo.rp-tag { margin-right: 0; vertical-align: baseline; color: var(--tag-ink); background: color-mix(in oklch, var(--tag) 15%, transparent); }
+.k7-cwd { color: var(--meta); font-size: var(--fs-meta); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.k7-now { min-width: 0; color: var(--text); font-size: var(--fs-body); }
+.k7-srow.quiet .k7-now .k7-tool { color: var(--label); }
+.k7-tool { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.k7-limits { font-size: var(--fs-meta); color: var(--meta); }
+.k7-limits.amber { color: var(--warn); }
+.k7-limits.over { color: var(--bad); }
+.k7-meter { min-width: 0; }
+.k7-meter-h { display: flex; justify-content: space-between; font: var(--fw-semibold) var(--fs-micro)/1.6 var(--sans); letter-spacing: .08em; color: var(--label); }
+.k7-meter-v { letter-spacing: 0; font-variant-numeric: tabular-nums; }
+.k7-bar { height: 4px; border-radius: 2px; background: var(--hair); overflow: hidden; margin-top: var(--sp-1); }
+.k7-bar > i { display: block; height: 100%; background: var(--label); }
+.k7-meter.waiting .k7-bar > i { background: var(--accent); }
+.k7-meter.unread .k7-meter-v { color: var(--meta); }
+.k7-meter.over .k7-bar > i { background: var(--bad); }
+.k7-meter.over .k7-meter-v { color: var(--bad); }
+.k7-over { margin-left: auto; margin-right: var(--sp-2); padding: 0 var(--sp-2); border-radius: 3px; background: var(--bad); color: var(--bg, #fff); letter-spacing: .08em; }
+.k7-when { text-align: right; color: var(--label); font-size: var(--fs-meta); white-space: nowrap; }
+.k7-srow.waiting .k7-now .k7-tool { color: var(--text); }
+@media (max-width: 720px) {
+  .k7-srow { grid-template-columns: 14px minmax(0, 1fr); }
+  .k7-srow > .k7-now, .k7-srow > .k7-meter, .k7-srow > .k7-when { grid-column: 2; }
+  .k7-when { text-align: left; }
+}
+/* Results & edits */
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head { display: flex; }
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .zone-title:not(.k7-zt),
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .zone-gloss:not(.k7-zg) { display: none; }
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .k7-zt { display: block; }
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .k7-zg { display: inline; }
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] { margin-top: var(--sec); }
+@media (min-width: 721px) {
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] { grid-template-rows: auto 1fr; }
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs"],
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] { grid-column: 1; grid-row: 1 / span 2; align-self: start; }
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="edits"] { grid-column: 2; grid-row: 1; }
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] .panel[data-ck-panel="loops"] { grid-column: 2; grid-row: 2; align-self: start; }
+}
+body.ke .ck-zgrid .panel.k7-results-none { flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-5); height: auto; max-height: none;
+  background: none; border: 1px dashed var(--hair-2); border-radius: var(--r-lg); padding: var(--sp-4) var(--sp-5); }
+body.ke .ck-zgrid .panel.k7-results-none .phead { padding: 0; flex: none; }
+body.ke .ck-zgrid .panel.k7-results-none .pbody { padding: 0; flex: 1 1 200px; min-width: 0; overflow: visible; color: var(--label); font-size: var(--fs-body); }
+body.ke .row.k7-res { position: relative; padding-left: var(--sp-5); }
+@media (max-width: 720px) {
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs"], body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] { order: 1; }
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="edits"] { order: 2; }
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] .panel[data-ck-panel="loops"] { order: 3; }
+}
+body.ke .row.k7-res > .k7-rdot { grid-row: 2 !important; grid-column: 1 !important; justify-self: start; align-self: start; margin: .55em 0 0 calc(-1 * var(--sp-5)); position: relative; z-index: 1; width: 8px; height: 8px; border-radius: 50%; background: var(--meta); }
+body.ke .row.k7-res > .k7-rdot.ok { background: var(--ok); }
+body.ke .row.k7-res > .k7-rdot.bad { background: var(--bad); }
+/* Open loops on Build: an accent bar, the title, then the spore id, how long it has been open and its repo */
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4); border-left: 3px solid var(--heat, var(--accent)); border-radius: 0; padding-left: var(--sp-5); margin-block: var(--sp-3); }
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .clause { order: -1; flex: 1 1 calc(100% - var(--sp-8)); min-width: 0; }
+/* the fold chevron rides the title line's right edge (as on the Board), never the meta row beneath it */
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .clause-toggle { order: -1; align-self: start; margin-left: auto; }
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row > [data-ck-tag].tier { display: none; }
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .k7-repo { display: inline-block; }
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .k7-opend { display: inline; color: var(--meta); font-size: var(--fs-meta); }
+
+/* F7: an empty provider is its header line, one sentence and its action: a single dashed row (Team without a ledger, an Inbox with no
+   source). Never a card with a body gap, never an empty box. The action opens the compose box under the line. */
+body.ke .ck-zgrid .panel.ck-dash { flex-direction: row; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-5); height: auto; max-height: none;
+  background: none; border: 1px dashed var(--hair-2); border-radius: var(--r-lg); padding: var(--sp-4) var(--sp-5); }
+body.ke .ck-zgrid .panel.ck-dash .phead { padding: 0; flex: none; }
+body.ke .ck-zgrid .panel.ck-dash .phead .src, body.ke .ck-zgrid .panel.ck-dash .phead .ck-card-title ~ *:not(.ck-dash-act), body.ke .ck-zgrid .panel.ck-dash .ck-count { display: none; }
+body.ke .ck-zgrid .panel.ck-dash h2 { font: var(--fw-bold) var(--fs-body) var(--round); min-width: var(--sp-8); }
+body.ke .ck-zgrid .panel.ck-dash .pbody { padding: 0; flex: 1 1 200px; min-width: 0; overflow: visible; max-height: none; color: var(--label); font-size: var(--fs-body); display: block; }
+body.ke .ck-zgrid .panel.ck-dash .pbody .row { padding: 0; border: 0; }
+body.ke .ck-zgrid .panel.ck-dash .pbody .clause-toggle { display: none; }
+body.ke .ck-zgrid .panel.ck-dash .pbody .tray-dump { display: none; }
+body.ke .ck-zgrid .panel.ck-dash.ck-dash-open .pbody { flex-basis: 100%; }
+body.ke .ck-zgrid .panel.ck-dash.ck-dash-open .pbody .tray-dump { display: flex; margin: var(--sp-3) 0 0; }
+body.ke .ck-zgrid .panel:not(.ck-dash) .ck-dash-act { display: none; }
+.ck-dash-act { margin-left: auto; order: 2; background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-md); color: var(--label); font: var(--fw-semibold) var(--fs-meta) var(--round); padding: var(--sp-2) var(--sp-4); cursor: pointer; }
+.ck-dash-act:hover { color: var(--text); }
+body.ke .ck-zgrid .panel.ck-dash .phead { display: contents; }
+body.ke .ck-zgrid .panel.ck-dash .phead h2 { order: 0; }
+body.ke .ck-zgrid .panel.ck-dash .pbody { order: 1; }
+body.ke .ck-zgrid .panel.ck-dash.ck-dash-open .pbody { order: 3; }
+body.ke .ck-zgrid .panel.ck-is-empty:not(.ck-dash) .pbody { padding-bottom: var(--sp-4); }
+
+/* the count beside a card's title: a pill, hidden at 0 */
+.ck-count { font: var(--fw-semibold) var(--fs-meta)/1 var(--round); color: var(--label); background: var(--card-2); border-radius: var(--r-pill); padding: var(--sp-1) var(--sp-3); align-self: center; }
+.ck-count[hidden] { display: none; }
+
+/* a compose box (Tray, Keep) is one row until it is used: the field and its button; the sort choice and the room to write open when it
+   is focused or holds text. The button keeps its place, so a click that opens the box still lands on it. */
+body.ke .tray-dump:not(.text-editor):not(.action-bare) { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: var(--sp-2) var(--sp-3); padding: var(--sp-2) var(--sp-2) var(--sp-2) var(--sp-4); }
+body.ke .tray-dump:not(.text-editor):not(.action-bare) .tray-dump-ta { grid-column: 1; grid-row: 1; height: 28px; min-height: 28px; max-height: 28px; padding: var(--sp-2) 0; overflow: hidden; resize: none; line-height: 1.4; white-space: nowrap; }
+body.ke .tray-dump:not(.text-editor):not(.action-bare) .tray-dump-controls { display: contents; }
+body.ke .tray-dump:not(.text-editor):not(.action-bare) .tray-dump-btn { grid-column: 2; grid-row: 1; margin: 0; }
+body.ke .tray-dump:not(.text-editor):not(.action-bare) .tray-dump-type { grid-column: 1; grid-row: 2; justify-self: start; display: none; }
+body.ke .tray-dump:not(.text-editor):not(.action-bare) .edit-msg { grid-column: 1 / -1; grid-row: 3; }
+body.ke .tray-dump:not(.text-editor):not(.action-bare) .edit-msg:empty { display: none; }
+body.ke .tray-dump:not(.text-editor):not(.action-bare):focus-within .tray-dump-ta,
+body.ke .tray-dump:not(.text-editor):not(.action-bare):has(.tray-dump-ta:not(:placeholder-shown)) .tray-dump-ta { height: auto; min-height: 64px; max-height: 220px; overflow: auto; white-space: pre-wrap; }
+body.ke .tray-dump:not(.text-editor):not(.action-bare):focus-within .tray-dump-type,
+body.ke .tray-dump:not(.text-editor):not(.action-bare):has(.tray-dump-ta:not(:placeholder-shown)) .tray-dump-type { display: inline-block; }
+@media (pointer: coarse) { body.ke .tray-dump:not(.text-editor):not(.action-bare) .tray-dump-ta { height: var(--hit-min); min-height: var(--hit-min); max-height: var(--hit-min); } }
+
+/* the narrow page: one column of cards (the Board's two stacks run one after the other); the glance is two across, tiles whole */
+@media (max-width: 720px) {
+  body.ke .ck-zgrid { grid-template-columns: minmax(0, 1fr); }
+  body.ke .ck-widgets, body.ke .ck-widgets[data-shape="tiles"] { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-3); background: none; border: 0; border-radius: 0; overflow: visible; }
+  body.ke .ck-widgets[data-n="1"] { grid-template-columns: minmax(0, 1fr); }
+  body.ke .ck-widgets > .ck-card.w { flex-direction: column; align-items: stretch; gap: var(--sp-2); padding: var(--sp-4); border: 1px solid var(--hair); border-radius: var(--r-lg); }
+  body.ke .ck-widgets > .ck-card.w[data-last] { grid-column: 1 / -1; }
+  body.ke .ck-widgets .wbody, body.ke .ck-widgets .w .xbody, body.ke .ck-widgets .w .dots { flex-direction: column; align-items: stretch; gap: var(--sp-2); }
+  body.ke .ck-widgets > .ck-card.w { padding-right: var(--sp-6); }
+  body.ke .ck-widgets .w .sub { white-space: normal; }
+  body.ke .ck-widgets .w .row { flex-wrap: wrap; white-space: normal; }
+  body.ke .ck-widgets .w .big, body.ke .ck-widgets[data-shape="tiles"] .w .big { font-size: 28px; }
+  body.ke .ck-widgets .w .bigrow { flex-wrap: wrap; row-gap: 0; }   /* a wide figure keeps its unit: the unit drops under it instead of being cut */
+  body.ke .ck-widgets > .ck-card.w[data-signal="on"] { border-color: var(--wait-ring); box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 22%, transparent), var(--edge-hi); }
+  body.ke[data-mode="board"] .ck-zgrid.ck-twocol, body.ke[data-mode="board"] .ck-zgrid.ck-twocol[data-cols="1"] { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* the page is as tall as the screen, so the footer sits at the bottom of a short tab */
+body.ke .deck { min-height: 100vh; display: flex; flex-direction: column; }
+body.ke .deck > main.frame { flex: 1 0 auto; }
+body.ke .deck > * { flex-shrink: 0; }
+
+/* ── the Memory tab (K6): one neocortex card, crystals beside cognition, identity as one list ───────────────────────── */
+body.ke .ck-zgrid > .ck-mem-card, body.ke .ck-zgrid > .ck-mem-row { grid-column: 1 / -1; }
+body.ke .ck-zgrid .ck-mem-card { height: auto; max-height: none; background: var(--card); border: 1px solid var(--hair); }
+body.ke .ck-mem-card > .phead { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; }
+body.ke .ck-mem-card > .phead .ck-count { margin-left: 0; }
+body.ke .ck-mem-meta { font: var(--fw-regular) var(--fs-meta)/1.3 var(--sans); color: var(--label); }
+body.ke .ck-mem-card > .pbody { max-height: none; overflow: visible; }
+body.ke .ck-mem-cols { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 0 var(--sp-8, 40px); align-items: start; }
+/* ONE grid, no holes: the columns dissolve, the left sections take column 1 (each capped), and the right sections span two left rows each,
+   sized by the left alone (contain: size), so Patterns ends where State + Threads end and Decisions where Context + Understanding end */
+@media (min-width: 1101px) {
+  body.ke .ck-mem-cols:not(.ck-mem-one) { align-items: stretch; }
+  body.ke .ck-mem-cols:not(.ck-mem-one) > .ck-mem-col { display: contents; }
+  body.ke .ck-mem-cols:not(.ck-mem-one) > .ck-mem-col:first-child > .ck-mem-nest { grid-column: 1; }
+  body.ke .ck-zgrid .ck-mem-cols:not(.ck-mem-one) > .ck-mem-col:nth-child(2) > .ck-mem-nest { grid-column: 2; contain: size; min-height: 240px; max-height: none; overflow: hidden; }
+  body.ke .ck-mem-cols:not(.ck-mem-one) > .ck-mem-col:nth-child(2) > .ck-mem-nest:nth-child(1) { grid-row: 1 / span 2; }
+  body.ke .ck-mem-cols:not(.ck-mem-one) > .ck-mem-col:nth-child(2) > .ck-mem-nest:nth-child(2) { grid-row: 3 / span 2; }
+}
+@media (max-width: 1100px) {
+  body.ke .ck-mem-cols { grid-template-columns: minmax(0, 1fr); }
+  body.ke .ck-zgrid .ck-mem-cols > .ck-mem-col:nth-child(2) > .ck-mem-nest:first-child { border-top: 1px solid var(--hair); padding-top: var(--sp-6); margin-top: var(--sp-5); }
+}
+body.ke .ck-zgrid .ck-mem-cols > .ck-mem-col > .panel.ck-mem-nest { max-height: var(--card-section); }
+body.ke .ck-mem-cols.ck-mem-one { grid-template-columns: minmax(0, 1fr); }
+body.ke .ck-mem-col { display: flex; flex-direction: column; min-width: 0; }
+body.ke .ck-zgrid .panel.ck-mem-nest { height: auto; max-height: none; border: 0; border-radius: 0; background: none; overflow: visible; padding: 0; margin: 0; }
+/* the size classes cap a card's height; a nested section is never cut, so its cap is lifted at their specificity (heights only) */
+body.ke .ck-zgrid .panel.ck-mem-nest.ck-h-short, body.ke .ck-zgrid .panel.ck-mem-nest.ck-h-medium, body.ke .ck-zgrid .panel.ck-mem-nest.ck-h-tall { height: auto; max-height: none; }
+body.ke .ck-zgrid .ck-mem-cols:not(.ck-mem-one) > .ck-mem-col:first-child > .panel.ck-mem-nest.ck-h-short, body.ke .ck-zgrid .ck-mem-cols:not(.ck-mem-one) > .ck-mem-col:first-child > .panel.ck-mem-nest.ck-h-medium,
+body.ke .ck-zgrid .ck-mem-cols:not(.ck-mem-one) > .ck-mem-col:first-child > .panel.ck-mem-nest.ck-h-tall { max-height: var(--card-section); }
+body.ke .ck-zgrid .ck-mem-col > .ck-mem-nest { padding: var(--sp-6) 0 0; margin-top: var(--sp-5); border-top: 1px solid var(--hair); }
+body.ke .ck-zgrid .ck-mem-col > .ck-mem-nest:first-child { border-top: 0; padding-top: var(--sp-5); margin-top: 0; }
+/* a section the cap clips: its body is cut, the last --fade-h fades (scroll-driven, so it needs no script and shows only where the body overflows),
+   and the foot (dashboard_core.js) opens the section whole */
+@property --fade-now { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@keyframes edge-fade { from, 92% { --fade-now: var(--fade-h); } to { --fade-now: 0px; } }
+body.ke .ck-zgrid .ck-mem-nest { display: flex; flex-direction: column; }
+body.ke .ck-zgrid .ck-mem-nest > .pbody { flex: 1 1 auto; min-height: 0; overflow-y: hidden; overflow-x: hidden; -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-now)), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-now)), transparent); animation: edge-fade linear both; animation-timeline: scroll(self); }
+body.ke .ck-zgrid .ck-mem-nest > .pbody.is-clipped { -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-h)), transparent); mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-h)), transparent); animation: none; }
+body.ke .panel.ck-mem-nest > .more-foot, body.ke .ck-mem-row > .panel > .more-foot { align-self: flex-start; padding-inline: 0; margin: var(--sp-2) 0 0; min-height: var(--ctl-md); }
+body.ke .ck-zgrid .ck-mem-nest > .phead { padding: 0 0 var(--sp-3); }
+body.ke .ck-zgrid .ck-mem-nest > .phead h2 { font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); }
+body.ke .ck-mem-nest > .phead > :not(h2) { display: none; }
+body.ke .ck-zgrid .ck-mem-nest > .pbody { padding: 0; max-height: none; }
+body.ke .ck-mem-nest .edit-trigger-row { margin-top: var(--sp-2); }
+body.ke .ck-mem-pats .md-ul, body.ke .ck-mem-pats .md-ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-2); }
+body.ke .ck-mem-pats .md-li::before, body.ke .ck-mem-pats .md-li::marker { content: none; display: none; }
+body.ke .ck-mem-decs .md-li::before { content: none; display: none; }
+body.ke .ck-mem-dec { display: flex; flex-direction: column; gap: var(--sp-2); }
+body.ke .ck-mem-dec > .ck-mem-li, body.ke .ck-mem-dec > .ck-mem-cont { display: grid; grid-template-columns: 3.2rem minmax(0, 1fr); gap: var(--sp-4); align-items: baseline; }
+body.ke .ck-mem-dec > .ck-mem-cont { grid-template-columns: minmax(0, 1fr); padding-left: calc(3.2rem + var(--sp-4)); }
+body.ke .ck-mem-decs { display: flex; flex-direction: column; gap: var(--sp-2); }
+body.ke .ck-mem-decs .md-p, body.ke .ck-mem-pats .md-p { margin: 0; }
+body.ke .ck-mem-li { display: grid; grid-template-columns: 3.2rem minmax(0, 1fr); gap: var(--sp-4); align-items: baseline; }
+body.ke .ck-mem-n { font: var(--fw-semibold) var(--fs-meta)/1.5 var(--mono); color: var(--label); }
+body.ke .ck-mem-t { display: flex; flex-direction: column; min-width: 0; }
+body.ke .ck-mem-name { font: var(--fw-regular) var(--fs-meta)/1.5 var(--mono); overflow-wrap: anywhere; }
+body.ke .ck-mem-rest, body.ke .ck-mem-cite { color: var(--label); font-size: var(--fs-micro, var(--fs-meta)); line-height: 1.4; overflow-wrap: anywhere; }
+/* N4 a `{group}` line heads a band of patterns: the label, then a hairline running to the edge, with real air below it before the
+   first pattern and more above it than between two patterns, so the band reads as a band (same rhythm wherever a group recurs) */
+body.ke p.md-p.ck-mem-group, body.ke .ck-mem-group { display: flex; align-items: center; gap: var(--sp-3); font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps);
+  text-transform: uppercase; color: var(--label); padding: 0; margin: var(--sp-6) 0 var(--sp-4); }
+body.ke .ck-mem-group::after { content: ""; flex: 1 1 auto; height: 1px; background: var(--hair); }
+body.ke p.md-p.ck-mem-group:first-child, body.ke .ck-mem-group:first-child { margin-top: var(--sp-3); }
+body.ke .ck-zgrid .panel.ck-mem-slim { display: flex; flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: var(--sp-3); }
+body.ke .ck-zgrid .ck-mem-slim > .phead { padding: 0; }
+body.ke .ck-zgrid .ck-mem-slim .edit-trigger-row { margin: 0; }
+body.ke .ck-mem-slim > .pbody { flex: 1 1 auto; min-width: 0; }
+body.ke .ck-mem-slim > .pbody:has(.editor) { flex-basis: 100%; }
+body.ke .ck-mem-slim .empty { margin: 0; color: var(--label); }
+body.ke .ck-mem-when { font: var(--fw-regular) var(--fs-meta)/1.5 var(--mono); color: var(--label); }
+body.ke .ck-mem-text { overflow-wrap: anywhere; min-width: 0; }
+body.ke .ck-mem-text .ck-mem-when { margin-right: var(--sp-2); }
+/* crystals beside cognition */
+body.ke .ck-mem-row { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: var(--gap); align-items: stretch; }
+body.ke .ck-zgrid .ck-mem-row > .panel { height: auto; min-height: 0; max-height: var(--card-tall); min-width: 0; }
+body.ke .ck-mem-row > .panel > .phead { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; }
+body.ke .ck-zgrid .ck-mem-row .pbody { flex: 1 1 auto; min-height: 0; max-height: none; overflow: visible; }
+body.ke .ck-zgrid .ck-mem-row > .ck-mem-crys > .pbody { overflow-y: hidden; -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-now)), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-now)), transparent); animation: edge-fade linear both; animation-timeline: scroll(self); }
+body.ke .ck-zgrid .ck-mem-row > .ck-mem-crys > .pbody.is-clipped { -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-h)), transparent); mask-image: linear-gradient(to bottom, #000 calc(100% - var(--fade-h)), transparent); animation: none; }
+body.ke .ck-crys { align-content: start; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 var(--sp-8, 40px); }
+body.ke .ck-crys .row { display: flex; flex-wrap: nowrap; gap: var(--sp-4); align-items: baseline; padding: var(--sp-3) 0; border-bottom: 1px solid var(--hair); }
+body.ke .ck-crys .lvl { color: var(--accent); font: var(--fw-bold) var(--fs-lead)/1 var(--round); min-width: 2rem; }
+body.ke .ck-crys .lvl { flex: none; }
+body.ke .ck-crys-t { display: flex; flex-direction: column; gap: 2px; flex: 1 1 0; min-width: 0; }
+body.ke .ck-crys .name { font: var(--fw-regular) var(--fs-meta)/1.4 var(--mono); overflow-wrap: break-word; word-break: normal; min-width: 0; }
+body.ke .ck-crys .ck-crys-meta { color: var(--label); font-size: var(--fs-micro, var(--fs-meta)); line-height: 1.3; overflow-wrap: anywhere; }
+body.ke .ck-crys .clause { flex: none; color: var(--label); font-size: var(--fs-meta); }
+body.ke .ck-mem-cog .scope-wrap { display: flex; flex-direction: column; gap: var(--sp-2); flex: 1 1 auto; min-height: 0; }
+body.ke .ck-mem-cog .scope-plot { display: flex; gap: var(--sp-6); align-items: stretch; flex: 1 1 auto; min-height: 0; }
+body.ke .ck-mem-cog .scope-box { flex: 1 1 0; min-width: 0; min-height: 0; }
+body.ke .ck-mem-cog .scope-box svg.scope { height: 100%; min-height: 150px; max-height: 360px; border: 0; background: none; }
+body.ke .ck-mem-cog .scope-legend { flex: 0 0 auto; flex-direction: column; gap: var(--sp-3); margin: 0; }
+body.ke .ck-mem-cog .scope-ch { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 0 var(--sp-2); text-align: left; }
+body.ke .ck-mem-cog .scope-ch::before { content: ""; display: block; width: 10px; height: 2px; background: currentColor; margin-bottom: 2px; }
+body.ke .ck-mem-cog .scope-ch-l { font-weight: var(--fw-bold); color: var(--text); }
+body.ke .ck-mem-cog .scope-ch-v { color: var(--label); font-size: var(--fs-meta); }
+body.ke .ck-mem-cog .scope-wrap > .note { display: none; }
+/* identity: one card of rows. Each identity card IS its row: title | one-line summary | the card's own Edit. The body of the card is
+   flattened into the row's grid (display: contents), the summary is the card's own first paragraph cut to one line, and the editor, when
+   opened, takes the next row of the same card. Nothing is hidden and no node is added. */
+body.ke .ck-mem-ident .ck-mem-meta { margin-left: 0; }
+body.ke .ck-mem-ilist { display: flex; flex-direction: column; }
+body.ke .ck-zgrid .panel.ck-mem-rowcard { display: grid; grid-template-columns: minmax(8rem, 15rem) minmax(0, 1fr) auto; column-gap: var(--sp-6); align-items: center; padding: var(--sp-3) 0; border-top: 1px solid var(--hair); }
+body.ke .ck-zgrid .panel.ck-mem-rowcard:first-child { border-top: 0; }
+body.ke .ck-mem-rowcard > .phead { grid-column: 1; grid-row: 1; padding: 0; }
+body.ke .ck-mem-rowcard > .phead h2 { font: var(--fw-semibold) var(--fs-body, 14px)/1.4 var(--sans); letter-spacing: 0; text-transform: none; color: var(--text); }
+body.ke .ck-mem-rowcard > .pbody { display: contents; }
+body.ke .ck-mem-rowcard .pbody > * { display: none; }
+body.ke .ck-mem-rowcard .pbody > .section-display, body.ke .ck-mem-rowcard .pbody > .md-p:first-of-type, body.ke .ck-mem-rowcard .pbody > .err, body.ke .ck-mem-rowcard .pbody > .empty { display: block; grid-column: 2; grid-row: 1; min-width: 0; margin: 0; overflow: hidden; }
+body.ke .ck-mem-rowcard .section-display > * { display: none; }
+body.ke .ck-mem-rowcard .section-display > .md-p:first-of-type { display: block; }
+body.ke .ck-mem-rowcard .md-p { margin: 0; color: var(--label); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+body.ke .ck-mem-rowcard .pbody > .err { color: var(--bad); white-space: normal; }
+body.ke .ck-mem-rowcard > .edit-trigger-row, body.ke .ck-mem-rowcard .pbody > .edit-trigger-row { display: block; grid-column: 3; grid-row: 1; margin: 0; padding: 0; }
+body.ke .ck-mem-rowcard > .ext-note, body.ke .ck-mem-rowcard .pbody > .ext-note { display: block; grid-column: 1 / -1; grid-row: 2; margin: var(--sp-1) 0 0; }
+body.ke .ck-mem-rowcard .edit-btn { text-transform: capitalize; min-height: 32px; }
+body.ke .ck-mem-rowcard .pbody > .text-editor:not([hidden]), body.ke .ck-mem-rowcard .pbody > .editor { display: block; grid-column: 1 / -1; grid-row: 3; margin-top: var(--sp-3); }
+body.ke .ck-mem-rowcard:has(.text-editor:not([hidden])) .md-p, body.ke .ck-mem-rowcard:has(.editor) .md-p { display: none; }
+@media (max-width: 720px) {
+  body.ke .ck-mem-cols, body.ke .ck-mem-row, body.ke .ck-crys { grid-template-columns: minmax(0, 1fr); }
+  body.ke .ck-mem-cog .scope-plot { flex-direction: column; align-items: stretch; }
+  body.ke .ck-mem-cog .scope-box { flex: none; }
+  body.ke .ck-mem-cog .scope-legend { flex-direction: row; flex-wrap: wrap; }
+  body.ke .ck-zgrid .panel.ck-mem-rowcard { grid-template-columns: minmax(0, 1fr) auto; row-gap: var(--sp-1); }
+  body.ke .ck-mem-rowcard > .phead { grid-column: 1; grid-row: 1; }
+  body.ke .ck-mem-rowcard .pbody > .section-display, body.ke .ck-mem-rowcard .pbody > .md-p:first-of-type, body.ke .ck-mem-rowcard .pbody > .err, body.ke .ck-mem-rowcard .pbody > .empty { grid-column: 1 / -1; grid-row: 2; }
+  body.ke .ck-mem-rowcard > .edit-trigger-row, body.ke .ck-mem-rowcard .pbody > .edit-trigger-row { grid-column: 2; grid-row: 1; }
+  body.ke .ck-mem-rowcard .pbody > .text-editor:not([hidden]), body.ke .ck-mem-rowcard .pbody > .editor { grid-row: 4; }
+  body.ke .ck-mem-rowcard > .ext-note, body.ke .ck-mem-rowcard .pbody > .ext-note { grid-row: 3; }
+}
+/* the retired Health strip: its figures are the Cognition card's header and chart (the Morning glance keeps its own Health tile) */
+body.ke[data-mode="memory"] .ck-widgets { display: none; }
+body.ke .ck-zgrid .ck-mem-row > .panel.ck-fold, body.ke .ck-zgrid .ck-mem-row > .panel.ck-is-empty { grid-column: auto; order: 0; align-self: start; }
+body.ke .ck-mem-row > .panel .phead .src { margin-left: auto; }
+
+/* K5: collapse and reorder. The controls sit at the end of a card's head, quiet until the card is hovered or holds focus; on touch they are
+   always shown. A folded card keeps its head (title and count) and hides everything under it. */
+.ck-lay { display: inline-flex; gap: var(--sp-1); align-items: center; margin-left: auto; align-self: center; }
+.ck-lay-btn { border: 0; background: none; color: var(--label); width: 24px; height: 24px; border-radius: var(--r-sm); cursor: pointer; display: grid; place-items: center;
+  font-size: var(--fs-meta); line-height: 1; padding: 0; }
+.ck-lay-btn:hover:not(:disabled) { background: var(--card-2); color: var(--text); }
+.ck-lay-btn:disabled { opacity: 0.3; cursor: default; }
+.ck-lay-btn:focus-visible { outline: 2px solid var(--hue-2); outline-offset: 1px; }
+.ck-lay-fold::before { content: ""; width: 6px; height: 6px; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: translateY(-2px) rotate(45deg); transition: transform var(--dur-micro) var(--ease-out); }
+.panel.ck-collapsed .ck-lay-fold::before { transform: translateX(-2px) rotate(-45deg); }
+.panel.ck-collapsed > :not(.phead) { display: none; }
+body.ke .panel.ck-collapsed, body.ke .ck-zgrid .panel.ck-collapsed { height: auto; min-height: 0; }
+/* a card whose place CSS `order` pins would take a move as a no-op: the page marks its box (one set of keys in dashboard_core.js), no move buttons, collapse stays */
+.ck-lay.ck-nomove .ck-lay-up, .ck-lay.ck-nomove .ck-lay-down { display: none; }
+body.ke .panel .phead .ck-lay-up, body.ke .panel .phead .ck-lay-down { opacity: 0; transition: opacity var(--dur-micro) var(--ease-out); }
+body.ke .panel:hover .phead .ck-lay-up, body.ke .panel:hover .phead .ck-lay-down,
+body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phead .ck-lay-down { opacity: 1; }
+@media (hover: none) { body.ke .panel .phead .ck-lay-up, body.ke .panel .phead .ck-lay-down { opacity: 1; } }
+.layoutreset { flex: none; border: 1px solid var(--hair); border-radius: var(--r-md); background: var(--card); color: var(--label); cursor: pointer;
+  font: var(--fw-semibold) var(--fs-meta) var(--round); padding: var(--sp-2) var(--sp-4); white-space: nowrap; }
+.layoutreset:hover { color: var(--text); }
+.ck-zreset { margin-left: auto; align-self: center; font-size: var(--fs-micro); padding: var(--sp-1) var(--sp-3); }
+/* F12b: the work view (topology_view.js) inside the Build tab's Sessions card. The topology panel is the feed, not a card of its own:
+   Sessions draws it. State colour is the page's: orange only for waiting on you, amber stuck, red failed, green running, quiet done. */
+.panel.k-topology:not(.ck-faulted), [data-ck-panel="topology"]:not([data-ck-external]):not(.ck-faulted) { display: none !important; }   /* a faulted panel is the one error panel: cockpit_view.js marks it, and it stays */
+.tv { container-type: inline-size; padding: 0 var(--sp-6) var(--sp-6); min-width: 0; }
+/* N1 the lens switch: a recessed track holding three keys; the chosen one is a raised, lit key (its top edge catches the light,
+   a short shadow sets it on the track). Quiet by design: the accent stays reserved for what waits on the operator. */
+.tv-seg { display: inline-flex; flex: none; align-items: stretch; gap: var(--sp-1); height: var(--seg-h); padding: 3px; box-sizing: border-box;
+  background: var(--track-bg); border: 1px solid var(--hair); border-radius: calc(var(--r-md) + 3px); box-shadow: var(--recess); }
+.tv-seg-b { border: 0; background: none; color: var(--label); padding: 0 var(--sp-5); border-radius: var(--r-md); white-space: nowrap;
+  font: var(--fw-semibold) var(--fs-meta)/1 var(--round); letter-spacing: .01em; cursor: pointer;
+  transition: color var(--dur-micro) var(--ease-out), background-color var(--dur-micro) var(--ease-out), box-shadow var(--dur-micro) var(--ease-out); }
+.tv-seg-b:hover:not([aria-pressed="true"]) { color: var(--text); background: color-mix(in oklch, var(--card-2) 55%, transparent); }
+.tv-seg-b[aria-pressed="true"] { background: var(--key-bg); color: var(--text); box-shadow: var(--edge-hi), var(--key-ring), var(--lift); }
+.tv-seg-b:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; }
+@media (prefers-reduced-motion: reduce) { .tv-seg-b { transition: none; } }
+.tv-bar { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--sp-4) var(--sp-6); margin: 0 0 var(--sp-5); }
+/* the switch sits level with the figures it heads (centred on the figure + caps label pair), and a hairline divides the control
+   from the readout */
+.tv-bar > .tv-seg { margin-top: 5px; }
+.tv-bar > .tv-seg + .tv-metrics, .tv-bar > .tv-seg + .tv-strip { padding-left: var(--sp-6); border-left: 1px solid var(--hair); min-height: 44px; }
+/* narrow: the switch takes the full row as three equal keys, the readout wraps under it with no divider */
+@container (max-width: 560px) {
+  .tv-bar > .tv-seg { width: 100%; margin-top: 0; }
+  .tv-bar > .tv-seg > .tv-seg-b { flex: 1 1 0; padding-inline: var(--sp-3); }
+  .tv-bar > .tv-seg + .tv-metrics, .tv-bar > .tv-seg + .tv-strip { padding-left: 0; border-left: 0; min-height: 0; }
+}
+@media (max-width: 560px) {
+  .hl-bar > .tv-seg { width: 100%; }
+  .hl-bar > .tv-seg > .tv-seg-b { flex: 1 1 0; padding-inline: var(--sp-3); }
+}
+/* the Event graph's bar: its figures ride the lens bar like the other lenses', so the band's own title row is not drawn beside them */
+.skycard[data-hlens="events"] .sky-bar.sky-head { display: none; }
+.tv-evfig .tv-evwin { margin-left: auto; align-self: center; font-size: var(--fs-micro); color: var(--meta); white-space: nowrap; }
+.tv-strip { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-5); flex: 1 1 320px; min-width: 0; font-size: var(--fs-meta); color: var(--label); }
+.tv-metrics { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--sp-3) var(--sp-6); flex: 1 1 320px; min-width: 0; }
+.tv-m { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.tv-m b { font-size: 26px; line-height: 1.05; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+.tv-ml { font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase; color: var(--label); }
+.tv-msub { font-size: var(--fs-meta); font-style: normal; color: var(--meta); }
+.tv-m.hot b { color: var(--accent); } .tv-m.warn b { color: var(--warn); }
+.tv-m.dim b { color: var(--meta); }
+.tv-stat b { color: var(--text); font-size: var(--fs-lead); font-variant-numeric: tabular-nums; }
+.tv-stat.hot, .tv-stat.hot b { color: var(--accent); }
+.tv-stat.warn, .tv-stat.warn b { color: var(--warn); }
+.tv-stat.bad, .tv-stat.bad b { color: var(--bad); }
+.tv-stat.dim { color: var(--meta); }
+.tv-right { margin-left: auto; }
+.tv-conf { margin: 0 0 var(--sp-4); font-size: var(--fs-meta); color: var(--warn); }
+.tv-conf summary { cursor: pointer; }
+.tv-conf-row { padding: var(--sp-1) 0 0 var(--sp-5); color: var(--label); overflow-wrap: anywhere; }
+.tv-quiet { margin: var(--sp-5) 0 0; font-size: var(--fs-meta); color: var(--meta); overflow-wrap: anywhere; }
+.k7-card.k7-lone .tv-quiet { margin: 0; padding: 0 var(--sp-5) var(--sp-4); flex: 1 1 100%; }
+.tv-none { margin: 0; color: var(--meta); font-size: var(--fs-meta); }
+.tv-gloss { color: var(--meta); font-size: var(--fs-meta); font-weight: var(--fw-regular); }
+.tv-n { font: var(--fw-semibold) var(--fs-meta)/1 var(--round); color: var(--label); background: var(--card-2); border-radius: var(--r-pill); padding: var(--sp-1) var(--sp-3); }
+.tv-dot { display: inline-block; flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--meta); }
+.tv-dot.running { background: var(--ok); }
+.tv-dot.waiting { background: var(--accent); box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 25%, transparent); }
+.tv-dot.stuck, .tv-dot.stalled { background: var(--warn); }
+.tv-dot.failed, .tv-dot.errored { background: var(--bad); }
+.tv-risk { display: inline-block; flex: none; width: 8px; height: 8px; margin-left: var(--sp-1); border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 2px color-mix(in oklch, var(--warn) 25%, transparent); }
+.tv-tag { flex: none; padding: 0 var(--sp-3); border-radius: var(--r-pill); font: var(--fw-bold) var(--fs-micro)/1.7 var(--sans); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); border: 1px solid var(--hair-2); }
+.tv-tag.waiting { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.tv-tag.stuck, .tv-tag.stalled { color: var(--warn); border: 1px dashed var(--warn); }
+.tv-tag.failed, .tv-tag.errored { color: var(--bad); border-color: var(--bad); }
+.tv-tag.running { color: var(--ok); border-color: var(--ok); }
+/* an open loop's heat: the quiet ramp only (state colours are taken), hot filled and bright to parked hollow and dashed */
+.tv-dot.open { background: none; border: 1px solid var(--meta); }
+.tv-heat { display: inline-block; flex: none; width: 8px; height: 8px; border-radius: 50%; box-sizing: border-box; }
+.tv-heat.hot { background: var(--text); }
+.tv-heat.warm { background: var(--label); }
+.tv-heat.cold { background: var(--meta); }
+.tv-heat.parked { background: none; border: 1px dashed var(--meta); }
+.tv-age { color: var(--meta); font-size: var(--fs-meta); font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* the Work lens: records | tasks | outcomes. Wide, one grid: the records are a cell spanning every task row, a task and its
+   outcomes share a row (--tv-r, --tv-c set by the renderer). Narrow, the same children stack in DOM order. */
+.tv-work { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-3); align-items: start; }
+.tv-work [hidden] { display: none; }
+.tv-links { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+.tv-link { fill: none; stroke: var(--hair-2); stroke-width: 1.5; }
+.tv-link.waiting { stroke: var(--accent-line); }
+.tv-link.bad { stroke: var(--bad); stroke-dasharray: 3 3; }
+.tv-colh { font: var(--fw-semibold) var(--fs-micro)/1.4 var(--sans); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); margin-top: var(--sp-3); }
+.tv-colh2 { display: none; }
+.tv-wl { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; }
+.tv-rec { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; padding: var(--sp-3) var(--sp-4); border: 1px solid var(--accent-line); border-radius: var(--r-md); background: var(--accent-soft); }
+.tv-rec-t { font: var(--fw-bold) var(--fs-meta) var(--round); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tv-rec-m { font: var(--fw-regular) var(--fs-micro) var(--mono); color: var(--label); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tv-task { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; padding: var(--sp-3) var(--sp-4);
+  background: var(--card-2); border: 1px solid var(--hair-2); border-radius: var(--r-md); }
+.tv-task.waiting { border-color: var(--accent-line); }
+.tv-task.stuck { border-style: dashed; border-color: var(--warn); }
+.tv-task.failed { border-color: var(--bad); }
+.tv-task.done { background: none; }
+.tv-task.open { background: none; border-color: var(--hair); }
+.tv-task.tv-loose { background: none; border-style: dashed; }
+.tv-open { cursor: pointer; }
+.tv-open:hover, .tv-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.tv-task-h { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; }
+.tv-task-t { flex: 0 1 auto; min-width: 0; font: var(--fw-bold) var(--fs-body) var(--round); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tv-loose-h { font: var(--fw-semibold) var(--fs-micro)/1.4 var(--sans); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); }
+.tv-kind { font: var(--fw-semibold) var(--fs-micro)/1.6 var(--mono); color: var(--label); background: var(--card); border-radius: var(--r-sm); padding: 0 var(--sp-3); }
+.tv-chip { display: inline-flex; align-items: center; gap: var(--sp-2); max-width: 100%; padding: var(--sp-1) var(--sp-3); border: 1px solid var(--hair-2); border-radius: var(--r-pill); background: var(--card);
+  font: var(--fw-medium) var(--fs-meta)/1.3 var(--mono); color: var(--text); overflow-wrap: anywhere; }
+.tv-task-f { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-3); font-size: var(--fs-meta); color: var(--label); }
+.tv-cost { margin-left: auto; font-variant-numeric: tabular-nums; }
+.tv-cost.dim { color: var(--meta); }
+.tv-outs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+.tv-out { display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; gap: var(--sp-3); align-items: baseline; padding: var(--sp-2) var(--sp-3); border: 1px solid var(--hair); border-radius: var(--r-sm); background: var(--card); font-size: var(--fs-meta); color: var(--text); }
+.tv-out.ok .tv-out-m { color: var(--ok); }
+.tv-out.bad { border-color: var(--bad); }
+.tv-out.bad .tv-out-m { color: var(--bad); }
+.tv-out-l { overflow-wrap: anywhere; }
+.tv-out-at { color: var(--meta); font-variant-numeric: tabular-nums; }
+.tv-legend { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-5); margin-top: var(--sp-5); font-size: var(--fs-meta); color: var(--label); }
+.tv-leg { display: inline-flex; align-items: center; gap: var(--sp-2); }
+.tv-legdef { color: var(--meta); }
+@container (min-width: 780px) {      /* the card shares the row with Lost if closed from 1440, so its body is ~830 px there */
+  .tv-work { grid-template-columns: minmax(180px, 230px) minmax(0, 1fr) minmax(200px, 280px); column-gap: var(--sp-8, 40px); row-gap: var(--sp-3); }
+  .tv-work.tv-noouts { grid-template-columns: minmax(180px, 230px) minmax(0, 1fr); }
+  .tv-colh0 { grid-column: 1; grid-row: 1; }
+  .tv-colh1 { grid-column: 2; grid-row: 1; }
+  .tv-colh2 { display: block; grid-column: 3; grid-row: 1; }
+  .tv-colh2[hidden] { display: none; }
+  .tv-wl { grid-column: 1; }
+  .tv-task, .tv-outs, .tv-more { grid-column: var(--tv-c); grid-row: var(--tv-r); }
+  .tv-more { justify-self: start; }
+  .tv-no-tasks { grid-column: 2; grid-row: 2; }
+}
+/* the Agents lens: the graph as the F12 mock draws it. The SVG carries every node, ring, edge and face; a canvas under it carries only the particle streams. */
+.tv-agents { display: flex; flex-direction: column; gap: var(--sp-5); min-width: 0; }
+.tv-stage { position: relative; min-width: 0; overflow: hidden; background: var(--base); border: 1px solid var(--hair); border-radius: var(--r-md); }
+.tv-graph { position: relative; z-index: 1; display: block; width: 100%; height: auto; }
+/* a phone keeps the graph at a readable scale and pans it sideways (the svg and the particle canvas carry their own pixel width) */
+.tv-stage.tv-phone { overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch; }
+.tv-stage.tv-phone .tv-graph { max-width: none; }
+.tv-particles { position: absolute; top: 0; left: 0; z-index: 0; pointer-events: none; color: var(--text); }
+:root[data-theme="light"] .tv-particles { color: var(--label); }
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) .tv-particles { color: var(--label); } }
+.tv-hint { position: absolute; z-index: 2; top: var(--sp-4); right: var(--sp-5); color: var(--meta); font-size: var(--fs-micro); pointer-events: none; }
+/* Replay (K10 S8b): the strip under both lenses, the paused line, the unknown lines. No animation anywhere in it. */
+.tv-lensbody { position: relative; min-width: 0; }
+.tv-replaying .tv-hint { display: none; }
+.tv-rbadgewrap { display: flex; justify-content: center; align-items: center; gap: var(--sp-4); margin-top: var(--sp-4); padding: var(--sp-2) var(--sp-3) var(--sp-2) var(--sp-4); width: fit-content; margin-inline: auto; border: 1px solid var(--hair-2); background: var(--card-2); border-radius: var(--r-md); }
+.tv-lensbody:has(.tv-agents) .tv-rbadgewrap { position: absolute; z-index: 3; top: var(--sp-4); left: 50%; transform: translateX(-50%); margin: 0; }
+.tv-rbadge { font: var(--fw-semibold) var(--fs-meta)/1 var(--mono); color: var(--text); }
+.tv-rback, .tv-live { font: inherit; font-size: var(--fs-meta); color: var(--label); background: transparent; border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: 3px var(--sp-3); cursor: pointer; }
+.tv-rback:hover, .tv-live:hover { color: var(--text); }
+.tv-replay { display: grid; grid-template-columns: 112px minmax(0, 1fr) auto; align-items: center; gap: var(--sp-5); margin-top: var(--sp-5); }
+.tv-rcap { display: flex; flex-direction: column; gap: 3px; }
+.tv-rcap b { font-size: var(--fs-body); font-weight: var(--fw-bold, 700); color: var(--text); }
+.tv-rcap span { color: var(--meta); font-size: var(--fs-micro); }
+.tv-rtrack { position: relative; height: 44px; cursor: ew-resize; touch-action: none; user-select: none; outline-offset: 2px; }
+.tv-rbars { position: absolute; left: 0; right: 0; top: 0; height: 30px; display: flex; align-items: flex-end; gap: 1px; }
+.tv-rbars i { flex: 1 1 0; min-width: 0; height: 2px; border-radius: 1px; background: var(--hair); }
+.tv-rbars i.on { background: var(--hair-2); }
+.tv-rbars.unk i { background-image: repeating-linear-gradient(135deg, var(--hair-2) 0 2px, transparent 2px 4px); background-color: transparent; }
+.tv-rhr { position: absolute; top: 32px; transform: translateX(-50%); font: 500 10px var(--mono); color: var(--meta); }
+@media (max-width: 560px) { .tv-rhr-alt { display: none; } }   /* ~200px of track holds four labels, not seven */
+.tv-rhead { position: absolute; top: 0; bottom: 14px; width: 2px; background: var(--text); border-radius: 2px; transform: translateX(-1px); pointer-events: none; }
+.tv-rhead::before { content: ""; position: absolute; left: -5px; top: -3px; width: 12px; height: 12px; border-radius: 99px; background: var(--text); border: 2px solid var(--base); }
+.tv-rhead.live, .tv-rhead.live::before { background: var(--ok); }
+.tv-rtime { display: none; position: absolute; left: 50%; top: -22px; transform: translateX(-50%); font: 600 10px var(--mono); color: var(--text); background: var(--card-2); border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: 1px 5px; white-space: nowrap; }
+.tv-rtrack.drag .tv-rtime { display: block; }
+.tv-live[aria-pressed="true"] { color: var(--ok); border-color: color-mix(in oklch, var(--ok) 45%, var(--base)); }
+.tv-livedot { display: inline-block; width: 7px; height: 7px; border-radius: 99px; background: var(--ok); margin-right: var(--sp-2); }
+.tv-live[aria-pressed="false"] .tv-livedot { background: var(--meta); }
+.tv-rnote { grid-column: 2; color: var(--meta); font-size: var(--fs-micro); }
+.tv-rnote:empty { display: none; }
+.tv-rerr { grid-column: 1 / -1; margin: 0; color: var(--bad); font-size: var(--fs-meta); }
+.tv-unk { margin: var(--sp-3) 0 0; color: var(--meta); font-size: var(--fs-meta); font-style: italic; }
+.tv-gring { fill: none; stroke: var(--hair); stroke-width: 1; stroke-dasharray: 1 5; stroke-linecap: round; opacity: .9; }
+.tv-edge { fill: none; stroke: var(--hair-2); stroke-width: 1.1; opacity: .55; }
+.tv-edge.hub { stroke-width: 1.4; }
+.tv-edge.still { stroke: var(--hair); stroke-dasharray: 2 4; opacity: .9; }
+.tv-edge.waiting { stroke: var(--accent-line); opacity: .8; }
+.tv-confline { fill: none; stroke: var(--warn); stroke-width: 1.5; stroke-dasharray: 5 4; opacity: .9; }
+.tv-confchip { fill: var(--base); stroke: var(--warn); stroke-width: 1; }
+.tv-conftext { fill: var(--warn); font: var(--fw-semibold) 11px var(--mono); }
+.tv-hubhalo { fill: none; stroke: var(--hair-2); stroke-width: 1.5; opacity: .5; }
+.tv-hubbody { fill: var(--card-2); stroke: var(--hair-2); stroke-width: 1.5; }
+.tv-hubcore { fill: var(--meta); }
+.tv-hubcore.run, .tv-gcore.run { fill: var(--ok); }
+.tv-lblbg { fill: var(--base); fill-opacity: .88; }
+.tv-hubname { fill: var(--text); font: var(--fw-bold) 14px var(--round); }
+.tv-hubsub, .tv-gsub { fill: var(--meta); font: var(--fw-medium) 11px var(--mono); }
+.tv-gbody { fill: var(--card-2); stroke: var(--hair-2); stroke-width: 1.6; }
+.tv-ggroup.waiting .tv-gbody { stroke: var(--accent-line); }
+.tv-gcore { fill: var(--meta); opacity: .7; }
+.tv-gcore.run { opacity: .85; }
+.tv-gname { fill: var(--text); font: var(--fw-bold) 13px var(--round); }
+.tv-gnode { outline: none; }
+.tv-hit { fill: transparent; }
+.tv-ring { fill: var(--card-2); stroke-width: 1.8; stroke: var(--meta); }
+.tv-core { fill: var(--meta); }
+.tv-gnode:hover .tv-ring, .tv-gnode:focus-visible .tv-ring { stroke-width: 2.6; }
+.tv-gnode.running .tv-ring { stroke: var(--ok); stroke-opacity: .55; }
+.tv-gnode.running .tv-core { fill: var(--ok); }
+.tv-gnode.stalled .tv-ring { stroke: var(--warn); stroke-dasharray: 3.2 3; }
+.tv-gnode.stalled .tv-core { fill: var(--warn); }
+.tv-gnode.errored .tv-ring { stroke: var(--bad); }
+.tv-gnode.errored .tv-x { fill: none; stroke: var(--bad); stroke-width: 2; stroke-linecap: round; }
+.tv-gnode.idle .tv-ring { opacity: .9; }
+.tv-gnode.idle .tv-core { opacity: .8; }
+.tv-gnode.waiting .tv-ring { stroke: var(--accent); }
+.tv-gnode.waiting .tv-core { fill: var(--accent); }
+.tv-glow { fill: var(--accent); stroke: none; }
+.tv-pulse { fill: none; stroke: var(--accent); stroke-width: 2; opacity: .62; transform-box: fill-box; transform-origin: center; }
+.tv-gnode-risk { fill: var(--warn); }
+.tv-facebg { fill: var(--base); fill-opacity: .82; }
+.tv-tagpill { fill: var(--accent); }
+.tv-facetag { fill: var(--meta); font: var(--fw-bold) 10px var(--round); }
+.tv-gnode.waiting .tv-facetag { fill: var(--on-accent); }
+.tv-gnode.errored .tv-facetag { fill: var(--bad); }
+.tv-gnode.stalled .tv-facetag { fill: var(--warn); }
+.tv-face1 { fill: var(--text); font: var(--fw-semibold) 12px var(--round); }
+.tv-gnode.idle .tv-face1 { fill: var(--label); }
+.tv-face2 { fill: var(--label); font: var(--fw-medium) 11px var(--mono); }
+.tv-face2.unk { fill: var(--meta); }
+.tv-face3 { fill: var(--meta); font: var(--fw-medium) 11px var(--mono); }
+.tv-gnode.tv-open { cursor: pointer; }
+.tv-gnode.tv-open:focus-visible .tv-facebg { stroke: var(--accent); stroke-width: 2; }
+.tv-tip { position: absolute; z-index: 3; min-width: 190px; max-width: 280px; padding: var(--sp-3) var(--sp-4); border: 1px solid var(--hair-2); border-radius: var(--r-md); background: var(--card-2); color: var(--text); font-size: var(--fs-meta); pointer-events: none; box-shadow: 0 6px 24px color-mix(in oklch, var(--base), black 55%); }
+.tv-tip[hidden] { display: none; }
+.tv-tip b { display: block; margin-bottom: var(--sp-2); font: var(--fw-bold) var(--fs-body) var(--round); overflow-wrap: anywhere; }
+.tv-tl { display: inline-block; min-width: 76px; color: var(--meta); }
+.tv-lg { display: inline-block; flex: none; width: 10px; height: 10px; box-sizing: border-box; border-radius: 50%; border: 2px solid var(--meta); background: none; }
+.tv-lg.waiting { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 25%, transparent); }
+.tv-lg.errored { border-color: var(--bad); }
+.tv-lg.stalled { border: 2px dashed var(--warn); }
+.tv-lg.running { border-color: var(--ok); }
+.tv-lit { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* F12c: Lost if closed, its own panel. Beside the Sessions card from 1440 px (360 px wide), under it below; phone: a stacked card. */
+.k7-sess-wrap > .panel { grid-column: auto; }      /* the page's generic panel span is for the board grid, not this wrap */
+.k7-sess-wrap { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-6); align-items: start; }
+@media (min-width: 1440px) { .k7-sess-wrap.k7-has-lost { grid-template-columns: minmax(0, 1fr) 360px; } }
+.lc { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); padding: 0 var(--sp-6) var(--sp-5); min-width: 0; overflow: hidden; }
+.lc-h { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-3) var(--sp-4); padding: var(--sp-5) 0 var(--sp-4); }
+.lc-h h2 { margin: 0; font: var(--fw-bold) var(--fs-lead)/1.2 var(--round); }
+.lc-h .ck-count { margin: 0; }
+.lc-sum { font-size: var(--fs-meta); color: var(--meta); }
+.lc-none { margin: 0; font-size: var(--fs-meta); color: var(--meta); overflow-wrap: anywhere; }
+.lc-none.err { color: var(--bad); }
+.lc-sess { display: flex; flex-direction: column; gap: var(--sp-3); padding: var(--sp-4) 0; border-top: 1px solid var(--hair); min-width: 0; }
+.lc-h + .lc-sess { border-top: 0; padding-top: 0; }
+.lc-top { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; }
+.lc-top b { font: var(--fw-bold) var(--fs-body) var(--round); color: var(--text); overflow-wrap: anywhere; min-width: 0; }
+.lc-chips { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.lc-chip { padding: var(--sp-1) var(--sp-3); border: 1px solid var(--warn); border-radius: var(--r-sm); color: var(--text); font: var(--fw-medium) var(--fs-meta)/1.3 var(--round); }
+.lc-chip.unk { border: 1px dashed var(--hair-2); color: var(--meta); }
+.lc-mono { font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); overflow-wrap: anywhere; }
+.lc-quiet { display: flex; flex-direction: column; gap: var(--sp-3); padding: var(--sp-4) 0 0; border-top: 1px solid var(--hair); }
+.lc-line { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; font-size: var(--fs-meta); }
+.lc-name { color: var(--text); font-weight: var(--fw-medium); overflow-wrap: anywhere; min-width: 0; }
+.lc-ok, .lc-unread { margin-left: auto; white-space: nowrap; color: var(--ok); }
+.lc-unread { color: var(--meta); }
+.lc-foot { margin: var(--sp-4) 0 0; padding-top: var(--sp-4); border-top: 1px solid var(--hair); font-size: var(--fs-micro); color: var(--meta); }
+@media (prefers-reduced-motion: no-preference) { .tv-task.waiting, .tv-rec { animation: tv-breathe 3.2s ease-in-out 3; } .tv-pulse { animation: tv-ring 2.6s ease-in-out 4; }   /* finite, like traceBreathe: an infinite animation keeps the page compositing every frame (10-15) */ }
+@keyframes tv-breathe { 50% { box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 22%, transparent); } }
+@keyframes tv-ring { 50% { transform: scale(0.82); opacity: .3; } }
+.tv-replaying .tv-task.waiting, .tv-replaying .tv-rec, .tv-replaying .tv-pulse { animation: none; }       /* a frame from the ledger is still: nothing breathes or pulses */
+@container (max-width: 520px) { .tv-right { margin-left: 0; } .tv-bar { align-items: flex-start; } .tv-task-h { flex-wrap: wrap; } }
+.tv-more { align-self: flex-start; border: 1px solid var(--hair-2); background: none; color: var(--label); border-radius: var(--r-md); padding: var(--sp-1) var(--sp-4); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
+.tv-more:hover { background: var(--card-2); color: var(--text); }
+
+/* ═══════════════════════════ BOARD WORK LISTS TO THE MOCK (K10 S4) ═══════════════════════════
+   Open loops: a left stripe per heat (hot orange, warm violet, parked grey), the spore id, "open N d" and the repo, on Board as on Build.
+   Tray: what is late reads first, with a red stripe and "overdue N d" in red; Resolve and Snooze are always on the row, never hover-only. */
+body.ke [data-ck-panel="loops"] .row[data-heat] { --heat: var(--meta); }
+body.ke [data-ck-panel="loops"] .row[data-heat="hot"] { --heat: var(--accent); }
+body.ke [data-ck-panel="loops"] .row[data-heat="warm"] { --heat: var(--violet); }
+body.ke:not([data-mode="build"]) [data-ck-panel="loops"] .row[data-heat] { border-left: 3px solid var(--heat); padding-left: var(--sp-5); border-radius: 0; }
+body.ke [data-ck-panel="loops"] .row > .k7-opend { display: inline; color: var(--meta); font-size: var(--fs-meta); }
+body.ke [data-ck-panel="tray"] .row[data-band="overdue"] { border-left: 3px solid var(--bad); padding-left: var(--sp-5); border-radius: 0; }
+body.ke [data-ck-panel="tray"] .row[data-band="overdue"] > [data-ck-tag][data-ck-tag-state="overdue"] { color: var(--bad); font-weight: var(--fw-semibold); }
+body.ke [data-ck-panel="tray"] .row .verb-actions { opacity: 1; }
+body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn:not(.verb-more) { box-shadow: inset 0 0 0 1px var(--hair); border-radius: var(--r-md); padding: 0 var(--sp-4); background: transparent; }
+
+/* the "N more" foot of a work list that folds its lower rows (dashboard_core.js foldRows) */
+body.ke .panel > .more-foot { align-self: center; flex: none; margin: 0 0 var(--sp-4); padding: var(--sp-1) var(--sp-5); border: 0; background: none; color: var(--label); font: var(--fw-medium) var(--fs-meta)/1.4 var(--sans); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+body.ke .panel > .more-foot:hover, body.ke .panel > .more-foot:focus-visible { color: var(--text); }
+/* the Crystallized panel's "Read all" starts where its content does */
+body.ke .ck-zgrid .ck-mem-crys > .more-foot { padding-inline: var(--sp-6); margin-bottom: var(--sp-4); }
+
+/* Board work lists: the repo chip sits in the meta line (the mock), its held-back line closes the list (every long panel keeps its filter box: Phill 10-11) */
+body.ke [data-ck-panel="tray"] .row > .k7-repo, body.ke [data-ck-panel="loops"] .row > .k7-repo, body.ke [data-ck-panel="keep"] .row > .k7-repo { display: inline-block; }
+body.ke [data-ck-panel="tray"] .held-line { justify-content: center; padding: var(--sp-3) 0 var(--sp-4); font-size: var(--fs-meta); }
+body.ke [data-ck-panel="tray"] .held-toggle { text-decoration: underline; text-underline-offset: 3px; }
+/* the Board's work lists show their rows whole before they fold: room for a full Tray, Now, Open loops and Keep */
+body.ke[data-mode="board"] .ck-zgrid .panel:is([data-ck-panel="tray"], [data-ck-panel="now"], [data-ck-panel="loops"], [data-ck-panel="keep"]) { max-height: 700px; }
+/* the taller Board stack's last card ends the two stacks together (dashboard_core.js balanceStacks sets the cap) */
+body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col > .panel[data-stack-cap] { max-height: var(--stack-cap); }
+.grp-col { display: contents; }
+body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--sp-8, 32px); align-items: start; }
+body.ke[data-mode="morning"] [data-ck-panel="tray"] .grp-col { display: block; min-width: 0; }
+/* L3 a Tray with ONE group (flow's "Also pending") would fill the left column and leave the right one empty: the lone group takes
+   both columns and its rows run down two columns under one heading, so it reads like the two-group Tray beside it */
+body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col { grid-column: 1 / -1; columns: 2; column-gap: var(--sp-8, 32px); }
+body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col > .grp-head { column-span: all; }
+body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col > .row { break-inside: avoid; }
+@media (max-width: 900px) { body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results { display: block; }
+  body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col { columns: auto; } }
+body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_descend"] { order: -1; }

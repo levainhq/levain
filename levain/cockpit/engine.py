@@ -67,11 +67,11 @@ from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 
 SCHEMA = "levain.cockpit/2"
 ENTITY_TIMEOUT_S = 10.0
-# The eleven kinds of the kernel's vocabulary (docs/cockpit-contract.md). A provider written against
+# The twelve kinds of the kernel's vocabulary (docs/cockpit-contract.md). A provider written against
 # levain.cockpit/1 declares an ALIAS; it is normalised to the new kind when the spec is built, so the
 # manifest only ever carries the new names.
 KINDS = ("reading", "line", "brief", "count-queue", "ambient", "status-dots", "metric-grid", "roster", "list",
-         "form", "log")
+         "form", "log", "topology")
 ALIASES = {"triage-list": "list", "metric": "status-dots", "visual": "ambient", "prose": "brief"}
 # row-shaped kinds (the searchable property); list and count-queue ride the RowIn engine, roster and log
 # carry their rows inside the value
@@ -81,6 +81,10 @@ ROW_KINDS = ROW_ENGINE_KINDS + VALUE_ROW_KINDS
 VERSIONED_VALUE_KINDS = ("line", "brief")     # a value write binds to the value's version (§4.4)
 SEARCH_THRESHOLD = 8      # a row-shaped panel with MORE rows than this (or a windowed one) gets the box
 SEARCH_Q_MAX = 200        # a search query is plain text of at most this many characters
+REPLAY_READ_CAP = 4           # past reads (``?at=``) that may run at once: their own pool, never a slot of WRITE_READ_CAP
+REPLAY_CACHE_S = 20.0         # a past read of one (panel, minute) is kept this long, so a repeated read does not re-read the source
+REPLAY_CACHE_MAX = 16
+REPLAY_WINDOW_S = 14 * 3600   # a past read (``?at=``) reaches back at most this far (F12 Replay: the last 14 h)
 SEARCH_LIMIT_MAX = 200    # the most rows a store search returns
 SEARCH_LIMIT_DEFAULT = 50
 SEARCH_INFLIGHT = 2       # live store-search workers per panel: the current query plus one superseded by typing
@@ -179,6 +183,9 @@ class ProviderSpec:
     refresh_every_s: float | None = None
     stale_after_s: float = 900.0
     optional: bool = False
+    # a source the substrate only creates on first use (the spore store): absent before it was ever seen is an EMPTY panel,
+    # never a fault. Once seen, its disappearance is still a fault ("source disappeared").
+    absent_is_empty: bool = False
     timeout_s: float = 10.0
     order: str | None = None
     # other server orders of the SAME rows, as ``(id, title, ordering)``: a triage-list's views. The
@@ -222,11 +229,20 @@ class ProviderSpec:
     # "header" when the spec declared the legacy region; ``region`` then holds where it was normalised to.
     # Derived like ``legacy_kind``: a caller cannot set it.
     legacy_region: str = field(default="", init=False)
+    # the panel's read at a past instant (F12 Replay): ``read_at(ctx, iso)`` returning the same shape as ``read`` for
+    # that instant. Optional: None (and no ``read.read_at`` on the provider's read) means the panel has no past read,
+    # its head carries no ``replay`` flag and ``?at=`` on it is refused. A provider may also carry it on its read
+    # function as ``read.read_at`` (how the topology provider offers it); an explicit field wins.
+    read_at: Callable[["ReadContext", str], Result] | None = None
 
     def __post_init__(self) -> None:
         # rank is a sort key beside str ids: anything but an int would turn every manifest into a 500
         if type(self.rank) is not int:
             raise CockpitRegistrationError("a panel's rank must be an int")
+        if self.read_at is None and callable(getattr(self.read, "read_at", None)):
+            self.read_at = self.read.read_at  # type: ignore[attr-defined]
+        if self.read_at is not None and not callable(self.read_at):
+            raise CockpitRegistrationError("a panel's read_at must be callable")
         if self.kind in ALIASES:
             self.legacy_kind = self.kind
             self.kind = ALIASES[self.kind]
@@ -522,6 +538,7 @@ class Cockpit:
         self._discovery_states: list[_State] = []
         self._retiring: frozenset[int] | set[int] = frozenset()   # discoverers whose vanished panels are unregistered
         self._discovered: dict[str, int] = {}   # panel id -> the index of the discoverer that registered it
+        self._hero_yields: set[str] = set()     # hero panels a later hero panel of their kind replaces (yield_hero)
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
         self._life = threading.Lock()    # start() and stop() never run at once
@@ -535,6 +552,8 @@ class Cockpit:
         self._edits_reader: Callable[[int], Any] | None = None
         # source reads made inside a write still running (a hung source keeps its flight here)
         self._one_live: list[list[Any]] = []
+        self._replay_live: list[list[Any]] = []                  # the past reads still running: their own bounded pool
+        self._replay_cache: dict[tuple[str, str], tuple[float, ProviderSpec, "_Snap"]] = {}
         # panel id -> its live store-search workers, capped at SEARCH_INFLIGHT, so hung hooks cost bounded threads
         self._searching: dict[str, list[threading.Thread]] = {}
         self._search_mu = threading.Lock()
@@ -665,13 +684,26 @@ class Cockpit:
         self._register_locked(spec)
         self._dec.spec = spec
 
+    def yield_hero(self, panel_id: str) -> None:
+        """Mark a registered hero panel as the kernel's default for its slot: a later hero panel of the same kind
+        replaces it (it is unregistered, no error) instead of being refused. Levain's own ``activity`` ambient
+        yields this way, so a downstream's own hero ambient (flow's ``sky``) needs no opt-out."""
+        with self._lock:
+            spec = self._specs.get(panel_id)
+            if spec is None or spec.region != HERO:
+                raise CockpitRegistrationError(f"{panel_id!r} is not a registered hero panel")
+            self._hero_yields.add(panel_id)
+
     def _unregister_locked(self, sid: str) -> None:
+        self._hero_yields.discard(sid)
         specs = dict(self._specs)
         old = specs.pop(sid)
         if old.rowset is not None and self._rowsets.get(old.rowset) == sid:
             del self._rowsets[old.rowset]
         states = dict(self._state)
         states.pop(sid, None)
+        for k in [k for k in self._replay_cache if k[0] == sid]:
+            del self._replay_cache[k]
         self._specs = specs
         self._state = states
 
@@ -818,6 +850,10 @@ class Cockpit:
                 raise CockpitRegistrationError(
                     f"{sid}: row set {spec.rowset!r} already belongs to panel {owner!r} (one panel per row set)"
                 )
+        if spec.region == HERO:          # validated whole: only now does a yielding default leave the slot
+            for o in [o.id for o in self._specs.values()
+                      if o.region == HERO and o.kind == spec.kind and o.id in self._hero_yields]:
+                self._unregister_locked(o)
         states = dict(self._state)
         states[sid] = _State(read=spec.read)
         specs = dict(self._specs)
@@ -851,7 +887,8 @@ class Cockpit:
             if kind not in HERO_KINDS:
                 raise CockpitRegistrationError(
                     f"{sid}: the hero holds a reading and an ambient, not a {kind!r}")
-            if any(o.region == HERO and o.kind == kind for o in self._specs.values()):
+            if any(o.region == HERO and o.kind == kind and o.id not in self._hero_yields
+                   for o in self._specs.values()):
                 if spec.legacy_region != HEADER:
                     raise CockpitRegistrationError(f"{sid}: the hero holds at most one {kind}")
                 return spec.replaced(region="operate")
@@ -1022,12 +1059,13 @@ class Cockpit:
             # joiners get the outcome only if it was fully committed; otherwise an error
             _set_once(fl.out, result if committed_ok else refused("the read could not be committed"))
 
-    def _bounded(self, timeout_s: float, st: _State | None, fn: Callable[..., Any], *args: Any) -> Any:
+    def _bounded(self, timeout_s: float, st: _State | None, fn: Callable[..., Any], *args: Any,
+                 allow_snap: bool = False) -> Any:
         """A provider call that is not a panel read (entity, discovery, read_one): one flight on its own
         state (a throwaway when it has none), the outcome handed back as-is."""
         def produce() -> Any:
             out = fn(*args)
-            if not isinstance(out, (Read, Absent, Fault)):
+            if not isinstance(out, (Read, Absent, Fault, _Snap) if allow_snap else (Read, Absent, Fault)):
                 return Fault(f"provider returned {type(out).__name__}, not Read/Absent/Fault")
             return out
 
@@ -1271,6 +1309,8 @@ class Cockpit:
                 if spec.optional and not st.ever_present:
                     return _Snap("ok", [] if listy else None, None, [], [], now_iso, None,
                                  f"not configured: {out.reason}", value_version=vv)
+                if spec.absent_is_empty and not st.ever_present and listy:
+                    return _Snap("empty", [], None, [], [], now_iso, None, spec.note, empty=None, value_version=vv)
                 why = "source disappeared" if st.ever_present else "source absent"
                 return dataclasses.replace(self._fault(spec, st, f"{why}: {out.reason}", now_iso), value_version=vv)
             message = out.message if isinstance(out, Fault) else f"unexpected outcome {type(out).__name__}"
@@ -1359,6 +1399,9 @@ class Cockpit:
 
     @staticmethod
     def _value_empty(kind: str, value: Any) -> bool:
+        if kind == "topology":
+            # empty only when it read everything and found nothing: a source it could not read is not "no work"
+            return not value.get("nodes") and not value.get("tasks") and not value.get("unreadable")
         key = {"line": "lines", "status-dots": "metrics", "metric-grid": "numbers", "roster": "rows",
                "log": "rows", "ambient": "events"}.get(kind)
         if key == "events" and "visual" in value:
@@ -1529,6 +1572,7 @@ class Cockpit:
             "actionable_count": None if snap.status == "error" else count,
             "filtered": snap.filtered, "skipped": snap.skipped,
             "as_of": snap.as_of, "stale_after_s": spec.stale_after_s,
+            "today": today.isoformat(),   # the server's calendar day: the page counts "overdue" / "today" against this, never its own clock
             "refresh_every_s": spec.refresh_every_s,
             "etag": etag,
             "error": snap.error, "note": note, "empty": spec.empty if snap.empty is None else snap.empty,
@@ -1544,6 +1588,8 @@ class Cockpit:
             # never from the values the current rows happen to carry
             **({"facets": sorted(spec.facets)} if spec.facets else {}),
             **({"compose": copy.deepcopy(spec.compose)} if spec.compose else {}),
+            # the panel has a past read (``?at=``): a renderer draws a replay control only when this says so
+            **({"replay": True} if spec.read_at is not None and spec.kind not in ROW_ENGINE_KINDS else {}),
         }
 
     @staticmethod
@@ -1880,11 +1926,16 @@ class Cockpit:
 
     def panel(self, panel_id: str, *, profile: str = "full", q: str | None = None,
               row: str | None = None, credential_class: str = "none",
-              limit: int | None = None) -> dict[str, Any] | None:
+              limit: int | None = None, at: str | None = None) -> dict[str, Any] | None:
         """The ``Panel`` payload, or None for an unknown panel id. ``profile`` is ``full`` or
         ``compact``; ``q`` is the search (plain text, bounded: ``check_query``) over the panel's declared
         search fields, answered by the provider's ``search`` hook when the panel is a store-scope window;
-        ``limit`` caps a store search; ``row`` returns one row in full. ``q`` is never logged or journalled."""
+        ``limit`` caps a store search; ``row`` returns one row in full. ``q`` is never logged or journalled.
+        ``at`` is a past read (``_panel_at``)."""
+        if at is not None:
+            if q is not None or row is not None or limit is not None:
+                raise QueryError("at is a read of the whole panel: it takes no q, row or limit")
+            return self._panel_at(panel_id, at, profile=profile, credential_class=credential_class)
         q, limit = check_query(q, limit)
         auth = self.authority()
         ctx = ReadContext(auth.now, authority=auth)
@@ -1992,7 +2043,7 @@ class Cockpit:
                     value = _with_health(value, ctx.now)
             if profile == "compact":
                 out["value"] = _compact_value(head["kind"], value)
-                if head["priority"] == "feed" or head["kind"] in ("ambient", "brief"):
+                if head["priority"] == "feed" or head["kind"] in ("ambient", "brief", "topology"):
                     out["next"] = f"/cockpit/panel/{panel_id}.json?profile=full"
                 if head["priority"] == "feed" and head["kind"] in ("line", "status-dots"):
                     out["value"] = None
@@ -2001,6 +2052,61 @@ class Cockpit:
         if q and spec is not None and ("match_label" in out or "search_error" in out):
             self._seal_search(out)
         return out
+
+    def _panel_at(self, panel_id: str, at: str, *, profile: str, credential_class: str) -> dict[str, Any] | None:
+        """The panel as it was at the past instant ``at`` (F12 Replay): the provider's ``read_at`` under the panel's own
+        timeout, called with this request's context (its authority, its ``now``) and T, served on the same route and
+        under the same read gate as the live read. Only a value panel whose provider declares a past read has one
+        (else ``QueryError``: a 400); T outside ``check_replay_at``'s bounds is refused, never clamped. It never
+        touches the live read's state: it does not join the live flight, commit a snapshot or move ``last good``.
+        The payload is the live one's shape plus ``at`` (T, as checked) and ``replay: true``; the value carries its
+        own ``as_of`` (T). Its validator covers T, so two instants never share an ETag."""
+        auth = self.authority()
+        ctx = ReadContext(auth.now, authority=auth)
+        spec = self._specs.get(panel_id)
+        if spec is None:
+            return None
+        if spec.read_at is None or spec.kind in ROW_ENGINE_KINDS:
+            raise QueryError(f"panel {panel_id!r} has no past read")
+        t = check_replay_at(at, ctx.now)
+        iso = t.isoformat()
+        ctx.today = t.astimezone().date()           # a past read's calendar day is T's, not the server's today
+        snap = self._replay_snap(spec, ctx, iso)
+        out: dict[str, Any] = dict(self._head(spec, snap, credential_class, ctx.today, auth, ctx.now))
+        out["etag"] = _sha({"base": out["etag"], "at": iso})
+        out["rows"], out["value"], out["next"] = None, None, None
+        out["at"], out["replay"] = iso, True
+        if out["status"] == "error":
+            return out
+        out["value"] = _compact_value(spec.kind, snap.value) if profile == "compact" else snap.value
+        return out
+
+    def _replay_snap(self, spec: ProviderSpec, ctx: ReadContext, iso: str) -> "_Snap":
+        """One past read of ``spec`` at ``iso``, as a snapshot: ``read_at`` AND its normalisation run inside the one
+        bounded call (the live read's shape: provider data is never touched on the request thread), in the replay
+        pool (``REPLAY_READ_CAP`` at once, apart from the write pool). A good answer is kept ``REPLAY_CACHE_S`` under
+        (panel, minute), so a client re-reading one minute reads the source once; a refusal or fault is never kept."""
+        key = (spec.id, iso)
+        if self._state_of(spec) is None:             # retirement is checked before the cache: a retired panel is never served
+            raw: Any = Fault("this panel was retired while it was being read")
+        else:
+            with self._lock:
+                hit = self._replay_cache.get(key)
+                if hit is not None and hit[1] is spec and time.monotonic() - hit[0] < REPLAY_CACHE_S:
+                    return hit[2]
+            def once(c: ReadContext) -> Any:
+                return self._normalize(spec, c, spec.read_at(c, iso))     # type: ignore[misc]
+            raw = self._bounded_fresh(("replay", spec.id), spec.timeout_s, once, ctx, pool="replay", allow_snap=True)
+        if isinstance(raw, _Snap):
+            if raw.status != "error":
+                mono = time.monotonic()               # the entry's age starts when the read succeeded, not before the provider ran
+                with self._lock:
+                    if len(self._replay_cache) >= REPLAY_CACHE_MAX:
+                        self._replay_cache.pop(min(self._replay_cache, key=lambda k: self._replay_cache[k][0]))
+                    self._replay_cache[key] = (mono, spec, raw)
+            return raw
+        msg = raw.message if isinstance(raw, Fault) else f"source absent: {getattr(raw, 'reason', '')}"
+        return _Snap("error", None, None, [], [], None, _safe_str(msg), spec.note)
 
     @staticmethod
     def _seal_search(out: dict[str, Any]) -> None:
@@ -2197,27 +2303,35 @@ class Cockpit:
                 return Fault(f"provider output refused: {_safe_str(exc)}")
         return self._bounded_fresh(("panel", panel_id), spec.timeout_s, once, ctx)
 
-    def _bounded_fresh(self, source: tuple[str, Any], timeout_s: float, fn: Callable[..., Any], *args: Any) -> Any:
+    def _bounded_fresh(self, source: tuple[str, Any], timeout_s: float, fn: Callable[..., Any], *args: Any,
+                       pool: str = "writes", allow_snap: bool = False) -> Any:
         """A source read made inside a write. It never joins a flight another request started: a
         flight that began before this write's own read could hand it a version older than the source.
         The bound is on reads still running (a hung source's threads), not on requests: at most
         ``WRITE_READ_CAP_PER_SOURCE`` per source (a panel, a discoverer), so one hung source refuses
-        its own writes and leaves the rest of the cap to the others, and ``WRITE_READ_CAP`` in all."""
+        its own writes and leaves the rest of the cap to the others, and ``WRITE_READ_CAP`` in all. ``pool="replay"``
+        is the past read's own pool (``REPLAY_READ_CAP`` in all and per source): it never takes a write's slot."""
+        replay = pool == "replay"
+        per_cap, total_cap = (REPLAY_READ_CAP, REPLAY_READ_CAP) if replay else (WRITE_READ_CAP_PER_SOURCE, WRITE_READ_CAP)
         st = _State()
         entry = [st, False, source]     # state, returned, (kind, id): a namespaced key, so a panel
         with self._lock:                # id never shares a discoverer's count
             # live: a read whose call has not returned (reserved from here to its finally, so no
             # scheduler stall can make it uncounted), or one that returned while its worker still
             # runs (a hung source); a returned read whose worker ended is dropped at once
-            self._one_live = [e for e in self._one_live if not e[1] or e[0].pflight is not None]
-            if sum(1 for e in self._one_live if e[2] == source) >= WRITE_READ_CAP_PER_SOURCE:
-                return Fault(f"{WRITE_READ_CAP_PER_SOURCE} reads of {source[0]} {source[1]!r} are still "
+            live = [e for e in (self._replay_live if replay else self._one_live) if not e[1] or e[0].pflight is not None]
+            if replay:
+                self._replay_live = live
+            else:
+                self._one_live = live
+            if sum(1 for e in live if e[2] == source) >= per_cap:
+                return Fault(f"{per_cap} reads of {source[0]} {source[1]!r} are still "
                              "running (a hung source?); refused")
-            if len(self._one_live) >= WRITE_READ_CAP:
-                return Fault(f"{WRITE_READ_CAP} source reads are still running (a hung source?); refused")
-            self._one_live.append(entry)
+            if len(live) >= total_cap:
+                return Fault(f"{total_cap} source reads are still running (a hung source?); refused")
+            live.append(entry)
         try:
-            return self._bounded(timeout_s, st, fn, *args)
+            return self._bounded(timeout_s, st, fn, *args, allow_snap=allow_snap)
         finally:
             entry[1] = True
 
@@ -2339,6 +2453,17 @@ def _v_brief(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
                 raise _bad(spec, f"value.lines[{i}].text", "must be a string")
             if ln.get("label") is not None and not _is_str(ln["label"]):
                 raise _bad(spec, f"value.lines[{i}].label", "must be a string")
+    for k in ("title", "source"):
+        if v.get(k) is not None and not _is_str(v[k]):
+            raise _bad(spec, f"value.{k}", "must be a string")
+    if v.get("threads") is not None:
+        for i, t in enumerate(_need_list(spec, v, "threads")):
+            if not (isinstance(t, dict) and _is_str(t.get("text"))):
+                raise _bad(spec, f"value.threads[{i}].text", "must be a string")
+    ov = v.get("overnight")
+    if ov is not None and not (isinstance(ov, dict) and isinstance(ov.get("episodes"), int) and not isinstance(ov.get("episodes"), bool)
+                               and _is_iso(ov.get("since"))):
+        raise _bad(spec, "value.overnight", "must be {episodes: int, since: ISO-8601}")
     return v
 
 
@@ -2379,7 +2504,7 @@ def _v_status_dots(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
             raise _bad(spec, f"value.metrics[{i}].status", f"must be ok|warn|bad|unknown, got {m.get('status')!r}")
         if m.get("value") is not None and not (_is_num(m["value"]) or _is_str(m["value"])):
             raise _bad(spec, f"value.metrics[{i}].value", "must be a finite number or a string")
-        for k in ("unit", "read"):
+        for k in ("unit", "read", "detail"):
             if m.get(k) is not None and not _is_str(m[k]):
                 raise _bad(spec, f"value.metrics[{i}].{k}", "must be a string")
     if v.get("alerts") is not None:
@@ -2402,6 +2527,9 @@ def _v_metric_grid(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
 
 
 EVENT_OUTCOMES = ("ok", "failed")
+# an ambient event's outcome: flow's two, then the Levain-native activity feed's (K1_DESIGN §1): a session live, a
+# decision's outcome, a question's state. A roster's last_call keeps the two.
+AMBIENT_OUTCOMES = EVENT_OUTCOMES + ("live", "allowed", "denied", "waiting", "open", "answered")
 
 
 def _v_ambient(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
@@ -2425,10 +2553,12 @@ def _v_ambient(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
         for k in ("repo", "agent"):
             if e[k] is not None and not _is_str(e[k]):
                 raise _bad(spec, f"value.events[{i}].{k}", "must be a string or null")
-        if e["outcome"] not in EVENT_OUTCOMES:
-            raise _bad(spec, f"value.events[{i}].outcome", f"must be one of {list(EVENT_OUTCOMES)}, got {e['outcome']!r}")
+        if e["outcome"] not in AMBIENT_OUTCOMES:
+            raise _bad(spec, f"value.events[{i}].outcome", f"must be one of {list(AMBIENT_OUTCOMES)}, got {e['outcome']!r}")
     if not _is_str(v.get("legend")) or not v["legend"].strip():
         raise _bad(spec, "value.legend", "must be a non-empty string (one line saying what the encoding means)")
+    if "dialect" in v and v["dialect"] not in ("levain", "flow"):
+        raise _bad(spec, "value.dialect", f"is optional and must be 'levain' or 'flow' when present, got {v['dialect']!r}")
     return v
 
 
@@ -2645,10 +2775,181 @@ def _v_log(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
     return v
 
 
+TOPOLOGY_NODE_STATES = ("waiting", "errored", "stalled", "running", "idle")
+TOPOLOGY_TASK_KINDS = ("dispatch", "spore", "consent", "question", "unattached")
+TOPOLOGY_TASK_STATES = ("waiting", "stuck", "running", "open", "done", "failed")
+TOPOLOGY_TASK_HEATS = ("hot", "warm", "cold", "parked")
+TOPOLOGY_COST_SOURCES = ("dispatch", "ledger")
+TOPOLOGY_LABEL_MAX = 48
+
+
+def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
+    """F12's live topology (F12_SPEC, with the 14a amendment): a hub, groups, nodes, tasks and what closing a live
+    node would lose. Every string is display-safe (``visible`` leaves it unchanged) and every label at most
+    ``TOPOLOGY_LABEL_MAX`` characters; ids are unique and every reference names one; null is "unknown" wherever the
+    contract allows it, and is never read as zero. ``conflicts`` may be null (the source is not tracked) and the
+    counts in ``lost_if_closed`` may be null (not read). Extra keys are accepted and ignored."""
+    v = _need_obj(spec, v)
+
+    def text(where: str, x: Any, *, null: bool = False, label: bool = False, blank: bool = True) -> None:
+        if x is None and null:
+            return
+        if not _is_str(x):
+            raise _bad(spec, where, "must be a string" + (" or null" if null else ""))
+        if not blank and not x:
+            raise _bad(spec, where, "must be a non-empty string")
+        if visible(x) != x:
+            raise _bad(spec, where, "carries an invisible or format character (send it through display_safe.visible)")
+        if label and len(x) > TOPOLOGY_LABEL_MAX:
+            raise _bad(spec, where, f"is longer than {TOPOLOGY_LABEL_MAX} characters")
+
+    def count(where: str, x: Any, *, null: bool = True) -> None:
+        if x is None and null:
+            return
+        if not (isinstance(x, int) and not isinstance(x, bool) and x >= 0):
+            raise _bad(spec, where, "must be a non-negative integer" + (" or null (unknown)" if null else ""))
+
+    def strings(where: str, x: Any, *, names: bool = False, label: bool = False) -> list[str]:
+        if not isinstance(x, list):
+            raise _bad(spec, where, "must be a list of strings")
+        for i, s_ in enumerate(x):
+            text(f"{where}[{i}]", s_, label=names or label, blank=False)
+            if names and ("/" in s_ or "\\" in s_):
+                raise _bad(spec, f"{where}[{i}]", "must be a basename (no path on the wire)")
+        return x
+
+    def unique(where: str, items: list[Any]) -> set[str]:
+        seen: set[str] = set()
+        for i, it in enumerate(items):
+            text(f"{where}[{i}].id", it.get("id"), blank=False)
+            if it["id"] in seen:
+                raise _bad(spec, f"{where}[{i}].id", f"{it['id']!r} is repeated")
+            seen.add(it["id"])
+            text(f"{where}[{i}].label", it.get("label"), label=True)
+        return seen
+
+    hub = v.get("hub")
+    if not isinstance(hub, dict):
+        raise _bad(spec, "value.hub", "must be an object {id, label}")
+    text("value.hub.id", hub.get("id"), blank=False)
+    text("value.hub.label", hub.get("label"), label=True)
+    groups = _need_list(spec, v, "groups")
+    group_ids = unique("value.groups", groups)
+    for i, g in enumerate(groups):
+        text(f"value.groups[{i}].repo", g.get("repo"), null=True)
+    nodes = _need_list(spec, v, "nodes")
+    node_ids = unique("value.nodes", nodes)
+    for i, n in enumerate(nodes):
+        w = f"value.nodes[{i}]"
+        if n.get("group") not in group_ids:
+            raise _bad(spec, f"{w}.group", f"must name a group id, got {n.get('group')!r}")
+        par = n.get("parent")
+        if par is not None and (par not in node_ids or par == n["id"]):
+            raise _bad(spec, f"{w}.parent", f"must be null or another node's id, got {par!r}")
+        for k in ("agent", "model", "tool", "card"):
+            text(f"{w}.{k}", n.get(k), null=True, label=k in ("agent", "model", "tool"))
+        if n.get("state") not in TOPOLOGY_NODE_STATES:
+            raise _bad(spec, f"{w}.state", f"must be one of {list(TOPOLOGY_NODE_STATES)}, got {n.get('state')!r}")
+        count(f"{w}.tokens", n.get("tokens"))
+        for k in ("started", "last_event"):
+            if not _is_iso(n.get(k)):
+                raise _bad(spec, f"{w}.{k}", "must be an ISO-8601 timestamp")
+        if n.get("rate") is not None and (not _is_num(n["rate"]) or n["rate"] < 0):
+            raise _bad(spec, f"{w}.rate", "must be a non-negative finite number (events per minute) or null (no log)")
+    parent_of = {n["id"]: n.get("parent") for n in nodes}
+    for i, n in enumerate(nodes):
+        # a parent chain that returns to itself has no root: the renderer would have nowhere to start
+        seen_p, cur = {n["id"]}, n.get("parent")
+        while cur is not None:
+            if cur in seen_p:
+                raise _bad(spec, f"value.nodes[{i}].parent", f"is part of a parent cycle through {cur!r} (a node's ancestors never include itself)")
+            seen_p.add(cur)
+            cur = parent_of.get(cur)
+    if "conflicts" not in v:
+        raise _bad(spec, "value.conflicts", "is required (null when the source is not tracked)")
+    if v["conflicts"] is not None:
+        for i, c in enumerate(_need_list(spec, v, "conflicts")):
+            text(f"value.conflicts[{i}].path", c.get("path"), label=True, blank=False)
+            if "/" in c["path"] or "\\" in c["path"]:
+                raise _bad(spec, f"value.conflicts[{i}].path", "must be a basename (no path on the wire)")
+            ids = c.get("nodes")
+            if not (isinstance(ids, list) and len(ids) >= 2 and all(isinstance(x, str) and x in node_ids for x in ids)
+                    and len(set(ids)) == len(ids)):
+                raise _bad(spec, f"value.conflicts[{i}].nodes", "must be two or more distinct node ids")
+        total = v.get("conflicts_total")
+        if total is not None and (isinstance(total, bool) or not isinstance(total, int) or total < len(v["conflicts"])):
+            raise _bad(spec, "value.conflicts_total", "must be an integer no smaller than the conflicts listed (the count before the cap), or null")
+    counts = v.get("counts")
+    if not isinstance(counts, dict):
+        raise _bad(spec, "value.counts", "must be an object {tokens_today}")
+    if "tokens_today" not in counts:
+        raise _bad(spec, "value.counts.tokens_today", "is required (null when not tracked)")
+    count("value.counts.tokens_today", counts["tokens_today"])
+    if not _is_iso(v.get("as_of")):
+        raise _bad(spec, "value.as_of", "must be an ISO-8601 timestamp")
+    tasks = _need_list(spec, v, "tasks")
+    unique("value.tasks", tasks)
+    for i, t in enumerate(tasks):
+        w = f"value.tasks[{i}]"
+        if t.get("kind") not in TOPOLOGY_TASK_KINDS:
+            raise _bad(spec, f"{w}.kind", f"must be one of {list(TOPOLOGY_TASK_KINDS)}, got {t.get('kind')!r}")
+        if t.get("state") not in TOPOLOGY_TASK_STATES:
+            raise _bad(spec, f"{w}.state", f"must be one of {list(TOPOLOGY_TASK_STATES)}, got {t.get('state')!r}")
+        strings(f"{w}.waits_on", t.get("waits_on"))
+        text(f"{w}.card", t.get("card"), null=True)
+        # an open loop's age and heat, both optional (a provider with no such thing omits them): present means ISO / a tier name, or null
+        if t.get("opened") is not None and not _is_iso(t["opened"]):
+            raise _bad(spec, f"{w}.opened", "must be an ISO-8601 timestamp or null (when the task was opened)")
+        age = t.get("age_days")
+        if age is not None and (isinstance(age, bool) or not isinstance(age, int) or age < 0):
+            raise _bad(spec, f"{w}.age_days", "must be a non-negative integer or null (calendar days open, in the provider's day)")
+        if t.get("heat") is not None and t["heat"] not in TOPOLOGY_TASK_HEATS:
+            raise _bad(spec, f"{w}.heat", f"must be one of {list(TOPOLOGY_TASK_HEATS)} or null, got {t.get('heat')!r}")
+        outs = t.get("outcomes")
+        if not isinstance(outs, list):
+            raise _bad(spec, f"{w}.outcomes", "must be a list")
+        for j, o in enumerate(outs):
+            if not isinstance(o, dict):
+                raise _bad(spec, f"{w}.outcomes[{j}]", "must be an object {label, at, ok}")
+            text(f"{w}.outcomes[{j}].label", o.get("label"), label=True)
+            if not _is_iso(o.get("at")):
+                raise _bad(spec, f"{w}.outcomes[{j}].at", "must be an ISO-8601 timestamp")
+            if not isinstance(o.get("ok"), bool):
+                raise _bad(spec, f"{w}.outcomes[{j}].ok", "must be a boolean")
+        cost = t.get("cost")
+        if not isinstance(cost, dict) or not {"usd", "tokens", "source"} <= set(cost):
+            raise _bad(spec, f"{w}.cost", "must be an object {usd, tokens, source} (null fields = not tracked)")
+        if cost["usd"] is not None and not (_is_num(cost["usd"]) and cost["usd"] >= 0):
+            raise _bad(spec, f"{w}.cost.usd", "must be a non-negative finite number or null")
+        count(f"{w}.cost.tokens", cost["tokens"])
+        if cost["source"] is not None and cost["source"] not in TOPOLOGY_COST_SOURCES:
+            raise _bad(spec, f"{w}.cost.source", f"must be one of {list(TOPOLOGY_COST_SOURCES)} or null")
+        if cost["source"] is None and (cost["usd"] is not None or cost["tokens"] is not None):
+            raise _bad(spec, f"{w}.cost.source", "must name where a cost came from (a cost is never an estimate)")
+        workers = strings(f"{w}.workers", t.get("workers"))
+        for j, x in enumerate(workers):
+            if x not in node_ids:
+                raise _bad(spec, f"{w}.workers[{j}]", f"must name a node id, got {x!r}")
+    for i, lost in enumerate(_need_list(spec, v, "lost_if_closed")):
+        w = f"value.lost_if_closed[{i}]"
+        if lost.get("node") not in node_ids:
+            raise _bad(spec, f"{w}.node", f"must name a node id, got {lost.get('node')!r}")
+        for k in ("dirty", "unpushed", "uncaptured_episodes", "running_children"):
+            if k not in lost:
+                raise _bad(spec, f"{w}.{k}", "is required (null when not read)")
+            count(f"{w}.{k}", lost[k])
+        strings(f"{w}.dirty_names", lost.get("dirty_names"), names=True)
+        strings(f"{w}.branches", lost.get("branches"), label=True)
+    for k in ("errors", "unreadable"):
+        if v.get(k) is not None:
+            strings(f"value.{k}", v[k])
+    return v
+
+
 VALUE_VALIDATORS: dict[str, Callable[["ProviderSpec", Any], dict[str, Any]]] = {
     "reading": _v_reading, "line": _v_line, "brief": _v_brief, "ambient": _v_ambient,
     "status-dots": _v_status_dots, "metric-grid": _v_metric_grid, "roster": _v_roster, "form": _v_form,
-    "log": _v_log,
+    "log": _v_log, "topology": _v_topology,
 }
 
 # What a row of each row-shaped kind carries, i.e. what ``search.fields`` may name, and the default.
@@ -2762,6 +3063,29 @@ def check_query(q: str | None, limit: int | None = None) -> tuple[str | None, in
     return q, min(limit, SEARCH_LIMIT_MAX)
 
 
+def check_replay_at(at: Any, now: datetime) -> datetime:
+    """The kernel's bounds on a past read (``?at=``, a provider's ``read_at``): an ISO-8601 instant with an explicit
+    zone, on a whole minute, inside ``[now - REPLAY_WINDOW_S, now]``. Anything else is refused (``QueryError``, an
+    HTTP 400), never clamped to the window: a read of another instant than the one asked would pass as it."""
+    if not isinstance(at, str) or not at or len(at) > 40:
+        raise QueryError("at is an ISO-8601 instant, e.g. 2026-10-20T11:30:00Z")
+    try:
+        t = datetime.fromisoformat(at[:-1] + "+00:00" if at.endswith("Z") else at)
+    except ValueError:
+        raise QueryError(f"at is not an ISO-8601 instant: {at!r}") from None
+    if t.tzinfo is None:
+        raise QueryError("at must carry its zone (Z or an offset)")
+    if t.second or t.microsecond:
+        raise QueryError("at is on a whole minute (replay has minute resolution)")
+    try:
+        t = t.astimezone(timezone.utc)
+    except OverflowError:               # 0001-01-01T00:00:00+23:59: a valid instant whose UTC form is out of range
+        raise QueryError(f"at is not an ISO-8601 instant: {at!r}") from None
+    if t > now or t < now - timedelta(seconds=REPLAY_WINDOW_S):
+        raise QueryError(f"at must be inside the last {REPLAY_WINDOW_S // 3600} h (now - {REPLAY_WINDOW_S // 3600} h .. now)")
+    return t
+
+
 def _fold(text: str) -> str:
     """Case- and accent-folded, for the rows-scope substring match."""
     return "".join(c for c in unicodedata.normalize("NFD", text.casefold()) if unicodedata.category(c) != "Mn")
@@ -2782,4 +3106,9 @@ def _compact_value(kind: str, value: Any) -> Any:
         return {"legend": value.get("legend", ""), "events": len(value.get("events") or [])}
     if kind == "brief":
         return {"headline": value.get("headline", "")}
+    if kind == "topology":
+        # the phone draws no topology (F12_SPEC): the counts, and the full value one link away
+        return {"as_of": value.get("as_of"), "nodes": len(value.get("nodes") or []),
+                "tasks": len(value.get("tasks") or []),
+                "waiting": sum(1 for t in value.get("tasks") or [] if t.get("state") == "waiting")}
     return value

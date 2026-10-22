@@ -323,9 +323,11 @@ class Broker:
             # no journal and no anchor (by stat, no opener): no log has ever been kept here, so it is
             # positively empty and the shipped default holds; any trace of one may hold a raise this
             # broker cannot read, so the policy is unknown (every verb T3) and its writes are refused
-            return RequestAuthority(now, inactive("provenance is served by the active broker"),
+            # no trace of a log: nothing is hidden, so the panels say nothing (a leftover log keeps the sentence)
+            trace = self._ledger_trace()
+            return RequestAuthority(now, inactive("provenance is served by the active broker" if trace else ""),
                                     authority_error="the broker is not active", no_log=True,
-                                    log_empty=not self._ledger_trace())
+                                    log_empty=not trace)
         return self._capture(db, now)
 
     def _ledger_trace(self) -> bool:

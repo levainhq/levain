@@ -27,17 +27,17 @@ def _zone(r, zid):
 
 
 class TestDefaultLayout:
-    def test_hero_is_empty_the_kernel_has_no_reading_or_ambient(self, regions) -> None:
+    def test_hero_holds_the_activity_ambient_and_no_reading(self, regions) -> None:
         r, _ = regions
-        assert r["hero"] == []
+        assert r["hero"] == ["activity"]       # K1: the Levain-native feed; a downstream hero ambient (flow's sky) replaces it
 
     def test_brief_holds_the_state_line(self, regions) -> None:
         r, _ = regions
-        assert r["brief"] == ["state"]
+        assert r["brief"] == ["state", "begin"]      # the state line, then Where to begin (read from the Tray and Open loops)
 
     def test_health_is_a_widget(self, regions) -> None:
         r, heads = regions
-        assert r["widgets"] == ["sessions", "health"]      # Q7a: the Sessions tile sits ahead of Health
+        assert r["widgets"] == ["sessions", "memory_glance", "health", "doctor"]      # Q7a Sessions first; K1 Memory, Levain health
         assert heads["health"]["kind"] == "status-dots"
         assert "health" not in _zone(r, "mind")["panels"]
 

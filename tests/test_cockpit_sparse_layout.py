@@ -1,5 +1,6 @@
-"""A sparse install (every new user's) keeps the designed widths: each glance widget is one of four tracks, and Morning's lone
-Work card is one of three, not stretched across the page (Phill 10-14: "stretches full screen and looks like shit")."""
+"""A sparse install (every new user's) keeps the designed shape (K2_L1L2 L2-1 / L2-7): on Morning the glance tiles share the whole row
+(a bordered strip below four, full tiles at four or more; never a lone 240px tile), and Morning's Tray is the page's full width on
+purpose (the cockpit shape, F3: Morning = intake, the Tray wide)."""
 
 from __future__ import annotations
 
@@ -16,37 +17,51 @@ def _page(tmp_path: Path, steps: list[dict]) -> list:
 
 
 @needs_browser
-def test_a_sparse_glance_keeps_one_of_four_tracks_per_widget(tmp_path: Path) -> None:
-    vals = _page(tmp_path, [{"eval": """(() => { const w = document.querySelector('.ck-widgets'); const cs = [...w.querySelectorAll(':scope > .ck-card.w')];
-      return [cs.length, cs.map(c => c.getBoundingClientRect().width / w.getBoundingClientRect().width)]; })()"""}])
-    n, shares = vals[1]
-    assert 1 <= n <= 4 and all(0.2 < s < 0.3 for s in shares), vals
+def test_a_sparse_glance_shares_the_row_between_its_tiles(tmp_path: Path) -> None:
+    vals = _page(tmp_path, [{"eval": "(() => { document.querySelector('[data-mode-tab=\"morning\"]').click(); return document.body.dataset.mode; })()"},
+      {"eval": """(async () => { await new Promise(r => setTimeout(r, 300));
+      const w = document.querySelector('.ck-widgets');
+      const cs = [...w.querySelectorAll(':scope > .ck-card.w')].filter(c => getComputedStyle(c).display !== 'none');
+      const W = w.getBoundingClientRect().width;
+      return { n: cs.length, shape: w.dataset.shape, shares: cs.map(c => c.getBoundingClientRect().width / W) }; })()"""}])
+    assert vals[1] == "morning", vals
+    got = vals[2]
+    n, shares = got["n"], got["shares"]
+    assert n >= 1, got
+    assert got["shape"] == ("strip" if n < 4 else "tiles"), got                # the shape follows the count
+    assert max(shares) - min(shares) < 0.03, got                                # equal tiles
+    assert sum(shares) > 0.85, got                                              # together they fill the row: no lone 240px tile, no void
 
 
 @needs_browser
-def test_morning_does_not_stretch_a_lone_work_card_across_the_page(tmp_path: Path) -> None:
+def test_morning_draws_the_tray_the_full_width_of_the_page(tmp_path: Path) -> None:
     vals = _page(tmp_path, [
         {"eval": "(() => { document.querySelector('[data-mode-tab=\"morning\"]').click(); return document.body.dataset.mode; })()"},
         {"eval": """(async () => { await new Promise(r => setTimeout(r, 300));
-          const g = [...document.querySelectorAll('.ck-zgrid')].find(z => [...z.children].some(p => getComputedStyle(p).display !== 'none' && p.querySelector('.tray-dump')));
-          const shown = [...g.children].filter(p => getComputedStyle(p).display !== 'none');
-          return [shown.length, shown[0].getBoundingClientRect().width / g.getBoundingClientRect().width]; })()"""},
+          const tray = [...document.querySelectorAll('.ck-zgrid .panel[data-ck-panel="tray"]')].find(p => getComputedStyle(p).display !== 'none');
+          if (!tray) return null;
+          const g = tray.closest('.ck-zgrid');
+          return { inCol: !!tray.closest('.ck-col'), share: tray.getBoundingClientRect().width / g.getBoundingClientRect().width }; })()"""},
     ])
     assert vals[1] == "morning", vals
-    n, share = vals[2]
-    assert n == 1 and 0.25 < share < 0.4, vals
+    assert vals[2] is not None, "no visible Tray on Morning"
+    assert vals[2]["inCol"] is True, vals                                       # the Tray sits inside .ck-col, not as a direct grid child
+    assert vals[2]["share"] > 0.95, vals                                        # found inside .ck-col (display: contents), not as a direct child
 
 
 @needs_browser
 def test_an_empty_card_is_its_header_and_one_line_not_a_populated_height(tmp_path: Path) -> None:
     vals = _page(tmp_path, [{"eval": """(async () => { await new Promise(r => setTimeout(r, 400));
-      const out = {}; for (const p of document.querySelectorAll('.ck-zgrid > .panel')) { const h = p.querySelector('h2'); if (h && /\\(0\\)$/.test(h.textContent)) out[h.textContent] = [p.classList.contains('ck-is-empty'), p.getBoundingClientRect().height]; }
-      const tall = [...document.querySelectorAll('.ck-zgrid > .panel.ck-h-tall')].filter(p => !p.classList.contains('ck-is-empty') && p.getBoundingClientRect().height > 0).map(p => p.getBoundingClientRect().height);
+      const empties = [...document.querySelectorAll('.ck-zgrid .panel')].filter(p => p.querySelector('.ck-count[hidden]'));   // descendants of a column included
+      const out = empties.map(p => [p.dataset.ckPanel, p.classList.contains('ck-is-empty') || p.classList.contains('ck-dash'), p.getBoundingClientRect().height, getComputedStyle(p).display]);
+      const tall = [...document.querySelectorAll('.ck-zgrid .panel.ck-h-tall')].filter(p => !p.classList.contains('ck-is-empty') && p.getBoundingClientRect().height > 0).map(p => p.getBoundingClientRect().height);
       return { out, tall: tall.length ? Math.min(...tall) : 0 }; })()"""}])
     got = vals[1]
     assert got["out"], vals
-    for name, (marked, h) in got["out"].items():
-        assert marked and h < got["tall"] / 2, (name, h, got["tall"])
+    for name, marked, h, display in got["out"]:
+        assert marked, (name, got)                                              # an empty card is marked empty (or dashed), whatever tab shows it
+        if display != "none" and got["tall"]:
+            assert h < got["tall"] / 2, (name, h, got["tall"])
 
 
 @needs_browser

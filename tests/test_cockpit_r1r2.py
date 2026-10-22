@@ -364,7 +364,7 @@ class TestManifestMapperAdversarial:
         view = _view(self._snap(ck))
         now = view["extra_panels"]["now"]["lines"][0]
         assert now["text"].endswith("<U+202E>END") and len(now["text"]) > 160   # full body, sanitised
-        assert "Overdue" in now["meta"]                                         # the kernel's band title, not "overdue"
+        assert now["grp"] == "OVERDUE"                                          # Now is a dated list: an overdue row sits under OVERDUE
 
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
@@ -428,7 +428,7 @@ class TestManifestMapperBoundary:
         snap["panels"]["now"]["degraded"] = ["tray"]
         snap["panels"]["now"]["error"] = None
         view = _view(snap)
-        assert view["extra_panels"]["now"]["note"] == "not complete: tray"
+        assert view["extra_panels"]["now"]["note"] == "next 7 days · not complete: tray"
 
     def test_wraps_state_is_tri_state_missing_is_not_unavailable_but_errored_is(self) -> None:
         def health_view(with_wraps: str | None) -> dict[str, Any]:

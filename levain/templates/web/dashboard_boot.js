@@ -203,10 +203,11 @@
   // a read (job-poll / search) on repeated 403s until a full substrate reload happens to re-bootstrap
   // (codex L3 LOW). Preserves the server's error message on a hard non-OK (e.g. the fail-closed 500 a
   // corrupt job store returns); the caller surfaces it. The token-class 403 is handled here.
-  async function authedReadJson(url) {
-    let res = await fetch(url, { cache: "no-store", headers: readHeaders() });
+  // `signal` (optional): an AbortSignal, so a caller that supersedes its own read (the topology Replay scrub) can cancel the older one.
+  async function authedReadJson(url, signal) {
+    let res = await fetch(url, { cache: "no-store", headers: readHeaders(), signal: signal });
     if (res.status === 403 && await isTokenReject(res)) {
-      if (promptForToken()) res = await fetch(url, { cache: "no-store", headers: readHeaders() });
+      if (promptForToken()) res = await fetch(url, { cache: "no-store", headers: readHeaders(), signal: signal });
       if (res.status === 403) { dropToken(); throw new Error("off-box token missing or invalid"); }
     }
     if (!res.ok) {

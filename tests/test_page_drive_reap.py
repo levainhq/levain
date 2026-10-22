@@ -52,3 +52,55 @@ def test_shot_writes_png_and_a_raising_run_reaps_chrome(tmp_path):
     with pytest.raises(subprocess.TimeoutExpired):
         _page_drive_run.run([node, DRIVER, CHROME, "about:blank", str(steps)], timeout=4)
     assert _survivors(before) == set()
+
+
+@pytest.mark.skipif(not Path(CHROME).exists() or not shutil.which("node"), reason="needs Chrome and node")
+def test_an_until_that_never_comes_true_fails_the_drive_unless_it_may_time_out(tmp_path):
+    node = shutil.which("node")
+    steps = tmp_path / "steps.json"
+
+    def drive(step):
+        steps.write_text(json.dumps([step]))
+        return _page_drive_run.run([node, DRIVER, CHROME, "about:blank", str(steps)], timeout=60)
+
+    r = drive({"until": "document.title === 'never'", "ms": 300})
+    assert r.returncode != 0 and "step 0" in r.stderr and "document.title === 'never'" in r.stderr, (r.returncode, r.stderr)
+    r = drive({"until": "document.title === 'never'", "ms": 300, "may_timeout": True})
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["values"] == [{"timeout": "document.title === 'never'"}]
+
+
+@pytest.mark.skipif(not Path(CHROME).exists() or not shutil.which("node"), reason="needs Chrome and node")
+def test_an_until_that_errors_or_never_answers_fails_the_drive_inside_its_own_deadline(tmp_path):
+    node = shutil.which("node")
+    steps = tmp_path / "steps.json"
+
+    def drive(step):
+        steps.write_text(json.dumps([step]))
+        t0 = time.monotonic()
+        r = _page_drive_run.run([node, DRIVER, CHROME, "about:blank", str(steps)], timeout=60)
+        return r, time.monotonic() - t0
+
+    # a syntax error is CDP exceptionDetails, never a truthy value: the wait fails and names the expression and the error
+    r, _ = drive({"until": "document.querySelector(", "ms": 300})
+    assert r.returncode != 0 and "document.querySelector(" in r.stderr and "last error" in r.stderr, (r.returncode, r.stderr)
+    # a promise that never settles is bounded by the step's ms, not by the runner's timeout
+    r, took = drive({"until": "new Promise(() => {})", "ms": 300})
+    assert r.returncode != 0 and "until never came true" in r.stderr, (r.returncode, r.stderr)
+    assert took < 30, took
+
+
+@pytest.mark.skipif(not Path(CHROME).exists() or not shutil.which("node"), reason="needs Chrome and node")
+def test_a_posts_wait_that_comes_up_short_fails_the_drive_and_leaves_a_picture_of_the_page(tmp_path):
+    node = shutil.which("node")
+    steps = tmp_path / "steps.json"
+
+    def drive(step):
+        steps.write_text(json.dumps([step]))
+        return _page_drive_run.run([node, DRIVER, CHROME, "about:blank", str(steps)], timeout=60)
+
+    r = drive({"posts": 1, "ms": 300})
+    assert r.returncode != 0 and "step 0: posts never reached 1" in r.stderr, (r.returncode, r.stderr)
+    assert (tmp_path / "timeout-step-0.png").stat().st_size > 0 and "timeout-step-0.png" in r.stderr       # what the page showed
+    r = drive({"posts": 1, "ms": 300, "may_timeout": True})
+    assert r.returncode == 0, r.stderr

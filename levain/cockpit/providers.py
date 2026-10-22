@@ -8,20 +8,21 @@ edit ledger is read directly because ``recent_edits`` swallows every fault."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Collection, Mapping, Sequence
 
 from levain import unshowable
 from levain.cockpit.anneal_effects import section_resource_key
 from levain.cockpit.authority import LabelKey
 from levain.cockpit.effects import SPORE_AUTHORITY_FIELDS, _stored_authority, spore_resource_key
 from levain.cockpit.engine import Cockpit, ProviderSpec, ReadContext, row_version_of
-from levain.cockpit.registry import parse_date
+from levain.cockpit.registry import opened_day, parse_date
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 from levain.dashboard import (
     CLASS_A,
@@ -105,12 +106,16 @@ def _view_fault(view: SubstrateView, *keys: str) -> Fault | None:
     return None
 
 
+def _handoff_expired(s: Any, today: date) -> bool:
+    """An undated handoff nobody has touched for more than ``HANDOFF_FRESH_DAYS``: the Tray lists it under "Also pending" and
+    Where to begin leaves it out. The one rule both read (a row's ``handoff_expired`` facet is this)."""
+    seen = parse_date(s.seen)
+    return bool(s.disposition == "handoff" and not parse_date(s.next) and seen and (today - seen).days > HANDOFF_FRESH_DAYS)
+
+
 def _spore_row(s: Any, today: date, *, held: bool = False) -> RowIn:
     due = parse_date(s.next)
-    seen = parse_date(s.seen)
-    expired = bool(
-        s.disposition == "handoff" and not due and seen and (today - seen).days > HANDOFF_FRESH_DAYS
-    )
+    expired = _handoff_expired(s, today)
     facets: dict[str, Any] = {
         "disposition": s.disposition, "domain": s.domain, "tier": s.tier, "salience": s.salience,
         "spore_type": s.type, "handoff_expired": expired, "last_seen": s.seen or None,
@@ -121,7 +126,7 @@ def _spore_row(s: Any, today: date, *, held: bool = False) -> RowIn:
         facets["held"] = True
     if due:
         facets["overdue_days"] = max(0, (today - due).days)
-    created = parse_date(s.created)
+    created = opened_day(s.created)
     if created and created <= today:
         facets["age_days"] = (today - created).days
     return RowIn(id=f"spore:{s.id}", title=s.text, body=s.text, facets=facets, stored=spore_stored(s))
@@ -160,6 +165,85 @@ def spore_row_version(raw: Mapping[str, Any]) -> str:
     spore write passes it to anneal as ``version_of``, so the compare runs inside anneal's write
     transaction against exactly what the operator was shown (§4.4)."""
     return row_version_of(spore_stored(open_spore_from(raw)), SPORE_VERSION_FIELDS, SPORE_VERSION_EXCLUDED)
+
+
+# a fresh install has no spore store until something is dropped: each panel says what fills it
+SPORE_EMPTY = {
+    "tray": "Nothing yet. Drop a thought in the box above and Sage sorts it.",
+    "loops": "Nothing yet. What stays open after Sage sorts the Tray is listed here.",
+    "keep": "Nothing yet. Add a note above to keep something handy.",
+}
+
+
+def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
+    """The Morning card's "Where to begin": read from the install's own Tray and Open loops, never set by anything else. What is late
+    leads (earliest first), then what is due today or a handoff still inside its claim, then the hottest open loop. With nothing in
+    either it says so and names the two real ways to fill it: a thought dropped in the Tray, and ``levain state``."""
+    def clip(text: Any) -> str:
+        t = " ".join(str(text).split())
+        return t if len(t) <= TOP_MAX_BEGIN else t[:TOP_MAX_BEGIN - 1] + "…"
+
+    def read(ctx: ReadContext) -> Result:
+        v = _view(source, ctx)
+        bad = _view_fault(v, "open_spores")
+        if bad:
+            return bad
+        today = ctx.today
+        late, due = [], []
+        for s in v.tray:
+            d = parse_date(s.next)
+            if d and d > today:
+                continue                                    # held until its surface date
+            if d and d < today:
+                late.append((d, s))
+            elif d == today or (not d and s.disposition == "handoff" and not _handoff_expired(s, today)):
+                due.append(s)
+        late.sort(key=lambda t: t[0])
+        first = [s for _d, s in late] + due
+        loops = sorted(v.open_spores, key=lambda s: {"hot": 0, "warm": 1, "cold": 2, "parked": 3}.get(s.tier, 9))
+        lines: list[dict[str, str]] = []
+        for i, s in enumerate(first[:3]):
+            lines.append({"label": ("first", "then", "after that")[i], "text": clip(s.text)})
+        if loops:
+            lines.append({"label": "loop", "text": clip(loops[0].text)})
+        if not lines:
+            return Read(value={"headline": "Nothing set for today yet", "title": "Where to begin", "source": "from the Tray and Open loops",
+                               "lines": [{"label": "set", "text": "Drop a thought in the Tray, or say what you are on with `levain state \"...\"`."}]})
+        value: dict[str, Any] = {"headline": "", "lines": lines, "title": "Where to begin",
+                                 "source": "from the Tray and Open loops"}
+        if loops:
+            # the open loops, hottest first, for the card's Threads column: the page groups them by the repo each one names (the
+            # same reading the row tags use), because only the page knows the sky's repos. Capped: the column shows few.
+            value["threads"] = [{"text": clip(s.text), "domain": s.domain or "", "tier": s.tier} for s in loops[:THREADS_MAX_LOOPS]]
+        overnight = _overnight(v)
+        if overnight:
+            value["overnight"] = overnight
+        return Read(value=value)
+    return read
+
+
+THREADS_MAX_LOOPS = 40
+
+
+def _overnight(v: Any) -> dict[str, Any] | None:
+    """Episodes recorded since the last wrap, from Levain's own stores (the last wrap's time and the substrate's episodes-since-wrap
+    count), or None when either is unknown: an absent figure is never drawn as 0."""
+    errors = getattr(v, "errors", None) or {}
+    if "wraps" in errors or "health" in errors:
+        return None
+    wraps = getattr(v, "wraps", None)
+    health = getattr(v, "health", None)
+    since = getattr(health, "episodes_since_wrap", None)
+    at = getattr(wraps[0], "wrapped_at", None) if wraps else None
+    if not at or isinstance(since, bool) or not isinstance(since, int) or since < 0:
+        return None
+    utc = _utc_at(at)
+    if not utc:                 # a wrap time that does not parse (or has no zone) is unknown time, not a reason to fault the card
+        return None
+    return {"episodes": since, "since": utc}
+
+
+TOP_MAX_BEGIN = 110
 
 
 def _spore_provider(
@@ -234,7 +318,10 @@ def _utc_at(v: Any) -> str:
         return ""
     if d.tzinfo is None:
         return ""
-    return d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    try:
+        return d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    except OverflowError:       # an instant whose UTC form is out of range is unknown time too
+        return ""
 
 
 @dataclass
@@ -639,7 +726,8 @@ def _crystals(source: SubstrateSource) -> Callable[[ReadContext], Result]:
                 continue
             rows.append(RowIn(
                 id=f"crystal:{name}", title=name, body=clause,
-                facets={"crystal_level": level, "permanence": perm, "last_activated_on": last or None, "tags": tags},
+                facets={"crystal_level": level, "permanence": perm, "activation_mode": act, "last_activated_on": last or None,
+                        "tags": tags},
                 stored={"name": name, "level": level, "one_clause": clause, "permanence": perm,
                         "activation_mode": act, "last_activated_on": last, "tags": tags}))
         return Read(rows=tuple(rows), skipped=((dropped, "malformed crystal row"),) if dropped else ())
@@ -759,6 +847,30 @@ def _prose(source: SubstrateSource, kind: str, ident: str) -> Callable[[ReadCont
     return read
 
 
+def _utc_iso(ts: str, add_s: float = 0) -> str | None:
+    """``ts`` as a UTC ISO string with microseconds, so the kernel's string-wise newest-first ordering is the order of the
+    instants whatever offset the store wrote; ``None`` if it does not parse."""
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    dt = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return (dt.astimezone(timezone.utc) + timedelta(seconds=add_s)).isoformat(timespec="microseconds")
+
+
+def _job_at(r: dict[str, Any], lease_s: int) -> str:
+    """When a job's result EXISTS, as a UTC instant: its finish for a terminal job; for a failed job with no finish (the
+    store projected a lease-expired record as failed) the instant its lease ran out, ``created_at + lease_s``
+    (``JobStore._lease_expired``); its creation while it is still pending or running. An unparseable stamp is kept as is."""
+    if r["status"] in ("done", "failed"):
+        if r.get("finished_at"):
+            return _utc_iso(r["finished_at"]) or r["finished_at"]
+        expired = _utc_iso(r["created_at"], lease_s)
+        if expired:
+            return expired
+    return _utc_iso(r["created_at"]) or r["created_at"]
+
+
 def _jobs(job_store: Any) -> Callable[[ReadContext], Result]:
     from levain.jobs import JobStoreCorruptError
 
@@ -769,11 +881,15 @@ def _jobs(job_store: Any) -> Callable[[ReadContext], Result]:
             recs = job_store.list_recent(ctx.now.isoformat(), 50)
         except JobStoreCorruptError as exc:
             return Fault(f"job store unreadable: {exc}")
+        ats = {r["job_id"]: _job_at(r, job_store.lease_s) for r in recs}
+        recs = sorted(recs, key=lambda r: ats[r["job_id"]], reverse=True)   # newest result first (UTC strings: instant order)
         rows = tuple(
             RowIn(
                 id=f"job:{r['job_id']}", title=f"{r['verb']} {r['status']}",
                 body=json.dumps(r.get("result")) if r.get("result") is not None else (r.get("error") or None),
-                facets={"job_status": r["status"], "verb": r["verb"], "at": r["created_at"]},
+                # `at` is when the result EXISTS: the job's finish for a terminal job (so Results orders and words by it),
+                # its creation while it is still pending or running
+                facets={"job_status": r["status"], "verb": r["verb"], "at": ats[r["job_id"]]},
                 stored={"job_id": r["job_id"], "verb": r["verb"], "status": r["status"],
                         "created_at": r["created_at"], "started_at": r.get("started_at"),
                         "finished_at": r.get("finished_at"), "result": r.get("result"), "error": r.get("error")},
@@ -892,7 +1008,11 @@ SESSIONS_NOTE = ("Sandbox is what the settings files say for each session's work
                  f"not visible to doctor or here: {SANDBOX_UNSEEN}. A session shows when it last fired a hook; "
                  "nothing says when one ends, so a silent one goes Quiet. Context is read from each session's transcript; a "
                  "relocated config directory is only found for sessions whose hook has recorded the path.")
-SESSION_FACETS = frozenset({"agent", "last_seen", "source", "session_activity", "legacy_meta"})
+SESSION_FACETS = frozenset({"agent", "last_seen", "source", "session_activity", "legacy_meta", "repo", "session_view"})
+SESSION_TOOL_LISTED = 12            # the newest listed sessions whose transcript log is read for the tool they last ran
+LIMIT_LABEL_MAX = 40               # characters of a limits metric label the Build tab shows
+SESSION_TOOL_MAX = 60               # characters of a tool event's text the Build tab shows
+LIMIT_STATUS_RANK = {"ok": 0, "amber": 1, "over": 2}
 
 
 def _session_stamp(v: Any) -> datetime | None:
@@ -979,6 +1099,127 @@ def _context_chip(rec: dict[str, Any]) -> tuple[str, Any]:
         return "context not read: unreadable", None
 
 
+def _cwd_hint(cwd: str) -> str:
+    """Where a session works, WITHOUT the whole path: this panel is token-free, and its tile has never carried the full
+    cwd. ``~/repo`` for a direct child of the home directory, ``~/…/repo`` deeper under it, ``/…/repo`` elsewhere."""
+    home = os.path.expanduser("~").rstrip("/\\")
+    name = unshowable.mark((os.path.basename(cwd.rstrip("/\\")) or "/"), "", allow="", selectors=False)[:64]
+    if name == "/":
+        return "/"
+    if home and cwd.rstrip("/\\") == home:
+        return "~"
+    if home and os.path.dirname(cwd.rstrip("/\\")) == home:
+        return f"~/{name}"
+    return f"~/…/{name}" if home and cwd.startswith(home + os.sep) else f"/…/{name}"
+
+
+# the tools whose one argument is a file path: the panel shows the BASENAME and nothing else of it
+_FILE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit", "Read", "apply_patch"})
+_TOOL_NAME = re.compile(r"[A-Za-z0-9_.\-]{1,48}")
+
+
+def _tool_name(name: Any) -> str:
+    """A tool's name as the token-free panel may show it: a plain identifier (MCP names included), else ``a tool``. Never
+    argument text: a name with a space, a slash or a control character is not a name."""
+    return name if isinstance(name, str) and _TOOL_NAME.fullmatch(name) else "a tool"
+
+
+def _tool_label(text: str) -> str:
+    """The token-free panel's words for a tool event (the hook logs ``Name: argument``): the tool name alone, plus the
+    BASENAME of the path for a file tool. The argument of any other tool (a shell command, an MCP call's payload) is never
+    shown, and a path is never shown whole: this panel is served without a token."""
+    name, sep, arg = " ".join(text.split("\n", 1)[0].split()).partition(": ")   # a multi-path patch logs one path a line: the first shows
+    name = _tool_name(name.strip())
+    if sep and name in _FILE_TOOLS:
+        base = re.split(r"[/\\]", arg.strip().rstrip("/\\"))[-1]
+        base = unshowable.mark(base, "", allow="", selectors=False)[:SESSION_TOOL_MAX]
+        if base:
+            return f"{name} {base}"
+    return name
+
+
+def _last_tool(install_root: Path, stem: str) -> tuple[str, str] | None:
+    """The newest ``tool`` event of a session's transcript log as (iso time, :func:`_tool_label`), or None. A display read
+    through the log reader's own bounded tail; any failure is no reading, never a dark panel."""
+    try:
+        from levain.cockpit import session_log as sl
+
+        raw = sl._tail(install_root / ".levain" / "sessions" / f"{stem}.log.jsonl")
+        if not raw:
+            return None
+        for line in reversed(raw.splitlines()):
+            ev = sl._event(line)
+            if ev is not None and ev["kind"] == "tool":
+                label = _tool_label(ev["text"])
+                return ev["at"], (label[:SESSION_TOOL_MAX - 1] + "\u2026" if len(label) > SESSION_TOOL_MAX else label)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _limit_figure(v: Any) -> str:
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return "unknown"
+    return str(int(v)) if float(v).is_integer() else f"{v:.1f}"
+
+
+def _limit_lines() -> tuple[str, dict[tuple[str, str], dict[str, Any]]]:
+    """Per (agent, session id), the budget line the Q13 limits panel reports: its worst metric, whether the session is
+    counted at all, whether it is halted. ``levain.consent.limits.panel`` is another lane's. Returns ``(state, lines)``:
+    ``absent`` (no such module or no ``panel``: no row draws a limits line), ``unreadable`` (it exists and raised or
+    answered junk: a budget nobody is watching, said on every row, never drawn as health) or ``ok``."""
+    import importlib
+
+    try:
+        mod = importlib.import_module("levain.consent.limits")
+        fn = getattr(mod, "panel", None)
+    except ModuleNotFoundError as exc:
+        # only THIS module (or a parent package) missing is "absent"; a dependency missing inside it is present and broken
+        if exc.name in ("levain.consent.limits", "levain.consent", "levain"):
+            return "absent", {}
+        return "unreadable", {}
+    except Exception:  # noqa: BLE001 - a module that exists and cannot be loaded (an ImportError included) is not a budget being watched
+        return "unreadable", {}
+    if not callable(fn):
+        return "absent", {}
+    try:
+        from levain.consent.queue import default_queue_dir
+
+        data = fn(default_queue_dir())
+        sessions = data.get("sessions") if isinstance(data, dict) else None
+        if not isinstance(sessions, list):
+            return "unreadable", {}
+        out: dict[tuple[str, str], dict[str, Any]] = {}
+        for ent in sessions:
+            if not isinstance(ent, dict) or not isinstance(ent.get("agent"), str) or not isinstance(ent.get("session"), str):
+                continue
+            worst, wr = None, (-1, -1.0)
+            for m in ent.get("metrics") or ():
+                if not isinstance(m, dict) or not isinstance(m.get("label"), str):
+                    continue
+                st = m.get("status") if m.get("status") in LIMIT_STATUS_RANK else "ok"
+                v, lim = m.get("value"), m.get("limit")
+                ratio = (v / lim) if isinstance(v, (int, float)) and isinstance(lim, (int, float)) \
+                    and not isinstance(v, bool) and not isinstance(lim, bool) and lim else 0.0
+                if (LIMIT_STATUS_RANK[st], ratio) > wr:
+                    worst, wr = (m, st), (LIMIT_STATUS_RANK[st], ratio)
+            # only an explicit `counting: true` is counting: a missing key is a session nobody is counting
+            line: dict[str, Any] = {"counting": ent.get("counting") is True}
+            if worst is not None:
+                m, st = worst
+                label = unshowable.mark(m["label"], "", allow="", selectors=False)[:LIMIT_LABEL_MAX]
+                figure = _limit_figure(m.get("value")) + (f"/{_limit_figure(m['limit'])}" if m.get("limit") is not None else "")
+                line["metric"] = f"{label} {figure}"
+                line["status"] = st
+            halted = ent.get("halted")
+            if isinstance(halted, dict):
+                line["halted"] = unshowable.mark(str(halted.get("kind") or "limit"), "", allow="", selectors=False)[:40]
+            out[(ent["agent"], ent["session"])] = line
+        return "ok", out
+    except Exception:  # noqa: BLE001 - a limits panel that cannot be read is said on the rows, never a dark sessions panel
+        return "unreadable", {}
+
+
 def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime], Any] | None]
               ) -> Callable[[ReadContext], Result]:
     def read(ctx: ReadContext) -> Result:
@@ -1004,6 +1245,7 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
             return Fault(f"the sessions directory cannot be read: {type(exc).__name__}")
         found.sort(key=lambda p: p[0], reverse=True)
         waiting: dict[tuple[str, str], int] = {}
+        waiting_on: dict[tuple[str, str], tuple[str, str]] = {}      # session -> (received_at, tool_name) of the NEWEST
         consent_read = True
         reader = consent()
         if reader is not None:
@@ -1014,9 +1256,13 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
                     if e.state in ("pending", "undecided"):
                         k = (e.request.agent, e.request.agent_session_id)
                         waiting[k] = waiting.get(k, 0) + 1
+                        at = str(e.request.received_at)
+                        if k not in waiting_on or at > waiting_on[k][0]:
+                            waiting_on[k] = (at, e.request.tool_name)
             except Exception:  # noqa: BLE001 - an unread queue is said, not shown as zero waiting
                 consent_read = False
-        listed: list[tuple[dict[str, Any], list[str], str, bool]] = []
+        listed: list[tuple[dict[str, Any], list[str], str, bool, dict[str, Any]]] = []
+        limits_state, limits = _limit_lines()
         bad = 0
         sandbox: dict[str, str] = {}
         for _mt, path in found[:SESSIONS_SHOWN]:
@@ -1035,24 +1281,45 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
                 chips.append("memory loaded at start")
             elif rec["context_delivered"] is False:
                 chips.append("memory not loaded")
-            chips.append(_context_chip(rec)[0])
+            ctx_text, sctx = _context_chip(rec)
+            chips.append(ctx_text)
             if not consent_read:
                 chips.append("consent not read")
             elif n := waiting.get((rec["agent"], rec["session_id"]), 0):
                 chips.append(f"{n} waiting")
             work = os.path.basename(rec["cwd"].rstrip("/\\")) or "/"
             work = unshowable.mark(work, "", allow="", selectors=False)[:64]
-            listed.append((rec, chips, work, age < SESSION_ACTIVE_S))
+            key = (rec["agent"], rec["session_id"])
+            view: dict[str, Any] = {"cwd": _cwd_hint(rec["cwd"]), "first_seen": rec["first_seen"], "last_seen": rec["last_seen"],
+                                    "context": ctx_text}
+            if sctx is not None:
+                from levain.cockpit.session_context import CONTEXT_WARN_TOKENS
+
+                view["tokens"], view["window"], view["compacted"] = sctx.tokens, sctx.window, bool(sctx.compacted)
+                view["warn"] = CONTEXT_WARN_TOKENS
+            if len(listed) < SESSION_TOOL_LISTED and (tool := _last_tool(source.install_root, rec["_stem"])) is not None:
+                view["tool_at"], view["tool"] = tool
+            if key in waiting_on:
+                view["waiting"] = _tool_name(waiting_on[key][1])
+                if waiting[key] > 1:
+                    view["waiting_n"] = waiting[key]
+            if limits_state == "unreadable":
+                view["limits"] = {"counting": False}
+            elif key in limits:
+                view["limits"] = limits[key]
+            listed.append((rec, chips, work, age < SESSION_ACTIVE_S, view))
         # Two listed sessions of one agent in one workspace would carry the same title: each such row says when it
         # started (never the session id, ruling 4). Two whose starts round alike (same minute; past an hour, same
         # hour) still read alike (known edge).
         titles: dict[tuple[str, str], int] = {}
-        for rec, _chips, work, _active in listed:
+        for rec, _chips, work, _active, _view in listed:
             titles[(rec["agent"], work)] = titles.get((rec["agent"], work), 0) + 1
         rows: list[RowIn] = []
-        for rec, chips, work, active in listed:
+        for rec, chips, work, active, view in listed:
             stored = {"agent": rec["agent"], "workspace": work, "last_seen": rec["last_seen"],
-                      "active": active, "chips": chips[1:]}
+                      "active": active, "chips": chips[1:],
+                      # the view ships once (facets); the row's version still moves with it, through its digest
+                      "view_sig": hashlib.sha1(json.dumps(view, sort_keys=True).encode("utf-8")).hexdigest()[:12]}
             started = _session_stamp(rec["first_seen"]) if titles[(rec["agent"], work)] > 1 else None
             meta = chips
             if started is not None and started <= rec["_seen"]:
@@ -1062,7 +1329,8 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
             rows.append(RowIn(
                 id=f"session:{rec['_stem']}", title=f"{rec['agent']} · {work}",
                 facets={"agent": rec["agent"], "last_seen": rec["last_seen"], "source": work,
-                        "session_activity": "active" if active else "quiet", "legacy_meta": " · ".join(meta)},
+                        "session_activity": "active" if active else "quiet", "legacy_meta": " · ".join(meta),
+                        "repo": work, "session_view": view},
                 stored=stored))
         skipped = ((bad, "session record that does not have the registry file's shape"),) if bad else ()
         if lost:
@@ -1073,10 +1341,27 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
     return read
 
 
+# the Levain-native panels a downstream may leave out (K1_DESIGN §3): only these; the kernel's core panels are not a menu
+OPTIONAL_NATIVE = frozenset({"activity", "memory_glance", "doctor", "topology"})
+
+
+def _dispatch_dir(consent_reader: Any) -> Any:
+    """Where the topology reads the dispatch store: the consent reader's own directory, and for the default reader
+    (``directory`` present and None = "the default queue", as ``read_listing`` resolves it) the queue's default
+    directory. A reader without the attribute names no directory, so none is read."""
+    if not hasattr(consent_reader, "directory"):
+        return None
+    if consent_reader.directory is not None:
+        return consent_reader.directory
+    from levain.consent.queue import default_queue_dir
+
+    return default_queue_dir()
+
+
 def build_default_cockpit(
     source: SubstrateSource, *, job_store: Any = None, clock: Callable[[], datetime] | None = None,
     episode_feeds: Mapping[str, Callable[[ReadContext], Result]] | None = None,
-    team_start: Path | str | None = None,
+    team_start: Path | str | None = None, exclude: Collection[str] = (),
 ) -> Cockpit:
     """The kernel's own cockpit over one substrate: every panel the dashboard already shows,
     as the five kinds (design §6.2). A downstream registers its own providers on the result.
@@ -1084,7 +1369,21 @@ def build_default_cockpit(
     ``episode_feeds`` federates other writers' episodes into the Episodes panel (a constellation's
     agents): ``{name: read}``, where ``read(ctx)`` returns a ``Read`` of ``RowIn`` rows using only the
     episode facets and stored fields. Each row is shown under ``feed:<name>:<id>`` with ``agent`` set
-    (the feed's name when the row names none); the entity's own rows carry the entity's name."""
+    (the feed's name when the row names none); the entity's own rows carry the entity's name.
+
+    ``exclude`` leaves out Levain-native panels a downstream draws its own way (ids in ``OPTIONAL_NATIVE``; any
+    other id raises ``ValueError``). The ``activity`` ambient holds the hero's ambient slot only until a
+    downstream registers its own hero ambient: it yields (``Cockpit.yield_hero``), so flow's ``sky`` takes the
+    slot with no opt-out."""
+    if isinstance(exclude, str):
+        raise ValueError("exclude is a collection of panel ids, not one string")
+    try:
+        exclude = frozenset(exclude)       # read once: a generator would be spent by the first membership test
+    except TypeError:
+        raise ValueError("exclude is a collection of panel ids") from None
+    bad_ids = sorted(map(str, exclude - OPTIONAL_NATIVE))      # str: a mixed-type set still sorts
+    if bad_ids:
+        raise ValueError(f"exclude {bad_ids}: only {sorted(OPTIONAL_NATIVE)} may be left out")
     feeds = tuple((episode_feeds or {}).items())
     for name, fn in feeds:
         if not isinstance(name, str) or not FEED_NAME.fullmatch(name) or not callable(fn):
@@ -1109,6 +1408,8 @@ def build_default_cockpit(
     ck.register(ProviderSpec("state", "line", "State", "gauge", _context_line(source),
                              region="brief", rank=0, optional=True, empty="No state line.",
                              verbs=("operator_state",)))
+    ck.register(ProviderSpec("begin", "brief", "Where to begin", "gauge", _where_to_begin(source),
+                             region="brief", rank=5, empty="Nothing set for today yet.", edit_class=CLASS_C))
     # mock-e's default layout (design 1011, "mock-e: what it decides"). The WORK zone (`operate`) is a
     # 3-column grid whose cards flow in rank order, `now` first: Now, Tray, Open loops (row a, tall) / [Inbox, Fleet,
     # Stream: downstream-only] / Recent episodes, Keep, Recent edits. Ranks leave gaps so a downstream's
@@ -1122,7 +1423,7 @@ def build_default_cockpit(
             pid, "triage-list", title, prio, _spore_provider(source, bucket), region="operate", rank=rank, size=size,
             order=order, views=views, rowset=f"spore:{bucket}", read_one=_spore_read_one(source, bucket),
             label_key=spore_label_key,
-            empty="Nothing waiting.", verbs=SPORE_ROW_VERBS + (("spore_seed",) if bucket == "tray" else ()),
+            empty=SPORE_EMPTY[bucket], absent_is_empty=True, verbs=SPORE_ROW_VERBS + (("spore_seed",) if bucket == "tray" else ()),
             **spore_common))
     ck.register(ProviderSpec(
         "episodes", "triage-list", "Recent episodes", "feed", _episodes(source, feeds), region="operate", rank=40,
@@ -1154,12 +1455,57 @@ def build_default_cockpit(
         version_fields=("*",), empty="No agent session active in the last 15 minutes."))
     ck.register(ProviderSpec("health", "metric", "Health", "gauge", _health(source), region="widgets", rank=40,
                              edit_class=CLASS_C))
+    # K1: the Levain-native activity feed (the hero's ambient) and two glance tiles; ``exclude`` leaves any out
+    from levain.cockpit.activity import ACTIVITY_GIT_DEADLINE_S, activity_reader
+    from levain.cockpit.glance import doctor_reader, memory_glance_reader
+
+    if "activity" not in exclude:
+        ck.register(ProviderSpec(
+            "activity", "ambient", "Activity", "feed",
+            activity_reader(install_root=source.install_root, episodic_db=source.anneal.episodic_db,
+                            consent=lambda: ck.consent_reader, questions=lambda: ck.question_store),
+            region="hero", rank=1, optional=True, timeout_s=ACTIVITY_GIT_DEADLINE_S + 6.0, edit_class=CLASS_C))
+        ck.yield_hero("activity")
+    if "memory_glance" not in exclude:
+        ck.register(ProviderSpec("memory_glance", "metric-grid", "Memory", "gauge",
+                                 memory_glance_reader(lambda ctx: _view(source, ctx)), region="widgets", rank=30,
+                                 edit_class=CLASS_C))
+    if "doctor" not in exclude:
+        ck.register(ProviderSpec("doctor", "status-dots", "Levain health", "gauge",
+                                 doctor_reader(source.install_root), region="widgets", rank=45, timeout_s=20.0,
+                                 edit_class=CLASS_C))
+    if "topology" not in exclude:
+        # F12a: the live topology (Build tab): sessions, the work they are on, what closing one would lose
+        from levain.cockpit.topology import topology_reader
+
+        def open_loops(ctx: ReadContext) -> list[Any]:
+            if not source.anneal.spores_json.exists():
+                return []
+            v = _view(source, ctx)
+            if "open_spores" in v.errors or "store" in v.errors:
+                raise RuntimeError("the spore store did not read")
+            return list(v.open_spores)
+
+        def hub_label(ctx: ReadContext) -> str:
+            try:
+                return _view(source, ctx).entity_name or "Levain"
+            except Exception:  # noqa: BLE001 - the hub's name is a label, never the panel's fault
+                return "Levain"
+
+        ck.register(ProviderSpec(
+            "topology", "topology", "Topology", "gauge",
+            topology_reader(install_root=source.install_root, consent=lambda: ck.consent_reader,
+                            questions=lambda: ck.question_store, hub_label=hub_label, spores=open_loops,
+                            dispatch_dir=lambda: _dispatch_dir(ck.consent_reader)),
+            region="operate", rank=80, size="tall", optional=True,
+            timeout_s=ACTIVITY_GIT_DEADLINE_S + 6.0, edit_class=CLASS_C,
+            empty="No agent session in the last day and no open task."))
     ck.register(ProviderSpec("graph", "visual", "Cognition trace", "feed", _graph(source), region="mind", rank=200,
                              size="short", tabs="Cognition", edit_class=CLASS_C))
     ck.register(ProviderSpec(
         "crystals", "triage-list", "Crystallized patterns", "feed", _crystals(source), region="mind", rank=100,
         size="tall", optional=True, order="crystal.level", rowset="crystals",
-        facets=frozenset({"crystal_level", "permanence", "last_activated_on", "tags"}),
+        facets=frozenset({"crystal_level", "permanence", "activation_mode", "last_activated_on", "tags"}),
         version_fields=("name", "level", "one_clause", "permanence", "activation_mode", "tags"),
         version_excluded=("last_activated_on",), search_fields=("title", "body"), edit_class=CLASS_C,
         empty="No crystals yet."))
