@@ -21,6 +21,7 @@ The slot state file ``L/slots/{e,v}<n>/state`` (``levain-slot-state/1``, §3.5 P
 """
 from __future__ import annotations
 
+import base64
 import errno
 import fcntl
 import os
@@ -38,6 +39,7 @@ from typing import Callable, ContextManager, Dict, Iterable, Iterator, List, Map
 
 from levain.contracts import ContractError, canon
 from levain.slot import Refused, wall, write_all
+from levain.slot import bundlefmt as BF
 from levain.slot import proc as PR
 from levain.slot import records as R
 from levain.slot import render as RD
@@ -1466,8 +1468,9 @@ def open_slot_owned_dir(parent: int, name: str, owner_uid: int, where: str) -> i
 
 
 def render_step3_files(run: RenderRun) -> None:
-    """(3) The staging bundle -> a FRESH ``<S>/in/repo.bundle`` (§5.4: the reader runs as alloc ``staging_uid``);
-    then ``<S>/root/*`` and the onboarding pre-seed from ``render.render``, each a fresh file with its §2.1 row;
+    """(3) The staging bundle -> a FRESH ``<S>/in/repo.bundle`` (§5.4: the reader runs as alloc ``staging_uid``),
+    its header parsed in the copy (§5a) and ``alloc.base`` written from it; then ``<S>/root/*`` and the onboarding
+    pre-seed from ``render.render``, each a fresh file with its §2.1 row;
     then staging is emptied, only now that every staged file's destination is durable."""
     ctx, a = run.ctx, run.alloc
     seams = ctx.seams
@@ -1480,10 +1483,23 @@ def render_step3_files(run: RenderRun) -> None:
         with ctx.store.dir(*S, *parent) as pfd:
             ctx.store.mkdir(pfd, name, row.uid, row.gid, row.mode, f"live/{a.session}/{row.rel}")
             seams.fsync(pfd)
+    # §5a: the header is parsed by bundlefmt as the bytes are copied (an incremental observer, never the whole body
+    # in memory); a header off the grammar or the base rule refuses inside the copy, so the staged file is removed.
+    obs = BF.HeaderObserver(check=BF.base_of)
     with ctx.store.dir("staging", a.session, trusted=False) as staging, ctx.store.dir(*S, "in") as dest:
-        ST.stage_bundle(staging, dest, staging_uid=a.staging_uid, staging_gid=seams.user_gid(a.staging_uid),
-                        dest_gid=facts.slot_gid, run_as=seams.stage_run_as, fsync=seams.fsync,
-                        chown=lambda fd, u, g: seams.chown(fd, u, g, f"live/{a.session}/in/{ST.BUNDLE_NAME}"))
+        staged = ST.stage_bundle(staging, dest, staging_uid=a.staging_uid,
+                                 staging_gid=seams.user_gid(a.staging_uid), dest_gid=facts.slot_gid,
+                                 run_as=seams.stage_run_as, fsync=seams.fsync, observe=obs.feed,
+                                 chown=lambda fd, u, g: seams.chown(fd, u, g,
+                                                                    f"live/{a.session}/in/{ST.BUNDLE_NAME}"))
+    header = obs.finish()
+    oid, ref = BF.base_of(header)
+    # alloc.base from the bytes root itself copied, written once the bundle is durable and before RENDERED (alloc
+    # is immutable after it); later alloc writes in this render carry it, being replaces of run.alloc.
+    run.alloc = a = replace(a, base=R.AllocBase(oid=oid, ref_b64=base64.b64encode(ref).decode("ascii"),
+                                                object_format=header.object_format,
+                                                bundle_sha256=staged.digest, bundle_bytes=staged.size))
+    write_alloc(ctx, a)
     owner = session_owner_uid(a)
     for f in rendered.files:
         *parent, name = f.path.split("/")
@@ -1743,7 +1759,7 @@ def adopt_peak_bytes(host: str, *, entries: int, nbytes: int, manifest_bytes: in
 
 
 def _alloc_base_field(a: R.Alloc) -> Optional[Mapping[str, object]]:
-    return getattr(a, "base", None)
+    return None if a.base is None else R.base_obj(a.base)
 
 
 @dataclass

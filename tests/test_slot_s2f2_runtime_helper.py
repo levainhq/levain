@@ -36,7 +36,10 @@ ACCOUNTS = {"_levain_s0": 899, "_levain_gw0": 898, "_levain_s1": 897, "_levain_g
             "_levain_dispatch": DISPATCH_UID}
 GROUPS = {"levain-gwfronts": 789, "levain-slots": 788}
 BOOT = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
-BUNDLE = b"# v2 git bundle\n" + b"bundle-bytes " * 64
+#: A header render's bundlefmt parse accepts (HEAD naming the one branch ref), then stand-in pack bytes.
+BUNDLE_OID = b"0123456789abcdef0123456789abcdef01234567"
+BUNDLE = (b"# v2 git bundle\n" + BUNDLE_OID + b" HEAD\n" + BUNDLE_OID + b" refs/heads/main\n\n"
+          + b"bundle-bytes " * 64)
 BASE = {"format": "levain-routes-base/1", "routes": [
     {"route": "anthropic", "type": "brokered"}, {"route": "github", "type": "egress"},
     {"route": "claude-sub", "type": "subscription_passthrough"}]}
