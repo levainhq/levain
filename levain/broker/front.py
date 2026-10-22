@@ -757,8 +757,9 @@ class BrokeredExchange:
 
     async def _write_body(self, kw: asyncio.StreamWriter, events: asyncio.Queue) -> None:
         """Forward the slot's body as `B` frames, then `E`. Posts how it ended: "end", "write-error" (a write to
-        keys failed), "slot-eof" / "slot-gone" (the slot closed or failed mid-body; an `X` was sent), "body-cap"
-        (chunked past the cap; `X` sent), or "malformed"."""
+        keys failed), "slot-eof" (the slot closed mid-body; an `X` was sent), ("slot-gone", the error's type) (a read
+        on the slot failed; `X` sent), "body-cap" (chunked past the cap; `X` sent), or "malformed". It never writes
+        the record: the relay does, from the event, only if the exchange ends that way."""
         cap, sent = self.route.body_cap, 0
         await self.parked.wait()
         self.parked_before_first_write = self.parked.is_set()
@@ -772,9 +773,8 @@ class BrokeredExchange:
                     await events.put(("body", "slot-eof"))
                     return
                 except OSError as e:   # a read error on the SLOT (a reset mid-upload): the slot is gone, keys hears X
-                    self.rec["slot_error"] = type(e).__name__
                     kw.write(gwwire.encode(b"X"))
-                    await events.put(("body", "slot-gone"))
+                    await events.put(("body", ("slot-gone", type(e).__name__)))
                     return
                 except Refused:
                     kw.write(gwwire.encode(b"X"))
@@ -805,8 +805,12 @@ class BrokeredExchange:
         try:
             await self._relay_events(kw, events, expect, writer)
         except OSError as e:   # the slot went away mid-answer (keys-side errors are caught where they happen)
-            self.rec["end"] = "slot-gone"
-            self.rec["slot_error"] = type(e).__name__
+            self._end_slot_gone(type(e).__name__)
+
+    def _end_slot_gone(self, error: str) -> None:
+        """The record of an exchange that ended because the slot failed: `end: slot-gone` and the error's type."""
+        self.rec["end"] = "slot-gone"
+        self.rec["slot_error"] = error
 
     async def _relay_events(self, kw: asyncio.StreamWriter, events: asyncio.Queue, expect: bool,
                             writer: asyncio.Future) -> None:
@@ -818,8 +822,11 @@ class BrokeredExchange:
                     continue
                 if payload == "write-error":
                     continue   # the reader's verdict decides: the F it already holds, or keys-unavailable
-                if payload in ("slot-eof", "slot-gone"):
+                if payload == "slot-eof":
                     self.rec["end"] = payload
+                    return
+                if isinstance(payload, tuple):   # ("slot-gone", the error's type): a read on the slot failed
+                    self._end_slot_gone(payload[1])
                     return
                 if not started:   # the writer has returned: nothing else reads the slot
                     await self.refuse(Refused("body-cap" if payload == "body-cap" else "malformed", "body"),
@@ -911,7 +918,12 @@ class BrokeredExchange:
             if early:
                 kw.write(gwwire.encode(b"D", early))
             while True:
-                data = await self.sreader.read(gwwire.CHUNK)
+                try:
+                    data = await self.sreader.read(gwwire.CHUNK)
+                except OSError as e:   # a read error on the SLOT (a reset): keys hears `E`, the relay below ends
+                    kw.write(gwwire.encode(b"E"))
+                    await events.put(("body", ("slot-gone", type(e).__name__)))
+                    return
                 if not data:
                     kw.write(gwwire.encode(b"E"))
                     await kw.drain()
@@ -923,6 +935,11 @@ class BrokeredExchange:
         try:
             while True:
                 kind, payload = await self._next(events)
+                if kind == "body" and isinstance(payload, tuple):   # the pump: a read on the slot failed
+                    self._end_slot_gone(payload[1])
+                    return
+                if kind == "body" and payload == "end":   # the GET's finished body writer: its event can queue behind `U`
+                    continue
                 if kind != b"D":
                     self.rec["end"] = "ws-" + (kind.decode("ascii") if isinstance(kind, bytes) else kind)
                     return
@@ -945,12 +962,14 @@ class BrokeredExchange:
                                b"X-Levain-Refused: %s\r\nConnection: close\r\n\r\n%s"
                                % (r.status, REASON[r.status], len(body), r.name.encode(), body))
             await self.swriter.drain()
-            if self.swriter.can_write_eof():
-                self.swriter.write_eof()
         except OSError as e:
-            self.rec["end"] = "slot-gone"
-            self.rec["slot_error"] = type(e).__name__
+            self._end_slot_gone(type(e).__name__)
             return
+        if self.swriter.can_write_eof():
+            try:
+                self.swriter.write_eof()
+            except OSError:   # the slot closed after the whole refusal: still delivered
+                pass
         if discard:
             await self._discard()
 
