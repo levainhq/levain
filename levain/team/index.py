@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from levain import unshowable
+
 from . import entry as E
 
 ANCHORABLE = ("decision", "constraint", "finding", "question", "tension")
@@ -292,11 +294,17 @@ _BREAKS = ("\r\n", "\n", "\r", " ", " ", "\x85", "\x0b", "\x0c",
            "\x1c", "\x1d", "\x1e")  # FS/GS/RS: str.splitlines() breaks on these too
 
 
-def oneline(text: str) -> str:
-    """Free text on one line, so recorded words can never draw a fake entry or heading where they are shown."""
+def oneline(text: str, *, ident: bool = False) -> str:
+    """Ledger text as it may be shown: on one line, so recorded words can never draw a fake entry or heading, and
+    with every character a reader cannot see written as ``⟨U+XXXX⟩`` (:mod:`levain.unshowable`).
+
+    This is the display rule, not a second write gate: the ledger refuses such text when it is recorded, but a line
+    is read without that check (one written before the rule, or by a teammate's own client), and what is shown here
+    goes into every teammate's agent. ``ident=True`` is the rule for an owner or a path (nothing hidden, no
+    presentation selector, and a tab is marked too); the default is the prose rule, where a tab shows as itself."""
     for b in _BREAKS:
         text = text.replace(b, " ⏎ ")
-    return text
+    return unshowable.mark(text, allow="", selectors=False) if ident else unshowable.mark(text, allow="\n\t")
 
 
 def render(e: dict) -> str:
@@ -306,7 +314,7 @@ def render(e: dict) -> str:
     if e.get("words"):
         bits.append(f'  words: "{oneline(e["words"])}"')
     if e.get("owner"):
-        bits.append(f"  owner of the call: {oneline(e['owner'])}")
+        bits.append(f"  owner of the call: {oneline(e['owner'], ident=True)}")
     src = f"pack {oneline(e['pack'])}" if e.get("pack") else (e.get("agent") or "human")
     bits.append(f"  recorded by {oneline(str(e.get('author')))} ({src}), {age(e.get('ts', ''))}")
     if e.get("summary"):
@@ -314,7 +322,7 @@ def render(e: dict) -> str:
     if e.get("reason"):
         bits.append(f"  why: {oneline(e['reason'])}")
     if e.get("paths"):
-        bits.append(f"  governs: {oneline(', '.join(e['paths']))}")
+        bits.append(f"  governs: {', '.join(oneline(p, ident=True) for p in e['paths'])}")
     if e.get("recheck"):
         bits.append(f"  re-check: {oneline(e['recheck'])}")
     # One fold over every line this emits, whatever field fed it: per-field folding missed a new field each review

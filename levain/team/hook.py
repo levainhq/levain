@@ -62,7 +62,7 @@ def decide(team: R.Team, ledger: I.Ledger, handle: str | None, rel: str, session
     acked = ledger.acked(session, handle) if session else set()
     seen = denied_before | acked
     pending = [e for e in once if e["id"] not in seen]
-    owners = sorted({I.oneline(e["owner"]) for e in tensions + foreign if e.get("owner")})
+    owners = sorted({I.oneline(e["owner"], ident=True) for e in tensions + foreign if e.get("owner")})
     blocks = "\n\n".join(I.render(e) for e in matched)
     head = (f"{TAG} {rel} is governed by {len(matched)} recorded entr{'y' if len(matched) == 1 else 'ies'} in "
             f"the {I.oneline(team.project)} team ledger.")
@@ -465,10 +465,11 @@ def sessionstart(payload: dict) -> None:
     for e in (rulings[:15] if show else []):
         # Every ledger-supplied string goes through oneline: a member writes these, and a line break in
         # them would draw a forged "[team]" line into every teammate's session context.
-        where = I.oneline(", ".join(e.get("paths") or ["(project-wide)"]))
-        words = I.oneline(e.get("words", ""))
-        owner = I.oneline(str(e.get("owner")))
-        lines.append(f"  - {where}: owner {owner}: \"{words[:160]}{'...' if len(words) > 160 else ''}\"")
+        where = ", ".join(I.oneline(p, ident=True) for p in e.get("paths") or []) or "(project-wide)"
+        raw = str(e.get("words") or "")
+        # Cut the raw words, then mark: a cut after marking can split a ⟨U+XXXX⟩ marker.
+        owner = I.oneline(str(e.get("owner") or ""), ident=True)
+        lines.append(f"  - {where}: owner {owner}: \"{I.oneline(raw[:160])}{'...' if len(raw) > 160 else ''}\"")
     if show and len(rulings) > 15:
         lines.append(f"  - ...and {len(rulings) - 15} more in PROJECT.md / `levain team status`")
     if fetch_note:

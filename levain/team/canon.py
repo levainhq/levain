@@ -23,7 +23,7 @@ def _count(ledger: I.Ledger) -> int:
 def _entry_block(e: dict, team: R.Team) -> list[str]:
     meta = [e["id"]]
     if e.get("owner"):
-        meta.append(f"owner {I.oneline(e['owner'])}")
+        meta.append(f"owner {I.oneline(e['owner'], ident=True)}")
     if e.get("kind") == "ruling":
         meta.append(f"mode {e.get('mode') or team.mode}")
     src = f"pack {I.oneline(e['pack'])}" if e.get("pack") else I.oneline(str(e.get("author", "?")))
@@ -76,7 +76,7 @@ def render(team: R.Team, ledger: I.Ledger, *, tree: str, by: str, ts: str) -> st
         lines.append("An agent editing a matching path is shown the ruling (and, by mode, stopped until it asks).")
         lines.append("")
         for g in sorted(by_path):
-            lines.append(f"### `{I.oneline(g)}`")
+            lines.append(f"### `{I.oneline(g, ident=True)}`")
             for e in by_path[g]:
                 lines.extend(_entry_block(e, team))
             lines.append("")

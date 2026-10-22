@@ -49,11 +49,30 @@ def _days(ts: str, now: datetime) -> int | None:
     return max(0, (now - then).days)
 
 
+# Every string the model emits to a pane is marked in ONE step (`_shown`, applied to the whole model at the return of
+# build_model), so a field added to a card cannot reach the page unmarked. Cards and panes below are built from RAW
+# ledger values: matching, filtering, grouping and sorting use those. Fields named here are identifiers (an owner, a
+# path, an author, a pack, an id): the strict rule, nothing hidden and a tab marked too. Every other string is prose.
+_IDENT_FIELDS = frozenset({"id", "owner", "paths", "path", "recorded_by", "pack", "ruling_ids", "you", "project",
+                           "type", "kind", "why", "path_filter"})
+
+
+def _shown(v: Any, key: str = "") -> Any:
+    if isinstance(v, str):
+        return I.oneline(v, ident=key in _IDENT_FIELDS)
+    if isinstance(v, dict):
+        return {k: _shown(x, k) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_shown(x, key) for x in v]
+    return v
+
+
 def _card(e: dict, now: datetime) -> dict:
-    """The fields a pane shows for one entry. No counts, nothing keyed by person."""
+    """The fields a pane shows for one entry, RAW (`build_model` marks the whole model once). No counts, nothing keyed
+    by person."""
     return {"id": e["id"], "type": e.get("type"), "kind": e.get("kind"), "owner": e.get("owner") or "",
-            "words": I.oneline(e.get("words") or ""), "summary": I.oneline(e.get("summary") or ""),
-            "reason": I.oneline(e.get("reason") or ""), "recheck": I.oneline(e.get("recheck") or ""),
+            "words": e.get("words") or "", "summary": e.get("summary") or "",
+            "reason": e.get("reason") or "", "recheck": e.get("recheck") or "",
             "paths": list(dict.fromkeys(e.get("paths") or [])), "recorded_by": e.get("author", "?"),
             "age": I.age(e.get("ts", ""), now), "age_days": _days(e.get("ts", ""), now),
             "pack": e.get("pack") or ""}
@@ -61,7 +80,7 @@ def _card(e: dict, now: datetime) -> dict:
 
 def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: str | None, state: str, *,
                 now: datetime | None = None, recheck_days: int = DEFAULT_RECHECK_DAYS,
-                ack_flag: int = DEFAULT_ACK_FLAG, path_filter: str = "") -> dict:
+                ack_flag: int = DEFAULT_ACK_FLAG, path_filter: str = "", partial: str | None = None) -> dict:
     """The four panes as plain data, from one ledger snapshot. Pure: no I/O.
 
     ``path_filter`` narrows all four panes to what governs one path: an entry stays when one of its globs matches the
@@ -107,7 +126,7 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
                 if g not in seen:
                     seen.add(g)
                     slot["acks"] += 1
-                slot["rulings"][rid] = I.oneline(r.get("words") or r.get("summary") or "")
+                slot["rulings"][rid] = r.get("words") or r.get("summary") or ""
         ack_total += bool(seen)
     stopped = [{"path": g, "acks": s["acks"], "ruling_ids": sorted(s["rulings"]),
                 "ruling_words": [s["rulings"][k] for k in sorted(s["rulings"])],
@@ -124,7 +143,7 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
     for e in live:
         why = []
         if (e.get("kind") == "ruling" or e.get("type") in ("question", "tension")) and holder_gone(e.get("owner") or ""):
-            why.append("no owner" if not e.get("owner") else f"owner {I.oneline(e['owner'])} is not on team.toml")
+            why.append("no owner" if not e.get("owner") else f"owner {e['owner']} is not on team.toml")
         if e.get("recheck") and (_days(e.get("ts", ""), now) or 0) > recheck_days:
             why.append(f"recheck is {_days(e.get('ts', ''), now)} days old")
         if why:
@@ -139,13 +158,14 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
                 paths[g].append(_card(e, now))
     canon = [{"path": g, "entries": paths[g]} for g in sorted(paths)]
 
-    return {"project": team.project, "owner": team.owner, "mode": team.mode, "you": handle,
+    return _shown({"project": team.project, "owner": team.owner, "mode": team.mode, "you": handle,
             "canon_status": C.staleness(canon_text, state), "problems": len(ledger.problems),
             "recheck_days": recheck_days, "ack_flag": ack_flag,
             "waiting": waiting, "stopped": stopped,
             "ack_total": ack_total, "held": held, "held_count": len(held), "in_force": canon,
             "in_force_count": len(live), "path_filter": pf,
-            "generated": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            **({"partial": partial} if partial else {}),
+            "generated": now.strftime("%Y-%m-%dT%H:%M:%SZ")})
 
 
 # ---- rendering ---------------------------------------------------------------------------------------------
@@ -406,18 +426,18 @@ class _ViewHandler(GuardedHandler):
             raise _Busy()
         try:
             sha, team, ledger = gl.snapshot()
-            model = build_model(team, ledger, gl.handle(team), gl.read_canon(sha), gl.state_hash(ledger, team),
-                                recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag,
-                                path_filter=path_filter)
             # a ledger judged only in part says so here as the Team zone does, never drawn as if current; the
-            # derivation is the one the snapshot just used (cached per tip), not a second judgement
+            # derivation is the one the snapshot just used (cached per tip), not a second judgement. It enters
+            # build_model, so `partial` is marked by the same single `_shown` step as every other string.
             derive = getattr(gl, "derivation", None)
+            partial = None
             if callable(derive):
                 from .reader import partial_why
 
-                why = partial_why(derive(sha))
-                if why is not None:
-                    model["partial"] = why
+                partial = partial_why(derive(sha))
+            model = build_model(team, ledger, gl.handle(team), gl.read_canon(sha), gl.state_hash(ledger, team),
+                                recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag,
+                                path_filter=path_filter, partial=partial)
             return model
         finally:
             self.server.model_lock.release()

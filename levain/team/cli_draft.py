@@ -1,15 +1,21 @@
 """``levain team draft ...``: the coordinator drafts team-ledger entries, the operator signs (C8).
 
 ``add`` is the coordinator's (or yours); ``promote`` is the one step that signs, and it runs the ordinary record path
-under THIS clone's key after showing the whole draft. Inside a session Levain launched, only ``add`` (as the
-coordinator), ``list`` and ``show`` run: the coordinator's door refuses the rest before this module is reached. That
-keeps the draft path honest; it is not a lock on the key, which any process of the same user can still use.
+under THIS clone's key after showing the whole draft. Run from inside the coordinator's workspace, only ``add`` (as the
+coordinator), ``list`` and ``show`` run, for the operator too: the coordinator's door (:mod:`levain.coordinator.door`)
+refuses the rest by WHERE the command runs, so promote from your own clone. That keeps the draft path honest; it is
+not a lock on the key, which any process of the same user can still use.
+
+A draft is shown with every character a person cannot see written as ``⟨U+XXXX⟩`` (:mod:`levain.unshowable`), so a
+draft stored before the ledger refused such text shows what it holds; promote refuses to sign such text.
 """
 from __future__ import annotations
 
 import json
 import sys
 from pathlib import Path
+
+from levain import unshowable
 
 from . import entry as E
 from .ledger_api import open_ledger
@@ -26,12 +32,14 @@ def _show(v: dict) -> str:
     e = v["entry"]
     lines = [f"draft {v['draft_id']}  [{v['state']}]  drafted by {v['drafted_by']} at {v['drafted_at']}",
              f"  {v['type']}" + (f" . {e['kind']}" if e.get("kind") else "") +
-             (f"  owner {e['owner']}" if e.get("owner") else "")]
+             (f"  owner {unshowable.mark(e['owner'], allow='', selectors=False)}" if e.get("owner") else "")]
     for k in ("words", "summary", "reason", "recheck"):
         if e.get(k):
-            lines.append(f"  {k}: {json.dumps(e[k], ensure_ascii=False)}")
+            # newline and tab are prose: shown escaped by json, never as a marker; a stored non-string is shown as is
+            shown = unshowable.mark(e[k], allow="\n\t") if isinstance(e[k], str) else e[k]
+            lines.append(f"  {k}: {json.dumps(shown, ensure_ascii=False)}")
     if e.get("paths"):
-        lines.append("  governs: " + ", ".join(e["paths"]))
+        lines.append("  governs: " + ", ".join(unshowable.mark(p, allow="", selectors=False) for p in e["paths"]))
     if v.get("ledger_id"):
         lines.append(f"  signed as ledger entry {v['ledger_id']}")
     return "\n".join(lines)
@@ -58,9 +66,11 @@ def _signed(gl, handle: str, key: str) -> tuple[dict | None, dict[str, dict]]:
 
 
 def _words(args) -> str | None:
+    from .cli import _prose
+
     if getattr(args, "words_file", None):
-        return Path(args.words_file).read_text(encoding="utf-8").strip()
-    return args.words
+        return _prose(Path(args.words_file).read_text(encoding="utf-8").strip())
+    return _prose(args.words)
 
 
 def cmd_draft(args) -> int:
@@ -70,13 +80,16 @@ def cmd_draft(args) -> int:
     from levain.coordinator.store import CoordError
     from levain.dispatch.jobs import JobStoreError
 
+    from .cli import _prose
+
     verb = args.draft_command
     try:
         store = _store(args)      # opening the store refuses like any of its verbs: an error line, never a traceback
         if verb == "add":
             v = T.add_draft(store, args.type, words=_words(args), kind=args.kind, owner=args.owner,
-                            paths=[p for p in (args.paths or [])], summary=args.summary, reason=args.reason,
-                            recheck=args.recheck, thread_id=args.thread, by=args.by, token=args.token)
+                            paths=[p for p in (args.paths or [])], summary=_prose(args.summary),
+                            reason=_prose(args.reason), recheck=_prose(args.recheck), thread_id=args.thread, by=args.by,
+                            token=args.token)
             print(_show(v) if not args.json else json.dumps(v, ensure_ascii=False))
         elif verb == "list":
             rows = T.list_drafts(store, state=None if args.all else ("drafted", "promoting"))

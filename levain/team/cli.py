@@ -29,6 +29,12 @@ def _repo(args) -> Repo:
     return repo
 
 
+def _prose(text: str | None) -> str | None:
+    """Prose as typed or pasted: a Windows line end (CRLF) is a line break, so it becomes one before the ledger checks
+    the text. A lone carriage return is not, and the ledger still refuses it."""
+    return text.replace("\r\n", "\n") if isinstance(text, str) else text
+
+
 def _split(values: list[str] | None) -> list[str]:
     out = []
     for v in values or []:
@@ -194,7 +200,8 @@ def cmd_record(args) -> int:
     if owner and not team.owner_ok(owner):
         raise TeamError(f"owner {owner!r} is not allowed by team.toml (members, lead, client:<client_owners>)")
     e = E.build(handle, args.type, kind=args.kind, mode=args.mode, paths=_repo_paths(repo, _split(args.paths)),
-                owner=owner, words=words, summary=args.summary, reason=args.reason, recheck=args.recheck,
+                owner=owner, words=_prose(words), summary=_prose(args.summary), reason=_prose(args.reason),
+                recheck=_prose(args.recheck),
                 supersedes=_split(args.supersedes), refs=_split(args.refs),
                 agent=args.agent or os.environ.get("LEVAIN_TEAM_AGENT") or "human",
                 session=args.session or os.environ.get("CLAUDE_SESSION_ID"))
@@ -214,7 +221,7 @@ def cmd_retire(args) -> int:
     team, handle = _actor(gl)
     if args.owner and not team.owner_ok(args.owner):
         raise TeamError(f"owner {args.owner!r} is not allowed by team.toml (members, lead, client:<client_owners>)")
-    e = E.build(handle, "retire", supersedes=_split(args.ids), words=args.words, reason=args.reason,
+    e = E.build(handle, "retire", supersedes=_split(args.ids), words=_prose(args.words), reason=_prose(args.reason),
                 owner=args.owner, agent=args.agent or "human")
     sealed = gl.append(e, push=not args.no_push)
     print(f"recorded {sealed['id']} (retires {', '.join(sealed['supersedes'])})")
