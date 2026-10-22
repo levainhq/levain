@@ -501,11 +501,15 @@ def install_loose(objects: Path, oid: str, spool: Spool, f: Frame, object_format
         tmp = d / f"tmp_{oid[2:]}_{os.getpid()}"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o444)
         try:
-            for chunk in spool.chunks(f.offset, f.size):
-                write_all(fd, chunk)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+            try:
+                for chunk in spool.chunks(f.offset, f.size):
+                    write_all(fd, chunk)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except BaseException:
+            _unlink_quietly(tmp)
+            raise
         _link_final(tmp, final, oid, object_format)
     except OSError as e:
         raise _oserror(e, f"writing loose object {oid}") from None
@@ -523,21 +527,41 @@ def _link_final(tmp: Path, final: Path, oid: str, object_format: str) -> None:
         os.unlink(tmp)
 
 
+def _unlink_quietly(path: Path) -> None:
+    """A temp name the importer created, removed on a failed write (an error here would hide the first one)."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def _same_object(path: Path, oid: str, object_format: str) -> bool:
+    """Whether the file at a final loose name inflates and hashes to ``oid``, read and inflated in chunks, so memory
+    stays bounded whatever the object's size. Bytes after the zlib stream, or a stream that does not end, are not
+    the object."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
         return False
+    hasher = FORMATS[object_format][1]()
+    d = zlib.decompressobj()
     try:
-        data = b""
         while chunk := os.read(fd, _CHUNK):
-            data += chunk
-    finally:
-        os.close(fd)
-    try:
-        return FORMATS[object_format][1](zlib.decompress(data)).hexdigest() == oid
+            if d.eof:
+                return False
+            data = chunk
+            while data:
+                hasher.update(d.decompress(data, _CHUNK))
+                data = d.unconsumed_tail
+                if d.eof:
+                    if data or d.unused_data:
+                        return False
+                    break
     except zlib.error:
         return False
+    finally:
+        os.close(fd)
+    return d.eof and hasher.hexdigest() == oid
 
 
 def ingest_objects(runner: GitRunner, spool: Spool, frames: Sequence[Frame], *, object_format: str,
@@ -808,8 +832,8 @@ def worktree_entries(frames: Sequence[Frame]) -> list[tuple[bytes, int, Frame]]:
     """The worktree as index entries ``(path, mode, frame)``: every ``file`` and ``link`` frame under ``repo/``, its
     path relative to ``repo/``, minus the session's own git directory (a first component that IS ``.git``) and minus
     every skipped nested repo whole (a directory holding a ``skipped-git`` frame: nothing below it is the session's
-    worktree, as ``git add`` would not add its files). A ``link`` is 120000; a ``file`` is 100755 when any execute bit
-    is set, else 100644. Directories, special files and ``unread`` placeholders carry no index entry."""
+    worktree, as ``git add`` would not add its files). A ``link`` is 120000; a ``file`` is 100755 when the owner's
+    execute bit is set (git's own index rule; a group or other bit alone is 100644), else 100644. Directories, special files and ``unread`` placeholders carry no index entry."""
     nested: dict = {}
     for f in frames:
         if f.type == "skipped-git" and f.path.startswith(_REPO):
@@ -836,7 +860,7 @@ def worktree_entries(frames: Sequence[Frame]) -> list[tuple[bytes, int, Frame]]:
                 break
         if skipped:
             continue
-        mode = 0o120000 if f.type == "link" else (0o100755 if f.mode & 0o111 else 0o100644)
+        mode = 0o120000 if f.type == "link" else (0o100755 if f.mode & 0o100 else 0o100644)
         out.append((rel, mode, f))
     return out
 
@@ -860,14 +884,18 @@ def write_blob(objects: Path, spool: Spool, f: Frame, object_format: str, writte
         tmp = d / f"tmp_{oid[2:]}_{os.getpid()}"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o444)
         try:
-            z = zlib.compressobj()
-            write_all(fd, z.compress(header))
-            for chunk in spool.chunks(f.offset, f.size):
-                write_all(fd, z.compress(chunk))
-            write_all(fd, z.flush())
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+            try:
+                z = zlib.compressobj()
+                write_all(fd, z.compress(header))
+                for chunk in spool.chunks(f.offset, f.size):
+                    write_all(fd, z.compress(chunk))
+                write_all(fd, z.flush())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except BaseException:
+            _unlink_quietly(tmp)
+            raise
         _link_final(tmp, d / oid[2:], oid, object_format)
     except OSError as e:
         raise _oserror(e, f"writing blob {oid}") from None

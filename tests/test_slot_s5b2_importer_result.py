@@ -5,14 +5,22 @@ nothing was refused ``no-ref`` (DESIGN T35 answers ``adopt-nothing-new``); a bra
 tree, were accepted at step 3 (the blob branch exited 0); a symbolic HEAD to a name ``check-ref-format`` refuses exited
 0; and no run wrote a bundle, a report or a ``result``. The symlink-target case is session 1's S row: without the
 symlink class an honest bundle's pack does not index alone on a git that checks symlink targets (v2.39.4).
+
+Also reproduced on 49a47242 (``s4b_repro_on_49a47242.txt``, L3 r1 of session 3): a file with a group execute bit but
+not the owner's made a spurious 100755 wip; a write failing ENOSPC left its ``tmp_*`` name in ``objects/``; and
+``_same_object`` held and inflated a whole object (peak RSS +1.9 GB for one 128 MiB blob).
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import os
 import shutil
+import stat
 import subprocess
+import tracemalloc
+import zlib
 
 import pytest
 
@@ -145,3 +153,50 @@ def test_a_delta_bundle_stands_alone_with_its_symlink_targets(tmp_path):
     assert report["format"] == "levain-adopt-report/1" and report["walk"] == result["walk"]
     assert canon.canonical_bytes(report) == raw
     assert got[f"refs/levain/{SESSION}/head"] == s.c1
+
+
+def test_only_the_owner_execute_bit_makes_100755(tmp_path):
+    s = _Session(tmp_path)
+    rc, result, got, _work = s.run(_main(s.c1), [CLEAN[0], (b"a.txt", b"a\n", "file", 0o654)])
+    assert (rc, result["refused"]) == (0, None), result
+    assert f"refs/levain/{SESSION}/wip" not in got, "git's index rule reads the owner bit only: no change, no wip"
+
+
+@pytest.mark.parametrize("with_git", [True, False])
+def test_a_failed_object_write_leaves_no_temp_name(tmp_path, monkeypatch, with_git):
+    s = _Session(tmp_path)
+    real_write_all, real_spool = importer.write_all, importer.spool_frames
+    armed = {"on": False}
+
+    def seam(fd, data):
+        if armed["on"] and not stat.S_ISFIFO(os.fstat(fd).st_mode):  # the result line's pipe is never failed
+            raise OSError(errno.ENOSPC, "seam")
+        return real_write_all(fd, data)
+
+    def spool_then_arm(*a, **k):
+        out = real_spool(*a, **k)
+        armed["on"] = True
+        return out
+    monkeypatch.setattr(importer, "write_all", seam)
+    monkeypatch.setattr(importer, "spool_frames", spool_then_arm)
+    rc, result, _got, work = s.run(_main(s.c1) if with_git else None, CLEAN)
+    assert (rc, result["enospc"]) == (1, True), result
+    assert not list((work / "repo.git" / "objects").rglob("tmp_*"))
+
+
+def test_same_object_streams(tmp_path):
+    raw = b"blob %d\0" % (32 << 20) + os.urandom(32 << 20)
+    oid = hashlib.sha1(raw).hexdigest()
+    path = tmp_path / "obj"
+    path.write_bytes(zlib.compress(raw, 1))
+    del raw
+    tracemalloc.start()
+    try:
+        assert importer._same_object(path, oid, "sha1")
+        _now, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 << 20, f"peak {peak >> 20} MiB for a 32 MiB object"
+    with open(path, "ab") as fh:
+        fh.write(b"x")
+    assert not importer._same_object(path, oid, "sha1"), "bytes after the zlib stream are not the object"
