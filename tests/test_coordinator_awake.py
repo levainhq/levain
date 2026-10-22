@@ -88,3 +88,22 @@ def test_a_holder_that_runs_out_is_never_our_zombie(held, tmp_path):
     time.sleep(2)                                # past its own life, with no store write after it
     row = subprocess.run(["ps", "-o", "ppid=,stat=", "-p", str(pid)], capture_output=True, text=True).stdout.split()
     assert not row or row[0] != str(os.getpid()), row     # gone, or init's: never a zombie child of this process
+
+
+def test_describe_says_the_lid_closes_the_sleep_anyway(tmp_path, monkeypatch):
+    """C7 premise (1021-32/c7/PREMISE.md): an idle-sleep assertion does not survive a closed lid on battery. The note
+    rides only a Mac line where a hold is held or about to be (L3 r1: never Linux, never the nothing-holds branch)."""
+    monkeypatch.setattr(awake, "holder_command", lambda *a, **k: ["caffeinate"])
+    monkeypatch.setattr(awake, "_is_darwin", lambda: True)
+    monkeypatch.setattr(awake, "fcntl", object())
+    ok, line = awake.describe(tmp_path, working_count=2)       # a working branch with a holder command
+    assert not ok and "lid" in line and "battery" in line, line
+    ok, line = awake.describe(tmp_path, working_count=0)       # nothing holds the host awake: no note, ok preserved
+    assert ok and "lid" not in line, line
+    (tmp_path / awake.FILE).write_text(json.dumps({"pid": os.getpid(), "until": time.time() + 99, "threads": ["t"]}))
+    monkeypatch.setattr(awake, "_ours", lambda rec: True)
+    ok, line = awake.describe(tmp_path, working_count=1)       # the held branch
+    assert ok and "idle sleep is held off" in line and "lid" in line, line
+    monkeypatch.setattr(awake, "_is_darwin", lambda: False)    # Linux: the held line carries no Mac note
+    ok, line = awake.describe(tmp_path, working_count=1)
+    assert ok and "lid" not in line, line

@@ -3,7 +3,8 @@
 The rule: an assertion is held while at least one thread of kind ``work`` is in state ``working``, and released when
 none is. It is an IDLE-sleep assertion only (macOS ``caffeinate -i``, Linux ``systemd-inhibit --what=idle``); Levain
 never writes the machine's power settings and never uses sudo. Whether it keeps a closed lid awake on battery is a
-separate claim that this module does not make (C0 §10, run owed).
+claim this module does not make: it does not, because an idle-sleep assertion is by Apple's own header not a hold
+against lid-close sleep (see :data:`LID_NOTE`).
 
 The holder is a process that expires by itself (``-t``), so a Levain that dies releases the host within
 :data:`HOLD_SECONDS` with no cleanup. It is started through a short-lived intermediate that exits at once, so the
@@ -42,6 +43,9 @@ LOCK = "awake.lock"
 # a test seam: a test run never holds the host unless a test turns this on (and points the holder at a harmless argv)
 _IN_TESTS = False
 _NO_LOCKS = "this host has no POSIX file locks (fcntl), so Levain does not hold it awake"
+# what doctor always says beside the hold; the premise verdict (an idle-sleep assertion does not outlast a closed lid)
+LID_NOTE = ("levain holds off idle sleep only; a closed lid can still sleep this Mac (always on battery), "
+            "as an idle-sleep assertion does not prevent lid-close sleep")
 # the intermediate: starts the holder in its own session, prints its pid, and exits, so the holder is never our child
 _LAUNCH = ("import subprocess, sys; p = subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL, "
            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True); print(p.pid)")
@@ -202,19 +206,31 @@ def _reconcile(store: Any, path: Path) -> dict[str, Any]:
 
 def describe(directory: Path | str, *, working_count: int | None = None) -> tuple[bool, str]:
     """(ok, one line) for ``levain doctor``: is the assertion held, and why or why not. Read-only."""
+    ok, line, holding = _describe(directory, working_count)
+    return ok, f"{line}; {LID_NOTE}" if holding and _is_darwin() else line
+
+
+def _is_darwin() -> bool:
+    """A seam: the lid note is a Mac statement, so a test sets the platform without touching the host."""
+    return sys.platform == "darwin"
+
+
+def _describe(directory: Path | str, working_count: int | None) -> tuple[bool, str, bool]:
+    """(ok, line, whether a hold is held or about to be): only then does the lid note apply."""
     cur = _read(Path(directory) / FILE)
     pid = cur.get("pid")
     held = _ours(cur) and cur.get("until", 0) > time.time()
     if held:
         n = len(cur.get("threads") or [])
         return True, (f"idle sleep is held off (pid {pid}, {n} work thread(s) working at its last sync); it "
-                      f"releases when none works, and by itself within {HOLD_SECONDS // 60} minutes if Levain stops")
+                      f"releases when none works, and by itself within {HOLD_SECONDS // 60} minutes if Levain stops"), True
     if working_count:
         if fcntl is None:
-            return False, f"{working_count} work thread(s) are working but {_NO_LOCKS}; it may sleep under them"
+            return False, f"{working_count} work thread(s) are working but {_NO_LOCKS}; it may sleep under them", False
         if holder_command() is None:
             return False, (f"{working_count} work thread(s) are working but this host has no idle-sleep tool, so it "
-                           "may sleep under them (macOS: caffeinate; Linux: systemd-inhibit)")
-        return False, f"{working_count} work thread(s) are working and no assertion is held (it is set on the next sync)"
+                           "may sleep under them (macOS: caffeinate; Linux: systemd-inhibit)"), False
+        return (False, f"{working_count} work thread(s) are working and no assertion is held (it is set on the next "
+                       "sync)", True)
     return True, ("no work thread is working, so nothing holds the host awake; it sleeps by your own power settings"
-                  + ("" if holder_command() else " (and this host has no idle-sleep tool for when one works)"))
+                  + ("" if holder_command() else " (and this host has no idle-sleep tool for when one works)")), False
