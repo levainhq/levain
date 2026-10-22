@@ -35,10 +35,12 @@ the past): a job past its lease that is not yet authorised, and not running, mov
 the process (kill-then-record); :meth:`JobStore.overdue_running` names the running jobs past their lease for it.
 The sweep commits in its own write transaction before the operation's, so an operation that is then refused does not
 roll the lapse back; the operation's transaction sweeps again, so what it checks is current. One
-live contract per write file: filing is refused while a live job (not terminal, lease not lapsed) in the same repo
+live contract per write file: filing is refused while a live job (not terminal) in the same repo
 writes the same place, compared without case (a case-insensitive disk holds ``A.py`` and ``a.py`` as one file): the
 same path, or one an ancestor of the other (``src/sub`` and ``src/sub/deep.py`` cannot both land), so an abandoned
-or runaway planner cannot hold a file past its lease.
+or runaway planner cannot hold a file past its lease, with one exception: a job that is not running leaves the live set
+when its lease lapses, but a RUNNING one holds its write files past the lease until the supervisor has stopped it
+(:meth:`JobStore.stop_recorded`; :meth:`JobStore.overdue_running` names it).
 
 By intent, an AUTHORISED job is never swept, even past its expiry, and so keeps holding its write files: a human signed
 for that result, and only adoption, the human cancel (:meth:`JobStore.cancel_by_human`, whose signed item is kept
