@@ -676,7 +676,8 @@ SessionRunAs = Callable[[int, int, Callable[[int], None], int, Sequence[int]], "
 
 class _Forked(stage._Forked):
     """stage's forked reader, whose ``wait()`` also returns the exit status (a signal = 128 + its number). A killed
-    reader's is ``None`` (failed): stage's bounded reap takes it, and one that will not die is never waited on."""
+    reader's is ``None`` (failed): stage's bounded reap takes it, and one that will not die is never waited on. So is
+    one still alive past the deadline after its end mark (``link-reader-failed``, never a success)."""
 
     code: int | None = None
 
@@ -684,8 +685,9 @@ class _Forked(stage._Forked):
         if self._killed:
             super().wait()
         elif not self._reaped:
-            _, status = os.waitpid(self.pid, 0)
-            self._reaped = True
+            status = self._clean_wait()
+            if status is None:
+                return None
             self.code = os.waitstatus_to_exitcode(status)
             if self.code < 0:
                 self.code = 128 - self.code
@@ -753,6 +755,8 @@ def read_as_session(facts: EndFacts, seams: "EndSeams", e: Entry, out_fd: int | 
     try:
         proc = seams.run_as(uid, uid, lambda w: session_reader(e.dirfd, e.name, cap, w), wfd, (e.dirfd,))
         wfd = -1   # run_as owns it now
+        if isinstance(proc, stage._Forked):   # the real reader: its clean wait gets only what is left of the budget
+            proc.until, proc.clock = budget.deadline, budget.clock
         pipe = stage._Pipe(rfd, budget.deadline, budget.clock, stage.POLL_SLICE_S)
         tag = pipe.exactly(1)
         if tag == b"R":

@@ -10,6 +10,9 @@ ce447bf7 (raw: levain-memory 1021-32/r1a-fix2/):
 3. G2, fix round 3 (reproduced on fix 2's tip 58f20980, raw: levain-memory 1021-35/r1a-fix3/): the same child as
    END's or stage's reader, killed on a deadline (``manifest-time-cap``, any refusal). Its ``wait()`` was a blocking
    ``waitpid(pid, 0)``, so END's budget held nothing.
+4. G2, fix round 4 (reproduced on fix 3's tip 63af8946, raw: levain-memory 1021-35/r1a-fix4/): the same reader on
+   the clean path, after root read its end mark (its ``close()`` hangs on a wedged volume). Its ``wait()`` was still a
+   blocking ``waitpid(pid, 0)``: the clean path held END and staging past their deadline.
 """
 from __future__ import annotations
 
@@ -76,13 +79,14 @@ def test_a_child_that_will_not_die_cannot_hold_the_bound(monkeypatch):
             P._LEFTOVER.remove(CHILD)
 
 
+@pytest.mark.parametrize("path", ["killed", "clean"])
 @pytest.mark.parametrize("cls", [S._Forked, E._Forked], ids=["stage", "end"])
-def test_a_killed_reader_that_will_not_die_cannot_hold_the_budget(monkeypatch, cls):
+def test_a_killed_reader_that_will_not_die_cannot_hold_the_budget(monkeypatch, cls, path):
     killed: list[int] = []
 
     def waitpid(pid: int, flags: int) -> tuple[int, int]:
         if not flags & os.WNOHANG:
-            raise AssertionError("a blocking waitpid on a killed reader that will not die: END hangs forever")
+            raise AssertionError(f"a blocking waitpid on a {path} reader that will not die: END hangs forever")
         return 0, 0
 
     def kill(pid: int, sig: int) -> None:
@@ -92,10 +96,21 @@ def test_a_killed_reader_that_will_not_die_cannot_hold_the_budget(monkeypatch, c
     monkeypatch.setattr(os, "kill", kill)
     monkeypatch.setattr(P, "_LEFTOVER", set())
     reader = cls(CHILD)
-    reader.kill()                                                 # the deadline path: kill, then the finally's wait
+    left = 0.0
     t0 = time.monotonic()
-    code = reader.wait()
-    assert time.monotonic() - t0 <= P.REAP_GRACE_S + 0.5
+    if path == "killed":
+        reader.kill()                                             # the deadline path: kill, then the finally's wait
+    else:                                                         # the end mark was read; the reader hangs in close()
+        left = 0.2
+        reader.until, reader.clock = t0 + left, time.monotonic
+    if cls is S._Forked and path == "clean":
+        with pytest.raises(Refused) as e:                         # stage: a failed reader, never a success
+            reader.wait()
+        assert e.value.name == "staging-reader-failed"
+        code = None
+    else:
+        code = reader.wait()
+    assert time.monotonic() - t0 <= left + P.REAP_GRACE_S + 0.5
     assert CHILD in P._LEFTOVER and set(killed) == {CHILD}
-    assert code is None                                           # END's code: a killed reader failed
+    assert code is None                                           # END's code: the reader failed
     assert reader.wait() is None and P._LEFTOVER == {CHILD}       # once: the leftover set owns it now

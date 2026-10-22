@@ -106,6 +106,21 @@ class _Forked:
         self.pid = pid
         self._reaped = False
         self._killed = False
+        # The deadline root's read already runs under (set by the caller); a clean wait never outlasts it. Unset:
+        # REAP_GRACE_S from the wait, so no clean wait is unbounded either.
+        self.until: float | None = None
+        self.clock: Callable[[], float] = time.monotonic
+
+    def _clean_wait(self) -> int | None:
+        """The reader sent its end mark; its exit status, polled within the deadline. A reader still alive past it
+        (its ``close()`` hung on a wedged volume) is killed and reaped by the one bounded helper: ``None``."""
+        until = self.clock() + PR.REAP_GRACE_S if self.until is None else self.until
+        status = PR._poll_wait(self.pid, 0, until, os.waitpid, self.clock, time.sleep)
+        if status is None:
+            self._killed = True
+            PR.kill_and_reap(self.pid)
+        self._reaped = True
+        return status
 
     def kill(self) -> None:
         if not self._reaped:
@@ -119,9 +134,9 @@ class _Forked:
         if not self._reaped:
             if self._killed:   # a deadline's kill: never a blocking wait (one that will not die joins the leftovers)
                 PR.kill_and_reap(self.pid)
-            else:
-                os.waitpid(self.pid, 0)
-            self._reaped = True
+                self._reaped = True
+            elif self._clean_wait() is None:   # never a success with a reader root could not reap
+                raise Refused("staging-reader-failed", f"reader {self.pid} did not exit by the deadline")
 
 
 def fork_run_as(uid: int, gid: int, fn: Callable[[int], None], wfd: int, keep: Sequence[int] = (), *,
@@ -294,6 +309,8 @@ def stage_copy(staging: int | str | os.PathLike[str], name: str, cap: int, heade
                       lambda w: reader(staging, name, cap, cap_refusal, w), wfd,
                       (staging,) if isinstance(staging, int) else ())
         wfd = -1   # run_as owns it now
+        if isinstance(proc, _Forked):   # the real reader: its clean wait gets only what is left of this deadline
+            proc.until, proc.clock = deadline, clock
         pipe = _Pipe(rfd, deadline, clock, poll_slice)
         tag = pipe.exactly(1)
         if tag == b"R":
@@ -346,6 +363,7 @@ def stage_copy(staging: int | str | os.PathLike[str], name: str, cap: int, heade
             raise Refused(digest_refusal, name)
         if validate is not None:
             validate(bytes(keep or b""))
+        proc.wait()   # here, not only in the finally: a reader that does not exit refuses, and its file is unlinked
         fsync(out)
         os.close(out)
         out = None
