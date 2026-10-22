@@ -2415,7 +2415,7 @@
     try { paintHeaderLens(); paintBuildSessions(); paintBuildZone(); } catch (e) { /* a Build tab that cannot paint leaves the page as the tiles drew it */ }
   }
 
-  // The glance is a compact strip (one bordered row of equal tiles) on Board and whenever fewer than four tiles show; four or more are full
+  // The glance is a compact strip (one bordered row of equal tiles) whenever fewer than four tiles show; four or more are full
   // tiles. A zone's grid is told which of its columns have a card on this tab, and a card that would sit alone in a row of a wider grid
   // is stretched to the row: a lone card never leaves a hole beside it. Measured after layout, so it is redone on every tab change.
   function layoutGrid(g) {
@@ -2446,12 +2446,12 @@
     markEmptyCards();
     tintRepos();
     paintBuild();
-    const board = document.body.dataset.mode === "board";
     for (const w of document.querySelectorAll(".ck-widgets")) {
       const n = Array.from(w.children).filter(shown).length;
       // more than four tiles wrap into rows of at most four (6 -> 3 x 2), whatever the tab: a tile never shares a row so narrow it clips its text
       let cols = n > 4 ? (n % 3 === 0 ? 3 : 4) : Math.max(4, n);
-      const shape = (board && n <= 4) || n < 4 ? "strip" : "tiles";
+      // the Board draws the same separate cards as Morning (Phill 10-22: the Board-only strip, K2 r2 3d5c8660, clipped every sub-row)
+      const shape = n < 4 ? "strip" : "tiles";
       // ...and never so many that a tile is narrower than MIN_TILE_PX: the 720px rule covers the phone, this covers the half-screen laptop in between
       const room = w.clientWidth;
       w.dataset.shape = shape;   // before the gap is read: only the tiles shape is a grid with a gap
@@ -2461,8 +2461,9 @@
         const fit = Math.max(2, Math.floor((room + gap) / (MIN_TILE_PX + gap)));
         cols = Math.max(2, Math.min(cols, fit));
         // P1: never leave a lone tile in the last row (n % cols === 1): take an exact divisor of n in 5..3 that fits, else the
-        // largest column count in 5..2 that fits and leaves no lone tile (5 tiles -> one row of 5, 6 -> 3 x 2, 7 -> 4 + 3)
-        if (n > 4) {
+        // largest column count in 5..2 that fits and leaves no lone tile (4 tiles -> one row of 4, or 2 x 2 where only three fit;
+        // 5 -> one row of 5, 6 -> 3 x 2, 7 -> 4 + 3)
+        if (n >= 4) {
           let pick = 0;
           for (let c = Math.min(5, fit); c >= 3 && !pick; c--) if (n % c === 0) pick = c;
           for (let c = Math.min(5, fit); c >= 2 && !pick; c--) if (n % c !== 1) pick = c;

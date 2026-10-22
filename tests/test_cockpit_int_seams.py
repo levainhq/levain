@@ -54,18 +54,24 @@ out.one = K.skyCounts({ events: [%s[0]] }).text;
 
 def test_i4_more_than_four_tiles_wrap_into_rows_of_at_most_four(tmp_path: Path) -> None:
     out = run_node(r"""
-globalThis.getComputedStyle = () => ({ display: "block" });
-globalThis.document.body.dataset.mode = "board";
-const run = (n) => {
+globalThis.getComputedStyle = () => ({ display: "block", columnGap: "24px" });
+const run = (mode, room) => (n) => {
+  globalThis.document.body.dataset.mode = mode;
   const props = {};
-  const w = Object.assign(new N("section"), { style: { setProperty: (k, v) => { props[k] = v; } }, children: Array.from({ length: n }, () => Object.assign(new N("div"), { dataset: {} })) });
+  const w = Object.assign(new N("section"), { clientWidth: room, style: { setProperty: (k, v) => { props[k] = v; } }, children: Array.from({ length: n }, () => Object.assign(new N("div"), { dataset: {} })) });
   globalThis.document.querySelectorAll = (sel) => (sel === ".ck-widgets" ? [w] : []);
   K.fillGrids();
   return [props["--ck-n"], w.dataset.shape];
 };
-out.r = [3, 4, 5, 6, 7, 8].map(run);
+for (const mode of ["board", "morning"]) {
+  out[mode] = [3, 4, 5, 6, 7, 8].map(run(mode, 0));          // no layout: the count alone decides
+  out[mode + "_wide"] = [4].map(run(mode, 1600));             // a full laptop row: four across
+  out[mode + "_half"] = [4].map(run(mode, 800));              // room for three: 2 x 2, never 3 + a lone tile
+}
 """, tmp_path)
-    assert out["r"] == [["4", "strip"], ["4", "strip"], ["4", "tiles"], ["3", "tiles"], ["4", "tiles"], ["4", "tiles"]], out["r"]
+    for mode in ("board", "morning"):   # the Board draws the same glance as Morning (Phill 10-22)
+        assert out[mode] == [["4", "strip"], ["4", "tiles"], ["4", "tiles"], ["3", "tiles"], ["4", "tiles"], ["4", "tiles"]], out
+        assert out[mode + "_wide"] == [["4", "tiles"]] and out[mode + "_half"] == [["2", "tiles"]], out
 
 
 def test_i5_the_failing_doctor_check_rides_in_the_tooltip_not_the_row() -> None:
