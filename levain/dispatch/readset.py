@@ -27,7 +27,9 @@ The read set then crosses from filing to the run as one git bundle, and the run 
 filing's bundle into a private, locked temp and returns it uninstalled; :func:`open_handoff` and :func:`verify_readset`
 ingest it at the run: one exact copy into the attempt's own workdir, a fixed-prefix header compare and a pack-count
 compare before git parses a byte, a bare fsck'd clone under resource limits, its refs and objects checked against
-``E`` and ``N``, and the repo-layer settings check on ``E``'s tree. Stdlib only.
+``E`` and ``N``, and the repo-layer settings check on ``E``'s tree. :func:`bundle_verified` re-checks that verified
+record against the contract bytes and re-cuts the slot's bundle from it into staging; :func:`sweep_workdirs` removes
+the workdirs a crashed supervisor left behind. Stdlib only.
 """
 from __future__ import annotations
 
@@ -50,9 +52,10 @@ from levain.dispatch import ContractRefused, DispatchError
 from levain.dispatch.attempt_id import is_attempt_id
 from levain.dispatch.contract import GIT_TIMEOUT, ResolvedContract, git_env, parse_contract
 
-__all__ = ["BRANCH", "ExportedReadSet", "ReadSet", "ReadSetRefused", "VerifiedReadSet", "WORKDIR_PREFIX",
-           "build_readset", "clone_limits", "discard", "export_readset", "full_fsync", "open_handoff",
-           "readset_commit", "verify_readset", "workdir_name"]
+__all__ = ["BRANCH", "ExportedReadSet", "ReadSet", "ReadSetRefused", "STAGED_BUNDLE", "StagedBundle", "SweepReport",
+           "VerifiedReadSet", "WORKDIR_PREFIX", "build_readset", "bundle_verified", "clone_limits", "discard",
+           "export_readset", "full_fsync", "open_handoff", "readset_commit", "sweep_workdirs", "verify_readset",
+           "workdir_name"]
 
 _log = logging.getLogger(__name__)
 
@@ -813,3 +816,191 @@ def discard(v: VerifiedReadSet) -> None:
         pass
     finally:
         os.close(pfd)
+
+
+# --- R8: the slot's bundle, re-cut from P --------------------------------------------------------------------------------
+
+#: The final bundle's name inside the lease peer's staging dir.
+STAGED_BUNDLE = "repo.bundle"
+
+
+@dataclass(frozen=True)
+class StagedBundle:
+    """The bundle :func:`bundle_verified` wrote at ``path`` (``size`` bytes, the read set ``commit`` / ``objects``),
+    read back and flushed. ``fsync`` is ``((step, call), ...)``: which call flushed the bundle and then staging."""
+    path: str
+    size: int
+    commit: str
+    objects: int
+    fsync: tuple
+
+
+def _verified_mismatch(detail: str) -> ReadSetRefused:
+    return ReadSetRefused("readset-verified-mismatch", detail)
+
+
+def _open_p(v: VerifiedReadSet) -> str:
+    # v.workdir/P must still be the directory verify made: reached fd-relative, never through a symlink, same dev/ino
+    workdir = v.workdir
+    if not (isinstance(workdir, str) and os.path.isabs(workdir) and is_attempt_id(v.attempt)):
+        raise _verified_mismatch("the read set's workdir is not an attempt's")
+    parent, name = os.path.split(workdir)
+    if name != WORKDIR_PREFIX + v.attempt:
+        raise _verified_mismatch("the read set's workdir is not named for its attempt")
+    try:
+        pfd = _open_dir(parent)
+    except (OSError, ValueError):
+        raise _verified_mismatch("the read set's workdir parent is gone") from None
+    try:
+        wfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=pfd)
+        try:
+            st = os.lstat(_P, dir_fd=wfd)
+        finally:
+            os.close(wfd)
+    except OSError:
+        raise _verified_mismatch("the read set's workdir or P is gone") from None
+    finally:
+        os.close(pfd)
+    if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != (v.p_dev, v.p_ino):
+        raise _verified_mismatch("P is not the directory verify_readset made")
+    return os.path.join(workdir, _P)
+
+
+def bundle_verified(v: VerifiedReadSet, contract_bytes: bytes, D: str, staging: str) -> StagedBundle:
+    """R8: re-cut the slot's bundle from ``v``'s ``P`` into ``staging/repo.bundle``, after checking ``v`` against the
+    contract bytes again. ``v`` is a record any caller can construct, so nothing in it is taken on trust.
+
+    ``E`` and ``N`` are re-derived from (``contract_bytes``, ``D``) by :func:`readset_commit`; ``v.commit == E``,
+    ``v.digest == D`` and ``v.objects == N`` are required, ``v.workdir/P`` must be the directory verify made (reached
+    without following a symlink, same dev/ino), and ``P``'s ``HEAD`` and ``refs/heads/readset`` must be ``E`` and its
+    only ref; each failure is ``readset-verified-mismatch``. ``staging`` must be a real absolute directory and hold no
+    ``repo.bundle`` yet (``readset-dest``). The bundle goes into an fd this call opened there
+    (``O_EXCL|O_NOFOLLOW``, 0600), is flushed with :func:`full_fsync` and read back: its first bytes must be exactly
+    the bundle header for ``E`` and a pack header of ``N`` objects, else ``readset-verified-mismatch``, the file is
+    unlinked and staging flushed. On success staging is flushed after the bundle."""
+    E, _tree, N = readset_commit(contract_bytes, D)
+    if not isinstance(v, VerifiedReadSet):
+        raise _verified_mismatch("not a VerifiedReadSet")
+    if v.commit != E or v.digest != D or v.objects != N:
+        raise _verified_mismatch("the verified read set is not this contract's")
+    p = _open_p(v)
+    pst = os.lstat(p)
+    env = _p_env()
+    try:
+        for ref in ("HEAD", f"refs/heads/{BRANCH}"):
+            got = _git(p, "rev-parse", "--verify", "-q", f"{ref}^{{commit}}", env=env).decode("ascii").strip()
+            if got != E:
+                raise _verified_mismatch(f"P's {ref} is not the contract's commit")
+        refs = _git(p, "for-each-ref", "--format=%(refname)", env=env).decode("utf-8", "replace").split()
+    except ReadSetRefused as exc:
+        if exc.name != "readset-git-failed":
+            raise
+        raise _verified_mismatch(f"P's refs cannot be read ({exc.detail})") from None
+    if refs != [f"refs/heads/{BRANCH}"]:
+        raise _verified_mismatch(f"P holds refs {refs[:4]!r}")
+    try:
+        usable = isinstance(staging, str) and os.path.isabs(staging) and os.path.realpath(staging) == staging
+        sfd = _open_dir(staging) if usable else -1
+    except (OSError, ValueError) as exc:
+        raise ReadSetRefused("readset-dest", f"staging cannot be opened ({type(exc).__name__})") from None
+    if sfd < 0:
+        raise ReadSetRefused("readset-dest", "staging must be a real absolute path")
+    try:
+        try:
+            fd = os.open(STAGED_BUNDLE, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
+                         dir_fd=sfd)
+        except OSError as exc:
+            raise ReadSetRefused("readset-dest", f"staging's {STAGED_BUNDLE} cannot be created "
+                                 f"({type(exc).__name__})") from None
+        try:
+            _bundle_into(p, fd, env)
+            how = full_fsync(fd)
+            problem = _prefix_problem(fd, E, N)
+            if problem is not None:
+                raise _verified_mismatch(f"the bundle written has another {problem}")
+            pst2 = os.lstat(p)
+            if (pst2.st_dev, pst2.st_ino) != (pst.st_dev, pst.st_ino):
+                raise _verified_mismatch("P was replaced while the bundle was cut")
+            size = os.fstat(fd).st_size
+        except BaseException:
+            os.close(fd)
+            try:
+                os.unlink(STAGED_BUNDLE, dir_fd=sfd)
+                full_fsync(sfd)
+            except OSError:
+                pass        # the refusal stands; a file left here makes the next cut into this staging readset-dest
+            raise
+        os.close(fd)
+        staged = full_fsync(sfd)
+    finally:
+        os.close(sfd)
+    return StagedBundle(path=os.path.join(staging, STAGED_BUNDLE), size=size, commit=E, objects=N,
+                        fsync=(("bundle", how), ("staging", staged)))
+
+
+# --- R0: the supervisor-start sweep ---------------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SweepReport:
+    """What :func:`sweep_workdirs` did: the entries ``removed``, the workdirs ``kept`` (their attempt is live), and
+    every entry ``left`` as ``(name, why)``, never followed."""
+    removed: tuple
+    kept: tuple
+    left: tuple
+
+
+def sweep_workdirs(parent: str, keep: set | frozenset) -> SweepReport:
+    """R0: remove the workdir of every attempt that is terminal or absent from the store, as a crashed supervisor
+    leaves them.
+
+    PRECONDITION: the caller holds the supervisor lock (the exclusive ``flock`` R0 takes before anything else), so no
+    launch is mid-flight while this runs. ``keep`` is the set of attempt ids the store holds in a non-terminal phase
+    after R0's reconciliation.
+
+    Refused (``readset-sweep-unsafe``) where ``shutil.rmtree`` does not walk by fds (``avoids_symlink_attacks`` is
+    False); ``parent`` must be a real absolute directory (``readset-workdir``). Each entry of ``parent`` is ``lstat``ed
+    at its fd; one is removed with ``rmtree(name, dir_fd=)`` only when it is a real directory (not a symlink) owned by
+    this process's uid, named :data:`WORKDIR_PREFIX` + an id in the attempt-id grammar, and that id is not in
+    ``keep``. Anything else is left, and named in the report and the log."""
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise ReadSetRefused("readset-sweep-unsafe", "shutil.rmtree does not avoid symlink attacks on this platform")
+    if not isinstance(keep, (set, frozenset)) or not all(isinstance(a, str) for a in keep):
+        raise ReadSetRefused("readset-attempt", "keep must be a set of attempt ids")
+    try:
+        usable = isinstance(parent, str) and os.path.isabs(parent) and os.path.realpath(parent) == parent
+        pfd = _open_dir(parent) if usable else -1
+    except (OSError, ValueError) as exc:
+        raise ReadSetRefused("readset-workdir", f"the workdir parent cannot be opened ({type(exc).__name__})") from None
+    if pfd < 0:
+        raise ReadSetRefused("readset-workdir", "the workdir parent must be a real absolute path")
+    uid = os.geteuid()
+    removed, kept, left = [], [], []
+    try:
+        for name in sorted(os.listdir(pfd)):
+            try:
+                st = os.lstat(name, dir_fd=pfd)
+            except OSError as exc:
+                left.append((name, f"cannot be lstat'd ({type(exc).__name__})"))
+                continue
+            attempt = name[len(WORKDIR_PREFIX):] if name.startswith(WORKDIR_PREFIX) else ""
+            if stat.S_ISLNK(st.st_mode):
+                left.append((name, "a symlink"))
+            elif not stat.S_ISDIR(st.st_mode):
+                left.append((name, "not a directory"))
+            elif not is_attempt_id(attempt):
+                left.append((name, "not a workdir name"))
+            elif st.st_uid != uid:
+                left.append((name, f"owned by uid {st.st_uid}"))
+            elif attempt in keep:
+                kept.append(name)
+            else:
+                try:
+                    shutil.rmtree(name, dir_fd=pfd)
+                    removed.append(name)
+                except OSError as exc:
+                    left.append((name, f"removal failed ({type(exc).__name__})"))
+    finally:
+        os.close(pfd)
+    for name, why in left:
+        _log.warning("readset: sweep left %r in the workdir parent: %s", name, why)
+    return SweepReport(removed=tuple(removed), kept=tuple(kept), left=tuple(left))
