@@ -1020,54 +1020,70 @@ def _walk_tree(tmp_path: Path, monkeypatch) -> tuple[Path, Path, Path]:
     return home, workspace, sub
 
 
-def _vanish_once(monkeypatch, name: str, trigger: Path, act) -> None:
-    """Patch ``os.<name>`` so its first call on ``trigger`` runs ``act`` before the real call."""
+def _vanish_once(monkeypatch, name: str, trigger: Path, act) -> list[bool]:
+    """Patch ``os.<name>`` so its first call reaching ``trigger`` runs ``act`` before the real call.
+
+    The walk names a child relative to its parent's descriptor, and lists an open descriptor, so a
+    call reaches ``trigger`` by absolute path, by ``(name, dir_fd)`` with ``dir_fd`` open on the
+    trigger's parent, or by a descriptor open on the trigger itself. Returns the fired flag so a
+    test can prove the race actually ran.
+    """
     stock = getattr(conf.os, name)
     fired: list[bool] = []
 
+    def reaches(path, dir_fd) -> bool:
+        try:
+            if isinstance(path, int):
+                return os.path.samestat(os.fstat(path), os.stat(trigger))
+            if not isinstance(path, (str, os.PathLike)):
+                return False
+            if dir_fd is None:
+                return Path(path) == trigger
+            return (Path(path).name == trigger.name
+                    and os.path.samestat(os.fstat(dir_fd), os.stat(trigger.parent)))
+        except OSError:
+            return False
+
     def racing(path, *args, **kwargs):
-        if not fired and isinstance(path, (str, os.PathLike)) and Path(path) == trigger:
+        if not fired and reaches(path, kwargs.get("dir_fd")):
             fired.append(True)
             act()
         return stock(path, *args, **kwargs)
 
     monkeypatch.setattr(conf.os, name, racing)
+    return fired
 
 
-@pytest.mark.parametrize("name", ["stat", "scandir"])
-def test_walk_skips_a_directory_that_vanishes_after_being_queued(tmp_path, monkeypatch, name) -> None:
+@pytest.mark.parametrize("name", ["open", "scandir"])
+def test_walk_skips_a_directory_that_vanishes_after_being_listed(tmp_path, monkeypatch, name) -> None:
     home, workspace, sub = _walk_tree(tmp_path, monkeypatch)
-    _vanish_once(monkeypatch, name, sub, lambda: shutil.rmtree(sub))
+    fired = _vanish_once(monkeypatch, name, sub, lambda: shutil.rmtree(sub))
     _, dirs, files, _ = conf._persistence_agent_paths(home, workspace)
+    assert fired
     assert workspace / ".claude" in dirs
     assert sub not in dirs and sub not in files
 
 
-def test_walk_skips_a_child_that_vanishes_between_scandir_and_lstat(tmp_path, monkeypatch) -> None:
-    home, workspace, sub = _walk_tree(tmp_path, monkeypatch)
-    child = sub / "child.json"
-    _vanish_once(monkeypatch, "lstat", child, child.unlink)
-    _, dirs, _, _ = conf._persistence_agent_paths(home, workspace)
-    assert workspace / ".claude" in dirs
-
-
-def test_walk_treats_a_directory_replaced_by_a_file_as_a_file_target(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("name", ["open", "scandir"])
+def test_walk_treats_a_directory_replaced_by_a_file_as_a_file_target(tmp_path, monkeypatch, name) -> None:
     home, workspace, sub = _walk_tree(tmp_path, monkeypatch)
 
     def replace() -> None:
         shutil.rmtree(sub)
         sub.write_text("now a file")
 
-    _vanish_once(monkeypatch, "scandir", sub, replace)
+    fired = _vanish_once(monkeypatch, name, sub, replace)
     _, _, files, _ = conf._persistence_agent_paths(home, workspace)
+    assert fired
     assert sub in files
 
 
-@pytest.mark.parametrize("name", ["stat", "scandir"])
+@pytest.mark.parametrize("name", ["open", "scandir"])
 @pytest.mark.parametrize("dangling", [False, True])
 def test_walk_classifies_a_directory_replaced_by_a_symlink(tmp_path, monkeypatch, name, dangling) -> None:
-    # L3 r1 W1: a queued directory swapped for a symlink is a link, not an absence; its target and
-    # the link dentry must be recorded exactly as a child symlink's are.
+    # L3 r1 W1: a directory swapped for a symlink is a link, not an absence; its target and the
+    # link dentry must be recorded exactly as a child symlink's are. ``open``: swapped before the
+    # no-follow open. ``scandir``: swapped after it, which only the post-listing re-read can see.
     home, workspace, sub = _walk_tree(tmp_path, monkeypatch)
     target = tmp_path / ("missing.json" if dangling else "external.json")
     if not dangling:
@@ -1077,30 +1093,16 @@ def test_walk_classifies_a_directory_replaced_by_a_symlink(tmp_path, monkeypatch
         shutil.rmtree(sub)
         sub.symlink_to(target)
 
-    _vanish_once(monkeypatch, name, sub, replace)
+    fired = _vanish_once(monkeypatch, name, sub, replace)
     _, _, files, pins = conf._persistence_agent_paths(home, workspace)
+    assert fired
     assert Path(os.path.realpath(target)) in files
     assert sub in pins
 
 
-def test_walk_classifies_a_child_whose_lstat_raced_a_symlink_swap(tmp_path, monkeypatch) -> None:
-    home, workspace, sub = _walk_tree(tmp_path, monkeypatch)
-    child = sub / "child.json"
-    target = tmp_path / "missing.json"
-
-    def replace() -> None:
-        child.unlink()
-        child.symlink_to(target)
-        raise FileNotFoundError(errno.ENOENT, "gone", str(child))
-
-    _vanish_once(monkeypatch, "lstat", child, replace)
-    _, _, files, pins = conf._persistence_agent_paths(home, workspace)
-    assert Path(os.path.realpath(target)) in files
-    assert child in pins
-
-
-def test_walk_does_not_skip_an_inode_whose_scan_failed_under_another_alias(tmp_path, monkeypatch) -> None:
-    # L3 r1 W2: ``a`` is renamed onto the already-queued ``b`` while its scan runs; the inode must
+@pytest.mark.parametrize("name", ["open", "scandir"])
+def test_walk_does_not_skip_an_inode_whose_scan_failed_under_another_alias(tmp_path, monkeypatch, name) -> None:
+    # L3 r1 W2: ``a`` is renamed onto the already-listed ``b`` while its scan runs; the inode must
     # still be walked under ``b``.
     home, workspace, _ = _walk_tree(tmp_path, monkeypatch)
     root = workspace / ".claude"
@@ -1115,24 +1117,38 @@ def test_walk_does_not_skip_an_inode_whose_scan_failed_under_another_alias(tmp_p
         b.rmdir()
         a.rename(b)
 
-    _vanish_once(monkeypatch, "scandir", a, rename)
+    fired = _vanish_once(monkeypatch, name, a, rename)
     _, _, files, pins = conf._persistence_agent_paths(home, workspace)
+    assert fired
     assert Path(os.path.realpath(target)) in files
     assert b / "link" in pins
 
 
 @pytest.mark.parametrize(("name", "reason"), [
-    ("stat", "unresolvable directory target"),
+    ("open", "cannot be walked"),
     ("scandir", "cannot be walked"),
     ("lstat", "cannot be inspected"),
 ])
 def test_walk_still_refuses_non_enoent_errors(tmp_path, monkeypatch, name, reason) -> None:
     home, workspace, sub = _walk_tree(tmp_path, monkeypatch)
-    trigger = sub / "child.json" if name == "lstat" else sub
 
     def deny() -> None:
-        raise PermissionError(errno.EACCES, "denied", str(trigger))
+        raise PermissionError(errno.EACCES, "denied", str(sub))
 
-    _vanish_once(monkeypatch, name, trigger, deny)
+    fired = _vanish_once(monkeypatch, name, sub, deny)
     with pytest.raises(conf.ConfinementError, match=f"{reason}.*denied"):
         conf._persistence_agent_paths(home, workspace)
+    assert fired
+
+
+def test_walk_refuses_an_unopenable_directory_target(tmp_path, monkeypatch) -> None:
+    home, workspace, _ = _walk_tree(tmp_path, monkeypatch)
+    root = workspace / ".claude"
+
+    def deny() -> None:
+        raise PermissionError(errno.EACCES, "denied", str(root))
+
+    fired = _vanish_once(monkeypatch, "open", root, deny)
+    with pytest.raises(conf.ConfinementError, match="unresolvable directory target.*denied"):
+        conf._persistence_agent_paths(home, workspace)
+    assert fired

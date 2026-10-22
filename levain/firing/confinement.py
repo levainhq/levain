@@ -830,12 +830,24 @@ def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
         # is skipped. Gone -> skip, since anything re-created there later lands inside a protected
         # subtree that is already write-denied. A symlink -> classified exactly as a child symlink,
         # so a dangling link is a write target, never an absence. Any other non-directory -> a
-        # file target. A directory again, or any failure to re-read -> refuse the floor. An inode
-        # is marked visited only once its scan completed, so a failed scan never hides it from
-        # another alias.
-        def confirm_gone(path: Path, exc: OSError) -> None:
+        # file target. A directory again, or any failure to re-read -> refuse the floor.
+        #
+        # The walk holds directory file descriptors and names every child relative to its parent's
+        # descriptor, never by absolute path: an entry nested deeper than the platform's path
+        # limit is walked like any other instead of refusing the whole floor. Each child directory
+        # is opened without following a final symlink, so a directory swapped for a link between
+        # listing and opening is re-read and classified as a link. Entry types come from the
+        # listing itself. The absolute path is still carried, for messages and because a found
+        # symlink is resolved from it.
+        #
+        # An inode is marked visited only once its whole subtree scan completed against a path
+        # that still named it, so a failed or renamed-away scan never hides it from another alias.
+        # A found link whose resolution did not begin at that link means an ancestor was renamed
+        # or replaced mid-walk; the scan is then not counted as complete.
+        def confirm_gone(path: Path, exc: OSError, dir_fd: int | None = None,
+                         name: str | None = None) -> None:
             try:
-                st = os.lstat(path)
+                st = os.lstat(path) if dir_fd is None else os.lstat(name, dir_fd=dir_fd)
             except (FileNotFoundError, NotADirectoryError):
                 return
             except OSError as lstat_exc:
@@ -847,41 +859,122 @@ def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
             else:
                 file_targets.append(path)
 
+        def open_directory(path: Path, problem: str, dir_fd: int | None = None,
+                           name: str | None = None) -> int | None:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            try:
+                return os.open(path if dir_fd is None else name, flags, dir_fd=dir_fd)
+            except (FileNotFoundError, NotADirectoryError) as exc:
+                confirm_gone(path, exc, dir_fd, name)
+                return None
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:  # a symlink now stands at the name
+                    confirm_gone(path, exc, dir_fd, name)
+                    return None
+                refuse(path, f"{problem} ({exc})", exc)
+
         visited: set[tuple[int, int]] = set()
         while directories_to_walk:
             directory = directories_to_walk.pop(0)
-            try:
-                st = os.stat(directory)
-            except (FileNotFoundError, NotADirectoryError) as exc:
-                confirm_gone(directory, exc)
+            top_fd = open_directory(directory, "an unresolvable directory target")
+            if top_fd is None:
                 continue
-            except OSError as exc:
-                refuse(directory, f"an unresolvable directory target ({exc})", exc)
-            identity = (st.st_dev, st.st_ino)
-            if identity in visited:
-                continue
-            try:
-                with os.scandir(directory) as scanned:
-                    entries = sorted(scanned, key=lambda entry: entry.name)
-            except (FileNotFoundError, NotADirectoryError) as exc:
-                confirm_gone(directory, exc)
-                continue
-            except OSError as exc:
-                refuse(directory, f"a protected directory that cannot be walked ({exc})", exc)
-            visited.add(identity)
-            for entry in entries:
-                child = Path(entry.path)
+            # One frame per open directory on the current descent:
+            # [fd, path, entries, identity, complete].
+            stack: list[list[Any]] = []
+            on_stack: set[tuple[int, int]] = set()
+
+            def descend(fd: int, path: Path, parent_fd: int | None, name: str | None,
+                        retried: bool = False) -> None:
+                # Takes ownership of ``fd``: it is either pushed as a frame or closed here. After
+                # the listing, the name it was opened under must still hold the same inode: a
+                # listing of a directory unlinked after its open can come back empty instead of
+                # failing, which would hide whatever now stands at the name.
+                pushed = False
+                now: os.stat_result | None = None
                 try:
-                    child_st = os.lstat(child)
-                except (FileNotFoundError, NotADirectoryError) as exc:
-                    confirm_gone(child, exc)
-                    continue
-                except OSError as exc:
-                    refuse(child, f"an entry that cannot be inspected ({exc})", exc)
-                if stat.S_ISLNK(child_st.st_mode):
-                    classify(child)
-                elif stat.S_ISDIR(child_st.st_mode):
-                    directories_to_walk.append(child)
+                    try:
+                        st = os.fstat(fd)
+                        identity = (st.st_dev, st.st_ino)
+                        if identity in visited or identity in on_stack:
+                            return
+                        with os.scandir(fd) as scanned:
+                            entries = sorted(scanned, key=lambda entry: entry.name)
+                        try:
+                            now = os.lstat(path) if parent_fd is None else os.lstat(name, dir_fd=parent_fd)
+                        except (FileNotFoundError, NotADirectoryError):
+                            now = None
+                        except OSError as exc:
+                            refuse(path, f"an entry that cannot be inspected ({exc})", exc)
+                    except (FileNotFoundError, NotADirectoryError) as exc:
+                        gone = exc
+                    except OSError as exc:
+                        refuse(path, f"a protected directory that cannot be walked ({exc})", exc)
+                    else:
+                        if now is not None and os.path.samestat(now, st):
+                            stack.append([fd, path, iter(entries), identity, True])
+                            on_stack.add(identity)
+                            pushed = True
+                            return
+                        gone = OSError(errno.ESTALE, "replaced while it was being read", str(path))
+                finally:
+                    if not pushed:
+                        os.close(fd)
+                # Removed or replaced after it was opened: re-read the name it was opened under.
+                # Another directory standing there now is walked instead, once; anything else is
+                # settled exactly as an entry that vanished.
+                if not retried:
+                    try:
+                        again_st = os.lstat(path) if parent_fd is None else os.lstat(name, dir_fd=parent_fd)
+                    except (FileNotFoundError, NotADirectoryError):
+                        again_st = None  # confirm_gone re-reads and settles it
+                    except OSError as exc:
+                        refuse(path, f"an entry that cannot be inspected ({exc})", exc)
+                    if again_st is not None and stat.S_ISDIR(again_st.st_mode):
+                        again = open_directory(
+                            path, "a protected directory that cannot be walked", parent_fd, name)
+                        if again is not None:
+                            descend(again, path, parent_fd, name, retried=True)
+                        return
+                confirm_gone(path, gone, parent_fd, name)
+
+            try:
+                descend(top_fd, directory, None, None)
+                while stack:
+                    frame = stack[-1]
+                    fd, path, entries = frame[0], frame[1], frame[2]
+                    entry = next(entries, None)
+                    if entry is None:
+                        stack.pop()
+                        on_stack.discard(frame[3])
+                        os.close(fd)
+                        if frame[4]:
+                            visited.add(frame[3])
+                        elif stack:
+                            stack[-1][4] = False
+                        continue
+                    child = path / entry.name
+                    try:
+                        is_link = entry.is_symlink()
+                        is_dir = not is_link and entry.is_dir(follow_symlinks=False)
+                    except OSError as exc:
+                        refuse(child, f"an entry that cannot be inspected ({exc})", exc)
+                    if is_link:
+                        before = len(links)
+                        classify(child)
+                        if links[before:before + 1] != [child]:
+                            frame[4] = False
+                    elif is_dir:
+                        child_fd = open_directory(
+                            child, "a protected directory that cannot be walked", fd, entry.name)
+                        if child_fd is not None:
+                            descend(child_fd, child, fd, entry.name)
+            finally:
+                for frame in stack:
+                    try:
+                        os.close(frame[0])
+                    except OSError:
+                        pass
 
     # The agents' own overrides of where their configuration lives: an absolute CLAUDE_CONFIG_DIR or
     # CODEX_HOME in levain's environment is a root like ~/.claude and ~/.codex.
