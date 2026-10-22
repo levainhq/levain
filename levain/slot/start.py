@@ -611,9 +611,8 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     try:
         with H.session_lock(ctx, a.session):
             pid = _start_fenced(ctx, a)
-    except BaseException:
-        _wake(seams)        # an END that waited on the lock, or refused end-busy, is retried by the reaper
-        raise
+    finally:
+        _wake(seams)        # every release: an END that waited on the lock, or refused end-busy, is retried now
     seams.at("wait")
     return {"exit": seams.wait(pid)}
 
