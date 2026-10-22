@@ -1547,13 +1547,37 @@ def front_launch(run: RenderRun) -> Tuple[Tuple[str, ...], bytes]:
     return argv, spec.to_json()
 
 
+#: DECISION [judged]: render (4)'s bound on the spawned front's drop to the gateway uid while it holds ``front.lock``
+#: (two interpreter starts, the stage's and the front's), below the revoker's own retry bound and SCRUB's lock wait.
+FRONT_DROP_WAIT_S = 3.0
+
+
+def front_dropped(run: RenderRun) -> int:
+    """Under ``front.lock``: wait until the spawned front's real uid is the gateway uid (the stage dropped and
+    asserted) and return its start time. Unknown, any other uid, or still root at :data:`FRONT_DROP_WAIT_S` refuses
+    ``front-start-unknown``; render's failure path then kills the child (it may still be root there)."""
+    seams = run.ctx.seams
+    assert run.front_pid is not None
+    deadline = seams.monotonic() + FRONT_DROP_WAIT_S
+    delay = 0.01
+    while True:
+        ident = seams.proc_identity(run.front_pid)
+        if ident is not None and ident[0] == run.front_uid:
+            return ident[1]
+        if ident is None or ident[0] != 0 or seams.monotonic() >= deadline:
+            raise Refused("front-start-unknown", str(run.front_pid))
+        seams.sleep(delay)
+        delay = min(delay * 2, 0.2)
+
+
 def render_step4_front(run: RenderRun) -> None:
     """(4) egress only: the front DETACHED, blocked reading the GO pipe; its ``pid`` + ``start`` into alloc, fsync.
 
     The spawn is the revoker's interlock: the slot's ``front.lock`` taken (render holds no pool or slot lock, so the
     order pool -> slot -> front holds), the ``front-revoked`` marker read under it, and a marker naming this lease
-    refuses ``front-revoked`` with nothing spawned; the lock is released once the spawn returns, and nothing else is
-    taken while it is held."""
+    refuses ``front-revoked`` with nothing spawned; the lock is released only once the spawned child's real uid is the
+    gateway uid (:func:`front_dropped`), so a revoker that takes the lock next sweeps a uid the front is already in,
+    and nothing else is taken while it is held."""
     if not run.egress:
         return
     seams = run.ctx.seams
@@ -1564,16 +1588,13 @@ def render_step4_front(run: RenderRun) -> None:
             if seams.front_revoked(run.ctx, run.alloc):
                 raise Refused("front-revoked", f"{run.alloc.slot.tag} lease {run.alloc.lease_seq}")
             run.front_pid = seams.spawn_front(argv, spec_json, go_r)
+            run.front_start = front_dropped(run)
         run.go_w = go_w
     except BaseException:
         os.close(go_w)
         raise
     finally:
         os.close(go_r)
-    ident = seams.proc_identity(run.front_pid)
-    if ident is None:
-        raise Refused("front-start-unknown", str(run.front_pid))
-    run.front_start = ident[1]
     pol = run.alloc.policy
     assert pol is not None and pol.front is not None
     run.alloc = replace(run.alloc, policy=replace(pol, front=replace(pol.front, pid=run.front_pid,

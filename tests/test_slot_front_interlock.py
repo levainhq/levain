@@ -152,3 +152,39 @@ def test_interlock_without_the_reaper_module(tmp_path):
     assert "DEFAULTS-REFUSE" in r.stdout, r.stdout
     counted = re.search(r"(\d+) passed", r.stdout)
     assert counted and int(counted.group(1)) >= 2 and "failed" not in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize("drop", ["drops", "never"])
+def test_front_lock_held_until_the_front_is_the_gateway_uid(tmp_path, drop):
+    """Group L3 r1 (codex MED 5), reproduced first (``1022-8/g1fix/item3_repro_before.txt``): ``front.lock`` was
+    released as soon as the fork returned, while the child was still root and had not passed the wall, so a revoker
+    taking the lock next swept a gateway uid the child was not yet in, wrote ``front-ended``, and the child entered
+    the swept uid after it. Now render holds the lock until the child's real uid is the gateway uid; a child that
+    stays root past the bound is refused ``front-start-unknown`` and killed."""
+    world = World(tmp_path)
+    s = _prepared(world)
+    rec = Interlock(world, lambda ctx, slot: nullcontext(), lambda ctx, alloc: False)
+    clock = [0.0]
+    world.seams.monotonic = lambda: clock[0]
+    world.seams.sleep = lambda dt: clock.__setitem__(0, clock[0] + dt)
+    asked: list = []
+
+    def identity(pid):
+        uid, start = world.fronts.identity(pid) or (None, None)
+        if uid is None:
+            return None
+        root = drop == "never" or len(asked) < 3          # the stage drops on the fourth look
+        asked.append((rec.held, 0 if root else uid))
+        return (0 if root else uid), start
+
+    world.seams.proc_identity = identity
+    code, line = world.main(["render", s], _blob())
+    print("asked", asked, "events", rec.events, "line", line)
+    if drop == "drops":
+        assert line == {"ok": True}
+        assert asked[:4] == [(True, 0), (True, 0), (True, 0), (True, asked[3][1])] and asked[3][1] != 0
+        assert rec.events == [("lock", "e0"), ("read", True), ("spawn", True), ("unlock", "e0")]
+    else:
+        assert line == {"ok": False, "refused": "front-start-unknown"}
+        assert all(held for held, _uid in asked[:-1]) and world.fronts.alive() == []   # killed (render's path)
+        assert clock[0] >= H.FRONT_DROP_WAIT_S
