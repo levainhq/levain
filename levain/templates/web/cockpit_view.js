@@ -2446,12 +2446,12 @@
     markEmptyCards();
     tintRepos();
     paintBuild();
-    const board = document.body.dataset.mode === "board";
     for (const w of document.querySelectorAll(".ck-widgets")) {
       const n = Array.from(w.children).filter(shown).length;
       // more than four tiles wrap into rows of at most four (6 -> 3 x 2), whatever the tab: a tile never shares a row so narrow it clips its text
       let cols = n > 4 ? (n % 3 === 0 ? 3 : 4) : Math.max(4, n);
-      const shape = (board && n <= 4) || n < 4 ? "strip" : "tiles";
+      // the Board draws the same separate cards as Morning (Phill 10-22: the Board-only strip, K2 r2 3d5c8660, clipped every sub-row)
+      const shape = n < 4 ? "strip" : "tiles";
       // ...and never so many that a tile is narrower than MIN_TILE_PX: the 720px rule covers the phone, this covers the half-screen laptop in between
       const room = w.clientWidth;
       w.dataset.shape = shape;   // before the gap is read: only the tiles shape is a grid with a gap

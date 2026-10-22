@@ -65,7 +65,7 @@ const run = (n) => {
 };
 out.r = [3, 4, 5, 6, 7, 8].map(run);
 """, tmp_path)
-    assert out["r"] == [["4", "strip"], ["4", "strip"], ["4", "tiles"], ["3", "tiles"], ["4", "tiles"], ["4", "tiles"]], out["r"]
+    assert out["r"] == [["4", "strip"], ["4", "tiles"], ["4", "tiles"], ["3", "tiles"], ["4", "tiles"], ["4", "tiles"]], out["r"]
 
 
 def test_i5_the_failing_doctor_check_rides_in_the_tooltip_not_the_row() -> None:

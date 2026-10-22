@@ -12,10 +12,11 @@
     --accent: oklch(0.76 0.165 55);
     --contrast: oklch(0.97 0.006 265);
 
-    --card: color-mix(in oklch, var(--base), var(--contrast) 5%);
-    --card-2: color-mix(in oklch, var(--base), var(--contrast) 9%);
-    --hair: color-mix(in oklch, var(--base), var(--contrast) 13%);
-    --hair-2: color-mix(in oklch, var(--base), var(--contrast) 22%);
+    /* dark: the panels lift clear of the page and the rules read (Phill 10-22: "an organized sea of text"); light sets its own */
+    --card: color-mix(in oklch, var(--base), var(--contrast) 8%);
+    --card-2: color-mix(in oklch, var(--base), var(--contrast) 12%);
+    --hair: color-mix(in oklch, var(--base), var(--contrast) 19%);
+    --hair-2: color-mix(in oklch, var(--base), var(--contrast) 28%);
     --text: var(--contrast);
     --label: color-mix(in oklch, var(--contrast) 66%, var(--base));
     --meta: color-mix(in oklch, var(--contrast) 58%, var(--base));
@@ -1659,7 +1660,7 @@ html body.ke .ck-card.w[data-signal="on"] { background: linear-gradient(to botto
 body.ke:not([data-mode="morning"]) #ck-h-brief, body.ke:not([data-mode="morning"]) #ck-brief { display: none; }
 body.ke:not([data-mode="morning"]) #ck-h-widgets { display: none; }
 
-/* the glance. Fewer than four tiles, or the Board: one bordered strip of equal tiles that share the whole row. Four or more: full tiles
+/* the glance. Fewer than four tiles: one bordered strip of equal tiles that share the whole row. Four or more: full tiles
    (cockpit_view.js sets data-shape). The tile never carries a fixed height. */
 /* K4: the Needs-you strip. Cards under the now band for what waits on the operator; absent when nothing waits. The accent is spent
    on "waiting on you" (the card's rim), never on a consent answer: Allow and Deny are one component at one weight (F11 a), and only
