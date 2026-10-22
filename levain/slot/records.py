@@ -405,6 +405,9 @@ def _alloc_base(value: object) -> AllocBase:
         ref = binascii.a2b_base64(ref_b64, strict_mode=True)
     except binascii.Error:
         raise Refused("bad-value", "alloc.base.ref_b64") from None
+    # strict_mode still accepts non-zero padding bits, so a second spelling of one ref would decode; one encoding.
+    if binascii.b2a_base64(ref, newline=False).decode("ascii") != ref_b64:
+        raise Refused("bad-value", "alloc.base.ref_b64 is not the canonical encoding")
     if not branch_ref_ok(ref):
         raise Refused("bad-value", "alloc.base.ref_b64 is not refs/heads/<a valid branch name>")
     return AllocBase(oid=oid, ref_b64=ref_b64, object_format=fmt,

@@ -595,6 +595,22 @@ def test_staging_kept_until_every_destination_durable(world):
     assert os.listdir(world.L / "staging" / s) == ["repo.bundle"]
 
 
+def test_base_recorded_only_when_step3_completes(world):
+    """A valid bundle copied, then a later step-(3) file faulting: alloc carries no base, so adopt answers
+    base-unrecorded instead of admitting a half-rendered session."""
+    s = _prepared(world)
+
+    def chown(fd, u, g, rel):
+        if rel.endswith("root/gitconfig"):
+            raise OSError(errno.EIO, "fault")
+        world.chowns.append((rel, u, g))
+
+    world.seams.chown = chown
+    assert world.main(["render", s], _blob())[0] == H.EXIT_INTERNAL
+    assert (world.L / "live" / s / "in" / "repo.bundle").exists()
+    assert world.alloc(s).base is None
+
+
 def test_none_class_no_front_no_handle(world):
     """A verifier (none class) render: no front started, no FRONT-ARM, MINT claims with no front, no handle."""
     s = "s-00000000000000c1"

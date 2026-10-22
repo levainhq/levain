@@ -1469,9 +1469,9 @@ def open_slot_owned_dir(parent: int, name: str, owner_uid: int, where: str) -> i
 
 def render_step3_files(run: RenderRun) -> None:
     """(3) The staging bundle -> a FRESH ``<S>/in/repo.bundle`` (§5.4: the reader runs as alloc ``staging_uid``),
-    its header parsed in the copy (§5a) and ``alloc.base`` written from it; then ``<S>/root/*`` and the onboarding
-    pre-seed from ``render.render``, each a fresh file with its §2.1 row;
-    then staging is emptied, only now that every staged file's destination is durable."""
+    its header parsed in the copy (§5a); then ``<S>/root/*`` and the onboarding pre-seed from ``render.render``, each
+    a fresh file with its §2.1 row; then staging is emptied, only now that every staged file's destination is durable;
+    and only then ``alloc.base`` is written from the parsed header."""
     ctx, a = run.ctx, run.alloc
     seams = ctx.seams
     facts = run.facts
@@ -1494,12 +1494,6 @@ def render_step3_files(run: RenderRun) -> None:
                                                                     f"live/{a.session}/in/{ST.BUNDLE_NAME}"))
     header = obs.finish()
     oid, ref = BF.base_of(header)
-    # alloc.base from the bytes root itself copied, written once the bundle is durable and before RENDERED (alloc
-    # is immutable after it); later alloc writes in this render carry it, being replaces of run.alloc.
-    run.alloc = a = replace(a, base=R.AllocBase(oid=oid, ref_b64=base64.b64encode(ref).decode("ascii"),
-                                                object_format=header.object_format,
-                                                bundle_sha256=staged.digest, bundle_bytes=staged.size))
-    write_alloc(ctx, a)
     owner = session_owner_uid(a)
     for f in rendered.files:
         *parent, name = f.path.split("/")
@@ -1526,6 +1520,13 @@ def render_step3_files(run: RenderRun) -> None:
     with ctx.store.dir("staging", a.session, trusted=False) as staging:
         os.unlink(ST.BUNDLE_NAME, dir_fd=staging)
         seams.fsync(staging)
+    # alloc.base from the bytes root itself copied, written last: a base present means step (3) completed, so a
+    # render refused or faulted anywhere earlier in this step leaves none and adopt answers base-unrecorded. It is
+    # written before RENDERED (alloc is immutable after it); later alloc writes carry it, being replaces of run.alloc.
+    run.alloc = replace(a, base=R.AllocBase(oid=oid, ref_b64=base64.b64encode(ref).decode("ascii"),
+                                            object_format=header.object_format,
+                                            bundle_sha256=staged.digest, bundle_bytes=staged.size))
+    write_alloc(ctx, run.alloc)
 
 
 def front_launch(run: RenderRun) -> Tuple[Tuple[str, ...], bytes]:
