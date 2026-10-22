@@ -693,7 +693,8 @@ class Control:
     ``TOKEN-RESOLVE``; ``None``: no peer is keys) ·
     ``slot_reusable(class, index, session) -> bool`` (the §3.5 mirror; default ``False``, which keeps a
     RETAINED session in ``REVOKED-SET``: the revoker's kill is uid + start checked, so over-inclusion is
-    safe and under-inclusion is not) · ``is_brokered(claims) -> bool`` · ``clock() -> epoch seconds`` ·
+    safe and under-inclusion is not) · ``is_brokered(claims) -> bool`` · ``clock() -> epoch seconds`` (persisted
+    timestamps only) · ``monotonic() -> seconds`` (every deadline and interval: a wall-clock step never moves one) ·
     ``sleep(seconds)`` (the EOF retry's backoff) · ``qbroker_uid`` (the ``_levain_qbroker`` peer; ``None``: no
     peer is the broker) · ``run_facts(session) -> {run_id, job_id, run_index, contract_digest, model_requested} |
     None`` (the run a dispatch session's bound ticket names; session 3c's ticket records supply it, and the default
@@ -713,6 +714,7 @@ class Control:
                  slot_reusable: Callable[[str, int, str], bool] = lambda c, i, s: False,
                  is_brokered: Callable[[Mapping[str, object]], bool] = _default_is_brokered,
                  clock: Callable[[], float] = time.time,
+                 monotonic: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep) -> None:
         if type(operator_uid) is not int or operator_uid <= ROOT_UID:
             raise Refused("bad-config", f"operator uid {operator_uid!r}")
@@ -742,6 +744,7 @@ class Control:
         self._slot_reusable = slot_reusable
         self._is_brokered = is_brokered
         self._clock = clock
+        self._monotonic = monotonic
         self._sleep = sleep
         self._mu = threading.Lock()
         self._leases: dict[str, Lease] = {}            # nonce -> lease (a dead one kept, bounded: _retire)
@@ -754,6 +757,8 @@ class Control:
         self._reg_epoch: dict[str, int] = {}
         #: every keys admin epoch at or below this one has ended and had its EOF handled.
         self._keys_lost_upto = 0
+        #: sessions whose keys-EOF revoke worker is running; another EOF coalesces into it (one worker per session).
+        self._keys_revoking: set[str] = set()
         self._retired: collections.deque[str] = collections.deque()   # dead lease nonces, oldest first
         self._stopping = threading.Event()
         #: The background threads still running (revokes, drop retries); each removes itself as it ends.
@@ -850,13 +855,25 @@ class Control:
         """keys' connection ``epoch`` has ended, so keys already cleared every registration it made: nothing to drop."""
         return self.keys_admin is not None and epoch is not None and not self.keys_admin.current(epoch)
 
+    def _refused_off_epoch(self, epoch: int | None, e: AdminRefused) -> tuple[int | None, bool]:
+        """A drop refused on connection ``e.conn``: the epoch the debt is bound to (the first refusal binds a debt that
+        had none) and whether the debt is moot. A refusal on another connection than the bound one means the bound
+        connection ended, and keys cleared its registrations at that EOF: the debt never moves to the newer one."""
+        if self.keys_admin is None:
+            return epoch, False
+        if epoch is None:
+            return e.conn, False
+        return epoch, e.conn != epoch
+
     def _drop(self, session: str, epoch: int | None = None) -> None:
         """``DROP-SESSION`` once now (``epoch``: the keys connection the session registered on, if known; once it has
         ended the drop is moot). A failure is retried with backoff on a background thread, and the debt ends only by
         an ack, by CONTROL stopping (whose next start re-issues it) or by a CONFIRMED teardown: with
-        :class:`KeysAdmin`, a drop still refused at V23 since the first try makes CONTROL close the connection that
-        refused it, through the EOF path, and keys clears every registration of a connection that ends (§4.5, §4.9).
-        Another seam has no connection to close, so it is retried until acked or stopped, never forgotten."""
+        :class:`KeysAdmin`, a drop still refused at V23 since the first try makes CONTROL close the connection the
+        debt is bound to, through the EOF path, and keys clears every registration of a connection that ends (§4.5,
+        §4.9). The debt is bound to ONE connection for its whole life, a fencing token: the registration's, else the
+        one that first refused it; it is never carried onto a newer connection. Another seam has no connection to
+        close, so it is retried until acked or stopped, never forgotten."""
         with self._mu:
             if session in self._drops_owed:
                 return                                   # a retry is already running
@@ -867,7 +884,9 @@ class Control:
             return
         except AdminRefused as e:
             self.seam_errors.append(("drop_session", session, e))
-            epoch = e.conn
+            epoch, moot = self._refused_off_epoch(epoch, e)
+            if moot:
+                return
         except BaseException as e:   # noqa: BLE001 - the revoke is durable; the drop is owed
             self.seam_errors.append(("drop_session", session, e))
         with self._mu:
@@ -879,23 +898,27 @@ class Control:
     def _drop_until_acked(self, session: str, epoch: int | None) -> None:
         from levain.slot.control_client import V23_SECONDS   # lazy: a module-level import would be circular
         delay = EOF_RETRY_FIRST_S
-        until = self._clock() + V23_SECONDS
+        until = self._monotonic() + V23_SECONDS
         try:
             while not self._stopping.is_set():
                 if self._drop_moot(epoch):
                     return                               # that connection ended: keys cleared what it made
-                if self.keys_admin is not None and self._clock() >= until:
+                if self.keys_admin is not None and self._monotonic() >= until:
                     self.seam_errors.append(("drop_session", session, TimeoutError(
-                        "no ack within V23: CONTROL closes the keys admin connection that refused it")))
+                        "no ack within V23: CONTROL closes the keys admin connection the drop is bound to")))
                     self.keys_admin.abort(epoch)
                     return
                 self._sleep(delay)
                 delay = min(delay * 2, EOF_RETRY_MAX_S)
+                if self._drop_moot(epoch):
+                    return                               # it ended during the sleep: never sent to its successor
                 try:
                     self._drop_session(session)
                     return
                 except AdminRefused as e:
-                    epoch = e.conn
+                    epoch, moot = self._refused_off_epoch(epoch, e)
+                    if moot:
+                        return
                 except BaseException:   # noqa: BLE001 - noted once by _drop; retried until acked
                     continue
         finally:
@@ -1037,9 +1060,27 @@ class Control:
         for session in victims:
             self._spawn_keys_revoke(session)
 
-    def _spawn_keys_revoke(self, session: str) -> threading.Thread:
-        return self._spawn(lambda s: self._revoke_after_eof(s, lease_eof=False), session,
-                           name=f"control-keys-eof-{session}")
+    def _spawn_keys_revoke(self, session: str) -> threading.Thread | None:
+        """The session's keys-EOF revoke, at most one in flight: a worker already running for it retries until the
+        revoke lands, so a later EOF's request is already covered (``None``: coalesced into that worker)."""
+        with self._mu:
+            if session in self._keys_revoking:
+                return None
+            self._keys_revoking.add(session)
+
+        def run(s: str) -> None:
+            try:
+                self._revoke_after_eof(s, lease_eof=False)
+            finally:
+                with self._mu:
+                    self._keys_revoking.discard(s)
+
+        try:
+            return self._spawn(run, session, name=f"control-keys-eof-{session}")
+        except BaseException:
+            with self._mu:
+                self._keys_revoking.discard(session)     # never started: nothing would clear the mark
+            raise
 
     def _keys_epoch_lost(self, epoch: object) -> bool:
         """Has keys connection ``epoch`` ended (caller holds ``_mu``)? Always ``False`` with no :class:`KeysAdmin`."""
@@ -1250,25 +1291,29 @@ class Control:
             if ("front" in claims) != (rec.claims.get("class") == "egress"):
                 raise Refused("claims-mismatch")
             epoch = None
+            lost = False
             if "front" in claims:
                 rec, epoch = self._register_front(rec, claims)
                 if self.keys_admin is not None:
                     with self._mu:
                         self._reg_epoch[session] = epoch    # from here keys' EOF of that epoch finds it a victim
-            merged = {**rec.claims, **claims}
-            h = Handles(token=new_handle() if self._is_brokered(merged) else None,
-                        queue_cap=new_handle() if claims["queue_grant"] else None)
-            new = self._write(rec, claims=merged, event_kind="none")
-            # The lease can read EOF during the keys wire or the write (lease_eof takes no session lock): the
-            # handles are published only if that same lease is live NOW, under the lock lease_eof drops them under.
-            # Likewise keys' connection: published only if the epoch keys acked the register on has not ended
-            # since, under the lock _keys_eof marks it lost under; else the session is left to its revoke.
-            with self._mu:
-                if self._session_lease.get(session) is not lease or not lease.live:
-                    raise Refused("lease-dead")
-                lost = epoch is not None and self._keys_epoch_lost(epoch)
-                if not lost:
-                    self._handles[session] = h
+                        # An EOF handled before the line above never saw this session: it is revoked here instead.
+                        lost = self._keys_epoch_lost(epoch)
+            if not lost:
+                merged = {**rec.claims, **claims}
+                h = Handles(token=new_handle() if self._is_brokered(merged) else None,
+                            queue_cap=new_handle() if claims["queue_grant"] else None)
+                new = self._write(rec, claims=merged, event_kind="none")
+                # The lease can read EOF during the keys wire or the write (lease_eof takes no session lock): the
+                # handles are published only if that same lease is live NOW, under the lock lease_eof drops them
+                # under. Likewise keys' connection: published only if the epoch keys acked the register on has not
+                # ended since, under the lock _keys_eof marks it lost under; else the session is left to its revoke.
+                with self._mu:
+                    if self._session_lease.get(session) is not lease or not lease.live:
+                        raise Refused("lease-dead")
+                    lost = epoch is not None and self._keys_epoch_lost(epoch)
+                    if not lost:
+                        self._handles[session] = h
         if lost:
             self._spawn_keys_revoke(session)             # runs once this verb releases the session lock
             raise Refused("keys-unavailable", f"{session}: keys' connection ended after FRONT-REGISTER")
@@ -1369,21 +1414,20 @@ class Control:
             if e.name == "registration-stale":
                 raise Refused("front-registration-stale", session) from None
             raise Refused("keys-unavailable", f"keys refused FRONT-ARM: {e.name}") from None
-        # The lock is not held across the relay, so the session can move under it: re-check both before root is
-        # told it may write the go byte. The arm counts only on the connection the session registered on, and only
-        # while that connection has not ended.
-        with self._mu:
-            lease_ok = self._session_lease.get(session) is lease and lease is not None and lease.live
-            keys_ok = self.keys_admin is None or (arm_epoch == self._reg_epoch.get(session)
-                                                  and not self._keys_epoch_lost(arm_epoch))
-        if not lease_ok:
-            raise Refused("lease-dead")
-        if not keys_ok:
-            raise Refused("keys-unavailable", f"{session}: keys' connection ended around FRONT-ARM")
+        # The lock is not held across the relay, so the session can move under it: re-check before root is told it
+        # may write the go byte. The store first; then the lease and keys' connection, and the answer, in ONE hold of
+        # the lock lease_eof and _keys_eof drop handles under, with nothing read or awaited after that check. The arm
+        # counts only on the connection the session registered on, and only while that connection has not ended.
         now = self.store.get(session)
         if now is None or now.state != R.RENDERING or now.generation != rec.generation:
             raise Refused("not-rendering")
-        return {"generation": rec.generation}
+        with self._mu:
+            if not (self._session_lease.get(session) is lease and lease is not None and lease.live):
+                raise Refused("lease-dead")
+            if not (self.keys_admin is None or (arm_epoch == self._reg_epoch.get(session)
+                                                and not self._keys_epoch_lost(arm_epoch))):
+                raise Refused("keys-unavailable", f"{session}: keys' connection ended around FRONT-ARM")
+            return {"generation": rec.generation}
 
     def _op_secrets(self, conn: Conn, args: dict) -> dict[str, object]:
         """§3.2: root's ``start`` fetches the handles by session, only while RENDERED."""

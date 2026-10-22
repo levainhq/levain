@@ -190,6 +190,107 @@ def test_nakd_drop_is_never_forgotten_on_an_open_connection(short_dir, monkeypat
         keys.close()
 
 
+def _record_eofs(admin: C.KeysAdmin) -> list[int]:
+    """The epochs whose EOF CONTROL has handled, appended after its handler returns."""
+    eofs: list[int] = []
+    seen_eof = admin.on_eof
+
+    def on_eof(no: int) -> None:
+        seen_eof(no)
+        eofs.append(no)
+
+    admin.on_eof = on_eof
+    return eofs
+
+
+def _wait_for(cond, timeout: float = 5) -> bool:
+    deadline = time.monotonic() + timeout
+    while not cond() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    return cond()
+
+
+def test_drop_debt_never_moves_to_a_newer_connection(short_dir, monkeypatch):
+    """gemini r2 MED: a drop debt is bound to its connection (a fencing token). Epoch 1 ends while the retry sleeps
+    and S2's MINT opens epoch 2: the debt is moot (keys cleared epoch 1 at its EOF), it is never sent on epoch 2, and
+    its V23 never aborts epoch 2."""
+    monkeypatch.setattr(control_client, "V23_SECONDS", 0.3)
+    store_dir = short_dir / "sessions"
+    store_dir.mkdir(mode=0o700)
+    keys = FakeKeys(short_dir / "a.sock")
+    admin = C.KeysAdmin(short_dir / "a.sock", answer_s=0.2, window_s=1.0)
+    box: dict = {}
+    first = threading.Event()
+
+    def sleep(s: float) -> None:
+        if threading.current_thread().name.startswith("control-drop-") and not first.is_set():
+            first.set()                                                       # the retry's first sleep
+            keys.end(0)
+            assert _wait_for(lambda: 1 in eofs)
+            box["mint2"] = _mint(box["control"], S2, box["gen2"])            # opens epoch 2
+            return
+        time.sleep(0.01)
+
+    control = box["control"] = C.Control(C.StateStore(store_dir), OP_UID, keys_admin=admin, sleep=sleep)
+    eofs = _record_eofs(admin)
+    control.start()
+    try:
+        _lease1, gen = _rendering(control, S1)
+        assert _mint(control, S1, gen)["ok"]                                  # registered on epoch 1
+        _lease2, box["gen2"] = _rendering(control, S2)
+        keys.nak.add("DROP-SESSION")
+        assert control.handle(C.Conn(0), {"v": 1, "op": "REVOKE", "id": 5, "session": S1})["ok"]
+        control.join_eof(3)
+        assert box["mint2"]["ok"], box["mint2"]
+        assert control.drops_owed() == frozenset()
+        time.sleep(0.4)                                                       # past the debt's V23
+        assert [i for i, r in keys.log if r["op"] == "DROP-SESSION"] == [0]
+        assert 1 not in keys.ended and 2 not in eofs and admin.connected(), "the debt's V23 aborted epoch 2"
+        assert control.store.get(S2).state == R.RENDERING
+    finally:
+        control.stop()
+        keys.close()
+
+
+def test_one_keys_eof_revoke_worker_per_session(short_dir):
+    """codex r2 MED: S1's revoke keeps failing (the store cannot settle) while keys' connection ends three times; the
+    later EOFs coalesce into the worker already retrying it, and that one worker lands the revoke once the store
+    recovers."""
+    store_dir = short_dir / "sessions"
+    store_dir.mkdir(mode=0o700)
+    failing = threading.Event()
+
+    def fsync(fd: int) -> None:
+        if failing.is_set() and stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "directory fsync failed")
+        os.fsync(fd)
+
+    keys = FakeKeys(short_dir / "a.sock")
+    admin = C.KeysAdmin(short_dir / "a.sock", answer_s=1.0)
+    control = C.Control(C.StateStore(store_dir, fsync=fsync), OP_UID, keys_admin=admin,
+                        sleep=lambda s: time.sleep(0.005))
+    eofs = _record_eofs(admin)
+    control.start()
+    try:
+        _lease, gen = _rendering(control, S1)
+        assert _mint(control, S1, gen)["ok"]
+        failing.set()
+        for i in range(3):
+            if i:
+                admin.call("NOOP")                                            # the next connection
+            keys.end(i)
+            assert _wait_for(lambda i=i: i + 1 in eofs)
+        workers = [t for t in threading.enumerate() if t.name == f"control-keys-eof-{S1}" and t.is_alive()]
+        assert len(workers) == 1, f"{len(workers)} keys-EOF revoke workers for one session"
+        failing.clear()
+        control.join_eof(5)
+        assert control.store.get(S1).state == R.REVOKED
+    finally:
+        failing.clear()
+        control.stop()
+        keys.close()
+
+
 @pytest.mark.parametrize("case", ["unsettled-record", "newer-connection"])
 def test_keys_eof_revokes_exactly_the_lost_connections_registrations(short_dir, case):
     """keys' admin EOF (§4.5). ``unsettled-record`` (codex r1 HIGH 2, glm-openrouter MED 1): an unrelated record that
