@@ -43,7 +43,8 @@ def test_a_node_with_work_to_lose_carries_an_at_risk_mark_in_both_lenses_and_unk
     out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}, {"eval": _paint(v, "agents")}, {"eval": probe_g}])
     work, agents = json.loads(out[-3]), json.loads(out[-1])
     assert work.get("n1") == "2 dirty · 1 unpushed · 3 running", work                      # the worker chip on the task it works
-    assert work.get("n3") is None, work                                                    # nothing to lose: no mark
+    assert work.get("n2") == "dirty not tracked · 4 unpushed · running not tracked", work   # null is "not tracked", never 0
+    assert work.get("n3") is None, work                                                  # nothing to lose: no mark
     assert agents["n1"] is True and agents["n2"] is True, agents                           # the node's dot: n2's null dirty is unknown, its 4 unpushed are not
     assert agents["n3"] is False and agents["n4"] is False, agents                         # all zero, or all unknown: no mark
 

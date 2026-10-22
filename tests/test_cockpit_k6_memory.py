@@ -54,28 +54,6 @@ def test_no_glance_tile_clips_its_text_at_phone_or_desktop_width(tmp_path: Path)
     assert out[5] == [], ("phone", out[5])
 
 
-# The fixture's own words fit the tile in the headless font and not in the real one ("failin" in the shot), so the probe puts a status
-# row of the longest realistic words through the tile's own markup: a state word and its reading, in a tile ~163px wide.
-LONG_ROW = """(() => { const tile = [...document.querySelectorAll('.ck-widgets .ck-card.w')].find(c => c.querySelector('.op') && c.getBoundingClientRect().width > 0);
-  const row = tile.querySelector('.op').cloneNode(true); row.querySelector('.op-l').textContent = 'cockpit keys mac';
-  row.querySelector('.v').textContent = 'failing,3/7'; tile.querySelector('.op').parentElement.appendChild(row); return true; })()"""
-
-
-# PREMISE MOVED (a8e55d2c, 173c00b2): the status rows (.op) draw only in the Health tile, which is Memory-only and hidden on the Memory tab
-# ("the Health strip is hidden here"); the glance tiles carry count faces, so no .op row is on screen on any tab. The clipping guard for what
-# a glance tile does draw is test_no_glance_tile_clips_its_text_at_phone_or_desktop_width. The head rules: retire this test, or re-point it
-# at the face that now carries a status word.
-@pytest.mark.skip(reason="no status row is drawn in any visible glance tile since K6 (a8e55d2c, 173c00b2); the head rules retire or re-point")
-@needs_browser
-def test_a_status_row_with_a_long_value_wraps_instead_of_clipping_in_a_narrow_tile(tmp_path: Path) -> None:
-    _root, src, _ids = _install(tmp_path)
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/#write_token=T", [
-            PHONE, {"until": "document.querySelector('.ck-widgets .op')"}, {"eval": "(async () => { await new Promise(r => setTimeout(r, 400)); " + LONG_ROW + "; " + PROBE + " })()"},
-        ])["values"]
-    assert out[1] == [], ("390", out[1])
-
-
 # ───────────────────────────── the Memory tab ─────────────────────────────
 MEMORY = f"#write_token=T&memory"
 SHAPE = """(async () => { await new Promise(r => setTimeout(r, 700));
@@ -266,7 +244,7 @@ def test_an_editable_section_with_no_text_keeps_its_edit(tmp_path: Path) -> None
   const mid = (n) => { const r = n.getBoundingClientRect(); return [Math.round((r.top + r.bottom) / 2), Math.round(r.left), Math.round(r.right)]; };
   const h = slim.querySelector('.phead h2'), e = slim.querySelector('.empty'), b = slim.querySelector('.edit-btn');
   // the slim row's CONTENT is one line; its box is the grid cell, stretched to sit level with the right-hand column's tall sections
-  const used = Math.round(Math.max(...[h, e, b].map((n) => n.getBoundingClientRect().bottom)) - slim.getBoundingClientRect().top);
+  const used = Math.round(Math.max(...[h, e, b].filter(Boolean).map((n) => n.getBoundingClientRect().bottom)) - slim.getBoundingClientRect().top);
   return { title: h && h.textContent, empty: e && e.textContent, edit: !!b, h: used,
     mids: [h, e, b].map((n) => n && mid(n)), pats: document.querySelectorAll('.ck-mem-neo .ck-mem-pats .ck-mem-n').length, decs: document.querySelectorAll('.ck-mem-neo .ck-mem-decs .ck-mem-when').length }; })()"""},
         ])["values"]

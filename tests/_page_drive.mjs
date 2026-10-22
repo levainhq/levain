@@ -68,10 +68,19 @@ const send = (method, params = {}) => new Promise((r) => { const i = ++id; pend.
 await send("Page.enable"); await send("Network.enable");
 await send("Page.navigate", { url });
 const values = [];
+// a CDP call that gives up after `ms`: a page that never answers must not outlive the step's deadline
+const sendWithin = (ms, method, params) => Promise.race([send(method, params), sleep(Math.max(ms, 1)).then(() => ({ timedOut: true }))]);
+// the outcome of an evaluation, kept apart from the page's own value: { value } or { error } (an exception the page raised,
+// a syntax error, a wait on a promise that rejects), or { error: "no answer ..." } when CDP did not reply in time
+const evaluateOutcome = async (expression, ms = 60000) => {
+  const r = await sendWithin(ms, "Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
+  if (r.timedOut) return { error: `no answer from the page within ${ms}ms` };
+  if (r.result?.exceptionDetails) return { error: r.result.exceptionDetails.text + " " + (r.result.exceptionDetails.exception?.description || "") };
+  return { value: r.result?.result?.value ?? null };
+};
 const evaluate = async (expression) => {
-  const r = await send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
-  return r.result?.exceptionDetails ? { error: r.result.exceptionDetails.text + " " + (r.result.exceptionDetails.exception?.description || "") }
-    : r.result?.result?.value ?? null;
+  const o = await evaluateOutcome(expression);
+  return "error" in o ? { error: o.error } : o.value;
 };
 // Page.navigate returns at commit: wait (bounded) for the load before the first step, or an early shot sees a blank page
 for (const end = Date.now() + 15000; Date.now() < end;) {
@@ -80,15 +89,16 @@ for (const end = Date.now() + 15000; Date.now() < end;) {
 }
 // a wait that fails the drive leaves a PNG of what the page showed beside the steps file (the test's tmp dir),
 // and its path on stderr, so the failure can be read rather than guessed at
+// (each call is raced against ~3 s: a wedged page must not turn the named failure into the runner's timeout)
 const shotOnTimeout = async (n) => {
   try {
-    const r = await send("Page.captureScreenshot", { format: "png" });
+    const r = await sendWithin(3000, "Page.captureScreenshot", { format: "png" });
     if (!r.result?.data) return;
     const p = join(dirname(stepsPath), `timeout-step-${n}.png`);
     writeFileSync(p, Buffer.from(r.result.data, "base64"));
     console.error(`screenshot at the timeout: ${p}`);
-    const t = await evaluate("document.body.innerText");
-    if (typeof t === "string") writeFileSync(p.replace(/\.png$/, ".txt"), t);
+    const t = await evaluateOutcome("document.body.innerText", 3000);
+    if (typeof t.value === "string") writeFileSync(p.replace(/\.png$/, ".txt"), t.value);
   } catch {}
 };
 for (const s of steps) {
@@ -128,14 +138,17 @@ for (const s of steps) {
       done(1); await sleep(10000);
     }
   } else if (s.until !== undefined) {
-    let v = null;
+    let v = null, lastError = null;
     for (;;) {
-      v = await evaluate(`(() => { try { return (${s.until}); } catch (e) { return null; } })()`);
+      // an error outcome never satisfies the wait (a context destroyed by a navigation is transient: keep polling)
+      const o = await evaluateOutcome(`(() => { try { return (${s.until}); } catch (e) { return null; } })()`, Math.max(deadline - Date.now(), 250));
+      if ("error" in o) { lastError = o.error; v = null; } else v = o.value;
       if (v || Date.now() >= deadline) break;
       await sleep(100);
     }
     if (!v && !s.may_timeout) {
-      console.error(`step ${steps.indexOf(s)}: until never came true within ${s.ms || 20000}ms: ${s.until}`);
+      console.error(`step ${steps.indexOf(s)}: until never came true within ${s.ms || 20000}ms: ${s.until}` +
+        (lastError ? ` (last error: ${lastError})` : ""));
       await shotOnTimeout(steps.indexOf(s));
       done(1); await sleep(10000);
     }

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -305,8 +306,10 @@ def test_a_details_retry_after_a_failed_read_reuses_its_slot(tmp_path, monkeypat
     q.withdraw(gone.id)
     _root, src, _ids = _install(tmp_path)
     # the first body fetch answers 500, so "details" shows an error and re-enables; the retry reads the body
-    stub = ("(() => { const real = window.fetch.bind(window); let n = 0; window.fetch = (u, o) => String(u).includes('/cockpit/consent/') && !String(u).includes('/proposals.json') && n++ < 1"
-            " ? Promise.resolve({ ok: false, status: 500 }) : real(u, o); return 1; })()")
+    # the stub records the url it failed, so the test reads back WHICH fetch consumed the single failure
+    stub = ("(() => { const real = window.fetch.bind(window); let n = 0; window.__failed = []; window.fetch = (u, o) =>"
+            " String(u).includes('/cockpit/consent/') && !String(u).includes('/proposals.json') && n++ < 1"
+            " ? (window.__failed.push(String(u)), Promise.resolve({ ok: false, status: 500 })) : real(u, o); return 1; })()")
     row = "[...document.querySelectorAll('#levain-modal .consent-row')].find(x => x.querySelector('.consent-audit'))"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
@@ -319,9 +322,12 @@ def test_a_details_retry_after_a_failed_read_reuses_its_slot(tmp_path, monkeypat
             {"eval": f"{row}.querySelector('.consent-details').click(); 1"},
             {"until": f"{row}.querySelector('.consent-display')"},
             {"eval": f"[{row}.querySelectorAll('.consent-body').length, {row}.querySelector('.consent-display').textContent]"},
+            {"eval": "window.__failed"},
         ])["values"]
-    assert out[-1][0] == 1, out
-    assert "zq-retry-marker" in out[-1][1]
+    # the one failure was the withdrawn request's own body read (not a poll that got there first), so "details failed, then retried" held
+    assert len(out[-1]) == 1 and urllib.parse.quote(gone.id, safe="") in out[-1][0], out
+    assert out[-2][0] == 1, out
+    assert "zq-retry-marker" in out[-2][1]
 
 
 @needs_browser
