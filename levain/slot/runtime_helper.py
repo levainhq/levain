@@ -608,7 +608,7 @@ def read_at(dirfd: int, name: str, where: str, *, cap: int = _RECORD_CAP) -> Opt
             raise Refused("record-too-large", where)
         out = bytearray()
         while len(out) <= cap:
-            chunk = os.read(fd, 65536)
+            chunk = os.read(fd, min(65536, cap + 1 - len(out)))   # never more than cap + 1 in total
             if not chunk:
                 break
             out += chunk
