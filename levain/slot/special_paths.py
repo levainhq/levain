@@ -1,5 +1,5 @@
 """git's ``.gitmodules`` / ``.gitattributes`` name predicates, ported, and the structural special-blob finder
-(S1 session 5 DESIGN §5 step 6, §6.1 step 4, T34, A10).
+(S1 session 5 DESIGN §5 step 6, §6.1 step 4, T34, A10; symlink targets as the third class, A4).
 
 A tree in an adopt bundle may name, at a ``.gitmodules`` or ``.gitattributes`` entry, a blob the bundle does not carry
 (a blob of the base). ``index-pack --fsck-objects`` in an empty store then looks that blob up after the pack and either
@@ -187,7 +187,7 @@ def tree_entries(payload: bytes, hexlen: int) -> Iterator[tuple[int, bytes, str]
 def special_entry_oids(payload: bytes, hexlen: int) -> Iterator[str]:
     """The oids one tree names at a ``.gitmodules`` or ``.gitattributes`` entry, by ``fsck_tree``'s rule: any entry
     that is not a symlink (a symlink there is git's own ``gitmodulesSymlink`` / ``gitattributesSymlink`` report, not a
-    lookup); and every segment after a backslash in a name is checked once more with the NTFS ``.gitmodules``
+    lookup of this class; its oid is a symlink target, :func:`symlink_entry_oids`); and every segment after a backslash in a name is checked once more with the NTFS ``.gitmodules``
     predicate (git checks no ``.gitattributes`` spelling there). The entry's mode is not read otherwise, so a gitlink
     (``160000``) or a tree (``040000``) at a special name is collected too, exactly as ``fsck_tree`` collects it: an oid
     here is not always a blob, and a caller sending or requiring them must treat a non-blob oid explicitly."""
@@ -213,4 +213,24 @@ def special_blobs(tree_payloads: Iterable[bytes], hexlen: int) -> set[str]:
     found: set[str] = set()
     for payload in tree_payloads:
         found.update(special_entry_oids(payload, hexlen))
+    return found
+
+
+def symlink_entry_oids(payload: bytes, hexlen: int) -> Iterator[str]:
+    """The oids one tree names at a symlink entry (mode ``120000`` by ``S_ISLNK``), whatever the name: ``fsck_tree``
+    collects each as a symlink target, and a git that checks them (v2.39.4 does; some later releases do not) makes
+    ``index-pack --fsck-objects`` in an empty store die ``symlinkTargetMissing`` when one is absent."""
+    for mode, _name, oid in tree_entries(payload, hexlen):
+        if mode & _S_IFMT == _S_IFLNK:
+            yield oid
+
+
+def adopt_specials(tree_payloads: Iterable[bytes], hexlen: int) -> set[str]:
+    """The adopt special set, three classes: :func:`special_blobs`' ``.gitmodules`` and ``.gitattributes`` (A10) and
+    every symlink target (A4). The importer sends the oids of it that its object list lacks, and the verifier requires
+    exactly those: one function, both callers."""
+    found: set[str] = set()
+    for payload in tree_payloads:
+        found.update(special_entry_oids(payload, hexlen))
+        found.update(symlink_entry_oids(payload, hexlen))
     return found
