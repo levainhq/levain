@@ -38,9 +38,11 @@ CONTROL checks, never as a fact root acts on.
    A vendor that exec'd but is not recorded ACTIVE is killed with its whole domain (Linux: the session cgroup;
    macOS: every process of the slot uid), then reaped.
 
+Steps 4-9 run under the session END lock (:func:`_start_fenced`, the spawn fence), released after the CAS's answer.
+
 ``teardown`` = END (§7.4): CAS live -> REVOKED, the END driver (end.py) with proc.py's real freeze / kill / proof,
-then SCRUBBED (proc.scrub over every uid of the slot) and the slot's state file back to ``reusable`` (rev + 1, under
-the pool lock). ``{ok, state}``.
+then SCRUBBED (proc.scrub over every uid of the slot, under the slot lock) and the slot's state file back to
+``reusable`` (rev + 1, under a TRY of the pool lock). ``{ok, state}``.
 """
 from __future__ import annotations
 
@@ -51,9 +53,10 @@ import select
 import stat
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from levain.contracts import canon
 from levain.slot import Refused, wall
@@ -201,23 +204,37 @@ def await_exec(fd: int, *, bound_s: float, clock: Callable[[], float] = time.mon
     return "exec" if os.read(fd, 1) == b"" else "failed"
 
 
-def kill_domain(ctx: H.Ctx, a: R.Alloc) -> bool:
-    """Every process of the session's kill domain, by proc.py's END kill (Linux: ``cgroup.kill`` on alloc's cgroup,
-    proven by ``populated 0``; macOS: SIGKILL sweeps of the slot uid). Never only one pid: on Linux the pid the
-    helper holds is bwrap's monitor, and the vendor is another process in the session's PID namespace."""
+def _proc_seams(ctx: H.Ctx) -> PR.ProcSeams:
+    return ctx.seams.proc_seams or PR.default_seams(ctx.seams.host)   # type: ignore[return-value]
+
+
+def kill_domain(ctx: H.Ctx, a: R.Alloc, children: Sequence[int] = ()) -> Tuple[PR.Domain, frozenset]:
+    """Every process of the session's kill domain ended and proven, and which of ``children`` (the start's own
+    unreaped children) that reaped. Linux: proc.py's END kill, ``cgroup.kill`` on alloc's cgroup proven by
+    ``populated 0`` (it reaps nothing). macOS: :func:`proc.end_domain` on the slot uid, which freezes first, boots the
+    uid's launchd domain out and reaps ``children`` before its proof. Never only one pid: on Linux the pid the helper
+    holds is bwrap's monitor, and the vendor is another process in the session's PID namespace."""
     seams = ctx.seams
-    _, kill, _ = PR.end_seams(seams.host, a.cgroup if seams.host == "linux" else None,
-                              seams.proc_seams)   # type: ignore[arg-type]
-    return kill(a.slot_uid, PR.V12_SECONDS)
+    if seams.host == "linux":
+        _, kill, _ = PR.end_seams("linux", a.cgroup, seams.proc_seams)   # type: ignore[arg-type]
+        return (PR.PROVEN if kill(a.slot_uid, PR.V12_SECONDS) else PR.Domain(False, "kill-unproven")), frozenset()
+    return PR.end_domain(a.slot_uid, PR.V12K_SECONDS, children, seams=_proc_seams(ctx))
 
 
 def _abandon(ctx: H.Ctx, a: R.Alloc, pid: int, what: str) -> None:
-    """A launch the start will not keep: its domain killed, then its pid reaped (``seams.kill``: SIGKILL + waitpid).
-    A failure here is noted, never raised over the refusal the caller is about to raise."""
+    """A launch the start will not keep: its domain killed with ``pid`` as the kill's child (macOS reaps it before the
+    proof: a zombie child of the start is a process of the uid until reaped), then ``seams.kill(pid)`` (SIGKILL +
+    waitpid) ONLY for a pid that kill did not reap: a reaped pid may already be another process's. The launched pid
+    is one process across ``launchctl asuser``'s exec, the stage's drop and its exec of the target: root until the
+    stage drops, the slot uid after. A pid still root at the kill is not the sweep's and is not reaped, so the
+    trailing kill ends it. A failure here is noted, never raised over the refusal the caller is about to raise.
+    Runs under the session END lock (:func:`start`)."""
+    reaped: frozenset = frozenset()
     try:
-        _kill_quiet(ctx, a, what)
+        reaped = _kill_quiet(ctx, a, what, (pid,))
     finally:
-        ctx.seams.kill(pid)
+        if pid not in reaped:
+            ctx.seams.kill(pid)
 
 
 _O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -279,13 +296,17 @@ def _fresh_repo(ctx: H.Ctx, a: R.Alloc, sfd: int) -> None:
     ctx.seams.fsync(sfd)
 
 
-def _kill_quiet(ctx: H.Ctx, a: R.Alloc, what: str) -> None:
-    """:func:`kill_domain` before a cleanup; a failure is noted, never raised over the caller's refusal."""
+def _kill_quiet(ctx: H.Ctx, a: R.Alloc, what: str, children: Sequence[int] = ()) -> frozenset:
+    """:func:`kill_domain` before a cleanup, answering the children it reaped; a failure is noted, never raised over
+    the caller's refusal."""
     try:
-        if not kill_domain(ctx, a):
-            _note(f"{a.session}: {what}: the kill domain was not proven empty within V12")
+        res, reaped = kill_domain(ctx, a, children)
     except Exception as e:   # noqa: BLE001 - the caller's refusal is the answer
         _note(f"{a.session}: {what}: kill domain failed: {type(e).__name__}")
+        return frozenset()
+    if not res.proven:
+        _note(f"{a.session}: {what}: the kill domain was not proven empty: {res.name} {res.detail}".rstrip())
+    return reaped
 
 
 # --- the post-clone check (§5.4 step 3) --------------------------------------------------------------------------------
@@ -580,6 +601,27 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         seams.egress_ready(a.slot, H.slot_ids(ctx, a.slot))
 
     seams.at("repo")
+    try:
+        with H.session_lock(ctx, a.session):
+            pid = _start_fenced(ctx, a)
+    except BaseException:
+        _wake(seams)        # an END that waited on the lock, or refused end-busy, is retried by the reaper
+        raise
+    seams.at("wait")
+    return {"exit": seams.wait(pid)}
+
+
+def _start_fenced(ctx: H.Ctx, a: R.Alloc) -> int:
+    """``start`` from the repo step through the ACTIVE CAS, under the session END lock (``L/alloc/<session>.lock``,
+    the one render takes and END waits on; reaper DESIGN RH1, the spawn fence). Every spawn into the slot (the
+    clone, its check children, the forwarder, the vendor) and every kill this start makes run under it, so an END
+    cannot prove, and SCRUB cannot release the slot, while a launch is in flight or being abandoned; and a start that
+    takes the lock after an END re-reads what END changed and refuses. Released right after the CAS's answer: the
+    vendor wait never holds it. Returns the vendor's pid."""
+    seams = ctx.seams
+    egress = a.slot.slot_class == "egress"
+    if H.read_alloc(ctx, a.session) != a:                  # END or the reaper ran between the unlocked read and here
+        raise Refused("not-rendered", f"{a.session}: the alloc changed")
     rec = read_record(ctx, a.session)
     if E.cloned_path(ctx.store.path, a.session).exists() or (rec is not None and rec.state in (R.ACTIVE, R.BRAKED)):
         # DECISION: a second start never clones twice. "Started" is what root and CONTROL recorded (ACTIVE or
@@ -661,8 +703,10 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         _abandon(ctx, a, pid, "exec-failed")
         raise Refused("exec-failed", f"no exec within {EXEC_MARKER_S:g}s")
     if got != "exec":
-        code = seams.wait(pid)
-        raise Refused("exec-failed", f"exit {code}")
+        # DECISION: under the lock no wait is unbounded (seat ruling r2-2), so a failed marker is abandoned like a
+        # timeout (the domain killed, the pid reaped) rather than waited on for its exit status.
+        _abandon(ctx, a, pid, "exec-failed")
+        raise Refused("exec-failed", "the exec marker failed")
 
     try:
         seams.at("active")
@@ -673,8 +717,14 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         # exec and the CAS) is killed with its whole domain, then its pid reaped.
         _abandon(ctx, a, pid, "active-refused")
         raise
-    seams.at("wait")
-    return {"exit": seams.wait(pid)}
+    return pid
+
+
+def _wake(seams: H.Seams) -> None:
+    if seams.wake_reaper is not None:
+        seams.wake_reaper()
+    else:
+        H.wake_reaper(seams.R)
 
 
 # --- teardown (§7.4 END, §7.3 SCRUBBED) ----------------------------------------------------------------------------
@@ -758,45 +808,145 @@ def _drop_unretained_live(ctx: H.Ctx, session: str) -> None:
         ctx.seams.fsync(live)
 
 
+#: ``slots/<tag>/front.lock`` (root 0600): serialises a front's start and every sweep of the slot's gateway uid
+#: (reaper DESIGN §4.7). No holder of it takes any other lock.
+FRONT_LOCK = "front.lock"
+#: ``slots/<tag>/front-revoked`` (root 0600): the lease (``session``, ``lease_seq``) whose front the revoker ended, for
+#: a front start of that lease to refuse ``front-revoked`` on.
+FRONT_REVOKED = "front-revoked"
+#: DECISION (reaper DESIGN RH6): SCRUB's wait for ``front.lock``, above the revoker's bound, so a SCRUB queued behind
+#: a revoker that ran to its bound does not time out.
+FRONT_LOCK_WAIT_S = 7.0
+#: §4.5: the revoker's bound on ending a front.
+REVOKE_FRONT_S = 5.0
+
+
+@contextmanager
+def front_lock(ctx: H.Ctx, slot, wait_s: Optional[float]) -> Iterator[None]:
+    """The slot's ``front.lock`` (made when absent, root 0600), TRIED (``wait_s`` None: held = ``front-busy``) or
+    waited for up to ``wait_s`` (else ``front-locked``)."""
+    seams = ctx.seams
+    with ctx.store.dir("slots", slot.tag) as sfd:
+        try:
+            fd = os.open(FRONT_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600,
+                         dir_fd=sfd)
+        except OSError as e:
+            if e.errno in (errno.ELOOP, errno.EMLINK, errno.ENXIO):
+                raise Refused("bad-root", f"slots/{slot.tag}/{FRONT_LOCK} is a link or not a file") from None
+            raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or not seams.trusted(st):
+            raise Refused("bad-root", f"slots/{slot.tag}/{FRONT_LOCK}")
+        if wait_s is None:
+            if not H.try_flock(fd):
+                raise Refused("front-busy", slot.tag)
+        else:
+            deadline = seams.monotonic() + wait_s
+            delay = H.LOCK_SLICE_S
+            while not H.try_flock(fd):
+                if seams.monotonic() >= deadline:
+                    raise Refused("front-locked", f"slots/{slot.tag}/{FRONT_LOCK} held past {wait_s:g} s")
+                seams.sleep(delay)
+                delay = min(delay * 2, 0.5)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _slot_state(ctx: H.Ctx, slot) -> Optional[R.SlotState]:
+    raw = ctx.store.read(("slots", slot.tag), "state")
+    return H.parse_slot_state_of(raw, slot) if raw is not None else None
+
+
+def _names_lease(st: Optional[R.SlotState], a: R.Alloc) -> bool:
+    return st is not None and st.state == "leased" and st.session == a.session and st.lease_seq == a.lease_seq
+
+
+def _marker(a: R.Alloc) -> bytes:
+    return canon.canonical_bytes({"lease_seq": a.lease_seq, "session": a.session})
+
+
 def scrub_and_release(ctx: H.Ctx, a: R.Alloc) -> bool:
-    """§7.3 ``slot: LEASED -> SCRUBBED -> REUSABLE``, under the pool lock then the slot lock (§3.5 order): only
-    while root's slot state file shows this slot leased to THIS session at alloc's ``lease_seq``, proc.scrub
-    (every process of the gateway uid SIGKILLed, then none of the slot's uids may own one), then the file back to
-    ``reusable`` with ``rev + 1``, no session. Returns whether it released the slot. DECISION: a slot that has
-    already left this lease (a second teardown, the reaper first) is not touched and not refused. A verifier
-    pair has no gateway uid: its child takes that place (killed, then proven gone with the driver)."""
+    """§7.3 ``slot: LEASED -> SCRUBBED -> REUSABLE``. Under the SLOT lock only, and only while root's slot state file
+    shows this slot leased to THIS session at alloc's ``lease_seq``: proc.scrub (macOS: :func:`proc.end_domain` on
+    every uid of the slot, the gateway's under ``front.lock`` waited for up to :data:`FRONT_LOCK_WAIT_S`; Linux: the
+    gateway uid SIGKILLed, then none of the slot's uids may own a process), then this lease's ``front-revoked``
+    marker removed under ``front.lock``; then a TRY of the pool lock (§3.5: the pool lock is never held across
+    SCRUBBED's kills; held by a ``prepare`` that only TRIES slot locks, so a try is the order's retake path) and,
+    with the state file unchanged since the check, the file back to ``reusable`` with ``rev + 1``, no session.
+
+    Returns whether it released the slot. A pool TRY that fails releases the slot lock and returns ``False``: the
+    slot stays leased to a RETAINED session with no process, which the reaper's pass rule ("leased + RETAINED + alloc
+    -> SCRUB again") owns. DECISION: a slot that has already left this lease (a second teardown, the reaper first) is
+    not touched and not refused. A verifier pair has no gateway uid: its child takes that place, with no
+    ``front.lock`` (it has no front)."""
     seams = ctx.seams
     slot = a.slot
     ids = H.slot_ids(ctx, slot)
     first, second = slot.accounts
-    with ctx.store.dir("slots") as slots_fd:
-        pool = H._open_lock(slots_fd, "pool.lock", "slots/pool.lock")
+    egress = slot.slot_class == "egress"
+    with ctx.store.dir("slots", slot.tag) as sfd:
+        lock = H._open_lock(sfd, "lock", f"slots/{slot.tag}/lock")
+    try:
+        H.wait_flock(lock, seams, "slot-locked")
+        st = _slot_state(ctx, slot)
+        if not _names_lease(st, a):
+            return False
+        seams.at("scrubbed")
+        gw_lock = (lambda: front_lock(ctx, slot, FRONT_LOCK_WAIT_S)) if egress else None
+        PR.scrub(ids[first], ids[second], seams=seams.proc_seams, gw_lock=gw_lock)   # type: ignore[arg-type]
+        if egress:
+            with front_lock(ctx, slot, FRONT_LOCK_WAIT_S):
+                if ctx.store.read(("slots", slot.tag), FRONT_REVOKED) == _marker(a):
+                    with ctx.store.dir("slots", slot.tag) as sfd:
+                        os.unlink(FRONT_REVOKED, dir_fd=sfd)
+                        seams.fsync(sfd)
+        _drop_unretained_live(ctx, a.session)
+        with ctx.store.dir("slots") as slots_fd:
+            pool = H._open_lock(slots_fd, "pool.lock", "slots/pool.lock")
         try:
-            H.wait_flock(pool, seams, "pool-locked")
-            with ctx.store.dir("slots", slot.tag) as sfd:
-                lock = H._open_lock(sfd, "lock", f"slots/{slot.tag}/lock")
-            try:
-                H.wait_flock(lock, seams, "slot-locked")
-                raw = ctx.store.read(("slots", slot.tag), "state")
-                st = H.parse_slot_state_of(raw, slot) if raw is not None else None
-                if st is None or st.state != "leased" or st.session != a.session or st.lease_seq != a.lease_seq:
-                    return False
-                seams.at("scrubbed")
-                PR.scrub(ids[first], ids[second], seams=seams.proc_seams)   # type: ignore[arg-type]
-                _drop_unretained_live(ctx, a.session)
-                new = replace(st, rev=st.rev + 1, state="reusable", session=None,
-                              changed_at=R.timestamp(seams.clock()))
-                seams.at("reusable")
-                ctx.store.replace(("slots", slot.tag), "state", R.slot_state_bytes(new), mode=0o644)
-            finally:
-                os.close(lock)
+            seams.at("pool")
+            if not H.try_flock(pool):
+                _note(f"scrub {a.session}: the pool lock is held; the slot stays leased for the reaper's next pass")
+                return False
+            if _slot_state(ctx, slot) != st:
+                return False
+            assert st is not None
+            new = replace(st, rev=st.rev + 1, state="reusable", session=None, changed_at=R.timestamp(seams.clock()))
+            seams.at("reusable")
+            ctx.store.replace(("slots", slot.tag), "state", R.slot_state_bytes(new), mode=0o644)
         finally:
             os.close(pool)
-    if seams.wake_reaper is not None:          # the Pool sync (§3.5): CONTROL's mirror learns the slot is free
-        seams.wake_reaper()
-    else:
-        H.wake_reaper(seams.R)
+    finally:
+        os.close(lock)
+    _wake(seams)                               # the Pool sync (§3.5): CONTROL's mirror learns the slot is free
     return True
+
+
+def revoke_front(ctx: H.Ctx, a: R.Alloc) -> str:
+    """The revoker's front kill at REVOKED (reaper DESIGN §4.7): every process of the slot's gateway uid, never only
+    ``front.pid`` (a front that forked or setsid'd escapes a pid). Under ``front.lock``, TRIED (held = ``front-busy``:
+    a front start or SCRUB's gateway sweep has it; the revoker tries again on its next wake), the slot state must
+    still name this lease (else ``front-lease-moved``, nothing signalled); then the durable ``front-revoked`` marker
+    naming the lease is written BEFORE the sweep, for a front start of this lease to refuse on (that check, and the
+    front start's own hold of ``front.lock``, are render's, session 3a's); then :func:`proc.end_domain` on the
+    gateway uid within :data:`REVOKE_FRONT_S`.
+    Answers ``"front-ended"``; Unproven = ``front-unproven:<step>`` (the session stays REVOKED and SCRUB ends the uid
+    again). A slot with no front (class ``none``) refuses ``no-front``."""
+    slot = a.slot
+    if slot.slot_class != "egress":
+        raise Refused("no-front", slot.tag)
+    gw = H.slot_ids(ctx, slot)[slot.accounts[1]]
+    with front_lock(ctx, slot, None):
+        if not _names_lease(_slot_state(ctx, slot), a):
+            raise Refused("front-lease-moved", f"{slot.tag} no longer names {a.session} at lease {a.lease_seq}")
+        ctx.seams.at("front-revoked")
+        ctx.store.replace(("slots", slot.tag), FRONT_REVOKED, _marker(a), mode=0o600)
+        res, _ = PR.end_domain(gw, REVOKE_FRONT_S, seams=_proc_seams(ctx))
+    if not res.proven:
+        raise Refused(f"front-unproven:{res.name}", res.detail)
+    return "front-ended"
 
 
 def teardown(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
@@ -826,9 +976,9 @@ def teardown(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     return {"state": R.RETAINED}
 
 
-__all__ = ["CheckFailed", "CheckStats", "EXEC_MARKER_S", "FORWARDER_READY_S", "ID_LINE_BYTES", "IndexEntry",
-           "LS_FILES_BOUND", "READSET_PATHS_MAX", "READSET_PATH_BYTES", "await_exec", "check_attributes",
-           "check_discovery", "check_index", "check_worktree", "clone_check", "discovery_listings", "end_facts",
-           "end_seams", "hash_batches", "kill_domain", "launch", "parse_ls_files", "read_record", "remove_tree_at",
-           "revoke", "scrub_and_release",
+__all__ = ["CheckFailed", "CheckStats", "EXEC_MARKER_S", "FORWARDER_READY_S", "FRONT_LOCK", "FRONT_LOCK_WAIT_S",
+           "FRONT_REVOKED", "ID_LINE_BYTES", "IndexEntry", "LS_FILES_BOUND", "READSET_PATHS_MAX", "READSET_PATH_BYTES",
+           "REVOKE_FRONT_S", "await_exec", "check_attributes", "check_discovery", "check_index", "check_worktree",
+           "clone_check", "discovery_listings", "end_facts", "end_seams", "front_lock", "hash_batches", "kill_domain",
+           "launch", "parse_ls_files", "read_record", "remove_tree_at", "revoke", "revoke_front", "scrub_and_release",
            "secret_env", "start", "teardown", "vendor_argv"]

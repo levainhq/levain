@@ -421,11 +421,14 @@ def test_a_second_end_is_refused_end_busy(tmp_path):
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         rec = Recorder()
         ctl = Control()
+        t = [0.0]                                 # END waits for the lock (bounded, RH1), on a fake clock here
+        waits = dict(clock=lambda: t[0], sleep=lambda s: t.__setitem__(0, t[0] + s))
         for call in (lambda s: end_session(w.facts, s, record_state=REVOKED),
                      lambda s: reconcile_session(w.facts, s)):
+            t[0] = 0.0
             with pytest.raises(Refused) as e:
-                call(w.seams(ctl, **rec.kw()))
-            assert e.value.name == "end-busy"
+                call(w.seams(ctl, **rec.kw(), **waits))
+            assert e.value.name == "end-busy" and t[0] >= end_mod.END_LOCK_WAIT_S
         assert rec.calls == [] and ctl.history == []
     finally:
         os.close(fd)

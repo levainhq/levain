@@ -571,7 +571,7 @@ def test_teardown_retains_then_scrubs_the_slot_reusable(env):
     after = w.slot_state(E0)
     assert (after.state, after.rev, after.session, after.lease_seq) == ("reusable", before.rev + 1, None,
                                                                          before.lease_seq)
-    assert w.steps[-4:] == ["end", "scrub", "scrubbed", "reusable"]
+    assert w.steps[-5:] == ["end", "scrub", "scrubbed", "pool", "reusable"]
     assert w.prepare()["slot"]["index"] == 0                      # the slot is handed out again
 
 

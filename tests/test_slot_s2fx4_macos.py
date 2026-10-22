@@ -219,10 +219,10 @@ def _call(sig, r):
 
 
 def test_fm3_child_stopped_by_its_own_sigstop_counts_as_sent_and_is_killed():
-    """raw/F_M3_exp: the child reads ``T`` after ``kill(-1, SIGSTOP)``. Reap with WUNTRACED, then SIGKILL + reap."""
+    """raw/F_M3_exp: the child reads ``T`` after ``kill(-1, SIGSTOP)``. Polled reap (RV2), SIGKILL, reap."""
     r = Reaper(_stopped(signal.SIGSTOP))
     assert _call(signal.SIGSTOP, r) is True
-    assert r.waits == [(4321, os.WUNTRACED), (4321, 0)]
+    assert r.waits == [(4321, os.WNOHANG | os.WUNTRACED), (4321, os.WNOHANG)]
     assert r.kills == [(4321, signal.SIGKILL)]
 
 
@@ -236,7 +236,7 @@ def test_fm3_every_stop_class_signal_is_handled_the_same(sig):
 def test_fm3_stopped_by_a_different_signal_is_not_sent_but_still_reaped():
     r = Reaper(_stopped(signal.SIGTSTP))
     assert _call(signal.SIGSTOP, r) is False
-    assert r.kills == [(4321, signal.SIGKILL)] and r.waits[-1] == (4321, 0)
+    assert r.kills == [(4321, signal.SIGKILL)] and r.waits[-1] == (4321, os.WNOHANG)
 
 
 def test_fm3_a_stop_while_sending_a_non_stop_signal_is_not_sent():
@@ -253,7 +253,7 @@ def test_fm3_child_already_gone_when_killed_is_still_reaped():
         raise ProcessLookupError(errno.ESRCH, "kill")
     r.kill = gone
     assert _call(signal.SIGSTOP, r) is True
-    assert r.waits[-1] == (4321, 0)
+    assert r.waits[-1] == (4321, os.WNOHANG)
 
 
 @pytest.mark.parametrize("status,sent", [(0, True), (70 << 8, False), (signal.SIGKILL, False)])
@@ -261,7 +261,7 @@ def test_fm3_exits_reap_once_and_kill_nothing(status, sent):
     """The SIGKILL / SIGCONT / clean-exit paths: one reap, no kill, the result as before."""
     r = Reaper(status)
     assert _call(signal.SIGKILL, r) is sent
-    assert r.waits == [(4321, os.WUNTRACED)] and r.kills == []
+    assert r.waits == [(4321, os.WNOHANG | os.WUNTRACED)] and r.kills == []
 
 
 REAL_FORK = """

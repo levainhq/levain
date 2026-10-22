@@ -18,7 +18,7 @@ from levain.slot import proc as P
 from levain.slot import records as R
 from levain.slot import start as ST
 from tests.test_slot_s2a_records import _alloc_obj, _parse_obj
-from tests.test_slot_s2f1_proc import CHILD, GW, SLOT, Table, pids_sent
+from tests.test_slot_s2f1_proc import CHILD, GW, SLOT, Table
 from tests.test_slot_s2f2_runtime_helper import World, _blob, _prepared
 
 
@@ -105,7 +105,7 @@ def _launchd_table():
         calls.append(("bootout", uid, sorted(p for p, q in t.procs.items() if uid in q.uids)))
         for pid in [p for p, q in t.procs.items() if uid in q.uids]:
             del t.procs[pid]
-        return True
+        return 0
     return t, calls, domain_out
 
 
@@ -116,52 +116,60 @@ def test_scrub_without_the_bootout_names_the_launchd_survivor():
     assert e.value.name == f"scrub-processes-remain:{SLOT}"
 
 
-def test_scrub_boots_out_every_uid_after_the_gateway_kill_then_proves():
+def test_scrub_ends_every_uid_through_end_domain_gateway_first():
+    """reaper DESIGN §3.1 (R1a): each uid is frozen, killed and booted out before its proof, the gateway first."""
     t, calls, domain_out = _launchd_table()
+    t.ignore_kill.clear()
     seams = t.seams()
     seams.domain_out = domain_out
     P.scrub(SLOT, GW, CHILD, seams=seams, bound_s=1.0)
-    assert pids_sent(t, 9) == {100}                       # the gateway's kill came first: its process is gone
-    assert [c[:2] for c in calls] == [("bootout", SLOT), ("bootout", GW), ("bootout", CHILD)]
-    assert calls[0][2] == [210, 211, 212, 213] and calls[1][2] == []
+    assert [c[:2] for c in calls] == [("bootout", GW), ("bootout", SLOT), ("bootout", CHILD)]
+    assert all(c[2] == [] for c in calls)                 # every bootout came after its uid's kill (K1 before B)
     assert t.procs == {}
 
 
-def test_a_failed_bootout_leaves_the_proof_to_refuse():
+def test_an_accepted_bootout_is_not_a_proof():
     t, _calls, _ = _launchd_table()
     seams = t.seams()
-    seams.domain_out = lambda uid, timeout: True           # launchctl said done, yet the scan still sees them
+    seams.domain_out = lambda uid, timeout: 0              # launchctl said done, yet the scan still sees them
     with pytest.raises(Refused) as e:
         P.scrub(SLOT, GW, seams=seams, bound_s=1.0)
     assert e.value.name == f"scrub-processes-remain:{SLOT}"
 
 
-def test_a_bootout_launchctl_did_not_report_done_refuses_by_uid():
+def test_a_bootout_launchctl_did_not_accept_refuses_by_uid():
     """L3 r1 (codex HIGH): a failed or timed-out bootout is not left to the scan, which cannot see agents launchd
     would start again."""
     t, _calls, domain_out = _launchd_table()
     seams = t.seams()
-    seams.domain_out = lambda uid, timeout: (domain_out(uid, timeout) and uid != GW)
+    seams.domain_out = lambda uid, timeout: 5 if uid == GW else domain_out(uid, timeout)
     with pytest.raises(Refused) as e:
         P.scrub(SLOT, GW, seams=seams, bound_s=1.0)
     assert e.value.name == f"scrub-domain-remains:{GW}"
+    seams.domain_out = lambda uid, timeout: None           # a launchctl past its timeout
+    with pytest.raises(Refused) as e:
+        P.scrub(SLOT, GW, seams=seams, bound_s=1.0)
+    assert e.value.name == f"scrub-domain-remains:{GW}" and "domain-not-accepted:timeout" in e.value.detail
 
 
-def test_the_bootouts_share_one_deadline():
-    """L3 r1 (codex MED): SCRUB holds the pool lock; the bootouts together get bound_s, never one timeout each."""
+def test_each_uid_gets_its_own_bound_and_a_slow_bootout_is_unproven():
+    """reaper DESIGN §4.6 (r5): SCRUB holds the slot lock, not the pool lock, through up to three ``end_domain``
+    calls, each with its own V12k; a bootout that eats one uid's bound is that uid's refusal."""
     t, _calls, domain_out = _launchd_table()
+    t.ignore_kill.clear()
     seams = t.seams()
     given = []
 
     def slow(uid, timeout):
-        given.append(timeout)
-        t.t += 0.6                                         # each bootout takes 0.6 s of a 1.0 s bound
+        given.append((uid, timeout))
+        if uid == CHILD:
+            t.t += 1.5                                     # past its own 1.0 s bound
         return domain_out(uid, timeout)
     seams.domain_out = slow
     with pytest.raises(Refused) as e:
         P.scrub(SLOT, GW, CHILD, seams=seams, bound_s=1.0)
-    assert e.value.name == f"scrub-domain-remains:{CHILD}"      # 0.6 + 0.6 passes the 1.0 s deadline before the third
-    assert given[0] <= 1.0 and all(b < a for a, b in zip(given, given[1:]))
+    assert e.value.name == f"scrub-processes-remain:{CHILD}" and "past-bound" in e.value.detail
+    assert [u for u, _ in given] == [GW, SLOT, CHILD] and all(0.9 < x <= 1.0 for _, x in given)
 
 
 def test_darwin_seams_carry_the_bootout_and_linux_none():
@@ -177,19 +185,19 @@ def test_darwin_seams_carry_the_bootout_and_linux_none():
 
 # --- undo: the same bootout, then a proof that refuses by name -------------------------------------------------------
 
-def test_undo_boots_out_before_the_kill_and_refuses_a_survivor_by_name():
+def test_undo_ends_the_uid_through_end_domain_and_refuses_a_survivor_by_name():
     order = []
-    ok = IH._end_processes("darwin", 3999, "_levain_s0", bootout=lambda u: order.append(("bootout", u)) or True,
-                           kill_all=lambda u: (order.append(("kill", u)), (True, ""))[1],
-                           none_left=lambda u: (order.append(("proof", u)), True)[1])
-    assert ok == (True, "") and order == [("bootout", 3999), ("kill", 3999), ("proof", 3999)]
-    got = IH._end_processes("darwin", 3999, "_levain_s0", bootout=lambda u: True, kill_all=lambda u: (True, ""),
-                            none_left=lambda u: False)
+    no_kill = dict(kill_all=lambda u: pytest.fail("macOS kills only through end_domain"),
+                   none_left=lambda u: pytest.fail("end_domain is the proof"))
+    ok = IH._end_processes("darwin", 3999, "_levain_s0", end=lambda u: order.append(("end", u)) or P.PROVEN, **no_kill)
+    assert ok == (True, "") and order == [("end", 3999)]
+    got = IH._end_processes("darwin", 3999, "_levain_s0", end=lambda u: P.Domain(False, "respawn-after-bootout"),
+                            **no_kill)
     assert got[0] is False and got[1].startswith("processes-remain:_levain_s0")
-    got = IH._end_processes("darwin", 3999, "_levain_s0", bootout=lambda u: False, kill_all=lambda u: (True, ""),
-                            none_left=lambda u: True)
+    got = IH._end_processes("darwin", 3999, "_levain_s0", end=lambda u: P.Domain(False, "domain-not-accepted:5"),
+                            **no_kill)
     assert got[0] is False and got[1].startswith("domain-remains:_levain_s0")
     order.clear()
-    IH._end_processes("linux", 3999, "_levain_s0", bootout=lambda u: order.append("bootout"),
+    IH._end_processes("linux", 3999, "_levain_s0", end=lambda u: order.append("end"),
                       kill_all=lambda u: (True, ""), none_left=lambda u: True)
     assert order == []

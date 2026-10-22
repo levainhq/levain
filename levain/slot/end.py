@@ -92,6 +92,9 @@ CAS_BACKOFF_MAX = 1.0
 SLOT_LOCK_WAIT_S = 10.0
 SLOT_LOCK_FIRST_S = 0.02
 SLOT_LOCK_MAX_S = 0.5
+# DECISION: END's wait for the session END lock (a ``start`` holds it from before its clone through its ACTIVE
+# CAS), on the same order and backoff; past it, ``end-busy``.
+END_LOCK_WAIT_S = SLOT_LOCK_WAIT_S
 
 #: The slot-lock and END-lock descriptors this process holds (comp r2 L4). Every forked child (the session-uid
 #: reader, macOS's signalling child) closes them before it runs anything, so a child that outlives END can never
@@ -1834,8 +1837,12 @@ def retained_whole(facts: EndFacts, seams: EndSeams) -> bool:
 
 @contextmanager
 def end_lock(facts: EndFacts, seams: EndSeams) -> Iterator[None]:
-    """Root's per-session try-lock (L2 M7): one END or reconciliation per session at a time; held =
-    ``end-busy`` (the reaper or helper retries). Under it, a dead writer's temp files of what END writes
+    """Root's per-session lock (L2 M7): one END or reconciliation per session at a time. Waited for up to
+    :data:`END_LOCK_WAIT_S`, else ``end-busy`` with the record UNCHANGED, never HELD (the reaper's next pass or the
+    helper retries): ``start`` holds this lock across every spawn and every kill it makes, so an END that waits here
+    cannot prove while a ``start`` is still launching or abandoning in the slot (reaper DESIGN RH1, Q-F1). Its
+    holder may also be a second END of the session, which a timed-out END must not write over. The open is
+    ``O_CLOEXEC``, so no exec'd child keeps a copy of it. Under it, a dead writer's temp files of what END writes
     (the journal's ``L/alloc/.<s>.intent.json.*.tmp``, ``L/retained/<s>/.*.tmp``) are swept: no live writer
     can own one. ``start``'s clone-marker temp is not END's to sweep."""
     path = facts.lock
@@ -1848,10 +1855,19 @@ def end_lock(facts: EndFacts, seams: EndSeams) -> Iterator[None]:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or not seams.owner_ok(st):
             raise Refused("bad-root", f"{path} is not a regular file with the expected owner")
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise Refused("end-busy", facts.session) from None
+        deadline = None
+        delay = SLOT_LOCK_FIRST_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                now = seams.clock()
+                deadline = now + END_LOCK_WAIT_S if deadline is None else deadline
+                if now >= deadline:
+                    raise Refused("end-busy", f"{facts.session} held past {END_LOCK_WAIT_S:g} s") from None
+                seams.sleep(delay)
+                delay = min(delay * 2, SLOT_LOCK_MAX_S)
         sweep_temps(facts.alloc_dir, facts.intent.name, owner_ok=seams.owner_ok)
         if os.path.isdir(facts.retained) and not os.path.islink(facts.retained):
             sweep_temps(facts.retained, "", owner_ok=seams.owner_ok)

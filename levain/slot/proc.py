@@ -16,6 +16,12 @@ Two kill domains:
 - :class:`CgroupProcs` (Linux) drives the session cgroup (§7.3): ``cgroup.freeze`` + ``frozen 1``,
   ``cgroup.kill`` + ``populated 0``; its proof is ``populated 0`` AND the uid sweep's.
 
+macOS ends a slot uid only through :func:`end_domain` (reaper DESIGN §3.1): freeze, kill, ``launchctl bootout
+user/<uid>``, kill again, a quiet window, then the proof, under one deadline. A uid sweep alone proves nothing there
+while the uid's launchd user domain holds a KeepAlive agent: launchd starts it again ``max(0, 10 s - age)`` after the
+kill [measured: levain-memory 1021-19/reaper/R0, d1b], so a proof taken before the bootout can pass with a respawn
+pending. :meth:`UidProcs.kill` therefore refuses on a host whose seams carry the bootout.
+
 Linux: every signal goes through :func:`signal_checked`: pin the pid (a pidfd, so a pid that dies and
 is reused after the check cannot receive it), re-read it, and send only if it is still the same
 process (start time) of the target uid (§7.1's "live check (uid + start time) of any process before
@@ -34,6 +40,7 @@ parse would be a second, looser definition of "a process of the uid".
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import errno
 import os
@@ -42,8 +49,8 @@ import struct
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
-from typing import Callable, Iterable
+from dataclasses import dataclass
+from typing import Callable, ContextManager, Iterable
 
 from levain.firing.hands import HostOS
 from levain.launch import child_env
@@ -56,6 +63,20 @@ V12_SECONDS = 10.0
 #: DECISION: the sweep's poll backoff (the contract fixes only the V12 bound).
 POLL_FIRST_S = 0.005
 POLL_MAX_S = 0.1
+
+#: V12k (reaper DESIGN §8 Q1, ruled): the bound of one :func:`end_domain`, every step under one deadline.
+V12K_SECONDS = 10.0
+#: Q: the quiet window after an accepted bootout: 3 x the longest observed teardown (42.1 ms, R0 d3b), floor 250 ms.
+QUIET_S = 0.25
+#: The scan period of the settle and the proof.
+SETTLE_POLL_S = 0.025
+#: A bootout answered 124 is issued again after this, doubling (R0 d3: the window it answers is tens of ms).
+BOOTOUT_RETRY_FIRST_S = 0.025
+#: ``launchctl``'s "Domain is tearing down": an earlier bootout left the domain re-instantiated and empty. Not yet,
+#: never done.
+EDOMAIN_TEARDOWN = 124
+#: A signalling child SIGKILLed at its deadline gets this long, from the SIGKILL, to be reaped (polled).
+REAP_GRACE_S = 1.0
 
 RUN, STOP, ZOMBIE, UNKNOWN = "run", "stop", "zombie", "unknown"
 
@@ -106,29 +127,41 @@ def _self_uids() -> tuple[int, ...]:
     return (os.getuid(), os.geteuid())
 
 
+def _reap_nohang(pid: int) -> bool:
+    """Whether ``pid`` is gone from the caller's children: reaped now, or not (or no longer) a child of the caller at
+    all. Either way the caller holds no pid it may still signal."""
+    try:
+        got, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return True
+    return got == pid
+
+
 @dataclass
 class ProcSeams:
     """The OS acts. ``listing()`` = every process on the host; ``probe(pid)`` = one pid now (``None`` =
     gone); ``pin(pid)`` -> a handle the signal goes to (raises ``ProcessLookupError`` when gone);
     ``send(handle, sig)`` (raises ``ProcessLookupError`` when gone); ``unpin(handle)``; ``read(path)`` /
-    ``write(path, text)`` for cgroup files (``FileNotFoundError`` when absent). ``signal_uid(uid, sig)``:
+    ``write(path, text)`` for cgroup files (``FileNotFoundError`` when absent). ``signal_uid(uid, sig, timeout)``:
     when set (macOS), a sweep signals every process of the uid at once AS the uid, never a pid, and
-    returns whether the signal was sent; ``pin`` / ``send`` are then never used."""
+    returns whether the signal was sent within ``timeout`` seconds; ``pin`` / ``send`` are then never used.
+    ``reap(pid)``: a non-blocking reap of the caller's own child (:func:`_reap_nohang`)."""
     listing: Callable[[], Iterable[Proc]]
     probe: Callable[[int], Proc | None]
     pin: Callable[[int], object]
     send: Callable[[object, int], None]
     unpin: Callable[[object], None] = _unpinned
-    signal_uid: Callable[[int, int], bool] | None = None
+    signal_uid: Callable[[int, int, float], bool] | None = None
     read: Callable[[str], str] = _read_text
     write: Callable[[str, str], None] = _write_text
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
     self_uids: Callable[[], tuple[int, ...]] = _self_uids
     self_pid: Callable[[], int] = os.getpid
-    #: macOS: end the uid's per-user launchd domain within a timeout, answering whether launchctl said it did
-    #: (:func:`darwin_bootout`); ``None`` elsewhere.
-    domain_out: Callable[[int, float], bool] | None = None
+    #: macOS: ``launchctl bootout user/<uid>`` within a timeout, answering launchctl's exit status, ``None`` on a
+    #: timeout or a spawn error (:func:`darwin_bootout`); ``None`` elsewhere.
+    domain_out: Callable[[int, float], int | None] | None = None
+    reap: Callable[[int], bool] = _reap_nohang
 
 
 def check_target(uid: object, seams: ProcSeams) -> int:
@@ -205,7 +238,7 @@ def _sweep(uid: int, sig: int, done: Callable[[list[Proc]], bool], target: Calla
             return False
         targets = [p for p in procs if target(p)]
         if targets and seams.signal_uid is not None:
-            if seams.signal_uid(uid, sig):
+            if seams.signal_uid(uid, sig, max(deadline - seams.clock(), 0.0)):
                 confirm = None
         else:
             for p in targets:
@@ -214,6 +247,14 @@ def _sweep(uid: int, sig: int, done: Callable[[list[Proc]], bool], target: Calla
         if confirm is None:
             seams.sleep(delay)
             delay = min(delay * 2, POLL_MAX_S)
+
+
+def _freeze_sweep(uid: int, bound_s: float, seams: ProcSeams) -> bool:
+    return _sweep(uid, signal.SIGSTOP, _frozen, lambda p: p.state == RUN, bound_s, seams)
+
+
+def _kill_sweep(uid: int, bound_s: float, seams: ProcSeams) -> bool:
+    return _sweep(uid, signal.SIGKILL, _gone, lambda p: p.state in (RUN, STOP), bound_s, seams)
 
 
 class UidProcs:
@@ -226,13 +267,17 @@ class UidProcs:
         """``SIGSTOP`` every running process of ``uid`` until two scans find all of them stopped (or
         zombies) within ``bound_s``."""
         uid = check_target(uid, self.seams)
-        return _sweep(uid, signal.SIGSTOP, _frozen, lambda p: p.state == RUN, bound_s, self.seams)
+        return _freeze_sweep(uid, bound_s, self.seams)
 
     def kill(self, uid: int, bound_s: float) -> bool:
         """``SIGKILL`` every process of ``uid`` until two scans find none (zombies aside) within
-        ``bound_s``. A stopped process dies of ``SIGKILL`` without being continued."""
+        ``bound_s``. A stopped process dies of ``SIGKILL`` without being continued. Refused on a host whose
+        seams carry the launchd bootout (macOS): there a slot uid ends only through :func:`end_domain`, which
+        freezes first and boots the domain out before its proof."""
         uid = check_target(uid, self.seams)
-        return _sweep(uid, signal.SIGKILL, _gone, lambda p: p.state in (RUN, STOP), bound_s, self.seams)
+        if self.seams.domain_out is not None:
+            raise Refused("unfrozen-kill", "macOS ends a uid only through end_domain")
+        return _kill_sweep(uid, bound_s, self.seams)
 
     def no_process(self, uid: int) -> bool:
         """The proof: two scans in a row find no process of ``uid`` and no unreadable pid."""
@@ -326,31 +371,169 @@ def end_seams(host: HostOS, cgroup: str | None = None, seams: ProcSeams | None =
     if cgroup is not None:
         raise Refused("bad-value", "macOS has no cgroup")
     u = UidProcs(seams or default_seams(host))
-    return u.freeze, u.kill, u.no_process
+
+    def kill(uid: int, bound_s: float) -> bool:
+        res, _ = end_domain(uid, bound_s, seams=u.seams)
+        if not res.proven:
+            raise Refused("kill-unproven", f"uid {uid}: {res.name}" + (f" ({res.detail})" if res.detail else ""))
+        return True
+    return u.freeze, kill, u.no_process
+
+
+# --- end_domain: the one way a macOS slot uid is ended (reaper DESIGN §3.1) --------------------------------------------
+
+@dataclass(frozen=True)
+class Domain:
+    """:func:`end_domain`'s answer: ``proven``, or ``name`` = the step that was not (``freeze-unproven``,
+    ``kill-unproven``, ``domain-not-accepted:<rc|timeout>``, ``respawn-after-bootout``, ``processes-remain``,
+    ``past-bound``, ``signal-child-hung``, ``raised:<type>``) with a ``detail`` for the log."""
+    proven: bool
+    name: str = ""
+    detail: str = ""
+
+
+PROVEN = Domain(True)
+
+
+def end_domain(uid: int, bound_s: float = V12K_SECONDS, children: Iterable[int] = (), *,
+               seams: ProcSeams | None = None) -> tuple[Domain, frozenset[int]]:
+    """End every process of ``uid`` and prove it, all within ``bound_s``; returns ``(Domain, reaped)``.
+
+    In order: F freeze sweep (two identical scans, every process stopped or a zombie) -> K1 kill sweep -> B
+    ``launchctl bootout user/<uid>`` (where the seams carry it: macOS), rc 0 = ACCEPTED, a trigger and never a proof,
+    never issued twice; rc 124 = an earlier bootout's empty domain still tearing down, issued again after 25 ms
+    doubling; anything else = ``domain-not-accepted`` (K2 still runs) -> K2 kill sweep again (``asuser``'s processes
+    are not launchd jobs and outlive B) -> S settle: a scan every :data:`SETTLE_POLL_S` until :data:`QUIET_S` has
+    passed since B's acceptance with every scan empty; a process seen inside the window is killed and the window
+    restarts, ONCE (a second sighting = ``respawn-after-bootout``) -> P proof: first a non-blocking reap of every pid
+    in ``children`` (the caller's own children, never ``waitpid(-1)``: a zombie child of the caller is a process of
+    the uid until reaped), polled to the deadline; then two identical scans with no process (zombies aside). Past
+    the deadline at any step = Unproven (``past-bound``). Without a bootout seam (Linux; the revoker's front sweep
+    there) the steps are F, K1 and P.
+
+    ``reaped``: every pid of ``children`` this call reaped, whatever the answer, an exception's included (the call
+    catches ``Exception`` and answers ``raised:<type>``): a reaped pid may already be reused, so the caller signals
+    none of them. The freeze is the call's own, so no caller can kill a slot uid unfrozen."""
+    seams = seams or default_seams()
+    uid = check_target(uid, seams)
+    reaped: set[int] = set()
+    try:
+        res = _end_domain(uid, seams.clock() + bound_s, tuple(children), seams, reaped)
+    except Refused as e:
+        named = e.name if e.name == "signal-child-hung" else f"raised:Refused:{e.name}"
+        res = Domain(False, named, e.detail or "")
+    except Exception as e:   # noqa: BLE001 - `reaped` is the caller's on every exit
+        res = Domain(False, f"raised:{type(e).__name__}", str(e)[:256])
+    return res, frozenset(reaped)
+
+
+def _end_domain(uid: int, deadline: float, children: tuple[int, ...], seams: ProcSeams, reaped: set[int]) -> Domain:
+    def left() -> float:
+        return deadline - seams.clock()
+
+    reap_leftovers()
+    if not _freeze_sweep(uid, left(), seams):
+        return Domain(False, "freeze-unproven")
+    if not _kill_sweep(uid, left(), seams):
+        return Domain(False, "kill-unproven")
+    if seams.domain_out is not None:
+        accepted = _bootout(uid, deadline, seams)
+        if isinstance(accepted, Domain):
+            _kill_sweep(uid, left(), seams)           # what B did not end still dies; the answer stays B's
+            return accepted
+        if left() <= 0:
+            return Domain(False, "past-bound", "at the bootout's acceptance")
+        if not _kill_sweep(uid, left(), seams):
+            return Domain(False, "kill-unproven", "after the bootout")
+        settled = _settle(uid, accepted, deadline, seams)
+        if settled is not None:
+            return settled
+    for pid in children:
+        while not seams.reap(pid):
+            if seams.clock() >= deadline:
+                return Domain(False, "past-bound", f"child {pid} not reaped")
+            seams.sleep(SETTLE_POLL_S)
+        reaped.add(pid)
+    while True:
+        if seams.clock() >= deadline:
+            return Domain(False, "past-bound", "proof")
+        a, b = _scan(uid, seams), _scan(uid, seams)
+        if not (_gone(a) and _gone(b)):
+            return Domain(False, "processes-remain", ",".join(str(p.pid) for p in a + b if p.state != ZOMBIE)[:256])
+        if _key(a) == _key(b):
+            break
+        seams.sleep(SETTLE_POLL_S)
+    if seams.clock() > deadline:
+        return Domain(False, "past-bound", "after the proof")
+    return PROVEN
+
+
+def _bootout(uid: int, deadline: float, seams: ProcSeams) -> float | Domain:
+    """B: the time launchd ACCEPTED the bootout (rc 0), or the Unproven answer."""
+    assert seams.domain_out is not None
+    delay = BOOTOUT_RETRY_FIRST_S
+    while True:
+        left = deadline - seams.clock()
+        if left <= 0:
+            return Domain(False, "domain-not-accepted:timeout")
+        rc = seams.domain_out(uid, left)
+        if rc == 0:
+            return seams.clock()
+        if rc != EDOMAIN_TEARDOWN:
+            return Domain(False, f"domain-not-accepted:{'timeout' if rc is None else rc}")
+        seams.sleep(min(delay, max(deadline - seams.clock(), 0.0)))
+        delay *= 2
+
+
+def _settle(uid: int, accepted: float, deadline: float, seams: ProcSeams) -> Domain | None:
+    """S: ``None`` once :data:`QUIET_S` passed since ``accepted`` with every scan empty (zombies aside)."""
+    quiet_from = accepted
+    sighted = False
+    while True:
+        now = seams.clock()
+        if now >= deadline:
+            return Domain(False, "past-bound", "settle")
+        live = [p for p in _scan(uid, seams) if p.state != ZOMBIE]
+        if any(p.state != UNKNOWN for p in live):
+            if sighted:
+                return Domain(False, "respawn-after-bootout", ",".join(str(p.pid) for p in live)[:256])
+            sighted = True
+            if not _kill_sweep(uid, deadline - seams.clock(), seams):
+                return Domain(False, "kill-unproven", "in the settle")
+            quiet_from = seams.clock()
+        elif not live and now - quiet_from >= QUIET_S:
+            return None
+        seams.sleep(SETTLE_POLL_S)
 
 
 def scrub(slot_uid: int, gw_uid: int, child_uid: int | None = None, *, seams: ProcSeams | None = None,
-          bound_s: float = V12_SECONDS) -> None:
-    """§7.3 SCRUBBED: ``SIGKILL`` every process of ``gw_uid`` (one front per slot, so the uid alone names
-    it), then (macOS) end each uid's launchd domain, then require that none of ``slot_uid``, ``gw_uid`` and
-    ``child_uid`` owns a process; else ``Refused("scrub-processes-remain:<uid>")`` naming the first that does,
-    and the slot stays leased. A bootout launchctl did not report done (an error or past the shared deadline) is
-    ``Refused("scrub-domain-remains:<uid>")``: the process scan cannot see agents launchd would start again. The
-    bootouts share one deadline, ``bound_s``, since the caller holds the pool lock. The domain goes after END's
-    kill, so it also takes the per-user agents launchd started for the uid while END ran: on a long END they
-    appeared after END's own proof had passed and only SCRUB refused (levain-memory runs/s2-macos/RESULT_D1D2.md X1, X6), which is why the bootout is here and not in END."""
+          bound_s: float = V12K_SECONDS, gw_lock: Callable[[], ContextManager[object]] | None = None) -> None:
+    """§7.3 SCRUBBED: no process of ``gw_uid`` (one front per slot, so the uid alone names it), ``slot_uid`` or
+    ``child_uid`` may remain; else ``Refused("scrub-processes-remain:<uid>")`` naming the first that does (or
+    ``scrub-domain-remains:<uid>``: launchctl did not accept the uid's bootout), and the slot stays leased.
+    ``gw_lock()``: entered around the gateway uid's sweep only (the slot's ``front.lock``, which a front start and the
+    revoker's sweep also take).
+
+    macOS: :func:`end_domain` per uid, gateway first, each with its own ``bound_s``. It boots out each uid's launchd
+    domain before its proof, which also ends the per-user agents launchd started for the uid while END ran (levain-
+    memory runs/s2-macos/RESULT_D1D2.md X1, X6). Linux: ``SIGKILL`` every process of ``gw_uid``, then the two-scan
+    proof for every uid (the session cgroup is END's)."""
     u = UidProcs(seams)
-    uids = [check_target(x, u.seams) for x in (slot_uid, gw_uid) + ((child_uid,) if child_uid is not None else ())]
-    u.kill(gw_uid, bound_s)        # its answer is the proof below, not this sweep's bool
-    if u.seams.domain_out is not None:
-        deadline = u.seams.clock() + bound_s
-        for x in uids:
-            left = deadline - u.seams.clock()
-            if left <= 0 or not u.seams.domain_out(x, left):
-                raise Refused(f"scrub-domain-remains:{x}", "launchctl did not report the uid's domain booted out")
+    uids = [check_target(x, u.seams) for x in (gw_uid, slot_uid) + ((child_uid,) if child_uid is not None else ())]
     for x in uids:
-        if not u.no_process(x):
-            raise Refused(f"scrub-processes-remain:{x}", "a process of the uid survived")
+        with (gw_lock() if gw_lock is not None and x == gw_uid else contextlib.nullcontext()):
+            if u.seams.domain_out is None:
+                if x == gw_uid:
+                    _kill_sweep(x, bound_s, u.seams)        # its answer is the proof below, not this sweep's bool
+                continue
+            res, _ = end_domain(x, bound_s, seams=u.seams)
+        if not res.proven:
+            what = "scrub-domain-remains" if res.name.startswith("domain-not-accepted") else "scrub-processes-remain"
+            raise Refused(f"{what}:{x}", f"{res.name} {res.detail}".strip())
+    if u.seams.domain_out is None:
+        for x in (slot_uid, gw_uid) + ((child_uid,) if child_uid is not None else ()):
+            if not u.no_process(x):
+                raise Refused(f"scrub-processes-remain:{x}", "a process of the uid survived")
 
 
 # --- real seams --------------------------------------------------------------------------------------
@@ -470,14 +653,24 @@ class _LibProc:
 SIGNAL_SENT = 0
 
 
+def _close_inherited() -> None:
+    os.closerange(3, min(os.sysconf("SC_OPEN_MAX"), 65536))
+
+
 def signal_child(uid: int, sig: int, *, drop: Callable[[int], None] | None = None,
-                 kill: Callable[[int, int], None] = os.kill) -> None:
-    """The signalling child's whole job, in this order (plan §2e 4): DROP to ``uid`` with the one drop
-    (:func:`levain.slot.wall.drop_and_assert`: groups exactly ``{uid}``, gid ``uid`` (§1.1: gid == uid), real
-    and effective ids, saved where the host reads them, all ``uid`` != 0, ``seteuid(0)`` proven to fail),
-    THEN ``kill(-1, sig)``. A drop that is not proven raises before the kill, so nothing is signalled as root.
-    ``kill(-1)`` from a process that is not root reaches only processes of its own uid; on macOS that includes
-    the caller (:func:`signal_as_uid` reaps a child its own stop-class signal stopped)."""
+                 kill: Callable[[int, int], None] = os.kill, close: Callable[[], None] = _close_inherited) -> None:
+    """The signalling child's whole job, in this order (plan §2e 4): CLOSE every inherited fd >= 3, then DROP to
+    ``uid`` with the one drop (:func:`levain.slot.wall.drop_and_assert`: groups exactly ``{uid}``, gid ``uid``
+    (§1.1: gid == uid), real and effective ids, saved where the host reads them, all ``uid`` != 0, ``seteuid(0)``
+    proven to fail), THEN ``kill(-1, sig)``. A drop that is not proven raises before the kill, so nothing is
+    signalled as root. ``kill(-1)`` from a process that is not root reaches only processes of its own uid; on macOS
+    that includes the caller (:func:`signal_as_uid` reaps a child its own stop-class signal stopped).
+
+    The close comes first because the child shares its parent's open-file descriptions, the flocks included (the
+    slot lock, the session END lock, ``front.lock``): a child stopped by its own stop-class signal whose parent is
+    then SIGKILLed would hold those locks for as long as it lives, and the sweep that would end it needs one of
+    them (reaper DESIGN RV1). The child needs no fd >= 3."""
+    close()
     (drop or _drop_to)(uid)
     kill(-1, sig)
 
@@ -491,22 +684,75 @@ def _drop_to(uid: int) -> None:
 _STOP_SIGNALS = frozenset({signal.SIGSTOP, signal.SIGTSTP, signal.SIGTTIN, signal.SIGTTOU})
 
 
-def signal_as_uid(uid: int, sig: int, *, fork: Callable[[], int] = os.fork,
+#: Signalling children SIGKILLed at a deadline and still unreaped after :data:`REAP_GRACE_S` (a child stuck in an
+#: uninterruptible kernel state): :func:`reap_leftovers` reaps them once they die.
+_LEFTOVER: list[int] = []
+
+
+def reap_leftovers(*, waitpid: Callable[[int, int], tuple[int, int]] = os.waitpid) -> None:
+    """A non-blocking reap of every pid in the leftover list; a reaped (or no longer ours) pid leaves it. For the
+    reaper's worker to call at the top of each pass and the revoker at each wake (reaper DESIGN §4.1);
+    :func:`end_domain` calls it at its start."""
+    for pid in tuple(_LEFTOVER):
+        try:
+            got, _ = waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            got = pid
+        if got == pid:
+            _LEFTOVER.remove(pid)
+
+
+def _poll_wait(pid: int, flags: int, deadline: float, waitpid: Callable[[int, int], tuple[int, int]],
+               clock: Callable[[], float], sleep: Callable[[float], None]) -> int | None:
+    """``waitpid(pid, flags | WNOHANG)`` until it reports ``pid``, or ``None`` once ``deadline`` passed."""
+    delay = POLL_FIRST_S
+    while True:
+        got, status = waitpid(pid, flags | os.WNOHANG)
+        if got == pid:
+            return status
+        now = clock()
+        if now >= deadline:
+            return None
+        sleep(min(delay, deadline - now))
+        delay = min(delay * 2, POLL_MAX_S)
+
+
+def _kill_and_reap(pid: int, kill: Callable[[int, int], None], waitpid: Callable[[int, int], tuple[int, int]],
+                   clock: Callable[[], float], sleep: Callable[[float], None]) -> None:
+    try:
+        kill(pid, signal.SIGKILL)
+    except ProcessLookupError:   # already dead: still ours to reap
+        pass
+    try:
+        if _poll_wait(pid, 0, clock() + REAP_GRACE_S, waitpid, clock, sleep) is None:
+            _LEFTOVER.append(pid)
+    except ChildProcessError:
+        pass
+
+
+def signal_as_uid(uid: int, sig: int, timeout: float = V12_SECONDS, *, fork: Callable[[], int] = os.fork,
                   waitpid: Callable[[int, int], tuple[int, int]] = os.waitpid,
                   child: Callable[[int, int], None] = signal_child,
                   exit: Callable[[int], None] = os._exit,
-                  kill: Callable[[int, int], None] = os.kill) -> bool:
+                  kill: Callable[[int, int], None] = os.kill,
+                  clock: Callable[[], float] = time.monotonic,
+                  sleep: Callable[[float], None] = time.sleep) -> bool:
     """macOS's signal (codex r1 3): fork; the child runs :func:`signal_child` and ``_exit``s
     :data:`SIGNAL_SENT`, or 70 if the drop or the kill raised (ESRCH included: nothing of the uid to signal);
     the parent reaps it. Returns whether the child signalled. Only root can run it (the drop; a target of 0
     is refused by the drop itself, ``drop-to-root``, and the sweeps that call this ran :func:`check_target`).
 
     A stop-class ``sig`` stops the child too (its ``kill(-1)`` reaches its own uid, itself included), so the
-    reap waits with ``WUNTRACED``: a child seen STOPPED by ``sig`` counts as sent (``kill(-1)`` delivers to
-    every target in one call); a child stopped by any other signal does not. Either way the stopped child is
-    then SIGKILLed and reaped, so the call never blocks on it. The pid is this call's own unreaped child, so
-    the root kill cannot reach a reused pid. DECISION: a slot process stopping the child with ``sig`` before
-    its kill also reads as sent; the sweeps decide on their scans, the return only paces them."""
+    reap polls with ``WNOHANG | WUNTRACED``: a child seen STOPPED by ``sig`` counts as sent (``kill(-1)`` delivers
+    to every target in one call); a child stopped by any other signal does not. Either way the stopped child is
+    then SIGKILLed and reaped. The pid is this call's own unreaped child, so the root kill cannot reach a reused
+    pid. DECISION: a slot process stopping the child with ``sig`` before its kill also reads as sent; the sweeps
+    decide on their scans, the return only paces them.
+
+    The wait is bounded by ``timeout`` (the caller's deadline; reaper DESIGN RH2): a child neither exited nor stopped
+    by then (a fork that inherited a libc lock another thread held, say) is SIGKILLed, its reap polled for
+    :data:`REAP_GRACE_S` (else it joins the leftover list, :func:`reap_leftovers`), and the call raises
+    ``Refused("signal-child-hung")``: never a hang."""
     pid = fork()
     if pid == 0:   # the child: never returns into the parent's stack
         code = SIGNAL_SENT
@@ -516,14 +762,13 @@ def signal_as_uid(uid: int, sig: int, *, fork: Callable[[], int] = os.fork,
             code = 70
         finally:
             exit(code)
-    _, status = waitpid(pid, os.WUNTRACED)
+    status = _poll_wait(pid, os.WUNTRACED, clock() + timeout, waitpid, clock, sleep)
+    if status is None:
+        _kill_and_reap(pid, kill, waitpid, clock, sleep)
+        raise Refused("signal-child-hung", f"uid {uid}: no exit or stop within {timeout:g} s")
     if os.WIFSTOPPED(status):
         sent = sig in _STOP_SIGNALS and os.WSTOPSIG(status) == sig
-        try:
-            kill(pid, signal.SIGKILL)
-        except ProcessLookupError:   # already dead: still ours to reap
-            pass
-        waitpid(pid, 0)
+        _kill_and_reap(pid, kill, waitpid, clock, sleep)
         return sent
     return os.WIFEXITED(status) and os.WEXITSTATUS(status) == SIGNAL_SENT
 
@@ -545,21 +790,21 @@ def darwin_seams() -> ProcSeams:
                      signal_uid=signal_as_uid, domain_out=darwin_bootout)
 
 
-def darwin_bootout(uid: int, timeout: float = V12_SECONDS) -> bool:
+def darwin_bootout(uid: int, timeout: float = V12_SECONDS) -> int | None:
     """``launchctl bootout user/<uid>``, as root: ends the uid's per-user launchd domain and every agent in it
     (lsd, trustd, distnoted, secd), which launchd otherwise keeps for the uid after END's kill
-    [measured: levain-memory runs/s2-macos/RESULT_D1D2.md X2 + X6, 2026-10-20]. ``True`` only on exit 0, which it
-    gives on an already-empty domain too (same file, X3); an error or ``timeout`` is ``False``. The process scan
-    after it is still the proof of no process. Never use ``launchctl print user/<uid>`` as a check: it re-creates
-    an empty domain (X3)."""
+    [measured: levain-memory runs/s2-macos/RESULT_D1D2.md X2 + X6, 2026-10-20]. Answers launchctl's exit status
+    (0 on an already-empty domain too, same file X3; 124 while an earlier bootout's empty domain tears down, R0 d3),
+    ``None`` on a ``timeout`` or a spawn error. Its stderr is never read. Never use ``launchctl print user/<uid>`` as
+    a check: it re-creates an empty domain (X3)."""
     if type(uid) is not int or uid <= 0:
         raise Refused("bad-target-uid", repr(uid))
     try:
         r = subprocess.run(["/bin/launchctl", "bootout", f"user/{uid}"], capture_output=True, cwd="/",
                            env=child_env(), timeout=timeout)
     except (OSError, subprocess.SubprocessError):
-        return False
-    return r.returncode == 0
+        return None
+    return r.returncode
 
 
 def default_seams(host: HostOS | None = None) -> ProcSeams:
@@ -567,7 +812,9 @@ def default_seams(host: HostOS | None = None) -> ProcSeams:
     return darwin_seams() if host == "darwin" else linux_seams()
 
 
-__all__ = ["CgroupProcs", "POLL_FIRST_S", "POLL_MAX_S", "Proc", "ProcSeams", "RUN", "SIGNAL_SENT", "STOP", "UNKNOWN",
-           "UidProcs", "V12_SECONDS", "ZOMBIE", "check_target", "darwin_seams", "default_seams", "end_seams",
-           "linux_listing", "linux_probe", "linux_seams", "parse_bsdinfo", "parse_linux_proc", "scrub",
-           "signal_as_uid", "signal_checked", "signal_child", "darwin_bootout"]
+__all__ = ["BOOTOUT_RETRY_FIRST_S", "CgroupProcs", "Domain", "EDOMAIN_TEARDOWN", "POLL_FIRST_S", "POLL_MAX_S", "PROVEN",
+           "Proc", "ProcSeams", "QUIET_S", "REAP_GRACE_S", "RUN", "SETTLE_POLL_S", "SIGNAL_SENT", "STOP", "UNKNOWN",
+           "UidProcs", "V12K_SECONDS", "V12_SECONDS", "ZOMBIE", "check_target", "darwin_seams", "default_seams",
+           "end_domain", "end_seams", "linux_listing", "linux_probe", "linux_seams", "parse_bsdinfo",
+           "parse_linux_proc", "reap_leftovers", "scrub", "signal_as_uid", "signal_checked", "signal_child",
+           "darwin_bootout"]
