@@ -433,55 +433,6 @@ def test_connection_keep_alive_is_dropped_not_refused():
     assert "refused" not in rec and "connection" not in rec["dropped"], rec
 
 
-def test_slot_reset_mid_body_ends_the_exchange_and_tells_keys():
-    """Reproduced (3b-1a-fix2, complement r2 MED): the slot RESETS mid-upload while keys holds the request open
-    without answering. The slot's read error was taken for a keys write error and the front waited on keys with no
-    bound. Now it is the slot gone: keys gets `X` and the exchange ends `slot-gone`."""
-    import struct
-
-    from levain.broker.front import BrokeredExchange, parse_head_conn
-
-    async def go() -> tuple[dict, list]:
-        got: list = []
-
-        async def serve(r, w):   # keys that never answers: reads frames until `X` / `E` / EOF
-            while True:
-                try:
-                    hdr = await r.readexactly(5)
-                    await r.readexactly(int.from_bytes(hdr[1:], "big"))
-                except (asyncio.IncompleteReadError, ConnectionError):
-                    break
-                got.append(hdr[:1])
-                if hdr[:1] in (b"E", b"X"):
-                    break
-            w.close()
-
-        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
-            path = os.path.join(tmp, "k.sock")
-            keys = await asyncio.start_unix_server(serve, path)
-            front = Front(load_policy(json.dumps(_EX_POLICY).encode()), log_path=os.path.join(tmp, "f.log"),
-                          keys_path=path)
-            fr, fw, sr, sw = await _tcp_slot_pair()
-            sw.write(b"POST /r/vendor/v1/messages HTTP/1.1\r\nHost: gw\r\nAuthorization: Bearer %s\r\n"
-                     b"Content-Length: %d\r\n\r\n" % (_TOKEN.encode(), 5 * 1024 * 1024) + b"x" * 65536)
-            await sw.drain()
-            conn, req = parse_head_conn(await fr.readuntil(b"\r\n\r\n"))
-            ex = BrokeredExchange(front, front.policy.brokered["vendor"], conn, req, req.target[9:], None, fr, fw)
-            run = asyncio.ensure_future(ex.run())
-            await asyncio.sleep(0.3)
-            sw.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-            sw.transport.abort()   # an RST, not a FIN
-            await asyncio.wait_for(run, 10)
-            fw.close()
-            await asyncio.sleep(0.1)
-            keys.close()
-        return ex.rec, got
-
-    rec, got = asyncio.run(go())
-    assert rec["end"] == "slot-gone" and rec.get("slot_error"), rec
-    assert got and got[-1] == b"X", got
-
-
 _WS_POLICY = {"format": "levain-front-session/1", "kind": "interactive", "session": "s-ws", "routes": [
     {"route": "ws", "type": "brokered", "upstream": {"scheme": "https", "host": "ws.vendor.example", "base_path": ""},
      "requests": {"templates": [{"method": "GET", "path": "/v1/live", "upgrade": "websocket"}],
@@ -490,23 +441,57 @@ _WS_POLICY = {"format": "levain-front-session/1", "kind": "interactive", "sessio
      "max_call_microdollars": 1}]}
 
 
-@pytest.mark.parametrize("close", ["rst", "fin"])
-def test_websocket_slot_close_ends_the_exchange_and_tells_keys(close):
-    """Reproduced (3b-1a-fix3, complement r3): on an established websocket the slot RESETS while keys stays silent.
-    The pump died on the slot's read error, keys never heard, and the relay waited on keys with no bound. Now keys
-    gets `E` and the exchange ends `slot-gone`. Reproduced (3b-1a-fix4, codex r4): the same wait on a CLEAN slot
-    close (a FIN): keys got `E` but the relay never ended. Now it ends `slot-eof`, with no `slot_error`."""
+#: every slot-side task the exchange starts (the body writer, the websocket pump) x every way it can end while keys is
+#: silent: the slot resets, the slot closes cleanly, the task raises after it wrote to keys (injected), and the pump's
+#: drain of its `E` to keys raising after a clean close (injected).
+_SLOT_EXITS = [("body", "rst"), ("body", "fin"), ("body", "raise"),
+               ("ws", "rst"), ("ws", "fin"), ("ws", "raise"), ("ws", "fin-drain-raises")]
+
+
+@pytest.mark.parametrize("site,fault", _SLOT_EXITS, ids=[f"{s}-{f}" for s, f in _SLOT_EXITS])
+def test_slot_task_exit_ends_the_exchange_and_tells_keys(site, fault, monkeypatch):
+    """A slot-side task that ends, by any path, ends the exchange within the bound while keys stays silent, and keys
+    hears the slot's end (`X` mid-body, `E` on a websocket). Reproduced, one site per round: the body writer on a slot
+    reset (3b-1a-fix2), the pump on a reset (fix3) and on a clean close (fix4); each waited on keys with no bound.
+    Reproduced (3b-1a-class, complement r5, injected): the pump's drain after its `E` raised and it posted nothing;
+    a body writer or pump raising anything else after writing to keys hung the same way."""
     import base64
     import struct
 
+    from levain.broker import front as front_mod
     from levain.broker import gwwire
     from levain.broker.front import BrokeredExchange, parse_head_conn
+
+    if fault == "fin-drain-raises":
+        real_open = front_mod.open_keys
+
+        async def open_keys(path):   # keys' writer whose drain raises once an `E` was written to it
+            kr, kw = await real_open(path)
+            write, drain, last = kw.write, kw.drain, [b""]
+
+            def w(data):
+                last[0] = bytes(data[:1])
+                write(data)
+
+            async def d():
+                if last[0] == b"E":
+                    raise BrokenPipeError("injected")
+                await drain()
+
+            kw.write, kw.drain = w, d
+            return kr, kw
+
+        monkeypatch.setattr(front_mod, "open_keys", open_keys)
+
+    async def raising(*a, **k):
+        raise RuntimeError("injected")
 
     async def go() -> tuple[dict, list]:
         got: list = []
 
-        async def serve(r, w):   # keys: `A`, `U`, then silent; records every frame type until EOF
-            w.write(gwwire.encode(b"A", {}) + gwwire.encode(b"U", {"v": 1, "headers": []}))
+        async def serve(r, w):   # keys: (for a websocket `A`, `U`), then silent; records every frame type until EOF
+            if site == "ws":
+                w.write(gwwire.encode(b"A", {}) + gwwire.encode(b"U", {"v": 1, "headers": []}))
             while True:
                 try:
                     hdr = await r.readexactly(5)
@@ -519,26 +504,39 @@ def test_websocket_slot_close_ends_the_exchange_and_tells_keys(close):
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
             path = os.path.join(tmp, "k.sock")
             keys = await asyncio.start_unix_server(serve, path)
-            front = Front(load_policy(json.dumps(_WS_POLICY).encode()), log_path=os.path.join(tmp, "f.log"),
-                          keys_path=path)
+            pol = _WS_POLICY if site == "ws" else _EX_POLICY
+            front = Front(load_policy(json.dumps(pol).encode()), log_path=os.path.join(tmp, "f.log"), keys_path=path)
             fr, fw, sr, sw = await _tcp_slot_pair()
-            sw.write(b"GET /r/ws/v1/live HTTP/1.1\r\nHost: gw\r\nAuthorization: Bearer %s\r\nConnection: Upgrade\r\n"
-                     b"Upgrade: websocket\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
-                     % (_TOKEN.encode(), base64.b64encode(b"k" * 16)))
+            if site == "ws":
+                sw.write(b"GET /r/ws/v1/live HTTP/1.1\r\nHost: gw\r\nAuthorization: Bearer %s\r\nConnection: Upgrade"
+                         b"\r\nUpgrade: websocket\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                         % (_TOKEN.encode(), base64.b64encode(b"k" * 16)))
+            else:
+                sw.write(b"POST /r/vendor/v1/messages HTTP/1.1\r\nHost: gw\r\nAuthorization: Bearer %s\r\n"
+                         b"Content-Length: %d\r\n\r\n" % (_TOKEN.encode(), 5 * 1024 * 1024) + b"x" * 65536)
             await sw.drain()
             conn, req = parse_head_conn(await fr.readuntil(b"\r\n\r\n"))
-            ex = BrokeredExchange(front, front.policy.brokered["ws"], conn, req, b"/v1/live", None, fr, fw)
+            route, upath = ("ws", b"/v1/live") if site == "ws" else ("vendor", b"/v1/messages")
+            ex = BrokeredExchange(front, front.policy.brokered[route], conn, req, upath, None, fr, fw)
             run = asyncio.ensure_future(ex.run())
-            assert (await asyncio.wait_for(sr.readuntil(b"\r\n\r\n"), 10)).startswith(b"HTTP/1.1 101 ")
-            sw.write(b"\x81\x05hello")
-            await sw.drain()
-            await asyncio.sleep(0.3)
-            if close == "rst":
+            if site == "ws":
+                assert (await asyncio.wait_for(sr.readuntil(b"\r\n\r\n"), 10)).startswith(b"HTTP/1.1 101 ")
+                sw.write(b"\x81\x05hello")
+                await sw.drain()
+            await asyncio.sleep(0.3)   # the task has written to keys and is parked in its next read of the slot
+            if fault == "raise":   # the task's NEXT read of the slot raises; the parked read returns the bytes below
+                if site == "ws":
+                    fr.read = raising
+                else:
+                    ex.body.next = raising
+                sw.write(b"\x81\x05again" if site == "ws" else b"y" * 65536)
+                await sw.drain()
+            elif fault == "rst":
                 sw.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
                 sw.transport.abort()   # an RST, not a FIN
             else:
                 sw.write_eof()         # a FIN
-            await asyncio.wait_for(run, 10)
+            await asyncio.wait_for(run, 5)
             fw.close()
             sw.close()
             await asyncio.sleep(0.1)
@@ -546,11 +544,16 @@ def test_websocket_slot_close_ends_the_exchange_and_tells_keys(close):
         return ex.rec, got
 
     rec, got = asyncio.run(go())
-    if close == "rst":
-        assert rec["end"] == "slot-gone" and rec.get("slot_error"), rec
-    else:
+    if fault in ("fin", "fin-drain-raises"):
         assert rec["end"] == "slot-eof" and "slot_error" not in rec, rec
-    assert b"D" in got and got[got.index(b"D") + 1:][:1] == [b"E"], got
+    else:
+        assert rec["end"] == "slot-gone" and rec.get("slot_error"), rec
+        if fault == "raise":
+            assert rec["slot_error"] == "RuntimeError", rec
+    if site == "ws":
+        assert b"D" in got and got[-1] == b"E", got
+    else:
+        assert b"B" in got and got[-1] == b"X", got
 
 
 def test_websocket_handshake_over_http_1_0_is_malformed():

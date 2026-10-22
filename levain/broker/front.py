@@ -48,7 +48,7 @@ import time
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
-from typing import Awaitable, Callable, Mapping, Optional, Sequence
+from typing import Awaitable, Callable, Coroutine, Mapping, Optional, Sequence
 
 try:
     import h11
@@ -471,8 +471,8 @@ _FWD_VALUE = re.compile(r"[\t\x20-\x7e]*\Z")
 #: the events queue between keys' reader and the relay: a full queue makes the reader wait, so a slot that reads
 #: slowly slows keys down instead of the front buffering the upstream's response.
 _EVENTS_MAX = 8
-#: body-writer events that never end an exchange: the writer finished ("end"), or its write to keys failed
-#: ("write-error"), and keys' reader decides the outcome. On a websocket they come from the GET's writer and can queue behind `U`.
+#: slot-task outcomes that never end an exchange: the writer finished ("end"), or a write to keys failed
+#: ("write-error"), and keys' reader decides the outcome. On a websocket the GET's writer may report one after `U`.
 _BODY_SKIP = frozenset({"end", "write-error"})
 
 
@@ -592,6 +592,10 @@ class BrokeredExchange:
         self.ws_key: Optional[str] = None
         #: True once a final answer (a refusal, keys' `R`, a 101) started on the slot; a `100 Continue` is not one.
         self.answered = False
+        #: the slot-side tasks started through `_slot_task` whose exit `_next` has not yet seen, and those it has seen
+        #: but not yet reported, each with how many of keys' frames were queued ahead of it when it was seen.
+        self._slot: set = set()
+        self._ended: list = []
 
     # -- the head ------------------------------------------------------------------------------------------------
 
@@ -698,7 +702,7 @@ class BrokeredExchange:
         writer: Optional[asyncio.Future] = None
         try:
             kw.write(qframe)
-            writer = asyncio.ensure_future(self._write_body(kw, events))
+            writer = self._slot_task(kw, self._write_body(kw), b"X")
             await self._relay(kw, events, expect, writer)
         finally:
             for t in (reader, writer):
@@ -730,26 +734,64 @@ class BrokeredExchange:
         except Exception as e:   # noqa: BLE001 - a reader that dies always tells the relay
             await events.put(("error", type(e).__name__))
 
+    def _slot_task(self, kw: asyncio.StreamWriter, work: Coroutine, end_frame: bytes) -> asyncio.Future:
+        """Start a slot-side task (the body writer, the websocket pump): the ONE way the exchange starts a task that
+        reads the slot. The task's exit, by any path, IS its terminal slot event: `_next` races the task itself, so no
+        exit can go unreported and none waits on a full events queue. Its result is the outcome `work` returned,
+        "write-error" for an OSError (the slot reads map their own errors, so one that escapes came from a write to
+        keys), or ("slot-gone", the error's type) for anything else raised. For an outcome that ends the slot's side
+        (any not in `_BODY_SKIP`) keys hears `end_frame` first, unflushed: closing the keys connection flushes it, and
+        a drain here could wait on a keys that has stopped reading."""
+        async def run() -> object:
+            try:
+                end = await work
+            except OSError as e:
+                self.rec["write_error"] = type(e).__name__
+                return "write-error"
+            except Exception as e:   # noqa: BLE001 - any other exit is the slot's side gone
+                end = ("slot-gone", type(e).__name__)
+            if end not in _BODY_SKIP:
+                try:
+                    kw.write(gwwire.encode(end_frame))
+                except Exception:   # noqa: BLE001 - keys' side is gone too; the slot's outcome still stands
+                    pass
+            return end
+
+        task = asyncio.ensure_future(run())
+        task.add_done_callback(lambda _: work.close())   # a task cancelled before it started never awaited `work`
+        self._slot.add(task)
+        return task
+
     async def _next(self, events: asyncio.Queue) -> tuple:
-        """The next event, or ("error", "reader-gone") once keys' reader has ended with none left: the relay never
-        waits on a reader that is gone."""
-        reader = self._reader_task
-        if not events.empty():
-            return events.get_nowait()
-        if reader.done():
-            return ("error", "reader-gone")
-        get = asyncio.ensure_future(events.get())
-        try:
-            await asyncio.wait({get, reader}, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            if not get.done():
-                get.cancel()
-        if get.done() and not get.cancelled():
-            return get.result()
-        await asyncio.gather(get, return_exceptions=True)
-        if not events.empty():   # put just before the reader ended; a cancelled get leaves it queued
-            return events.get_nowait()
-        return ("error", "reader-gone")
+        """The next event, in arrival order: keys' frames, and each slot-side task's exit as ("body", its outcome),
+        reported once, after the keys frames already queued when the exit was seen (at most the queue's bound, so a
+        keys that keeps sending cannot hold it back); else ("error", "reader-gone") once keys' reader has ended with
+        none left. The wait races the queue, keys' reader and every live slot-side task: the relay never waits on a
+        reader or a slot task that is gone."""
+        while True:
+            for t in list(self._slot):
+                if t.done():
+                    self._slot.discard(t)
+                    if not t.cancelled():
+                        self._ended.append([t, events.qsize()])
+            if self._ended and self._ended[0][1] <= 0:
+                return ("body", self._ended.pop(0)[0].result())
+            reader = self._reader_task
+            if not events.empty():
+                for e in self._ended:
+                    e[1] -= 1
+                return events.get_nowait()
+            if reader.done():   # anything it put before it ended was taken above
+                return ("error", "reader-gone")
+            get = asyncio.ensure_future(events.get())
+            try:
+                await asyncio.wait({get, reader, *self._slot}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                if not get.done():
+                    get.cancel()
+            if get.done() and not get.cancelled():
+                return get.result()
+            await asyncio.gather(get, return_exceptions=True)
 
     async def _stop(self, task: Optional[asyncio.Future]) -> None:
         """Cancel the body writer and wait until it has stopped: it may be parked in a read of the slot, which a
@@ -758,49 +800,37 @@ class BrokeredExchange:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-    async def _write_body(self, kw: asyncio.StreamWriter, events: asyncio.Queue) -> None:
-        """Forward the slot's body as `B` frames, then `E`. Posts how it ended: "end", "write-error" (a write to
-        keys failed), "slot-eof" (the slot closed mid-body; an `X` was sent), ("slot-gone", the error's type) (a read
-        on the slot failed; `X` sent), "body-cap" (chunked past the cap; `X` sent), or "malformed". It never writes
-        the record: the relay does, from the event, only if the exchange ends that way."""
+    async def _write_body(self, kw: asyncio.StreamWriter) -> object:
+        """Forward the slot's body as `B` frames, then `E`. Returns how it ended: "end", "slot-eof" (the slot closed
+        mid-body), ("slot-gone", the error's type) (a read on the slot failed), "body-cap" (chunked past the cap), or
+        "malformed"; a write to keys that fails raises. Run only through `_slot_task`, which maps a raise, sends keys
+        the `X`, and is what the relay reads the outcome from. It never writes the record: the relay does, from the
+        outcome, only if the exchange ends that way."""
         cap, sent = self.route.body_cap, 0
         await self.parked.wait()
         self.parked_before_first_write = self.parked.is_set()
-        try:
-            await kw.drain()   # the `Q`
-            while True:
-                try:
-                    chunk = await self.body.next()
-                except _SlotGone:
-                    kw.write(gwwire.encode(b"X"))
-                    await events.put(("body", "slot-eof"))
-                    return
-                except OSError as e:   # a read error on the SLOT (a reset mid-upload): the slot is gone, keys hears X
-                    kw.write(gwwire.encode(b"X"))
-                    await events.put(("body", ("slot-gone", type(e).__name__)))
-                    return
-                except Refused:
-                    kw.write(gwwire.encode(b"X"))
-                    await events.put(("body", "malformed"))
-                    return
-                if chunk is None:
-                    kw.write(gwwire.encode(b"E"))
-                    await kw.drain()
-                    await events.put(("body", "end"))
-                    return
-                sent += len(chunk)
-                if sent > cap:
-                    kw.write(gwwire.encode(b"X"))
-                    await events.put(("body", "body-cap"))
-                    return
-                for i in range(0, len(chunk), gwwire.CHUNK):
-                    if self.before_body_write is not None:
-                        await self.before_body_write.wait()
-                    kw.write(gwwire.encode(b"B", chunk[i:i + gwwire.CHUNK]))
-                    await kw.drain()
-        except OSError as e:
-            self.rec["write_error"] = type(e).__name__
-            await events.put(("body", "write-error"))
+        await kw.drain()   # the `Q`
+        while True:
+            try:
+                chunk = await self.body.next()
+            except _SlotGone:
+                return "slot-eof"
+            except OSError as e:   # a read error on the SLOT (a reset mid-upload): the slot is gone
+                return ("slot-gone", type(e).__name__)
+            except Refused:
+                return "malformed"
+            if chunk is None:
+                kw.write(gwwire.encode(b"E"))
+                await kw.drain()
+                return "end"
+            sent += len(chunk)
+            if sent > cap:
+                return "body-cap"
+            for i in range(0, len(chunk), gwwire.CHUNK):
+                if self.before_body_write is not None:
+                    await self.before_body_write.wait()
+                kw.write(gwwire.encode(b"B", chunk[i:i + gwwire.CHUNK]))
+                await kw.drain()
 
     async def _relay(self, kw: asyncio.StreamWriter, events: asyncio.Queue, expect: bool,
                      writer: asyncio.Future) -> None:
@@ -915,25 +945,22 @@ class BrokeredExchange:
         self.rec["status"] = 101
         early = self.body.conn.trailing_data[0]
 
-        async def up() -> None:
+        async def up() -> object:
+            """The slot's bytes -> keys as `D` frames. Returns how the slot's side ended; `_slot_task` sends keys
+            the `E` and the relay below ends on it."""
             if early:
                 kw.write(gwwire.encode(b"D", early))
             while True:
                 try:
                     data = await self.sreader.read(gwwire.CHUNK)
-                except OSError as e:   # a read error on the SLOT (a reset): keys hears `E`, the relay below ends
-                    kw.write(gwwire.encode(b"E"))
-                    await events.put(("body", ("slot-gone", type(e).__name__)))
-                    return
-                if not data:   # the slot closed cleanly: keys hears `E`, the relay below ends (not an error)
-                    kw.write(gwwire.encode(b"E"))
-                    await kw.drain()
-                    await events.put(("body", "slot-eof"))
-                    return
+                except OSError as e:   # a read error on the SLOT (a reset)
+                    return ("slot-gone", type(e).__name__)
+                if not data:   # the slot closed cleanly (not an error)
+                    return "slot-eof"
                 kw.write(gwwire.encode(b"D", data))
                 await kw.drain()
 
-        pump = asyncio.ensure_future(up())
+        pump = self._slot_task(kw, up(), b"E")
         try:
             while True:
                 kind, payload = await self._next(events)
@@ -943,7 +970,7 @@ class BrokeredExchange:
                 if kind == "body" and payload == "slot-eof":   # the pump: the slot closed cleanly
                     self.rec["end"] = "slot-eof"
                     return
-                if kind == "body" and payload in _BODY_SKIP:   # the GET's finished body writer, queued behind `U`
+                if kind == "body" and payload in _BODY_SKIP:   # the GET's finished body writer, reported after `U`
                     continue
                 if kind != b"D":
                     self.rec["end"] = "ws-" + (kind.decode("ascii") if isinstance(kind, bytes) else kind)
@@ -1302,8 +1329,10 @@ async def run_front(front: Front, *, unix: Optional[str] = None, port: Optional[
                 await frames.read(frozenset({b"K"}))   # K, EOF, or anything else: keys is gone for this front
             except (OSError, asyncio.IncompleteReadError, WireError):
                 pass
-            front._log({"event": "status-end"})
-            stop.set()
+            finally:   # every exit ends the front, an unforeseen raise included; shutdown's own cancel finds it set
+                if not stop.is_set():
+                    front._log({"event": "status-end"})
+                    stop.set()
 
         watch = asyncio.ensure_future(status_watch())
     server = await (front.serve_unix(unix) if unix is not None else front.serve_tcp(port))  # type: ignore[arg-type]
