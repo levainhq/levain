@@ -21,7 +21,7 @@ def _page(tmp_path: Path, steps: list[dict]) -> list:
 @needs_browser
 def test_hovering_a_row_never_changes_its_height(tmp_path: Path) -> None:
     vals = _page(tmp_path, [
-        {"eval": f"(() => {{ const r = {ROW}; const v = r.querySelector('.verb-actions'); return [r.getBoundingClientRect().height, getComputedStyle(v).opacity, matchMedia('(hover: none)').matches]; }})()"},
+        {"eval": f"(() => {{ const r = {ROW}; const v = r.querySelector('.verb-actions'); return [r.getBoundingClientRect().height, getComputedStyle(v).opacity]; }})()"},
         {"eval": f"(async () => {{ const r = {ROW}; r.focus(); await new Promise(x => setTimeout(x, 400)); const v = r.querySelector('.verb-actions'); return [r.getBoundingClientRect().height, getComputedStyle(v).opacity]; }})()"},
     ])
     before, after = vals[1], vals[2]

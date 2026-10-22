@@ -307,7 +307,7 @@ _H = "document.querySelector('#h6 %s')"
 # a host the test owns: the real topology module and transport, with a `resume` the test steers (applied / false / reject / hang / superseded)
 HOST = ("""(async () => { const V = window.LevainTopologyView; const host = document.createElement('div'); host.id = 'h6'; document.body.appendChild(host);
   window.__mode = 'applied'; window.__resumes = 0; window.__sup = 0;
-  const opts = {replay: {readJson: window.LevainCockpitTransport.readJson, resume: () => { window.__resumes++; const m = window.__mode;
+  const opts = {__h6: true, replay: {readJson: window.LevainCockpitTransport.readJson, resume: () => { window.__resumes++; const m = window.__mode;
     if (m === 'reject') return Promise.reject(new Error('boom')); if (m === 'false') return Promise.resolve(false);
     if (m === 'hang') return new Promise(() => {}); if (m === 'sup') return Promise.resolve('superseded');
     if (m === 'sup-once') return Promise.resolve(window.__sup++ === 0 ? 'superseded' : 'applied'); return Promise.resolve('applied'); }},
@@ -318,7 +318,10 @@ H_INFO = ("JSON.stringify({badge: (%s || {}).textContent || null, err: (%s || {}
           "urls: (window.__urls || []).filter(u => u.includes('at=')).length})") % (
     _H % ".tv-rbadge", _H % ".tv-rerr", _H % ".tv", _H % ".tv-rtrack")
 H_SCRUB = _scrub(0.4).replace("#ck-hlens .tv-rtrack", "#h6 .tv-rtrack")
-H_LIVE = "document.querySelector('#h6 .tv-live').click(); 1"
+# the host paints first, so the module's one `opts` slot is the host's when the click calls returnToLive: every repaint after that is production's own
+H_LIVE = "window.__opts.repaint(); document.querySelector('#h6 .tv-live').click(); 1"
+# the page's own card also owns that slot whenever it repaints; for a wait of seconds it is kept out of the way (it draws an empty card) so the slot stays the host's
+ISOLATE = {"eval": "(() => { const V = window.LevainTopologyView, o = V.render; V.render = function (v, op) { return op && op.__h6 ? o.apply(this, arguments) : document.createElement('div'); }; return 1; })()"}
 H_PAUSED = {"until": "((document.querySelector('#h6 .tv-rbadge') || {textContent: ''}).textContent).includes('live paused')", "ms": 8000}
 
 
@@ -388,7 +391,7 @@ def test_switching_lens_while_replaying_leaves_replay_and_the_strip_is_live_in_t
 @needs_browser
 def test_the_live_retry_after_a_failure_issues_a_new_read_and_never_shows_the_unlabelled_stale_value(tmp_path, monkeypatch):
     out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'false'; 1"}, {"eval": H_LIVE},
-                                            {"until": "(window.__opts.repaint(), !!document.querySelector('#h6 .tv-rerr'))", "ms": 15000}, {"eval": H_INFO},   # (15 s as the hung-resume test waits: a loaded host) the host shares the module state with the page's own card: repaint it by hand
+                                            {"until": "!!document.querySelector('#h6 .tv-rerr')", "ms": 15000}, {"eval": H_INFO},   # only production's own repaint can put the failed label on the host card
                                             {"eval": "window.__mode = 'hang'; 1"}, {"eval": H_LIVE}, SLEEP(200), {"eval": H_INFO}])
     failed, retry = json.loads(out[-5]), json.loads(out[-1])
     assert failed["resumes"] == 1 and "could not return to live" in failed["badge"] and "Live tries again" in failed["badge"], failed
@@ -399,11 +402,10 @@ def test_the_live_retry_after_a_failure_issues_a_new_read_and_never_shows_the_un
 @needs_browser
 def test_a_lens_switch_keeps_the_labelled_frame_until_the_live_read_applies(tmp_path, monkeypatch):
     out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'hang'; 1"},
-                                            {"eval": "document.querySelector('#h6 [data-tv=work]').click(); 1"}, SLEEP(300), {"eval": H_INFO},
+                                            {"eval": "document.querySelector('#h6 [data-tv=work]').click(); 1"}, SLEEP(300), {"eval": H_INFO},   # the precondition: the host card is in replay, badged
                                             {"eval": "window.__mode = 'applied'; 1"}, {"eval": H_LIVE},
-                                            # the wait and the final read are on the PAGE's own card (#ck-hlens), which production repaints itself when the live read
-                                            # applies: the test never calls the host's repaint, so a card production fails to repaint fails this
-                                            {"until": "!window.LevainTopologyView.replaying() && !document.querySelector('#ck-hlens .tv-rbadge')", "ms": 8000}, {"eval": INFO}])
+                                            # nothing here repaints the card: the badge leaves only if production's own repaint (when the live read applies) redraws it
+                                            {"until": "!document.querySelector('#h6 .tv-rbadge')", "ms": 8000}, {"eval": H_INFO}])
     mid, done = json.loads(out[-5]), json.loads(out[-1])
     assert mid["replaying"] is True and mid["badge"] == "returning to live…" and mid["rshown"] not in (None, "live") and mid["resumes"] == 1, mid
     assert done["replaying"] is False and done["badge"] is None, done
@@ -411,13 +413,13 @@ def test_a_lens_switch_keeps_the_labelled_frame_until_the_live_read_applies(tmp_
 
 @needs_browser
 def test_a_hung_resume_times_out_to_the_failed_label_and_live_tries_again(tmp_path, monkeypatch):
-    out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'hang'; 1"}, {"eval": H_LIVE},
-                                            {"until": "(window.__opts.repaint(), !!document.querySelector('#h6 .tv-rerr'))", "ms": 15000}, {"eval": H_INFO},   # the page's own card shares the module state: repaint the host by hand
-                                            {"eval": "window.__mode = 'applied'; 1"}, {"eval": H_LIVE}, {"until": "!window.LevainTopologyView.replaying()", "ms": 8000}, {"eval": H_INFO}])
+    out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, ISOLATE, {"eval": "window.__mode = 'hang'; 1"}, {"eval": H_LIVE},
+                                            {"until": "!!document.querySelector('#h6 .tv-rerr')", "ms": 15000}, {"eval": H_INFO},   # only production's own timeout repaint can draw the failed label
+                                            {"eval": "window.__mode = 'applied'; 1"}, {"eval": H_LIVE}, {"until": "!document.querySelector('#h6 .tv-rbadge') && !window.LevainTopologyView.replaying()", "ms": 8000}, {"eval": H_INFO}])
     failed, done = json.loads(out[-5]), json.loads(out[-1])
     assert "timed out" in failed["err"] and failed["replaying"] is True and failed["rshown"] not in (None, "live"), failed
     assert "Live tries again" in failed["badge"], failed
-    assert done["replaying"] is False and done["resumes"] == 2, done
+    assert done["replaying"] is False and done["resumes"] == 2 and done["badge"] is None, done
 
 
 @needs_browser
