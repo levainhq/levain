@@ -235,11 +235,20 @@ def test_f6_a_cleanup_that_leaves_a_name_behind_is_a_publish_refusal(tmp_path):
 # --- F7: the gate takes its role ------------------------------------------------------------------------------------
 
 def test_f7_the_gate_answers_with_the_role_it_is_given(tmp_path):
+    # 5c-ii-b L3 r1 B-5: a verifier SUCCESS no longer reaches the importer-shaped transaction (verifier-unbuilt);
+    # the role's names are proven on the transaction itself and on the denial.
     def fault(p):
         if p == "copy:bundle":
             raise OSError(errno.ENOSPC, "seam")
-    with pytest.raises(Refused) as ei:
-        _publish(tmp_path, seams=X.PublishSeams(fault=fault), role=X.VERIFIER)
+    w, c = _setup(tmp_path, older=False)
+    wd, cd = _dfd(w), _dfd(c)
+    fds = X.check_outputs(wd, ("bundle",), (), owner_uid=os.getuid(), caps=CAPS)
+    try:
+        with pytest.raises(Refused) as ei:
+            X.transact(cd, S, [("bundle", fds["bundle"])], X.VERIFIER, X.PublishSeams(fault=fault))
+    finally:
+        for fd in (wd, cd, *fds.values()):
+            os.close(fd)
     assert ei.value.name == "preview-space-exhausted"
     denied = X.Outcome(False, None, "", None)
     with pytest.raises(Refused) as ei2:

@@ -375,9 +375,11 @@ def clear_staging(class_dfd: int, staged: str, role: Role, seams: PublishSeams) 
 
 
 def probe_exchange(class_dfd: int, role: Role, seams: PublishSeams) -> None:
-    """DESIGN §1 step 6, the early exchange probe (r13 S16-3): run by the caller only when an older tree exists. Two
-    scratch dirs whose names no session id can be, a crash's pair deleted first, the SAME exchange, both removed
-    whatever the result. A refusal = ``<role>-failed:publish`` / ``exchange-unsupported`` before the import."""
+    """DESIGN §1 step 6, the early probe (r13 S16-3; HEAD_r16 Q-r13-2): run on EVERY seal-in, a first publish
+    included. Two scratch dirs whose names no session id can be, a crash's pair deleted first, the SAME exchange,
+    then the SAME no-replace rename of one onto the other, which must refuse EEXIST; both removed whatever the result.
+    Either call refused, or a no-replace rename that does not refuse the existing name = ``<role>-failed:publish`` /
+    ``exchange-unsupported`` before the import, not at the commit."""
     a, b = PROBE_NAMES
     for n in PROBE_NAMES:
         try:
@@ -392,6 +394,14 @@ def probe_exchange(class_dfd: int, role: Role, seams: PublishSeams) -> None:
         os.mkdir(b, 0o700, dir_fd=class_dfd)
         seams.rename2(class_dfd, a, class_dfd, b, EXCHANGE)
         seams.log("probe exchange ok")
+        try:
+            seams.rename2(class_dfd, a, class_dfd, b, NOREPLACE)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
+            seams.log("probe noreplace ok")
+        else:   # the flag was dropped: the commit's existence check would not be one call
+            raise ExchangeUnsupported("the no-replace rename did not refuse an existing name")
     except ExchangeUnsupported as e:
         raise _publish_refusal(role, "exchange-unsupported") from Refused(
             "exchange-unsupported", f"the export volume does not support atomic exchange ({e})")
@@ -526,7 +536,8 @@ def transact(class_dfd: int, session: str, sources: Sequence[Tuple[str, int]], r
     ``noreplace``, ``fsync class``, ``delete older``. ``before_commit`` runs between ``fsync staged`` and the commit
     (5c-ii-b's detach); the caller makes it never raise. After the commit call returns, the run is COMMITTED: a
     failed class-dir fsync or older-tree delete is logged and does not withhold the answer (an older tree left at
-    ``<s>.new`` is the next seal-in's stale delete); the failed fsync also puts a warning in ``warnings`` (A2)."""
+    ``<s>.new`` is the next seal-in's stale delete); the failed fsync also puts a warning in ``warnings`` (A2) and
+    skips the older-tree delete, so a crash that reverts the exchange still finds the older tree whole (B-7)."""
     staged = session + STAGING_SUFFIX
     stage = "staging"
     made = False
@@ -613,17 +624,24 @@ def transact(class_dfd: int, session: str, sources: Sequence[Tuple[str, int]], r
             warnings.append(f"a step after the commit failed ({event}: {type(e).__name__}); the publish stands")
 
     after("exchange" if exchanged else "noreplace")
+    synced = False
     try:
         seams.fault("fsync:class")
         seams.fsync(class_dfd)
+        synced = True
         after("fsync class")
     except Exception as e:          # noqa: BLE001
         # A2: the rename is the commit point, so ok: true stands; the operator is told it is not yet durable.
         what = _errname(e) if isinstance(e, OSError) else type(e).__name__
         after(f"fsync class failed {what}")
         warnings.append(f"the published export's directory entry could not be synced ({what}): a crash may undo "
-                        f"the publish")
-    if exchanged:
+                        f"the publish" + (f"; the older export is kept at {role.staged_help} until the next run "
+                                          f"deletes it" if exchanged else ""))
+    if exchanged and not synced:
+        # L3 5c-ii-b r1 B-7: a crash may still revert the exchange, and <s> would then name the older tree; it is
+        # left whole at the staged name for the next seal-in's stale delete.
+        after("delete older skipped: the class dir is not synced")
+    elif exchanged:
         try:
             seams.fault("delete-older")
             seams.delete(class_dfd, staged)
@@ -650,18 +668,35 @@ def publish_if_success(outcome: Outcome, work_dfd: int, class_dfd: int, session:
     """Seal-out's ONE gate into the publish (DESIGN §1 step 11, r10 S13-1): a DENIAL raises its name and touches
     nothing in the class dir; SUCCESS runs the output checks and the transaction. Returns ``(result, published)``,
     ``result`` derived from the copied header (prerequisites = ``delta``, none = ``unrelated``; root never
-    evaluates ancestry) or ``adopt-nothing-new``."""
+    evaluates ancestry) or ``adopt-nothing-new``.
+
+    Only the IMPORTER's outputs are published here: a verifier's SUCCESS refuses ``verifier-failed:publish`` /
+    ``verifier-unbuilt`` (a programming error) until 5d-i builds its own output set and transaction (L3 5c-ii-b r1
+    B-5); its DENIALS still answer with its own names. The output fds (files inside the image) are closed before
+    ``before_commit``, the detach, so DESIGN step 11's detach-then-commit order holds on Linux too, where an
+    ``umount`` with an open file is EBUSY (D2)."""
     if not outcome.success or outcome.line is None:
         raise Refused(outcome.name or f"{role.failed}:exit", outcome.detail)
+    if role != IMPORTER:
+        raise _publish_refusal(role, "verifier-unbuilt")
     nothing_new = outcome.line.result == "adopt-nothing-new"
     names = ("report.json",) if nothing_new else ("bundle", "report.json")
     fds = check_outputs(work_dfd, names, ("bundle",) if nothing_new else (), owner_uid=owner_uid, caps=caps)
+
+    def close_outputs() -> None:
+        while fds:
+            os.close(fds.popitem()[1])
+
+    def close_then_detach() -> None:
+        close_outputs()             # D2: the copies are made and fsynced; transact reads the sources no more
+        if before_commit is not None:
+            before_commit()
+
     try:
         pub = transact(class_dfd, session, [(n, fds[n]) for n in names], role, seams, gid=gid,
-                       bundle_check=importer_bundle_check(session, object_format), before_commit=before_commit)
+                       bundle_check=importer_bundle_check(session, object_format), before_commit=close_then_detach)
     finally:
-        for fd in fds.values():
-            os.close(fd)
+        close_outputs()
     if nothing_new:
         return "adopt-nothing-new", pub
     assert pub.header is not None

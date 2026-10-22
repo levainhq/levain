@@ -786,3 +786,82 @@ def test_verifier_facts_use_the_verify_names(tmp_path, monkeypatch):
     assert r.mount.endswith("/.verify") and "/cg/levain.slice/verify.scope/run" in r.cg.dirs
     assert "stale-staging deleted verify.new" in r.log.events
     assert X.classify(_ok_obs(r.run.seal_out()), X.VERIFIER).success
+
+
+# =================================================================================================================
+# 5c-ii-b L3 r1 (triage ``1022-18/adopt/L3_5c2b_r1_TRIAGE.md``: B-1 .. B-7) and the head-ruled 5c-ii-a defects D1, D2.
+# Each row was run against 251133df first (raw: ``1022-18/adopt/l3r1c_failfirst.txt``).
+# =================================================================================================================
+
+def test_b5_a_verifier_success_never_reaches_the_importer_shaped_publish(tmp_path):
+    w, c = _work(tmp_path), _class_dir(tmp_path, older=False)
+    wd, cd = _dfd(w), _dfd(c)
+    try:
+        ok = X.classify(X.RunObservation(exit="exit", code=0, line=_line()))
+        with pytest.raises(Refused) as ei:
+            X.publish_if_success(ok, wd, cd, S, object_format="sha1", owner_uid=os.getuid(), caps=CAPS,
+                                 seams=X.PublishSeams(), role=X.VERIFIER)
+    finally:
+        os.close(wd)
+        os.close(cd)
+    assert (ei.value.name, ei.value.detail) == ("verifier-failed:publish", "verifier-unbuilt")
+    assert os.listdir(c) == []
+
+
+def test_b7_a_failed_class_fsync_keeps_the_older_tree_at_the_staged_name(tmp_path):
+    def fault(p):
+        if p == "fsync:class":
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+    log = Log()
+    c, (_r, pub) = _publish(tmp_path, seams=X.PublishSeams(log=log, fault=fault), older=True)
+    assert (c / S / "bundle").read_bytes() == _bundle()
+    assert (c / (S + ".new") / "bundle").read_bytes() == b"OLD"      # left for the next seal-in's stale delete
+    assert "delete older" not in log.events and "delete older skipped: the class dir is not synced" in log.events
+    assert len(pub.warnings) == 1 and "L/export/<class>/<s>.new" in pub.warnings[0]
+
+
+def _no_replace_seam(*, ignore=False):
+    def rename2(fd1, n1, fd2, n2, flag):
+        if flag == X.NOREPLACE:
+            if ignore:
+                return None                              # a filesystem that drops the flag: the rename "succeeds"
+            raise X.ExchangeUnsupported("ENOTSUP")
+        X.rename2(fd1, n1, fd2, n2, flag)
+    return rename2
+
+
+@pytest.mark.parametrize("ignore", [False, True])
+def test_d1_the_probe_also_tests_the_no_replace_rename(tmp_path, ignore):
+    c = _class_dir(tmp_path, older=False)                # a FIRST publish: no older tree
+    cd = _dfd(c)
+    try:
+        with pytest.raises(Refused) as ei:
+            X.probe_exchange(cd, X.IMPORTER, X.PublishSeams(rename2=_no_replace_seam(ignore=ignore)))
+    finally:
+        os.close(cd)
+    assert (ei.value.name, ei.value.detail) == ("importer-failed:publish", "exchange-unsupported")
+    assert os.listdir(c) == []
+
+
+def test_d2_the_outputs_are_closed_before_the_detach_that_precedes_the_commit(tmp_path):
+    w, c = _work(tmp_path), _class_dir(tmp_path, older=False)
+    outs = {(st.st_dev, st.st_ino) for st in (os.stat(w / "out" / n) for n in ("bundle", "report.json"))}
+    held = []
+
+    def before_commit():
+        for n in os.listdir("/dev/fd"):
+            try:
+                st = os.fstat(int(n))
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) in outs:
+                held.append(n)
+    wd, cd = _dfd(w), _dfd(c)
+    try:
+        X.publish_if_success(X.classify(X.RunObservation(exit="exit", code=0, line=_line())), wd, cd, S,
+                             object_format="sha1", owner_uid=os.getuid(), caps=CAPS, seams=X.PublishSeams(),
+                             before_commit=before_commit)
+    finally:
+        os.close(wd)
+        os.close(cd)
+    assert held == [] and (c / S / "bundle").read_bytes() == _bundle()
