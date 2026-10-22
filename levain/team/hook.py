@@ -466,9 +466,10 @@ def sessionstart(payload: dict) -> None:
         # Every ledger-supplied string goes through oneline: a member writes these, and a line break in
         # them would draw a forged "[team]" line into every teammate's session context.
         where = ", ".join(I.oneline(p, ident=True) for p in e.get("paths") or []) or "(project-wide)"
-        words = I.oneline(e.get("words", ""))
+        raw = str(e.get("words", ""))
+        # Cut the raw words, then mark: a cut after marking can split a ⟨U+XXXX⟩ marker.
         owner = I.oneline(str(e.get("owner")), ident=True)
-        lines.append(f"  - {where}: owner {owner}: \"{words[:160]}{'...' if len(words) > 160 else ''}\"")
+        lines.append(f"  - {where}: owner {owner}: \"{I.oneline(raw[:160])}{'...' if len(raw) > 160 else ''}\"")
     if show and len(rulings) > 15:
         lines.append(f"  - ...and {len(rulings) - 15} more in PROJECT.md / `levain team status`")
     if fetch_note:

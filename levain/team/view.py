@@ -51,10 +51,10 @@ def _days(ts: str, now: datetime) -> int | None:
 
 def _card(e: dict, now: datetime) -> dict:
     """The fields a pane shows for one entry. No counts, nothing keyed by person."""
-    return {"id": e["id"], "type": e.get("type"), "kind": e.get("kind"), "owner": e.get("owner") or "",
+    return {"id": e["id"], "type": e.get("type"), "kind": e.get("kind"), "owner": I.oneline(e.get("owner") or "", ident=True),
             "words": I.oneline(e.get("words") or ""), "summary": I.oneline(e.get("summary") or ""),
             "reason": I.oneline(e.get("reason") or ""), "recheck": I.oneline(e.get("recheck") or ""),
-            "paths": list(dict.fromkeys(e.get("paths") or [])), "recorded_by": e.get("author", "?"),
+            "paths": [I.oneline(p, ident=True) for p in dict.fromkeys(e.get("paths") or [])], "recorded_by": e.get("author", "?"),
             "age": I.age(e.get("ts", ""), now), "age_days": _days(e.get("ts", ""), now),
             "pack": e.get("pack") or ""}
 
@@ -109,7 +109,7 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
                     slot["acks"] += 1
                 slot["rulings"][rid] = I.oneline(r.get("words") or r.get("summary") or "")
         ack_total += bool(seen)
-    stopped = [{"path": g, "acks": s["acks"], "ruling_ids": sorted(s["rulings"]),
+    stopped = [{"path": I.oneline(g, ident=True), "acks": s["acks"], "ruling_ids": sorted(s["rulings"]),
                 "ruling_words": [s["rulings"][k] for k in sorted(s["rulings"])],
                 "review": s["acks"] >= ack_flag, "in_force": any(k not in ledger.superseded for k in s["rulings"])}
                for g, s in by_path.items()]
@@ -137,7 +137,7 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
         for g in dict.fromkeys(e.get("paths") or ["(project-wide)"]):
             if not pf or hit(g):
                 paths[g].append(_card(e, now))
-    canon = [{"path": g, "entries": paths[g]} for g in sorted(paths)]
+    canon = [{"path": I.oneline(g, ident=True), "entries": paths[g]} for g in sorted(paths)]
 
     return {"project": team.project, "owner": team.owner, "mode": team.mode, "you": handle,
             "canon_status": C.staleness(canon_text, state), "problems": len(ledger.problems),

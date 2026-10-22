@@ -449,3 +449,19 @@ def test_a_peer_written_owner_with_a_hidden_character_is_shown_with_a_marker():
     from levain.team import view as V
     assert V._e("client:acme​") == "client:acme⟨U+200B⟩"
     assert V._e("<b>é") == "&lt;b&gt;é"
+
+
+def test_the_card_marks_hidden_text_in_an_owner_and_a_path():
+    # L3 1022-2 r2: the card carried owner and paths raw while every other field went through oneline. A ledger
+    # line read without the write gate (an owner still printable, a path never gated at read) reached the model raw.
+    ledger, _ = _ledger()
+
+    def plant(e):
+        e["owner"] = "ana\ufe0f"
+        e["paths"] = ["a\U000e0041\u202eb.py"]
+    led, _ = _plus(ledger, "ana", [("decision", dict(kind="ruling", owner="ana", paths=["x.py"], words="w"), plant)])
+    m = V.build_model(TEAM, led, "ana", None, "x", now=NOW)
+    cards = [c for g in m["in_force"] for c in g["entries"] if "b.py" in "".join(c["paths"])]
+    assert cards and cards[0]["owner"] == "ana⟨U+FE0F⟩"
+    assert cards[0]["paths"] == ["a⟨U+E0041⟩⟨U+202E⟩b.py"]
+    assert "a⟨U+E0041⟩⟨U+202E⟩b.py" in {g["path"] for g in m["in_force"]}
