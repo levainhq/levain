@@ -477,6 +477,40 @@ def _expire(conn: sqlite3.Connection, now: datetime) -> list[str]:
     return ended
 
 
+def _cancel_waiting(conn: sqlite3.Connection, principal: str, target_id: Any) -> bool:
+    """Whether ``principal`` already holds a ``WAITING`` ``pending_cancel`` of ``target_id``, read off the signed
+    records (the ``verb`` column is a mirror, as ``expires_at`` is in :func:`_expire`). A row whose record does not
+    parse counts as one, so the cap applies (fail closed)."""
+    for row in conn.execute("SELECT pending_id, record, record_sha256 FROM pendings "
+                            "WHERE principal = ? AND state = 'WAITING'", (principal,)).fetchall():
+        try:
+            record = _parse_record(row[0], row[1], row[2])
+        except JournalCorruptError:
+            return True
+        target = record.get("target") if isinstance(record.get("target"), dict) else {}
+        if record.get("verb") == "pending_cancel" and target.get("pending_id") == target_id:
+            return True
+    return False
+
+
+def _frees_a_write(conn: sqlite3.Connection, target_id: Any) -> bool:
+    """Whether cancelling ``target_id`` frees a held write: the target is ``WAITING`` and its signed record is not
+    itself a ``pending_cancel``. A cancel of a cancel, or of a pending already ended, frees nothing, so it gets no
+    reserved slot (else each would be "the first for its target" and a chain of them would pass the cap). A target
+    whose record does not parse frees nothing either (fail closed: the cap applies)."""
+    if not isinstance(target_id, str):
+        return False
+    row = conn.execute("SELECT pending_id, record, record_sha256 FROM pendings "
+                       "WHERE pending_id = ? AND state = 'WAITING'", (target_id,)).fetchone()
+    if row is None:
+        return False
+    try:
+        record = _parse_record(row[0], row[1], row[2])
+    except JournalCorruptError:
+        return False
+    return record.get("verb") != "pending_cancel"
+
+
 def _effect_rows(op: str, record: dict[str, Any], rows: list[sqlite3.Row],
                  state: str) -> tuple[EffectRow, ...]:
     plan = record["effects"]
@@ -693,11 +727,14 @@ class CockpitDB:
     # -- issue (§3.1 step 2) -------------------------------------------------------------------
 
     def issue(self, *, record_bytes: bytes, principal: str, idempotency_key: str, now: datetime,
-              harness: str = "cockpit", cap_exempt: bool = False) -> IssueResult:
+              harness: str = "cockpit", cap_exempt: bool = False, own_cancel: bool = False) -> IssueResult:
         """Record a new ``WAITING`` pending holding ``record_bytes`` (the JCS bytes of a
         :func:`~levain.cockpit.consent.build_record` record), or return the pending an earlier
         request with this idempotency key made. ``cap_exempt`` is for a pending that takes
-        ALLOWED-REPORTED in this same request, which never counts toward the cap."""
+        ALLOWED-REPORTED in this same request, which never counts toward the cap. ``own_cancel`` is for a
+        device's cancel of its own pending (K8): the FIRST waiting ``pending_cancel`` this principal holds for a
+        ``WAITING`` target that is not itself a cancel is outside the cap, checked in this transaction
+        (:func:`_frees_a_write`); a second for the same target, or a cancel that frees no write, meets the cap."""
         record = _parse_record(None, record_bytes, record_sha256(record_bytes))
         pid = record["operation_id"]
         intent = record.get("intent")
@@ -720,7 +757,11 @@ class CockpitDB:
                         f"idempotency key {idempotency_key!r} is bound to another request")
                 return IssueResult(pending_id=prior["pending_id"], record=prior["record"],
                                    replay=True, outcome=_outcome(prior))
-            if not cap_exempt:
+            target = record.get("target") if isinstance(record.get("target"), dict) else {}
+            reserved = own_cancel and record.get("verb") == "pending_cancel" \
+                and _frees_a_write(conn, target.get("pending_id")) \
+                and not _cancel_waiting(conn, principal, target.get("pending_id"))
+            if not (cap_exempt or reserved):
                 held = conn.execute(
                     "SELECT pending_id, idempotency_key, verb, issued_at FROM pendings "
                     "WHERE principal = ? AND state = 'WAITING' ORDER BY issued_at, rowid",

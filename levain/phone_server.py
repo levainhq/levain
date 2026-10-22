@@ -280,7 +280,8 @@ class _PhoneHandler(GuardedHandler):
                                403, head=head)
                     return True
                 action, pid = cockpit
-                app, transport = self.server.phone_app(), transport_of(cred[0], cred[1])
+                app = self.server.phone_app()
+                transport = transport_of(cred[0], cred[1], run_token=self.server.phone_token)
                 if action == "verb":
                     self._json(app.device_verb(_json_or_none(body), transport=transport))
                 elif action == "read":
