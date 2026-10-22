@@ -8,6 +8,7 @@
               size ('compact' | 'large' | 'strip'; default and 'compact' are today's size, 'large' is the tall chart,
                     'strip' is the phone's and the Build tab's: merged lanes, no gutter, no tooltip, no summary)
               head (true: a strip carries its own header row, "Activity  N commits · ...  last 14 h", as the Build tab draws it)
+              onHead (fn(parts, hours): called with each [count, label] pair every time the head row is rebuilt, so a host can draw the figures in its own bar)
      LevainSky.legendNode() -> a DOM key for the Levain marks (the host may place it, as the hero does with its own).
 
    A feed is Levain-shaped when it carries a session or question, a decision with an outcome of allowed / denied / waiting
@@ -386,6 +387,7 @@
         hc.textContent = parts.map(function (x) { return x[0] + ' ' + x[1]; }).join(' · ');
         var hw2 = document.createElement('span'); hw2.className = 'sky-head-win'; hw2.textContent = 'last ' + opts.windowHours + ' h';
         summary.replaceChildren(hb, hc, hw2);
+        if (typeof o.onHead === 'function') { try { o.onHead(parts, opts.windowHours); } catch (e) { /* the host's figures are its own; a throw there must not stop the chart */ } }
       } else if (!strip) {   // the phone's strip has no summary bar, so none is built
         var bold = function (n) { var e = document.createElement('b'); e.className = 'num'; e.textContent = String(n); return e; };
         var txt = function (x) { return document.createTextNode(x); };

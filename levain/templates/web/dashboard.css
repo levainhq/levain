@@ -2177,6 +2177,9 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
   .hl-bar > .tv-seg { width: 100%; }
   .hl-bar > .tv-seg > .tv-seg-b { flex: 1 1 0; padding-inline: var(--sp-3); }
 }
+/* the Event graph's bar: its figures ride the lens bar like the other lenses', so the band's own title row is not drawn beside them */
+.skycard[data-hlens="events"] .sky-bar.sky-head { display: none; }
+.tv-evfig .tv-evwin { margin-left: auto; align-self: center; font-size: var(--fs-micro); color: var(--meta); white-space: nowrap; }
 .tv-strip { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-5); flex: 1 1 320px; min-width: 0; font-size: var(--fs-meta); color: var(--label); }
 .tv-metrics { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--sp-3) var(--sp-6); flex: 1 1 320px; min-width: 0; }
 .tv-m { display: flex; flex-direction: column; gap: 2px; min-width: 0; }

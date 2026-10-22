@@ -1555,7 +1555,7 @@
     wrap.appendChild(plot);
     host.appendChild(wrap);
     if (root.LevainSky && typeof root.LevainSky.mount === "function") {
-      try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend, dialect: sky.dialect }, hero ? { legend: false, size: skySize(), head: true, toggleHost: document.querySelector("header.masthead .indicators"), toggleBefore: document.getElementById("jumpbtn") } : { legend: false, size: skySize(), head: true }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
+      try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend, dialect: sky.dialect }, hero ? { legend: false, size: skySize(), head: true, toggleHost: document.querySelector("header.masthead .indicators"), toggleBefore: document.getElementById("jumpbtn") } : { legend: false, size: skySize(), head: true, onHead: paintEventFigures }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
     } else plot.appendChild(el("p", "xnote", "the sky draws here once sky.js is loaded"));
     const legend = el("div", "legendbar" + (hero ? "" : " frame"));
     paintLegend(legend, sky);
@@ -2260,6 +2260,20 @@
   // The Event graph is the page's Activity band (#ck-sky, sky.js), unchanged; the other two are topology_view.js's renderer drawn into #ck-hlens
   // above it. The choice is a view preference (stored per browser by topology_view.js): it never changes what is read.
   let hSig = "";
+  // The Event graph's figures (sky.js hands them over each time it rebuilds its head row): drawn big in the lens bar, the head row itself is hidden there.
+  let evFig = null;
+  function paintEventFigures(parts, hours) {
+    if (parts) evFig = { parts, hours };
+    const box = document.querySelector("#ck-hlens .tv-evfig");
+    if (!box || !evFig) return;
+    const out = evFig.parts.map(([n, label]) => {
+      const m = el("div", "tv-m");
+      m.append(el("b", null, String(n)), el("span", "tv-ml", label));
+      return m;
+    });
+    out.push(el("span", "tv-evwin", "last " + evFig.hours + " h"));
+    box.replaceChildren(...out);
+  }
   function paintHeaderLens() {
     const host = document.getElementById("ck-hlens"), card = document.getElementById("ck-skycard");
     if (!host || !card) return;
@@ -2281,9 +2295,11 @@
     const repaint = () => { hSig = ""; k7Sig = ""; paintHeaderLens(); paintBuildSessions(); };
     const toggle = TV.headerToggle(lens, () => { if (TV.replaying && TV.replaying()) TV.returnToLive(); repaint(); });
     if (lens === "events") {
+      // the Event graph keeps the bar the other two lenses draw: the switch, a hairline, then the band's own figures at the same size
       const bar = el("div", "tv-bar hl-bar");
-      bar.appendChild(toggle);
+      bar.append(toggle, el("div", "tv-metrics tv-evfig"));
       host.replaceChildren(bar);
+      paintEventFigures();
       return;
     }
     let body = null, fail = false;
