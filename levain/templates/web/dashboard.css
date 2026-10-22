@@ -356,9 +356,9 @@
   /* ONE status line for empty / loading / unavailable (spec §3 "Card states"): a 6px dot + a
      12px sentence in --label. The dot carries the state: neutral = empty, pulsing = loading,
      --warn = unavailable. Errors take their status colour, never the accent orange. */
-  p.err, p.empty { display: flex; align-items: center; gap: var(--sp-3); margin: 0; padding: var(--sp-4) 0;
+  p.err, p.empty { display: flex; align-items: flex-start; gap: var(--sp-3); margin: 0; padding: var(--sp-4) 0;
     color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.4 var(--sans); }
-  p.err::before, p.empty::before { content: ""; width: 6px; height: 6px; flex: none; border-radius: var(--r-pill); background: var(--meta); }
+  p.err::before, p.empty::before { content: ""; width: 6px; height: 6px; flex: none; margin-top: .5em; border-radius: var(--r-pill); background: var(--meta); }
   p.err::before { background: var(--warn); }
   p.empty.loading::before { animation: statusPulse 1.2s ease-in-out 8;  /* finite, then a still dot: a panel stuck loading must not animate forever */ }
   @keyframes statusPulse { 50% { opacity: .3; } }
@@ -1089,6 +1089,7 @@
   .sky-summary b { color: var(--label); font-weight: var(--fw-semibold); }
   .sky-toggle { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); color: var(--label); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; flex: none; }
   .sky-toggle:hover { color: var(--text); border-color: var(--hair-2); }
+  .sky-toggle-ghost { visibility: hidden; pointer-events: none; }
   .sky-legend { padding-top: var(--sp-3); font-size: var(--fs-meta); color: var(--label); }
   @media (max-width: 720px) { .sky { grid-template-columns: 1fr; } .when { border-right: 0; } }
 
@@ -1122,12 +1123,12 @@ body.ke .deck { max-width: var(--page-max); margin: 0 auto; }
    weather: the band is still whole, and the sky card is simply not drawn. */
 body.ke .hero > .ck-region-err { padding: var(--sp-5) var(--gutter); }
 body.ke .hero { display: block; }
-body.ke .band { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: var(--sp-7); padding-block: var(--gap) var(--sp-5); }
+body.ke .band { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: var(--sp-7); padding-block: var(--gap) var(--sp-5); }
 body.ke .band .when { display: flex; flex-direction: column; padding: 0; border: 0; gap: 0; }
 body.ke .band .clock { font: var(--fw-clock) 46px/1 var(--round); letter-spacing: -.04em; }
 body.ke .band .clock small { font: var(--fw-semibold) var(--fs-lead)/1 var(--round); letter-spacing: 0; color: var(--label); margin-left: var(--sp-2); }
 body.ke .band .date { font: var(--fw-regular) var(--fs-body)/1.2 var(--sans); color: var(--label); margin-top: var(--sp-3); }
-body.ke .band-state { min-width: 0; padding-left: var(--sp-7); border-left: 1px solid var(--hair); }
+body.ke .band-state { min-width: 0; align-self: start; margin-top: 14px; padding-left: var(--sp-7); border-left: 1px solid var(--hair); }
 body.ke .band-state:not(:has(.stateline:not([hidden]))) { border-left: 0; padding-left: 0; }
 body.ke .band-state .stateline { padding: 0; margin: 0; align-items: baseline; gap: var(--sp-4); }
 body.ke .band-state .stateline .ftext { font: var(--fw-bold) var(--fs-lead)/var(--lh-tight) var(--round); }
@@ -1151,6 +1152,9 @@ body.ke .band-meta .wx .wx-air { grid-area: air; align-self: stretch; padding-le
 body.ke .band-meta .wx .wx-age { grid-area: foot; justify-self: start; align-self: end; margin: 0; padding-top: var(--sp-3); }
 /* the foot's hairline is the instrument's own line across its full width; the read age sits under it at the left, the re-read key at the right */
 body.ke .band-meta .wx::before { content: ""; grid-area: foot; align-self: start; height: 1px; background: var(--hair); }
+/* the last wrap sits in the card's foot, between the read age and the re-read key, as one quiet line */
+body.ke .band-meta .wx .wx-wrap { grid-area: foot; justify-self: center; align-self: end; display: flex; gap: var(--sp-3); padding-top: var(--sp-3); font-size: var(--fs-micro); color: var(--meta); white-space: nowrap; }
+body.ke .band-meta .wx .wx-wrap > div + div::before { content: "\00b7"; margin-right: var(--sp-3); }
 body.ke .band-meta .wx-refresh { grid-area: foot; justify-self: end; align-self: end; margin: var(--sp-3) 0 0; padding: 0; width: var(--ctl-row); height: var(--ctl-row);
   display: grid; place-items: center; border-radius: var(--r-sm); background: var(--key-bg); border: 0; box-shadow: var(--edge-hi), var(--lift); font-size: var(--fs-meta); }
 body.ke .band-meta .wx-refresh:hover { color: var(--text); }
@@ -1266,7 +1270,8 @@ body.ke .ck-briefcard .ck-brief-body:has(.brief-card) { margin-top: 0; }
 .brief-card .brief-head h3 { margin: 0; font: var(--fw-bold) var(--fs-title)/1.2 var(--round); letter-spacing: var(--track-tight); }
 .brief-card .brief-head .sp { flex: 1; }
 .brief-card .brief-head .stamp { color: var(--meta); font-size: var(--fs-micro); }
-.brief-card .brief-cols { display: grid; grid-template-columns: minmax(0, 1fr); column-gap: var(--sp-7); }
+.brief-card .brief-cols { display: grid; grid-template-columns: minmax(0, 1fr); column-gap: var(--sp-7); align-items: start; }
+.brief-card .brief-threads .brief-src { margin: calc(-1 * var(--sp-2)) 0 var(--sp-3); color: var(--meta); font-size: var(--fs-micro); }
 .brief-card .brief-cols.has-threads { grid-template-columns: minmax(0, 1fr) minmax(280px, 360px); }
 .brief-card .lead-first { margin: 0; font: var(--fw-bold) 17px/1.4 var(--round); letter-spacing: var(--track-tight); overflow-wrap: anywhere; }
 .brief-card .lead-then { margin: var(--sp-3) 0 0; font-size: var(--fs-body); line-height: var(--lh-list); color: var(--label); }
@@ -1518,8 +1523,8 @@ body.ke .tray-dump-ta { background: none; border: 0; border-radius: 0; padding: 
 body.ke .tray-dump-ta:focus { border: 0; outline: 1px solid var(--hair-2); outline-offset: 4px; border-radius: var(--r-sm); }
 body.ke .tray-dump-ta::placeholder { color: var(--meta); }
 body.ke .tray-dump-controls { gap: var(--sp-3); }
-body.ke .tray-dump-btn { margin-left: auto; font: var(--fw-semibold) var(--fs-meta) var(--sans); letter-spacing: 0; text-transform: none; color: var(--on-accent); background: var(--accent);
-  border: 0; border-radius: var(--r-md); padding: var(--sp-2) var(--sp-4); }
+body.ke .tray-dump-btn { margin-left: auto; font: var(--fw-semibold) var(--fs-meta) var(--sans); letter-spacing: 0; text-transform: none; color: var(--text); background: var(--key-bg);   /* the accent is for what waits on him; a drop key is a plain key */
+  border: 0; border-radius: var(--r-md); padding: var(--sp-2) var(--sp-4); box-shadow: var(--edge-hi), var(--key-ring), var(--lift); }
 body.ke .tray-dump-btn:hover { filter: brightness(1.08); }
 .ck-to { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; font-size: var(--fs-meta); color: var(--meta); }
 .ck-to-hint { margin-left: var(--sp-2); }
@@ -1586,6 +1591,13 @@ body.ke .ck-zgrid .panel.ck-fold .phead { padding: var(--sp-4) var(--sp-4) var(-
 body.ke .ck-zgrid .panel.ck-fold .pbody { padding: var(--sp-4) var(--sp-6) var(--sp-4) 0; flex: 1 1 200px; overflow: visible; max-height: none; }
 body.ke .ck-zgrid .panel.ck-fold .pbody { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--sp-5); }
 body.ke .ck-zgrid .panel.ck-fold .pbody .empty, body.ke .ck-zgrid .panel.ck-fold .pbody .ext-note { margin: 0; padding: 0; }
+/* an empty panel that folds keeps a head row (title, read age, the fold key at the right edge) with its one empty sentence under it, in the body,
+   never run on after the title with the key stranded between them */
+body.ke .ck-zgrid .panel.ck-fold.ck-is-empty:not(.ck-dash) { flex-direction: column; flex-wrap: nowrap; align-items: stretch; }
+body.ke .ck-zgrid .panel.ck-fold.ck-is-empty:not(.ck-dash) .phead { padding: var(--sp-4) var(--sp-5) var(--sp-2) var(--sp-6); align-items: center; }
+body.ke .ck-zgrid .panel.ck-fold.ck-is-empty:not(.ck-dash) .phead .src { margin-left: auto; }
+body.ke .ck-zgrid .panel.ck-fold.ck-is-empty:not(.ck-dash) .phead .src ~ * { margin-left: 0; }
+body.ke .ck-zgrid .panel.ck-fold.ck-is-empty:not(.ck-dash) .pbody { padding: 0 var(--sp-6) var(--sp-4); flex: none; }
 /* on a phone the body wraps below the head, so it takes the head's left inset instead of sitting at the card edge */
 @media (max-width: 720px) { body.ke .ck-zgrid .panel.ck-fold .pbody { padding: 0 var(--sp-6) var(--sp-4) var(--sp-6); } }
 
@@ -1662,7 +1674,9 @@ body.ke .needs-order { font-size: var(--fs-meta); color: var(--meta); text-trans
 body.ke .needs-history { margin-left: auto; font: var(--fw-medium) var(--fs-meta)/var(--lh-list) var(--sans); color: var(--label); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: var(--sp-1) var(--sp-3); cursor: pointer; }
 body.ke .needs-history:hover { color: var(--text); border-color: var(--label); }
 body.ke .needs-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: var(--gap); margin-top: var(--sp-4); align-items: stretch; }
-body.ke .needs-card { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; padding: var(--sp-5); background: var(--card); border: 1px solid var(--accent-line); border-radius: var(--r-lg); box-shadow: 0 0 0 3px var(--accent-soft); }
+/* the waiting ring is ONE recipe with the decisions strip: a crisp 1px ring, no second border, a soft lit edge and an accent bloom below */
+body.ke .needs-card { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; padding: var(--sp-5); background: var(--card); border: 1px solid var(--wait-ring); border-radius: var(--r-lg);
+  box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 22%, transparent), var(--edge-hi), 0 10px 30px -14px color-mix(in oklch, var(--accent) 35%, transparent); }
 body.ke .needs-card:focus { outline: none; box-shadow: 0 0 0 3px var(--accent-line); }
 body.ke .needs-head { align-items: center; }
 body.ke .needs-chip { font: var(--fw-medium) var(--fs-micro)/1.4 var(--mono); color: var(--label); border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: 0 var(--sp-2); }
@@ -1736,7 +1750,9 @@ body.ke .ck-widgets[hidden] { display: none; }
 /* every tile hidden on this tab (cockpit_view.js sets data-n): no empty bordered strip, no margin left behind */
 body.ke .ck-widgets[data-n="0"] { display: none; }
 body.ke .ck-secthead + .ck-widgets { margin-top: var(--sp-4); }
-body.ke .ck-widgets > .ck-card.w { flex: 1 1 0; min-width: 0; min-height: 0; height: auto; flex-direction: row; align-items: center; gap: var(--sp-4); padding: var(--sp-4) var(--sp-5);
+/* the glance strip clears the Needs-you cards by a full step (the heading rule above would otherwise win the tie and leave 12px) */
+body.ke .ck-needs ~ .ck-secthead + .ck-widgets { margin-top: var(--sp-6); }
+body.ke .ck-widgets > .ck-card.w { flex: 1 1 auto; min-width: 0; min-height: 0; height: auto; flex-direction: row; align-items: center; gap: var(--sp-4); padding: var(--sp-4) var(--sp-5);
   background: var(--card); border: 0; border-radius: 0; overflow: hidden; }
 body.ke .ck-widgets > .ck-card.w:hover { background: var(--card-2); }
 body.ke .ck-widgets .w > .k { flex: none; }
@@ -1748,10 +1764,11 @@ body.ke .ck-widgets .w .row { flex-wrap: wrap; white-space: nowrap; min-width: 0
 body.ke .ck-widgets .w .xbody { flex-direction: row; align-items: baseline; gap: var(--sp-2) var(--sp-5); flex-wrap: nowrap; min-width: 0; }
 body.ke .ck-widgets .w .dots { flex-direction: row; flex-wrap: wrap; min-width: 0; gap: var(--sp-1) var(--sp-5); }   /* a strip tile's dots wrap inside the box (the height fit then counts what does not fit), never run past its edge */
 body.ke .ck-widgets .w .op .v { margin-left: var(--sp-3); }
-/* a status row in a narrow tile wraps: the value drops under its label (right-aligned) rather than running past the body that clips it; the status word is never cut */
-body.ke .ck-widgets .w .op { flex-wrap: wrap; row-gap: 0; min-width: 0; }
-body.ke .ck-widgets .w .op .op-l { min-width: 0; overflow-wrap: anywhere; }
-body.ke .ck-widgets .w .op .v { max-width: 100%; overflow-wrap: anywhere; }
+/* a status row in a tile is ONE line: the value keeps its whole text and sits at the right edge, the name gives way (truncates) when the tile is narrow,
+   so every row's value shares the same edge instead of dropping under its label at a different place */
+body.ke .ck-widgets .w .op { flex-wrap: nowrap; row-gap: 0; min-width: 0; }
+body.ke .ck-widgets .w .op .op-l { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+body.ke .ck-widgets .w .op .v { flex: none; white-space: nowrap; font-size: var(--fs-micro); margin-left: var(--sp-2); }
 /* N3 the glance figures: every figure is tabular and lining (a column of counts does not shimmy as digits change), a figure and its
    label share one baseline, and a tile's secondary figures are a glance row, never a list row (the list row's top rule and rounded
    hover box are what drew a stray pill around "18 today" in the strip). */
@@ -1919,7 +1936,9 @@ body.ke .row.k7-res > .k7-rdot.ok { background: var(--ok); }
 body.ke .row.k7-res > .k7-rdot.bad { background: var(--bad); }
 /* Open loops on Build: an accent bar, the title, then the spore id, how long it has been open and its repo */
 body.ke[data-mode="build"] [data-ck-panel="loops"] .row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4); border-left: 3px solid var(--heat, var(--accent)); border-radius: 0; padding-left: var(--sp-5); margin-block: var(--sp-3); }
-body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .clause { order: -1; flex: 1 1 100%; }
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .clause { order: -1; flex: 1 1 calc(100% - var(--sp-8)); min-width: 0; }
+/* the fold chevron rides the title line's right edge (as on the Board), never the meta row beneath it */
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .clause-toggle { order: -1; align-self: start; margin-left: auto; }
 body.ke[data-mode="build"] [data-ck-panel="loops"] .row > [data-ck-tag].tier { display: none; }
 body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .k7-repo { display: inline-block; }
 body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .k7-opend { display: inline; color: var(--meta); font-size: var(--fs-meta); }
@@ -2042,7 +2061,7 @@ body.ke .ck-mem-dec > .ck-mem-cont { grid-template-columns: minmax(0, 1fr); padd
 body.ke .ck-mem-decs { display: flex; flex-direction: column; gap: var(--sp-2); }
 body.ke .ck-mem-decs .md-p, body.ke .ck-mem-pats .md-p { margin: 0; }
 body.ke .ck-mem-li { display: grid; grid-template-columns: 3.2rem minmax(0, 1fr); gap: var(--sp-4); align-items: baseline; }
-body.ke .ck-mem-n { font: var(--fw-bold) var(--fs-meta)/1.5 var(--mono); color: var(--accent); }
+body.ke .ck-mem-n { font: var(--fw-semibold) var(--fs-meta)/1.5 var(--mono); color: var(--label); }
 body.ke .ck-mem-t { display: flex; flex-direction: column; min-width: 0; }
 body.ke .ck-mem-name { font: var(--fw-regular) var(--fs-meta)/1.5 var(--mono); overflow-wrap: anywhere; }
 body.ke .ck-mem-rest, body.ke .ck-mem-cite { color: var(--label); font-size: var(--fs-micro, var(--fs-meta)); line-height: 1.4; overflow-wrap: anywhere; }
@@ -2051,7 +2070,7 @@ body.ke .ck-mem-rest, body.ke .ck-mem-cite { color: var(--label); font-size: var
 body.ke p.md-p.ck-mem-group, body.ke .ck-mem-group { display: flex; align-items: center; gap: var(--sp-3); font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps);
   text-transform: uppercase; color: var(--label); padding: 0; margin: var(--sp-6) 0 var(--sp-4); }
 body.ke .ck-mem-group::after { content: ""; flex: 1 1 auto; height: 1px; background: var(--hair); }
-body.ke p.md-p.ck-mem-group:first-child, body.ke .ck-mem-group:first-child { margin-top: 0; }
+body.ke p.md-p.ck-mem-group:first-child, body.ke .ck-mem-group:first-child { margin-top: var(--sp-3); }
 body.ke .ck-zgrid .panel.ck-mem-slim { display: flex; flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: var(--sp-3); }
 body.ke .ck-zgrid .ck-mem-slim > .phead { padding: 0; }
 body.ke .ck-zgrid .ck-mem-slim .edit-trigger-row { margin: 0; }
@@ -2280,6 +2299,9 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-agents { display: flex; flex-direction: column; gap: var(--sp-5); min-width: 0; }
 .tv-stage { position: relative; min-width: 0; overflow: hidden; background: var(--base); border: 1px solid var(--hair); border-radius: var(--r-md); }
 .tv-graph { position: relative; z-index: 1; display: block; width: 100%; height: auto; }
+/* a phone keeps the graph at a readable scale and pans it sideways (the svg and the particle canvas carry their own pixel width) */
+.tv-stage.tv-phone { overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch; }
+.tv-stage.tv-phone .tv-graph { max-width: none; }
 .tv-particles { position: absolute; top: 0; left: 0; z-index: 0; pointer-events: none; color: var(--text); }
 :root[data-theme="light"] .tv-particles { color: var(--label); }
 @media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) .tv-particles { color: var(--label); } }
