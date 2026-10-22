@@ -112,12 +112,12 @@
   }
 
   const HIDDEN_TEXT = "contains hidden characters; edit with the CLI";
-  function sporeOf(pid, row, groupTitles, hidden) {
+  function sporeOf(pid, row, groupTitles, hidden, today) {
     const f = row.facets || {};
     const t = targetOf(pid, row);
     return Object.assign({
-      id: bare(row.id), age: ageOf(row), type: f.spore_type || "task", tier: f.tier, salience: f.salience, domain: f.domain,
-      disposition: f.disposition, text: row.body || row.title, next: f.due || null, held: f.held === true,
+      id: bare(row.id), age: ageOf(row), age_days: Number.isInteger(f.age_days) ? f.age_days : null, type: f.spore_type || "task", tier: f.tier, salience: f.salience, domain: f.domain,
+      disposition: f.disposition, text: row.body || row.title, next: f.due || null, held: f.held === true, today: typeof today === "string" ? today : null,
       descend_kinds: kindsOf(t.actions, "spore_descend"), ascend_kinds: kindsOf(t.actions, "spore_ascend"),
       group_title: row.group ? (groupTitles.get(row.group) || row.group) : null, group: row.group || null,
     }, t, hidden && hidden.has(row.id) ? { text_locked: HIDDEN_TEXT } : {});
@@ -137,7 +137,8 @@
       if (held && f.reason === HELD_REASON) continue;
       out.push({ tone: "dim", text: f.count + " held back — " + f.reason });
     }
-    if (head.note) out.push({ tone: "dim", text: head.note });
+    // an optional source never seen says so once, in the panel's empty sentence: its "not configured: ..." note adds nothing over no rows
+    if (head.note && !(/^not configured: /.test(head.note) && !(panel.rows || []).length)) out.push({ tone: "dim", text: head.note });
     // a Metric's alerts (e.g. a wrap in progress) are part of its reading, never dropped
     for (const a of ((panel.value || {}).alerts || [])) out.push({ tone: "stale", alert: true, text: "! " + a.message });
     return out.length ? out : null;
@@ -192,6 +193,32 @@
     return { verb: c.verb, fields: fields };
   }
 
+  // Now's rows in date order with the heading each sits under. Overdue and undated (waiting on you) rows lead as TODAY / OVERDUE,
+  // each later day within a week is "TUE 10-20", anything further is LATER.
+  // `today` is the server's calendar day ("YYYY-MM-DD", the panel's own `today`); the browser's clock and zone decide nothing here
+  function nowByDate(rows, today) {
+    const day = (y, m, d) => Date.UTC(y, m, d);
+    const tm = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(today || ""));
+    const d0 = new Date();
+    const today0 = tm ? day(+tm[1], +tm[2] - 1, +tm[3]) : day(d0.getFullYear(), d0.getMonth(), d0.getDate());   // an old server sends none: the page's own day
+    const iso = (r) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String((r.facets || {}).due || "")); return m ? day(+m[1], +m[2] - 1, +m[3]) : null; };
+    const keyed = rows.map((r, i) => ({ r: r, i: i, t: iso(r) }));
+    const rank = (k) => (k.t === null ? today0 : k.t);     // undated: due now
+    keyed.sort((a, b) => rank(a) - rank(b) || a.i - b.i);
+    const label = new Map();
+    const names = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+    for (const k of keyed) {
+      const t = rank(k);
+      let text;
+      if (t < today0) text = "OVERDUE";
+      else if (t === today0) text = "TODAY";
+      else if (t - today0 <= 7 * 86400000) { const d = new Date(t); text = names[d.getUTCDay()] + " " + String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0"); }
+      else text = "LATER";
+      label.set(k.r.id, text);
+    }
+    return { rows: keyed.map((k) => k.r), label: label };
+  }
+
   function externalOf(head, panel, groupTitles, nowMs) {
     const v = panel.value || {};
     const kind = ALIAS[head.kind] || head.kind;
@@ -214,7 +241,12 @@
       const declared = Array.isArray(head.facets) ? head.facets : Array.isArray(panel.facets) ? panel.facets : [];
       const addressed = !!rfield || declared.indexOf("for") >= 0;
       if (compose) out.compose = compose;
-      out.lines = (panel.rows || []).map((r) => {
+      // Now reads as a dated list, as the mock draws it: what is late and what is due today first, then each day of the next seven by
+      // date ("TUE 10-20"), one line per item. A row with no date is due now (a decision waiting on you).
+      const nowRows = head.id === "now" ? nowByDate(panel.rows || [], panel.today) : null;
+      const srcRows = nowRows ? nowRows.rows : (panel.rows || []);
+      if (nowRows) out.note = "next 7 days";
+      out.lines = srcRows.map((r) => {
         const grp = r.group ? (groupTitles.get(r.group) || r.group) : "";
         const badges = (r.badges || []).map(badgeText).join(" · ");
         const prov = r.provenance ? r.provenance.label : "";
@@ -227,11 +259,24 @@
         const line = { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
         if (head.id === "sessions") {
           line.wrapMeta = true;
+          // the Build tab's session row (paintBuildSessions below): the provider's own measures, never a full cwd
+          const sv = (r.facets || {}).session_view;
+          if (isObj(sv)) line.sess = Object.assign({ agent: typeof (r.facets || {}).agent === "string" ? r.facets.agent : "", active: (r.facets || {}).session_activity === "active" }, sv);
           // the transcript button's key: the row id is "session:<stem>" (the stem is a hash, not the session id)
           if (typeof r.id === "string" && /^session:[0-9a-f]{24}$/.test(r.id)) line.session = r.id.slice("session:".length);
         }
         if (typeof r.id === "string" && r.id) line.key = r.id;
         if (grouped) line.grp = grp;
+        if (nowRows) { line.grp = nowRows.label.get(r.id) || ""; line.meta = ""; }
+        if (head.id === "jobs") {
+          // Build's Results: a finished job is a result: ok or failed, what ran, and when (never the raw result body)
+          const jf = r.facets || {};
+          const st = jf.job_status;
+          line.dot = st === "done" ? "ok" : st === "failed" ? "bad" : "off";
+          line.text = (typeof jf.verb === "string" && jf.verb ? jf.verb : r.title) + " " + (st === "done" ? "finished" : st === "failed" ? "failed" : st || "");
+          // `at` is the job's finish for a finished job; a job still pending or running is not a result yet and says so
+          line.meta = st === "pending" || st === "running" ? st : (typeof jf.at === "string" ? ago(jf.at) : "");
+        }
         const rf = (r.facets || {}).repo;   // the structured repo: when a row carries one, its tag comes from this, not its words
         if (typeof rf === "string" && visible(rf).trim()) line.repo = visible(rf).trim();
         if (addressed) {
@@ -282,7 +327,7 @@
         return line;
       });
       const fields = fieldsOf(out.search, ROW_FIELDS);
-      out.hays = (panel.rows || []).map((r) => hayOfRow(r, fields));
+      out.hays = srcRows.map((r) => hayOfRow(r, fields));
       out.typed = true;
       out.count = isNum(panel.count) ? panel.count : null;
       if (panel.degraded && panel.degraded.length) {
@@ -296,25 +341,26 @@
       // a dot's value is optional: a status with no figure is a legitimate reading
       need(Array.isArray(ms) && ms.every((m) => isObj(m) && typeof m.label === "string"
         && (m.value == null || typeof m.value === "string" || isNum(m.value)) && (m.unit == null || typeof m.unit === "string")
-        && (m.read == null || typeof m.read === "string")), "metrics");
+        && (m.read == null || typeof m.read === "string") && (m.detail == null || typeof m.detail === "string")), "metrics");
       out.metrics = ms;
       out.typed = true;
       out.lines = ms.map((m) => ({
         meta: m.label,
-        text: [m.value == null ? "" : m.value + (m.unit ? " " + m.unit : ""), m.read || ""].filter(Boolean).join(" — ") || (m.status || "unknown"),
+        text: [m.value == null ? "" : m.value + (m.unit ? " " + m.unit : ""), m.read || "", m.detail || ""].filter(Boolean).join(" — ") || (m.status || "unknown"),   // the detail rides along: the focus filter, the jump box and a touch reader have no hover
         accent: m.status === "warn" || m.status === "bad", dim: m.status === "unknown" }));
     } else if (kind === "ambient") {
       if (Array.isArray(v.events)) {
         need(v.events.every((e) => isObj(e) && typeof e.kind === "string" && typeof e.at === "string"), "events");
         need(typeof v.legend === "string", "legend");
-        out.sky = { events: v.events, legend: v.legend };
+        out.sky = { events: v.events, legend: v.legend, dialect: v.dialect };
         out.typed = true;
       } else out.lines = labelled(v.text, "text").map((l) => ({ meta: l.label, text: l.text }));
     } else if (kind === "brief") {
       const lines = labelled(v.lines, "lines");
       const head1 = typeof v.headline === "string" && v.headline ? v.headline : "";
       if (typeof v.markdown === "string" && v.markdown) out.markdown = v.markdown;   // the card's own head carries the title: a bold copy of it above the text read as a second title
-      else { out.typed = true; out.brief = { headline: head1, lines: lines }; }
+      else { out.typed = true; out.brief = { headline: head1, lines: lines, title: typeof v.title === "string" ? v.title : "", source: typeof v.source === "string" ? v.source : "",
+        threads: Array.isArray(v.threads) ? v.threads : null, overnight: isObj(v.overnight) ? v.overnight : null }; }
     } else if (kind === "reading") {
       need(isNum(v.value) || (typeof v.value === "string" && v.value), "reading value");
       need(v.sub === undefined || (Array.isArray(v.sub) && v.sub.every((s) => isObj(s) && typeof s.label === "string")), "reading sub");
@@ -338,6 +384,14 @@
       const fields = fieldsOf(out.search, ["verb", "target", "actor"]);
       out.hays = v.rows.map((r) => hayOfValue(r, fields));
       out.typed = true;
+    } else if (kind === "topology") {
+      // the counts as lines (the jump box, the filter and a phone read them), and the full value for topology_view.js; the
+      // compact profile carries numbers where the full one carries arrays, and has nothing to draw
+      const n = (x, c) => (Array.isArray(x) ? x.length : isNum(c) ? c : 0);
+      const tasks = Array.isArray(v.tasks) ? v.tasks : [];
+      const waiting = Array.isArray(v.nodes) && root.LevainTopologyView && root.LevainTopologyView.waitingOnYou ? root.LevainTopologyView.waitingOnYou(v) : isNum(v.waiting) ? v.waiting : 0;   // the one function behind every "waiting on you" figure; the compact profile carries the count itself
+      out.lines = [{ meta: "topology", text: n(v.nodes, v.nodes) + " sessions \u00b7 " + n(v.tasks, v.tasks) + " tasks \u00b7 " + waiting + " waiting on you" }];
+      if (Array.isArray(v.nodes) && Array.isArray(v.tasks) && Array.isArray(v.groups) && isObj(v.hub)) { out.topology = v; out.typed = true; out.replay = head.replay === true || panel.replay === true; }   // typed: the page keeps a live state for it (the header lens and Build's Lost-if-closed read it)
     } else if (kind === "form") {
       need(Array.isArray(v.fields) && v.fields.length && v.fields.every((f) => isObj(f) && typeof f.name === "string"), "form fields");
       out.form = { fields: v.fields, verb: typeof v.verb === "string" ? v.verb : "" };
@@ -369,18 +423,22 @@
     return t;
   }
 
-  // Which of the three modes show a panel. Morning is the intake read (what is waiting, the state, the
-  // sky); Build drops the readings that are only for orientation; Board is everything. An ambient panel, and anything placed in the hero, is in all.
-  const MORNING_KINDS = new Set(["brief", "reading", "count-queue", "ambient", "status-dots", "section"]);
-  const BUILD_DROPS = new Set(["brief", "reading", "section"]);
+  // Which of the four tabs show a panel (F3). Morning is the intake (Today, the glance, the Tray), Board the work (Tray, loops, Now,
+  // Keep, episodes, Team), Build the live agents (the sessions, hot loops, edits, results), Memory the mind (the six sections,
+  // crystals, cognition, identity). The hero is the page's header and is in all four. A panel the table does not name takes its
+  // region's tabs: a glance tile on Morning and Board, the brief on Morning, a work card on Board, a mind or identity card on Memory.
+  const ALL_TABS = "morning board build memory";
+  // Null-prototype tables: a panel id comes from the wire, and "constructor" or "__proto__" must read as not-in-the-table
+  // rather than an inherited function.
+  const tableOf = (o) => Object.assign(Object.create(null), o);
+  const TABS_OF_ID = tableOf({
+    tray: "morning board", loops: "board build", now: "board", keep: "board", episodes: "board", "team-status": "board",
+    edits: "build", jobs: "build", sessions: "morning board", topology: "build", health: "memory",
+    graph: "memory", wraps: "memory", crystals: "memory"
+  });
+  const TABS_OF_REGION = tableOf({ brief: "morning", widgets: "morning board", hero: ALL_TABS, operate: "board", mind: "memory", identity: "memory", team: "board" });
   function modesOf(e) {
-    const k = e.pkind || e.kind;
-    if (k === "ambient") return "morning board build";
-    const out = [];
-    if (MORNING_KINDS.has(k) || e.kind === "tray" || e.kind === "section") out.push("morning");
-    out.push("board");
-    if (!BUILD_DROPS.has(k) && e.kind !== "section") out.push("build");
-    return out.join(" ");
+    return TABS_OF_ID[e.id] || TABS_OF_REGION[e.region || e.zone] || "board";
   }
 
   // The entity record: a bad masthead string is omitted and named in view.errors.entity; the jar is all-or-null.
@@ -603,9 +661,12 @@
       const panel = P.get(pid);
       const groupTitles = new Map();
       for (const g of panel.groups || head.groups || []) groupTitles.set(g.id, titleOf(g.title, String(g.id)));
-      const entry = { zone: zoneId, edit_class: "", title: titleOf(panel.title, titleOf(head.title, pid)), id: pid,
+      const entry = { zone: zoneId, edit_class: "", title: pid === "jobs" ? "Results" : titleOf(panel.title, titleOf(head.title, pid)), id: pid,
                       pkind: ALIAS[panel.kind] || panel.kind };
       if (region) entry.region = region;
+      // how many rows the panel holds, from the kernel's own count: the page's count pill reads this, never the title's words
+      const held = isNum(panel.count) ? panel.count : (isNum(head.count) ? head.count : null);
+      if (held !== null) entry.count = held;
       const banner = bannerOf(panel, panel, now);
       if (banner) entry.banner = banner;
       if (panel.as_of) entry.fresh = ageLabel(panel.as_of, now, "read ");
@@ -629,9 +690,9 @@
       if ((rowsAct || pActions.length || (nat === "keep" && traySeeds)) && (nat === "tray" || nat === "loops" || nat === "keep" || nat === "episodes")) entry.edit_class = "B";
       const lists = { tray: "tray", loops: "open_spores", keep: "keep" };
       if ((nat === "tray" || nat === "loops" || nat === "keep") && (panel.kind === "triage-list" || panel.kind === "list")) {
-        view[lists[pid]] = rows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows));
+        view[lists[pid]] = rows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows, panel.today));
         if (heldRows.length) {
-          view.tray_held = heldRows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows));
+          view.tray_held = heldRows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows, panel.today));
           const hf = (head.filtered || []).find((f) => f && f.reason === HELD_REASON);
           view.tray_held_line = { count: hf && isNum(hf.count) ? hf.count : heldRows.length, reason: HELD_REASON };
         }
@@ -661,7 +722,7 @@
           const f = r.facets || {};
           const tags = tagsOf(f.tags);
           return { name: bare(r.id), level: f.crystal_level, one_clause: r.body || r.title, permanence: f.permanence,
-                   last_activated_on: f.last_activated_on, tags: tags };
+                   activation_mode: f.activation_mode, last_activated_on: f.last_activated_on, tags: tags };
         });
         view.layout.push(Object.assign(entry, { kind: "crystals" }));
       } else if (nat === "health" && (panel.kind === "metric" || panel.kind === "status-dots")) {
@@ -771,7 +832,7 @@
     // the hero is the page's header and reads the same in every mode: its weather is not one of the orientation
     // readings Build drops
     const inHero = new Set(view.ke ? view.ke.hero : []);
-    for (const e of view.layout) e.modes = inHero.has(e.id) ? "morning board build" : modesOf(e);
+    for (const e of view.layout) e.modes = inHero.has(e.id) ? ALL_TABS : modesOf(e);
     // the verbs the kernel offered somewhere with a gesture a browser can perform: an affordance whose
     // verb is not here has nothing to post to
     view.offered_verbs = Object.create(null);
@@ -788,7 +849,7 @@
   const states = new Set();             // every live typed panel body (a panel and its expanded copy are two)
   const FILTER_KEY = "levain_cockpit_filter:";
   const MODE_KEY = "levain_cockpit_mode";
-  const MODES = ["morning", "board", "build"];
+  const MODES = ["morning", "board", "build", "memory"];
   const SEARCH_DEBOUNCE_MS = 250;
   const STORE_LIMIT = 50;
   let hoverPanel = null;                // the panel the pointer last entered: `/` filters the panel you are looking at
@@ -927,6 +988,7 @@
       const fig = m.value == null ? "" : m.value + (m.unit ? " " + m.unit : "");
       // a state is never colour alone: with no figure and no reading, the word stands in
       row.appendChild(el("span", "v", [fig, m.read || ""].filter(Boolean).join(" · ") || st));
+      if (typeof m.detail === "string" && m.detail) row.title = m.label + ": " + m.detail;   // the long reading lives in the tooltip; the row stays one line
       host.appendChild(row);
     }
   }
@@ -1031,22 +1093,27 @@
     }
     if (side.childNodes.length) top.appendChild(side);
     host.appendChild(top);
+    // the banded sub-readings (air, pollen, any other) are one small table beside the figure: a band glyph, the name, the figure on a
+    // tabular column, the band in words; each source line sits under its own row. An absent reading draws nothing, never a placeholder.
+    const air = el("div", "wx-air");
     for (const sub of subs) {
       if (!(typeof sub.band === "string" && sub.band)) continue;
       if (drawn++ >= cap) continue;
       const token = bandOf(sub.band);
       const row = el("div", "aqi band-" + (token || "other"));
       row.appendChild(bars());
-      row.appendChild(el("b", "num", sub.label.charAt(0).toUpperCase() + sub.label.slice(1) + (sub.value == null ? "" : " " + sub.value)));
+      row.appendChild(el("span", "aqi-l", sub.label.charAt(0).toUpperCase() + sub.label.slice(1)));
+      row.appendChild(el("b", "num aqi-v", sub.value == null ? "" : String(sub.value)));
       // the pill carries the band in words; `good` is calm, any other named band is hot, an unknown one neutral
       const pill = el("span", "pill" + (token && token !== "good" ? " hot" : ""), token ? BAND_WORDS[token] : sub.band);
       pill.setAttribute("data-ck-weather", "aqi");
       row.appendChild(pill);
-      host.appendChild(row);
-      if (typeof sub.detail === "string" && sub.detail) host.appendChild(el("div", "wx-src", sub.detail));
+      air.appendChild(row);
+      if (typeof sub.detail === "string" && sub.detail) { row.title = sub.detail; air.appendChild(el("div", "wx-src aqi-d", sub.detail)); }
     }
+    if (air.childNodes.length) host.appendChild(air);
     const age = typeof v.as_of === "string" ? ago(v.as_of) : "";
-    if (age && !(opts && opts.age === false)) host.appendChild(el("div", "wx-src", "read " + age));
+    if (age && !(opts && opts.age === false)) host.appendChild(el("div", "wx-src wx-age", "read " + age));
   }
 
   // ---- the widget faces: one answer each, never a row (cockpit contract, widgets region) ----
@@ -1056,20 +1123,85 @@
   // the static caps allow); `s.units` is how many it could draw, `s.hidden` how many it does not (a "+N more" line), `s.clamp` whether
   // a run of text had to be cut to two lines. fitWidget() finds the budget that fits the tile's real height.
   const moreNote = (host, n) => { if (n > 0) host.appendChild(el("div", "xnote", "+" + n + " more")); };
+  // F5 (a): a count tile that holds rows names what is in front, not only how many. Decisions names the top item the strip draws
+  // first (levain-needs, dashboard_core.js, orders both); Sessions says live and quiet and names the busiest.
+  function glanceFace(d, n, host) {
+    const N = root.LevainNeeds;
+    if (d.pid === "decisions" && n && N && Array.isArray(d.lines)) {
+      const items = N.items(d.lines);
+      if (items.length) {
+        host.appendChild(el("div", "sub glance-top", N.name(items[0])));
+        host.appendChild(el("div", "sub glance-sum", N.summary(items)));
+      }
+      return;
+    }
+    if (d.pid === "sessions" && Array.isArray(d.lines)) {
+      const sess = d.lines.map((l) => l && l.sess).filter(isObj);
+      if (!sess.length) return;
+      const live = sess.filter((x) => x.active), quiet = sess.length - live.length;
+      const pool = live.length ? live : sess;
+      let top = pool[0];
+      for (const x of pool) if ((x.tokens || 0) > (top.tokens || 0)) top = x;
+      const line = d.lines.find((l) => l && l.sess === top);
+      const meter = isNum(top.tokens) && top.tokens > 0 ? (top.window ? " \u00b7 " + Math.round(100 * top.tokens / top.window) + "% of context" : " \u00b7 " + k7K(top.tokens) + " tokens") : "";
+      // one line: a strip tile draws only its first sub line, and the counts are what the reader wants first. The busiest seat is the tile's
+      // title (hover) and a second sub line where the tile has the room for it, never a tail that gets cut off the counts.
+      const busiest = ((line && line.text) || top.agent || "session").replace(/\s+/g, " ").trim() + meter;
+      const counts = el("div", "sub glance-top", live.length + " live \u00b7 " + quiet + " quiet");
+      counts.title = "busiest: " + busiest;
+      host.appendChild(counts);
+      host.appendChild(el("div", "sub glance-busiest", "busiest: " + busiest));
+    }
+  }
   function paintWidget(s, host) {
     const d = s.data;
     const cap = s.budget == null ? Infinity : s.budget;
     s.units = 0; s.hidden = 0;
     if (d.face === "count") {
       const n = isNum(d.count) ? d.count : (d.lines || []).length;
-      host.appendChild(el("div", "big num", n));
+      const big = el("div", "big num", n);
+      big.dataset.count = String(n);   // the glow below reads this, not the figure's drawn text
+      host.appendChild(big);
       // at zero the answer is the panel's empty sentence ("Nothing waiting on you"), as the mock draws it, but only for
       // a clean, fresh read: on a degraded one (partial, stale, cached, alerted, something held back) the zero may be a
       // failed read, so the provider's note stays the line. The sentence is the panel's own: only a plain lowercase
       // English word at its head is capitalised (an identifier or a path is left as written).
       const sentence = (e) => /^[a-z]+ /.test(e) ? e.charAt(0).toUpperCase() + e.slice(1) : e;
+      // a tile whose glance face draws it (Decisions names the top item, Sessions says live and quiet) is drawn by that face, after
+      // the provider's note when there is one: the generic first line + count would be a second, lesser answer ahead of it, and a
+      // strip tile shows only its first sub line
+      const glance = el("div");
+      glanceFace(d, n, glance);
+      const glanced = glance.childNodes.length > 0;
+      const note = typeof d.note === "string" ? d.note.trim() : "";
+      // the face names the top item and counts the rest ("backfill +3 more"), so the tile reads as an answer, not a bare number
+      const topItem = () => {
+        if (glanced || !n || s.ctx.alerted || !Array.isArray(d.lines) || !d.lines[0] || typeof d.lines[0].text !== "string") return;
+        host.appendChild(el("div", "sub", d.lines[0].text + (n > 1 ? " +" + (n - 1) + " more" : "")));
+      };
       if (!n && !s.ctx.alerted && d.clean !== false) { const e = String(d.empty || ""); if (e) host.appendChild(el("div", "sub", sentence(e))); }
-      else if (d.note) host.appendChild(el("div", "sub", d.note));
+      else if (note) {
+        // with something waiting (or a degraded zero), the provider's note is its word on what the read covers ("no cockpit
+        // broker: decisions waiting on a signature are not shown"), so it is the first line: a strip tile draws only its first
+        // sub line, and a count with its caveat dropped reads as the whole answer. The top item follows it.
+        host.appendChild(el("div", "sub", note));
+        topItem();
+      }
+      else topItem();
+      while (glance.firstChild) host.appendChild(glance.firstChild);
+      return;
+    }
+    if (d.kind === "status-dots" && d.pid === "doctor" && (d.metrics || []).some((m) => m.status === "ok" || m.status === "warn" || m.status === "bad")) {
+      // the face is one answer: how many checks are ok, and the worst one named ("hooks · 1 warning"); the rows are the focus view's
+      const ms = d.metrics || [];
+      const graded = ms.filter((m) => m.status === "ok" || m.status === "warn" || m.status === "bad");
+      const okN = graded.filter((m) => m.status === "ok").length;
+      const worst = graded.find((m) => m.status === "bad") || graded.find((m) => m.status === "warn");
+      s.units = 1; s.hidden = ms.length;     // the checks behind the face: the tile opens them in the focus view
+      const head = el("div", "bigrow");
+      head.append(el("div", "big num", okN + "/" + graded.length), el("span", "bl", "ok"));
+      host.appendChild(head);
+      host.appendChild(el("div", "sub", worst ? worst.label + " · " + (worst.value == null ? worst.status : worst.value) : "nothing needs attention"));
       return;
     }
     if (d.kind === "status-dots") {
@@ -1192,7 +1324,7 @@
     const d = s.data, dots = d.kind === "status-dots";
     const all = (dots ? d.metrics : d.numbers) || [];
     const terms = termsOf(s.query);
-    const hay = (m) => fold([m.label, m.value, m.unit, m.read, m.status].filter((x) => x != null).join(" "));
+    const hay = (m) => fold([m.label, m.value, m.unit, m.read, m.detail, m.status].filter((x) => x != null).join(" "));
     const ms = terms.length ? all.filter((m) => hits(hay(m), terms)) : all;
     if (s.countEl) s.countEl.textContent = terms.length ? ms.length + " of " + all.length : all.length + " metrics";
     if (!ms.length) { s.body.appendChild(el("p", "empty", terms.length ? "no match" : d.empty)); return; }
@@ -1213,7 +1345,92 @@
   // In the brief region a label that repeats is a list, not a paragraph: its lines sit in a side column, clamped, and
   // the rest read as the card's body. The first-seen order is kept; nothing is sorted.
   const BRIEF_SIDE_LINES = 6;
+  // Where to begin, as the mock draws it: a head (title, what it reads from), the lead in large type with what comes after it,
+  // the overnight line, and a Threads column: the open loops grouped by the repo each one names (the row tags' own reading), a
+  // loop naming none under its domain, else "other". Loudest first: most loops, then the hottest tier.
+  const THREADS_SHOWN = 5;
+  const TIER_RANK = { hot: 0, warm: 1, cold: 2, parked: 3 };
+  function groupThreads(threads) {
+    const sky = root.LevainSky;
+    const matchers = matchersOf(sky);
+    const groups = new Map();
+    for (const t of threads) {
+      if (!isObj(t) || typeof t.text !== "string") continue;
+      const text = visible(t.text);
+      const dom = typeof t.domain === "string" ? visible(t.domain).trim() : "";
+      // the repo a row's tag shows: its domain when that is a repo the sky knows (Build's Open loops chip), else the repo its words name
+      const hit = (dom && matchers.find(([n]) => n.toLowerCase() === dom.toLowerCase())) || matchers.find(([, re]) => re.test(text));
+      const key = hit ? "r:" + hit[0] : "d:" + (dom || "other");
+      let g = groups.get(key);
+      if (!g) { g = { repo: hit ? hit[0] : "", label: hit ? "" : (dom || "other"), top: text, n: 0, rank: 9, order: groups.size }; groups.set(key, g); }
+      g.n++;
+      const r = t.tier in TIER_RANK ? TIER_RANK[t.tier] : 9;
+      if (r < g.rank) { g.rank = r; g.top = text; }   // the group is named by its hottest loop
+    }
+    return Array.from(groups.values()).sort((a, b) => b.n - a.n || a.rank - b.rank || a.order - b.order);
+  }
+  function paintBriefCard(host, b) {
+    const head = el("div", "brief-head");
+    // levain's own card is named for what it holds: the Tray's next items (the data's "Where to begin" would read twice beside flow's plan card)
+    head.appendChild(el("h3", "", b.title === "Where to begin" ? "Next from the Tray" : b.title));
+    head.appendChild(el("span", "sp"));
+    const hasThreads = Array.isArray(b.threads) && groupThreads(b.threads).length > 0;
+    // where the card has a lower heading (the loops column) the "from ..." caption sits under it, not floating in the head
+    if (b.source && !hasThreads) head.appendChild(el("span", "stamp", b.source));
+    host.appendChild(head);
+    const body = el("div", "brief-cols");
+    const lead = el("div", "brief-lead");
+    const lines = b.lines || [];
+    if (b.headline) {
+      // nothing set: one line, what is missing and the way to fill it
+      lead.appendChild(el("p", "lead-first", [b.headline, ...lines.map((l) => l.text)].join(". ").replace(/\.\.$/, ".")));
+    } else {
+      if (lines[0]) lead.appendChild(el("p", "lead-first", lines[0].text));
+      if (lines[1]) { const p = el("p", "lead-then"); p.appendChild(el("span", "k", lines[1].label || "then")); p.appendChild(document.createTextNode(" " + lines[1].text)); lead.appendChild(p); }
+      if (lines.length > 2) {
+        const more = el("div", "lead-more");
+        for (const l of lines.slice(2)) { const p = el("p", "lead-item"); p.appendChild(el("span", "k", l.label || "")); p.appendChild(document.createTextNode(" " + l.text)); more.appendChild(p); }
+        lead.appendChild(more);
+      }
+    }
+    const ov = b.overnight;
+    if (isObj(ov) && Number.isInteger(ov.episodes) && typeof ov.since === "string") {
+      const at = new Date(ov.since);
+      if (!Number.isNaN(at.getTime())) {
+        const when = at.toLocaleDateString(undefined, { weekday: "short" }) + " " + at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+        const row = el("div", "brief-overnight");
+        row.appendChild(el("span", "k", "Overnight"));
+        row.appendChild(el("span", "mono", ov.episodes + (ov.episodes === 1 ? " episode" : " episodes") + " since the last wrap, " + when));
+        lead.appendChild(row);
+      }
+    }
+    body.appendChild(lead);
+    const groups = Array.isArray(b.threads) ? groupThreads(b.threads) : [];
+    if (groups.length) {
+      const col = el("div", "brief-threads");
+      col.appendChild(el("div", "k", "Loops by thread"));
+      if (b.source) col.appendChild(el("div", "brief-src", b.source));
+      for (const g of groups.slice(0, THREADS_SHOWN)) {
+        const row = el("div", "thread");
+        row.appendChild(el("span", "t", g.repo ? g.top : g.label));
+        row.appendChild(el("span", "pill", g.n + (g.n === 1 ? " loop" : " loops")));
+        if (g.repo) {
+          const sky = root.LevainSky;
+          const tag = el("span", "rp-tag", g.repo);
+          const key = sky && typeof sky.hueKey === "function" ? sky.hueKey(g.repo) : "";
+          if (key) tag.dataset.repo = key;
+          row.appendChild(tag);
+        }
+        col.appendChild(row);
+      }
+      if (groups.length > THREADS_SHOWN) col.appendChild(el("p", "xnote", "+" + (groups.length - THREADS_SHOWN) + " more"));
+      body.appendChild(col);
+    }
+    body.classList.toggle("has-threads", groups.length > 0);
+    host.appendChild(body);
+  }
   function paintBrief(host, b, region) {
+    if (region && b.title && b.source) { host.classList.add("brief-card"); paintBriefCard(host, b); return; }
     if (b.headline) host.appendChild(el("div", "q", b.headline));
     const count = new Map();
     for (const l of b.lines) count.set(l.label || "", (count.get(l.label || "") || 0) + 1);
@@ -1284,23 +1501,37 @@
     if (s.ro) { s.ro.disconnect(); s.ro = null; }
     states.delete(s);
   }
+  function isLevFeed(sky) {
+    const S = root.LevainSky;
+    try { return !!(S && typeof S.isLevainFeed === "function" && S.isLevainFeed({ events: sky.events, dialect: sky.dialect })); } catch (_) { return false; }
+  }
+  // the Build tab draws the sky as the compact strip the mock shows (merged lanes, its own header row), the others the full chart
+  function skySize() { return document.body && document.body.dataset && document.body.dataset.mode === "build" ? "strip" : "compact"; }
+  function skyNow(s) {
+    const k = s.skyParts;
+    return !!k && k.size === skySize();
+  }
   function skyCounts(sky) {
-    const repos = new Set(sky.events.map((e) => e.repo).filter((r) => typeof r === "string" && r));
-    const failed = sky.events.filter((e) => e.outcome === "failed").length;
-    return { text: sky.events.length + " events from " + repos.size + " repos", failed: failed };
+    const evs = Array.isArray(sky.events) ? sky.events : [];
+    const repos = new Set(evs.map((e) => e && e.repo).filter((r) => typeof r === "string" && r));
+    const failed = evs.filter((e) => e && e.outcome === "failed").length;
+    const n = evs.length + (evs.length === 1 ? " event" : " events");
+    return { text: repos.size ? n + " from " + repos.size + (repos.size === 1 ? " repo" : " repos") : n, failed: failed };
   }
   // the failed count is the one accent on the line: a failed review is where attention goes
   function paintCounts(node, sky) {
     const c = skyCounts(sky);
     node.replaceChildren(document.createTextNode(c.text));
+    // a Levain feed in the hero: the band draws only the wrap line (the mock), the sky's own summary line says the counts
+    if (node.dataset && node.dataset.ckHero === "events") { const lev = isLevFeed(sky); node.hidden = lev; if (lev) { node.replaceChildren(); return; } }
     if (c.failed) { node.appendChild(document.createTextNode(" · ")); node.appendChild(el("span", "bad", c.failed + " failed")); }
   }
   // An ambient panel whose sky is already mounted takes new events through the mount's own update(), so the
   // animation keeps running instead of restarting. True when it did; false leaves the paint to remount.
   function updateSky(s, sky) {
     const k = s.skyParts;
-    if (!k || !s.skyHandle || typeof s.skyHandle.update !== "function" || !k.plot.isConnected || !s.body.contains(k.plot)) return false;
-    try { s.skyHandle.update({ events: sky.events, legend: sky.legend }); } catch (_) { return false; }
+    if (!k || k.size !== skySize() || !s.skyHandle || typeof s.skyHandle.update !== "function" || !k.plot.isConnected || !s.body.contains(k.plot)) return false;
+    try { s.skyHandle.update({ events: sky.events, legend: sky.legend, dialect: sky.dialect }); } catch (_) { return false; }
     paintCounts(k.win, sky);
     paintLegend(k.legend, sky);
     return true;
@@ -1332,7 +1563,7 @@
     wrap.appendChild(plot);
     host.appendChild(wrap);
     if (root.LevainSky && typeof root.LevainSky.mount === "function") {
-      try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend }, hero ? { legend: false, toggleHost: document.querySelector("header.masthead .indicators"), toggleBefore: document.getElementById("jumpbtn") } : { legend: false }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
+      try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend, dialect: sky.dialect }, hero ? { legend: false, size: skySize(), head: true, toggleHost: document.querySelector("header.masthead .indicators"), toggleBefore: document.getElementById("jumpbtn"), onHead: paintEventFigures } : { legend: false, size: skySize(), head: true, onHead: paintEventFigures }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
     } else plot.appendChild(el("p", "xnote", "the sky draws here once sky.js is loaded"));
     const legend = el("div", "legendbar" + (hero ? "" : " frame"));
     paintLegend(legend, sky);
@@ -1340,7 +1571,7 @@
     // page's mount, which renderHero owns: this hands the legend to it (place) and never writes the live mount
     // itself. A sky anywhere else, or a page without the mount (place answers false), keeps it under its plot.
     if (!(hero && typeof hero.place === "function" && hero.place(legend))) host.appendChild(legend);
-    s.skyParts = { plot: plot, win: win, legend: legend };
+    s.skyParts = { plot: plot, win: win, legend: legend, size: skySize() };
   }
 
   // The strip chart's key: the real glyphs, drawn like the chart's own marks (sky.js). Page chrome, not data:
@@ -1350,7 +1581,14 @@
   const DRAWN_KINDS = new Set(["commit", "review", "decision", "memory"]);
   function paintLegend(host, sky) {
     host.replaceChildren();
-    host.title = sky.legend;
+    host.title = sky.legend || "";
+    // a Levain feed has its own key (sky.js), and the mock's hint beside it
+    if (isLevFeed(sky) && root.LevainSky && typeof root.LevainSky.legendNode === "function") {
+      host.appendChild(root.LevainSky.legendNode());
+      host.appendChild(el("span", "lg-sp"));
+      host.appendChild(el("span", "lg-note", "Hover a mark for its time, kind and repo."));
+      return;
+    }
     const known = (sky.events || []).every((e) => e && DRAWN_KINDS.has(e.kind));
     if (!known) { host.appendChild(el("span", "lg-note", String(sky.legend || ""))); return; }
     const NS = "http://www.w3.org/2000/svg";
@@ -1620,6 +1858,8 @@
   const liveOf = (pid) => Array.from(states).filter((s) => s.pid === pid && onPage(s));
   async function refetchPanel(pid) {
     if (!liveOf(pid).length) return false;
+    // a scrubbed past (topology_view.js Replay) pauses the topology's live refetch: answered without a read; Live reads it again
+    if (pid === "topology" && root.LevainTopologyView && root.LevainTopologyView.paused && root.LevainTopologyView.paused()) return "applied";
     const gen = (refetchGen.get(pid) || 0) + 1;
     refetchGen.set(pid, gen);
     const epoch = boardEpoch;
@@ -1660,23 +1900,135 @@
     return "applied";
   }
 
+  // ---- the theme (F6): one token set, two themes, three choices. System (no choice: dashboard.css follows prefers-color-scheme),
+  // dark, light. A choice is kept per browser, never anywhere an agent reads; `?theme=light|dark` is a one-visit override that is not
+  // kept. A browser that refuses storage still switches for the page's life.
+  const THEME_KEY = "levain_cockpit_theme";
+  const isTheme = (t) => t === "light" || t === "dark";
+  function storedTheme() { try { const t = root.localStorage.getItem(THEME_KEY); return isTheme(t) ? t : ""; } catch (_) { return ""; } }
+  function queryTheme() {
+    try { const t = new URLSearchParams(root.location.search).get("theme"); return isTheme(t) ? t : ""; } catch (_) { return ""; }
+  }
+  const pageRoot = () => (typeof document !== "undefined" && document.documentElement) || null;   // a DOM without an <html> (the test fake) has no theme to set
+  // the choice the page is under right now: "light", "dark", or "system" when neither is set
+  function chosenTheme() {
+    const t = pageRoot() && pageRoot().dataset ? pageRoot().dataset.theme : "";
+    return isTheme(t) ? t : "system";
+  }
+  function paintThemeSwitch() {
+    const now = chosenTheme();
+    for (const b of document.querySelectorAll("[data-theme-set]")) b.setAttribute("aria-pressed", b.dataset.themeSet === now ? "true" : "false");
+  }
+  function setTheme(t, keep) {
+    const html = pageRoot();
+    if (html && html.dataset) { if (isTheme(t)) html.dataset.theme = t; else delete html.dataset.theme; }
+    if (keep) { try { if (isTheme(t)) root.localStorage.setItem(THEME_KEY, t); else root.localStorage.removeItem(THEME_KEY); } catch (_) { /* the page still switched */ } }
+    paintThemeSwitch();
+  }
+  // run as this file loads (it is in the <head>): the theme is set before the body paints, so a stored light theme never flashes dark
+  (function earlyTheme() {
+    const html = pageRoot();
+    const t = queryTheme() || storedTheme();
+    if (html && html.dataset && t) html.dataset.theme = t;
+  })();
+  // ---- the layout (K5): the order of a zone's cards and which panels are folded, kept per browser under one key, the way the theme is.
+  // {"v":1,"zones":{"<zone id>":{"order":["<card key>",...]}},"collapsed":["<card key>",...]}; a card's key is its first panel id, and a folded card folds all its panels.
+  // Anything that is not that shape is ignored part by part, and a browser that refuses storage draws the kernel order.
+  const LAYOUT_KEY = "levain_cockpit_layout_v1";
+  const strings = (a) => (Array.isArray(a) ? a.filter((s) => typeof s === "string" && s) : []);
+  // The page's own copy of the last layout written: when the store refuses a write (Safari private, quota) it is the truth for the page's life.
+  let memLayout = null, memStale = false;
+  const copyLayout = (l) => { const zones = Object.create(null); for (const z of Object.keys(l.zones)) zones[z] = l.zones[z].slice(); return { zones, collapsed: l.collapsed.slice() }; };
+  function readLayout() {
+    if (memStale && memLayout) return copyLayout(memLayout);
+    const out = { zones: Object.create(null), collapsed: [] };
+    let v = null;
+    try { v = JSON.parse(root.localStorage.getItem(LAYOUT_KEY)); } catch (_) { return out; }
+    if (!v || typeof v !== "object" || v.v !== 1) return out;
+    if (v.zones && typeof v.zones === "object") {
+      for (const z of Object.keys(v.zones)) {
+        const o = v.zones[z];
+        if (o && typeof o === "object" && Array.isArray(o.order)) out.zones[z] = strings(o.order);
+      }
+    }
+    out.collapsed = strings(v.collapsed);
+    return out;
+  }
+  function writeLayout(l) {
+    const zones = {};
+    for (const z of Object.keys(l.zones)) zones[z] = { order: l.zones[z] };
+    memLayout = copyLayout(l);
+    try { root.localStorage.setItem(LAYOUT_KEY, JSON.stringify({ v: 1, zones, collapsed: l.collapsed })); memStale = false; } catch (_) { memStale = true; }
+  }
+  // A store that refuses the removal still holds the old copy: the page then keeps an EMPTY layout in memory (the stored one is never read
+  // back) and drops it only after a removal that worked.
+  function resetLayout() {
+    try { root.localStorage.removeItem(LAYOUT_KEY); memLayout = null; memStale = false; }
+    catch (_) { memLayout = { zones: Object.create(null), collapsed: [] }; memStale = true; }
+  }
+  // the stored names first, in their stored order; every key the page has and the store does not name follows in the order it came
+  function layoutOrder(zoneId, keys) {
+    const stored = readLayout().zones[zoneId] || [];
+    const have = new Set(keys), seen = new Set(), head = [];
+    for (const k of stored) if (have.has(k) && !seen.has(k)) { seen.add(k); head.push(k); }
+    return head.concat(keys.filter((k) => !seen.has(k)));
+  }
+  const layoutCollapsed = () => new Set(readLayout().collapsed);
+  // true when anything is saved (a stored order or a collapsed panel): the one condition under which a Reset layout control is drawn
+  function hasLayout() { const l = readLayout(); return l.collapsed.length > 0 || Object.keys(l.zones).length > 0; }
+  function setLayoutOrder(zoneId, order) { const l = readLayout(); l.zones[zoneId] = order; writeLayout(l); }
+  function setLayoutCollapsed(panelId, on) {
+    const l = readLayout(), s = new Set(l.collapsed);
+    if (on) s.add(panelId); else s.delete(panelId);
+    l.collapsed = Array.from(s);
+    writeLayout(l);
+  }
   // ---- the modes and the keys ----
-  function applyMode(m) {
+  // A tab named in the address: `#morning|#board|#build|#memory`, alone or beside other fragment parts (`#write_token=...&board`).
+  // A bare name may arrive spelled `name=`: dashboard_boot.js strips the write token through URLSearchParams, which writes every
+  // part it keeps as `key=value`. The name is read with that suffix removed and, when the address is rewritten, written bare.
+  const hashParts = () => String((root.location && root.location.hash) || "").replace(/^#/, "").split("&").filter(Boolean).map((p) => (MODES.indexOf(p.replace(/=$/, "")) >= 0 ? p.replace(/=$/, "") : p));
+  function hashMode() { return hashParts().find((p) => MODES.indexOf(p) >= 0) || ""; }
+  // the address follows the tab the reader chose; any other fragment part stays
+  function writeHash(m) {
+    try { root.history.replaceState(null, "", root.location.pathname + root.location.search + "#" + hashParts().filter((p) => MODES.indexOf(p) < 0).concat(m).join("&")); }
+    catch (_) { /* an address that cannot be rewritten is still a working page */ }
+  }
+  // `fromReader`: the tab was chosen by the reader (a click, a key, the jump box), so the address follows; the first paint does not write it
+  // the sky is mounted at the size its tab wants; a tab switch remounts the ones drawn at the other size
+  function resizeSkies() {
+    for (const s of Array.from(states)) {
+      if (!s.skyParts || !s.skyHandle || !s.data || !s.data.sky || !s.body.isConnected || skyNow(s)) continue;
+      try { dropSky(s); s.body.replaceChildren(); paintSky(s, s.body, s.data.sky); } catch (_) { /* the next paint remounts */ }
+    }
+  }
+  function applyMode(m, fromReader) {
     if (MODES.indexOf(m) < 0) m = "board";
     document.body.dataset.mode = m;
     save(MODE_KEY, m);
+    if (fromReader) writeHash(m);
     for (const b of document.querySelectorAll("[data-mode-tab]")) b.setAttribute("aria-selected", b.dataset.modeTab === m ? "true" : "false");
+    resizeSkies();
     fillGrids();
+    // the header lens is on every tab but Memory (going to Memory ends its replay and stops its stream loop), the Sessions card on Build only
+    try { paintHeaderLens(); paintBuildSessions(); } catch (_) { /* the card repaints on the next poll */ }
+    // the layout controls read what the tab shows: any tab change, by click, key, address or reveal, asks them to refresh
+    if (typeof document.dispatchEvent === "function") document.dispatchEvent(new Event("ck-layout-refresh"));
   }
-  // The grids keep their designed widths whatever a mode hides (10-14: a lone widget or a lone Work card stretched
-  // across the page "looks like shit"): a card spans its own tracks and the last row stays short, left-aligned. Widgets sit
-  // on four tracks (more than four widgets open more); the zone grid is six tracks under three, four under two, one under one.
+  // the first tab that shows a panel: the one it is on if it shows it, else Board if it does, else the first it names. A node with no
+  // tab list (page chrome) is on every tab.
+  function revealTab(node) {
+    const tabs = ((node && node.dataset && node.dataset.modes) || "").split(" ").filter(Boolean);
+    if (document.body.dataset.mode && tabs.length && tabs.indexOf(document.body.dataset.mode) < 0) applyMode(tabs.indexOf("board") >= 0 ? "board" : tabs[0], true);
+  }
+  // The grids are laid out from what a mode shows: the glance is a strip sharing its row (tiles from four), and a zone grid is six
+  // tracks under three, four under two, one under one.
   function shown(n) { return getComputedStyle(n).display !== "none"; }
   // A card with nothing to list is its header and the one empty-state line, not a populated card's height with a gap in it.
   // Decided at render (this runs after each one): a card the person is filtering keeps its height, since the filter is the
   // reason the list is short and a collapsing card would jump under the cursor.
   function markEmptyCards() {
-    for (const p of document.querySelectorAll(".ck-zgrid > .panel")) {
+    for (const p of document.querySelectorAll(".ck-zgrid .panel")) {
       const none = !!p.querySelector(".pbody .empty") && !p.querySelector(".xfilter, .pbody .row, .pbody .rrow, .pbody .lrow, .pbody .section-display, .pbody .ep-search-input");
       p.classList.toggle("ck-is-empty", none);
       // an empty card folds into a slim bar at the end of its zone, unless it has a compose box or an editor behind an Edit link on it
@@ -1713,15 +2065,25 @@
     }
     return repoMatchers;
   }
+  // The work lists' rows (Tray, Open loops, Keep, Now) carry the repo tag in the meta line, after the id, the date and the age, as the
+  // mock draws it; every other row keeps it at the head of its text. `tagHome` is where that tag lives for a row.
+  const META_TAG_PANELS = ["tray", "loops", "keep", "now"];
+  function tagHome(row, clause) {
+    const panel = row.closest("[data-ck-panel]");
+    const inMeta = !!panel && META_TAG_PANELS.indexOf(panel.dataset.ckPanel) >= 0 && row.classList.contains("row");
+    return { inMeta: inMeta, host: inMeta ? row : clause };
+  }
   function tintRepos() {
     const sky = root.LevainSky;
     const matchers = matchersOf(sky);
     for (const row of document.querySelectorAll(".ck-zgrid .row")) {
       const clause = row.querySelector(":scope > .clause");
       if (!clause) continue;
+      const home = tagHome(row, clause);
+      if (home.inMeta && row.querySelector(":scope > .k7-repo")) continue;   // a chip already names the repo (Build's loops)
       // decided again on every pass, on the row's words without its own tag: a repo noted later can be the longer name
       // the row means, or move a hue slot
-      const had = clause.querySelector(":scope > .rp-tag");
+      const had = home.host.querySelector(":scope > .rp-tag:not(.k7-repo)");
       // a row with a structured `repo` facet the sky's registry knows is tagged from it alone, in the registry's
       // spelling (so its length and count are the registry's bounds); any other row is read by its words
       const facet = (row.dataset.repoFacet || "").toLowerCase();
@@ -1729,8 +2091,12 @@
       let hit;
       if (known) hit = [known[0]];
       else {
-        let text = row.textContent;
-        if (had) { const c = row.cloneNode(true); c.querySelector(":scope > .clause > .rp-tag").remove(); text = c.textContent; }
+        // the pieces of the row are joined by a space: a badge ("handoff") and the text that follows it are not one word
+        // and without the tag it already wears, wherever it sits (a direct child of the row, or inside the clause): its own words
+        // are not evidence of the repo, and a tag glued to the clause's first word would hide a match
+        const bare = row.cloneNode(true);
+        for (const t of bare.querySelectorAll(".rp-tag:not(.k7-repo)")) t.remove();
+        let text = Array.from(bare.children).map((c) => c.textContent).join(" ");
         hit = matchers.find(([, re]) => re.test(text));
       }
       const key = hit && sky && typeof sky.hueKey === "function" ? sky.hueKey(hit[0]) : "";
@@ -1740,28 +2106,378 @@
       if (key) {
         const tag = el("span", "rp-tag", hit[0]);
         tag.dataset.repo = key;
-        clause.insertBefore(tag, clause.firstChild);
+        if (home.inMeta) row.insertBefore(tag, row.querySelector(":scope > .verb-actions"));   // null: appended
+        else clause.insertBefore(tag, clause.firstChild);
       }
       // the tag changes the clause's length after the clause toggles were measured: measure this row again
       if (clause.clientHeight && clause.classList.contains("clampable") && !row.classList.contains("row-expanded")) row.classList.toggle("has-more", clause.scrollHeight > clause.clientHeight);
     }
+    // Build's repo chips (session rows, Open loops rows) take the sky's hue for a repo its registry knows, and stay neutral otherwise
+    for (const c of document.querySelectorAll(".k7-repo[data-repo-facet]")) {
+      const facet = (c.dataset.repoFacet || "").toLowerCase();
+      const known = facet ? matchers.find(([n]) => n.toLowerCase() === facet) : undefined;
+      const key = known && sky && typeof sky.hueKey === "function" ? sky.hueKey(known[0]) : "";
+      if (key) { c.classList.add("rp-tag"); if (c.dataset.repo !== key) c.dataset.repo = key; }
+    }
     // the Decisions tile glows only while something waits on the operator
     for (const w of document.querySelectorAll('.ck-card.w[data-ck-panel="decisions"]')) {
-      const big = w.querySelector(".big");
-      const n = big ? parseInt(big.textContent, 10) : 0;
+      const big = w.querySelector(".big[data-count]");
+      const n = big ? Number(big.dataset.count) : 0;
       if (n > 0) w.dataset.signal = "on"; else delete w.dataset.signal;
     }
   }
   // a panel that refetches on its own repaints its rows after fillGrids has run, so the tags are laid again on a slow tick
-  if (typeof document !== "undefined" && document.documentElement) root.setInterval(() => { if (!document.hidden) tintRepos(); }, 1500);
+  if (typeof document !== "undefined" && document.documentElement) root.setInterval(() => { if (!document.hidden) { tintRepos(); paintBuild(); } }, 1500);
+  // ---- K7: the Build tab ----
+  // Sessions is a count tile on Morning and Board; on Build it is a large card of its own, drawn here from the same panel
+  // state (so one read feeds both) into #k7-sessions, with the headings the Build tab carries. Nothing here reads a store.
+  const K7_NONE_SESSIONS = "No agent session yet: start Claude Code or Codex in a workspace.";
+  const K7_NONE_RESULTS = "No results yet: finished jobs and checks appear here.";
+  let k7Sig = "";
+  function k7Time(iso) {
+    const t = parseIso(iso);
+    return isNaN(t) ? "" : new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  }
+  function k7Ago(iso, now) {
+    const t = parseIso(iso);
+    if (isNaN(t)) return "";
+    const s = Math.max(0, Math.floor((now - t) / 1000));
+    return s < 60 ? s + " s ago" : s < 3600 ? Math.floor(s / 60) + " m ago" : s < 86400 ? Math.floor(s / 3600) + " h ago" : Math.floor(s / 86400) + " d ago";
+  }
+  const k7K = (n) => (n >= 1000 ? Math.round(n / 1000) + "K" : String(n));
+  // the context meter: how much of the model's window (Codex states it) or of the operator's warn line (Claude Code does not)
+  // the session holds. A session at or past the warn line (either agent, not compacted) says OVER in words and in red: that
+  // reads on a screenshot and on touch, and is not the orange of a session waiting on a decision. Never a number the
+  // transcript did not give.
+  function k7Meter(v, waiting) {
+    const m = el("div", "k7-meter");
+    const head = el("div", "k7-meter-h");
+    head.appendChild(el("span", "k7-meter-l", "CONTEXT"));
+    const bar = el("div", "k7-bar");
+    const fill = el("i");
+    bar.appendChild(fill);
+    let label = "not read", frac = 0, over = false;
+    if (isNum(v.tokens) && v.compacted) { label = "compacted"; }
+    else if (isNum(v.tokens) && v.tokens > 0) {
+      const hasWin = isNum(v.window) && v.window > 0;
+      const wall = hasWin ? v.window : (isNum(v.warn) && v.warn > 0 ? v.warn : 0);
+      frac = wall ? Math.min(1, v.tokens / wall) : 0;
+      // Codex states its window: a percentage of it. Claude Code does not: the bar is measured against the warn line, and says so
+      label = hasWin ? Math.round((v.tokens / v.window) * 100) + "%" : (wall ? k7K(v.tokens) + " of " + k7K(wall) + " warn" : k7K(v.tokens));
+      over = isNum(v.warn) && v.warn > 0 && v.tokens >= v.warn;
+    }
+    fill.style.width = Math.round(frac * 100) + "%";
+    if (over) head.appendChild(el("span", "k7-over", "OVER"));
+    head.appendChild(el("span", "k7-meter-v", label));
+    m.append(head, bar);
+    if (typeof v.context === "string" && v.context) m.title = v.context;
+    if (waiting) m.classList.add("waiting");
+    if (over) m.classList.add("over");
+    if (label === "not read") m.classList.add("unread");
+    return m;
+  }
+  function k7Limits(v) {
+    const l = v.limits;
+    if (!isObj(l)) return null;
+    // the blocking fact first (a halted session), then that nobody is counting; a session nobody counts is never drawn as healthy
+    const parts = [];
+    let tone = "ok";
+    if (typeof l.halted === "string" && l.halted) { parts.push("halted: " + l.halted); tone = "over"; }
+    if (l.counting !== true) { parts.push("limits: not counting"); tone = "over"; }
+    if (!parts.length && typeof l.metric === "string" && l.metric) { parts.push(l.metric); tone = l.status === "over" || l.status === "amber" ? l.status : "ok"; }
+    return parts.length ? el("div", "k7-limits " + tone, parts.join(" \u00b7 ")) : null;
+  }
+  function k7Row(ln, now) {
+    const v = ln.sess, live = v.active === true;
+    const waiting = typeof v.waiting === "string" && v.waiting !== "";
+    const row = el("div", "k7-srow" + (live ? " live" : " quiet") + (waiting ? " waiting" : ""));
+    const dot = el("i", "k7-sdot " + (live ? "live" : "quiet"));
+    dot.setAttribute("aria-hidden", "true");
+    const who = el("div", "k7-who");
+    const top = el("div", "k7-who-t");
+    top.appendChild(el("b", "k7-agent", v.agent || "agent"));
+    if (ln.repo) { const chip = el("span", "k7-repo", ln.repo); chip.dataset.repoFacet = ln.repo; top.appendChild(chip); }
+    who.append(top, el("div", "k7-cwd", v.cwd || ""));
+    const nowc = el("div", "k7-now");
+    let said;
+    let tick = null;      // [prefix, iso]: an "N s ago" the page keeps current in place, without drawing the card again
+    if (waiting) said = "waiting on a decision (" + v.waiting + (isNum(v.waiting_n) && v.waiting_n > 1 ? " +" + (v.waiting_n - 1) : "") + ")";
+    else if (live) { tick = v.tool ? [v.tool + " \u00b7 ", v.tool_at] : ["last hook ", v.last_seen]; said = tick[0] + k7Ago(tick[1], now); }
+    else said = v.tool ? "last tool " + k7Time(v.tool_at) : "last hook " + k7Time(v.last_seen);
+    const toolEl = el("div", "k7-tool", said);
+    if (tick) { toolEl.dataset.k7Pre = tick[0]; toolEl.dataset.k7At = tick[1]; }
+    nowc.appendChild(toolEl);
+    const lim = k7Limits(v);
+    if (lim) nowc.appendChild(lim);
+    // "ended" would claim what no hook announces: a quiet session says when it last fired one
+    row.append(dot, who, nowc, k7Meter(v, waiting), el("div", "k7-when", live ? "since " + k7Time(v.first_seen) : "last active " + k7Time(v.last_seen)));
+    return row;
+  }
+  function k7Host() {
+    let sec = document.getElementById("k7-sessions");
+    if (sec) return sec;
+    const after = document.getElementById("ck-widgets");
+    if (!after || !after.parentNode) return null;
+    sec = el("section", "k7-sess frame");
+    sec.id = "k7-sessions";
+    sec.hidden = true;
+    after.parentNode.insertBefore(sec, after.nextSibling);
+    return sec;
+  }
+  function k7Heading(title, gloss) {
+    const h = el("div", "k7-head");
+    h.append(el("h3", null, title), el("span", null, gloss));
+    return h;
+  }
+  // A waiting task or node links to the Needs-you item it waits on: the strip's card with that id is scrolled to and lit (on Build, the bar's
+  // chip is). An item with no card (decided, no longer waiting) opens the Decisions focus view, where its row is marked and scrolled to by
+  // the card id the row carries (data-card). With no Decisions panel on the page, the Board tab is shown instead.
+  function openNeedsYouCard(card) {
+    const N = root.LevainNeeds;
+    if (N && N.go(card)) return;   // the strip's card (or, on Build, its chip) is lit; the strip is on the page only while the item waits
+    const mark = (tries) => {
+      const row = Array.from(document.querySelectorAll("[data-card]")).find((r) => r.dataset.card === card && !r.classList.contains("tv-open"));
+      if (row) { row.classList.add("tv-lit"); if (row.scrollIntoView) row.scrollIntoView({ block: "center" }); return; }
+      if (tries > 0) root.setTimeout(() => mark(tries - 1), 150);
+    };
+    if (N && N.history()) mark(12);
+    else applyMode("board", true);
+  }
+  // The topology panel's state, read once for the header lens and the Sessions card alike. The panel is hidden on the page (the header draws it), so a
+  // fault is the header's to say, three ways: a failed fetch (ts.fault), an error record the kernel sent (data.error), or the page's own
+  // "unavailable" card (an external panel, no state of its own).
+  function topoInfo() {
+    const TV = root.LevainTopologyView;
+    if (!TV) return { TV: null };
+    const ts = Array.from(states).find((o) => o.pid === "topology" && o.p && o.p.isConnected) || null;
+    const ep = !ts ? document.querySelector('[data-ck-panel="topology"][data-ck-external]') : null;
+    const epErr = ep ? ep.querySelector(".err") : null;
+    const tfault = ts ? (ts.fault || (ts.data && typeof ts.data.error === "string" ? ts.data.error : "")) : (epErr ? epErr.textContent : "");
+    const tvLive = ts && !tfault && ts.data && ts.data.topology && TV.hasWork(ts.data.topology) ? ts.data.topology : null;
+    // the lens in force: the stored choice, but an install with no topology to draw has only its Event graph
+    const lens = tvLive || tfault ? TV.headerLens() : "events";
+    // the header is on every tab but Memory; replay lives only while a topology lens is on screen with a replay path (the head's flag and the page's transport)
+    const shown = !!(tvLive || tfault) && lens !== "events" && !!document.body && document.body.dataset.mode !== "memory";
+    const canReplay = !!(shown && tvLive && ts && ts.data && ts.data.replay === true && root.LevainCockpitTransport);
+    if (TV.replaying && TV.replaying() && !canReplay) TV.leaveReplay(true);   // on any other exit it ends BEFORE a value is read, so nothing is drawn from the past without its badge
+    // a scrubbed past is drawn in place of the live value (the read behind it may hold no work: an empty past is still the past)
+    const tv = tvLive && TV.replaying && TV.replaying() ? (TV.replayValue() || tvLive) : tvLive;
+    return { TV, ts, ep, tfault, tvLive, tv, lens, shown, canReplay };
+  }
+  // ---- the header lens: the Activity slot's three views [Agents graph | Event graph | Work] ----
+  // The Event graph is the page's Activity band (#ck-sky, sky.js), unchanged; the other two are topology_view.js's renderer drawn into #ck-hlens
+  // above it. The choice is a view preference (stored per browser by topology_view.js): it never changes what is read.
+  let hSig = "";
+  // The Event graph's figures (sky.js hands them over each time it rebuilds its head row): drawn big in the lens bar, the head row itself is hidden there.
+  let evFig = null;
+  function paintEventFigures(parts, hours) {
+    if (parts) evFig = { parts, hours };
+    const box = document.querySelector("#ck-hlens .tv-evfig");
+    if (!box || !evFig) return;
+    const out = evFig.parts.map(([n, label]) => {
+      const m = el("div", "tv-m");
+      m.append(el("b", null, String(n)), el("span", "tv-ml", label));
+      return m;
+    });
+    out.push(el("span", "tv-evwin", "last " + evFig.hours + " h"));
+    box.replaceChildren(...out);
+  }
+  function paintHeaderLens() {
+    const host = document.getElementById("ck-hlens"), card = document.getElementById("ck-skycard");
+    if (!host || !card) return;
+    const I = topoInfo();
+    const TV = I.TV;
+    if (!TV) return;
+    const lens = I.lens;
+    card.dataset.hlens = lens;
+    const fp = I.ts && I.ts.p ? I.ts.p : I.ep;
+    if (fp) fp.classList.toggle("ck-faulted", !!I.tfault);       // a faulted topology panel is the one error panel: the page's hide rule leaves it alone
+    const has = !!(I.tvLive || I.tfault);
+    if (!has) { if (!host.hidden || host.firstChild) { TV.release(); host.replaceChildren(); host.hidden = true; } hSig = ""; return; }
+    if (document.body.dataset.mode === "memory") { TV.release(); hSig = ""; return; }      // the header is not on Memory: nothing runs behind it
+    const sig = JSON.stringify([lens, I.tfault, I.tv ? TV.signature(I.tv, lens) : "", I.canReplay]);
+    if (sig === hSig && !host.hidden) return;
+    hSig = sig;
+    host.hidden = false;
+    TV.release();                 // the old body's resize observer and stream go with it
+    const repaint = () => { hSig = ""; k7Sig = ""; paintHeaderLens(); paintBuildSessions(); };
+    const toggle = TV.headerToggle(lens, () => { if (TV.replaying && TV.replaying()) TV.returnToLive(); repaint(); });
+    if (lens === "events") {
+      // the Event graph keeps the bar the other two lenses draw: the switch, a hairline, then the band's own figures at the same size
+      const bar = el("div", "tv-bar hl-bar");
+      bar.append(toggle, el("div", "tv-metrics tv-evfig"));
+      host.replaceChildren(bar);
+      paintEventFigures();
+      return;
+    }
+    let body = null, fail = false;
+    if (I.tv) {
+      // the Replay strip rides the page's own read path (LevainCockpitTransport.readJson: its auth headers and token handling); resume re-reads the live topology
+      const replay = I.canReplay ? { readJson: root.LevainCockpitTransport.readJson, resume: () => refetchPanel("topology") } : undefined;
+      try { body = TV.render(I.tv, { lens, lensSeg: toggle, repaint, openCard: openNeedsYouCard, replay }); } catch (e) { fail = true; }
+    }
+    if (body) { host.replaceChildren(body); return; }
+    // a fault, or a throw while drawing: said in words with the switch beside it, so the Event graph is one click away
+    const bar = el("div", "tv-bar hl-bar");
+    bar.appendChild(toggle);
+    host.replaceChildren(bar, el("p", "k7-none err", I.tfault ? "Topology unavailable: " + I.tfault : "The topology could not be drawn."));
+    if (fail) hSig = "";
+  }
+  function paintBuildSessions() {
+    const sec = k7Host();
+    if (!sec) return;
+    const s = Array.from(states).find((o) => o.pid === "sessions" && o.ctx && o.ctx.widget && o.p && o.p.isConnected);
+    if (!s || document.body.dataset.mode !== "build") {
+      k7Sig = "";            // coming back to Build draws the card again
+      if (!s) sec.hidden = true;
+      return;
+    }
+    const lines = (s.data.lines || []).filter((l) => l && isObj(l.sess));
+    const now = Date.now();
+    const I = topoInfo();
+    const TV = I.TV, ts = I.ts, tfault = I.tfault || "", tv = I.tv;
+    // the signature is content only: the clock does not repaint the card (a focused button would lose focus), it moves the "ago" words
+    const sig = JSON.stringify([s.fault || "", lines.map((l) => [l.sess, l.repo]), s.data.empty || "", I.lens, I.lens === "events" ? tfault : "",
+                                tv ? TV.signature(tv, "agents") : (TV && ts && ts.data && ts.data.topology ? TV.signature({ e: ts.data.topology.errors, u: ts.data.topology.unreadable }, "") : "")]);
+    if (sig === k7Sig && !sec.hidden) {
+      for (const t of sec.querySelectorAll(".k7-tool[data-k7-at]")) {
+        const w = t.dataset.k7Pre + k7Ago(t.dataset.k7At, now);
+        if (t.textContent !== w) t.textContent = w;
+      }
+      return;
+    }
+    k7Sig = sig;
+    sec.hidden = false;
+    const card = el("div", "panel k7-card");
+    const head = el("div", "k7-card-h");
+    const live = lines.filter((l) => l.sess.active === true).length;
+    const ttl = el("h2", null, "Sessions");
+    head.appendChild(ttl);
+    if (lines.length) {
+      const pill = el("span", "ck-count", String(lines.length));
+      head.append(pill, el("span", "k7-sum", live + " live · " + (lines.length - live) + " quiet"));
+    }
+    head.appendChild(el("span", "k7-sp"));
+    if (lines.length) {
+      const day = new Date(now).toDateString();
+      const today = lines.filter((l) => { const t = parseIso(l.sess.first_seen); return !isNaN(t) && new Date(t).toDateString() === day; }).length;
+      head.appendChild(el("span", "k7-stats", "started today " + today));
+      const open = el("button", "k7-open", "all details");
+      open.type = "button";
+      open.title = "open the full session list with each session's transcript";
+      open.addEventListener("click", () => s.p.click());
+      head.appendChild(open);
+    }
+    card.appendChild(head);
+    // the topology is the header's: this card is the session list, with the topology fault said here only while the Event graph is the header's view
+    if (tfault && I.lens === "events") card.appendChild(el("p", "k7-none err", "Topology unavailable: " + tfault));
+    if (s.fault) card.appendChild(el("p", "k7-none err", "Sessions unavailable: " + s.fault));
+    else if (!lines.length) {
+      card.appendChild(el("p", "k7-none", K7_NONE_SESSIONS));
+      // an empty graph that could not read a source says so beside the empty line, never in place of it
+      const q = TV && ts && ts.data && ts.data.topology ? TV.quietLine(ts.data.topology) : null;
+      if (q) card.appendChild(q);
+      card.classList.add("k7-lone");
+    } else { const body = el("div", "k7-srows"); for (const ln of lines) body.appendChild(k7Row(ln, now)); card.appendChild(body); }
+    // Lost if closed (F12c): its own panel, right of the card from 1440 px, below it under that; drawn whenever the topology feed is
+    let lost = null;
+    try { if (TV && TV.renderLost) lost = tfault ? TV.renderLostFault(tfault) : tv ? TV.renderLost(tv) : null; } catch (e) { lost = null; }
+    const wrap = el("div", "k7-sess-wrap" + (lost ? " k7-has-lost" : ""));
+    wrap.appendChild(card);
+    if (lost) wrap.appendChild(lost);
+    sec.replaceChildren(k7Heading("Sessions", "Who is working right now, and how much room they have left."), wrap);
+    tintRepos();
+  }
+  // "Results & edits": the Work zone's own heading, shown on Build only, and the one line a Results card says when no job has
+  // ever been recorded (the jobs panel is optional: an install with none has no card to say so)
+  function paintBuildZone() {
+    const zone = document.querySelector('.ck-zone[data-zone="operate"]');
+    if (!zone) return;
+    const head = zone.querySelector(".zone-head");
+    if (head && !head.querySelector(".k7-zt")) {
+      const t = el("div", "zone-title k7-zt", "Results & edits");
+      const g = el("span", "zone-gloss k7-zg", "What the sessions produced.");
+      head.append(t, g);
+    }
+    const grid = zone.querySelector(".ck-zgrid");
+    if (grid && grid.querySelector('[data-ck-panel="jobs"]')) for (const old of grid.querySelectorAll(".k7-results-none")) old.remove();   // a real Results card replaces the placeholder
+    if (grid && !grid.querySelector('[data-ck-panel="jobs"]') && !grid.querySelector(".k7-results-none")) {
+      const p = el("div", "panel ck-dash k7-results-none");
+      p.dataset.ckPanel = "jobs-none";
+      p.dataset.modes = "build";
+      const h = el("div", "phead");
+      h.appendChild(el("h2", null, "Results"));
+      p.append(h, el("div", "pbody", K7_NONE_RESULTS));
+      grid.appendChild(p);
+    }
+  }
+  function paintBuild() {
+    try { paintHeaderLens(); paintBuildSessions(); paintBuildZone(); } catch (e) { /* a Build tab that cannot paint leaves the page as the tiles drew it */ }
+  }
+
+  // The glance is a compact strip (one bordered row of equal tiles) whenever fewer than four tiles show; four or more are full
+  // tiles. A zone's grid is told which of its columns have a card on this tab, and a card that would sit alone in a row of a wider grid
+  // is stretched to the row: a lone card never leaves a hole beside it. Measured after layout, so it is redone on every tab change.
+  function layoutGrid(g) {
+    for (const p of g.querySelectorAll(".panel[data-stretch]")) delete p.dataset.stretch;
+    const cols = Array.from(g.querySelectorAll(":scope > .ck-col"));
+    let live = 0;
+    for (const c of cols) {
+      const on = Array.from(c.querySelectorAll(".panel")).some(shown);
+      c.classList.toggle("ck-col-off", !on);
+      if (on) live++;
+    }
+    if (cols.length) g.dataset.cols = String(live);
+    const flat = (p) => p.parentElement === g || (p.parentElement.classList.contains("ck-col") && getComputedStyle(p.parentElement).display === "contents");
+    const rows = new Map();
+    for (const p of g.querySelectorAll(".panel")) {
+      if (!shown(p) || !flat(p)) continue;
+      const r = p.getBoundingClientRect();
+      const k = Math.round(r.top);
+      if (!rows.has(k)) rows.set(k, []);
+      rows.get(k).push([p, r.width]);
+    }
+    const full = g.clientWidth;
+    for (const row of rows.values()) if (row.length === 1 && row[0][1] < full * 0.9) row[0][0].dataset.stretch = "1";
+  }
+  const MIN_TILE_PX = 200;
   function fillGrids() {
     if (typeof getComputedStyle !== "function") return;   // a harness without layout
     markEmptyCards();
     tintRepos();
+    paintBuild();
     for (const w of document.querySelectorAll(".ck-widgets")) {
       const n = Array.from(w.children).filter(shown).length;
-      w.style.setProperty("--ck-n", String(Math.max(4, n)));
+      // more than four tiles wrap into rows of at most four (6 -> 3 x 2), whatever the tab: a tile never shares a row so narrow it clips its text
+      let cols = n > 4 ? (n % 3 === 0 ? 3 : 4) : Math.max(4, n);
+      // the Board draws the same separate cards as Morning (Phill 10-22: the Board-only strip, K2 r2 3d5c8660, clipped every sub-row)
+      const shape = n < 4 ? "strip" : "tiles";
+      // ...and never so many that a tile is narrower than MIN_TILE_PX: the 720px rule covers the phone, this covers the half-screen laptop in between
+      const room = w.clientWidth;
+      w.dataset.shape = shape;   // before the gap is read: only the tiles shape is a grid with a gap
+      // the grid's column gap is room no tile gets: c columns need c * MIN_TILE_PX + (c - 1) * gap
+      const gap = parseFloat(getComputedStyle(w).columnGap) || 0;
+      if (shape === "tiles" && room > 0) {
+        const fit = Math.max(2, Math.floor((room + gap) / (MIN_TILE_PX + gap)));
+        cols = Math.max(2, Math.min(cols, fit));
+        // P1: never leave a lone tile in the last row (n % cols === 1): take an exact divisor of n in 5..3 that fits, else the
+        // largest column count in 5..2 that fits and leaves no lone tile (4 tiles -> one row of 4, or 2 x 2 where only three fit;
+        // 5 -> one row of 5, 6 -> 3 x 2, 7 -> 4 + 3)
+        if (n >= 4) {
+          let pick = 0;
+          for (let c = Math.min(5, fit); c >= 3 && !pick; c--) if (n % c === 0) pick = c;
+          for (let c = Math.min(5, fit); c >= 2 && !pick; c--) if (n % c !== 1) pick = c;
+          if (pick) cols = pick;
+        }
+      }
+      w.style.setProperty("--ck-n", String(cols));
+      w.dataset.shape = shape;
+      w.dataset.n = String(n);
+      const tiles = Array.from(w.children).filter(shown);
+      for (const t of tiles) delete t.dataset.last;
+      if (tiles.length % 2 === 1) tiles[tiles.length - 1].dataset.last = "1";   // the narrow page is two across: an odd one out takes the row
     }
+    for (const g of document.querySelectorAll(".ck-zgrid")) layoutGrid(g);
   }
   function typing(t) { return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable); }
   function visibleFilters() {
@@ -1814,11 +2530,13 @@
     const choose = (it) => {
       close();
       if (it.kind === "panel") {
-        // a panel the current mode hides is reached through Board, which shows every panel
-        if (document.body.dataset.mode && (it.node.dataset.modes || "").split(" ").indexOf(document.body.dataset.mode) < 0) applyMode("board");
+        // a panel the current tab hides is reached through the first tab that shows it
+        revealTab(it.node);
         if (it.node.ckShowTab) it.node.ckShowTab();
         it.node.scrollIntoView({ block: "start" }); it.node.setAttribute("tabindex", "-1"); it.node.focus({ preventScroll: true }); return; }
-      applyMode("board");
+      // a row in a panel on another tab (crystals, a Memory section, an episode list) is reached through that panel's tab, the same way
+      revealTab(it.state.p);
+      if (it.state.p.ckShowTab) it.state.p.ckShowTab();
       it.state.setQuery(it.q, true);
       it.state.p.scrollIntoView({ block: "start" });
       if (it.state.filterInput) it.state.filterInput.focus();
@@ -1850,13 +2568,28 @@
   }
 
   function install() {
-    applyMode(saved(MODE_KEY) || "board");
+    // the address wins over the tab kept for this browser tab; an unknown fragment falls back to the kept one, then Board
+    applyMode(hashMode() || saved(MODE_KEY) || "board");
+    setTheme(queryTheme() || storedTheme(), false);
+    if (root.matchMedia) { const mq = root.matchMedia("(prefers-color-scheme: light)"); if (mq.addEventListener) mq.addEventListener("change", paintThemeSwitch); }
+    if (typeof root.addEventListener === "function") root.addEventListener("hashchange", () => { const m = hashMode(); if (m) applyMode(m); });
+    document.addEventListener("click", (ev) => {
+      const b = ev.target && ev.target.closest ? ev.target.closest("[data-theme-set]") : null;
+      if (b) setTheme(b.dataset.themeSet, true);
+    });
+    document.addEventListener("click", (ev) => {
+      if (!(ev.target && ev.target.closest && ev.target.closest("[data-layout-reset]"))) return;
+      const D = root.LevainDashboard;
+      if (D && D.hasUnsavedEdit && D.hasUnsavedEdit()) return;   // the gate comes before the write: a draft or a running job keeps the layout as it is
+      resetLayout();
+      if (D && D.redraw) root.LevainDashboard.redraw();
+    });
     let fillTimer = 0;
     if (typeof root.addEventListener === "function") root.addEventListener("resize", () => { root.clearTimeout(fillTimer); fillTimer = root.setTimeout(fillGrids, 120); });
     document.addEventListener("click", (ev) => {
       const t = ev.target && ev.target.closest ? ev.target.closest("[data-mode-tab],#jumpbtn") : null;
       if (!t) return;
-      if (t.id === "jumpbtn") openJump(); else applyMode(t.dataset.modeTab);
+      if (t.id === "jumpbtn") openJump(); else applyMode(t.dataset.modeTab, true);
     });
     // a filter keeps focus through a re-render until the operator goes somewhere else
     document.addEventListener("mousedown", (ev) => { if (!(ev.target && ev.target.closest && ev.target.closest(".xfilter"))) focusKeep = null; });
@@ -1878,7 +2611,7 @@
         const onScreen = r.bottom > 0 && r.top < (root.innerHeight || document.documentElement.clientHeight);
         near.focus(onScreen ? { preventScroll: true } : undefined);
         near.select();
-      } else if (ev.key.length === 1 && "123".indexOf(ev.key) >= 0) applyMode(MODES["123".indexOf(ev.key)]);
+      } else if (ev.key.length === 1 && "1234".indexOf(ev.key) >= 0) applyMode(MODES["1234".indexOf(ev.key)], true);
     });
   }
   if (typeof document !== "undefined") {
@@ -1886,7 +2619,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids });
+  Object.assign(K, { paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

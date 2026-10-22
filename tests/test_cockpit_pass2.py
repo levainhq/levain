@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime as d
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -48,26 +49,34 @@ def _page(tmp_path: Path, steps: list[dict]) -> list:
 
 
 @needs_browser
-def test_the_phone_header_leads_with_the_nav_and_centres_its_buttons(tmp_path: Path) -> None:
-    vals = _page(tmp_path, [{"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, {"until": "document.querySelector('.hero .seg') && document.querySelector('.hero .clock') && document.querySelector('.hero .indicators button')"}, {"eval": """(() => {
-      const top = (s) => document.querySelector(s).getBoundingClientRect().top, box = (e) => e.getBoundingClientRect();
-      const seg = document.querySelector('.hero .seg'), btns = [...document.querySelectorAll('.hero .indicators button')];
-      const l = Math.min(...btns.map(b => box(b).left)), r = Math.max(...btns.map(b => box(b).right));
-      return { segTop: top('.hero .seg'), clockTop: top('.hero .clock'), segShare: box(seg).width / innerWidth, mid: (l + r) / 2, vw: innerWidth, sw: document.documentElement.scrollWidth }; })()"""}])
+def test_the_phone_bar_is_two_rows_with_the_tabs_across_the_width(tmp_path: Path) -> None:
+    """K2 r2 (L2-9): brand, status dot, Sync and the theme switch on one row, the four tabs across the width on the next; no horizontal scroll."""
+    vals = _page(tmp_path, [{"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, {"until": "document.querySelector('.masthead .seg') && document.querySelector('.band .clock') && document.querySelector('.masthead .indicators button')"}, {"eval": """(() => {
+      const box = (e) => e.getBoundingClientRect(), q = (s) => document.querySelector(s);
+      const bar = q('.masthead'), seg = q('.masthead .seg'), theme = q('.masthead .themesw'), brand = q('.masthead .brand');
+      return { segTop: box(seg).top, clockTop: box(q('.band .clock')).top, segShare: box(seg).width / innerWidth, barH: box(bar).height,
+        oneRow: Math.abs(box(theme).top - box(brand).top) < 24 && box(theme).bottom < box(seg).top, sw: document.documentElement.scrollWidth, vw: innerWidth }; })()"""}])
     got = vals[2]
-    assert got["segTop"] < got["clockTop"] and got["segShare"] > 0.85 and abs(got["mid"] - got["vw"] / 2) < 8 and got["sw"] <= got["vw"], got
+    assert got["segTop"] < got["clockTop"] and got["segShare"] > 0.85 and got["oneRow"] and got["barH"] < 150 and got["sw"] <= got["vw"], got
 
 
 @needs_browser
 def test_an_empty_card_with_no_compose_box_is_a_full_width_bar_after_its_zones_cards(tmp_path: Path) -> None:
-    vals = _page(tmp_path, [{"until": "document.querySelector('.ck-zgrid > .panel.ck-fold')"}, {"eval": """(() => {
-      const bars = [...document.querySelectorAll('.ck-zgrid > .panel.ck-fold')].filter(p => getComputedStyle(p).display !== 'none'); if (!bars.length) return null;
+    vals = _page(tmp_path, [{"eval": "document.querySelector('[data-mode-tab=build]').click(); 1"}, {"until": "document.querySelector('.ck-zgrid .panel.ck-fold')"}, {"eval": """(() => {
+      const bars = [...document.querySelectorAll('.ck-zgrid .panel.ck-fold')].filter(p => getComputedStyle(p).display !== 'none'); if (!bars.length) return null;
       return bars.map(b => { const g = b.parentElement, gw = g.getBoundingClientRect().width, bt = b.getBoundingClientRect().top;
-        const cards = [...g.children].filter(p => p !== b && !p.classList.contains('ck-fold') && getComputedStyle(p).display !== 'none');
-        return [b.getBoundingClientRect().width / gw, cards.every(c => c.getBoundingClientRect().bottom <= bt + 1), !!b.querySelector('.tray-dump')]; }); })()"""}])
-    assert vals[2], vals
-    for share, after_cards, has_box in vals[2]:
-        assert share > 0.95 and after_cards and not has_box, vals
+        const cards = [...g.querySelectorAll('.panel')].filter(p => p !== b && !p.classList.contains('ck-fold') && getComputedStyle(p).display !== 'none');
+        const placed = g.dataset.ckZone === 'operate' && ['jobs', 'jobs-none', 'edits', 'loops'].includes(b.dataset.ckPanel);
+        return [b.getBoundingClientRect().width / gw, cards.every(c => c.getBoundingClientRect().bottom <= bt + 1), !!b.querySelector('.tray-dump'),
+                placed, b.getBoundingClientRect().height]; }); })()"""}])
+    assert vals[3], vals
+    for share, after_cards, has_box, placed, height in vals[3]:
+        if placed:
+            # K4s ruling 10-19 (k-reviews/K7_FOLD_RULING.md): on Build, Results / edits / loops keep their designed slots (K7 grid),
+            # so an empty one stays a one-line bar IN its column and the layout does not move as data arrives
+            assert share < 0.6 and height < 90 and not has_box, vals
+        else:
+            assert share > 0.95 and after_cards and not has_box, vals
 
 
 def test_a_fire_reads_as_a_sentence_and_an_unknown_shape_is_named_as_the_store_names_it() -> None:
@@ -84,12 +93,12 @@ def test_a_fire_reads_as_a_sentence_and_an_unknown_shape_is_named_as_the_store_n
 
 @needs_browser
 def test_a_text_editor_keeps_its_own_size_when_typed_in(tmp_path: Path) -> None:
-    vals = _page(tmp_path, [{"until": "[...document.querySelectorAll('.panel')].find(p => /Operator · Identity/.test((p.querySelector('h2') || {}).textContent || ''))"}, {"eval": """(() => {
+    vals = _page(tmp_path, [{"eval": "document.querySelector('[data-mode-tab=memory]').click(); 1"}, {"until": "[...document.querySelectorAll('.panel')].find(p => /Operator · Identity/.test((p.querySelector('h2') || {}).textContent || ''))"}, {"eval": """(() => {
       const card = [...document.querySelectorAll('.panel')].find(p => /Operator · Identity/.test((p.querySelector('h2') || {}).textContent || ''));
       card.querySelector('.edit-btn').click(); const ta = card.querySelector('.text-editor textarea');
       const before = ta.offsetHeight; ta.value = Array.from({length: 60}, (_, i) => 'line ' + i).join('\\n'); ta.dispatchEvent(new Event('input', {bubbles: true}));
       return { before, after: ta.offsetHeight, inline: ta.style.height }; })()"""}])
-    got = vals[2]
+    got = vals[3]
     assert got["before"] > 0 and got["after"] == got["before"] and got["inline"] == "", got
 
 
@@ -110,12 +119,12 @@ def test_project_colour_is_the_product_with_no_variant_switch_and_no_repo_of_its
       const root = getComputedStyle(document.documentElement);
       const stripe = document.querySelector('.ck-card.w[data-ck-panel="decisions"], .ck-card.w[data-ck-panel="memory"]');
       const k = window.LevainSky ? window.LevainSky.hueKey : null;
-      return { variantAttr: document.documentElement.dataset.variant || '', slots: [1, 2, 3, 4, 5].map(i => !!root.getPropertyValue('--hue-' + i).trim()),
-        stripeH: stripe ? getComputedStyle(stripe, '::before').height : '', tags: document.querySelectorAll('.rp-tag').length,
+      return { variantAttr: document.documentElement.dataset.variant || '', slots: [1, 2, 3, 4, 5, 6, 7, 8].map(i => !!root.getPropertyValue('--hue-' + i).trim()),
+        stripe: stripe ? getComputedStyle(stripe, '::before').content : '', tags: document.querySelectorAll('.rp-tag').length,
         hues: k ? ['alpha', 'Alpha', 'my-app', 'x'.repeat(300), '', null].map(k) : [] }; })()"""}])
     got = vals[2]
-    assert got["variantAttr"] == "" and all(got["slots"]) and got["stripeH"] == "2px" and got["tags"] == 0, got
-    assert got["hues"][0] == got["hues"][1] and all(h in "12345" and h for h in got["hues"][:4]) and got["hues"][4:] == ["", ""], got
+    assert got["variantAttr"] == "" and all(got["slots"]) and got["stripe"] == '""' and got["tags"] == 0, got
+    assert got["hues"][0] == got["hues"][1] and all(isinstance(h, str) and re.fullmatch(r"[1-8]", h) for h in got["hues"][:4]) and got["hues"][4:] == ["", ""], got
 
 
 # Phill 10-15: "there is no reason a public package should have my personal dealings in it". The names are held as hash
