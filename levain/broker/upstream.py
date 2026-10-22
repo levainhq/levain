@@ -26,7 +26,7 @@ import asyncio
 import ipaddress
 import logging
 import ssl
-from typing import Any, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, List, NamedTuple, Optional, Tuple
 
 import h11
 
@@ -210,6 +210,20 @@ async def _connect(addr: str, port: int) -> Tuple[Any, Any]:
     return await asyncio.open_connection(addr, port, limit=LIMIT)
 
 
+def _resume_or_lost(resume: Callable[[], None]) -> Callable[[], None]:
+    """The TLS transport's `resume_reading`, which the reader calls, made a no-op once the connection is lost. 3.9's
+    TLS transport resumes through its socket transport, which is None once the connection is lost (AttributeError),
+    and `StreamReader.read` resumes only AFTER taking the bytes out of its buffer, so the raise lost them: a peer's
+    close_notify landing while the reader was paused cut the body short. A lost connection has nothing to resume.
+    `pause_reading` needs no guard: the reader pauses only inside `data_received`, while the connection is live."""
+    def resume_reading() -> None:
+        try:
+            resume()
+        except AttributeError:
+            pass
+    return resume_reading
+
+
 async def _handshake(addr: str, port: int, host: str) -> Tuple[Any, Any, Any]:
     """TLS on `_connect`'s connection, returning `(reader, writer, plain_writer)`; called ONLY by `open_exchange` and
     `refresh_post`. One `try` spans the whole ownership interval, from the transport `_connect` returns to the return
@@ -223,6 +237,7 @@ async def _handshake(addr: str, port: int, host: str) -> Tuple[Any, Any, Any]:
         proto = asyncio.StreamReaderProtocol(reader)
         tls = await loop.start_tls(plain_writer.transport, proto, _tls_context(), server_hostname=host,
                                    ssl_handshake_timeout=CONNECT_TIMEOUT_S)
+        tls.resume_reading = _resume_or_lost(tls.resume_reading)
         proto.connection_made(tls)   # 3.9's start_tls never calls it: without it the reader has no transport to pause
         writer = asyncio.StreamWriter(tls, proto, reader, loop)
     except BaseException:
