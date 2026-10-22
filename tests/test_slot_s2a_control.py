@@ -9,6 +9,7 @@ import shutil
 import socket
 import struct
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -525,7 +526,8 @@ def test_lease_eof_revokes_lease_live_first(env):
 
 
 def test_lease_eof_meets_held_lock(env):
-    """EOF while another holder has the session lock: nothing is dropped; REVOKED lands once it frees."""
+    """EOF while another holder has the session lock: the revoke is never given up, and REVOKED lands once it frees.
+    keys hears the drop at the first failed attempt (group L3 r1, complement MED 1) and again after REVOKED."""
     op, root = attach(env)
     holder = env.store.lock(S1)
     holder.__enter__()
@@ -537,14 +539,14 @@ def test_lease_eof_meets_held_lock(env):
         time.sleep(0.2)                                    # several retry rounds pass
         rec = env.record(S1)
         assert (rec.state, rec.lease_live, rec.generation) == ("ALLOCATED", True, 0)
-        assert ("drop", S1) not in env.seams.calls
+        assert env.seams.calls.count(("drop", S1)) == 1                # the early drop, while the lock is held
         assert cas(root, S1, 0, "ALLOCATED", "RENDERING")["refused"] == "locked"
     finally:
         holder.__exit__(None, None, None)
     env.control.join_eof(5)
     rec = env.record(S1)
     assert (rec.state, rec.lease_live, rec.generation) == ("REVOKED", False, 2)
-    assert env.seams.calls.count(("drop", S1)) == 1
+    assert env.seams.calls.count(("drop", S1)) == 2
 
 
 def test_mint_refused_after_lease_eof(env):
@@ -749,3 +751,32 @@ def test_control_restart_ends_sessions_retained(env):
     root = env.client("root")
     assert root.ask("SECRETS", session=S2)["refused"] == "lease-dead"
     assert env.control.handles(S2) is None
+
+
+def test_lease_eof_drops_at_keys_while_the_revoke_cannot_land(env):
+    """Group L3 r1 (complement MED 1), reproduced first (``1022-8/g1fix/item4_repro_before.txt``): a lease EOF dropped
+    CONTROL's handles at once, but keys heard nothing until REVOKED was durable, so while the store write kept failing
+    keys kept the token cached and live exchanges kept injecting the credential. Now the revoke's first failed attempt
+    sends ``DROP-SESSION`` (idempotent) on its own thread; the drop after the durable REVOKED still follows."""
+    op, root = to_rendered(env)
+    real_put = env.store.put
+    failing = threading.Event()
+    failing.set()
+
+    def put(rec):
+        if failing.is_set():
+            raise OSError(28, "No space left on device")
+        real_put(rec)
+
+    env.store.put = put
+    env.seams.calls.clear()
+    op.close()
+    deadline = time.time() + 3
+    while time.time() < deadline and ("drop", S1) not in env.seams.calls:
+        time.sleep(0.01)
+    rec = env.record(S1)
+    assert rec.state == "RENDERED"                                     # the revoke has not landed
+    assert ("drop", S1) in env.seams.calls                             # keys heard it anyway
+    failing.clear()
+    rec = settle(env, S1, "REVOKED")
+    assert env.seams.calls[-2:] == [("wake",), ("drop", S1)]           # the durable path's own drop still runs
