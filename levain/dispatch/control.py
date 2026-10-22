@@ -24,7 +24,9 @@ refused by every other, however the two are pinned. The ACTIVE configuration is 
 The TRUST ROOT is a key fingerprint pinned once, at setup (:meth:`ControlStore.init`), and only when the authority
 log shows it as a key that may sign configuration: enrolled, not revoked, of a class that covers
 :data:`CONFIG_TIER` (configuration widens what runs, a laptop-only act, so a display-phone key never signs it) and
-held at a stated presence custody (never a passkey, never ``unstated``). The same test applies on every
+held at a stated presence custody (never a passkey, never ``unstated``), the custody its key material shows
+(:func:`levain.consent.passkey.custody_mismatch`: WebAuthn material stored at custody ``fido`` is still a passkey,
+and refused). The same test applies on every
 verification. A second init naming another fingerprint is refused. A signature by any other enrolled key, however
 strong its class, is refused: the pin is the root, not the class.
 
@@ -217,6 +219,11 @@ def _root_problem(snapshot: Any, trust_root: str) -> str | None:
         return "the trust root is not an enrolled key"
     if not key.active:
         return "the trust root's key is revoked"
+    from levain.consent.passkey import custody_mismatch
+
+    problem = custody_mismatch(key.public_key, key.custody)
+    if problem is not None:
+        return problem
     if key.custody == PASSKEY:
         return "the trust root is a passkey; configuration is signed on the laptop"
     if not class_covers(key.key_class, CONFIG_TIER):

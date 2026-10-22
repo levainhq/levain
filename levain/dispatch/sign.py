@@ -114,6 +114,19 @@ def reason_problem(reason: Any) -> str | None:
     return None
 
 
+def _passkey_problem(signature: str, key: Any) -> str | None:
+    """A passkey's WebAuthn checks that ssh-keygen does not make (user verification, the page's origin), picked by
+    ``key``'s stored custody once that custody is held equal to the one its key material shows: the consent path's
+    checks (:func:`levain.consent.passkey.custody_mismatch`, ``answer_signature_problem``), so the two paths hold a
+    passkey to one rule."""
+    from levain.consent.passkey import answer_signature_problem, custody_mismatch
+
+    problem = custody_mismatch(key.public_key, key.custody)
+    if problem is None and key.custody == PASSKEY:
+        problem = answer_signature_problem(signature, key.public_key)
+    return problem
+
+
 def refusal(payload: Any, signature: Any, authority: AuthoritySnapshot, job: SignableJob, *,
             ssh_keygen: Path | str | None = None) -> str | None:
     """Why ``payload``/``signature`` is not the operator's signature over ``job`` under ``authority``; ``None``
@@ -157,14 +170,9 @@ def refusal(payload: Any, signature: Any, authority: AuthoritySnapshot, job: Sig
         return "the contract signature is empty"
     if len(signature) > SIGNATURE_MAX:
         return f"the contract signature is over {SIGNATURE_MAX} characters"
-    if key.custody == PASSKEY:
-        # a passkey's WebAuthn checks that ssh-keygen does not make (user verification, the page's origin): the
-        # consent path's passkey check is called here so the two paths hold a passkey to one rule
-        from levain.consent.passkey import answer_signature_problem
-
-        problem = answer_signature_problem(signature, key.public_key)
-        if problem is not None:
-            return problem
+    problem = _passkey_problem(signature, key)
+    if problem is not None:
+        return problem
     try:
         message = sign_message(payload)
     except (TypeError, ValueError) as exc:
@@ -219,12 +227,9 @@ def cancel_refusal(payload: Any, signature: Any, authority: AuthoritySnapshot, j
         return "the cancel signature is empty"
     if len(signature) > SIGNATURE_MAX:
         return f"the cancel signature is over {SIGNATURE_MAX} characters"
-    if key.custody == PASSKEY:
-        from levain.consent.passkey import answer_signature_problem
-
-        problem = answer_signature_problem(signature, key.public_key)
-        if problem is not None:
-            return problem
+    problem = _passkey_problem(signature, key)
+    if problem is not None:
+        return problem
     try:
         message = sign_message(payload)
     except (TypeError, ValueError) as exc:
