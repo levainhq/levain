@@ -152,7 +152,7 @@ def test_partial_setup_reruns(host):
         if s.argv and Path(s.argv[0]).name == "mkdir" and "-p" not in s.argv:
             assert s.skip_if, s.why
         if s.argv and Path(s.argv[0]).name == "mv":
-            assert s.skip_if or s.argv[-2].endswith("levain.new"), s.why
+            assert s.skip_if or s.argv[-2].endswith(("levain.new", "h11.new")), s.why
         if s.write and s.write[1] == "":            # an empty file row (a lock): never replaced under a holder
             assert s.skip_if[-2:] == ("-e", str(s.write[0])), s.why
     # what an interrupted run made at an out-of-range id is not ours to keep

@@ -198,7 +198,7 @@ def test_operator_record_written_last_and_removed_last(host):
 #: CONTRACT §1.2's table, typed out: the test's oracle is the contract, not the module.
 TABLE = {
     "levain-slots": "every slot account (s, v, c)",
-    "levain-gwfronts": "every gw",
+    "levain-gwfronts": {"_levain_gw0", "_levain_gw1", "_levain_gw2", "_levain_keys"},   # every gw, and keys (E12)
     "levain-control": {"OP", "_levain_keys", "_levain_qbroker", "_levain_dispatch"},
     "levain-wake": {"_levain_control"},
     "levain-lineage": {"_levain_dispatch"},
@@ -215,7 +215,7 @@ def test_slot_groups_exact(host):
     assert set(members) == set(TABLE) == set(SHARED_GROUPS)
     slots = {f"_levain_{p}{i}" for p in "s" for i in range(3)} | {f"_levain_{p}{i}" for p in "vc" for i in range(2)}
     assert members["levain-slots"] == slots
-    assert members["levain-gwfronts"] == {f"_levain_gw{i}" for i in range(3)}
+    assert members["levain-gwfronts"] == {f"_levain_gw{i}" for i in range(3)} | {"_levain_keys"}
     for g, want in TABLE.items():
         if isinstance(want, set):
             assert members[g] == {OP if x == "OP" else x for x in want}, g
