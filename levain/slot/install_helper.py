@@ -30,6 +30,8 @@ from levain.slot import Refused, bwrap, netns, pf, root_tree, units
 from levain.slot import proc as PR
 from levain.slot import records as R
 from levain.slot import runtime_helper as RH
+from levain.slot import store_verbs as SV
+from levain.slot.root_intent import PhaseFailed
 from levain.slot.intent import INTENT_PATH, Intent, install_lock, intent_remove_step, intent_write_step, read_intent
 from levain.slot.accounts import (SLOT_MARKER, SLOT_RETIRED_MARKER, Account, Group, account_steps, accounts_of,
                                   delete_group_steps, membership_pairs, membership_steps, revive_steps,
@@ -195,7 +197,7 @@ def check_tools(facts: HostFacts, steps: Sequence[Step], *, verb: str, python: b
 
 
 #: The verbs :func:`main` applies; every other verb of the §5.2 grammar answers ``verb-unbuilt:<verb>``.
-BUILT_VERBS = ("setup", "undo", "replenish")
+BUILT_VERBS = ("setup", "undo", "replenish", "purge")
 
 
 def helper_pending() -> tuple[str, ...]:
@@ -1138,6 +1140,37 @@ def _host() -> HostOS:
         raise Refused("unsupported-host", str(e)) from None
 
 
+def run_purge(session: str, caller_uid: int, host: HostOS, *, store_seams: RH.Seams | None = None,
+              verb_seams: Callable[[SV.Cas], SV.StoreSeams] | None = None) -> dict[str, object]:
+    """``purge <session>`` (CONTRACT §5.2, §7.4; DESIGN §4.6): the operator's forced purge of a TRASH session, whatever
+    its age. The alloc is read as the runtime helper reads the store; a caller who is not its ``operator_uid`` learns
+    nothing (``no-session``). The verb is :func:`levain.slot.store_verbs.purge` with ``forced``; its CAS goes to
+    CONTROL. A purge that stops part-way keeps its journal, which the reaper finishes: refused
+    ``purge-incomplete:<phase>``. ``verb_seams``: a test's store-verb seams around the CAS (default: real ones)."""
+    rs = store_seams or RH.Seams(host=host)
+    store = RH.Store(rs)
+    ctx = None
+    try:
+        data = store.read(("alloc",), f"{session}.json")
+        if data is None:
+            raise Refused("no-session", session)
+        a = R.parse_alloc(data)
+        if a.session != session or a.operator_uid != caller_uid:
+            raise Refused("no-session", session)
+        ctx = RH.Ctx(rs, store, caller_uid, RH.OPERATOR, a.operator_uid, {})
+        cas = SV.control_cas(ctx, session)
+        seams = verb_seams(cas) if verb_seams is not None else SV.StoreSeams(cas=cas)
+        try:
+            state = SV.purge(SV.facts_from_alloc(a, rs.L), seams, forced=True)
+        except PhaseFailed as e:
+            raise Refused(f"purge-incomplete:{e.phase}", str(e.cause)) from None
+    finally:
+        if ctx is not None:
+            ctx.close()
+        store.close()
+    return {"verb": "purge", "session": session, "state": state}
+
+
 @dataclass
 class Seams:
     """Every act :func:`main` takes that a unit test cannot take as a non-root user, with its real default."""
@@ -1148,6 +1181,7 @@ class Seams:
     gather: Callable[[InstallCommand, HostOS, int], Gathered] = gather_facts
     plan: Callable[[InstallCommand, Gathered], InstallPlan] = plan_for
     apply: Callable[[InstallPlan, TextIO], Optional[str]] = apply_steps
+    purge: Callable[[str, int, HostOS], dict] = run_purge
 
 
 def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextIO) -> dict[str, object]:
@@ -1162,6 +1196,11 @@ def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextI
         raise Refused(f"verb-unbuilt:{cmd.verb}", cmd.verb)
     caller_uid = RH._sudo_uid(env)
     host = seams.host()
+    if cmd.verb == "purge":
+        # A store verb, not a host plan: no account read, no pool hold (a live lease does not refuse it, §5.2); the
+        # install lock still keeps an undo of the store out from under it.
+        with seams.lock(host):
+            return seams.purge(cmd.session, caller_uid, host)   # type: ignore[arg-type]
     with seams.lock(host):
         gathered = seams.gather(cmd, host, caller_uid)
         try:
@@ -1209,7 +1248,7 @@ INSTALL_ENTRY_ENV = ("SUDO_UID",)
 
 
 __all__ = ["BUILT_VERBS", "INSTALL_ENTRY_ENV", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
-           "apply_steps", "check_account_ids", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
+           "apply_steps", "check_account_ids", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",
            "plan_for", "plan_replenish", "plan_setup", "plan_tools", "plan_undo", "pool_lock", "preflight", "Quiesce",
            "quiesce_step",

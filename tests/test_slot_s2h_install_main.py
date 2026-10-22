@@ -118,7 +118,7 @@ def test_refusals_before_the_lock_read_nothing():
 
 
 @pytest.mark.parametrize("argv", [["repair"], ["set-retention", "30"], ["set-dispatch-retain", "3"], ["set-ceiling"],
-                                  ["set-signers"], ["purge", S1], ["force-retire", "egress", "0"]])
+                                  ["set-signers"], ["force-retire", "egress", "0"]])
 def test_unbuilt_verbs_refuse_by_name_before_the_lock(argv):
     o = _Order()
     rc, out, _ = _main(argv, o.seams())
@@ -145,13 +145,19 @@ def test_an_unexpected_error_is_internal_exit_70():
 @pytest.mark.parametrize("verb", ["setup", "undo", "replenish", "purge", "force-retire"])
 def test_install_verbs_refuse_with_live_lease(verb):
     """CONTRACT §5.2 through main: every built verb refuses ``live-lease`` before any step; ``purge`` and
-    ``force-retire`` are lease-exempt and not built (session 5), so they answer ``verb-unbuilt``."""
+    ``force-retire`` are lease-exempt: ``purge`` (built, session 5e) runs under the install lock with no host
+    plan gathered, ``force-retire`` is not built and answers ``verb-unbuilt``."""
     argv = {"setup": SETUP, "purge": ["purge", S1], "force-retire": ["force-retire", "egress", "0"]}.get(verb, [verb])
     facts = _facts("linux", live_leases=1) if verb == "setup" else _set_up("linux", live_leases=1)
     o = _Order(facts)
     o.plan = lambda cmd, g: _PLAN(cmd, Gathered(g.facts, live={"egress": (0,), "none": (0,)}))
-    rc, out, _ = _main(argv, o.seams("linux"))
-    want = f"verb-unbuilt:{verb}" if verb in ("purge", "force-retire") else "live-lease"
+    seams = o.seams("linux")
+    seams.purge = lambda s, uid, host: {"verb": "purge", "session": s, "state": "PURGED"}
+    rc, out, _ = _main(argv, seams)
+    if verb == "purge":
+        assert rc == 0 and o.calls == ["lock", "unlock"]
+        return
+    want = "verb-unbuilt:force-retire" if verb == "force-retire" else "live-lease"
     assert (rc, out) == (1, f'{{"ok":false,"refused":"{want}"}}\n')
     assert "apply" not in o.calls
 

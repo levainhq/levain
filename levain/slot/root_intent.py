@@ -22,7 +22,7 @@ import secrets
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Collection, Mapping
 
 from levain.contracts import ContractError, canon
 from levain.slot import Refused, write_all
@@ -30,8 +30,9 @@ from levain.slot.grammar import SESSION_RE
 
 ROOT_INTENT_FORMAT = "levain-root-intent/1"
 
-# CONTRACT §7.4's table. discard / restore / purge are listed so a journal session 5 writes parses
-# by name here; their steps are session 5's, so reconciling one refuses `intent-unbuilt`.
+# CONTRACT §7.4's table. END's two intents (retain, park) are reconciled by END under its slot proofs; the store
+# verbs' three (discard, restore, purge) by the store verbs under the session lock. Each reconciler
+# names the intents it finishes, and a journal of the other's refuses `intent-unbuilt` there, untouched.
 INTENT_PHASES: Mapping[str, tuple[str, ...]] = {
     "retain": ("init", "manifest", "meta", "object", "tree", "commit"),
     "park": ("move", "commit"),
@@ -42,7 +43,9 @@ INTENT_PHASES: Mapping[str, tuple[str, ...]] = {
 #: The state each intent CASes after its last step (CONTRACT §7.3, §7.4).
 TARGET_STATE: Mapping[str, str] = {"retain": "RETAINED", "park": "CREDENTIAL_PARKED", "discard": "TRASH",
                                    "restore": "RETAINED", "purge": "PURGED"}
-BUILT_INTENTS = ("retain", "park")
+END_INTENTS = ("retain", "park")
+STORE_INTENTS = ("discard", "restore", "purge")
+BUILT_INTENTS = END_INTENTS + STORE_INTENTS
 
 TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")   # CONTRACT header
 # DECISION: a journal is four short fields; a file past this is not one, refused before it is parsed.
@@ -328,21 +331,23 @@ def begin(path: Path, plan: Plan, *, started_at: str, cas: Cas, forced: bool | N
 
 def reconcile(path: Path, plan_for: Callable[[RootIntent], Plan], *, cas: Cas, fault: Fault = _no_fault,
               retry: Retry = _direct,
-              owner_ok: Callable[[os.stat_result], bool] = _root_owned) -> RootIntent | None:
+              owner_ok: Callable[[os.stat_result], bool] = _root_owned,
+              intents: Collection[str] = END_INTENTS) -> RootIntent | None:
     """Finish the journal at ``path`` FORWARD from its recorded phase; ``None`` when there is none.
     ``plan_for`` builds the intent's plan from alloc-derived facts (CONTRACT §7.1: every path root
-    uses derives from alloc); an intent whose steps are not built here refuses ``intent-unbuilt``
-    and nothing is touched. Returns the journal it finished."""
+    uses derives from alloc); an intent not in ``intents`` (the caller's own: END's by default, the
+    store verbs pass theirs) refuses ``intent-unbuilt`` before any plan is built, and nothing is
+    touched. Returns the journal it finished."""
     ri = read_root_intent(path, owner_ok=owner_ok)
     if ri is None:
         return None
-    if ri.intent not in BUILT_INTENTS:
-        raise Refused("intent-unbuilt", f"{ri.intent} is session 5's")
+    if ri.intent not in intents:
+        raise Refused("intent-unbuilt", f"{ri.intent} is not reconciled by this caller")
     run_from(path, plan_for(ri), ri, cas=cas, fault=fault, retry=retry)
     return ri
 
 
-__all__ = ["BUILT_INTENTS", "Cas", "INTENT_PHASES", "MAX_INTENT_BYTES", "Phase", "PhaseFailed", "Plan",
+__all__ = ["BUILT_INTENTS", "Cas", "END_INTENTS", "INTENT_PHASES", "STORE_INTENTS", "MAX_INTENT_BYTES", "Phase", "PhaseFailed", "Plan",
            "ROOT_INTENT_FORMAT", "RootIntent", "TARGET_STATE", "TIMESTAMP_RE", "atomic_write", "begin",
            "delete_root_intent", "fsync_dir", "intent_bytes", "intent_path", "parse_root_intent",
            "is_temp_of", "pending_sessions", "read_root_intent", "reconcile", "run_from", "sweep_temps",
