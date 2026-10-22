@@ -16,7 +16,7 @@ import pytest
 from levain.cockpit.consent import utc_stamp
 from levain.dispatch.contract import PathEntry, ResolvedTemplate, resolve_contract
 from levain.dispatch.policy import ProviderPolicy
-from levain.dispatch.readset import BRANCH, ReadSet, ReadSetRefused, build_readset
+from levain.dispatch.readset import BRANCH, ReadSet, ReadSetRefused, build_readset, readset_commit
 from levain.slot.stage import make_bundle
 from tests.test_dispatch_verifier_report import ENTRY as VERIFIER_ENTRY
 
@@ -38,6 +38,11 @@ def git(repo: Path, *args: str) -> str:
                           env=env, timeout=30).stdout
 
 
+#: P2's shapes plus a directory that prefixes sibling blobs, one blob at two paths and two identical subtrees
+SHAPES = {"src/lib/x.py": "x\n", "src/lib.go": "go\n", "src/lib-a": "la\n", "src/d1.txt": "same\n",
+          "src/d2.txt": "same\n", "src/t1/f.py": "f\n", "src/t2/f.py": "f\n"}
+
+
 @pytest.fixture(scope="module")
 def world(tmp_path_factory):
     root = Path(os.path.realpath(tmp_path_factory.mktemp("readset")))
@@ -57,6 +62,9 @@ def world(tmp_path_factory):
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "c2")
     (repo / "src/b.py").write_text("b = 2\n")
+    for rel, body in SHAPES.items():         # tracked at base, read only by the shapes contract
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text(body)
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "c3")
     base = git(repo, "rev-parse", "HEAD").strip()
@@ -66,6 +74,13 @@ def world(tmp_path_factory):
            "expires_at": utc_stamp(NOW + timedelta(hours=2)), "repo": str(repo)}
     contract = resolve_contract(sub, resolve_template=lambda t: TEMPLATE, policy=POLICY, now=NOW)
     return root, repo, base, old_a, contract
+
+
+def json_sub(c) -> dict:
+    # the submission a contract was resolved from
+    return {"template": "fix-lint", "goal": c.goal, "read": [e.path for e in c.read], "write": [e.path for e in c.write],
+            "base": c.base, "budget": dict(c.budget), "grant": list(c.grant), "expires_at": c.expires_at,
+            "repo": c.repo}
 
 
 def dest(root: Path, name: str) -> str:
@@ -84,6 +99,13 @@ def objects(repo: str | Path) -> list[tuple[str, str]]:
 def built(world):
     root, repo, base, old_a, contract = world
     rs = build_readset(str(repo), contract, dest(root, "built"), contract_digest=contract.digest)
+    # the pure readset_commit agrees with git on every build here, over the shapes too (a 100755 entry among them)
+    shapes = resolve_contract({**json_sub(contract), "read": sorted([*SHAPES, "src/run.sh"])},
+                              resolve_template=lambda t: TEMPLATE, policy=POLICY, now=NOW)
+    for i, c in enumerate((contract, shapes)):
+        got = rs if i == 0 else build_readset(str(repo), c, dest(root, "built-shapes"), contract_digest=c.digest)
+        E, tree, N = readset_commit(c.canonical().encode("utf-8"), c.digest)
+        assert (E, tree, N) == (got.commit, got.tree, len(objects(got.repo_dir)))
     bundle = root / "built.bundle"
     make_bundle(rs.repo_dir, rs.branch, bundle)
     clone = root / "built-clone"
@@ -352,3 +374,58 @@ def test_the_dispatch_session_env_has_no_operator_key_and_roots_under_the_slot()
     assert env["HOME"] == S or env["HOME"].startswith(S + "/")
     for k in ("TMPDIR", "XDG_DATA_HOME", "XDG_CACHE_HOME", "CODEX_HOME", "GIT_CONFIG_GLOBAL"):
         assert env[k].startswith(S)
+
+
+def test_the_attempt_id_validator_is_exactly_controls_grammar(world, tmp_path):
+    # reproduced (wa_repro.py 1): with no validator, attempt "x/../../escaped" made its workdir outside the parent
+    from levain.dispatch.attempt_id import ATTEMPT_ID_FORM, check_attempt_id, is_attempt_id, new_attempt_id
+    from levain.dispatch.readset import verify_readset, workdir_name
+    minted = new_attempt_id()
+    assert ATTEMPT_ID_FORM.fullmatch(minted)
+    for ok in ("a", "a" * 64, minted, "0-9"):
+        assert is_attempt_id(ok) and check_attempt_id(ok) == ok and workdir_name(ok) == "w-" + ok
+    for bad in ("", "a" * 65, "-a", "A", "aB", "a_b", "a.b", "a/b", "..", "a\n", "a\0", "x/../../escaped", b"a", None):
+        assert not is_attempt_id(bad)
+        assert refusal(workdir_name, bad).name == "readset-attempt"
+    parent = Path(os.path.realpath(tmp_path)) / "attempts"
+    (parent / "w-x").mkdir(parents=True)
+    contract = world[4]
+    cb = contract.canonical().encode("utf-8")
+    assert refusal(verify_readset, cb, contract.digest, -1, str(parent), "x/../../escaped").name == "readset-attempt"
+    assert sorted(os.listdir(parent)) == ["w-x"] and not (Path(os.path.realpath(tmp_path)) / "escaped").exists()
+
+
+def test_verify_refuses_a_read_set_that_loosens_the_settings_by_name(tmp_path):
+    # reproduced (wa_repro.py 2): with the repo-layer check removed, this read set verified
+    from levain.dispatch.attempt_id import new_attempt_id
+    from levain.dispatch.readset import _bundle_into, _scratch_env, verify_readset
+    top = Path(os.path.realpath(tmp_path))
+    repo = top / "r"
+    (repo / ".claude").mkdir(parents=True)
+    (repo / "src").mkdir()
+    (repo / ".claude/settings.json").write_text('{"disableAllHooks": true}')
+    (repo / "src/a.py").write_text("a\n")
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "c")
+    sub = {"template": "fix-lint", "goal": "g", "read": [".claude/settings.json", "src/a.py"], "write": ["src/a.py"],
+           "base": git(repo, "rev-parse", "HEAD").strip(), "budget": {"tool_calls": 1, "tokens": 1, "dollars_cents": 1},
+           "grant": ["Edit"], "expires_at": utc_stamp(NOW + timedelta(hours=1)), "repo": str(repo)}
+    policy = ProviderPolicy.from_mapping({"never": [], "providers": {"openrouter": {"read": ["**"]}}})
+    c = resolve_contract(sub, resolve_template=lambda t: TEMPLATE, policy=policy, now=NOW)
+    rs = build_readset(str(repo), c, dest(top, "scratch"), contract_digest=c.digest)
+    bundle = top / "h.bundle"
+    fd = os.open(bundle, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        _bundle_into(rs.repo_dir, fd, _scratch_env())
+    finally:
+        os.close(fd)
+    parent = top / "attempts"
+    parent.mkdir()
+    fd = os.open(bundle, os.O_RDONLY)
+    try:
+        got = refusal(verify_readset, c.canonical().encode("utf-8"), c.digest, fd, str(parent), new_attempt_id())
+    finally:
+        os.close(fd)
+    assert got.name == "loosening:disable-all-hooks"
+    assert os.listdir(parent) == []                                    # the refused attempt's workdir is gone
