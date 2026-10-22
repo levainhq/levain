@@ -43,45 +43,20 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **Dispatch files a job and its read set together.** `levain dispatch file` (and the MCP door) builds the contract's
   read set and exports its bundle before anything reaches the store, then publishes the job and the bundle together. A
   filing process that opened the store before a newer Levain migrated it is refused (`store-format`) instead of
-  filing a job with no handoff. Nothing launches from the bundle yet. The job store moves
-  to **format 5** the first time this version opens it, and your jobs are kept. After that, Levain 0.11.14 and earlier
-  refuse the store, so do not downgrade.
+  filing a job with no handoff. Nothing launches from the bundle yet. The job store moves to format 5 (see the upgrade
+  note under Changed).
 - **The consent hooks' version pin takes Claude Code 2.1.306 and 2.1.308.** `levain consent canary --agent claude_code`
-  passed on 2.1.308 (hook fired, the agent reported the denial, the sentinel was not written). The pin is now Claude
-  Code 2.1.300, 2.1.301, 2.1.306 and 2.1.308, and Codex 0.162.1.
+  passed on 2.1.306 and on 2.1.308 (each time the hook fired, the agent reported the denial, the sentinel was not
+  written). The pin is now Claude Code 2.1.300, 2.1.301, 2.1.306 and 2.1.308, and Codex 0.162.1.
 - **Each consent request records the model the agent named.** Codex's hook payload names it; Claude Code's does not
   (2.1.306), so its requests read `unknown`. It is kept beside the request, never in what you sign. An older store
   gains it on its next open.
 - **CI runs the cockpit's browser tests.** They had been skipped in CI, because it had no Chrome. A browser job now
   installs a pinned Chrome and fails on any skip.
 
-### Security
-- **A team-ledger line could carry text a reader cannot see into every teammate's agent.** Levain now refuses hidden
-  characters (TAG characters, bidi overrides, zero-width text) in a ruling's words, summary, reason, re-check and paths
-  when you record or draft one. A line it reads without that check (one recorded before this release, or one a
-  teammate wrote with another client) is now shown with each such character written as `⟨U+XXXX⟩` wherever the ledger
-  is shown: the edit hook, session start, the canon and the team view.
-- **A passkey may now sign one authority link: revoking a consent grant.** A revoke only takes authority away, so a
-  stolen passkey can cost you prompts, never widen what an agent may do. Every other link (an enrolment, a grant, a
-  policy change, a revoke of an egress grant) is refused for a passkey, and a passkey made on `localhost` signs no
-  authority link: a phone page on localhost lists grants and says to revoke from the laptop.
-- **The coordinator keeps to its door.** Inside the coordinator's workspace every `levain` command other than the
-  coordinator's own verbs, `team draft add --by coordinator` and the team read verbs is refused ("run it from your own
-  terminal, outside it"). The workspace is read from a record Levain keeps outside every workspace
-  (`<levain home>/consent/coordinator_workspaces.json`), so a coordinator that deletes or damages its own marker is still
-  doored. `levain coord agent claude --cwd DIR` refuses a directory that is your own Levain install.
-
-### Fixed
-- **The phone page's top bar holds on a narrow phone.** On a narrow phone, or a wider font, the theme switch could
-  wrap onto a row of its own. The bar now stays one row from 320 to 430 px wide, and a long white-label name is cut
-  with an ellipsis, its full text in the tooltip.
-- **The cockpit's phone-width tiles no longer clip.** The Ops tile's reading wraps onto the line under its name, and four
-  tiles never leave a lone tile on a half-screen laptop.
-- **The macOS persistence scan no longer refuses on a very deep tree.** The scan of the agent roots held absolute
-  paths, so one entry deeper than the path limit refused the whole confinement floor. It now walks by directory
-  descriptor. A re-read it cannot inspect refuses rather than reading as absent.
-
 ### Changed
+- **Upgrade note: the dispatch job store moves to format 5 the first time this version opens it, and Levain
+  0.11.14 and earlier then refuse it. Do not downgrade after upgrading.** Your jobs are kept.
 - **`levain team record`, `retire` and `draft` accept Windows line ends (CRLF) in prose fields.** They are read as
   ordinary line breaks. A lone carriage return is still refused.
 - **The cockpit's dark theme lifts its panels and rules, and the Board's glance is separate cards again.** Light is
@@ -95,6 +70,33 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   - Levain's own MCP servers (anneal_memory, levain_band, levain_dispatch) are approved in that install, so a
     coordinator starting in the background no longer waits on Claude Code's "new MCP servers found" dialog, which
     nobody can answer there. A server you add yourself still asks.
+
+### Fixed
+- **The phone page's top bar holds on a narrow phone.** On a narrow phone, or a wider font, the theme switch could
+  wrap onto a row of its own. The bar now stays one row from 320 to 430 px wide, and a long white-label name is cut
+  with an ellipsis, its full text in the tooltip.
+- **The cockpit's phone-width tiles no longer clip.** The Ops tile's reading wraps onto the line under its name, and four
+  tiles never leave a lone tile on a half-screen laptop.
+- **The macOS persistence scan no longer refuses on a very deep tree.** The scan of the agent roots held absolute
+  paths, so one entry deeper than the path limit refused the whole confinement floor. It now walks by directory
+  descriptor. A re-read it cannot inspect refuses rather than reading as absent.
+
+### Security
+- **A team-ledger line could carry text a reader cannot see into every teammate's agent.** Levain now refuses hidden
+  characters (TAG characters, bidi overrides, zero-width text) in a ruling's words, summary, reason, re-check and paths
+  when you record or draft one. A line it reads without that check (one recorded before this release, or one a
+  teammate wrote with another client) is now shown with each such character written as `⟨U+XXXX⟩` in the edit hook, session start, the canon and the
+  team view.
+- **A passkey may now sign one authority link: revoking a consent grant.** A revoke only takes authority away, so a
+  stolen passkey can cost you prompts, never widen what an agent may do. Every other link (an enrolment, a grant, a
+  policy change, a revoke of an egress grant) is refused for a passkey, and a passkey made on `localhost` signs no
+  authority link: a phone page on localhost lists grants and says to revoke from the laptop.
+- **The coordinator keeps to its door.** Inside the coordinator's workspace every `levain` command other than the
+  coordinator's own verbs, `team draft add --by coordinator` and the team and draft read verbs is refused ("run it from your own
+  terminal, outside it"). The workspace is read from a record Levain keeps outside every workspace
+  (`<levain home>/consent/coordinator_workspaces.json`), so a coordinator that deletes or damages its own marker is still
+  doored. This fences an honest coordinator; it is not a sandbox (see Known edges). `levain coord agent claude --cwd
+  DIR` refuses a directory that is your own Levain install.
 
 ### Groundwork for isolation (nothing here is reachable from a `levain` command yet)
 - **The isolation gateway and its session store are being built; the install step that would run them is not built
@@ -114,8 +116,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - A Codex coordinator runs under your own Codex approval and sandbox settings, so its first `levain coord claim` asks for
   your approval and waits until you open the thread. OpenAI marks Codex's app-server and its WebSocket transport
   experimental and not supported for production workloads; the Codex coordinator rests on it.
-- A pre-rule team-ledger draft with CRLF in its summary still refuses at promote, and SessionStart's 160-character cut
-  can split a hidden-character marker.
+- A pre-rule team-ledger draft with CRLF in its summary still refuses at promote.
+- `levain team` re-genesis lists the old ledger's in-force rulings without marking hidden characters (your terminal
+  only; nothing reaches an agent).
 - A coordinator started by a different Levain than the one that set up `~/.levain/coordinator` asks before each of
   its commands; run `levain update --path ~/.levain/coordinator` from the Levain that starts it.
 
