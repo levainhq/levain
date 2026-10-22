@@ -274,8 +274,11 @@ def _sweep(uid: int, sig: int, done: Callable[[list[Proc]], bool], target: Calla
             return False
         targets = [p for p in procs if target(p)]
         if targets and seams.signal_uid is not None:
+            left = deadline - seams.clock()
+            if left <= 0:              # a spent deadline is the sweep's own answer, never a signalling child's hang
+                return False
             try:
-                sent = seams.signal_uid(uid, sig, max(deadline - seams.clock(), 0.0))
+                sent = seams.signal_uid(uid, sig, left)
                 hangs = 0
             except Refused as e:
                 if e.name != "signal-child-hung":
@@ -857,7 +860,10 @@ def signal_as_uid(uid: int, sig: int, timeout: float = V12_SECONDS, *, fork: Cal
     held, say) is SIGKILLed, its reap polled for :data:`REAP_GRACE_S` (else it joins the leftover set,
     :func:`reap_leftovers`), and the call raises ``Refused("signal-child-hung")``: never a hang. The sweep that
     called it goes on (:func:`_sweep`). A ``fork`` refused with EAGAIN (the process table or the caller's process
-    limit full) is tried again until ``timeout``; past it the call returns ``False``, nothing sent."""
+    limit full) is tried again until ``timeout``; past it the call returns ``False``, nothing sent. A ``timeout`` of 0
+    or less returns ``False`` before any fork: no child is given a bound it cannot meet."""
+    if timeout <= 0:
+        return False
     end = clock() + timeout
     delay = POLL_FIRST_S
     while True:
