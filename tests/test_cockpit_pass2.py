@@ -123,7 +123,7 @@ def test_project_colour_is_the_product_with_no_variant_switch_and_no_repo_of_its
         hues: k ? ['alpha', 'Alpha', 'my-app', 'x'.repeat(300), '', null].map(k) : [] }; })()"""}])
     got = vals[2]
     assert got["variantAttr"] == "" and all(got["slots"]) and got["stripe"] == '""' and got["tags"] == 0, got
-    assert got["hues"][0] == got["hues"][1] and all(h in "12345" and h for h in got["hues"][:4]) and got["hues"][4:] == ["", ""], got
+    assert got["hues"][0] == got["hues"][1] and all(h in "12345678" and h for h in got["hues"][:4]) and got["hues"][4:] == ["", ""], got
 
 
 # Phill 10-15: "there is no reason a public package should have my personal dealings in it". The names are held as hash

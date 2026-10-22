@@ -94,19 +94,22 @@ def test_a_question_card_keeps_its_rec_and_its_cli_line_sits_behind_details(tmp_
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": READY},
+            {"until": "document.querySelector('#ck-needs .needs-consent .needs-open') && document.querySelector('#ck-needs .needs-question .question-option')"},
             {"eval": "(() => { const q = document.querySelector('#ck-needs .needs-question'); return JSON.stringify({"
                      " recText: /REC\\s+hold\\./.test(q.innerText), title: (q.querySelector('.needs-q-title')||{}).textContent, recBtn: [...q.querySelectorAll('.question-option')].map(b => [b.textContent, b.classList.contains('question-rec')]),"
                      " words: !!q.querySelector('.question-words')}); })()"},
-            {"eval": "(() => { const c = document.querySelector('#ck-needs .needs-consent'); const d = c.querySelector('details.needs-details'); const code = c.querySelector('.consent-code');"
-                     " return JSON.stringify({isDetails: !!d, openBefore: d.open, shownBefore: code.checkVisibility()}); })()"},
-            {"eval": "(() => { const c = document.querySelector('#ck-needs .needs-consent'); c.querySelector('details.needs-details summary').click();"
-                     " const code = c.querySelector('.consent-code'); return JSON.stringify({openAfter: c.querySelector('details').open, shownAfter: code.checkVisibility(), cmd: code.textContent}); })()"}])["values"]
-    q, before, after = (json.loads(v) for v in out[-3:])
+            {"eval": "(() => { const c = document.querySelector('#ck-needs .needs-consent'); return JSON.stringify({hasOpen: !!c.querySelector('.needs-open'), inlineCmd: !!c.querySelector('.consent-code')}); })()"},
+            {"eval": "document.querySelector('#ck-needs .needs-consent .needs-open').click(); 1"},
+            {"until": "document.querySelector('#levain-modal .needs-terminal .consent-code')"},
+            {"eval": "JSON.stringify({cmd: document.querySelector('#levain-modal .needs-terminal .consent-code').textContent})"}])["values"]
+    q, before, after = json.loads(out[-5]), json.loads(out[-4]), json.loads(out[-1])
     assert q["title"] == "Ship the sweep fix tonight or hold it?", q
     assert not any("recommended" in b[0] for b in q["recBtn"]), q          # the fill and the REC line say it
     assert q["recText"] and q["words"] and ["hold", True] == [q["recBtn"][1][0].split(" ")[0], q["recBtn"][1][1]] and q["recBtn"][0][1] is False, q
-    assert before == {"isDetails": True, "openBefore": False, "shownBefore": False}, before
-    assert after["openAfter"] and after["shownAfter"] and after["cmd"].startswith("levain consent answer "), after
+    # The K-polish pass (Phill L2: "each should either be scrollable or open into a model with all info well organized") moved the CLI
+    # route from an inline disclosure to the card's "Open" row: the strip card carries no command, the focus view does.
+    assert before == {"hasOpen": True, "inlineCmd": False}, before
+    assert after["cmd"].startswith("levain consent answer "), after
 
 
 @needs_browser

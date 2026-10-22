@@ -145,6 +145,10 @@ from tests.test_cockpit_flip_parity import _drive, needs_browser          # noqa
 from tests.test_cockpit_k2a import _install, _serve                        # noqa: E402
 
 TILE = "[...document.querySelectorAll('.ck-widgets .ck-card.w')].find(c => /^Decisions waiting/i.test(c.innerText))"
+# K4 moved the premise on purpose: while something waits, the Decisions tile takes the reader to the Needs-you strip and opens no
+# modal (test_cockpit_k4a_needs pins that). The history modal is then one click further, on the strip's "all decisions" button;
+# with nothing waiting there is no strip and the tile itself opens it.
+OPEN_DECISIONS = ("(() => { const h = document.querySelector('#ck-needs:not([hidden]) .needs-history'); (h || " + TILE + ").click(); return 1; })()")
 MARK_CMD, MARK_CWD = "zq-cmd-marker-7731", "/w/zq-cwd-marker-4419"
 
 
@@ -214,7 +218,7 @@ def test_the_page_draws_a_consent_request_as_text_with_a_countdown_and_copy_butt
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /1/.test({TILE}.innerText)"},
-            {"eval": f"{TILE}.click(); 1"},
+            {"eval": OPEN_DECISIONS},
             {"until": "document.querySelector('#levain-modal .consent-row .consent-code')"},
             {"eval": "(() => { const m = document.getElementById('levain-modal'); const row = m.querySelector('.consent-row');"
                      " return [row.querySelector('.consent-agent').textContent, row.querySelector('.consent-tool').textContent,"
@@ -256,21 +260,24 @@ def test_a_decided_row_has_a_details_button_and_a_malformed_body_releases_its_sl
                   cwd="/w", hold=timedelta(minutes=5), event_id="p3")
     q.withdraw(gone.id)
     _root, src, _ids = _install(tmp_path)
-    # the first two body fetches answer 200 with an unreadable body; a freed slot lets the third (details) through
-    stub = ("(() => { const real = window.fetch.bind(window); let n = 0; window.fetch = (u, o) => String(u).includes('/cockpit/consent/') && !String(u).includes('/proposals.json') && n++ < 2"
+    # The Needs-you strip already read the two waiting bodies and the modal reuses them, so the decided row's own fetches are the
+    # ones to spoil: its first answers 200 with an unreadable body, and a freed slot lets the retry through.
+    stub = ("(() => { const real = window.fetch.bind(window); let n = 0; window.fetch = (u, o) => String(u).includes('/cockpit/consent/" + gone.id + "') && n++ < 1"
             " ? Promise.resolve({ ok: true, status: 200, json: () => Promise.reject(new Error('bad json')) }) : real(u, o); return 1; })()")
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /2/.test({TILE}.innerText)"},
             {"eval": stub},
-            {"eval": f"{TILE}.click(); 1"},
-            {"until": "document.querySelectorAll('#levain-modal .consent-row .consent-note').length >= 2"},
+            {"eval": OPEN_DECISIONS},
+            {"until": "[...document.querySelectorAll('#levain-modal .consent-row')].some(x => x.querySelector('.consent-details'))"},
             {"eval": "(() => { const r = [...document.querySelectorAll('#levain-modal .consent-row')].find(x => x.querySelector('.consent-details'));"
                      " const before = !!r.querySelector('.consent-display'); r.querySelector('.consent-details').click(); return before; })()"},
+            {"until": "[...document.querySelectorAll('#levain-modal .consent-row')].some(x => x.querySelector('.consent-details') && x.querySelector('.consent-note'))"},
+            {"eval": "(() => { const r = [...document.querySelectorAll('#levain-modal .consent-row')].find(x => x.querySelector('.consent-details')); r.querySelector('.consent-details').click(); return 1; })()"},
             {"until": "[...document.querySelectorAll('#levain-modal .consent-row')].some(r => r.querySelector('.consent-display'))"},
             {"eval": "[...document.querySelectorAll('#levain-modal .consent-row')].filter(r => r.querySelector('.consent-display')).map(r => r.querySelector('.consent-display').textContent)"},
         ])["values"]
-    assert out[-3] is False, out        # before the click the decided row had no body
+    assert out[-5] is False, out        # before the click the decided row had no body
     assert any("zq-decided-marker" in t for t in out[-1])
 
 
@@ -289,7 +296,7 @@ def test_a_details_retry_after_a_failed_read_reuses_its_slot(tmp_path, monkeypat
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /1/.test({TILE}.innerText)"},
             {"eval": stub},
-            {"eval": f"{TILE}.click(); 1"},
+            {"eval": OPEN_DECISIONS},
             {"until": f"{row} && {row}.querySelector('.consent-details')"},
             {"eval": f"{row}.querySelector('.consent-details').click(); 1"},
             {"until": f"{row}.querySelector('.consent-note') && !{row}.querySelector('.consent-details').disabled"},
@@ -318,7 +325,7 @@ def test_the_decisions_modal_carries_a_filter_that_narrows_by_agent_tool_and_sta
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /2/.test({TILE}.innerText)"},
-            {"eval": f"{TILE}.click(); 1"},
+            {"eval": OPEN_DECISIONS},
             {"until": "document.querySelector('#levain-modal .xfilter-input') && document.querySelector('#levain-modal .consent-row')"},
             {"eval": rows},
             {"eval": f"{typ}('apply_patch'); {rows}"},
@@ -347,12 +354,12 @@ def test_a_reopened_decisions_modal_starts_unfiltered_even_with_a_saved_query(tm
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /3/.test({TILE}.innerText)"},
-            {"eval": f"{TILE}.click(); 1"},
+            {"eval": OPEN_DECISIONS},
             {"until": ready},
             {"eval": f"{typ}('apply_patch'); {rows}"},
             {"eval": "document.querySelector('#levain-modal .modal-close, #levain-modal [aria-label=Close], #levain-modal button.x') ? (document.querySelector('#levain-modal .modal-close, #levain-modal [aria-label=Close], #levain-modal button.x').click(), 1) : (document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})), 2)"},
             {"until": "!document.querySelector('#levain-modal .consent-row')"},
-            {"eval": f"{TILE}.click(); 1"},
+            {"eval": OPEN_DECISIONS},
             {"until": ready},
             {"eval": rows},
         ])["values"]
@@ -372,7 +379,7 @@ def test_an_undecided_row_is_drawn_waiting_not_answered(tmp_path, monkeypatch):
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /1/.test({TILE}.innerText)"},
-            {"eval": f"{TILE}.click(); 1"},
+            {"eval": OPEN_DECISIONS},
             {"until": row},
             {"eval": f"[{row}.className, {row}.querySelector('.consent-head').textContent]"},
         ])["values"]
