@@ -321,7 +321,7 @@
     // The bridge sets these to flow-brand its cockpit.
     if (view.brand_wordmark) {
       const wm = document.querySelector(".brand .wordmark");
-      if (wm) wm.textContent = view.brand_wordmark;
+      if (wm) { wm.textContent = view.brand_wordmark; wm.title = view.brand_wordmark; }   // the title is the whole name where a narrow bar cuts it
       // The browser tab / <title> too — the HTML ships "Levain · substrate control"
       // hardcoded and JS is the only override seam (the static template can't know
       // the brand). Keep the " · substrate control" suffix; swap only the wordmark.
