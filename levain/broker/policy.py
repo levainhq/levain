@@ -136,7 +136,7 @@ def _requests(route: str, raw: object, source: str) -> dict:
             raise PolicyError(f"route {route}: requests.headers.{name} must be a pattern")
         try:
             pats[name] = re.compile(pat)
-        except re.error as e:
+        except (re.error, OverflowError) as e:   # a repetition count past the compiler's limit is OverflowError
             raise PolicyError(f"route {route}: requests.headers.{name}: {e}") from None
     if raw["body_codec"] not in BODY_CODECS:
         raise PolicyError(f"route {route}: body_codec {raw['body_codec']!r}")
