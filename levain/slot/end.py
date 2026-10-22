@@ -1769,6 +1769,9 @@ class Reserve:
         except FileNotFoundError:
             return 0
         try:
+            # The reaper's refill holds a flock on this same file across its fstat, write and fsync; taking
+            # it here means a release never truncates under a refill (the unlock is the close below).
+            fcntl.flock(fd, fcntl.LOCK_EX)
             cur = os.fstat(fd).st_size
             new = max(0, cur - self.step)
             os.ftruncate(fd, new)
