@@ -1192,7 +1192,10 @@ class Keys:
                 raise PolicyError("format or routes")
             parsed: Dict[str, RoutePolicy] = {}
             for entry in doc["routes"]:
-                pol = parse_route(entry, source="base")
+                try:
+                    pol = parse_route(entry, source="base")
+                except Exception as e:   # any entry's parse failure, of whatever type, refuses the map whole
+                    raise PolicyError(f"an entry does not parse ({type(e).__name__})") from None
                 if pol.route in parsed:
                     raise PolicyError("a route named twice")
                 parsed[pol.route] = pol

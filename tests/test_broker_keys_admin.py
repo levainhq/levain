@@ -825,14 +825,16 @@ async def _one_q(d: str, ledger: _Ledger) -> bytes:
         os.close(cred_fd)
 
 
-@pytest.mark.parametrize("fault", ["unbuilt", "reset", "tls", "timeout", "head-write", "head-drain", "body-drain"])
+@pytest.mark.parametrize("fault", ["unbuilt", "reset", "tls", "timeout", "head-write", "head-stale", "head-drain",
+                                   "body-drain"])
 def test_upstream_failure_answers_f_and_releases_the_budget(monkeypatch, fault):
     # L3 r2 (codex MED, complement LOW x2), reproduced first (`3b-3b-p5/repro_before.txt`): a failure in
     # `open_exchange` (the shipped seam's NotImplementedError included), the head's write or a drain escaped every
     # translation, so the front read EOF; and the reservation made before `open_exchange` was never released.
     # Now each is answered `upstream-error` (`upstream-timeout` for a deadline) and every reservation released once.
-    # P5 L3 r1 (codex MED), reproduced first (`3b-3b-p5/repro_p5b_head_write_before.txt`): a head write that raised
-    # before taking a byte was released `sent=True`; `sent` now follows the write's return.
+    # P5 L3 r1 (codex MED, complement LOW), reproduced first (`3b-3b-p5/repro_p5b_head_write_before.txt`,
+    # `p5b_mutation_sent.txt`): a head write that raised before taking a byte, or that the gate refused, was released
+    # `sent=True`; `sent` now follows the write's return. A refused (detached) exchange is answered nothing.
     import ssl
 
     from levain.broker import upstream as U
@@ -862,6 +864,15 @@ def test_upstream_failure_answers_f_and_releases_the_budget(monkeypatch, fault):
 
     if fault != "unbuilt":
         monkeypatch.setattr(U, "_handshake", handshake)
+    if fault == "head-stale":
+        opened = K.open_exchange
+
+        async def then_detached(addr, port, host, exchange):
+            up = await opened(addr, port, host, exchange)
+            exchange.detached = True   # a phase 1 landing between the store and the head's write
+            return up
+
+        monkeypatch.setattr(K, "open_exchange", then_detached)
     ledger = _Ledger()
     try:
         got = asyncio.run(_one_q(d, ledger))
@@ -869,12 +880,13 @@ def test_upstream_failure_answers_f_and_releases_the_budget(monkeypatch, fault):
         shutil.rmtree(d, ignore_errors=True)
     name = "upstream-timeout" if fault == "timeout" else "upstream-error"
     want = (gwwire.encode(b"A") if fault == "body-drain" else b"") + gwwire.encode(b"F", {"refused": name})
-    assert got == want
+    assert got == (b"" if fault == "head-stale" else want)
+    assert st["raw"] == [] or fault not in ("head-write", "head-stale")   # the gate refused: nothing written
     assert ledger.held == 0 and len(ledger.sent) == 1
     assert ledger.sent == [fault in ("head-drain", "body-drain")]   # `sent` once the head was handed upstream
 
 
-@pytest.mark.parametrize("routes", ["non-object", "duplicate", "malformed"])
+@pytest.mark.parametrize("routes", ["non-object", "duplicate", "malformed", "overflow"])
 def test_base_map_unusable_anywhere_refuses_every_route(routes):
     # L3 r2 (codex LOW) against ruling S-24's fail-closed rule, reproduced first (`3b-3b-p5/repro_before.txt`): the
     # map was filtered to the asked route before validation, so an unusable or duplicated UNRELATED entry left `r`
@@ -886,7 +898,11 @@ def test_base_map_unusable_anywhere_refuses_every_route(routes):
     with open(path, "rb") as f:
         route = canon.parse(f.read())["routes"][0]
     extra = {"non-object": [42], "duplicate": [dict(route, route="z"), dict(route, route="z")],
-             "malformed": [{"route": "z", "type": "brokered"}]}[routes]
+             "malformed": [{"route": "z", "type": "brokered"}],
+             # P5 L3 r1 (complement MED), reproduced first (`3b-3b-p5/p5b_parse_route_escapes_r2.txt`): a pattern
+             # whose `re.compile` raises OverflowError escaped the refusal, so the front read EOF
+             "overflow": [dict(route, route="z", requests=dict(route["requests"],
+                                                                headers={"content-type": "a{99999999999}"}))]}[routes]
     with open(path, "wb") as f:
         f.write(canon.canonical_bytes({"format": K.BASE_MAP_FORMAT, "routes": [route] + extra}))
     ledger = _Ledger()
