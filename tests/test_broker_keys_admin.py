@@ -155,6 +155,36 @@ async def _answer(r: asyncio.StreamReader) -> dict:
     return canon.parse(await r.readexactly(n))
 
 
+class _Recorder(asyncio.Protocol):
+    """A raw client: every received byte is kept, and the connection's end, EOF or reset, is the one terminal event."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.got = bytearray()
+        self.lost: asyncio.Future = loop.create_future()
+
+    def data_received(self, data: bytes) -> None:
+        self.got += data
+
+    def connection_lost(self, exc) -> None:
+        if not self.lost.done():
+            self.lost.set_result(exc)
+
+
+async def _foreign_peer(loop: asyncio.AbstractEventLoop, admin: str) -> bytes:
+    """Connect, send one frame, wait (one deadline for the whole exchange) for the connection to end, and return what
+    arrived. A stream reader raises a stored reset before it returns bytes it already buffered, so it could not tell
+    "closed unread" from "answered, then reset"; a protocol sees `data_received` first, whatever ends the connection."""
+    deadline = loop.time() + 5
+    transport, rec = await asyncio.wait_for(loop.create_unix_connection(lambda: _Recorder(loop), admin), 5)
+    try:
+        # a send-side close is just another terminal event: it never fails the test
+        transport.write(K.encode_admin({"v": 1, "op": "DROP-SESSION", "id": 1, "session": "s-x"}))
+        await asyncio.wait_for(rec.lost, max(0.0, deadline - loop.time()))
+    finally:
+        transport.abort()
+    return bytes(rec.got)
+
+
 def test_admin_eof_kills_cached_tokens_and_fronts(monkeypatch):
     d = tempfile.mkdtemp(prefix="lk", dir="/tmp")
     holds, entered, cancels = {}, {}, []
@@ -168,20 +198,10 @@ def test_admin_eof_kills_cached_tokens_and_fronts(monkeypatch):
         try:
             # a peer that is not `_levain_control` is closed unread and unanswered. Closed unread, its frame can still
             # sit in keys' receive queue at the close: Linux then resets the peer, macOS gives it EOF. Either is
-            # "closed"; an answer, or the connection staying open, is not.
+            # "closed"; an answer, or the connection staying open, is not. `_foreign_peer` records every byte the peer
+            # receives, so an answer followed by a reset still fails.
             k.control_uid = os.getuid() + 1
-            r, w = await asyncio.open_unix_connection(admin)
-            await _send(w, 1, "DROP-SESSION", session="s-x")
-            # read in chunks so bytes that arrive before a reset are kept, not dropped with read(-1)'s buffer: an
-            # answer followed by a reset must still fail
-            got = bytearray()
-            try:
-                while chunk := await asyncio.wait_for(r.read(4096), 5):
-                    got += chunk
-            except ConnectionResetError:
-                pass
-            out["foreign"] = bytes(got)
-            w.close()
+            out["foreign"] = await _foreign_peer(loop, admin)
             k.control_uid = os.getuid()
 
             r, w = await asyncio.open_unix_connection(admin)
