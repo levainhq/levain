@@ -649,3 +649,42 @@ def test_websocket_handshake_over_http_1_0_is_malformed():
     rec, got = asyncio.run(go())
     assert got.startswith(b"HTTP/1.1 400 "), got[:200]
     assert rec["refused"] == "malformed" and rec["detail"] == "websocket-version", rec
+
+
+def test_front_entry_point_refuses_to_serve_without_keys_and_go(tmp_path, monkeypatch):
+    # group L3 r1 (codex HIGH 2), reproduced first (`1022-8/g1fix/item1_repro_before.txt`): the installed entry point
+    # took `--keys` and `--go-fd` as optional, so a front started without them bound and served CONNECT with no
+    # registration and no STATUS connection: no `K` could ever reach it, so it could never be revoked. Both are now
+    # required by `main()`, and `run_front` refuses a front with no keys socket; the standalone shape is the in-process
+    # `Front` + `serve_unix` the other tests use.
+    from levain.broker import front as F
+    pol = dict(POLICY, incarnation=1)
+    p = tmp_path / "session.json"
+    p.write_text(json.dumps(pol))
+    sock = str(tmp_path / "gw.sock")
+    served: list = []
+
+    async def fake_run_front(front, *, unix=None, port=None, keys=None):
+        served.append(keys)
+        return 0
+
+    monkeypatch.setattr(F, "run_front", fake_run_front)
+    base = ["--unix", sock, "--slot-uid", str(os.getuid()), "--policy", str(p)]
+    for argv in (base, base + ["--keys", str(tmp_path / "front.sock")], base + ["--go-fd", "9"]):
+        with pytest.raises(SystemExit) as e:
+            F.main(argv)
+        assert e.value.code == 2, argv
+    assert served == []
+    monkeypatch.undo()
+
+    async def run() -> str:
+        front = Front(load_policy(json.dumps(pol).encode()), slot_uid=os.getuid())
+        try:
+            await asyncio.wait_for(F.run_front(front, unix=sock), 0.5)
+        except ValueError:
+            return "refused"
+        except asyncio.TimeoutError:
+            return "served" if os.path.exists(sock) else "timeout"
+        return "returned"
+
+    assert asyncio.run(run()) == "refused"
