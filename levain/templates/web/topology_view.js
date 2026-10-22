@@ -471,6 +471,7 @@
   // faces are SVG (every one a real element a test or a screen reader can reach); only the particle streams are a canvas under it.
   // A stream's density is the node's rate (events per minute). A null rate, a rate of 0 and an idle node have NO stream, never a decoration;
   // the loop runs only while some edge streams, adapts to the frame time, and draws nothing under prefers-reduced-motion.
+  const PHONE_SCALE = 0.75;                // under NARROW_PX the graph keeps this scale and the stage pans sideways, instead of shrinking to unreadable text
   const MIN_LW = 920;                      // the graph is laid out at no less than this width and scaled down to fit a narrower card
   const MIN_H = 540;
   const RING_H = [0.2, 0.34];
@@ -1108,6 +1109,7 @@
     tip.setAttribute("aria-hidden", "true");
     wrap.appendChild(stage);
     let LW = 0, svgNode = null, scale = 1, built = false;
+    let reanchorPin = null;                                               // set once the card helpers exist: re-seats a pinned card on its node after every layout
     const mctx = document.createElement("canvas").getContext ? document.createElement("canvas").getContext("2d") : null;
     const build = (W) => {
       const cs = root.getComputedStyle(stage);
@@ -1115,20 +1117,23 @@
                       tag: "700 10px " + (cs.getPropertyValue("--round").trim() || "sans-serif"), group: "700 13px " + (cs.getPropertyValue("--round").trim() || "sans-serif"),
                       chip: "600 11px " + (cs.getPropertyValue("--mono").trim() || "monospace") };
       const measure = (text, k) => { if (mctx) { mctx.font = fonts[k]; return mctx.measureText(String(text)).width; } return String(text).length * 6.4; };
-      LW = Math.max(MIN_LW, Math.round(W));
-      scale = Math.min(1, W / LW);
+      const phone = W < NARROW_PX;
+      LW = phone ? MIN_LW : Math.max(MIN_LW, Math.round(W));
+      scale = phone ? PHONE_SCALE : Math.min(1, W / LW);
+      stage.classList.toggle("tv-phone", phone);
       ensureGraphCss();
       const L = layoutGraph(v, LW, measure);
       assignSeats(L);
       const edges = graphEdges(v, L);
-      hint.hidden = W < NARROW_PX;                                    // a phone has no hover, and the hint is a mouse's
+      hint.textContent = phone ? "Swipe sideways to pan. Tap a node for its card." : "Click a node for its card. Hover for the face.";
       if (streamStop) { streamStop(); streamStop = null; }
       if (svgNode) svgNode.remove();
       const g = drawGraph(v, L, edges, measure, opts);
       svgNode = g.svg;
+      if (phone) svgNode.style.width = Math.round(LW * scale) + "px";
       stage.insertBefore(svgNode, canvas);
       // the canvas keeps the graph's own proportions: CSS size follows the SVG, the backing store follows the device
-      const cssW = Math.round(W), cssH = Math.round(L.H * scale), dpr = Math.min(2, root.devicePixelRatio || 1);
+      const cssW = phone ? Math.round(LW * scale) : Math.round(W), cssH = Math.round(L.H * scale), dpr = Math.min(2, root.devicePixelRatio || 1);
       canvas.width = Math.max(1, Math.round(cssW * dpr)); canvas.height = Math.max(1, Math.round(cssH * dpr));
       canvas.style.width = cssW + "px"; canvas.style.height = cssH + "px";
       if (ticker) { root.clearInterval(ticker); ticker = null; }
@@ -1144,6 +1149,7 @@
       streamStop = startStreams(canvas, stage, edges, () => scale, !!(opts && opts.still));
       stage.dataset.nodes = String(arr(v.nodes).length);
       built = true;
+      if (reanchorPin) reanchorPin();
     };
     build(920);                                                           // a width to draw at before the card has one; the observer redraws at the real one
     let seen = 0;
@@ -1169,7 +1175,7 @@
       tip.hidden = false;
       const place = () => {
         const box = stage.getBoundingClientRect();
-        tip.style.left = Math.max(4, Math.min(box.width - tip.offsetWidth - 4, x + 16)) + "px";
+        tip.style.left = Math.max(4, Math.min(Math.max(box.width, stage.scrollWidth) - tip.offsetWidth - 4, x + 16)) + "px";
         tip.style.top = Math.max(4, Math.min(box.height - tip.offsetHeight - 4, y + 14)) + "px";
       };
       // a pin restored by the live redraw runs before the new stage is in the page: measured then, the card clamps to the corner,
@@ -1183,7 +1189,7 @@
       const g = nodeOf(ev.target), n = g ? byId.get(g.dataset.node) : null;
       if (!n) { tip.hidden = true; return; }
       const box = stage.getBoundingClientRect();
-      showTip(n, ev.clientX - box.left, ev.clientY - box.top);
+      showTip(n, ev.clientX - box.left + stage.scrollLeft, ev.clientY - box.top);
     });
     stage.addEventListener("pointerleave", () => { if (!pinned) hideTip(); });
     const syncPins = () => {
@@ -1191,15 +1197,34 @@
       for (const g of svgNode.querySelectorAll("[data-node]")) g.setAttribute("aria-pressed", pinned && pinned.id === g.dataset.node ? "true" : "false");
     };
     // the one pin/let-go move, for a click and for a key: the same node again, or no node, lets go
+    // a node's ring centre in stage px, or null while it has no box (the stage is not in the page yet)
+    const ringCentre = (id) => {
+      const g = svgNode && Array.from(svgNode.querySelectorAll("[data-node]")).find((e) => e.dataset.node === id);
+      if (!g) return null;
+      const rc = (g.querySelector(".tv-ring") || g).getBoundingClientRect(), box = stage.getBoundingClientRect();
+      return rc.width ? { x: rc.left + rc.width / 2 - box.left + stage.scrollLeft, y: rc.top + rc.height / 2 - box.top } : null;
+    };
     const toggle = (n, x, y) => {
       if (!n || (pinned && pinned.id === n.id)) { pinned = null; hideTip(); }
-      else { pinned = { id: n.id, x, y }; showTip(n, x, y); }
+      else {
+        const c = ringCentre(n.id);
+        pinned = { id: n.id, x, y, dx: c ? x - c.x : 0, dy: c ? y - c.y : 0 };   // where the card sits relative to its node, kept across layouts
+        showTip(n, x, y);
+      }
       syncPins();
+    };
+    // the card stays on its node through every layout (a live relayout moves the node, a resize moves the whole graph), not only a stage replacement
+    reanchorPin = () => {
+      if (!pinned || !stage.isConnected) return;
+      const c = ringCentre(pinned.id), n = byId.get(pinned.id);
+      if (!c || !n) return;
+      pinned.x = c.x + (pinned.dx || 0); pinned.y = c.y + (pinned.dy || 0);
+      showTip(n, pinned.x, pinned.y);
     };
     stage.addEventListener("click", (ev) => {
       const g = nodeOf(ev.target), n = g ? byId.get(g.dataset.node) : null;
       const box = stage.getBoundingClientRect();
-      toggle(n, ev.clientX - box.left, ev.clientY - box.top);
+      toggle(n, ev.clientX - box.left + stage.scrollLeft, ev.clientY - box.top);
     });
     // keyboard: a focused node pins on Enter or Space as a click does (a waiting node also opens its card, as its click does); Esc lets go
     stage.addEventListener("keydown", (ev) => {
@@ -1209,13 +1234,13 @@
       if (!n) return;
       ev.preventDefault();
       const ring = g.querySelector(".tv-ring") || g, rc = ring.getBoundingClientRect(), box = stage.getBoundingClientRect();
-      toggle(n, rc.left + rc.width / 2 - box.left, rc.top + rc.height / 2 - box.top);
+      toggle(n, rc.left + rc.width / 2 - box.left + stage.scrollLeft, rc.top + rc.height / 2 - box.top);
     });
     // a redraw replaces the focused node: keyboard focus follows the id to its new element (focus that leaves while the node is still there clears it)
     stage.addEventListener("focusin", (ev) => { const g = nodeOf(ev.target); if (g) kbFocus = g.dataset.node; });
     stage.addEventListener("focusout", (ev) => { const t = ev.target; root.setTimeout(() => { if (t.isConnected) kbFocus = null; }, 0); });
     stage.appendChild(tip);
-    if (pinned && byId.has(pinned.id)) { showTip(byId.get(pinned.id), pinned.x, pinned.y); } else pinned = null;
+    if (pinned && byId.has(pinned.id)) { showTip(byId.get(pinned.id), pinned.x, pinned.y); root.requestAnimationFrame ? root.requestAnimationFrame(() => reanchorPin && reanchorPin()) : null; } else pinned = null;
     if (kbFocus && byId.has(kbFocus) && typeof root.requestAnimationFrame === "function") {
       const want = kbFocus;
       root.requestAnimationFrame(() => {
