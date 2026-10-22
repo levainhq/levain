@@ -818,7 +818,6 @@
     ".tv-graph .tv-facebg { fill-opacity: .84; } .tv-graph .tv-lblbg { fill-opacity: .88; }",
     ".tv-graph .tv-facebg, .tv-graph .tv-lblbg { filter: drop-shadow(0 0 6px var(--base)); }",
     ".tv-graph .tv-gnode:focus-visible .tv-facebg { stroke: var(--accent); stroke-width: 2; }",
-    ".tv-graph .tv-gnode[aria-pressed=\"true\"] .tv-ring { stroke-width: 2.6; }",
     ".tv-graph .tv-gring { opacity: .5; }",
     // the theme token sets the seat glow's strength (a light stage takes less)
     ".tv-glow { --_na: calc(var(--glow-a, .35) * .4 + .07); pointer-events: none; }",
@@ -956,11 +955,10 @@
       const risk = riskTitle(lost.get(n.id));
       if (risk) g.appendChild(sv("circle", { cx: num(P.x + dir * 12), cy: num(P.y - 12), r: 3.5 }, "tv-gnode-risk"));
       g.dataset.face = [f.tag, f.l1, f.l2, f.l3].filter(Boolean).join(" | ");
-      // every node is a keyboard stop: Enter or Space pins its card as a click does, Esc lets go (agentsLens binds the keys)
+      // every node is a keyboard stop: Enter or Space opens its page as a click does (agentsLens binds the keys)
       g.setAttribute("role", "button");
       g.setAttribute("tabindex", "0");
-      g.setAttribute("aria-pressed", pinned && pinned.id === n.id ? "true" : "false");
-      g.setAttribute("aria-label", n.label + ", " + (NODE_WORDS[n.state] || n.state) + ": pin its card");
+      g.setAttribute("aria-label", n.label + ", " + (NODE_WORDS[n.state] || n.state) + ": open its page");
       if (wait && typeof n.card === "string" && n.card && opts && typeof opts.openCard === "function") {
         g.classList.add("tv-open");
         g.setAttribute("aria-label", n.label + ", waiting on you: open its card");
@@ -1093,13 +1091,13 @@
     return () => { stopped = true; if (raf && root.cancelAnimationFrame) root.cancelAnimationFrame(raf); PART.length = 0; };
   }
 
-  let pinned = null;                                                      // the node whose card a click pinned: {id, x, y} in stage px
+  let pinned = null;                                                      // the fallback pin (no agent page in the page): {id, x, y, dx, dy} in stage px
   let kbFocus = null;                                                     // the node id the keyboard focus sits on, kept across a redraw
   function agentsLens(v, opts) {
     release();
     const wrap = el("div", "tv-agents");
     const stage = el("div", "tv-stage");
-    const hint = el("span", "tv-hint", "Click a node for its card. Hover for the face.");
+    const hint = el("span", "tv-hint", "Click a node for its page. Hover for the face.");
     stage.appendChild(hint);
     const canvas = el("canvas", "tv-particles");
     canvas.setAttribute("aria-hidden", "true");
@@ -1125,7 +1123,7 @@
       const L = layoutGraph(v, LW, measure);
       assignSeats(L);
       const edges = graphEdges(v, L);
-      hint.textContent = phone ? "Swipe sideways to pan. Tap a node for its card." : "Click a node for its card. Hover for the face.";
+      hint.textContent = phone ? "Swipe sideways to pan. Tap a node for its page." : "Click a node for its page. Hover for the face.";
       if (streamStop) { streamStop(); streamStop = null; }
       if (svgNode) svgNode.remove();
       const g = drawGraph(v, L, edges, measure, opts);
@@ -1163,8 +1161,7 @@
     // the hover card follows the pointer over a node, inside the stage
     const nodeOf = (t) => (t && t.closest ? t.closest("[data-node]") : null);
     const byId = new Map(arr(v.nodes).map((n) => [n.id, n]));
-    // a click pins the card on its node (a touch screen has no hover; a mouse user wants it to stay still to read), a click
-    // elsewhere in the graph lets go. The pin survives the live redraw, which rebuilds this lens.
+    // a click opens the node's page (the dashboard's modal); a page without the dashboard shows the card at the click point instead
     const showTip = (n, x, y) => {
       if (tip.dataset.node !== n.id) {
         tip.dataset.node = n.id;
@@ -1213,6 +1210,15 @@
       }
       syncPins();
     };
+    // the one open move, for a click and for a key. A waiting node with a needs card keeps its own handler (opts.openCard).
+    // With the dashboard's agent page present a click opens it (K13-7); a page without the dashboard falls back to pinning the card.
+    const openPage = (g, n, x, y) => {
+      if (!n) { toggle(null); return; }
+      if (g.classList.contains("tv-open")) return;
+      const A = root.LevainAgentPage;
+      if (A && typeof A.open === "function") { hideTip(); A.open({ id: n.id, label: n.label, rows: tipRows(n, v.as_of), session: typeof n.session === "string" ? n.session : "" }, g); }
+      else toggle(n, x, y);
+    };
     // the card stays on its node through every layout (a live relayout moves the node, a resize moves the whole graph), not only a stage replacement
     reanchorPin = () => {
       if (!pinned || !stage.isConnected) return;
@@ -1224,17 +1230,16 @@
     stage.addEventListener("click", (ev) => {
       const g = nodeOf(ev.target), n = g ? byId.get(g.dataset.node) : null;
       const box = stage.getBoundingClientRect();
-      toggle(n, ev.clientX - box.left + stage.scrollLeft, ev.clientY - box.top);
+      openPage(g, n, ev.clientX - box.left + stage.scrollLeft, ev.clientY - box.top);
     });
-    // keyboard: a focused node pins on Enter or Space as a click does (a waiting node also opens its card, as its click does); Esc lets go
+    // keyboard: a focused node opens its page on Enter or Space as a click does
     stage.addEventListener("keydown", (ev) => {
-      if (ev.key === "Escape") { if (pinned) { ev.preventDefault(); toggle(null); } return; }
       if (ev.key !== "Enter" && ev.key !== " ") return;
       const g = nodeOf(ev.target), n = g ? byId.get(g.dataset.node) : null;
       if (!n) return;
       ev.preventDefault();
       const ring = g.querySelector(".tv-ring") || g, rc = ring.getBoundingClientRect(), box = stage.getBoundingClientRect();
-      toggle(n, rc.left + rc.width / 2 - box.left + stage.scrollLeft, rc.top + rc.height / 2 - box.top);
+      openPage(g, n, rc.left + rc.width / 2 - box.left + stage.scrollLeft, rc.top + rc.height / 2 - box.top);
     });
     // a redraw replaces the focused node: keyboard focus follows the id to its new element (focus that leaves while the node is still there clears it)
     stage.addEventListener("focusin", (ev) => { const g = nodeOf(ev.target); if (g) kbFocus = g.dataset.node; });
