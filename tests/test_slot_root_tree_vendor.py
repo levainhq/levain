@@ -18,15 +18,22 @@ def _tree(host):
     return f"{'/usr/local/lib' if host == 'darwin' else '/usr/lib'}/levain-root"
 
 
+#: Row 33 R1: tree_steps stages into ONE generation; the id is planned (a fake source cannot be hashed).
+GEN = "gen-0123456789abcdef"
+
+
 @pytest.mark.parametrize("host", HOSTS)
 def test_root_tree_vendors_deps(host):
     h11_dir = Path("/venv/site-packages/h11")
-    steps = root_tree.tree_steps(host, Path("/src/levain"), h11_dir=h11_dir)
+    steps = root_tree.tree_steps(host, Path("/src/levain"), h11_dir=h11_dir, generation=GEN)
     tree = _tree(host)
+    partial = f"{tree}/staging.partial"
     argvs = [s.argv for s in steps if s.argv]
     cps = [a for a in argvs if a[0].endswith("cp")]
-    assert [(a[-2], a[-1]) for a in cps] == [("/src/levain", f"{tree}/levain.new"), (str(h11_dir), f"{tree}/h11.new")]
-    # h11 gets the whole staged discipline, in order: no-link check < chown -R < chmod -R < foreign check < swap
+    assert [(a[-2], a[-1]) for a in cps] == [("/src/levain", f"{partial}/levain"), (str(h11_dir), f"{partial}/h11")]
+    # h11 gets the whole staged discipline, in order: no-link check < chown -R < chmod -R < foreign check < its floor
+    # read as text < the staged id check < the rename of the ONE generation into the tree (row 33 R1: no swap of
+    # a top-level h11 any more; levain and h11 move together)
     why = [s.why for s in steps]
     start = next(i for i, a in enumerate(why) if "copy the h11 package" in a)
     seg = steps[start:]
@@ -34,29 +41,39 @@ def test_root_tree_vendors_deps(host):
     chown = next(i for i, s in enumerate(seg) if s.argv and s.argv[0].endswith("chown") and "-R" in s.argv)
     chmod = next(i for i, s in enumerate(seg) if s.argv and s.argv[0].endswith("chmod") and "-R" in s.argv)
     foreign = next(i for i, s in enumerate(seg) if s.call and "only root's plain files" in s.why)
-    aside = next(i for i, s in enumerate(seg) if s.argv and s.argv[1:] == (f"{tree}/h11", f"{tree}/h11.old"))
-    into = next(i for i, s in enumerate(seg) if s.argv and s.argv[1:] == (f"{tree}/h11.new", f"{tree}/h11"))
-    assert no_link < chown < chmod < foreign < aside < into
-    assert seg[aside].skip_if[-3:] == ("!", "-e", f"{tree}/h11")
+    floor = next(i for i, s in enumerate(seg) if s.call and "staged h11 is at least" in s.why)
+    hashed = next(i for i, s in enumerate(seg) if s.call and f"hashes to {GEN}" in s.why)
+    into = next(i for i, s in enumerate(seg) if s.call and s.why == f"rename {partial} to {tree}/{GEN}")
+    flip = next(i for i, s in enumerate(seg) if s.call and s.why.startswith("flip "))
+    assert no_link < chown < chmod < foreign < floor < hashed < into < flip
+    assert chown == next(i for i, s in enumerate(seg) if s.argv and s.argv[0].endswith("chown"))   # no earlier chown
+    # nothing names the legacy top-level h11 or levain: the only tree paths touched are the partial and the generation
+    assert not [a for a in argvs if any(x in (f"{tree}/h11", f"{tree}/levain") for x in a)]
     # the entries are unchanged: keys gets no installed entry in 3b
     assert {s.write[0].name for s in steps if s.write} == {"install-helper", "runtime-helper", "service-entry"}
     # the real h11 the installing Levain imports is the default source, and it passes the floor
     real = root_tree.h11_source()
     assert real.name == "h11" and (real / "__init__.py").is_file()
-    assert root_tree.tree_steps(host, Path("/src/levain"))[0].why == steps[0].why
+    assert root_tree.tree_steps(host, Path("/src/levain"), generation=GEN)[0].why == steps[0].why
 
 
 def test_root_tree_refuses_a_bad_h11(monkeypatch, tmp_path):
     pkg = tmp_path / "h11"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
+    (pkg / "_version.py").write_text('__version__ = "0.15.9"\n')      # row 33: the floor reads this as text
     fake = types.ModuleType("h11")
-    fake.__file__, fake.__version__ = str(pkg / "__init__.py"), "0.15.9"
+    fake.__file__ = str(pkg / "__init__.py")
     monkeypatch.setitem(sys.modules, "h11", fake)
     with pytest.raises(Refused) as e:
         root_tree.h11_source()
-    assert e.value.name == "bad-root" and "older" in str(e.value)
-    fake.__version__, fake.__file__ = "0.16.0", "/x/h11.py"
+    assert e.value.name == "bad-root" and "is older than" in str(e.value)
+    # a package with no readable version is refused too (never read by importing it)
+    (pkg / "_version.py").unlink()
+    with pytest.raises(Refused) as e:
+        root_tree.h11_source()
+    assert e.value.name == "bad-root" and "no readable version" in str(e.value)
+    fake.__file__ = "/x/h11.py"
     with pytest.raises(Refused):
         root_tree.h11_source()
     with pytest.raises(Refused):
@@ -108,12 +125,15 @@ def test_h11_version_floor(monkeypatch, tmp_path, version, ok):
     pkg = tmp_path / "h11"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
+    (pkg / "_version.py").write_text(f'__version__ = "{version}"\n')  # row 33: read as text, never imported
     fake = types.ModuleType("h11")
-    fake.__file__, fake.__version__ = str(pkg / "__init__.py"), version
+    fake.__file__ = str(pkg / "__init__.py")
     monkeypatch.setitem(sys.modules, "h11", fake)
     if ok:
         assert root_tree.h11_source() == pkg
+        assert root_tree.h11_floor(pkg) == version
     else:
         with pytest.raises(Refused) as e:
             root_tree.h11_source()
-        assert "older" in str(e.value)
+        # "is older than", not "older": the macOS tmp path holds "folders", so a bare "older" matched any refusal
+        assert "is older than" in str(e.value)

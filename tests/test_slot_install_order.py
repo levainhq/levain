@@ -4,6 +4,7 @@ root tree's checks. Plan and text assertions; the only files touched are pytest 
 from __future__ import annotations
 
 import os
+import re
 import stat
 import subprocess
 from pathlib import Path
@@ -143,14 +144,26 @@ def test_partial_setup_reruns(host):
     assert dict(again.allocation.ids) == ids and dict(again.allocation.shared) == dict(first.allocation.shared)
     assert set(again.kept) == set(live) and again.revived == ()
     assert [s.tag for s in again.allocation.slots] == [s.tag for s in first.allocation.slots]
-    # the same steps, so the re-run converges on the same install
-    assert [s.why for s in again.steps] == [s.why for s in first.steps]
-    for s in again.steps:
+    # the same steps, so the re-run converges on the same install. Row 33 R1: with no journal to resume (this
+    # re-run is planned blind) each plan mints its own txn, which two step texts name; nothing else may differ
+    txn = re.compile(r"txn [0-9a-f]{32}")
+    assert first.intent.txn != again.intent.txn
+    assert [txn.sub("txn T", s.why) for s in again.steps] == [txn.sub("txn T", s.why) for s in first.steps]
+    assert sum(1 for s in first.steps if txn.search(s.why)) == 2          # the journal write and the install record
+    # re-planned FROM ITS JOURNAL (what a real re-run reads) the steps are identical, txn included
+    resumed = _plan(host, 3, 2, existing_names=names, used_ids=frozenset(live.values()), levain_live=live,
+                    intent=first.intent, host_ids=live)
+    assert resumed.intent == first.intent
+    assert [s.why for s in resumed.steps] == [s.why for s in first.steps]
+    for prev, s in zip((None, *again.steps), again.steps):
         if s.argv and (Path(s.argv[0]).name in _NOT_IDEMPOTENT or "netns" in s.argv[1:3] and "add" in s.argv
                        or "bootstrap" in s.argv):
             assert s.skip_if, s.why
         if s.argv and Path(s.argv[0]).name == "mkdir" and "-p" not in s.argv:
-            assert s.skip_if, s.why
+            # Row 33 R1: the one exception is a dir the step just before removed (staging.partial: rm -rf, then a
+            # fresh 0700 mkdir), which a re-run always finds absent; a skip_if there would stage into a stale copy
+            cleared = prev is not None and prev.argv[1:] == ("-rf", s.argv[-1]) and Path(prev.argv[0]).name == "rm"
+            assert s.skip_if or (cleared and not prev.skip_if), s.why
         if s.argv and Path(s.argv[0]).name == "mv":
             assert s.skip_if or s.argv[-2].endswith(("levain.new", "h11.new")), s.why
         if s.write and s.write[1] == "":            # an empty file row (a lock): never replaced under a holder
@@ -369,23 +382,81 @@ def test_root_tree_ancestry_follows_links_to_their_real_parents():
 
 @pytest.mark.parametrize("host", HOSTS)
 def test_tree_links_refused_before_chown_and_renamed_into_place(host):
-    steps = root_tree.tree_steps(host, Path("/src/levain"))
+    """Row 33 R1 (DESIGN 1022-8/upgrade §2.3 R2-R3, R9): the package is staged in ``staging.partial``, checked for links
+    before any chown or chmod, renamed whole to ``gen-<id>``, then ``current`` flips to it; the live generation is
+    never removed or written into. (The ``.new``/``.old`` swap this test pinned before R1 is deleted, §2.5.)"""
+    gen = "gen-0123456789abcdef"
+    steps = root_tree.tree_steps(host, Path("/src/levain"), generation=gen)
     tree = f"{'/usr/local/lib' if host == 'darwin' else '/usr/lib'}/levain-root"
+    partial = f"{tree}/staging.partial"
     why = [s.why for s in steps]
     no_link = next(i for i, w in enumerate(why) if "holds no link" in w)
     chown_r = next(i for i, s in enumerate(steps) if s.argv and s.argv[0].endswith("chown") and "-R" in s.argv)
     chmod_r = next(i for i, s in enumerate(steps) if s.argv and s.argv[0].endswith("chmod") and "-R" in s.argv)
     assert no_link < chown_r < chmod_r
-    # never rm -rf the live package then mv: rename it aside, rename the staged one in, remove the old
+    assert steps[chown_r].argv[-1] == partial and steps[chmod_r].argv[-1] == partial
+    # never rm -rf the live package: the only removals are the partial and a stale copy at the target's own name
     argvs = [s.argv for s in steps if s.argv]
-    assert not [a for a in argvs if a[0].endswith("rm") and a[-1] == f"{tree}/levain"]
-    aside = argvs.index(next(a for a in argvs if a[1:] == (f"{tree}/levain", f"{tree}/levain.old")))
-    into = argvs.index(next(a for a in argvs if a[1:] == (f"{tree}/levain.new", f"{tree}/levain")))
-    drop = argvs.index(next(a for a in argvs if a[1:] == ("-rf", f"{tree}/levain.old")))
-    assert aside < into < drop
-    assert next(s for s in steps if s.argv == argvs[aside]).skip_if[-3:] == ("!", "-e", f"{tree}/levain")
+    rms = [a[-1] for a in argvs if a[0].endswith("/rm")]
+    assert set(rms) == {partial, f"{tree}/{gen}"}
+    assert not [a for a in argvs if any(x in (f"{tree}/levain", f"{tree}/current") for x in a)]
+    into = why.index(f"rename {partial} to {tree}/{gen}")
+    durable = next(i for i, w in enumerate(why) if w.startswith(f"make {tree}/{gen} durable"))
+    flip = why.index(f"flip {tree}/current -> {gen}")
+    first_entry = next(i for i, s in enumerate(steps) if s.write)
+    assert no_link < chmod_r < into < durable < flip < first_entry
+    assert steps[into].call and steps[flip].call and not steps[flip].argv          # rename(2), never mv
+    assert not [a for a in argvs if a[0].endswith("/mv")]
     entries = {s.write[0].name for s in steps if s.write}
     assert entries == {"install-helper", "runtime-helper", "service-entry"}
+    # a re-run whose target is already current drops the partial and touches no generation
+    again = root_tree.tree_steps(host, Path("/src/levain"), generation=gen, current=gen)
+    again_rms = [s.argv[-1] for s in again if s.argv and s.argv[0].endswith("/rm")]
+    assert set(again_rms) == {partial} and not [s for s in again if s.why.startswith("rename ")]
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_resumed_setup_never_replaces_the_live_generation(host, tmp_path, monkeypatch):
+    """U14 (codex HIGH 3, complement MED 3), option (b): setup reads ``current``. A re-run whose target is already
+    current never removes the generation live services import from; a RESUMED setup that changes generation stops
+    every service this code knows before the flip, so none keeps running the old code beside the new record."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    monkeypatch.setitem(root_tree.IMPORT_TREE, host, tree)
+    stop_names = {f"stop {units.launchd_label(s) if host == 'darwin' else units.systemd_name(s)}"
+                  for s in units.services_for(host)}
+    first = _plan(host, 3, 2)
+    gen = first.generation
+    live = {**first.allocation.ids, **first.allocation.shared}
+    resumed = dict(existing_names=frozenset(live), used_ids=frozenset(live.values()), levain_live=live,
+                   intent=first.intent, host_ids=live)
+
+    def stops_and_flip(plan):
+        whys = [s.why for s in plan.steps]
+        return [i for i, w in enumerate(whys) if w in stop_names], whys.index(f"flip {tree}/current -> {gen}")
+
+    # the interrupted setup got as far as the flip: the re-run drops the partial and never rm -rf's the live gen
+    os.symlink(gen, tree / "current")
+    again = _plan(host, 3, 2, **resumed)
+    rms = [s.argv[-1] for s in again.steps if s.argv and s.argv[0].endswith("/rm")]
+    assert str(tree / gen) not in rms and not [s for s in again.steps if s.why.startswith("rename ")]
+    assert stops_and_flip(again)[0] == []                     # the same generation: nothing to stop
+    # current names another generation, or none beside the legacy tree (a levain-intent/1 setup ran from it): stop
+    os.unlink(tree / "current")
+    os.symlink("gen-" + "0" * 16, tree / "current")
+    moved = _plan(host, 3, 2, **resumed)
+    stops, flip = stops_and_flip(moved)
+    assert {moved.steps[i].why for i in stops} == stop_names and max(stops) < flip
+    # class check: a FRESH setup (no journal) stops nothing, whatever current names
+    assert stops_and_flip(_plan(host, 3, 2))[0] == []
+    os.unlink(tree / "current")
+    (tree / "levain").mkdir()
+    legacy = _plan(host, 3, 2, **resumed)
+    stops, flip = stops_and_flip(legacy)
+    assert {legacy.steps[i].why for i in stops} == stop_names and max(stops) < flip
+    # class check: no current and no legacy tree: setup never reached its flip, so nothing it started can run
+    (tree / "levain").rmdir()
+    assert stops_and_flip(_plan(host, 3, 2, **resumed))[0] == []
 
 
 def test_launchd_job_absent_reads_launchctl():

@@ -240,6 +240,7 @@ def test_units_install_only_with_their_program(host, tmp_path):
     every skipped one."""
     pkg = tmp_path / "levain"
     (pkg / "slot" / "services").mkdir(parents=True)
+    (pkg / "__init__.py").write_text('__version__ = "0.0.0"\n')          # row 33 R1: setup reads it as text
     (pkg / "slot" / "services" / "control.py").write_text("")
     plan = plan_setup(_setup(), _facts(host), read_sysctl=lambda p: "0", source=pkg)
     assert plan.services == ("control",)
@@ -252,7 +253,11 @@ def test_units_install_only_with_their_program(host, tmp_path):
     assert len(skipped) == len(units.services_for(host)) - 1
     assert all("services/control.py" not in p for p in skipped)
     # nothing built: no unit, no start step at all
-    bare = plan_setup(_setup(), _facts(host), read_sysctl=lambda p: "0", source=tmp_path / "x" / "levain")
+    empty = tmp_path / "x" / "levain"
+    empty.mkdir(parents=True)
+    (empty / "__init__.py").write_text('__version__ = "0.0.0"\n')
+    bare = plan_setup(_setup(), _facts(host), read_sysctl=lambda p: "0", source=empty)
+    assert len(bare.pending) - len(plan.pending) == 1                     # control is named skipped too
     assert bare.services == () and not [s for s in bare.steps if s.write and str(s.write[0]).startswith(unit_dir)]
     assert not [s for s in bare.steps if s.argv and ("bootstrap" in s.argv or "--now" in s.argv)]
 
@@ -343,8 +348,10 @@ def test_service_exits_without_run_dir(host):
 
 def _tree(tmp_path, host, program: str):
     tree = tmp_path / "tree"
-    shutil.copytree(Path(levain.__file__).parent, tree / "levain", ignore=shutil.ignore_patterns("__pycache__"))
-    (tree / "levain" / "slot" / "services" / "reaper.py").write_text(program)
+    gen = tree / "gen-0123456789abcdef"
+    shutil.copytree(Path(levain.__file__).parent, gen / "levain", ignore=shutil.ignore_patterns("__pycache__"))
+    (tree / "current").symlink_to(gen.name)                              # row 33 R1: the one link, relative
+    (gen / "levain" / "slot" / "services" / "reaper.py").write_text(program)
     entry = tmp_path / "service-entry"
     entry.write_text(root_tree.entry_text(host, "service-entry", tree=tree))
     return tree, entry
@@ -362,7 +369,8 @@ def test_service_entry_imports_levain(tmp_path):
                        env={"PATH": "/usr/bin:/bin"})
     assert r.returncode == 0, r.stderr
     imported, site = r.stdout.split("\n")[:2]
-    assert Path(imported).resolve() == (tree / "levain" / "__init__.py").resolve()
+    # FROM THE TREE: its current generation, never a copy elsewhere (the path the boot line resolved)
+    assert Path(imported) == (tree / "gen-0123456789abcdef" / "levain" / "__init__.py").resolve()
     assert site == "False"
     # a name not in §1.3 is refused before any program runs
     r = subprocess.run([sys.executable, "-IS", str(entry), "evil"], capture_output=True, text=True, cwd=tmp_path)
@@ -374,7 +382,7 @@ def test_service_entry_exits_without_run_dir(tmp_path):
     """§22, executed: control's entry exits EX_TEMPFAIL on a host with no R/ and never runs its program."""
     host = service_boot.host_os()
     tree, entry = _tree(tmp_path, host, "")
-    (tree / "levain" / "slot" / "services" / "control.py").write_text("print('ran')\n")
+    (tree / "current" / "levain" / "slot" / "services" / "control.py").write_text("print('ran')\n")
     r = subprocess.run([sys.executable, "-IS", str(entry), "control"], capture_output=True, text=True, cwd=tmp_path)
     assert r.returncode == service_boot.EXIT_NO_RUN_DIR and "ran" not in r.stdout
 
@@ -767,7 +775,8 @@ def test_helper_imports_root_tree_only(host):
         assert lines[0] == "#!/usr/bin/python3 -IS"                      # isolated (-I), no site dir (-S)
         assert "-I" in lines[0]
         path_lines = [ln for ln in lines if "sys.path" in ln and not ln.startswith("#")]
-        assert path_lines == [f"sys.path.insert(0, {tree!r})"]           # the tree is the ONE path added
+        # the tree is the ONE path added: its current generation, resolved once at start (row 33 R1)
+        assert path_lines == [f"import os, sys; sys.path.insert(0, os.path.realpath({tree + '/current'!r}))"]
         assert "PYTHONPATH" not in text and "site" not in text.replace("site-packages", "")
         plan = _plan(host)
         w = [s for s in plan.steps if s.write and s.write[0] == path]
@@ -775,10 +784,13 @@ def test_helper_imports_root_tree_only(host):
     plan = _plan(host)
     argvs = [s.argv for s in plan.steps if s.argv]
     cp = next(a for a in argvs if a[0].endswith("cp"))
-    assert cp[1:3] == ("-R", "-P") and cp[-1] == f"{tree}/levain.new" and Path(cp[-2]).name == "levain"
+    partial = f"{tree}/staging.partial"                                   # row 33 R1: one staged generation
+    assert cp[1:3] == ("-R", "-P") and cp[-1] == f"{partial}/levain" and Path(cp[-2]).name == "levain"
     assert any(a[0].endswith("chmod") and a[1:] == ("0755", tree) for a in argvs)
-    assert any(a[0].endswith("chmod") and a[1:] == ("-R", "u=rwX,go=rX", f"{tree}/levain.new") for a in argvs)
-    assert any(a[-2:] == (f"{tree}/levain.new", f"{tree}/levain") for a in argvs)
+    assert any(a[0].endswith("chmod") and a[1:] == ("-R", "u=rwX,go=rX", partial) for a in argvs)
+    whys = [s.why for s in plan.steps]
+    into = whys.index(f"rename {partial} to {tree}/{plan.generation}")
+    assert whys.index(f"flip {tree}/current -> {plan.generation}") > into
     checks = [s.why for s in plan.steps if s.call]
     assert any("only root's plain files" in w for w in checks)
     assert any(f"above {tree} is root's alone" in w for w in checks)

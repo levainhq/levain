@@ -418,6 +418,7 @@ def _darwin_fixture(tmp_path):
         ". -list /Users RealName": f"root System  Administrator\n{OP} Alice\n_levain_s3 Levain session account\n"
                                    "_levain_s1 Levain session account (retired)\n",
         ". -list /Groups RealName": "wheel\nlevain-slots Levain session account\n",
+        ". -list /Groups GroupMembership": "wheel root\nlevain-slots _levain_s3\n",   # row 33 §3: membership read
     })
     L = tmp_path / "L"
     (L / "policy").mkdir(parents=True)
@@ -428,7 +429,7 @@ def _darwin_fixture(tmp_path):
     state.mkdir()
     (state / RETIRED_IDS_PATH["darwin"].name).write_text("7\n")
     (state / "install-intent").write_text(intent_text(Intent("setup", OP, {"_levain_keys": keys},
-                                                             {"levain-slots": slots_gid})))
+                                                             {"levain-slots": slots_gid}, "0" * 32)))
     return run, L, state, dict(s3=s3, s1=s1, gid=slots_gid)
 
 
@@ -451,6 +452,29 @@ def test_gather_facts_darwin(tmp_path):
     g = gather_facts(parse_install_argv(SETUP), "darwin", OP_UID, run=run, store_seams=_store_seams(L),
                      state_dir=state, user_name=lambda uid: OP)
     assert g.facts.operator_uid == OP_UID
+
+
+@pytest.mark.parametrize("bad", [b'{"format":"levain-install-shape/1","generation"', b'{"format":"levain-install-shape/2"}'])
+def test_a_corrupt_install_shape_blocks_repair_not_undo(tmp_path, bad):
+    """U15 (complement MED 4): undo is the recovery verb, so an unparseable install-shape (truncated, or a newer
+    format) is read as absent for undo, which then plans exactly what it plans on a host with no record file;
+    repair and replenish still refuse it."""
+    run, L, state, _ = _darwin_fixture(tmp_path)
+
+    def gathered(verb):
+        return gather_facts(parse_install_argv(verb), "darwin", OP_UID, run=run, store_seams=_store_seams(L),
+                            state_dir=state, user_name=lambda uid: OP)
+
+    absent = gathered(["undo"])
+    (L / "policy" / "install-shape").write_bytes(bad)
+    corrupt = gathered(["undo"])
+    assert corrupt.facts.install_shape is None
+    assert corrupt.facts == absent.facts and corrupt.accounts == absent.accounts     # plan_undo reads only these
+    assert corrupt.shared_groups == absent.shared_groups
+    for verb in (["repair"], ["replenish"]):
+        with pytest.raises(Refused) as ei:
+            gathered(verb)
+        assert ei.value.name == "install-shape-malformed", verb
 
 
 def test_gather_facts_linux_groups_carry_no_label(tmp_path):

@@ -423,7 +423,8 @@ def test_sudoers_text(host):
     for ok in ("alice", "default", "alias", "bob_aliases"):
         assert install_sudoers_text(host, ok)                 # positive control: the reserved words only
     plan = plan_setup(_setup(), _facts(host))
-    last = plan.steps[-4:-2]
+    last = plan.steps[-5:-3]          # row 33: the install record is written between them and the operator record
+    assert plan.steps[-3].why.startswith("write the install record")
     assert [s.write[0] for s in last] == [RUNTIME_SUDOERS, INSTALL_SUDOERS]
     assert all(s.write[2] == 0o440 and s.validate[-1] == "-cf" for s in last)
 
