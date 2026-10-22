@@ -70,6 +70,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   terminal, outside it"). The workspace is read from a record Levain keeps outside every workspace
   (`<levain home>/consent/coordinator_workspaces.json`), so a coordinator that deletes or damages its own marker is still
   doored. `levain coord agent claude --cwd DIR` refuses a directory that is your own Levain install.
+
 ### Fixed
 - **The phone page's top bar holds on a narrow phone.** On a narrow phone, or a wider font, the theme switch could
   wrap onto a row of its own. The bar now stays one row from 320 to 430 px wide, and a long white-label name is cut
@@ -96,8 +97,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
     nobody can answer there. A server you add yourself still asks.
 
 ### Groundwork for isolation (nothing here is reachable from a `levain` command yet)
-- **The isolation gateway and its session store are being built behind the install that does not exist yet.** No
-  command starts any of it, and it needs the extra `levain[isolation]` (h11 >= 0.16.0). What has landed: the egress
+- **The isolation gateway and its session store are being built; the install step that would run them is not built
+  yet.** No command starts any of it, and it needs the extra `levain[isolation]` (h11 >= 0.16.0). What has landed: the egress
   proxy (`CONNECT <host>:443` to an allow-listed host only, address validated once and connected to directly, TLS
   `ClientHello` must name the same host); the brokered front and its keys service (who may connect, per-session caps,
   a refused request answered rather than reset); a reaper service that sweeps dead sessions and revokes the sessions
