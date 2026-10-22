@@ -278,6 +278,23 @@ def _resolve_done(t: asyncio.Task) -> None:
         t.exception()
 
 
+def _same_uint(v: object, want: int) -> bool:
+    return type(v) is int and v == want
+
+
+def front_binding(answer: dict, reg: "Registration") -> bool:
+    """A TOKEN-RESOLVE answer binds to `reg` only when its session is `reg`'s and its claims name `reg`'s front
+    exactly: CONTROL's persisted claims carry `front: {uid, pid, start}` and `incarnation`, and each must be present,
+    an integer, and equal to the registration's. A missing or mistyped field fails the binding, never defaults to the
+    registration's own value."""
+    claims = answer.get("claims")
+    front = claims.get("front") if type(claims) is dict else None
+    return (answer.get("session") == reg.session and type(front) is dict
+            and _same_uint(front.get("uid"), reg.front_uid) and _same_uint(front.get("pid"), reg.pid)
+            and _same_uint(front.get("start"), reg.start)
+            and _same_uint(claims.get("incarnation"), reg.incarnation))
+
+
 def encode_admin(answer: dict) -> bytes:
     data = canon.canonical_bytes(answer)
     return len(data).to_bytes(4, "big") + data
@@ -414,8 +431,10 @@ class Keys:
         self.cache: Dict[str, dict] = {}
         #: digests keys itself saw dropped (bounded, oldest first): `token-revoked` without asking
         self.dropped: "OrderedDict[str, None]" = OrderedDict()
-        #: the per-digest single-flight: (admin_epoch, digest) -> the table-owned resolve task
-        self.resolving: Dict[Tuple[int, str], asyncio.Task] = {}
+        #: the per-digest single-flight: (admin_epoch, registration, digest) -> the table-owned resolve task. Keyed by
+        #: the asking registration too, so no registration joins a resolve another one started (one started before a
+        #: drop can never answer the registration that replaced it), and a detach cancels its own registration's.
+        self.resolving: Dict[Tuple[int, "Registration", str], asyncio.Task] = {}
         self.resolve_sem: Optional[asyncio.Semaphore] = None   # the global RESOLVE_CONNS
         self.servers: list = []
         self.state_lock: Optional[asyncio.Lock] = None
@@ -513,9 +532,10 @@ class Keys:
     async def _close(self) -> None:
         """Shutdown is a transition (design 1.5 "Shutdown's order"), run once behind the latch: wait for a start() in
         progress to return (its only awaits are its server creations); phase 1 over every registration; (1) the
-        listeners' synchronous close; (2) phase 2; (2b) the adopted admin connection closed (the EOF it wakes finds
-        the table empty); (3) the credential layer's detached tasks cancelled; (4) ONE bounded wait over the
-        listeners' closure and the detached exchange tasks, nothing cancelled. Steps (1) to (3) have no await between
+        listeners' synchronous close; (2) phase 2; (2b) the adopted admin connection's transport aborted and its
+        read loop and request tasks cancelled (the EOF path the read loop runs finds the table empty); (3) the
+        credential layer's detached tasks cancelled; (4) ONE bounded wait over the listeners' closure, the detached
+        exchange tasks and the admin tasks, nothing cancelled by the wait itself. Steps (1) to (3) have no await between
         them, and a failure of one step never skips the rest."""
         assert self._done is not None and self.state_lock is not None
         try:
@@ -528,17 +548,23 @@ class Keys:
             for s in self.servers:          # (1) the listeners' synchronous close: no accept after this
                 s.close()
             self._effects(victims)          # (2) phase 2
-            if self.admin is not None:      # (2b)
+            admin_tasks: Set[asyncio.Task] = set()
+            adm = self.admin
+            if adm is not None:             # (2b) aborted, not closed: a CONTROL that stopped reading holds a close
                 try:
-                    self.admin.writer.close()
+                    adm.writer.transport.abort()
                 except Exception as e:
-                    _note(logging.WARNING, "levain gw-keys: closing the admin connection failed (%s)", type(e).__name__)
+                    _note(logging.WARNING, "levain gw-keys: aborting the admin connection failed (%s)", type(e).__name__)
+                for t in {adm.task} | set(adm.tasks):   # its read loop (whose EOF path finds the table empty) and requests
+                    if t is not None and t is not asyncio.current_task() and not t.done():
+                        t.cancel()
+                        admin_tasks.add(t)
             try:                            # (3)
                 self.cred_lifecycle.cancel_detached()
             except Exception as e:
                 _note(logging.WARNING, "levain gw-keys: cred_lifecycle.cancel_detached failed (%s)", type(e).__name__)
             closures = {asyncio.ensure_future(s.wait_closed()) for s in self.servers}
-            waitset = closures | tasks
+            waitset = closures | tasks | admin_tasks
             if waitset:                     # an empty set is a ValueError; nothing pending past the deadline is cancelled
                 await asyncio.wait(waitset, timeout=SHUTDOWN_WAIT_S)
         finally:
@@ -617,6 +643,9 @@ class Keys:
             del self.cache[digest]
             if revoke:
                 self._mark_dropped(digest)
+        for key, t in list(self.resolving.items()):
+            if key[1] is reg:
+                t.cancel()   # only this registration's exchanges await it: its permits are freed now, not at RESOLVE_S
         reg.state = "dropped"
         victims = ([reg.status] if reg.status is not None else []) + list(reg.pending) + list(reg.exchanges)
         reg.status = None
@@ -633,17 +662,17 @@ class Keys:
 
     def _detach_all(self) -> List[Victim]:
         """Phase 1 of the fail-closed clear (caller holds state_lock; no await): every registration detached, every
-        `Upstream` ahead of every connection, the token cache and the dropped set cleared, and every resolve task of
-        an older epoch cancelled (every one, once closing). `reg_high` is kept: a clear never lowers a fence."""
+        `Upstream` ahead of every connection, the token cache and the dropped set cleared, and every resolve task
+        cancelled (the table is empty after it, so no resolve has a registration left to answer, whatever its epoch).
+        `reg_high` is kept: a clear never lowers a fence."""
         regs = {id(r): r for r in list(self.regs.values()) + list(self.by_session.values())}
         got: List[Victim] = []
         for reg in regs.values():
             got += self._detach(reg)
         self.cache.clear()
         self.dropped.clear()
-        for (epoch, _digest), t in list(self.resolving.items()):
-            if epoch != self.admin_epoch or self.closing:
-                t.cancel()   # its permits are freed now, not at its deadline; its `finally` pops the entry
+        for t in list(self.resolving.values()):
+            t.cancel()   # its permits are freed now, not at its deadline; its `finally` pops the entry
         return [v for v in got if isinstance(v, Upstream)] + [v for v in got if not isinstance(v, Upstream)]
 
     def _mark_dropped(self, digest: str) -> None:
@@ -965,10 +994,10 @@ class Keys:
 
     def _current(self, conn: Conn) -> bool:
         """Under state_lock: the exchange may still mutate shared state (its epoch current, not detached, its
-        registration the current one, not closing)."""
+        registration the current one for both its front and its session, not closing)."""
         reg = conn.reg
         return (not conn.detached and not self.closing and conn.admin_epoch == self.admin_epoch
-                and self.regs.get(reg.front_uid) is reg)
+                and self.regs.get(reg.front_uid) is reg and self.by_session.get(reg.session) is reg)
 
     async def _serve_q(self, conn: Conn, frames: FrameReader, side: KeysSide, q: dict) -> None:
         """The `Q` handler: the token state first. A stale or detached exchange ends with NO answer (its front
@@ -987,7 +1016,10 @@ class Keys:
         """`{"answer": {"session", "claims"}}`, `{"refused": name}`, or None for a stale exchange (no answer). A
         cached digest and one in flight take no permit; a dropped one is `token-revoked` without asking; otherwise
         the first `Q` (the owner) starts the table-owned resolve and every `Q` awaits it through a shield, within
-        RESOLVE_S of its own arrival."""
+        RESOLVE_S of its own arrival. The answer must bind to the asking registration (`front_binding`) before
+        anything else; only a bound answer enters the cache, under state_lock, with the asking registration still
+        current and the digest not dropped, so no answer of another session, and none that a drop overtook, is ever
+        cached."""
         if TOKEN_RE.match(token) is None:
             return {"refused": "token-invalid"}
         digest = norm.digest_of_token(token)
@@ -1002,7 +1034,7 @@ class Keys:
             if hit is None and digest in self.dropped:
                 return {"refused": "token-revoked"}
             if hit is None:
-                key = (conn.admin_epoch, digest)
+                key = (conn.admin_epoch, reg, digest)
                 task = self.resolving.get(key)
                 if task is None:
                     task = asyncio.ensure_future(self._resolve(key, reg, deadline))
@@ -1017,17 +1049,20 @@ class Keys:
                 return {"refused": "keys-unavailable"}
             if res[0] == "refused":
                 return {"refused": RESOLVE_REFUSALS[res[1]]}
-            hit = res[1]
+            if not front_binding(res[1], reg):
+                return {"refused": "front-mismatch"}
             async with self.state_lock:      # the claims enter the cache only as a fenced mutation
                 if not self._current(conn):
                     return None
-                self.cache[digest] = hit
-        if hit["session"] != reg.session or hit["claims"].get("front_uid", reg.front_uid) != reg.front_uid \
-                or hit["claims"].get("incarnation", reg.incarnation) != reg.incarnation:
+                if digest in self.dropped:
+                    return {"refused": "token-revoked"}
+                self.cache[digest] = res[1]
+            return {"answer": res[1]}
+        if not front_binding(hit, reg):
             return {"refused": "front-mismatch"}
         return {"answer": hit}
 
-    async def _resolve(self, key: Tuple[int, str], reg: Registration, deadline: float) -> tuple:
+    async def _resolve(self, key: Tuple[int, Registration, str], reg: Registration, deadline: float) -> tuple:
         """The table-owned resolve task: its TYPED outcome is `("answer", {"session", "claims"})`,
         `("refused", "token-unknown" | "token-revoked")` or `("failed",)` (any Exception, the deadline included); it
         never raises one to its awaiters. It holds the permits itself, per-session FIRST, global second, each
@@ -1037,7 +1072,7 @@ class Keys:
                 reg.resolve_sem = asyncio.Semaphore(RESOLVE_PER_SESSION)
             assert self.resolve_sem is not None
             loop = asyncio.get_running_loop()
-            return await asyncio.wait_for(self._resolve_permitted(reg.resolve_sem, key[1]),
+            return await asyncio.wait_for(self._resolve_permitted(reg.resolve_sem, key[2]),
                                           max(0.0, deadline - loop.time()))
         except Exception:
             return ("failed",)

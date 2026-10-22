@@ -445,12 +445,13 @@ def test_resolve_fenced_across_preemption_then_shutdown_order(monkeypatch):
     # R21 (design 1.5): a TOKEN-RESOLVE held at CONTROL across a preemption and then answered leaves the token cache
     # EMPTY of it (the old epoch's resolve is cancelled and its exchange detached, no answer); DROP-SESSION answers
     # `{dropped}` (CONTRACT 4.9); then shutdown's order with the credential seam: `begin_closing` at the latch,
-    # `cancel_detached` before the wait, and an adopted admin connection closed by step (2b), not held to the bound.
+    # `cancel_detached` before the wait, and an adopted admin connection aborted by step (2b), not held to the bound.
     _by_path(monkeypatch)
     d = tempfile.mkdtemp(prefix="lk", dir="/tmp")
     from levain.broker.norm import digest_of_token
     held = digest_of_token(_tok(7))
-    fake = _FakeControl({held: {"ok": True, "session": "s1", "claims": {"front_uid": 70000, "incarnation": 1}}},
+    fake = _FakeControl({held: {"ok": True, "session": "s1",
+                                "claims": {"front": {"uid": 70000, "pid": 1, "start": 1}, "incarnation": 1}}},
                         {held})
 
     async def run() -> dict:
