@@ -405,11 +405,15 @@ _GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIREC
 _GIT_ENV_KEEP = ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM")
 
 
-def _git_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
+def _git_env(base: Mapping[str, str] | None = None, *, user_config: bool = True) -> dict[str, str]:
     """git's environment: the allowlist (:func:`levain.launch.allowed_env`) of ``base`` (default this process's),
     which carries what a local clone and bundle need (``PATH``, ``HOME`` for the caller's config, the locale,
     ``TMPDIR``), plus :data:`_GIT_ENV_KEEP`, minus any ``GIT_*`` redirection, with the terminal prompt off. Never a
-    copy: whatever git is given sits in its exec-time block, readable by every process of the caller."""
+    copy: whatever git is given sits in its exec-time block, readable by every process of the caller.
+
+    ``user_config=False`` is for git that reads only a repo levain made (the repo-layer check): no global or system
+    config is read (``GIT_CONFIG_GLOBAL=/dev/null``, ``GIT_CONFIG_NOSYSTEM=1``, as the dispatch read set's own git
+    runs), so the caller's config can neither break nor change what it reads."""
     src = os.environ if base is None else base
     env = allowed_env(src)
     env.update({k: src[k] for k in _GIT_ENV_KEEP if k in src})
@@ -417,6 +421,9 @@ def _git_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
         if k in _GIT_ENV_DROP or k.startswith("GIT_CONFIG_KEY_") or k.startswith("GIT_CONFIG_VALUE_"):
             del env[k]
     env["GIT_TERMINAL_PROMPT"] = "0"
+    if not user_config:
+        env.pop("GIT_CONFIG_SYSTEM", None)
+        env.update({"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"})
     return env
 
 

@@ -16,7 +16,7 @@ import pytest
 from levain.cockpit.consent import utc_stamp
 from levain.dispatch.contract import PathEntry, ResolvedTemplate, resolve_contract
 from levain.dispatch.policy import ProviderPolicy
-from levain.dispatch.readset import BRANCH, ReadSet, ReadSetRefused, build_readset
+from levain.dispatch.readset import BRANCH, ReadSet, ReadSetRefused, build_readset, readset_commit
 from levain.slot.stage import make_bundle
 from tests.test_dispatch_verifier_report import ENTRY as VERIFIER_ENTRY
 
@@ -38,6 +38,11 @@ def git(repo: Path, *args: str) -> str:
                           env=env, timeout=30).stdout
 
 
+#: P2's shapes plus a directory that prefixes sibling blobs, one blob at two paths and two identical subtrees
+SHAPES = {"src/lib/x.py": "x\n", "src/lib.go": "go\n", "src/lib-a": "la\n", "src/d1.txt": "same\n",
+          "src/d2.txt": "same\n", "src/t1/f.py": "f\n", "src/t2/f.py": "f\n"}
+
+
 @pytest.fixture(scope="module")
 def world(tmp_path_factory):
     root = Path(os.path.realpath(tmp_path_factory.mktemp("readset")))
@@ -57,6 +62,9 @@ def world(tmp_path_factory):
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "c2")
     (repo / "src/b.py").write_text("b = 2\n")
+    for rel, body in SHAPES.items():         # tracked at base, read only by the shapes contract
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text(body)
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "c3")
     base = git(repo, "rev-parse", "HEAD").strip()
@@ -66,6 +74,13 @@ def world(tmp_path_factory):
            "expires_at": utc_stamp(NOW + timedelta(hours=2)), "repo": str(repo)}
     contract = resolve_contract(sub, resolve_template=lambda t: TEMPLATE, policy=POLICY, now=NOW)
     return root, repo, base, old_a, contract
+
+
+def json_sub(c) -> dict:
+    # the submission a contract was resolved from
+    return {"template": "fix-lint", "goal": c.goal, "read": [e.path for e in c.read], "write": [e.path for e in c.write],
+            "base": c.base, "budget": dict(c.budget), "grant": list(c.grant), "expires_at": c.expires_at,
+            "repo": c.repo}
 
 
 def dest(root: Path, name: str) -> str:
@@ -84,6 +99,13 @@ def objects(repo: str | Path) -> list[tuple[str, str]]:
 def built(world):
     root, repo, base, old_a, contract = world
     rs = build_readset(str(repo), contract, dest(root, "built"), contract_digest=contract.digest)
+    # the pure readset_commit agrees with git on every build here, over the shapes too (a 100755 entry among them)
+    shapes = resolve_contract({**json_sub(contract), "read": sorted([*SHAPES, "src/run.sh"])},
+                              resolve_template=lambda t: TEMPLATE, policy=POLICY, now=NOW)
+    for i, c in enumerate((contract, shapes)):
+        got = rs if i == 0 else build_readset(str(repo), c, dest(root, "built-shapes"), contract_digest=c.digest)
+        E, tree, N = readset_commit(c.canonical().encode("utf-8"), c.digest)
+        assert (E, tree, N) == (got.commit, got.tree, len(objects(got.repo_dir)))
     bundle = root / "built.bundle"
     make_bundle(rs.repo_dir, rs.branch, bundle)
     clone = root / "built-clone"
@@ -352,3 +374,241 @@ def test_the_dispatch_session_env_has_no_operator_key_and_roots_under_the_slot()
     assert env["HOME"] == S or env["HOME"].startswith(S + "/")
     for k in ("TMPDIR", "XDG_DATA_HOME", "XDG_CACHE_HOME", "CODEX_HOME", "GIT_CONFIG_GLOBAL"):
         assert env[k].startswith(S)
+
+
+def test_the_attempt_id_validator_is_exactly_controls_grammar(world, tmp_path):
+    # reproduced (wa_repro.py 1): with no validator, attempt "x/../../escaped" made its workdir outside the parent
+    from levain.dispatch.attempt_id import ATTEMPT_ID_FORM, check_attempt_id, is_attempt_id, new_attempt_id
+    from levain.dispatch.readset import verify_readset, workdir_name
+    minted = new_attempt_id()
+    assert ATTEMPT_ID_FORM.fullmatch(minted)
+    for ok in ("a", "a" * 64, minted, "0-9"):
+        assert is_attempt_id(ok) and check_attempt_id(ok) == ok and workdir_name(ok) == "w-" + ok
+    for bad in ("", "a" * 65, "-a", "A", "aB", "a_b", "a.b", "a/b", "..", "a\n", "a\0", "x/../../escaped", b"a", None):
+        assert not is_attempt_id(bad)
+        assert refusal(workdir_name, bad).name == "readset-attempt"
+    parent = Path(os.path.realpath(tmp_path)) / "attempts"
+    (parent / "w-x").mkdir(parents=True)
+    contract = world[4]
+    cb = contract.canonical().encode("utf-8")
+    assert refusal(verify_readset, cb, contract.digest, -1, str(parent), "x/../../escaped").name == "readset-attempt"
+    assert sorted(os.listdir(parent)) == ["w-x"] and not (Path(os.path.realpath(tmp_path)) / "escaped").exists()
+
+
+def test_verify_refuses_a_read_set_that_loosens_the_settings_by_name(tmp_path):
+    # reproduced (wa_repro.py 2): with the repo-layer check removed, this read set verified
+    from levain.dispatch.attempt_id import new_attempt_id
+    from levain.dispatch.readset import _bundle_into, _scratch_env, verify_readset
+    top = Path(os.path.realpath(tmp_path))
+    repo = top / "r"
+    (repo / ".claude").mkdir(parents=True)
+    (repo / "src").mkdir()
+    (repo / ".claude/settings.json").write_text('{"disableAllHooks": true}')
+    (repo / "src/a.py").write_text("a\n")
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "c")
+    sub = {"template": "fix-lint", "goal": "g", "read": [".claude/settings.json", "src/a.py"], "write": ["src/a.py"],
+           "base": git(repo, "rev-parse", "HEAD").strip(), "budget": {"tool_calls": 1, "tokens": 1, "dollars_cents": 1},
+           "grant": ["Edit"], "expires_at": utc_stamp(NOW + timedelta(hours=1)), "repo": str(repo)}
+    policy = ProviderPolicy.from_mapping({"never": [], "providers": {"openrouter": {"read": ["**"]}}})
+    c = resolve_contract(sub, resolve_template=lambda t: TEMPLATE, policy=policy, now=NOW)
+    rs = build_readset(str(repo), c, dest(top, "scratch"), contract_digest=c.digest)
+    bundle = top / "h.bundle"
+    fd = os.open(bundle, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        _bundle_into(rs.repo_dir, fd, _scratch_env())
+    finally:
+        os.close(fd)
+    parent = top / "attempts"
+    parent.mkdir()
+    fd = os.open(bundle, os.O_RDONLY)
+    try:
+        got = refusal(verify_readset, c.canonical().encode("utf-8"), c.digest, fd, str(parent), new_attempt_id())
+    finally:
+        os.close(fd)
+    assert got.name == "loosening:disable-all-hooks"
+    assert os.listdir(parent) == []                                    # the refused attempt's workdir is gone
+
+
+def test_a_read_set_over_the_handoff_cap_is_refused_at_filing(world, tmp_path, monkeypatch):
+    # reproduced (wa-fix1 repro.py R2): an over-cap read set was exported for signing and refused only at the run
+    import levain.slot.stage as stage
+    from levain.dispatch.readset import TMP_DIR, export_readset
+    _root, repo, _base, _old_a, contract = world
+    top = Path(os.path.realpath(tmp_path))
+    rs = build_readset(str(repo), contract, dest(top, "scratch"), contract_digest=contract.digest)
+    handoff = top / "handoff"
+    handoff.mkdir(mode=0o700)
+    monkeypatch.setattr(stage, "BUNDLE_CAP", 64)
+    got = refusal(export_readset, rs, contract.canonical().encode("utf-8"), contract.digest, str(handoff))
+    assert got.name == "readset-handoff"
+    assert os.listdir(handoff / TMP_DIR) == []                         # the temp was unlinked
+
+
+def test_a_failed_staging_flush_is_named_and_leaves_no_bundle(world, tmp_path, monkeypatch):
+    # reproduced (wa-fix1 repro.py R7): EIO on the staging flush escaped raw and left repo.bundle behind, so the next
+    # cut into that staging was refused readset-dest
+    import errno
+    import stat
+
+    from levain.dispatch import readset as R
+    from levain.dispatch.attempt_id import new_attempt_id
+    _root, repo, _base, _old_a, contract = world
+    top = Path(os.path.realpath(tmp_path))
+    cb, d = contract.canonical().encode("utf-8"), contract.digest
+    rs = build_readset(str(repo), contract, dest(top, "scratch"), contract_digest=d)
+    for name in ("handoff", "attempts", "staging"):
+        (top / name).mkdir(mode=0o700)
+    ex = R.export_readset(rs, cb, d, str(top / "handoff"))
+    try:
+        fd = R.open_handoff(ex.path, size=ex.size)
+    finally:
+        os.close(ex.fd)
+    try:
+        v = R.verify_readset(cb, d, fd, str(top / "attempts"), new_attempt_id())
+    finally:
+        os.close(fd)
+    real = R.full_fsync
+
+    def eio_on_dirs(f: int) -> str:
+        if stat.S_ISDIR(os.fstat(f).st_mode):
+            raise OSError(errno.EIO, "injected")
+        return real(f)
+
+    monkeypatch.setattr(R, "full_fsync", eio_on_dirs)
+    got = refusal(R.bundle_verified, v, cb, d, str(top / "staging"))
+    assert got.name == "readset-dest"
+    assert os.listdir(top / "staging") == []
+    monkeypatch.setattr(R, "full_fsync", real)
+    assert R.bundle_verified(v, cb, d, str(top / "staging")).commit == v.commit
+    R.discard(v)
+
+
+def _verified(world, tmp_path):
+    from levain.dispatch import readset as R
+    from levain.dispatch.attempt_id import new_attempt_id
+    _root, repo, _base, _old_a, contract = world
+    top = Path(os.path.realpath(tmp_path))
+    cb, d = contract.canonical().encode("utf-8"), contract.digest
+    rs = build_readset(str(repo), contract, dest(top, "scratch"), contract_digest=d)
+    for name in ("handoff", "attempts", "staging"):
+        (top / name).mkdir(mode=0o700)
+    ex = R.export_readset(rs, cb, d, str(top / "handoff"))
+    try:
+        fd = R.open_handoff(ex.path, size=ex.size)
+    finally:
+        os.close(ex.fd)
+    try:
+        return R.verify_readset(cb, d, fd, str(top / "attempts"), new_attempt_id()), cb, d, top
+    finally:
+        os.close(fd)
+
+
+def test_a_p_swapped_after_it_was_checked_is_refused_at_the_cut(world, tmp_path, monkeypatch):
+    # reproduced (wa-fix2 fix2_run.py W2): P swapped for a copy right after _open_p checked it was cut and staged,
+    # because the later "P was replaced" compare used a second path read taken after the swap
+    import shutil
+
+    from levain.dispatch import readset as R
+    v, cb, d, top = _verified(world, tmp_path)
+    real = R._open_p
+
+    def swapping(vv):
+        out = real(vv)
+        p = os.path.join(vv.workdir, "P")
+        shutil.copytree(p, p + ".new", symlinks=True)
+        os.rename(p, p + ".old")
+        os.rename(p + ".new", p)
+        return out
+
+    monkeypatch.setattr(R, "_open_p", swapping)
+    got = refusal(R.bundle_verified, v, cb, d, str(top / "staging"))
+    assert (got.name, got.detail) == ("readset-verified-mismatch", "P was replaced while the bundle was cut")
+    assert os.listdir(top / "staging") == []
+    R.discard(v)
+
+
+def test_a_staging_close_error_after_the_flush_returns_the_bundle(world, tmp_path, monkeypatch):
+    # reproduced (wa-fix2 fix2_run.py W3): EIO from closing staging's fd after its flush escaped raw, so a durable
+    # repo.bundle was reported as a failure and left in staging
+    import errno
+
+    from levain.dispatch import readset as R
+    v, cb, d, top = _verified(world, tmp_path)
+    sst = os.stat(top / "staging")
+    real, hit = os.close, []
+
+    def eio_on_staging(f: int) -> None:
+        st = os.fstat(f)
+        real(f)
+        if not hit and (st.st_dev, st.st_ino) == (sst.st_dev, sst.st_ino):
+            hit.append(f)
+            raise OSError(errno.EIO, "injected")
+
+    monkeypatch.setattr(os, "close", eio_on_staging)
+    sb = R.bundle_verified(v, cb, d, str(top / "staging"))
+    monkeypatch.setattr(os, "close", real)
+    assert hit and sb.commit == v.commit
+    assert os.listdir(top / "staging") == [R.STAGED_BUNDLE] and os.path.getsize(sb.path) == sb.size
+    R.discard(v)
+
+
+def test_a_disk_error_writing_the_handoff_temp_is_named_and_leaves_no_temp(world, tmp_path, monkeypatch):
+    # reproduced (wa-fix3 fix3_run.py X2): ENOSPC from the temp's flush escaped export_readset as a raw OSError
+    import errno
+    import stat
+
+    from levain.dispatch import readset as R
+    _root, repo, _base, _old_a, contract = world
+    top = Path(os.path.realpath(tmp_path))
+    cb, d = contract.canonical().encode("utf-8"), contract.digest
+    rs = build_readset(str(repo), contract, dest(top, "scratch"), contract_digest=d)
+    (top / "handoff").mkdir(mode=0o700)
+    real = R.full_fsync
+
+    def enospc_on_files(f: int) -> str:
+        if stat.S_ISREG(os.fstat(f).st_mode):
+            raise OSError(errno.ENOSPC, "injected")
+        return real(f)
+
+    monkeypatch.setattr(R, "full_fsync", enospc_on_files)
+    got = refusal(R.export_readset, rs, cb, d, str(top / "handoff"))
+    assert got.name == "readset-dest" and "ENOSPC" in got.detail
+    assert os.listdir(top / "handoff" / R.TMP_DIR) == []
+
+
+def test_a_parent_close_error_after_the_verify_returns_the_verified_set(world, tmp_path, monkeypatch):
+    # reproduced (wa-fix3 fix3_run.py X1): EIO from closing the workdir parent's fd replaced verify_readset's result
+    import errno
+
+    from levain.dispatch import readset as R
+    from levain.dispatch.attempt_id import new_attempt_id
+    _root, repo, _base, _old_a, contract = world
+    top = Path(os.path.realpath(tmp_path))
+    cb, d = contract.canonical().encode("utf-8"), contract.digest
+    rs = build_readset(str(repo), contract, dest(top, "scratch"), contract_digest=d)
+    for name in ("handoff", "attempts"):
+        (top / name).mkdir(mode=0o700)
+    ex = R.export_readset(rs, cb, d, str(top / "handoff"))
+    os.close(ex.fd)
+    fd = R.open_handoff(ex.path, size=ex.size)
+    pst = os.stat(top / "attempts")
+    real, hit = os.close, []
+
+    def eio_on_parent(f: int) -> None:
+        st = os.fstat(f)
+        real(f)
+        if (st.st_dev, st.st_ino) == (pst.st_dev, pst.st_ino) and not hit:
+            hit.append(f)
+            raise OSError(errno.EIO, "injected")
+
+    try:
+        monkeypatch.setattr(os, "close", eio_on_parent)
+        v = R.verify_readset(cb, d, fd, str(top / "attempts"), new_attempt_id())
+        monkeypatch.setattr(os, "close", real)
+    finally:
+        monkeypatch.setattr(os, "close", real)
+        os.close(fd)
+    assert hit and v.commit == rs.commit
+    R.discard(v)

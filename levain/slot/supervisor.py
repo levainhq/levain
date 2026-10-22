@@ -475,15 +475,21 @@ SETTINGS_CAP = 1 << 20          # DECISION: a settings file past 1 MiB is refuse
 _REGULAR = (b"100644", b"100755")
 
 
-def _git_env() -> Dict[str, str]:
-    from levain.slot.stage import _git_env as env      # the bundle's own scrubbed git environment: one definition
-
-    return env()
+#: The refusal the repo-layer check's git runs under: that git reads only the clone levain made, so it reads no
+#: global or system config (the caller's own config cannot break or steer the check).
+_LAYER_REFUSAL = "repo-settings-malformed"
 
 
 def _git(argv: Sequence[str], *, git: str, run: Callable[..., subprocess.CompletedProcess], refusal: str,
          check: bool = True) -> subprocess.CompletedProcess:
-    p = run([git, "-c", "core.hooksPath=/dev/null", *argv], env=_git_env(), capture_output=True)
+    # the bundle's own scrubbed git environment (one definition) and the stage's own bound on its git
+    from levain.slot.stage import STAGE_DEADLINE_S, _git_env as env
+
+    try:
+        p = run([git, "-c", "core.hooksPath=/dev/null", *argv], env=env(user_config=refusal != _LAYER_REFUSAL),
+                capture_output=True, timeout=STAGE_DEADLINE_S)
+    except subprocess.TimeoutExpired:
+        raise Refused(refusal, f"git passed its {STAGE_DEADLINE_S}s timeout") from None
     if check and p.returncode != 0:
         err = p.stderr.decode("utf-8", "replace") if isinstance(p.stderr, bytes) else (p.stderr or "")
         raise Refused(refusal, f"{argv[0] if argv[0] != '-C' else argv[2]}: {err.strip()[:200]}")
@@ -561,14 +567,15 @@ def _no_dup(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
 
 
 def repo_layer_docs(clone: Path, *, git: str = "git",
-                    run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> Dict[str, Any]:
-    """The clone's committed settings layers, parsed: repo-relative name -> JSON value, for every tree entry whose
-    name folds to ``.claude`` / ``settings.json`` / ``settings.local.json``. Refused ``repo-settings-malformed`` when
+                    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+                    treeish: str = "HEAD") -> Dict[str, Any]:
+    """The clone's committed settings layers at ``treeish`` (the clone's HEAD unless named), parsed: repo-relative
+    name -> JSON value, for every tree entry whose name folds to ``.claude`` / ``settings.json`` / ``settings.local.json``. Refused ``repo-settings-malformed`` when
     such an entry is a link or a submodule (CC would read through it), is over :data:`SETTINGS_CAP`, is not JSON, or
     repeats a key (DECISION: two values for one key is refused, not resolved), or nests too deep to parse."""
     want = {_fold(Path(n).name): n for n in REPO_SETTINGS}
     docs: Dict[str, Any] = {}
-    for mode, typ, sha, name in _ls_tree(clone, "HEAD", git=git, run=run):
+    for mode, typ, sha, name in _ls_tree(clone, treeish, git=git, run=run):
         if _fold(name) != _fold(".claude"):
             continue
         if typ != b"tree":
