@@ -1,4 +1,4 @@
-"""keys' upstream client: the capability SHELL (S1 session 3b, design 1.2).
+"""keys' upstream client (S1 session 3b, design 1.2 and 1.6).
 
 Every byte keys sends upstream for an exchange goes through that exchange's `Upstream.write`, which checks the
 exchange's `detached` flag SYNCHRONOUSLY and then calls the TLS writer's `write`, with no `await` between them. A phase
@@ -10,9 +10,11 @@ either out. There are exactly two ways to an `Upstream`:
 `open_exchange` (an exchange is mandatory) and `refresh_post` (the maintenance form, local to that function, used for
 the one refresh request it was given).
 
-This tip is the shell. `_connect` (plain TCP to a validated address) and `_handshake` (TLS on that connection) refuse
-until the real client is built; a test fixture replaces `_handshake` with one returning fake `(reader, writer,
-plain_writer)` objects. Reading an upstream response is likewise not built here.
+The path to a vendor: `pick_address` resolves the route's host ONCE and passes every answer through the front's
+`refused_address` (all or nothing); `_connect` opens plain TCP to that address literal; `_handshake` runs TLS on that
+connection with `loop.start_tls` (the one construction the root interpreter supports: 3.9 has no
+`StreamWriter.start_tls`), the route's host as SNI and for the hostname check. The response is read with an h11
+client: `read_head` consumes every informational response but 101 (bounded), `read_body` yields the body.
 
 Ownership: whoever holds an `Upstream`, or a transport no `Upstream` holds yet, releases it in a `finally` (or, where
 ownership passes on success, an `except BaseException`) with `abort()`, which is idempotent, best-effort and never
@@ -21,14 +23,34 @@ raises an `Exception`.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
-from typing import Any, NamedTuple, Tuple
+import ssl
+from typing import Any, List, NamedTuple, Optional, Tuple
+
+import h11
+
+from levain.broker.norm import Refused
 
 logger = logging.getLogger("levain.broker")
 
 #: the graceful close's bound: on 3.9 `SSLProtocol` has no shutdown timeout of its own, so a peer that never answers
 #: `close_notify` would otherwise hold an exchange in its registration's exchange set.
 GRACE = 2.0
+#: the connect and the TLS handshake together (DECISION, judged, design 1.6)
+CONNECT_TIMEOUT_S = 10.0
+#: from the request's last byte to the FINAL response head, one absolute deadline (DECISION, judged: a long first token)
+HEAD_TIMEOUT_S = 300.0
+#: after the final head, the longest wait for the next response bytes (DECISION, judged, 3a's IDLE_S rule)
+IDLE_S = 600.0
+#: the TLS reader's buffer limit: past it the reader pauses its transport, so a slow front bounds keys' memory
+LIMIT = 64 * 1024
+#: one read from the upstream
+READ_CHUNK = 64 * 1024
+#: informational responses consumed before the final one; one more is `upstream-error` (DECISION, judged, r2 W10)
+MAX_INFORMATIONAL = 16
+#: the refresh response's body, read whole (a token endpoint's JSON is far below it)
+REFRESH_BODY_CAP = 64 * 1024
 
 
 def _note(level: int, msg: str, *a: object) -> None:
@@ -46,6 +68,16 @@ class StaleExchange(Exception):
     exception, so the exchange's own `finally` (its release) still runs."""
 
 
+class BadResponse(EOFError):
+    """The upstream's response is one keys does not relay (h11 refused it, an unsolicited 101, a run of informational
+    responses past MAX_INFORMATIONAL, a refresh body past its cap). `detail` names which, for the note only. An
+    EOFError, so keys answers it `upstream-error` like any other upstream failure."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
 class RefreshRequest(NamedTuple):
     """The one request `refresh_post` sends: the address already validated, the host for SNI and the hostname check,
     and the request's bytes as the credential layer built them."""
@@ -54,6 +86,12 @@ class RefreshRequest(NamedTuple):
     port: int
     host: str
     head: bytes
+    body: bytes
+
+
+class RefreshResponse(NamedTuple):
+    status: int
+    headers: List[Tuple[bytes, bytes]]
     body: bytes
 
 
@@ -99,6 +137,10 @@ class Upstream:
         """Flow control after a `write`; it sends no new bytes, so it is not gated."""
         await self._writer.drain()
 
+    async def read(self, n: int) -> bytes:
+        """Up to `n` response bytes (b"" at EOF). Reading sends nothing, so it is not gated."""
+        return await self._reader.read(n)
+
     def abort(self) -> bool:
         """Abort the TLS transport (which also closes the plaintext one under it), then the plaintext transport itself,
         each attempted whatever the other did. Idempotent; never raises an `Exception`. Returns True iff both aborts
@@ -125,20 +167,71 @@ class Upstream:
         await self._writer.wait_closed()
 
 
+# --- the path to the vendor -------------------------------------------------------------------------------------
+
+async def _resolve(host: str, port: int) -> List[str]:
+    """The system resolver, as the front uses it (an absolute name, bounded threads)."""
+    from levain.broker.front import system_resolve
+    return await system_resolve(host, port)
+
+
+async def pick_address(host: str, port: int) -> str:
+    """Resolve `host` ONCE and return the address to connect to. Every answer passes the front's `refused_address`
+    or the whole lookup is `address-refused` (403): one refused answer refuses them all, as the front's CONNECT."""
+    from levain.broker.front import refused_address
+    addrs = list(dict.fromkeys(await _resolve(host, port)))
+    if not addrs:
+        raise Refused("address-refused", "no answer")
+    bad = [(a, why) for a, why in ((a, refused_address(a)) for a in addrs) if why]
+    if bad:
+        _note(logging.WARNING, "levain gw-keys: address-refused host=%s %s", host,
+              "; ".join(f"{a} {w}" for a, w in bad))
+        raise Refused("address-refused", "refused answer")
+    return addrs[0]
+
+
+_CTX: Optional[ssl.SSLContext] = None
+
+
+def _tls_context() -> ssl.SSLContext:
+    """THE client context, made once: the platform default (system CAs, hostname check, CERT_REQUIRED), TLS >= 1.2."""
+    global _CTX
+    if _CTX is None:
+        ctx = ssl.create_default_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        _CTX = ctx
+    return _CTX
+
+
 async def _connect(addr: str, port: int) -> Tuple[Any, Any]:
-    """The plain-TCP seam: the one place an upstream connection is opened. Not built at this tip."""
-    raise NotImplementedError("upstream._connect: the plain-TCP connect is not built yet (session 3b-4)")
+    """The plain-TCP seam: the one place an upstream connection is opened, to an address LITERAL (a name here would be
+    a second, unchecked resolution, so one is refused before any socket exists)."""
+    ipaddress.ip_address(addr)
+    return await asyncio.open_connection(addr, port, limit=LIMIT)
 
 
 async def _handshake(addr: str, port: int, host: str) -> Tuple[Any, Any, Any]:
     """TLS on `_connect`'s connection, returning `(reader, writer, plain_writer)`; called ONLY by `open_exchange` and
-    `refresh_post`. Not built at this tip: a test fixture replaces it."""
-    raise NotImplementedError("upstream._handshake: the TLS handshake is not built yet (session 3b-4)")
-
-
-async def _read_response(up: Upstream) -> Any:
-    """Read one upstream response through `up`. Not built at this tip (the h11 client)."""
-    raise NotImplementedError("upstream._read_response: the response reader is not built yet (session 3b-4)")
+    `refresh_post`. One `try` spans the whole ownership interval, from the transport `_connect` returns to the return
+    the constructor consumes, and aborts whatever transport it holds on ANY exit by exception (3.9's `start_tls` closes
+    the transport only around its own handshake wait, and owns nothing after it returns)."""
+    plain_reader, plain_writer = await _connect(addr, port)
+    tls = None
+    try:
+        loop = asyncio.get_running_loop()
+        reader = asyncio.StreamReader(limit=LIMIT)   # made inside the running loop (3.9 binds it)
+        proto = asyncio.StreamReaderProtocol(reader)
+        tls = await loop.start_tls(plain_writer.transport, proto, _tls_context(), server_hostname=host,
+                                   ssl_handshake_timeout=CONNECT_TIMEOUT_S)
+        proto.connection_made(tls)   # 3.9's start_tls never calls it: without it the reader has no transport to pause
+        writer = asyncio.StreamWriter(tls, proto, reader, loop)
+    except BaseException:
+        if tls is not None:
+            tls.abort()
+        plain_writer.transport.abort()
+        raise
+    del plain_reader   # nothing reads the plain stream; the TLS protocol owns the socket now
+    return reader, writer, plain_writer
 
 
 async def open_exchange(addr: str, port: int, host: str, exchange: Any) -> Upstream:
@@ -162,6 +255,94 @@ async def open_exchange(addr: str, port: int, host: str, exchange: Any) -> Upstr
     return up
 
 
+# --- the response (h11 client) ----------------------------------------------------------------------------------
+
+async def _next_event(up: Upstream, conn: "h11.Connection", wait: float) -> Any:
+    """The next h11 event, reading from `up` while h11 needs data; each read waits at most `wait` (a timeout raises
+    asyncio.TimeoutError). h11's refusal of the bytes is BadResponse."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + wait
+    while True:
+        try:
+            ev = conn.next_event()
+        except h11.RemoteProtocolError as e:
+            raise BadResponse(f"protocol: {e}") from None
+        if ev is not h11.NEED_DATA:
+            return ev
+        data = await asyncio.wait_for(up.read(READ_CHUNK), max(0.0, deadline - loop.time()))
+        try:
+            conn.receive_data(data)
+        except h11.RemoteProtocolError as e:
+            raise BadResponse(f"protocol: {e}") from None
+
+
+async def read_head(up: Upstream, conn: "h11.Connection", deadline: float) -> "h11.Response":
+    """The FINAL response head, by the absolute `deadline` (loop time) fixed when the request's last byte was sent: an
+    informational response never extends it. Every 1xx but 101 is consumed; more than MAX_INFORMATIONAL of them, or a
+    101 (keys asks for no upgrade at this tip), is BadResponse."""
+    loop = asyncio.get_running_loop()
+    seen = 0
+    while True:
+        ev = await _next_event(up, conn, max(0.0, deadline - loop.time()))
+        if isinstance(ev, h11.InformationalResponse):
+            if ev.status_code == 101:
+                raise BadResponse("unsolicited-upgrade")
+            seen += 1
+            if seen > MAX_INFORMATIONAL:
+                raise BadResponse("informational")
+            continue
+        if isinstance(ev, h11.Response):
+            return ev
+        raise BadResponse(f"unexpected {type(ev).__name__}")
+
+
+async def read_body(up: Upstream, conn: "h11.Connection", idle_s: float) -> Optional[bytes]:
+    """The next body bytes, or None at the end of the response (its trailers, if any, are dropped). Each wait for
+    bytes is bounded by `idle_s`."""
+    while True:
+        ev = await _next_event(up, conn, idle_s)
+        if isinstance(ev, h11.Data):
+            if ev.data:
+                return bytes(ev.data)
+            continue
+        if isinstance(ev, h11.EndOfMessage):
+            return None
+        raise BadResponse(f"unexpected {type(ev).__name__}")
+
+
+def h11_bytes(conn: "h11.Connection", event: Any) -> bytes:
+    """The bytes h11 writes for `event` on `conn`. h11's serializer does no I/O (the caller sends what it returns
+    through `Upstream.write`); every serialization in keys goes through this one function, so the networking
+    inventory names its `send` once."""
+    return conn.send(event) or b""
+
+
+def client_after_request(method: bytes) -> "h11.Connection":
+    """An h11 client connection placed after a request of `method` with no body, so it parses that request's
+    response (a HEAD's response has no body). For the refresh, whose request bytes the credential layer built."""
+    conn = h11.Connection(our_role=h11.CLIENT)
+    for ev in (h11.Request(method=method, target=b"/", headers=[(b"host", b"refresh")]), h11.EndOfMessage()):
+        h11_bytes(conn, ev)
+    return conn
+
+
+async def _read_response(up: Upstream) -> RefreshResponse:
+    """Read the refresh's one response through `up`: its head by HEAD_TIMEOUT_S, its body by IDLE_S per read, the body
+    at most REFRESH_BODY_CAP."""
+    conn = client_after_request(b"POST")
+    loop = asyncio.get_running_loop()
+    head = await read_head(up, conn, loop.time() + HEAD_TIMEOUT_S)
+    body = b""
+    while True:
+        part = await read_body(up, conn, IDLE_S)
+        if part is None:
+            break
+        body += part
+        if len(body) > REFRESH_BODY_CAP:
+            raise BadResponse("refresh body cap")
+    return RefreshResponse(head.status_code, [(bytes(n), bytes(v)) for n, v in head.headers], body)
+
+
 async def refresh_post(request: RefreshRequest) -> Any:
     """The refresh's entry point: build the maintenance `Upstream` here, send THIS request, read its response, close,
     and return the response only. The `Upstream` never leaves this function; every exit aborts it."""
@@ -182,4 +363,3 @@ async def refresh_post(request: RefreshRequest) -> Any:
         if not up.abort():
             _note(logging.WARNING, "levain gw-keys: dropped an unclosed transport")
     return response
-

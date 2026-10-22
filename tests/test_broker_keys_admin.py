@@ -22,6 +22,23 @@ from levain.slot import control as C
 pytestmark = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="unix sockets")
 
 
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    """keys resolves a route's host before it connects: no test here reaches a real resolver or a real address. The
+    resolver answers one global address; the plain-TCP seam refuses (a test that needs a connection fakes the
+    handshake above it)."""
+    from levain.broker import upstream as U
+
+    async def resolve(host: str, port: int) -> list:
+        return ["93.184.216.34"]
+
+    async def connect(addr: str, port: int):
+        raise ConnectionRefusedError("no network in unit tests")
+
+    monkeypatch.setattr(U, "_resolve", resolve)
+    monkeypatch.setattr(U, "_connect", connect)
+
+
 def _hold(monkeypatch, holds: dict, entered: dict, cancels: list) -> None:
     """FRONT-REGISTER for a session in `holds` waits for that event first; with `swallow`, a cancel delivered while
     it waits is recorded and ignored, so the task outlives preemption's cancel and its bounded await."""
@@ -707,14 +724,14 @@ def test_revoke_at_every_suspension(monkeypatch, transition, delivery, cached):
         st["transports"] += [raw.transport, plain.transport]
         return object(), raw, plain
 
-    async def read_response(up):
+    async def read_response(up, *rest):
         await asyncio.sleep(0)   # the response wait
         raise NotImplementedError
 
     monkeypatch.setattr(U.Upstream, "write", counting_write)
     monkeypatch.setattr(K.Keys, "_detach", spy_detach)
     monkeypatch.setattr(U, "_handshake", handshake)
-    monkeypatch.setattr(U, "_read_response", read_response)
+    monkeypatch.setattr(U, "read_head", read_response)   # the exchange's response wait
 
     async def one(pause_at: int) -> dict:
         st.clear()
