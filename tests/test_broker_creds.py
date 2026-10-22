@@ -564,6 +564,7 @@ def test_p5_keys_main_opens_the_writers_directory_before_serve_counts(monkeypatc
 
     async def fake_serve(keys, *a):
         seen["dir_fd"] = keys.cred_lifecycle._dir_fd    # what _serve's count_open_fds would see
+        seen["reader"] = keys.creds
         keys.trigger()
         await keys.wait_done()
         return 0
@@ -574,6 +575,25 @@ def test_p5_keys_main_opens_the_writers_directory_before_serve_counts(monkeypatc
     rc = K.main(["--runtime-root", str(tmp_path), "--lib-root", str(tmp_path), "--control", str(tmp_path / "c"),
                  "--test-single-uid"])
     assert rc == 0 and seen["dir_fd"] is not None
+    assert seen["reader"] is not None                  # the reader's directory too (the item flagged after P5)
+
+
+def test_the_readers_lazy_directory_is_one_fd_and_open_cred_store_is_best_effort(tmp_path, caplog):
+    from levain.broker import keys as K
+
+    k = K.Keys(unmetered=True, lib_root=str(tmp_path))
+    with caplog.at_level(logging.WARNING):
+        assert k.open_cred_store() is False and k.creds is None     # no cred/ yet: silent, nothing opened
+    assert "not open at start" not in caplog.text
+    (tmp_path / "keys" / "cred").mkdir(parents=True, mode=0o700)
+    base = K.count_open_fds()
+    store = k._cred_store()                            # the lazy case TRANSIENT_NAMED names: exactly one fd
+    try:
+        assert K.count_open_fds() - base == 1
+        assert k.open_cred_store() is True and k.creds is store     # already open: nothing more
+        assert K.count_open_fds() - base == 1
+    finally:
+        os.close(store.dir_fd)
 
 
 def test_p5_open_dir_without_a_credential_directory_leaves_it_to_the_first_commit(tmp_path):

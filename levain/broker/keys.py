@@ -93,10 +93,10 @@ DNS_CONCURRENCY = 32
 #: of distinct uncached names: 36 extra fds under 3.9.6, 35 under 3.12.13, so 2 per lookup rounded up]. Linux is
 #: unmeasured: its VM run prints its own.
 DNS_FDS_PER_LOOKUP = 2
-#: the second admin connection during a preemption, the refresh's response, the credential read, and the writer
-#: thread's commit: its lock, its temp (or listing, or compare read) and, when `cred/` did not exist at start, its
-#: directory (creds.COMMIT_FDS).
-TRANSIENT_NAMED = 3 + COMMIT_FDS
+#: the second admin connection during a preemption, the refresh's response, the credential read, the reader's
+#: credential directory when `cred/` did not exist at start (Keys.open_cred_store), and the writer thread's commit: its
+#: lock, its temp (or listing, or compare read) and, in the same case, its directory (creds.COMMIT_FDS).
+TRANSIENT_NAMED = 4 + COMMIT_FDS
 #: passed to listen() and to every start_unix_server, never asyncio's default of 100: asyncio accepts up to this many
 #: connections per wakeup before admission closes any of them.
 ACCEPT_BACKLOG = 8
@@ -1531,12 +1531,29 @@ class Keys:
             if self.lib_root is None:
                 raise norm.Refused("credential-unavailable", "no lib root")
             try:
-                fd = os.open(os.path.join(self.lib_root, "keys", "cred"), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                fd = self._open_cred_dir()
             except OSError as e:
                 _note(logging.WARNING, "levain gw-keys: the credential directory is unreadable (%s)", type(e).__name__)
                 raise norm.Refused("credential-unavailable", "no credential directory") from None
             self.creds = CredStore(fd)
         return self.creds
+
+    def _open_cred_dir(self) -> int:
+        return os.open(os.path.join(self.lib_root, "keys", "cred"), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+    def open_cred_store(self) -> bool:
+        """At keys' start, before `_serve` counts the fixed fds: open the reader's credential directory now, so its fd
+        is a counted one. False (nothing opened, no failure) when it cannot be: `cred/` is made by the first
+        `set-credential`, so it may not exist yet; the first exchange that needs a credential opens it then
+        (TRANSIENT_NAMED budgets that case)."""
+        if self.creds is None and self.lib_root is not None:
+            try:
+                self.creds = CredStore(self._open_cred_dir())
+            except OSError as e:
+                if e.errno != errno.ENOENT:
+                    _note(logging.WARNING, "levain gw-keys: the credential directory is not open at start (%s)",
+                          type(e).__name__)
+        return self.creds is not None
 
     def _check_request(self, reg: Registration, claims: dict, pol: RoutePolicy,
                        q: dict) -> Tuple[bytes, "h11.Connection", object, norm.Template]:
@@ -1910,6 +1927,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"levain gw-keys: refused: gw.jsonl cannot be opened ({type(e).__name__})", file=sys.stderr)
             return 3
         cred_writer.open_dir()   # before _serve counts the fds: the writer's directory fd is a fixed one when it exists
+        keys.open_cred_store()   # and the reader's
         front_path = os.path.join(a.runtime_root, "keys", "front.sock")
         admin_path = os.path.join(a.runtime_root, "keys", "admin.sock")
         try:

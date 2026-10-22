@@ -4,12 +4,15 @@ umask and environment, drops to keys (a no-op seam here: these run as the lane u
 then opens ``L/keys``, creates ``cred/`` and writes under the lock. Root opens nothing below ``L/keys/``."""
 from __future__ import annotations
 
+import fcntl
 import functools
 import io
 import json
 import os
 import pwd
+import signal
 import stat
+import time
 
 import pytest
 
@@ -103,7 +106,7 @@ def _stdin(obj) -> "callable":
     (b" " * (C.FILE_CAP + 1), "bad-credential:size"),
     ([1, 2], "bad-credential:format"),
 ], ids=lambda v: v if isinstance(v, str) else None)
-def test_root_refuses_a_bad_object_before_the_lock_and_before_any_fork(obj, name):
+def test_root_refuses_a_bad_object_before_the_lock_and_before_any_fork(obj, name, L):
     calls = []
 
     def lock(host):
@@ -115,7 +118,7 @@ def test_root_refuses_a_bad_object_before_the_lock_and_before_any_fork(obj, name
         raise AssertionError("forked")
 
     seams = Seams(euid=lambda: 0, host=lambda: "darwin", lock=lock, stdin=_stdin(obj),
-                  credential=functools.partial(run_credential, fork=fork))
+                  credential=functools.partial(run_credential, fork=fork, store_seams=_rs(L)))   # B7: the operator check is first
     out, err = io.StringIO(), io.StringIO()
     assert main(["set-credential", NAME], env=ENV, seams=seams, out=out, err=err) == RH.EXIT_REFUSED
     assert out.getvalue() == json.dumps({"ok": False, "refused": name}, separators=(",", ":")) + "\n"
@@ -156,6 +159,11 @@ class _Lock:
                 lk.calls.append("unlock")
                 lk.held -= 1
         return _Cm()
+
+
+def _rs(L):
+    return RH.Seams(host="darwin", store=L, trusted=lambda st: True, account_uid=lambda n: ME,
+                    group_gid=lambda n: os.getgid())
 
 
 def _seams(L, obj=None, *, drop=None, lock=None, **kw):
@@ -334,3 +342,165 @@ def test_a_not_durable_remove_is_success_with_the_same_warning(L, monkeypatch):
     rc, out, err = _main(["remove-credential", NAME], _seams(L)[0])   # the retry fsyncs again, and says so
     assert (rc, out["removed"]) == (0, False)
     assert "not durable" in err
+
+
+# --- part B L3 r1 fixes (1022-12 3b5a, B1-B9) -----------------------------------------------------------------------
+
+class _ReapCheckLock(_Lock):
+    """The install lock, recording at its release whether the forked child was already reaped."""
+
+    def __init__(self, pids):
+        super().__init__()
+        self.pids, self.reaped_at_unlock = pids, []
+
+    def __call__(self, host):
+        cm, lk = super().__call__(host), self
+
+        class _Cm:
+            def __enter__(self):
+                cm.__enter__()
+
+            def __exit__(self, *a):
+                for pid in lk.pids:
+                    try:
+                        os.waitpid(pid, os.WNOHANG)
+                        lk.reaped_at_unlock.append(False)
+                    except ChildProcessError:
+                        lk.reaped_at_unlock.append(True)
+                cm.__exit__(*a)
+        return _Cm()
+
+
+def _forking(pids):
+    def fork():
+        pid = os.fork()
+        if pid:
+            pids.append(pid)
+        return pid
+    return fork
+
+
+@pytest.mark.parametrize("verb", ["set-credential", "remove-credential"])
+def test_b1_a_held_credential_lock_is_credential_lock_timeout_and_the_install_lock_goes(L, verb):
+    (L / "keys" / "cred").mkdir(mode=0o700)
+    holder = os.open(str(L / "keys" / "cred" / ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)              # a stopped keys writer, or anything of keys' uid
+    pids = []
+    lock = _ReapCheckLock(pids)
+    try:
+        rc, out, _ = _main([verb, NAME], _seams(L, lock=lock, fork=_forking(pids), lock_timeout_s=0.3)[0])
+    finally:
+        os.close(holder)
+    assert (rc, out) == (1, {"ok": False, "refused": "credential-lock-timeout"})
+    assert lock.calls == ["lock", "unlock"] and lock.reaped_at_unlock == [True]
+
+
+def test_b1_a_stopped_child_is_killed_and_reaped_before_the_install_lock_goes(L):
+    def drop(uid, gid):
+        os.kill(os.getpid(), signal.SIGSTOP)
+    pids = []
+    lock = _ReapCheckLock(pids)
+    t0 = time.monotonic()
+    rc, out, _ = _main(["set-credential", NAME], _seams(L, drop=drop, lock=lock, fork=_forking(pids),
+                                                       deadline_s=0.5)[0])
+    assert (rc, out) == (1, {"ok": False, "refused": "credential-child-timeout"})
+    assert time.monotonic() - t0 < 5
+    assert lock.calls == ["lock", "unlock"] and lock.reaped_at_unlock == [True]
+    assert not os.path.lexists(L / "keys" / "cred" / f"{NAME}.json")
+
+
+def test_b1_root_s_one_deadline_is_past_the_child_s_lock_bound():
+    assert IH.CHILD_MARGIN_S > 0 and C.LOCK_TIMEOUT_S + IH.CHILD_MARGIN_S > C.LOCK_TIMEOUT_S
+
+
+@pytest.mark.parametrize("verb, forged", [("set-credential", "removed durable"),
+                                          ("set-credential", "absent durable"),
+                                          ("remove-credential", "committed " + "a" * 32 + " durable")])
+def test_b2_a_status_that_does_not_answer_the_verb_is_internal(L, monkeypatch, verb, forged):
+    def child(verb_, name, fields, keys_dir, uid, gid, w, drop, *a):
+        os.write(w, forged.encode() + b"\n")
+        os._exit(0)
+    monkeypatch.setattr(IH, "_credential_child", child)
+    rc, out, _ = _main([verb, NAME], _seams(L)[0])
+    assert (rc, out) == (RH.EXIT_INTERNAL, {"ok": False, "refused": "internal"})
+
+
+def test_b3_the_child_s_stdin_and_stdout_are_dev_null(L):
+    probe = L.parent / "probe.json"
+    nul = os.stat(os.devnull)
+
+    def drop(uid, gid):
+        same = [(os.fstat(fd).st_dev, os.fstat(fd).st_ino) == (nul.st_dev, nul.st_ino) for fd in (0, 1)]
+        probe.write_text(json.dumps(same))
+    rc, out, err = _main(["set-credential", NAME], _seams(L, drop=drop)[0])
+    assert rc == 0, err
+    assert json.loads(probe.read_text()) == [True, True]
+
+
+def test_b4_the_first_set_fsyncs_L_keys_and_a_failure_is_not_durable(L, monkeypatch):
+    def bad(fd):                     # creds.dir_fsync by module name: only the child's L/keys fsync calls it so
+        raise OSError(5, "EIO")
+    monkeypatch.setattr(C, "dir_fsync", bad)
+    rc, out, err = _main(["set-credential", NAME], _seams(L)[0])
+    assert rc == 0 and "not durable" in err
+    rc, out, err = _main(["set-credential", NAME], _seams(L, _fields(secret="sk-test-two"))[0])
+    assert rc == 0 and "not durable" not in err      # cred/ existed: nothing new in L/keys
+
+
+def test_b5_is_p1_a_not_durable_remove_at_the_verb(L):
+    # B5 = P1 at the verb: covered by test_a_not_durable_remove_is_success_with_the_same_warning (the child's
+    # `removed not-durable`, root's warning); here the per-verb grammar admits both forms for remove only.
+    assert IH._CHILD_OK["remove-credential"].fullmatch("removed not-durable")
+    assert IH._CHILD_OK["remove-credential"].fullmatch("absent not-durable")
+    assert not IH._CHILD_OK["set-credential"].fullmatch("removed not-durable")
+
+
+def _no_h11(monkeypatch):
+    import sys as _sys
+
+    import levain.broker as B
+    monkeypatch.setitem(_sys.modules, "h11", None)
+    for m in ("levain.broker.creds", "levain.broker.upstream"):
+        monkeypatch.delitem(_sys.modules, m, raising=False)
+    monkeypatch.delattr(B, "creds", raising=False)
+    monkeypatch.delattr(B, "upstream", raising=False)
+
+
+@pytest.mark.parametrize("verb", ["set-credential", "remove-credential"])
+def test_b6_no_h11_in_root_s_python_is_a_named_refusal_before_any_fork(L, monkeypatch, verb):
+    forks, reads = [], []
+
+    def fork():
+        forks.append(1)
+        raise AssertionError("forked")
+
+    def read(n):
+        reads.append(n)
+        return json.dumps(_fields()).encode()
+    seams = _seams(L, fork=fork)[0]
+    seams.stdin = read
+    _no_h11(monkeypatch)
+    rc, out, _ = _main([verb, NAME], seams)
+    assert (rc, out) == (1, {"ok": False, "refused": "credential-layer-unavailable"})
+    assert forks == [] and reads == []
+
+
+def test_b7_a_non_operator_is_refused_before_root_reads_stdin(L):
+    reads = []
+
+    def read(n):
+        reads.append(n)
+        return b"not json"
+    seams = _seams(L)[0]
+    seams.stdin = read
+    out = io.StringIO()
+    assert main(["set-credential", NAME], env={"SUDO_UID": str(ME + 1)}, seams=seams, out=out,
+                err=io.StringIO()) == 1
+    assert out.getvalue() == '{"ok":false,"refused":"operator-mismatch"}\n'
+    assert reads == []
+
+
+def test_b9_remove_on_a_host_without_cred_is_absent_and_creates_nothing(L):
+    rc, out, err = _main(["remove-credential", NAME], _seams(L)[0])
+    assert (rc, out["removed"]) == (0, False), err
+    assert not os.path.lexists(L / "keys" / "cred")
