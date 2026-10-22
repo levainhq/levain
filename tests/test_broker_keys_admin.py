@@ -825,12 +825,14 @@ async def _one_q(d: str, ledger: _Ledger) -> bytes:
         os.close(cred_fd)
 
 
-@pytest.mark.parametrize("fault", ["unbuilt", "reset", "tls", "timeout", "head-drain", "body-drain"])
+@pytest.mark.parametrize("fault", ["unbuilt", "reset", "tls", "timeout", "head-write", "head-drain", "body-drain"])
 def test_upstream_failure_answers_f_and_releases_the_budget(monkeypatch, fault):
     # L3 r2 (codex MED, complement LOW x2), reproduced first (`3b-3b-p5/repro_before.txt`): a failure in
     # `open_exchange` (the shipped seam's NotImplementedError included), the head's write or a drain escaped every
     # translation, so the front read EOF; and the reservation made before `open_exchange` was never released.
     # Now each is answered `upstream-error` (`upstream-timeout` for a deadline) and every reservation released once.
+    # P5 L3 r1 (codex MED), reproduced first (`3b-3b-p5/repro_p5b_head_write_before.txt`): a head write that raised
+    # before taking a byte was released `sent=True`; `sent` now follows the write's return.
     import ssl
 
     from levain.broker import upstream as U
@@ -840,6 +842,11 @@ def test_upstream_failure_answers_f_and_releases_the_budget(monkeypatch, fault):
 
     class _Failing(_RawTLS):
         drains = 0
+
+        def write(self, data: bytes) -> None:
+            if fault == "head-write":
+                raise ConnectionResetError("upstream reset before the head")
+            super().write(data)
 
         async def drain(self) -> None:
             self.drains += 1

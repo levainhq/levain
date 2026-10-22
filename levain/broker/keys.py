@@ -1129,8 +1129,14 @@ class Keys:
             host = pol.upstream.host
             # 3b-4 resolves `host` and passes a validated address; at this tip the handshake seam is the fixture's
             up = await upstream_step(open_exchange(host, UPSTREAM_PORT, host, conn))
-            sent = True   # from here the head may have reached the upstream
-            await upstream_send(up, head)
+
+            async def send_head() -> None:
+                nonlocal sent
+                up.write(head)   # the gate: a refused or failed write handed nothing upstream
+                sent = True      # from here the head may have reached the upstream
+                await up.drain()
+
+            await upstream_step(send_head())
             if not conn.detached:   # a detached exchange answers nothing; its next upstream write is refused by the gate
                 conn.writer.write(_A)
                 await conn.writer.drain()
