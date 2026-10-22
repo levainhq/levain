@@ -56,7 +56,7 @@ import socket
 import stat
 import sys
 from collections import OrderedDict
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Awaitable, Dict, List, Optional, Sequence, Set, Tuple, TypeVar, Union
 
 from levain.broker import gwwire, norm, upstream
 from levain.broker.creds import CredLifecycle, CredStore, FakeCredLifecycle, check_host
@@ -66,6 +66,8 @@ from levain.broker.policy import PolicyError, RoutePolicy, parse_route
 from levain.broker.upstream import GRACE, StaleExchange, Upstream, _note, open_exchange
 from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
+
+T = TypeVar("T")
 
 # --- the admission values (DECISION, judged against the 8-slot default; one constant each) ------------------------
 FIRST_FRAME_S = 5.0
@@ -167,16 +169,27 @@ BASE_MAP_CAP = 1024 * 1024
 # --- the seams 3c fills (design 1.11), with their refusing production defaults ------------------------------------
 
 class RefusingBudget:
-    """`budget`'s production default until 3c's ledger: every reservation is refused `budget-exhausted`."""
+    """`budget`'s production default until 3c's ledger: every reservation is refused `budget-exhausted`.
+
+    The seam is two calls: `reserve` (the request check's last step; refusing raises `norm.Refused`) and `release`,
+    which keys calls exactly once for every reservation `reserve` made, when its exchange ends without a relayed
+    response to settle it. `sent` says whether the request head was handed to the upstream connection by then (it
+    may have been processed, so a ledger may hold what it would otherwise free)."""
 
     def reserve(self, session: str, route: str, max_call_microdollars: Optional[int]) -> None:
         raise norm.Refused("budget-exhausted", "no ledger")
+
+    def release(self, session: str, route: str, max_call_microdollars: Optional[int], sent: bool) -> None:
+        return None
 
 
 class UnmeteredBudget:
     """`--unmetered` (3b's fixture and VM runs only; 3c deletes the flag): every reservation is admitted."""
 
     def reserve(self, session: str, route: str, max_call_microdollars: Optional[int]) -> None:
+        return None
+
+    def release(self, session: str, route: str, max_call_microdollars: Optional[int], sent: bool) -> None:
         return None
 
 
@@ -194,6 +207,41 @@ class NoCodec:
     def check(self, run: object, route: RoutePolicy) -> None:
         if run is not None:
             raise norm.Refused("model-not-allowed", "no codec")
+
+
+#: what an upstream connection's failure raises, each answered `upstream-error` (`upstream-timeout` for a deadline):
+#: a refused or reset connect, a TLS failure (`ssl.SSLError` is an OSError), a write or drain on a lost connection,
+#: and a seam that is not built yet. `StaleExchange` is none of them: a detached exchange still ends with no answer.
+UPSTREAM_FAILURES = (OSError, EOFError, asyncio.TimeoutError, NotImplementedError)
+
+
+class UpstreamFailed(Exception):
+    """An upstream failure translated to the refusal the front is answered: `name` is `upstream-error` or
+    `upstream-timeout`."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.name = name
+
+
+async def upstream_step(aw: Awaitable[T]) -> T:
+    """Await one upstream step; an UPSTREAM_FAILURES raise becomes UpstreamFailed (noted), anything else, a
+    StaleExchange or a cancel included, propagates unchanged."""
+    try:
+        return await aw
+    except UPSTREAM_FAILURES as e:
+        # on 3.11+ asyncio's TimeoutError IS the builtin one, an OSError: the deadline is told apart first
+        timeout = isinstance(e, (asyncio.TimeoutError, TimeoutError))
+        _note(logging.WARNING, "levain gw-keys: upstream failed (%s)", type(e).__name__)
+        raise UpstreamFailed("upstream-timeout" if timeout else "upstream-error") from None
+
+
+async def upstream_send(up: Upstream, data: bytes) -> None:
+    """`up.write(data)` (the gate) and its drain, as one upstream step."""
+    async def send() -> None:
+        up.write(data)
+        await up.drain()
+    await upstream_step(send())
 
 
 def bounded() -> int:
@@ -1069,33 +1117,42 @@ class Keys:
             await self._refuse(conn, frames, side, r.name, UNTRUSTED_DRAIN_CAP)
             return
         try:
-            head = self._check_request(conn.reg, claims, pol, q)
+            head = self._check_request(conn.reg, claims, pol, q)   # the budget reservation is its last step
         except norm.Refused as r:
             await self._refuse(conn, frames, side, r.name, pol.body_cap)
             return
-        assert pol.upstream is not None   # a brokered route always names one
-        host = pol.upstream.host
-        # 3b-4 resolves `host` and passes a validated address; at this tip the handshake seam is the fixture's
-        up = await open_exchange(host, UPSTREAM_PORT, host, conn)
-        up.write(head)
-        await up.drain()
-        if not conn.detached:   # a detached exchange answers nothing; its next upstream write is refused by the gate
-            conn.writer.write(_A)
-            await conn.writer.drain()
+        # From the reservation on, every exit releases it (no relayed response settles one at this tip): nothing that
+        # can raise runs between the reservation and the try.
+        sent = False
         try:
+            assert pol.upstream is not None   # a brokered route always names one
+            host = pol.upstream.host
+            # 3b-4 resolves `host` and passes a validated address; at this tip the handshake seam is the fixture's
+            up = await upstream_step(open_exchange(host, UPSTREAM_PORT, host, conn))
+            sent = True   # from here the head may have reached the upstream
+            await upstream_send(up, head)
+            if not conn.detached:   # a detached exchange answers nothing; its next upstream write is refused by the gate
+                conn.writer.write(_A)
+                await conn.writer.drain()
             ended = await self._forward_body(frames, side, up, q["body"], pol.body_cap)
-        except norm.Refused as r:
+            if not ended:
+                return   # the front aborted (`X`) or went away before `E`: nothing to answer
+            await upstream_step(upstream._read_response(up))
+            # The response relay (`R` `b`* `e`) is 3b-4's; until it exists an exchange that reached the upstream is
+            # answered `upstream-error`.
+            await self._refuse(conn, frames, side, "upstream-error", pol.body_cap)
+        except (norm.Refused, UpstreamFailed) as r:
             await self._refuse(conn, frames, side, r.name, pol.body_cap)
-            return
-        if not ended:
-            return   # the front aborted (`X`) or went away before `E`: nothing to answer
+        finally:
+            self._release(conn.reg, pol, sent)
+
+    def _release(self, reg: Registration, pol: RoutePolicy, sent: bool) -> None:
+        """The budget reservation's release, synchronous so a cancel cannot skip it; a failing seam is noted and
+        never replaces the exchange's own outcome."""
         try:
-            await upstream._read_response(up)
-        except NotImplementedError:
-            pass
-        # The response relay (`R` `b`* `e`) is 3b-4's; until it exists an exchange that reached the upstream is
-        # answered `upstream-error`.
-        await self._refuse(conn, frames, side, "upstream-error", pol.body_cap)
+            self.budget.release(reg.session, pol.route, pol.max_call_microdollars, sent)
+        except Exception as e:
+            _note(logging.WARNING, "levain gw-keys: budget release failed (%s)", type(e).__name__)
 
     def _route_policy(self, claims: dict, route: str) -> RoutePolicy:
         """keys' OWN policy for `route`: it must be one of the token's `routes`, and the object comes from keys' load
@@ -1113,8 +1170,9 @@ class Keys:
 
     def _base_route(self, route: str) -> Optional[RoutePolicy]:
         """`route`'s object in `L/routes/base.json`, read and parsed (`policy.parse_route`, source `base`) at every
-        `Q`, or None when the map has none. A map keys cannot read or parse, or one naming the route twice, refuses
-        `keys-unavailable` (logged), never a pass."""
+        `Q`, or None when the map has none. EVERY entry is parsed before one is selected: a map keys cannot read, any
+        entry that does not parse, or any route id named twice anywhere in the map refuses `keys-unavailable`
+        (logged), never a pass for the route asked about."""
         if self.lib_root is None:
             raise norm.Refused("keys-unavailable", "no lib root")
         path = os.path.join(self.lib_root, "routes", "base.json")
@@ -1126,10 +1184,13 @@ class Keys:
             doc = canon.parse(data)
             if type(doc) is not dict or doc.get("format") != BASE_MAP_FORMAT or type(doc.get("routes")) is not list:
                 raise PolicyError("format or routes")
-            hits = [r for r in doc["routes"] if type(r) is dict and r.get("route") == route]
-            if len(hits) > 1:
-                raise PolicyError("a route named twice")
-            return parse_route(hits[0], source="base") if hits else None
+            parsed: Dict[str, RoutePolicy] = {}
+            for entry in doc["routes"]:
+                pol = parse_route(entry, source="base")
+                if pol.route in parsed:
+                    raise PolicyError("a route named twice")
+                parsed[pol.route] = pol
+            return parsed.get(route)
         except (OSError, ValueError, ContractError, RecursionError) as e:
             _note(logging.WARNING, "levain gw-keys: the base route map is unusable (%s)", type(e).__name__)
             raise norm.Refused("keys-unavailable", "base map") from None
@@ -1173,12 +1234,14 @@ class Keys:
             check_host(cred, pol.upstream.host, pol.route)
             if any(n == cred.header for n, _ in fwd):
                 raise norm.Refused("policy-header", cred.header)
-        self.budget.reserve(reg.session, pol.route, pol.max_call_microdollars)
-        return request_head(pol, method, path, query, fwd, body, cred)
+        head = request_head(pol, method, path, query, fwd, body, cred)
+        self.budget.reserve(reg.session, pol.route, pol.max_call_microdollars)   # the last step: see `_serve_q`
+        return head
 
     async def _forward_body(self, frames: FrameReader, side: KeysSide, up: Upstream, body: str, cap: int) -> bool:
         """The front's `B` frames through `up.write`, framed as the head declared, until `E` (True) or `X` / EOF
-        (False). keys counts the bytes itself: past `cap` is `body-cap`, a `length:n` body of any other size, or any
+        (False); an upstream failure raises UpstreamFailed. keys counts the bytes itself: past `cap` is `body-cap`, a
+        `length:n` body of any other size, or any
         body on a `none` request, is `malformed`."""
         want = int(body[len("length:"):]) if body.startswith("length:") else None
         got = 0
@@ -1198,13 +1261,11 @@ class Keys:
                 raise norm.Refused("malformed", "body length")
             if got > cap:
                 raise norm.Refused("body-cap", "body")
-            up.write(b"%x\r\n" % len(payload) + payload + b"\r\n" if body == "chunked" else payload)
-            await up.drain()
+            await upstream_send(up, b"%x\r\n" % len(payload) + payload + b"\r\n" if body == "chunked" else payload)
         if want is not None and got != want:
             raise norm.Refused("malformed", "body length")
         if body == "chunked":
-            up.write(b"0\r\n\r\n")
-            await up.drain()
+            await upstream_send(up, b"0\r\n\r\n")
         return True
 
     async def _token_state(self, conn: Conn, token: str) -> Optional[dict]:

@@ -766,3 +766,126 @@ def test_revoke_at_every_suspension(monkeypatch, transition, delivery, cached):
         assert not r["in_set"] and r["held"] is None, where
     if cached and delivery == "cancel-lost":
         assert sum(r["refused"] for r in paused) >= 1                   # the gate itself refused, not only the cancel
+
+
+# --- P5: the request path's upstream failures and the base map, L3 r2's findings ----------------------------------
+
+class _Ledger:
+    """A budget seam that counts: +1 per reservation, -1 per release."""
+
+    def __init__(self) -> None:
+        self.held = 0
+        self.sent: list = []
+
+    def reserve(self, session, route, max_call) -> None:
+        self.held += 1
+
+    def release(self, session, route, max_call, sent) -> None:
+        self.held -= 1
+        self.sent.append(sent)
+
+
+async def _one_q(d: str, ledger: _Ledger) -> bytes:
+    """One cached-token `Q` with a 5-byte body through the real `_exchange`; returns what the front read."""
+    from levain.broker.creds import CredStore
+    from levain.broker.norm import digest_of_token
+    cred_fd = os.open(os.path.join(d, "keys", "cred"), os.O_RDONLY | os.O_DIRECTORY)
+    a, b = socket.socketpair()
+    try:
+        k = K.Keys(unmetered=True, lib_root=d, creds=CredStore(cred_fd), budget=ledger)
+        k._in_loop()
+        k.admin = K.AdminConn(None, _AdminW(), k.admin_epoch)
+        await k.front_register(k.admin_epoch, "s1", 70000, 1, 1, 1, 1)
+        await k.front_arm(k.admin_epoch, "s1", 1)
+        reg = k.regs[70000]
+        reg.state = "claimed"
+        k.cache[digest_of_token(_FRAME_TOKEN)] = {"session": "s1", "claims": dict(_FRAME_CLAIMS)}
+        _r, w = await asyncio.open_unix_connection(sock=a)
+        fr = asyncio.StreamReader()
+        fr.feed_data(gwwire.encode(b"B", b"hello") + gwwire.encode(b"E"))
+        fr.feed_eof()
+        side = gwwire.KeysSide()
+        side.got(b"Q")
+        conn = K.Conn(w, reg, "pending")
+        reg.pending.add(conn)
+        k.pool.add(conn)
+        await k._exchange(conn, gwwire.FrameReader(fr), side, dict(_FRAME_Q))
+        w.close()
+        await asyncio.wait_for(w.wait_closed(), 2)
+        b.settimeout(2)
+        got = b""
+        while True:
+            x = b.recv(65536)
+            if not x:
+                return got
+            got += x
+    finally:
+        a.close()
+        b.close()
+        os.close(cred_fd)
+
+
+@pytest.mark.parametrize("fault", ["unbuilt", "reset", "tls", "timeout", "head-drain", "body-drain"])
+def test_upstream_failure_answers_f_and_releases_the_budget(monkeypatch, fault):
+    # L3 r2 (codex MED, complement LOW x2), reproduced first (`3b-3b-p5/repro_before.txt`): a failure in
+    # `open_exchange` (the shipped seam's NotImplementedError included), the head's write or a drain escaped every
+    # translation, so the front read EOF; and the reservation made before `open_exchange` was never released.
+    # Now each is answered `upstream-error` (`upstream-timeout` for a deadline) and every reservation released once.
+    import ssl
+
+    from levain.broker import upstream as U
+    d = tempfile.mkdtemp(prefix="lu", dir="/tmp")
+    _frame_lib(d)
+    st = {"after": False, "raw": []}
+
+    class _Failing(_RawTLS):
+        drains = 0
+
+        async def drain(self) -> None:
+            self.drains += 1
+            if self.drains >= (1 if fault == "head-drain" else 2):
+                raise ConnectionResetError("upstream reset")
+
+    raises = {"reset": ConnectionResetError("rst"), "tls": ssl.SSLError("bad cert"), "timeout": asyncio.TimeoutError()}
+
+    async def handshake(addr, port, host):
+        if fault in raises:
+            raise raises[fault]
+        return object(), _Failing(st), _Plain()
+
+    if fault != "unbuilt":
+        monkeypatch.setattr(U, "_handshake", handshake)
+    ledger = _Ledger()
+    try:
+        got = asyncio.run(_one_q(d, ledger))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    name = "upstream-timeout" if fault == "timeout" else "upstream-error"
+    want = (gwwire.encode(b"A") if fault == "body-drain" else b"") + gwwire.encode(b"F", {"refused": name})
+    assert got == want
+    assert ledger.held == 0 and len(ledger.sent) == 1
+    assert ledger.sent == [fault in ("head-drain", "body-drain")]   # `sent` once the head was handed upstream
+
+
+@pytest.mark.parametrize("routes", ["non-object", "duplicate", "malformed"])
+def test_base_map_unusable_anywhere_refuses_every_route(routes):
+    # L3 r2 (codex LOW) against ruling S-24's fail-closed rule, reproduced first (`3b-3b-p5/repro_before.txt`): the
+    # map was filtered to the asked route before validation, so an unusable or duplicated UNRELATED entry left `r`
+    # served. Now every entry is parsed and every id checked once across the map: `keys-unavailable`, nothing
+    # reserved.
+    d = tempfile.mkdtemp(prefix="lm", dir="/tmp")
+    _frame_lib(d)
+    path = os.path.join(d, "routes", "base.json")
+    with open(path, "rb") as f:
+        route = canon.parse(f.read())["routes"][0]
+    extra = {"non-object": [42], "duplicate": [dict(route, route="z"), dict(route, route="z")],
+             "malformed": [{"route": "z", "type": "brokered"}]}[routes]
+    with open(path, "wb") as f:
+        f.write(canon.canonical_bytes({"format": K.BASE_MAP_FORMAT, "routes": [route] + extra}))
+    ledger = _Ledger()
+    try:
+        got = asyncio.run(_one_q(d, ledger))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    assert got == gwwire.encode(b"F", {"refused": "keys-unavailable"})
+    assert ledger.sent == []
