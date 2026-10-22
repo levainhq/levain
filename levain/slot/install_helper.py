@@ -848,7 +848,8 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
         # Row 33 (§8 N1/N1a): the ONLY proof a repair finished is install-shape's completed_txn == its txn.
         shape = facts.install_shape
         if shape is None or journal.txn != shape.completed_txn:
-            raise Refused("install-interrupted:repair", "re-run repair to finish it")
+            # U7 (HEAD 1022-12): setup's shape, the interrupted verb as the detail, so every verb renders it alike.
+            raise Refused("install-interrupted", journal.verb)
         journal = None    # finished: this run's journal write replaces it
     new: dict[SlotClass, tuple[SlotId, ...]] = {}
     if journal is not None and journal.verb == "replenish":
@@ -1037,7 +1038,7 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     journal = facts.intent
     finished: Intent | None = None
     if journal is not None and journal.verb == "replenish":
-        raise Refused("install-interrupted:replenish", "finish the replenish first")
+        raise Refused("install-interrupted", journal.verb)      # U7: setup's shape (plan_setup above)
     if journal is not None and journal.verb == "setup":
         journal = None    # stale: the operator record proves that setup finished (preflight refuses without one)
     if journal is not None and shape is not None and journal.txn == shape.completed_txn:

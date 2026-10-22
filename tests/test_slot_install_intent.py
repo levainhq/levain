@@ -2,6 +2,7 @@
 files only."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from levain.slot.ids import RANGES, SHARED_GROUPS, SINGLETONS
 from levain.slot.install_helper import HostFacts, operator_record, plan_replenish, plan_setup, plan_undo
 from levain.slot.intent import (INSTALL_LOCK, INTENT_PATH, Intent, install_lock, intent_text, parse_intent,
                                 read_intent, write_intent_atomically)
+from levain.slot.generation import TXN_RE
 from levain.slot.layout import operator_record_path
 
 HOSTS = ("linux", "darwin")
@@ -137,13 +139,19 @@ def test_install_lock_refuses_bad_root(tmp_path):
 def test_intent_record_round_trips_and_is_strict(host):
     plan = _plan(host)
     j = plan.intent
-    assert j == Intent("setup", OP, dict(plan.allocation.ids), dict(plan.allocation.shared))
+    # row 33 R1: setup writes levain-intent/2, which carries the run's fresh txn
+    assert TXN_RE.fullmatch(j.txn)
+    assert j == Intent("setup", OP, dict(plan.allocation.ids), dict(plan.allocation.shared), j.txn)
+    assert json.loads(intent_text(j))["format"] == "levain-intent/2"
     assert parse_intent(intent_text(j).encode(), host) == j
+    # a txn-less journal is never written (the /2 record requires one)
+    assert _refusal(intent_text, Intent("setup", OP, dict(plan.allocation.ids), dict(plan.allocation.shared))).name \
+        == "intent-malformed"
     r = RANGES[host]
     good = {"format": "levain-intent/1", "verb": "replenish", "operator": OP,
             "accounts": {"_levain_s1": r.slots[0]}, "groups": {}}
-    import json
     assert parse_intent(json.dumps(good).encode(), host).accounts == {"_levain_s1": r.slots[0]}
+    assert parse_intent(json.dumps(good).encode(), host).txn is None             # a /1 journal still reads, no txn
     for bad in ({**good, "verb": "undo"}, {**good, "format": "levain-intent/2"}, {**good, "extra": 1},
                 {**good, "operator": "a b"}, {**good, "accounts": {"bob": r.slots[0]}},
                 {**good, "accounts": {"_levain_s1": r.singletons[0]}},
@@ -157,7 +165,7 @@ def test_intent_record_round_trips_and_is_strict(host):
 
 
 def test_intent_written_atomically_0600(tmp_path):
-    j = Intent("replenish", OP, {"_levain_s1": 899})
+    j = Intent("replenish", OP, {"_levain_s1": 899}, txn="0" * 32)     # row 33: a /2 journal carries a txn
     path = tmp_path / "state" / "install-intent"
     (path.parent).mkdir()
     (path.parent / "install-intent.tmp").write_text("a dead run's temp file")
@@ -192,7 +200,8 @@ def test_intent_written_first_removed_last(host, tmp_path, monkeypatch):
                                    "_levain_c0": sl[3]})
     assert rep.steps[0].call and "journal" in rep.steps[0].why
     assert rep.steps[-1].argv[1:] == ("-f", str(tmp_path / "install-intent"))
-    assert rep.intent == Intent("replenish", OP, dict(rep.allocation.ids))
+    assert TXN_RE.fullmatch(rep.intent.txn)
+    assert rep.intent == Intent("replenish", OP, dict(rep.allocation.ids), txn=rep.intent.txn)
     confinement = [i for i, s in enumerate(rep.steps)
                    if s.argv and ("netns" in s.argv or "pfctl" in s.argv[0] or "ifconfig" in s.argv[0])
                    or "bwrap" in s.why]
@@ -252,7 +261,8 @@ def test_replenish_resumes_intent(host):
     ids = list(r.slots)
     live_accts = {**{f"_levain_s{i}": ids[2 * i] for i in range(1, 8)},
                   **{f"_levain_gw{i}": ids[2 * i + 1] for i in range(1, 8)}}
-    j = Intent("replenish", OP, {"_levain_s8": ids[40], "_levain_gw8": ids[41]})
+    # row 33 R1: a levain-intent/2 journal, resumed at its own txn (the /1 case is below)
+    j = Intent("replenish", OP, {"_levain_s8": ids[40], "_levain_gw8": ids[41]}, txn="1" * 32)
     # the interrupted run made _levain_s8, not its front; s0 is a tombstone
     names = frozenset(live_accts) | {"_levain_s0", "_levain_gw0", "_levain_s8"}
     used = frozenset(live_accts.values()) | {ids[0], ids[1], ids[40]}
@@ -276,6 +286,12 @@ def test_replenish_resumes_intent(host):
     # a journaled name present at another id
     assert _refusal(plan_replenish, cmd, _set_up(host, existing_names=names, used_ids=used, intent=j,
                                                  host_ids={"_levain_s8": ids[42]}), **kw).name == "account-exists"
+    # a levain-intent/1 journal (no txn) resumes the same allocation under a freshly minted txn
+    j1 = Intent("replenish", OP, dict(j.accounts))
+    rep1 = plan_replenish(cmd, _set_up(host, existing_names=names, used_ids=used, intent=j1,
+                                       host_ids={"_levain_s8": ids[40]}), **kw)
+    assert dict(rep1.allocation.ids) == dict(j.accounts) and TXN_RE.fullmatch(rep1.intent.txn)
+    assert rep1.intent == Intent("replenish", OP, dict(j.accounts), txn=rep1.intent.txn)
     # a stale setup journal (setup died after its record) does not stop a replenish
     sj = Intent("setup", OP, {}, {})
     plan_replenish(cmd, _set_up(host, existing_names=names, used_ids=used, intent=sj), **kw)

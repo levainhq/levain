@@ -223,7 +223,7 @@ def _short_writes(monkeypatch, *, zero_after=None):
 
 
 def test_journal_write_survives_short_writes(tmp_path, monkeypatch):
-    j = Intent("setup", OP, {"_levain_control": 3790}, {})
+    j = Intent("setup", OP, {"_levain_control": 3790}, {}, "0" * 32)   # row 33: a /2 journal carries a txn
     text = intent_mod.intent_text(j)
     _short_writes(monkeypatch)
     assert intent_mod.write_intent_atomically(tmp_path / "install-intent", text) == (True, "")
@@ -233,7 +233,7 @@ def test_journal_write_survives_short_writes(tmp_path, monkeypatch):
 def test_journal_zero_progress_write_is_an_error(tmp_path, monkeypatch):
     target = tmp_path / "install-intent"
     _short_writes(monkeypatch, zero_after=1)
-    ok, why = intent_mod.write_intent_atomically(target, intent_mod.intent_text(Intent("setup", OP, {}, {})))
+    ok, why = intent_mod.write_intent_atomically(target, intent_mod.intent_text(Intent("setup", OP, {}, {}, "0" * 32)))
     assert not ok and why
     assert not target.exists() and not target.with_name(target.name + ".tmp").exists()
 

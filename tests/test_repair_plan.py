@@ -227,7 +227,13 @@ def test_repair_completion_is_the_txn(tmp_path: Path) -> None:
     with pytest.raises(Refused) as e:
         IH.plan_replenish(replenish, facts_with(TXN_B), slots=1, verifier_slots=1, live={"egress": (0,), "none": (0,)},
                           accounts=SLOT_UIDS)
-    assert e.value.name == "install-interrupted:repair"
+    # U7 (HEAD 1022-12): one shape for the refusal, setup's (name install-interrupted, the verb as detail), so the
+    # rendered text is identical whichever verb meets the unfinished repair
+    assert (e.value.name, e.value.detail) == ("install-interrupted", "repair")
+    with pytest.raises(Refused) as s_e:
+        IH.plan_setup(parse_install_argv(["setup", "--slots", "1", "--verifier-slots", "1", "--operator", OP]),
+                      facts_with(TXN_B))
+    assert str(s_e.value) == str(e.value) == "install-interrupted: repair"
     # equal txns: the repair finished; replenish overwrites its journal with its own
     plan = IH.plan_replenish(replenish, facts_with(TXN_A), slots=1, verifier_slots=1,
                              live={"egress": (0,), "none": (0,)}, accounts=SLOT_UIDS)
@@ -243,6 +249,14 @@ def test_repair_completion_is_the_txn(tmp_path: Path) -> None:
     assert whys[0].startswith("remove the finished repair journal")
     assert whys[1].startswith("journal what this repair")
     assert rplan.intent.txn != TXN_A and G.TXN_RE.fullmatch(rplan.intent.txn)
+    # a repair meeting an interrupted replenish renders that refusal exactly as setup does (U7)
+    rj = Intent("replenish", OP, {"_levain_s1": RANGES[HOST].slots[0]}, txn=TXN_B)
+    rjf, _ = _pre_change(tmp_path / "rj", intent=parse_intent(intent_text(rj).encode(), HOST), shape=shape)
+    with pytest.raises(Refused) as r_e:
+        _plan(rjf, rf)
+    with pytest.raises(Refused) as s_e:
+        IH.plan_setup(parse_install_argv(["setup", "--slots", "1", "--verifier-slots", "1", "--operator", OP]), rjf)
+    assert str(r_e.value) == str(s_e.value) == "install-interrupted: replenish"
     # ...while an unfinished one (txn differs) is resumed at its own txn
     f = facts_with(TXN_B)
     rplan = _plan(f, rf)
