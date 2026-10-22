@@ -1192,7 +1192,7 @@ CREDENTIAL_VERBS = ("set-credential", "remove-credential")
 _CHILD_MAX = 256                     # the child's one status line, read to EOF up to this
 _O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 #: what the child may answer, and nothing else is believed: a dropped child's bytes are not root's.
-_CHILD_OK = re.compile(r"(committed [0-9a-f]{32} (?:durable|not-durable)|removed|absent)")
+_CHILD_OK = re.compile(r"(?:committed [0-9a-f]{32}|removed|absent) (?:durable|not-durable)")
 _CHILD_FAILED = re.compile(r"failed (credential-commit-failed|credential-lock-timeout|credential-drop-failed"
                            r"|credential-dir-failed|internal) ([A-Za-z]{1,40})")
 
@@ -1272,7 +1272,8 @@ def _credential_child(verb: str, name: str, fields: Optional[dict], keys_dir: st
                 out = C.commit(cred_fd, name, fields or {}, wait=True)   # the operator's write: no rev compare
                 msg = f"committed {out.rev} {'durable' if out.durable else 'not-durable'}"
             else:
-                msg = "removed" if C.remove(cred_fd, name, wait=True) else "absent"
+                out = C.remove(cred_fd, name, wait=True)
+                msg = f"{out.result} {'durable' if out.durable else 'not-durable'}"
         except C.CommitFailed as e:
             msg = f"failed {e.name} CommitFailed"
             raise
@@ -1332,13 +1333,17 @@ def run_credential(verb: str, name: str, fields: Optional[dict], caller_uid: int
     line = b"".join(chunks).decode("ascii", "replace").rstrip("\n")
     exited = os.WEXITSTATUS(status) if os.WIFEXITED(status) else None
     if exited == 0 and _CHILD_OK.fullmatch(line):
-        if line.startswith("committed"):
-            _, rev, durable = line.split(" ")
-            if durable == "not-durable":
-                (err or sys.stderr).write(f"levain install-helper: warning: credential {name} committed but not "
-                                          f"durable (the directory fsync failed); it is in use\n")
-            return {"verb": verb, "credential": name, "rev": rev}
-        return {"verb": verb, "credential": name, "removed": line == "removed"}
+        words = line.split(" ")
+        if words[-1] == "not-durable":
+            what = {"committed": "committed but not durable (the directory fsync failed); it is in use",
+                    "removed": "removed but not durable (the directory fsync failed); a crash may bring it back",
+                    "absent": "was absent, but not durable (the directory fsync failed); an earlier removal may "
+                              "come back after a crash",
+                    }[words[0]]
+            (err or sys.stderr).write(f"levain install-helper: warning: credential {name} {what}\n")
+        if words[0] == "committed":
+            return {"verb": verb, "credential": name, "rev": words[1]}
+        return {"verb": verb, "credential": name, "removed": words[0] == "removed"}
     m = _CHILD_FAILED.fullmatch(line)
     if exited == 70 and m and m.group(1) != "internal":
         raise Refused(m.group(1), m.group(2))

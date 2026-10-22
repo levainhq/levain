@@ -288,9 +288,19 @@ LOCK = ".lock"
 LOCK_TIMEOUT_S = 10.0      # keys' flock: a stopped holder fails the commit after this (DECISION, design 1.8 / R8)
 LOCK_RETRY_S = 0.05
 STALE_TMP_S = 60.0         # whoever holds the lock removes temps older than this
-_TMP_RE = re.compile(r"\.[a-z0-9-]{1,48}\.[0-9]+\.[0-9a-f]+\.tmp")   # `.<name>.<pid>.<random>.tmp`, nothing else
+#: exactly `_tmp_name`'s namespace: the name, a canonical positive pid, 8 lowercase hex, and nothing else
+_TMP_RE = re.compile(r"\.(?:" + NAME_RE.pattern + r")\.[1-9][0-9]*\.[0-9a-f]{8}\.tmp")
 _O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+#: the fds a commit or remove holds beyond keys' counted fixed ones, at its peak: the directory (when keys started
+#: before `cred/` existed, the first commit opens it), the lock, and ONE more at a time (the sweep's listing, which
+#: dups the dirfd; the compare's read; the temp). keys' NOFILE transient term is built from it.
+COMMIT_FDS = 3
 COMMITTED, DISCARDED = "committed", "discarded"
+REMOVED, ABSENT = "removed", "absent"
+
+
+def _tmp_name(name: str) -> str:
+    return f".{name}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
 
 
 class CommitFailed(Exception):
@@ -304,7 +314,9 @@ class CommitFailed(Exception):
 
 class Outcome:
     """`COMMITTED` with the new `rev` (`durable` False when the directory fsync failed after the rename: the new file
-    is in place, and the caller uses it), or `DISCARDED` (the `rev` compare failed: the file changed or is gone)."""
+    is in place, and the caller uses it), or `DISCARDED` (the `rev` compare failed: the file changed or is gone).
+    A remove's: `REMOVED` or `ABSENT` (no file was there), each with `durable` False when the directory fsync failed
+    (a crash may bring the file back)."""
     __slots__ = ("result", "rev", "durable")
 
     def __init__(self, result: str, rev: Optional[str] = None, durable: bool = True) -> None:
@@ -315,16 +327,8 @@ class Outcome:
 
 
 def full_fsync(fd: int) -> None:
-    """`F_FULLFSYNC` on macOS (a plain fsync there does not reach the medium), `os.fsync` elsewhere."""
-    if sys.platform == "darwin":
-        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
-    else:
-        os.fsync(fd)
-
-
-def dir_fsync(fd: int) -> None:
-    """The directory's fsync: on macOS `F_FULLFSYNC` on the dirfd, and `os.fsync` if that raises (some filesystems
-    refuse it on a directory)."""
+    """`F_FULLFSYNC` on macOS (a plain fsync there does not reach the medium), and `os.fsync` if that raises (some
+    filesystems refuse it: SMB, NFS, some FUSE mounts); `os.fsync` elsewhere. One rule for a file and a directory."""
     if sys.platform == "darwin":
         try:
             fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
@@ -332,6 +336,11 @@ def dir_fsync(fd: int) -> None:
         except OSError:
             pass
     os.fsync(fd)
+
+
+def dir_fsync(fd: int) -> None:
+    """The directory's fsync, by `full_fsync`'s rule."""
+    full_fsync(fd)
 
 
 def _renameat(src: str, dst: str, dir_fd: int) -> None:
@@ -382,7 +391,9 @@ def _open_lock(dir_fd: int) -> int:
 
 def _take_lock(fd: int, wait: bool, timeout_s: float, seams: WriteSeams) -> bool:
     """`flock(LOCK_EX)`: waiting (the install helper: an operator verb may wait), or `LOCK_NB` retried every
-    LOCK_RETRY_S for at most `timeout_s` (keys' writer thread: a stopped holder never holds it forever)."""
+    LOCK_RETRY_S for at most `timeout_s` (keys' writer thread: a stopped holder never holds it forever). After the
+    first attempt no attempt is made at or past the deadline (a thread descheduled in its sleep must not take the lock
+    late), and no sleep runs past it."""
     if wait:
         fcntl.flock(fd, fcntl.LOCK_EX)
         return True
@@ -394,14 +405,24 @@ def _take_lock(fd: int, wait: bool, timeout_s: float, seams: WriteSeams) -> bool
         except OSError as e:
             if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
                 raise
+        remaining = end - seams.monotonic()
+        if remaining <= 0:
+            return False
+        seams.sleep(min(LOCK_RETRY_S, remaining))
         if seams.monotonic() >= end:
             return False
-        seams.sleep(LOCK_RETRY_S)
 
 
 def _sweep(dir_fd: int, now: float) -> None:
-    """Under the lock: remove `.<name>.<pid>.<random>.tmp` files older than STALE_TMP_S (a killed writer's)."""
-    for entry in os.listdir(dir_fd):
+    """Under the lock: remove `_tmp_name`-shaped files older than STALE_TMP_S (a killed writer's). Best effort: a
+    directory that cannot be listed skips the sweep with a warning and never fails the commit or remove (whatever
+    is wrong with it, the commit's own steps fail on their own)."""
+    try:
+        entries = os.listdir(dir_fd)
+    except OSError as e:
+        _note(logging.WARNING, "levain gw-keys: credential-temp-sweep-skipped (listdir: %s)", type(e).__name__)
+        return
+    for entry in entries:
         if not _TMP_RE.fullmatch(entry):
             continue
         try:
@@ -440,18 +461,24 @@ def _locked(dir_fd: int, wait: bool, timeout_s: float, seams: WriteSeams) -> int
 
 
 def _unlock(lock_fd: int) -> None:
+    """Release and close. Never raises: closing the fd releases the flock, so a failed `LOCK_UN` (or close) is a
+    warning and never replaces the commit's outcome or the failure in flight."""
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
-    finally:
+    except OSError as e:
+        _note(logging.WARNING, "levain gw-keys: credential unlock failed (%s); the close releases it", type(e).__name__)
+    try:
         os.close(lock_fd)
+    except OSError as e:
+        _note(logging.WARNING, "levain gw-keys: credential lock close failed (%s)", type(e).__name__)
 
 
-def _durable(dir_fd: int, seams: WriteSeams, name: str) -> bool:
+def _durable(dir_fd: int, seams: WriteSeams, name: str, act: str = "commit") -> bool:
     try:
         seams.fsync_dir(dir_fd)
         return True
     except OSError as e:
-        _note(logging.WARNING, "levain gw-keys: credential-commit-not-durable credential=%s (%s)", name,
+        _note(logging.WARNING, "levain gw-keys: credential-%s-not-durable credential=%s (%s)", act, name,
               type(e).__name__)
         return False
 
@@ -484,7 +511,7 @@ def commit(dir_fd: int, name: str, fields: dict, *, expect_rev: Optional[str] = 
             if cur_rev != expect_rev:
                 _note(logging.INFO, "levain gw-keys: credential %s changed or removed meanwhile; result discarded", name)
                 return Outcome(DISCARDED)
-        tmp = f".{name}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
+        tmp = _tmp_name(name)
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
                          0o600, dir_fd=dir_fd)
@@ -512,9 +539,11 @@ def commit(dir_fd: int, name: str, fields: dict, *, expect_rev: Optional[str] = 
 
 
 def remove(dir_fd: int, name: str, *, wait: bool = True, lock_timeout_s: float = LOCK_TIMEOUT_S,
-           seams: Optional[WriteSeams] = None) -> bool:
-    """`remove-credential`'s act: under the same lock, unlink `<name>.json` and fsync the directory. True when a file
-    was removed, False when there was none. A refresh begun before it then finds the file gone and discards."""
+           seams: Optional[WriteSeams] = None) -> Outcome:
+    """`remove-credential`'s act: under the same lock, unlink `<name>.json` and fsync the directory. `REMOVED` when a
+    file was removed, `ABSENT` when there was none; the directory is fsynced either way (a retry after a remove whose
+    fsync failed makes that unlink durable), and `durable` False is the warning `credential-remove-not-durable`, as
+    commit's. A refresh begun before it then finds the file gone and discards."""
     if not isinstance(name, str) or not NAME_RE.fullmatch(name):
         raise Unparseable("name")
     s = seams or WriteSeams()
@@ -523,12 +552,14 @@ def remove(dir_fd: int, name: str, *, wait: bool = True, lock_timeout_s: float =
         _sweep(dir_fd, s.clock())
         try:
             os.unlink(name + ".json", dir_fd=dir_fd)
+            result = REMOVED
         except FileNotFoundError:
-            return False
+            result = ABSENT
         except OSError as e:
+            _note(logging.WARNING, "levain gw-keys: credential-commit-failed credential=%s (unlink: %s)", name,
+                  type(e).__name__)
             raise CommitFailed("credential-commit-failed", f"unlink: {type(e).__name__}") from None
-        _durable(dir_fd, s, name)
-        return True
+        return Outcome(result, durable=_durable(dir_fd, s, name, "remove"))
     finally:
         _unlock(lock_fd)
 
@@ -538,7 +569,8 @@ class CredWriter:
     writer thread (`ThreadPoolExecutor(max_workers=1)`, made here at keys' start; its thread starts at the first
     commit), so keys' own commits serialize and nothing on the event loop blocks on the `flock` or an fsync; the loop
     awaits the job's future, and a job runs to its end whatever happens to its awaiter. The credential directory is
-    opened (`O_DIRECTORY|O_NOFOLLOW`) on that thread at the first commit and kept.
+    opened (`O_DIRECTORY|O_NOFOLLOW`) by `open_dir()` at keys' start, before keys counts its fixed fds, or, when it
+    did not exist then, on the writer thread at the first commit (COMMIT_FDS budgets that case); it is kept.
 
     The seam's shell (R86): `begin_closing()` sets `_closing`; `cancel_detached()` cancels the members of
     `_refresh_tasks`. The single-flight that fills the set and reads the flag is not built at this tip, so the set
@@ -549,7 +581,7 @@ class CredWriter:
         self.seams = seams or WriteSeams()
         self.lock_timeout_s = LOCK_TIMEOUT_S
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="levain-cred-writer")
-        self._dir_fd: Optional[int] = None    # the writer thread's only
+        self._dir_fd: Optional[int] = None    # set by open_dir() before any job, else by the writer thread only
         self._closing = False
         self._refresh_tasks: Set["asyncio.Task"] = set()
 
@@ -561,6 +593,20 @@ class CredWriter:
     def cancel_detached(self) -> None:
         for t in list(self._refresh_tasks):
             t.cancel()
+
+    def open_dir(self) -> bool:
+        """At keys' start, before any commit is submitted and before `_serve` counts the fixed fds: open the credential
+        directory now so its fd is one of the counted ones. False (nothing opened, no failure) when it cannot be
+        opened: `cred/` is made by the first `set-credential`, so it may not exist yet, and the first commit retries."""
+        if self._dir_fd is None:
+            try:
+                self._dir_fd = os.open(self.cred_dir, _O_DIR)
+            except OSError as e:
+                if e.errno != errno.ENOENT:
+                    _note(logging.WARNING, "levain gw-keys: the credential directory is not open at start (%s)",
+                          type(e).__name__)
+                return False
+        return True
 
     # -- the writer thread --
 

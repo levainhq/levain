@@ -66,7 +66,8 @@ from typing import Awaitable, Dict, List, Optional, Sequence, Set, Tuple, TypeVa
 import h11
 
 from levain.broker import gwwire, norm, upstream
-from levain.broker.creds import CredLifecycle, CredStore, CredWriter, FakeCredLifecycle, check_host, on_upstream_401
+from levain.broker.creds import (COMMIT_FDS, CredLifecycle, CredStore, CredWriter, FakeCredLifecycle, check_host,
+                                 on_upstream_401)
 from levain.broker.gwwire import FrameReader, KeysSide, WireError
 from levain.broker.peer import PeerUnknown, peer_of, peer_uid
 from levain.broker.policy import PolicyError, RoutePolicy, parse_route
@@ -92,8 +93,10 @@ DNS_CONCURRENCY = 32
 #: of distinct uncached names: 36 extra fds under 3.9.6, 35 under 3.12.13, so 2 per lookup rounded up]. Linux is
 #: unmeasured: its VM run prints its own.
 DNS_FDS_PER_LOOKUP = 2
-#: the second admin connection during a preemption, the commit's temp file, the refresh's response, the credential read.
-TRANSIENT_NAMED = 4
+#: the second admin connection during a preemption, the refresh's response, the credential read, and the writer
+#: thread's commit: its lock, its temp (or listing, or compare read) and, when `cred/` did not exist at start, its
+#: directory (creds.COMMIT_FDS).
+TRANSIENT_NAMED = 3 + COMMIT_FDS
 #: passed to listen() and to every start_unix_server, never asyncio's default of 100: asyncio accepts up to this many
 #: connections per wakeup before admission closes any of them.
 ACCEPT_BACKLOG = 8
@@ -1906,6 +1909,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         except OSError as e:
             print(f"levain gw-keys: refused: gw.jsonl cannot be opened ({type(e).__name__})", file=sys.stderr)
             return 3
+        cred_writer.open_dir()   # before _serve counts the fds: the writer's directory fd is a fixed one when it exists
         front_path = os.path.join(a.runtime_root, "keys", "front.sock")
         admin_path = os.path.join(a.runtime_root, "keys", "admin.sock")
         try:

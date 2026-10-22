@@ -316,3 +316,21 @@ def test_a_not_durable_commit_is_success_with_a_warning(L, monkeypatch):
     rc, out, err = _main(["set-credential", NAME], _seams(L)[0])
     assert rc == 0 and _observe(L).rev == out["rev"]
     assert "not durable" in err
+
+
+def test_a_not_durable_remove_is_success_with_the_same_warning(L, monkeypatch):
+    # L3 r1 P1: a remove's failed directory fsync reaches the operator the way a commit's does, absent or not
+    rc, out, err = _main(["set-credential", NAME], _seams(L)[0])
+    assert rc == 0, err
+
+    def bad_dir_fsync(fd):
+        raise OSError(5, "EIO")
+    monkeypatch.setattr(C, "dir_fsync", bad_dir_fsync)
+    monkeypatch.setattr(C.WriteSeams.__init__, "__kwdefaults__",
+                        dict(C.WriteSeams.__init__.__kwdefaults__, fsync_dir=bad_dir_fsync))
+    rc, out, err = _main(["remove-credential", NAME], _seams(L)[0])
+    assert (rc, out["removed"]) == (0, True)
+    assert "not durable" in err
+    rc, out, err = _main(["remove-credential", NAME], _seams(L)[0])   # the retry fsyncs again, and says so
+    assert (rc, out["removed"]) == (0, False)
+    assert "not durable" in err

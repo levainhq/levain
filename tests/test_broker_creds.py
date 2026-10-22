@@ -8,6 +8,8 @@ is 0600 and parses as the reader parses it, so the next exchange's observation p
 from __future__ import annotations
 
 import asyncio
+import errno
+import fcntl
 import json
 import logging
 import os
@@ -111,8 +113,8 @@ def test_rev_compare_on_a_removed_file_discards_and_it_stays_removed(cred_dir):
     first = _commit_now(cred_dir, _fields())
     fd = _dir_fd(cred_dir)
     try:
-        assert C.remove(fd, NAME) is True
-        assert C.remove(fd, NAME) is False   # already gone
+        assert C.remove(fd, NAME).result == C.REMOVED
+        assert C.remove(fd, NAME).result == C.ABSENT   # already gone
     finally:
         os.close(fd)
     out = _commit_now(cred_dir, _fields("sk-late"), expect_rev=first.rev)
@@ -379,3 +381,247 @@ def test_keys_reader_does_not_follow_a_linked_cred_dir(tmp_path):
         assert store.observe(NAME).secret == "sk-test-one"
     finally:
         os.close(store.dir_fd)
+
+
+# --- L3 r1 fixes (1022-12 3b5a, P1-P7) ------------------------------------------------------------------------------
+
+def _eio(fd):
+    raise OSError(errno.EIO, "EIO")
+
+
+def test_p1_a_remove_whose_directory_fsync_fails_says_not_durable_and_logs_it(cred_dir, caplog):
+    _commit_now(cred_dir, _fields())
+    fd = _dir_fd(cred_dir)
+    try:
+        with caplog.at_level(logging.WARNING):
+            out = C.remove(fd, NAME, seams=C.WriteSeams(fsync_dir=_eio))
+    finally:
+        os.close(fd)
+    assert (out.result, out.durable) == (C.REMOVED, False)
+    assert not (cred_dir / f"{NAME}.json").exists()
+    assert "credential-remove-not-durable" in caplog.text
+
+
+def test_p1_a_remove_of_an_absent_file_still_fsyncs_the_directory(cred_dir):
+    # an ENOENT retry of a remove whose fsync failed: the unlink is in the directory but may not be on the medium
+    synced = []
+    fd = _dir_fd(cred_dir)
+    try:
+        out = C.remove(fd, NAME, seams=C.WriteSeams(fsync_dir=synced.append))
+        assert (out.result, out.durable) == (C.ABSENT, True)
+        assert synced == [fd]
+        bad = C.remove(fd, NAME, seams=C.WriteSeams(fsync_dir=_eio))
+        assert (bad.result, bad.durable) == (C.ABSENT, False)
+    finally:
+        os.close(fd)
+
+
+def test_p2_no_flock_attempt_is_made_past_the_deadline(cred_dir):
+    # the thread is descheduled in its retry sleep; meanwhile the holder lets go and the clock passes the deadline.
+    # The next step must be the deadline check, not an flock that would commit arbitrarily late.
+    holder = os.open(str(cred_dir / C.LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    now = [1000.0]
+
+    def descheduled(s):
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        now[0] += C.LOCK_TIMEOUT_S + 1
+
+    try:
+        with pytest.raises(C.CommitFailed) as e:
+            _commit_now(cred_dir, _fields(), seams=C.WriteSeams(monotonic=lambda: now[0], sleep=descheduled))
+    finally:
+        os.close(holder)
+    assert e.value.name == "credential-lock-timeout"
+    assert not (cred_dir / f"{NAME}.json").exists()
+
+
+def test_p2_each_retry_sleeps_at_most_what_remains(cred_dir):
+    holder = os.open(str(cred_dir / C.LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    now, slept = [1000.0], []
+
+    def sleep(s):
+        slept.append(s)
+        now[0] += s
+
+    bound = C.LOCK_RETRY_S * 2.5
+    try:
+        with pytest.raises(C.CommitFailed):
+            _commit_now(cred_dir, _fields(), lock_timeout_s=bound,
+                        seams=C.WriteSeams(monotonic=lambda: now[0], sleep=sleep))
+    finally:
+        os.close(holder)
+    assert max(slept) <= C.LOCK_RETRY_S
+    assert sum(slept) == pytest.approx(bound)          # never past the bound
+    assert slept[-1] == pytest.approx(bound - 2 * C.LOCK_RETRY_S)
+
+
+def _listdir_fails_on_fds(monkeypatch):
+    real = os.listdir
+
+    def listdir(p="."):
+        if isinstance(p, int):
+            raise OSError(errno.EIO, "EIO")
+        return real(p)
+    monkeypatch.setattr(os, "listdir", listdir)
+
+
+def test_p3_a_sweep_that_cannot_list_skips_and_the_commit_and_remove_go_on(cred_dir, monkeypatch, caplog):
+    _listdir_fails_on_fds(monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        out = _commit_now(cred_dir, _fields())
+        assert out.result == C.COMMITTED
+        fd = _dir_fd(cred_dir)
+        try:
+            assert C.remove(fd, NAME).result == C.REMOVED
+        finally:
+            os.close(fd)
+    assert "credential-temp-sweep-skipped" in caplog.text
+
+
+def test_p3_a_skipped_sweep_does_not_hide_a_commit_failure(cred_dir, monkeypatch):
+    _listdir_fails_on_fds(monkeypatch)
+
+    def bad_rename(src, dst, dir_fd):
+        raise OSError(errno.EIO, "EIO")
+    with pytest.raises(C.CommitFailed) as e:
+        _commit_now(cred_dir, _fields(), seams=C.WriteSeams(rename=bad_rename))
+    assert e.value.name == "credential-commit-failed"
+
+
+def _fullfsync_refused(monkeypatch):
+    """darwin's path with an F_FULLFSYNC the filesystem refuses (SMB/NFS/FUSE answer ENOTSUP); os.fsync recorded."""
+    import fcntl as F
+    full = getattr(F, "F_FULLFSYNC", 51)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(F, "F_FULLFSYNC", full, raising=False)
+    real_fcntl, real_fsync, synced = F.fcntl, os.fsync, []
+
+    def fcntl_(fd, cmd, *a):
+        if cmd == full:
+            raise OSError(errno.ENOTSUP, "ENOTSUP")
+        return real_fcntl(fd, cmd, *a)
+
+    def fsync(fd):
+        synced.append(fd)
+        return real_fsync(fd)
+    monkeypatch.setattr(F, "fcntl", fcntl_)
+    monkeypatch.setattr(os, "fsync", fsync)
+    return synced
+
+
+def test_p4_full_fsync_falls_back_to_fsync_as_dir_fsync_does(cred_dir, monkeypatch):
+    synced = _fullfsync_refused(monkeypatch)
+    fd = os.open(str(cred_dir / "probe"), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        C.full_fsync(fd)
+        C.dir_fsync(fd)
+    finally:
+        os.close(fd)
+    assert synced == [fd, fd]
+    out = _commit_now(cred_dir, _fields())           # the real seams: the file's fsync no longer fails the commit
+    assert (out.result, out.durable) == (C.COMMITTED, True)
+
+
+def test_p5_a_commit_holds_at_most_commit_fds_beyond_the_counted_ones(cred_dir):
+    from levain.broker import keys as K
+
+    seen = []
+
+    def fsync_file(fd):
+        seen.append(K.count_open_fds())
+        os.fsync(fd)
+
+    # a writer whose directory did not exist when keys counted: its first commit opens the directory too
+    lazy = C.CredWriter(str(cred_dir), seams=C.WriteSeams(fsync_file=fsync_file))
+    try:
+        base = K.count_open_fds()
+        lazy._commit_sync(NAME, _fields(), None)
+        assert seen[-1] - base == C.COMMIT_FDS
+    finally:
+        lazy.close()
+    # a writer opened before the count: the directory is a fixed fd, the commit's own are the rest
+    w = C.CredWriter(str(cred_dir), seams=C.WriteSeams(fsync_file=fsync_file))
+    try:
+        before = K.count_open_fds()
+        assert w.open_dir() is True
+        base = K.count_open_fds()
+        assert base - before == 1
+        w._commit_sync(NAME, _fields("sk-two"), None)
+        assert seen[-1] - base == C.COMMIT_FDS - 1
+        assert K.count_open_fds() == base               # nothing of the commit's is kept
+    finally:
+        w.close()
+    assert C.COMMIT_FDS <= K.TRANSIENT_NAMED
+
+
+def test_p5_keys_main_opens_the_writers_directory_before_serve_counts(monkeypatch, tmp_path):
+    from levain.broker import keys as K
+
+    (tmp_path / "keys" / "cred").mkdir(parents=True, mode=0o700)
+    seen = {}
+
+    async def fake_serve(keys, *a):
+        seen["dir_fd"] = keys.cred_lifecycle._dir_fd    # what _serve's count_open_fds would see
+        keys.trigger()
+        await keys.wait_done()
+        return 0
+
+    monkeypatch.setattr(K, "_serve", fake_serve)
+    monkeypatch.setattr(K, "install_log", lambda lib_root: None)
+    monkeypatch.setattr(K, "raise_nofile", lambda: None)
+    rc = K.main(["--runtime-root", str(tmp_path), "--lib-root", str(tmp_path), "--control", str(tmp_path / "c"),
+                 "--test-single-uid"])
+    assert rc == 0 and seen["dir_fd"] is not None
+
+
+def test_p5_open_dir_without_a_credential_directory_leaves_it_to_the_first_commit(tmp_path):
+    w = C.CredWriter(str(tmp_path / "absent"))
+    try:
+        assert w.open_dir() is False and w._dir_fd is None
+    finally:
+        w.close()
+
+
+def _unlock_fails(monkeypatch):
+    real = fcntl.flock
+
+    def flock(fd, op):
+        if op == fcntl.LOCK_UN:
+            raise OSError(errno.EIO, "EIO")
+        return real(fd, op)
+    monkeypatch.setattr(fcntl, "flock", flock)
+
+
+def test_p6_an_unlock_failure_never_replaces_the_outcome(cred_dir, monkeypatch):
+    from levain.broker import keys as K
+
+    _unlock_fails(monkeypatch)
+    base = K.count_open_fds()
+    out = _commit_now(cred_dir, _fields())
+    assert out.result == C.COMMITTED
+    assert K.count_open_fds() == base                    # the lock fd was closed: closing released the flock
+
+    def bad_rename(src, dst, dir_fd):
+        raise OSError(errno.EIO, "EIO")
+    with pytest.raises(C.CommitFailed) as e:
+        _commit_now(cred_dir, _fields("sk-two"), seams=C.WriteSeams(rename=bad_rename))
+    assert e.value.name == "credential-commit-failed"
+    monkeypatch.undo()
+    assert _commit_now(cred_dir, _fields("sk-three"), lock_timeout_s=0.2).result == C.COMMITTED
+
+
+def test_p7_the_sweep_matches_exactly_the_generated_temp_names(cred_dir):
+    assert C._TMP_RE.fullmatch(C._tmp_name(NAME))
+    never_ours = [f".{NAME}.7.a.tmp", f".{NAME}.07.abcdef01.tmp", f".{NAME}.0.abcdef01.tmp",
+                  f".{NAME}.7.abcdef012.tmp", f".{NAME}.9.ABCDEF09.tmp", f".{NAME}.-7.abcdef01.tmp"]
+    # (the upper-case case gets its own pid and hex: on a case-insensitive APFS it would otherwise BE `ours`)
+    ours = cred_dir / f".{NAME}.7.abcdef01.tmp"
+    old = time.time() - C.STALE_TMP_S - 5
+    for n in never_ours + [ours.name]:
+        (cred_dir / n).write_bytes(b"x")
+        os.utime(cred_dir / n, (old, old))
+    _commit_now(cred_dir, _fields())
+    assert not ours.exists()
+    assert all((cred_dir / n).exists() for n in never_ours)
