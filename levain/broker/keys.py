@@ -15,7 +15,8 @@ The admin server (design 1.5 "The admin connection", "Fencing", "Order inside on
   requests naming one session run in frame order, the order assigned in the read loop with no `await` between the
   read and the append to that session's chain.
 - FRONT-REGISTER / FRONT-ARM / DROP-SESSION are the fenced table calls; RELOAD is refused until a dispatch map exists.
-- a newer connection PREEMPTS in five steps: bump the epoch and stop reading the old one; cancel its request tasks and
+- a newer connection PREEMPTS in five steps: bump the epoch, fence every live exchange (marked detached, so its next
+  upstream write is refused) and stop reading the old one; cancel its request tasks and
   await them, bounded; the fail-closed clear in two phases (`reg_high` kept); close the old connection; adopt.
 - the adopted connection's EOF fails closed: the epoch is bumped (its in-flight tasks are stale from that instant) and
   every registration is detached, `K` sent on each STATUS connection.
@@ -255,7 +256,7 @@ class Registration:
     STATUS connection ends without keys' `K`)."""
 
     __slots__ = ("session", "front_uid", "pid", "start", "incarnation", "reg_token", "state", "armed_at",
-                 "status", "pending", "exchanges", "resolve_sem")
+                 "status", "pending", "exchanges", "resolve_sem", "admin_epoch")
 
     def __init__(self, session: str, front_uid: int, pid: int, start: int, incarnation: int, reg_token: int) -> None:
         self.session, self.front_uid, self.pid, self.start = session, front_uid, pid, start
@@ -267,6 +268,8 @@ class Registration:
         self.exchanges: Set[Conn] = set()           # connections past `Q`
         #: this registration's share of the resolve slots, made at its first resolve (inside the loop)
         self.resolve_sem: Optional[asyncio.Semaphore] = None
+        #: the admin epoch FRONT-REGISTER made it under: an exchange is admitted only while that epoch is current
+        self.admin_epoch: Optional[int] = None
 
     def fields(self) -> tuple:
         return (self.session, self.front_uid, self.pid, self.start, self.incarnation)
@@ -688,6 +691,7 @@ class Keys:
                 if cur is not None:
                     victims = self._detach(cur)
                 reg = Registration(session, front_uid, pid, start, incarnation, reg_token)
+                reg.admin_epoch = epoch
                 self.regs[front_uid] = reg
                 self.by_session[session] = reg
                 self.reg_high[front_uid] = reg_token
@@ -773,6 +777,15 @@ class Keys:
             t.cancel()   # its permits are freed now, not at its deadline; its `finally` pops the entry
         return [v for v in got if isinstance(v, Upstream)] + [v for v in got if not isinstance(v, Upstream)]
 
+    def _fence_exchanges(self) -> None:
+        """Preemption's step (1) (caller holds state_lock; no await): every live exchange is marked detached, so
+        `Upstream.write` refuses its next byte from the bump on, through step (2)'s bounded await. The tables are
+        left to step (3)'s phase 1, which records each exchange's `Upstream` for phase 2's abort; a new exchange is
+        refused at admission meanwhile, its registration having been made under an older epoch."""
+        for reg in list(self.regs.values()) + list(self.by_session.values()):
+            for c in reg.exchanges:
+                c.detached = True
+
     def _mark_dropped(self, digest: str) -> None:
         self.dropped[digest] = None
         self.dropped.move_to_end(digest)
@@ -844,8 +857,10 @@ class Keys:
             if self.closing:
                 return None
             old = self.admin
-            self.admin_epoch += 1                    # (1) every task of the old connection is stale from here
-            epoch = self.admin_epoch
+            async with self.state_lock:
+                self.admin_epoch += 1                # (1) every task of the old connection is stale from here,
+                epoch = self.admin_epoch
+                self._fence_exchanges()              # (1) and every exchange it admitted sends nothing more
             if old is not None:
                 old.preempted = True
                 wait: Set[asyncio.Task] = set(old.tasks)
@@ -1077,7 +1092,7 @@ class Keys:
             if conn.detached:
                 return
             admitted = (self.regs.get(reg.front_uid) is reg and reg.state == "claimed" and not self.closing
-                        and len(reg.exchanges) < self.exchanges_per_session)
+                        and reg.admin_epoch == self.admin_epoch and len(reg.exchanges) < self.exchanges_per_session)
             if admitted:
                 conn.kind = "exchange"
                 conn.admin_epoch = self.admin_epoch

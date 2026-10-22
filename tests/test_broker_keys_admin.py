@@ -942,3 +942,98 @@ def test_base_map_unusable_anywhere_refuses_every_route(routes):
         shutil.rmtree(d, ignore_errors=True)
     assert got == gwwire.encode(b"F", {"refused": "keys-unavailable"})
     assert ledger.sent == []
+
+
+def test_preemption_fences_old_exchanges_before_its_bounded_await(monkeypatch):
+    # group L3 r1 (codex HIGH 3), reproduced first (`1022-8/g1fix/item2_repro_before.txt`): preemption bumped the
+    # epoch, then awaited the old connection's request tasks (bounded) BEFORE its fail-closed clear detached anything,
+    # and `Upstream.write` gates on `detached` alone, so a `B` frame read in that window still reached the upstream,
+    # and a `Q` arriving in it was admitted on the old registration. Now the bump fences the old epoch's exchanges and
+    # admission refuses a registration made under an older epoch.
+    from levain.broker import upstream as U
+    from levain.broker.creds import CredStore
+    from levain.broker.norm import digest_of_token
+    d = tempfile.mkdtemp(prefix="lp", dir="/tmp")
+    _frame_lib(d)
+    st = {"after": False, "raw": []}
+
+    async def handshake(addr, port, host):
+        return object(), _RawTLS(st), _Plain()
+
+    async def run() -> dict:
+        cred_fd = os.open(os.path.join(d, "keys", "cred"), os.O_RDONLY | os.O_DIRECTORY)
+        pairs = [socket.socketpair() for _ in range(2)]
+        gate = asyncio.Event()
+
+        async def resisting() -> None:   # an old request task that outlives its cancel, as step (2) allows
+            while not gate.is_set():
+                try:
+                    await gate.wait()
+                except asyncio.CancelledError:
+                    pass
+
+        try:
+            k = K.Keys(unmetered=True, lib_root=d, creds=CredStore(cred_fd))
+            k._in_loop()
+            k.admin = K.AdminConn(None, _AdminW(), k.admin_epoch)
+            k.admin.task = None
+            await k.front_register(k.admin_epoch, "s1", 70000, 1, 1, 1, 1)
+            await k.front_arm(k.admin_epoch, "s1", 1)
+            reg = k.regs[70000]
+            reg.state = "claimed"
+            k.cache[digest_of_token(_FRAME_TOKEN)] = {"session": "s1", "claims": dict(_FRAME_CLAIMS)}
+            old_task = asyncio.ensure_future(resisting())
+            k.admin.tasks.add(old_task)
+
+            async def exchange(sock, feed_now: bool):
+                _r, w = await asyncio.open_unix_connection(sock=sock)
+                fr = asyncio.StreamReader()
+                if feed_now:
+                    fr.feed_data(gwwire.encode(b"B", b"hello") + gwwire.encode(b"E"))
+                    fr.feed_eof()
+                side = gwwire.KeysSide()
+                side.got(b"Q")
+                conn = K.Conn(w, reg, "pending")
+                reg.pending.add(conn)
+                k.pool.add(conn)
+                task = asyncio.ensure_future(k._exchange(conn, gwwire.FrameReader(fr), side, dict(_FRAME_Q)))
+                return conn, fr, w, task
+
+            conn1, fr1, w1, t1 = await exchange(pairs[0][0], False)
+            for _ in range(50):
+                await asyncio.sleep(0)
+            head_written = len(st["raw"])
+            epoch0 = k.admin_epoch
+            pre = asyncio.ensure_future(k._adopt(None, _AdminW()))
+            while k.admin_epoch == epoch0:
+                await asyncio.sleep(0)
+            st["after"] = True                     # the epoch is bumped: preemption is in its bounded await
+            fr1.feed_data(gwwire.encode(b"B", b"hello") + gwwire.encode(b"E"))
+            fr1.feed_eof()
+            conn2, _fr2, w2, t2 = await exchange(pairs[1][0], True)   # a `Q` arriving inside the window
+            await asyncio.sleep(0.2)
+            in_window = {"pre_done": pre.done(), "raw_after": [x for x in st["raw"] if x[0]],
+                         "q2_admitted": conn2.kind == "exchange"}
+            gate.set()
+            await pre
+            for t in (t1, t2):
+                await asyncio.wait_for(t, 5)
+            for w in (w1, w2):
+                w.close()
+            return dict(in_window, head_written=head_written)
+        finally:
+            for a, b in pairs:
+                a.close()
+                b.close()
+            os.close(cred_fd)
+
+    monkeypatch.setattr(U, "_handshake", handshake)
+    try:
+        out = asyncio.run(run())
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    print("preempt-window", out)
+    assert out["head_written"] == 1                 # the exchange was live before the preemption
+    assert out["pre_done"] is False                 # the window is real: the clear has not run yet
+    assert out["raw_after"] == []                   # nothing reached the upstream after the bump
+    assert out["q2_admitted"] is False              # and no new exchange was admitted on the old registration
