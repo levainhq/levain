@@ -157,7 +157,7 @@ class _Os:
     ``mounted`` reports another device (a mount there, without mounting one)."""
 
     def __init__(self, mounted=frozenset()):
-        self.mounted, self.reads = mounted, 0
+        self.mounted, self.reads, self.listings = mounted, 0, 0
 
     def __getattr__(self, n):
         return getattr(os, n)
@@ -175,6 +175,7 @@ class _Os:
 
     def scandir(self, fd):
         outer, it = self, os.scandir(fd)
+        outer.listings += 1
 
         class It:
             def __enter__(self):
@@ -212,6 +213,54 @@ def test_delete_reads_each_entry_once_and_refuses_a_mounted_target(tmp_path, mon
     with pytest.raises(Refused) as e:
         SV.delete_named(L, ("trash",), (S,), _seams(Ctl(R.TRASH)))
     assert e.value.name == "delete-crosses-mount" and (top / "tree" / "repo" / "sub" / "a.txt").exists()
+
+
+def test_delete_lists_each_directory_once_to_its_end(tmp_path, monkeypatch):
+    # Reproduced on d522cee3: 2,000 sibling dirs of 2 files each cost 6,001 directory listings (each child read
+    # twice and the parent re-listed after every child). The L3 r2 shape it must also take: one directory of 3,000
+    # files, past any batch.
+    top = tmp_path / "t"
+    (top / "flat").mkdir(parents=True)
+    for i in range(3000):
+        (top / "flat" / f"f{i:05d}").write_bytes(b"x")
+    for i in range(2000):
+        d = top / "wide" / f"d{i:05d}"
+        d.mkdir(parents=True)
+        (d / "a").write_bytes(b"a")
+        (d / "b").write_bytes(b"b")
+    entries = sum(1 for _ in top.rglob("*"))
+    dirs = 1 + sum(1 for p in top.rglob("*") if p.is_dir())
+    fake = _Os()
+    monkeypatch.setattr(SV, "os", fake)
+    dfd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        assert SV.delete_at(dfd, "t", _seams(Ctl(R.TRASH)))
+    finally:
+        os.close(dfd)
+    assert not top.exists()
+    assert (fake.listings, fake.reads) == (dirs, entries)
+
+
+def test_delete_refuses_a_tree_deeper_than_its_fd_bound(tmp_path):
+    # The walk holds one fd per level: past DELETE_MAX_DEPTH it refuses, every fd it opened closed, the deep
+    # leaf kept.
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    for n in ["deep"] + ["d"] * (SV.DELETE_MAX_DEPTH + 1):
+        os.mkdir(n, dir_fd=fd)
+        nfd = os.open(n, os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+        os.close(fd)
+        fd = nfd
+    os.close(os.open("leaf", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=fd))
+    os.close(fd)
+    fds = len(os.listdir("/dev/fd"))
+    dfd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(Refused) as e:
+            SV.delete_at(dfd, "deep", _seams(Ctl(R.TRASH)))
+    finally:
+        os.close(dfd)
+    assert e.value.name == "delete-too-deep" and len(os.listdir("/dev/fd")) == fds
+    assert any(p.name == "leaf" for p in (tmp_path / "deep").rglob("leaf"))
 
 
 def test_purge_verb_removes_export_staging_and_flagged_trash(tmp_path):

@@ -55,9 +55,10 @@ DAY_SECONDS = 86400
 MAX_STAMP_BYTES = 64
 #: Root's own stamp files at the top of a trash entry (the only temp names swept there).
 STAMPS = ("trashed_at", "restored_at")
-# DECISION: a delete reads at most this many leaves of a directory before it unlinks them and reads on: memory per
-# directory stays bounded and each entry is read once (an unlinked leaf is not in the next read).
-DELETE_BATCH = 1024
+# DECISION: a delete holds one directory fd per level of the tree, so it refuses a tree deeper than this
+# (``delete-too-deep``) rather than run out of fds part-way. It sits at half of macOS's default soft RLIMIT_NOFILE
+# (256, the smallest default of the hosts), leaving the rest for the process's own fds.
+DELETE_MAX_DEPTH = 128
 
 _DIR_OPEN = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _LEAF_OPEN = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
@@ -404,31 +405,28 @@ def _unlink_leaf(dfd: int, name: str, st: os.stat_result, seams: StoreSeams) -> 
         os.unlink(name, dir_fd=dfd)
 
 
-def _read_some(cur: int) -> tuple[list[tuple[str, os.stat_result]], tuple[str, os.stat_result] | None]:
-    """The leaves of ``cur`` read before its first subdirectory (at most :data:`DELETE_BATCH`), and that
-    subdirectory; the stream is closed there, never read to its end."""
-    leaves: list[tuple[str, os.stat_result]] = []
+def _list_all(cur: int) -> list[tuple[str, os.stat_result]]:
+    """Every entry of ``cur`` with its lstat, the directory read to its end once (the stream is closed only after
+    it is exhausted, so no name read ahead is dropped)."""
+    out: list[tuple[str, os.stat_result]] = []
     with os.scandir(cur) as it:
         for e in it:
             est = _lstat_at(cur, e.name)
-            if est is None:
-                continue
-            if stat.S_ISDIR(est.st_mode):
-                return leaves, (e.name, est)
-            leaves.append((e.name, est))
-            if len(leaves) >= DELETE_BATCH:
-                break
-    return leaves, None
+            if est is not None:
+                out.append((e.name, est))
+    return out
 
 
 def delete_at(dfd: int, name: str, seams: StoreSeams) -> bool:
     """Delete ``name`` in the directory ``dfd`` and everything below it; False when it was absent. Iterative and by
-    directory fd: one directory is open at a time, the way back up is ``..`` checked against the recorded
-    (dev, inode) of the directory it must be (else ``delete-moved``), no link is followed, and a directory on
-    another device than ``dfd`` (``name`` itself included) is refused (``delete-crosses-mount``), never entered.
-    Flags are cleared before each unlink. Each entry is read once: a directory's stream is read only up to its
-    first subdirectory (or :data:`DELETE_BATCH` leaves), what was read is removed, and the next read starts past it.
-    Idempotent: a crash part-way leaves a smaller tree that the next call deletes."""
+    directory fd, the way ``shutil.rmtree``'s fd walk is: each directory is listed once, to its end, and its
+    entries are removed from that list; a subdirectory is opened relative to its parent's fd (checked to be the
+    object it was listed as, else ``delete-moved``), and the parent's fd stays open on a stack so an emptied
+    subdirectory is removed relative to it, never by a path or ``..``. No link is followed; a directory on another
+    device than ``dfd`` (``name`` itself included) is refused (``delete-crosses-mount``), never entered; a tree
+    deeper than :data:`DELETE_MAX_DEPTH` is refused (``delete-too-deep``) before the fd past it is opened. Flags are
+    cleared before each unlink. Idempotent: a crash or refusal part-way leaves a smaller tree that the next call
+    deletes."""
     st = _lstat_at(dfd, name)
     if st is None:
         return False
@@ -439,43 +437,44 @@ def delete_at(dfd: int, name: str, seams: StoreSeams) -> bool:
     top_dev = os.fstat(dfd).st_dev
     if st.st_dev != top_dev:
         raise Refused("delete-crosses-mount", name)
-    chain = [(st.st_dev, st.st_ino)]
-    names = [name]
-    cur = _open_dir_at(dfd, name, st, seams)
+    # One level per open directory: its fd, its name and lstat in the parent, the entries still to remove.
+    stack: list[tuple[int, str, os.stat_result, list[tuple[str, os.stat_result]]]] = []
+    fd = _open_dir_at(dfd, name, st, seams)
     try:
-        while True:
-            leaves, sub = _read_some(cur)
-            for n, est in leaves:
-                _unlink_leaf(cur, n, est, seams)
-            if sub is None and leaves:
-                continue
-            if sub is not None:
-                n, sst = sub
-                if sst.st_dev != top_dev:
+        stack.append((fd, name, st, _list_all(fd)))
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
+        while stack:
+            cur, _, _, entries = stack[-1]
+            if entries:
+                n, est = entries.pop()
+                if not stat.S_ISDIR(est.st_mode):
+                    _unlink_leaf(cur, n, est, seams)
+                    continue
+                if est.st_dev != top_dev:
                     raise Refused("delete-crosses-mount", n)
-                child = _open_dir_at(cur, n, sst, seams)
-                os.close(cur)
-                cur = child
-                chain.append((sst.st_dev, sst.st_ino))
-                names.append(n)
+                if len(stack) >= DELETE_MAX_DEPTH:
+                    raise Refused("delete-too-deep", n)
+                child = _open_dir_at(cur, n, est, seams)
+                try:
+                    stack.append((child, n, est, _list_all(child)))
+                except BaseException:
+                    os.close(child)
+                    raise
                 continue
-            if len(chain) == 1:
-                os.close(cur)
-                cur = -1
-                os.rmdir(name, dir_fd=dfd)
-                os.fsync(dfd)
-                return True
-            up = os.open("..", _DIR_OPEN, dir_fd=cur)
-            ust = os.fstat(up)
-            if (ust.st_dev, ust.st_ino) != chain[-2]:
-                os.close(up)
-                raise Refused("delete-moved", "..")
+            cur, n, est, _ = stack.pop()
             os.close(cur)
-            cur = up
-            chain.pop()
-            os.rmdir(names.pop(), dir_fd=cur)
+            parent = stack[-1][0] if stack else dfd
+            now = _lstat_at(parent, n)
+            if now is None or (now.st_dev, now.st_ino) != (est.st_dev, est.st_ino):
+                raise Refused("delete-moved", n)
+            os.rmdir(n, dir_fd=parent)
+        os.fsync(dfd)
+        return True
     finally:
-        if cur >= 0:
+        for cur, _, _, _ in stack:
             os.close(cur)
 
 
