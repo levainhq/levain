@@ -223,6 +223,20 @@ def _isolate_levain_home(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_home(monkeypatch, tmp_path_factory):
+    """TEST ONLY: ``$HOME`` is a per-test scratch directory and ``$CODEX_HOME`` is cleared, so a policy build (or
+    anything else that walks ``Path.home()``) never reads the operator's real ``~/.claude`` (hundreds of thousands
+    of entries on a working account) or ``~/.codex``. The scratch home carries a minimal ``.gitconfig``: tests that
+    commit need an identity. ``GIT_CONFIG_GLOBAL`` is deliberately NOT set, because the confinement floor reads
+    that variable. The account's home from the password database is untouched (see ``_isolate_levain_home``). This
+    fixture runs before the test body, so a test's own ``setenv("HOME", ...)`` or ``Path.home`` patch still wins."""
+    home = tmp_path_factory.mktemp("hermetic-home")
+    (home / ".gitconfig").write_text("[user]\n\tname = levain test\n\temail = test@levain.invalid\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _reset_entity_process_latch():
     """`$LEVAIN_ENTITY_PROCESS` is a one-way latch by design (spore-438): opening an entity sets it
     and nothing in levain clears it, because nothing should. A test process opens many entities, so
