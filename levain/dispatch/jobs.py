@@ -71,6 +71,14 @@ publish that fails is logged and never fails the operation: a write that fails l
 job (its grants queue); a removal that fails leaves a terminal job's record until the next call removes it or its
 expiry ends it (the known edges in :func:`levain.dispatch.published.sync`).
 
+THE HANDOFF (W-C). A filing door that hands :meth:`JobStore.file` an exporter publishes the job WITH its read-set
+bundle: the bundle is built and checked before any lock, installed under a fresh ``hb-`` id under the ONE handoff-store
+lock (:mod:`levain.dispatch.handoff`), and the job and its ``handoffs`` row (id and size) are written in ONE
+transaction, an envelope job's ``filed -> signed`` inside it. A replay whose existing job wins unlinks only its own
+bundle; after any exception the row decides whether the bundle stays. The first filing of a store object collects
+the bundles no row names and the stale unlocked temps; after every operation the bundles of terminal jobs are deleted
+by row, without that lock.
+
 Known edge: until S1 places the control principal (design §8), the store is an operator-uid file, so any process of
 that uid can write it; no executor exists in this slice, so no run rests on it. The filing agent is the name the
 filing door was given (a flag or the agent's own environment), kept for the signer to read, never proven. Stdlib
@@ -104,6 +112,7 @@ from levain.dispatch import ContractRefused, DispatchError
 from levain.dispatch import published
 from levain.dispatch import sign as dsign
 from levain.dispatch.contract import ResolvedContract, ResolvedTemplate, parse_contract, resolve_contract
+from levain.dispatch.handoff import HandoffDir, HandoffRefused, is_bundle_id
 from levain.dispatch.policy import ProviderPolicy
 from levain.dispatch.verifier_report import ReportRefused, VerifierRun, check_envelope, run_problem
 
@@ -119,7 +128,7 @@ __all__ = [
 log = logging.getLogger("levain.dispatch.jobs")
 
 DB_NAME = "dispatch.db"
-FORMAT = "levain-dispatch-jobs/4"
+FORMAT = "levain-dispatch-jobs/5"
 # the formats a store is migrated from IN PLACE when this code opens it, each by tables and triggers added beside
 # the old ones (CREATE ... IF NOT EXISTS) and its marker rewritten in the same transaction; no row is rewritten.
 # /2 added the human authorise item and the base_moved edges (F11), so a Levain that knows only /1 refuses the
@@ -128,8 +137,11 @@ FORMAT = "levain-dispatch-jobs/4"
 # the envelope binding (job_envelopes, job_threads and the envelope causes, F11-C): 0.11.13 shipped /3 without it
 # and, run against a store holding an envelope job, read that job as a plain signed one and let its own private
 # edge walk take it to running with no envelope check (measured on 0.11.13 from PyPI), so a Levain
-# that knows only /3 now refuses the store instead
-_MIGRATES_FROM = frozenset({"levain-dispatch-jobs/1", "levain-dispatch-jobs/2", "levain-dispatch-jobs/3"})
+# that knows only /3 now refuses the store instead. /5 added the handoff rows (W-C): a filed job's read-set bundle,
+# named by id and size, written in the job's own filing transaction; a Levain that knows only /4 would delete no
+# terminal job's bundle and collect no orphan, so it refuses the store instead
+_MIGRATES_FROM = frozenset({"levain-dispatch-jobs/1", "levain-dispatch-jobs/2", "levain-dispatch-jobs/3",
+                            "levain-dispatch-jobs/4"})
 # how long an unsigned contract holds its write files before it lapses
 UNSIGNED_LEASE = timedelta(minutes=30)
 # how far a signature's signed_at may run ahead of the store's clock (the signer's clock is its own)
@@ -421,6 +433,14 @@ _SCHEMA = (
     "CREATE TRIGGER IF NOT EXISTS job_threads_no_replace BEFORE INSERT ON job_threads "
     "WHEN EXISTS (SELECT 1 FROM job_threads WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a job thread is never replaced'); END",
+    # a filed job's handoff (W-C, F4): the read-set bundle the filing installed, by its random id and its size,
+    # written in the job's own filing transaction; once, never replaced, and kept after the file is deleted
+    "CREATE TABLE IF NOT EXISTS handoffs (job_id TEXT PRIMARY KEY REFERENCES jobs(id), bundle_id TEXT NOT NULL "
+    "UNIQUE, size INTEGER NOT NULL, at TEXT NOT NULL)",
+    *_append_only("handoffs", "a handoff row is written once"),
+    "CREATE TRIGGER IF NOT EXISTS handoffs_no_replace BEFORE INSERT ON handoffs "
+    "WHEN EXISTS (SELECT 1 FROM handoffs WHERE job_id = NEW.job_id OR bundle_id = NEW.bundle_id "
+    "OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a handoff row is never replaced'); END",
     "CREATE TRIGGER IF NOT EXISTS cancel_signatures_no_replace BEFORE INSERT ON cancel_signatures "
     "WHEN EXISTS (SELECT 1 FROM cancel_signatures WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a cancel is never replaced'); END",
@@ -557,6 +577,20 @@ def _intent_problem(evidence: str, named: Mapping[str, str]) -> str | None:
     return None
 
 
+#: The filing door's read-set exporter: ``(resolved, canonical_text, digest, handoff_dir) -> exported temp``, an object
+#: with ``path`` (under ``handoff_dir/.tmp/``), ``fd`` (holding the temp's lock) and ``size``. It is handed in, so this
+#: module takes no dependency on the read-set code.
+Exporter = Callable[[ResolvedContract, str, str, str], Any]
+
+# A test seam at the filing's named points ("exported", "installed", "in-transaction", "committed"); None in use.
+_FAULT_SEAM: Callable[[str], None] | None = None
+
+
+def _seam(point: str) -> None:
+    if _FAULT_SEAM is not None:
+        _FAULT_SEAM(point)
+
+
 def _label(name: str, value: Any, high: int) -> str:
     if not isinstance(value, str) or not value or len(value) > high:
         raise DispatchError(f"{name} must be 1 to {high} characters")
@@ -579,6 +613,9 @@ class JobStore:
         self._clock = clock
         self._ssh_keygen = ssh_keygen
         self._ready = False
+        # the filing's read-set bundles (W-C): <directory>/handoffs/, under <directory>/handoff.lock
+        self.handoffs = HandoffDir(self.directory)
+        self._collected = False
 
     # --- store ---------------------------------------------------------------------------------------------------
     def _check_directory(self) -> None:
@@ -670,6 +707,7 @@ class JobStore:
         finally:
             # after the commit (or the refusal: the first sweep committed either way)
             self._publish()
+            self._sync_handoffs()
 
     def _publish(self) -> None:
         """Sync :attr:`published_dir` to the live signed jobs; a failure is logged, never raised."""
@@ -694,6 +732,67 @@ class JobStore:
                 log.error("dispatch: publishing to %s: %s", self.published_dir, line)
         except Exception:   # noqa: BLE001 - the broker fails closed on a missing record; this store's op stands
             log.exception("dispatch: the signed contracts could not be published to %s", self.published_dir)
+
+    # --- the handoffs (W-C) --------------------------------------------------------------------------------------
+    def _handoff_ids(self, *, terminal_only: bool) -> list[str]:
+        conn = self._connect()
+        try:
+            if terminal_only:
+                rows = conn.execute(
+                    f"SELECT h.bundle_id FROM handoffs h JOIN ({_CURRENT}) c ON c.job_id = h.job_id "
+                    f"WHERE c.to_state IN ({','.join('?' * len(TERMINAL))})", sorted(TERMINAL)).fetchall()
+            else:
+                rows = conn.execute("SELECT bundle_id FROM handoffs").fetchall()
+        finally:
+            conn.close()
+        ids = []
+        for (bundle_id,) in rows:
+            if is_bundle_id(bundle_id):
+                ids.append(bundle_id)
+            else:
+                # a row no filing wrote (the store was edited by hand): it names no path, so it is never joined
+                log.error("dispatch: a handoff row holds an id that is not a bundle id; it names no file")
+        return ids
+
+    def _sync_handoffs(self) -> None:
+        """After every operation's commit: delete the bundles of terminal jobs (a lapse is terminal), by row. Takes no
+        handoff-store lock; a failure is logged, never raised (the next operation retries)."""
+        if not self._ready:
+            return
+        try:
+            self.handoffs.remove(self._handoff_ids(terminal_only=True))
+        except Exception:   # noqa: BLE001 - the operation stands; a bundle left is deleted by the next sync
+            log.exception("dispatch: the terminal jobs' handoffs could not be deleted from %s", self.handoffs.path)
+
+    def collect_handoffs(self) -> Any:
+        """Startup collection, under the handoff-store lock: remove every bundle no handoff row names (a filing killed
+        between its install and its commit) and every unlocked ``.tmp/`` temp older than the grace (a filing killed
+        before its install). Returns :class:`levain.dispatch.handoff.CollectReport`."""
+        with self.handoffs.locked():
+            report = self.handoffs.collect(self._handoff_ids(terminal_only=False))
+        self._collected = True
+        return report
+
+    def handoff_row(self, job_id: str) -> tuple[str, str, int] | None:
+        """``(bundle_id, path, size)`` of ``job_id``'s handoff row, or ``None`` when it has none (a job filed without
+        one, or before W-C). The id is checked before the path is built (``handoff-id``)."""
+        if not isinstance(job_id, str) or _JOB_ID.fullmatch(job_id) is None:
+            return None
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT bundle_id, size FROM handoffs WHERE job_id = ?", (job_id,)).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        if not is_bundle_id(row[0]):
+            raise HandoffRefused("handoff-id", f"job {job_id}'s handoff row holds an id that is not a bundle id")
+        return row[0], os.path.join(self.handoffs.path, row[0]), row[1]
+
+    def _names_handoff(self, bundle_id: str) -> bool:
+        # a fresh transaction: is ``bundle_id`` named by a committed row? (adopted is a DB fact)
+        with self._write() as conn:
+            return conn.execute("SELECT 1 FROM handoffs WHERE bundle_id = ?", (bundle_id,)).fetchone() is not None
 
     # --- reading, inside a transaction ---------------------------------------------------------------------------
     @staticmethod
@@ -776,6 +875,7 @@ class JobStore:
                 return self._sweep(conn, self._stamp())
         finally:
             self._publish()
+            self._sync_handoffs()
 
     def _idem_row(self, filer_session: str, idem_key: str) -> tuple[str, str, str] | None:
         with self._write() as conn:
@@ -785,7 +885,7 @@ class JobStore:
 
     def file(self, submission: Any, *, resolve_template: Callable[[str], ResolvedTemplate | None],
              policy: ProviderPolicy, filer_session: str, idem_key: str | None = None,
-             filer_agent: str | None = None) -> tuple[Job, str | None]:
+             filer_agent: str | None = None, export: Exporter | None = None) -> tuple[Job, str | None]:
         """Resolve the planner's contract ``submission`` (:func:`levain.dispatch.contract.resolve_contract`, with
         ``resolve_template`` and ``policy``, at the store's clock) and file it for the planner session
         ``filer_session``; returns the job and its capability. ``filer_agent`` is the agent the filing door named,
@@ -797,13 +897,23 @@ class JobStore:
         never mints a second token for one job. The key is looked up BEFORE the expiry is judged: a replay is
         resolved at its job's own filing time, so a replay after the contract expired still returns that job (in
         whatever state it is now). The same key with another digest is refused. Filing is refused while another live
-        job in the same repo writes the same path or an ancestor or descendant of one, compared without case."""
+        job in the same repo writes the same path or an ancestor or descendant of one, compared without case.
+
+        ``export`` (the filing door's read-set exporter, W-C) publishes the job WITH its handoff: called as
+        ``export(resolved, canonical_text, digest, handoff_dir)`` before any lock, it builds and checks the read set
+        and returns its bundle in a private locked temp under ``handoff_dir/.tmp/`` (``path``, ``fd``, ``size``), and
+        nothing reaches the store if it refuses. Then, under the ONE handoff-store lock, the temp is installed under a
+        fresh ``hb-`` id and ONE transaction writes the job and its handoff row (id and size). A replay whose
+        existing job wins unlinks this filing's own bundle; after any exception the row for this filing's id is
+        re-read and the bundle unlinked only if no row names it. The first filing of a store object collects
+        orphans first (:meth:`collect_handoffs`)."""
         return self._file(submission, resolve_template=resolve_template, policy=policy, filer_session=filer_session,
-                          idem_key=idem_key, filer_agent=filer_agent, envelope=None)
+                          idem_key=idem_key, filer_agent=filer_agent, envelope=None, export=export)
 
     def file_in_envelope(self, submission: Any, *, resolve_template: Callable[[str], ResolvedTemplate | None],
                          policy: ProviderPolicy, filer_session: str, envelope: Envelope,
-                         idem_key: str | None = None, filer_agent: str | None = None) -> tuple[Job, str | None]:
+                         idem_key: str | None = None, filer_agent: str | None = None,
+                         export: Exporter | None = None) -> tuple[Job, str | None]:
         """File ``submission`` as :meth:`file` does and take it ``filed -> signed`` with cause ``envelope`` in the SAME
         write transaction (a contract inside an envelope is a KNOW: the envelope's signature is its, C0 §5),
         writing ``job_envelopes(job_id, envelope_id, thread_id, bound_at)`` and ``job_threads(job_id, thread_id)``
@@ -817,16 +927,17 @@ class JobStore:
         A replay of the same ``(filer_session, idem_key)`` returns the job only when it is bound to this object's
         envelope and thread, and runs NO precondition: a replay is not a liveness assertion (the job is judged again
         at :meth:`take_slot` and at :meth:`authorise`). Python API only: no CLI, MCP or phone verb files a
-        cause-envelope job (F11 §12: refused until S1 and the run supervisor exist)."""
+        cause-envelope job (F11 §12: refused until S1 and the run supervisor exist). ``export`` is :meth:`file`'s: the
+        ``filed -> signed`` happens only inside the transaction that also writes the handoff row."""
         if envelope is None or not callable(getattr(envelope, "evidence", None)) or \
                 not callable(getattr(envelope, "precondition", None)):
             raise EnvelopeRefused("a filing with cause envelope needs the envelope object (evidence, precondition)")
         return self._file(submission, resolve_template=resolve_template, policy=policy, filer_session=filer_session,
-                          idem_key=idem_key, filer_agent=filer_agent, envelope=envelope)
+                          idem_key=idem_key, filer_agent=filer_agent, envelope=envelope, export=export)
 
     def _file(self, submission: Any, *, resolve_template: Callable[[str], ResolvedTemplate | None],
               policy: ProviderPolicy, filer_session: str, idem_key: str | None, filer_agent: str | None,
-              envelope: Envelope | None) -> tuple[Job, str | None]:
+              envelope: Envelope | None, export: Exporter | None = None) -> tuple[Job, str | None]:
         filer_session = _label("filer_session", filer_session, _SESSION_MAX)
         if filer_agent is not None:
             filer_agent = _label("filer_agent", filer_agent, _AGENT_MAX)
@@ -839,6 +950,56 @@ class JobStore:
         text = resolved.canonical()
         parsed = parse_contract(text)      # what is stored must read back as this contract, digest and all
         digest = parsed.digest
+        if export is None or prior is not None:
+            # no exporter (a Python caller filing with no read set: a job with no handoff row, which the launch
+            # design refuses as handoff-missing), or a
+            # replay seen before resolving, whose job and bundle exist already: nothing is exported, and the
+            # transaction still judges the replay (one that turns out not to be one is refused there)
+            job, capability, _adopted = self._commit_filing(
+                parsed, text, digest, filer_session=filer_session, idem_key=idem_key, filer_agent=filer_agent,
+                envelope=envelope, prior=prior, handoff=None)
+            return job, capability
+        if not self._collected:
+            self.collect_handoffs()
+        # F2 + F3, before the lock: the read set built and checked, its bundle in a private locked temp, uninstalled
+        exported = export(resolved, text, digest, self.handoffs.ensure())
+        _seam("exported")
+        with self.handoffs.locked():
+            bundle_id = self.handoffs.install(exported.path, exported.fd)       # F3'
+            _seam("installed")
+            done = False
+            adopted = False
+            try:
+                job, capability, adopted = self._commit_filing(                  # F4
+                    parsed, text, digest, filer_session=filer_session, idem_key=idem_key, filer_agent=filer_agent,
+                    envelope=envelope, prior=None, handoff=(bundle_id, exported.size))
+                _seam("committed")
+                done = True
+            finally:
+                if done:
+                    if not adopted:
+                        # an idempotent replay whose existing job won: this filing's own bundle, never the winner's
+                        self.handoffs.unlink_own(bundle_id)
+                else:
+                    # a raise does not say whether the commit happened: the row decides, read in a fresh
+                    # transaction under this same lock hold; a re-read that fails leaves the bundle for collection
+                    try:
+                        named = self._names_handoff(bundle_id)
+                    except BaseException:   # noqa: BLE001 - the original failure is what propagates
+                        log.exception("dispatch: handoff %s left for collection: its row could not be re-read",
+                                      bundle_id)
+                        named = True
+                    if not named:
+                        self.handoffs.unlink_own(bundle_id)
+        return job, capability
+
+    def _commit_filing(self, parsed: ResolvedContract, text: str, digest: str, *, filer_session: str,
+                       idem_key: str | None, filer_agent: str | None, envelope: Envelope | None,
+                       prior: tuple[str, str, str] | None, handoff: tuple[str, int] | None
+                       ) -> tuple[Job, str | None, bool]:
+        """F4: ONE swept write transaction publishing the job, its handoff row (when ``handoff`` is given) and, for
+        an envelope filing, its ``filed -> signed``. Returns the job, its capability and whether THIS filing's row
+        was written (False for an idempotent replay, whose existing job won)."""
         with self._swept() as (conn, stamp):
             # the binding, read from the envelope object inside this transaction (never a second caller input)
             bound: tuple[str, str] | None = None
@@ -862,7 +1023,7 @@ class JobStore:
                     if (job.envelope_id, job.thread_id) != (bound or (None, None)):
                         raise ContractRefused(f"idem_key {idem_key!r} already filed job {row[0]} under another "
                                               "envelope binding (or none); a replay resends the same filing")
-                    return job, None
+                    return job, None, False
                 if prior is not None:
                     # the row read before resolving is gone: the store is append-only, so this is not a replay
                     raise JobStoreError(f"job {prior[0]} vanished from an append-only store")
@@ -907,6 +1068,11 @@ class JobStore:
                          (job_id, stamp, json.dumps({"filer_session": filer_session}, sort_keys=True)))
             if filer_agent is not None:
                 conn.execute("INSERT INTO job_filers (job_id, agent) VALUES (?, ?)", (job_id, filer_agent))
+            if handoff is not None:
+                # the handoff row in the job's own transaction: the job and its bundle's name appear together or not
+                # at all (an envelope job's signing below is in this same transaction, never before it)
+                conn.execute("INSERT INTO handoffs (job_id, bundle_id, size, at) VALUES (?, ?, ?, ?)",
+                             (job_id, handoff[0], handoff[1], stamp))
             if envelope is not None:
                 assert bound is not None
                 pin, thread_id = bound
@@ -920,9 +1086,10 @@ class JobStore:
                 _envelope_check(envelope, conn, stamp, as_filed)
                 self._apply(conn, job_id, "signed", "envelope", stamp,
                             json.dumps({"envelope_id": pin, "thread_id": thread_id}, sort_keys=True))
+            _seam("in-transaction")
             job = self._load(conn, job_id)
         assert job is not None
-        return job, capability
+        return job, capability, True
 
     def sign(self, job_id: str, payload: Any, signature: Any, authority: AuthoritySource) -> Job:
         """Store the operator's signature over a filed job's digest and move it to ``signed``, in one write
