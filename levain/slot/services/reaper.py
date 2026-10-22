@@ -13,7 +13,7 @@ every wake and every V11 tick, and every :data:`levain.slot.reaper.REVOKER_RETRY
 
 Why processes and not threads (RH2): the macOS signalling child is a ``fork()``, and forking a process with a second
 Python thread can leave the child blocked on a lock that thread held. Each process here runs one Python thread; the
-signalling child's wait is bounded by its caller's deadline either way.
+signalling child's wait is bounded by its caller's deadline either way (RH2).
 """
 from __future__ import annotations
 

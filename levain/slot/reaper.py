@@ -5,7 +5,7 @@ each single-threaded) is :mod:`levain.slot.services.reaper`.
 The reaper is root and acts through the helpers' own functions, never a second copy of them: END is
 :func:`end.end_session` / :func:`end.reconcile_session` on the facts and seams :mod:`start` builds, SCRUB is
 :func:`start.scrub_and_release`, the front kill is :func:`start.revoke_front`, every slot-uid kill is
-:func:`proc.end_domain` (through :func:`proc.scrub` on the orphan revert). What it reads of CONTROL's records is a HINT
+:func:`proc.end_domain` (reaper DESIGN I1). What it reads of CONTROL's records is a HINT
 (§7.1): a REVOKE or CAS it sends is checked by CONTROL.
 
 The pass (§4.3), in this fixed order; each step try-locks and skips what is busy, and one item that fails is logged
@@ -46,7 +46,7 @@ V22_S = 3600.0
 HELD_BACKOFF_S = 60.0
 #: §11 V23: how long a SLOW CONTROL answer is retried before the revoker treats CONTROL as down (§4.5).
 V23_S = 10.0
-#: DECISION: the revoker's tick while a front kill is pending (a ``front-busy`` retried inside the 5 s bound).
+#: DECISION: the revoker's tick while a front kill is pending (a ``front-busy`` retried inside the revoker's bound).
 REVOKER_RETRY_S = 0.25
 #: DECISION (§4.2 step 4): the worker's boot waits this long for CONTROL to answer, then passes run anyway (a pass
 #: with CONTROL down runs the local steps only).
@@ -398,7 +398,7 @@ class Reaper:
 
     def end_and_scrub(self, ctx: H.Ctx, rep: Dict[str, object]) -> None:
         """Records in REVOKED, FROZEN, DEAD or CREDENTIAL_PARKED run END; HELD runs END from its ``failed_step`` when
-        its backoff is due (a HELD ``kill`` re-runs END from ``kill``, whose kill is :func:`proc.end_domain`). A
+        its backoff is due (a HELD ``kill`` re-runs END from ``kill``). A
         RETAINED END goes on to SCRUB. The pass rule (RH5): a RETAINED record whose alloc is present and whose slot is
         still leased to it is SCRUBbed again, every pass, no backoff (SCRUB re-proves and is idempotent). An
         ``end-busy`` (or ``slot-locked``) refusal is not an attempt: no record change, no backoff (DESIGN r5 F5)."""
@@ -460,10 +460,10 @@ class Reaper:
     def revert_orphans(self, ctx: H.Ctx, rep: Dict[str, object]) -> None:
         """A slot ``leased`` to a session with no alloc and no record (a ``prepare`` that died before ATTACH). Two
         phases: a snapshot under the pool lock; then, per slot, the slot lock TRIED, the state still the snapshot's,
-        alloc and record still absent, every uid of the slot ended and proven (:func:`proc.scrub`: macOS
-        :func:`proc.end_domain` per uid; I1), the pool lock TRIED, and the state written ``reusable`` (DESIGN Q3:
+        alloc and record still absent, every uid of the slot ended and proven
+        (I1), the pool lock TRIED, and the state written ``reusable`` (DESIGN Q3:
         ``scrubbed`` is a format value only) with ``rev + 1`` iff the rev is unchanged. A slot carrying the ``spent``
-        mark is written ``retired`` instead (R-d), and no account is removed (the install helper is the one remover).
+        mark is written ``retired`` instead (R-d), and no account is removed (DESIGN Q-G1).
         The gateway uid is swept without ``front.lock``: no render of a session with no alloc can be in flight."""
         with _PoolLock(ctx.store) as pool:
             if not pool.held:
@@ -572,11 +572,11 @@ class Reaper:
 
 class Revoker:
     """The REVOKER process's state: which leases' fronts it has dealt with, when it first saw each, and since when
-    CONTROL has been slow. It takes no lock the pass worker takes (``front.lock`` is the only one, inside
-    :func:`start.revoke_front`). Each wake (a datagram or a tick): reap leftover signalling children; ask CONTROL for
-    ``REVOKED-SET``; for every session in it whose alloc names an egress slot, :func:`start.revoke_front`. CONTROL DOWN
-    (connect refused or the socket absent; or an answer slow past V23): every egress alloc's front is ended, since no
-    session can be confirmed live. A ``front-busy`` is retried on the next wake until 5 s after the lease was first
+    CONTROL has been slow. It takes no lock the pass worker takes (DESIGN §4.7: ``front.lock`` alone). Each wake (a
+    datagram or a tick): reap leftover signalling children; ask CONTROL for ``REVOKED-SET``; for every session in it
+    whose alloc names an egress slot, :func:`start.revoke_front`. CONTROL DOWN (connect refused or the socket absent; or
+    an answer slow past V23): every egress alloc's front is ended, since no session can be confirmed live (CONTRACT
+    §4.5). A ``front-busy`` is retried on the next wake until the revoker's bound has passed since the lease was first
     seen, then recorded; ``front-ended``, ``front-lease-moved`` and an Unproven sweep are final (SCRUB ends the gateway
     uid again either way)."""
 
