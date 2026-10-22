@@ -1056,7 +1056,7 @@ def _stop_steps(host: HostOS, services: Sequence[units.Service], noted: dict[str
                 if units._launchd_job_absent(lb)[0]:
                     return True, ""
                 out(("/bin/launchctl", "bootout", f"system/{lb}"))   # its status is not the verdict: checked next
-                return units._launchd_job_absent(lb)
+                return units._launchd_job_absent(lb, wait_s=units.LAUNCHD_UNLOAD_WAIT_S)   # launchd unloads after bootout returns
 
             steps.append(Step(f"stop {label}", call=note_then(s.name, bootout)))
         else:
