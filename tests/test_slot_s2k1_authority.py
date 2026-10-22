@@ -41,7 +41,7 @@ class Box:
         seams = dict(drop_session=lambda s: self.calls.append(("drop", s)),
                      wake_reaper=lambda: self.calls.append(("wake",)),
                      keys_front_register=lambda *a: self.calls.append(("register",) + a),
-                     keys_front_arm=lambda s: self.calls.append(("arm", s)),
+                     keys_front_arm=lambda s, t: self.calls.append(("arm", s)),
                      sleep=lambda s: None)
         seams.update(kw)
         self.control = C.Control(self.store, OP_UID, **seams)
@@ -355,27 +355,27 @@ def test_lease_eof_during_front_register_publishes_no_handle(tmp_path):
 def test_front_arm_rechecks_the_lease_after_the_relay(tmp_path):
     box: Box
 
-    def arm(session):
+    def arm(session, reg_token):
         box.control.lease_eof(op.lease)
 
     box = Box(tmp_path, keys_front_arm=arm)
     op = box.attach()
     assert box.cas(S1, 0, "ALLOCATED", "RENDERING")["ok"]
     assert box.ask(C.Conn(0), "MINT", session=S1, generation=1, claims=mint_claims())["ok"]
-    assert box.ask(C.Conn(0), "FRONT-ARM", session=S1, generation=2)["refused"] == "lease-dead"
+    assert box.ask(C.Conn(0), "FRONT-ARM", session=S1, generation=3)["refused"] == "lease-dead"
 
 
 def test_front_arm_rechecks_the_record_after_the_relay(tmp_path):
     box: Box
 
-    def arm(session):
+    def arm(session, reg_token):
         assert box.ask(C.Conn(0), "REVOKE", session=session)["ok"]       # root's teardown, the lease still live
 
     box = Box(tmp_path, keys_front_arm=arm)
     box.attach()
     assert box.cas(S1, 0, "ALLOCATED", "RENDERING")["ok"]
     assert box.ask(C.Conn(0), "MINT", session=S1, generation=1, claims=mint_claims())["ok"]
-    assert box.ask(C.Conn(0), "FRONT-ARM", session=S1, generation=2)["refused"] == "not-rendering"
+    assert box.ask(C.Conn(0), "FRONT-ARM", session=S1, generation=3)["refused"] == "not-rendering"
 
 
 # --- c7 / comp4: the lifetime collections are bounded ------------------------------------------------------------------------
