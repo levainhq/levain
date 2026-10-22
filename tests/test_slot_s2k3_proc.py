@@ -24,8 +24,8 @@ from tests.test_slot_s2f1_proc import FORKER, OTHER, SENTINEL, SLOT, Table
 def test_signal_child_drops_before_it_signals_and_signals_minus_one():
     calls: list = []
     P.signal_child(SLOT, signal.SIGSTOP, drop=lambda uid: calls.append(("drop", uid)),
-                   kill=lambda pid, sig: calls.append(("kill", pid, sig)))
-    assert calls == [("drop", SLOT), ("kill", -1, signal.SIGSTOP)]
+                   kill=lambda pid, sig: calls.append(("kill", pid, sig)), close=lambda: calls.append(("close",)))
+    assert calls == [("close",), ("drop", SLOT), ("kill", -1, signal.SIGSTOP)]   # RV1: no inherited lock fd first
 
 
 def test_signal_child_never_signals_when_the_drop_is_not_proven():
@@ -35,7 +35,8 @@ def test_signal_child_never_signals_when_the_drop_is_not_proven():
         calls.append(("drop", uid))
         raise Refused("drop-assert", "saved uid")
     with pytest.raises(Refused):
-        P.signal_child(SLOT, signal.SIGKILL, drop=refused, kill=lambda pid, sig: calls.append(("kill", pid, sig)))
+        P.signal_child(SLOT, signal.SIGKILL, drop=refused, kill=lambda pid, sig: calls.append(("kill", pid, sig)),
+                       close=lambda: None)
     assert calls == [("drop", SLOT)]                      # no kill(-1) as root
 
 
@@ -95,7 +96,7 @@ def uid_signal_table():
     t = Table()
     sigs: list = []
 
-    def signal_uid(uid, sig):
+    def signal_uid(uid, sig, timeout):
         sigs.append((uid, sig))
         hit = False
         for pid, p in list(t.procs.items()):
@@ -133,7 +134,7 @@ def test_freeze_and_kill_signal_by_uid_never_by_pid():
 def test_a_uid_signal_that_was_not_sent_leaves_the_proof_unmet():
     t, s, sigs = uid_signal_table()
     t.add(100, SLOT)
-    s = replace(s, signal_uid=lambda uid, sig: sigs.append((uid, sig)) and False)
+    s = replace(s, signal_uid=lambda uid, sig, timeout: sigs.append((uid, sig)) and False)
     assert P.UidProcs(s).freeze(SLOT, 0.5) is False                # past the bound, never claimed
     assert sigs and t.procs[100].state != STOP
 
@@ -185,7 +186,7 @@ def test_real_darwin_uid_sweep_on_a_forking_process_group():
     def listing():
         return [relabel(p) for p in real.listing() if p.state != UNKNOWN and mine(p.pid)]
 
-    def signal_uid(uid, sig):
+    def signal_uid(uid, sig, timeout):
         assert uid == SENTINEL
         try:
             os.killpg(pg, sig)

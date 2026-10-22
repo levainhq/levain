@@ -147,6 +147,10 @@ class Launches:
         self.states_at_wait.append(st.state if st else None)
         return self.codes.get(rec["target"], 0)
 
+    def wait_within(self, pid, bound_s) -> int:
+        self.bounds = getattr(self, "bounds", []) + [bound_s]
+        return self.wait(pid)
+
     def kill(self, pid) -> None:
         if pid in {r["pid"] for r in self.spawns}:
             self.killed.append(pid)
@@ -173,7 +177,7 @@ def _world(tmp_path, *, host: str = "linux") -> tuple[World, Launches, Table]:
     la = Launches(w, table)
     w.session = None
     s = w.seams
-    s.spawn, s.wait, s.kill = la.spawn, la.wait, la.kill
+    s.spawn, s.wait, s.wait_within, s.kill = la.spawn, la.wait, la.wait_within, la.kill
     s.netns_names = lambda: {"levain-e0", "levain-e1", "levain-e2", "levain-v0"}
     s.host_links = lambda: {"/bin": "usr/bin", "/sbin": "usr/sbin", "/lib": "usr/lib", "/lib64": None}
     w.cgroups: list[str] = []
@@ -571,7 +575,7 @@ def test_teardown_retains_then_scrubs_the_slot_reusable(env):
     after = w.slot_state(E0)
     assert (after.state, after.rev, after.session, after.lease_seq) == ("reusable", before.rev + 1, None,
                                                                          before.lease_seq)
-    assert w.steps[-4:] == ["end", "scrub", "scrubbed", "reusable"]
+    assert w.steps[-5:] == ["end", "scrub", "scrubbed", "pool", "reusable"]
     assert w.prepare()["slot"]["index"] == 0                      # the slot is handed out again
 
 

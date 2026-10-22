@@ -359,9 +359,9 @@ def test_failed_clone_kills_the_domain_before_emptying_the_repo(env, monkeypatch
     order: list = []
     real_kill, real_fresh = SS.kill_domain, SS._fresh_repo
 
-    def kill(ctx, a):
+    def kill(ctx, a, children=()):
         order.append("kill")
-        return real_kill(ctx, a)
+        return real_kill(ctx, a, children)
 
     def fresh(ctx, a, sfd):
         order.append("fresh")

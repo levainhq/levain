@@ -836,7 +836,9 @@ def test_provenance_on_every_entry_passes_meta_cap(tmp_path):
 
 
 @pytest.mark.parametrize("seam,failed", [
-    ({"freeze": lambda uid, b: False}, "freeze"),
+    # reaper H1: an unproven freeze no longer stops END; the kill runs, and only its failure lands HELD, still named
+    # "freeze" while no FROZEN edge was sent.
+    ({"freeze": lambda uid, b: False, "kill": lambda uid, b: False}, "freeze"),
     ({"kill": lambda uid, b: False}, "kill"),
     ({"no_process": lambda uid: False}, "kill"),          # killed, but a process of the uid remains
 ])
@@ -852,18 +854,30 @@ def test_kill_failure_held(world, seam, failed):
 
 
 def test_bound_passed_is_not_proven(world):
-    t = itertools.chain([0.0, 11.0], itertools.repeat(11.0))   # the freeze seam returned after 11 s (V12 = 10 s)
+    now = [0.0]
+
+    def slow_kill(uid, b):                                       # the kill seam returns after 11 s (V12 = 10 s)
+        now[0] += 11.0
+        return True
     ctl = Control()
-    assert end_session(world.facts, world.seams(ctl, clock=lambda: next(t)), record_state=REVOKED) == HELD
-    assert ctl.failed_step == "freeze"
+    assert end_session(world.facts, world.seams(ctl, clock=lambda: now[0], kill=slow_kill),
+                       record_state=REVOKED) == HELD
+    assert ctl.failed_step == "kill"
 
 
 def test_unbuilt_seams_hold(world):
     ctl = Control()
     seams = world.seams(ctl)
-    seams.freeze = end_mod.unbuilt_freeze
+    seams.freeze, seams.kill = end_mod.unbuilt_freeze, end_mod.unbuilt_kill
     assert end_session(world.facts, seams, record_state=REVOKED) == HELD
     assert ctl.failed_step == "freeze"
+    # reaper H1: a freeze that cannot prove (here: unbuilt) does not keep END from its kill; the kill and its proof
+    # pass, so FROZEN is sent after them, before DEAD.
+    edges_before = len(ctl.history)
+    seams = world.seams(ctl)
+    seams.freeze = end_mod.unbuilt_freeze
+    assert end_session(world.facts, seams, record_state=HELD, failed_step="freeze") == RETAINED
+    assert [h[0] for h in ctl.history[edges_before:]] == [FROZEN, DEAD, CREDENTIAL_PARKED, RETAINED]
 
 
 _RETAIN_STEP_FNS = {"init": "_init_step", "manifest": "_manifest_step", "meta": "_meta_step",
@@ -878,7 +892,7 @@ def test_held_retried_each_step(world, monkeypatch, failed):
     ctl = Control()
     kw: dict = {}
     if failed == "freeze":
-        kw["freeze"] = lambda uid, b: False
+        kw["freeze"] = kw["kill"] = lambda uid, b: False          # H1: an unproven freeze alone is not HELD
     elif failed == "kill":
         kw["kill"] = lambda uid, b: False
     else:

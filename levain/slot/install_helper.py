@@ -683,15 +683,22 @@ def _abandoned_setup(facts: HostFacts) -> Intent | None:
     return j
 
 
-def _end_processes(host: HostOS, uid: int, name: str, *, bootout: Callable[..., bool] = PR.darwin_bootout,
+def _end_processes(host: HostOS, uid: int, name: str, *,
+                   end: Callable[[int], "PR.Domain"] = lambda u: PR.end_domain(u, PR.V12K_SECONDS)[0],
                    kill_all: Callable[[int], tuple[bool, str]] = _kill_all,
                    none_left: Callable[[int], bool] = lambda u: PR.UidProcs().no_process(u)) -> tuple[bool, str]:
-    """macOS first ends the uid's launchd domain, so no agent is respawned for it after the kill (an undo once
-    left a slot's distnoted running past rc 0: levain-memory runs/s2-macos/raw_d/998_undo.txt); then every
-    process is killed, and the proof (two scans, no process of the uid) refuses by the account's name. A bootout
-    launchctl did not report done refuses ``domain-remains:<name>`` (the account is never removed under it)."""
-    if host == "darwin" and not bootout(uid):
-        return False, f"domain-remains:{name}: launchctl did not report uid {uid}'s domain booted out"
+    """Every process of the uid ended and proven before its account is removed, refused by the account's name.
+    macOS: :func:`proc.end_domain` (freeze, kill, the launchd domain booted out, kill again, a quiet window, the
+    proof), so no agent is respawned for the uid after the kill (an undo once left a slot's distnoted running past
+    rc 0: levain-memory runs/s2-macos/raw_d/998_undo.txt); a bootout launchctl did not accept refuses
+    ``domain-remains:<name>``, any other unproven step ``processes-remain:<name>``. Linux: every process killed,
+    then the proof (two scans, no process of the uid)."""
+    if host == "darwin":
+        res = end(uid)
+        if res.proven:
+            return True, ""
+        what = "domain-remains" if res.name.startswith("domain-not-accepted") else "processes-remain"
+        return False, f"{what}:{name}: uid {uid}: {res.name} {res.detail}".rstrip()
     ok, why = kill_all(uid)
     if not ok:
         return False, why
