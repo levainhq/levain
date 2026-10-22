@@ -272,6 +272,28 @@ def test_an_http_1_0_101_is_upstream_error(monkeypatch):
     assert json.loads(frames[1][1]) == {"refused": "upstream-error"}
 
 
+def test_the_idle_clock_ends_a_silent_websocket(monkeypatch):
+    """T7: neither side sends a byte for `idle_s`: keys sends `E`, and the record says `upstream-timeout`."""
+    up = _Up()
+    _scripted(monkeypatch, up)
+
+    async def go(d: str) -> tuple:
+        log = K.GwLog(d)
+        async with _Rig(d, idle_s=0.3) as rig:
+            rig.k.gw_log = log
+            rig.front.feed_data(_gw(b"E"))
+            up.feed(_h101())
+            await asyncio.wait_for(rig.run(_q()), 10)
+            frames = await rig.got()
+        with open(log.path, "rb") as f:
+            return frames, f.read()
+
+    frames, gw = _run(go)
+    assert _types(frames) == b"AUE", frames
+    recs = [json.loads(x) for x in gw.splitlines() if b'"status"' in x]
+    assert [(r["status"], r["refused"]) for r in recs] == [(101, "upstream-timeout")], gw
+
+
 @pytest.mark.parametrize("q,why", [
     (_q(path="/plain"), "upgrade on a template without upgrade"),
     (_q(headers=[["sec-websocket-version", "13"]]), "no key"),
