@@ -4382,7 +4382,12 @@
       const read = () => {
         btn.disabled = true;
         slot.replaceChildren(document.createTextNode("reading the transcript\u2026"));
-        sessionTranscript(stem, wrap).then((b) => drawSessionTranscript(slot, b))
+        sessionTranscript(stem, wrap).then((b) => {
+          drawSessionTranscript(slot, b);
+          // the page opens on the newest entry (the timeline is oldest first, so that is its last row)
+          const last = slot.querySelector(".sess-tl") && slot.querySelector(".sess-tl").lastElementChild;
+          if (last && typeof last.scrollIntoView === "function") last.scrollIntoView({ block: "end" });
+        })
           .catch(() => slot.replaceChildren(el("div", "consent-note ext-meta", SESS_BAD_READ)))
           .finally(() => { btn.disabled = false; });
       };
