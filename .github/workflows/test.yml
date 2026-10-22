@@ -104,8 +104,7 @@ jobs:
     # is the macOS app bundle, so in the `test` job every one of them skips. Here Chrome is installed at a
     # pinned version and CHROME points at it. Selection is by file (every test file that names
     # `needs_browser`), because the mark is a skipif and not a registered marker, so `-m` cannot pick it.
-    # The job fails if that selection is empty, if nothing was collected, or if ANY test skips for the
-    # missing browser.
+    # The job fails if that selection is empty, if nothing was collected, or if ANY test skips.
     name: cockpit browser tests (Python 3.13)
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -124,15 +123,17 @@ jobs:
 
       - name: Install Chrome
         id: chrome
-        uses: browser-actions/setup-chrome@v2.2.0
+        # third-party action pinned to the commit its v2.2.0 tag named on 2026-10-22; Chrome pinned to the build the
+        # first run of this job resolved from `stable`, so an unchanged commit tests against the same browser
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4
         with:
-          chrome-version: stable
+          chrome-version: "156.0.8078.47"
 
       - name: Let Chrome use its sandbox
         # The runner's AppArmor refuses the unprivileged user namespace Chrome's sandbox needs, and the
         # page driver's flags (tests/chrome_flags.json) do not pass --no-sandbox. This lifts the
         # restriction on the throwaway runner VM, the same remedy the linux-live job applies for bwrap.
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Install package
         run: |
@@ -151,9 +152,9 @@ jobs:
           test -n "$files" || { echo "no test file names needs_browser"; exit 1; }
           set -o pipefail
           pytest -q -rs $files 2>&1 | tee browser.log
-          # a skipped browser test is a failure here: the whole point of this job is that they run
-          if grep -q "node and Chrome are needed" browser.log; then
-            echo "browser tests skipped for a missing node or Chrome"
+          # ANY skip is a failure here, whatever its reason: the whole point of this job is that these tests run
+          if grep -q -E "^SKIPPED|[0-9]+ skipped" browser.log; then
+            echo "a test skipped in the browser job (reasons above, from -rs)"
             exit 1
           fi
 
