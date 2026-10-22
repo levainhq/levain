@@ -75,8 +75,8 @@ def _run(tmp_path, stream: bytes, base_oid: str):
     log = tmp_path / "git.log"
     r, w = os.pipe()
     try:
-        rc = importer.run(["--git", GIT, "--object-format", "sha1", "--base-oid", base_oid, "--max-bytes", str(1 << 30),
-                           "--max-input-size", str(1 << 30), "--git-log", str(log)],
+        rc = importer.run(["--git", GIT, "--session", "s-" + "0" * 16, "--object-format", "sha1", "--base-oid", base_oid,
+                           "--max-bytes", str(1 << 30), "--max-input-size", str(1 << 30), "--git-log", str(log)],
                           stdin=io.BytesIO(stream), result_fd=w, work=work)
     finally:
         os.close(w)
