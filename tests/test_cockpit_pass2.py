@@ -195,8 +195,9 @@ def test_the_phone_theme_keys_sit_inside_their_track_in_every_selected_state(tmp
       for (const w of ['system', 'dark', 'light']) {
         tr.querySelector('[data-theme-set=' + w + ']').click();
         const t = tr.getBoundingClientRect(), bs = [...tr.querySelectorAll('button')].map((b) => b.getBoundingClientRect());
-        out.push({ sizes: bs.map((b) => [b.width, b.height]), inside: bs.every((b) => b.top >= t.top && b.bottom <= t.bottom) });
+        out.push({ want: w, got: (tr.querySelector('[aria-pressed=true]') || {}).dataset?.themeSet, sizes: bs.map((b) => [b.width, b.height]), inside: bs.every((b) => b.top >= t.top && b.bottom <= t.bottom) });
       }
       return out; })()"""}])
     for state in vals[2]:
+        assert state["got"] == state["want"], state
         assert state["inside"] and len({tuple(s) for s in state["sizes"]}) == 1, state
