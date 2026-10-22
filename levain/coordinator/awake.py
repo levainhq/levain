@@ -3,7 +3,8 @@
 The rule: an assertion is held while at least one thread of kind ``work`` is in state ``working``, and released when
 none is. It is an IDLE-sleep assertion only (macOS ``caffeinate -i``, Linux ``systemd-inhibit --what=idle``); Levain
 never writes the machine's power settings and never uses sudo. Whether it keeps a closed lid awake on battery is a
-separate claim that this module does not make (C0 §10, run owed).
+claim this module does not make: it does not, because an idle-sleep assertion is by Apple's own header not a hold
+against lid-close sleep (see :data:`LID_NOTE`).
 
 The holder is a process that expires by itself (``-t``), so a Levain that dies releases the host within
 :data:`HOLD_SECONDS` with no cleanup. It is started through a short-lived intermediate that exits at once, so the
@@ -42,6 +43,9 @@ LOCK = "awake.lock"
 # a test seam: a test run never holds the host unless a test turns this on (and points the holder at a harmless argv)
 _IN_TESTS = False
 _NO_LOCKS = "this host has no POSIX file locks (fcntl), so Levain does not hold it awake"
+# what doctor always says beside the hold; the premise verdict (an idle-sleep assertion does not outlast a closed lid)
+LID_NOTE = ("kept awake only with the lid OPEN: closing the lid on battery still sleeps this Mac "
+            "(an idle-sleep assertion does not prevent lid-close sleep)")
 # the intermediate: starts the holder in its own session, prints its pid, and exits, so the holder is never our child
 _LAUNCH = ("import subprocess, sys; p = subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL, "
            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True); print(p.pid)")
@@ -202,6 +206,11 @@ def _reconcile(store: Any, path: Path) -> dict[str, Any]:
 
 def describe(directory: Path | str, *, working_count: int | None = None) -> tuple[bool, str]:
     """(ok, one line) for ``levain doctor``: is the assertion held, and why or why not. Read-only."""
+    ok, line = _describe(directory, working_count)
+    return ok, f"{line}; {LID_NOTE}"
+
+
+def _describe(directory: Path | str, working_count: int | None) -> tuple[bool, str]:
     cur = _read(Path(directory) / FILE)
     pid = cur.get("pid")
     held = _ours(cur) and cur.get("until", 0) > time.time()

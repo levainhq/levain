@@ -88,3 +88,11 @@ def test_a_holder_that_runs_out_is_never_our_zombie(held, tmp_path):
     time.sleep(2)                                # past its own life, with no store write after it
     row = subprocess.run(["ps", "-o", "ppid=,stat=", "-p", str(pid)], capture_output=True, text=True).stdout.split()
     assert not row or row[0] != str(os.getpid()), row     # gone, or init's: never a zombie child of this process
+
+
+def test_describe_says_the_lid_closes_the_sleep_anyway(tmp_path):
+    """C7 premise (1021-32/c7/PREMISE.md): an idle-sleep assertion does not survive a closed lid on battery, so every
+    doctor line says the hold is lid-open only. Reproduced first: describe() named no lid in any of its three shapes."""
+    for working in (None, 0, 2):
+        _, line = awake.describe(tmp_path, working_count=working)
+        assert "lid" in line and "battery" in line, line
