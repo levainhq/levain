@@ -40,8 +40,10 @@ import sys
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from levain.broker import gwwire
+from levain.broker.creds import CredLifecycle, FakeCredLifecycle
 from levain.broker.gwwire import FrameReader, KeysSide, WireError
 from levain.broker.peer import PeerUnknown, peer_of
+from levain.broker.upstream import _note
 
 # --- the admission values (DECISION, judged against the 8-slot default; one constant each) ------------------------
 FIRST_FRAME_S = 5.0
@@ -93,15 +95,6 @@ FRONTS_GROUP = "levain-gwfronts"
 
 _K = gwwire.encode(b"K")
 _A = gwwire.encode(b"A")
-logger = logging.getLogger("levain.broker")
-
-
-def _note(level: int, msg: str, *a: object) -> None:
-    """A failure note that can never raise an `Exception` into its caller (a full disk, a handler whose `emit` raises)."""
-    try:
-        logger.log(level, msg, *a)
-    except Exception:
-        pass
 
 
 def bounded() -> int:
@@ -215,7 +208,10 @@ class Keys:
     refuses at accept, at the STATUS claim (`H`) and at `Q`, and every in-process API call refuses."""
 
     def __init__(self, *, gw_uids: frozenset = frozenset(), single_uid: Optional[int] = None,
-                 control_path: Optional[str] = None, lib_root: Optional[str] = None) -> None:
+                 control_path: Optional[str] = None, lib_root: Optional[str] = None,
+                 cred_lifecycle: Optional[CredLifecycle] = None) -> None:
+        #: the credential layer's lifecycle seam, which shutdown calls; the stand-in until the real writer is passed.
+        self.cred_lifecycle: CredLifecycle = cred_lifecycle if cred_lifecycle is not None else FakeCredLifecycle()
         #: uids admitted at accept: the `_levain_gw<n>` accounts.
         self.gw_uids = frozenset(gw_uids)
         #: TEST ONLY (the one-uid fixture harness): peers of this uid are matched to a registration by (pid, start)
