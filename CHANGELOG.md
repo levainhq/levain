@@ -23,6 +23,21 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   crash may undo it (a removal warns that the credential may come back). The command gives up after 30 seconds,
   stops the child and refuses `credential-child-timeout`. The keys service uses a new credential on its next exchange,
   and has its own one-thread writer for the token refresh that comes later; nothing calls that writer yet.
+- **The keys service refreshes an expiring sign-in token.** Before an exchange goes upstream, an access token that
+  expires within 60 seconds waits for its refresh. An expired one is refused as `credential-unavailable` and is never
+  sent. A 401 from the vendor starts a refresh, but the request that got the 401 is never replayed. Concurrent requests for
+  one credential share one refresh. A refresh that fails backs off from 30 seconds, doubling, to at most 15 minutes. The
+  refresh writes through the credential writer above, and a credential the operator replaced during a refresh is kept.
+- **The installed tree moves to versioned generations.** Setup installs levain's root-owned code as one content-addressed
+  generation behind a single `current` link. It records the install's shape so a later repair can plan the upgrade of
+  an existing install. The `repair` verb that will use this plan is not built yet.
+
+### Fixed
+- **The isolation install helper: `undo` right after `setup` no longer fails on a service that is still unloading.** After `launchctl bootout`, the
+  install helper waits a bounded time for launchd to finish unloading the job before it checks the job is stopped.
+  It treats a job as absent only when launchd says the service does not exist. Any other answer, or a `launchctl print`
+  that hangs past its time limit, counts as "could not be checked", and the step refuses rather than carrying on with a root
+  service possibly still loaded.
 
 ## [0.11.16] — 2026-10-22
 
