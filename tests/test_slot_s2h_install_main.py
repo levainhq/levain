@@ -454,6 +454,29 @@ def test_gather_facts_darwin(tmp_path):
     assert g.facts.operator_uid == OP_UID
 
 
+@pytest.mark.parametrize("bad", [b'{"format":"levain-install-shape/1","generation"', b'{"format":"levain-install-shape/2"}'])
+def test_a_corrupt_install_shape_blocks_repair_not_undo(tmp_path, bad):
+    """U15 (complement MED 4): undo is the recovery verb, so an unparseable install-shape (truncated, or a newer
+    format) is read as absent for undo, which then plans exactly what it plans on a host with no record file;
+    repair and replenish still refuse it."""
+    run, L, state, _ = _darwin_fixture(tmp_path)
+
+    def gathered(verb):
+        return gather_facts(parse_install_argv(verb), "darwin", OP_UID, run=run, store_seams=_store_seams(L),
+                            state_dir=state, user_name=lambda uid: OP)
+
+    absent = gathered(["undo"])
+    (L / "policy" / "install-shape").write_bytes(bad)
+    corrupt = gathered(["undo"])
+    assert corrupt.facts.install_shape is None
+    assert corrupt.facts == absent.facts and corrupt.accounts == absent.accounts     # plan_undo reads only these
+    assert corrupt.shared_groups == absent.shared_groups
+    for verb in (["repair"], ["replenish"]):
+        with pytest.raises(Refused) as ei:
+            gathered(verb)
+        assert ei.value.name == "install-shape-malformed", verb
+
+
 def test_gather_facts_linux_groups_carry_no_label(tmp_path):
     r = RANGES["linux"]
     s0 = r.slots[0]

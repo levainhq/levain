@@ -25,7 +25,7 @@ import stat
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator, Mapping, Optional, Tuple
+from typing import Callable, Iterator, Mapping, NoReturn, Optional, Tuple
 
 from levain.contracts import canon
 from levain.firing.hands import OPERATOR_RE, HostOS
@@ -40,6 +40,9 @@ KIND_RE = re.compile(r"[a-z][a-z0-9-]{0,23}/[1-9][0-9]{0,2}")
 #: The parsers' bound on one record's identity text (an unknown kind's identity is kept, never interpreted).
 MAX_IDENTITY = 1024
 MAX_MANAGED = 4096
+#: The byte cap on reading a journal or an install-shape, the one value both reads pass (the same size as the runtime
+#: helper's default store record cap): larger refuses ``record-too-large`` before it is read whole.
+MAX_RECORD_BYTES = 1 << 20
 _PYCACHE = "__pycache__"
 
 
@@ -51,30 +54,42 @@ def new_txn() -> str:
 # --- the generation id (§1.1) ------------------------------------------------------------------------------------
 
 
+def _walk_error(e: OSError) -> NoReturn:
+    raise Refused("bad-source", f"cannot read {e.filename} ({e.strerror or e})")
+
+
 def _entries(top: Path, prefix: str) -> Iterator[Tuple[str, str, int, str]]:
-    """``(type, relpath, x, sha256)`` for ``top`` and every entry below it, ``__pycache__`` dropped. A link or any
-    other file type refuses ``bad-source``: the id is taken over a tree of plain files and directories only."""
-    st = os.lstat(top)
+    """``(type, relpath, x, sha256)`` for ``top`` and every entry below it. Every entry NAMED ``__pycache__`` (a
+    directory, a file or a link) is dropped: the one rule staging's ``find -name __pycache__`` applies, so the staged
+    copy and the source hash alike. A link or any other file type refuses ``bad-source``, as does anything that cannot
+    be read: the id is taken over a tree of plain files and directories only."""
+    try:
+        st = os.lstat(top)
+    except OSError as e:
+        _walk_error(e)
     if not stat.S_ISDIR(st.st_mode):
         raise Refused("bad-source", f"{top} is not a real directory")
     yield ("d", prefix, 0, "")
-    for dirpath, dirnames, filenames in os.walk(top):
+    for dirpath, dirnames, filenames in os.walk(top, onerror=_walk_error):
         dirnames[:] = sorted(d for d in dirnames if d != _PYCACHE)
         rel_dir = os.path.relpath(dirpath, top)
-        for name in dirnames + sorted(filenames):
+        for name in dirnames + sorted(f for f in filenames if f != _PYCACHE):
             p = os.path.join(dirpath, name)
             rel = prefix + "/" + (name if rel_dir == "." else f"{rel_dir}/{name}")
-            st = os.lstat(p)
-            if stat.S_ISDIR(st.st_mode):
-                yield ("d", rel, 0, "")
-            elif stat.S_ISREG(st.st_mode):
-                h = hashlib.sha256()
-                with open(p, "rb") as fh:
-                    for chunk in iter(lambda: fh.read(1 << 16), b""):
-                        h.update(chunk)
-                yield ("f", rel, 1 if st.st_mode & 0o111 else 0, h.hexdigest())
-            else:
-                raise Refused("bad-source", f"{p} is not a plain file or directory")
+            try:
+                st = os.lstat(p)
+                if stat.S_ISDIR(st.st_mode):
+                    yield ("d", rel, 0, "")
+                elif stat.S_ISREG(st.st_mode):
+                    h = hashlib.sha256()
+                    with open(p, "rb") as fh:
+                        for chunk in iter(lambda: fh.read(1 << 16), b""):
+                            h.update(chunk)
+                    yield ("f", rel, 1 if st.st_mode & 0o111 else 0, h.hexdigest())
+                else:
+                    raise Refused("bad-source", f"{p} is not a plain file or directory")
+            except OSError as e:
+                _walk_error(e)
 
 
 def generation_id(levain_dir: Path, h11_dir: Path) -> str:

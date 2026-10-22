@@ -13,6 +13,9 @@ Two tests, each with every sub-case the design names:
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -20,9 +23,10 @@ import pytest
 from levain.slot import Refused
 from levain.slot import generation as G
 from levain.slot import install_helper as IH
-from levain.slot import root_tree
+from levain.slot import intent as I
+from levain.slot import root_tree, units
 from levain.slot.grammar import parse_install_argv
-from levain.slot.ids import RANGES, SHARED_GROUPS
+from levain.slot.ids import RANGES, SHARED_GROUPS, loopback_alias
 from levain.slot.intent import Intent, parse_intent, intent_text
 
 OP, OP_UID = "phill", 501
@@ -257,7 +261,318 @@ def test_repair_completion_is_the_txn(tmp_path: Path) -> None:
     with pytest.raises(Refused) as s_e:
         IH.plan_setup(parse_install_argv(["setup", "--slots", "1", "--verifier-slots", "1", "--operator", OP]), rjf)
     assert str(r_e.value) == str(s_e.value) == "install-interrupted: replenish"
-    # ...while an unfinished one (txn differs) is resumed at its own txn
-    f = facts_with(TXN_B)
+    # ...while an unfinished one (txn differs) is resumed at its own txn. U13: its journal names no generation yet
+    # (killed before R3), so --source may still establish one; a journaled generation would bind it (see below)
+    j = Intent("repair", OP, txn=TXN_B, generation=None, groups={}, managed=())
+    f, _ = _pre_change(tmp_path / "u", intent=parse_intent(intent_text(j).encode(), HOST), shape=shape)
     rplan = _plan(f, rf)
     assert rplan.intent.txn == TXN_B and rplan.steps[0].why.startswith("journal what this repair")
+
+
+# --- L3 r1 fix round (HEAD 1022-12 rulings U13-U18, triage R-a..R-k) ------------------------------------------------
+# A crash after step k is the journal the plan's OWN journal step bodies 0..k leave (the install helper's plan is data;
+# its crash state is the journal plus what the earlier steps made), so each crash point below runs those bodies with the
+# write captured and re-plans on the journal they left. No timer, no hand-built journal.
+
+
+def _crash_after(plan, k: int, monkeypatch) -> Intent | None:
+    written: list[str] = []
+
+    def capture(path, text):
+        written.append(text)
+        return True, ""
+
+    with monkeypatch.context() as m:
+        m.setattr(I, "write_intent_atomically", capture)
+        m.setattr(IH, "write_intent_atomically", capture)
+        for s in plan.steps[:k + 1]:
+            if s.why.startswith("journal "):
+                assert s.call() == (True, "")
+    return parse_intent(written[-1].encode(), HOST) if written else None
+
+
+def _step(plan, prefix: str) -> int:
+    return _first([s.why for s in plan.steps], lambda w: w.startswith(prefix))
+
+
+def _shape(gen: str, txn: str = TXN_A, *, levain: str = "0.9.0", h11: str = "0.16.0", managed=()) -> G.InstallShape:
+    return G.InstallShape(gen, levain, h11, txn, {}, tuple(managed))
+
+
+def _other_package(tmp: Path) -> tuple[Path, Path]:
+    lv, h11 = _package(tmp)
+    (lv / "slot" / "changed.py").write_text("X = 1\n")
+    return lv, h11
+
+
+def _written_record(plan, monkeypatch) -> G.InstallShape:
+    got: list[str] = []
+    with monkeypatch.context() as m:
+        m.setattr(G, "write_record_durably", lambda p, t, **kw: (got.append(t), (True, ""))[1])
+        assert plan.steps[_step(plan, "write the install record")].call() == (True, "")
+    return G.parse_shape(got[-1].encode())
+
+
+def test_resumed_repair_target_is_the_journals(tmp_path: Path, monkeypatch) -> None:
+    """U13 (codex HIGH 1, 2): an unfinished repair journal fixes the target; never the old shape, never a new source."""
+    gen_a = "gen-" + "a" * 16
+    facts, rf = _pre_change(tmp_path / "a", shape=_shape(gen_a))
+    rf = replace(rf, current=gen_a, legacy=False)
+    plan_b = _plan(facts, rf)                                                 # A -> B
+    gen_b = plan_b.generation
+    assert gen_b != gen_a
+
+    # (1) killed after the first journal (generation None): a bare repair must not fall back to A and commit it
+    j0 = _crash_after(plan_b, 0, monkeypatch)
+    assert j0 is not None and j0.generation is None and j0.txn == plan_b.intent.txn
+    f0 = replace(facts, intent=j0)
+    with pytest.raises(Refused) as e:
+        _plan(f0, replace(rf, source=None, h11=None), argv=("repair",))
+    assert e.value.name == "source-required:none"
+
+    # (2) killed after the R3 journal (generation B): a retry with another package C is refused, B stays the target
+    j3 = _crash_after(plan_b, _step(plan_b, "journal the generation"), monkeypatch)
+    assert j3.generation == gen_b and j3.txn == plan_b.intent.txn
+    f3 = replace(facts, intent=j3)
+    lv_c, h11_c = _other_package(tmp_path / "c")
+    with pytest.raises(Refused) as e:
+        _plan(f3, replace(rf, source=lv_c, h11=h11_c))
+    assert e.value.name == f"source-mismatch:{gen_b}"
+
+    # (3) the same package resumes the same txn and the same target
+    again = _plan(f3, rf)
+    assert (again.generation, again.intent.txn) == (gen_b, plan_b.intent.txn)
+    # ... and a journal that has no generation yet takes the supplied package's (only --source may establish it)
+    est = _plan(f0, replace(rf, source=lv_c, h11=h11_c))
+    assert est.intent.txn == plan_b.intent.txn and est.generation == G.generation_id(lv_c, h11_c)
+
+    # (4) class check: a FINISHED journal (its txn is the record's completed_txn) never binds a fresh repair
+    done = replace(facts, intent=j3, install_shape=_shape(gen_b, j3.txn))
+    fresh = _plan(done, replace(rf, current=gen_b, source=lv_c, h11=h11_c))
+    assert fresh.generation == G.generation_id(lv_c, h11_c) and fresh.intent.txn != j3.txn
+    assert fresh.steps[0].why.startswith("remove the finished repair journal")
+
+
+def _gen_tree(tmp: Path, src_lv: Path, src_h11: Path, gen: str, monkeypatch) -> Path:
+    tree = tmp / "tree"
+    (tree / gen).mkdir(parents=True)
+    shutil.copytree(src_lv, tree / gen / "levain")
+    shutil.copytree(src_h11, tree / gen / "h11")
+    os.symlink(gen, tree / root_tree.CURRENT)
+    monkeypatch.setitem(root_tree.IMPORT_TREE, HOST, tree)
+    return tree
+
+
+def test_bare_repair_reads_versions_from_the_target_tree(tmp_path: Path, monkeypatch) -> None:
+    """U17 (complement MED 1): the record's versions are the target generation's own, read as text from its tree."""
+    # a pre-record host (no install-shape) killed after the flip: journal names B, current is B
+    facts, rf = _pre_change(tmp_path / "p")
+    plan = _plan(facts, rf)
+    gen_b = plan.generation
+    j = _crash_after(plan, _step(plan, "flip "), monkeypatch)
+    assert j.generation == gen_b
+    _gen_tree(tmp_path / "p", rf.source, rf.h11, gen_b, monkeypatch)
+    bare = replace(rf, current=gen_b, legacy=False, source=None, h11=None)
+    facts_j, _ = _pre_change(tmp_path / "pj", intent=j)                     # the journaled groups present at their gids
+    resumed = _plan(facts_j, bare, argv=("repair",))                        # 2a122d24: AssertionError (no shape)
+    rec = _written_record(resumed, monkeypatch)
+    assert (rec.generation, rec.levain, rec.h11) == (gen_b, "1.0.0", "0.16.0")
+    assert rec.completed_txn == j.txn
+    # an older shape (A, older versions) whose flip to B landed: the record carries B's versions, never A's
+    facts_a, _ = _pre_change(tmp_path / "q", shape=_shape("gen-" + "a" * 16, levain="0.9.0", h11="0.16.0"),
+                             intent=j)
+    rec = _written_record(_plan(facts_a, bare, argv=("repair",)), monkeypatch)
+    assert (rec.generation, rec.levain, rec.h11) == (gen_b, "1.0.0", "0.16.0")
+
+
+class _Proc:
+    def __init__(self, rc: int = 0, out: str = "") -> None:
+        self.returncode, self.stdout, self.stderr = rc, out, ""
+
+
+def test_stop_steps_verify_the_end_state(monkeypatch) -> None:
+    """U18 (codex MED 5 = complement MED 2): a service with no unit is stopped already; the stop's exit status is never
+    the verdict, the end state is."""
+    calls: list[list[str]] = []
+    # systemd's answers: a unit with no file reads ActiveState=inactive; `stop` exits 5 for it
+    state = {"active": "inactive", "after": "inactive", "stop_rc": 5, "print_rc": 113}
+
+    def run(argv, *a, **kw):
+        argv = list(argv)
+        calls.append(argv)
+        if argv[1:4] == ["show", "-p", "ActiveState"]:
+            return _Proc(0, state["active"])
+        if argv[1] == "stop":
+            state["active"] = state["after"]
+            return _Proc(state["stop_rc"])
+        if argv[1] == "print":
+            return _Proc(state["print_rc"])
+        return _Proc(0)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    svc = units.services_for("linux")[0]
+    noted: dict[str, int] = {}
+    step, = IH._stop_steps("linux", [svc], noted, lambda: 1234.9)
+    assert step.call() == (True, "")                                 # no unit: stop exits 5 on 2a122d24, aborting
+    assert noted == {svc.name: 1234} and not [c for c in calls if c[1] == "stop"]
+    # running (also: a unit whose file was deleted after a daemon-reload, LoadState not-found): stopped, and a
+    # non-zero stop status is not the verdict; the state after it is
+    state.update(active="active", after="failed", stop_rc=1)
+    assert step.call() == (True, "") and [c for c in calls if c[1] == "stop"]
+    state.update(active="active", after="active", stop_rc=0)
+    ok, why = step.call()
+    assert not ok and "active" in why                                # still running after the stop: the step fails
+    # macOS: a job launchd does not know is stopped already; nothing is booted out
+    calls.clear()
+    dsvc = units.services_for("darwin")[0]
+    dstep, = IH._stop_steps("darwin", [dsvc], noted, lambda: 7.0)
+    assert dstep.call() == (True, "") and not [c for c in calls if c[1] == "bootout"]
+
+
+def test_every_mutating_verb_checks_the_records(tmp_path: Path) -> None:
+    """U15 (codex HIGH 4): undo and replenish refuse a well-formed record naming a kind this code cannot remove, or an
+    out-of-bound record, before step one, as repair does."""
+    undo = parse_install_argv(["undo"])
+    replenish = parse_install_argv(["replenish"])
+    for recs, name in (([("widget/3", G.Opaque('"x"'))], "downgrade-unsupported:widget/3"),
+                       ([("group/1", ("admin", 80))], "bad-record")):
+        f, _ = _pre_change(tmp_path / name.replace(":", "-").replace("/", ""), shape=_shape("gen-" + "0" * 16,
+                                                                                            managed=recs))
+        with pytest.raises(Refused) as e:
+            IH.plan_undo(undo, f, accounts=SLOT_UIDS, shared_groups=OLD_GROUPS)
+        assert e.value.name == name
+        with pytest.raises(Refused) as e:
+            IH.plan_replenish(replenish, f, slots=1, verifier_slots=1, live={"egress": (0,), "none": (0,)},
+                              accounts=SLOT_UIDS)
+        assert e.value.name == name
+    # an unfinished repair journal naming a kind this code lacks: undo refuses it too
+    j = Intent("repair", OP, txn=TXN_B, managed=(("widget/3", ("anything",)),))
+    f, _ = _pre_change(tmp_path / "j", intent=parse_intent(intent_text(j).encode(), HOST))
+    with pytest.raises(Refused) as e:
+        IH.plan_undo(undo, f, accounts=SLOT_UIDS, shared_groups=OLD_GROUPS)
+    assert e.value.name == "downgrade-unsupported:widget/3"
+
+
+def test_replenish_extends_the_install_shape(tmp_path: Path, monkeypatch) -> None:
+    """U16 (codex MED 7): what replenish made is in install-shape.managed before its journal goes, the rest kept."""
+    shared = list(RANGES[HOST].shared)
+    groups = {g: shared[i] for i, g in enumerate(SHARED_GROUPS)}
+    old = _shape("gen-" + "c" * 16, TXN_A, managed=[("group/1", (g, i)) for g, i in groups.items()])
+    old = replace(old, started_after={"keys": 5})
+    f, _ = _pre_change(tmp_path, shape=old)
+    plan = IH.plan_replenish(parse_install_argv(["replenish"]), f, slots=2, verifier_slots=1,
+                             live={"egress": (0,), "none": (0,)}, accounts=SLOT_UIDS)
+    whys = [s.why for s in plan.steps]
+    ext = _first(whys, lambda w: w.startswith("extend the install record"))
+    assert max(_all(whys, lambda w: "under the pool lock" in w)) < ext == len(whys) - 2
+    assert whys[-1].startswith("remove the intent journal")
+    rec = _written_record_at(plan, ext, monkeypatch)
+    assert (rec.generation, rec.levain, rec.h11, rec.completed_txn, dict(rec.started_after)) == \
+           (old.generation, old.levain, old.h11, TXN_A, {"keys": 5})
+    made = set(rec.managed) - set(old.managed)
+    assert set(old.managed) <= set(rec.managed)
+    new = [s for s in plan.allocation.slots]
+    assert {("account/1", (n, u)) for n, u in plan.allocation.ids.items()} <= made
+    assert {("pf-alias/1", loopback_alias(s)) for s in new if s.slot_class == "egress"} <= made
+    assert all(k in ("account/1", "member/1", "pf-alias/1") for k, _ in made)
+    for k, i in made:
+        if k == "member/1":
+            assert groups[i[1]] == i[2]
+    G.check_managed(HOST, rec.managed, operator=OP)
+    # no shape (a pre-record host): nothing to extend; repair writes the record
+    f2, _ = _pre_change(tmp_path / "n")
+    p2 = IH.plan_replenish(parse_install_argv(["replenish"]), f2, slots=2, verifier_slots=1,
+                           live={"egress": (0,), "none": (0,)}, accounts=SLOT_UIDS)
+    assert not [s for s in p2.steps if s.why.startswith("extend the install record")]
+
+
+def _written_record_at(plan, i: int, monkeypatch) -> G.InstallShape:
+    got: list[str] = []
+    with monkeypatch.context() as m:
+        m.setattr(G, "write_record_durably", lambda p, t, **kw: (got.append(t), (True, ""))[1])
+        assert plan.steps[i].call() == (True, "")
+    return G.parse_shape(got[-1].encode())
+
+
+def test_replenish_mints_its_own_txn_over_a_stale_setup_journal(tmp_path: Path) -> None:
+    """R-i (complement LOW 5): a txn is reused only from a journal of the verb being planned."""
+    stale = Intent("setup", OP, {}, {}, "c" * 32)
+    f, _ = _pre_change(tmp_path, intent=stale)
+    plan = IH.plan_replenish(parse_install_argv(["replenish"]), f, slots=1, verifier_slots=1,
+                             live={"egress": (0,), "none": (0,)}, accounts=SLOT_UIDS)
+    assert G.TXN_RE.fullmatch(plan.intent.txn) and plan.intent.txn != "c" * 32
+
+
+def test_current_is_validated_at_gather(tmp_path: Path) -> None:
+    """R-g (codex MED 6): ``current`` and ``current.new`` are read once, at gather, and must be relative links to a
+    generation; anything else refuses ``bad-root`` before any act (it was read as absent)."""
+    def tree(name: str) -> Path:
+        t = tmp_path / name
+        t.mkdir()
+        return t
+
+    t = tree("none")
+    assert root_tree.read_current(t) is None
+    t = tree("ok")
+    os.symlink("gen-" + "1" * 16, t / "current")
+    os.symlink("gen-" + "2" * 16, t / "current.new")                 # a stray from a flip killed mid-way: fine
+    assert root_tree.read_current(t) == "gen-" + "1" * 16
+    for name, make in (("file", lambda t: (t / "current").write_text("")),
+                       ("dir", lambda t: (t / "current").mkdir()),
+                       ("up", lambda t: os.symlink("../etc", t / "current")),
+                       ("abs", lambda t: os.symlink(str(t / ("gen-" + "1" * 16)), t / "current")),
+                       ("newfile", lambda t: (os.symlink("gen-" + "1" * 16, t / "current"),
+                                              (t / "current.new").write_text("")))):
+        t = tree(name)
+        make(t)
+        with pytest.raises(Refused) as e:
+            root_tree.read_current(t)
+        assert e.value.name == "bad-root", name
+
+
+def test_journal_read_is_bounded(tmp_path: Path) -> None:
+    """R-h (codex MED 9): a journal larger than the one named record cap refuses ``record-too-large`` unread."""
+    p = tmp_path / "install-intent"
+    p.write_bytes(b" " * (G.MAX_RECORD_BYTES + 1))
+    with pytest.raises(Refused) as e:
+        I.read_intent(HOST, path=p)
+    assert e.value.name == "record-too-large"
+    j = Intent("repair", OP, txn=TXN_B)
+    p.write_text(intent_text(j))
+    assert I.read_intent(HOST, path=p) == j
+
+
+def test_generation_id_walk_errors_and_pycache_files(tmp_path: Path) -> None:
+    """R-j (complement LOW 6, codex LOW 11): an unreadable subdir refuses ``bad-source``; ANY entry named
+    ``__pycache__`` is dropped, the rule staging's ``find -name __pycache__`` applies."""
+    lv, h11 = _package(tmp_path)
+    base = G.generation_id(lv, h11)
+    (lv / "slot" / "__pycache__").write_bytes(b"a plain file")
+    assert G.generation_id(lv, h11) == base
+    if os.geteuid() != 0:
+        sub = lv / "sealed"
+        sub.mkdir()
+        (sub / "m.py").write_text("")
+        os.chmod(sub, 0)
+        try:
+            with pytest.raises(Refused) as e:
+                G.generation_id(lv, h11)
+            assert e.value.name == "bad-source"
+        finally:
+            os.chmod(sub, 0o755)
+
+
+def test_missing_or_unreadable_source_is_bad_source(tmp_path: Path) -> None:
+    """R-k (codex LOW 10): a missing package, or a file that cannot be read, is ``bad-source``, never a raw OSError."""
+    lv, h11 = _package(tmp_path)
+    with pytest.raises(Refused) as e:
+        G.generation_id(tmp_path / "missing" / "levain", h11)
+    assert e.value.name == "bad-source"
+    if os.geteuid() != 0:
+        os.chmod(lv / "slot" / "__init__.py", 0)
+        try:
+            with pytest.raises(Refused) as e:
+                G.generation_id(lv, h11)
+            assert e.value.name == "bad-source"
+        finally:
+            os.chmod(lv / "slot" / "__init__.py", 0o644)

@@ -756,9 +756,9 @@ class Store:
         finally:
             os.close(fd)
 
-    def read(self, parts: Sequence[str], name: str, *, trusted: bool = True) -> Optional[bytes]:
+    def read(self, parts: Sequence[str], name: str, *, trusted: bool = True, cap: int = _RECORD_CAP) -> Optional[bytes]:
         with self.dir(*parts, trusted=trusted) as fd:
-            return read_at(fd, name, "/".join((str(self.path), *parts, name)))
+            return read_at(fd, name, "/".join((str(self.path), *parts, name)), cap=cap)
 
     def replace(self, parts: Sequence[str], name: str, data: bytes, *, mode: int) -> None:
         with self.dir(*parts) as fd:

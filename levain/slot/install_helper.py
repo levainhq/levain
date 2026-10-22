@@ -624,6 +624,16 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
                               services=[s.name for s in services], slots=alloc.slots, apparmor=restricted_aa)
     noted: dict[str, int] = {}
     shape_path = install_shape_path(host)
+    # U14 (HEAD 1022-12), option (b): what `current` names, so a re-run whose target is already current drops its
+    # partial copy instead of replacing the generation live services import from. A RESUMED setup that changes
+    # generation may have started services on the old code, whose unit text need not change: setup starts services
+    # only after its flip, so that is when `current` names another generation, or names none while the legacy tree
+    # is there (a levain-intent/1 setup ran from it). Then every service this code knows is stopped before the flip
+    # (U18's stop: one with no unit is already stopped), and the start steps bring them up on the new generation.
+    tree = root_tree.current_path(host).parent
+    current = root_tree.read_current(tree)
+    ran_old = current != target if current is not None else os.path.isdir(tree / "levain")
+    restart = _stop_steps(host, units.services_for(host), {}, time.time) if journal is not None and ran_old else []
 
     def note() -> tuple[bool, str]:
         now = int(time.time())
@@ -649,7 +659,8 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         *base_routes_steps(host),
         *roots_steps(host, roots),
         *pool_config_steps(host, cmd.slots, cmd.verifier_slots),
-        *root_tree.tree_steps(host, package, h11_dir=h11_dir, generation=target),
+        *restart,
+        *root_tree.tree_steps(host, package, h11_dir=h11_dir, generation=target, current=current),
         *confinement,
         # Before the first start: each service's started_after threshold (row 33 §2.5).
         Step("note each service's started_after threshold (before the first start)", call=note),
@@ -765,6 +776,7 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         # reports are set aside and the journal's own names, at their journaled ids, are undone.
         operator = abandoned.operator
         accounts, shared_groups = {}, ()
+    check_records(facts, operator)
     host = facts.host
     check_account_ids(host, accounts)
     accounts = dict(accounts)
@@ -840,6 +852,7 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
     host = facts.host
     rec = facts.operator_record
     assert rec is not None
+    check_records(facts, str(rec.get("name")))
     accounts = dict(accounts or {})
     check_account_ids(host, accounts)
     check_capacity(host, slots, verifier_slots, facts.retired)
@@ -886,7 +899,8 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
         # without its pf rules; every egress slot's alias (§24) added where lo0 lacks it.
         confinement = [*pf.alias_steps(in_service + alloc.slots),
                        *pf.load_steps(in_service + alloc.slots, {**accounts, **alloc.ids})]
-    txn = journal.txn if journal is not None and journal.txn else gen_mod.new_txn()
+    # R-i: a txn is resumed only from this verb's own journal (a stale setup journal's is setup's, never ours).
+    txn = journal.txn if journal is not None and journal.verb == "replenish" and journal.txn else gen_mod.new_txn()
     intent = Intent("replenish", str(rec.get("name")), dict(alloc.ids), {}, txn)
     steps = [
         # FIRST (§25): the slots this run makes, so a run that dies part-way resumes them, never spends more.
@@ -897,6 +911,7 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
         *confinement,
         # Only now may prepare take them: a new slot is reusable once its confinement is loaded (§3.5 Pool).
         *slot_state_steps(host, alloc.slots),
+        *_extend_shape_steps(host, facts.install_shape, made, alloc.slots),
         intent_remove_step(host),   # LAST, after the confinement steps
     ]
     check_tools(facts, steps, verb="replenish")
@@ -941,19 +956,60 @@ def desired_managed(host: HostOS, *, accounts: Mapping[str, int], shared: Mappin
     out: set = {("unit/1", s) for s in services}
     out |= {("sudoers/1", p.name) for p in sudoers_paths()}
     out |= {("group/1", (g, gid)) for g, gid in shared.items()}
-    out |= {("account/1", (a.name, a.uid)) for a in accts}
-    out |= {("member/1", (a, g, shared[g])) for a, g in membership_pairs(accts, operator)}
+    out |= _slot_managed(host, accts, shared, operator, slots)
     out |= {("entry/1", e) for e in root_tree.ENTRY_MODULES}
-    slots = tuple(slots)
     if host == "darwin":
-        out |= {("pf-alias/1", loopback_alias(s)) for s in slots if s.slot_class == "egress"}
         out |= {("pf-anchor/1", (pf.ANCHOR, str(pf.ANCHOR_FILE))), ("pf-enable/1", str(pf.PF_TOKEN))}
     else:
         out |= {("bwrap-copy/1", (str(bwrap.LEVAIN_BWRAP), str(bwrap.BWRAP_DIGEST)))}
-        out |= {("netns/1", s.netns) for s in slots}
         if apparmor:
             out.add(("apparmor/1", bwrap.APPARMOR_PROFILE_NAME))
     return frozenset(out)
+
+
+def _slot_managed(host: HostOS, accts: Iterable[Account], shared: Mapping[str, int], operator: str | None,
+                  slots: Iterable[SlotId]) -> set:
+    """The records that come with accounts and slots: each account, each of its memberships (and the operator's, when
+    named) at the group's gid, and per slot its lo0 alias (macOS egress) or its netns (Linux). ONE derivation for
+    setup's and repair's desired set and for what replenish adds (U16)."""
+    accts = tuple(accts)
+    out: set = {("account/1", (a.name, a.uid)) for a in accts}
+    out |= {("member/1", (a, g, shared[g])) for a, g in membership_pairs(accts, operator)}
+    if host == "darwin":
+        out |= {("pf-alias/1", loopback_alias(s)) for s in slots if s.slot_class == "egress"}
+    else:
+        out |= {("netns/1", s.netns) for s in slots}
+    return out
+
+
+def _extend_shape_steps(host: HostOS, shape: gen_mod.InstallShape | None, made: Sequence[Account],
+                        slots: Sequence[SlotId]) -> list[Step]:
+    """U16 (HEAD 1022-12): replenish's records added to ``install-shape.managed``, durably, before its journal goes;
+    the generation, versions, ``completed_txn`` and ``started_after`` kept, nothing dropped (a union, so a resumed
+    replenish writes the same record). No record (a pre-row-33 install): nothing to extend; repair writes it."""
+    if shape is None:
+        return []
+    gids = {i[0]: i[1] for k, i in shape.managed if k == "group/1"}
+    lacking = sorted({g for _, g in membership_pairs(made, None)} - set(gids))
+    if lacking:
+        raise Refused("install-shape-malformed", f"it records no group/1 for {', '.join(lacking)}")
+    grown = replace(shape, managed=_shape_of(set(shape.managed) | _slot_managed(host, made, gids, None, slots)))
+    path, text = install_shape_path(host), gen_mod.shape_text(grown)
+    return [Step(f"extend the install record {path} with what this replenish made (its generation, versions and "
+                 "completed_txn kept)", call=lambda: gen_mod.write_record_durably(path, text))]
+
+
+def check_records(facts: HostFacts, operator: str | None) -> None:
+    """U15 (HEAD 1022-12), the one preflight every mutating verb (repair, replenish, undo) runs before step one: every
+    record ``install-shape`` holds, and every write-ahead record of an UNFINISHED journal (a finished one's txn is the
+    record's ``completed_txn``: what it named is settled in the record), is of a kind this code can remove and within
+    its bound, else ``downgrade-unsupported:<kind>`` / ``bad-record`` (§1.1 rules c, e). The operator then runs the
+    newer code's verb. A record that does not PARSE never reaches here: undo reads it as absent, the rest refuse it."""
+    shape, journal = facts.install_shape, facts.intent
+    recs = sorted(shape.managed, key=repr) if shape is not None else []
+    if journal is not None and not (shape is not None and journal.txn == shape.completed_txn):
+        recs += sorted(journal.managed, key=repr)
+    gen_mod.check_managed(facts.host, recs, operator=operator)
 
 
 def _shape_of(records: Iterable) -> tuple:
@@ -968,16 +1024,20 @@ def _journal_step(host: HostOS, why: str, intent: Intent) -> Step:
 def _stop_steps(host: HostOS, services: Sequence[units.Service], noted: dict[str, int],
                 clock: Callable[[], float]) -> list[Step]:
     """§2.3 R5: stop ``services`` in reverse start order, noting ``floor(now)`` for each just BEFORE its stop (R14
-    writes it to ``started_after``)."""
+    writes it to ``started_after``). U18: the verdict is the END STATE, never the stop's exit status, and only a
+    service that runs is stopped: macOS boots out only a job launchd holds, then checks it is gone; Linux reads
+    ``ActiveState`` (``inactive`` or ``failed`` is stopped, which is also what a unit systemd has no file for reads,
+    the damage a repair is there to fix), else stops it and reads it again. Never ``LoadState`` alone: after a
+    daemon-reload a unit whose file was deleted reads ``not-found`` while its process still runs."""
     def note_then(name: str, act: Callable[[], tuple[bool, str]]) -> Callable[[], tuple[bool, str]]:
         def go() -> tuple[bool, str]:
             noted[name] = int(clock())
             return act()
         return go
 
-    def run_argv(argv: tuple[str, ...]) -> tuple[bool, str]:
+    def out(argv: tuple[str, ...]) -> str:
         r = subprocess.run(list(argv), capture_output=True, text=True, cwd="/", env=child_env())
-        return r.returncode == 0, (r.stderr or r.stdout).strip()
+        return (r.stdout or "").strip()
 
     steps: list[Step] = []
     for s in reversed([x for x in units.services_for(host) if x in services]):
@@ -985,13 +1045,25 @@ def _stop_steps(host: HostOS, services: Sequence[units.Service], noted: dict[str
             label = units.launchd_label(s)
 
             def bootout(lb: str = label) -> tuple[bool, str]:
-                run_argv(("/bin/launchctl", "bootout", f"system/{lb}"))   # not loaded answers non-zero: checked next
+                if units._launchd_job_absent(lb)[0]:
+                    return True, ""
+                out(("/bin/launchctl", "bootout", f"system/{lb}"))   # its status is not the verdict: checked next
                 return units._launchd_job_absent(lb)
 
             steps.append(Step(f"stop {label}", call=note_then(s.name, bootout)))
         else:
-            name = units.systemd_name(s)
-            steps.append(Step(f"stop {name}", call=note_then(s.name, lambda n=name: run_argv((_abs("systemctl"), "stop", n)))))
+            name, systemctl = units.systemd_name(s), _abs("systemctl")
+
+            def stop(n: str = name, sc: str = systemctl) -> tuple[bool, str]:
+                if out((sc, "show", "-p", "ActiveState", "--value", n)) in ("inactive", "failed"):
+                    return True, ""
+                out((sc, "stop", n))                                  # its status is not the verdict: checked next
+                state = out((sc, "show", "-p", "ActiveState", "--value", n))
+                if state not in ("inactive", "failed"):
+                    return False, f"{n} is {state or 'in an unknown state'} after systemctl stop"
+                return True, ""
+
+            steps.append(Step(f"stop {name}", call=note_then(s.name, stop)))
     return steps
 
 
@@ -1049,29 +1121,40 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     operator = str(rec["name"])
     previous = frozenset(shape.managed) if shape is not None else frozenset()
     journaled = frozenset(journal.managed) if journal is not None else frozenset()
-    gen_mod.check_managed(host, [*sorted(previous, key=repr), *sorted(journaled, key=repr)], operator=operator)
+    check_records(facts, operator)                                     # U15: the preflight every mutating verb runs
     if journal is not None:
         _, foreign = _journal_presence(facts)
         if foreign:
             raise Refused("account-exists", ", ".join(foreign))
     run_txn = journal.txn if journal is not None and journal.txn else txn()
 
-    # The target generation (R2): the --source package's id, else the journal's or the record's.
+    # The target generation (R2). U13: an UNFINISHED repair's target is its journal's. Once journaled (R3) it is fixed:
+    # a --source must hash to it. Before R3 only a --source may establish it, never the record or current (that would
+    # finish the interrupted txn on the generation it was moving away from). With no journal: the --source package's
+    # id, else the record's generation, which must be current.
+    pinned = journal.generation if journal is not None else None
     if rf.source is not None:
         if rf.h11 is None:
             raise Refused("bad-source", "no h11 beside the levain package")
         root_tree.check_sources(rf.source, rf.h11)
         target = gen_mod.generation_id(rf.source, rf.h11)
+        if pinned is not None and target != pinned:
+            raise Refused(f"source-mismatch:{pinned}", f"the interrupted repair is moving to {pinned}; --source "
+                                                      f"{rf.source} is {target}. Re-run with that package")
         versions = (gen_mod.read_version_text(rf.source / "__init__.py"), root_tree.h11_floor(rf.h11))
         package = rf.source
     else:
-        target = (journal.generation if journal is not None and journal.generation else
-                  shape.generation if shape is not None else None)
+        if journal is not None:
+            target = pinned
+        else:
+            target = shape.generation if shape is not None else None
         if target is None or target != rf.current:
             raise Refused(f"source-required:{target or 'none'}", "this host needs repair --source <levain package>")
-        assert shape is not None
-        versions = (shape.levain, shape.h11)
-        package = root_tree.current_path(host) / "levain"
+        # U17: the record's versions are the TARGET generation's own, read as text from its tree (never an older
+        # record's: after a crash past the flip the record may still describe the generation it replaced).
+        gen_dir = root_tree.current_path(host).parent / target
+        versions = (gen_mod.read_version_text(gen_dir / "levain" / "__init__.py"), root_tree.h11_floor(gen_dir / "h11"))
+        package = gen_dir / "levain"
     gen_change = shape is None or shape.generation != target or rf.current != target
 
     # R4b: the shared groups, kept at the gids they hold (or were journaled at); only the missing ones allocated.
@@ -1410,8 +1493,17 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
         store = RH.Store(rs)
         try:
             orec = _operator_of(store)
-            raw_shape = store.read(("policy",), "install-shape") if orec is not None else None
-            shape = gen_mod.parse_shape(raw_shape) if raw_shape is not None else None
+            try:
+                raw_shape = (store.read(("policy",), "install-shape", cap=gen_mod.MAX_RECORD_BYTES)
+                             if orec is not None else None)
+                shape = gen_mod.parse_shape(raw_shape) if raw_shape is not None else None
+            except Refused as e:
+                # U15: undo is the recovery verb. A record whose CONTENT it cannot read (torn, oversized, a newer
+                # format) is read as absent, so undo plans what it plans on a pre-record host and removes the file;
+                # every other verb refuses. A link or non-file there is a trust fault (bad-root) and refuses undo too.
+                if cmd.verb != "undo" or e.name not in ("install-shape-malformed", "record-too-large"):
+                    raise
+                shape = None
             if cmd.verb in ("replenish", "repair") and orec is not None:
                 in_service = slots_in_service(store)
                 configured = {cls: tuple(sorted(i)) for cls, i in RH.configured_slots(store).items()}
@@ -1466,10 +1558,7 @@ def _repair_facts(cmd: InstallCommand, host: HostOS, d: Directory, accounts: Map
 
     groups = {g: i for g, i in d.groups.items() if GROUP_RE.fullmatch(g)}
     tree = root_tree.current_path(host).parent
-    try:
-        current: str | None = os.readlink(tree / root_tree.CURRENT)
-    except OSError:
-        current = None
+    current = root_tree.read_current(tree)
     source = h11 = None
     if cmd.source is not None:
         parent = Path(os.path.realpath(os.path.dirname(cmd.source)))

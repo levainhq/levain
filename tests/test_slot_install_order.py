@@ -415,6 +415,50 @@ def test_tree_links_refused_before_chown_and_renamed_into_place(host):
     assert set(again_rms) == {partial} and not [s for s in again if s.why.startswith("rename ")]
 
 
+@pytest.mark.parametrize("host", HOSTS)
+def test_resumed_setup_never_replaces_the_live_generation(host, tmp_path, monkeypatch):
+    """U14 (codex HIGH 3, complement MED 3), option (b): setup reads ``current``. A re-run whose target is already
+    current never removes the generation live services import from; a RESUMED setup that changes generation stops
+    every service this code knows before the flip, so none keeps running the old code beside the new record."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    monkeypatch.setitem(root_tree.IMPORT_TREE, host, tree)
+    stop_names = {f"stop {units.launchd_label(s) if host == 'darwin' else units.systemd_name(s)}"
+                  for s in units.services_for(host)}
+    first = _plan(host, 3, 2)
+    gen = first.generation
+    live = {**first.allocation.ids, **first.allocation.shared}
+    resumed = dict(existing_names=frozenset(live), used_ids=frozenset(live.values()), levain_live=live,
+                   intent=first.intent, host_ids=live)
+
+    def stops_and_flip(plan):
+        whys = [s.why for s in plan.steps]
+        return [i for i, w in enumerate(whys) if w in stop_names], whys.index(f"flip {tree}/current -> {gen}")
+
+    # the interrupted setup got as far as the flip: the re-run drops the partial and never rm -rf's the live gen
+    os.symlink(gen, tree / "current")
+    again = _plan(host, 3, 2, **resumed)
+    rms = [s.argv[-1] for s in again.steps if s.argv and s.argv[0].endswith("/rm")]
+    assert str(tree / gen) not in rms and not [s for s in again.steps if s.why.startswith("rename ")]
+    assert stops_and_flip(again)[0] == []                     # the same generation: nothing to stop
+    # current names another generation, or none beside the legacy tree (a levain-intent/1 setup ran from it): stop
+    os.unlink(tree / "current")
+    os.symlink("gen-" + "0" * 16, tree / "current")
+    moved = _plan(host, 3, 2, **resumed)
+    stops, flip = stops_and_flip(moved)
+    assert {moved.steps[i].why for i in stops} == stop_names and max(stops) < flip
+    # class check: a FRESH setup (no journal) stops nothing, whatever current names
+    assert stops_and_flip(_plan(host, 3, 2))[0] == []
+    os.unlink(tree / "current")
+    (tree / "levain").mkdir()
+    legacy = _plan(host, 3, 2, **resumed)
+    stops, flip = stops_and_flip(legacy)
+    assert {legacy.steps[i].why for i in stops} == stop_names and max(stops) < flip
+    # class check: no current and no legacy tree: setup never reached its flip, so nothing it started can run
+    (tree / "levain").rmdir()
+    assert stops_and_flip(_plan(host, 3, 2, **resumed))[0] == []
+
+
 def test_launchd_job_absent_reads_launchctl():
     class R:
         def __init__(self, rc):

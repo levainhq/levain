@@ -25,7 +25,7 @@ from typing import Callable, Iterator, Mapping
 from levain.contracts import canon
 from levain.firing.hands import OPERATOR_RE, HostOS, Step, _abs
 from levain.slot import Refused, write_all
-from levain.slot.generation import GEN_RE, TXN_RE, Record, managed_json, parse_managed
+from levain.slot.generation import GEN_RE, MAX_RECORD_BYTES, TXN_RE, Record, managed_json, parse_managed
 from levain.slot.ids import RANGES, RETIRED_IDS_PATH, in_own_range, is_levain_account
 
 INTENT_FORMAT = "levain-intent/2"
@@ -179,18 +179,25 @@ def parse_intent(data: bytes, host: HostOS) -> Intent:
 
 def read_intent(host: HostOS, *, path: Path | None = None) -> Intent | None:
     """The apply layer's read, under the lock: ``None`` when there is no journal. A link or a file
-    that is not regular is refused, as for the lock."""
+    that is not regular is refused, as for the lock; one larger than :data:`MAX_RECORD_BYTES` is refused
+    ``record-too-large`` without being read whole (by its size, then by a read of at most one byte more)."""
     path = Path(path or INTENT_PATH[host])
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except FileNotFoundError:
         return None
     except OSError as e:
         raise Refused("bad-root", f"{path}: {e.strerror}") from None
     with os.fdopen(fd, "rb") as fh:
-        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
             raise Refused("bad-root", f"{path} is not a regular file")
-        return parse_intent(fh.read(), host)
+        if st.st_size > MAX_RECORD_BYTES:
+            raise Refused("record-too-large", str(path))
+        data = fh.read(MAX_RECORD_BYTES + 1)
+        if len(data) > MAX_RECORD_BYTES:
+            raise Refused("record-too-large", str(path))
+        return parse_intent(data, host)
 
 
 # --- the journal steps -------------------------------------------------------------------------------

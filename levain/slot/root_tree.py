@@ -353,6 +353,30 @@ def _flip(tree: Path, target: str) -> tuple[bool, str]:
     return True, ""
 
 
+def read_current(tree: Path) -> str | None:
+    """What ``<tree>/current`` names, read once at gather (§2.3 R0), or None when it is absent (a pre-generation
+    install). ``current``, and a stray ``current.new`` when present (a flip killed between its symlink and its
+    rename), must each be a link to a generation id relative to ``tree`` (``gen-<16 hex>``); anything else, or a
+    read that fails other than by absence, refuses ``bad-root`` here, before any act."""
+    from levain.slot.generation import GEN_RE
+
+    out: str | None = None
+    for name in (CURRENT, f"{CURRENT}.new"):
+        p = tree / name
+        try:
+            st = os.lstat(p)
+            link = os.readlink(p) if stat.S_ISLNK(st.st_mode) else None
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            raise Refused("bad-root", f"cannot read {p} ({e.strerror or e})") from None
+        if link is None or not GEN_RE.fullmatch(link):
+            raise Refused("bad-root", f"{p} is not a link to a generation in {tree}")
+        if name == CURRENT:
+            out = link
+    return out
+
+
 def flip_step(host: HostOS, target: str) -> Step:
     tree = IMPORT_TREE[host]
     return Step(f"flip {current_path(host)} -> {target}", call=lambda: _flip(tree, target))
@@ -427,5 +451,5 @@ def tree_steps(host: HostOS, source: Path, *, h11_dir: Path | None = None, gener
 
 __all__ = ["CURRENT", "ENTRY_MODULES", "H11_MIN", "HELPER_MODULES", "PY_FLAGS", "ROOT_PYTHON", "STAGING",
            "VENDOR_PREFIX", "boot_path_code", "check_sources", "current_path", "dir_steps", "entry_steps",
-           "entry_text", "flip_step", "gc_step", "h11_floor", "h11_source", "helper_entry_text", "stage_steps",
+           "entry_text", "flip_step", "gc_step", "h11_floor", "h11_source", "helper_entry_text", "read_current", "stage_steps",
            "tree_steps"]
