@@ -18,19 +18,16 @@ from __future__ import annotations
 
 from typing import Iterable, Iterator
 
-#: The git tag the predicates and the collection rule were ported from, and the sha256 of each source file at it.
+#: The git tag the predicates and the collection rule were ported from.
 PORT_TAG = "v2.39.4"
-PORT_SOURCES_SHA256 = {
-    "utf8.c": "730310e6db97542d3236c25dd769f4282ae039f095a65a843075d786c44bd6e2",
-    "path.c": "3b0c0dee7b084b41fda6642035a0aa92d1e1a1da0d820273388fd247d9675cb2",
-    "fsck.c": "6236f625f903aae9b3768068e2c748e6fcdcc785eca30351e900ddd97f6edfb7",
-}
 
 #: Code points HFS+ ignores entirely (git's ``next_hfs_char``).
 _HFS_IGNORED = frozenset({0x200C, 0x200D, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
                           0x206A, 0x206B, 0x206C, 0x206D, 0x206E, 0x206F, 0xFEFF})
 #: The most octal digits a tree entry's mode may take here (git's own modes take 5 or 6).
 MODE_DIGITS_MAX = 7
+#: The hex lengths of the two object formats (sha1, sha256).
+_HEXLENS = (40, 64)
 _S_IFMT = 0o170000
 _S_IFLNK = 0o120000
 
@@ -95,10 +92,15 @@ def _is_hfs_dot(name: bytes, needle: bytes) -> bool:
     return not (c and c != 0x2F)
 
 
-def _is_ntfs_dot(name: bytes, needle: bytes, shortname_prefix: bytes) -> bool:
+def _is_ntfs_dot(name: bytes, needle: bytes, shortname_prefix: bytes, start: int = 0) -> bool:
+    """git's ``is_ntfs_dot_generic`` on the name that begins at ``start`` of ``name``: every read indexes the one
+    buffer, as git's pointer does, so checking each backslash segment never copies a suffix."""
+    def at(i: int) -> int:
+        return _at(name, start + i)
+
     def only_spaces_and_periods(i: int) -> bool:
         while True:
-            c = _at(name, i)
+            c = at(i)
             i += 1
             if c == 0 or c == 0x3A:
                 return True
@@ -106,17 +108,17 @@ def _is_ntfs_dot(name: bytes, needle: bytes, shortname_prefix: bytes) -> bool:
                 return False
 
     n = len(needle)
-    if _at(name, 0) == 0x2E and len(name) >= 1 + n and name[1:1 + n].lower() == needle:
+    if at(0) == 0x2E and len(name) - start >= 1 + n and name[start + 1:start + 1 + n].lower() == needle:
         return only_spaces_and_periods(n + 1)
     # A regular NTFS short name: the first 6 characters, then ~1 .. ~4.
-    if (len(name) >= 6 and name[:6].lower() == needle[:6] and _at(name, 6) == 0x7E
-            and 0x31 <= _at(name, 7) <= 0x34):
+    if (len(name) - start >= 6 and name[start:start + 6].lower() == needle[:6] and at(6) == 0x7E
+            and 0x31 <= at(7) <= 0x34):
         return only_spaces_and_periods(8)
     # A fall-back NTFS short name.
     i = 0
     saw_tilde = False
     while i < 8:
-        c = _at(name, i)
+        c = at(i)
         if c == 0:
             return False
         if saw_tilde:
@@ -124,7 +126,7 @@ def _is_ntfs_dot(name: bytes, needle: bytes, shortname_prefix: bytes) -> bool:
                 return False
         elif c == 0x7E:
             i += 1
-            if not 0x31 <= _at(name, i) <= 0x39:
+            if not 0x31 <= at(i) <= 0x39:
                 return False
             saw_tilde = True
         elif i >= 6 or c & 0x80 or _lower(c) != shortname_prefix[i]:
@@ -160,7 +162,9 @@ def is_dotgitattributes(name: bytes) -> bool:
 def tree_entries(payload: bytes, hexlen: int) -> Iterator[tuple[int, bytes, str]]:
     """A tree object's entries, ``(mode, name, oid hex)``, in order. Bounded: a mode of 1 to
     :data:`MODE_DIGITS_MAX` octal digits, a NUL ending the name, a whole raw oid of the format's length. Anything else
-    raises ValueError (the payload is not a tree this reader accepts)."""
+    raises ValueError (the payload is not a tree this reader accepts), as does a ``hexlen`` that is not 40 or 64."""
+    if hexlen not in _HEXLENS:
+        raise ValueError(f"hexlen {hexlen!r}: not an object format's (40 or 64)")
     raw = hexlen // 2
     i = 0
     end = len(payload)
@@ -184,7 +188,9 @@ def special_entry_oids(payload: bytes, hexlen: int) -> Iterator[str]:
     """The oids one tree names at a ``.gitmodules`` or ``.gitattributes`` entry, by ``fsck_tree``'s rule: any entry
     that is not a symlink (a symlink there is git's own ``gitmodulesSymlink`` / ``gitattributesSymlink`` report, not a
     lookup); and every segment after a backslash in a name is checked once more with the NTFS ``.gitmodules``
-    predicate (git checks no ``.gitattributes`` spelling there)."""
+    predicate (git checks no ``.gitattributes`` spelling there). The entry's mode is not read otherwise, so a gitlink
+    (``160000``) or a tree (``040000``) at a special name is collected too, exactly as ``fsck_tree`` collects it: an oid
+    here is not always a blob, and a caller sending or requiring them must treat a non-blob oid explicitly."""
     for mode, name, oid in tree_entries(payload, hexlen):
         if mode & _S_IFMT == _S_IFLNK:
             continue
@@ -193,14 +199,15 @@ def special_entry_oids(payload: bytes, hexlen: int) -> Iterator[str]:
             continue
         bs = name.find(b"\\")
         while bs >= 0:
-            if is_ntfs_dotgitmodules(name[bs + 1:]):
+            if _is_ntfs_dot(name, b"gitmodules", b"gi7eba", bs + 1):
                 yield oid
                 break
             bs = name.find(b"\\", bs + 1)
 
 
 def special_blobs(tree_payloads: Iterable[bytes], hexlen: int) -> set[str]:
-    """Every oid the given trees name at a ``.gitmodules`` or ``.gitattributes`` entry (:func:`special_entry_oids`).
+    """Every oid the given trees name at a ``.gitmodules`` or ``.gitattributes`` entry (:func:`special_entry_oids`;
+    gitlinks and trees at such a name included, as git collects them).
     Meant for the trees of ``closure(tips) - closure(base)``: of what it returns, the oids that list lacks are the
     ones to send, or to require."""
     found: set[str] = set()
