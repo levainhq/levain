@@ -1941,11 +1941,13 @@ def ws_accept(key: str) -> str:
 
 def ws_upgrade_refusal(resp: "h11.InformationalResponse", key: str, offered: Sequence[str],
                        relayed: Sequence[str]) -> Optional[str]:
-    """Why an upstream's 101 is not a websocket keys relays (RFC 6455 §4.1's client checks), or None: exactly one
-    `sec-websocket-accept` equal to `ws_accept(key)`, `upgrade: websocket`, `upgrade` among the `connection` options,
+    """Why an upstream's 101 is not a websocket keys relays (RFC 6455 §4.1's client checks), or None: HTTP/1.1, exactly
+    one `sec-websocket-accept` equal to `ws_accept(key)`, `upgrade: websocket`, `upgrade` among the `connection` options,
     no `sec-websocket-extensions` (keys offered none), and at most one `sec-websocket-protocol`, one keys offered.
     `relayed` is the `sec-websocket-protocol` values `U` would carry (after the route's response allow-list and the
     scanner): the selection must arrive whole, or the client and the upstream disagree on the protocol."""
+    if resp.http_version != b"1.1":   # h11 takes an HTTP/1.0 101 as a switch; the websocket handshake is 1.1's
+        return "websocket-http-version"
     hs: Dict[str, List[str]] = {}
     for n, v in resp.headers:
         hs.setdefault(bytes(n).decode("latin-1").lower(), []).append(bytes(v).decode("latin-1").strip())

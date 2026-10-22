@@ -264,6 +264,14 @@ def test_no_selected_protocol_upgrades_on_a_route_that_relays_none(monkeypatch):
     assert json.loads(frames[1][1])["headers"] == []
 
 
+def test_an_http_1_0_101_is_upstream_error(monkeypatch):
+    """T4 (codex LOW): h11 takes an `HTTP/1.0 101` as a switch; RFC 6455 §4.1 needs 1.1."""
+    frames, _ = _exchange(monkeypatch, _q(), lambda up: up.feed(_h101().replace(b"HTTP/1.1", b"HTTP/1.0", 1)),
+                          _gw(b"E"))
+    assert _types(frames) == b"AF", frames
+    assert json.loads(frames[1][1]) == {"refused": "upstream-error"}
+
+
 @pytest.mark.parametrize("q,why", [
     (_q(path="/plain"), "upgrade on a template without upgrade"),
     (_q(headers=[["sec-websocket-version", "13"]]), "no key"),
