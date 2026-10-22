@@ -156,7 +156,25 @@ def base_of(h: BundleHeader) -> tuple[str, bytes]:
     branches = [(oid, name) for oid, name in h.refs if name != b"HEAD"]
     if len(heads) != 1 or len(branches) != 1 or branches[0][0] != heads[0]:
         raise Refused("bundle-head-mismatch", "HEAD does not name the bundle's single branch ref")
+    if not branch_ref_ok(branches[0][1]):
+        raise Refused("bundle-head-mismatch", "the ref beside HEAD is not refs/heads/<a valid branch name>")
     return branches[0]
+
+
+_REF_BAD = re.compile(rb"[\x00-\x20\x7f~^:?*\[\\]")
+
+
+def branch_ref_ok(name: bytes) -> bool:
+    """``refs/heads/<name>`` with ``<name>`` a valid ref name by git's ``check-ref-format`` rules: no control
+    byte, space or ``~^:?*[\\``, no ``..`` or ``@{``, not ``@``, no empty component, none starting with ``.`` or
+    ending ``.lock``, and not ending ``/`` or ``.``."""
+    prefix = b"refs/heads/"
+    if not name.startswith(prefix) or len(name) == len(prefix):
+        return False
+    rest = name[len(prefix):]
+    if _REF_BAD.search(rest) or b".." in rest or b"@{" in rest or rest == b"@" or rest.endswith((b"/", b".")):
+        return False
+    return all(c and not c.startswith(b".") and not c.endswith(b".lock") for c in rest.split(b"/"))
 
 
 def write_header(object_format: str, refs: list[tuple[str, bytes]] | tuple[tuple[str, bytes], ...],
