@@ -13,6 +13,7 @@ records use: a temp file in the same directory, fsync, rename, fsync of the dire
 """
 from __future__ import annotations
 
+import binascii
 import calendar
 import errno
 import os
@@ -26,6 +27,7 @@ from typing import Callable, Mapping
 from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
 from levain.slot import Refused, write_all
+from levain.slot.bundlefmt import HEADER_MAX, OID_HEX, branch_ref_ok
 from levain.slot.grammar import SESSION_RE
 from levain.slot.ids import SlotId
 from levain.slot.render import _VAR_FOLDERS_RE, DISCOVERY
@@ -369,6 +371,55 @@ class AllocPolicy:
     front: Front | None = None
 
 
+#: ``alloc.base``'s keys: every one required.
+ALLOC_BASE_KEYS = frozenset({"oid", "ref_b64", "object_format", "bundle_sha256", "bundle_bytes"})
+_HEX_RE = re.compile(r"[0-9a-f]+", re.ASCII)
+_B64_RE = re.compile(r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?", re.ASCII)
+
+
+@dataclass(frozen=True)
+class AllocBase:
+    """``alloc.base`` (§7.1, s5 §5a): what render (3) read from the staging bundle root itself copied: the HEAD
+    oid (the base), its branch ref (base64 of the header's bytes), the object format, and the sha256 + size of
+    every byte copied. The only source of an adopt's base; nothing the session writes can move it."""
+
+    oid: str
+    ref_b64: str
+    object_format: str
+    bundle_sha256: str
+    bundle_bytes: int
+
+
+def _alloc_base(value: object) -> AllocBase:
+    obj = _obj(value, "alloc.base")
+    _keys(obj, ALLOC_BASE_KEYS, ALLOC_BASE_KEYS, "alloc.base")
+    fmt = _enum(obj["object_format"], "alloc.base.object_format", tuple(OID_HEX))
+    oid = _match(obj["oid"], "alloc.base.oid", _HEX_RE)
+    if len(oid) != OID_HEX[fmt]:
+        raise Refused("bad-value", f"alloc.base.oid is not a {fmt} oid")
+    ref_b64 = _match(obj["ref_b64"], "alloc.base.ref_b64", _B64_RE)
+    # A header's ref is inside its byte bound, so its base64 is inside 4/3 of it.
+    if not ref_b64 or len(ref_b64) > 4 * (HEADER_MAX // 3 + 1):
+        raise Refused("bad-value", "alloc.base.ref_b64")
+    try:
+        ref = binascii.a2b_base64(ref_b64, strict_mode=True)
+    except binascii.Error:
+        raise Refused("bad-value", "alloc.base.ref_b64") from None
+    # strict_mode still accepts non-zero padding bits, so a second spelling of one ref would decode; one encoding.
+    if binascii.b2a_base64(ref, newline=False).decode("ascii") != ref_b64:
+        raise Refused("bad-value", "alloc.base.ref_b64 is not the canonical encoding")
+    if not branch_ref_ok(ref):
+        raise Refused("bad-value", "alloc.base.ref_b64 is not refs/heads/<a valid branch name>")
+    return AllocBase(oid=oid, ref_b64=ref_b64, object_format=fmt,
+                     bundle_sha256=_match(obj["bundle_sha256"], "alloc.base.bundle_sha256", _DIGEST_RE),
+                     bundle_bytes=_uint(obj["bundle_bytes"], "alloc.base.bundle_bytes"))
+
+
+def base_obj(b: AllocBase) -> dict[str, object]:
+    return {"oid": b.oid, "ref_b64": b.ref_b64, "object_format": b.object_format,
+            "bundle_sha256": b.bundle_sha256, "bundle_bytes": b.bundle_bytes}
+
+
 @dataclass(frozen=True)
 class Alloc:
     """``L/alloc/<session>.json`` (§7.1). ``policy`` is None until ``render`` writes it."""
@@ -396,6 +447,8 @@ class Alloc:
     #: driver's), read once at prepare; every later phase reads them here (getconf AS the uid would re-create one).
     var_folders: tuple[str, ...] | None = None
     policy: AllocPolicy | None = None
+    #: render (3) writes it, after the policy; None = rendered before it existed (adopt: ``base-unrecorded``).
+    base: AllocBase | None = None
 
     def __post_init__(self) -> None:
         check_alloc(alloc_record(self, check=False))
@@ -436,6 +489,8 @@ def alloc_record(a: Alloc, *, check: bool = True) -> dict[str, object]:
             if p.front.start is not None:
                 f["start"] = p.front.start
             rec["front"] = f
+    if a.base is not None:
+        rec["base"] = base_obj(a.base)
     if check:
         check_alloc(rec)
     return rec
@@ -448,7 +503,7 @@ def alloc_bytes(a: Alloc) -> bytes:
 def check_alloc(obj: object) -> Alloc:
     """Validate an alloc object (already parsed) and return it typed."""
     obj = _obj(obj, "alloc")
-    _keys(obj, ALLOC_IDENTITY_KEYS | ALLOC_POLICY_KEYS, ALLOC_IDENTITY_REQUIRED, "alloc")
+    _keys(obj, ALLOC_IDENTITY_KEYS | ALLOC_POLICY_KEYS | {"base"}, ALLOC_IDENTITY_REQUIRED, "alloc")
     if obj["format"] != ALLOC_FORMAT:
         raise Refused("bad-format", "alloc")
     session = check_session(obj["session"], "alloc.session")
@@ -517,10 +572,15 @@ def check_alloc(obj: object) -> Alloc:
             incarnation=_uint(obj["incarnation"], "alloc.incarnation"),
             model=_match(obj["model"], "alloc.model", _MODEL_RE) if "model" in obj else None,
             verifier_steps=steps, front=front)
+    base = None
+    if "base" in obj:
+        if policy is None:                                  # §5.1: render (3) writes it, after (2)'s policy
+            raise Refused("bad-value", "alloc.base without the render policy")
+        base = _alloc_base(obj["base"])
     return _alloc_unchecked(session=session, slot=slot, kind=kind, vendor=vendor, auth=auth,
                             created_at=created_at, boot_id=boot_id, child_uid=child_uid, ticket=ticket,
                             ticket_facts=facts, netns=netns, cgroup=cgroup, var_folders=var_folders, policy=policy,
-                            **ints)
+                            base=base, **ints)
 
 
 def _alloc_unchecked(**kw) -> Alloc:
@@ -826,7 +886,8 @@ def read_record(path: Path, *, max_bytes: int = 1 << 20) -> bytes | None:
 
 
 __all__ = [
-    "ACTIVE", "ALLOCATED", "ALLOC_FORMAT", "ARTIFACT_FIELDS", "ATTACH_CLAIM_KEYS", "Alloc", "AllocPolicy",
+    "ACTIVE", "ALLOCATED", "ALLOC_BASE_KEYS", "ALLOC_FORMAT", "ARTIFACT_FIELDS", "ATTACH_CLAIM_KEYS", "Alloc",
+    "AllocBase", "AllocPolicy", "base_obj",
     "BRAKED", "CAS_FIELDS", "CREDENTIAL_PARKED", "DEAD", "EDGES", "END_FROM_STATES", "END_INTO_STATES",
     "EVENT_KINDS", "EXCLUSIVE_PAIRS", "FIELD_CHECKS", "FRONT_REG_KEYS", "FROZEN", "Front", "FrontReg", "HELD",
     "LIVE_STATES", "MINT_CLAIM_KEYS", "NotDurable", "OBSERVED_ID_RE", "PERSISTED_CLAIM_KEYS", "PURGED", "REG_TOKEN",

@@ -36,7 +36,10 @@ ACCOUNTS = {"_levain_s0": 899, "_levain_gw0": 898, "_levain_s1": 897, "_levain_g
             "_levain_dispatch": DISPATCH_UID}
 GROUPS = {"levain-gwfronts": 789, "levain-slots": 788}
 BOOT = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
-BUNDLE = b"# v2 git bundle\n" + b"bundle-bytes " * 64
+#: A header render's bundlefmt parse accepts (HEAD naming the one branch ref), then stand-in pack bytes.
+BUNDLE_OID = b"0123456789abcdef0123456789abcdef01234567"
+BUNDLE = (b"# v2 git bundle\n" + BUNDLE_OID + b" HEAD\n" + BUNDLE_OID + b" refs/heads/main\n\n"
+          + b"bundle-bytes " * 64)
 BASE = {"format": "levain-routes-base/1", "routes": [
     {"route": "anthropic", "type": "brokered"}, {"route": "github", "type": "egress"},
     {"route": "claude-sub", "type": "subscription_passthrough"}]}
@@ -590,6 +593,22 @@ def test_staging_kept_until_every_destination_durable(world):
     assert code == H.EXIT_INTERNAL
     assert (world.L / "live" / s / "in" / "repo.bundle").exists()
     assert os.listdir(world.L / "staging" / s) == ["repo.bundle"]
+
+
+def test_base_recorded_only_when_step3_completes(world):
+    """A valid bundle copied, then a later step-(3) file faulting: alloc carries no base, so adopt answers
+    base-unrecorded instead of admitting a half-rendered session."""
+    s = _prepared(world)
+
+    def chown(fd, u, g, rel):
+        if rel.endswith("root/gitconfig"):
+            raise OSError(errno.EIO, "fault")
+        world.chowns.append((rel, u, g))
+
+    world.seams.chown = chown
+    assert world.main(["render", s], _blob())[0] == H.EXIT_INTERNAL
+    assert (world.L / "live" / s / "in" / "repo.bundle").exists()
+    assert world.alloc(s).base is None
 
 
 def test_none_class_no_front_no_handle(world):

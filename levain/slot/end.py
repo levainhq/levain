@@ -384,7 +384,7 @@ def _reopen_parent(child_fd: int, frame: list) -> None:
 
 
 def walk(root: Path, extra: Mapping[bytes, Path] | None = None, *,
-         depth_cap: int = MANIFEST_DEPTH) -> Iterator[Entry]:
+         depth_cap: int = MANIFEST_DEPTH, prune: Callable[[Entry], bool] | None = None) -> Iterator[Entry]:
     """Every entry under ``root`` (not ``root`` itself), depth first, a directory before its children,
     names in byte order; never follows a link (each directory opened ``O_NOFOLLOW`` from its parent's
     fd and checked against the ``lstat`` that named it). ``extra`` adds root children that live
@@ -397,7 +397,11 @@ def walk(root: Path, extra: Mapping[bytes, Path] | None = None, *,
     ``manifest-depth-cap``. At most :data:`WALK_OPEN_DIRS` directory fds are held: the root's always, and
     the deepest ones; an ancestor is closed before a child would pass that, and reopened from its child's ``..``
     on the way back up (:func:`_reopen_parent`). The walk never has more than :data:`WALK_PEAK_FDS` open at
-    once. Only the directory of the entry yielded is guaranteed open."""
+    once. Only the directory of the entry yielded is guaranteed open.
+
+    ``prune``: called on a yielded directory AFTER the consumer's step returns and before the walk opens it;
+    true = do not descend (the directory itself was yielded, nothing under it is opened or listed). The default
+    descends everywhere. A plain call, never a ``send()``: callers iterate with ``for``."""
     extra = dict(extra or {})
     root_b = os.fsencode(root)
     root_fd = os.open(root_b, _DIR_FLAGS)
@@ -442,15 +446,19 @@ def walk(root: Path, extra: Mapping[bytes, Path] | None = None, *,
                 raise Refused("manifest-depth-cap", f"{path[:200]!r}... is deeper than {depth_cap} levels")
             if name in fextra:
                 absp, st = fextra[name]
-                yield Entry(path, st, -1, name, absp)
+                e = Entry(path, st, -1, name, absp)
+                yield e
             else:
                 st = os.stat(name, dir_fd=fd, follow_symlinks=False)
                 if st.st_dev != dev:
                     raise Refused("tree-mount", f"{path!r} is on another filesystem")
                 absp = absprefix + b"/" + name
-                yield Entry(path, st, fd, name, absp)
+                e = Entry(path, st, fd, name, absp)
+                yield e
                 if not stat.S_ISDIR(st.st_mode):
                     continue
+            if prune is not None and prune(e):
+                continue
             # The open frames are the root's and stack[low:]; the child makes one more, so the shallowest goes
             # first (never the current frame: WALK_OPEN_DIRS is far above two).
             if 1 + len(stack) - low >= WALK_OPEN_DIRS:
@@ -1751,6 +1759,8 @@ class Reserve:
 
     path: Path
     size: int = RESERVE_BYTES
+    #: how long a release waits for the reaper's refill lock before it refuses (a test shortens it).
+    lock_wait_s: float = SLOT_LOCK_WAIT_S
 
     @property
     def step(self) -> int:
@@ -1763,12 +1773,28 @@ class Reserve:
             return 0
 
     def release_step(self) -> int:
-        """Shrink by one step; returns the bytes released (0 = nothing left to give)."""
+        """Shrink by one step; returns the bytes released (0 = nothing left to give). Never call it from a
+        process holding the reaper's reserve lock: flock is per open file description, so it would wait on
+        itself (now a bounded ``reserve-locked`` refusal)."""
         try:
             fd = os.open(self.path, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         except FileNotFoundError:
             return 0
         try:
+            # The reaper's refill holds a flock on this same file across its fstat, write and fsync; taking
+            # it here means a release never truncates under a refill (the unlock is the close below). The
+            # wait is bounded like END's other lock waits, else a stalled reaper would pin the transition.
+            deadline = time.monotonic() + self.lock_wait_s
+            delay = SLOT_LOCK_FIRST_S
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise Refused("reserve-locked", f"{self.path} held past {self.lock_wait_s:g} s") from None
+                    time.sleep(delay)
+                    delay = min(delay * 2, SLOT_LOCK_MAX_S)
             cur = os.fstat(fd).st_size
             new = max(0, cur - self.step)
             os.ftruncate(fd, new)
