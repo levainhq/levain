@@ -1751,6 +1751,8 @@ class Reserve:
 
     path: Path
     size: int = RESERVE_BYTES
+    #: how long a release waits for the reaper's refill lock before it refuses (a test shortens it).
+    lock_wait_s: float = SLOT_LOCK_WAIT_S
 
     @property
     def step(self) -> int:
@@ -1763,15 +1765,28 @@ class Reserve:
             return 0
 
     def release_step(self) -> int:
-        """Shrink by one step; returns the bytes released (0 = nothing left to give)."""
+        """Shrink by one step; returns the bytes released (0 = nothing left to give). Never call it from a
+        process holding the reaper's reserve lock: flock is per open file description, so it would wait on
+        itself (now a bounded ``reserve-locked`` refusal)."""
         try:
             fd = os.open(self.path, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         except FileNotFoundError:
             return 0
         try:
             # The reaper's refill holds a flock on this same file across its fstat, write and fsync; taking
-            # it here means a release never truncates under a refill (the unlock is the close below).
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            # it here means a release never truncates under a refill (the unlock is the close below). The
+            # wait is bounded like END's other lock waits, else a stalled reaper would pin the transition.
+            deadline = time.monotonic() + self.lock_wait_s
+            delay = SLOT_LOCK_FIRST_S
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise Refused("reserve-locked", f"{self.path} held past {self.lock_wait_s:g} s") from None
+                    time.sleep(delay)
+                    delay = min(delay * 2, SLOT_LOCK_MAX_S)
             cur = os.fstat(fd).st_size
             new = max(0, cur - self.step)
             os.ftruncate(fd, new)
