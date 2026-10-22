@@ -13,6 +13,7 @@ built yet is derived from the helpers themselves (``install_helper.helper_pendin
 from __future__ import annotations
 
 import os
+import re
 import stat
 from pathlib import Path
 from typing import Callable, Iterator, Mapping
@@ -62,30 +63,49 @@ def helper_entry_text(host: HostOS, helper: str) -> str:
 
 
 def _walk(tree: Path) -> Iterator[str]:
+    """``tree`` itself first, then every entry below it. The root is yielded because ``os.walk`` follows a
+    top-level link: its descendants alone would prove nothing about a ``tree`` that is a link."""
+    yield str(tree)
     for dirpath, dirnames, filenames in os.walk(tree):
         for name in dirnames + filenames:
             yield os.path.join(dirpath, name)
 
 
+def _entry_problem(tree: Path, p: str, st: os.stat_result) -> str:
+    if p == str(tree):
+        return "" if stat.S_ISDIR(st.st_mode) else f"{p} is not a real directory"
+    return "" if stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode) else f"{p} is not a plain file or directory"
+
+
 def _no_links(tree: Path, *, lstat: Callable[[str], os.stat_result] = os.lstat,
               walk: Callable[[Path], Iterator[str]] = _walk) -> tuple[bool, str]:
-    """Before any chown or chmod touches the copy: every entry is a plain directory or regular file, so
-    no recursive chown or chmod can follow a link out of the tree (CONTRACT §23)."""
+    """Before any chown or chmod touches the copy: ``tree`` is a real directory and every entry below it a
+    plain directory or regular file, so no recursive chown or chmod can follow a link out of the tree
+    (CONTRACT §23). An entry that cannot be examined is refused."""
     for p in walk(tree):
-        st = lstat(p)
-        if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
-            return False, f"{p} is not a plain file or directory"
+        try:
+            st = lstat(p)
+        except OSError as e:
+            return False, f"cannot examine {p} ({e.strerror or e}); refusing"
+        problem = _entry_problem(tree, p, st)
+        if problem:
+            return False, problem
     return True, ""
 
 
 def _no_foreign_entries(tree: Path, *, lstat: Callable[[str], os.stat_result] = os.lstat,
                         walk: Callable[[Path], Iterator[str]] = _walk) -> tuple[bool, str]:
-    """After the chown and chmod: every entry under ``tree`` is a plain directory or regular file owned
-    by root, writable by root alone. A symlink would let an import resolve outside the tree."""
+    """After the chown and chmod: ``tree`` is a real directory and every entry under it a plain directory or
+    regular file owned by root, writable by root alone. A symlink would let an import resolve outside the
+    tree."""
     for p in walk(tree):
-        st = lstat(p)
-        if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
-            return False, f"{p} is not a plain file or directory"
+        try:
+            st = lstat(p)
+        except OSError as e:
+            return False, f"cannot examine {p} ({e.strerror or e}); refusing"
+        problem = _entry_problem(tree, p, st)
+        if problem:
+            return False, problem
         if st.st_uid != 0 or st.st_mode & 0o022:
             return False, f"{p} is not root's alone"
     return True, ""
@@ -149,10 +169,36 @@ def _tools(host: HostOS) -> dict[str, str]:
 H11_MIN = (0, 16, 0)
 
 
+def _release(version: str) -> tuple[int, int, int]:
+    """The release part of ``version`` for the floor: the leading digits of each dot component (up to three),
+    zero-padded to three. A local (``+...``) part is dropped; a pre/post/dev suffix ends the release and is
+    ignored. ``ValueError`` when the first component has no leading digit."""
+    parts: list[int] = []
+    for c in version.split("+", 1)[0].split(".")[:3]:
+        m = re.match(r"\d+", c)
+        if m is None:
+            break
+        parts.append(int(m.group()))
+        if m.end() != len(c):
+            break
+    if not parts:
+        raise ValueError(version)
+    return (*parts, 0, 0, 0)[:3]  # type: ignore[return-value]
+
+
+def _refuse_link(path: Path, what: str) -> None:
+    """A package source must be the directory itself: a link is refused, never resolved and copied, so the
+    operator sees that their package is a link."""
+    if path.is_symlink():
+        raise Refused("bad-root", f"the {what} package {path} is a symlink (to {os.readlink(path)}); "
+                                  "refusing to vendor through it")
+
+
 def h11_source() -> Path:
     """The package directory of the h11 the installing Levain itself imports (pure Python, so the copy is
     interpreter-neutral), checked ``>= 0.16.0`` from its ``__version__``. Refuses an h11 that is not an
-    ordinary package directory (a zipped or single-file install has nothing to copy) or is too old."""
+    ordinary package directory (a zipped or single-file install has nothing to copy, and a symlinked one
+    would put a link in root's tree) or is too old."""
     try:
         import h11
     except ImportError as e:
@@ -160,8 +206,9 @@ def h11_source() -> Path:
     f = getattr(h11, "__file__", None)
     if not f or Path(f).name != "__init__.py" or not Path(f).parent.is_dir():
         raise Refused("bad-root", f"h11 is not a package directory ({f!r}); nothing to vendor")
+    _refuse_link(Path(f).parent, "h11")
     try:
-        have = tuple(int(x) for x in str(h11.__version__).split(".")[:3])
+        have = _release(str(h11.__version__))
     except (AttributeError, ValueError):
         raise Refused("bad-root", f"h11 has no readable version ({getattr(h11, '__version__', None)!r})")
     if have < H11_MIN:
@@ -200,9 +247,11 @@ def tree_steps(host: HostOS, source: Path, *, h11_dir: Path | None = None) -> li
     Every step is safe to re-run after a failure at any point (CONTRACT §23)."""
     if source.name != "levain":
         raise Refused("bad-root", f"{source} is not a levain package directory")
+    _refuse_link(source, "levain")
     h11_dir = h11_dir if h11_dir is not None else h11_source()
     if h11_dir.name != "h11":
         raise Refused("bad-root", f"{h11_dir} is not an h11 package directory")
+    _refuse_link(h11_dir, "h11")
     t = _tools(host)
     tree, helpers, vendor = IMPORT_TREE[host], HELPER_DIR[host], VENDOR_PREFIX[host]
     owner = f"root:{ROOT_GROUP[host]}"
