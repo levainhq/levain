@@ -198,8 +198,9 @@ def _default_client(path: Path):
 
 def proc_identity(pid: int) -> Optional[Tuple[int, int]]:
     """``(real uid, start)`` of a live process, or None: proc.py's probe (macOS libproc, microseconds; Linux
-    ``/proc/<pid>/stat`` field 22, clock ticks), the ONE start-time source, so MINT's ``front.start`` and every
-    later live check (keys' peer check, END, SCRUBBED) read the same units. A pid whose facts cannot be read
+    ``/proc/<pid>/stat`` field 22, clock ticks), so MINT's ``front.start`` and the later live checks (END, SCRUBBED)
+    read the same units; keys' peer check reads the same value by its own probe (``levain.broker.peer.start_of``:
+    sysctl ``KERN_PROC_PID`` on macOS, where libproc cannot read another uid's process). A pid whose facts cannot be read
     counts as unknown (None): nothing is signalled on it."""
     p = PR.default_seams().probe(int(pid))
     if p is None or p.state == PR.UNKNOWN or not p.uids:
