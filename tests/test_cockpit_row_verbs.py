@@ -21,12 +21,15 @@ def _page(tmp_path: Path, steps: list[dict]) -> list:
 @needs_browser
 def test_hovering_a_row_never_changes_its_height(tmp_path: Path) -> None:
     vals = _page(tmp_path, [
-        {"eval": f"(() => {{ const r = {ROW}; const v = r.querySelector('.verb-actions'); return [r.getBoundingClientRect().height, getComputedStyle(v).opacity]; }})()"},
+        {"eval": f"(() => {{ const r = {ROW}; const v = r.querySelector('.verb-actions'); return [r.getBoundingClientRect().height, getComputedStyle(v).opacity, matchMedia('(hover: none)').matches]; }})()"},
         {"eval": f"(async () => {{ const r = {ROW}; r.focus(); await new Promise(x => setTimeout(x, 400)); const v = r.querySelector('.verb-actions'); return [r.getBoundingClientRect().height, getComputedStyle(v).opacity]; }})()"},
     ])
     before, after = vals[1], vals[2]
     assert before[0] == after[0], vals
-    assert float(before[1]) == 0.0 and float(after[1]) > 0.0, vals
+    # a browser that reports no hover (a phone; headless Linux Chrome) shows the verbs from the start, by the page's own
+    # (hover: none) rule; everywhere else they are hidden until the row is hovered or focused
+    want_before = 1.0 if before[2] else 0.0
+    assert float(before[1]) == want_before and float(after[1]) > 0.0, vals
 
 
 @needs_browser
