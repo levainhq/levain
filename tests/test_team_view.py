@@ -451,7 +451,7 @@ def test_a_peer_written_owner_with_a_hidden_character_is_shown_with_a_marker():
     assert V._e("<b>é") == "&lt;b&gt;é"
 
 
-def test_the_card_marks_hidden_text_in_an_owner_and_a_path():
+def test_the_card_marks_hidden_text_in_an_owner_and_a_path(monkeypatch):
     # L3 1022-2 r2: the card carried owner and paths raw while every other field went through oneline. A ledger
     # line read without the write gate (an owner still printable, a path never gated at read) reached the model raw.
     ledger, _ = _ledger()
@@ -472,7 +472,24 @@ def test_the_card_marks_hidden_text_in_an_owner_and_a_path():
     from levain import unshowable
     held, _ = _plus(ledger, "ana", [("decision", dict(kind="ruling", owner="gone", paths=["y.py"], words="w"),
                                      lambda e: e.update(owner="gone\ufe0f"))])
-    for model in (m, V.build_model(TEAM, held, "ana", None, "x", now=NOW)):
+    # ... and the model exactly as _ViewHandler._model emits it: a partial-ledger sentence and a tab in the path filter
+    import json
+    import types
+    from levain.team import reader as R
+    monkeypatch.setattr(R, "partial_why", lambda d: "part\tly\ufe0f judged")
+    stub = _Stub()
+    stub.derivation = lambda sha: types.SimpleNamespace(judged="partial", waiting=0)
+    httpd = V.make_view_server(stub, port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        _, body = _req(httpd.server_address[1], "GET", "/view.json?path=a%09b%EF%B8%8F")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    emitted = json.loads(body)
+    assert "⟨U+FE0F⟩" in emitted["partial"] and "\ufe0f" not in emitted["partial"]
+    assert "⟨U+FE0F⟩" in emitted["path_filter"] and "\ufe0f" not in emitted["path_filter"]
+    for model in (m, V.build_model(TEAM, held, "ana", None, "x", now=NOW), emitted):
         def walk(v, where="model"):
             if isinstance(v, str):
                 assert unshowable.hidden(v, allow="\n\t") == [], (where, v)

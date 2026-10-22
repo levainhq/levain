@@ -54,7 +54,7 @@ def _days(ts: str, now: datetime) -> int | None:
 # ledger values: matching, filtering, grouping and sorting use those. Fields named here are identifiers (an owner, a
 # path, an author, a pack, an id): the strict rule, nothing hidden and a tab marked too. Every other string is prose.
 _IDENT_FIELDS = frozenset({"id", "owner", "paths", "path", "recorded_by", "pack", "ruling_ids", "you", "project",
-                           "type", "kind", "why"})
+                           "type", "kind", "why", "path_filter"})
 
 
 def _shown(v: Any, key: str = "") -> Any:
@@ -80,7 +80,7 @@ def _card(e: dict, now: datetime) -> dict:
 
 def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: str | None, state: str, *,
                 now: datetime | None = None, recheck_days: int = DEFAULT_RECHECK_DAYS,
-                ack_flag: int = DEFAULT_ACK_FLAG, path_filter: str = "") -> dict:
+                ack_flag: int = DEFAULT_ACK_FLAG, path_filter: str = "", partial: str | None = None) -> dict:
     """The four panes as plain data, from one ledger snapshot. Pure: no I/O.
 
     ``path_filter`` narrows all four panes to what governs one path: an entry stays when one of its globs matches the
@@ -164,6 +164,7 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
             "waiting": waiting, "stopped": stopped,
             "ack_total": ack_total, "held": held, "held_count": len(held), "in_force": canon,
             "in_force_count": len(live), "path_filter": pf,
+            **({"partial": partial} if partial else {}),
             "generated": now.strftime("%Y-%m-%dT%H:%M:%SZ")})
 
 
@@ -425,18 +426,18 @@ class _ViewHandler(GuardedHandler):
             raise _Busy()
         try:
             sha, team, ledger = gl.snapshot()
-            model = build_model(team, ledger, gl.handle(team), gl.read_canon(sha), gl.state_hash(ledger, team),
-                                recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag,
-                                path_filter=path_filter)
             # a ledger judged only in part says so here as the Team zone does, never drawn as if current; the
-            # derivation is the one the snapshot just used (cached per tip), not a second judgement
+            # derivation is the one the snapshot just used (cached per tip), not a second judgement. It enters
+            # build_model, so `partial` is marked by the same single `_shown` step as every other string.
             derive = getattr(gl, "derivation", None)
+            partial = None
             if callable(derive):
                 from .reader import partial_why
 
-                why = partial_why(derive(sha))
-                if why is not None:
-                    model["partial"] = why
+                partial = partial_why(derive(sha))
+            model = build_model(team, ledger, gl.handle(team), gl.read_canon(sha), gl.state_hash(ledger, team),
+                                recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag,
+                                path_filter=path_filter, partial=partial)
             return model
         finally:
             self.server.model_lock.release()

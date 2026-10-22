@@ -468,7 +468,7 @@ def sessionstart(payload: dict) -> None:
         where = ", ".join(I.oneline(p, ident=True) for p in e.get("paths") or []) or "(project-wide)"
         raw = str(e.get("words") or "")
         # Cut the raw words, then mark: a cut after marking can split a ⟨U+XXXX⟩ marker.
-        owner = I.oneline(str(e.get("owner")), ident=True)
+        owner = I.oneline(str(e.get("owner") or ""), ident=True)
         lines.append(f"  - {where}: owner {owner}: \"{I.oneline(raw[:160])}{'...' if len(raw) > 160 else ''}\"")
     if show and len(rulings) > 15:
         lines.append(f"  - ...and {len(rulings) - 15} more in PROJECT.md / `levain team status`")
