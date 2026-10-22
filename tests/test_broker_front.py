@@ -169,13 +169,15 @@ def test_brokered_upstream_host_trailing_dot_refused():
         load_policy(json.dumps(doc).encode())
 
 
-def test_a_header_pattern_that_overflows_the_regex_compiler_is_a_policy_error():
+@pytest.mark.parametrize("pat", ["a{99999999999}", "(" * 600 + "a" + ")" * 600], ids=["overflow", "recursion"])
+def test_a_header_pattern_that_overflows_the_regex_compiler_is_a_policy_error(pat):
     """Reproduced (3b-3b P5 L3 r2, codex): `re.compile('a{99999999999}')` raises OverflowError, not re.error, so a
-    session file carrying it crashed load_policy with a raw OverflowError instead of the named refusal."""
+    session file carrying it crashed load_policy with a raw OverflowError instead of the named refusal. Deep nesting
+    raises RecursionError the same way (L3 on 7a27845a, codex, reproduced on 3.9 and 3.12)."""
     doc = {"format": "levain-front-session/1", "kind": "interactive", "session": "s", "routes": [
         {"route": "br", "type": "brokered", "upstream": {"scheme": "https", "host": "api.example.com", "base_path": ""},
          "requests": {"templates": [{"method": "POST", "path": "/v1/messages"}],
-                                          "headers": {"content-type": "a{99999999999}"}, "body_cap": 1024,
+                                          "headers": {"content-type": pat}, "body_cap": 1024,
                                           "body_codec": "none"},
          "max_call_microdollars": 1000, "max_session_microdollars": 100000}]}
     with pytest.raises(PolicyError, match="requests.headers.content-type"):
