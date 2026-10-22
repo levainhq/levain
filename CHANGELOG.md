@@ -35,9 +35,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **The keys service carries a websocket.** A route that permits an upgrade now gets one. The keys service checks the
   client's handshake itself and asks the vendor to upgrade. It accepts the vendor's 101 only when it is HTTP/1.1 with the
   right accept value, no extensions, and a subprotocol the route can relay back. It then relays frames both ways under one
-  idle clock. If a credential appears in a frame from the vendor, the frame is cut where the credential begins and the
-  websocket is closed. A masked, reserved-bit or reserved-opcode frame from the vendor also closes it. No 1.0 client
-  takes this path yet: Codex runs with websockets off.
+  idle clock. If a credential appears inside one frame's payload from the vendor, the frame is cut where the credential
+  begins and the websocket is closed. This is a canary, not a wall: a credential split across fragmented frames is
+  not caught. A masked, reserved-bit or reserved-opcode frame from the vendor, or one with an invalid length, also
+  closes it. Nothing calls this path yet. The isolation layer that will route a client through it is still groundwork,
+  and its design runs Codex with websockets off for 1.0.
 
 ### Fixed
 - **The isolation install helper no longer refuses on a service that is still unloading.** This happened in `undo` right
