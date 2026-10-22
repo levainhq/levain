@@ -246,6 +246,24 @@ def test_mixed_case_handshake_names_upgrade(monkeypatch):
     assert json.loads(frames[1][1])["headers"] == [["sec-websocket-protocol", "chat"]]
 
 
+def test_a_selected_protocol_the_route_cannot_relay_is_upstream_error(monkeypatch):
+    """T3 (codex MED): a route whose `responses.headers` omits `sec-websocket-protocol` would drop the upstream's
+    selection from `U`, and the client and the upstream would disagree on the protocol: refused instead."""
+    frames, _ = _exchange(monkeypatch, _q(headers=_CHAT),
+                          lambda up: up.feed(_h101(extra=b"sec-websocket-protocol: chat\r\n")), _gw(b"E"),
+                          lib={"responses": ("content-type",)})
+    assert _types(frames) == b"AF", frames
+    assert json.loads(frames[1][1]) == {"refused": "upstream-error"}
+
+
+def test_no_selected_protocol_upgrades_on_a_route_that_relays_none(monkeypatch):
+    """T3's other half: the same route, the upstream selects nothing: nothing to disagree on, so `U`."""
+    frames, _ = _exchange(monkeypatch, _q(headers=_CHAT), lambda up: up.feed(_h101()), _gw(b"E") + _gw(b"E"),
+                          lib={"responses": ("content-type",)})
+    assert _types(frames) == b"AU", frames
+    assert json.loads(frames[1][1])["headers"] == []
+
+
 @pytest.mark.parametrize("q,why", [
     (_q(path="/plain"), "upgrade on a template without upgrade"),
     (_q(headers=[["sec-websocket-version", "13"]]), "no key"),

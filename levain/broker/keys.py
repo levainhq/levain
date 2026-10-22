@@ -1485,11 +1485,11 @@ class Keys:
         from the request it sent, never re-read from the `Q`. `U` carries the allow-listed response headers; the
         front writes the slot's 101 itself (1.3 step 7)."""
         key, offered = ws
-        why = ws_upgrade_refusal(resp, key, offered)
+        out = self._relayed_headers(resp.headers, pol, scanner)
+        why = ws_upgrade_refusal(resp, key, offered, [v for n, v in out if n == "sec-websocket-protocol"])
         if why is not None:
             _note(logging.WARNING, "levain gw-keys: websocket upgrade refused (%s)", why)
             raise norm.Refused("upstream-error", why)
-        out = self._relayed_headers(resp.headers, pol, scanner)
         try:
             return gwwire.encode(b"U", {"v": 1, "headers": out})
         except WireError:
@@ -1939,10 +1939,13 @@ def ws_accept(key: str) -> str:
     return base64.b64encode(hashlib.sha1(key.encode("ascii") + _WS_GUID).digest()).decode("ascii")
 
 
-def ws_upgrade_refusal(resp: "h11.InformationalResponse", key: str, offered: Sequence[str]) -> Optional[str]:
+def ws_upgrade_refusal(resp: "h11.InformationalResponse", key: str, offered: Sequence[str],
+                       relayed: Sequence[str]) -> Optional[str]:
     """Why an upstream's 101 is not a websocket keys relays (RFC 6455 §4.1's client checks), or None: exactly one
     `sec-websocket-accept` equal to `ws_accept(key)`, `upgrade: websocket`, `upgrade` among the `connection` options,
-    no `sec-websocket-extensions` (keys offered none), and at most one `sec-websocket-protocol`, one keys offered."""
+    no `sec-websocket-extensions` (keys offered none), and at most one `sec-websocket-protocol`, one keys offered.
+    `relayed` is the `sec-websocket-protocol` values `U` would carry (after the route's response allow-list and the
+    scanner): the selection must arrive whole, or the client and the upstream disagree on the protocol."""
     hs: Dict[str, List[str]] = {}
     for n, v in resp.headers:
         hs.setdefault(bytes(n).decode("latin-1").lower(), []).append(bytes(v).decode("latin-1").strip())
@@ -1957,6 +1960,8 @@ def ws_upgrade_refusal(resp: "h11.InformationalResponse", key: str, offered: Seq
     proto = hs.get("sec-websocket-protocol", [])
     if len(proto) > 1 or (proto and proto[0] not in offered):
         return "websocket-protocol"
+    if list(relayed) != proto:
+        return "websocket-protocol-unrelayed"
     return None
 
 
