@@ -13,6 +13,7 @@ records use: a temp file in the same directory, fsync, rename, fsync of the dire
 """
 from __future__ import annotations
 
+import base64
 import binascii
 import calendar
 import errno
@@ -402,10 +403,10 @@ def _alloc_base(value: object) -> AllocBase:
     if not ref_b64 or len(ref_b64) > 4 * (HEADER_MAX // 3 + 1):
         raise Refused("bad-value", "alloc.base.ref_b64")
     try:
-        ref = binascii.a2b_base64(ref_b64, strict_mode=True)
+        ref = base64.b64decode(ref_b64, validate=True)   # not a2b_base64(strict_mode=): root runs 3.9
     except binascii.Error:
         raise Refused("bad-value", "alloc.base.ref_b64") from None
-    # strict_mode still accepts non-zero padding bits, so a second spelling of one ref would decode; one encoding.
+    # validate=True still accepts non-zero padding bits, so a second spelling of one ref would decode; one encoding.
     if binascii.b2a_base64(ref, newline=False).decode("ascii") != ref_b64:
         raise Refused("bad-value", "alloc.base.ref_b64 is not the canonical encoding")
     if not branch_ref_ok(ref):
