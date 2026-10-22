@@ -1570,6 +1570,8 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
   body.ke .masthead .seg { height: auto; min-height: var(--hit-min); }
   body.ke .masthead .mode { min-height: calc(var(--hit-min) - var(--sp-1) * 2); }
   body.ke .masthead .indicators button { height: var(--hit-min); }
+  /* the track grows with its keys (as .seg does above): the keys are touch-sized, and in a fixed --seg-h track the raised one stood taller than it */
+  body.ke .masthead .themesw { height: auto; min-height: var(--hit-min); }
   body.ke .masthead .themesw button { width: var(--hit-min); height: calc(var(--hit-min) - var(--sp-2) * 2); }
   body.ke .skycol { padding-inline: 0; }
   body.ke .skycard { border-radius: 0; border-inline: 0; }

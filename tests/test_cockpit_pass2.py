@@ -185,3 +185,19 @@ def test_a_row_with_a_repo_facet_is_tagged_from_it_and_a_row_without_one_from_it
         )()"""}])["values"]
     got = {k.strip(): t for k, t in vals[2]}
     assert got == {"fix the flaky test": "review", "Review the cash flow report": "website", "Review the invoice": "review"}, vals[2]
+
+
+@needs_browser
+def test_the_phone_theme_keys_sit_inside_their_track_in_every_selected_state(tmp_path: Path) -> None:
+    """Phill 10-22 (iPhone 15 Pro Max): the raised theme key stood taller than its track. Every key is one box and fits the track."""
+    vals = _page(tmp_path, [{"emulate": {"w": 430, "h": 932, "dpr": 3, "mobile": True}}, {"until": "document.body.classList.contains('ke') && document.querySelector('.masthead .themesw button')"}, {"eval": """(() => {
+      const out = [], tr = document.querySelector('.masthead .themesw');
+      for (const w of ['system', 'dark', 'light']) {
+        tr.querySelector('[data-theme-set=' + w + ']').click();
+        const t = tr.getBoundingClientRect(), bs = [...tr.querySelectorAll('button')].map((b) => b.getBoundingClientRect());
+        out.push({ want: w, got: (tr.querySelector('[aria-pressed=true]') || {}).dataset?.themeSet, sizes: bs.map((b) => [b.width, b.height]), inside: bs.every((b) => b.top >= t.top && b.bottom <= t.bottom) });
+      }
+      return out; })()"""}])
+    for state in vals[2]:
+        assert state["got"] == state["want"], state
+        assert state["inside"] and len({tuple(s) for s in state["sizes"]}) == 1, state
