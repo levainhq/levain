@@ -280,14 +280,17 @@ def stage_copy(staging: int | str | os.PathLike[str], name: str, cap: int, heade
                digest: str | None, *, dest_dir: int | str | os.PathLike[str], dest_name: str,
                staging_uid: int, staging_gid: int, dest_gid: int, mode: int = 0o640,
                digest_refusal: str = "input-bundle-mismatch", cap_refusal: str = "bundle-cap",
-               validate: Callable[[bytes], object] | None = None, deadline_s: float = STAGE_DEADLINE_S,
+               validate: Callable[[bytes], object] | None = None,
+               observe: Callable[[bytes], None] | None = None, deadline_s: float = STAGE_DEADLINE_S,
                run_as: RunAs = fork_run_as, chown: Callable[[int, int, int], None] = os.fchown,
                clock: Callable[[], float] = time.monotonic, poll_slice: float = POLL_SLICE_S,
                fsync: Callable[[int], None] = os.fsync) -> StageResult:
     """CONTRACT §5.4's ONE primitive. Copies ``staging/name`` into a fresh ``dest_dir/dest_name`` (root :
     ``dest_gid``, ``mode``: 0640 for the bundle, §2.1). ``header_check``: the first 16 bytes must be a git bundle header (``bundle-header``).
     ``digest``: ``sha256:<hex>`` the streamed bytes must hash to (``digest_refusal``). ``validate``: called with the
-    whole body before the fsync (the driver_input parse); it raises :class:`Refused` to refuse. Every refusal after
+    whole body before the fsync (the driver_input parse); it raises :class:`Refused` to refuse. ``observe``: called
+    with each piece of the body in order as it is written (the bundle header parse), never buffering it, then once
+    with ``b""`` at the body's end; a :class:`Refused` it raises refuses the copy. Every refusal after
     the destination is created unlinks it. Returns the size and digest of what was written."""
     for n in (name, dest_name):
         if not _NAME_RE.fullmatch(n) or n in (".", ".."):
@@ -345,6 +348,8 @@ def stage_copy(staging: int | str | os.PathLike[str], name: str, cap: int, heade
                 raise Refused("bundle-header" if accepted < HEADER_LEN else "staging-raced", name)
             write_all(out, hdr)
             h.update(hdr)
+            if observe is not None:
+                observe(hdr)
             left -= HEADER_LEN
         while left:
             chunk = pipe.read(min(CHUNK, left))
@@ -352,12 +357,16 @@ def stage_copy(staging: int | str | os.PathLike[str], name: str, cap: int, heade
                 raise Refused("staging-raced", "early EOF")
             write_all(out, chunk)
             h.update(chunk)
+            if observe is not None:
+                observe(chunk)
             if keep is not None:
                 keep += chunk
             left -= len(chunk)
         trailer = pipe.exactly(1)
         if trailer != b"E":
             raise Refused("staging-raced", "extra byte" if trailer == b"X" else "early EOF")
+        if observe is not None:
+            observe(b"")   # the end of the body
         got_digest = "sha256:" + h.hexdigest()
         if digest is not None and got_digest != digest:
             raise Refused(digest_refusal, name)
