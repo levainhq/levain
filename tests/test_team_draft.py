@@ -167,3 +167,53 @@ def test_a_draft_holding_hidden_text_is_refused_and_an_older_one_shows_escaped(w
     assert "summary must be text that shows as itself" in err
     assert git("rev-parse", "levain-team-ledger", cwd=ana) == before
     assert T.get_draft(store, d["draft_id"])["state"] == "drafted"
+
+
+def test_no_coordinator_path_reaches_the_signer(world, tmp_path, monkeypatch, capsys):
+    """C8's never-sign property, as an assertion: every signing entry of the ledger raises if anything reaches it, and
+    the coordinator does everything its door lets it do about a draft. A draft path that ever grew a call to the
+    signer fails here, not in a review."""
+    from levain.team.transport import GitLedger
+
+    ana, qdir, store, token = world
+
+    def reached(name):
+        def boom(*a, **k):
+            raise AssertionError(f"a coordinator path reached the signer: GitLedger.{name}")
+        return boom
+    for name in ("append", "write_canon", "update_counted", "init", "join"):
+        monkeypatch.setattr(GitLedger, name, reached(name))
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path))
+    monkeypatch.chdir(_coordinator_workspace(tmp_path))
+    before = git("rev-parse", "levain-team-ledger", cwd=ana)
+    d = T.add_draft(store, "decision", words="use the queue", kind="practice", paths=["a.py"], by="coordinator",
+                    token=token)
+    assert T.get_draft(store, d["draft_id"])["state"] == "drafted" and T.list_drafts(store)
+    assert levain_main(["team", "draft", "add", "finding", "--summary", "s", "--token", str(token)]) == 0
+    for argv in (["team", "draft", "list"], ["team", "draft", "show", d["draft_id"]],
+                 ["team", "status", "--repo", str(ana)], ["team", "verify", "--repo", str(ana)],
+                 ["team", "export", "--repo", str(ana)]):
+        levain_main(argv)                    # reads: whatever they print, none may sign
+    for argv in (["team", "draft", "promote", d["draft_id"], "--yes", "--repo", str(ana)],
+                 ["team", "draft", "promote", d["draft_id"], "--resume", "--yes", "--repo", str(ana)],
+                 ["team", "record", "decision", "--kind", "practice", "--words", "w", "--repo", str(ana)]):
+        assert levain_main(argv) == 1, argv
+    T.withdraw_draft(store, d["draft_id"], by="coordinator", token=token)
+    assert git("rev-parse", "levain-team-ledger", cwd=ana) == before
+    assert "reached the signer" not in capsys.readouterr().err
+
+
+def test_the_draft_module_cannot_import_the_ledger_writer():
+    """The only team module the draft store imports is the entry schema (what it validates against); the signer's
+    modules are never named in it, so a draft row can only become an entry through the operator's verb."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(T))
+    named = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module} | \
+            {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+    team_imports = {m for m in named if m.startswith("levain.team")}
+    assert team_imports <= {"levain.team"}, team_imports
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and n.module == "levain.team":
+            assert {a.name for a in n.names} <= {"entry"}, [a.name for a in n.names]
