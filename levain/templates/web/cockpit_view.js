@@ -1144,9 +1144,13 @@
       for (const x of pool) if ((x.tokens || 0) > (top.tokens || 0)) top = x;
       const line = d.lines.find((l) => l && l.sess === top);
       const meter = isNum(top.tokens) && top.tokens > 0 ? (top.window ? " \u00b7 " + Math.round(100 * top.tokens / top.window) + "% of context" : " \u00b7 " + k7K(top.tokens) + " tokens") : "";
-      // one line: a strip tile draws only its first sub line, and the counts are what the reader wants first
-      host.appendChild(el("div", "sub glance-top", live.length + " live \u00b7 " + quiet + " quiet \u00b7 busiest: " +
-        ((line && line.text) || top.agent || "session").replace(/\s+/g, " ").trim() + meter));
+      // one line: a strip tile draws only its first sub line, and the counts are what the reader wants first. The busiest seat is the tile's
+      // title (hover) and a second sub line where the tile has the room for it, never a tail that gets cut off the counts.
+      const busiest = ((line && line.text) || top.agent || "session").replace(/\s+/g, " ").trim() + meter;
+      const counts = el("div", "sub glance-top", live.length + " live \u00b7 " + quiet + " quiet");
+      counts.title = "busiest: " + busiest;
+      host.appendChild(counts);
+      host.appendChild(el("div", "sub glance-busiest", "busiest: " + busiest));
     }
   }
   function paintWidget(s, host) {
@@ -1367,9 +1371,12 @@
   }
   function paintBriefCard(host, b) {
     const head = el("div", "brief-head");
-    head.appendChild(el("h3", "", b.title));
+    // levain's own card is named for what it holds: the Tray's next items (the data's "Where to begin" would read twice beside flow's plan card)
+    head.appendChild(el("h3", "", b.title === "Where to begin" ? "Next from the Tray" : b.title));
     head.appendChild(el("span", "sp"));
-    if (b.source) head.appendChild(el("span", "stamp", b.source));
+    const hasThreads = Array.isArray(b.threads) && groupThreads(b.threads).length > 0;
+    // where the card has a lower heading (the loops column) the "from ..." caption sits under it, not floating in the head
+    if (b.source && !hasThreads) head.appendChild(el("span", "stamp", b.source));
     host.appendChild(head);
     const body = el("div", "brief-cols");
     const lead = el("div", "brief-lead");
@@ -1402,6 +1409,7 @@
     if (groups.length) {
       const col = el("div", "brief-threads");
       col.appendChild(el("div", "k", "Loops by thread"));
+      if (b.source) col.appendChild(el("div", "brief-src", b.source));
       for (const g of groups.slice(0, THREADS_SHOWN)) {
         const row = el("div", "thread");
         row.appendChild(el("span", "t", g.repo ? g.top : g.label));
