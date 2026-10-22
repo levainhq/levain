@@ -263,6 +263,37 @@ def test_delete_refuses_a_tree_deeper_than_its_fd_bound(tmp_path):
     assert any(p.name == "leaf" for p in (tmp_path / "deep").rglob("leaf"))
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="BSD flags on a symlink are macOS's")
+@pytest.mark.parametrize("walk", ["trash", "export"])
+def test_a_flagged_symlink_is_cleared_by_path_only_in_the_root_owned_trash_walk(tmp_path, monkeypatch, walk):
+    # Reproduced on 7749b672: the export walk (a tree _levain_export owns, so it can swap a directory under the
+    # path) cleared a flagged symlink's flags by os.chflags on a path.
+    L = _store(tmp_path)
+    SV.discard(_facts(L), _seams(Ctl(R.RETAINED)))
+    _plant(L, S)
+    link = (L / "trash" / S / "tree" / "repo" if walk == "trash" else L / "export" / "operator" / S) / "flagged"
+    os.symlink("bundle", link)
+    subprocess.run(["chflags", "-h", "uchg", str(link)], check=True)
+    calls = []
+
+    class Os(_Os):
+        def chflags(self, path, *a, **k):
+            calls.append(str(path))
+            return os.chflags(path, *a, **k)
+    monkeypatch.setattr(SV, "os", Os())
+    if walk == "trash":
+        SV._delete_trash_step(_facts(L), _seams(Ctl(R.TRASH)))
+        assert not os.path.lexists(link) and calls == [str(link.parent.resolve() / "flagged")]
+        return
+    try:
+        with pytest.raises(Refused) as e:
+            SV.delete_export(_facts(L), _seams(Ctl(R.TRASH)))
+        assert (e.value.name, calls) == ("delete-flagged-special", []) and os.path.lexists(link)
+    finally:
+        if os.path.lexists(link):
+            os.chflags(link, 0, follow_symlinks=False)
+
+
 def test_purge_verb_removes_export_staging_and_flagged_trash(tmp_path):
     L = _store(tmp_path)
     ctl = Ctl(R.RETAINED)

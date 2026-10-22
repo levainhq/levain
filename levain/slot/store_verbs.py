@@ -21,7 +21,8 @@ the verb completes it rather than refusing it.
 Locks (§4.7): root's per-session lock ``L/alloc/<s>.lock`` (shared with every per-session root verb), TRY, held =
 ``session-busy``; purge also TRIES the machine-wide adopt lock ``L/export/adopt.lock`` after it (order session ->
 adopt), held = ``adopt-busy``. Every delete walks by directory fd (``unlinkat``), never follows a link, never crosses
-a mount, and clears BSD flags (macOS) / the immutable and append-only bits (Linux) before it unlinks.
+a mount, and clears BSD flags (macOS) / the immutable and append-only bits (Linux) before it unlinks; outside the
+root-owned trash entry a flagged macOS symlink / FIFO / socket is refused (``delete-flagged-special``), not cleared.
 """
 from __future__ import annotations
 
@@ -372,11 +373,16 @@ def _darwin_clear_at(dfd: int, name: str, st: os.stat_result) -> None:
     os.chflags(path, pst.st_flags & ~_DARWIN_CLEAR, follow_symlinks=False)
 
 
-def _clear_leaf(dfd: int, name: str, st: os.stat_result, seams: StoreSeams) -> bool:
+def _clear_leaf(dfd: int, name: str, st: os.stat_result, seams: StoreSeams, root_tree: bool) -> bool:
     """Clear a leaf's flags: a regular file's through an fd of it, a macOS non-regular leaf's by path; False when
-    it is neither (a Linux non-regular leaf: no fd ioctl reaches it)."""
+    it is neither (a Linux non-regular leaf: no fd ioctl reaches it). The path route is taken only in a tree
+    ``root_tree`` says is root's for its whole length: elsewhere the tree's owner could swap a directory on the
+    path between the check and the call, so a flagged non-regular leaf there is refused
+    (``delete-flagged-special``) and left in place."""
     if not stat.S_ISREG(st.st_mode):
         if sys.platform == "darwin" and refusing_flags(st):
+            if not root_tree:
+                raise Refused("delete-flagged-special", name)
             _darwin_clear_at(dfd, name, st)
             return True
         return False
@@ -391,16 +397,16 @@ def _clear_leaf(dfd: int, name: str, st: os.stat_result, seams: StoreSeams) -> b
     return True
 
 
-def _unlink_leaf(dfd: int, name: str, st: os.stat_result, seams: StoreSeams) -> None:
+def _unlink_leaf(dfd: int, name: str, st: os.stat_result, seams: StoreSeams, root_tree: bool) -> None:
     if refusing_flags(st):
-        _clear_leaf(dfd, name, st, seams)
+        _clear_leaf(dfd, name, st, seams, root_tree)
     try:
         os.unlink(name, dir_fd=dfd)
     except FileNotFoundError:
         return
     except PermissionError:
         # Linux's immutable bit is not in stat: clear it now that the unlink named it, then once more.
-        if not _clear_leaf(dfd, name, st, seams):
+        if not _clear_leaf(dfd, name, st, seams, root_tree):
             raise
         os.unlink(name, dir_fd=dfd)
 
@@ -417,7 +423,7 @@ def _list_all(cur: int) -> list[tuple[str, os.stat_result]]:
     return out
 
 
-def delete_at(dfd: int, name: str, seams: StoreSeams) -> bool:
+def delete_at(dfd: int, name: str, seams: StoreSeams, *, root_tree: bool = False) -> bool:
     """Delete ``name`` in the directory ``dfd`` and everything below it; False when it was absent. Iterative and by
     directory fd, the way ``shutil.rmtree``'s fd walk is: each directory is listed once, to its end, and its
     entries are removed from that list; a subdirectory is opened relative to its parent's fd (checked to be the
@@ -425,13 +431,15 @@ def delete_at(dfd: int, name: str, seams: StoreSeams) -> bool:
     subdirectory is removed relative to it, never by a path or ``..``. No link is followed; a directory on another
     device than ``dfd`` (``name`` itself included) is refused (``delete-crosses-mount``), never entered; a tree
     deeper than :data:`DELETE_MAX_DEPTH` is refused (``delete-too-deep``) before the fd past it is opened. Flags are
-    cleared before each unlink. Idempotent: a crash or refusal part-way leaves a smaller tree that the next call
-    deletes."""
+    cleared before each unlink. ``root_tree`` is the CALLER's word that the tree is root's for its whole length,
+    never inferred from it: only then is a flagged macOS symlink / FIFO / socket cleared by path; otherwise it is
+    refused (``delete-flagged-special``). Idempotent: a crash or refusal part-way leaves a smaller tree that the
+    next call deletes."""
     st = _lstat_at(dfd, name)
     if st is None:
         return False
     if not stat.S_ISDIR(st.st_mode):
-        _unlink_leaf(dfd, name, st, seams)
+        _unlink_leaf(dfd, name, st, seams, root_tree)
         os.fsync(dfd)
         return True
     top_dev = os.fstat(dfd).st_dev
@@ -451,7 +459,7 @@ def delete_at(dfd: int, name: str, seams: StoreSeams) -> bool:
             if entries:
                 n, est = entries.pop()
                 if not stat.S_ISDIR(est.st_mode):
-                    _unlink_leaf(cur, n, est, seams)
+                    _unlink_leaf(cur, n, est, seams, root_tree)
                     continue
                 if est.st_dev != top_dev:
                     raise Refused("delete-crosses-mount", n)
@@ -478,20 +486,23 @@ def delete_at(dfd: int, name: str, seams: StoreSeams) -> bool:
             os.close(cur)
 
 
-def delete_named(store: Path, parts: tuple[str, ...], names: tuple[str, ...], seams: StoreSeams) -> list[str]:
-    """Delete each of ``names`` (exact names, never a pattern) in ``L/<parts>``; the names that were there."""
+def delete_named(store: Path, parts: tuple[str, ...], names: tuple[str, ...], seams: StoreSeams, *,
+                 root_tree: bool = False) -> list[str]:
+    """Delete each of ``names`` (exact names, never a pattern) in ``L/<parts>``; the names that were there.
+    ``root_tree`` as :func:`delete_at`'s."""
     dfd = _open_store_dir(store, *parts)
     if dfd is None:
         return []
     try:
-        return [n for n in names if delete_at(dfd, n, seams)]
+        return [n for n in names if delete_at(dfd, n, seams, root_tree=root_tree)]
     finally:
         os.close(dfd)
 
 
 def delete_export(facts: StoreFacts, seams: StoreSeams) -> list[str]:
     """§7.4 purge ``delete_export``: ``L/export/<class>/<s>/`` (a ``verify.new/`` inside it goes with it) and the
-    publish transaction's ``L/export/<class>/<s>.new/``, the class from alloc ``kind``."""
+    publish transaction's ``L/export/<class>/<s>.new/``, the class from alloc ``kind``. The export tree is not
+    root's, so a flagged non-regular leaf in it is refused (``delete-flagged-special``), that leaf and the directories above it left in place."""
     return delete_named(facts.store, ("export", facts.export_class), facts.export_names, seams)
 
 
@@ -548,7 +559,8 @@ def _delete_export_step(facts: StoreFacts, seams: StoreSeams) -> None:
 
 
 def _delete_trash_step(facts: StoreFacts, seams: StoreSeams) -> None:
-    delete_named(facts.store, ("trash",), (facts.session,), seams)
+    # The trash entry is root's for its whole length, so this walk alone may clear a non-regular leaf by path.
+    delete_named(facts.store, ("trash",), (facts.session,), seams, root_tree=True)
 
 
 def discard_plan(facts: StoreFacts, seams: StoreSeams) -> Plan:
