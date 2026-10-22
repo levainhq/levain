@@ -1025,6 +1025,7 @@ class Control:
         delay = EOF_RETRY_FIRST_S
         noted = False
         dropped_early = False
+        spawn_noted = False
         while True:
             try:
                 revoked = False
@@ -1055,7 +1056,9 @@ class Control:
                         self._spawn(lambda s, ep=epoch: self._drop(s, ep), session, name=f"control-eofdrop-{session}")
                         dropped_early = True
                     except RuntimeError as spawn_err:  # no thread to be had: the revoke keeps retrying, and so does this
-                        self.seam_errors.append(("eofdrop", session, spawn_err))
+                        if not spawn_noted:
+                            self.seam_errors.append(("eofdrop", session, spawn_err))
+                            spawn_noted = True
                 self._sleep(delay)
                 delay = min(delay * 2, EOF_RETRY_MAX_S)
         if revoked:
