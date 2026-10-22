@@ -66,6 +66,21 @@ def test_a_waiting_node_opens_its_card_and_no_other_node_is_a_button(tmp_path, m
 
 
 @needs_browser
+def test_a_click_on_a_node_opens_the_agent_page_and_the_hover_card_is_not_the_answer(tmp_path, monkeypatch):
+    # reproduced 10-21: a click pinned the same hover card and opened nothing. A click, or Enter on a focused node, opens the modal page; empty stage does nothing.
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    page = ("JSON.stringify([!!document.getElementById('levain-modal'), (document.getElementById('levain-modal-title') || {}).textContent, "
+            "[...document.querySelectorAll('#levain-modal dt')].map(d => d.textContent).slice(0, 3), (document.querySelector('#levain-modal .agent-page') || {}).textContent.includes('keeps no transcript')])")
+    click = "%s.querySelector('.tv-gnode[data-node=n4]').dispatchEvent(new MouseEvent('click', {bubbles: true})); 1" % TV
+    empty = "document.getElementById('levain-modal').remove(); %s.querySelector('.tv-stage').dispatchEvent(new MouseEvent('click', {bubbles: true})); String(!!document.getElementById('levain-modal'))" % TV
+    key = "%s.querySelector('.tv-gnode[data-node=n4]').dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true})); String(!!document.getElementById('levain-modal'))" % TV
+    out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_graph_value(), "agents")}, {"eval": click}, {"eval": page}, {"eval": empty}, {"eval": key}])
+    opened, title, dts, notx = json.loads(out[-3])
+    assert opened is True and title.endswith("stalled") and dts == ["state", "agent", "model"] and notx is True, out
+    assert out[-2] == "false" and out[-1] == "true", out
+
+
+@needs_browser
 def test_streams_run_only_on_a_real_positive_rate_of_a_live_node(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     wait = "new Promise(r => setTimeout(r, 300))"

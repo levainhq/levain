@@ -4316,6 +4316,43 @@
     modalEpisodeQuery = "";
     buildModal(null);
   }
+  // The agent page: one node of the Agents graph opened as a modal. The fact rows come from the caller (the graph's one row builder);
+  // the transcript is read at open through the session reader and drawn by the session drawer.
+  function openAgentPage(page, opener) {
+    if (!page || typeof page !== "object") return;
+    const id = String(page.id || "");
+    const stem = typeof page.session === "string" && page.session ? page.session : (id.startsWith("session:") ? id.slice(8) : "");
+    let card = null;
+    const buildCard = () => {
+      const c = el("div", "agent-page");
+      const dl = el("dl", "consent-kv");
+      for (const [k, v] of (Array.isArray(page.rows) ? page.rows : [])) { dl.appendChild(el("dt", null, k)); dl.appendChild(el("dd", null, String(v))); }
+      c.appendChild(dl);
+      if (!stem) { c.appendChild(el("div", "ext-meta", "this view keeps no transcript for this agent")); return c; }
+      const wrap = el("div", "sess-tx-wrap");
+      const slot = el("div", "sess-tx ext-meta");
+      const btn = el("button", "undo-btn sess-tx-btn", "refresh");
+      btn.type = "button";
+      const read = () => {
+        btn.disabled = true;
+        slot.replaceChildren(document.createTextNode("reading the transcript\u2026"));
+        sessionTranscript(stem, wrap).then((b) => drawSessionTranscript(slot, b))
+          .catch(() => slot.replaceChildren(el("div", "consent-note ext-meta", SESS_BAD_READ)))
+          .finally(() => { btn.disabled = false; });
+      };
+      btn.addEventListener("click", read);
+      wrap.append(btn, slot);
+      c.appendChild(wrap);
+      read();
+      return c;
+    };
+    modalCustom = { id, page: true, title: String(page.label || "agent") + " \u00b7 " + String((page.rows && page.rows[0] && page.rows[0][1]) || "agent"), build: () => (card = card || buildCard()) };
+    modalGlance = false;
+    modalKey = "agent:" + id;
+    modalReturnFocus = opener || null;
+    modalEpisodeQuery = "";
+    buildModal(null);
+  }
   // A JSON payload (a tool's input) as a key/value list: command, description, file_path. Anything else stays the verbatim text.
   function consentRequest(display, tool) {
     let t = String(display || "");
@@ -5118,6 +5155,7 @@
     if (!modalKey) return;
     // a Needs-you card keeps its place (and any words typed into it) while the item still waits; it closes when the item is answered
     if (modalCustom) {
+      if (modalCustom.page) return;   // an agent page is not tied to a waiting item
       if (!needsItems(((currentView && currentView.extra_panels || {}).decisions || {}).lines).some((it) => needsIdOf(it) === modalCustom.id)) closeModal();
       return;
     }
@@ -5300,6 +5338,7 @@
     }
   }
 
+  window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
   window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
 })();
