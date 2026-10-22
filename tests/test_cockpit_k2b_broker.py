@@ -31,9 +31,11 @@ BROWSER = {"class": "token", "name": "browser"}
 PHONE = {"class": "token", "name": "flowconnect"}
 
 
+from tests.autonomic_confirm_keys import account_home
+
 @pytest.fixture
 def home() -> Iterator[Path]:
-    d = Path(tempfile.mkdtemp(prefix=".levain-k2b-broker-", dir=Path.home()))
+    d = Path(tempfile.mkdtemp(prefix=".levain-k2b-broker-", dir=account_home()))
     try:
         yield d
     finally:

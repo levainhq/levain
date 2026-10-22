@@ -55,9 +55,11 @@ VERBS = {
 }
 
 
+from tests.autonomic_confirm_keys import account_home
+
 @pytest.fixture
 def home() -> Iterator[Path]:
-    d = Path(tempfile.mkdtemp(prefix=".levain-k2b-crash-", dir=Path.home()))
+    d = Path(tempfile.mkdtemp(prefix=".levain-k2b-crash-", dir=account_home()))
     try:
         yield d
     finally:

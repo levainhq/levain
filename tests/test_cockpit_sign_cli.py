@@ -30,9 +30,11 @@ from tests.test_cockpit_k2a import _get, _install, _post, _serve
 TOKEN = "row12b-token"
 
 
+from tests.autonomic_confirm_keys import account_home
+
 @pytest.fixture
 def home() -> Iterator[Path]:
-    d = Path(tempfile.mkdtemp(prefix=".levain-row12b-", dir=Path.home()))
+    d = Path(tempfile.mkdtemp(prefix=".levain-row12b-", dir=account_home()))
     try:
         yield d
     finally:
