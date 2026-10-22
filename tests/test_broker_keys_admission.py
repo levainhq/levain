@@ -26,6 +26,10 @@ def _connect(path: str) -> str:
     try:
         s.connect(path)
         return "connected"
+    except (ConnectionRefusedError, FileNotFoundError):
+        # nothing listens: a closed listener whose path is left behind refuses; Python 3.13's asyncio unlinks a unix
+        # server's path when the server closes, so the same state reads as a missing file there
+        return "refused"
     except OSError as e:
         return type(e).__name__
     finally:
@@ -55,7 +59,7 @@ def test_stdin_not_a_pipe_never_ends_keys():
             assert p.wait(10) == 0
             err = p.stderr.read().decode()
             assert "trigger is not armed" in err and "stopped" in err, err
-            assert _connect(front) == "ConnectionRefusedError"
+            assert _connect(front) == "refused"
         finally:
             if p.poll() is None:
                 p.kill()
@@ -112,7 +116,7 @@ def test_trigger_while_start_creates_its_server_leaves_no_listener(monkeypatch):
 
     try:
         serving, conn = asyncio.run(run())
-        assert serving == [False] and conn == "ConnectionRefusedError", (serving, conn)
+        assert serving == [False] and conn == "refused", (serving, conn)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
