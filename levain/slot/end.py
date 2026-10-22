@@ -384,7 +384,7 @@ def _reopen_parent(child_fd: int, frame: list) -> None:
 
 
 def walk(root: Path, extra: Mapping[bytes, Path] | None = None, *,
-         depth_cap: int = MANIFEST_DEPTH) -> Iterator[Entry]:
+         depth_cap: int = MANIFEST_DEPTH, prune: Callable[[Entry], bool] | None = None) -> Iterator[Entry]:
     """Every entry under ``root`` (not ``root`` itself), depth first, a directory before its children,
     names in byte order; never follows a link (each directory opened ``O_NOFOLLOW`` from its parent's
     fd and checked against the ``lstat`` that named it). ``extra`` adds root children that live
@@ -397,7 +397,11 @@ def walk(root: Path, extra: Mapping[bytes, Path] | None = None, *,
     ``manifest-depth-cap``. At most :data:`WALK_OPEN_DIRS` directory fds are held: the root's always, and
     the deepest ones; an ancestor is closed before a child would pass that, and reopened from its child's ``..``
     on the way back up (:func:`_reopen_parent`). The walk never has more than :data:`WALK_PEAK_FDS` open at
-    once. Only the directory of the entry yielded is guaranteed open."""
+    once. Only the directory of the entry yielded is guaranteed open.
+
+    ``prune``: called on a yielded directory AFTER the consumer's step returns and before the walk opens it;
+    true = do not descend (the directory itself was yielded, nothing under it is opened or listed). The default
+    descends everywhere. A plain call, never a ``send()``: callers iterate with ``for``."""
     extra = dict(extra or {})
     root_b = os.fsencode(root)
     root_fd = os.open(root_b, _DIR_FLAGS)
@@ -442,15 +446,19 @@ def walk(root: Path, extra: Mapping[bytes, Path] | None = None, *,
                 raise Refused("manifest-depth-cap", f"{path[:200]!r}... is deeper than {depth_cap} levels")
             if name in fextra:
                 absp, st = fextra[name]
-                yield Entry(path, st, -1, name, absp)
+                e = Entry(path, st, -1, name, absp)
+                yield e
             else:
                 st = os.stat(name, dir_fd=fd, follow_symlinks=False)
                 if st.st_dev != dev:
                     raise Refused("tree-mount", f"{path!r} is on another filesystem")
                 absp = absprefix + b"/" + name
-                yield Entry(path, st, fd, name, absp)
+                e = Entry(path, st, fd, name, absp)
+                yield e
                 if not stat.S_ISDIR(st.st_mode):
                     continue
+            if prune is not None and prune(e):
+                continue
             # The open frames are the root's and stack[low:]; the child makes one more, so the shallowest goes
             # first (never the current frame: WALK_OPEN_DIRS is far above two).
             if 1 + len(stack) - low >= WALK_OPEN_DIRS:
