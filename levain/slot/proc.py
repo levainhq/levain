@@ -787,12 +787,13 @@ _STOP_SIGNALS = frozenset({signal.SIGSTOP, signal.SIGTSTP, signal.SIGTTIN, signa
 
 
 #: Signalling children SIGKILLed at a deadline and still unreaped after :data:`REAP_GRACE_S` (a child stuck in an
-#: uninterruptible kernel state): :func:`reap_leftovers` reaps them once they die.
-_LEFTOVER: list[int] = []
+#: uninterruptible kernel state): :func:`reap_leftovers` reaps them once they die. Per process, and each process
+#: that uses it single-threaded (reaper DESIGN RH2).
+_LEFTOVER: set[int] = set()
 
 
 def reap_leftovers(*, waitpid: Callable[[int, int], tuple[int, int]] = os.waitpid) -> None:
-    """A non-blocking reap of every pid in the leftover list; a reaped (or no longer ours) pid leaves it. For the
+    """A non-blocking reap of every pid in the leftover set; a reaped (or no longer ours) pid leaves it. For the
     reaper's worker to call at the top of each pass and the revoker at each wake (reaper DESIGN §4.1);
     :func:`end_domain` calls it at its start."""
     for pid in tuple(_LEFTOVER):
@@ -801,7 +802,7 @@ def reap_leftovers(*, waitpid: Callable[[int, int], tuple[int, int]] = os.waitpi
         except ChildProcessError:
             got = pid
         if got == pid:
-            _LEFTOVER.remove(pid)
+            _LEFTOVER.discard(pid)
 
 
 def _poll_wait(pid: int, flags: int, deadline: float, waitpid: Callable[[int, int], tuple[int, int]],
@@ -827,7 +828,7 @@ def _kill_and_reap(pid: int, kill: Callable[[int, int], None], waitpid: Callable
         pass
     try:
         if _poll_wait(pid, 0, clock() + REAP_GRACE_S, waitpid, clock, sleep) is None:
-            _LEFTOVER.append(pid)
+            _LEFTOVER.add(pid)
     except ChildProcessError:
         pass
 
@@ -853,7 +854,7 @@ def signal_as_uid(uid: int, sig: int, timeout: float = V12_SECONDS, *, fork: Cal
 
     The wait is bounded by :data:`SIGNAL_CHILD_S` or ``timeout`` (the caller's deadline; reaper DESIGN RH2, H3),
     whichever is shorter: a child neither exited nor stopped by then (a fork that inherited a libc lock another thread
-    held, say) is SIGKILLed, its reap polled for :data:`REAP_GRACE_S` (else it joins the leftover list,
+    held, say) is SIGKILLed, its reap polled for :data:`REAP_GRACE_S` (else it joins the leftover set,
     :func:`reap_leftovers`), and the call raises ``Refused("signal-child-hung")``: never a hang. The sweep that
     called it goes on (:func:`_sweep`). A ``fork`` refused with EAGAIN (the process table or the caller's process
     limit full) is tried again until ``timeout``; past it the call returns ``False``, nothing sent."""
