@@ -66,7 +66,7 @@ from typing import Awaitable, Dict, List, Optional, Sequence, Set, Tuple, TypeVa
 import h11
 
 from levain.broker import gwwire, norm, upstream
-from levain.broker.creds import CredLifecycle, CredStore, FakeCredLifecycle, check_host, on_upstream_401
+from levain.broker.creds import CredLifecycle, CredStore, CredWriter, FakeCredLifecycle, check_host, on_upstream_401
 from levain.broker.gwwire import FrameReader, KeysSide, WireError
 from levain.broker.peer import PeerUnknown, peer_of, peer_uid
 from levain.broker.policy import PolicyError, RoutePolicy, parse_route
@@ -1895,20 +1895,26 @@ def main(argv: Optional[List[str]] = None) -> int:
             else:
                 admin_gid = g
     raise_nofile()
-    keys = Keys(gw_uids=gw_uids, single_uid=single_uid, control_path=a.control, lib_root=a.lib_root,
-                control_uid=control_uid, unmetered=a.unmetered)
+    # the ONE credential writer (design 1.8): its executor made here at start, its thread at the first commit; it is
+    # the credential layer shutdown's latch and step (3) call. Closed after the loop, whatever ended it.
+    cred_writer = CredWriter(os.path.join(a.lib_root, "keys", "cred"))
     try:
-        keys.gw_log = install_log(a.lib_root)   # before _serve counts the fds: the log's fd is a fixed one
-    except OSError as e:
-        print(f"levain gw-keys: refused: gw.jsonl cannot be opened ({type(e).__name__})", file=sys.stderr)
-        return 3
-    front_path = os.path.join(a.runtime_root, "keys", "front.sock")
-    admin_path = os.path.join(a.runtime_root, "keys", "admin.sock")
-    try:
-        return asyncio.run(_serve(keys, front_path, gid, admin_path, admin_gid))
-    except FileExistsError as e:
-        print(f"levain gw-keys: {e}", file=sys.stderr)
-        return 3
+        keys = Keys(gw_uids=gw_uids, single_uid=single_uid, control_path=a.control, lib_root=a.lib_root,
+                    control_uid=control_uid, unmetered=a.unmetered, cred_lifecycle=cred_writer)
+        try:
+            keys.gw_log = install_log(a.lib_root)   # before _serve counts the fds: the log's fd is a fixed one
+        except OSError as e:
+            print(f"levain gw-keys: refused: gw.jsonl cannot be opened ({type(e).__name__})", file=sys.stderr)
+            return 3
+        front_path = os.path.join(a.runtime_root, "keys", "front.sock")
+        admin_path = os.path.join(a.runtime_root, "keys", "admin.sock")
+        try:
+            return asyncio.run(_serve(keys, front_path, gid, admin_path, admin_gid))
+        except FileExistsError as e:
+            print(f"levain gw-keys: {e}", file=sys.stderr)
+            return 3
+    finally:
+        cred_writer.close()
 
 
 if __name__ == "__main__":

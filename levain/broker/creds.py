@@ -9,18 +9,27 @@ equal the bytes it was parsed from, else the file is parsed and the cache replac
 is never served from an earlier parse; ENOENT evicts at once, so a removed credential stops working on the next
 exchange. `rev` is compared for equality only, never ordered.
 
-The refresh (kind `oauth2-refresh`) and the one credential writer are not built at this tip: an upstream 401 reaches
-the credential layer through `on_upstream_401`, a no-op for the static kind.
+The one write discipline (design 1.8) is `commit` / `remove`, used by both writers: keys' `CredWriter` (on its one
+writer thread, the `flock` non-blocking and bounded) and the install helper's `set-credential` / `remove-credential`
+child (the `flock` waits). `CredWriter` is also the real `CredLifecycle`; its `_refresh_tasks` set stays empty until the
+refresh exists. The refresh (kind `oauth2-refresh`) is not built at this tip: an upstream 401 reaches the credential
+layer through `on_upstream_401`, a no-op for the static kind.
 """
 from __future__ import annotations
 
+import asyncio
 import errno
+import fcntl
+import functools
 import json
 import logging
 import os
 import re
 import stat
-from typing import Dict, List, Optional, Protocol, Set, Tuple
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Dict, List, Optional, Protocol, Set, Tuple
 
 from levain.broker.norm import Refused
 from levain.broker.redact import unsafe_with_marker
@@ -191,6 +200,37 @@ def _no_dup(pairs: list) -> dict:
     return out
 
 
+def read_file(dir_fd: int, name: str) -> Optional[bytes]:
+    """`<name>.json` below `dir_fd`, at most FILE_CAP bytes, or None when absent; `Unparseable` for a file that is not
+    a regular one or is over the cap, `OSError` for any other failure. The one read: the per-exchange observation and
+    the writers' `rev` compare both use it."""
+    # O_NONBLOCK: opening a FIFO with no writer would otherwise block keys' one loop; the fstat then refuses
+    # anything but a regular file before a byte is read (O_NONBLOCK changes nothing for a regular file's read).
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(name + ".json", flags, dir_fd=dir_fd)
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            return None
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Unparseable("not a regular file")
+        chunks, got = [], 0
+        while got <= FILE_CAP:
+            b = os.read(fd, FILE_CAP + 1 - got)
+            if not b:
+                break
+            chunks.append(b)
+            got += len(b)
+    finally:
+        os.close(fd)
+    raw = b"".join(chunks)
+    if len(raw) > FILE_CAP:
+        raise Unparseable("size")
+    return raw
+
+
 class CredStore:
     """Credentials observed under one directory fd. `observe(name)` is called once per exchange that needs `name`."""
 
@@ -200,31 +240,7 @@ class CredStore:
         self.cache: Dict[str, Tuple[bytes, Credential]] = {}
 
     def _read(self, name: str) -> Optional[bytes]:
-        # O_NONBLOCK: opening a FIFO with no writer would otherwise block keys' one loop; the fstat then refuses
-        # anything but a regular file before a byte is read (O_NONBLOCK changes nothing for a regular file's read).
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
-        try:
-            fd = os.open(name + ".json", flags, dir_fd=self.dir_fd)
-        except OSError as e:
-            if e.errno == errno.ENOENT:
-                return None
-            raise
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise Unparseable("not a regular file")
-            chunks, got = [], 0
-            while got <= FILE_CAP:
-                b = os.read(fd, FILE_CAP + 1 - got)
-                if not b:
-                    break
-                chunks.append(b)
-                got += len(b)
-        finally:
-            os.close(fd)
-        raw = b"".join(chunks)
-        if len(raw) > FILE_CAP:
-            raise Unparseable("size")
-        return raw
+        return read_file(self.dir_fd, name)
 
     def observe(self, name: str) -> Credential:
         """The credential `name` as the file holds it NOW, or `Refused("credential-unavailable")`."""
@@ -264,3 +280,311 @@ def on_upstream_401(credential: Credential, generation: str) -> None:
     """An upstream 401 on an exchange that sent `credential` at `generation`. The static kind relays the 401 as is,
     so this is a no-op for it; the refresh kind's handling is not built at this tip."""
     return None
+
+
+# --- the one write discipline (design 1.8) ---------------------------------------------------------------------------
+
+LOCK = ".lock"
+LOCK_TIMEOUT_S = 10.0      # keys' flock: a stopped holder fails the commit after this (DECISION, design 1.8 / R8)
+LOCK_RETRY_S = 0.05
+STALE_TMP_S = 60.0         # whoever holds the lock removes temps older than this
+_TMP_RE = re.compile(r"\.[a-z0-9-]{1,48}\.[0-9]+\.[0-9a-f]+\.tmp")   # `.<name>.<pid>.<random>.tmp`, nothing else
+_O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+COMMITTED, DISCARDED = "committed", "discarded"
+
+
+class CommitFailed(Exception):
+    """Nothing was committed and the old file is intact: `credential-lock-timeout` (the flock was not had within the
+    bound) or `credential-commit-failed` (an OS failure at the lock, the read, the temp or the rename)."""
+
+    def __init__(self, name: str, detail: str = "") -> None:
+        super().__init__(f"{name}: {detail}" if detail else name)
+        self.name = name
+
+
+class Outcome:
+    """`COMMITTED` with the new `rev` (`durable` False when the directory fsync failed after the rename: the new file
+    is in place, and the caller uses it), or `DISCARDED` (the `rev` compare failed: the file changed or is gone)."""
+    __slots__ = ("result", "rev", "durable")
+
+    def __init__(self, result: str, rev: Optional[str] = None, durable: bool = True) -> None:
+        self.result, self.rev, self.durable = result, rev, durable
+
+    def __repr__(self) -> str:
+        return f"Outcome({self.result}, rev={self.rev!r}, durable={self.durable})"
+
+
+def full_fsync(fd: int) -> None:
+    """`F_FULLFSYNC` on macOS (a plain fsync there does not reach the medium), `os.fsync` elsewhere."""
+    if sys.platform == "darwin":
+        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+    else:
+        os.fsync(fd)
+
+
+def dir_fsync(fd: int) -> None:
+    """The directory's fsync: on macOS `F_FULLFSYNC` on the dirfd, and `os.fsync` if that raises (some filesystems
+    refuse it on a directory)."""
+    if sys.platform == "darwin":
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            return
+        except OSError:
+            pass
+    os.fsync(fd)
+
+
+def _renameat(src: str, dst: str, dir_fd: int) -> None:
+    os.rename(src, dst, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+
+
+class WriteSeams:
+    """The commit's OS acts a test injects a failure into, each with its real default."""
+
+    def __init__(self, *, fsync_file: Callable[[int], None] = full_fsync, fsync_dir: Callable[[int], None] = dir_fsync,
+                 rename: Callable[[str, str, int], None] = _renameat,
+                 monotonic: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
+                 clock: Callable[[], float] = time.time) -> None:
+        self.fsync_file, self.fsync_dir, self.rename = fsync_file, fsync_dir, rename
+        self.monotonic, self.sleep, self.clock = monotonic, sleep, clock
+
+
+def render(fields: dict, name: str) -> Tuple[bytes, str]:
+    """A credential object WITHOUT `rev` -> the file's bytes with a FRESH random `rev` (16 bytes of `os.urandom`, hex),
+    and that `rev`. The bytes are parsed by `parse` before they are returned, so a writer only ever writes what the
+    reader accepts; `Unparseable` names the field otherwise."""
+    if not isinstance(fields, dict) or "rev" in fields:
+        raise Unparseable("rev")
+    rev = os.urandom(16).hex()
+    d = dict(fields)
+    d["rev"] = rev
+    try:
+        raw = json.dumps(d, sort_keys=True, separators=(",", ":")).encode("ascii")
+    except (TypeError, ValueError, RecursionError) as e:
+        raise Unparseable(type(e).__name__) from None
+    if len(raw) > FILE_CAP:
+        raise Unparseable("size")
+    parse(raw, name)
+    return raw, rev
+
+
+def _open_lock(dir_fd: int) -> int:
+    fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0), 0o600,
+                 dir_fd=dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "the lock is not a regular file")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _take_lock(fd: int, wait: bool, timeout_s: float, seams: WriteSeams) -> bool:
+    """`flock(LOCK_EX)`: waiting (the install helper: an operator verb may wait), or `LOCK_NB` retried every
+    LOCK_RETRY_S for at most `timeout_s` (keys' writer thread: a stopped holder never holds it forever)."""
+    if wait:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return True
+    end = seams.monotonic() + timeout_s
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError as e:
+            if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                raise
+        if seams.monotonic() >= end:
+            return False
+        seams.sleep(LOCK_RETRY_S)
+
+
+def _sweep(dir_fd: int, now: float) -> None:
+    """Under the lock: remove `.<name>.<pid>.<random>.tmp` files older than STALE_TMP_S (a killed writer's)."""
+    for entry in os.listdir(dir_fd):
+        if not _TMP_RE.fullmatch(entry):
+            continue
+        try:
+            st = os.lstat(entry, dir_fd=dir_fd)
+            if stat.S_ISREG(st.st_mode) and now - st.st_mtime > STALE_TMP_S:
+                os.unlink(entry, dir_fd=dir_fd)
+        except OSError:
+            pass
+
+
+def _unlink_quiet(path: str, dir_fd: int) -> None:
+    try:
+        os.unlink(path, dir_fd=dir_fd)
+    except OSError:
+        pass
+
+
+def _locked(dir_fd: int, wait: bool, timeout_s: float, seams: WriteSeams) -> int:
+    """Open the lock and take it (step 1), or raise `CommitFailed`; returns the held lock's fd."""
+    try:
+        lock_fd = _open_lock(dir_fd)
+    except OSError as e:
+        _note(logging.WARNING, "levain gw-keys: credential-commit-failed (lock: %s)", type(e).__name__)
+        raise CommitFailed("credential-commit-failed", "lock") from None
+    try:
+        had = _take_lock(lock_fd, wait, timeout_s, seams)
+    except OSError as e:
+        os.close(lock_fd)
+        _note(logging.WARNING, "levain gw-keys: credential-commit-failed (flock: %s)", type(e).__name__)
+        raise CommitFailed("credential-commit-failed", "flock") from None
+    if not had:
+        os.close(lock_fd)
+        _note(logging.WARNING, "levain gw-keys: credential-lock-timeout after %.1f s", timeout_s)
+        raise CommitFailed("credential-lock-timeout")
+    return lock_fd
+
+
+def _unlock(lock_fd: int) -> None:
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
+
+
+def _durable(dir_fd: int, seams: WriteSeams, name: str) -> bool:
+    try:
+        seams.fsync_dir(dir_fd)
+        return True
+    except OSError as e:
+        _note(logging.WARNING, "levain gw-keys: credential-commit-not-durable credential=%s (%s)", name,
+              type(e).__name__)
+        return False
+
+
+def commit(dir_fd: int, name: str, fields: dict, *, expect_rev: Optional[str] = None, wait: bool = False,
+           lock_timeout_s: float = LOCK_TIMEOUT_S, seams: Optional[WriteSeams] = None) -> Outcome:
+    """The commit, step by step, synchronous (keys runs it on its writer thread, the install helper's child inline):
+    (1) the `flock` (a timeout = `CommitFailed`, nothing written); the stale-temp sweep; (2) when `expect_rev` is
+    given, read the file's `rev` and compare: a different `rev`, an unparseable file or no file = DISCARDED (the
+    operator's act wins; a removed credential stays removed); (3) a unique temp (`O_CREAT|O_EXCL|O_NOFOLLOW`, 0600),
+    written and fsynced, a failure unlinks it = `CommitFailed`; (4) the rename over `<name>.json`, a failure unlinks
+    the temp = `CommitFailed`; (5) the directory fsync, a failure = COMMITTED with `durable` False and the warning
+    `credential-commit-not-durable`; (6) unlock. `expect_rev` None is the operator's write: no compare.
+    `Unparseable` (from `render`, before the lock) means `fields` is not a credential: nothing is touched."""
+    s = seams or WriteSeams()
+    raw, rev = render(fields, name)
+    lock_fd = _locked(dir_fd, wait, lock_timeout_s, s)
+    try:
+        _sweep(dir_fd, s.clock())
+        if expect_rev is not None:
+            try:
+                cur = read_file(dir_fd, name)
+                cur_rev = parse(cur, name).rev if cur is not None else None
+            except Unparseable:
+                cur_rev = None
+            except OSError as e:
+                _note(logging.WARNING, "levain gw-keys: credential-commit-failed credential=%s (read: %s)", name,
+                      type(e).__name__)
+                raise CommitFailed("credential-commit-failed", "read") from None
+            if cur_rev != expect_rev:
+                _note(logging.INFO, "levain gw-keys: credential %s changed or removed meanwhile; result discarded", name)
+                return Outcome(DISCARDED)
+        tmp = f".{name}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                         0o600, dir_fd=dir_fd)
+        except OSError as e:
+            _note(logging.WARNING, "levain gw-keys: credential-commit-failed credential=%s (temp: %s)", name,
+                  type(e).__name__)
+            raise CommitFailed("credential-commit-failed", "temp") from None
+        try:
+            try:
+                view = memoryview(raw)
+                while view:
+                    view = view[os.write(fd, view):]
+                s.fsync_file(fd)
+            finally:
+                os.close(fd)
+            s.rename(tmp, name + ".json", dir_fd)
+        except OSError as e:
+            _unlink_quiet(tmp, dir_fd)
+            _note(logging.WARNING, "levain gw-keys: credential-commit-failed credential=%s (%s)", name,
+                  type(e).__name__)
+            raise CommitFailed("credential-commit-failed", "write") from None
+        return Outcome(COMMITTED, rev, _durable(dir_fd, s, name))
+    finally:
+        _unlock(lock_fd)
+
+
+def remove(dir_fd: int, name: str, *, wait: bool = True, lock_timeout_s: float = LOCK_TIMEOUT_S,
+           seams: Optional[WriteSeams] = None) -> bool:
+    """`remove-credential`'s act: under the same lock, unlink `<name>.json` and fsync the directory. True when a file
+    was removed, False when there was none. A refresh begun before it then finds the file gone and discards."""
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
+        raise Unparseable("name")
+    s = seams or WriteSeams()
+    lock_fd = _locked(dir_fd, wait, lock_timeout_s, s)
+    try:
+        _sweep(dir_fd, s.clock())
+        try:
+            os.unlink(name + ".json", dir_fd=dir_fd)
+        except FileNotFoundError:
+            return False
+        except OSError as e:
+            raise CommitFailed("credential-commit-failed", f"unlink: {type(e).__name__}") from None
+        _durable(dir_fd, s, name)
+        return True
+    finally:
+        _unlock(lock_fd)
+
+
+class CredWriter:
+    """keys' ONE credential writer (design 1.8, r2 W4) and the real `CredLifecycle`. Every commit runs on one dedicated
+    writer thread (`ThreadPoolExecutor(max_workers=1)`, made here at keys' start; its thread starts at the first
+    commit), so keys' own commits serialize and nothing on the event loop blocks on the `flock` or an fsync; the loop
+    awaits the job's future, and a job runs to its end whatever happens to its awaiter. The credential directory is
+    opened (`O_DIRECTORY|O_NOFOLLOW`) on that thread at the first commit and kept.
+
+    The seam's shell (R86): `begin_closing()` sets `_closing`; `cancel_detached()` cancels the members of
+    `_refresh_tasks`. The single-flight that fills the set and reads the flag is not built at this tip, so the set
+    stays empty."""
+
+    def __init__(self, cred_dir: str, *, seams: Optional[WriteSeams] = None) -> None:
+        self.cred_dir = cred_dir
+        self.seams = seams or WriteSeams()
+        self.lock_timeout_s = LOCK_TIMEOUT_S
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="levain-cred-writer")
+        self._dir_fd: Optional[int] = None    # the writer thread's only
+        self._closing = False
+        self._refresh_tasks: Set["asyncio.Task"] = set()
+
+    # -- CredLifecycle --
+
+    def begin_closing(self) -> None:
+        self._closing = True
+
+    def cancel_detached(self) -> None:
+        for t in list(self._refresh_tasks):
+            t.cancel()
+
+    # -- the writer thread --
+
+    async def commit(self, name: str, fields: dict, expect_rev: Optional[str] = None) -> Outcome:
+        """`commit` on the writer thread, with keys' bounded `flock`."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor,
+                                          functools.partial(self._commit_sync, name, fields, expect_rev))
+
+    def _commit_sync(self, name: str, fields: dict, expect_rev: Optional[str]) -> Outcome:
+        if self._dir_fd is None:
+            try:
+                self._dir_fd = os.open(self.cred_dir, _O_DIR)
+            except OSError as e:
+                _note(logging.WARNING, "levain gw-keys: credential-commit-failed (the credential directory: %s)",
+                      type(e).__name__)
+                raise CommitFailed("credential-commit-failed", "directory") from None
+        return commit(self._dir_fd, name, fields, expect_rev=expect_rev, wait=False,
+                      lock_timeout_s=self.lock_timeout_s, seams=self.seams)
+
+    def close(self) -> None:
+        """At keys' exit, after the loop: wait for a job in flight (bounded by the lock timeout and the fsyncs), then
+        close the directory fd."""
+        self._executor.shutdown(wait=True)
+        if self._dir_fd is not None:
+            os.close(self._dir_fd)
+            self._dir_fd = None
