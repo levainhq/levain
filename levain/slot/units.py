@@ -170,22 +170,35 @@ def start_order(host: HostOS, services: Iterable[Service] | None = None) -> tupl
 #: for the job to go before it calls it still loaded (a fresh setup then an immediate undo hit it on a macOS VM, 10-22).
 LAUNCHD_UNLOAD_WAIT_S = 10.0
 _LAUNCHD_POLL_S = 0.2
+#: one `launchctl print` may take this long at least, so a check with no wait is still bounded
+_LAUNCHD_PRINT_MIN_S = 5.0
+#: `launchctl print` exits with this when launchd has no such service: the ONE answer that means absent
+_LAUNCHCTL_NO_SUCH_SERVICE = 113
 
 
 def _launchd_job_absent(label: str, run: Callable[..., object] | None = None, *, wait_s: float = 0.0,
                         sleep: Callable[[float], None] | None = None,
                         clock: Callable[[], float] | None = None) -> tuple[bool, str]:
+    """True only when launchd says it has no such job. Loaded, an unexpected exit or a timed-out query are
+    all "not absent" (fail closed); with ``wait_s`` the check re-asks until absent or the deadline."""
     import subprocess
     import time
 
     sleep, clock = sleep or time.sleep, clock or time.monotonic
     deadline = clock() + wait_s
     while True:
-        r = (run or subprocess.run)(["/bin/launchctl", "print", f"system/{label}"], capture_output=True,
-                                    env=child_env())
-        loaded = getattr(r, "returncode", 1) == 0
-        if not loaded or clock() >= deadline:
-            return (not loaded, f"{label} is still loaded" if loaded else "")
+        try:
+            r = (run or subprocess.run)(["/bin/launchctl", "print", f"system/{label}"], capture_output=True,
+                                        env=child_env(),
+                                        timeout=max(deadline - clock(), _LAUNCHD_PRINT_MIN_S))
+            rc = getattr(r, "returncode", None)
+            why = (f"{label} is still loaded" if rc == 0
+                   else "" if rc == _LAUNCHCTL_NO_SUCH_SERVICE
+                   else f"{label} could not be checked (launchctl print exited {rc})")
+        except subprocess.TimeoutExpired:
+            why = f"{label} could not be checked (launchctl print timed out)"
+        if not why or clock() >= deadline:
+            return (not why, why)
         sleep(min(_LAUNCHD_POLL_S, max(deadline - clock(), 0.0)))
 
 

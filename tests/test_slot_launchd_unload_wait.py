@@ -62,3 +62,31 @@ def test_undos_stop_check_is_the_waiting_one():
     finally:
         U._launchd_job_absent = real
     assert seen and all(w == U.LAUNCHD_UNLOAD_WAIT_S for w in seen)
+
+
+def test_only_launchds_no_such_service_answer_means_absent():
+    c = _Clock()
+    for rc in (1, 5, 37, None):
+        def run(argv, rc=rc, **kw):
+            return SimpleNamespace(returncode=rc)
+
+        absent, why = U._launchd_job_absent("com.levain.reaper", run, sleep=c.sleep, clock=c.now)
+        assert not absent and "could not be checked" in why, (rc, why)
+
+
+def test_a_hung_launchctl_print_is_bounded_and_fails_closed():
+    import subprocess
+
+    c, timeouts = _Clock(), []
+
+    def run(argv, **kw):
+        timeouts.append(kw["timeout"])
+        c.t += kw["timeout"]
+        raise subprocess.TimeoutExpired(argv, kw["timeout"])
+
+    absent, why = U._launchd_job_absent("com.levain.reaper", run, wait_s=U.LAUNCHD_UNLOAD_WAIT_S,
+                                        sleep=c.sleep, clock=c.now)
+    assert not absent and "timed out" in why
+    assert timeouts and all(t >= U._LAUNCHD_PRINT_MIN_S for t in timeouts)
+    assert c.t <= U.LAUNCHD_UNLOAD_WAIT_S + U._LAUNCHD_PRINT_MIN_S + U._LAUNCHD_POLL_S
+    assert U._launchd_job_absent("x", run, sleep=c.sleep, clock=c.now)[0] is False   # the no-wait check is bounded too
