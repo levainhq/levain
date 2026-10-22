@@ -6,12 +6,28 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.16] — 2026-10-22
+
+### Fixed
+- **The cockpit's theme switch keeps every key the same size on a phone.** At phone width the selected light or dark
+  key stood taller than the others, because the switch's track was shorter than its touch-sized keys. The track now
+  holds them, and the selected key is marked by its colour and raised shading, not by its size. The desktop switch is
+  unchanged.
+
 ### Groundwork for isolation (nothing here is reachable from a `levain` command yet)
 - **The keys service gains its request path.** A brokered request is admitted, checked against the route's
   policy and the session's budget, and forwarded; a refused one is answered by name (`keys-unavailable`,
   `upstream-error`, `upstream-timeout`) instead of a closed connection, and a session's revoked token cannot come
   back from a resolve that was in flight when it was dropped. A route map with any entry that fails to parse refuses
   every route.
+- **The keys service reaches the vendor.** It opens the vendor connection under one deadline that covers name
+  resolution, the connect and TLS, and relays the vendor's status and the headers the route allows back to the
+  session. A session that cancels its request before it is sent sends nothing to the vendor. An early 413, or a 401 on
+  a static key, during an upload is passed back as soon as keys reads it; a 401 on a refreshing credential is answered
+  `credential-unavailable`. A response with no body (HEAD, 204, 304) is held until it is complete, so a keys
+  connection that ends early is answered `keys-unavailable` rather than looking finished. A malformed vendor response
+  is logged as a fixed label, never its text, and a credential whose secret the redaction marker could contain or
+  rebuild is refused when it is loaded.
 - **Session adopt's importer takes in a session's objects** and checks them with `git fsck` before anything else
   happens.
 
