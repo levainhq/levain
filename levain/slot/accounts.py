@@ -20,11 +20,13 @@ SLOT_RETIRED_MARKER = {"darwin": "Levain session account (retired)", "linux": "L
 
 NO_HOME = {"darwin": "/var/empty", "linux": "/nonexistent"}
 
-#: CONTRACT §1.2: the shared groups each singleton is in.
+#: CONTRACT §1.2: the shared groups each singleton is in. A primary group stays its account's only: keys gives its
+#: admin socket a group itself (not root), which only a member may do, so that socket's group is the shared
+#: levain-keysadmin, whose members are keys and CONTROL, the socket's one admitted peer.
 _SINGLETON_GROUPS: Mapping[str, tuple[str, ...]] = {
-    "_levain_keys": ("levain-control", "levain-gwfronts"),
+    "_levain_keys": ("levain-control", "levain-gwfronts", "levain-keysadmin"),
     "_levain_export": (),
-    "_levain_control": ("levain-wake",),
+    "_levain_control": ("levain-keysadmin", "levain-wake"),
     "_levain_qbroker": ("levain-control", "levain-queue"),
     "_levain_dispatch": ("levain-control", "levain-dispatch-export", "levain-lineage", "levain-queue"),
 }
