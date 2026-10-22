@@ -29,7 +29,9 @@ fresh ``/dev/shm``, tmpfs, the session dir and the socket dirs) built by bwrap i
 
 Targets: ``vendor``, ``clone`` (§5.4 step 3: by the SAME path as the vendor), ``clone-check`` (the post-clone
 check's ``git`` children, §5.4 step 3 (b), by that same path), ``step`` (a verifier step, §5.6 step 2), ``driver``
-(§5.6 step 3), ``forwarder`` (Linux egress, §9.1) and ``front`` (§5.1 render (4)).
+(§5.6 step 3), ``forwarder`` (Linux egress, §9.1) and ``front`` (§5.1 render (4)). The export targets
+``importer`` and ``verifier`` (s5 §5b) run as their own singletons (:func:`export_principal`), ROOT-launched
+through the same stage by their own spec builder (:func:`export_launch_spec`) and walls (:class:`WallFacts`).
 
 ⛔ Nothing here is ever run on the host by a test: every OS act is a seam (:class:`OsCalls`) and every
 argv is asserted as text. No ``syscall`` operation may reach a profile (trg-069, §8).
@@ -82,9 +84,12 @@ ENV_CAP = 64 * 1024
 PROFILE_CAP = 1024 * 1024
 
 TARGETS = ("vendor", "clone", "clone-check", "step", "driver", "forwarder", "front")
+#: s5 §5b: the export wall's targets, each ROOT-launched by :func:`export_launch_spec`, never by
+#: :func:`launch_spec` (which is slot-shaped). The stage runs either spec with the same machinery.
+EXPORT_TARGETS = ("importer", "verifier")
 #: §3.1 step 4: a slot child holds 0, 1, 2 + its pty; the front 0, 1, 2 + its GO pipe (§5.1 render (4)); the
-#: forwarder 0, 1, 2 + its readiness pipe.
-_ONE_EXTRA_FD = frozenset({"vendor", "front", "forwarder"})
+#: forwarder 0, 1, 2 + its readiness pipe; an export target 0, 1, 2 + its result pipe (s5 §5b).
+_ONE_EXTRA_FD = frozenset({"vendor", "front", "forwarder"}) | frozenset(EXPORT_TARGETS)
 #: Only these targets carry handles or a TERM (§3.2: start adds token + cap at the VENDOR's exec).
 _EXTRA_ENV = frozenset({"vendor", "front"})
 
@@ -130,6 +135,51 @@ def principal(host: str, name: str, ids: Mapping[str, int], shared: Mapping[str,
     sg = shared.get(grp)
     if not isinstance(sg, int) or isinstance(sg, bool) or sg not in RANGES[host].shared:
         raise Refused("bad-token", f"{grp}: gid {sg!r} is not in the §1.1 shared range")
+    return Principal(name, uid, uid, (uid, sg))
+
+
+#: s5 §4.9 (A16, S2): the export roles' singleton accounts, the group each runs with, and the entry each execs
+#: from the helper dir (names from s5 §5b). The importer's group follows the export class it imports for.
+EXPORT_ACCOUNT = {"importer": "_levain_export", "verifier": "_levain_verify"}
+EXPORT_GROUPS = {("importer", "operator"): "levain-export", ("importer", "dispatch"): "levain-dispatch-export",
+                 ("verifier", None): "levain-verify"}
+EXPORT_ENTRY = {"importer": "export-importer", "verifier": "export-verifier"}
+
+
+def export_principal(host: str, role: str, ids: Mapping[str, int], shared: Mapping[str, int], *,
+                     export_class: Optional[str] = None) -> Principal:
+    """Who an export target becomes (s5 §4.9, A16, S2), on its OWN path: :func:`principal` keeps refusing every
+    singleton for a slot target. ``importer``: ``_levain_export`` with ``levain-export`` (``export_class``
+    ``operator``) or ``levain-dispatch-export`` (``dispatch``); ``verifier``: ``_levain_verify`` with
+    ``levain-verify`` (no class). Never ``levain-slots``, never the other role's group.
+
+    Refused ``export-account-missing`` when the account has no uid in ``ids``; ``export-account-bad`` when its
+    uid is not an int in §1.1's singleton range (a slot-range uid among them), equals the other role's uid, or
+    its group's gid is missing, outside the shared range or shared with ``levain-slots`` or another export
+    group."""
+    from levain.slot.ids import RANGES
+
+    if host not in RANGES:
+        raise Refused("unsupported-host", repr(host))
+    if (role, export_class) not in EXPORT_GROUPS:
+        raise Refused("bad-token", f"export role {role!r} class {export_class!r}")
+    name = EXPORT_ACCOUNT[role]
+    if name not in ids:
+        raise Refused("export-account-missing", name)
+    uid = ids[name]
+    r = RANGES[host]
+    if not _is_int(uid) or uid in r.slots or uid not in r.singletons:
+        raise Refused("export-account-bad", f"{name}: uid {uid!r} is not in the §1.1 singleton range")
+    other = EXPORT_ACCOUNT["verifier" if role == "importer" else "importer"]
+    if ids.get(other) == uid:
+        raise Refused("export-account-bad", f"{name}: uid {uid} is {other}'s")
+    grp = EXPORT_GROUPS[(role, export_class)]
+    sg = shared.get(grp)
+    if not _is_int(sg) or sg not in r.shared:
+        raise Refused("export-account-bad", f"{grp}: gid {sg!r} is not in the §1.1 shared range")
+    others = {g for g in set(EXPORT_GROUPS.values()) | {"levain-slots", "levain-gwfronts"} if g != grp}
+    if any(shared.get(g) == sg for g in others):
+        raise Refused("export-account-bad", f"{grp}: gid {sg} is another group's")
     return Principal(name, uid, uid, (uid, sg))
 
 
@@ -197,7 +247,7 @@ def _abs_path(v: object) -> bool:
 def _check_spec(s: Spec) -> None:
     """The shape every spec must have, checked by the plan half when it builds one AND by the stage when it
     reads one (the stage trusts its root parent, but never runs a spec it would not have built)."""
-    if s.target not in TARGETS:
+    if s.target not in TARGETS and s.target not in EXPORT_TARGETS:
         raise Refused("spec-malformed", f"target {s.target!r}")
     if not (_is_int(s.uid) and _is_int(s.gid) and s.uid > 0 and s.gid > 0):
         raise Refused("drop-to-root", f"uid {s.uid!r} gid {s.gid!r}")
@@ -437,6 +487,125 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
     return spec
 
 
+# --- the wall's facts (s5 §5b, A7) ---------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WallFacts:
+    """One wall's capability list as a value: the parameter the profile-line builder
+    (:func:`levain.slot.render.profile_lines`) and the view builder (:func:`wall_view_args`) take, so a slot and an
+    export target differ only in their facts, never in a forked builder (s5 §5b, A7).
+
+    Both OSes: ``writable`` (groups of paths: on macOS one ``file-write*`` line per group; on Linux every path is
+    one rw bind at its own path, in order), ``chdir`` and ``keep_fds`` (the fds kept past 0, 1, 2). macOS:
+    ``label`` (the profile's comment line), ``read_denied`` (``file-read*`` denied subpaths), ``devices`` (the
+    writable device literals), ``devices_only`` (reads and ioctls under ``/dev`` limited to ``devices``),
+    ``network`` (the network rule lines, required: an empty list would leave ``(allow default)`` holding
+    them), ``ipc_denied``, ``mach_allow``. Linux: ``unshare`` (the namespaces bwrap makes beside the mount one,
+    in order), ``new_session``, ``caps`` (None = bwrap's own default; a tuple = ``--cap-drop ALL`` then those
+    added back), ``read_only`` (ro binds beside ``/usr`` and ``/etc``), ``host_dev`` (the host's ``/dev`` bound
+    whole, the slot's; else bwrap's minimal ``--dev``)."""
+
+    writable: Tuple[Tuple[str, ...], ...]
+    network: Tuple[str, ...] = ()
+    label: str = ""
+    read_denied: Tuple[str, ...] = ()
+    devices: Tuple[str, ...] = ()
+    devices_only: bool = False
+    ipc_denied: bool = False
+    mach_allow: Tuple[str, ...] = ()
+    unshare: Tuple[str, ...] = ()
+    new_session: bool = False
+    caps: Optional[Tuple[str, ...]] = ()
+    read_only: Tuple[str, ...] = ()
+    host_dev: bool = False
+    chdir: str = "/"
+    keep_fds: Tuple[int, ...] = ()
+
+
+#: s5 §5b: each export target's ONE durable writable path, relative to ``L/export/`` (its per-run image's mount
+#: point). The wall facts and the sealed run read the same constant, so they cannot disagree (§4.9).
+EXPORT_WRITABLE = (".work",)
+VERIFY_WRITABLE = (".verify",)
+#: s5 §5b (HEAD_r10 Q-r7-5): the one protected object, the users' data, under every spelling macOS gives it.
+EXPORT_READ_DENIED = ("/Users", "/System/Volumes/Data/Users", "/Volumes")
+#: s5 §5b: an export target's devices on macOS, NOT the slot's set (no tty, no ptmx, no dtracehelper).
+EXPORT_DEVICES = ("/dev/null", "/dev/zero")
+#: s5 §5b: the start of the Mach allow-list; the list git and the importer need is measured on the VM (5g).
+EXPORT_MACH_ALLOW = ("com.apple.system.opendirectoryd.libinfo",)
+#: s5 §5b: ``--cap-drop ALL`` with only the two capabilities the stage spends on its drop added back. The stage
+#: runs as root inside bwrap and calls ``setgroups`` / ``setgid`` / ``setuid``; with no capability at all each
+#: fails EPERM and nothing starts [reasoned from bwrap's privileged path; not run on Linux, a 5g row].
+#: ``drop_and_assert`` then proves the permitted, effective and ambient sets empty, and ``no_new_privs`` keeps a
+#: setuid program from using the bounding set left behind.
+EXPORT_CAPS = ("CAP_SETGID", "CAP_SETUID")
+#: s5 §5b: ``RLIMIT_NPROC`` for an export target (its principal owns no other process).
+EXPORT_NPROC = 64
+#: s5 §5b: the fd an export target's bounded result pipe sits on (its fd map is 0 / 1, 2 / this).
+RESULT_FD = 4
+_EXPORT_DIRS = {"importer": EXPORT_WRITABLE, "verifier": VERIFY_WRITABLE}
+_EXPORT_SCOPE = {"importer": "export.scope", "verifier": "verify.scope"}
+
+
+def export_wall_facts(host: str, role: str) -> WallFacts:
+    """The importer's or the verifier's wall (s5 §5b capability list): the one writable path ``L/export/.work``
+    (``.verify``), the cwd there, fd 4 kept (the bounded result pipe). macOS: ``(allow default)`` reads less the
+    three user-data subpaths, ``/dev/null`` and ``/dev/zero`` the only devices, all network and IPC denied, Mach
+    denied but for the allow-list. Linux: fresh net, IPC, PID and UTS namespaces, a new session, capabilities
+    dropped (:data:`EXPORT_CAPS`), ro ``/usr`` ``/etc`` (+ the import tree and helper dir where ``/usr`` does not
+    hold them), bwrap's minimal ``/dev``, nothing of the operator's and no socket dir."""
+    from levain.slot.layout import HELPER_DIR, IMPORT_TREE, STORE
+
+    if host not in ("darwin", "linux"):
+        raise Refused("unsupported-host", repr(host))
+    if role not in EXPORT_TARGETS:
+        raise Refused("bad-token", f"export role {role!r}")
+    base = PurePosixPath(str(STORE[host])) / "export"
+    writable = tuple(str(base / d) for d in _EXPORT_DIRS[role])
+    common = dict(writable=(writable,), chdir=writable[0], keep_fds=(RESULT_FD,))
+    if host == "darwin":
+        return WallFacts(label=f"Levain export wall profile, target {role}, principal {EXPORT_ACCOUNT[role]}.",
+                         read_denied=EXPORT_READ_DENIED, devices=EXPORT_DEVICES, devices_only=True,
+                         network=("(deny network*)",), ipc_denied=True, mach_allow=EXPORT_MACH_ALLOW, **common)
+    ro = tuple(str(p) for p in (IMPORT_TREE[host], HELPER_DIR[host])
+               if PurePosixPath("/usr") not in PurePosixPath(str(p)).parents
+               and PurePosixPath("/etc") not in PurePosixPath(str(p)).parents)
+    return WallFacts(unshare=("net", "ipc", "pid", "uts"), new_session=True, caps=EXPORT_CAPS, read_only=ro,
+                     host_dev=False, **common)
+
+
+def export_launch_spec(host: str, role: str, *, ids: Mapping[str, int], shared: Mapping[str, int],
+                       args: Sequence[str] = (), export_class: Optional[str] = None) -> Spec:
+    """The stage's spec for an export target (s5 §5b; build note [r6: I codex MED launch]): the same
+    :class:`Spec` as :func:`launch_spec`, built on its own path because ``launch_spec`` is slot-shaped. The
+    principal is :func:`export_principal`'s; argv is the role's root-tree entry (``HELPER_DIR/export-<role>``)
+    then ``args``, root's fixed arguments (at most :data:`_FRONT_ARGS` strings of at most 4 KiB, no NUL); cwd and
+    the kept fd are the role's :func:`export_wall_facts`; ``RLIMIT_NPROC`` :data:`EXPORT_NPROC`; no env file and
+    no extra env (the stage execs it with an empty env); macOS the profile ``L/export/<role>.sb``."""
+    from levain.slot.layout import HELPER_DIR, STORE
+
+    if host not in ("darwin", "linux"):
+        raise Refused("unsupported-host", repr(host))
+    if role not in EXPORT_TARGETS:
+        raise Refused("bad-token", f"export role {role!r}")
+    who = export_principal(host, role, ids, shared, export_class=export_class)
+    facts = export_wall_facts(host, role)
+    args = tuple(args)
+    if len(args) > _FRONT_ARGS or not all(
+            isinstance(a, str) and "\x00" not in a and len(a.encode("utf-8", "surrogatepass")) <= _STEP_ARG_BYTES
+            for a in args):
+        raise Refused("spec-malformed", f"an export target's fixed argv: <= {_FRONT_ARGS} strings of <= 4 KiB")
+    argv = (str(PurePosixPath(str(HELPER_DIR[host])) / EXPORT_ENTRY[role]),) + args
+    profile = str(PurePosixPath(str(STORE[host])) / "export" / f"{role}.sb") if host == "darwin" else None
+    spec = Spec(role, who.uid, who.gid, who.groups, EXPORT_NPROC, None, (), profile, facts.chdir, argv, False,
+                facts.keep_fds)
+    _check_spec(spec)
+    size = len(spec.to_json())
+    if size > SPEC_CAP:
+        raise Refused("spec-over-cap", f"{role} spec of {size} bytes, past {SPEC_CAP}")
+    return spec
+
+
 def stage_argv(host: str, spec_fd: int = SPEC_FD) -> Tuple[str, ...]:
     """The stage: this module run as ``__main__`` by the root interpreter, reading its spec from ``spec_fd``."""
     return module_argv(host, "levain.slot.wall", "--spec-fd", str(spec_fd))
@@ -538,15 +707,39 @@ def linux_view_args(slot, session: str, *, kind: str, queue_grant: bool, host_li
     elif kind == "verifier":
         raise Refused("bad-token", "kind verifier runs in a verifier pair")
 
+    binds = [str(S)]
+    if slot.slot_class == "egress":
+        R = PurePosixPath(str(RUN["linux"]))
+        grants = ["gw"] + (["qb"] if queue_grant else []) + (["planner"] if kind == "planner" else [])
+        binds += [str(R / g / f"slot{slot.index}") for g in grants]
+    ro = tuple(p for p in prefixes if PurePosixPath("/usr") not in PurePosixPath(p).parents
+               and PurePosixPath("/etc") not in PurePosixPath(p).parents)
+    # No --cap-* (caps None): the slot's own nested bwrap keeps a full bounding set.
+    return wall_view_args(WallFacts(writable=(tuple(binds),), unshare=("ipc", "pid", "uts"), caps=None,
+                                    read_only=ro, host_dev=True, chdir="/"), host_links)
+
+
+def wall_view_args(facts: WallFacts, host_links: Mapping[str, Optional[str]]) -> Tuple[str, ...]:
+    """The bwrap view of one wall, a pure function of its :class:`WallFacts` (s5 §5b, A7): the slot's view
+    (:func:`linux_view_args`) and the export targets' (:func:`importer_view_args`, :func:`verifier_view_args`) are
+    this one builder called with different facts. In order: ``--die-with-parent``, the ``--unshare-*`` flags,
+    ``--new-session``, the capability flags, ro ``/usr`` ``/etc`` and the ``read_only`` binds, the host's
+    ``/bin /sbin /lib /lib64`` links into ``/usr`` (any other link = ``view-path-off-list``), a fresh ``/proc``,
+    ``/dev`` (the host's bound whole, or bwrap's minimal one) with a fresh ``/dev/shm``, tmpfs ``/tmp /var/tmp
+    /run``, the writable binds' ancestors (:func:`view_ancestor_dirs`), the rw binds, ``--chdir``."""
     # --die-with-parent: bwrap's sandbox (every process of it, the target included) is SIGKILLed when bwrap or
     # its parent, the helper, dies, so a helper that dies or kills bwrap never leaves a vendor running past it.
     # It also bounds the forwarder: it lives until the helper exits, no longer until END [not run: a 2g row].
-    args = ["--die-with-parent", "--unshare-ipc", "--unshare-pid", "--unshare-uts",
-            "--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc"]
-    for p in prefixes:
-        pp = PurePosixPath(p)
-        if PurePosixPath("/usr") not in pp.parents and PurePosixPath("/etc") not in pp.parents:
-            args += ["--ro-bind", p, p]
+    args = ["--die-with-parent"] + [f"--unshare-{ns}" for ns in facts.unshare]
+    if facts.new_session:
+        args.append("--new-session")
+    if facts.caps is not None:
+        args += ["--cap-drop", "ALL"]
+        for cap in facts.caps:
+            args += ["--cap-add", cap]
+    args += ["--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc"]
+    for p in facts.read_only:
+        args += ["--ro-bind", p, p]
     for name in _USR_LINKS:
         target = host_links.get(name)
         if target is None:
@@ -555,18 +748,27 @@ def linux_view_args(slot, session: str, *, kind: str, queue_grant: bool, host_li
         if not target or ".." in resolved.parts or PurePosixPath("/usr") not in resolved.parents:
             raise Refused("view-path-off-list", f"{name} -> {target!r} is not a link into /usr (§9.2)")
         args += ["--symlink", target, name]
-    args += ["--proc", "/proc", "--dev-bind", "/dev", "/dev", "--tmpfs", "/dev/shm",
-             "--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/run"]
-    binds = [str(S)]
-    if slot.slot_class == "egress":
-        R = PurePosixPath(str(RUN["linux"]))
-        grants = ["gw"] + (["qb"] if queue_grant else []) + (["planner"] if kind == "planner" else [])
-        binds += [str(R / g / f"slot{slot.index}") for g in grants]
+    args += ["--proc", "/proc"]
+    args += ["--dev-bind", "/dev", "/dev"] if facts.host_dev else ["--dev", "/dev"]
+    args += ["--tmpfs", "/dev/shm", "--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/run"]
+    binds = [p for group in facts.writable for p in group]
+    if not binds or not all(_abs_path(p) for p in binds) or not _abs_path(facts.chdir):
+        raise Refused("view-path-off-list", "a wall view needs absolute writable paths and cwd")
     args += view_ancestor_dirs(binds)
     for d in binds:
         args += ["--bind", d, d]
-    args += ["--chdir", "/"]
+    args += ["--chdir", facts.chdir]
     return tuple(args)
+
+
+def importer_view_args(host_links: Mapping[str, Optional[str]]) -> Tuple[str, ...]:
+    """The importer's bwrap view (s5 §5b): :func:`wall_view_args` over ``export_wall_facts("linux", "importer")``."""
+    return wall_view_args(export_wall_facts("linux", "importer"), host_links)
+
+
+def verifier_view_args(host_links: Mapping[str, Optional[str]]) -> Tuple[str, ...]:
+    """The verifier's bwrap view (s5 §5b, §6.0): the importer's shape with ``.verify`` the one rw bind."""
+    return wall_view_args(export_wall_facts("linux", "verifier"), host_links)
 
 
 #: DECISION: an ancestor §2.1 / §2.2 gives no row (``/var``, ``/run``) is the host's ordinary 0755.
@@ -637,6 +839,26 @@ def linux_launch_argv(spec: Spec, *, slot, session: str, kind: str, queue_grant:
                            host_links=read_host_links() if host_links is None else host_links)
     argv = (NSENTER, f"--net={ns}", "--", str(LEVAIN_BWRAP)) + view + ("--",) + stage_argv("linux", spec_fd)
     return LinuxLaunch(cgroup_dir(slot, session, cgroup_leaf), argv)
+
+
+def export_linux_launch_argv(spec: Spec, *, host_links: Optional[Mapping[str, Optional[str]]] = None,
+                             spec_fd: int = SPEC_FD) -> LinuxLaunch:
+    """s5 §5b: an export target's Linux launch. The forked root child joins this run's leaf
+    (``levain.slice/export.scope/run``, the verifier's ``verify.scope/run``), then Levain's bwrap copy, run as
+    root, builds the role's view (:func:`importer_view_args` / :func:`verifier_view_args`; its ``--unshare-net`` is
+    the empty network namespace, so no ``nsenter``) -> the stage (drop + assert + ``no_new_privs``) -> the entry.
+    This builds the argv only: it sets no cgroup limit and makes no image."""
+    from levain.slot.bwrap import LEVAIN_BWRAP
+
+    _check_spec(spec)
+    if spec.target not in EXPORT_TARGETS:
+        raise Refused("spec-malformed", f"{spec.target} is not an export target")
+    if spec.profile is not None:
+        raise Refused("spec-malformed", "Linux runs no Seatbelt profile")
+    view = wall_view_args(export_wall_facts("linux", spec.target),
+                          read_host_links() if host_links is None else host_links)
+    argv = (str(LEVAIN_BWRAP),) + view + ("--",) + stage_argv("linux", spec_fd)
+    return LinuxLaunch(f"{CGROUP_ROOT}/{_EXPORT_SCOPE[spec.target]}/run", argv)
 
 
 # --- macOS start check: the live pf anchor + the slot's alias (carried item F5) ---------------------------------
@@ -1307,11 +1529,15 @@ if __name__ == "__main__":
     os._exit(main(sys.argv[1:]))
 
 
-__all__ = ["EXEC_FD", "EXEC_OK", "EXEC_REFUSED", "FORWARDER_PORT", "HASH_OBJECT_PREFIX",
+__all__ = ["EXEC_FD", "EXEC_OK", "EXEC_REFUSED", "EXPORT_ACCOUNT", "EXPORT_CAPS", "EXPORT_DEVICES", "EXPORT_ENTRY",
+           "EXPORT_GROUPS", "EXPORT_MACH_ALLOW", "EXPORT_NPROC", "EXPORT_READ_DENIED", "EXPORT_TARGETS",
+           "EXPORT_WRITABLE", "FORWARDER_PORT", "HASH_OBJECT_PREFIX", "RESULT_FD", "VERIFY_WRITABLE", "WallFacts",
            "LinuxLaunch", "NPROC", "OsCalls", "Principal", "READY_FD", "SPEC_FD", "SPEC_FORMAT", "STAGE_EXIT",
            "Spec", "TARGETS", "cgroup_dir", "check_egress_ready", "check_profile_text", "clone_argv",
-           "drop_and_assert", "exec_launch", "expected_slot_rules", "hash_object_argv", "launch_spec",
+           "drop_and_assert", "exec_launch", "expected_slot_rules", "export_launch_spec", "export_linux_launch_argv",
+           "export_principal", "export_wall_facts", "hash_object_argv", "importer_view_args", "launch_spec",
            "linux_launch_argv", "linux_view_args", "ls_files_argv", "macos_egress_ready", "macos_launch_argv",
+           "verifier_view_args", "wall_view_args",
            "module_argv", "parse_env", "parse_spec", "pf_printed", "principal", "read_host_links", "read_netns_names",
            "real_os_calls", "require_netns",
            "set_no_new_privs", "stage_argv", "stage_main", "target_account", "trampoline_argv", "trampoline_main"]
