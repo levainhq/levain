@@ -34,6 +34,8 @@ parentProxy hop (plan §2b R-C(3)), so this proxy is the only place it can hold.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import ipaddress
 import json
 import os
@@ -43,15 +45,22 @@ import socket
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from http import HTTPStatus
 from pathlib import Path
-from typing import Awaitable, Callable, Mapping, Optional, Sequence
+from typing import Awaitable, Callable, Coroutine, Mapping, Optional, Sequence
 
 try:
     import h11
 except ImportError:   # an install without levain[isolation]: main() says so in one line
     h11 = None  # type: ignore[assignment]
 
+from levain.broker import gwwire
+from levain.broker.gwwire import FrameReader, FrontSide, HoldingReader, WireError
+from levain.broker.norm import REASON, STATUS, Refused  # noqa: F401 - STATUS and Refused are re-exported
+from levain.broker import norm
+from levain.broker.policy import (CONNECT_TYPES, ROUTE_TYPES, PolicyError, RoutePolicy,  # noqa: F401 - re-exported
+                                  parse_route)
 from levain.broker.stub import GWPORT_BASE, SLOTS, clear_stale_socket, peer_uid
 
 POLICY_FORMAT = "levain-front-session/1"
@@ -81,35 +90,11 @@ _DRAIN_S = 1.0
 SESSION_KINDS = ("interactive", "login", "dispatch", "planner")
 #: the kinds a dispatch ticket renders; their routes are the ticket's route + egress routes only (CONTRACT §3.5).
 DISPATCH_KINDS = ("dispatch", "planner")
-ROUTE_TYPES = ("egress", "subscription_passthrough", "brokered")
-CONNECT_TYPES = ("egress", "subscription_passthrough")
 _ROUTE_ID = re.compile(r"^[a-z0-9-]{1,48}\Z")
-_LABEL = r"(?!-)[a-z0-9-]{1,63}(?<!-)"
-#: lowercase IDNA A-label host names with at least two labels; the last label is not all digits (no address literals).
-_HOSTNAME = re.compile(rf"^(?=.{{1,253}}\Z){_LABEL}(?:\.{_LABEL})+\Z")
-_POLICY_KEYS = frozenset({"route", "type", "hosts", "upstream", "requests", "responses",
-                          "max_call_microdollars", "max_session_microdollars"})
-
-#: refusal name -> HTTP status (CONTRACT §4.7's table, the names this half can produce).
-STATUS = {"host-not-allowed": 403, "address-refused": 403, "malformed": 400, "template-miss": 404,
-          "upstream-error": 502, "upstream-timeout": 504, "keys-unavailable": 503}
-_REASON = {400: b"Bad Request", 403: b"Forbidden", 404: b"Not Found", 502: b"Bad Gateway",
-           503: b"Service Unavailable", 504: b"Gateway Timeout"}
-
-
-class PolicyError(ValueError):
-    """The front's policy file is unusable: the front does not start."""
-
-
-class Refused(Exception):
-    def __init__(self, name: str, detail: str = "") -> None:
-        super().__init__(name)
-        self.name = name
-        self.detail = detail
-
-    @property
-    def status(self) -> int:
-        return STATUS[self.name]
+#: V34: keys answers the front's `H` with `A` within this, else the front exits 3 without binding.
+STATUS_A_S = 5.0
+#: V34: after a refusal written mid-body, the front discards the slot's remaining body for at most this long.
+DISCARD_S = 5.0
 
 
 # --- policy ---------------------------------------------------------------------------------------------------
@@ -126,35 +111,15 @@ class FrontPolicy:
     session: str
     kind: str
     connect: Mapping[str, ConnectRoute]   # host -> the one route that admits it
-
-
-def _is_inet_aton_spelling(h: str) -> bool:
-    try:
-        socket.inet_aton(h)
-    except OSError:
-        return False
-    return True
-
-
-def _hosts(route: str, raw: object) -> list[str]:
-    """The one host grammar, for CONNECT hosts and a brokered route's `upstream.host` alike: a lowercase IDNA A-label
-    name of two or more labels, with no trailing dot and no port. A host that is an address in disguise is refused
-    too: a last label of digits only, and any spelling `socket.inet_aton` accepts as IPv4 (hex, octal, short forms
-    such as 0x7f.0x1), because the system resolver would turn it into that address without a lookup."""
-    if not isinstance(raw, list) or not raw:
-        raise PolicyError(f"route {route}: hosts must be a non-empty list")
-    out = []
-    for h in raw:
-        if (not isinstance(h, str) or not _HOSTNAME.match(h) or h.rsplit(".", 1)[1].isdigit()
-                or _is_inet_aton_spelling(h)):
-            raise PolicyError(f"route {route}: host {h!r} is not a lowercase A-label host name")
-        out.append(h)
-    return out
+    brokered: Mapping[str, RoutePolicy] = field(default_factory=dict)   # route id -> its policy
+    #: render's incarnation for the session (the STATUS connection's `H`); None in a file without one.
+    incarnation: Optional[int] = None
 
 
 def load_policy(data: bytes) -> FrontPolicy:
     """Parse the front's policy file (render's `R/gw/slot<n>/session.json`, CONTRACT §4.3 "the front's view").
-    Refuses: an unknown key, any `credential` field (the front holds no key), a duplicate route id, a host admitted
+    Each route is parsed by `policy.parse_route`; this function keeps the file's own checks. Refuses: an unknown
+    key, any `credential` field (the front holds no key), a duplicate route id, a host admitted
     by two CONNECT routes (so whether a tunnel is passthrough is never ambiguous), a CONNECT host that is also a
     brokered route's host (a brokered session's vendor API traffic must go through the data plane, never a tunnel),
     and a `subscription_passthrough` route in a dispatch-ticket session (CONTRACT §4.1: dispatch may NEVER use one)."""
@@ -162,8 +127,12 @@ def load_policy(data: bytes) -> FrontPolicy:
         doc = json.loads(data)
     except (ValueError, UnicodeDecodeError) as e:
         raise PolicyError(f"not JSON: {e}") from None
-    if not isinstance(doc, dict) or set(doc) != {"format", "kind", "session", "routes"}:
-        raise PolicyError("top level must be exactly {format, kind, session, routes}")
+    if not isinstance(doc, dict) or not {"format", "kind", "session", "routes"} <= set(doc) \
+            or not set(doc) <= {"format", "kind", "session", "routes", "incarnation"}:
+        raise PolicyError("top level must be exactly {format, kind, session, routes, incarnation?}")
+    inc = doc.get("incarnation")
+    if inc is not None and (not isinstance(inc, int) or isinstance(inc, bool) or inc < 0):
+        raise PolicyError("incarnation must be an unsigned integer")
     if doc["format"] != POLICY_FORMAT:
         raise PolicyError(f"format must be {POLICY_FORMAT}")
     if doc["kind"] not in SESSION_KINDS:
@@ -175,41 +144,29 @@ def load_policy(data: bytes) -> FrontPolicy:
     seen: set[str] = set()
     connect: dict[str, ConnectRoute] = {}
     brokered_hosts: set[str] = set()
-    for pol in doc["routes"]:
-        if not isinstance(pol, dict):
-            raise PolicyError("a route must be an object")
-        route = pol.get("route")
-        if not isinstance(route, str) or not _ROUTE_ID.match(route):
-            raise PolicyError(f"bad route id {route!r}")
-        if "credential" in pol:
-            raise PolicyError(f"route {route}: the front's policy carries no credential field")
-        unknown = set(pol) - _POLICY_KEYS
-        if unknown:
-            raise PolicyError(f"route {route}: unknown keys {sorted(unknown)}")
+    brokered: dict[str, RoutePolicy] = {}
+    for raw in doc["routes"]:
+        pol = parse_route(raw, source="dispatch-session" if doc["kind"] in DISPATCH_KINDS else "session")
+        route, typ = pol.route, pol.type
         if route in seen:
             raise PolicyError(f"route {route} twice")
         seen.add(route)
-        typ = pol.get("type")
-        if typ not in ROUTE_TYPES:
-            raise PolicyError(f"route {route}: type {typ!r} not in {ROUTE_TYPES}")
         if typ == "brokered":
-            if "hosts" in pol:
-                brokered_hosts.update(_hosts(route, pol["hosts"]))
-            up = pol.get("upstream")
-            if not isinstance(up, dict):
-                raise PolicyError(f"route {route}: a brokered route's upstream must be an object")
-            brokered_hosts.update(_hosts(route, [up.get("host")]))
+            assert pol.upstream is not None
+            brokered_hosts.update(pol.hosts)
+            brokered_hosts.add(pol.upstream.host)
+            brokered[route] = pol
             continue
         if typ == "subscription_passthrough" and doc["kind"] in DISPATCH_KINDS:
             raise PolicyError(f"route {route}: a {doc['kind']} session may not carry a subscription_passthrough route")
-        for h in _hosts(route, pol.get("hosts")):
+        for h in pol.hosts:
             if h in connect:
                 raise PolicyError(f"host {h} admitted by two routes ({connect[h].route}, {route})")
             connect[h] = ConnectRoute(route, h, typ == "subscription_passthrough")
     both = sorted(brokered_hosts & set(connect))
     if both:
         raise PolicyError(f"CONNECT routes admit brokered hosts {both}")
-    return FrontPolicy(doc["session"], doc["kind"], connect)
+    return FrontPolicy(doc["session"], doc["kind"], connect, brokered, inc)
 
 
 # --- addresses ------------------------------------------------------------------------------------------------
@@ -343,6 +300,11 @@ def prescan_head(head: bytes) -> None:
 
 
 def parse_head(head: bytes) -> h11.Request:
+    return parse_head_conn(head)[1]
+
+
+def parse_head_conn(head: bytes) -> tuple[h11.Connection, h11.Request]:
+    """`parse_head`, also returning the h11 connection that read it: a brokered exchange reads the body through it."""
     prescan_head(head)
     conn = h11.Connection(h11.SERVER, max_incomplete_event_size=HEAD_CAP)
     conn.receive_data(head)
@@ -362,7 +324,7 @@ def parse_head(head: bytes) -> h11.Request:
             raise Refused("malformed", "connect-with-body")
     elif not event.target.startswith(b"/"):
         raise Refused("malformed", "absolute-or-asterisk-form")
-    return event
+    return conn, event
 
 
 _AUTHORITY = re.compile(rb"^([^:\[\]]+):([0-9]{1,5})\Z")
@@ -501,6 +463,582 @@ def client_hello_sni(body: bytes) -> str:
     return name.decode("ascii").lower()
 
 
+# --- the brokered half (3b): keys' wire, the exchange -------------------------------------------------------------
+
+_WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+#: a forwarded header value the wire can carry: visible ASCII and tab.
+_FWD_VALUE = re.compile(r"[\t\x20-\x7e]*\Z")
+#: the events queue between keys' reader and the relay: a full queue makes the reader wait, so a slot that reads
+#: slowly slows keys down instead of the front buffering the upstream's response.
+_EVENTS_MAX = 8
+#: slot-task outcomes that never end an exchange: the writer finished ("end"), or a write to keys failed
+#: ("write-error"), and keys' reader decides the outcome. On a websocket the GET's writer may report one after `U`.
+_BODY_SKIP = frozenset({"end", "write-error"})
+
+
+async def open_keys(path: str) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """The front's ONE keys-side client: a connection to keys' `R/keys/front.sock`, for the STATUS connection and for
+    each brokered exchange (one connection per exchange). Its reader is a `HoldingReader` over the connection's
+    socket, so a frame keys sent before a reset is still read."""
+    loop = asyncio.get_running_loop()
+    reader = HoldingReader(limit=_CHUNK, loop=loop)
+    protocol = asyncio.StreamReaderProtocol(reader, loop=loop)
+    transport, _ = await loop.create_unix_connection(lambda: protocol, path)
+    reader.sock = transport.get_extra_info("socket")
+    return reader, asyncio.StreamWriter(transport, protocol, reader, loop)
+
+
+def split_route_target(target: bytes) -> tuple[str, bytes, Optional[bytes]]:
+    """`/r/<route>[/path][?query]` -> (route, path, query or None). A malformed route id is `route-not-allowed`."""
+    rest = target[3:]
+    path_part, q, query = rest.partition(b"?")
+    route_b, slash, tail = path_part.partition(b"/")
+    try:
+        route = route_b.decode("ascii")
+    except UnicodeDecodeError:
+        raise Refused("route-not-allowed", "route-id") from None
+    if not _ROUTE_ID.match(route):
+        raise Refused("route-not-allowed", "route-id")
+    return route, slash + tail, (query if q else None)
+
+
+async def open_status(path: str, session: str, incarnation: int) -> tuple[FrameReader, asyncio.StreamWriter]:
+    """The STATUS connection: `H`, then keys' `A` within STATUS_A_S. Anything else raises (the caller exits 3)."""
+    kr, kw = await asyncio.wait_for(open_keys(path), STATUS_A_S)
+    try:
+        kw.write(gwwire.encode(b"H", {"v": 1, "session": session, "incarnation": incarnation}))
+        await kw.drain()
+        frames = FrameReader(kr)
+        got = await asyncio.wait_for(frames.read(FrontSide(status=True).allowed()), STATUS_A_S)
+        if got is None:
+            raise ConnectionError("keys closed the STATUS connection before A")
+        return frames, kw
+    except BaseException:
+        kw.close()
+        raise
+
+
+class _SlotGone(Exception):
+    """The slot closed before its request body ended."""
+
+
+class _SlotBody:
+    """The slot's request body, read through the h11 connection that parsed its head. `next()` is cancel-safe: state
+    changes only after an await returns."""
+
+    def __init__(self, conn: h11.Connection, reader: asyncio.StreamReader) -> None:
+        self.conn, self.reader = conn, reader
+        self.done = False
+
+    async def next(self, limit: int = _CHUNK) -> Optional[bytes]:
+        """The next body bytes, or None once the body ended. Raises _SlotGone at an EOF mid-body and
+        Refused("malformed") for a body h11 refuses. At most `limit` bytes are read from the slot for this call
+        (h11 may still return bytes it already held)."""
+        while not self.done:
+            try:
+                ev = self.conn.next_event()
+            except h11.RemoteProtocolError:
+                if self.conn.their_state is h11.ERROR and getattr(self, "_eof", False):
+                    raise _SlotGone() from None
+                raise Refused("malformed", "body") from None
+            if ev is h11.NEED_DATA:
+                data = await self.reader.read(max(1, min(_CHUNK, limit)))
+                if not data:
+                    self._eof = True
+                self.conn.receive_data(data)
+                continue
+            if isinstance(ev, h11.Data):
+                if ev.data:
+                    return bytes(ev.data)
+                continue
+            if isinstance(ev, h11.EndOfMessage):   # its trailers, if any, are dropped
+                self.done = True
+                return None
+            raise _SlotGone()
+        return None
+
+
+def _ws_accept(key: str) -> str:
+    return base64.b64encode(hashlib.sha1(key.encode("ascii") + _WS_GUID).digest()).decode("ascii")
+
+
+class BrokeredExchange:
+    """One brokered request: the slot's head checked (design 1.3 steps 1-4), `Q` to keys, then keys' frames relayed
+    back while the body streams forward. One task READS keys from the moment `Q` is sent and another WRITES `B`
+    frames: the reader is parked in its read loop before the first write (`parked`), so an `F` keys wrote is never
+    lost to a write error. After ANY refusal written to the slot mid-body the front half-closes the slot and
+    DISCARDS its remaining body (≤ the route's `body_cap` read after the refusal, ≤ DISCARD_S), then closes.
+
+    `before_keys_read` / `before_body_write` are the R15 gates: events the reader awaits after parking and the
+    writer awaits before each `B`. Production passes None (open); only the gate script holds them."""
+
+    def __init__(self, front: "Front", route: RoutePolicy, conn: h11.Connection, req: h11.Request, path: bytes,
+                 query: Optional[bytes], sreader: asyncio.StreamReader, swriter: asyncio.StreamWriter, *,
+                 before_keys_read: Optional[asyncio.Event] = None,
+                 before_body_write: Optional[asyncio.Event] = None) -> None:
+        self.front, self.route, self.req = front, route, req
+        self.path, self.query = path, query
+        self.sreader, self.swriter = sreader, swriter
+        self.body = _SlotBody(conn, sreader)
+        self.before_keys_read, self.before_body_write = before_keys_read, before_body_write
+        self.parked = asyncio.Event()
+        #: True when the first `B` write found `parked` already set (the R26 invariant, read by the gate script).
+        self.parked_before_first_write: Optional[bool] = None
+        self.pairs = [(n.decode("latin-1"), v.decode("latin-1")) for n, v in req.headers]
+        self.nobody = req.method == b"HEAD"
+        self.rec: dict = {"event": "exchange", "route": route.route, "method": req.method.decode("ascii")}
+        #: the `Q.upgrade` sent ("websocket" only after the whole handshake checked) and the key it carried.
+        self.upgrade = "none"
+        self.ws_key: Optional[str] = None
+        #: True once a final answer (a refusal, keys' `R`, a 101) started on the slot; a `100 Continue` is not one.
+        self.answered = False
+        #: the slot-side tasks started through `_slot_task` whose exit `_next` has not yet seen, and those it has seen
+        #: but not yet reported, each with the count of keys' events decoded when it was seen.
+        self._slot: set = set()
+        self._ended: list = []
+        #: keys' events decoded by the reader (counted before its `put`, which a full queue blocks) and taken by `_next`.
+        self._decoded = self._taken = 0
+
+    # -- the head ------------------------------------------------------------------------------------------------
+
+    def _q(self) -> tuple[dict, bool]:
+        """-> (the `Q` payload, expect-100). Raises Refused for a head refused before keys."""
+        r = self.route
+        tpl = norm.match_template(r.templates, self.req.method, self.path, self.query)
+        token = norm.bearer_token(self.pairs)
+        fwd = norm.check_headers(self.pairs, r.headers or {}, upgrade_ok=tpl.upgrade is not None)
+        if any(not _FWD_VALUE.match(v) for _, v in fwd):
+            raise Refused("malformed", "header-value")   # the wire carries visible ASCII and tab only
+        names = {n for n, _ in fwd}
+        self.rec["dropped"] = sorted({n.lower() for n, _ in self.pairs} - names - norm.CONSUMED
+                                     - {"connection"} - ({"upgrade"} if tpl.upgrade else set()))
+        expect = [v.lower() for n, v in self.pairs if n == "expect"]
+        if expect and expect != ["100-continue"]:
+            raise Refused("malformed", "expect")
+        cl = [v for n, v in self.pairs if n == "content-length"]
+        te = [v for n, v in self.pairs if n == "transfer-encoding"]
+        if cl and te:
+            raise Refused("malformed", "cl-and-te")
+        if cl:
+            n = int(cl[0])   # h11 validated it
+            if n > r.body_cap:
+                raise Refused("body-cap", "length")
+            body = f"length:{n}"
+        elif te:
+            body = "chunked"
+        else:
+            body = "none"
+        upgrade = "none"
+        if tpl.upgrade and self._asks_upgrade():
+            self._check_websocket_handshake(fwd, body)
+            upgrade = "websocket"
+        self.upgrade = upgrade
+        return ({"v": 1, "token": token, "route": r.route, "method": self.req.method.decode("ascii"),
+                 "path": self.path.decode("ascii"), "query": (self.query or b"").decode("ascii"),
+                 "headers": [[n, v] for n, v in fwd], "body": body, "upgrade": upgrade}, bool(expect))
+
+    def _asks_upgrade(self) -> bool:
+        return any(n == "upgrade" for n, _ in self.pairs) or any(
+            "upgrade" in norm.connection_tokens(v) for n, v in self.pairs if n == "connection")
+
+    def _check_websocket_handshake(self, fwd: list, body: str) -> None:
+        """A request on a websocket template that asks to upgrade must carry the whole RFC 6455 §4.1 client
+        handshake, else `malformed`: HTTP/1.1 or later, `upgrade` among its Connection options, `Upgrade:
+        websocket`, version 13, no body, and one `Sec-WebSocket-Key` that is the canonical base64 of 16 bytes and is
+        among the forwarded headers (the 101 is computed from it). Only then may keys' `U` become a 101."""
+        if self.req.http_version < b"1.1":   # h11 gives "d.d", so a bytes comparison orders it
+            raise Refused("malformed", "websocket-version")
+        conn = [t for n, v in self.pairs if n == "connection" for t in norm.connection_tokens(v)]
+        ups = [v.strip().lower() for n, v in self.pairs if n == "upgrade"]
+        vers = [v.strip() for n, v in self.pairs if n == "sec-websocket-version"]
+        keys = [v.strip() for n, v in self.pairs if n == "sec-websocket-key"]
+        if "upgrade" not in conn or ups != ["websocket"] or vers != ["13"] or body != "none" or len(keys) != 1:
+            raise Refused("malformed", "websocket-handshake")
+        key = keys[0]
+        try:
+            raw = base64.b64decode(key, validate=True)
+        except ValueError:
+            raw = b""
+        if len(raw) != 16 or base64.b64encode(raw).decode("ascii") != key:
+            raise Refused("malformed", "websocket-key")
+        if not any(n == "sec-websocket-key" and v == key for n, v in fwd):
+            raise Refused("malformed", "websocket-key")
+        self.ws_key = key
+
+    # -- the run -------------------------------------------------------------------------------------------------
+
+    async def run(self) -> None:
+        """The exchange, start to end. Every path, each refusal made before keys included, writes its record."""
+        try:
+            await self._run()
+        except WireError as e:   # a frame the wire will not encode never escapes the exchange
+            self.rec["wire_error"] = str(e)
+            if not self.answered:
+                await self.refuse(Refused("keys-unavailable", "wire"))
+        finally:
+            self.front._log(self.rec)
+
+    async def _run(self) -> None:
+        try:
+            q, expect = self._q()
+            try:
+                qframe = gwwire.encode(b"Q", q)
+            except WireError:
+                # a head under HEAD_CAP whose `Q` is over the wire's cap (JSON escaping grows it): refused with the
+                # head cap's name, before keys is opened
+                raise Refused("malformed", "q-cap") from None
+        except Refused as r:
+            await self.refuse(r)
+            return
+        if self.front.keys_path is None:
+            await self.refuse(Refused("keys-unavailable", "no-keys"))
+            return
+        try:
+            kr, kw = await asyncio.wait_for(open_keys(self.front.keys_path), CONNECT_TIMEOUT_S)
+        except (OSError, asyncio.TimeoutError):
+            await self.refuse(Refused("keys-unavailable", "keys-connect"))
+            return
+        self.front.live.add(kw)
+        events: asyncio.Queue = asyncio.Queue(maxsize=_EVENTS_MAX)
+        reader = self._reader_task = asyncio.ensure_future(self._read_keys(FrameReader(kr), events))
+        writer: Optional[asyncio.Future] = None
+        try:
+            kw.write(qframe)
+            writer = self._slot_task(kw, self._write_body(kw), b"X")
+            await self._relay(kw, events, expect, writer)
+        finally:
+            for t in (reader, writer):
+                if t is not None:
+                    t.cancel()
+            await asyncio.gather(*(t for t in (reader, writer) if t is not None), return_exceptions=True)
+            kw.close()
+            self.front.live.discard(kw)
+
+    async def _read_keys(self, frames: FrameReader, events: asyncio.Queue) -> None:
+        """keys' frames, in order, onto `events`; however it ends, the last event says so ("eof" / "error"). It
+        awaits each `put`, so a full queue holds keys back. Each event is counted in `_decoded` before its `put`, so
+        `_next` orders a slot task's exit after every event decoded ahead of it, including one still waiting on the
+        queue."""
+        side = FrontSide(status=False)
+        self.parked.set()   # entered the loop: the body writer may start
+        if self.before_keys_read is not None:
+            await self.before_keys_read.wait()
+        try:
+            while side.state != "done":
+                got = await frames.read(side.allowed())
+                if got is None:
+                    self._decoded += 1
+                    await events.put(("eof", None))
+                    return
+                ftype, payload = got
+                if ftype == b"U" and self.upgrade != "websocket":
+                    raise WireError("U for a request that asked no upgrade")
+                nobody = ftype == b"R" and (self.nobody or payload["status"] in (204, 304))  # type: ignore[index]
+                side.got(ftype, nobody=nobody)
+                self._decoded += 1
+                await events.put((ftype, payload))
+        except Exception as e:   # noqa: BLE001 - a reader that dies always tells the relay
+            self._decoded += 1
+            await events.put(("error", type(e).__name__))
+
+    def _slot_task(self, kw: asyncio.StreamWriter, work: Coroutine, end_frame: bytes) -> asyncio.Future:
+        """Start a slot-side task (the body writer, the websocket pump): the ONE way the exchange starts a task that
+        reads the slot. The task's exit, by any path, IS its terminal slot event: `_next` races the task itself, so no
+        exit can go unreported and none waits on a full events queue. Its result is the outcome `work` returned,
+        "write-error" for an OSError (the slot reads map their own errors, so one that escapes came from a write to
+        keys), or ("slot-gone", the error's type) for anything else raised. For an outcome that ends the slot's side
+        (any not in `_BODY_SKIP`) keys hears `end_frame` first, unflushed: closing the keys connection flushes it, and
+        a drain here could wait on a keys that has stopped reading."""
+        async def run() -> object:
+            try:
+                end = await work
+            except OSError as e:
+                self.rec["write_error"] = type(e).__name__
+                return "write-error"
+            except Exception as e:   # noqa: BLE001 - any other exit is the slot's side gone
+                end = ("slot-gone", type(e).__name__)
+            if end not in _BODY_SKIP:
+                try:
+                    kw.write(gwwire.encode(end_frame))
+                except Exception:   # noqa: BLE001 - keys' side is gone too; the slot's outcome still stands
+                    pass
+            return end
+
+        task = asyncio.ensure_future(run())
+        task.add_done_callback(lambda _: work.close())   # a task cancelled before it started never awaited `work`
+        self._slot.add(task)
+        return task
+
+    async def _next(self, events: asyncio.Queue) -> tuple:
+        """The next event, in arrival order: keys' frames, and each slot-side task's exit as ("body", its outcome),
+        reported once, after every keys event the reader had decoded when the exit was seen, one still blocked on the
+        full queue included (at most the queue's bound plus that one, so a keys that keeps sending cannot hold it
+        back); else ("error", "reader-gone") once keys' reader has ended with none left. The wait races the queue,
+        keys' reader and every live slot-side task: the relay never waits on a reader or a slot task that is gone."""
+        while True:
+            for t in list(self._slot):
+                if t.done():
+                    self._slot.discard(t)
+                    if not t.cancelled():
+                        self._ended.append((t, self._decoded))
+            reader = self._reader_task
+            # a reader that ended (cancelled while blocked on a put) never delivers what it counted
+            if self._ended and (self._ended[0][1] <= self._taken or (reader.done() and events.empty())):
+                return ("body", self._ended.pop(0)[0].result())
+            if not events.empty():
+                self._taken += 1
+                return events.get_nowait()
+            if reader.done():   # anything it put before it ended was taken above
+                return ("error", "reader-gone")
+            get = asyncio.ensure_future(events.get())
+            try:
+                await asyncio.wait({get, reader, *self._slot}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                if not get.done():
+                    get.cancel()
+            if get.done() and not get.cancelled():
+                self._taken += 1
+                return get.result()
+            await asyncio.gather(get, return_exceptions=True)
+
+    async def _stop(self, task: Optional[asyncio.Future]) -> None:
+        """Cancel the body writer and wait until it has stopped: it may be parked in a read of the slot, which a
+        discard is about to read too."""
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _write_body(self, kw: asyncio.StreamWriter) -> object:
+        """Forward the slot's body as `B` frames, then `E`. Returns how it ended: "end", "slot-eof" (the slot closed
+        mid-body), ("slot-gone", the error's type) (a read on the slot failed), "body-cap" (chunked past the cap), or
+        "malformed"; a write to keys that fails raises. Run only through `_slot_task`, which maps a raise, sends keys
+        the `X`, and is what the relay reads the outcome from. It never writes the record: the relay does, from the
+        outcome, only if the exchange ends that way."""
+        cap, sent = self.route.body_cap, 0
+        await self.parked.wait()
+        self.parked_before_first_write = self.parked.is_set()
+        await kw.drain()   # the `Q`
+        while True:
+            try:
+                chunk = await self.body.next()
+            except _SlotGone:
+                return "slot-eof"
+            except OSError as e:   # a read error on the SLOT (a reset mid-upload): the slot is gone
+                return ("slot-gone", type(e).__name__)
+            except Refused:
+                return "malformed"
+            if chunk is None:
+                kw.write(gwwire.encode(b"E"))
+                await kw.drain()
+                return "end"
+            sent += len(chunk)
+            if sent > cap:
+                return "body-cap"
+            for i in range(0, len(chunk), gwwire.CHUNK):
+                if self.before_body_write is not None:
+                    await self.before_body_write.wait()
+                kw.write(gwwire.encode(b"B", chunk[i:i + gwwire.CHUNK]))
+                await kw.drain()
+
+    async def _relay(self, kw: asyncio.StreamWriter, events: asyncio.Queue, expect: bool,
+                     writer: asyncio.Future) -> None:
+        """keys' events -> the slot. A write to the slot that fails ends the exchange as "slot-gone"."""
+        try:
+            await self._relay_events(kw, events, expect, writer)
+        except OSError as e:   # the slot went away mid-answer (keys-side errors are caught where they happen)
+            self._end_slot_gone(type(e).__name__)
+
+    def _end_slot_gone(self, error: str) -> None:
+        """The record of an exchange that ended because the slot failed: `end: slot-gone` and the error's type."""
+        self.rec["end"] = "slot-gone"
+        self.rec["slot_error"] = error
+
+    async def _relay_events(self, kw: asyncio.StreamWriter, events: asyncio.Queue, expect: bool,
+                            writer: asyncio.Future) -> None:
+        started = False
+        while True:
+            kind, payload = await self._next(events)
+            if kind == "body":
+                if payload in _BODY_SKIP:
+                    continue   # the reader's verdict decides: the F it already holds, or keys-unavailable
+                if payload == "slot-eof":
+                    self.rec["end"] = payload
+                    return
+                if isinstance(payload, tuple):   # ("slot-gone", the error's type): a read on the slot failed
+                    self._end_slot_gone(payload[1])
+                    return
+                if not started:   # the writer has returned: nothing else reads the slot
+                    await self.refuse(Refused("body-cap" if payload == "body-cap" else "malformed", "body"),
+                                      discard=True)
+                self.rec.setdefault("end", payload)
+                return
+            if kind in ("eof", "error"):
+                self.rec["keys_end"] = payload or kind
+                if not started:
+                    await self._stop(writer)
+                    await self.refuse(Refused("keys-unavailable", f"keys-{kind}"), discard=True)
+                self.rec.setdefault("end", "keys-" + kind)
+                return
+            if kind == b"A":
+                if expect:
+                    self.swriter.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+                    await self.swriter.drain()
+                continue
+            if kind == b"F":
+                await self._stop(writer)
+                if kw.can_write_eof():
+                    try:
+                        kw.write_eof()   # keys' drain ends at once
+                    except OSError:
+                        pass
+                await self.refuse(Refused(payload["refused"], "keys"), discard=True)  # type: ignore[index]
+                return
+            if kind == b"R":
+                started = self.answered = True
+                self._write_response_head(payload)  # type: ignore[arg-type]
+                await self.swriter.drain()
+                continue
+            if kind == b"b":
+                self.swriter.write(b"%x\r\n%s\r\n" % (len(payload), payload))  # type: ignore[arg-type]
+                await self.swriter.drain()
+                continue
+            if kind == b"e":
+                if not self.nobody_response:
+                    self.swriter.write(b"0\r\n\r\n")
+                    await self.swriter.drain()
+                self.rec["status"] = self.status
+                # keys may answer before the request body has all arrived: stop forwarding it, half-close, and
+                # discard the rest as a refusal does, so the close is not a reset over the response just written
+                await self._stop(writer)
+                if self.swriter.can_write_eof():
+                    try:
+                        self.swriter.write_eof()
+                    except OSError:   # the slot closed after the whole response: still delivered
+                        pass
+                self.rec["end"] = "ok"
+                if not self.body.done:
+                    await self._discard()
+                return
+            if kind == b"U":
+                await self._websocket(kw, payload, events, writer)  # type: ignore[arg-type]
+                return
+
+    def _write_response_head(self, r: dict) -> None:
+        """keys' `R`: the status line and R's headers (forbidden names dropped again), re-framed chunked so the front
+        never trusts a length from keys, except for a response with no body by HTTP's rules (HEAD, 204, 304)."""
+        self.status = r["status"]
+        self.nobody_response = self.nobody or self.status in (204, 304)
+        out = [b"HTTP/1.1 %d %s\r\n" % (self.status, _reason(self.status))]
+        for n, v in r["headers"]:
+            if not norm.is_forbidden(n):
+                out.append(b"%s: %s\r\n" % (n.encode("ascii"), v.encode("ascii")))
+        if not self.nobody_response:
+            out.append(b"transfer-encoding: chunked\r\n")
+        out.append(b"connection: close\r\n\r\n")
+        self.swriter.write(b"".join(out))
+
+    async def _websocket(self, kw: asyncio.StreamWriter, u: dict, events: asyncio.Queue,
+                         writer: asyncio.Future) -> None:
+        """keys' `U`: the front writes the slot's 101 itself (`sec-websocket-accept` from the key it forwarded),
+        then relays raw bytes as `D` frames both ways until either side's `E` or EOF."""
+        await asyncio.gather(writer, return_exceptions=True)   # the GET's body (none) is over
+        out = [b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: upgrade\r\n",
+               b"sec-websocket-accept: %s\r\n" % _ws_accept(self.ws_key).encode("ascii")]
+        for n, v in u["headers"]:
+            if n == "sec-websocket-protocol" and n in self.route.response_headers:
+                out.append(b"sec-websocket-protocol: %s\r\n" % v.encode("ascii"))
+        self.answered = True
+        self.swriter.write(b"".join(out) + b"\r\n")
+        await self.swriter.drain()
+        self.rec["status"] = 101
+        early = self.body.conn.trailing_data[0]
+
+        async def up() -> object:
+            """The slot's bytes -> keys as `D` frames. Returns how the slot's side ended; `_slot_task` sends keys
+            the `E` and the relay below ends on it."""
+            if early:
+                kw.write(gwwire.encode(b"D", early))
+            while True:
+                try:
+                    data = await self.sreader.read(gwwire.CHUNK)
+                except OSError as e:   # a read error on the SLOT (a reset)
+                    return ("slot-gone", type(e).__name__)
+                if not data:   # the slot closed cleanly (not an error)
+                    return "slot-eof"
+                kw.write(gwwire.encode(b"D", data))
+                await kw.drain()
+
+        pump = self._slot_task(kw, up(), b"E")
+        try:
+            while True:
+                kind, payload = await self._next(events)
+                if kind == "body" and isinstance(payload, tuple):   # the pump: a read on the slot failed
+                    self._end_slot_gone(payload[1])
+                    return
+                if kind == "body" and payload == "slot-eof":   # the pump: the slot closed cleanly
+                    self.rec["end"] = "slot-eof"
+                    return
+                if kind == "body" and payload in _BODY_SKIP:   # the GET's finished body writer, reported after `U`
+                    continue
+                if kind != b"D":
+                    self.rec["end"] = "ws-" + (kind.decode("ascii") if isinstance(kind, bytes) else kind)
+                    return
+                self.swriter.write(payload)  # type: ignore[arg-type]
+                await self.swriter.drain()
+        finally:
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+
+    # -- refusals ------------------------------------------------------------------------------------------------
+
+    async def refuse(self, r: Refused, *, discard: bool = True) -> None:
+        """Answer the slot with `r`'s status, half-close it, then discard what is left of its body: until the body
+        ends, the slot's EOF, `body_cap` bytes READ AFTER THIS REFUSAL (counted from zero here), or DISCARD_S."""
+        self.rec.update({"refused": r.name, "detail": r.detail, "status": r.status})
+        self.answered = True
+        body = r.name.encode() + b"\n"
+        try:
+            self.swriter.write(b"HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
+                               b"X-Levain-Refused: %s\r\nConnection: close\r\n\r\n%s"
+                               % (r.status, REASON[r.status], len(body), r.name.encode(), body))
+            await self.swriter.drain()
+        except OSError as e:
+            self._end_slot_gone(type(e).__name__)
+            return
+        if self.swriter.can_write_eof():
+            try:
+                self.swriter.write_eof()
+            except OSError:   # the slot closed after the whole refusal: still delivered
+                pass
+        if discard:
+            await self._discard()
+
+    async def _discard(self) -> None:
+        """Read and drop the slot's remaining body after the answer was written: until the body ends, the slot's EOF,
+        `body_cap` bytes read here (counted from zero, each read bounded by what is left), or DISCARD_S."""
+        loop = asyncio.get_running_loop()
+        deadline, read, cap = loop.time() + DISCARD_S, 0, self.route.body_cap
+        try:
+            while read < cap:
+                left = deadline - loop.time()
+                if left <= 0:
+                    break
+                chunk = await asyncio.wait_for(self.body.next(cap - read), left)
+                if chunk is None:
+                    break
+                read += len(chunk)
+        except (asyncio.TimeoutError, OSError, _SlotGone, Refused):
+            pass
+        self.rec["discarded"] = read
+
+
+def _reason(status: int) -> bytes:
+    try:
+        return HTTPStatus(status).phrase.encode("ascii")
+    except ValueError:
+        return b"Unknown"
+
+
 # --- the server -----------------------------------------------------------------------------------------------
 
 def _keepalive(writer: asyncio.StreamWriter) -> None:
@@ -516,8 +1054,10 @@ def _keepalive(writer: asyncio.StreamWriter) -> None:
 class Front:
     def __init__(self, policy: FrontPolicy, *, log_path: Optional[Path | str] = None,
                  slot_uid: Optional[int] = None, resolve: Resolver = system_resolve,
-                 connect: Connector = open_by_address) -> None:
+                 connect: Connector = open_by_address, keys_path: Optional[str] = None) -> None:
         self.policy = policy
+        #: keys' `R/keys/front.sock`: every brokered exchange is one connection to it. None = no keys (503).
+        self.keys_path = keys_path
         self.log_path = Path(log_path) if log_path is not None else None
         self.slot_uid = slot_uid
         self._resolve = resolve
@@ -570,10 +1110,16 @@ class Front:
         except (asyncio.IncompleteReadError, asyncio.TimeoutError):
             return
         try:
-            req = parse_head(head)
+            conn, req = parse_head_conn(head)
             if req.method != b"CONNECT":
-                # The brokered data plane is session 3b's; until it exists a route path has no keys to reach.
-                raise Refused("keys-unavailable" if req.target.startswith(b"/r/") else "template-miss")
+                if not req.target.startswith(b"/r/"):
+                    raise Refused("template-miss", "not-a-route-target")
+                route_id, path, query = split_route_target(req.target)
+                pol = self.policy.brokered.get(route_id)
+                if pol is None:
+                    raise Refused("route-not-allowed")
+                await BrokeredExchange(self, pol, conn, req, path, query, reader, writer).run()
+                return
             route, port = connect_target(self.policy, req.target)
             ureader, uwriter, addr = await self._open_upstream(route, port)
         except Refused as r:
@@ -703,7 +1249,7 @@ class Front:
         body = r.name.encode() + b"\n"
         writer.write(b"HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
                      b"X-Levain-Refused: %s\r\nConnection: close\r\n\r\n%s"
-                     % (r.status, _REASON[r.status], len(body), r.name.encode(), body))
+                     % (r.status, REASON[r.status], len(body), r.name.encode(), body))
         await writer.drain()
         if writer.can_write_eof():
             writer.write_eof()
@@ -761,16 +1307,49 @@ class Front:
         return await asyncio.start_server(self._handle, host=host, port=port, limit=HEAD_CAP)
 
 
-async def run_front(front: Front, *, unix: Optional[str] = None, port: Optional[int] = None) -> None:
-    """Serve until SIGTERM / SIGINT, then close every tunnel and the listener."""
+async def run_front(front: Front, *, unix: Optional[str] = None, port: Optional[int] = None,
+                    keys: Optional[str] = None) -> int:
+    """With `keys`: open the STATUS connection first and bind ONLY after keys' `A` (else return 3, never having
+    bound); then serve until SIGTERM / SIGINT, or keys' `K` / EOF on STATUS, then close every stream and the
+    listener and return 0. The keys socket has ONE source: `keys` here, else the front's own `keys_path`; the front's
+    brokered exchanges use the same path, and two different paths are refused."""
+    if keys is None:
+        keys = front.keys_path
+    elif front.keys_path is not None and front.keys_path != keys:
+        raise ValueError(f"run_front(keys={keys!r}) and Front(keys_path={front.keys_path!r}) disagree")
+    front.keys_path = keys
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
+    watch: Optional[asyncio.Future] = None
+    if keys is not None:
+        try:
+            frames, kw = await open_status(keys, front.policy.session, front.policy.incarnation or 0)
+        except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, WireError, ConnectionError) as e:
+            print(f"levain gw-front: keys did not accept the STATUS hello ({type(e).__name__}); not serving",
+                  file=sys.stderr)
+            return 3
+        front.live.add(kw)
+
+        async def status_watch() -> None:
+            try:
+                await frames.read(frozenset({b"K"}))   # K, EOF, or anything else: keys is gone for this front
+            except (OSError, asyncio.IncompleteReadError, WireError):
+                pass
+            finally:   # every exit ends the front, an unforeseen raise included; shutdown's own cancel finds it set
+                if not stop.is_set():
+                    front._log({"event": "status-end"})
+                    stop.set()
+
+        watch = asyncio.ensure_future(status_watch())
     server = await (front.serve_unix(unix) if unix is not None else front.serve_tcp(port))  # type: ignore[arg-type]
     try:
         await stop.wait()
     finally:
+        if watch is not None:
+            watch.cancel()
+            await asyncio.gather(watch, return_exceptions=True)   # retrieves an unforeseen raise that ended the front
         server.close()
         front.close_live()
         try:
@@ -779,6 +1358,7 @@ async def run_front(front: Front, *, unix: Optional[str] = None, port: Optional[
             pass
         if unix is not None:
             front.unbind()
+    return 0
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -793,6 +1373,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--log", help="JSON-lines tunnel log (default: stderr)")
     ap.add_argument("--go-fd", type=int, help="render's GO pipe: serve only after one byte arrives on it; EOF = exit "
                                               "without serving (CONTRACT §5.1 render (4)-(5b))")
+    ap.add_argument("--keys", help="keys' R/keys/front.sock: the STATUS connection is opened after GO and the "
+                                   "listener bound only after keys' A; brokered exchanges go there")
     a = ap.parse_args(argv)
     # every argument is checked before the GO fd is read: a bad one exits at once instead of after render's byte
     if a.unix is not None and a.slot_uid is None:
@@ -812,6 +1394,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     except (OSError, PolicyError) as e:
         print(f"levain gw-front: policy refused: {e}", file=sys.stderr)
         return 2
+    if a.keys is not None and policy.incarnation is None:
+        print("levain gw-front: policy refused: --keys needs the session's incarnation", file=sys.stderr)
+        return 2
     if a.go_fd is not None:
         # The policy is read first: render is to write it before it starts the front (CONTRACT §4.3). Nothing is
         # bound until GO.
@@ -827,9 +1412,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 pass
         if not go:
             return 3   # EOF before GO: render refused or died, so this front never serves
-    front = Front(policy, log_path=a.log, slot_uid=a.slot_uid)
-    asyncio.run(run_front(front, unix=a.unix, port=a.port))
-    return 0
+    front = Front(policy, log_path=a.log, slot_uid=a.slot_uid, keys_path=a.keys)
+    return asyncio.run(run_front(front, unix=a.unix, port=a.port, keys=a.keys))
 
 
 if __name__ == "__main__":
