@@ -43,6 +43,7 @@ from levain.slot.bwrap import LEVAIN_BWRAP
 from levain.slot.ids import SlotId, loopback_alias
 from levain.slot.layout import RUN, STORE
 from levain.slot.runtime_grammar import AUTHS, KINDS, RenderBlob, parse_stdin
+from levain.slot.wall import WallFacts
 
 VENDOR_PREFIX: Mapping[str, PurePosixPath] = {"darwin": PurePosixPath("/usr/local/lib/levain-vendor"),
                                               "linux": PurePosixPath("/usr/lib/levain-vendor")}   # §2.1
@@ -525,9 +526,44 @@ def assert_no_syscall(text: str) -> None:
         raise Refused("profile-syscall-rule", "a rendered profile names syscall")
 
 
+def profile_lines(facts: WallFacts) -> list[str]:
+    """The SBPL lines of one wall, a pure function of its :class:`~levain.slot.wall.WallFacts` (s5 §5b, A7): the
+    slot's profile and the export targets' profiles are this one builder called with different facts, never a
+    fork of it. In order: ``(allow default)``; the read-denied subpaths; ``file-write*`` denied, then allowed for
+    each writable group (one line per group) and the device literals; with ``devices_only``, reads and ioctls
+    under ``/dev`` denied but for those literals; the network lines as given; the IPC denials; Mach denied but for
+    the allow-list. A facts value with no network line, an empty writable group or a path off the SBPL-safe
+    alphabet is refused: an omission here would leave ``(allow default)`` holding the operation."""
+    if not facts.network or not facts.writable or not all(facts.writable):
+        raise Refused("internal", "wall facts: no network rule or an empty writable group")
+    if any(ch in facts.label for ch in "\n\r\x00"):     # the label is a comment line: a break would start a rule
+        raise Refused("internal", "wall facts: a line break or NUL in the label")
+    lines = ["(version 1)", f";; {facts.label}", "(allow default)"]
+    if facts.read_denied:
+        lines.append("(deny file-read* " + " ".join(f"(subpath {_q(p)})" for p in facts.read_denied) + ")")
+    lines += ["(deny file-write*)", "(allow file-write*"]
+    lines += ["  " + " ".join(f"(subpath {_q(p)})" for p in group) for group in facts.writable]
+    lines.append("  " + " ".join(f"(literal {_q(d)})" for d in facts.devices) + ")")
+    if facts.devices_only:
+        lines += ['(deny file-read* file-ioctl (subpath "/dev"))',
+                  "(allow file-read* file-ioctl " + " ".join(f"(literal {_q(d)})" for d in facts.devices) + ")"]
+    lines += list(facts.network)
+    if facts.ipc_denied:
+        lines += ["(deny ipc-posix*)", "(deny ipc-sysv*)"]
+    lines += ["(deny mach-lookup)", "(deny mach-register)"]
+    lines += [f'(allow mach-lookup (global-name "{m}"))' for m in facts.mach_allow]
+    return lines
+
+
+def _profile_bytes(facts: WallFacts) -> bytes:
+    text = "\n".join(profile_lines(facts)) + "\n"
+    assert_no_syscall(text)
+    return text.encode("utf-8")
+
+
 def render_profile(blob: RenderBlob, facts: RenderFacts) -> bytes:
     """§8.1's classes as SBPL, every path the real ``/private/...`` path, in the forms runs/macos-RM2 and
-    runs/macos-RM1b measured (``vm/rm2_profile.sb.in``, ``vm/rm1b_profile.sb.in``).
+    runs/macos-RM1b measured (``vm/rm2_profile.sb.in``, ``vm/rm1b_profile.sb.in``), through :func:`profile_lines`.
 
     Network block (§24): egress without own loopback = outbound to ``localhost:<gwport>`` only; with it,
     outbound/bind/inbound ``localhost:*`` (pf isolates the slots); none class = nothing. AF_UNIX: ``<S>/sock``
@@ -539,40 +575,49 @@ def render_profile(blob: RenderBlob, facts: RenderFacts) -> bytes:
         raise Refused("unsupported-host", "profile.sb is macOS only")
     S = str(facts.S)
     writable = SLOT_WRITABLE + (DRIVER_WRITABLE if facts.slot.slot_class == "none" else ())
-    lines = [
-        "(version 1)",
-        f";; Levain session profile (CONTRACT §8.1) for {facts.session} on {facts.slot.tag}, kind {facts.kind}.",
-        "(allow default)",
-        "(deny file-write*)",
-        "(allow file-write*",
-        "  " + " ".join(f"(subpath {_q(f'{S}/{d}')})" for d in writable),
-        "  " + " ".join(f"(subpath {_q(vf)})" for vf in facts.var_folders),
-        "  " + " ".join(f"(literal {_q(d)})" for d in DEVICE_LITERALS) + ")",
-        "(deny network-outbound)",
-        "(deny network-bind)",
-        "(deny network-inbound)",
-    ]
+    network = ["(deny network-outbound)", "(deny network-bind)", "(deny network-inbound)"]
     if facts.slot.slot_class == "egress":
         if own_loopback(blob, facts):
-            lines += ['(allow network-outbound (remote ip "localhost:*"))',
-                      '(allow network-bind (local ip "localhost:*"))',
-                      '(allow network-inbound (local ip "localhost:*"))']
+            network += ['(allow network-outbound (remote ip "localhost:*"))',
+                        '(allow network-bind (local ip "localhost:*"))',
+                        '(allow network-inbound (local ip "localhost:*"))']
         else:
-            lines.append(f'(allow network-outbound (remote ip "localhost:{facts.gwport}"))')
+            network.append(f'(allow network-outbound (remote ip "localhost:{facts.gwport}"))')
     sock = _q(f"{S}/sock")
-    lines += [f"(allow network-outbound (remote unix-socket (subpath {sock})))",
-              f"(allow network-bind (local unix-socket (subpath {sock})))",
-              f"(allow network-inbound (local unix-socket (subpath {sock})))"]
+    network += [f"(allow network-outbound (remote unix-socket (subpath {sock})))",
+                f"(allow network-bind (local unix-socket (subpath {sock})))",
+                f"(allow network-inbound (local unix-socket (subpath {sock})))"]
     R, n = str(facts.R), facts.slot.index
     if "levain_queue" in blob.hooks:
-        lines.append(f"(allow network-outbound (remote unix-socket (subpath {_q(f'{R}/qb/slot{n}')})))")
+        network.append(f"(allow network-outbound (remote unix-socket (subpath {_q(f'{R}/qb/slot{n}')})))")
     if facts.kind == "planner":
-        lines.append(f"(allow network-outbound (remote unix-socket (subpath {_q(f'{R}/planner/slot{n}')})))")
-    lines += ["(deny mach-lookup)", "(deny mach-register)"]
-    lines += [f'(allow mach-lookup (global-name "{m}"))' for m in MACH_ALLOW]
-    text = "\n".join(lines) + "\n"
-    assert_no_syscall(text)
-    return text.encode("utf-8")
+        network.append(f"(allow network-outbound (remote unix-socket (subpath {_q(f'{R}/planner/slot{n}')})))")
+    return _profile_bytes(WallFacts(
+        label=f"Levain session profile (CONTRACT §8.1) for {facts.session} on {facts.slot.tag}, kind {facts.kind}.",
+        writable=(tuple(f"{S}/{d}" for d in writable), tuple(facts.var_folders)),
+        devices=DEVICE_LITERALS, network=tuple(network), mach_allow=MACH_ALLOW))
+
+
+def render_importer_profile(host: HostOS) -> bytes:
+    """``L/export/importer.sb`` (s5 §5b): the importer's facts (:func:`levain.slot.wall.export_wall_facts`)
+    through :func:`profile_lines`, guarded like a slot's (:func:`assert_no_syscall` here, the stage's
+    ``check_profile_text`` before it is applied). macOS only."""
+    return _export_profile(host, "importer")
+
+
+def render_verifier_profile(host: HostOS) -> bytes:
+    """``L/export/verifier.sb`` (s5 §5b, §6.0): the importer's shape with ``.verify`` the one writable path."""
+    return _export_profile(host, "verifier")
+
+
+def _export_profile(host: HostOS, role: str) -> bytes:
+    from levain.slot.wall import check_profile_text, export_wall_facts
+
+    if host != "darwin":
+        raise Refused("unsupported-host", f"{role}.sb is macOS only")
+    data = _profile_bytes(export_wall_facts(host, role))
+    check_profile_text(data.decode("utf-8"))
+    return data
 
 
 # --- the whole render ------------------------------------------------------------------------------------------
@@ -820,7 +865,8 @@ __all__ = [
     "REPO_DISCOVERY", "wire_name", "gwport_for", "own_loopback", "check_facts", "render_env", "secret_env_names",
     "TOKEN_ENV", "ABSENT_ENV", "check_env_absent",
     "env_text", "render_cc_settings", "render_cc_onboarding", "codex_config", "codex_toml", "gitconfig_text",
-    "assert_no_syscall", "render_profile", "render", "render_from_stdin", "expected_effective_cc",
+    "assert_no_syscall", "profile_lines", "render_profile", "render_importer_profile", "render_verifier_profile",
+    "render", "render_from_stdin", "expected_effective_cc",
     "expected_effective_codex", "readback_refusals", "refuse_readback", "repo_loosening_refusals",
     "refuse_repo_loosening", "discovery_refusals", "refuse_discovery", "repo_discovery_names", "parse_driver_input",
 ]
