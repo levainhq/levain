@@ -306,6 +306,53 @@ class UpstreamFailed(Exception):
         self.name = name
 
 
+class FrontAborted(Exception):
+    """The front's abort (`X`, EOF, a frame the wire refuses) was read before the request head was written."""
+
+
+class FrontFrames:
+    """The front's frames for one exchange, read by ONE task that outlives whoever waits on it: a waiter that stops
+    waiting (a lost race, a cancel) leaves that read in place for the next one, so no frame is lost or split by a
+    cancel mid-read, and keys holds no more than the one frame it returns. `read` has `FrameReader.read`'s shape."""
+
+    __slots__ = ("frames", "_t")
+
+    def __init__(self, frames: FrameReader) -> None:
+        self.frames = frames
+        self._t: Optional[asyncio.Future] = None
+
+    def pending(self, allowed: frozenset) -> asyncio.Future:
+        """The next frame's read, started now if none is in flight (its allowed set is the one given here)."""
+        if self._t is None:
+            self._t = asyncio.ensure_future(self.frames.read(allowed))
+        return self._t
+
+    async def read(self, allowed: frozenset) -> Optional[Tuple[bytes, object]]:
+        t = self.pending(allowed)
+        got = await asyncio.shield(t)
+        self._t = None
+        return got
+
+    def aborted(self) -> bool:
+        """The next frame, already read, is the front's abort: `X`, EOF, or a read that failed."""
+        t = self._t
+        if t is None or not t.done():
+            return False
+        if t.cancelled() or t.exception() is not None:
+            return True
+        got = t.result()
+        return got is None or got[0] == b"X"
+
+    def close(self) -> None:
+        t, self._t = self._t, None
+        if t is None:
+            return
+        if not t.done():
+            t.cancel()
+        elif not t.cancelled():
+            t.exception()   # retrieved: the exchange is over, a failed read is its end, not an error to report
+
+
 async def upstream_step(aw: Awaitable[T]) -> T:
     """Await one upstream step; an UPSTREAM_FAILURES raise becomes UpstreamFailed (noted), anything else, a
     StaleExchange or a cancel included, propagates unchanged."""
@@ -1237,35 +1284,37 @@ class Keys:
             return
         rec["template"] = tpl.path
         scanner = Scanner([cred.secret.encode("latin-1")] if cred is not None else [])
+        ff = FrontFrames(frames)
         # From the reservation on, every exit releases it (no ledger settles one at this tip): nothing that can raise
         # runs between the reservation and the try. Once `R` is sent no `F` may follow (the wire's order), so a
         # failure after it ends the exchange with the front's connection closed mid-body.
         sent = responded = False
         try:
-            assert pol.upstream is not None   # a brokered route always names one
-            host = pol.upstream.host
-            addr = await upstream_step(pick_address(host, UPSTREAM_PORT))
-            rec["upstream_address"] = addr
-            # the connect and the TLS handshake share one deadline; a result that lands as it expires is still stored
-            # on the exchange by open_exchange, so the release aborts it
-            up = await upstream_step(asyncio.wait_for(open_exchange(addr, UPSTREAM_PORT, host, conn),
-                                                      self.connect_timeout_s))
+            if conn.detached:   # a detached exchange answers nothing
+                return
+            # `A` once the exchange is accepted and before the upstream opens (design 1.3); from here keys reads the
+            # front while it connects, so an abort that arrives before the head is written stops the request
+            conn.writer.write(_A)
+            await conn.writer.drain()
+            up = await self._open_upstream(conn, ff, side, pol, rec)
+            if up is None:
+                return   # the front aborted (`X`) or went away during the connect: nothing went upstream
 
             async def send_head() -> None:
                 nonlocal sent
+                if ff.aborted():   # checked with no await before the write: an abort read by now stops the head
+                    raise FrontAborted()
                 up.write(head)   # the gate: a refused or failed write handed nothing upstream
                 sent = True      # from here the head may have reached the upstream
                 await up.drain()
 
-            await upstream_step(send_head())
-            if not conn.detached:   # a detached exchange answers nothing; its next upstream write is refused by the gate
-                conn.writer.write(_A)
-                await conn.writer.drain()
-            ended = await self._forward_body(frames, side, up, hconn, q["body"], pol.body_cap, rec)
-            if not ended:
+            try:
+                await upstream_step(send_head())
+            except FrontAborted:
+                return
+            resp = await self._upload_and_head(ff, side, up, hconn, q["body"], pol.body_cap, rec)
+            if resp is None:
                 return   # the front aborted (`X`) or went away before `E`: nothing to answer
-            loop = asyncio.get_running_loop()
-            resp = await upstream_step(upstream.read_head(up, hconn, loop.time() + self.head_timeout_s))
             r_frame = self._response_frame(resp, pol, cred, scanner)
             if conn.detached:
                 return
@@ -1279,10 +1328,65 @@ class Keys:
                 rec["refused"] = r.name   # after `R`: the front's connection is closed with the body cut short
                 _note(logging.WARNING, "levain gw-keys: response cut short after its head (%s)", r.name)
             else:
-                await self._refuse(conn, frames, side, r.name, pol.body_cap)
+                await self._refuse(conn, ff, side, r.name, pol.body_cap)
         finally:
+            ff.close()
             rec["redactions"] = scanner.count
             self._release(conn.reg, pol, sent)
+
+    async def _open_upstream(self, conn: Conn, ff: "FrontFrames", side: KeysSide, pol: RoutePolicy,
+                             rec: dict) -> Optional[Upstream]:
+        """The exchange's `Upstream`, or None when the front aborted first: the resolve, the connect and the TLS
+        handshake run as one task, raced with the front's next frame. `X`, EOF or a bad frame cancels them (a
+        connection already made is stored on the exchange, which the release aborts); a `B` or `E` is left for the
+        upload, so keys holds no more than that one frame."""
+        assert pol.upstream is not None   # a brokered route always names one
+        host = pol.upstream.host
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.connect_timeout_s
+
+        async def connect() -> Upstream:
+            # resolve, connect and TLS share the one connect deadline (design 1.6); a resolver thread may outlive a
+            # resolve past it, the exchange does not. A connection that lands as the deadline expires is still stored
+            # on the exchange by open_exchange, so the release aborts it.
+            addr = await upstream_step(asyncio.wait_for(pick_address(host, UPSTREAM_PORT),
+                                                        max(0.0, deadline - loop.time())))
+            rec["upstream_address"] = addr
+            return await upstream_step(asyncio.wait_for(open_exchange(addr, UPSTREAM_PORT, host, conn),
+                                                        max(0.0, deadline - loop.time())))
+
+        task = asyncio.ensure_future(connect())
+        try:
+            await asyncio.wait({task, ff.pending(side.allowed())}, return_when=asyncio.FIRST_COMPLETED)
+            if ff.aborted():
+                return None
+            return await task
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)   # a race lost to the abort: its outcome is dropped
+
+    async def _upload_and_head(self, ff: "FrontFrames", side: KeysSide, up: Upstream, hconn: "h11.Connection",
+                               body: str, cap: int, rec: dict) -> Optional["h11.Response"]:
+        """The request body up and the response head down, AT ONCE: an upstream may answer before it has read the
+        body (a 401 or a 413) and stop reading, so the final head ends the upload. Returns that head, or None when the
+        front aborted before its body ended. The head's deadline starts at the request's last byte (design 1.6);
+        while the body is still going up, the head waits as long as the upload does."""
+        upload = asyncio.ensure_future(self._forward_body(ff, side, up, hconn, body, cap, rec))
+        head = asyncio.ensure_future(upstream.read_head(up, hconn, None))
+        try:
+            await asyncio.wait({upload, head}, return_when=asyncio.FIRST_COMPLETED)
+            if upload.done():
+                if not upload.result():   # the body's own refusal or upstream failure raises here
+                    return None
+                if not head.done():
+                    await upstream_step(asyncio.wait_for(asyncio.shield(head), self.head_timeout_s))
+            return await upstream_step(head)
+        finally:
+            for t in (upload, head):
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(upload, head, return_exceptions=True)
 
     def _response_frame(self, resp: "h11.Response", pol: RoutePolicy, cred: object, scanner: Scanner) -> bytes:
         """The `R` frame for a final response head, or the refusal (design 1.6): a redirect is `upstream-redirect`;
@@ -1321,18 +1425,23 @@ class Keys:
     async def _relay_body(self, conn: Conn, up: Upstream, hconn: "h11.Connection", scanner: Scanner,
                           rec: dict) -> None:
         """`b`* `e`: each body read relayed at once through the scanner (no buffering but the held possible start of a
-        secret), each frame drained before the next read, so a slow front pauses the upstream's reader."""
+        secret), each frame drained before the next read, so a slow front pauses the upstream's reader. A detached
+        exchange relays nothing more: `detached` is checked before every frame, after each read and each drain."""
         w = conn.writer
         while True:
             part = await upstream_step(upstream.read_body(up, hconn, self.idle_s))
             out = scanner.feed(part) if part is not None else scanner.flush()
             for i in range(0, len(out), BODY_FRAME):
+                if conn.detached:
+                    return
                 piece = out[i:i + BODY_FRAME]
                 w.write(gwwire.encode(b"b", piece))
                 rec["bytes_down"] += len(piece)
                 await w.drain()
             if part is None:
                 break
+        if conn.detached:
+            return
         w.write(gwwire.encode(b"e"))
         await w.drain()
 
@@ -1454,7 +1563,7 @@ class Keys:
         self.budget.reserve(reg.session, pol.route, pol.max_call_microdollars)   # the last step: see `_serve_q`
         return head, hconn, cred, tpl
 
-    async def _forward_body(self, frames: FrameReader, side: KeysSide, up: Upstream, hconn: "h11.Connection",
+    async def _forward_body(self, frames: "FrontFrames", side: KeysSide, up: Upstream, hconn: "h11.Connection",
                             body: str, cap: int, rec: dict) -> bool:
         """The front's `B` frames through `up.write`, framed as the head declared, until `E` (True) or `X` / EOF
         (False); an upstream failure raises UpstreamFailed. keys counts the bytes itself: past `cap` is `body-cap`, a
@@ -1584,7 +1693,8 @@ class Keys:
             return ("refused", ans["refused"])
         return ("failed",)
 
-    async def _refuse(self, conn: Conn, frames: FrameReader, side: KeysSide, name: str, cap: int) -> None:
+    async def _refuse(self, conn: Conn, frames: Union[FrameReader, "FrontFrames"], side: KeysSide, name: str,
+                      cap: int) -> None:
         """The `F` path: `F`, SHUT_WR, then read and discard the front's frames until `E`, `X`, EOF, `cap` body bytes
         read after the `F`, or DRAIN_S; the caller closes. So `F` is never cut off by a close with unread bytes. A
         detached exchange is answered nothing (phase 2 closes its connection)."""

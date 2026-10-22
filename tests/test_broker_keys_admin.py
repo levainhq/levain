@@ -907,7 +907,7 @@ def test_upstream_failure_answers_f_and_releases_the_budget(monkeypatch, fault):
     async def handshake(addr, port, host):
         if fault in raises:
             raise raises[fault]
-        return object(), _Failing(st), _Plain()
+        return asyncio.StreamReader(), _Failing(st), _Plain()   # the head is read while the body goes: none comes
 
     if fault != "unbuilt":
         monkeypatch.setattr(U, "_handshake", handshake)
@@ -926,8 +926,9 @@ def test_upstream_failure_answers_f_and_releases_the_budget(monkeypatch, fault):
     finally:
         shutil.rmtree(d, ignore_errors=True)
     name = "upstream-timeout" if fault == "timeout" else "upstream-error"
-    want = (gwwire.encode(b"A") if fault == "body-drain" else b"") + gwwire.encode(b"F", {"refused": name})
-    assert got == (b"" if fault == "head-stale" else want)
+    # `A` answers the accepted `Q` before the upstream opens (design 1.3), so every failure is `A` then `F`
+    want = gwwire.encode(b"A") + gwwire.encode(b"F", {"refused": name})
+    assert got == (gwwire.encode(b"A") if fault == "head-stale" else want)
     assert st["raw"] == [] or fault not in ("head-write", "head-stale")   # the gate refused: nothing written
     assert ledger.held == 0 and len(ledger.sent) == 1
     assert ledger.sent == [fault in ("head-drain", "body-drain")]   # `sent` once the head was handed upstream
@@ -975,7 +976,7 @@ def test_preemption_fences_old_exchanges_before_its_bounded_await(monkeypatch):
     st = {"after": False, "raw": []}
 
     async def handshake(addr, port, host):
-        return object(), _RawTLS(st), _Plain()
+        return asyncio.StreamReader(), _RawTLS(st), _Plain()   # the head is read while the body goes: none comes
 
     async def run() -> dict:
         cred_fd = os.open(os.path.join(d, "keys", "cred"), os.O_RDONLY | os.O_DIRECTORY)
