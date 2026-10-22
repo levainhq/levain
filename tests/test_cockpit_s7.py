@@ -65,7 +65,7 @@ _PROBE = r"""(() => {
     t: r.querySelector('.t').textContent, n: r.querySelector('.pill').textContent,
     tag: (r.querySelector('.rp-tag') || {}).textContent || null, hue: (r.querySelector('.rp-tag') || {dataset: {}}).dataset.repo || null}));
   return JSON.stringify({card: true, title: card.querySelector('.brief-head h3').textContent,
-    source: card.querySelector('.brief-head .stamp').textContent, lead: card.querySelector('.lead-first').textContent,
+    source: (card.querySelector('.brief-head .stamp') || card.querySelector('.brief-threads .brief-src')).textContent, lead: card.querySelector('.lead-first').textContent,
     rows: rows, overnight: (card.querySelector('.brief-overnight .mono') || {}).textContent || null,
     items: card.querySelectorAll('.lead-then, .lead-item').length});
 })()"""
@@ -78,7 +78,7 @@ def test_the_card_groups_threads_by_repo_loudest_first(tmp_path: Path) -> None:
         out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": READY}, {"until": "document.querySelector('.brief-card')"},
                                                           {"eval": _PROBE}])["values"]
     got = json.loads(out[-1])
-    assert got["card"] and got["title"] == "Where to begin" and got["source"] == "from the Tray and Open loops", got
+    assert got["card"] and got["title"] == "Next from the Tray" and got["source"] == "from the Tray and Open loops", got   # the data says "Where to begin"; the card names what it holds, and the caption sits under the loops heading
     assert got["lead"] and got["rows"], got
     counts = [int(r["n"].split()[0]) for r in got["rows"]]
     assert counts == sorted(counts, reverse=True), got                  # loudest first

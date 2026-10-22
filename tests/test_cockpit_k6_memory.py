@@ -7,6 +7,7 @@ actually cuts (the tile body, the nearest overflow-hidden ancestor), and by the 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from tests.test_cockpit_flip_parity import _drive, needs_browser
@@ -213,10 +214,11 @@ def test_patterns_and_decisions_are_the_markdown_dressed_in_place_and_lose_nothi
             {"emulate": {"w": 1440, "h": 900, "dpr": 1}}, {"until": "window.LevainDashboard"}, {"eval": LOSSLESS},
         ])["values"]
     r = out[1]
-    assert r["pText"] == r["pPlain"], r                                    # every character the markdown showed is still there
+    plain = re.sub(r"\{([^{}]*?) \u2014 ([^{}]*)\}", "\\1 \u00b7 \\2", r["pPlain"])   # the group head is shown without its braces, its dash a middle dot
+    assert r["pText"] == plain, r                                          # every other character the markdown showed is still there
     assert r["dText"] == r["dPlain"], r
     assert r["pChips"] == ["40x", "2x", "3x", "4x"], r                      # the count moved into a leading chip
-    assert [g.strip() for g in r["pGroups"]] == ["{today — 2026-10-19}", "{carried — not re-exercised today}"], r   # stale patterns are labelled
+    assert [g.strip() for g in r["pGroups"]] == ["today \u00b7 2026-10-19", "carried \u00b7 not re-exercised today"], r   # stale patterns are labelled, braces dropped
     assert r["pNames"][0].strip() == "!!! absence_of_signal_rendered_as_health", r  # the severity mark survives, in the name
     assert r["pCode"] == 1, r                                              # a code span in a name stays a code span
     assert r["pStray"] == r["pStrayPlain"] and len(r["pStray"]) == 1, r    # a line that matches nothing is left exactly as rendered

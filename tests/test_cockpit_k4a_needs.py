@@ -127,7 +127,7 @@ def test_the_sessions_tile_says_live_and_quiet_and_names_the_busiest(tmp_path: P
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": f"{SESS_TILE}"},
             {"eval": "new Promise(r => setTimeout(() => r(1), 800))"},
-            {"eval": f"{SESS_TILE}.innerText.replace(/\\s+/g, ' ')"}])["values"][-1]
+            {"eval": f"({SESS_TILE}.innerText + ' ' + [...{SESS_TILE}.querySelectorAll('[title]')].map(e => e.title).join(' ')).replace(/\\s+/g, ' ')"}])["values"][-1]   # the busiest rides the tile's title, off the counts line
     text = out.lower()
     assert "live" in text and "quiet" in text and "busiest" in text, out
 
