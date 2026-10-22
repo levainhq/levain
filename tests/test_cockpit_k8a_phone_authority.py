@@ -731,3 +731,57 @@ def test_a_cancel_from_another_transport_never_takes_the_reserved_slot(world):
         _refused("pending_cap", w.b.cancel, pid, credential=thief)
     # the phone's own transport still takes its one reserved cancel per pending
     assert w.b.cancel(phones[0], credential=w.dev)["state"] == "WAITING"
+
+
+def test_a_retried_signature_after_a_revoke_answers_the_persisted_outcome(install, monkeypatch):
+    # K-4 (codex MED): the signature committed but its answer was lost on the phone's network; before the retry the
+    # passkey is revoked, or the authority cannot be read. The retry of the same assertion gets the persisted terminal
+    # outcome and signer, applying nothing and verifying nothing new; a WAITING pending still needs the full check
+    from levain.phone_app import PhoneApp, PhoneAppError
+    from tests.cockpit_authority_rig import revoke_any
+
+    w = install
+    base, httpd = _serve(w.qdir)
+    try:
+        row = _tray_row(base)
+        status, out = _fire(base, {"fingerprint": w.phone.fingerprint, "verb": "spore_update", "panel_id": "tray",
+                                   "row_id": row["id"], "row_version": row["version"], "params": {"text": "once"}})
+        assert status == 200, out
+        pid = out["pending_id"]
+        pend = _call(base, f"/cockpit/pending/{pid}")[1]
+        ad, cdj, der = w.phone.assertion(_unb64u(pend["challenge"]), origin=base)
+        body = {"fingerprint": w.phone.fingerprint, "authenticator_data": _b64u(ad), "client_data_json": _b64u(cdj),
+                "signature": _b64u(der)}
+        status, first = _call(base, f"/cockpit/pending/{pid}/signature", body)
+        assert status == 200 and first["state"] == "COMMITTED", first
+        # a second WAITING pending, signed only after the revoke: refused, nothing applied
+        row = _tray_row(base)
+        status, late = _fire(base, {"fingerprint": w.phone.fingerprint, "verb": "spore_update", "panel_id": "tray",
+                                    "row_id": row["id"], "row_version": row["version"], "params": {"text": "late"}})
+        assert status == 200, late
+        lpend = _call(base, f"/cockpit/pending/{late['pending_id']}")[1]
+        revoke_any(CockpitDB(w.root), w.phone)                              # type: ignore[arg-type]
+        status, again = _call(base, f"/cockpit/pending/{pid}/signature", body)
+        assert status == 200 and again["state"] == "COMMITTED" and again["replay"] is True, again
+        assert again["signer_fp"] == w.phone.fingerprint, again
+        ad, cdj, der = w.phone.assertion(_unb64u(lpend["challenge"]), origin=base)
+        status, no = _call(base, f"/cockpit/pending/{late['pending_id']}/signature",
+                           {**body, "authenticator_data": _b64u(ad), "client_data_json": _b64u(cdj),
+                            "signature": _b64u(der)})
+        assert status == 422 and no["error"] == "no_passkey", no
+        assert _call(base, f"/cockpit/pending/{late['pending_id']}")[1]["state"] == "WAITING"
+
+        # an authority that cannot be read now: the terminal retry still answers, the WAITING one is a 503
+        def unreadable(self: Any, cockpit: Any) -> None:
+            raise PhoneAppError(503, "authority_unreadable", "cannot be read now")
+
+        monkeypatch.setattr(PhoneApp, "_governed_refusal", unreadable)
+        status, again = _call(base, f"/cockpit/pending/{pid}/signature", body)
+        assert status == 200 and again["state"] == "COMMITTED" and again["signer_fp"] == w.phone.fingerprint, again
+        status, no = _call(base, f"/cockpit/pending/{late['pending_id']}/signature",
+                           {**body, "authenticator_data": _b64u(ad), "client_data_json": _b64u(cdj),
+                            "signature": _b64u(der)})
+        assert status == 503 and no["error"] == "authority_unreadable", no
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

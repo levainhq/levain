@@ -373,6 +373,12 @@ class PhoneApp:
         answer's ``signer_fp`` is the signer the journal PERSISTED for the pending (None when no signature decided
         it, e.g. it had expired), never the fingerprint this request named.
 
+        A pending that is no longer ``WAITING`` (effectively: one past its signed ``expires_at`` reads ``EXPIRED``) is
+        answered from the journal first, its persisted outcome and signer, before the authority or the key is read:
+        a retry after a lost answer recovers the outcome even once the passkey is revoked or the authority cannot be
+        read, and nothing is applied or verified for it (the broker's ``submit`` answers a decided pending the same
+        way). Only a ``WAITING`` pending goes through the governed refusal and the key checks.
+
         Only building the cockpit parts takes the read lock: ssh-keygen (two runs, 10 s each at most) runs under the
         write lock alone, so the board and pending reads answer meanwhile."""
         from levain.autonomic.confirm import COCKPIT_PHONE_NAMESPACE
@@ -386,9 +392,15 @@ class PhoneApp:
             raise PhoneAppError(400, "bad_request", f"request keys must be {sorted(_ASSERTION)}")
         with self._lock:
             source, cockpit, registry = self._parts()
-            self._governed_refusal(cockpit)
         with self._write_lock, self._broker(source, cockpit, registry) as broker:
             try:
+                db = broker.db
+                assert db is not None
+                now = broker.result(db, pending_id, replay=True)
+                if now["state"] != "WAITING":
+                    return {**now, "signer_fp": db.load(pending_id).signer_fp}
+                with self._lock:
+                    self._governed_refusal(cockpit)
                 snap = broker.capture().authority
                 key = snap.key(req["fingerprint"]) if snap is not None and isinstance(req["fingerprint"], str) \
                     else None
@@ -401,8 +413,7 @@ class PhoneApp:
                                       b64url_decode(req["signature"], "signature"),
                                       namespace=COCKPIT_PHONE_NAMESPACE, page_origin=page_origin)
                 out = broker.submit(pending_id, signature, page_origin=page_origin)
-                db = broker.db
-                return {**out, "signer_fp": db.load(pending_id).signer_fp if db is not None else None}
+                return {**out, "signer_fp": db.load(pending_id).signer_fp}
             except PasskeyError as exc:
                 raise PhoneAppError(422, "bad_signature", str(exc)) from None
             except BrokerError as exc:
