@@ -16,9 +16,12 @@ from levain.web_server import make_server
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install
 
-# every direct child of the board is tall, so the page's height comes from the board (the thing a reload empties)
-TALL = ("(() => { const s = document.createElement('style'); s.textContent = '#board > * { min-height: 900px; }';"
-        " document.head.appendChild(s); return document.documentElement.scrollHeight; })()")
+# the page's height comes from rules that match what a repaint RECREATES (inline styles on the existing children would
+# be thrown away with them, and the page would shrink for the wrong reason). The page's CSP (style-src 'self') refuses a
+# <style> element, but a rule inserted through the CSSOM into an existing stylesheet applies. No padding on #board itself:
+# an emptied board must make the page SHORT, or the clamp this guards never happens.
+TALL = ("(() => { const ss = document.styleSheets[0]; ss.insertRule('#board > * { min-height: 1600px !important; }', ss.cssRules.length);"
+        " return document.documentElement.scrollHeight; })()")
 # count the renders (the boot code calls LevainDashboard.render on every load) without changing what they do
 COUNT = ("(() => { const L = window.LevainDashboard, r = L.render; window.__renders = 0;"
          " L.render = function () { try { return r.apply(this, arguments); } finally { window.__renders++; } }; return 1; })()")
@@ -122,7 +125,9 @@ def test_refocusing_the_filter_box_after_a_reload_does_not_scroll_the_page(tmp_p
             {"until": f"{box} && 1"},
             {"eval": TALL},
             {"eval": COUNT},
-            {"eval": f"(() => {{ {box}.focus(); window.scrollTo(0, 1500); const r = {box}.getBoundingClientRect();"
+            # scrolled far enough that the box is above the viewport wherever the layout puts it (the K layout no longer puts it near the
+            # top of #board), and the page keeps that scroll through the reload
+            {"eval": f"(() => {{ {box}.focus(); const b = {box}.getBoundingClientRect(); const y = Math.min(document.documentElement.scrollHeight - innerHeight, Math.round(b.bottom + window.scrollY + 300)); window.scrollTo(0, y); const r = {box}.getBoundingClientRect();"
                      " return [window.scrollY, r.bottom < 0 || r.top > innerHeight]; })()"},
             {"eval": "document.getElementById('refresh').click(); 1"},
             {"until": "window.__renders >= 1 && window.__renders"},
@@ -130,9 +135,9 @@ def test_refocusing_the_filter_box_after_a_reload_does_not_scroll_the_page(tmp_p
             {"eval": f"new Promise(r => setTimeout(() => r([window.scrollY, document.activeElement === {box}]), 600))"},
         ])
     v = out["values"]
-    assert v[3][1] is True and abs(v[3][0] - 1500) <= 2, f"the filter box must start off-screen: {v}"
+    assert v[3][1] is True and v[3][0] > 0, f"the filter box must start off-screen: {v}"
     assert v[6][1] is True, f"the filter box was not refocused after the reload (the test would prove nothing): {v}"
-    assert abs(v[6][0] - 1500) <= 2, f"refocusing the filter box scrolled the page: {v}"
+    assert abs(v[6][0] - v[3][0]) <= 2, f"refocusing the filter box scrolled the page: {v}"
 
 
 @needs_browser

@@ -43,7 +43,7 @@
     p.dataset.editClass = entry.edit_class || "";
     // the panel's stable id: what a kept row or scroll position is filed under (the heading is not an identity)
     if (entry.id) p.dataset.panelId = String(entry.id);
-    if (entry.modes) p.dataset.modes = entry.modes;   // which of the Morning / Board / Build modes show this panel
+    if (entry.modes) p.dataset.modes = entry.modes;   // which of the four tabs (Morning / Board / Build / Memory) show this panel
     const head = el("div", "phead");
     head.appendChild(el("h2", null, entry.title));
     if (entry.edit_class) {
@@ -61,7 +61,7 @@
     return p;
   };
   function appendBanner(host, entry) {
-    for (const b of entry.banner || []) host.appendChild(el("div", "ext-note" + (b.tone === "stale" ? " stale" : ""), b.text));
+    for (const b of entry.banner || []) host.appendChild(richEl("div", "ext-note" + (b.tone === "stale" ? " stale" : ""), b.text));
   }
   const kv = (parent, k, v) => {
     const row = el("div", "kv");
@@ -128,9 +128,13 @@
   // is the ⤢ trigger to restore focus to on close; `modalEpisodeQuery` persists the
   // modal's episode search across refresh-rebuilds (the supersede — see renderEpisodes).
   let currentView = null;
+  let lastOpts = null;   // the options the last draw was made with: a layout change (K5) redraws the same view the same way
   let modalKey = null;
   let modalGlance = false;   // the open view came from a glance tile: it shows that tile's own typed panel, whatever the entry's kind
   let modalReturnFocus = null;
+  // a focus view that is not a layout entry (a Needs-you card): { id, title, build() -> element }. One slot, so the dialog,
+  // its Esc, its Tab trap and its focus return are the one implementation every focus view uses.
+  let modalCustom = null;
   let modalEpisodeQuery = "";
   // Open-Loops filter query — CLIENT-side (the loops all ride the wire), persisted across
   // re-renders (a verb fires → the board rebuilds → you stay in your filter) and into the
@@ -255,6 +259,7 @@
     pollJob = opts && typeof opts.pollJob === "function" ? opts.pollJob : null;
     onJobsIdle = opts && typeof opts.onJobsIdle === "function" ? opts.onJobsIdle : null;
     recall = opts && typeof opts.recall === "function" ? opts.recall : null;
+    lastOpts = opts;
 
     const board = document.getElementById("board");
     if (!board) return;
@@ -269,7 +274,7 @@
     const storeEl = document.getElementById("store");
     if (!view || typeof view !== "object") {
       board.appendChild(el("p", "empty", "No substrate data delivered."));
-      keShell(false);      // the KE regions, the moved masthead and the state line must not outlive the data they showed
+      keShell(false);      // the KE regions and the state line (moved into the now band) must not outlive the data they showed
       renderState(null);
       closeModal();  // don't leave a focus-modal open over a view we can't render
       return;
@@ -340,7 +345,7 @@
 
     const layout = Array.isArray(view.layout) ? view.layout : [];
     keShell(!!view.ke);
-    if (view.ke) { renderKe(view, board); if (window.LevainCockpitKinds && window.LevainCockpitKinds.fillGrids) window.LevainCockpitKinds.fillGrids(); }
+    if (view.ke) renderKe(view, board);
     let lastZone = null;
     for (const entry of view.ke ? [] : layout) {
       // In the "All" view, drop a zone separator before each zone's first panel.
@@ -370,6 +375,9 @@
     settleKept(board, kept);
     buildKept = null;
     applyFilter();
+    // the cards are on the page and wrapped: the grids learn which columns hold a card on this tab, which card is empty, and which stands
+    // alone in its row (measured, so it waits for the bodies)
+    if (view.ke && window.LevainCockpitKinds && window.LevainCockpitKinds.fillGrids) window.LevainCockpitKinds.fillGrids();
     // Webfonts can shift line metrics after first paint — recompute the scents once they
     // settle so a panel that only overflows post-font-load still gets the cue + affordance.
     if (document.fonts && document.fonts.ready) {
@@ -398,10 +406,81 @@
   // no longer overflows (search shrinking results, font reflow) so the scent never goes stale.
   // Reads layout synchronously; valid because render() builds into the live #board, so the
   // .clamped max-height is actually applied (a detached board would read zero overflow).
+  // The work lists draw whole rows and say how many they leave out: a list that does not fit its card folds the rows below the fold
+  // (display none, never a half row) and ends in an "N more" link that opens the panel's focus view. Re-runnable: a redraw, a filter
+  // or a resize unfolds first and measures again.
+  const FOLD_PANELS = ["tray", "loops", "keep", "episodes", "now", "inbox", "roster", "stream", "flow-episodes", "flow-spores"];
+  // what a folding list is made of: its rows (a work row, a roster row, a log line) and the headings that group them
+  const FOLD_ROW = ".row, .rrow, .lrow", FOLD_HEAD = ".grp-head, .grp-h";
+  function foldRows(body) {
+    const panel = body.closest && body.closest(".panel[data-ck-panel]");
+    if (!panel || FOLD_PANELS.indexOf(panel.dataset.ckPanel) < 0 || panel.closest(".modal")) return false;
+    // the reading place survives every fold trigger (a row opening, a search, fonts settling): unfolding and folding again
+    // changes the body's height, and the browser clamps or anchors the scroll under the reader
+    const place = body.scrollTop;
+    try { return foldRowsAt(body, panel); } finally { if (body.scrollTop !== place) body.scrollTop = place; }
+  }
+  function foldRowsAt(body, panel) {
+    for (const n of body.querySelectorAll("[data-folded]")) { n.style.display = ""; delete n.dataset.folded; }
+    const old = panel.querySelector(":scope > .more-foot:not([data-readall])"); if (old) old.remove();   // the "Read all" foot is memFoot's: removing it here made memFoot re-add it, a childList change that re-ran this, without end
+    if (!(body.scrollHeight > body.clientHeight + 1)) return false;
+    const top = body.getBoundingClientRect().top;
+    const heldLine = body.querySelector(":scope > .held-line, .held-line");
+    const limit = body.clientHeight - 34 - (heldLine ? heldLine.offsetHeight : 0);   // room kept for the link and the held-back line
+    const isRow = (n) => n.matches(FOLD_ROW), isHead = (n) => n.matches(FOLD_HEAD);
+    const items = Array.prototype.filter.call(body.querySelectorAll(FOLD_ROW + ", " + FOLD_HEAD), (n) => !n.parentElement.closest(FOLD_ROW));
+    // where bands sit side by side (Morning's Tray: Overdue | Today) each column has its own fold, since a column that overflows says
+    // nothing about the one beside it; a band laid in the same flow (`display: contents`) shares the one
+    const colOf = (n) => { const c = n.closest(".grp-col"); return c && body.contains(c) && window.getComputedStyle(c).display !== "contents" ? c : null; };
+    const buckets = new Map();
+    for (const n of items) { const k = colOf(n); if (!buckets.has(k)) buckets.set(k, []); buckets.get(k).push(n); }
+    let hidden = 0;
+    for (const list of buckets.values()) {
+      let cut = false;
+      // a row the reader opened is the one thing they are reading: it and every row above it stay, however tall it
+      // grew (the body then scrolls inside the card); only the rows after it fold. A fold that took the open row
+      // away closed it under the reader on the click and again on every redraw.
+      let pin = -1;
+      list.forEach((n, i) => { if (n.classList.contains("row-expanded")) pin = i; });
+      for (const [i, n] of list.entries()) {
+        const r = n.getBoundingClientRect();
+        // rects are measured against where the body is scrolled to: add the scroll back, or a scrolled body folds too few rows
+        if (!cut && i > pin && r.bottom - top + body.scrollTop > limit) cut = true;
+        if (cut) { n.style.display = "none"; n.dataset.folded = "1"; if (isRow(n)) hidden++; }
+      }
+      // a heading left with no row under it goes too
+      for (let i = 0; i < list.length; i++) {
+        if (!isHead(list[i]) || list[i].dataset.folded) continue;
+        const next = list.slice(i + 1).find((n) => !n.dataset.folded && isRow(n));
+        const nextHead = list.slice(i + 1).findIndex((n) => isHead(n) && !n.dataset.folded);
+        const nextRow = next ? list.indexOf(next) : -1;
+        if (nextRow < 0 || (nextHead >= 0 && i + 1 + nextHead < nextRow)) { list[i].style.display = "none"; list[i].dataset.folded = "1"; }
+      }
+    }
+    if (!hidden) return false;
+    // a list that has more rows than it first draws ends in its own "show all N" link; once the card folds, two links to the same rest would
+    // disagree on the count, so the card keeps one: the foot, saying how many the focus view holds
+    const xm = body.querySelector(".xmore"), total = xm ? parseInt((/\d+/.exec(xm.textContent) || [])[0], 10) : NaN;
+    if (xm) { xm.style.display = "none"; xm.dataset.folded = "1"; }
+    const more = el("button", "more-foot", Number.isFinite(total) && total > hidden ? "Read all " + total : hidden + " more");
+    more.type = "button";
+    more.setAttribute("aria-label", (Number.isFinite(total) && total > hidden ? "Read all " + total + " rows" : hidden + " more rows") + ": open the full list");
+    more.addEventListener("click", () => { const x = panel.querySelector(".pexpand"); if (x) x.click(); });
+    panel.appendChild(more);
+    return true;
+  }
+
   function measureOverflow(body) {
+    const folded = foldRows(body);
     const atEnd = () => body.scrollTop + body.clientHeight >= body.scrollHeight - 1;
     const over = body.scrollHeight > body.clientHeight + 1;
-    body.classList.toggle("has-overflow", over);
+    // a folded card still scrolls when the reader's open row is taller than it: it keeps the keyboard affordance below,
+    // and only the "more below" fade is skipped (the "N more" link is its cue)
+    body.classList.toggle("has-overflow", over && !folded);
+    // the fade and the "Read all" foot key off this one class: set here for every bounded body, cleared when the content fits again
+    body.classList.toggle("is-clipped", over && !folded);
+    const memPanel = body.closest && !body.closest(".modal") ? body.closest(".ck-mem-nest, .ck-mem-row > .panel") : null;
+    if (memPanel) memFoot(memPanel);
     // Keyboard access (codex L3): make the scroll region focusable + named so arrow-keys
     // scroll a text-only panel (no focusable child) — the affordance the expander gave.
     if (over) {
@@ -416,7 +495,7 @@
         body.dataset.scrollWired = "1";
         body.addEventListener("scroll", () => { body.classList.toggle("at-end", atEnd()); }, { passive: true });
       }
-      body.classList.toggle("at-end", atEnd());  // recompute now (content size may have changed)
+      body.classList.toggle("at-end", !folded && atEnd());  // recompute now (content size may have changed)
     } else {
       body.removeAttribute("tabindex");
       body.removeAttribute("role");
@@ -434,6 +513,7 @@
     for (const clause of root.querySelectorAll(".clause.clampable")) {
       const row = clause.closest(".row");
       if (!row || row.classList.contains("row-expanded")) continue;
+      if (row.dataset.folded) continue;   // display:none reads 0 high: leave a folded row's toggle as it was measured
       // No +1 tolerance: the harm is asymmetric — a false NEGATIVE hides the tail with no
       // toggle (the bug this slice fixes), a false positive is a harmless toggle on a 2-line
       // row. Line-clamp overflow is full-line-granular + heights are integers, so an exactly-
@@ -465,6 +545,9 @@
       if (p.dataset.editable === "1" && p._levainEdit) {
         p.appendChild(buildEditRow(p, p._levainEdit.entry, p._levainEdit.doc));
       }
+      // K5: a zone card's collapse and move controls, in the same draw as its body (dashPass keeps them right after a repaint)
+      const zgrid = p.closest(".ck-zgrid");
+      if (zgrid && !emptyProvider(p)) layoutControls(zgrid, p);
     }
   }
 
@@ -474,37 +557,31 @@
   // One panel whose data a renderer cannot draw is an unavailable panel, never a blank board or a
   // stale modal: the board and the focus modal both draw through this.
   // ---------------------------------------------------------------- the KE page ----
-  // A manifest that declares hero / brief / widgets is drawn as the page's own regions: the hero first (the
-  // clock column with the weather under it, the sky beside it with the tool strip above), the brief, one row
-  // of widgets, then each zone as a 3-column grid of cards. The nav bar's contents live in the hero's strip.
+  // A manifest that declares hero / brief / widgets is drawn as the page's own regions: the hero first (the now band: clock, date,
+  // the state line, the wrap line; the sky as a card under it), the brief, one row of widgets, then each zone as a grid of cards.
+  // The masthead above them is the page's bar and stays where the static page put it.
   const CK_SIZES = ["short", "medium", "tall"];   // ascending height; a grid row is as tall as its tallest card
   const CK_COLUMNS = 3;
   const tabChoice = new Map();                     // zone/title -> the tab the operator chose, kept across renders
-  // the two structural nodes the KE page moves into its regions. A region that fails restores its own node here, BEFORE
-  // anything is cleared, so no catch can strand them inside a region it is about to wipe.
+  // the one structural node the KE page moves into a region: the state line, which lives in the now band while the KE page is up.
+  // A region that fails restores it here BEFORE anything is cleared, so no catch can strand it inside a region it is about to wipe.
+  // (The masthead and the brand no longer move: the bar is the same on every page.)
   function restoreState() {
     const state = document.getElementById("state"), store = document.getElementById("store");
     if (state && store && store.parentNode && state.parentNode !== store.parentNode) store.parentNode.insertBefore(state, store);
   }
-  function restoreMasthead() {
-    const mast = document.querySelector("header.masthead"), brand = document.querySelector(".brand");
-    const state = document.getElementById("state"), store = document.getElementById("store");
-    if (!mast || !store || !store.parentNode) return;
-    if (brand && !mast.contains(brand)) mast.insertBefore(brand, mast.firstChild);
-    const anchor = state && state.parentNode === store.parentNode ? state : store;
-    if (mast.parentNode !== store.parentNode || mast.nextSibling !== anchor) store.parentNode.insertBefore(mast, anchor);
-  }
-  // a failed hero render: the masthead goes home and the CONTENT mounts are emptied (stale weather and sky beside the
-  // error line would read as current); the structural mounts (#ck-hero, #ck-skycol, #ck-strip) stay for the next render
+  // a failed hero render: the CONTENT mounts are emptied (stale weather and sky beside the error line would read as current);
+  // the structural mounts (#ck-hero, #ck-band, #ck-skycol) stay for the next render
   function restoreHero() {
-    restoreMasthead();
-    for (const id of ["ck-when", "ck-sky", "ck-legend"]) { const m = document.getElementById(id); if (m) { m.replaceChildren(); if (id === "ck-legend") m.hidden = true; } }
+    for (const id of ["ck-when", "ck-sky", "ck-legend", "ck-wrapline"]) { const m = document.getElementById(id); if (m) { m.replaceChildren(); if (id === "ck-legend") m.hidden = true; } }
   }
   function keShell(on) {
     const hero = document.getElementById("ck-hero"), brief = document.getElementById("ck-brief"), widgets = document.getElementById("ck-widgets");
     if (!hero || !brief || !widgets) return;
     hero.hidden = brief.hidden = widgets.hidden = !on;
-    // the hero's legend band follows the hero: shown by the sky's own render, hidden with the region
+    const needsHost = document.getElementById("ck-needs");
+    if (needsHost && !on) clearNeeds(needsHost);   // the strip is drawn only by the KE page, and only while something waits (renderNeeds)
+    // the hero's legend follows the hero: shown by the sky's own render, hidden with the region
     const band = document.getElementById("ck-legend");
     if (band) band.hidden = true;
     // the section headers are page chrome that follows its region: hidden here, set by the region's own render
@@ -513,11 +590,10 @@
     const bd = document.getElementById("board");
     if (bd) bd.classList.toggle("ke", on);
     if (on) return;
-    // back to the pre-KE page: the brand, the masthead and the state line return to where the static page put them
+    // back to the pre-KE page: the state line returns to where the static page put it
     restoreState();
-    restoreMasthead();
     // what the regions drew is stale once the page is no longer the KE page
-    for (const id of ["ck-when", "ck-sky", "ck-legend", "ck-brief", "ck-widgets"]) { const h = document.getElementById(id); if (h) h.replaceChildren(); }
+    for (const id of ["ck-when", "ck-sky", "ck-legend", "ck-wrapline", "ck-brief", "ck-widgets"]) { const h = document.getElementById(id); if (h) h.replaceChildren(); }
   }
 
   function ckAttrs(node, entry, kind) {
@@ -535,18 +611,47 @@
   // one bare node (no panel header): the hero's weather and sky, the brief, the widgets. It draws what a zone card draws
   // for the same panel: the banner (stale / partial / held back / an alert), the note, then the content in whichever
   // shape the contract allows (markdown, a typed face, or lines). An alert is content, so it suppresses the empty message.
+  // An error sentence from a provider may carry a raw ISO timestamp ("failing since 2026-10-21T22:37:12.126051+00:00"): shown as the local clock
+  // ("6:37 PM", with the day when it is not today), the exact stamp kept in the element's title. The text sits in ONE span so the dot beside it
+  // stays a single flex sibling of a wrapping line.
+  const ISO_AT = /\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:?\d\d)/g;
+  function humanTimesIn(text) {
+    const out = [];
+    let at = 0, m;
+    ISO_AT.lastIndex = 0;
+    while ((m = ISO_AT.exec(text)) !== null) {
+      const d = new Date(m[0]);
+      if (Number.isNaN(d.getTime())) continue;
+      if (m.index > at) out.push(text.slice(at, m.index));
+      const same = d.toDateString() === new Date().toDateString();
+      const clock = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+      const t = el("time", null, same ? clock : d.toLocaleDateString([], { month: "short", day: "numeric" }) + ", " + clock);
+      t.title = m[0];
+      t.dateTime = m[0];
+      out.push(t);
+      at = m.index + m[0].length;
+    }
+    if (at < text.length) out.push(text.slice(at));
+    return out;
+  }
+  function errorLine(text) {
+    const p = el("p", "err"), span = el("span");
+    span.append(...humanTimesIn(String(text)));
+    p.appendChild(span);
+    return p;
+  }
   function bareNode(entry, view, cls, ctx) {
     const data = (view.extra_panels || {})[entry.id] || {};
     const node = el("div", cls);
     ckAttrs(node, entry, ckKindOf(entry, data));
     const K = window.LevainCockpitKinds;
-    if (data.error) { node.appendChild(el("p", "err", "unavailable — " + data.error)); return node; }
+    if (data.error) { node.appendChild(errorLine("unavailable \u2014 " + data.error)); return node; }
     appendBanner(node, entry);
-    if (data.note && !(ctx && ctx.widget && data.face === "count")) node.appendChild(el("div", "ext-note", data.note));
+    if (data.note && !(ctx && ctx.widget && data.face === "count")) node.appendChild(richEl("div", "ext-note", data.note));
     const alerted = (entry.banner || []).some((b) => b.alert);
     if (data.markdown != null) {
       const md = String(data.markdown);
-      if (md.trim() === "") { if (!alerted) node.appendChild(el("p", "empty", data.empty || "nothing here")); }
+      if (md.trim() === "") { if (!alerted) node.appendChild(richEl("p", "empty", data.empty || "nothing here")); }
       else node.appendChild(renderMarkdown(md));
       return node;
     }
@@ -557,15 +662,53 @@
     }
     if (!Array.isArray(data.lines)) { node.appendChild(el("p", "err", "unavailable — this panel cannot be drawn here")); return node; }
     if (data.lines.length) appendExternalLines(node, data.lines);
-    else if (!alerted) node.appendChild(el("p", "empty", data.empty || "nothing here"));
+    else if (!alerted) node.appendChild(richEl("p", "empty", data.empty || "nothing here"));
     return node;
+  }
+
+  // The band's right cell, never blank. With wrap history: "Last wrap Mon 06:02" over the wrap count (the health panel's own total when
+  // the page holds it; else "N wraps held", or "N+ wraps" when the list is as long as a history list is sent: it is a floor then, not
+  // a count). Without history: "No wraps yet" over a fact the install has (its name, and the day's episodes when the jar counts them).
+  // When the wraps panel could not be read the line says nothing about wraps at all: unreadable is not "never".
+  function wrapLineOf(view) {
+    const WRAP_LIST_CAP = 50;   // the longest history list the page is sent
+    const ws = Array.isArray(view.wraps) ? view.wraps : [];
+    const unread = !!((view.errors && view.errors.wraps) || (view.health && view.health.wrap_history_unavailable));
+    const last = ws.length && ws[0] && typeof ws[0].wrapped_at === "string" ? ws[0] : null;
+    const at = last ? new Date(last.wrapped_at) : null;
+    const box = el("div", "wrapline");
+    const first = el("div"), second = el("div");
+    if (at && !Number.isNaN(at.getTime())) {
+      const when = at.toLocaleDateString(undefined, { weekday: "short" }) + " " + at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+      first.append(el("b", null, "Last wrap"), " " + when);
+      const total = view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : null;
+      second.textContent = total !== null ? total + (total === 1 ? " wrap" : " wraps")
+        : ws.length >= WRAP_LIST_CAP ? ws.length + "+ wraps" : ws.length + (ws.length === 1 ? " wrap held" : " wraps held");
+    } else {
+      const today = view.jar && Number.isInteger(view.jar.today) ? view.jar.today + " today" : "";
+      const name = typeof view.entity_name === "string" ? view.entity_name : "";
+      if (unread) {
+        first.appendChild(el("b", null, name || "This install"));
+        second.textContent = today;
+      } else {
+        const total = view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : 0;
+        if (total > 0) {   // the history list was not sent but the health panel counts wraps: a count, never "none yet"
+          first.appendChild(el("b", null, total + (total === 1 ? " wrap" : " wraps")));
+          second.textContent = [name, today].filter(Boolean).join(" · ");
+        } else {
+          first.appendChild(el("b", null, "No wraps yet"));
+          second.textContent = [name, today].filter(Boolean).join(" · ") || "a fresh install";
+        }
+      }
+    }
+    box.append(first, second);
+    return box;
   }
 
   let heroEpoch = 0;
   function renderHero(view, byId) {
-    const hero = document.getElementById("ck-hero"), when = document.getElementById("ck-when"), skycol = document.getElementById("ck-skycol");
-    const strip = document.getElementById("ck-strip"), skyHost = document.getElementById("ck-sky");
-    const mast = document.querySelector("header.masthead");
+    const hero = document.getElementById("ck-hero"), when = document.getElementById("ck-when"), wrapline = document.getElementById("ck-wrapline");
+    const skyHost = document.getElementById("ck-sky");
     // The legend band (#ck-legend) is the hero's: cleared and hidden here, filled and placed with the other mounts at
     // the end, and only when a sky painted a key. Until then the sky hands its legend to `place`, which holds it off
     // the page; after, `place` writes the band (a hot repaint) and `hide` clears it (a dropped or failed sky).
@@ -580,19 +723,24 @@
     const entries = view.ke.hero.map((id) => byId.get(id)).filter(Boolean);
     const kindOf = (e) => ((view.extra_panels || {})[e.id] || {}).kind;
     const wx = entries.find((e) => kindOf(e) === "reading"), sky = entries.find((e) => kindOf(e) === "ambient");
-    // the nav bar's brand sits over the clock; everything else it carried is the strip above the sky
-    const brand = document.querySelector(".brand");
+    // the now band: the clock and date at the left, the state line beside them (placed by renderBriefRegion), and at the right the
+    // wrap line (always something real: the last wrap, or "No wraps yet" and a fact the install has), the sky's event count and the
+    // weather when a provider supplies one. A bare install has no sky and no weather and the band is still whole.
     const clock = el("div", "clock num"), date = el("div", "date"), events = el("div", "events");
     clock.dataset.ckHero = "clock"; date.dataset.ckHero = "date"; events.dataset.ckHero = "events";
-    // everything that can throw is built off the page; the structural mounts (when, strip, sky) and the masthead
+    // everything that can throw is built off the page; the structural mounts (when, wrap line, sky)
     // are touched only once all of it exists
-    const whenKids = [], skyKids = [];
+    const whenKids = [], metaKids = [], skyKids = [];
     const stamp = el("div", "clockbox");
     stamp.append(clock, date);
-    whenKids.push(stamp, events);
+    whenKids.push(stamp);
+    const lastWrap = wrapLineOf(view);
+    if (!wx) metaKids.push(lastWrap);   // with a weather card the wrap line rides the card's foot row instead (no dead band under it)
+    metaKids.push(events);
     if (wx) {
       const node = bareNode(wx, view, "wx");
       node.dataset.ckHero = "weather";
+      lastWrap.classList.add("wx-wrap");
       const V = window.LevainCockpitView;
       if (V && typeof V.refetchPanel === "function") {
         // re-reads this panel's source now; the source decides how fresh that is (the read age under the figure says)
@@ -614,18 +762,16 @@
             return r;
           }).catch(() => "fault").finally(() => { busy = false; again.removeAttribute("aria-busy"); });
         });
-        node.appendChild(again);
-      }
-      whenKids.push(node);
-    } else whenKids.push(Object.assign(el("div", "wx"), { hidden: true }));
+        node.append(lastWrap, again);
+      } else node.appendChild(lastWrap);
+      metaKids.push(node);
+    }
     if (sky) skyKids.push(bareNode(sky, view, "ck-sky", { hero: { events: events, place: legendHook.place, hide: legendHook.hide } }));
     for (const e of entries) if (e !== wx && e !== sky) skyKids.push(bareNode(e, view, "ck-card"));
     // the clock is mounted only now: nothing after this can throw, so no clock ticks on a node that never attached
     if (window.LevainCockpitKinds) window.LevainCockpitKinds.mountClock(clock, date);
-    when.replaceChildren();
-    if (brand) when.appendChild(brand);
-    when.append(...whenKids);
-    if (mast) strip.replaceChildren(mast);
+    when.replaceChildren(...whenKids);
+    if (wrapline) wrapline.replaceChildren(...metaKids);
     skyHost.replaceChildren(...skyKids);
     hero.hidden = false;
     live = true;
@@ -633,18 +779,21 @@
     pending = null;
   }
 
+  // TODAY: where to begin, one card. The state line is not in it any more: it lives in the now band (#ck-state-slot), so a
+  // bare install, which has no brief panel, draws no Today card and no heading at all.
   function renderBriefRegion(view, byId) {
     const region = document.getElementById("ck-brief");
     const state = document.getElementById("state");
-    const card = el("div", "ck-card ck-briefcard");
+    const slot = document.getElementById("ck-state-slot");
     const entries = view.ke.brief.map((id) => byId.get(id)).filter(Boolean);
     const bodies = entries.map((e) => bareNode(e, view, "ck-brief-body", { region: "brief" }));   // may throw: #state has not moved yet
-    if (state) { state.dataset.ckPanel = "state"; state.dataset.ckKind = "line"; card.appendChild(state); }
-    for (const node of bodies) card.appendChild(node);
-    region.replaceChildren(card);
-    // no brief entries and no state worth showing: no card (an operator who can set the state keeps the card for its set button)
-    const st = view.state;
-    region.hidden = !entries.length && !(st && (st.text || (commit && st.can_edit !== false)));
+    if (state && slot) { state.dataset.ckPanel = "state"; state.dataset.ckKind = "line"; slot.appendChild(state); }
+    if (bodies.length) {
+      const card = el("div", "ck-card ck-briefcard");
+      for (const node of bodies) card.appendChild(node);
+      region.replaceChildren(card);
+    } else region.replaceChildren();
+    region.hidden = !entries.length;
     const hb = document.getElementById("ck-h-brief"); if (hb) hb.hidden = region.hidden;   // page chrome: the section's header follows its region
   }
 
@@ -665,7 +814,12 @@
       // a count tile is one answer with a list behind it: it opens that list in the focus modal (a button, so the keyboard reaches it).
       // Any other tile that does not draw everything it has (a "+N more", a clipped run of text) is the same kind of button: the
       // fit pass in cockpit_view.js says so with a "levain-hidden" event on the tile's body, and the focus view shows all of it.
-      const open = () => openModal(findEntry(currentView, entryKey(e)) || e, node, true);
+      // Decisions has no modal while something waits: the strip under the band is where it is answered, so the tile takes the
+      // reader there. With nothing waiting it opens the history (decided requests, outcomes, proposals).
+      const open = () => {
+        if (e.id === "decisions" && needsFocus()) return;
+        openModal(findEntry(currentView, entryKey(e)) || e, node, true);
+      };
       const onKey = (ev) => {
         if (ev.target !== node || (ev.key !== "Enter" && ev.key !== " ")) return;
         ev.preventDefault();
@@ -697,8 +851,12 @@
     pruneLineTiles();     // the last render's tiles went with their cards: nothing may keep watching them
     for (const f of fitLines) f();
     if (window.LevainCockpitKinds && window.LevainCockpitKinds.fitWidgets) window.LevainCockpitKinds.fitWidgets(region);   // after attach: the room a tile has is only known on the page
+    if (!region.dataset.ckWatched && typeof MutationObserver === "function") {   // the glance tiles alone can change: the strip's count and shape follow them
+      region.dataset.ckWatched = "1";
+      new MutationObserver(scheduleLayout).observe(region, { childList: true });
+    }
     const hw = document.getElementById("ck-h-widgets"); if (hw) hw.hidden = region.hidden;
-    region.style.setProperty("--ck-n", String(Math.max(4, entries.length)));   // four tracks at least: a lone widget keeps its width
+    // --ck-n (the tile grid's column count) has one writer: LevainCockpitKinds.fillGrids
   }
 
   // An untyped lines tile (rows the page draws itself) draws the rows that fit the tile and counts the rest in a "+N more" line, then
@@ -765,19 +923,23 @@
     const cards = [];
     for (const c of zone.cards) {
       const entries = c.panels.map((id) => byId.get(id)).filter(Boolean);
-      if (entries.length) cards.push({ entries: entries, size: c.size, span: c.span, tabs: c.tabs });
+      if (entries.length) cards.push({ entries: entries, size: c.size, span: c.span, tabs: c.tabs, key: entries[0].id });
     }
     if (!cards.length) return;
+    const laid = ckArrange(zone.id, cards);   // K5: the saved order; null for a zone the layout does not reach (the Memory and Identity compositions)
     const sec = el("section", "ck-zone");
     sec.dataset.zone = zone.id;
     // the title is the manifest's; the one-line gloss beside it is page chrome (a zone the page has no gloss for gets none)
     const head = el("div", "zone-head");
     head.appendChild(el("div", "zone-title", zone.title));
     if (Object.hasOwn(ZONE_GLOSS, zone.id)) head.appendChild(el("span", "zone-gloss", ZONE_GLOSS[zone.id]));
+    if (laid) ckZoneReset(head);   // K5: Reset layout lives in a laid-out zone's head, and only while a layout is saved
     sec.appendChild(head);
     const grid = el("div", "ck-zgrid");
+    const entryOf = new Map();   // node -> its manifest entry (the Memory tab's composition reads it)
     grid.dataset.ckRegion = "zone";
     grid.dataset.ckZone = zone.id;
+    if (laid) grid._ckOrder = laid;
     // rows: sequential fill, the way a 3-column grid auto-places spans
     const rows = [];
     let used = CK_COLUMNS + 1;
@@ -794,17 +956,527 @@
           const node = renderPanelSafe(e, view) || ckPlaceholder(e);
           if (CLAMP_KINDS.has(e.kind)) node.setAttribute("data-clamp", "");
           ckAttrs(node, e, ckKindOf(e, (view.extra_panels || {})[e.id]));
+          node.dataset.ckCard = c.key;
           // a kernel kind drawn by one of the page's own components is still a typed mount: it names its kind too
           if (!Array.from(node.classList).some((k) => /^k-/.test(k))) node.classList.add("k-" + (e.pkind || e.kind));
           node.classList.add("ck-h-" + CK_SIZES[tallest], "ck-span-" + c.span);
+          if (e.kind === "external") node.dataset.ckExternal = "1";
+          ckCountPill(node, e.count);
+          entryOf.set(node, e);
           nodes.push(node);
           grid.appendChild(node);
         }
-        if (c.tabs && nodes.length > 1) wireCardTabs(zone.id + "/" + c.tabs, c.tabs, c.entries, nodes);
+        // the Memory tab shows every neocortex section at once (composeMemory), so its section card has no tabs
+        const sectionsOnly = zone.id === "mind" && c.entries.every((e) => e.kind === "section");
+        if (c.tabs && nodes.length > 1 && !sectionsOnly) wireCardTabs(zone.id + "/" + c.tabs, c.tabs, c.entries, nodes);
       }
     }
+    if (zone.id === "mind" || zone.id === "identity") composeMemory(zone.id, grid, view, entryOf);
+    stackColumns(grid);
     sec.appendChild(grid);
     board.appendChild(sec);
+    dashPass(grid); pairBoard(grid); memClips(grid); balanceStacks(grid);
+    if (typeof MutationObserver === "function") new MutationObserver(() => { dashPass(grid); pairBoard(grid); memClips(grid); balanceStacks(grid); scheduleLayout(); }).observe(grid, { childList: true, subtree: true });
+    // a card folds or empties by a class set after the draw (markEmptyCards), which no childList mutation reports: the pairs and the
+    // "Read all" feet follow it. Only a change to the classes pairBoard reads wakes it: the classes these passes write are not among them.
+    if (typeof MutationObserver === "function") {
+      const watched = (v) => CK_PAIR_SKIP.filter((c) => (" " + (v || "") + " ").indexOf(" " + c + " ") >= 0).join(" ");
+      new MutationObserver((recs) => {
+        // measureOverflow and memFoot toggle is-clipped / has-overflow on cards inside the grid: reacting to those would feed this observer forever
+        if (recs.some((r) => watched(r.oldValue) !== watched(r.target.getAttribute("class")))) { pairBoard(grid); memClips(grid); balanceStacks(grid); }
+      }).observe(grid, { attributes: true, attributeFilter: ["class"], attributeOldValue: true, subtree: true });
+    }
+  }
+
+  // A panel's count ("Tray (2)" in the kernel's title) is a pill beside the title, hidden at 0: the title says what the card is, the
+  // pill how many it holds. The number is the panel's own count (`count`, from the manifest), never parsed out of the title's words:
+  // a title that ends in a number of its own ("Annual plan (2026)") keeps it. Only the kernel's own " (count)" suffix is lifted off.
+  // The pill is a sibling of the h2, so the heading's text (what the jump box lists) stays the name alone.
+  function ckCountPill(node, count) {
+    if (!Number.isInteger(count) || count < 0) return;
+    const h2 = node.querySelector(":scope > .phead > h2");
+    if (!h2) return;
+    const tail = " (" + count + ")";
+    const text = String(h2.textContent);
+    if (text.endsWith(tail)) h2.textContent = text.slice(0, -tail.length).replace(/\s+$/, "");
+    const pill = el("span", "ck-count", String(count));
+    pill.hidden = count === 0;
+    h2.after(pill);
+  }
+
+  // The Board is two independent stacks, not rows that pair: Tray and Now down the left, Open loops and Keep down the right, each as
+  // tall as its own cards, so the shorter card of a pair never leaves a hole. Other tabs lay the same cards out as plain grid items
+  // (the stacks are display: contents there). Only a zone that holds both sides is stacked; a card the table does not name stays a
+  // direct, full-width child.
+  const CK_STACK_SIDE = Object.assign(Object.create(null), { tray: 0, now: 0, loops: 1, keep: 1 });
+  // Top to bottom inside a side when nothing is saved (the CSS used to draw this with `order`, which would override a saved order).
+  const CK_STACK_RANK = Object.assign(Object.create(null), { tray: 0, now: 1, loops: 0, keep: 1 });
+  // ---- K5: collapse and reorder the cards of a zone, saved per browser (cockpit_view.js holds the storage). Reorder is within a zone and,
+  // on the Board's two stacks, within a side. The Memory and Identity zones are composed by composeMemory (their own rows and sections),
+  // so the layout does not reach them; the now band, sky, widgets, brief and Needs-you strip are not zone cards and have no controls.
+  const CK_NO_LAYOUT = new Set(["mind", "identity"]);
+  const layoutKit = () => { const K = window.LevainCockpitKinds; return K && K.layoutOrder ? K : null; };
+  // the cards in their drawn order (the saved order over the kernel's), their keys left on the zone's grid for the move buttons
+  function ckArrange(zoneId, cards) {
+    const K = layoutKit();
+    if (!K || CK_NO_LAYOUT.has(zoneId)) return null;
+    // a zone that holds both stack sides starts from the stacks' own top-to-bottom, not the kernel's
+    const sided = cards.filter((c) => CK_STACK_SIDE[c.key] !== undefined);
+    if (sided.some((c) => CK_STACK_SIDE[c.key] === 0) && sided.some((c) => CK_STACK_SIDE[c.key] === 1)) {
+      const sorted = sided.slice().sort((a, b) => CK_STACK_RANK[a.key] - CK_STACK_RANK[b.key]);   // stable: equal ranks keep the kernel's order
+      let n = 0;
+      for (let i = 0; i < cards.length; i++) if (CK_STACK_SIDE[cards[i].key] !== undefined) cards[i] = sorted[n++];
+    }
+    const order = K.layoutOrder(zoneId, cards.map((c) => c.key));
+    const at = new Map(order.map((k, i) => [k, i]));
+    cards.sort((a, b) => at.get(a.key) - at.get(b.key));
+    return order;
+  }
+  // The layout controls are off while a draft is open or a job is polling (a redraw would throw it away): every handler checks this
+  // BEFORE it writes anything, and the controls say why they are off.
+  const CK_GATE_WHY = "finish or cancel the edit first";
+  const CK_EDIT_OPEN = ".text-editor, .edit-ta, .verb-edit-ta";
+  // a zone's cards in the DOM, found by comparing dataset values (a panel id is never put into a selector)
+  const ckPanels = (grid) => Array.from(grid.querySelectorAll(":scope > .panel, :scope > .ck-col > .panel"));
+  const ckNodesOf = (grid, key) => ckPanels(grid).filter((n) => n.dataset.ckCard === key);
+  function ckFind(zone, key) {
+    for (const g of document.querySelectorAll(".ck-zgrid")) if (g.dataset.ckZone === zone) return ckNodesOf(g, key)[0] || null;
+    return null;
+  }
+  // A card whose place CSS `order` pins (a fold line, a dashed line, Recent episodes on the Board, the Build jobs / edits / loops rows) takes
+  // a move as a no-op: it gets no move buttons and is never a neighbour. One set of keys here, never a CSS selector list beside it.
+  const CK_PIN_BOARD = new Set(["episodes"]);
+  const CK_PIN_BUILD = new Set(["jobs", "jobs-none", "edits", "loops"]);
+  function ckPinned(zone, key, nodes) {
+    if (nodes.some((n) => n.classList.contains("ck-fold") || n.classList.contains("ck-dash"))) return true;
+    const mode = document.body && document.body.dataset ? document.body.dataset.mode : "";
+    return (mode === "board" && CK_PIN_BOARD.has(key)) || (mode === "build" && zone === "operate" && CK_PIN_BUILD.has(key));
+  }
+  // What a zone's controls need, read once per pass: the folded set, which cards are pinned, which are movable AND on screen (a card in
+  // another tab is not a neighbour), and whether the gate is shut.
+  function ckCtx(grid) {
+    const K = layoutKit(), zone = grid.dataset.ckZone;
+    const ctx = { folded: K ? K.layoutCollapsed() : new Set(), pinned: new Set(), ok: new Set(), gated: hasUnsavedEdit() };
+    for (const key of grid._ckOrder || []) {
+      const nodes = ckNodesOf(grid, key);
+      if (ckPinned(zone, key, nodes)) { ctx.pinned.add(key); continue; }
+      if (nodes.some((n) => n.getClientRects().length > 0)) ctx.ok.add(key);
+    }
+    return ctx;
+  }
+  // the nearest visible, movable card in `dir` (-1 earlier, +1 later) on the same stack side; -1 when there is none
+  function ckNeighbor(grid, key, dir, ctx) {
+    const order = grid._ckOrder || [], ok = (ctx || ckCtx(grid)).ok;
+    const side = (k) => (grid.classList.contains("ck-twocol") && CK_STACK_SIDE[k] !== undefined ? CK_STACK_SIDE[k] : -1);
+    const i = order.indexOf(key);
+    if (i < 0) return -1;
+    for (let j = i + dir; j >= 0 && j < order.length; j += dir) if (ok.has(order[j]) && side(order[j]) === side(key)) return j;
+    return -1;
+  }
+  // the one Reset layout control: in a zone head (never the top bar, which has no room at any width), drawn only while a layout is saved
+  function ckZoneReset(head) {
+    const K = layoutKit();
+    let have = head.querySelector(":scope > .ck-zreset");
+    if (K && K.hasLayout && K.hasLayout()) {
+      if (!have) {
+        have = el("button", "layoutreset ck-zreset", "Reset layout");
+        have.type = "button";
+        have.setAttribute("data-layout-reset", "");
+        head.appendChild(have);
+      }
+      const gated = hasUnsavedEdit();
+      have.disabled = gated;
+      have.title = gated ? CK_GATE_WHY : "Put the panels back in the default order and unfold them";
+    } else if (have) have.remove();
+  }
+  function ckSyncResets() {
+    for (const g of document.querySelectorAll(".ck-zgrid")) {
+      const head = g._ckOrder && g.parentNode ? g.parentNode.querySelector(":scope > .zone-head") : null;
+      if (head) ckZoneReset(head);
+    }
+  }
+  function ckRedraw() {
+    if (!currentView || hasUnsavedEdit()) return;   // a draft in an open editor is not thrown away for a reorder
+    renderKeepingPlace(currentView, lastOpts);
+  }
+  // a button's panel, grid and card key are read when it is CLICKED: a panel that survives a redraw (adopted) keeps its buttons
+  const ckAt = (ev) => {
+    const p = ev.currentTarget.closest(".panel"), grid = p && p.closest(".ck-zgrid");
+    return grid && grid._ckOrder && p.dataset.ckCard ? { p, grid, key: p.dataset.ckCard } : null;
+  };
+  function ckMove(ev, dir, focusCls) {
+    const K = layoutKit(), at = ckAt(ev);
+    if (!K || !at || hasUnsavedEdit()) return;   // the gate comes before any write
+    const { grid, key } = at, zone = grid.dataset.ckZone, j = ckNeighbor(grid, key, dir);
+    if (j < 0) return;
+    const order = grid._ckOrder.slice(), to = order[j];
+    order.splice(order.indexOf(key), 1);
+    order.splice(order.indexOf(to) + (dir > 0 ? 1 : 0), 0, key);
+    K.setLayoutOrder(zone, order);
+    ckRedraw();
+    // the redraw rebuilt the buttons: a keyboard user stays on the control they pressed (or its partner, when this card is now at the end)
+    const node = ckFind(zone, key);
+    const btn = node && (node.querySelector(".phead .ck-lay-" + focusCls + ":not(:disabled)") || node.querySelector(".phead .ck-lay-btn:not(:disabled)"));
+    if (btn) btn.focus();
+  }
+  function ckFold(ev) {
+    const K = layoutKit(), at = ckAt(ev);
+    if (!K || !at || hasUnsavedEdit()) return;
+    const { p, grid, key } = at, now = !p.classList.contains("ck-collapsed");
+    if (now && ckNodesOf(grid, key).some((n) => n.querySelector(CK_EDIT_OPEN))) return;   // never fold a card whose edit row is open
+    K.setLayoutCollapsed(key, now);
+    const ctx = ckCtx(grid);
+    for (const n of ckPanels(grid)) layoutControls(grid, n, ctx);
+    ckSyncResets();
+  }
+  function ckButton(cls, glyph, label, onclick) {
+    const b = el("button", "ck-lay-btn " + cls, glyph);
+    b.type = "button";
+    b.setAttribute("aria-label", label);
+    b.title = label;
+    b.addEventListener("click", onclick);
+    return b;
+  }
+  // idempotent: dashPass calls it for every panel of a zone grid after every repaint. A dashed F7 line gets none.
+  function layoutControls(grid, p, ctx) {
+    const K = layoutKit(), head = p.querySelector(":scope > .phead"), body = p.querySelector(":scope > .pbody");
+    let box = head ? head.querySelector(":scope > .ck-lay") : null;
+    const on = !!(K && head && body && grid._ckOrder && p.dataset.ckCard && !p.classList.contains("ck-dash"));
+    if (!on) {
+      if (box) box.remove();
+      p.classList.remove("ck-collapsed");
+      return;
+    }
+    ctx = ctx || ckCtx(grid);
+    const key = p.dataset.ckCard, id = p.dataset.ckPanel;
+    const name = (head.querySelector("h2") || {}).textContent || id;
+    const folded = ctx.folded.has(key);   // folded by CARD key: every panel of a tabbed card folds together
+    p.classList.toggle("ck-collapsed", folded);
+    if (!box) {
+      box = el("span", "ck-lay");
+      box.appendChild(ckButton("ck-lay-up", "↑", "", (ev) => ckMove(ev, -1, "up")));
+      box.appendChild(ckButton("ck-lay-down", "↓", "", (ev) => ckMove(ev, 1, "down")));
+      box.appendChild(ckButton("ck-lay-fold", "", "", ckFold));
+      head.appendChild(box);
+    }
+    if (!body.id) body.id = "ck-pb-" + id.replace(/[^\w-]/g, "_");
+    box.classList.toggle("ck-nomove", ctx.pinned.has(key));
+    const say = (b, label, off) => { b.disabled = off; b.setAttribute("aria-label", label); b.title = off && ctx.gated ? CK_GATE_WHY : label; };
+    say(box.querySelector(".ck-lay-up"), "Move " + name + " earlier", ctx.gated || ckNeighbor(grid, key, -1, ctx) < 0);
+    say(box.querySelector(".ck-lay-down"), "Move " + name + " later", ctx.gated || ckNeighbor(grid, key, 1, ctx) < 0);
+    const fold = box.querySelector(".ck-lay-fold");
+    const editOpen = !folded && ckNodesOf(grid, key).some((n) => n.querySelector(CK_EDIT_OPEN));
+    say(fold, (folded ? "Expand " : "Collapse ") + name, ctx.gated || editOpen);
+    fold.setAttribute("aria-expanded", folded ? "false" : "true");
+    fold.setAttribute("aria-controls", body.id);
+  }
+  // The controls' state reads the screen (which cards are visible, whether a draft is open), so a tab switch, a click or typing asks for a
+  // fresh pass over every zone grid; one debounced path.
+  let ckRefreshTimer = null;
+  function ckRefreshAll() {
+    for (const g of document.querySelectorAll(".ck-zgrid")) {
+      balanceStacks(g); memClips(g);   // a tab switch shows a tab for the first time: its stacks and capped cards have heights only now
+      if (!g._ckOrder) continue;
+      const ctx = ckCtx(g);
+      for (const p of ckPanels(g)) layoutControls(g, p, ctx);
+    }
+    ckSyncResets();
+  }
+  function ckScheduleRefresh() {
+    if (ckRefreshTimer !== null) window.clearTimeout(ckRefreshTimer);
+    ckRefreshTimer = window.setTimeout(() => { ckRefreshTimer = null; ckRefreshAll(); }, 60);
+  }
+  document.addEventListener("click", ckScheduleRefresh);
+  document.addEventListener("input", ckScheduleRefresh);
+  window.addEventListener("hashchange", ckScheduleRefresh);
+  document.addEventListener("ck-layout-refresh", ckScheduleRefresh);   // a tab change (cockpit_view applyMode)
+  document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") ckScheduleRefresh(); });   // Esc closes an editor
+  function stackColumns(grid) {
+    const kids = Array.from(grid.children);
+    const side = (n) => CK_STACK_SIDE[n.dataset.ckPanel];
+    if (!kids.some((k) => side(k) === 0) || !kids.some((k) => side(k) === 1)) return;
+    const first = kids.find((k) => side(k) !== undefined);
+    const cols = [el("div", "ck-col"), el("div", "ck-col")];
+    cols[0].dataset.side = "left"; cols[1].dataset.side = "right";
+    grid.insertBefore(cols[0], first);
+    grid.insertBefore(cols[1], first);
+    for (const k of kids) if (side(k) !== undefined) cols[side(k)].appendChild(k);
+    grid.classList.add("ck-twocol");
+  }
+
+  // F4: below the two stacks the Board's full-width cards sit two to a row (Inbox | Fleet, Stream | Recent episodes). A card is marked
+  // data-ck-pair = "l" | "r" in the order it is drawn (Recent episodes is pinned last by CSS, so it is last here), an odd one out is
+  // "solo" and keeps its full row. A folded or empty card keeps the full row it already has and is no partner. Re-runnable: it is
+  // asked again whenever a card folds, empties or appears, and it writes an attribute only when the value changed.
+  const CK_PAIR_SKIP = ["ck-fold", "ck-dash", "ck-is-empty", "ck-tab-off"];
+  function pairBoard(grid) {
+    if (!grid.classList.contains("ck-twocol")) return;
+    const direct = Array.from(grid.children).filter((n) => n.classList.contains("panel"));
+    const set = (n, v) => { if (v === null) { if (n.hasAttribute("data-ck-pair")) n.removeAttribute("data-ck-pair"); } else if (n.getAttribute("data-ck-pair") !== v) n.setAttribute("data-ck-pair", v); };
+    const ok = direct.filter((n) => !CK_PAIR_SKIP.some((c) => n.classList.contains(c)));
+    for (const n of direct) if (!ok.includes(n)) set(n, null);
+    const pinnedLast = (n) => (CK_PIN_BOARD.has(n.dataset.ckPanel) ? 1 : 0);
+    const seq = ok.slice().sort((a, b) => pinnedLast(a) - pinnedLast(b));   // stable
+    seq.forEach((n, i) => set(n, i === seq.length - 1 && seq.length % 2 === 1 ? "solo" : (i % 2 === 0 ? "l" : "r")));
+  }
+
+  // The two Board stacks end where their own cards end, so a long right stack beside a short left one leaves a blank band under the
+  // left. When one stack is more than STACK_RATIO taller than the other, the taller stack's LAST card takes a cap that ends the two
+  // stacks together (never below STACK_FLOOR, never above its own cap), and its overflow goes behind the card's own "more" and focus
+  // view like every other capped card. The cap is a data attribute plus a custom property: neither is a class, so nothing watches it.
+  // It reads natural heights (the cap cleared first), so repeating it settles on the same answer.
+  const STACK_RATIO = 1.25, STACK_FLOOR = 300;
+  function balanceStacks(grid) {
+    if (!grid.classList.contains("ck-twocol")) return;
+    const cols = Array.from(grid.children).filter((n) => n.classList.contains("ck-col") && n.offsetParent !== null);
+    for (const n of grid.querySelectorAll(":scope > .ck-col > .panel[data-stack-cap]")) { n.removeAttribute("data-stack-cap"); n.style.removeProperty("--stack-cap"); }
+    if (cols.length !== 2 || Math.abs(cols[0].getBoundingClientRect().top - cols[1].getBoundingClientRect().top) > 2) return;   // one column: nothing sits beside anything
+    const hs = cols.map((c) => c.offsetHeight);
+    const t = hs[0] >= hs[1] ? 0 : 1;
+    if (hs[t] <= hs[1 - t] * STACK_RATIO) return;
+    const cards = Array.from(cols[t].children).filter((n) => n.classList.contains("panel") && n.offsetParent !== null && !CK_PAIR_SKIP.some((c) => n.classList.contains(c)));
+    if (cards.length < 2) return;
+    const last = cards[cards.length - 1];
+    const cap = Math.max(STACK_FLOOR, hs[1 - t] - (hs[t] - last.offsetHeight));
+    if (cap >= last.offsetHeight) return;
+    last.dataset.stackCap = "1";
+    last.style.setProperty("--stack-cap", cap + "px");
+  }
+
+  // F6: a card the page caps (a neocortex section, a panel of the Crystallized | Cognition row) that clips its content ends in a
+  // "Read all" foot that opens that card's focus view. The foot is built once and shown only while the card clips, so a card that
+  // fits shows nothing. Which element clips (the card or its body) depends on the style, so both are measured, with the foot hidden
+  // so it cannot be what makes the card clip.
+  function memFoot(panel) {
+    let foot = panel.querySelector(":scope > .more-foot[data-readall]");
+    const body = panel.querySelector(":scope > .pbody");
+    const cut = (n) => !!n && n.scrollHeight > n.clientHeight + 1;
+    if (foot) foot.hidden = true;
+    const clipped = panel.offsetParent !== null && (cut(panel) || cut(body));
+    panel.classList.toggle("is-clipped", clipped);
+    if (!clipped) { if (foot) foot.hidden = true; return; }
+    if (!foot) {
+      foot = el("button", "more-foot", "Read all");
+      foot.type = "button";
+      foot.dataset.readall = "1";
+      foot.setAttribute("aria-label", "Read all of " + ((panel.querySelector(":scope > .phead h2") || {}).textContent || "this card") + ": open the focus view");
+      foot.addEventListener("click", () => {
+        const x = panel.querySelector(".pexpand");
+        if (x) x.click(); else if (panel._ckEntry) openModal(panel._ckEntry, foot);
+      });
+      panel.appendChild(foot);
+    }
+    foot.hidden = false;
+  }
+  let memResizeWired = false;
+  function wireMemResize() {
+    if (memResizeWired || typeof window.addEventListener !== "function") return;
+    memResizeWired = true;
+    let t = null;
+    window.addEventListener("resize", () => { window.clearTimeout(t); t = window.setTimeout(() => { for (const g of document.querySelectorAll(".ck-zgrid")) { memClips(g); balanceStacks(g); } }, 150); });
+  }
+  function memClips(grid) {
+    wireMemResize();
+    for (const p of grid.querySelectorAll(".ck-mem-nest, .ck-mem-row > .panel")) {
+      const body = p.querySelector(":scope > .pbody");
+      if (body) measureOverflow(body); else memFoot(p);
+    }
+  }
+
+  // F7, the empty provider: an external panel that reports empty and says how to fix it collapses to ONE dashed line (its title, the
+  // sentence, the fix), never a card with a body gap. An empty provider is an external panel with no rows, or one row that is the
+  // provider's own report (a `no_` state key; its words are never read). Team without a ledger and an Inbox with no source
+  // are the cases. A compose box stays reachable: the line carries its action ("Send"), which opens the box under the line.
+  // A card of the page's own (Tray, Keep, Identity) keeps its card: its box is its content. An empty list card folds in
+  // markEmptyCards (cockpit_view.js). Idempotent: it toggles classes and adds the action once, so the observer that calls it again
+  // cannot loop.
+  function emptyProvider(p) {
+    if (!p.dataset.ckPanel || !p.dataset.ckExternal) return false;
+    const rows = p.querySelectorAll(".pbody .row");
+    if (rows.length === 0) return !!p.querySelector(".pbody .empty");
+    if (rows.length > 1) return false;
+    const key = rows[0].dataset.keepKey || "";
+    return /^no_/.test(key);   // the provider's own sentinel row id; a row's words (a command in backticks) say nothing about it
+  }
+  function dashAction(p) {
+    const head = p.querySelector(":scope > .phead");
+    const compose = p.querySelector(".tray-dump");
+    let act = head ? head.querySelector(".ck-dash-act") : null;
+    if (!head || !compose) { if (act) act.remove(); p.classList.remove("ck-dash-open"); return; }
+    if (act) return;
+    const go = compose.querySelector(".tray-dump-btn");
+    const label = (go && go.textContent.trim()) || "Write";
+    act = el("button", "ck-dash-act", label.charAt(0).toUpperCase() + label.slice(1));
+    act.type = "button";
+    act.setAttribute("aria-expanded", "false");
+    act.addEventListener("click", () => {
+      const open = p.classList.toggle("ck-dash-open");
+      act.setAttribute("aria-expanded", open ? "true" : "false");
+      const ta = compose.querySelector("textarea, input");
+      if (open && ta) ta.focus();
+    });
+    head.appendChild(act);
+  }
+  function dashPass(grid) {
+    for (const p of grid.querySelectorAll(".panel")) {
+      const dash = emptyProvider(p);
+      p.classList.toggle("ck-dash", dash);
+      if (dash) dashAction(p);
+      else {
+        // a card that stops being dashed gives its line's action and open state back
+        const act = p.querySelector(":scope > .phead > .ck-dash-act");
+        if (act) act.remove();
+        p.classList.remove("ck-dash-open");
+      }
+    }
+    // the controls come after every dashed line is settled, and read the grid once for the whole pass
+    const ctx = grid._ckOrder ? ckCtx(grid) : null;
+    for (const p of grid.querySelectorAll(".panel")) layoutControls(grid, p, ctx || undefined);
+  }
+  // The zone grids' layout (which columns are live, which card takes its row) is measured after layout. A repaint inside a grid (a card
+  // folding, a dashed line appearing, a refetch) can change it, so the same observer that re-runs dashPass asks for it again here:
+  // one debounced path, however many mutations a repaint makes.
+  let layoutTimer = null;
+  function scheduleLayout() {
+    if (layoutTimer !== null) window.clearTimeout(layoutTimer);
+    layoutTimer = window.setTimeout(() => {
+      layoutTimer = null;
+      const K = window.LevainCockpitKinds;
+      if (K && typeof K.fillGrids === "function") K.fillGrids();
+    }, 60);
+  }
+
+  // ---- the Memory tab (K6) --------------------------------------------------------------------------------------------------
+  // The mind zone is ONE neocortex card with every section readable at once (State, threads, context and understanding left;
+  // patterns and decisions right), then Crystallized patterns and Cognition side by side. The identity zone is ONE card of eight rows:
+  // the identity cards themselves, restyled into rows (title | one-line summary | the card's own Edit), the editor opening in place.
+  // Nothing is hidden and nothing is pressed for the reader: each panel the kernel drew keeps doing its own work.
+  const MEM_WRAP_CAP = 50;   // the longest history list the page is sent
+  // the authoritative wrap count when the view has one; the list is capped, so its length is only ever a floor
+  const memWrapTotal = (view) => (view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : null);
+  function memWrapsLine(view) {
+    const ws = Array.isArray(view.wraps) ? view.wraps : [];
+    const total = memWrapTotal(view);
+    // the newest stamp, wherever it sits in the list
+    let last = null;
+    for (const w of ws) {
+      const d = w && typeof w.wrapped_at === "string" ? new Date(w.wrapped_at) : null;
+      if (d && !Number.isNaN(d.getTime()) && (!last || d > last)) last = d;
+    }
+    if (total === null && !ws.length) return "";
+    let out = total !== null ? total + (total === 1 ? " wrap" : " wraps")
+      : ws.length >= MEM_WRAP_CAP ? ws.length + "+ wraps" : ws.length + (ws.length === 1 ? " wrap" : " wraps");
+    if (total === 0) return "";
+    if (last) {
+      out += " · last wrap " + last.toLocaleDateString(undefined, { weekday: "short" }) + " " +
+        last.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+    }
+    return out;
+  }
+  // the Cognition header's figures, the same on both of its tabs. The write path speaks only when it is dark.
+  function memCogBits(view) {
+    const g = view.graph, gn = g && Array.isArray(g.nodes) ? g.nodes.length : 0, ge = g && Array.isArray(g.edges) ? g.edges.length : 0;
+    const listed = Array.isArray(view.wraps) ? view.wraps.length : 0, total = memWrapTotal(view);
+    const ws = total !== null ? total : listed;
+    const bits = [];
+    if (ws) bits.push((total === null && ws >= MEM_WRAP_CAP ? ws + "+" : String(ws)) + (ws === 1 ? " consolidation" : " consolidations"));
+    if (gn) bits.push(gn + " nodes");
+    if (ge) bits.push(ge + " edges");
+    // dark if either place the view can say so says so
+    if (view.write_path_live === false || (view.health && view.health.write_path_live === false)) bits.push("write path dark");
+    return bits;
+  }
+  function memCard(cls, title, meta, modes) {
+    const card = el("div", "panel ck-mem-card " + cls);
+    card.dataset.zone = cls.indexOf("ident") >= 0 ? "identity" : "mind";
+    if (modes) card.dataset.modes = modes;
+    const head = el("div", "phead");
+    head.appendChild(el("h2", null, title));
+    if (meta) head.appendChild(el("span", "ck-mem-meta", meta));
+    card.appendChild(head);
+    return card;
+  }
+  // a kernel card moved inside another: its own chrome (the expand control, the edit-class chip, the source path) stays out of the
+  // way, and it is never clamped, so the section reads in full
+  function memNest(node) {
+    node.classList.add("ck-mem-nest");
+    node.removeAttribute("data-clamp");
+    node.classList.remove("ck-tab-off");
+    return node;
+  }
+  function composeMemory(zoneId, grid, view, entryOf) {
+    const nodes = Array.from(grid.children).filter((n) => n.classList && n.classList.contains("panel"));
+    if (!nodes.length) return;
+    const pid = (n) => n.dataset.ckPanel || "";
+    const modes = nodes[0].dataset.modes || "memory";
+    if (zoneId === "identity") {
+      // the identity cards are config panels (the page's own) or typed text panels (the kernel's `config:*` panels): either is a card with
+      // its own editor, and the card IS the row
+      const rows = nodes.filter((n) => /^config(:|$)/.test(pid(n)) || (entryOf.get(n) || {}).kind === "config");
+      if (!rows.length) return;
+      const card = memCard("ck-mem-ident", "Identity", "", modes);
+      card.querySelector(".phead h2").after(el("span", "ck-count", String(rows.length)));
+      card.querySelector(".phead").appendChild(el("span", "ck-mem-meta", "read at every session start"));
+      const list = el("div", "ck-mem-ilist");
+      for (const n of rows) {
+        memNest(n);
+        n.classList.add("ck-mem-rowcard");
+        list.appendChild(n);
+      }
+      card.appendChild(list);
+      grid.insertBefore(card, grid.firstChild);
+      return;
+    }
+    // the mind zone
+    const secs = nodes.filter((n) => (entryOf.get(n) || {}).kind === "section");
+    const crystals = nodes.find((n) => pid(n) === "crystals");
+    const cog = nodes.filter((n) => pid(n) === "graph" || pid(n) === "wraps");
+    const RIGHT = /^(patterns|decisions)$/i;
+    const card = memCard("ck-mem-neo", "Neocortex", memWrapsLine(view), modes);
+    // a section with no text is left out unless it can be edited: an editable one stays as a slim row that keeps its Edit
+    const full = secs.filter((n) => !n.dataset.ckNoText || n.dataset.ckSlim);
+    for (const n of secs) if (!full.includes(n)) n.remove();
+    if (!full.length) card.appendChild(el("p", "empty", "No wrap yet: the first consolidation writes this."));
+    else {
+      const left = el("div", "ck-mem-col"), right = el("div", "ck-mem-col");
+      for (const n of full) { n._ckEntry = entryOf.get(n); (RIGHT.test(String((entryOf.get(n) || {}).heading || "").trim()) ? right : left).appendChild(memNest(n)); }
+      const cols = el("div", "ck-mem-cols");
+      cols.appendChild(left);
+      if (right.children.length) cols.appendChild(right); else cols.classList.add("ck-mem-one");
+      if (!left.children.length) { cols.classList.add("ck-mem-one"); cols.replaceChildren(right); }
+      card.appendChild(cols);
+    }
+    grid.insertBefore(card, grid.firstChild);
+    // Crystallized patterns beside Cognition (about 60 / 40)
+    const row = el("div", "ck-mem-row");
+    row.dataset.modes = modes;
+    if (crystals) {
+      const lv = (Array.isArray(view.crystal_index) ? view.crystal_index : []).map((c) => num(c && c.level)).filter((x) => x > 0);
+      const chead = crystals.querySelector(".phead");
+      if (lv.length && chead) {
+        const lo = Math.min(...lv), hi = Math.max(...lv);
+        chead.appendChild(el("span", "ck-mem-meta", lo === hi ? "level " + lo : "levels " + lo + " to " + hi));
+      }
+      crystals.classList.add("ck-mem-crys");
+      crystals._ckEntry = entryOf.get(crystals);
+      crystals.classList.remove("ck-fold");   // the kernel's dashed one-liner spans its grid; here it keeps its side of the row
+      row.appendChild(crystals);
+    }
+    if (cog.length) {
+      const ws = Array.isArray(view.wraps) ? view.wraps.length : 0;
+      const bits = memCogBits(view);
+      const graph = cog.find((n) => pid(n) === "graph") || cog[0];
+      if (!ws) {
+        // no wrap yet: no history to tab to, so no tab row and no second panel; the card is the title and its one line
+        for (const n of cog) { const t = n.querySelector(".ck-tabs"); if (t) t.remove(); if (n !== graph) n.remove(); }
+        cog.splice(0, cog.length, graph);
+      }
+      // the figures ride the header of every Cognition tab, so whichever is showing carries them
+      if (bits.length) for (const n of cog) { const gh = n.querySelector(".phead"); const t = gh && (gh.querySelector(".ck-card-title") || gh.querySelector("h2")); if (t) t.after(el("span", "ck-mem-meta", bits.join(" · "))); }
+      graph.classList.add("ck-mem-cog");
+      for (const n of cog) { n._ckEntry = entryOf.get(n); row.appendChild(n); }
+    }
+    if (row.children.length) grid.insertBefore(row, card.nextSibling);
   }
 
   // Tabs of one card: each panel of the group is a full card, only the chosen one shows, and every one carries
@@ -870,6 +1542,7 @@
     for (const old of document.querySelectorAll("#ck-hero > .ck-region-err")) old.remove();   // a clean hero render clears its last error line
     guardRegion("the hero", () => renderHero(view, byId), regionErr("ck-hero", false), restoreHero);
     guardRegion("the brief", () => renderBriefRegion(view, byId), regionErr("ck-brief", true), restoreState);
+    guardRegion("the needs strip", () => renderNeeds(view), regionErr("ck-needs", true));
     guardRegion("the widgets", () => renderWidgets(view, byId), regionErr("ck-widgets", true));
     // a zone builds its section off to the side and attaches it last, so a throw leaves nothing half-drawn behind
     for (const zone of view.ke.zones) guardRegion(zone.title, () => renderZone(zone, view, byId, board), (node) => board.appendChild(node));
@@ -958,11 +1631,11 @@
       return p;
     }
     const NS = "http://www.w3.org/2000/svg";
-    const W = 640, H = 210, PAD = 12;
+    const W = 480, H = 170, PAD = 10;
     const CHANNELS = [
-      { label: "CH1 EPISODES", cls: "ch1", val: (w) => num(w.episodes_compressed) },
-      { label: "CH2 GRADUATIONS", cls: "ch2", val: (w) => num(w.graduations_validated) },
-      { label: "CH3 LINKS", cls: "ch3",
+      { label: "Episodes", cls: "ch1", val: (w) => num(w.episodes_compressed) },
+      { label: "Graduations", cls: "ch2", val: (w) => num(w.graduations_validated) },
+      { label: "Links", cls: "ch3",
         val: (w) => num(w.associations_formed) + num(w.associations_strengthened) },
     ];
 
@@ -975,11 +1648,12 @@
     const wrap = el("div", "scope-wrap");
     wrap.dataset.solo = "";
     const bar = el("div", "scope-bar");
-    bar.appendChild(el("span", "lbl", "timebase"));
+    if (series.length > 12) bar.appendChild(el("span", "lbl", "timebase"));
     const scopeBox = el("div", "scope-box");
     const legend = el("div", "scope-legend");
     const note = el("p", "note", "");
-    for (const n of [12, 24, 48]) {
+    // the timebase is drawn only when the history is longer than its shortest span: below that every button would draw the same trace
+    for (const n of (series.length > 12 ? [12, 24, 48] : [])) {
       const b = el("button", "scope-tb" + (n === span ? " active" : ""), String(n));
       b.type = "button";
       b.addEventListener("click", () => {
@@ -1021,8 +1695,9 @@
           pl.setAttribute("pathLength", "1"); // normalizes the draw-in dash math
           svg.appendChild(pl);
         }
-        const chip = el("button", `scope-ch ${ch.cls}`,
-          `${ch.label} ${fmt(vals[vals.length - 1])} · max ${fmt(actualMax)}`);
+        const chip = el("button", `scope-ch ${ch.cls}`);
+        chip.appendChild(el("span", "scope-ch-l", ch.label));
+        chip.appendChild(el("span", "scope-ch-v", `${fmt(vals[vals.length - 1])} · max ${fmt(actualMax)}`));
         chip.type = "button";
         chip.title = "solo this channel (click again for all)";
         chip.setAttribute("aria-pressed", solo === ch.cls ? "true" : "false");
@@ -1035,17 +1710,14 @@
         legend.appendChild(chip);
       }
       scopeBox.replaceChildren(svg);
-      const g = view.graph;
-      const assoc = g && g.nodes && g.nodes.length
-        ? ` · association graph ${g.nodes.length} nodes / ${(g.edges || []).length} edges`
-        : "";
-      note.textContent = `${wraps.length} consolidations, oldest → newest${assoc}`;
+      note.textContent = `oldest → newest`;   // the consolidation / node / edge counts are the card's header line (composeMemory)
     }
 
     p.appendChild(wrap);
-    wrap.appendChild(bar);
-    wrap.appendChild(scopeBox);
-    wrap.appendChild(legend);
+    if (bar.children.length) wrap.appendChild(bar);
+    const plot = el("div", "scope-plot");
+    plot.append(scopeBox, legend);
+    wrap.appendChild(plot);
     wrap.appendChild(note);
     draw();
     return p;
@@ -1063,24 +1735,30 @@
   const tierErr = (view, key) => view.errors && view.errors[key];
 
   function renderCrystals(entry, view) {
-    const list = view.crystal_index || [];
+    const list = Array.isArray(view.crystal_index) ? view.crystal_index : [];
     const p = panel(entry);
     const err = tierErr(view, "crystal_index");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     if (list.length === 0) { p.appendChild(el("p", "empty", "none crystallized yet")); return p; }
+    const grid = el("div", "ck-crys");
     for (const c of list) {
       const row = el("div", "row");
       row.appendChild(el("span", "lvl", `${c.level}x`));
-      row.appendChild(el("span", "name", c.name));
-      if (c.one_clause) row.appendChild(el("span", "clause", "— " + c.one_clause));
-      // fuller crystal detail — permanence / activation mode / tags
+      const txt = el("span", "ck-crys-t");
+      // a name breaks after each underscore, so a long snake_case name wraps at a word and never mid-word
+      const nm = el("span", "name");
+      String(c.name == null ? "" : c.name).split("_").forEach((part, i) => { if (i) nm.appendChild(document.createTextNode("_")), nm.appendChild(document.createElement("wbr")); nm.appendChild(document.createTextNode(part)); });
+      txt.appendChild(nm);
+      if (c.one_clause) txt.appendChild(el("span", "clause", c.one_clause));
+      // permanence / activation mode / tags are a muted line under the clause: touch has no hover, so a tooltip is not a place to keep them
       const meta = [c.permanence, c.activation_mode].filter(Boolean).join(" · ");
-      if (meta) row.appendChild(el("span", "muted", meta));
-      if (Array.isArray(c.tags) && c.tags.length) {
-        row.appendChild(tagEl("tags", "#" + c.tags.slice(0, 6).join(" #")));
-      }
-      p.appendChild(row);
+      const tags = Array.isArray(c.tags) && c.tags.length ? "#" + c.tags.slice(0, 6).join(" #") : "";
+      const detail = [meta, tags].filter(Boolean).join(" · ");
+      if (detail) txt.appendChild(el("span", "ck-crys-meta", detail));
+      row.appendChild(txt);
+      grid.appendChild(row);
     }
+    p.appendChild(grid);
     return p;
   }
 
@@ -1149,6 +1827,8 @@
     const bodies = Array.from(root.querySelectorAll(".pbody.clamped"));
     if (root.matches && root.matches(".pbody.clamped")) bodies.push(root);
     for (const b of bodies) measureOverflow(b);
+    // the fold and the cue change how tall a body is, and a body shorter than the scroll it was given clamps it: put it back once more
+    restoreKeptScroll(root, kept);
   }
 
   // Append a clause + its per-item expand toggle (shared by spore + episode rows). The
@@ -1156,6 +1836,17 @@
   // so expand is instant and any edit reads the whole thing — no truncation, no data loss.
   // CSS clamps the clause to 3 lines; measureClauses reveals the toggle only when it
   // overflows; the toggle flips .row-expanded to show all of it inline.
+  // Text that carries `code` spans is drawn through the same inline renderer the neocortex panel uses (mdInline), so a command or a path
+  // reads as code and not as raw backticks; text without a backtick stays a plain text node (no other markdown is opened up).
+  function codeSpansInto(parent, text) {
+    if (String(text).indexOf("`") === -1) { parent.appendChild(document.createTextNode(text)); return; }
+    mdInline(String(text), parent, 0);
+  }
+  function richEl(tag, cls, text) {
+    const n = el(tag, cls);
+    codeSpansInto(n, String(text != null ? text : ""));
+    return n;
+  }
   function appendClause(row, text) {
     // .clampable is what the CSS clamps + measureClauses targets — bare .clause (crystals,
     // wrap/edit labels) stays full so it never clamps without this expand affordance.
@@ -1164,7 +1855,7 @@
     const parts = String(text != null ? text : "").split(/(\b\d{4}-\d{2}-\d{2}\b)/);   // nullish text draws an empty clause, as el() does
     parts.forEach((part, i) => {
       if (i % 2) clause.appendChild(el("span", "nowrap", part));
-      else if (part) clause.appendChild(document.createTextNode(part));
+      else if (part) codeSpansInto(clause, part);
     });
     row.appendChild(clause);
     const toggle = el("button", "clause-toggle", "⌄");  // caret only; the action lives in aria-label
@@ -1173,10 +1864,11 @@
     toggle.setAttribute("aria-label", "expand full text");
     toggle.addEventListener("click", (ev) => {
       ev.stopPropagation();  // don't trip a row/modal handler
+      const body = row.closest(".pbody, .modal-body");
+      const place = body ? body.scrollTop : 0;   // the browser's scroll anchoring shifts it when a row above the reader grows
       const open = setExpanded(row, !row.classList.contains("row-expanded"));
       // expanding changes the panel's content height → refresh its overflow scent
-      const body = row.closest(".pbody, .modal-body");
-      if (body && body.classList.contains("pbody")) measureOverflow(body);
+      if (body && body.classList.contains("pbody")) { measureOverflow(body); if (body.scrollTop !== place) body.scrollTop = place; }
     });
     row.appendChild(toggle);
     return clause;
@@ -1197,9 +1889,9 @@
   const VERBS_VISIBLE = 3;
   // Where the row is too narrow for the meta line (id, tag, date, age) beside the verbs, a container query on the row
   // (CSS, decided at render and on every resize) hides the inline verbs and shows a copy of each in the "···" menu.
-  function overflowVerbs(group, prefer) {
+  function overflowVerbs(group, prefer, shown) {
     const btns = Array.prototype.slice.call(group.querySelectorAll(":scope > .verb-btn"));
-    const visible = VERBS_VISIBLE;
+    const visible = shown || VERBS_VISIBLE;
     if (btns.length <= visible) return;
     let keep = [];
     for (const label of prefer || []) {
@@ -1289,8 +1981,8 @@
     group.appendChild(more);
     group.appendChild(menu);
   }
-  function appendRowVerbs(row, group, prefer) {
-    if (document.body.classList.contains("ke")) { row.tabIndex = 0; overflowVerbs(group, prefer); }
+  function appendRowVerbs(row, group, prefer, visible) {
+    if (document.body.classList.contains("ke")) { row.tabIndex = 0; overflowVerbs(group, prefer, visible); }
     row.appendChild(group);
     return row;
   }
@@ -1315,12 +2007,25 @@
       sf.setAttribute("data-ck-tag-state", "held");
       row.appendChild(sf);
     } else if (s.next) {
-      const due = tagEl("muted", "→ " + s.next);
-      if (isOverdue(s.next)) due.setAttribute("data-ck-tag-state", "overdue");
-      row.appendChild(due);
+      // a late row says how late ("overdue 4 d") and keeps its date ("due 10-17"); a row due today says so
+      const late = daysLate(s.next, s.today);
+      if (late > 0) {
+        row.dataset.band = "overdue";
+        const od = tagEl("muted", "overdue " + late + " d");
+        od.setAttribute("data-ck-tag-state", "overdue");
+        row.appendChild(od);
+        row.appendChild(tagEl("muted", "due " + shortDate(s.next)));
+      } else {
+        row.appendChild(tagEl("muted", late === 0 ? "due today" : "due " + shortDate(s.next)));
+      }
     }
+    if (panelKind !== "tray" && panelKind !== "keep" && s.tier) row.dataset.heat = String(s.tier);   // Open loops: a stripe per heat
     if (s.age_shown && s.age) row.appendChild(el("span", "muted", s.age));
-    if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["edit", "schedule", "dismiss"] : null);
+    // Build's Open loops draw "open N d" and the repo chip under the title (cockpit.css hides both elsewhere)
+    // the integer the kernel sends (the spore's own created date), never the badge words parsed back
+    if (Number.isInteger(s.age_days) && s.age_days >= 0) row.appendChild(el("span", "k7-opend", "open " + s.age_days + " d"));
+    if (s.domain) { const rc = el("span", "k7-repo", String(s.domain)); rc.dataset.repoFacet = String(s.domain); row.appendChild(rc); }
+    if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "Snooze"] : null, panelKind === "tray" ? 2 : 0);
     return row;
   }
 
@@ -1405,7 +2110,10 @@
       controls: (bar, redraw) => {
         if (heldLine) {
           const line = el("div", "ext-note held-line");
-          line.appendChild(el("span", null, heldLine.count + " held back — " + heldLine.reason + " "));
+          // the earliest surface date among the held rows: "1 held back until Dec 3"
+          const nexts = held.map((h) => String(h.next || "")).filter((d) => /^\d{4}-\d{2}-\d{2}/.test(d)).sort();
+          line.appendChild(el("span", null, nexts.length ? heldLine.count + " held back until " + surfaceLabel(nexts[0]) + " "
+            : heldLine.count + " held back — " + heldLine.reason + " "));
           const tog = el("button", "held-toggle");
           tog.type = "button";
           tog.dataset.heldToggle = "1";
@@ -1422,7 +2130,7 @@
             for (const m of [...heldMounts]) { if (m.tog.isConnected) m.sync(); else heldMounts.delete(m); }
           });
           line.appendChild(tog);
-          bar.after(line);
+          p.appendChild(line);   // at the foot of the list, as the mock draws it
         }
         if (!views.length) return;
         const sel = el("select", "tray-dump-type");
@@ -1446,14 +2154,19 @@
     mountSporeFilter(p, list || [], "items", entry.kind, (rows, results) => {
       let lastGroup = null;
       let heldHead = false;
+      let box = results;
       for (const s of rows) {
-        if (s.held && !heldHead) { heldHead = true; results.appendChild(el("div", "grp-head", "Held until their surface date")); }
+        if (s.held && !heldHead) { heldHead = true; box = results; results.appendChild(el("div", "grp-head", "Held until their surface date")); }
         // a manifest source brings the kernel's own bands (Today / Overdue / Also pending), in its order;
         // a chosen view is ungrouped
         const g = s.group || null;
-        if (s.group_title && g !== lastGroup && !viewOf() && !s.held) results.appendChild(el("div", "grp-head", s.group_title));
+        if (s.group_title && g !== lastGroup && !viewOf() && !s.held) {
+          // each band is a column of its own where the page is wide (Morning's Tray: Overdue | Today); `display: contents` elsewhere
+          box = entry.kind === "tray" ? results.appendChild(el("div", "grp-col")) : results;
+          box.appendChild(el("div", "grp-head", s.group_title));
+        }
         lastGroup = g;
-        results.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
+        box.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
       }
     }, opts);
     return p;
@@ -1488,7 +2201,7 @@
       results.replaceChildren();
       if (rows.length === 0) {
         results.appendChild(el("p", "empty",
-          q ? "no loops match “" + raw.trim() + "”" : "no open prospective loops"));
+          q ? "no loops match “" + raw.trim() + "”" : "Nothing yet. What stays open after Sage sorts the Tray is listed here."));
       } else {
         for (const s of rows) results.appendChild(sporeRow(s, verbs, "tier", entry.kind));
       }
@@ -1520,7 +2233,7 @@
 
   function renderTray(entry, view) {
     const p = renderSporeProjection(entry, view, view.tray,
-      "tray clear — nothing waiting", "disposition");
+      "Nothing yet. Drop a thought in the box above and Sage sorts it.", "disposition");
     // The dump box is the primary capture affordance — mounted under the title when
     // writable. A read-only port (mesh) shows the Tray but offers no dump (NO-THEATER).
     if (isVerbPanel(entry)) mountCaptureBox(p, buildTrayDump(view.entity_name || "the assistant"));
@@ -1532,7 +2245,7 @@
   // (when writable), then the list badged per-item (note → "note", parked loop → "parked").
   function renderKeep(entry, view) {
     const p = renderSporeProjection(entry, view, view.keep,
-      "keep empty — nothing kept", "keep");
+      "Nothing yet. Add a note above to keep something handy.", "keep");
     if (isVerbPanel(entry)) mountCaptureBox(p, buildKeepNote());
     return p;
   }
@@ -1619,7 +2332,7 @@
     const showRecent = () => {
       status.textContent = "";
       const shown = agentNow() ? list.filter((e) => e.agent === agentNow()) : list;
-      if (list.length === 0) results.replaceChildren(el("p", "empty", "no episodes yet"));
+      if (list.length === 0) results.replaceChildren(el("p", "empty", "Nothing yet. Episodes appear here as sessions write them."));
       else renderRows(shown);
       reMeasure();
     };
@@ -1999,10 +2712,92 @@
   }
   // [MD-EXTRACT-END]
 
+  // The Patterns and Decisions sections are decorated on the Memory tab, never re-parsed: the section is drawn by its own markdown
+  // renderer (sectionDisplay, the same path every other section takes), then the rendered DOM is dressed in place. So whatever the
+  // markdown shows is still there (names with code spans, severity marks, bracket metadata, tails, lines that do not match), and an
+  // item the decoration does not recognise is left exactly as rendered.
+  // Patterns: in each list item the `| NNx` token (a direct text child, outside any code span) moves into a leading count chip; what
+  // came before it is the name, what follows is muted after it. A `{group}` line is a group label.
+  const MEM_COUNT = /\|\s*(\d+)x\b/;
+  function memDecoratePatterns(root) {
+    for (const p of root.querySelectorAll("p.md-p")) {
+      if (/^\s*\{[^}]*\}\s*$/.test(p.textContent)) {
+        p.classList.add("ck-mem-group");
+        // the FlowScript braces are the file's notation, not the page's: the head reads "Today · 2026-10-21" (the stored text is untouched)
+        if (!p.children.length) p.textContent = p.textContent.trim().slice(1, -1).trim().replace(/\s+\u2014\s+/, " \u00b7 ");
+      }
+    }
+    for (const li of root.querySelectorAll("li.md-li")) {
+      let at = null, m = null;
+      for (const n of li.childNodes) {
+        if (n.nodeType !== 3) continue;
+        m = MEM_COUNT.exec(n.nodeValue);
+        if (m) { at = n; break; }
+      }
+      if (!at) continue;
+      const kids = Array.from(li.childNodes);
+      const name = el("span", "ck-mem-name"), rest = el("span", "ck-mem-rest");
+      const text = at.nodeValue, before = text.slice(0, m.index), after = text.slice(m.index + m[0].length);
+      let seen = false;
+      for (const n of kids) {
+        if (n === at) { seen = true; if (before) name.appendChild(document.createTextNode(before)); if (after) rest.appendChild(document.createTextNode(after)); }
+        else (seen ? rest : name).appendChild(n);
+      }
+      const t = el("span", "ck-mem-t");
+      t.append(name, rest);
+      li.replaceChildren(el("span", "ck-mem-n", m[1] + "x"), t);
+      li.classList.add("ck-mem-li");
+    }
+  }
+  // Decisions: an item (or paragraph) that begins with a `[decided|forwarded|carried ...]` bracket takes the bracket's date into a
+  // leading date column; the whole bracket (who, qualifier) stays visible as muted text. A later line of the same paragraph that
+  // opens with such a bracket gets its date inline. Anything else (a `[rejected ...]` line, prose) is left as rendered.
+  const MEM_BRACKET = /^(\s*)(\[(decided|forwarded|carried)\b([^\]]*)\])/;
+  function memWhen(m) {
+    const d = /,\s*(?:\d{4}-)?(\d\d-\d\d)/.exec(m[4]);
+    return m[3] === "decided" && d ? d[1] : m[3];
+  }
+  function memDecorateDecisions(root) {
+    for (const host of root.querySelectorAll("p.md-p, li.md-li")) {
+      // a paragraph's source lines are split at its <br>s into one block per line, so each decision line is its own row; a line that
+      // opens with no bracket (a continuation) stays a block of its own under the row above, its words untouched
+      const kids = Array.from(host.childNodes);
+      const lines = [[]];
+      for (const n of kids) { if (n.nodeName === "BR" && host.nodeName === "P") lines.push([]); else lines[lines.length - 1].push(n); }
+      const hits = lines.map((ln) => { const n = ln[0]; return n && n.nodeType === 3 ? MEM_BRACKET.exec(n.nodeValue) : null; });
+      if (!hits.some(Boolean)) continue;
+      host.replaceChildren();
+      lines.forEach((ln, i) => {
+        const m = hits[i];
+        const row = el("span", m ? "ck-mem-li" : "ck-mem-cont");
+        if (m) {
+          const first = ln[0];
+          first.nodeValue = first.nodeValue.slice(m[0].length);
+          const t = el("span", "ck-mem-text");
+          t.appendChild(el("span", "ck-mem-cite", m[1] + m[2]));
+          for (const n of ln) t.appendChild(n);
+          row.append(el("span", "ck-mem-when", memWhen(m)), t);
+        } else for (const n of ln) row.appendChild(n);
+        host.appendChild(row);
+      });
+      host.classList.add("ck-mem-dec");
+    }
+  }
+
   function renderSection(entry, sec) {
     const p = panel(entry);
     if (!sec) { p.appendChild(el("p", "empty", "—")); return p; }
-    p.appendChild(sectionDisplay(sec.body));  // markdown-rendered (edit shows raw)
+    const head = String(sec.heading || entry.heading || entry.title || "").trim().toLowerCase();
+    const disp = sectionDisplay(sec.body);   // markdown-rendered (edit shows raw)
+    // Patterns and Decisions are dressed in place on the Memory tab; a body the decoration finds nothing in stays the markdown it is
+    if (head === "patterns") { memDecoratePatterns(disp); disp.classList.add("ck-mem-pats"); }
+    else if (head === "decisions") { memDecorateDecisions(disp); disp.classList.add("ck-mem-decs"); }
+    p.appendChild(disp);
+    // a section with no text is left out of the Memory tab's neocortex card (a bare heading says nothing), unless it can be edited:
+    // then it is a slim row that keeps its Edit
+    const bare = !String(sec.body || "").trim();
+    if (bare) p.dataset.ckNoText = "1";
+    if (bare && isEditablePanel(entry)) { p.dataset.ckSlim = "1"; p.classList.add("ck-mem-slim"); p.appendChild(el("p", "empty", "empty")); }
     if (isEditablePanel(entry)) {
       // State (Class-A neocortex section) is editable in Slice 2b via the SAME
       // affordance config panels use — mark + stash; finalizePanels appends the bar.
@@ -2087,6 +2882,8 @@
       if (p.hasAttribute("data-clamp")) body.classList.add("clamped");
       row.style.display = "";
       body.dataset.editing = "";
+      const again = row.querySelector(".edit-btn");   // the way back in is where focus returns, not the page
+      if (again) again.focus();
     };
     cancel.addEventListener("click", restore);
     // Escape cancels the edit (not the whole modal): stopPropagation keeps it from
@@ -2129,7 +2926,7 @@
   // is kept only when the kernel offered that verb on the row, and is disabled, with the gesture as its
   // title, when the gesture is one a browser cannot perform. A legacy row lists none and is untouched.
   const BUTTON_VERB = { touch: "spore_touch", edit: "spore_update", reclassify: "spore_update", park: "spore_update",
-    reactivate: "spore_update", schedule: "spore_surface_at", metabolize: "spore_set_disposition",
+    reactivate: "spore_update", schedule: "spore_surface_at", Snooze: "spore_surface_at", Resolve: "spore_descend", metabolize: "spore_set_disposition",
     "→ tray": "spore_set_disposition", activate: "spore_set_disposition", "remind me": "spore_set_disposition",
     dismiss: "spore_descend", remove: "spore_descend", compost: "spore_descend", promote: "spore_ascend",
     tombstone: "episode_tombstone" };
@@ -2141,14 +2938,17 @@
     t.setAttribute("data-ck-tag", "");
     return t;
   }
-  // a due stamp ("2026-10-12", or a longer ISO date) before today
-  function isOverdue(due) {
-    const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(due));
-    if (!m) return false;
-    const d = new Date();
-    const today = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
-    return m[1] < today;
+  // whole days a due stamp is before today (negative: still ahead; 0: today); NaN when it is no date. `today` is the server's
+  // calendar day ("YYYY-MM-DD", carried on the row): the browser's own zone and clock are used only when the server sent none
+  function daysLate(due, today) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(due));
+    if (!m) return NaN;
+    const tm = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(today || ""));
+    const now = new Date();
+    const t0 = tm ? Date.UTC(+tm[1], +tm[2] - 1, +tm[3]) : Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+    return Math.round((t0 - Date.UTC(+m[1], +m[2] - 1, +m[3])) / 86400000);
   }
+  const shortDate = (due) => String(due).slice(5, 10);
 
   function verbBtn(label, title, onClick) {
     const b = el("button", "verb-btn", label);
@@ -2209,9 +3009,9 @@
         b.disabled = false;
         verbErr(wrap, res);
       }));
-      wrap.appendChild(verbBtn("schedule", "resurface on a future date", () => openSurfaceForm(wrap, s)));
+      wrap.appendChild(verbBtn("Snooze", "resurface on a future date", () => openSurfaceForm(wrap, s)));
       if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
-        wrap.appendChild(verbBtn("dismiss", "compost this inbox item", () =>
+        wrap.appendChild(verbBtn("Resolve", "resolve or compost this inbox item", () =>
           openResolveForm(wrap, "spore_descend", "dismiss", s, s.descend_kinds, false)));
       }
       return gateByActions(wrap, s.actions);
@@ -2490,7 +3290,7 @@
   function buildCaptureBox(placeholder, btnLabel, emptyMsg, withType, buildReq, sortEntity) {
     const box = el("div", "tray-dump");
     const ta = el("textarea", "tray-dump-ta");
-    ta.placeholder = placeholder; ta.rows = 2;
+    ta.placeholder = placeholder; ta.title = "⌘/Ctrl+Enter sends"; ta.rows = 2;
     box.appendChild(ta);
     const controls = el("div", "tray-dump-controls");
     let sel = null;
@@ -2532,7 +3332,7 @@
   // cognition until triaged). The type dropdown lets them classify; default = let flow sort.
   function buildTrayDump(entity) {
     return buildCaptureBox(
-      `dump anything — a to-do, a thought, a thread to pick up… ${entity} sorts it (⌘/Ctrl+Enter)`,
+      `Drop anything. ${entity} sorts it.`,
       "drop", "nothing to drop", true,
       (text, type) => {
         const req = { kind: "spore_seed", text };
@@ -2545,7 +3345,7 @@
   // cognition-excluded + resolve-exempt. No type (reference never resolves).
   function buildKeepNote() {
     return buildCaptureBox(
-      "add a note — a command, a pointer, durable reference to keep handy (⌘/Ctrl+Enter)",
+      "Add a note or a command",
       "keep", "nothing to keep", false,
       (text) => ({ kind: "spore_seed", text, disposition: "note" }));
   }
@@ -3070,7 +3870,7 @@
       if (textEdit) mountTextEditor(p, act, spec, String(data.markdown));
       else if (spec) mountCaptureBox(p, buildActionBox(act, spec));
     }
-    if (data.note) p.appendChild(el("div", "ext-note", data.note));
+    if (data.note) p.appendChild(richEl("div", "ext-note", data.note));
     // the Decisions panel carries proposal cards whatever rows it holds (three old hand-allows make a card on a panel with
     // nothing pending): decided by panel id, never by the presence of a consent row. The cards lead the rows when there are
     // any (appendExternalLines mounts them); a panel that drew none gets them after the body (renderExternal, below)
@@ -3105,14 +3905,15 @@
   function consentLeft(expiresAt) {
     const ms = Date.parse(expiresAt) - Date.now();
     if (!Number.isFinite(ms) || ms <= 0) return "expired";
-    const t = Math.floor(ms / 1000);
-    return (t >= 60 ? Math.floor(t / 60) + "m" + String(t % 60).padStart(2, "0") + "s" : t + "s") + " left";
+    // "11 h 31 m left", "52 m left", "40 s left": whole units the eye reads at a glance, one formatter for every place a clock shows
+    const t = Math.floor(ms / 1000), h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60);
+    return (h ? h + " h " + String(m).padStart(2, "0") + " m" : m ? m + " m" : t + " s") + " left";
   }
   let consentTicker = null;
   function tickConsent() {
     const nodes = document.querySelectorAll("[data-consent-expires]");
     if (!nodes.length && consentTicker) { window.clearInterval(consentTicker); consentTicker = null; return; }
-    for (const n of nodes) n.textContent = consentLeft(n.dataset.consentExpires);
+    for (const n of nodes) n.textContent = (n.dataset.consentPrefix || "") + consentLeft(n.dataset.consentExpires);
   }
   function copyText(text, codeEl, btn) {
     const done = (msg) => { btn.textContent = msg; setTimeout(() => { btn.textContent = btn.dataset.label; }, 1500); };
@@ -3199,23 +4000,19 @@
     consentBodies.set(key, got);
     return got;
   }
-  function drawConsentBody(row, slot, b, pending) {
-    const sv = (x) => (typeof x === "string" ? x : "");
-    if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
-    const parts = [el("pre", "consent-display", sv(b.display))];
-    const facts = el("div", "consent-facts");
-    facts.appendChild(el("span", "ext-meta", "cwd " + sv(b.cwd)));
-    facts.appendChild(el("span", "ext-meta", "targets " + sv(b.targets)));
-    parts.push(facts);
-    // Q12 / Q16: the two digests the terminal prints before signing (short, the whole value one click away) and what a shell
-    // command looks like; text only, and a hint informs, never authorises
+  // Q12 / Q16: the hint box (what a shell command looks like; text only, and a hint informs, never authorises) and the two
+  // digests the terminal prints before signing (short, the whole value one click away). Shared by the row and the strip's card.
+  function consentHintBox(b) {
     const hints = Array.isArray(b.hints) ? b.hints.filter((h) => typeof h === "string" && h) : [];
-    if (hints.length) {
-      const box = el("div", "consent-facts consent-hint");
-      box.appendChild(el("span", "ext-meta", "hint (a few patterns only; informs, never authorises)"));
-      for (const h of hints) box.appendChild(el("div", h === "no pattern matched: read the command" ? "consent-dgtext consent-none" : "consent-dgtext", "\u2022 " + h));
-      parts.push(box);
-    }
+    if (!hints.length) return null;
+    const box = el("div", "consent-facts consent-hint");
+    box.appendChild(el("span", "ext-meta", "hint (a few patterns only; informs, never authorises)"));
+    for (const h of hints) box.appendChild(el("div", h === "no pattern matched: read the command" ? "consent-dgtext consent-none" : "consent-dgtext", "\u2022 " + h));
+    return box;
+  }
+  function consentDigestLines(b) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const parts = [];
     for (const [label, value] of [["input digest", b.tool_input_digest], ["request digest", b.digest]]) {
       const full = sv(value);
       if (!full) {                                 // a missing digest is shown as missing, never dropped
@@ -3238,6 +4035,19 @@
       line.append(el("span", "ext-meta", label), code);
       parts.push(line);
     }
+    return parts;
+  }
+  function drawConsentBody(row, slot, b, pending) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
+    const parts = [el("pre", "consent-display", sv(b.display))];
+    const facts = el("div", "consent-facts");
+    facts.appendChild(el("span", "ext-meta", "cwd " + sv(b.cwd)));
+    facts.appendChild(el("span", "ext-meta", "targets " + sv(b.targets)));
+    parts.push(facts);
+    const hintBox = consentHintBox(b);
+    if (hintBox) parts.push(hintBox);
+    parts.push(...consentDigestLines(b));
     if (sv(b.note)) parts.push(el("div", "consent-note ext-meta", sv(b.note)));
     if (!pending && sv(b.audit)) {
       const audit = row.querySelector(".consent-audit");
@@ -3266,6 +4076,7 @@
     const undecided = c.state === "undecided";
     const row = el("div", "row consent-row" + (pending || undecided ? " ext-accent" : " ext-dim"));
     row.setAttribute("data-consent-row", "");
+    if (c.id) row.dataset.card = "consent:" + c.id;     // the id the topology's waiting tasks name (topology_view.js)
     const head = el("div", "consent-head");
     head.appendChild(el("span", "consent-agent", c.agent || "agent"));
     head.appendChild(el("b", "consent-tool", c.tool));
@@ -3353,7 +4164,9 @@
     line.append(code, btn);
     return line;
   }
-  function drawQuestionBody(q, slot, b) {
+  // `card` (the Needs-you strip's card) draws the mock's anatomy: the question as a bold title, "blocks: ...", then "REC key. words";
+  // the options, the words box and the send button go to the card's own bottom row, so cards in a row end their actions together.
+  function drawQuestionBody(q, slot, b, card) {
     const sv = (x) => (typeof x === "string" ? x : "");
     const open = q.state === "open";
     const cli = "levain question show " + q.n;   // the options are listed there; answer with: levain question answer N --option KEY
@@ -3363,12 +4176,24 @@
       slot.replaceChildren(...parts);
       return;
     }
-    const parts = [el("pre", "consent-display", sv(b.what))];
     const options = Array.isArray(b.options) ? b.options : [];
-    const facts = el("div", "consent-facts");
-    facts.appendChild(el("span", "ext-meta", "recommends " + sv(b.rec)));
-    facts.appendChild(el("span", "ext-meta", "blocks: " + sv(b.blocks)));
-    parts.push(facts);
+    const parts = [];
+    if (card) {
+      parts.push(el("div", "needs-q-title", sv(b.what)));
+      if (sv(b.blocks)) parts.push(el("div", "ext-meta needs-q-blocks", "blocks: " + sv(b.blocks)));
+      const recOpt = options.find((o) => o && sv(o.key) === sv(b.rec));
+      if (sv(b.rec)) {
+        const rl = el("div", "needs-rec");
+        rl.append(el("span", "needs-rec-tag", "REC"), document.createTextNode(" " + sv(b.rec) + (recOpt && sv(recOpt.label) ? ". " + sv(recOpt.label) : "")));
+        parts.push(rl);
+      }
+    } else {
+      parts.push(el("pre", "consent-display", sv(b.what)));
+      const facts = el("div", "consent-facts");
+      facts.appendChild(el("span", "ext-meta", "recommends " + sv(b.rec)));
+      facts.appendChild(el("span", "ext-meta", "blocks: " + sv(b.blocks)));
+      parts.push(facts);
+    }
     const a = b.answer && typeof b.answer === "object" ? b.answer : null;
     if (a) {
       const opt = options.find((o) => o && o.key === a.value);
@@ -3400,7 +4225,8 @@
     };
     for (const o of options) {
       const key = sv(o && o.key);
-      const btn = el("button", "undo-btn question-option", key + " · " + sv(o && o.label) + (key === sv(b.rec) ? " (recommended)" : ""));
+      const btn = el("button", "undo-btn question-option", key + " · " + sv(o && o.label) + (!card && key === sv(b.rec) ? " (recommended)" : ""));
+      if (key === sv(b.rec)) btn.classList.add("question-rec");
       btn.type = "button";
       btn.title = "answer with option " + key;
       btn.addEventListener("click", () => send({ option: key }));
@@ -3410,12 +4236,19 @@
     const words = el("textarea", "question-words");
     words.rows = 2;
     words.maxLength = 4000;
-    words.placeholder = "or answer in your own words";
+    words.placeholder = card ? "or your own words" : "or answer in your own words";
     if (questionDrafts.has(q.id)) { words.value = questionDrafts.get(q.id); questionDrafts.delete(q.id); }
     const sendWords = el("button", "undo-btn question-send", "send words");
     sendWords.type = "button";
     sendWords.addEventListener("click", () => { if (words.value.trim()) send({ text: words.value }); });
     controls.push(words, sendWords);
+    if (card) {
+      const bottom = el("div", "needs-actions needs-qa");
+      bottom.append(wrap, words, sendWords, msg);
+      slot.replaceChildren(...parts);
+      card.appendChild(bottom);
+      return;
+    }
     parts.push(wrap, words, sendWords, msg);
     slot.replaceChildren(...parts);
   }
@@ -3424,6 +4257,7 @@
     const open = q.state === "open";
     const row = el("div", "row consent-row question-row" + (open ? " ext-accent" : " ext-dim"));
     row.setAttribute("data-question-row", "");
+    if (q.id) row.dataset.card = String(q.id);
     const head = el("div", "consent-head");
     head.appendChild(el("span", "consent-agent", q.agent || "agent"));
     head.appendChild(el("b", "consent-tool", "question #" + q.n));
@@ -3447,6 +4281,383 @@
     });
     head.appendChild(btn);
     return row;
+  }
+
+  // ---- The Needs-you strip (K4, F4 a / F11 a) ----
+  // What waits on the operator, drawn as cards under the now band: each PENDING consent request and each OPEN question of the
+  // Decisions panel, as the mock draws them: the open questions first (they block work and have no clock), then the requests on a
+  // clock, soonest expiry first. The strip is absent when nothing waits
+  // (never an empty strip), and on a tab that is not Morning or Board it is the header alone. A consent card carries no rec:
+  // Allow and Deny weigh the same and the hint line is what informs (F11 a). A question keeps its rec, which is the agent's
+  // words and authorises nothing. This page signs nothing: the card says to answer on the phone, and its buttons copy the CLI
+  // command for a terminal; the question's answer goes through the verb path the board already has. History (decided rows,
+  // outcomes, standing-rule proposals) stays in the Decisions focus view, behind the strip's "all decisions" button.
+  function needsItems(lines) {
+    const consents = [], questions = [];
+    for (const ln of Array.isArray(lines) ? lines : []) {
+      if (!ln || typeof ln !== "object") continue;
+      if (ln.consent && ln.consent.state === "pending") consents.push({ kind: "consent", c: ln.consent });
+      else if (ln.question && ln.question.state === "open") questions.push({ kind: "question", q: ln.question });
+    }
+    const due = (it) => { const ms = Date.parse(it.c.expiresAt); return Number.isFinite(ms) ? ms : Infinity; };
+    consents.sort((a, b) => due(a) - due(b));   // Array.prototype.sort is stable: equal expiries keep the kernel's order
+    return questions.concat(consents);
+  }
+  const needsKey = (it) => (it.kind === "consent" ? "c:" + it.c.id + "|" + it.c.state + "|" + it.c.expiresAt : "q:" + it.q.n + "|" + it.q.state);
+  // the name a glance tile gives the top item: the tool and who asked, or the question's number (its words are fetched, not in the row)
+  function needsName(it) {
+    return it.kind === "consent" ? (it.c.tool || "request") + " · " + (it.c.agent || "agent") : "question #" + it.q.n + " · " + (it.q.agent || "agent");
+  }
+  function needsSummary(items) {
+    const nc = items.filter((it) => it.kind === "consent").length, nq = items.length - nc;
+    const parts = [];
+    if (nc) parts.push(nc + (nc === 1 ? " consent" : " consents"));
+    if (nq) parts.push(nq + (nq === 1 ? " question" : " questions"));
+    const first = items.find((it) => it.kind === "consent");
+    return parts.join(" · ") + (first && Number.isFinite(Date.parse(first.c.expiresAt)) ? " · soonest " + consentLeft(first.c.expiresAt) : "");
+  }
+  function needsHead(card, kindChip, agent, tail) {
+    const head = el("div", "consent-head needs-head");
+    // the focus view's dialog title already names the tool or question number and the agent: its card head keeps only the rest
+    if (!card.classList.contains("is-full")) {
+      head.appendChild(kindChip);
+      head.appendChild(el("span", "needs-chip consent-agent", agent || "agent"));
+    }
+    if (tail) head.appendChild(tail);
+    card.appendChild(head);
+  }
+  const needsIdOf = (it) => (it.kind === "consent" ? (it.c.id ? "consent:" + it.c.id : "") : (it.q.id ? String(it.q.id) : ""));
+  // The strip's card carries one "Open" row: it opens the focus view, where the SAME card is drawn unclamped (`is-full`) and the CLI
+  // route (the digests, the note and the commands) sits under "Answer from a terminal". There is no second renderer: the full card is
+  // the strip card built again with `full` set.
+  function needsDetails(parts, note, card) {
+    if (card && card.classList.contains("is-full")) {
+      const t = el("div", "needs-terminal");
+      t.appendChild(el("div", "needs-sec-label", "Answer from a terminal"));
+      if (note) t.appendChild(el("span", "needs-phone ext-meta", note));
+      t.append(...parts);
+      return t;
+    }
+    const d = el("div", "needs-details needs-open-row");
+    const btn = el("button", "needs-open", "Open");
+    btn.type = "button";
+    btn.title = "open the whole request";
+    btn.setAttribute("aria-haspopup", "dialog");
+    btn.addEventListener("click", () => { if (card && card._needsItem) openNeedsFocus(card._needsItem, btn); });
+    d.appendChild(btn);
+    if (note) d.appendChild(el("span", "needs-phone ext-meta", note));
+    return d;
+  }
+  // The focus view of one waiting item: the card built again, unclamped. Closes when the item is answered (refreshModal).
+  function openNeedsFocus(it, opener) {
+    const id = needsIdOf(it);
+    modalCustom = {
+      id,
+      title: it.kind === "consent" ? (it.c.tool || "request") + " · " + (it.c.agent || "agent") : "Question #" + it.q.n + " · " + (it.q.agent || "agent"),
+      build: () => (it.kind === "consent" ? consentCard(it.c, true) : questionCard(it.q, true)),
+    };
+    modalGlance = false;
+    modalKey = "needs:" + id;
+    modalReturnFocus = opener || null;
+    modalEpisodeQuery = "";
+    buildModal(null);
+  }
+  // The agent page: one node of the Agents graph opened as a modal. The fact rows come from the caller (the graph's one row builder);
+  // the transcript is read at open through the session reader and drawn by the session drawer.
+  function openAgentPage(page, opener) {
+    if (!page || typeof page !== "object") return;
+    const id = String(page.id || "");
+    const stem = typeof page.session === "string" && page.session ? page.session : (id.startsWith("session:") ? id.slice(8) : "");
+    let card = null;
+    const buildCard = () => {
+      const c = el("div", "agent-page");
+      const dl = el("dl", "consent-kv");
+      for (const [k, v] of (Array.isArray(page.rows) ? page.rows : [])) { dl.appendChild(el("dt", null, k)); dl.appendChild(el("dd", null, String(v))); }
+      c.appendChild(dl);
+      if (!stem) { c.appendChild(el("div", "ext-meta", "this view keeps no transcript for this agent")); return c; }
+      const wrap = el("div", "sess-tx-wrap");
+      const slot = el("div", "sess-tx ext-meta");
+      const btn = el("button", "undo-btn sess-tx-btn", "refresh");
+      btn.type = "button";
+      const read = () => {
+        btn.disabled = true;
+        slot.replaceChildren(document.createTextNode("reading the transcript\u2026"));
+        sessionTranscript(stem, wrap).then((b) => {
+          drawSessionTranscript(slot, b);
+          // the page opens on the newest entry (the timeline is oldest first, so that is its last row)
+          const last = slot.querySelector(".sess-tl") && slot.querySelector(".sess-tl").lastElementChild;
+          if (last && typeof last.scrollIntoView === "function") last.scrollIntoView({ block: "end" });
+        })
+          .catch(() => slot.replaceChildren(el("div", "consent-note ext-meta", SESS_BAD_READ)))
+          .finally(() => { btn.disabled = false; });
+      };
+      btn.addEventListener("click", read);
+      wrap.append(btn, slot);
+      c.appendChild(wrap);
+      read();
+      return c;
+    };
+    modalCustom = { id, page: true, title: String(page.label || "agent") + " \u00b7 " + String((page.rows && page.rows[0] && page.rows[0][1]) || "agent"), build: () => (card = card || buildCard()) };
+    modalGlance = false;
+    modalKey = "agent:" + id;
+    modalReturnFocus = opener || null;
+    modalEpisodeQuery = "";
+    buildModal(null);
+  }
+  // A JSON payload (a tool's input) as a key/value list: command, description, file_path. Anything else stays the verbatim text.
+  function consentRequest(display, tool) {
+    let t = String(display || "");
+    const head = tool && t.replace(/^\s+/, "").startsWith(tool) ? t.replace(/^\s+/, "").slice(tool.length) : t;
+    try {
+      const o = JSON.parse(head.trim());
+      if (o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).length) {
+        const dl = el("dl", "consent-kv");
+        for (const [k, v] of Object.entries(o)) {
+          dl.appendChild(el("dt", null, k));
+          dl.appendChild(el("dd", null, typeof v === "string" ? v : JSON.stringify(v)));
+        }
+        return dl;
+      }
+    } catch (e) { /* not a JSON payload: the text below */ }
+    return el("pre", "consent-display", t);
+  }
+  function drawConsentCard(card, slot, b) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
+    const full = card.classList.contains("is-full");
+    const label = (t) => el("div", "needs-sec-label", t);
+    const parts = full ? [label("Request"), consentRequest(sv(b.display), card._needsItem && card._needsItem.c.tool)] : [el("pre", "consent-display", sv(b.display))];
+    if (full) parts.push(label("Where"));
+    const facts = el("div", "consent-facts");
+    // the server's home shortens a path under it to ~/..., the full path stays as the title (never the browser's home)
+    const where = el("span", "ext-meta", "in " + (sv(b.cwd_short) || sv(b.cwd)) + " \u00b7 targets " + sv(b.targets));
+    if (sv(b.cwd)) where.title = sv(b.cwd);
+    facts.appendChild(where);
+    parts.push(facts);
+    const hintBox = consentHintBox(b);
+    if (hintBox) { if (full) parts.push(label("Hint")); parts.push(hintBox); }
+    if (full && card._needsItem && Number.isFinite(Date.parse(card._needsItem.c.expiresAt))) {
+      parts.push(label("Expires"), el("div", "ext-meta needs-expires", new Date(card._needsItem.c.expiresAt).toLocaleString()));
+    }
+    // Allow and Deny are one component at one weight: neither is filled, neither leads. This page signs nothing, so each
+    // copies the terminal command that answers; the phone is where the answer is signed.
+    const acts = el("div", "needs-actions");
+    const cmds = [];
+    for (const [label, cmd] of [["Allow", sv(b.answer_allow)], ["Deny", sv(b.answer_deny)]]) {
+      if (!cmd) continue;
+      const btn = el("button", "needs-btn", label);
+      btn.type = "button";
+      btn.dataset.label = label;
+      btn.title = "copy the " + label.toLowerCase() + " command for a terminal; this page signs nothing, sign on your phone with Face ID";
+      const code = el("code", "consent-code", cmd);
+      btn.addEventListener("click", () => copyText(cmd, code, btn));
+      acts.appendChild(btn);
+      const line = el("div", "consent-cmd");
+      line.appendChild(code);
+      cmds.push(line);
+    }
+    const more = [...consentDigestLines(b)];
+    if (sv(b.note)) more.push(el("div", "consent-note ext-meta", sv(b.note)));
+    more.push(...cmds);
+    slot.replaceChildren(...parts);
+    // the actions and the one-line footer are the card's own rows, pinned below the body so cards in a row end alike
+    if (acts.childElementCount) card.appendChild(acts);
+    card.appendChild(needsDetails(more, "signs on your phone", card));
+  }
+  function consentCard(c, full) {
+    const card = el("div", "needs-card needs-consent" + (full ? " is-full" : ""));
+    card.dataset.needsCard = "consent";
+    card._needsItem = { kind: "consent", c };
+    if (c.id && !full) card.dataset.needsId = "consent:" + c.id;
+    card.dataset.needsExpires = String(c.expiresAt);
+    card.dataset.needsState = String(c.state);
+    needsHead(card, el("b", "consent-tool", c.tool), c.agent, (() => {
+      const left = el("span", "consent-left needs-left", consentLeft(c.expiresAt));
+      left.dataset.consentExpires = c.expiresAt;
+      if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
+      return left;
+    })());
+    if (c.tier) card.firstChild.insertBefore(el("span", "needs-chip", c.tier), card.firstChild.children[full ? 0 : 1]);
+    const slot = el("div", "needs-body ext-meta", "reading the request…");
+    card.appendChild(slot);
+    if (c.id) consentBody(c, card).then((b) => drawConsentCard(card, slot, b));
+    else slot.textContent = "this request has no id";
+    return card;
+  }
+  function questionCard(q, full) {
+    const card = el("div", "needs-card needs-question" + (full ? " is-full" : ""));
+    card.dataset.needsCard = "question";
+    card._needsItem = { kind: "question", q };
+    if (q.id && !full) card.dataset.needsId = String(q.id);
+    needsHead(card, el("span", "needs-chip", "question"), q.agent, q.age ? el("span", "ext-meta needs-left", "asked " + q.age) : null);
+    const slot = el("div", "needs-body ext-meta", "reading the question…");
+    card.appendChild(slot);
+    questionBody(q, card).then((b) => {
+      drawQuestionBody(q, slot, b, card);
+      if (!b.error) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")], "", card));
+    });
+    return card;
+  }
+  function clearNeeds(host) {
+    host.replaceChildren();
+    host.hidden = true;
+    delete host.dataset.sig;
+  }
+  function renderNeeds(view) {
+    const host = document.getElementById("ck-needs");
+    if (!host) return;
+    const items = needsItems(((view.extra_panels || {}).decisions || {}).lines);
+    if (!items.length) { clearNeeds(host); return; }
+    // the same set of waiting items leaves the strip as it is: a card with half-typed words, an open "details" and a running
+    // countdown is not rebuilt under the reader by a refetch that changed nothing about what waits
+    const sig = items.map(needsKey).join("\n");
+    if (host.dataset.sig === sig && !host.hidden) return;
+    const head = el("div", "needs-headline");
+    head.appendChild(el("h3", null, "Needs you"));
+    head.appendChild(el("span", "needs-count", String(items.length)));
+    // no re-ping route exists (the phone is told when a request is filed, and the queue re-pings on its own clock; nothing here
+    // pushes), so the gloss claims no ping: it says where the answer is signed
+    head.appendChild(el("span", "needs-gloss", "Agents are waiting on a ruling. Sign it on your phone."));
+    if (items.some((it) => it.kind === "question") && items.some((it) => it.kind === "consent")) {
+      head.appendChild(el("span", "needs-order", "questions first, then soonest to expire"));
+    }
+    const hist = el("button", "needs-history", "all decisions");
+    hist.type = "button";
+    hist.title = "decided requests, outcomes and standing-rule proposals";
+    hist.addEventListener("click", () => openDecisionsHistory(hist));
+    head.appendChild(hist);
+    // the cards are kept by their stable id: a card whose item still waits is moved, never rebuilt, so the words typed into a
+    // question and an open "details" survive a change in what else waits; only a card whose item has gone is dropped
+    let grid = host.querySelector(".needs-grid");
+    const kept = new Map();
+    if (grid) for (const c of grid.children) if (c.dataset && c.dataset.needsId) kept.set(c.dataset.needsId, c);
+    const idOf = (it) => (it.kind === "consent" ? (it.c.id ? "consent:" + it.c.id : "") : (it.q.id ? String(it.q.id) : ""));
+    // a card kept by id still shows what its item says NOW: a consent whose expiry moved (extended) takes the new clock in place;
+    // one whose state changed is rebuilt unless words are typed into it or its details are open (then it is kept as it is)
+    const fresh = (it) => (it.kind === "consent" ? consentCard(it.c) : questionCard(it.q));
+    const keep = (card, it) => {
+      if (it.kind !== "consent") return card;
+      const st = it.c.state;
+      if (card.dataset.needsState !== undefined && card.dataset.needsState !== st) {
+        const ta = card.querySelector("textarea");
+        const open = card.querySelector("details[open]");
+        if (!(ta && ta.value) && !open) return consentCard(it.c);
+      }
+      const exp = String(it.c.expiresAt);
+      if (card.dataset.needsExpires !== exp) {
+        card.dataset.needsExpires = exp;
+        const left = card.querySelector(".consent-left");
+        if (left) { left.dataset.consentExpires = exp; left.textContent = consentLeft(it.c.expiresAt); }
+      }
+      return card;
+    };
+    const cards = items.map((it) => { const id = idOf(it); const k = id && kept.get(id); return k ? keep(k, it) : fresh(it); });
+    if (!grid) grid = el("div", "needs-grid");
+    for (let i = 0; i < cards.length; i++) if (grid.children[i] !== cards[i]) grid.insertBefore(cards[i], grid.children[i] || null);
+    while (grid.children.length > cards.length) grid.removeChild(grid.lastChild);
+    host.replaceChildren(head, needsBar(items), grid);
+    host.hidden = false;
+    host.dataset.sig = sig;   // only a strip that was drawn is recorded as drawn: a build that threw is tried again at the next render
+  }
+  // the Decisions focus view (decided requests, outcomes, proposals); false when this page has no Decisions panel
+  function openDecisionsHistory(opener) {
+    const entry = currentView && Array.isArray(currentView.layout) ? currentView.layout.find((e) => e.id === "decisions") : null;
+    if (!entry) return false;
+    openModal(findEntry(currentView, entryKey(entry)) || entry, opener || null, true);
+    return true;
+  }
+  // The one orange bar Build and Memory draw in place of the cards (CSS shows it only there): dot, "Needs you", the count, one chip
+  // per waiting item (its tool and first words, or the question's), the soonest clock, and "Open on Board". A chip goes to Board
+  // too, with its card lit. A consent chip says its tool at once and adds the command's first words when the body arrives.
+  const NEEDS_CHIPS = 6, NEEDS_CHIP_WORDS = 26;
+  function needsFirstWords(display, tool) {
+    let t = String(display || "").replace(/^\s+/, "");
+    if (tool && t.startsWith(tool)) t = t.slice(tool.length).replace(/^\s+/, "");
+    const m = /"(?:command|file_path|path|url|pattern|prompt)"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(t);
+    t = (m ? m[1] : t.replace(/^[{\["]+/, "")).replace(/\\n/g, " ").replace(/\s+/g, " ").trim();
+    return t.length > NEEDS_CHIP_WORDS ? t.slice(0, NEEDS_CHIP_WORDS - 1).trimEnd() + "\u2026" : t;
+  }
+  function needsBar(items) {
+    const bar = el("div", "needs-bar");
+    bar.appendChild(el("span", "needs-dot"));
+    bar.appendChild(el("b", "needs-bar-title", "Needs you"));
+    bar.appendChild(el("span", "needs-count", String(items.length)));
+    const chips = el("div", "needs-chips");
+    // the bar is the only surface on Build and Memory: as the mock's Build bar draws it, the requests on a clock come first, so an
+    // expiring one is never folded behind "+N more" by questions (the cards keep the questions first)
+    const barOrder = items.filter((it) => it.kind === "consent").concat(items.filter((it) => it.kind !== "consent"));
+    for (const it of barOrder.slice(0, NEEDS_CHIPS)) {
+      const chip = el("button", "needs-chip-btn", it.kind === "consent" ? (it.c.tool || "request") : "question #" + it.q.n);
+      chip.type = "button";
+      const id = it.kind === "consent" ? (it.c.id ? "consent:" + it.c.id : "") : (it.q.id ? String(it.q.id) : "");
+      if (id) chip.dataset.needsId = id;
+      chip.title = "open on the Board";
+      chip.addEventListener("click", () => needsToBoard(id));
+      chips.appendChild(chip);
+      if (it.kind === "consent" && it.c.id) {
+        consentBody(it.c, chip).then((b) => {
+          const w = b && !b.error ? needsFirstWords(b.display, it.c.tool) : "";
+          if (w) chip.textContent = (it.c.tool || "request") + " " + w;
+        });
+      } else if (it.kind === "question") {
+        questionBody(it.q, chip).then((b) => {
+          const w = b && !b.error && typeof b.what === "string" ? needsFirstWords(b.what, "") : "";
+          if (w) chip.textContent = w;
+        });
+      }
+    }
+    if (items.length > NEEDS_CHIPS) chips.appendChild(el("span", "needs-more ext-meta", "+" + (items.length - NEEDS_CHIPS) + " more"));
+    bar.appendChild(chips);
+    const first = items.find((it) => it.kind === "consent" && Number.isFinite(Date.parse(it.c.expiresAt)));
+    if (first) {
+      const soon = el("span", "needs-soonest ext-meta", "soonest " + consentLeft(first.c.expiresAt));
+      soon.dataset.consentExpires = first.c.expiresAt;
+      soon.dataset.consentPrefix = "soonest ";
+      bar.appendChild(soon);
+      if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
+    }
+    const open = el("button", "needs-history needs-open", "Open on Board");
+    open.type = "button";
+    open.addEventListener("click", () => needsToBoard(""));
+    bar.appendChild(open);
+    return bar;
+  }
+  // switch to Board, then focus the card the id names (the first card with no id)
+  function needsToBoard(id) {
+    const K = window.LevainCockpitKinds;
+    if (K && typeof K.applyMode === "function") K.applyMode("board", true);
+    window.setTimeout(() => { if (!(id && needsGo(id))) needsFocus(); }, 0);
+  }
+  // the focus the Decisions tile hands the operator in place of a modal: the first card, scrolled to
+  function needsFocus() {
+    const host = document.getElementById("ck-needs");
+    if (!host || host.hidden) return false;
+    const first = host.querySelector(".needs-card");
+    if (!first || !first.offsetParent) return false;   // on Build and Memory the cards are not drawn: the bar is
+    first.tabIndex = -1;
+    if (typeof first.scrollIntoView === "function") first.scrollIntoView({ block: "center", behavior: "smooth" });
+    first.focus({ preventScroll: true });
+    return true;
+  }
+
+  // A record that names a card (the Work lens's waiting items) goes to the strip's card with that id: scrolled to and lit by an
+  // animation that ends on its own (needs-lit), any earlier light cleared first. Where the strip is the bar (Build, Memory) the matching
+  // chip is lit instead. False when no card or chip carries the id, so the caller can open the history.
+  function needsGo(id) {
+    const host = document.getElementById("ck-needs");
+    if (!host || host.hidden || !id) return false;
+    for (const n of host.querySelectorAll(".needs-lit")) n.classList.remove("needs-lit");
+    const cards = host.querySelector(".needs-card") && host.querySelector(".needs-card").offsetParent;
+    const sel = cards ? ".needs-card" : ".needs-chip-btn";
+    const node = Array.prototype.find.call(host.querySelectorAll(sel), (n) => n.dataset.needsId === id);
+    if (!node) return false;
+    if (typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "center", behavior: "smooth" });
+    void node.offsetWidth;   // restart the animation if the same node is lit twice
+    node.classList.add("needs-lit");
+    const off = () => node.classList.remove("needs-lit");
+    node.addEventListener("animationend", off, { once: true });
+    window.setTimeout(off, 3000);   // a page that plays no animation (reduced motion) still ends the light
+    return true;
   }
 
   // A session's transcript (Q8): the Sessions modal's row button fetches /cockpit/session/<stem>.json with the token this
@@ -3645,6 +4856,7 @@
       if (o.wrapMeta) row.classList.add("meta-wrap");   // a row whose meta line IS its content (the sessions' chips): it wraps, never ellipsises
       if (typeof o.key === "string" && o.key) row.dataset.keepKey = o.key;   // the id an expanded row is found by after a repaint
       if (typeof o.repo === "string" && o.repo) row.dataset.repoFacet = o.repo;   // read by the project-colour tag pass (cockpit_view.js)
+      if (o.dot === "ok" || o.dot === "bad" || o.dot === "off") { row.classList.add("k7-res"); row.appendChild(el("i", "k7-rdot " + o.dot)); }   // Build's Results: the outcome dot leads
       if (o.meta && !o.addr) row.appendChild(el("span", "ext-meta", String(o.meta)));
       if (o.addr) {
         // an addressed row leads with `source -> for` ("everyone" when it names no reader)
@@ -3668,7 +4880,7 @@
   function renderEdits(entry, view) {
     const list = view.recent_edits || [];
     const p = panel(entry);
-    if (list.length === 0) { p.appendChild(el("p", "empty", "no edits yet")); return p; }
+    if (list.length === 0) { p.appendChild(el("p", "empty", "Edits appear here once a session writes a file.")); return p; }
     const claimed = new Set();
     for (const e of list) {
       const row = el("div", "edit-row");
@@ -3900,6 +5112,16 @@
     return { host, zone: p.dataset.zone || "", title: entry.title || "", editClass: entry.edit_class || "" };
   }
 
+  function customModalContent(c) {
+    const card = c.build();
+    if (!card) return null;
+    const host = el("div", "modal-panel");
+    const body = el("div", "pbody modal-pbody");
+    body.appendChild(card);
+    host.appendChild(body);
+    return { host, zone: "", title: c.title, editClass: "" };
+  }
+
   function buildModal(entry) {
     const gen = ++modalGen;
     modalAwaiting = false;
@@ -3908,7 +5130,7 @@
     const openBody = document.querySelector("#levain-modal .modal-body");
     const modalKept = modalPending || captureKept(openBody);
     buildKept = modalKept;   // a typed panel filled in this build may owe the reader a later repaint of it
-    const content = currentView ? modalContent(entry, currentView) : null;
+    const content = modalCustom ? customModalContent(modalCustom) : (currentView ? modalContent(entry, currentView) : null);
     if (!content) { buildKept = null; closeModal(); return; }
 
     let overlay = document.getElementById("levain-modal");
@@ -3982,6 +5204,12 @@
 
   function refreshModal() {
     if (!modalKey) return;
+    // a Needs-you card keeps its place (and any words typed into it) while the item still waits; it closes when the item is answered
+    if (modalCustom) {
+      if (modalCustom.page) return;   // an agent page is not tied to a waiting item
+      if (!needsItems(((currentView && currentView.extra_panels || {}).decisions || {}).lines).some((it) => needsIdOf(it) === modalCustom.id)) closeModal();
+      return;
+    }
     const entry = findEntry(currentView, modalKey);
     if (!entry) { closeModal(); return; }  // the panel vanished from the view → close
     buildModal(entry);
@@ -4003,6 +5231,7 @@
     pruneModalKinds();
     document.body.classList.remove("modal-open");
     modalKey = null;
+    modalCustom = null;
     modalGlance = false;
     modalPending = null;
     modalAwaiting = false;
@@ -4147,14 +5376,20 @@
     for (const k of Object.keys(rows)) if (rows[k].panel_id === pid) delete rows[k];
     for (const k of Object.keys(fresh.targets.rows)) if (fresh.targets.rows[k].panel_id === pid) rows[k] = fresh.targets.rows[k];
     if (fresh.targets.panels[pid]) currentView.targets.panels[pid] = fresh.targets.panels[pid]; else delete currentView.targets.panels[pid];
+    if (pid === "decisions") { try { renderNeeds(currentView); } catch (e) { /* the strip keeps what it showed */ } }
   }
   // A reload (the tab coming back, the refresh button, a stream reload) re-renders the whole board: emptying it
   // clamps the page's scroll to the top, so the reader's place is put back once the board is drawn again.
   function renderKeepingPlace(view, opts) {
     const y = window.scrollY || 0;
     try { return render(view, opts); }
-    finally { if (y > 0 && window.scrollY !== y) window.scrollTo(window.scrollX, y); }
+    finally {
+      if (y > 0 && window.scrollY !== y) window.scrollTo(window.scrollX, y);
+      ckScheduleRefresh();   // what the draw left on screen (the tab, the jobs) decides which moves are live
+    }
   }
 
-  window.LevainDashboard = { render: renderKeepingPlace, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
+  window.LevainAgentPage = { open: openAgentPage };
+  window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
+  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
 })();

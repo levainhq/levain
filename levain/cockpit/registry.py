@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Callable
 
 from levain.cockpit.results import RowIn
@@ -80,6 +80,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "undoable": ("bool", _is_bool),
     "crystal_level": ("int", _is_int),
     "permanence": ("str", _is_str),
+    "activation_mode": ("str", _is_str),
     "last_activated_on": ("date|null", _opt(_is_str)),
     "tags": ("list[str]", _is_str_list),
     "legacy_meta": ("str", _is_str),
@@ -112,6 +113,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "question_n": ("int", _is_int),
     "question_state": ("enum", _enum("open", "answered")),
     "question_options": ("int", _is_int),
+    "session_view": ("object", lambda v: isinstance(v, dict)),   # K7: what the Build tab's session row draws (the provider's own measures, no full cwd)
     "session_activity": ("enum", _enum("active", "quiet")),   # Q7a: how recently a session's hook last fired (the provider's measure)
 }
 
@@ -168,6 +170,22 @@ def parse_date(v: Any) -> date | None:
         return date.fromisoformat(m.group(0))
     except ValueError:
         return None
+
+
+def opened_day(v: Any) -> date | None:
+    """The one rule for "the day a spore was opened": the install's LOCAL calendar day of the stored instant (an ISO
+    timestamp with a zone, parsed and converted), a date-only or zone-less string as written, None when unusable. Every
+    server view that counts a spore's age calls this, so none can count from a different day."""
+    if not isinstance(v, str):
+        return None
+    if v and len(v) <= 40:
+        try:
+            t = datetime.fromisoformat(v[:-1] + "+00:00" if v.endswith("Z") else v)
+        except ValueError:
+            t = None
+        if t is not None and t.tzinfo is not None:
+            return t.astimezone().date()
+    return parse_date(v)
 
 
 def _salience(row: RowIn) -> int:
@@ -318,7 +336,7 @@ def register_ordering(o: Ordering, *, builtin: bool = False) -> None:
 register_ordering(
     Ordering(
         "spore.tray", _tray_order_key, _tray_group,
-        (("today", "Today"), ("overdue", "Overdue"), ("also", "Also pending")),
+        (("overdue", "Overdue"), ("today", "Today"), ("also", "Also pending")),   # overdue leads: what is late is read first
         frozenset({"today", "overdue"}),
     ),
     builtin=True,

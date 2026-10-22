@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -145,6 +146,17 @@ from tests.test_cockpit_flip_parity import _drive, needs_browser          # noqa
 from tests.test_cockpit_k2a import _install, _serve                        # noqa: E402
 
 TILE = "[...document.querySelectorAll('.ck-widgets .ck-card.w')].find(c => /^Decisions waiting/i.test(c.innerText))"
+# K4 moved the premise on purpose: while something waits, the Decisions tile takes the reader to the Needs-you strip and opens no
+# modal (test_cockpit_k4a_needs pins that). The history modal is then one click further, on the strip's "all decisions" button;
+# with nothing waiting there is no strip and the tile itself opens it.
+# The strip and the tile render on separate passes, so the helper first waits for the state to settle: the strip's button exists, or
+# the tile shows a zero count (nothing waits, so the tile itself opens the modal). The wait is bounded; a timeout falls through to
+# the click and the step after it fails on its own.
+OPEN_DECISIONS = ("(async () => { const find = () => document.querySelector('#ck-needs:not([hidden]) .needs-history');"
+                  " const tile = () => " + TILE + ";"
+                  " const settled = () => { const t = tile(); return !!find() || (!!t && /(^|\\D)0(\\D|$)/.test(t.innerText)); };"
+                  " for (let i = 0; i < 100 && !settled(); i++) await new Promise(r => setTimeout(r, 100));"
+                  " (find() || tile()).click(); return 1; })()")
 MARK_CMD, MARK_CWD = "zq-cmd-marker-7731", "/w/zq-cwd-marker-4419"
 
 
@@ -214,7 +226,7 @@ def test_the_page_draws_a_consent_request_as_text_with_a_countdown_and_copy_butt
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /1/.test({TILE}.innerText)"},
-            {"eval": f"{TILE}.click(); 1"},
+            {"eval": OPEN_DECISIONS},
             {"until": "document.querySelector('#levain-modal .consent-row .consent-code')"},
             {"eval": "(() => { const m = document.getElementById('levain-modal'); const row = m.querySelector('.consent-row');"
                      " return [row.querySelector('.consent-agent').textContent, row.querySelector('.consent-tool').textContent,"
@@ -252,26 +264,38 @@ def test_a_decided_row_has_a_details_button_and_a_malformed_body_releases_its_sl
     for n in ("p1", "p2"):
         q.file(agent="claude_code", agent_session_id="s", tool_name="Bash", tool_input={"command": "echo " + n},
                cwd="/w", hold=timedelta(minutes=5), event_id=n)
-    gone = q.file(agent="codex", agent_session_id="s", tool_name="Bash", tool_input={"command": "echo zq-decided-marker"},
-                  cwd="/w", hold=timedelta(minutes=5), event_id="p3")
-    q.withdraw(gone.id)
+    gone = []
+    for n in ("p3", "p4"):
+        g = q.file(agent="codex", agent_session_id="s", tool_name="Bash", tool_input={"command": "echo zq-decided-marker-" + n},
+                   cwd="/w", hold=timedelta(minutes=5), event_id=n)
+        q.withdraw(g.id)
+        gone.append(g.id)
     _root, src, _ids = _install(tmp_path)
-    # the first two body fetches answer 200 with an unreadable body; a freed slot lets the third (details) through
-    stub = ("(() => { const real = window.fetch.bind(window); let n = 0; window.fetch = (u, o) => String(u).includes('/cockpit/consent/') && !String(u).includes('/proposals.json') && n++ < 2"
-            " ? Promise.resolve({ ok: true, status: 200, json: () => Promise.reject(new Error('bad json')) }) : real(u, o); return 1; })()")
+    # The Needs-you strip already read the two waiting bodies and the modal reuses them, so the decided rows' own fetches are the
+    # ones to spoil: each answers its FIRST read with a 200 and an unreadable body. Both are triggered before either is retried, so a
+    # leaked slot would saturate the two-slot queue and the third read could never run. The page encodes the id in the route
+    # (the colons of a timestamp id), so the stub matches the encoded form.
+    stub = ("(() => { const real = window.fetch.bind(window); const ids = " + json.dumps(gone) + "; const seen = new Set();"
+            " window.fetch = (u, o) => { const id = ids.find(i => String(u).includes('/cockpit/consent/' + encodeURIComponent(i)));"
+            " if (id && !seen.has(id)) { seen.add(id); return Promise.resolve({ ok: true, status: 200, json: () => Promise.reject(new Error('bad json')) }); }"
+            " return real(u, o); }; return 1; })()")
+    rows = "[...document.querySelectorAll('#levain-modal .consent-row')].filter(x => x.querySelector('.consent-details'))"
+    tagged = "[...document.querySelectorAll('#levain-modal .consent-row[data-zq]')]"     # a read that succeeds removes its button
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /2/.test({TILE}.innerText)"},
             {"eval": stub},
-            {"eval": f"{TILE}.click(); 1"},
-            {"until": "document.querySelectorAll('#levain-modal .consent-row .consent-note').length >= 2"},
-            {"eval": "(() => { const r = [...document.querySelectorAll('#levain-modal .consent-row')].find(x => x.querySelector('.consent-details'));"
-                     " const before = !!r.querySelector('.consent-display'); r.querySelector('.consent-details').click(); return before; })()"},
-            {"until": "[...document.querySelectorAll('#levain-modal .consent-row')].some(r => r.querySelector('.consent-display'))"},
-            {"eval": "[...document.querySelectorAll('#levain-modal .consent-row')].filter(r => r.querySelector('.consent-display')).map(r => r.querySelector('.consent-display').textContent)"},
+            {"eval": OPEN_DECISIONS},
+            {"until": f"{rows}.length === 2"},
+            {"eval": f"(() => {{ const rs = {rows}; const before = rs.map(r => !!r.querySelector('.consent-display')); rs.forEach(r => {{ r.dataset.zq = '1'; r.querySelector('.consent-details').click(); }}); return before; }})()"},
+            {"until": f"{tagged}.length === 2 && {tagged}.every(x => x.querySelector('.consent-note') && x.querySelector('.consent-details') && !x.querySelector('.consent-details').disabled)"},
+            {"eval": f"(() => {{ {tagged}.forEach(r => r.querySelector('.consent-details').click()); return 1; }})()"},
+            {"until": f"{tagged}.length === 2 && {tagged}.every(r => r.querySelector('.consent-display'))"},
+            {"eval": f"{tagged}.map(r => r.querySelector('.consent-display').textContent)"},
         ])["values"]
-    assert out[-3] is False, out        # before the click the decided row had no body
-    assert any("zq-decided-marker" in t for t in out[-1])
+    assert out[-5] == [False, False], out        # before the click neither decided row had a body
+    assert not isinstance(out[-4], dict), out    # a timeout is a value, not a failure: both spoiled reads really drew their note
+    assert len(out[-1]) == 2 and all("zq-decided-marker" in t for t in out[-1]), out
 
 
 @needs_browser
@@ -282,23 +306,28 @@ def test_a_details_retry_after_a_failed_read_reuses_its_slot(tmp_path, monkeypat
     q.withdraw(gone.id)
     _root, src, _ids = _install(tmp_path)
     # the first body fetch answers 500, so "details" shows an error and re-enables; the retry reads the body
-    stub = ("(() => { const real = window.fetch.bind(window); let n = 0; window.fetch = (u, o) => String(u).includes('/cockpit/consent/') && !String(u).includes('/proposals.json') && n++ < 1"
-            " ? Promise.resolve({ ok: false, status: 500 }) : real(u, o); return 1; })()")
+    # the stub records the url it failed, so the test reads back WHICH fetch consumed the single failure
+    stub = ("(() => { const real = window.fetch.bind(window); let n = 0; window.__failed = []; window.fetch = (u, o) =>"
+            " String(u).includes('/cockpit/consent/') && !String(u).includes('/proposals.json') && n++ < 1"
+            " ? (window.__failed.push(String(u)), Promise.resolve({ ok: false, status: 500 })) : real(u, o); return 1; })()")
     row = "[...document.querySelectorAll('#levain-modal .consent-row')].find(x => x.querySelector('.consent-audit'))"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
-            {"until": f"{TILE} && /1/.test({TILE}.innerText)"},
+            {"until": TILE},                    # the one request is withdrawn, so nothing waits and the tile counts 0: it is the signal
             {"eval": stub},
-            {"eval": f"{TILE}.click(); 1"},
+            {"eval": OPEN_DECISIONS},
             {"until": f"{row} && {row}.querySelector('.consent-details')"},
             {"eval": f"{row}.querySelector('.consent-details').click(); 1"},
             {"until": f"{row}.querySelector('.consent-note') && !{row}.querySelector('.consent-details').disabled"},
             {"eval": f"{row}.querySelector('.consent-details').click(); 1"},
             {"until": f"{row}.querySelector('.consent-display')"},
             {"eval": f"[{row}.querySelectorAll('.consent-body').length, {row}.querySelector('.consent-display').textContent]"},
+            {"eval": "window.__failed"},
         ])["values"]
-    assert out[-1][0] == 1, out
-    assert "zq-retry-marker" in out[-1][1]
+    # the one failure was the withdrawn request's own body read (not a poll that got there first), so "details failed, then retried" held
+    assert len(out[-1]) == 1 and urllib.parse.quote(gone.id, safe="") in out[-1][0], out
+    assert out[-2][0] == 1, out
+    assert "zq-retry-marker" in out[-2][1]
 
 
 @needs_browser
@@ -318,7 +347,7 @@ def test_the_decisions_modal_carries_a_filter_that_narrows_by_agent_tool_and_sta
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /2/.test({TILE}.innerText)"},
-            {"eval": f"{TILE}.click(); 1"},
+            {"eval": OPEN_DECISIONS},
             {"until": "document.querySelector('#levain-modal .xfilter-input') && document.querySelector('#levain-modal .consent-row')"},
             {"eval": rows},
             {"eval": f"{typ}('apply_patch'); {rows}"},
@@ -347,12 +376,12 @@ def test_a_reopened_decisions_modal_starts_unfiltered_even_with_a_saved_query(tm
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /3/.test({TILE}.innerText)"},
-            {"eval": f"{TILE}.click(); 1"},
+            {"eval": OPEN_DECISIONS},
             {"until": ready},
             {"eval": f"{typ}('apply_patch'); {rows}"},
             {"eval": "document.querySelector('#levain-modal .modal-close, #levain-modal [aria-label=Close], #levain-modal button.x') ? (document.querySelector('#levain-modal .modal-close, #levain-modal [aria-label=Close], #levain-modal button.x').click(), 1) : (document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})), 2)"},
             {"until": "!document.querySelector('#levain-modal .consent-row')"},
-            {"eval": f"{TILE}.click(); 1"},
+            {"eval": OPEN_DECISIONS},
             {"until": ready},
             {"eval": rows},
         ])["values"]
@@ -372,7 +401,7 @@ def test_an_undecided_row_is_drawn_waiting_not_answered(tmp_path, monkeypatch):
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /1/.test({TILE}.innerText)"},
-            {"eval": f"{TILE}.click(); 1"},
+            {"eval": OPEN_DECISIONS},
             {"until": row},
             {"eval": f"[{row}.className, {row}.querySelector('.consent-head').textContent]"},
         ])["values"]

@@ -37,6 +37,24 @@ _SHELL_TOOLS = frozenset({"Bash", "shell", "exec_command", "shell_command", "loc
 _PATCH_HEADER = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$", re.MULTILINE)
 
 
+# An apply_patch can touch many files: every path is logged, one per line (the first after `apply_patch: `, as a one-file patch
+# always was, so an older reader still sees the first), at most _PATCH_PATHS_MAX of them and about _PATCH_TEXT_BUDGET characters
+# (the log cuts a line at _LOG_TEXT_MAX and a cut line names no whole path). The rest are counted, never silently dropped.
+_PATCH_PATHS_MAX = 32
+_PATCH_TEXT_BUDGET = 3500
+
+
+def _patch_summary(paths) -> str:
+    kept, used = [], 0
+    for p in paths[:_PATCH_PATHS_MAX]:
+        if kept and used + len(p) + 1 > _PATCH_TEXT_BUDGET:
+            break
+        kept.append(p)
+        used += len(p) + 1
+    rest = len(paths) - len(kept)
+    return "\n".join(kept) + (f"\n(+{rest} more)" if rest else "")
+
+
 def _summary(tool_name, tool_input) -> str | None:
     if not isinstance(tool_input, dict):
         return None
@@ -44,9 +62,9 @@ def _summary(tool_name, tool_input) -> str | None:
     if tool_name in _SHELL_TOOLS and isinstance(command, str) and command.strip():
         return command.strip().splitlines()[0]
     if tool_name == "apply_patch" and isinstance(command, str):
-        m = _PATCH_HEADER.search(command)
-        if m and m.group(1):
-            return m.group(1)
+        paths = [p for p in _PATCH_HEADER.findall(command) if p]
+        if paths:
+            return _patch_summary(paths)
     for key in ("file_path", "notebook_path"):
         path = tool_input.get(key)
         if isinstance(path, str) and path:

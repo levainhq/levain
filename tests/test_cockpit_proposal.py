@@ -211,7 +211,7 @@ def test_the_route_serves_the_cards_only_with_the_write_token(seed, monkeypatch)
     assert body["proposals"][0]["command"].startswith("levain consent grant create --agent claude_code ")
 
 
-from tests.test_cockpit_consent_rows import TILE  # noqa: E402
+from tests.test_cockpit_consent_rows import OPEN_DECISIONS, TILE  # noqa: E402
 from tests.test_cockpit_flip_parity import _drive, needs_browser  # noqa: E402
 from tests.test_cockpit_k2a import _install, _serve  # noqa: E402
 
@@ -230,7 +230,7 @@ def test_the_page_draws_the_card_as_text_with_a_copy_button_and_signs_nothing(tm
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
-            {"until": TILE}, {"eval": f"{TILE}.click(); 1"},
+            {"until": TILE}, {"eval": OPEN_DECISIONS},
             {"until": f"{_CARDS}.length === 1"},
             {"eval": f"[{_CARDS}[0].querySelector('.consent-code').textContent, !!{_CARDS}[0].querySelector('.consent-copy'),"
                      f" !!window.__pwned, {_CARDS}[0].querySelectorAll('img').length]"},
@@ -253,7 +253,7 @@ def test_a_page_without_its_token_draws_no_card(tmp_path, monkeypatch):
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/", [
-            {"until": TILE}, {"eval": f"{TILE}.click(); 1"},
+            {"until": TILE}, {"eval": OPEN_DECISIONS},
             {"until": "document.querySelectorAll('#levain-modal .consent-row').length >= 1"},
             {"eval": "new Promise(r => setTimeout(() => r(document.querySelectorAll('#levain-modal [data-consent-proposal]').length), 1500))"},
         ])
@@ -365,7 +365,7 @@ def test_f1_a_page_with_only_old_history_shows_the_card(tmp_path, monkeypatch):
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
-            {"until": TILE}, {"eval": f"{TILE}.click(); 1"},
+            {"until": TILE}, {"eval": OPEN_DECISIONS},
             {"until": f"{_CARDS}.length === 1"},
             {"eval": f"{_CARDS}[0].querySelector('.consent-code').textContent"},
         ])
@@ -387,12 +387,12 @@ def test_f6_a_rejected_read_is_not_cached_for_thirty_seconds(tmp_path, monkeypat
             {"eval": "(() => { const f = window.fetch; let n = 0; window.__calls = 0; window.fetch = function (u, o) {"
                      " if (String(u).includes('proposals.json')) { window.__calls++; if (n++ === 0) return Promise.reject(new TypeError('boom')); }"
                      " return f.apply(this, arguments); }; return 1; })()"},
-            {"eval": f"{TILE}.click(); 1"},
+            {"eval": OPEN_DECISIONS},
             {"until": "window.__calls >= 1"},
             {"eval": "new Promise(r => setTimeout(() => r(1), 800))"},
             {"eval": "document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); 1"},
             {"eval": "new Promise(r => setTimeout(() => r(1), 500))"},
-            {"eval": f"{TILE}.click(); 1"},
+            {"eval": OPEN_DECISIONS},
             {"until": f"{_CARDS}.length === 1"},
             {"eval": "window.__calls"},
         ])
@@ -412,7 +412,7 @@ def test_f7_the_cards_follow_the_live_requests_and_precede_the_resolved(tmp_path
     heads = "[...document.querySelectorAll('#levain-modal .ext-grouphead')].map(h => h.textContent.trim().toLowerCase())"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
-            {"until": TILE}, {"eval": f"{TILE}.click(); 1"},
+            {"until": TILE}, {"eval": OPEN_DECISIONS},
             {"until": f"{_CARDS}.length === 1"},
             {"eval": heads},
         ])
@@ -436,7 +436,7 @@ def test_g1_filtering_then_clearing_then_show_all_keeps_the_cards(tmp_path, monk
     pause = "new Promise(r => setTimeout(() => r(1), 700))"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
-            {"until": TILE}, {"eval": f"{TILE}.click(); 1"},
+            {"until": TILE}, {"eval": OPEN_DECISIONS},
             {"until": f"{_CARDS}.length === 1"},
             {"eval": typed % "zzz-nothing-matches"}, {"eval": pause},
             {"eval": typed % ""}, {"eval": pause},
@@ -527,14 +527,14 @@ def test_a_dashboard_reload_drops_the_cached_proposals(tmp_path, monkeypatch):
             {"until": TILE},
             {"eval": "(() => { const f = window.fetch; window.__calls = 0; window.fetch = function (u, o) {"
                      " if (String(u).includes('proposals.json')) window.__calls++; return f.apply(this, arguments); }; return 1; })()"},
-            {"eval": f"{TILE}.click(); 1"}, {"until": f"{_CARDS}.length === 1"},
+            {"eval": OPEN_DECISIONS}, {"until": f"{_CARDS}.length === 1"},
             {"eval": esc}, {"eval": wait},
-            {"eval": f"{TILE}.click(); 1"}, {"until": f"{_CARDS}.length === 1"},
+            {"eval": OPEN_DECISIONS}, {"until": f"{_CARDS}.length === 1"},
             {"eval": "window.__calls"},                                   # a fresh open reads again
             {"eval": esc}, {"eval": wait},
             {"eval": "window.LevainCockpitTransport.reload().then(() => 1)"},
             {"eval": wait},
-            {"eval": f"{TILE}.click(); 1"}, {"until": f"{_CARDS}.length === 1"},
+            {"eval": OPEN_DECISIONS}, {"until": f"{_CARDS}.length === 1"},
             {"eval": "window.__calls"},                                   # after a reload: read again
         ])
     v = out["values"]

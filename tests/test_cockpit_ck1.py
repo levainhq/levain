@@ -41,8 +41,8 @@ def _refused(kind: str, value: Any, *needles: str, **kw: Any) -> None:
     assert "'p'" in p["error"]       # the panel id is named
 
 
-def test_the_eleven_kinds_and_the_four_aliases() -> None:
-    assert len(KINDS) == 11 and len(set(KINDS)) == 11
+def test_the_twelve_kinds_and_the_four_aliases() -> None:
+    assert len(KINDS) == 12 and len(set(KINDS)) == 12
     assert ALIASES == {"triage-list": "list", "metric": "status-dots", "visual": "ambient", "prose": "brief"}
     assert set(ALIASES.values()) <= set(KINDS)
     assert SCHEMA == "levain.cockpit/2"

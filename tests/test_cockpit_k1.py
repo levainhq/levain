@@ -570,8 +570,8 @@ class TestOrderingAndGroups:
         p = ck.panel("tray")
         by_group = {r["id"]: r["group"] for r in p["rows"]}
         assert by_group == {"spore:spore-003": "today", "spore:spore-002": "overdue"}
-        assert [g["id"] for g in p["groups"]] == ["today", "overdue", "also"]
-        assert [r["group"] for r in p["rows"]] == ["today", "overdue"]  # group order leads
+        assert [g["id"] for g in p["groups"]] == ["overdue", "today", "also"]
+        assert [r["group"] for r in p["rows"]] == ["overdue", "today"]  # group order leads
         assert all(r["band"] == "now" for r in p["rows"])
 
     def test_overdue_is_ordered_most_overdue_first_and_providers_do_not_sort(self) -> None:
@@ -979,8 +979,8 @@ class TestNowGroups:
     def test_the_now_head_carries_the_union_of_its_sources_groups_counted(self, env) -> None:
         _r, _s, ck = env
         now = ck.panel(NOW_ID)
-        assert [g["id"] for g in now["groups"]] == ["today", "overdue", "also"]
-        assert [g["title"] for g in now["groups"]][:2] == ["Today", "Overdue"]
+        assert [g["id"] for g in now["groups"]] == ["overdue", "today", "also"]
+        assert [g["title"] for g in now["groups"]][:2] == ["Overdue", "Today"]
         by = {g["id"]: g["count"] for g in now["groups"]}
         assert by == {"today": 1, "overdue": 1, "also": 0} and sum(by.values()) == now["count"]
         assert ck.manifest(NONE_CRED)["panels"][NOW_ID]["groups"] == now["groups"]
@@ -1019,7 +1019,7 @@ class TestSession2Freshness:
 
     def test_freshness_reads_error_for_a_failing_panel(self, env) -> None:
         root, _s, ck = env
-        (root / ".levain" / "memory.spores.json").unlink()
+        (root / ".levain" / "memory.spores.json").write_text("{not json")     # present and unreadable: a real fault (an absent store is empty)
         ck.manifest(NONE_CRED)
         assert ck.freshness()["tray"]["status"] == "error"
 
@@ -1091,10 +1091,11 @@ class TestSession2Gaps:
         _r, _s, ck = env
         heads = ck.manifest(NONE_CRED)["panels"]
         assert {k: v["edit_class"] for k, v in heads.items() if not k.startswith(("section:", "config:"))} == {
-            "now": None, "state": None, "tray": "B", "loops": "B", "keep": "B",
+            "now": None, "state": None, "begin": "C", "tray": "B", "loops": "B", "keep": "B",
             "episodes": "B", "edits": None, "jobs": None, "health": "C", "graph": "C",
-            "crystals": "C", "wraps": "C", "team-status": None, "sessions": None,      # the Team zone's one card: this install root has no team ledger
-            "notifications": None}
+            "crystals": "C", "wraps": "C", "team-status": None, "sessions": None,
+            "activity": "C", "memory_glance": "C", "doctor": "C", "topology": "C",
+            "notifications": None}      # the Team zone's one card: this install root has no team ledger
         sections = {k: v["edit_class"] for k, v in heads.items() if k.startswith(("section:", "config:"))}
         assert sections and all(c in ("A", "B", "C") for c in sections.values())
 
@@ -1111,6 +1112,17 @@ class TestSession2CompactNow:
         for r in now["rows"]:
             assert tray[r["id"]]["version"] == r["version"] and tray[r["id"]]["group"] == r["group"]
         assert now["count"] == full["count"]
+
+
+class TestK6CrystalMode:
+    def test_a_crystal_row_carries_its_activation_mode_to_the_page(self, env) -> None:
+        """The Memory tab draws a crystal's mode (K6 r3, codex): the row must carry it as a facet, not only in stored."""
+        root, _s, ck = env
+        (root / ".levain" / "memory.crystal.json").write_text(
+            '{"crystal": [{"name": "good", "status": "crystallized", "level": 2, "explanation": "x",'
+            ' "activation_mode": "always", "permanence": "permanent"}]}')
+        rows = ck.panel("crystals")["rows"]
+        assert [r["facets"].get("activation_mode") for r in rows] == ["always"]
 
 
 class TestL3R4Fixes:
