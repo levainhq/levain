@@ -45,3 +45,28 @@ def test_a_reader_that_raises_or_returns_no_events_list_is_a_failed_read(tmp_pat
         for stem in ("boom", "noevents"):
             status, blob = _get(f"{url}/cockpit/session/{stem}.json", "T")
             assert status == 500 and b"zq-reader-exploded" not in blob and b"not a list" not in blob
+
+
+class _Shifting(dict):
+    """A reader-owned dict that changes after its first serialization (json reads a dict subclass via items())."""
+
+    reads = 0
+
+    def items(self):
+        self.reads += 1
+        if self.reads == 1:
+            return super().items()
+        return {**dict(super().items()), "events": [object()]}.items()
+
+
+def test_a_reader_body_is_serialized_once_so_a_later_change_never_drops_the_connection(tmp_path):
+    held: list[_Shifting] = []
+
+    def reader(stem, now):
+        held.append(_Shifting(BODY))
+        return held[-1]
+
+    _root, src, _ids = _install(tmp_path)
+    with _serve(dataclasses.replace(src, session_reader=reader), surface_tokens={"browser": "T"}) as (url, _h):
+        status, blob = _get(f"{url}/cockpit/session/{UUID}.json", "T")
+    assert status == 200 and json.loads(blob) == BODY and held[-1].reads == 1

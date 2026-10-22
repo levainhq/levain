@@ -945,6 +945,7 @@ class _Handler(GuardedHandler):
             return
         stem = path[len(_SESSION_LOG_PREFIX):-len(_SESSION_LOG_SUFFIX)]
         status, payload = 404, {"error": "not_found", "message": "no such session recorded"}
+        blob: bytes | None = None     # a host reader's body, serialized once; the reader owns the object, not us
         source = self.server.levain_source
         root = source.install_root
         reader = getattr(source, "session_reader", None)
@@ -956,12 +957,15 @@ class _Handler(GuardedHandler):
                     self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
                     return
                 try:
+                    # The reader runs inside the request gate, as read_session does, so a host reader must be bounded.
                     body = reader(stem, datetime.now(timezone.utc))
                     if body is not None:
                         if not isinstance(body, dict) or not isinstance(body.get("events"), list):
                             raise TypeError("a session reader's body must be a dict whose events is a list")
-                        json.dumps(body)     # a body that cannot go out is a failed read, answered here
-                        status, payload = 200, body
+                        # These bytes are what goes out: the object may change after this, and NaN or Infinity
+                        # would make a body a browser's JSON.parse rejects. Either failure is a failed read.
+                        blob = json.dumps(body, allow_nan=False).encode("utf-8")
+                        status = 200
                 except Exception as exc:  # noqa: BLE001 - a log that cannot be read is an answer, never a dead connection
                     _log.warning("session transcript read failed: %s: %s", type(exc).__name__, exc)
                     status, payload = 500, {"error": "internal", "message": "the session's transcript could not be read"}
@@ -982,7 +986,9 @@ class _Handler(GuardedHandler):
                 status, payload = 500, {"error": "internal", "message": "the session's transcript could not be read"}
             finally:
                 self.server.request_gate.release()
-        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+        if blob is None:
+            blob = json.dumps(payload).encode("utf-8")
+        self._send(blob, "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
     def _acquire_read_slot(self) -> bool:
