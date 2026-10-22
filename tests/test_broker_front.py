@@ -578,9 +578,20 @@ def test_a_decided_keys_answer_is_not_lost_to_a_later_slot_exit():
 
             fw.drain = held_drain
             run = asyncio.ensure_future(ex.run())
-            await asyncio.sleep(0.3)   # the relay holds `R`; the queue is full of `b`; keys' reader holds the `e`
+            async def until(cond, what):   # a bounded wait on a stated condition; the failure says what it saw
+                loop = asyncio.get_running_loop()
+                end = loop.time() + 10
+                while not cond():
+                    if loop.time() > end:
+                        raise AssertionError(f"timed out waiting for {what}: decoded={ex._decoded} taken={ex._taken} "
+                                             f"slot_done={[t.done() for t in ex._slot]}")
+                    await asyncio.sleep(0.01)
+
+            # the relay holds `R`; the queue is full of `b`; keys' reader has decoded the `e` and is blocked putting it
+            # (`A`, `R`, every `b` and the `e`: the count the reader decoded)
+            await until(lambda: ex._decoded >= len(chunks) + 3, "keys' `e` to be decoded")
             sw.write_eof()             # the slot closes mid-body: the body writer ends "slot-eof"
-            await asyncio.sleep(0.3)
+            await until(lambda: ex._slot and all(t.done() for t in ex._slot), "the slot task to exit")
             gate.set()
             await asyncio.wait_for(run, 5)
             fw.close()
