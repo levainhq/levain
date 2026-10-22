@@ -7,7 +7,9 @@ line on fd 4.
 Steps built here (5b1): 0, spool every frame into one append-only file and validate the terminal frame before any git
 command runs; 1, the base objects from ``in/repo.bundle``; 2, the session's own objects, loose ones name-verified and
 packs re-indexed by ``index-pack``, every other ``.git/`` path ignored and counted. Step 3 (5b2): the session's refs,
-parsed as data, under ``refs/levain/<s>/``. Steps 4-6 (the WIP commit, ``fsck``, the bundle) are not built yet.
+parsed as data, under ``refs/levain/<s>/``. Step 4: the worktree's blobs written by the importer itself, one commit of
+them as ``refs/levain/<s>/wip``. Step 5: ``fsck --strict``, then the explicit ``no-ref`` check. Step 6 (the result,
+the pack, the bundle) is not built yet.
 
 Also here: the root-written ``repo.git`` config for both object formats (:func:`render_config`), the skeleton root
 makes at seal-in (:func:`make_skeleton`), and the environment and argv every importer git runs under.
@@ -35,7 +37,7 @@ import time
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO, Iterator, Sequence
+from typing import BinaryIO, Iterable, Iterator, Sequence
 
 from levain.contracts import canon
 from levain.slot import Refused, bundlefmt, fsck_ids, walker, walkframe, write_all
@@ -274,15 +276,23 @@ class GitRunner:
     log: BinaryIO | None = None
     started: list[list[str]] = field(default_factory=list)
 
-    def run(self, *args: str, stdin: tuple[Spool, int, int] | bytes | None = None) -> tuple[int, str, str]:
-        """``stdin``: a spool slice streamed in chunks, or bytes the importer itself built (never session bytes)."""
+    def run(self, *args: str, stdin: tuple[Spool, int, int] | bytes | None = None,
+            env: dict[str, str] | None = None) -> tuple[int, str, str]:
+        """``stdin``: a spool slice streamed in chunks, or bytes the importer itself built from data it parsed.
+        ``env``: keys added to :func:`git_env` (the WIP's index file and ident), never replacing one of its own."""
         argv = git_argv(self.git, self.work, *args)
         self.started.append(argv)
         if self.log is not None:
             self.log.write((" ".join(argv) + "\n").encode("utf-8", "replace"))
             self.log.flush()
-        p = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin else subprocess.DEVNULL, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, env=git_env(self.work), cwd=str(self.work), close_fds=True)
+        child_env = git_env(self.work)
+        if env:
+            if set(env) & set(child_env):
+                raise ValueError(f"env would replace {sorted(set(env) & set(child_env))}")
+            child_env.update(env)
+        p = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, env=child_env, cwd=str(self.work), close_fds=True)
         out: list[bytes] = []
         err: list[bytes] = []
         started: list[threading.Thread] = []
@@ -320,8 +330,9 @@ class GitRunner:
                 t.join()
         return rc, b"".join(out).decode("utf-8", "replace"), b"".join(err).decode("utf-8", "replace")
 
-    def must(self, *args: str, stdin: tuple[Spool, int, int] | bytes | None = None) -> str:
-        rc, out, err = self.run(*args, stdin=stdin)
+    def must(self, *args: str, stdin: tuple[Spool, int, int] | bytes | None = None,
+             env: dict[str, str] | None = None) -> str:
+        rc, out, err = self.run(*args, stdin=stdin, env=env)
         if rc != 0:
             last = (err.strip().splitlines() or [""])[-1]
             raise Fatal(None, f"git {args[0]} rc {rc}: {last[:300]}")
@@ -478,15 +489,21 @@ def install_loose(objects: Path, oid: str, spool: Spool, f: Frame, object_format
             os.fsync(fd)
         finally:
             os.close(fd)
-        try:
-            os.link(tmp, final, follow_symlinks=False)
-        except FileExistsError:
-            if not _same_object(final, oid, object_format):
-                raise Fatal("export-object-collision", f"{oid} is present with other bytes") from None
-        finally:
-            os.unlink(tmp)
+        _link_final(tmp, final, oid, object_format)
     except OSError as e:
         raise _oserror(e, f"writing loose object {oid}") from None
+
+
+def _link_final(tmp: Path, final: Path, oid: str, object_format: str) -> None:
+    """``link()`` a written, fsynced temp to its final loose name, then unlink the temp. An existing final name counts
+    as present only if it inflates and hashes to ``oid`` (``export-object-collision``, S7)."""
+    try:
+        os.link(tmp, final, follow_symlinks=False)
+    except FileExistsError:
+        if not _same_object(final, oid, object_format):
+            raise Fatal("export-object-collision", f"{oid} is present with other bytes") from None
+    finally:
+        os.unlink(tmp)
 
 
 def _same_object(path: Path, oid: str, object_format: str) -> bool:
@@ -612,6 +629,29 @@ def parse_packed_refs(spool: Spool, f: Frame, object_format: str) -> dict[bytes,
     return out
 
 
+def conflict_pair(names: Iterable[bytes]) -> tuple[bytes, bytes] | None:
+    """The first name (in ``names`` order) that is also a DIRECTORY of another name, as ``(name, the other)``:
+    ``a`` and ``a/b`` cannot both exist as refs, nor as index paths. One trie of ``/``-components, so the cost is the
+    names' total length whatever their depth. Equal names are not a conflict (the caller's names are unique)."""
+    root: dict = {}
+    for name in names:
+        node = root
+        parts = name.split(b"/")
+        for i, part in enumerate(parts):
+            if None in node:  # a name already given ends here: it is a directory of this one
+                return b"/".join(parts[:i]), name
+            node = node.setdefault(part, {})
+        if any(k is not None for k in node):  # this name is a directory of one already given
+            longer = [name]
+            while None not in node:
+                k = next(k for k in node if k is not None)
+                longer.append(k)
+                node = node[k]
+            return name, b"/".join(longer)
+        node[None] = True
+    return None
+
+
 def _resolve_head(head: RefValue | None, refs: dict[bytes, RefValue]) -> str | None:
     """HEAD's oid: its own (detached), or the branch it names followed through symbolic branches. A branch that is
     not there (unborn) is no head. A chain that comes back to a name it passed is ``ref-head-loop``."""
@@ -632,15 +672,17 @@ def _resolve_head(head: RefValue | None, refs: dict[bytes, RefValue]) -> str | N
 
 
 def import_refs(runner: GitRunner, spool: Spool, frames: Sequence[Frame], *, object_format: str,
-                session: str) -> None:
+                session: str) -> str | None:
     """Step 3: the session's ``HEAD``, loose ``refs/heads/**`` and ``packed-refs``, parsed as data (never by a git
     reading the session's ``.git``). A reftable store (any ``reftable`` path) is ``refs-format-unsupported``: its refs
     are not in these files. A loose ref overrides a packed one of the same name, as in git. Then, in this order: more
     than :data:`REFS_CAP` branches = ``refs-cap``; the reserved name = ``ref-reserved:<name>``; a HEAD loop =
-    ``ref-head-loop``; each name through ``check-ref-format`` (``ref-name-bad:<escaped>``); every oid in the store
+    ``ref-head-loop``; each name through ``check-ref-format`` (``ref-name-bad:<escaped>``); two imported branches where
+    one is a directory of the other (``a`` and ``a/b``, packed or loose) = ``ref-conflict:<escaped shorter name>``, by
+    name before any ref is written (``update-ref`` would refuse the pair without naming it); every oid in the store
     (``ref-object-missing``); then ONE ``update-ref --stdin -z`` transaction creating ``refs/levain/<s>/heads/<name>``
     for each branch holding an oid and ``refs/levain/<s>/head`` for HEAD's oid. A symbolic branch is followed for HEAD
-    only, never imported as a ref of its own."""
+    only, never imported as a ref of its own. Returns HEAD's oid, or ``None`` when HEAD resolves to no oid."""
     loose: dict[bytes, RefValue] = {}
     packed: dict[bytes, str] = {}
     head: RefValue | None = None
@@ -682,11 +724,15 @@ def import_refs(runner: GitRunner, spool: Spool, frames: Sequence[Frame], *, obj
         if rc != 0:
             raise _ref_bad(name, "refused by check-ref-format")
     want = [(name, v.oid) for name, v in sorted(refs.items()) if v.oid is not None]
+    pair = conflict_pair(name for name, _oid in want)
+    if pair is not None:
+        raise Fatal(f"ref-conflict:{walker.escape(pair[0])}",
+                    f"{walker.escape(pair[0])} is also a directory of {walker.escape(pair[1])}")
     if head_oid is not None:
         want.append((b"HEAD", head_oid))
     oids = sorted({oid for _name, oid in want})
     if not oids:
-        return
+        return None
     # One type per line: a present object answers at most 7 bytes, so the whole answer stays inside the reader's
     # kept head, and the first missing line is always read whole.
     out = runner.must("cat-file", "--batch-check=%(objecttype)", stdin="".join(o + "\n" for o in oids).encode())
@@ -704,6 +750,178 @@ def import_refs(runner: GitRunner, spool: Spool, frames: Sequence[Frame], *, obj
     if head_oid is not None:
         txn += b"create " + base + b"head\0" + head_oid.encode("ascii") + b"\0"
     runner.must("update-ref", "--stdin", "-z", stdin=txn)
+    return head_oid
+
+
+# --- step 4: the worktree commit ----------------------------------------------------------------------------------
+
+#: The WIP commit's author and committer: fixed, never the session's or the host's configuration.
+WIP_IDENT = ("Levain", "levain@localhost")
+#: The temp index's name under ``.work/spool/``.
+WIP_INDEX = "wip-index"
+_REPO = walkframe.PRUNE_SCOPE_PREFIX[0] + b"/"
+_INDEX_ENTRY_FIXED = 40  # the ctime .. size words of an on-disk index entry, before its oid
+
+
+def worktree_entries(frames: Sequence[Frame]) -> list[tuple[bytes, int, Frame]]:
+    """The worktree as index entries ``(path, mode, frame)``: every ``file`` and ``link`` frame under ``repo/``, its
+    path relative to ``repo/``, minus the session's own git directory (a first component that IS ``.git``) and minus
+    every skipped nested repo whole (a directory holding a ``skipped-git`` frame: nothing below it is the session's
+    worktree, as ``git add`` would not add its files). A ``link`` is 120000; a ``file`` is 100755 when any execute bit
+    is set, else 100644. Directories, special files and ``unread`` placeholders carry no index entry."""
+    nested: dict = {}
+    for f in frames:
+        if f.type == "skipped-git" and f.path.startswith(_REPO):
+            node = nested
+            for part in f.path[len(_REPO):].split(b"/")[:-1]:
+                node = node.setdefault(part, {})
+            node[None] = True
+    out: list[tuple[bytes, int, Frame]] = []
+    for f in frames:
+        if f.type not in walkframe.PAYLOAD_TYPES or not f.path.startswith(_REPO):
+            continue
+        rel = f.path[len(_REPO):]
+        parts = rel.split(b"/")
+        if walker.is_git_name(parts[0]):
+            continue
+        node = nested
+        skipped = False
+        for part in parts[:-1]:
+            node = node.get(part)
+            if node is None:
+                break
+            if None in node:
+                skipped = True
+                break
+        if skipped:
+            continue
+        mode = 0o120000 if f.type == "link" else (0o100755 if f.mode & 0o111 else 0o100644)
+        out.append((rel, mode, f))
+    return out
+
+
+def write_blob(objects: Path, spool: Spool, f: Frame, object_format: str, written: set[str]) -> str:
+    """One worktree payload as a loose blob, by the importer itself (no git per blob, no filter): hash
+    ``blob <len>\\0<payload>`` from the spool, then, unless this run already wrote that oid, deflate it into a temp
+    name in its directory (``O_CREAT|O_EXCL``), fsync, and :func:`_link_final` it (the S7 rule for a name already
+    there). Returns the oid."""
+    hasher = FORMATS[object_format][1]()
+    header = b"blob %d\0" % f.size
+    hasher.update(header)
+    for chunk in spool.chunks(f.offset, f.size):
+        hasher.update(chunk)
+    oid = hasher.hexdigest()
+    if oid in written:
+        return oid
+    d = objects / oid[:2]
+    try:
+        d.mkdir(mode=0o700, exist_ok=True)
+        tmp = d / f"tmp_{oid[2:]}_{os.getpid()}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o444)
+        try:
+            z = zlib.compressobj()
+            write_all(fd, z.compress(header))
+            for chunk in spool.chunks(f.offset, f.size):
+                write_all(fd, z.compress(chunk))
+            write_all(fd, z.flush())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        _link_final(tmp, d / oid[2:], oid, object_format)
+    except OSError as e:
+        raise _oserror(e, f"writing blob {oid}") from None
+    written.add(oid)
+    return oid
+
+
+def _index_paths(data: bytes, object_format: str) -> Iterator[bytes]:
+    """The paths of an on-disk version-2 index (git wrote it from the importer's own lines): each entry is the fixed
+    stat words, the oid, two flag bytes, the NUL-terminated path, padded to a multiple of eight."""
+    raw = FORMATS[object_format][0] // 2
+    count = int.from_bytes(data[8:12], "big")
+    pos = 12
+    for _ in range(count):
+        start = pos + _INDEX_ENTRY_FIXED + raw + 2
+        end = data.index(b"\0", start)
+        yield data[start:end]
+        pos += (_INDEX_ENTRY_FIXED + raw + 2 + (end - start) + 8) & ~7
+
+
+def write_wip(runner: GitRunner, spool: Spool, frames: Sequence[Frame], *, object_format: str, session: str,
+              head_oid: str | None, base_oid: str) -> str | None:
+    """Step 4: every worktree blob written (:func:`write_blob`); the entries into a fresh temp index by ONE
+    ``update-index -z --index-info``; ``write-tree``; ``commit-tree`` on the parent (``refs/levain/<s>/head`` when
+    step 3 made it, else the base) with :data:`WIP_IDENT`; ``refs/levain/<s>/wip`` created only when the tree differs
+    from the parent's. Returns the wip oid or ``None``.
+
+    ``update-index --index-info`` refuses nothing: a path ``verify_path`` rejects (a ``.git`` in any HFS or NTFS
+    spelling, a ``.gitmodules`` symlink) is dropped with a warning and exit 0, and of a file/directory pair the later
+    line silently wins. So the importer checks the pair itself first, and after it reads the index's own entry count
+    against the entries it fed; either failure = ``wip-path-refused:<escaped path>``, the path found in the importer's
+    own data or in the index git wrote, never in git's stderr."""
+    entries = worktree_entries(frames)
+    pair = conflict_pair(rel for rel, _m, _f in entries)
+    if pair is not None:
+        raise Fatal(f"wip-path-refused:{walker.escape(pair[0])}",
+                    f"{walker.escape(pair[0])} is a file and a directory of {walker.escape(pair[1])}")
+    objects = runner.work / "repo.git" / "objects"
+    written: set[str] = set()
+    lines = bytearray()
+    for rel, mode, f in entries:
+        oid = write_blob(objects, spool, f, object_format, written)
+        lines += b"%o %s\t%s\0" % (mode, oid.encode("ascii"), rel)
+    index = runner.work / "spool" / WIP_INDEX
+    if os.path.lexists(index):
+        raise Fatal(None, "the WIP index exists before step 4")
+    ienv = {"GIT_INDEX_FILE": str(index)}
+    runner.must("update-index", "--index-version=2", "-z", "--index-info", stdin=bytes(lines), env=ienv)
+    try:
+        data = index.read_bytes() if entries else b""
+    except OSError as e:
+        raise _oserror(e, "reading the WIP index") from None
+    if entries:
+        if data[:4] != b"DIRC" or int.from_bytes(data[4:8], "big") != 2:
+            raise Fatal(None, "the WIP index is not a version-2 index")
+        if int.from_bytes(data[8:12], "big") != len(entries):
+            present = set(_index_paths(data, object_format))
+            first = next((rel for rel, _m, _f in entries if rel not in present), b"")
+            raise Fatal(f"wip-path-refused:{walker.escape(first)}",
+                        f"update-index kept {len(present)} of {len(entries)} paths")
+    tree = runner.must("write-tree", env=ienv).strip()
+    parent = head_oid if head_oid is not None else base_oid
+    kind = runner.must("cat-file", "-t", parent).strip()
+    if kind != "commit":
+        raise Fatal(None, f"the WIP parent {parent} is a {kind[:20]}, not a commit")
+    if runner.must("rev-parse", "--verify", f"{parent}^{{tree}}").strip() == tree:
+        return None
+    when = f"{int(time.time())} +0000"
+    name, email = WIP_IDENT
+    cenv = {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email, "GIT_AUTHOR_DATE": when,
+            "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email, "GIT_COMMITTER_DATE": when}
+    wip = runner.must("commit-tree", tree, "-p", parent, "-m", f"levain: the worktree of {session}", env=cenv).strip()
+    runner.must("update-ref", "--stdin", "-z",
+                stdin=f"create refs/levain/{session}/wip\0{wip}\0".encode("ascii"))
+    return wip
+
+
+# --- step 5: fsck and the no-ref check ----------------------------------------------------------------------------
+
+_FSCK_LINE = re.compile(r"^(?:error|warning) in [a-z]+ [0-9a-f]+: ([A-Za-z]+):", re.MULTILINE)
+
+
+def check_store(runner: GitRunner, *, session: str) -> None:
+    """Step 5: ``fsck --strict --no-dangling`` over every object in the store; non-zero = ``fsck:<id>``, the id of its
+    first ``error|warning in <type> <oid>: <id>:`` line matched against :func:`fsck_ids.closed_ids`, else
+    ``fsck:other``. Then the explicit no-ref check: fsck exits 0 on a store with no ref at all, so a store with no ref
+    under ``refs/levain/<s>/`` after steps 3 and 4 is refused ``no-ref`` by its own name."""
+    rc, out, err = runner.run("fsck", "--strict", "--no-dangling")
+    if rc != 0:
+        m = _FSCK_LINE.search(err) or _FSCK_LINE.search(out)
+        found = m.group(1) if m is not None else None
+        ident = found if found in fsck_ids.closed_ids() else "other"
+        raise Fatal(f"fsck:{ident}", f"fsck rc {rc}, first id line: {found or 'none'}"[:300])
+    if not runner.must("for-each-ref", "--count=1", "--format=%(refname)", f"refs/levain/{session}/").strip():
+        raise Fatal("no-ref", f"no ref under refs/levain/{session}/ after the refs and worktree steps")
 
 
 # --- the result line and the run ----------------------------------------------------------------------------------
@@ -835,7 +1053,10 @@ def run(argv: Sequence[str], *, stdin: BinaryIO | None, result_fd: int, work: Pa
                         cap=a.max_input_size)
             progress.ignored_git_paths = ingest_objects(runner, spool, frames, object_format=a.object_format,
                                                         cap=a.max_input_size)
-            import_refs(runner, spool, frames, object_format=a.object_format, session=a.session)
+            head_oid = import_refs(runner, spool, frames, object_format=a.object_format, session=a.session)
+            write_wip(runner, spool, frames, object_format=a.object_format, session=a.session, head_oid=head_oid,
+                      base_oid=a.base_oid)
+            check_store(runner, session=a.session)
             out.update(rc=0, refused=None, detail="", enospc=False)
         except Fatal as f:
             out.update(rc=1, refused=f.name, detail=f.detail,

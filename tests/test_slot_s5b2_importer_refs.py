@@ -63,6 +63,8 @@ def _run(tmp_path, make_refs):
     refs = make_refs(commits)
     items = [(b"in/repo.bundle", bundle)] + [(b"repo/.git/" + r, d) for r, d in objects]
     items += [(b"repo/.git/" + r, d) for r, d in refs.items()]
+    # The worktree as checked out at the last commit, so step 4 makes no wip of it.
+    items += [(b"repo/README", b"base\n"), (b"repo/one", b"one\n"), (b"repo/two", b"two\n")]
     stream = b"".join(_file(p, d) for p, d in items) + walkframe.encode_terminal(len(items),
                                                                                  sum(len(d) for _p, d in items))
     work = tmp_path / "work"
