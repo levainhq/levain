@@ -7,11 +7,14 @@ hidden (macOS) or in the system range (Linux), no home. Supplementary membership
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Sequence
 
 from levain.firing.hands import HostOS, Step, _abs, _absent, _darwin_leave_groups, _nologin
 from levain.slot import Refused
 from levain.slot.ids import SINGLETONS, SLOT_NAME_RE, Allocation, is_levain_account
+
+if TYPE_CHECKING:
+    from levain.slot.removal import Live
 
 #: Stamped on every record this package creates. It must NOT start with the hands marker
 #: (``levain.firing.hands.HANDS_MARKER``), so no hands undo ever matches one of ours; a test holds it.
@@ -234,3 +237,138 @@ __all__ = ["Account", "Group", "OPERATOR_GROUPS", "SINGLETONS", "SLOT_MARKER", "
            "accounts_of", "account_steps", "delete_group_steps", "group_members", "membership_pairs",
            "membership_steps", "revive_steps", "shared_group_steps", "shared_groups_of", "supplementary_groups",
            "tombstone_steps"]
+
+
+# --- row 33 R1b: removal by the RECORDED identity (§1.1 table rows 3-5) -------------------------------------------
+
+
+def _directory(host: HostOS, live: "Live"):   # -> install_helper.Directory
+    from levain.slot.install_helper import read_directory
+    from levain.slot.removal import ReadFailed
+
+    try:
+        return read_directory(host, run=live.run)
+    except Refused as e:
+        raise ReadFailed(f"{e.name}: {e.detail}") from None
+
+
+def _group_ours(host: HostOS, d, name: str, gid: int) -> str:
+    from levain.slot.removal import ABSENT, NOT_OURS, OURS
+
+    if name not in d.groups:
+        return ABSENT
+    if d.groups[name] != gid or (host == "darwin" and d.group_labels.get(name) != SLOT_MARKER):
+        return NOT_OURS
+    return OURS
+
+
+def member_state(host: HostOS, account: str, group: str, gid: int, live: "Live") -> str:
+    """OURS: the group is present at the RECORDED gid (macOS: under Levain's label) and lists the account. NOT_OURS:
+    the name at another gid or label. ABSENT: no such group, or the account is not listed."""
+    from levain.slot.removal import ABSENT, OURS
+
+    d = _directory(host, live)
+    state = _group_ours(host, d, group, gid)
+    if state != OURS:
+        return state
+    return OURS if account in d.group_members.get(group, frozenset()) else ABSENT
+
+
+def remove_member_steps(host: HostOS, account: str, group: str, gid: int, *, live: "Live") -> list[Step]:
+    """``member/1`` (R7): macOS ``dseditgroup -o edit -d``, Linux ``gpasswd -d``."""
+    from levain.slot.removal import chain, point, remove_step
+
+    argv = (("/usr/sbin/dseditgroup", "-o", "edit", "-d", account, "-t", "user", group) if host == "darwin"
+            else (_abs("gpasswd"), "-d", account, group))
+    return [remove_step(f"take {account} out of {group}", ("member/1", (account, group, gid)), live,
+                        lambda: member_state(host, account, group, gid, live),
+                        chain(lambda: live.act(argv), point(live, "member/1:after-remove")))]
+
+
+def group_state(host: HostOS, name: str, gid: int, live: "Live") -> str:
+    return _group_ours(host, _directory(host, live), name, gid)
+
+
+def remove_group_steps(host: HostOS, name: str, gid: int, *, live: "Live", retire: bool = True,
+                       record_held: bool = True) -> list[Step]:
+    """``group/1`` (R7, after every ``member/1``). The gid rule (§1.1 g): the RECORDED gid is retired DURABLY
+    (:func:`levain.slot.ids.retire_ids_durably`) BEFORE ``dscl -delete`` / ``groupdel``, for OURS (then deleted),
+    NOT_OURS (left alone) and ABSENT when ``record_held`` (a completed run had it, so rows may carry it); an ABSENT
+    group the write-ahead journal alone held was never made and is dropped unretired. ``retire=False``: undo."""
+    from levain.slot.ids import RETIRED_IDS_PATH, retire_ids_durably
+    from levain.slot.removal import ABSENT, NOT_OURS, OURS, ReadFailed
+
+    record = ("group/1", (name, gid))
+    argv = (*_DSCL, "-delete", f"/Groups/{name}") if host == "darwin" else (_abs("groupdel"), name)
+
+    def go() -> tuple[bool, str]:
+        try:
+            state = group_state(host, name, gid, live)
+        except ReadFailed as e:
+            return False, f"group/1: the live read failed, record kept: {e}"
+        if retire and (state != ABSENT or record_held):
+            try:
+                retire_ids_durably(live.at(RETIRED_IDS_PATH[host]), {gid}, fsync=live.fsync)
+            except OSError as e:
+                return False, f"could not retire gid {gid} durably: {e.strerror or e}"
+            live.fault("group/1:after-retire")
+        if state == NOT_OURS:
+            live.skips.add(record)
+            return True, f"the group {name} is present and not Levain's: left in place (install-skips)"
+        if state != OURS:
+            return True, ""
+        ok, why = live.act(argv)
+        if ok:
+            live.fault("group/1:after-delete")
+        return ok, why
+
+    return [Step(f"delete the group {name} (its gid {gid} retired first)" if retire else f"delete the group {name}",
+                 call=go)]
+
+
+def account_state(host: HostOS, name: str, uid: int, live: "Live") -> str:
+    """OURS: present at the recorded uid with Levain's LIVE label. ABSENT: no account, or it carries the retired
+    label. NOT_OURS: the name at another uid or under a foreign label."""
+    from levain.slot.removal import ABSENT, NOT_OURS, OURS
+
+    d = _directory(host, live)
+    if name not in d.users:
+        return ABSENT
+    label = d.user_labels.get(name, "")
+    if d.users[name] != uid:
+        return NOT_OURS
+    if label == SLOT_RETIRED_MARKER[host]:
+        return ABSENT
+    return OURS if label == SLOT_MARKER else NOT_OURS
+
+
+def remove_account_steps(host: HostOS, name: str, uid: int, *, live: "Live",
+                         end: "Callable[[int, str], tuple[bool, str]]", retire: bool = True) -> list[Step]:
+    """``account/1`` (R7): the uid retired durably, every process ended (``end``: the caller's proven end), then the
+    tombstone (never a delete). Each act re-reads the live label first, so a run killed inside the tombstone re-runs
+    it from its first act while the label is still live."""
+    from levain.slot.ids import RETIRED_IDS_PATH, retire_ids_durably
+    from levain.slot.removal import remove_step
+
+    record = ("account/1", (name, uid))
+    classify = lambda: account_state(host, name, uid, live)   # noqa: E731
+
+    def retire_then_end() -> tuple[bool, str]:
+        if retire:
+            try:
+                retire_ids_durably(live.at(RETIRED_IDS_PATH[host]), {uid}, fsync=live.fsync)
+            except OSError as e:
+                return False, f"could not retire uid {uid} durably: {e.strerror or e}"
+            live.fault("account/1:after-retire")
+        return end(uid, name)
+
+    steps = [remove_step(f"retire {name}'s uid {uid}, then stop every process of {name}", record, live, classify,
+                         retire_then_end)]
+    for i, s in enumerate(tombstone_steps(host, name)):
+        def act(s: Step = s, first: bool = i == 0) -> tuple[bool, str]:
+            ok, why = s.call() if s.call is not None else live.act(s.argv)
+            if ok and first:
+                live.fault("account/1:after-first-act")
+            return ok, why
+        steps.append(remove_step(s.why, record, live, classify, act))
+    return steps

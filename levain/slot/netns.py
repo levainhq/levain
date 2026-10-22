@@ -8,10 +8,13 @@ from ``ip netns list`` (the namespaces ``ip`` itself knows, not a path test), an
 """
 from __future__ import annotations
 
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 from levain.firing.hands import Step, _abs
 from levain.slot.ids import SlotId
+
+if TYPE_CHECKING:
+    from levain.slot.removal import Live
 
 
 def _ip() -> str:
@@ -60,3 +63,20 @@ def netns_undo_steps(slots: Iterable[SlotId]) -> list[Step]:
 
 
 __all__ = ["netns_absent", "netns_present", "netns_steps", "netns_undo_steps"]
+
+
+def netns_state(name: str, live: "Live") -> str:
+    """OURS: ``ip netns list`` names it (a namespace carries no owner; CONTRACT §9.1 reserves the names). A failing
+    ``ip netns list`` raises: never read as absent."""
+    from levain.slot.removal import ABSENT, OURS
+
+    out = live.read((_ip(), "netns", "list"))
+    return OURS if any(ln.split(" ", 1)[0] == name for ln in out.splitlines()) else ABSENT
+
+
+def remove_netns_steps(name: str, *, live: "Live") -> list[Step]:
+    """Row 33 R1b, ``netns/1`` (R8): ``ip netns delete`` the RECORDED namespace."""
+    from levain.slot.removal import chain, point, remove_step
+
+    return [remove_step(f"delete the network namespace {name}", ("netns/1", name), live, lambda: netns_state(name, live),
+                        chain(lambda: live.act((_ip(), "netns", "delete", name)), point(live, "netns/1:after-delete")))]

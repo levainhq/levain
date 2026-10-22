@@ -21,13 +21,16 @@ from __future__ import annotations
 import plistlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Literal
+from typing import TYPE_CHECKING, Callable, Iterable, Literal
 
 from levain.firing.hands import HostOS, Step, _abs
 from levain.launch import child_env
 from levain.slot import Refused
 from levain.slot.layout import ROOT_GROUP, service_entry_path
 from levain.slot.root_tree import PY_FLAGS, ROOT_PYTHON
+
+if TYPE_CHECKING:
+    from levain.slot.removal import Live
 
 LAUNCHD_DIR = Path("/Library/LaunchDaemons")
 SYSTEMD_DIR = Path("/etc/systemd/system")
@@ -322,3 +325,105 @@ def uninstall_steps(host: HostOS) -> list[Step]:
 __all__ = ["SERVICES", "Service", "argv", "built_services", "by_name", "install_steps", "launchd_label",
            "launchd_plist_text", "program_relpath", "program_source", "services_for", "start_order",
            "systemd_name", "systemd_unit_text", "uninstall_steps"]
+
+
+# --- row 33 R1b: a unit removed by its RECORDED name (§1.1 table row 1) -------------------------------------------
+
+
+def _launchd_state(label: str, live: "Live") -> str:
+    """``loaded`` / ``absent`` from ``launchctl print``: 113 (no such service) is the ONE absent answer; any other
+    non-zero exit is a failed read (DESIGN X4-M1), never absent."""
+    from levain.slot.removal import ReadFailed
+
+    rc, out, err = live.out(("/bin/launchctl", "print", f"system/{label}"))
+    if rc == 0:
+        return "loaded"
+    if rc == _LAUNCHCTL_NO_SUCH_SERVICE:
+        return "absent"
+    raise ReadFailed(f"launchctl print system/{label} exited {rc}: {(err or out).strip()[:200]}")
+
+
+def _systemd_state(prop: str, name: str, live: "Live") -> str:
+    """``systemctl show -p <prop> --value``; a failing ``systemctl show`` raises (never read as stopped or absent)."""
+    return live.read((_abs("systemctl"), "show", "-p", prop, "--value", name)).strip()
+
+
+def _plist_is(label: str) -> Callable[[bytes], bool]:
+    def check(data: bytes) -> bool:
+        try:
+            return plistlib.loads(data).get("Label") == label
+        except Exception:   # noqa: BLE001 — a file that is not our plist is not ours
+            return False
+    return check
+
+
+def unit_state(host: HostOS, n: str, live: "Live") -> str:
+    """OURS: the unit file is a regular root file (macOS: its ``Label`` is ``com.levain.<n>``), OR the file is gone and
+    the job is still loaded (the bound reserves the name). ABSENT: no file and not loaded. NOT_OURS: a file at the
+    name that is not ours."""
+    from levain.slot.removal import ABSENT, OURS, root_file
+
+    if host == "darwin":
+        label = f"com.levain.{n}"
+        state = root_file(live, LAUNCHD_DIR / f"{label}.plist", check=_plist_is(label))
+        if state != ABSENT:
+            return state
+        return OURS if _launchd_state(label, live) == "loaded" else ABSENT
+    unit = f"levain-{n}.service"
+    state = root_file(live, SYSTEMD_DIR / unit)
+    if state != ABSENT:
+        return state
+    if _systemd_state("LoadState", unit, live) != "not-found":
+        return OURS
+    return ABSENT if _systemd_state("ActiveState", unit, live) in ("inactive", "failed") else OURS
+
+
+def stop_unit_act(host: HostOS, n: str, live: "Live", *, disable: bool) -> tuple[bool, str]:
+    """The ONE stop body (repair's R5 stops and a removed unit's revoke): the verdict is the END STATE, never the
+    stop's exit status. macOS boots out a loaded job and waits for launchd to unload it; Linux stops it (``disable
+    --now`` for a unit leaving the install) and reads ``ActiveState`` again."""
+    if host == "darwin":
+        label = f"com.levain.{n}"
+        if _launchd_state(label, live) == "absent":
+            return True, ""
+        live.out(("/bin/launchctl", "bootout", f"system/{label}"))      # its status is not the verdict: checked next
+        return _launchd_job_absent(label, live.run, wait_s=LAUNCHD_UNLOAD_WAIT_S)
+    unit, systemctl = f"levain-{n}.service", _abs("systemctl")
+    if not disable and _systemd_state("ActiveState", unit, live) in ("inactive", "failed"):
+        return True, ""
+    live.out((systemctl, "disable", "--now", unit) if disable else (systemctl, "stop", unit))
+    state = _systemd_state("ActiveState", unit, live)
+    if state not in ("inactive", "failed"):
+        return False, f"{unit} is {state or 'in an unknown state'} after systemctl {'disable --now' if disable else 'stop'}"
+    return True, ""
+
+
+def stop_unit_by_name(host: HostOS, n: str, *, live: "Live") -> list[Step]:
+    """``unit/1`` revoke (R5): the recorded unit stopped by NAME, never through :data:`SERVICES`."""
+    from levain.slot.removal import chain, point, remove_step
+
+    why = f"stop com.levain.{n}" if host == "darwin" else f"stop and disable levain-{n}.service"
+    return [remove_step(why, ("unit/1", n), live, lambda: unit_state(host, n, live),
+                        chain(lambda: stop_unit_act(host, n, live, disable=True), point(live, "unit/1:after-stop")))]
+
+
+def remove_unit_file_by_name(host: HostOS, n: str, *, live: "Live") -> list[Step]:
+    """``unit/1`` destroy (R12): ``rm -f`` the recorded unit file; Linux then ``daemon-reload`` and ``reset-failed``
+    (a file gone while systemd still holds the unit loaded reads OURS, so a re-run reloads)."""
+    from levain.slot.removal import chain, point, remove_step
+
+    if host == "darwin":
+        path = LAUNCHD_DIR / f"com.levain.{n}.plist"
+        return [remove_step(f"remove {path}", ("unit/1", n), live, lambda: unit_state(host, n, live),
+                            chain(lambda: live.act(("/bin/rm", "-f", str(path))), point(live, "unit/1:after-rm")))]
+    unit, systemctl = f"levain-{n}.service", _abs("systemctl")
+    path = SYSTEMD_DIR / unit
+
+    def reset() -> tuple[bool, str]:
+        live.out((systemctl, "reset-failed", unit))     # best effort: a unit systemd holds no record of answers non-zero
+        return True, ""
+
+    return [remove_step(f"remove {path} (then daemon-reload, reset-failed)", ("unit/1", n), live,
+                        lambda: unit_state(host, n, live),
+                        chain(lambda: live.act((_abs("rm"), "-f", str(path))), point(live, "unit/1:after-rm"),
+                              lambda: live.act((systemctl, "daemon-reload")), reset))]

@@ -35,6 +35,7 @@ from levain.contracts import canon
 from levain.firing.hands import OPERATOR_RE, HandsSetupError, HostOS, Step, _abs, _kill_all, host_os, run_plan
 from levain.launch import child_env
 from levain.slot import Refused, bwrap, netns, pf, root_tree, units
+from levain.slot import removal as RM
 from levain.slot import generation as gen_mod
 from levain.slot import proc as PR
 from levain.slot import records as R
@@ -45,7 +46,8 @@ from levain.slot.intent import (INTENT_PATH, Intent, install_lock, intent_remove
                                 read_intent, write_intent_atomically)
 from levain.slot.accounts import (SLOT_MARKER, SLOT_RETIRED_MARKER, Account, Group, account_steps, accounts_of,
                                   delete_group_steps, membership_pairs, membership_steps, revive_steps,
-                                  shared_group_steps, shared_groups_of, tombstone_steps)
+                                  shared_group_steps, shared_groups_of, tombstone_steps, member_state, group_state,
+                                  account_state, remove_member_steps, remove_group_steps, remove_account_steps)
 from levain.slot.grammar import LEASE_EXEMPT, SESSION_RE, VERBS, InstallCommand, check_roots, parse_install_argv
 from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS, SLOT_NAME_RE, Allocation,
                              SlotClass, SlotId, allocate, check_capacity, choose_indices, in_own_range,
@@ -56,8 +58,9 @@ from levain.slot.layout import (STORE, Row, base_routes_steps, base_run_rows, ba
                                 parse_pool_config, policy_rows, pool_config_row, pool_config_steps,
                                 pool_config_undo_steps, reserve_row, reserve_steps, roots_steps, row_steps,
                                 run_dir_undo_steps, single_filesystem_steps, slot_rows, tmpfiles_steps,
-                                tmpfiles_undo_steps, ungroup_steps)
-from levain.slot.sudoers import remove_install_sudoers_steps, remove_runtime_sudoers_steps, sudoers_paths, sudoers_steps
+                                tmpfiles_undo_steps, ungroup_steps, entry_state, remove_entry_steps)
+from levain.slot.sudoers import (remove_dropin_steps, remove_install_sudoers_steps, remove_runtime_sudoers_steps,
+                                 sudoers_paths, sudoers_steps)
 
 OPERATOR_FORMAT = "levain-operator/1"
 
@@ -1024,54 +1027,161 @@ def _shape_of(records: Iterable) -> tuple:
     return tuple(sorted(records, key=lambda r: (r[0], canon.canonical(gen_mod.managed_json([r])))))
 
 
+# --- the remove-step table (row 33 R1b; DESIGN §1.1, the per-identity steps in their phases) -----------------------
+
+#: Each kind's phases: its revoke and destroy R-steps (§1.1 table, "revoke @" / "destroy @"). Row order is the
+#: table's: within one R-step, kinds go in this order.
+REMOVE_PHASES: Mapping[str, tuple[str, ...]] = {
+    "unit/1": ("R5", "R12"), "sudoers/1": ("R5",), "member/1": ("R7",), "group/1": ("R7",), "account/1": ("R7",),
+    "pf-alias/1": ("R8",), "pf-anchor/1": ("R8",), "pf-enable/1": ("R8",), "apparmor/1": ("R8",),
+    "bwrap-copy/1": ("R8",), "netns/1": ("R8",), "entry/1": ("R10",),
+}
+#: §1.1 rule b2: every kind ever shipped keeps its remove step forever (a test pins this set).
+SHIPPED_KINDS = frozenset(REMOVE_PHASES)
+if SHIPPED_KINDS != frozenset(gen_mod.KINDS):   # a bound with no remove step, or a remove step with no bound
+    raise ImportError(f"remove-step table and kind bounds differ: {sorted(SHIPPED_KINDS ^ frozenset(gen_mod.KINDS))}")
+
+
+def _kind_steps(host: HostOS, kind: str, ident, phase: str, live: RM.Live, *, retire: bool, held: bool,
+                end: Callable[[int, str], tuple[bool, str]]) -> list[Step]:
+    """One record's steps for ``phase``: its kind's per-identity builder, given the RECORDED identity only."""
+    if kind == "unit/1":
+        return (units.stop_unit_by_name(host, ident, live=live) if phase == "R5"
+                else units.remove_unit_file_by_name(host, ident, live=live))
+    if kind == "sudoers/1":
+        return remove_dropin_steps(host, ident, live=live)
+    if kind == "member/1":
+        return remove_member_steps(host, *ident, live=live)
+    if kind == "group/1":
+        return remove_group_steps(host, *ident, live=live, retire=retire, record_held=held)
+    if kind == "account/1":
+        return remove_account_steps(host, *ident, live=live, end=end, retire=retire)
+    if kind == "pf-alias/1":
+        return pf.remove_alias_steps(ident, live=live)
+    if kind == "pf-anchor/1":
+        return pf.remove_anchor_steps(*ident, live=live)
+    if kind == "pf-enable/1":
+        return pf.remove_enable_steps(ident, live=live)
+    if kind == "apparmor/1":
+        return bwrap.remove_apparmor_profile_steps(ident, live=live)
+    if kind == "bwrap-copy/1":
+        return bwrap.remove_bwrap_copy_steps(*ident, live=live)
+    if kind == "netns/1":
+        return netns.remove_netns_steps(ident, live=live)
+    if kind == "entry/1":
+        return remove_entry_steps(host, ident, live=live)
+    raise Refused(f"downgrade-unsupported:{kind}", "this code holds no remove step for that kind")
+
+
+def kind_state(host: HostOS, kind: str, ident, live: RM.Live) -> str:
+    """The live outcome of one record (ABSENT / OURS / NOT_OURS); a failed read raises :class:`removal.ReadFailed`."""
+    if kind == "unit/1":
+        return units.unit_state(host, ident, live)
+    if kind == "sudoers/1":
+        return RM.root_file(live, sudoers_paths()[0].parent / ident)
+    if kind == "member/1":
+        return member_state(host, *ident, live)
+    if kind == "group/1":
+        return group_state(host, *ident, live)
+    if kind == "account/1":
+        return account_state(host, *ident, live)
+    if kind == "pf-alias/1":
+        return pf.alias_state(ident, live)
+    if kind == "pf-anchor/1":
+        return pf.anchor_state(*ident, live)
+    if kind == "pf-enable/1":
+        return pf.enable_state(ident, live)
+    if kind == "apparmor/1":
+        return bwrap.apparmor_state(ident, live)
+    if kind == "bwrap-copy/1":
+        return bwrap.bwrap_copy_state(*ident, live)
+    if kind == "netns/1":
+        return netns.netns_state(ident, live)
+    if kind == "entry/1":
+        return entry_state(host, ident, live)
+    raise Refused(f"downgrade-unsupported:{kind}", "this code holds no remove step for that kind")
+
+
+def removal_steps(host: HostOS, records: Iterable, phase: str, *, live: RM.Live, held: frozenset = frozenset(),
+                  retire: bool = True, end: Callable[[int, str], tuple[bool, str]] | None = None) -> list[Step]:
+    """Every record in ``records`` whose kind has a phase at ``phase``, in the table's row order (records of one kind
+    in a fixed order), each through its kind's per-identity step. ``held``: the records ``install-shape`` holds (the
+    gid rule retires an ABSENT group only when the record held it). ``retire=False``: undo (§1.1 g)."""
+    end = end or (lambda uid, name: _end_processes(host, uid, name))
+    recs = list(records)
+    steps: list[Step] = []
+    for kind, phases in REMOVE_PHASES.items():
+        if phase not in phases:
+            continue
+        for k, ident in sorted((r for r in recs if r[0] == kind), key=repr):
+            steps += _kind_steps(host, k, ident, phase, live, retire=retire, held=(k, ident) in held, end=end)
+    return steps
+
+
+SKIPS_FORMAT = "levain-install-skips/1"
+
+
+def install_skips_path(host: HostOS) -> Path:
+    return operator_record_path(host).parent / "install-skips"
+
+
+def _skips_now(host: HostOS, live: RM.Live, path: Path) -> list:
+    """§2.3 R14: this run's NOT_OURS records plus every earlier entry whose object is still present (re-read live; a
+    read that fails keeps it). An entry the operator removed by hand drops out."""
+    earlier: list = []
+    try:
+        obj = canon.parse(live.at(path).read_bytes())
+        if isinstance(obj, dict) and obj.get("format") == SKIPS_FORMAT:
+            earlier = list(gen_mod.parse_managed(obj.get("skips"), what="install-skips"))
+    except (OSError, canon.ContractError, Refused):
+        earlier = []
+    keep = set(live.skips)
+    for kind, ident in earlier:
+        try:
+            if kind not in SHIPPED_KINDS or kind_state(host, kind, ident, live) != RM.ABSENT:
+                keep.add((kind, ident))
+        except RM.ReadFailed:
+            keep.add((kind, ident))
+    return gen_mod.managed_json(keep)
+
+
+def write_install_skips(host: HostOS, live: RM.Live) -> tuple[bool, str]:
+    """``L/policy/install-skips`` (root 0644), durably, BEFORE ``install-shape`` (DESIGN X4-M2), so the shape's
+    write stays the one completion commit."""
+    path = install_skips_path(host)
+    text = canon.canonical({"format": SKIPS_FORMAT, "skips": _skips_now(host, live, path)})
+    return gen_mod.write_record_durably(live.at(path), text)
+
+
 def _journal_step(host: HostOS, why: str, intent: Intent) -> Step:
     path, text = INTENT_PATH[host], intent_text(intent)
     return Step(why, call=lambda: write_intent_atomically(path, text))
 
 
 def _stop_steps(host: HostOS, services: Sequence[units.Service], noted: dict[str, int],
-                clock: Callable[[], float]) -> list[Step]:
+                clock: Callable[[], float], *, live: RM.Live | None = None) -> list[Step]:
     """§2.3 R5: stop ``services`` in reverse start order, noting ``floor(now)`` for each just BEFORE its stop (R14
-    writes it to ``started_after``). U18: the verdict is the END STATE, never the stop's exit status, and only a
-    service that runs is stopped: macOS boots out only a job launchd holds, then checks it is gone; Linux reads
-    ``ActiveState`` (``inactive`` or ``failed`` is stopped, which is also what a unit systemd has no file for reads,
-    the damage a repair is there to fix), else stops it and reads it again. Never ``LoadState`` alone: after a
-    daemon-reload a unit whose file was deleted reads ``not-found`` while its process still runs."""
-    def note_then(name: str, act: Callable[[], tuple[bool, str]]) -> Callable[[], tuple[bool, str]]:
+    writes it to ``started_after``). The stop body is :func:`units.stop_unit_act`, the ONE body a removed unit's
+    revoke runs too (R1b). U18: the verdict is the END STATE, never the stop's exit status, and only a service that
+    runs is stopped: macOS boots out only a job launchd holds, then checks it is gone (a ``launchctl print`` exit that
+    is neither 0 nor launchd's not-found fails the step, DESIGN X4-M1); Linux reads ``ActiveState`` (``inactive`` or
+    ``failed`` is stopped), else stops it and reads it again. Never ``LoadState`` alone: after a daemon-reload a unit
+    whose file was deleted reads ``not-found`` while its process still runs."""
+    lv = live or RM.Live()
+
+    def note_then(name: str) -> Callable[[], tuple[bool, str]]:
         def go() -> tuple[bool, str]:
             noted[name] = int(clock())
-            return act()
+            try:
+                return units.stop_unit_act(host, name, lv, disable=False)
+            except RM.ReadFailed as e:
+                return False, str(e)
         return go
-
-    def out(argv: tuple[str, ...]) -> str:
-        r = subprocess.run(list(argv), capture_output=True, text=True, cwd="/", env=child_env())
-        return (r.stdout or "").strip()
 
     steps: list[Step] = []
     for s in reversed([x for x in units.services_for(host) if x in services]):
-        if host == "darwin":
-            label = units.launchd_label(s)
-
-            def bootout(lb: str = label) -> tuple[bool, str]:
-                if units._launchd_job_absent(lb)[0]:
-                    return True, ""
-                out(("/bin/launchctl", "bootout", f"system/{lb}"))   # its status is not the verdict: checked next
-                return units._launchd_job_absent(lb, wait_s=units.LAUNCHD_UNLOAD_WAIT_S)   # launchd unloads after bootout returns
-
-            steps.append(Step(f"stop {label}", call=note_then(s.name, bootout)))
-        else:
-            name, systemctl = units.systemd_name(s), _abs("systemctl")
-
-            def stop(n: str = name, sc: str = systemctl) -> tuple[bool, str]:
-                if out((sc, "show", "-p", "ActiveState", "--value", n)) in ("inactive", "failed"):
-                    return True, ""
-                out((sc, "stop", n))                                  # its status is not the verdict: checked next
-                state = out((sc, "show", "-p", "ActiveState", "--value", n))
-                if state not in ("inactive", "failed"):
-                    return False, f"{n} is {state or 'in an unknown state'} after systemctl stop"
-                return True, ""
-
-            steps.append(Step(f"stop {name}", call=note_then(s.name, stop)))
+        unit = units.launchd_label(s) if host == "darwin" else units.systemd_name(s)
+        steps.append(Step(f"stop {unit}", call=note_then(s.name)))
     return steps
 
 
@@ -1100,7 +1210,8 @@ def _recognised_groups(host: HostOS, facts: HostFacts, rf: RepairFacts, journale
 def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
                 txn: Callable[[], str] = gen_mod.new_txn, clock: Callable[[], float] = time.time,
                 read_sysctl: Callable[[str], str] | None = None,
-                program_exists: Callable[[Path], bool] = Path.is_file) -> InstallPlan:
+                program_exists: Callable[[Path], bool] = Path.is_file, live: RM.Live | None = None,
+                end: Callable[[int, str], tuple[bool, str]] | None = None) -> InstallPlan:
     """``repair [--source PATH]`` (§2.1, §2.3), the ADDITION path: setup's own plan re-applied against what is
     installed, every step idempotent, the levain + h11 pair staged as ONE generation behind one flip of ``current``.
     Order: the journal (a finished repair journal, ``txn == record.completed_txn``, is removed first and a fresh
@@ -1109,8 +1220,11 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     the missing memberships (R7); rows and confinement (R8); THE FLIP (R9); entries (R10); sudoers (R11); units and
     every start (R12); GC (R13); ``install-shape`` (R14, the completion commit); the journal removed (R15).
 
-    The removal path (a recorded resource the code no longer desires) is R1b's: until it lands such a plan refuses
-    ``removal-unbuilt:<kind>`` before any act. The phase A / phase B handover (probe, exec) is R2's."""
+    The removal path (R1b): ``remove = (record.managed ∪ journal.managed ∪ desired) − desired``, each record through
+    its kind's per-identity step in its phases (:data:`REMOVE_PHASES`: R5 unit stops and sudoers, R7 members, groups
+    and accounts, R8 the confinement kinds BEFORE the re-render, R10 entries, R12 unit files), with the three outcomes
+    (``live``: every live read and act; ``end``: the account kind's proven process end). ``install-skips`` is written
+    durably before ``install-shape`` (R14). The phase A / phase B handover (probe, exec) is R2's."""
     if cmd.verb != "repair":
         raise Refused("wrong-verb", cmd.verb)
     host = facts.host
@@ -1169,7 +1283,10 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     jgroups = dict(journal.groups) if journal is not None else {}
     present = _recognised_groups(host, facts, rf, jgroups)
     keep_shared = {**{g: i for g, i in jgroups.items() if g in SHARED_GROUPS}, **present}
-    alloc = allocate(host, egress=(), verifier=(), used=facts.used_ids, retired=facts.retired, shared=True,
+    # R1b: a recorded or journaled group this code no longer names is on its way out, and its gid is retired at R7
+    # (§1.1 g); R6 runs first, so that gid must never be handed to a new group here, even when no group holds it now.
+    leaving = {i[1] for k, i in previous | journaled if k == "group/1" and i[0] not in SHARED_GROUPS}
+    alloc = allocate(host, egress=(), verifier=(), used=facts.used_ids | leaving, retired=facts.retired, shared=True,
                      keep_shared=keep_shared)
     check_account_ids(host, rf.accounts)
     slots = tuple(SlotId("egress", i) for i in rf.egress) + tuple(SlotId("none", i) for i in rf.verifier)
@@ -1181,9 +1298,10 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
                               services=[s.name for s in services], slots=slots, apparmor=restricted)
     reconcile = previous | journaled | desired
     remove = reconcile - desired
-    if remove:
-        raise Refused(f"removal-unbuilt:{sorted(remove, key=repr)[0][0]}",
-                      "removing a recorded resource is row 33 R1b; this code only adds")
+    live = live if live is not None else RM.Live()
+
+    def removals(phase: str) -> list[Step]:
+        return removal_steps(host, remove, phase, live=live, held=previous, end=end)
     accts = accounts_of(Allocation(host, (), (), dict(rf.accounts), {}))
     missing_groups = [Group(g, gid, ()) for g, gid in alloc.shared.items() if g not in present]
     missing_pairs = [(a, g) for a, g in membership_pairs(accts, operator) if a not in rf.members.get(g, frozenset())]
@@ -1202,6 +1320,9 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     def record() -> tuple[bool, str]:
         new = gen_mod.InstallShape(target, versions[0], versions[1], run_txn, {**carried, **noted},
                                    _shape_of(desired))
+        ok, why = write_install_skips(host, live)          # X4-M2: before the shape, the one completion commit
+        if not ok:
+            return ok, why
         return gen_mod.write_record_durably(shape_path, gen_mod.shape_text(new))
 
     rows = base_store_rows(host, operator) + base_run_rows(host) + slot_rows(host, slots)
@@ -1221,15 +1342,20 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     steps.append(_journal_step(host, f"journal the generation {target} (same txn)", staged))      # R3
     steps.append(_journal_step(host, "journal the shared-group gids and the write-ahead managed set (same txn)",
                                final))                                                            # R4b
-    steps += _stop_steps(host, stop, noted, clock)                                                # R5
+    steps += _stop_steps(host, stop, noted, clock, live=live)                                     # R5
+    steps += removals("R5")                         # R1b: recorded units stopped by name, then sudoers (grants first)
     steps += shared_group_steps(host, missing_groups)                                             # R6
     steps += membership_steps(host, missing_pairs)                                                # R7
+    steps += removals("R7")                         # R1b: members, then groups (gid retired first), then accounts
+    steps += removals("R8")                         # R1b: the confinement kinds' removals first, then the re-render
     steps += [*row_steps(host, rows), *reserve_steps(host), *base_routes_steps(host),             # R8
               *single_filesystem_steps(host, slots), *confinement]
     if rf.current != target:
         steps.append(root_tree.flip_step(host, target))                                          # R9
     steps += root_tree.entry_steps(host)                                                          # R10
+    steps += removals("R10")                        # R1b: entries after the flip (their sudoers rule went at R5)
     steps += sudoers_steps(host, operator)                                                        # R11
+    steps += removals("R12")                        # R1b: the removed units' files
     steps += units.install_steps(host, services)                                                  # R12
     if rf.legacy or gen_change:
         steps.append(root_tree.gc_step(host, keep))                                               # R13

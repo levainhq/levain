@@ -8,10 +8,14 @@ Runtime helper: two NOPASSWD rules, the operator's (every verb) and ``_levain_di
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from levain.firing.hands import _SUDOERS_DIR, HostOS, Step, _abs
 from levain.slot.grammar import check_operator_name
 from levain.slot.layout import install_helper_path, runtime_helper_path
+
+if TYPE_CHECKING:
+    from levain.slot.removal import Live
 
 #: sudo skips a sudoers.d file whose name contains a "." or ends in "~"; these names have neither.
 RUNTIME_SUDOERS = _SUDOERS_DIR / "levain-runtime"
@@ -78,3 +82,16 @@ def remove_install_sudoers_steps(host: HostOS) -> list[Step]:
 
 def sudoers_paths() -> tuple[Path, Path]:
     return RUNTIME_SUDOERS, INSTALL_SUDOERS
+
+
+def remove_dropin_steps(host: HostOS, name: str, *, live: "Live") -> list[Step]:
+    """Row 33 R1b, ``sudoers/1`` (§1.1 table row 2, R5): the recorded drop-in ``_SUDOERS_DIR/<name>`` removed when it
+    is a regular root file, then ``visudo -c`` of the whole config. Never a current name looked up."""
+    from levain.slot.removal import chain, point, remove_step, root_file
+
+    path = _SUDOERS_DIR / name
+    check = (_visudo(host)[0], "-c")
+    return [remove_step(f"remove {path} (then visudo -c)", ("sudoers/1", name), live,
+                        lambda: root_file(live, path),
+                        chain(lambda: live.act((_rm(host), "-f", str(path))), point(live, "sudoers/1:after-rm"),
+                              lambda: live.act(check)))]
