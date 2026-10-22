@@ -46,6 +46,7 @@ from levain.slot import Refused, write_all
 from levain.slot import bundlefmt as BF
 #: The importer's cap on its one line, the newline included: ONE constant, the writer's.
 from levain.slot.importer import RESULT_CAP
+from levain.slot.proc import V12K_SECONDS
 
 # --- the two commit calls ---------------------------------------------------------------------------------------
 
@@ -1009,9 +1010,9 @@ def enable_controllers(role_key: str, seams: LeafSeams, cgroup_root: Optional[st
 
 def make_leaf(leaf: str, *, memory_max: int, pids_max: int, seams: LeafSeams) -> None:
     """Seal-in (§4.9 Memory): create this run's leaf and write, in this order, ``memory.max`` FIRST (its failure fatal
-    whatever the swap test then finds, r9 S12-7), ``memory.swap.max = 0`` (SKIPPED when the file is absent, a kernel
-    without swap accounting, r8; any other failure fatal), then ``pids.max``; all before the child joins. A failure =
-    ``export-image-unavailable``."""
+    whatever the swap test then finds, r9 S12-7), ``memory.swap.max = 0`` (SKIPPED when the write finds no such file,
+    a kernel without swap accounting, r8; any other failure fatal), then ``pids.max``; all before the child joins. A
+    failure = ``export-image-unavailable``."""
     def write(name: str, value: str) -> None:
         try:
             seams.write(f"{leaf}/{name}", value)
@@ -1024,10 +1025,13 @@ def make_leaf(leaf: str, *, memory_max: int, pids_max: int, seams: LeafSeams) ->
     except OSError as e:
         raise Refused(UNAVAILABLE, f"{leaf}: {_errname(e)}") from e
     write("memory.max", str(memory_max))
-    if seams.exists(f"{leaf}/memory.swap.max"):
-        write("memory.swap.max", "0")
-    else:
+    try:        # written directly (L3 5c-ii-b r1 B-3): an existence test would read EACCES as "absent"
+        seams.write(f"{leaf}/memory.swap.max", "0")
+        seams.log("memory.swap.max=0")
+    except FileNotFoundError:
         seams.log("memory.swap.max absent, skipped")
+    except OSError as e:
+        raise Refused(UNAVAILABLE, f"{leaf}/memory.swap.max: {_errname(e)}") from e
     write("pids.max", str(pids_max))
 
 
@@ -1060,7 +1064,8 @@ _LIBPROC: list = []
 
 def phys_footprint(pid: int) -> Optional[int]:
     """``proc_pid_rusage(RUSAGE_INFO_V4)`` ``ri_phys_footprint`` (the ledger jetsam enforces; never ``ps`` text), or
-    None when the pid cannot be read (gone, or not ours to read)."""
+    None when the pid is gone (ESRCH). Any other failure raises ``OSError`` with its errno (L3 5c-ii-b r1 B-4): a pid
+    root cannot read is a blind sample, never a skipped one."""
     if not _LIBPROC:
         lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
         lib.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
@@ -1068,23 +1073,46 @@ def phys_footprint(pid: int) -> Optional[int]:
         _LIBPROC.append(lib)
     buf = ctypes.create_string_buffer(_RUSAGE_BUF)
     if _LIBPROC[0].proc_pid_rusage(pid, RUSAGE_INFO_V4, buf) != 0:
-        return None
+        e = ctypes.get_errno()
+        if e == errno.ESRCH:
+            return None
+        raise OSError(e, f"proc_pid_rusage({pid}): {os.strerror(e)}")
     return int.from_bytes(buf.raw[_FOOTPRINT_OFFSET:_FOOTPRINT_OFFSET + 8], sys.byteorder)
 
 
+class WatchdogBlind(Exception):
+    """A sampling pass cannot see the whole domain (a process whose owner could not be read)."""
+
+
 def uid_pids(uid: int) -> Sequence[int]:
-    """Every pid of ``uid`` (real, effective or saved; an unreadable pid counts as every uid's, as in the proof)."""
+    """Every pid of ``uid`` (real, effective or saved), and only those (B-4: a foreign process is never a kill
+    candidate). A process whose owner could not be read (``UNKNOWN``) may be the uid's, so it raises
+    :class:`WatchdogBlind`: blindness, never a candidate and never skipped."""
     from levain.slot import proc as P
-    return [p.pid for p in P.default_seams("darwin").listing() if p.of(uid) or p.state == P.UNKNOWN]
+    out = []
+    for p in P.default_seams("darwin").listing():
+        if p.state == P.UNKNOWN:
+            raise WatchdogBlind(f"pid {p.pid}: owner unreadable")
+        if p.of(uid):
+            out.append(p.pid)
+    return out
+
+
+#: The join bound on :meth:`FootprintWatchdog.stop` (B-2): its ``end()`` may wait for seal-out's proof to release
+#: the one lock and then run its own, two ``end_domain`` bounds in a row, plus a margin [judged by adopt-c, 10-22,
+#: against that worst case]. A join that times out marks the watchdog blind.
+WATCHDOG_JOIN_MARGIN_S = 5.0
+WATCHDOG_JOIN_S = 2 * V12K_SECONDS + WATCHDOG_JOIN_MARGIN_S
 
 
 class FootprintWatchdog:
     """Samples ``footprint`` of every pid ``pids(uid)`` names every ``interval`` from its OWN thread (never from
-    root's walker loop, which blocks) and calls ``end()`` (the domain kill) once a sample passes ``cap``: "a sampled
-    termination threshold with measured overshoot", never "enforced" (§8). After :meth:`stop`, ``killed`` is the kill
-    flag seal-out reads; ``blind`` is True when a sampling pass raised or the thread did not stop, so the memory
-    observation cannot be established (the macOS twin of an unreadable ``memory.events.local``) [judged by adopt-b,
-    10-22, against DESIGN §1 step 10's "(1) cannot be established" clause: a question in RETURN_B]."""
+    root's walker loop, which blocks) and calls ``end()`` (the domain kill) once a pass's SUM passes ``cap`` (DESIGN
+    V30: "``ri_phys_footprint``, summed over the verify domain"): "a sampled termination threshold with measured
+    overshoot", never "enforced" (§8). After :meth:`stop`, ``killed`` is the kill flag seal-out reads; ``blind`` is
+    True when a sampling pass raised (an unreadable footprint or owner included) or the thread did not stop, so the
+    memory observation cannot be established (the macOS twin of an unreadable ``memory.events.local``; head ruling
+    B1, 1022-18: never SUCCESS)."""
 
     def __init__(self, uid: int, cap: int, end: Callable[[], object], *, interval: float = WATCHDOG_INTERVAL_S,
                  pids: Callable[[int], Sequence[int]] = uid_pids,
@@ -1105,25 +1133,28 @@ class FootprintWatchdog:
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
+                total, seen = 0, 0
                 for pid in self._pids(self.uid):
                     fp = self._footprint(pid)
-                    if fp is None:
+                    if fp is None:          # ESRCH: gone since the listing
                         continue
-                    self.peak = max(self.peak, fp)
-                    if fp > self.cap:
-                        self.killed = True
-                        self._log(f"watchdog: pid {pid} footprint {fp} > cap {self.cap}")
-                        self._end()
-                        return
+                    total += fp
+                    seen += 1
+                self.peak = max(self.peak, total)
+                if total > self.cap:
+                    self.killed = True
+                    self._log(f"watchdog: {seen} pid(s) footprint {total} > cap {self.cap}")
+                    self._end()
+                    return
             except Exception as e:      # noqa: BLE001 - a blind watchdog must say so, never read as "no kill"
                 self.blind = True
                 self._log(f"watchdog blind: {type(e).__name__}: {e}"[:300])
                 return
             self._stop.wait(self.interval)
 
-    def stop(self, timeout: float = 30.0) -> None:
+    def stop(self, timeout: float = WATCHDOG_JOIN_S) -> None:
         self._stop.set()
-        if self._thread.is_alive() or self._thread.ident is not None:
+        if self._thread.ident is not None:      # started (a finished thread's join returns at once)
             self._thread.join(timeout)
         if self._thread.is_alive():
             self.blind = True
@@ -1136,7 +1167,10 @@ def export_domain_prover(host: str, role_key: str, uid: int, *, bound_s: Optiona
                          seams: object = None) -> Callable[[Sequence[int]], object]:
     """``prove(children) -> proc.Domain``: kill and prove the export domain empty. macOS
     ``end_domain(uid, V12k)`` (freeze, kill, bootout, kill, settle, proof); Linux the scope ``cgroup.freeze`` +
-    ``cgroup.kill`` + ``populated 0`` (hierarchical, so the run leaf too), then the uid sweep by ``end_domain``."""
+    ``cgroup.kill`` + ``populated 0`` (hierarchical, so the run leaf too), then the scope THAWED (``cgroup.freeze``
+    0, confirmed by ``frozen 0``; L3 5c-ii-b r1 B-1: a scope left frozen freezes the next run's child as it joins
+    the leaf), then the uid sweep by ``end_domain``. A thaw that cannot be confirmed raises
+    ``export-image-unavailable``: the next run could not execute."""
     from levain.slot import proc as P
     bound = P.V12K_SECONDS if bound_s is None else bound_s
 
@@ -1149,9 +1183,24 @@ def export_domain_prover(host: str, role_key: str, uid: int, *, bound_s: Optiona
         c = P.CgroupProcs(scope_path(role_key), seams)
         c.freeze(uid, bound * P.FREEZE_SHARE)
         if not c.kill(uid, bound):
-            return P.Domain(False, "kill-unproven", f"{c.cgroup}: populated is not 0")
+            return P.Domain(False, "kill-unproven", f"{c.cgroup}: populated is not 0")   # left frozen: refused
+        _thaw_scope(c, bound * P.FREEZE_SHARE)
         return P.end_domain(uid, bound, children, seams=c.seams)[0]
     return prove_linux
+
+
+def _thaw_scope(c: object, bound_s: float) -> None:
+    """``cgroup.freeze`` 0 on a scope ``populated 0`` already reads empty (so the thaw releases nothing), then
+    ``frozen 0`` polled within ``bound_s``. A scope that does not exist held nothing to thaw."""
+    path = f"{c.cgroup}/cgroup.freeze"                 # type: ignore[attr-defined]
+    try:
+        c.seams.write(path, "0")                       # type: ignore[attr-defined]
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        raise Refused(UNAVAILABLE, f"{path}: the thaw failed ({_errname(e)})") from e
+    if c._poll("frozen", "0", bound_s) is False:      # type: ignore[attr-defined]  (None = the scope is gone)
+        raise Refused(UNAVAILABLE, f"{path}: written 0, cgroup.events still reads frozen 1")
 
 
 # --- the sealed run ------------------------------------------------------------------------------------------------
@@ -1204,15 +1253,16 @@ class SealedRun:
     """One sealed run's OS side (§1 steps 6, 7, 10, 11). :meth:`seal_in` in step 6's order: the domain proven empty
     (``export-domain-unproven``), a stale image detached and unlinked, (Linux) a stale leaf removed under its bound,
     the controller chain, this run's leaf with its limits, the per-run image created and attached, a stale staged
-    name deleted (``<role>-failed:publish`` / ``stale-staging``), the early exchange probe when asked; a refusal after
+    name deleted (``<role>-failed:publish`` / ``stale-staging``), the early probe, always (D1); a refusal after
     anything was made tears it down first. :meth:`start_watchdog` (macOS, after the spawn). :meth:`seal_out`: the
-    watchdog stopped, the domain proven empty again (else ``export-domain-unproven`` and the image LEFT attached for
-    the next seal-in), then the memory observation (Linux the leaf's ``oom_kill`` after ``populated 0``; macOS the
-    watchdog's flag), the leaf removed (a failure leaves it for the next seal-in), the host reading. :meth:`teardown`:
-    the order domain empty -> fds closed -> umount -> backing unlinked (r6 build note). :meth:`release_image` is
-    idempotent and never raises, so it serves as :func:`transact`'s ``before_commit`` AND teardown's last step: a
-    detach that fails there (a Linux ``umount`` while an output fd is still open) is retried by teardown once every
-    fd is closed."""
+    domain proven empty again while the watchdog still samples, the watchdog's kill and this proof under one lock,
+    then the watchdog stopped and joined (an unproven domain = ``export-domain-unproven``, the image LEFT attached
+    for the next seal-in), then the memory observation (Linux the leaf's ``oom_kill`` after ``populated 0``; macOS
+    the watchdog's flags), the leaf removed (a failure leaves it for the next seal-in), the host reading.
+    :meth:`teardown`: the order domain empty -> fds closed -> umount -> backing unlinked (r6 build note).
+    :meth:`release_image` is idempotent and never raises, so it serves as :func:`transact`'s ``before_commit`` (the
+    outputs already closed, D2) AND teardown's last step: a detach that fails there (any fd root still holds into the
+    image, for one) is retried by teardown once every fd in :attr:`fds` is closed."""
 
     def __init__(self, facts: SealFacts, seams: SealSeams) -> None:
         self.f, self.s = facts, seams
@@ -1222,11 +1272,18 @@ class SealedRun:
         self.fds: list = []
         self.released = False
         self.proven_out = False
+        import threading
+        #: B-2: the watchdog's kill and seal-out's proof take this ONE lock: never two end_domain calls on one uid.
+        self._prove_lock = threading.Lock()
+
+    def _prove(self, children: Sequence[int]) -> object:
+        with self._prove_lock:
+            return self.s.prove(tuple(children))
 
     # seal-in -------------------------------------------------------------------------------------------------------
-    def seal_in(self, class_dfd: int, staged: str, *, probe: bool) -> None:
+    def seal_in(self, class_dfd: int, staged: str) -> None:
         f, s = self.f, self.s
-        d = s.prove(())
+        d = self._prove(())
         if not getattr(d, "proven", False):
             raise Refused(UNPROVEN, f"seal-in: {getattr(d, 'name', d)} {getattr(d, 'detail', '')}".strip())
         s.log("seal-in domain proven empty")
@@ -1236,14 +1293,13 @@ class SealedRun:
                 leaf = leaf_path(f.role_key)
                 remove_stale_leaf(leaf, s.leaf)
                 enable_controllers(f.role_key, s.leaf)
+                self.leaf = leaf    # B-6: owned BEFORE it is configured, so teardown removes a partly made leaf
                 make_leaf(leaf, memory_max=f.memory_cap, pids_max=f.pids_max, seams=s.leaf)
-                self.leaf = leaf
                 s.log("leaf made")
             self.image = create_image(f.export_dir, f.role_key, f.host, size=f.image_bytes, inodes=f.image_inodes,
                                       owner_uid=f.uid, seams=s.image)
             clear_staging(class_dfd, staged, f.role, s.publish)
-            if probe:
-                probe_exchange(class_dfd, f.role, s.publish)
+            probe_exchange(class_dfd, f.role, s.publish)     # D1 (HEAD_r16 Q-r13-2): a first publish too
         except BaseException:
             self.proven_out = True          # nothing ran in the domain: seal-in's own proof stands
             self.teardown()
@@ -1254,16 +1310,20 @@ class SealedRun:
         if self.f.host != "darwin":
             return
         factory = self.s.watchdog or FootprintWatchdog
-        self.watchdog = factory(self.f.uid, self.f.memory_cap, lambda: self.s.prove(()), log=self.s.log)
+        self.watchdog = factory(self.f.uid, self.f.memory_cap, lambda: self._prove(()), log=self.s.log)
         self.watchdog.start()           # type: ignore[union-attr]
         self.s.log("watchdog started")
 
     # seal-out ------------------------------------------------------------------------------------------------------
     def seal_out(self, children: Sequence[int] = ()) -> SealReading:
         f, s = self.f, self.s
-        if self.watchdog is not None:
-            self.watchdog.stop()        # type: ignore[union-attr]
-        d = s.prove(tuple(children))
+        # B-2: the watchdog keeps sampling through the domain kill (a process can cross the cap during it); only
+        # once the proof is in is it stopped and joined, and its flags read below.
+        try:
+            d = self._prove(children)
+        finally:
+            if self.watchdog is not None:
+                self.watchdog.stop()    # type: ignore[union-attr]
         if not getattr(d, "proven", False):
             raise Refused(UNPROVEN, f"seal-out: {getattr(d, 'name', d)} {getattr(d, 'detail', '')}".strip())
         self.proven_out = True

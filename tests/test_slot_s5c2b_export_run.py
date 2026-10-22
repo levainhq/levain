@@ -429,16 +429,16 @@ def test_watchdog_ends_the_domain_past_the_cap():
     w.start()
     _wait(lambda: ended)
     w.stop()
-    assert w.killed and ended == [1] and not w.blind and w.peak == 5000
+    assert w.killed and ended == [1] and not w.blind and w.peak == 5100     # the sum over the domain (V30)
 
 
 def test_watchdog_below_the_cap_never_kills():
     w = X.FootprintWatchdog(7, 1000, lambda: pytest.fail("ended"), interval=0.01, pids=lambda uid: [1, 2],
-                            footprint=lambda pid: 999)
+                            footprint=lambda pid: 499)
     w.start()
-    _wait(lambda: w.peak == 999)
+    _wait(lambda: w.peak == 998)
     w.stop()
-    assert not w.killed and not w.blind and w.peak == 999
+    assert not w.killed and not w.blind and w.peak == 998                   # the sum stays under the cap
 
 
 def test_a_watchdog_that_cannot_sample_is_blind():
@@ -487,14 +487,17 @@ def test_domain_prover_linux_kills_the_scope_then_sweeps_the_uid(monkeypatch):
             return self.populated0
 
     monkeypatch.setattr(P, "CgroupProcs", FakeCP)
+    monkeypatch.setattr(X, "_thaw_scope", lambda c, b: calls.append(("thaw",)))
     monkeypatch.setattr(P, "end_domain", lambda uid, bound, children=(), *, seams=None:
                         (calls.append(("sweep", uid, tuple(children))) or (PROVEN, frozenset())))
     FakeCP.populated0 = True
     assert X.export_domain_prover("linux", "verifier", 298)([5]) is PROVEN
-    assert calls == [("cg", X.scope_path("verifier")), ("freeze", 298), ("kill", 298), ("sweep", 298, (5,))]
+    assert calls == [("cg", X.scope_path("verifier")), ("freeze", 298), ("kill", 298), ("thaw",),
+                     ("sweep", 298, (5,))]
     FakeCP.populated0 = False
+    del calls[:]
     d = X.export_domain_prover("linux", "importer", 299)(())
-    assert not d.proven and d.name == "kill-unproven"
+    assert not d.proven and d.name == "kill-unproven" and ("thaw",) not in calls     # live tasks stay frozen
 
 
 # --- SealedRun: seal-in, seal-out, teardown -----------------------------------------------------------------------
@@ -531,10 +534,10 @@ class Rig:
             prove=prove, image=self.fr.seams(self.log), leaf=leaf, statvfs=lambda _p: _Sv(1 << 50),
             publish=X.PublishSeams(log=self.log, **(publish_kw or {})), watchdog=watchdog, log=self.log))
 
-    def seal_in(self, probe=True):
+    def seal_in(self):
         cfd = _dfd(self.cls)
         try:
-            self.run.seal_in(cfd, STAGED if self.facts.role_key == "importer" else "verify.new", probe=probe)
+            self.run.seal_in(cfd, STAGED if self.facts.role_key == "importer" else "verify.new")
         finally:
             os.close(cfd)
 
@@ -620,7 +623,7 @@ def _ok_obs(reading, *, code=0):
 def test_linux_seal_out_reads_the_late_oom_kill_after_the_proof_and_classifies_memory(tmp_path, monkeypatch):
     _patch_leaf(monkeypatch)
     r = Rig(tmp_path)
-    r.seal_in(probe=False)
+    r.seal_in()
     r.cg.files[f"{LEAF}/memory.events.local"] = "oom_kill 1\n"         # a git child OOM-killed after the line
     reading = r.run.seal_out([4242])
     out = X.classify(_ok_obs(reading))
@@ -634,7 +637,7 @@ def test_linux_seal_out_reads_the_late_oom_kill_after_the_proof_and_classifies_m
 def test_linux_seal_out_unreadable_events_ranks_first_even_on_exit_0(tmp_path, monkeypatch):
     _patch_leaf(monkeypatch)
     r = Rig(tmp_path)
-    r.seal_in(probe=False)
+    r.seal_in()
     del r.cg.files[f"{LEAF}/memory.events.local"]                      # the leaf's controllers dropped mid-run
     reading = r.run.seal_out()
     out = X.classify(_ok_obs(reading))
@@ -644,12 +647,12 @@ def test_linux_seal_out_unreadable_events_ranks_first_even_on_exit_0(tmp_path, m
 def test_a_fresh_leaf_after_a_memory_kill_starts_at_zero(tmp_path, monkeypatch):
     _patch_leaf(monkeypatch)
     r = Rig(tmp_path, cg=FakeCg(oom=0))
-    r.seal_in(probe=False)
+    r.seal_in()
     r.cg.files[f"{LEAF}/memory.events.local"] = "oom_kill 1\n"
     assert r.run.seal_out().memory_killed
     r.run.teardown()
     r2 = Rig(tmp_path / "2" if (tmp_path / "2").mkdir() is None else None, cg=r.cg)
-    r2.seal_in(probe=False)
+    r2.seal_in()
     reading = r2.run.seal_out()
     out = X.classify(_ok_obs(reading, code=1))
     assert not reading.memory_killed and out.name == "importer-failed:exit"
@@ -658,7 +661,7 @@ def test_a_fresh_leaf_after_a_memory_kill_starts_at_zero(tmp_path, monkeypatch):
 def test_seal_out_unproven_leaves_the_image_for_the_next_seal_in(tmp_path, monkeypatch):
     _patch_leaf(monkeypatch)
     r = Rig(tmp_path, proofs=[PROVEN, Domain(False, "respawn-after-bootout")])
-    r.seal_in(probe=False)
+    r.seal_in()
     with pytest.raises(Refused) as ei:
         r.run.seal_out()
     assert ei.value.name == "export-domain-unproven"
@@ -668,7 +671,7 @@ def test_seal_out_unproven_leaves_the_image_for_the_next_seal_in(tmp_path, monke
     nxt.__dict__.update(r.__dict__)
     nxt.run = X.SealedRun(r.facts, r.run.s)
     nxt.cls = r.cls
-    nxt.seal_in(probe=False)                                            # force-detaches and unlinks the stale one
+    nxt.seal_in()                                            # force-detaches and unlinks the stale one
     assert "stale image removed" in r.log.events and r.mount in r.fr.mounted   # the new run's image
 
 
@@ -684,25 +687,25 @@ def test_darwin_seal_out_reads_the_watchdog_flag_after_stopping_it(tmp_path):
             self.killed = True                                          # a kill after the result line
             self.log("w stop")
     r = Rig(tmp_path, host="darwin", watchdog=W)
-    r.seal_in(probe=False)
+    r.seal_in()
     r.run.start_watchdog()
     reading = r.run.seal_out()
     ev = r.log.events
-    assert ev.index("w stop") < ev.index("seal-out domain proven empty") < ev.index(
-        "watchdog flag killed=True blind=False")
+    assert ev.index("prove", ev.index("w start")) < ev.index("w stop") < ev.index(
+        "seal-out domain proven empty") < ev.index("watchdog flag killed=True blind=False")    # B-2: kill, then stop
     assert X.classify(_ok_obs(reading)).name == "adopt-cap:memory"
 
 
 def test_darwin_seal_out_without_a_watchdog_cannot_establish_memory(tmp_path):
     r = Rig(tmp_path, host="darwin")
-    r.seal_in(probe=False)
+    r.seal_in()
     assert r.run.seal_out().memory_unreadable
 
 
 def test_linux_runs_no_watchdog(tmp_path, monkeypatch):
     _patch_leaf(monkeypatch)
     r = Rig(tmp_path, watchdog=lambda *a, **k: pytest.fail("a Linux watchdog"))
-    r.seal_in(probe=False)
+    r.seal_in()
     r.run.start_watchdog()
     assert r.run.watchdog is None
 
@@ -710,7 +713,7 @@ def test_linux_runs_no_watchdog(tmp_path, monkeypatch):
 def test_a_good_run_publishes_and_the_detach_happens_before_the_commit(tmp_path, monkeypatch):
     _patch_leaf(monkeypatch)
     r = Rig(tmp_path)
-    r.seal_in(probe=False)
+    r.seal_in()
     reading = r.run.seal_out()
     w = _work(tmp_path / "w" if (tmp_path / "w").mkdir() is None else None, SESSION)
     wd, cd = _dfd(w), _dfd(r.cls)
@@ -730,7 +733,7 @@ def test_a_good_run_publishes_and_the_detach_happens_before_the_commit(tmp_path,
 def test_a_detach_failure_after_a_good_run_still_publishes_and_teardown_retries(tmp_path, monkeypatch):
     _patch_leaf(monkeypatch)
     r = Rig(tmp_path)
-    r.seal_in(probe=False)
+    r.seal_in()
     reading = r.run.seal_out()
     w = _work(tmp_path / "w" if (tmp_path / "w").mkdir() is None else None, SESSION)
     wd, cd = _dfd(w), _dfd(r.cls)
@@ -752,7 +755,7 @@ def test_a_detach_failure_after_a_good_run_still_publishes_and_teardown_retries(
 def test_teardown_order_is_fds_then_umount_then_unlink(tmp_path, monkeypatch):
     _patch_leaf(monkeypatch)
     r = Rig(tmp_path)
-    r.seal_in(probe=False)
+    r.seal_in()
     r.run.seal_out()
     fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
     r.run.fds.append(fd)
@@ -767,7 +770,7 @@ def test_teardown_order_is_fds_then_umount_then_unlink(tmp_path, monkeypatch):
 def test_a_hostile_tree_in_the_image_goes_with_the_file_nothing_walked(tmp_path, monkeypatch):
     _patch_leaf(monkeypatch)
     r = Rig(tmp_path)
-    r.seal_in(probe=False)
+    r.seal_in()
     d = r.mount
     for _ in range(50):                                                  # a deep chain (5000 is 5g's on a real fs)
         d = os.path.join(d, "d")
@@ -782,7 +785,7 @@ def test_verifier_facts_use_the_verify_names(tmp_path, monkeypatch):
     _patch_leaf(monkeypatch)
     r = Rig(tmp_path, role="verifier")
     (tmp_path / "operator" / "verify.new").mkdir()
-    r.seal_in(probe=False)
+    r.seal_in()
     assert r.mount.endswith("/.verify") and "/cg/levain.slice/verify.scope/run" in r.cg.dirs
     assert "stale-staging deleted verify.new" in r.log.events
     assert X.classify(_ok_obs(r.run.seal_out()), X.VERIFIER).success
@@ -792,6 +795,193 @@ def test_verifier_facts_use_the_verify_names(tmp_path, monkeypatch):
 # 5c-ii-b L3 r1 (triage ``1022-18/adopt/L3_5c2b_r1_TRIAGE.md``: B-1 .. B-7) and the head-ruled 5c-ii-a defects D1, D2.
 # Each row was run against 251133df first (raw: ``1022-18/adopt/l3r1c_failfirst.txt``).
 # =================================================================================================================
+
+SCOPE = "/sys/fs/cgroup/levain.slice/export.scope"
+
+
+class FsScope:
+    """A cgroupfs scope for :class:`levain.slot.proc.CgroupProcs`: ``cgroup.freeze`` / ``cgroup.kill`` writes move
+    ``cgroup.events``; a child made under the scope is born frozen while the scope's ``cgroup.freeze`` reads 1."""
+
+    def __init__(self, *, fail_thaw=None, stuck_frozen=False):
+        self.freeze, self.populated, self.frozen = "0", "1", "0"
+        self.fail_thaw, self.stuck = fail_thaw, stuck_frozen
+        self.t = 0.0
+        self.writes = []
+
+    def write(self, p, text):
+        self.writes.append((p.rsplit("/", 1)[1], text))
+        if p == f"{SCOPE}/cgroup.freeze":
+            if text == "0" and self.fail_thaw:
+                raise OSError(self.fail_thaw, os.strerror(self.fail_thaw), p)
+            self.freeze = text
+            self.frozen = "1" if text == "1" or self.stuck else "0"
+        elif p == f"{SCOPE}/cgroup.kill":
+            self.populated = "0"
+        else:
+            raise FileNotFoundError(errno.ENOENT, "absent", p)
+
+    def read(self, p):
+        if p == f"{SCOPE}/cgroup.events":
+            return f"populated {self.populated}\nfrozen {self.frozen}\n"
+        raise FileNotFoundError(errno.ENOENT, "absent", p)
+
+    def child_born_frozen(self):
+        return self.freeze == "1"
+
+    def seams(self):
+        from levain.slot import proc as P
+        return P.ProcSeams(listing=lambda: [], probe=lambda pid: None, pin=lambda pid: pid,
+                           send=lambda h, s: None, read=self.read, write=self.write, clock=lambda: self.t,
+                           sleep=self._sleep, self_uids=lambda: (0,))
+
+    def _sleep(self, s):
+        self.t += s
+
+
+def _sweep_ok(monkeypatch):
+    from levain.slot import proc as P
+    monkeypatch.setattr(P, "end_domain", lambda uid, bound, children=(), *, seams=None: (PROVEN, frozenset()))
+
+
+def test_b1_the_linux_scope_is_thawed_after_the_kill_and_the_next_child_is_not_born_frozen(monkeypatch):
+    _sweep_ok(monkeypatch)
+    fs = FsScope()
+    prove = X.export_domain_prover("linux", "importer", 299, seams=fs.seams())
+    for _ in range(3):                                   # seal-in, seal-out, the next run's seal-in
+        assert prove(()) is PROVEN
+        assert fs.freeze == "0" and fs.frozen == "0" and not fs.child_born_frozen()
+    assert fs.writes[:3] == [("cgroup.freeze", "1"), ("cgroup.kill", "1"), ("cgroup.freeze", "0")]
+
+
+@pytest.mark.parametrize("fail_thaw,stuck", [(errno.EACCES, False), (None, True)])
+def test_b1_a_thaw_that_cannot_be_confirmed_fails_closed(monkeypatch, fail_thaw, stuck):
+    _sweep_ok(monkeypatch)
+    fs = FsScope(fail_thaw=fail_thaw, stuck_frozen=stuck)
+    with pytest.raises(Refused) as ei:
+        X.export_domain_prover("linux", "importer", 299, seams=fs.seams())(())
+    assert ei.value.name == "export-image-unavailable" and "cgroup.freeze" in ei.value.detail
+
+
+def _darwin_rig(tmp_path, footprint, prove):
+    import dataclasses
+    r = Rig(tmp_path, host="darwin", watchdog=lambda uid, cap, end, log: X.FootprintWatchdog(
+        uid, cap, end, interval=0.005, pids=lambda u: [77], footprint=footprint, log=log))
+    r.run.s = dataclasses.replace(r.run.s, prove=prove)
+    return r
+
+
+def test_b2_the_watchdog_samples_through_the_seal_out_kill_and_the_two_proofs_never_overlap(tmp_path):
+    import threading
+    import time
+    state = {"crossing": False, "inflight": 0, "max": 0, "calls": []}
+    lock = threading.Lock()
+
+    def prove(children):
+        with lock:
+            state["inflight"] += 1
+            state["max"] = max(state["max"], state["inflight"])
+        state["calls"].append(tuple(children))
+        if children == (4242,):                          # seal-out's: the importer's child crosses the cap meanwhile
+            state["crossing"] = True
+            time.sleep(0.2)
+        with lock:
+            state["inflight"] -= 1
+        return PROVEN
+
+    r = _darwin_rig(tmp_path, lambda pid: (2 << 30) if state["crossing"] else 1, prove)
+    r.seal_in()
+    r.run.start_watchdog()
+    reading = r.run.seal_out([4242])
+    assert reading.memory_killed and not reading.memory_unreadable
+    assert X.classify(_ok_obs(reading)).name == "adopt-cap:memory"
+    assert state["max"] == 1                             # one lock: never two end_domain calls on one uid
+    assert () in state["calls"][1:]                      # the watchdog's own kill ran, serialized
+
+
+def test_b2_the_join_bound_covers_two_serialized_proofs_and_a_join_timeout_is_blind():
+    import inspect
+    import threading
+    from levain.slot import proc as P
+    assert inspect.signature(X.FootprintWatchdog.stop).parameters["timeout"].default == X.WATCHDOG_JOIN_S
+    assert X.WATCHDOG_JOIN_S > 2 * P.V12K_SECONDS
+    gate = threading.Event()
+    w = X.FootprintWatchdog(7, 10, gate.wait, interval=0.005, pids=lambda u: [1], footprint=lambda p: 99)
+    w.start()
+    _wait(lambda: w.killed)
+    w.stop(timeout=0.05)                                 # its end() is still inside the domain kill
+    gate.set()
+    assert w.blind and w.killed
+
+
+def test_b3_an_unreadable_swap_file_is_not_an_absent_one():
+    cg = FakeCg(fail={f"{LEAF}/memory.swap.max": errno.EACCES})
+    seams = cg.seams()
+    import dataclasses
+    seams = dataclasses.replace(seams, exists=lambda p: False if p.endswith("memory.swap.max") else cg.exists(p))
+    with pytest.raises(Refused) as ei:
+        X.make_leaf(LEAF, memory_max=1, pids_max=1, seams=seams)
+    assert ei.value.name == "export-image-unavailable" and "memory.swap.max: EACCES" in ei.value.detail
+
+
+class _FakeLib:
+    def __init__(self, err):
+        self.err = err
+
+    def proc_pid_rusage(self, pid, flavor, buf):
+        import ctypes
+        ctypes.set_errno(self.err)
+        return -1
+
+
+@pytest.mark.parametrize("err,want", [(errno.ESRCH, None), (errno.EPERM, OSError), (errno.EIO, OSError)])
+def test_b4_phys_footprint_keeps_the_errno(monkeypatch, err, want):
+    monkeypatch.setattr(X, "_LIBPROC", [_FakeLib(err)])
+    if want is None:
+        assert X.phys_footprint(5) is None
+    else:
+        with pytest.raises(OSError) as ei:
+            X.phys_footprint(5)
+        assert ei.value.errno == err
+
+
+def test_b4_a_footprint_read_failure_makes_the_watchdog_blind():
+    def fp(pid):
+        raise OSError(errno.EPERM, "seam")
+    w = X.FootprintWatchdog(7, 1000, lambda: pytest.fail("ended"), interval=0.005, pids=lambda u: [1], footprint=fp)
+    w.start()
+    _wait(lambda: w.blind)
+    w.stop()
+    assert w.blind and not w.killed
+
+
+def _listing(monkeypatch, procs):
+    from levain.slot import proc as P
+
+    class Seams:
+        def listing(self):
+            return procs
+    monkeypatch.setattr(P, "default_seams", lambda host: Seams())
+
+
+def test_b4_only_the_export_uids_pids_count_and_an_unknown_owner_is_blindness(monkeypatch):
+    from levain.slot.proc import Proc, RUN, UNKNOWN
+    _listing(monkeypatch, [Proc(10, (299, 299, 299), 1, RUN), Proc(11, (501, 501, 501), 1, RUN)])
+    assert list(X.uid_pids(299)) == [10]
+    _listing(monkeypatch, [Proc(10, (299, 299, 299), 1, RUN), Proc(12, (), 0, UNKNOWN)])
+    with pytest.raises(X.WatchdogBlind):
+        X.uid_pids(299)
+
+
+def test_b4_the_cap_is_on_the_sum_over_the_domain():
+    ended = []
+    w = X.FootprintWatchdog(7, 1000, lambda: ended.append(1), interval=0.005, pids=lambda u: [1, 2],
+                            footprint=lambda p: 600)
+    w.start()
+    _wait(lambda: ended)
+    w.stop()
+    assert w.killed and w.peak == 1200 and not w.blind
+
 
 def test_b5_a_verifier_success_never_reaches_the_importer_shaped_publish(tmp_path):
     w, c = _work(tmp_path), _class_dir(tmp_path, older=False)
@@ -806,6 +996,15 @@ def test_b5_a_verifier_success_never_reaches_the_importer_shaped_publish(tmp_pat
         os.close(cd)
     assert (ei.value.name, ei.value.detail) == ("verifier-failed:publish", "verifier-unbuilt")
     assert os.listdir(c) == []
+
+
+def test_b6_a_leaf_whose_limit_write_failed_is_removed_by_the_teardown(tmp_path, monkeypatch):
+    _patch_leaf(monkeypatch)
+    r = Rig(tmp_path, cg=FakeCg(fail={f"{LEAF}/memory.max": errno.EINVAL}))
+    with pytest.raises(Refused) as ei:
+        r.seal_in()
+    assert ei.value.name == "export-image-unavailable"
+    assert LEAF not in r.cg.dirs and "leaf removed" in r.log.events
 
 
 def test_b7_a_failed_class_fsync_keeps_the_older_tree_at_the_staged_name(tmp_path):
@@ -841,6 +1040,19 @@ def test_d1_the_probe_also_tests_the_no_replace_rename(tmp_path, ignore):
         os.close(cd)
     assert (ei.value.name, ei.value.detail) == ("importer-failed:publish", "exchange-unsupported")
     assert os.listdir(c) == []
+
+
+def test_d1_seal_in_always_probes_a_first_publish_too(tmp_path, monkeypatch):
+    _patch_leaf(monkeypatch)
+    r = Rig(tmp_path, older=False)
+    cfd = _dfd(r.cls)
+    try:
+        r.run.seal_in(cfd, STAGED)                       # no caller's word: the probe is not optional
+    finally:
+        os.close(cfd)
+    ev = r.log.events
+    assert ev.index("probe exchange ok") < ev.index("probe noreplace ok") < ev.index("seal-in done")
+    assert os.listdir(r.cls) == []
 
 
 def test_d2_the_outputs_are_closed_before_the_detach_that_precedes_the_commit(tmp_path):
