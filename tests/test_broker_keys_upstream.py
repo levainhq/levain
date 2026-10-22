@@ -347,6 +347,37 @@ def test_an_early_413_during_the_upload_is_relayed(monkeypatch):
     assert json.loads(frames[1][1])["status"] == 413 and frames[2][1] == b"nope"
 
 
+class _ResetUp(_Up):
+    """An upstream that answers 413 during the upload, then resets: the head reaches keys' reader, and the next body
+    drain fails, so the upload ends in an upstream failure while the head is already there."""
+
+    async def drain(self) -> None:
+        self.drains += 1
+        if self.drains == 2:   # the head's drain returned; the first body drain meets the reset
+            # the head and the reset in one step: both tasks are done before the exchange looks at either
+            self.feed(b"HTTP/1.1 413 Payload Too Large\r\ncontent-length: 4\r\n\r\nnope")
+            raise ConnectionResetError(54, "Connection reset by peer")
+        await asyncio.sleep(0)
+
+
+def test_an_early_413_then_a_reset_relays_the_413(monkeypatch):
+    # L3 r2 N2 (complement MED), reproduced first (3b4m/r2fix_before.txt): after the race, a failed upload was
+    # consulted before a head that had already arrived, so the 413 became `upstream-error`. A completed head wins.
+    up = _ResetUp()
+
+    async def go(d: str) -> list:
+        _scripted(monkeypatch, up)
+        async with _Rig(d) as rig:
+            rig.front.feed_data(gwwire.encode(b"B", b"x" * 3000) + gwwire.encode(b"B", b"y" * 1000))
+            rig.front.feed_eof()   # ends a refusal's drain, so the failure shows as `F`, not a hang
+            await asyncio.wait_for(rig.run(_q("length:4000")), 5)
+            return await rig.got()
+
+    frames = _run(go)
+    assert _types(frames) == b"ARbe", frames
+    assert json.loads(frames[1][1])["status"] == 413 and frames[2][1] == b"nope"
+
+
 # --- L3 r1 complement MED 2: a detached exchange relays nothing more -------------------------------------------------
 
 def test_a_detached_exchange_relays_no_more_body(monkeypatch):

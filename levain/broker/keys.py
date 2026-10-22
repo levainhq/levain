@@ -1377,6 +1377,11 @@ class Keys:
         try:
             await asyncio.wait({upload, head}, return_when=asyncio.FIRST_COMPLETED)
             if upload.done():
+                # an upstream that answers (a 413) and then resets fails the upload too; when its head has already
+                # been read, the head wins over that failure (the front's abort and keys' own refusal still stand)
+                if (isinstance(upload.exception(), UpstreamFailed) and head.done() and not head.cancelled()
+                        and head.exception() is None):
+                    return head.result()
                 if not upload.result():   # the body's own refusal or upstream failure raises here
                     return None
                 if not head.done():
