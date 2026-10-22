@@ -51,14 +51,20 @@ def _session(tmp_path):
     _git("bundle", "create", str(bundle), "HEAD", "main", cwd=base)
     repo = tmp_path / "repo"
     _git("clone", "-q", str(bundle), str(repo))
+    # The packs are cut by hand: `repack` and the auto-maintenance a commit may start decide their own pack count by git
+    # version and config, and this fixture means exactly two packs, one per commit, the second naming the first's objects.
+    quiet = ("-c", "gc.auto=0", "-c", "maintenance.auto=false")
     packs = []
+    prev = _git("rev-parse", "HEAD", cwd=repo)
     for name in ("one", "two"):
-        before = set((repo / ".git/objects/pack").glob("*.pack"))
         (repo / name).write_text(name + "\n")
-        _git("add", name, cwd=repo)
-        _git("commit", "-qm", name, cwd=repo)
-        _git("repack", "-q", cwd=repo)
-        packs += list(set((repo / ".git/objects/pack").glob("*.pack")) - before)
+        _git(*quiet, "add", name, cwd=repo)
+        _git(*quiet, "commit", "-qm", name, cwd=repo)
+        objects = _git("rev-list", "--objects", "HEAD", "^" + prev, cwd=repo)
+        stem = subprocess.run([GIT, "pack-objects", "-q", str(repo / ".git/objects/pack/pack")], cwd=repo, env=ENV, check=True,
+                              input=objects.encode(), capture_output=True).stdout.decode().strip()
+        packs.append(repo / ".git/objects/pack" / ("pack-" + stem + ".pack"))
+        prev = _git("rev-parse", "HEAD", cwd=repo)
     return bundle, _git("rev-parse", "main", cwd=base), repo, packs
 
 
