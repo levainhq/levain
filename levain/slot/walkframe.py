@@ -146,10 +146,14 @@ def check_terminal(header: dict) -> None:
     _int(header, "bytes", _INT_MAX)
 
 
+_READ_CHUNK = 1 << 20
+
+
 def _read_exact(fh: BinaryIO, n: int) -> bytes:
+    """Up to ``n`` bytes, read in bounded chunks: a header's ``size`` never sizes an allocation up front."""
     out = bytearray()
     while len(out) < n:
-        chunk = fh.read(n - len(out))
+        chunk = fh.read(min(n - len(out), _READ_CHUNK))
         if not chunk:
             break
         out += chunk
@@ -182,7 +186,12 @@ def read_header(fh: BinaryIO) -> dict | None:
     if "end" in header:
         check_terminal(header)
     else:
-        check_entry(header)
+        parts = check_entry(header).split(b"/")
+        # The decoder's bound is the format's: a path no deeper than MAX_DEPTH, no component past NAME_MAX.
+        if len(parts) > MAX_DEPTH:
+            raise _bad("path_b64", f"{len(parts)} components > {MAX_DEPTH}")
+        if any(len(p) > NAME_MAX for p in parts):
+            raise _bad("path_b64", f"a component past {NAME_MAX} bytes")
     return header
 
 
