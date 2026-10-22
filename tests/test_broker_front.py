@@ -490,10 +490,12 @@ _WS_POLICY = {"format": "levain-front-session/1", "kind": "interactive", "sessio
      "max_call_microdollars": 1}]}
 
 
-def test_websocket_slot_reset_ends_the_exchange_and_tells_keys():
+@pytest.mark.parametrize("close", ["rst", "fin"])
+def test_websocket_slot_close_ends_the_exchange_and_tells_keys(close):
     """Reproduced (3b-1a-fix3, complement r3): on an established websocket the slot RESETS while keys stays silent.
     The pump died on the slot's read error, keys never heard, and the relay waited on keys with no bound. Now keys
-    gets `E` and the exchange ends `slot-gone`."""
+    gets `E` and the exchange ends `slot-gone`. Reproduced (3b-1a-fix4, codex r4): the same wait on a CLEAN slot
+    close (a FIN): keys got `E` but the relay never ended. Now it ends `slot-eof`, with no `slot_error`."""
     import base64
     import struct
 
@@ -531,16 +533,23 @@ def test_websocket_slot_reset_ends_the_exchange_and_tells_keys():
             sw.write(b"\x81\x05hello")
             await sw.drain()
             await asyncio.sleep(0.3)
-            sw.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-            sw.transport.abort()   # an RST, not a FIN
+            if close == "rst":
+                sw.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                sw.transport.abort()   # an RST, not a FIN
+            else:
+                sw.write_eof()         # a FIN
             await asyncio.wait_for(run, 10)
             fw.close()
+            sw.close()
             await asyncio.sleep(0.1)
             keys.close()
         return ex.rec, got
 
     rec, got = asyncio.run(go())
-    assert rec["end"] == "slot-gone" and rec.get("slot_error"), rec
+    if close == "rst":
+        assert rec["end"] == "slot-gone" and rec.get("slot_error"), rec
+    else:
+        assert rec["end"] == "slot-eof" and "slot_error" not in rec, rec
     assert b"D" in got and got[got.index(b"D") + 1:][:1] == [b"E"], got
 
 

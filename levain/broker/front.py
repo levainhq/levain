@@ -471,6 +471,9 @@ _FWD_VALUE = re.compile(r"[\t\x20-\x7e]*\Z")
 #: the events queue between keys' reader and the relay: a full queue makes the reader wait, so a slot that reads
 #: slowly slows keys down instead of the front buffering the upstream's response.
 _EVENTS_MAX = 8
+#: body-writer events that never end an exchange: the writer finished ("end"), or its write to keys failed
+#: ("write-error"), and keys' reader decides the outcome. On a websocket they come from the GET's writer and can queue behind `U`.
+_BODY_SKIP = frozenset({"end", "write-error"})
 
 
 async def open_keys(path: str) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
@@ -818,9 +821,7 @@ class BrokeredExchange:
         while True:
             kind, payload = await self._next(events)
             if kind == "body":
-                if payload == "end":
-                    continue
-                if payload == "write-error":
+                if payload in _BODY_SKIP:
                     continue   # the reader's verdict decides: the F it already holds, or keys-unavailable
                 if payload == "slot-eof":
                     self.rec["end"] = payload
@@ -924,9 +925,10 @@ class BrokeredExchange:
                     kw.write(gwwire.encode(b"E"))
                     await events.put(("body", ("slot-gone", type(e).__name__)))
                     return
-                if not data:
+                if not data:   # the slot closed cleanly: keys hears `E`, the relay below ends (not an error)
                     kw.write(gwwire.encode(b"E"))
                     await kw.drain()
+                    await events.put(("body", "slot-eof"))
                     return
                 kw.write(gwwire.encode(b"D", data))
                 await kw.drain()
@@ -938,7 +940,10 @@ class BrokeredExchange:
                 if kind == "body" and isinstance(payload, tuple):   # the pump: a read on the slot failed
                     self._end_slot_gone(payload[1])
                     return
-                if kind == "body" and payload == "end":   # the GET's finished body writer: its event can queue behind `U`
+                if kind == "body" and payload == "slot-eof":   # the pump: the slot closed cleanly
+                    self.rec["end"] = "slot-eof"
+                    return
+                if kind == "body" and payload in _BODY_SKIP:   # the GET's finished body writer, queued behind `U`
                     continue
                 if kind != b"D":
                     self.rec["end"] = "ws-" + (kind.decode("ascii") if isinstance(kind, bytes) else kind)
