@@ -598,6 +598,16 @@
     return postVerb(action, params, {});
   }
 
+  // dismiss an agent's note: the row's own offered note_dismiss (C1, no confirm, no params). It tells the agent nothing;
+  // the kernel's 409 on a row that changed is the answer when it was dismissed elsewhere
+  async function dismissNote(rowId) {
+    if (!live) return { ok: false, error: "not_ready", message: "the page has not finished reading" };
+    const row = live.rows[rowId];
+    const action = row && Array.isArray(row.actions) ? row.actions.find((a) => a && a.verb === "note_dismiss") : null;
+    if (!action) return { ok: false, error: "not_offered", message: "the cockpit no longer offers a dismiss here; nothing was sent" };
+    return postVerb(action, {}, {});
+  }
+
   // Draw what the last write said on its row (or in the status line when the row is gone). The status
   // line carries it either way.
   function showNotice() {
@@ -703,7 +713,7 @@
         if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return false; }
         writeTokenRequired = mview.write_token_required === true;
         window.LevainDashboard.render(mview, mview.writable
-          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, onJobsIdle, recall } : { recall });
+          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, dismissNote, onJobsIdle, recall } : { recall });
         live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };
         if (heldNext) {    // published once drawn: only then can a panel be refetched in place
           window.LevainCockpitHeld = heldNext;

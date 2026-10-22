@@ -31,6 +31,9 @@ it serves only these:
     ``POST /question/<n>/answer`` answers one by an option key or free text, once. An answer is UNSIGNED (no
     passkey) and authorises NOTHING: it is words the agent is told; it is then delivered to the agent's session
     on its own thread (:func:`levain.consent.band.deliver_answer`), as a ruling is.
+  - ``GET /consent.json`` also lists ``notes`` (the open ones, :mod:`levain.consent.notes`: an agent telling the
+    operator something that needs no answer) and ``POST /note/<n>/dismiss`` marks one read, once. A dismissal is
+    unsigned, authorises nothing and is delivered to nobody.
 
 A proxy the operator runs (``tailscale serve``) puts it on an https name. Every data route needs this server's own
 token (``X-Levain-Phone-Token``), printed in the phone link's fragment (new each run, unless ``--token-file`` keeps
@@ -80,6 +83,7 @@ _CONSENT_PREFIX = "/consent/"
 _CONSENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")      # the cockpit's consent-body id shape
 _ACTIONS = ("challenge", "answer", "rule-challenge", "rule")
 _QUESTION_ROUTE = re.compile(r"/question/([0-9]{1,12})/(answer|rule)")
+_NOTE_ROUTE = re.compile(r"/note/([0-9]{1,12})/dismiss")    # an agent's note, marked read: unsigned, delivers nothing
 _KEY_LINE = "/passkey/key-line"
 _SIGN_PREFIX = "/sign/"
 _SIGN_ACTIONS = ("challenge", "answer", "deny")
@@ -320,10 +324,11 @@ class _PhoneHandler(GuardedHandler):
         consent = _consent_route(route)
         sign = _sign_route(route)
         question = _QUESTION_ROUTE.fullmatch(route)
+        note = _NOTE_ROUTE.fullmatch(route)
         dispatch = _DISPATCH_ROUTE.fullmatch(route)
         grant = _grant_route(route)
-        if (consent is None and sign is None and question is None and dispatch is None and grant is None
-                and route != _KEY_LINE):
+        if (consent is None and sign is None and question is None and note is None and dispatch is None
+                and grant is None and route != _KEY_LINE):
             if not self._app_post(route):
                 self._reject(404, "not_found", "no such route")
             return
@@ -368,6 +373,8 @@ class _PhoneHandler(GuardedHandler):
                 result = self.server.question_rule(int(question.group(1)), req)
             elif question is not None:
                 result = self.server.question_answer(int(question.group(1)), req)
+            elif note is not None:
+                result = self.server.note_dismiss(int(note.group(1)), req)
             else:
                 result = self.server.key_line(req)
         except PhoneError as exc:
@@ -560,8 +567,10 @@ class _PhoneServer(ThreadingHTTPServer):
             page = self.signer.page(sign_signers)
             sign_pending, sign_overflow = page["rows"], page["overflow"]
         dispatch_pending, dispatch_note, dispatch_overflow = self.dispatch.pending()
+        notes, notes_overflow, notes_note = self._notes()
         return {"rp_id": self.rp_id, "questions": questions, "questions_overflow": questions_overflow,
-                "questions_note": questions_note,
+                "questions_note": questions_note, "notes": notes, "notes_overflow": notes_overflow,
+                "notes_note": notes_note,
                 "pending": rows, "undecided": undecided, "overflow": listing.overflow,
                 "enrolled": self._enrolled(memo), "sign_pending": sign_pending, "sign_note": sign_note,
                 "sign_overflow": sign_overflow, "dispatch_pending": dispatch_pending, "dispatch_note": dispatch_note,
@@ -587,6 +596,43 @@ class _PhoneServer(ThreadingHTTPServer):
                                                       "request_id": q.link.request_id, "card": None}}
                 for q in open_[:PENDING_CAP]]
         return rows, max(len(open_) - PENDING_CAP, 0), ""
+
+    def _notes(self) -> "tuple[list[dict[str, Any]], int, str]":
+        """The open notes (oldest first, capped like the pending list), how many were left out, and a note when the
+        store could not be read. A queue with no ``notes.db`` lists none and creates none."""
+        from levain.consent.listing import PENDING_CAP
+        from levain.consent.notes import NoteStore, NoteStoreError
+
+        try:
+            open_ = NoteStore(self.queue_dir).open_notes()
+        except (NoteStoreError, OSError, sqlite3.Error) as exc:
+            return [], 0, f"{type(exc).__name__}: {exc}"
+        rows = [{"n": n.n, "id": n.id, "agent": n.agent, "what": n.what, "detail": n.detail, "filed_at": n.filed_at}
+                for n in open_[:PENDING_CAP]]
+        return rows, max(len(open_) - PENDING_CAP, 0), ""
+
+    def note_dismiss(self, n: int, req: Any) -> dict[str, Any]:
+        """``POST /note/<n>/dismiss`` (``{}``): mark the note read, once, channel ``phone``. Unsigned, and it delivers
+        NOTHING to the agent: no delivery thread and no ``_AWAIT``, unlike an answer."""
+        from levain.cockpit.consent import ConsentError
+        from levain.consent.notes import NoteStore, NoteStoreError
+
+        if req != {}:
+            raise PhoneError(400, "bad_request", "a dismiss takes an empty object")
+        store = NoteStore(self.queue_dir)
+        try:
+            note = store.get(n)
+            if note is None:
+                raise PhoneError(404, "not_found", f"no note #{n}")
+            if note.dismissed is not None:
+                raise PhoneError(409, "conflict", f"note #{n} was already dismissed")
+            try:
+                store.dismiss(note.id, channel="phone")
+            except ConsentError as exc:
+                raise PhoneError(409 if "already dismissed" in str(exc) else 422, "dismiss_refused", str(exc)) from None
+        except (NoteStoreError, OSError, sqlite3.Error) as exc:
+            raise PhoneError(503, "unavailable", f"the note store cannot dismiss now: {exc}") from None
+        return {"dismissed": note.n}
 
     def question_answer(self, n: int, req: Any) -> dict[str, Any]:
         """``POST /question/<n>/answer`` ({option} or {text}): record the answer (unsigned, once), then deliver it

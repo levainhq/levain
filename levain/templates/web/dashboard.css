@@ -1703,6 +1703,26 @@ body.ke .needs-btn:hover, body.ke .needs-card .question-option:hover { border-co
 body.ke .needs-card .question-option:disabled { opacity: .4; cursor: default; }
 body.ke .needs-card .question-rec { color: var(--base); background: var(--accent); border-color: var(--accent); }
 body.ke .needs-card .question-rec:hover { background: var(--accent); border-color: var(--text); }
+/* An agent's note: grey, flat and quiet on purpose. No accent, no ring, no REC and no sign line, so nothing about it reads as a
+   decision or as authority; its one control is "dismiss". */
+.note-chip { font: var(--fw-medium) var(--fs-micro)/1.4 var(--mono); color: var(--meta); border: 1px dashed var(--hair-2); border-radius: var(--r-sm); padding: 0 var(--sp-2); }
+.note-what { font-weight: var(--fw-semibold); color: var(--text); overflow-wrap: anywhere; }
+.note-detail { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--label); margin-top: var(--sp-2); }
+.note-actions { display: flex; align-items: center; gap: var(--sp-3); margin-top: var(--sp-3); }
+.note-dismiss { min-height: 34px; font: var(--fw-medium) var(--fs-meta)/1 var(--sans); color: var(--label); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-4); cursor: pointer; }
+.note-dismiss:hover { color: var(--text); border-color: var(--label); }
+.note-dismiss:disabled { opacity: .4; cursor: default; }
+body.ke .ck-notes.frame { padding-inline: 0; margin-inline: var(--gutter-ke); margin-top: var(--sec); }
+body.ke .ck-notes[hidden], .ck-notes[hidden] { display: none; }
+body.ke .notes-headline { display: flex; align-items: baseline; gap: var(--sp-4); flex-wrap: wrap; }
+body.ke .notes-headline h3 { margin: 0; font: var(--fw-bold) var(--fs-title)/1.2 var(--round); color: var(--label); }
+body.ke .notes-count { font: var(--fw-bold) var(--fs-meta)/1 var(--mono); color: var(--meta); border: 1px solid var(--hair-2); border-radius: 999px; padding: var(--sp-1) var(--sp-3); }
+body.ke .notes-gloss { font-size: var(--fs-meta); color: var(--meta); }
+body.ke .notes-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: var(--gap); margin-top: var(--sp-4); }
+body.ke .note-card { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; padding: var(--sp-4) var(--sp-5); background: var(--card-2); border: 1px solid var(--hair-2); border-radius: var(--r-lg); }
+body.ke .note-head { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; font-size: var(--fs-meta); }
+body.ke .note-from { color: var(--label); }
+body.ke .note-card .note-detail { max-height: 10em; overflow-y: auto; }
 body.ke .needs-card .question-answer { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); width: 100%; margin: 0; justify-content: stretch; }
 body.ke .needs-card .question-answer .question-option:last-child:nth-child(odd) { grid-column: 1 / -1; }
 body.ke .needs-card .question-option { line-height: 1.3; }

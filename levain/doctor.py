@@ -3481,19 +3481,23 @@ def _check_dispatch_server(install: Path, server: object) -> CheckResult:
                                            "(each call needs the operator's approval)")
 
 
-BAND_ALLOW_ROW = "settings levain_band ask allowed"
+BAND_ALLOW_ROW = "settings levain_band tools allowed"
+_BAND_TOOL_RULES = ("mcp__levain_band__ask", "mcp__levain_band__note")
 
 
 def _check_band_allow(allow: object) -> CheckResult:
-    """Advisory: Claude Code may call the band's ``ask`` tool without a prompt. Without the rule a headless session
-    (``-p``, dontAsk) is refused the call and files nothing, though the server is registered. A settings.json kept as
-    the operator's on update can lack it."""
+    """Advisory: Claude Code may call the band's ``ask`` and ``note`` tools without a prompt. Without a tool's rule a
+    headless session (``-p``, dontAsk) is refused that call and files nothing, though the server is registered. A
+    settings.json kept as the operator's on update can lack one."""
     rules = allow if isinstance(allow, list) else []
-    if any(a in ("mcp__levain_band", "mcp__levain_band__ask") for a in rules):
-        return CheckResult(BAND_ALLOW_ROW, True, "mcp__levain_band__ask allowed")
-    return CheckResult(BAND_ALLOW_ROW, True, "mcp__levain_band__ask is not in permissions.allow: a headless session "
-                                             "is refused the `ask` tool (an interactive one asks first)",
-                       "Add 'mcp__levain_band__ask' to .claude/settings.json permissions.allow", warn=True)
+    missing = [] if "mcp__levain_band" in rules else [r for r in _BAND_TOOL_RULES if r not in rules]
+    if not missing:
+        return CheckResult(BAND_ALLOW_ROW, True, " and ".join(_BAND_TOOL_RULES) + " allowed")
+    tools = " and ".join(f"`{r.rsplit('__', 1)[1]}`" for r in missing)
+    return CheckResult(BAND_ALLOW_ROW, True, f"{', '.join(missing)} not in permissions.allow: a headless session "
+                                             f"is refused the {tools} tool (an interactive one asks first)",
+                       "Add " + " and ".join(f"'{r}'" for r in missing) + " to .claude/settings.json "
+                       "permissions.allow", warn=True)
 
 
 _BAND_KEYS = frozenset({"type", "command", "args"})

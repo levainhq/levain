@@ -67,12 +67,17 @@
     const asks = Array.isArray(data.questions) ? data.questions : [];
     // dispatch jobs a planner filed (levain dispatch): a contract to sign with a passkey, or a live job to cancel
     const jobs = Array.isArray(data.dispatch_pending) ? data.dispatch_pending : [];
+    // notes an agent filed: read and dismissed, never answered; they wait on nothing, so they are not counted as waiting
+    const memos = Array.isArray(data.notes) ? data.notes : [];
     // words typed for a request no longer listed (signed, denied, expired) go with it, so a reused id starts empty
     for (const id of writeIns.keys()) if (!signs.some((r) => r.id === id)) writeIns.delete(id);
     const waiting = rows.length + gaps.length + signs.length + asks.length + jobs.length;
     const unread = (Number(data.sign_overflow) > 0 ? " \u00b7 " + Number(data.sign_overflow) + " more sign requests not shown" : "")
       + (Number(data.questions_overflow) > 0 ? " \u00b7 " + Number(data.questions_overflow) + " more questions not shown" : "")
-      + (Number(data.dispatch_overflow) > 0 ? " \u00b7 " + Number(data.dispatch_overflow) + " more dispatch jobs not shown" : "");
+      + (Number(data.dispatch_overflow) > 0 ? " \u00b7 " + Number(data.dispatch_overflow) + " more dispatch jobs not shown" : "")
+      + (memos.length ? " \u00b7 " + memos.length + (memos.length === 1 ? " note" : " notes") : "")
+      + (Number(data.notes_overflow) > 0 ? " \u00b7 " + Number(data.notes_overflow) + " more notes not shown" : "")
+      + (typeof data.notes_note === "string" && data.notes_note ? " \u00b7 agent notes unavailable: " + data.notes_note : "");
     const qnote = typeof data.questions_note === "string" && data.questions_note ? data.questions_note : "";
     const dnote = typeof data.dispatch_note === "string" && data.dispatch_note ? data.dispatch_note : "";
     // a store fault is never "nothing waiting": the page says it cannot see the agents' questions or dispatch jobs
@@ -84,7 +89,8 @@
     const rest = linked.length ? signs.filter((r) => r.id !== focus) : signs;
     list.replaceChildren(...linked.map((r) => signCard(r, data.sign_note, true)), ...asks.map(questionCard),
                          ...rest.map((r) => signCard(r, data.sign_note)), ...jobs.map(dispatchCard),
-                         ...rows.map((r) => row(r, false)), ...gaps.map((r) => row(r, true)));
+                         ...rows.map((r) => row(r, false)), ...gaps.map((r) => row(r, true)),
+                         ...(memos.length ? [el("h2", "notes-head", "Notes · nothing to answer"), ...memos.map(noteCard)] : []));
     // said once: after the linked card is signed or denied here the link goes without a note; otherwise it is let go
     // after three listings without it (a passing sign-side fault gets two more). A link opened mid-ceremony reloads
     // the page and the result shows on the reload
@@ -188,6 +194,37 @@
     const sendRow = el("div", "actions");
     sendRow.appendChild(go);
     card.append(leads, actions, words, sendRow, note);
+    return card;
+  }
+
+  // an agent's note: text only, never HTML. It carries no answer, no rec and no passkey; "Dismiss" marks it read and the
+  // agent is told nothing
+  function noteCard(n) {
+    const card = el("article", "req agent-note");
+    const head = el("div", "req-head");
+    head.append(el("span", "tool", "note #" + n.n), el("span", "meta", "from " + (n.agent || "agent")));
+    card.append(head, el("div", "note-what", typeof n.what === "string" ? n.what : ""));
+    if (typeof n.detail === "string" && n.detail) card.appendChild(el("div", "note-detail", n.detail));
+    const key = "note\u0000" + n.id;   // never a consent or question id
+    const msg = el("div", "note");
+    const say = (text, kind) => { notes.set(key, [text, kind || ""]); msg.textContent = text; msg.className = "note " + (kind || ""); };
+    if (notes.has(key)) say(notes.get(key)[0], notes.get(key)[1]);
+    const go = el("button", "quiet", "Dismiss");
+    go.type = "button";
+    go.addEventListener("click", () => {
+      if (busy) return;
+      busy++;
+      go.disabled = true;
+      call("POST", "/note/" + encodeURIComponent(n.n) + "/dismiss", {}).then((a) => {
+        if (!a.ok && a.status !== 409) { go.disabled = false; return say("not dismissed: " + why(a), "bad"); }
+        last = "dismissed note #" + n.n;
+        say("dismissed", "ok");
+      }).catch((e) => { go.disabled = false; say("the page failed (" + ((e && e.name) || "error") + "); try again", "bad"); })
+        .finally(() => { busy--; setTimeout(load, 800); });
+    });
+    const row = el("div", "actions");
+    row.appendChild(go);
+    card.append(row, msg);
     return card;
   }
 

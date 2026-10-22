@@ -314,7 +314,40 @@ def _applies_to_row(verb: "VerbSpec", row: dict[str, Any]) -> bool:
     source declared without an ``applies_to`` (that source's verbs bind to its own rows)."""
     if str(row.get("id", "")).startswith("question:") and verb.name != "question_answer":
         return False
+    if str(row.get("id", "")).startswith("note:") and verb.name != "note_dismiss":
+        return False
     return verb.applies_to is None or bool(verb.applies_to(row))
+
+
+# an OPEN note row only: a dismissed one is a 409
+_OPEN_NOTE_ROW = lambda r: (str(r.get("id", "")).startswith("note:")   # noqa: E731
+                            and _facet(r, "note_state") == "open")
+
+
+def _note_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
+    """Dismiss one note: written once, channel ``cockpit``. It tells the agent NOTHING: no delivery, no thread, no
+    hook, no resume (``levain.consent.notes`` has no path that could), so it spends no agent's tokens; and it
+    authorises nothing, so it is C1 and needs no broker."""
+    from levain.cockpit.consent import ConsentError
+    from levain.consent.notes import NoteStoreError
+
+    store = target.get("notes")
+    if store is None:
+        raise EditError("not_built", 501, "this cockpit has no note store")
+    if params:
+        raise EditError("bad_request", 400, "a dismiss takes no parameters")
+    n = _facet(target["row"], "note_n")
+    try:
+        note = store.get(n)
+        if note is None or note.dismissed is not None:   # the version check ran on the row; this is the race behind it
+            raise EditError("stale", 409, f"note #{n} was dismissed or is gone")
+        store.dismiss(note.id, channel="cockpit")
+    except ConsentError as exc:
+        raise EditError("stale" if "already dismissed" in str(exc) else "bad_request",
+                        409 if "already dismissed" in str(exc) else 400, str(exc)) from None
+    except (NoteStoreError, OSError, sqlite3.Error) as exc:
+        raise EditError("source_unavailable", 503, f"the note store cannot dismiss now: {exc}") from None
+    return {"dismissed": n}
 
 
 def _question_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
@@ -408,6 +441,9 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("question_answer", "answer", "records your answer to an agent's question and sends it to the agent "
              "(it authorises nothing)", "row", fields=("option", "text"), floor="C1", tier_fn=_const("C1"),
              reversible=False, fire=_question_fire, applies_to=_OPEN_QUESTION_ROW),
+    VerbSpec("note_dismiss", "dismiss", "marks an agent's note read (it tells the agent nothing and authorises "
+             "nothing)", "row", floor="C1", tier_fn=_const("C1"), reversible=False, fire=_note_fire,
+             applies_to=_OPEN_NOTE_ROW),
     VerbSpec("operator_state", "set state", "sets your freeform state line", "value",
              fields=("text",), floor="C1", tier_fn=_const("C1"), fire=_operator_state_fire,
              legacy_kind="operator_state"),
@@ -829,7 +865,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
         raise _refuse("not_built", 501, f"{verb.name!r} has no handler")
     target: dict[str, Any] = {"panel_id": panel_id, "row_id": req.get("row_id"), "row": row,
                               "source": _SURFACE_SOURCE.get(str(credential.get("name")), "web"),
-                              "questions": cockpit.question_store}
+                              "questions": cockpit.question_store, "notes": getattr(cockpit, "note_store", None)}
     if verb.binding == "value":
         supplied = req.get("panel_version")
         target["check"] = lambda: _check_value_version(cockpit, panel_id, supplied)

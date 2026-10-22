@@ -1,6 +1,7 @@
-"""The question band's MCP door: a stdio MCP server with one tool, ``ask``, that files a question exactly as
+"""The question band's MCP door: a stdio MCP server with two tools: ``ask``, which files a question exactly as
 ``levain ask`` does (:func:`levain.consent.band.file_question`), for an agent that reaches tools more readily than its
-shell. Stdlib only: JSON-RPC 2.0, one JSON message per line. Run as
+shell; and ``note``, which files a note (:class:`levain.consent.notes.NoteStore`): something the operator reads and
+dismisses, with no answer and nothing delivered back. Stdlib only: JSON-RPC 2.0, one JSON message per line. Run as
 ``<python> -P -m levain.consent.band_mcp --agent <claude_code|codex>``.
 
 The session is read per call: the ``tools/call`` request's ``params._meta`` (``threadId``, then ``sessionId``) when it
@@ -46,6 +47,25 @@ TOOL: dict[str, Any] = {
             "blocks": {"type": "string", "description": "What waits on the answer, one line."},
         },
         "required": ["what", "options", "rec", "blocks"],
+        "additionalProperties": False,
+    },
+}
+# a note (Phill 10-22): told, read, dismissed; no answer comes back and nothing waits on it (levain.consent.notes)
+NOTE_TOOL: dict[str, Any] = {
+    "name": "note",
+    "description": (
+        "Tell the operator something that needs no answer: a reply, a result, a heads-up. File what (one line) and, "
+        "if useful, detail. The operator reads it and dismisses it; nothing comes back to you and nothing waits on "
+        "it. A note authorises nothing and is not a question: if you need a decision, use ask."),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "what": {"type": "string", "description": "What you are telling the operator, one line (up to 200 "
+                                                      "characters)."},
+            "detail": {"type": "string", "description": "Optional: more, up to 4000 characters; line breaks are "
+                                                        "kept."},
+        },
+        "required": ["what"],
         "additionalProperties": False,
     },
 }
@@ -111,6 +131,46 @@ def _ask(agent: str, params: dict[str, Any]) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}], "isError": q is None}
 
 
+def _session(agent: str, params: dict[str, Any]) -> str:
+    """The session a call names (``_meta``), else the server's environment, else :data:`band.NO_SESSION`."""
+    session = _meta_session(params)
+    if session is not None:
+        return session
+    env = os.environ
+    return (env.get("CLAUDE_CODE_SESSION_ID") if agent == "claude_code" else env.get("CODEX_THREAD_ID")) \
+        or band.NO_SESSION
+
+
+def _note(agent: str, params: dict[str, Any]) -> dict[str, Any]:
+    """File a note. It pings nobody and nothing is ever delivered back: a note's session is provenance only."""
+    import sqlite3
+
+    from levain.cockpit.consent import ConsentError
+    from levain.consent.notes import NoteStore, NoteStoreError
+
+    raw = params.get("arguments")
+    if not isinstance(raw, dict):
+        raise _RpcError(INVALID_PARAMS, "arguments must be an object")
+    extra = set(raw) - {"what", "detail"}
+    if "what" not in raw or extra:
+        raise _RpcError(INVALID_PARAMS, "a note takes what (required) and detail (optional) only"
+                        + (f": not {', '.join(sorted(extra))}" if extra else ""))
+    if not isinstance(raw["what"], str) or not isinstance(raw.get("detail", ""), str):
+        raise _RpcError(INVALID_PARAMS, "what and detail must be strings")
+    try:
+        n = NoteStore().file(agent=agent, agent_session_id=_session(agent, params), what=raw["what"],
+                             detail=raw.get("detail"), cwd=os.path.abspath(os.getcwd()))
+    except (ConsentError, NoteStoreError, OSError) as exc:
+        return {"content": [{"type": "text", "text": f"levain note: refused, nothing was filed: {exc}"}],
+                "isError": True}
+    except sqlite3.Error as exc:
+        return {"content": [{"type": "text", "text": f"levain note: the note store could not be written, so nothing "
+                                                     f"was filed ({exc}); try again"}], "isError": True}
+    return {"content": [{"type": "text", "text": f"levain note: note #{n.n} filed ({n.id}); the operator reads it and "
+                                                 "dismisses it. Nothing comes back to you: do not wait for it."}],
+            "isError": False}
+
+
 def handle(agent: str, msg: Any) -> dict[str, Any] | None:
     """The reply to one decoded message, or ``None`` for a notification (a message with no ``id``)."""
     if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
@@ -131,8 +191,10 @@ def handle(agent: str, msg: Any) -> dict[str, Any] | None:
             return _ok(rid, {"protocolVersion": version if isinstance(version, str) else _PROTOCOL,
                              "capabilities": {"tools": {}}, "serverInfo": {"name": "levain_band", "version": "1"}})
         if method == "tools/list":
-            return _ok(rid, {"tools": [TOOL]})
+            return _ok(rid, {"tools": [TOOL, NOTE_TOOL]})
         if method == "tools/call":
+            if params.get("name") == NOTE_TOOL["name"]:
+                return _ok(rid, _note(agent, params))
             if params.get("name") != TOOL["name"]:
                 raise _RpcError(INVALID_PARAMS, f"unknown tool {params.get('name')!r}")
             return _ok(rid, _ask(agent, params))

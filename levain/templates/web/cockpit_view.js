@@ -324,6 +324,16 @@
                             decidedAge: typeof f.decided_at === "string" ? ageLabel(f.decided_at, nowMs || Date.now(), "") : "",
                             offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "question_answer" && a.gesture === "direct") };
         }
+        // an agent's note: who filed it, when, and whether it was dismissed; its words are fetched with the page's token
+        // (dashboard_core.js noteBody). It carries no answer and no authority: `offered` is only the kernel's dismiss
+        if (head.id === "decisions" && typeof r.id === "string" && r.id.indexOf("note:") === 0) {
+          const f = r.facets || {};
+          const sv = (x) => (typeof x === "string" ? x : "");
+          line.note = { id: r.id, n: isNum(f.note_n) ? f.note_n : 0, agent: sv(f.agent), state: sv(f.note_state),
+                        age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "",
+                        decidedAge: typeof f.decided_at === "string" ? ageLabel(f.decided_at, nowMs || Date.now(), "") : "",
+                        offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "note_dismiss" && a.gesture === "direct") };
+        }
         return line;
       });
       const fields = fieldsOf(out.search, ROW_FIELDS);
