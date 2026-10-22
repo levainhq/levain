@@ -444,7 +444,10 @@ def test_b4_the_first_set_fsyncs_L_keys_and_a_failure_is_not_durable(L, monkeypa
     rc, out, err = _main(["set-credential", NAME], _seams(L)[0])
     assert rc == 0 and "not durable" in err
     rc, out, err = _main(["set-credential", NAME], _seams(L, _fields(secret="sk-test-two"))[0])
-    assert rc == 0 and "not durable" not in err      # cred/ existed: nothing new in L/keys
+    assert rc == 0 and "not durable" in err          # cred/ existed, but its entry in L/keys was never synced
+    monkeypatch.undo()
+    rc, out, err = _main(["set-credential", NAME], _seams(L, _fields(secret="sk-test-three"))[0])
+    assert rc == 0 and "not durable" not in err      # a retry with a working fsync discharges the earlier failure
 
 
 def test_b5_is_p1_a_not_durable_remove_at_the_verb(L):

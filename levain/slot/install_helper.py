@@ -1293,12 +1293,12 @@ def _credential_child(verb: str, name: str, fields: Optional[dict], keys_dir: st
             if verb == "set-credential":
                 try:
                     os.mkdir("cred", 0o700, dir_fd=keys_fd)
-                    try:
-                        C.dir_fsync(keys_fd)          # the new `cred` entry in L/keys reaches the medium
-                    except OSError:
-                        keys_durable = False
                 except FileExistsError:
                     pass
+                try:
+                    C.dir_fsync(keys_fd)              # every set, so a retry discharges an earlier failed sync of the `cred` entry
+                except OSError:
+                    keys_durable = False
             try:
                 cred_fd = os.open("cred", _O_DIR, dir_fd=keys_fd)
             except FileNotFoundError:
