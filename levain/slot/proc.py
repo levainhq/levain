@@ -435,8 +435,9 @@ def end_seams(host: HostOS, cgroup: str | None = None, seams: ProcSeams | None =
 class Domain:
     """:func:`end_domain`'s answer: ``proven``, or ``name`` = the step that was not (``kill-unproven``,
     ``domain-not-accepted:<rc|timeout|past-bound|124-exhausted>``, ``respawn-after-bootout``, ``processes-remain``,
-    ``child-not-reaped``, ``past-bound``, ``signal-child-hung``, ``raised:<type>``) with a ``detail`` for the log. The
-    freeze never names the answer (H1): it is best-effort, and the kill runs after it either way."""
+    ``child-not-reaped``, ``past-bound``, ``unreadable-pid``, ``signal-child-hung``, ``raised:<type>``) with a
+    ``detail`` for the log. The freeze never names the answer (H1): it is best-effort, and the kill runs after it
+    either way."""
     proven: bool
     name: str = ""
     detail: str = ""
@@ -576,13 +577,16 @@ def _bootout(uid: int, deadline: float, seams: ProcSeams) -> float | Domain:
 
 
 def _settle(uid: int, accepted: float, deadline: float, seams: ProcSeams) -> Domain | None:
-    """S: ``None`` once :data:`QUIET_S` passed since ``accepted`` with every scan empty (zombies aside)."""
+    """S: ``None`` once :data:`QUIET_S` passed since ``accepted`` with every scan empty (zombies aside). A deadline
+    reached while the last scan's every remaining process was unreadable answers ``unreadable-pid`` (still Unproven)."""
     quiet_from = accepted
     sighted = False
+    live: list[Proc] = []
     while True:
         now = seams.clock()
         if now >= deadline:
-            return Domain(False, "past-bound", "settle")
+            unreadable = live and all(p.state == UNKNOWN for p in live)
+            return Domain(False, "unreadable-pid" if unreadable else "past-bound", "settle")
         live = [p for p in _scan(uid, seams) if p.state != ZOMBIE]
         if any(p.state != UNKNOWN for p in live):
             if sighted:
