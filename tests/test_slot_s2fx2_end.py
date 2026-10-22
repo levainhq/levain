@@ -13,7 +13,7 @@ from levain.slot import Refused
 from levain.slot import end as end_mod
 from levain.slot.end import (CREDENTIAL_PARKED, DEAD, HELD, PROVEN_PHASES, RETAINED, REVOKED, end_lock, end_session,
                              reconcile_session, slot_lock)
-from levain.slot.root_intent import BUILT_INTENTS, INTENT_PHASES, read_root_intent
+from levain.slot.root_intent import END_INTENTS, INTENT_PHASES, read_root_intent
 from tests.test_slot_s2c_end import UID, Control, Crash, World, mine, slot_state, thread_run_as
 from tests.test_slot_s2g_end import Recorder, _outside
 from tests.test_slot_s2k3_end import OTHER, frame_run_as, lock_free
@@ -34,7 +34,7 @@ def _crash_at(w: World, ctl: Control, point: str) -> None:
 
 def test_the_gate_names_every_phase_but_commit():
     assert PROVEN_PHASES == {"retain": ("init", "manifest", "meta", "object", "tree"), "park": ("move",)}
-    assert set(PROVEN_PHASES) == set(BUILT_INTENTS)
+    assert set(PROVEN_PHASES) == set(END_INTENTS)
     for intent, phases in PROVEN_PHASES.items():
         assert phases + ("commit",) == INTENT_PHASES[intent]
 
