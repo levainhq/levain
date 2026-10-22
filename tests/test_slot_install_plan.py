@@ -205,6 +205,7 @@ TABLE = {
     "levain-export": {"OP"},
     "levain-dispatch-export": {"_levain_dispatch"},
     "levain-queue": {"OP", "_levain_dispatch", "_levain_qbroker"},
+    "levain-keysadmin": {"_levain_keys", "_levain_control"},
 }
 
 

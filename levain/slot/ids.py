@@ -39,8 +39,9 @@ RETIRED_IDS_PATH: Mapping[str, Path] = {   # CONTRACT §1.1
 
 SINGLETONS = ("_levain_keys", "_levain_export", "_levain_control", "_levain_qbroker", "_levain_dispatch")
 
+#: Allocation takes these in order, top-down from the shared range: a new group goes LAST, so no group's id moves.
 SHARED_GROUPS = ("levain-slots", "levain-gwfronts", "levain-control", "levain-wake", "levain-lineage",
-                 "levain-export", "levain-dispatch-export", "levain-queue")   # CONTRACT §1.2
+                 "levain-export", "levain-dispatch-export", "levain-queue", "levain-keysadmin")   # CONTRACT §1.2
 
 _PREFIXES: Mapping[str, tuple[str, str]] = {"egress": ("s", "gw"), "none": ("v", "c")}
 _TAG = {"egress": "e", "none": "v"}

@@ -111,9 +111,12 @@ SHUTDOWN_WAIT_S = 3.0
 PREEMPT_WAIT_S = 2.0
 #: `levain-control/1`'s frame cap, which the admin wire shares.
 ADMIN_FRAME_MAX = 64 * 1024
-#: once an admin frame's length is in, its body must arrive within this (the connection idles legitimately only
-#: BETWEEN frames).
+#: once an admin frame's first byte is in, the rest of its length and its body must arrive within this, and an
+#: answer's write must drain within it (the connection idles legitimately only BETWEEN frames).
 ADMIN_FRAME_S = 10.0
+#: request tasks one admin connection may hold at once; one more closes the connection, which is its EOF (DECISION,
+#: judged: well above a legitimate CONTROL's concurrency, its retransmits included).
+ADMIN_INFLIGHT_MAX = 1024
 #: the admin verbs and their argument keys, exactly; every argument but `session` is an unsigned integer.
 ADMIN_VERBS = {
     "FRONT-REGISTER": frozenset({"session", "front_uid", "pid", "start", "incarnation", "reg_token"}),
@@ -128,6 +131,10 @@ GW_ACCOUNT = "_levain_gw{}"
 KEYS_ACCOUNT = "_levain_keys"
 CONTROL_ACCOUNT = "_levain_control"
 FRONTS_GROUP = "levain-gwfronts"
+#: admin.sock's group: a shared group whose only members are keys and CONTROL, so no other account can connect (and
+#: the peer uid check admits CONTROL alone). keys binds the socket as itself, so it must be a member for the chown to
+#: succeed; a primary group stays its own account's only, hence a shared group and not CONTROL's.
+ADMIN_GROUP = "levain-keysadmin"
 
 _K = gwwire.encode(b"K")
 _A = gwwire.encode(b"A")
@@ -182,7 +189,7 @@ class AdminConn:
     """One accepted admin connection: the epoch it was adopted on, its read loop's task, its request tasks, and per
     session the last request task read for that session (the tail of that session's chain)."""
 
-    __slots__ = ("reader", "writer", "epoch", "task", "tasks", "last", "preempted")
+    __slots__ = ("reader", "writer", "epoch", "task", "tasks", "last", "preempted", "wlock")
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, epoch: int) -> None:
         self.reader, self.writer, self.epoch = reader, writer, epoch
@@ -192,6 +199,8 @@ class AdminConn:
         #: set by the preemption that replaces this connection, before it cancels the read loop: the EOF path then
         #: does nothing, and the preemption closes the connection itself, after its clear.
         self.preempted = False
+        #: one answer is written and drained at a time (a concurrent drain is not allowed on 3.9's StreamWriter).
+        self.wlock = asyncio.Lock()
 
 
 class AdminMalformed(Exception):
@@ -202,16 +211,18 @@ async def read_admin_frame(reader: asyncio.StreamReader) -> Optional[Tuple[int, 
     """The next request as `(id, op, args)`, or None at a clean EOF between frames; anything else that is not a
     canonical `{"v":1,"op":<string>,"id":<uint>,...}` object within ADMIN_FRAME_MAX raises AdminMalformed."""
     try:
-        head = await reader.readexactly(4)
-    except asyncio.IncompleteReadError as e:
-        if not e.partial:
-            return None
-        raise AdminMalformed("EOF inside a frame") from None
-    n = int.from_bytes(head, "big")
-    if n == 0 or n > ADMIN_FRAME_MAX:
-        raise AdminMalformed(f"frame length {n}")
+        first = await reader.readexactly(1)
+    except asyncio.IncompleteReadError:
+        return None
+    # from the frame's first byte, ONE deadline covers the rest of its length and its body
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + ADMIN_FRAME_S
     try:
-        data = await asyncio.wait_for(reader.readexactly(n), ADMIN_FRAME_S)
+        head = first + await asyncio.wait_for(reader.readexactly(3), ADMIN_FRAME_S)
+        n = int.from_bytes(head, "big")
+        if n == 0 or n > ADMIN_FRAME_MAX:
+            raise AdminMalformed(f"frame length {n}")
+        data = await asyncio.wait_for(reader.readexactly(n), max(0.0, deadline - loop.time()))
     except (asyncio.IncompleteReadError, asyncio.TimeoutError):
         raise AdminMalformed("a frame cut short or stalled") from None
     try:
@@ -609,7 +620,7 @@ class Keys:
                     await self._admin_eof(conn)
                 finally:
                     if not conn.preempted:
-                        writer.close()
+                        writer.transport.abort()   # the clear has run: no answer still buffered stands
 
     async def _adopt(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> Optional[AdminConn]:
         """Adopt a new admin connection; with one adopted already, preempt it first, in the design's five steps."""
@@ -626,23 +637,35 @@ class Keys:
                 if old.task is not None:
                     old.task.cancel()                # (1) stop reading it
                     wait.add(old.task)
-                for t in old.tasks:                  # (2) cancel its request tasks, then await them, bounded
-                    t.cancel()
-                if wait:
-                    await asyncio.wait(wait, timeout=PREEMPT_WAIT_S)
-                async with self.state_lock:          # (3) the fail-closed clear, phase 1
-                    victims = self._detach_all()
-                self._effects(victims)               # (3) phase 2
                 try:
-                    old.writer.close()               # (4)
-                except Exception as e:
-                    _note(logging.WARNING, "levain gw-keys: closing a preempted admin connection failed (%s)",
-                          type(e).__name__)
+                    for t in old.tasks:              # (2) cancel its request tasks, then await them, bounded
+                        t.cancel()
+                    if wait:
+                        await asyncio.wait(wait, timeout=PREEMPT_WAIT_S)
+                finally:
+                    # (3)-(4) run however this handler leaves step (2), a cancel of it included: the old connection
+                    # no longer runs its own EOF clear, so nothing else would
+                    await asyncio.shield(self._preempt_clear(old))
             if self.closing:
                 return None
             conn = AdminConn(reader, writer, epoch)  # (5) adopt; it starts against an empty table
             self.admin = conn
             return conn
+
+    async def _preempt_clear(self, old: AdminConn) -> None:
+        """Preemption's steps (3) and (4): the fail-closed clear in its two phases, then the old connection closed.
+        Until step (5) adopts the new connection, none is adopted."""
+        assert self.state_lock is not None
+        async with self.state_lock:                  # (3) phase 1
+            if self.admin is old:
+                self.admin = None
+            victims = self._detach_all()
+        self._effects(victims)                       # (3) phase 2
+        try:
+            old.writer.close()                       # (4)
+        except Exception as e:
+            _note(logging.WARNING, "levain gw-keys: closing a preempted admin connection failed (%s)",
+                  type(e).__name__)
 
     async def _admin_eof(self, conn: AdminConn) -> None:
         """The adopted connection ended: fail closed. The epoch is bumped in the same mutation section as the clear,
@@ -666,6 +689,8 @@ class Keys:
             if got is None:
                 return
             rid, op, args = got
+            if len(conn.tasks) >= ADMIN_INFLIGHT_MAX:
+                raise AdminMalformed("too many requests in flight")
             session = args.get("session") if type(args.get("session")) is str else None
             prev = conn.last.get(session) if session is not None else None
             t = asyncio.ensure_future(self._admin_request(conn, rid, op, args, prev))
@@ -687,18 +712,26 @@ class Keys:
     async def _admin_request(self, conn: AdminConn, rid: int, op: str, args: dict,
                              prev: Optional[asyncio.Task]) -> None:
         """One request: wait for the previous request of its session (its outcome is not this one's), answer it,
-        and write the answer only while its connection's epoch is current. A failure inside keys' own call closes
-        the connection: its EOF clears everything, never a table left as the failure left it."""
+        and write the answer only while its connection's epoch is current. A failure inside keys' own call, in the
+        answer's encoding or in its write (an answer not drained within ADMIN_FRAME_S included) closes the
+        connection: its EOF clears everything, never a table left as the failure left it nor a client left waiting."""
         if prev is not None and not prev.done():
             await asyncio.wait({prev})
         try:
             answer = await self._admin_answer(conn.epoch, rid, op, args)
+            if answer is None or conn.epoch != self.admin_epoch:
+                return   # stale, or refused by the shutdown latch: no answer
+            data = encode_admin(answer)
+            async with conn.wlock:
+                if conn.epoch != self.admin_epoch:
+                    return
+                conn.writer.write(data)
+                await asyncio.wait_for(conn.writer.drain(), ADMIN_FRAME_S)
         except Exception:
-            conn.writer.close()
+            # abort, not close: a close waits to flush what a client that stopped reading will never read, and
+            # the read loop sees EOF only once the transport is gone
+            conn.writer.transport.abort()
             raise
-        if answer is None or conn.epoch != self.admin_epoch:
-            return   # stale, or refused by the shutdown latch: no answer
-        conn.writer.write(encode_admin(answer))
 
     async def _admin_answer(self, epoch: int, rid: int, op: str, args: dict) -> Optional[dict]:
         bad = check_admin_args(op, args)
@@ -956,7 +989,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if control_uid is None:
             print(f"levain gw-keys: no {CONTROL_ACCOUNT} account exists; nothing may administer keys", file=sys.stderr)
             return 2
-        for group in (FRONTS_GROUP, CONTROL_ACCOUNT):
+        for group in (FRONTS_GROUP, ADMIN_GROUP):
             try:
                 g = grp.getgrnam(group).gr_gid
             except KeyError:

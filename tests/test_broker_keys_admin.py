@@ -225,3 +225,80 @@ def test_admin_eof_kills_cached_tokens_and_fronts(monkeypatch):
     assert out["after_eof"] == []                         # every registration cleared
     assert out["after_release"] == []                     # the in-flight request, released after the EOF, made none
     assert out["admin"] is None
+
+
+def test_admin_socket_group_admits_keys_and_control():
+    """keys binds admin.sock as itself and gives it ADMIN_GROUP: a non-root process may only do that for a group it
+    is in, so the install's membership table must put keys in it (else keys exits at startup), and CONTROL, the
+    one admitted peer, must reach the socket through it. It is a shared group the install makes, never an
+    account's own primary group, and nobody else is in it."""
+    from levain.slot.accounts import OPERATOR_GROUPS, supplementary_groups
+    from levain.slot.ids import SHARED_GROUPS, SINGLETONS
+    assert K.ADMIN_GROUP == "levain-keysadmin" and K.ADMIN_GROUP in SHARED_GROUPS
+    assert K.FRONTS_GROUP in supplementary_groups(K.KEYS_ACCOUNT)
+    everyone = (*SINGLETONS, *(f"_levain_{p}{i}" for p in ("s", "gw", "v", "c") for i in (0, 1)))
+    assert {n for n in everyone if K.ADMIN_GROUP in supplementary_groups(n)} == {K.KEYS_ACCOUNT, K.CONTROL_ACCOUNT}
+    assert K.ADMIN_GROUP not in OPERATOR_GROUPS
+
+
+def test_admin_stalled_peer_closed_within_bound(monkeypatch):
+    """A CONTROL that stops mid-frame, or that stops reading its answers, is closed within ADMIN_FRAME_S: the
+    connection's EOF, so everything clears."""
+    monkeypatch.setattr(K, "ADMIN_FRAME_S", 0.5)
+    d = tempfile.mkdtemp(prefix="lk", dir="/tmp")
+
+    async def until_cleared(k, secs: float):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < secs:
+            if k.admin is None:
+                return time.monotonic() - t0
+            await asyncio.sleep(0.05)
+        return None
+
+    async def run() -> dict:
+        k, _front, admin = await _serve(d)
+        out: dict = {}
+        try:
+            # (a) two bytes of a length header, then nothing
+            r, w = await asyncio.open_unix_connection(admin)
+            await _send(w, 1, "RELOAD", generation=1)
+            await _answer(r)
+            w.write(b"\x00\x00")
+            await w.drain()
+            out["header"] = await until_cleared(k, 3.0)
+            out["header_eof"] = await asyncio.wait_for(r.read(), 2)
+            w.close()
+            # (b) requests sent in small batches, no answer ever read; the in-flight cap is lifted so the bound this
+            # measures is the write's own
+            monkeypatch.setattr(K, "ADMIN_INFLIGHT_MAX", 10 ** 6)
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+            s.connect(admin)
+            r, w = await asyncio.open_unix_connection(sock=s)
+            await _send(w, 1, "RELOAD", generation=1)
+            await _answer(r)                              # adopted; from here no answer is read
+            t0, rid = time.monotonic(), 1
+            try:
+                while k.admin is not None and time.monotonic() - t0 < 5.0:
+                    for _ in range(20):
+                        rid += 1
+                        w.write(K.encode_admin({"v": 1, "op": "RELOAD", "id": rid, "generation": 1}))
+                    await asyncio.wait_for(w.drain(), 2.0)   # keys may stop reading: never hang here
+                    await asyncio.sleep(0.005)
+            except (ConnectionError, OSError, asyncio.TimeoutError):
+                pass
+            out["unread"] = await until_cleared(k, 2.0)
+            out["unread_after"] = time.monotonic() - t0
+            w.close()
+            return out
+        finally:
+            await asyncio.wait_for(k.shutdown(), 10)
+
+    try:
+        out = asyncio.run(run())
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    print("STALLED", out)
+    assert out["header"] is not None and out["header"] < 0.5 + 1.0   # the header is under the frame's deadline
+    assert out["header_eof"] == b""
+    assert out["unread"] is not None and out["unread_after"] < 5.0     # a write that cannot drain closes it
