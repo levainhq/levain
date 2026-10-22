@@ -29,4 +29,6 @@ NETWORK_SITES = (
     ("stub.py", "Stub.serve_unix", "start_unix_server", "asyncio.start_unix_server", 1),
     ("stub.py", "Stub.serve_tcp", "start_server", "asyncio.start_server", 1),
     ("keys.py", "Keys.start", "start_unix_server", "asyncio.start_unix_server", 1),
+    # keys' TOKEN-RESOLVE client: one connection to CONTROL's socket per resolve.
+    ("keys.py", "Keys._token_resolve", "open_unix_connection", "asyncio.open_unix_connection", 1),
 )

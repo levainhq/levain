@@ -22,8 +22,11 @@ on a build's parent commit (before the subjects exist), set by the run-only swit
 missing subject is reported "NO SUBJECT", which is not a pass, and the test skips with that report. Under CI the switch
 being set at all fails the test.
 
-KNOWN EDGE: reflection on an `Upstream` instance from outside the class (`inspect.getmembers`, `gc.get_referents`,
-`copy.copy`, a subclass defining `__getattribute__`) is not covered by a static test.
+KNOWN EDGE: the AST test catches honest builder mistakes at the capability boundary; deliberate evasion through
+Python's reflection (aliased reflective imports, shadowing class definitions, computed
+__getattribute__/methodcaller/getattr_static, sys.modules, and outside-class inspect/gc/copy) is out of its scope. The
+runtime invariant (the raw writer lives only in Upstream's slots behind the synchronous detached fence) is what holds
+the boundary; the test is its backstop.
 """
 from __future__ import annotations
 

@@ -1,8 +1,9 @@
 """gw-keys (S1 session 3b): the credential side of the gateway, run as `_levain_keys`. This tip holds WHO MAY CONNECT
 (design 1.5, session 3b-3a): keys' `R/keys/front.sock` server, the registration table, the two admission pools, the
 `F` path, the NOFILE floor, the process entry and its one shutdown trigger; and WHO MAY ASK (session 3b-3b): the admin
-server on `R/keys/admin.sock`. The token states, the upstream and the credentials are later parts'; until the real `Q`
-handler exists every `Q` is answered `F keys-unavailable`.
+server on `R/keys/admin.sock`; and the `Q` handler's frame and token states. The request path, the upstream and the
+credentials are later parts': until the request path exists a `Q` whose token resolves is answered
+`F keys-unavailable`.
 
 The admin server (design 1.5 "The admin connection", "Fencing", "Order inside one connection"):
 - a connection is accepted only from the `_levain_control` uid, read from the kernel; any other peer is closed unread.
@@ -47,18 +48,20 @@ import functools
 import logging
 import os
 import pwd
+import re
 import resource
 import signal
 import socket
 import stat
 import sys
+from collections import OrderedDict
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
-from levain.broker import gwwire
+from levain.broker import gwwire, norm
 from levain.broker.creds import CredLifecycle, FakeCredLifecycle
 from levain.broker.gwwire import FrameReader, KeysSide, WireError
 from levain.broker.peer import PeerUnknown, peer_of, peer_uid
-from levain.broker.upstream import Upstream, _note
+from levain.broker.upstream import GRACE, Upstream, _note
 from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
 
@@ -103,8 +106,20 @@ DRAIN_S = 5.0
 UNTRUSTED_DRAIN_CAP = 64 * 1024 * 1024
 #: phase 2: a victim closed now is aborted this long after, whether or not the front read its `K`.
 ABORT_AFTER_S = 2.0
-#: shutdown's awaits (the listeners' closure, later the exchange tasks) share ONE deadline.
+#: shutdown's awaits (the listeners' closure and the detached exchange tasks) share ONE deadline.
 SHUTDOWN_WAIT_S = 3.0
+
+#: resolves one registration may have in flight inside the global RESOLVE_CONNS (DECISION, judged: a session's
+#: legitimate first burst is a handful of parallel requests, and the per-digest single-flight folds repeats).
+RESOLVE_PER_SESSION = 4
+#: ONE deadline per TOKEN-RESOLVE, from the `Q` that wanted it: both permits, the connect and the answer.
+RESOLVE_S = 5.0
+#: digests keys itself saw dropped, answered `token-revoked` without asking (oldest evicted first).
+DROPPED_MAX = 64 * 1024
+#: a session token as the front sends it: 43 base64url characters (the `Bearer` value).
+TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
+#: CONTROL's TOKEN-RESOLVE refusals keys maps, and the name each maps to.
+RESOLVE_REFUSALS = {"token-unknown": "token-invalid", "token-revoked": "token-revoked"}
 
 #: preemption's step (2): the old connection's request tasks are awaited this long after their cancel (DECISION,
 #: judged: a task's work is memory operations plus closing sockets); one still running is left to its epoch check.
@@ -151,7 +166,7 @@ class Registration:
     STATUS connection ends without keys' `K`)."""
 
     __slots__ = ("session", "front_uid", "pid", "start", "incarnation", "reg_token", "state", "armed_at",
-                 "status", "pending", "exchanges")
+                 "status", "pending", "exchanges", "resolve_sem")
 
     def __init__(self, session: str, front_uid: int, pid: int, start: int, incarnation: int, reg_token: int) -> None:
         self.session, self.front_uid, self.pid, self.start = session, front_uid, pid, start
@@ -161,6 +176,8 @@ class Registration:
         self.status: Optional[Conn] = None          # the STATUS candidate, then the STATUS connection
         self.pending: Set[Conn] = set()             # exchange candidates that have sent no frame yet
         self.exchanges: Set[Conn] = set()           # connections past `Q`
+        #: this registration's share of the resolve slots, made at its first resolve (inside the loop)
+        self.resolve_sem: Optional[asyncio.Semaphore] = None
 
     def fields(self) -> tuple:
         return (self.session, self.front_uid, self.pid, self.start, self.incarnation)
@@ -172,13 +189,15 @@ class Conn:
     `upstream` holds the exchange's `Upstream` from `open_exchange`'s store until the release drops it, so a phase 1
     always finds what it must abort."""
 
-    __slots__ = ("writer", "reg", "kind", "task", "detached", "upstream")
+    __slots__ = ("writer", "reg", "kind", "task", "detached", "upstream", "admin_epoch")
 
     def __init__(self, writer: asyncio.StreamWriter, reg: Registration, kind: str) -> None:
         self.writer, self.reg, self.kind = writer, reg, kind   # kind: candidate | status | pending | exchange
         self.task: Optional[asyncio.Task] = asyncio.current_task()
         self.detached = False
         self.upstream: Optional[Upstream] = None
+        #: the admin epoch stamped at `Q`, under state_lock: the exchange's mutations and its resolve key compare it
+        self.admin_epoch: Optional[int] = None
 
 
 #: one entry of a phase 1's detached-objects list: a connection to close, or a detached exchange's `Upstream` to abort
@@ -237,6 +256,26 @@ async def read_admin_frame(reader: asyncio.StreamReader) -> Optional[Tuple[int, 
     if type(rid) is not int or not 0 <= rid <= JSON_INT_MAX:
         raise AdminMalformed("id is an unsigned integer")
     return rid, op, {k: x for k, x in obj.items() if k not in ("v", "op", "id")}
+
+
+async def read_control_answer(reader: asyncio.StreamReader) -> dict:
+    """One `levain-control/1` answer from CONTROL: a 4-byte length within ADMIN_FRAME_MAX and one canonical JSON
+    object. Anything else raises (the resolve's outcome is then `failed`)."""
+    n = int.from_bytes(await reader.readexactly(4), "big")
+    if n == 0 or n > ADMIN_FRAME_MAX:
+        raise AdminMalformed(f"answer length {n}")
+    data = await reader.readexactly(n)
+    obj = canon.parse(data)
+    if type(obj) is not dict:
+        raise AdminMalformed("not a JSON object")
+    return obj
+
+
+def _resolve_done(t: asyncio.Task) -> None:
+    """Reads the resolve task's outcome so none is left unretrieved; `cancelled()` first, since a preemption's
+    cancel makes a cancelled resolve common and `exception()` on one raises."""
+    if not t.cancelled():
+        t.exception()
 
 
 def encode_admin(answer: dict) -> bytes:
@@ -370,6 +409,14 @@ class Keys:
         self.by_session: Dict[str, Registration] = {}
         self.reg_high: Dict[int, int] = {}               # front_uid -> highest reg_token accepted (process life)
         self.pool: Set[Conn] = set()                     # every exchange-pool connection still open, detached or not
+        #: token_digest -> CONTROL's answer `{"session", "claims"}`; cleared by DROP-SESSION (that session's) and by
+        #: every fail-closed clear
+        self.cache: Dict[str, dict] = {}
+        #: digests keys itself saw dropped (bounded, oldest first): `token-revoked` without asking
+        self.dropped: "OrderedDict[str, None]" = OrderedDict()
+        #: the per-digest single-flight: (admin_epoch, digest) -> the table-owned resolve task
+        self.resolving: Dict[Tuple[int, str], asyncio.Task] = {}
+        self.resolve_sem: Optional[asyncio.Semaphore] = None   # the global RESOLVE_CONNS
         self.servers: list = []
         self.state_lock: Optional[asyncio.Lock] = None
         self._done: Optional[asyncio.Event] = None
@@ -384,6 +431,7 @@ class Keys:
             self.state_lock = asyncio.Lock()
             self.admin_lock = asyncio.Lock()
             self._done = asyncio.Event()
+            self.resolve_sem = asyncio.Semaphore(RESOLVE_CONNS)
 
     async def start(self, socks: Sequence[socket.socket], admin: Optional[socket.socket] = None) -> None:
         """Serve `socks` as front listeners and `admin` as the admin listener (bind_listeners' output). start() alone
@@ -445,11 +493,16 @@ class Keys:
     def trigger(self) -> None:
         """The latch: `closing` is set here, synchronously, so admission and the admin calls refuse from this instant
         (no table mutation awaits inside its lock, so none can be half-done when it is set). The close runs once, as
-        a task; a later trigger is a no-op."""
+        a task; a later trigger is a no-op. The latch's first transition also tells the credential layer
+        (`begin_closing`), whose failure is noted and never stops the shutdown."""
         self._in_loop()
         self.closing = True
         if self._closer is None:
             self._closer = asyncio.ensure_future(self._close())
+            try:
+                self.cred_lifecycle.begin_closing()
+            except Exception as e:
+                _note(logging.WARNING, "levain gw-keys: cred_lifecycle.begin_closing failed (%s)", type(e).__name__)
 
     async def shutdown(self) -> None:
         """Trigger, then await the one close's completion (a later call awaits the same completion and returns)."""
@@ -458,16 +511,34 @@ class Keys:
         await self._done.wait()
 
     async def _close(self) -> None:
-        """Wait for a start() in progress to return (its only awaits are its server creations), then stop accepting
-        and close the listeners, then await their closure (bounded)."""
-        assert self._done is not None
+        """Shutdown is a transition (design 1.5 "Shutdown's order"), run once behind the latch: wait for a start() in
+        progress to return (its only awaits are its server creations); phase 1 over every registration; (1) the
+        listeners' synchronous close; (2) phase 2; (2b) the adopted admin connection closed (the EOF it wakes finds
+        the table empty); (3) the credential layer's detached tasks cancelled; (4) ONE bounded wait over the
+        listeners' closure and the detached exchange tasks, nothing cancelled. Steps (1) to (3) have no await between
+        them, and a failure of one step never skips the rest."""
+        assert self._done is not None and self.state_lock is not None
         try:
             if self._starting is not None:
                 await self._starting.wait()
+            async with self.state_lock:     # phase 1: keys' own act, so no epoch check
+                victims = self._detach_all()
+            tasks = {v.task for v in victims if isinstance(v, Conn) and v.kind == "exchange" and v.task is not None
+                     and v.task is not asyncio.current_task() and not v.task.done()}
             for s in self.servers:          # (1) the listeners' synchronous close: no accept after this
                 s.close()
+            self._effects(victims)          # (2) phase 2
+            if self.admin is not None:      # (2b)
+                try:
+                    self.admin.writer.close()
+                except Exception as e:
+                    _note(logging.WARNING, "levain gw-keys: closing the admin connection failed (%s)", type(e).__name__)
+            try:                            # (3)
+                self.cred_lifecycle.cancel_detached()
+            except Exception as e:
+                _note(logging.WARNING, "levain gw-keys: cred_lifecycle.cancel_detached failed (%s)", type(e).__name__)
             closures = {asyncio.ensure_future(s.wait_closed()) for s in self.servers}
-            waitset = closures
+            waitset = closures | tasks
             if waitset:                     # an empty set is a ValueError; nothing pending past the deadline is cancelled
                 await asyncio.wait(waitset, timeout=SHUTDOWN_WAIT_S)
         finally:
@@ -526,21 +597,26 @@ class Keys:
                 return None
             reg = self.by_session.get(session)
             if reg is not None:
-                victims = self._detach(reg)
+                victims = self._detach(reg, revoke=True)
         self._effects(victims)
-        return {}
+        return {"dropped": reg is not None}   # false = nothing held: still success
 
     # -- transitions --
 
-    def _detach(self, reg: Registration) -> List[Victim]:
+    def _detach(self, reg: Registration, revoke: bool = False) -> List[Victim]:
         """Phase 1 (caller holds state_lock; no await): take `reg` out of every table and return every connection
         attributed to it, each marked detached, preceded by the `Upstream` OBJECT of each detached exchange that holds
         one (phase 2 aborts it: an abort drops the transport's buffer, where a close would flush credential-bearing
-        bytes); an exchange's task is cancelled (delivery only, never the guarantee)."""
+        bytes); an exchange's task is cancelled (delivery only, never the guarantee). The session's cached claims
+        leave the token cache; with `revoke` (DROP-SESSION) their digests enter the dropped set."""
         if self.regs.get(reg.front_uid) is reg:
             del self.regs[reg.front_uid]
         if self.by_session.get(reg.session) is reg:
             del self.by_session[reg.session]
+        for digest in [d for d, a in self.cache.items() if a["session"] == reg.session]:
+            del self.cache[digest]
+            if revoke:
+                self._mark_dropped(digest)
         reg.state = "dropped"
         victims = ([reg.status] if reg.status is not None else []) + list(reg.pending) + list(reg.exchanges)
         reg.status = None
@@ -557,12 +633,24 @@ class Keys:
 
     def _detach_all(self) -> List[Victim]:
         """Phase 1 of the fail-closed clear (caller holds state_lock; no await): every registration detached, every
-        `Upstream` ahead of every connection. `reg_high` is kept: a clear never lowers a fence."""
+        `Upstream` ahead of every connection, the token cache and the dropped set cleared, and every resolve task of
+        an older epoch cancelled (every one, once closing). `reg_high` is kept: a clear never lowers a fence."""
         regs = {id(r): r for r in list(self.regs.values()) + list(self.by_session.values())}
         got: List[Victim] = []
         for reg in regs.values():
             got += self._detach(reg)
+        self.cache.clear()
+        self.dropped.clear()
+        for (epoch, _digest), t in list(self.resolving.items()):
+            if epoch != self.admin_epoch or self.closing:
+                t.cancel()   # its permits are freed now, not at its deadline; its `finally` pops the entry
         return [v for v in got if isinstance(v, Upstream)] + [v for v in got if not isinstance(v, Upstream)]
+
+    def _mark_dropped(self, digest: str) -> None:
+        self.dropped[digest] = None
+        self.dropped.move_to_end(digest)
+        while len(self.dropped) > DROPPED_MAX:
+            self.dropped.popitem(last=False)
 
     def _effects(self, victims: List[Victim]) -> None:
         """Phase 2: run right after phase 1 released the lock, synchronously. An `Upstream` is aborted (never closed;
@@ -654,12 +742,15 @@ class Keys:
 
     async def _preempt_clear(self, old: AdminConn) -> None:
         """Preemption's steps (3) and (4): the fail-closed clear in its two phases, then the old connection closed.
-        Until step (5) adopts the new connection, none is adopted."""
+        Until step (5) adopts the new connection, none is adopted. A clear that runs only after a NEWER connection
+        was adopted (its preempting handler was cancelled and the shielded clear ran late) clears nothing: the table
+        is the newer connection's, and that adoption's own preemption already cleared what `old` held."""
         assert self.state_lock is not None
+        victims: List[Victim] = []
         async with self.state_lock:                  # (3) phase 1
-            if self.admin is old:
+            if self.admin is old or self.admin is None:
                 self.admin = None
-            victims = self._detach_all()
+                victims = self._detach_all()
         self._effects(victims)                       # (3) phase 2
         try:
             old.writer.close()                       # (4)
@@ -819,7 +910,7 @@ class Keys:
             if ftype == b"H":
                 await self._status(conn, frames, payload)
             else:
-                await self._exchange(conn, frames, side)
+                await self._exchange(conn, frames, side, payload)
         except (OSError, EOFError, WireError, asyncio.TimeoutError):
             pass   # the peer went away, sent what the wire does not allow, or nothing in time: closed with no frame
         except Exception as e:
@@ -848,19 +939,139 @@ class Keys:
                 reg.state = "lost"   # the claim ended without keys' `K`: refused from now on
                 _note(logging.WARNING, "levain gw-keys: front-lost session=%s", reg.session)
 
-    async def _exchange(self, conn: Conn, frames: FrameReader, side: KeysSide) -> None:
+    async def _exchange(self, conn: Conn, frames: FrameReader, side: KeysSide, q: dict) -> None:
+        """THE FRAME (design 1.2): the ONE admission check at `Q` and the epoch stamp, then entry into the
+        registration's exchange set as the LAST statement under the lock; the outer `try` follows with no await
+        between them, and its `finally` is the release, so phase 1 can always find the exchange until it is released."""
         reg = conn.reg
         assert self.state_lock is not None
         async with self.state_lock:
             reg.pending.discard(conn)
             if conn.detached:
                 return
-            if (self.regs.get(reg.front_uid) is reg and reg.state == "claimed" and not self.closing
-                    and len(reg.exchanges) < self.exchanges_per_session):
+            admitted = (self.regs.get(reg.front_uid) is reg and reg.state == "claimed" and not self.closing
+                        and len(reg.exchanges) < self.exchanges_per_session)
+            if admitted:
                 conn.kind = "exchange"
+                conn.admin_epoch = self.admin_epoch
                 reg.exchanges.add(conn)
-        # Until the real `Q` handler exists every `Q` is answered `keys-unavailable`, through the one `F` path.
+        if not admitted:
+            await self._refuse(conn, frames, side, "keys-unavailable", UNTRUSTED_DRAIN_CAP)
+            return
+        try:
+            await self._serve_q(conn, frames, side, q)
+        finally:
+            await release_exchange(conn)
+
+    def _current(self, conn: Conn) -> bool:
+        """Under state_lock: the exchange may still mutate shared state (its epoch current, not detached, its
+        registration the current one, not closing)."""
+        reg = conn.reg
+        return (not conn.detached and not self.closing and conn.admin_epoch == self.admin_epoch
+                and self.regs.get(reg.front_uid) is reg)
+
+    async def _serve_q(self, conn: Conn, frames: FrameReader, side: KeysSide, q: dict) -> None:
+        """The `Q` handler: the token state first. A stale or detached exchange ends with NO answer (its front
+        connection is one of phase 1's victims, which phase 2 closes)."""
+        out = await self._token_state(conn, q["token"])
+        if out is None or conn.detached:
+            return
+        if "refused" in out:
+            await self._refuse(conn, frames, side, out["refused"], UNTRUSTED_DRAIN_CAP)
+            return
+        # The request path (the route against the claims, keys' own policy, the upstream) is the next part's; until
+        # it exists a resolved `Q` is answered `keys-unavailable`.
         await self._refuse(conn, frames, side, "keys-unavailable", UNTRUSTED_DRAIN_CAP)
+
+    async def _token_state(self, conn: Conn, token: str) -> Optional[dict]:
+        """`{"answer": {"session", "claims"}}`, `{"refused": name}`, or None for a stale exchange (no answer). A
+        cached digest and one in flight take no permit; a dropped one is `token-revoked` without asking; otherwise
+        the first `Q` (the owner) starts the table-owned resolve and every `Q` awaits it through a shield, within
+        RESOLVE_S of its own arrival."""
+        if TOKEN_RE.match(token) is None:
+            return {"refused": "token-invalid"}
+        digest = norm.digest_of_token(token)
+        reg = conn.reg
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + RESOLVE_S
+        assert self.state_lock is not None and conn.admin_epoch is not None
+        async with self.state_lock:
+            if not self._current(conn):
+                return None
+            hit = self.cache.get(digest)
+            if hit is None and digest in self.dropped:
+                return {"refused": "token-revoked"}
+            if hit is None:
+                key = (conn.admin_epoch, digest)
+                task = self.resolving.get(key)
+                if task is None:
+                    task = asyncio.ensure_future(self._resolve(key, reg, deadline))
+                    self.resolving[key] = task
+                    task.add_done_callback(_resolve_done)
+        if hit is None:
+            try:
+                res = await asyncio.wait_for(asyncio.shield(task), max(0.0, deadline - loop.time()))
+            except asyncio.TimeoutError:
+                return {"refused": "keys-unavailable"}
+            if res[0] == "failed":
+                return {"refused": "keys-unavailable"}
+            if res[0] == "refused":
+                return {"refused": RESOLVE_REFUSALS[res[1]]}
+            hit = res[1]
+            async with self.state_lock:      # the claims enter the cache only as a fenced mutation
+                if not self._current(conn):
+                    return None
+                self.cache[digest] = hit
+        if hit["session"] != reg.session or hit["claims"].get("front_uid", reg.front_uid) != reg.front_uid \
+                or hit["claims"].get("incarnation", reg.incarnation) != reg.incarnation:
+            return {"refused": "front-mismatch"}
+        return {"answer": hit}
+
+    async def _resolve(self, key: Tuple[int, str], reg: Registration, deadline: float) -> tuple:
+        """The table-owned resolve task: its TYPED outcome is `("answer", {"session", "claims"})`,
+        `("refused", "token-unknown" | "token-revoked")` or `("failed",)` (any Exception, the deadline included); it
+        never raises one to its awaiters. It holds the permits itself, per-session FIRST, global second, each
+        released on every exit; its `finally` pops its table entry."""
+        try:
+            if reg.resolve_sem is None:
+                reg.resolve_sem = asyncio.Semaphore(RESOLVE_PER_SESSION)
+            assert self.resolve_sem is not None
+            loop = asyncio.get_running_loop()
+            return await asyncio.wait_for(self._resolve_permitted(reg.resolve_sem, key[1]),
+                                          max(0.0, deadline - loop.time()))
+        except Exception:
+            return ("failed",)
+        finally:
+            if self.resolving.get(key) is asyncio.current_task():
+                del self.resolving[key]
+
+    async def _resolve_permitted(self, mine: asyncio.Semaphore, digest: str) -> tuple:
+        assert self.resolve_sem is not None
+        async with mine:                     # the per-session permit FIRST: no global permit is held while waiting
+            async with self.resolve_sem:
+                return await self._token_resolve(digest)
+
+    async def _token_resolve(self, digest: str) -> tuple:
+        """`TOKEN-RESOLVE {token_digest}` on its own connection to CONTROL's socket: one request, one answer."""
+        if self.control_path is None:
+            return ("failed",)
+        reader, writer = await asyncio.open_unix_connection(self.control_path)
+        try:
+            writer.write(encode_admin({"v": 1, "op": "TOKEN-RESOLVE", "id": 1, "token_digest": digest}))
+            await writer.drain()
+            ans = await read_control_answer(reader)
+        finally:
+            writer.transport.abort()
+        if ans.get("id") != 1:
+            return ("failed",)
+        if ans.get("ok") is True:
+            session, claims = ans.get("session"), ans.get("claims")
+            if type(session) is str and session and type(claims) is dict:
+                return ("answer", {"session": session, "claims": claims})
+            return ("failed",)
+        if ans.get("ok") is False and ans.get("refused") in RESOLVE_REFUSALS:
+            return ("refused", ans["refused"])
+        return ("failed",)
 
     async def _refuse(self, conn: Conn, frames: FrameReader, side: KeysSide, name: str, cap: int) -> None:
         """The `F` path: `F`, SHUT_WR, then read and discard the front's frames until `E`, `X`, EOF, `cap` body bytes
@@ -883,6 +1094,29 @@ class Keys:
             if ftype in (b"E", b"X"):
                 return
             got += len(payload)
+
+
+async def release_exchange(exchange: Conn) -> None:
+    """The exchange's release: a graceful close of an undetached exchange's `Upstream` bounded by GRACE, then an
+    abort on every exit (a False abort is noted), then the leave from the exchange set and the drop of the
+    `Upstream`, which run even if the abort is cut short. A detached exchange's `Upstream` is never closed
+    gracefully (a close would flush what phase 2's abort discards)."""
+    up = exchange.upstream
+    try:
+        if up is not None and not exchange.detached:
+            up._graceful_close()
+            try:
+                await asyncio.wait_for(up.wait_closed(), GRACE)
+            except Exception:
+                _note(logging.DEBUG, "levain gw-keys: graceful close ended early")
+    finally:
+        try:
+            if up is not None:
+                if not up.abort():
+                    _note(logging.WARNING, "levain gw-keys: dropped an unclosed transport")
+        finally:
+            exchange.reg.exchanges.discard(exchange)
+            exchange.upstream = None
 
 
 # --- the process ----------------------------------------------------------------------------------------------------

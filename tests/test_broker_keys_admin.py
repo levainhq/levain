@@ -302,3 +302,203 @@ def test_admin_stalled_peer_closed_within_bound(monkeypatch):
     assert out["header"] is not None and out["header"] < 0.5 + 1.0   # the header is under the frame's deadline
     assert out["header_eof"] == b""
     assert out["unread"] is not None and out["unread_after"] < 5.0     # a write that cannot drain closes it
+
+
+# --- P4: the `Q` handler's token states ------------------------------------------------------------------------------
+
+def _tok(n: int) -> str:
+    return f"{n:043d}"
+
+
+def _by_path(monkeypatch) -> None:
+    """Peers are told apart by the path each client socket binds before it connects: `A*` is (pid 1, start 1), `B*`
+    (pid 2, start 2), so two sessions' fronts can live in this one process."""
+    def peer(sock):
+        name = os.path.basename(sock.getpeername())
+        return (os.getuid(), 1, 1) if name.startswith("A") else (os.getuid(), 2, 2)
+
+    monkeypatch.setattr(K, "peer_of", peer)
+
+
+def _client(d: str, name: str, front: str) -> socket.socket:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(10)
+    s.bind(os.path.join(d, name))
+    s.connect(front)
+    return s
+
+
+def _claim(d: str, name: str, front: str, session: str) -> socket.socket:
+    s = _client(d, name, front)
+    s.sendall(gwwire.encode(b"H", {"v": 1, "session": session, "incarnation": 1}))
+    assert s.recv(64) == gwwire.encode(b"A")
+    return s
+
+
+def _q(token: str) -> bytes:
+    return gwwire.encode(b"Q", {"v": 1, "token": token, "route": "r", "method": "GET", "path": "/", "query": "",
+                                "headers": [], "body": "none", "upgrade": "none"}) + gwwire.encode(b"E")
+
+
+class _FakeControl:
+    """CONTROL's socket for TOKEN-RESOLVE: `held` digests are answered only when `release` is set, with `answers`;
+    others at once. `inflight` counts requests per digest prefix class while held."""
+
+    def __init__(self, answers: dict, held: set) -> None:
+        self.answers, self.held = answers, held
+        self.release = asyncio.Event()
+        self.seen: list = []
+        self.inflight = 0
+        self.peak = 0
+
+    async def handle(self, reader, writer) -> None:
+        try:
+            n = int.from_bytes(await reader.readexactly(4), "big")
+            req = canon.parse(await reader.readexactly(n))
+            digest = req["token_digest"]
+            self.seen.append(digest)
+            if digest in self.held:
+                self.inflight += 1
+                self.peak = max(self.peak, self.inflight)
+                try:
+                    await self.release.wait()
+                finally:
+                    self.inflight -= 1
+            writer.write(K.encode_admin({"id": req["id"], **self.answers.get(digest, {"ok": False,
+                                                                                     "refused": "token-unknown"})}))
+            await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+
+
+async def _keys_with_control(d: str, fake: _FakeControl) -> tuple:
+    ctl = os.path.join(d, "c.sock")
+    srv = await asyncio.start_unix_server(fake.handle, path=ctl)
+    me = os.getuid()
+    k = K.Keys(single_uid=me, control_uid=me, control_path=ctl)
+    k.pending_per_peer = 64
+    front, admin = os.path.join(d, "f.sock"), os.path.join(d, "a.sock")
+    socks = K.bind_listeners([(front, None), (admin, None)])
+    await k.start(socks[:1], admin=socks[1])
+    return k, srv, front, admin
+
+
+def test_flooding_session_leaves_another_sessions_first_q_resolved(monkeypatch):
+    # R6 (design 1.5 "Resolve slots"): a front sending 32 unknown tokens, every resolve held unanswered at CONTROL,
+    # leaves another session's first `Q` resolved inside the deadline; F-B row 21 (keys half): that `Q`'s token is
+    # unknown, so the real handler answers `token-invalid` through the one `F` path and drains to the front's `E`.
+    _by_path(monkeypatch)
+    d = tempfile.mkdtemp(prefix="lk", dir="/tmp")
+    from levain.broker.norm import digest_of_token
+    flood = {digest_of_token(_tok(i)) for i in range(32)}
+    fake = _FakeControl({}, flood)
+
+    async def run() -> dict:
+        loop = asyncio.get_running_loop()
+        ex = lambda f, *a: loop.run_in_executor(None, f, *a)   # noqa: E731
+        k, srv, front, admin = await _keys_with_control(d, fake)
+        a = C.KeysAdmin(admin, answer_s=2.0)
+        socks = []
+        try:
+            for sess, uid, n in (("s-flood", 70000, 1), ("s-other", 70001, 2)):
+                await ex(a.front_register, sess, uid, n, n, 1, 1)
+                await ex(a.front_arm, sess, 1)
+            socks.append(await ex(_claim, d, "Ast", front, "s-flood"))
+            socks.append(await ex(_claim, d, "Bst", front, "s-other"))
+            for i in range(32):
+                s = await ex(_client, d, f"A{i}", front)
+                s.sendall(_q(_tok(i)))
+                socks.append(s)
+            for _ in range(100):
+                if fake.peak >= 4:
+                    break
+                await asyncio.sleep(0.02)
+            await asyncio.sleep(0.2)
+            t0 = time.monotonic()
+            b = await ex(_client, d, "B0", front)
+            socks.append(b)
+            b.sendall(_q(_tok(99)))
+            got = await ex(_rest, b)
+            took = time.monotonic() - t0
+            return {"got": got, "took": took, "peak": fake.peak, "inflight": fake.inflight}
+        finally:
+            fake.release.set()
+            for s in socks:
+                s.close()
+            a.close()
+            await asyncio.wait_for(k.shutdown(), 10)
+            srv.close()
+
+    try:
+        out = asyncio.run(run())
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    print("R6", {k: v for k, v in out.items() if k != "got"})
+    assert out["got"] == gwwire.encode(b"F", {"refused": "token-invalid"})
+    assert out["took"] < 2.0                     # well inside RESOLVE_S: no wait behind the flooding session
+    assert out["peak"] == K.RESOLVE_PER_SESSION  # the flooding session holds its own share, never more
+
+
+def test_resolve_fenced_across_preemption_then_shutdown_order(monkeypatch):
+    # R21 (design 1.5): a TOKEN-RESOLVE held at CONTROL across a preemption and then answered leaves the token cache
+    # EMPTY of it (the old epoch's resolve is cancelled and its exchange detached, no answer); DROP-SESSION answers
+    # `{dropped}` (CONTRACT 4.9); then shutdown's order with the credential seam: `begin_closing` at the latch,
+    # `cancel_detached` before the wait, and an adopted admin connection closed by step (2b), not held to the bound.
+    _by_path(monkeypatch)
+    d = tempfile.mkdtemp(prefix="lk", dir="/tmp")
+    from levain.broker.norm import digest_of_token
+    held = digest_of_token(_tok(7))
+    fake = _FakeControl({held: {"ok": True, "session": "s1", "claims": {"front_uid": 70000, "incarnation": 1}}},
+                        {held})
+
+    async def run() -> dict:
+        loop = asyncio.get_running_loop()
+        ex = lambda f, *a: loop.run_in_executor(None, f, *a)   # noqa: E731
+        k, srv, front, admin = await _keys_with_control(d, fake)
+        a1, a2 = C.KeysAdmin(admin, answer_s=2.0), C.KeysAdmin(admin, answer_s=2.0)
+        socks = []
+        try:
+            await ex(a1.front_register, "s1", 70000, 1, 1, 1, 1)
+            await ex(a1.front_arm, "s1", 1)
+            socks.append(await ex(_claim, d, "Ast", front, "s1"))
+            q = await ex(_client, d, "A1", front)
+            socks.append(q)
+            q.sendall(_q(_tok(7)))
+            for _ in range(100):
+                if fake.inflight:
+                    break
+                await asyncio.sleep(0.02)
+            await ex(a2.front_register, "s2", 70001, 2, 2, 1, 1)    # preempts a1
+            resolving_after_preempt = len(k.resolving)
+            fake.release.set()
+            q_got = await ex(_rest, q)
+            await asyncio.sleep(0.2)
+            cache = dict(k.cache)
+            dropped = (await ex(lambda: a2.call("DROP-SESSION", connect=False, session="s2")),
+                       await ex(lambda: a2.call("DROP-SESSION", connect=False, session="s9")))
+            t0 = time.monotonic()
+            await asyncio.wait_for(k.shutdown(), 10)
+            took = time.monotonic() - t0
+            return {"q_got": q_got, "cache": cache, "resolving": resolving_after_preempt, "dropped": dropped,
+                    "calls": list(k.cred_lifecycle.calls), "took": took, "admin": k.admin}
+        finally:
+            fake.release.set()
+            for s in socks:
+                s.close()
+            a1.close()
+            a2.close()
+            srv.close()
+
+    try:
+        out = asyncio.run(run())
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    print("R21", out)
+    assert out["q_got"] == b""            # detached: no answer, the connection closed
+    assert out["cache"] == {}
+    assert out["resolving"] == 0          # the old epoch's resolve task was cancelled in the preemption's phase 1
+    assert [x.get("dropped") for x in out["dropped"]] == [True, False]
+    assert out["calls"] == ["begin_closing", "cancel_detached"]
+    assert out["took"] < K.SHUTDOWN_WAIT_S and out["admin"] is None

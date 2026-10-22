@@ -128,15 +128,17 @@ def test_admin_calls_after_the_latch_change_nothing():
         k = K.Keys(single_uid=os.getuid())
         k._in_loop()
         await k.front_register(0, "s1", 70000, 123, 456, 1, 1)
+        s1 = k.regs[70000]
         await asyncio.wait_for(k.shutdown(), 5)
         reg = await k.front_register(0, "s2", 70001, 124, 457, 1, 1)
         arm = await k.front_arm(0, "s1", 1)
         drop = await k.drop_session(0, "s1")
-        return reg, arm, drop, sorted(k.regs), k.regs[70000].state
+        return reg, arm, drop, sorted(k.regs), s1.state
 
     reg, arm, drop, uids, state = asyncio.run(run())
     assert (reg, arm, drop) == (None, None, None)
-    assert uids == [70000] and state == "registered"
+    # shutdown is a transition: its phase 1 detached s1, and nothing after the latch re-created a registration
+    assert uids == [] and state == "dropped"
 
 
 class _T:
