@@ -79,7 +79,7 @@ def test_every_root_side_module_imports_on_the_floor_interpreter():
         pytest.skip(why)
     code = _CHILD.format(repo=str(REPO), vendored=VENDORED, modules=_modules())
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
-    r = subprocess.run([python, "-I", "-S", "-c", code], capture_output=True, text=True, timeout=180, env=env)
+    r = subprocess.run([python, "-I", "-S", "-B", "-c", code], capture_output=True, text=True, timeout=180, env=env)
     assert r.returncode == 0, "root-side modules that do not import on the floor interpreter:\n" + r.stdout + r.stderr[-1000:]
 
 
@@ -148,6 +148,8 @@ def _post_39_violations(source: str, label: str) -> list[str]:
                     hit(node, f"from {node.module} import {a.name}: {why}")
         elif type(node).__name__ == "Match":  # ast.Match exists only on 3.10+, so match by class name
             hit(node, "match statement (3.10+)")
+        elif type(node).__name__ == "TryStar":  # ast.TryStar exists only on 3.11+
+            hit(node, "except* (3.11+)")
     return hits
 
 
