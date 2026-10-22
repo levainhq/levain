@@ -48,7 +48,8 @@ V22_S = 3600.0
 HELD_BACKOFF_S = 60.0
 #: §11 V23: how long a SLOW CONTROL answer is retried before the revoker treats CONTROL as down (§4.5).
 V23_S = 10.0
-#: DECISION: the revoker's tick while a front kill is pending (a ``front-busy`` retried inside the revoker's bound).
+#: DECISION: a pending front kill's first retry delay (a ``front-busy`` retried inside the revoker's bound); it doubles
+#: on each retry with the same outcome, up to the revoker's tick.
 REVOKER_RETRY_S = 0.25
 #: DECISION (§4.2 step 4): the worker's boot waits this long for CONTROL to answer, then passes run anyway (a pass
 #: with CONTROL down runs the local steps only).
@@ -641,6 +642,16 @@ class Reaper:
 
 # --- the revoker (§4.7, CONTRACT §4.5) ----------------------------------------------------------------------------------
 
+@dataclass
+class _Retry:
+    """One pending target's retry: its last outcome, the delay now in force, when it is next due, and the outcome
+    last logged."""
+    outcome: str
+    delay: float
+    due_at: float
+    logged: Optional[str]
+
+
 class Revoker:
     """The REVOKER process's state: which leases' fronts it has dealt with, when it first saw each, and since when
     CONTROL has been slow. It takes no lock the pass worker takes (DESIGN §4.7: ``front.lock`` alone). Each wake (a
@@ -649,24 +660,57 @@ class Revoker:
     an answer slow past V23): every egress alloc's front is ended, since no session can be confirmed live (CONTRACT
     §4.5). Only an outcome that proves this lease's front cannot run is final: ``front-ended``, and
     ``front-lease-moved`` (the slot no longer names this lease: its uids are SCRUB's, not this lease's). Anything
-    else (an error, ``front-unproven:*``, ``front-busy``) stays pending and is retried on every wake while the lease
-    is a target. A REVOKED-SET answer of the wrong shape is a protocol failure: CONTROL is down. While CONTROL is slow (under
-    V23 since the first slow attempt began), the leases already confirmed and still pending are retried and nothing
-    is forgotten."""
+    else (an error, ``front-unproven:*``, ``front-busy``, an alloc it could not read) stays pending while the lease is
+    a target, and is retried when due: REVOKER_RETRY_S after the attempt, doubling on each retry with the same outcome
+    up to the tick, back to REVOKER_RETRY_S when the outcome changes. A wake between retries still acts at once on a
+    target it has not tried; a pending one waits until it is due. A retry is logged when its outcome changes, and once
+    when its delay reaches the tick. A REVOKED-SET answer of the wrong shape is a protocol failure: CONTROL is down.
+    While CONTROL is slow (under V23 since the first slow attempt began), the leases already confirmed and still
+    pending, and the targets whose alloc could not be read, are retried and nothing is forgotten."""
 
     #: The outcomes that prove a lease's front cannot run (the only ones kept in ``done``).
     FINAL = frozenset({"front-ended", "front-lease-moved"})
 
-    def __init__(self, seams: H.Seams, *, log: Callable[[str], None] = _log_to_stderr) -> None:
+    def __init__(self, seams: H.Seams, *, log: Callable[[str], None] = _log_to_stderr, tick_s: float = V11_S) -> None:
         self.seams = seams
         self.log = log
+        self.tick_s = tick_s
         self.done: Dict[Tuple[str, int], str] = {}
         self.first_seen: Dict[Tuple[str, int], float] = {}
         self.slow_since: Optional[float] = None
-        self.unread: frozenset = frozenset()   # the targets whose alloc the last wake could not read
+        self.unread: frozenset = frozenset()   # the targets whose alloc could not be read, until it is
+        self.retry: Dict[object, _Retry] = {}  # per pending lease key, or per unread session
+
+    def _pending(self, k: object) -> bool:
+        return k in self.unread or (k in self.first_seen and k not in self.done)
 
     def pending(self) -> bool:
         return bool(self.unread) or any(k not in self.done for k in self.first_seen)
+
+    def retry_in(self) -> Optional[float]:
+        """Seconds to the earliest due retry, within [REVOKER_RETRY_S, tick]; None when nothing is pending."""
+        if not self.pending():
+            return None
+        dues = [r.due_at for k, r in self.retry.items() if self._pending(k)]
+        left = min(dues) - self.seams.monotonic() if dues else REVOKER_RETRY_S
+        return min(max(left, REVOKER_RETRY_S), self.tick_s)
+
+    def _due(self, k: object, now: float) -> bool:
+        r = self.retry.get(k)
+        return r is None or now >= r.due_at
+
+    def _retry_later(self, k: object, res: str, now: float, line: Optional[str]) -> None:
+        """``k``'s next attempt, and its log ``line`` (None: silent) when ``res`` is not the outcome last logged for
+        it, or once when the delay reaches the tick."""
+        r = self.retry.get(k)
+        delay = REVOKER_RETRY_S if r is None or r.outcome != res else min(r.delay * 2, self.tick_s)
+        logged = r.logged if r is not None else None
+        if line is not None and res != logged:
+            self.log(f"{line}; retried in {delay:g} s")
+            logged = res
+        elif line is not None and r is not None and r.delay < self.tick_s <= delay:
+            self.log(f"{line}; retried every {self.tick_s:g} s from now")
+        self.retry[k] = _Retry(res, delay, now + delay, logged)
 
     def wake(self) -> Dict[str, object]:
         PR.reap_leftovers()
@@ -676,35 +720,41 @@ class Revoker:
         try:
             targets = self._targets(ctx, out)
             slow = targets is None
-            if slow:   # only the leases CONTROL already confirmed, still pending
-                targets = sorted({k[0] for k in self.first_seen if k not in self.done})
+            if slow:   # only the leases CONTROL already confirmed, still pending, and the allocs not yet read
+                targets = sorted({k[0] for k in self.first_seen if k not in self.done} | self.unread)
+            now = seams.monotonic()
             allocs = {}
             unread = set()
             for s in targets:   # type: ignore[union-attr]
+                if s in self.unread and not self._due(s, now):   # still pending; its retry is not due yet
+                    unread.add(s)
+                    continue
                 try:
                     raw = ctx.store.read(("alloc",), f"{s}.json")
                     if raw is None:
                         continue
                     a = R.parse_alloc(raw)
                 except Exception as e:   # noqa: BLE001 - this alloc is named and kept pending; the other targets go on
-                    self.log(f"revoker: alloc {s}: {type(e).__name__}: {e}")
-                    out["outcomes"][s] = f"alloc:{_name(e)}"            # type: ignore[index]
+                    res = f"alloc:{_name(e)}"
+                    out["outcomes"][s] = res                            # type: ignore[index]
                     unread.add(s)
+                    self._retry_later(s, res, now, f"revoker: alloc {s}: {type(e).__name__}: {e}")
                     continue
                 key = (s, a.lease_seq)
-                if a.session == s and a.slot.slot_class == "egress" and (not slow or key in self.first_seen):
+                if a.session == s and a.slot.slot_class == "egress" and (
+                        not slow or key in self.first_seen or s in self.unread):
                     allocs[key] = a
-            now = seams.monotonic()
             for key, a in allocs.items():
-                if key in self.done:
+                if key in self.done or not self._due(key, now):
                     continue
                 self.first_seen.setdefault(key, now)
+                detail = ""
                 try:
                     res = SS.revoke_front(ctx, a)
-                except Exception as e:   # noqa: BLE001 - not proven; retried on the next wake
+                except Exception as e:   # noqa: BLE001 - not proven; retried when due
                     res = e.name if isinstance(e, Refused) else f"error:{type(e).__name__}"
                     if not isinstance(e, Refused):
-                        self.log(f"revoker: {a.session}: {type(e).__name__}: {e}")
+                        detail = f" ({type(e).__name__}: {e})"
                 out["outcomes"][a.session] = res                        # type: ignore[index]
                 if res == "front-ended":
                     out["ended"].append(a.session)                      # type: ignore[union-attr]
@@ -712,13 +762,17 @@ class Revoker:
                     self.done[key] = res
                     if res != "front-ended":
                         self.log(f"revoker: {a.session} lease {a.lease_seq}: {res}")
-                elif not (res == "front-busy" and now - self.first_seen[key] < SS.REVOKE_FRONT_S):
-                    self.log(f"revoker: {a.session} lease {a.lease_seq}: {res}; retried on the next wake")
+                else:
+                    quiet = res == "front-busy" and now - self.first_seen[key] < SS.REVOKE_FRONT_S
+                    self._retry_later(key, res, now,
+                                      None if quiet else f"revoker: {a.session} lease {a.lease_seq}: {res}{detail}")
             self.unread = frozenset(unread)
             if not slow:   # a lease whose alloc could not be read is not known gone: it is kept
                 for key in [k for k in self.first_seen if k not in allocs and k[0] not in unread]:
                     self.first_seen.pop(key, None)
                     self.done.pop(key, None)
+            for k in [k for k in self.retry if not self._pending(k)]:
+                self.retry.pop(k)
         finally:
             try:
                 ctx.close()

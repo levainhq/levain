@@ -49,6 +49,9 @@ class _FakeRevoker:
     def pending(self):
         return False
 
+    def retry_in(self):
+        return None
+
 
 @pytest.fixture
 def world(monkeypatch):

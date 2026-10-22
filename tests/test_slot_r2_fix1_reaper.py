@@ -2,6 +2,8 @@
 that does not prove the front is gone. On lane F2's ``World`` and the fake process table of the start tests."""
 from __future__ import annotations
 
+import os
+
 from levain.slot import Refused
 from levain.slot import start as SS
 from levain.slot.ids import SlotId
@@ -9,6 +11,13 @@ from tests.test_slot_r2_reaper import _lease_to, _reaper
 from tests.test_slot_s2f3_start import E0, _started, _world
 
 E1 = SlotId("egress", 1)
+
+
+def _clock(w):
+    """The revoker's monotonic clock, set by hand: a retry is due only once its delay has passed."""
+    clk = [1000.0]
+    w.seams.monotonic = lambda: clk[0]
+    return clk
 
 
 def test_one_unreadable_slot_state_does_not_starve_the_next_slots_orphan_revert(tmp_path):
@@ -47,12 +56,14 @@ def test_revoker_retries_a_front_kill_that_errored_while_control_is_down(tmp_pat
         return real(ctx, a)
     monkeypatch.setattr(SS, "revoke_front", flaky)
 
+    clk = _clock(w)
     rv = RP.Revoker(w.seams)
     first = rv.wake()
     assert first["control"] == "down"
     assert first["outcomes"][s] == "error:OSError"
     assert rv.pending()
 
+    clk[0] += RP.REVOKER_RETRY_S
     second = rv.wake()
     assert calls == [s, s]
     assert second["outcomes"][s] == "front-ended"
@@ -90,13 +101,116 @@ def test_an_unreadable_alloc_keeps_its_pending_kill_and_the_fast_retry(tmp_path,
     monkeypatch.setattr(SS, "revoke_front", flaky_kill)
     monkeypatch.setattr(H.Store, "read", flaky_read)
 
+    clk = _clock(w)
     rv = RP.Revoker(w.seams)
     unreadable["n"] = 1
     assert rv.wake()["outcomes"][s] == "alloc:OSError"
     assert rv.pending() and not kills
+    clk[0] += RP.REVOKER_RETRY_S
     assert rv.wake()["outcomes"][s] == "error:OSError"
     unreadable["n"] = 1
+    clk[0] += RP.REVOKER_RETRY_S
     assert rv.wake()["outcomes"][s] == "alloc:OSError"
     assert rv.pending() and len(rv.first_seen) == 1
+    clk[0] += RP.REVOKER_RETRY_S
     assert rv.wake()["outcomes"][s] == "front-ended"
     assert kills == [s, s] and not rv.pending()
+
+
+def test_an_unread_alloc_survives_a_slow_wake(tmp_path, monkeypatch):
+    # Reproduced on 2ed56044: the slow wake's targets left out the unread session, its empty set replaced unread,
+    # and pending() went false with the front never ended.
+    """CONTROL down, the alloc unreadable on its first read; then CONTROL slow. The unread session is still a target
+    of the slow wake: once its alloc reads, its front is ended."""
+    from levain.slot import reaper as RP
+    from levain.slot import runtime_helper as H
+
+    w, la, table = _world(tmp_path)
+    s = _started(w, la, table)
+
+    class Slow:
+        def call(self, op, **kw):
+            raise Refused("control-down", "timed out")
+
+        def close(self):
+            pass
+
+    def down(path):
+        raise Refused("control-down", str(path))
+    real_read = H.Store.read
+    unreadable = {"n": 2}
+
+    def flaky_read(self, parts, name, **kw):
+        if tuple(parts) == ("alloc",) and unreadable["n"]:
+            unreadable["n"] -= 1
+            raise OSError(5, "Input/output error")
+        return real_read(self, parts, name, **kw)
+    monkeypatch.setattr(H.Store, "read", flaky_read)
+
+    clk = _clock(w)
+    rv = RP.Revoker(w.seams)
+    w.seams.client_factory = down
+    assert rv.wake()["outcomes"] == {s: "alloc:OSError"}
+    w.seams.client_factory = lambda path: Slow()
+    clk[0] += RP.REVOKER_RETRY_S
+    out = rv.wake()
+    assert (out["control"], out["outcomes"]) == ("slow", {s: "alloc:OSError"})
+    assert rv.pending() and rv.unread == {s}
+    clk[0] += 2 * RP.REVOKER_RETRY_S
+    out = rv.wake()
+    assert (out["control"], out["outcomes"]) == ("slow", {s: "front-ended"})
+    assert not rv.pending()
+
+
+def test_a_stuck_retry_and_a_raising_wake_back_off_to_the_tick(tmp_path, monkeypatch):
+    # Reproduced on 2ed56044: over 600 s both woke 2400 times (every 0.25 s); the unreadable alloc logged 4801 lines
+    # and the raising wake 2401.
+    """CONTROL down and an alloc that never reads; separately, a wake that always raises. Over a fixed span the
+    revoker's waits double from REVOKER_RETRY_S to the tick, and each logs only on a change."""
+    from levain.slot import reaper as RP
+    from levain.slot import runtime_helper as H
+    from levain.slot.services import reaper as SR
+
+    def run(rv, clk):
+        waits, logs = [], []
+        r, wfd = os.pipe()
+        os.set_blocking(r, False)
+
+        def fake_wait(fd, timeout):
+            waits.append(timeout)
+            clk[0] += timeout
+        monkeypatch.setattr(SR, "_wait", fake_wait)
+        rv.log = logs.append
+        try:
+            SR.revoker_loop(rv, r, wakes=17, tick_s=RP.V11_S, log=logs.append)
+        finally:
+            os.close(r)
+            os.close(wfd)
+        return waits, logs
+
+    w, la, table = _world(tmp_path)
+    s = _started(w, la, table)
+
+    def down(path):
+        raise Refused("control-down", str(path))
+    w.seams.client_factory = down
+
+    def unreadable(self, parts, name, **kw):
+        raise OSError(5, "Input/output error")
+    monkeypatch.setattr(H.Store, "read", unreadable)
+    clk = _clock(w)
+    rv = RP.Revoker(w.seams)
+    doubling = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0] + [RP.V11_S] * 8
+    waits, logs = run(rv, clk)
+    assert waits == doubling
+    assert sum("revoker: alloc" in x for x in logs) == 2                 # the first outcome, then the tick cap
+    assert sum("revoker wake" in x for x in logs) == 1                   # every summary after the first is the same
+    assert rv.pending() and rv.unread == {s}
+
+    def boom():
+        raise OSError(13, "Permission denied")
+    rv = RP.Revoker(w.seams)
+    rv.wake = boom
+    waits, logs = run(rv, clk)
+    assert waits == doubling
+    assert sum("failed" in x for x in logs) == 1

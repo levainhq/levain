@@ -11,7 +11,9 @@ EOF (the main process is gone); on Linux the kernel also sends it SIGTERM then, 
 The worker runs §4.2 steps 2-4 and then the pass (:meth:`levain.slot.reaper.Reaper.run_pass`) on every V11 tick and
 on wakes, coalesced: a wake during a pass leaves bytes in the pipe, so one more pass follows, never sooner than V18
 after the previous pass began (a flood is one extra pass). The revoker runs :meth:`levain.slot.reaper.Revoker.wake` on
-every wake and every V11 tick, and every :data:`levain.slot.reaper.REVOKER_RETRY_S` while a front kill is pending.
+every wake and every V11 tick, and sooner when a pending front kill's retry is due (from
+:data:`levain.slot.reaper.REVOKER_RETRY_S`, doubling while the outcome repeats, up to the tick); a wake that raises
+backs off the same way while it keeps raising.
 
 Why processes and not threads (RH2): the macOS signalling child is a ``fork()``, and forking a process with a second
 Python thread can leave the child blocked on a lock that thread held. Each process here runs one Python thread; the
@@ -171,20 +173,41 @@ def revoker_loop(revoker: RP.Revoker, wake_fd: int, *, wakes: Optional[int] = No
                  log: Callable[[str], None] = _log) -> int:
     log(f"revoker pid {os.getpid()} parent {os.getppid()}")
     n = 0
+    fail_s = 0.0                  # the backoff after consecutive failed wakes; 0 after a clean one
+    failed, repeats = None, 0     # the failure last logged, and how often it repeated since
+    summary = None                # the last wake summary logged
     while True:
         n += 1
-        slow = False
         try:
             out = revoker.wake()
-        except Exception as e:   # noqa: BLE001 - one bad wake is logged and retried like a slow one
-            log(f"revoker wake {n} failed: {type(e).__name__}: {e}")
-            slow = True
+        except Exception as e:   # noqa: BLE001 - a bad wake is logged and retried, backing off while it repeats
+            msg = f"{type(e).__name__}: {e}"
+            if msg == failed:
+                repeats += 1
+            else:
+                if repeats:
+                    log(f"revoker wake failed {repeats} more times: {failed}")
+                log(f"revoker wake {n} failed: {msg}")
+                failed, repeats = msg, 0
+            summary = None
+            fail_s = min(fail_s * 2, tick_s) if fail_s else RP.REVOKER_RETRY_S
+            wait = fail_s
         else:
-            log(f"revoker wake {n}: control {out['control']} outcomes {out['outcomes']}")
-            slow = out["control"] == "slow"
+            if repeats:
+                log(f"revoker wake failed {repeats} more times: {failed}")
+            failed, repeats, fail_s = None, 0, 0.0
+            line = f"control {out['control']} outcomes {out['outcomes']}"
+            if line != summary:
+                log(f"revoker wake {n}: {line}")
+                summary = line
+            if out["control"] == "slow":   # bounded by V23, after which CONTROL is taken as down
+                wait = RP.REVOKER_RETRY_S
+            else:
+                due = revoker.retry_in()
+                wait = tick_s if due is None else min(due, tick_s)
         if wakes is not None and n >= wakes:
             return 0
-        _wait(wake_fd, RP.REVOKER_RETRY_S if revoker.pending() or slow else tick_s)
+        _wait(wake_fd, wait)
         if not _drain(wake_fd):
             log("revoker: the main process is gone; exiting")
             return 0
@@ -252,7 +275,7 @@ def serve(seams: H.Seams, *, tuning: RP.Tuning = RP.Tuning(), worker_passes: Opt
     try:
         sock = bind_wake(seams, chown_path=chown_path)
         reaper = RP.Reaper(seams, tuning=tuning, log=log, netns=netns)
-        revoker = RP.Revoker(seams, log=log)
+        revoker = RP.Revoker(seams, log=log, tick_s=tick_s)
         children[:] = [
             _Child("worker", lambda fd: worker_loop(reaper, fd, passes=worker_passes, tick_s=tick_s, log=log),
                    worker_passes),
