@@ -552,7 +552,10 @@ def probe_enospc(work: Path) -> bool:
     except OSError as e:
         return e.errno in _ENOSPC_ERRNOS
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         try:
             os.unlink(p)
         except OSError:
@@ -597,81 +600,93 @@ def _parser() -> _Parser:
     return ap
 
 
-def run(argv: Sequence[str], *, stdin: BinaryIO, result_fd: int, work: Path,
-        trailing_wait: float = TRAILING_WAIT) -> int:
-    """The importer: exactly one result line on ``result_fd`` on every exit path (a usage error, a log that cannot
-    be opened, any failure), then the exit code; a result line that cannot be written exits 1."""
+def _probe_quietly(work: Path) -> bool:
+    try:
+        return probe_enospc(work)
+    except Exception:  # noqa: BLE001 - a probe never decides whether the line is written
+        return False
+
+
+def run(argv: Sequence[str], *, stdin: BinaryIO | None, result_fd: int, work: Path | None,
+        trailing_wait: float = TRAILING_WAIT, startup_error: OSError | None = None) -> int:
+    """The importer. The result line is written at EXACTLY ONE place, the ``finally`` below, from a mutable outcome
+    that starts as a generic failure; every step only updates it. Any exception (the work, a probe, a close) folds
+    into the outcome. KeyboardInterrupt and SystemExit stay outside the contract (they propagate) but the line is
+    still attempted on the way out. A line that cannot be written exits 1."""
     progress = Progress()
+    out = {"rc": 1, "refused": None, "detail": "importer aborted", "enospc": False}
     log: BinaryIO | None = None
     spool: Spool | None = None
     try:
         try:
-            a = _parser().parse_args(list(argv))
-        except _Usage as u:
-            raise Fatal(None, f"usage: {u}") from None
-        if not re.fullmatch(r"[0-9a-f]{%d}" % FORMATS[a.object_format][0], a.base_oid):
-            raise Fatal(None, "usage: --base-oid is not an oid of the object format")
-        if a.git_log:
+            if startup_error is not None:  # fd 0 closed, or the cwd gone
+                raise Fatal(None, f"startup: {errno.errorcode.get(startup_error.errno or 0, startup_error.errno)}",
+                            own_enospc=startup_error.errno in _ENOSPC_ERRNOS)
+            assert stdin is not None and work is not None
             try:
-                log = open(a.git_log, "ab")
+                a = _parser().parse_args(list(argv))
+            except _Usage as u:
+                raise Fatal(None, f"usage: {u}") from None
+            if not re.fullmatch(r"[0-9a-f]{%d}" % FORMATS[a.object_format][0], a.base_oid):
+                raise Fatal(None, "usage: --base-oid is not an oid of the object format")
+            if a.git_log:
+                try:
+                    log = open(a.git_log, "ab")
+                except OSError as e:
+                    raise _oserror(e, "--git-log open") from None
+            runner = GitRunner(a.git, work, log)
+            try:
+                spool = Spool(work / "spool" / "frames")
             except OSError as e:
-                raise _oserror(e, "--git-log open") from None
-        runner = GitRunner(a.git, work, log)
+                raise _oserror(e, "spool create") from None
+            frames = spool_frames(stdin, spool, progress, payload_cap=a.max_bytes, trailing_wait=trailing_wait)
+            ingest_base(runner, spool, frames, object_format=a.object_format, base_oid=a.base_oid,
+                        cap=a.max_input_size)
+            progress.ignored_git_paths = ingest_objects(runner, spool, frames, object_format=a.object_format,
+                                                        cap=a.max_input_size)
+            out.update(rc=0, refused=None, detail="", enospc=False)
+        except Fatal as f:
+            out.update(rc=1, refused=f.name, detail=f.detail,
+                       enospc=f.own_enospc or (work is not None and _probe_quietly(work)))
+        except Exception as e:  # noqa: BLE001 - every failure answers one line
+            out.update(rc=1, refused=None, detail=f"{type(e).__name__}: {e}",
+                       enospc=work is not None and _probe_quietly(work))
+        # Cleanup can fail too: that folds into the outcome like everything else.
+        for closer in (spool.close if spool is not None else None, log.close if log is not None else None):
+            if closer is None:
+                continue
+            try:
+                closer()
+            except Exception as e:  # noqa: BLE001
+                en = getattr(e, "errno", None)
+                note = f"cleanup close: {errno.errorcode.get(en or 0, en) if isinstance(e, OSError) else type(e).__name__}"
+                out["rc"] = 1
+                out["detail"] = f"{out['detail']}; {note}" if out["detail"] else note
+                out["enospc"] = bool(out["enospc"]) or en in _ENOSPC_ERRNOS
+    finally:
         try:
-            spool = Spool(work / "spool" / "frames")
-        except OSError as e:
-            raise _oserror(e, "spool create") from None
-        frames = spool_frames(stdin, spool, progress, payload_cap=a.max_bytes, trailing_wait=trailing_wait)
-        ingest_base(runner, spool, frames, object_format=a.object_format, base_oid=a.base_oid,
-                    cap=a.max_input_size)
-        progress.ignored_git_paths = ingest_objects(runner, spool, frames, object_format=a.object_format,
-                                                    cap=a.max_input_size)
-    except Fatal as f:
-        # The decision point: enospc from what THIS path saw, never from an earlier handled failure.
-        rc, refused, detail = 1, f.name, f.detail
-        enospc = f.own_enospc or probe_enospc(work)
-    except Exception as e:  # noqa: BLE001 - every failure answers one line
-        rc, refused, detail = 1, None, f"{type(e).__name__}: {e}"
-        enospc = probe_enospc(work)
-    else:
-        rc, refused, detail, enospc = 0, None, "", False
-    # Cleanup can fail too (a buffered log's flush on close, the spool's close): that error folds into the pending
-    # outcome, and the one result line is built and written regardless.
-    for closer in (spool.close if spool is not None else None, log.close if log is not None else None):
-        if closer is None:
-            continue
+            line = result_line(progress, refused=out["refused"], detail=str(out["detail"]), enospc=bool(out["enospc"]))
+        except Exception:  # noqa: BLE001 - the line is owed on every exit
+            line = result_line(progress, refused=None, detail="", enospc=bool(out["enospc"]))
+            out["rc"] = 1
         try:
-            closer()
-        except OSError as e:
-            note = f"cleanup close: {errno.errorcode.get(e.errno or 0, e.errno)}"
-            rc = 1
-            detail = f"{detail}; {note}" if detail else note
-            enospc = enospc or e.errno in _ENOSPC_ERRNOS
-    try:
-        line = result_line(progress, refused=refused, detail=detail, enospc=enospc)
-    except Exception:  # noqa: BLE001 - the line is owed on every exit
-        line = result_line(progress, refused=None, detail="", enospc=enospc)
-        rc = 1
-    try:
-        write_all(result_fd, line)
-    except OSError:
-        return 1
-    return rc
+            write_all(result_fd, line)  # THE one result-line write
+        except OSError:
+            out["rc"] = 1
+    return int(out["rc"])
 
 
 def main() -> int:
     # fd 0 unbuffered: no read-ahead hides bytes from the trailing check's readiness wait.
+    stdin: BinaryIO | None = None
+    work: Path | None = None
+    err: OSError | None = None
     try:
         stdin = open(0, "rb", buffering=0, closefd=False)
         work = Path(os.getcwd())
-    except OSError as e:  # fd 0 closed, or the cwd gone: still one result line
-        try:
-            write_all(4, result_line(Progress(), refused=None, detail=f"startup: {errno.errorcode.get(e.errno or 0, e.errno)}",
-                                     enospc=e.errno in _ENOSPC_ERRNOS))
-        except OSError:
-            pass
-        return 1
-    return run(sys.argv[1:], stdin=stdin, result_fd=4, work=work)
+    except OSError as e:
+        err = e
+    return run(sys.argv[1:], stdin=stdin, result_fd=4, work=work, startup_error=err)
 
 
 if __name__ == "__main__":
