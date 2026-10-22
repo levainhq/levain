@@ -320,6 +320,7 @@ def test_slot_socket_group_inherited(host):
 STORE_DIRS = {
     "": ("R", "R", 0o755), "live": ("R", "R", 0o711), "alloc": ("R", "R", 0o700),
     "sessions": ("_levain_control", "_levain_control", 0o700),
+    "sessions/front-reg": ("_levain_control", "_levain_control", 0o700),
     "slots": ("R", "R", 0o755), "retained": ("R", "R", 0o700), "trash": ("R", "R", 0o700),
     "staging": ("R", "R", 0o711), "export": ("R", "R", 0o755),
     "export/operator": ("_levain_export", "levain-export", 0o2750),

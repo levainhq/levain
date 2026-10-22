@@ -194,6 +194,26 @@ def test_record_claims_shapes():
     _refused("missing-key", R.parse_claims, _mint_claims())    # MINT claims never stand alone
 
 
+def test_persisted_claims_carry_reg_token_and_the_counter_record_parses():
+    # §3.3 persisted claims: ATTACH + MINT + reg_token loads; TOKEN-ONLY (ATTACH + reg_token) loads, not minted.
+    for claims in ({**_attach_claims(), **_mint_claims(), "reg_token": 7}, {**_attach_claims(), "reg_token": 7}):
+        s = _state(state=R.RENDERING, claims=claims)
+        assert R.parse_state(R.state_bytes(s)).claims == claims
+    assert not R.has_mint_claims(R.parse_claims({**_attach_claims(), "reg_token": 7}))
+    _refused("unknown-key", R.parse_mint_claims, _mint_claims(reg_token=7))     # root never supplies it
+    for bad in ("7", True, -1):
+        _refused("wrong-type" if bad != -1 else "out-of-range", R.parse_claims, {**_attach_claims(), "reg_token": bad})
+    _refused("missing-key", R.parse_claims, {"reg_token": 7})
+    # §2.1 the per-front_uid counter: round-trips; whatever does not parse is front-registration-corrupt.
+    rec = R.FrontReg(front_uid=3989, reg_token=7)
+    data = R.front_reg_bytes(rec)
+    assert data == b'{"front_uid":3989,"reg_token":7}' and R.parse_front_reg(data, 3989) == rec
+    for raw in (b"", b"{", b'{ "front_uid":3989,"reg_token":7}', b'{"front_uid":3989}',
+                b'{"front_uid":3989,"reg_token":"7"}', b'{"front_uid":3989,"reg_token":7,"x":1}'):
+        _refused("front-registration-corrupt", R.parse_front_reg, raw, 3989)
+    _refused("front-registration-corrupt", R.parse_front_reg, data, 3990)    # another uid's file
+
+
 # --- the state record ------------------------------------------------------------------------------------
 
 def _state(**kw) -> R.SessionState:
