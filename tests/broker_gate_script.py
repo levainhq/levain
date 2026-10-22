@@ -8,9 +8,10 @@ Cases (each a 5 MiB body with `Content-Length`, the slot reading the response wh
   1 `before_keys_read` held until the stand-in keys has written `F` and half-closed, while the body writer streams
     into keys' drain: the slot reads `F`'s status and keys' drain ends at the front's half-close, not at its bound.
   2 `before_body_write` held while the stand-in writes `F` and closes at once: the slot reads `F`'s status.
-  R the reproduced failure (probe (b)'s write-then-read shape): the reader held until the body writer has failed
-    against a keys that closed at once: no `F` reaches the slot (503), which is what the parked reader prevents.
-Exit 0 and a last line `GATE PASS` when 1 and 2 pass and R shows the failure.
+  R probe (b)'s write-then-read shape: the reader held until the body writer has failed against a keys that wrote
+    `F` and closed at once. The `F` arrived before the write error, so the slot still reads its status: the keys-side
+    reader returns every frame it received before it raises the error (an earlier front answered 503 here).
+Exit 0 and a last line `GATE PASS` when all three read the `F`'s status.
 """
 from __future__ import annotations
 
@@ -180,9 +181,8 @@ async def main() -> int:
            and d.get("ended_by") == "eof" and d.get("after_release_s") is not None
            and d["after_release_s"] < 1.0)
     ok2 = r2["slot_status_line"].startswith("HTTP/1.1 401") and r2["parked_before_first_write"] in (True, None)
-    okr = not rr["slot_status_line"].startswith("HTTP/1.1 401")
-    print(f"case1 {'PASS' if ok1 else 'FAIL'}  case2 {'PASS' if ok2 else 'FAIL'}  "
-          f"reproduced-failure {'SHOWN' if okr else 'NOT SHOWN'}")
+    okr = rr["slot_status_line"].startswith("HTTP/1.1 401") and rr["write_error"] is not None
+    print(f"case1 {'PASS' if ok1 else 'FAIL'}  case2 {'PASS' if ok2 else 'FAIL'}  caseR {'PASS' if okr else 'FAIL'}")
     if ok1 and ok2 and okr:
         print("GATE PASS")
         return 0

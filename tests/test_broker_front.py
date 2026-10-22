@@ -297,9 +297,10 @@ _ROOT_PYTHON = "/usr/bin/python3"
 
 
 def test_refusal_survives_streaming_body_gates(tmp_path):
-    """Reproduced (3b-1a, probe (b)'s write-then-read shape, the script's case R): a front whose keys reader starts
-    only after its body writer failed answers 503, never the 401 keys sent. The gate script proves the parked reader
-    keeps the F under both gates; it runs as the root interpreter runs the gateway, isolated, from a launcher."""
+    """Reproduced (3b-1a, probe (b)'s write-then-read shape, the script's case R): a front whose keys reader resumes
+    only after its body writer failed answered 503, never the 401 keys sent, though the `F` had already arrived
+    (3b-1a-fix1: the whole frame sat in the reader's buffer). The gate script proves the `F` is kept under both
+    gates and in case R; it runs as the root interpreter runs the gateway, isolated, from a launcher."""
     import shutil
     import subprocess
     import sys
@@ -322,3 +323,111 @@ def test_refusal_survives_streaming_body_gates(tmp_path):
     out = subprocess.run([_ROOT_PYTHON, "-IS", str(launcher)], capture_output=True, text=True, timeout=120)
     sys.stdout.write(out.stdout + out.stderr)
     assert out.returncode == 0 and out.stdout.strip().endswith("GATE PASS"), out.stdout + out.stderr
+
+
+# --- the brokered exchange against a stand-in keys -------------------------------------------------------------------
+
+_TOKEN = "A" * 43
+_EX_POLICY = {"format": "levain-front-session/1", "kind": "interactive", "session": "s-ex", "routes": [
+    {"route": "vendor", "type": "brokered", "upstream": {"scheme": "https", "host": "api.vendor.example",
+                                                         "base_path": ""},
+     "requests": {"templates": [{"method": "POST", "path": "/v1/messages"}], "headers": {"content-type": ".*"},
+                  "body_cap": 32 * 1024 * 1024, "body_codec": "none"},
+     "max_call_microdollars": 1}]}
+
+
+async def _answering_keys(path: str, seen: list):
+    """keys' front.sock for one exchange: records `Q`, answers `A`, `R 200`, one `b`, `e` at once, then reads
+    whatever the front still sends until its `E` / `X` / EOF."""
+    from levain.broker import gwwire
+
+    async def frame(r):
+        try:
+            hdr = await r.readexactly(5)
+            return hdr[:1], await r.readexactly(int.from_bytes(hdr[1:], "big"))
+        except (asyncio.IncompleteReadError, ConnectionError):
+            return None
+
+    async def serve(r, w):
+        first = await frame(r)
+        seen.append(json.loads(first[1]))
+        for f in (gwwire.encode(b"A", {}), gwwire.encode(b"R", {"v": 1, "status": 200, "headers": []}),
+                  gwwire.encode(b"b", b"early-ok"), gwwire.encode(b"e")):
+            w.write(f)
+        await w.drain()
+        while (fr := await frame(r)) is not None and fr[0] not in (b"E", b"X"):
+            pass
+        w.close()
+
+    return await asyncio.start_unix_server(serve, path)
+
+
+async def _exchange(slot_pair, head: bytes, body: bytes) -> tuple[dict, bytes, list]:
+    """One brokered exchange, the front's side driven directly; the slot writes its whole body BEFORE it reads."""
+    from levain.broker.front import BrokeredExchange, parse_head_conn
+
+    seen: list = []
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        keys = await _answering_keys(os.path.join(tmp, "k.sock"), seen)
+        front = Front(load_policy(json.dumps(_EX_POLICY).encode()), log_path=os.path.join(tmp, "f.log"),
+                      keys_path=os.path.join(tmp, "k.sock"))
+        fr, fw, sr, sw = await slot_pair()
+
+        async def slot() -> bytes:
+            sw.write(head)
+            try:
+                for i in range(0, len(body), 65536):
+                    sw.write(body[i:i + 65536])
+                    await sw.drain()
+                return await asyncio.wait_for(sr.read(), 20)
+            except OSError as e:
+                return type(e).__name__.encode()
+
+        s = asyncio.ensure_future(slot())
+        conn, req = parse_head_conn(await fr.readuntil(b"\r\n\r\n"))
+        ex = BrokeredExchange(front, front.policy.brokered["vendor"], conn, req, req.target[9:], None, fr, fw)
+        await asyncio.wait_for(ex.run(), 30)
+        fw.close()   # as Front._handle does once the exchange returns
+        got = await asyncio.wait_for(s, 30)
+        sw.close()
+        keys.close()
+    return ex.rec, got, seen
+
+
+async def _tcp_slot_pair():
+    accepted: asyncio.Future = asyncio.get_running_loop().create_future()
+    server = await asyncio.start_server(lambda r, w: accepted.set_result((r, w)), "127.0.0.1", 0)
+    sr, sw = await asyncio.open_connection("127.0.0.1", server.sockets[0].getsockname()[1])
+    fr, fw = await accepted
+    server.close()
+    return fr, fw, sr, sw
+
+
+async def _unix_slot_pair():
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    fr, fw = await asyncio.open_unix_connection(sock=a)
+    sr, sw = await asyncio.open_unix_connection(sock=b)
+    return fr, fw, sr, sw
+
+
+def test_early_response_is_not_reset_by_the_unread_body():
+    """Reproduced (3b-1a-fix1, codex r1 HIGH 2): keys answers `R 200 ... e` while a 5 MiB body is still arriving; the
+    front used to close over the unread body, and a TCP slot that uploads before it reads got a broken pipe and no
+    response. Now the front discards the rest of the body after the response, then closes."""
+    body = b"x" * (5 * 1024 * 1024)
+    head = (b"POST /r/vendor/v1/messages HTTP/1.1\r\nHost: gw\r\nAuthorization: Bearer %s\r\n"
+            b"Content-Length: %d\r\n\r\n" % (_TOKEN.encode(), len(body)))
+    rec, got, _ = asyncio.run(_exchange(_tcp_slot_pair, head, body))
+    assert got.startswith(b"HTTP/1.1 200 OK\r\n") and b"early-ok" in got, got[:200]
+    assert rec["end"] == "ok" and rec["discarded"] > 0, rec
+
+
+def test_connection_keep_alive_is_dropped_not_refused():
+    """Reproduced (3b-1a-fix1, complement r1 9): `Connection: keep-alive`, which common clients send, was refused 400
+    `malformed`. It is a connection option: dropped, never forwarded, the request served."""
+    head = (b"POST /r/vendor/v1/messages HTTP/1.1\r\nHost: gw\r\nAuthorization: Bearer %s\r\n"
+            b"Connection: keep-alive\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n" % _TOKEN.encode())
+    rec, got, seen = asyncio.run(_exchange(_unix_slot_pair, head, b"{}"))
+    assert got.startswith(b"HTTP/1.1 200 OK\r\n"), got[:200]
+    assert [q["headers"] for q in seen] == [[["content-type", "application/json"]]], seen
+    assert "refused" not in rec and "connection" not in rec["dropped"], rec

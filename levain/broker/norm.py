@@ -139,6 +139,13 @@ CONSUMED = frozenset({"authorization", "host", "content-length", "transfer-encod
 #: the request headers that may repeat; any other name twice is refused.
 LIST_HEADERS = frozenset({"accept", "accept-language", "cache-control", "anthropic-beta"})
 _NAME = re.compile(r"[a-z0-9!#$%&'*+.^_`|~-]+\Z")
+#: the `Connection` options a slot may send on any brokered request; they are dropped, never refused.
+CONNECTION_OPTIONS = frozenset({"keep-alive", "close"})
+
+
+def connection_tokens(value: str) -> list[str]:
+    """A `Connection` value as its lowercased options (RFC 9110 §7.6.1: a comma list; empty elements ignored)."""
+    return [t.strip().lower() for t in value.split(",") if t.strip()]
 
 
 def is_forbidden(name: str) -> bool:
@@ -147,8 +154,11 @@ def is_forbidden(name: str) -> bool:
 
 def check_headers(pairs: Sequence[tuple[str, str]], allow: Mapping[str, Pattern[str]], upgrade_ok: bool,
                   strict: bool = False) -> list[tuple[str, str]]:
-    """The headers to forward, in order. Names are lowercased. Refused `malformed`: a hop-by-hop name (`upgrade`
-    and `connection: upgrade` pass only when `upgrade_ok`, and are consumed), a duplicate of a non-list name. Then
+    """The headers to forward, in order. Names are lowercased. Refused `malformed`: a hop-by-hop name, a duplicate
+    of a non-list name. `Connection` is read as a token list and consumed: `keep-alive` and `close` are dropped
+    silently (every common client sends one; the front closes after each brokered exchange anyway), `upgrade` passes
+    only when `upgrade_ok`, any other token is `malformed`. `Upgrade` passes, consumed, only when `upgrade_ok`
+    (the front checks the whole websocket handshake). Then
     allow-list forwarding: a forbidden or consumed name is removed, a name not in `allow` is dropped, a named one
     whose value does not fully match its pattern is `policy-header`. `strict` (keys' re-check of a `Q`): a
     forbidden, consumed or off-list name is `policy-header` instead of being removed."""
@@ -164,9 +174,13 @@ def check_headers(pairs: Sequence[tuple[str, str]], allow: Mapping[str, Pattern[
         if name in HOP_BY_HOP or name.startswith("proxy-"):
             if strict:
                 raise Refused("policy-header", name)
-            if upgrade_ok and (name == "upgrade" and value.lower() == "websocket"
-                               or name == "connection" and value.lower() == "upgrade"):
+            if name == "connection":
+                toks = connection_tokens(value)
+                if not toks or not set(toks) <= (CONNECTION_OPTIONS | ({"upgrade"} if upgrade_ok else set())):
+                    raise Refused("malformed", "connection")
                 continue
+            if name == "upgrade" and upgrade_ok:
+                continue   # the front judges it with the rest of the websocket handshake
             if name == "transfer-encoding":
                 continue   # the body framing, already read by the parser
             raise Refused("malformed", "hop-by-hop")

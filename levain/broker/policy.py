@@ -17,8 +17,13 @@ ROUTE_TYPES = ("egress", "subscription_passthrough", "brokered")
 CONNECT_TYPES = ("egress", "subscription_passthrough")
 BODY_CODECS = ("anthropic-messages", "openai-responses", "openai-chat", "none")
 #: where a policy object comes from: the base map, a dispatch map, or a front's session file (render's copy of
-#: either, with no credential field).
-SOURCES = ("base", "dispatch", "session")
+#: either, with no credential field). `dispatch-session` is a dispatch or planner session's file: its brokered
+#: routes keep the dispatch map's rules, and its egress routes load as in any session file.
+SOURCES = ("base", "dispatch", "session", "dispatch-session")
+#: the sources whose brokered routes follow the dispatch rules (a codec, no websocket template, no session budget).
+DISPATCH_RULES = ("dispatch", "dispatch-session")
+#: the sources that are a front's session file (no credential field).
+SESSION_FILES = ("session", "dispatch-session")
 _ROUTE_ID = re.compile(r"^[a-z0-9-]{1,48}\Z")
 _LABEL = r"(?!-)[a-z0-9-]{1,63}(?<!-)"
 #: lowercase IDNA A-label host names with at least two labels; the last label is not all digits (no address literals).
@@ -112,7 +117,7 @@ def _templates(route: str, raw: object, source: str) -> tuple[norm.Template, ...
         if upgrade is not None:
             if upgrade != "websocket" or method != "GET":
                 raise PolicyError(f"route {route}: only a GET template may carry upgrade: websocket")
-            if source == "dispatch":
+            if source in DISPATCH_RULES:
                 raise PolicyError(f"route {route}: a dispatch route carries no websocket template")
         out.append(norm.Template(method, path, upgrade))
     return tuple(out)
@@ -135,7 +140,7 @@ def _requests(route: str, raw: object, source: str) -> dict:
             raise PolicyError(f"route {route}: requests.headers.{name}: {e}") from None
     if raw["body_codec"] not in BODY_CODECS:
         raise PolicyError(f"route {route}: body_codec {raw['body_codec']!r}")
-    if source == "dispatch" and raw["body_codec"] == "none":
+    if source in DISPATCH_RULES and raw["body_codec"] == "none":
         raise PolicyError(f"route {route}: a dispatch route needs a body_codec")
     return {"templates": _templates(route, raw["templates"], source), "headers": pats,
             "body_cap": _posint(route, "requests.body_cap", raw["body_cap"]), "body_codec": raw["body_codec"]}
@@ -161,7 +166,8 @@ def _upstream(route: str, raw: object) -> Upstream:
 def parse_route(pol: object, *, source: str) -> RoutePolicy:
     """One `levain-route-policy/1` object. `source` decides the per-map rules: `max_session_microdollars` REQUIRED
     on a base-map brokered route and FORBIDDEN on a dispatch-map one; a dispatch route is brokered with a codec and
-    no websocket template; a session file's route (render's copy) carries no `credential`."""
+    no websocket template; a session file's route (render's copy) carries no `credential`; a dispatch or planner
+    session file's brokered route (`dispatch-session`) keeps the dispatch rules."""
     if source not in SOURCES:
         raise ValueError(source)
     if not isinstance(pol, dict):
@@ -169,7 +175,7 @@ def parse_route(pol: object, *, source: str) -> RoutePolicy:
     route = pol.get("route")
     if not isinstance(route, str) or not _ROUTE_ID.match(route):
         raise PolicyError(f"bad route id {route!r}")
-    if source == "session" and "credential" in pol:
+    if source in SESSION_FILES and "credential" in pol:
         raise PolicyError(f"route {route}: the front's policy carries no credential field")
     unknown = set(pol) - _POLICY_KEYS
     if unknown:
@@ -198,7 +204,7 @@ def parse_route(pol: object, *, source: str) -> RoutePolicy:
         resp = tuple(_header_name(route, "responses", n) for n in r["headers"])
     max_call = _posint(route, "max_call_microdollars", pol.get("max_call_microdollars"))
     max_sess = pol.get("max_session_microdollars")
-    if source == "dispatch" and max_sess is not None:
+    if source in DISPATCH_RULES and max_sess is not None:
         raise PolicyError(f"route {route}: a dispatch route carries no max_session_microdollars")
     if source == "base" and max_sess is None:
         raise PolicyError(f"route {route}: a base-map brokered route needs max_session_microdollars")

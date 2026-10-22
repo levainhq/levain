@@ -56,7 +56,7 @@ except ImportError:   # an install without levain[isolation]: main() says so in 
     h11 = None  # type: ignore[assignment]
 
 from levain.broker import gwwire
-from levain.broker.gwwire import FrameReader, FrontSide, WireError
+from levain.broker.gwwire import FrameReader, FrontSide, HoldingReader, WireError
 from levain.broker.norm import REASON, STATUS, Refused  # noqa: F401 - STATUS and Refused are re-exported
 from levain.broker import norm
 from levain.broker.policy import (CONNECT_TYPES, ROUTE_TYPES, PolicyError, RoutePolicy,  # noqa: F401 - re-exported
@@ -146,7 +146,7 @@ def load_policy(data: bytes) -> FrontPolicy:
     brokered_hosts: set[str] = set()
     brokered: dict[str, RoutePolicy] = {}
     for raw in doc["routes"]:
-        pol = parse_route(raw, source="session")
+        pol = parse_route(raw, source="dispatch-session" if doc["kind"] in DISPATCH_KINDS else "session")
         route, typ = pol.route, pol.type
         if route in seen:
             raise PolicyError(f"route {route} twice")
@@ -466,12 +466,23 @@ def client_hello_sni(body: bytes) -> str:
 # --- the brokered half (3b): keys' wire, the exchange -------------------------------------------------------------
 
 _WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+#: a forwarded header value the wire can carry: visible ASCII and tab.
+_FWD_VALUE = re.compile(r"[\t\x20-\x7e]*\Z")
+#: the events queue between keys' reader and the relay: a full queue makes the reader wait, so a slot that reads
+#: slowly slows keys down instead of the front buffering the upstream's response.
+_EVENTS_MAX = 8
 
 
 async def open_keys(path: str) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     """The front's ONE keys-side client: a connection to keys' `R/keys/front.sock`, for the STATUS connection and for
-    each brokered exchange (one connection per exchange)."""
-    return await asyncio.open_unix_connection(path)
+    each brokered exchange (one connection per exchange). Its reader is a `HoldingReader` over the connection's
+    socket, so a frame keys sent before a reset is still read."""
+    loop = asyncio.get_running_loop()
+    reader = HoldingReader(limit=_CHUNK, loop=loop)
+    protocol = asyncio.StreamReaderProtocol(reader, loop=loop)
+    transport, _ = await loop.create_unix_connection(lambda: protocol, path)
+    reader.sock = transport.get_extra_info("socket")
+    return reader, asyncio.StreamWriter(transport, protocol, reader, loop)
 
 
 def split_route_target(target: bytes) -> tuple[str, bytes, Optional[bytes]]:
@@ -516,9 +527,10 @@ class _SlotBody:
         self.conn, self.reader = conn, reader
         self.done = False
 
-    async def next(self) -> Optional[bytes]:
+    async def next(self, limit: int = _CHUNK) -> Optional[bytes]:
         """The next body bytes, or None once the body ended. Raises _SlotGone at an EOF mid-body and
-        Refused("malformed") for a body h11 refuses."""
+        Refused("malformed") for a body h11 refuses. At most `limit` bytes are read from the slot for this call
+        (h11 may still return bytes it already held)."""
         while not self.done:
             try:
                 ev = self.conn.next_event()
@@ -527,7 +539,7 @@ class _SlotBody:
                     raise _SlotGone() from None
                 raise Refused("malformed", "body") from None
             if ev is h11.NEED_DATA:
-                data = await self.reader.read(_CHUNK)
+                data = await self.reader.read(max(1, min(_CHUNK, limit)))
                 if not data:
                     self._eof = True
                 self.conn.receive_data(data)
@@ -572,6 +584,11 @@ class BrokeredExchange:
         self.pairs = [(n.decode("latin-1"), v.decode("latin-1")) for n, v in req.headers]
         self.nobody = req.method == b"HEAD"
         self.rec: dict = {"event": "exchange", "route": route.route, "method": req.method.decode("ascii")}
+        #: the `Q.upgrade` sent ("websocket" only after the whole handshake checked) and the key it carried.
+        self.upgrade = "none"
+        self.ws_key: Optional[str] = None
+        #: True once a final answer (a refusal, keys' `R`, a 101) started on the slot; a `100 Continue` is not one.
+        self.answered = False
 
     # -- the head ------------------------------------------------------------------------------------------------
 
@@ -581,14 +598,18 @@ class BrokeredExchange:
         tpl = norm.match_template(r.templates, self.req.method, self.path, self.query)
         token = norm.bearer_token(self.pairs)
         fwd = norm.check_headers(self.pairs, r.headers or {}, upgrade_ok=tpl.upgrade is not None)
+        if any(not _FWD_VALUE.match(v) for _, v in fwd):
+            raise Refused("malformed", "header-value")   # the wire carries visible ASCII and tab only
         names = {n for n, _ in fwd}
         self.rec["dropped"] = sorted({n.lower() for n, _ in self.pairs} - names - norm.CONSUMED
-                                     - ({"upgrade", "connection"} if tpl.upgrade else set()))
+                                     - {"connection"} - ({"upgrade"} if tpl.upgrade else set()))
         expect = [v.lower() for n, v in self.pairs if n == "expect"]
         if expect and expect != ["100-continue"]:
             raise Refused("malformed", "expect")
         cl = [v for n, v in self.pairs if n == "content-length"]
         te = [v for n, v in self.pairs if n == "transfer-encoding"]
+        if cl and te:
+            raise Refused("malformed", "cl-and-te")
         if cl:
             n = int(cl[0])   # h11 validated it
             if n > r.body_cap:
@@ -599,20 +620,62 @@ class BrokeredExchange:
         else:
             body = "none"
         upgrade = "none"
-        if tpl.upgrade and any(n == "upgrade" and v.lower() == "websocket" for n, v in self.pairs):
+        if tpl.upgrade and self._asks_upgrade():
+            self._check_websocket_handshake(fwd, body)
             upgrade = "websocket"
-            self.ws_key = next((v for n, v in fwd if n == "sec-websocket-key"), None)
-            if self.ws_key is None:
-                raise Refused("malformed", "websocket-key")
+        self.upgrade = upgrade
         return ({"v": 1, "token": token, "route": r.route, "method": self.req.method.decode("ascii"),
                  "path": self.path.decode("ascii"), "query": (self.query or b"").decode("ascii"),
                  "headers": [[n, v] for n, v in fwd], "body": body, "upgrade": upgrade}, bool(expect))
 
+    def _asks_upgrade(self) -> bool:
+        return any(n == "upgrade" for n, _ in self.pairs) or any(
+            "upgrade" in norm.connection_tokens(v) for n, v in self.pairs if n == "connection")
+
+    def _check_websocket_handshake(self, fwd: list, body: str) -> None:
+        """A request on a websocket template that asks to upgrade must carry the whole RFC 6455 §4.1 client
+        handshake, else `malformed`: `upgrade` among its Connection options, `Upgrade: websocket`, version 13, no
+        body, and one `Sec-WebSocket-Key` that is the canonical base64 of 16 bytes and is among the forwarded
+        headers (the 101 is computed from it). Only then may keys' `U` become a 101."""
+        conn = [t for n, v in self.pairs if n == "connection" for t in norm.connection_tokens(v)]
+        ups = [v.strip().lower() for n, v in self.pairs if n == "upgrade"]
+        vers = [v.strip() for n, v in self.pairs if n == "sec-websocket-version"]
+        keys = [v.strip() for n, v in self.pairs if n == "sec-websocket-key"]
+        if "upgrade" not in conn or ups != ["websocket"] or vers != ["13"] or body != "none" or len(keys) != 1:
+            raise Refused("malformed", "websocket-handshake")
+        key = keys[0]
+        try:
+            raw = base64.b64decode(key, validate=True)
+        except ValueError:
+            raw = b""
+        if len(raw) != 16 or base64.b64encode(raw).decode("ascii") != key:
+            raise Refused("malformed", "websocket-key")
+        if not any(n == "sec-websocket-key" and v == key for n, v in fwd):
+            raise Refused("malformed", "websocket-key")
+        self.ws_key = key
+
     # -- the run -------------------------------------------------------------------------------------------------
 
     async def run(self) -> None:
+        """The exchange, start to end. Every path, each refusal made before keys included, writes its record."""
+        try:
+            await self._run()
+        except WireError as e:   # a frame the wire will not encode never escapes the exchange
+            self.rec["wire_error"] = str(e)
+            if not self.answered:
+                await self.refuse(Refused("keys-unavailable", "wire"))
+        finally:
+            self.front._log(self.rec)
+
+    async def _run(self) -> None:
         try:
             q, expect = self._q()
+            try:
+                qframe = gwwire.encode(b"Q", q)
+            except WireError:
+                # a head under HEAD_CAP whose `Q` is over the wire's cap (JSON escaping grows it): refused with the
+                # head cap's name, before keys is opened
+                raise Refused("malformed", "q-cap") from None
         except Refused as r:
             await self.refuse(r)
             return
@@ -625,11 +688,11 @@ class BrokeredExchange:
             await self.refuse(Refused("keys-unavailable", "keys-connect"))
             return
         self.front.live.add(kw)
-        events: asyncio.Queue = asyncio.Queue()
-        reader = asyncio.ensure_future(self._read_keys(FrameReader(kr), events))
+        events: asyncio.Queue = asyncio.Queue(maxsize=_EVENTS_MAX)
+        reader = self._reader_task = asyncio.ensure_future(self._read_keys(FrameReader(kr), events))
         writer: Optional[asyncio.Future] = None
         try:
-            kw.write(gwwire.encode(b"Q", q))
+            kw.write(qframe)
             writer = asyncio.ensure_future(self._write_body(kw, events))
             await self._relay(kw, events, expect, writer)
         finally:
@@ -639,9 +702,10 @@ class BrokeredExchange:
             await asyncio.gather(*(t for t in (reader, writer) if t is not None), return_exceptions=True)
             kw.close()
             self.front.live.discard(kw)
-            self.front._log(self.rec)
 
     async def _read_keys(self, frames: FrameReader, events: asyncio.Queue) -> None:
+        """keys' frames, in order, onto `events`; however it ends, the last event says so ("eof" / "error"). It
+        awaits each `put`, so a full queue holds keys back."""
         side = FrontSide(status=False)
         self.parked.set()   # entered the loop: the body writer may start
         if self.before_keys_read is not None:
@@ -650,14 +714,44 @@ class BrokeredExchange:
             while side.state != "done":
                 got = await frames.read(side.allowed())
                 if got is None:
-                    events.put_nowait(("eof", None))
+                    await events.put(("eof", None))
                     return
                 ftype, payload = got
+                if ftype == b"U" and self.upgrade != "websocket":
+                    raise WireError("U for a request that asked no upgrade")
                 nobody = ftype == b"R" and (self.nobody or payload["status"] in (204, 304))  # type: ignore[index]
                 side.got(ftype, nobody=nobody)
-                events.put_nowait((ftype, payload))
-        except (WireError, OSError, asyncio.IncompleteReadError) as e:
-            events.put_nowait(("error", type(e).__name__))
+                await events.put((ftype, payload))
+        except Exception as e:   # noqa: BLE001 - a reader that dies always tells the relay
+            await events.put(("error", type(e).__name__))
+
+    async def _next(self, events: asyncio.Queue) -> tuple:
+        """The next event, or ("error", "reader-gone") once keys' reader has ended with none left: the relay never
+        waits on a reader that is gone."""
+        reader = self._reader_task
+        if not events.empty():
+            return events.get_nowait()
+        if reader.done():
+            return ("error", "reader-gone")
+        get = asyncio.ensure_future(events.get())
+        try:
+            await asyncio.wait({get, reader}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if not get.done():
+                get.cancel()
+        if get.done() and not get.cancelled():
+            return get.result()
+        await asyncio.gather(get, return_exceptions=True)
+        if not events.empty():   # put just before the reader ended; a cancelled get leaves it queued
+            return events.get_nowait()
+        return ("error", "reader-gone")
+
+    async def _stop(self, task: Optional[asyncio.Future]) -> None:
+        """Cancel the body writer and wait until it has stopped: it may be parked in a read of the slot, which a
+        discard is about to read too."""
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def _write_body(self, kw: asyncio.StreamWriter, events: asyncio.Queue) -> None:
         """Forward the slot's body as `B` frames, then `E`. Posts how it ended: "end", "write-error", "slot-eof"
@@ -672,21 +766,21 @@ class BrokeredExchange:
                     chunk = await self.body.next()
                 except _SlotGone:
                     kw.write(gwwire.encode(b"X"))
-                    events.put_nowait(("body", "slot-eof"))
+                    await events.put(("body", "slot-eof"))
                     return
                 except Refused:
                     kw.write(gwwire.encode(b"X"))
-                    events.put_nowait(("body", "malformed"))
+                    await events.put(("body", "malformed"))
                     return
                 if chunk is None:
                     kw.write(gwwire.encode(b"E"))
                     await kw.drain()
-                    events.put_nowait(("body", "end"))
+                    await events.put(("body", "end"))
                     return
                 sent += len(chunk)
                 if sent > cap:
                     kw.write(gwwire.encode(b"X"))
-                    events.put_nowait(("body", "body-cap"))
+                    await events.put(("body", "body-cap"))
                     return
                 for i in range(0, len(chunk), gwwire.CHUNK):
                     if self.before_body_write is not None:
@@ -695,13 +789,22 @@ class BrokeredExchange:
                     await kw.drain()
         except OSError as e:
             self.rec["write_error"] = type(e).__name__
-            events.put_nowait(("body", "write-error"))
+            await events.put(("body", "write-error"))
 
     async def _relay(self, kw: asyncio.StreamWriter, events: asyncio.Queue, expect: bool,
                      writer: asyncio.Future) -> None:
+        """keys' events -> the slot. A write to the slot that fails ends the exchange as "slot-gone"."""
+        try:
+            await self._relay_events(kw, events, expect, writer)
+        except OSError as e:   # the slot went away mid-answer (keys-side errors are caught where they happen)
+            self.rec["end"] = "slot-gone"
+            self.rec["slot_error"] = type(e).__name__
+
+    async def _relay_events(self, kw: asyncio.StreamWriter, events: asyncio.Queue, expect: bool,
+                            writer: asyncio.Future) -> None:
         started = False
         while True:
-            kind, payload = await events.get()
+            kind, payload = await self._next(events)
             if kind == "body":
                 if payload == "end":
                     continue
@@ -710,7 +813,7 @@ class BrokeredExchange:
                 if payload == "slot-eof":
                     self.rec["end"] = "slot-eof"
                     return
-                if not started:
+                if not started:   # the writer has returned: nothing else reads the slot
                     await self.refuse(Refused("body-cap" if payload == "body-cap" else "malformed", "body"),
                                       discard=True)
                 self.rec.setdefault("end", payload)
@@ -718,6 +821,7 @@ class BrokeredExchange:
             if kind in ("eof", "error"):
                 self.rec["keys_end"] = payload or kind
                 if not started:
+                    await self._stop(writer)
                     await self.refuse(Refused("keys-unavailable", f"keys-{kind}"), discard=True)
                 self.rec.setdefault("end", "keys-" + kind)
                 return
@@ -727,7 +831,7 @@ class BrokeredExchange:
                     await self.swriter.drain()
                 continue
             if kind == b"F":
-                writer.cancel()
+                await self._stop(writer)
                 if kw.can_write_eof():
                     try:
                         kw.write_eof()   # keys' drain ends at once
@@ -736,7 +840,7 @@ class BrokeredExchange:
                 await self.refuse(Refused(payload["refused"], "keys"), discard=True)  # type: ignore[index]
                 return
             if kind == b"R":
-                started = True
+                started = self.answered = True
                 self._write_response_head(payload)  # type: ignore[arg-type]
                 await self.swriter.drain()
                 continue
@@ -750,7 +854,13 @@ class BrokeredExchange:
                     await self.swriter.drain()
                 self.rec["status"] = self.status
                 self.rec["end"] = "ok"
-                writer.cancel()
+                # keys may answer before the request body has all arrived: stop forwarding it, half-close, and
+                # discard the rest as a refusal does, so the close is not a reset over the response just written
+                await self._stop(writer)
+                if self.swriter.can_write_eof():
+                    self.swriter.write_eof()
+                if not self.body.done:
+                    await self._discard()
                 return
             if kind == b"U":
                 await self._websocket(kw, payload, events, writer)  # type: ignore[arg-type]
@@ -780,6 +890,7 @@ class BrokeredExchange:
         for n, v in u["headers"]:
             if n == "sec-websocket-protocol" and n in self.route.response_headers:
                 out.append(b"sec-websocket-protocol: %s\r\n" % v.encode("ascii"))
+        self.answered = True
         self.swriter.write(b"".join(out) + b"\r\n")
         await self.swriter.drain()
         self.rec["status"] = 101
@@ -800,7 +911,7 @@ class BrokeredExchange:
         pump = asyncio.ensure_future(up())
         try:
             while True:
-                kind, payload = await events.get()
+                kind, payload = await self._next(events)
                 if kind != b"D":
                     self.rec["end"] = "ws-" + (kind.decode("ascii") if isinstance(kind, bytes) else kind)
                     return
@@ -816,6 +927,7 @@ class BrokeredExchange:
         """Answer the slot with `r`'s status, half-close it, then discard what is left of its body: until the body
         ends, the slot's EOF, `body_cap` bytes READ AFTER THIS REFUSAL (counted from zero here), or DISCARD_S."""
         self.rec.update({"refused": r.name, "detail": r.detail, "status": r.status})
+        self.answered = True
         body = r.name.encode() + b"\n"
         try:
             self.swriter.write(b"HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
@@ -826,16 +938,20 @@ class BrokeredExchange:
                 self.swriter.write_eof()
         except OSError:
             return
-        if not discard:
-            return
+        if discard:
+            await self._discard()
+
+    async def _discard(self) -> None:
+        """Read and drop the slot's remaining body after the answer was written: until the body ends, the slot's EOF,
+        `body_cap` bytes read here (counted from zero, each read bounded by what is left), or DISCARD_S."""
         loop = asyncio.get_running_loop()
-        deadline, read = loop.time() + DISCARD_S, 0
+        deadline, read, cap = loop.time() + DISCARD_S, 0, self.route.body_cap
         try:
-            while read <= self.route.body_cap:
+            while read < cap:
                 left = deadline - loop.time()
                 if left <= 0:
                     break
-                chunk = await asyncio.wait_for(self.body.next(), left)
+                chunk = await asyncio.wait_for(self.body.next(cap - read), left)
                 if chunk is None:
                     break
                 read += len(chunk)
@@ -1123,7 +1239,13 @@ async def run_front(front: Front, *, unix: Optional[str] = None, port: Optional[
                     keys: Optional[str] = None) -> int:
     """With `keys`: open the STATUS connection first and bind ONLY after keys' `A` (else return 3, never having
     bound); then serve until SIGTERM / SIGINT, or keys' `K` / EOF on STATUS, then close every stream and the
-    listener and return 0."""
+    listener and return 0. The keys socket has ONE source: `keys` here, else the front's own `keys_path`; the front's
+    brokered exchanges use the same path, and two different paths are refused."""
+    if keys is None:
+        keys = front.keys_path
+    elif front.keys_path is not None and front.keys_path != keys:
+        raise ValueError(f"run_front(keys={keys!r}) and Front(keys_path={front.keys_path!r}) disagree")
+    front.keys_path = keys
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):

@@ -52,7 +52,10 @@ _ALLOW = {"content-type": re.compile("application/json"), "anthropic-version": r
 HEADERS = [
     ([("Content-Type", "application/json"), ("X-Telemetry", "1")], False, [("content-type", "application/json")]),
     ([("authorization", "Bearer x"), ("x-api-key", "k"), ("accept-encoding", "gzip"), ("host", "h")], False, []),
-    ([("connection", "keep-alive")], False, "malformed"),
+    ([("connection", "keep-alive")], False, []),
+    ([("Connection", "Keep-Alive, close")], False, []),
+    ([("connection", "x-other")], False, "malformed"),
+    ([("connection", "keep-alive, upgrade")], False, "malformed"),
     ([("te", "trailers")], False, "malformed"),
     ([("proxy-authorization", "x")], False, "malformed"),
     ([("upgrade", "websocket"), ("connection", "upgrade")], False, "malformed"),

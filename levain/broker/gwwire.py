@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from typing import Iterable, Optional, Union
 
@@ -34,6 +35,8 @@ class WireError(Exception):
 def encode(ftype: bytes, payload: Union[bytes, dict, None] = None) -> bytes:
     if ftype not in CAPS:
         raise WireError(f"type {ftype!r}")
+    if ftype == b"A" and payload is None:
+        payload = {}   # `A` carries `{}`; a bare `encode(b"A")` must not emit `null`, which decode refuses
     if ftype in EMPTY:
         data = b""
         if payload:
@@ -66,7 +69,7 @@ def _json(data: bytes) -> dict:
     try:
         text = data.decode("utf-8")
         doc = json.loads(text, object_pairs_hook=_pairs_hook, parse_constant=_no_constant)
-    except (UnicodeDecodeError, ValueError) as e:
+    except (UnicodeDecodeError, ValueError, RecursionError) as e:   # RecursionError: a deeply nested payload
         raise WireError(f"payload: {type(e).__name__}") from None
     if not isinstance(doc, dict):
         raise WireError("payload is not an object")
@@ -131,10 +134,54 @@ def decode(ftype: bytes, data: bytes) -> Union[dict, bytes, None]:
 
 # --- reading ------------------------------------------------------------------------------------------------------
 
+class HoldingReader(asyncio.StreamReader):
+    """A `StreamReader` that never lets a transport error overtake bytes already received. A plain `StreamReader`
+    raises its stored exception before it returns what it buffered, so a complete frame that arrived just before a
+    reset is lost. Here the error is held as `terminal` and the stream is ended instead: `read()` returns every
+    buffered byte, then EOF, and `FrameReader` raises `terminal` only once no complete frame is left.
+
+    When `sock` is set (the connection's socket), the bytes the kernel still holds for it at the error are read into
+    the buffer first, at most `SALVAGE_CAP`: an error on a WRITE can abort the transport before its reader saw what the
+    peer sent last (keys' `F` followed by its close, then the front's next `B` write failing)."""
+
+    SALVAGE_CAP = 2 * CHUNK
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.terminal: Optional[BaseException] = None
+        self.sock: Optional[object] = None   # anything with fileno(); -1 once closed
+        self._ended = False
+
+    def feed_eof(self) -> None:
+        self._ended = True
+        super().feed_eof()
+
+    def set_exception(self, exc: BaseException) -> None:
+        if self.terminal is not None:
+            return
+        got = 0
+        while self.sock is not None and not self._ended and got < self.SALVAGE_CAP:
+            try:
+                data = os.read(self.sock.fileno(), min(65536, self.SALVAGE_CAP - got))  # type: ignore[attr-defined]
+            except OSError:   # nothing more (EAGAIN), the reset itself, or a closed socket (fileno -1)
+                break
+            if not data:
+                break
+            self.feed_data(data)
+            got += len(data)
+        self.terminal = exc
+        if not self._ended:
+            self.feed_eof()
+
+    def exception(self) -> Optional[BaseException]:
+        # what `StreamWriter.drain()` consults: a writer on this connection still sees the error at once
+        return self.terminal
+
+
 class FrameReader:
-    """Frames off a `StreamReader`, decoded from this object's OWN buffer. Bytes are moved out of the stream with one
-    `read()` per wake, so a frame whose bytes already arrived is decoded even if the transport aborts afterwards
-    (a `StreamReader` raises its stored exception before it returns what it buffered)."""
+    """Frames off a `StreamReader`, decoded from this object's OWN buffer: every complete frame held is returned
+    before a terminal error is raised. Over a `HoldingReader` that includes the frames that arrived just before the
+    transport failed; over a plain `StreamReader`, only those already moved into this buffer."""
 
     def __init__(self, reader: asyncio.StreamReader) -> None:
         self._reader = reader
@@ -167,6 +214,9 @@ class FrameReader:
                 return ftype, decode(ftype, data)
             chunk = await self._reader.read(65536)
             if not chunk:
+                terminal = getattr(self._reader, "terminal", None)
+                if terminal is not None:
+                    raise terminal
                 if self._buf:
                     raise asyncio.IncompleteReadError(bytes(self._buf), None)
                 return None
