@@ -77,9 +77,8 @@ NAME_ALLOW = {
     ("front.py", "Front._open_upstream", "_connect", "self._connect(...)"): 1,
 }
 
-#: rule (c): `refresh_post`'s callers. The refresh caller is built later (credentials, oauth2-refresh); until then the
-#: bound is "at most one", and the session that adds the caller makes it "exactly one" in that commit.
-MAX_REFRESH_POST_CALLERS = 1
+#: rule (c): `refresh_post`'s callers: EXACTLY one, the credential layer's refresh (creds.py `_post`, session 3b-5b)
+REFRESH_POST_CALLERS = 1
 
 #: rule (f): each method called directly on `self._writer`, bound to the one `Upstream` method allowed to call it
 WRITER_BIND = {"write": "write", "close": "_graceful_close", "wait_closed": "wait_closed", "drain": "drain",
@@ -348,7 +347,7 @@ def rule_b(mods: Dict[str, Module]) -> List[str]:
 
 def rule_c(mods: Dict[str, Module]) -> List[str]:
     """(c) Every load of `maintenance` (attribute or name) anywhere in `levain/` is refused except the one direct call
-    `Upstream.maintenance(...)` inside `upstream.refresh_post`; `refresh_post` has at most MAX_REFRESH_POST_CALLERS
+    `Upstream.maintenance(...)` inside `upstream.refresh_post`; `refresh_post` has exactly REFRESH_POST_CALLERS
     callers, each a direct call in `creds.py`."""
     out = []
     callers = 0
@@ -369,8 +368,8 @@ def rule_c(mods: Dict[str, Module]) -> List[str]:
     if the_call != 1:
         out.append(f"(c) the direct Upstream.maintenance(...) call in refresh_post occurs {the_call} times, expected "
                    f"once")
-    if callers > MAX_REFRESH_POST_CALLERS:
-        out.append(f"(c) refresh_post has {callers} callers, the bound is {MAX_REFRESH_POST_CALLERS}")
+    if callers != REFRESH_POST_CALLERS:
+        out.append(f"(c) refresh_post has {callers} callers, expected exactly {REFRESH_POST_CALLERS}")
     return out
 
 

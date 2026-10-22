@@ -11,9 +11,13 @@ exchange. `rev` is compared for equality only, never ordered.
 
 The one write discipline (design 1.8) is `commit` / `remove`, used by both writers: keys' `CredWriter` (on its one
 writer thread, the `flock` non-blocking and bounded) and the install helper's `set-credential` / `remove-credential`
-child (the `flock` waits). `CredWriter` is also the real `CredLifecycle`; its `_refresh_tasks` set stays empty until the
-refresh exists. The refresh (kind `oauth2-refresh`) is not built at this tip: an upstream 401 reaches the credential
-layer through `on_upstream_401`, a no-op for the static kind.
+child (the `flock` waits). `CredWriter` is also the real `CredLifecycle`.
+
+The refresh (kind `oauth2-refresh`, design 1.8) is `CredWriter`'s: it is wanted by `fresh` (the access token expires
+within REFRESH_AHEAD_S, before the exchange goes upstream) or by `on_upstream_401` (on the generation the 401'd
+exchange used, if it is still the file's). `CredWriter.want` passes the one gate keyed by `(name, rev)` and the
+single-flight table, and runs the refresh as a DETACHED task (`_refresh`, the one `upstream.refresh_post` caller) that
+nothing an exchange does can cancel; every waiter awaits `asyncio.shield` of its future.
 """
 from __future__ import annotations
 
@@ -30,7 +34,9 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, List, Optional, Protocol, Set, Tuple
+from urllib.parse import urlencode
 
+from levain.broker import upstream
 from levain.broker.norm import Refused
 from levain.broker.redact import unsafe_with_marker
 from levain.broker.upstream import _note
@@ -95,12 +101,15 @@ def is_a_label(host: object) -> bool:
 
 
 class Credential:
-    __slots__ = ("name", "rev", "hosts", "header", "scheme", "kind", "secret")
+    __slots__ = ("name", "rev", "hosts", "header", "scheme", "kind", "secret", "expires_at", "fields")
 
     def __init__(self, name: str, rev: str, hosts: frozenset, header: str, scheme: str, kind: str,
-                 secret: str) -> None:
+                 secret: str, expires_at: Optional[int] = None, fields: Optional[dict] = None) -> None:
         self.name, self.rev, self.hosts = name, rev, hosts
         self.header, self.scheme, self.kind, self.secret = header, scheme, kind, secret
+        #: the refresh kind only: the access token's expiry (epoch s), and the file's object without `rev`, which the
+        #: refresh rewrites with the new tokens
+        self.expires_at, self.fields = expires_at, fields
 
     @property
     def generation(self) -> str:
@@ -188,7 +197,11 @@ def _parse(raw: bytes, expect_name: str) -> Credential:
     for v in [secret] + ([d["refresh"]["refresh_token"]] if kind == "oauth2-refresh" else []):
         if unsafe_with_marker(v.encode("utf-8")):
             raise Unparseable("secret marker")
-    return Credential(d["name"], d["rev"], frozenset(hosts), inj["header"], inj["scheme"], kind, secret)
+    if kind == "static":
+        return Credential(d["name"], d["rev"], frozenset(hosts), inj["header"], inj["scheme"], kind, secret)
+    fields = {k: v for k, v in d.items() if k != "rev"}
+    return Credential(d["name"], d["rev"], frozenset(hosts), inj["header"], inj["scheme"], kind, secret,
+                      d["expires_at"], fields)
 
 
 def _no_dup(pairs: list) -> dict:
@@ -276,9 +289,42 @@ def check_host(cred: Credential, host: str, route: str) -> None:
         raise Refused("credential-host-mismatch")
 
 
-def on_upstream_401(credential: Credential, generation: str) -> None:
-    """An upstream 401 on an exchange that sent `credential` at `generation`. The static kind relays the 401 as is,
-    so this is a no-op for it; the refresh kind's handling is not built at this tip."""
+def _now(lifecycle: object) -> float:
+    return lifecycle.seams.clock() if isinstance(lifecycle, CredWriter) else time.time()
+
+
+async def fresh(lifecycle: object, store: CredStore, name: str) -> Credential:
+    """Before an exchange goes upstream: the credential `name`, observed. A refresh-kind credential whose access token
+    expires within REFRESH_AHEAD_S wants a refresh (proactive); when `lifecycle` is the real writer and the want
+    starts or joins one, the exchange waits for it SHIELDED (cancelling the exchange never cancels the refresh), then
+    observes the file again. An access token that has expired by then is `credential-unavailable`, never sent; a
+    still-valid one is used while the gate is shut or the refresh failed. Any other `lifecycle` (the in-process
+    stand-in) refreshes nothing."""
+    cred = store.observe(name)
+    if cred.kind != "oauth2-refresh" or cred.expires_at - _now(lifecycle) >= REFRESH_AHEAD_S:
+        return cred
+    if isinstance(lifecycle, CredWriter):
+        fut = lifecycle.want(cred)
+        if fut is not None:
+            await asyncio.shield(fut)
+            cred = store.observe(name)
+    if cred.kind == "oauth2-refresh" and cred.expires_at <= _now(lifecycle):
+        raise Refused("credential-unavailable", "expired")
+    return cred
+
+
+def on_upstream_401(lifecycle: object, store: Optional[CredStore], credential: Credential, generation: str) -> None:
+    """An upstream 401 on an exchange that sent `credential` at `generation` (that exchange answers 503 and is never
+    replayed, keys' side). The static kind relays the 401 as is: nothing here. For the refresh kind the want runs
+    only if `generation` is still the file's (a newer one means someone already refreshed); it never waits."""
+    if credential.kind != "oauth2-refresh" or store is None or not isinstance(lifecycle, CredWriter):
+        return None
+    try:
+        cur = store.observe(credential.name)
+    except Refused:
+        return None
+    if cur.rev == generation:
+        lifecycle.want(cur)
     return None
 
 
@@ -564,6 +610,107 @@ def remove(dir_fd: int, name: str, *, wait: bool = True, lock_timeout_s: float =
         _unlock(lock_fd)
 
 
+# --- the refresh (design 1.8, kind oauth2-refresh) -------------------------------------------------------------------
+
+REFRESH_AHEAD_S = 60.0     # a refresh is wanted when the access token expires within this (proactive)
+GATE_MIN_S = 30.0          # at most one attempt per this, from the start of the last attempt (DECISION, r2 W8)
+GATE_MAX_S = 900.0         # the failure backoff, 30 s x 2^(failures - 1), is at most this (15 min)
+TOKEN_PORT = 443           # `token_url` is `https://<host>/...` with `<host>` an A-label of `hosts`: no port in it
+#: refresh connections open at once (the refresh semaphore, design 1.6's NOFILE terms; keys' `refresh` term is this)
+REFRESH_CONNS = 8
+#: the request target the POST carries: printable ASCII, no space and no fragment
+_TARGET_RE = re.compile(r"/[\x21-\x22\x24-\x7e]*")
+
+
+class RefreshRejected(Exception):
+    """The token endpoint's answer is not a refresh keys commits; `detail` is a fixed token (the response body is never
+    logged): `status`, `json`, `access_token`, `expires_in`, `refresh_token`, or `token-url` (refused before any byte)."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class _Gate:
+    """The one per-credential gate, for the `rev` it holds (a newly observed `rev` gets a new, open gate; the `rev`
+    a refresh commits keeps its gate, so one refresh's own success never opens the next attempt early): an attempt is
+    admitted at most once per GATE_MIN_S from the last attempt's start, and not while a failure's backoff runs."""
+    __slots__ = ("rev", "last_start", "failures", "shut_until")
+
+    def __init__(self, rev: str) -> None:
+        self.rev = rev
+        self.last_start: Optional[float] = None
+        self.failures = 0
+        self.shut_until = float("-inf")
+
+    def admits(self, now: float) -> bool:
+        return (self.last_start is None or now - self.last_start >= GATE_MIN_S) and now >= self.shut_until
+
+    def failed(self, now: float) -> None:
+        self.failures += 1
+        self.shut_until = now + min(GATE_MIN_S * 2 ** min(self.failures - 1, 16), GATE_MAX_S)
+
+    def succeeded(self, rev: str) -> None:
+        self.rev, self.failures, self.shut_until = rev, 0, float("-inf")
+
+
+async def _post(cred: Credential) -> "upstream.RefreshResponse":
+    """RFC 6749 §6 for `cred`: a form-encoded `grant_type=refresh_token` POST to its `token_url`, through
+    `upstream.refresh_post` (the address checks, TLS, the host as SNI, no redirect, the body cap). The one caller."""
+    r = cred.fields["refresh"]
+    host, _, path = r["token_url"][len("https://"):].partition("/")
+    target = "/" + path
+    if not _TARGET_RE.fullmatch(target):
+        raise RefreshRejected("token-url")
+    addr = await upstream.pick_address(host, TOKEN_PORT)
+    body = urlencode({"grant_type": "refresh_token", "refresh_token": r["refresh_token"],
+                      "client_id": r["client_id"]}).encode("ascii")
+    head = (f"POST {target} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/x-www-form-urlencoded\r\n"
+            f"Content-Length: {len(body)}\r\nAccept: application/json\r\nAccept-Encoding: identity\r\n"
+            f"Connection: close\r\n\r\n").encode("ascii")
+    return await upstream.refresh_post(upstream.RefreshRequest(addr, TOKEN_PORT, host, head, body))
+
+
+def _refreshed(cred: Credential, resp: "upstream.RefreshResponse", now: float) -> dict:
+    """The credential's object with the endpoint's new tokens, or `RefreshRejected`: a status other than 200, a body
+    that is not a JSON object, an `access_token` or `refresh_token` that is not a string of at most VALUE_CAP bytes, an
+    `expires_in` that is not a positive integer (or is absent: the expiry is what the next want reads). A returned
+    `refresh_token` replaces the old one (rotation); none keeps it. `render` parses the result before it is written."""
+    if resp.status != 200:
+        raise RefreshRejected("status")
+    try:
+        d = json.loads(resp.body.decode("utf-8"), object_pairs_hook=_no_dup)
+    except (ValueError, RecursionError):
+        raise RefreshRejected("json") from None
+    if not isinstance(d, dict):
+        raise RefreshRejected("json")
+    try:
+        access = _value(d.get("access_token"), "access_token")
+        rotated = d.get("refresh_token")
+        if rotated is not None:
+            rotated = _value(rotated, "refresh_token")
+    except Unparseable as e:
+        raise RefreshRejected(str(e)) from None
+    exp = d.get("expires_in")
+    if not isinstance(exp, int) or isinstance(exp, bool) or exp <= 0:
+        raise RefreshRejected("expires_in")
+    fields = json.loads(json.dumps(cred.fields))
+    fields["access"] = access
+    fields["expires_at"] = int(now) + exp
+    if rotated is not None:
+        fields["refresh"]["refresh_token"] = rotated
+    return fields
+
+
+def _why(e: BaseException) -> str:
+    """A refresh failure's name for the log: a fixed token or a type name, never text from the response."""
+    if isinstance(e, RefreshRejected):
+        return e.detail
+    if isinstance(e, (CommitFailed, Refused)):
+        return e.name
+    return type(e).__name__
+
+
 class CredWriter:
     """keys' ONE credential writer (design 1.8, r2 W4) and the real `CredLifecycle`. Every commit runs on one dedicated
     writer thread (`ThreadPoolExecutor(max_workers=1)`, made here at keys' start; its thread starts at the first
@@ -572,9 +719,9 @@ class CredWriter:
     opened (`O_DIRECTORY|O_NOFOLLOW`) by `open_dir()` at keys' start, before keys counts its fixed fds, or, when it
     did not exist then, on the writer thread at the first commit (COMMIT_FDS budgets that case); it is kept.
 
-    The seam's shell (R86): `begin_closing()` sets `_closing`; `cancel_detached()` cancels the members of
-    `_refresh_tasks`. The single-flight that fills the set and reads the flag is not built at this tip, so the set
-    stays empty."""
+    The seam (R86): `begin_closing()` sets `_closing`, after which `want` starts no refresh (R61);
+    `cancel_detached()` cancels the members of `_refresh_tasks`, the refreshes `want` started. `want`, the
+    refresh-wanted entry point, is not on the seam."""
 
     def __init__(self, cred_dir: str, *, seams: Optional[WriteSeams] = None) -> None:
         self.cred_dir = cred_dir
@@ -584,6 +731,11 @@ class CredWriter:
         self._dir_fd: Optional[int] = None    # set by open_dir() before any job, else by the writer thread only
         self._closing = False
         self._refresh_tasks: Set["asyncio.Task"] = set()
+        #: the single-flight table: name -> the future of the refresh in flight for it
+        self._inflight: Dict[str, "asyncio.Future"] = {}
+        #: the one gate per credential, holding the `rev` it is for
+        self._gates: Dict[str, _Gate] = {}
+        self._refresh_sem: Optional[asyncio.Semaphore] = None
 
     # -- CredLifecycle --
 
@@ -607,6 +759,63 @@ class CredWriter:
                           type(e).__name__)
                 return False
         return True
+
+    # -- the refresh: the gate and the single-flight (design 1.8, R4, R5, R61) --
+
+    def want(self, cred: Credential) -> "Optional[asyncio.Future]":
+        """The refresh-wanted entry point, on keys' loop, with no await (so the check and the table update are one
+        step): None when closing (R61) or when the gate for `(name, rev)` is shut; else the future of the refresh in
+        flight for `name`, made here on a miss as a DETACHED task held in `_refresh_tasks`. The future always resolves
+        (to the outcome's name, never an exception), so no waiter hangs; a waiter awaits it shielded."""
+        if self._closing:
+            _note(logging.INFO, "levain gw-keys: credential %s refresh refused (closing)", cred.name)
+            return None
+        fut = self._inflight.get(cred.name)
+        if fut is not None:
+            return fut
+        g = self._gates.get(cred.name)
+        if g is None or g.rev != cred.rev:
+            g = self._gates[cred.name] = _Gate(cred.rev)
+        now = self.seams.monotonic()
+        if not g.admits(now):
+            return None
+        g.last_start = now
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._inflight[cred.name] = fut
+        self._refresh_tasks.add(loop.create_task(self._refresh(cred, g, fut)))
+        return fut
+
+    async def _refresh(self, cred: Credential, gate: _Gate, fut: "asyncio.Future") -> None:
+        """The detached refresh: the POST, the new object, the commit on the writer thread awaited SHIELDED (the job
+        runs to its end whatever happens to this task) with the generation compare. A failure counts on the gate and
+        leaves the old file; a DISCARD (the operator's act landed) is neither. The `finally` ALWAYS pops the table
+        entry and resolves the future."""
+        result = "cancelled"
+        try:
+            if self._refresh_sem is None:
+                self._refresh_sem = asyncio.Semaphore(REFRESH_CONNS)   # made inside the running loop (3.9 binds it)
+            async with self._refresh_sem:
+                response = await _post(cred)
+            fields = _refreshed(cred, response, self.seams.clock())
+            out = await asyncio.shield(self.commit(cred.name, fields, expect_rev=cred.rev))
+            result = out.result
+            if out.result == COMMITTED:
+                gate.succeeded(out.rev)
+            else:
+                _note(logging.INFO, "levain gw-keys: credential %s refresh discarded (changed meanwhile)", cred.name)
+        except Exception as e:
+            result = "failed"
+            gate.failed(self.seams.monotonic())
+            _note(logging.WARNING, "levain gw-keys: credential-refresh-failed credential=%s (%s)", cred.name, _why(e))
+        finally:
+            if self._inflight.get(cred.name) is fut:
+                del self._inflight[cred.name]
+            task = asyncio.current_task()
+            if task is not None:
+                self._refresh_tasks.discard(task)
+            if not fut.done():
+                fut.set_result(result)
 
     # -- the writer thread --
 

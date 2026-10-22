@@ -66,8 +66,8 @@ from typing import Awaitable, Dict, List, Optional, Sequence, Set, Tuple, TypeVa
 import h11
 
 from levain.broker import gwwire, norm, upstream
-from levain.broker.creds import (COMMIT_FDS, CredLifecycle, CredStore, CredWriter, FakeCredLifecycle, check_host,
-                                 on_upstream_401)
+from levain.broker.creds import (COMMIT_FDS, REFRESH_CONNS, CredLifecycle, CredStore, CredWriter, FakeCredLifecycle, check_host,
+                                 fresh, on_upstream_401)
 from levain.broker.gwwire import FrameReader, KeysSide, WireError
 from levain.broker.peer import PeerUnknown, peer_of, peer_uid
 from levain.broker.policy import PolicyError, RoutePolicy, parse_route
@@ -87,7 +87,7 @@ MAX_EXCHANGE_CONNS = 512
 #: the `_levain_gw<n>` index space: at most one STATUS connection per registered front.
 STATUS_CONNS = 64
 RESOLVE_CONNS = 32
-REFRESH_CONNS = 8
+# REFRESH_CONNS (imported): the refresh semaphore's size, creds.CredWriter's
 DNS_CONCURRENCY = 32
 #: fds one in-flight `getaddrinfo` of an uncached name holds [measured 2026-10-22, macOS 26.6, 32 concurrent lookups
 #: of distinct uncached names: 36 extra fds under 3.9.6, 35 under 3.12.13, so 2 per lookup rounded up]. Linux is
@@ -1281,6 +1281,10 @@ class Keys:
             await self._refuse(conn, frames, side, r.name, UNTRUSTED_DRAIN_CAP)
             return
         try:
+            if pol.credential is not None:
+                # a refresh-kind credential near its expiry waits here for its refresh (shielded: cancelling this
+                # exchange never cancels it); `_check_request` then observes the file as it is now
+                await fresh(self.cred_lifecycle, self._cred_store(), pol.credential)
             head, hconn, cred, tpl = self._check_request(conn.reg, claims, pol, q)   # the budget reservation is last
         except norm.Refused as r:
             await self._refuse(conn, frames, side, r.name, pol.body_cap)
@@ -1422,7 +1426,7 @@ class Keys:
                 continue
             out.append([name, text])
         if status == 401 and cred is not None:
-            on_upstream_401(cred, cred.generation)   # type: ignore[attr-defined]
+            on_upstream_401(self.cred_lifecycle, self.creds, cred, cred.generation)   # type: ignore[attr-defined]
             if getattr(cred, "kind", None) == "oauth2-refresh":
                 raise norm.Refused("credential-unavailable", "upstream 401")
         try:
