@@ -35,7 +35,9 @@ def _show(v: dict) -> str:
              (f"  owner {unshowable.mark(e['owner'], allow='', selectors=False)}" if e.get("owner") else "")]
     for k in ("words", "summary", "reason", "recheck"):
         if e.get(k):
-            lines.append(f"  {k}: {json.dumps(unshowable.mark(e[k]), ensure_ascii=False)}")
+            # newline and tab are prose: shown escaped by json, never as a marker; a stored non-string is shown as is
+            shown = unshowable.mark(e[k], allow="\n\t") if isinstance(e[k], str) else e[k]
+            lines.append(f"  {k}: {json.dumps(shown, ensure_ascii=False)}")
     if e.get("paths"):
         lines.append("  governs: " + ", ".join(unshowable.mark(p, allow="", selectors=False) for p in e["paths"]))
     if v.get("ledger_id"):
@@ -64,9 +66,11 @@ def _signed(gl, handle: str, key: str) -> tuple[dict | None, dict[str, dict]]:
 
 
 def _words(args) -> str | None:
+    from .cli import _prose
+
     if getattr(args, "words_file", None):
-        return Path(args.words_file).read_text(encoding="utf-8").strip()
-    return args.words
+        return _prose(Path(args.words_file).read_text(encoding="utf-8").strip())
+    return _prose(args.words)
 
 
 def cmd_draft(args) -> int:
@@ -76,13 +80,16 @@ def cmd_draft(args) -> int:
     from levain.coordinator.store import CoordError
     from levain.dispatch.jobs import JobStoreError
 
+    from .cli import _prose
+
     verb = args.draft_command
     try:
         store = _store(args)      # opening the store refuses like any of its verbs: an error line, never a traceback
         if verb == "add":
             v = T.add_draft(store, args.type, words=_words(args), kind=args.kind, owner=args.owner,
-                            paths=[p for p in (args.paths or [])], summary=args.summary, reason=args.reason,
-                            recheck=args.recheck, thread_id=args.thread, by=args.by, token=args.token)
+                            paths=[p for p in (args.paths or [])], summary=_prose(args.summary),
+                            reason=_prose(args.reason), recheck=_prose(args.recheck), thread_id=args.thread, by=args.by,
+                            token=args.token)
             print(_show(v) if not args.json else json.dumps(v, ensure_ascii=False))
         elif verb == "list":
             rows = T.list_drafts(store, state=None if args.all else ("drafted", "promoting"))
