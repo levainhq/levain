@@ -19,6 +19,8 @@ from tests.test_team_git import KEYS, _keys, clone, git, join, record_ruling, te
 PREVIEW = {"tier_seen": "T3", "gesture_seen": "laptop-only"}
 
 
+from tests.autonomic_confirm_keys import account_home
+
 @pytest.fixture
 def tmp_path():
     """Every directory of these tests lives under the home directory, as test_cockpit_k2b_broker's do: the broker's
@@ -27,7 +29,7 @@ def tmp_path():
     under /tmp). Overriding the name reaches the imported team fixtures too."""
     import shutil
     import tempfile
-    d = Path(tempfile.mkdtemp(prefix=".levain-t3-", dir=Path.home()))
+    d = Path(tempfile.mkdtemp(prefix=".levain-t3-", dir=account_home()))
     try:
         yield d
     finally:

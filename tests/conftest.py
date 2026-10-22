@@ -253,6 +253,18 @@ def pytest_unconfigure(config):
 
 
 @pytest.fixture(autouse=True)
+def _per_test_home(monkeypatch, tmp_path):
+    """TEST ONLY: on top of the session scratch home, every test gets its own ``$HOME`` (with the minimal
+    ``.gitconfig``), so state one test writes under HOME (enrolled keys, verifier and journal stores, a gpg home)
+    never reaches the next. The monkeypatch undo returns to the SESSION scratch home, never the operator's. A test
+    that wants a different HOME still sets it itself."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text("[user]\n\tname = levain test\n\temail = test@levain.invalid\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+
+
+@pytest.fixture(autouse=True)
 def _fresh_floor_path_cache():
     """``levain.session._floor_path`` caches the expanded credential stores for the process, built from ``$HOME``;
     a test that sets its own HOME would otherwise read a pattern built from another test's."""
