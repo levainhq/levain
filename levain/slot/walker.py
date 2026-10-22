@@ -41,8 +41,8 @@ SF_DATALESS = 0x40000000
 UNREAD_PLACEHOLDER_MODE = 0o600
 
 _CHUNK = 1 << 20
-#: The preflight reads the walk's clock once before its first record and again every this many records.
-_PREFLIGHT_CLOCK_EVERY = 4096
+#: A :class:`_Manifest` reads the walk's clock before its first record and again every this many records.
+_MANIFEST_CLOCK_EVERY = 4096
 _O_FILE = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
 _SETID = stat.S_ISUID | stat.S_ISGID
 _FD_ERRNOS = frozenset({errno.EMFILE, errno.ENFILE})
@@ -135,20 +135,26 @@ def _oserror(err: OSError, where: bytes) -> Refused:
 
 
 class _Manifest:
-    """``manifest.jsonl`` as a peekable stream of validated records (root's own file, read once, in order)."""
+    """``manifest.jsonl`` as a peekable stream of validated records (root's own file, read once, in order).
+    V7's wall is held here, where every record is read: :meth:`peek` reads ``clock`` before the first record and
+    every :data:`_MANIFEST_CLOCK_EVERY` records, whichever caller consumes them, and past ``deadline`` refuses
+    ``walker-cap:time``."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, deadline: float, clock: Callable[[], float]) -> None:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         self._fh = os.fdopen(fd, "rb", buffering=_CHUNK)
         self._cap = walkframe.header_cap() + 1024
         self._next: dict | None = None
         self._line = 0
+        self._deadline, self._clock = deadline, clock
 
     def close(self) -> None:
         self._fh.close()
 
     def peek(self) -> dict | None:
         if self._next is None:
+            if self._line % _MANIFEST_CLOCK_EVERY == 0 and self._clock() > self._deadline:
+                raise Refused("walker-cap:time", f"reading manifest record {self._line + 1}")
             line = self._fh.readline(self._cap + 1)
             if not line:
                 return None
@@ -339,17 +345,10 @@ def _preflight(manifest: Path, deadline: float, clock: Callable[[], float]) -> N
     path for path, so these are the framed paths) is within the decoder's bound,
     :func:`walkframe.check_path_bound`, else its ``frame-bad:path_b64`` refuses with nothing written. The same
     pruning as the walk: an ``OUT`` path is not framed, and nothing below a directory adopt does not descend.
-    V7's wall holds here too: the clock is read before the first record and every
-    :data:`_PREFLIGHT_CLOCK_EVERY` records, and past ``deadline`` it refuses ``walker-cap:time``."""
-    mf = _Manifest(manifest)
-    n = 0
+    V7's wall holds through :class:`_Manifest`, which reads ``clock`` as it reads records."""
+    mf = _Manifest(manifest, deadline, clock)
     try:
-        while True:
-            if n % _PREFLIGHT_CLOCK_EVERY == 0 and clock() > deadline:
-                raise Refused("walker-cap:time", f"preflighting the manifest at record {n}")
-            if (rec := mf.take()) is None:
-                break
-            n += 1
+        while (rec := mf.take()) is not None:
             path = rec["_path"]
             where = scope(path)
             if where != FRAME and rec["type"] == "dir":
@@ -370,7 +369,7 @@ def walk_frames(tree: Path, manifest: Path, out_fd: int, *, depth: int, caps: Wa
     seams = seams or WalkSeams()
     _preflight(manifest, caps.deadline, seams.clock)
     pipe = _Pipe(out_fd, caps.deadline, seams.clock)
-    mf = _Manifest(manifest)
+    mf = _Manifest(manifest, caps.deadline, seams.clock)
     it = seams.walk(tree, depth_cap=depth, prune=adopt_prune)
     count = total = 0
     base_digest = ""

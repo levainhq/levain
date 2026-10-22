@@ -162,9 +162,32 @@ def test_the_preflight_refuses_at_its_first_clock_read_past_the_deadline(tmp_pat
     monkeypatch.setattr(walkframe, "check_path_bound", lambda p: (checked.__setitem__(0, checked[0] + 1), real(p)))
     err, got = _walk(tree, mf, deadline=10.0, seams=walker.WalkSeams(owner_uid=os.getuid(), clock=clock))
     assert err is not None and err.name == "walker-cap:time"
-    assert checked[0] == walker._PREFLIGHT_CLOCK_EVERY and reads[0] == 2
+    assert checked[0] == walker._MANIFEST_CLOCK_EVERY and reads[0] == 2
     assert got == b""
 
+
+def test_a_pruned_subtree_does_not_outrun_the_manifest_clock(tmp_path: Path, monkeypatch) -> None:
+    # Reproduced on 7cc29d62 (s5-5a-fix4 fail_before.txt): an OUT directory's 9000 descendants were consumed by
+    # skip_under, which never read the clock, so the preflight read all 9006 records past the deadline.
+    from levain.contracts import canon
+    tree, _ = _retained(tmp_path)
+    (tree / "aaa").mkdir()
+    for i in range(9000):
+        (tree / "aaa" / f"f{i:05d}").write_bytes(b"")
+    mf = tmp_path / "out.jsonl"
+    end._stream_jsonl(mf, end.iter_manifest(tree, caps=end.Caps(depth=end.MANIFEST_DEPTH)), 1 << 40, "x")
+    reads, parsed = [0], [0]
+
+    def clock() -> float:
+        reads[0] += 1
+        return 0.0 if reads[0] == 1 else 100.0
+
+    real = canon.parse
+    monkeypatch.setattr(canon, "parse", lambda b: (parsed.__setitem__(0, parsed[0] + 1), real(b))[1])
+    err, got = _walk(tree, mf, deadline=10.0, seams=walker.WalkSeams(owner_uid=os.getuid(), clock=clock))
+    assert err is not None and err.name == "walker-cap:time"
+    assert parsed[0] == walker._MANIFEST_CLOCK_EVERY and reads[0] == 2
+    assert got == b""
 
 def test_the_encoder_refuses_a_path_its_decoder_refuses() -> None:
     # Reproduced on afbcd383 (s5-5a-fix3 fail_before.txt item 2): encode_header emitted a frame for a
