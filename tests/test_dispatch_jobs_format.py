@@ -23,9 +23,12 @@ from tests.test_dispatch_jobs import at_state, clock, new_store, repo  # noqa: F
 V1 = "levain-dispatch-jobs/1"
 V2 = "levain-dispatch-jobs/2"
 V3 = "levain-dispatch-jobs/3"
+V4 = "levain-dispatch-jobs/4"
 # the envelope binding (F11-C) is /4's: 0.11.10, 0.11.12 and 0.11.13 had none of it
 F11C = ("job_envelopes", "job_threads")
-V3_SCHEMA = tuple(s for s in djobs._SCHEMA if not any(t in s for t in F11C))
+# the handoff rows (W-C) are /5's: every Levain through 0.11.14 had none
+V4_SCHEMA = tuple(s for s in djobs._SCHEMA if "handoffs" not in s)
+V3_SCHEMA = tuple(s for s in V4_SCHEMA if not any(t in s for t in F11C))
 V2_SCHEMA = tuple(s for s in V3_SCHEMA if "run_records" not in s)
 V1_SCHEMA = tuple(s for s in V2_SCHEMA if "authorise_signatures" not in s)
 
@@ -34,7 +37,8 @@ def old_store(tmp_path, clock, monkeypatch, repo, fmt, schema, state="verified")
     """A store of format ``fmt`` holding one job at ``state``, written as the Levain of that format wrote it."""
     # this code reads the envelope binding on every job load, so the job is walked with those tables present and
     # they are dropped after, leaving the older Levain's tables exactly
-    f11c = tuple(s for s in djobs._SCHEMA if any(t in s for t in F11C))
+    later = tuple(t for t in (*F11C, "handoffs") if not any(t in s for s in schema))
+    f11c = tuple(s for s in djobs._SCHEMA if any(t in s for t in later))
     with monkeypatch.context() as m:
         m.setattr(djobs, "FORMAT", fmt)
         m.setattr(djobs, "_SCHEMA", schema + f11c)
@@ -43,7 +47,7 @@ def old_store(tmp_path, clock, monkeypatch, repo, fmt, schema, state="verified")
         job, _cap = at_state(store, repo, state)
     conn = sqlite3.connect(store.directory / djobs.DB_NAME)
     try:
-        for t in F11C:
+        for t in later:
             conn.execute(f"DROP TABLE {t}")
         conn.commit()
     finally:
@@ -74,7 +78,7 @@ def test_a_0_11_10_store_is_migrated_in_place_and_keeps_its_jobs(tmp_path, clock
     again = store.get(job.id)
     assert again is not None and again.state == "verified" and again.digest == job.digest
     names, fmt = tables(path)
-    assert fmt == djobs.FORMAT == "levain-dispatch-jobs/4" and {"authorise_signatures", "run_records"} <= names
+    assert fmt == djobs.FORMAT == "levain-dispatch-jobs/5" and {"authorise_signatures", "run_records", "handoffs"} <= names
     # the migrated job takes /2's edges
     assert store._transition(job.id, "failed", "base_moved").state == "failed"
     # and opening it again changes nothing
@@ -101,16 +105,19 @@ def test_a_0_11_12_store_is_migrated_in_place_and_its_verifying_job_records_its_
     assert len(store.run_records(job.id)) == 1
 
 
-def test_a_0_11_13_store_is_migrated_in_place_and_gains_the_envelope_binding(tmp_path, clock, monkeypatch, repo):
-    d, job = old_store(tmp_path, clock, monkeypatch, repo, V3, V3_SCHEMA)
+@pytest.mark.parametrize("fmt0, schema, lacks", [(V3, V3_SCHEMA, set(F11C) | {"handoffs"}), (V4, V4_SCHEMA, {"handoffs"})])
+def test_a_0_11_13_store_is_migrated_in_place_and_gains_the_envelope_binding(tmp_path, clock, monkeypatch, repo, fmt0,
+                                                                             schema, lacks):
+    # (/4, 0.11.14's, gains the handoff rows the same way; its job keeps no handoff row and is read as before)
+    d, job = old_store(tmp_path, clock, monkeypatch, repo, fmt0, schema)
     path = d / djobs.DB_NAME
     names, fmt = tables(path)
-    assert fmt == V3 and not set(F11C) & names
+    assert fmt == fmt0 and not lacks & names
     store = JobStore(d, clock=clock)
     again = store.get(job.id)
     assert again is not None and again.history == job.history and again.envelope_id is None
     names, fmt = tables(path)
-    assert fmt == djobs.FORMAT and set(F11C) <= names
+    assert fmt == djobs.FORMAT and set(F11C) | {"handoffs"} <= names and store.handoff_row(job.id) is None
 
 
 def test_the_migration_leaves_meta_written_once(tmp_path, clock, monkeypatch, repo):
@@ -126,16 +133,17 @@ def test_the_migration_leaves_meta_written_once(tmp_path, clock, monkeypatch, re
         conn.close()
 
 
-@pytest.mark.parametrize("known, migrates", [(V1, frozenset()), (V2, frozenset({V1})), (V3, frozenset({V1, V2}))])
-def test_a_levain_that_knows_only_an_older_format_refuses_a_v4_store(tmp_path, clock, monkeypatch, repo, known,
+@pytest.mark.parametrize("known, migrates", [(V1, frozenset()), (V2, frozenset({V1})), (V3, frozenset({V1, V2})),
+                                            (V4, frozenset({V1, V2, V3}))])
+def test_a_levain_that_knows_only_an_older_format_refuses_a_current_store(tmp_path, clock, monkeypatch, repo, known,
                                                                      migrates):
     store = new_store(tmp_path, clock)
     at_state(store, repo, "verified")
-    # 0.11.10's, 0.11.12's and 0.11.13's check, verbatim in effect: a marker that is not its FORMAT and not one it migrates from
+    # 0.11.10's, 0.11.12's, 0.11.13's and 0.11.14's check, verbatim in effect: a marker that is not its FORMAT and not one it migrates from
     # is refused, naming both
     monkeypatch.setattr(djobs, "FORMAT", known)
     monkeypatch.setattr(djobs, "_MIGRATES_FROM", migrates)
-    with pytest.raises(JobStoreError, match=rf"store format 'levain-dispatch-jobs/4' is not '{known}'"):
+    with pytest.raises(JobStoreError, match=rf"store format 'levain-dispatch-jobs/5' is not '{known}'"):
         JobStore(store.directory, clock=clock).list()
 
 

@@ -287,6 +287,28 @@ def planner_session(agent: str | None, session: str | None) -> tuple[str | None,
     return agent, session if caps.session_problem(session) is None else caps.NO_SESSION
 
 
+def readset_export(resolved: Any, text: str, digest: str, handoff_dir: str) -> Any:
+    """The filing door's read-set exporter (W-C's F2 + F3, :meth:`JobStore.file`'s ``export``): build the contract's
+    read set from its own repo into a private scratch, then export it into a locked temp under ``handoff_dir/.tmp/``,
+    so a contract the run would refuse is refused here, before the human is asked to sign it; the scratch is removed
+    either way. A refusal is raised by its name and nothing is filed."""
+    import shutil
+    import tempfile
+
+    from levain.dispatch import handoff as dhandoff
+    from levain.dispatch import readset as drs
+
+    if drs.TMP_DIR != dhandoff.TEMP_DIR:
+        # the exporter's temp dir and the installer's must be one name, or an install would never find its temp
+        raise DispatchError("the read-set temp dir and the handoff temp dir disagree; this Levain is mis-built")
+    parent = os.path.realpath(tempfile.mkdtemp(prefix="levain-readset-"))
+    try:
+        rs = drs.build_readset(resolved.repo, resolved, os.path.join(parent, "rs"), contract_digest=digest)
+        return drs.export_readset(rs, text.encode("utf-8"), digest, handoff_dir)
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
 def file_job(store: JobStore, submission: Any, *, agent: str | None, session: str, idem_key: str | None = None,
              resolved: tuple[Callable[[str], ResolvedTemplate | None], ProviderPolicy] | None = None,
              data_root: Path | None = None) -> tuple[Job, str | None, str]:
@@ -311,7 +333,7 @@ def file_job(store: JobStore, submission: Any, *, agent: str | None, session: st
             raise caps.CapabilityRecordError(f"this session's capability record cannot be kept ({exc}); nothing "
                                              "was filed") from exc
     job, capability = store.file(submission, resolve_template=resolve_template, policy=policy,
-                                 filer_session=session, idem_key=idem_key, filer_agent=agent)
+                                 filer_session=session, idem_key=idem_key, filer_agent=agent, export=readset_export)
     if capability is None:
         return job, None, ("this is a replay of a filing already made: its capability was shown once, then, and is "
                            "not shown again")

@@ -14,8 +14,8 @@ from levain.cockpit.consent import utc_stamp
 from levain.dispatch import ContractRefused, DispatchError
 from levain.dispatch import sign as dsign
 from levain.dispatch.jobs import (
-    CAUSES, EDGES, STATES, TERMINAL, UNSIGNED_LEASE, CapabilityRefused, JobStore, JobStoreError, SignatureRefused,
-    TransitionRefused,
+    CAUSES, EDGES, FORMAT, STATES, TERMINAL, UNSIGNED_LEASE, CapabilityRefused, JobStore, JobStoreError,
+    SignatureRefused, TransitionRefused,
 )
 from tests.test_dispatch_contract import NOW, POLICY, WRITE_SET, make_repo, registry, resolve, submission, template
 from tests.test_dispatch_sign import Clock, keys, log, snapshot  # noqa: F401  (module fixtures)
@@ -490,7 +490,8 @@ def test_a_naive_clock_is_refused(tmp_path, repo):
 # --- fix round 1 (L1/L2 slice a) -----------------------------------------------------------------------------------
 
 _SEED = ("INSERT INTO jobs (id, digest, contract, filed_at, filer_session, capability_sha256, idem_key, repo, "
-         "expires_at, unsigned_until) VALUES (?, ?, 'c', 't', 's', 'cap', ?, '/r', 'e', 'u')")
+         f"expires_at, unsigned_until, writer_format) VALUES (?, ?, 'c', 't', 's', 'cap', ?, '/r', 'e', 'u', "
+         f"'{FORMAT}')")
 
 
 def test_insert_or_replace_through_the_session_idem_key_is_refused(store):
@@ -743,9 +744,10 @@ def test_a_live_job_whose_stored_contract_no_longer_parses_is_a_damaged_store(st
     conn = sqlite3.connect(store.path, isolation_level=None)
     try:
         conn.execute("INSERT INTO jobs (id, digest, contract, filed_at, filer_session, capability_sha256, idem_key, "
-                     "repo, expires_at, unsigned_until) VALUES (?, ?, 'not a contract', ?, 's', ?, NULL, ?, ?, ?)",
+                     "repo, expires_at, unsigned_until, writer_format) "
+                     "VALUES (?, ?, 'not a contract', ?, 's', ?, NULL, ?, ?, ?, ?)",
                      (damaged, "sha256:" + "0" * 64, utc_stamp(NOW), "0" * 64, str(path),
-                      utc_stamp(NOW + timedelta(hours=1)), utc_stamp(NOW + timedelta(minutes=20))))
+                      utc_stamp(NOW + timedelta(hours=1)), utc_stamp(NOW + timedelta(minutes=20)), FORMAT))
         conn.execute("INSERT INTO transitions (job_id, seq, to_state, cause, at, evidence) "
                      "VALUES (?, 1, 'filed', 'filed', ?, '')", (damaged, utc_stamp(NOW)))
     finally:

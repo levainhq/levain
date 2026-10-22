@@ -32,16 +32,16 @@ record against the contract bytes and re-cuts the slot's bundle from it into sta
 the workdirs a crashed supervisor left behind. Stdlib only.
 
 Known edges (judged, no code): an existing handoff dir or ``.tmp/`` owned by another uid, or writable by one, is
-accepted; such a uid can swap or remove the temp before it is installed, which denies the filing but cannot change
-what the run accepts (the run re-verifies the content). The install that links the temp in is not in this module; its
-design says it will "full-fsync the handoff dir". The checkout-length bound (:func:`checkout_prefix`) is the length
-of the running uid's own session path, so a contract filed under one home can be refused ``readset-path-length`` under
-a longer one; it fails closed, and only for a path within a home's length of the limit. :func:`discard` removes the
-directory a :class:`VerifiedReadSet` names after checking its name and type only, not a recorded dev/ino: the record
-it trusts is :func:`verify_readset`'s own, and it is not an entry point for a record from outside. A failed ``flock``
-on a just-created local temp that is then also not closable, and a stderr-pipe close that eclipses a bounded child's
-failure, are not reachable on a local filesystem. ``/proc`` mounted ``hidepid=1`` makes the task count uncountable and
-the clone is refused: it fails closed, on hardened Linux only.
+accepted; such a uid can swap or remove the temp before it is installed, which denies the filing but cannot change what
+the run accepts (the run re-verifies the content). The install that links the temp in, and the flush every write here
+uses (:func:`levain.dispatch.handoff.full_fsync`), are the handoff module's. The checkout-length bound
+(:func:`checkout_prefix`) is the length of the running uid's own session path, so a contract filed under one home can be
+refused ``readset-path-length`` under a longer one; it fails closed, and only for a path within a home's length of the
+limit. :func:`discard` removes the directory a :class:`VerifiedReadSet` names after checking its name and type only, not
+a recorded dev/ino: the record it trusts is :func:`verify_readset`'s own, and it is not an entry point for a record from
+outside. A failed ``flock`` on a just-created local temp that is then also not closable, and a stderr-pipe close that
+eclipses a bounded child's failure, are not reachable on a local filesystem. ``/proc`` mounted ``hidepid=1`` makes the
+task count uncountable and the clone is refused: it fails closed, on hardened Linux only.
 """
 from __future__ import annotations
 
@@ -66,6 +66,7 @@ from dataclasses import dataclass
 from levain.dispatch import ContractRefused, DispatchError
 from levain.dispatch.attempt_id import is_attempt_id
 from levain.dispatch.contract import GIT_TIMEOUT, ResolvedContract, git_env, parse_contract
+from levain.dispatch.handoff import full_fsync
 
 __all__ = ["BRANCH", "ExportedReadSet", "ReadSet", "ReadSetRefused", "STAGED_BUNDLE", "StagedBundle", "SweepReport",
            "VerifiedReadSet", "WORKDIR_PREFIX", "build_readset", "bundle_verified", "clone_limits", "discard",
@@ -362,35 +363,6 @@ def readset_commit(contract_bytes: bytes, D: str) -> tuple[str, str, int]:
     body = f"tree {tree}\nauthor {who}\ncommitter {who}\n\nlevain read set {parsed.digest}\n".encode("utf-8")
     commit = _git_object(b"commit", body).hex()
     return commit, tree, 1 + len(trees) + len({e.blob for e in parsed.read})
-
-
-# --- durability -----------------------------------------------------------------------------------------------------
-
-_FALLBACK_ERRNOS = frozenset({errno.ENOTSUP, errno.EINVAL, errno.ENOTTY, errno.EOPNOTSUPP, errno.ENOSYS,
-                              errno.ENODEV})
-_fallback_logged = False
-
-
-def full_fsync(fd: int) -> str:
-    """Flush ``fd`` to stable storage and name the call that did it: ``F_FULLFSYNC`` (which also flushes the drive's
-    cache on macOS), or ``fsync`` where that call does not exist on this Python or this filesystem (logged once per
-    process). Every other error propagates: a failing disk is never reported as durable."""
-    global _fallback_logged
-    try:
-        import fcntl
-        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
-        return "F_FULLFSYNC"
-    except AttributeError:
-        why = "no F_FULLFSYNC on this Python"
-    except OSError as exc:
-        if exc.errno not in _FALLBACK_ERRNOS:
-            raise
-        why = f"F_FULLFSYNC unsupported here ({errno.errorcode.get(exc.errno, exc.errno)})"
-    if not _fallback_logged:
-        _fallback_logged = True
-        _log.warning("readset: %s; falling back to fsync (ordering holds across process kill, not power loss)", why)
-    os.fsync(fd)
-    return "fsync"
 
 
 # --- the bundle's fixed prefix ------------------------------------------------------------------------------------------
