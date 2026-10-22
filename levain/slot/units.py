@@ -166,12 +166,27 @@ def start_order(host: HostOS, services: Iterable[Service] | None = None) -> tupl
     return tuple(launchd_label(s) if host == "darwin" else systemd_name(s) for s in ordered)
 
 
-def _launchd_job_absent(label: str, run: Callable[..., object] | None = None) -> tuple[bool, str]:
-    import subprocess
+#: launchd finishes unloading a job after `launchctl bootout` returns; a check made right after a bootout waits this long
+#: for the job to go before it calls it still loaded (a fresh setup then an immediate undo hit it on a macOS VM, 10-22).
+LAUNCHD_UNLOAD_WAIT_S = 10.0
+_LAUNCHD_POLL_S = 0.2
 
-    r = (run or subprocess.run)(["/bin/launchctl", "print", f"system/{label}"], capture_output=True, env=child_env())
-    loaded = getattr(r, "returncode", 1) == 0
-    return (not loaded, f"{label} is still loaded" if loaded else "")
+
+def _launchd_job_absent(label: str, run: Callable[..., object] | None = None, *, wait_s: float = 0.0,
+                        sleep: Callable[[float], None] | None = None,
+                        clock: Callable[[], float] | None = None) -> tuple[bool, str]:
+    import subprocess
+    import time
+
+    sleep, clock = sleep or time.sleep, clock or time.monotonic
+    deadline = clock() + wait_s
+    while True:
+        r = (run or subprocess.run)(["/bin/launchctl", "print", f"system/{label}"], capture_output=True,
+                                    env=child_env())
+        loaded = getattr(r, "returncode", 1) == 0
+        if not loaded or clock() >= deadline:
+            return (not loaded, f"{label} is still loaded" if loaded else "")
+        sleep(min(_LAUNCHD_POLL_S, max(deadline - clock(), 0.0)))
 
 
 def _read_or_none(path: Path) -> bytes | None:
@@ -199,7 +214,7 @@ def _unload_launchd_if_changed(label: str, path: Path, text: str, run: Callable[
     if absent or not _differs(read, path, text):
         return True, ""
     (run or subprocess.run)(["/bin/launchctl", "bootout", f"system/{label}"], capture_output=True, env=child_env())
-    return _launchd_job_absent(label, run)
+    return _launchd_job_absent(label, run, wait_s=LAUNCHD_UNLOAD_WAIT_S)
 
 
 def _stop_unit_if_changed(systemctl: str, name: str, path: Path, text: str, run: Callable[..., object] | None,
@@ -274,7 +289,7 @@ def uninstall_steps(host: HostOS) -> list[Step]:
             label = launchd_label(s)
             steps += [
                 Step(f"stop {label}", ("/bin/launchctl", "bootout", f"system/{label}"), allow_fail=True),
-                Step(f"check {label} is stopped", call=lambda lb=label: _launchd_job_absent(lb)),
+                Step(f"check {label} is stopped", call=lambda lb=label: _launchd_job_absent(lb, wait_s=LAUNCHD_UNLOAD_WAIT_S)),
             ]
         steps += [Step(f"remove {launchd_path(s)}", ("/bin/rm", "-f", str(launchd_path(s)))) for s in services_for(host)]
         return steps
