@@ -42,7 +42,8 @@ def cert(tmp_path_factory):
 
 
 class Endpoint:
-    """A token endpoint: counts calls; `mode` picks the answer; `hold` (an Event) delays it."""
+    """A token endpoint: counts calls; `mode` picks the answer; `hold` (an Event) delays it (only the calls numbered
+    in `hold_only`, when that is set)."""
 
     def __init__(self) -> None:
         self.calls = 0
@@ -50,6 +51,7 @@ class Endpoint:
         self.expires_in = 3600
         self.rotate = True
         self.hold = None
+        self.hold_only = None
         self.got = None   # made by `_serve`, inside the running loop (3.9 binds an Event at construction)
         self.server = None
         self.port = 0
@@ -62,7 +64,7 @@ class Endpoint:
             self.bodies.append(await reader.readexactly(n))
             self.calls += 1
             self.got.set()
-            if self.hold is not None:
+            if self.hold is not None and (self.hold_only is None or self.calls in self.hold_only):
                 await self.hold.wait()
             if self.mode == "reset":
                 writer.write(b"HTTP/1.1 200 OK\r\n")
@@ -671,9 +673,17 @@ def _kup():
     return mod
 
 
-def _keys_case(env, expires_at: int, vendor: bytes):
+def _c1(expires_at: int, access: str = "old-access") -> dict:
+    f = _fields(expires_at, access=access)
+    f["name"] = "c1"
+    f["hosts"] = ["api.example.com", HOST]
+    return f
+
+
+def _keys_case(env, expires_at: int, vendor: bytes, *, seams=None, on_vendor_connect=None, setup=None):
     """One exchange through `Keys._exchange` on route `r` (credential `c1`, now an `oauth2-refresh` one) with the real
-    CredWriter; the vendor is the scripted upstream, the token endpoint the real TLS fake."""
+    CredWriter (with `seams`, when given); the vendor is the scripted upstream, the token endpoint the real TLS fake.
+    `on_vendor_connect()` runs (synchronously) as keys connects to the vendor; `setup(mp, cdir)` before the exchange."""
     ep, _d, _store, cert, mp = env
     kup = _kup()
     real_handshake = upstream._handshake
@@ -688,18 +698,19 @@ def _keys_case(env, expires_at: int, vendor: bytes):
         scripted = upstream._handshake
 
         async def handshake(addr, port, host):
+            if host != HOST and on_vendor_connect is not None:
+                on_vendor_connect()
             return await (real_handshake if host == HOST else scripted)(addr, port, host)
         mp.setattr(upstream, "_handshake", handshake)
         mp.setattr(upstream, "pick_address", pick)
-        f = _fields(expires_at)
-        f["name"] = "c1"
-        f["hosts"] = ["api.example.com", HOST]
         cdir = os.path.join(d, "keys", "cred")
         os.unlink(os.path.join(cdir, "c1.json"))
         fd = os.open(cdir, os.O_RDONLY | os.O_DIRECTORY)
-        C.commit(fd, "c1", f, wait=True)
+        C.commit(fd, "c1", _c1(expires_at), wait=True)
         os.close(fd)
-        w = C.CredWriter(cdir)
+        if setup is not None:
+            setup(mp, cdir)
+        w = C.CredWriter(cdir, seams=seams)
         async with kup._Rig(d, cred_lifecycle=w) as rig:
             rig.front.feed_data(kup.gwwire.encode(b"E"))
             rig.front.feed_eof()   # a refusal drains the front until EOF
@@ -730,6 +741,217 @@ def test_through_keys_a_401_is_answered_503_never_replayed_and_wants_one_refresh
     assert b"credential-unavailable" in frames[1][1]
     assert b"".join(up.writes).count(b"POST /v1/messages") == 1   # never replayed
     assert ep.calls == 1 and after["access"] == "new-access-1"
+
+
+# --- L3 r1 (1022+12): T1-T7 ------------------------------------------------------------------------------------------
+
+def test_t1_through_keys_the_credential_fresh_checked_is_the_one_sent(env):
+    """T1: an operator installing an EXPIRED rev between `fresh`'s observation and the request's build does not get
+    that rev sent unchecked: the request is built from the one credential `fresh` observed and checked."""
+    from levain.broker import keys as K
+
+    def setup(mp, cdir):
+        real = K.fresh
+
+        async def fresh_then_operator(lifecycle, store, name):
+            c = await real(lifecycle, store, name)
+            fd = os.open(cdir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                C.commit(fd, "c1", _c1(int(time.time()) - 5, access="operator-expired"), wait=True)
+            finally:
+                os.close(fd)
+            return c
+        mp.setattr(K, "fresh", fresh_then_operator)
+    frames, after, up, ep = _keys_case(env, int(time.time()) + 3600,
+                                       b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok", setup=setup)
+    sent = b"".join(up.writes)
+    assert b"operator-expired" not in sent
+    assert b"authorization: Bearer old-access" in sent
+    assert b"".join(t for t, _ in frames) == b"ARbe", frames
+
+
+def test_t2_through_keys_a_token_expiring_during_the_connect_is_refused_before_the_head(env):
+    """T2: the expiry is checked again at the write, with no await between: a token valid at `fresh` and expired by
+    the time the connect is done is never sent."""
+    clk = Clock()
+
+    def advance():
+        clk.t += 3601.0   # the connect "took" past the token's expiry
+    frames, after, up, ep = _keys_case(env, int(clk.wall()) + 3600,
+                                       b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
+                                       seams=C.WriteSeams(monotonic=clk.mono, clock=clk.wall),
+                                       on_vendor_connect=advance)
+    assert b"".join(t for t, _ in frames) == b"AF", frames
+    assert b"credential-unavailable" in frames[1][1]
+    assert up.writes == []   # no byte of the head reached the vendor
+
+
+def test_t3_a_stalled_refresh_of_one_rev_does_not_hold_the_operators_new_rev(env):
+    """T3: the single-flight is keyed by `(name, rev)`: rev A's refresh stalls at its endpoint; the operator installs
+    rev B (expired too) to recover; B's refresh runs on its own at once and serves B's new token."""
+    ep, d, store, cert, mp = env
+    _write(d, _fields(int(time.time()) - 5))
+
+    async def go():
+        await _serve(ep, cert, mp)
+        ep.hold = asyncio.Event()
+        ep.hold_only = {1}   # only A's call stalls
+        w, s = _writer(d), store()
+        ta = asyncio.ensure_future(C.fresh(w, s, NAME))
+        await ep.got.wait()
+        _write(d, _fields(int(time.time()) - 5, access="operator-expired", refresh_token="operator-refresh"))
+        try:
+            cb = await asyncio.wait_for(C.fresh(w, s, NAME), 5)
+            calls_b = ep.calls
+        finally:
+            ep.hold.set()
+        ca = await ta
+        await _settle(w)
+        w.close()
+        return cb.secret, calls_b, ca.secret
+    b, calls_b, a = run(go())
+    assert (b, calls_b) == ("new-access-2", 2)
+    assert a == "new-access-2"   # A's waiter re-observes the file: A's own result was discarded
+    f = _file(d)
+    assert f["access"] == "new-access-2" and f["refresh"]["refresh_token"] == "new-refresh-2"
+    assert "refresh_token=operator-refresh" in ep.bodies[1].decode()
+
+
+def test_t3_the_refreshs_own_rev_keeps_its_gate_even_before_the_refresh_resumes(env):
+    """T3's class check (H19 (2)): with the table keyed by `(name, rev)`, the refresh's OWN new rev, observed in the
+    window after its file lands and before the refresh task resumes, still finds the gate it shut: no second call
+    (row 8, at most one per 30 s). A 10 s token, so the new rev is itself inside REFRESH_AHEAD_S."""
+    ep, d, store, cert, mp = env
+    clk = Clock()
+    _write(d, _fields(int(clk.wall()) - 5))
+    ep.expires_in = 10
+
+    async def go():
+        await _serve(ep, cert, mp)
+        w, s = _writer(d, clk), store()
+        real_commit = w.commit
+        seen = {}
+
+        async def commit_then_look(name, fields, expect_rev=None, **kw):
+            out = await real_commit(name, fields, expect_rev=expect_rev, **kw)
+            if seen:
+                return out   # the first window only (a gate that failed would otherwise chain refreshes without end)
+            cur = s.observe(NAME)   # the window: the file is the new rev, the refresh has not resumed
+            seen["landed"] = cur.rev == out.rev
+            seen["want"] = w.want(cur)
+            seen["tasks"] = len(w._refresh_tasks)
+            return out
+        w.commit = commit_then_look
+        c = await C.fresh(w, s, NAME)
+        await _settle(w)
+        w.close()
+        return c.secret, seen, ep.calls
+    secret, seen, calls = run(go())
+    assert secret == "new-access-1"
+    assert seen["landed"] and seen["tasks"] == 1   # no second refresh started in the window
+    assert calls == 1
+
+
+def test_t4_a_refresh_cancelled_before_its_first_step_resolves_its_waiter_and_clears_the_table(env):
+    """T4: `want(); begin_closing(); cancel_detached()` with no yield between the want and the cancel: the task never
+    runs a step (no `finally`), and the done-callback still pops the table, drops the task and resolves the future."""
+    ep, d, store, cert, mp = env
+    _write(d, _fields(int(time.time()) - 5))
+
+    async def go():
+        await _serve(ep, cert, mp)
+        w, s = _writer(d), store()
+        waiter = asyncio.ensure_future(C.fresh(w, s, NAME))
+        await asyncio.sleep(0)   # the waiter runs `want` (the task is made, not started) and awaits its future
+        (task,) = list(w._refresh_tasks)
+        w.begin_closing()
+        w.cancel_detached()
+        try:
+            await asyncio.wait_for(waiter, 5)
+            out = "served"
+        except Refused as r:
+            out = r.name
+        await asyncio.sleep(0)
+        w.close()
+        return out, task.cancelled(), w._inflight, w._refresh_tasks, ep.calls
+    out, cancelled, inflight, tasks, calls = run(go())
+    assert out == "credential-unavailable"
+    assert cancelled and inflight == {} and tasks == set()
+    assert calls == 0
+
+
+def test_t5_through_keys_a_gzip_401_on_a_refresh_credential_still_wants_the_refresh(env):
+    """T5: a refreshing credential's 401 is handled right after the status, before any header is processed: a 401
+    with `content-encoding: gzip` is `credential-unavailable` and wants one refresh, not `upstream-error`."""
+    frames, after, up, ep = _keys_case(env, int(time.time()) + 3600,
+                                       b"HTTP/1.1 401 Unauthorized\r\ncontent-encoding: gzip\r\n"
+                                       b"content-length: 0\r\n\r\n")
+    assert b"".join(t for t, _ in frames) == b"AF", frames
+    assert b"credential-unavailable" in frames[1][1]
+    assert ep.calls == 1 and after["access"] == "new-access-1"
+
+
+def test_t6_a_commit_failing_after_its_refresh_was_cancelled_leaves_no_unretrieved_exception(env):
+    """T6: the shielded commit's task is held and its exception retrieved, so a commit that fails after the refresh
+    was cancelled (shutdown's cancel_detached mid-commit) logs no "Task exception was never retrieved"."""
+    ep, d, store, cert, mp = env
+    _write(d, _fields(int(time.time()) - 5))
+
+    async def go():
+        await _serve(ep, cert, mp)
+        loop = asyncio.get_running_loop()
+        errs = []
+        loop.set_exception_handler(lambda _l, ctx: errs.append(str(ctx.get("message"))))
+        w, s = _writer(d), store()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def failing_commit(name, fields, expect_rev=None, **kw):
+            entered.set()
+            await release.wait()
+            raise C.CommitFailed("credential-commit-failed", "write")
+        w.commit = failing_commit
+        waiter = asyncio.ensure_future(C.fresh(w, s, NAME))
+        await entered.wait()
+        w.begin_closing()
+        w.cancel_detached()
+        await _settle(w)
+        with pytest.raises(Refused):
+            await waiter
+        release.set()
+        for _ in range(5):
+            await asyncio.sleep(0.01)
+        gc.collect()
+        await asyncio.sleep(0)
+        w.close()
+        return errs
+    errs = run(go())
+    assert not [m for m in errs if "never retrieved" in m], errs
+
+
+class _Resp:
+    def __init__(self, expires_in) -> None:
+        self.status = 200
+        self.body = json.dumps({"access_token": "a1", "expires_in": expires_in}).encode()
+
+
+@pytest.mark.parametrize("v,want", [(3600, 3600), ("3600", 3600), (3600.0, 3600), (10 ** 18, "max"),
+                                    ("31536001", "max"), (1e300, "max"),
+                                    ("abc", None), ("", None), (" 3600", None), ("-5", None), ("0", None),
+                                    ("3600.0", None), (3600.5, None), (0, None), (-1, None), (True, None),
+                                    (float("inf"), None), (None, None), ([3600], None)])
+def test_t7_expires_in_accepts_a_numeric_string_and_an_integral_float_and_is_clamped(v, want):
+    """T7: `expires_in` as a JSON integer, a string of decimal digits, or an integral float; past
+    EXPIRES_IN_MAX_S it is clamped to it; anything else (a fraction, a sign, a space, a bool, inf) is refused."""
+    cred = C.parse(C.render(_fields(1000), NAME)[0], NAME)
+    if want is None:
+        with pytest.raises(C.RefreshRejected) as e:
+            C._refreshed(cred, _Resp(v), 5000.0)
+        assert e.value.detail == "expires_in"
+        return
+    f = C._refreshed(cred, _Resp(v), 5000.0)
+    assert f["expires_at"] == 5000 + (C.EXPIRES_IN_MAX_S if want == "max" else want)
+    assert isinstance(f["expires_at"], int) and not isinstance(f["expires_at"], bool)
+    C.parse(C.render(f, NAME)[0], NAME)   # what the commit writes still parses
 
 
 # --- rule (c): EXACTLY ONE refresh_post caller (R76) ------------------------------------------------------------------

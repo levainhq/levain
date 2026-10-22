@@ -308,9 +308,16 @@ async def fresh(lifecycle: object, store: CredStore, name: str) -> Credential:
         if fut is not None:
             await asyncio.shield(fut)
             cred = store.observe(name)
+    unexpired(lifecycle, cred)
+    return cred
+
+
+def unexpired(lifecycle: object, cred: Credential) -> None:
+    """`credential-unavailable` when `cred` is a refresh-kind credential whose access token has expired by
+    `lifecycle`'s clock. Synchronous: keys calls it again immediately before the request head's write, with no await
+    between the two, so a token that expired during the resolve, connect or TLS is never sent."""
     if cred.kind == "oauth2-refresh" and cred.expires_at <= _now(lifecycle):
         raise Refused("credential-unavailable", "expired")
-    return cred
 
 
 def on_upstream_401(lifecycle: object, store: Optional[CredStore], credential: Credential, generation: str) -> None:
@@ -404,13 +411,20 @@ class WriteSeams:
         self.monotonic, self.sleep, self.clock = monotonic, sleep, clock
 
 
-def render(fields: dict, name: str) -> Tuple[bytes, str]:
-    """A credential object WITHOUT `rev` -> the file's bytes with a FRESH random `rev` (16 bytes of `os.urandom`, hex),
-    and that `rev`. The bytes are parsed by `parse` before they are returned, so a writer only ever writes what the
-    reader accepts; `Unparseable` names the field otherwise."""
+def new_rev() -> str:
+    """A fresh random `rev`: 16 bytes of `os.urandom`, hex."""
+    return os.urandom(16).hex()
+
+
+def render(fields: dict, name: str, rev: Optional[str] = None) -> Tuple[bytes, str]:
+    """A credential object WITHOUT `rev` -> the file's bytes with `rev` (a fresh `new_rev()` when None: a caller
+    passes one only when it must know the `rev` before the write lands), and that `rev`. The bytes are parsed by
+    `parse` before they are returned, so a writer only ever writes what the reader accepts; `Unparseable` names the
+    field otherwise."""
     if not isinstance(fields, dict) or "rev" in fields:
         raise Unparseable("rev")
-    rev = os.urandom(16).hex()
+    if rev is None:
+        rev = new_rev()
     d = dict(fields)
     d["rev"] = rev
     try:
@@ -530,7 +544,8 @@ def _durable(dir_fd: int, seams: WriteSeams, name: str, act: str = "commit") -> 
 
 
 def commit(dir_fd: int, name: str, fields: dict, *, expect_rev: Optional[str] = None, wait: bool = False,
-           lock_timeout_s: float = LOCK_TIMEOUT_S, seams: Optional[WriteSeams] = None) -> Outcome:
+           lock_timeout_s: float = LOCK_TIMEOUT_S, seams: Optional[WriteSeams] = None,
+           rev: Optional[str] = None) -> Outcome:
     """The commit, step by step, synchronous (keys runs it on its writer thread, the install helper's child inline):
     (1) the `flock` (a timeout = `CommitFailed`, nothing written); the stale-temp sweep; (2) when `expect_rev` is
     given, read the file's `rev` and compare: a different `rev`, an unparseable file or no file = DISCARDED (the
@@ -538,9 +553,10 @@ def commit(dir_fd: int, name: str, fields: dict, *, expect_rev: Optional[str] = 
     written and fsynced, a failure unlinks it = `CommitFailed`; (4) the rename over `<name>.json`, a failure unlinks
     the temp = `CommitFailed`; (5) the directory fsync, a failure = COMMITTED with `durable` False and the warning
     `credential-commit-not-durable`; (6) unlock. `expect_rev` None is the operator's write: no compare.
-    `Unparseable` (from `render`, before the lock) means `fields` is not a credential: nothing is touched."""
+    `Unparseable` (from `render`, before the lock) means `fields` is not a credential: nothing is touched. `rev` is
+    `render`'s: the new file's `rev` when given (the refresh's, made before the commit is submitted)."""
     s = seams or WriteSeams()
-    raw, rev = render(fields, name)
+    raw, rev = render(fields, name, rev)
     lock_fd = _locked(dir_fd, wait, lock_timeout_s, s)
     try:
         _sweep(dir_fd, s.clock())
@@ -620,6 +636,10 @@ TOKEN_PORT = 443           # `token_url` is `https://<host>/...` with `<host>` a
 REFRESH_CONNS = 8
 #: the request target the POST carries: printable ASCII, no space and no fragment
 _TARGET_RE = re.compile(r"/[\x21-\x22\x24-\x7e]*")
+#: a token endpoint's `expires_in` past this is taken as this (one year), so a huge value cannot stop the proactive
+#: refresh for good
+EXPIRES_IN_MAX_S = 365 * 86400
+_DIGITS_RE = re.compile(r"[0-9]{1,20}")
 
 
 class RefreshRejected(Exception):
@@ -634,11 +654,14 @@ class RefreshRejected(Exception):
 class _Gate:
     """The one per-credential gate, for the `rev` it holds (a newly observed `rev` gets a new, open gate; the `rev`
     a refresh commits keeps its gate, so one refresh's own success never opens the next attempt early): an attempt is
-    admitted at most once per GATE_MIN_S from the last attempt's start, and not while a failure's backoff runs."""
-    __slots__ = ("rev", "last_start", "failures", "shut_until")
+    admitted at most once per GATE_MIN_S from the last attempt's start, and not while a failure's backoff runs.
+    `own` is the `rev` this gate's latest refresh commits, set BEFORE that commit is submitted: the new file can be
+    observed before the refresh resumes to call `succeeded`, and that observation must find this gate, not open one."""
+    __slots__ = ("rev", "own", "last_start", "failures", "shut_until")
 
     def __init__(self, rev: str) -> None:
         self.rev = rev
+        self.own: Optional[str] = None
         self.last_start: Optional[float] = None
         self.failures = 0
         self.shut_until = float("-inf")
@@ -674,8 +697,9 @@ async def _post(cred: Credential) -> "upstream.RefreshResponse":
 def _refreshed(cred: Credential, resp: "upstream.RefreshResponse", now: float) -> dict:
     """The credential's object with the endpoint's new tokens, or `RefreshRejected`: a status other than 200, a body
     that is not a JSON object, an `access_token` or `refresh_token` that is not a string of at most VALUE_CAP bytes, an
-    `expires_in` that is not a positive integer (or is absent: the expiry is what the next want reads). A returned
-    `refresh_token` replaces the old one (rotation); none keeps it. `render` parses the result before it is written."""
+    `expires_in` that is not a positive whole number (`_expires_in`; absent is a failure: the expiry is what the next
+    want reads). A returned `refresh_token` replaces the old one (rotation); none keeps it. `render` parses the result
+    before it is written."""
     if resp.status != 200:
         raise RefreshRejected("status")
     try:
@@ -691,15 +715,26 @@ def _refreshed(cred: Credential, resp: "upstream.RefreshResponse", now: float) -
             rotated = _value(rotated, "refresh_token")
     except Unparseable as e:
         raise RefreshRejected(str(e)) from None
-    exp = d.get("expires_in")
-    if not isinstance(exp, int) or isinstance(exp, bool) or exp <= 0:
-        raise RefreshRejected("expires_in")
+    exp = _expires_in(d.get("expires_in"))
     fields = json.loads(json.dumps(cred.fields))
     fields["access"] = access
     fields["expires_at"] = int(now) + exp
     if rotated is not None:
         fields["refresh"]["refresh_token"] = rotated
     return fields
+
+
+def _expires_in(v: object) -> int:
+    """`expires_in` as seconds, at most EXPIRES_IN_MAX_S: a JSON integer, a string of decimal digits (some endpoints
+    send `"3600"`), or a float with no fraction (`3600.0`); positive. Anything else (a bool, a fraction, a sign or a
+    space in the string, inf or nan) is `RefreshRejected("expires_in")`."""
+    if isinstance(v, str) and _DIGITS_RE.fullmatch(v):
+        v = int(v)
+    elif isinstance(v, float) and v.is_integer():   # False for inf and nan
+        v = int(v)
+    if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
+        raise RefreshRejected("expires_in")
+    return min(v, EXPIRES_IN_MAX_S)
 
 
 def _why(e: BaseException) -> str:
@@ -731,11 +766,14 @@ class CredWriter:
         self._dir_fd: Optional[int] = None    # set by open_dir() before any job, else by the writer thread only
         self._closing = False
         self._refresh_tasks: Set["asyncio.Task"] = set()
-        #: the single-flight table: name -> the future of the refresh in flight for it
-        self._inflight: Dict[str, "asyncio.Future"] = {}
+        #: the single-flight table: (name, rev) -> the future of the refresh in flight for that rev (a stalled refresh
+        #: of one rev never holds the operator's next one)
+        self._inflight: Dict[Tuple[str, str], "asyncio.Future"] = {}
         #: the one gate per credential, holding the `rev` it is for
         self._gates: Dict[str, _Gate] = {}
         self._refresh_sem: Optional[asyncio.Semaphore] = None
+        #: the shielded commits' tasks, held until done (their outcome is retrieved even when the refresh was cancelled)
+        self._commit_jobs: Set["asyncio.Task"] = set()
 
     # -- CredLifecycle --
 
@@ -764,17 +802,19 @@ class CredWriter:
 
     def want(self, cred: Credential) -> "Optional[asyncio.Future]":
         """The refresh-wanted entry point, on keys' loop, with no await (so the check and the table update are one
-        step): None when closing (R61) or when the gate for `(name, rev)` is shut; else the future of the refresh in
-        flight for `name`, made here on a miss as a DETACHED task held in `_refresh_tasks`. The future always resolves
-        (to the outcome's name, never an exception), so no waiter hangs; a waiter awaits it shielded."""
+        step): None when closing (R61) or when the gate is shut; else the future of the refresh in flight for
+        `(name, rev)`, made here on a miss as a DETACHED task held in `_refresh_tasks`. The gate is the one for `name`
+        when it holds `rev` (or `rev` is its own refresh's commit); any other `rev` gets a new, open gate. The future
+        always resolves (to the outcome's name, never an exception), so no waiter hangs; a waiter awaits it shielded."""
         if self._closing:
             _note(logging.INFO, "levain gw-keys: credential %s refresh refused (closing)", cred.name)
             return None
-        fut = self._inflight.get(cred.name)
+        key = (cred.name, cred.rev)
+        fut = self._inflight.get(key)
         if fut is not None:
             return fut
         g = self._gates.get(cred.name)
-        if g is None or g.rev != cred.rev:
+        if g is None or cred.rev not in (g.rev, g.own):
             g = self._gates[cred.name] = _Gate(cred.rev)
         now = self.seams.monotonic()
         if not g.admits(now):
@@ -782,15 +822,33 @@ class CredWriter:
         g.last_start = now
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
-        self._inflight[cred.name] = fut
-        self._refresh_tasks.add(loop.create_task(self._refresh(cred, g, fut)))
+        self._inflight[key] = fut
+        task = loop.create_task(self._refresh(cred, g, fut))
+        self._refresh_tasks.add(task)
+        # a task cancelled before its first step never runs `_refresh`'s `finally`; this runs for every task
+        task.add_done_callback(functools.partial(self._refresh_ended, key, fut))
         return fut
+
+    def _refresh_ended(self, key: Tuple[str, str], fut: "asyncio.Future", task: "asyncio.Task") -> None:
+        """A refresh task's done-callback, and `_refresh`'s `finally`: idempotent. Pops the table entry if it is still
+        this refresh's, drops the task, and resolves the future ("cancelled" when nothing resolved it)."""
+        if self._inflight.get(key) is fut:
+            del self._inflight[key]
+        self._refresh_tasks.discard(task)
+        if not fut.done():
+            fut.set_result("cancelled")
+
+    def _commit_ended(self, job: "asyncio.Task") -> None:
+        self._commit_jobs.discard(job)
+        if not job.cancelled():
+            job.exception()   # retrieved: a failure after the refresh was cancelled is not "never retrieved"
 
     async def _refresh(self, cred: Credential, gate: _Gate, fut: "asyncio.Future") -> None:
         """The detached refresh: the POST, the new object, the commit on the writer thread awaited SHIELDED (the job
-        runs to its end whatever happens to this task) with the generation compare. A failure counts on the gate and
-        leaves the old file; a DISCARD (the operator's act landed) is neither. The `finally` ALWAYS pops the table
-        entry and resolves the future."""
+        runs to its end whatever happens to this task; it is held in `_commit_jobs`) with the generation compare, its
+        new `rev` made first and set as the gate's `own`. A failure counts on the gate and leaves the old file; a
+        DISCARD (the operator's act landed) is neither. The `finally` resolves the future with the outcome; the
+        task's done-callback repeats the cleanup for a task cancelled before its first step."""
         result = "cancelled"
         try:
             if self._refresh_sem is None:
@@ -798,7 +856,11 @@ class CredWriter:
             async with self._refresh_sem:
                 response = await _post(cred)
             fields = _refreshed(cred, response, self.seams.clock())
-            out = await asyncio.shield(self.commit(cred.name, fields, expect_rev=cred.rev))
+            gate.own = rev = new_rev()   # no await between this and the submit below
+            job = asyncio.ensure_future(self.commit(cred.name, fields, expect_rev=cred.rev, rev=rev))
+            self._commit_jobs.add(job)
+            job.add_done_callback(self._commit_ended)
+            out = await asyncio.shield(job)
             result = out.result
             if out.result == COMMITTED:
                 gate.succeeded(out.rev)
@@ -809,23 +871,22 @@ class CredWriter:
             gate.failed(self.seams.monotonic())
             _note(logging.WARNING, "levain gw-keys: credential-refresh-failed credential=%s (%s)", cred.name, _why(e))
         finally:
-            if self._inflight.get(cred.name) is fut:
-                del self._inflight[cred.name]
-            task = asyncio.current_task()
-            if task is not None:
-                self._refresh_tasks.discard(task)
             if not fut.done():
                 fut.set_result(result)
+            task = asyncio.current_task()
+            if task is not None:
+                self._refresh_ended((cred.name, cred.rev), fut, task)
 
     # -- the writer thread --
 
-    async def commit(self, name: str, fields: dict, expect_rev: Optional[str] = None) -> Outcome:
+    async def commit(self, name: str, fields: dict, expect_rev: Optional[str] = None,
+                     rev: Optional[str] = None) -> Outcome:
         """`commit` on the writer thread, with keys' bounded `flock`."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor,
-                                          functools.partial(self._commit_sync, name, fields, expect_rev))
+                                          functools.partial(self._commit_sync, name, fields, expect_rev, rev))
 
-    def _commit_sync(self, name: str, fields: dict, expect_rev: Optional[str]) -> Outcome:
+    def _commit_sync(self, name: str, fields: dict, expect_rev: Optional[str], rev: Optional[str] = None) -> Outcome:
         if self._dir_fd is None:
             try:
                 self._dir_fd = os.open(self.cred_dir, _O_DIR)
@@ -834,7 +895,7 @@ class CredWriter:
                       type(e).__name__)
                 raise CommitFailed("credential-commit-failed", "directory") from None
         return commit(self._dir_fd, name, fields, expect_rev=expect_rev, wait=False,
-                      lock_timeout_s=self.lock_timeout_s, seams=self.seams)
+                      lock_timeout_s=self.lock_timeout_s, seams=self.seams, rev=rev)
 
     def close(self) -> None:
         """At keys' exit, after the loop: wait for a job in flight (bounded by the lock timeout and the fsyncs), then
