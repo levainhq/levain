@@ -253,13 +253,13 @@ def pytest_unconfigure(config):
 
 
 @pytest.fixture(autouse=True)
-def _per_test_home(monkeypatch, tmp_path):
+def _per_test_home(monkeypatch, tmp_path_factory):
     """TEST ONLY: on top of the session scratch home, every test gets its own ``$HOME`` (with the minimal
     ``.gitconfig``), so state one test writes under HOME (enrolled keys, verifier and journal stores, a gpg home)
     never reaches the next. The monkeypatch undo returns to the SESSION scratch home, never the operator's. A test
-    that wants a different HOME still sets it itself."""
-    home = tmp_path / "home"
-    home.mkdir()
+    that wants a different HOME still sets it itself. The home sits beside the test's ``tmp_path``, never in it:
+    tests make ``tmp_path / "home"`` themselves and some assert ``tmp_path``'s exact contents."""
+    home = tmp_path_factory.mktemp("home")
     (home / ".gitconfig").write_text("[user]\n\tname = levain test\n\temail = test@levain.invalid\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
 

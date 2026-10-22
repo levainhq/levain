@@ -17,6 +17,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from levain.autonomic import ConfirmDecision, GateHandle
 
 SIGNER = "operator"
@@ -25,8 +27,16 @@ SIGNER = "operator"
 def account_home() -> str:
     """The account's real home directory (password database): the one place a trust-anchor temp dir can sit
     where no ancestor is world-writable (the suite's scratch ``$HOME`` is under the temp directory, which is).
-    Callers make a private temp dir there, holding a throwaway key, and remove it at exit."""
-    return pwd.getpwuid(os.getuid()).pw_dir
+    Callers make a private temp dir there, holding a throwaway key, and remove it at exit. An account with no
+    passwd entry, or a home that is not a writable directory (a container's arbitrary uid), skips the test by
+    name instead of erroring in setup."""
+    try:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        pytest.skip("no passwd entry for this uid: no account home for a trust-anchor dir")
+    if not (os.path.isdir(home) and os.access(home, os.W_OK)):
+        pytest.skip(f"account home {home!r} is not a writable directory: no place for a trust-anchor dir")
+    return home
 
 
 @functools.cache
