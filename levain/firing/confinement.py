@@ -926,8 +926,10 @@ def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
                 if not retried:
                     try:
                         again_st = os.lstat(path) if parent_fd is None else os.lstat(name, dir_fd=parent_fd)
-                    except OSError:
+                    except (FileNotFoundError, NotADirectoryError):
                         again_st = None  # confirm_gone re-reads and settles it
+                    except OSError as exc:
+                        refuse(path, f"an entry that cannot be inspected ({exc})", exc)
                     if again_st is not None and stat.S_ISDIR(again_st.st_mode):
                         again = open_directory(
                             path, "a protected directory that cannot be walked", parent_fd, name)

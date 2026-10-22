@@ -82,3 +82,27 @@ def test_walk_still_denies_the_target_of_a_deep_outward_symlink(synthetic_home) 
     # The outward target is itself walked: a link inside it is followed in turn.
     assert Path(os.path.realpath(farther)) in files
     assert Path(os.path.realpath(outside)) / "inner" / "next.json" in pins
+
+
+def test_retry_reread_that_cannot_inspect_the_name_refuses_the_floor(synthetic_home, monkeypatch) -> None:
+    # Reproduced before the fix: the replacement retry turned an EACCES re-read into absence, and a
+    # later ENOENT re-read let the floor build over an entry it had failed to inspect.
+    home, workspace, _ = synthetic_home
+    (home / ".claude" / "projects" / "sub").mkdir(parents=True)
+    real_lstat = os.lstat
+    replies = iter([
+        FileNotFoundError(2, "gone", "sub"),     # post-listing re-read: the name moved away
+        PermissionError(13, "denied", "sub"),    # replacement retry: the name cannot be inspected
+        FileNotFoundError(2, "gone", "sub"),     # the settle re-read: absent again
+    ])
+
+    def lstat(path, *, dir_fd=None, **kwargs):
+        if dir_fd is not None and path == "sub":
+            reply = next(replies, None)
+            if reply is not None:
+                raise reply
+        return real_lstat(path, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(conf.os, "lstat", lstat)
+    with pytest.raises(conf.ConfinementError, match="cannot be inspected"):
+        conf._persistence_agent_paths(home, workspace)
