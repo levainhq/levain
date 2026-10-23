@@ -15,7 +15,7 @@
 3. ``adopt-open <session>`` ("waiting on a running import" is printed first: root's adopt-lock wait is bounded,
    §4.7); its answer checked against the alloc's base. ``adopt-nothing-new`` copies the report and shows it
    (:func:`render_report_only`). Every helper call runs within :func:`helper_timeout` of its verb, in its own
-   process group, and every answer's ``warnings`` are printed (:func:`show_warnings`).
+   bounded wait (:func:`_run`), and every answer's ``warnings`` are printed (:func:`show_warnings`).
 4. The private copies (§6 setup): a 0700 dir under ``$TMPDIR``; the published ``bundle`` and ``report.json``, then
    (after ``adopt-verify``) ``verify/verified.json``, ``verify/q.idx`` and ``verify/preview.txt``, each opened under
    the export dir's fd (``O_DIRECTORY|O_NOFOLLOW``, then ``O_NOFOLLOW|O_NONBLOCK``), regular, owner root, nlink 1,
@@ -47,7 +47,6 @@ import errno
 import hashlib
 import os
 import shutil
-import signal
 import stat
 import subprocess
 import sys
@@ -95,49 +94,48 @@ def _errno_name(e: OSError) -> str:
 
 def _run(argv: Sequence[str], *, env: Mapping[str, str], timeout: float, stdin: object = subprocess.DEVNULL,
          cwd: Optional[str] = None, **kw: object) -> "subprocess.CompletedProcess[bytes]":
-    """Every child this module starts: ``env`` is required (the spawn scan, ``tests/test_launch.py``). The child
-    leads its own session (process group), and past ``timeout`` the WHOLE group gets SIGTERM, then after
-    :data:`KILL_GRACE_S` SIGKILL, then ``TimeoutExpired`` is raised: a timeout never leaves a descendant running
-    beside the CLI. (``sudo`` relays a SIGTERM from its invoking user to the root helper; a SIGKILL it cannot relay,
-    hence the TERM first [judged by adopt-s4a-fix1, 10-23, against sudo(8)'s signal relay; not run under a real
-    sudo here].)"""
+    """Every child this module starts: ``env`` is required (the spawn scan, ``tests/test_launch.py``). The child stays
+    in the operator's session and tty (a ``requiretty`` / ``tty_tickets`` sudoers policy that works from his shell
+    works here). Every wait is bounded: past ``timeout`` the DIRECT child gets SIGTERM (``sudo`` relays it to the
+    root helper), the CLI closes its pipe ends, waits at most :data:`STOP_GRACE_S` for the child, and then
+    ``TimeoutExpired`` is raised whether or not it exited. The CLI does not own root's processes: root's own wall
+    reaps its sealed child (``runtime_helper.verify_wall_s``; ``export_run``'s ``importer-failed:time`` /
+    ``verifier-failed:*``) [judged by adopt-s4a-fix2, 10-23, against sudo(8)'s signal relay; not run under a real
+    sudo here]."""
     stdout = kw.pop("stdout", subprocess.PIPE)
     stderr = kw.pop("stderr", subprocess.PIPE)
     if kw.pop("capture_output", False):
         stdout = stderr = subprocess.PIPE
     if kw:
         raise TypeError(f"_run: {sorted(kw)}")
-    p = subprocess.Popen(list(argv), env=dict(env), stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd,
-                         start_new_session=True)
+    p = subprocess.Popen(list(argv), env=dict(env), stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd)
     try:
         out, err = p.communicate(timeout=timeout)
-    except BaseException:           # the timeout, and an interrupt: the group never outlives this call
-        _kill_group(p)
+    except BaseException:           # the timeout, and an interrupt: stop waiting, bounded
+        _stop(p)
         raise
     return subprocess.CompletedProcess(p.args, p.returncode, out, err)
 
 
-#: After a timeout's SIGTERM to the child's group, how long it gets before SIGKILL [judged by adopt-s4a-fix1, 10-23,
-#: against the helper's own cleanup being fd closes and a lock release].
-KILL_GRACE_S = 10.0
+#: After a timeout's SIGTERM to the direct child, how long the CLI waits for it before it stops waiting
+#: [judged by adopt-s4a-fix2, 10-23, against the helper's own cleanup being fd closes and a lock release].
+STOP_GRACE_S = 10.0
 
 
-def _kill_group(p: "subprocess.Popen[bytes]") -> None:
-    for sig, wait in ((signal.SIGTERM, KILL_GRACE_S), (signal.SIGKILL, None)):
-        try:
-            os.killpg(p.pid, sig)
-        except ProcessLookupError:
-            break
-        except PermissionError:     # nothing in the group is ours to signal (every member already gone or root's)
-            pass
-        try:
-            p.communicate(timeout=wait)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+def _stop(p: "subprocess.Popen[bytes]") -> None:
     try:
-        p.wait(timeout=KILL_GRACE_S)
-    except subprocess.TimeoutExpired:   # a child we may not signal: named by the caller's helper-timeout, never waited on
+        p.terminate()
+    except OSError:                 # already reaped, or not ours to signal: either way not waited on
+        pass
+    for f in (p.stdin, p.stdout, p.stderr):
+        if f is not None:
+            try:
+                f.close()
+            except OSError:
+                pass
+    try:
+        p.wait(timeout=STOP_GRACE_S)
+    except subprocess.TimeoutExpired:   # a child that ignored TERM: named by the caller's helper-timeout, never waited on
         pass
 
 
@@ -204,7 +202,8 @@ def call_helper(seams: Seams, *args: str, err: IO[str], timeout: Optional[float]
         p = seams.spawn(argv, env=child_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE, timeout=wall)
     except subprocess.TimeoutExpired:
-        raise Refused("helper-timeout", f"{args[0]} ran past {wall:.0f} s") from None
+        raise Refused("helper-timeout", f"{args[0]} ran past {wall:.0f} s; the CLI stopped waiting, and root's own "
+                                        "wall reaps its sealed child") from None
     except OSError as e:
         raise Refused("helper-unrunnable", f"{args[0]}: {e.strerror or e}") from None
     for line in (p.stderr or b"").splitlines()[-5:]:
@@ -228,7 +227,10 @@ def show_warnings(ans: Mapping[str, object], verb: str, err: IO[str]) -> List[st
     if not isinstance(w, list) or len(w) > WARNINGS_MAX or any(
             not isinstance(x, str) or len(x) > WARNING_CHARS for x in w):
         raise Refused("adopt-answer-malformed", f"{verb}: warnings")
-    shown = [adopt_preview.escape(x.encode("utf-8", "surrogateescape")) for x in w]
+    try:
+        shown = [adopt_preview.escape(x.encode("utf-8", "surrogateescape")) for x in w]
+    except UnicodeEncodeError:      # a lone surrogate outside surrogateescape's U+DC80-DCFF
+        raise Refused("adopt-answer-malformed", f"{verb}: warnings") from None
     for x in shown:
         err.write(f"WARNING ({verb}): {x}\n")
     if shown:
@@ -308,7 +310,8 @@ def check_repo(seams: Seams, repo: Path, base: Mapping[str, object]) -> Path:
     r = _git(seams, repo, "rev-parse", "--show-object-format")
     fmt = (r.stdout or b"").decode("ascii", "replace").strip()
     if r.returncode != 0 or fmt not in bundlefmt.OID_HEX:
-        raise Refused(f"repo-unreadable:{r.returncode}", f"git rev-parse --show-object-format: {_stderr(r)}")
+        raise Refused(f"repo-unreadable:{r.returncode}", "git rev-parse --show-object-format (needs git >= 2.38): "
+                                                         f"{_stderr(r)}")
     if fmt != base["object_format"]:
         raise Refused("object-format-mismatch", f"his repository is {adopt_preview.escape(fmt.encode())}, the "
                                                 f"session's base is {base['object_format']}")
@@ -652,7 +655,7 @@ def main(argv: Sequence[str], *, seams: Optional[Seams] = None, out: Optional[IO
         return 1
 
 
-__all__ = ["EXPORT_CLASS", "HELPER_SLACK_S", "KILL_GRACE_S", "PRESENCE_REGEXP", "PRIVATE_MARGIN", "PROMISOR_REGEXP",
-           "REPO_GIT_TIMEOUT", "RESULTS", "STORE_VERBS", "Seams", "TAKES", "VERBS", "adopt", "bundle_space",
+__all__ = ["EXPORT_CLASS", "HELPER_SLACK_S", "PRESENCE_REGEXP", "PRIVATE_MARGIN", "PROMISOR_REGEXP",
+           "REPO_GIT_TIMEOUT", "RESULTS", "STOP_GRACE_S", "STORE_VERBS", "Seams", "TAKES", "VERBS", "adopt", "bundle_space",
            "call_helper", "check_base", "check_repo", "copy_private", "helper_timeout", "main", "open_dir",
            "open_published", "private_dir", "render", "render_report_only", "show_warnings", "store_verb"]

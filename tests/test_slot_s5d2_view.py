@@ -7,6 +7,7 @@ import io
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -112,22 +113,69 @@ def test_verify_wall_derives_from_the_helpers_bounds() -> None:
     assert AVW.helper_timeout("adopt-open") == RH.AdoptSeams().lock_wait_s + RH.RESULT_GRACE_S + AVW.HELPER_SLACK_S
 
 
-def test_timeout_kills_the_whole_group(tmp_path: Path) -> None:
-    # codex HIGH 2: a grandchild outlived the pre-fix subprocess.run timeout (row H2).
-    pidf = tmp_path / "pid"
-    with pytest.raises(subprocess.TimeoutExpired):
-        AVW._run(["/bin/sh", "-c", 'sleep 300 & echo $! > "$0"; wait', str(pidf)], env={"PATH": "/bin:/usr/bin"},
-                 timeout=1.0)
-    pid = int(pidf.read_text())
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
+HOLDER = """import os, sys, time
+os.setsid()                                  # out of the helper's group: no group signal reaches it
+open(sys.argv[1], "w").write(str(os.getpid()))
+time.sleep(60)                               # and it holds the helper's stdout and stderr
+"""
+
+
+def test_timeout_stops_waiting_on_a_pipe_holder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # L3 s4a r2 codex HIGH + complement LOW: on 1e3a37a5 a helper that ignores TERM with a setsid'd grandchild holding
+    # the pipe hung the CLI forever (the unbounded communicate after SIGKILL). The CLI returns within wall + grace.
+    import threading
+
+    monkeypatch.setattr(AVW, "STOP_GRACE_S", 1.0, raising=False)
+    holder = tmp_path / "holder.py"
+    holder.write_text(HOLDER)
+    gpid, hpid = tmp_path / "g.pid", tmp_path / "h.pid"
+    helper = tmp_path / "helper.sh"
+    helper.write_text(f"#!/bin/sh\ntrap '' TERM\necho $$ > '{hpid}'\n'{sys.executable}' -I '{holder}' '{gpid}' &\n"
+                      "sleep 60\n")
+    helper.chmod(0o755)
+    seams = AVW.Seams(helper=(str(helper),), store=Path("/nonexistent"), helper_timeout_s=1.0)
+    got: list = []
+
+    def call() -> None:
         try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.05)
-    os.kill(pid, 9)
-    raise AssertionError("the grandchild outlived the timeout")
+            AVW.call_helper(seams, "status", S, err=io.StringIO())
+            got.append(None)
+        except Refused as e:
+            got.append(e)
+
+    t0 = time.monotonic()
+    t = threading.Thread(target=call, daemon=True)
+    t.start()
+    t.join(20)                                  # the test's own bound: the pre-fix code never returns
+    took = time.monotonic() - t0
+    try:
+        assert got, "the CLI never stopped waiting"
+        assert got[0] is not None and got[0].name == "helper-timeout", got
+        assert "root's own wall reaps its sealed child" in got[0].detail
+        assert took < 1.0 + 1.0 + 5, took       # wall + grace + slack for the spawn
+    finally:
+        for f in (gpid, hpid):
+            try:
+                os.kill(int(f.read_text()), 9)
+            except (OSError, ValueError):
+                pass
+
+
+def test_run_stays_in_the_callers_session() -> None:
+    # L3 s4a r2 complement MED: a new session detaches the tty a requiretty / tty_tickets sudoers policy needs.
+    r = AVW._run([sys.executable, "-I", "-c", "import os; print(os.getsid(0))"], env={"PATH": "/bin:/usr/bin"},
+                 timeout=30)
+    assert int(r.stdout) == os.getsid(0)
+
+
+def test_object_format_needs_git_238(tmp_path: Path) -> None:
+    # L3 s4a r2 complement LOW: a git before 2.38 has no --show-object-format; the refusal names the requirement.
+    (tmp_path / ".git").mkdir()
+    seams, _ = _seams({("config", "--local"): (1, b"", b""),
+                       ("rev-parse", "--show-object-format"): (129, b"", b"error: unknown option\n")})
+    with pytest.raises(Refused) as e:
+        AVW.check_repo(seams, tmp_path, BASE)
+    assert e.value.name == "repo-unreadable:129" and "needs git >= 2.38" in e.value.detail
 
 
 def test_copy_private_unlinks_a_bad_copy(tmp_path: Path) -> None:
@@ -150,4 +198,7 @@ def test_warnings_shown_escaped_and_typed() -> None:
     assert err.getvalue() == "WARNING (adopt-verify): fsync \\u001b[31m\n"
     with pytest.raises(Refused) as e:
         AVW.show_warnings({"warnings": [7]}, "adopt-open", io.StringIO())
+    assert e.value.name == "adopt-answer-malformed"
+    with pytest.raises(Refused) as e:      # L3 s4a r2 complement LOW: a lone surrogate outside surrogateescape's range
+        AVW.show_warnings({"warnings": ["\ud800"]}, "adopt-open", io.StringIO())
     assert e.value.name == "adopt-answer-malformed"
