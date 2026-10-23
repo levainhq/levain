@@ -76,7 +76,8 @@ The rules, each a refusal before anything is signed:
     challenge, or that expired, is refused, checked again after the signature verifies and just before the result
     is written (the verify runs outside the lock, so a file changed or expired during it is refused too);
   - the signature passes the same checks as a consent answer's: user verification and a page whose origin is
-    exactly ``https://<rp id>``, or on ``localhost`` exactly the phone port's own ``http://localhost:<port>``
+    exactly ``https://<rp id>``, or exactly the Signer's ``page_origin`` when one is set (the phone port's own
+    ``http://localhost:<port>`` on ``localhost``; the https name and port a cockpit is served on)
     (:func:`levain.consent.passkey.answer_signature_problem`), then ``ssh-keygen`` in the request's namespace
     (:func:`levain.authority.verify_link_sig`).
 
@@ -90,8 +91,11 @@ Nothing here touches the consent queue's database or the authority log: the file
 
 Known edges:
 
-  - two phone servers on one queue dir can race a deny against a sign (the lock is per process): one server per
-    queue is the supported shape;
+  - two Signers on one queue dir (the phone port's, and the one a cockpit is given as
+    :func:`levain.web_server.make_server`'s ``signer``) may each challenge
+    one request; the last check and the writes of an answer or a deny run under an ``flock`` on ``sign/.lock``
+    held across processes, so the first decision wins whole and the other is refused (409), and a ``.sig`` always
+    belongs to the ``.signed.json`` beside it;
   - identical messages in one namespace share a challenge and so a signature: the caller embeds a unique id (a
     report id, a period) in the message, and its verifier checks it. A choice is no exception: "release 1.0?" with
     "(a): yes" signed once verifies on every later request with the same message;
@@ -106,6 +110,7 @@ Known edges:
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -114,17 +119,18 @@ import secrets
 import stat
 import threading
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 from levain import unshowable
 
-__all__ = ["CHOICE_FORMAT", "CHOICE_MARK", "LIST_MAX", "MESSAGE_MAX", "OPTIONS_MAX", "REFUSED_NAMESPACES",
-           "REQUEST_FORMAT", "SIGN_DIR", "WRITE_IN_KEY", "SignRefused", "SignRequest", "Signer", "choice_line",
-           "deep_link", "namespace_problem", "parse_choice", "read_request", "sign_dir", "signed_bytes", "state_of",
-           "write_in_problem"]
+__all__ = ["CHOICE_FORMAT", "CHOICE_MARK", "ERROR_WORDS", "LIST_MAX", "LOCK_WAIT_S", "MESSAGE_MAX", "OPTIONS_MAX",
+           "REFUSED_NAMESPACES", "REQUEST_FORMAT", "SIGN_DIR", "WRITE_IN_KEY", "SignRefused", "SignRequest", "Signer",
+           "choice_line", "deep_link", "error_word", "namespace_problem", "parse_choice", "passkey_key_source",
+           "read_request", "request_id_ok", "sign_dir", "sign_root", "signed_bytes", "state_of", "write_in_problem"]
 
 REQUEST_FORMAT = "levain-sign-request/1"
 CHOICE_FORMAT = "levain-sign-choice/1"
@@ -145,6 +151,15 @@ _OPTION_KEY = re.compile(r"[a-z0-9]{1,8}")
 WRITE_IN_KEY = "*"                 # the key a write-in signs under: never an option key, which is [a-z0-9]{1,8}
 # ssh's conventional namespaces: git's commit signing (levain's team ledger verifies in it), file and email
 REFUSED_NAMESPACES = frozenset({"git", "file", "email"})
+# how long an answer or a deny waits for the queue lock another Signer holds (its writes take milliseconds), then a 503
+LOCK_WAIT_S = 5.0
+_LOCK_POLL_S = 0.02
+
+
+def request_id_ok(request_id: object) -> bool:
+    """True iff ``request_id`` is a sign request id (what a request file is named by, and a cockpit row's `sign` facet
+    carries)."""
+    return isinstance(request_id, str) and _ID.fullmatch(request_id) is not None
 
 
 class SignRefused(Exception):
@@ -154,6 +169,57 @@ class SignRefused(Exception):
     def __init__(self, message: str, status: int = 422) -> None:
         super().__init__(message)
         self.status = status
+
+
+# the error word a port answers a SignRefused with, by its status; any other status is "sign_refused". ONE table: the
+# phone port (levain.phone_server) and the cockpit (levain.web_server) both import it, so the two cannot drift
+ERROR_WORDS = {400: "bad_request", 404: "not_found", 409: "conflict", 503: "unavailable"}
+
+
+def error_word(status: int) -> str:
+    """The error word for a :class:`SignRefused` of ``status`` (:data:`ERROR_WORDS`, else ``sign_refused``)."""
+    return ERROR_WORDS.get(status, "sign_refused")
+
+
+def sign_root(queue_dir: Path) -> Path:
+    """The ONE cockpit the queue's consent hooks name, whose passkeys sign a sign request or a dispatch job.
+    SignRefused (503) when no hook names one, or when they name several (which passkeys sign is then not one
+    answer)."""
+    from levain.consent.answering import hook_roots
+
+    roots = hook_roots(queue_dir)
+    if not roots:
+        raise SignRefused("no consent hook names a cockpit, so no passkey can sign here: this queue dir names no "
+                          "cockpit: write claude_code.json with cockpit_data_root", 503)
+    if len(roots) > 1:
+        raise SignRefused("the consent hooks name more than one cockpit, so which passkeys sign is not one "
+                          "answer: nothing is signed", 503)
+    return roots[0]
+
+
+def passkey_key_source(queue_dir: Path, rp_id: str, *, cache: Any = None) -> "Callable[[], dict[str, Any]]":
+    """What may sign a sign request, as the ``keys`` a :class:`Signer` takes: a callable returning the active passkey
+    keys (fingerprint -> :class:`levain.authority.AuthorityKey`) enrolled on ``rp_id`` in :func:`sign_root`'s
+    cockpit, re-read on every call (the hooks and the authority log both, never a snapshot). A laptop key never
+    signs. SignRefused (503) when no single cockpit is named or its keys cannot be read now. ``cache`` is a
+    :class:`levain.authority.ReplayCache` shared with the caller's other replays; None keeps one for this source."""
+    import sqlite3
+
+    from levain.authority import AuthorityError, ReplayCache, anchor_path
+    from levain.consent.answering import passkey_keys
+    from levain.consent.queue import authority_source
+
+    replay = ReplayCache() if cache is None else cache
+
+    def keys() -> "dict[str, Any]":
+        root = sign_root(queue_dir)
+        try:
+            source = authority_source(root / "cockpit.db", anchor=anchor_path(root), cache=replay)
+            return {k.fingerprint: k for k in passkey_keys(source(), rp_id)}
+        except (AuthorityError, OSError, sqlite3.Error) as exc:
+            raise SignRefused(f"the cockpit's keys cannot be read now: {exc}", 503) from None
+
+    return keys
 
 
 def namespace_problem(namespace: object) -> str | None:
@@ -489,6 +555,38 @@ def _publish(write: Any, path: Path, text: str, exists: str) -> None:
         raise SignRefused(f"could not write {path}: [Errno {exc.errno}] {exc.strerror or exc}", 503) from None
 
 
+@contextmanager
+def _queue_lock(queue_dir: Path) -> Iterator[None]:
+    """An exclusive ``flock`` on ``<queue_dir>/sign/.lock`` around the last check and the writes of an answer or a
+    deny, held across every Signer on the queue in any process (a Signer's own lock orders only its own threads).
+    A fresh open per acquisition, so two Signers in one process contend too; closing the descriptor releases it. A
+    sign directory that cannot hold the lock (flock's own OSError: ENOLCK, ENOTSUP) is a 503, never an unlocked
+    write, and so is a lock another holder keeps past :data:`LOCK_WAIT_S`; the descriptor is closed on every path."""
+    import time
+
+    path = sign_dir(queue_dir) / ".lock"
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as exc:
+        raise SignRefused(f"could not lock {path}: [Errno {exc.errno}] {exc.strerror or exc}", 503) from None
+    try:
+        deadline = time.monotonic() + LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise SignRefused(f"could not lock {path}: another signer has held it past {LOCK_WAIT_S:g}s; "
+                                      "nothing was written, try again", 503) from None
+                time.sleep(_LOCK_POLL_S)
+            except OSError as exc:
+                raise SignRefused(f"could not lock {path}: [Errno {exc.errno}] {exc.strerror or exc}", 503) from None
+        yield
+    finally:
+        os.close(fd)
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -496,8 +594,10 @@ def _now() -> datetime:
 class Signer:
     """The phone port's sign side over the queue at ``queue_dir``: lists, challenges, verifies and records. ``keys()``
     returns the active passkey keys that may sign (fingerprint -> :class:`levain.authority.AuthorityKey`), or raises
-    :class:`SignRefused` saying why there are none to ask. ``page_origin`` is the phone port's own origin when its
-    name is ``localhost`` (a passkey's page must be exactly it), else None."""
+    :class:`SignRefused` saying why there are none to ask. ``page_origin`` is the page a passkey's assertion must
+    come from exactly, set by the caller: the phone port's own origin when its name is ``localhost`` (else None,
+    which holds the page to ``https://<rp_id>``), or the https name and port a cockpit serves the ceremony on
+    (:func:`levain.web_server.make_server` refuses a missing or malformed one)."""
 
     def __init__(self, queue_dir: Path, namespaces: "tuple[str, ...]", rp_id: str, keys: Any) -> None:
         for ns in namespaces:
@@ -532,6 +632,11 @@ class Signer:
         if request.refused is not None:
             raise SignRefused(f"sign request {request_id} is refused: {request.refused}")
         return request
+
+    def signers(self) -> list[str]:
+        """The fingerprints of the active passkeys that may sign here (what a listing names as its signers), or
+        :class:`SignRefused` saying why there are none to ask."""
+        return list(self._keys())
 
     def listing(self, signers: "list[str]") -> list[dict[str, Any]]:
         """The rows of :meth:`page`."""
@@ -674,8 +779,10 @@ class Signer:
             raise SignRefused(f"the signature could not be verified now: {exc}", 503) from None
         if not ok:
             raise SignRefused("the passkey's signature does not verify over this message")
-        with self._lock:
-            # what was verified is what is still there: the same challenge, the same bytes, open and unexpired now
+        with self._lock, _queue_lock(self.queue_dir):
+            # what was verified is what is still there: the same challenge, the same bytes, open and unexpired now,
+            # with every other Signer on the queue held off until both files are written (a .sig always belongs to
+            # the .signed.json beside it)
             if self._challenged.get(request_id) != bound:
                 raise SignRefused(f"sign request {request_id} was answered or re-challenged meanwhile: nothing was "
                                   "signed", 409)
@@ -703,7 +810,9 @@ class Signer:
 
         if not isinstance(req, dict) or set(req) != {"request_sha256"} or not isinstance(req["request_sha256"], str):
             raise SignRefused("request keys must be ['request_sha256']", 400)
-        with self._lock:
+        if not self._ours(read_request(self.queue_dir, request_id)):
+            raise SignRefused("no such sign request", 404)
+        with self._lock, _queue_lock(self.queue_dir):      # what any Signer on the queue decided last is seen here
             request = read_request(self.queue_dir, request_id)
             if not self._ours(request):
                 raise SignRefused("no such sign request", 404)

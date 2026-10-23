@@ -52,6 +52,13 @@ def _is_str_list(v: Any) -> bool:
     return isinstance(v, list) and all(isinstance(x, str) for x in v)
 
 
+def _is_sign_facet(v: Any) -> bool:
+    """``{"request": <id>}`` and nothing else, the id as :mod:`levain.consent.sign` accepts one."""
+    from levain.consent.sign import request_id_ok
+
+    return isinstance(v, dict) and set(v) == {"request"} and request_id_ok(v["request"])
+
+
 # name -> (type label, validator). The type label is documentation the diff script can print.
 FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "disposition": ("enum", _enum("loop", "seed", "handoff", "agenda", "note")),
@@ -117,6 +124,8 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "note_n": ("int", _is_int),
     "note_state": ("enum", _enum("open", "dismissed")),
     "note_open_total": ("int", _is_int),   # how many notes are open in all (a listing shows a page of them)
+    # DESIGN_SIGN D5: a question or note a caller filed a levain sign request for; an id, never the request's words
+    "sign": ("object {request: id}", _is_sign_facet),
     "session_view": ("object", lambda v: isinstance(v, dict)),   # K7: what the Build tab's session row draws (the provider's own measures, no full cwd)
     "session_activity": ("enum", _enum("active", "quiet")),   # Q7a: how recently a session's hook last fired (the provider's measure)
 }
