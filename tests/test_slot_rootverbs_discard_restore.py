@@ -20,7 +20,7 @@ from levain.slot.ids import SlotId
 
 S = "s-" + "9d" * 8
 OTHER = "s-" + "9e" * 8
-UID = os.getuid()
+UID = os.getuid() if os.getuid() != 0 else 501      # the file passes as root too (as the runtime-helper tests do)
 DISPATCH_UID = UID + 1
 STRANGER_UID = UID + 2
 
@@ -30,9 +30,12 @@ class Control:
 
     def __init__(self, L: Path) -> None:
         self.L, self.calls = L, []
+        self.fail: list = []                       # Refused to raise on the next call(s), before the record moves
 
     def call(self, op, **f):
         self.calls.append((op, f["from"], f["to"]))
+        if self.fail:
+            raise self.fail.pop(0)
         p = self.L / "sessions" / f"{f['session']}.json"
         rec = R.parse_state(p.read_bytes())
         if op != "CAS" or rec.state != f["from"] or rec.generation != f["generation"]:
@@ -75,6 +78,7 @@ class World:
     def main(self, verb: str, uid: int = UID, s: str = S):
         out, err = io.StringIO(), io.StringIO()
         rc = RH.main([verb, s], stdin=b"", env={"SUDO_UID": str(uid)}, seams=self.seams, out=out, err=err)
+        self.err = err.getvalue()
         return rc, canon.parse(out.getvalue().strip().encode())
 
     def where(self, s: str = S):
@@ -125,3 +129,19 @@ def test_a_held_session_lock_refuses_session_busy(world, verb):
     finally:
         os.close(fd)
     assert world.where() == before
+
+
+def test_an_interrupted_discard_is_refused_incomplete_naming_its_cause_and_a_rerun_finishes_the_journal(world):
+    # The rename, stamp and commit ran; CONTROL's CAS then failed: the journal stays and the record still says RETAINED.
+    world.control.fail = [Refused("from-mismatch", "raced")]
+    assert world.main("discard") == (RH.EXIT_REFUSED, {"ok": False, "refused": "discard-incomplete:commit.from-mismatch"})
+    assert "raced" in world.err
+    assert world.where() == (R.RETAINED, ["trash"]) and (world.L / "alloc" / f"{S}.intent.json").exists()
+    assert world.main("discard") == (RH.EXIT_OK, {"ok": True, "state": R.TRASH})
+    assert world.where() == (R.TRASH, ["trash"]) and not (world.L / "alloc" / f"{S}.intent.json").exists()
+
+
+def test_a_cause_name_the_wire_grammar_cannot_carry_stays_in_the_detail(world):
+    world.control.fail = [Refused("no-baseline:e3", "gone")]            # a second ":" is not a name on the wire
+    assert world.main("discard") == (RH.EXIT_REFUSED, {"ok": False, "refused": "discard-incomplete:commit"})
+    assert "gone" in world.err

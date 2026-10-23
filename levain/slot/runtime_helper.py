@@ -50,6 +50,7 @@ from levain.slot import stage as ST
 from levain.slot import verify_caps as VC
 from levain.slot.end import V5_FLOOR_BYTES
 from levain.slot.grammar import SESSION_RE
+from levain.slot.runtime_grammar import _NAME_RE as _WIRE_NAME_RE
 from levain.slot.ids import SlotId, in_own_range
 from levain.slot.layout import BASE_ROUTES_FORMAT, RUN, STORE
 from levain.slot.runtime_grammar import (DISPATCH, OPERATOR, VENDORS, PrepareInput, RenderBlob, RuntimeRequest,
@@ -2906,7 +2907,13 @@ def _store_verb(ctx: Ctx, req: RuntimeRequest, verb: Callable[..., str]) -> Dict
     try:
         state = verb(SV.facts_from_alloc(a, ctx.seams.L), seams)
     except PhaseFailed as e:
-        raise Refused(f"{req.verb}-incomplete:{e.phase}", str(e.cause)) from None
+        name = f"{req.verb}-incomplete:{e.phase}"
+        cause = e.cause.name if isinstance(e.cause, Refused) and isinstance(e.cause.name, str) else ""
+        # A cause that is itself a named refusal rides the name when the wire grammar passes it
+        # (``<verb>-incomplete:<phase>.<cause>``; its own ``:qualifier`` cannot, so that one stays in the detail).
+        if cause and _WIRE_NAME_RE.fullmatch(f"{name}.{cause}") and len(name) + 1 + len(cause) <= 64:
+            name = f"{name}.{cause}"
+        raise Refused(name, str(e.cause)) from None
     return {"state": state}
 
 
