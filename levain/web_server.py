@@ -93,7 +93,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 from levain.cockpit.broker import Broker, BrokerError
 from levain.cockpit.anneal_effects import (
@@ -116,7 +116,7 @@ from levain.cockpit.verbs import (SERVED_VERBS_NAME, VerbRegistry, VerbSpec, Ver
 
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
-from levain.http_guards import GuardedHandler
+from levain.http_guards import _WRITE_SEC_FETCH_ALLOWED as _SAME_ORIGIN, GuardedHandler
 from levain.http_guards import host_header_allowed  # noqa: F401 — kept importable from its pre-2026-10-03 home
 from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
@@ -124,6 +124,9 @@ from levain.writes import (
     ActionVerb,
     EditError,
 )
+
+if TYPE_CHECKING:
+    from levain.consent.sign import Signer
 
 # The one write route of the shared cockpit (design §4.1). ``/edit`` and ``/action`` are its aliases:
 # all three end in ``levain.cockpit.verbs.dispatch``.
@@ -171,6 +174,53 @@ def _pending_route(route: str) -> "tuple[str, str] | None":
 
 def _is_write_route(route: str) -> bool:
     return route in _WRITE_ROUTES or _pending_route(route) is not None
+
+
+# levain's sign-request ceremony hosted by the cockpit (DESIGN_SIGN D4): GET /cockpit/sign.json lists the requests and
+# POST /cockpit/sign/<id>/{challenge,answer,deny} runs the caller's levain.consent.sign.Signer, each behind the write
+# gate (a surface token on every bind, the Host allowlist, same-origin only, the request gate). Served only when
+# make_server was given a Signer: without one every path here is 404.
+_SIGN_LIST_PATH = "/cockpit/sign.json"
+_SIGN_PREFIX = "/cockpit/sign/"
+_SIGN_ACTIONS = ("challenge", "answer", "deny")
+_SIGN_ERRORS = {400: "bad_request", 404: "not_found", 409: "conflict", 503: "unavailable"}   # the phone port's words
+# one extra Host value (make_server extra_hosts): a DNS name or IPv4 literal, an optional trailing dot, an optional port
+_EXTRA_HOST = re.compile(r"(?P<name>(?=[^:]{1,253}(?::|\Z))[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+                         r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?)(?::(?P<port>[1-9][0-9]{0,4}))?")
+
+
+def _sign_route(route: str) -> "tuple[str, str] | None":
+    """``(request_id, action)`` for a sign route, else None. The id is passed on as it came (the Signer refuses
+    anything that is not a request id)."""
+    if not route.startswith(_SIGN_PREFIX):
+        return None
+    rid, sep, action = route[len(_SIGN_PREFIX):].partition("/")
+    if not sep or not rid or action not in _SIGN_ACTIONS:
+        return None
+    return rid, action
+
+
+def _extra_hosts(hosts: object) -> frozenset[str]:
+    """``extra_hosts`` as the Host gate compares names (:func:`levain.http_guards.host_header_allowed`: lowercase, no
+    trailing dot, no port, since the gate compares host names only, for loopback too). ValueError for anything that
+    is not ``name`` or ``name:port``: a scheme, a path, userinfo, a wildcard, an IPv6 literal, or a bare string where
+    a list belongs (its letters would each become a host)."""
+    if hosts is None:
+        return frozenset()
+    if isinstance(hosts, (str, bytes)):
+        raise ValueError("refusing extra_hosts: pass a list of host names, not one string")
+    try:
+        items = list(hosts)        # type: ignore[call-overload]
+    except TypeError:
+        raise ValueError("refusing extra_hosts: pass a list of host names") from None
+    out = set()
+    for h in items:
+        m = _EXTRA_HOST.fullmatch(h) if isinstance(h, str) else None
+        if m is None or (m["port"] is not None and int(m["port"]) > 65535):
+            raise ValueError(f"refusing extra_hosts entry {str(h)[:80]!r}: it must be a host name with at most a "
+                             "port (no scheme, path, userinfo or wildcard)")
+        out.add(m["name"].rstrip(".").lower())
+    return frozenset(out)
 
 
 class _ConsentReader:
@@ -398,10 +448,10 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/job.json",
     "/edit",
     "/action",
-    "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH,
+    "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
-_RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX)
+_RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX, _SIGN_PREFIX)
 
 
 def load_web_asset(filename: str) -> str:
@@ -716,6 +766,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # The cockpit broker (K2b): None on a read-only source; else started with the cockpit and drained
     # by server_close. It is write-disabled unless the install class is declared (design §6).
     broker: "Broker | None" = None
+    # The caller's sign-request Signer (DESIGN_SIGN D4), its page_origin pinned to the page this cockpit is served on;
+    # None serves no sign route.
+    signer: "Signer | None" = None
     # The change stream (levain.cockpit.stream): set per instance in __init__, before the socket binds,
     # because a failed bind runs server_close and that reads these.
     stream_gate: threading.BoundedSemaphore
@@ -957,6 +1010,67 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
+    def _serve_sign_list(self, *, head: bool) -> None:
+        """``GET /cockpit/sign.json``: ``{requests, signers}``, the Signer's own listing rows (sha256, options,
+        write_in, recommended) for the active passkeys that may sign, and those keys' fingerprints. Reached only
+        through ``_route`` (Host allowlist, cross-site refusal), then the write gate's other checks before the
+        directory is read: same-origin only (``Sec-Fetch-Site`` absent or ``same-origin``), a surface token on every
+        bind, the request gate. Without a signer, 404. Keys that cannot be read list no signers and say why in
+        ``note``; the rows still list, as on the phone page."""
+        from levain.consent.sign import SignRefused
+
+        signer = self.server.signer
+        hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
+        if signer is None:
+            self._send(json.dumps({"error": "not_found", "message": "no such route"}).encode("utf-8"),
+                       "application/json; charset=utf-8", status=404, head=head)
+            return
+        if self.headers.get("Sec-Fetch-Site") not in (None, _SAME_ORIGIN):
+            self._send(json.dumps({"error": "forbidden", "message": "cross-origin read refused"}).encode("utf-8"),
+                       "application/json; charset=utf-8", status=403, head=head, headers=hdrs,
+                       cache_control="private, no-store")
+            return
+        if not self._off_box_token_valid():
+            self._send(json.dumps({"error": "forbidden", "message": (
+                f"the sign requests need this page's write token, sent as {_WRITE_TOKEN_HEADER}")}).encode("utf-8"),
+                "application/json; charset=utf-8", status=403, head=head, headers=hdrs,
+                cache_control="private, no-store")
+            return
+        if not self.server.request_gate.acquire(blocking=False):
+            self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+            return
+        status: int
+        try:
+            payload: dict[str, Any]
+            try:
+                signers = signer.signers()
+                note = None
+            except SignRefused as exc:
+                signers, note = [], str(exc)
+            payload = {"requests": signer.listing(signers), "signers": signers}
+            if note is not None:
+                payload["note"] = note
+            status = 200
+        except Exception as exc:  # noqa: BLE001 - a directory that cannot be read is an answer, never a dead connection
+            status, payload = 500, _store_fault("sign request", exc)
+        finally:
+            self.server.request_gate.release()
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=hdrs, cache_control="private, no-store")
+
+    def _sign_post(self, request_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
+        """``POST /cockpit/sign/<id>/<action>``: the Signer's own reply, or its refusal as ``{error, message}``
+        with the refusal's status, in the phone port's words for it."""
+        from levain.consent.sign import SignRefused
+
+        signer = self.server.signer
+        if signer is None:     # the route is not served without one; an explicit check survives `python -O`
+            return {"error": "not_found", "message": "no such route"}, 404
+        try:
+            return getattr(signer, action)(request_id, req), 200
+        except SignRefused as exc:
+            return {"error": _SIGN_ERRORS.get(exc.status, "sign_refused"), "message": str(exc)}, exc.status
+
     def _serve_note_body(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/note/<n>.json``: one note's body (what, detail, agent, filed_at, and its dismissal if any),
         behind exactly the question body's gate. Read-only: a bad id or no such note is 404, no ``notes.db`` is made."""
@@ -1137,6 +1251,12 @@ class _Handler(GuardedHandler):
 
         # Strip any query string; route on the bare path against the allowlist.
         path = self.path.split("?", 1)[0]
+
+        # The sign listing runs the write gate's own checks (a token on every bind), stricter than the off-box gate
+        # below, so it is routed before it; without a signer it is 404 to everyone (the route's name is public).
+        if path == _SIGN_LIST_PATH:
+            self._serve_sign_list(head=head)
+            return
 
         # OFF-BOX READ GATE (spore-220): the substrate-bearing reads must carry the SAME device-held
         # token the writes do WHEN this surface is writable AND bound off-loopback — else any tailnet
@@ -1470,6 +1590,11 @@ class _Handler(GuardedHandler):
             # K2a (design §4.3): every write carries a credential on every bind, loopback included;
             # refused before a byte of the body is read
             return self._reject(403, "credential_required", "missing or invalid write token")
+        # A sign route (DESIGN_SIGN D4) needs a surface token on every bind whatever the source's write scope: its
+        # gesture is the operator's passkey, and the page that carries it must be this cockpit's own.
+        sign = _sign_route(route) if self.server.signer is not None else None
+        if sign is not None and not self._off_box_token_valid():
+            return self._reject(403, "credential_required", "missing or invalid write token")
         if (self._write_token_required() and not _is_write_route(route)
                 and not self._off_box_token_valid()):
             return self._reject(403, "forbidden", "missing or invalid write token")
@@ -1483,7 +1608,7 @@ class _Handler(GuardedHandler):
         # write_scope, and action verbs REQUIRE a write_scope (make_server enforces it), so
         # it already covers /action with no change here.
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
-        if not _is_write_route(route) and not is_chat:
+        if not _is_write_route(route) and not is_chat and sign is None:
             return self._reject(404, "not_found", "no such route")
         if is_chat and not self._chat_token_valid():   # before a byte of the body is read
             return self._reject(403, "chat_token", (
@@ -1523,6 +1648,14 @@ class _Handler(GuardedHandler):
                     self._send_json({"error": "not_found", "message": "no such route"}, 404)
                     return
                 self._send_chat(self._chat_post(route, host, req))
+                return
+            if sign is not None:
+                # the Signer's own ceremony, not the substrate's write scope: no read-only refusal applies to it
+                try:
+                    payload, status = self._sign_post(sign[0], sign[1], req)
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
                 return
             scope = self.server.levain_source.write_scope
             if scope is None:
@@ -1594,6 +1727,8 @@ def make_server(
     cockpit: "Cockpit | None" = None,
     install_class: str | None = None,
     extra_effects: "Mapping[str, DownstreamEffect] | None" = None,
+    signer: "Signer | None" = None,
+    extra_hosts: "Iterable[str] | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -1644,7 +1779,19 @@ def make_server(
       a writable source stays loopback-only;
     - an INSTALL-bearing source stays loopback-only UNCONDITIONALLY (its seed/config is
       operator-private; a token does not relax this — a different concern than spore-129).
-    Raises ``ValueError`` (before binding) on a disallowed non-loopback bind. [codex L3 MED]"""
+    Raises ``ValueError`` (before binding) on a disallowed non-loopback bind. [codex L3 MED]
+
+    ``signer`` (DESIGN_SIGN D4) is a :class:`levain.consent.sign.Signer` the cockpit page signs sign requests
+    through: ``GET /cockpit/sign.json`` and ``POST /cockpit/sign/<id>/{challenge,answer,deny}``, each behind the
+    write gate on every bind. The caller sets ``signer.page_origin`` to the page this cockpit is served on (an
+    ``https://<rp_id>[:port]``, or ``http://localhost:<port>`` on localhost), and a missing or malformed one is a
+    ``ValueError`` before binding: an assertion from any other page is refused. The kernel reads no signers file
+    and writes no trust root; the Signer's keys are the caller's.
+
+    ``extra_hosts`` names Host values the gate admits beside loopback and the bound address: the https name a
+    reverse proxy on this machine forwards (tailscale serve passes the browser's ``Host`` through, port included).
+    Each is ``name`` or ``name:port``; the gate compares names only, so a port is accepted and dropped. Anything
+    else is a ``ValueError`` before binding. It changes no bind rule and no token rule."""
     # Wildcard / public binds are refused for ANY source — a non-loopback bind is for
     # ONE specific private/mesh interface, never every interface or the internet.
     reason = _rejected_bind_host(host)
@@ -1814,6 +1961,19 @@ def make_server(
         raise ValueError(f"refusing extra_effects {stray}: each must name a verb in extra_verbs")
     Broker.check_downstream(extra_effects)
 
+    # The sign ceremony's Signer and the proxied names (DESIGN_SIGN D3, D4): refused here, pre-bind.
+    if signer is not None:
+        from levain.consent.passkey import page_origin_problem
+        from levain.consent.sign import Signer as _Signer
+
+        if not isinstance(signer, _Signer):
+            raise ValueError("refusing signer: it must be a levain.consent.sign.Signer")
+        problem = (page_origin_problem(signer.rp_id, signer.page_origin) if signer.page_origin is not None
+                   else "its page_origin is not set (the page this cockpit is served on, which the caller pins)")
+        if problem is not None:
+            raise ValueError(f"refusing signer: {problem}")
+    proxied_hosts = _extra_hosts(extra_hosts)
+
     # The async-job runtime for I/O-BOUND (``job=True``) verbs. AUTO-CREATE one when a job verb is
     # registered and the caller didn't inject its own (tests inject; production auto-creates): the
     # store lives under the write_scope's ledger_root (the same governed location as the idempotency
@@ -1859,6 +2019,7 @@ def make_server(
     httpd.extra_verbs = extra_verbs
     httpd.job_runtime = job_runtime
     httpd.chat_host = chat_host
+    httpd.signer = signer
     # The shared cockpit (levain.cockpit). A downstream passes its own (the kernel's providers plus
     # its panels); None means the kernel's default over this substrate, built on first request.
     # Its start() (refresher threads) is the caller's when it passes its own.
@@ -1957,9 +2118,9 @@ def make_server(
             + ("" if _is_install_bearing(source) else " or pass a write_token for an off-box bind")
             + "."
         )
-    # Allow the loopback names + the exact bound address (covers a 127.0.0.x bind),
+    # Allow the loopback names + the exact bound address (covers a 127.0.0.x bind) + the caller's extra_hosts,
     # normalized lowercase to match the Host check; any other Host is refused.
-    httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()}
+    httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()} | proxied_hosts
     # Bound the expensive routes (store read + writes). Cockpit GET reads wait briefly for a read-pool slot (see
     # _acquire_read_slot) and leave _RESERVED_SLOTS free; every other gated route answers 503 past the cap.
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
