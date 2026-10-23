@@ -27,7 +27,8 @@ What that means here:
   is held (a ``held_pings`` row) instead of sent; no store, no lease, a lapsed or expired lease, or any fault: the
   ping goes as before. :func:`claim_held` releases a held ping once (a ``held_ping_releases`` row): ``escalated`` when
   the coordinator escalated it, ``unread`` when it has no first read :data:`UNREAD_AFTER` after filing (that one also
-  files the escalation's ANSWER record, so it shows in "waiting on you"), ``answered`` (no ping) when the operator
+  files the escalation's ANSWER record, so it shows in "waiting on you", and its first read as ``escalated``, so the
+  coordinator's later ``coord answer`` or ``coord escalate`` on it is refused by name), ``answered`` (no ping) when the operator
   answered it meanwhile. A KNOW holds it for good: the KNOW is the review item. Nothing runs on a clock: the release is
   checked by :func:`levain.consent.band.release_held_pings`, which the gate hook (every tool call of every session
   in the store's directory), ``levain coord watch``'s pass, ``levain ask`` and ``levain coord escalate`` call.
@@ -212,6 +213,16 @@ def _read(conn: sqlite3.Connection, question_id: str) -> tuple[str, str] | None:
     return None if row is None else (row[0], row[1])
 
 
+def _already_read(q: Any, outcome: str) -> CoordError:
+    """The refusal for a question read first already: an escalation (the coordinator's, or the held ping's 10-minute
+    release) is named, since the question is the operator's from then on."""
+    if outcome == "escalated":
+        return CoordError(f"question #{q.n} was escalated to the operator (by the coordinator, or unread "
+                          f"{int(UNREAD_AFTER.total_seconds() // 60)} minutes after it was filed): it was already read first, "
+                          "and it is his now")
+    return CoordError(f"question #{q.n} was already read first ({outcome})")
+
+
 def verdict(store: Any, ref: Any, *, authority: Any = None) -> Reading:
     """The verdict for one question (its number or id), read now. Raises CoordError when there is no such question."""
     q = _questions(store.directory).get(ref)
@@ -289,7 +300,7 @@ def _answer_once(store: Any, ref: Any, option: str | None, text: str | None, tok
     with store._write("coordinator", token) as (conn, now):
         done = _read(conn, q.id)
         if done is not None:
-            raise CoordError(f"question #{q.n} was already read first ({done[0]})")
+            raise _already_read(q, done[0])
         # read again, inside the fenced transaction: the question (its answer and consent link)
         fresh = _questions(store.directory).get(q.id)
         if fresh is None:
@@ -336,7 +347,7 @@ def escalate(store: Any, ref: Any, why: str, *, token: object) -> str:
     with store._write("coordinator", token) as (conn, now):
         done = _read(conn, q.id)
         if done is not None:
-            raise CoordError(f"question #{q.n} was already read first ({done[0]})")
+            raise _already_read(q, done[0])
         # read again inside the fenced transaction: an answer the operator gave since needs no escalation
         fresh = _questions(store.directory).get(q.id)
         if fresh is None:
@@ -453,7 +464,7 @@ _DUE_SQL = ("SELECT h.question_id, h.at, f.outcome FROM held_pings h LEFT JOIN f
 def claim_held(directory: Path | str, *, after: timedelta | None = None) -> list[tuple[Any, str]]:
     """Release every held ping now due, once: ``[(question, cause)]`` for the caller to ping, cause ``escalated`` or
     ``unread`` (module docstring). An ``unread`` release also files the escalation's ANSWER record (once per question,
-    as :func:`escalate` does), in the same transaction as the release. A question the operator answered meanwhile is
+    as :func:`escalate` does) and its ``first_reads`` row (``escalated``), in the same transaction as the release. A question the operator answered meanwhile is
     released as ``answered`` and returned to nobody. Cheap when nothing waits: one read-only query."""
     from levain.cockpit.consent import parse_stamp
     from levain.coordinator import lease
@@ -489,15 +500,23 @@ def claim_held(directory: Path | str, *, after: timedelta | None = None) -> list
                 continue
             conn.execute("INSERT INTO held_ping_releases (question_id, cause, at) VALUES (?, ?, ?)",
                          (question_id, cause, now))
-            if cause == "unread" and conn.execute(
-                    "SELECT 1 FROM replies WHERE kind = 'answer' AND ref_store = 'questions.db' AND ref_id = ?",
-                    (q.id,)).fetchone() is None:
-                ln = lease.by_harness_session(conn, q.agent_session_id)
-                store._reply(conn, ln.threads[0] if ln is not None and len(ln.threads) == 1 else None, "answer",
-                             "questions.db", q.id,
-                             {"text": f"question #{q.n}: {q.what}"[:_TEXT_MAX], "by": "service",
-                              "why": f"the coordinator had not read it {int(after.total_seconds() // 60)} minutes "
-                                     "after it was filed"}, now)
+            if cause == "unread":
+                # the release IS the question's first read (an escalation), so a later ``coord answer`` or
+                # ``coord escalate`` on it is refused by name (L3 r3): the KNOW would contradict the push to him
+                same = conn.execute("SELECT reply_id FROM replies WHERE kind = 'answer' AND ref_store = 'questions.db' "
+                                    "AND ref_id = ?", (q.id,)).fetchone()
+                if same is not None:
+                    reply_id = same[0]
+                else:
+                    ln = lease.by_harness_session(conn, q.agent_session_id)
+                    reply_id = store._reply(
+                        conn, ln.threads[0] if ln is not None and len(ln.threads) == 1 else None, "answer",
+                        "questions.db", q.id,
+                        {"text": f"question #{q.n}: {q.what}"[:_TEXT_MAX], "by": "service",
+                         "why": f"the coordinator had not read it {int(after.total_seconds() // 60)} minutes "
+                                "after it was filed"}, now)
+                conn.execute("INSERT INTO first_reads (question_id, outcome, reply_id, at) "
+                             "VALUES (?, 'escalated', ?, ?)", (q.id, reply_id, now))
             if cause != "answered":
                 out.append((q, cause))
     return out

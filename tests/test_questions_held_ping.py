@@ -160,3 +160,39 @@ def test_a_store_fault_at_filing_pings_as_before(desk, monkeypatch):
     monkeypatch.setattr(fr, "_coord_store", broken)
     desk.ask()
     assert len(desk.sent) == 1
+
+
+def test_an_unread_release_is_the_first_read_and_the_coordinator_cannot_answer_it_after(desk):
+    """L3 r3 (codex MED): the 10-minute release filed the escalation's ANSWER record but no ``first_reads`` row, so a
+    later ``coord answer`` passed ``_read`` and could file a KNOW contradicting the escalation (red on 3540ae0c: no
+    row, and the refusal did not name the escalation)."""
+    tok = desk.coordinator()
+    q, _ = desk.ask()
+    desk.later(minutes=10)
+    assert band.release_held_pings(desk.dir) == [f"question #{q.n} (unread): the operator was pinged"]
+    reply = desk.rows("SELECT reply_id FROM replies WHERE kind = 'answer'")
+    assert desk.rows("SELECT question_id, outcome, reply_id FROM first_reads") == [(q.id, "escalated", reply[0][0])]
+    with pytest.raises(fr.CoordError, match=f"question #{q.n} was escalated to the operator"):
+        fr.answer(desk.store, q.id, option="a", token=tok)
+    with pytest.raises(fr.CoordError, match=f"question #{q.n} was escalated to the operator"):
+        fr.escalate(desk.store, q.id, "again", token=tok)
+    assert desk.rows("SELECT COUNT(*) FROM replies WHERE kind = 'know'") == [(0,)]
+    assert desk.rows("SELECT COUNT(*) FROM replies WHERE kind = 'answer'") == [(1,)]
+
+
+@pytest.mark.parametrize("claude", ["unavailable", "unreadable"])
+def test_a_watch_pass_releases_a_due_ping_whatever_claude_reads(desk, monkeypatch, claude):
+    """L3 r3 (codex MED): ``watch_once`` released held pings only at its bottom, after the returns for no ``claude``
+    on PATH and an unreadable session list, so in a Codex-only install a due ping stayed silent (red on 3540ae0c)."""
+    from levain.coordinator import codex_launch
+    from levain.coordinator import launch as cl
+
+    desk.coordinator()
+    q, _ = desk.ask()
+    desk.later(minutes=10)
+    monkeypatch.setattr(codex_launch, "watch_once", lambda store: [])
+    monkeypatch.setattr(cl, "_harness", lambda: (None, {}) if claude == "unavailable" else ("/x/claude", {}))
+    monkeypatch.setattr(cl, "_observed", lambda exe, env, cwd: None)
+    lines = cl.watch_once(desk.store)
+    assert f"question #{q.n} (unread): the operator was pinged" in lines
+    assert len(desk.sent) == 1
