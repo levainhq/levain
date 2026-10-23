@@ -9,12 +9,14 @@ Root runs these under ``ROOT_PYTHON`` (``/usr/bin/python3``, 3.9.6 on macOS), wh
     python tests/ci/root_closure.py tests         # the tests/test_*.py files that import only ``modules`` members
     python tests/ci/root_closure.py h11-spec      # the pip requirement for the h11 floor ``root_tree.H11_MIN`` states
     python tests/ci/root_closure.py sites         # the dynamic-execution sites found, with the module(s) each runs
+    python tests/ci/root_closure.py lazy          # the function-local imports in the closure, with their class
 
-Function-local imports are not followed: they are where code the root helpers must not reach is kept behind a call
-(``levain/slot/render.py`` imports ``levain.host_guard``, which needs 3.11 ``tomllib``, inside a function that the
-operator's process runs, never the root helper), and following them chains into the operator CLI and most of the package.
-A one-hop compile of those imports was tried and removed for that reason; root-run lazy imports are covered by the
-selected 3.9 tests and ``import-check``.
+Function-local imports are a tripwire too, classified rather than followed blind: following every one chains into the
+operator CLI and most of the package (``levain/slot/render.py`` imports ``levain.host_guard``, which needs 3.11
+``tomllib``, inside a function only the operator's process runs). ``LAZY_SITES`` lists every function-local ``levain``
+import in the closure, each ``"root"`` (a root process can run that function; its target joins the closure, to a fixed
+point) or ``"operator"`` (only the operator's interpreter does; the row's comment names the call path). When that
+cannot be shown the row is ``"root"``. ``lazy`` prints the sites found.
 
 Dynamic roots are a tripwire, not an inference: an import graph cannot see ``runpy.run_module`` / ``wall.module_argv``
 targets, so ``DYNAMIC_SITES`` classifies every such call site in ``levain/`` (found by a text scan of the same two
@@ -51,6 +53,152 @@ DYNAMIC_SITES = {
     "levain/slot/wall.py:468::argv = module_argv(host, front_module or \"\", *argv)": "@front",
     "levain/slot/wall.py:625::" 'return module_argv(host, "levain.slot.wall", "--spec-fd", str(spec_fd))': ("levain.slot.wall",),
     "levain/slot/wall.py:1449::" 'return module_argv("darwin", "levain.slot.wall", "--exec-fd", str(exec_fd), "--", *argv)': ("levain.slot.wall",),
+}
+LAZY_SITES = {
+    # operator: ``_resolve`` <- ``pick_address`` <- ``creds._post`` / ``keys`` (the broker's dial); the root credential verbs only ``commit`` / ``remove`` files
+    'levain/broker/upstream.py:183::from levain.broker.front import system_resolve': 'operator',
+    # operator: ``pick_address`` <- ``creds._post`` / ``keys`` (the broker's dial); the root credential verbs only ``commit`` / ``remove`` files
+    'levain/broker/upstream.py:190::from levain.broker.front import refused_address': 'operator',
+    # operator: ``canon.REGISTRY`` (module ``__getattr__``) has no reader in ``levain/``: ``git grep -n REGISTRY -- levain`` finds only ``contracts.leaves`` and unrelated names
+    'levain/contracts/canon.py:47::from .leaves import REGISTRY': 'operator',
+    'levain/firing/contract.py:105::from levain.firing.encoding import RECEIPT_KEY, scan_text': 'root',
+    'levain/firing/hands.py:604::from levain.slot.grammar import is_sudoers_alias   # levain.slot imports this module': 'root',
+    # operator: ``_readable_and_sanitised`` <- ``plan_undo`` <- ``cmd_setup_isolation`` <- ``cli.py`` (``levain setup-isolation``); root uses only ``hands._abs``
+    'levain/firing/hands.py:1047::from levain.firing.ws_git import CONFIG_ALLOWLIST': 'operator',
+    # operator: ``_undo_lock`` <- ``cmd_setup_isolation`` (undo path) <- ``cli.py``
+    'levain/firing/hands.py:1475::from levain.firing.ws_git import HANDS_LOCK': 'operator',
+    # operator: ``_repair_linux`` <- ``cmd_setup_isolation`` <- ``cli.py``
+    'levain/firing/hands.py:1574::from levain.firing.confinement import ConfinementError, load_confinement_config': 'operator',
+    # operator: ``cmd_setup_isolation`` <- ``cli.py`` (the one caller)
+    'levain/firing/hands.py:1615::from levain.firing.confinement import ConfinementError, load_confinement_config': 'operator',
+    # operator: ``cmd_setup_isolation`` <- ``cli.py`` (the one caller)
+    'levain/firing/hands.py:1616::from levain.firing.isolation import IsolationError, guard_entity': 'operator',
+    # operator: ``cmd_setup_isolation`` <- ``cli.py`` (the one caller)
+    'levain/firing/hands.py:1684::from levain.firing.ws_git import LIVENESS_TIMEOUT, WsGitError, entity_session_live': 'operator',
+    # operator: the console script ``levain = levain.launch:main`` (pyproject.toml): the operator's interpreter, never a root helper
+    'levain/launch.py:324::from levain.firing.confinement import sweep_floor_placeholders': 'operator',
+    # operator: the console script ``levain = levain.launch:main`` (pyproject.toml): the operator's interpreter, never a root helper
+    'levain/launch.py:329::from levain.cli import main as cli_main': 'operator',
+    'levain/slot/accounts.py:245::from levain.slot.install_helper import read_directory': 'root',
+    'levain/slot/accounts.py:246::from levain.slot.removal import ReadFailed': 'root',
+    'levain/slot/accounts.py:265::from levain.slot.removal import ABSENT, NOT_OURS, OURS': 'root',
+    'levain/slot/accounts.py:277::from levain.slot.removal import ABSENT, OURS': 'root',
+    'levain/slot/accounts.py:288::from levain.slot.removal import chain, point, remove_step': 'root',
+    'levain/slot/accounts.py:308::from levain.slot.ids import RETIRED_IDS_PATH, retire_ids_durably': 'root',
+    'levain/slot/accounts.py:309::from levain.slot.removal import ABSENT, NOT_OURS, OURS, ReadFailed, RemoveStep': 'root',
+    'levain/slot/accounts.py:346::from levain.slot.removal import ABSENT, NOT_OURS, OURS': 'root',
+    'levain/slot/accounts.py:379::from levain.slot.ids import RETIRED_IDS_PATH, retire_ids_durably': 'root',
+    'levain/slot/accounts.py:380::from levain.slot.removal import ABSENT, NOT_OURS, ReadFailed, RemoveStep, remove_step': 'root',
+    'levain/slot/bwrap.py:141::from levain.slot.removal import ReadFailed': 'root',
+    'levain/slot/bwrap.py:155::from levain.slot.removal import ABSENT, OURS, root_file': 'root',
+    'levain/slot/bwrap.py:167::from levain.slot.removal import at, chain, point, remove_step': 'root',
+    'levain/slot/bwrap.py:216::from levain.slot.removal import ABSENT, NOT_OURS, OURS, ReadFailed, root_file': 'root',
+    'levain/slot/bwrap.py:243::from levain.slot.removal import at, chain, point, remove_step': 'root',
+    'levain/slot/control.py:466::from levain.slot.control_client import V23_SECONDS   # lazy: a module-level import would be circular': 'root',
+    'levain/slot/control.py:899::from levain.slot.control_client import V23_SECONDS   # lazy: a module-level import would be circular': 'root',
+    'levain/slot/export_run.py:349::from levain.slot import store_verbs as SV': 'root',
+    'levain/slot/export_run.py:786::from levain.slot import wall': 'root',
+    'levain/slot/export_run.py:997::from levain.slot import wall': 'root',
+    'levain/slot/export_run.py:1040::from levain.slot import wall': 'root',
+    'levain/slot/export_run.py:1133::from levain.slot import proc as P': 'root',
+    'levain/slot/export_run.py:1217::from levain.slot import proc as P': 'root',
+    'levain/slot/fsck_reader.py:125::from levain.slot import adopt_verify as AV': 'root',
+    'levain/slot/fsck_reader.py:281::from levain.contracts import canon': 'root',
+    'levain/slot/generation.py:293::from levain.slot.records import write_durably': 'root',
+    'levain/slot/ids.py:247::from levain.slot.records import write_durably': 'root',
+    'levain/slot/ids.py:250::from levain.slot.generation import _full_fsync as fsync': 'root',
+    'levain/slot/install_helper.py:564::import levain': 'root',
+    'levain/slot/install_helper.py:2089::from levain.slot.intent import GROUP_RE': 'root',
+    'levain/slot/install_helper.py:2236::from levain.broker import creds as C': 'root',
+    'levain/slot/install_helper.py:2277::from levain.slot import wall': 'root',
+    'levain/slot/install_helper.py:2295::from levain.broker import creds as C': 'root',
+    'levain/slot/install_helper.py:2296::from levain.slot.stage import _close_fds_except': 'root',
+    'levain/slot/layout.py:195::from levain.contracts import canon': 'root',
+    'levain/slot/layout.py:232::from levain.contracts import canon': 'root',
+    'levain/slot/layout.py:258::from levain.contracts import canon': 'root',
+    'levain/slot/layout.py:266::from levain.contracts import canon': 'root',
+    'levain/slot/layout.py:371::from levain.slot.ids import SHARED_GROUPS': 'root',
+    'levain/slot/layout.py:404::from levain.slot.removal import root_file': 'root',
+    'levain/slot/layout.py:411::from levain.slot.removal import at, chain, point, remove_step': 'root',
+    'levain/slot/netns.py:63::from levain.slot.removal import ABSENT, OURS': 'root',
+    'levain/slot/netns.py:71::from levain.slot.removal import chain, point, remove_step': 'root',
+    'levain/slot/pf.py:298::from levain.slot.removal import ABSENT, OURS': 'root',
+    'levain/slot/pf.py:305::from levain.slot.removal import chain, point, remove_step': 'root',
+    'levain/slot/pf.py:316::from levain.slot.removal import ABSENT, OURS, root_file': 'root',
+    'levain/slot/pf.py:328::from levain.slot.removal import at, chain, point, remove_step': 'root',
+    'levain/slot/pf.py:346::from levain.slot.removal import ABSENT, NOT_OURS, root_file': 'root',
+    'levain/slot/pf.py:356::from levain.slot.removal import remove_step': 'root',
+    'levain/slot/reaper.py:610::from levain.slot.install_helper import _operator_held': 'root',
+    'levain/slot/reaper.py:899::from levain.slot.netns import netns_steps': 'root',
+    'levain/slot/removal.py:63::from levain.slot.generation import _full_fsync': 'root',
+    'levain/slot/render.py:615::from levain.slot.wall import check_profile_text, export_wall_facts': 'root',
+    # operator: ``repo_loosening_refusals`` <- ``supervisor.check_repo_layer`` <- ``supervisor`` / ``dispatch.readset``, none in the closure (host_guard needs 3.11 ``tomllib``)
+    'levain/slot/render.py:748::from levain.host_guard import _LOOSENING_NONEMPTY, _LOOSENING_TRUE': 'operator',
+    'levain/slot/render.py:848::from levain.contracts.canon import _int, _no_constant, _no_float, _no_lone_surrogate, _pairs, text_depth': 'root',
+    'levain/slot/root_tree.py:240::from levain.slot.generation import read_version_text': 'root',
+    'levain/slot/root_tree.py:285::from levain.slot.generation import generation_id': 'root',
+    'levain/slot/root_tree.py:369::from levain.slot.generation import generation_id': 'root',
+    'levain/slot/root_tree.py:394::from levain.launch import child_env': 'root',
+    'levain/slot/root_tree.py:432::from levain.slot.generation import GEN_RE': 'root',
+    'levain/slot/root_tree.py:479::from levain.slot.generation import GEN_RE': 'root',
+    'levain/slot/root_tree.py:517::from levain.launch import child_env': 'root',
+    'levain/slot/root_tree.py:621::from levain.slot.generation import generation_id': 'root',
+    'levain/slot/runtime_helper.py:196::from levain.slot.control_client import ControlClient': 'root',
+    'levain/slot/runtime_helper.py:495::from levain.slot import start as SS': 'root',
+    'levain/slot/runtime_helper.py:824::from levain.slot.install_helper import parse_operator_record': 'root',
+    'levain/slot/runtime_helper.py:1750::from levain.slot import start as SS': 'root',
+    'levain/slot/runtime_helper.py:1756::from levain.slot import start as SS': 'root',
+    'levain/slot/runtime_helper.py:1835::from levain.slot import walker as WK': 'root',
+    'levain/slot/runtime_helper.py:1910::from levain.slot import walkframe as WF': 'root',
+    'levain/slot/runtime_helper.py:1936::from levain.slot import end as E': 'root',
+    'levain/slot/runtime_helper.py:1937::from levain.slot import store_verbs as SV': 'root',
+    'levain/slot/runtime_helper.py:1938::from levain.slot import walkframe as WF': 'root',
+    'levain/slot/runtime_helper.py:2038::from levain.slot import walkframe as WF': 'root',
+    'levain/slot/runtime_helper.py:2272::from levain.slot import importer as IM': 'root',
+    'levain/slot/runtime_helper.py:2359::from levain.slot import export_run as ER': 'root',
+    'levain/slot/runtime_helper.py:2360::from levain.slot import importer as IM': 'root',
+    'levain/slot/runtime_helper.py:2361::from levain.slot import walker as WK': 'root',
+    'levain/slot/runtime_helper.py:2692::from levain.slot import adopt_verify as AV': 'root',
+    'levain/slot/runtime_helper.py:2693::from levain.slot import export_run as ER': 'root',
+    'levain/slot/runtime_helper.py:2694::from levain.slot import importer as IM': 'root',
+    'levain/slot/service_boot.py:74::from levain.slot.units import services_for': 'root',
+    'levain/slot/start.py:142::from levain.slot.layout import STORE': 'root',
+    'levain/slot/start.py:143::from levain.slot.root_tree import VENDOR_PREFIX': 'root',
+    'levain/slot/store_verbs.py:297::from levain.slot import end as E': 'root',
+    'levain/slot/sudoers.py:88::from levain.slot.removal import root_file': 'root',
+    'levain/slot/sudoers.py:98::from levain.slot.removal import RemoveStep': 'root',
+    'levain/slot/sudoers.py:114::from levain.slot.removal import OURS, ReadFailed': 'root',
+    'levain/slot/sudoers.py:141::from levain.slot.removal import at, chain, point, remove_step': 'root',
+    'levain/slot/units.py:314::from levain.slot.removal import ReadFailed': 'root',
+    'levain/slot/units.py:347::from levain.slot.removal import ABSENT, OURS, root_file': 'root',
+    'levain/slot/units.py:396::from levain.slot.removal import chain, point, remove_step': 'root',
+    'levain/slot/units.py:408::from levain.slot.removal import at, chain, point, remove_step': 'root',
+    'levain/slot/wall.py:128::from levain.slot.ids import RANGES, SINGLETONS, in_own_range': 'root',
+    'levain/slot/wall.py:160::from levain.slot.ids import RANGES': 'root',
+    'levain/slot/wall.py:226::from levain.contracts import canon': 'root',
+    'levain/slot/wall.py:286::from levain.contracts import ContractError, canon': 'root',
+    'levain/slot/wall.py:309::from levain.slot.grammar import SESSION_RE': 'root',
+    'levain/slot/wall.py:310::from levain.slot.layout import STORE': 'root',
+    'levain/slot/wall.py:324::from levain.slot.root_tree import PY_FLAGS, ROOT_PYTHON, boot_path_code': 'root',
+    'levain/slot/wall.py:349::from levain.slot.render import READSET_KINDS, READSET_TEMPLATE': 'root',
+    'levain/slot/wall.py:350::from levain.slot.runtime_grammar import KINDS': 'root',
+    'levain/slot/wall.py:419::from levain.slot.layout import IMPORT_TREE, RUN': 'root',
+    'levain/slot/wall.py:420::from levain.slot.root_tree import ROOT_PYTHON, VENDOR_PREFIX': 'root',
+    'levain/slot/wall.py:560::from levain.slot.layout import HELPER_DIR, IMPORT_TREE, STORE': 'root',
+    'levain/slot/wall.py:581::from levain.slot.layout import STORE': 'root',
+    'levain/slot/wall.py:599::from levain.slot.layout import HELPER_DIR': 'root',
+    'levain/slot/wall.py:676::from levain.firing.hands import _abs': 'root',
+    'levain/slot/wall.py:677::from levain.launch import child_env': 'root',
+    'levain/slot/wall.py:713::from levain.slot.layout import IMPORT_TREE, RUN': 'root',
+    'levain/slot/wall.py:714::from levain.slot.root_tree import VENDOR_PREFIX': 'root',
+    'levain/slot/wall.py:801::from levain.slot.layout import base_run_rows, base_store_rows': 'root',
+    'levain/slot/wall.py:848::from levain.slot.bwrap import LEVAIN_BWRAP': 'root',
+    'levain/slot/wall.py:873::from levain.slot.bwrap import LEVAIN_BWRAP': 'root',
+    'levain/slot/wall.py:986::from levain.slot.pf import anchor_rules': 'root',
+    'levain/slot/wall.py:994::from levain.slot.ids import loopback_alias': 'root',
+    'levain/slot/wall.py:1019::from levain.launch import child_env': 'root',
+    'levain/slot/wall.py:1031::from levain.slot.pf import ANCHOR, IFCONFIG, PFCTL': 'root',
+    'levain/slot/wall.py:1467::from levain.slot.keyring_join import join_session_keyring, real_keyctl': 'root',
 }
 _NEEDLES = ("run_module(", "module_argv(")
 
@@ -133,6 +281,24 @@ def _nodes(tree):
                 stack.append(c)
 
 
+def _import_names(node, pkg: str) -> set:
+    """The ``levain`` names an import statement names: the module, and ``module.name`` for each ``from`` name (which
+    is a module only when a file of that name exists; ``_eager`` skips the rest). ``pkg`` resolves relative imports."""
+    if isinstance(node, ast.Import):
+        names = [a.name for a in node.names]
+    elif isinstance(node, ast.ImportFrom):
+        if node.level:
+            parts = pkg.split(".")
+            base = ".".join(parts[: len(parts) - node.level + 1])
+            base = base + "." + node.module if node.module else base
+        else:
+            base = node.module or ""
+        names = [base] + [base + "." + a.name for a in node.names]
+    else:
+        return set()
+    return {n for n in names if n == PKG or n.startswith(PKG + ".")}
+
+
 def _imports(mod: str, path: Path) -> set:
     is_pkg = path.name == "__init__.py"
     pkg = mod if is_pkg else mod.rpartition(".")[0]
@@ -151,21 +317,7 @@ def _imports(mod: str, path: Path) -> set:
                 found.update(m.group(1) + "." + n.strip().split(" as ")[0] for n in m.group(2).split(",") if n.strip())
         return found
     for node in _nodes(tree):
-        if isinstance(node, ast.Import):
-            names = [a.name for a in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            if node.level:
-                parts = pkg.split(".")
-                base = ".".join(parts[: len(parts) - node.level + 1])
-                base = base + "." + node.module if node.module else base
-            else:
-                base = node.module or ""
-            names = [base] + [base + "." + a.name for a in node.names]
-        else:
-            continue
-        for n in names:
-            if n == PKG or n.startswith(PKG + "."):
-                found.add(n)
+        found.update(_import_names(node, pkg))
     return found
 
 
@@ -185,9 +337,42 @@ def _eager(roots) -> set:
     return seen
 
 
+def lazy_sites(mods) -> dict:
+    """Every function-local ``levain`` import in ``mods``: ``"<path>:<line number>::<stripped line>"`` -> the module
+    names it names. A module this interpreter cannot parse is reported on stderr and has no sites here."""
+    found = {}
+    for mod in mods:
+        path = _path(mod)
+        text = path.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(text, filename=str(path))
+        except SyntaxError:
+            print("root_closure: lazy sites not scanned (3.10+ syntax): " + mod, file=sys.stderr)
+            continue
+        is_pkg = path.name == "__init__.py"
+        pkg = mod if is_pkg else mod.rpartition(".")[0]
+        eager = {id(n) for n in _nodes(tree)}
+        lines = text.splitlines()
+        rel = path.relative_to(ROOT).as_posix()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)) and id(node) not in eager:
+                names = _import_names(node, pkg)
+                if names:
+                    found.setdefault("%s:%d::%s" % (rel, node.lineno, lines[node.lineno - 1].strip()), set()).update(names)
+    return found
+
+
 def closure() -> list:
-    """The modules the entries import at import time."""
-    return sorted(_eager(_entry_modules()))
+    """The modules the entries import at import time, plus the targets of every ``"root"`` row of ``LAZY_SITES``
+    (and what those import at import time), to a fixed point: a lazy import a root process can run is as much root
+    code as a top-level one. A site not in the table adds nothing here; the test fails it."""
+    roots = set(_entry_modules())
+    while True:
+        mods = _eager(roots)
+        grown = {n for key, names in lazy_sites(mods).items() if LAZY_SITES.get(key) == "root" for n in names} - roots
+        if not grown:
+            return sorted(mods)
+        roots |= grown
 
 
 def _levain_imports(tree) -> set:
@@ -302,8 +487,11 @@ def main(argv: list) -> int:
     elif cmd == "sites":
         for key, spec in sorted(DYNAMIC_SITES.items()):
             print("%s -> %s" % (key, ", ".join(_site_modules(spec)) or "(caller's module)"))
+    elif cmd == "lazy":
+        for key, names in sorted(lazy_sites(mods).items()):
+            print("%s -> %s [%s]" % (key, ", ".join(sorted(names)), LAZY_SITES.get(key, "UNCLASSIFIED")))
     else:
-        raise SystemExit("usage: root_closure.py modules|compile|import-check|tests|h11-spec|sites")
+        raise SystemExit("usage: root_closure.py modules|compile|import-check|tests|h11-spec|sites|lazy")
     return 0
 
 

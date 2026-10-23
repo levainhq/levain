@@ -41,3 +41,45 @@ def test_a_test_with_an_unparseable_helper_is_not_selected(tmp_path, monkeypatch
     assert rc._test_deps(tmp_path / "tests" / "test_a.py", set()) is None
     assert rc._test_files(["levain.slot.forwarder"]) == []
     assert "skipped (3.10+ syntax): tests/test_a.py" in capsys.readouterr().err
+
+
+def test_every_function_local_import_in_the_closure_is_classified():
+    """A new function-local ``levain`` import in a closure module fails here until it is a row of LAZY_SITES, ``"root"``
+    or ``"operator"``, so a lazy import a root process can run cannot be missed by the import-graph walk."""
+    found, table = sorted(rc.lazy_sites(rc.closure())), sorted(rc.LAZY_SITES)
+    assert found == table, {"unclassified": sorted(set(found) - set(table)), "stale": sorted(set(table) - set(found))}
+    assert set(rc.LAZY_SITES.values()) == {"root", "operator"}
+
+
+def _lazy_tree(tmp_path, monkeypatch, body):
+    (tmp_path / "levain" / "slot").mkdir(parents=True)
+    for d in ("levain", "levain/slot"):
+        (tmp_path / d / "__init__.py").write_text("")
+    (tmp_path / "levain" / "slot" / "forwarder.py").write_text(body)
+    (tmp_path / "levain" / "lazy_a.py").write_text("")
+    (tmp_path / "levain" / "lazy_b.py").write_text("")
+    monkeypatch.setattr(rc, "ROOT", tmp_path)
+    monkeypatch.setattr(rc, "DYNAMIC_SITES", {})
+    monkeypatch.setattr(rc, "_entry_modules", lambda: ["levain.slot.forwarder"])
+
+
+def test_a_new_lazy_import_is_unclassified_until_the_table_names_it(tmp_path, monkeypatch):
+    _lazy_tree(tmp_path, monkeypatch, "def f():\n    from levain import lazy_a\n")
+    monkeypatch.setattr(rc, "LAZY_SITES", {})
+    found = rc.lazy_sites(rc.closure())
+    key = "levain/slot/forwarder.py:2::from levain import lazy_a"
+    assert sorted(found) == [key]
+    assert sorted(set(found) - set(rc.LAZY_SITES)) == [key]  # the test above would fail on this tree
+
+
+def test_root_lazy_targets_join_the_closure_and_operator_ones_do_not(tmp_path, monkeypatch):
+    _lazy_tree(tmp_path, monkeypatch, "def f():\n    from levain import lazy_a\n\n\ndef g():\n    import levain.lazy_b\n")
+    monkeypatch.setattr(rc, "LAZY_SITES", {"levain/slot/forwarder.py:2::from levain import lazy_a": "root",
+                                           "levain/slot/forwarder.py:6::import levain.lazy_b": "operator"})
+    mods = rc.closure()
+    assert "levain.lazy_a" in mods and "levain.lazy_b" not in mods
+
+
+def test_a_module_level_import_is_not_a_lazy_site(tmp_path, monkeypatch):
+    _lazy_tree(tmp_path, monkeypatch, "from levain import lazy_a\ntry:\n    import levain.lazy_b\nexcept ImportError:\n    pass\n")
+    assert rc.lazy_sites(["levain.slot.forwarder"]) == {}
