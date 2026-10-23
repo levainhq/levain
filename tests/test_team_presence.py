@@ -593,7 +593,7 @@ def test_a_session_outside_the_coordinator_workspace_cannot_promote_a_draft_with
     # team refuses file keys the signer itself refuses it, whatever the cwd: nothing is written, the draft stays drafted.
     from levain.coordinator import teamdrafts as T
     from levain.coordinator.store import CoordStore
-    monkeypatch.setattr(tenure, "_REQUIRE_PRESENCE", True, raising=False)
+    monkeypatch.setattr(tenure, "_REQUIRE_PRESENCE", True)
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "ana@test", "-f", str(tmp_path / "k")],
                    check=True, capture_output=True)
