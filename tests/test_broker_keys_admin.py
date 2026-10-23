@@ -18,6 +18,7 @@ from levain.broker.peer import start_of
 from levain.contracts import canon
 from levain.slot import Refused
 from levain.slot import control as C
+from tests.ledger_support import file_lines, keys_ledger, until
 
 pytestmark = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="unix sockets")
 
@@ -745,8 +746,11 @@ def test_revoke_at_every_suspension(monkeypatch, transition, delivery, cached):
         st.update(after=False, raw=[], inserts_after=0, refused=0, detached=[], transports=[])
         cred_fd = os.open(os.path.join(d, "keys", "cred"), os.O_RDONLY | os.O_DIRECTORY)
         a, b = socket.socketpair()
+        # a fresh ledger per run: a run cancelled after its head went books its hold `uncertain` at the full amount,
+        # so one shared file would fill the route's cap across the enumeration
+        led = keys_ledger(os.path.join(d, "keys", f"ledger-{pause_at}.jsonl"))
         try:
-            k = K.Keys(unmetered=True, lib_root=d, creds=CredStore(cred_fd))
+            k = K.Keys(ledger=led, lib_root=d, creds=CredStore(cred_fd))
             k._in_loop()
             k.cache = _CountingCache(st)
             k.admin = K.AdminConn(None, _AdminW(), k.admin_epoch)
@@ -790,6 +794,7 @@ def test_revoke_at_every_suspension(monkeypatch, transition, delivery, cached):
             a.close()
             b.close()
             os.close(cred_fd)
+            await led.aclose(2.0)
 
     async def all_runs() -> list:
         runs, n = [], 1
@@ -824,29 +829,16 @@ def test_revoke_at_every_suspension(monkeypatch, transition, delivery, cached):
 
 # --- P5: the request path's upstream failures and the base map, L3 r2's findings ----------------------------------
 
-class _Ledger:
-    """A budget seam that counts: +1 per reservation, -1 per release."""
-
-    def __init__(self) -> None:
-        self.held = 0
-        self.sent: list = []
-
-    def reserve(self, session, route, max_call) -> None:
-        self.held += 1
-
-    def release(self, session, route, max_call, sent) -> None:
-        self.held -= 1
-        self.sent.append(sent)
-
-
-async def _one_q(d: str, ledger: _Ledger) -> bytes:
-    """One cached-token `Q` with a 5-byte body through the real `_exchange`; returns what the front read."""
+async def _one_q(d: str) -> bytes:
+    """One cached-token `Q` with a 5-byte body through the real `_exchange`, on a real ledger at `L/keys/ledger.jsonl`
+    (closed before this returns, so every line it queued is in the file); returns what the front read."""
     from levain.broker.creds import CredStore
     from levain.broker.norm import digest_of_token
     cred_fd = os.open(os.path.join(d, "keys", "cred"), os.O_RDONLY | os.O_DIRECTORY)
     a, b = socket.socketpair()
+    led = keys_ledger(os.path.join(d, "keys", "ledger.jsonl"))
     try:
-        k = K.Keys(unmetered=True, lib_root=d, creds=CredStore(cred_fd), budget=ledger)
+        k = K.Keys(ledger=led, lib_root=d, creds=CredStore(cred_fd))
         k._in_loop()
         k.admin = K.AdminConn(None, _AdminW(), k.admin_epoch)
         await k.front_register(k.admin_epoch, "s1", 70000, 1, 1, 1, 1)
@@ -877,11 +869,12 @@ async def _one_q(d: str, ledger: _Ledger) -> bytes:
         a.close()
         b.close()
         os.close(cred_fd)
+        await led.aclose(2.0)
 
 
 @pytest.mark.parametrize("fault", ["unbuilt", "reset", "tls", "timeout", "head-write", "head-stale", "head-drain",
                                    "body-drain"])
-def test_upstream_failure_answers_f_and_releases_the_budget(monkeypatch, fault):
+def test_upstream_failure_answers_f_and_resolves_the_hold(monkeypatch, fault):
     # L3 r2 (codex MED, complement LOW x2), reproduced first (`3b-3b-p5/repro_before.txt`): a failure in
     # `open_exchange` (the shipped seam's NotImplementedError included), the head's write or a drain escaped every
     # translation, so the front read EOF; and the reservation made before `open_exchange` was never released.
@@ -927,9 +920,9 @@ def test_upstream_failure_answers_f_and_releases_the_budget(monkeypatch, fault):
             return up
 
         monkeypatch.setattr(K, "open_exchange", then_detached)
-    ledger = _Ledger()
     try:
-        got = asyncio.run(_one_q(d, ledger))
+        got = asyncio.run(_one_q(d))
+        lines = file_lines(os.path.join(d, "keys", "ledger.jsonl"))
     finally:
         shutil.rmtree(d, ignore_errors=True)
     name = "upstream-timeout" if fault == "timeout" else "upstream-error"
@@ -937,8 +930,13 @@ def test_upstream_failure_answers_f_and_releases_the_budget(monkeypatch, fault):
     want = gwwire.encode(b"A") + gwwire.encode(b"F", {"refused": name})
     assert got == (gwwire.encode(b"A") if fault == "head-stale" else want)
     assert st["raw"] == [] or fault not in ("head-write", "head-stale")   # the gate refused: nothing written
-    assert ledger.held == 0 and len(ledger.sent) == 1
-    assert ledger.sent == [fault in ("head-drain", "body-drain")]   # `sent` once the head was handed upstream
+    # 3c-1: one hold, resolved once; released while the head was never handed upstream, `uncertain {ended}` once it
+    # may have been (the ledger's `mark_sent` follows the write's return)
+    held = [o["seq"] for o in lines if o["kind"] == "reserved"]
+    res = [(o["kind"], o["ref"], o.get("reason")) for o in lines if o["kind"] in ("released", "settled", "uncertain")]
+    assert len(held) == 1
+    sent = fault in ("head-drain", "body-drain")
+    assert res == [("uncertain", held[0], "ended") if sent else ("released", held[0], None)]
 
 
 @pytest.mark.parametrize("routes", ["non-object", "duplicate", "malformed", "overflow"])
@@ -960,13 +958,13 @@ def test_base_map_unusable_anywhere_refuses_every_route(routes):
                                                                 headers={"content-type": "a{99999999999}"}))]}[routes]
     with open(path, "wb") as f:
         f.write(canon.canonical_bytes({"format": K.BASE_MAP_FORMAT, "routes": [route] + extra}))
-    ledger = _Ledger()
     try:
-        got = asyncio.run(_one_q(d, ledger))
+        got = asyncio.run(_one_q(d))
+        kinds = [o["kind"] for o in file_lines(os.path.join(d, "keys", "ledger.jsonl"))]
     finally:
         shutil.rmtree(d, ignore_errors=True)
     assert got == gwwire.encode(b"F", {"refused": "keys-unavailable"})
-    assert ledger.sent == []
+    assert "reserved" not in kinds                       # nothing admitted
 
 
 def test_preemption_fences_old_exchanges_before_its_bounded_await(monkeypatch):
@@ -989,6 +987,7 @@ def test_preemption_fences_old_exchanges_before_its_bounded_await(monkeypatch):
         cred_fd = os.open(os.path.join(d, "keys", "cred"), os.O_RDONLY | os.O_DIRECTORY)
         pairs = [socket.socketpair() for _ in range(2)]
         gate = asyncio.Event()
+        led = keys_ledger(os.path.join(d, "keys", "ledger.jsonl"))
 
         async def resisting() -> None:   # an old request task that outlives its cancel, as step (2) allows
             while not gate.is_set():
@@ -998,7 +997,7 @@ def test_preemption_fences_old_exchanges_before_its_bounded_await(monkeypatch):
                     pass
 
         try:
-            k = K.Keys(unmetered=True, lib_root=d, creds=CredStore(cred_fd))
+            k = K.Keys(ledger=led, lib_root=d, creds=CredStore(cred_fd))
             k._in_loop()
             k.admin = K.AdminConn(None, _AdminW(), k.admin_epoch)
             k.admin.task = None
@@ -1025,6 +1024,8 @@ def test_preemption_fences_old_exchanges_before_its_bounded_await(monkeypatch):
                 return conn, fr, w, task
 
             conn1, fr1, w1, t1 = await exchange(pairs[0][0], False)
+            # the head goes only behind the hold's durable `reserved` line (a real flush), so wait for the head itself
+            await until(lambda: len(st["raw"]) >= 1)
             for _ in range(50):
                 await asyncio.sleep(0)
             head_written = len(st["raw"])
@@ -1051,6 +1052,7 @@ def test_preemption_fences_old_exchanges_before_its_bounded_await(monkeypatch):
                 a.close()
                 b.close()
             os.close(cred_fd)
+            await led.aclose(2.0)
 
     monkeypatch.setattr(U, "_handshake", handshake)
     try:
@@ -1082,7 +1084,7 @@ def test_base_map_parsed_once_per_file_and_refused_when_it_changes_badly(monkeyp
     monkeypatch.setattr(K, "parse_route", counting)
     path = os.path.join(d, "routes", "base.json")
     try:
-        k = K.Keys(unmetered=True, lib_root=d)
+        k = K.Keys(lib_root=d)
         assert k._base_route("r").route == "r" and k._base_route("r").route == "r"
         assert parses == ["r"]                                   # one parse for two `Q`s
         with open(path, "rb") as f:
