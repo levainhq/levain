@@ -1436,6 +1436,15 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
                      keep_shared=keep_shared)
     check_account_ids(host, rf.accounts)
     slots = tuple(SlotId("egress", i) for i in rf.egress) + tuple(SlotId("none", i) for i in rf.verifier)
+    # R2 entry (1022+20 Linux VM, `userdel _levain_s7`): desired holds only the LIVE accounts, so a recorded one that
+    # is gone is removed at R7 while R8 still renders its slot's rows for it. §2.4: repair never creates or removes a
+    # slot, so it can neither re-create the account nor drop the slot. Every account the rendered plan names (the
+    # singletons, every in-service slot's pair) must be live, else refused before any act.
+    missing = [n for n in (*SINGLETONS, *(n for s in slots for n in s.accounts)) if n not in rf.accounts]
+    if missing:
+        raise Refused("account-missing", f"{', '.join(missing)}: no live Levain account by that name, and repair "
+                                         "never creates one (it never creates or removes a slot). Run undo, then "
+                                         "setup")
     services, skipped = units.built_services(host, package, exists=program_exists)
     restricted = False
     if host == "linux":
