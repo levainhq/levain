@@ -268,22 +268,30 @@ class Codec:
 
     # -- usage ---------------------------------------------------------------------------------------------------
 
-    def usage(self, content_type: bytes) -> "UsageReader":
+    def call_names(self, obj: Mapping[str, Any], price: Price) -> Dict[str, str]:
+        """The `per_use` name each billed response item type settles under, read from the request's own `tools[]`
+        through `_tool_name`, the normaliser the estimate's `_uses` keys the hold by: a call is named at the settle as
+        its tool was named at the hold. Empty for a codec whose reported usage names its tools itself."""
+        return {}
+
+    def usage(self, content_type: bytes, names: Optional[Mapping[str, str]] = None) -> "UsageReader":
         """The side reader for one response (R4 §1.7 step 8): SSE when the response's `content-type` is
-        `text/event-stream`, else one JSON body. It reads the bytes the relay passes and never changes them."""
+        `text/event-stream`, else one JSON body. It reads the bytes the relay passes and never changes them. `names`
+        is `call_names` of the request (keys passes it; none = each item type's canonical name)."""
         ct = content_type.split(b";", 1)[0].strip().lower()
-        return UsageReader(self, ct == b"text/event-stream")
+        return UsageReader(self, ct == b"text/event-stream", names or {})
 
     def _usage_event(self, obj: Mapping[str, Any], st: Dict[str, Any]) -> None:
         """One parsed SSE event; the usage it reports, if any, kept in `st`."""
         raise NotImplementedError
 
-    def _usage_stream(self, st: Mapping[str, Any]) -> Optional[Usage]:
-        """The usage of a whole stream from what `_usage_event` kept; None when it reported none."""
+    def _usage_stream(self, st: Mapping[str, Any], names: Mapping[str, str]) -> Optional[Usage]:
+        """The usage of a whole stream from what `_usage_event` kept; None when it reported none. `names` as
+        `call_names` answered."""
         raise NotImplementedError
 
-    def _usage_body(self, obj: Mapping[str, Any]) -> Optional[Usage]:
-        """The usage of a non-stream JSON response; None when it reports none."""
+    def _usage_body(self, obj: Mapping[str, Any], names: Mapping[str, str]) -> Optional[Usage]:
+        """The usage of a non-stream JSON response; None when it reports none. `names` as `call_names` answered."""
         raise NotImplementedError
 
     def _uses(self, obj: Mapping[str, Any], price: Price) -> int:
@@ -426,11 +434,12 @@ class UsageReader:
     `result`), keeps at most one SSE event (`USAGE_EVENT_MAX`) or a copy of a non-stream body (`USAGE_COPY_MAX`),
     and never raises: past a cap, or on any error, it stops reading and `result` is None. It buffers only on the
     side; the relayed bytes are the relay's own."""
-    __slots__ = ("_codec", "_stream", "_buf", "_data", "_held", "_st", "stopped")
+    __slots__ = ("_codec", "_stream", "_names", "_buf", "_data", "_held", "_st", "stopped")
 
-    def __init__(self, c: "Codec", stream: bool) -> None:
+    def __init__(self, c: "Codec", stream: bool, names: Mapping[str, str]) -> None:
         self._codec = c
         self._stream = stream
+        self._names = names              # the request's `call_names`
         self._buf = bytearray()          # non-stream: the copied body; SSE: the line not yet ended
         self._data: List[bytes] = []     # SSE: the current event's `data` lines
         self._held = 0                   # SSE: the bytes of those lines
@@ -509,9 +518,9 @@ class UsageReader:
             return None
         try:
             if self._stream:
-                return _or_none(lambda: self._codec._usage_stream(self._st))
+                return _or_none(lambda: self._codec._usage_stream(self._st, self._names))
             obj = json.loads(bytes(self._buf))
-            return _or_none(lambda: self._codec._usage_body(obj)) if isinstance(obj, dict) else None
+            return _or_none(lambda: self._codec._usage_body(obj, self._names)) if isinstance(obj, dict) else None
         except (ValueError, RecursionError):
             return None
         finally:
@@ -550,13 +559,13 @@ class AnthropicMessages(Codec):
         elif t == "message_delta":
             st["delta"] = obj.get("usage")
 
-    def _usage_stream(self, st: Mapping[str, Any]) -> Optional[Usage]:
+    def _usage_stream(self, st: Mapping[str, Any], names: Mapping[str, str]) -> Optional[Usage]:
         start, delta = st.get("start"), st.get("delta")
         if not isinstance(start, dict) or not isinstance(delta, dict):
             return None   # a stream with no final `message_delta` reported no final count
         return self._usage(dict(start, **{k: v for k, v in delta.items() if v is not None}))
 
-    def _usage_body(self, obj: Mapping[str, Any]) -> Optional[Usage]:
+    def _usage_body(self, obj: Mapping[str, Any], names: Mapping[str, str]) -> Optional[Usage]:
         return self._usage(obj["usage"]) if isinstance(obj.get("usage"), dict) else None
 
     def _usage(self, u: Mapping[str, Any]) -> Usage:
@@ -629,10 +638,10 @@ class OpenAIChat(_OpenAI):
         if isinstance(obj.get("usage"), dict):
             st["usage"] = obj["usage"]
 
-    def _usage_stream(self, st: Mapping[str, Any]) -> Optional[Usage]:
+    def _usage_stream(self, st: Mapping[str, Any], names: Mapping[str, str]) -> Optional[Usage]:
         return self._usage(st["usage"]) if "usage" in st else None
 
-    def _usage_body(self, obj: Mapping[str, Any]) -> Optional[Usage]:
+    def _usage_body(self, obj: Mapping[str, Any], names: Mapping[str, str]) -> Optional[Usage]:
         return self._usage(obj["usage"]) if isinstance(obj.get("usage"), dict) else None
 
     def _usage(self, u: Mapping[str, Any]) -> Usage:
@@ -670,17 +679,31 @@ class OpenAIResponses(_OpenAI):
     # (`input_tokens_details.cache_write_tokens`, when present), priced at `cache_write`; the rest at `in`.
     _FINAL = ("response.completed", "response.incomplete")
     # A server tool's calls are not in `usage`: each is an output item. The items billed per call, by the `per_use`
-    # name their tool is priced under (https://developers.openai.com/api/docs/pricing, "Built-in tools": web search
+    # names their tool may be priced under (https://developers.openai.com/api/docs/pricing, "Built-in tools": web search
     # "$10.00 / 1k calls", file search tool call "$2.50 / 1k calls"; code interpreter is billed per container session,
     # not per call, so it is not here). They are counted once per item id, from the non-stream body's `output`, or from
     # a stream's `response.output_item.done` items and its final event's `response.output` together.
     # [judged by lane 3c2b-fix1, 2026-10-23, against that page and https://developers.openai.com/api/docs/guides/
     # tools-web-search ("Search actions incur a tool call cost"): every `web_search_call` item counts as one call
-    # whatever its `action`, so an `open_page` / `find_in_page` action is charged high, never low; the preview tool's
-    # calls are the same item type and count under `web_search`.]
-    _BILLED_CALLS = {"web_search_call": "web_search", "file_search_call": "file_search"}
+    # whatever its `action`, so an `open_page` / `find_in_page` action is charged high, never low.]
+    # The search tool and its preview make the same item type, so a call is named by the tool the REQUEST declared
+    # (`call_names`, through `_tool_name`, the name the hold reserved it under); the first name is the one an item
+    # takes when the request declared none of them.
+    _BILLED_CALLS = {"web_search_call": ("web_search", "web_search_preview"), "file_search_call": ("file_search",)}
     #: the distinct billed items one response may report; past it the exchange has no usage
     BILLED_ITEMS_MAX = 4096
+
+    def call_names(self, obj: Mapping[str, Any], price: Price) -> Dict[str, str]:
+        """Each billed item type -> the `per_use` name its calls settle under: the one of its tool names the request's
+        `tools[]` declares (`_tool_name`, as `_uses` reads them). Two declared (search and its preview): the item
+        cannot say which ran, so the one with the higher `per_use` rate, charged high, never low."""
+        declared = self._tools(obj)
+        out: Dict[str, str] = {}
+        for item_type, tools in self._BILLED_CALLS.items():
+            named = [t for t in tools if t in declared]
+            if named:
+                out[item_type] = max(named, key=lambda t: price.per_use.get(t, 0))
+        return out
 
     def _usage_event(self, obj: Mapping[str, Any], st: Dict[str, Any]) -> None:
         calls = st.setdefault("calls", {})
@@ -690,15 +713,15 @@ class OpenAIResponses(_OpenAI):
             st["usage"] = obj["response"].get("usage")
             self._calls(obj["response"], calls)
 
-    def _usage_stream(self, st: Mapping[str, Any]) -> Optional[Usage]:
-        return self._usage(st["usage"], st.get("calls", {})) if isinstance(st.get("usage"), dict) else None
+    def _usage_stream(self, st: Mapping[str, Any], names: Mapping[str, str]) -> Optional[Usage]:
+        return self._usage(st["usage"], st.get("calls", {}), names) if isinstance(st.get("usage"), dict) else None
 
-    def _usage_body(self, obj: Mapping[str, Any]) -> Optional[Usage]:
+    def _usage_body(self, obj: Mapping[str, Any], names: Mapping[str, str]) -> Optional[Usage]:
         if not isinstance(obj.get("usage"), dict):
             return None
         calls: Dict[Any, str] = {}
         self._calls(obj, calls)
-        return self._usage(obj["usage"], calls)
+        return self._usage(obj["usage"], calls, names)
 
     def _calls(self, response: Mapping[str, Any], calls: Dict[Any, str]) -> None:
         """Every billed item of a Response object's `output` into `calls`. An `output` that is present and not a
@@ -712,25 +735,23 @@ class OpenAIResponses(_OpenAI):
             self._call(item, calls)
 
     def _call(self, item: Any, calls: Dict[Any, str]) -> None:
-        """One output item into `calls` (item id -> `per_use` name) when it is billed per call. An item with no string
+        """One output item into `calls` (item id -> item type) when it is billed per call. An item with no string
         id is a call of its own (counted high, never dropped)."""
-        if not isinstance(item, dict):
-            return
-        name = self._BILLED_CALLS.get(item.get("type"))
-        if name is None:
+        if not isinstance(item, dict) or item.get("type") not in self._BILLED_CALLS:
             return
         key = item["id"] if isinstance(item.get("id"), str) else len(calls)
         if key not in calls and len(calls) >= self.BILLED_ITEMS_MAX:
             raise _NoUsage("output")
-        calls[key] = name
+        calls[key] = item["type"]
 
-    def _usage(self, u: Mapping[str, Any], calls: Mapping[Any, str]) -> Usage:
+    def _usage(self, u: Mapping[str, Any], calls: Mapping[Any, str], names: Mapping[str, str]) -> Usage:
         det = u.get("input_tokens_details")
         if det is not None and not isinstance(det, dict):
             raise _NoUsage("input_tokens_details")
         cached, written = _count(det, "cached_tokens"), _count(det, "cache_write_tokens")
         uses: Dict[str, int] = {}
-        for name in calls.values():
+        for item_type in calls.values():
+            name = names.get(item_type, self._BILLED_CALLS[item_type][0])
             uses[name] = uses.get(name, 0) + 1
         return Usage(in_=_plain(_count(u, "input_tokens", True), cached, written, "input_tokens_details"),
                      out=_count(u, "output_tokens", True), cache_write=written, cache_read=cached,

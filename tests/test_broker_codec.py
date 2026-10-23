@@ -829,3 +829,37 @@ def test_codec_write_stream_usage_openai_chat(body, want):
 def test_codec_write_stream_usage_other_codecs_write_nothing(cname):
     obj = {"model": "m1", "stream": True}
     assert codec.CODECS[cname].write_stream_usage(obj) is False and obj == {"model": "m1", "stream": True}
+
+
+def test_codec_responses_call_names_read_the_requests_tools():
+    # L3 r2 codex: a billed Responses item is named by the tool key the REQUEST declared, through `_tool_name` (the
+    # normaliser the estimate's `_uses` keys the hold by), so the hold and the settle name a call alike. Two declared
+    # search tools: the call cannot say which ran, so the higher `per_use` rate. None declared: the canonical name.
+    c = codec.CODECS["openai-responses"]
+    priced = parse_price("EP", dict(EO_RAW, per_use={"web_search_preview": 25_000, "web_search": 10_000}))
+
+    def names(*types):
+        return c.call_names({"model": "m1", "tools": [{"type": t} for t in types]}, priced)
+
+    assert names("web_search_preview_2025_03_11") == {"web_search_call": "web_search_preview"}
+    assert names("web_search_preview") == {"web_search_call": "web_search_preview"}
+    assert names("web_search_2025_08_26") == {"web_search_call": "web_search"}
+    assert names("web_search", "web_search_preview") == {"web_search_call": "web_search_preview"}
+    assert names("file_search") == {"file_search_call": "file_search"}
+    assert names("function") == {}
+    assert c.call_names({"model": "m1"}, priced) == {}
+    for other in ("anthropic-messages", "openai-chat"):
+        assert codec.CODECS[other].call_names({"model": "m1", "tools": [{"type": "web_search"}]}, priced) == {}
+    # the reader takes them: one call item under the declared key, stream and non-stream; with none, `web_search`
+    body = dict(UR.OPENAI_RESPONSES_JSON, output=[_WS1, _FS1, _MSG])
+    want = _u(328 - 64, 52, 0, 64, [("file_search", 1), ("web_search_preview", 1)])
+    nm = names("web_search_preview_2025_03_11", "file_search")
+    r = c.usage(CT_JSON, nm)
+    r.feed(json.dumps(body).encode())
+    assert r.result() == want
+    ev = UR._sse([("response.completed", {"type": "response.completed", "response": {
+        "status": "completed", "output": body["output"], "usage": UR._RESP_USAGE}})])
+    r = c.usage(CT_SSE, nm)
+    r.feed(ev)
+    assert r.result() == want
+    assert _read("openai-responses", json.dumps(body).encode(), False).uses == (("file_search", 1), ("web_search", 1))

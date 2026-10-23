@@ -69,7 +69,7 @@ async def _one(d: str, monkeypatch, body: bytes, *, response: bytes = b"HTTP/1.1
         path = rig.ledger.path
         buffered = rig.k.body_buffer.used if hasattr(rig.k, "body_buffer") else None   # None: a keys before 3c-2a
     return {"frames": got, "up": up, "handshakes": st["handshakes"], "reserved": _reserved(path),
-            "kinds": [o["kind"] for o in file_lines(path)], "buffered": buffered}
+            "kinds": [o["kind"] for o in file_lines(path)], "buffered": buffered, "lines": file_lines(path)}
 
 
 # --- §8 test 4: the absent ceiling is written in, and a call that does not fit is refused, never shrunk ----------
@@ -860,3 +860,36 @@ def test_stream_usage_written_in_for_openai_chat(monkeypatch, body, want):
         obj["stream_options"] = want
     assert _sent(out["up"])[1] == codec.serialize(obj)
     assert [o["amount"] for o in out["reserved"]] == [CHAT.estimate(obj, P)]
+
+
+def test_responses_search_call_settles_under_the_tool_key_the_request_declared(monkeypatch):
+    # L3 r2 codex (a HIGH the r1 fix introduced): a request declaring `web_search_preview_2025_03_11` is held under the
+    # `per_use` key `web_search_preview` (the estimate's `_tool_name`); its `web_search_call` settles under that same
+    # key, named from the request's own tools, so the settle charges the call the hold reserved for it. Before the fix
+    # the call settled under `web_search`, priced 0 here, and the overrun it causes went unseen.
+    from tests import usage_responses as UR
+    priced = dict(PRICE, per_use={"web_search_preview": 10_000})
+    pp = parse_price("m1", priced)
+    body = (b'{"model":"m1","max_output_tokens":10,"input":"hi",'
+            b'"tools":[{"type":"web_search_preview_2025_03_11","max_uses":1}]}')
+    call = {"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "q"}}
+    resp = json.dumps(dict(UR.OPENAI_RESPONSES_JSON, output=[call] + UR.OPENAI_RESPONSES_JSON["output"])).encode()
+    response = (b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n" % len(resp)
+                + resp)
+
+    async def go(d: str) -> dict:
+        _write_map(d, base_route(codec="openai-responses", prices={"m1": priced}))
+        return await _one(d, monkeypatch, body, response=response)
+
+    out = _run(go)
+    assert _types(out["frames"]) == b"ARbe", out["frames"]
+    responses = codec.CODECS["openai-responses"]
+    (held,) = [o["amount"] for o in out["reserved"]]
+    assert held == responses.estimate(json.loads(body), pp)
+    assert held - responses.estimate(json.loads(body), P) == 10_000          # the call is held under the preview key
+    (res,) = [o for o in out["lines"] if o["kind"] in ("settled", "uncertain")]
+    want = codec.Usage(in_=328 - 64, out=52, cache_write=0, cache_read=64, uses=(("web_search_preview", 1),))
+    cost = codec.price_usage(want, pp)
+    assert cost == codec.price_usage(codec.Usage(328 - 64, 52, 0, 64), pp) + 10_000
+    assert res["kind"] == "settled" and res["settled"] + res["overrun"] == cost, res
+    assert res["meta"]["usage"]["uses"] == {"web_search_preview": 1}

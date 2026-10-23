@@ -1431,7 +1431,7 @@ class Keys:
             ff.close()
 
     async def _serve_held(self, conn: Conn, ff: "FrontFrames", side: KeysSide, pol: RoutePolicy, rec: dict,
-                          meter: "Tuple[codec.Codec, Price]", hold: ledger.Hold, head: bytes,
+                          meter: "Tuple[codec.Codec, Price, Dict[str, str]]", hold: ledger.Hold, head: bytes,
                           hconn: "h11.Connection", cred: Optional[Credential], tpl: norm.Template, data: bytes,
                           buf: "BodyTake") -> None:
         """The exchange from its admitted hold on (R4 §1.7 steps 6-8): the upstream, the durable wait, the head behind
@@ -1490,7 +1490,7 @@ class Keys:
                 ff.responded = True
                 rec["status"] = resp.status_code
                 await conn.writer.drain()
-                reader = meter[0].usage(_header(resp.headers, b"content-type"))
+                reader = meter[0].usage(_header(resp.headers, b"content-type"), meter[2])
                 await self._relay_body(conn, up, hconn, scanner, rec, reader)
                 return not conn.detached   # fenced mid-relay: cut short, so `_serve_q`'s `end()` books it
 
@@ -1799,7 +1799,7 @@ class Keys:
 
     def _check_request(self, reg: Registration, pol: RoutePolicy, req: tuple, raw: "_OneShot",
                        buf: "BodyTake") -> Tuple[bytes, "h11.Connection", object, norm.Template, bytes,
-                                                 Tuple[codec.Codec, Price], ledger.Hold]:
+                                                 Tuple[codec.Codec, Price, Dict[str, str]], ledger.Hold]:
         """R4 §1.7 steps 4-5, ONE synchronous call (no `await` anywhere in it): the body codec's parse of the buffered
         body, its `check` (the model has a price entry; on a dispatch-shaped route, one with no per-session cap, the
         unboundable shapes are `body-unbounded:<what>`), the ceiling written in where absent and, beside it, a streamed
@@ -1809,8 +1809,8 @@ class Keys:
         declared), and the ledger's admit LAST (a hold is admitted only for a request that
         goes out). A `RecursionError` anywhere in these steps is `body-json`, with no hold taken. Returns the request
         head, the h11 client that wrote it (it frames the body and parses the response), the credential (or None),
-        the matched template, the body bytes, the codec and price entry the settle reads (the meter), and the admitted
-        hold. `req` is `_check_q`'s answer."""
+        the matched template, the body bytes, the codec, the price entry and the request's `call_names` the settle
+        reads (the meter), and the admitted hold. `req` is `_check_q`'s answer."""
         method, path, query, fwd, tpl, cred = req
         c = codec.CODECS[pol.body_codec]   # a priced route's codec is never `none` (`policy.parse_base_map`)
         obj = c.parse(raw.take())   # the raw bytes are unreferenced once parsed: only `data` below is kept
@@ -1818,6 +1818,7 @@ class Keys:
         codec.guarded(c.write_ceiling, obj, checked.price)
         codec.guarded(c.write_stream_usage, obj)
         estimate = codec.guarded(c.estimate, obj, checked.price)
+        names = codec.guarded(c.call_names, obj, checked.price)   # the settle names a billed call as the hold did
         data = codec.guarded(codec.serialize, obj)
         if len(data) > pol.body_cap:   # what is written in can grow a body at the cap past it
             raise norm.Refused("body-cap", "serialized")
@@ -1826,7 +1827,7 @@ class Keys:
         # an interactive route admits content the estimate cannot see, marked on its `reserved` line (R4 §1.6)
         meta = {"bound": "unproven"} if checked.unproven else {}
         hold = self._admit_hold(reg, pol, estimate, checked.model, meta)   # the last step: see `_serve_q`
-        return head, hconn, cred, tpl, data, (c, checked.price), hold
+        return head, hconn, cred, tpl, data, (c, checked.price, names), hold
 
     def _admit_hold(self, reg: Registration, pol: RoutePolicy, estimate: int, price_ref: str,
                     meta: dict) -> ledger.Hold:
