@@ -340,9 +340,12 @@ class Staged:
 
     target: Optional[str] = None
     refused: Optional[Refused] = None
-    #: ``<tree>/<target>`` was there before :func:`_place` replaced it (same id, same content: a retained generation),
-    #: so a phase-A restore keeps it [r5: L3 r1 complement LOW 4].
+    #: ``<tree>/<target>`` was there before this run touched it (same id, same content: a retained generation), so a
+    #: phase-A restore keeps it [r5: L3 r1 complement LOW 4]. Recorded by the hash step, before it sets ``target``
+    #: [r5: L3 r2 codex MED], so no act between the hash and :func:`_place` can leave a target without it.
     existed: bool = False
+    #: :func:`_place` began replacing ``<tree>/<target>`` (its ``rm -rf``): only then may a restore remove it.
+    placed: bool = False
 
 
 def _hash_staged(cell: Staged, partial: Path, source: Path, h11_dir: Path, pinned: Optional[str]) -> tuple[bool, str]:
@@ -364,6 +367,7 @@ def _hash_staged(cell: Staged, partial: Path, source: Path, h11_dir: Path, pinne
                                                            f"{source} is {got}. Re-run with that package")
     if cell.refused is not None:
         return False, f"{cell.refused.name}: {cell.refused.detail}"
+    cell.existed = os.path.lexists(partial.parent / got)     # before ``target``: the restore reads them together
     cell.target = got
     return True, got
 
@@ -382,6 +386,7 @@ def _place(host: HostOS, tree: Path, partial: Path, cell: Staged, current: Optio
         return r.returncode == 0, (f"{target} is already current" if r.returncode == 0 else r.stderr.strip())
     gen = tree / target
     cell.existed = cell.existed or os.path.lexists(gen)
+    cell.placed = True                                       # from the rm on, the target is this run's
     r = subprocess.run((rm, "-rf", str(gen)), capture_output=True, text=True, cwd="/")
     if r.returncode != 0:
         return False, r.stderr.strip()

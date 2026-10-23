@@ -22,6 +22,7 @@ import json
 import os
 import re
 import select
+import selectors
 import signal
 import stat
 import subprocess
@@ -2345,14 +2346,27 @@ PROBE_OUT_CAP = 64 * 1024
 #: ``repair_probe`` could not read the host's records.
 PROBE_EXIT_NO_IMPORT = 3
 PROBE_EXIT_UNSUPPORTED = 4
+#: [r5: L3 r2 codex] the staged ``repair_continue`` cannot bind the call :func:`phase_b_text` makes (phase A's own
+#: program checks it, so a self-reported ABI is never the only evidence).
+PROBE_EXIT_HANDOVER = 5
+#: [r5: L3 r2 codex MED] the staged code's own bounds refuse a record or a journal identity (``bad-record``).
+PROBE_EXIT_BAD_RECORD = 6
 #: The handover's ABI [r5: codex MED 3]: what phase A's exec passes to ``repair_continue`` (the call shape of
 #: :func:`phase_b_text`) and what phase B adopts. The probe answers it; phase A execs only into its own.
 HANDOVER_ABI = 1
 
 
+def _handover_args(lock_fd: int, pool_fd: int, gen: str, caller_uid: int) -> str:
+    """The argument list of phase A's call into ``repair_continue``: the exec's (:func:`phase_b_text`) and the probe's
+    ``inspect.signature(...).bind`` of it (:func:`probe_text`) are this one string."""
+    return f"{lock_fd}, {pool_fd}, {gen!r}, caller_uid={caller_uid}"
+
+
 def probe_text(host: HostOS, gen: str, *, tree: Path | None = None) -> str:
     """The R3a probe program for ``gen``: its code on ``sys.path`` (:func:`root_tree.generation_boot_code`), then
-    :func:`repair_probe` if the staged package has the handover. Written by phase A, so every exit code is phase A's."""
+    :func:`repair_probe` if the staged package has the handover and its ``repair_continue`` binds the exact call
+    phase B's program makes (:func:`_handover_args`). Written by phase A, so every exit code but ``repair_probe``'s
+    own is phase A's."""
     return (f"{root_tree.generation_boot_code(host, gen, tree=tree)}\n"
             "try:\n"
             "    from levain.slot import install_helper as M\n"
@@ -2360,27 +2374,41 @@ def probe_text(host: HostOS, gen: str, *, tree: Path | None = None) -> str:
             f"    raise SystemExit({PROBE_EXIT_NO_IMPORT})\n"
             "if not (callable(getattr(M, 'repair_probe', None)) and callable(getattr(M, 'repair_continue', None))):\n"
             f"    raise SystemExit({PROBE_EXIT_UNSUPPORTED})\n"
+            "import inspect\n"
+            "try:\n"
+            f"    inspect.signature(M.repair_continue).bind({_handover_args(0, 0, gen, 0)})\n"
+            "except (TypeError, ValueError):\n"
+            f"    raise SystemExit({PROBE_EXIT_HANDOVER})\n"
             "raise SystemExit(M.repair_probe())\n")
 
 
 def repair_probe(*, stdin=None, out: TextIO | None = None, host: HostOS | None = None) -> int:
     """R3a, run by the STAGED generation in a child (§2.2 [r3: X2-M5, X2-H1]): stdin holds the host's
-    ``install-shape`` and journal texts (``{"journal": <text|null>, "shape": <text|null>}``, canonical). Exactly one
-    canonical ``{"handover":<HANDOVER_ABI>,"kinds":[...],"ok":true}`` line on ``out`` (the kinds this code can
-    REMOVE, so the caller can check every recorded and journalled one, and the handover ABI it takes) and 0; :data:`PROBE_EXIT_UNSUPPORTED` with nothing printed when either record
-    does not parse here."""
+    ``install-shape`` and journal texts and the operator's name (``{"journal": <text|null>, "operator": <name|null>,
+    "shape": <text|null>}``, canonical). Exactly one canonical ``{"handover":<HANDOVER_ABI>,"kinds":[...],"ok":true}``
+    line on ``out`` (the kinds this code can REMOVE, so the caller can check every recorded and journalled one, and
+    the handover ABI it takes) and 0; :data:`PROBE_EXIT_UNSUPPORTED` with nothing printed when either record does
+    not parse here; [r5: L3 r2 codex MED] :data:`PROBE_EXIT_BAD_RECORD` when a record of a kind this code holds fails
+    its bound (:func:`generation.check_managed`, the check phase B's plan runs first). A kind it lacks is left to the
+    caller's ``kinds`` check, which names it."""
     host = host or _host()
     raw = (stdin if stdin is not None else sys.stdin.buffer).read(4 * gen_mod.MAX_RECORD_BYTES + 1)
     try:
         records = canon.parse(raw)
-        if not isinstance(records, dict) or set(records) != {"journal", "shape"}:
+        if not isinstance(records, dict) or set(records) != {"journal", "operator", "shape"}:
             return PROBE_EXIT_UNSUPPORTED
-        if records["shape"] is not None:
-            gen_mod.parse_shape(str(records["shape"]).encode())
-        if records["journal"] is not None:
-            parse_intent(str(records["journal"]).encode(), host)
+        operator = records["operator"]
+        if operator is not None and not (isinstance(operator, str) and OPERATOR_RE.fullmatch(operator)):
+            return PROBE_EXIT_UNSUPPORTED
+        shape = gen_mod.parse_shape(str(records["shape"]).encode()) if records["shape"] is not None else None
+        journal = parse_intent(str(records["journal"]).encode(), host) if records["journal"] is not None else None
     except (Refused, canon.ContractError, TypeError, ValueError):
         return PROBE_EXIT_UNSUPPORTED
+    held = [r for r in (*(shape.managed if shape else ()), *(journal.managed if journal else ())) if r[0] in gen_mod.KINDS]
+    try:
+        gen_mod.check_managed(host, held, operator=operator)
+    except Refused:
+        return PROBE_EXIT_BAD_RECORD
     o = out or sys.stdout
     o.write(canon.canonical({"ok": True, "kinds": sorted(gen_mod.KINDS), "handover": HANDOVER_ABI}) + "\n")
     o.flush()
@@ -2405,14 +2433,15 @@ def _bounded_child(argv: Sequence[str], data: bytes, *, timeout: float, cap: int
     assert p.stdout is not None
     out, deadline, over = b"", clock() + timeout, False
     fd = p.stdout.fileno()
+    sel = selectors.DefaultSelector()            # [r5: L3 r2 OBS] select.select refuses an fd >= FD_SETSIZE
+    sel.register(fd, selectors.EVENT_READ)
     try:
         while True:
             left = deadline - clock()
             if left <= 0:
                 over = True
                 break
-            r, _, _ = select.select([fd], [], [], left)
-            if not r:
+            if not sel.select(left):
                 continue
             chunk = os.read(fd, 65536)
             if not chunk:
@@ -2422,6 +2451,7 @@ def _bounded_child(argv: Sequence[str], data: bytes, *, timeout: float, cap: int
                 over = True
                 break
     finally:
+        sel.close()
         p.stdout.close()
         if over:
             try:
@@ -2451,12 +2481,14 @@ def run_probe(host: HostOS, gen: str, shape: gen_mod.InstallShape | None, journa
     host over. Returns its ``kinds``. A timeout, an exit other than 0, or anything but exactly one canonical
     ``{"handover":<n>,"kinds":[...],"ok":true}`` line (``handover`` may be absent), or a probe that cannot be
     started, refuses ``source-broken``; a package with no handover (from before row 33) or one that cannot read the
-    records refuses ``downgrade-unsupported``; an ABI other than :data:`HANDOVER_ABI` (or none) refuses
-    ``downgrade-unsupported:handover``; a kind in the record's ``managed`` or the journal's write-ahead ``managed``
+    records refuses ``downgrade-unsupported``; an ABI other than :data:`HANDOVER_ABI` (or none), or a
+    ``repair_continue`` that cannot bind the exec's call, refuses ``downgrade-unsupported:handover``; a record the
+    staged code's bounds refuse, ``bad-record``; a kind in the record's ``managed`` or the journal's write-ahead ``managed``
     that it cannot remove refuses ``downgrade-unsupported:<kind>``."""
     python = python or root_tree.ROOT_PYTHON[host]
     data = canon.canonical({"shape": gen_mod.shape_text(shape) if shape is not None else None,
-                            "journal": intent_text(journal) if journal is not None else None}).encode()
+                            "journal": intent_text(journal) if journal is not None else None,
+                            "operator": journal.operator if journal is not None else None}).encode()
     try:
         rc, out = _bounded_child([python, root_tree.PY_FLAGS, "-c", probe_text(host, gen, tree=tree)], data,
                                  timeout=timeout, cap=cap)
@@ -2465,6 +2497,12 @@ def run_probe(host: HostOS, gen: str, shape: gen_mod.InstallShape | None, journa
     if rc == PROBE_EXIT_UNSUPPORTED:
         raise Refused("downgrade-unsupported", f"{gen} cannot take this host over (it has no repair handover, or "
                                                "it cannot read the install record or the journal)")
+    if rc == PROBE_EXIT_HANDOVER:
+        raise Refused("downgrade-unsupported:handover", f"{gen}'s repair_continue does not take the call this "
+                                                        "code's exec makes")
+    if rc == PROBE_EXIT_BAD_RECORD:
+        raise Refused("bad-record", f"{gen} finds a record of the install record or the journal outside its "
+                                    "kind's bound")
     if rc is None:
         raise Refused("source-broken", f"the probe of {gen} ran past {timeout:g} s or printed past {cap} bytes")
     if rc != 0:
@@ -2497,8 +2535,8 @@ def phase_b_text(host: HostOS, gen: str, lock_fd: int, pool_fd: int, caller_uid:
     it, so the grammar gains no hidden verb. ``call``: a test's own entry instead (it still runs in ``gen``'s code)."""
     if not all(type(x) is int and x >= 0 for x in (lock_fd, pool_fd, caller_uid)):
         raise Refused("bad-token", "phase B's descriptors and caller")
-    call = call if call is not None else (f"raise SystemExit(M.repair_continue({lock_fd}, {pool_fd}, {gen!r}, "
-                                          f"caller_uid={caller_uid}))")
+    call = call if call is not None else (f"raise SystemExit(M.repair_continue("
+                                          f"{_handover_args(lock_fd, pool_fd, gen, caller_uid)}))")
     return (f"{root_tree.generation_boot_code(host, gen, tree=tree)}\n"
             "from levain.slot import install_helper as M\n"
             f"{call}\n")
@@ -2543,13 +2581,15 @@ def _restore_phase_a(host: HostOS, cell: root_tree.Staged, prior: Intent | None,
     exec: ``staging.partial`` and the staged generation removed (never ``current``, never a generation that was there
     before :func:`root_tree._place` replaced it, ``cell.existed``), the import tree fsynced, and the journal back to
     what phase A read (``prior`` rewritten, a finished one included; none -> the run's own removed, the state dir
-    fsynced). Every op is checked: returns what could NOT be put back (empty when all of it was)."""
+    fsynced). [r5: L3 r2 codex MED] The target is removed only when THIS run placed it (``cell.placed``) and it was
+    not there before (``cell.existed``, recorded by the hash step before anything can raise). Every op is checked:
+    returns what could NOT be put back (empty when all of it was)."""
     import shutil
 
     tree = tree if tree is not None else root_tree.current_path(host).parent
     undone: list[str] = []
     removed = False
-    names = [root_tree.STAGING] + ([cell.target] if cell.target and not cell.existed else [])
+    names = [root_tree.STAGING] + ([cell.target] if cell.target and cell.placed and not cell.existed else [])
     for name in names:
         p = tree / name
         if name == current or not os.path.lexists(p):
@@ -2644,9 +2684,10 @@ class ContinueSeams:
 def adopt_lock(fd: int, path: Path, *, owner_ok: Callable[[os.stat_result], bool]) -> None:
     """R4a [r2: X-4]: ``fd`` (inherited across the exec) must be the lock file at ``path``: ``path`` opened
     ``O_NOFOLLOW`` and both ``fstat``-ed to the same ``st_dev``/``st_ino``, a regular file with the expected owner and
-    mode 0600, and the flock HELD [r5: L3 r1 complement LOW 5]: a ``LOCK_EX|LOCK_NB`` on that second description
-    must meet ``BlockingIOError``. Else ``bad-root`` (a descriptor that did not survive the exec, names another file,
-    or holds no lock)."""
+    mode 0600, and the flock HELD by ``fd`` itself [r5: L3 r1 complement LOW 5, L3 r2 codex]: a ``LOCK_EX|LOCK_NB`` on
+    that second description must meet ``BlockingIOError`` (someone holds it), and then the same on ``fd`` must succeed
+    (a description that holds the lock re-takes it; one that does not meets the other holder). Else ``bad-root`` (a
+    descriptor that did not survive the exec, names another file, or holds no lock)."""
     try:
         held = os.fstat(fd)
     except OSError as e:
@@ -2663,11 +2704,18 @@ def adopt_lock(fd: int, path: Path, *, owner_ok: Callable[[os.stat_result], bool
         try:
             fcntl.flock(check, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            pass                     # held, by ``fd``'s description (this process's, or no other run's: same file)
+            pass                     # held by some description: ``fd``'s, or another run's (proved next)
         except OSError as e:
             raise Refused("bad-root", f"{path}: {e.strerror}") from None
         else:
             raise Refused("bad-root", f"descriptor {fd} for {path} holds no lock")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)    # a no-op on the description that holds it
+        except BlockingIOError:
+            raise Refused("bad-root", f"descriptor {fd} for {path} holds no lock (another description holds "
+                                      "it)") from None
+        except OSError as e:
+            raise Refused("bad-root", f"{path}: {e.strerror}") from None
     finally:
         os.close(check)              # a second description: its close never drops the flock on ``fd``'s
 

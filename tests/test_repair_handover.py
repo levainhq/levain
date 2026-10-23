@@ -236,7 +236,7 @@ def _phase_a(tmp: Path, gen_maker, *, prior: Intent | None = None, shape: G.Inst
     first = prior or Intent("repair", OP, txn=TXN)
     if prior is not None:
         jpath.write_text(intent_text(prior))                # on disk before phase A
-    cell = root_tree.Staged(target=GEN)
+    cell = root_tree.Staged(target=GEN, placed=True)        # the hash and place steps ran (a fresh stage)
     plan = IH.InstallPlan("repair", HOST, (), intent=first, handover=cell)
     q = IH.Quiesce(L, waits=IH.RH.Seams(host=HOST, store=L, trusted=lambda st: True, lock_wait_s=0.05))
     facts = IH.HostFacts(host=HOST, caller_uid=os.getuid(), intent=prior, install_shape=shape)
@@ -339,11 +339,12 @@ def test_repair_probe_reads_both_records(tmp_path: Path) -> None:
 
     shape = G.InstallShape("gen-" + "0" * 16, "0.9.0", "0.16.0", TXN, {}, ())
     j = Intent("repair", OP, txn=TXN, generation=GEN)
-    good = json.dumps({"shape": G.shape_text(shape), "journal": intent_text(j)}).encode()
+    good = json.dumps({"shape": G.shape_text(shape), "journal": intent_text(j), "operator": OP}).encode()
     out = io.StringIO()
     assert IH.repair_probe(stdin=io.BytesIO(good), out=out, host=HOST) == 0
     assert json.loads(out.getvalue()) == {"ok": True, "kinds": sorted(G.KINDS), "handover": IH.HANDOVER_ABI}
-    for bad in (b"{}", json.dumps({"shape": "{}", "journal": None}).encode(), b"not json"):
+    for bad in (b"{}", json.dumps({"shape": "{}", "journal": None, "operator": OP}).encode(), b"not json",
+                json.dumps({"shape": None, "journal": None}).encode()):
         assert IH.repair_probe(stdin=io.BytesIO(bad), out=io.StringIO(), host=HOST) == IH.PROBE_EXIT_UNSUPPORTED
 
 
@@ -623,6 +624,107 @@ def test_the_bounded_child_kills_what_the_probe_left_behind(tmp_path: Path) -> N
     if not gone:
         os.kill(pid, 9)
     assert gone, f"the probe's grandchild {pid} outlived the probe"
+
+
+# --- L3 r2 (head 1022+21 S3 brief, commit 1: a-e) --------------------------------------------------------------------
+
+def test_adopt_lock_refuses_an_unlocked_descriptor_while_another_holds_the_lock(tmp_path: Path) -> None:
+    """r2 a (codex): the second description meets ``BlockingIOError`` because ANOTHER description holds the flock;
+    the inherited one holds nothing -> ``bad-root``."""
+    a = tmp_path / "a"
+    a.write_text("")
+    os.chmod(a, 0o600)
+    fd, other = os.open(a, os.O_RDWR), os.open(a, os.O_RDWR)
+    try:
+        fcntl.flock(other, fcntl.LOCK_EX)                    # another run's description holds it; ``fd`` does not
+        with pytest.raises(Refused) as e:
+            IH.adopt_lock(fd, a, owner_ok=_mine)
+        assert e.value.name == "bad-root" and "no lock" in e.value.detail
+    finally:
+        os.close(other)
+        os.close(fd)
+
+
+def test_a_probe_whose_repair_continue_takes_another_call_shape_refuses_handover(tmp_path: Path,
+                                                                                monkeypatch) -> None:
+    """r2 b (codex): ABI 1 self-reported, but ``repair_continue`` cannot bind phase A's exact call ->
+    ``downgrade-unsupported:handover`` before the exec, host restored."""
+    _monkey_built(monkeypatch)
+    wrong = _answers(G.KINDS).replace(_HANDOVER, "def repair_continue(lock_fd, gen):\n    return 0\n")
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(t, GEN, wrong))
+    with pytest.raises(Refused) as e:
+        _go(seams)
+    assert e.value.name == "downgrade-unsupported:handover" and not execs
+    assert not (tree / GEN).exists() and not jpath.exists() and not q.held
+
+
+def test_an_exception_between_the_hash_and_the_place_keeps_a_pre_existing_target(tmp_path: Path,
+                                                                                monkeypatch) -> None:
+    """r2 c (codex MED): the hash step found ``gen-<id>`` already there (a retained generation); something raised
+    before ``_place`` ran (stderr a closed pipe); the restore removes only what THIS run placed -> kept."""
+    import shutil
+
+    from tests.test_repair_plan import _package
+
+    _monkey_built(monkeypatch)
+    lv, h11 = _package(tmp_path)
+    gid = G.generation_id(lv, h11)
+
+    def hash_then_raise(p, e):
+        jpath.write_text(intent_text(Intent("repair", OP, txn=TXN)))
+        for name, src in (("levain", lv), ("h11", h11)):
+            shutil.copytree(src, tree / root_tree.STAGING / name)
+        cell.target, cell.placed = None, False               # the plan's fresh cell
+        assert root_tree._hash_staged(cell, tree / root_tree.STAGING, lv, h11, None) == (True, gid)
+        raise BrokenPipeError(32, "stderr closed")           # before the place step
+
+    def retained(t: Path) -> None:
+        for name, src in (("levain", lv), ("h11", h11)):
+            shutil.copytree(src, t / gid / name)
+
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, retained, apply=lambda p, e: hash_then_raise(p, e))
+    cell = seams.plan(None, None).handover
+    with pytest.raises(BrokenPipeError):
+        _go(seams)
+    assert cell.existed and not cell.placed and not execs
+    assert (tree / gid / "levain" / "__init__.py").is_file() and not (tree / root_tree.STAGING).exists()
+
+
+def test_the_staged_probe_refuses_an_out_of_bound_identity(tmp_path: Path, monkeypatch) -> None:
+    """r2 d (codex MED): an in-format journal record whose identity is out of its kind's bound (a shared group at a
+    gid outside the shared range) is refused AT THE PROBE (``bad-record``), the host restored, never in phase B."""
+    _monkey_built(monkeypatch)
+    prior = Intent("repair", OP, txn=TXN, managed=(("group/1", ("levain-keysadmin", 80)),))
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, _real_generation, prior=prior)
+    with pytest.raises(Refused) as e:
+        _go(seams)
+    assert e.value.name == "bad-record" and not execs and not q.held
+    assert read_intent(HOST, path=jpath) == prior and not (tree / GEN).exists()
+
+
+def test_the_bounded_child_reads_a_pipe_above_fd_setsize(tmp_path: Path) -> None:
+    """r2 e (ruled OBS): the probe runner's wait works on a child pipe at an fd >= 1024 (``select.select`` raises
+    ``ValueError`` there)."""
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = 1200
+    if hard != resource.RLIM_INFINITY and hard < want:
+        pytest.skip(f"RLIMIT_NOFILE hard limit {hard} < {want}")
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, want), hard))
+    held: list[int] = []
+    try:
+        while True:                                          # every fd below 1030 taken, so the pipe lands above
+            fd = os.open(os.devnull, os.O_RDONLY)
+            held.append(fd)
+            if fd >= 1030:
+                break
+        rc, out = IH._bounded_child([sys.executable, "-c", "print('hi')"], b"", timeout=20.0, cap=1024)
+        assert (rc, out) == (0, b"hi\n")
+    finally:
+        for fd in held:
+            os.close(fd)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
 
 # --- test 2: the flip, killed between its acts ------------------------------------------------------------------------
