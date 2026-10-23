@@ -469,14 +469,24 @@ def bundle_space(src: int, size: int, object_format: str) -> Tuple[int, int]:
 # --- the view (§6.2) -------------------------------------------------------------------------------------------
 
 
+#: The copies this command deletes when it ends; every other file in the private dir stays for him to re-read.
+LARGE_COPIES = ("bundle", "q.idx")
+
+
 def removal_line(private: Path) -> str:
-    """The one command that removes the private dir, printed beside its path (S4a Q6 as ruled by the head 1023+13:
-    the dir stays so he can re-read the preview; no verb, no flag). A path the escaper would change is not offered
-    as a command."""
+    """What the end of this command does to the private dir and the one command that removes the rest, printed
+    beside its path (S4a Q6 as ruled by the head 1023+13: the dir stays so he can re-read the preview; no verb, no
+    flag). The files named are the ones in the dir NOW. A path the escaper would change is not offered as a command."""
+    try:
+        keep = sorted(p.name for p in private.iterdir() if p.name not in LARGE_COPIES)
+    except OSError:
+        keep = []
+    head = (f"the {' and '.join(LARGE_COPIES)} copies will be removed when this command ends; "
+            f"these remain: {', '.join(keep) or 'nothing'}; ")
     shown = adopt_preview.escape(os.fsencode(private))
     if shown != str(private):
-        return "remove them with rm -r on that directory (its name holds characters shown escaped above)"
-    return f"remove them with: rm -r -- {shlex.quote(str(private))}"
+        return head + "remove them by rm -r on that directory (its name holds characters shown escaped above)"
+    return head + f"remove them with: rm -r -- {shlex.quote(str(private))}"
 
 
 def render(*, session: str, result: str, refs: Sequence[str], preview: bytes, report: Mapping[str, object],
@@ -513,15 +523,35 @@ def render_report_only(*, session: str, report: Mapping[str, object], repo: Path
     return out
 
 
+#: The longest answer read at the prompt; a longer one is drained to its newline and asked again.
+ANSWER_MAX = 64
+
+
+def is_tty(stream: object) -> bool:
+    """A stream that is a terminal. None, a closed stream or one without ``isatty`` is not."""
+    try:
+        return bool(stream is not None and stream.isatty())       # type: ignore[attr-defined]
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
 def ask_take(refs: Sequence[str], stdin: IO[str], out: IO[str]) -> str:
     """The interactive choice after the preview: the refs the export carries, then ``none``. Anything else asks
-    again; end of input = ``none``."""
+    again (an answer that does not decode, or runs past :data:`ANSWER_MAX`, included); end of input = ``none``."""
     choices = [r for r in ("head", "wip") if r in refs] + ["none"]
     prompt = "take " + " / ".join(choices) + "? "
     while True:
         out.write(prompt)
         out.flush()
-        line = stdin.readline()
+        try:
+            line = stdin.readline(ANSWER_MAX)
+            while len(line) >= ANSWER_MAX and not line.endswith("\n"):      # too long: drain to its newline
+                more = stdin.readline(ANSWER_MAX)
+                if not more:
+                    break
+                line = more
+        except UnicodeDecodeError:
+            line = "?\n"
         if not line:
             out.write("\n(end of input: none)\n")
             return "none"
@@ -529,6 +559,33 @@ def ask_take(refs: Sequence[str], stdin: IO[str], out: IO[str]) -> str:
         if answer in choices:
             return answer
         out.write(f"answer one of: {', '.join(choices)}\n")
+
+
+def ask_or_interrupt(refs: Sequence[str], stdin: IO[str], out: IO[str], err: IO[str]) -> Tuple[Optional[str], int]:
+    """:func:`ask_take`, with Ctrl-C at the prompt = (None, 130) and one line: nothing was taken."""
+    try:
+        return ask_take(refs, stdin, out), 0
+    except KeyboardInterrupt:
+        err.write("levain session adopt: interrupted; nothing taken\n")
+        return None, 130
+
+
+def verify_line(wall: float) -> str:
+    """The one line before ``adopt-verify`` (the S4b L4 run: nothing printed for up to V30's wall)."""
+    return (f"verifying in root's confined verify (this can take a while; the CLI waits at most {wall:.0f} s)...\n")
+
+
+def warn_old_git(seams: "Seams", err: IO[str]) -> None:
+    """One ``WARNING`` line when his git is below the maintenance release of its line (Q1; never a refusal). A git
+    that cannot say its version is warned about as unparsed."""
+    from levain.slot import fsck_ids
+
+    try:
+        note = fsck_ids.below_maintenance(fsck_ids.git_version_text(seams.git or "git"))
+    except Refused as e:
+        note = f"git version unparsed ({e.name})"
+    if note is not None:
+        err.write("WARNING: " + adopt_preview.escape(note.encode()) + "\n")
 
 
 # --- the verbs --------------------------------------------------------------------------------------------------
@@ -637,9 +694,11 @@ def adopt(session: str, repo: Path, which: Optional[str], seams: Seams, out: IO[
         finally:
             os.close(edfd)
         report = _copy_report(seams, expect, priv, ans)
+        wall = helper_timeout("adopt-verify", bundle_bytes=size, base_bytes=_base_bytes(base))
+        out.write(verify_line(seams.helper_timeout_s if seams.helper_timeout_s is not None else wall))
+        out.flush()
         v = call_helper(seams, "adopt-verify", session, "--bundle-digest", "sha256:" + _digest(ans, "bundle_digest"),
-                        err=err, timeout=helper_timeout("adopt-verify", bundle_bytes=size,
-                                                        base_bytes=_base_bytes(base)))
+                        err=err, timeout=wall)
         warned = warned or bool(v.get("warnings"))
         edfd = open_dir(seams, expect)
         try:
@@ -665,7 +724,9 @@ def adopt(session: str, repo: Path, which: Optional[str], seams: Seams, out: IO[
             out.write(line + "\n")
         shown = True
         if which is None:
-            which = ask_take(refs, seams.stdin or sys.stdin, out)
+            which, rc = ask_or_interrupt(refs, seams.stdin or sys.stdin, out, err)
+            if which is None:
+                return rc
         if which == "none":
             out.write("nothing taken (none); " + (
                 "root WARNED above that its publish may not survive a crash: the export stays retained only if "
@@ -674,6 +735,7 @@ def adopt(session: str, repo: Path, which: Optional[str], seams: Seams, out: IO[
         # The checks again, immediately before his repo is written (L3 s4a r1 codex MED 3): the import and verify
         # may have run for an hour, during which his repo could have turned shallow, partial or another format.
         check_repo(seams, repo, base)
+        warn_old_git(seams, err)
         t = adopt_take.take(git=seams.git or "git", repo=repo, bundle=bundle_copy, idx=idx_copy, claims=claims,
                             session=session, object_format=fmt, which=which, log=seams.log)
         out.write(f"took {which}: {t.ref} -> {t.oid}\n")
@@ -711,8 +773,9 @@ def main(argv: Sequence[str], *, seams: Optional[Seams] = None, out: Optional[IO
         if verb == "adopt":
             if args.git is not None:
                 seams.git = args.git
-            if args.take is None and not (seams.stdin or sys.stdin).isatty():
-                raise Refused("bad-argument", "--take head|wip|none is required when stdin is not a terminal")
+            if args.take is None and not (is_tty(seams.stdin or sys.stdin) and is_tty(out)):
+                raise Refused("bad-argument", "--take head|wip|none is required unless both stdin and stdout are "
+                                              "terminals (the prompt needs a person reading it)")
             if seams.git is None:
                 from levain.launch import child_env
                 seams.git = shutil.which("git", path=child_env().get("PATH")) or "git"
@@ -726,8 +789,9 @@ def main(argv: Sequence[str], *, seams: Optional[Seams] = None, out: Optional[IO
         return 1
 
 
-__all__ = ["EXPORT_CLASS", "HELPER_SLACK_S", "PRESENCE_REGEXP", "PRIVATE_MARGIN", "PROMISOR_REGEXP",
-           "REPO_GIT_TIMEOUT", "RESULTS", "STOP_GRACE_S", "STORE_SLACK_S", "STORE_VERBS", "STORE_VERB_CAS_CALLS",
-           "Seams", "TAKES", "VERBS", "adopt", "ask_take", "bundle_space", "call_helper", "check_base", "check_repo",
-           "copy_private", "helper_timeout", "main", "open_dir", "open_published", "private_dir", "removal_line",
-           "render", "render_report_only", "show_warnings", "store_verb"]
+__all__ = ["ANSWER_MAX", "EXPORT_CLASS", "HELPER_SLACK_S", "LARGE_COPIES", "PRESENCE_REGEXP", "PRIVATE_MARGIN",
+           "PROMISOR_REGEXP", "REPO_GIT_TIMEOUT", "RESULTS", "STOP_GRACE_S", "STORE_SLACK_S", "STORE_VERBS",
+           "STORE_VERB_CAS_CALLS", "Seams", "TAKES", "VERBS", "adopt", "ask_or_interrupt", "ask_take", "bundle_space",
+           "call_helper", "check_base", "check_repo", "copy_private", "helper_timeout", "is_tty", "main", "open_dir",
+           "open_published", "private_dir", "removal_line", "render", "render_report_only", "show_warnings", "store_verb",
+           "verify_line", "warn_old_git"]
