@@ -27,6 +27,7 @@ import math
 import os
 import re
 import secrets
+import shlex
 import sqlite3
 import struct
 import subprocess
@@ -48,15 +49,17 @@ __all__ = [
     "CONSENT_MCP_GRANT_KIND", "CONSENT_MCP_READ_ONLY_TOOLS",
     "CONSENT_GRANTABLE_TOOLS", "CONSENT_POSTURES", "CONSENT_SHELL_TOOLS",
     "CUSTODIES", "DISPLAY_PHONE", "FIDO_ATTESTED", "FORMAT", "PASSKEY", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
-    "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
+    "Anchor", "AnchorError", "ForeignAnchor", "KEY_WORD", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
-    "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify",
+    "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_data_root", "anchor_path",
+    "check_anchor", "classify", "foreign_anchor",
     "consent_grant", "consent_grant_tool_problem", "consent_revocable", "consent_tool_shape_problem",
     "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem",
     "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_mismatch",
     "custody_problem", "is_passkey_material",
-    "genesis_policy", "inert_grant", "log_head", "prepare", "read_anchor", "reset_anchor", "reset_message",
-    "sign_and_append", "presence_missing", "quarantined", "signing_laptops", "snapshot", "sshsig_public_key", "UNSTATED",
+    "genesis_policy", "inert_grant", "init_hint", "log_head", "prepare", "read_anchor", "reset_anchor", "reset_hint",
+    "reset_lock", "reset_message", "sign_and_append",
+    "presence_missing", "quarantined", "signing_laptops", "snapshot", "sshsig_public_key", "UNSTATED",
     "verify_anchor_reset", "verify_link_sig",
 ]
 
@@ -406,6 +409,11 @@ class HeadBelowCache(AuthorityError):
 
 class AnchorError(AuthorityError):
     """The anchor refuses this log."""
+
+
+class ForeignAnchor(AnchorError):
+    """The anchor names another store than this log's: an anchor reset refuses it (it is for a rollback of the
+    same store, DESIGN §3.8), so the refusal names the file to check or move instead."""
 
 
 def _ranks() -> Mapping[str, int]:
@@ -1839,11 +1847,13 @@ def append(conn: sqlite3.Connection, link: UnsignedLink, signature: str, *, now:
         if anchor is not None:
             current = read_anchor(anchor)
             if state is None and current is not None:
+                # not a reset: an empty log holds no key a reset could verify against (verify_anchor_reset)
                 raise AnchorError(f"the authority log is empty but its anchor names store {current.store_id} at "
                                   f"seq {current.seq}; a new genesis here would fork it. If this store was "
-                                  f"emptied on purpose, run {_RESET_HINT}")
+                                  f"emptied on purpose, move {anchor} aside, then run "
+                                  f"{init_hint(anchor_data_root(anchor))}")
             if state is not None:
-                check_anchor(state, current)
+                check_anchor(state, current, path=anchor)
         head = (0, "") if state is None else (state.seq, state.head_hash)
         if head != (link.seq - 1, link.prev_hash):
             raise StaleHead(f"the authority log's head moved to seq {head[0]} since this link was prepared")
@@ -1901,13 +1911,32 @@ class Anchor:
         return {"store_id": self.store_id, "seq": self.seq, "head_hash": self.head_hash}
 
 
-_RESET_HINT = "`levain cockpit anchor reset`"
+# the one word of a printed remedy the operator fills in: which of their laptop-presence key files signs (levain.doctor
+# prints the same word)
+KEY_WORD = "YOUR_LAPTOP_PRESENCE_KEY"
+
+
+def reset_hint(data_root: Path | str) -> str:
+    """The remedy an anchor refusal of a same-store rollback prints: the whole `levain cockpit anchor reset` argv,
+    this data root filled in, so the operator runs it as printed with their key file in place of :data:`KEY_WORD`
+    (tests/test_cockpit_anchor_reset.py runs each one through levain.cli's parser)."""
+    return f"`levain cockpit anchor reset --signing-key {KEY_WORD} --data-root {shlex.quote(str(data_root))}`"
+
+
+def init_hint(data_root: Path | str) -> str:
+    """The remedy for an empty log: the whole `levain cockpit ledger init` argv, this data root filled in."""
+    return f"`levain cockpit ledger init --signing-key {KEY_WORD} --data-root {shlex.quote(str(data_root))}`"
 
 
 def anchor_path(data_root: Path | str) -> Path:
     """``<data_root>/anchor/authority.anchor``: its own directory, so a backup can leave it out while it
     takes the store (:func:`_anchor_dir`)."""
     return Path(data_root) / ANCHOR_DIR / ANCHOR_NAME
+
+
+def anchor_data_root(path: Path | str) -> Path:
+    """The data root whose anchor is ``path`` (:func:`anchor_path` inverted)."""
+    return Path(path).parent.parent
 
 
 def _exclude_from_time_machine(directory: Path) -> None:
@@ -1941,7 +1970,7 @@ def read_anchor(path: Path) -> Anchor | None:
         return None
     except OSError as exc:
         raise AnchorError(f"the authority anchor {path} cannot be read ({type(exc).__name__}); "
-                          f"after checking the log, run {_RESET_HINT}") from None
+                          f"after checking the log, run {reset_hint(anchor_data_root(path))}") from None
     try:
         data = json.loads(raw.decode("utf-8"))
         if data.get("format") != ANCHOR_FORMAT:
@@ -1952,19 +1981,38 @@ def read_anchor(path: Path) -> Anchor | None:
             raise ValueError
     except (ValueError, KeyError, AttributeError, UnicodeDecodeError, RecursionError):
         raise AnchorError(f"the authority anchor {path} is unreadable; after checking the log, run "
-                          f"{_RESET_HINT}") from None
+                          f"{reset_hint(anchor_data_root(path))}") from None
     return Anchor(store_id, seq, head)
 
 
-def check_anchor(snap: AuthoritySnapshot, anchor: Anchor | None) -> None:
-    """Refuse a log behind ``anchor``: another store, fewer links, or another hash at the anchor's seq."""
+def foreign_anchor(snap: AuthoritySnapshot, anchor: Mapping[str, Any] | Anchor | None,
+                   path: Path | str) -> ForeignAnchor | None:
+    """The refusal of an anchor at ``path`` that names another store than ``snap``'s, or None (no anchor, an
+    unreadable one, or this store's). Its remedy is the file to check or move, never a reset: a reset is for a
+    rollback of the same store (DESIGN §3.8), and signing over another store's anchor with this log's keys would
+    let a substituted log adopt the anchor that exists to refuse it."""
+    store = anchor.store_id if isinstance(anchor, Anchor) else None if anchor is None else anchor.get("store_id")
+    if store is None or store == snap.store_id:
+        return None
+    return ForeignAnchor(f"the authority anchor {path} names store {store}, but this log is store {snap.store_id}: "
+                         f"the anchor belongs to another store, and an anchor reset refuses it. Check that "
+                         f"{anchor_data_root(path)} holds the store you meant; if you replaced that store on purpose, "
+                         f"move {path} aside (the next signed link writes this store's anchor)")
+
+
+def check_anchor(snap: AuthoritySnapshot, anchor: Anchor | None, *, path: Path | str) -> None:
+    """Refuse a log behind ``anchor`` (the anchor file at ``path``): another store (:class:`ForeignAnchor`),
+    fewer links, or another hash at the anchor's seq."""
     if anchor is None:
         return
+    foreign = foreign_anchor(snap, anchor, path)
+    if foreign is not None:
+        raise foreign
     here = f"log store {snap.store_id} at seq {snap.seq} ({snap.head_hash[:12]})"
     there = f"anchor store {anchor.store_id} at seq {anchor.seq} ({anchor.head_hash[:12]})"
-    if anchor.store_id != snap.store_id or snap.seq < anchor.seq or snap.hash_at(anchor.seq) != anchor.head_hash:
+    if snap.seq < anchor.seq or snap.hash_at(anchor.seq) != anchor.head_hash:
         raise AnchorError(f"the authority log is behind its anchor: {here}, {there}. If this store was "
-                          f"restored on purpose, run {_RESET_HINT}")
+                          f"restored on purpose, run {reset_hint(anchor_data_root(path))}")
 
 
 def _write_anchor(path: Path, payload: Mapping[str, Any]) -> None:
@@ -2012,7 +2060,7 @@ def advance_anchor(path: Path, snap: AuthoritySnapshot) -> Anchor:
         current = read_anchor(path)
         if current is not None and current.store_id == snap.store_id and current.seq > snap.seq:
             return current
-        check_anchor(snap, current)
+        check_anchor(snap, current, path=path)
         new = Anchor(snap.store_id, snap.seq, snap.head_hash)
         if current != new:
             _write_anchor(path, {"format": ANCHOR_FORMAT, **new.as_dict()})
@@ -2072,26 +2120,60 @@ def _no_live_cockpit(path: Path) -> Iterator[None]:
     for: a server still holding the abandoned store could advance the anchor back onto it."""
     from levain.cockpit.broker import LOCK_NAME
     lock = Path(path).parent.parent / LOCK_NAME
-    fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    except OSError as exc:            # a read-only or missing data root: a refusal, not a traceback (S3a-2 MUST)
+        raise AnchorError(f"the store lock {lock} cannot be opened ({type(exc).__name__}); a reset needs it") from None
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise AnchorError(f"a cockpit server holds {lock}: stop it, then run {_RESET_HINT}") from None
+            raise AnchorError(f"a cockpit server holds {lock}: stop it, then run "
+                              f"{reset_hint(anchor_data_root(path))}") from None
         yield
     finally:
         os.close(fd)
 
 
+class ResetLock:
+    """Both locks a reset holds (:func:`reset_lock`), while its ``with`` block runs."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.live = True
+
+
+@contextmanager
+def reset_lock(path: Path | str) -> Iterator[ResetLock]:
+    """The store lock (:func:`_no_live_cockpit`, refused while a cockpit server holds it) and the anchor's lock,
+    held together: a caller that reads the old anchor, has the reset signed and writes it holds this across all
+    three (``levain.cockpit.keys.anchor_reset``), so no server starts and no advance lands between them."""
+    held = ResetLock(Path(path))
+    try:
+        with _no_live_cockpit(held.path), _anchor_lock(held.path):
+            yield held
+    finally:
+        held.live = False
+
+
 def reset_anchor(path: Path, snap: AuthoritySnapshot, *, signer_fp: str, signature: str,
-                 ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> Anchor:
+                 ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN, held: ResetLock | None = None) -> Anchor:
     """Move the anchor at ``path`` to ``snap``'s head on a verified reset signature, storing the proof
-    in the anchor file (the log refuses to open, so it cannot be a log link). Refused while a cockpit
-    server is live on the store (:func:`_no_live_cockpit`)."""
-    with _no_live_cockpit(path), _anchor_lock(path):
-        old = _old_anchor_view(path)
-        verify_anchor_reset(snap, old, signer_fp=signer_fp, signature=signature, ssh_keygen=ssh_keygen)
-        new = Anchor(snap.store_id, snap.seq, snap.head_hash)
-        _write_anchor(path, {"format": ANCHOR_FORMAT, **new.as_dict(),
-                             "reset": {"old_anchor": old, "signer_fp": signer_fp, "signature": signature}})
-        return new
+    in the anchor file (the log refuses to open, so it cannot be a log link). Runs under :func:`reset_lock`:
+    ``held``, the caller's, or else taken here (refused while a cockpit server is live on the store). An anchor
+    of another store is refused (:func:`foreign_anchor`), whatever the signature."""
+    if held is None:
+        with reset_lock(path) as mine:
+            return reset_anchor(path, snap, signer_fp=signer_fp, signature=signature, ssh_keygen=ssh_keygen,
+                                held=mine)
+    if not held.live or held.path != Path(path):
+        raise AnchorError(f"reset_anchor needs the reset lock of {path}, held")
+    old = _old_anchor_view(path)
+    foreign = foreign_anchor(snap, old, path)
+    if foreign is not None:
+        raise foreign
+    verify_anchor_reset(snap, old, signer_fp=signer_fp, signature=signature, ssh_keygen=ssh_keygen)
+    new = Anchor(snap.store_id, snap.seq, snap.head_hash)
+    _write_anchor(path, {"format": ANCHOR_FORMAT, **new.as_dict(),
+                         "reset": {"old_anchor": old, "signer_fp": signer_fp, "signature": signature}})
+    return new
