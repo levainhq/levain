@@ -260,7 +260,9 @@ def test_delete_refuses_a_tree_deeper_than_its_fd_bound(tmp_path):
     finally:
         os.close(dfd)
     assert e.value.name == "delete-too-deep" and len(os.listdir("/dev/fd")) == fds
-    assert any(p.name == "leaf" for p in (tmp_path / "deep").rglob("leaf"))
+    # os.walk, not Path.rglob: before 3.12 rglob recurses a frame or more per level, and a tree this deep can overflow
+    # the stack of the 3.9 root interpreter this file runs on in CI (the ``root-py39`` job)
+    assert any("leaf" in names for _, _, names in os.walk(tmp_path / "deep"))
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="BSD flags on a symlink are macOS's")
