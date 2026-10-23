@@ -130,7 +130,7 @@ from levain import unshowable
 __all__ = ["CHOICE_FORMAT", "CHOICE_MARK", "ERROR_WORDS", "LIST_MAX", "MESSAGE_MAX", "OPTIONS_MAX",
            "REFUSED_NAMESPACES", "REQUEST_FORMAT", "SIGN_DIR", "WRITE_IN_KEY", "SignRefused", "SignRequest", "Signer",
            "choice_line", "deep_link", "error_word", "namespace_problem", "parse_choice", "passkey_key_source",
-           "read_request", "sign_dir", "sign_root", "signed_bytes", "state_of", "write_in_problem"]
+           "read_request", "request_id_ok", "sign_dir", "sign_root", "signed_bytes", "state_of", "write_in_problem"]
 
 REQUEST_FORMAT = "levain-sign-request/1"
 CHOICE_FORMAT = "levain-sign-choice/1"
@@ -151,6 +151,12 @@ _OPTION_KEY = re.compile(r"[a-z0-9]{1,8}")
 WRITE_IN_KEY = "*"                 # the key a write-in signs under: never an option key, which is [a-z0-9]{1,8}
 # ssh's conventional namespaces: git's commit signing (levain's team ledger verifies in it), file and email
 REFUSED_NAMESPACES = frozenset({"git", "file", "email"})
+
+
+def request_id_ok(request_id: object) -> bool:
+    """True iff ``request_id`` is a sign request id (what a request file is named by, and a cockpit row's `sign` facet
+    carries)."""
+    return isinstance(request_id, str) and _ID.fullmatch(request_id) is not None
 
 
 class SignRefused(Exception):

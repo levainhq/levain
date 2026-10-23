@@ -103,6 +103,9 @@ class Question:
     filed_at: str
     answer: Answer | None
     link: Link | None = None
+    # the levain sign request (levain.consent.sign) a caller filed for this question, by id: the cockpit row then
+    # carries `sign: {"request": <id>}` and the page signs the request's own options. The kernel's store sets none
+    sign_request: str | None = None
 
 
 @dataclass(frozen=True)

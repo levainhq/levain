@@ -134,7 +134,7 @@ KERNEL_DECISION_FACETS = frozenset({"principal", "pending_tier", "expires_at", "
                                     "reason", "unapplied", "cancelled_by",
                                     "agent", "tool", "consent_state", "consent_tier", "decided_at",
                                     "question_n", "question_state", "question_options", "note_n", "note_state",
-                                    "note_open_total"})
+                                    "note_open_total", "sign"})
 QUESTION_VERB = "question_answer"       # the cockpit verb a question row offers (verbs.py registers it)
 QUESTION_DONE_HOURS = 24                # an answered question stays listed this long, as a decided request does
 NOTE_VERB = "note_dismiss"              # the cockpit verb a note row offers (verbs.py registers it)
@@ -508,8 +508,18 @@ def _question_row_in(q: Any) -> RowIn:
                               "question_options": len(q.options)}
     if answered:
         facets["decided_at"] = q.answer.answered_at
+    _sign_facet(facets, q)
     return RowIn(id=f"{QUESTION_ROW_PREFIX}{q.n}", title=f"{agent} · question #{q.n}", facets=facets,
                  stored={"n": q.n, "answered_at": q.answer.answered_at if answered else "open"})
+
+
+def _sign_facet(facets: dict[str, Any], item: Any) -> None:
+    """DESIGN_SIGN D5: ``sign: {"request": <id>}`` on a question or note row whose item names a levain sign request
+    (``sign_request``; an item without the attribute names none). The id only: the page reads the request itself from
+    ``/cockpit/sign.json`` behind the token."""
+    request = getattr(item, "sign_request", None)
+    if request is not None:
+        facets["sign"] = {"request": request}
 
 
 def _question_rows_in(store: Any, now: datetime) -> tuple[list[RowIn], int]:
@@ -541,6 +551,7 @@ def _note_row_in(n: Any, open_total: int | None = None) -> RowIn:
         facets["decided_at"] = n.dismissed.dismissed_at
     elif open_total is not None:
         facets["note_open_total"] = open_total
+    _sign_facet(facets, n)
     return RowIn(id=f"{NOTE_ROW_PREFIX}{n.n}", title=f"note from {agent} #{n.n}", facets=facets,
                  stored={"n": n.n, "dismissed_at": n.dismissed.dismissed_at if dismissed else "open"})
 
