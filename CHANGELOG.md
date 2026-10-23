@@ -20,6 +20,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   Levain enforces an authorized-spend cap: a route's per-session cap on what Levain lets an agent spend. It is a budget, not a ceiling on your bill. Calls already running when the cap is reached can finish past it. To put a hard ceiling on what a provider can bill, set a spending limit on the API key itself.
 
   Sizing: a route's per-session cap should be at least the concurrent calls × their output ceiling × the model's output rate, or calls are refused 402 before they start.
+- **Metered calls are charged what the provider reports, and a call that costs more than its hold stops its session.**
+  When a call on a metered route completes, Levain reads the usage the provider reports in the response (input,
+  output, cache writes, cache reads and per-call tools such as web search) and charges it at the route's price table.
+  A call that reports no usage, or whose usage could not be read, is charged its whole hold. When a call costs more
+  than was held for it, it is charged in full and its session is stopped: the session's later calls are refused
+  `budget-overrun` (402), while calls already running finish and are charged from their own usage. The stop lasts
+  until the session ends, or until the credential-holding process restarts (the stop is kept in its memory). A streamed openai-chat request that does not say whether it wants usage is sent asking for
+  it, so the provider adds one final chunk carrying the usage.
 
 ## [0.11.20] — 2026-10-23
 
