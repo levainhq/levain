@@ -3,7 +3,7 @@
 Root launches it with its cwd at the mount of ITS per-run image (``.verify/``), whose layout root made at seal-in:
 ``in/bundle`` and ``in/base.bundle`` (root's copies, hashed while copied), ``scratch/`` (empty), ``out/`` (empty) and
 ``log/``. It runs :func:`adopt_verify.quarantine_verify` and, on a pass, writes ``out/verified.json``, ``out/q.idx``
-(Q's one idx, byte for byte) and ``out/preview.txt`` (5d-i: the §6.2 step-0 header line only; the content is 5d-ii's),
+(Q's one idx, byte for byte) and ``out/preview.txt`` (§6.2, :func:`adopt_preview.write_preview` over the P it left),
 then answers ONE result line on fd 4 (:func:`result_line`). Every exit answers exactly one line, written at one
 place; a failed run leaves no file in ``out/``. ``enospc`` is SOURCE-SIDE, from the verifier's own readings on its
 fatal path only (the importer's rule, :func:`importer.probe_enospc` over ``scratch/``).
@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from levain.contracts import canon
-from levain.slot import Refused, adopt_verify, bundlefmt, importer, write_all
+from levain.slot import Refused, adopt_preview, adopt_verify, bundlefmt, importer, write_all
 from levain.slot.grammar import SESSION_RE
 
 RESULT_FD = 4
@@ -68,11 +68,15 @@ def _copy_new(src: Path, dst: Path) -> None:
         os.close(fd)
 
 
-def write_outputs(work: Path, v: adopt_verify.Verified, q_idx: Path) -> None:
+def write_outputs(work: Path, v: adopt_verify.Verified, q_idx: Path, *, git: str, base_oid: str, object_format: str,
+                  log=None) -> None:
+    """The preview first (it can still refuse, ``preview-cap:output``, before any output exists), then the two
+    others."""
     out = work / "out"
+    p = importer.GitRunner(git, work / "scratch" / "p", log)
+    adopt_preview.write_preview(out / "preview.txt", p, v, base_oid=base_oid, hexlen=bundlefmt.OID_HEX[object_format])
     _write_new(out / "verified.json", v.to_json() + b"\n")
     _copy_new(q_idx, out / "q.idx")
-    _write_new(out / "preview.txt", (adopt_verify.PREVIEW_HEADER + "\n").encode("utf-8"))
 
 
 def remove_outputs(work: Path) -> bool:
@@ -112,7 +116,8 @@ def run(argv: Sequence[str], *, result_fd: int, work: Optional[Path],
                 work / "in" / "bundle", work / "in" / "base.bundle", session=a.session, base_oid=a.base_oid,
                 object_format=a.object_format, result=a.result, scratch=work / "scratch", git=a.git,
                 max_input_size=a.max_input_size, log=log)
-            write_outputs(work, v, work / "scratch" / "q" / "repo.git" / "objects" / "pack" / v.q_idx[0])
+            write_outputs(work, v, work / "scratch" / "q" / "repo.git" / "objects" / "pack" / v.q_idx[0],
+                          git=a.git, base_oid=a.base_oid, object_format=a.object_format, log=log)
             out.update(rc=0, refused=None, detail="", enospc=False, result=v.result)
         except Refused as r:
             out.update(rc=1, refused=r.name, detail=r.detail, result=None)

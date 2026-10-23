@@ -330,7 +330,7 @@ def _required(p: importer.GitRunner, q: importer.GitRunner, scratch: Path, tips:
                     absent = True
                 else:
                     pf.write(oid + b"\n")
-        specials = _delta_specials(p, scratch, present, rf, hexlen, objects) if result == "delta" else set()
+        specials = _delta_specials(p, scratch, raw, present, rf, hexlen, objects) if result == "delta" else set()
     finally:
         rf.close()
     out = scratch / "required"
@@ -343,9 +343,10 @@ def _required(p: importer.GitRunner, q: importer.GitRunner, scratch: Path, tips:
     return out, specials, absent
 
 
-def _delta_specials(p: importer.GitRunner, scratch: Path, present: Path, rf: _Inventory, hexlen: int,
+def _delta_specials(p: importer.GitRunner, scratch: Path, raw: Path, present: Path, rf: _Inventory, hexlen: int,
                     objects: int) -> set:
-    """DELTA's adopt special set over the closure's trees, appended to the required list ``rf``."""
+    """DELTA's adopt special set over the closure's trees, appended to the required list ``rf`` (which already holds
+    every line of ``raw``, the closure, present and absent)."""
     types = scratch / "closure-types"
     with _Inventory(types, objects, hexlen) as w:
         _to_inventory(p, w, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)", stdin=present)
@@ -368,11 +369,13 @@ def _delta_specials(p: importer.GitRunner, scratch: Path, present: Path, rf: _In
         specials = special_paths.adopt_specials(importer._tree_payloads(payloads, hexlen), hexlen)
     except ValueError as e:
         raise Refused("fsck:other", f"a tree Levain's reader refuses: {e}"[:300]) from None
-    # Only the specials the closure lacks: each present oid is then on the list once, so it stays within its share (a
-    # delta adding symlinks to a small base wrote each target twice and went past its share: this lane's own row)
+    # Only the specials the closure lacks, present OR absent (``?<oid>``): each closure oid is then on the list once, so
+    # it stays within its share (a delta adding symlinks to a small base wrote each target twice and went past its
+    # share, fix1's row; an absent target was still written twice, L3 r2 complement LOW 2)
     new = set(specials)
-    for oid in _oid_lines(present, hexlen, "closure-present"):
-        new.discard(oid)
+    with importer._read_own(raw) as fh:
+        for line in importer._lines(fh, "rev-list"):
+            new.discard((line[1:] if line[:1] == b"?" else line).decode("ascii"))
     for oid in sorted(new):
         rf.write(oid.encode("ascii") + b"\n")
     return specials
