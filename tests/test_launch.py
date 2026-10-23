@@ -191,8 +191,21 @@ def _spawn_problems(path: Path, root: Path = ROOT) -> list[str]:
     return out + _alias_problems(tree, path.relative_to(root))
 
 
-def _env_problem(call: ast.Call, what: str) -> str | None:
+# Where the env argument sits in the env-taking exec family: a fixed positional index, or (for the `l`
+# forms) the LAST positional after this many leading ones.
+_ENV_AT = {"execve": 2, "execvpe": 2, "posix_spawn": 2, "posix_spawnp": 2, "spawnve": 3, "spawnvpe": 3}
+_ENV_LAST_AFTER = {"execle": 2, "execlpe": 2, "spawnle": 3, "spawnlpe": 3}
+
+
+def _env_problem(call: ast.Call, what: str, name: str = "") -> str | None:
     env = next((k.value for k in call.keywords if k.arg == "env"), None)
+    if env is None and name in _ENV_EXEC:
+        if any(isinstance(a, ast.Starred) for a in call.args):
+            return f"{what} with a starred argument: the scan cannot find its env"
+        if name in _ENV_AT and len(call.args) > _ENV_AT[name]:
+            env = call.args[_ENV_AT[name]]
+        elif name in _ENV_LAST_AFTER and len(call.args) > _ENV_LAST_AFTER[name]:
+            env = call.args[-1]
     if env is None:
         return f"{what} without env="
     if ast.unparse(env) == "None" or "os.environ" in ast.unparse(env):
@@ -203,7 +216,8 @@ def _env_problem(call: ast.Call, what: str) -> str | None:
 def _alias_problems(tree: ast.Module, rel: Path) -> list[str]:
     """Spawners held as a VALUE (`run: Run = subprocess.run`, `run = run or subprocess.run`,
     `(run or subprocess.run)(...)`): the scan above sees only `subprocess.run(...)`, so it follows the
-    alias instead. Every call through it must pass env=; the alias may be handed on to a function defined
+    alias instead. Every call through it must pass env (`env=`, or the env-taking exec family's own positional
+    slot); the alias may be handed on to a function defined
     in the same module (followed into that parameter); any other use of it, and any other value reference
     to a spawner, is refused because the scan cannot follow it. Type annotations are not references."""
     parent = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
@@ -224,12 +238,12 @@ def _alias_problems(tree: ast.Module, rel: Path) -> list[str]:
 
     funcs = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
     out: list[str] = []
-    todo: list[tuple[ast.AST, str, str]] = []   # (scope, alias name, what it holds)
+    todo: list[tuple[ast.AST, str, str, str]] = []   # (scope, alias name, what it holds, the spawner's name)
     for n in ast.walk(tree):
         if not (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)) or id(n) in annotations:
             continue
         key = (n.value.id, n.attr)
-        if key not in _SPAWN and key not in _NO_ENV:
+        if key not in _SPAWN and key not in _NO_ENV and not (key[0] == "os" and key[1] in _ENV_EXEC):
             continue
         p = parent.get(n)
         if isinstance(p, ast.Call) and p.func is n:
@@ -240,7 +254,7 @@ def _alias_problems(tree: ast.Module, rel: Path) -> list[str]:
             continue
         holder = parent.get(p) if isinstance(p, ast.BoolOp) else p
         if isinstance(p, ast.BoolOp) and isinstance(holder, ast.Call) and holder.func is p:
-            problem = _env_problem(holder, f"{what} (through `{ast.unparse(p)}`)")
+            problem = _env_problem(holder, f"{what} (through `{ast.unparse(p)}`)", key[1])
             if problem:
                 out.append(problem)
         elif isinstance(holder, ast.arguments):
@@ -250,14 +264,14 @@ def _alias_problems(tree: ast.Module, rel: Path) -> list[str]:
                 arg = positional[len(positional) - len(holder.defaults) + holder.defaults.index(node)]
             else:
                 arg = holder.kwonlyargs[holder.kw_defaults.index(node)]
-            todo.append((parent[holder], arg.arg, what))
+            todo.append((parent[holder], arg.arg, what, key[1]))
         elif isinstance(holder, ast.Assign) and len(holder.targets) == 1 and isinstance(holder.targets[0], ast.Name):
-            todo.append((scope_of(holder), holder.targets[0].id, what))
+            todo.append((scope_of(holder), holder.targets[0].id, what, key[1]))
         else:
             out.append(f"{what} held as a value the scan cannot follow: call it directly with env=")
     seen: set[tuple[int, str]] = set()
     while todo:
-        scope, name, what = todo.pop()
+        scope, name, what, spawner = todo.pop()
         if (id(scope), name) in seen:
             continue
         seen.add((id(scope), name))
@@ -266,7 +280,7 @@ def _alias_problems(tree: ast.Module, rel: Path) -> list[str]:
                 continue
             p = parent[u]
             if isinstance(p, ast.Call) and p.func is u:
-                problem = _env_problem(p, f"{rel}:{u.lineno} {name}(...) (holds {what})")
+                problem = _env_problem(p, f"{rel}:{u.lineno} {name}(...) (holds {what})", spawner)
                 if problem:
                     out.append(problem)
                 continue
@@ -279,10 +293,10 @@ def _alias_problems(tree: ast.Module, rel: Path) -> list[str]:
             if callee is not None:
                 params = callee.args.posonlyargs + callee.args.args
                 if isinstance(u, ast.keyword):
-                    todo.append((callee, u.arg, what))
+                    todo.append((callee, u.arg, what, spawner))
                     continue
                 if u in p.args and p.args.index(u) < len(params):
-                    todo.append((callee, params[p.args.index(u)].arg, what))
+                    todo.append((callee, params[p.args.index(u)].arg, what, spawner))
                     continue
             out.append(f"{rel}:{u.lineno} `{name}` (holds {what}) used where the scan cannot follow it")
     return out
@@ -326,6 +340,24 @@ def test_the_scan_follows_a_spawner_held_as_a_value(tmp_path: Path) -> None:
     problems = _spawn_problems(bad, tmp_path)
     assert len(problems) == 6, "\n".join(problems)
     assert not any(f"bad.py:{n} " in p for n in (16, 17, 18) for p in problems), "\n".join(problems)
+
+
+def test_the_scan_follows_an_execve_held_as_a_value(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.py"
+    bad.write_text("import os\n"
+                   "def g(ex=os.execve):\n    ex('x', ['x'])\n"                        # default, no env
+                   "def h(ex=os.execve):\n    ex('x', ['x'], env=None)\n"             # env=None
+                   "def k(ex=None):\n    (ex or os.execve)('x', ['x'])\n"             # call target, no env
+                   "E = os.execve\nE('x', ['x'])\n"                                    # module alias
+                   "def s(ex=os.spawnve):\n    ex(0, 'x', ['x'])\n"                    # spawnve slot is 3
+                   "def le(ex=os.execle):\n    ex('x', 'x')\n"                         # execle: env is last
+                   "def ok(ex=os.execve):\n    ex('x', ['x'], {})\n"                   # positional env
+                   "def ok2(ex=os.execve):\n    ex('x', ['x'], env={})\n"              # keyword env
+                   "def ok3(ex=os.spawnve):\n    ex(0, 'x', ['x'], {})\n"
+                   "def ok4(ex=os.execle):\n    ex('x', 'x', {})\n")
+    problems = _spawn_problems(bad, tmp_path)
+    assert len(problems) == 6, "\n".join(problems)
+    assert not any(f"bad.py:{n} " in p for n in range(14, 25) for p in problems), "\n".join(problems)
 
 
 # --- the console entry --------------------------------------------------------------------------
