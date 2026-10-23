@@ -4978,14 +4978,20 @@
     const got = consentQueued(() => fetchBounded("/cockpit/consent/grants.json", { cache: "no-store", headers: headers },
       (res) => (res.ok ? res.json().then((b) => (b && Array.isArray(b.grants) ? b : null), () => null) : null),
       () => null), "the standing grants could not be read").then((b) => {
-        if (!b) { if (grantRead === got) grantRead = null; return null; }
+        // the queued read answers {error} on its own failures (a throw, a stall past the deadline): only a read that
+        // carries grants is kept, so a failed one is read again at the next repaint instead of hiding the slot for 30 s
+        if (!b || !Array.isArray(b.grants)) { if (grantRead === got) grantRead = null; return null; }
         return b;
       });
     grantRead = got;
     return got;
   }
-  const grantRefused = (g) => (g && g.answered && Array.isArray(g.answered.recent) ? g.answered.recent : [])
+  // how many of a grant's calls were refused: the server's count over all of them (`answered.refused_count`), never read
+  // off the newest calls it sends (a refusal older than those still counts)
+  const grantRefusedShown = (g) => (g && g.answered && Array.isArray(g.answered.recent) ? g.answered.recent : [])
     .filter((c) => c && c.outcome === "refused").length;
+  const grantRefused = (g) => Math.max(g && g.answered && Number.isInteger(g.answered.refused_count) ? g.answered.refused_count : 0,
+                                       grantRefusedShown(g));
   function grantCard(g, inertNote) {
     const sv = (x) => (typeof x === "string" ? x : "");
     const state = sv(g.state);
@@ -5010,7 +5016,7 @@
     row.appendChild(facts);
     if (state === "inert" && inertNote) row.appendChild(el("div", "consent-note ext-meta", inertNote));
     // the newest calls the server sent, refused ones first (sort is stable: each group stays newest first). A refused call
-    // older than those is not on the card; the count says how many there were in all
+    // older than those is not on the card; the counts say how many there were in all
     const calls = (Array.isArray(a.recent) ? a.recent.slice() : [])
       .sort((x, y) => (y.outcome === "refused" ? 1 : 0) - (x.outcome === "refused" ? 1 : 0));
     if (calls.length) {
@@ -5020,7 +5026,9 @@
         box.appendChild(el("div", "grant-call ext-meta grant-" + o, o + " · " + sv(c.tool) + " · " + sv(c.at)
                            + (sv(c.cwd) ? " · in " + c.cwd : "")));
       }
-      if (calls.length < count) box.appendChild(el("div", "grant-call ext-meta", "the newest " + calls.length + " of " + count));
+      const older = refused - grantRefusedShown(g);
+      if (calls.length < count) box.appendChild(el("div", "grant-call ext-meta", "the newest " + calls.length + " of " + count
+                                                   + (older > 0 ? " · " + older + " refused call" + (older === 1 ? "" : "s") + " older than these" : "")));
       row.appendChild(box);
     }
     const cmd = sv(g.revoke);

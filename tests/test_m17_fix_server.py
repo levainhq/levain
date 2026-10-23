@@ -8,19 +8,13 @@ challenge from the line it shows and refuse any other."""
 from __future__ import annotations
 
 import json
-from datetime import timedelta
 
 from levain import authority as auth
-from levain.consent.grants import create_grant, grant_view
+from levain.consent.grants import grant_view
 from levain.consent.passkey import challenge
 from tests.test_dispatch_phone import _b64u
 from tests.test_grant_phone import _now, world  # noqa: F401  (world is a fixture)
-from tests.test_phone_grants_tab import _answered
-
-
-def _grant(world, gid: str, tool: str) -> None:
-    create_grant(world.root, agent="claude_code", tools=[tool], workspace=world.ws, postures=["default"],
-                 expires=timedelta(days=1), signer_fp=world.lfp, sign=world.laptop_sign, clock=_now, grant_id=gid)
+from tests.test_phone_grants_tab import _answered, _grant
 
 
 def test_a_refusal_older_than_the_newest_calls_is_still_counted(world):

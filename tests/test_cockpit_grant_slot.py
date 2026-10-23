@@ -64,3 +64,57 @@ def test_a_page_without_its_token_draws_no_grant(world, tmp_path, monkeypatch):
             {"eval": "new Promise(r => setTimeout(() => r(document.querySelectorAll('#levain-modal [data-consent-grant]').length), 1500))"},
         ])
     assert out["values"][-1] == 0
+
+
+_TYPE = ("(v => { const i = document.querySelector('#levain-modal .xfilter-input'); i.value = v;"
+         " i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })")
+
+
+@needs_browser
+def test_a_failed_grants_read_is_not_cached_as_a_good_one(world, tmp_path, monkeypatch):
+    """M17 L3 r1 M-2. The first grants.json read fails (the fetch throws, so the queued read answers ``{error}``); the
+    next repaint of the slot (a filter repaint, inside the 30 s cache) must read again and draw the grant. Reproduced
+    red on 7ae3def0: the ``{error}`` object was cached as a read, so no card came back until the modal was reopened."""
+    monkeypatch.setenv("LEVAIN_HOME", str(world.qdir.parent))
+    _grant(world, "cg-0000000000aa", "Write")
+    assert _answered(world, "Write", "a.txt", "accepted") == "cg-0000000000aa"   # a decided row: the modal draws its filter
+    _root, src, _ids = _install(tmp_path)
+    stub = ("(() => { const real = window.fetch.bind(window); let n = 0; window.fetch = (u, o) => {"
+            " if (String(u).includes('/grants.json') && n++ < 1) throw new TypeError('the first grants read fails');"
+            " return real(u, o); }; return 1; })()")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": TILE}, {"eval": stub}, {"eval": OPEN_DECISIONS},
+            {"until": "!!document.querySelector('#levain-modal .xfilter-input')"},
+            {"eval": f"new Promise(r => setTimeout(() => r({_CARDS}.length), 1500))"},
+            {"eval": f"{_TYPE}('zzz-no-row')"}, {"eval": f"{_TYPE}('')"},
+            {"eval": f"new Promise(r => setTimeout(() => r({_CARDS}.length), 2000))"},
+        ])
+    first, after = out["values"][-4], out["values"][-1]
+    assert first == 0, out["values"]            # the failed read drew nothing
+    assert after == 1, out["values"]            # and was not kept: the repaint read again
+
+
+@needs_browser
+def test_a_refusal_older_than_the_newest_calls_still_leads_the_slot(world, tmp_path, monkeypatch):
+    """M17 L3 r1 M-5 (ruling M17-1), desktop. Reproduced red on 7ae3def0: the grant whose one refusal is older than
+    its 5 newest calls was neither first nor accented, and its head said no refusal."""
+    monkeypatch.setenv("LEVAIN_HOME", str(world.qdir.parent))
+    _grant(world, "cg-0000000000aa", "Write")
+    _grant(world, "cg-0000000000bb", "Edit")
+    assert _answered(world, "Write", "a.txt", "accepted") == "cg-0000000000aa"
+    assert _answered(world, "Edit", "r.txt", "refused") == "cg-0000000000bb"
+    for i in range(5):
+        assert _answered(world, "Edit", f"b{i}.txt", "accepted") == "cg-0000000000bb"
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": TILE}, {"eval": OPEN_DECISIONS},
+            {"until": f"{_CARDS}.length === 2"},
+            {"eval": f"{_CARDS}.map(c => c.dataset.consentGrant)"},
+            {"eval": f"{_CARDS}[0].classList.contains('grant-demote')"},
+            {"eval": f"{_CARDS}[0].querySelector('.consent-left').textContent"},
+        ])
+    order, demote, left = out["values"][-3:]
+    assert order == ["cg-0000000000bb", "cg-0000000000aa"] and demote is True, out["values"]
+    assert "answered 6×" in left and "1 refused" in left, left
