@@ -1217,8 +1217,12 @@
       if (g.classList.contains("tv-open")) return;
       // a seat the compose card can address (its chip id is among the card's chips now) takes the tap into the message box; the chip id is
       // "seat:" + the full roster name, which is its GROUP's label (the node's own label is only the tail). Anything else keeps its page.
+      // Only the seat's own node does: its lanes sit in the seat's group with that node as parent, and a label shared by two groups
+      // names no one seat. Each of those keeps its agent page.
       const D = root.LevainDashboard, grp = arr(v.groups).find((q) => q && q.id === n.group);
-      if (D && typeof D.messageTo === "function" && grp && typeof grp.label === "string" && D.messageTo("seat:" + grp.label.trim())) { hideTip(); return; }
+      const own = n.parent == null || n.parent === "";
+      const unique = grp && typeof grp.label === "string" && arr(v.groups).filter((q) => q && typeof q.label === "string" && q.label.trim() === grp.label.trim()).length === 1;
+      if (own && unique && D && typeof D.messageTo === "function" && D.messageTo("seat:" + grp.label.trim())) { hideTip(); return; }
       const A = root.LevainAgentPage;
       if (A && typeof A.open === "function") { hideTip(); A.open({ id: n.id, label: n.label, rows: tipRows(n, v.as_of), session: typeof n.session === "string" ? n.session : "" }, g); }
       else toggle(n, x, y);

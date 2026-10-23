@@ -3664,11 +3664,18 @@
         const pick = el("select", "rc-pick");
         pick.setAttribute("aria-label", f.label ? String(f.label) : "To");
         pick.setAttribute("data-ck-compose", "recipient-pick");
-        pick.appendChild(Object.assign(el("option", null, "everyone"), { value: "" }));
-        for (const c of chips) pick.appendChild(Object.assign(el("option", null, c.textContent), { value: c.dataset.value }));
+        // the picker's options are told apart by IDENTITY, never by value: a roster may legally hold an id equal to the synthetic one's value
+        const everyone = Object.assign(el("option", null, "everyone"), { value: "" });
+        pick.appendChild(everyone);
+        const optOf = new Map();
+        for (const c of chips) { const o = Object.assign(el("option", null, c.textContent), { value: c.dataset.value }); pick.appendChild(o); optOf.set(c.dataset.value, o); }
         const several = Object.assign(el("option", null, "several readers"), { value: SEVERAL_VALUE, hidden: true, disabled: true });
         pick.appendChild(several);
-        pick.addEventListener("change", () => setTo(pick.value === "" || pick.value === SEVERAL_VALUE ? [] : [pick.value]));
+        const optAt = (o) => Array.prototype.indexOf.call(pick.options, o);
+        pick.addEventListener("change", () => {
+          const o = pick.options[pick.selectedIndex];
+          setTo(!o || o === everyone || o === several ? [] : [o.value]);
+        });
         group.appendChild(pick);
         group.appendChild(el("span", "ck-to-hint", "none selected = everyone"));
         box.insertBefore(group, box.firstChild);
@@ -3677,7 +3684,7 @@
           const want = new Set(values);
           for (const c of chips) c.setAttribute("aria-pressed", want.has(c.dataset.value) ? "true" : "false");
           const now = pressedNow();
-          pick.value = now.length === 1 ? now[0] : (now.length ? SEVERAL_VALUE : "");
+          pick.selectedIndex = optAt(now.length === 1 ? optOf.get(now[0]) : (now.length ? several : everyone));
           if (remember !== false) composePick[pickKey] = now;
           chipAddr();
         }
@@ -3737,7 +3744,9 @@
     if (addr) { chipAddr(); row.appendChild(addr); }
     if (chipCtl) {
       chipCtl.set(chipCtl.initial, false);
-      box.ckPick = (values) => chipCtl.set(values);   // the agents graph's tap on a seat (messageTo, below)
+      box.dataset.composeKey = chipCtl.pickKey;
+      box.ckBusy = () => go.disabled;                 // mid-send or at the confirm: the recipient is frozen
+      box.ckPick = (values) => { if (go.disabled) return false; chipCtl.set(values); return true; };   // the agents graph's tap on a seat (messageTo, below)
     }
     const msg = el("span", "edit-msg", "");
     row.append(go, msg);
@@ -3753,20 +3762,34 @@
     const collect = () => collectActionParams(controls.map((c) =>
       ({ name: c.f.name, kind: c.f.kind, required: c.f.required, label: c.f.label, value: c.read() })));
 
-    const failed = (res) => {
-      setDisabled(false);
-      showFail(msg, res, "failed");
-      // a seat that left the roster since the chips were drawn: the kernel refuses with a plain error naming no live seat
-      const text = String((res && (res.message || res.error)) || "");
-      if (chipCtl && /no live seat/i.test(text)) {
-        msg.textContent = "that seat is gone, choose again";
-        chipCtl.set(chipCtl.chips.filter((c) => c.getAttribute("aria-pressed") === "true" && !/^seat:/.test(c.dataset.value)).map((c) => c.dataset.value));
-        delete composePick[chipCtl.pickKey];
-        const V = window.LevainCockpitView;
-        if (V && typeof V.refetchPanel === "function" && action.panel) { try { V.refetchPanel(action.panel); } catch (_) { /* the next poll redraws the chips */ } }
-      }
+    // The kept pick is taken BEFORE a send goes out: a landed send rebuilds the board (and this box) before its promise resolves, and the
+    // fresh box must start from the desk, not from the pick it just used. The returned restore puts it back if the send fails.
+    const takePick = () => {
+      if (!chipCtl) return null;
+      const had = chipCtl.pickKey in composePick, snap = composePick[chipCtl.pickKey];
+      delete composePick[chipCtl.pickKey];
+      return () => { if (had && !(chipCtl.pickKey in composePick)) composePick[chipCtl.pickKey] = snap; };
     };
-    const sent = () => { if (chipCtl) delete composePick[chipCtl.pickKey]; };
+    const failed = (res, restore) => {
+      setDisabled(false);
+      if (restore) restore();
+      showFail(msg, res, "failed");
+      // a seat that left the roster since the chips were drawn: the serving app's refusal names "no live seat" (code or words, whichever
+      // transport carried it)
+      const text = res ? [res.error, res.message].map((x) => String(x || "")).join(" ") : "";
+      if (chipCtl && /no[ _]live[ _]seat/i.test(text)) seatGone();
+    };
+    async function seatGone() {
+      const notice = "that seat is gone, choose again";
+      const currentBox = () => box.isConnected ? box : document.querySelector('.tray-dump[data-compose-key="' + String(chipCtl.pickKey).replace(/["\\]/g, "") + '"]');
+      const say = () => { const b = currentBox(), m = b ? b.querySelector(".edit-msg") : null; if (m) { m.className = "edit-msg err"; m.textContent = notice; } };
+      const V = window.LevainCockpitView;
+      let r = false;
+      if (V && typeof V.refetchPanel === "function" && action.panel) { try { r = await V.refetchPanel(action.panel); } catch (_) { r = "fault"; } }
+      // not rebuilt (the refetch declined, faulted or never ran): un-press the seat chips here and leave the draft where it is
+      if (r !== "applied" && box.isConnected) chipCtl.set(chipCtl.read().filter((v) => !/^seat:/.test(v)));
+      say();
+    }
 
     // ── async-job (spec.job) result area + poll loop ──
     // A job verb PROPOSES (commitJob — NO board reload) then polls /job.json. The result lives in
@@ -3808,10 +3831,10 @@
       };
       setTimeout(tick, 1000);  // first poll soon, then every 2s
     };
-    const startJob = async (params, key) => {
+    const startJob = async (params, key, restore) => {
       msg.className = "edit-msg busy"; msg.textContent = "starting…";
       const res = await commitJob(action.verb, params, true, key);
-      if (!(res && res.ok)) { failed(res); return; }
+      if (!(res && res.ok)) { failed(res, restore); return; }
       msg.className = "edit-msg"; msg.textContent = "";
       setJob("running", null);
       startPoll(res.job_id);
@@ -3823,8 +3846,9 @@
       const sendKey = keyForSend(c.params);  // stable across a retry of THIS content (above)
       if (!spec.confirm_required) {
         setDisabled(true); msg.className = "edit-msg busy"; msg.textContent = "…";
-        if (spec.job) { startJob(c.params, sendKey).then(() => setDisabled(false)); return; }
-        commitAction(action.verb, c.params, false, sendKey, action.panel).then((res) => { if (res && res.ok) sent(); else failed(res); });
+        const restore = takePick();
+        if (spec.job) { startJob(c.params, sendKey, restore).then(() => setDisabled(false)); return; }
+        commitAction(action.verb, c.params, false, sendKey, action.panel).then((res) => { if (!(res && res.ok)) failed(res, restore); });
         return;
       }
       // confirm step (the fat-finger gate): swap the send button for a confirm/cancel pair AND
@@ -3854,16 +3878,17 @@
       yes.addEventListener("click", async () => {
         yes.disabled = true; no.disabled = true; setDisabled(true);
         msg.className = "edit-msg busy"; msg.textContent = "…";
+        const restore = takePick();
         if (spec.job) {
           // A job verb PROPOSES (no board reload), then polls in-box. Close the confirm form
           // (restores the compose box + re-enables it for a next run); the result renders below.
-          await startJob(c.params, sendKey);
+          await startJob(c.params, sendKey, restore);
           close();
           return;
         }
         const res = await commitAction(action.verb, c.params, true, sendKey, action.panel);
-        if (res && res.ok) { sent(); return; }  // re-rendered → this box is gone, replaced fresh
-        close(); failed(res);
+        if (res && res.ok) return;  // re-rendered → this box is gone, replaced fresh
+        close(); failed(res, restore);
       });
     });
 
@@ -5684,7 +5709,7 @@
     const chip = Array.from(document.querySelectorAll('[data-ck-compose="recipient"]'))
       .find((c) => c.dataset.value === chipId && !c.closest("#levain-modal") && !c.disabled);
     const box = chip ? chip.closest(".tray-dump") : null;
-    if (!chip || !box || typeof box.ckPick !== "function") return false;
+    if (!chip || !box || typeof box.ckPick !== "function" || (typeof box.ckBusy === "function" && box.ckBusy())) return false;
     const panel = chip.closest("[data-ck-panel]");
     const K = layoutKit();
     if (panel) {
