@@ -5,7 +5,14 @@ server on `R/keys/admin.sock`; and the `Q` handler: its frame, token states and 
 token's claims, keys' own policy load, the re-checks, the 3c seams at their refusing defaults, the credential, and the
 request through `Upstream.write`); and the UPSTREAM half (session 3b-4): the address check, TLS through `upstream.py`,
 the h11 request and response, the relay `R` `b`* `e` through the redaction scanner, and keys' log `gw.jsonl` (one
-record per exchange, plus the `levain.broker` notes).
+record per exchange, plus the `levain.broker` notes); and the reservation ledger's wiring (S1 3c-1, `ledger.py`): the
+request check's last step admits a hold against the route's per-session cap, the head goes only behind its durable
+`reserved` line and the ledger's send gate, and every exit resolves the hold.
+
+Known edges of the ledger wiring (3c-1 B1 L2, 10-23; not built, never a loss):
+- before Python 3.12 a cancel landing in the loop turn the durable wait completes is lost (bpo-42130; reproduced on
+  /usr/bin/python3 3.9.6); money-safe because `_detach` marks the exchange detached before it cancels, so
+  `Upstream.write` raises StaleExchange and `mark_sent` is never reached.
 
 The admin server (design 1.5 "The admin connection", "Fencing", "Order inside one connection"):
 - a connection is accepted only from the `_levain_control` uid, read from the kernel; any other peer is closed unread.
@@ -67,7 +74,7 @@ from typing import Awaitable, Dict, List, Optional, Sequence, Set, Tuple, TypeVa
 
 import h11
 
-from levain.broker import gwwire, norm, upstream
+from levain.broker import gwwire, ledger, norm, upstream
 from levain.broker.creds import (COMMIT_FDS, REFRESH_CONNS, CredLifecycle, CredStore, Credential, CredWriter,
                                  FakeCredLifecycle, check_host, fresh, on_upstream_401, unexpired)
 from levain.broker.gwwire import FrameReader, KeysSide, WireError
@@ -191,6 +198,8 @@ WS_FRAME = gwwire.CAPS[b"D"]
 _WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 #: keys' log, under the lib root (design 1.9): one JSON line per exchange and per diagnostic note
 GW_LOG = ("keys", "log", "gw.jsonl")
+#: the reservation ledger, under the lib root (design 3c-1 §2.5): opened by `main()` before anything is bound
+LEDGER = ("keys", "ledger.jsonl")
 
 
 def _at(t: float) -> str:
@@ -259,31 +268,6 @@ def install_log(lib_root: str) -> GwLog:
 
 # --- the seams 3c fills (design 1.11), with their refusing production defaults ------------------------------------
 
-class RefusingBudget:
-    """`budget`'s production default until 3c's ledger: every reservation is refused `budget-exhausted`.
-
-    The seam is two calls: `reserve` (the request check's last step; refusing raises `norm.Refused`) and `release`,
-    which keys calls exactly once for every reservation `reserve` made, when its exchange ends without a relayed
-    response to settle it. `sent` says whether the request head was handed to the upstream connection by then (it
-    may have been processed, so a ledger may hold what it would otherwise free)."""
-
-    def reserve(self, session: str, route: str, max_call_microdollars: Optional[int]) -> None:
-        raise norm.Refused("budget-exhausted", "no ledger")
-
-    def release(self, session: str, route: str, max_call_microdollars: Optional[int], sent: bool) -> None:
-        return None
-
-
-class UnmeteredBudget:
-    """`--unmetered` (3b's fixture and VM runs only; 3c deletes the flag): every reservation is admitted."""
-
-    def reserve(self, session: str, route: str, max_call_microdollars: Optional[int]) -> None:
-        return None
-
-    def release(self, session: str, route: str, max_call_microdollars: Optional[int], sent: bool) -> None:
-        return None
-
-
 def no_dispatch_route(route: str) -> Optional[RoutePolicy]:
     """`dispatch_policy`'s production default until 3c: no dispatch map is loaded (RELOAD is refused), so it knows
     no route, and a dispatch-map id is `route-not-allowed`."""
@@ -324,11 +308,13 @@ class FrontFrames:
     waiting (a lost race, a cancel) leaves that read in place for the next one, so no frame is lost or split by a
     cancel mid-read, and keys holds no more than the one frame it returns. `read` has `FrameReader.read`'s shape."""
 
-    __slots__ = ("frames", "_t")
+    __slots__ = ("frames", "_t", "responded")
 
     def __init__(self, frames: FrameReader) -> None:
         self.frames = frames
         self._t: Optional[asyncio.Future] = None
+        #: `R` or `U` has been written to the front: from then no `F` may follow (the wire's order)
+        self.responded = False
 
     def pending(self, allowed: frozenset) -> asyncio.Future:
         """The next frame's read, started now if none is in flight (its allowed set is the one given here)."""
@@ -634,11 +620,12 @@ class Keys:
     def __init__(self, *, gw_uids: frozenset = frozenset(), single_uid: Optional[int] = None,
                  control_path: Optional[str] = None, lib_root: Optional[str] = None,
                  cred_lifecycle: Optional[CredLifecycle] = None, control_uid: Optional[int] = None,
-                 unmetered: bool = False, budget: object = None, dispatch_policy: object = None,
+                 ledger: Optional[ledger.Ledger] = None, dispatch_policy: object = None,
                  codec: object = None, creds: Optional[CredStore] = None) -> None:
-        #: the seams 3c fills; each defaults to its refusing production default (`--unmetered` admits the budget)
-        self.unmetered = unmetered
-        self.budget = budget if budget is not None else (UnmeteredBudget() if unmetered else RefusingBudget())
+        #: the reservation ledger (`main()` opens it; `_serve` attaches and closes it). None refuses every admit
+        #: `budget-exhausted` "no ledger" (design 3c-1 §2.5, Q6)
+        self.ledger = ledger
+        #: the seams 3c fills; each defaults to its refusing production default
         self.dispatch_policy = dispatch_policy if dispatch_policy is not None else no_dispatch_route
         self.codec = codec if codec is not None else NoCodec()
         #: the credentials under `L/keys/cred`, opened at the first exchange that names one
@@ -731,17 +718,21 @@ class Keys:
             self._starting.set()
 
     def arm_triggers(self) -> None:
-        """The ONE shutdown trigger: SIGTERM, and EOF on stdin when stdin is a pipe (the launcher's), both setting the
-        one latch. A stdin that is not a pipe (launchd's, `</dev/null`) is never read: EOF there means nothing."""
+        """The ONE shutdown trigger: SIGTERM or SIGINT, and EOF on stdin when stdin is a pipe (the launcher's), each
+        setting the one latch. A stdin that is not a pipe (launchd's, `</dev/null`) is never read: EOF there means
+        nothing. SIGINT is a loop handler, never a KeyboardInterrupt, so a Ctrl-C cannot land between `up.write(head)`
+        and `mark_sent` and release a hold whose head may be on the wire."""
         self._in_loop()
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGTERM, self.trigger)
+        loop.add_signal_handler(signal.SIGINT, self.trigger)
         try:
             fifo = stat.S_ISFIFO(os.fstat(0).st_mode)
         except OSError:
             fifo = False
         if not fifo:
-            print("levain gw-keys: stdin is not a pipe; the stdin-EOF shutdown trigger is not armed (SIGTERM only)",
+            print("levain gw-keys: stdin is not a pipe; the stdin-EOF shutdown trigger is not armed (SIGTERM and "
+                  "SIGINT only)",
                   file=sys.stderr, flush=True)
             return
         os.set_blocking(0, False)
@@ -1286,6 +1277,7 @@ class Keys:
         except norm.Refused as r:
             await self._refuse(conn, frames, side, r.name, UNTRUSTED_DRAIN_CAP)
             return
+        ff = FrontFrames(frames)
         try:
             observed = None
             if pol.credential is not None:
@@ -1293,18 +1285,41 @@ class Keys:
                 # cancelling this exchange never cancels it); the credential `fresh` checked is the one the request
                 # is built with
                 observed = await fresh(self.cred_lifecycle, self._cred_store(), pol.credential)
-            head, hconn, cred, tpl, ws = self._check_request(conn.reg, claims, pol, q,
-                                                             observed)   # the budget reservation is last
+            head, hconn, cred, tpl, ws, hold = self._check_request(conn.reg, claims, pol, q,
+                                                                   observed)   # the ledger's admit is last
         except norm.Refused as r:
             await self._refuse(conn, frames, side, r.name, pol.body_cap)
             return
+        # The hold is resolved explicitly on every exit, before anything after the exchange's work runs (the refusal's
+        # drain, `release_exchange`, the record): `end()` releases an unsent hold and books a sent one `uncertain
+        # {ended}`, and is a no-op after the relay's settle. No statement runs between the admit above and this try
+        # (a tripwire holds it), and no ledger call sits in a `finally`; the ledger's owner callback is the backstop.
+        try:
+            await self._serve_held(conn, ff, side, pol, rec, hold, head, hconn, cred, tpl, ws, q)
+        except (norm.Refused, UpstreamFailed) as r:
+            hold.end()
+            if ff.responded:
+                rec["refused"] = r.name   # after `R`: the front's connection is closed with the body cut short
+                _note(logging.WARNING, "levain gw-keys: response cut short after its head (%s)", r.name)
+            else:
+                await self._refuse(conn, ff, side, r.name, pol.body_cap)
+        except BaseException:
+            hold.end()   # a cancel, StaleExchange, any other raise: the same call, then the raise goes on
+            raise
+        else:
+            hold.end()   # every normal return (detached, connect lost, FrontAborted, no response); after a settle, a no-op
+        finally:
+            ff.close()
+
+    async def _serve_held(self, conn: Conn, ff: "FrontFrames", side: KeysSide, pol: RoutePolicy, rec: dict,
+                          hold: ledger.Hold, head: bytes, hconn: "h11.Connection", cred: Optional[Credential],
+                          tpl: norm.Template, ws: Optional[Tuple[str, List[str]]], q: dict) -> None:
+        """The exchange from its admitted hold on: `A`, the upstream, the durable wait, the head behind the ledger's
+        send gate, the body and the response. A completed relay settles the hold at its full amount (3c-1: no cost
+        yet); every other exit is resolved by `_serve_q`. Once `R` is sent no `F` may follow (the wire's order), so a
+        failure after it ends the exchange with the front's connection closed mid-body (`ff.responded`)."""
         rec["template"] = tpl.path
         scanner = Scanner([cred.secret.encode("latin-1")] if cred is not None else [])
-        ff = FrontFrames(frames)
-        # From the reservation on, every exit releases it (no ledger settles one at this tip): nothing that can raise
-        # runs between the reservation and the try. Once `R` is sent no `F` may follow (the wire's order), so a
-        # failure after it ends the exchange with the front's connection closed mid-body.
-        sent = responded = False
         try:
             if conn.detached:   # a detached exchange answers nothing
                 return
@@ -1315,17 +1330,28 @@ class Keys:
             up = await self._open_upstream(conn, ff, side, pol, rec)
             if up is None:
                 return   # the front aborted (`X`) or went away during the connect: nothing went upstream
+            # the hold's `reserved` line durable before the head can go (its flush overlaps `A` and the connect)
+            try:
+                await hold.durable()
+            except ledger.LedgerUnavailable as e:
+                raise norm.Refused("keys-unavailable", e.detail) from None
 
             async def send_head() -> None:
-                nonlocal sent
                 if ff.aborted():   # checked with no await before the write: an abort read by now stops the head
                     raise FrontAborted()
                 if cred is not None:
                     # an access token that expired during the resolve, connect or TLS is never sent (no await
                     # between this check and the write)
                     unexpired(self.cred_lifecycle, cred)
-                up.write(head)   # the gate: a refused or failed write handed nothing upstream
-                sent = True      # from here the head may have reached the upstream
+                try:
+                    hold.send_gate()   # the ledger's gate: a durable hold, the ledger healthy and open
+                except ledger.LedgerUnavailable as e:
+                    raise norm.Refused("keys-unavailable", e.detail) from None
+                except ledger.LedgerMisuse as e:
+                    _note(logging.WARNING, "levain gw-keys: ledger misuse at the send gate (%s)", e)
+                    raise norm.Refused("keys-unavailable", "ledger misuse") from None
+                up.write(head)     # the gate: a refused or failed write handed nothing upstream
+                hold.mark_sent()   # from here the head may have reached the upstream
                 await up.drain()
 
             try:
@@ -1342,30 +1368,28 @@ class Keys:
                 if conn.detached:
                     return
                 conn.writer.write(u_frame)
-                responded = True
+                ff.responded = True
                 side.upgraded()
                 rec["status"] = 101
                 await conn.writer.drain()
                 await self._websocket(conn, ff, side, up, hconn, scanner, rec)
+                if conn.detached:   # fenced mid-relay: cut short, so `_serve_q`'s `end()` books it, never a settle
+                    return
+                hold.settle(hold.amount)
                 return
             r_frame = self._response_frame(resp, pol, cred, scanner)
             if conn.detached:
                 return
             conn.writer.write(r_frame)
-            responded = True
+            ff.responded = True
             rec["status"] = resp.status_code
             await conn.writer.drain()
             await self._relay_body(conn, up, hconn, scanner, rec)
-        except (norm.Refused, UpstreamFailed) as r:
-            if responded:
-                rec["refused"] = r.name   # after `R`: the front's connection is closed with the body cut short
-                _note(logging.WARNING, "levain gw-keys: response cut short after its head (%s)", r.name)
-            else:
-                await self._refuse(conn, ff, side, r.name, pol.body_cap)
+            if conn.detached:   # fenced mid-relay: cut short, so `_serve_q`'s `end()` books it, never a settle
+                return
+            hold.settle(hold.amount)   # 3c-1: a completed relay settles at its full hold (no cost until 3c-2a)
         finally:
-            ff.close()
             rec["redactions"] = scanner.count
-            self._release(conn.reg, pol, sent)
 
     async def _open_upstream(self, conn: Conn, ff: "FrontFrames", side: KeysSide, pol: RoutePolicy,
                              rec: dict) -> Optional[Upstream]:
@@ -1629,14 +1653,6 @@ class Keys:
         except Exception as e:
             _note(logging.WARNING, "levain gw-keys: the exchange record was not written (%s)", type(e).__name__)
 
-    def _release(self, reg: Registration, pol: RoutePolicy, sent: bool) -> None:
-        """The budget reservation's release, synchronous so a cancel cannot skip it; a failing seam is noted and
-        never replaces the exchange's own outcome."""
-        try:
-            self.budget.release(reg.session, pol.route, pol.max_call_microdollars, sent)
-        except Exception as e:
-            _note(logging.WARNING, "levain gw-keys: budget release failed (%s)", type(e).__name__)
-
     def _route_policy(self, claims: dict, route: str) -> RoutePolicy:
         """keys' OWN policy for `route`: it must be one of the token's `routes`, and the object comes from keys' load
         of the base map (then the dispatch seam), never from the front or session.json. A route that is not brokered
@@ -1718,15 +1734,17 @@ class Keys:
 
     def _check_request(self, reg: Registration, claims: dict, pol: RoutePolicy, q: dict,
                        observed: Optional[Credential]
-                       ) -> Tuple[bytes, "h11.Connection", object, norm.Template, Optional[Tuple[str, List[str]]]]:
+                       ) -> Tuple[bytes, "h11.Connection", object, norm.Template, Optional[Tuple[str, List[str]]],
+                                  ledger.Hold]:
         """keys' own re-check of the `Q` against ITS policy (the front's verdict is never taken), then the seams and
         the credential; returns the request head, the h11 client that wrote it (it frames the body and parses the
-        response), the credential (or None), the matched template, and for a websocket `Q` the handshake's (key,
+        response), the credential (or None), the matched template, for a websocket `Q` the handshake's (key,
         offered protocols) read from the re-checked headers (`ws_handshake`; None otherwise), which the 101 is
-        checked against. Order: target and template, headers (strict: a forbidden, consumed
+        checked against, and the admitted hold. Order: target and template, headers (strict: a forbidden, consumed
         or off-list name is `policy-header`), the declared length against `body_cap`, the codec, the credential and
-        its host binding, the budget last (a reservation is made only for a request that goes out). The credential
-        is `observed`, the one `fresh` observed and checked for the route's `credential`: it is not observed again."""
+        its host binding, the ledger's admit last (a hold is admitted only for a request that goes out). The
+        credential is `observed`, the one `fresh` observed and checked for the route's `credential`: it is not
+        observed again."""
         try:
             method, path = q["method"].encode("ascii"), q["path"].encode("ascii")
             query = q["query"].encode("ascii") or None
@@ -1753,8 +1771,35 @@ class Keys:
             if any(n == cred.header for n, _ in fwd):
                 raise norm.Refused("policy-header", cred.header)
         head, hconn = request_head(pol, method, path, query, fwd, body, cred, upgrade=upgrade)
-        self.budget.reserve(reg.session, pol.route, pol.max_call_microdollars)   # the last step: see `_serve_q`
-        return head, hconn, cred, tpl, ws
+        hold = self._admit_hold(reg, pol)   # the last step: see `_serve_q`
+        return head, hconn, cred, tpl, ws, hold
+
+    def _admit_hold(self, reg: Registration, pol: RoutePolicy) -> ledger.Hold:
+        """The ledger's synchronous admit against the route's per-session cap, scope ("session-route", session,
+        route). The bound is the frozen rule `min(max_call, room)` (the room alone with no `max_call`); `price_ref`
+        is the route id until 3c-2a prices a call. The ledger's own errors become refusals: `budget-exhausted` (402),
+        and `keys-unavailable` (503) for an unhealthy or closing ledger and, noted, for a misuse."""
+        if self.ledger is None:
+            raise norm.Refused("budget-exhausted", "no ledger")
+        cap = pol.max_session_microdollars
+        if cap is None:   # a dispatch route (unreachable in 3c-1: no dispatch map is loaded)
+            raise norm.Refused("budget-exhausted", "no scope")
+        max_call = pol.max_call_microdollars
+        if max_call is not None:
+            def bound(room: int) -> int:
+                return min(max_call, room)
+        else:
+            def bound(room: int) -> int:
+                return room
+        try:
+            return self.ledger.admit(("session-route", reg.session, pol.route), cap, bound, price_ref=pol.route)
+        except ledger.Refused as e:
+            raise norm.Refused(e.name, e.detail) from None
+        except ledger.LedgerUnavailable as e:
+            raise norm.Refused("keys-unavailable", e.detail) from None
+        except ledger.LedgerMisuse as e:
+            _note(logging.WARNING, "levain gw-keys: ledger misuse at admit (%s)", e)
+            raise norm.Refused("keys-unavailable", "ledger misuse") from None
 
     async def _forward_body(self, frames: "FrontFrames", side: KeysSide, up: Upstream, hconn: "h11.Connection",
                             body: str, cap: int, rec: dict) -> bool:
@@ -2066,13 +2111,12 @@ async def _serve(keys: Keys, front_path: str, gid: Optional[int], admin_path: st
         need = fixed + bounded()
         print(f"levain gw-keys: start pid={os.getpid()} nofile_soft={soft} nofile_hard={hard} "
               f"fixed_measured={fixed} bounded={bounded()} need={need}", file=sys.stderr, flush=True)
-        if keys.unmetered:
-            print("levain gw-keys: --unmetered is set: every budget reservation is admitted (no ledger)",
-                  file=sys.stderr, flush=True)
         if soft != resource.RLIM_INFINITY and soft < need:
             print(f"levain gw-keys: refused nofile-low (soft {soft} < fixed_measured {fixed} + bounded {bounded()})",
                   file=sys.stderr, flush=True)
             return 3
+        if keys.ledger is not None:
+            keys.ledger.attach(asyncio.get_running_loop())   # its writer thread starts here, before anything is served
         started = True   # from here start() owns the sockets: it closes what it does not serve, even on a failure
         await keys.start(socks[:1], admin=socks[1])
         if keys.servers and not keys.closing:   # a trigger before or during start: nothing is served
@@ -2081,9 +2125,15 @@ async def _serve(keys: Keys, front_path: str, gid: Optional[int], admin_path: st
         print("levain gw-keys: stopped", file=sys.stderr, flush=True)
         return 0
     finally:
-        if not started:
-            for s in socks:
-                s.close()
+        try:
+            if not started:
+                for s in socks:
+                    s.close()
+        finally:
+            if keys.ledger is not None:
+                # after wait_done: every live hold resolved by the close column, the writer drained for at most
+                # SHUTDOWN_WAIT_S; lines past it are replay's (design 3c-1 §2.7). The one ledger call in a `finally`.
+                await keys.ledger.aclose(SHUTDOWN_WAIT_S)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -2096,8 +2146,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--test-single-uid", action="store_true",
                     help="TEST ONLY: admit peers of keys' own uid, matched to a registration by (pid, start); "
                          "refused as root or as " + KEYS_ACCOUNT)
-    ap.add_argument("--unmetered", action="store_true",
-                    help="3b's fixture and VM runs only: admit every budget reservation (no ledger exists yet)")
     a = ap.parse_args(argv)
     for name, v in (("--runtime-root", a.runtime_root), ("--lib-root", a.lib_root), ("--control", a.control)):
         if not os.path.isabs(v):
@@ -2142,8 +2190,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     # the credential layer shutdown's latch and step (3) call. Closed after the loop, whatever ended it.
     cred_writer = CredWriter(os.path.join(a.lib_root, "keys", "cred"))
     try:
+        # the ledger: locked, replayed and flushed before anything is bound, and its fd a fixed one when _serve counts
+        # them; any refusal is a refused start (the gw.jsonl pattern). A ledger that never reaches `_serve`'s attach
+        # holds only its fd, which process exit drops.
+        try:
+            led = ledger.Ledger.open(os.path.join(a.lib_root, *LEDGER))
+        except ledger.LedgerOpenError as e:
+            print(e.line, file=sys.stderr)
+            return 3
         keys = Keys(gw_uids=gw_uids, single_uid=single_uid, control_path=a.control, lib_root=a.lib_root,
-                    control_uid=control_uid, unmetered=a.unmetered, cred_lifecycle=cred_writer)
+                    control_uid=control_uid, ledger=led, cred_lifecycle=cred_writer)
         try:
             keys.gw_log = install_log(a.lib_root)   # before _serve counts the fds: the log's fd is a fixed one
         except OSError as e:
