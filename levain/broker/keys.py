@@ -183,6 +183,9 @@ RECONCILE_MISSES = 3
 #: DECISION: the attach client's reconnect backoff, doubling from the first value to the cap.
 ATTACH_RETRY_FIRST_S = 0.25
 ATTACH_RETRY_MAX_S = 5.0
+#: DECISION: one SPEND-OVERRUN attempt's answer deadline (CONTROL's `KEYS_ANSWER_S` for its own admin verbs); a missed
+#: one is sent again, same payload, until V23 from the first send.
+ATTACH_ATTEMPT_S = 2.0
 #: DECISION: the digests one SESSIONS carries (CONTROL's `SESSIONS_DIGESTS_MAX`); more are sent as several.
 SESSIONS_CHUNK = 512
 
@@ -540,9 +543,10 @@ class AdminConn:
 
 class Attachment:
     """keys' one `KEYS-ATTACH` connection to CONTROL's socket (§4.5), multiplexed by `id`: the attachment's number (from
-    1), the answer futures per request id, one write at a time, and the count of consecutive unanswered SESSIONS."""
+    1), the answer futures per request id, one write at a time, the count of consecutive unanswered SESSIONS, and
+    whether a SESSIONS was answered on it (a healthy attachment: the reconnect backoff resets after it)."""
 
-    __slots__ = ("reader", "writer", "no", "pending", "next_id", "wlock", "misses", "ended")
+    __slots__ = ("reader", "writer", "no", "pending", "next_id", "wlock", "misses", "ended", "healthy")
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, no: int) -> None:
         self.reader, self.writer, self.no = reader, writer, no
@@ -550,6 +554,7 @@ class Attachment:
         self.next_id = 1   # id 1 was the KEYS-ATTACH itself
         self.wlock = asyncio.Lock()
         self.misses = 0
+        self.healthy = False
         #: set once its EOF has been handled (`Keys._attach_lost`): nothing is sent on it after that
         self.ended = False
 
@@ -778,6 +783,7 @@ class Keys:
         self.attach_answer_s = V23_S
         self.reconcile_s = RECONCILE_S
         self.unclaimed_s = V23_S
+        self.attach_attempt_s = ATTACH_ATTEMPT_S
         self._attach_task: Optional[asyncio.Task] = None
         #: the attach sends in flight (FRONT-LOST, SPEND-OVERRUN), kept so none is collected mid-send
         self._attach_sends: Set[asyncio.Task] = set()
@@ -1083,6 +1089,11 @@ class Keys:
             self._attach_task = asyncio.ensure_future(self._attach_loop())
 
     async def _attach_loop(self) -> None:
+        """Attach, serve, fail closed, again. The backoff grows after a failed open AND after an attachment that ended
+        before it was healthy (no SESSIONS answered on it, and shorter than `reconcile_s`): a CONTROL that answers
+        `ok` and closes at once sees growing gaps, not a connect storm. Only a healthy attachment resets it. Any
+        exception out of the serve is that attachment's EOF (logged); the loop itself ends only at the latch."""
+        loop = asyncio.get_running_loop()
         backoff = ATTACH_RETRY_FIRST_S
         noted = False
         while not self.closing:
@@ -1097,11 +1108,22 @@ class Keys:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, ATTACH_RETRY_MAX_S)
                 continue
-            backoff, noted = ATTACH_RETRY_FIRST_S, False
+            noted = False
+            opened = loop.time()
             try:
                 await self._attach_serve(att)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                _note(logging.WARNING, "levain gw-keys: the attachment's read loop failed (%s); its EOF",
+                      type(e).__name__)
             finally:
                 await asyncio.shield(self._attach_lost(att))
+            if att.healthy or loop.time() - opened >= self.reconcile_s:
+                backoff = ATTACH_RETRY_FIRST_S
+            elif not self.closing:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, ATTACH_RETRY_MAX_S)
 
     async def _attach_open(self) -> Attachment:
         """One connect and `KEYS-ATTACH`, stating the route-map generation keys serves: none (`null`, `null`) until keys
@@ -1177,6 +1199,8 @@ class Keys:
             pass
         self._effects(victims)
         if adm is not None:
+            for t in list(adm.tasks):          # as `_admin_eof` does: that EOF path returns early for it now
+                t.cancel()
             try:
                 adm.writer.transport.abort()   # its handler's EOF path finds it no longer adopted: nothing more
             except Exception as e:
@@ -1193,13 +1217,13 @@ class Keys:
             except Exception:
                 pass
 
-    async def _attach_call(self, att: Attachment, op: str, args: dict) -> Optional[dict]:
+    async def _attach_call(self, att: Attachment, op: str, args: dict, wait: Optional[float] = None) -> Optional[dict]:
         """`op` on `att`; its answer, or None when the attachment is not (or no longer) the current one or no answer
-        came within `attach_answer_s` of the send."""
+        came within `wait` (default `attach_answer_s`) of the send."""
         if att.ended or self.attached is not att:
             return None
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self.attach_answer_s
+        deadline = loop.time() + (self.attach_answer_s if wait is None else wait)
         att.next_id += 1
         rid = att.next_id
         fut: asyncio.Future = loop.create_future()
@@ -1238,6 +1262,41 @@ class Keys:
         if not await self._attach_notify("FRONT-LOST", {"session": session}):
             self._attach_close(att)
 
+    async def _spend_overrun(self, args: dict) -> None:
+        """`SPEND-OVERRUN` (R4 §1.4 step 2) on the current attachment, kept until acked: an attempt not answered within
+        `attach_attempt_s` is sent again with the same payload (CONTROL records it once per (session, ref)), until V23
+        (`attach_answer_s`) from the first send. Exhausted, refused, or not encodable, the attachment ends (fail
+        closed: CONTROL's EOF rule revokes every egress session): an overrun is never dropped while the attachment it
+        was owed on stays up. Unattached, or once that attachment has ended, there is nothing to send it on: the EOF
+        already revoked the session. KNOWN EDGE: a cost above the wire's JSON_INT_MAX cannot be encoded, so it ends
+        the attachment too."""
+        att = self.attached
+        if att is None:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.attach_answer_s
+        why = "no answer within V23"
+        try:
+            while not att.ended and self.attached is att:
+                left = deadline - loop.time()
+                if left <= 0:
+                    break
+                sent = loop.time()
+                ans = await self._attach_call(att, "SPEND-OVERRUN", args, wait=min(self.attach_attempt_s, left))
+                if ans is None:   # attempts stay `attach_attempt_s` apart, a failed write's quick None included
+                    await asyncio.sleep(max(0.0, min(sent + self.attach_attempt_s, deadline) - loop.time()))
+                    continue
+                if ans["ok"] is True:
+                    return
+                why = "refused %s" % ans.get("refused")
+                break
+        except Exception as e:   # the payload's encoding (a cost past JSON_INT_MAX), or the send itself
+            why = type(e).__name__
+        if att.ended or self.attached is not att:
+            return
+        _note(logging.WARNING, "levain gw-keys: SPEND-OVERRUN not acked (%s); the attachment ends", why)
+        self._attach_close(att)
+
     def _attach_send_task(self, coro: Awaitable[None]) -> None:
         """Run an attach send on its own task (a call site that cannot await it: a `finally`, the settle, a timer)."""
         if not self.attach or self.closing:
@@ -1255,10 +1314,17 @@ class Keys:
             _note(logging.WARNING, "levain gw-keys: an attach send failed (%s)", type(t.exception()).__name__)
 
     async def _reconcile_loop(self, att: Attachment) -> None:
-        """SESSIONS on the attachment's open, then every `reconcile_s` while it stays the attachment."""
-        while self.attached is att and not att.ended:
-            await self._reconcile_tick(att)
-            await asyncio.sleep(self.reconcile_s)
+        """SESSIONS on the attachment's open, then every `reconcile_s` while it stays the attachment. A tick that raises
+        ends the attachment (fail closed): an attachment never stays up with its reconcile dead."""
+        try:
+            while self.attached is att and not att.ended:
+                await self._reconcile_tick(att)
+                await asyncio.sleep(self.reconcile_s)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _note(logging.WARNING, "levain gw-keys: the reconcile failed (%s); the attachment ends", type(e).__name__)
+            self._attach_close(att)
 
     async def _reconcile_tick(self, att: Attachment) -> None:
         """One reconcile (3c design r3 §2.1 (e), R4 §0): the token digests keys holds a cached resolve for go in
@@ -1279,6 +1345,7 @@ class Keys:
                 return
             drop.update(d for d in got if d in chunk)
         att.misses = 0
+        att.healthy = True
         if not drop:
             return
         assert self.state_lock is not None
@@ -1442,10 +1509,14 @@ class Keys:
                     # (3)-(4) run however this handler leaves step (2), a cancel of it included: the old connection
                     # no longer runs its own EOF clear, so nothing else would
                     await asyncio.shield(self._preempt_clear(old))
-            if self.closing:
-                return None
-            conn = AdminConn(reader, writer, epoch)  # (5) adopt; it starts against an empty table
-            self.admin = conn
+            async with self.state_lock:
+                # (5) adopt, only while the epoch captured at (1) is still current: an attachment EOF (or another
+                # clear) that bumped it during step (2) makes a connection stamped `epoch` stale before its first
+                # request, every answer on it withheld. The caller closes the connection on None.
+                if self.closing or epoch != self.admin_epoch:
+                    return None
+                conn = AdminConn(reader, writer, epoch)  # it starts against an empty table
+                self.admin = conn
             return conn
 
     async def _preempt_clear(self, old: AdminConn) -> None:
@@ -1866,7 +1937,7 @@ class Keys:
         finally:
             if stopped and self.attach:
                 ledger_id, epoch, seq = hold.ref
-                self._attach_send_task(self._attach_notify("SPEND-OVERRUN", {
+                self._attach_send_task(self._spend_overrun({
                     "session": reg.session, "route": route, "model": model, "ref": [ledger_id, epoch, seq],
                     "overrun": cost - hold.amount, "unproven": unproven}))
 

@@ -235,18 +235,26 @@ def test_reconcile_drops_unrevoked_session(py):
 
 
 class AttachServer:
-    """CONTROL's socket for the in-process reconcile case: answers KEYS-ATTACH `ok` and never answers SESSIONS. Per
-    connection it records the SESSIONS it read, each with whether the connection was still open when it arrived."""
+    """CONTROL's socket for the in-process attachment cases: answers KEYS-ATTACH `ok`; by default never answers
+    SESSIONS or SPEND-OVERRUN. Per connection it records when it was accepted (the loop's clock), the SESSIONS it read,
+    each SPEND-OVERRUN's arguments, and how many SESSIONS it had read at its EOF. The modes, settable between
+    connections: `close_after_attach` (close right after the ok), `answer_sessions` (`ok` with an empty `drop`, then
+    close 0.1 s later), `overrun_ignore` (that many SPEND-OVERRUN sends go unanswered, then each is acked; -1: none
+    is), `overrun_refuse` (answered `ok: false`)."""
 
     def __init__(self, path: str) -> None:
         self.path = path
-        self.conns: list = []      # per connection: {"sessions": int, "eof_after": int | None}
+        self.conns: list = []      # per connection: {"at", "sessions", "overruns", "eof_after"}
+        self.close_after_attach = False
+        self.answer_sessions = False
+        self.overrun_ignore = -1
+        self.overrun_refuse = False
 
     async def start(self) -> None:
         self.server = await asyncio.start_unix_server(self._on, self.path)
 
     async def _on(self, r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        me = {"sessions": 0, "eof_after": None}
+        me = {"at": asyncio.get_running_loop().time(), "sessions": 0, "overruns": [], "eof_after": None}
         self.conns.append(me)
         try:
             while True:
@@ -255,11 +263,27 @@ class AttachServer:
                 if req["op"] == "KEYS-ATTACH":
                     w.write(K.encode_admin({"id": req["id"], "ok": True, "attach": len(self.conns)}))
                     await w.drain()
+                    if self.close_after_attach:
+                        break
                 elif req["op"] == "SESSIONS":
                     me["sessions"] += 1
+                    if self.answer_sessions:
+                        w.write(K.encode_admin({"id": req["id"], "ok": True, "drop": []}))
+                        await w.drain()
+                        await asyncio.sleep(0.1)
+                        break
+                elif req["op"] == "SPEND-OVERRUN":
+                    me["overruns"].append({k: v for k, v in req.items() if k != "id"})
+                    if self.overrun_refuse:
+                        w.write(K.encode_admin({"id": req["id"], "ok": False, "refused": "bad-arguments"}))
+                        await w.drain()
+                    elif 0 <= self.overrun_ignore < len(me["overruns"]):
+                        w.write(K.encode_admin({"id": req["id"], "ok": True}))
+                        await w.drain()
         except (asyncio.IncompleteReadError, ConnectionError):
-            me["eof_after"] = me["sessions"]
+            pass
         finally:
+            me["eof_after"] = me["sessions"]
             w.close()
 
     async def close(self) -> None:
@@ -296,6 +320,206 @@ def test_reconcile_misses_end_the_attachment_on_the_third():
     out = run(go(), 30)
     assert out["standing_after_two"] is True, out
     assert out["eof_after"] == 3, out
+
+
+async def _attached_keys(d: str, srv: AttachServer) -> K.Keys:
+    """In-process keys attached to `srv` (its clocks short, the reconcile out of the way unless a test sets it)."""
+    k = K.Keys(control_path=srv.path, lib_root=d, attach=True)
+    k.reconcile_s, k.attach_answer_s = 30.0, 0.5
+    k.start_attach()
+    await R3.aio_until(lambda: k.attached is not None, what="attached")
+    return k
+
+
+def _with_keys(body, timeout: float = 30):
+    """Run `body(k, srv)` against an AttachServer and an attached in-process keys, then shut both down."""
+    async def go():
+        d = tempfile.mkdtemp(prefix="c3x", dir="/tmp")
+        try:
+            srv = AttachServer(os.path.join(d, "c.sock"))
+            await srv.start()
+            k = await _attached_keys(d, srv)
+            try:
+                return await body(k, srv)
+            finally:
+                await k.shutdown()
+                await srv.close()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    return run(go(), timeout)
+
+
+def test_attach_serve_exception_is_the_attachments_eof(monkeypatch):
+    # L3 r1 (complement MED 1): an exception `_attach_serve` does not list (a RecursionError out of a deep frame's parse,
+    # say) is that attachment's EOF: the fail-closed clear runs, and keys attaches again; the attach client never dies.
+    async def body(k, srv):
+        first = k.attached
+        real = k._attach_serve
+        calls = []
+
+        async def boom(att):
+            calls.append(att.no)
+            if len(calls) == 1:
+                raise RuntimeError("an exception the read loop does not list")
+            return await real(att)
+
+        k._attach_serve = boom
+        k._attach_close(first)   # the first attachment's serve already runs: the next one is the one that raises
+        await R3.aio_until(lambda: len(calls) >= 2, timeout=10, what="a third attachment after the raise")
+        return {"first_ended": first.ended, "calls": calls, "task_alive": not k._attach_task.done(),
+                "conns": len(srv.conns)}
+
+    out = _with_keys(body)
+    assert out["first_ended"] and out["task_alive"] and out["conns"] >= 3, out
+
+
+def test_reconcile_exception_ends_the_attachment(monkeypatch):
+    # L3 r1 (complement MED 1): the reconcile ticker raising ends the attachment (fail closed), never leaves it up with
+    # the reconcile dead; keys then attaches again.
+    real = K.Keys._reconcile_tick
+    raised = []
+
+    async def boom(self, att):
+        if not raised:           # the first attachment's tick at its open
+            raised.append(att.no)
+            raise RuntimeError("the reconcile tick failed")
+        return await real(self, att)
+
+    monkeypatch.setattr(K.Keys, "_reconcile_tick", boom)
+
+    async def body(k, srv):
+        await R3.aio_until(lambda: k.attached is not None and k.attached.no >= 2, timeout=10, what="attached again")
+        return {"raised": list(raised), "eof": srv.conns[0]["eof_after"] is not None}
+
+    out = _with_keys(body)
+    assert out["raised"] == [1] and out["eof"], out
+
+
+def test_short_lived_attachments_back_off(monkeypatch):
+    # L3 r1 (codex MED 4, complement LOW 2): a CONTROL that answers KEYS-ATTACH ok and closes at once sees GROWING gaps
+    # between keys' connects (the backoff applies after a short-lived attachment, not only after a failed open); one
+    # healthy attachment (a SESSIONS answered) resets it, so the connect after that one comes at once.
+    monkeypatch.setattr(K, "ATTACH_RETRY_FIRST_S", 0.05)
+    monkeypatch.setattr(K, "ATTACH_RETRY_MAX_S", 0.8)
+
+    async def body(k, srv):
+        srv.close_after_attach = True
+        k._attach_close(k.attached)
+        await R3.aio_until(lambda: len(srv.conns) >= 7, timeout=15, what="six short-lived attachments")
+        at = [c["at"] for c in srv.conns[1:7]]
+        gaps = [b - a for a, b in zip(at, at[1:])]
+        srv.close_after_attach, srv.answer_sessions = False, True
+        n = len(srv.conns)
+        await R3.aio_until(lambda: len(srv.conns) >= n + 2, timeout=15, what="a healthy attachment, then the next")
+        reset_gap = srv.conns[n + 1]["at"] - srv.conns[n]["at"]
+        return {"gaps": gaps, "reset_gap": reset_gap}
+
+    out = _with_keys(body)
+    gaps = out["gaps"]
+    assert all(g >= 0.04 for g in gaps), out
+    assert all(b > a * 1.5 for a, b in zip(gaps, gaps[1:4])), out   # doubling from 0.05 s
+    # the healthy attachment lasted ~0.1 s past its SESSIONS answer; the connect after it does not wait the backoff
+    assert out["reset_gap"] < 0.4, out
+
+
+OVERRUN = {"session": S1, "route": "r", "model": "m1", "ref": ["a" * 32, "b" * 32, 7], "overrun": 5,
+           "unproven": False}
+
+
+def test_spend_overrun_retried_until_acked():
+    # L3 r1 (codex MED 1): an unacked SPEND-OVERRUN is kept and sent again, the same payload (CONTROL records it once
+    # per (session, ref)), until acked; the attachment stays up.
+    async def body(k, srv):
+        srv.overrun_ignore = 2
+        k.attach_attempt_s, k.attach_answer_s = 0.1, 2.0
+        first = k.attached
+        await k._spend_overrun(dict(OVERRUN))
+        return {"overruns": srv.conns[0]["overruns"], "standing": k.attached is first and not first.ended}
+
+    out = _with_keys(body)
+    want = {"v": 1, "op": "SPEND-OVERRUN", **OVERRUN}
+    assert out["overruns"] == [want] * 3 and out["standing"], out
+
+
+@pytest.mark.parametrize("refuse", [False, True], ids=["never-acked", "refused"])
+def test_spend_overrun_unacked_ends_the_attachment(refuse):
+    # L3 r1 (codex MED 1): a SPEND-OVERRUN never acked within V23 (scaled to 0.6 s), or refused, ends the attachment
+    # (fail closed: CONTROL's EOF rule revokes every egress session), never dropped silently; keys attaches again.
+    async def body(k, srv):
+        srv.overrun_refuse = refuse
+        k.attach_attempt_s, k.attach_answer_s = 0.1, 0.6
+        first = k.attached
+        await k._spend_overrun(dict(OVERRUN))
+        await R3.aio_until(lambda: first.ended, timeout=5, what="the attachment ended")
+        await R3.aio_until(lambda: k.attached is not None and k.attached is not first, timeout=10,
+                           what="attached again")
+        return {"sent": len(srv.conns[0]["overruns"]), "eof": srv.conns[0]["eof_after"] is not None}
+
+    out = _with_keys(body)
+    assert out["eof"], out
+    assert out["sent"] == 1 if refuse else out["sent"] >= 3, out
+
+
+async def _admin_pair():
+    a, b = socket.socketpair()
+    r, w = await asyncio.open_unix_connection(sock=a)
+    return r, w, b
+
+
+def test_adopt_installs_nothing_after_an_attachment_loss():
+    # L3 r1 (codex MED 3): a new admin connection's adoption that yields in its preemption wait while the attachment
+    # ends (`_attach_lost` bumps the admin epoch) does not install a connection stamped with the epoch it captured
+    # before: every request on that one would be stale and unanswered until CONTROL's V23. It installs nothing.
+    async def body(k, srv):
+        r, w, _b = await _admin_pair()
+        old = K.AdminConn(r, w, k.admin_epoch)
+        old.task = None
+        release = asyncio.Event()
+
+        async def stall():
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await release.wait()   # the preemption's bounded wait yields here
+                raise
+
+        t = asyncio.ensure_future(stall())
+        old.tasks.add(t)
+        k.admin = old
+        r2, w2, _b2 = await _admin_pair()
+        adopt = asyncio.ensure_future(k._adopt(r2, w2))
+        await R3.aio_until(lambda: old.preempted, what="the preemption began")
+        first = k.attached
+        k._attach_close(first)
+        await R3.aio_until(lambda: first.ended, what="the attachment ended")
+        release.set()
+        conn = await asyncio.wait_for(adopt, 5)
+        return {"conn": conn, "admin": k.admin, "epoch": k.admin_epoch}
+
+    out = _with_keys(body)
+    assert out["conn"] is None and out["admin"] is None, (out, getattr(out["conn"], "epoch", None))
+
+
+def test_attach_lost_cancels_the_admin_connections_tasks():
+    # L3 r1 (complement LOW 3): the attachment's EOF lets go of the admin connection AND cancels its request tasks, as
+    # the admin EOF does (`_admin_eof` returns early for a connection no longer adopted, so nothing else would).
+    async def body(k, srv):
+        r, w, _b = await _admin_pair()
+        adm = K.AdminConn(r, w, k.admin_epoch)
+        adm.task = None
+        t = asyncio.ensure_future(asyncio.sleep(30))
+        adm.tasks.add(t)
+        k.admin = adm
+        first = k.attached
+        k._attach_close(first)
+        await R3.aio_until(lambda: first.ended, what="the attachment ended")
+        await asyncio.wait({t}, timeout=0.5)
+        cancelled = t.cancelled()
+        t.cancel()
+        return {"cancelled": cancelled, "admin": k.admin}
+
+    out = _with_keys(body)
+    assert out["cancelled"] and out["admin"] is None, out
 
 
 def test_keys_unattached_refuses_registration():
@@ -515,15 +739,29 @@ def test_attach_reload_goes_after_the_attach_answer():
         admin = C.KeysAdmin(d / "a.sock", answer_s=0.5, window_s=3.0)
         control = C.Control(C.StateStore(d / "s"), OP_UID, keys_uid=R3.KEYS_UID, keys_admin=admin,
                             routemap_head=lambda: head)
-        srv = C.ControlServer(control, d / "c.sock", peer_uid=lambda sock: R3.KEYS_UID)
+        # the server-side order, in one list (list.append is atomic): the attach answer handed to the socket, the
+        # RELOAD's thread spawned, the RELOAD begun
+        events: list = []
+        spawn, reload = control._spawn, control._attach_reload
+        control._spawn = lambda *a, **kw: (events.append("spawn"), spawn(*a, **kw))[1]
+        control._attach_reload = lambda *a, **kw: (events.append("reload"), reload(*a, **kw))[1]
+
+        class Ordered(C.ControlServer):
+            def _send(self, sock, answer):
+                ok = super()._send(sock, answer)
+                if "attach" in answer:
+                    events.append("answer-sent")
+                return ok
+
+        srv = Ordered(control, d / "c.sock", peer_uid=lambda sock: R3.KEYS_UID)
         srv.start()
         try:
             t0 = time.monotonic()
             s1, ans1, t_ans = _attach_client(d / "c.sock", None, None)
             stated_none = control.keys_serves()
             R3.until(lambda: any(op == "RELOAD" for op, _ in keys.arrived), what="RELOAD sent")
-            t_reload = next(t for op, t in keys.arrived if op == "RELOAD")
             reload_frame = next(r for _, r in keys.log if r["op"] == "RELOAD")
+            order = list(events)
             s1.close()
             R3.until(lambda: control.keys_attached() is None, what="attachment 1 ended")
             n = len(keys.arrived)
@@ -540,8 +778,11 @@ def test_attach_reload_goes_after_the_attach_answer():
     assert ans1 == {"id": 1, "ok": True, "attach": 1} and t_ans - t0 < 1.0, (ans1, t_ans - t0)
     assert stated_none is None
     # keys never answers this RELOAD, so a RELOAD inside the handler would hold the answer above for the admin window
-    # (3 s); the answer came at once, and the RELOAD was still sent (two threads' clocks cannot order the two closer)
-    assert t_reload >= t0 and reload_frame["generation"] == 3, (t_reload, t0, reload_frame)
+    # (3 s); the answer came at once, and the RELOAD was still sent
+    assert reload_frame["generation"] == 3, reload_frame
+    # the order itself, as CONTROL's side recorded it: the answer was on the socket before the RELOAD's thread was
+    # spawned, and before the RELOAD began (a spawn or a call inside the handler would put it ahead of the answer)
+    assert order[:3] == ["answer-sent", "spawn", "reload"], order
     assert ans2 == {"id": 1, "ok": True, "attach": 2} and "RELOAD" not in later, (ans2, later)
     assert serves == head
 
