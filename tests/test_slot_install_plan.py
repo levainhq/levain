@@ -181,11 +181,17 @@ def test_operator_record_written_last_and_removed_last(host):
     uid = RANGES[host].slots[0]
     undo = plan_undo(parse_install_argv(["undo"]), _set_up(host), accounts={"_levain_s0": uid},
                      shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(SHARED_GROUPS)})
-    assert undo.steps[-1].argv[1:] == ("-f", str(operator_record_path(host)))
-    assert undo.steps[0].why.startswith(f"remove {RUNTIME_SUDOERS} ")
-    assert undo.steps[-2].argv[1:] == ("-f", str(INTENT_PATH[host]))
-    # the install rule's removal, then its visudo -c (R1b: sudoers/1 through its per-identity step)
-    assert undo.steps[-4].why.startswith(f"remove {INSTALL_SUDOERS} ") and undo.steps[-3].why.startswith("check ")
+    # FIX1 M1: the check after the install rule's removal is the LAST step, after the operator record
+    assert undo.steps[-1].why.startswith("check the sudoers config with visudo -c (after ")
+    assert undo.steps[-2].argv[1:] == ("-f", str(operator_record_path(host)))
+    # FIX1 M1/M2: the sudoers preflight, then undo's own journal, before the runtime rule
+    assert undo.steps[0].why.startswith("check the sudoers config with visudo -c before undo removes anything")
+    assert undo.steps[1].why.startswith("journal what this undo ")
+    assert undo.steps[2].why.startswith(f"remove {RUNTIME_SUDOERS} ")
+    assert undo.steps[-3].argv[1:] == ("-f", str(INTENT_PATH[host]))
+    # the install rule's removal (R1b: sudoers/1 through its per-identity step), checked while it still stands
+    assert undo.steps[-4].why.startswith(f"remove {INSTALL_SUDOERS} ")
+    assert undo.steps[-5].why == f"check the sudoers config with visudo -c before {INSTALL_SUDOERS} goes"
     assert [s.why.split()[1] for s in undo.steps if s.why.startswith("remove /") and "sudoers" in s.why] == [
         str(RUNTIME_SUDOERS), str(INSTALL_SUDOERS)]
     retire = next(i for i, s in enumerate(undo.steps) if s.write)

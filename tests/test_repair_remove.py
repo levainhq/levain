@@ -13,6 +13,7 @@ sit under a tmp root (``Live.root``), where the tmp root's owner stands in for r
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import replace
 import plistlib
@@ -26,7 +27,7 @@ from levain.slot import install_helper as IH
 from levain.slot.accounts import SLOT_MARKER, SLOT_RETIRED_MARKER
 from levain.slot.ids import RANGES, RETIRED_IDS_PATH, read_retired_ids
 from levain.slot.intent import Intent, intent_text, parse_intent
-from levain.slot.sudoers import RUNTIME_SUDOERS
+from levain.slot.sudoers import RUNTIME_SUDOERS, runtime_sudoers_text
 
 from tests.test_repair_plan import HOST, OP, TXN_B, _pre_change, _plan
 
@@ -168,29 +169,40 @@ def _plist(n: str) -> bytes:
 
 ENTRY = b"#!/usr/bin/python3 -IS\n# Levain old-helper (CONTRACT). Written by the install helper. Imports only\n"
 PROFILE = bwrap.apparmor_profile_text().encode()
+# FIX1 H1: each file kind's object as its writer writes it (a file kind is ours only by its bytes)
+SUDO = runtime_sudoers_text("darwin", "phill").encode()
+UNIT = units.systemd_unit_text(next(s for s in units.SERVICES if "linux" in s.hosts)).encode()
+ANCHOR = pf.anchor_text((), {}).encode()
+BWRAP_COPY = b"\x7fELF the slots' bwrap\n"
+_SHA = hashlib.sha256(BWRAP_COPY).hexdigest()
+BWRAP_RECORD = bwrap.digest_record_text("/usr/bin/bwrap", _SHA, _SHA).encode()
+
+
+def _bwrap(live: RM.Live) -> None:
+    _put(live, bwrap.LEVAIN_BWRAP, BWRAP_COPY)
+    _put(live, bwrap.BWRAP_DIGEST, BWRAP_RECORD)
 
 
 def _everything(h: FakeHost, live: RM.Live) -> None:
     """Every kind's object present and Levain's (both hosts' kinds; each step reads only its own)."""
     _put(live, units.LAUNCHD_DIR / "com.levain.old-svc.plist", _plist("old-svc"))
     h.loaded |= {"com.levain.old-svc", "com.levain.qbroker"}
-    _put(live, units.SYSTEMD_DIR / "levain-old-svc.service")
+    _put(live, units.SYSTEMD_DIR / "levain-old-svc.service", UNIT)
     h.systemd["levain-old-svc.service"] = ["loaded", "active"]
-    _put(live, SUDOERS_DIR / "levain-old")
-    _put(live, SUDOERS_DIR / "levain-runtime")
+    _put(live, SUDOERS_DIR / "levain-old", SUDO)
+    _put(live, SUDOERS_DIR / "levain-runtime", SUDO)
     gid = GID if h.host == "darwin" else LGID
     h.groups["levain-gone"] = [gid, SLOT_MARKER, {"_levain_keys", "_levain_control"}]
     h.groups["levain-control"] = [gid - 1, SLOT_MARKER, {"_levain_keys"}]
     h.users["_levain_s7"] = [3990, SLOT_MARKER]
     h.aliases |= {"127.0.1.9", "127.0.1.1"}
-    _put(live, pf.ANCHOR_FILE)
+    _put(live, pf.ANCHOR_FILE, ANCHOR)
     h.rules[pf.ANCHOR] = True
     h.rules["com.apple/levain-t"] = True
     _put(live, pf.PF_TOKEN, b"12345\n")
     _put(live, bwrap.APPARMOR_PROFILE, PROFILE)
     _put(live, bwrap.APPARMOR_LOADED, b"levain-slot-bwrap (enforce)\nlevain-bwrap (enforce)\n")
-    _put(live, bwrap.LEVAIN_BWRAP)
-    _put(live, bwrap.BWRAP_DIGEST)
+    _bwrap(live)
     h.netns |= {"levain-e7", "levain-e0"}
     _put(live, layout.HELPER_DIR[h.host] / "old-helper", ENTRY)
 
@@ -326,7 +338,7 @@ def _cases():
         "unit/1": ("darwin", "old-svc", {"ours": put(plist, _plist("old-svc")),
                                          "not-ours": put(plist, plistlib.dumps({"Label": "com.other.x"})),
                                          "fail": fail("launchctl")}),
-        "sudoers/1": ("darwin", "levain-old", {"ours": put(SUDOERS_DIR / "levain-old"),
+        "sudoers/1": ("darwin", "levain-old", {"ours": put(SUDOERS_DIR / "levain-old", SUDO),
                                                "not-ours": sym(SUDOERS_DIR / "levain-old"),
                                                "fail": nd(SUDOERS_DIR / "levain-old")}),
         "member/1": ("darwin", ("_levain_keys", "levain-gone", GID),
@@ -340,7 +352,7 @@ def _cases():
         "pf-alias/1": ("darwin", "127.0.1.9", {"ours": lambda h, lv: h.aliases.add("127.0.1.9"),
                                                "fail": fail("ifconfig")}),
         "pf-anchor/1": ("darwin", (pf.ANCHOR, str(pf.ANCHOR_FILE)),
-                        {"ours": put(pf.ANCHOR_FILE), "not-ours": sym(pf.ANCHOR_FILE), "fail": fail("pfctl")}),
+                        {"ours": put(pf.ANCHOR_FILE, ANCHOR), "not-ours": sym(pf.ANCHOR_FILE), "fail": fail("pfctl")}),
         "pf-enable/1": ("darwin", str(pf.PF_TOKEN), {"ours": put(pf.PF_TOKEN, b"12345\n"),
                                                      "not-ours": sym(pf.PF_TOKEN), "fail": nd(pf.PF_TOKEN)}),
         "apparmor/1": ("linux", "levain-slot-bwrap",
@@ -349,7 +361,7 @@ def _cases():
                         "not-ours": put(bwrap.APPARMOR_PROFILE, b"# hands' profile\n"),
                         "fail": lambda h, lv: lv.at(bwrap.APPARMOR_LOADED).mkdir(parents=True)}),
         "bwrap-copy/1": ("linux", (str(bwrap.LEVAIN_BWRAP), str(bwrap.BWRAP_DIGEST)),
-                         {"ours": put(bwrap.LEVAIN_BWRAP), "not-ours": sym(bwrap.LEVAIN_BWRAP),
+                         {"ours": lambda h, lv: _bwrap(lv), "not-ours": sym(bwrap.LEVAIN_BWRAP),
                           "fail": nd(bwrap.LEVAIN_BWRAP)}),
         "netns/1": ("linux", "levain-e7", {"ours": lambda h, lv: h.netns.add("levain-e7"), "fail": fail("ip")}),
         "entry/1": ("darwin", "old-helper",
@@ -601,7 +613,7 @@ def test_a_linux_unit_running_with_its_file_gone_is_stopped(tmp_path: Path) -> N
     assert sc[:2] == ["stop", "disable"], sc
     # with the file present, disable --now as before
     h, live = _host(tmp_path / "c1f", "linux")
-    _put(live, units.SYSTEMD_DIR / "levain-old-svc.service")
+    _put(live, units.SYSTEMD_DIR / "levain-old-svc.service", UNIT)
     h.systemd["levain-old-svc.service"] = ["loaded", "active"]
     step, = IH.removal_steps("linux", [("unit/1", "old-svc")], "R5", live=live)
     assert step.call() == (True, "") and [a for a in h.acts() if a[1:3] == ("disable", "--now")]
@@ -611,7 +623,7 @@ def test_the_sudoers_check_runs_whatever_the_drop_in_reads(tmp_path: Path) -> No
     """C2: ``visudo -c`` failing after the ``rm`` used to pass on the re-run (the drop-in now reads ABSENT, so the
     chained check never ran). The check is its own step: it fails the re-run too, until the config checks clean."""
     h, live = _host(tmp_path / "c2")
-    _put(live, SUDOERS_DIR / "levain-old")
+    _put(live, SUDOERS_DIR / "levain-old", SUDO)
     h.fail.add("visudo")
     first = _run_all(IH.removal_steps(HOST, [("sudoers/1", "levain-old")], "R5", live=live))
     rerun = _run_all(IH.removal_steps(HOST, [("sudoers/1", "levain-old")], "R5", live=live))
@@ -621,13 +633,16 @@ def test_the_sudoers_check_runs_whatever_the_drop_in_reads(tmp_path: Path) -> No
     assert all(ok for ok, _ in _run_all(IH.removal_steps(HOST, [("sudoers/1", "levain-old")], "R5", live=live)))
 
 
-def test_an_empty_pf_token_file_is_removed(tmp_path: Path) -> None:
-    """C3 (refuted on disk, pinned): ``pf._read_token`` removes a token file that holds no token, so the removal
-    leaves nothing behind. Green on b8a59db0 too (``fix/repro_b8a59db0.txt``)."""
+def test_an_empty_pf_token_file_is_left_and_logged(tmp_path: Path) -> None:
+    """C3, re-pinned by FIX1 H1 (HEAD 1022-19): a recorded token path is ours only when it holds a pf token, so an
+    empty file there reads NOT_OURS: left in place, logged to skips, and the step passes (it never wedges undo). Before
+    H1, ``pf._read_token`` removed it, and with it any non-token file the bound admits (the retired-ids file's name
+    included: ``test_undo_fix1``). ``_write_token`` replaces the file in one rename, so Levain never leaves it empty."""
     h, live = _host(tmp_path / "c3")
     _put(live, pf.PF_TOKEN, b"")
     step, = IH.removal_steps(HOST, [("pf-enable/1", str(pf.PF_TOKEN))], "R8", live=live)
-    assert step.call()[0] and not os.path.lexists(live.at(pf.PF_TOKEN))
+    assert step.call()[0] and live.at(pf.PF_TOKEN).read_bytes() == b""
+    assert live.skips == {("pf-enable/1", str(pf.PF_TOKEN))} and not [a for a in h.log if "-X" in a]
 
 
 def test_every_live_run_is_bounded(tmp_path: Path) -> None:

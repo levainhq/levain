@@ -23,6 +23,7 @@ from levain.slot.grammar import parse_install_argv
 from levain.slot.ids import RANGES, SHARED_GROUPS, SINGLETONS, SlotId, loopback_alias
 from levain.slot.install_helper import HostFacts, operator_record, plan_replenish, plan_setup, plan_undo
 from levain.slot.layout import IMPORT_TREE, RUN, install_helper_path, runtime_helper_path, service_entry_path
+from levain.slot.sudoers import RUNTIME_SUDOERS
 
 HOSTS = ("linux", "darwin")
 
@@ -290,7 +291,9 @@ def test_services_start_order(host):
     undo = _undo(host, dict(plan.allocation.ids))
     whys = [s.why for s in undo.steps]
     stops = [i for i, w in enumerate(whys) if w.startswith(("stop com.levain.", "stop and disable levain-"))]
-    assert stops and min(stops) == 2 and whys[1].startswith("check the sudoers config")
+    # FIX1: the sudoers preflight [0] and undo's journal [1] first, then the runtime rule [2] and its check [3]
+    assert stops and min(stops) == 4 and whys[3].startswith("check the sudoers config") \
+        and whys[2].startswith(f"remove {RUNTIME_SUDOERS} ")
     first_removal = next(i for i, s in enumerate(undo.steps) if s.write or "tombstone" in s.why or
                          (s.why.startswith("remove /") and "sudoers" not in s.why))
     assert max(stops) < first_removal

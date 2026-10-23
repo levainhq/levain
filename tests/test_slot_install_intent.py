@@ -315,8 +315,9 @@ def test_undo_reads_intent(host):
     assert s0 in undo.retired_after and j.accounts["_levain_gw0"] not in undo.retired_after
     deleted = [s.why.removeprefix("delete the group ") for s in undo.steps if s.why.startswith("delete the group ")]
     assert sorted(deleted) == sorted(SHARED_GROUPS)
-    assert undo.steps[-2].argv[1:] == ("-f", str(INTENT_PATH[host]))
-    assert undo.steps[-1].argv[1:] == ("-f", str(operator_record_path(host)))
+    assert undo.steps[-3].argv[1:] == ("-f", str(INTENT_PATH[host]))
+    assert undo.steps[-2].argv[1:] == ("-f", str(operator_record_path(host)))
+    assert undo.steps[-1].why.startswith("check the sudoers config with visudo -c (after ")                         # FIX1 M1
     # without the journal, Linux would leave the unlabelled groups and the unlabelled-yet account behind
     blind = plan_undo(parse_install_argv(["undo"]), _set_up(host), accounts=labelled, shared_groups=shared)
     assert s0 not in blind.retired_after

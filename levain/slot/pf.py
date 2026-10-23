@@ -40,6 +40,12 @@ PF_OPTIMIZE = ("-o", "none")
 GWPORT_BASE = 47100
 
 _TOKEN_RE = re.compile(r"Token\s*:\s*([0-9]{1,20})")
+#: The first line of every rules file :func:`anchor_text` writes starts with this (every version since S1:
+#: ``git log -S`` on it in this file); :func:`anchor_state` reads the file as Levain's only then.
+ANCHOR_HEADER = "# Levain session slots"
+#: What :func:`_write_token` writes and :func:`_read_token` accepts (stripped): :func:`enable_state` reads a recorded
+#: token path as Levain's only when it holds this.
+_TOKEN_BYTES = re.compile(rb"[0-9]{1,20}")
 
 
 def gwport(slot: SlotId) -> int:
@@ -95,7 +101,7 @@ def anchor_rules(slots: Iterable[SlotId], ids: Mapping[str, int]) -> list[str]:
 
 
 def anchor_text(slots: Iterable[SlotId], ids: Mapping[str, int]) -> str:
-    return ("# Levain session slots (CONTRACT §8.3, §24). Written by the install helper; removed by its undo verb.\n"
+    return (f"{ANCHOR_HEADER} (CONTRACT §8.3, §24). Written by the install helper; removed by its undo verb.\n"
             + "".join(f"{r}\n" for r in anchor_rules(slots, ids)))
 
 
@@ -301,11 +307,12 @@ def remove_alias_steps(addr: str, *, live: "Live") -> list[Step]:
 
 
 def anchor_state(anchor: str, file: str, live: "Live") -> str:
-    """OURS: the rules file is a regular root file, or it is gone and the anchor still holds rules. ABSENT: no file and
-    ``pfctl -a <anchor> -sr`` prints no rule."""
+    """OURS: the rules file is a regular root file whose first line starts with :data:`ANCHOR_HEADER`, or it is gone
+    and the anchor still holds rules. ABSENT: no file and ``pfctl -a <anchor> -sr`` prints no rule. NOT_OURS: any other
+    file at the recorded path (nothing is flushed or removed)."""
     from levain.slot.removal import ABSENT, OURS, root_file
 
-    state = root_file(live, Path(file))
+    state = root_file(live, Path(file), check=lambda b: b.split(b"\n", 1)[0].startswith(ANCHOR_HEADER.encode()))
     if state != ABSENT:
         return state
     return OURS if live.read((PFCTL, "-a", anchor, "-sr")).strip() else ABSENT
@@ -329,9 +336,12 @@ def remove_anchor_steps(anchor: str, file: str, *, live: "Live") -> list[Step]:
 
 
 def enable_state(token: str, live: "Live") -> str:
+    """OURS: a regular root file holding a pf token (:data:`_TOKEN_BYTES`). Anything else at the recorded path is
+    NOT_OURS and left: the bound admits every name under ``/var/db/levain``, the retired-ids file's included, and
+    :func:`release_enable_reference` removes a file that holds no token."""
     from levain.slot.removal import root_file
 
-    return root_file(live, Path(token))
+    return root_file(live, Path(token), check=lambda b: _TOKEN_BYTES.fullmatch(b.strip()) is not None)
 
 
 def remove_enable_steps(token: str, *, live: "Live") -> list[Step]:

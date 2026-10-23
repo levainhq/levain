@@ -21,6 +21,10 @@ if TYPE_CHECKING:
 RUNTIME_SUDOERS = _SUDOERS_DIR / "levain-runtime"
 INSTALL_SUDOERS = _SUDOERS_DIR / "levain-install"
 
+#: The first line of every drop-in this module writes, both rules, every version since S1 (``git log -S`` on it in
+#: this file): :func:`dropin_state` reads a recorded drop-in as Levain's only when its first line starts with it.
+HEADER = "# Written by the Levain install helper"
+
 #: CONTRACT §5.1: the runtime verbs ``_levain_dispatch`` may call (every verb but adopt-open,
 #: discard, restore, confirm-identity).
 DISPATCH_VERBS = ("prepare", "render", "start", "resume", "teardown", "status")
@@ -33,7 +37,7 @@ def runtime_sudoers_text(host: HostOS, operator: str) -> str:
     # with no arguments.
     dispatch_cmds = ", ".join([*(f"{h} {v} *" for v in DISPATCH_VERBS), f"{h} status"])
     return (
-        "# Written by the Levain install helper (CONTRACT §5.1); removed by its undo verb.\n"
+        f"{HEADER} (CONTRACT §5.1); removed by its undo verb.\n"
         f"Defaults!{h} use_pty\n"
         f"{op} ALL=(root) NOPASSWD: {h}\n"
         f"_levain_dispatch ALL=(root) NOPASSWD: {dispatch_cmds}\n"
@@ -44,7 +48,7 @@ def install_sudoers_text(host: HostOS, operator: str) -> str:
     op = check_operator_name(operator)
     h = str(install_helper_path(host))
     return (
-        "# Written by the Levain install helper (CONTRACT §5.2, §23); removed by its undo verb.\n"
+        f"{HEADER} (CONTRACT §5.2, §23); removed by its undo verb.\n"
         # §23: the password is asked unless a LATER sudoers rule for this path says NOPASSWD (root-written,
         # so trusted): with several matching rules sudo applies the last one.
         f"Defaults!{h} authenticate, timestamp_timeout=0\n"
@@ -73,18 +77,43 @@ def sudoers_paths() -> tuple[Path, Path]:
     return RUNTIME_SUDOERS, INSTALL_SUDOERS
 
 
+def _is_ours(data: bytes) -> bool:
+    return data.split(b"\n", 1)[0].startswith(HEADER.encode())
+
+
+def dropin_state(name: str, live: "Live") -> str:
+    """``sudoers/1``'s live outcome: OURS only for a regular root file whose first line starts with :data:`HEADER`. Any
+    other file at the recorded name (an admin's own rule there, say) is NOT_OURS: never removed (L3 r1 codex HIGH)."""
+    from levain.slot.removal import root_file
+
+    return root_file(live, _SUDOERS_DIR / name, check=_is_ours)
+
+
+def config_check_step(host: HostOS, why: str, *, live: "Live", refusal: str) -> Step:
+    """``visudo -c`` of the whole sudoers config as its own step. ``refusal`` leads the failure text: what the run has
+    and has not done when the config does not parse."""
+    from levain.slot.removal import RemoveStep
+
+    check = (_visudo(host)[0], "-c")
+
+    def go() -> tuple[bool, str]:
+        ok, out = live.act(check)
+        return (True, "") if ok else (False, f"{refusal}: {out}")
+    return RemoveStep(why, call=go, tools=(check[0],))
+
+
 def remove_dropin_steps(host: HostOS, name: str, *, live: "Live") -> list[Step]:
     """Row 33 R1b, ``sudoers/1`` (§1.1 table row 2, R5): the recorded drop-in ``_SUDOERS_DIR/<name>`` removed when it
     is a regular root file, then ``visudo -c`` of the whole config as its OWN step, run whatever the drop-in's
     outcome: a re-run after a failed check finds the drop-in ABSENT and must still check, never pass silently. Never
     a current name looked up."""
-    from levain.slot.removal import RemoveStep, at, chain, point, remove_step, root_file
+    from levain.slot.removal import at, chain, point, remove_step
 
     path = _SUDOERS_DIR / name
-    rm, check = _rm(host), (_visudo(host)[0], "-c")
+    rm = _rm(host)
     return [remove_step(f"remove {path} (visudo -c checks the config next)", ("sudoers/1", name), live,
-                        lambda: root_file(live, path),
+                        lambda: dropin_state(name, live),
                         chain(lambda: live.act((rm, "-f", at(live, path))), point(live, "sudoers/1:after-rm")),
                         tools=(rm,)),
-            RemoveStep(f"check the sudoers config with visudo -c (after {path})", call=lambda: live.act(check),
-                       tools=(check[0],))]
+            config_check_step(host, f"check the sudoers config with visudo -c (after {path})", live=live,
+                              refusal=f"the sudoers config does not parse after {path} was removed")]

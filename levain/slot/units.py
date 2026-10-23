@@ -35,6 +35,9 @@ if TYPE_CHECKING:
 
 LAUNCHD_DIR = Path("/Library/LaunchDaemons")
 SYSTEMD_DIR = Path("/etc/systemd/system")
+#: The first line of every systemd unit :func:`systemd_unit_text` writes (every version since S1: ``git log -S`` on it
+#: in this file). :func:`unit_state` reads a unit file as Levain's only when its first line is this.
+SYSTEMD_HEADER = "# Written by the Levain install helper; removed by its undo verb."
 
 
 @dataclass(frozen=True)
@@ -148,7 +151,7 @@ def systemd_unit_text(svc: Service) -> str:
         unit += [f"After={deps}", f"Wants={deps}"]
     unit.append("StartLimitIntervalSec=0")   # "always" means always: no start-rate limit gives up on it
     lines = [
-        "# Written by the Levain install helper; removed by its undo verb.",
+        SYSTEMD_HEADER,
         "[Unit]", *unit, "",
         "[Service]", "Type=simple", f"User={svc.user}", f"Group={_group('linux', svc)}",
         f"ExecStart={' '.join(argv('linux', svc))}",
@@ -332,8 +335,13 @@ def _plist_is(label: str) -> Callable[[bytes], bool]:
     return check
 
 
+def _unit_is_ours(data: bytes) -> bool:
+    return data.split(b"\n", 1)[0] == SYSTEMD_HEADER.encode()
+
+
 def unit_state(host: HostOS, n: str, live: "Live") -> str:
-    """OURS: the unit file is a regular root file (macOS: its ``Label`` is ``com.levain.<n>``), OR the file is gone and
+    """OURS: the unit file is a regular root file Levain wrote (macOS: its ``Label`` is ``com.levain.<n>``; Linux: its
+    first line is :data:`SYSTEMD_HEADER`), OR the file is gone and
     the job is still loaded (the bound reserves the name). ABSENT: no file and not loaded. NOT_OURS: a file at the
     name that is not ours."""
     from levain.slot.removal import ABSENT, OURS, root_file
@@ -345,7 +353,7 @@ def unit_state(host: HostOS, n: str, live: "Live") -> str:
             return state
         return OURS if _launchd_state(label, live) == "loaded" else ABSENT
     unit = f"levain-{n}.service"
-    state = root_file(live, SYSTEMD_DIR / unit)
+    state = root_file(live, SYSTEMD_DIR / unit, check=_unit_is_ours)
     if state != ABSENT:
         return state
     if _systemd_state("LoadState", unit, live) != "not-found":

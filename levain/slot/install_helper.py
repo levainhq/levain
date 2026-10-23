@@ -59,8 +59,8 @@ from levain.slot.layout import (STORE, Row, base_routes_steps, base_run_rows, ba
                                 pool_config_undo_steps, reserve_row, reserve_steps, roots_steps, row_steps,
                                 run_dir_undo_steps, single_filesystem_steps, slot_rows, tmpfiles_steps,
                                 tmpfiles_undo_steps, ungroup_steps, entry_state, remove_entry_steps)
-from levain.slot.sudoers import (INSTALL_SUDOERS, RUNTIME_SUDOERS, remove_dropin_steps,
-                                 sudoers_paths, sudoers_steps)
+from levain.slot.sudoers import (INSTALL_SUDOERS, RUNTIME_SUDOERS, config_check_step, dropin_state,
+                                 remove_dropin_steps, sudoers_paths, sudoers_steps)
 
 OPERATOR_FORMAT = "levain-operator/1"
 
@@ -730,7 +730,9 @@ def _abandoned_setup(facts: HostFacts) -> Intent | None:
     setup died before writing it), or None when undo takes its ordinary path. With no record, only the
     journal's operator may run it, by the name the caller's uid resolves to; a live lease still refuses."""
     j = facts.intent
-    if facts.operator_record is not None or j is None or j.verb != "setup":
+    # An UNDO journal with no operator record is an interrupted undo of such a setup (undo removes its journal before
+    # the record, so an ordinary undo's journal never outlives the record).
+    if facts.operator_record is not None or j is None or j.verb not in ("setup", "undo"):
         return None
     if facts.live_leases > 0:
         raise Refused("live-lease", _live_lease_why("undo", facts))
@@ -763,6 +765,13 @@ def _end_processes(host: HostOS, uid: int, name: str, *,
     return True, ""
 
 
+def _undo_journal_step(host: HostOS, intent: Intent, live: RM.Live) -> Step:
+    """Undo's own journal (FIX1 M2), written whole and durably under :attr:`removal.Live.root` (``/`` on a host)."""
+    path, text = live.at(INTENT_PATH[host]), intent_text(intent)
+    return Step(f"journal what this undo will remove in {INTENT_PATH[host]} (txn {intent.txn})",
+                call=lambda: write_intent_atomically(path, text))
+
+
 def _undo_unit_order(host: HostOS, names: Iterable[str]) -> list[str]:
     """Undo stops units in reverse start order: a recorded name this code does not ship first (sorted), then the
     shipped ones in reverse of :data:`units.SERVICES`."""
@@ -778,22 +787,27 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
     ``shared_groups``: the shared groups present, name -> their live gid.
 
     Row 33 R1b: undo removes ``record.managed ∪ journal.managed`` plus its own desired set (what this code would manage
-    for those accounts and groups, so a host with no record undoes as before), each record through its kind's
-    per-identity remove step with ``retire=False`` (§1.1 g: undo retires no gid), in the order of CONTRACT §23: the
+    for those accounts and groups, so a host with no record undoes as before; a FINISHED repair journal's records are
+    the record's, and undo reads none of them), each record through its kind's per-identity remove step with
+    ``retire=False`` (§1.1 g: undo retires no gid). FIX1: first ``visudo -c`` (a config that does not parse refuses
+    undo with nothing removed), then undo's OWN journal of that whole set (a re-run plans from it, so what this run
+    derived from accounts it then tombstones is not lost). Then, in the order of CONTRACT §23: the
     runtime sudoers rule first (and every other recorded drop-in but the install rule: no new runtime-helper calls),
     every unit stopped (reverse start order) before any unit file is removed, slot state and pool config, the account
     ids retired, each account's processes ended and proven then the account tombstoned, every dir naming a shared
     group given back to root's group, the memberships, the groups deleted, slot confinement (macOS the lo0 aliases,
     the pf anchor and pf's enable reference; Linux the AppArmor profile, the bwrap copy, the netns, then tmpfiles.d
-    and R), the install record, the install sudoers rule, the intent journal, the operator record LAST. Every remove
+    and R), the install record, ``visudo -c``, the install sudoers rule, the intent journal, the operator record, and
+    the ``visudo -c`` after the install rule as the very last step (it can fail without stranding undo). Every remove
     step reads its live object before it acts (ABSENT: nothing run; NOT_OURS: left in place), and the other steps
     are idempotent, so every step is safe to re-run. The store and
     the root import tree stay: ``entry/1`` records are not undo's. ``live``: every live read and act of the remove
     steps; ``end``: the account kind's proven process end.
 
     With a journal (§25), the accounts and groups it names that are present at their journaled ids are undone with
-    the rest. With no operator record and a SETUP journal (the setup died before its record), undo runs against the
-    journal alone, for its operator, and ends by removing the journal: there is no record to remove."""
+    the rest. With no operator record and a SETUP journal (the setup died before its record), or the UNDO journal an
+    interrupted undo of that setup wrote, undo runs against the journal alone, for its operator, and removes the
+    journal last of its removals: there is no record to remove."""
     if cmd.verb != "undo":
         raise Refused("wrong-verb", cmd.verb)
     abandoned = _abandoned_setup(facts)
@@ -824,10 +838,23 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         check_account_ids(host, accounts)
     desired = desired_managed(host, accounts=accounts, shared=groups, operator=operator,
                               services=[s.name for s in units.services_for(host)], slots=slots_of(accounts),
-                              apparmor=host == "linux")
+                              apparmor=host == "linux", partial_groups=True)
     shape, journal = facts.install_shape, facts.intent
+    # A FINISHED repair journal (its txn is the record's completed_txn) is settled in the record: undo reads none of its
+    # records, as check_records checks none (an unknown kind there is kept, never read).
+    if journal is not None and shape is not None and journal.txn == shape.completed_txn:
+        journal = None
     every = (set(shape.managed) if shape is not None else set()) | (set(journal.managed) if journal else set()) | desired
     every = {r for r in every if r[0] != "entry/1"}               # the root import tree stays (§23)
+    # M2: what this run derived goes into ITS journal before the first removal, and a re-run plans from it (with the
+    # rest): a pre-row-33 install's slot confinement is derived from live accounts, which this run tombstones.
+    # Only records within their bound are journaled, so the re-run's check_records cannot refuse its own journal.
+    txn = facts.intent.txn if facts.intent is not None and facts.intent.verb == "undo" and facts.intent.txn \
+        else gen_mod.new_txn()
+    undo_intent = Intent("undo", operator,
+                         {n: i for n, i in accounts.items() if in_own_range(host, n, i)},
+                         {g: i for g, i in groups.items() if i in RANGES[host].shared}, txn, None,
+                         _shape_of(r for r in every if _in_bound(host, r, operator)))
     live = live if live is not None else RM.Live()
     end = end or (lambda uid, name: _end_processes(host, uid, name))
 
@@ -842,11 +869,19 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
     grants = sorted((r for r in of("sudoers/1") if r != install_rule), key=lambda r: (r[1] != RUNTIME_SUDOERS.name, r[1]))
     unit_recs = [("unit/1", n) for n in _undo_unit_order(host, (i for _, i in of("unit/1")))]
     uids = {i[0]: i[1] for _, i in of("account/1")}
-    retired_after = frozenset(facts.retired) | frozenset(uids.values())
+    # L1: only the uids of accounts this run removes (ours: live, or journal-present, at the recorded uid). A recorded
+    # name present at another uid is left in place, and so is its id.
+    retired_after = frozenset(facts.retired) | frozenset(u for n, u in uids.items() if accounts.get(n) == u)
     path = RETIRED_IDS_PATH[host]
     mkdir = "/bin/mkdir" if host == "darwin" else _abs("mkdir")
     rm = "/bin/rm" if host == "darwin" else _abs("rm")
     steps: list[Step] = [
+        # M1: a config that does not parse refuses undo here, with nothing removed (every drop-in's own check after its
+        # removal would otherwise stop undo part-way).
+        config_check_step(host, "check the sudoers config with visudo -c before undo removes anything", live=live,
+                          refusal="the sudoers config does not parse: undo has removed nothing; fix what visudo "
+                                  "names, then run undo again"),
+        _undo_journal_step(host, undo_intent, live),
         *remove(grants, "R5"),                      # the runtime rule first: no new runtime-helper calls
         *remove(unit_recs, "R5"),                   # every unit stopped before anything is removed
         *remove(unit_recs, "R12"),                  # then their files
@@ -868,13 +903,23 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         steps += tmpfiles_undo_steps() + run_dir_undo_steps(host)
     # Row 33 §1.1: the install record goes before the last three acts (the install rule, the journal, the record).
     steps.append(Step("remove the install record", (rm, "-f", str(install_shape_path(host)))))
-    steps += remove([install_rule], "R5")           # the install rule LAST: until it goes, a failed undo re-runs
+    # The install rule LAST: until it goes, a failed undo re-runs. M1: so nothing may fail between its removal and the
+    # end. The config is checked while the rule still stands (a failure there leaves undo re-runnable through the
+    # helper), and the check after its removal runs as the plan's LAST step, after the journal and the operator record
+    # are gone: a failure there reports a config broken during undo and strands nothing.
+    rm_rule, after_rule = remove([install_rule], "R5")
+    steps.append(config_check_step(host, f"check the sudoers config with visudo -c before {INSTALL_SUDOERS} goes",
+                                   live=live, refusal=f"the sudoers config does not parse: {INSTALL_SUDOERS} is "
+                                                      "still in place, so undo can run again once visudo checks "
+                                                      "clean"))
+    steps.append(rm_rule)
     # Just before the record (§25): until undo is complete a re-run still reads what the journal names.
     steps.append(intent_remove_step(host))
     if abandoned is None:
         steps.append(Step("remove the operator record (last)", (rm, "-f", str(operator_record_path(host)))))
+    steps.append(after_rule)
     check_tools(facts, steps, verb="undo")
-    return InstallPlan("undo", host, tuple(steps), retired_after=retired_after)
+    return InstallPlan("undo", host, tuple(steps), retired_after=retired_after, intent=undo_intent)
 
 
 # --- replenish -------------------------------------------------------------------------------------
@@ -903,6 +948,8 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
     check_account_ids(host, accounts)
     check_capacity(host, slots, verifier_slots, facts.retired)
     journal = facts.intent
+    if journal is not None and journal.verb == "undo":
+        raise Refused("install-interrupted", journal.verb)      # undo finishes it: run undo again
     if journal is not None and journal.verb == "repair":
         # Row 33 (§8 N1/N1a): the ONLY proof a repair finished is install-shape's completed_txn == its txn.
         shape = facts.install_shape
@@ -997,14 +1044,16 @@ def install_shape_path(host: HostOS) -> Path:
 
 
 def desired_managed(host: HostOS, *, accounts: Mapping[str, int], shared: Mapping[str, int], operator: str,
-                    services: Iterable[str], slots: Iterable[SlotId], apparmor: bool = False) -> frozenset:
+                    services: Iterable[str], slots: Iterable[SlotId], apparmor: bool = False,
+                    partial_groups: bool = False) -> frozenset:
     """§1.1 ``managed``: what an install with these accounts, shared groups, services and slots manages, typed, one
-    record per resource, derived from the plan (never typed by hand)."""
+    record per resource, derived from the plan (never typed by hand). ``partial_groups``: undo's alone (a re-run after
+    its groups went has no gid to name for them); every other caller passes every group and a missing one raises."""
     accts = accounts_of(Allocation(host, (), (), dict(accounts), {}))
     out: set = {("unit/1", s) for s in services}
     out |= {("sudoers/1", p.name) for p in sudoers_paths()}
     out |= {("group/1", (g, gid)) for g, gid in shared.items()}
-    out |= _slot_managed(host, accts, shared, operator, slots)
+    out |= _slot_managed(host, accts, shared, operator, slots, partial_groups=partial_groups)
     out |= {("entry/1", e) for e in root_tree.ENTRY_MODULES}
     if host == "darwin":
         out |= {("pf-anchor/1", (pf.ANCHOR, str(pf.ANCHOR_FILE))), ("pf-enable/1", str(pf.PF_TOKEN))}
@@ -1016,14 +1065,16 @@ def desired_managed(host: HostOS, *, accounts: Mapping[str, int], shared: Mappin
 
 
 def _slot_managed(host: HostOS, accts: Iterable[Account], shared: Mapping[str, int], operator: str | None,
-                  slots: Iterable[SlotId]) -> set:
+                  slots: Iterable[SlotId], *, partial_groups: bool = False) -> set:
     """The records that come with accounts and slots: each account, each of its memberships (and the operator's, when
     named) at the group's gid, and per slot its lo0 alias (macOS egress) or its netns (Linux). ONE derivation for
     setup's and repair's desired set and for what replenish adds (U16)."""
     accts = tuple(accts)
     out: set = {("account/1", (a.name, a.uid)) for a in accts}
-    # A group with no gid here has none to name (an undo re-run after the groups went): its pairs went with it.
-    out |= {("member/1", (a, g, shared[g])) for a, g in membership_pairs(accts, operator) if g in shared}
+    # partial_groups (undo only): a group with no gid here has none to name (a re-run after the groups went); its
+    # pairs went with it. Every other caller passes every group, and a missing one raises KeyError.
+    out |= {("member/1", (a, g, shared[g])) for a, g in membership_pairs(accts, operator)
+            if not partial_groups or g in shared}
     if host == "darwin":
         out |= {("pf-alias/1", loopback_alias(s)) for s in slots if s.slot_class == "egress"}
     else:
@@ -1059,6 +1110,12 @@ def check_records(facts: HostFacts, operator: str | None) -> None:
     if journal is not None and not (shape is not None and journal.txn == shape.completed_txn):
         recs += sorted(journal.managed, key=repr)
     gen_mod.check_managed(facts.host, recs, operator=operator)
+
+
+def _in_bound(host: HostOS, record, operator: str | None) -> bool:
+    """One record within its kind's bound (:func:`generation.check_managed`'s test, record by record)."""
+    kind, ident = record
+    return kind in gen_mod.KINDS and not isinstance(ident, gen_mod.Opaque) and gen_mod.KINDS[kind](host, ident, operator)
 
 
 def _shape_of(records: Iterable) -> tuple:
@@ -1116,7 +1173,7 @@ def kind_state(host: HostOS, kind: str, ident, live: RM.Live) -> str:
     if kind == "unit/1":
         return units.unit_state(host, ident, live)
     if kind == "sudoers/1":
-        return RM.root_file(live, sudoers_paths()[0].parent / ident)
+        return dropin_state(ident, live)
     if kind == "member/1":
         return member_state(host, *ident, live)
     if kind == "group/1":
@@ -1290,7 +1347,7 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     shape = facts.install_shape
     journal = facts.intent
     finished: Intent | None = None
-    if journal is not None and journal.verb == "replenish":
+    if journal is not None and journal.verb in ("replenish", "undo"):
         raise Refused("install-interrupted", journal.verb)      # U7: setup's shape (plan_setup above)
     if journal is not None and journal.verb == "setup":
         journal = None    # stale: the operator record proves that setup finished (preflight refuses without one)

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -188,11 +189,50 @@ def remove_apparmor_profile_steps(name: str, *, live: "Live") -> list[Step]:
     ]
 
 
-def bwrap_copy_state(copy: str, digest: str, live: "Live") -> str:
-    """OURS: the copy or its digest record is present, each a regular root file. ABSENT: neither."""
-    from levain.slot.removal import ABSENT, NOT_OURS, OURS, root_file
+#: One line of :func:`digest_record_text` (``sha256sum`` check format: a digest, two spaces, an absolute path).
+_DIGEST_LINE = re.compile(rb"([0-9a-f]{64})  (/[^\n]*)")
 
-    states = {root_file(live, Path(copy)), root_file(live, Path(digest))}
+
+def _digest_lines(data: bytes) -> dict | None:
+    """A digest record's ``path -> sha256``; None when the bytes are not one :func:`digest_record_text` wrote."""
+    lines = data.split(b"\n")
+    if lines[-1] != b"" or len(lines) < 2:
+        return None
+    out = {}
+    for ln in lines[:-1]:
+        m = _DIGEST_LINE.fullmatch(ln)
+        if m is None:
+            return None
+        out[m.group(2).decode("utf-8", "replace")] = m.group(1).decode()
+    return out
+
+
+def bwrap_copy_state(copy: str, digest: str, live: "Live") -> str:
+    """OURS: the copy or its digest record is present, each a regular root file Levain wrote: the digest record parses
+    as :func:`digest_record_text`'s, and the copy's sha256 is the one that record names for it. ABSENT: neither.
+    NOT_OURS when either is any other file (the bound admits every name under ``/var/lib/levain``, the retired-ids
+    file's included), so nothing is removed. Known edge: a copy whose digest record was never written (setup killed
+    between the ``install`` and the record) reads NOT_OURS and is left, logged; the next setup or repair re-records."""
+    from levain.slot.removal import ABSENT, NOT_OURS, OURS, ReadFailed, root_file
+
+    named: dict = {}
+
+    def record_ok(b: bytes) -> bool:
+        lines = _digest_lines(b)
+        if lines is not None:
+            named.update(lines)
+        return lines is not None
+
+    d = root_file(live, Path(digest), check=record_ok)
+    c = root_file(live, Path(copy))
+    if c == OURS:
+        try:
+            have = file_sha256(live.at(Path(copy)))
+        except OSError as e:
+            raise ReadFailed(f"cannot read {copy}: {e.strerror or e}") from None
+        if d != OURS or named.get(copy) != have:
+            c = NOT_OURS
+    states = {c, d}
     if NOT_OURS in states:
         return NOT_OURS
     return OURS if OURS in states else ABSENT

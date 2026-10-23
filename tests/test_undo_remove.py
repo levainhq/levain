@@ -23,7 +23,7 @@ from levain.slot.grammar import parse_install_argv
 from levain.slot.ids import RANGES, RETIRED_IDS_PATH, SlotId, loopback_alias, read_retired_ids
 from levain.slot.sudoers import INSTALL_SUDOERS, RUNTIME_SUDOERS
 
-from tests.test_repair_remove import GID, LGID, SUDOERS_DIR, _host, _plist, _put
+from tests.test_repair_remove import ANCHOR, GID, LGID, SUDO, SUDOERS_DIR, _bwrap, _host, _plist, _put
 
 OP, OP_UID = "phill", 501
 S0 = 3999                                     # _levain_s0's uid (darwin slot range)
@@ -46,12 +46,12 @@ def _darwin_host(tmp: Path):
     _put(live, units.LAUNCHD_DIR / "com.levain.qbroker.plist", _plist("qbroker"))
     h.loaded |= {"com.levain.old-svc", "com.levain.qbroker"}
     for d in (RUNTIME_SUDOERS, INSTALL_SUDOERS, SUDOERS_DIR / "levain-old"):
-        _put(live, d)
+        _put(live, d, SUDO)
     h.users["_levain_s0"] = [S0, SLOT_MARKER]
     h.groups["levain-slots"] = [slots_gid, SLOT_MARKER, {"_levain_s0"}]
     h.groups["levain-gone"] = [GID, SLOT_MARKER, {OP}]
     h.aliases.add(loopback_alias(SlotId("egress", 0)))
-    _put(live, pf.ANCHOR_FILE)
+    _put(live, pf.ANCHOR_FILE, ANCHOR)
     h.rules[pf.ANCHOR] = True
     _put(live, pf.PF_TOKEN, b"12345\n")
     return h, live, {"levain-slots": slots_gid}
@@ -135,8 +135,7 @@ def test_undo_linux_confinement_after_the_tombstones(tmp_path: Path, monkeypatch
     h.users["_levain_s0"] = [s0, SLOT_MARKER]
     h.groups["levain-slots"] = [lslots, SLOT_MARKER, {"_levain_s0"}]
     h.netns.add(SlotId("egress", 0).netns)
-    _put(live, bwrap.LEVAIN_BWRAP)
-    _put(live, bwrap.BWRAP_DIGEST)
+    _bwrap(live)
     _put(live, bwrap.APPARMOR_LOADED, b"")
     shape = _shape(("group/1", ("levain-gone", LGID)), ("account/1", ("_levain_s0", s0)))
     h.groups["levain-gone"] = [LGID, SLOT_MARKER, set()]

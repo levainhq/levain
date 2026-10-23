@@ -297,13 +297,14 @@ def test_undo_clears_abandoned_setup_intent(host):
     assert {j.accounts[n] for n in tombed} <= undo.retired_after
     deleted = [s.why.removeprefix("delete the group ") for s in undo.steps if s.why.startswith("delete the group ")]
     assert sorted(deleted) == sorted(SHARED_GROUPS)
-    # the journal goes last; there is no record to remove
-    assert undo.steps[-1].argv[1:] == ("-f", str(INTENT_PATH[host]))
+    # the journal goes last of the removals (then FIX1 M1's sudoers check); there is no record to remove
+    assert undo.steps[-1].why.startswith("check the sudoers config with visudo -c (after ")
+    assert undo.steps[-2].argv[1:] == ("-f", str(INTENT_PATH[host]))
     assert not any(str(operator_record_path(host)) in s.argv for s in undo.steps)
     # with the record present, undo is the ordinary one
     normal = plan_undo(undo_cmd, _facts(host, operator_record=operator_record(OP, OP_UID), intent=j,
                                         host_ids=present), accounts={}, shared_groups={})
-    assert normal.steps[-1].argv[1:] == ("-f", str(operator_record_path(host)))
+    assert normal.steps[-2].argv[1:] == ("-f", str(operator_record_path(host))) and normal.steps[-1].why.startswith("check the sudoers config with visudo -c (after ")
 
 
 # --- G4 / G5: an OSError is a refusal, not a crash -----------------------------------------------------

@@ -209,12 +209,13 @@ def test_undo_reruns_after_failure(host):
     plan = _plan(host, 2, 1)
     ids = dict(plan.allocation.ids)
     undo = _undo(host, ids)
-    def install_rule_at(p):   # the install rule's removal, then its visudo -c, the journal, the record
+    def install_rule_at(p):   # the install rule's removal, then the journal, the record, the visudo -c (FIX1 M1)
         whys = [s.why for s in p.steps]
         hits = [i for i, w in enumerate(whys) if str(INSTALL_SUDOERS) in w and not w.startswith("check ")]
         return hits == [len(whys) - 4]
 
-    assert undo.steps[0].why.startswith(f"remove {RUNTIME_SUDOERS} ") and install_rule_at(undo)
+    # FIX1: the sudoers preflight and undo's own journal come first
+    assert undo.steps[2].why.startswith(f"remove {RUNTIME_SUDOERS} ") and install_rule_at(undo)
     # R1b: every removal of a group, a profile or a namespace reads the live object first (a remove step), so a
     # re-run acts only on what is still there
     for s in undo.steps:
@@ -222,7 +223,7 @@ def test_undo_reruns_after_failure(host):
             assert isinstance(s, RemoveStep) and s.call is not None and not s.argv, s.why
     # the re-run after a failure past the tombstones: no live accounts left, half the groups gone
     again = _undo(host, {}, shared=SHARED_GROUPS[:3], retired=undo.retired_after)
-    assert again.steps[0].why.startswith(f"remove {RUNTIME_SUDOERS} ") and install_rule_at(again)
+    assert again.steps[2].why.startswith(f"remove {RUNTIME_SUDOERS} ") and install_rule_at(again)
     assert again.retired_after == undo.retired_after
 
 
