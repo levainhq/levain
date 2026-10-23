@@ -297,7 +297,8 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         f"`{lv} coord questions {tail}` lists the questions you have not read, each marked MAY ANSWER or ESCALATE. "
         "Your answer is YOUR OWN, never the operator's: it goes to his review queue as a KNOW, the seat gets it "
         "labelled as yours, and the question stays open for him. Never answer through the question band's own answer "
-        "verb: that is his channel, and it refuses this session.",
+        "verb: that is his channel, and it refuses this session. A question's directory and session are the asking "
+        "process's own word, so MAY ANSWER (asked from inside the envelope) is a label, not proof.",
         "",
         f"- answer one marked MAY ANSWER, only when its subject is inside the envelope: `{lv} coord answer N "
         f"--option KEY --token N {tail}` (or `--text WORDS`);",

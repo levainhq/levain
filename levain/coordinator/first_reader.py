@@ -10,19 +10,22 @@ What that means here:
   yet, each with the one mechanical verdict below.
 - **Its answer is a KNOW, never the operator's answer** (:func:`answer`). It is written in the coordinator's own store
   (``dispatch.db``): a reply of kind ``know`` pointing at the question, its review item (feed ``know``) and a
-  ``first_reads`` row, in ONE fenced transaction. Nothing is written to ``questions.db``: the operator's one answer slot
-  stays his, the question stays OPEN, and an answer he records later reaches the seat too and is the one that counts.
+  ``first_reads`` row, in ONE fenced transaction of ``dispatch.db``. Nothing is written to ``questions.db``: the
+  operator's one answer slot stays his, the question stays OPEN, and an answer he records later reaches the seat too
+  and is the one that counts.
   C5's first run showed why: the only path a coordinator
   had was ``levain question answer``, which recorded its pick under the operator's channel (``via cli``) and refused
   the operator's own answer after it.
 - **The seat gets it labelled** (:func:`claim_knows`, read by the band's hook path,
   :func:`levain.consent.band.question_context`): once, as the coordinator's own reading, while the question is still
-  open.
+  open (re-read inside the delivery transaction; a KNOW is formatted before it is marked delivered).
 - **Escalating** (:func:`escalate`): an ANSWER record (the grammar's push, C0 §3.3) pointing at the question, which then
   shows in "waiting on you"; the question stays open for the operator.
 
-**The verdict** (:func:`verdict`) is necessary, never sufficient. The coordinator may answer only when ALL hold, checked
-again inside the transaction that writes the KNOW:
+**The verdict** (:func:`verdict`) is necessary, never sufficient. The coordinator may answer only when ALL hold, read
+again inside the fenced ``dispatch.db`` transaction that writes the KNOW (the question re-read from ``questions.db``,
+the authority snapshot taken there when the caller gives its source, the launch and envelope chain read on that
+transaction's own connection):
 
 1. the question has no answer yet;
 2. no option of it is tied to a consent request (``levain ask --would-push``): that one is the operator's ruling;
@@ -41,18 +44,29 @@ NOTHING HERE IS AUTHORITY. A KNOW is information; this module never imports the 
 writes ``questions.db`` and never rules a request. Before S1 any process of your uid can hold the lease token and write
 this file (C0 §2), so ``by = coordinator`` is a label. Stdlib only.
 
-Known edges (one line each): a KNOW reaches a live session at its next tool call only (an ENDED session is not resumed
-for it); a question filed before a coordinator reads it was already pinged to you at filing (``levain ask`` pings, as
-before C5); a session Levain did not start (yours, and today every seat: :mod:`levain.coordinator.launch` starts
-coordinator launches only) always escalates; while a coordinator store exists, each hook reads ``questions.db`` once
-more for this session's open questions.
+Known edges:
+
+- the question and the authority log are other files, so their re-reads inside the ``dispatch.db`` transaction are
+  not atomic with it: an operator answer or a revocation landing between that re-read and the commit still files a
+  KNOW. Accepted, not locked across databases: a KNOW grants nothing, delivery re-checks the question is open inside
+  its own transaction (a KNOW to an answered question never reaches the seat), and every KNOW waits in the operator's
+  review queue;
+- a question's ``cwd`` and session are the asking process's own word (``levain ask`` runs as the agent), so "asked
+  from inside the envelope" is a label, never proof;
+- a KNOW whose line cannot be formatted stays undelivered (tried again at each hook) and waits in the review queue;
+- a KNOW reaches a live session at its next tool call only (an ENDED session is not resumed for it);
+- a question filed before a coordinator reads it was already pinged to you at filing (``levain ask`` pings, as before
+  C5);
+- a session Levain did not start (yours, and today every seat: :mod:`levain.coordinator.launch` starts coordinator
+  launches only) always escalates;
+- while a coordinator store exists, each hook reads ``questions.db`` once more for this session's open questions.
 """
 from __future__ import annotations
 
 import json
 import os
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -104,11 +118,14 @@ def _questions(directory: Path) -> Any:
 
 
 def _inside(cwd: str, where: Sequence[dict[str, Any]]) -> bool:
+    """Whether ``cwd`` is, or is under, a repo ``where`` names; both sides by real path (a repo spelled through a link,
+    or macOS's ``/var`` for ``/private/var``, still contains its own real path)."""
     try:
         real = os.path.realpath(cwd)
+        repos = [os.path.realpath(w["repo"]) for w in where]
     except (OSError, ValueError):
         return False
-    return any(real == w["repo"] or real.startswith(w["repo"].rstrip("/") + "/") for w in where)
+    return any(real == r or real.startswith(r.rstrip("/") + "/") for r in repos)
 
 
 def _verdict(store: Any, conn: sqlite3.Connection, now: str, q: Any, authority: Any) -> Reading:
@@ -183,12 +200,16 @@ def _text(name: str, value: Any, high: int) -> str:
 
 
 def answer(store: Any, ref: Any, *, option: str | None = None, text: str | None = None, token: object,
-           authority: Any) -> tuple[Any, str]:
+           authority: Any = None, authority_source: Callable[[], Any] | None = None) -> tuple[Any, str]:
     """The coordinator's own answer to question ``ref``: a KNOW (reply + review item + first read) in ONE transaction
-    fenced by the lease ``token``, refused unless :func:`_verdict` holds inside it. Returns ``(item, reply_id)``.
-    ``questions.db`` is never written: the question stays open for the operator."""
+    fenced by the lease ``token``, refused unless :func:`_verdict` holds inside it, on the question re-read there and,
+    given ``authority_source`` (a callable returning a snapshot, or None for none), on a snapshot taken there; else on
+    ``authority``. Returns ``(item, reply_id)``. ``questions.db`` is never written: the question stays open for the
+    operator. The re-reads narrow the window, they do not close it (the module's known edges)."""
     from levain.coordinator.review import _insert
 
+    if authority is not None and authority_source is not None:
+        raise CoordError("give an authority snapshot or its source, not both")
     if (option is None) == (text is None):
         raise CoordError("the coordinator answers with exactly one of an option key or its own words")
     q = _questions(store.directory).get(ref)
@@ -202,6 +223,13 @@ def answer(store: Any, ref: Any, *, option: str | None = None, text: str | None 
         done = _read(conn, q.id)
         if done is not None:
             raise CoordError(f"question #{q.n} was already read first ({done[0]})")
+        # read again, inside the fenced transaction: the question (its answer and consent link) and the authority log
+        fresh = _questions(store.directory).get(q.id)
+        if fresh is None:
+            raise CoordError(f"no question {q.id[:40]}")
+        q = fresh
+        if authority_source is not None:
+            authority = authority_source()
         got = _verdict(store, conn, now, q, authority)
         if not got.may_answer:
             raise CoordError(f"escalate question #{q.n}: {got.why}")
@@ -248,10 +276,14 @@ def escalate(store: Any, ref: Any, why: str, *, token: object) -> str:
 
 
 # --- the seat's side (the band's hook path) ------------------------------------------------------------------------
-def claim_knows(directory: Path | str, agent: str, session: str) -> list[tuple[Any, dict[str, Any]]]:
-    """The coordinator's KNOW answers to this session's still-OPEN questions not yet delivered, claimed (each reaches
-    the session once): ``[(question, know body)]``. Cheap when there is nothing: no ``dispatch.db``, or no open question
-    of this session, opens nothing for writing."""
+def claim_knows(directory: Path | str, agent: str, session: str,
+                render: Callable[[Any, dict[str, Any]], str]) -> list[str]:
+    """The coordinator's KNOW answers to this session's still-OPEN questions not yet delivered, each formatted by
+    ``render(question, know body)`` and claimed (each reaches the session once): the lines, oldest first. Inside the
+    delivery transaction the session's open questions are read again, and a KNOW is marked delivered only after
+    ``render`` returned its line: one whose question was answered meanwhile, or that fails to format, is left
+    unmarked. Cheap when there is nothing: no ``dispatch.db``, or no open question of this session, opens nothing for
+    writing."""
     d = Path(directory)
     db = d / "dispatch.db"
     if not db.exists():
@@ -276,14 +308,21 @@ def claim_knows(directory: Path | str, agent: str, session: str) -> list[tuple[A
     except sqlite3.Error:        # no first_reads table yet (no coordinator has read anything): nothing to deliver
         return []
     store = CoordStore(d)
-    out: list[tuple[Any, dict[str, Any]]] = []
+    out: list[str] = []
     # a plain write: a delivery is the service's record, and it moves no thread (no awake reconcile, no lease fence)
     with write_transaction(store._connect) as conn:
         now = store._stamp()
+        still = {q.id: q for q in qs.open_questions(agent) if q.agent_session_id == session}
         for reply_id, question_id, body in conn.execute(sql, tuple(mine)).fetchall():
+            if question_id not in still:          # answered since the read above: the operator's answer counts
+                continue
+            try:
+                line = render(still[question_id], json.loads(body))
+            except Exception:  # noqa: BLE001 - left unmarked, so it is tried again at the next hook, never lost unseen
+                continue
             conn.execute("INSERT INTO know_deliveries (reply_id, agent_session_id, at) VALUES (?, ?, ?)",
                          (reply_id, session, now))
-            out.append((mine[question_id], json.loads(body)))
+            out.append(line)
     return out
 
 

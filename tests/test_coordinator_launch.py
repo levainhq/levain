@@ -1241,3 +1241,54 @@ def test_a_claude_coordinator_may_not_edit_its_own_record(tmp_path, monkeypatch)
     assert f"Edit(/{record}.lock)" in doc["permissions"]["deny"]
     assert all(r.startswith("Edit(//") for r in doc["permissions"]["deny"])
     assert "deny" not in json.loads(inst._apply_role(json.dumps({"permissions": {}}), None, "/venv/bin/python"))["permissions"]
+
+
+def test_every_levain_verb_the_brief_names_passes_the_coordinators_door(store, fake, live_hook, monkeypatch):
+    """C5 L3 r1 (codex HIGH): the brief told the coordinator to run `coord questions|answer|escalate`, and the door
+    refused all three inside its workspace. Every command path the brief names is read off the real CLI parser and
+    must be in the door: a brief that names a verb the door refuses fails here."""
+    from levain import install as inst
+    from levain.cli import main
+    from levain.coordinator import door
+
+    launch_id = woken(store)
+    assert cl.launch_session(store, launch_id).started
+    text = cl.brief_path(store.launch(launch_id)).read_text()
+    # the real parser, caught at the door's own call (the refusal stops the command before it runs)
+    caught = []
+
+    def catch(parser, args):
+        caught.append(parser)
+        return "caught"
+
+    monkeypatch.setattr(door, "refusal", catch)
+    assert main(["coord", "status"]) == 1 and caught
+    parser = caught[0]
+
+    def path_of(words):
+        import argparse
+
+        level, path = parser, []
+        for word in words:
+            subs = [a for a in level._actions if isinstance(a, argparse._SubParsersAction)]
+            if not subs or word not in subs[0].choices:
+                break
+            nxt = subs[0].choices[word]
+            path.append(next(name for name, p in subs[0].choices.items() if p is nxt))
+            level = nxt
+        return tuple(path)
+
+    lv = inst.coordinator_levain(sys.executable)
+    commands = [c for c in re.findall(r"`([^`]+)`", text) if c.startswith(lv + " ")]
+    paths = set()
+    for command in commands:
+        words = command[len(lv) + 1:].split()
+        # `thread state|set|merge|detach|add ...`: each alternative is a verb the brief names
+        alts = next(((i, w.split("|")) for i, w in enumerate(words) if "|" in w), None)
+        for alt in (alts[1] if alts else [None]):
+            got = path_of(words if alts is None else [*words[:alts[0]], alt])
+            assert len(got) >= 2, command
+            paths.add(got)
+    assert {("coord", "questions"), ("coord", "answer"), ("coord", "escalate"), ("coord", "claim")} <= paths
+    refused = sorted(p for p in paths if p not in door.DOOR)
+    assert not refused, f"the brief names verbs the coordinator's door refuses: {refused}"

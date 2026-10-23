@@ -203,7 +203,8 @@ def _coordinator_lines(directory: Path | str, agent: str, session: str) -> list[
     try:
         from levain.coordinator.first_reader import claim_knows
 
-        return [know_line(q, body) for q, body in claim_knows(directory, agent, session)]
+        # each line is formatted inside the claim, before its KNOW is marked delivered (never marked unseen)
+        return claim_knows(directory, agent, session, know_line)
     except Exception:  # noqa: BLE001 - the hook carries the operator's answers whatever the coordinator's store does
         return []
 
