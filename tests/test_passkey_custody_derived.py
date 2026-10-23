@@ -4,12 +4,17 @@ the broker's B6-C shape carried to the consent queue and dispatch).
 ``ssh-keygen -Y verify`` checks a WebAuthn signature's ECDSA, challenge and rpId, but not user verification and not
 what the origin is: those are levain's (:func:`levain.consent.passkey.answer_signature_problem`). Before this file
 each site chose to run them by the key's STORED custody, and the authority log admits WebAuthn key material at
-custody ``unstated`` (display-phone) or ``fido`` (any class), so such a key's signature skipped them. Keys here are a
-software P-256 key answering as an authenticator does, its flags and origin chosen per case, and the sites read a
-real signed authority log (the consent queue tests' ``Key`` and ``Log``)."""
+custody ``unstated`` (display-phone) or ``fido`` (any class), so such a key's signature skipped them; the authority
+replay itself took links such a key signed. Now the enrol door (:func:`levain.authority.custody_problem`) refuses that
+enrolment, and every verify site holds the derived custody equal to the stored one
+(:func:`levain.authority.custody_mismatch`). A verify site is reached here through a replay without the door
+(:func:`pre_door`, the replay code before it), since with the door no log holds such a key. Keys here are a software
+P-256 key answering as an authenticator does, its flags and origin chosen per case, and the sites read a real signed
+authority log (the consent queue tests' ``Key`` and ``Log``)."""
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -86,6 +91,22 @@ class Clock:
 
     def __call__(self):
         return self.now
+
+
+@contextlib.contextmanager
+def pre_door():
+    """The replay as it was before the enrol door: ``custody_problem`` without its key-material rule, so a log may
+    hold WebAuthn material at another custody (a log written by an older levain). The verify sites' own check is
+    untouched."""
+    from unittest import mock
+
+    real = auth.custody_problem
+
+    def without_door(key_class, custody, key_type, *, legacy=False, public_key=None):
+        return real(key_class, custody, key_type, legacy=legacy)
+
+    with mock.patch.object(auth, "custody_problem", without_door):
+        yield
 
 
 def _log(tmp: Path, pk: WebAuthnKey, cls: str, custody: str):
@@ -165,6 +186,57 @@ def control_verdict(tmp: Path, custody: str, **sig) -> str | None:
     return None
 
 
+class _LinkSigner:
+    def __init__(self, pk: WebAuthnKey, **sig) -> None:
+        self.pk, self.sig, self.fp = pk, sig, pk.fp
+
+    def sign(self, message: bytes, namespace: str) -> str:
+        return self.pk.sign(message, namespace, **self.sig)
+
+
+def authority_link_verdict(tmp: Path, **sig) -> str | None:
+    """``None`` when the authority replay takes an ``enrol`` link signed by ``pk`` (enrolled laptop-presence at custody
+    fido, which needs :func:`pre_door`), else the refusal."""
+    pk = WebAuthnKey()
+    lg = _log(tmp, pk, "laptop-presence", "fido")
+    other = WebAuthnKey("other.example.ts.net")
+    lg.keys["pk"] = _LinkSigner(pk, **sig)
+    try:
+        lg.link({"op": "enrol", "fingerprint": other.fp, "public_key": other.public_key, "class": "laptop-presence",
+                 "custody": "fido"}, signer="pk")
+    except auth.AuthorityError as exc:
+        return str(exc)
+    return None if lg.source().key(other.fp) is not None else "not in the replay"
+
+
+@pytest.fixture
+def old_log():
+    with pre_door():
+        yield
+
+
+# --- the enrol door ----------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cls, custody", [("display-phone", auth.UNSTATED), ("display-phone", "fido"),
+                                          ("laptop-presence", "fido"), ("laptop-presence", "touch-id"),
+                                          ("presence", "windows-hello")])
+def test_the_log_refuses_webauthn_material_enrolled_at_any_custody_but_passkey(tmp_path, cls, custody):
+    with pytest.raises(auth.AuthorityError, match="WebAuthn passkey"):
+        _log(tmp_path, WebAuthnKey(), cls, custody)
+
+
+def test_a_log_holding_such_an_enrolment_from_before_the_door_fails_closed(tmp_path):
+    """A fresh replay (a new process) refuses the log at that enrolment. A replay cache warmed before the door keeps
+    its verified prefix, which is why every verify site holds the same rule (:func:`levain.authority.custody_mismatch`)."""
+    from levain.consent import authority_source
+
+    with pre_door():
+        lg = _log(tmp_path, WebAuthnKey(), "display-phone", "fido")
+        lg.source()
+    with pytest.raises(auth.AuthorityError, match="WebAuthn passkey"):
+        authority_source(lg.path, anchor=None, cache=auth.ReplayCache())()
+
+
 # --- the stored custody agrees with the key material: the passkey's checks run, a good signature is taken ------------
 
 def test_a_passkey_at_custody_passkey_is_taken_with_uv_from_its_own_origin_only(tmp_path):
@@ -180,7 +252,7 @@ def test_a_passkey_at_custody_passkey_is_taken_with_uv_from_its_own_origin_only(
 
 @pytest.mark.parametrize("custody", [auth.UNSTATED, "fido"])
 @pytest.mark.parametrize("name", list(SIGS))
-def test_the_consent_queue_refuses_a_passkey_stored_at_another_custody(tmp_path, custody, name):
+def test_the_consent_queue_refuses_a_passkey_stored_at_another_custody(tmp_path, old_log, custody, name):
     got = consent_verdict(tmp_path, custody, **SIGS[name])
     assert got is not None and "custody" in got, got
 
@@ -188,21 +260,27 @@ def test_the_consent_queue_refuses_a_passkey_stored_at_another_custody(tmp_path,
 @pytest.mark.parametrize("which", ["sign", "cancel"])
 @pytest.mark.parametrize("custody", [auth.UNSTATED, "fido"])
 @pytest.mark.parametrize("name", list(SIGS))
-def test_dispatch_refuses_a_passkey_stored_at_another_custody(tmp_path, which, custody, name):
+def test_dispatch_refuses_a_passkey_stored_at_another_custody(tmp_path, old_log, which, custody, name):
     got = dispatch_verdict(tmp_path, custody, which, **SIGS[name])
     assert got is not None and "custody" in got, got
 
 
 @pytest.mark.parametrize("name", list(SIGS))
-def test_a_passkey_stored_at_custody_fido_is_never_a_configuration_root(tmp_path, name):
+def test_a_passkey_stored_at_custody_fido_is_never_a_configuration_root(tmp_path, old_log, name):
     got = control_verdict(tmp_path, "fido", **SIGS[name])
     assert got is not None and "custody" in got, got
+
+
+@pytest.mark.parametrize("name", list(SIGS))
+def test_the_replay_refuses_a_link_signed_by_a_passkey_stored_at_custody_fido(tmp_path, old_log, name):
+    got = authority_link_verdict(tmp_path, **SIGS[name])
+    assert got is not None and "custody its key material shows" in got, got
 
 
 def test_an_openssh_fido_key_at_custody_fido_still_signs(tmp_path):
     """The derived custody of an OpenSSH FIDO key (application ``ssh:``) is not passkey: custody fido agrees with it.
     Pinned with the helper alone, since no hardware key is here to sign."""
-    from levain.consent.passkey import custody_mismatch
+    from levain.authority import custody_mismatch
 
     sk = public_key_line(WebAuthnKey().priv.public_key().public_bytes(
         serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo), RP)
@@ -210,6 +288,8 @@ def test_an_openssh_fido_key_at_custody_fido_still_signs(tmp_path):
     ssh_app = blob[:blob.rfind(_string(RP))] + _string("ssh:")
     fido = f"{sk.split()[0]} {base64.b64encode(ssh_app).decode()}"
     assert custody_mismatch(fido, "fido") is None
+    assert auth.custody_problem("laptop-presence", "fido", fido.split()[0], public_key=fido) is None
+    assert "WebAuthn passkey" in auth.custody_problem("laptop-presence", "fido", sk.split()[0], public_key=sk)
     assert custody_mismatch(fido, auth.PASSKEY) is not None
     assert custody_mismatch(sk, auth.PASSKEY) is None
     for custody in (auth.UNSTATED, "fido", "touch-id", None):

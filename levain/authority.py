@@ -53,7 +53,8 @@ __all__ = [
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify",
     "consent_grant", "consent_grant_tool_problem", "consent_revocable", "consent_tool_shape_problem",
     "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem",
-    "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_problem",
+    "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_mismatch",
+    "custody_problem", "is_passkey_material",
     "genesis_policy", "inert_grant", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
     "presence_missing", "snapshot", "sshsig_public_key", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
 ]
@@ -102,13 +103,18 @@ _CUSTODY_KEY_TYPES: Mapping[str, frozenset[str]] = MappingProxyType({
 _LAPTOP_KEY_TYPES = frozenset().union(*_CUSTODY_KEY_TYPES.values())
 
 
-def custody_problem(key_class: str, custody: Any, key_type: str, *, legacy: bool = False) -> str | None:
+def custody_problem(key_class: str, custody: Any, key_type: str, *, legacy: bool = False,
+                    public_key: str | None = None) -> str | None:
     """Why ``custody`` cannot be declared for a ``key_class`` key of ``key_type`` (None when it can): the
     one rule the replay enforces and the CLI checks before anything is signed. ``legacy``: the key is
     carried from a levain-cockpit/2 store (its record has ``legacy_enrolled_at``), the one laptop-presence
-    key that may leave its custody ``unstated``."""
+    key that may leave its custody ``unstated``. ``public_key`` (the replay always passes it): a key whose
+    material is a WebAuthn passkey's (:func:`is_passkey_material`) is declared ``passkey`` or not at all."""
     if not isinstance(custody, str) or custody not in CUSTODIES:
         return f"unknown custody {str(custody)[:40]!r}; one of {', '.join(CUSTODIES)}"
+    if public_key is not None and custody != PASSKEY and is_passkey_material(public_key):
+        return (f"the key is a WebAuthn passkey (an {_PASSKEY_KEY_TYPE} key made on a web origin, not ssh:); "
+                f"its custody is {PASSKEY}, never {custody}")
     if custody == FIDO_ATTESTED:
         return (f"custody {FIDO_ATTESTED} is refused until attestation at enrol is built (it comes with the "
                 "governed install); an unattested FIDO key is custody fido")
@@ -128,6 +134,42 @@ def custody_problem(key_class: str, custody: Any, key_type: str, *, legacy: bool
     if key_type not in admits:
         return f"custody {custody} needs a key of type {', '.join(sorted(admits))}, not {key_type}"
     return None
+
+
+_PASSKEY_KEY_TYPE = "sk-ecdsa-sha2-nistp256@openssh.com"
+
+
+def is_passkey_material(public_key: object) -> bool:
+    """Whether ``public_key``'s own material is a WebAuthn passkey's: an ``sk-ecdsa-sha2-nistp256@openssh.com``
+    key whose application is a web rpId (``levain.consent.passkey.public_key_line`` puts it there), where an
+    OpenSSH FIDO key's is ``ssh:...``. Anything else, or a key line that cannot be read, is not. Stdlib only."""
+    parts = public_key.split() if isinstance(public_key, str) else []
+    if len(parts) < 2 or parts[0] != _PASSKEY_KEY_TYPE:
+        return False
+    try:
+        wire = _Wire(base64.b64decode(parts[1], validate=True))
+        if wire.string() != _PASSKEY_KEY_TYPE.encode("ascii"):
+            return False
+        wire.string()                  # curve
+        wire.string()                  # point
+        application = wire.string()
+        wire.end()
+    except (ValueError, struct.error):
+        return False
+    return not application.startswith(b"ssh:")
+
+
+def custody_mismatch(public_key: str, custody: object) -> str | None:
+    """Why a key whose stored custody is ``custody`` may not have its signature checked as that custody, or None:
+    the custody its material shows (:func:`is_passkey_material`) must be the stored one, passkey or not. Every
+    levain verifier that picks a passkey's checks (user verification, the exact origin, what it may sign) by the
+    stored custody runs this first. :func:`custody_problem` refuses such an enrolment at the door; this holds the
+    same at every verification, for a log or snapshot from before that door, or one built past it."""
+    derived = is_passkey_material(public_key)
+    if derived == (custody == PASSKEY):
+        return None
+    return (f"the signing key's stored custody {str(custody)[:40]!r} is not the custody its key material shows "
+            f"({'a passkey' if derived else 'not a passkey'})")
 
 # Delta kinds the recompute classifier returns (§4.3).
 NOOP, TIGHTEN, LOOSEN, RENEW, GRANT_REVOKE = "noop", "tighten", "loosen", "renew", "grant_revoke"
@@ -1200,7 +1242,7 @@ def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, Authority
     if legacy is not None and not isinstance(legacy, str):
         raise AuthorityError("legacy_enrolled_at must be text")
     custody = rec["custody"]
-    problem = custody_problem(cls, custody, public_key.split()[0], legacy=legacy is not None)
+    problem = custody_problem(cls, custody, public_key.split()[0], legacy=legacy is not None, public_key=public_key)
     if problem is not None:
         raise AuthorityError(problem)
     old = keys.get(fp)
@@ -1268,6 +1310,12 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             signer = found
             if not signer.active:
                 raise AuthorityError(f"signer {row.signer_fp} was revoked at seq {signer.revoked_seq}")
+            # the custody that picks the rule below and the passkey checks after the signature is the stored one,
+            # held equal to the one the signer's key material shows (an enrolment from before the door at
+            # custody_problem could hold a passkey at custody fido)
+            why = custody_mismatch(signer.public_key, signer.custody)
+            if why is not None:
+                raise AuthorityError(why)
             if signer.custody == PASSKEY:
                 # a passkey signs consent answers (its own namespace, the consent queue's check) and, in this log,
                 # one op: the removal of a consent or inert grant, which only ever narrows what an agent may do (a

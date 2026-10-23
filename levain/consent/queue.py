@@ -133,7 +133,7 @@ from typing import Any
 
 from levain.authority import (
     _WEBAUTHN_SIG_TYPE, PASSKEY, AuthorityError, AuthoritySnapshot, ReplayCache, VerifierUnavailable,
-    sshsig_public_key, verify_link_sig,
+    custody_mismatch, sshsig_public_key, verify_link_sig,
 )
 from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
@@ -716,8 +716,6 @@ def _signature_refusal(public_key: str, fingerprint: str, custody: str | None, p
     fingerprint is ``fingerprint``); ``None`` when it does. A passkey's (``custody``) own checks run first."""
     if not isinstance(signature, str) or not signature:
         return f"the {noun} carries no signature"
-    from levain.consent.passkey import answer_signature_problem, custody_mismatch
-
     # the custody that picks the checks below is the stored one, held equal to the one the key material shows
     problem = custody_mismatch(public_key, custody)
     if problem is not None:
@@ -725,6 +723,8 @@ def _signature_refusal(public_key: str, fingerprint: str, custody: str | None, p
     if custody == PASSKEY:
         # a passkey's checks that ssh-keygen does not make (user verification, the page's origin), on every
         # verification, not only where the phone port converted the assertion
+        from levain.consent.passkey import answer_signature_problem
+
         problem = answer_signature_problem(signature, public_key)
         if problem is not None:
             return problem

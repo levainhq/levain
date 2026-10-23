@@ -41,8 +41,8 @@ import urllib.parse
 from levain.consent.record import ANSWER_NAMESPACE
 
 __all__ = ["KEY_TYPE", "SIG_TYPE", "PasskeyError", "answer_signature_problem", "authority_signature_problem",
-           "b64url_decode", "challenge", "custody_mismatch", "is_host_name", "is_passkey_material",
-           "key_application", "public_key_line", "to_sshsig"]
+           "b64url_decode", "challenge", "is_host_name", "key_application",
+           "public_key_line", "to_sshsig"]
 
 KEY_TYPE = "sk-ecdsa-sha2-nistp256@openssh.com"
 SIG_TYPE = "webauthn-sk-ecdsa-sha2-nistp256@openssh.com"
@@ -291,31 +291,6 @@ def authority_signature_problem(signature: str, public_key: str) -> str | None:
         return ("a passkey made on localhost signs no authority link (its page is http on this machine, which any "
                 "program here can serve); sign it with a passkey made on the phone page's https name")
     return answer_signature_problem(signature, public_key)
-
-
-def is_passkey_material(public_key: object) -> bool:
-    """Whether ``public_key``'s own material is a WebAuthn passkey's: an ``sk-ecdsa-sha2-nistp256@openssh.com`` key
-    whose application is an rp host (:func:`public_key_line` puts the rpId there), where an OpenSSH FIDO key's is
-    ``ssh:...``. Anything else, or a key line that cannot be read, is not."""
-    try:
-        return not _key_parts(public_key)[1].startswith("ssh:")
-    except (ValueError, struct.error, UnicodeError, binascii.Error, PasskeyError):
-        return False
-
-
-def custody_mismatch(public_key: str, custody: object) -> str | None:
-    """Why a key whose stored custody is ``custody`` may not have its signature checked as that custody, or None:
-    the custody its material shows (:func:`is_passkey_material`) must be the stored one, passkey or not. Every levain
-    verifier that picks a passkey's checks (user verification, the exact origin) by the stored custody runs this
-    first, since the authority log admits WebAuthn material at custody ``unstated`` or ``fido``, and such a key's
-    signature would otherwise skip them (head ruling K1; the cockpit broker holds the same equality)."""
-    from levain.authority import PASSKEY
-
-    derived = is_passkey_material(public_key)
-    if derived == (custody == PASSKEY):
-        return None
-    return (f"the signing key's stored custody {str(custody)[:40]!r} is not the custody its key material shows "
-            f"({'a passkey' if derived else 'not a passkey'})")
 
 
 def to_sshsig(public_key: str, authenticator_data: bytes, client_data_json: bytes, der_signature: bytes,

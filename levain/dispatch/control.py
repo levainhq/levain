@@ -25,7 +25,7 @@ The TRUST ROOT is a key fingerprint pinned once, at setup (:meth:`ControlStore.i
 log shows it as a key that may sign configuration: enrolled, not revoked, of a class that covers
 :data:`CONFIG_TIER` (configuration widens what runs, a laptop-only act, so a display-phone key never signs it) and
 held at a stated presence custody (never a passkey, never ``unstated``), the custody its key material shows
-(:func:`levain.consent.passkey.custody_mismatch`: WebAuthn material stored at custody ``fido`` is still a passkey,
+(:func:`levain.authority.custody_mismatch`: WebAuthn material stored at custody ``fido`` is still a passkey,
 and refused). The same test applies on every
 verification. A second init naming another fingerprint is refused. A signature by any other enrolled key, however
 strong its class, is refused: the pin is the root, not the class.
@@ -92,7 +92,7 @@ from types import MappingProxyType
 from typing import Any
 
 from levain.authority import (
-    PASSKEY, UNSTATED, AuthorityError, AuthoritySnapshot, VerifierUnavailable, verify_link_sig,
+    PASSKEY, UNSTATED, AuthorityError, AuthoritySnapshot, VerifierUnavailable, custody_mismatch, verify_link_sig,
 )
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
@@ -219,8 +219,6 @@ def _root_problem(snapshot: Any, trust_root: str) -> str | None:
         return "the trust root is not an enrolled key"
     if not key.active:
         return "the trust root's key is revoked"
-    from levain.consent.passkey import custody_mismatch
-
     problem = custody_mismatch(key.public_key, key.custody)
     if problem is not None:
         return problem
