@@ -427,6 +427,8 @@ def _lexists_at(dfd: int, name: str) -> bool:
         os.lstat(name, dir_fd=dfd)
     except FileNotFoundError:
         return False
+    except OSError:
+        return True   # L3 r2 (5c-ii-a): absence not proven counts as left, so the caller refuses stale-staging
     return True
 
 

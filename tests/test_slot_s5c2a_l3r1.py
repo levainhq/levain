@@ -255,3 +255,36 @@ def test_f7_the_gate_answers_with_the_role_it_is_given(tmp_path):
         _publish(tmp_path / "b" if (tmp_path / "b").mkdir() is None else None, seams=X.PublishSeams(),
                  role=X.VERIFIER, outcome=denied)
     assert ei2.value.name == "verifier-failed:exit"
+
+
+def test_r2_an_lstat_that_cannot_prove_absence_counts_as_left(tmp_path, monkeypatch):
+    """L3 r2: an lstat failure other than ENOENT (EIO, EACCES) never escapes raw from the probe's residue check."""
+    dfd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        def eio(*a, **kw):
+            raise OSError(errno.EIO, "io")
+        monkeypatch.setattr(X.os, "lstat", eio)
+        assert X._lexists_at(dfd, "anything") is True
+    finally:
+        os.close(dfd)
+
+
+# --- 5c-ii-a L3 r2 (adopt/L3_5c2a_r2.txt, both seats): absence the probe cannot prove is a refusal ------------------
+
+@pytest.mark.parametrize("err", [errno.EIO, errno.EACCES, errno.EPERM])
+def test_r2_an_lstat_that_cannot_prove_the_probe_names_gone_is_a_publish_refusal(tmp_path, monkeypatch, err):
+    calls = []
+    real_lstat = os.lstat
+
+    def delete(dfd, name):
+        calls.append(name)
+        return X._store_delete(dfd, name)
+
+    def lstat(path, *a, **k):
+        if len(calls) >= 4 and path in X.PROBE_NAMES:         # only the residue check after the final deletes
+            raise OSError(err, os.strerror(err), path)
+        return real_lstat(path, *a, **k)
+    monkeypatch.setattr(X.os, "lstat", lstat)
+    with pytest.raises(Refused) as ei:
+        _probe(tmp_path, delete)
+    assert (ei.value.name, ei.value.detail) == ("importer-failed:publish", "stale-staging")
