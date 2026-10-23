@@ -146,11 +146,20 @@ def test_child_env_is_the_allowlist_plus_what_was_asked(monkeypatch) -> None:
 # - asyncio spawners: grep -rn "create_subprocess_exec\|subprocess_exec" levain
 # - pty spawners: grep -rn "pty\.spawn\|pty\.fork" levain
 # - the posix module's exec/spawn: grep -rn "posix\.exec\|posix\.posix_spawn" levain
-# - subprocess aliased by assignment: grep -rnE "^\s*[A-Za-z_.]+ *= *subprocess\.[A-Za-z_]+ *(#.*)?$" levain
+# - a spawner function aliased by assignment: grep -rnE "^\s*[A-Za-z_.]+ *= *subprocess\.[A-Za-z_]+ *(#.*)?$" levain
+# - the os or subprocess MODULE bound to another name: grep -rnE "^\s*[A-Za-z_]+ *= *(subprocess|os) *(#.*)?$" levain
+# - a spawner CALLED inside an annotation (runs at definition time):
+#   grep -rnE "(:|->) *(subprocess|os)\.(run|Popen|call|check_[a-z]+|exec[a-z]*|spawn[a-z]*|posix_spawnp?)\(" levain
 # - subprocess reached by getattr: grep -rn "getattr(subprocess" levain
 # - the whole environment as a default: grep -rn "env=os\.environ" levain
 # - a spawner reached through `getattr(os, name)` with a non-literal name: grep -rn "getattr(os, *[a-z_]" levain
 #   (1 hit: _FlooredOs.__getattr__ in the OpenHands tools, a proxy, not a spawn; getattr(os, "O_NOFOLLOW", 0) is a constant)
+# Two edges carried over from main unchanged, with their size, not 0:
+# - env is judged by its TEXT: a name bound to the whole environment and later passed as env= is not traced.
+#   Names bound to it: grep -rnE "= *(dict\()?os\.environ *(\)|$|#| if )" levain (16 on 1023); whether any reaches a
+#   spawn's env is not checked here (a scan2b candidate).
+# - levain/launch.py's direct os exec-family calls are not env-checked (_LAUNCH): grep -nE "os\.(exec|spawn|posix_spawn)"
+#   levain/launch.py (1 on 1023).
 
 _SUBPROCESS_ENV = {"run", "Popen", "call", "check_call", "check_output"}     # env= keyword
 _SUBPROCESS_NO_ENV = {"getoutput", "getstatusoutput"}

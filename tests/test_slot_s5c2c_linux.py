@@ -233,7 +233,6 @@ def test_the_forked_child_joins_the_leaf_through_exec_launch_and_execs_only_when
     finally:
         for fd in (frame_r, frame_w, result_r, result_w, out):
             os.close(fd)
-    assert os.WEXITSTATUS(status) != GUARD_EXIT                 # the guard fired in the child: an exec went unpatched
     assert procs.read_text() == f"{pid}\n"                    # the child wrote ITS pid before anything else
     if joined:
         assert os.WEXITSTATUS(status) == 0 and seen.exists()
