@@ -1,16 +1,19 @@
 """The operator's side of adopt: ``levain session adopt|discard|restore <session>`` (S1 session 5 DESIGN §1 steps
 13-14, §4.6, §4.8, §6 setup, §6.2; CONTRACT §10.3), routed from :func:`levain.slot.launch.main`.
 
-``adopt <session> --repo PATH --take head|wip|none``, as the operator:
+``adopt <session> --repo PATH [--take head|wip|none]``, as the operator (no ``--take`` = the prompt after the
+preview, :func:`ask_take`, when stdin is a terminal; a script must say, so no ``--take`` and no terminal =
+``bad-argument`` before any helper call):
 
 1. ``status <session>`` through the runtime helper: the alloc's ``base`` (none = ``base-unrecorded``).
 2. :func:`check_repo`, BEFORE adopt-open, so a refusal costs no sealed run, and again immediately before the take
-   writes his repo: ``repo-not-a-root`` (``--repo`` is not the top of a work tree that holds its own ``.git``
-   directory: a subdirectory, a linked worktree or a submodule checkout, whose ``.git`` is a file),
-   ``object-format-mismatch`` (``rev-parse --show-object-format`` against the base's;
-   ``extensions.compatObjectFormat`` set refuses too), ``repo-partial`` (``extensions.partialClone``, a
-   ``remote.<name>.promisor`` git reads as true, or a ``remote.<name>.partialCloneFilter``), ``repo-shallow``, and
-   ``base-missing`` (``cat-file -e <base_oid>``). Every value is git's own typing; an empty or invalid ``.git``
+   writes his repo, in this order: ``repo-not-a-root`` (``--repo/.git`` is not a directory: a subdirectory, a
+   linked worktree or a submodule checkout, whose ``.git`` is a file; that directory is the whole check), then the
+   config reads: a set ``extensions.compatObjectFormat`` = ``object-format-mismatch`` and ``extensions.partialClone``
+   or a ``remote.<name>.partialCloneFilter`` = ``repo-partial`` (whichever git lists first), then a
+   ``remote.<name>.promisor`` git reads as true = ``repo-partial``; then ``object-format-mismatch``
+   (``rev-parse --show-object-format`` against the base's), ``repo-shallow``, and ``base-missing``
+   (``cat-file -e <base_oid>``). Every value is git's own typing; an empty or invalid ``.git``
    is ``repo-unreadable:128`` (every git call names the repository, :func:`adopt_take.repo_args`).
 3. ``adopt-open <session>`` ("waiting on a running import" is printed first: root's adopt-lock wait is bounded,
    §4.7); its answer checked against the alloc's base. ``adopt-nothing-new`` copies the report and shows it
@@ -26,15 +29,18 @@
    :func:`adopt_preview.escape` (the verifier's FSI / PDI isolates allowed, every other unshowable character marked),
    since the confined verifier read hostile bytes; the importer's report by :func:`adopt_preview.report_section`;
    the checkout path (his ``--repo``) and the private dir's path.
-6. ``--take head|wip``: :func:`adopt_take.take` over the private copies; ``none`` takes nothing. An adopt that
-   fails before its preview was shown removes the whole private dir.
+6. ``head`` or ``wip`` (``--take``, or his answer): :func:`adopt_take.take` over the private copies; ``none``
+   takes nothing. An adopt that fails before its preview was shown removes the whole private dir; once shown, only
+   ``bundle`` and ``q.idx`` are removed and the dir is printed with the one command that removes it
+   (:func:`removal_line`).
 
 His git runs only on trusted input, each spawn through :func:`_git` (``-c core.hooksPath=/dev/null``,
 :func:`adopt_take.repo_args`, :func:`adopt_take.git_env`, ``env=`` given): ``config --local --includes
 --name-only --get-regexp`` and ``config --local --includes --type=bool --get-regexp`` (the partial-clone reads),
 ``rev-parse --show-object-format``, ``rev-parse --is-shallow-repository``, ``cat-file -e <base_oid>``; the take adds
 ``cat-file -e`` per
-prerequisite, ``rev-parse --git-path objects`` and ``update-ref``. A git that cannot start or outlives
+prerequisite, ``rev-parse --git-path objects`` and ``update-ref``; and once, before the take, the repo-less
+``--version`` for the maintenance warning (:func:`warn_old_git`, the take's own env, never a refusal). A git that cannot start or outlives
 :data:`REPO_GIT_TIMEOUT` = ``repo-unreadable:<errno name>`` / ``repo-unreadable:timeout``; one that answers the
 config read or ``rev-parse`` with an rc it has no meaning for = ``repo-unreadable:<rc>``.
 
@@ -45,7 +51,9 @@ from __future__ import annotations
 import argparse
 import errno
 import hashlib
+import inspect
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -149,23 +157,45 @@ def _stop(p: "subprocess.Popen[bytes]", *, signal_child: bool) -> None:
 #: The setup slack of one helper verb beyond its own named bounds: root's copies-in, hashes and publish around the
 #: sealed run [judged by adopt-s4a-fix1, 10-23, against two passes over V7_BYTES of bundle + base at disk speed].
 HELPER_SLACK_S = 900.0
+#: The slack of ``status`` / ``discard`` / ``restore``: sudo, the helper's start and its file reads, renames and
+#: fsyncs, none of which copies a bundle [judged by adopt-s4b, 10-23, against ``store_verbs`` doing renames and
+#: stamp writes only].
+STORE_SLACK_S = 60.0
+#: CAS calls one ``discard`` / ``restore`` can make: a journal of the other verb finished forward first
+#: (``store_verbs._finish_journal``), then its own commit.
+STORE_VERB_CAS_CALLS = 2
+
+
+def _control_bounds() -> Tuple[float, float]:
+    """CONTROL's per-answer bound (``ControlClient``'s ``timeout``, which also bounds the connect) and its ``locked``
+    retry window (V23), read from the client the helper uses."""
+    from levain.slot.control_client import ControlClient
+
+    return (float(inspect.signature(ControlClient.__init__).parameters["timeout"].default),
+            float(ControlClient.retry_window_s))
 
 
 def helper_timeout(verb: str, *, bundle_bytes: int = 0, base_bytes: int = 0) -> float:
     """The CLI's wall for one helper verb, from the helper's own bounds (never a fixed number): ``adopt-open`` =
     its one deadline over the adopt-lock wait and the walk (``AdoptSeams.lock_wait_s``) + ``RESULT_GRACE_S``;
     ``adopt-verify`` = its lock-wait deadline (``VerifySeams.lock_wait_s``) + V30's wall for these sizes
-    (``verify_wall_s``) + ``RESULT_GRACE_S``; each + :data:`HELPER_SLACK_S`. Every other verb (status, discard,
-    restore) = one ``V7_SECONDS`` + the slack [judged by adopt-s4a-fix1, 10-23: no named bound of their own]."""
+    (``verify_wall_s``) + ``RESULT_GRACE_S``; each + :data:`HELPER_SLACK_S`. ``status`` reads files only (no lock, no
+    CONTROL call); ``discard`` / ``restore`` TRY the session lock (``session-busy``, no wait) and make at most
+    :data:`STORE_VERB_CAS_CALLS` CAS calls, each bounded by CONTROL's connect / answer bound and its ``locked``
+    window (:func:`_control_bounds`); each + :data:`STORE_SLACK_S`."""
     from levain.slot import runtime_helper as RH
 
     if verb == "adopt-open":
-        own = RH.AdoptSeams().lock_wait_s + RH.RESULT_GRACE_S
-    elif verb == "adopt-verify":
-        own = RH.VerifySeams().lock_wait_s + RH.verify_wall_s(bundle_bytes, base_bytes) + RH.RESULT_GRACE_S
-    else:
-        own = RH.V7_SECONDS
-    return own + HELPER_SLACK_S
+        return RH.AdoptSeams().lock_wait_s + RH.RESULT_GRACE_S + HELPER_SLACK_S
+    if verb == "adopt-verify":
+        return (RH.VerifySeams().lock_wait_s + RH.verify_wall_s(bundle_bytes, base_bytes) + RH.RESULT_GRACE_S
+                + HELPER_SLACK_S)
+    if verb in STORE_VERBS:
+        answer, window = _control_bounds()
+        return answer + STORE_VERB_CAS_CALLS * (window + answer) + STORE_SLACK_S
+    if verb == "status":
+        return STORE_SLACK_S
+    raise ValueError(f"helper_timeout: {verb!r}")
 
 
 @dataclass
@@ -181,6 +211,7 @@ class Seams:
     git: Optional[str] = None
     helper_timeout_s: Optional[float] = None        # None = :func:`helper_timeout` per verb (a rig sets a wall)
     log: Log = None
+    stdin: Optional[IO[str]] = None                 # his answer to the prompt (None = ``sys.stdin``)
     spawn: Callable[..., "subprocess.CompletedProcess[bytes]"] = field(default_factory=lambda: _run)
 
     def __post_init__(self) -> None:
@@ -276,7 +307,8 @@ def check_base(base: object) -> Mapping[str, object]:
 
 
 def check_repo(seams: Seams, repo: Path, base: Mapping[str, object]) -> Path:
-    """§4.8's checks, in this order, before adopt-open. Returns ``repo`` made absolute."""
+    """§4.8's checks, in the order the module docstring's step 2 lists, before adopt-open and again before the take.
+    Returns ``repo`` made absolute."""
     repo = Path(os.path.abspath(repo))
     try:
         st = os.lstat(repo / ".git")
@@ -440,6 +472,28 @@ def bundle_space(src: int, size: int, object_format: str) -> Tuple[int, int]:
 # --- the view (§6.2) -------------------------------------------------------------------------------------------
 
 
+#: The copies this command deletes when it ends; every other file in the private dir stays for him to re-read.
+LARGE_COPIES = ("bundle", "q.idx")
+
+
+def removal_line(private: Path) -> str:
+    """What the end of this command does to the private dir and the one command that removes the rest, printed
+    beside its path (S4a Q6 as ruled by the head 1023+13: the dir stays so he can re-read the preview; no verb, no
+    flag). The files named are the ones in the dir NOW. A path the escaper would change is not offered as a command."""
+    try:
+        names = sorted(p.name for p in private.iterdir())
+    except OSError:
+        names = []
+    gone = [n for n in LARGE_COPIES if n in names]
+    keep = [adopt_preview.escape(os.fsencode(n)) for n in names if n not in LARGE_COPIES]
+    head = (f"the {' and '.join(gone)} copies will be removed when this command ends; " if gone else "")
+    head += f"these remain: {', '.join(keep) or 'nothing'}; "
+    shown = adopt_preview.escape(os.fsencode(private))
+    if shown != str(private):
+        return head + "remove the directory by rm -r (its name holds characters shown escaped above)"
+    return head + f"remove the directory with: rm -r -- {shlex.quote(str(private))}"
+
+
 def render(*, session: str, result: str, refs: Sequence[str], preview: bytes, report: Mapping[str, object],
            repo: Path, private: Path) -> List[str]:
     """The preview the operator reads: the A4 header, his checkout path, the verifier's preview re-escaped line by
@@ -459,6 +513,7 @@ def render(*, session: str, result: str, refs: Sequence[str], preview: bytes, re
     out.append("refs you can take: " + (", ".join(f"{r} -> {adopt_take.ref_name(session, r)}"
                                                    for r in refs) or "none"))
     out.append(f"private copies: {adopt_preview.escape(os.fsencode(private))}")
+    out.append(removal_line(private))
     return out
 
 
@@ -469,7 +524,85 @@ def render_report_only(*, session: str, report: Mapping[str, object], repo: Path
     out += adopt_preview.report_section(report)
     out.append("")
     out.append(f"private copies: {adopt_preview.escape(os.fsencode(private))}")
+    out.append(removal_line(private))
     return out
+
+
+#: The longest answer read at the prompt; a longer one is drained to its newline and asked again.
+ANSWER_MAX = 64
+
+
+def is_tty(stream: object) -> bool:
+    """A stream that is a terminal. None, a closed stream or one without ``isatty`` is not."""
+    try:
+        return bool(stream is not None and stream.isatty())       # type: ignore[attr-defined]
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def ask_take(refs: Sequence[str], stdin: IO[str], out: IO[str]) -> str:
+    """The interactive choice after the preview: the refs the export carries, then ``none``. Anything else asks
+    again (an answer that does not decode, or runs past :data:`ANSWER_MAX`, included); end of input = ``none``."""
+    choices = [r for r in ("head", "wip") if r in refs] + ["none"]
+    prompt = "take " + " / ".join(choices) + "? "
+    while True:
+        out.write(prompt)
+        out.flush()
+        try:
+            line = stdin.readline(ANSWER_MAX)
+            if len(line) >= ANSWER_MAX and not line.endswith("\n"):
+                while True:                 # too long: drain to its newline; the whole logical line is one bad answer
+                    more = stdin.readline(ANSWER_MAX)
+                    if not more:            # end of input mid-drain = the end-of-input path below
+                        line = ""
+                        break
+                    if more.endswith("\n"):
+                        line = "?\n"
+                        break
+        except UnicodeDecodeError:
+            line = "?\n"
+        if not line:
+            out.write("\n(end of input: none)\n")
+            return "none"
+        answer = line.strip()
+        if answer in choices:
+            return answer
+        out.write(f"answer one of: {', '.join(choices)}\n")
+
+
+def ask_or_interrupt(refs: Sequence[str], stdin: IO[str], out: IO[str], err: IO[str]) -> Tuple[Optional[str], int]:
+    """:func:`ask_take`, with Ctrl-C at the prompt = (None, 130) and one line: nothing was taken."""
+    try:
+        return ask_take(refs, stdin, out), 0
+    except KeyboardInterrupt:
+        err.write("levain session adopt: interrupted; nothing taken\n")
+        return None, 130
+
+
+def verify_line(wall: float) -> str:
+    """The one line before ``adopt-verify`` (the S4b L4 run: nothing printed for up to V30's wall)."""
+    return (f"verifying in root's confined verify (this can take a while; the CLI waits at most {wall:.0f} s)...\n")
+
+
+def warn_old_git(seams: "Seams", err: IO[str]) -> None:
+    """One ``WARNING`` line when his git is below the maintenance release of its line (Q1; never a refusal). The
+    probe is the take's own git, spawned the way the take spawns it (``adopt_take.git_env()``, so the same PATH
+    resolution), bounded by ``fsck_ids.VERSION_TIMEOUT``; a git that cannot say its version is warned about as unparsed."""
+    from levain.slot import fsck_ids
+
+    try:
+        r = seams.spawn([seams.git or "git", "--version"], env=adopt_take.git_env(), stdin=subprocess.DEVNULL,
+                        capture_output=True, timeout=fsck_ids.VERSION_TIMEOUT, cwd="/")
+        if r.returncode != 0:
+            note: Optional[str] = f"git version unparsed (exit {r.returncode})"
+        else:
+            note = fsck_ids.below_maintenance(r.stdout.decode("utf-8", "replace"))
+    except subprocess.TimeoutExpired:
+        note = "git version unparsed (no answer in time)"
+    except (OSError, ValueError) as e:
+        note = f"git version unparsed ({type(e).__name__})"
+    if note is not None:
+        err.write("WARNING: " + adopt_preview.escape(note.encode()) + "\n")
 
 
 # --- the verbs --------------------------------------------------------------------------------------------------
@@ -483,9 +616,9 @@ def _parser(verb: str) -> argparse.ArgumentParser:
     if verb == "adopt":
         p.add_argument("--repo", required=True, type=Path, metavar="PATH",
                        help="Your repository: the top of its work tree, holding the session's base commit.")
-        p.add_argument("--take", choices=TAKES, required=True,
+        p.add_argument("--take", choices=TAKES, default=None,
                        help="head or wip: create refs/heads/levain/<session>[-wip] from the export; none: preview "
-                            "only.")
+                            "only. Without it you are asked after the preview (a terminal is required).")
         p.add_argument("--git", default=None, metavar="GIT", help=argparse.SUPPRESS)
     return p
 
@@ -524,7 +657,8 @@ def _base_bytes(base: Mapping[str, object]) -> int:
     return nb if isinstance(nb, int) and not isinstance(nb, bool) and nb >= 0 else V7_BYTES + bundlefmt.HEADER_MAX
 
 
-def adopt(session: str, repo: Path, which: str, seams: Seams, out: IO[str], err: IO[str]) -> int:
+def adopt(session: str, repo: Path, which: Optional[str], seams: Seams, out: IO[str], err: IO[str]) -> int:
+    """``which`` None = :func:`ask_take` on ``seams.stdin`` after the preview (the caller checked it is a terminal)."""
     rec = call_helper(seams, "status", session, err=err).get("records")
     if not isinstance(rec, list) or len(rec) != 1 or not isinstance(rec[0], dict):
         raise Refused("adopt-answer-malformed", "status: records")
@@ -561,7 +695,7 @@ def adopt(session: str, repo: Path, which: str, seams: Seams, out: IO[str], err:
                 out.write(line + "\n")
             shown = True
             return 0
-        if which != "none" and which not in refs:
+        if which is not None and which != "none" and which not in refs:
             raise Refused("bad-argument", f"--take {which}: the export carries no {which} ref")
         edfd = open_dir(seams, expect)
         try:
@@ -577,9 +711,11 @@ def adopt(session: str, repo: Path, which: str, seams: Seams, out: IO[str], err:
         finally:
             os.close(edfd)
         report = _copy_report(seams, expect, priv, ans)
+        wall = helper_timeout("adopt-verify", bundle_bytes=size, base_bytes=_base_bytes(base))
+        out.write(verify_line(seams.helper_timeout_s if seams.helper_timeout_s is not None else wall))
+        out.flush()
         v = call_helper(seams, "adopt-verify", session, "--bundle-digest", "sha256:" + _digest(ans, "bundle_digest"),
-                        err=err, timeout=helper_timeout("adopt-verify", bundle_bytes=size,
-                                                        base_bytes=_base_bytes(base)))
+                        err=err, timeout=wall)
         warned = warned or bool(v.get("warnings"))
         edfd = open_dir(seams, expect)
         try:
@@ -604,14 +740,19 @@ def adopt(session: str, repo: Path, which: str, seams: Seams, out: IO[str], err:
                            report=report, repo=repo, private=priv):
             out.write(line + "\n")
         shown = True
+        if which is None:
+            which, rc = ask_or_interrupt(refs, seams.stdin or sys.stdin, out, err)
+            if which is None:
+                return rc
         if which == "none":
-            out.write("nothing taken (--take none); " + (
+            out.write("nothing taken (none); " + (
                 "root WARNED above that its publish may not survive a crash: the export stays retained only if "
                 "that publish did.\n" if warned else "the export stays retained.\n"))
             return 0
         # The checks again, immediately before his repo is written (L3 s4a r1 codex MED 3): the import and verify
         # may have run for an hour, during which his repo could have turned shallow, partial or another format.
         check_repo(seams, repo, base)
+        warn_old_git(seams, err)
         t = adopt_take.take(git=seams.git or "git", repo=repo, bundle=bundle_copy, idx=idx_copy, claims=claims,
                             session=session, object_format=fmt, which=which, log=seams.log)
         out.write(f"took {which}: {t.ref} -> {t.oid}\n")
@@ -649,6 +790,9 @@ def main(argv: Sequence[str], *, seams: Optional[Seams] = None, out: Optional[IO
         if verb == "adopt":
             if args.git is not None:
                 seams.git = args.git
+            if args.take is None and not (is_tty(seams.stdin or sys.stdin) and is_tty(out)):
+                raise Refused("bad-argument", "--take head|wip|none is required unless both stdin and stdout are "
+                                              "terminals (the prompt needs a person reading it)")
             if seams.git is None:
                 from levain.launch import child_env
                 seams.git = shutil.which("git", path=child_env().get("PATH")) or "git"
@@ -662,7 +806,9 @@ def main(argv: Sequence[str], *, seams: Optional[Seams] = None, out: Optional[IO
         return 1
 
 
-__all__ = ["EXPORT_CLASS", "HELPER_SLACK_S", "PRESENCE_REGEXP", "PRIVATE_MARGIN", "PROMISOR_REGEXP",
-           "REPO_GIT_TIMEOUT", "RESULTS", "STOP_GRACE_S", "STORE_VERBS", "Seams", "TAKES", "VERBS", "adopt", "bundle_space",
-           "call_helper", "check_base", "check_repo", "copy_private", "helper_timeout", "main", "open_dir",
-           "open_published", "private_dir", "render", "render_report_only", "show_warnings", "store_verb"]
+__all__ = ["ANSWER_MAX", "EXPORT_CLASS", "HELPER_SLACK_S", "LARGE_COPIES", "PRESENCE_REGEXP", "PRIVATE_MARGIN",
+           "PROMISOR_REGEXP", "REPO_GIT_TIMEOUT", "RESULTS", "STOP_GRACE_S", "STORE_SLACK_S", "STORE_VERBS",
+           "STORE_VERB_CAS_CALLS", "Seams", "TAKES", "VERBS", "adopt", "ask_or_interrupt", "ask_take", "bundle_space",
+           "call_helper", "check_base", "check_repo", "copy_private", "helper_timeout", "is_tty", "main", "open_dir",
+           "open_published", "private_dir", "removal_line", "render", "render_report_only", "show_warnings", "store_verb",
+           "verify_line", "warn_old_git"]

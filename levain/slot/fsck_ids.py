@@ -35,6 +35,10 @@ from levain.slot import Refused
 #: The floor git release, and the tag :data:`FLOOR_SEVERITIES` was read from.
 FLOOR = (2, 39, 4)
 FLOOR_TAG = "v2.39.4"
+#: The CVE-2024-32004 maintenance releases, one per release line (the list ``levain/consent/push.py``'s known-edge
+#: line names): a git below its line's minimum can run an upload-pack that ignores ``GIT_NO_LAZY_FETCH``. Advisory
+#: only (:func:`below_maintenance`); the refusing floor stays :data:`FLOOR`.
+MAINTENANCE_MINIMA = ((2, 45, 1), (2, 44, 1), (2, 43, 4), (2, 42, 2), (2, 41, 1), (2, 40, 2), (2, 39, 4))
 #: sha256 of ``https://raw.githubusercontent.com/git/git/v2.39.4/fsck.h``, the file the severities below come from.
 FLOOR_FSCK_H_SHA256 = "bb6c36caa68818ea7a198396713a92ef7cb716d86bccb4697ebb32b2b122c664"
 
@@ -150,6 +154,22 @@ def check_floor(version_text: str) -> tuple[int, int, int]:
     return v.release[0], v.release[1], v.release[2]
 
 
+def below_maintenance(version_text: str) -> str | None:
+    """``git --version``'s text against :data:`MAINTENANCE_MINIMA`: None when it is at or above its line's minimum or
+    on a line newer than the table's newest; otherwise one sentence naming the version and the minimum (a line older
+    than the table's oldest is named against that oldest). A text off the grammar answers as unparsed, never raises."""
+    v = parse_version(version_text)
+    if v is None:
+        return f"git version unparsed ({version_text.strip()[:120]!r}); cannot check it against the maintenance releases"
+    line = v.release[:2]
+    if line > MAINTENANCE_MINIMA[0][:2]:
+        return None
+    want = next((m for m in MAINTENANCE_MINIMA if m[:2] == line), MAINTENANCE_MINIMA[-1])
+    if v.key() >= GitVersion("", want, None, 0).key():
+        return None
+    return f"git {v.text} is below {'.'.join(map(str, want))}, the minimum of its release line (CVE-2024-32004)"
+
+
 #: The scrubbed environment every check here runs git under: no system or global config, no home.
 SCRUBBED_ENV = {"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
                 "HOME": "/nonexistent", "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0"}
@@ -205,6 +225,6 @@ def _last(stderr: str) -> str:
 
 
 __all__ = ["CONFIG_IDS", "DEFAULT_ERROR_NAMED", "FLOOR", "FLOOR_FSCK_H_SHA256", "FLOOR_SEVERITIES", "FLOOR_TAG",
-           "FSCK_PROBE_FAILED", "FSCK_TIMEOUT", "GitVersion", "ID_PATTERN", "LARGE_PATHNAME", "SCRUBBED_ENV",
-           "STRICT_COMMIT_NAMED", "UNPARSED", "VERSION_TIMEOUT", "check_config_ids", "check_floor", "closed_ids",
-           "git_version_text", "parse_fsck_h", "parse_version", "reader_ids", "snake_to_id"]
+           "FSCK_PROBE_FAILED", "FSCK_TIMEOUT", "GitVersion", "ID_PATTERN", "LARGE_PATHNAME", "MAINTENANCE_MINIMA",
+           "SCRUBBED_ENV", "STRICT_COMMIT_NAMED", "UNPARSED", "VERSION_TIMEOUT", "below_maintenance", "check_config_ids",
+           "check_floor", "closed_ids", "git_version_text", "parse_fsck_h", "parse_version", "reader_ids", "snake_to_id"]
