@@ -387,3 +387,31 @@ def ungroup_steps(host: HostOS, operator: str) -> list[Step]:
                  f"(its group {r.group} is about to be deleted)",
                  (chgrp, "-R", "-h", "-P", ROOT_GROUP[host], str(r.path)), skip_if=(test, "!", "-e", str(r.path)))
             for r in shared_group_rows(host, operator)]
+
+
+# --- row 33 R1b: an entry removed by its RECORDED name (§1.1 table row 12) -----------------------------------------
+
+
+def _boot_text(data: bytes) -> bool:
+    """A Levain entry script: a ``#!`` line, then the ``# Levain <entry> ... Written by the install helper`` header
+    every entry text carries (``root_tree.entry_text``, the current form and the pre-generation one alike)."""
+    lines = data.split(b"\n", 2)
+    return len(lines) >= 2 and lines[0].startswith(b"#!") and lines[1].startswith(b"# Levain ") \
+        and b"Written by the install helper" in lines[1]
+
+
+def entry_state(host: HostOS, name: str, live) -> str:
+    from levain.slot.removal import root_file
+
+    return root_file(live, HELPER_DIR[host] / name, check=_boot_text)
+
+
+def remove_entry_steps(host: HostOS, name: str, *, live) -> list[Step]:
+    """``entry/1`` (R10, after the flip; its sudoers rule went at R5): ``rm -f`` the recorded entry under HELPER_DIR."""
+    from levain.slot.removal import at, chain, point, remove_step
+
+    path = HELPER_DIR[host] / name
+    rm = "/bin/rm" if host == "darwin" else _abs("rm")
+    return [remove_step(f"remove the entry {path}", ("entry/1", name), live, lambda: entry_state(host, name, live),
+                        chain(lambda: live.act((rm, "-f", at(live, path))), point(live, "entry/1:after-rm")),
+                        tools=(rm,))]

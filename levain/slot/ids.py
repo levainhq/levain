@@ -238,3 +238,19 @@ def in_own_range(host: HostOS, name: str, uid: object) -> bool:
         return False
     r = RANGES[host]
     return uid in (r.singletons if name in SINGLETONS else r.slots)
+
+
+def retire_ids_durably(path: Path, ids: Iterable[int], *, fsync=None) -> None:
+    """Row 33 R1b (§1.1 rule g): add ``ids`` to the retired-ids file DURABLY (tmp, fsync, rename, fsync of the dir;
+    macOS ``F_FULLFSYNC``) before the caller frees what held them. A set: retiring an id twice changes nothing, and
+    an id already in the file writes nothing. Raises ``OSError`` (the caller's step fails, nothing is freed)."""
+    from levain.slot.records import write_durably
+
+    if fsync is None:
+        from levain.slot.generation import _full_fsync as fsync
+    have = read_retired_ids(path)
+    want = have | frozenset(ids)
+    if want == have:
+        return
+    Path(path).parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    write_durably(Path(path), retired_ids_text(want).encode("ascii"), mode=0o644, fsync=fsync)

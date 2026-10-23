@@ -307,21 +307,22 @@ def test_undo_reads_intent(host):
     present = {**made, "_levain_s0": s0, "_levain_gw0": j.accounts["_levain_gw0"] - 1}   # gw0 is not ours
     # the directory service reports only the labelled accounts; Linux reports no shared group
     labelled = {n: made[n] for n in SINGLETONS}
-    shared = () if host == "linux" else SHARED_GROUPS
+    shared = {} if host == "linux" else {g: made[g] for g in SHARED_GROUPS}
     undo = plan_undo(parse_install_argv(["undo"]), _set_up(host, intent=j, host_ids=present),
                      accounts=labelled, shared_groups=shared)
     tombed = {s.why.split(":")[0].removeprefix("tombstone ") for s in undo.steps if s.why.startswith("tombstone ")}
     assert "_levain_s0" in tombed and "_levain_gw0" not in tombed and set(SINGLETONS) <= tombed
     assert s0 in undo.retired_after and j.accounts["_levain_gw0"] not in undo.retired_after
-    deleted = [s.why.removeprefix("delete the shared group ") for s in undo.steps if "delete the shared group" in s.why]
+    deleted = [s.why.removeprefix("delete the group ") for s in undo.steps if s.why.startswith("delete the group ")]
     assert sorted(deleted) == sorted(SHARED_GROUPS)
-    assert undo.steps[-2].argv[1:] == ("-f", str(INTENT_PATH[host]))
-    assert undo.steps[-1].argv[1:] == ("-f", str(operator_record_path(host)))
+    assert undo.steps[-3].argv[1:] == ("-f", str(INTENT_PATH[host]))
+    assert undo.steps[-2].argv[1:] == ("-f", str(operator_record_path(host)))
+    assert undo.steps[-1].why.startswith("check the sudoers config with visudo -c (after ")                         # FIX1 M1
     # without the journal, Linux would leave the unlabelled groups and the unlabelled-yet account behind
     blind = plan_undo(parse_install_argv(["undo"]), _set_up(host), accounts=labelled, shared_groups=shared)
     assert s0 not in blind.retired_after
     # a replenish journal is read the same way
     rj = Intent("replenish", OP, {"_levain_s0": s0, "_levain_gw0": j.accounts["_levain_gw0"]})
     undo2 = plan_undo(parse_install_argv(["undo"]), _set_up(host, intent=rj, host_ids={"_levain_s0": s0}),
-                      accounts={}, shared_groups=())
+                      accounts={}, shared_groups={})
     assert s0 in undo2.retired_after and any(s.why.startswith("tombstone _levain_s0") for s in undo2.steps)

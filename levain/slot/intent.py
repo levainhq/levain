@@ -31,8 +31,11 @@ from levain.slot.ids import RANGES, RETIRED_IDS_PATH, in_own_range, is_levain_ac
 INTENT_FORMAT = "levain-intent/2"
 #: Still read (a journal an older generation wrote): no ``txn``, no ``generation``, no ``managed``.
 INTENT_FORMAT_V1 = "levain-intent/1"
-#: The verbs that journal; ``undo`` reads a journal but never writes one.
-INTENT_VERBS = ("setup", "replenish", "repair")
+#: The verbs that journal. ``undo`` (row 33 R1b FIX1) journals the records it will remove before its first removal,
+#: so a re-run after a crash plans from what the first run derived, not from what the host still reports.
+INTENT_VERBS = ("setup", "replenish", "repair", "undo")
+#: The verbs whose journal carries a write-ahead ``managed`` list (every other verb's is empty).
+MANAGED_VERBS = ("repair", "undo")
 
 STATE_DIR: Mapping[str, Path] = {h: p.parent for h, p in RETIRED_IDS_PATH.items()}
 INSTALL_LOCK: Mapping[str, Path] = {h: d / "install.lock" for h, d in STATE_DIR.items()}
@@ -94,7 +97,8 @@ def install_lock(host: HostOS | None = None, *, path: Path | None = None,
 
 @dataclass(frozen=True)
 class Intent:
-    """What a ``setup``, ``replenish`` or ``repair`` is about to create: its accounts (name -> uid == gid) and its
+    """What a ``setup``, ``replenish`` or ``repair`` is about to create (an ``undo``: what it is about to remove, its
+    ``managed`` the whole set): its accounts (name -> uid == gid) and its
     shared groups (name -> gid). ``levain-intent/2`` (row 33) adds the run's ``txn`` (a fresh 128-bit id; repair's
     completion proof is ``install-shape``'s ``completed_txn == txn``), the ``generation`` a repair is moving to (None
     until its staged copy is hashed, §2.3 R3) and the write-ahead ``managed`` (R4b). A ``/1`` journal reads with
@@ -149,12 +153,13 @@ def parse_intent(data: bytes, host: HostOS) -> Intent:
     v2 = v1 | {"txn", "generation", "managed"}
     if not isinstance(obj, dict) or (set(obj), obj.get("format")) not in ((v1, INTENT_FORMAT_V1), (v2, INTENT_FORMAT)):
         raise bad
-    if obj["format"] == INTENT_FORMAT_V1 and obj["verb"] == "repair":
+    if obj["format"] == INTENT_FORMAT_V1 and obj["verb"] in MANAGED_VERBS:
         raise bad
     if obj["format"] == INTENT_FORMAT and (
             not isinstance(obj["txn"], str) or not TXN_RE.fullmatch(obj["txn"])
             or not (obj["generation"] is None or (isinstance(obj["generation"], str) and GEN_RE.fullmatch(obj["generation"])))
-            or (obj["verb"] != "repair" and (obj["generation"] is not None or obj["managed"]))):
+            or (obj["verb"] != "repair" and obj["generation"] is not None)
+            or (obj["verb"] not in MANAGED_VERBS and obj["managed"])):
         raise bad
     if (obj["verb"] not in INTENT_VERBS
             or not isinstance(obj["operator"], str) or not OPERATOR_RE.fullmatch(obj["operator"])

@@ -19,12 +19,15 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Callable, Iterable, Mapping
 
-from levain.firing.hands import Step
+from levain.firing.hands import _RETIRED_IDS as _HANDS_RETIRED_IDS, Step
 from levain.launch import child_env
 from levain.slot import Refused, write_all
-from levain.slot.ids import SlotId, in_own_range, loopback_alias
+from levain.slot.ids import RETIRED_IDS_PATH, SlotId, in_own_range, loopback_alias
+
+if TYPE_CHECKING:
+    from levain.slot.removal import Live
 
 ANCHOR = "com.apple/levain"
 ANCHOR_FILE = Path("/etc/pf.anchors/levain")
@@ -37,6 +40,15 @@ PF_OPTIMIZE = ("-o", "none")
 GWPORT_BASE = 47100
 
 _TOKEN_RE = re.compile(r"Token\s*:\s*([0-9]{1,20})")
+#: The first line of every rules file :func:`anchor_text` writes starts with this (every version since S1:
+#: ``git log -S`` on it in this file); :func:`anchor_state` reads the file as Levain's only then.
+ANCHOR_HEADER = "# Levain session slots"
+#: What :func:`_write_token` writes, exactly one line of it (the unstripped bytes): :func:`enable_state` reads a
+#: recorded token path as Levain's only when it holds this.
+_TOKEN_BYTES = re.compile(rb"[0-9]{1,20}\n?")
+#: Levain's own one-id-per-line files inside ``pf-enable/1``'s bound: a single id there is a token's bytes, so these
+#: paths are never a token (L3 r2 complement LOW 1).
+_NOT_TOKENS = frozenset(RETIRED_IDS_PATH.values()) | frozenset(_HANDS_RETIRED_IDS.values())
 
 
 def gwport(slot: SlotId) -> int:
@@ -92,7 +104,7 @@ def anchor_rules(slots: Iterable[SlotId], ids: Mapping[str, int]) -> list[str]:
 
 
 def anchor_text(slots: Iterable[SlotId], ids: Mapping[str, int]) -> str:
-    return ("# Levain session slots (CONTRACT §8.3, §24). Written by the install helper; removed by its undo verb.\n"
+    return (f"{ANCHOR_HEADER} (CONTRACT §8.3, §24). Written by the install helper; removed by its undo verb.\n"
             + "".join(f"{r}\n" for r in anchor_rules(slots, ids)))
 
 
@@ -165,11 +177,13 @@ def _write_token(token_path: Path, token: str) -> None:
         os.close(dfd)
 
 
-def release_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run) -> tuple[bool, str]:
+def release_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run, *,
+                             after_release: Callable[[], None] = lambda: None) -> tuple[bool, str]:
     """Release the reference whose token :func:`take_enable_reference` stored, then remove the token
     file. No file, or a file holding no token, = nothing to release. The file goes only once pf
     confirms the reference is gone (released now, or already dropped); any other failure keeps it. A
-    token path that cannot be read is a failure, and nothing is removed."""
+    token path that cannot be read is a failure, and nothing is removed. ``after_release``: the crash
+    table's ``pf-enable/1:after-release`` point (row 33 R1b), between the release and the unlink."""
     readable, token, note = _read_token(token_path)
     if not readable:
         return False, note
@@ -177,6 +191,7 @@ def release_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.
         return True, note
     ok, why = _release(token, run)
     if ok:
+        after_release()
         token_path.unlink(missing_ok=True)
     return ok, why
 
@@ -264,23 +279,88 @@ def alias_steps(slots: Iterable[SlotId]) -> list[Step]:
             for s in sorted(set(slots)) if s.slot_class == "egress"]
 
 
-def alias_undo_steps(slots: Iterable[SlotId]) -> list[Step]:
-    """Remove each egress slot's lo0 alias if lo0 still has it. Run after every slot process is stopped."""
-    return [Step(f"remove the lo0 alias {loopback_alias(s)} of {s.tag}", (IFCONFIG, "lo0", "-alias", loopback_alias(s)),
-                 skip_if=alias_absent(loopback_alias(s)))
-            for s in sorted(set(slots)) if s.slot_class == "egress"]
+__all__ = ["ANCHOR", "ANCHOR_FILE", "GWPORT_BASE", "IFCONFIG", "PFCTL", "PF_OPTIMIZE", "PF_TOKEN", "PF_TOKEN_GONE", "alias_absent", "alias_present",
+           "alias_steps", "anchor_rules", "anchor_text", "gwport", "load_steps",
+           "release_enable_reference", "take_enable_reference"]
 
 
-def unload_steps() -> list[Step]:
-    """Flush the sub-anchor, release Levain's enable reference, remove both files."""
+# --- row 33 R1b: removal by the RECORDED identity (§1.1 table rows 6-8) --------------------------------------------
+
+
+def _lo0_has(addr: str, live: "Live") -> bool:
+    """The three-state alias probe (DESIGN X4-M1): ``ifconfig lo0``'s own exit status is checked BEFORE parsing, so a
+    failed read raises (the step fails) and only a zero exit that does not list ``addr`` reads as absent."""
+    out = live.read((IFCONFIG, "lo0"))
+    return any(ln.split()[:2] == ["inet", addr] for ln in out.splitlines())
+
+
+def alias_state(addr: str, live: "Live") -> str:
+    from levain.slot.removal import ABSENT, OURS
+
+    return OURS if _lo0_has(addr, live) else ABSENT   # an address carries no owner: the bound is the ownership
+
+
+def remove_alias_steps(addr: str, *, live: "Live") -> list[Step]:
+    """``pf-alias/1`` (R8, before every ``pf-anchor/1``): ``ifconfig lo0 -alias <addr>``."""
+    from levain.slot.removal import chain, point, remove_step
+
+    return [remove_step(f"remove the lo0 alias {addr}", ("pf-alias/1", addr), live, lambda: alias_state(addr, live),
+                        chain(lambda: live.act((IFCONFIG, "lo0", "-alias", addr)), point(live, "pf-alias/1:after-remove")),
+                        tools=(IFCONFIG,))]
+
+
+def anchor_state(anchor: str, file: str, live: "Live") -> str:
+    """OURS: the rules file is a regular root file whose first line starts with :data:`ANCHOR_HEADER`, or it is gone
+    and the anchor still holds rules. ABSENT: no file and ``pfctl -a <anchor> -sr`` prints no rule. NOT_OURS: any other
+    file at the recorded path (nothing is flushed or removed)."""
+    from levain.slot.removal import ABSENT, OURS, root_file
+
+    state = root_file(live, Path(file), check=lambda b: b.split(b"\n", 1)[0].startswith(ANCHOR_HEADER.encode()))
+    if state != ABSENT:
+        return state
+    return OURS if live.read((PFCTL, "-a", anchor, "-sr")).strip() else ABSENT
+
+
+def remove_anchor_steps(anchor: str, file: str, *, live: "Live") -> list[Step]:
+    """``pf-anchor/1`` (R8): flush the recorded anchor, then ``rm -f`` its rules file. Never pf's enable reference
+    (that is ``pf-enable/1``'s): an anchor rename must not release the reference this run just took. A non-zero
+    ``pfctl -F all`` fails the step (whether it exits 0 on an empty anchor is the crash table's to measure)."""
+    from levain.slot.removal import at, chain, point, remove_step
+
+    record = ("pf-anchor/1", (anchor, file))
+    state = lambda: anchor_state(anchor, file, live)   # noqa: E731
     return [
-        Step(f"flush the pf anchor {ANCHOR}", (PFCTL, "-a", ANCHOR, "-F", "all")),
-        Step(f"release pf's enable reference (the token in {PF_TOKEN})", call=lambda: release_enable_reference()),
-        Step(f"remove {ANCHOR_FILE}", ("/bin/rm", "-f", str(ANCHOR_FILE))),
-        Step(f"remove {PF_TOKEN}", ("/bin/rm", "-f", str(PF_TOKEN))),
+        remove_step(f"flush the pf anchor {anchor}", record, live, state,
+                    chain(lambda: live.act((PFCTL, "-a", anchor, "-F", "all")), point(live, "pf-anchor/1:after-flush")),
+                    tools=(PFCTL,)),
+        remove_step(f"remove {file}", record, live, state, lambda: live.act(("/bin/rm", "-f", at(live, Path(file)))),
+                    tools=(PFCTL, "/bin/rm")),
     ]
 
 
-__all__ = ["ANCHOR", "ANCHOR_FILE", "GWPORT_BASE", "IFCONFIG", "PFCTL", "PF_OPTIMIZE", "PF_TOKEN", "PF_TOKEN_GONE", "alias_absent", "alias_present",
-           "alias_steps", "alias_undo_steps", "anchor_rules", "anchor_text", "gwport", "load_steps",
-           "release_enable_reference", "take_enable_reference", "unload_steps"]
+def enable_state(token: str, live: "Live") -> str:
+    """OURS: a regular root file holding a pf token (:data:`_TOKEN_BYTES`). Anything else at the recorded path is
+    NOT_OURS and left: the bound admits every name under ``/var/db/levain``, the retired-ids file's included, and
+    :func:`release_enable_reference` removes a file that holds no token. One of Levain's id files
+    (:data:`_NOT_TOKENS`) is never a token, whatever it holds."""
+    from levain.slot.removal import ABSENT, NOT_OURS, root_file
+
+    state = root_file(live, Path(token), check=lambda b: _TOKEN_BYTES.fullmatch(b) is not None)
+    return NOT_OURS if state != ABSENT and Path(token) in _NOT_TOKENS else state
+
+
+def remove_enable_steps(token: str, *, live: "Live") -> list[Step]:
+    """``pf-enable/1`` (R8, after every ``pf-anchor/1``): :func:`release_enable_reference` on the recorded token
+    path, which removes the file only once pf confirms the reference gone (a file holding no token names nothing pf
+    could release, and :func:`_read_token` removes it). ``pfctl -X`` runs bounded by ``live.timeout``."""
+    from levain.slot.removal import remove_step
+
+    def release() -> tuple[bool, str]:
+        try:
+            return release_enable_reference(live.at(Path(token)), run=live.timed,
+                                            after_release=lambda: live.fault("pf-enable/1:after-release"))
+        except subprocess.TimeoutExpired:
+            return False, f"pfctl -X timed out after {live.timeout:g}s, token kept"
+
+    return [remove_step(f"release pf's enable reference (the token in {token})", ("pf-enable/1", token), live,
+                        lambda: enable_state(token, live), release, tools=(PFCTL,))]
