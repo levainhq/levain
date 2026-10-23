@@ -336,9 +336,16 @@ def test_one_vendor_item_holds_a_call_an_approval_and_a_result(cs, world, qdir):
         assert created and e.vendor_event_key == f"{kind}:{item}"
     rows = raw(qdir).execute("SELECT kind FROM chat_events WHERE call_id = ? ORDER BY gseq", (item,)).fetchall()
     assert [r[0] for r in rows] == ["tool_call", "approval_request", "tool_result"]
+    c = raw(qdir)
     for bad in (item, "agent_text:" + item, "tool_call:"):
         with pytest.raises(CoordError, match="kind-qualified"):
             ev(cs, world, kind="tool_call", full_key=bad, pos="0001.0009")
+        # the table holds the same shape for any writer
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+            c.execute("INSERT INTO chat_events (launch_id, vendor_event_key, gseq, vendor_pos, kind, body, "
+                      "body_sha256, body_norm_sha256, truncated, backfill, source, at) VALUES (?, ?, "
+                      "(SELECT MAX(gseq) + 1000 FROM gseq), 'p', 'tool_call', 'x', 's', 's', 0, 0, 'vendor', 'x')",
+                      (world["launch"], bad))
 
 
 def test_event_replay_is_idempotent_and_a_changed_key_conflicts(cs, world, qdir):
@@ -363,7 +370,7 @@ def test_event_source_is_vendor_only(cs, world, qdir, clock):
     c = raw(qdir)
     with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
         c.execute("INSERT INTO chat_events (launch_id, vendor_event_key, gseq, vendor_pos, kind, body, body_sha256, "
-                  "body_norm_sha256, truncated, backfill, source, at) VALUES (?, 'k', ?, 'p', 'user_item', 'x', 's', "
+                  "body_norm_sha256, truncated, backfill, source, at) VALUES (?, 'user_item:k', ?, 'p', 'user_item', 'x', 's', "
                   "'s', 0, 0, 'operator', 'x')", (world["launch"], gseq(c, clock)))
 
 

@@ -144,7 +144,10 @@ CHAT_SCHEMA: tuple[str, ...] = (
     "body TEXT NOT NULL, body_sha256 TEXT NOT NULL, body_norm_sha256 TEXT NOT NULL, "
     "truncated INTEGER NOT NULL CHECK (truncated IN (0, 1)), backfill INTEGER NOT NULL CHECK (backfill IN (0, 1)), "
     "source TEXT NOT NULL CHECK (source = 'vendor'), at TEXT NOT NULL, PRIMARY KEY (launch_id, vendor_event_key), "
-    f"CHECK (length(CAST(body AS BLOB)) <= {EVENT_BODY_MAX}))",
+    f"CHECK (length(CAST(body AS BLOB)) <= {EVENT_BODY_MAX}), "
+    # rev 3 §16 item 2 (head ruling on Q1): the key is "<kind>:<vendor id>", its prefix the row's own kind
+    "CHECK (substr(vendor_event_key, 1, length(kind) + 1) = kind || ':' "
+    "AND length(vendor_event_key) > length(kind) + 1))",
     *_append_only("chat_events", "a chat event"),
     "CREATE TRIGGER IF NOT EXISTS chat_events_no_replace BEFORE INSERT ON chat_events WHEN EXISTS (SELECT 1 FROM "
     "chat_events WHERE (launch_id = NEW.launch_id AND vendor_event_key = NEW.vendor_event_key) OR gseq = NEW.gseq "
