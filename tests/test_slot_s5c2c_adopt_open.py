@@ -11,6 +11,7 @@ Built from the first run of the wiring (``project_memory/1022-19/adopt_cc/run_s1
 from __future__ import annotations
 
 import base64
+import dataclasses
 import errno
 import hashlib
 import os
@@ -468,7 +469,9 @@ def test_install_writes_the_export_importer_entry_the_launch_names(host):
     steps = {s.write[0]: s.write for s in root_tree.entry_steps(host)}
     assert path in steps and steps[path][2] == 0o755
     assert 'runpy.run_module(\'levain.slot.importer\', run_name="__main__"' in steps[path][1]
-    assert root_tree.ENTRY_MODULES["export-verifier"] == "levain.slot.verify_run"   # 5d-i S1 added it
+    # 5d-i session 1 added the verifier entry: an ENTRY, never a sudo helper.
+    assert root_tree.ENTRY_MODULES["export-verifier"] == "levain.slot.verify_run"
+    assert "export-verifier" not in root_tree.HELPER_MODULES
 
 
 # --- fix round 1 (L3 r1): each row built red against 58e5e3f2 -------------------------------------------------------
@@ -563,3 +566,18 @@ def test_an_importer_reaped_before_collect_export_fails_is_never_handed_to_seal_
     rc, line, err = rig.run()
     assert _answer(line)["refused"] == "internal" and "after the reap" in err, (line, err)
     assert rig.prover.children[-1] == (), rig.prover.children
+
+
+# --- 1022+20 s2m: head ruling S2-Q5 (CONTRACT §5.1 adopt-open: the resolved git at or above the floor) -----------------
+
+def test_adopt_open_refuses_a_git_below_the_floor_before_seal_in(rigs):
+    # Built red: adopt-open read no floor (only adopt-verify called fsck_ids.check_floor), so this published.
+    rig = rigs("delta")
+    base = rig.seams
+    rig.seams = lambda: dataclasses.replace(base(), adopt=RH.AdoptSeams(git_version=lambda: "git version 2.38.1\n"))
+    rc, line, err = rig.run()
+    assert (rc, _answer(line)["refused"]) == (RH.EXIT_REFUSED, "git-below-floor:2.38.1"), (line, err)
+    assert "adopt:5" in rig.log and "adopt:6" not in rig.log and "seal-in done" not in rig.log
+    assert "spawned" not in rig.log and rig.log[-2:] == ["adopt:adopt-unlocked", "adopt:session-unlocked"]
+    exp = rig.L / "export"
+    assert not (exp / "operator" / S).exists() and not (exp / "work.sparseimage").exists()

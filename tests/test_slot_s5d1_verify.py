@@ -170,3 +170,98 @@ def test_export_verifier_is_an_entry_and_not_a_sudo_helper():
     assert "export-verifier" not in root_tree.HELPER_MODULES
     with pytest.raises(Exception):
         root_tree.helper_entry_text("darwin", "export-verifier")
+
+
+# --- fix round 1 (L3 r1, lane adopt-5di-fix1): each row built red against 662b22a9 -----------------------------------
+
+def _two_past(fx: Fx):
+    """A second commit on top of ``fx.head`` (a new blob ``b.txt``); returns its oid and the head's tree oid."""
+    (fx.repo / "b.txt").write_text("b\n")
+    g("add", "b.txt", cwd=fx.repo)
+    g("commit", "-qm", "two", cwd=fx.repo)
+    c2 = g("rev-parse", "HEAD", cwd=fx.repo).decode().strip()
+    return c2, g("rev-parse", f"{fx.head}^{{tree}}", cwd=fx.repo).strip()
+
+
+@needs_git
+@pytest.mark.parametrize("case,expected", [
+    ("tip-absent", "bundle-tip-not-commit"), ("parent-absent", "preview-graph-unresolved"),
+    ("tree-absent", "preview-graph-unresolved")])
+def test_an_absent_tip_parent_or_tree_refuses_by_name_not_verifier_failed(tmp_path, case, expected):
+    # complement 1 (MED): an absent tip died in update-ref and an absent parent in merge-base, both unnamed (exit).
+    fx = Fx(tmp_path)
+    ref = f"refs/levain/{S}/head".encode()
+    if case == "tip-absent":
+        b = fx.bundle("x.bundle", fx.listing, refs=[("1" * 40, ref)])
+    elif case == "parent-absent":
+        c2, head_tree = _two_past(fx)
+        objs = g("rev-list", "--objects", "--no-object-names", c2, "--not", fx.base, cwd=fx.repo).split()
+        b = fx.bundle("x.bundle", [o for o in objs if o not in (fx.head.encode(), head_tree)], refs=[(c2, ref)])
+    else:
+        head_tree = g("rev-parse", f"{fx.head}^{{tree}}", cwd=fx.repo).strip()
+        b = fx.bundle("x.bundle", [o for o in fx.listing if o != head_tree])
+    oc, outs, _v = fx.run(case, b)
+    assert not oc.success and outs == []
+    assert oc.line.refused == expected, oc.detail
+
+
+def test_the_verifier_line_parser_refuses_a_noncanonical_line_or_a_bool_version():
+    # complement 3 + codex 1 (MED): canon.parse took whitespace and key order, and True == 1 passed the version.
+    ok = VR.result_line(refused=None, detail="", enospc=False, result="delta")
+    spaced = b'{ "v":1, "enospc":false, "refused":null, "result":"delta", "detail":"" }\n'
+    reordered = b'{"v":1,"detail":"","enospc":false,"refused":null,"result":"delta"}\n'
+    booly = ok.replace(b'"v":1', b'"v":true')
+    assert booly != ok and reordered != ok
+    for bad in (spaced, reordered, booly):
+        with pytest.raises(ER.LineBad):
+            AV.parse_verifier_line(bad)
+        oc = ER.classify(ER.RunObservation("exit", 0, line=bad), ER.VERIFIER, parse=AV.parse_verifier_line)
+        assert oc.name == "verifier-failed:result-malformed"
+
+
+class _FakeGit:
+    def __init__(self, rc: int, err: str) -> None:
+        self.rc, self.err = rc, err
+
+    def run(self, *a, **kw):
+        return self.rc, "", self.err
+
+
+def test_index_pack_names_fsck_only_from_error_or_fatal_lines():
+    # complement 2 (LOW): a closed-list WARNING beside another failure was taken as the failure's name.
+    warn = ("warning: object 1234abcd: zeroPaddedFilemode: contains zero-padded file modes\n"
+            "fatal: pack exceeds maximum allowed size\n")
+    from levain.slot import importer
+    with pytest.raises(importer.Fatal):
+        AV._index_pack_q(_FakeGit(128, warn), AV._Region(Path(os.devnull)), 0, 0, 1)
+    err = "error: object 1234abcd: hasDotgit: contains '.git'\nfatal: fsck error in packed object\n"
+    with pytest.raises(AV.Refused) as r:
+        AV._index_pack_q(_FakeGit(128, err), AV._Region(Path(os.devnull)), 0, 0, 1)
+    assert r.value.name == "fsck:hasDotgit"
+
+
+@needs_git
+def test_a_run_called_inside_an_except_block_still_succeeds(tmp_path):
+    # complement 4 (LOW): run() read sys.exc_info() in its finally, so a caller's active exception rewrote a pass.
+    fx = Fx(tmp_path)
+    b = fx.bundle("good.bundle", fx.listing)
+    v = tmp_path / "verify-inproc"
+    for d in ("in", "scratch", "out", "log"):
+        (v / d).mkdir(parents=True, mode=0o700)
+    shutil.copyfile(b, v / "in" / "bundle")
+    shutil.copyfile(fx.base_bundle, v / "in" / "base.bundle")
+    argv = ["--git", GIT, "--session", S, "--object-format", "sha1", "--base-oid", fx.base, "--result", "delta",
+            "--max-input-size", str(1 << 30)]
+    r, w = os.pipe()
+    try:
+        try:
+            raise ValueError("the caller's own exception")
+        except ValueError:
+            rc = VR.run(argv, result_fd=w, work=v)
+        os.close(w)
+        line = os.read(r, 1 << 16)
+    finally:
+        os.close(r)
+    assert rc == 0, line
+    assert AV.parse_verifier_line(line).result == "delta"
+    assert sorted(os.listdir(v / "out")) == ["preview.txt", "q.idx", "verified.json"]

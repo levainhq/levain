@@ -1794,15 +1794,21 @@ def _alloc_base_field(a: R.Alloc) -> Optional[Mapping[str, object]]:
     return None if a.base is None else R.base_obj(a.base)
 
 
+def _root_git_version() -> str:
+    return FI.git_version_text(wall.GIT)
+
+
 @dataclass
 class AdoptSeams:
     """adopt-open's own injected facts: the alloc's ``base`` (render writes it; ``None`` = unrecorded), V7's wall
-    in seconds (one absolute deadline over the adopt-lock wait and the walk) and the walker caps."""
+    in seconds (one absolute deadline over the adopt-lock wait and the walk), the walker caps, and ``git_version()``
+    (root's git's ``git --version``, read against the floor)."""
 
     alloc_base: Callable[[R.Alloc], Optional[Mapping[str, object]]] = _alloc_base_field
     lock_wait_s: float = V7_SECONDS
     max_bytes: int = V7_BYTES
     max_entries: int = V7_ENTRIES
+    git_version: Callable[[], str] = _root_git_version
 
 
 @dataclass(frozen=True)
@@ -2050,8 +2056,9 @@ def adopt_step5_precaps(ctx: Ctx, front: AdoptFront, adopt: AdoptSeams) -> None:
 @contextmanager
 def adopt_open_front(ctx: Ctx, session: str, adopt: Optional[AdoptSeams] = None) -> Iterator[AdoptFront]:
     """adopt-open steps 1-5: the caller and kind, the session lock (TRY, ``session-busy``), root facts, the adopt
-    lock (bounded wait, ``adopt-busy``), the pre-caps. Both locks are held while the caller runs steps 6-12 and are
-    released adopt lock first, then the session lock."""
+    lock (bounded wait, ``adopt-busy``), the pre-caps, then the git floor (``git-below-floor:<version>``, CONTRACT
+    §5.1 adopt-open; :func:`fsck_ids.check_floor`, the one function adopt-verify calls too), before any seal-in. Both
+    locks are held while the caller runs steps 6-12 and are released adopt lock first, then the session lock."""
     adopt = adopt or AdoptSeams()
     deadline = ctx.seams.monotonic() + adopt.lock_wait_s   # V7's one wall: the lock wait and the walk
     a = adopt_step1_caller(ctx, session)
@@ -2065,6 +2072,8 @@ def adopt_open_front(ctx: Ctx, session: str, adopt: Optional[AdoptSeams] = None)
                 with adopt_lock_wait(ctx, front.deadline):
                     ctx.seams.at("adopt:5")
                     adopt_step5_precaps(ctx, front, adopt)
+                    FI.check_floor(adopt.git_version())
+                    ctx.seams.at("adopt:floor")
                     yield front
             finally:
                 ctx.seams.at("adopt:adopt-unlocked")
@@ -2503,10 +2512,6 @@ def _pf_unbuilt(uid: int) -> bool:
                   "adopt-verify refuses rather than run the verifier unchecked")
 
 
-def _root_git_version() -> str:
-    return FI.git_version_text(wall.GIT)
-
-
 @dataclass
 class VerifySeams:
     """adopt-verify's own injected facts: ``git_version()`` (root's git's ``git --version``, read against the floor);
@@ -2785,8 +2790,12 @@ def verify_sealed_run(ctx: Ctx, front: AdoptFront, export_class: str, bundle_dig
                                               role=ER.VERIFIER)
             at("verify:12")
             d = pub.digests
-            return {"verified_digest": "sha256:" + d["verified.json"], "idx_digest": "sha256:" + d["q.idx"],
-                    "preview_digest": "sha256:" + d["preview.txt"]}
+            out: Dict[str, object] = {"verified_digest": "sha256:" + d["verified.json"],
+                                      "idx_digest": "sha256:" + d["q.idx"],
+                                      "preview_digest": "sha256:" + d["preview.txt"]}
+            if pub.warnings:               # adopt-open's rule (A2; head 1022+20 S2-Q6): only a post-commit failure
+                out["warnings"] = list(pub.warnings)
+            return out
         finally:
             try:
                 if not sealed_out:
@@ -2806,7 +2815,8 @@ def adopt_verify(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]
     (:func:`verify_caller`), the alloc session lock (TRY, ``session-busy``), the root facts as adopt-open step 3
     (RETAINED, SCRUBBED, ``alloc.base``), the adopt lock (adopt-open's bounded wait, ``adopt-busy``: one sealed run
     machine-wide, importer or verifier), the git floor (``git-below-floor:<version>``), then the sealed verify run
-    (:func:`verify_sealed_run`). Answers ``{ok, verified_digest, idx_digest, preview_digest}``; the adopt lock is
+    (:func:`verify_sealed_run`). Answers ``{ok, verified_digest, idx_digest, preview_digest, warnings?}``
+    (``warnings`` only when the publish recorded a post-commit failure, adopt-open's rule); the adopt lock is
     released first, then the session lock."""
     assert req.session is not None and req.bundle_digest is not None
     vseams = ctx.seams.verify if ctx.seams.verify is not None else VerifySeams()

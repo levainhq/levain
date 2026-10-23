@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import errno
 import fcntl
 import hashlib
 import importlib.util
@@ -440,3 +441,25 @@ def test_the_product_launch_is_the_verifier_entry_as_levain_verify(host, uid, gi
     assert spec["argv"][1:] == ["--git", wall.GIT, "--session", S, "--object-format", "sha1", "--base-oid", "f" * 40,
                                 "--result", "delta", "--max-input-size", "1234"]
     assert spec["uid"] == uid and spec["target"] == "verifier"
+
+
+# --- 1022+20 s2m: head ruling S2-Q6 (warnings? on adopt-verify, adopt-open's rule A2) ---------------------------------
+
+@SEAM
+def test_adopt_verify_carries_warnings_only_when_the_publish_recorded_one(tmp_path):
+    # Built red: verify_sealed_run dropped the transaction's warnings. The clean answer's exact keys are pinned in
+    # test_adopt_verify_publishes_by_copy.
+    r = VRig(tmp_path)
+    try:
+        def fault(point):
+            if point == "fsync:class":
+                raise OSError(errno.EIO, "seam")
+        r.rig.fault = fault
+        rc, out, err = r.verify()
+        assert rc == 0 and out["ok"] is True, (out, err)
+        assert sorted(out) == ["idx_digest", "ok", "preview_digest", "verified_digest", "warnings"]
+        assert len(out["warnings"]) == 1 and out["warnings"][0]
+        v = r.sdir / "verify"
+        assert out["verified_digest"] == _sha(v / "verified.json") and r.clean()
+    finally:
+        r.rig.cleanup()

@@ -147,8 +147,9 @@ _NAME = re.compile(r"[a-z][a-z0-9-]*(?::[\x21-\x7e]{1,512})?")
 LINE_MAX_DEPTH = 4
 #: Ruling A1b (L3 r1 F2): the refusal line carries ``<role>-failed:<base>``, the base being the importer's refusal up
 #: to its first ``:``; the whole refusal rides in the answer's detail. ``runtime_grammar.refusal_line`` turns any name
-#: off its charset (``[a-z0-9]+(-[a-z0-9]+)*``, one optional ``:`` part, <= 64 chars) into ``internal``, so a base
-#: that cannot ride is spelled by this ONE table, and one off the table by :data:`WIRE_FALLBACK`.
+#: off ``runtime_grammar._NAME_RE`` (or over 64 chars) into ``internal``; the BASE there is ``[a-z0-9]+(-[a-z0-9]+)*``
+#: (only the ``:`` qualifier may carry uppercase and ``.``), so a base that cannot ride is spelled by this ONE table,
+#: and one off the table by :data:`WIRE_FALLBACK`.
 WIRE_BASES: Mapping[str, str] = {}
 WIRE_FALLBACK = "refused"
 _WIRE_BASE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*", re.ASCII)
