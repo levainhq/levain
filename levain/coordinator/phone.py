@@ -13,13 +13,19 @@ The phone port (:mod:`levain.phone_server`) carries the coordinator's phone half
   there is no store). The page binds every outbox item to the identity it held when the item was made and sends it as
   ``store_id``; a drop whose ``store_id`` is not this store's (or that names a store where there is none, or names none
   where there is one) is refused 409 ``other_store`` with nothing written, so a drop made against one Levain is never
-  filed into another that later answers on the same name.
+  filed into another that later answers on the same name. Every reply that makes or names the store carries
+  ``store_id``, and the review and challenge replies also ``store_created`` (L3 r2, both seats: on a fresh install the
+  REVIEW makes the store, so the page binds the signed drop to the id its review reply names, and rebinds every item
+  it made while there was no store only when that reply says this request made it). An item bound to None is
+  accepted by the store the same request creates; on a store it did not see made, only its resend lookup answers.
 - **The outbox** (gap 6): the page keeps a drop until this route answers 2xx. The page picks the ``outbox_id`` once,
   when the drop is made, and resends it unchanged. A resend is looked up FIRST (:meth:`CoordStore.resent_drop`, the
   words and surface compared) and answered with the stored drop (``created: false``) with nothing else checked, so a
   carrier that has since gone stale (a revoked passkey, an old signature) never turns a delivered drop into a refusal;
   the same id with other words is a conflict (409). A retry after a lost reply never files twice, and the 2xx IS the
-  delivered receipt.
+  delivered receipt. The resend lookup runs BEFORE the store-id check (L3 r2 codex MED): a first drop that made the
+  store and whose reply was lost is sent again still bound to None, and gets its stored receipt and the store's id;
+  one that matches nothing is still ``other_store``, so no new write ever passes the identity check.
 - **A structured envelope signed at send** (T4, C0 §4), in two steps so the signature is as fresh as the tap:
   ``POST /coord/envelope-review`` {words, outbox_id, spec, signer_fp} builds the body with the CLI's own builder
   (:func:`levain.coordinator.cli._spec_body`, the one ``levain drop --envelope`` signs), holds it to the store's disk
@@ -41,7 +47,8 @@ The phone port (:mod:`levain.phone_server`) carries the coordinator's phone half
   started by the exact call ``levain drop`` makes (:func:`levain.coordinator.launch.launch_session`, the CLI's
   ``_launch_woken``), once: only a drop this call created names one (``woken_launch`` is read once), so a resend, a
   refusal and the run token wake nothing. It runs on its own thread, so the reply never waits on a spawn, and its
-  outcome, a failure included, is a ``woken`` drop receipt (:meth:`CoordStore.record_wake`).
+  outcome, a failure included, is a ``woken`` drop receipt (:meth:`CoordStore.record_wake`). A thread that cannot be
+  started (L3 r2 codex MED) is that receipt too, and the reply is still the stored drop's.
 
 A land from the phone is always ``from: "named"``, ``onto_from: "inferred"``: the phone sheet has no repo/branch picker
 yet, so the drop records no source, and C0 §4.3 allows ``from: "source"`` only for a drop that recorded one. The body
@@ -52,6 +59,10 @@ A paired device's token only opens the routes: an envelope's authority is the pa
 verifies.
 The listing (:meth:`CoordPhone.listing`) never creates the store; a drop does, exactly as ``levain drop`` does. Stdlib
 only.
+
+Known edges: a browser without Web Locks (``navigator.locks``) edits the outbox unlocked, so two tabs of it can each
+overwrite the other's change; the page says "one tab at a time" there. iOS Safari ships Web Locks from 15.4
+[judged by coordphone-fix2, 2026-10-23, against the head's ruling 4].
 """
 from __future__ import annotations
 
@@ -128,6 +139,11 @@ class CoordPhone:
             except FileNotFoundError:
                 return None
         return EnvelopeStore(self.dispatch_dir, clock=self._clock)
+
+    def _made_store(self) -> tuple[Any, bool]:
+        """The store, created when there is none; True when this call created it (the review on a fresh install)."""
+        store = self._store(create=False)
+        return (self._store(create=True), True) if store is None else (store, False)
 
     def _signers(self) -> tuple[list[str], str]:
         """The passkeys that may sign an envelope here (class covering the envelope's floor), and a note when none."""
@@ -300,7 +316,7 @@ class CoordPhone:
         key = self._key(req["signer_fp"])
         if not isinstance(req["outbox_id"], str):
             raise CoordError("an outbox id is text")
-        store = self._store(create=True)
+        store, created = self._made_store()
         if (sent := store.drop_by_outbox(req["outbox_id"])) is not None:
             # a resend returns the stored drop as it was, so an envelope signed now would never be read
             raise CoordRefused(409, "conflict", f"this drop is already delivered as {sent.drop_id}; nothing new is "
@@ -318,7 +334,8 @@ class CoordPhone:
             self._reviews[review_id] = {"device": device, "body": body, "outbox_id": req["outbox_id"],
                                         "signer_fp": key.fingerprint, "until": now + REVIEW_TTL}
         return {"review_id": review_id, "body_text": text, "digest": env.envelope_digest(body), "rp_id": self.rp_id,
-                "view": ccli._view(body, store, words=words).split("\n")}
+                "view": ccli._view(body, store, words=words).split("\n"),
+                "store_id": store.store_id(), "store_created": created}
 
     def _challenge(self, req: dict[str, Any], device: str) -> dict[str, Any]:
         """Sign tapped: the payload over the KEPT body, signed_at now (L3 r1 codex MED: a long read of the sheet is
@@ -335,13 +352,14 @@ class CoordPhone:
             raise CoordRefused(409, "review_gone", "this envelope's review is no longer held here (it expired, or the "
                                                    "phone port restarted): review it again, then sign")
         key = self._key(kept["signer_fp"])         # still an active passkey covering the envelope's floor
-        store = self._store(create=True)
+        store, created = self._made_store()
         if (sent := store.drop_by_outbox(kept["outbox_id"])) is not None:
             raise CoordRefused(409, "conflict", f"this drop is already delivered as {sent.drop_id}; nothing new is "
                                                 "signed for it")
         payload = env.sign_payload(kept["body"], signer_fp=key.fingerprint, signed_at=now)
         return {"payload": payload, "rp_id": self.rp_id,
-                "challenge": _b64u(challenge(env.sign_message(payload), namespace=env.SIGN_NAMESPACE))}
+                "challenge": _b64u(challenge(env.sign_message(payload), namespace=env.SIGN_NAMESPACE)),
+                "store_id": store.store_id(), "store_created": created}
 
     def _drop(self, req: dict[str, Any]) -> dict[str, Any]:
         from levain.consent.passkey import b64url_decode, to_sshsig
@@ -357,11 +375,14 @@ class CoordPhone:
             raise CoordRefused(400, "bad_request", "sent_at is a timestamp and outbox_id is text")
         if req["store_id"] is not None and not isinstance(req["store_id"], str):
             raise CoordRefused(400, "bad_request", "store_id is the store identity the listing reported, or null")
+        # a resend first, with nothing else checked, the store identity included: a delivered drop is answered as
+        # delivered, whatever has happened to its carrier since (L3 r1 codex MED), and a first drop that made the
+        # store and lost its reply gets its receipt though it is still bound to no store (L3 r2 codex MED). A match
+        # writes nothing; everything that writes is behind _bound_store
+        if (here := self._store(create=False)) is not None \
+                and (again := here.resent_drop(req["outbox_id"], req["words"], surface="phone")) is not None:
+            return self._delivered(here, again, False, None if signed is None else signed.get("body_text"))
         store = self._bound_store(req["store_id"])
-        # a resend first, with nothing else checked: a delivered drop is answered as delivered, whatever has happened
-        # to its carrier since (L3 r1 codex MED)
-        if (again := store.resent_drop(req["outbox_id"], req["words"], surface="phone")) is not None:
-            return self._delivered(store, again, False, None if signed is None else signed.get("body_text"))
         if signed is None:
             drop, created = store.accept_drop(req["words"], surface="phone", outbox_id=req["outbox_id"],
                                               sent_at=req["sent_at"], source=Source())
@@ -443,10 +464,20 @@ class CoordPhone:
             except Exception:  # noqa: BLE001 - the drop is delivered either way
                 pass
 
-        t = threading.Thread(target=run, name=f"levain-coord-wake-{launch_id}", daemon=True)
-        with self._lock:
-            self._wakes = [w for w in self._wakes if w.is_alive()] + [t]
-        t.start()
+        try:
+            t = threading.Thread(target=run, name=f"levain-coord-wake-{launch_id}", daemon=True)
+            with self._lock:
+                self._wakes = [w for w in self._wakes if w.is_alive()] + [t]
+            t.start()
+        except Exception as exc:  # noqa: BLE001 - the drop has committed: a start that fails is its receipt (L3 r2)
+            with self._lock:
+                self._wakes = [w for w in self._wakes if w.is_alive()]
+            try:
+                self._store(create=True).record_wake(
+                    drop_id, launch_id, started=False,
+                    said=f"not started: the wake could not start its thread: {type(exc).__name__}: {str(exc)[:200]}")
+            except Exception:  # noqa: BLE001 - the drop is delivered either way; the launch stays pending
+                pass
 
     def wait_wakes(self, timeout: float) -> None:
         """Wait for the wakes started so far (tests, and a server shutting down)."""

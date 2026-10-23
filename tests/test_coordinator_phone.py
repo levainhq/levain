@@ -578,3 +578,111 @@ def test_r4_the_store_strict_carry_answers_a_resend_before_checking_its_carrier(
                                        envelope=(envelope["body_text"], envelope["payload"], "not a signature"),
                                        authority=world["source"](), keep_plain=False)
     assert created is False and again.drop_id == first["drop"]["drop_id"]
+
+
+# --- 8. L3 r2: the first use of a store and a lost reply (coordphone fix2) ---------------------------------------------
+
+def test_f2_a_fresh_install_signs_its_first_drop_bound_to_the_store_its_review_made(world) -> None:
+    # head ruling 1: the review creates the store, so its reply names the store and says it made it; the page binds
+    # the signed item (and every item it made while there was no store) to that id, and the drop is stored
+    cp = coord_for(world)
+    assert sid(cp) is None and not (world["qdir"] / DB_NAME).exists()
+    oid = "ph-" + "f1" * 16
+    r = review(world, cp, "the first drop ever", oid, _land_spec(str(world["repo"][0])))
+    here = EnvelopeStore(world["qdir"]).store_id()
+    assert (r["store_id"], r["store_created"]) == (here, True)
+    c, envelope = sign(world, cp, r)
+    assert (c["store_id"], c["store_created"]) == (here, False)
+    got = drop(cp, "the first drop ever", oid, envelope=envelope, store_id=r["store_id"])
+    assert got["created"] is True and got["envelope"]["taken"] is True and got["store_id"] == here
+    # a review on a store that already exists names it and made nothing
+    r2 = review(world, cp, "a second drop", "ph-" + "f2" * 16, _land_spec(str(world["repo"][0])))
+    assert (r2["store_id"], r2["store_created"]) == (here, False)
+    # the store's rule is unchanged: a null-bound drop on a store this request did not make is another Levain's
+    with pytest.raises(CoordRefused) as exc:
+        drop(cp, "a second drop", "ph-" + "f2" * 16, store_id=None)
+    assert (exc.value.status, exc.value.error) == (409, "other_store")
+    assert len(EnvelopeStore(world["qdir"]).drops()) == 1
+
+
+def test_f2_a_lost_reply_of_the_drop_that_made_the_store_is_answered_by_the_resend_lookup(world) -> None:
+    # head ruling 2: the resend lookup runs BEFORE the store-id check, so the null-bound retry gets its receipt
+    cp = coord_for(world)
+    oid = "ph-" + "f3" * 16
+    first = drop(cp, "this one made the store", oid, store_id=None)
+    assert first["created"] is True and first["store_id"] == sid(cp)
+    again = drop(cp, "this one made the store", oid, store_id=None)        # the first reply was lost
+    assert again["created"] is False and again["drop"]["drop_id"] == first["drop"]["drop_id"]
+    assert again["store_id"] == first["store_id"]
+    with pytest.raises(CoordRefused) as exc:                               # the same id, other words
+        drop(cp, "other words", oid, store_id=None)
+    assert exc.value.status == 409 and exc.value.error == "conflict"
+    # a null-bound item that matches nothing on this store stays another Levain's (head ruling Q1, unchanged)
+    with pytest.raises(CoordRefused) as exc:
+        drop(cp, "never sent here", "ph-" + "f4" * 16, store_id=None)
+    assert (exc.value.status, exc.value.error) == (409, "other_store")
+    assert [d.drop_id for d in EnvelopeStore(world["qdir"]).drops()] == [first["drop"]["drop_id"]]
+
+
+def test_f2_a_wake_thread_that_cannot_start_is_a_woken_receipt_and_the_reply_stands(world, tmp_path,
+                                                                                   monkeypatch) -> None:
+    # head ruling 3: Thread.start() raising after the drop committed is the wake's receipt, never a 500
+    import threading
+
+    class _NoStart(threading.Thread):
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    _coord_set(world, tmp_path)
+    launcher = _Launcher()
+    cp = coord_for(world, launcher=launcher)
+    monkeypatch.setattr(threading, "Thread", _NoStart)
+    got = drop(cp, "wake, but no thread starts", "ph-" + "f5" * 16)
+    monkeypatch.undo()
+    assert got["created"] is True and got["woken"] is not None and launcher.calls == []
+    (w,) = _wakes(world, got["drop"]["drop_id"])
+    assert w["launch_id"] == got["woken"] and w["started"] is False and "can't start new thread" in w["said"], w
+    assert cp._wakes == []                                  # the unstarted thread is not held for wait_wakes
+
+
+def test_f2_two_concurrent_first_sends_of_one_outbox_id_store_one_drop_and_wake_once(world, tmp_path,
+                                                                                    monkeypatch) -> None:
+    # complement's note, confirmed on disk: CoordStore.accept_drop looks the outbox id up INSIDE its write
+    # transaction, so two first sends that both missed the read-only resend lookup still file one drop
+    import threading
+
+    from levain.coordinator.store import CoordStore
+
+    _coord_set(world, tmp_path)
+    launcher = _Launcher()
+    cp = coord_for(world, launcher=launcher)
+    here = sid(cp)
+    oid = "ph-" + "f6" * 16
+    both = threading.Barrier(2, timeout=10)
+    real = CoordStore.resent_drop
+
+    def both_miss(self, *a, **k):
+        got = real(self, *a, **k)
+        both.wait()                       # neither send writes until both lookups have missed
+        return got
+
+    monkeypatch.setattr(CoordStore, "resent_drop", both_miss)
+    out, errs = [], []
+
+    def send() -> None:
+        try:
+            out.append(drop(cp, "raced from two tabs", oid, store_id=here))
+        except Exception as exc:  # noqa: BLE001 - the assertion below names it
+            errs.append(exc)
+
+    ts = [threading.Thread(target=send) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(30)
+    cp.wait_wakes(10)
+    assert errs == [] and sorted(o["created"] for o in out) == [False, True], (errs, out)
+    assert len({o["drop"]["drop_id"] for o in out}) == 1
+    (won,) = [o for o in out if o["created"]]
+    assert [d.outbox_id for d in EnvelopeStore(world["qdir"]).drops()] == [oid]
+    assert launcher.calls == [won["woken"]] and len(_wakes(world, won["drop"]["drop_id"])) == 1

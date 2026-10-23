@@ -1219,7 +1219,12 @@
   // said on the outbox card as why it is not delivered yet. WHERE: every outbox item is bound to the coordinator store
   // identity this page held when the item was made (coord_store_id, null while there is no store). Nothing is sent
   // until this page load has READ the current identity, and an item bound to another identity is shown as "from
-  // another Levain", never sent: a phone name that now answers for another dispatch directory never files it.
+  // another Levain", never sent: a phone name that now answers for another dispatch directory never files it. On a
+  // fresh install the envelope REVIEW makes the store: the signed drop is bound to the id the review's reply names,
+  // and a reply that says its request made the store (store_created) rebinds every item made while there was none.
+  // An item made while there was no store that meets one it never saw made gets ONE receipt-only retry per identity:
+  // the server answers it from its resend lookup (its own first send made the store, and the reply was lost) or
+  // refuses it other_store with nothing written, and then it is "from another Levain".
   // CROSS-TAB: every outbox change runs under one Web Lock (navigator.locks) and re-reads the outbox inside it, and a
   // change another tab made (the storage event) redraws this one. A SIGNED drop the server refuses is never filed
   // plain behind your back: a stale signature (envelope-stale) offers Sign again, and every refused signed drop offers
@@ -1263,6 +1268,15 @@
     });
   }
   const foreign = (x) => storeRead && x.store_id !== storeId;     // made against another store identity
+  // a foreign item made while there was no store, not yet asked of this identity: its one receipt-only retry
+  const unasked = (x) => foreign(x) && x.store_id === null && x.asked !== storeId;
+  // a reply whose request made the store: every item made while there was none belongs to it
+  function adoptStore(sid) {
+    storeId = sid;
+    storeRead = true;
+    store.set("localStorage", STORE_KEY, sid);
+    return withOutbox((all) => { for (const x of all) if (x.store_id === null) x.store_id = sid; });
+  }
   function dropSay(text, kind) {
     const n = $("drop-note");
     if (!n) return;
@@ -1285,7 +1299,7 @@
   const refusal = (status) => status === 400 || status === 409 || status === 413 || status === 422;
   function flush() {
     if (flushing || !token || !storeRead) return;
-    const next = outboxRead().find((x) => x.state === "waiting" && !foreign(x));
+    const next = outboxRead().find((x) => x.state === "waiting" && (!foreign(x) || unasked(x)));
     if (!next) return;
     flushing = true;
     let again = false;
@@ -1313,6 +1327,12 @@
         });
       }
       const x0 = { why: why(a), error: a.body.error || "" };
+      if (a.body.error === "other_store") {
+        // nothing was written: this identity has answered for the item (it shows as another Levain's once the
+        // listing names the store), and the identity is read again
+        setTimeout(load, 0);
+        return outboxEdit(next.outbox_id, (x) => Object.assign({}, x, { asked: storeId }, x0));
+      }
       if (refusal(a.status)) {
         again = true;
         return outboxEdit(next.outbox_id, (x) => Object.assign({}, x, { state: "refused" }, x0));
@@ -1335,7 +1355,8 @@
     if (!box) return;
     const items = outboxRead();
     $("drop-outbox-meta").textContent = (items.length ? items.length + " not delivered" : "empty")
-      + (outboxMem ? " · this browser keeps no storage: the outbox lasts this visit only" : "");
+      + (outboxMem ? " · this browser keeps no storage: the outbox lasts this visit only" : "")
+      + (navigator.locks ? "" : " · one tab at a time: this browser cannot lock the outbox between tabs");
     box.replaceChildren(...items.map((x) => {
       const other = foreign(x);
       const refused = !other && x.state === "refused";
@@ -1449,7 +1470,7 @@
   // passkey signs its challenge. `again` is the outbox id of a refused signed drop being signed again (same words)
   function envelopeSheet(fp, rawId, words, spec, again) {
     if (busy || closeSheet) return;
-    const sid = again ? (outboxRead().find((x) => x.outbox_id === again) || {}).store_id : boundStore();
+    let sid = again ? (outboxRead().find((x) => x.outbox_id === again) || {}).store_id : boundStore();
     if (sid === undefined) return dropSay("still reading which Levain answers here; sign it in a moment", "bad");
     busy++;
     const id = again || outboxId();      // picked before the review: the server refuses one already delivered
@@ -1470,6 +1491,10 @@
     };
     call("POST", "/coord/envelope-review", { words: words, outbox_id: id, spec: spec, signer_fp: fp }).then((c) => {
       if (!c.ok) { close(); return dropSay("nothing to sign: " + why(c), "bad"); }
+      // the store this envelope was built against: the signed drop is bound to it (a fresh install's review made it)
+      const rsid = typeof c.body.store_id === "string" ? c.body.store_id : null;
+      if (rsid !== null && c.body.store_created === true) adoptStore(rsid).then(drawOutbox);
+      if (!again && rsid !== null) sid = rsid;
       closeSheet = close;
       openReviews.add(close);   // a view change or a hidden page dismisses it (window.levainViewChanged)
       text.disabled = true;     // the words the envelope names are frozen while it is reviewed
@@ -1500,8 +1525,10 @@
             if (!again) text.value = "";
             dropSay("signed; in the outbox, sending…");
             const prior = again ? outboxRead().find((x) => x.outbox_id === again) : null;
+            // Sign again keeps its item's binding, unless the review made the store it was made without
+            const bound = prior ? (prior.store_id === null && c.body.store_created === true ? rsid : prior.store_id) : sid;
             enqueue({ outbox_id: id, words: words, sent_at: prior ? prior.sent_at : stamp(), state: "waiting", envelope: envelope,
-                      store_id: sid, spec: spec, signer_fp: fp, raw_id: rawId || null });
+                      store_id: bound, spec: spec, signer_fp: fp, raw_id: rawId || null });
           }, (e) => { signing = false; dropSay(declined(e, "nothing was signed; sign again or dismiss"), "bad"); });
         }, () => { signing = false; dropSay("the phone port could not be reached; nothing was signed", "bad"); });
       });

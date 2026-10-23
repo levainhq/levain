@@ -156,3 +156,79 @@ def test_drop_wake_stale_sign_again_and_another_levain_through_the_page(world, t
     (w,) = [r.body for r in store.drop_receipts(plain.drop_id) if r.body.get("stage") == "woken"]
     assert w["started"] is False and w["launch_id"] in woken and w["said"] in woken
     assert sideways is False
+
+
+OUTBOX_META = "document.getElementById('drop-outbox-meta').textContent"
+
+
+@needs_browser
+def test_f2_a_fresh_install_signs_its_first_drop_through_the_page(world, tmp_path: Path) -> None:
+    # L3 r2 (both seats): no store at all, so the listing names none and the REVIEW makes it; the review's reply names
+    # the store, the page binds the signed drop to it, and the first-ever signed drop is stored with its envelope
+    shots = Path(os.environ.get("LEVAIN_SHOT_DIR") or tmp_path)
+    from levain.dispatch.jobs import DB_NAME
+
+    assert not (world["qdir"] / DB_NAME).exists()
+    repo_path = str(world["repo"][0])
+    dev = device_token(world["qdir"])
+    with _serve(world["qdir"], world["qdir"]) as (base, httpd):
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={dev}", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
+            _authenticator(world["phone"]),
+            {"until": "document.getElementById('status').textContent !== 'reading the queue…' && 1"},
+            {"eval": "document.getElementById('tab-drop').click() || 1"},
+            {"eval": _set("drop-words", "the first drop this Levain ever gets")},
+            {"eval": "document.getElementById('drop-env').open = true; 1"},
+            {"eval": _set("drop-repo", repo_path)},
+            {"eval": _set("drop-onto", "main")},
+            {"eval": "document.getElementById('drop-sign').click() || 1"},
+            {"until": "(() => { const p = document.querySelector('#drop-review pre.display'); return p && p.textContent; })()"},
+            {"eval": _click("^Sign")},
+            {"until": f"/envelope ev-[0-9a-f]{{32}} taken/.test({NOTE}) && {NOTE}"},
+            {"until": "document.querySelectorAll('#drop-recent .row.drop').length === 1 && "
+                      "document.querySelector('#drop-outbox').children.length === 0 && 1"},
+            {"eval": OUTBOX_META},
+            {"shot": str(shots / "fix2_fresh_signed.png"), "full": True},
+        ])
+    vals = out["values"]
+    taken, meta = vals[9], vals[11]
+    store = EnvelopeStore(world["qdir"])
+    (d,) = store.drops()
+    assert d.envelope_id and d.envelope_id in taken, taken
+    posts = [(p.split(" ", 1)[0], json.loads(p.split(" ", 1)[1])) for p in out["posts"]]
+    assert [r for r, _ in posts] == ["/coord/envelope-review", "/coord/envelope-challenge", "/coord/drop"]
+    assert posts[2][1]["store_id"] == store.store_id()
+    assert "one tab at a time" not in meta, meta          # this Chrome has Web Locks
+
+
+@needs_browser
+def test_f2_a_lost_first_reply_that_made_the_store_clears_from_the_outbox(world, tmp_path: Path) -> None:
+    # L3 r2 codex MED: the first plain drop makes the store and its reply is lost; the next listing names a store the
+    # item (bound to none) never saw, and its one receipt-only retry is answered from the resend lookup
+    shots = Path(os.environ.get("LEVAIN_SHOT_DIR") or tmp_path)
+    dev = device_token(world["qdir"])
+    with _serve(world["qdir"], world["qdir"]) as (base, httpd):
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={dev}", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
+            {"until": "document.getElementById('status').textContent !== 'reading the queue…' && 1"},
+            {"eval": "document.getElementById('tab-drop').click() || 1"},
+            {"eval": LOSE_FIRST_REPLY},
+            {"eval": _set("drop-words", "the drop that made the store")},
+            {"eval": "document.getElementById('drop-send').click() || 1"},
+            {"until": "(() => { const n = document.querySelector('#drop-outbox .row .note'); return n && n.textContent; })()"},
+            # the listing now names the store this drop made
+            {"eval": "document.getElementById('refresh').click() || 1"},
+            {"until": f"/^delivered/.test({NOTE}) && {NOTE}"},
+            {"until": "document.querySelector('#drop-outbox').children.length === 0 && "
+                      "document.querySelectorAll('#drop-recent .row.drop').length === 1 && 1"},
+            {"shot": str(shots / "fix2_lost_first_reply.png"), "full": True},
+        ])
+    delivered = out["values"][7]
+    assert "(it had arrived before: filed once)" in delivered, delivered
+    store = EnvelopeStore(world["qdir"])
+    (d,) = store.drops()
+    drops = [json.loads(p.split(" ", 1)[1]) for p in out["posts"] if p.startswith("/coord/drop ")]
+    assert len(drops) == 2 and {b["outbox_id"] for b in drops} == {d.outbox_id}
+    assert [b["store_id"] for b in drops] == [None, None]
