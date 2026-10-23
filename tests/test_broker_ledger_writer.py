@@ -338,16 +338,19 @@ def test_aclose_finalizes_live_holds(tmp_path, monkeypatch):
         g.hold.release()                               # RESOLVING at aclose
         # a straggler still inside a gated release_exchange when aclose runs
         straggle = asyncio.Event()
+        st_hold = []
 
         async def straggler():
             h = led.admit(SCOPE, CAP, lambda x: AMOUNT, "r-a")
+            st_hold.append(h)
             await h.durable()
             await straggle.wait()
             return h
         st_task = asyncio.ensure_future(straggler())
         asyncio.get_running_loop().call_later(0.05, ctl.gate.set)
         await asyncio.sleep(0)
-        await until(lambda: ctl.returned >= 4)   # the straggler's hold is RESERVED
+        # the straggler's hold is RESERVED (a state, not a flush count: how the writer batches lines is its own)
+        await until(lambda: st_hold != [] and st_hold[0].state is L.RESERVED and p.hold.state is L.RESERVED)
         ctl.gate.clear()
         asyncio.get_running_loop().call_later(0.05, ctl.gate.set)
         await led.aclose(5.0)

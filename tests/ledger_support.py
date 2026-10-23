@@ -59,17 +59,30 @@ def wait_thread(cond: Callable[[], bool], timeout: float = 5.0) -> None:
         time.sleep(0.002)
 
 
+class _Gate(threading.Event):
+    """The flush gate. Closing it also clears `entered`, so a wait on `entered` after `gate.clear()` waits for a flush
+    that starts after the clear, never one that ran before it."""
+
+    def __init__(self, entered: threading.Event) -> None:
+        super().__init__()
+        self._entered = entered
+
+    def clear(self) -> None:
+        self._entered.clear()
+        super().clear()
+
+
 class FlushCtl:
     """Replaces `ledger._flush` after open: each call is recorded, may wait on a gate, sleep, or raise a scripted
-    error, then runs the real flush."""
+    error, then runs the real flush. `entered` is set by the first flush call since the gate last closed."""
 
     def __init__(self) -> None:
         self.real = L._flush
-        self.gate = threading.Event()
+        self.entered = threading.Event()
+        self.gate = _Gate(self.entered)
         self.gate.set()
         self.calls = 0
         self.returned = 0
-        self.entered = threading.Event()
         self.delay = 0.0
         self.errors: List[Optional[BaseException]] = []      # popped per call; None = OK
         self.lock = threading.Lock()
