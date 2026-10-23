@@ -568,6 +568,37 @@ def test_an_early_413_stops_the_upload_between_chunks(monkeypatch):
     assert 0 < len(body) <= getattr(K, "UPLOAD_CHUNK", 64 * 1024) < size, len(body)
 
 
+def test_the_gw_record_counts_only_the_bytes_handed_upstream(monkeypatch):
+    # L3 b2 r2 codex LOW: the collection wrote `bytes_up` = the bytes RECEIVED from the front, and only a completed
+    # upload overwrote it, so an early 413 recorded the whole body as sent though one chunk was. `bytes_up` is now
+    # counted per chunk as each is handed upstream.
+    size = 512 * 1024
+    big = big_body(size)
+    up = _Up(stall_at=2)   # the head's drain returns; the first body drain never does
+    recs = []
+    real_log = K.Keys._log_exchange
+
+    def log(self, conn):
+        recs.append(dict(conn.rec) if conn.rec is not None else None)   # the record as `_log_exchange` writes it
+        real_log(self, conn)
+    monkeypatch.setattr(K.Keys, "_log_exchange", log)
+
+    async def go(d: str) -> None:
+        _write_map(d, base_route(cap=10 ** 10, body_cap=size))
+        _scripted(monkeypatch, up)
+        async with _Rig(d) as rig:
+            rig.front.feed_data(b"".join(gwwire.encode(b"B", big[i:i + gwwire.CHUNK])
+                                         for i in range(0, size, gwwire.CHUNK)) + gwwire.encode(b"E"))
+            up.feed(b"HTTP/1.1 413 Payload Too Large\r\ncontent-length: 4\r\n\r\nnope")
+            await asyncio.wait_for(rig.run(_q("length:%d" % size)), 5)
+            await rig.got()
+
+    _run(go)
+    [rec] = recs
+    head, body = _sent(up)
+    assert rec["bytes_up"] == len(body) < size, (rec["bytes_up"], len(body))
+
+
 def test_a_serialized_body_past_the_routes_body_cap_is_refused(monkeypatch):
     # codex MED 3: an openai-chat body of exactly `body_cap` bytes with no ceiling grows when the ceiling is written
     # in; the grown serialization went upstream past the route's cap. It is `body-cap` now, checked after the

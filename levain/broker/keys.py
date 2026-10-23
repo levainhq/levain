@@ -1859,7 +1859,6 @@ class Keys:
             if want is None:
                 buf.take(len(payload))
             parts.append(payload)
-            rec["bytes_up"] = got
         if want is not None and got != want:
             raise norm.Refused("malformed", "body length")
         return _OneShot(b"".join(parts))
@@ -1867,13 +1866,17 @@ class Keys:
     async def _send_body(self, up: Upstream, hconn: "h11.Connection", data: bytes, rec: dict) -> None:
         """`data` through `up.write` in `UPLOAD_CHUNK` pieces, each drained before the next is written (so a cancel
         from an early response head stops the upload between chunks), framed as the head declared (`content-length`
-        = its length), then h11's end of message; an upstream failure raises UpstreamFailed."""
+        = its length), then h11's end of message; an upstream failure raises UpstreamFailed. `rec["bytes_up"]` counts
+        the body bytes handed to the transport: a chunk is counted as its send starts (`upstream_send` writes, then
+        drains, and a drain that never returns still left the chunk queued), so a write that fails over-counts by at
+        most one chunk."""
         for i in range(0, len(data), UPLOAD_CHUNK):
-            await upstream_send(up, h11_bytes(hconn, h11.Data(data=data[i:i + UPLOAD_CHUNK])))
+            piece = data[i:i + UPLOAD_CHUNK]
+            rec["bytes_up"] += len(piece)
+            await upstream_send(up, h11_bytes(hconn, h11.Data(data=piece)))
         tail = h11_bytes(hconn, h11.EndOfMessage())   # nothing for a content-length body; kept for the framing's sake
         if tail:
             await upstream_send(up, tail)
-        rec["bytes_up"] = len(data)
 
     async def _token_state(self, conn: Conn, token: str) -> Optional[dict]:
         """`{"answer": {"session", "claims"}}`, `{"refused": name}`, or None for a stale exchange (no answer). A
