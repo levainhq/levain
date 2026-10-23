@@ -135,7 +135,7 @@ def root_file(live: Live, path: Path, *, check: Optional[Callable[[bytes], bool]
     if check is not None:
         try:
             with open(p, "rb") as fh:
-                data = fh.read(1 << 16)
+                data = fh.read(1 << 16)    # ``check`` sees only the first 64 KiB: a header test, never a whole-file digest
         except OSError as e:
             raise ReadFailed(f"cannot read {path}: {e.strerror or e}") from None
         if not check(data):

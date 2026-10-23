@@ -7,6 +7,7 @@ Runtime helper: two NOPASSWD rules, the operator's (every verb) and ``_levain_di
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -89,17 +90,47 @@ def dropin_state(name: str, live: "Live") -> str:
     return root_file(live, _SUDOERS_DIR / name, check=_is_ours)
 
 
-def config_check_step(host: HostOS, why: str, *, live: "Live", refusal: str) -> Step:
+def config_check_step(host: HostOS, why: str, *, live: "Live", refusal: str, remedy: bool = False) -> Step:
     """``visudo -c`` of the whole sudoers config as its own step. ``refusal`` leads the failure text: what the run has
-    and has not done when the config does not parse."""
+    and has not done when the config does not parse. ``remedy``: the failure text also names each drop-in Levain
+    wrote (:func:`dropin_state` OURS) that visudo flagged, with the command that removes it (L3 r2 complement LOW 2:
+    undo's preflight cannot get past its own broken drop-in, so the operator is given the command)."""
     from levain.slot.removal import RemoveStep
 
     check = (_visudo(host)[0], "-c")
 
     def go() -> tuple[bool, str]:
-        ok, out = live.act(check)
-        return (True, "") if ok else (False, f"{refusal}: {out}")
+        rc, out, err = live.out(check)
+        if rc == 0:
+            return True, ""
+        text = f"{refusal}: {' '.join(check)} exited {rc}: {(err or out).strip()[:200]}"
+        fixes = [f"{_SUDOERS_DIR / n} (remove it: sudo {_rm(host)} -f {_SUDOERS_DIR / n})"
+                 for n in (_flagged_dropins(f"{out}\n{err}") if remedy else ()) if _written_by_us(n, live)]
+        return False, text + (f"; Levain's own drop-ins visudo flagged: {', '.join(fixes)}" if fixes else "")
     return RemoveStep(why, call=go, tools=(check[0],))
+
+
+def _written_by_us(name: str, live: "Live") -> bool:
+    from levain.slot.removal import OURS, ReadFailed
+
+    try:
+        return dropin_state(name, live) == OURS
+    except ReadFailed:            # unreadable: not named, the visudo text above still is
+        return False
+
+
+def _flagged_dropins(text: str) -> list[str]:
+    """The drop-in names ``visudo -c`` output names on a line that is not its ``parsed OK`` report, in order."""
+    pat = re.compile(re.escape(str(_SUDOERS_DIR)) + r"/([^\s:<>,]+)")
+    names: list[str] = []
+    for line in text.splitlines():
+        if "parsed OK" not in line:
+            names += [n for n in pat.findall(line) if _NAME.fullmatch(n) and n not in names]
+    return names
+
+
+#: A drop-in name sudo reads (no "." and no trailing "~", see :data:`RUNTIME_SUDOERS`).
+_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 
 def remove_dropin_steps(host: HostOS, name: str, *, live: "Live") -> list[Step]:

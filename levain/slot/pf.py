@@ -21,10 +21,10 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Mapping
 
-from levain.firing.hands import Step
+from levain.firing.hands import _RETIRED_IDS as _HANDS_RETIRED_IDS, Step
 from levain.launch import child_env
 from levain.slot import Refused, write_all
-from levain.slot.ids import SlotId, in_own_range, loopback_alias
+from levain.slot.ids import RETIRED_IDS_PATH, SlotId, in_own_range, loopback_alias
 
 if TYPE_CHECKING:
     from levain.slot.removal import Live
@@ -43,9 +43,12 @@ _TOKEN_RE = re.compile(r"Token\s*:\s*([0-9]{1,20})")
 #: The first line of every rules file :func:`anchor_text` writes starts with this (every version since S1:
 #: ``git log -S`` on it in this file); :func:`anchor_state` reads the file as Levain's only then.
 ANCHOR_HEADER = "# Levain session slots"
-#: What :func:`_write_token` writes and :func:`_read_token` accepts (stripped): :func:`enable_state` reads a recorded
-#: token path as Levain's only when it holds this.
-_TOKEN_BYTES = re.compile(rb"[0-9]{1,20}")
+#: What :func:`_write_token` writes, exactly one line of it (the unstripped bytes): :func:`enable_state` reads a
+#: recorded token path as Levain's only when it holds this.
+_TOKEN_BYTES = re.compile(rb"[0-9]{1,20}\n?")
+#: Levain's own one-id-per-line files inside ``pf-enable/1``'s bound: a single id there is a token's bytes, so these
+#: paths are never a token (L3 r2 complement LOW 1).
+_NOT_TOKENS = frozenset(RETIRED_IDS_PATH.values()) | frozenset(_HANDS_RETIRED_IDS.values())
 
 
 def gwport(slot: SlotId) -> int:
@@ -338,10 +341,12 @@ def remove_anchor_steps(anchor: str, file: str, *, live: "Live") -> list[Step]:
 def enable_state(token: str, live: "Live") -> str:
     """OURS: a regular root file holding a pf token (:data:`_TOKEN_BYTES`). Anything else at the recorded path is
     NOT_OURS and left: the bound admits every name under ``/var/db/levain``, the retired-ids file's included, and
-    :func:`release_enable_reference` removes a file that holds no token."""
-    from levain.slot.removal import root_file
+    :func:`release_enable_reference` removes a file that holds no token. One of Levain's id files
+    (:data:`_NOT_TOKENS`) is never a token, whatever it holds."""
+    from levain.slot.removal import ABSENT, NOT_OURS, root_file
 
-    return root_file(live, Path(token), check=lambda b: _TOKEN_BYTES.fullmatch(b.strip()) is not None)
+    state = root_file(live, Path(token), check=lambda b: _TOKEN_BYTES.fullmatch(b) is not None)
+    return NOT_OURS if state != ABSENT and Path(token) in _NOT_TOKENS else state
 
 
 def remove_enable_steps(token: str, *, live: "Live") -> list[Step]:

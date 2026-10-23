@@ -43,7 +43,7 @@ from levain.slot import runtime_helper as RH
 from levain.slot import store_verbs as SV
 from levain.slot.root_intent import PhaseFailed
 from levain.slot.intent import (INTENT_PATH, Intent, install_lock, intent_remove_step, intent_text, intent_write_step,
-                                read_intent, write_intent_atomically)
+                                parse_intent, read_intent, write_intent_atomically)
 from levain.slot.accounts import (SLOT_MARKER, SLOT_RETIRED_MARKER, Account, Group, account_steps, accounts_of,
                                   membership_pairs, membership_steps, revive_steps,
                                   shared_group_steps, shared_groups_of, member_state, group_state,
@@ -109,6 +109,9 @@ class HostFacts:
     live_sessions: tuple[str, ...] = ()
     #: ``L/policy/install-shape`` parsed (row 33), or None: a host set up before it, or never set up.
     install_shape: gen_mod.InstallShape | None = None
+    #: Every user on the host, name -> uid, whatever its label: undo reads whether a recorded account is absent and
+    #: whether another account holds its uid (L3 r2 codex HIGH).
+    user_ids: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -772,6 +775,37 @@ def _undo_journal_step(host: HostOS, intent: Intent, live: RM.Live) -> Step:
                 call=lambda: write_intent_atomically(path, text))
 
 
+def _check_journal_reads_back(host: HostOS, intent: Intent) -> None:
+    """L3 r2 codex MED: undo's journal unions three sets, each within :data:`generation.MAX_MANAGED`, so the union can
+    exceed what :func:`read_intent` accepts. It is parsed back by that reader's own rules (its byte cap, then
+    :func:`parse_intent`) before step one; one that does not read back as itself refuses ``undo-journal-unreadable``
+    with nothing removed, never written to strand the re-run."""
+    data = intent_text(intent).encode()
+    try:
+        if len(data) > gen_mod.MAX_RECORD_BYTES:
+            raise Refused("record-too-large", f"{len(data)} bytes, over {gen_mod.MAX_RECORD_BYTES}")
+        same = parse_intent(data, host) == intent
+    except Refused as e:
+        raise Refused("undo-journal-unreadable", f"undo's journal of {len(intent.managed)} records would not read "
+                                                 f"back ({e.name}: {e.detail}); undo has removed nothing") from None
+    if not same:
+        raise Refused("undo-journal-unreadable", "undo's journal does not read back as written; undo has removed "
+                                                 "nothing")
+
+
+def _uid_is_undos(facts: HostFacts, accounts: Mapping[str, int], name: str, uid: int) -> bool:
+    """Whether undo retires a recorded account's ``uid``: the account is Levain's at that uid (live, journal-present, or
+    our tombstone there) or ABSENT (deleted by hand, say, while files it owned remain: the uid must never be reissued;
+    L3 r2 codex HIGH). Left: the name present at another uid or under a foreign label, or the name absent and another
+    account at the uid (FIX1 L1)."""
+    if name in accounts:
+        return accounts[name] == uid
+    have = facts.user_ids.get(name)
+    if have is not None:
+        return have == uid and facts.levain_tombstones.get(name) == uid
+    return uid not in facts.user_ids.values()
+
+
 def _undo_unit_order(host: HostOS, names: Iterable[str]) -> list[str]:
     """Undo stops units in reverse start order: a recorded name this code does not ship first (sorted), then the
     shipped ones in reverse of :data:`units.SERVICES`."""
@@ -855,6 +889,7 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
                          {n: i for n, i in accounts.items() if in_own_range(host, n, i)},
                          {g: i for g, i in groups.items() if i in RANGES[host].shared}, txn, None,
                          _shape_of(r for r in every if _in_bound(host, r, operator)))
+    _check_journal_reads_back(host, undo_intent)
     live = live if live is not None else RM.Live()
     end = end or (lambda uid, name: _end_processes(host, uid, name))
 
@@ -869,9 +904,8 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
     grants = sorted((r for r in of("sudoers/1") if r != install_rule), key=lambda r: (r[1] != RUNTIME_SUDOERS.name, r[1]))
     unit_recs = [("unit/1", n) for n in _undo_unit_order(host, (i for _, i in of("unit/1")))]
     uids = {i[0]: i[1] for _, i in of("account/1")}
-    # L1: only the uids of accounts this run removes (ours: live, or journal-present, at the recorded uid). A recorded
-    # name present at another uid is left in place, and so is its id.
-    retired_after = frozenset(facts.retired) | frozenset(u for n, u in uids.items() if accounts.get(n) == u)
+    retired_after = frozenset(facts.retired) | frozenset(u for n, u in uids.items()
+                                                         if _uid_is_undos(facts, accounts, n, u))
     path = RETIRED_IDS_PATH[host]
     mkdir = "/bin/mkdir" if host == "darwin" else _abs("mkdir")
     rm = "/bin/rm" if host == "darwin" else _abs("rm")
@@ -880,7 +914,7 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         # removal would otherwise stop undo part-way).
         config_check_step(host, "check the sudoers config with visudo -c before undo removes anything", live=live,
                           refusal="the sudoers config does not parse: undo has removed nothing; fix what visudo "
-                                  "names, then run undo again"),
+                                  "names, then run undo again", remedy=True),
         _undo_journal_step(host, undo_intent, live),
         *remove(grants, "R5"),                      # the runtime rule first: no new runtime-helper calls
         *remove(unit_recs, "R5"),                   # every unit stopped before anything is removed
@@ -1790,7 +1824,8 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
         live_leases=len(leased), live_sessions=leased,
         used_ids=frozenset(d.users.values()) | frozenset(d.groups.values()),
         existing_names=frozenset(d.users) | frozenset(d.groups), retired=read_retired_ids(retired_path),
-        levain_tombstones=tombs, levain_live=live, intent=journal, host_ids=host_ids, install_shape=shape)
+        levain_tombstones=tombs, levain_live=live, intent=journal, host_ids=host_ids, install_shape=shape,
+        user_ids=dict(d.users))
     if cmd.verb == "repair":
         repair = _repair_facts(cmd, host, d, accounts, in_service or {}, skips=skips)
         return Gathered(facts, accounts, quiesce=q, repair=repair)

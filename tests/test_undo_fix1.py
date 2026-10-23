@@ -9,7 +9,7 @@
 * M2: undo journals what it will remove before its first removal, and a re-run after a crash plans from that journal
   (the slot confinement a pre-row-33 install derived from live accounts survives their tombstones).
 * M3: a FINISHED repair journal's records are not undo's to read (check_records' rule), an unknown kind there included.
-* L1: undo retires only the uids of the accounts it removes (ours: live at the recorded uid).
+* L1: undo retires no uid another account may hold (FIX2 widened it: an ABSENT recorded account's uid is retired).
 * L2: ``desired_managed`` drops a group with no gid only when undo asks; every other caller still raises.
 """
 from __future__ import annotations
@@ -250,8 +250,10 @@ def test_undo_retires_no_uid_of_an_account_it_leaves(tmp_path: Path) -> None:
     s5 = S0 - 5                                                  # in the slot range (account/1's bound)
     assert s5 in RANGES["darwin"].slots
     h.users["_levain_s5"] = [s5 - 100, "someone else's"]         # the recorded name, live at another uid: NOT_OURS
+    # FIX2: the facts report every user as gather does (HostFacts.user_ids); an ABSENT recorded account is retired
     plan = IH.plan_undo(parse_install_argv(["undo"]),
-                        _facts("darwin", _shape(("account/1", ("_levain_s5", s5)))),
+                        replace(_facts("darwin", _shape(("account/1", ("_levain_s5", s5)))),
+                                user_ids={n: v[0] for n, v in h.users.items()}),
                         accounts={"_levain_s0": S0}, shared_groups=shared, live=live, end=lambda u, n: (True, ""))
     assert S0 in plan.retired_after and s5 not in plan.retired_after
 
