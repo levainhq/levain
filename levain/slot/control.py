@@ -24,8 +24,10 @@ Session 2 builds the operator verbs (``LEASE-OPEN``, ``STATUS``) and root's (``A
 admin wire (:class:`KeysAdmin`, §4.9: ``FRONT-REGISTER`` fenced by the per-``front_uid`` registration counter in
 ``L/sessions/front-reg/``, ``FRONT-ARM``, ``DROP-SESSION``); S1 session 3c-3 keys' long-lived ``KEYS-ATTACH``
 connection and the verbs it carries (``FRONT-LOST``, ``SPEND-OVERRUN``, ``SESSIONS``: §4.5, 3c design r3 §2.1 (e),
-R4 §1.4), whose EOF revokes every egress-class session, and :func:`serve`, the program's one entry. Root's
-``SLOT-SYNC``, keys' ``LINEAGE-APPEND`` and every dispatch verb (§3.3, §3.5, §3.6) are later 3c sessions': until then
+R4 §1.4), whose EOF revokes every egress-class session, and :func:`serve`, the program's one entry; S1 3c-4 the
+``_levain_dispatch`` peer's ``ROUTE-SUBMIT`` (§4.3, 3c design r3 §2.3 as R4 §2 amends it: :mod:`levain.slot.routemaps`),
+its start pass and the RELOADs to keys, each under the one activation lock. Root's ``SLOT-SYNC``, keys'
+``LINEAGE-APPEND`` and the other dispatch verbs (§3.3, §3.5, §3.6) are later 3c sessions': until then
 every other peer, and every other verb of a known one, is refused ``verb-not-allowed-for-peer`` (see
 :data:`PEER_VERBS`). Every act on keys and the reaper wake are seams: :class:`KeysAdmin` supplies the keys ones when
 CONTROL is given one.
@@ -55,6 +57,7 @@ from levain.broker.stub import peer_uid as kernel_peer_uid
 from levain.contracts import ContractError, canon
 from levain.slot import Refused
 from levain.slot import records as R
+from levain.slot import routemaps
 from levain.slot.layout import STORE, session_repo
 from levain.slot.runtime_grammar import HANDLE_BYTES, _handle, _keys
 
@@ -65,14 +68,15 @@ _LEN = struct.Struct(">I")
 ROOT_UID = 0
 
 #: §3.3's verbs per peer, as built so far. Later 3c sessions add root's ``SLOT-SYNC``, keys' ``LINEAGE-APPEND`` and
-#: the ``_levain_dispatch`` row (a peer kind that :meth:`Control.peer_kind` learns from its uid); until then that peer
-#: is ``foreign``. keys' ``FRONT-LOST`` / ``SPEND-OVERRUN`` / ``SESSIONS`` are answered only on the connection that
+#: the rest of the ``_levain_dispatch`` row (3c-4 builds its ``ROUTE-SUBMIT``; the peer is ``dispatch`` when
+#: :meth:`Control.peer_kind` is given its uid, else ``foreign``). keys' ``FRONT-LOST`` / ``SPEND-OVERRUN`` / ``SESSIONS`` are answered only on the connection that
 #: holds the current ``KEYS-ATTACH`` (else ``not-attached``).
 PEER_VERBS: Mapping[str, frozenset[str]] = {
     "operator": frozenset({"LEASE-OPEN", "STATUS"}),
     "root": frozenset({"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET"}),
     "qbroker": frozenset({"QUEUE-RESOLVE"}),
     "keys": frozenset({"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS"}),
+    "dispatch": frozenset({"ROUTE-SUBMIT"}),
     "foreign": frozenset(),
 }
 
@@ -93,6 +97,7 @@ _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "FRONT-LOST": (frozenset({"session"}),) * 2,
     "SPEND-OVERRUN": (frozenset({"session", "route", "model", "ref", "overrun", "unproven"}),) * 2,
     "SESSIONS": (frozenset({"digests"}),) * 2,
+    "ROUTE-SUBMIT": (frozenset({"map", "sig"}),) * 2,
 }
 
 #: KEYS-ATTACH's ``item_sha256``: the hex SHA-256 of the route-map item keys loaded (3c design R4 §2).
@@ -732,7 +737,10 @@ class Control:
     None`` (the run a dispatch session's bound ticket names; session 3c's ticket records supply it, and the default
     knows none, so a dispatch session's ``QUEUE-RESOLVE`` is refused ``run-unknown``) · ``host`` (whose store
     ``repo_root`` names) · ``routemap_head() -> {generation, item_sha256} | None`` (CONTROL's active dispatch route-map
-    head, R4 §2; 3c-4 supplies it, and the default ``None`` sends no attach-time ``RELOAD``)."""
+    head, R4 §2; ``routes`` supplies it when given, else the default ``None`` sends no attach-time ``RELOAD``) ·
+    ``routes`` (a :class:`levain.slot.routemaps.ControlRoutes`: ``ROUTE-SUBMIT``, the start pass, and THE activation
+    lock every RELOAD to keys is sent under; ``None``: ``ROUTE-SUBMIT`` refused ``routemap-verifier``) · ``dispatch_uid``
+    (the ``_levain_dispatch`` peer; ``None``: no peer is dispatch)."""
 
     def __init__(self, store: StateStore, operator_uid: int, *,
                  qbroker_uid: int | None = None,
@@ -749,7 +757,9 @@ class Control:
                  clock: Callable[[], float] = time.time,
                  monotonic: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
-                 routemap_head: Callable[[], Mapping[str, object] | None] = lambda: None) -> None:
+                 routemap_head: Callable[[], Mapping[str, object] | None] | None = None,
+                 routes: routemaps.ControlRoutes | None = None,
+                 dispatch_uid: int | None = None) -> None:
         if type(operator_uid) is not int or operator_uid <= ROOT_UID:
             raise Refused("bad-config", f"operator uid {operator_uid!r}")
         if qbroker_uid is not None and (type(qbroker_uid) is not int or qbroker_uid <= ROOT_UID
@@ -758,6 +768,9 @@ class Control:
         if keys_uid is not None and (type(keys_uid) is not int or keys_uid <= ROOT_UID
                                      or keys_uid in (operator_uid, qbroker_uid)):
             raise Refused("bad-config", f"keys uid {keys_uid!r}")
+        if dispatch_uid is not None and (type(dispatch_uid) is not int or dispatch_uid <= ROOT_UID
+                                         or dispatch_uid in (operator_uid, qbroker_uid, keys_uid)):
+            raise Refused("bad-config", f"dispatch uid {dispatch_uid!r}")
         if type(host) is not str or host not in STORE:
             raise Refused("bad-config", f"host {host!r}")
         if keys_admin is not None:
@@ -800,7 +813,14 @@ class Control:
         store.on_settle = self._on_settle
         #: Exceptions a seam raised after a revoke landed (the revoke itself is durable by then).
         self.seam_errors: list[tuple[str, str, BaseException]] = []
+        self.routes = routes
+        self.dispatch_uid = dispatch_uid
+        if routemap_head is None:
+            routemap_head = routes.head if routes is not None else (lambda: None)
         self._routemap_head = routemap_head
+        #: THE activation lock (R4 §2): the routes' own, so ROUTE-SUBMIT, the start pass and every RELOAD to keys (the
+        #: attach-time one included) are one order
+        self._activation = routes.lock if routes is not None else threading.Lock()
         #: keys' current attachment (the connection whose KEYS-ATTACH was answered last and has not ended), its number,
         #: and what keys stated (and, after an attach-time RELOAD, acked) it serves on THAT attachment (R4 §2).
         self._attach: Conn | None = None
@@ -822,6 +842,8 @@ class Control:
             return "qbroker"
         if uid is not None and uid == self.keys_uid:
             return "keys"
+        if uid is not None and uid == self.dispatch_uid:
+            return "dispatch"
         return "foreign"
 
     # -- start pass (§1 CONTROL row, §1.3) ---------------------------------------------------------------
@@ -835,7 +857,12 @@ class Control:
         CONTROL that died between the REVOKED write and the drop, or whose drop never got an ack, owes it
         still. Then one reaper wake. The split keys off the STATE alone: a record past live that still says
         ``lease_live:true`` (CONTROL died between a CAS into REVOKED and its after-acts) has the flag cleared,
-        then its drop and the wake like every other record past live."""
+        then its drop and the wake like every other record past live.
+
+        The route maps' start pass runs first (:meth:`levain.slot.routemaps.ControlRoutes.start_pass`: an interrupted
+        activation finished, under the activation lock); keys is sent the head by the attach-time ``RELOAD``."""
+        if self.routes is not None:
+            self.routes.start_pass()
         self.store.load()
         past = False
         for rec in sorted(self.store.all(), key=lambda r: r.session):
@@ -1660,29 +1687,52 @@ class Control:
                     pass
         head = self._routemap_head()
         if head is not None and dict(head) != serves:
-            want = dict(head)
-            conn.after.append(lambda: self._spawn(lambda _s: self._attach_reload(no, want), "",
+            conn.after.append(lambda: self._spawn(lambda _s: self._attach_reload(no), "",
                                                   name=f"control-attach-reload-{no}"))
         return {"attach": no}
 
-    def _attach_reload(self, no: int, head: dict[str, object]) -> None:
-        """The attach-time ``RELOAD`` of CONTROL's head (R4 §2), on keys' admin wire, for attachment ``no`` only. keys'
-        acked generation is what keys serves on that attachment from then on; a refusal is noted, and keys keeps
-        serving what it stated."""
-        with self._mu:
-            if self._attach is None or self._attach.attach_no != no:
-                return
+    def _attach_reload(self, no: int) -> None:
+        """The attach-time ``RELOAD`` of CONTROL's head (R4 §2), for attachment ``no`` only, under the activation lock:
+        the head is read again inside it (a ROUTE-SUBMIT may have moved it since the attach), and nothing is sent when
+        keys already serves it."""
+        with self._activation:
+            with self._mu:
+                if self._attach is None or self._attach.attach_no != no:
+                    return
+                serves = self._keys_serves
+            head = self._routemap_head()
+            if head is not None and dict(head) != serves:
+                self._reload_keys(head)
+
+    def _reload_keys(self, head: Mapping[str, object]) -> None:
+        """``RELOAD {generation, item_sha256}`` of ``head`` on keys' admin wire; the caller holds the activation lock.
+        keys' ack is recorded as what keys serves on the attachment that was current when it was sent, if that is
+        still the current one (a newer attachment states its own); a refusal is noted, and keys then refuses every
+        dispatch route until a valid RELOAD."""
         if self.keys_admin is None:
             return
+        want = {"generation": head["generation"], "item_sha256": head["item_sha256"]}
+        with self._mu:
+            no = None if self._attach is None else self._attach.attach_no
         try:
-            got = self.keys_admin.call("RELOAD", generation=head["generation"])
+            got = self.keys_admin.call("RELOAD", **want)
         except Refused as e:
             self.seam_errors.append(("reload", "", e))
             return
         with self._mu:
-            if (self._attach is not None and self._attach.attach_no == no
-                    and got.get("generation") == head["generation"]):
-                self._keys_serves = dict(head)
+            if (no is not None and self._attach is not None and self._attach.attach_no == no
+                    and got.get("generation") == want["generation"] and got.get("item_sha256") == want["item_sha256"]):
+                self._keys_serves = want
+
+    # -- dispatch's route maps (§4.3; 3c design r3 §2.3, R4 §2) ------------------------------------------------
+
+    def _op_route_submit(self, conn: Conn, args: dict) -> dict[str, object]:
+        """``ROUTE-SUBMIT {map, sig}`` -> ``{generation}``: :meth:`levain.slot.routemaps.ControlRoutes.submit` under the
+        activation lock, whose RELOAD to keys is :meth:`_reload_keys`. The answer is CONTROL's activation (its head and
+        ``current`` durable); keys' ack is what a mint checks (3c-5), never this answer."""
+        if self.routes is None:
+            raise Refused("routemap-verifier", "CONTROL holds no route store")
+        return {"generation": self.routes.submit(args["map"], args["sig"], self._reload_keys)}
 
     def keys_attach_eof(self, conn: Conn) -> None:
         """The attachment's connection ended (:class:`ControlServer`): §4.5's "either EOF at CONTROL", unless a newer
@@ -1972,6 +2022,9 @@ class ServeConfig:
     keys_admin_path: Path | None = None
     keys_uid: int | None = None
     qbroker_uid: int | None = None
+    #: ``L/routes`` (trust, base map, the dispatch route maps) and the ``_levain_dispatch`` peer: S1 3c-4
+    routes_dir: Path | None = None
+    dispatch_uid: int | None = None
     host: str = "darwin" if sys.platform == "darwin" else "linux"
     peer_uid: Callable[[socket.socket], int | None] | None = None
     ready: Callable[[ControlServer], object] | None = None
@@ -1985,8 +2038,9 @@ def serve(config: ServeConfig) -> int:
     revoke: the next start revokes them). Returns 0."""
     store = StateStore(Path(config.store_dir))
     admin = KeysAdmin(config.keys_admin_path) if config.keys_admin_path is not None else None
+    routes = routemaps.ControlRoutes(Path(config.routes_dir)) if config.routes_dir is not None else None
     control = Control(store, config.operator_uid, qbroker_uid=config.qbroker_uid, keys_uid=config.keys_uid,
-                      keys_admin=admin, host=config.host)
+                      keys_admin=admin, host=config.host, routes=routes, dispatch_uid=config.dispatch_uid)
     if config.peer_uid is not None:
         server = ControlServer(control, Path(config.socket_path), peer_uid=config.peer_uid)
     else:

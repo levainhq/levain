@@ -34,8 +34,10 @@ class ControlThread:
     the socket listens, with `control` the running `Control`. `stop()` sets the config's stop event (a stop is a
     crash, as far as any session can tell: no revoke)."""
 
-    def __init__(self, d: str) -> None:
+    def __init__(self, d: str, routes_dir: Optional[Path] = None, dispatch_uid: Optional[int] = None) -> None:
         self.d = d
+        #: S1 3c-4: CONTROL's `L/routes` and the `_levain_dispatch` peer uid (None: no route store, no dispatch peer)
+        self.routes_dir, self.dispatch_uid = routes_dir, dispatch_uid
         self.socket_path = os.path.join(d, "control.sock")
         os.makedirs(os.path.join(d, "sessions"), mode=0o700, exist_ok=True)
         self.stop_event = threading.Event()
@@ -57,7 +59,7 @@ class ControlThread:
         cfg = C.ServeConfig(store_dir=Path(self.d) / "sessions", socket_path=Path(self.socket_path),
                             operator_uid=OP_UID, keys_admin_path=Path(self.d) / "keys" / "admin.sock",
                             keys_uid=KEYS_UID, peer_uid=lambda sock: KEYS_UID, ready=self._ready_cb,
-                            stop=self.stop_event)
+                            stop=self.stop_event, routes_dir=self.routes_dir, dispatch_uid=self.dispatch_uid)
 
         def run() -> None:
             self._rc.append(C.serve(cfg))
