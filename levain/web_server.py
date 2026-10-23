@@ -117,7 +117,7 @@ from levain.cockpit.verbs import (SERVED_VERBS_NAME, VerbRegistry, VerbSpec, Ver
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
 from levain.http_guards import _WRITE_SEC_FETCH_ALLOWED as _SAME_ORIGIN, GuardedHandler
-from levain.http_guards import host_header_allowed  # noqa: F401 — kept importable from its pre-2026-10-03 home
+from levain.http_guards import host_header_allowed  # the off-box read gate; importable here since before 2026-10-03
 from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
     MAX_BODY_BYTES,
@@ -726,6 +726,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # surface's token: minted on a writable server given no tokens at all, None when the caller's
     # ``surface_tokens`` name no browser surface, and None on a read-only server.
     is_loopback_bind: bool
+    # the make_server extra_hosts: a request whose Host names one came through a proxy on this machine (from
+    # loopback, so is_loopback_bind cannot see it) and meets the off-box read gate (DESIGN_SIGN D3, head 1023+21)
+    proxied_hosts: frozenset[str]
     write_token: str | None
     # K2a (design §4.3, §9): one write token per surface (``browser``, ``flowconnect``), required on
     # EVERY bind for every write, since 127.0.0.1 is reachable by every local uid. Name -> token.
@@ -866,14 +869,17 @@ class _Handler(GuardedHandler):
     server: _LevainHTTPServer  # narrow the type for typed attribute access
 
     def _write_token_required(self) -> bool:
-        """True iff this surface is writable AND bound off-loopback: the off-box half of the token
+        """True iff this surface is writable AND the request is off-box (an off-loopback bind, or a Host
+        naming an ``extra_hosts`` entry): the off-box half of the token
         rule, which gates the substrate-bearing READS (spore-220) and every non-write POST
         (spore-129). Writes are gated by ``_writes_need_credential`` on every bind (K2a); the
         frontend's ``write_token_required`` signal is the OR of the two. Loopback-bound or
         read-only → False (a read-only mesh bind stays token-free — iPad/iPhone VIEWING is
-        unauthenticated by design)."""
+        unauthenticated by design). A request whose Host names an ``extra_hosts`` entry is off-box
+        whatever the bind: a proxy on this machine delivers it from loopback (head 1023+21)."""
         return (
-            not self.server.is_loopback_bind
+            (not self.server.is_loopback_bind
+             or host_header_allowed(self.headers.get("Host"), self.server.proxied_hosts))
             and self.server.levain_source.write_scope is not None
         )
 
@@ -1792,8 +1798,9 @@ def make_server(
     ``extra_hosts`` names Host values the gate admits beside loopback and the bound address: the https name a
     reverse proxy on this machine forwards (tailscale serve passes the browser's ``Host`` through, port included).
     Each is a bare ``name`` (a port in an entry is refused); the gate compares names only, so a request Host of
-    ``name:8443`` is admitted. Anything else is a ``ValueError`` before binding. It changes no bind rule and no
-    token rule."""
+    ``name:8443`` is admitted. Anything else is a ``ValueError`` before binding. It changes no bind rule. A
+    request whose Host names one is OFF-BOX for the read gate: the substrate reads need the token exactly as on an
+    off-box bind, since the proxy delivers every tailnet request from loopback."""
     # Wildcard / public binds are refused for ANY source — a non-loopback bind is for
     # ONE specific private/mesh interface, never every interface or the internet.
     reason = _rejected_bind_host(host)
@@ -2123,6 +2130,7 @@ def make_server(
     # Allow the loopback names + the exact bound address (covers a 127.0.0.x bind) + the caller's extra_hosts,
     # normalized lowercase to match the Host check; any other Host is refused.
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()} | proxied_hosts
+    httpd.proxied_hosts = proxied_hosts
     # Bound the expensive routes (store read + writes). Cockpit GET reads wait briefly for a read-pool slot (see
     # _acquire_read_slot) and leave _RESERVED_SLOTS free; every other gated route answers 503 past the cap.
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)

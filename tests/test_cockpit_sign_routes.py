@@ -348,6 +348,29 @@ def test_an_extra_host_relaxes_no_off_box_bind_rule(tmp_path: Path) -> None:
         make_server(src, host="100.64.0.7", port=0, write_token=TOK, extra_hosts=[RP])
 
 
+def test_a_request_through_an_extra_host_is_off_box_for_the_read_gate(tmp_path: Path) -> None:
+    """A proxy on this machine (tailscale serve) delivers every tailnet node's request from 127.0.0.1, so the bound
+    address cannot tell them from a local one; the Host can. A request naming an extra host meets the off-box read
+    gate exactly as an off-box bind does: no token, no substrate, manifest or panel. The same server still serves
+    them token-free to a loopback Host, and the app shell stays token-free to both."""
+    name = "missinglayer.tail1c8687.ts.net"
+    with _serving(tmp_path, extra_hosts=[name]) as (url, httpd):
+        assert httpd.is_loopback_bind
+        st, manifest = _call(url, "/cockpit/manifest.json", token=None, host="127.0.0.1")
+        assert st == 200, manifest
+        panel = "/cockpit/panel/" + next(iter(manifest["panels"])) + ".json"
+        for path in ("/substrate.json", "/cockpit/manifest.json", panel):
+            assert _call(url, path, token=None, host="127.0.0.1")[0] == 200, path
+            for host in (name, f"{name}:8443", f"{name.upper()}.:8443"):
+                st, body = _call(url, path, token=None, host=host)
+                assert st == 403 and "token" in body["message"], (path, host, st)
+                assert _call(url, path, token="wrong", host=host)[0] == 403, (path, host)
+                assert _call(url, path, host=host)[0] == 200, (path, host)
+        assert _call(url, "/", token=None, host=name)[0] == 200
+        st, sub = _call(url, "/substrate.json", host=name)
+        assert sub["write_token_required"] is True           # the page keeps sending the token through the proxy
+
+
 def test_a_signer_without_a_valid_page_origin_is_refused_before_binding(tmp_path: Path) -> None:
     pk = _Passkey()
     for origin in (None, f"http://{RP}:8443", "https://other.example:8443", f"https://{RP}:8443/"):
