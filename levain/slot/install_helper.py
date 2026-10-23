@@ -46,7 +46,7 @@ from levain.slot.intent import (INTENT_PATH, Intent, install_lock, intent_remove
                                 parse_intent, read_intent, write_intent_atomically)
 from levain.slot.accounts import (SLOT_MARKER, SLOT_RETIRED_MARKER, Account, Group, account_steps, accounts_of,
                                   membership_pairs, membership_steps, revive_steps,
-                                  shared_group_steps, shared_groups_of, member_state, group_state,
+                                  shared_group_steps, shared_groups_of, member_state, group_state, uid_retires,
                                   account_state, remove_member_steps, remove_group_steps, remove_account_steps)
 from levain.slot.grammar import LEASE_EXEMPT, SESSION_RE, VERBS, InstallCommand, check_roots, parse_install_argv
 from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS, SLOT_NAME_RE, Allocation,
@@ -794,16 +794,10 @@ def _check_journal_reads_back(host: HostOS, intent: Intent) -> None:
 
 
 def _uid_is_undos(facts: HostFacts, accounts: Mapping[str, int], name: str, uid: int) -> bool:
-    """Whether undo retires a recorded account's ``uid``: the account is Levain's at that uid (live, journal-present, or
-    our tombstone there) or ABSENT (deleted by hand, say, while files it owned remain: the uid must never be reissued;
-    L3 r2 codex HIGH). Left: the name present at another uid or under a foreign label, or the name absent and another
-    account at the uid (FIX1 L1)."""
-    if name in accounts:
-        return accounts[name] == uid
-    have = facts.user_ids.get(name)
-    if have is not None:
-        return have == uid and facts.levain_tombstones.get(name) == uid
-    return uid not in facts.user_ids.values()
+    """Whether undo retires a recorded account's ``uid``: :func:`accounts.uid_retires`, the rule repair's account step
+    also runs (r1b-fix3), over this host's users with Levain's own (``accounts``: live or journal-present; our
+    tombstones)."""
+    return uid_retires(name, uid, users=facts.user_ids, levain={**facts.levain_tombstones, **accounts})
 
 
 def _undo_unit_order(host: HostOS, names: Iterable[str]) -> list[str]:
@@ -919,8 +913,9 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         *remove(grants, "R5"),                      # the runtime rule first: no new runtime-helper calls
         *remove(unit_recs, "R5"),                   # every unit stopped before anything is removed
         *remove(unit_recs, "R12"),                  # then their files
-        # With the services stopped nothing rewrites them: no slot reads as reusable from here on.
-        *slot_state_undo_steps(host, slots_of(uids)),
+        # With the services stopped nothing rewrites them: no slot reads as reusable from here on. The store under
+        # Live.root, as every other act here (the store itself on a host).
+        *slot_state_undo_steps(host, slots_of(uids), store=live.at(STORE[host])),
         *pool_config_undo_steps(host),
         Step(f"create {path.parent}", (mkdir, "-p", "-m", "755", str(path.parent))),
         Step("retire every account id so none is reissued", write=(path, retired_ids_text(retired_after), 0o644)),
