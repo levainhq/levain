@@ -1177,7 +1177,8 @@ def export_domain_prover(host: str, role_key: str, uid: int, *, bound_s: Optiona
     ``cgroup.kill`` + ``populated 0`` (hierarchical, so the run leaf too), then the scope THAWED (``cgroup.freeze``
     0, confirmed by ``frozen 0``; L3 5c-ii-b r1 B-1: a scope left frozen freezes the next run's child as it joins
     the leaf), then the uid sweep by ``end_domain``. A thaw that cannot be confirmed raises
-    ``export-image-unavailable``: the next run could not execute."""
+    ``export-image-unavailable``: the next run could not execute. So does a ``cgroup.events`` read that fails with any
+    errno but ENOENT at the freeze, kill or thaw poll (B-1 class); ENOENT is the scope gone, as everywhere."""
     from levain.slot import proc as P
     bound = P.V12K_SECONDS if bound_s is None else bound_s
 
@@ -1188,10 +1189,23 @@ def export_domain_prover(host: str, role_key: str, uid: int, *, bound_s: Optiona
 
     def prove_linux(children: Sequence[int]) -> object:
         c = P.CgroupProcs(scope_path(role_key), seams)
-        c.freeze(uid, bound * P.FREEZE_SHARE)
-        if not c.kill(uid, bound):
-            return P.Domain(False, "kill-unproven", f"{c.cgroup}: populated is not 0")   # left frozen: refused
-        _thaw_scope(c, bound * P.FREEZE_SHARE)
+        step = "freeze poll"
+        try:
+            c.freeze(uid, bound * P.FREEZE_SHARE)
+            step = "kill poll"
+            if not c.kill(uid, bound):
+                return P.Domain(False, "kill-unproven", f"{c.cgroup}: populated is not 0")   # left frozen: refused
+            step = "thaw poll"
+            _thaw_scope(c, bound * P.FREEZE_SHARE)
+        except OSError as e:
+            # B-1 class (head ruling 1022+19): ONE guard for every read of the scope's state this prover makes. The
+            # cgroup writes in this block never raise OSError here (CgroupProcs._act and _thaw_scope answer each
+            # write's OSError themselves), so what reaches this line is a CgroupProcs.events() read, which has
+            # already turned ENOENT into None ("the scope is gone"). Any other errno means the scope's state
+            # cannot be read, so the domain cannot be proven and the next run cannot execute.
+            # (Derive the reads: grep -n "events()" levain/slot/proc.py; each sits under _poll or no_process.)
+            where = e.filename or f"{c.cgroup}/cgroup.events"
+            raise Refused(UNAVAILABLE, f"{where}: the {step} could not read the scope ({_errname(e)})") from e
         return P.end_domain(uid, bound, children, seams=c.seams)[0]
     return prove_linux
 
@@ -1206,13 +1220,8 @@ def _thaw_scope(c: object, bound_s: float) -> None:
         return
     except OSError as e:
         raise Refused(UNAVAILABLE, f"{path}: the thaw failed ({_errname(e)})") from e
-    try:
-        # None = the scope is gone: CgroupProcs.events() turns FileNotFoundError into None, so every OSError that
-        # reaches here is not ENOENT and the thaw cannot be confirmed (codex L3 r2 B-1).
-        got = c._poll("frozen", "0", bound_s)          # type: ignore[attr-defined]
-    except OSError as e:
-        events = f"{c.cgroup}/cgroup.events"           # type: ignore[attr-defined]
-        raise Refused(UNAVAILABLE, f"{events}: the thaw poll failed ({_errname(e)})") from e
+    # None = the scope is gone. An unreadable cgroup.events here raises OSError to prove_linux's one guard (B-1 class).
+    got = c._poll("frozen", "0", bound_s)              # type: ignore[attr-defined]
     if got is False:
         raise Refused(UNAVAILABLE, f"{path}: written 0, cgroup.events still reads frozen 1")
 

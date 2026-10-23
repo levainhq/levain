@@ -864,19 +864,20 @@ def test_b1_a_thaw_that_cannot_be_confirmed_fails_closed(monkeypatch, fail_thaw,
 
 
 class FsScopeEventsFail(FsScope):
-    """After the thaw write (``cgroup.freeze`` 0), reading ``cgroup.events`` raises ``OSError(read_errno)``."""
+    """After the write ``after`` (default the thaw, ``cgroup.freeze`` 0), reading ``cgroup.events`` raises
+    ``OSError(read_errno)``: so the first read that fails is the poll that write starts."""
 
-    def __init__(self, read_errno):
+    def __init__(self, read_errno, after=("cgroup.freeze", "0")):
         super().__init__()
-        self.read_errno, self.thawed = read_errno, False
+        self.read_errno, self.after, self.armed = read_errno, after, False
 
     def write(self, p, text):
         super().write(p, text)
-        if p == f"{SCOPE}/cgroup.freeze" and text == "0":
-            self.thawed = True
+        if (p.rsplit("/", 1)[1], text) == self.after:
+            self.armed = True
 
     def read(self, p):
-        if self.thawed and p == f"{SCOPE}/cgroup.events":
+        if self.armed and p == f"{SCOPE}/cgroup.events":
             if self.read_errno == errno.ENOENT:
                 raise FileNotFoundError(errno.ENOENT, "absent", p)
             raise OSError(self.read_errno, os.strerror(self.read_errno), p)
@@ -897,6 +898,34 @@ def test_b1_an_unreadable_cgroup_events_during_the_thaw_poll_is_export_image_una
 def test_b1_a_scope_gone_during_the_thaw_poll_still_held_nothing_to_thaw(monkeypatch):
     _sweep_ok(monkeypatch)
     fs = FsScopeEventsFail(errno.ENOENT)
+    assert X.export_domain_prover("linux", "importer", 299, seams=fs.seams())(()) is PROVEN
+
+
+# B-1 CLASS (head ruling 1022+19): every cgroup.events read the Linux prover makes (the freeze, kill and thaw polls,
+# all through CgroupProcs.events) answers a non-ENOENT OSError with export-image-unavailable, behind ONE guard in
+# prove_linux. Red first on 808f2829: ``1022-18/adopt/b1class_failfirst.txt``.
+PROVER_READ_SITES = {"freeze poll": ("cgroup.freeze", "1"), "kill poll": ("cgroup.kill", "1"),
+                     "thaw poll": ("cgroup.freeze", "0")}
+
+
+@pytest.mark.parametrize("read_errno", [errno.EACCES, errno.EIO])
+@pytest.mark.parametrize("site", sorted(PROVER_READ_SITES))
+def test_b1class_an_unreadable_cgroup_events_at_any_prover_read_is_export_image_unavailable(monkeypatch, site,
+                                                                                            read_errno):
+    _sweep_ok(monkeypatch)
+    fs = FsScopeEventsFail(read_errno, after=PROVER_READ_SITES[site])
+    with pytest.raises(Refused) as ei:
+        X.export_domain_prover("linux", "importer", 299, seams=fs.seams())(())
+    assert ei.value.name == "export-image-unavailable"
+    d = ei.value.detail
+    assert "cgroup.events" in d and errno.errorcode[read_errno] in d and site in d
+
+
+@pytest.mark.parametrize("site", sorted(PROVER_READ_SITES))
+def test_b1class_a_scope_gone_at_any_prover_read_still_reads_gone(monkeypatch, site):
+    # ENOENT stays CgroupProcs.events()'s None ("the scope is gone"): the uid sweep answers, never a refusal.
+    _sweep_ok(monkeypatch)
+    fs = FsScopeEventsFail(errno.ENOENT, after=PROVER_READ_SITES[site])
     assert X.export_domain_prover("linux", "importer", 299, seams=fs.seams())(()) is PROVEN
 
 
