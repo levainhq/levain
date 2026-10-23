@@ -2410,7 +2410,9 @@ def adopt_sealed_run(ctx: Ctx, front: AdoptFront, adopt: AdoptSeams, run_seams: 
                     # anything that failed after seal-in: the domain is still killed and proven before the locks go.
                     # L3 r1 M1 / ruling Q5: an unproven seal-out here RAISES export-domain-unproven, which replaces
                     # the pending failure (Python chains that one as its __context__); teardown still runs below and
-                    # leaves the image for the next seal-in.
+                    # leaves the image for the next seal-in. Known edge (L3 r2, codex MED / complement LOW): a pending
+                    # KeyboardInterrupt or SystemExit is replaced the same way, so a signal mid-adopt answers
+                    # export-domain-unproven instead of interrupting; nothing publishes and the helper still exits.
                     run.seal_out(() if (pid is None or reaped[0]) else (pid,))
             finally:
                 at("adopt:teardown")
