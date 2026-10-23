@@ -1451,8 +1451,8 @@ def trampoline_argv(exec_fd: int, argv: Sequence[str]) -> Tuple[str, ...]:
 
 
 def stage_main(spec_fd: int = SPEC_FD, os_calls: Optional[OsCalls] = None, *, err=None) -> int:
-    """The stage, in order: spec -> drop + assert (+ ``RLIMIT_NPROC``, + ``no_new_privs`` on Linux) -> the env
-    file -> the profile guard -> cwd -> the target's path -> the fd allowlist -> exec (macOS slot targets:
+    """The stage, in order: spec -> session keyring (Linux export) -> drop + assert (+ ``RLIMIT_NPROC``, +
+    ``no_new_privs`` on Linux) -> the env file -> the profile guard -> cwd -> the target's path -> the fd allowlist -> exec (macOS slot targets:
     ``sandbox-exec -f <profile>``). The vendor's exec marker (:data:`EXEC_FD`): with no profile the stage is the
     last hop, so it writes :data:`EXEC_OK` just before the execve; under a profile the trampoline writes it, so
     ``+`` means the profile applied. Returns :data:`STAGE_EXIT` on any refusal or error, having exec'd nothing
@@ -1463,8 +1463,8 @@ def stage_main(spec_fd: int = SPEC_FD, os_calls: Optional[OsCalls] = None, *, er
         spec = parse_spec(c.read_fd(spec_fd, SPEC_CAP))
         if spec.target in EXPORT_TARGETS and sys.platform.startswith("linux"):
             # s5 §5b A6 (head ruling 1022+19 Q2): a fresh session keyring, joined while still root and proved,
-            # between the spec and the drop (a step the docstring's order list does not name yet: one wall hunk). The real keyctl only on the real path (no os_calls); an injected OsCalls carries its
-            # own ``keyctl`` or the join refuses: no path skips it.
+            # between the spec and the drop. The real keyctl only on the real path (no os_calls); an injected
+            # OsCalls carries its own ``keyctl`` or the join refuses: no path skips it.
             from levain.slot.keyring_join import join_session_keyring, real_keyctl
             join_session_keyring(real_keyctl if os_calls is None else getattr(c, "keyctl", None))
         drop_and_assert(spec.uid, spec.gid, spec.groups, nproc=spec.nproc, os_calls=c,
