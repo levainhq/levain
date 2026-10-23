@@ -393,9 +393,11 @@ def entry_steps(host: HostOS) -> list[Step]:
 def _gc(tree: Path, keep: frozenset[str], rm: str) -> tuple[bool, str]:
     import subprocess
 
+    from levain.launch import child_env
+
     gone = sorted(n for n in os.listdir(tree) if (n.startswith("gen-") and n not in keep) or n in ("levain", "h11"))
     for n in gone:
-        r = subprocess.run([rm, "-rf", str(tree / n)], capture_output=True, text=True, cwd="/")
+        r = subprocess.run([rm, "-rf", str(tree / n)], capture_output=True, text=True, cwd="/", env=child_env())
         if r.returncode != 0:
             return False, (r.stderr or r.stdout).strip()
     return True, ", ".join(gone)
