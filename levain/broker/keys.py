@@ -9,6 +9,13 @@ record per exchange, plus the `levain.broker` notes); and the reservation ledger
 request check's last step admits a hold against the route's per-session cap, the head goes only behind its durable
 `reserved` line and the ledger's send gate, and every exit resolves the hold.
 
+Known edges of the ledger wiring (3c-1 B1 L2, 10-23; not built, never a loss):
+- before Python 3.12 a cancel landing in the loop turn the durable wait completes is lost (bpo-42130; reproduced on
+  /usr/bin/python3 3.9.6); money-safe because `_detach` marks the exchange detached before it cancels, so
+  `Upstream.write` raises StaleExchange and `mark_sent` is never reached.
+- keys installs no SIGINT handler, so a Ctrl-C on a foreground keys between `up.write(head)` and `mark_sent` releases
+  a hold whose head may be on the wire; launchd and systemd stop keys with SIGTERM, which is handled.
+
 The admin server (design 1.5 "The admin connection", "Fencing", "Order inside one connection"):
 - a connection is accepted only from the `_levain_control` uid, read from the kernel; any other peer is closed unread.
 - framing and answer shape are `levain-control/1`'s: a 4-byte big-endian length and one canonical JSON object,

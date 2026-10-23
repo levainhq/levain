@@ -1,13 +1,15 @@
 """keys' wiring onto the reservation ledger (S1 3c-1 session B1, design `1023-1/3c/C1_DESIGN.md` r4 §2.5 and §7):
 T2 (a cancel at each await resolves the hold), T4 and T4b (tripwires on keys.py's shape), T16 (the unmetered seam is
-gone), T20 (every non-settle exit resolves before the task ends), T20b (the owner callback is the backstop), T21's
-keys half (a route's per-session cap, per route), and `main()` / `_serve`'s open, attach and close. Each exchange
-case drives the real `Keys._exchange` in-process on a real ledger file, against the scripted upstream of
-`test_broker_keys_upstream.py`."""
+gone), T20 (every non-settle exit resolves before the task ends, the two ledger-unavailable sites, a cancel and a
+stale exchange included), T20b (the owner callback is the backstop), T21's keys half (a route's per-session cap, per
+route), the request check's refusal and a cap-less route admitting nothing, and `main()` / `_serve`'s open, attach
+and close. Each exchange case drives the real `Keys._exchange` in-process on a real ledger file, against the scripted
+upstream of `test_broker_keys_upstream.py`."""
 from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import logging
 import os
 import shutil
@@ -229,7 +231,11 @@ def test_completed_relay_settles_at_the_full_hold(monkeypatch):
 
 # --- T20 / T20b: every non-settle exit resolves while the task still runs; the backstop catches a missed one --------
 
-EXITS = ["detached", "connect-lost", "front-aborted", "resp-none", "refused-before-r", "upstream-failed"]
+EXITS = ["detached", "connect-lost", "front-aborted", "resp-none", "refused-before-r", "upstream-failed",
+         "unavailable-at-durable", "unavailable-at-send-gate", "cancel", "stale"]
+#: the two `LedgerUnavailable -> keys-unavailable` sites in `_serve_held`: the ledger closes before the durable wait,
+#: or after it returns and before `send_gate` (B1 L1 #1)
+_UNAVAILABLE = ("unavailable-at-durable", "unavailable-at-send-gate")
 
 
 def _exit_case(monkeypatch, exit_: str, *, end_stubbed: bool = False) -> dict:
@@ -237,6 +243,24 @@ def _exit_case(monkeypatch, exit_: str, *, end_stubbed: bool = False) -> dict:
     seen = _durable_seen(monkeypatch)
     if end_stubbed:
         monkeypatch.setattr(L.Hold, "end", lambda self: False)
+    hook: dict = {}
+    if exit_ in _UNAVAILABLE or exit_ == "stale":
+        seen_durable = L.Hold.durable
+
+        async def durable(self):
+            # `aclose` resolves a live hold `released` (its `closed` column) and closes the ledger; run as its own
+            # task, its synchronous part is done after one yield
+            if exit_ == "unavailable-at-durable":
+                hook["close"] = asyncio.ensure_future(hook["ledger"].aclose(2.0))
+                await asyncio.sleep(0)
+            await seen_durable(self)
+            if exit_ == "unavailable-at-send-gate":
+                hook["close"] = asyncio.ensure_future(hook["ledger"].aclose(2.0))
+                await asyncio.sleep(0)
+            if exit_ == "stale":
+                hook["conn"].detached = True   # a phase 1 after the durable wait: `Upstream.write` raises Stale
+
+        monkeypatch.setattr(L.Hold, "durable", durable)
 
     async def go(d: str) -> dict:
         seen["e"] = asyncio.Event()
@@ -247,6 +271,7 @@ def _exit_case(monkeypatch, exit_: str, *, end_stubbed: bool = False) -> dict:
         async with _Rig(d) as rig:
             holds = _capture(rig)
             led = rig.ledger
+            hook["ledger"], hook["conn"] = led, rig.conn
             box: dict = {}
 
             def snap(where: str) -> None:
@@ -310,6 +335,9 @@ def _exit_case(monkeypatch, exit_: str, *, end_stubbed: bool = False) -> dict:
                 await until(lambda: up.reads >= 1)
                 rig.front.feed_data(gwwire.encode(b"X"))
                 rig.front.feed_eof()
+            elif exit_ == "cancel":
+                await until(lambda: up.reads >= 1)   # the head is sent: the hold is SENT
+                task.cancel()
             await until(lambda: "refuse" in at or "release" in at)
             if "refuse" in at:
                 ref_gate.set()
@@ -321,7 +349,11 @@ def _exit_case(monkeypatch, exit_: str, *, end_stubbed: bool = False) -> dict:
             await asyncio.wait([task])
             await asyncio.sleep(0)    # the owner callback runs after the task ends
             out = {"at": at, "head": up.writes[:1], "path": led.path,
-                   "state_after": holds[0].state, "outcome_after": holds[0].outcome}
+                   "state_after": holds[0].state, "outcome_after": holds[0].outcome,
+                   "raised": None if task.cancelled() else task.exception()}
+            if exit_ in _UNAVAILABLE:
+                await asyncio.wait_for(hook["close"], 5)
+                out["frames"] = await rig.got()
         out["res"] = resolutions(out["path"])
         out["seqs"] = [o["seq"] for o in file_lines(out["path"]) if o["kind"] == "reserved"]
         return out
@@ -329,19 +361,27 @@ def _exit_case(monkeypatch, exit_: str, *, end_stubbed: bool = False) -> dict:
     return _run(go)
 
 
-_SENT_EXITS = ("resp-none", "refused-before-r", "upstream-failed")
+_SENT_EXITS = ("resp-none", "refused-before-r", "upstream-failed", "cancel")
 
 
 @pytest.mark.parametrize("exit_", EXITS)
 def test_non_settle_exit_resolves_before_task_end(monkeypatch, exit_):
     # T20 [prescription: reasoned]: with `release_exchange` and `_refuse`'s drain gated open, the hold is resolving
     # (`released`, or `uncertain {ended}` if sent) BEFORE the gate is released, while the task is still running.
+    # `cancel` and `stale` leave by `except BaseException`: its explicit `end()`, not the owner backstop, resolves
+    # them. The two ledger-unavailable sites answer `F{keys-unavailable}` and leave the hold `released`.
     out = _exit_case(monkeypatch, exit_)
     sent = exit_ in _SENT_EXITS
     want = (L.UNCERTAIN, "ended") if sent else (L.RELEASED,)
     first = "refuse" if "refuse" in out["at"] else "release"
-    if exit_ in ("refused-before-r", "upstream-failed"):
+    if exit_ in ("refused-before-r", "upstream-failed") + _UNAVAILABLE:
         assert first == "refuse"                               # the refusal's drain comes first
+    if exit_ in _UNAVAILABLE:
+        assert out["raised"] is None, out["raised"]            # refused, not raised out of the exchange
+        assert _types(out["frames"]) == b"AF", out["frames"]
+        assert out["frames"][-1] == (b"F", gwwire.encode(b"F", {"refused": "keys-unavailable"})[5:])
+    if exit_ == "stale":
+        assert out["raised"] is None                           # `_exchange` takes StaleExchange as a detach
     state, outcome, done = out["at"][first]
     assert done is False                                       # the task is still running
     assert state in (L.RESOLVING, L.RESOLVED) and outcome == want, out
@@ -459,6 +499,68 @@ def test_no_ledger_and_ledger_errors_are_refusals(caplog):
     assert got[1] == ("keys-unavailable", "ledger misuse")
     assert got[2][0] == "keys-unavailable"
     assert "ledger misuse at admit" in caplog.text
+
+
+def test_a_capless_route_is_no_scope():
+    # B1 L1 #5: a RoutePolicy with no per-session cap (a dispatch route's shape) is refused `budget-exhausted`
+    # "no scope" before the ledger is asked; nothing is admitted
+    d = tempfile.mkdtemp(prefix="l4", dir="/tmp")
+    _two_route_lib(d)
+    path = os.path.join(d, "keys", "ledger.jsonl")
+
+    async def go() -> tuple:
+        led = keys_ledger(path)
+        try:
+            k = K.Keys(ledger=led, lib_root=d)
+            pol = dataclasses.replace(k._route_policy({"routes": ["a"]}, "a"), max_session_microdollars=None)
+            try:
+                k._admit_hold(types.SimpleNamespace(session="s1"), pol)
+                got = "admitted"
+            except norm.Refused as r:
+                got = (r.name, r.detail)
+            return got, led.charged(("session-route", "s1", "a"))
+        finally:
+            await led.aclose(2.0)
+
+    try:
+        got, charged = asyncio.run(go())
+        kinds_ = [o["kind"] for o in file_lines(path)]
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    assert got == ("budget-exhausted", "no scope")
+    assert charged == 0 and "reserved" not in kinds_
+
+
+def test_a_request_check_refusal_admits_nothing(monkeypatch):
+    # B1 L1 #3 (pins `_check_request`'s "the ledger's admit last"): a `Q` refused by the request check (a header off
+    # the route's list) is answered `F{policy-header}` with nothing admitted: `charged` is 0 while the refusal runs,
+    # and the file holds no `reserved` line
+    up = _Up()
+
+    async def go(d: str) -> dict:
+        _scripted(monkeypatch, up)
+        at: dict = {}
+        async with _Rig(d) as rig:
+            holds = _capture(rig)
+            real_refuse = K.Keys._refuse
+
+            async def snap_refuse(self, conn, frames, side, name, cap):
+                at["charged"], at["holds"] = rig.ledger.charged(SCOPE), len(holds)
+                return await real_refuse(self, conn, frames, side, name, cap)
+
+            monkeypatch.setattr(K.Keys, "_refuse", snap_refuse)
+            q = _q("none")
+            q["headers"] = q["headers"] + [["x-not-on-the-list", "1"]]
+            rig.front.feed_eof()
+            await asyncio.wait_for(rig.run(q), 5)
+            out = {"at": at, "frames": await rig.got(), "path": rig.ledger.path}
+        out["kinds"] = [o["kind"] for o in file_lines(out["path"])]
+        return out
+
+    out = _run(go)
+    assert out["frames"][-1] == (b"F", gwwire.encode(b"F", {"refused": "policy-header"})[5:]), out["frames"]
+    assert out["at"] == {"charged": 0, "holds": 0}, out["at"]
+    assert "reserved" not in out["kinds"] and up.writes == []
 
 
 # --- main() and _serve: open before bind, exit 3 on a refused open, attach and close ---------------------------------
