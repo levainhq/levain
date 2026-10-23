@@ -3102,12 +3102,17 @@ def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_cockpit_keys(args: argparse.Namespace) -> int:
+    from levain.cockpit import keys as ckeys
     from levain.cockpit.custody import custody_note
-    from levain.cockpit.keys import keys
 
     try:
-        rows, note = keys(_cockpit_root(args), now=_utc_now())
+        rows, note = ckeys.keys(_cockpit_root(args), now=_utc_now())
         notes = custody_note(rows)
+        for r in rows:
+            # a QUARANTINED key (its row carries AuthoritySnapshot.quarantined_keys' why): it signs nothing new
+            if r.quarantined is not None:
+                notes[r.fingerprint] = "; ".join(filter(None, (f"QUARANTINED: {r.quarantined}; `levain doctor` names "
+                                                               "the remedy", notes.get(r.fingerprint))))
     except _cockpit_refusals() as exc:
         print(f"keys: {exc}", file=sys.stderr)
         return 1

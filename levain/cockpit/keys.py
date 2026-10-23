@@ -75,6 +75,8 @@ class KeyRow:
     legacy_enrolled_at: str | None = None
     custody: str = UNSTATED          # what its enrol record declares (a declaration, never a proof)
     public_key: str | None = None
+    # why it is QUARANTINED (levain.authority.AuthoritySnapshot.quarantined_keys), or None
+    quarantined: str | None = None
 
 
 # what signs a link's message (namespace ``levain-authority``); returns the armored SSHSIG
@@ -163,9 +165,9 @@ def _check_reported(conn: object) -> None:
         raise KeyError_(f"this journal's install class is {cls!r}; enrolling here is for a reported install")
 
 
-def _row(k: AuthorityKey) -> KeyRow:
+def _row(k: AuthorityKey, quarantined: str | None = None) -> KeyRow:
     return KeyRow(k.fingerprint, k.principal, k.key_class, k.enrolled_seq, k.enrolled_at, k.revoked_seq,
-                  k.compromised_since, k.legacy_enrolled_at, k.custody, k.public_key)
+                  k.compromised_since, k.legacy_enrolled_at, k.custody, k.public_key, quarantined)
 
 
 def _capture(db: CockpitDB, now: datetime, ssh_keygen: Path | str) -> RequestAuthority:
@@ -209,7 +211,7 @@ def enroll(data_root: Path | str, public_key_text: str, key_class: str, *, signe
     if key_class not in _CLASS_RANK:
         raise KeyError_(f"unknown key class {key_class!r}; one of {', '.join(KEY_CLASSES)}")
     public_key = normalise_public_key(public_key_text)
-    problem = _authority.custody_problem(key_class, custody, public_key.split()[0])
+    problem = _authority.custody_problem(key_class, custody, public_key.split()[0], public_key=public_key)
     if problem is not None:
         raise KeyError_(problem)
     fp = fingerprint_of(public_key, ssh_keygen=ssh_keygen)
@@ -326,7 +328,8 @@ def keys(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAU
             raise KeyError_(str(auth.authority_error))
         return [], auth.authority_error
     rows = sorted(auth.authority.keys.values(), key=lambda k: k.enrolled_seq)
-    return [_row(k) for k in rows], auth.authority_error
+    held = {k.fingerprint: why for k, why in auth.authority.quarantined_keys()}
+    return [_row(k, held.get(k.fingerprint)) for k in rows], auth.authority_error
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -390,7 +393,8 @@ def _legacy_row(raw: Any, state: AuthoritySnapshot | None, ssh_keygen: Path | st
         # A carried row is re-enrolled with its custody unstated (/2 never recorded one), which the replay
         # admits for a laptop-presence key only on a record carrying legacy_enrolled_at (its enrol time).
         if problem is None:
-            problem = _authority.custody_problem(cls, UNSTATED, key_type, legacy=isinstance(enrolled_at, str))
+            problem = _authority.custody_problem(cls, UNSTATED, key_type, legacy=isinstance(enrolled_at, str),
+                                                 public_key=normal)
     held = None if state is None else state.key(fp)
     return LegacyRow(fp, str(cls), key_type, enrolled_at if isinstance(enrolled_at, str) else None,
                      revoked_at is not None, compromised is not None, normal, problem,
@@ -471,7 +475,7 @@ def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str
     signer_key = normalise_public_key(signer_public_key)
     if fingerprint_of(signer_key, ssh_keygen=ssh_keygen) != signer_fp:
         raise KeyError_("the signing key's public half is not the key that signs")
-    problem = _authority.custody_problem(LAPTOP, signer_custody, signer_key.split()[0])
+    problem = _authority.custody_problem(LAPTOP, signer_custody, signer_key.split()[0], public_key=signer_key)
     if problem is not None:
         raise KeyError_(f"the signing key: {problem}")
     confirmed = set(confirmed)

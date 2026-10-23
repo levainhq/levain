@@ -51,9 +51,11 @@ def test_shape_refusals_name_the_site_and_the_presence_flag():
 
 
 def test_a_passkey_answers_for_a_display_phone_key_only():
-    assert custody_problem("display-phone", PASSKEY, KEY_TYPE) is None
-    assert "display-phone key only" in custody_problem("laptop-presence", PASSKEY, KEY_TYPE)
-    assert custody_problem("display-phone", PASSKEY, "ssh-ed25519") is not None
+    key = _parts()[0]
+    ed25519 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA=="
+    assert custody_problem("display-phone", PASSKEY, KEY_TYPE, public_key=key) is None
+    assert "display-phone key only" in custody_problem("laptop-presence", PASSKEY, KEY_TYPE, public_key=key)
+    assert custody_problem("display-phone", PASSKEY, "ssh-ed25519", public_key=ed25519) is not None
 
 
 def test_the_presence_rule_reads_a_webauthn_signature():

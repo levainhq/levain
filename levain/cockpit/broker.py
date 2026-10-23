@@ -103,7 +103,8 @@ from levain.cockpit.firejournal import (
 )
 from levain.cockpit.install import REPORTED, decide_install, network_fs_problem
 from levain.cockpit.labels import BrokerLabeller, LabelSnapshot, label_class
-from levain.authority import DISPLAY_PHONE, PASSKEY, AnchorError, advance_anchor, anchor_path, presence_missing
+from levain.authority import (DISPLAY_PHONE, PASSKEY, AnchorError, advance_anchor, anchor_path, quarantined,
+                              presence_missing, sshsig_public_key)
 from levain.cockpit.authority import RequestAuthority, bound, current, inactive
 from levain.cockpit.results import Absent, Fault
 from levain.cockpit.verbs import DEVICE_VERBS, KERNEL_VERBS
@@ -1055,6 +1056,19 @@ class Broker:
         record could replay as a link. That stays closed where it was really closed, ``authority._step`` refusing
         any link a passkey signed but a consent or inert grant's revoke, and the namespace split closes the
         cross-protocol replay here: a link verifies only in ``levain-authority``."""
+        # The one custody rule (levain.authority.quarantined), per key, checked first: a QUARANTINED key (its stored
+        # custody is not the one its material shows; a log from before the enrol door holds it) never enters the
+        # signers file, and a signature naming it (by fingerprint, never by key string) is refused with that reason.
+        # The stored-vs-derived check after it holds the same rule for the carried key, so it refuses nothing the
+        # quarantine has not already refused [judged by land13, 2026-10-22, against authority.custody_mismatch and
+        # _derived_passkey: both read an sk-ecdsa key's application as rp host vs ``ssh:``].
+        held = {k.fingerprint: why for k, why in quarantined(authority.active_keys())}
+        try:
+            named: str | None = sshsig_public_key(signature)[1]
+        except ValueError:
+            named = None                    # ssh-keygen below refuses what cannot be read
+        if named in held:
+            raise BrokerError("bad_signature", 400, f"key {named} is quarantined ({held[named]}); it signs nothing new")
         signer = self._carried_key(authority, signature)
         if signer is not None and self._derived_passkey(signer.public_key) != (signer.custody == PASSKEY):
             raise BrokerError("bad_signature", 400, "the signing key's stored custody is not the custody its key "
@@ -1064,7 +1078,8 @@ class Broker:
             why = self._passkey_refusal(signer, signature, pending, db, page_origin)
             if why is not None:
                 raise BrokerError("bad_signature", 400, why)
-        keys = sorted((k.principal, k.public_key, k.custody == PASSKEY) for k in authority.active_keys())
+        keys = sorted((k.principal, k.public_key, k.custody == PASSKEY) for k in authority.active_keys()
+                      if k.fingerprint not in held)
         fd, path = tempfile.mkstemp(prefix=".signers-", dir=self.data_root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
