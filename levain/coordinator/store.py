@@ -172,6 +172,19 @@ def next_gseq(conn: sqlite3.Connection, now: str) -> int:
     return conn.execute("INSERT INTO gseq (at) VALUES (?)", (now,)).lastrowid
 
 
+def _replies_gseq(conn: sqlite3.Connection) -> None:
+    """The additive migration (CH-D1 §2.8): ``replies`` gains ``gseq``, NULL on every reply written before it, so the
+    chat timeline can merge a reply into the store-wide order. SQLite adds no UNIQUE column, so uniqueness is an index,
+    and a replacing INSERT that reuses a gseq is refused by its own trigger (an INSERT OR REPLACE on a unique index
+    deletes the other row without firing a delete trigger). Runs in the opener's schema transaction."""
+    if "gseq" not in {r[1] for r in conn.execute("PRAGMA table_info(replies)")}:
+        conn.execute("ALTER TABLE replies ADD COLUMN gseq INTEGER")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS replies_gseq ON replies (gseq)")
+    conn.execute("CREATE TRIGGER IF NOT EXISTS replies_gseq_no_replace BEFORE INSERT ON replies WHEN NEW.gseq IS NOT "
+                 "NULL AND EXISTS (SELECT 1 FROM replies WHERE gseq = NEW.gseq) "
+                 "BEGIN SELECT RAISE(ABORT, 'a reply is never replaced'); END")
+
+
 def members_sha256(members: Iterable[str]) -> str:
     """``sha256:<hex>`` over the canonical JSON of the sorted drop ids: what a revision's signature will bind."""
     return "sha256:" + hashlib.sha256(canonical_bytes(sorted(members))).hexdigest()
@@ -340,6 +353,7 @@ class CoordStore:
                     # the lease is checked by every opener's coordinator writes, so its tables are every opener's
                     for stmt in (*self._SCHEMA, *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA):
                         conn.execute(stmt)
+                    _replies_gseq(conn)
                     conn.execute("COMMIT")
                 except BaseException:
                     _rollback(conn)
@@ -1097,9 +1111,10 @@ class CoordStore:
     def _reply(conn: sqlite3.Connection, thread_id: str | None, kind: str, ref_store: str, ref_id: str,
                body: dict[str, Any], now: str) -> str:
         reply_id = "rp-" + secrets.token_hex(16)
-        conn.execute("INSERT INTO replies (reply_id, thread_id, kind, ref_store, ref_id, body, at) "
-                     "VALUES (?, ?, ?, ?, ?, ?, ?)", (reply_id, thread_id, kind, ref_store, ref_id, canonical(body),
-                                                      now))
+        # every reply takes its place in the store-wide order (CH-D1 §2.8): the chat timeline merges it by gseq
+        conn.execute("INSERT INTO replies (reply_id, thread_id, kind, ref_store, ref_id, body, at, gseq) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (reply_id, thread_id, kind, ref_store, ref_id, canonical(body),
+                                                         now, next_gseq(conn, now)))
         return reply_id
 
     def _drop_receipt(self, conn: sqlite3.Connection, drop_id: str, stage: str, now: str) -> None:
