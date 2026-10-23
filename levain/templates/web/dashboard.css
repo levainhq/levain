@@ -1555,9 +1555,9 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
 /* ═══════════════════════════ PASS 2 (10-14 ~19:2x): the phone's header, and the known gaps ═══════════════════════════ */
 
 /* THE BAR ON A NARROW SCREEN. Two rows: the brand with the status dot, Sync and the theme switch; then the four tabs across the width.
-   Under 960px the read-time line and the jar sit on a third row; under 480px they go (the live dot stays), Jump becomes its icon and
+   Under 1040px (960 until 1023+13: the jar and the live dot overlapped the tabs between 961 and 1040) the read-time line and the jar sit on a third row; under 480px they go (the live dot stays), Jump becomes its icon and
    the keyboard cues go: a phone has no keyboard. Then the band stacked (clock, date, the state line, the wrap line). */
-@media (max-width: 960px) {
+@media (max-width: 1040px) {
   body.ke .masthead { flex-wrap: wrap; row-gap: var(--sp-3); column-gap: var(--sp-3); padding-block: var(--sp-4); }
   body.ke .masthead .brand { order: 0; margin-right: auto; }
   body.ke .masthead .seg { order: 2; flex: 1 1 100%; }
@@ -2467,7 +2467,7 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 @keyframes tv-breathe { 50% { box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 22%, transparent); } }
 @keyframes tv-ring { 50% { transform: scale(0.82); opacity: .3; } }
 .tv-replaying .tv-task.waiting, .tv-replaying .tv-rec, .tv-replaying .tv-pulse { animation: none; }       /* a frame from the ledger is still: nothing breathes or pulses */
-@container (max-width: 520px) { .tv-right { margin-left: 0; } .tv-bar { align-items: flex-start; } .tv-task-h { flex-wrap: wrap; } }
+@container (min-width: 341px) and (max-width: 520px) {   /* at 340 and under the inline verbs already fold into the ··· menu */ .tv-right { margin-left: 0; } .tv-bar { align-items: flex-start; } .tv-task-h { flex-wrap: wrap; } }
 .tv-more { align-self: flex-start; border: 1px solid var(--hair-2); background: none; color: var(--label); border-radius: var(--r-md); padding: var(--sp-1) var(--sp-4); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
 .tv-more:hover { background: var(--card-2); color: var(--text); }
 
@@ -2509,3 +2509,35 @@ body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-
 @media (max-width: 900px) { body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results { display: block; }
   body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col { columns: auto; } }
 body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_descend"] { order: -1; }
+
+/* ═══════════════════════════ NARROW VIEW (1023+13): the cockpit at half a laptop screen ═══════════════════════════ */
+/* A rename editor open in the masthead takes its own line below the tabs, never a slot beside the brand (the unit is display: contents
+   in the two-row bar, so the editor would otherwise be a flex item of the bar itself). */
+@media (max-width: 1040px) {
+  body.ke .masthead .name-editor { order: 4; flex: 1 1 100%; }
+  body.ke .masthead .name-input { flex: 1 1 12ch; min-width: 0; max-width: none; }
+}
+/* The hero weather card's foot holds three things in one grid area (read age, last wrap, re-read key). Where the band stacks they
+   cannot share one line: the last wrap takes a line of its own under the age and the key. */
+@media (max-width: 1180px) {
+  body.ke .band-meta .wx { grid-template-areas: "main air" "foot foot" "wrap wrap"; }
+  body.ke .band-meta .wx:not(:has(.wx-air)) { grid-template-areas: "main" "foot" "wrap"; }
+  body.ke .band-meta .wx .wx-wrap { grid-area: wrap; justify-self: start; padding-top: 0; }
+}
+/* A tile's lines never run past its edge: a status row keeps its label and cuts its reading with an ellipsis (the row's title holds
+   the whole of it), and a big figure's label drops under it when they do not fit side by side. Tiles only, and not the phone's
+   half-width tile (its own rule above wraps the reading instead). */
+@media (min-width: 721px) {
+  body.ke .ck-widgets[data-shape="tiles"] .w .op { min-width: 0; }
+  body.ke .ck-widgets[data-shape="tiles"] .w .op .v { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  body.ke .ck-widgets[data-shape="tiles"] .w .bigrow { flex-wrap: wrap; row-gap: 0; }
+}
+/* A row too narrow for its meta line and its verbs together (they overlapped: the verbs, right-aligned, spilled left over the meta):
+   the verbs take the line under the meta, right-aligned. Container width, so it holds in a half-screen column and not in a wide one. */
+@container (min-width: 341px) and (max-width: 520px) {   /* at 340 and under the inline verbs already fold into the ··· menu */
+  body.ke .row .verb-actions:not(:has(.verb-form)):not(:has(.edit-msg)) { grid-column: 1 / -1; grid-row: 4; }
+}
+/* The strip (fewer than four tiles) is one row that shrinks its segments to fit; below the width where they fit it squeezed the
+   first segment until its figure had 2px to stand in and ran out of it. The segments now wrap to a second row instead (the
+   1px gap is the hairline between rows too). Above 1100px nothing changes. */
+@media (max-width: 1100px) { body.ke .ck-widgets:not([data-shape="tiles"]) { flex-wrap: wrap; } }   /* not wider: from 1101 the shrunk single row is the look he has */

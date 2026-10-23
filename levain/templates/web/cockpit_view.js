@@ -1000,6 +1000,7 @@
       // a state is never colour alone: with no figure and no reading, the word stands in
       row.appendChild(el("span", "v", [fig, m.read || ""].filter(Boolean).join(" · ") || st));
       if (typeof m.detail === "string" && m.detail) row.title = m.label + ": " + m.detail;   // the long reading lives in the tooltip; the row stays one line
+      else if (fig || m.read) row.title = m.label + ": " + [fig, m.read || ""].filter(Boolean).join(" · ");   // a cut reading is whole on hover
       host.appendChild(row);
     }
   }
