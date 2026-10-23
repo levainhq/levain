@@ -86,6 +86,11 @@ def _errno_name(e: OSError) -> str:
 # --- the runtime helper ---------------------------------------------------------------------------------------
 
 
+def _run(argv: Sequence[str], *, env: Mapping[str, str], **kw: object) -> "subprocess.CompletedProcess[bytes]":
+    """Every child this module starts: ``env`` is required (the spawn scan, ``tests/test_launch.py``)."""
+    return subprocess.run(list(argv), env=dict(env), **kw)              # type: ignore[call-overload]
+
+
 @dataclass
 class Seams:
     """The CLI's OS facts. ``helper`` is the argv prefix of the root runtime helper (``sudo -n <path>``);
@@ -99,7 +104,7 @@ class Seams:
     git: Optional[str] = None
     helper_timeout_s: float = 2 * 1800.0 + 600.0    # V7's lock wait + V7's wall + V30's slack [judged]
     log: Log = None
-    spawn: Callable[..., "subprocess.CompletedProcess[bytes]"] = field(default=subprocess.run)
+    spawn: Callable[..., "subprocess.CompletedProcess[bytes]"] = field(default_factory=lambda: _run)
 
     def __post_init__(self) -> None:
         from levain.slot import layout
