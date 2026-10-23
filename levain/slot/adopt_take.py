@@ -26,8 +26,8 @@ Before step 1 writes anything, :func:`check_prerequisites` holds every bundle pr
 (``base-missing``).
 
 His git runs here on trusted input only: ``cat-file -e <oid>`` once per prerequisite, ``rev-parse --git-path
-objects`` and ``update-ref``, each through :func:`_git` with :func:`git_env` and ``-c core.hooksPath=/dev/null``;
-update-ref also gets
+objects`` and ``update-ref``, each through :func:`_git` with :func:`git_env`, ``-c core.hooksPath=/dev/null`` and
+``--git-dir=<repo>/.git --work-tree=<repo>`` (:func:`repo_args`: never a discovered repository); update-ref also gets
 ``-c hook.reference-transaction.enabled=false`` (it runs the ``reference-transaction`` hook otherwise). A spawn that
 cannot start or outlives its timeout is ``take-failed:<errno name>`` / ``take-failed:timeout``, as is an OSError reading
 the private copies.
@@ -329,15 +329,22 @@ def git_env() -> Dict[str, str]:
     return env
 
 
+def repo_args(repo: Path) -> Tuple[str, str]:
+    """``--git-dir=<repo>/.git --work-tree=<repo>``: his git acts on the repository he named and never discovers
+    one (an empty or invalid ``<repo>/.git`` makes a discovering git walk up to a PARENT repository and act there;
+    with these it refuses instead: L3 s4a r1 complement MED 2)."""
+    return (f"--git-dir={os.path.join(str(repo), '.git')}", f"--work-tree={repo}")
+
+
 def _git(git: str, repo: Path, *args: str, config: Tuple[str, ...] = (),
          log: Log = None) -> subprocess.CompletedProcess:
-    """His git, run once, ``-c core.hooksPath=/dev/null`` then a ``-c`` per ``config`` entry. A spawn that outlives
-    ``_GIT_TIMEOUT`` = ``take-failed:timeout``; one that cannot start (no such git, his repo dir gone) =
-    ``take-failed:<errno name>``."""
+    """His git, run once, ``-c core.hooksPath=/dev/null`` then a ``-c`` per ``config`` entry, then
+    :func:`repo_args`. A spawn that outlives ``_GIT_TIMEOUT`` = ``take-failed:timeout``; one that cannot start (no
+    such git, his repo dir gone) = ``take-failed:<errno name>``."""
     argv = [git, "-c", "core.hooksPath=/dev/null"]
     for c in config:
         argv += ["-c", c]
-    argv += args
+    argv += [*repo_args(repo), *args]
     _note(log, "spawn " + " ".join(argv[1:]))
     what = "git " + args[0]
     try:
