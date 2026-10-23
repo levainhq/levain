@@ -673,3 +673,131 @@ def test_the_front_reader_is_closed_when_the_refusal_raises(monkeypatch):
     out = _run(go)
     assert out["done"] and isinstance(out["raised"], RuntimeError), out
     assert closed and closed[0] is not None, closed     # the in-flight read was handed to `close`
+
+
+# --- the body buffer is held to the exchange's end (lane 3c2a-b2-fix2, head ruling on fix1 item 5) -----------------
+
+_PART = b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabcde"   # a response head and half its body: the relay is open
+
+
+class _Boom(_Up):
+    """An upstream whose response read fails once `blow` is set."""
+
+    blow = False
+
+    async def read(self, n: int) -> bytes:
+        if self.blow:
+            raise ConnectionResetError("reset")
+        return await super().read(n)
+
+
+def _used_during_relay(monkeypatch, end: str) -> dict:
+    # (a): while an admitted call relays, the session's bytes are still in the buffer (the serialization), and every
+    # way the exchange ends gives them back.
+    up = _Boom() if end == "upstream-error" else _Up()
+
+    async def go(d: str) -> dict:
+        _scripted(monkeypatch, up)
+        async with _Sessions(d, 1) as ss:
+            front, task, got = await ss.start(0, _q())
+            front.feed_data(gwwire.encode(b"B", BODY) + gwwire.encode(b"E"))
+            up.feed(_PART)
+            await asyncio.wait_for(up.read_called.wait(), 5)
+            for _ in range(50):   # the relay's body read is the second read: the head was handed on
+                if up.reads >= 2:
+                    break
+                await asyncio.sleep(0.02)
+            mid = (ss.k.body_buffer.used, dict(ss.k.body_buffer.by_session))
+            if end == "completed":
+                up.feed(b"fghij")
+                up.feed(b"")
+            elif end == "front-abort":
+                front.feed_data(gwwire.encode(b"X"))
+            else:
+                up.blow = True
+                up.feed(b"x")
+            await asyncio.wait_for(task, 5)
+            return {"mid": mid, "after": ss.k.body_buffer.used, "by": dict(ss.k.body_buffer.by_session),
+                    "sent": len(_sent(up)[1])}
+
+    return _run(go)
+
+
+@pytest.mark.parametrize("end", ["completed", "front-abort", "upstream-error"])
+def test_the_buffer_still_counts_the_body_during_the_relay_and_is_empty_after(monkeypatch, end):
+    out = _used_during_relay(monkeypatch, end)
+    assert out["sent"] > 0 and out["mid"] == (out["sent"], {"s0": out["sent"]}), out
+    assert out["after"] == 0 and out["by"] == {}, out
+
+
+def test_a_second_exchange_past_the_share_is_refused_while_the_first_relays_and_admitted_after(monkeypatch):
+    # (b): the share holds one body, not two. While the first relays, a second of the same session is
+    # `keys-unavailable` (503) before `A`; once the first ends, the same call is admitted.
+    up = _Up()
+
+    async def go(d: str) -> dict:
+        _scripted(monkeypatch, up)
+        async with _Sessions(d, 1, body_buffer=K.BodyBuffer(budget=8 * len(BODY), session_max=len(BODY) + 5)) as ss:
+            f1, t1, g1 = await ss.start(0, _q())
+            f1.feed_data(gwwire.encode(b"B", BODY) + gwwire.encode(b"E"))
+            up.feed(_PART)
+            await asyncio.wait_for(up.read_called.wait(), 5)
+            for _ in range(50):
+                if up.reads >= 2:
+                    break
+                await asyncio.sleep(0.02)
+            f2, t2, g2 = await ss.start(0, _q("length:%d" % len(BODY)))
+            f2.feed_data(gwwire.encode(b"B", BODY) + gwwire.encode(b"E"))   # the refusal drains the front
+            await asyncio.wait_for(t2, 5)
+            second = await g2()
+            up.feed(b"fghij")   # completes the response's content-length: no EOF is fed, the third call reads next
+            await asyncio.wait_for(t1, 5)
+            f3, t3, g3 = await ss.start(0, _q())
+            f3.feed_data(gwwire.encode(b"B", BODY) + gwwire.encode(b"E"))
+            up.feed(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+            up.feed(b"")
+            await asyncio.wait_for(t3, 5)
+            return {"second": second, "third": await g3(), "used": ss.k.body_buffer.used}
+
+    out = _run(go)
+    assert out["second"] == [_f("keys-unavailable")], out["second"]
+    assert _types(out["third"]) == b"ARbe", out["third"]
+    assert out["used"] == 0
+
+
+def test_no_reference_to_the_raw_body_is_held_after_the_serialization(monkeypatch):
+    # (c): `_check_request` parses the body through a one-shot holder; once it has returned, nothing in the exchange
+    # refers to the raw bytes. A bytes object can be neither weakly referenced nor tracked by gc, so the test holds the
+    # one reference it made (a list slot) and reads `sys.getrefcount` while the relay is open: 2 (the slot, the call's
+    # argument) is "nobody else", on 3.9 and 3.12 alike.
+    refs: list = []
+    real = K.Keys._collect_body
+
+    async def wrapped(self, *a, **kw):
+        held = await real(self, *a, **kw)
+        if held is not None:
+            held.b = b"".join([held.b[:1], held.b[1:]])   # a fresh object, not interned
+            refs.append(held.b)
+        return held
+    monkeypatch.setattr(K.Keys, "_collect_body", wrapped)
+    up = _Up()
+
+    async def go(d: str) -> dict:
+        _scripted(monkeypatch, up)
+        async with _Sessions(d, 1) as ss:
+            front, task, got = await ss.start(0, _q())
+            front.feed_data(gwwire.encode(b"B", BODY) + gwwire.encode(b"E"))
+            up.feed(_PART)
+            await asyncio.wait_for(up.read_called.wait(), 5)
+            for _ in range(50):
+                if up.reads >= 2:
+                    break
+                await asyncio.sleep(0.02)
+            alive = sys.getrefcount(refs[0]) != 2
+            up.feed(b"fghij")
+            up.feed(b"")
+            await asyncio.wait_for(task, 5)
+            return {"alive": alive}
+
+    out = _run(go)
+    assert refs and out["alive"] is False, "the exchange still refers to the raw body"

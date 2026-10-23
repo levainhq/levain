@@ -200,6 +200,11 @@ LEDGER = ("keys", "ledger.jsonl")
 #: arrive. [judged by 1023+8 head, 10-23: one max-size body per session] r3 gives no value; the session share is a
 #: quarter of it and must be at least `policy.BODY_CAP_MAX`, or a max-size body could never be admitted.
 BODY_BUFFER_BUDGET = 128 * 1024 * 1024
+#: KNOWN EDGE [measured by 3c2a-b2-fix1, 10-23: 26.32x, empty objects, 3.12; file b2f1_mem.py]: parsing a body of empty
+#: objects peaks at about 26x its length (842 MiB on one 32 MiB body), and the buffer does not charge it. It stays
+#: one such transient because parse, check, estimate and serialize run in one synchronous call (`_check_request`); a
+#: move off the loop must keep one parse at a time. What an exchange keeps after that is the serialization alone, and
+#: the buffer holds `max(raw, serialized)` until the exchange ends.
 #: one session's share of BODY_BUFFER_BUDGET: a take past it ends that session's exchange, never another session's
 BODY_BUFFER_SESSION_MAX = BODY_BUFFER_BUDGET // 4
 #: the whole request body must arrive within this many seconds of `A`, else `body-timeout` (408)
@@ -297,9 +302,23 @@ class BodyBuffer:
         return BodyTake(self, session)
 
 
+class _OneShot:
+    """The collected request body, handed over once: `take` returns the bytes and leaves the holder empty, so the
+    exchange's frame never keeps the raw body after `_check_request` has parsed it (only the serialization lives)."""
+
+    __slots__ = ("b",)
+
+    def __init__(self, b: bytes) -> None:
+        self.b = b
+
+    def take(self) -> bytes:
+        b, self.b = self.b, b""
+        return b
+
+
 class BodyTake:
     """One exchange's bytes in its BodyBuffer. `give_back` returns them all and is idempotent (not `release`: T4 reads
-    that name as a ledger call)."""
+    that name as a ledger call); `_serve_q` calls it when the EXCHANGE ends, never at the upload's end."""
 
     __slots__ = ("buf", "session", "n")
 
@@ -1339,7 +1358,7 @@ class Keys:
             return
         ff = FrontFrames(frames)
         # the body's bytes in the keys-wide buffer: returned on every exit of this handler (the refusal before its
-        # drain), and by `_serve_held` once the body is written upstream
+        # drain), and by the last `finally`, when the exchange ends: the serialization lives through the relay
         buf = self.body_buffer.taker(conn.reg.session)
         try:
             observed = None
@@ -1443,7 +1462,6 @@ class Keys:
                 except FrontAborted:
                     return False
                 resp = await self._upload_and_head(up, hconn, data, rec)
-                buf.give_back()   # the body is written: its bytes leave the buffer budget
                 r_frame = self._response_frame(resp, pol, cred, scanner)
                 if conn.detached:
                     return False
@@ -1736,7 +1754,7 @@ class Keys:
             raise norm.Refused("budget-overrun", "the session is stopped")
         return method, path, query, fwd, tpl, cred
 
-    def _check_request(self, reg: Registration, entry: dict, pol: RoutePolicy, req: tuple, raw: bytes,
+    def _check_request(self, reg: Registration, entry: dict, pol: RoutePolicy, req: tuple, raw: "_OneShot",
                        buf: "BodyTake") -> Tuple[bytes, "h11.Connection", object, norm.Template, bytes, ledger.Hold]:
         """R4 §1.7 steps 4-5, ONE synchronous call (no `await` anywhere in it): the body codec's parse of the buffered
         body, its `check` (the model has a price entry; on a dispatch-shaped route, one with no per-session cap, the
@@ -1749,7 +1767,7 @@ class Keys:
         the matched template, the body bytes, and the admitted hold. `req` is `_check_q`'s answer."""
         method, path, query, fwd, tpl, cred = req
         c = codec.CODECS[pol.body_codec]   # a priced route's codec is never `none` (`policy.parse_base_map`)
-        obj = c.parse(raw)
+        obj = c.parse(raw.take())   # the raw bytes are unreferenced once parsed: only `data` below is kept
         checked = codec.guarded(c.check, obj, pol.prices, dispatch=pol.max_session_microdollars is None)
         codec.guarded(c.write_ceiling, obj, checked.price)
         estimate = codec.guarded(c.estimate, obj, checked.price)
@@ -1794,7 +1812,7 @@ class Keys:
             raise norm.Refused("keys-unavailable", "ledger misuse") from None
 
     async def _collect_body(self, conn: Conn, ff: "FrontFrames", side: KeysSide, q: dict, pol: RoutePolicy,
-                            buf: "BodyTake", rec: dict) -> Optional[bytes]:
+                            buf: "BodyTake", rec: dict) -> Optional[_OneShot]:
         """R4 §1.7 steps 2-3: the buffer budget, `A`, then the front's `B` frames into memory until `E` (the body) or
         `X` / EOF / a frame the wire refuses (None, nothing reserved); None too for a detached exchange (no `A`). A
         declared length is taken from `buf` before `A`, a chunked body per `B` frame as it arrives (`keys-unavailable`
@@ -1844,7 +1862,7 @@ class Keys:
             rec["bytes_up"] = got
         if want is not None and got != want:
             raise norm.Refused("malformed", "body length")
-        return b"".join(parts)
+        return _OneShot(b"".join(parts))
 
     async def _send_body(self, up: Upstream, hconn: "h11.Connection", data: bytes, rec: dict) -> None:
         """`data` through `up.write` in `UPLOAD_CHUNK` pieces, each drained before the next is written (so a cancel
