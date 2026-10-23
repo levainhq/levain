@@ -478,15 +478,17 @@ def removal_line(private: Path) -> str:
     beside its path (S4a Q6 as ruled by the head 1023+13: the dir stays so he can re-read the preview; no verb, no
     flag). The files named are the ones in the dir NOW. A path the escaper would change is not offered as a command."""
     try:
-        keep = sorted(p.name for p in private.iterdir() if p.name not in LARGE_COPIES)
+        names = sorted(p.name for p in private.iterdir())
     except OSError:
-        keep = []
-    head = (f"the {' and '.join(LARGE_COPIES)} copies will be removed when this command ends; "
-            f"these remain: {', '.join(keep) or 'nothing'}; ")
+        names = []
+    gone = [n for n in LARGE_COPIES if n in names]
+    keep = [adopt_preview.escape(os.fsencode(n)) for n in names if n not in LARGE_COPIES]
+    head = (f"the {' and '.join(gone)} copies will be removed when this command ends; " if gone else "")
+    head += f"these remain: {', '.join(keep) or 'nothing'}; "
     shown = adopt_preview.escape(os.fsencode(private))
     if shown != str(private):
-        return head + "remove them by rm -r on that directory (its name holds characters shown escaped above)"
-    return head + f"remove them with: rm -r -- {shlex.quote(str(private))}"
+        return head + "remove the directory by rm -r (its name holds characters shown escaped above)"
+    return head + f"remove the directory with: rm -r -- {shlex.quote(str(private))}"
 
 
 def render(*, session: str, result: str, refs: Sequence[str], preview: bytes, report: Mapping[str, object],
@@ -545,11 +547,15 @@ def ask_take(refs: Sequence[str], stdin: IO[str], out: IO[str]) -> str:
         out.flush()
         try:
             line = stdin.readline(ANSWER_MAX)
-            while len(line) >= ANSWER_MAX and not line.endswith("\n"):      # too long: drain to its newline
-                more = stdin.readline(ANSWER_MAX)
-                if not more:
-                    break
-                line = more
+            if len(line) >= ANSWER_MAX and not line.endswith("\n"):
+                while True:                 # too long: drain to its newline; the whole logical line is one bad answer
+                    more = stdin.readline(ANSWER_MAX)
+                    if not more:            # end of input mid-drain = the end-of-input path below
+                        line = ""
+                        break
+                    if more.endswith("\n"):
+                        line = "?\n"
+                        break
         except UnicodeDecodeError:
             line = "?\n"
         if not line:
@@ -576,14 +582,22 @@ def verify_line(wall: float) -> str:
 
 
 def warn_old_git(seams: "Seams", err: IO[str]) -> None:
-    """One ``WARNING`` line when his git is below the maintenance release of its line (Q1; never a refusal). A git
-    that cannot say its version is warned about as unparsed."""
+    """One ``WARNING`` line when his git is below the maintenance release of its line (Q1; never a refusal). The
+    probe is the take's own git, spawned the way the take spawns it (``adopt_take.git_env()``, so the same PATH
+    resolution), bounded by ``fsck_ids.VERSION_TIMEOUT``; a git that cannot say its version is warned about as unparsed."""
     from levain.slot import fsck_ids
 
     try:
-        note = fsck_ids.below_maintenance(fsck_ids.git_version_text(seams.git or "git"))
-    except Refused as e:
-        note = f"git version unparsed ({e.name})"
+        r = seams.spawn([seams.git or "git", "--version"], env=adopt_take.git_env(), stdin=subprocess.DEVNULL,
+                        capture_output=True, timeout=fsck_ids.VERSION_TIMEOUT, cwd="/")
+        if r.returncode != 0:
+            note: Optional[str] = f"git version unparsed (exit {r.returncode})"
+        else:
+            note = fsck_ids.below_maintenance(r.stdout.decode("utf-8", "replace"))
+    except subprocess.TimeoutExpired:
+        note = "git version unparsed (no answer in time)"
+    except (OSError, ValueError) as e:
+        note = f"git version unparsed ({type(e).__name__})"
     if note is not None:
         err.write("WARNING: " + adopt_preview.escape(note.encode()) + "\n")
 

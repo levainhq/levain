@@ -468,21 +468,53 @@ def test_below_maintenance_table() -> None:
     assert FI.FLOOR == (2, 39, 4)
 
 
-def test_old_git_warns_never_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
-    from levain.slot import fsck_ids as FI
+def _version_spawn(text: str, rc: int = 0, seen: Optional[list] = None):
+    def spawn(argv, **kw):
+        if seen is not None:
+            seen.append((list(argv), kw))
+        return subprocess.CompletedProcess(argv, rc, text.encode(), b"")
+    return spawn
 
-    monkeypatch.setattr(FI, "git_version_text", lambda git, **k: "git version 2.40.0\n")
+
+def test_old_git_warns_never_refuses() -> None:
     err = io.StringIO()
-    AVW.warn_old_git(AVW.Seams(git="git"), err)
+    AVW.warn_old_git(AVW.Seams(git="git", spawn=_version_spawn("git version 2.40.0\n")), err)
     assert err.getvalue().startswith("WARNING") and "2.40.0" in err.getvalue() and "2.40.2" in err.getvalue()
-    monkeypatch.setattr(FI, "git_version_text", lambda git, **k: "git version 2.54.0\n")
     err = io.StringIO()
-    AVW.warn_old_git(AVW.Seams(git="git"), err)
+    AVW.warn_old_git(AVW.Seams(git="git", spawn=_version_spawn("git version 2.54.0\n")), err)
     assert err.getvalue() == ""
-    monkeypatch.setattr(FI, "git_version_text", lambda git, **k: (_ for _ in ()).throw(Refused(FI.UNPARSED, "x")))
     err = io.StringIO()
-    AVW.warn_old_git(AVW.Seams(git="git"), err)
+    AVW.warn_old_git(AVW.Seams(git="git", spawn=_version_spawn("boom", rc=1)), err)
     assert "unparsed" in err.getvalue()
+
+    def timeout(argv, **kw):
+        raise subprocess.TimeoutExpired(argv, 1)
+    err = io.StringIO()
+    AVW.warn_old_git(AVW.Seams(git="git", spawn=timeout), err)
+    assert "unparsed" in err.getvalue()
+
+    def missing(argv, **kw):
+        raise FileNotFoundError("git")
+    err = io.StringIO()
+    AVW.warn_old_git(AVW.Seams(git="git", spawn=missing), err)
+    assert "unparsed" in err.getvalue()
+
+
+def test_the_version_probe_is_the_takes_git_under_the_takes_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # HEAD re-run finding: the warning must name the git that writes. /usr/bin/git and the PATH git differ here.
+    d = tmp_path / "bin"
+    d.mkdir()
+    fake = d / "git"
+    fake.write_text("#!/bin/sh\necho 'git version 2.40.0'\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{d}:/usr/bin:/bin")
+    err = io.StringIO()
+    AVW.warn_old_git(AVW.Seams(git="git"), err)             # the real spawn, a bare "git"
+    assert "2.40.0" in err.getvalue() and "2.40.2" in err.getvalue()
+    seen: list = []
+    AVW.warn_old_git(AVW.Seams(git="git", spawn=_version_spawn("git version 2.54.0\n", seen=seen)), io.StringIO())
+    argv, kw = seen[0]
+    assert argv == ["git", "--version"] and kw["env"] == AVW.adopt_take.git_env() and kw["timeout"] > 0
 
 
 def test_interrupt_at_the_prompt_is_one_line_exit_130() -> None:
@@ -498,3 +530,39 @@ def test_interrupt_at_the_prompt_is_one_line_exit_130() -> None:
 def test_verify_line_names_the_confined_verify_and_its_wall() -> None:
     line = AVW.verify_line(1234.0)
     assert "confined" in line and "1234" in line and line.endswith("\n")
+
+
+def test_an_overlong_answer_with_a_valid_tail_is_one_bad_answer() -> None:
+    # L3 s4b r2 complement + codex: "x"*ANSWER_MAX + "head\n" was accepted as head. The whole logical line is bad.
+    for text in ("x" * AVW.ANSWER_MAX + "head\n", "x" * (AVW.ANSWER_MAX * 3) + "head\n"):
+        out = io.StringIO()
+        assert AVW.ask_take(["head"], io.StringIO(text), out) == "none"          # then end of input
+        assert out.getvalue().count("take head / none? ") == 2
+        assert out.getvalue().count("answer one of: head, none") == 1
+    out = io.StringIO()
+    assert AVW.ask_take(["head"], io.StringIO("x" * (AVW.ANSWER_MAX + 5)), out) == "none"     # EOF mid-drain
+    assert out.getvalue().count("take head / none? ") == 1
+    out = io.StringIO()
+    assert AVW.ask_take(["head"], io.StringIO("x" * AVW.ANSWER_MAX + "head\nhead\n"), out) == "head"
+
+
+def test_removal_line_escapes_retained_filenames_and_says_directory(tmp_path: Path) -> None:
+    priv = tmp_path / "levain-adopt-x"
+    priv.mkdir()
+    for n in ("bundle", "preview.txt", "evil\x1b[31m\nname"):
+        (priv / n).write_text("x")
+    line = AVW.removal_line(priv)
+    assert "\n" not in line and not any(ord(c) < 32 or ord(c) == 0x7f for c in line)
+    assert "preview.txt" in line and "remove the directory with: rm -r -- " in line and "remove them" not in line
+
+
+def test_removal_line_names_only_the_large_copies_present(tmp_path: Path) -> None:
+    priv = tmp_path / "levain-adopt-y"
+    priv.mkdir()
+    (priv / "report.json").write_text("x")
+    line = AVW.removal_line(priv)                       # adopt-nothing-new: neither copy was made
+    assert "will be removed" not in line and "bundle" not in line and "q.idx" not in line
+    assert "report.json" in line
+    (priv / "bundle").write_text("x")
+    line = AVW.removal_line(priv)
+    assert "the bundle copies will be removed" in line and "q.idx" not in line
