@@ -708,3 +708,20 @@ def test_codec_usage_cap_hit_has_its_own_reason(cname):
 def test_usage_over_cap_reason_is_a_ledger_reason():
     from levain.broker import ledger
     assert ledger._REASON_RE.fullmatch("usage-over-cap") and "usage-over-cap" not in ledger.RESERVED_REASONS
+
+
+@pytest.mark.parametrize("cname,u", [
+    # L3 r1 complement 4 + codex 5: cached + written above the documented total is no usage, never clamped to 0
+    ("openai-chat", {"prompt_tokens": 1, "completion_tokens": 0, "prompt_tokens_details": {"cached_tokens": 1000}}),
+    ("openai-chat", {"prompt_tokens": 100, "completion_tokens": 0,
+                     "prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 41}}),
+    ("openai-responses", {"input_tokens": 1, "output_tokens": 0, "input_tokens_details": {"cached_tokens": 1000}}),
+])
+def test_codec_usage_impossible_breakdown_is_no_usage(cname, u):
+    assert _read(cname, json.dumps({"usage": u}).encode(), False) is None
+
+
+def test_codec_usage_breakdown_equal_to_the_total_is_usage():
+    body = {"usage": {"prompt_tokens": 100, "completion_tokens": 3,
+                      "prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 40}}}
+    assert _read("openai-chat", json.dumps(body).encode(), False) == _u(0, 3, 40, 60)

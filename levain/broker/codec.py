@@ -400,6 +400,15 @@ def _count(d: Any, key: str, required: bool = False) -> int:
     return v
 
 
+def _plain(total: int, cached: int, written: int, key: str) -> int:
+    """The input tokens at the plain rate: an OpenAI-shaped `total` less its cached and cache-written parts. Parts
+    that add up to more than the total are a breakdown no provider documents: no usage (charged the hold), never
+    clamped to a smaller charge."""
+    if cached + written > total:
+        raise _NoUsage(key)
+    return total - cached - written
+
+
 def _or_none(fn: Callable[[], Usage]) -> Optional[Usage]:
     try:
         return fn()
@@ -610,7 +619,7 @@ class OpenAIChat(_OpenAI):
         if det is not None and not isinstance(det, dict):
             raise _NoUsage("prompt_tokens_details")
         cached, written = _count(det, "cached_tokens"), _count(det, "cache_write_tokens")
-        return Usage(in_=max(0, _count(u, "prompt_tokens", True) - cached - written),
+        return Usage(in_=_plain(_count(u, "prompt_tokens", True), cached, written, "prompt_tokens_details"),
                      out=_count(u, "completion_tokens", True), cache_write=written, cache_read=cached)
 
 
@@ -654,8 +663,8 @@ class OpenAIResponses(_OpenAI):
         if det is not None and not isinstance(det, dict):
             raise _NoUsage("input_tokens_details")
         cached = _count(det, "cached_tokens")
-        return Usage(in_=max(0, _count(u, "input_tokens", True) - cached), out=_count(u, "output_tokens", True),
-                     cache_write=0, cache_read=cached)
+        return Usage(in_=_plain(_count(u, "input_tokens", True), cached, 0, "input_tokens_details"),
+                     out=_count(u, "output_tokens", True), cache_write=0, cache_read=cached)
 
 
 #: `body_codec` -> its codec. Every name of `policy.BODY_CODECS` but `none` (a test asserts the equality).
