@@ -42,7 +42,7 @@ from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.contracts.canon import canonical
 from levain.coordinator import chat_lease
 from levain.coordinator.chat_lease import TURN_LEASE_SCHEMA, TurnLease, TurnRefused, TurnView
-from levain.coordinator.store import WORDS_MAX, CoordError, _append_only, _in, next_gseq
+from levain.coordinator.store import WORDS_MAX, CoordError, _append_only, _in, next_gseq, schema_present
 
 __all__ = [
     "ATTACHMENTS_MAX", "AUTHOR_KINDS", "AUTHOR_SURFACES", "CHAT_SCHEMA", "EVENT_BODY_MAX", "EVENT_KINDS", "MODES",
@@ -123,8 +123,9 @@ CHAT_SCHEMA: tuple[str, ...] = (
     "op_id TEXT, vendor_anchor TEXT, vendor_turn_id TEXT, vendor_item_id TEXT, cause TEXT NOT NULL, "
     "by TEXT NOT NULL CHECK (by IN ('service', 'operator')), at TEXT NOT NULL, PRIMARY KEY (message_id, seq), "
     # the one attempt carries the service-made op_id and the vendor anchor read before it (§6, rev 3 §16 item 1); only
-    # a vendor outcome names a vendor turn or item
+    # a vendor outcome names a vendor turn or item; no other row carries an op_id or an anchor
     "CHECK (state <> 'attempted' OR (op_id IS NOT NULL AND vendor_anchor IS NOT NULL)), "
+    "CHECK (state = 'attempted' OR (op_id IS NULL AND vendor_anchor IS NULL)), "
     "CHECK (state IN ('accepted', 'ambiguous', 'not_delivered') OR (vendor_turn_id IS NULL AND "
     "vendor_item_id IS NULL)))",
     # the attempt CAS: only the transaction whose attempted row commits may call the driver (§2.2, codex Critical 3)
@@ -357,6 +358,12 @@ def record_message(conn: sqlite3.Connection, now: str, *, thread_id: str, recipi
             raise MessageConflict(f"outbox_id {outbox_id} is already stored for a different message "
                                   f"({stored.message_id}); nothing was written")
         return stored, False
+    # the chat_messages_worker trigger's own query, so a caller catching CoordError never meets its IntegrityError
+    if launch_id is not None and conn.execute(
+            "SELECT 1 FROM launches l, json_each(l.threads) j WHERE l.launch_id = ? AND l.role = 'worker' "
+            "AND j.value = ?", (launch_id, thread_id)).fetchone() is None:
+        raise CoordError(f"launch {launch_id} is not a worker launch of its thread {thread_id}; a chat message to a "
+                         "worker names a worker launch of its thread")
     message_id = "cm-" + secrets.token_hex(16)
     conn.execute("INSERT INTO chat_messages (message_id, gseq, thread_id, launch_id, recipient, author_kind, "
                  "author_surface, client_id, outbox_id, mode, expected_turn_id, owner_epoch, body, body_sha256, "
@@ -400,6 +407,9 @@ def outbox_step(conn: sqlite3.Connection, now: str, message_id: str, state: str,
         _line("an attempt's op_id", op_id, 128)
         # with no vendor position the send is cancelled before any call, never attempted blind (rev 3 §16 item 1)
         _line("an attempt's vendor anchor", vendor_anchor)
+    elif op_id is not None or vendor_anchor is not None:
+        raise OutboxRefused("only an attempt carries an op_id and a vendor anchor (the one attempt's); nothing was "
+                            "written")
     for name, value in (("an op_id", op_id), ("a vendor anchor", vendor_anchor), ("a vendor turn id", vendor_turn_id),
                         ("a vendor item id", vendor_item_id)):
         if value is not None:
@@ -430,16 +440,27 @@ def _event_row(conn: sqlite3.Connection, launch_id: str, key: str) -> ChatEvent 
     return None if r is None else ChatEvent(*r[:10], truncated=bool(r[10]), backfill=bool(r[11]), at=r[12])
 
 
+def _worker_launch(conn: sqlite3.Connection, launch_id: object) -> str:
+    """``launch_id`` if it is a worker launch, running or ended (an ended one still takes its backfill). A coordinator
+    launch holds no thread, so its events would reach no timeline while its cursor moved past them."""
+    if not isinstance(launch_id, str) or _LAUNCH_ID.fullmatch(launch_id) is None:
+        raise CoordError(f"no launch {str(launch_id)[:40]!r}")
+    row = conn.execute("SELECT role FROM launches WHERE launch_id = ?", (launch_id,)).fetchone()
+    if row is None:
+        raise CoordError(f"no launch {launch_id}")
+    if row[0] != "worker":
+        raise CoordError(f"launch {launch_id} is the coordinator's; only a worker launch has a vendor thread here")
+    return launch_id
+
+
 def record_event(conn: sqlite3.Connection, now: str, *, launch_id: str, key: str, pos: str, kind: str, body: str,
                  normalized: str, turn_id: str | None = None, call_id: str | None = None,
                  backfill: bool = False) -> tuple[ChatEvent, bool]:
-    """Record one vendor event in the caller's transaction: ``(event, True)``; a replay of a recorded key with the same
-    content writes nothing: ``(stored, False)``; the same key with other content raises :class:`EventConflict`. The
-    digests are of the WHOLE body (the reconciliation matches them against a message's); the stored body is clipped
-    to :data:`EVENT_BODY_MAX` bytes."""
-    if not isinstance(launch_id, str) or _LAUNCH_ID.fullmatch(launch_id) is None or conn.execute(
-            "SELECT 1 FROM launches WHERE launch_id = ?", (launch_id,)).fetchone() is None:
-        raise CoordError(f"no launch {str(launch_id)[:40]!r}")
+    """Record one vendor event of a worker launch in the caller's transaction: ``(event, True)``; a replay of a
+    recorded key with the same content (both digests included) writes nothing: ``(stored, False)``; the same key with
+    other content raises :class:`EventConflict`. The digests are of the WHOLE body (the reconciliation matches them
+    against a message's); the stored body is clipped to :data:`EVENT_BODY_MAX` bytes."""
+    _worker_launch(conn, launch_id)
     _line("a vendor event key", key)
     _line("a vendor position", pos)
     if kind not in EVENT_KINDS:
@@ -458,8 +479,10 @@ def record_event(conn: sqlite3.Connection, now: str, *, launch_id: str, key: str
     kept, truncated = _clip(whole.replace("\x00", "�"))
     stored = _event_row(conn, launch_id, key)
     if stored is not None:
-        if (stored.vendor_pos, stored.kind, stored.vendor_turn_id, stored.call_id, stored.body_sha256) != \
-                (pos, kind, turn_id, call_id, sha):
+        # the normalized digest too: a driver whose normalization changed mid-turn would otherwise get back a digest
+        # its reconciliation does not compute
+        if (stored.vendor_pos, stored.kind, stored.vendor_turn_id, stored.call_id, stored.body_sha256,
+                stored.body_norm_sha256) != (pos, kind, turn_id, call_id, sha, norm):
             raise EventConflict(f"vendor event {key[:60]!r} of launch {launch_id} is already recorded with other "
                                 "content; nothing was written")
         return stored, False
@@ -474,10 +497,9 @@ def record_event(conn: sqlite3.Connection, now: str, *, launch_id: str, key: str
 def record_cursor(conn: sqlite3.Connection, now: str, *, launch_id: str, vendor_cursor: str | None,
                   complete_through: str | None, gap: bool) -> int:
     """The driver's cursor after a batch, in the batch's own transaction (§2.4); the row's seq. ``complete_through``
-    is the vendor position up to which the driver asserts it read everything: the only basis for an absence."""
-    if not isinstance(launch_id, str) or _LAUNCH_ID.fullmatch(launch_id) is None or conn.execute(
-            "SELECT 1 FROM launches WHERE launch_id = ?", (launch_id,)).fetchone() is None:
-        raise CoordError(f"no launch {str(launch_id)[:40]!r}")
+    is the vendor position up to which the driver asserts it read everything: the only basis for an absence. A worker
+    launch's only."""
+    _worker_launch(conn, launch_id)
     for name, value in (("a vendor cursor", vendor_cursor), ("a complete-through position", complete_through)):
         if value is not None:
             _line(name, value, 4096)
@@ -534,13 +556,29 @@ class ChatStore:
             self._ready = True
         return conn
 
+    def _read_connect(self) -> sqlite3.Connection:
+        """A connection for a read that takes no write lock: the opener's (see its ``_read_connect``) once the chat
+        tables are in the file too; a file still missing them is made by :meth:`_connect`, under the lock."""
+        if self._ready:
+            return self._connect()
+        conn = self._opener._read_connect()
+        try:
+            present = schema_present(conn, CHAT_SCHEMA)
+        except BaseException:
+            conn.close()
+            raise
+        if present:
+            return conn
+        conn.close()
+        return self._connect()
+
     @contextmanager
     def _write(self) -> Iterator[tuple[sqlite3.Connection, str]]:
         with write_transaction(self._connect) as conn:
             yield conn, self._opener._stamp()
 
     def _read(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
-        with read_transaction(self._connect) as conn:
+        with read_transaction(self._read_connect) as conn:
             return fn(conn)
 
     # --- the turn lease (chat_lease holds the rules) ------------------------------------------------------------
@@ -550,7 +588,17 @@ class ChatStore:
             return chat_lease.settle(conn, now, launch_id)
 
     def turn_view(self, launch_id: str, owner: str) -> TurnView:
-        """What ``owner``'s composer shows: yours, free, or taken (read-only, naming the holder)."""
+        """What ``owner``'s composer shows: yours, free, or taken (read-only, naming the holder). Every composer polls
+        this, so it reads without the write lock; only an epoch that reads not-live is settled, in a write that
+        settles again under the lock (the read may be stale by then)."""
+        def read(conn: sqlite3.Connection) -> TurnView | None:
+            now = self._opener._stamp()
+            held = chat_lease.turn_lease(conn, now, launch_id)
+            return None if held is not None and not held.live else chat_lease.view(conn, now, launch_id, owner)
+
+        shown = self._read(read)
+        if shown is not None:
+            return shown
         with self._write() as (conn, now):
             chat_lease.settle(conn, now, launch_id)
             return chat_lease.view(conn, now, launch_id, owner)

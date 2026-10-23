@@ -116,7 +116,7 @@ _FORBIDDEN_MODULES = ("levain.coordinator.lease", "levain.coordinator.envelopes"
                       "levain.coordinator.launch", "levain.coordinator.codex_launch", "levain.coordinator.budget",
                       "levain.coordinator.review", "levain.coordinator.first_reader", "levain.coordinator.cli",
                       "levain.consent", "levain.broker", "levain.slot", "levain.dispatch")
-_STORE_NAMES = {"WORDS_MAX", "CoordError", "_append_only", "_in", "next_gseq"}
+_STORE_NAMES = {"WORDS_MAX", "CoordError", "_append_only", "_in", "next_gseq", "schema_present"}
 _AUTHORITY_TABLES = ("launches", "launch_events", "launch_spawns", "launch_threads", "launch_sweeps", "lease_events",
                      "coord_settings", "envelopes", "envelope_binds", "envelope_attenuations", "drops", "threads",
                      "thread_revisions", "thread_events", "replies")
@@ -807,3 +807,128 @@ def test_release_frees_the_turn(cs, world, qdir, clock):
     with pytest.raises(sqlite3.IntegrityError, match="edge §5"):
         _raw_turn(raw(qdir), clock, world["launch"], "release", token=e, owner=ME, until=None)
     assert cs.turn_claim(world["launch"], PHONE) > e
+
+
+# --- CH-D1a L3 r1 fixes (1023+26 rulings) ---------------------------------------------------------------------------
+def _coordinator_launch(store, world):
+    ln = store.launch_request(world["token"], harness="claude", role="coordinator")
+    got, why = store.launch_activate(ln.launch_id, harness_session_id="coord-1")
+    assert why is None and got.role == "coordinator"
+    return got.launch_id
+
+
+def test_events_and_cursors_name_a_worker_launch(cs, world, store, qdir, clock):
+    # codex MED 1: a coordinator launch holds no thread, so its events never reach a timeline while its cursor moves on
+    coord = _coordinator_launch(store, world)
+    with pytest.raises(CoordError, match="worker launch"):
+        ev(cs, {**world, "launch": coord})
+    with pytest.raises(CoordError, match="worker launch"):
+        with cs._write() as (conn, now):
+            chat.record_cursor(conn, now, launch_id=coord, vendor_cursor="c", complete_through=None, gap=False)
+    c = raw(qdir)
+    assert c.execute("SELECT COUNT(*) FROM chat_events").fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM chat_cursors").fetchone()[0] == 0
+    # an ended worker still takes its backfill
+    store.launch_end(world["launch"], "ended", "done")
+    assert ev(cs, world, backfill=True)[1]
+    with cs._write() as (conn, now):
+        assert chat.record_cursor(conn, now, launch_id=world["launch"], vendor_cursor="c", complete_through="p",
+                                  gap=False) == 1
+
+
+def test_event_replay_compares_the_normalized_digest(cs, world, qdir):
+    # codex MED 4: a driver whose normalization changed mid-turn replays the key with another normalized body
+    ev(cs, world)
+    with pytest.raises(EventConflict, match="other content"):
+        ev(cs, world, normalized="hello, normalized otherwise")
+    assert ev(cs, world)[1] is False
+    assert raw(qdir).execute("SELECT COUNT(*) FROM chat_events").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("field", ["op_id", "vendor_anchor"])
+def test_only_an_attempt_carries_attempt_metadata(cs, world, qdir, clock, field):
+    # codex LOW: the one attempt carries op_id and the vendor anchor; no other row may
+    m, _ = msg(cs, world)
+    with pytest.raises(OutboxRefused, match="only an attempt"):
+        step(cs, m.message_id, "pending", **{field: "x-1"})
+    c = raw(qdir)
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        c.execute(f"INSERT INTO chat_outbox_events (message_id, seq, gseq, state, {field}, cause, by, at) "
+                  "VALUES (?, 1, ?, 'pending', 'x-1', 'raw', 'service', 'x')", (m.message_id, gseq(c, clock)))
+    step(cs, m.message_id, "pending")
+    step(cs, m.message_id, "attempted")
+    with pytest.raises(OutboxRefused, match="only an attempt"):
+        step(cs, m.message_id, "accepted", **{field: "x-2"})
+    assert cs._read(lambda conn: chat.outbox_state(conn, m.message_id)) == "attempted"
+
+
+def test_message_to_another_threads_launch_is_a_coord_error(cs, world, store, qdir, clock):
+    # complement LOW 2: the refusal is the module's, never a raw IntegrityError from the trigger
+    d = store.accept_drop("another", surface="cli")[0]
+    other = store.split(d.drop_id, [Part("work", "other")])[0].thread_id
+    with pytest.raises(CoordError, match="worker launch of its thread"):
+        msg(cs, {**world, "thread": other})
+    with pytest.raises(CoordError, match="worker launch of its thread"):
+        msg(cs, world, outbox="ob-00000002", launch_id=_coordinator_launch(store, world))
+    with pytest.raises(CoordError, match="worker launch of its thread"):
+        msg(cs, world, outbox="ob-00000003", launch_id="ln-" + "0" * 32)
+    assert raw(qdir).execute("SELECT COUNT(*) FROM chat_messages").fetchone()[0] == 0
+
+
+def _answers_under_a_held_write_lock(qdir, fn):
+    """``fn()``'s result while a second connection holds ``BEGIN IMMEDIATE`` on dispatch.db; fails if ``fn`` blocks
+    (the store's busy timeout is 30 s) or raises."""
+    out: dict = {}
+
+    def run():
+        try:
+            out["value"] = fn()
+        except BaseException as exc:          # noqa: BLE001 - reported below
+            out["error"] = exc
+
+    c = raw(qdir)
+    c.execute("BEGIN IMMEDIATE")
+    t = threading.Thread(target=run, daemon=True)
+    try:
+        t.start()
+        t.join(timeout=5)
+        blocked = t.is_alive()
+    finally:
+        c.execute("ROLLBACK")
+        c.close()
+        t.join(timeout=60)
+    assert not blocked, "the read waited on the write lock"
+    assert "error" not in out, out.get("error")
+    return out["value"]
+
+
+def test_chat_show_takes_no_write_lock(cs, world, qdir):
+    # complement LOW 3: every `levain chat show` opens a fresh store; with the schema present it creates nothing
+    from levain.coordinator.cli import run_chat
+
+    msg(cs, world)
+
+    class A:
+        queue_dir = qdir
+        json = True
+        thread_id = world["thread"]
+        chat_cmd = "show"
+
+    out = io.StringIO()
+    assert _answers_under_a_held_write_lock(qdir, lambda: run_chat(A(), out)) == 0
+    assert [r["kind"] for r in json.loads(out.getvalue())["timeline"]] == ["message"]
+
+
+def test_turn_view_takes_no_write_lock_while_the_lease_reads_live(cs, world, qdir, clock):
+    # complement LOW 3: a composer polls turn_view; it writes only to settle an epoch that reads not-live
+    assert _answers_under_a_held_write_lock(qdir, lambda: cs.turn_view(world["launch"], ME)).state == "free"
+    e = cs.turn_claim(world["launch"], ME)
+    fresh = ChatStore(EnvelopeStore(qdir, clock=clock))          # a new process's first poll
+    assert _answers_under_a_held_write_lock(qdir, lambda: fresh.turn_view(world["launch"], PHONE)) == \
+        chat_lease.TurnView("taken", e, "your cockpit has this turn")
+    assert _answers_under_a_held_write_lock(qdir, lambda: cs.turn_view(world["launch"], ME)).state == "yours"
+    n = len(cs.turn_history(world["launch"]))
+    clock.advance(seconds=chat_lease.TURN_TTL.total_seconds())
+    assert cs.turn_view(world["launch"], ME).state == "free"
+    hist = cs.turn_history(world["launch"])
+    assert len(hist) == n + 1 and hist[-1][1:3] == ("lapse", e) and hist[-1][6] == "past until"
