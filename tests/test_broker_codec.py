@@ -744,3 +744,61 @@ def test_codec_usage_responses_cache_write_over_the_total_is_no_usage():
     body = {"usage": {"input_tokens": 100, "output_tokens": 7,
                       "input_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 41}}}
     assert _read("openai-responses", json.dumps(body).encode(), False) is None
+
+
+_WS1 = {"type": "web_search_call", "id": "ws_1", "status": "completed",
+        "action": {"type": "search", "query": "q"}}
+_WS2 = {"type": "web_search_call", "id": "ws_2", "status": "completed", "action": {"type": "open_page"}}
+_FS1 = {"type": "file_search_call", "id": "fs_1", "status": "completed", "queries": ["q"], "results": None}
+_MSG = UR.OPENAI_RESPONSES_JSON["output"][0]
+
+
+def test_codec_usage_responses_counts_billable_tool_calls():
+    # codex 1: the Responses output items billed per call count into `Usage.uses` under the per_use names
+    body = dict(UR.OPENAI_RESPONSES_JSON, output=[_WS1, _MSG, _WS2, _FS1, dict(_WS1)])   # ws_1 twice: one call
+    want = _u(328 - 64, 52, 0, 64, [("file_search", 1), ("web_search", 2)])
+    for step in STEPS:
+        assert _read("openai-responses", json.dumps(body).encode(), False, step) == want
+    priced = parse_price("EP", dict(EA_RAW, per_use={"web_search": 10_000, "file_search": 2_500}))
+    base = codec.price_usage(_u(328 - 64, 52, 0, 64), priced)
+    assert codec.price_usage(want, priced) == base + 2 * 10_000 + 2_500
+    assert want.meta()["usage"]["uses"] == {"file_search": 1, "web_search": 2}
+
+
+def test_codec_usage_responses_stream_counts_tool_calls_once_by_id():
+    # stream: each `response.output_item.done` item and the final event's `response.output`, deduplicated by id
+    events = [
+        ("response.created", UR.OPENAI_RESPONSES_SSE[0][1]),
+        ("response.output_item.done", {"type": "response.output_item.done", "output_index": 0, "item": _WS1}),
+        ("response.output_item.done", {"type": "response.output_item.done", "output_index": 1, "item": _FS1}),
+        ("response.completed", {"type": "response.completed", "response": {
+            "status": "completed", "output": [_WS1, _FS1, _WS2, _MSG], "usage": UR._RESP_USAGE}}),
+    ]
+    want = _u(328 - 64, 52, 0, 64, [("file_search", 1), ("web_search", 2)])
+    for step in STEPS:
+        assert _read("openai-responses", UR._sse(events), True, step) == want
+    # no final event: no usage, whatever items were seen
+    assert _read("openai-responses", UR._sse(events[:3]), True) is None
+
+
+def test_codec_usage_responses_without_tool_calls_has_no_uses():
+    assert _read("openai-responses", UR.body("openai-responses", False), False).uses == ()
+
+
+def test_codec_usage_responses_tool_call_edges(monkeypatch):
+    # an item with no string id is a call of its own (counted high, never dropped)
+    anon = {k: v for k, v in _WS1.items() if k != "id"}
+    body = dict(UR.OPENAI_RESPONSES_JSON, output=[anon, dict(anon), _WS1])
+    assert _read("openai-responses", json.dumps(body).encode(), False).uses == (("web_search", 3),)
+    # an `output` that is not a list is not the documented shape: no usage
+    body = dict(UR.OPENAI_RESPONSES_JSON, output={"0": _WS1})
+    assert _read("openai-responses", json.dumps(body).encode(), False) is None
+    # past BILLED_ITEMS_MAX distinct items, no usage (stream and non-stream)
+    monkeypatch.setattr(codec.OpenAIResponses, "BILLED_ITEMS_MAX", 2)
+    three = [dict(_WS1, id="ws_%d" % i) for i in range(3)]
+    body = dict(UR.OPENAI_RESPONSES_JSON, output=three)
+    assert _read("openai-responses", json.dumps(body).encode(), False) is None
+    assert _read("openai-responses", json.dumps(dict(body, output=three[:2])).encode(), False) is not None
+    events = [("response.output_item.done", {"type": "response.output_item.done", "item": it}) for it in three]
+    events.append(("response.completed", {"type": "response.completed", "response": {"usage": UR._RESP_USAGE}}))
+    assert _read("openai-responses", UR._sse(events), True) is None

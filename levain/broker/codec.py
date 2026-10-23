@@ -648,24 +648,72 @@ class OpenAIResponses(_OpenAI):
     # ones (`input_tokens_details.cached_tokens`), priced at `cache_read`, and the cache writes
     # (`input_tokens_details.cache_write_tokens`, when present), priced at `cache_write`; the rest at `in`.
     _FINAL = ("response.completed", "response.incomplete")
+    # A server tool's calls are not in `usage`: each is an output item. The items billed per call, by the `per_use`
+    # name their tool is priced under (https://developers.openai.com/api/docs/pricing, "Built-in tools": web search
+    # "$10.00 / 1k calls", file search tool call "$2.50 / 1k calls"; code interpreter is billed per container session,
+    # not per call, so it is not here). They are counted once per item id, from the non-stream body's `output`, or from
+    # a stream's `response.output_item.done` items and its final event's `response.output` together.
+    # [judged by lane 3c2b-fix1, 2026-10-23, against that page and https://developers.openai.com/api/docs/guides/
+    # tools-web-search ("Search actions incur a tool call cost"): every `web_search_call` item counts as one call
+    # whatever its `action`, so an `open_page` / `find_in_page` action is charged high, never low; the preview tool's
+    # calls are the same item type and count under `web_search`.]
+    _BILLED_CALLS = {"web_search_call": "web_search", "file_search_call": "file_search"}
+    #: the distinct billed items one response may report; past it the exchange has no usage
+    BILLED_ITEMS_MAX = 4096
 
     def _usage_event(self, obj: Mapping[str, Any], st: Dict[str, Any]) -> None:
-        if obj.get("type") in self._FINAL and isinstance(obj.get("response"), dict):
+        calls = st.setdefault("calls", {})
+        if obj.get("type") == "response.output_item.done":
+            self._call(obj.get("item"), calls)
+        elif obj.get("type") in self._FINAL and isinstance(obj.get("response"), dict):
             st["usage"] = obj["response"].get("usage")
+            self._calls(obj["response"], calls)
 
     def _usage_stream(self, st: Mapping[str, Any]) -> Optional[Usage]:
-        return self._usage(st["usage"]) if isinstance(st.get("usage"), dict) else None
+        return self._usage(st["usage"], st.get("calls", {})) if isinstance(st.get("usage"), dict) else None
 
     def _usage_body(self, obj: Mapping[str, Any]) -> Optional[Usage]:
-        return self._usage(obj["usage"]) if isinstance(obj.get("usage"), dict) else None
+        if not isinstance(obj.get("usage"), dict):
+            return None
+        calls: Dict[Any, str] = {}
+        self._calls(obj, calls)
+        return self._usage(obj["usage"], calls)
 
-    def _usage(self, u: Mapping[str, Any]) -> Usage:
+    def _calls(self, response: Mapping[str, Any], calls: Dict[Any, str]) -> None:
+        """Every billed item of a Response object's `output` into `calls`. An `output` that is present and not a
+        list is not the documented shape: no usage."""
+        out = response.get("output")
+        if out is None:
+            return
+        if not isinstance(out, list):
+            raise _NoUsage("output")
+        for item in out:
+            self._call(item, calls)
+
+    def _call(self, item: Any, calls: Dict[Any, str]) -> None:
+        """One output item into `calls` (item id -> `per_use` name) when it is billed per call. An item with no string
+        id is a call of its own (counted high, never dropped)."""
+        if not isinstance(item, dict):
+            return
+        name = self._BILLED_CALLS.get(item.get("type"))
+        if name is None:
+            return
+        key = item["id"] if isinstance(item.get("id"), str) else len(calls)
+        if key not in calls and len(calls) >= self.BILLED_ITEMS_MAX:
+            raise _NoUsage("output")
+        calls[key] = name
+
+    def _usage(self, u: Mapping[str, Any], calls: Mapping[Any, str]) -> Usage:
         det = u.get("input_tokens_details")
         if det is not None and not isinstance(det, dict):
             raise _NoUsage("input_tokens_details")
         cached, written = _count(det, "cached_tokens"), _count(det, "cache_write_tokens")
+        uses: Dict[str, int] = {}
+        for name in calls.values():
+            uses[name] = uses.get(name, 0) + 1
         return Usage(in_=_plain(_count(u, "input_tokens", True), cached, written, "input_tokens_details"),
-                     out=_count(u, "output_tokens", True), cache_write=written, cache_read=cached)
+                     out=_count(u, "output_tokens", True), cache_write=written, cache_read=cached,
+                     uses=tuple(sorted(uses.items())))
 
 
 #: `body_codec` -> its codec. Every name of `policy.BODY_CODECS` but `none` (a test asserts the equality).
