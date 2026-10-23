@@ -18,21 +18,54 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # The one place the shard count is written. The `plan` job reads it and emits the shard list the matrix uses.
+  # 4 shards: the 3.12 job ran ~55-67 min unsharded, so four shards of ~15-17 min leave headroom under the cap
+  # while the per-job install (~1 min) stays small. Rebalance from the per-shard durations in a run's job list.
+  TEST_SHARDS: "4"
+
 jobs:
+  plan:
+    # Ground truth for what the suite is: pytest's own collection under the repo's real config. tests/ci/shard.py
+    # partitions the collected files and fails the job if the shards do not hold each file exactly once, if any
+    # shard is empty, or if collection yielded nothing. pipefail makes a failed collection fail the step.
+    name: plan test shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      files: ${{ steps.plan.outputs.files }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install package with dev and openhands extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,openhands]" hatchling
+
+      - name: Collect the suite and plan the shards
+        id: plan
+        run: |
+          set -o pipefail
+          pytest --collect-only -q | python tests/ci/shard.py plan --shards "$TEST_SHARDS"
+
   test:
     name: pytest (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
+    needs: plan
     runs-on: ubuntu-latest
     # History: the unsharded suite outgrew 40 min (10-21) and then 60 min (10-22; run 39881613545's 3.12 job was
     # cancelled at the cap at 96% with no failure), so it was split into shards. A hang still ends at this cap.
-    # Per-shard durations are in each run's job list; rebalance by changing the shard count here and in --check.
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
-        # 4 shards: the 3.12 job ran ~55-67 min, so four shards of ~15-17 min each leave headroom under the cap
-        # while the per-job install (~1 min) stays small. The partition is computed by tests/ci/shard.py.
-        shard: [0, 1, 2, 3]
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     steps:
       - uses: actions/checkout@v6
 
@@ -55,12 +88,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,openhands]" hatchling
 
-      - name: Check the shards hold every test file exactly once
-        # Fails if the union of the 4 shards differs from the files pytest collects (a dropped or doubled file).
-        run: python tests/ci/shard.py --check 4
-
-      - name: Run pytest shard ${{ matrix.shard }} of 4
-        run: pytest -q $(python tests/ci/shard.py 4 ${{ matrix.shard }})
+      - name: Run pytest shard ${{ matrix.shard }} of ${{ env.TEST_SHARDS }}
+        # The file list arrives as JSON in an env var, becomes one path per line, and is loaded into an array,
+        # so no path is word-split or globbed. An empty list fails here instead of running the whole suite.
+        env:
+          SHARD_FILES: ${{ toJSON(fromJSON(needs.plan.outputs.files)[matrix.shard]) }}
+        run: |
+          mapfile -t files < <(python tests/ci/shard.py files)
+          test "${#files[@]}" -gt 0 || { echo "shard ${{ matrix.shard }} has no files"; exit 1; }
+          pytest -q "${files[@]}"
 
   linux-live:
     # The bwrap floor RUN, not read as data. GitHub's ubuntu runners refuse unprivileged user
