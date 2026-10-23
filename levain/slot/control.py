@@ -22,10 +22,13 @@ Session 2 builds the operator verbs (``LEASE-OPEN``, ``STATUS``) and root's (``A
 ``MINT``, ``FRONT-ARM``, ``SECRETS``, ``REVOKE``, ``REVOKED-SET``); session 3 the queue broker's
 ``QUEUE-RESOLVE`` (§3.3, §26 S1-c); S1 session 3b the keys peer's ``TOKEN-RESOLVE`` and CONTROL's side of keys'
 admin wire (:class:`KeysAdmin`, §4.9: ``FRONT-REGISTER`` fenced by the per-``front_uid`` registration counter in
-``L/sessions/front-reg/``, ``FRONT-ARM``, ``DROP-SESSION``). Root's ``SLOT-SYNC`` and keys' ``KEYS-ATTACH`` /
-``LINEAGE-APPEND`` and every dispatch verb (§3.3, §3.5, §3.6) are session 3c's: until then every other peer, and
-every other verb of a known one, is refused ``verb-not-allowed-for-peer`` (see :data:`PEER_VERBS`). Every act on
-keys and the reaper wake are seams: :class:`KeysAdmin` supplies the keys ones when CONTROL is given one.
+``L/sessions/front-reg/``, ``FRONT-ARM``, ``DROP-SESSION``); S1 session 3c-3 keys' long-lived ``KEYS-ATTACH``
+connection and the verbs it carries (``FRONT-LOST``, ``SPEND-OVERRUN``, ``SESSIONS``: §4.5, 3c design r3 §2.1 (e),
+R4 §1.4), whose EOF revokes every egress-class session, and :func:`serve`, the program's one entry. Root's
+``SLOT-SYNC``, keys' ``LINEAGE-APPEND`` and every dispatch verb (§3.3, §3.5, §3.6) are later 3c sessions': until then
+every other peer, and every other verb of a known one, is refused ``verb-not-allowed-for-peer`` (see
+:data:`PEER_VERBS`). Every act on keys and the reaper wake are seams: :class:`KeysAdmin` supplies the keys ones when
+CONTROL is given one.
 """
 from __future__ import annotations
 
@@ -35,6 +38,7 @@ import hashlib
 import hmac
 import os
 import re
+import signal
 import socket
 import struct
 import sys
@@ -60,14 +64,15 @@ _LEN = struct.Struct(">I")
 
 ROOT_UID = 0
 
-#: §3.3's verbs per peer, as built so far. Session 3c adds root's ``SLOT-SYNC``, the rest of ``_levain_keys``' row
-#: (``KEYS-ATTACH``, ``LINEAGE-APPEND``) and the ``_levain_dispatch`` row (a peer kind that :meth:`Control.peer_kind`
-#: learns from its uid); until then that peer is ``foreign``.
+#: §3.3's verbs per peer, as built so far. Later 3c sessions add root's ``SLOT-SYNC``, keys' ``LINEAGE-APPEND`` and
+#: the ``_levain_dispatch`` row (a peer kind that :meth:`Control.peer_kind` learns from its uid); until then that peer
+#: is ``foreign``. keys' ``FRONT-LOST`` / ``SPEND-OVERRUN`` / ``SESSIONS`` are answered only on the connection that
+#: holds the current ``KEYS-ATTACH`` (else ``not-attached``).
 PEER_VERBS: Mapping[str, frozenset[str]] = {
     "operator": frozenset({"LEASE-OPEN", "STATUS"}),
     "root": frozenset({"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET"}),
     "qbroker": frozenset({"QUEUE-RESOLVE"}),
-    "keys": frozenset({"TOKEN-RESOLVE"}),
+    "keys": frozenset({"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS"}),
     "foreign": frozenset(),
 }
 
@@ -84,7 +89,23 @@ _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "REVOKED-SET": (frozenset(), frozenset()),
     "QUEUE-RESOLVE": (frozenset({"slot", "cap_digest"}),) * 2,
     "TOKEN-RESOLVE": (frozenset({"token_digest"}),) * 2,
+    "KEYS-ATTACH": (frozenset({"generation", "item_sha256"}),) * 2,
+    "FRONT-LOST": (frozenset({"session"}),) * 2,
+    "SPEND-OVERRUN": (frozenset({"session", "route", "model", "ref", "overrun", "unproven"}),) * 2,
+    "SESSIONS": (frozenset({"digests"}),) * 2,
 }
+
+#: KEYS-ATTACH's ``item_sha256``: the hex SHA-256 of the route-map item keys loaded (3c design R4 §2).
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+#: SPEND-OVERRUN's ``ref``: keys' ledger hold ref ``[ledger_id, epoch, seq]``, each id 32 lower-case hex digits.
+_HEX32_RE = re.compile(r"[0-9a-f]{32}")
+#: a route id or a model name as SPEND-OVERRUN carries it (keys' own policy names; CONTROL records, never acts on them).
+_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}")
+#: DECISION: the SPEND-OVERRUN records CONTROL keeps for the card (R4 §4), oldest forgotten first. Memory only: a
+#: CONTROL restart loses them, as R4 §1.4 says (its restart is keys' attachment EOF, which refuses every token).
+SPEND_OVERRUNS_MAX = 4096
+#: DECISION: the token digests one SESSIONS may carry; keys sends more as several (a test pins its chunk below this).
+SESSIONS_DIGESTS_MAX = 512
 
 #: §3.3 / c6: a ``*_digest`` on the wire, the form the broker sends a queue cap's digest in.
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
@@ -281,6 +302,12 @@ class StateStore:
                 return self._mem.get(session)
         return self._settle(session)
 
+    def in_memory(self) -> list[R.SessionState]:
+        """Every record as memory holds it (an unsettled one as it was before its failed write), with no disk read and
+        no settle: for a path that must not miss a session because one record cannot be read (keys' attachment EOF)."""
+        with self._mu:
+            return list(self._mem.values())
+
     def all(self) -> list[R.SessionState]:
         with self._mu:
             unsettled = sorted(self._unsettled)
@@ -362,10 +389,15 @@ class Lease:
 
 @dataclass(eq=False)
 class Conn:
-    """CONTROL's view of one connection: its peer and, once ``LEASE-OPEN`` answered, its lease."""
+    """CONTROL's view of one connection: its peer and, once ``LEASE-OPEN`` answered, its lease; once ``KEYS-ATTACH``
+    answered, the attachment's number. ``after`` holds what CONTROL does once the current answer is on the wire (the
+    attach-time ``RELOAD``, R4 §10); ``sock`` lets CONTROL end a superseded attachment."""
 
     peer_uid: int | None
     lease: Lease | None = None
+    sock: socket.socket | None = field(default=None, repr=False)
+    attach_no: int | None = None
+    after: list[Callable[[], object]] = field(default_factory=list, repr=False)
 
 
 @dataclass(frozen=True)
@@ -699,7 +731,8 @@ class Control:
     peer is the broker) · ``run_facts(session) -> {run_id, job_id, run_index, contract_digest, model_requested} |
     None`` (the run a dispatch session's bound ticket names; session 3c's ticket records supply it, and the default
     knows none, so a dispatch session's ``QUEUE-RESOLVE`` is refused ``run-unknown``) · ``host`` (whose store
-    ``repo_root`` names)."""
+    ``repo_root`` names) · ``routemap_head() -> {generation, item_sha256} | None`` (CONTROL's active dispatch route-map
+    head, R4 §2; 3c-4 supplies it, and the default ``None`` sends no attach-time ``RELOAD``)."""
 
     def __init__(self, store: StateStore, operator_uid: int, *,
                  qbroker_uid: int | None = None,
@@ -715,7 +748,8 @@ class Control:
                  is_brokered: Callable[[Mapping[str, object]], bool] = _default_is_brokered,
                  clock: Callable[[], float] = time.time,
                  monotonic: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 routemap_head: Callable[[], Mapping[str, object] | None] = lambda: None) -> None:
         if type(operator_uid) is not int or operator_uid <= ROOT_UID:
             raise Refused("bad-config", f"operator uid {operator_uid!r}")
         if qbroker_uid is not None and (type(qbroker_uid) is not int or qbroker_uid <= ROOT_UID
@@ -766,6 +800,16 @@ class Control:
         store.on_settle = self._on_settle
         #: Exceptions a seam raised after a revoke landed (the revoke itself is durable by then).
         self.seam_errors: list[tuple[str, str, BaseException]] = []
+        self._routemap_head = routemap_head
+        #: keys' current attachment (the connection whose KEYS-ATTACH was answered last and has not ended), its number,
+        #: and what keys stated (and, after an attach-time RELOAD, acked) it serves on THAT attachment (R4 §2).
+        self._attach: Conn | None = None
+        self._attach_no = 0
+        self._keys_serves: dict[str, object] | None = None
+        #: (session, ref) -> the SPEND-OVERRUN record, oldest first (R4 §1.4, §4: the card's data; never a revoke).
+        self._overruns: collections.OrderedDict[tuple[str, tuple], dict[str, object]] = collections.OrderedDict()
+        #: the sessions keys reported FRONT-LOST for, oldest first, bounded (doctor / tests).
+        self.front_lost: collections.deque[str] = collections.deque(maxlen=SPEND_OVERRUNS_MAX)
 
     # -- peers -------------------------------------------------------------------------------------------
 
@@ -1578,11 +1622,200 @@ class Control:
                 raise Refused("token-revoked")         # dropped while the record was read
         return {"session": session, "claims": {k: v for k, v in rec.claims.items() if k != R.REG_TOKEN}}
 
+    # -- keys' attachment (§4.5; 3c design r3 §2.1 (e), §2.4; R4 §1.4, §2) ---------------------------------------
+
+    def _op_keys_attach(self, conn: Conn, args: dict) -> dict[str, object]:
+        """keys' long-lived connection becomes THE attachment: it states the route-map generation keys serves
+        (``generation`` + ``item_sha256``, or both ``null`` for none), recorded against this attachment only. One per
+        connection (``attach-exists``). A newer attachment supersedes an older one still open: the older one's EOF rule
+        runs (every egress-class session revoked) and its connection is closed. When CONTROL's route-map head differs
+        from what keys stated, the attach-time ``RELOAD`` goes on keys' admin wire AFTER this answer is written (R4
+        §10: keys waits on this answer, so a RELOAD sent inside the handler would stall it until V23)."""
+        gen, sha = args["generation"], args["item_sha256"]
+        serves: dict[str, object] | None
+        if gen is None and sha is None:
+            serves = None
+        else:
+            gen = R._uint(gen, "generation")
+            if type(sha) is not str:
+                raise Refused("wrong-type", "item_sha256 is a string")
+            if _SHA256_HEX_RE.fullmatch(sha) is None:
+                raise Refused("bad-value", "item_sha256")
+            serves = {"generation": gen, "item_sha256": sha}
+        with self._mu:
+            if conn.attach_no is not None:
+                raise Refused("attach-exists")
+            old = self._attach
+            self._attach_no += 1
+            no = self._attach_no
+            conn.attach_no = no
+            self._attach = conn
+            self._keys_serves = serves
+        if old is not None:
+            self._attach_revoke()                        # the superseded attachment's EOF rule
+            if old.sock is not None:
+                try:
+                    old.sock.shutdown(socket.SHUT_RDWR)  # its thread reads EOF; it is no longer the attachment
+                except OSError:
+                    pass
+        head = self._routemap_head()
+        if head is not None and dict(head) != serves:
+            want = dict(head)
+            conn.after.append(lambda: self._spawn(lambda _s: self._attach_reload(no, want), "",
+                                                  name=f"control-attach-reload-{no}"))
+        return {"attach": no}
+
+    def _attach_reload(self, no: int, head: dict[str, object]) -> None:
+        """The attach-time ``RELOAD`` of CONTROL's head (R4 §2), on keys' admin wire, for attachment ``no`` only. keys'
+        acked generation is what keys serves on that attachment from then on; a refusal is noted, and keys keeps
+        serving what it stated."""
+        with self._mu:
+            if self._attach is None or self._attach.attach_no != no:
+                return
+        if self.keys_admin is None:
+            return
+        try:
+            got = self.keys_admin.call("RELOAD", generation=head["generation"])
+        except Refused as e:
+            self.seam_errors.append(("reload", "", e))
+            return
+        with self._mu:
+            if (self._attach is not None and self._attach.attach_no == no
+                    and got.get("generation") == head["generation"]):
+                self._keys_serves = dict(head)
+
+    def keys_attach_eof(self, conn: Conn) -> None:
+        """The attachment's connection ended (:class:`ControlServer`): §4.5's "either EOF at CONTROL", unless a newer
+        attachment already superseded it (whose KEYS-ATTACH ran the rule then)."""
+        with self._mu:
+            if self._attach is not conn:
+                return
+            self._attach = None
+            self._keys_serves = None
+        self._attach_revoke()
+
+    def _attach_revoke(self) -> None:
+        """§4.5: keys' attachment ended, so keys has failed closed (no registration, no cached token); CONTROL revokes
+        every egress-class live session (work retained) and closes the other of the two connections, keys' admin wire
+        (whose EOF revokes the sessions registered on it, :meth:`_keys_eof`). The victims are read from memory, never
+        settled from disk, and their handles dropped before any write; each is then revoked on its own worker."""
+        if self._stopping.is_set():
+            return
+        if self.keys_admin is not None:
+            self.keys_admin.abort()
+        egress = {r.session for r in self.store.in_memory()
+                  if r.state in R.LIVE_STATES and r.claims.get("class") == "egress"}
+        with self._mu:
+            victims = sorted(egress | set(self._reg_epoch))
+            for session in victims:
+                self._drop_handles(session)
+        for session in victims:
+            self._spawn_keys_revoke(session)
+
+    def _require_attached(self, conn: Conn) -> None:
+        with self._mu:
+            if conn.attach_no is None or self._attach is not conn:
+                raise Refused("not-attached")
+
+    def _op_front_lost(self, conn: Conn, args: dict) -> dict[str, object]:
+        """§4.5 ``FRONT-LOST {session}``: keys saw the session's front go (its STATUS connection ended without keys'
+        ``K``, or its registration stayed unclaimed for V23 after ``FRONT-ARM``). CONTROL REVOKES the session (work
+        retained): its handles are dropped now, and the REVOKED write runs on the session's revoke worker, which retries
+        until it lands (a record already past live is left as it is). Acked ``{}`` at once; idempotent."""
+        self._require_attached(conn)
+        session = R.check_session(args["session"])
+        with self._mu:
+            self._drop_handles(session)
+            self.front_lost.append(session)
+        self._spawn_keys_revoke(session)
+        return {}
+
+    def _op_spend_overrun(self, conn: Conn, args: dict) -> dict[str, object]:
+        """R4 §1.4 step 2 ``SPEND-OVERRUN {session, route, model, ref, overrun, unproven}``: a settle cost more than
+        its hold, and keys has stopped the session itself. CONTROL RECORDS it, the data of the session's card row (R4
+        §4), and does NOT revoke: a revoke aborts streams, which would leave the calls still in flight ``uncertain`` at
+        their holds and lose their reported cost. Idempotent by ``(session, ref)``."""
+        self._require_attached(conn)
+        session = R.check_session(args["session"])
+        route, model = args["route"], args["model"]
+        for name, v in (("route", route), ("model", model)):
+            if type(v) is not str:
+                raise Refused("wrong-type", f"{name} is a string")
+            if _NAME_RE.fullmatch(v) is None:
+                raise Refused("bad-value", name)
+        ref = args["ref"]
+        if (type(ref) is not list or len(ref) != 3 or type(ref[0]) is not str or type(ref[1]) is not str
+                or _HEX32_RE.fullmatch(ref[0]) is None or _HEX32_RE.fullmatch(ref[1]) is None):
+            raise Refused("bad-value", "ref")
+        R._uint(ref[2], "ref.seq")
+        overrun = R._uint(args["overrun"], "overrun")
+        if overrun == 0:
+            raise Refused("bad-value", "overrun")
+        unproven = args["unproven"]
+        if type(unproven) is not bool:
+            raise Refused("wrong-type", "unproven is a boolean")
+        rec: dict[str, object] = {"session": session, "route": route, "model": model, "ref": list(ref),
+                                  "overrun": overrun, "unproven": unproven}
+        key = (session, (ref[0], ref[1], ref[2]))
+        with self._mu:
+            if key not in self._overruns:
+                self._overruns[key] = rec
+                while len(self._overruns) > SPEND_OVERRUNS_MAX:
+                    self._overruns.popitem(last=False)
+        return {}
+
+    def _op_sessions(self, conn: Conn, args: dict) -> dict[str, object]:
+        """3c design r3 §2.1 (e), the reconcile: ``SESSIONS {digests}``, the token digests keys holds a cached resolve
+        for. CONTROL answers ``{drop}``: each digest whose session is not LIVE here (no handles for it, which covers a
+        revoke whose DROP-SESSION never reached keys and a token CONTROL forgot; a record missing, past live, or that
+        cannot be read now). keys treats each exactly as a DROP-SESSION."""
+        self._require_attached(conn)
+        digests = args["digests"]
+        if type(digests) is not list:
+            raise Refused("wrong-type", "digests is a list")
+        if len(digests) > SESSIONS_DIGESTS_MAX:
+            raise Refused("out-of-range", "digests")
+        for d in digests:
+            if type(d) is not str or _DIGEST_RE.fullmatch(d) is None:
+                raise Refused("bad-token", "digests")
+        with self._mu:
+            by_digest = {h.token_digest: (s, h) for s, h in self._handles.items() if h.token_digest is not None}
+        drop = []
+        for d in sorted(set(digests)):
+            found = by_digest.get(d)
+            if found is None:
+                drop.append(d)
+                continue
+            session, handles = found
+            try:
+                rec = self.store.get(session)
+            except Refused:
+                rec = None                               # cannot be confirmed live: the safe answer is drop
+            with self._mu:
+                if rec is None or rec.state not in R.LIVE_STATES or self._handles.get(session) is not handles:
+                    drop.append(d)
+        return {"drop": drop}
+
     # -- test / service views --------------------------------------------------------------------------------
 
     def handles(self, session: str) -> Handles | None:
         with self._mu:
             return self._handles.get(session)
+
+    def keys_attached(self) -> int | None:
+        """The current attachment's number, or ``None`` while keys is not attached."""
+        with self._mu:
+            return None if self._attach is None else self._attach.attach_no
+
+    def keys_serves(self) -> dict[str, object] | None:
+        """The route-map generation keys stated (or acked) on the current attachment (R4 §2), ``None`` for none."""
+        with self._mu:
+            return None if self._keys_serves is None else dict(self._keys_serves)
+
+    def spend_overruns(self, session: str | None = None) -> list[dict[str, object]]:
+        """The SPEND-OVERRUN records CONTROL holds (R4 §4's card data), oldest first; ``session`` filters."""
+        with self._mu:
+            return [dict(r) for (s, _), r in self._overruns.items() if session is None or s == session]
 
 
 # --- the server ---------------------------------------------------------------------------------------------
@@ -1666,7 +1899,7 @@ class ControlServer:
             uid = self._peer_uid(sock)
         except OSError:
             uid = None
-        conn = Conn(uid)
+        conn = Conn(uid, sock=sock)
         try:
             while not self._stop.is_set():
                 try:
@@ -1684,10 +1917,19 @@ class ControlServer:
                     return
                 if not self._send(sock, self.control.handle(conn, req)):
                     return
+                while conn.after:                        # once the answer is on the wire (R4 §10)
+                    act = conn.after.pop(0)
+                    try:
+                        act()
+                    except Exception as e:   # noqa: BLE001 - an after-act's failure is noted, never the connection's
+                        self.control.seam_errors.append(("after", "", e))
         finally:
-            # The lease dies before the socket closes, so a peer that sees the close sees a dead lease.
+            # The lease dies before the socket closes, so a peer that sees the close sees a dead lease; likewise the
+            # attachment (§4.5: its EOF revokes every egress-class session).
             if conn.lease is not None and not self._stop.is_set():
                 self.control.lease_eof(conn.lease)
+            if conn.attach_no is not None and not self._stop.is_set():
+                self.control.keys_attach_eof(conn)
             with self._mu:
                 self._conns.discard(sock)
                 me = threading.current_thread()
@@ -1715,8 +1957,61 @@ class ControlServer:
             t.join(2)
 
 
+# --- the program's one entry -----------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ServeConfig:
+    """What :func:`serve` runs CONTROL from; the CONTROL program (3c-9) fills it from its argv. ``keys_admin_path`` is
+    keys' ``R/keys/admin.sock`` (``None``: no keys client, every keys act refuses ``keys-unavailable``). The last three
+    are seams for host tests: ``peer_uid`` replaces the kernel's peer read, ``ready(server)`` runs once the start pass
+    is done and the socket listens, and ``stop`` ends :func:`serve` when set."""
+
+    store_dir: Path
+    socket_path: Path
+    operator_uid: int
+    keys_admin_path: Path | None = None
+    keys_uid: int | None = None
+    qbroker_uid: int | None = None
+    host: str = "darwin" if sys.platform == "darwin" else "linux"
+    peer_uid: Callable[[socket.socket], int | None] | None = None
+    ready: Callable[[ControlServer], object] | None = None
+    stop: threading.Event | None = None
+
+
+def serve(config: ServeConfig) -> int:
+    """CONTROL as one call: the store, keys' admin client, :class:`Control`, its server; the start pass (every live
+    record revoked, every owed drop re-sent) before the socket listens; then served until SIGTERM or SIGINT (handled
+    only when called on the main thread) or ``config.stop``; then stopped the way a crash looks to every session (no
+    revoke: the next start revokes them). Returns 0."""
+    store = StateStore(Path(config.store_dir))
+    admin = KeysAdmin(config.keys_admin_path) if config.keys_admin_path is not None else None
+    control = Control(store, config.operator_uid, qbroker_uid=config.qbroker_uid, keys_uid=config.keys_uid,
+                      keys_admin=admin, host=config.host)
+    if config.peer_uid is not None:
+        server = ControlServer(control, Path(config.socket_path), peer_uid=config.peer_uid)
+    else:
+        server = ControlServer(control, Path(config.socket_path))
+    stop = config.stop if config.stop is not None else threading.Event()
+    restore: list[tuple[int, object]] = []
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            restore.append((sig, signal.signal(sig, lambda *_a: stop.set())))
+    try:
+        server.start()
+        if config.ready is not None:
+            config.ready(server)
+        while not stop.wait(0.5):
+            pass
+    finally:
+        server.stop()
+        for sig, old in restore:
+            signal.signal(sig, old)   # type: ignore[arg-type]
+    return 0
+
+
 __all__ = ["AdminRefused", "CONTROL_FORMAT", "Conn", "Control", "ControlServer", "FRAME_MAX", "FRAME_READ_S",
            "FRONT_REG_DIR", "FrameMalformed", "FrameTooLarge", "Handles", "KEYS_ANSWER_S", "KEYS_RECONNECT_FIRST_S",
            "KEYS_RECONNECT_MAX_S", "KeysAdmin", "Lease", "MAX_CONNECTIONS", "PEER_VERBS", "RETIRED_LEASES_MAX",
-           "REVOKED_TOKENS_MAX", "StateStore", "check_request", "digest_of", "encode_frame", "new_handle", "ok",
-           "read_frame", "refused", "try_lock"]
+           "REVOKED_TOKENS_MAX", "SESSIONS_DIGESTS_MAX", "SPEND_OVERRUNS_MAX", "ServeConfig", "StateStore",
+           "check_request", "digest_of", "encode_frame", "new_handle", "ok", "read_frame", "refused", "serve",
+           "try_lock"]

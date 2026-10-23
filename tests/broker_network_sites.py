@@ -31,6 +31,8 @@ NETWORK_SITES = (
     ("keys.py", "Keys.start", "start_unix_server", "asyncio.start_unix_server", 1),
     # keys' TOKEN-RESOLVE client: one connection to CONTROL's socket per resolve.
     ("keys.py", "Keys._token_resolve", "open_unix_connection", "asyncio.open_unix_connection", 1),
+    # keys' attach client (S1 3c-3): its one long-lived KEYS-ATTACH connection to CONTROL's socket.
+    ("keys.py", "Keys._attach_open", "open_unix_connection", "asyncio.open_unix_connection", 1),
     # keys' upstream client: plain TCP to the validated address (the one connect seam), and TLS on that connection.
     ("upstream.py", "_connect", "open_connection", "asyncio.open_connection", 1),
     ("upstream.py", "_handshake", "start_tls", "loop.start_tls", 1),
