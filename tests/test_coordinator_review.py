@@ -558,9 +558,59 @@ def test_g1_a_death_below_more_than_two_thousand_healthy_launches_is_filed_and_e
     assert max(seen.values()) == 1 and len(seen) == 2101        # each terminal launch evaluated exactly once, ever
 
 
-def test_g1_a_launch_that_is_not_terminal_yet_holds_the_watermark_below_it(store, clock):
+def _allocator_past(store, top):
+    """Move the store's gseq allocator past ``top``: the fixtures write gseq values by hand, and a real event is
+    always numbered by the allocator (commit order = gseq order)."""
+    c = sqlite3.connect(store.path)
+    c.execute("INSERT INTO gseq (gseq, at) VALUES (?, 'x')", (top + 100,))
+    c.commit()
+    c.close()
+
+
+def _dead_launch_above(store, template_id, top, *, cause="0 turns"):
+    """One launch that ended at ``0 turns`` (a death by the lease's rule), its events above gseq ``top``."""
+    lid = "ln-" + f"{(0xdead << 80) + top:032x}"
+    c = sqlite3.connect(store.path)
+    c.execute("INSERT INTO launches (launch_id, session_key, harness, role, threads, model, cwd, token, placement, at, gseq) "
+              "SELECT ?, ?, harness, 'worker', '[]', model, cwd, token, placement, at, ? FROM launches WHERE launch_id = ?",
+              (lid, "sk-" + lid, top + 1, template_id))
+    for seq, kind, c_ in ((1, "pending", "asked"), (2, "active", "started"), (3, "ended", cause)):
+        c.execute("INSERT INTO launch_events (launch_id, seq, gseq, kind, until, harness_session_id, cause, at) "
+                  "VALUES (?, ?, ?, ?, ?, ?, ?, '2026-10-22T21:00:00.000000Z')",
+                  (lid, seq, top + 1 + seq, kind, "2026-10-22T21:05:00.000000Z" if seq == 1 else None,
+                   "hs-" + lid if seq == 2 else None, c_))
+    c.commit()
+    c.close()
+    return lid
+
+
+def test_g1_one_long_running_launch_pins_nothing_and_every_terminal_event_is_read_once(store, clock, monkeypatch):
+    from levain.coordinator import lease
+    first, g = _spawned_launch(store)                           # still pending at the lowest gseq: never terminal here
+    top = _healthy_launches(store, first.launch_id, 2100, top=g)
+    _allocator_past(store, top + 10)
+    seen: dict[str, int] = {}
+    real = lease.launch
+
+    def counting(conn, launch_id):
+        seen[launch_id] = seen.get(launch_id, 0) + 1
+        return real(conn, launch_id)
+    monkeypatch.setattr(lease, "launch", counting)
+    for _run in range(4):
+        assert review.feed_dead_seats(store) == []
+    dead = _dead_launch_above(store, first.launch_id, top)
+    ids = [i.body["launch_id"] for i in review.feed_dead_seats(store)]
+    assert ids == [dead]                                        # filed on the first run after it died
+    for _run in range(3):
+        review.feed_dead_seats(store)
+    assert max(seen.values()) == 1 and len(seen) == 2101        # 2100 healthy + the death; the pinned one never read
+    clock.advance(hours=1)                                      # the pinned launch dies later
+    assert [i.body["launch_id"] for i in review.feed_dead_seats(store)] == [first.launch_id]
+
+
+def test_g1_a_launch_that_dies_after_the_offset_passed_its_start_is_still_filed(store, clock):
     first, g = _spawned_launch(store)                           # pending: it can still die
-    _healthy_launches(store, first.launch_id, 30, top=g)
+    _allocator_past(store, _healthy_launches(store, first.launch_id, 30, top=g) + 10)
     assert review.feed_dead_seats(store) == []
     clock.advance(hours=1)                                      # now it has expired without a start
     assert [i.body["launch_id"] for i in review.feed_dead_seats(store)] == [first.launch_id]

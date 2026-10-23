@@ -450,7 +450,6 @@ def _mark(conn: sqlite3.Connection, feed: str) -> int:
 
 
 _TERMINAL = "('failed', 'expired', 'ended')"
-_LAST_KIND = "(SELECT kind FROM launch_events e WHERE e.launch_id = l.launch_id ORDER BY e.seq DESC LIMIT 1)"
 
 
 def _lazy_expiry(store: CoordStore) -> None:
@@ -469,10 +468,13 @@ def _lazy_expiry(store: CoordStore) -> None:
 
 
 def _dead_launches(store: CoordStore) -> tuple[list[tuple[int, Any]], int]:
-    """``(the dead launches without an item as (gseq, launch), the watermark this scan reached)``. The watermark W means
-    every terminal launch with gseq < W was evaluated: the scan runs oldest first from the stored W, at most
-    ``_MAX_PAGES`` pages, and the new W is the last gseq evaluated, never past the lowest launch that is not terminal
-    (it can still die). A launch is read once; what the page bound leaves is the next run's."""
+    """``(the dead launches without an item as (gseq, launch), the watermark this scan reached)``. The watermark W is a
+    consumer offset over the append-only ``launch_events`` log: every terminal event with gseq < W was read. The scan
+    runs oldest event first from the stored W, at most ``_MAX_PAGES`` pages, and the new W is the last event read, so
+    a launch that is still running never sits below W and pins nothing. A gseq is taken inside the same
+    ``BEGIN IMMEDIATE`` transaction that appends its event (``next_gseq`` in ``lease._launch_event``), so commit order is
+    gseq order and no event lands below W after W passed it. A terminal event is read once; what the page bound leaves
+    is the next run's. Known edge: each run that reads something writes one ``review_marks`` row (a real state change)."""
     from levain.coordinator import lease
 
     _lazy_expiry(store)
@@ -482,29 +484,26 @@ def _dead_launches(store: CoordStore) -> tuple[list[tuple[int, Any]], int]:
         reached = None
         for _page in range(_MAX_PAGES):
             ids = conn.execute(
-                f"SELECT l.launch_id, l.gseq FROM launches l WHERE l.gseq >= ? AND {_LAST_KIND} IN {_TERMINAL} "
-                "AND NOT EXISTS (SELECT 1 FROM review_items r WHERE r.dedupe_key = 'seat:' || l.launch_id) "
-                "ORDER BY l.gseq ASC LIMIT ?", (cursor, _PAGE)).fetchall()
+                f"SELECT e.launch_id, e.gseq FROM launch_events e WHERE e.gseq >= ? AND e.kind IN {_TERMINAL} "
+                "AND NOT EXISTS (SELECT 1 FROM review_items r WHERE r.dedupe_key = 'seat:' || e.launch_id) "
+                "ORDER BY e.gseq ASC LIMIT ?", (cursor, _PAGE)).fetchall()
             for launch_id, gseq in ids:
                 ln = lease.launch(conn, launch_id)
                 if ln is not None and lease.launch_death(conn, ln) is True and ln.cause not in _NOT_A_DEATH:
                     found.append((gseq, ln))
             if len(ids) < _PAGE:
-                top = conn.execute("SELECT MAX(gseq) FROM launches").fetchone()[0]
+                top = conn.execute("SELECT MAX(gseq) FROM launch_events").fetchone()[0]
                 reached = start if top is None else top + 1
                 break
             cursor = reached = ids[-1][1] + 1
-        low = conn.execute(f"SELECT MIN(l.gseq) FROM launches l WHERE COALESCE({_LAST_KIND}, '') NOT IN {_TERMINAL}"
-                           ).fetchone()[0]
-    mark = start if reached is None else reached
-    return found, mark if low is None else min(mark, low)
+    return found, start if reached is None else reached
 
 
 def feed_dead_seats(store: CoordStore, *, errors: list[str] | None = None) -> list[Item]:
     """A launch that died, by the lease's own rule (:func:`levain.coordinator.lease.launch_death`: failed or expired
     after a spawn was claimed, ended at ``0 turns``, a coordinator that lost the lease without ever writing). One that
     carried an envelope-bound thread is authority-relevant. The scan keeps a persisted watermark (``_dead_launches``):
-    it advances past a launch only once its item is filed, so a row that could not be filed is tried again."""
+    it advances past a launch's terminal event only once its item is filed, so a row that could not be filed is tried again."""
     found, mark = _dead_launches(store)
     failed_at: list[int] = []
 
