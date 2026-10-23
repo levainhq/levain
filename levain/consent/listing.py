@@ -348,10 +348,14 @@ def _read_ledger_into(conn: sqlite3.Connection, out: "dict[str, dict[str, Any]]"
     raises :class:`~levain.consent.ledger.LedgerStoreError` (the same check as
     :func:`levain.consent.ledger.request_outcomes`). ``calls`` below is unqualified on purpose: the per-call view
     text names it bare and only the attached ledger has that table.
-    The refusal count is ONE grouped query over the requests of the listed grants only, joined per request to the
-    ledger's per-call ``pre`` rows (the refused ones are collected once, not rescanned per request). A request counts refused if ANY of its ``pre`` rows reads refused: a deliberate
-    choice [judged by m17 fix3 lane, 2026-10-22, against the old last-row-wins dict, which was arbitrary here], and
-    it counts once however many rows name it."""
+    The refusal count is ONE grouped query per chunk of listed grants: the listed grants' requests joined to the set
+    of request ids with a refused ``pre`` row. That set is collected from the WHOLE ledger once per chunk, so this
+    read's cost grows with the ledger's refused rows, not with the listed grants alone (known edge, L3 r4 LOW, closed
+    under the reachability line: a correlated per-request form measured ~10x slower at 20,006 requests). The queue
+    and ledger snapshots each start at their file's first read, so they are two points in time; ``refused_count``
+    cannot exceed ``count`` because the join is driven from the queue rows. A request counts refused if ANY of its
+    ``pre`` rows reads refused: a deliberate choice [judged by m17 fix3 lane, 2026-10-22, against the old
+    last-row-wins dict, which was arbitrary here], and it counts once however many rows name it."""
     from levain.consent.ledger import _PER_CALL, STORE_FORMAT as LEDGER_FORMAT, LedgerStoreError
 
     tables = {r[0] for r in conn.execute("SELECT name FROM l.sqlite_master WHERE type = 'table'")}
