@@ -339,9 +339,12 @@ def remove_group_steps(host: HostOS, name: str, gid: int, *, live: "Live", retir
 def account_state(host: HostOS, name: str, uid: int, live: "Live") -> str:
     """OURS: present at the recorded uid with Levain's LIVE label. ABSENT: no account, or it carries the retired
     label. NOT_OURS: the name at another uid or under a foreign label."""
+    return _account_state_in(host, _directory(host, live), name, uid)
+
+
+def _account_state_in(host: HostOS, d, name: str, uid: int) -> str:
     from levain.slot.removal import ABSENT, NOT_OURS, OURS
 
-    d = _directory(host, live)
     if name not in d.users:
         return ABSENT
     label = d.user_labels.get(name, "")
@@ -352,6 +355,20 @@ def account_state(host: HostOS, name: str, uid: int, live: "Live") -> str:
     return OURS if label == SLOT_MARKER else NOT_OURS
 
 
+def uid_retires(name: str, uid: int, *, users: Mapping[str, int], levain: Mapping[str, int]) -> bool:
+    """THE rule for whether a recorded ``account/1`` (``name``, ``uid``) has its uid retired: undo's plan
+    (``install_helper._uid_is_undos``, from ``HostFacts``) and repair's account step (the live directory, at the act)
+    both call this, and nothing else decides it. ``users``: every user on the host, name -> uid, any label;
+    ``levain``: the users Levain holds as its own (its live label, its tombstone, or for undo journal-present), name ->
+    uid. Retired: the name present at the uid and Levain's, or the name ABSENT (deleted by hand, say, while files it
+    owned remain: the uid must never be reissued; L3 r2 codex HIGH) and no other account at the uid. Left: the name at
+    another uid or not Levain's, or another account holding the uid (FIX1 L1)."""
+    have = users.get(name)
+    if have is not None:
+        return have == uid and levain.get(name) == uid
+    return uid not in users.values()
+
+
 def remove_account_steps(host: HostOS, name: str, uid: int, *, live: "Live",
                          end: "Callable[[int, str], tuple[bool, str]]", retire: bool = True) -> list[Step]:
     """``account/1`` (R7): the uid retired durably (``retire``; undo passes False and retires uids itself), every process ended (``end``: the caller's proven end), then the
@@ -360,7 +377,7 @@ def remove_account_steps(host: HostOS, name: str, uid: int, *, live: "Live",
     "out of every group" is read and acted here, never :func:`levain.firing.hands._darwin_leave_groups` (the host's
     own ``subprocess``)."""
     from levain.slot.ids import RETIRED_IDS_PATH, retire_ids_durably
-    from levain.slot.removal import ReadFailed, remove_step
+    from levain.slot.removal import ABSENT, NOT_OURS, ReadFailed, RemoveStep, remove_step
 
     record = ("account/1", (name, uid))
     classify = lambda: account_state(host, name, uid, live)   # noqa: E731
@@ -378,18 +395,31 @@ def remove_account_steps(host: HostOS, name: str, uid: int, *, live: "Live",
         return True, ""
 
     def retire_then_end() -> tuple[bool, str]:
-        if retire:
+        # The retire is decided from the live read, BEFORE the outcome gates the act (as group/1's gid): an ABSENT
+        # account and our tombstone at the uid are retired too, by :func:`uid_retires` (r1b-fix3).
+        try:
+            d = _directory(host, live)
+        except ReadFailed as e:
+            return False, f"account/1: the live read failed, record kept: {e}"
+        levain = {n: u for n, u in d.users.items()
+                  if d.user_labels.get(n, "") in (SLOT_MARKER, SLOT_RETIRED_MARKER[host])}
+        if retire and uid_retires(name, uid, users=d.users, levain=levain):
             try:
                 retire_ids_durably(live.at(RETIRED_IDS_PATH[host]), {uid}, fsync=live.fsync)
             except OSError as e:
                 return False, f"could not retire uid {uid} durably: {e.strerror or e}"
             live.fault("account/1:after-retire")
+        state = _account_state_in(host, d, name, uid)
+        if state == NOT_OURS:
+            live.skips.add(record)
+            return True, f"account/1 {record[1]!r} is present and not Levain's: left in place (install-skips)"
+        if state == ABSENT:
+            return True, ""
         return end(uid, name)
 
     first = f"retire {name}'s uid {uid}, then stop every process of {name}" if retire else \
         f"stop every process of {name}, and check they are gone"
-    steps = [remove_step(first, record, live, classify,
-                         retire_then_end, tools=reads)]
+    steps: list[Step] = [RemoveStep(first, call=retire_then_end, tools=reads)]
     for i, s in enumerate(tombstone_steps(host, name)):
         if s.call is not None and not isinstance(s, LeaveGroupsStep):   # a new callback needs a live body here
             raise AssertionError(f"tombstone step {s.why!r} has a callback remove_account_steps cannot route")

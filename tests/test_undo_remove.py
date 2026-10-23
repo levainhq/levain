@@ -122,12 +122,38 @@ def test_undo_over_the_same_record_retires_no_gid(tmp_path: Path) -> None:
     assert not [e for e in ev if e == ("fsync",)]
 
 
+def _no_real_store(monkeypatch) -> None:
+    """r1b-fix3: any open, os.open or unlink under the real store (either host's ``layout.STORE``, plus the macOS
+    ``/var`` spelling) fails the test. Before the fix undo's slot-state step held the REAL ``pool.lock``: a
+    PermissionError on any host where a slot install ever ran (the Linux VM's py39 run), and a silent pass here."""
+    import builtins
+    import io
+    import os
+
+    from levain.slot.layout import STORE
+
+    real = {str(p) for p in STORE.values()} | {"/var/levain"}
+
+    def guard(name, fn):
+        def go(path, *a, **kw):
+            if any(str(path) == r or str(path).startswith(r + "/") for r in real):
+                raise AssertionError(f"{name} touched the real store: {path}")
+            return fn(path, *a, **kw)
+        return go
+    monkeypatch.setattr(os, "open", guard("os.open", os.open))
+    monkeypatch.setattr(os, "unlink", guard("os.unlink", os.unlink))
+    monkeypatch.setattr(builtins, "open", guard("open", builtins.open))
+    monkeypatch.setattr(io, "open", guard("io.open", io.open))     # pathlib's opens
+
+
 def test_undo_linux_confinement_after_the_tombstones(tmp_path: Path, monkeypatch) -> None:
     from levain.firing import hands
     from levain.slot import bwrap
+    from levain.slot.layout import STORE
 
     real = hands.shutil.which                   # a Linux plan built here names tools this host lacks
     monkeypatch.setattr(hands.shutil, "which", lambda n, path=None: real(n, path=path) or f"/usr/sbin/{n}")
+    _no_real_store(monkeypatch)
 
     h, live = _host(tmp_path, "linux")
     lslots = RANGES["linux"].shared[0]
@@ -137,6 +163,10 @@ def test_undo_linux_confinement_after_the_tombstones(tmp_path: Path, monkeypatch
     h.netns.add(SlotId("egress", 0).netns)
     _bwrap(live)
     _put(live, bwrap.APPARMOR_LOADED, b"")
+    store = live.at(STORE["linux"])                # the store under Live.root: undo's slot-state step acts here
+    _put(live, STORE["linux"] / "slots" / "pool.lock", b"")
+    state = SlotId("egress", 0).slot_dir(store) / "state"
+    _put(live, state, b"x\n")
     shape = _shape(("group/1", ("levain-gone", LGID)), ("account/1", ("_levain_s0", s0)))
     h.groups["levain-gone"] = [LGID, SLOT_MARKER, set()]
     plan = IH.plan_undo(parse_install_argv(["undo"]), _facts("linux", shape), accounts={"_levain_s0": s0},
@@ -156,6 +186,7 @@ def test_undo_linux_confinement_after_the_tombstones(tmp_path: Path, monkeypatch
     assert tomb < gdel < copy and gdel < ns
     assert "levain-gone" not in h.groups and not h.netns and not live.at(bwrap.LEVAIN_BWRAP).exists()
     assert LGID not in plan.retired_after
+    assert not state.exists()                      # removed under the tmp store's lock, not the real one's
 
 
 def test_the_tombstone_callback_is_routed_by_type_not_text(tmp_path: Path, monkeypatch) -> None:
