@@ -8,8 +8,9 @@ passkey ceremony (:meth:`GrantPhone.step`): ``revoke-challenge`` then ``revoke``
 the grant under that id is no longer that one (renewed, or revoked and made again). It builds the ``revoke_grant``
 link on the server (:func:`levain.consent.grants.prepare_revoke`, judged by every rule of the log but the signature,
 on the head the instance was checked on) and HOLDS it, one per grant, for :data:`HOLD`; it answers with the
-challenge (the SSHSIG signed-data blob of the link's message in the authority namespace) and ``line``, the link's
-record, which is exactly what is signed. The page never sends a link: ``revoke`` takes only the assertion, converts
+challenge (the SSHSIG signed-data blob of the link's message in the authority namespace), ``line``, the link's
+record, which is exactly what is signed, and ``prev_hash``, the head it chains to (the message is ``prev_hash``, a
+newline, then ``line``), so the page recomputes the challenge from what it shows. The page never sends a link: ``revoke`` takes only the assertion, converts
 it (:func:`levain.consent.passkey.to_sshsig`, which checks the origin is the page's own) and appends the HELD link with
 it (:func:`levain.consent.grants.append_revoke`). The log verifies the signature itself, so an assertion over any
 other bytes is refused there, and a head that moved since the challenge refuses the link (the page asks again). A
@@ -147,8 +148,10 @@ class GrantPhone:
             # a lapsed hold is dropped here, so the held links never outgrow the grants being revoked right now
             self._held = {g: h for g, h in self._held.items() if h[2] >= now}
             self._held[grant_id] = (link, signer_fp, now + HOLD)
+        # prev_hash is the head the link chains to: with ``line`` it is the whole signed message, so the page recomputes
+        # the challenge from the line it shows and refuses one that is not over it
         return {"grant_id": grant_id, "rp_id": self.rp_id, "signer_fp": signer_fp, "line": link.record,
-                "challenge": _b64u(challenge(link.message, NAMESPACE))}
+                "prev_hash": link.prev_hash, "challenge": _b64u(challenge(link.message, NAMESPACE))}
 
     def _revoke(self, grant_id: str, req: dict[str, str]) -> dict[str, Any]:
         from levain.authority import NAMESPACE, StaleHead, VerifierUnavailable

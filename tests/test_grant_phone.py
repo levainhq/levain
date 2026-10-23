@@ -166,7 +166,8 @@ def test_the_grants_read_shows_what_each_grant_answered_and_a_revoke_line_of_one
     rows = {g["id"]: g for g in body["grants"]}
     assert set(rows) == {gid, "cg-quiet0000000"} and all(g["state"] == "live" for g in rows.values())
     hit, other = rows[answered_by], rows[next(k for k in rows if k != answered_by)]
-    assert hit["answered"]["count"] == 1 and other["answered"] == {"count": 0, "last_at": "", "recent": []}
+    assert hit["answered"]["count"] == 1 and other["answered"] == {"count": 0, "last_at": "", "recent": [],
+                                                                  "refused_count": 0}
     assert [(c["request_id"], c["tool"], c["outcome"]) for c in hit["answered"]["recent"]] == [(r.id, "Write",
                                                                                                 "accepted")]
     words = shlex.split(rows[gid]["revoke"])
@@ -258,6 +259,7 @@ def test_a_revoke_asked_from_a_listing_names_the_grant_it_showed(world) -> None:
     assert [g.id for g in grant_listing(world.root, now=_now())[0]] == ["cg-G"]
     # the new grant shows only its own answers (none), and a challenge naming it is built
     row = {g["id"]: g for g in world.gp.listing()["grants"]}["cg-G"]
-    assert row["instance"] != old["instance"] and row["answered"] == {"count": 0, "last_at": "", "recent": []}
+    assert row["instance"] != old["instance"] and row["answered"] == {"count": 0, "last_at": "", "recent": [],
+                                                                                     "refused_count": 0}
     c = world.gp.step("cg-G", "revoke-challenge", world.shown("cg-G"))
     assert json.loads(c["line"])["grant_id"] == "cg-G"

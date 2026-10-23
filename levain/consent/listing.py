@@ -270,14 +270,16 @@ def read_evidence(directory: Path | str | None = None, *, now: datetime, exclude
 
 def read_grant_evidence(directory: Path | str | None, grants: "list[tuple[str, int, str]]", *, recent: int = 5
                         ) -> dict[str, dict[str, Any]]:
-    """What each standing grant answered: ``{grant id: {"count", "last_at", "recent"}}`` for ``grants``, each
-    ``(id, seq, hash)`` of the link that created or last changed it. An answer counts for a grant only when its
+    """What each standing grant answered: ``{grant id: {"count", "last_at", "recent", "refused_count"}}`` for
+    ``grants``, each ``(id, seq, hash)`` of the link that created or last changed it. An answer counts for a grant only when its
     stored answer names all three (``grant_id``, ``grant_seq``, ``grant_hash``), so a grant revoked and made again
     under the same id starts with nothing. Read from the requests the queue allowed by a grant (``via = 'grant'``),
     over the queue's whole history. ``recent`` holds the newest ``recent`` of them, each ``{"request_id", "at",
     "tool", "cwd", "outcome"}``; ``outcome`` is the authority ledger's word for whether that call then ran
-    (``accepted``, ``refused``, ``unknown`` when the ledger holds no row for it). A grant that answered nothing is
-    absent. Same read-only rules as :func:`read_listing`, the ledger's too
+    (``accepted``, ``refused``, ``unknown`` when the ledger holds no row for it). ``refused_count`` is how many of
+    ALL its calls (not only the newest ``recent``) the ledger reads as refused, so a refusal older than those still
+    counts; a ledger that cannot be read now counts none (as ``recent`` then reads ``unknown``). A grant that
+    answered nothing is absent. Same read-only rules as :func:`read_listing`, the ledger's too
     (:func:`levain.consent.ledger.request_outcomes`); no queue (or no ledger) creates none. ``tool`` and ``cwd`` are
     the agent's text, as stored: the caller shows them through ``visible``."""
     out: dict[str, dict[str, Any]] = {}
@@ -285,11 +287,26 @@ def read_grant_evidence(directory: Path | str | None, grants: "list[tuple[str, i
     conn = _open_ro(directory) if wanted_grants else None
     if conn is None:
         return out
+    from levain.consent.ledger import DB_NAME as LEDGER_DB
+
+    base = Path(directory) if directory is not None else _default_dir()
+    ledger_path = base / LEDGER_DB
+    ledger_attached = False
     try:
+        if ledger_path.is_file():
+            # ATTACH is refused inside a transaction: it comes first, read-only, so the queue and the ledger are then
+            # read in the ONE transaction below (one snapshot: a count and a row can never disagree)
+            try:
+                conn.execute("ATTACH DATABASE ? AS l", (ledger_path.resolve().as_uri() + "?mode=ro",))
+                ledger_attached = True
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc) and "busy" not in str(exc):
+                    raise
         conn.execute("BEGIN")
         _check_format(conn)
         match = ("via = 'grant' AND state = 'allowed' AND json_extract(answer, '$.grant_id') = ? "
                  "AND json_extract(answer, '$.grant_seq') = ? AND json_extract(answer, '$.grant_hash') = ?")
+        links: dict[str, tuple[int, str]] = {}
         for gid, seq, link_hash in wanted_grants:
             n, last = conn.execute(f"SELECT COUNT(*), MAX(decided_at) FROM requests WHERE {match}",
                                    (gid, seq, link_hash)).fetchone()
@@ -300,20 +317,78 @@ def read_grant_evidence(directory: Path | str | None, grants: "list[tuple[str, i
                 "ORDER BY decided_at DESC, rowid DESC LIMIT ?", (gid, seq, link_hash, max(recent, 0))).fetchall()
             out[gid] = {"count": int(n), "last_at": last or "",
                         "recent": [{"request_id": rid, "at": at, "tool": tool, "cwd": cwd, "outcome": "unknown"}
-                                   for rid, at, tool, cwd in calls]}
+                                   for rid, at, tool, cwd in calls], "refused_count": 0}
+            links[gid] = (seq, link_hash)        # the same iteration as ``out``: count and refusals name ONE instance
+        if out and ledger_attached:
+            try:
+                _read_ledger_into(conn, out, links)
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc) and "busy" not in str(exc):
+                    raise
+                for g in out.values():           # a ledger still locked after the short wait: no outcome, none refused
+                    g["refused_count"] = 0
+                    for c in g["recent"]:
+                        c["outcome"] = "unknown"
         conn.execute("COMMIT")
     finally:
         conn.close()
-    wanted = [c["request_id"] for g in out.values() for c in g["recent"]]
-    if wanted:
-        from levain.consent.ledger import request_outcomes
-        from levain.consent.queue import default_queue_dir
-
-        outcomes = request_outcomes(Path(directory) if directory is not None else default_queue_dir(), wanted)
-        for g in out.values():
-            for c in g["recent"]:
-                c["outcome"] = outcomes.get(c["request_id"], "unknown")
     return out
+
+
+def _default_dir() -> Path:
+    from levain.consent.queue import default_queue_dir
+
+    return default_queue_dir()
+
+
+def _read_ledger_into(conn: sqlite3.Connection, out: "dict[str, dict[str, Any]]",
+                      links: "dict[str, tuple[int, str]]") -> None:
+    """Fill the outcomes of the shown rows and every grant's ``refused_count`` from the ledger attached as ``l`` to
+    ``conn``, inside the caller's one read transaction (the queue rows were read in it). A ledger of another format
+    raises :class:`~levain.consent.ledger.LedgerStoreError` (the same check as
+    :func:`levain.consent.ledger.request_outcomes`). ``calls`` below is unqualified on purpose: the per-call view
+    text names it bare and only the attached ledger has that table.
+    The refusal count is ONE grouped query per chunk of listed grants: the listed grants' requests joined to the set
+    of request ids with a refused ``pre`` row. That set is collected from the WHOLE ledger once per chunk, so this
+    read's cost grows with the ledger's refused rows, not with the listed grants alone (known edge, L3 r4 LOW, closed
+    under the reachability line: a correlated per-request form measured ~10x slower at 20,006 requests). The queue
+    and ledger snapshots each start at their file's first read, so they are two points in time; ``refused_count``
+    cannot exceed ``count`` because the join is driven from the queue rows. A request counts refused if ANY of its
+    ``pre`` rows reads refused: a deliberate choice [judged by m17 fix3 lane, 2026-10-22, against the old
+    last-row-wins dict, which was arbitrary here], and it counts once however many rows name it."""
+    from levain.consent.ledger import _PER_CALL, STORE_FORMAT as LEDGER_FORMAT, LedgerStoreError
+
+    tables = {r[0] for r in conn.execute("SELECT name FROM l.sqlite_master WHERE type = 'table'")}
+    fmt = conn.execute("SELECT value FROM l.meta WHERE key = 'format'").fetchone() if "meta" in tables else None
+    if fmt is None or fmt[0] != LEDGER_FORMAT or "calls" not in tables or "outcome" not in {
+            r[1] for r in conn.execute("PRAGMA l.table_info(calls)")}:
+        raise LedgerStoreError(f"store format {None if fmt is None else fmt[0]!r} is not {LEDGER_FORMAT!r}")
+    shown = sorted({c["request_id"] for g in out.values() for c in g["recent"]})
+    outcomes: dict[str, str] = {}
+    for i in range(0, len(shown), 500):          # bounded by ``recent`` per grant
+        chunk = shown[i:i + 500]
+        outcomes.update(conn.execute(
+            f"SELECT request_id, outcome FROM {_PER_CALL} WHERE phase = 'pre' AND request_id IN "
+            f"({', '.join('?' for _ in chunk)})", chunk).fetchall())
+    for g in out.values():
+        for c in g["recent"]:
+            c["outcome"] = outcomes.get(c["request_id"], "unknown")
+    instances = sorted({(gid, seq, h) for gid, (seq, h) in links.items()})
+    for i in range(0, len(instances), 200):
+        chunk = instances[i:i + 200]
+        params = [v for inst in chunk for v in inst]
+        rows = conn.execute(
+            "SELECT json_extract(r.answer, '$.grant_id'), json_extract(r.answer, '$.grant_seq'), "
+            "json_extract(r.answer, '$.grant_hash'), COUNT(*) FROM requests r "
+            f"JOIN (SELECT DISTINCT request_id FROM {_PER_CALL} WHERE phase = 'pre' AND outcome = 'refused') f "
+            "ON f.request_id = r.id "
+            "WHERE r.via = 'grant' AND r.state = 'allowed' AND (json_extract(r.answer, '$.grant_id'), "
+            "json_extract(r.answer, '$.grant_seq'), json_extract(r.answer, '$.grant_hash')) IN (VALUES "
+            + ", ".join("(?, ?, ?)" for _ in chunk) + ") GROUP BY 1, 2, 3", params).fetchall()
+        got = {(gid, seq, h): int(n) for gid, seq, h, n in rows}
+        for gid, g in out.items():
+            seq, h = links[gid]
+            g["refused_count"] = got.get((gid, seq, h), g["refused_count"])
 
 
 def _open_ro(directory: Path | str | None) -> sqlite3.Connection | None:
