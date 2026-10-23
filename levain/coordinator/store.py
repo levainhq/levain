@@ -730,8 +730,30 @@ class CoordStore:
         from levain.coordinator import lease
 
         with self._write() as (conn, now):
+            # C6, T6: the activation is the pin's transaction, so a leg's budget gauge is read here, in it
+            refused = self._budget_refusal(conn, now, launch_id)
+            if refused is not None:
+                return refused
             return lease.activate(conn, now, launch_id, harness_session_id=harness_session_id,
                                   argv_sha256=argv_sha256)
+
+    def _budget_refusal(self, conn: sqlite3.Connection, now: str, launch_id: str) -> Any:
+        """A pending one-thread worker whose thread's budget gauge is crossed (:mod:`levain.coordinator.budget`): the
+        launch is written ``failed`` (cause ``budget crossed``) and the SIGN to extend filed, both in this transaction,
+        and ``(launch, reason)`` returned as :func:`levain.coordinator.lease.activate` returns a refusal. None
+        otherwise (activation then decides as before)."""
+        from levain.coordinator import budget, lease
+
+        ln = lease.launch(conn, launch_id)
+        if ln is None or ln.state != "pending" or ln.role != "worker" or len(ln.threads) != 1 or \
+                ln.until is None or now >= ln.until:
+            return None
+        g = budget.gauge(conn, self.directory, ln.threads[0])
+        if g is None or g.refusal is None:
+            return None
+        lease._launch_event(conn, now, launch_id, "failed", lease.BUDGET_CROSSED)
+        budget.file_sign(self, conn, now, g)
+        return lease.launch(conn, launch_id), g.refusal
 
     def launch_end(self, launch_id: str, kind: str, cause: str) -> Any:
         from levain.coordinator import lease

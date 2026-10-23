@@ -66,6 +66,8 @@ __all__ = [
 LEASE_KINDS = ("claim", "beat", "release", "lapse", "takeover")
 LAUNCH_KINDS = ("pending", "active", "failed", "expired", "ended")
 HARNESSES = ("claude", "codex")
+# a worker refused at activation because its thread's budget gauge is crossed (C6): a stop, never a death
+BUDGET_CROSSED = "budget crossed"
 ROLES = ("coordinator", "worker")
 SETTING_AGENTS = (*HARNESSES, "none")
 _LEASE_BY = ("operator", "coordinator", "service")
@@ -756,7 +758,7 @@ def launch_death(conn: sqlite3.Connection, ln: Launch) -> bool | None:
     # a launch asked for under a lease its asker lost is not the launch's fault; one that lost the lease without ever
     # writing as coordinator died idle
     wrote = _wrote_since(conn, ln.session_key)
-    died = ln.state in ("failed", "expired") and ln.cause != "lease lost before active" \
+    died = ln.state in ("failed", "expired") and ln.cause not in ("lease lost before active", BUDGET_CROSSED) \
         or ln.state == "ended" and (ln.cause == "0 turns" or ln.cause == "lost the lease" and not wrote)
     if not died:
         return False

@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from levain import unshowable
+from levain.autonomic.durable_sqlite import read_transaction
 from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.contracts.canon import canonical
 from levain.coordinator import envelope as env
@@ -380,7 +381,7 @@ def _describe(body: dict[str, Any], store: EnvelopeStore | None = None, *, binds
         return f"{shown} allowed" if v else "0 allowed (none named: new steps stop at once)"
     L += [f"    tool calls: {_allowed(b['tool_calls'], str(b['tool_calls']))}",
           f"    tokens: {_allowed(b['tokens'], str(b['tokens']))}",
-          f"    dollars: {_allowed(b['dollars_cents'], _money(b['dollars_cents']))}",
+          f"    dollars: {_money(b['dollars_cents'])} (not metered: Levain counts no dollars, so this never stops a step)",
           f"    hours: {_allowed(b['hours'], str(b['hours']))}"]
     stop = (f"was to stop {_clock(parse_stamp(body['stop_at']))}" if ended else _stops(body['stop_at'], now))
     L.append(f"  issued {_clock(parse_stamp(body['issued_at']))}; {stop}")
@@ -545,6 +546,55 @@ def run_envelope_echo(args: argparse.Namespace, out: Any) -> int:
     _emit(out, args.json, {"body": body, "digest": env.envelope_digest(body),
                            "file": None if args.output is None else str(args.output)},
           shown + (f"\nbody written to {args.output}; sign it with `levain envelope sign {args.output} "
+                   "--signing-key KEY`" if args.output is not None else f"\nbody: {text}"))
+    return 0
+
+
+def run_envelope_extend(args: argparse.Namespace, out: Any) -> int:
+    """``levain envelope extend THREAD --budget K=N,...`` (C6, T6): the body that raises a thread's budget, for YOU to
+    sign. It is the thread's head envelope as narrowed (its effective where, effects and stop) with the budget you
+    name (keys you leave out keep the head's), a worded envelope bound to the thread's current revision that supersedes
+    the head. Writing it grants nothing: only ``levain envelope sign`` (your key) makes it an envelope."""
+    from levain.coordinator import budget
+
+    store = _store(args)
+    t = store.thread(args.thread)
+    head = store.head(t.thread_id)
+    if head is None:
+        raise CoordError(f"thread {t.thread_id} has no envelope, so no budget to extend (levain envelope echo)")
+    ended = store.end_of(head.envelope_id, t.thread_id)
+    if ended is not None:
+        raise CoordError(f"envelope {head.envelope_id} ended for this thread ({ended[0]}); a new one is an echo")
+    eff = store.effective(head.envelope_id, t.thread_id)
+    now = _tick().replace(microsecond=0)
+    if parse_stamp(eff["stop_at"]) - now < _MIN_LEFT:
+        raise CoordError(f"envelope {head.envelope_id} has stopped or stops within 5 minutes; echo a new one")
+    given = _parse_budget(args.budget)
+    named = {item.partition("=")[0].strip() for item in args.budget.split(",")}
+    new_budget = {k: (given[k] if k in named else eff["budget"][k]) for k in env.BUDGET_KEYS}
+    if new_budget == eff["budget"]:
+        raise CoordError("--budget names the budget the thread already has; nothing to extend")
+    if head.drop_id not in t.members:
+        raise CoordError(f"the head's drop {head.drop_id} left thread {t.thread_id}; echo a new envelope")
+    drop = store.drop(head.drop_id)
+    body = {"format": env.BODY_FORMAT, "store_id": store.store_id(), "envelope_id": "ev-" + secrets.token_hex(16),
+            "origin": "worded", "drop_id": drop.drop_id, "words_sha256": drop.words_sha256,
+            "binds": [{"thread_id": t.thread_id, "rev": t.rev, "members_sha256": t.members_sha256}],
+            "supersedes": {"envelope_id": head.envelope_id, "digest": head.digest},
+            "where": eff["where"], "lands": eff["lands"], "pushes": eff["pushes"], "publishes": eff["publishes"],
+            "budget": new_budget, "stop_at": eff["stop_at"], "issued_at": utc_stamp(now)}
+    text = canonical(body)
+    store.check_body(text)
+    with read_transaction(store._connect) as conn:
+        g = budget.gauge(conn, store.directory, t.thread_id)
+    used = "" if g is None else ("used so far on this thread: " + ", ".join(
+        f"{k} {budget._num(k, g.used[k])}" for k in budget.METERS) + "; dollars not metered")
+    shown = _view(body, store) + (f"\n{used}" if used else "")
+    if args.output is not None:
+        _write_new(args.output, text + "\n", args.force)
+    _emit(out, args.json, {"body": body, "digest": env.envelope_digest(body), "used": None if g is None else g.used,
+                           "file": None if args.output is None else str(args.output)},
+          shown + (f"\nbody written to {args.output}; YOU sign it: `levain envelope sign {args.output} "
                    "--signing-key KEY`" if args.output is not None else f"\nbody: {text}"))
     return 0
 
@@ -833,7 +883,8 @@ def run_envelope_narrow(args: argparse.Namespace, out: Any) -> int:
     return 0
 
 
-_ENVELOPE_RUN = {"echo": run_envelope_echo, "sign": run_envelope_sign, "accept": run_envelope_accept,
+_ENVELOPE_RUN = {"echo": run_envelope_echo, "extend": run_envelope_extend, "sign": run_envelope_sign,
+                 "accept": run_envelope_accept,
                  "show": run_envelope_show, "list": run_envelope_list, "kill": run_envelope_narrow,
                  "narrow": run_envelope_narrow}
 
@@ -1000,6 +1051,8 @@ def run_coord(args: argparse.Namespace, out: Any = None) -> int:
             return _coord_agent(args, out, store)
         if cmd in ("questions", "answer", "escalate"):
             return _coord_first_reader(args, out, store)
+        if cmd in ("morning", "away", "budget"):
+            return _coord_c6(args, out, store)
         if cmd == "launch":
             from levain.coordinator.launch import launch_session
 
@@ -1138,6 +1191,37 @@ def _coord_first_reader(args: argparse.Namespace, out: Any, store: EnvelopeStore
     _emit(out, args.json, {"item_id": item.item_id, "reply_id": reply_id},
           f"KNOW {reply_id} filed for your review ({item.item_id}); the seat gets it labelled as the coordinator's "
           "own, and the question stays open for you")
+    return 0
+
+
+def _coord_c6(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
+    """``levain coord morning|away|budget`` (C6): the morning card, away from your word, the thread budget gauges."""
+    from levain.coordinator import budget, morning
+
+    cmd = args.coord_cmd
+    if cmd == "morning":
+        c = morning.card(store)
+        _emit(out, args.json, c, morning.render(c))
+        return 0
+    if cmd == "away":
+        got = morning.away_from_drop(store, args.drop_id, token=args.token)
+        skipped = "".join(f"\n  not set for {a}: {w}" for a, w in got["skipped"].items())
+        _emit(out, args.json, got, f"away ON for {', '.join(got['marked'])} on the operator's word in drop "
+                                   f"{args.drop_id}; KNOW {got['item_id']} tells him. Only he can leave it.{skipped}")
+        return 0
+    threads = [args.thread] if args.thread else [t.thread_id for t in store.threads()]
+    with read_transaction(store._connect) as conn:
+        gauges = [g for g in (budget.gauge(conn, store.directory, t) for t in threads) if g is not None]
+    if args.thread and not gauges:
+        raise CoordError(f"thread {args.thread[:40]} has no envelope, so no budget")
+    lines = []
+    for g in gauges:
+        used = ", ".join(f"{k} {budget._num(k, g.used[k])} of {g.budget[k]}" for k in budget.METERS)
+        lines.append(f"{g.thread_id} ({g.envelope_id}): {used}; dollars not metered (Q13 counts none)")
+        lines.append(f"  {g.refusal or 'within budget: new steps may start'}")
+        if g.uncounted:
+            lines.append(f"  not counted by Q13 yet: {', '.join(r for _a, r in g.uncounted)}")
+    _emit(out, args.json, {"gauges": [g.as_dict() for g in gauges]}, "\n".join(lines) or "no thread has an envelope")
     return 0
 
 
@@ -1342,7 +1426,22 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ces.add_argument("ref", help="The question's number or id.")
     ces.add_argument("--why", required=True, help="Why it is the operator's, one line.")
     ces.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
-    for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces):
+    cmo = c_sub.add_parser(
+        "morning", help="The morning card: away, what waits UNDECIDED, thread budgets, what waits on you.",
+        description="What waits for you after a night away, read from the stores (display only: every line names the "
+                    "command that decides it, which is yours).")
+    caw = c_sub.add_parser(
+        "away", help="Read a drop as the operator's word that he is away: set away ON (never off).",
+        description="Sets away ON for both agents through `levain consent away on`'s own path, so every SIGN waits "
+                    "UNDECIDED for his morning card, and files a KNOW saying so. Leaving away takes his signature.")
+    caw.add_argument("drop_id", metavar="DROP", help="The drop whose words say he is away.")
+    caw.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
+    cbu = c_sub.add_parser(
+        "budget", help="Each thread's budget against what its sessions used (Q13's counts): the gauge.",
+        description="The budget is the thread's head envelope's; usage is Q13's count of the worker sessions pinned to "
+                    "the thread's envelopes. Crossing it stops new steps; a SIGN extends it (levain envelope extend).")
+    cbu.add_argument("thread", nargs="?", default=None, metavar="THREAD")
+    for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces, cmo, caw, cbu):
         common(p)
         p.set_defaults(func=run_coord)
 
@@ -1377,6 +1476,19 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ee.add_argument("--force", action="store_true", help="Replace an existing -o file.")
     ee.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, help=qdir_help)
     ee.add_argument("--json", action="store_true", help="Machine-readable output.")
+
+    ex = e_sub.add_parser(
+        "extend", help="Write the envelope that raises a thread's budget (a SIGN: only your signature extends it).",
+        description="The thread's head envelope, as narrowed, with the budget you name; it supersedes the head once "
+                    "you sign it with `levain envelope sign`. Keys you leave out keep the head's budget.")
+    ex.add_argument("thread", metavar="THREAD")
+    ex.add_argument("--budget", required=True, metavar="K=N,...",
+                    help="tool_calls=N,tokens=N,dollars_cents=N,hours=N: the new total for any you name.")
+    ex.add_argument("-o", "--output", type=Path, default=None, metavar="FILE",
+                    help="Write the canonical body here (default: print it).")
+    ex.add_argument("--force", action="store_true", help="Replace an existing -o file.")
+    ex.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, help=qdir_help)
+    ex.add_argument("--json", action="store_true", help="Machine-readable output.")
 
     es = e_sub.add_parser("sign", help="Read the whole envelope, then sign and accept it.")
     es.add_argument("file", type=Path, metavar="FILE")
@@ -1415,5 +1527,5 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                    help="Drop one effect, by the identity `levain envelope show` prints beside it.")
     en.add_argument("--thread", default=None, metavar="THREAD")
     common(en)
-    for p in (ee, es, ea, esh, el, ek, en):
+    for p in (ee, ex, es, ea, esh, el, ek, en):
         p.set_defaults(func=run_envelope)

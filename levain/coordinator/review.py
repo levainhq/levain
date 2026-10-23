@@ -367,12 +367,20 @@ def waiting_on_you(store: CoordStore, *, sign_open: Callable[[str], bool | None]
     """What waits on you, derived from the open SIGN and ANSWER records: ``{"threads": {thread_id: [records]},
     "loose": [records with no thread], "unresolved": [records whose state could not be read]}``. A record is
     ``{"kind", "ref_id", "reply_id", "text"}``. A thread with no open record is absent."""
+    from levain.coordinator import budget
+
     with read_transaction(store._connect) as conn:
-        rows = conn.execute("SELECT reply_id, thread_id, kind, ref_id, body FROM replies WHERE kind IN "
+        rows = conn.execute("SELECT reply_id, thread_id, kind, ref_id, body, ref_store FROM replies WHERE kind IN "
                             "('sign', 'answer') ORDER BY rowid").fetchall()
+        # a SIGN to extend a thread's budget (C6) points into this store, not queue.db: read here, in this transaction
+        now = store._stamp()
+        extend = {r[3]: budget.sign_open(conn, r[3], now) for r in rows if r[5] == budget.SIGN_REF}
     out: dict[str, Any] = {"threads": {}, "loose": [], "unresolved": []}
-    for reply_id, thread_id, kind, ref_id, body in rows:
-        state = (sign_open if kind == "sign" else answer_open)(ref_id)
+    for reply_id, thread_id, kind, ref_id, body, ref_store in rows:
+        if ref_store == budget.SIGN_REF:
+            state = extend[ref_id]
+        else:
+            state = (sign_open if kind == "sign" else answer_open)(ref_id)
         rec = {"kind": kind, "ref_id": ref_id, "reply_id": reply_id, "text": json.loads(body).get("text", "")}
         if state is None:
             out["unresolved"].append(rec)
