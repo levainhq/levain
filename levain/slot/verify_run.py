@@ -91,6 +91,7 @@ def run(argv: Sequence[str], *, result_fd: int, work: Optional[Path],
         startup_error: Optional[OSError] = None) -> int:
     out = {"rc": 1, "refused": None, "detail": "verifier aborted", "enospc": False, "result": None}
     log = None
+    interrupted = False                 # set only by THIS run's BaseException, never by a caller's active exception
     try:
         try:
             if startup_error is not None:
@@ -128,8 +129,11 @@ def run(argv: Sequence[str], *, result_fd: int, work: Optional[Path],
                 log.close()
             except OSError:
                 pass
+    except BaseException:
+        interrupted = True
+        raise
     finally:
-        if sys.exc_info()[0] is not None:
+        if interrupted:
             out.update(rc=1, refused=None, result=None, detail="verifier interrupted")
         if out["rc"] != 0 and work is not None and not _remove_quietly(work):
             out["detail"] = f"{out['detail']}; an output could not be removed"
