@@ -518,7 +518,8 @@ class AnthropicMessages(Codec):
         return d
 
     # Usage (https://platform.claude.com/docs/en/build-with-claude/streaming): `message_start.message.usage`, then the
-    # LAST `message_delta.usage`, whose counts "are cumulative", over it. `input_tokens` excludes the cache classes;
+    # LAST `message_delta.usage`, whose counts "are cumulative", over it: only its keys whose value is not null, so a
+    # null in the delta never erases a count the start reported. `input_tokens` excludes the cache classes;
     # `server_tool_use.<tool>_requests` counts a server tool's uses.
     def _usage_event(self, obj: Mapping[str, Any], st: Dict[str, Any]) -> None:
         t = obj.get("type")
@@ -531,7 +532,7 @@ class AnthropicMessages(Codec):
         start, delta = st.get("start"), st.get("delta")
         if not isinstance(start, dict) or not isinstance(delta, dict):
             return None   # a stream with no final `message_delta` reported no final count
-        return self._usage(dict(start, **delta))
+        return self._usage(dict(start, **{k: v for k, v in delta.items() if v is not None}))
 
     def _usage_body(self, obj: Mapping[str, Any]) -> Optional[Usage]:
         return self._usage(obj["usage"]) if isinstance(obj.get("usage"), dict) else None

@@ -670,3 +670,18 @@ def test_price_usage_by_class_rounded_up():
     assert codec.price_usage(_u(0, 0, 0, 0, [("web_fetch", 3)]), EA) == 0
     # one rounding: a class's product is rounded up on its own (1 token x 0.3 microdollars = 1)
     assert codec.price_usage(_u(0, 0, 0, 1), EA) == 1
+
+
+def test_codec_usage_anthropic_delta_nulls_never_override_the_start():
+    # L3 r1 complement 2: a `message_delta.usage` key whose value is null leaves `message_start`'s count standing
+    events = [e if e[0] != "message_delta" else
+              ("message_delta", dict(e[1], usage={"output_tokens": 15, "input_tokens": None,
+                                                  "cache_read_input_tokens": None,
+                                                  "cache_creation_input_tokens": None}))
+              for e in UR.ANTHROPIC_SSE]
+    assert _read("anthropic-messages", UR._sse(events), True) == _u(472, 15, 100, 200)
+    # a non-null delta count still lays over the start's (the counts are cumulative)
+    events = [e if e[0] != "message_delta" else
+              ("message_delta", dict(e[1], usage={"output_tokens": 15, "input_tokens": 480}))
+              for e in UR.ANTHROPIC_SSE]
+    assert _read("anthropic-messages", UR._sse(events), True) == _u(480, 15, 100, 200)
