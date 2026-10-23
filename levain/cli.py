@@ -3278,8 +3278,11 @@ def _cmd_cockpit_sign(args: argparse.Namespace) -> int:
 def _cmd_cockpit_key_create(args: argparse.Namespace) -> int:
     import shlex as _shlex
 
+    from levain.authority import KEY_WORD as _KEY_WORD
     from levain.authority import init_hint as _init_hint
+    from levain.authority import serve_hint as _serve_hint
     from levain.cockpit import custody as _custody
+    from levain.cockpit.firejournal import DB_NAME as _DB_NAME
     from levain.cockpit.keys import fingerprint_of
 
     try:
@@ -3302,14 +3305,22 @@ def _cmd_cockpit_key_create(args: argparse.Namespace) -> int:
           + (f"; CTK identity {made.ctk_hash}, label {made.label}" if made.ctk_hash else ""))
     print(f"public key: {made.public_path}")
     print(_GUARANTEE[made.custody])
+    here = Path.cwd()
     try:
-        root: Path | str = _cockpit_root(argparse.Namespace(path=Path.cwd(), data_root=None))
-    except (SystemExit, Exception):  # noqa: BLE001 - no install here: the operator names the cockpit's directory
-        root = "DATA_ROOT"
-    print(f"next: {_init_hint(root, made.path)}"
-          f"{' (DATA_ROOT: the cockpit directory)' if root == 'DATA_ROOT' else ''} for a new log, or `levain cockpit "
-          f"enroll {_shlex.quote(str(made.public_path))} --signing-key <an enrolled laptop-presence key>` (the custody is read "
-          "from the key's sidecar)")
+        root: Path | None = _cockpit_root(argparse.Namespace(path=here, data_root=None))
+    except (SystemExit, OSError, ValueError):     # no writable install at the cwd: no cockpit to name
+        root = None
+    if root is not None and (root / _DB_NAME).is_file():
+        print(f"next, for the cockpit under this directory ({root}): {_init_hint(root, made.path)} for a new log, or "
+              f"`{_shlex.join(['levain', 'cockpit', 'enroll', str(made.public_path), '--signing-key', _KEY_WORD, '--data-root', str(root)])}` "
+              "(the custody is read from the key's sidecar)")
+    elif root is not None:
+        print(f"next: this directory's cockpit ({root}) has not been started, so it has no journal: "
+              f"{_serve_hint(here)}, then {_init_hint(root, made.path)} for a new log")
+    else:
+        print(f"next: start your cockpit (levain serve --write --install-class reported), then give it its first "
+              f"log with levain cockpit ledger init, --signing-key {_shlex.quote(str(made.path))} and --data-root "
+              "the cockpit's directory; an existing log enrols this key with levain cockpit enroll instead")
     return 0
 
 

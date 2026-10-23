@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from levain.authority import SCHEMA as AUTHORITY_SCHEMA
-from levain.authority import AuthoritySnapshot, init_hint
+from levain.authority import AuthoritySnapshot, conn_init_hint
 from levain.autonomic.journal import JournalCorruptError
 from levain.cockpit.consent import (
     ConsentError,
@@ -1296,12 +1296,6 @@ def _credential_problem(conn: sqlite3.Connection, principal: str) -> str | None:
     if row[0] != tok[1]:
         return "token rotated"
     return None
-
-
-def conn_init_hint(conn: sqlite3.Connection) -> str:
-    """:func:`levain.authority.init_hint` for the data root whose ``cockpit.db`` is ``conn``'s main database."""
-    file = conn.execute("PRAGMA database_list").fetchone()[2]     # (seq, name, file): the main database first
-    return init_hint(Path(file).parent)
 
 
 def _key_problem(conn: sqlite3.Connection, authority: AuthoritySnapshot | None, fingerprint: str | None,
