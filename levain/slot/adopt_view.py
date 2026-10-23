@@ -39,7 +39,8 @@ His git runs only on trusted input, each spawn through :func:`_git` (``-c core.h
 --name-only --get-regexp`` and ``config --local --includes --type=bool --get-regexp`` (the partial-clone reads),
 ``rev-parse --show-object-format``, ``rev-parse --is-shallow-repository``, ``cat-file -e <base_oid>``; the take adds
 ``cat-file -e`` per
-prerequisite, ``rev-parse --git-path objects`` and ``update-ref``. A git that cannot start or outlives
+prerequisite, ``rev-parse --git-path objects`` and ``update-ref``; and once, before the take, the repo-less
+``--version`` for the maintenance warning (:func:`warn_old_git`, the take's own env, never a refusal). A git that cannot start or outlives
 :data:`REPO_GIT_TIMEOUT` = ``repo-unreadable:<errno name>`` / ``repo-unreadable:timeout``; one that answers the
 config read or ``rev-parse`` with an rc it has no meaning for = ``repo-unreadable:<rc>``.
 
