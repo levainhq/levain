@@ -41,7 +41,14 @@ function page(pending, signed, gate) {
   } } };
   const window = { isSecureContext: true, PublicKeyCredential: function () {}, localStorage: memStore(), addEventListener() {},
                    sessionStorage: memStore() };
-  const ctx = { window, navigator, fetch, document: { getElementById: () => elem(), createElement: () => elem(), querySelectorAll: () => [], addEventListener() {}, hidden: false },
+  // the document keeps its listeners, so a test can hide the page (visibilitychange) and count what is registered
+  const listeners = new Map();
+  const document = { getElementById: () => elem(), createElement: () => elem(), querySelectorAll: () => [], hidden: false,
+                     addEventListener(t, f) { if (!listeners.has(t)) listeners.set(t, []); listeners.get(t).push(f); },
+                     removeEventListener(t, f) { const l = listeners.get(t) || []; const i = l.indexOf(f); if (i >= 0) l.splice(i, 1); } };
+  const visibility = (hidden) => { document.hidden = hidden; (listeners.get("visibilitychange") || []).slice().forEach((f) => f()); };
+  const vcount = () => (listeners.get("visibilitychange") || []).length;
+  const ctx = { window, navigator, fetch, document,
                 location: { hash: "", hostname: "localhost", pathname: "/" }, history: { replaceState() {} },
                 setInterval: () => 0, btoa, atob };
   window.window = window;
@@ -57,7 +64,7 @@ function page(pending, signed, gate) {
     window.levainSign(["SHA256:a"], say, elem(), issue, (_b, _s, dismiss) => dismiss(), () => {});
     return tick().then(() => log.issued > before);
   };
-  return { window, log, say, issue, probe };
+  return { window, log, say, issue, probe, visibility, vcount };
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 30));
@@ -195,6 +202,74 @@ async function main() {
     p.log.free_after_retry = await p.probe();
     p.log.free_again = await p.probe();
     out.retry_held = p.log;
+  }
+  // L3 r3: a hidden page (a switched tab, a backgrounded PWA) dismisses the open review, so its hold never freezes
+  // the list; the hide listener lives only as long as the review and goes once it is released
+  {
+    const p = page(WAITING, { state: "COMMITTED", signer_fp: "SHA256:a" });
+    const base = p.vcount();
+    const held = {};
+    const review = (_body, sign, dismiss) => { p.log.reviewed++; held.sign = sign; held.dismiss = dismiss; };
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, (a) => p.log.done.push(a));
+    await tick();
+    p.log.listeners_open = p.vcount() - base;
+    p.visibility(true);
+    await tick();
+    p.visibility(false);
+    p.log.free_after_hide = await p.probe();
+    p.log.listeners_after = p.vcount() - base;
+    p.visibility(true);          // a later hide finds no listener of this review: nothing is released twice
+    await tick();
+    p.visibility(false);
+    p.log.free_again = await p.probe();
+    held.sign();                 // the sheet is gone: a stale tap signs nothing
+    await tick();
+    out.hidden_review = p.log;
+  }
+  // hidden while a sign is in flight: the existing rule holds, the page stays held until that sign settles, then
+  // it is released once and the listener is gone
+  {
+    let open;
+    const gate = new Promise((r) => { open = r; });
+    const p = page(WAITING, { state: "COMMITTED", signer_fp: "SHA256:a" }, gate);
+    const base = p.vcount();
+    const held = {};
+    const review = (_body, sign, dismiss) => { p.log.reviewed++; held.sign = sign; held.dismiss = dismiss; };
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, (a) => p.log.done.push(a));
+    await tick();
+    held.sign();
+    await tick();
+    p.visibility(true);
+    await tick();
+    p.visibility(false);
+    p.log.free_in_flight = await p.probe();
+    p.log.listeners_in_flight = p.vcount() - base;
+    open();
+    await tick();
+    p.log.free_after = await p.probe();
+    p.log.listeners_after = p.vcount() - base;
+    p.visibility(true);
+    await tick();
+    p.visibility(false);
+    p.log.free_again = await p.probe();
+    out.hidden_in_flight = p.log;
+  }
+  // the view-change hook point: the phone app calls window.levainDismissReviews() when its view changes, and every
+  // open review is dismissed (the same rule: a sign in flight defers the release)
+  {
+    const p = page(WAITING, { state: "COMMITTED", signer_fp: "SHA256:a" });
+    const base = p.vcount();
+    const review = (_body, _sign, _dismiss) => { p.log.reviewed++; };
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, (a) => p.log.done.push(a));
+    await tick();
+    p.log.has_hook = typeof p.window.levainDismissReviews === "function";
+    p.log.free_before = await p.probe();
+    if (p.log.has_hook) p.log.dismissed_count = p.window.levainDismissReviews();
+    await tick();
+    p.log.free_after = await p.probe();
+    p.log.listeners_after = p.vcount() - base;
+    if (p.log.has_hook) p.log.dismissed_again = p.window.levainDismissReviews();
+    out.view_change = p.log;
   }
   out.unhandled = unhandled;
   process.stdout.write(JSON.stringify(out));

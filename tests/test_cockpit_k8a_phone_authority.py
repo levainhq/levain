@@ -881,3 +881,25 @@ def test_levainsign_runs_one_sign_lifecycle_per_review():
     assert r["webauthn"] == 2 and r["posts"] == 2, r
     assert [a["status"] for a in r["done"]] == [409, 200] and r["done"][1]["body"]["state"] == "COMMITTED", r
     assert r["free_after_retry"] is True and r["free_again"] is True, r
+
+
+def test_levainsign_review_is_dismissed_when_the_page_hides_or_the_view_changes():
+    """L3 r3 (consensus MED): an open review's hold never outlives a hidden page or a view change."""
+    got = _drive_levainsign()
+    assert got["unhandled"] == [], got["unhandled"]
+    # (a) a hide dismisses the open review and frees the page; (c) its listener is gone after the release, so a
+    # later hide releases nothing twice; the sheet's stale Sign then signs nothing
+    h = got["hidden_review"]
+    assert h["listeners_open"] == 1, h
+    assert h["free_after_hide"] is True and h["listeners_after"] == 0, h
+    assert h["free_again"] is True and h["webauthn"] == 0 and h["posts"] == 0, h
+    # (b) a hide during an in-flight sign defers the release until that sign settles, then releases once
+    f = got["hidden_in_flight"]
+    assert f["free_in_flight"] is False and f["listeners_in_flight"] == 1, f
+    assert f["free_after"] is True and f["free_again"] is True and f["listeners_after"] == 0, f
+    assert f["webauthn"] == 1 and f["posts"] == 1 and len(f["done"]) == 1, f
+    # (d) the view-change hook point dismisses every open review
+    v = got["view_change"]
+    assert v["has_hook"] is True and v["free_before"] is False, v
+    assert v["dismissed_count"] == 1 and v["free_after"] is True and v["listeners_after"] == 0, v
+    assert v["dismissed_again"] == 0, v

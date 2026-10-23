@@ -842,12 +842,15 @@
   // server's STORED record, fetched by the pending's id (GET /cockpit/pending/<id>), never from bytes this page holds;
   // review(pending, sign, dismiss) shows that same record and calls sign() from its own Sign tap (a fresh gesture for the
   // passkey prompt), and is required: there is no signing without it. The page stays held (busy) while the sheet is up,
-  // until a sign() gets the server's terminal answer or the sheet calls dismiss() (a dismiss during an in-flight sign
+  // until a sign() gets the server's terminal answer or dismiss() is called: by the sheet, by the page hiding, or by
+  // the phone app's view change through window.levainDismissReviews (a dismiss during an in-flight sign
   // waits for that sign to settle), so a refresh never redraws it away; sign() runs one ceremony at a time (a second
   // tap does nothing; a non-terminal failure lets the sheet sign again, still held; after dismiss it does nothing). A pending the server no longer holds
   // WAITING (expired, or decided elsewhere) gets no sheet and no prompt. The broker verifies the signature over its own
   // copy and decides; the outcome names the signer the server persisted. done(answer) gets every outcome. This page decides nothing:
   // what it shows is the server's words.
+  // every open review's dismiss, so a view change can close them all (window.levainDismissReviews below)
+  const openReviews = new Set();
   function signPending(issue, fp, rawId, say, review, done) {
     if (busy) return;
     busy++;
@@ -872,8 +875,15 @@
           // settles. A non-terminal failure (a 4xx, a cancelled passkey, an unknown outcome) re-arms Sign and keeps the
           // hold while the sheet is open. After dismiss or release, sign() does nothing, however late it is called
           let signing = false, dismissed = false, released = false;
-          const release = () => { if (released) return; released = true; settle(); };
+          // L3 r3: for the review's lifetime a hidden page (a switched tab, a backgrounded PWA) dismisses it, and so
+          // does the phone app's view change (window.levainDismissReviews), so the hold never freezes the list
+          // behind a sheet nobody can see. Both hooks go at release, exactly once
+          const onHide = () => { if (document.hidden) dismiss(); };
+          const unhook = () => { document.removeEventListener("visibilitychange", onHide); openReviews.delete(dismiss); };
+          const release = () => { if (released) return; released = true; unhook(); settle(); };
           const dismiss = () => { if (released) return; dismissed = true; if (!signing) release(); };
+          document.addEventListener("visibilitychange", onHide);
+          openReviews.add(dismiss);
           const sign = () => {
             if (signing || dismissed || released) return;
             signing = true;
@@ -909,7 +919,7 @@
               if (!told) finish(failed(e));
             }).finally(() => { signing = false; if (terminal || dismissed) release(); });
           };
-          try { review(c.body, sign, dismiss); } catch (e) { released = true; fail(e); }
+          try { review(c.body, sign, dismiss); } catch (e) { if (!released) { released = true; unhook(); } fail(e); }
         });
       });
     }).catch((e) => { finish(failed(e)); say("the page failed (" + ((e && e.name) || "error") + ")", "bad"); })
@@ -926,6 +936,13 @@
       return;
     }
     start(null, null, signers, say, actions, false, (fp, rawId) => signPending(issue, fp, rawId, say, review, done));
+  };
+  // the hook point a view change calls (the phone app's tab/view switch): dismiss every open review, under the same
+  // rule as the sheet's own dismiss (a sign in flight releases when it settles). Answers how many it dismissed
+  window.levainDismissReviews = () => {
+    const open = Array.from(openReviews);
+    open.forEach((d) => d());
+    return open.length;
   };
 
   $("refresh").addEventListener("click", load);
