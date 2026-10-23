@@ -22,11 +22,16 @@ import pytest
 
 from levain.slot import Refused, pf, proc as P, wall
 from levain.slot.ids import SlotId
+from tests.execve_guard import refuse_real_execve
 from tests.test_slot_s2d_wall import FakeOS
 
 ROOT = str(Path(wall.__file__).resolve().parents[2])
 
 UID, GID = 3987, 3987
+
+@pytest.fixture(autouse=True)
+def _no_real_execve(monkeypatch):
+    yield from refuse_real_execve(monkeypatch, wall.os, route=True)
 
 
 # --- F-M1: RLIMIT_NPROC under kern.maxprocperuid --------------------------------------------------------------
