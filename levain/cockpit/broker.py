@@ -1043,6 +1043,9 @@ class Broker:
         request's authority snapshot (its unrevoked keys) for this verification into a fresh
         ``mkstemp`` file in the data root.
 
+        A QUARANTINED key (``levain.authority.quarantined``: its stored custody is not the one its material shows) is
+        refused first and never enters the signers file; the stored-vs-derived custody checks below are its backstop.
+
         A passkey (custody ``passkey``, Q6b) signs a pending only on the phone's terms (K8, B5's conditions): its
         signer line names ONLY ``levain-cockpit-phone`` and every other key's only ``levain-cockpit``, so a
         passkey's signature never verifies as a laptop's (nor a laptop key's as a phone's). Which checks run is

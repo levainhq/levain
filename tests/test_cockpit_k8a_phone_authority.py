@@ -509,7 +509,7 @@ def test_a_key_whose_material_is_a_passkey_never_signs_as_a_laptop_key(world):
     auth.PROCESS_CACHE.clear()
     t2 = _edit(w, 1, cred=BROWSER, tier="T2")
     e = _refused("bad_signature", w.b.submit, t2["pending_id"], mis.sign(t2["record"].encode(), COCKPIT_NAMESPACE))
-    assert "custody" in str(e) and _state(w, t2["pending_id"]) == "WAITING" and _text(w.spores, 1) == "seed 1"
+    assert "quarantined" in str(e) and _state(w, t2["pending_id"]) == "WAITING" and _text(w.spores, 1) == "seed 1"
 
 
 def test_a_device_at_its_pending_cap_can_still_cancel_its_own_pending_once(world):
