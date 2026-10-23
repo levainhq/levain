@@ -831,3 +831,32 @@ def test_no_reference_to_the_raw_body_is_held_after_the_serialization(monkeypatc
 
     out = _run(go)
     assert refs and out["alive"] is False, "the exchange still refers to the raw body"
+
+
+# --- 3c-2b fix1 (HEAD Q2): a streamed openai-chat call asks for its usage ------------------------------------------
+
+@pytest.mark.parametrize("body,want", [
+    (b'{"model":"m1","messages":[],"max_completion_tokens":10,"stream":true}', {"include_usage": True}),
+    (b'{"model":"m1","messages":[],"max_completion_tokens":10,"stream":true,"stream_options":{"x":1}}',
+     {"x": 1, "include_usage": True}),
+    (b'{"model":"m1","messages":[],"max_completion_tokens":10,"stream":true,'
+     b'"stream_options":{"include_usage":false}}', {"include_usage": False}),   # the client's explicit value stands
+    (b'{"model":"m1","messages":[],"max_completion_tokens":10}', None),          # non-stream: untouched
+])
+def test_stream_usage_written_in_for_openai_chat(monkeypatch, body, want):
+    # At step 4 beside the ceiling write-in: OpenAI sends a stream's usage only when the request carries
+    # `stream_options.include_usage`, so keys writes it in where the key is absent. The upstream echo carries it, and
+    # the hold is the estimate of the body that went upstream.
+    async def go(d: str) -> dict:
+        _write_map(d, base_route(codec="openai-chat"))
+        return await _one(d, monkeypatch, body)
+
+    out = _run(go)
+    assert _types(out["frames"]) == b"ARbe", out["frames"]
+    sent = json.loads(_sent(out["up"])[1])
+    assert sent.get("stream_options") == want
+    obj = json.loads(body)
+    if want is not None:
+        obj["stream_options"] = want
+    assert _sent(out["up"])[1] == codec.serialize(obj)
+    assert [o["amount"] for o in out["reserved"]] == [CHAT.estimate(obj, P)]

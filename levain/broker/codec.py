@@ -227,6 +227,11 @@ class Codec:
         obj[nulls[0] if nulls else self.ceiling_fields[0]] = price.default_output
         return True
 
+    def write_stream_usage(self, obj: Dict[str, Any]) -> bool:
+        """Ask a streamed request for its usage where the provider sends a stream's usage only when asked (openai-chat
+        only). Returns whether it wrote."""
+        return False
+
     # -- the estimate --------------------------------------------------------------------------------------------
 
     def _strip_images(self, obj: Any) -> Tuple[Any, int]:
@@ -592,6 +597,22 @@ class OpenAIChat(_OpenAI):
     unbounded_fields = ("web_search_options", "plugins")
     server_tools = ()
     ceiling_fields = ("max_completion_tokens", "max_tokens")
+
+    def write_stream_usage(self, obj: Dict[str, Any]) -> bool:
+        """A `stream: true` body with no `stream_options.include_usage` key gets `include_usage: true` written in
+        (OpenAI sends a stream's usage only with it; without it the call settles `no-usage` at its hold). A null
+        `stream_options` is absent; the client's explicit `include_usage`, and every other `stream_options` key, stand;
+        a `stream_options` of any other type is left for the provider to refuse."""
+        if obj.get("stream") is not True:
+            return False
+        opts = obj.get("stream_options")
+        if opts is None:
+            obj["stream_options"] = {"include_usage": True}
+            return True
+        if not isinstance(opts, dict) or "include_usage" in opts:
+            return False
+        opts["include_usage"] = True
+        return True
 
     def _n(self, obj: Mapping[str, Any]) -> int:
         if "n" not in obj:

@@ -1802,7 +1802,8 @@ class Keys:
                                                  Tuple[codec.Codec, Price], ledger.Hold]:
         """R4 §1.7 steps 4-5, ONE synchronous call (no `await` anywhere in it): the body codec's parse of the buffered
         body, its `check` (the model has a price entry; on a dispatch-shaped route, one with no per-session cap, the
-        unboundable shapes are `body-unbounded:<what>`), the ceiling written in where absent, the estimate, keys' own
+        unboundable shapes are `body-unbounded:<what>`), the ceiling written in where absent and, beside it, a streamed
+        request's usage asked for where the codec's provider sends it only when asked, the estimate, keys' own
         serialization (the bytes that go upstream; past `body_cap` it is `body-cap`, and `buf` is made to cover its
         length), the request head (`content-length` = that serialization's length, whatever framing the `Q`
         declared), and the ledger's admit LAST (a hold is admitted only for a request that
@@ -1815,9 +1816,10 @@ class Keys:
         obj = c.parse(raw.take())   # the raw bytes are unreferenced once parsed: only `data` below is kept
         checked = codec.guarded(c.check, obj, pol.prices, dispatch=pol.max_session_microdollars is None)
         codec.guarded(c.write_ceiling, obj, checked.price)
+        codec.guarded(c.write_stream_usage, obj)
         estimate = codec.guarded(c.estimate, obj, checked.price)
         data = codec.guarded(codec.serialize, obj)
-        if len(data) > pol.body_cap:   # the ceiling written in can grow a body at the cap past it
+        if len(data) > pol.body_cap:   # what is written in can grow a body at the cap past it
             raise norm.Refused("body-cap", "serialized")
         buf.cover(len(data))   # the buffer holds at least the serialization keys keeps until the upload
         head, hconn = request_head(pol, method, path, query, fwd, "length:%d" % len(data), cred)

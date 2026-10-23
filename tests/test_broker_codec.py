@@ -28,12 +28,14 @@ EO = parse_price("EO", EO_RAW)
 
 
 def _go(cname, body, entry, *, dispatch=False, model_requested=None):
-    """§1.7 step 4-5 in order: parse, check, write_ceiling, estimate; the forwarded bytes. A refusal = its name."""
+    """§1.7 step 4-5 in order: parse, check, write_ceiling, write_stream_usage, estimate; the forwarded bytes. A
+    refusal = its name."""
     c = codec.CODECS[cname]
     try:
         obj = c.parse(body.encode() if isinstance(body, str) else body)
         chk = codec.guarded(c.check, obj, {"m1": entry}, dispatch=dispatch, model_requested=model_requested)
         codec.guarded(c.write_ceiling, obj, chk.price)
+        codec.guarded(c.write_stream_usage, obj)
         return codec.guarded(c.estimate, obj, chk.price), chk.unproven, codec.serialize(obj).decode()
     except norm.Refused as r:
         return r.name
@@ -802,3 +804,28 @@ def test_codec_usage_responses_tool_call_edges(monkeypatch):
     events = [("response.output_item.done", {"type": "response.output_item.done", "item": it}) for it in three]
     events.append(("response.completed", {"type": "response.completed", "response": {"usage": UR._RESP_USAGE}}))
     assert _read("openai-responses", UR._sse(events), True) is None
+
+
+@pytest.mark.parametrize("body,want", [
+    # HEAD Q2: a streamed openai-chat body with no `stream_options.include_usage` key gets it written in
+    ({"model": "m1", "messages": [], "stream": True}, {"include_usage": True}),
+    ({"model": "m1", "messages": [], "stream": True, "stream_options": None}, {"include_usage": True}),
+    ({"model": "m1", "messages": [], "stream": True, "stream_options": {"x": 1}}, {"x": 1, "include_usage": True}),
+    # the client's explicit value stands; a non-stream body is untouched
+    ({"model": "m1", "messages": [], "stream": True, "stream_options": {"include_usage": False}}, None),
+    ({"model": "m1", "messages": [], "stream": False}, None),
+    ({"model": "m1", "messages": []}, None),
+])
+def test_codec_write_stream_usage_openai_chat(body, want):
+    obj = copy.deepcopy(body)
+    wrote = codec.CODECS["openai-chat"].write_stream_usage(obj)
+    if want is None:
+        assert wrote is False and obj == body
+    else:
+        assert wrote is True and obj == dict(body, stream_options=want)
+
+
+@pytest.mark.parametrize("cname", ["anthropic-messages", "openai-responses"])
+def test_codec_write_stream_usage_other_codecs_write_nothing(cname):
+    obj = {"model": "m1", "stream": True}
+    assert codec.CODECS[cname].write_stream_usage(obj) is False and obj == {"model": "m1", "stream": True}
