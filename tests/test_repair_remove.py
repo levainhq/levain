@@ -460,6 +460,50 @@ def test_install_skips_is_written_before_the_shape(tmp_path: Path) -> None:
     path.write_text(G.canon.canonical({"format": IH.SKIPS_FORMAT, "skips": old}))
     os.symlink("/dev/null", live.at(SUDOERS_DIR / "levain-kept")) if live.at(SUDOERS_DIR).mkdir(parents=True) is None \
         else None
-    assert IH.write_install_skips(HOST, live) == (True, "")
+    assert IH.write_install_skips(HOST, live, IH.parse_install_skips(path.read_bytes())) == (True, "")
     got = G.canon.parse(path.read_bytes())["skips"]
     assert got == [["sudoers/1", "levain-kept"], ["sudoers/1", "levain-mine"]]   # the gone alias dropped out
+
+
+# --- L3 r1 X3 + HEAD ruling R1b-6 (1022-18 r1b/L3_r1_TRIAGE.md) --------------------------------------------------
+
+def test_install_skips_malformed_or_out_of_bound_refuses_before_any_act(tmp_path: Path) -> None:
+    """X3 + HEAD ruling R1b-6: an ``install-skips`` that does not parse, or holds a known kind's identity outside its
+    bound (``["group/1", "x"]`` used to reach ``group_state`` with a missing argument at R14, after every other act),
+    refuses ``install-skips-malformed`` at plan time. An unknown kind's entry is kept and never read."""
+    canon = G.canon.canonical
+    assert IH.parse_install_skips(None) == ()
+    for raw in (b"not json at all", canon({"format": "levain-install-skips/2", "skips": []}).encode(),
+                canon({"format": IH.SKIPS_FORMAT, "skips": "x"}).encode(),
+                canon({"format": IH.SKIPS_FORMAT, "skips": [], "more": 1}).encode()):
+        with pytest.raises(Refused) as ei:
+            IH.parse_install_skips(raw)
+        assert ei.value.name == "install-skips-malformed", raw
+    bad = IH.parse_install_skips(canon({"format": IH.SKIPS_FORMAT, "skips": [["group/1", "x"]]}).encode())
+    facts, rf = _pre_change(tmp_path / "p")
+    with pytest.raises(Refused) as ei:
+        _plan(facts, replace(rf, skips=bad))
+    assert ei.value.name == "install-skips-malformed"
+    good = (("group/1", ("levain-gone", GID)), ("widget/9", G.Opaque('"anything"')))
+    assert _plan(facts, replace(rf, skips=good)).steps                      # control: in bound, and an unknown kind
+    h, live = _host(tmp_path / "w")
+    h.groups["levain-gone"] = [GID, "someone else's", set()]
+    live.at(IH.install_skips_path(HOST)).parent.mkdir(parents=True)
+    assert IH.write_install_skips(HOST, live, good) == (True, "")
+    got = G.canon.parse(live.at(IH.install_skips_path(HOST)).read_bytes())["skips"]
+    assert got == [["group/1", ["levain-gone", GID]], ["widget/9", "anything"]]
+
+
+def test_a_malformed_install_skips_refuses_repair_at_the_gather(tmp_path: Path) -> None:
+    """R1b-6 end to end: the store read under the install lock refuses, so no plan is built and nothing runs."""
+    from levain.slot.grammar import parse_install_argv
+    from tests.test_slot_s2h_install_main import OP as MOP, OP_UID, _darwin_fixture, _store_seams
+
+    run, L, state, _ = _darwin_fixture(tmp_path)
+    (L / "slots").mkdir()                                   # repair's gather reads the slots in service first
+    (L / "slots" / "pool.lock").write_text("")
+    (L / "policy" / "install-skips").write_bytes(b'{"format":"levain-install-skips/1","skips"')
+    with pytest.raises(Refused) as ei:
+        IH.gather_facts(parse_install_argv(["repair"]), "darwin", OP_UID, run=run, store_seams=_store_seams(L),
+                        state_dir=state, user_name=lambda uid: MOP)
+    assert ei.value.name == "install-skips-malformed"

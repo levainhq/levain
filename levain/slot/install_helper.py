@@ -953,6 +953,8 @@ class RepairFacts:
     #: ``--source``: the RESOLVED levain package dir and its sibling ``h11`` (§2.1 (e)); None without ``--source``.
     source: Path | None = None
     h11: Path | None = None
+    #: The earlier ``L/policy/install-skips`` entries (:func:`parse_install_skips`; R14 re-reads each live).
+    skips: tuple = ()
 
 
 def install_shape_path(host: HostOS) -> Path:
@@ -1125,16 +1127,37 @@ def install_skips_path(host: HostOS) -> Path:
     return operator_record_path(host).parent / "install-skips"
 
 
-def _skips_now(host: HostOS, live: RM.Live, path: Path) -> list:
-    """§2.3 R14: this run's NOT_OURS records plus every earlier entry whose object is still present (re-read live; a
-    read that fails keeps it). An entry the operator removed by hand drops out."""
-    earlier: list = []
+def parse_install_skips(raw: bytes | None) -> tuple:
+    """The earlier ``install-skips`` entries, from the bytes R0 read through the store under the install lock (None:
+    no file, so none). Bytes that are not a ``levain-install-skips/1`` record holding a well-formed managed list
+    refuse ``install-skips-malformed`` (HEAD ruling R1b-6): read as empty, its NOT_OURS entries would be lost, and
+    doctor would go green over a foreign object left in place. The per-kind bounds are :func:`check_install_skips`',
+    at plan time."""
+    if raw is None:
+        return ()
+    bad = "install-skips-malformed"
     try:
-        obj = canon.parse(live.at(path).read_bytes())
-        if isinstance(obj, dict) and obj.get("format") == SKIPS_FORMAT:
-            earlier = list(gen_mod.parse_managed(obj.get("skips"), what="install-skips"))
-    except (OSError, canon.ContractError, Refused):
-        earlier = []
+        obj = canon.parse(raw)
+    except canon.ContractError as e:
+        raise Refused(bad, str(e)) from None
+    if not isinstance(obj, dict) or set(obj) != {"format", "skips"} or obj["format"] != SKIPS_FORMAT:
+        raise Refused(bad, f"not a {SKIPS_FORMAT} record")
+    return gen_mod.parse_managed(obj["skips"], what="install-skips")
+
+
+def check_install_skips(host: HostOS, skips: Iterable, *, operator: str) -> None:
+    """Every earlier entry of a kind this code holds passes that kind's bound (§1.1), else ``install-skips-malformed``
+    before any act: R14 re-reads each entry through its kind's live read, which takes only a bounded identity. An
+    unknown kind's entry is kept as it is and never read (it names nothing this code can inspect)."""
+    for kind, ident in skips:
+        if kind in gen_mod.KINDS and (isinstance(ident, gen_mod.Opaque) or not gen_mod.KINDS[kind](host, ident, operator)):
+            raise Refused("install-skips-malformed", f"{kind} {canon.canonical(gen_mod._thaw(ident))} breaks its bound")
+
+
+def _skips_now(host: HostOS, live: RM.Live, earlier: Iterable) -> list:
+    """§2.3 R14: this run's NOT_OURS records plus every earlier entry (read at R0, bound-checked at plan time) whose
+    object is still present (re-read live; a read that fails keeps it). An entry the operator removed by hand drops
+    out."""
     keep = set(live.skips)
     for kind, ident in earlier:
         try:
@@ -1145,11 +1168,11 @@ def _skips_now(host: HostOS, live: RM.Live, path: Path) -> list:
     return gen_mod.managed_json(keep)
 
 
-def write_install_skips(host: HostOS, live: RM.Live) -> tuple[bool, str]:
+def write_install_skips(host: HostOS, live: RM.Live, earlier: Iterable = ()) -> tuple[bool, str]:
     """``L/policy/install-skips`` (root 0644), durably, BEFORE ``install-shape`` (DESIGN X4-M2), so the shape's
-    write stays the one completion commit."""
+    write stays the one completion commit. ``earlier``: :func:`parse_install_skips`' entries (``RepairFacts.skips``)."""
     path = install_skips_path(host)
-    text = canon.canonical({"format": SKIPS_FORMAT, "skips": _skips_now(host, live, path)})
+    text = canon.canonical({"format": SKIPS_FORMAT, "skips": _skips_now(host, live, earlier)})
     return gen_mod.write_record_durably(live.at(path), text)
 
 
@@ -1244,6 +1267,7 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     previous = frozenset(shape.managed) if shape is not None else frozenset()
     journaled = frozenset(journal.managed) if journal is not None else frozenset()
     check_records(facts, operator)                                     # U15: the preflight every mutating verb runs
+    check_install_skips(host, rf.skips, operator=operator)              # R1b-6: before any act
     if journal is not None:
         _, foreign = _journal_presence(facts)
         if foreign:
@@ -1320,7 +1344,7 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     def record() -> tuple[bool, str]:
         new = gen_mod.InstallShape(target, versions[0], versions[1], run_txn, {**carried, **noted},
                                    _shape_of(desired))
-        ok, why = write_install_skips(host, live)          # X4-M2: before the shape, the one completion commit
+        ok, why = write_install_skips(host, live, rf.skips)    # X4-M2: before the shape, the one completion commit
         if not ok:
             return ok, why
         return gen_mod.write_record_durably(shape_path, gen_mod.shape_text(new))
@@ -1621,7 +1645,7 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
         q.hold()        # before the live-lease count below, so the count is one no prepare can change
     retired_path = Path(state_dir) / RETIRED_IDS_PATH[host].name if state_dir else RETIRED_IDS_PATH[host]
     intent_path = Path(state_dir) / INTENT_PATH[host].name if state_dir else INTENT_PATH[host]
-    orec, in_service, pool, configured, shape = None, None, None, {}, None
+    orec, in_service, pool, configured, shape, skips = None, None, None, {}, None, ()
     if os.path.lexists(L):
         # Read as the runtime helper reads the store: one dirfd, every component O_NOFOLLOW, root's dirs only.
         store = RH.Store(rs)
@@ -1643,6 +1667,8 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
                 configured = {cls: tuple(sorted(i)) for cls, i in RH.configured_slots(store).items()}
                 raw = store.read(("policy",), "pool")
                 pool = parse_pool_config(raw) if raw is not None else None
+            if cmd.verb == "repair" and orec is not None:     # R1b-6: a malformed one refuses here, before any act
+                skips = parse_install_skips(store.read(("policy",), "install-skips", cap=gen_mod.MAX_RECORD_BYTES))
         finally:
             store.close()
     journal = read_intent(host, path=intent_path)
@@ -1673,7 +1699,8 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
         existing_names=frozenset(d.users) | frozenset(d.groups), retired=read_retired_ids(retired_path),
         levain_tombstones=tombs, levain_live=live, intent=journal, host_ids=host_ids, install_shape=shape)
     if cmd.verb == "repair":
-        return Gathered(facts, accounts, quiesce=q, repair=_repair_facts(cmd, host, d, accounts, in_service or {}))
+        repair = _repair_facts(cmd, host, d, accounts, in_service or {}, skips=skips)
+        return Gathered(facts, accounts, quiesce=q, repair=repair)
     if cmd.verb == "undo":
         return Gathered(facts, accounts, shared, quiesce=q)
     if in_service is not None:
@@ -1684,7 +1711,7 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
 
 
 def _repair_facts(cmd: InstallCommand, host: HostOS, d: Directory, accounts: Mapping[str, int],
-                  in_service: Mapping[str, tuple[int, ...]]) -> RepairFacts:
+                  in_service: Mapping[str, tuple[int, ...]], *, skips: tuple = ()) -> RepairFacts:
     """Row 33 §2.3 R0: the directory's ``levain-*`` groups and their members, the slots in service, what
     ``<tree>/current`` names, whether the legacy tree is there, and ``--source`` RESOLVED (§2.1 (e): every later read
     names the resolved parent). The source-ownership check on that chain is R2's (phase A)."""
@@ -1700,7 +1727,8 @@ def _repair_facts(cmd: InstallCommand, host: HostOS, d: Directory, accounts: Map
     return RepairFacts(accounts=dict(accounts), groups=groups, members={g: d.group_members.get(g, frozenset())
                                                                         for g in groups},
                        egress=tuple(in_service.get("egress", ())), verifier=tuple(in_service.get("none", ())),
-                       current=current, legacy=os.path.isdir(tree / "levain"), source=source, h11=h11)
+                       current=current, legacy=os.path.isdir(tree / "levain"), source=source, h11=h11,
+                       skips=skips)
 
 
 def plan_for(cmd: InstallCommand, g: Gathered, **setup_kw) -> InstallPlan:
