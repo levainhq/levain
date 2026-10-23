@@ -232,8 +232,7 @@ def test_panels_carry_the_subsystem_stripe_of_variant_b_and_orange_is_for_what_w
 
 # ---- L3 r1 (K2_L3r1.md): G the band's wrap line through the manifest, H the deep link after the token strip, C-F ----
 
-_FIGS = ["links", "avg strength", "max strength", "density", "local density", "episodes", "episodes since wrap", "tombstones",
-         "wraps", "graduated", "demoted"]
+_FIGS = ["episodes", "episodes since wrap", "tombstones", "wraps", "graduated", "demoted"]
 
 
 def _views(tmp_path: Path) -> dict:

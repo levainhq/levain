@@ -54,6 +54,7 @@ from levain.dashboard import (
     ZONE_OPERATE,
     SubstrateSource,
     SubstrateView,
+    graph_caption,
 )
 
 __all__ = [
@@ -609,12 +610,10 @@ def _render_health(view: SubstrateView) -> list[str]:
         return [f"(health unavailable — {msg})"]
     lines: list[str] = []
     if h.write_path_live:
-        lines.append(
-            f"Write-path:  LIVE — {h.total_links} links "
-            f"(avg {h.avg_strength:.2f}, max {h.max_strength:.2f})"
-        )
+        last = h.last_wrap_at.split("T")[0] if h.last_wrap_at else "recorded"
+        lines.append(f"Write-path:  LIVE — last wrap {last}")
     else:
-        lines.append("Write-path:  DARK — 0 associations (a graduated wrap should form links)")
+        lines.append("Write-path:  no wraps yet")
     lines.append(
         f"Graduations: {h.graduations_validated_total} validated / "
         f"{h.graduations_demoted_total} demoted"
@@ -641,8 +640,7 @@ def _render_cognition_trace(view: SubstrateView) -> list[str]:
     lines: list[str] = []
     if view.graph is not None:
         g = view.graph
-        suffix = " (capped for display)" if g.truncated else ""
-        lines.append(f"Association graph: {len(g.nodes)} nodes, {len(g.edges)} edges{suffix}")
+        lines.append(f"Association graph: {graph_caption(g)}")
     else:
         lines.append("Association graph: unavailable")
     lines.append("")
@@ -652,8 +650,9 @@ def _render_cognition_trace(view: SubstrateView) -> list[str]:
             stamp = w.wrapped_at.split("T")[0] if w.wrapped_at else ""
             lines.append(
                 f"  {stamp}  {w.graduations_validated}↑/{w.graduations_demoted}↓ grad  "
-                f"+{w.associations_formed}/~{w.associations_strengthened}/-{w.associations_decayed} links  "
-                f"{w.continuity_chars:,} chars"
+                + (f"+{w.associations_formed}/~{w.associations_strengthened}/-{w.associations_decayed} links  "
+                   if w.associations_formed or w.associations_strengthened or w.associations_decayed else "")
+                + f"{w.continuity_chars:,} chars"
             )
     else:
         lines.append("(no wraps yet — the trace fills as the entity consolidates)")
@@ -679,7 +678,8 @@ def _render_wraps(view: SubstrateView) -> list[str]:
         lines.append(
             f"{stamp}  {w.episodes_compressed} eps · "
             f"{w.graduations_validated}↑/{w.graduations_demoted}↓ grad · "
-            f"+{w.associations_formed} links · {w.continuity_chars:,} chars"
+            + (f"+{w.associations_formed} links · " if w.associations_formed else "")
+            + f"{w.continuity_chars:,} chars"
         )
     return lines
 

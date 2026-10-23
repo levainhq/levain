@@ -133,7 +133,8 @@ class TestBuildView:
         v = build_substrate_view(AnnealPaths.from_db(db))
         assert v.errors == {}
         assert v.health is not None
-        assert v.health.write_path_live is False
+        assert v.health.write_path_live is False  # nothing committed yet: not live, and not a fault
+        assert v.health.status == "no-wraps"
         assert v.health.total_episodes == 0
         assert v.crystal_index == []
         assert v.open_spores == []
@@ -498,7 +499,7 @@ class TestCLISurface:
         assert rc == 0
         assert json.loads(capsys.readouterr().out)["health"]["total_episodes"] == 1
 
-    def test_render_text_handles_dark_write_path(self, tmp_path: Path) -> None:
+    def test_render_text_handles_a_store_with_no_wraps(self, tmp_path: Path) -> None:
         from anneal_memory import Store
 
         from levain.dashboard import AnnealPaths, build_substrate_view, render_text
@@ -508,7 +509,8 @@ class TestCLISurface:
             pass
         v = build_substrate_view(AnnealPaths.from_db(db))
         text = render_text(v)
-        assert "DARK" in text  # an existing empty store has no associations
+        assert "no wraps yet" in text  # a fresh store is not a failure
+        assert "DARK" not in text and "links" not in text
 
     def test_render_text_with_content(self, tmp_path: Path) -> None:
         from anneal_memory import Store
@@ -520,13 +522,15 @@ class TestCLISurface:
         with Store(db) as store:
             a = store.record("episode A", "decision")
             b = store.record("episode B", "observation")
-            store.record_associations({(a.id, b.id)})
+            store.wrap_started(token="w1", episode_ids=[a.id, b.id])
+            store.wrap_completed(2, 20, wrap_token="w1", episode_ids=[a.id, b.id])
         SporeStore(tmp_path / "memory.spores.json").add(
             type="task", text="loop", tier="hot"
         )
         (tmp_path / "memory.continuity.md").write_text("## State\nfoc\n", encoding="utf-8")
         text = render_text(build_substrate_view(AnnealPaths.from_db(db)))
-        assert "LIVE" in text  # has associations
+        assert "LIVE" in text and "last wrap" in text  # a committed wrap reads live
+        assert "Hebbian" not in text and "0 links" not in text
         assert "Open loops" in text
         assert "State" in text
 
@@ -906,6 +910,64 @@ class TestL3Fixes:
         )
         g = _build_graph(stub, min_strength=0.0, max_nodes=300, max_edges=2000)
         assert g.truncated is True
+
+
+class TestFormationCaption:
+    """anneal >= 1.0.2 forms no new links; the graph says so, and an old anneal says nothing."""
+
+    @staticmethod
+    def _stub(formation):
+        from types import SimpleNamespace
+
+        ep = SimpleNamespace(id="e1", type=SimpleNamespace(value="observation"), content="x")
+        kw = {} if formation is None else {"association_formation": lambda: formation}
+        return SimpleNamespace(
+            recall=lambda limit: SimpleNamespace(episodes=[ep], total_matching=1),
+            get_associations=lambda chunk, min_strength, limit: [],
+            **kw,
+        )
+
+    def test_a_disabled_store_carries_the_wrap_it_stopped_at(self) -> None:
+        from levain.dashboard import _build_graph
+
+        g = _build_graph(
+            self._stub({"mode": "disabled", "off_at_wrap": 7, "off_by_version": "1.0.2"}),
+            min_strength=0.0, max_nodes=300, max_edges=2000,
+        )
+        assert g.formation_off_at_wrap == 7
+        assert g.to_dict()["formation_off_at_wrap"] == 7
+
+    def test_an_enabled_store_or_an_old_anneal_claims_nothing(self) -> None:
+        from levain.dashboard import _build_graph
+
+        for formation in (None, {"mode": "enabled", "off_at_wrap": None, "off_by_version": None}, "odd",
+                          {"mode": "disabled", "off_at_wrap": "7"}):
+            g = _build_graph(self._stub(formation), min_strength=0.0, max_nodes=300, max_edges=2000)
+            assert g.formation_off_at_wrap is None, formation
+
+    def test_the_caption_reads_not_formed_for_an_empty_graph_and_never_errors(self) -> None:
+        from levain.dashboard import AssociationGraph, GraphEdge, GraphNode, graph_caption
+
+        assert graph_caption(AssociationGraph([], [])) == "not formed"
+        assert graph_caption(AssociationGraph([], [], formation_off_at_wrap=3)) == "not formed · no new links since wrap 3"
+        full = AssociationGraph([GraphNode("a", "episode", "A"), GraphNode("b", "episode", "B")],
+                                [GraphEdge("a", "b", 0.9, 3, None, 0.0)], truncated=True, formation_off_at_wrap=3)
+        assert graph_caption(full) == "2 nodes, 1 edges (capped for display) · no new links since wrap 3"
+
+    def test_render_text_prints_the_caption(self) -> None:
+        from levain.dashboard import AnnealPaths, AssociationGraph, SubstrateView, render_text
+
+        v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")), scope="solo")
+        v.graph = AssociationGraph([], [], formation_off_at_wrap=9)
+        assert "Association graph: not formed · no new links since wrap 9" in render_text(v)
+
+    def test_a_wrap_row_prints_links_only_when_the_row_has_them(self) -> None:
+        from levain.dashboard import AnnealPaths, SubstrateView, WrapRow, render_text
+
+        v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")), scope="solo")
+        v.wraps = [WrapRow("2026-10-23T01:00:00", 5, 900, 1, 0, 0, 0, 0), WrapRow("2026-10-01T01:00:00", 5, 900, 1, 0, 4, 1, 0)]
+        lines = [x for x in render_text(v).splitlines() if x.startswith("  - 2026-")]
+        assert "links" not in lines[0] and "+4 links" in lines[1]
 
 
 class TestEntityNameExtraction:

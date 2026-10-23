@@ -301,25 +301,30 @@ out.few = memWrapsLine({ wraps: wr(3) });
 // the newest stamp wins wherever it sits in the list
 const shuffled = [{ wrapped_at: "2026-10-01T06:00:00" }, { wrapped_at: "2026-10-19T06:02:00" }, { wrapped_at: "2026-10-10T06:00:00" }];
 out.lastIsMax = memWrapsLine({ wraps: shuffled }).endsWith("06:02");
-out.dark = memCogBits({ write_path_live: false, wraps: wr(2), graph: { nodes: [1], edges: [] } });
-out.darkHealth = memCogBits({ health: { write_path_live: false }, wraps: [] });
-out.live = memCogBits({ write_path_live: true, wraps: wr(2) });
+out.dark = memCogBits({ write_path_status: "unreadable", wraps: wr(2), graph: { nodes: [1], edges: [] } });
+out.darkHealth = memCogBits({ health: { status: "unreadable" }, wraps: [] });
+out.noWraps = memCogBits({ health: { status: "no-wraps", write_path_live: false }, write_path_status: "no-wraps", wraps: [] });
+out.formation = memCogBits({ wraps: [], graph: { nodes: [], edges: [], formation_off_at_wrap: 12 } });
+out.live = memCogBits({ write_path_status: "live", wraps: wr(2) });
 out.capBits = memCogBits({ wraps: wr(50) });
 out.totalBits = memCogBits({ wraps: wr(50), health: { total_wraps: 212 } });
 out.totalFew = memCogBits({ wraps: wr(3), health: { total_wraps: 3 } });
-out.darkEither = memCogBits({ write_path_live: true, health: { write_path_live: false }, wraps: [] });
-out.darkTop = memCogBits({ write_path_live: false, health: { write_path_live: true }, wraps: [] });
+out.darkEither = memCogBits({ write_path_status: "live", health: { status: "unreadable" }, wraps: [] });
+out.darkTop = memCogBits({ write_path_status: "unreadable", health: { status: "live" }, wraps: [] });
 """, tmp_path, fn)
     assert out["capped"].startswith("50+ wraps"), out["capped"]                  # the list is capped at 50: it never claims a total of 50
     assert out["total"].startswith("212 wraps"), out["total"]                    # the authoritative figure wins when the view has it
     assert out["few"].startswith("3 wraps"), out["few"]
     assert out["lastIsMax"] is True
-    assert "write path dark" in out["dark"] and "write path dark" in out["darkHealth"], out
-    assert "write path dark" not in out["live"], out
+    assert "write path unreadable" in out["dark"] and "write path unreadable" in out["darkHealth"], out
+    assert "write path unreadable" not in out["live"], out
+    assert not [b for b in out["noWraps"] if "write path" in b], out                    # no wraps yet is not a fault
+    assert "no new links since wrap 12" in out["formation"], out["formation"]
     assert any(b.startswith("50+") for b in out["capBits"]), out["capBits"]
     assert out["totalBits"][0] == "212 consolidations", out["totalBits"]            # the same total as the wraps line, never the capped list's length
     assert out["totalFew"][0] == "3 consolidations", out["totalFew"]
-    assert "write path dark" in out["darkEither"] and "write path dark" in out["darkTop"], out   # dark if EITHER place says so
+    assert "write path unreadable" in out["darkEither"], out                       # the health's own word wins over the top-level one
+    assert "write path unreadable" not in out["darkTop"], out
 
 
 @needs_browser

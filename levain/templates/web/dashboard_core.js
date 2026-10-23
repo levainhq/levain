@@ -1379,7 +1379,7 @@
     }
     return out;
   }
-  // the Cognition header's figures, the same on both of its tabs. The write path speaks only when it is dark.
+  // the Cognition header's figures, the same on both of its tabs. The write path speaks only when it is unreadable.
   function memCogBits(view) {
     const g = view.graph, gn = g && Array.isArray(g.nodes) ? g.nodes.length : 0, ge = g && Array.isArray(g.edges) ? g.edges.length : 0;
     const listed = Array.isArray(view.wraps) ? view.wraps.length : 0, total = memWrapTotal(view);
@@ -1388,8 +1388,10 @@
     if (ws) bits.push((total === null && ws >= MEM_WRAP_CAP ? ws + "+" : String(ws)) + (ws === 1 ? " consolidation" : " consolidations"));
     if (gn) bits.push(gn + " nodes");
     if (ge) bits.push(ge + " edges");
-    // dark if either place the view can say so says so
-    if (view.write_path_live === false || (view.health && view.health.write_path_live === false)) bits.push("write path dark");
+    // the write path speaks when it cannot be read; a store with no wraps yet is not a fault. The graph says when links stopped.
+    const wst = (view.health && view.health.status) || view.write_path_status;
+    if (wst === "unreadable") bits.push("write path unreadable");
+    if (g && g.formation_off_at_wrap != null) bits.push("no new links since wrap " + g.formation_off_at_wrap);
     return bits;
   }
   function memCard(cls, title, meta, modes) {
@@ -1597,15 +1599,14 @@
     }
     const head = el("div", "kv");
     head.appendChild(el("span", "k", "write-path"));
-    const b = el("span", "badge " + (h.write_path_live ? "live" : "dark"),
-      h.write_path_live ? "LIVE" : "DARK · 0 links");
+    const st = h.status || (h.write_path_live ? "live" : "no-wraps");
+    const b = el("span", "badge " + (st === "live" ? "live" : "dark"),
+      st === "live" ? "LIVE" : (st === "unreadable" ? "UNREADABLE" : "NO WRAPS YET"));
     const vWrap = el("span", "v"); vWrap.appendChild(b);
     head.appendChild(vWrap);
     p.appendChild(head);
 
     // a manifest source may not carry every figure: show only what was sent, never a made-up 0.00
-    kv(p, "Hebbian links", `${fmt(h.total_links)} (avg ${num(h.avg_strength).toFixed(2)}` + (h.max_strength != null ? `, max ${num(h.max_strength).toFixed(2)}` : "") + ")");
-    kv(p, "density", `${num(h.density).toFixed(3)}` + (h.local_density != null ? ` · local ${num(h.local_density).toFixed(3)}` : ""));
     kv(p, "graduations", `${fmt(h.graduations_validated_total)} validated / ${fmt(h.graduations_demoted_total)} demoted`);
     kv(p, "episodes", `${fmt(h.total_episodes)} (${fmt(h.episodes_since_wrap)} since wrap)`);
     if (h.wrap_history_unavailable) {
@@ -2435,7 +2436,8 @@
       row.appendChild(el("span", "tier", datePart(w.wrapped_at)));
       row.appendChild(el("span", "clause",
         `${fmt(num(w.graduations_validated))}↑ / ${fmt(num(w.graduations_demoted))}↓ grad · ` +
-        `+${fmt(num(w.associations_formed))} links · ${fmt(num(w.continuity_chars))} chars`));
+        (num(w.associations_formed) ? `+${fmt(num(w.associations_formed))} links · ` : "") +
+        `${fmt(num(w.continuity_chars))} chars`));
       // digest-delta: how much the projection grew/shrank vs the previous (older)
       // regeneration — list is newest-first, so the older wrap is the next index.
       const older = list[i + 1];

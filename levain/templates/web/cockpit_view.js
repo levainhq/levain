@@ -474,21 +474,22 @@
     return out;
   }
 
-  // The figures health reads: each is a finite number, except the write-path flag.
-  const HEALTH_FIGURES = ["links", "avg strength", "max strength", "density", "local density", "episodes",
-    "episodes since wrap", "tombstones", "wraps", "graduated", "demoted"];
+  // The figures health reads: each is a finite number, except the write-path status.
+  const HEALTH_FIGURES = ["episodes", "episodes since wrap", "tombstones", "wraps", "graduated", "demoted"];
+  // the write path's three words, and the status each stands for (Health.status; "dark" is the older kernel's word for unreadable)
+  const WRITE_PATH_STATUS = { "live": "live", "no wraps yet": "no-wraps", "unreadable": "unreadable", "dark": "unreadable" };
+  const WRITE_PATHS = Object.keys(WRITE_PATH_STATUS);
   function healthOf(metrics, wraps) {
     need(Array.isArray(metrics), "metrics");
     const m = new Map();
     for (const x of metrics) { need(isObj(x) && typeof x.label === "string", "metric"); m.set(x.label, x.value); }
     // every figure is required: the kernel always sends each one, and an absent figure would print as 0
     for (const k of HEALTH_FIGURES) need(m.has(k) && isNum(m.get(k)), "metric " + k);
-    need(m.get("write path") === "live" || m.get("write path") === "dark", "metric write path");
+    need(WRITE_PATHS.indexOf(m.get("write path")) >= 0, "metric write path");
     const n = (k) => m.get(k);
     const last = Array.isArray(wraps) && wraps[0] ? wraps[0] : null;
     return {
-      write_path_live: m.get("write path") === "live", total_links: n("links"), avg_strength: n("avg strength"),
-      max_strength: n("max strength"), density: n("density"), local_density: n("local density"),
+      write_path_live: m.get("write path") === "live", status: WRITE_PATH_STATUS[m.get("write path")],
       total_episodes: n("episodes"), episodes_since_wrap: n("episodes since wrap"),
       tombstones: n("tombstones"), total_wraps: n("wraps"),
       graduations_validated_total: n("graduated"), graduations_demoted_total: n("demoted"),
@@ -757,7 +758,7 @@
         view.extra_panels[pid].pid = pid;
         // a health widget is drawn as a widget, never as the Health panel, so the page's liveness reads its own write-path metric
         const wp = (view.extra_panels[pid].metrics || []).find((x) => x.label === "write path");
-        if (region && wp && (wp.value === "live" || wp.value === "dark")) view.write_path_live = wp.value === "live";
+        if (region && wp && WRITE_PATHS.indexOf(wp.value) >= 0) { view.write_path_live = wp.value === "live"; view.write_path_status = WRITE_PATH_STATUS[wp.value]; }
         // a downstream's own verb on this panel becomes the compose box. The manifest names the verb's
         // fields and not their widgets, so a widget is chosen from the field's name (a known edge).
         // a form panel names its verb: the action is the one offered under that name, and no other
