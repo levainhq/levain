@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import stat
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Mapping
+from dataclasses import dataclass
+from typing import Callable, Iterable, Iterator, Mapping, Optional
 
 from levain.firing.hands import HostOS, Step, _abs
 from levain.slot import Refused
@@ -293,7 +295,8 @@ def _rename(src: Path, dst: Path) -> tuple[bool, str]:
     return True, ""
 
 
-def stage_steps(host: HostOS, source: Path, h11_dir: Path, target: str, *, current: str | None) -> list[Step]:
+def stage_steps(host: HostOS, source: Path, h11_dir: Path, target: str, *, current: str | None,
+                fault: Optional[Callable[[str], None]] = None) -> list[Step]:
     """§2.3 R2 + R3: stage ``source`` (a ``levain`` package dir) and ``h11_dir`` together into
     ``<tree>/staging.partial``, check it (no link before any chown or chmod; root's plain files after; h11's floor read
     as text; the id recomputed over the staged copy equals ``target``), then rename it to ``<tree>/<target>`` and make
@@ -301,24 +304,8 @@ def stage_steps(host: HostOS, source: Path, h11_dir: Path, target: str, *, curre
     ``target`` is already ``current`` the partial copy is dropped instead (a no-op repair)."""
     t = _tools(host)
     tree = IMPORT_TREE[host]
-    owner = f"root:{ROOT_GROUP[host]}"
     partial, gen = tree / STAGING, tree / target
-    steps = [
-        Step(f"clear {partial} (left by an interrupted run)", (t["rm"], "-rf", str(partial))),
-        Step(f"create {partial}", (t["mkdir"], "-m", "700", str(partial))),
-        Step(f"copy the levain package to {partial / 'levain'} (symlinks copied as links, then refused)",
-             (t["cp"], "-R", "-P", str(source), str(partial / "levain"))),
-        Step(f"copy the h11 package to {partial / 'h11'} (symlinks copied as links, then refused)",
-             (t["cp"], "-R", "-P", str(h11_dir), str(partial / "h11"))),
-        Step(f"drop compiled files copied into {partial}",
-             (t["find"], str(partial), "-name", "__pycache__", "-prune", "-exec", t["rm"], "-rf", "{}", "+")),
-        Step(f"check {partial} holds no link (before any chown or chmod)", call=lambda: _no_links(partial)),
-        Step(f"own {partial} as root", (t["chown"], "-R", owner, str(partial))),
-        Step(f"make {partial} writable by root alone", (t["chmod"], "-R", "u=rwX,go=rX", str(partial))),
-        Step(f"check {partial} holds only root's plain files and directories",
-             call=lambda: _no_foreign_entries(partial)),
-        Step(f"check the staged h11 is at least {'.'.join(map(str, H11_MIN))} (its version read as text)",
-             call=lambda: (True, h11_floor(partial / "h11"))),
+    steps = _copy_steps(host, source, h11_dir, partial, fault=fault) + [
         Step(f"check the staged copy hashes to {target}", call=lambda: _staged_is(target, partial)),
     ]
     if current == target:
@@ -330,10 +317,129 @@ def stage_steps(host: HostOS, source: Path, h11_dir: Path, target: str, *, curre
     ]
 
 
-def _flip(tree: Path, target: str) -> tuple[bool, str]:
+def _copy_steps(host: HostOS, source: Path, h11_dir: Path, partial: Path, *,
+                fault: Optional[Callable[[str], None]] = None) -> list[Step]:
+    """R2's copy and its checks into ``partial``, up to (not including) the hash. ``fault``: the launcher's hook
+    (§5 [F7]), called with ``mid-copy`` after the levain copy and before the h11 copy; no step without it."""
+    t = _tools(host)
+    owner = f"root:{ROOT_GROUP[host]}"
+    mid = [Step("fault point R2 mid-copy", call=lambda: (fault("mid-copy"), (True, ""))[1])] if fault else []
+    return [
+        Step(f"clear {partial} (left by an interrupted run)", (t["rm"], "-rf", str(partial))),
+        Step(f"create {partial}", (t["mkdir"], "-m", "700", str(partial))),
+        Step(f"copy the levain package to {partial / 'levain'} (symlinks copied as links, then refused)",
+             (t["cp"], "-R", "-P", str(source), str(partial / "levain"))),
+        *mid,
+        Step(f"copy the h11 package to {partial / 'h11'} (symlinks copied as links, then refused)",
+             (t["cp"], "-R", "-P", str(h11_dir), str(partial / "h11"))),
+        Step(f"drop compiled files copied into {partial}",
+             (t["find"], str(partial), "-name", "__pycache__", "-prune", "-exec", t["rm"], "-rf", "{}", "+")),
+        Step(f"check {partial} holds no link (before any chown or chmod)", call=lambda: _no_links(partial)),
+        Step(f"own {partial} as root", (t["chown"], "-R", owner, str(partial))),
+        Step(f"make {partial} writable by root alone", (t["chmod"], "-R", "u=rwX,go=rX", str(partial))),
+        Step(f"check {partial} holds only root's plain files and directories",
+             call=lambda: _no_foreign_entries(partial)),
+        Step(f"check the staged h11 is at least {'.'.join(map(str, H11_MIN))} (its version read as text)",
+             call=lambda: (True, h11_floor(partial / "h11"))),
+    ]
+
+
+@dataclass
+class Staged:
+    """What repair's phase A staging learned while it ran (§2.2, §2.3 R2-R3): the id hashed over the STAGED copy
+    (None until the hash step ran), or the refusal that step met. The plan cannot know the id: it is the copy's."""
+
+    target: Optional[str] = None
+    refused: Optional[Refused] = None
+    #: ``<tree>/<target>`` was there before this run touched it (same id, same content: a retained generation), so a
+    #: phase-A restore keeps it [r5: L3 r1 complement LOW 4]. Recorded by the hash step, before it sets ``target``
+    #: [r5: L3 r2 codex MED], so no act between the hash and :func:`_place` can leave a target without it.
+    existed: bool = False
+    #: :func:`_place` began replacing ``<tree>/<target>`` (its ``rm -rf``): only then may a restore remove it.
+    placed: bool = False
+    #: [r6: L3 s3 r1 codex MED] The refusal the run meets only once EVERY step succeeded (a torn resume's: "was
+    #: removed"). A failed step is ``step-failed`` instead, so a removal that did not happen is never reported done.
+    then_refuse: Optional[Refused] = None
+
+
+def _hash_staged(cell: Staged, partial: Path, source: Path, h11_dir: Path, pinned: Optional[str]) -> tuple[bool, str]:
+    """§2.3 R2 [r3: X2-M3]: the id is hashed over the root-owned STAGED copy FIRST, then the same function over the
+    source; unequal refuses ``source-changed`` (the package changed during the copy). U13: an interrupted repair's
+    journaled generation fixes the target, so a staged id other than ``pinned`` refuses ``source-mismatch:<G>``."""
+    from levain.slot.generation import generation_id
+
+    try:
+        got = generation_id(partial / "levain", partial / "h11")
+        src = generation_id(source, h11_dir)
+    except Refused as e:
+        cell.refused = e
+        return False, f"{e.name}: {e.detail}"
+    if src != got:
+        cell.refused = Refused("source-changed", f"the staged copy hashes to {got}, {source} now to {src}")
+    elif pinned is not None and got != pinned:
+        cell.refused = Refused(f"source-mismatch:{pinned}", f"the interrupted repair is moving to {pinned}; "
+                                                           f"{source} is {got}. Re-run with that package")
+    if cell.refused is not None:
+        return False, f"{cell.refused.name}: {cell.refused.detail}"
+    cell.existed = os.path.lexists(partial.parent / got)     # before ``target``: the restore reads them together
+    cell.target = got
+    return True, got
+
+
+def _place(host: HostOS, tree: Path, partial: Path, cell: Staged, current: Optional[str]) -> tuple[bool, str]:
+    """§2.3 R3 for the id the hash step found: dropped when it is ``current`` already (a no-op repair), else any
+    ``gen-<id>`` an interrupted run left is removed, the partial renamed to it, and the generation made durable."""
+    import subprocess
+
+    target = cell.target
+    if target is None:
+        return False, "no staged id (the hash step did not run)"
+    rm = _tools(host)["rm"]
+    if target == current:
+        r = subprocess.run((rm, "-rf", str(partial)), capture_output=True, text=True, cwd="/")
+        return r.returncode == 0, (f"{target} is already current" if r.returncode == 0 else r.stderr.strip())
+    gen = tree / target
+    cell.existed = cell.existed or os.path.lexists(gen)
+    cell.placed = True                                       # from the rm on, the target is this run's
+    r = subprocess.run((rm, "-rf", str(gen)), capture_output=True, text=True, cwd="/")
+    if r.returncode != 0:
+        return False, r.stderr.strip()
+    _rename(partial, gen)
+    return _fsync_generation(gen, tree)
+
+
+def stage_hashing_steps(host: HostOS, source: Path, h11_dir: Path, cell: Staged, *, current: Optional[str],
+                        pinned: Optional[str] = None, tree: Optional[Path] = None,
+                        fault: Optional[Callable[[str], None]] = None) -> list[Step]:
+    """Repair's phase A stage (§2.3 R2 + R3, r3 X2-M3): :func:`stage_steps`'s copy and checks, then the id hashed
+    over the STAGED copy (into ``cell``) and checked against the source, then the generation placed and made durable.
+    The R3 journal of ``generation:<id>`` is the caller's next step, so it always follows the hash."""
+    tree = tree if tree is not None else IMPORT_TREE[host]
+    partial = tree / STAGING
+    return _copy_steps(host, source, h11_dir, partial, fault=fault) + [
+        Step(f"hash the staged copy {partial}; the same hash over {source} must equal it",
+             call=lambda: _hash_staged(cell, partial, source, h11_dir, pinned)),
+        Step(f"place the staged generation in {tree} (dropped if it is current; else renamed to gen-<id> and made "
+             "durable)", call=lambda: _place(host, tree, partial, cell, current)),
+    ]
+
+
+def generation_boot_code(host: HostOS, gen: str, *, tree: Optional[Path] = None) -> str:
+    """:func:`boot_path_code` for ONE generation by name (repair's probe and phase B, §2.2): ``sys.path`` gets
+    ``realpath(<tree>/<gen>)``, never ``current`` (which still names the old generation until the flip)."""
+    from levain.slot.generation import GEN_RE
+
+    if not GEN_RE.fullmatch(gen):
+        raise Refused("bad-token", f"generation: {gen!r}")
+    path = (tree if tree is not None else IMPORT_TREE[host]) / gen
+    return f"import os, sys; sys.path.insert(0, os.path.realpath({str(path)!r}))"
+
+
+def _flip(tree: Path, target: str, *, fault: Optional[Callable[[str], None]] = None) -> tuple[bool, str]:
     """§2.3 R9: ``current.new`` -> ``target``, renamed over ``current`` (rename(2) replaces it atomically: there is
     no instant at which ``current`` names a mixed pair or nothing), then the tree fsynced. Never ``mv``: BSD ``mv``
-    onto a link to a directory moves the source INTO it."""
+    onto a link to a directory moves the source INTO it. ``fault`` (§5 [F7]): called with ``a`` after the symlink and
+    before the rename, ``b`` after the rename and before the fsync."""
     new, cur = tree / f"{CURRENT}.new", tree / CURRENT
     try:
         st = os.lstat(new)
@@ -350,7 +456,11 @@ def _flip(tree: Path, target: str) -> tuple[bool, str]:
     except FileNotFoundError:
         pass
     os.symlink(target, new)
+    if fault is not None:
+        fault("a")
     os.replace(new, cur)
+    if fault is not None:
+        fault("b")
     fd = os.open(str(tree), os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(fd)
@@ -383,9 +493,9 @@ def read_current(tree: Path) -> str | None:
     return out
 
 
-def flip_step(host: HostOS, target: str) -> Step:
+def flip_step(host: HostOS, target: str, *, fault: Optional[Callable[[str], None]] = None) -> Step:
     tree = IMPORT_TREE[host]
-    return Step(f"flip {current_path(host)} -> {target}", call=lambda: _flip(tree, target))
+    return Step(f"flip {current_path(host)} -> {target}", call=lambda: _flip(tree, target, fault=fault))
 
 
 def entry_steps(host: HostOS) -> list[Step]:
@@ -443,6 +553,61 @@ def check_sources(source: Path, h11_dir: Path) -> None:
     _refuse_link(h11_dir, "h11")
 
 
+def check_source_writers(parent: Path, *, operator_uid: int, operator_gids: Iterable[int],
+                         group_names: Mapping[int, str] | None = None,
+                         lstat: Callable[[str], os.stat_result] = os.lstat,
+                         walk: Callable[..., Iterator] = os.walk) -> None:
+    """Row 33 §2.1 [r2: X-8; r3: F9 (a)-(c)]: who may write the ``--source`` package, checked BEFORE any other root
+    read of it (the generation hash included). ``parent`` is ``realpath(PATH/..)``, so the ancestor chain checked is
+    the RESOLVED one. Every ancestor of ``parent`` up to ``/``, ``parent`` itself, and every entry below
+    ``parent/levain`` and ``parent/h11`` must be owned by root or the operator and not other-writable (sticky or
+    not); a group-writable one is accepted only when its group is in ``operator_gids``: the groups whose COMPLETE
+    membership (the member list AND every user whose primary gid it is) is the operator alone (L3 r1: Ubuntu's
+    user-private group passes, macOS ``staff`` never does). Else ``bad-source``, naming the remedy on that exact path
+    (``chmod g-w``; ``chmod -R g-w`` for a directory below a package, never on an ancestor). A link below either package
+    reads mode 0777 on Linux and is refused here; :func:`levain.slot.generation.generation_id` refuses links on both
+    hosts. ACLs are not read (§2.1 (d), a known edge). Known edge (L3 r1): the check runs at R0 and the hash and copy
+    later, so a writer the check admits (the operator, root) can change the tree between; §2.1 does not claim it."""
+    trusted, names = frozenset(operator_gids), group_names or {}
+    below = (os.path.join(str(parent), "levain"), os.path.join(str(parent), "h11"))
+
+    def check(p: str) -> None:
+        try:
+            st = lstat(p)
+        except OSError as e:
+            raise Refused("bad-source", f"cannot read {p} ({e.strerror or e})") from None
+        if st.st_uid not in (0, operator_uid):
+            raise Refused("bad-source", f"{p} is owned by uid {st.st_uid}, neither root nor the operator")
+        if st.st_mode & stat.S_IWOTH:
+            raise Refused("bad-source", f"{p} is writable by every user")
+        if st.st_mode & stat.S_IWGRP and st.st_gid not in trusted:
+            grp = f"{names[st.st_gid]} (gid {st.st_gid})" if st.st_gid in names else f"gid {st.st_gid}"
+            rec = stat.S_ISDIR(st.st_mode) and (p in below or p.startswith(tuple(b + os.sep for b in below)))
+            raise Refused("bad-source", f"{p} is writable by group {grp}, which holds an account other than the "
+                                        f"operator. Run `chmod {'-R ' if rec else ''}g-w {shlex.quote(p)}`, then "
+                                        "repair again")
+
+    chain, p = [], str(parent)
+    while True:
+        chain.append(p)
+        up = os.path.dirname(p)
+        if up == p:
+            break
+        p = up
+    for p in reversed(chain):
+        check(p)
+
+    def fail(e: OSError) -> None:
+        raise Refused("bad-source", f"cannot read {e.filename} ({e.strerror or e})")
+
+    for name in ("levain", "h11"):
+        top = os.path.join(str(parent), name)
+        check(top)
+        for root, dirs, files in walk(top, onerror=fail, followlinks=False):
+            for n in sorted(dirs) + sorted(files):
+                check(os.path.join(root, n))
+
+
 def tree_steps(host: HostOS, source: Path, *, h11_dir: Path | None = None, generation: str | None = None,
                current: str | None = None) -> list[Step]:
     """Setup (§2.5): stage the ``levain`` package at ``source`` and h11 (``h11_dir``, default the installing Levain's
@@ -460,7 +625,8 @@ def tree_steps(host: HostOS, source: Path, *, h11_dir: Path | None = None, gener
             *entry_steps(host)]
 
 
-__all__ = ["CURRENT", "ENTRY_MODULES", "H11_MIN", "HELPER_MODULES", "PY_FLAGS", "ROOT_PYTHON", "STAGING",
-           "VENDOR_PREFIX", "boot_path_code", "check_sources", "current_path", "dir_steps", "entry_steps",
-           "entry_text", "flip_step", "gc_step", "h11_floor", "h11_source", "helper_entry_text", "read_current", "stage_steps",
-           "tree_steps"]
+__all__ = ["CURRENT", "ENTRY_MODULES", "H11_MIN", "HELPER_MODULES", "PY_FLAGS", "ROOT_PYTHON", "STAGING", "Staged",
+           "generation_boot_code", "stage_hashing_steps",
+           "VENDOR_PREFIX", "boot_path_code", "check_source_writers", "check_sources", "current_path", "dir_steps",
+           "entry_steps", "entry_text", "flip_step", "gc_step", "h11_floor", "h11_source", "helper_entry_text",
+           "read_current", "stage_steps", "tree_steps"]
