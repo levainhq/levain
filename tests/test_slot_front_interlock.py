@@ -137,7 +137,9 @@ for default in (H.front_lock_default, H.front_revoked_default):
         raise SystemExit("a default did not refuse with the reaper absent")
 print("DEFAULTS-REFUSE")
 import pytest
-sys.exit(pytest.main([sys.argv[1], "-q", "-p", "no:cacheprovider", "--rootdir", sys.argv[2], "-k", "fake"]))
+# The repo conftest is written for 3.12+ (it imports the operator side); the 3.9 root-py39 job runs with --noconftest.
+extra = ["--noconftest"] if sys.version_info < (3, 11) else []
+sys.exit(pytest.main([sys.argv[1], "-q", "-p", "no:cacheprovider", "--rootdir", sys.argv[2], "-k", "fake"] + extra))
 """
 
 

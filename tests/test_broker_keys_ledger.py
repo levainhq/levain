@@ -726,6 +726,8 @@ def _main_args(tmp_path) -> list:
             "--test-single-uid"]
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="keys refuses to run as root (it runs as _levain_keys): main() exits "
+                                              "before the ledger open this test is about")
 @pytest.mark.parametrize("why", ["no-keys-dir", "locked"])
 def test_main_refuses_to_start_on_a_refused_ledger_open(monkeypatch, tmp_path, capsys, why):
     bound = []

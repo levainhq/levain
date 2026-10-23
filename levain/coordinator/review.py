@@ -621,10 +621,11 @@ def feed_end(store: CoordStore, queue_dir: Path | str, *, errors: list[str] | No
 
     def make(row: tuple[Any, ...]) -> Item:
         s, a, r, k, _t = row
+        digest = hashlib.sha256((str(a) + "\0" + str(r)).encode()).hexdigest()[:24]  # no backslash inside an f-string: 3.9
         return file_item(store, "end", {
             "agent": _clip(a), "root": _clip(r), "kind": _clip(k), "halt": s,
             "text": _clip(f"you ended {a} session {r} at its {k} limit; it stays stopped until you extend")},
-            dedupe_key=f"end:{hashlib.sha256(f'{a}\0{r}'.encode()).hexdigest()[:24]}:{s}")[0]
+            dedupe_key=f"end:{digest}:{s}")[0]
     return _each("end", halts, make, errors)
 
 

@@ -6,7 +6,8 @@
 :mod:`levain.slot.runtime_grammar` and runs the verb. Every refusal is :func:`runtime_grammar.refusal_line` and a
 non-zero exit, raised before the next act: nothing after the refusing check acts.
 
-Verbs built here: ``prepare``, ``render``, ``resume``, ``status``, ``adopt-open`` and ``adopt-verify`` (session 5's);
+Verbs built here: ``prepare``, ``render``, ``resume``, ``status``, ``adopt-open``, ``adopt-verify``, ``discard`` and
+``restore`` (session 5's);
 ``start`` and ``teardown`` dispatch to :mod:`levain.slot.start`. Every other verb (derive: ``VERBS`` less
 ``VERB_HANDLERS``) answers ``verb-unbuilt:<verb>``. A ticketed (dispatch) ``prepare`` answers ``verb-unbuilt:ticket``
 (session 2f's).
@@ -49,6 +50,7 @@ from levain.slot import stage as ST
 from levain.slot import verify_caps as VC
 from levain.slot.end import V5_FLOOR_BYTES
 from levain.slot.grammar import SESSION_RE
+from levain.slot.runtime_grammar import _NAME_RE as _WIRE_NAME_RE
 from levain.slot.ids import SlotId, in_own_range
 from levain.slot.layout import BASE_ROUTES_FORMAT, RUN, STORE
 from levain.slot.runtime_grammar import (DISPATCH, OPERATOR, VENDORS, PrepareInput, RenderBlob, RuntimeRequest,
@@ -2870,9 +2872,68 @@ def adopt_verify(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]
         at("verify:session-unlocked")
 
 
+# --- discard / restore: the operator's store verbs (DESIGN §4.6, §4.7; CONTRACT §5.1, §7.4) --------------------------
+
+
+def store_caller(ctx: Ctx, session: str) -> R.Alloc:
+    """The alloc, bound to its operator (``SUDO_UID`` == alloc ``operator_uid``; anything else answers ``no-session``,
+    so a caller learns nothing of another's sessions), as :func:`adopt_step1_caller` and the install helper's purge
+    bind it. Any kind: he may discard / restore any session he operates, dispatch ones included (CONTRACT: "he can
+    `discard` / `restore` / `purge` any")."""
+    data = ctx.store.read(("alloc",), f"{session}.json")
+    if data is None:
+        raise Refused("no-session", session)
+    try:
+        a = R.parse_alloc(data)
+    except (ContractError, Refused) as e:
+        # Read before the operator check, so its failure names nothing about the record.
+        raise Refused("no-session", session) from e
+    if a.session != session or a.operator_uid != ctx.sudo_uid:
+        raise Refused("no-session", session)
+    return a
+
+
+def _store_verb(ctx: Ctx, req: RuntimeRequest, verb: Callable[..., str]) -> Dict[str, object]:
+    """:func:`store_verbs.discard` / :func:`store_verbs.restore` on the caller's session: the session lock (TRY,
+    ``session-busy``; the same ``L/alloc/<s>.lock`` adopt-open holds, DESIGN §4.7) and the journal are the store verb's,
+    its CAS goes to CONTROL. A run that stops part-way keeps its journal and is refused ``<verb>-incomplete:<phase>``
+    (the install helper's purge rule); the verb run again finishes that journal first. Answers ``{state}``."""
+    from levain.slot import store_verbs as SV
+    from levain.slot.root_intent import PhaseFailed
+
+    assert req.session is not None
+    a = store_caller(ctx, req.session)
+    seams = SV.StoreSeams(cas=SV.control_cas(ctx, req.session), owner_ok=ctx.seams.trusted)
+    try:
+        state = verb(SV.facts_from_alloc(a, ctx.seams.L), seams)
+    except PhaseFailed as e:
+        name = f"{req.verb}-incomplete:{e.phase}"
+        cause = e.cause.name if isinstance(e.cause, Refused) and isinstance(e.cause.name, str) else ""
+        # A cause that is itself a named refusal rides the name when the wire grammar passes it
+        # (``<verb>-incomplete:<phase>.<cause>``; its own ``:qualifier`` cannot, so that one stays in the detail).
+        if cause and _WIRE_NAME_RE.fullmatch(f"{name}.{cause}") and len(name) + 1 + len(cause) <= 64:
+            name = f"{name}.{cause}"
+        raise Refused(name, str(e.cause)) from None
+    return {"state": state}
+
+
+def discard(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
+    """``discard <session>``: RETAINED -> TRASH (DESIGN §4.6). Refuses as :func:`store_verbs.discard` does
+    (``not-retained:trash`` for a session already in trash)."""
+    from levain.slot import store_verbs as SV
+    return _store_verb(ctx, req, SV.discard)
+
+
+def restore(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
+    """``restore <session>``: TRASH -> RETAINED, rename only (DESIGN §4.6). Refuses as :func:`store_verbs.restore`."""
+    from levain.slot import store_verbs as SV
+    return _store_verb(ctx, req, SV.restore)
+
+
 VERB_HANDLERS: Dict[str, Callable[[Ctx, RuntimeRequest, object], Dict[str, object]]] = {
     "prepare": prepare, "render": render, "resume": resume, "status": status,
     "start": _start, "teardown": _teardown, "adopt-open": adopt_open, "adopt-verify": adopt_verify,
+    "discard": discard, "restore": restore,
 }
 
 
