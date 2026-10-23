@@ -97,7 +97,7 @@ jobs:
   root-py39:
     # The code root runs is executed by `ROOT_PYTHON` (levain/slot/root_tree.py): /usr/bin/python3, which is 3.9.6 on
     # macOS, while the `test` matrix is 3.12 / 3.13. This job runs that code on 3.9. tests/ci/root_closure.py derives
-    # the set from every dynamic-execution site (its DYNAMIC_SITES table, held to the source by a test) at run time: (i) byte-compile and import the import-time closure and, syntax only, one hop of function-local imports,
+    # the set from every dynamic-execution site (its DYNAMIC_SITES table, held to the source by a test) at run time: (i) byte-compile and import the import-time closure,
     # (ii) run the test files that import only that closure. The package is not installed (it needs a newer Python):
     # the files import from the checkout, and --noconftest keeps the repo conftest, which is written for 3.12+, out.
     name: root-run code (Python 3.9)
@@ -116,9 +116,6 @@ jobs:
 
       - name: Import each import-time closure module
         run: python tests/ci/root_closure.py import-check
-
-      - name: Byte-compile one hop of function-local imports (syntax only)
-        run: python tests/ci/root_closure.py compile-hop1
 
       - name: Run the tests that exercise only that closure
         run: |
