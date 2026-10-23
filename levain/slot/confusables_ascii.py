@@ -1,13 +1,14 @@
 """Single code points that look like an ASCII character of a CONTRACT §10.3 surface name, for
 :func:`levain.slot.adopt_preview.surface_lookalike` (a ``.cl\u0430ude`` with a Cyrillic ``\u0430``).
 
-GENERATED, do not edit: ``/usr/bin/python3 project_memory/1022-21/adopt5dii/s2f1_gen_confusables.py <confusables.txt>
+GENERATED, do not edit: ``/usr/bin/python3 project_memory/1023-1/adopt5dii/s2f2_gen_confusables.py <confusables.txt>
 <this file>`` over Unicode's ``security/18.0.0/confusables.txt`` ("# Date: 2026-08-06, 01:05:35 GMT",
 sha256 ``6ed3ee967c9dfdf6677d563c9985182fbc50a2efb7d6059cd57b2e2ce18f5b92``). Kept: each entry whose source is ONE
 non-ASCII code point and whose prototype is ONE character that casefolds to ``[a-z0-9._-]``, minus the sources NFKC +
 casefold already fold to it (on the floor python's unicodedata, so the table is a superset of what a newer one
 leaves). Multi-character prototypes (``rn`` for ``m``) are not kept. The data is derived from Unicode data files,
-Copyright (c) Unicode, Inc., used under the Unicode License v3 (https://www.unicode.org/license.txt). Count:
+Copyright (c) Unicode, Inc., used under the Unicode License v3, whose full text is ``LICENSES/Unicode-3.0.txt`` in this
+repository (as served at https://www.unicode.org/license.txt). Count:
 ``python3 -c "from levain.slot import confusables_ascii as C; print(len(C.LOOKALIKE))"``.
 """
 from __future__ import annotations

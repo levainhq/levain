@@ -13,11 +13,15 @@ change lists (base..head, head..wip; ``diff-tree -r -t --no-renames``, its tree 
 check and not listed), the config-surface list (CONTRACT §10.3's names on path components, case-insensitive; a path
 whose non-ASCII component LOOKS LIKE one, by :mod:`levain.slot.confusables_ascii`; every changed directory and each
 tip's root tree holding ``HEAD`` + ``objects/`` + ``refs/``, with one ``safe.bareRepository=explicit`` hint), every
-symlink with its target, every case-fold / NFC collision pair in each tip's tree with at least one side changed from
-base, and last, the full listing: every path of every change list, uncut. The config-surface, symlink and bare checks
-run on the net lists AND on every new commit against its parents (``diff-tree --stdin --root -m``), so a surface a
-commit adds and a later one deletes is listed with the commit that touched it (``commit <oid>``), unless the same
-(status, path, mode, oid) is already listed from a net list.
+symlink with its target, every case-fold / NFC collision pair in each tip's tree with at least one side ADDED since base
+(a pair whose two names the base already held is not new, however the content beneath them changed: codex 6), and
+last, the full listing: every path of every change list, uncut. The config-surface, symlink and bare checks run on the
+net lists AND on every new commit against its parents (``diff-tree --stdin --root -m``; a merge's header is its bare
+oid, once per parent, measured on git 2.50.1 in ``1023-1/adopt5dii/s2f2_merge_probe.txt``), so a surface a commit adds
+and a later one deletes is listed with the commit that touched it (``commit <oid>``), unless the same (status, path,
+mode, oid) is already listed from a net list. That includes a commit's ROOT tree: it is read when the commit changes
+a root ``HEAD``, ``objects`` or ``refs`` against a parent (the only way a root becomes bare), and listed when it is
+bare and some parent's root is not (codex 1).
 
 Every untrusted string goes through :func:`escape`, which asks :mod:`levain.unshowable` (the ONE rule for a character
 a person cannot see) which characters hide, and is shown by :func:`field`: capped at
@@ -27,9 +31,12 @@ input into ``\\u2068`` / ``\\u2069``), so a bidi run inside one field cannot reo
 holding a bidi R / AL / AN code point is also flagged ``[right-to-left text]``.
 
 Each section keeps its first :data:`verify_caps.SECTION_LINES` entries; after that, a FLAGGED entry (an outside link,
-a surface hit, a bare repository, an over-long path, a right-to-left field, a collision) is still listed, and the
-others are counted in ``<dir>/: N more not listed, M flagged listed above`` groupings by first component (at most as
-many groups again, then one ``(other directories)`` line). Every git output byte counts against
+a surface hit, a bare repository, an over-long path, a right-to-left field, a collision, a commit whose author,
+committer or message line is flagged) is still listed, and the others are counted in ``<dir>/: N more not listed, M
+flagged listed above`` groupings by first component (at most as many groups again, then one ``(other directories)``
+line). Past the first commits, each commit's author and committer
+identity is counted; a flagged identity (right-to-left, or :func:`ascii_lookalike`) is never folded into ``(other
+identities)``, whose line carries its flagged count (codex 2). Every git output byte counts against
 :data:`verify_caps.EXPANDED_OUTPUT_CAP` as it is read (each ``cat-file`` response whole: the probe's line when it
 arrives, then the content's header, payload and newline before it is asked for), every listed path against
 :data:`verify_caps.LISTED_PATHS_CAP`, every entry of each tip-tree walk against
@@ -68,11 +75,14 @@ _META = re.compile(rb":([0-7]{6}) ([0-7]{6}) ([0-9a-f]+) ([0-9a-f]+) ([ADMT])")
 FSI = "⁨"
 PDI = "⁩"
 RTL = "  [right-to-left text]"
+LOOKS_ASCII = "  [looks like ASCII]"
 BARE_HINT = ("hint: an embedded bare repository is listed. A git you run inside it runs its config (core.fsmonitor, "
              "hooks); safe.bareRepository=explicit in your git config stops that.")
 NO_SURFACE = "no config surface changed"
 #: macOS's PATH_MAX, the operator's side of the checkout (the verifier's Linux host says 4096): the warning fires at
-#: the lower of this and the host's (complement LOW 4).
+#: the lower of this and the host's (complement LOW 4). It measures the repository-relative path only: the checkout's
+#: own prefix is not known here (the verifier's only inputs are the two bundles, DESIGN §6.0, and the take writes no
+#: checkout, §6a), so the warning says so (codex 4).
 PATH_MAX_FLOOR = 1024
 #: NAME_MAX on macOS and Linux: one path component past it fails at checkout.
 NAME_MAX = 255
@@ -88,6 +98,7 @@ _NAME_RULES = {".mcp.json": ".mcp.json", ".envrc": ".envrc", ".pre-commit-config
                "taskfile.yml": "Makefile", "taskfile.yaml": "Makefile"}
 _GLOB_RULES = (("claude*.md", "CLAUDE*.md"), ("agents*.md", "AGENTS*.md"), ("*.mk", "Makefile"), (".git*", ".git*"))
 BARE_RULE = "embedded bare repository"
+_BARE_NAMES = frozenset({"head", "objects", "refs"})
 _RTL_CLASSES = frozenset({"R", "AL", "AN"})
 
 
@@ -160,6 +171,22 @@ def surface_lookalike(path: bytes) -> Optional[str]:
     return surface_rule(skel.encode("utf-8", "surrogateescape"))
 
 
+def ascii_lookalike(raw: bytes) -> bool:
+    """Whether a NON-ASCII field reads as ASCII once NFKC + casefolded and every look-alike code point
+    (:data:`confusables_ascii.LOOKALIKE`) replaced by its prototype (``\\u0430lice`` -> ``alice``) [judged by
+    adopt5dii-s2fix2, 10-23, against the brief's "flagged (RTL / confusable) identity": a name in another script keeps a
+    non-ASCII skeleton and is not flagged]."""
+    text = raw.decode("utf-8", "surrogateescape")
+    if text.isascii():
+        return False
+    look = confusables_ascii.LOOKALIKE
+    return "".join(look.get(ch, ch) for ch in unicodedata.normalize("NFKC", text).casefold()).isascii()
+
+
+def _ident_marks(raw: bytes) -> str:
+    return (RTL if rtl(raw) else "") + (LOOKS_ASCII if ascii_lookalike(raw) else "")
+
+
 class _Budget:
     """The git bytes read, the paths listed and the lines kept, each against its V30 cap (read at each check)."""
 
@@ -191,11 +218,10 @@ class _Section:
     """One section: its first :data:`verify_caps.SECTION_LINES` entries kept, then every flagged entry kept and the
     rest counted by group. ``budget`` (when given) holds every kept line to the file's cap as it is kept."""
 
-    def __init__(self, title: str, budget: Optional[_Budget] = None, empty: str = "none", flags: bool = True) -> None:
+    def __init__(self, title: str, budget: Optional[_Budget] = None, empty: str = "none") -> None:
         self.title = title
         self.budget = budget
         self.empty = empty
-        self.flags = flags
         self.n = 0
         self.lines: List[str] = []
         self.groups: Dict[str, List[int]] = {}      # group -> [not listed, flagged and listed past the first entries]
@@ -225,9 +251,8 @@ class _Section:
                 slot = self.other
         slot[1 if flagged else 0] += 1
 
-    def _more(self, g: str, slot: List[int]) -> str:
-        if not self.flags:
-            return f"{g}: {slot[0]} more not listed"
+    @staticmethod
+    def _more(g: str, slot: List[int]) -> str:
         return f"{g}: {slot[0]} more not listed, {slot[1]} flagged listed above"
 
     def render(self) -> List[str]:
@@ -393,6 +418,7 @@ class _Ctx:
     bare: bool = False
     listed: Set[Tuple[str, bytes, int, str]] = _dc_field(default_factory=set)
     bare_oids: Dict[str, bool] = _dc_field(default_factory=dict)
+    roots: Dict[str, Tuple[str, List[str]]] = _dc_field(default_factory=dict)
 
     def keep_full(self, line: str) -> None:
         self.budget.out(line)
@@ -402,6 +428,13 @@ class _Ctx:
         got = self.bare_oids.get(oid)
         if got is None:
             got = self.bare_oids[oid] = _is_bare(self.reader.read(oid, "tree"), self.hexlen)
+        return got
+
+    def root(self, commit: str) -> Tuple[str, List[str]]:
+        """A commit's root tree and its parents (read once)."""
+        got = self.roots.get(commit)
+        if got is None:
+            got = self.roots[commit] = _tree_parents(commit, self.reader.read(commit, "commit"), self.hexlen)
         return got
 
 
@@ -496,13 +529,14 @@ def _commit_fields(raw: bytes) -> Tuple[Dict[bytes, bytes], bytes]:
 def _commits(p: importer.GitRunner, reader: _Reader, budget: _Budget, tips: Sequence[str],
              base_oid: Optional[str]) -> Tuple[_Section, List[str]]:
     """The commits section and every new commit's oid. Past :data:`verify_caps.SECTION_LINES`, each commit is still
-    read (whole, size-checked) and its author and committer identities counted (at most as many identities again
-    per role, then one ``(other identities)`` count)."""
-    sec = _Section("commits", budget, flags=False)
+    read (whole, size-checked): one whose author, committer or a shown message line is flagged is listed whole
+    (codex 2), and every commit's author and committer identities are counted (at most as many identities again per
+    role, then one ``(other identities)`` count; a flagged identity is never folded into it)."""
+    sec = _Section("commits", budget)
     hexlen = reader.store.hexlen
     oids: List[str] = []
     who: Dict[bytes, Dict[bytes, int]] = {b"author": {}, b"committer": {}}
-    other = {b"author": 0, b"committer": 0}
+    other = {b"author": [0, 0], b"committer": [0, 0]}      # role -> [folded, flagged and listed past the cap]
 
     def one(rec: bytes) -> None:
         oid = rec.decode("ascii", "replace")
@@ -515,8 +549,10 @@ def _commits(p: importer.GitRunner, reader: _Reader, budget: _Budget, tips: Sequ
         if sec.n < verify_caps.SECTION_LINES:
             sec.add(lambda: _commit_lines(oid, raw), lambda: "(more commits)")
             return
-        sec.add(lambda: [], lambda: "(more commits)")
-        fields, _msg = _commit_fields(raw)
+        fields, msg = _commit_fields(raw)
+        flagged = any(_ident_marks(fields.get(role, b"")) for role in (b"author", b"committer")) or \
+            any(rtl(ln) for ln in _message_lines(msg))
+        sec.add(lambda: _commit_lines(oid, raw), lambda: "(more commits)", flagged=flagged)
         for role in (b"author", b"committer"):
             val = fields.get(role, b"")
             m = _IDENT.fullmatch(val)
@@ -526,18 +562,22 @@ def _commits(p: importer.GitRunner, reader: _Reader, budget: _Budget, tips: Sequ
                 counts[ident] += 1
             elif len(counts) < verify_caps.SECTION_LINES:
                 counts[ident] = 1
+            elif _ident_marks(ident):
+                counts[ident] = 1
+                other[role][1] += 1
             else:
-                other[role] += 1
+                other[role][0] += 1
 
     extra = ("--not", base_oid) if base_oid is not None else ()
     _stream(p, budget, b"\n", one, "rev-list", *tips, *extra)
     for role in (b"author", b"committer"):
-        for ident, n in who[role].items():
-            ln = f"  {role.decode()} {field(ident, selectors=True)}: {n}{RTL if rtl(ident) else ''}"
+        lines = [f"  {role.decode()} {field(ident, selectors=True)}: {n}{_ident_marks(ident)}"
+                 for ident, n in who[role].items()]
+        if any(other[role]):
+            lines.append("  " + _Section._more("(other identities)", other[role]))
+        for ln in lines:
             budget.out(ln)
             sec.tail.append(ln)
-        if other[role]:
-            sec.tail.append(f"  (other identities): {other[role]}")
     return sec, oids
 
 
@@ -546,17 +586,43 @@ def _commit_lines(oid: str, raw: bytes) -> List[str]:
     out = [f"commit {oid}"]
     for role in (b"author", b"committer"):
         val = fields.get(role, b"")
-        out.append(f"  {role.decode()} {field(val, selectors=True)}{RTL if rtl(val) else ''}")
+        out.append(f"  {role.decode()} {field(val, selectors=True)}{_ident_marks(val)}")
     out.append("  message")
     cap = verify_caps.DISPLAY_FIELD_MAX
-    body = msg[:cap]
-    if body.endswith(b"\n"):
-        body = body[:-1]
+    body = _message_body(msg)
     for raw_ln, ln in zip(body.split(b"\n"), escape(body, allow="\n", selectors=True).split("\n")):
         out.append(f"    {FSI}{ln}{PDI}{RTL if rtl(raw_ln) else ''}")
     if len(msg) > cap:
         out.append(f"    [{len(msg)} bytes, sha256 {hashlib.sha256(msg).hexdigest()[:16]}]")
     return out
+
+
+def _message_body(msg: bytes) -> bytes:
+    """The part of a message the file shows: its first :data:`verify_caps.DISPLAY_FIELD_MAX` bytes, less a final
+    newline."""
+    body = msg[:verify_caps.DISPLAY_FIELD_MAX]
+    return body[:-1] if body.endswith(b"\n") else body
+
+
+def _message_lines(msg: bytes) -> List[bytes]:
+    return _message_body(msg).split(b"\n")
+
+
+def _tree_parents(oid: str, raw: bytes, hexlen: int) -> Tuple[str, List[str]]:
+    """A commit's tree and parents, from the header lines it starts with (index-pack's fsck refuses any other
+    order first)."""
+    hdr = raw.partition(b"\n\n")[0].split(b"\n")
+    hexre = rb"[0-9a-f]{%d}" % hexlen
+    if not hdr[0].startswith(b"tree ") or not re.fullmatch(hexre, hdr[0][5:]):
+        raise Refused("fsck:other", f"commit {oid}: no tree line first")
+    parents = []
+    for ln in hdr[1:]:
+        if not ln.startswith(b"parent "):
+            break
+        if not re.fullmatch(hexre, ln[7:]):
+            raise Refused("fsck:other", f"commit {oid}: a parent line that is not an oid")
+        parents.append(ln[7:].decode("ascii"))
+    return hdr[0][5:].decode("ascii"), parents
 
 
 def _raw_records(on_change: Callable[[_Change], None], on_header: Optional[Callable[[str], None]],
@@ -624,13 +690,14 @@ def _surfaces(ctx: _Ctx, label: str, c: _Change, net: bool) -> None:
 
 def _changes(ctx: _Ctx, label: str, a: str, b: str) -> Tuple[_Section, Set[bytes]]:
     """One net change list: its section, the full listing's lines, the surface checks, and the paths (tree entries
-    too) it adds or changes, for the collision check."""
+    too) it ADDS, for the collision check (a modified or type-changed path is a name its base side already held:
+    codex 6)."""
     sec = _Section(f"changes {label}", ctx.budget)
     paths: Set[bytes] = set()
 
     def change(c: _Change) -> None:
         ctx.budget.path()
-        if c.status != "D":
+        if c.status == "A":
             paths.add(c.path)
         _surfaces(ctx, label, c, True)
         if c.dst_mode & _S_IFMT == _S_IFDIR or (c.status == "D" and c.src_mode & _S_IFMT == _S_IFDIR):
@@ -649,10 +716,14 @@ def _changes(ctx: _Ctx, label: str, a: str, b: str) -> Tuple[_Section, Set[bytes
 def _per_commit(ctx: _Ctx, oids: Sequence[str]) -> None:
     """Every new commit against each of its parents (a root commit against nothing), its surface, bare and symlink
     hits listed under ``commit <oid>`` (complement MED 1: a surface added in one commit and deleted in the next is in
-    no net list). Bounded by :data:`adopt_verify.MAX_COMMITS` and :data:`verify_caps.LISTED_PATHS_CAP`."""
+    no net list). A commit that changes a root ``HEAD``, ``objects`` or ``refs`` against a parent then has its root
+    tree checked (codex 1): those three entries are all the bare pattern reads, so a root that is bare where a
+    parent's is not always shows such a change. Bounded by :data:`adopt_verify.MAX_COMMITS` and
+    :data:`verify_caps.LISTED_PATHS_CAP`."""
     if not oids:
         return
     cur: List[str] = []
+    roots: Dict[str, None] = {}                         # in order: the commits whose root may have become bare
 
     def header(oid: str) -> None:
         cur[:] = [oid]
@@ -661,6 +732,8 @@ def _per_commit(ctx: _Ctx, oids: Sequence[str]) -> None:
         if not cur:
             raise importer.Fatal(None, "diff-tree --stdin printed a change before its commit")
         ctx.budget.path()
+        if b"/" not in c.path and _fold(c.path) in _BARE_NAMES:
+            roots[cur[0]] = None
         _surfaces(ctx, f"commit {cur[0]}", c, False)
 
     one = _raw_records(change, header, ctx.hexlen)
@@ -668,24 +741,34 @@ def _per_commit(ctx: _Ctx, oids: Sequence[str]) -> None:
             stdin="".join(o + "\n" for o in oids).encode("ascii"))
     if one.pending:                                     # type: ignore[attr-defined]
         raise importer.Fatal(None, "diff-tree: a raw line without its path")
+    for oid in roots:
+        tree, parents = ctx.root(oid)
+        if _root_key(tree) in ctx.listed or not ctx.is_bare(tree):
+            continue                                    # a tip's root line already shows this tree
+        if parents and all(ctx.is_bare(ctx.root(q)[0]) for q in parents):
+            continue                                    # every parent's root was bare already
+        ctx.bare = True
+        ctx.config.add(lambda: [f"commit {oid} root tree  [{BARE_RULE}]"], lambda: "./", flagged=True)
+
+
+def _root_key(tree: str) -> Tuple[str, bytes, int, str]:
+    return "A", b"", _S_IFDIR, tree
 
 
 def _root_bare(ctx: _Ctx, label: str, tip: str) -> None:
     """A tip's ROOT tree holding the embedded-bare pattern (``diff-tree -t`` never lists the root; complement LOW 5)."""
-    raw = ctx.reader.read(tip, "commit")
-    first = raw.split(b"\n", 1)[0]
-    if not first.startswith(b"tree ") or not re.fullmatch(rb"[0-9a-f]{%d}" % ctx.hexlen, first[5:]):
-        raise Refused("fsck:other", f"commit {tip}: no tree line first")    # index-pack's fsck refuses it first
-    if ctx.is_bare(first[5:].decode("ascii")):
+    tree, _parents = ctx.root(tip)
+    if ctx.is_bare(tree):
         ctx.bare = True
+        ctx.listed.add(_root_key(tree))
         ctx.config.add(lambda: [f"{label} root tree  [{BARE_RULE}]"], lambda: "./", flagged=True)
 
 
 def _change_lines(c: _Change, pmax: int) -> List[str]:
     out = [f"{c.status} {_mode_text(c)} {field(c.path)}{RTL if rtl(c.path) else ''}"]
     if len(c.path) >= pmax:
-        out.append(f"  warning: {len(c.path)} bytes reaches PATH_MAX ({pmax}) before your checkout's own path: a "
-                   f"checkout may fail")
+        out.append(f"  warning: {len(c.path)} bytes reaches PATH_MAX ({pmax}) on its own; your checkout's path (not "
+                   f"known to the verifier) adds to it: a checkout may fail")
     longest = max(len(part) for part in c.path.split(b"/"))
     if longest > NAME_MAX:
         out.append(f"  warning: a {longest}-byte component is past NAME_MAX ({NAME_MAX}): a checkout may fail")
@@ -695,7 +778,8 @@ def _change_lines(c: _Change, pmax: int) -> List[str]:
 def _collisions(p: importer.GitRunner, budget: _Budget, label: str, tip: str, changed: Set[bytes],
                 sec: _Section) -> None:
     """Every sibling pair in ``tip``'s tree whose names agree after NFC (``NFC``) or after NFC + casefold
-    (``case-fold``), in tree order, at least one side in ``changed`` (a pair the base already held is not new)
+    (``case-fold``), in tree order, at least one side in ``changed``, the paths added since base (a pair whose two
+    names the base already held is not new, even when content beneath a directory of it changed: codex 6)
     [judged by adopt5dii-s2, 10-22, against §6.2: Python's full casefold, not HFS+'s or NTFS's own tables]. Every
     pair is listed (each a flagged line, held to the file's cap as it is kept), so a fan of k alike names costs at
     most the cap. The walk's entries count against :data:`verify_caps.TREE_WALK_ENTRIES_CAP`, not the listed paths.
@@ -776,6 +860,6 @@ def report_section(report: Mapping[str, object]) -> List[str]:
     return out
 
 
-__all__ = ["BARE_HINT", "BARE_RULE", "CAP", "FSI", "NAME_MAX", "NO_SURFACE", "PATH_MAX_FLOOR", "PDI", "RTL", "Stats",
-           "build", "escape", "field", "report_section", "rtl", "shown", "surface_lookalike", "surface_rule",
-           "write_preview"]
+__all__ = ["BARE_HINT", "BARE_RULE", "CAP", "FSI", "LOOKS_ASCII", "NAME_MAX", "NO_SURFACE", "PATH_MAX_FLOOR", "PDI",
+           "RTL", "Stats", "ascii_lookalike", "build", "escape", "field", "report_section", "rtl", "shown",
+           "surface_lookalike", "surface_rule", "write_preview"]

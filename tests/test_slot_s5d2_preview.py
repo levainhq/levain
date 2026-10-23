@@ -2,8 +2,10 @@
 
 The rows come from the session's RUN (lane adopt5dii-s2, ``1022-21/adopt5dii/s2_run.txt``, the expected text in that
 dir's ``s2_expected.md``, written before it ran), revised and extended by the S2 fix1 RUN (lane adopt5dii-s2fix1,
-``s2f1_run.txt``, expected text ``s2f1_expected.md``; the L3 s2 r1 findings, rows F1-F7). Objects are written loose by the rig (any byte can sit in a commit
-or a name), the export bundle is ``bundlefmt.write_header`` + ``pack-objects``, and every row runs on the host git.
+``s2f1_run.txt``, expected text ``s2f1_expected.md``; the L3 s2 r1 findings, rows F1-F7) and by the S2 fix2 RUN
+(lane adopt5dii-s2fix2, ``1023-1/adopt5dii/s2f2_run.txt``, ``s2f2_expected.md``; the L3 s2 r2 findings, rows G1-G6).
+Objects are written loose by the rig (any byte can sit in a commit or a name), the export bundle is
+``bundlefmt.write_header`` + ``pack-objects``, and every row runs on the host git.
 """
 import hashlib
 import os
@@ -27,6 +29,8 @@ needs_git = pytest.mark.skipif(GIT is None, reason="needs a git")
 HOSTILE = b"subj \x1b[31mred\x1b[0m \xe2\x80\xae evil \xc2\x9b c1 \x9b raw \x01\x7f\x1b[2J nul-adjacent \\ back\n"
 HOSTILE_SHOWN = ("    ⁨subj \\u001b[31mred\\u001b[0m \\u202e evil \\u009b c1 \\x9b raw \\u0001\\u007f\\u001b[2J "
                  "nul-adjacent \\\\ back⁩")
+#: The PATH_MAX warning's tail: the checkout prefix is not known to the verifier (S2 fix2, codex 4).
+PREFIX_UNKNOWN = "on its own; your checkout's path (not known to the verifier) adds to it: a checkout may fail"
 
 
 def w(s: str) -> str:
@@ -176,8 +180,7 @@ def test_a_long_path_is_capped_before_escaping_and_warned_past_path_max(tmp_path
     lines = r.preview(r.delta({long: (b"100644", r.blob(b"x\n"))})).splitlines()
     assert "A 100644 " + w(f"{long[:4096].decode()} [{len(long)} bytes, sha256 "
                            f"{hashlib.sha256(long).hexdigest()[:16]}]") in lines
-    assert (f"  warning: {len(long)} bytes reaches PATH_MAX (1024) before your checkout's own path: a checkout may "
-            f"fail") in lines
+    assert f"  warning: {len(long)} bytes reaches PATH_MAX (1024) {PREFIX_UNKNOWN}" in lines
     assert "  warning: a 1023-byte component is past NAME_MAX (255): a checkout may fail" in lines
 
 
@@ -191,8 +194,7 @@ def test_path_max_warns_at_equality_at_the_lower_of_macos_and_the_host_and_past_
     r = Repo(tmp_path)
     lines = r.preview(r.delta({p1024: (b"100644", r.blob(b"1\n")), p256: (b"100644", r.blob(b"2\n"))}),
                       path_max=None).splitlines()
-    assert ("  warning: 1024 bytes reaches PATH_MAX (1024) before your checkout's own path: a checkout may fail"
-            in lines)
+    assert f"  warning: 1024 bytes reaches PATH_MAX (1024) {PREFIX_UNKNOWN}" in lines
     assert "  warning: a 256-byte component is past NAME_MAX (255): a checkout may fail" in lines
 
 
@@ -232,7 +234,8 @@ def test_commits_past_the_section_are_read_and_their_identities_counted(tmp_path
     for i in range(VC.SECTION_LINES + 1):
         tip = r.commit(t, [tip], b"c%d\n" % i)
     lines = section(r.preview(r.export(tip, [r.base])), "commits")
-    assert lines[-3:] == ["(more commits): 1 more not listed", "  author " + w("a <a@a>") + ": 1",
+    assert lines[-3:] == ["(more commits): 1 more not listed, 0 flagged listed above",
+                          "  author " + w("a <a@a>") + ": 1",
                           "  committer " + w("a <a@a>") + ": 1"]
 
 
@@ -554,3 +557,90 @@ def test_nul_in_commit_is_a_closed_fsck_id_and_rides_the_verifier_wire():
     from levain.slot import export_run as ER, fsck_ids
     assert "nulInCommit" in fsck_ids.closed_ids() and "nulInCommit" not in fsck_ids.reader_ids()
     assert "fsck:nulInCommit" in ER.VERIFIER_NAMES
+
+
+@needs_git
+def test_a_merge_in_the_new_range_previews_and_its_merged_side_is_listed(tmp_path):
+    # S2 fix2 row G1 (complement MED, unverified): on git 2.50.1 a merge's --stdin -m -z header is its bare oid
+    r = Repo(tmp_path)
+    cl = r.blob(b"{}\n")
+    ks = r.commit(r.files({b".claude/settings.json": (b"100644", cl)}), [r.base], b"side\n")
+    km = r.commit(r.files({b"m.txt": (b"100644", r.blob(b"m\n"))}), [r.base], b"main\n")
+    kM = r.commit(r.files({b".claude/settings.json": (b"100644", cl), b"m.txt": (b"100644", r.blob(b"m\n"))}),
+                  [km, ks], b"merge\n")
+    kd = r.commit(r.files({b"m.txt": (b"100644", r.blob(b"m\n"))}), [kM], b"del\n")
+    cfg = section(r.preview(r.export(kd, [r.base])), "config surface")
+    for k, st in ((ks, "A"), (kM, "A"), (kd, "D")):
+        assert f"commit {k} {st} 100644 {w('.claude/settings.json')}  [.claude/]" in cfg
+
+
+@needs_git
+def test_an_intermediate_commits_root_tree_holding_the_bare_pattern_is_listed(tmp_path):
+    # S2 fix2 row G2 (codex 1)
+    r = Repo(tmp_path)
+    k1 = r.commit(r.files({b"HEAD": (b"100644", r.blob(b"ref: x\n")), b"objects/x": (b"100644", r.blob(b"o\n")),
+                           b"refs/y": (b"100644", r.blob(b"r\n"))}), [r.base], b"bare\n")
+    k2 = r.commit(r.files({}), [k1], b"unbare\n")
+    text = r.preview(r.export(k2, [r.base]))
+    assert f"commit {k1} root tree  [embedded bare repository]" in section(text, "config surface")
+    assert text.count("safe.bareRepository") == 1
+
+
+@needs_git
+def test_commits_past_the_section_are_read_for_flags_and_flagged_identities_never_fold(tmp_path):
+    # S2 fix2 row G3 (codex 2), SECTION_LINES patched to 2; rev-list order (newest first) is L0 .. L7
+    r = Repo(tmp_path)
+    plan = [(b"b1 <b@b> 0 +0000", "שלום עולם\n".encode()), ("שלום <h@h> 0 +0000".encode(), b"m\n"),
+            ("аlice <a@a> 0 +0000".encode(), b"m\n"), (b"b3 <b@b> 0 +0000", b"m\n"), (b"b2 <b@b> 0 +0000", b"m\n"),
+            (b"b1 <b@b> 0 +0000", b"m\n"), (b"a <a@a> 0 +0000", b"m\n"), (b"a <a@a> 0 +0000", b"m\n")]
+    tip, made = r.base, []
+    for author, msg in plan:
+        tip = r.commit(r.base_tree, [tip], msg, author=author)
+        made.append(tip)
+    L = made[::-1]
+    cm = section(r.preview(r.export(tip, [r.base]), patch={"SECTION_LINES": 2}), "commits")
+    assert cm[0] == "== commits (8) =="
+    assert [k for k in L if f"commit {k}" in cm] == [L[0], L[1], L[5], L[6], L[7]]
+    assert "  author " + w("аlice <a@a> 0 +0000") + AP.LOOKS_ASCII in cm
+    assert "  author " + w("שלום <h@h> 0 +0000") + AP.RTL in cm
+    assert "    " + w("שלום עולם") + AP.RTL in cm
+    assert cm[-7:] == ["(more commits): 3 more not listed, 3 flagged listed above",
+                       "  author " + w("b1 <b@b>") + ": 2", "  author " + w("b2 <b@b>") + ": 1",
+                       "  author " + w("аlice <a@a>") + ": 1" + AP.LOOKS_ASCII,
+                       "  author " + w("שלום <h@h>") + ": 1" + AP.RTL,
+                       "  (other identities): 1 more not listed, 2 flagged listed above",
+                       "  committer " + w("a <a@a>") + ": 6"]
+
+
+@needs_git
+def test_a_collision_the_base_held_is_not_new_when_content_beneath_it_changes(tmp_path):
+    # S2 fix2 row G5 (codex 6): the base holds Dir/ + dir/ and A.txt + a.txt; the delta changes content under both
+    r = Repo(tmp_path)
+    x, y, tA, ta = r.blob(b"x\n"), r.blob(b"y\n"), r.blob(b"A\n"), r.blob(b"a\n")
+    held = {b"Dir/x": (b"100644", x), b"dir/y": (b"100644", y), b"A.txt": (b"100644", tA), b"a.txt": (b"100644", ta)}
+    r.base_tree = r.files(held)
+    r.base = r.commit(r.base_tree, [])
+    g("update-ref", "refs/heads/main", r.base, cwd=r.path)
+    r.base_bundle.unlink()
+    g("bundle", "create", "-q", str(r.base_bundle), "HEAD", "main", cwd=r.path)
+    keep = set(r.made)
+    r.made.clear()
+    tip = r.commit(r.files({**held, b"Dir/x": (b"100644", r.blob(b"x2\n")), b"A.txt": (b"100644", r.blob(b"A2\n")),
+                            b"DIR/z": (b"100644", r.blob(b"z\n"))}), [r.base])
+    r.made[:] = [o for o in r.made if o not in keep]
+    assert section(r.preview(r.export(tip, [r.base])), "collisions") == [
+        "== collisions (2) ==", f"head case-fold {w('DIR')} <-> {w('Dir')}",
+        f"head case-fold {w('DIR')} <-> {w('dir')}"]
+
+
+def test_the_unicode_license_is_in_the_repo_and_the_table_points_at_it():
+    # S2 fix2 row G6 (head Q4)
+    from levain.slot import confusables_ascii as C
+    root = Path(__file__).resolve().parent.parent
+    assert (root / "LICENSES" / "Unicode-3.0.txt").read_text(encoding="utf-8").startswith("UNICODE LICENSE V3\n")
+    assert "LICENSES/Unicode-3.0.txt" in (C.__doc__ or "")
+
+
+def test_an_identity_that_reads_as_ascii_is_flagged_and_another_script_is_not():
+    assert AP.ascii_lookalike("аlice".encode()) and not AP.ascii_lookalike(b"alice")
+    assert not AP.ascii_lookalike("Иван".encode()) and not AP.ascii_lookalike("José".encode())
