@@ -9,7 +9,7 @@ description = "A consent queue and memory harness for Claude Code and Codex: per
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
-license-files = ["LICENSE", "NOTICE"]
+license-files = ["LICENSE", "NOTICE", "LICENSES/Unicode-3.0.txt"]
 authors = [{ name = "Phill Clapham" }]
 keywords = [
     "agent",
