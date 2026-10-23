@@ -315,7 +315,7 @@ def test_f3_an_other_store_answer_on_an_item_the_page_sees_as_its_own_is_a_refus
             {"eval": "document.getElementById('tab-drop').click() || 1"},
             {"eval": ANSWER_OTHER_STORE},
             {"eval": BOUND_PLAIN.format(oid=json.dumps(PLAIN_ID), sid=json.dumps(store_id))},
-            {"until": f"(() => {{ const t = {OUTBOX_CARD}; return t && /refused/.test(t) && t; }})()", "ms": 15000},
+            {"until": f"(() => {{ const t = {OUTBOX_CARD}; return t && /refused: this drop was made for another Levain/.test(t) && t; }})()", "ms": 15000},
         ])
     card = out["values"][-1]
     assert "refused: this drop was made for another Levain" in card and "waiting to be delivered" not in card, card
