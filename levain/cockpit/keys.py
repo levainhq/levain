@@ -344,44 +344,75 @@ def anchor_reset(data_root: Path | str, *, signer_fp: str, sign: Signer, ssh_key
     that head (:func:`levain.authority.reset_anchor`, which stores the proof in the anchor file). Returns
     ``(old_anchor, new)``; ``new`` is None, and nothing is signed, when the anchor is absent or already agrees
     with the log. The log is replayed in full with a fresh cache: this is the trust decision, so no chain this
-    process verified earlier stands in for it. The signer's class and a live cockpit server are checked before
-    the signature too, so those refusals spend no touch; the custody rule and the signature itself are judged
-    after it, by :func:`levain.authority.verify_anchor_reset`."""
+    process verified earlier stands in for it.
+
+    Everything that can refuse is judged before ``sign`` asks for a touch: an anchor of another store (a reset is
+    for a rollback of the same store, DESIGN §3.8), a signer that is not one of the log's laptop-presence keys that
+    can sign (:meth:`~levain.authority.AuthoritySnapshot.signing_laptop_keys`: unrevoked, not quarantined), and a
+    live cockpit server. The reset lock (:func:`levain.authority.reset_lock`) is held from the read of the old
+    anchor through the signature, a re-read of the log's head and the write, so no server starts, no advance lands
+    and no link is appended unseen in between; only the signature itself is judged after the touch."""
     db = _journal(data_root, marker_directory=marker_directory)
     path = anchor_path(db.data_root)
+    cache = _authority.ReplayCache()
     with db.read() as conn:
         # anchor=None: the log as it stands, which the anchor is about to be judged against, not by
         auth = RequestAuthority.capture(conn, now=datetime.now(timezone.utc), anchor=None, source=str(db.path),
-                                        cache=_authority.ReplayCache(), ssh_keygen=ssh_keygen)
+                                        cache=cache, ssh_keygen=ssh_keygen)
         _check_reported(conn)
     if auth.authority is None:
         if auth.log_empty:
+            init = _authority.init_hint(db.data_root)
+            if _authority._old_anchor_view(path) is None:
+                raise KeyError_(f"the authority log is empty and has no anchor: run {init}")
             raise KeyError_(f"the authority log is empty, so it holds no key a reset can verify against; if this "
-                            f"store was emptied on purpose, move {path} aside, then run `levain cockpit ledger init`")
+                            f"store was emptied on purpose, move {path} aside, then run {init}")
         raise KeyError_(str(auth.authority_error))
     snap = auth.authority
-    try:
-        current = _authority.read_anchor(path)
-        # absent, at the head, or behind it: the next open or append writes or advances it, so nothing to reset
-        _authority.check_anchor(snap, current)
-        return (None if current is None else current.as_dict()), None
-    except AnchorError:
-        pass                                    # unreadable, or the log is behind it: the case a reset is for
-    key = snap.key(signer_fp)
-    if key is None or not key.active:
-        raise KeyError_(f"{signer_fp} is not an unrevoked key of this log at seq {snap.seq} (nothing signed)")
-    if key.key_class != LAPTOP:
-        raise KeyError_(f"an anchor reset needs a {LAPTOP} key, not {key.key_class} (nothing signed)")
-    with _authority._no_live_cockpit(path):
-        pass                                    # checked again, under the lock, by reset_anchor
-    old = _authority._old_anchor_view(path)
-    signature = sign(_authority.reset_message(snap.store_id, old, snap.seq, snap.head_hash))
-    try:
-        new = _authority.reset_anchor(path, snap, signer_fp=signer_fp, signature=signature, ssh_keygen=ssh_keygen)
-    except VerifierUnavailable:
-        raise
-    except AuthorityError as exc:
-        raise KeyError_(str(exc)) from None
+
+    def agrees() -> Mapping[str, Any] | None | bool:
+        """The anchor as it stands when it needs no reset (absent, at the head, or behind it: the next open or
+        append writes or advances it), else False (unreadable, or the log is behind it: the case a reset is for)."""
+        try:
+            current = _authority.read_anchor(path)
+            _authority.check_anchor(snap, current, path=path)
+        except _authority.ForeignAnchor as exc:
+            raise KeyError_(f"{exc} (nothing signed)") from None
+        except AnchorError:
+            return False
+        return None if current is None else current.as_dict()
+
+    # first without the lock, so an anchor that needs nothing is answered while a server runs
+    if (stands := agrees()) is not False:
+        return stands, None
+    with _authority.reset_lock(path) as held:
+        if (stands := agrees()) is not False:     # again under the lock: an advance may have landed
+            return stands, None
+        key = snap.key(signer_fp)
+        if key is None or not key.active:
+            raise KeyError_(f"{signer_fp} is not an unrevoked key of this log at seq {snap.seq} (nothing signed)")
+        if key.key_class != LAPTOP:
+            raise KeyError_(f"an anchor reset needs a {LAPTOP} key, not {key.key_class} (nothing signed)")
+        if signer_fp not in {k.fingerprint for k in snap.signing_laptop_keys()}:
+            why = dict((k.fingerprint, w) for k, w in snap.quarantined_keys()).get(signer_fp, "it cannot sign")
+            raise KeyError_(f"{signer_fp} is quarantined, so it cannot sign an anchor reset: {why} (nothing signed)")
+        old = _authority._old_anchor_view(path)
+        signature = sign(_authority.reset_message(snap.store_id, old, snap.seq, snap.head_hash))
+        with db.read() as conn:
+            # a CLI append between the capture and here (the store lock keeps out a server, not the CLI)
+            again = RequestAuthority.capture(conn, now=datetime.now(timezone.utc), anchor=None, source=str(db.path),
+                                             cache=cache, ssh_keygen=ssh_keygen).authority
+        if again is None or (again.seq, again.head_hash) != (snap.seq, snap.head_hash):
+            at = "unreadable" if again is None else f"at seq {again.seq}"
+            raise KeyError_(f"the authority log moved while the reset was signed (it was at seq {snap.seq}, now "
+                            f"{at}); nothing written, run the reset again")
+        try:
+            new = _authority.reset_anchor(path, snap, signer_fp=signer_fp, signature=signature,
+                                          ssh_keygen=ssh_keygen, held=held)
+        except VerifierUnavailable:
+            raise
+        except AuthorityError as exc:
+            raise KeyError_(str(exc)) from None
     return old, new
 
 

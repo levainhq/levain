@@ -242,11 +242,12 @@ class RequestAuthority:
                     # the remedy as levain.authority.append names it: an empty log holds no key a reset verifies
                     raise auth.AnchorError(f"the authority log is empty but its anchor names store "
                                            f"{pinned.store_id} at seq {pinned.seq}; if this store was emptied on "
-                                           f"purpose, move {anchor} aside, then run {INIT_HINT}") from None
+                                           f"purpose, move {anchor} aside, then run "
+                                           f"{auth.init_hint(auth.anchor_data_root(anchor))}") from None
                 empty = True
                 error = f"authority not initialised: run {INIT_HINT}"
             if snap is not None and anchor is not None:
-                auth.check_anchor(snap, pinned)
+                auth.check_anchor(snap, pinned, path=anchor)
         except auth.VerifierUnavailable as exc:
             snap, empty, verifier_down = None, False, True
             error = f"the authority log could not be verified: {exc}"

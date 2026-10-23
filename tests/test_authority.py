@@ -809,7 +809,7 @@ def test_a_truncated_log_reads_as_its_prefix_and_the_anchor_refuses_it(granted, 
     snap = auth.snapshot(granted, cache=cache)
     assert snap.seq == 3
     with pytest.raises(AnchorError, match="behind its anchor"):
-        auth.check_anchor(snap, auth.read_anchor(a))
+        auth.check_anchor(snap, auth.read_anchor(a), path=a)
 
 
 def test_cache_refuses_a_rewrite_below_its_head(granted, keys):
@@ -831,7 +831,7 @@ def test_anchor_advances_after_commit_and_refuses_a_log_behind_it(base, keys, tm
     assert auth.read_anchor(a).seq == 4
     base.execute("DELETE FROM authority_log WHERE seq = 4")      # a restore of an older store
     with pytest.raises(AnchorError, match="behind its anchor.*anchor reset"):
-        auth.check_anchor(head(base), auth.read_anchor(a))
+        auth.check_anchor(head(base), auth.read_anchor(a), path=a)
     with pytest.raises(AnchorError, match="behind its anchor"):
         link(base, {"op": "raise", "verb": "b", "tier": "T3"}, keys["phone"], anchor=a)
 
@@ -842,7 +842,7 @@ def test_anchor_refuses_another_hash_at_its_seq(base, keys, tmp_path):
     base.execute("DELETE FROM authority_log WHERE seq = 3")
     link(base, _enrol(keys["other"], "presence"), keys["laptop"])
     with pytest.raises(AnchorError, match="behind its anchor"):
-        auth.check_anchor(head(base), auth.read_anchor(a))
+        auth.check_anchor(head(base), auth.read_anchor(a), path=a)
 
 
 def test_unreadable_anchor_names_the_reset(tmp_path):
@@ -870,7 +870,7 @@ def test_anchor_reset_verifies_against_the_logs_own_keys(base, keys, tmp_path):
     new = auth.reset_anchor(a, snap, signer_fp=keys["laptop"].fp,
                             signature=keys["laptop"].sign(msg, auth.RESET_NAMESPACE))
     assert new.seq == 3 and auth.read_anchor(a) == new
-    auth.check_anchor(head(base), auth.read_anchor(a))
+    auth.check_anchor(head(base), auth.read_anchor(a), path=a)
 
 
 def test_empty_log_beside_an_anchor_refuses_before_commit(base, keys, tmp_path):

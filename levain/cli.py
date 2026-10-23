@@ -576,6 +576,7 @@ def main(argv: list[str] | None = None) -> int:
             "itself holds unrevoked at its head; it may ask for a touch) signs the old anchor and the new head, "
             "and the signature is kept in the anchor file. Every key or grant the rolled-back links held is "
             "gone from the log. Refused while a cockpit server holds the store: stop it first. An anchor that "
+            "names another store is refused, never reset: the refusal names the file to check. An anchor that "
             "already agrees with the log is left alone and nothing is signed."
         ),
     )

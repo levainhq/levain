@@ -65,11 +65,13 @@ def _run(*argv: str) -> tuple[int, str, str]:
 _TICK = re.compile(r"`(levain [^`]+)`")
 
 
-def _hinted_argv(message: str) -> list[str]:
-    """The `levain ...` argv a refusal names, its placeholder words left in."""
+def _hinted_argv(message: str, key: Path | None = None) -> list[str]:
+    """The `levain ...` argv a refusal names; with ``key``, its one placeholder word (the operator's key file)
+    filled in."""
     m = _TICK.search(message)
     assert m is not None, message
-    return m.group(1).split()[1:]
+    argv = m.group(1).split()[1:]
+    return argv if key is None else [str(key) if w == auth.KEY_WORD else w for w in argv]
 
 
 # --- the command, as §3.8 specifies it ------------------------------------------------------------------
@@ -80,9 +82,9 @@ def test_the_printed_remedy_runs_and_reopens_a_restored_store(tmp_path: Path) ->
     root, laptop, _ = _restored(tmp_path)
     rc, _, err = _run("cockpit", "keys", "--data-root", str(root))
     assert rc == 1 and "behind its anchor" in err
-    argv = _hinted_argv(re.sub(r"<[^>]*>", str(laptop.path), err))
-    assert argv[:3] == ["cockpit", "anchor", "reset"] and "--signing-key" in argv
-    rc, out, err = _run(*argv, "--data-root", str(root))
+    argv = _hinted_argv(err, laptop.path)
+    assert argv == ["cockpit", "anchor", "reset", "--signing-key", str(laptop.path), "--data-root", str(root)]
+    rc, out, err = _run(*argv)                                    # as printed, nothing added
     assert rc == 0, err
     assert "anchor reset" in out and "seq 1" in out
     stored = json.loads(anchor_path(root).read_text())
@@ -165,11 +167,232 @@ def test_an_empty_log_beside_an_anchor_names_a_remedy_that_runs_today(tmp_path: 
         enrol(CockpitDB(root), laptop, "laptop-presence", now=NOW)
     msg = str(exc.value)
     assert "anchor reset" not in msg
-    assert str(anchor_path(root)) in msg and "`levain cockpit ledger init`" in msg
+    init = auth.init_hint(root)
+    assert str(anchor_path(root)) in msg and init in msg
     # the read path (RequestAuthority.capture) names the same remedy, and so does the reset command itself
     for argv in (("cockpit", "keys"), ("cockpit", "anchor", "reset", "--signing-key", str(laptop.path))):
         rc, _, err = _run(*argv, "--data-root", str(root))
-        assert rc == 1 and str(anchor_path(root)) in err and "`levain cockpit ledger init`" in err, err
+        assert rc == 1 and str(anchor_path(root)) in err and init in err, err
+
+
+# --- 1022+20 L3 r1 (FIX1): everything that can refuse is judged before the touch -----------------------------------
+
+class _Recorder:
+    """A ``sign`` that records each message it is asked for, then signs as ``key`` (``during`` runs first, inside
+    the touch, as whatever else the operator's machine does while they hold the key)."""
+
+    def __init__(self, key: RealKey, during=None) -> None:
+        self.key, self.during, self.asked = key, during, []
+
+    def __call__(self, message: bytes) -> str:
+        self.asked.append(message)
+        if self.during is not None:
+            self.during()
+        return self.key.sign(message, auth.RESET_NAMESPACE)
+
+
+def _reset(root: Path, signer_fp: str, sign) -> tuple:
+    from levain.cockpit.keys import anchor_reset
+
+    return anchor_reset(root, signer_fp=signer_fp, sign=sign)
+
+
+def _foreign(root: Path) -> bytes:
+    """The anchor replaced by another store's (well-formed, at the seq the log is behind)."""
+    anchor_path(root).write_text(json.dumps({"format": auth.ANCHOR_FORMAT, "store_id": "another-store", "seq": 2,
+                                             "head_hash": "ab" * 32}))
+    return anchor_path(root).read_bytes()
+
+
+def test_an_anchor_of_another_store_is_refused_before_the_touch_and_names_the_file(tmp_path: Path) -> None:
+    """codex HIGH (L3 r1): `check_anchor` refused a store-id mismatch, then the reset took it as a rollback and
+    signed over it with this log's own key, so a substituted log adopted the anchor that exists to refuse it. Now
+    it is refused by name before anything is signed, and its remedy is the file to check or move (§3.8: a reset
+    is for a rollback of the same store)."""
+    from levain.cockpit.keys import KeyError_
+
+    root, laptop, _ = _restored(tmp_path)
+    before = _foreign(root)
+    sign = _Recorder(laptop)
+    with pytest.raises(KeyError_) as ei:
+        _reset(root, laptop.fingerprint, sign)
+    msg = str(ei.value)
+    assert sign.asked == [] and anchor_path(root).read_bytes() == before
+    assert "another-store" in msg and "another store" in msg and str(anchor_path(root)) in msg, msg
+    assert "levain cockpit anchor reset" not in msg and "move" in msg and "nothing signed" in msg, msg
+    # the open names the same remedy, not a reset
+    rc, _, err = _run("cockpit", "keys", "--data-root", str(root))
+    assert rc == 1 and "another store" in err and "levain cockpit anchor reset" not in err, err
+    # and the remedy is true: the anchor moved aside, the store opens and its next link writes its own anchor
+    anchor_path(root).rename(anchor_path(root).with_name("foreign.anchor"))
+    rc, out, err = _run("cockpit", "keys", "--data-root", str(root))
+    assert rc == 0 and laptop.fingerprint in out, err
+
+
+def test_the_library_reset_refuses_another_stores_anchor_whatever_the_signature(tmp_path: Path) -> None:
+    """The backstop under the CLI: ``reset_anchor`` re-reads the anchor under the lock and refuses a foreign one,
+    a signature over exactly that anchor included."""
+    from levain.cockpit.authority import RequestAuthority
+
+    root, laptop, _ = _restored(tmp_path)
+    before = _foreign(root)
+    with CockpitDB(root).read() as conn:
+        snap = RequestAuthority.capture(conn, now=NOW, anchor=None, source="t", cache=auth.ReplayCache()).authority
+    old = auth._old_anchor_view(anchor_path(root))
+    sig = laptop.sign(auth.reset_message(snap.store_id, old, snap.seq, snap.head_hash), auth.RESET_NAMESPACE)
+    with pytest.raises(auth.ForeignAnchor, match="another store"):
+        auth.reset_anchor(anchor_path(root), snap, signer_fp=laptop.fingerprint, signature=sig)
+    assert anchor_path(root).read_bytes() == before
+
+
+def test_a_quarantined_laptop_key_is_refused_before_it_is_asked_for_a_touch(tmp_path: Path) -> None:
+    """codex MED + complement LOW (L3 r1): an unrevoked laptop-presence key that is QUARANTINED (WebAuthn material
+    at custody fido, from a log written before the enrol door) was asked to sign, then refused by the verify.
+    The pre-sign gate is now ``snap.signing_laptop_keys()``, the one usable-key predicate."""
+    from types import SimpleNamespace
+
+    from levain.cockpit.keys import KeyError_
+    from tests.test_passkey_custody_derived import WebAuthnKey, pre_door
+
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    CockpitDB(root).set_install_class("reported")
+    laptop, pk = RealKey(tmp_path, "laptop"), WebAuthnKey()
+    enrol(CockpitDB(root), laptop, "laptop-presence", now=NOW)
+    with pre_door():                              # written by a levain from before the enrol door
+        enrol(CockpitDB(root), SimpleNamespace(fingerprint=pk.fp, public=pk.public_key), "laptop-presence",
+              by=laptop, now=NOW, custody="fido")
+    enrol(CockpitDB(root), RealKey(tmp_path, "phone"), "display-phone", by=laptop, now=NOW)
+    conn = sqlite3.connect(root / "cockpit.db", isolation_level=None)
+    conn.execute("DELETE FROM authority_log WHERE seq = 3")      # the log (laptop, pk) sits behind the anchor
+    conn.close()
+    before = anchor_path(root).read_bytes()
+    asked = []
+    with pytest.raises(KeyError_) as ei:
+        _reset(root, pk.fp, lambda m: asked.append(m) or pk.sign(m, auth.RESET_NAMESPACE))
+    assert asked == [] and anchor_path(root).read_bytes() == before
+    assert "quarantined" in str(ei.value) and "nothing signed" in str(ei.value), ei.value
+    # the control: the laptop key that can sign resets the same store
+    assert _reset(root, laptop.fingerprint, _Recorder(laptop))[1].seq == 2
+
+
+def test_the_store_lock_is_held_through_the_touch(tmp_path: Path) -> None:
+    """codex LOW (L3 r1): the live-server check released ``cockpit.lock`` before the signature, so a server that
+    started during the touch made the touch wasted. The reset lock is now held from the old anchor's read through
+    the write: inside the touch neither the store lock nor the anchor's lock can be taken."""
+    from levain.cockpit.broker import LOCK_NAME
+
+    root, laptop, _ = _restored(tmp_path)
+    tried = {}
+
+    def contend() -> None:
+        for name, lock in (("store", root / LOCK_NAME), ("anchor", anchor_path(root).with_name(auth.ANCHOR_NAME + ".lock"))):
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                tried[name] = "taken"
+            except BlockingIOError:
+                tried[name] = "held"
+            finally:
+                os.close(fd)
+
+    _, new = _reset(root, laptop.fingerprint, _Recorder(laptop, during=contend))
+    assert tried == {"store": "held", "anchor": "held"} and new.seq == 1
+
+
+def test_a_link_appended_during_the_touch_refuses_the_reset(tmp_path: Path) -> None:
+    """complement LOW (L3 r1): the snapshot was taken before the lock, so an append between it and the write left
+    the anchor reset to an older head. Under the lock the head is read again; a moved head refuses, nothing
+    written."""
+    from levain.cockpit.keys import KeyError_
+
+    root, laptop, _ = _restored(tmp_path)
+    before = anchor_path(root).read_bytes()
+    extra = RealKey(tmp_path, "extra")
+
+    def append_unanchored() -> None:              # a writer the store lock does not keep out
+        db = CockpitDB(root)
+        with db.autocommit() as conn:
+            auth.sign_and_append(conn, {"op": "enrol", "fingerprint": extra.fingerprint, "public_key": extra.public,
+                                        "class": "display-phone", "custody": "unstated"},
+                                 signer_fp=laptop.fingerprint, sign=laptop.sign_link, clock=lambda: NOW, anchor=None)
+
+    with pytest.raises(KeyError_, match="moved while the reset was signed"):
+        _reset(root, laptop.fingerprint, _Recorder(laptop, during=append_unanchored))
+    assert anchor_path(root).read_bytes() == before
+
+
+def test_an_empty_log_with_no_anchor_names_only_ledger_init(tmp_path: Path) -> None:
+    """complement LOW (L3 r1): with no anchor file the remedy said to move one aside."""
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    CockpitDB(root).set_install_class("reported")
+    laptop = RealKey(tmp_path, "laptop")
+    rc, _, err = _run("cockpit", "anchor", "reset", "--signing-key", str(laptop.path), "--data-root", str(root))
+    assert rc == 1 and auth.init_hint(root) in err and "aside" not in err, err
+
+
+def _parsed(argv: list[str], monkeypatch) -> "argparse.Namespace":
+    """``argv`` through levain.cli's own parser (``main``'s), stopped before the command runs."""
+    import argparse
+
+    from levain import cli
+
+    class Parsed(Exception):
+        pass
+
+    real = argparse.ArgumentParser.parse_args
+
+    def spy(self, args=None, namespace=None):
+        raise Parsed(real(self, args, namespace))
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", spy)
+    try:
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            cli.main(argv)
+    except Parsed as done:
+        return done.args[0]
+    except SystemExit:
+        raise AssertionError(f"levain's parser refused {argv}: {err.getvalue()}") from None
+    finally:
+        monkeypatch.setattr(argparse.ArgumentParser, "parse_args", real)
+    raise AssertionError("never parsed")
+
+
+def test_every_printed_anchor_remedy_is_a_complete_command_the_parser_takes(tmp_path: Path, monkeypatch) -> None:
+    """codex LOW + complement LOW (L3 r1): the hint named `--path or --data-root` in prose and `ledger init` without
+    its required `--signing-key`. Each refusal's printed remedy, with only the key file filled in, now parses to the
+    command it names, on this data root."""
+    from levain.cockpit.broker import LOCK_NAME
+
+    root, laptop, _ = _restored(tmp_path)
+    printed = {}
+    printed["behind"] = _run("cockpit", "keys", "--data-root", str(root))[2]
+    fd = os.open(root / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        printed["server"] = _run("cockpit", "anchor", "reset", "--signing-key", str(laptop.path),
+                                 "--data-root", str(root))[2]
+    finally:
+        os.close(fd)
+    good = anchor_path(root).read_bytes()
+    anchor_path(root).write_bytes(b"not an anchor")
+    printed["unreadable"] = _run("cockpit", "keys", "--data-root", str(root))[2]
+    anchor_path(root).write_bytes(good)
+    conn = sqlite3.connect(root / "cockpit.db", isolation_level=None)
+    conn.execute("DELETE FROM authority_log")
+    conn.close()
+    printed["empty, anchored"] = _run("cockpit", "keys", "--data-root", str(root))[2]
+    anchor_path(root).unlink()
+    printed["empty"] = _run("cockpit", "anchor", "reset", "--signing-key", str(laptop.path),
+                            "--data-root", str(root))[2]
+    want = {"behind": "_cmd_cockpit_anchor_reset", "server": "_cmd_cockpit_anchor_reset",
+            "unreadable": "_cmd_cockpit_anchor_reset", "empty, anchored": "_cmd_cockpit_ledger_init",
+            "empty": "_cmd_cockpit_ledger_init"}
+    for case, err in printed.items():
+        ns = _parsed(_hinted_argv(err, laptop.path), monkeypatch)
+        assert ns.func.__name__ == want[case], (case, err)
+        assert (ns.data_root, ns.signing_key) == (root, laptop.path), (case, err)
 
 
 # --- every printed remedy is an argv the CLI accepts --------------------------------------------------------
