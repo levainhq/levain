@@ -105,6 +105,7 @@ def step(cs, message_id, state, **kw):
     kw.setdefault("cause", "test")
     if state == "attempted":
         kw.setdefault("op_id", "op-1")
+        kw.setdefault("vendor_anchor", "0001.0000")
     with cs._write() as (conn, now):
         return chat.outbox_step(conn, now, message_id, state, **kw)
 
@@ -252,12 +253,14 @@ _ALLOWED = {None: {"refused", "pending"}, "pending": {"attempted", "cancelled", 
             "attempted": {"accepted", "ambiguous", "not_delivered"}, "ambiguous": {"accepted", "not_delivered"}}
 
 
-def _raw_step(c, clock, message_id, state, *, by="service", op_id="op-raw"):
+def _raw_step(c, clock, message_id, state, *, by="service", op_id="op-raw", anchor="0001.0000"):
     seq = c.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM chat_outbox_events WHERE message_id = ?",
                     (message_id,)).fetchone()[0]
-    c.execute("INSERT INTO chat_outbox_events (message_id, seq, gseq, state, op_id, cause, by, at) "
-              "VALUES (?, ?, ?, ?, ?, 'raw', ?, ?)", (message_id, seq, gseq(c, clock), state,
-                                                      op_id if state == "attempted" else None, by, stamp(clock)))
+    attempt = state == "attempted"
+    c.execute("INSERT INTO chat_outbox_events (message_id, seq, gseq, state, op_id, vendor_anchor, cause, by, at) "
+              "VALUES (?, ?, ?, ?, ?, ?, 'raw', ?, ?)", (message_id, seq, gseq(c, clock), state,
+                                                         op_id if attempt else None, anchor if attempt else None,
+                                                         by, stamp(clock)))
 
 
 @pytest.mark.parametrize("frm", list(_PATH), ids=lambda s: s or "none")
@@ -298,6 +301,14 @@ def test_attempt_carries_op_id_and_the_partial_index_is_the_cas(cs, world, qdir,
     c = raw(qdir)
     with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
         _raw_step(c, clock, m.message_id, "attempted", op_id=None)
+    # rev 3 §16 item 1: an attempt also names the vendor position read before it
+    with pytest.raises(CoordError, match="vendor anchor"):
+        step(cs, m.message_id, "attempted", vendor_anchor=None)
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        _raw_step(c, clock, m.message_id, "attempted", anchor=None)
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        _raw_step(c, clock, m.message_id, "attempted", op_id=None, anchor=None)
+    assert cs._read(lambda conn: chat.outbox_state(conn, m.message_id)) == "pending"
     with pytest.raises(OutboxRefused, match="vendor outcome"):
         step(cs, m.message_id, "cancelled", vendor_turn_id="t1")
     # the index refuses a second attempt on its own, even with the edge trigger gone (a test copy only)
@@ -309,10 +320,25 @@ def test_attempt_carries_op_id_and_the_partial_index_is_the_cas(cs, world, qdir,
 
 # --- §2.3 / §2.4 events and cursors ---------------------------------------------------------------------------------
 def ev(cs, world, key="item-1", body="hello", **kw):
+    """One vendor event; ``key`` is the vendor id, qualified by the kind as rev 3 §16 item 2 mints it."""
+    kind = kw.pop("kind", "agent_text")
     with cs._write() as (conn, now):
-        return chat.record_event(conn, now, launch_id=world["launch"], key=key, pos=kw.pop("pos", "0001.0001"),
-                                 kind=kw.pop("kind", "agent_text"), body=body, normalized=kw.pop("normalized", body),
-                                 **kw)
+        return chat.record_event(conn, now, launch_id=world["launch"], key=kw.pop("full_key", f"{kind}:{key}"),
+                                 pos=kw.pop("pos", "0001.0001"), kind=kind, body=body,
+                                 normalized=kw.pop("normalized", body), **kw)
+
+
+def test_one_vendor_item_holds_a_call_an_approval_and_a_result(cs, world, qdir):
+    # rev 2's bare item id put a call's tool_call and approval_request rows on one primary key
+    item = "exec-0b5e6c2a-1111-4c3d-9e2f-000000000001"
+    for kind, pos in (("tool_call", "0001.0002"), ("approval_request", "0001.0003"), ("tool_result", "0001.0004")):
+        e, created = ev(cs, world, key=item, kind=kind, pos=pos, body=f"{kind} body", call_id=item)
+        assert created and e.vendor_event_key == f"{kind}:{item}"
+    rows = raw(qdir).execute("SELECT kind FROM chat_events WHERE call_id = ? ORDER BY gseq", (item,)).fetchall()
+    assert [r[0] for r in rows] == ["tool_call", "approval_request", "tool_result"]
+    for bad in (item, "agent_text:" + item, "tool_call:"):
+        with pytest.raises(CoordError, match="kind-qualified"):
+            ev(cs, world, kind="tool_call", full_key=bad, pos="0001.0009")
 
 
 def test_event_replay_is_idempotent_and_a_changed_key_conflicts(cs, world, qdir):

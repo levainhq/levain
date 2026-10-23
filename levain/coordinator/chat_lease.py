@@ -3,7 +3,9 @@
 A worker launch's turn is held by at most one EPOCH at a time, recorded as an append-only run of ``turn_lease_events``
 in ``dispatch.db``. The epoch is the ``seq`` of the row that OPENED the holding: ``claim`` (the turn was free),
 ``handoff`` (the holder passed it on), ``take`` (your explicit "take the turn", from any of your surfaces, at any time)
-or ``outside`` (the service saw a line or an answer from a client Levain cannot fence: the terminal, the vendor's app).
+or ``outside`` (the service saw a line or an answer from a client Levain cannot fence: the terminal, the vendor's app;
+rev 3 §5.4: any ``user_item`` not PROVEN to be a Levain message, by a vendor correlation id or the send's own accepted
+item id, and never decided by a digest match; that trigger is CH-D1b's, this module only records the epoch).
 ``beat``, ``outside_beat``, ``release`` and ``lapse`` carry ``token`` = the epoch they affect, and the edge trigger
 refuses one whose token is not the launch's LATEST opening, so a delayed release for epoch N can never end N+1.
 

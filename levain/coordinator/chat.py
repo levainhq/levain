@@ -122,8 +122,9 @@ CHAT_SCHEMA: tuple[str, ...] = (
     f"seq INTEGER NOT NULL, gseq INTEGER NOT NULL UNIQUE, state TEXT NOT NULL CHECK ({_in('state', OUTBOX_STATES)}), "
     "op_id TEXT, vendor_anchor TEXT, vendor_turn_id TEXT, vendor_item_id TEXT, cause TEXT NOT NULL, "
     "by TEXT NOT NULL CHECK (by IN ('service', 'operator')), at TEXT NOT NULL, PRIMARY KEY (message_id, seq), "
-    # the one attempt carries the service-made op_id (§6); only a vendor outcome names a vendor turn or item
-    "CHECK (state != 'attempted' OR op_id IS NOT NULL), "
+    # the one attempt carries the service-made op_id and the vendor anchor read before it (§6, rev 3 §16 item 1); only
+    # a vendor outcome names a vendor turn or item
+    "CHECK (state <> 'attempted' OR (op_id IS NOT NULL AND vendor_anchor IS NOT NULL)), "
     "CHECK (state IN ('accepted', 'ambiguous', 'not_delivered') OR (vendor_turn_id IS NULL AND "
     "vendor_item_id IS NULL)))",
     # the attempt CAS: only the transaction whose attempted row commits may call the driver (§2.2, codex Critical 3)
@@ -394,6 +395,8 @@ def outbox_step(conn: sqlite3.Connection, now: str, message_id: str, state: str,
                             "service's")
     if state == "attempted":
         _line("an attempt's op_id", op_id, 128)
+        # with no vendor position the send is cancelled before any call, never attempted blind (rev 3 §16 item 1)
+        _line("an attempt's vendor anchor", vendor_anchor)
     for name, value in (("an op_id", op_id), ("a vendor anchor", vendor_anchor), ("a vendor turn id", vendor_turn_id),
                         ("a vendor item id", vendor_item_id)):
         if value is not None:
@@ -438,6 +441,10 @@ def record_event(conn: sqlite3.Connection, now: str, *, launch_id: str, key: str
     _line("a vendor position", pos)
     if kind not in EVENT_KINDS:
         raise CoordError(f"a vendor event's kind is one of {', '.join(EVENT_KINDS)}")
+    # rev 3 §16 item 2: a key is "<kind>:<vendor id>", so one vendor item's tool_call, approval_request and
+    # tool_result are three rows, never a primary-key collision
+    if not key.startswith(kind + ":") or len(key) == len(kind) + 1:
+        raise CoordError(f"a vendor event key is {kind}:<vendor id> (kind-qualified), not {key[:60]!r}")
     for name, value in (("a vendor turn id", turn_id), ("a vendor call id", call_id)):
         if value is not None:
             _line(name, value)
