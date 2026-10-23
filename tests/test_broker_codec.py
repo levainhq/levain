@@ -725,3 +725,22 @@ def test_codec_usage_breakdown_equal_to_the_total_is_usage():
     body = {"usage": {"prompt_tokens": 100, "completion_tokens": 3,
                       "prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 40}}}
     assert _read("openai-chat", json.dumps(body).encode(), False) == _u(0, 3, 40, 60)
+
+
+@pytest.mark.parametrize("det,want", [
+    # codex 2: `input_tokens_details.cache_write_tokens`, when present, is priced at cache_write and is out of `in`
+    ({"cached_tokens": 0, "cache_write_tokens": 100}, _u(0, 7, 100, 0)),
+    ({"cached_tokens": 20, "cache_write_tokens": 30}, _u(50, 7, 30, 20)),
+    ({"cached_tokens": 20}, _u(80, 7, 0, 20)),
+])
+def test_codec_usage_responses_cache_writes_priced_apart(det, want):
+    body = {"usage": {"input_tokens": 100, "output_tokens": 7, "input_tokens_details": det}}
+    assert _read("openai-responses", json.dumps(body).encode(), False) == want
+    ev = UR._sse([("response.completed", {"type": "response.completed", "response": {"status": "completed", **body}})])
+    assert _read("openai-responses", ev, True) == want
+
+
+def test_codec_usage_responses_cache_write_over_the_total_is_no_usage():
+    body = {"usage": {"input_tokens": 100, "output_tokens": 7,
+                      "input_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 41}}}
+    assert _read("openai-responses", json.dumps(body).encode(), False) is None

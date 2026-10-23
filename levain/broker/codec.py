@@ -645,7 +645,8 @@ class OpenAIResponses(_OpenAI):
     # Usage: a non-stream body's `usage`; a stream's `response.completed` `response.usage`, and
     # `response.incomplete`'s (the call that stopped at its ceiling ends with that event, not `completed`)
     # [judged by lane 3c2b, 2026-10-23, against the Responses streaming reference]. `input_tokens` counts the cached
-    # ones (`input_tokens_details.cached_tokens`), priced at `cache_read`.
+    # ones (`input_tokens_details.cached_tokens`), priced at `cache_read`, and the cache writes
+    # (`input_tokens_details.cache_write_tokens`, when present), priced at `cache_write`; the rest at `in`.
     _FINAL = ("response.completed", "response.incomplete")
 
     def _usage_event(self, obj: Mapping[str, Any], st: Dict[str, Any]) -> None:
@@ -662,9 +663,9 @@ class OpenAIResponses(_OpenAI):
         det = u.get("input_tokens_details")
         if det is not None and not isinstance(det, dict):
             raise _NoUsage("input_tokens_details")
-        cached = _count(det, "cached_tokens")
-        return Usage(in_=_plain(_count(u, "input_tokens", True), cached, 0, "input_tokens_details"),
-                     out=_count(u, "output_tokens", True), cache_write=0, cache_read=cached)
+        cached, written = _count(det, "cached_tokens"), _count(det, "cache_write_tokens")
+        return Usage(in_=_plain(_count(u, "input_tokens", True), cached, written, "input_tokens_details"),
+                     out=_count(u, "output_tokens", True), cache_write=written, cache_read=cached)
 
 
 #: `body_codec` -> its codec. Every name of `policy.BODY_CODECS` but `none` (a test asserts the equality).
