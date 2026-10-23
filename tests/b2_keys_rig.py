@@ -22,6 +22,7 @@ from levain.broker import gwwire
 from levain.broker import keys as K
 from levain.broker import peer
 from levain.contracts import canon
+from tests.test_broker_keys_upstream import BODY, PRICE
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER = str(ROOT / "tests" / "b2_keys_driver.py")
@@ -30,18 +31,19 @@ SECRET = "sk-upstream-test-SECRET-0123456789"
 READY_S = 40.0
 
 
-def lib(d: str, cap: int, max_call: int) -> None:
-    """`test_broker_keys_upstream._lib` with the route's two limits as arguments."""
+def lib(d: str, cap: int) -> None:
+    """`test_broker_keys_upstream._lib` with the route's per-session cap as the argument (base `/2`)."""
     os.makedirs(os.path.join(d, "routes"), exist_ok=True)
     os.makedirs(os.path.join(d, "keys", "cred"), exist_ok=True)
     os.chmod(os.path.join(d, "keys"), 0o700)
     route = {"route": "r", "type": "brokered",
              "upstream": {"scheme": "https", "host": "api.example.com", "base_path": ""}, "credential": "c1",
              "requests": {"templates": [{"method": "POST", "path": "/v1/messages"}],
-                          "headers": {"content-type": "application/json"}, "body_cap": 4096, "body_codec": "none"},
-             "max_call_microdollars": max_call, "max_session_microdollars": cap}
+                          "headers": {"content-type": "application/json"}, "body_cap": 4096,
+                          "body_codec": "anthropic-messages"},
+             "max_session_microdollars": cap, "prices": {"m1": PRICE}}
     with open(os.path.join(d, "routes", "base.json"), "wb") as f:
-        f.write(canon.canonical_bytes({"format": "levain-routes-base/1", "routes": [route]}))
+        f.write(canon.canonical_bytes({"format": "levain-routes-base/2", "routes": [route]}))
     with open(os.path.join(d, "keys", "cred", "c1.json"), "w") as f:
         f.write(json.dumps({"format": CR.FORMAT, "name": "c1", "rev": "0" * 32, "hosts": ["api.example.com"],
                             "inject": {"header": "x-api-key", "scheme": ""}, "kind": "static", "secret": SECRET}))
@@ -245,11 +247,12 @@ class Front:
 
     async def _q_once(self) -> Dict[str, Any]:
         q = {"v": 1, "token": TOKEN, "route": "r", "method": "POST", "path": "/v1/messages", "query": "",
-             "headers": [["content-type", "application/json"]], "body": "none", "upgrade": "none"}
+             "headers": [["content-type", "application/json"]], "body": "length:%d" % len(BODY),
+             "upgrade": "none"}
         frames: List[tuple] = []
         r, w = await asyncio.open_unix_connection(self.keys.front_path)
         try:
-            w.write(gwwire.encode(b"Q", q) + gwwire.encode(b"E"))
+            w.write(gwwire.encode(b"Q", q) + gwwire.encode(b"B", BODY) + gwwire.encode(b"E"))
             await w.drain()
             while True:
                 try:

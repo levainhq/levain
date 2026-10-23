@@ -30,8 +30,40 @@ SECRET = "sk-upstream-test-SECRET-0123456789"
 TOKEN = "T" * 43
 CLAIMS = {"routes": ["r"], "front": {"uid": 70000, "pid": 1, "start": 1}, "incarnation": 1}
 
+#: the fixtures' one priced model (R4 §1.3): rates in microdollars per million tokens
+PRICE = {"in": 1_000_000, "out": 2_000_000, "cache_write": 1_250_000, "cache_read": 100_000, "default_output": 1000,
+         "overhead_tokens": 10, "image_tokens": 100, "source": "https://example.com/pricing"}
+#: the JSON body every exchange sends, already compact, so keys' own serialization of it is these bytes
+BODY = b'{"model":"m1","max_tokens":10,"messages":[]}'
+BODY_Q = "length:%d" % len(BODY)
 
-def _q(body: str) -> dict:
+
+def body_frames(body: bytes = BODY) -> bytes:
+    """The front's `B` + `E` for one body."""
+    return gwwire.encode(b"B", body) + gwwire.encode(b"E")
+
+
+def big_body(n: int) -> bytes:
+    """A JSON body of exactly `n` bytes (a padding string field), compact as `BODY` is."""
+    head, tail = b'{"model":"m1","max_tokens":10,"messages":[],"pad":"', b'"}'
+    return head + b"x" * (n - len(head) - len(tail)) + tail
+
+
+def base_route(rid: str = "r", cap: int = 100000, *, body_cap: int = 4096, credential: "str | None" = "c1",
+               headers: "dict | None" = None, codec: str = "anthropic-messages", prices: "dict | None" = None) -> dict:
+    """One base `/2` brokered route on api.example.com with the `m1` price entry."""
+    r = {"route": rid, "type": "brokered",
+         "upstream": {"scheme": "https", "host": "api.example.com", "base_path": ""},
+         "requests": {"templates": [{"method": "POST", "path": "/v1/messages"}],
+                      "headers": {"content-type": "application/json"} if headers is None else headers,
+                      "body_cap": body_cap, "body_codec": codec},
+         "max_session_microdollars": cap, "prices": {"m1": PRICE} if prices is None else prices}
+    if credential is not None:
+        r["credential"] = credential
+    return r
+
+
+def _q(body: str = BODY_Q) -> dict:
     return {"v": 1, "token": TOKEN, "route": "r", "method": "POST", "path": "/v1/messages", "query": "",
             "headers": [["content-type", "application/json"]], "body": body, "upgrade": "none"}
 
@@ -39,13 +71,8 @@ def _q(body: str) -> dict:
 def _lib(d: str) -> None:
     os.makedirs(os.path.join(d, "routes"))
     os.makedirs(os.path.join(d, "keys", "cred"))
-    route = {"route": "r", "type": "brokered",
-             "upstream": {"scheme": "https", "host": "api.example.com", "base_path": ""}, "credential": "c1",
-             "requests": {"templates": [{"method": "POST", "path": "/v1/messages"}],
-                          "headers": {"content-type": "application/json"}, "body_cap": 4096, "body_codec": "none"},
-             "max_call_microdollars": 1000, "max_session_microdollars": 100000}
     with open(os.path.join(d, "routes", "base.json"), "wb") as f:
-        f.write(canon.canonical_bytes({"format": "levain-routes-base/1", "routes": [route]}))
+        f.write(canon.canonical_bytes({"format": "levain-routes-base/2", "routes": [base_route()]}))
     with open(os.path.join(d, "keys", "cred", "c1.json"), "w") as f:
         f.write(json.dumps({"format": CR.FORMAT, "name": "c1", "rev": "0" * 32, "hosts": ["api.example.com"],
                             "inject": {"header": "x-api-key", "scheme": ""}, "kind": "static", "secret": SECRET}))
@@ -244,11 +271,11 @@ def test_a_malformed_response_echoing_the_secret_never_reaches_a_log(monkeypatch
         try:
             async with _Rig(d) as rig:
                 rig.k.gw_log = log
-                rig.front.feed_data(gwwire.encode(b"E"))
+                rig.front.feed_data(body_frames())
                 rig.front.feed_eof()   # the front half-closes on reading `F`, which ends keys' drain
                 up.feed(_MALFORMED[where])
                 up.feed(b"")
-                await rig.run(_q("none"))
+                await rig.run(_q())
                 frames = await rig.got()
         finally:
             for h in handlers:
@@ -312,7 +339,8 @@ def test_an_abort_during_the_handshake_sends_no_request(monkeypatch):
         holder["gate"] = gate()
         st = _scripted(monkeypatch, up, holder["gate"])
         async with _Rig(d) as rig:
-            task = rig.run(_q("length:5"))
+            rig.front.feed_data(body_frames())
+            task = rig.run(_q())
             for _ in range(200):
                 if st["handshakes"]:
                     break
@@ -340,7 +368,9 @@ def test_an_early_413_during_the_upload_is_relayed(monkeypatch):
     async def go(d: str) -> list:
         _scripted(monkeypatch, up)
         async with _Rig(d) as rig:
-            rig.front.feed_data(gwwire.encode(b"B", b"x" * 3000) + gwwire.encode(b"B", b"y" * 1000))
+            big = big_body(4000)
+            rig.front.feed_data(gwwire.encode(b"B", big[:3000]) + gwwire.encode(b"B", big[3000:])
+                                + gwwire.encode(b"E"))
             up.feed(b"HTTP/1.1 413 Payload Too Large\r\ncontent-length: 4\r\n\r\nnope")
             await asyncio.wait_for(rig.run(_q("length:4000")), 5)
             return await rig.got()
@@ -371,7 +401,9 @@ def test_an_early_413_then_a_reset_relays_the_413(monkeypatch):
     async def go(d: str) -> list:
         _scripted(monkeypatch, up)
         async with _Rig(d) as rig:
-            rig.front.feed_data(gwwire.encode(b"B", b"x" * 3000) + gwwire.encode(b"B", b"y" * 1000))
+            big = big_body(4000)
+            rig.front.feed_data(gwwire.encode(b"B", big[:3000]) + gwwire.encode(b"B", big[3000:])
+                                + gwwire.encode(b"E"))
             rig.front.feed_eof()   # ends a refusal's drain, so the failure shows as `F`, not a hang
             await asyncio.wait_for(rig.run(_q("length:4000")), 5)
             return await rig.got()
@@ -391,9 +423,9 @@ def test_a_detached_exchange_relays_no_more_body(monkeypatch):
     async def go(d: str) -> list:
         _scripted(monkeypatch, up)
         async with _Rig(d) as rig:
-            rig.front.feed_data(gwwire.encode(b"E"))
+            rig.front.feed_data(body_frames())
             up.feed(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabcde")
-            task = rig.run(_q("none"))
+            task = rig.run(_q())
             while up.reads < 2:
                 up.read_called.clear()
                 await up.read_called.wait()
@@ -436,8 +468,8 @@ def test_a_hung_resolve_is_upstream_timeout(monkeypatch):
     async def go(d: str) -> list:
         monkeypatch.setattr(U, "_resolve", hung)
         async with _Rig(d, connect_timeout_s=0.2) as rig:
-            rig.front.feed_data(gwwire.encode(b"E"))
-            await asyncio.wait_for(rig.run(_q("none")), 5)
+            rig.front.feed_data(body_frames())
+            await asyncio.wait_for(rig.run(_q()), 5)
             return await rig.got()
 
     frames = _run(go)

@@ -562,24 +562,22 @@ def test_resolve_fenced_across_preemption_then_shutdown_order(monkeypatch):
 
 # --- P4b: THE FRAME, at every suspension (design 1.5 "test_revoke_at_every_suspension") ------------------------------
 
+from tests import test_broker_keys_upstream as _UP   # noqa: E402  (the shared /2 fixture: price, body)
+
 _SECRET = "sk-frame-test-SECRET"
 _FRAME_TOKEN = "F" * 43
 _FRAME_CLAIMS = {"routes": ["r"], "front": {"uid": 70000, "pid": 1, "start": 1}, "incarnation": 1}
 _FRAME_Q = {"v": 1, "token": _FRAME_TOKEN, "route": "r", "method": "POST", "path": "/v1/messages", "query": "",
-            "headers": [["content-type", "application/json"]], "body": "length:5", "upgrade": "none"}
+            "headers": [["content-type", "application/json"]], "body": _UP.BODY_Q, "upgrade": "none"}
 
 
 def _frame_lib(d: str) -> None:
-    """L: a base map with one brokered route `r` naming the static credential `c1`, and that credential."""
+    """L: a base `/2` map with one brokered route `r` naming the static credential `c1` (the `m1` price entry of
+    `test_broker_keys_upstream`), and that credential."""
     os.makedirs(os.path.join(d, "routes"))
     os.makedirs(os.path.join(d, "keys", "cred"))
-    route = {"route": "r", "type": "brokered",
-             "upstream": {"scheme": "https", "host": "api.example.com", "base_path": ""}, "credential": "c1",
-             "requests": {"templates": [{"method": "POST", "path": "/v1/messages"}],
-                          "headers": {"content-type": "application/json"}, "body_cap": 1024, "body_codec": "none"},
-             "max_call_microdollars": 1000, "max_session_microdollars": 100000}
     with open(os.path.join(d, "routes", "base.json"), "wb") as f:
-        f.write(canon.canonical_bytes({"format": "levain-routes-base/1", "routes": [route]}))
+        f.write(canon.canonical_bytes({"format": "levain-routes-base/2", "routes": [_UP.base_route(body_cap=1024)]}))
     with open(os.path.join(d, "keys", "cred", "c1.json"), "w") as f:
         f.write('{"format": "levain-keys-credential/1", "name": "c1", "rev": "%s", "hosts": ["api.example.com"], '
                 '"inject": {"header": "x-api-key", "scheme": ""}, "kind": "static", "secret": "%s"}'
@@ -769,7 +767,7 @@ def test_revoke_at_every_suspension(monkeypatch, transition, delivery, cached):
                 k._token_resolve = resolve
             _r, w = await asyncio.open_unix_connection(sock=a)
             fr = asyncio.StreamReader()
-            fr.feed_data(gwwire.encode(b"B", b"hello") + gwwire.encode(b"E"))
+            fr.feed_data(_UP.body_frames())
             fr.feed_eof()
             side = gwwire.KeysSide()
             side.got(b"Q")
@@ -848,7 +846,7 @@ async def _one_q(d: str) -> bytes:
         k.cache[digest_of_token(_FRAME_TOKEN)] = {"session": "s1", "claims": dict(_FRAME_CLAIMS)}
         _r, w = await asyncio.open_unix_connection(sock=a)
         fr = asyncio.StreamReader()
-        fr.feed_data(gwwire.encode(b"B", b"hello") + gwwire.encode(b"E"))
+        fr.feed_data(_UP.body_frames())
         fr.feed_eof()
         side = gwwire.KeysSide()
         side.got(b"Q")
@@ -957,7 +955,7 @@ def test_base_map_unusable_anywhere_refuses_every_route(routes):
              "overflow": [dict(route, route="z", requests=dict(route["requests"],
                                                                 headers={"content-type": "a{99999999999}"}))]}[routes]
     with open(path, "wb") as f:
-        f.write(canon.canonical_bytes({"format": "levain-routes-base/1", "routes": [route] + extra}))
+        f.write(canon.canonical_bytes({"format": "levain-routes-base/2", "routes": [route] + extra}))
     try:
         got = asyncio.run(_one_q(d))
         kinds = [o["kind"] for o in file_lines(os.path.join(d, "keys", "ledger.jsonl"))]
@@ -1013,7 +1011,7 @@ def test_preemption_fences_old_exchanges_before_its_bounded_await(monkeypatch):
                 _r, w = await asyncio.open_unix_connection(sock=sock)
                 fr = asyncio.StreamReader()
                 if feed_now:
-                    fr.feed_data(gwwire.encode(b"B", b"hello") + gwwire.encode(b"E"))
+                    fr.feed_data(_UP.body_frames())
                     fr.feed_eof()
                 side = gwwire.KeysSide()
                 side.got(b"Q")
@@ -1034,7 +1032,7 @@ def test_preemption_fences_old_exchanges_before_its_bounded_await(monkeypatch):
             while k.admin_epoch == epoch0:
                 await asyncio.sleep(0)
             st["after"] = True                     # the epoch is bumped: preemption is in its bounded await
-            fr1.feed_data(gwwire.encode(b"B", b"hello") + gwwire.encode(b"E"))
+            fr1.feed_data(_UP.body_frames())
             fr1.feed_eof()
             conn2, _fr2, w2, t2 = await exchange(pairs[1][0], True)   # a `Q` arriving inside the window
             await asyncio.sleep(0.2)

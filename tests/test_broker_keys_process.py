@@ -41,7 +41,7 @@ class World:
 
     async def __aenter__(self) -> "World":
         self.d = R.short_dir()
-        R.lib(self.d, self.cap, self.max_call)
+        R.lib(self.d, self.cap)
         self.control = FakeControl(os.path.join(self.d, "control.sock"))
         await self.control.start()
         self.up = await FakeUpstream().start(self.hold)

@@ -26,7 +26,7 @@ from levain.broker import keys as K
 from levain.broker import ledger as L
 from levain.contracts import canon
 from tests.ledger_support import FlushCtl, file_lines, keys_ledger, resolutions, until
-from tests.test_broker_keys_upstream import _Rig, _Up, _lib, _q, _run, _scripted, _types
+from tests.test_broker_keys_upstream import _Rig, _Up, _lib, _q, _run, _scripted, _types, base_route, body_frames
 
 pytestmark = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="unix sockets")
 
@@ -129,9 +129,9 @@ def test_cancel_at_each_await_resolves(monkeypatch, caplog, row):
                 gw = _GatedWriter(rig.conn.writer)
                 rig.conn.writer = gw
             if row in ("6-relay",):
-                rig.front.feed_data(gwwire.encode(b"E"))
+                rig.front.feed_data(body_frames())
                 up.feed(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabcde")
-            task = rig.run(_q("none"))
+            task = rig.run(_q())
             state_at_cancel = None
             if row == "1-after-A":
                 await asyncio.wait_for(gw.entered.wait(), 5)
@@ -212,10 +212,10 @@ def test_completed_relay_settles_at_the_full_hold(monkeypatch):
         _scripted(monkeypatch, up)
         async with _Rig(d) as rig:
             holds = _capture(rig)
-            rig.front.feed_data(gwwire.encode(b"E"))
+            rig.front.feed_data(body_frames())
             up.feed(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nabcde")
             up.feed(b"")
-            await asyncio.wait_for(rig.run(_q("none")), 5)
+            await asyncio.wait_for(rig.run(_q()), 5)
             frames = await rig.got()
             await until(lambda: holds[0].state is L.RESOLVED)
             out = {"frames": frames, "charged": rig.ledger.charged(SCOPE), "path": rig.ledger.path,
@@ -315,12 +315,12 @@ def _exit_case(monkeypatch, exit_: str, *, end_stubbed: bool = False) -> dict:
                     raise norm.Refused("upstream-error", "a response head keys refuses")
 
                 rig.k._response_frame = refuse_head
-                rig.front.feed_data(gwwire.encode(b"E"))
+                rig.front.feed_data(body_frames())
                 up.feed(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
             if exit_ == "upstream-failed":
-                rig.front.feed_data(gwwire.encode(b"E"))
+                rig.front.feed_data(body_frames())
                 up.feed(b"")   # EOF before a head
-            task = box["task"] = rig.run(_q("none"))
+            task = box["task"] = rig.run(_q())
             if exit_ == "connect-lost":
                 await until(lambda: st["handshakes"] == 1)
                 rig.front.feed_data(gwwire.encode(b"X"))
@@ -413,9 +413,9 @@ def test_a_fenced_http_relay_is_uncertain_not_settled(monkeypatch):
         _scripted(monkeypatch, up)
         async with _Rig(d) as rig:
             holds = _capture(rig)
-            rig.front.feed_data(gwwire.encode(b"E"))
+            rig.front.feed_data(body_frames())
             up.feed(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabcde")
-            task = rig.run(_q("none"))
+            task = rig.run(_q())
             await until(lambda: up.reads >= 2)   # the relay waits on the body's rest
             rig.k._fence_exchanges()
             up.feed(b"fghij")
@@ -474,9 +474,9 @@ def test_a_misuse_at_the_send_gate_is_keys_unavailable(monkeypatch, caplog):
         _scripted(monkeypatch, up)
         async with _Rig(d) as rig:
             holds = _capture(rig)
-            rig.front.feed_data(gwwire.encode(b"E"))
+            rig.front.feed_data(body_frames())
             rig.front.feed_eof()
-            task = rig.run(_q("none"))
+            task = rig.run(_q())
             await asyncio.wait([task], timeout=5)
             out = {"raised": None if task.cancelled() else task.exception(), "frames": await rig.got(),
                    "path": rig.ledger.path, "head": up.writes[:1]}
@@ -530,10 +530,10 @@ def test_end_in_the_refusal_handler_does_not_raise(monkeypatch, ledger_state):
         async with _Rig(d) as rig:
             holds = _capture(rig)
             hook["ledger"] = rig.ledger
-            rig.front.feed_data(gwwire.encode(b"E"))
+            rig.front.feed_data(body_frames())
             rig.front.feed_eof()
             up.feed(b"")   # EOF before a head
-            task = rig.run(_q("none"))
+            task = rig.run(_q())
             await asyncio.wait([task], timeout=5)
             out = {"raised": None if task.cancelled() else task.exception(), "frames": await rig.got(),
                    "path": rig.ledger.path, "head": up.writes[:1], "state": holds[0].state,
@@ -563,16 +563,10 @@ def _two_route_lib(d: str) -> None:
     os.makedirs(os.path.join(d, "routes"))
     os.makedirs(os.path.join(d, "keys"), mode=0o700)
 
-    def route(rid: str, max_call: int, cap: int) -> dict:
-        return {"route": rid, "type": "brokered",
-                "upstream": {"scheme": "https", "host": "api.example.com", "base_path": ""},
-                "requests": {"templates": [{"method": "POST", "path": "/v1/messages"}], "headers": {},
-                             "body_cap": 4096, "body_codec": "none"},
-                "max_call_microdollars": max_call, "max_session_microdollars": cap}
-
     with open(os.path.join(d, "routes", "base.json"), "wb") as f:
-        f.write(canon.canonical_bytes({"format": "levain-routes-base/1",
-                                       "routes": [route("a", 100, 100), route("b", 900, 1000)]}))
+        f.write(canon.canonical_bytes({"format": "levain-routes-base/2",
+                                       "routes": [base_route("a", 100, credential=None, headers={}),
+                                                  base_route("b", 1000, credential=None, headers={})]}))
 
 
 def test_route_caps_are_per_route():
@@ -705,7 +699,7 @@ def test_a_request_check_refusal_admits_nothing(monkeypatch):
                 return await real_refuse(self, conn, frames, side, name, cap)
 
             monkeypatch.setattr(K.Keys, "_refuse", snap_refuse)
-            q = _q("none")
+            q = _q()
             q["headers"] = q["headers"] + [["x-not-on-the-list", "1"]]
             rig.front.feed_eof()
             await asyncio.wait_for(rig.run(q), 5)
