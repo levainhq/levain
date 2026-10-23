@@ -366,3 +366,54 @@ def test_f3_a_listing_that_arrives_after_adoptstore_does_not_unset_the_adopted_s
     vals = out["values"]
     kept = vals[-1]
     assert kept == EnvelopeStore(world["qdir"]).store_id(), kept
+
+
+# every /consent.json reply names store A (OTHER_STORE) while the server holds store B: the page read A, and the name
+# now answers for a replacement store
+LISTING_SAYS_A = f"""(() => {{ const f = window.fetch; window.fetch = (u, o) => {{
+  const p = f(u, o);
+  if (!String(u).endsWith('/consent.json')) return p;
+  return p.then((r) => r.json().then((j) => new Response(JSON.stringify(
+    Object.assign(j, {{ coord_store_id: '{OTHER_STORE}' }})), {{ status: r.status, headers: r.headers }}))); }};
+  return 1; }})()"""
+
+
+@needs_browser
+def test_f4_a_store_replaced_between_listing_and_review_signs_nothing_and_keeps_the_page_s_store(world,
+                                                                                               tmp_path: Path) -> None:
+    # L3 r3 codex HIGH: the review request carried no store identity and the page took the review reply's store over
+    # the one it had read, so a signed drop made against store A was bound to (and filed in) replacement store B. The
+    # review now carries A, B refuses it other_store, nothing is signed or written, and the page keeps A
+    repo_path = str(world["repo"][0])
+    store_b = EnvelopeStore(world["qdir"]).store_id()
+    dev = device_token(world["qdir"])
+    with _serve(world["qdir"], world["qdir"]) as (base, httpd):
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={dev}", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
+            _authenticator(world["phone"]),
+            {"until": "document.getElementById('status').textContent !== 'reading the queue…' && 1"},
+            {"eval": "document.getElementById('tab-drop').click() || 1"},
+            {"eval": LISTING_SAYS_A},
+            {"eval": "document.getElementById('refresh').click() || 1"},
+            {"until": f"localStorage.getItem('levain-store-id:' + location.hostname) === '{OTHER_STORE}' && 1"},
+            {"eval": _set("drop-words", "signed for the store this page read")},
+            {"eval": "document.getElementById('drop-env').open = true; 1"},
+            {"eval": _set("drop-repo", repo_path)},
+            {"eval": _set("drop-onto", "main")},
+            {"eval": "document.getElementById('drop-sign').click() || 1"},
+            {"until": f"/^nothing to sign/.test({NOTE}) && {NOTE}", "ms": 15000},
+            {"until": "new Promise(r => setTimeout(() => r(1), 700))"},
+            {"eval": "localStorage.getItem('levain-store-id:' + location.hostname)"},
+            {"eval": "document.querySelector('#drop-review').hidden && "
+                     "document.querySelector('#drop-outbox').children.length"},
+        ])
+    vals = out["values"]
+    note, kept, outbox = vals[-4], vals[-2], vals[-1]
+    assert "another Levain" in note, note
+    assert kept == OTHER_STORE, kept
+    assert outbox == 0, outbox
+    posts = [(p.split(" ", 1)[0], json.loads(p.split(" ", 1)[1])) for p in out["posts"]]
+    assert [r for r, _ in posts] == ["/coord/envelope-review"]
+    assert posts[0][1]["store_id"] == OTHER_STORE
+    assert EnvelopeStore(world["qdir"]).store_id() == store_b and EnvelopeStore(world["qdir"]).drops() == []

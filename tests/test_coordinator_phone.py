@@ -47,9 +47,10 @@ def drop(cp: CoordPhone, words: str, outbox_id: str, **extra):
     return cp.step("drop", {"words": words, "outbox_id": outbox_id, "sent_at": SENT, **extra}, device=DEV)
 
 
-def review(world, cp: CoordPhone, words: str, outbox_id: str, spec: dict):
+def review(world, cp: CoordPhone, words: str, outbox_id: str, spec: dict, **extra):
+    extra.setdefault("store_id", sid(cp))     # the identity the page read, as the drop carries it
     return cp.step("envelope-review", {"words": words, "outbox_id": outbox_id, "spec": spec,
-                                       "signer_fp": world["phone"].fp}, device=DEV)
+                                       "signer_fp": world["phone"].fp, **extra}, device=DEV)
 
 
 def sign(world, cp: CoordPhone, r: dict, **assert_kw):
@@ -325,7 +326,7 @@ def test_r1_the_run_token_is_refused_on_every_coordinator_route_and_writes_nothi
     repo_path = str(world["repo"][0])
     bodies = {"drop": {"words": "w", "outbox_id": "ph-" + "6" * 32, "sent_at": SENT, "store_id": None},
               "envelope-review": {"words": "w", "outbox_id": "ph-" + "6" * 32, "signer_fp": world["phone"].fp,
-                                  "spec": {"where": [{"repo": repo_path, "paths": ["."]}]}},
+                                  "store_id": None, "spec": {"where": [{"repo": repo_path, "paths": ["."]}]}},
               "envelope-challenge": {"review_id": "rv-" + "0" * 32}}
     with _serve(world["qdir"], world["qdir"]) as (base, _):
         status, got = _post(base, f"/coord/{action}", bodies[action], _TOK)
@@ -453,7 +454,7 @@ def test_r6_sign_refused_from_the_keys_is_a_structured_503(world) -> None:
     r = review(world, good, "keys", "ph-" + "a6" * 16, _land_spec(str(world["repo"][0])))
     _c, envelope = sign(world, good, r)
     cp = coord_for(world, keys=broken)
-    for action, req in (("envelope-review", {"words": "keys", "outbox_id": "ph-" + "b6" * 16, "signer_fp": "x",
+    for action, req in (("envelope-review", {"words": "keys", "outbox_id": "ph-" + "b6" * 16, "signer_fp": "x", "store_id": sid(cp),
                                              "spec": _land_spec(str(world["repo"][0]))}),
                         ("drop", {"words": "keys", "outbox_id": "ph-" + "a6" * 16, "sent_at": SENT,
                                   "store_id": sid(cp), "envelope": envelope})):
@@ -698,3 +699,47 @@ def test_f3_a_sent_at_ahead_of_the_store_clock_is_refused_with_the_gap_named(wor
         drop(cp, "from a fast clock", "ph-" + "f3" * 16, sent_at=ahead)
     assert exc.value.status == 422 and "ahead of the store's clock" in str(exc.value)
     assert re.search(r"4[5-8] minutes ahead", str(exc.value)), str(exc.value)
+
+
+# --- 9. L3 r3 codex HIGH: the review is bound to the page's store (coordphone fix4) ------------------------------------
+
+def test_f4_a_store_replaced_between_listing_and_review_is_409_and_writes_nothing(world, tmp_path) -> None:
+    # the page read store A; the name now answers for replacement store B (same passkeys). The review carries A, and
+    # B refuses it other_store with nothing kept and nothing written, so no envelope is ever signed for B
+    a = coord_for(world)
+    drop(a, "made against A", "ph-" + "a4" * 16)
+    store_a = sid(a)
+    other = tmp_path / "replacement"
+    other.mkdir(mode=0o700)
+    b = CoordPhone(other, RP, ORIGIN, phone_for(world, page_origin=ORIGIN)._keys)
+    store_b = EnvelopeStore(other).store_id()
+    assert store_b != store_a
+    oid = "ph-" + "b4" * 16
+    with pytest.raises(CoordRefused) as exc:
+        review(world, b, "signed for A", oid, _land_spec(str(world["repo"][0])), store_id=store_a)
+    assert (exc.value.status, exc.value.error) == (409, "other_store"), exc.value.message
+    assert b._reviews == {} and EnvelopeStore(other).drops() == []
+    # the drop of that item meets the same rule (nothing passes the review rule that the drop rule would refuse)
+    with pytest.raises(CoordRefused) as exc:
+        drop(b, "signed for A", oid, store_id=store_a)
+    assert (exc.value.status, exc.value.error) == (409, "other_store")
+    assert EnvelopeStore(other).drops() == []
+
+
+def test_f4_a_null_bound_review_takes_the_store_only_when_it_made_it(world) -> None:
+    # null may become the returned identity only when that review created the store; on a store it did not make, a
+    # null-bound review is another Levain's, as the drop is
+    cp = coord_for(world)
+    first = review(world, cp, "the first review makes the store", "ph-" + "c4" * 16,
+                   _land_spec(str(world["repo"][0])), store_id=None)
+    here = EnvelopeStore(world["qdir"]).store_id()
+    assert (first["store_id"], first["store_created"]) == (here, True)
+    with pytest.raises(CoordRefused) as exc:
+        review(world, cp, "a page that never saw the store made", "ph-" + "d4" * 16,
+               _land_spec(str(world["repo"][0])), store_id=None)
+    assert (exc.value.status, exc.value.error) == (409, "other_store")
+    bound = review(world, cp, "bound to it", "ph-" + "e4" * 16, _land_spec(str(world["repo"][0])), store_id=here)
+    assert (bound["store_id"], bound["store_created"]) == (here, False)
+    with pytest.raises(CoordRefused) as exc:
+        review(world, cp, "bad id", "ph-" + "f5" * 16, _land_spec(str(world["repo"][0])), store_id=7)
+    assert exc.value.status == 400

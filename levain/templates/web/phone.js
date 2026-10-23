@@ -1223,6 +1223,8 @@
   // another Levain", never sent: a phone name that now answers for another dispatch directory never files it. On a
   // fresh install the envelope REVIEW makes the store: the signed drop is bound to the id the review's reply names,
   // and a reply that says its request made the store (store_created) rebinds every item made while there was none.
+  // The review carries the identity the page read and is held to the drop's rule, so a non-null identity the page
+  // read is never replaced from a review reply: a name that now answers for another store refuses the review.
   // An item made while there was no store that meets one it never saw made gets ONE receipt-only retry per identity:
   // the server answers it from its resend lookup (its own first send made the store, and the reply was lost) or
   // refuses it other_store with nothing written, and then it is "from another Levain".
@@ -1496,12 +1498,16 @@
       $("drop-send").disabled = $("drop-sign").disabled = false;
       busy--;
     };
-    call("POST", "/coord/envelope-review", { words: words, outbox_id: id, spec: spec, signer_fp: fp }).then((c) => {
+    // the review carries the identity this page read and the server holds it to the drop's rule: a name that now
+    // answers for another store refuses it (other_store), so nothing is signed for a store this page did not read
+    call("POST", "/coord/envelope-review", { words: words, outbox_id: id, spec: spec, signer_fp: fp, store_id: sid }).then((c) => {
       if (!c.ok) { close(); return dropSay("nothing to sign: " + why(c), "bad"); }
-      // the store this envelope was built against: the signed drop is bound to it (a fresh install's review made it)
+      // a fresh install's review made the store: only then does a null identity take the reply's (a non-null one the
+      // page read is never replaced from a reply)
       const rsid = typeof c.body.store_id === "string" ? c.body.store_id : null;
-      if (rsid !== null && c.body.store_created === true) adoptStore(rsid).then(drawOutbox);
-      if (!again && rsid !== null) sid = rsid;
+      const made = rsid !== null && c.body.store_created === true;
+      if (made) adoptStore(rsid).then(drawOutbox);
+      if (sid === null && made) sid = rsid;
       closeSheet = close;
       openReviews.add(close);   // a view change or a hidden page dismisses it (window.levainViewChanged)
       text.disabled = true;     // the words the envelope names are frozen while it is reviewed

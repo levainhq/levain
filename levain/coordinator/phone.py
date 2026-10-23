@@ -18,6 +18,10 @@ The phone port (:mod:`levain.phone_server`) carries the coordinator's phone half
   REVIEW makes the store, so the page binds the signed drop to the id its review reply names, and rebinds every item
   it made while there was no store only when that reply says this request made it). An item bound to None is
   accepted by the store the same request creates; on a store it did not see made, only its resend lookup answers.
+  The REVIEW carries the page's ``store_id`` too and passes the same :meth:`CoordPhone._bound_store` the drop does
+  (L3 r3 codex HIGH): a page that read store A while the name now answers for store B is refused ``other_store``
+  before anything is built or kept, so its reply never names B and no envelope is signed for a store the page did
+  not read. A None identity becomes the reply's only when this review made the store (``store_created``).
 - **The outbox** (gap 6): the page keeps a drop until this route answers 2xx. The page picks the ``outbox_id`` once,
   when the drop is made, and resends it unchanged. A resend is looked up FIRST (:meth:`CoordStore.resent_drop`, the
   words and surface compared) and answered with the stored drop (``created: false``) with nothing else checked, so a
@@ -27,9 +31,9 @@ The phone port (:mod:`levain.phone_server`) carries the coordinator's phone half
   store and whose reply was lost is sent again still bound to None, and gets its stored receipt and the store's id;
   one that matches nothing is still ``other_store``, so no new write ever passes the identity check.
 - **A structured envelope signed at send** (T4, C0 §4), in two steps so the signature is as fresh as the tap:
-  ``POST /coord/envelope-review`` {words, outbox_id, spec, signer_fp} builds the body with the CLI's own builder
-  (:func:`levain.coordinator.cli._spec_body`, the one ``levain drop --envelope`` signs), holds it to the store's disk
-  checks (``check_body``), KEEPS it here under a ``review_id`` and answers its canonical text, its digest and the
+  ``POST /coord/envelope-review`` {words, outbox_id, spec, signer_fp, store_id} builds the body with the CLI's own
+  builder (:func:`levain.coordinator.cli._spec_body`, the one ``levain drop --envelope`` signs), holds it to the
+  store's disk checks (``check_body``), KEEPS it here under a ``review_id`` and answers its canonical text, its digest and the
   plain-words view the CLI prints before signing (:func:`levain.coordinator.cli._view`). ``POST
   /coord/envelope-challenge`` {review_id}, sent when Sign is tapped, mints the payload
   (:func:`levain.coordinator.envelope.sign_payload`) with ``signed_at`` = now over the KEPT body and answers it with the
@@ -83,7 +87,7 @@ DROPS_SHOWN = 10
 _REPOS_SHOWN = 20
 _DROP_KEYS = frozenset({"words", "outbox_id", "sent_at", "store_id"})
 _ENVELOPE_KEYS = frozenset({"body_text", "payload", "authenticator_data", "client_data_json", "signature"})
-_REVIEW_KEYS = frozenset({"words", "outbox_id", "spec", "signer_fp"})
+_REVIEW_KEYS = frozenset({"words", "outbox_id", "spec", "signer_fp", "store_id"})
 _CHALLENGE_KEYS = frozenset({"review_id"})
 _ACTIONS = ("drop", "envelope-review", "envelope-challenge")
 # a reviewed body is kept this long for its Sign, and at most this many at once (oldest dropped first)
@@ -235,8 +239,9 @@ class CoordPhone:
     # --- the routes --------------------------------------------------------------------------------------------------
     def step(self, action: str, req: Any, *, device: str | None) -> dict[str, Any]:
         """``drop`` {words, outbox_id, sent_at, store_id[, envelope]} -> the drop delivered (or the stored one, on a
-        resend); ``envelope-review`` {words, outbox_id, spec, signer_fp} -> the body to sign, kept under a review id;
-        ``envelope-challenge`` {review_id} -> its payload, signed_at now, and the WebAuthn challenge. ``device`` is the
+        resend); ``envelope-review`` {words, outbox_id, spec, signer_fp, store_id} -> the body to sign, kept under a
+        review id; ``envelope-challenge`` {review_id} -> its payload, signed_at now, and the WebAuthn challenge.
+        ``device`` is the
         paired device the request's token belongs to (None for any other credential: refused). Raises
         :class:`CoordRefused`: 400 a malformed request, 403 no paired device, 409 an outbox id already used otherwise or
         another store's item, 422 a refusal, 503 a fault on this machine (nothing written)."""
@@ -316,7 +321,12 @@ class CoordPhone:
         key = self._key(req["signer_fp"])
         if not isinstance(req["outbox_id"], str):
             raise CoordError("an outbox id is text")
-        store, created = self._made_store()
+        if req["store_id"] is not None and not isinstance(req["store_id"], str):
+            raise CoordRefused(400, "bad_request", "store_id is the store identity the listing reported, or null")
+        # the drop's own identity rule (L3 r3 codex HIGH): a page that read another store is refused here, and None
+        # passes only where there is no store, which this call then creates, so created is exactly "store_id was None"
+        store = self._bound_store(req["store_id"])
+        created = req["store_id"] is None
         if (sent := store.drop_by_outbox(req["outbox_id"])) is not None:
             # a resend returns the stored drop as it was, so an envelope signed now would never be read
             raise CoordRefused(409, "conflict", f"this drop is already delivered as {sent.drop_id}; nothing new is "
@@ -407,7 +417,7 @@ class CoordPhone:
     def _bound_store(self, store_id: str | None) -> Any:
         """The store, only when it is the one the outbox item was made against (L3 r1 codex HIGH). An item made while
         there was no store (``store_id`` None) creates it, as ``levain drop`` does; an item bound to a store never
-        creates a new one."""
+        creates a new one. The envelope review passes the same rule, with the identity the page read (L3 r3)."""
         from levain.coordinator.envelopes import EnvelopeStore
 
         store = self._store(create=False)
