@@ -12,14 +12,18 @@ copies of the bundle and of ``verify/q.idx`` (§6 setup, S4). It MIGRATES and do
 1. :func:`migrate` writes the ``.pack`` from the private copy, hashed while it writes (the running sha256 must equal
    step 0's, else ``take-bytes-changed``), then the ``.idx`` LAST (a pack is invisible to git until its idx exists),
    each to an ``O_CREAT|O_EXCL`` 0444 temp in his ``objects/pack/``, fsynced, then linked to ``pack-<trailer>.<ext>``
-   (never replacing a file there) and the dir fsynced. A final name already holding equal bytes is skipped; different
-   bytes = ``take-pack-collision``; an OSError = ``take-failed:<errno name>``, temps removed.
+   (never replacing a file there) and the dir fsynced. Both final names are looked at before anything is written: one
+   already holding equal bytes is skipped; different bytes = ``take-pack-collision``; an OSError =
+   ``take-failed:<errno name>``. On ANY failure, an interrupt included, the temps are removed, and so is a pack this
+   take created whose idx did not land.
 2. :func:`create_ref`: ``update-ref --no-deref --create-reflog refs/heads/levain/<s>[-wip] <oid> <zero oid>``,
    create-only (``take-ref-exists``, ``take-ref-conflict``, ``take-failed:<rc>``).
 
 His git runs here twice, both on trusted input: ``rev-parse --git-path objects`` and ``update-ref``, each through
-:func:`_git` with :func:`git_env` and ``-c core.hooksPath=/dev/null`` (update-ref runs the ``reference-transaction``
-hook otherwise).
+:func:`_git` with :func:`git_env` and ``-c core.hooksPath=/dev/null``; update-ref also gets
+``-c hook.reference-transaction.enabled=false`` (it runs the ``reference-transaction`` hook otherwise). A spawn that
+cannot start or outlives its timeout is ``take-failed:<errno name>`` / ``take-failed:timeout``, as is an OSError reading
+the private copies.
 
 Known edge (§6a, HEAD_r5 Q-C, S3's words): "Shadowing requires the confined verifier to produce a semantically false
 idx; the take does not independently validate oid-to-offset mappings."
@@ -39,9 +43,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
+from levain import unshowable
 from levain.slot import Refused, adopt_verify, bundlefmt
+from levain.slot.grammar import SESSION_RE
 
-#: E14's closed ``<check>`` enum, in the order :func:`check_idx` evaluates it.
+#: E14's closed ``<check>`` enum.
 IDX_CHECKS = ("magic", "version", "fanout", "count", "crc-len", "order", "large-table", "offset-range",
               "first-offset", "offset-dup", "pack-checksum", "pack-hash", "trailer")
 IDX_MAGIC = b"\377tOc"
@@ -63,8 +69,24 @@ def _note(log: Log, line: str) -> None:
 
 
 def _idx_bad(check: str, detail: str) -> Refused:
-    assert check in IDX_CHECKS, check
+    if check not in IDX_CHECKS:
+        raise ValueError(f"idx check {check!r} is not in E14's enum")
     return Refused(f"take-idx-invalid:{check}", detail)
+
+
+def _errno_name(e: OSError) -> str:
+    return errno.errorcode.get(e.errno or 0, str(e.errno))
+
+
+def _failed(e: OSError, what: str) -> Refused:
+    return Refused(f"take-failed:{_errno_name(e)}", f"{what}: {e.strerror}")
+
+
+def _check_session(session: str) -> None:
+    # DESIGN §4.1 (S16-2): "a session id is `^s-[0-9a-f]{16}$` (the S1 contract's argv grammar, CONTRACT.md §5 Helper
+    # grammars: "Session `^s-[0-9a-f]{16}$`"; `levain/slot/grammar.py` `SESSION_RE = s-[0-9a-f]{16}`".
+    if not isinstance(session, str) or not SESSION_RE.fullmatch(session):
+        raise ValueError(f"session id {session!r}")
 
 
 @dataclass(frozen=True)
@@ -84,8 +106,16 @@ class Derived:
 
 def derive(bundle: Path, *, session: str, object_format: str) -> Derived:
     """Step 0's derivations from the private bundle copy, in ONE read of its pack region."""
+    _check_session(session)
     if object_format not in HASH:
         raise ValueError(f"object format {object_format!r}")
+    try:
+        return _derive(bundle, session, object_format)
+    except OSError as e:
+        raise _failed(e, f"the private bundle copy {bundle.name}") from None
+
+
+def _derive(bundle: Path, session: str, object_format: str) -> Derived:
     hl = HASH[object_format]().digest_size
     fd = os.open(bundle, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
@@ -123,8 +153,14 @@ def derive(bundle: Path, *, session: str, object_format: str) -> Derived:
                    fmt.digest() == tail)
 
 
+def _shown(v: object) -> str:
+    return unshowable.mark(str(v), allow="")[:200]
+
+
 def check_claims(claims: Mapping[str, object], d: Derived) -> None:
-    """The verifier's five byte claims equal step 0's derivations, or ``verifier-claim-mismatch``."""
+    """The verifier's five byte claims equal step 0's derivations, or ``verifier-claim-mismatch``. Both values reach
+    his terminal in the detail (the verifier's, and the derived refs, which are the hostile bundle's names), so each
+    passes :func:`levain.unshowable.mark` (the one escaper) before the 200-character cut."""
     derived = {"refs": dict(d.refs), "prerequisites": list(d.prerequisites), "pack_offset": d.pack_offset,
                "pack_sha256": d.pack_sha256, "object_count": d.object_count}
     for k in CLAIMS:
@@ -132,8 +168,8 @@ def check_claims(claims: Mapping[str, object], d: Derived) -> None:
         if k == "prerequisites" and isinstance(got, tuple):
             got = list(got)
         if type(got) is not type(derived[k]) or got != derived[k]:
-            raise Refused("verifier-claim-mismatch", f"{k}: the verifier claims {str(got)[:200]}, the private copy "
-                                                     f"gives {str(derived[k])[:200]}")
+            raise Refused("verifier-claim-mismatch", f"{k}: the verifier claims {_shown(got)}, the private copy "
+                                                     f"gives {_shown(derived[k])}")
 
 
 def _read_exact(fd: int, n: int, pos: int) -> bytes:
@@ -148,11 +184,26 @@ def _read_exact(fd: int, n: int, pos: int) -> bytes:
 
 def check_idx(idx: Path, d: Derived) -> str:
     """E14's structural check of the private idx copy against step 0's derivations, nothing inflated. Returns the
-    idx's sha256 (step 1 writes the idx hashed against it). The large-offset index's range (§6a "a large-offset index
-    in range of its table") is held by ``large-table``: with the table's length equal to the msbit-set count and each
-    index used exactly once, every index is in range [seat reading, adopt5dii-s3, 10-23, against E14]. ``fanout``
-    also holds that each oid's first byte lands in its fanout bucket (git binary-searches by the fanout) [judged by
-    adopt5dii-s3, 10-23, against E14's "fanout (monotonic)": a stricter reading of the same token]."""
+    idx's sha256 (step 1 writes the idx hashed against it). An OSError reading the copy = ``take-failed:<errno name>``.
+
+    ``large-table`` holds the table's length to git's own ceiling, at most ``max(n - 1, 0)`` entries (``packfile.c``
+    ``load_idx``'s max_size; measured: git's ``index-pack --index-version=2,0`` idx, m == n, is "wrong index v2 file
+    size" to git 2.54.0 and 2.50.1 and its ``2,0x10`` idx, m == n - 1, opens: ``1023-6/adopt/s3f1_large_*.txt``),
+    and its indexes, the low 31 bits of the msbit-set 4-byte offsets, to exactly ``0 .. m - 1`` each once:
+    the table's length equals the msbit-set count and every index is in range of it (§6a "a large-offset index in
+    range of its table") [seat reading, adopt5dii-s3, 10-23, against E14; head KEEP, S3 Q3].
+
+    ``fanout`` holds more than E14's "monotonic": ``fanout[i]`` must equal the number of oids whose first byte is at
+    most ``i``, for every ``i``, so each oid lies in the slice git's lookup binary-searches for it (``fanout[b - 1]``
+    up to ``fanout[b]``, ``b`` its first byte) [judged by adopt5dii-s3, 10-23, against E14's "fanout (monotonic)": a
+    stricter reading of the same token; head KEEP, S3 Q3]."""
+    try:
+        return _check_idx(idx, d)
+    except OSError as e:
+        raise _failed(e, f"the private idx copy {idx.name}") from None
+
+
+def _check_idx(idx: Path, d: Derived) -> str:
     hl = len(d.trailer)
     fmt = HASH[d.object_format]
     fd = os.open(idx, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -190,6 +241,9 @@ def check_idx(idx: Path, d: Derived) -> str:
             raise _idx_bad("crc-len", f"{length} bytes do not hold {n} oids, {n} CRC32s, {n} offsets and the "
                                       "trailers on an 8-byte large-offset table")
         m = rest // 8
+        if m > max(n - 1, 0):                           # git's load_idx ceiling, before the table is read
+            raise _idx_bad("large-table", f"{m} large-offset entries for {n} objects; git opens at most "
+                                          f"{max(n - 1, 0)}")
         # oids: strictly increasing; each in its fanout bucket
         pos = _FANOUT_END
         prev = b""
@@ -221,10 +275,9 @@ def check_idx(idx: Path, d: Derived) -> str:
             small.byteswap()
             large.byteswap()
         msb = [v & 0x7FFFFFFF for v in small if v & 0x80000000]
-        if len(msb) != m:
-            raise _idx_bad("large-table", f"{m} large-offset entries, {len(msb)} msbit-set offsets")
         if sorted(msb) != list(range(m)):
-            raise _idx_bad("large-table", "a large-offset index used twice, or one unused")
+            raise _idx_bad("large-table", f"{len(msb)} msbit-set offsets do not index the {m} large-offset entries "
+                                          "once each")
         limit = d.pack_size - hl
         offsets = array("Q", (large[v & 0x7FFFFFFF] if v & 0x80000000 else v for v in small))
         for i, off in enumerate(offsets):
@@ -265,11 +318,24 @@ def git_env() -> Dict[str, str]:
     return env
 
 
-def _git(git: str, repo: Path, *args: str, log: Log = None) -> subprocess.CompletedProcess:
-    argv = [git, "-c", "core.hooksPath=/dev/null", *args]
+def _git(git: str, repo: Path, *args: str, config: Tuple[str, ...] = (),
+         log: Log = None) -> subprocess.CompletedProcess:
+    """His git, run once, ``-c core.hooksPath=/dev/null`` then a ``-c`` per ``config`` entry. A spawn that outlives
+    ``_GIT_TIMEOUT`` = ``take-failed:timeout``; one that cannot start (no such git, his repo dir gone) =
+    ``take-failed:<errno name>``."""
+    argv = [git, "-c", "core.hooksPath=/dev/null"]
+    for c in config:
+        argv += ["-c", c]
+    argv += args
     _note(log, "spawn " + " ".join(argv[1:]))
-    return subprocess.run(argv, cwd=str(repo), env=git_env(), capture_output=True, timeout=_GIT_TIMEOUT,
-                          stdin=subprocess.DEVNULL)
+    what = "git " + args[0]
+    try:
+        return subprocess.run(argv, cwd=str(repo), env=git_env(), capture_output=True, timeout=_GIT_TIMEOUT,
+                              stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise Refused("take-failed:timeout", f"{what} ran past {_GIT_TIMEOUT} s") from None
+    except OSError as e:
+        raise _failed(e, what) from None
 
 
 def objects_dir(git: str, repo: Path, log: Log = None) -> Path:
@@ -294,19 +360,39 @@ class Migrated:
     skipped: List[str] = field(default_factory=list)    # already present with equal bytes
 
 
-def _errno_name(e: OSError) -> str:
-    return errno.errorcode.get(e.errno or 0, str(e.errno))
+def _full_fsync(fd: int) -> None:
+    """An fsync that reaches the medium. Darwin: ``F_FULLFSYNC`` (a plain fsync there leaves the drive's cache
+    unflushed), and ``os.fsync`` only when that fcntl answers ENOTSUP or EINVAL (a filesystem without it; the fallback
+    set is the S3 fix brief's, after git's ``git_fsync``); any other errno is raised. Elsewhere ``os.fsync``. A file
+    and a directory alike."""
+    if sys.platform == "darwin":
+        import fcntl
+
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            return
+        except OSError as e:
+            if e.errno not in (errno.ENOTSUP, errno.EINVAL):
+                raise
+    os.fsync(fd)
 
 
 def _sha256_at(dirfd: int, name: str) -> Optional[str]:
     """The sha256 of ``name`` in ``dirfd`` when it is a regular file opened without following a link; None when the
-    name does not exist. Anything else there (a link, a dir, a FIFO) answers ``""``, which equals no digest."""
+    name does not exist; ``""`` (equal to no digest: other bytes) when it is a symlink or not a regular file. Any
+    other OSError = ``take-failed:<errno name>``."""
     try:
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dirfd)
     except FileNotFoundError:
         return None
-    except OSError:
-        return ""
+    except OSError as e:                            # a symlink (ELOOP under O_NOFOLLOW), a socket: other bytes
+        try:
+            mode = os.stat(name, dir_fd=dirfd, follow_symlinks=False).st_mode
+        except OSError:
+            raise _failed(e, f"objects/pack/{name}") from None
+        if not stat.S_ISREG(mode):
+            return ""
+        raise _failed(e, f"objects/pack/{name}") from None
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return ""
@@ -337,7 +423,7 @@ def _copy_into(dirfd: int, tmp: str, src: Path, offset: int, size: int, want: st
     from levain import slot
 
     write = slot.write_all                          # looked up per call: a test seam replaces it (ENOSPC)
-    out =os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o444, dir_fd=dirfd)
+    out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o444, dir_fd=dirfd)
     try:
         os.fchmod(out, 0o444)
         h = hashlib.sha256()
@@ -357,41 +443,69 @@ def _copy_into(dirfd: int, tmp: str, src: Path, offset: int, size: int, want: st
             os.close(inp)
         if left or extra or h.hexdigest() != want:
             raise Refused("take-bytes-changed", f"{src.name}: the bytes written are not the bytes step 0 checked")
-        os.fsync(out)
+        _full_fsync(out)
     finally:
         os.close(out)
 
 
-def _finalize(dirfd: int, tmp: str, final: str, want: str, log: Log) -> bool:
-    """``tmp`` to ``final`` without replacing a file there (link, then unlink the temp; git's own
-    ``finalize_object_file`` order, and like git a rename when the filesystem refuses hard links). True when
-    created; False when ``final`` appeared meanwhile with equal bytes."""
+def _finalize(dirfd: int, tmp: str, final: str, want: str, m: Migrated, log: Log) -> None:
+    """``tmp`` to ``final`` without replacing a file there: link (never following a link), then unlink the temp
+    (git's own ``finalize_object_file`` order). ``final`` goes into ``m.written`` the moment the link lands, so a
+    failed unlink of the temp after it still rolls the created file back; into ``m.skipped`` when ``final`` appeared
+    meanwhile with equal bytes. Where the filesystem refuses hard links, a rename, as git does, but only after
+    ``final`` is looked at (a rename would replace it): equal bytes = skipped, other bytes = ``take-pack-collision``."""
     try:
-        os.link(tmp, final, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        os.link(tmp, final, src_dir_fd=dirfd, dst_dir_fd=dirfd, follow_symlinks=False)
     except FileExistsError:
-        if _present(dirfd, final, want, log):       # equal: skipped; other bytes: take-pack-collision
-            os.unlink(tmp, dir_fd=dirfd)
-            return False
-        raise                                       # gone again between the link and the look: take-failed:EEXIST
+        if not _present(dirfd, final, want, log):   # other bytes: take-pack-collision
+            raise                                   # gone again between the link and the look: take-failed:EEXIST
+        m.skipped.append(final)
+        os.unlink(tmp, dir_fd=dirfd)
+        return
     except OSError:
-        if _sha256_at(dirfd, final) is not None:
-            raise
+        if _present(dirfd, final, want, log):
+            m.skipped.append(final)
+            os.unlink(tmp, dir_fd=dirfd)
+            return
         os.rename(tmp, final, src_dir_fd=dirfd, dst_dir_fd=dirfd)
-        _note(log, f"rename {tmp} -> {final}")
-        return True
+        m.written.append(final)
+        _note(log, f"finalise {tmp} -> {final} (rename)")
+        return
+    m.written.append(final)
+    _note(log, f"finalise {tmp} -> {final}")
     os.unlink(tmp, dir_fd=dirfd)
-    _note(log, f"rename {tmp} -> {final}")
-    return True
+
+
+def _roll_back(dirfd: int, tmps: List[str], m: Migrated) -> None:
+    """:func:`migrate`'s cleanup on any failure: every temp removed, and the pack this take created removed when the
+    take did not also create its idx (a failed take leaves nothing new; a pack already present is never touched)."""
+    for t in tmps:
+        try:
+            os.unlink(t, dir_fd=dirfd)
+        except OSError:
+            pass
+    if m.pack in m.written and m.idx not in m.written:
+        try:
+            os.unlink(m.pack, dir_fd=dirfd)
+            m.written.remove(m.pack)
+        except OSError:
+            pass
+    try:
+        _full_fsync(dirfd)
+    except OSError:
+        pass
 
 
 def migrate(git: str, repo: Path, bundle: Path, idx: Path, d: Derived, idx_sha256: str, *,
             log: Log = None) -> Migrated:
-    """Step 1: the private copies' pack then idx into his ``objects/pack/``."""
+    """Step 1: the private copies' pack then idx into his ``objects/pack/``. Both final names are looked at before
+    anything is written (a stale idx at the idx's name would otherwise go live the moment the pack is linked). Any
+    failure, an interrupt included, runs :func:`_roll_back` and is re-raised; an OSError is raised as
+    ``take-failed:<errno name>``."""
     stem = "pack-" + d.trailer.hex()
     m = Migrated(stem + ".pack", stem + ".idx")
     objects = objects_dir(git, repo, log)
     tmps: List[str] = []
-    created_pack = False
     pack_fd = -1
     try:
         try:
@@ -401,41 +515,25 @@ def migrate(git: str, repo: Path, bundle: Path, idx: Path, d: Derived, idx_sha25
             finally:
                 os.close(obj_fd)
             idx_size = os.stat(idx, follow_symlinks=False).st_size
-            for final, src, off, size, want in ((m.pack, bundle, d.pack_offset, d.pack_size, d.pack_sha256),
-                                                (m.idx, idx, 0, idx_size, idx_sha256)):
-                if _present(pack_fd, final, want, log):
+            todo = ((m.pack, bundle, d.pack_offset, d.pack_size, d.pack_sha256),
+                    (m.idx, idx, 0, idx_size, idx_sha256))
+            present = [_present(pack_fd, final, want, log) for final, _src, _off, _size, want in todo]
+            for (final, src, off, size, want), there in zip(todo, present):
+                if there:
                     m.skipped.append(final)
                     continue
                 tmp = f"tmp_{final[-4:]}_levain_{secrets.token_hex(6)}"
                 tmps.append(tmp)
                 _copy_into(pack_fd, tmp, src, off, size, want)
-                if _finalize(pack_fd, tmp, final, want, log):
-                    m.written.append(final)
-                    created_pack = created_pack or final == m.pack
-                else:
-                    m.skipped.append(final)
+                _finalize(pack_fd, tmp, final, want, m, log)
                 tmps.remove(tmp)
-                os.fsync(pack_fd)
+                _full_fsync(pack_fd)
             return m
         except OSError as e:
-            raise Refused(f"take-failed:{_errno_name(e)}", f"objects/pack: {e.strerror}") from None
-    except Refused:
+            raise _failed(e, "objects/pack") from None
+    except BaseException:
         if pack_fd >= 0:
-            for t in tmps:
-                try:
-                    os.unlink(t, dir_fd=pack_fd)
-                except OSError:
-                    pass
-            if created_pack and m.idx not in m.written:     # a pack with no idx is invisible: take it back out
-                try:
-                    os.unlink(m.pack, dir_fd=pack_fd)
-                    m.written.remove(m.pack)
-                except OSError:
-                    pass
-            try:
-                os.fsync(pack_fd)
-            except OSError:
-                pass
+            _roll_back(pack_fd, tmps, m)
         raise
     finally:
         if pack_fd >= 0:
@@ -446,6 +544,7 @@ def migrate(git: str, repo: Path, bundle: Path, idx: Path, d: Derived, idx_sha25
 
 
 def ref_name(session: str, which: str) -> str:
+    _check_session(session)
     return f"refs/heads/levain/{session}{REF_SUFFIX[which]}"
 
 
@@ -454,7 +553,8 @@ def create_ref(git: str, repo: Path, session: str, which: str, oid: str, object_
     """Step 2, create-only. Returns the ref created."""
     ref = ref_name(session, which)
     zero = "0" * bundlefmt.OID_HEX[object_format]
-    r = _git(git, repo, "update-ref", "--no-deref", "--create-reflog", ref, oid, zero, log=log)
+    r = _git(git, repo, "update-ref", "--no-deref", "--create-reflog", ref, oid, zero,
+             config=("hook.reference-transaction.enabled=false",), log=log)
     if r.returncode == 0:
         return ref
     err = r.stderr.decode("utf-8", "replace")
@@ -482,6 +582,7 @@ def take(*, git: str, repo: Path, bundle: Path, idx: Path, claims: Mapping[str, 
     carries (the CLI offers only those)."""
     if which not in REF_SUFFIX:
         raise ValueError(f"take {which!r}")
+    _check_session(session)
     d = derive(bundle, session=session, object_format=object_format)
     check_claims(claims, d)
     if which not in d.refs:
