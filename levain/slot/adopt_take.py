@@ -14,19 +14,28 @@ copies of the bundle and of ``verify/q.idx`` (§6 setup, S4). It MIGRATES and do
    each to an ``O_CREAT|O_EXCL`` 0444 temp in his ``objects/pack/``, fsynced, then linked to ``pack-<trailer>.<ext>``
    (never replacing a file there) and the dir fsynced. Both final names are looked at before anything is written: one
    already holding equal bytes is skipped; different bytes = ``take-pack-collision``; an OSError =
-   ``take-failed:<errno name>``. On ANY failure, an interrupt included, the temps are removed, and so is a pack this
-   take created whose idx did not land.
+   ``take-failed:<errno name>``; a link that fails otherwise (hard links refused included) is ``take-failed:<errno
+   name>`` too, never a rename. On ANY failure, an interrupt included, the temps are removed. A final name already
+   linked stays: a pack whose idx did not land is invisible to git, a retry finds it present with equal bytes, and
+   another take of the same export may already have adopted it.
 2. :func:`create_ref`: ``update-ref --no-deref --create-reflog refs/heads/levain/<s>[-wip] <oid> <zero oid>``,
    create-only (``take-ref-exists``, ``take-ref-conflict``, ``take-failed:<rc>``).
 
-His git runs here twice, both on trusted input: ``rev-parse --git-path objects`` and ``update-ref``, each through
-:func:`_git` with :func:`git_env` and ``-c core.hooksPath=/dev/null``; update-ref also gets
+Before step 1 writes anything, :func:`check_prerequisites` holds every bundle prerequisite to his repository
+(``base-missing``).
+
+His git runs here on trusted input only: ``cat-file -e <oid>`` once per prerequisite, ``rev-parse --git-path
+objects`` and ``update-ref``, each through :func:`_git` with :func:`git_env` and ``-c core.hooksPath=/dev/null``;
+update-ref also gets
 ``-c hook.reference-transaction.enabled=false`` (it runs the ``reference-transaction`` hook otherwise). A spawn that
 cannot start or outlives its timeout is ``take-failed:<errno name>`` / ``take-failed:timeout``, as is an OSError reading
 the private copies.
 
 Known edge (§6a, HEAD_r5 Q-C, S3's words): "Shadowing requires the confined verifier to produce a semantically false
 idx; the take does not independently validate oid-to-offset mappings."
+Known edges (HEAD_rulings 1023-6 "adopt S3 L3 r1"): a retry after a ref that landed reports ``take-ref-exists``; a
+symlinked ``objects/`` or ``objects/pack/`` fails closed (``take-failed:ELOOP``, or ``ENOTDIR``, the errno macOS
+gives for ``objects/``: ``1023-6/adopt/s3f1_run.txt`` row M7).
 """
 from __future__ import annotations
 
@@ -450,10 +459,10 @@ def _copy_into(dirfd: int, tmp: str, src: Path, offset: int, size: int, want: st
 
 def _finalize(dirfd: int, tmp: str, final: str, want: str, m: Migrated, log: Log) -> None:
     """``tmp`` to ``final`` without replacing a file there: link (never following a link), then unlink the temp
-    (git's own ``finalize_object_file`` order). ``final`` goes into ``m.written`` the moment the link lands, so a
-    failed unlink of the temp after it still rolls the created file back; into ``m.skipped`` when ``final`` appeared
-    meanwhile with equal bytes. Where the filesystem refuses hard links, a rename, as git does, but only after
-    ``final`` is looked at (a rename would replace it): equal bytes = skipped, other bytes = ``take-pack-collision``."""
+    (git's own ``finalize_object_file`` order). ``final`` goes into ``m.written`` when the link lands; into
+    ``m.skipped`` when ``final`` appeared meanwhile with equal bytes (other bytes = ``take-pack-collision``). Any other
+    link failure, a filesystem that refuses hard links included, is raised (``take-failed:<errno name>``): there is no
+    rename, which would replace a file that appeared at ``final``."""
     try:
         os.link(tmp, final, src_dir_fd=dirfd, dst_dir_fd=dirfd, follow_symlinks=False)
     except FileExistsError:
@@ -462,46 +471,18 @@ def _finalize(dirfd: int, tmp: str, final: str, want: str, m: Migrated, log: Log
         m.skipped.append(final)
         os.unlink(tmp, dir_fd=dirfd)
         return
-    except OSError:
-        if _present(dirfd, final, want, log):
-            m.skipped.append(final)
-            os.unlink(tmp, dir_fd=dirfd)
-            return
-        os.rename(tmp, final, src_dir_fd=dirfd, dst_dir_fd=dirfd)
-        m.written.append(final)
-        _note(log, f"finalise {tmp} -> {final} (rename)")
-        return
     m.written.append(final)
     _note(log, f"finalise {tmp} -> {final}")
     os.unlink(tmp, dir_fd=dirfd)
-
-
-def _roll_back(dirfd: int, tmps: List[str], m: Migrated) -> None:
-    """:func:`migrate`'s cleanup on any failure: every temp removed, and the pack this take created removed when the
-    take did not also create its idx (a failed take leaves nothing new; a pack already present is never touched)."""
-    for t in tmps:
-        try:
-            os.unlink(t, dir_fd=dirfd)
-        except OSError:
-            pass
-    if m.pack in m.written and m.idx not in m.written:
-        try:
-            os.unlink(m.pack, dir_fd=dirfd)
-            m.written.remove(m.pack)
-        except OSError:
-            pass
-    try:
-        _full_fsync(dirfd)
-    except OSError:
-        pass
 
 
 def migrate(git: str, repo: Path, bundle: Path, idx: Path, d: Derived, idx_sha256: str, *,
             log: Log = None) -> Migrated:
     """Step 1: the private copies' pack then idx into his ``objects/pack/``. Both final names are looked at before
     anything is written (a stale idx at the idx's name would otherwise go live the moment the pack is linked). Any
-    failure, an interrupt included, runs :func:`_roll_back` and is re-raised; an OSError is raised as
-    ``take-failed:<errno name>``."""
+    failure, an interrupt included, removes this take's temps and is re-raised; an OSError is raised as
+    ``take-failed:<errno name>``. A final name already linked stays: a pack whose idx did not land is invisible to git
+    and a retry finds it present with equal bytes, and another take may already have adopted it."""
     stem = "pack-" + d.trailer.hex()
     m = Migrated(stem + ".pack", stem + ".idx")
     objects = objects_dir(git, repo, log)
@@ -532,8 +513,11 @@ def migrate(git: str, repo: Path, bundle: Path, idx: Path, d: Derived, idx_sha25
         except OSError as e:
             raise _failed(e, "objects/pack") from None
     except BaseException:
-        if pack_fd >= 0:
-            _roll_back(pack_fd, tmps, m)
+        for t in tmps:
+            try:
+                os.unlink(t, dir_fd=pack_fd)
+            except OSError:
+                pass
         raise
     finally:
         if pack_fd >= 0:
@@ -541,6 +525,19 @@ def migrate(git: str, repo: Path, bundle: Path, idx: Path, d: Derived, idx_sha25
 
 
 # --- step 2 -----------------------------------------------------------------------------------------------------
+
+
+def check_prerequisites(git: str, repo: Path, d: Derived, *, log: Log = None) -> None:
+    """Every prerequisite of the bundle is an object in his repository, or ``base-missing`` (a ref onto a delta whose
+    base he lacks is a disconnected branch). One ``cat-file -e <oid>`` each: rc 1 = absent; any other non-zero rc =
+    ``take-failed:<rc>``."""
+    for oid in d.prerequisites:
+        r = _git(git, repo, "cat-file", "-e", oid, log=log)
+        if r.returncode == 1:
+            raise Refused("base-missing", f"the prerequisite {oid} is not in his repository")
+        if r.returncode != 0:
+            raise Refused(f"take-failed:{r.returncode}", "git cat-file -e: "
+                          + r.stderr.decode("utf-8", "replace").strip()[-300:])
 
 
 def ref_name(session: str, which: str) -> str:
@@ -589,6 +586,7 @@ def take(*, git: str, repo: Path, bundle: Path, idx: Path, claims: Mapping[str, 
         raise ValueError(f"the bundle carries no {which} ref")
     idx_sha = check_idx(idx, d)
     _note(log, "step0 ok")
+    check_prerequisites(git, repo, d, log=log)      # before anything is written in his repo
     m = migrate(git, repo, bundle, idx, d, idx_sha, log=log)
     ref = create_ref(git, repo, session, which, d.refs[which], object_format, log=log)
     return Taken(ref, d.refs[which], m)
