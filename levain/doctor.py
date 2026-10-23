@@ -144,6 +144,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_compat_set(install))
     core.extend(_check_consent_hooks(install))
     core.extend(_check_consent_limits())
+    core.extend(_check_spend_cap_words())
     core.extend(_check_dispatch_adoption_rules())
     core.extend(_check_dispatch_verifiers())
     for r in core:
@@ -288,6 +289,25 @@ def _check_consent_hooks(install: Path) -> list[CheckResult]:
     from levain.consent.canary import doctor_findings
 
     return [CheckResult(f.name, True, f.detail, f.hint, warn=f.warn) for f in doctor_findings(install)]
+
+
+#: The ruled words for the authorized-spend cap (R4 DESIGN §1.1, "3a") and the sizing line (§10, 3c-2a). One home:
+#: the CHANGELOG's [Unreleased] entry carries the same strings and a test holds the two together.
+SPEND_CAP_WORDS = (
+    "Levain enforces an authorized-spend cap: a route's per-session cap on what Levain lets an agent spend. "
+    "It is a budget, not a ceiling on your bill. Calls already running when the cap is reached can finish past it. "
+    "To put a hard ceiling on what a provider can bill, set a spending limit on the API key itself."
+)
+SPEND_CAP_SIZING_LINE = (
+    "a route's per-session cap should be at least the concurrent calls × their output ceiling × the model's output "
+    "rate, or calls are refused 402 before they start (refuse-never-shrink, §1.3)."
+)
+
+
+def _check_spend_cap_words() -> list[CheckResult]:
+    """One INFO row under the keys/broker section: what the authorized-spend cap is and how to size it. Never a
+    WARN and never a refusal; the per-credential KEY-LIMIT rows are not here."""
+    return [CheckResult("authorized-spend cap", True, f"{SPEND_CAP_WORDS} Sizing: {SPEND_CAP_SIZING_LINE}")]
 
 
 def _check_consent_limits() -> list[CheckResult]:

@@ -6,6 +6,21 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **Metered routes hold each call's estimated cost against the route's per-session cap.** On a metered base route
+  (a `levain-routes-base/2` map with a price table) the credential-holding process buffers the request body, checks
+  the model against the route's price table, writes the output ceiling into the body and holds the call's estimated
+  cost against the route's per-session cap before the request goes upstream; a call whose estimate does not fit the
+  room left under the cap is refused `budget-exhausted` (402) and is never shrunk to fit. The body is forwarded as
+  Levain's own re-serialization of the parsed JSON, not as the agent's bytes. A body that does not arrive within
+  `BODY_READ_S` (in `levain/broker/keys.py`) is refused `body-timeout` (408). A websocket upgrade on a metered route
+  is refused `body-unbounded:websocket` (403), because one exchange would carry many responses and no one usage would
+  settle it. `levain doctor` carries the same words in its `authorized-spend cap` row.
+
+  Levain enforces an authorized-spend cap: a route's per-session cap on what Levain lets an agent spend. It is a budget, not a ceiling on your bill. Calls already running when the cap is reached can finish past it. To put a hard ceiling on what a provider can bill, set a spending limit on the API key itself.
+
+  Sizing: a route's per-session cap should be at least the concurrent calls × their output ceiling × the model's output rate, or calls are refused 402 before they start (refuse-never-shrink, §1.3).
+
 ## [0.11.20] — 2026-10-23
 
 This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which were never published, and everything merged since.
