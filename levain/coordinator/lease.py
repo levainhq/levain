@@ -66,8 +66,13 @@ __all__ = [
 LEASE_KINDS = ("claim", "beat", "release", "lapse", "takeover")
 LAUNCH_KINDS = ("pending", "active", "failed", "expired", "ended")
 HARNESSES = ("claude", "codex")
-# a worker refused at activation because its thread's budget gauge is crossed (C6): a stop, never a death
+# a worker refused at its spawn claim or activation because its thread's budget gauge is crossed (C6): a stop, never
+# a death
 BUDGET_CROSSED = "budget crossed"
+# a worker holding several threads, refused when asked for and, if one is already pending, at its spawn claim or
+# activation (C6 L3 r1 B1): C0 §3.4 gives such a launch no envelope authority, so no budget can meter it, and nothing
+# launches past a crossed budget. A refusal, never a death
+SEVERAL_THREADS = "a worker holds one thread"
 ROLES = ("coordinator", "worker")
 SETTING_AGENTS = (*HARNESSES, "none")
 _LEASE_BY = ("operator", "coordinator", "service")
@@ -89,7 +94,7 @@ SERVICE_BEAT_WINDOW = 2 * LEASE_TTL
 _MODEL = re.compile(r"[A-Za-z0-9._\[\]][A-Za-z0-9._\[\]-]*")
 # causes the store writes itself; a caller's end_launch never takes one, so no caller can relabel a death
 _SERVICE_CAUSES = ("takeover", "operator release", "lease lost before active", "pending past until",
-                   "lost the lease")
+                   "lost the lease", BUDGET_CROSSED, SEVERAL_THREADS)
 MAX_DEATHS = 3
 
 _LAUNCH_ID = re.compile(r"ln-[0-9a-f]{32}")
@@ -471,10 +476,29 @@ def _pending(conn: sqlite3.Connection, now: str, *, token: int, harness: str, ro
 def request_launch(conn: sqlite3.Connection, now: str, token: object, *, harness: str, role: str = "worker",
                    threads: Sequence[str] = (), model: str | None = None, cwd: str | None = None) -> Launch:
     """The lease holder asks for a launch: written ``pending`` under its token, activated only while that token is
-    still the live lease's. A coordinator launch asked for while a lease is held is a rotation."""
+    still the live lease's. A coordinator launch asked for while a lease is held is a rotation. A worker holds
+    exactly one thread (:data:`SEVERAL_THREADS`): refused here with nothing written."""
     fence(conn, now, token)
+    threads = list(threads)
+    if role == "worker" and len(threads) > 1:
+        raise _refused(_several(len(threads)))
     return _pending(conn, now, token=token, harness=harness, role=role, threads=threads, model=model, cwd=cwd,
                     cause="requested")
+
+
+def _several(n: int) -> str:
+    return (f"a worker holds one thread, and this launch names {n}: C0 §3.4 gives a launch holding several threads no "
+            "envelope authority, so no thread budget could meter it; ask for one worker per thread")
+
+
+def refuse_several(conn: sqlite3.Connection, now: str, ln: Launch) -> tuple[Launch, str] | None:
+    """A pending worker holding several threads (one asked for before :func:`request_launch` refused them): written
+    ``failed`` (cause :data:`SEVERAL_THREADS`) in the caller's transaction and ``(launch, why)`` returned; None for
+    any other launch. The spawn claim and the activation both call it, so such a launch never starts."""
+    if ln.state != "pending" or ln.role != "worker" or len(ln.threads) <= 1:
+        return None
+    _launch_event(conn, now, ln.launch_id, "failed", SEVERAL_THREADS)
+    return _launch_row(conn, "launch_id", ln.launch_id), f"launch {ln.launch_id}: {_several(len(ln.threads))}"
 
 
 def _head_envelope(conn: sqlite3.Connection, thread_id: str) -> str | None:
@@ -496,8 +520,8 @@ def activate(conn: sqlite3.Connection, now: str, launch_id: str, *, harness_sess
 
     THE PIN (C0 §3.4): a worker launch whose threads are exactly ``[T]`` records T's head envelope at this moment on
     its ``active`` row, in this transaction; it and every job it files run under that envelope, which later
-    successors and attenuations can only narrow. A coordinator launch, a worker holding several threads, and a
-    thread with no envelope pin nothing (no envelope authority). The pin is the head as bound, live or not: whether
+    successors and attenuations can only narrow. A coordinator launch and a thread with no envelope pin nothing (no
+    envelope authority); a pending worker holding several threads is refused here (:func:`refuse_several`). The pin is the head as bound, live or not: whether
     it is still in force is the predicate's question at each use (§4.5), never this one's."""
     ln = _must_launch(conn, launch_id)
     hsid = _line("harness session id", harness_session_id)
@@ -513,7 +537,10 @@ def activate(conn: sqlite3.Connection, now: str, launch_id: str, *, harness_sess
         _launch_event(conn, now, launch_id, "failed", "lease lost before active")
         return _launch_row(conn, "launch_id", launch_id), (f"launch {launch_id} was asked for under lease token "
                                                            f"{ln.token}, which is no longer live")
-    pin = _head_envelope(conn, ln.threads[0]) if ln.role == "worker" and len(ln.threads) == 1 else None
+    several = refuse_several(conn, now, ln)
+    if several is not None:
+        return several
+    pin = _head_envelope(conn, ln.threads[0]) if ln.role == "worker" else None
     _launch_event(conn, now, launch_id, "active", "spawned", harness_session_id=hsid,
                   argv_sha256=_line("argv sha256", argv_sha256), pinned_envelope_id=pin)
     if ln.role == "coordinator" and held.holder == ln.session_key:
@@ -739,6 +766,9 @@ def claim_spawn(conn: sqlite3.Connection, now: str, launch_id: str, pid: int) ->
         _launch_event(conn, now, launch_id, "failed", "lease lost before active")
         return _launch_row(conn, "launch_id", launch_id), (f"launch {launch_id} was asked for under lease token "
                                                            f"{ln.token}, which is no longer live")
+    several = refuse_several(conn, now, ln)
+    if several is not None:
+        return several
     conn.execute("INSERT INTO launch_spawns (launch_id, gseq, pid, at) VALUES (?, ?, ?, ?)",
                  (launch_id, next_gseq(conn, now), pid, now))
     return ln, None
@@ -758,7 +788,8 @@ def launch_death(conn: sqlite3.Connection, ln: Launch) -> bool | None:
     # a launch asked for under a lease its asker lost is not the launch's fault; one that lost the lease without ever
     # writing as coordinator died idle
     wrote = _wrote_since(conn, ln.session_key)
-    died = ln.state in ("failed", "expired") and ln.cause not in ("lease lost before active", BUDGET_CROSSED) \
+    died = ln.state in ("failed", "expired") and ln.cause not in ("lease lost before active", BUDGET_CROSSED,
+                                                                       SEVERAL_THREADS) \
         or ln.state == "ended" and (ln.cause == "0 turns" or ln.cause == "lost the lease" and not wrote)
     if not died:
         return False

@@ -1181,16 +1181,20 @@ def test_a_one_thread_worker_is_pinned_to_its_threads_head_envelope(ctx, structu
     st = ctx.store
     token = _lease(st)
     _d2, t2 = ctx.plain_thread("a thread with no envelope")
+    from levain.coordinator.store import CoordError
+
     one = st.launch_request(token, harness="claude", threads=[t.thread_id])
-    two = st.launch_request(token, harness="claude", threads=[t.thread_id, t2.thread_id])
+    # several threads carry no envelope authority, so no budget could meter them: refused (C6 L3 r1 B1)
+    with pytest.raises(CoordError, match="a worker holds one thread"):
+        st.launch_request(token, harness="claude", threads=[t.thread_id, t2.thread_id])
     bare = st.launch_request(token, harness="claude", threads=[t2.thread_id])
     coord = st.launch_request(token, harness="claude", role="coordinator")
-    for i, ln in enumerate((one, two, bare, coord)):
+    for i, ln in enumerate((one, bare, coord)):
         got, refused = st.launch_activate(ln.launch_id, harness_session_id=f"sid-{i}")
         assert refused is None and got.state == "active"
     assert st.launch(one.launch_id).pinned_envelope_id == b["envelope_id"] == st.head(t.thread_id).envelope_id
-    # several threads carry no envelope authority; a thread with none and the coordinator pin nothing
-    assert [st.launch(ln.launch_id).pinned_envelope_id for ln in (two, bare, coord)] == [None, None, None]
+    # a thread with no envelope and the coordinator pin nothing
+    assert [st.launch(ln.launch_id).pinned_envelope_id for ln in (bare, coord)] == [None, None]
     assert ctx.rows(f"SELECT kind, pinned_envelope_id FROM launch_events WHERE launch_id = '{one.launch_id}' "
                     "ORDER BY seq") == [("pending", None), ("active", b["envelope_id"])]
 

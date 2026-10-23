@@ -33,7 +33,7 @@ from levain.autonomic.durable_sqlite import read_transaction
 from levain.coordinator import budget, review
 from levain.coordinator.store import CoordError, CoordStore
 
-__all__ = ["AGENTS", "away_from_drop", "card", "render"]
+__all__ = ["AGENTS", "away_from_drop", "card", "render", "skipped_lines"]
 
 AGENTS = ("claude_code", "codex")
 _FIELD = 300
@@ -43,9 +43,11 @@ def away_from_drop(store: CoordStore, drop_id: str, *, token: object, agents: Se
     """The coordinator read drop ``drop_id`` as your word that you are away: set Q14 away ON for each of ``agents``
     through the operator's own path, then file a KNOW saying so. Lease-fenced (``token``): refused with nothing written
     unless the caller holds the live lease. An agent whose consent settings are missing, or whose held calls nobody
-    could answer, is skipped and named (``set_away`` refuses it exactly as it refuses ``levain consent away on``);
-    when every agent is skipped nothing is filed and :class:`CoordError` says why. Returns ``{"marked", "skipped",
-    "item_id"}``. There is no away OFF here: leaving takes your signature."""
+    could answer (``set_away`` refuses it exactly as it refuses ``levain consent away on``), or whose settings cannot
+    be read or written (an ``OSError``), is skipped and named with why; the KNOW says which agents were set away and
+    which were not, never "every" when not every (L3 r1 A1). When every agent is skipped nothing is filed and
+    :class:`CoordError` says why. Returns ``{"marked", "skipped", "item_id"}``. There is no away OFF here: leaving
+    takes your signature."""
     from levain.consent import away as consent_away
 
     with store._write("coordinator", token) as (conn, _now):
@@ -59,20 +61,26 @@ def away_from_drop(store: CoordStore, drop_id: str, *, token: object, agents: Se
         try:
             consent_away.set_away(Path(store.directory), agent, True)
             marked.append(agent)
-        except ValueError as exc:
-            skipped[agent] = str(exc)[:_FIELD]
+        except (ValueError, OSError) as exc:
+            skipped[agent] = f"{type(exc).__name__}: {exc}"[:_FIELD] if isinstance(exc, OSError) else str(exc)[:_FIELD]
     if not marked:
         raise CoordError("away was not set for any agent: " + "; ".join(f"{a}: {w}" for a, w in skipped.items()))
     words = drop.words if len(drop.words) <= 200 else drop.words[:200] + "..."
     text = (f"the coordinator read your drop {drop_id} ({words!r}) as away and set away ON for "
-            f"{', '.join(marked)}: every SIGN now waits UNDECIDED for your morning card. Only you can leave away "
-            "(`levain consent away off --signing-key KEY`).")
+            f"{', '.join(marked)}: a SIGN from {'that agent' if len(marked) == 1 else 'those agents'} now waits "
+            "UNDECIDED for your morning card. Only you can leave away (`levain consent away off --signing-key KEY`)."
+            + skipped_lines(skipped))
     try:
         item, _reply = review.file_know(store, threads[0] if threads else None, text, by="coordinator", token=token)
     except CoordError as exc:
         raise CoordError(f"away was set ON for {', '.join(marked)}, but the KNOW telling him was not filed: {exc}") \
             from exc
     return {"marked": marked, "skipped": skipped, "item_id": item.item_id}
+
+
+def skipped_lines(skipped: dict[str, str]) -> str:
+    """What the KNOW and the CLI say about agents away was NOT set for: their SIGNs are not held as away."""
+    return "".join(f" Away was NOT set for {a} ({w}): its SIGNs are not held as away." for a, w in skipped.items())
 
 
 def _ro(path: Path) -> sqlite3.Connection:
@@ -184,6 +192,10 @@ def render(c: dict[str, Any]) -> str:
                  + (f"  [thread {u['thread_id']}]" if u.get("thread_id") else "") + f"\n    rule it: {u['rule']}")
     L.append(f"thread budgets ({len(c['budgets'])}):")
     for b in c["budgets"]:
+        if b["unreadable"]:
+            # never "crossed" with zero usage: the meter could not be read (L3 r1 U1)
+            L.append(f"  {b['thread_id']} ({b['envelope_id']}): UNREADABLE, new steps stop: {b['unreadable']}")
+            continue
         used = ", ".join(f"{k} {budget._num(k, b['used'][k])}/{b['budget'][k]}" for k in budget.METERS)
         state = "CROSSED: new steps stop" if b["refusal"] else "within"
         L.append(f"  {b['thread_id']} ({b['envelope_id']}): {used}; dollars not metered; {state}")

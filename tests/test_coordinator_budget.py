@@ -256,3 +256,117 @@ def test_the_cli_views(night):
     out = io.StringIO()
     assert run_coord(_coord_args(night.store, "morning", json=True), out) == 0
     assert json.loads(out.getvalue())["budgets"][0]["crossed"] == ["tool_calls"]
+
+
+# --- C6 L3 r1 fix round (head rulings B1, B2, C6-3, A1, E1, U1) ----------------------------------------------------
+
+def test_b1_a_multi_thread_worker_is_refused_at_request_and_at_activation(night):
+    """L3 r1 codex: a worker holding [crossed T, T2] activated with no budget check, no SIGN and no meter (only a pinned
+    one-thread worker was metered). C0 §3.4 gives a launch holding several threads no envelope authority, so it has no
+    budget semantics: such a worker is refused when asked for, and one already pending is refused at activation."""
+    night.calls(7)
+    _d2, t2 = night.c.plain_thread("a second thread")
+    with pytest.raises(CoordError, match="one thread"):
+        night.store.launch_request(night.token, harness="claude", threads=[night.T, t2.thread_id])
+    # one already pending (asked for before this rule): written as a store of the old code would hold it
+    with night.store._write() as (conn, now):
+        old = lease._pending(conn, now, token=night.token, harness="claude", role="worker",
+                             threads=[night.T, t2.thread_id], model=None, cwd=None, cause="requested")
+    ln, why = night.store.launch_activate(old.launch_id, harness_session_id="sess-multi")
+    assert ln.state == "failed" and why is not None and "one thread" in why
+    assert ln.cause == lease.SEVERAL_THREADS
+    with sqlite3.connect(night.store.path) as conn:
+        assert lease.launch_death(conn, lease.launch(conn, ln.launch_id)) is False
+
+
+def test_b2_a_crossed_thread_is_refused_before_the_spawn(night):
+    """L3 r1 complement MED: the budget was read only at activation, after `claude --bg` had started a session. The
+    spawn claim (the one CAS every spawner takes before it spawns) now refuses a crossed thread's worker: no spawn
+    claim row, the launch written failed (budget crossed) and the SIGN filed, all before anything starts."""
+    night.calls(7)
+    w = night.store.launch_request(night.token, harness="claude", threads=[night.T])
+    ln, why = night.store.launch_claim_spawn(w.launch_id, 4242)
+    assert why is not None and "has used its budget" in why
+    assert night.c.rows(f"SELECT COUNT(*) FROM launch_spawns WHERE launch_id = '{w.launch_id}'") == [(0,)]
+    assert night.store.launch(w.launch_id).state == "failed"
+    assert night.store.launch(w.launch_id).cause == lease.BUDGET_CROSSED
+    assert night.signs() == [("budget", f"{night.T}/{night.body['envelope_id']}")]
+    # under the budget the claim is the same as before
+    other = Night(night.c, calls=100)
+    w2 = other.store.launch_request(other.token, harness="claude", threads=[other.T])
+    assert other.store.launch_claim_spawn(w2.launch_id, 4243)[1] is None
+
+
+def test_c6_3_echo_refuses_a_budget_that_omits_a_measured_key(night, monkeypatch):
+    from levain.coordinator.cli import run_envelope_echo
+
+    def args(b):
+        return Namespace(threads=[night.T], where=[f"{night.c.path}=."], land=[], stop="2h", budget=b, output=None,
+                         force=False, queue_dir=night.store.directory, json=False)
+
+    with pytest.raises(CoordError) as e:
+        run_envelope_echo(args("tool_calls=50"), io.StringIO())
+    assert "--budget leaves out tokens, hours, which the budget gauge measures" in str(e.value)
+    with pytest.raises(CoordError, match="hours"):
+        run_envelope_echo(args("tool_calls=50,tokens=0"), io.StringIO())
+
+
+def _extend(night, monkeypatch, b):
+    from levain.coordinator import cli
+
+    monkeypatch.setattr(cli, "_tick", lambda: NOW)
+    return cli.run_envelope_extend(Namespace(thread=night.T, budget=b, output=None, force=False,
+                                             queue_dir=night.store.directory, json=False), io.StringIO())
+
+
+def test_e1_extend_refuses_a_lower_value_and_needs_a_greater_one(night, monkeypatch):
+    with pytest.raises(CoordError, match="below"):
+        _extend(night, monkeypatch, "tool_calls=1")
+    with pytest.raises(CoordError, match="below"):
+        _extend(night, monkeypatch, "tool_calls=50,hours=1")
+    with pytest.raises(CoordError, match="greater"):
+        _extend(night, monkeypatch, "tool_calls=3,hours=2")
+    assert _extend(night, monkeypatch, "tool_calls=50") == 0
+
+
+def test_u1_a_limits_store_with_no_sessions_table_reads_unreadable_never_crossed(night):
+    night.calls(1)
+    p = night.store.directory / "limits.db"
+    p.unlink()
+    sqlite3.connect(p).execute("CREATE TABLE other (x)").connection.commit()
+    g = night.gauge()
+    assert g.unreadable is not None and "no sessions table" in g.unreadable and g.crossed == ()
+    assert "no sessions table" in g.refusal
+    text = morning.render(morning.card(night.store))
+    assert "UNREADABLE" in text and "no sessions table" in text and "CROSSED" not in text
+    out = io.StringIO()
+    assert run_coord(_coord_args(night.store, "budget", thread=night.T), out) == 0
+    assert "UNREADABLE" in out.getvalue() and "0 of 3" not in out.getvalue()
+    # a leg is refused, and no SIGN to extend is filed: no extension unblocks an unreadable meter
+    assert night.leg()[0].state == "failed" and night.signs() == []
+
+
+def test_a1_away_says_exactly_which_agents_were_set_and_which_skipped(away_night, monkeypatch):
+    n = away_night
+    note, _ = n.store.accept_drop("closing my eyes", surface="cli")
+    n.store.split(note.drop_id, [Part("note", "eyes")])
+    real = consent_away.set_away
+
+    def flaky(qdir, agent, on, *a, **k):
+        if agent == "codex":
+            raise OSError("codex.json: permission denied")
+        return real(qdir, agent, on, *a, **k)
+
+    monkeypatch.setattr(consent_away, "set_away", flaky)
+    got = morning.away_from_drop(n.store, note.drop_id, token=n.token)
+    assert got["marked"] == ["claude_code"] and "permission denied" in got["skipped"]["codex"]
+    (k,) = [str(i.body["text"]) for i in review.list_items(n.store) if i.feed == "know"]
+    assert "every" not in k and "NOT set for codex" in k and "permission denied" in k
+    # the CLI view of that result (the CLI's own store runs on the wall clock, past this test's lease: its result is
+    # handed in)
+    monkeypatch.setattr(morning, "away_from_drop", lambda *_a, **_k: got)
+    out = io.StringIO()
+    assert run_coord(_coord_args(n.store, "away", drop_id=note.drop_id, token=n.token), out) == 0
+    text = out.getvalue()
+    assert "away ON for claude_code only" in text and "NOT set for codex" in text and "permission denied" in text
+    assert "every" not in text

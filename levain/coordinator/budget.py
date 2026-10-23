@@ -10,7 +10,9 @@ asks for a SIGN to extend; the stop time is the hard edge, the budget is not.
   budget, an envelope or a count: there is no coordinator-side extension to refuse, because there is no such path.
 - **The meter** is DERIVED, never a second counter: Q13 already counts every tool call of every session at its gate
   (:mod:`levain.consent.limits`, ``limits.db``). A thread's usage is the sum of Q13's counts of every worker session
-  Levain activated PINNED to an envelope bound to that thread (C0 §3.4: a pin needs a one-thread worker). Read with
+  Levain activated PINNED to an envelope bound to that thread (C0 §3.4: a pin needs a one-thread worker, and a worker
+  holding several threads is refused when asked for and at its spawn claim and activation, so no worker runs
+  unmetered: L3 r1 B1, :data:`levain.coordinator.lease.SEVERAL_THREADS`). Read with
   ``mode=ro``: this module never writes ``limits.db``, so the gate is exactly what it was. Mapping, envelope key -> Q13
   count: ``tool_calls`` -> ``calls``; ``tokens`` -> ``fresh_tokens``; ``hours`` -> ``active_hours`` (Q13's active time,
   not wall clock). ``dollars_cents`` is NOT METERED: Q13 counts no dollars (its F1d), so it never crosses and every view
@@ -19,9 +21,10 @@ asks for a SIGN to extend; the stop time is the hard edge, the budget is not.
   refill. [judged by c6 lane; question C6-2]
 - **Crossed** when a metered count is AT OR PAST its budget (a budget of 0 is crossed at once: the echo says "0
   allowed (none named: new steps stop at once)").
-- **A leg** today is a worker launch activated for the thread: the activation is the pin's transaction
-  (:meth:`levain.coordinator.store.CoordStore.launch_activate`), so the gauge is read there, in it, and a crossed gauge
-  writes the launch ``failed`` and files the SIGN record in that same transaction. A dispatch job's ``-> running`` is the
+- **A leg** today is a worker launch for the thread. The gauge is read at its spawn claim, before anything starts
+  (:meth:`levain.coordinator.store.CoordStore.launch_claim_spawn`), and again at activation, the pin's transaction and
+  the authoritative check (:meth:`levain.coordinator.store.CoordStore.launch_activate`); at either, a crossed gauge
+  writes the launch ``failed`` and files the SIGN record in that same transaction, so no new worker starts. A dispatch job's ``-> running`` is the
   other leg the design names; its caller (the run supervisor, S1 + C-sessions) does not exist yet, and the envelope
   object's ``precondition`` there must call :func:`leg_refusal` (an interface owed, not built here).
 - **The SIGN record** is a ``replies`` row of kind ``sign`` with ``ref_store`` :data:`SIGN_REF` and ``ref_id``
@@ -36,6 +39,10 @@ Known edges (one line each):
 - a running session is never stopped by the gauge: a crossing stops NEW legs; the session's own Q13 limits stop it.
 - Q13 counts per session root, so a worker session reused for two threads would count twice (a pinned worker holds
   one thread, so Levain never does this).
+- a session whose harness id differs from the root Q13 keys it under is not matched: it lands in ``uncounted`` (shown,
+  not refusing), so its usage is not summed.
+- ``limits.db`` that cannot be read (corrupt, or no ``sessions`` table yet) makes the gauge UNREADABLE: it refuses new
+  legs and every view says why, never "crossed" with zero usage.
 
 Stdlib only.
 """
@@ -135,6 +142,8 @@ def _q13(queue_dir: Path, sessions: list[tuple[str, str]]) -> tuple[dict[str, fl
         return used, list(sessions)
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
     try:
+        if not _has(conn, "sessions"):
+            raise sqlite3.OperationalError(f"{path} has no sessions table (Q13 has not counted a call there yet)")
         uncounted = []
         for agent, root in sessions:
             row = conn.execute("SELECT calls, active_s, fresh FROM sessions WHERE agent = ? AND root = ?",

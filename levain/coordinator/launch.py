@@ -6,7 +6,9 @@ A launch row (:mod:`levain.coordinator.lease`) is what was asked for; this modul
 does, in order:
 
   1. the one-spawner compare-and-set (:func:`levain.coordinator.lease.claim_spawn`): still pending, in time, under the
-     live lease's token, and nobody else started it. A loser spawns nothing;
+     live lease's token, and nobody else started it. A loser spawns nothing. The claim
+     (:meth:`levain.coordinator.store.CoordStore.launch_claim_spawn`) also refuses a worker whose thread's budget
+     gauge is crossed, or one holding several threads, writing it failed with nothing started (C6);
   2. the hook check (L2): doctor's own Claude Code check of the launch's directory must report the consent hook
      "wired to this install", and no row of that check may report the hooks turned off (``disableAllHooks`` in any
      settings file a session there loads). Anything else (not wired, off, no install) refuses: a session there would

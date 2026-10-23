@@ -712,10 +712,19 @@ class CoordStore:
         return self._woken.pop(drop_id, None)
 
     def launch_claim_spawn(self, launch_id: str, pid: int) -> Any:
-        """The one-spawner compare-and-set (:func:`levain.coordinator.lease.claim_spawn`), one transaction."""
+        """The one-spawner compare-and-set (:func:`levain.coordinator.lease.claim_spawn`), one transaction. Every
+        spawner takes it BEFORE it spawns, so the budget gauge is read here first (C6 L3 r1 B2): a worker for a thread
+        whose gauge is crossed is refused with nothing started, written ``failed`` (budget crossed) with its SIGN
+        filed, exactly as at activation. Activation reads the gauge again and stays the authoritative check (usage can
+        move between the two)."""
         from levain.coordinator import lease
 
         with self._write() as (conn, now):
+            if conn.execute("SELECT 1 FROM launch_spawns WHERE launch_id = ?", (launch_id,)).fetchone() is None:
+                # a spawn already claimed is another process's, mid-spawn: its activation reads the gauge
+                refused = self._budget_refusal(conn, now, launch_id)
+                if refused is not None:
+                    return refused
             return lease.claim_spawn(conn, now, launch_id, pid)
 
     def launch_request(self, token: int, *, harness: str, role: str = "worker", threads: Sequence[str] = (),
@@ -730,7 +739,8 @@ class CoordStore:
         from levain.coordinator import lease
 
         with self._write() as (conn, now):
-            # C6, T6: the activation is the pin's transaction, so a leg's budget gauge is read here, in it
+            # C6, T6: the activation is the pin's transaction, so a leg's budget gauge is read here, in it. This is the
+            # authoritative check; the spawn claim read it first so a crossed thread starts nothing (L3 r1 B2)
             refused = self._budget_refusal(conn, now, launch_id)
             if refused is not None:
                 return refused
@@ -739,9 +749,11 @@ class CoordStore:
 
     def _budget_refusal(self, conn: sqlite3.Connection, now: str, launch_id: str) -> Any:
         """A pending one-thread worker whose thread's budget gauge is crossed (:mod:`levain.coordinator.budget`): the
-        launch is written ``failed`` (cause ``budget crossed``) and the SIGN to extend filed, both in this transaction,
+        launch is written ``failed`` (cause ``budget crossed``) and the SIGN to extend filed (not for a gauge that is
+        unreadable, which no extension unblocks), both in this transaction,
         and ``(launch, reason)`` returned as :func:`levain.coordinator.lease.activate` returns a refusal. None
-        otherwise (activation then decides as before)."""
+        otherwise (the claim or the activation then decides as before). A worker holding several threads is not read
+        here: :func:`levain.coordinator.lease.refuse_several` refuses it at both the claim and the activation."""
         from levain.coordinator import budget, lease
 
         ln = lease.launch(conn, launch_id)
@@ -752,7 +764,9 @@ class CoordStore:
         if g is None or g.refusal is None:
             return None
         lease._launch_event(conn, now, launch_id, "failed", lease.BUDGET_CROSSED)
-        budget.file_sign(self, conn, now, g)
+        if g.unreadable is None:
+            # an unreadable meter is no crossing: a SIGN to extend could not unblock it (L3 r1 U1)
+            budget.file_sign(self, conn, now, g)
         return lease.launch(conn, launch_id), g.refusal
 
     def launch_end(self, launch_id: str, kind: str, cause: str) -> Any:

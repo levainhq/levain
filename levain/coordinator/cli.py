@@ -249,6 +249,27 @@ def _parse_budget(text: str | None) -> dict[str, int]:
     return out
 
 
+def _named(text: str) -> set[str]:
+    return {item.partition("=")[0].strip() for item in text.split(",")}
+
+
+def _echo_budget(text: str | None) -> dict[str, int]:
+    """``echo --budget``: parsed as :func:`_parse_budget`, and refused when it leaves out a key the gauge measures
+    (head ruling C6-3): a key left out reads 0, and 0 stops the first worker, so a partial budget is never read as
+    meant. Name the key with 0 to mean 0; the signed meaning of 0 is unchanged. No ``--budget`` at all is the
+    all-zero budget the sign view states."""
+    from levain.coordinator.budget import METERS
+
+    out = _parse_budget(text)
+    if text is not None:
+        missing = [k for k in METERS if k not in _named(text)]
+        if missing:
+            raise CoordError(f"--budget leaves out {', '.join(missing)}, which the budget gauge measures; a key left "
+                             "out would be 0, and 0 stops the first worker. Name each one (K=0 means none): "
+                             f"{','.join(k + '=N' for k in METERS)}")
+    return out
+
+
 def _real(path: str) -> str:
     return os.path.realpath(os.path.expanduser(path))
 
@@ -536,7 +557,7 @@ def run_envelope_echo(args: argparse.Namespace, out: Any) -> int:
             "binds": [{"thread_id": t.thread_id, "rev": t.rev, "members_sha256": t.members_sha256} for t in threads],
             "supersedes": None if first is None else {"envelope_id": first.envelope_id, "digest": first.digest},
             "where": where, "lands": [_parse_land(s) for s in args.land], "pushes": [], "publishes": [],
-            "budget": _parse_budget(args.budget), "stop_at": utc_stamp(now + _parse_stop(args.stop)),
+            "budget": _echo_budget(args.budget), "stop_at": utc_stamp(now + _parse_stop(args.stop)),
             "issued_at": utc_stamp(now)}
     text = canonical(body)
     store.check_body(text)          # the shape and the disk checks this reader will sign, before a file holds it
@@ -570,10 +591,16 @@ def run_envelope_extend(args: argparse.Namespace, out: Any) -> int:
     if parse_stamp(eff["stop_at"]) - now < _MIN_LEFT:
         raise CoordError(f"envelope {head.envelope_id} has stopped or stops within 5 minutes; echo a new one")
     given = _parse_budget(args.budget)
-    named = {item.partition("=")[0].strip() for item in args.budget.split(",")}
+    named = _named(args.budget)
+    lower = [f"{k}={given[k]} (now {eff['budget'][k]})" for k in env.BUDGET_KEYS
+             if k in named and given[k] < eff["budget"][k]]
+    if lower:
+        # extend means extend (L3 r1 E1): a smaller budget is a new echo, never this command
+        raise CoordError(f"--budget names a value below the thread's current budget: {', '.join(lower)}; extend only "
+                         "raises")
     new_budget = {k: (given[k] if k in named else eff["budget"][k]) for k in env.BUDGET_KEYS}
-    if new_budget == eff["budget"]:
-        raise CoordError("--budget names the budget the thread already has; nothing to extend")
+    if not any(new_budget[k] > eff["budget"][k] for k in env.BUDGET_KEYS):
+        raise CoordError("--budget names no value greater than the thread's current budget; nothing to extend")
     if head.drop_id not in t.members:
         raise CoordError(f"the head's drop {head.drop_id} left thread {t.thread_id}; echo a new envelope")
     drop = store.drop(head.drop_id)
@@ -1205,8 +1232,10 @@ def _coord_c6(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
         return 0
     if cmd == "away":
         got = morning.away_from_drop(store, args.drop_id, token=args.token)
-        skipped = "".join(f"\n  not set for {a}: {w}" for a, w in got["skipped"].items())
-        _emit(out, args.json, got, f"away ON for {', '.join(got['marked'])} on the operator's word in drop "
+        skipped = "".join(f"\n  NOT set for {a}: {w}; its SIGNs are not held as away" for a, w in
+                          got["skipped"].items())
+        only = " only" if got["skipped"] else ""
+        _emit(out, args.json, got, f"away ON for {', '.join(got['marked'])}{only}, on the operator's word in drop "
                                    f"{args.drop_id}; KNOW {got['item_id']} tells him. Only he can leave it.{skipped}")
         return 0
     threads = [args.thread] if args.thread else [t.thread_id for t in store.threads()]
@@ -1216,6 +1245,10 @@ def _coord_c6(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
         raise CoordError(f"thread {args.thread[:40]} has no envelope, so no budget")
     lines = []
     for g in gauges:
+        if g.unreadable is not None:
+            # never "crossed" with zero usage: the meter could not be read (L3 r1 U1)
+            lines.append(f"{g.thread_id} ({g.envelope_id}): UNREADABLE: {g.refusal}")
+            continue
         used = ", ".join(f"{k} {budget._num(k, g.used[k])} of {g.budget[k]}" for k in budget.METERS)
         lines.append(f"{g.thread_id} ({g.envelope_id}): {used}; dollars not metered (Q13 counts none)")
         lines.append(f"  {g.refusal or 'within budget: new steps may start'}")
@@ -1470,7 +1503,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     help="A merge the coordinator may land onto that branch. Repeatable.")
     ee.add_argument("--stop", default="2h", metavar="DURATION", help="When it stops: 2h, 90m, 1h30m (at most 24h).")
     ee.add_argument("--budget", default=None, metavar="K=N,...",
-                    help="tool_calls=N,tokens=N,dollars_cents=N,hours=N; any you leave out is 0.")
+                    help="tool_calls=N,tokens=N,hours=N, each named (K=0 means none), and dollars_cents=N if you "
+                         "want it (not metered; left out is 0). Without --budget every key is 0.")
     ee.add_argument("-o", "--output", type=Path, default=None, metavar="FILE",
                     help="Write the canonical body here (default: print it).")
     ee.add_argument("--force", action="store_true", help="Replace an existing -o file.")
@@ -1480,7 +1514,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ex = e_sub.add_parser(
         "extend", help="Write the envelope that raises a thread's budget (a SIGN: only your signature extends it).",
         description="The thread's head envelope, as narrowed, with the budget you name; it supersedes the head once "
-                    "you sign it with `levain envelope sign`. Keys you leave out keep the head's budget.")
+                    "you sign it with `levain envelope sign`. Keys you leave out keep the head's budget; a value "
+                    "you name may not be below the current one, and at least one must be greater.")
     ex.add_argument("thread", metavar="THREAD")
     ex.add_argument("--budget", required=True, metavar="K=N,...",
                     help="tool_calls=N,tokens=N,dollars_cents=N,hours=N: the new total for any you name.")
