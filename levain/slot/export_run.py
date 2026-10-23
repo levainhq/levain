@@ -22,6 +22,9 @@ writes in the drive's cache. DESIGN r12 S15-3 rules ``F_FULLFSYNC`` NOT required
 pinned digest (``export-changed``) and the adopt is re-run. (The s3b credential writer flushes fully because a lost
 credential has no such re-run.)
 
+Known edge (L3 r2): an importer refusal whose base is ``time``, ``signal`` or ``exit`` rides the wire under the same
+name as root's own observation (``importer-failed:time``); the whole refusal stays in the answer's detail.
+
 Root code: runs under ``/usr/bin/python3 -IS`` (3.9). Seams are injected parameters (:class:`PublishSeams`), never
 env flags. The image, the leaf, the watchdog and the domain proof are piece 5c-ii-b; the wiring into adopt-open is
 5c-ii-c.
