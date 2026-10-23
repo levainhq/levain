@@ -3,6 +3,8 @@ name: test
 # Minimal CI: the full pytest suite on Ubuntu. Tests that need macOS sandbox-exec,
 # a live Ollama, or the Linux image (LEVAIN_REQUIRE_LINUX_LIVE) skip themselves
 # where those are absent; a skip is not a pass, so read the skip count in the log.
+# The `test` job runs the suite in shards (tests/ci/shard.py computes the partition); the workflow stays
+# named `test` because the release gate reads a completed success of that workflow on the exact sha.
 
 on:
   push:
@@ -18,17 +20,19 @@ concurrency:
 
 jobs:
   test:
-    name: pytest (Python ${{ matrix.python-version }})
+    name: pytest (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # Raised from 40 on 10-21: green runs had reached 29-37 min and two land branches were cut at the cap
-    # mid-suite (not hung). Raised from 60 on 10-22: run 39881613545's pytest 3.12 was cancelled at the 60-min cap
-    # at 96% with no failure, and main's 7bcfabdd took 59:43. A hang still ends here; splitting the suite is the
-    # durable fix.
-    timeout-minutes: 90
+    # History: the unsharded suite outgrew 40 min (10-21) and then 60 min (10-22; run 39881613545's 3.12 job was
+    # cancelled at the cap at 96% with no failure), so it was split into shards. A hang still ends at this cap.
+    # Per-shard durations are in each run's job list; rebalance by changing the shard count here and in --check.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
+        # 4 shards: the 3.12 job ran ~55-67 min, so four shards of ~15-17 min each leave headroom under the cap
+        # while the per-job install (~1 min) stays small. The partition is computed by tests/ci/shard.py.
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v6
 
@@ -51,8 +55,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,openhands]" hatchling
 
-      - name: Run pytest
-        run: pytest -q
+      - name: Check the shards hold every test file exactly once
+        # Fails if the union of the 4 shards differs from the files pytest collects (a dropped or doubled file).
+        run: python tests/ci/shard.py --check 4
+
+      - name: Run pytest shard ${{ matrix.shard }} of 4
+        run: pytest -q $(python tests/ci/shard.py 4 ${{ matrix.shard }})
 
   linux-live:
     # The bwrap floor RUN, not read as data. GitHub's ubuntu runners refuse unprivileged user
