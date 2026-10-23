@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import stat
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Mapping
+from dataclasses import dataclass
+from typing import Callable, Iterable, Iterator, Mapping, Optional
 
 from levain.firing.hands import HostOS, Step, _abs
 from levain.slot import Refused
@@ -295,9 +297,24 @@ def stage_steps(host: HostOS, source: Path, h11_dir: Path, target: str, *, curre
     ``target`` is already ``current`` the partial copy is dropped instead (a no-op repair)."""
     t = _tools(host)
     tree = IMPORT_TREE[host]
-    owner = f"root:{ROOT_GROUP[host]}"
     partial, gen = tree / STAGING, tree / target
-    steps = [
+    steps = _copy_steps(host, source, h11_dir, partial) + [
+        Step(f"check the staged copy hashes to {target}", call=lambda: _staged_is(target, partial)),
+    ]
+    if current == target:
+        return steps + [Step(f"drop {partial}: {target} is already current", (t["rm"], "-rf", str(partial)))]
+    return steps + [
+        Step(f"clear {gen} (a copy an interrupted run left)", (t["rm"], "-rf", str(gen))),
+        Step(f"rename {partial} to {gen}", call=lambda: _rename(partial, gen)),
+        Step(f"make {gen} durable (every file, every directory, the tree)", call=lambda: _fsync_generation(gen, tree)),
+    ]
+
+
+def _copy_steps(host: HostOS, source: Path, h11_dir: Path, partial: Path) -> list[Step]:
+    """R2's copy and its checks into ``partial``, up to (not including) the hash."""
+    t = _tools(host)
+    owner = f"root:{ROOT_GROUP[host]}"
+    return [
         Step(f"clear {partial} (left by an interrupted run)", (t["rm"], "-rf", str(partial))),
         Step(f"create {partial}", (t["mkdir"], "-m", "700", str(partial))),
         Step(f"copy the levain package to {partial / 'levain'} (symlinks copied as links, then refused)",
@@ -313,15 +330,85 @@ def stage_steps(host: HostOS, source: Path, h11_dir: Path, target: str, *, curre
              call=lambda: _no_foreign_entries(partial)),
         Step(f"check the staged h11 is at least {'.'.join(map(str, H11_MIN))} (its version read as text)",
              call=lambda: (True, h11_floor(partial / "h11"))),
-        Step(f"check the staged copy hashes to {target}", call=lambda: _staged_is(target, partial)),
     ]
-    if current == target:
-        return steps + [Step(f"drop {partial}: {target} is already current", (t["rm"], "-rf", str(partial)))]
-    return steps + [
-        Step(f"clear {gen} (a copy an interrupted run left)", (t["rm"], "-rf", str(gen))),
-        Step(f"rename {partial} to {gen}", call=lambda: _rename(partial, gen)),
-        Step(f"make {gen} durable (every file, every directory, the tree)", call=lambda: _fsync_generation(gen, tree)),
+
+
+@dataclass
+class Staged:
+    """What repair's phase A staging learned while it ran (§2.2, §2.3 R2-R3): the id hashed over the STAGED copy
+    (None until the hash step ran), or the refusal that step met. The plan cannot know the id: it is the copy's."""
+
+    target: Optional[str] = None
+    refused: Optional[Refused] = None
+
+
+def _hash_staged(cell: Staged, partial: Path, source: Path, h11_dir: Path, pinned: Optional[str]) -> tuple[bool, str]:
+    """§2.3 R2 [r3: X2-M3]: the id is hashed over the root-owned STAGED copy FIRST, then the same function over the
+    source; unequal refuses ``source-changed`` (the package changed during the copy). U13: an interrupted repair's
+    journaled generation fixes the target, so a staged id other than ``pinned`` refuses ``source-mismatch:<G>``."""
+    from levain.slot.generation import generation_id
+
+    try:
+        got = generation_id(partial / "levain", partial / "h11")
+        src = generation_id(source, h11_dir)
+    except Refused as e:
+        cell.refused = e
+        return False, f"{e.name}: {e.detail}"
+    if src != got:
+        cell.refused = Refused("source-changed", f"the staged copy hashes to {got}, {source} now to {src}")
+    elif pinned is not None and got != pinned:
+        cell.refused = Refused(f"source-mismatch:{pinned}", f"the interrupted repair is moving to {pinned}; "
+                                                           f"{source} is {got}. Re-run with that package")
+    if cell.refused is not None:
+        return False, f"{cell.refused.name}: {cell.refused.detail}"
+    cell.target = got
+    return True, got
+
+
+def _place(host: HostOS, tree: Path, partial: Path, cell: Staged, current: Optional[str]) -> tuple[bool, str]:
+    """§2.3 R3 for the id the hash step found: dropped when it is ``current`` already (a no-op repair), else any
+    ``gen-<id>`` an interrupted run left is removed, the partial renamed to it, and the generation made durable."""
+    import subprocess
+
+    target = cell.target
+    if target is None:
+        return False, "no staged id (the hash step did not run)"
+    rm = _tools(host)["rm"]
+    if target == current:
+        r = subprocess.run((rm, "-rf", str(partial)), capture_output=True, text=True, cwd="/")
+        return r.returncode == 0, (f"{target} is already current" if r.returncode == 0 else r.stderr.strip())
+    gen = tree / target
+    r = subprocess.run((rm, "-rf", str(gen)), capture_output=True, text=True, cwd="/")
+    if r.returncode != 0:
+        return False, r.stderr.strip()
+    _rename(partial, gen)
+    return _fsync_generation(gen, tree)
+
+
+def stage_hashing_steps(host: HostOS, source: Path, h11_dir: Path, cell: Staged, *, current: Optional[str],
+                        pinned: Optional[str] = None, tree: Optional[Path] = None) -> list[Step]:
+    """Repair's phase A stage (§2.3 R2 + R3, r3 X2-M3): :func:`stage_steps`'s copy and checks, then the id hashed
+    over the STAGED copy (into ``cell``) and checked against the source, then the generation placed and made durable.
+    The R3 journal of ``generation:<id>`` is the caller's next step, so it always follows the hash."""
+    tree = tree if tree is not None else IMPORT_TREE[host]
+    partial = tree / STAGING
+    return _copy_steps(host, source, h11_dir, partial) + [
+        Step(f"hash the staged copy {partial}; the same hash over {source} must equal it",
+             call=lambda: _hash_staged(cell, partial, source, h11_dir, pinned)),
+        Step(f"place the staged generation in {tree} (dropped if it is current; else renamed to gen-<id> and made "
+             "durable)", call=lambda: _place(host, tree, partial, cell, current)),
     ]
+
+
+def generation_boot_code(host: HostOS, gen: str, *, tree: Optional[Path] = None) -> str:
+    """:func:`boot_path_code` for ONE generation by name (repair's probe and phase B, §2.2): ``sys.path`` gets
+    ``realpath(<tree>/<gen>)``, never ``current`` (which still names the old generation until the flip)."""
+    from levain.slot.generation import GEN_RE
+
+    if not GEN_RE.fullmatch(gen):
+        raise Refused("bad-token", f"generation: {gen!r}")
+    path = (tree if tree is not None else IMPORT_TREE[host]) / gen
+    return f"import os, sys; sys.path.insert(0, os.path.realpath({str(path)!r}))"
 
 
 def _flip(tree: Path, target: str) -> tuple[bool, str]:
@@ -463,7 +550,8 @@ def check_source_writers(parent: Path, *, operator_uid: int, operator_gids: Iter
             grp = f"{names[st.st_gid]} (gid {st.st_gid})" if st.st_gid in names else f"gid {st.st_gid}"
             rec = stat.S_ISDIR(st.st_mode) and (p in below or p.startswith(tuple(b + os.sep for b in below)))
             raise Refused("bad-source", f"{p} is writable by group {grp}, which holds an account other than the "
-                                        f"operator. Run `chmod {'-R ' if rec else ''}g-w {p}`, then repair again")
+                                        f"operator. Run `chmod {'-R ' if rec else ''}g-w {shlex.quote(p)}`, then "
+                                        "repair again")
 
     chain, p = [], str(parent)
     while True:
@@ -503,7 +591,8 @@ def tree_steps(host: HostOS, source: Path, *, h11_dir: Path | None = None, gener
             *entry_steps(host)]
 
 
-__all__ = ["CURRENT", "ENTRY_MODULES", "H11_MIN", "HELPER_MODULES", "PY_FLAGS", "ROOT_PYTHON", "STAGING",
+__all__ = ["CURRENT", "ENTRY_MODULES", "H11_MIN", "HELPER_MODULES", "PY_FLAGS", "ROOT_PYTHON", "STAGING", "Staged",
+           "generation_boot_code", "stage_hashing_steps",
            "VENDOR_PREFIX", "boot_path_code", "check_source_writers", "check_sources", "current_path", "dir_steps",
            "entry_steps", "entry_text", "flip_step", "gc_step", "h11_floor", "h11_source", "helper_entry_text",
            "read_current", "stage_steps", "tree_steps"]

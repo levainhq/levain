@@ -229,3 +229,20 @@ def test_gather_reads_macos_primary_groups_only_for_a_repair_source(monkeypatch,
     seams = SimpleNamespace(L=tmp_path / "L")
     IH.gather_facts(parse_install_argv(argv), host, OP_UID, run=lambda *a, **k: None, store_seams=seams)
     assert seen == ([base] if read else [])
+
+
+def test_the_printed_remedy_quotes_the_path(tmp_path: Path, monkeypatch) -> None:
+    """L3 r2 (both seats LOW, head 1022+21 ruling 1): a printed remedy is a command the operator will run, so the path
+    is shell-quoted; unquoted, `chmod g-w <dir>/a b.py` names two paths and leaves the offending one writable."""
+    import shlex
+
+    d = _linux(users={"bob": (1001, 1002)})
+    spaced = tmp_path / "pkg" / "levain" / "a b.py"
+    spaced.parent.mkdir(parents=True)
+    spaced.write_text("")
+    why = _refused(tmp_path, monkeypatch, "linux", d, spaced, 1002, mode=0o664)
+    assert f"`chmod g-w {shlex.quote(str(spaced))}`" in why and shlex.quote(str(spaced)) != str(spaced)
+    sub = tmp_path / "s" / "pkg" / "levain" / "my dir"
+    sub.mkdir(parents=True)
+    why = _refused(tmp_path / "s", monkeypatch, "linux", d, sub, 1002)
+    assert f"`chmod -R g-w {shlex.quote(str(sub))}`" in why
