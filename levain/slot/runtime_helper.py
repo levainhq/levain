@@ -52,7 +52,7 @@ from levain.slot.end import V5_FLOOR_BYTES
 from levain.slot.grammar import SESSION_RE
 from levain.slot.runtime_grammar import _NAME_RE as _WIRE_NAME_RE
 from levain.slot.ids import SlotId, in_own_range
-from levain.slot.layout import BASE_ROUTES_FORMAT, RUN, STORE
+from levain.slot.layout import BASE_ROUTES_FORMAT, BASE_ROUTES_FORMATS, RUN, STORE
 from levain.slot.runtime_grammar import (DISPATCH, OPERATOR, VENDORS, PrepareInput, RenderBlob, RuntimeRequest,
                                          bind_stdin, ok_line, parse_runtime_argv, parse_stdin, refusal_line)
 
@@ -858,7 +858,7 @@ def base_route_types(store: Store) -> Dict[str, str]:
         raise Refused("base-map-missing", "L/routes/base.json")
     obj = _canon_obj(data, "base-map")
     routes = obj.get("routes")
-    if obj.get("format") != BASE_ROUTES_FORMAT or type(routes) is not list:
+    if obj.get("format") not in BASE_ROUTES_FORMATS or type(routes) is not list:
         raise Refused("base-map-malformed", "format or routes")
     out: Dict[str, str] = {}
     for r in routes:

@@ -181,7 +181,9 @@ def row_steps(host: HostOS, rows: Iterable[Row]) -> list[Step]:
     return steps
 
 
-BASE_ROUTES_FORMAT = "levain-routes-base/1"   # CONTRACT §4.3
+BASE_ROUTES_FORMAT = "levain-routes-base/2"   # CONTRACT §4.3, R4 §1.3: the format the writer writes
+#: the formats every base-map reader accepts (`policy.BASE_MAP_FORMATS`, a test holds the equality)
+BASE_ROUTES_FORMATS = ("levain-routes-base/1", "levain-routes-base/2")
 
 
 def base_routes_path(host: HostOS) -> Path:

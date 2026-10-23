@@ -802,3 +802,10 @@ def test_store_links_refused(world):
     os.rename(world.L / "alloc", world.L / "alloc.real")
     os.symlink(world.L / "alloc.real", world.L / "alloc")
     assert world.prepare()["refused"] == "bad-root"
+
+
+@pytest.mark.parametrize("fmt", ["levain-routes-base/1", "levain-routes-base/2"])
+def test_base_route_types_reads_both_formats(world, fmt):
+    # 3c-2a: layout writes /2; a store that kept its /1 map is still read
+    (world.L / "routes" / "base.json").write_bytes(canon.canonical_bytes(dict(BASE, format=fmt)))
+    assert H.base_route_types(H.Store(world.seams)) == {r["route"]: r["type"] for r in BASE["routes"]}

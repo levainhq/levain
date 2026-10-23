@@ -589,8 +589,9 @@ def test_read_base_map(tmp_path: Path) -> None:
     with pytest.raises(Refused) as e:
         SV.read_base_map(p)
     assert e.value.name == "base-map-unreadable"
-    p.write_text('{"format":"levain-routes-base/1","routes":[]}')
-    assert SV.read_base_map(p) == []
+    for fmt in ("levain-routes-base/1", "levain-routes-base/2"):   # 3c-2a: the writer flipped to /2, /1 still read
+        p.write_text('{"format":"%s","routes":[]}' % fmt)
+        assert SV.read_base_map(p) == []
     p.write_text('{"format":"other/1","routes":[]}')
     with pytest.raises(Refused) as e:
         SV.read_base_map(p)

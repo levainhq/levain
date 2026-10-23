@@ -373,7 +373,7 @@ def test_store_layout(host):
     assert L == (Path("/private/var/levain") if host == "darwin" else Path("/var/levain"))
     # L/routes/base.json: §4.3's base map, no routes, canonical, root 0644, never over an existing map
     base = [s for s in plan.steps if s.write and s.write[0] == L / "routes" / "base.json"]
-    assert len(base) == 1 and base[0].write[1:] == ('{"format":"levain-routes-base/1","routes":[]}', 0o644)
+    assert len(base) == 1 and base[0].write[1:] == ('{"format":"levain-routes-base/2","routes":[]}', 0o644)
     assert base[0].skip_if[-2:] == ("-e", str(L / "routes" / "base.json"))
     # every file the plan writes is under the store or a fixed system path
     fixed = ("/etc/sudoers.d/", "/usr/local/libexec/levain/", "/usr/libexec/levain/", "/Library/LaunchDaemons/",
@@ -466,3 +466,11 @@ def test_plans_are_steps_only():
     plan = plan_setup(_setup(), _facts("linux"))
     assert all(isinstance(s, Step) for s in plan.steps)
     assert not any(s.argv and s.argv[0].endswith("sudo") for s in plan.steps)
+
+
+def test_base_map_formats_are_the_policy_readers_formats():
+    # 3c-2a (R4 §1.3): layout writes base /2, and every reader accepts exactly what keys' parser accepts
+    from levain.broker import policy
+    from levain.slot import layout
+    assert layout.BASE_ROUTES_FORMATS == policy.BASE_MAP_FORMATS
+    assert layout.BASE_ROUTES_FORMAT == policy.BASE_MAP_FORMATS[-1] == "levain-routes-base/2"

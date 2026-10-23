@@ -562,24 +562,22 @@ def test_resolve_fenced_across_preemption_then_shutdown_order(monkeypatch):
 
 # --- P4b: THE FRAME, at every suspension (design 1.5 "test_revoke_at_every_suspension") ------------------------------
 
+from tests import test_broker_keys_upstream as _UP   # noqa: E402  (the shared /2 fixture: price, body)
+
 _SECRET = "sk-frame-test-SECRET"
 _FRAME_TOKEN = "F" * 43
 _FRAME_CLAIMS = {"routes": ["r"], "front": {"uid": 70000, "pid": 1, "start": 1}, "incarnation": 1}
 _FRAME_Q = {"v": 1, "token": _FRAME_TOKEN, "route": "r", "method": "POST", "path": "/v1/messages", "query": "",
-            "headers": [["content-type", "application/json"]], "body": "length:5", "upgrade": "none"}
+            "headers": [["content-type", "application/json"]], "body": _UP.BODY_Q, "upgrade": "none"}
 
 
 def _frame_lib(d: str) -> None:
-    """L: a base map with one brokered route `r` naming the static credential `c1`, and that credential."""
+    """L: a base `/2` map with one brokered route `r` naming the static credential `c1` (the `m1` price entry of
+    `test_broker_keys_upstream`), and that credential."""
     os.makedirs(os.path.join(d, "routes"))
     os.makedirs(os.path.join(d, "keys", "cred"))
-    route = {"route": "r", "type": "brokered",
-             "upstream": {"scheme": "https", "host": "api.example.com", "base_path": ""}, "credential": "c1",
-             "requests": {"templates": [{"method": "POST", "path": "/v1/messages"}],
-                          "headers": {"content-type": "application/json"}, "body_cap": 1024, "body_codec": "none"},
-             "max_call_microdollars": 1000, "max_session_microdollars": 100000}
     with open(os.path.join(d, "routes", "base.json"), "wb") as f:
-        f.write(canon.canonical_bytes({"format": K.BASE_MAP_FORMAT, "routes": [route]}))
+        f.write(canon.canonical_bytes({"format": "levain-routes-base/2", "routes": [_UP.base_route(body_cap=1024)]}))
     with open(os.path.join(d, "keys", "cred", "c1.json"), "w") as f:
         f.write('{"format": "levain-keys-credential/1", "name": "c1", "rev": "%s", "hosts": ["api.example.com"], '
                 '"inject": {"header": "x-api-key", "scheme": ""}, "kind": "static", "secret": "%s"}'
@@ -769,8 +767,7 @@ def test_revoke_at_every_suspension(monkeypatch, transition, delivery, cached):
                 k._token_resolve = resolve
             _r, w = await asyncio.open_unix_connection(sock=a)
             fr = asyncio.StreamReader()
-            fr.feed_data(gwwire.encode(b"B", b"hello") + gwwire.encode(b"E"))
-            fr.feed_eof()
+            fr.feed_data(_UP.body_frames())
             side = gwwire.KeysSide()
             side.got(b"Q")
             conn = K.Conn(w, reg, "pending")
@@ -848,8 +845,7 @@ async def _one_q(d: str) -> bytes:
         k.cache[digest_of_token(_FRAME_TOKEN)] = {"session": "s1", "claims": dict(_FRAME_CLAIMS)}
         _r, w = await asyncio.open_unix_connection(sock=a)
         fr = asyncio.StreamReader()
-        fr.feed_data(gwwire.encode(b"B", b"hello") + gwwire.encode(b"E"))
-        fr.feed_eof()
+        fr.feed_data(_UP.body_frames())
         side = gwwire.KeysSide()
         side.got(b"Q")
         conn = K.Conn(w, reg, "pending")
@@ -957,7 +953,7 @@ def test_base_map_unusable_anywhere_refuses_every_route(routes):
              "overflow": [dict(route, route="z", requests=dict(route["requests"],
                                                                 headers={"content-type": "a{99999999999}"}))]}[routes]
     with open(path, "wb") as f:
-        f.write(canon.canonical_bytes({"format": K.BASE_MAP_FORMAT, "routes": [route] + extra}))
+        f.write(canon.canonical_bytes({"format": "levain-routes-base/2", "routes": [route] + extra}))
     try:
         got = asyncio.run(_one_q(d))
         kinds = [o["kind"] for o in file_lines(os.path.join(d, "keys", "ledger.jsonl"))]
@@ -972,7 +968,8 @@ def test_preemption_fences_old_exchanges_before_its_bounded_await(monkeypatch):
     # epoch, then awaited the old connection's request tasks (bounded) BEFORE its fail-closed clear detached anything,
     # and `Upstream.write` gates on `detached` alone, so a `B` frame read in that window still reached the upstream,
     # and a `Q` arriving in it was admitted on the old registration. Now the bump fences the old epoch's exchanges and
-    # admission refuses a registration made under an older epoch.
+    # admission refuses a registration made under an older epoch. (3c-2a, R4 §1.7: the body is buffered before the
+    # head, so exchange 1's head and body are both up before the bump, and the window is its response wait.)
     from levain.broker import upstream as U
     from levain.broker.creds import CredStore
     from levain.broker.norm import digest_of_token
@@ -1013,17 +1010,18 @@ def test_preemption_fences_old_exchanges_before_its_bounded_await(monkeypatch):
                 _r, w = await asyncio.open_unix_connection(sock=sock)
                 fr = asyncio.StreamReader()
                 if feed_now:
-                    fr.feed_data(gwwire.encode(b"B", b"hello") + gwwire.encode(b"E"))
-                    fr.feed_eof()
+                    fr.feed_data(_UP.body_frames())
                 side = gwwire.KeysSide()
                 side.got(b"Q")
                 conn = K.Conn(w, reg, "pending")
                 reg.pending.add(conn)
                 k.pool.add(conn)
                 task = asyncio.ensure_future(k._exchange(conn, gwwire.FrameReader(fr), side, dict(_FRAME_Q)))
+                conn.task = task   # as `_on_conn` makes it: the phase 2 cancel reaches the exchange, not this test
                 return conn, fr, w, task
 
-            conn1, fr1, w1, t1 = await exchange(pairs[0][0], False)
+            k.head_timeout_s = 1.0   # exchange 1's head is never answered: it ends at this deadline
+            conn1, fr1, w1, t1 = await exchange(pairs[0][0], True)
             # the head goes only behind the hold's durable `reserved` line (a real flush), so wait for the head itself
             await until(lambda: len(st["raw"]) >= 1)
             for _ in range(50):
@@ -1034,16 +1032,14 @@ def test_preemption_fences_old_exchanges_before_its_bounded_await(monkeypatch):
             while k.admin_epoch == epoch0:
                 await asyncio.sleep(0)
             st["after"] = True                     # the epoch is bumped: preemption is in its bounded await
-            fr1.feed_data(gwwire.encode(b"B", b"hello") + gwwire.encode(b"E"))
-            fr1.feed_eof()
             conn2, _fr2, w2, t2 = await exchange(pairs[1][0], True)   # a `Q` arriving inside the window
             await asyncio.sleep(0.2)
             in_window = {"pre_done": pre.done(), "raw_after": [x for x in st["raw"] if x[0]],
                          "q2_admitted": conn2.kind == "exchange"}
             gate.set()
             await pre
-            for t in (t1, t2):
-                await asyncio.wait_for(t, 5)
+            done, _ = await asyncio.wait({t1, t2}, timeout=5)   # exchange 1 ends cancelled by the clear's phase 2
+            assert len(done) == 2
             for w in (w1, w2):
                 w.close()
             return dict(in_window, head_written=head_written)
@@ -1060,7 +1056,7 @@ def test_preemption_fences_old_exchanges_before_its_bounded_await(monkeypatch):
     finally:
         shutil.rmtree(d, ignore_errors=True)
     print("preempt-window", out)
-    assert out["head_written"] == 1                 # the exchange was live before the preemption
+    assert out["head_written"] == 2                 # the exchange was live before the preemption: its head and body
     assert out["pre_done"] is False                 # the window is real: the clear has not run yet
     assert out["raw_after"] == []                   # nothing reached the upstream after the bump
     assert out["q2_admitted"] is False              # and no new exchange was admitted on the old registration
@@ -1075,13 +1071,13 @@ def test_base_map_parsed_once_per_file_and_refused_when_it_changes_badly(monkeyp
     d = tempfile.mkdtemp(prefix="lc", dir="/tmp")
     _frame_lib(d)
     parses: list = []
-    real = K.parse_route
+    real = K.parse_base_map
 
-    def counting(entry, source):
-        parses.append(entry.get("route"))
-        return real(entry, source=source)
+    def counting(doc):
+        parses.extend(e.get("route") for e in doc["routes"] if isinstance(e, dict))
+        return real(doc)
 
-    monkeypatch.setattr(K, "parse_route", counting)
+    monkeypatch.setattr(K, "parse_base_map", counting)
     path = os.path.join(d, "routes", "base.json")
     try:
         k = K.Keys(lib_root=d)

@@ -18,11 +18,11 @@ STATUS = {
     "template-miss": 404,
     "body-cap": 413,
     "malformed": 400,
-    "budget-exhausted": 402,
+    "budget-exhausted": 402, "budget-overrun": 402,
     "upstream-error": 502, "upstream-timeout": 504, "keys-unavailable": 503,
     "upstream-redirect": 502,
     "credential-unavailable": 503,
-    "body-json": 400, "body-unbounded": 403,
+    "body-json": 400, "body-unbounded": 403, "body-timeout": 408,
 }
 #: the names that carry a `:<what>` suffix on the wire (R4 §1.6: `body-unbounded:document`); the status is the prefix's.
 PARAMETERISED = ("body-unbounded",)
@@ -46,8 +46,8 @@ def is_name(name: str) -> bool:
         return False
     return True
 REASON = {400: b"Bad Request", 401: b"Unauthorized", 402: b"Payment Required", 403: b"Forbidden",
-          404: b"Not Found", 413: b"Payload Too Large", 502: b"Bad Gateway", 503: b"Service Unavailable",
-          504: b"Gateway Timeout"}
+          404: b"Not Found", 408: b"Request Timeout", 413: b"Payload Too Large", 502: b"Bad Gateway",
+          503: b"Service Unavailable", 504: b"Gateway Timeout"}
 
 
 class Refused(Exception):
