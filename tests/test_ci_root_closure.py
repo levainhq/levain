@@ -83,3 +83,12 @@ def test_root_lazy_targets_join_the_closure_and_operator_ones_do_not(tmp_path, m
 def test_a_module_level_import_is_not_a_lazy_site(tmp_path, monkeypatch):
     _lazy_tree(tmp_path, monkeypatch, "from levain import lazy_a\ntry:\n    import levain.lazy_b\nexcept ImportError:\n    pass\n")
     assert rc.lazy_sites(["levain.slot.forwarder"]) == {}
+
+
+def test_importlib_call_sites_are_dynamic_sites(tmp_path, monkeypatch):
+    (tmp_path / "levain").mkdir()
+    (tmp_path / "levain" / "a.py").write_text('import importlib\nx = importlib.import_module("levain.x")\ny = __import__("levain.y")\n')
+    monkeypatch.setattr(rc, "ROOT", tmp_path)
+    monkeypatch.setattr(rc, "DYNAMIC_SITES", {})
+    assert rc.dynamic_sites() == ['levain/a.py:2::x = importlib.import_module("levain.x")',
+                                  'levain/a.py:3::y = __import__("levain.y")']  # unclassified until a row names them

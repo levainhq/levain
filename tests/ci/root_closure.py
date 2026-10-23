@@ -53,6 +53,15 @@ DYNAMIC_SITES = {
     "levain/slot/wall.py:468::argv = module_argv(host, front_module or \"\", *argv)": "@front",
     "levain/slot/wall.py:625::" 'return module_argv(host, "levain.slot.wall", "--spec-fd", str(spec_fd))': ("levain.slot.wall",),
     "levain/slot/wall.py:1449::" 'return module_argv("darwin", "levain.slot.wall", "--exec-fd", str(exec_fd), "--", *argv)': ("levain.slot.wall",),
+    # in-process ``importlib`` calls, none run by a root process (empty = no module seeded); each row's reason:
+    # the two comments name the explicit leaf maps; the firing / presence calls import only the blessed leaves of
+    # ``_LAZY_FIRING_MODULES`` / ``_LAZY_PRESENCE_MODULES`` for the operator's daemon (a variable, not a root target);
+    # the cockpit one is the operator's panel, importing ``levain.consent.limits`` (not a root-run module)
+    "levain/cockpit/providers.py:1174::" 'mod = importlib.import_module("levain.consent.limits")': (),
+    "levain/firing/contract.py:193::" '# rather than ``import_module(f"{__name__}.{kind}")`` GOVERNS which leaves build_firing may': (),
+    "levain/firing/contract.py:229::" 'importlib.import_module(module)  # blessed leaf — its own import errors propagate': (),
+    "levain/firing/presence.py:136::" 'importlib.import_module(module)  # blessed leaf — its own import errors propagate': (),
+    "levain/firing/presence.py:92::" '# recover. An EXPLICIT map (not ``import_module(f"…{kind}")``) governs which modules may be': (),
 }
 LAZY_SITES = {
     # operator: ``_resolve`` <- ``pick_address`` <- ``creds._post`` / ``keys`` (the broker's dial); the root credential verbs only ``commit`` / ``remove`` files
@@ -132,7 +141,7 @@ LAZY_SITES = {
     'levain/slot/reaper.py:899::from levain.slot.netns import netns_steps': 'root',
     'levain/slot/removal.py:63::from levain.slot.generation import _full_fsync': 'root',
     'levain/slot/render.py:615::from levain.slot.wall import check_profile_text, export_wall_facts': 'root',
-    # operator: ``repo_loosening_refusals`` <- ``supervisor.check_repo_layer`` <- ``supervisor`` / ``dispatch.readset``, none in the closure (host_guard needs 3.11 ``tomllib``)
+    # operator: ``repo_loosening_refusals`` and ``refuse_repo_loosening`` <- ``supervisor.check_repo_layer`` <- ``supervisor`` / ``dispatch.readset``; neither has a caller in ``levain/`` outside the operator, none in the closure (host_guard needs 3.11 ``tomllib``)
     'levain/slot/render.py:748::from levain.host_guard import _LOOSENING_NONEMPTY, _LOOSENING_TRUE': 'operator',
     'levain/slot/render.py:848::from levain.contracts.canon import _int, _no_constant, _no_float, _no_lone_surrogate, _pairs, text_depth': 'root',
     'levain/slot/root_tree.py:240::from levain.slot.generation import read_version_text': 'root',
@@ -200,7 +209,7 @@ LAZY_SITES = {
     'levain/slot/wall.py:1031::from levain.slot.pf import ANCHOR, IFCONFIG, PFCTL': 'root',
     'levain/slot/wall.py:1467::from levain.slot.keyring_join import join_session_keyring, real_keyctl': 'root',
 }
-_NEEDLES = ("run_module(", "module_argv(")
+_NEEDLES = ("run_module(", "module_argv(", "import_module(", "__import__(")
 
 
 def dynamic_sites() -> list:
