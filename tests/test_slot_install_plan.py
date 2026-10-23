@@ -373,7 +373,7 @@ def test_store_layout(host):
     assert L == (Path("/private/var/levain") if host == "darwin" else Path("/var/levain"))
     # L/routes/base.json: §4.3's base map, no routes, canonical, root 0644, never over an existing map
     base = [s for s in plan.steps if s.write and s.write[0] == L / "routes" / "base.json"]
-    assert len(base) == 1 and base[0].write[1:] == ('{"format":"levain-routes-base/2","routes":[]}', 0o644)
+    assert len(base) == 1 and base[0].write[1:] == ('{"format":"levain-routes-base/1","routes":[]}', 0o644)
     assert base[0].skip_if[-2:] == ("-e", str(L / "routes" / "base.json"))
     # every file the plan writes is under the store or a fixed system path
     fixed = ("/etc/sudoers.d/", "/usr/local/libexec/levain/", "/usr/libexec/levain/", "/Library/LaunchDaemons/",

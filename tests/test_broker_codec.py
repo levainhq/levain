@@ -1,0 +1,276 @@
+"""3c-2a session i: the body codecs, the price entry and the priced map formats (3c R4 §1.2, §1.3, §1.6).
+
+Every estimate below was hand-computed BEFORE the codec ran (`project_memory/1023-8/3c2a/a1_expected.md`).
+Runs on the root interpreter too (3.9): codec.py and policy.py are imported by the root-run broker.
+"""
+from __future__ import annotations
+
+import copy
+import json
+import os
+import sys
+
+import pytest
+
+from levain.broker import codec, norm, policy, vendor_prices
+from levain.broker.policy import PolicyError, parse_base_map, parse_price, parse_route, parse_routemap
+
+sys.path.insert(0, os.path.dirname(__file__))
+from _policy_pin_corpus import corpus, render  # noqa: E402
+
+EA_RAW = {"in": 3_000_000, "out": 15_000_000, "cache_write": 3_750_000, "cache_read": 300_000,
+          "default_output": 4096, "overhead_tokens": 64, "image_tokens": 1600,
+          "per_use": {"web_search": 10_000}, "source": "https://example.test/a"}
+EO_RAW = {"in": 2_000_000, "out": 8_000_000, "cache_write": 2_000_000, "cache_read": 500_000,
+          "default_output": 4096, "overhead_tokens": 64, "image_tokens": 1600, "source": "https://example.test/o"}
+EA = parse_price("EA", EA_RAW)
+EO = parse_price("EO", EO_RAW)
+
+
+def _go(cname, body, entry, *, dispatch=False, model_requested=None):
+    """§1.7 step 4-5 in order: parse, check, write_ceiling, estimate; the forwarded bytes. A refusal = its name."""
+    c = codec.CODECS[cname]
+    try:
+        obj = c.parse(body.encode() if isinstance(body, str) else body)
+        chk = codec.guarded(c.check, obj, {"m1": entry}, dispatch=dispatch, model_requested=model_requested)
+        codec.guarded(c.write_ceiling, obj, chk.price)
+        return codec.guarded(c.estimate, obj, chk.price), chk.unproven, codec.serialize(obj).decode()
+    except norm.Refused as r:
+        return r.name
+
+
+def test_codec_table_is_the_policy_codec_set():
+    assert set(codec.CODECS) == set(policy.BODY_CODECS) - {"none"}
+    assert all(c.name == n for n, c in codec.CODECS.items())
+
+
+E2_FWD = '{"model":"m1","n":3,"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":4096}'
+ESTIMATES = [
+    ("E1", "anthropic-messages", '{"model":"m1","max_tokens":1000,"messages":[{"role":"user","content":"hi"}]}',
+     EA, 15525, ()),
+    ("E2", "openai-chat", '{"model":"m1","n":3,"messages":[{"role":"user","content":"hi"}]}', EO, 98618, ()),
+    ("E3", "openai-responses", '{"model":"m1","max_output_tokens":500,"input":[{"role":"user","content":'
+     '[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]}', EO, 7556, ()),
+    ("E4", "anthropic-messages", '{"model":"m1","max_tokens":100,"tools":[{"type":"web_search_20250305",'
+     '"name":"web_search","max_uses":5}],"messages":[]}', EA, 52187, ("web_search",)),
+    ("E5", "anthropic-messages", '{"model":"m1","max_tokens":10,"messages":[{"role":"user","content":[{"type":'
+     '"image","source":{"type":"base64","media_type":"image/png","data":"QUJDRA=="}}]}]}', EA, 6953, ()),
+    ("R14", "openai-chat", '{"model":"m1","messages":[{"role":"user","content":"hi"}]}', EO, 33070, ()),
+]
+
+
+@pytest.mark.parametrize("row", ESTIMATES, ids=[r[0] for r in ESTIMATES])
+def test_estimate_hand_computed(row):
+    _, cname, body, entry, want, unproven = row
+    got = _go(cname, body, entry)
+    assert got[:2] == (want, unproven)
+
+
+def test_absent_ceiling_written_in_and_multiplied_by_n():
+    est, _, fwd = _go("openai-chat", '{"model":"m1","n":3,"messages":[{"role":"user","content":"hi"}]}', EO)
+    assert fwd == E2_FWD
+    responses = _go("openai-responses", '{"model":"m1","input":"x"}', EO)[2]
+    assert json.loads(responses)["max_output_tokens"] == 4096
+
+
+def test_stated_ceiling_never_written_over():
+    body = '{"model":"m1","max_tokens":50,"messages":[]}'
+    est, _, fwd = _go("openai-chat", body, EO)
+    assert fwd == body and est == -(-((len(body) + 64) * 2_000_000) // 1_000_000) + 50 * 8
+    # Anthropic requires max_tokens: the codec never writes one in (the provider refuses the call)
+    assert "max_tokens" not in _go("anthropic-messages", '{"model":"m1","messages":[]}', EA)[2]
+
+
+def test_both_openai_chat_ceilings_take_the_larger():
+    body = '{"model":"m1","max_tokens":10,"max_completion_tokens":20,"messages":[]}'
+    est = _go("openai-chat", body, EO)[0]
+    assert est == -(-((len(body) + 64) * 2_000_000) // 1_000_000) + 20 * 8
+
+
+def test_image_data_excluded_from_bytes():
+    small = _go("openai-chat", '{"model":"m1","max_tokens":1,"messages":[{"role":"user","content":[{"type":'
+                '"image_url","image_url":{"url":"data:image/png;base64,QQ=="}}]}]}', EO)[0]
+    big = _go("openai-chat", '{"model":"m1","max_tokens":1,"messages":[{"role":"user","content":[{"type":'
+              '"image_url","image_url":{"url":"data:image/png;base64,' + "Q" * 100000 + '"}}]}]}', EO)[0]
+    assert small == big
+
+
+REFUSALS = [
+    ("R1", "anthropic-messages", "{", {}, "body-json"),
+    ("R2", "anthropic-messages", "[" * 100000, {}, "body-json"),
+    ("R3", "anthropic-messages", "[]", {}, "body-json"),
+    ("R4", "openai-chat", '{"model":"m1","temperature":NaN}', {}, "body-json"),
+    ("R4b", "openai-chat", b'{"model":"m1","x":"\xff"}', {}, "body-json"),
+    ("R5", "anthropic-messages", '{"model":"nope","max_tokens":1}', {}, "model-not-allowed"),
+    ("R5b", "anthropic-messages", '{"max_tokens":1}', {}, "model-not-allowed"),
+    ("R6", "anthropic-messages", '{"model":"m1","max_tokens":1}', {"model_requested": "m2"}, "model-not-allowed"),
+    ("R8", "anthropic-messages", '{"model":"m1","max_tokens":10,"messages":[{"role":"user","content":[{"type":'
+     '"document","source":{"type":"base64","media_type":"application/pdf","data":"QQ=="}}]}]}',
+     {"dispatch": True}, "body-unbounded:document"),
+    ("R8b", "anthropic-messages", '{"model":"m1","max_tokens":10,"tools":[{"type":"web_fetch_20250910",'
+     '"name":"web_fetch"}],"messages":[]}', {"dispatch": True}, "body-unbounded:web_fetch"),
+    ("R9", "openai-responses", '{"model":"m1","previous_response_id":"resp_1","input":"x"}', {"dispatch": True},
+     "body-unbounded:previous_response_id"),
+    ("R9b", "openai-responses", '{"model":"m1","tools":[{"type":"web_search"}],"input":"x"}', {"dispatch": True},
+     "body-unbounded:web_search"),
+    ("R10", "openai-chat", '{"model":"m1","plugins":[{"id":"web"}],"messages":[]}', {"dispatch": True},
+     "body-unbounded:plugins"),
+    ("R12", "anthropic-messages", '{"model":"m1","max_tokens":"100"}', {}, "body-json"),
+    ("R12b", "openai-chat", '{"model":"m1","max_tokens":true}', {}, "body-json"),
+    ("R12c", "openai-chat", '{"model":"m1","n":"3"}', {}, "body-json"),
+]
+
+
+@pytest.mark.parametrize("row", REFUSALS, ids=[r[0] for r in REFUSALS])
+def test_refusal_shapes(row):
+    _, cname, body, kw, want = row
+    entry = EA if cname == "anthropic-messages" else EO
+    assert _go(cname, body, entry, **kw) == want
+    assert norm.status_of(want) == {"body-json": 400}.get(want, 403)
+
+
+def test_unproven_marked_interactive_refused_dispatch():
+    body = ('{"model":"m1","max_tokens":10,"tools":[{"type":"web_search_20250305","name":"web_search"}],'
+            '"messages":[{"role":"user","content":[{"type":"document","source":{"type":"url","url":"https://x.test/a.pdf"}}]}]}')
+    assert _go("anthropic-messages", body, EA)[1] == ("web_search", "document")
+    assert _go("anthropic-messages", body, EA, dispatch=True) == "body-unbounded:web_search"
+
+
+def test_websocket_refused_on_metered_route():
+    with pytest.raises(norm.Refused) as e:
+        codec.refuse_upgrade()
+    assert e.value.name == "body-unbounded:websocket" and e.value.status == 403
+
+
+def test_recursion_in_a_later_step_is_body_json():
+    deep: object = "x"
+    for _ in range(sys.getrecursionlimit() + 50):
+        deep = {"a": deep}
+    obj = {"model": "m1", "max_tokens": 1, "messages": [deep]}
+    with pytest.raises(norm.Refused) as e:
+        codec.guarded(codec.CODECS["anthropic-messages"].estimate, obj, EA)
+    assert e.value.name == "body-json"
+
+
+def test_forwarded_body_is_the_compact_serialization():
+    est, _, fwd = _go("anthropic-messages", '{ "model" : "m1",\n "max_tokens": 1, "messages": [] }', EA)
+    assert fwd == '{"model":"m1","max_tokens":1,"messages":[]}'
+
+
+def test_refused_names_on_the_wire():
+    from levain.broker import gwwire
+    for name in ("body-json", "body-unbounded:document", "body-unbounded:websocket"):
+        assert gwwire.decode(b"F", gwwire.encode(b"F", {"refused": name})[5:]) == {"refused": name}
+    for bad in ("body-unbounded:", "body-unbounded:Bad", "body-json:x", "model-not-allowed:x"):
+        assert not norm.is_name(bad)
+
+
+# --- the price entry ----------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("key,val", [("in", 0), ("out", -1), ("in", True), ("cache_read", 1.5), ("default_output", 0),
+                                     ("image_tokens", 0), ("in", 10 ** 12 + 1), ("source", "http://x.test"),
+                                     ("source", "https://x.test/a b"), ("per_use", {"Web": 1}),
+                                     ("per_use", {"web_search": 0}), ("per_use", []), ("extra", 1)])
+def test_price_entry_refused(key, val):
+    raw = dict(EA_RAW, **{key: val})
+    with pytest.raises(PolicyError):
+        parse_price("t", raw)
+
+
+def test_price_entry_missing_key_refused_and_zero_cache_accepted():
+    for k in ("in", "out", "cache_write", "cache_read", "default_output", "overhead_tokens", "image_tokens", "source"):
+        with pytest.raises(PolicyError):
+            parse_price("t", {x: v for x, v in EA_RAW.items() if x != k})
+    p = parse_price("t", dict(EA_RAW, cache_read=0, cache_write=0, overhead_tokens=0))
+    assert (p.cache_read, p.cache_write, p.overhead_tokens) == (0, 0, 0)
+
+
+# --- base /2 and routemap /3 --------------------------------------------------------------------------------------
+
+
+def _brokered(**over):
+    base = {"route": "anth", "type": "brokered",
+            "upstream": {"scheme": "https", "host": "api.anthropic.com", "base_path": ""},
+            "requests": {"templates": [{"method": "POST", "path": "/v1/messages"}], "headers": {},
+                         "body_cap": 1048576, "body_codec": "anthropic-messages"},
+            "credential": "anth-key", "max_session_microdollars": 5_000_000}
+    base.update(over)
+    return base
+
+
+def test_base_v2_reads_prices_and_refuses_per_call():
+    m = parse_base_map({"format": "levain-routes-base/2", "routes": [
+        _brokered(prices={"m1": EA_RAW}), {"route": "pypi", "type": "egress", "hosts": ["pypi.org"]}]})
+    assert m["anth"].prices == {"m1": EA} and m["anth"].max_call_microdollars is None
+    assert m["pypi"].prices is None
+    for bad in ([_brokered()],                                                    # no prices
+                [_brokered(prices={"m1": EA_RAW}, max_call_microdollars=1)],      # a per-call cap
+                [_brokered(prices={"m1": dict(EA_RAW, in_=1)})],                  # a bad entry
+                [_brokered(prices={"m1": EA_RAW}, requests=dict(_brokered()["requests"], body_cap=policy.BODY_CAP_MAX + 1))],
+                [{"route": "pypi", "type": "egress", "hosts": ["pypi.org"], "prices": {}}],
+                [_brokered(prices={"m1": EA_RAW}), _brokered(prices={"m1": EA_RAW})]):
+        with pytest.raises(PolicyError):
+            parse_base_map({"format": "levain-routes-base/2", "routes": bad})
+
+
+def test_base_v1_reads_as_main():
+    one = _brokered(max_call_microdollars=250_000)
+    m = parse_base_map({"format": "levain-routes-base/1", "routes": [one]})
+    assert render(m["anth"]) == render(parse_route(copy.deepcopy(one), source="base")) and m["anth"].prices is None
+    with pytest.raises(PolicyError):
+        parse_base_map({"format": "levain-routes-base/1", "routes": [_brokered(prices={"m1": EA_RAW})]})
+    with pytest.raises(PolicyError):
+        parse_base_map({"format": "levain-routes-base/3", "routes": []})
+
+
+def _dispatch_route(**over):
+    pol = {k: v for k, v in _brokered().items() if k != "max_session_microdollars"}
+    r = {"policy": pol, "provider": "openrouter",
+         "models": [{"requested": "z-ai/glm-5.2", "backend": "zhipu/glm-5.2", "price": EO_RAW}],
+         "body_policy": {"provider_only": ["z-ai"]}, "retention_claim": "recorded, never a guarantee"}
+    r.update(over)
+    return r
+
+
+def test_routemap_v3():
+    [r] = parse_routemap({"format": "levain-dispatch-routemap/3", "routes": [_dispatch_route()]})
+    assert r.policy.prices == {"z-ai/glm-5.2": EO} and r.backends == {"z-ai/glm-5.2": "zhipu/glm-5.2"}
+    assert r.policy.max_call_microdollars is None
+    pol_cap = dict(_dispatch_route()["policy"], max_call_microdollars=1)
+    for bad in ({"format": "levain-dispatch-routemap/2", "routes": [_dispatch_route()]},
+                {"format": "levain-dispatch-routemap/3", "routes": [_dispatch_route(policy=pol_cap)]},
+                {"format": "levain-dispatch-routemap/3", "routes": [_dispatch_route(
+                    models=[{"requested": "z-ai/glm-5.2", "backend": "zhipu/glm-5.2"}])]},
+                {"format": "levain-dispatch-routemap/3", "routes": [_dispatch_route(models=[])]},
+                {"format": "levain-dispatch-routemap/3", "routes": [_dispatch_route(), _dispatch_route()]},
+                {"format": "levain-dispatch-routemap/3", "routes": [_dispatch_route(extra=1)]}):
+        with pytest.raises(PolicyError):
+            parse_routemap(bad)
+
+
+# --- the frozen readers and the vendor table ----------------------------------------------------------------------
+
+
+def test_route_policy_v1_reader_pinned_to_main():
+    """main's `parse_route` (66115cde) on the corpus, every source, compared result by result."""
+    with open(os.path.join(os.path.dirname(__file__), "data", "policy_pin_main_66115cde.json")) as f:
+        pinned = json.load(f)
+    rows = corpus()
+    got = []
+    for i, src, _ in pinned:
+        try:
+            pol = parse_route(copy.deepcopy(rows[i]), source=src)
+            assert pol.prices is None
+            got.append([i, src, "OK " + render(pol)])
+        except PolicyError as e:
+            got.append([i, src, "PolicyError " + str(e)])
+        except Exception as e:
+            got.append([i, src, type(e).__name__ + " " + str(e)])
+    assert got == pinned
+
+
+def test_vendor_table_parses_and_names_its_derivation():
+    table = vendor_prices.prices()
+    assert all(p.source.startswith("https://") for p in table.values())
+    assert "git grep -nE" in (vendor_prices.__doc__ or "")
