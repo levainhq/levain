@@ -3,6 +3,7 @@ admits and waits, the file's lines, and canonical line builders for hand-made fi
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 import threading
@@ -203,4 +204,5 @@ def write_file(path: str, *lines: bytes) -> None:
 
 
 def open_fds() -> int:
+    gc.collect()   # an earlier test's unclosed socket, finalized mid-count, is not this test's fd (CI 40022706958, 14 == 15)
     return len(os.listdir("/dev/fd"))
