@@ -20,11 +20,12 @@ tests/test_a.py::test_y
 tests/test_b.py::TestK::test_z
 tests/sub/c_test.py::test_w
 tests/test d [x].py::test_spaced
+tests/test::edge.py::test_colons
 
 6 tests collected in 0.10s
 tests/test_a.py:12: DeprecationWarning: noise
 """
-EXPECTED = ["tests/sub/c_test.py", "tests/test d [x].py", "tests/test_a.py", "tests/test_b.py"]
+EXPECTED = ["tests/sub/c_test.py", "tests/test d [x].py", "tests/test::edge.py", "tests/test_a.py", "tests/test_b.py"]
 
 
 def _run(*args, stdin="", env=None):

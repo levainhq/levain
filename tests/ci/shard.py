@@ -25,18 +25,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 _TEST_DEF = re.compile(r"^\s*(?:async\s+)?def test_", re.MULTILINE)
-# `pytest --collect-only -q` prints each collected item as `<path>::<name>[<params>]`. A node id is a line holding
-# `::` whose part before the first `::` ends in `.py`; that part is its file. Every other line (the summary, a warning
-# "tests/x.py:3: Warning", "ERROR collecting tests/x.py") holds no `::` and is ignored; a collection error also fails
-# the plan step through `set -o pipefail`.
+# `pytest --collect-only -q` prints each collected item as `<path>.py::<name>[<params>]`. A node id is a line holding
+# `.py::`; its file is everything up to the first `.py::`, so a path that itself holds `::` keeps it whole. Every other
+# line (the summary, a warning "tests/x.py:3: Warning", "ERROR collecting tests/x.py") holds no `.py::` and is ignored;
+# a collection error also fails the shard job's step (bash -e).
 
 
 def files_from_node_ids(text):
     files = set()
     for line in text.splitlines():
-        head, sep, _ = line.rstrip().partition("::")
-        if sep and head.endswith(".py"):
-            files.add(head)
+        head, sep, _ = line.rstrip().partition(".py::")
+        if sep and head:
+            files.add(head + ".py")
     return sorted(files)
 
 
