@@ -1060,7 +1060,9 @@ def test_b5_a_verifier_success_never_reaches_the_importer_shaped_publish(tmp_pat
     finally:
         os.close(wd)
         os.close(cd)
-    assert (ei.value.name, ei.value.detail) == ("verifier-failed:publish", "verifier-unbuilt")
+    # 5d-i S2 built the verifier's own publish: an importer-shaped out/ (no verifier outputs) is output-missing,
+    # never the importer's transaction, and nothing is published
+    assert ei.value.name == "verifier-failed:output-missing"
     assert os.listdir(c) == []
 
 

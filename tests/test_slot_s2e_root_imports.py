@@ -22,7 +22,8 @@ ROOT_PYTHON = "/usr/bin/python3"
 BLOCKED = ("tomllib", "levain.host_guard")
 
 _LISTED = ("records", "control", "render", "stage", "root_intent", "end", "wall", "forwarder", "runtime_grammar",
-           "install_helper", "layout", "ids", "root_tree", "service_boot", "start", "proc", "control_client")
+           "install_helper", "layout", "ids", "root_tree", "service_boot", "start", "proc", "control_client",
+           "keyring_join")   # keyring_join: the stage imports it lazily (s5 §5b A6), so it is listed
 #: The brief's list, plus every root entry module that exists (runtime_helper joins once it is built).
 ROOT_MODULES = tuple(sorted({f"levain.slot.{m}" for m in _LISTED}
                             | {m for m in ENTRY_MODULES.values() if importlib.util.find_spec(m) is not None}))

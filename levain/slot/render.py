@@ -22,8 +22,9 @@ the §5.5 discovery check (:func:`discovery_refusals`, refused ``planted-discove
 runs before exec, and the repo-layer loosening check (:func:`repo_loosening_refusals`, host_guard's lists, refused
 ``loosening:<key>``), which the supervisor runs on the clone before it bundles it.
 
-Refusal names travel on the helper's stdout through ``runtime_grammar.refusal_line``, whose name alphabet is
-lowercase words joined by ``-`` with one ``:`` qualifier; a key or file name is folded into that alphabet by
+Refusal names travel on the helper's stdout through ``runtime_grammar.refusal_line``, whose name alphabet
+(``runtime_grammar._NAME_RE``) is lowercase words joined by ``-`` with one ``:`` qualifier (the qualifier may also
+carry uppercase and ``.``); a key or file name is still folded to the lowercase alphabet by
 :func:`wire_name` (``disableBypassPermissionsMode`` -> ``disable-bypass-permissions-mode``). The exact key or path
 rides ``Refused.detail``.
 """
