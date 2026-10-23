@@ -57,8 +57,8 @@ __all__ = [
     "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem",
     "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_mismatch",
     "custody_problem", "is_passkey_material",
-    "genesis_policy", "inert_grant", "init_hint", "log_head", "prepare", "read_anchor", "reset_anchor", "reset_hint",
-    "reset_lock", "reset_message", "sign_and_append",
+    "genesis_policy", "inert_grant", "conn_data_root", "conn_init_hint", "init_hint", "log_head", "prepare", "read_anchor",
+    "reset_anchor", "reset_hint", "reset_lock", "reset_message", "sign_and_append",
     "presence_missing", "quarantined", "signing_laptops", "snapshot", "sshsig_public_key", "UNSTATED",
     "verify_anchor_reset", "verify_link_sig",
 ]
@@ -1604,7 +1604,7 @@ def snapshot(conn: sqlite3.Connection, *, cache: ReplayCache | None = None,
     inside the caller's read transaction so it and the caller's other reads see one head)."""
     state = _replay(conn, PROCESS_CACHE if cache is None else cache, ssh_keygen)
     if state is None:
-        raise NotInitialised("the authority log is empty: run `levain cockpit ledger init`")
+        raise NotInitialised(f"the authority log is empty: {conn_init_hint(conn)}")
     return state
 
 
@@ -1923,9 +1923,28 @@ def reset_hint(data_root: Path | str) -> str:
     return f"`levain cockpit anchor reset --signing-key {KEY_WORD} --data-root {shlex.quote(str(data_root))}`"
 
 
-def init_hint(data_root: Path | str) -> str:
-    """The remedy for an empty log: the whole `levain cockpit ledger init` argv, this data root filled in."""
-    return f"`levain cockpit ledger init --signing-key {KEY_WORD} --data-root {shlex.quote(str(data_root))}`"
+def init_hint(data_root: Path | str, signing_key: Path | str = KEY_WORD) -> str:
+    """The remedy for an empty log: the whole `levain cockpit ledger init` argv, this data root filled in (and the
+    signing key, where the caller holds one: `levain cockpit key create` has just made it)."""
+    argv = ["levain", "cockpit", "ledger", "init", "--signing-key", str(signing_key), "--data-root", str(data_root)]
+    return f"`{shlex.join(argv)}`"
+
+
+def conn_data_root(conn: sqlite3.Connection) -> Path | None:
+    """The data root whose ``cockpit.db`` is ``conn``'s main database, or None for a database with no file
+    (``:memory:``, a temp database): there the code cannot name a cockpit."""
+    file = conn.execute("PRAGMA database_list").fetchone()[2]     # (seq, name, file): the main database first
+    return Path(file).parent if file else None
+
+
+def conn_init_hint(conn: sqlite3.Connection) -> str:
+    """:func:`init_hint` for ``conn``'s own data root. A fileless database has no root to name, so it says in prose
+    what the command needs and pastes nothing."""
+    root = conn_data_root(conn)
+    if root is None:
+        return ("levain cockpit ledger init, with its --signing-key (a laptop-presence key) and --data-root "
+                "(the cockpit directory)")
+    return init_hint(root)
 
 
 def anchor_path(data_root: Path | str) -> Path:

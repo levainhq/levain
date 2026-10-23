@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from levain.authority import SCHEMA as AUTHORITY_SCHEMA
-from levain.authority import AuthoritySnapshot
+from levain.authority import AuthoritySnapshot, conn_init_hint
 from levain.autonomic.journal import JournalCorruptError
 from levain.cockpit.consent import (
     ConsentError,
@@ -54,8 +54,8 @@ __all__ = [
     "CAP_ATTEMPTS", "CockpitDB", "CockpitFormatError", "DB_NAME", "DecideOutcome", "DecisionRows",
     "EditRow", "EditsPage", "EffectRow", "FaultOutcome", "FIRST_RETRY_DELAY", "IdempotencyConflict",
     "IssueResult", "JournalCorruptError", "LabelRow", "OpView", "Outcome", "OUTCOME_WINDOW",
-    "INIT_HINT", "OUTCOMES_LIMIT", "OutcomeRow", "PENDING_CAP", "PendingCapExceeded", "PendingRow", "STORE_FORMAT", "UNINITIALISED", "authority_fence",
-    "UnitResult", "UnitOutcome", "UnknownPending", "backoff_seconds", "new_pending_id",
+    "OUTCOMES_LIMIT", "OutcomeRow", "PENDING_CAP", "PendingCapExceeded", "PendingRow", "STORE_FORMAT", "UNINITIALISED", "authority_fence",
+    "UnitResult", "UnitOutcome", "UnknownPending", "backoff_seconds", "conn_init_hint", "new_pending_id",
 ]
 
 STORE_FORMAT = "levain-cockpit/3"
@@ -63,7 +63,6 @@ STORE_FORMAT = "levain-cockpit/3"
 _MIGRATES_FROM = "levain-cockpit/2"
 # set by the migration until `levain cockpit ledger init` re-enrols the keys: every signed act refuses
 UNINITIALISED = "authority_uninitialised"
-INIT_HINT = "`levain cockpit ledger init`"
 DB_NAME = "cockpit.db"
 PENDING_CAP = 8                        # WAITING pendings per principal generation (§3.1)
 CAP_ATTEMPTS = 10                      # recorded transient faults before a unit ends `store error` (§4.1.2)
@@ -1353,7 +1352,7 @@ def _key_problem(conn: sqlite3.Connection, authority: AuthoritySnapshot | None, 
     """The verified signer is an enrolled, unrevoked key of the captured authority whose class covers
     the tier (invariant 8), in a store whose authority is initialised. Returns (refusal, enrolled_at)."""
     if authority is None or _meta(conn, UNINITIALISED) is not None:
-        return f"authority not initialised: run {INIT_HINT}", None
+        return f"authority not initialised: run {conn_init_hint(conn)}", None
     key = authority.key(fingerprint) if isinstance(fingerprint, str) else None
     if key is None:
         return "key not enrolled", None

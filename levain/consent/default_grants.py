@@ -130,6 +130,7 @@ def _after_stop(word: str, state: dict) -> str:
 
 def _offer(install: Path, adapter: str, *, interactive: bool, emit: Callable[[str], None],
            input_fn: Callable[[str], str], clock: Callable[[], datetime] | None, state: dict) -> None:
+    from levain.authority import init_hint
     from levain.cockpit.consent import utc_stamp
     from levain.cockpit.keys import KeyError_, keys
     from levain.consent.grants import list_grants
@@ -149,20 +150,28 @@ def _offer(install: Path, adapter: str, *, interactive: bool, emit: Callable[[st
     if not root.is_absolute():
         emit(f"  default grant: not offered: the consent settings' cockpit {str(root)!r} is not an absolute path")
         return
+    force = shlex.join(["levain", "init", "--path", workspace, "--adapter", adapter, "--force"])
     try:
         rows, why = keys(root, now=now)
     except KeyError_ as exc:
         if "no cockpit journal" not in str(exc):
             emit(f"  default grant: not offered: the authority log at {root} is unusable ({exc})")
             return
-        rows = []
+        # an absent journal is not an empty log: `ledger init` refuses until the cockpit has been started once
+        emit(f"  default grant: not offered: it would cover {covers}; there is no cockpit journal at {root} yet: "
+             f"start the cockpit that uses that directory "
+             f"({shlex.join(['levain', 'serve', '--path', workspace, '--write', '--install-class', 'reported'])}) "
+             f"and open it once in the browser, "
+             f"then run levain cockpit ledger init (with its --signing-key and --data-root), then `{force}` "
+             f"offers it")
+        return
     except Exception as exc:  # noqa: BLE001 - an unreadable log never fails init
         emit(f"  default grant: not offered: the authority log at {root} could not be read "
              f"({type(exc).__name__}: {exc})")
         return
     if not rows:
         emit(f"  default grant: not offered: it would cover {covers}; it needs an authority log first "
-             f"(`levain cockpit ledger init`), then `levain init --force` offers it")
+             f"({init_hint(root)}), then `{force}` offers it")
         return
     if why is not None:
         emit(f"  default grant: not offered: nothing may sign the authority log at {root} now ({why})")

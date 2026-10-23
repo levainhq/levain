@@ -3276,7 +3276,12 @@ def _cmd_cockpit_sign(args: argparse.Namespace) -> int:
 
 
 def _cmd_cockpit_key_create(args: argparse.Namespace) -> int:
+    import shlex as _shlex
+
+    from levain.authority import KEY_WORD as _KEY_WORD
+    from levain.authority import init_hint as _init_hint
     from levain.cockpit import custody as _custody
+    from levain.cockpit.firejournal import DB_NAME as _DB_NAME
     from levain.cockpit.keys import fingerprint_of
 
     try:
@@ -3299,9 +3304,27 @@ def _cmd_cockpit_key_create(args: argparse.Namespace) -> int:
           + (f"; CTK identity {made.ctk_hash}, label {made.label}" if made.ctk_hash else ""))
     print(f"public key: {made.public_path}")
     print(_GUARANTEE[made.custody])
-    print(f"next: `levain cockpit ledger init --signing-key {made.path}` for a new log, or `levain cockpit "
-          f"enroll {made.public_path} --signing-key <an enrolled laptop-presence key>` (the custody is read "
-          "from the key's sidecar)")
+    # the key exists: whatever follows only names the next step, so a failure to work it out is prose, never a crash
+    try:
+        root: Path | None = _cockpit_root(argparse.Namespace(path=Path.cwd(), data_root=None))
+        if not (root.parent / "memory.db").is_file():     # not a real install: a command here could only fail
+            root = None
+        journal = root is not None and (root / _DB_NAME).is_file()
+    except (Exception, SystemExit):  # noqa: BLE001 - any failure naming the cockpit is prose
+        root, journal = None, False
+    if root is not None and journal:
+        print(f"next, for the cockpit under this directory ({root}): {_init_hint(root, made.path)} for a new log, or "
+              f"`{_shlex.join(['levain', 'cockpit', 'enroll', str(made.public_path), '--signing-key', _KEY_WORD, '--data-root', str(root)])}` "
+              "(the custody is read from the key's sidecar)")
+    elif root is not None:
+        print("next: this install has no cockpit journal yet: start the cockpit (levain serve --write --install-class reported) and open it "
+              "once in the browser, then run levain cockpit ledger init with --signing-key "
+              f"{_shlex.quote(str(made.path))} and --data-root {_shlex.quote(str(root))} for a new log")
+    else:
+        print("next: start your cockpit (levain serve --write --install-class reported) and open it once in the "
+              f"browser, then give it its first log with levain cockpit ledger init, --signing-key "
+              f"{_shlex.quote(str(made.path))} and --data-root the cockpit's directory; an existing log enrols this "
+              "key with levain cockpit enroll instead")
     return 0
 
 
