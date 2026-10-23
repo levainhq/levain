@@ -370,3 +370,24 @@ def test_a1_away_says_exactly_which_agents_were_set_and_which_skipped(away_night
     text = out.getvalue()
     assert "away ON for claude_code only" in text and "NOT set for codex" in text and "permission denied" in text
     assert "every" not in text
+
+
+@pytest.mark.parametrize("step", ["claim", "activate"])
+def test_a_dead_asker_on_a_crossed_thread_is_refused_for_its_lease_and_files_no_sign(night, step):
+    """C6 L3 r2 (consensus LOW): the budget was read BEFORE the lease's liveness, so a pending worker whose asker lost
+    the lease, on a crossed thread, was written `budget crossed` and filed a SIGN to extend, where it is `lease lost
+    before active` and nothing to sign (red on 81dfd173). The claim and the activation both read the lease first."""
+    # the asker's lease runs out before its pending launch does (a take, a release and a lapse void or expire pending
+    # launches; a lease past its until that nobody has lapsed yet leaves this one pending): a one-minute hold, a
+    # LAUNCH_TTL launch, the clock two minutes on
+    assert lease.LAUNCH_TTL > timedelta(minutes=2)
+    token = night.store.coord_take(hold=timedelta(minutes=1))
+    night.calls(7)
+    w = night.store.launch_request(token, harness="claude", threads=[night.T])
+    night.store._clock = lambda: NOW + timedelta(minutes=2)
+    if step == "claim":
+        ln, why = night.store.launch_claim_spawn(w.launch_id, 4242)
+    else:
+        ln, why = night.store.launch_activate(w.launch_id, harness_session_id="sess-dead")
+    assert ln.state == "failed" and ln.cause == "lease lost before active", (ln.state, ln.cause, why)
+    assert night.signs() == []

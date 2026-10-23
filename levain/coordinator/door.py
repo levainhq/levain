@@ -47,6 +47,8 @@ DOOR: frozenset[tuple[str, ...]] = frozenset({
     ("coord", "status"), ("coord", "claim"), ("coord", "beat"), ("coord", "release"),
     # the seats' questions, read first (C5): its own KNOWs and escalations, never the operator's answer verb
     ("coord", "questions"), ("coord", "answer"), ("coord", "escalate"),
+    # away ON from a drop (fenced by the lease token), and the budget gauge and morning card it reads (C6)
+    ("coord", "away"), ("coord", "budget"), ("coord", "morning"),
     ("drops", "list"), ("drops", "show"), ("drops", "split"),
     ("thread", "list"), ("thread", "show"), ("thread", "state"), ("thread", "merge"), ("thread", "detach"),
     ("thread", "add"), ("thread", "set"),

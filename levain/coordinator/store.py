@@ -752,13 +752,19 @@ class CoordStore:
         launch is written ``failed`` (cause ``budget crossed``) and the SIGN to extend filed (not for a gauge that is
         unreadable, which no extension unblocks), both in this transaction,
         and ``(launch, reason)`` returned as :func:`levain.coordinator.lease.activate` returns a refusal. None
-        otherwise (the claim or the activation then decides as before). A worker holding several threads is not read
+        otherwise, and for a launch whose lease token is no longer live (the claim or the activation then decides as
+        before). A worker holding several threads is not read
         here: :func:`levain.coordinator.lease.refuse_several` refuses it at both the claim and the activation."""
         from levain.coordinator import budget, lease
 
         ln = lease.launch(conn, launch_id)
         if ln is None or ln.state != "pending" or ln.role != "worker" or len(ln.threads) != 1 or \
                 ln.until is None or now >= ln.until:
+            return None
+        # the asker's lease is read before the budget (C6 L3 r2): a pending launch whose token is no longer the live
+        # lease's is the claim's or the activation's to write `lease lost before active`, with no SIGN to extend
+        held = lease.lease(conn, now)
+        if held is None or not held.live or held.token != ln.token:
             return None
         g = budget.gauge(conn, self.directory, ln.threads[0])
         if g is None or g.refusal is None:
