@@ -48,6 +48,9 @@ PRICE_TOKENS = ("default_output", "overhead_tokens", "image_tokens")
 _PRICE_KEYS = frozenset(PRICE_RATES + PRICE_TOKENS + ("source",))
 #: a priced tool's name as `per_use` keys it: the tool type with any `_YYYYMMDD` version suffix removed.
 _TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,47}\Z")
+#: the template methods whose requests carry no body. A priced route parses every request's body (its codec reads
+#: the model and estimates the call), so a priced route naming one would answer `body-json` on every call: refused.
+BODYLESS_METHODS = frozenset({"GET", "HEAD"})
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}\Z")
 #: an upper bound on every integer in a price entry, so no product can leave exact float-free integer arithmetic
 #: unreadable: 10**12 microdollars per million tokens is $1M per million tokens.
@@ -299,6 +302,13 @@ def parse_price(where: str, raw: object) -> Price:
                  vals["overhead_tokens"], vals["image_tokens"], per_use, src)
 
 
+def _priced_templates(pol: RoutePolicy) -> None:
+    """A priced route (base `/2`, routemap `/3`) names no template whose method carries no body."""
+    for t in pol.templates:
+        if t.method in BODYLESS_METHODS:
+            raise PolicyError(f"route {pol.route}: a priced route's template {t.method} {t.path} carries no body")
+
+
 def parse_prices(route: str, raw: object) -> dict:
     """A `prices: {<model>: <entry>}` table (base `/2`)."""
     if not isinstance(raw, dict):
@@ -334,6 +344,7 @@ def parse_base_map(doc: object) -> dict:
                     raise PolicyError(f"route {pol.route}: a base /2 brokered route needs a body_codec")
                 if "prices" not in entry:
                     raise PolicyError(f"route {pol.route}: a base /2 brokered route needs prices")
+                _priced_templates(pol)
                 pol = replace(pol, prices=parse_prices(pol.route, entry["prices"]))
             elif "prices" in entry:
                 raise PolicyError(f"route {pol.route}: only a brokered route carries prices")
@@ -379,6 +390,7 @@ def parse_routemap(body: object) -> list:
         if not isinstance(r, dict) or set(r) != _ROUTEMAP_ROUTE_KEYS:
             raise PolicyError(f"a routemap route is exactly {sorted(_ROUTEMAP_ROUTE_KEYS)}")
         pol = parse_route(r["policy"], source="dispatch", per_call=False)
+        _priced_templates(pol)
         if pol.route in seen:
             raise PolicyError(f"route {pol.route}: named twice")
         seen.add(pol.route)

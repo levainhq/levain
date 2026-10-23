@@ -283,7 +283,37 @@ def test_route_policy_v1_reader_pinned_to_main():
 def test_vendor_table_parses_and_names_its_derivation():
     table = vendor_prices.prices()
     assert all(p.source.startswith("https://") for p in table.values())
-    assert "git grep -nE" in (vendor_prices.__doc__ or "")
+    # the reviewed docstring (1e77173a) names the head's ruling as the model list's source; the earlier `git grep`
+    # derivation printed nothing and was replaced (1023+13 head, ii-b RETURNED)
+    assert "The model list is the head's ruling" in (vendor_prices.__doc__ or "")
+
+
+# --- L3 r1 on ii-b2 (lane 3c2a-b2-fix1) ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_a_priced_route_with_a_bodyless_template_is_refused_at_load(method):
+    # complement LOW 4: a priced route's template whose method carries no body (a GET /models) answered `body-json`
+    # on every call, since keys parses every metered body. The map is refused at load instead, base /2 and
+    # routemap /3 alike; a /1 base map (no prices) keeps main's reading.
+    req = dict(_brokered()["requests"], templates=[{"method": "POST", "path": "/v1/messages"},
+                                                   {"method": method, "path": "/v1/models"}])
+    with pytest.raises(PolicyError, match="carries no body"):
+        parse_base_map({"format": "levain-routes-base/2", "routes": [_brokered(prices={"m1": EA_RAW}, requests=req)]})
+    pol = {k: v for k, v in _brokered(requests=req).items() if k != "max_session_microdollars"}
+    with pytest.raises(PolicyError, match="carries no body"):
+        parse_routemap({"format": "levain-dispatch-routemap/3", "routes": [_dispatch_route(policy=pol)]})
+    m = parse_base_map({"format": "levain-routes-base/1",
+                        "routes": [_brokered(max_call_microdollars=250_000, requests=req)]})
+    assert [t.method for t in m["anth"].templates] == ["POST", method]
+
+
+@pytest.mark.parametrize("model", ["mé", "ｍ1", "m 1", "m\x7f", "m\t1", ""])
+def test_a_price_model_outside_printable_ascii_is_refused(model):
+    # head ruling Q4 (ii-b RETURNED): `price_ref` is the model id, and the ledger refuses a non-ASCII ref, so the
+    # price table refuses such a model at load. [measured by 3c2a-b2-fix1, 10-23: `_MODEL_ID` already refused every
+    # one of these on 0497ccc6 (b2f1_failfirst.txt); this test pins it, no code changed]
+    with pytest.raises(PolicyError):
+        policy.parse_prices("anth", {model: EA_RAW})
 
 
 # --- 3c2a-i L3 r1 (1023-8/3c2a/L3_a1_r1.txt): each test is its finding's own failure ------------------------------

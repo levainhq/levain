@@ -23,9 +23,9 @@ from levain.broker.norm import digest_of_token
 from levain.broker.policy import parse_price
 from levain.contracts import canon
 from tests import b2_keys_rig as R
-from tests.ledger_support import file_lines, keys_ledger
+from tests.ledger_support import file_lines, keys_ledger, resolutions
 from tests.test_broker_keys_upstream import (BODY, PRICE, TOKEN, _AdminW, _q, _Rig, _run, _scripted, _types,
-                                             _Up, base_route)
+                                             _Up, base_route, big_body)
 
 pytestmark = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="unix sockets")
 
@@ -364,9 +364,18 @@ def test_budget_stopped_session_is_refused_at_both_reads(monkeypatch, when):
                 rig.front.feed_data(gwwire.encode(b"B", BODY) + gwwire.encode(b"E"))
                 await asyncio.wait_for(rig.run(_q()), 5)
             else:
+                # codex LOW 6 (lane 3c2a-b2-fix1): gated on `_collect_body`'s entry, which runs only after step 1's
+                # `_check_q` returned, never on an elapsed time a slow box can outrun
+                entered = asyncio.Event()
+                real = K.Keys._collect_body
+
+                async def gated(self, *a, **kw):
+                    entered.set()
+                    return await real(self, *a, **kw)
+                monkeypatch.setattr(K.Keys, "_collect_body", gated)
                 rig.front.feed_data(gwwire.encode(b"B", BODY[:5]))
                 task = rig.run(_q())
-                await asyncio.sleep(0.05)                 # step 1 passed; the body read waits for the rest
+                await asyncio.wait_for(entered.wait(), 5)   # step 1 passed; the body read waits for the rest
                 entry["budget_stopped"] = True
                 rig.front.feed_data(gwwire.encode(b"B", BODY[5:]) + gwwire.encode(b"E"))
                 await asyncio.wait_for(task, 5)
@@ -481,3 +490,186 @@ def test_concurrent_no_ceiling_calls_share(py):
     refused = [r.get("refused") for r in res if r.get("refused")]
     assert refused == ["budget-exhausted"] * (n - admitted), refused
     assert out["rc"] == 0
+
+
+# --- L3 r1 on ii-b2 (`1023-13/3c2a/L3_b2_r1.txt`), lane 3c2a-b2-fix1: each test was red on 0497ccc6 -----------------
+
+async def _until_rig(cond, timeout: float = 5.0) -> None:
+    end = asyncio.get_running_loop().time() + timeout
+    while not cond():
+        assert asyncio.get_running_loop().time() < end, "condition not met within %s s" % timeout
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize("phase", ["upload", "head", "relay"])
+def test_a_front_abort_after_the_head_stops_the_upstream_work(monkeypatch, phase):
+    # codex MED 1: an `X` read after `send_head`'s last `ff.aborted()` check was recorded and never looked at, so the
+    # upload, the response-head wait and the relay ran on. From the head on, the front's next frame is raced against
+    # the upstream work: an `X` ends the exchange at once (no `F`: the front has gone), and the sent hold is booked as
+    # the ledger books every sent call that ends unsettled, `uncertain {ended}`. The deadlines are set far past the
+    # test's own bound, so only the abort can end it.
+    up = _Up(stall_at=2 if phase == "upload" else 0)
+
+    async def go(d: str) -> dict:
+        _scripted(monkeypatch, up)
+        async with _Rig(d, head_timeout_s=60.0, idle_s=60.0) as rig:
+            rig.front.feed_data(gwwire.encode(b"B", BODY) + gwwire.encode(b"E"))
+            if phase == "relay":
+                up.feed(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabc")
+            task = rig.run(_q())
+            if phase == "upload":
+                await _until_rig(lambda: up.drains >= 2)           # the body's drain: the upstream stopped reading
+            elif phase == "head":
+                await _until_rig(lambda: len(up.writes) >= 2 and up.reads >= 1)   # body up, the head awaited
+            else:
+                await _until_rig(lambda: rig.conn.rec is not None and rig.conn.rec["bytes_down"] >= 3)   # `R` + `b`, a stall
+            rig.front.feed_data(gwwire.encode(b"X"))
+            done, _ = await asyncio.wait([task], timeout=3)
+            out = {"ended": bool(done), "frames": await rig.got() if done else None, "path": rig.ledger.path}
+            if not done:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            else:
+                out["raised"] = task.exception()
+        out["res"] = resolutions(out["path"])
+        out["seqs"] = [o["seq"] for o in file_lines(out["path"]) if o["kind"] == "reserved"]
+        return out
+
+    out = _run(go)
+    assert out["ended"], "the exchange ran on past the front's X"
+    assert out["raised"] is None, out["raised"]
+    assert _types(out["frames"]) == (b"ARb" if phase == "relay" else b"A"), out["frames"]
+    assert out["res"] == [("uncertain", out["seqs"][0], "ended")], out["res"]
+
+
+def test_an_early_413_stops_the_upload_between_chunks(monkeypatch):
+    # codex MED 2: the whole serialized body went to `Upstream.write()` in one call, so an upstream that answered 413
+    # and stopped reading still had every byte queued in the transport. The body now goes up in bounded `h11.Data`
+    # chunks with a drain between chunks: the stalled drain is the first chunk's, the head wins, and no later chunk
+    # is written.
+    size = 512 * 1024
+    big = big_body(size)
+    up = _Up(stall_at=2)   # the head's drain returns; the first body drain never does
+
+    async def go(d: str) -> dict:
+        _write_map(d, base_route(cap=10 ** 10, body_cap=size))
+        _scripted(monkeypatch, up)
+        async with _Rig(d) as rig:
+            rig.front.feed_data(b"".join(gwwire.encode(b"B", big[i:i + gwwire.CHUNK])
+                                         for i in range(0, size, gwwire.CHUNK)) + gwwire.encode(b"E"))
+            up.feed(b"HTTP/1.1 413 Payload Too Large\r\ncontent-length: 4\r\n\r\nnope")
+            await asyncio.wait_for(rig.run(_q("length:%d" % size)), 5)
+            return {"frames": await rig.got()}
+
+    out = _run(go)
+    assert _types(out["frames"]) == b"ARbe", out["frames"]
+    assert json.loads(out["frames"][1][1])["status"] == 413
+    head, body = _sent(up)
+    assert 0 < len(body) <= getattr(K, "UPLOAD_CHUNK", 64 * 1024) < size, len(body)
+
+
+def test_a_serialized_body_past_the_routes_body_cap_is_refused(monkeypatch):
+    # codex MED 3: an openai-chat body of exactly `body_cap` bytes with no ceiling grows when the ceiling is written
+    # in; the grown serialization went upstream past the route's cap. It is `body-cap` now, checked after the
+    # serialization and before the head and the admit: nothing held, nothing upstream.
+    body = b'{"model":"m1","messages":[]}'
+    obj = json.loads(body)
+    assert CHAT.write_ceiling(obj, P) and len(codec.serialize(obj)) > len(body)
+
+    async def go(d: str) -> dict:
+        _write_map(d, base_route(body_cap=len(body), codec="openai-chat"))
+        return await _one(d, monkeypatch, body)
+
+    out = _run(go)
+    assert out["frames"] == [(b"A", b"{}"), _f("body-cap")], out["frames"]
+    assert out["handshakes"] == 0 and out["up"].writes == [] and "reserved" not in out["kinds"]
+    assert out["buffered"] == 0
+
+
+def test_the_body_buffer_covers_the_serialized_length(monkeypatch):
+    # codex MED 3, its second half: the buffer held the raw body's length while the grown serialization is what keys
+    # keeps until the upload. A session whose share holds the raw body but not its serialization is refused
+    # `keys-unavailable` at the serialization, before the admit: nothing held, nothing upstream, the buffer empty.
+    body = b'{"model":"m1","messages":[]}'
+    obj = json.loads(body)
+    CHAT.write_ceiling(obj, P)
+    grown = len(codec.serialize(obj))
+
+    async def go(d: str) -> dict:
+        _write_map(d, base_route(codec="openai-chat"))
+        return await _one(d, monkeypatch, body,
+                          body_buffer=K.BodyBuffer(budget=4 * grown, session_max=grown - 1))
+
+    out = _run(go)
+    assert out["frames"] == [(b"A", b"{}"), _f("keys-unavailable")], out["frames"]
+    assert out["handshakes"] == 0 and out["up"].writes == [] and "reserved" not in out["kinds"]
+    assert out["buffered"] == 0
+
+
+def test_a_zero_take_leaves_no_session_entry():
+    # codex LOW 4: `take(0)` (a `length:0` body) put `by_session[session] = 0`, which `give_back` (n == 0) never
+    # removed: distinct sessions grew the daemon-lifetime dict. A zero take is a no-op.
+    buf = K.BodyBuffer()
+    t = buf.taker("s-zero")
+    t.take(0)
+    t.give_back()
+    assert buf.by_session == {} and buf.used == 0
+
+
+def test_a_parameterised_refusal_records_its_status(monkeypatch):
+    # codex LOW 5: `F{body-unbounded:websocket}` was sent with `"status": null` on its gw.jsonl record, because the
+    # plain STATUS lookup does not read a parameterised name; the record carries `norm.status_of(name)`.
+    from levain.broker import norm
+    up = _Up()
+
+    recs = []
+    real_log = K.Keys._log_exchange
+
+    def log(self, conn):
+        recs.append(dict(conn.rec) if conn.rec is not None else None)   # the record as `_log_exchange` writes it
+        real_log(self, conn)
+    monkeypatch.setattr(K.Keys, "_log_exchange", log)
+
+    async def go(d: str) -> None:
+        _scripted(monkeypatch, up)
+        async with _Rig(d) as rig:
+            rig.front.feed_data(gwwire.encode(b"E"))
+            ws_q = dict(_q("none"), upgrade="websocket", headers=[["sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="],
+                                                                ["sec-websocket-version", "13"]])
+            await asyncio.wait_for(rig.run(ws_q), 5)
+
+    _run(go)
+    [rec] = recs
+    assert rec["refused"] == "body-unbounded:websocket"
+    assert rec["status"] == norm.status_of("body-unbounded:websocket") is not None, rec
+
+
+def test_the_front_reader_is_closed_when_the_refusal_raises(monkeypatch):
+    # complement LOW 6: in `except norm.Refused`, a `_refuse` that raised (or was cancelled) skipped `ff.close()`, so
+    # the front read still in flight (here: the one the body-timeout left) was never retrieved. It is closed in a
+    # `finally` now. The refusal is made to raise; the exchange still ends, with the reader closed.
+    closed = []
+    real_close = K.FrontFrames.close
+
+    def close(self):
+        closed.append(self._t)
+        real_close(self)
+
+    async def boom(self, conn, frames, side, name, cap):
+        raise RuntimeError("a refusal that raised")
+
+    monkeypatch.setattr(K.FrontFrames, "close", close)
+    monkeypatch.setattr(K.Keys, "_refuse", boom)
+
+    async def go(d: str) -> dict:
+        up = _Up()
+        _scripted(monkeypatch, up)
+        async with _Rig(d, body_read_s=0.2) as rig:
+            rig.front.feed_data(gwwire.encode(b"B", BODY[:10]))
+            task = rig.run(_q())
+            await asyncio.wait([task], timeout=5)
+            return {"done": task.done(), "raised": task.exception() if task.done() else None}
+
+    out = _run(go)
+    assert out["done"] and isinstance(out["raised"], RuntimeError), out
+    assert closed and closed[0] is not None, closed     # the in-flight read was handed to `close`

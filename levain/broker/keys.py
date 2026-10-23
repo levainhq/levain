@@ -204,6 +204,11 @@ BODY_BUFFER_BUDGET = 128 * 1024 * 1024
 BODY_BUFFER_SESSION_MAX = BODY_BUFFER_BUDGET // 4
 #: the whole request body must arrive within this many seconds of `A`, else `body-timeout` (408)
 BODY_READ_S = 60.0
+#: the largest `h11.Data` chunk of the request body keys writes upstream before it drains: an upstream that answers
+#: early (a 401, a 413) and stops reading has at most this much past the transport's high-water mark queued, and the
+#: head's arrival stops the next chunk. [judged by 3c2a-b2-fix1, 10-23, against asyncio's default 64 KiB write
+#: high-water mark: a chunk of that size reaches the drain that waits]
+UPLOAD_CHUNK = 64 * 1024
 
 
 def _at(t: float) -> str:
@@ -302,6 +307,8 @@ class BodyTake:
         self.buf, self.session, self.n = buf, session, 0
 
     def take(self, n: int) -> None:
+        if not n:
+            return   # a `length:0` body: no entry, so `by_session` never keeps a zero for a session
         b = self.buf
         mine = b.by_session.get(self.session, 0)
         if b.used + n > b.budget or mine + n > b.session_max:
@@ -309,6 +316,12 @@ class BodyTake:
         b.used += n
         b.by_session[self.session] = mine + n
         self.n += n
+
+    def cover(self, n: int) -> None:
+        """Take what makes this exchange's bytes at least `n` (keys' serialization, which writing the ceiling in can
+        grow past the raw body); a take that cannot be granted is `keys-unavailable`, as any take."""
+        if n > self.n:
+            self.take(n - self.n)
 
     def give_back(self) -> None:
         n, self.n = self.n, 0
@@ -1341,12 +1354,18 @@ class Keys:
                 buf.give_back()
                 ff.close()
                 return   # detached, or the front aborted before its `E`: nothing was reserved, nothing sent
-            head, hconn, cred, tpl, data, hold = self._check_request(conn.reg, entry, pol, req,
-                                                                     raw)   # the ledger's admit is last
+            if observed is not None:
+                # the body read can take up to `body_read_s` after `fresh`'s observation: a token that expired
+                # meanwhile is refused here, before anything is checked or held (the head's write checks it again)
+                unexpired(self.cred_lifecycle, observed)
+            head, hconn, cred, tpl, data, hold = self._check_request(conn.reg, entry, pol, req, raw,
+                                                                     buf)   # the ledger's admit is last
         except norm.Refused as r:
             buf.give_back()
-            await self._refuse(conn, ff, side, r.name, pol.body_cap)
-            ff.close()
+            try:
+                await self._refuse(conn, ff, side, r.name, pol.body_cap)
+            finally:
+                ff.close()   # a refusal that raises or is cancelled still retrieves the front's read in flight
             return
         except BaseException:
             buf.give_back()
@@ -1417,22 +1436,26 @@ class Keys:
                 hold.mark_sent()   # from here the head may have reached the upstream
                 await up.drain()
 
-            try:
-                await upstream_step(send_head())
-            except FrontAborted:
-                return
-            resp = await self._upload_and_head(up, hconn, data, rec)
-            buf.give_back()   # the body is written: its bytes leave the buffer budget
-            r_frame = self._response_frame(resp, pol, cred, scanner)
-            if conn.detached:
-                return
-            conn.writer.write(r_frame)
-            ff.responded = True
-            rec["status"] = resp.status_code
-            await conn.writer.drain()
-            await self._relay_body(conn, up, hconn, scanner, rec)
-            if conn.detached:   # fenced mid-relay: cut short, so `_serve_q`'s `end()` books it, never a settle
-                return
+            async def work() -> bool:
+                """The head, the upload, the response head and the relay; True when the relay completed."""
+                try:
+                    await upstream_step(send_head())
+                except FrontAborted:
+                    return False
+                resp = await self._upload_and_head(up, hconn, data, rec)
+                buf.give_back()   # the body is written: its bytes leave the buffer budget
+                r_frame = self._response_frame(resp, pol, cred, scanner)
+                if conn.detached:
+                    return False
+                conn.writer.write(r_frame)
+                ff.responded = True
+                rec["status"] = resp.status_code
+                await conn.writer.drain()
+                await self._relay_body(conn, up, hconn, scanner, rec)
+                return not conn.detached   # fenced mid-relay: cut short, so `_serve_q`'s `end()` books it
+
+            if not await self._against_front(ff, side, up, work()):
+                return   # the front aborted, or the exchange was cut short: `_serve_q`'s `end()` resolves the hold
             hold.settle(hold.amount)   # a completed relay settles at its full hold (no usage read until 3c-2b)
         finally:
             rec["redactions"] = scanner.count
@@ -1468,6 +1491,29 @@ class Keys:
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)   # a race lost to the abort: its outcome is dropped
+
+    async def _against_front(self, ff: "FrontFrames", side: KeysSide, up: Upstream, work: Awaitable[bool]) -> bool:
+        """`work` (the exchange from its request head on) raced against the front's next frame, the ONE read
+        `FrontFrames` keeps in flight. The body's `E` was read before the admit, so the only frame the wire still
+        allows is `X`, and any completed read (`X`, EOF, a frame the wire refuses) is the front's abort: `work` is
+        cancelled, the upstream connection aborted (nothing it queued is flushed), and False returned, so the hold is
+        resolved by `_serve_q`'s exit (`end()`: released if unsent, `uncertain {ended}` once sent). A `work` that
+        finished first wins whatever the front did; its raise goes on unchanged."""
+        task = asyncio.ensure_future(work)
+        try:
+            await asyncio.wait({task, ff.pending(side.allowed())}, return_when=asyncio.FIRST_COMPLETED)
+            if task.done():
+                return task.result()
+            if ff.aborted():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)   # its outcome is dropped: the front has gone
+                up.abort()
+                return False
+            return await task   # no frame but `X` is allowed after `E`, so this is unreached; the work alone
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def _upload_and_head(self, up: Upstream, hconn: "h11.Connection", data: bytes,
                                rec: dict) -> object:
@@ -1690,13 +1736,14 @@ class Keys:
             raise norm.Refused("budget-overrun", "the session is stopped")
         return method, path, query, fwd, tpl, cred
 
-    def _check_request(self, reg: Registration, entry: dict, pol: RoutePolicy, req: tuple,
-                       raw: bytes) -> Tuple[bytes, "h11.Connection", object, norm.Template, bytes, ledger.Hold]:
+    def _check_request(self, reg: Registration, entry: dict, pol: RoutePolicy, req: tuple, raw: bytes,
+                       buf: "BodyTake") -> Tuple[bytes, "h11.Connection", object, norm.Template, bytes, ledger.Hold]:
         """R4 §1.7 steps 4-5, ONE synchronous call (no `await` anywhere in it): the body codec's parse of the buffered
         body, its `check` (the model has a price entry; on a dispatch-shaped route, one with no per-session cap, the
         unboundable shapes are `body-unbounded:<what>`), the ceiling written in where absent, the estimate, keys' own
-        serialization (the bytes that go upstream), the request head (`content-length` = that serialization's length,
-        whatever framing the `Q` declared), and the ledger's admit LAST (a hold is admitted only for a request that
+        serialization (the bytes that go upstream; past `body_cap` it is `body-cap`, and `buf` is made to cover its
+        length), the request head (`content-length` = that serialization's length, whatever framing the `Q`
+        declared), and the ledger's admit LAST (a hold is admitted only for a request that
         goes out). A `RecursionError` anywhere in these steps is `body-json`, with no hold taken. Returns the request
         head, the h11 client that wrote it (it frames the body and parses the response), the credential (or None),
         the matched template, the body bytes, and the admitted hold. `req` is `_check_q`'s answer."""
@@ -1707,6 +1754,9 @@ class Keys:
         codec.guarded(c.write_ceiling, obj, checked.price)
         estimate = codec.guarded(c.estimate, obj, checked.price)
         data = codec.guarded(codec.serialize, obj)
+        if len(data) > pol.body_cap:   # the ceiling written in can grow a body at the cap past it
+            raise norm.Refused("body-cap", "serialized")
+        buf.cover(len(data))   # the buffer holds at least the serialization keys keeps until the upload
         head, hconn = request_head(pol, method, path, query, fwd, "length:%d" % len(data), cred)
         # an interactive route admits content the estimate cannot see, marked on its `reserved` line (R4 §1.6)
         meta = {"bound": "unproven"} if checked.unproven else {}
@@ -1797,10 +1847,11 @@ class Keys:
         return b"".join(parts)
 
     async def _send_body(self, up: Upstream, hconn: "h11.Connection", data: bytes, rec: dict) -> None:
-        """`data` through `up.write`, framed as the head declared (`content-length` = its length), then h11's end of
-        message; an upstream failure raises UpstreamFailed."""
-        if data:
-            await upstream_send(up, h11_bytes(hconn, h11.Data(data=data)))
+        """`data` through `up.write` in `UPLOAD_CHUNK` pieces, each drained before the next is written (so a cancel
+        from an early response head stops the upload between chunks), framed as the head declared (`content-length`
+        = its length), then h11's end of message; an upstream failure raises UpstreamFailed."""
+        for i in range(0, len(data), UPLOAD_CHUNK):
+            await upstream_send(up, h11_bytes(hconn, h11.Data(data=data[i:i + UPLOAD_CHUNK])))
         tail = h11_bytes(hconn, h11.EndOfMessage())   # nothing for a content-length body; kept for the framing's sake
         if tail:
             await upstream_send(up, tail)
@@ -1911,7 +1962,11 @@ class Keys:
         if conn.detached:
             return
         if conn.rec is not None and conn.rec["refused"] is None:
-            conn.rec["refused"], conn.rec["status"] = name, norm.STATUS.get(name)
+            try:
+                status: Optional[int] = norm.status_of(name)   # reads a parameterised name (`body-unbounded:<what>`)
+            except KeyError:
+                status = None
+            conn.rec["refused"], conn.rec["status"] = name, status
         w = conn.writer
         w.write(gwwire.encode(b"F", {"refused": name}))
         if w.can_write_eof():

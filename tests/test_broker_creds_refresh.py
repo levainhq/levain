@@ -975,3 +975,29 @@ def test_rule_c_passes_with_one_caller_and_fails_on_none_and_on_two():
     wrong = dict(src)                   # L3 r1 codex LOW 6: a call on any other receiver is not upstream.refresh_post
     wrong[mod.CREDS] = creds_src.replace("upstream.refresh_post(", "not_upstream.refresh_post(")
     assert any("refresh_post" in p for p in mod.rule_c({r: mod.Module(r, s) for r, s in wrong.items()}))
+
+
+def test_through_keys_a_token_expiring_during_the_body_read_is_refused_before_the_admit(env):
+    """L3 r1 on ii-b2, complement MED 1 (lane 3c2a-b2-fix1, red on 0497ccc6): `fresh` observes the credential
+    before the body read, which may take up to `body_read_s`. The expiry is checked again right after the body read,
+    before the request is checked and admitted: a token that expired during the read is `credential-unavailable` with
+    no hold taken and no connection made (it was refused only at the head's write, after the connect)."""
+    from levain.broker import keys as K
+    clk = Clock()
+    connects = []
+
+    def setup(mp, cdir):
+        real = K.Keys._collect_body
+
+        async def slow_body(self, *a, **kw):
+            raw = await real(self, *a, **kw)
+            clk.t += 3601.0   # the body "took" past the token's expiry
+            return raw
+        mp.setattr(K.Keys, "_collect_body", slow_body)
+    frames, after, up, ep = _keys_case(env, int(clk.wall()) + 3600,
+                                       b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
+                                       seams=C.WriteSeams(monotonic=clk.mono, clock=clk.wall),
+                                       on_vendor_connect=lambda: connects.append(1), setup=setup)
+    assert b"".join(t for t, _ in frames) == b"AF", frames
+    assert b"credential-unavailable" in frames[1][1]
+    assert connects == [] and up.writes == []
