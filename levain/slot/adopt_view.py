@@ -5,12 +5,13 @@
 
 1. ``status <session>`` through the runtime helper: the alloc's ``base`` (none = ``base-unrecorded``).
 2. :func:`check_repo`, BEFORE adopt-open, so a refusal costs no sealed run, and again immediately before the take
-   writes his repo: ``repo-not-a-root`` (``--repo`` is not the top of a work tree that holds its own ``.git``
-   directory: a subdirectory, a linked worktree or a submodule checkout, whose ``.git`` is a file),
-   ``object-format-mismatch`` (``rev-parse --show-object-format`` against the base's;
-   ``extensions.compatObjectFormat`` set refuses too), ``repo-partial`` (``extensions.partialClone``, a
-   ``remote.<name>.promisor`` git reads as true, or a ``remote.<name>.partialCloneFilter``), ``repo-shallow``, and
-   ``base-missing`` (``cat-file -e <base_oid>``). Every value is git's own typing; an empty or invalid ``.git``
+   writes his repo, in this order: ``repo-not-a-root`` (``--repo/.git`` is not a directory: a subdirectory, a
+   linked worktree or a submodule checkout, whose ``.git`` is a file; that directory is the whole check), then the
+   config reads: a set ``extensions.compatObjectFormat`` = ``object-format-mismatch`` and ``extensions.partialClone``
+   or a ``remote.<name>.partialCloneFilter`` = ``repo-partial`` (whichever git lists first), then a
+   ``remote.<name>.promisor`` git reads as true = ``repo-partial``; then ``object-format-mismatch``
+   (``rev-parse --show-object-format`` against the base's), ``repo-shallow``, and ``base-missing``
+   (``cat-file -e <base_oid>``). Every value is git's own typing; an empty or invalid ``.git``
    is ``repo-unreadable:128`` (every git call names the repository, :func:`adopt_take.repo_args`).
 3. ``adopt-open <session>`` ("waiting on a running import" is printed first: root's adopt-lock wait is bounded,
    §4.7); its answer checked against the alloc's base. ``adopt-nothing-new`` copies the report and shows it
@@ -276,7 +277,8 @@ def check_base(base: object) -> Mapping[str, object]:
 
 
 def check_repo(seams: Seams, repo: Path, base: Mapping[str, object]) -> Path:
-    """§4.8's checks, in this order, before adopt-open. Returns ``repo`` made absolute."""
+    """§4.8's checks, in the order the module docstring's step 2 lists, before adopt-open and again before the take.
+    Returns ``repo`` made absolute."""
     repo = Path(os.path.abspath(repo))
     try:
         st = os.lstat(repo / ".git")

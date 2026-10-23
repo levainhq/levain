@@ -111,7 +111,7 @@ jobs:
         with:
           python-version: "3.9"
 
-      - name: Install h11 at the floor root vendors
+      - name: Install h11 at or above the floor root vendors
         # root_tree stages h11 beside the levain package, so the root tree imports it; the closure's import-check
         # needs it as much as the tests do.
         run: python -m pip install --upgrade pip pytest "$(python tests/ci/root_closure.py h11-spec)"
