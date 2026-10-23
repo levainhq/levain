@@ -432,18 +432,23 @@ def check_sources(source: Path, h11_dir: Path) -> None:
     _refuse_link(h11_dir, "h11")
 
 
-def check_source_writers(parent: Path, *, operator_uid: int, levain_gids: Iterable[int],
+def check_source_writers(parent: Path, *, operator_uid: int, operator_gids: Iterable[int],
+                         group_names: Mapping[int, str] | None = None,
                          lstat: Callable[[str], os.stat_result] = os.lstat,
                          walk: Callable[..., Iterator] = os.walk) -> None:
     """Row 33 §2.1 [r2: X-8; r3: F9 (a)-(c)]: who may write the ``--source`` package, checked BEFORE any other root
     read of it (the generation hash included). ``parent`` is ``realpath(PATH/..)``, so the ancestor chain checked is
     the RESOLVED one. Every ancestor of ``parent`` up to ``/``, ``parent`` itself, and every entry below
     ``parent/levain`` and ``parent/h11`` must be owned by root or the operator and not other-writable (sticky or
-    not); a group-writable one is accepted only when its group reaches no Levain account (``levain_gids``: every
-    gid a Levain account holds as primary group or is listed in). Else ``bad-source``. A link below either package
+    not); a group-writable one is accepted only when its group is in ``operator_gids``: the groups whose COMPLETE
+    membership (the member list AND every user whose primary gid it is) is the operator alone (L3 r1: Ubuntu's
+    user-private group passes, macOS ``staff`` never does). Else ``bad-source``, naming the remedy on that exact path
+    (``chmod g-w``; ``chmod -R g-w`` for a directory below a package, never on an ancestor). A link below either package
     reads mode 0777 on Linux and is refused here; :func:`levain.slot.generation.generation_id` refuses links on both
-    hosts. ACLs are not read (§2.1 (d), a known edge)."""
-    reach = frozenset(levain_gids)
+    hosts. ACLs are not read (§2.1 (d), a known edge). Known edge (L3 r1): the check runs at R0 and the hash and copy
+    later, so a writer the check admits (the operator, root) can change the tree between; §2.1 does not claim it."""
+    trusted, names = frozenset(operator_gids), group_names or {}
+    below = (os.path.join(str(parent), "levain"), os.path.join(str(parent), "h11"))
 
     def check(p: str) -> None:
         try:
@@ -454,8 +459,11 @@ def check_source_writers(parent: Path, *, operator_uid: int, levain_gids: Iterab
             raise Refused("bad-source", f"{p} is owned by uid {st.st_uid}, neither root nor the operator")
         if st.st_mode & stat.S_IWOTH:
             raise Refused("bad-source", f"{p} is writable by every user")
-        if st.st_mode & stat.S_IWGRP and st.st_gid in reach:
-            raise Refused("bad-source", f"{p} is writable by group {st.st_gid}, which a Levain account holds")
+        if st.st_mode & stat.S_IWGRP and st.st_gid not in trusted:
+            grp = f"{names[st.st_gid]} (gid {st.st_gid})" if st.st_gid in names else f"gid {st.st_gid}"
+            rec = stat.S_ISDIR(st.st_mode) and (p in below or p.startswith(tuple(b + os.sep for b in below)))
+            raise Refused("bad-source", f"{p} is writable by group {grp}, which holds an account other than the "
+                                        f"operator. Run `chmod {'-R ' if rec else ''}g-w {p}`, then repair again")
 
     chain, p = [], str(parent)
     while True:
@@ -496,6 +504,6 @@ def tree_steps(host: HostOS, source: Path, *, h11_dir: Path | None = None, gener
 
 
 __all__ = ["CURRENT", "ENTRY_MODULES", "H11_MIN", "HELPER_MODULES", "PY_FLAGS", "ROOT_PYTHON", "STAGING",
-           "VENDOR_PREFIX", "boot_path_code", "check_source_writers", "check_sources", "current_path", "dir_steps", "entry_steps",
-           "entry_text", "flip_step", "gc_step", "h11_floor", "h11_source", "helper_entry_text", "read_current", "stage_steps",
-           "tree_steps"]
+           "VENDOR_PREFIX", "boot_path_code", "check_source_writers", "check_sources", "current_path", "dir_steps",
+           "entry_steps", "entry_text", "flip_step", "gc_step", "h11_floor", "h11_source", "helper_entry_text",
+           "read_current", "stage_steps", "tree_steps"]

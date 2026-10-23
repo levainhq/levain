@@ -1066,6 +1066,9 @@ class RepairFacts:
     h11: Path | None = None
     #: The earlier ``L/policy/install-skips`` entries (:func:`parse_install_skips`; R14 re-reads each live).
     skips: tuple = ()
+    #: L3 r1: each live account's same-named group, name -> gid, present only at the directory's gid for that name
+    #: (macOS: under Levain's label). The plan requires it at the account's uid (§1.1: gid == uid).
+    account_groups: Mapping[str, int] = field(default_factory=dict)
 
 
 def install_shape_path(host: HostOS) -> Path:
@@ -1445,6 +1448,14 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
         raise Refused("account-missing", f"{', '.join(missing)}: no live Levain account by that name, and repair "
                                          "never creates one (it never creates or removes a slot). Run undo, then "
                                          "setup")
+    # L3 r1 (codex): R8 renders `chown <owner>:<account>` against each account's same-named primary group, so a
+    # group deleted (or moved, or relabelled on macOS) by hand while its user stays is the same gap; refused here.
+    ungrouped = [n for n in (*SINGLETONS, *(n for s in slots for n in s.accounts))
+                 if rf.account_groups.get(n) != rf.accounts[n]]
+    if ungrouped:
+        raise Refused("group-missing", f"{', '.join(ungrouped)}: no Levain group of that name at the account's id, "
+                                       "and repair never creates one (it never creates or removes a slot). Run undo, "
+                                       "then setup")
     services, skipped = units.built_services(host, package, exists=program_exists)
     restricted = False
     if host == "linux":
@@ -1584,6 +1595,12 @@ class Directory:
     group_labels: Mapping[str, str] = field(default_factory=dict)
     #: Each group's listed members (macOS ``GroupMembership``; Linux ``getent group`` field 4). Row 33 §3.
     group_members: Mapping[str, frozenset] = field(default_factory=dict)
+    #: Each user's primary gid (Linux ``getent passwd`` field 4; macOS :func:`read_primary_groups`, read only for a
+    #: ``repair --source``): a group's members include every user whose primary group it is, whom no member list
+    #: names (§2.1, the source writer check).
+    user_gids: Mapping[str, int] = field(default_factory=dict)
+    #: macOS: each group that nests others (``NestedGroups``), whose members no list here enumerates. Linux: none.
+    nested: frozenset = frozenset()
 
 
 def _lines(run: Callable[..., object], argv: Sequence[str]) -> list[str]:
@@ -1608,6 +1625,7 @@ def read_directory(host: HostOS, *, run: Callable[..., object] = subprocess.run)
     ulab: dict[str, str] = {}
     glab: dict[str, str] = {}
     gmem: dict[str, frozenset] = {}
+    ugid: dict[str, int] = {}
     if host == "darwin":
         dscl = "/usr/bin/dscl"
         for kind, key, into in (("/Users", "UniqueID", users), ("/Groups", "PrimaryGroupID", groups)):
@@ -1636,6 +1654,7 @@ def read_directory(host: HostOS, *, run: Callable[..., object] = subprocess.run)
             if len(p) != 7:
                 raise Refused("host-read-failed", f"getent passwd: {ln[:120]!r}")
             users[p[0]] = _id(p[2], ln)
+            ugid[p[0]] = _id(p[3], ln)
             ulab[p[0]] = p[4]
         for ln in _lines(run, (getent, "group")):
             if not ln:
@@ -1649,7 +1668,24 @@ def read_directory(host: HostOS, *, run: Callable[..., object] = subprocess.run)
         raise Refused("unsupported-host", repr(host))
     if users.get("root") != 0:
         raise Refused("host-read-failed", "the directory service lists no root at uid 0")
-    return Directory(users, groups, ulab, glab, gmem)
+    return Directory(users, groups, ulab, glab, gmem, ugid)
+
+
+def read_primary_groups(d: Directory, *, run: Callable[..., object] = subprocess.run) -> Directory:
+    """macOS: ``d`` with each user's primary gid and the groups that nest others, the two reads a group's COMPLETE
+    membership needs beyond ``GroupMembership`` (L3 r1, the ``--source`` writer check). A failed read refuses
+    ``host-read-failed``; a user with no ``PrimaryGroupID`` is in no group by it."""
+    dscl = "/usr/bin/dscl"
+    ugid: dict[str, int] = {}
+    for ln in _lines(run, (dscl, ".", "-list", "/Users", "PrimaryGroupID")):
+        p = ln.split()
+        if len(p) > 2:
+            raise Refused("host-read-failed", f"dscl /Users PrimaryGroupID: {ln[:120]!r}")
+        if len(p) == 2:
+            ugid[p[0]] = _id(p[1], ln)
+    nested = frozenset(p[0] for p in (ln.split() for ln in _lines(run, (dscl, ".", "-list", "/Groups", "NestedGroups")))
+                       if len(p) > 1)
+    return replace(d, user_gids=ugid, nested=nested)
 
 
 def live_lease_sessions(sessions: Path) -> tuple[str, ...]:
@@ -1758,6 +1794,8 @@ def gather_facts(cmd: InstallCommand, host: HostOS, caller_uid: int, *,
     Accounts and groups are Levain's by label (§23) or, with a journal, by name AND journaled id (§25: a Linux
     group carries no label)."""
     d = read_directory(host, run=run)
+    if host == "darwin" and cmd.verb == "repair" and cmd.source is not None:
+        d = read_primary_groups(d, run=run)
     rs = store_seams or RH.Seams(host=host)
     L = rs.L
     q = Quiesce(L, waits=rs) if cmd.verb not in LEASE_EXEMPT else None
@@ -1849,30 +1887,55 @@ def _repair_facts(cmd: InstallCommand, host: HostOS, d: Directory, accounts: Map
     """Row 33 §2.3 R0: the directory's ``levain-*`` groups and their members, the slots in service, what
     ``<tree>/current`` names, whether the legacy tree is there, and ``--source`` RESOLVED (§2.1 (e): every later read
     names the resolved parent), its names checked and then who may write it (§2.1, :func:`root_tree.
-    check_source_writers`) before any other root read of it. ``operator_uid`` None (no operator record): no check,
-    the plan refuses ``not-set-up`` before it reads the source."""
+    check_source_writers`) before any other root read of it. ``operator_uid`` None (no operator record) with a
+    ``--source``: ``not-set-up`` here, before the resolve (L3 r1: the first root read of the source).
+
+    ``account_groups``: each live account's same-named group at its gid (macOS: under Levain's label), for the
+    plan's ``group-missing`` refusal (L3 r1)."""
     from levain.slot.intent import GROUP_RE
 
+    if cmd.source is not None and operator_uid is None:
+        raise Refused("not-set-up", cmd.verb)
     groups = {g: i for g, i in d.groups.items() if GROUP_RE.fullmatch(g)}
+    own = {n: d.groups[n] for n in accounts
+           if n in d.groups and (host != "darwin" or d.group_labels.get(n) == SLOT_MARKER)}
     tree = root_tree.current_path(host).parent
     current = root_tree.read_current(tree)
     source = h11 = None
     if cmd.source is not None:
         parent = Path(os.path.realpath(os.path.dirname(cmd.source)))
         source, h11 = parent / os.path.basename(cmd.source), parent / "h11"
-        if operator_uid is not None:
-            root_tree.check_sources(source, h11)
-            # [judged by r2repair, 10-22, against CONTRACT §1.1 "own primary group each"]: a Levain account's primary
-            # gid is its uid, so the gids a Levain account reaches are those uids plus every group listing one.
-            reach = {u for n, u in d.users.items() if is_levain_account(n)}
-            reach |= {d.groups[g] for g, m in d.group_members.items()
-                      if g in d.groups and any(is_levain_account(a) for a in m)}
-            root_tree.check_source_writers(parent, operator_uid=operator_uid, levain_gids=reach)
+        assert operator_uid is not None
+        root_tree.check_sources(source, h11)
+        root_tree.check_source_writers(parent, operator_uid=operator_uid,
+                                       operator_gids=operator_only_gids(d, operator_uid),
+                                       group_names={i: g for g, i in sorted(d.groups.items(), reverse=True)})
     return RepairFacts(accounts=dict(accounts), groups=groups, members={g: d.group_members.get(g, frozenset())
                                                                         for g in groups},
                        egress=tuple(in_service.get("egress", ())), verifier=tuple(in_service.get("none", ())),
                        current=current, legacy=os.path.isdir(tree / "levain"), source=source, h11=h11,
-                       skips=skips)
+                       skips=skips, account_groups=own)
+
+
+def operator_only_gids(d: Directory, operator_uid: int) -> frozenset:
+    """L3 r1 (§2.1, the source writer check): the gids whose COMPLETE membership is the operator alone: every group
+    holding that gid lists no one but the operator and nests no group (macOS), no other user holds it as primary
+    group, and the operator IS in it (listed or by primary gid). A listed name the directory does not resolve counts
+    as another account. Ubuntu's user-private group passes; macOS ``staff`` (gid 20, every local user's primary group,
+    listing ``root``) never does. The operator must be found in it because an EMPTY membership proves nothing on
+    macOS: its computed groups (``everyone``, ``localaccounts``, ``authedusers``...) list no one and hold everyone
+    [measured by r2repair-fix1, 10-22, `dscl . -list /Groups GroupMembership` on Phill's Mac]."""
+    by_gid: dict[int, list[str]] = {}
+    for g, i in d.groups.items():
+        by_gid.setdefault(i, []).append(g)
+    out = set()
+    for i, gs in by_gid.items():
+        if any(g in d.nested for g in gs):
+            continue
+        names = {n for g in gs for n in d.group_members.get(g, ())} | {n for n, pg in d.user_gids.items() if pg == i}
+        if names and all(d.users.get(n) == operator_uid for n in names):
+            out.add(i)
+    return frozenset(out)
 
 
 def plan_for(cmd: InstallCommand, g: Gathered, **setup_kw) -> InstallPlan:

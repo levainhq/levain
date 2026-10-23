@@ -87,7 +87,8 @@ def _pre_change(tmp: Path, *, foreign: dict[str, int] | None = None, intent: Int
                          tool_present=lambda p: True, xcode_ready=lambda: True)
     lv, h11 = _package(tmp)
     rf = IH.RepairFacts(accounts=accounts, groups={**groups, **foreign}, members=_members(groups),
-                        egress=(0,), verifier=(0,), current=None, legacy=True, source=lv, h11=h11)
+                        egress=(0,), verifier=(0,), current=None, legacy=True, source=lv, h11=h11,
+                        account_groups=dict(accounts))
     return facts, rf
 
 

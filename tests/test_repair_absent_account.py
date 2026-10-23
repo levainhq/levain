@@ -45,11 +45,12 @@ def _package(tmp: Path) -> tuple[Path, Path]:
     return lv, h11
 
 
-def _host(tmp: Path, host: str, *, egress=(0, 1), verifier=(0,), gone=(), out_of_service=()):
+def _host(tmp: Path, host: str, *, egress=(0, 1), verifier=(0,), gone=(), out_of_service=(), ungrouped=None):
     """A host set up at this code (every shared group, the record holding setup's whole desired set) with slots
     ``egress`` + ``verifier`` set up. ``gone``: accounts deleted by hand (absent from the directory: no name, no uid,
     and on Linux userdel took the same-named group). ``out_of_service``: egress slots retired at runtime (their
-    accounts tombstoned, so not live; their records stay in the shape)."""
+    accounts tombstoned, so not live; their records stay in the shape). ``ungrouped``: name -> the gid its same-named
+    group now has (None: the group is gone; the user stays)."""
     r = RANGES[host]
     ids = {n: u for n, u in zip(SINGLETONS, r.singletons)}
     slots = [SlotId("egress", i) for i in egress] + [SlotId("none", i) for i in verifier]
@@ -75,7 +76,9 @@ def _host(tmp: Path, host: str, *, egress=(0, 1), verifier=(0,), gone=(), out_of
     in_service = [i for i in egress if i not in out_of_service]
     rf = IH.RepairFacts(accounts=live, groups=groups, members={g: frozenset(m) for g, m in members.items()},
                         egress=tuple(in_service), verifier=tuple(verifier), current=shape.generation,
-                        source=lv, h11=h11)
+                        source=lv, h11=h11,
+                        account_groups={n: (ungrouped or {}).get(n, u) for n, u in live.items()
+                                        if (ungrouped or {}).get(n, u) is not None})
     return facts, rf
 
 
@@ -131,3 +134,45 @@ def test_an_intact_host_removes_no_account(tmp_path: Path, host) -> None:
     facts, rf = _host(tmp_path, host)
     plan = _plan(facts, rf)
     assert not [s.why for s in plan.steps if s.why.startswith("retire ") and "'s uid" in s.why]
+
+
+@pytest.mark.parametrize("host", ["linux", "darwin"])
+@pytest.mark.parametrize("name", ["_levain_s1", "_levain_gw1", "_levain_keys"])
+@pytest.mark.parametrize("now", [None, 4321])                 # deleted by hand; moved to another gid
+def test_repair_refuses_when_an_accounts_own_group_is_gone(tmp_path: Path, host, name, now) -> None:
+    """L3 r1 (codex): the user stays live but its same-named group is gone or moved, so R8's `chown <owner>:<name>`
+    would fail after earlier acts. RED at 24b86068 (the plan built). Refused before any act."""
+    facts, rf = _host(tmp_path, host, ungrouped={name: now})
+    with pytest.raises(Refused) as e:
+        _plan(facts, rf)
+    assert e.value.name == "group-missing", e.value
+    assert name in e.value.detail and "undo" in e.value.detail
+
+
+def test_the_gather_carries_each_accounts_own_group(tmp_path: Path, monkeypatch) -> None:
+    """``_repair_facts``: a same-named group is carried at its gid; on macOS only under Levain's label."""
+    from levain.slot import root_tree
+    from levain.slot.accounts import SLOT_MARKER
+
+    monkeypatch.setattr(root_tree, "read_current", lambda tree: None)
+    d = IH.Directory(users={"_levain_s0": 3999, "_levain_s1": 3998, "_levain_c0": 3997},
+                     groups={"_levain_s0": 3999, "_levain_s1": 3998},
+                     group_labels={"_levain_s0": SLOT_MARKER, "_levain_s1": "someone else"})
+    accounts = {"_levain_s0": 3999, "_levain_s1": 3998, "_levain_c0": 3997}
+    cmd = parse_install_argv(["repair"])
+    assert IH._repair_facts(cmd, "darwin", d, accounts, {}, operator_uid=OP_UID).account_groups == {"_levain_s0": 3999}
+    assert IH._repair_facts(cmd, "linux", d, accounts, {}, operator_uid=OP_UID).account_groups == {
+        "_levain_s0": 3999, "_levain_s1": 3998}
+
+
+def test_not_set_up_refuses_before_the_source_is_resolved(tmp_path: Path, monkeypatch) -> None:
+    """L3 r1 (complement): with no operator record, a --source is never read (realpath is the first read)."""
+    from levain.slot import root_tree
+
+    monkeypatch.setattr(root_tree, "read_current", lambda tree: None)
+    seen: list = []
+    monkeypatch.setattr(IH.os.path, "realpath", lambda p: seen.append(p) or p)
+    cmd = parse_install_argv(["repair", "--source", str(tmp_path / "levain")])
+    with pytest.raises(Refused) as e:
+        IH._repair_facts(cmd, "linux", IH.Directory(users={}, groups={}), {}, {}, operator_uid=None)
+    assert e.value.name == "not-set-up" and seen == []
