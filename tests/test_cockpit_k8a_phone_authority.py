@@ -36,6 +36,7 @@ from levain.cockpit.firejournal import PENDING_CAP, CockpitDB  # noqa: E402
 from levain.cockpit.keys import fingerprint_of  # noqa: E402
 from levain.cockpit.verbs import DEVICE_VERBS, KERNEL_VERBS, gesture_for  # noqa: E402
 from levain.contracts.namespaces import REGISTRY  # noqa: E402
+from tests.autonomic_confirm_keys import account_home  # noqa: E402
 from tests.cockpit_authority_rig import RealKey, enrol, enrol_any, root_of  # noqa: E402
 
 BROWSER = {"class": "token", "name": "browser"}
@@ -93,7 +94,7 @@ class SoftPasskey:
 
 @pytest.fixture
 def home() -> Iterator[Path]:
-    d = Path(tempfile.mkdtemp(prefix=".levain-k8a-", dir=Path.home()))
+    d = Path(tempfile.mkdtemp(prefix=".levain-k8a-", dir=account_home()))   # a signers dir needs ancestors nobody else writes
     try:
         yield d
     finally:
@@ -302,21 +303,21 @@ def test_a_device_principal_names_a_well_formed_transport():
 # --- end to end over the phone port: the same dispatch and broker, a virtual passkey ------------------------------
 
 @pytest.fixture
-def install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+def install(home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
     from levain import install as install_mod
     from levain.cli import main
 
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    user_home = home / "home"
+    user_home.mkdir()
+    monkeypatch.setenv("HOME", str(user_home))
     for var in ("LEVAIN_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
         monkeypatch.delenv(var, raising=False)
     assert main(["init", "--answers-template"]) in (0, None)
     answers = json.loads(capsys.readouterr().out)
     answers.update(OPERATOR_NAME="Test", ENTITY_NAME="test")
-    (tmp_path / "answers.json").write_text(json.dumps(answers))
-    inst = tmp_path / "inst"
-    assert main(["init", "--path", str(inst), "--adapter", "claude-code", "--answers", str(tmp_path / "answers.json"),
+    (home / "answers.json").write_text(json.dumps(answers))
+    inst = home / "inst"
+    assert main(["init", "--path", str(inst), "--adapter", "claude-code", "--answers", str(home / "answers.json"),
                  "--consent-hook", "on", "--force"]) in (0, None)
     store = SporeStore(inst / ".levain" / "memory.spores.json")
     store.add(type="task", text="tray one", disposition="seed")
@@ -324,7 +325,7 @@ def install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.Capt
     root.mkdir(parents=True, exist_ok=True)
     db = CockpitDB(root, install_class="reported")
     db.set_install_class("reported")
-    keys = tmp_path / "keys"
+    keys = home / "keys"
     keys.mkdir(mode=0o700)
     laptop = RealKey(keys, "laptop")
     enrol_any(db, laptop, "laptop-presence")
