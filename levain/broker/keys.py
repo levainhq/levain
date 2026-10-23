@@ -2060,7 +2060,10 @@ class Keys:
             left = deadline - loop.time()
             if left <= 0:
                 return
-            fr = await asyncio.wait_for(frames.read(side.allowed()), left)
+            try:
+                fr = await asyncio.wait_for(frames.read(side.allowed()), left)
+            except asyncio.TimeoutError:
+                return   # DRAIN_S is up: the caller closes (a stalled body, `body-timeout`, ends here)
             if fr is None:
                 return
             ftype, payload = fr

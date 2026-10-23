@@ -31,8 +31,8 @@ SECRET = "sk-upstream-test-SECRET-0123456789"
 READY_S = 40.0
 
 
-def lib(d: str, cap: int) -> None:
-    """`test_broker_keys_upstream._lib` with the route's per-session cap as the argument (base `/2`)."""
+def lib(d: str, cap: int, codec: str = "anthropic-messages") -> None:
+    """`test_broker_keys_upstream._lib` with the route's per-session cap and body codec as arguments (base `/2`)."""
     os.makedirs(os.path.join(d, "routes"), exist_ok=True)
     os.makedirs(os.path.join(d, "keys", "cred"), exist_ok=True)
     os.chmod(os.path.join(d, "keys"), 0o700)
@@ -40,7 +40,7 @@ def lib(d: str, cap: int) -> None:
              "upstream": {"scheme": "https", "host": "api.example.com", "base_path": ""}, "credential": "c1",
              "requests": {"templates": [{"method": "POST", "path": "/v1/messages"}],
                           "headers": {"content-type": "application/json"}, "body_cap": 4096,
-                          "body_codec": "anthropic-messages"},
+                          "body_codec": codec},
              "max_session_microdollars": cap, "prices": {"m1": PRICE}}
     with open(os.path.join(d, "routes", "base.json"), "wb") as f:
         f.write(canon.canonical_bytes({"format": "levain-routes-base/2", "routes": [route]}))
@@ -84,11 +84,13 @@ class FakeControl:
 
 
 class FakeUpstream:
-    """Plain TCP on 127.0.0.1. `conns` counts accepted connections, `heads` request heads fully received. Responses
-    wait on `release` (cleared = hold every response open); then a 200 with a 2-byte body."""
+    """Plain TCP on 127.0.0.1. `conns` counts accepted connections, `heads` request heads fully received, `bodies`
+    each request's body as received (read by its `content-length`). Responses wait on `release` (cleared = hold every
+    response open); then a 200 with a 2-byte body."""
 
     def __init__(self) -> None:
         self.conns = self.heads = 0
+        self.bodies: List[bytes] = []
         self.server: Any = None
         self.port = 0
         self.release: Optional[asyncio.Event] = None
@@ -106,8 +108,14 @@ class FakeUpstream:
         self.conns += 1
         self.writers.append(w)
         try:
-            await r.readuntil(b"\r\n\r\n")
+            head = await r.readuntil(b"\r\n\r\n")
             self.heads += 1
+            n = 0
+            for line in head.split(b"\r\n"):
+                name, _, value = line.partition(b":")
+                if name.strip().lower() == b"content-length":
+                    n = int(value.strip())
+            self.bodies.append(await r.readexactly(n))
             await self.release.wait()
             w.write(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
             await w.drain()
@@ -230,14 +238,14 @@ class Front:
         self.status = (r, w)
         return self
 
-    async def q(self, attempts: int = 1) -> Dict[str, Any]:
+    async def q(self, attempts: int = 1, body: bytes = BODY) -> Dict[str, Any]:
         """One exchange. A connection keys closed with no frame (its pending cap, at accept) is retried, up to
         `attempts`; `retries` in the result counts them. The retry is valid ONLY for that accept-time close: had keys
         admitted a hold and then dropped the connection before the first frame, the retry would reserve a second hold
         (T12 would then fail loudly on an extra `reserved` line)."""
         retries = 0
         while True:
-            out = await self._q_once()
+            out = await self._q_once(body)
             if out["frames"] == [] and retries + 1 < attempts:
                 retries += 1
                 await asyncio.sleep(0.05)
@@ -245,14 +253,14 @@ class Front:
             out["retries"] = retries
             return out
 
-    async def _q_once(self) -> Dict[str, Any]:
+    async def _q_once(self, body: bytes = BODY) -> Dict[str, Any]:
         q = {"v": 1, "token": TOKEN, "route": "r", "method": "POST", "path": "/v1/messages", "query": "",
-             "headers": [["content-type", "application/json"]], "body": "length:%d" % len(BODY),
+             "headers": [["content-type", "application/json"]], "body": "length:%d" % len(body),
              "upgrade": "none"}
         frames: List[tuple] = []
         r, w = await asyncio.open_unix_connection(self.keys.front_path)
         try:
-            w.write(gwwire.encode(b"Q", q) + gwwire.encode(b"B", BODY) + gwwire.encode(b"E"))
+            w.write(gwwire.encode(b"Q", q) + gwwire.encode(b"B", body) + gwwire.encode(b"E"))
             await w.drain()
             while True:
                 try:
