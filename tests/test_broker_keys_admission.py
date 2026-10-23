@@ -69,6 +69,39 @@ def test_stdin_not_a_pipe_never_ends_keys():
         shutil.rmtree(d, ignore_errors=True)
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="keys refuses to run as root")
+def test_sigint_takes_the_graceful_path():
+    # B1 L3 r1 codex HIGH: a Ctrl-C on a foreground keys is the SIGTERM trigger, not a KeyboardInterrupt that could
+    # land between `up.write(head)` and `mark_sent`: keys stops through its one close and exits 0
+    d = tempfile.mkdtemp(prefix="lk", dir="/tmp")
+    try:
+        os.mkdir(os.path.join(d, "keys"))
+        front = os.path.join(d, "keys", "front.sock")
+        env = {**os.environ, "PYTHONPATH": str(Path(levain.__file__).resolve().parents[1])}
+        # SIGINT at its default in the child (a runner that ignores it would hand the child SIG_IGN, which Python keeps)
+        p = subprocess.Popen([sys.executable, "-m", "levain.broker.keys", "--runtime-root", d, "--lib-root", d,
+                              "--control", os.path.join(d, "control.sock"), "--test-single-uid"],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env,
+                             preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+        try:
+            end = time.monotonic() + 20
+            while _connect(front) != "connected":
+                assert p.poll() is None, p.stderr.read().decode()
+                assert time.monotonic() < end, "keys never served front.sock"
+                time.sleep(0.05)
+            p.send_signal(signal.SIGINT)
+            assert p.wait(10) == 0
+            err = p.stderr.read().decode()
+            assert "stopped" in err and "KeyboardInterrupt" not in err, err
+            assert _connect(front) == "refused"
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_shutdown_triggered_during_start_ends_keys():
     # a SIGTERM between arm_triggers() and start(): the latch's run finishes, nothing is served, the wait ends
     d = tempfile.mkdtemp(prefix="lk", dir="/tmp")
