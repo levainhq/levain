@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.17] — 2026-10-22
+
 ### Added
 - **Notes: an agent can send you a reply that needs no answer.** Through the band's tools an agent files a note: one
   line, with optional detail. It shows in the cockpit's Notes strip under Needs you and on the phone page below your
