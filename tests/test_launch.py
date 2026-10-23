@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -134,13 +135,75 @@ def test_child_env_is_the_allowlist_plus_what_was_asked(monkeypatch) -> None:
 
 
 # --- every child levain starts gets an explicit, allowlisted environment ----------------------------
+#
+# 1023+2 head ruling (scan2a): outside levain/launch.py every reference to a spawner is the callee of a direct call
+# that passes an explicit env; ANY other reference (a value, an alias, a default, a class attribute, an attribute
+# store, an argument) is refused by file:line, except a parameter default named in _HELD_SEAMS: inside its function
+# every call of that parameter passes env, and it goes nowhere but a parameter of a same-module helper, which the
+# same rule covers (_seam_uses). No other alias is followed.
+# This scan is a TRIPWIRE over the spawn shapes levain uses today, not a proof that no spawn escapes it. Known edges
+# (a shape nobody writes; each measured by the grep named, run over levain/ on 1023, 0 hits unless stated):
+# - asyncio spawners: grep -rn "create_subprocess_exec\|subprocess_exec" levain
+# - pty spawners: grep -rn "pty\.spawn\|pty\.fork" levain
+# - the posix module's exec/spawn: grep -rn "posix\.exec\|posix\.posix_spawn" levain
+# - a spawner function aliased by assignment: grep -rnE "^\s*[A-Za-z_.]+ *= *subprocess\.[A-Za-z_]+ *(#.*)?$" levain
+# - the os or subprocess MODULE bound to another name: grep -rnE "^\s*[A-Za-z_]+ *= *(subprocess|os) *(#.*)?$" levain
+# - a spawner CALLED inside an annotation (runs at definition time):
+#   grep -rnE "(:|->) *(subprocess|os)\.(run|Popen|call|check_[a-z]+|exec[a-z]*|spawn[a-z]*|posix_spawnp?)\(" levain
+# - subprocess reached by getattr: grep -rn "getattr(subprocess" levain
+# - the whole environment as a default: grep -rn "env=os\.environ" levain
+# - a spawner reached through `getattr(os, name)` with a non-literal name: grep -rn "getattr(os, *[a-z_]" levain
+#   (1 hit: _FlooredOs.__getattr__ in the OpenHands tools, a proxy, not a spawn; getattr(os, "O_NOFOLLOW", 0) is a constant)
+# Two edges carried over from main unchanged, with their size, not 0:
+# - env is judged by its TEXT: a name bound to the whole environment and later passed as env= is not traced.
+#   Names bound to it: grep -rnE "= *(dict\()?os\.environ *(\)|$|#| if )" levain (16 on 1023); whether any reaches a
+#   spawn's env is not checked here (a scan2b candidate).
+# - levain/launch.py's direct os exec-family calls are not env-checked (_LAUNCH): grep -nE "os\.(exec|spawn|posix_spawn)"
+#   levain/launch.py (1 on 1023).
 
-_SPAWN = {("subprocess", n) for n in ("run", "Popen", "call", "check_call", "check_output")}
-_ENV_EXEC = {"execve", "execvpe", "execle", "execlpe", "spawnve", "spawnvpe", "spawnle", "spawnlpe",
-             "posix_spawn", "posix_spawnp"}
-_NO_ENV = {("subprocess", "getoutput"), ("subprocess", "getstatusoutput"), ("os", "system"),
-           ("os", "popen")} | {("os", n) for n in ("execv", "execvp", "execl", "execlp", "spawnv",
-                                                    "spawnvp", "spawnl", "spawnlp")}
+_SUBPROCESS_ENV = {"run", "Popen", "call", "check_call", "check_output"}     # env= keyword
+_SUBPROCESS_NO_ENV = {"getoutput", "getstatusoutput"}
+# The env-taking os exec family: env's positional slot, and whether the API also takes it as `env=`
+# (os.posix_spawn and os.posix_spawnp are positional-only) ...
+_OS_ENV_AT = {"execve": (2, True), "execvpe": (2, True), "spawnve": (3, True), "spawnvpe": (3, True),
+              "posix_spawn": (2, False), "posix_spawnp": (2, False)}
+# ... and the `l` wrappers, which take it as their LAST positional, after this many leading ones (never `env=`).
+_OS_ENV_LAST_AFTER = {"execle": 2, "execlpe": 2, "spawnle": 3, "spawnlpe": 3}
+_OS_NO_ENV = {"execv", "execvp", "execl", "execlp", "spawnv", "spawnvp", "spawnl", "spawnlp", "system", "popen"}
+_OS_SPAWNERS = set(_OS_ENV_AT) | set(_OS_ENV_LAST_AFTER) | _OS_NO_ENV
+_LAUNCH = "levain/launch.py"     # the re-exec's home: its direct os exec-family calls are not env-checked (as on main)
+
+# Spawners still held as parameter defaults (scan2 step 0, `1023-2/scan2/HELD_SITES.md`; scan2b converts them and
+# empties this table): (module, function, parameter) -> the spawner it defaults to. Each must match exactly once.
+_HELD_SEAMS = {
+    ("levain/consent/publish.py", "execute", "run"): "subprocess.run",
+    ("levain/host_canary.py", "_drive", "popen"): "subprocess.Popen",
+    ("levain/slot/fsck_ids.py", "git_version_text", "run"): "subprocess.run",
+    ("levain/slot/fsck_ids.py", "check_config_ids", "run"): "subprocess.run",
+    ("levain/slot/install_helper.py", "_act", "run"): "subprocess.run",
+    ("levain/slot/install_helper.py", "read_directory", "run"): "subprocess.run",
+    ("levain/slot/install_helper.py", "read_primary_groups", "run"): "subprocess.run",
+    ("levain/slot/install_helper.py", "gather_facts", "run"): "subprocess.run",
+    ("levain/slot/pf.py", "release_enable_reference", "run"): "subprocess.run",
+    ("levain/slot/pf.py", "take_enable_reference", "run"): "subprocess.run",
+    ("levain/slot/stage.py", "make_bundle", "run"): "subprocess.run",
+    ("levain/slot/supervisor.py", "repo_toplevel", "run"): "subprocess.run",
+    ("levain/slot/supervisor.py", "operator_clone", "run"): "subprocess.run",
+    ("levain/slot/supervisor.py", "repo_layer_docs", "run"): "subprocess.run",
+    ("levain/slot/supervisor.py", "git_identity", "run"): "subprocess.run",
+    ("levain/slot/units.py", "_launchd_job_absent", "run"): "subprocess.run",          # `run or subprocess.run`
+    ("levain/slot/units.py", "_unload_launchd_if_changed", "run"): "subprocess.run",   # `run or subprocess.run`
+    ("levain/slot/units.py", "_stop_unit_if_changed", "run"): "subprocess.run",        # `run = run or ...`
+    ("levain/slot/wall.py", "read_netns_names", "run"): "subprocess.run",
+    ("levain/slot/wall.py", "macos_egress_ready", "run"): "subprocess.run",
+}
+
+# The one named pass-through: (module, function, spawner, the env text it passes) -> why. Must match exactly once.
+_PASS_THROUGH = {
+    ("levain/slot/wall.py", "trampoline_main", "execve", "os.environb if environ is None else environ"):
+        "the macOS last hop, run by the Seatbelt launcher after the profile: its env IS the one the stage built "
+        "explicitly, because the stage execs it with an explicit env",
+}
 
 
 def _sources() -> list[Path]:
@@ -149,147 +212,229 @@ def _sources() -> list[Path]:
     return [p for p in PKG.rglob("*.py") if "templates" not in p.relative_to(PKG).parts]
 
 
-def _spawn_problems(path: Path, root: Path = ROOT) -> list[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    out = []
-    for node in ast.walk(tree):
-        # Aliases would hide a call from the scan below: `from subprocess import run`, `import
-        # subprocess as sp`, `from webbrowser import open`.
-        if isinstance(node, ast.ImportFrom):
-            names = {a.name for a in node.names}
-            spawners = {n for _, n in _NO_ENV} | _ENV_EXEC
-            if (node.module in ("subprocess", "webbrowser")
-                    or (node.module == "os" and names & spawners)
-                    or (node.module == "asyncio" and any(n.startswith("create_subprocess") for n in names))):
-                out.append(f"{path.relative_to(root)}:{node.lineno} `from {node.module} import`: "
-                           "call it through the module so the scan sees the call")
-        if isinstance(node, ast.Import):
-            for a in node.names:
-                if a.name in ("subprocess", "webbrowser") and a.asname:
-                    out.append(f"{path.relative_to(root)}:{node.lineno} `import {a.name} as {a.asname}`")
-        if not isinstance(node, ast.Call):
-            continue
-        f = node.func
-        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
-            key = (f.value.id, f.attr)
-        elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Attribute) and f.attr.startswith("create_subprocess"):
-            key = ("asyncio", f.attr)
-        else:
-            continue
-        where = f"{path.relative_to(root)}:{node.lineno}"
-        if key[0] == "webbrowser" and path.name != "_browser.py":
-            out.append(f"{where} webbrowser.{key[1]}: open it through levain.launch.open_browser")
-            continue
-        if key in _NO_ENV:
-            out.append(f"{where} {key[0]}.{key[1]} cannot take an environment")
-        elif key in _SPAWN or key[0] == "asyncio" and key[1].startswith("create_subprocess"):
-            problem = _env_problem(node, f"{where} {key[0]}.{key[1]}")
-            if problem:
-                out.append(problem)
-        elif key[0] == "os" and key[1] in _ENV_EXEC and path.name != "launch.py":
-            out.append(f"{where} os.{key[1]}: only levain/launch.py re-executes")
-    return out + _alias_problems(tree, path.relative_to(root))
-
-
-def _env_problem(call: ast.Call, what: str) -> str | None:
-    env = next((k.value for k in call.keywords if k.arg == "env"), None)
-    if env is None:
-        return f"{what} without env="
-    if ast.unparse(env) == "None" or "os.environ" in ast.unparse(env):
-        return f"{what} with env={ast.unparse(env)}"
+def _spawner(n: ast.AST) -> tuple[str, str] | None:
+    """``("os", "execve")`` for a reference to a spawner (``os.execve``, ``x.os.execve``), else None."""
+    if not isinstance(n, ast.Attribute):
+        return None
+    v = n.value
+    mod = v.id if isinstance(v, ast.Name) else v.attr if isinstance(v, ast.Attribute) else None
+    if mod == "subprocess" and n.attr in _SUBPROCESS_ENV | _SUBPROCESS_NO_ENV:
+        return ("subprocess", n.attr)
+    if mod == "os" and n.attr in _OS_SPAWNERS:
+        return ("os", n.attr)
+    if n.attr.startswith("create_subprocess"):
+        return ("asyncio", n.attr)
     return None
 
 
-def _alias_problems(tree: ast.Module, rel: Path) -> list[str]:
-    """Spawners held as a VALUE (`run: Run = subprocess.run`, `run = run or subprocess.run`,
-    `(run or subprocess.run)(...)`): the scan above sees only `subprocess.run(...)`, so it follows the
-    alias instead. Every call through it must pass env=; the alias may be handed on to a function defined
-    in the same module (followed into that parameter); any other use of it, and any other value reference
-    to a spawner, is refused because the scan cannot follow it. Type annotations are not references."""
+def _env_problem(call: ast.Call, spawner: tuple[str, str], what: str) -> tuple[str | None, str]:
+    """(the problem with ``call``'s env, or None; the env text found, "" if none)."""
+    mod, name = spawner
+    if (mod, name) in {("subprocess", n) for n in _SUBPROCESS_NO_ENV} or mod == "os" and name in _OS_NO_ENV:
+        return f"{what} cannot take an environment", ""
+    kw = next((k for k in call.keywords if k.arg == "env"), None)
+    starred = [i for i, a in enumerate(call.args) if isinstance(a, ast.Starred)]
+    env = None
+    if mod == "os" and name in _OS_ENV_AT:
+        at, keyword_ok = _OS_ENV_AT[name]
+        if kw is not None and not keyword_ok:
+            return f"{what} with env=: os.{name} takes it positionally only", ""
+        if kw is not None:
+            env = kw.value
+        elif starred and starred[0] <= at:
+            return f"{what} with a starred argument: the scan cannot find its env", ""
+        elif len(call.args) > at:
+            env = call.args[at]
+    elif mod == "os":
+        if kw is not None:
+            return f"{what} with env=: os.{name} takes it as its last argument", ""
+        if starred:
+            return f"{what} with a starred argument: the scan cannot find its env", ""
+        if len(call.args) > _OS_ENV_LAST_AFTER[name]:
+            env = call.args[-1]
+    elif kw is not None:
+        env = kw.value
+    if env is None:
+        return f"{what} without env", ""
+    text = ast.unparse(env)
+    if text == "None" or "os.environ" in text:
+        return f"{what} with env={text}", text
+    return None, text
+
+
+def _site_count_problems(matched: Counter, sites) -> list[str]:
+    return [f"{site} matched {matched[site]} time(s), want exactly 1" for site in sites if matched[site] != 1]
+
+
+def _spawn_problems(path: Path, root: Path = ROOT, held: dict | None = None, passthrough: dict | None = None,
+                    matched: Counter | None = None) -> list[str]:
+    held = _HELD_SEAMS if held is None else held
+    passthrough = _PASS_THROUGH if passthrough is None else passthrough
+    matched = Counter() if matched is None else matched
+    rel = path.relative_to(root).as_posix()
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     parent = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
-    annotations: set[int] = set()
+    annotations: set[int] = set()   # a type annotation is not a reference
     for n in ast.walk(tree):
-        held = [getattr(n, "annotation", None), getattr(n, "returns", None)]
-        for a in held:
+        for a in (getattr(n, "annotation", None), getattr(n, "returns", None)):
             if isinstance(a, ast.AST):
                 annotations.update(id(x) for x in ast.walk(a))
-    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+    # module-level functions defined once and never rebound by an assignment: a hand-on can be resolved to them
+    defined = Counter(n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    defined.update(t.id for n in tree.body if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+                   for t in (n.targets if isinstance(n, ast.Assign) else [n.target]) if isinstance(t, ast.Name))
+    funcs = {n.name: n for n in tree.body
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and defined[n.name] == 1}
 
-    def scope_of(n: ast.AST) -> ast.AST:
+    def func_of(n: ast.AST):
         while n in parent:
             n = parent[n]
-            if isinstance(n, scopes):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
                 return n
-        return tree
+        return None
 
-    funcs = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
     out: list[str] = []
-    todo: list[tuple[ast.AST, str, str]] = []   # (scope, alias name, what it holds)
-    for n in ast.walk(tree):
-        if not (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)) or id(n) in annotations:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            names = {a.name for a in node.names}
+            if (node.module in ("subprocess", "webbrowser")
+                    or (node.module == "os" and names & (_OS_SPAWNERS | {"*"}))
+                    or (node.module == "asyncio" and any(n.startswith("create_subprocess") for n in names))):
+                out.append(f"{rel}:{node.lineno} `from {node.module} import`: "
+                           "call it through the module so the scan sees the call")
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname and (a.name in ("subprocess", "webbrowser") or a.name == "os" and rel != _LAUNCH):
+                    out.append(f"{rel}:{node.lineno} `import {a.name} as {a.asname}`")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "webbrowser" \
+                and path.name != "_browser.py":
+            out.append(f"{rel}:{node.lineno} webbrowser.{node.func.attr}: open it through levain.launch.open_browser")
+        sp = _spawner(node)
+        if sp is None or id(node) in annotations:
             continue
-        key = (n.value.id, n.attr)
-        if key not in _SPAWN and key not in _NO_ENV:
-            continue
-        p = parent.get(n)
-        if isinstance(p, ast.Call) and p.func is n:
-            continue   # a direct call: checked above
-        what = f"{rel}:{n.lineno} {key[0]}.{key[1]}"
-        if key in _NO_ENV:
-            out.append(f"{what} held as a value: it cannot take an environment")
-            continue
-        holder = parent.get(p) if isinstance(p, ast.BoolOp) else p
-        if isinstance(p, ast.BoolOp) and isinstance(holder, ast.Call) and holder.func is p:
-            problem = _env_problem(holder, f"{what} (through `{ast.unparse(p)}`)")
+        where = f"{rel}:{node.lineno} {sp[0]}.{sp[1]}"
+        p = parent.get(node)
+        if isinstance(p, ast.Call) and p.func is node:          # a direct call
+            if rel == _LAUNCH and sp[0] == "os" and sp[1] not in _OS_NO_ENV:
+                continue
+            problem, env_text = _env_problem(p, sp, where)
+            fn = func_of(p)
+            site = (rel, getattr(fn, "name", ""), sp[1], env_text)
+            if problem and site in passthrough:
+                matched[site] += 1
+                continue
             if problem:
                 out.append(problem)
-        elif isinstance(holder, ast.arguments):
-            node = p if isinstance(p, ast.BoolOp) else n
-            positional = holder.posonlyargs + holder.args
-            if node in holder.defaults:
-                arg = positional[len(positional) - len(holder.defaults) + holder.defaults.index(node)]
-            else:
-                arg = holder.kwonlyargs[holder.kw_defaults.index(node)]
-            todo.append((parent[holder], arg.arg, what))
-        elif isinstance(holder, ast.Assign) and len(holder.targets) == 1 and isinstance(holder.targets[0], ast.Name):
-            todo.append((scope_of(holder), holder.targets[0].id, what))
-        else:
-            out.append(f"{what} held as a value the scan cannot follow: call it directly with env=")
-    seen: set[tuple[int, str]] = set()
-    while todo:
-        scope, name, what = todo.pop()
-        if (id(scope), name) in seen:
             continue
-        seen.add((id(scope), name))
-        for u in ast.walk(scope):
-            if not (isinstance(u, ast.Name) and u.id == name and isinstance(u.ctx, ast.Load)):
+        seam = _held_site(node, p, parent, func_of)
+        if seam is not None:
+            fn, param = seam
+            site = (rel, fn.name, param)
+            if held.get(site) == f"{sp[0]}.{sp[1]}":
+                matched[site] += 1
+                out += _seam_uses(fn, param, sp, rel, held, parent, funcs)
                 continue
-            p = parent[u]
-            if isinstance(p, ast.Call) and p.func is u:
-                problem = _env_problem(p, f"{rel}:{u.lineno} {name}(...) (holds {what})")
-                if problem:
-                    out.append(problem)
-                continue
-            q = parent.get(p) if isinstance(p, ast.BoolOp) else p
-            if isinstance(q, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in q.targets):
-                continue   # `run = run or subprocess.run`: the rebind is the alias itself
-            if isinstance(p, ast.keyword):
-                p, u = parent[p], p
-            callee = funcs.get(p.func.id) if isinstance(p, ast.Call) and isinstance(p.func, ast.Name) else None
-            if callee is not None:
-                params = callee.args.posonlyargs + callee.args.args
-                if isinstance(u, ast.keyword):
-                    todo.append((callee, u.arg, what))
-                    continue
-                if u in p.args and p.args.index(u) < len(params):
-                    todo.append((callee, params[p.args.index(u)].arg, what))
-                    continue
-            out.append(f"{rel}:{u.lineno} `{name}` (holds {what}) used where the scan cannot follow it")
+        out.append(f"{where} referenced as a value: call it directly, with env")
     return out
 
 
+def _held_site(node: ast.AST, p: ast.AST, parent: dict, func_of) -> tuple[ast.AST, str] | None:
+    """(function, parameter) when ``node`` is a parameter's default (``run=subprocess.run``) or the right of
+    ``run or subprocess.run`` on a parameter, called or rebound to that parameter; else None."""
+    if isinstance(p, ast.arguments) and isinstance(parent.get(p), (ast.FunctionDef, ast.AsyncFunctionDef)):
+        positional = p.posonlyargs + p.args
+        if node in p.defaults:
+            return parent[p], positional[len(positional) - len(p.defaults) + p.defaults.index(node)].arg
+        if node in p.kw_defaults:
+            return parent[p], p.kwonlyargs[p.kw_defaults.index(node)].arg
+        return None
+    if not (isinstance(p, ast.BoolOp) and isinstance(p.op, ast.Or) and len(p.values) == 2 and p.values[1] is node
+            and isinstance(p.values[0], ast.Name)):
+        return None
+    fn, param = func_of(p), p.values[0].id
+    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    a = fn.args
+    if param not in {x.arg for x in a.posonlyargs + a.args + a.kwonlyargs}:
+        return None
+    q = parent.get(p)
+    if isinstance(q, ast.Call) and q.func is p:
+        return fn, param
+    if isinstance(q, ast.Assign) and len(q.targets) == 1 and isinstance(q.targets[0], ast.Name) \
+            and q.targets[0].id == param:
+        return fn, param
+    return None
+
+
+def _seam_uses(fn: ast.AST, param: str, sp: tuple[str, str], rel: str, held: dict, parent: dict,
+               funcs: dict, seen: set | None = None) -> list[str]:
+    """Inside ``fn``, the table parameter ``param`` is only ever called with env (directly, or as ``(param or
+    <spawner>)(...)``), rebound by ``param = param or <spawner>``, or handed to a parameter of a module-level
+    function of the same module (defined once): a table entry is checked by its own row, any other such parameter
+    by this same rule, once. Every other use is refused: stored, aliased, returned, passed anywhere else."""
+    seen = set() if seen is None else seen
+    seen.add((id(fn), param, sp))
+    out: list[str] = []
+    what = f"(table seam {param}, holds {sp[0]}.{sp[1]})"
+    for u in ast.walk(fn):
+        if not (isinstance(u, ast.Name) and u.id == param):
+            continue
+        p = parent[u]
+        site_rebind = (isinstance(p, ast.Assign) and p.targets == [u] and isinstance(p.value, ast.BoolOp)
+                       and _spawner(p.value.values[-1]) == sp)
+        if not isinstance(u.ctx, ast.Load):
+            if not site_rebind:
+                out.append(f"{rel}:{u.lineno} `{param}` rebound {what}")
+            continue
+        call = p if isinstance(p, ast.Call) and p.func is u else None
+        if isinstance(p, ast.BoolOp) and p.values[0] is u and len(p.values) == 2 and _spawner(p.values[1]) == sp:
+            q = parent.get(p)
+            if isinstance(q, ast.Assign) and len(q.targets) == 1 and isinstance(q.targets[0], ast.Name) \
+                    and q.targets[0].id == param:
+                continue   # `run = run or subprocess.run`: the site itself
+            call = q if isinstance(q, ast.Call) and q.func is p else None
+        if call is not None:
+            problem, _ = _env_problem(call, sp, f"{rel}:{u.lineno} {param}(...) {what}")
+            if problem:
+                out.append(problem)
+            continue
+        handed = _handed_on(u, p, parent, funcs)
+        if handed is None:
+            out.append(f"{rel}:{u.lineno} `{param}` used other than as a call {what}")
+            continue
+        callee, q = handed
+        if (rel, callee.name, q) not in held and (id(callee), q, sp) not in seen:
+            out += _seam_uses(callee, q, sp, rel, held, parent, funcs, seen)
+    return out
+
+
+def _handed_on(u: ast.Name, p: ast.AST, parent: dict, funcs: dict) -> tuple[ast.AST, str] | None:
+    """(callee, parameter) when ``u`` is an argument of a call to a module-level function of the same module (defined
+    once), landing on a named parameter; else None."""
+    if isinstance(p, ast.keyword) and p.arg is not None:
+        call, name = parent[p], p.arg
+    elif isinstance(p, ast.Call) and u in p.args:
+        call, name = p, None
+        if any(isinstance(a, ast.Starred) for a in p.args[:p.args.index(u)]):
+            return None
+    else:
+        return None
+    callee = funcs.get(call.func.id) if isinstance(call.func, ast.Name) else None
+    if callee is None:
+        return None
+    a = callee.args
+    if name is None:
+        params = a.posonlyargs + a.args
+        i = call.args.index(u)
+        return (callee, params[i].arg) if i < len(params) else None
+    return (callee, name) if name in {x.arg for x in a.args + a.kwonlyargs} else None
+
+
 def test_every_child_levain_starts_is_given_an_explicit_environment() -> None:
-    problems = [p for src in _sources() for p in _spawn_problems(src)]
+    matched: Counter = Counter()
+    problems = [p for src in _sources() for p in _spawn_problems(src, matched=matched)]
+    problems += _site_count_problems(matched, [*_HELD_SEAMS, *_PASS_THROUGH])
     assert problems == [], "\n".join(problems)
 
 
@@ -301,31 +446,117 @@ def test_no_child_environment_is_built_from_a_copy_of_os_environ() -> None:
     assert hits == [], "use levain.launch.child_env: " + ", ".join(hits)
 
 
+def _scan(tmp_path: Path, source: str, held: dict | None = None, passthrough: dict | None = None):
+    bad = tmp_path / "bad.py"
+    bad.write_text(source)
+    matched: Counter = Counter()
+    problems = _spawn_problems(bad, tmp_path, held or {}, passthrough or {}, matched)
+    return problems, matched
+
+
+def _lines(problems: list[str]) -> set[int]:
+    return {int(p.split(":")[1].split()[0]) for p in problems}
+
+
 def test_the_scan_catches_a_call_without_env(tmp_path: Path) -> None:
-    bad = tmp_path / "bad.py"
-    bad.write_text("import subprocess, os\nsubprocess.run(['x'])\nos.system('x')\n"
-                   "subprocess.Popen(['x'], env=os.environ)\nos.execv('x', ['x'])\n"
-                   "subprocess.run(['x'], env={})\nsubprocess.run(['x'], env=None)\n"
-                   "subprocess.run(['x'], env=os.environ | {'A': 'b'})\nimport webbrowser\n"
-                   "webbrowser.open('u')\nfrom subprocess import run\nimport subprocess as sp\n")
-    assert len(_spawn_problems(bad, tmp_path)) == 9
+    problems, _ = _scan(tmp_path, "import subprocess, os\nsubprocess.run(['x'])\nos.system('x')\n"
+                        "subprocess.Popen(['x'], env=os.environ)\nos.execv('x', ['x'])\n"
+                        "subprocess.run(['x'], env={})\nsubprocess.run(['x'], env=None)\n"
+                        "subprocess.run(['x'], env=os.environ | {'A': 'b'})\nimport webbrowser\n"
+                        "webbrowser.open('u')\nfrom subprocess import run\nimport subprocess as sp\n")
+    assert _lines(problems) == {2, 3, 4, 5, 7, 8, 10, 11, 12}, "\n".join(problems)
 
 
-def test_the_scan_follows_a_spawner_held_as_a_value(tmp_path: Path) -> None:
-    bad = tmp_path / "bad.py"
-    bad.write_text("import subprocess\n"
-                   "def g(run=subprocess.run):\n    return run(['x'])\n"            # default, no env
-                   "def h(run=subprocess.run):\n    return _inner(run)\n"           # handed on ...
-                   "def _inner(run):\n    return run(['x'])\n"                      # ... and called bare
-                   "def k(run=None):\n    return (run or subprocess.run)(['x'])\n"  # call target, no env
-                   "def m(run=None):\n    run = run or subprocess.run\n    run(['x'])\n"
-                   "R = subprocess.Popen\nR(['y'])\n"                               # module alias
-                   "print(subprocess.run)\n"                                         # cannot follow
-                   "def ok(run=subprocess.run):\n    return run(['x'], env={})\n"
-                   "def ann(p: subprocess.Popen) -> subprocess.Popen:\n    return p\n")
-    problems = _spawn_problems(bad, tmp_path)
-    assert len(problems) == 6, "\n".join(problems)
-    assert not any(f"bad.py:{n} " in p for n in (16, 17, 18) for p in problems), "\n".join(problems)
+def test_the_scan_refuses_every_spawner_held_as_a_value(tmp_path: Path) -> None:
+    problems, _ = _scan(tmp_path, (
+        "import subprocess, os\n"
+        "def g(run=subprocess.run):\n"                        # 2: a default not in the table
+        "    return run(['x'], env={})\n"
+        "class A:\n"
+        "    ex: object = os.execve\n"                         # 5: annotated class attribute
+        "    run = subprocess.run\n"                           # 6: unannotated class attribute
+        "R = subprocess.Popen\n"                               # 7: alias
+        "def h(self):\n"
+        "    self.run = subprocess.run\n"                      # 9: attribute store
+        "    print(subprocess.run)\n"                          # 10: passed as an argument
+        "import os as o\n"                                     # 11: import alias
+        "from subprocess import run\n"                         # 12: from-import
+        "from os import execve\n"                              # 13: from-import of an os spawner
+        "def k(run=None):\n"
+        "    return (run or subprocess.run)(['x'], env={})\n"  # 15: `or` on a parameter not in the table
+        "def ann(p: subprocess.Popen) -> subprocess.Popen:\n"  # 16: annotations are not references
+        "    return p\n"))
+    assert _lines(problems) == {2, 5, 6, 7, 9, 10, 11, 12, 13, 15}, "\n".join(problems)
+
+
+def test_the_env_is_found_where_each_api_takes_it(tmp_path: Path) -> None:
+    problems, _ = _scan(tmp_path, (
+        "import os, subprocess\n"
+        "subprocess.run(['x'], env={})\n"                      # 2: clean
+        "os.execve('x', ['x'], {})\n"                          # 3: clean (positional slot)
+        "os.execve('x', ['x'], env={})\n"                      # 4: clean (execve takes env=)
+        "os.posix_spawn('x', ['x'], {})\n"                     # 5: clean
+        "os.execle('x', 'x', {})\n"                            # 6: clean (last positional)
+        "os.spawnve(0, 'x', ['x'], {})\n"                      # 7: clean
+        "os.posix_spawn('x', ['x'], env={})\n"                 # 8: positional-only API given env=
+        "os.execle('x', 'x', env={})\n"                        # 9: an `l` wrapper given env=
+        "os.execve('x', ['x'])\n"                              # 10: no env
+        "os.execve('x', *a)\n"                                 # 11: starred: env not findable
+        "os.execve('x', ['x'], os.environ)\n"                  # 12: the inherited env
+        "subprocess.run(['x'], **kw)\n"))                      # 13: env not findable
+    assert _lines(problems) == {8, 9, 10, 11, 12, 13}, "\n".join(problems)
+
+
+def test_a_table_seam_is_called_with_env_inside_its_function_and_goes_nowhere_else(tmp_path: Path) -> None:
+    names = ("f", "g", "h", "u", "s", "onward")
+    held = {("bad.py", n, "run"): "subprocess.run" for n in names}
+    problems, matched = _scan(tmp_path, (
+        "import subprocess\n"
+        "def f(run=subprocess.run):\n"
+        "    return run(['x'], env={})\n"                      # 3: clean
+        "def g(run=subprocess.run):\n"
+        "    return run(['x'])\n"                              # 5: called without env
+        "def h(run=subprocess.run):\n"
+        "    return helper(run)\n"                             # 7: handed to a same-module helper: followed
+        "def helper(run):\n"
+        "    return run\n"                                     # 9: returned, in the helper
+        "def u(run=None):\n"
+        "    run = run or subprocess.run\n"                    # 11: the site itself
+        "    run(['x'], env={})\n"                             # 12: clean
+        "    return run\n"                                     # 13: returned
+        "def s(self, run=subprocess.run):\n"
+        "    self.r = run\n"                                   # 15: stored
+        "def onward(run=subprocess.run):\n"
+        "    f(run=run)\n"                                     # 17: handed to a seam: clean
+        "    alias = run\n"                                    # 18: aliased
+        "    _go(['x'], run=run)\n"                            # 19: handed to a helper that calls it with env
+        "    twice(run)\n"                                     # 20: a helper name bound twice: not followed
+        "def _go(argv, *, run):\n"
+        "    return run(argv, env={})\n"
+        "def twice(run):\n"
+        "    return run(['x'], env={})\n"
+        "twice = None\n"),
+        held)
+    assert _lines(problems) == {5, 9, 13, 15, 18, 20}, "\n".join(problems)
+    assert _site_count_problems(matched, held) == []
+
+
+def test_the_pass_through_matches_one_named_call(tmp_path: Path) -> None:
+    src = "import os\ndef t(environ=None):\n    os.execve('x', ['x'], os.environb if environ is None else environ)\n"
+    site = ("bad.py", "t", "execve", "os.environb if environ is None else environ")
+    problems, matched = _scan(tmp_path, src, passthrough={site: "why"})
+    assert problems == [] and _site_count_problems(matched, [site]) == []
+    problems, _ = _scan(tmp_path, src)
+    assert _lines(problems) == {3}, "without the table entry it is an inherited env"
+    _, matched = _scan(tmp_path, src + src.replace("import os\n", ""), passthrough={site: "why"})
+    assert len(_site_count_problems(matched, [site])) == 1, "two calls"
+
+
+def test_the_site_count_wants_exactly_one() -> None:
+    site = ("m.py", "f", "run")
+    assert _site_count_problems(Counter({site: 1}), [site]) == []
+    assert len(_site_count_problems(Counter(), [site])) == 1
+    assert len(_site_count_problems(Counter({site: 2}), [site])) == 1
 
 
 # --- the console entry --------------------------------------------------------------------------

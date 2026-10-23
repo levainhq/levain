@@ -2680,11 +2680,10 @@ def phase_b_text(host: HostOS, gen: str, lock_fd: int, pool_fd: int, caller_uid:
 
 
 def exec_phase_b(host: HostOS, gen: str, lock_fd: int, pool_fd: int, caller_uid: int, *, python: str | None = None,
-                 tree: Path | None = None, entry: str | None = None, fault: Optional[Tuple[str, str]] = None,
-                 execve: Callable[[str, Sequence[str], Mapping[str, str]], object] = os.execve) -> None:
+                 tree: Path | None = None, entry: str | None = None, fault: Optional[Tuple[str, str]] = None) -> None:
     """R4 [r2: X-4]: both lock descriptors made inheritable (a flock belongs to the open file description, so it
     survives the exec), then ``execve`` into ``gen`` with :func:`levain.launch.child_env` (never this process's whole
-    environment): same PID, so sudo still waits on it. Returns only through a test's ``execve``."""
+    environment): same PID, so sudo still waits on it. Returns only through a test's patched ``os.execve``."""
     python = python or root_tree.ROOT_PYTHON[host]
     text = phase_b_text(host, gen, lock_fd, pool_fd, caller_uid, tree=tree, entry=entry, fault=fault)
     os.set_inheritable(lock_fd, True)
@@ -2692,7 +2691,7 @@ def exec_phase_b(host: HostOS, gen: str, lock_fd: int, pool_fd: int, caller_uid:
     try:
         sys.stdout.flush()
         sys.stderr.flush()
-        execve(python, [python, root_tree.PY_FLAGS, "-c", text], child_env())
+        os.execve(python, [python, root_tree.PY_FLAGS, "-c", text], child_env())
     except BaseException:
         os.set_inheritable(lock_fd, False)    # the exec did not happen: nothing may inherit them now
         os.set_inheritable(pool_fd, False)
@@ -2762,7 +2761,6 @@ def _restore_phase_a(host: HostOS, cell: root_tree.Staged, prior: Intent | None,
 def repair_handover(plan: InstallPlan, g: Gathered, lock_fd: int, caller_uid: int, err: TextIO, *,
                     apply: Callable[[InstallPlan, TextIO], Optional[str]] = apply_steps,
                     probe: Callable[..., tuple[str, ...]] = run_probe,
-                    execve: Callable[[str, Sequence[str], Mapping[str, str]], object] = os.execve,
                     python: str | None = None,
                     tree: Path | None = None, intent_path: Path | None = None, entry: str | None = None,
                     fault: Optional[Tuple[str, str]] = None) -> None:
@@ -2795,8 +2793,7 @@ def repair_handover(plan: InstallPlan, g: Gathered, lock_fd: int, caller_uid: in
         journal = replace(plan.intent, generation=cell.target) if plan.intent is not None else None
         probe(host, cell.target, g.facts.install_shape, journal, fault=fault)
         err.write(f"levain install-helper: {cell.target} staged and probed; handing over to it\n")
-        exec_phase_b(host, cell.target, lock_fd, q.fd, caller_uid, python=python, tree=tree, entry=entry, fault=fault,
-                     execve=execve)
+        exec_phase_b(host, cell.target, lock_fd, q.fd, caller_uid, python=python, tree=tree, entry=entry, fault=fault)
     except BaseException as e:
         undone = _restore_phase_a(host, cell, prior, current, intent_path=intent_path, tree=tree)
         if not undone:

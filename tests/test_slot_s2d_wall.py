@@ -13,6 +13,7 @@ from levain.slot import Refused
 from levain.slot import wall
 from levain.slot.ids import SlotId
 from levain.slot.pf import anchor_rules
+from tests.execve_guard import refuse_real_execve, using
 
 SESSION = "s-0123456789abcdef"
 OTHER = "s-fedcba9876543210"
@@ -79,13 +80,15 @@ class FakeOS:
             read_fd=self._w("read_fd", lambda fd, cap: self.spec_bytes),
             read_file=self._w("read_file", self._read_file), chdir=self._w("chdir", lambda p: None),
             list_fds=lambda: sorted(self.open_fds), close=self._w("close", self.open_fds.discard),
-            set_inheritable=lambda fd, v: self.inheritable.add(fd), access_x=lambda p: p in self.path,
-            execve=self._w("execve", lambda p, a, e: None), dup2=self._w("dup2", lambda a, b: None),
+            set_inheritable=self._inh, access_x=lambda p: p in self.path,
+            dup2=self._w("dup2", lambda a, b: None),
             getpid=lambda: 4242, write_file=self._w("write_file", lambda p, t: None),
             read_text=self._w("read_text", lambda p: self.files.get(p, "")))
         # s5 §5b A6: the fake kernel's session keyring (an export stage on Linux joins a fresh one before the drop)
         self.session_keyring = 100
         self.calls.keyctl = self._w("keyctl", self._keyctl)
+        # wall calls os.execve itself: the module's guard routes it here (tests/execve_guard.py)
+        self.execve = self._w("execve", lambda p, a, e: None)
 
     def _keyctl(self, op, arg2, arg3=0):
         if op == 1 and arg2 == 0:                  # KEYCTL_JOIN_SESSION_KEYRING, anonymous
@@ -95,8 +98,13 @@ class FakeOS:
             return self.session_keyring
         raise OSError(errno.EINVAL, "keyctl")
 
+    def _inh(self, fd, v):
+        using(self)
+        self.inheritable.add(fd)
+
     def _w(self, name, fn):
         def call(*a):
+            using(self)
             self.log.append((name,) + a)
             f = self.faults.get(name)
             if f == "raise":
@@ -165,6 +173,11 @@ def fake_for(sp, *, linux=False, faults=None, extra_files=None, fds=(0, 1, 2), p
         files[sp.profile] = PROFILE_TEXT
     files.update(extra_files or {})
     return FakeOS(faults, linux=linux, files=files, fds=fds, spec_bytes=sp.to_json(), path=path)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_execve(monkeypatch):
+    yield from refuse_real_execve(monkeypatch, wall.os, route=True)
 
 
 @pytest.fixture
