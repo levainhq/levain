@@ -1,0 +1,93 @@
+"""Message a seat from the cockpit (Phill 10-23, "2a"): a tap on a seat in the agents graph presses that seat's chip on the inbox compose
+card and focuses its message box; the desk (`fanin`) is pressed by default; at a phone width the chips are a picker holding the same
+values. Real page in headless Chrome over the real kernel: the inbox panel declares a typed compose (the roster's chips are its enum),
+and a literal topology value is painted into the header the way the Agents-lens tests do."""
+from __future__ import annotations
+
+import json
+
+from levain.cockpit import ProviderSpec, Read, RowIn
+from levain.cockpit.providers import build_default_cockpit
+from levain.writes import ActionVerb
+from tests.test_cockpit_f12b_topology_view import NARROW, TV, _paint, _value
+from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_k2a import _serve
+from tests.test_cockpit_k7_build import BUILD, DESKTOP, _sessions_fixture
+
+ENUM = ["cli", "fanin", "seat:ledgerline"]          # the group label of n1..n3 is "ledgerline"; "tally" (n4, n5) is a lane: not in the enum
+COMPOSE = {"verb": "send_inbox", "fields": [{"name": "message", "type": "text", "label": "Message"},
+                                            {"name": "for", "type": "recipient", "label": "To (none = everyone)", "enum": ENUM}]}
+CHIPS = "[...document.querySelectorAll('[data-ck-compose=recipient]')]"
+PRESSED = CHIPS + ".filter(c => c.getAttribute('aria-pressed') === 'true').map(c => c.dataset.value)"
+PICK = "document.querySelector('[data-ck-compose=recipient-pick]')"
+PRIME = [{"eval": "document.querySelector('#ck-hlens [data-tv=agents]').click(); 1"}, {"until": TV + ".dataset.lens == 'agents'"}]
+
+
+def _serve_inbox(src):
+    ck = build_default_cockpit(src)
+    ck.register(ProviderSpec(id="inbox", kind="list", title="Inbox", priority="feed", order="time.desc", version_fields=("id",),
+                             facets=frozenset({"source", "for", "at"}), verbs=("send_inbox",), compose=COMPOSE, read=lambda c: Read(rows=(RowIn("a", "hello", facets={"source": "bridge", "for": "cli", "at": "2026-10-23T11:00:00+00:00"}, stored={"id": "a"}),))))
+    verb = ActionVerb(handler=lambda p: {"summary": "sent"}, label="Send to inbox", fields=("message", "for"))
+    return _serve(src, cockpit=ck, extra_verbs={"send_inbox": verb}, surface_tokens={"browser": "T"}, install_class="reported")
+
+
+def _run(tmp_path, src, steps, first=DESKTOP, page=BUILD):
+    with _serve_inbox(src) as (url, _httpd):
+        return _drive(tmp_path, f"{url}/{page}", [first, {"until": "document.querySelector('[data-ck-compose=recipient]')"}, *steps])["values"]
+
+
+def _tap(node: str) -> str:
+    return "%s.querySelector('.tv-gnode[data-node=%s]').dispatchEvent(new MouseEvent('click', {bubbles: true})); 1" % (TV, node)
+
+
+@needs_browser
+def test_the_desk_is_pressed_by_default_and_unpressing_it_leaves_none(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    addr = "(document.querySelector('.ck-addr') || {}).textContent"
+    out = _run(tmp_path, src, [{"eval": "JSON.stringify([%s, %s, %s])" % (PRESSED, CHIPS + ".map(c => c.dataset.value)", addr)},
+                               {"eval": CHIPS + ".find(c => c.dataset.value === 'fanin').click(); JSON.stringify([%s, %s])" % (PRESSED, addr)}], page="#write_token=T")
+    pressed, values, text = json.loads(out[-2])
+    assert pressed == ["fanin"] and values == ENUM and text == "to fanin", out
+    pressed, text = json.loads(out[-1])
+    assert pressed == [] and text == "to everyone", out                        # none pressed still means everyone
+
+
+@needs_browser
+def test_a_tap_on_a_seat_presses_its_chip_and_focuses_the_box_but_a_lane_keeps_its_page(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    seat = _tap("n3")      # n3 is in group "ledgerline": chip "seat:ledgerline" is in the enum
+    lane = _tap("n4")      # n4 is in group "tally": "seat:tally" is not (a lane)
+    state = ("JSON.stringify([%s, document.activeElement && document.activeElement.className, document.body.dataset.mode, "
+             "!!document.getElementById('levain-modal'), (document.querySelector('[data-ck-compose=recipient]').closest('[data-ck-panel]') || {dataset: {}}).dataset.modes])") % PRESSED
+    out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_value(), "agents")}, {"eval": lane}, {"eval": state},
+                               {"eval": "document.querySelector('#levain-modal .modal-close').click(); 1"},
+                               {"eval": seat},
+                               {"until": "document.activeElement.classList.contains('tray-dump-ta') && " + state}])   # the box lands a frame later, after the tab change redraws it
+    pressed, _focus, _mode, modal, _modes = json.loads(out[-4])
+    assert pressed == ["fanin"] and modal is True, out                         # the lane: the desk stays pressed, its agent page opens
+    pressed, focus, mode, modal, modes = json.loads(out[-1])
+    assert pressed == ["seat:ledgerline"] and "tray-dump-ta" in focus and mode == "board" and modal is False, out
+
+
+@needs_browser
+def test_a_phone_width_holds_the_same_values_in_a_picker_that_agrees_with_the_chips(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    probe = ("JSON.stringify({w: window.innerWidth, opts: [...%s.options].filter(o => !o.disabled).map(o => o.value), sel: %s.value, "
+             "pickShown: getComputedStyle(%s).display !== 'none', chipsShown: %s.some(c => getComputedStyle(c).display !== 'none')})") % (PICK, PICK, PICK, CHIPS)
+    choose = "%s.value = 'seat:ledgerline'; %s.dispatchEvent(new Event('change', {bubbles: true})); JSON.stringify([%s, %s.value])" % (PICK, PICK, PRESSED, PICK)
+    every = "%s.value = ''; %s.dispatchEvent(new Event('change', {bubbles: true})); %s" % (PICK, PICK, PRESSED)
+    out = _run(tmp_path, src, [{"eval": probe}, {"eval": choose}, {"eval": every}], first=NARROW, page="#write_token=T")
+    got = json.loads(out[-3])
+    assert got["w"] < 720 and got["opts"] == ["", *ENUM] and got["sel"] == "fanin", got          # "everyone" first, the desk chosen
+    assert got["pickShown"] is True and got["chipsShown"] is False, got
+    assert json.loads(out[-2]) == [["seat:ledgerline"], "seat:ledgerline"], out                   # the picker presses the chip
+    assert out[-1] == [], out                                                          # "everyone" presses none
+
+
+@needs_browser
+def test_a_wide_page_shows_the_chips_and_not_the_picker(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    probe = "JSON.stringify([getComputedStyle(%s).display, %s.every(c => getComputedStyle(c).display !== 'none'), window.innerWidth])" % (PICK, CHIPS)
+    out = _run(tmp_path, src, [{"eval": probe}], page="#write_token=T")
+    none, chips, width = json.loads(out[-1])
+    assert none == "none" and chips is True and width >= 1000, out

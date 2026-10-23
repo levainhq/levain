@@ -3611,6 +3611,12 @@
     ta.style.height = (ta.scrollHeight + ta.offsetHeight - ta.clientHeight) + "px";
   }
 
+  // The reader chip that is the desk, pressed by default on a compose card that offers it; the value of the picker's option for
+  // a choice of several; and the pick a compose card keeps across the rebuild of its box (by panel), until a send lands.
+  const DESK_CHIP = "fanin";
+  const SEVERAL_VALUE = "*several";
+  const composePick = Object.create(null);
+
   function buildActionBox(action, spec) {
     const box = el("div", "tray-dump");
     // The at-most-once key for an idempotent verb is stable per SEND CONTENT: a retry of identical
@@ -3633,7 +3639,11 @@
     for (const f of fields) {
       if (!f || typeof f !== "object" || !f.name) continue;
       if (f.kind === "multiselect" && f.chips) {
-        // the KE compose card's recipient chips: toggle buttons, none pressed = the field is omitted = everyone
+        // the KE compose card's recipient chips: toggle buttons. The desk (DESK_CHIP) is pressed when it is in the enum and nothing
+        // else was chosen; un-pressing it leaves none pressed = the field is omitted = everyone. The enum is the one the panel head
+        // carries NOW (this builds at every render and refetch): a seat chip that left the roster is not here, so it cannot be pressed.
+        // At a phone width the same values are a <select> (a pick list holds a long roster; CSS shows one of the two), and every
+        // change goes through one setter so chips, picker, address line and the kept pick agree.
         const group = el("div", "ck-to");
         group.appendChild(el("span", "ck-to-label", "To"));
         const chips = [];
@@ -3646,16 +3656,38 @@
           chip.setAttribute("aria-pressed", "false");
           chip.setAttribute("data-ck-compose", "recipient");
           chip.addEventListener("click", () => {
-            chip.setAttribute("aria-pressed", chip.getAttribute("aria-pressed") === "true" ? "false" : "true");
-            chipAddr();
+            setTo(chips.filter((c) => (c === chip) !== (c.getAttribute("aria-pressed") === "true")).map((c) => c.dataset.value));
           });
           group.appendChild(chip);
           chips.push(chip);
         }
+        const pick = el("select", "rc-pick");
+        pick.setAttribute("aria-label", f.label ? String(f.label) : "To");
+        pick.setAttribute("data-ck-compose", "recipient-pick");
+        pick.appendChild(Object.assign(el("option", null, "everyone"), { value: "" }));
+        for (const c of chips) pick.appendChild(Object.assign(el("option", null, c.textContent), { value: c.dataset.value }));
+        const several = Object.assign(el("option", null, "several readers"), { value: SEVERAL_VALUE, hidden: true, disabled: true });
+        pick.appendChild(several);
+        pick.addEventListener("change", () => setTo(pick.value === "" || pick.value === SEVERAL_VALUE ? [] : [pick.value]));
+        group.appendChild(pick);
         group.appendChild(el("span", "ck-to-hint", "none selected = everyone"));
         box.insertBefore(group, box.firstChild);
-        controls.push({ f: f, nodes: chips,
-                        read: () => chips.filter((c) => c.getAttribute("aria-pressed") === "true").map((c) => c.dataset.value) });
+        const pressedNow = () => chips.filter((c) => c.getAttribute("aria-pressed") === "true").map((c) => c.dataset.value);
+        function setTo(values, remember) {
+          const want = new Set(values);
+          for (const c of chips) c.setAttribute("aria-pressed", want.has(c.dataset.value) ? "true" : "false");
+          const now = pressedNow();
+          pick.value = now.length === 1 ? now[0] : (now.length ? SEVERAL_VALUE : "");
+          if (remember !== false) composePick[pickKey] = now;
+          chipAddr();
+        }
+        // a rebuild of this box (every refetch of the panel) keeps what the person chose, as far as it is still in the enum
+        const pickKey = String(action.panel || action.verb);
+        const kept = composePick[pickKey];
+        const inEnum = new Set(chips.map((c) => c.dataset.value));
+        const keptNow = Array.isArray(kept) ? kept.filter((v) => inEnum.has(v)) : null;
+        const start = keptNow && (keptNow.length || !kept.length) ? keptNow : (inEnum.has(DESK_CHIP) ? [DESK_CHIP] : []);
+        controls.push({ f: f, nodes: chips.concat([pick]), read: pressedNow, set: setTo, chips: chips, pickKey: pickKey, initial: start });
         continue;
       }
       if (f.kind === "multiselect") {
@@ -3703,6 +3735,10 @@
       addr.textContent = "to " + (to.length ? to.join(", ") : "everyone");
     }
     if (addr) { chipAddr(); row.appendChild(addr); }
+    if (chipCtl) {
+      chipCtl.set(chipCtl.initial, false);
+      box.ckPick = (values) => chipCtl.set(values);   // the agents graph's tap on a seat (messageTo, below)
+    }
     const msg = el("span", "edit-msg", "");
     row.append(go, msg);
     box.appendChild(row);
@@ -3720,7 +3756,17 @@
     const failed = (res) => {
       setDisabled(false);
       showFail(msg, res, "failed");
+      // a seat that left the roster since the chips were drawn: the kernel refuses with a plain error naming no live seat
+      const text = String((res && (res.message || res.error)) || "");
+      if (chipCtl && /no live seat/i.test(text)) {
+        msg.textContent = "that seat is gone, choose again";
+        chipCtl.set(chipCtl.chips.filter((c) => c.getAttribute("aria-pressed") === "true" && !/^seat:/.test(c.dataset.value)).map((c) => c.dataset.value));
+        delete composePick[chipCtl.pickKey];
+        const V = window.LevainCockpitView;
+        if (V && typeof V.refetchPanel === "function" && action.panel) { try { V.refetchPanel(action.panel); } catch (_) { /* the next poll redraws the chips */ } }
+      }
     };
+    const sent = () => { if (chipCtl) delete composePick[chipCtl.pickKey]; };
 
     // ── async-job (spec.job) result area + poll loop ──
     // A job verb PROPOSES (commitJob — NO board reload) then polls /job.json. The result lives in
@@ -3778,7 +3824,7 @@
       if (!spec.confirm_required) {
         setDisabled(true); msg.className = "edit-msg busy"; msg.textContent = "…";
         if (spec.job) { startJob(c.params, sendKey).then(() => setDisabled(false)); return; }
-        commitAction(action.verb, c.params, false, sendKey, action.panel).then((res) => { if (!(res && res.ok)) failed(res); });
+        commitAction(action.verb, c.params, false, sendKey, action.panel).then((res) => { if (res && res.ok) sent(); else failed(res); });
         return;
       }
       // confirm step (the fat-finger gate): swap the send button for a confirm/cancel pair AND
@@ -3816,7 +3862,7 @@
           return;
         }
         const res = await commitAction(action.verb, c.params, true, sendKey, action.panel);
-        if (res && res.ok) return;  // re-rendered → this box is gone, replaced fresh
+        if (res && res.ok) { sent(); return; }  // re-rendered → this box is gone, replaced fresh
         close(); failed(res);
       });
     });
@@ -5630,7 +5676,39 @@
     }
   }
 
+  // The agents graph's tap on a seat: press exactly that seat's chip on the compose card, bring the card into view and focus its message
+  // box. A seat is messageable IFF its chip id is among the chips the card holds NOW (the enum changes with the roster; a lane, the
+  // desk and an exited seat are never in it): a false answer means "not a seat you can message", and the caller keeps its own click.
+  function messageTo(chipId) {
+    if (typeof chipId !== "string" || !chipId) return false;
+    const chip = Array.from(document.querySelectorAll('[data-ck-compose="recipient"]'))
+      .find((c) => c.dataset.value === chipId && !c.closest("#levain-modal") && !c.disabled);
+    const box = chip ? chip.closest(".tray-dump") : null;
+    if (!chip || !box || typeof box.ckPick !== "function") return false;
+    const panel = chip.closest("[data-ck-panel]");
+    const K = layoutKit();
+    if (panel) {
+      if (K && typeof K.revealTab === "function") K.revealTab(panel);   // the card is on another tab: show the tab that has it
+      if (panel.classList.contains("ck-collapsed")) {                  // folded: its own fold button opens it
+        const fold = panel.querySelector(".phead .ck-lay-fold");
+        if (fold && !fold.disabled) fold.click();
+      }
+    }
+    box.ckPick([chipId]);
+    // a tab change redraws the board, which rebuilds this box (it keeps the pick): land again on the box that is there a frame later
+    const land = () => {
+      const c = Array.from(document.querySelectorAll('[data-ck-compose="recipient"]')).find((x) => x.dataset.value === chipId && !x.closest("#levain-modal"));
+      const b = c ? c.closest(".tray-dump") : null, ta = b ? b.querySelector(".tray-dump-ta") : null;
+      if (!ta || document.activeElement === ta) return;
+      if (typeof b.scrollIntoView === "function") b.scrollIntoView({ block: "center" });
+      if (typeof ta.focus === "function") ta.focus({ preventScroll: true });
+    };
+    land();
+    if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(() => window.requestAnimationFrame(land));
+    return true;
+  }
+
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
-  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
+  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, messageTo, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();

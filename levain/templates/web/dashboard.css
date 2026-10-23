@@ -1538,6 +1538,10 @@ body.ke .tray-dump-btn:hover { filter: brightness(1.08); }
 .rc-chip[aria-pressed="true"] { background: var(--card-2); color: var(--text); border-color: var(--label); }
 .rc-chip:disabled { opacity: .45; cursor: default; }
 .rc-chip:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
+/* the recipient picker: the same values as the chips, shown instead of them at the phone width (the cockpit's 720px rule) */
+.rc-pick { display: none; font: var(--fw-medium) var(--fs-meta) var(--sans); color: var(--text); background: var(--card-2); border: 1px solid var(--hair-2); border-radius: var(--r-pill); padding: var(--sp-1) var(--sp-3); max-width: 100%; min-width: 0; }
+.rc-pick:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
+@media (max-width: 720px) { .ck-to .rc-chip, .ck-to .ck-to-hint { display: none; } .ck-to .rc-pick { display: inline-block; } }   /* the picker has its own "everyone" */
 .ck-addr { font: var(--fw-regular) var(--fs-meta) var(--mono); color: var(--label); }
 body.ke .ck-rowaddr { flex: 1 0 100%; font: var(--fw-regular) var(--fs-meta) var(--mono); color: var(--label); }
 body.ke .ck-rowaddr b { color: var(--text); font-weight: var(--fw-semibold); }
