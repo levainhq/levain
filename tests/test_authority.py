@@ -1200,7 +1200,9 @@ def test_a_cockpit_act_signed_without_user_presence_is_refused_like_a_link(monke
     pk = _sk_public_key()
     key = SimpleNamespace(fingerprint=FAKE_FP, principal="laptop", public_key=pk, active=True, custody="fido")
     authority = SimpleNamespace(active_keys=lambda: [key], key=lambda fp: key if fp == FAKE_FP else None)
-    me = SimpleNamespace(data_root=tmp_path, ssh_keygen="/usr/bin/ssh-keygen")
+    # the stand-in Broker carries the static helpers _verify calls since K8 (the carried key, the derived custody)
+    me = SimpleNamespace(data_root=tmp_path, ssh_keygen="/usr/bin/ssh-keygen",
+                         _carried_key=broker_mod.Broker._carried_key, _derived_passkey=broker_mod.Broker._derived_passkey)
     monkeypatch.setattr(broker_mod, "verify_cockpit_signature",
                         lambda *a, **kw: CockpitVerdict(VERIFIED, "laptop", FAKE_FP))
     no_touch = _armored_sshsig(pk, "sk-ssh-ed25519@openssh.com", flags=0x04)

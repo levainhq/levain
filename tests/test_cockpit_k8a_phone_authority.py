@@ -496,10 +496,17 @@ def test_levainsign_signs_only_what_a_review_sheet_showed_and_only_a_waiting_pen
 def test_a_key_whose_material_is_a_passkey_never_signs_as_a_laptop_key(world):
     # B6-C: the custody that picks the namespace and the checks is derived from the key material and must equal the
     # stored one: a WebAuthn passkey (an rp-host application) declared custody fido does not sign in levain-cockpit
+    # Since custody K1 the enrol door refuses that enrolment, so the key exists only in a log written before the door
+    # (pre_door), read fresh by this levain: the broker refuses it as QUARANTINED, a reason that names the custody.
+    import levain.authority as auth
+    from tests.test_passkey_custody_derived import pre_door
+
     w = world
     mis = SoftPasskey()
     assert w.b.db is not None
-    enrol(w.b.db, mis, "display-phone", by=w.laptop, custody="fido")    # type: ignore[arg-type]
+    with pre_door():
+        enrol(w.b.db, mis, "display-phone", by=w.laptop, custody="fido")    # type: ignore[arg-type]
+    auth.PROCESS_CACHE.clear()
     t2 = _edit(w, 1, cred=BROWSER, tier="T2")
     e = _refused("bad_signature", w.b.submit, t2["pending_id"], mis.sign(t2["record"].encode(), COCKPIT_NAMESPACE))
     assert "custody" in str(e) and _state(w, t2["pending_id"]) == "WAITING" and _text(w.spores, 1) == "seed 1"
