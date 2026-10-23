@@ -1913,9 +1913,11 @@ def reset_hint(data_root: Path | str) -> str:
     return f"`levain cockpit anchor reset --signing-key {KEY_WORD} --data-root {shlex.quote(str(data_root))}`"
 
 
-def init_hint(data_root: Path | str) -> str:
-    """The remedy for an empty log: the whole `levain cockpit ledger init` argv, this data root filled in."""
-    return f"`levain cockpit ledger init --signing-key {KEY_WORD} --data-root {shlex.quote(str(data_root))}`"
+def init_hint(data_root: Path | str, signing_key: Path | str = KEY_WORD) -> str:
+    """The remedy for an empty log: the whole `levain cockpit ledger init` argv, this data root filled in (and the
+    signing key, where the caller holds one: `levain cockpit key create` has just made it)."""
+    return (f"`levain cockpit ledger init --signing-key {shlex.quote(str(signing_key))} "
+            f"--data-root {shlex.quote(str(data_root))}`")
 
 
 def anchor_path(data_root: Path | str) -> Path:

@@ -3276,6 +3276,9 @@ def _cmd_cockpit_sign(args: argparse.Namespace) -> int:
 
 
 def _cmd_cockpit_key_create(args: argparse.Namespace) -> int:
+    import shlex as _shlex
+
+    from levain.authority import init_hint as _init_hint
     from levain.cockpit import custody as _custody
     from levain.cockpit.keys import fingerprint_of
 
@@ -3299,8 +3302,13 @@ def _cmd_cockpit_key_create(args: argparse.Namespace) -> int:
           + (f"; CTK identity {made.ctk_hash}, label {made.label}" if made.ctk_hash else ""))
     print(f"public key: {made.public_path}")
     print(_GUARANTEE[made.custody])
-    print(f"next: `levain cockpit ledger init --signing-key {made.path}` for a new log, or `levain cockpit "
-          f"enroll {made.public_path} --signing-key <an enrolled laptop-presence key>` (the custody is read "
+    try:
+        root: Path | str = _cockpit_root(argparse.Namespace(path=Path.cwd(), data_root=None))
+    except (SystemExit, Exception):  # noqa: BLE001 - no install here: the operator names the cockpit's directory
+        root = "DATA_ROOT"
+    print(f"next: {_init_hint(root, made.path)}"
+          f"{' (DATA_ROOT: the cockpit directory)' if root == 'DATA_ROOT' else ''} for a new log, or `levain cockpit "
+          f"enroll {_shlex.quote(str(made.public_path))} --signing-key <an enrolled laptop-presence key>` (the custody is read "
           "from the key's sidecar)")
     return 0
 

@@ -130,6 +130,7 @@ def _after_stop(word: str, state: dict) -> str:
 
 def _offer(install: Path, adapter: str, *, interactive: bool, emit: Callable[[str], None],
            input_fn: Callable[[str], str], clock: Callable[[], datetime] | None, state: dict) -> None:
+    from levain.authority import init_hint
     from levain.cockpit.consent import utc_stamp
     from levain.cockpit.keys import KeyError_, keys
     from levain.consent.grants import list_grants
@@ -162,7 +163,7 @@ def _offer(install: Path, adapter: str, *, interactive: bool, emit: Callable[[st
         return
     if not rows:
         emit(f"  default grant: not offered: it would cover {covers}; it needs an authority log first "
-             f"(`levain cockpit ledger init`), then `levain init --force` offers it")
+             f"({init_hint(root)}), then `levain init --force` offers it")
         return
     if why is not None:
         emit(f"  default grant: not offered: nothing may sign the authority log at {root} now ({why})")

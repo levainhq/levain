@@ -66,3 +66,39 @@ def test_every_authority_not_initialised_remedy_is_a_complete_command_the_parser
         ns = _parsed(_argv(err, laptop.path), monkeypatch)
         assert ns.func.__name__ == "_cmd_cockpit_ledger_init", (case, err)
         assert (ns.data_root, ns.signing_key) == (root, laptop.path), (case, err)
+
+
+def test_key_create_and_default_grant_hints_are_complete_commands_the_parser_takes(tmp_path: Path, monkeypatch,
+                                                                                    capsys) -> None:
+    """The two printers that named `ledger init` outside a refusal: `key create`'s "next:" line (the key it just made
+    is the signing key; the root is the one `--path` defaults to, cwd's) and the default-grant offer
+    (its cockpit root is in hand, here with a space in it)."""
+    from types import SimpleNamespace
+
+    from levain import cli
+    from levain.cockpit import custody
+    from levain.cockpit import keys as keys_mod
+    from levain.consent import default_grants
+
+    key = tmp_path / "k ey" / "made"
+    made = SimpleNamespace(path=key, public_path=Path(str(key) + ".pub"), public_key="pk", custody="passphrase",
+                           ctk_hash=None, label="made")
+    monkeypatch.setattr(custody, "create_passphrase", lambda d, label: made)
+    monkeypatch.setattr(keys_mod, "fingerprint_of", lambda pk: "SHA256:x")
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["cockpit", "key", "create", "--custody", "passphrase", "--dir", str(tmp_path)]) == 0
+    nxt = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("next:"))
+    ns = _parsed(_argv(nxt, key), monkeypatch)
+    assert ns.func.__name__ == "_cmd_cockpit_ledger_init", nxt
+    assert (ns.data_root, ns.signing_key) == (tmp_path.resolve() / ".levain" / "cockpit", key), nxt
+
+    root = tmp_path / "a cockpit"
+    monkeypatch.setattr(default_grants, "_hook_root", lambda adapter: root)
+    said: list[str] = []
+    adapter = next(iter(default_grants._AGENTS))
+    default_grants._offer(tmp_path, adapter, interactive=False, emit=said.append, input_fn=input, clock=lambda: NOW,
+                          state={})
+    line = next(m for m in said if "needs an authority log first" in m)
+    ns = _parsed(_argv(line, key), monkeypatch)
+    assert ns.func.__name__ == "_cmd_cockpit_ledger_init", line
+    assert (ns.data_root, ns.signing_key) == (root, key), line
