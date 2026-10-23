@@ -343,8 +343,10 @@ def test_keys_main_builds_the_real_credwriter_as_cred_lifecycle(monkeypatch, tmp
     async def fake_serve(keys, *a):
         keys.trigger()
         await keys.wait_done()
+        await keys.ledger.aclose(1.0)   # never attached here: it closes its own fd
         return 0
 
+    (tmp_path / "keys").mkdir(mode=0o700)   # L/keys, where main() opens the ledger (3c-1)
     monkeypatch.setattr(K, "Keys", Spy)
     monkeypatch.setattr(K, "_serve", fake_serve)
     monkeypatch.setattr(K, "install_log", lambda lib_root: None)
@@ -369,7 +371,7 @@ def test_keys_reader_does_not_follow_a_linked_cred_dir(tmp_path):
     (real / f"{NAME}.json").write_bytes(C.render(_fields(), NAME)[0])
     (tmp_path / "keys").mkdir(mode=0o700)
     (tmp_path / "keys" / "cred").symlink_to(real)
-    k = K.Keys(unmetered=True, lib_root=str(tmp_path))
+    k = K.Keys(lib_root=str(tmp_path))
     with pytest.raises(Refused) as e:
         k._cred_store()
     assert e.value.name == "credential-unavailable"
@@ -565,8 +567,10 @@ def test_p5_keys_main_opens_the_writers_directory_before_serve_counts(monkeypatc
     async def fake_serve(keys, *a):
         seen["dir_fd"] = keys.cred_lifecycle._dir_fd    # what _serve's count_open_fds would see
         seen["reader"] = keys.creds
+        seen["ledger"] = keys.ledger is not None and keys.ledger.path == str(tmp_path / "keys" / "ledger.jsonl")
         keys.trigger()
         await keys.wait_done()
+        await keys.ledger.aclose(1.0)   # never attached here: it closes its own fd
         return 0
 
     monkeypatch.setattr(K, "_serve", fake_serve)
@@ -576,12 +580,13 @@ def test_p5_keys_main_opens_the_writers_directory_before_serve_counts(monkeypatc
                  "--test-single-uid"])
     assert rc == 0 and seen["dir_fd"] is not None
     assert seen["reader"] is not None                  # the reader's directory too (the item flagged after P5)
+    assert seen["ledger"] is True                      # and the ledger, at L/keys/ledger.jsonl (3c-1)
 
 
 def test_the_readers_lazy_directory_is_one_fd_and_open_cred_store_is_best_effort(tmp_path, caplog):
     from levain.broker import keys as K
 
-    k = K.Keys(unmetered=True, lib_root=str(tmp_path))
+    k = K.Keys(lib_root=str(tmp_path))
     with caplog.at_level(logging.WARNING):
         assert k.open_cred_store() is False and k.creds is None     # no cred/ yet: silent, nothing opened
     assert "not open at start" not in caplog.text

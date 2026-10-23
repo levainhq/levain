@@ -22,6 +22,7 @@ from levain.broker import keys as K
 from levain.broker import redact as RD
 from levain.broker import upstream as U
 from levain.contracts import canon
+from tests.ledger_support import keys_ledger
 
 pytestmark = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="unix sockets")
 
@@ -128,7 +129,8 @@ class _Rig:
         from levain.broker.norm import digest_of_token
         self.cred_fd = os.open(os.path.join(self.d, "keys", "cred"), os.O_RDONLY | os.O_DIRECTORY)
         self.a, self.b = socket.socketpair()
-        k = self.k = K.Keys(unmetered=True, lib_root=self.d, creds=CredStore(self.cred_fd))
+        self.ledger = keys_ledger(os.path.join(self.d, "keys", "ledger.jsonl"))
+        k = self.k = K.Keys(ledger=self.ledger, lib_root=self.d, creds=CredStore(self.cred_fd))
         for n, v in self.kw.items():
             setattr(k, n, v)
         k._in_loop()
@@ -171,6 +173,7 @@ class _Rig:
         self.a.close()
         self.b.close()
         os.close(self.cred_fd)
+        await self.ledger.aclose(2.0)
 
 
 class _AdminW:

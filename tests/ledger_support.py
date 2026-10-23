@@ -22,6 +22,27 @@ def ledger_path(tmp_path) -> str:
     return str(d / "ledger.jsonl")
 
 
+def keys_ledger(path: str) -> "L.Ledger":
+    """A real ledger for an in-process keys (S1 3c-1 session B), opened at `path` and attached to the running loop as
+    keys' `_serve` attaches it. The caller awaits `aclose` when that keys is done."""
+    led = L.Ledger.open(path)
+    led.attach(asyncio.get_running_loop())
+    return led
+
+
+def resolutions(path: str) -> List[tuple]:
+    """The file's resolution lines as (kind, ref, reason or settled amount), in file order."""
+    out = []
+    for o in file_lines(path):
+        if o["kind"] == "released":
+            out.append(("released", o["ref"], None))
+        elif o["kind"] == "settled":
+            out.append(("settled", o["ref"], o["settled"]))
+        elif o["kind"] == "uncertain":
+            out.append(("uncertain", o["ref"], o["reason"]))
+    return out
+
+
 def file_lines(path: str) -> List[dict]:
     with open(path, "rb") as f:
         return [json.loads(x) for x in f.read().splitlines()]
