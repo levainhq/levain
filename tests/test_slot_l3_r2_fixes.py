@@ -281,28 +281,28 @@ def test_undo_clears_abandoned_setup_intent(host):
     undo_cmd = parse_install_argv(["undo"])
     # the caller here is not the operator the journal names
     stranger = _facts(host, caller_uid=OP_UID + 1, caller_name="mallory", intent=j, host_ids=present)
-    assert pytest.raises(Refused, plan_undo, undo_cmd, stranger, accounts={}, shared_groups=()).value.name \
+    assert pytest.raises(Refused, plan_undo, undo_cmd, stranger, accounts={}, shared_groups={}).value.name \
         == "operator-mismatch"
     # with no journal and no record: nothing to undo
-    assert pytest.raises(Refused, plan_undo, undo_cmd, _facts(host), accounts={}, shared_groups=()).value.name \
+    assert pytest.raises(Refused, plan_undo, undo_cmd, _facts(host), accounts={}, shared_groups={}).value.name \
         == "not-set-up"
     # a replenish journal with no record is not a setup that died: still not set up
     rj = Intent("replenish", OP, {"_levain_s0": j.accounts["_levain_s0"]})
     assert pytest.raises(Refused, plan_undo, undo_cmd, _facts(host, intent=rj, host_ids=present),
-                         accounts={}, shared_groups=()).value.name == "not-set-up"
-    undo = plan_undo(undo_cmd, _facts(host, intent=j, host_ids=present), accounts={}, shared_groups=())
+                         accounts={}, shared_groups={}).value.name == "not-set-up"
+    undo = plan_undo(undo_cmd, _facts(host, intent=j, host_ids=present), accounts={}, shared_groups={})
     tombed = {s.why.split(":")[0].removeprefix("tombstone ") for s in undo.steps if s.why.startswith("tombstone ")}
     assert tombed == {n for n in made if n not in SHARED_GROUPS}
     assert j.accounts["_levain_gw0"] not in undo.retired_after
     assert {j.accounts[n] for n in tombed} <= undo.retired_after
-    deleted = [s.why.removeprefix("delete the shared group ") for s in undo.steps if "delete the shared group" in s.why]
+    deleted = [s.why.removeprefix("delete the group ") for s in undo.steps if s.why.startswith("delete the group ")]
     assert sorted(deleted) == sorted(SHARED_GROUPS)
     # the journal goes last; there is no record to remove
     assert undo.steps[-1].argv[1:] == ("-f", str(INTENT_PATH[host]))
     assert not any(str(operator_record_path(host)) in s.argv for s in undo.steps)
     # with the record present, undo is the ordinary one
     normal = plan_undo(undo_cmd, _facts(host, operator_record=operator_record(OP, OP_UID), intent=j,
-                                        host_ids=present), accounts={}, shared_groups=())
+                                        host_ids=present), accounts={}, shared_groups={})
     assert normal.steps[-1].argv[1:] == ("-f", str(operator_record_path(host)))
 
 

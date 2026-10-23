@@ -339,7 +339,8 @@ def test_replenish_marks_its_new_slots_after_confinement_just_before_the_journal
 
 def _undo_plan(host):
     al = allocate(host, egress=(SlotId("egress", 0),), verifier=(SlotId("none", 0),), used=(), retired=())
-    return plan_undo(parse_install_argv(["undo"]), _set_up(host), accounts=dict(al.ids), shared_groups=SHARED_GROUPS)
+    return plan_undo(parse_install_argv(["undo"]), _set_up(host), accounts=dict(al.ids),
+                     shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(SHARED_GROUPS)})
 
 
 @pytest.mark.parametrize("host", HOSTS)
@@ -348,20 +349,21 @@ def test_undo_removes_each_slot_state_once_the_services_are_stopped(host):
     removes = _index(whys, "remove /")
     states = [i for i in removes if whys[i].endswith("/state (under the pool lock)")]
     assert [whys[i].split()[1].split("/")[-2] for i in states] == ["e0", "v0"]
-    stopped = [i for i, w in enumerate(whys) if w.startswith(("stop ", "check ", "tell systemd"))
-               and "every process" not in w]
+    stopped = [i for i, w in enumerate(whys) if w.startswith("stop ") and "every process" not in w]
+    unit_files = [i for i, w in enumerate(whys) if w.endswith((".plist", "(then daemon-reload, reset-failed)"))]
+    assert stopped and max(stopped) < min(unit_files)            # every unit stopped before any unit file goes
     retire = _index(whys, "retire every account id")[0]
-    assert max(stopped) < min(states) and max(states) < retire
+    assert max(stopped + unit_files) < min(states) and max(states) < retire
 
 
 def test_linux_undo_clears_failed_units_and_removes_the_run_dir():
     steps = _undo_plan("linux").steps
     whys = [s.why for s in steps]
-    reload = _index(whys, "tell systemd")[0]
-    resets = [s for s in steps if s.argv[1:2] == ("reset-failed",)]
-    assert [s.argv[2] for s in resets] == list(units.start_order("linux"))
-    assert all(s.allow_fail and s.argv[0].endswith("systemctl") for s in resets)
-    assert min(whys.index(s.why) for s in resets) > reload
+    # R1b: each unit's file goes through unit/1's per-identity step (rm, daemon-reload, a best-effort reset-failed),
+    # every unit, after every stop, in reverse start order
+    resets = [w for w in whys if w.endswith("(then daemon-reload, reset-failed)")]
+    assert [w.split()[1].rsplit("/", 1)[1] for w in resets] == list(reversed(units.start_order("linux")))
+    assert max(_index(whys, "stop and disable ")) < whys.index(resets[0])
     rmrun = [i for i, s in enumerate(steps) if s.argv[-1:] == (str(RUN["linux"]),)]
     assert len(rmrun) == 1 and steps[rmrun[0]].argv[1:] == ("-rf", "--one-file-system", "--", "/run/levain")
     assert not steps[rmrun[0]].allow_fail
@@ -372,7 +374,7 @@ def test_linux_undo_clears_failed_units_and_removes_the_run_dir():
 
 def test_darwin_undo_has_neither_linux_item():
     steps = _undo_plan("darwin").steps
-    assert not any("reset-failed" in s.argv for s in steps)
+    assert not any("reset-failed" in s.why for s in steps)
     assert not any(str(RUN["darwin"]) in s.argv for s in steps)
 
 
@@ -448,7 +450,7 @@ def test_gather_facts_darwin(tmp_path):
         assert {0, OP_UID, ids["s3"], ids["s1"], ids["gid"]} == set(f.used_ids)
         assert "wheel" in f.existing_names and "root" in f.existing_names
     assert f.operator_uid is None                                      # undo names no operator
-    assert (g.accounts, g.shared_groups) == ({"_levain_s3": ids["s3"]}, ("levain-slots",))
+    assert (g.accounts, g.shared_groups) == ({"_levain_s3": ids["s3"]}, {"levain-slots": ids["gid"]})
     g = gather_facts(parse_install_argv(SETUP), "darwin", OP_UID, run=run, store_seams=_store_seams(L),
                      state_dir=state, user_name=lambda uid: OP)
     assert g.facts.operator_uid == OP_UID
@@ -490,7 +492,7 @@ def test_gather_facts_linux_groups_carry_no_label(tmp_path):
     g = gather_facts(parse_install_argv(["undo"]), "linux", OP_UID, run=run, store_seams=_store_seams(L, "linux"),
                      state_dir=tmp_path, user_name=lambda uid: OP)
     assert g.facts.levain_live == {"_levain_s0": s0}               # no group: Linux groups have no label
-    assert g.shared_groups == ("levain-slots",) and g.facts.live_leases == 0 and g.facts.operator_record is None
+    assert g.shared_groups == {"levain-slots": r.shared[0]} and g.facts.live_leases == 0 and g.facts.operator_record is None
     assert run.calls[0][0].endswith("getent")
 
 

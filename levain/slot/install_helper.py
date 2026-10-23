@@ -785,8 +785,9 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
     ids retired, each account's processes ended and proven then the account tombstoned, every dir naming a shared
     group given back to root's group, the memberships, the groups deleted, slot confinement (macOS the lo0 aliases,
     the pf anchor and pf's enable reference; Linux the AppArmor profile, the bwrap copy, the netns, then tmpfiles.d
-    and R), the install record, the install sudoers rule, the intent journal, the operator record LAST. A live read
-    precedes every act (ABSENT: nothing run; NOT_OURS: left in place), so every step is safe to re-run. The store and
+    and R), the install record, the install sudoers rule, the intent journal, the operator record LAST. Every remove
+    step reads its live object before it acts (ABSENT: nothing run; NOT_OURS: left in place), and the other steps
+    are idempotent, so every step is safe to re-run. The store and
     the root import tree stay: ``entry/1`` records are not undo's. ``live``: every live read and act of the remove
     steps; ``end``: the account kind's proven process end.
 
@@ -1614,12 +1615,12 @@ def slots_in_service(store: RH.Store) -> dict[str, tuple[int, ...]]:
 @dataclass(frozen=True)
 class Gathered:
     """What :func:`gather_facts` read under the install lock: the facts every plan takes, plus each verb's own
-    inputs (undo: every live Levain account and the shared groups present; replenish: the slots in service, by
-    class, and their accounts)."""
+    inputs (undo: every live Levain account and the shared groups present, name -> live gid; replenish: the slots in
+    service, by class, and their accounts)."""
 
     facts: HostFacts
     accounts: Mapping[str, int] = field(default_factory=dict)
-    shared_groups: tuple[str, ...] = ()
+    shared_groups: Mapping[str, int] = field(default_factory=dict)
     live: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
     #: The pool-lock hold taken before the live-lease count, released by :func:`run` after the last act.
     quiesce: Quiesce | None = None

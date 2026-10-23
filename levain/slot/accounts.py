@@ -354,7 +354,7 @@ def account_state(host: HostOS, name: str, uid: int, live: "Live") -> str:
 
 def remove_account_steps(host: HostOS, name: str, uid: int, *, live: "Live",
                          end: "Callable[[int, str], tuple[bool, str]]", retire: bool = True) -> list[Step]:
-    """``account/1`` (R7): the uid retired durably, every process ended (``end``: the caller's proven end), then the
+    """``account/1`` (R7): the uid retired durably (``retire``; undo passes False and retires uids itself), every process ended (``end``: the caller's proven end), then the
     tombstone (never a delete). Each act re-reads the live label first, so a run killed inside the tombstone re-runs
     it from its first act while the label is still live. Every act goes through ``live``: the macOS tombstone's
     "out of every group" is read and acted here, never :func:`levain.firing.hands._darwin_leave_groups` (the host's

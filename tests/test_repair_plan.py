@@ -439,7 +439,7 @@ def test_every_mutating_verb_checks_the_records(tmp_path: Path) -> None:
         f, _ = _pre_change(tmp_path / name.replace(":", "-").replace("/", ""), shape=_shape("gen-" + "0" * 16,
                                                                                             managed=recs))
         with pytest.raises(Refused) as e:
-            IH.plan_undo(undo, f, accounts=SLOT_UIDS, shared_groups=OLD_GROUPS)
+            IH.plan_undo(undo, f, accounts=SLOT_UIDS, shared_groups={g: RANGES[HOST].shared[i] for i, g in enumerate(OLD_GROUPS)})
         assert e.value.name == name
         with pytest.raises(Refused) as e:
             IH.plan_replenish(replenish, f, slots=1, verifier_slots=1, live={"egress": (0,), "none": (0,)},
@@ -449,7 +449,7 @@ def test_every_mutating_verb_checks_the_records(tmp_path: Path) -> None:
     j = Intent("repair", OP, txn=TXN_B, managed=(("widget/3", ("anything",)),))
     f, _ = _pre_change(tmp_path / "j", intent=parse_intent(intent_text(j).encode(), HOST))
     with pytest.raises(Refused) as e:
-        IH.plan_undo(undo, f, accounts=SLOT_UIDS, shared_groups=OLD_GROUPS)
+        IH.plan_undo(undo, f, accounts=SLOT_UIDS, shared_groups={g: RANGES[HOST].shared[i] for i, g in enumerate(OLD_GROUPS)})
     assert e.value.name == "downgrade-unsupported:widget/3"
 
 

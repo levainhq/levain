@@ -126,7 +126,7 @@ def test_retired_id_never_reissued(host, tmp_path):
     # undo retires every account id it tombstones, keeping the old ones
     accounts = dict(plan.allocation.ids)
     undo = plan_undo(parse_install_argv(["undo"]), _set_up(host, retired=retired), accounts=accounts,
-                     shared_groups=SHARED_GROUPS)
+                     shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(SHARED_GROUPS)})
     assert undo.retired_after == retired | set(accounts.values())
     write = [s.write for s in undo.steps if s.write and s.write[0].name == "retired-session-ids"]
     assert write and write[0][1] == retired_ids_text(undo.retired_after) and write[0][2] == 0o644
@@ -180,13 +180,14 @@ def test_operator_record_written_last_and_removed_last(host):
         assert _refusal(parse_operator_record, bad) == "operator-record-malformed"
     uid = RANGES[host].slots[0]
     undo = plan_undo(parse_install_argv(["undo"]), _set_up(host), accounts={"_levain_s0": uid},
-                     shared_groups=SHARED_GROUPS)
+                     shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(SHARED_GROUPS)})
     assert undo.steps[-1].argv[1:] == ("-f", str(operator_record_path(host)))
-    assert undo.steps[0].argv[-1] == str(RUNTIME_SUDOERS)
+    assert undo.steps[0].why.startswith(f"remove {RUNTIME_SUDOERS} ")
     assert undo.steps[-2].argv[1:] == ("-f", str(INTENT_PATH[host]))
-    assert undo.steps[-3].argv[-1] == str(INSTALL_SUDOERS)
-    assert [s.argv[-1] for s in undo.steps if s.argv and "sudoers" in s.argv[-1]] == [str(RUNTIME_SUDOERS),
-                                                                                       str(INSTALL_SUDOERS)]
+    # the install rule's removal, then its visudo -c (R1b: sudoers/1 through its per-identity step)
+    assert undo.steps[-4].why.startswith(f"remove {INSTALL_SUDOERS} ") and undo.steps[-3].why.startswith("check ")
+    assert [s.why.split()[1] for s in undo.steps if s.why.startswith("remove /") and "sudoers" in s.why] == [
+        str(RUNTIME_SUDOERS), str(INSTALL_SUDOERS)]
     retire = next(i for i, s in enumerate(undo.steps) if s.write)
     first_tomb = next(i for i, s in enumerate(undo.steps) if "tombstone" in s.why)
     first_kill = next(i for i, s in enumerate(undo.steps) if s.call and "stop every process" in s.why)
@@ -448,7 +449,7 @@ def test_setup_refuses_existing_singleton_or_shared_group():
 
 def test_undo_refuses_a_foreign_account():
     assert _refusal(plan_undo, parse_install_argv(["undo"]), _set_up("linux"), accounts={"bob": 501},
-                    shared_groups=()) == "not-levain-name"
+                    shared_groups={}) == "not-levain-name"
 
 
 def test_plans_are_steps_only():
