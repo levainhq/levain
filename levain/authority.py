@@ -1603,7 +1603,7 @@ def snapshot(conn: sqlite3.Connection, *, cache: ReplayCache | None = None,
     inside the caller's read transaction so it and the caller's other reads see one head)."""
     state = _replay(conn, PROCESS_CACHE if cache is None else cache, ssh_keygen)
     if state is None:
-        raise NotInitialised("the authority log is empty: run `levain cockpit ledger init`")
+        raise NotInitialised("the authority log is empty: `ledger init` writes its first link")
     return state
 
 
