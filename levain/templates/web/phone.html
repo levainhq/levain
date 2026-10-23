@@ -24,6 +24,7 @@
   <button type="button" role="tab" id="tab-needs" data-view="needs" aria-selected="true">Needs you</button>
   <button type="button" role="tab" id="tab-board" data-view="board" aria-selected="false">Board</button>
   <button type="button" role="tab" id="tab-notes" data-view="notes" aria-selected="false">Notifications</button>
+  <button type="button" role="tab" id="tab-grants" data-view="grants" aria-selected="false">Grants</button>
 </nav>
 <div id="view-needs">
 <p id="status" class="status" role="status">reading the queue…</p>
@@ -39,6 +40,10 @@
 <section id="notes" class="view" hidden>
   <div id="pings" class="card pings"></div>
   <div id="record"></div>
+</section>
+<section id="grants" class="view" hidden>
+  <p id="grants-status" class="status" role="status">reading the grants…</p>
+  <div id="grants-list"></div>
 </section>
 <script src="/phone_app.js"></script>
 <script src="/phone.js"></script>

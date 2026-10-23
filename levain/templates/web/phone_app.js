@@ -155,10 +155,11 @@
   // ---- tabs -----------------------------------------------------------------------------------------------------
   let view = askedView || store.get("sessionStorage", "levain-view") || "needs";
   if (askedView) { try { history.replaceState(null, "", location.pathname + location.hash); } catch (e) { /* the address stays */ } }
-  if (!["needs", "board", "notes"].includes(view)) view = "needs";
+  if (!["needs", "board", "notes", "grants"].includes(view)) view = "needs";
   function show(v) {
     view = v; store.set("sessionStorage", "levain-view", v);
     $("view-needs").hidden = v !== "needs"; $("board").hidden = v !== "board"; $("notes").hidden = v !== "notes";
+    if ($("grants")) $("grants").hidden = v !== "grants";   // drawn by phone.js from the same consent.json read
     for (const b of document.querySelectorAll("#tabs button")) b.setAttribute("aria-selected", b.dataset.view === v ? "true" : "false");
     refreshView();
   }

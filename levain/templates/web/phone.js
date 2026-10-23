@@ -112,6 +112,7 @@
         ? "a passkey is enrolled for " + rpId + ", not one this browser made. Make one here if this phone has none."
         : "no passkey is enrolled for " + rpId + " yet. Make one here, then enrol it from the laptop.";
     if (!usable) $("status").textContent += " · this browser cannot use a passkey here (needs https)";
+    drawGrants(data);
   }
 
   // a question: text only (never HTML) for everything the agent wrote. No passkey: the answer is unsigned and
@@ -761,6 +762,151 @@
       });
     }).catch((e) => say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
       .finally(() => { busy--; setTimeout(load, 1500); });
+  }
+
+  // M17: the Grants tab. consent.json carries `grants` (levain.consent.grant_phone): every standing grant the cockpit
+  // the consent hook names holds, what it answered (a count and the newest calls, each with the outcome the ledger
+  // read) and the passkeys that may revoke it. A revoke is ONE authority link the server builds and holds: the page
+  // sends the grant's `instance` as listed, shows the link's record (`line`, exactly what is signed), and only the
+  // sheet's own tap asks for Face ID. The page never sends a link; the log verifies the signature and every refusal
+  // shown is the server's words. A grant that answered a call which was then refused is the one to look at for a
+  // demotion: it leads the list, and its refused calls lead its card
+  const grantNotes = new Map();   // grant id -> [text, kind], kept across redraws
+  let grantLast = "";             // the last revoke made here: the revoked grant leaves the list, its result stays
+  const grantCalls = (g) => (g.answered && Array.isArray(g.answered.recent) ? g.answered.recent : []);
+  const refusedCalls = (g) => grantCalls(g).filter((c) => c && c.outcome === "refused").length;
+
+  function drawGrants(data) {
+    const list = $("grants-list"), status = $("grants-status");
+    if (!list || !status) return;
+    // sort is stable: the server's order holds among grants with and among grants without a refused call
+    const rows = (Array.isArray(data.grants) ? data.grants.slice() : [])
+      .sort((a, b) => (refusedCalls(b) > 0 ? 1 : 0) - (refusedCalls(a) > 0 ? 1 : 0));
+    const flagged = rows.filter((g) => refusedCalls(g) > 0).length;
+    const note = typeof data.grants_note === "string" ? data.grants_note : "";
+    // a read the server could not make is said as that, never as "no standing grants"
+    status.textContent = (rows.length ? rows.length + (rows.length === 1 ? " standing grant" : " standing grants")
+                                        + (flagged ? " · " + flagged + " with a refused call" : "")
+                                      : note ? "the grants: " + note : "no standing grants")
+      + (grantLast ? " · last: " + grantLast : "");
+    const inert = typeof data.inert_note === "string" ? data.inert_note : "";
+    list.replaceChildren(...rows.map((g) => grantCard(g, note, inert)));
+  }
+
+  function grantCard(g, signerNote, inertNote) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const state = sv(g.state);
+    const card = el("article", "req grant" + (state === "live" ? "" : " " + (state || "unknown")) + (refusedCalls(g) ? " demote" : ""));
+    card.dataset.grant = sv(g.id);
+    const tools = Array.isArray(g.tools) ? g.tools.filter((t) => typeof t === "string").join(", ") : "";
+    const head = el("div", "req-head");
+    head.append(el("span", "tool", tools || sv(g.kind) || "(grant)"), el("span", "tier" + (state === "live" ? "" : " off"), state),
+                el("span", "meta", sv(g.agent) || sv(g.kind)));
+    card.appendChild(head);
+    if (sv(g.workspace)) card.appendChild(el("div", "where", "in " + g.workspace));
+    if (Array.isArray(g.postures) && g.postures.length) card.appendChild(el("div", "where", "modes " + g.postures.join(", ")));
+    if (g.mcp_fields && typeof g.mcp_fields === "object") {
+      for (const [tool, fields] of Object.entries(g.mcp_fields)) {
+        const f = fields && typeof fields === "object" ? Object.entries(fields).map(([k, v]) => k + "=" + v).join(", ") : "";
+        card.appendChild(el("div", "where", tool + ": " + f));
+      }
+    }
+    card.appendChild(el("div", "where", (state === "expired" ? "expired " : "until ") + readable(g.expires_at)
+                        + " · " + sv(g.kind) + " · " + sv(g.id_shown)));
+    if (state === "inert" && inertNote) card.appendChild(el("div", "where", inertNote));
+    // what it answered: the count, then the newest calls the server sent, refused ones first (sort is stable, so each
+    // group stays newest first). A refused call older than those is not on this card: the server sends the newest only
+    const a = g.answered && typeof g.answered === "object" ? g.answered : {};
+    const count = Number.isInteger(a.count) ? a.count : 0;
+    const calls = grantCalls(g).slice().sort((x, y) => (y.outcome === "refused" ? 1 : 0) - (x.outcome === "refused" ? 1 : 0));
+    card.appendChild(el("div", "where answered", count ? "answered " + count + (count === 1 ? " call" : " calls")
+                        + (a.last_at ? ", last " + readable(a.last_at) : "")
+                        + (calls.length < count ? " · the newest " + calls.length + " of " + count + " below" : "")
+                                                      : "answered nothing yet"));
+    for (const c of calls) {
+      const o = sv(c.outcome) || "unknown";
+      card.appendChild(el("div", "call " + o, o + " · " + sv(c.tool) + " · " + readable(c.at) + (sv(c.cwd) ? " · in " + c.cwd : "")));
+    }
+    const note = el("div", "note");
+    const key = sv(g.id);
+    const say = (text, kind) => { grantNotes.set(key, [text, kind || ""]); note.textContent = text; note.className = "note " + (kind || ""); };
+    if (grantNotes.has(key)) say(grantNotes.get(key)[0], grantNotes.get(key)[1]);
+    const signers = Array.isArray(g.signers) ? g.signers : [];
+    if (!signers.length && !grantNotes.has(key)) { note.textContent = signerNote || "no passkey here may revoke this grant"; }
+    const actions = el("div", "actions");
+    const b = el("button", "deny", "revoke with passkey");
+    b.type = "button";
+    b.disabled = !usable || !signers.length;
+    b.addEventListener("click", () => start(g, null, signers, say, actions, false,
+                                            (fp, rawId) => revokeAsk(g, fp, rawId, say, actions), "to REVOKE grant " + sv(g.id_shown)));
+    actions.appendChild(b);
+    card.append(actions, note);
+    return card;
+  }
+
+  // the challenge, then the sheet: the link's record and the tap that asks for Face ID. The sheet holds the list still
+  // (busy) until it is used or dismissed; the page put away dismisses it (closePick) until Face ID is asked for
+  function revokeAsk(g, fp, rawId, say, actions) {
+    if (busy) return;
+    busy++;
+    let released = false;
+    const release = () => { if (released) return; released = true; busy--; setTimeout(load, 1500); };
+    const base = "/grant/" + encodeURIComponent(g.id) + "/";
+    say("asking for the revoke to sign…");
+    call("POST", base + "revoke-challenge", { signer_fp: fp, instance: g.instance }).then((c) => {
+      if (!c.ok) { say("not revoked: " + why(c), "bad"); return release(); }
+      let link = null;
+      try { link = JSON.parse(c.body.line); } catch (e) { link = null; }
+      // the server builds the link itself; one that does not name this grant is not put to the passkey
+      if (!link || link.op !== "revoke_grant" || link.grant_id !== g.id || typeof c.body.challenge !== "string") {
+        say("not revoked: the link the server sent does not name this grant, so nothing was signed", "bad");
+        return release();
+      }
+      const sheet = el("div", "sheet");
+      sheet.append(el("div", "where", "Face ID signs exactly this authority link (it removes grant " + (g.id_shown || g.id) + "):"),
+                   el("pre", "display line", c.body.line));
+      const row = el("div", "actions");
+      const go = el("button", "deny", "revoke with Face ID");
+      go.type = "button";
+      const no = el("button", "quiet", "cancel");
+      no.type = "button";
+      row.append(go, no);
+      sheet.appendChild(row);
+      actions.after(sheet);
+      say("check the link, then revoke with Face ID");
+      const dismiss = () => {
+        if (released) return false;
+        sheet.remove();
+        say("");
+        if (closePick === dismiss) closePick = null;
+        release();
+        return true;
+      };
+      if (closePick) closePick();
+      closePick = dismiss;
+      no.addEventListener("click", dismiss);
+      go.addEventListener("click", () => {
+        if (released || go.disabled) return;
+        go.disabled = no.disabled = true;
+        if (closePick === dismiss) closePick = null;   // Face ID is being asked: leaving the page no longer dismisses
+        say("confirm with your passkey to revoke…");
+        const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+        if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
+        navigator.credentials.get({ publicKey: pk }).then((cred) => call("POST", base + "revoke", {
+          authenticator_data: b64u(cred.response.authenticatorData), client_data_json: b64u(cred.response.clientDataJSON),
+          signature: b64u(cred.response.signature) }).then((r) => {
+          // the passkey signed: once it is sent, only the server's own refusal (a 4xx) says nothing was revoked
+          if (!r.ok && (r.status === 0 || r.status >= 500)) return say("result unknown (" + why(r) + "): the list re-reads to show whether the grant is still there", "bad");
+          if (!r.ok) return say("not revoked: " + why(r), "bad");
+          grantLast = "revoked " + (g.id_shown || g.id);
+          say("revoked · link seq " + r.body.seq + (r.body.warning ? " · " + r.body.warning : ""), "ok");
+        }), (e) => {
+          if (rawId && e && e.name === "NotAllowedError") forget(fp);
+          say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was revoked", "bad");
+        }).catch((e) => say("result unknown (the page failed: " + ((e && e.name) || "error") + "): the list re-reads to show where it stands", "bad"))
+          .finally(() => { sheet.remove(); release(); });
+      });
+    }).catch((e) => { say("the page failed (" + ((e && e.name) || "error") + "); nothing was signed", "bad"); release(); });
   }
 
   // enrolment: the created credential is kept, so a failed key-line call retries only that call, never makes another
