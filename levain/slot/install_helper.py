@@ -1831,7 +1831,8 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
         levain_tombstones=tombs, levain_live=live, intent=journal, host_ids=host_ids, install_shape=shape,
         user_ids=dict(d.users))
     if cmd.verb == "repair":
-        repair = _repair_facts(cmd, host, d, accounts, in_service or {}, skips=skips)
+        repair = _repair_facts(cmd, host, d, accounts, in_service or {}, skips=skips,
+                               operator_uid=int(orec["uid"]) if orec is not None else None)
         return Gathered(facts, accounts, quiesce=q, repair=repair)
     if cmd.verb == "undo":
         return Gathered(facts, accounts, {g: d.groups[g] for g in shared}, quiesce=q)
@@ -1843,10 +1844,13 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
 
 
 def _repair_facts(cmd: InstallCommand, host: HostOS, d: Directory, accounts: Mapping[str, int],
-                  in_service: Mapping[str, tuple[int, ...]], *, skips: tuple = ()) -> RepairFacts:
+                  in_service: Mapping[str, tuple[int, ...]], *, skips: tuple = (),
+                  operator_uid: int | None = None) -> RepairFacts:
     """Row 33 §2.3 R0: the directory's ``levain-*`` groups and their members, the slots in service, what
     ``<tree>/current`` names, whether the legacy tree is there, and ``--source`` RESOLVED (§2.1 (e): every later read
-    names the resolved parent). The source-ownership check on that chain is R2's (phase A)."""
+    names the resolved parent), its names checked and then who may write it (§2.1, :func:`root_tree.
+    check_source_writers`) before any other root read of it. ``operator_uid`` None (no operator record): no check,
+    the plan refuses ``not-set-up`` before it reads the source."""
     from levain.slot.intent import GROUP_RE
 
     groups = {g: i for g, i in d.groups.items() if GROUP_RE.fullmatch(g)}
@@ -1856,6 +1860,14 @@ def _repair_facts(cmd: InstallCommand, host: HostOS, d: Directory, accounts: Map
     if cmd.source is not None:
         parent = Path(os.path.realpath(os.path.dirname(cmd.source)))
         source, h11 = parent / os.path.basename(cmd.source), parent / "h11"
+        if operator_uid is not None:
+            root_tree.check_sources(source, h11)
+            # [judged by r2repair, 10-22, against CONTRACT §1.1 "own primary group each"]: a Levain account's primary
+            # gid is its uid, so the gids a Levain account reaches are those uids plus every group listing one.
+            reach = {u for n, u in d.users.items() if is_levain_account(n)}
+            reach |= {d.groups[g] for g, m in d.group_members.items()
+                      if g in d.groups and any(is_levain_account(a) for a in m)}
+            root_tree.check_source_writers(parent, operator_uid=operator_uid, levain_gids=reach)
     return RepairFacts(accounts=dict(accounts), groups=groups, members={g: d.group_members.get(g, frozenset())
                                                                         for g in groups},
                        egress=tuple(in_service.get("egress", ())), verifier=tuple(in_service.get("none", ())),

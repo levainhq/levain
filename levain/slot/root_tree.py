@@ -432,6 +432,52 @@ def check_sources(source: Path, h11_dir: Path) -> None:
     _refuse_link(h11_dir, "h11")
 
 
+def check_source_writers(parent: Path, *, operator_uid: int, levain_gids: Iterable[int],
+                         lstat: Callable[[str], os.stat_result] = os.lstat,
+                         walk: Callable[..., Iterator] = os.walk) -> None:
+    """Row 33 §2.1 [r2: X-8; r3: F9 (a)-(c)]: who may write the ``--source`` package, checked BEFORE any other root
+    read of it (the generation hash included). ``parent`` is ``realpath(PATH/..)``, so the ancestor chain checked is
+    the RESOLVED one. Every ancestor of ``parent`` up to ``/``, ``parent`` itself, and every entry below
+    ``parent/levain`` and ``parent/h11`` must be owned by root or the operator and not other-writable (sticky or
+    not); a group-writable one is accepted only when its group reaches no Levain account (``levain_gids``: every
+    gid a Levain account holds as primary group or is listed in). Else ``bad-source``. A link below either package
+    reads mode 0777 on Linux and is refused here; :func:`levain.slot.generation.generation_id` refuses links on both
+    hosts. ACLs are not read (§2.1 (d), a known edge)."""
+    reach = frozenset(levain_gids)
+
+    def check(p: str) -> None:
+        try:
+            st = lstat(p)
+        except OSError as e:
+            raise Refused("bad-source", f"cannot read {p} ({e.strerror or e})") from None
+        if st.st_uid not in (0, operator_uid):
+            raise Refused("bad-source", f"{p} is owned by uid {st.st_uid}, neither root nor the operator")
+        if st.st_mode & stat.S_IWOTH:
+            raise Refused("bad-source", f"{p} is writable by every user")
+        if st.st_mode & stat.S_IWGRP and st.st_gid in reach:
+            raise Refused("bad-source", f"{p} is writable by group {st.st_gid}, which a Levain account holds")
+
+    chain, p = [], str(parent)
+    while True:
+        chain.append(p)
+        up = os.path.dirname(p)
+        if up == p:
+            break
+        p = up
+    for p in reversed(chain):
+        check(p)
+
+    def fail(e: OSError) -> None:
+        raise Refused("bad-source", f"cannot read {e.filename} ({e.strerror or e})")
+
+    for name in ("levain", "h11"):
+        top = os.path.join(str(parent), name)
+        check(top)
+        for root, dirs, files in walk(top, onerror=fail, followlinks=False):
+            for n in sorted(dirs) + sorted(files):
+                check(os.path.join(root, n))
+
+
 def tree_steps(host: HostOS, source: Path, *, h11_dir: Path | None = None, generation: str | None = None,
                current: str | None = None) -> list[Step]:
     """Setup (§2.5): stage the ``levain`` package at ``source`` and h11 (``h11_dir``, default the installing Levain's
@@ -450,6 +496,6 @@ def tree_steps(host: HostOS, source: Path, *, h11_dir: Path | None = None, gener
 
 
 __all__ = ["CURRENT", "ENTRY_MODULES", "H11_MIN", "HELPER_MODULES", "PY_FLAGS", "ROOT_PYTHON", "STAGING",
-           "VENDOR_PREFIX", "boot_path_code", "check_sources", "current_path", "dir_steps", "entry_steps",
+           "VENDOR_PREFIX", "boot_path_code", "check_source_writers", "check_sources", "current_path", "dir_steps", "entry_steps",
            "entry_text", "flip_step", "gc_step", "h11_floor", "h11_source", "helper_entry_text", "read_current", "stage_steps",
            "tree_steps"]
