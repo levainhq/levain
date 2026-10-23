@@ -6,6 +6,9 @@ repository and a reftable one, the claim check, every token of the closed idx en
 copy, and the pack's trailer held to its hash. The export bundle is ``bundlefmt.write_header`` + ``pack-objects``;
 the verifier's idx is ``index-pack -o`` of the same pack (what Q holds), and the claims are what an honest verifier
 says, so each row edits exactly one thing.
+
+The tests after "the S3 fix round" are that round's (lane adopt5dii-s3-fix1): each goes red with its fix reverted
+(``1023-6/adopt/s3f1_mutate.py``, output ``s3f1_mutate.txt``).
 """
 import errno
 import hashlib
@@ -72,11 +75,13 @@ def ex(tmp_path_factory):
     (q / "p.pack").write_bytes(pack)
     g("index-pack", "-o", str(q / "p.idx"), str(q / "p.pack"), cwd=q)
     g("index-pack", "--index-version=2,0x10", "-o", str(q / "large.idx"), str(q / "p.pack"), cwd=q)
+    g("index-pack", "--index-version=2,0", "-o", str(q / "all-large.idx"), str(q / "p.pack"), cwd=q)
     hdr = BF.parse(bundle[:bundle.index(b"\n\n") + 2])
     claims = {"refs": {"head": head, "wip": wip}, "prerequisites": [base], "pack_offset": hdr.size,
               "pack_sha256": hashlib.sha256(pack).hexdigest(), "object_count": struct.unpack(">I", pack[8:12])[0]}
     return {"t": t, "his": his, "base": base, "head": head, "wip": wip, "pack": pack, "bundle": bundle,
-            "idx": (q / "p.idx").read_bytes(), "large": (q / "large.idx").read_bytes(), "claims": claims}
+            "idx": (q / "p.idx").read_bytes(), "large": (q / "large.idx").read_bytes(),
+            "all-large": (q / "all-large.idx").read_bytes(), "claims": claims}
 
 
 def private(d: Path, bundle: bytes, idx: bytes):
@@ -144,7 +149,8 @@ def test_take_create_only(ex, tmp_path, ref_format, monkeypatch):
     assert t.ref == ref and t.oid == ex["head"]
     assert plog.read_text().splitlines() == [
         "-c core.hooksPath=/dev/null rev-parse --git-path objects",
-        f"-c core.hooksPath=/dev/null update-ref --no-deref --create-reflog {ref} {ex['head']} {'0' * 40}"]
+        "-c core.hooksPath=/dev/null -c hook.reference-transaction.enabled=false "
+        f"update-ref --no-deref --create-reflog {ref} {ex['head']} {'0' * 40}"]
     assert not marker.exists()
     assert {k: v for k, v in post["refs"].items() if k != ref} == pre["refs"] and post["refs"][ref] == ex["head"]
     assert all(post["logs"][k] == v for k, v in pre["logs"].items())
@@ -156,7 +162,7 @@ def test_take_create_only(ex, tmp_path, ref_format, monkeypatch):
         assert rest == {f"refs/heads/levain/{S}", f"logs/refs/heads/levain/{S}"}
     else:
         assert rest and all(c.startswith("reftable/") for c in rest)
-    assert [x for x in lines if x.startswith("rename ")][-1].endswith(".idx")      # the idx LAST
+    assert [x for x in lines if x.startswith("finalise ")][-1].endswith(".idx")      # the idx LAST
     for ext in (".pack", ".idx"):
         st = (repo / ".git" / (stem + ext)).stat()
         assert stat.S_IMODE(st.st_mode) == 0o444 and st.st_nlink == 1
@@ -307,3 +313,236 @@ def test_take_pack_hash_is_trailer(ex, tmp_path):
     assert not d2.pack_hash_ok
     AT.check_claims(claims, d2)
     assert refused(lambda: AT.check_idx(i2, d2)) == "take-idx-invalid:pack-hash"
+
+
+# --- the S3 fix round (lane adopt5dii-s3-fix1; HEAD_rulings 1023-6 "adopt S3 L1" / "adopt S3 L2") ---------------------
+
+
+def test_take_idx_large_table_git_ceiling(ex, tmp_path):
+    """git's own ``index-pack --index-version=2,0`` puts every offset in the large table (m == n): git's ``load_idx``
+    refuses it ("wrong index v2 file size", ``1023-6/adopt/s3f1_large_before.txt``), so the take does
+    (``large-table``); git's ``2,0x10`` idx sits on the ceiling (m == n - 1) and passes."""
+    b, _i = private(tmp_path / "p", ex["bundle"], ex["idx"])
+    d = AT.derive(b, session=S, object_format="sha1")
+    n = d.object_count
+    for which, m in (("all-large", n), ("large", n - 1)):
+        assert (len(ex[which]) - (1032 + 28 * n + 40)) // 8 == m
+    _b, i = private(tmp_path / "q", ex["bundle"], ex["all-large"])
+    assert refused(lambda: AT.check_idx(i, d)) == "take-idx-invalid:large-table"
+    _b, i = private(tmp_path / "r", ex["bundle"], ex["large"])
+    assert AT.check_idx(i, d) == hashlib.sha256(ex["large"]).hexdigest()
+
+
+def test_take_idx_fanout_bucket_shift(ex, tmp_path):
+    """A fanout still monotonic with ``fanout[255] == n`` but one bucket boundary moved by one oid = ``fanout``: only
+    the per-bucket count sees it."""
+    idx = ex["idx"]
+    fan = list(struct.unpack(">256I", idx[8:1032]))
+    i = next(i for i in range(1, 255) if fan[i] > fan[i - 1])
+    fan[i - 1] += 1
+    assert all(fan[k] <= fan[k + 1] for k in range(255)) and fan[255] == struct.unpack(">I", idx[1028:1032])[0]
+    b, i_ = private(tmp_path / "p", ex["bundle"], _retrailer(idx[:8] + struct.pack(">256I", *fan) + idx[1032:]))
+    d = AT.derive(b, session=S, object_format="sha1")
+    assert refused(lambda: AT.check_idx(i_, d)) == "take-idx-invalid:fanout"
+
+
+def _prep(ex, tmp_path):
+    repo = tmp_path / "his"
+    make_his(repo)
+    b, i = private(tmp_path / "p", ex["bundle"], ex["idx"])
+    d = AT.derive(b, session=S, object_format="sha1")
+    return repo, repo / ".git" / "objects" / "pack", b, i, d, AT.check_idx(i, d)
+
+
+@pytest.mark.parametrize("at", [1, 2])
+def test_take_interrupt_mid_copy_leaves_nothing(ex, tmp_path, monkeypatch, at):
+    """A KeyboardInterrupt in the pack's copy (1) or the idx's, after the pack landed (2): the temps and the pack
+    this take created are removed, and the interrupt is re-raised."""
+    repo, pd, b, i, d, isha = _prep(ex, tmp_path)
+    real, seen = SLOT.write_all, []
+
+    def write(fd, data):
+        seen.append(sorted(os.listdir(pd)))
+        if len(seen) == at:
+            raise KeyboardInterrupt
+        real(fd, data)
+    monkeypatch.setattr(SLOT, "write_all", write)
+    with pytest.raises(KeyboardInterrupt):
+        AT.migrate(GIT, repo, b, i, d, isha)
+    assert any(n.endswith(".pack") and not n.startswith("tmp_") for n in seen[-1]) == (at == 2)
+    assert os.listdir(pd) == []
+
+
+def test_take_idx_stage_failure_rolls_back_created_pack_only(ex, tmp_path, monkeypatch):
+    """S3 Q2 (head KEEP): the idx stage fails after the pack landed = the pack this take created is removed; a pack
+    that was already present is untouched."""
+    repo, pd, b, i, d, isha = _prep(ex, tmp_path)
+    real = SLOT.write_all
+
+    def enospc_on_idx(fd, data):
+        if data[:4] == AT.IDX_MAGIC:
+            raise OSError(errno.ENOSPC, "seam")
+        real(fd, data)
+    monkeypatch.setattr(SLOT, "write_all", enospc_on_idx)
+    assert refused(lambda: AT.migrate(GIT, repo, b, i, d, isha)) == "take-failed:ENOSPC"
+    assert os.listdir(pd) == []
+    there = pd / f"pack-{ex['pack'][-20:].hex()}.pack"
+    there.write_bytes(ex["pack"])
+    there.chmod(0o444)
+    ino = there.stat().st_ino
+    assert refused(lambda: AT.migrate(GIT, repo, b, i, d, isha)) == "take-failed:ENOSPC"
+    assert os.listdir(pd) == [there.name] and there.stat().st_ino == ino and there.read_bytes() == ex["pack"]
+
+
+def test_take_failed_temp_unlink_after_link_rolls_back(ex, tmp_path, monkeypatch):
+    """The pack counts as created the moment its link lands: an unlink of its temp that fails right after still
+    removes the created pack (and the temp)."""
+    repo, pd, b, i, d, isha = _prep(ex, tmp_path)
+    real, fired = os.unlink, []
+
+    def unlink(path, *a, **k):
+        if str(path).startswith("tmp_pack") and not fired:
+            fired.append(path)
+            raise OSError(errno.EIO, "seam")
+        return real(path, *a, **k)
+    monkeypatch.setattr(os, "unlink", unlink)
+    assert refused(lambda: AT.migrate(GIT, repo, b, i, d, isha)) == "take-failed:EIO"
+    assert fired and os.listdir(pd) == []
+
+
+def test_take_spawn_and_read_failures_named(ex, tmp_path, monkeypatch):
+    """Every spawn failure of his git has a name: no such git = ``take-failed:ENOENT``, past the timeout =
+    ``take-failed:timeout``; an OSError on the private copies = ``take-failed:<errno name>``."""
+    repo = tmp_path / "his"
+    make_his(repo)
+    nogit = str(tmp_path / "no-such-git")
+    assert refused(lambda: AT.objects_dir(nogit, repo)) == "take-failed:ENOENT"
+    assert refused(lambda: AT.create_ref(nogit, repo, S, "head", ex["head"], "sha1")) == "take-failed:ENOENT"
+    slow = tmp_path / "slow-git"
+    slow.write_text("#!/bin/sh\nexec sleep 30\n")
+    slow.chmod(0o755)
+    monkeypatch.setattr(AT, "_GIT_TIMEOUT", 0.5)
+    assert refused(lambda: AT.objects_dir(str(slow), repo)) == "take-failed:timeout"
+    assert refused(lambda: AT.derive(tmp_path / "absent", session=S, object_format="sha1")) == "take-failed:ENOENT"
+    b, i = private(tmp_path / "p", ex["bundle"], ex["idx"])
+    d = AT.derive(b, session=S, object_format="sha1")
+    link = tmp_path / "idx-link"
+    link.symlink_to(i)
+    assert refused(lambda: AT.check_idx(link, d)) == "take-failed:ELOOP"
+
+
+def test_take_claim_detail_escaped(ex):
+    """A verifier-claimed value reaches his terminal escaped by the one escaper, the cut after it."""
+    d_bundle = ex["t"] / "esc"
+    b, _i = private(d_bundle, ex["bundle"], ex["idx"])
+    d = AT.derive(b, session=S, object_format="sha1")
+    for bad in ("\x1b[2J\x9b31m‮evil", "\x1b" * 300):
+        with pytest.raises(Refused) as e:
+            AT.check_claims(dict(ex["claims"], pack_sha256=bad), d)
+        assert e.value.name == "verifier-claim-mismatch"
+        shown = e.value.detail.split("the verifier claims ", 1)[1].split(", the private copy gives ", 1)[0]
+        assert not any(c in e.value.detail for c in "\x1b\x9b‮")
+        assert "⟨U+001B⟩" in shown and len(shown) <= 200
+
+
+def test_take_final_name_not_regular_or_unreadable(ex, tmp_path):
+    """Only a symlink or a non-regular file at a final name is "other bytes" (``take-pack-collision``, left as it
+    is); an unreadable regular file there = ``take-failed:EACCES``. Nothing is written either way."""
+    repo, pd, b, i, d, isha = _prep(ex, tmp_path)
+    final = pd / f"pack-{ex['pack'][-20:].hex()}.pack"
+    final.symlink_to(b)
+    assert refused(lambda: AT.migrate(GIT, repo, b, i, d, isha)) == "take-pack-collision"
+    assert os.listdir(pd) == [final.name] and final.is_symlink()
+    final.unlink()
+    os.mkfifo(final)
+    assert refused(lambda: AT.migrate(GIT, repo, b, i, d, isha)) == "take-pack-collision"
+    final.unlink()
+    if os.geteuid() == 0:
+        pytest.skip("root reads a 0000 file")
+    final.write_bytes(ex["pack"])
+    final.chmod(0)
+    assert refused(lambda: AT.migrate(GIT, repo, b, i, d, isha)) == "take-failed:EACCES"
+    assert os.listdir(pd) == [final.name]
+
+
+def test_take_both_final_names_checked_before_any_write(ex, tmp_path, monkeypatch):
+    """Other bytes at the idx's final name refuse the take BEFORE the pack is written (a stale idx would otherwise
+    go live the moment the pack is linked): not one byte is written."""
+    repo, pd, b, i, d, isha = _prep(ex, tmp_path)
+    stale = pd / f"pack-{ex['pack'][-20:].hex()}.idx"
+    stale.write_bytes(b"stale\n")
+    writes: list = []
+    monkeypatch.setattr(SLOT, "write_all", lambda fd, data: writes.append(len(data)))
+    assert refused(lambda: AT.migrate(GIT, repo, b, i, d, isha)) == "take-pack-collision"
+    assert writes == [] and os.listdir(pd) == [stale.name]
+
+
+def test_take_rename_fallback(ex, tmp_path, monkeypatch):
+    """A filesystem that refuses hard links: each file is renamed into place after its final name is looked at;
+    a final name that appeared meanwhile with equal bytes is skipped, never ``take-failed:EPERM``."""
+    repo, pd, b, i, d, isha = _prep(ex, tmp_path)
+    lines: list = []
+
+    def no_link(src, dst, *a, **k):
+        raise OSError(errno.EPERM, "seam: no hard links")
+    monkeypatch.setattr(os, "link", no_link)
+    m = AT.migrate(GIT, repo, b, i, d, isha, log=lines.append)
+    assert m.written == [m.pack, m.idx] and sorted(os.listdir(pd)) == sorted([m.pack, m.idx])
+    assert [x.endswith("(rename)") for x in lines if x.startswith("finalise ")] == [True, True]
+    for name in (m.pack, m.idx):
+        assert stat.S_IMODE((pd / name).stat().st_mode) == 0o444
+    assert subprocess.run([GIT, "cat-file", "-e", ex["head"]], cwd=repo, env=ENV).returncode == 0
+    for name in (m.pack, m.idx):
+        (pd / name).unlink()
+
+    def racing(src, dst, *, src_dir_fd=None, dst_dir_fd=None, follow_symlinks=True):
+        if dst.endswith(".pack"):                   # the same bytes arrive at the final name first
+            fd = os.open(src, os.O_RDONLY, dir_fd=src_dir_fd)
+            out = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444, dir_fd=dst_dir_fd)
+            os.write(out, os.read(fd, len(ex["pack"]) + 1))
+            os.close(fd)
+            os.close(out)
+        raise OSError(errno.EPERM, "seam: no hard links")
+    monkeypatch.setattr(os, "link", racing)
+    m = AT.migrate(GIT, repo, b, i, d, isha)
+    assert m.skipped == [m.pack] and m.written == [m.idx]
+    assert sorted(os.listdir(pd)) == sorted([m.pack, m.idx])
+
+
+@pytest.mark.parametrize("bad", ["s-" + "E4" * 8, "s-" + "e4" * 7, "s-" + "e4" * 8 + "0", "../x", "s-e4e4/../e4e4"])
+def test_take_session_id_refused(ex, tmp_path, bad):
+    """A session id outside the design's form (``^s-[0-9a-f]{16}$``) is refused before anything is read."""
+    with pytest.raises(ValueError):
+        AT.take(git=GIT, repo=tmp_path, bundle=tmp_path / "b", idx=tmp_path / "i", claims=ex["claims"], session=bad,
+                object_format="sha1", which="head")
+    with pytest.raises(ValueError):
+        AT.ref_name(bad, "head")
+
+
+@pytest.mark.skipif(not hasattr(__import__("fcntl"), "F_FULLFSYNC"), reason="F_FULLFSYNC is Darwin")
+def test_take_full_fsync(tmp_path, monkeypatch):
+    """Darwin: ``F_FULLFSYNC``; ``os.fsync`` only when it answers ENOTSUP or EINVAL; any other errno raised."""
+    import fcntl
+    calls: list = []
+    answer: list = [None]
+
+    def fake_fcntl(fd, op, *a):
+        calls.append("F_FULLFSYNC" if op == fcntl.F_FULLFSYNC else op)
+        if answer[0] is not None:
+            raise OSError(answer[0], "seam")
+        return 0
+    monkeypatch.setattr(fcntl, "fcntl", fake_fcntl)
+    monkeypatch.setattr(os, "fsync", lambda fd: calls.append("fsync"))
+    fd = os.open(tmp_path, os.O_RDONLY)
+    try:
+        for err, want in ((None, ["F_FULLFSYNC"]), (errno.ENOTSUP, ["F_FULLFSYNC", "fsync"]),
+                          (errno.EINVAL, ["F_FULLFSYNC", "fsync"])):
+            calls.clear()
+            answer[0] = err
+            AT._full_fsync(fd)
+            assert calls == want
+        answer[0] = errno.EIO
+        with pytest.raises(OSError):
+            AT._full_fsync(fd)
+    finally:
+        os.close(fd)
