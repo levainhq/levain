@@ -45,6 +45,8 @@ from typing import Any
 # verbs. Never `team record` / `retire` / `draft promote`: the ledger is signed by the operator.
 DOOR: frozenset[tuple[str, ...]] = frozenset({
     ("coord", "status"), ("coord", "claim"), ("coord", "beat"), ("coord", "release"),
+    # the seats' questions, read first (C5): its own KNOWs and escalations, never the operator's answer verb
+    ("coord", "questions"), ("coord", "answer"), ("coord", "escalate"),
     ("drops", "list"), ("drops", "show"), ("drops", "split"),
     ("thread", "list"), ("thread", "show"), ("thread", "state"), ("thread", "merge"), ("thread", "detach"),
     ("thread", "add"), ("thread", "set"),

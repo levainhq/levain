@@ -54,7 +54,7 @@ __all__ = [
     "consent_grant", "consent_grant_tool_problem", "consent_revocable", "consent_tool_shape_problem",
     "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem",
     "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_problem",
-    "genesis_policy", "inert_grant", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
+    "genesis_policy", "inert_grant", "log_head", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
     "presence_missing", "snapshot", "sshsig_public_key", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
 ]
 
@@ -1472,6 +1472,15 @@ def snapshot(conn: sqlite3.Connection, *, cache: ReplayCache | None = None,
     if state is None:
         raise NotInitialised("the authority log is empty: run `levain cockpit ledger init`")
     return state
+
+
+def log_head(conn: sqlite3.Connection) -> tuple[int, str] | None:
+    """``(seq, hash)`` of the log's last stored link, unverified (one indexed read, no replay); None when the log is
+    empty. Equal to a verified snapshot's ``(seq, head_hash)`` exactly when no link was appended at, or replaced in,
+    the head since that replay: a caller that verified a snapshot outside a lock compares only this inside it. A row
+    rewritten below an unchanged head row is not seen here; the next full replay and the anchor refuse it."""
+    row = conn.execute("SELECT seq, hash FROM authority_log ORDER BY seq DESC LIMIT 1").fetchone()
+    return None if row is None else (row[0], row[1])
 
 
 # ---------------------------------------------------------------------------------------------------

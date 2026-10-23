@@ -476,6 +476,13 @@ def _snapshot(args: argparse.Namespace, store: EnvelopeStore) -> Any:
     return _authority_source(store.directory, args.data_root)()
 
 
+def _head_reader(args: argparse.Namespace, store: EnvelopeStore) -> Any:
+    """The same authority source's head reader (``AuthoritySource.head``): the log's stored head, no replay."""
+    from levain.dispatch.cli import _authority_source
+
+    return _authority_source(store.directory, args.data_root).head
+
+
 def _need_terminal(args: argparse.Namespace, what: str) -> None:
     from levain.dispatch import cli as dcli
 
@@ -1194,12 +1201,16 @@ def _coord_first_reader(args: argparse.Namespace, out: Any, store: EnvelopeStore
 
     cmd = args.coord_cmd
     if cmd == "escalate":
+        from levain.consent.band import release_held_pings
+
         reply_id = fr.escalate(store, args.ref, args.why, token=args.token)
-        _emit(out, args.json, {"reply_id": reply_id}, f"escalated: question {args.ref} waits on the operator "
-                                                      f"(ANSWER {reply_id}); the question is untouched")
+        released = release_held_pings(store.directory)        # a ping held for it goes now (C5-1)
+        _emit(out, args.json, {"reply_id": reply_id, "pings": released},
+              f"escalated: question {args.ref} waits on the operator (ANSWER {reply_id}); the question is untouched"
+              + "".join(f"\n{line}" for line in released))
         return 0
-    authority, unchecked = _band_snapshot(args, store)
     if cmd == "questions":
+        authority, unchecked = _band_snapshot(args, store)
         rows = fr.read_band(store, authority=authority)
         obj = [{"n": r.question.n, "id": r.question.id, "agent": r.question.agent,
                 "session": r.question.agent_session_id, "what": r.question.what,
@@ -1213,8 +1224,15 @@ def _coord_first_reader(args: argparse.Namespace, out: Any, store: EnvelopeStore
         _emit(out, args.json, {"questions": obj, "unchecked": unchecked or None},
               "\n".join(lines) if rows else "no unread questions" + (f" ({unchecked})" if unchecked else ""))
         return 0
+    # the snapshot (a verified replay) is taken just before the answer's fenced transaction, and only the log's head is
+    # compared inside it (C5 L3 r1, r2); with no head reader the snapshot is never live-checked again, so none is used
+    try:
+        head = _head_reader(args, store)
+    except _faults():
+        head = None
     item, reply_id = fr.answer(store, args.ref, option=args.option, text=args.text, token=args.token,
-                               authority=authority)
+                               authority_source=(lambda: _band_snapshot(args, store)[0]) if head is not None
+                               else (lambda: None), authority_head=head)
     _emit(out, args.json, {"item_id": item.item_id, "reply_id": reply_id},
           f"KNOW {reply_id} filed for your review ({item.item_id}); the seat gets it labelled as the coordinator's "
           "own, and the question stays open for you")
@@ -1442,7 +1460,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         description="You read the question band first (Q17). You may answer a question only when it was asked by a "
                     "worker Levain started under a live envelope, from inside a repo the envelope names, and no "
                     "option of it is tied to a consent request; everything else you escalate. Whether its subject "
-                    "is inside the envelope is your judgement: the operator reviews every answer you give.")
+                    "is inside the envelope is your judgement: the operator reviews every answer you give. A "
+                    "question's directory and session are the asking process's own word, so 'asked from inside the "
+                    "envelope' is a label, not proof.")
     cq.add_argument("--data-root", dest="data_root", type=Path, default=None, help=band_root)
     can = c_sub.add_parser(
         "answer", help="Answer a seat's question as your own KNOW (never the operator's answer).",

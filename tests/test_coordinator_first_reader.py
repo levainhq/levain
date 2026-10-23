@@ -205,7 +205,7 @@ def test_the_hook_path_reads_nothing_without_a_coordinator_store(tmp_path):
     d.mkdir(mode=0o700)
     QuestionStore(d).file(agent="claude_code", agent_session_id=SEAT, what="w?", options=[("a", "x"), ("b", "y")],
                           rec="a", blocks="b", cwd=str(tmp_path))
-    assert fr.claim_knows(d, "claude_code", SEAT) == []
+    assert fr.claim_knows(d, "claude_code", SEAT, band_mod.know_line) == []
     assert not (d / "dispatch.db").exists()
     assert question_context(d, "claude_code", SEAT) is None
 
@@ -216,3 +216,237 @@ def test_a_coordinator_session_is_recognised_only_by_a_coordinator_launch(band):
     assert not fr.is_coordinator_session(band.store.directory, None)
     assert not sqlite3.connect(band.store.path).execute(
         "SELECT 1 FROM launch_events WHERE harness_session_id = 'nobody'").fetchone()
+
+
+# --- C5 fix round (L3 r1): the door, the stale reads, the realpath, format-before-mark ----------------------------
+def _seam(monkeypatch, store, act):
+    """Run ``act`` (the operator, between the coordinator's read and its fenced transaction) as ``store._write`` opens."""
+    import contextlib
+
+    orig = store._write
+
+    @contextlib.contextmanager
+    def write(*a, **k):
+        act()
+        with orig(*a, **k) as got:
+            yield got
+
+    monkeypatch.setattr(store, "_write", write)
+
+
+def test_the_coordinators_question_verbs_pass_its_door(band, monkeypatch, capsys):
+    """L3 r1 codex HIGH, reproduced by run_door_BEFORE.txt: run from its recorded workspace, the coordinator's three
+    question verbs (the ones its brief names) were refused by the door before they ran."""
+    from levain.cli import main
+    from levain.coordinator import cli as ccli
+    from levain.coordinator import door
+
+    q1, q2 = band.ask(), band.ask("clean my home?", cwd=str(band.c.tmp))
+    ws = band.c.tmp / "coordws"
+    (ws / "sub").mkdir(parents=True)
+    door.record(ws)
+    monkeypatch.chdir(ws / "sub")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", COORD)
+    monkeypatch.setattr(ccli, "_store", lambda args: band.store)          # the store on the test's fixed clock
+    monkeypatch.setattr(ccli, "_snapshot", lambda args, store: band.c.snap)
+    monkeypatch.setattr(ccli, "_head_reader", lambda args, store: lambda: (band.c.snap.seq, band.c.snap.head_hash))
+    qd = ["--queue-dir", str(band.store.directory)]
+    assert main(["coord", "questions", *qd]) == 0, capsys.readouterr().err
+    assert "MAY ANSWER" in capsys.readouterr().out
+    assert main(["coord", "answer", str(q1.n), "--option", "a", "--token", str(band.token), *qd]) == 0
+    assert main(["coord", "escalate", str(q2.n), "--why", "outside", "--token", str(band.token), *qd]) == 0
+    assert sorted(band.reads()) == sorted([(q1.id, "know"), (q2.id, "escalated")])
+    assert main(["coord", "take", *qd]) == 1             # a verb not in the door stays refused there
+    assert "is the operator's, and this is the coordinator's workspace" in capsys.readouterr().err
+
+
+def test_an_operator_answer_between_the_read_and_the_write_files_no_know(band, monkeypatch):
+    """L3 r1 consensus MED: ``answer`` checked the question it read BEFORE its fenced transaction. The operator answers
+    in that gap: nothing is filed."""
+    q = band.ask()
+    _seam(monkeypatch, band.store, lambda: band.qs.answer(q.id, option="b", channel="cli"))
+    with pytest.raises(CoordError, match="the operator has answered it"):
+        band.answer(q)
+    assert band.reads() == [] and band.c.rows("SELECT COUNT(*) FROM replies WHERE kind = 'know'") == [(0,)]
+    assert band.c.rows("SELECT COUNT(*) FROM review_items WHERE feed = 'know'") == [(0,)]
+
+
+def test_a_signer_revoked_between_the_snapshot_and_the_write_files_no_know(band, keys, tmp_path, monkeypatch):  # noqa: F811
+    """L3 r1 codex MED: the CLI took the authority snapshot before the fenced transaction. The envelope's signer is
+    revoked in that gap: the log's head moved, so the snapshot is taken again (outside the lock, L3 r2), and nothing
+    is filed."""
+    from levain.coordinator import cli as ccli
+
+    (tmp_path / "auth2").mkdir()
+    lg = Log(tmp_path / "auth2", keys)
+    lg.enrol("laptop", "laptop-presence")
+    lg.enrol("phone", "display-phone")
+    monkeypatch.setattr(ccli, "_snapshot", lambda args, store: lg.source())
+    monkeypatch.setattr(ccli, "_head_reader", lambda args, store: lg.source.head)
+    q = band.ask()
+    assert fr.read_band(band.store, authority=lg.source())[0].may_answer      # live before the revoke
+    _held(monkeypatch, band.store, act=lambda: lg.revoke("phone"))      # once: the retry re-opens the lock
+    args = argparse.Namespace(coord_cmd="answer", ref=str(q.n), option="a", text=None, token=band.token,
+                              data_root=None, json=False)
+    with pytest.raises(CoordError, match="escalate"):
+        ccli._coord_first_reader(args, io.StringIO(), band.store)
+    assert band.reads() == [] and band.c.rows("SELECT COUNT(*) FROM replies WHERE kind = 'know'") == [(0,)]
+
+
+def test_a_know_is_not_delivered_when_the_operator_answers_between_the_read_and_the_claim(band, monkeypatch):
+    """L3 r1 codex MED: ``claim_knows`` read the session's open questions before its delivery transaction. The operator
+    answers in that gap: the KNOW is not delivered and not marked delivered."""
+    from levain.autonomic.durable_sqlite import write_transaction as real
+
+    q = band.ask()
+    band.answer(q)
+
+    def write(connect):
+        band.qs.answer(q.id, option="b", channel="cli")
+        return real(connect)
+
+    monkeypatch.setattr(fr, "write_transaction", write)
+    assert fr.claim_knows(band.store.directory, "claude_code", SEAT, band_mod.know_line) == []
+    assert band.c.rows("SELECT COUNT(*) FROM know_deliveries") == [(0,)]
+
+
+def test_a_know_that_fails_to_format_is_not_marked_delivered(band, monkeypatch):
+    """L3 r1 LOW: the KNOW was marked delivered before it was formatted, so a formatting error lost it unseen."""
+    q = band.ask()
+    band.answer(q)
+
+    def broken(question, body):
+        raise ValueError("cannot format")
+
+    monkeypatch.setattr(band_mod, "know_line", broken)
+    assert question_context(band.store.directory, "claude_code", SEAT) is None
+    assert band.c.rows("SELECT COUNT(*) FROM know_deliveries") == [(0,)]
+    monkeypatch.undo()
+    assert "the coordinator, not the operator, answered question #1" in question_context(
+        band.store.directory, "claude_code", SEAT)
+
+
+def test_a_symlinked_repo_in_the_envelope_still_contains_its_own_real_path(tmp_path):
+    """L3 r1 LOW: only the question's cwd was resolved; an envelope repo spelled through a link never matched."""
+    real = tmp_path / "real-repo"
+    (real / "sub").mkdir(parents=True)
+    link = tmp_path / "link-repo"
+    link.symlink_to(real)
+    assert fr._inside(str(real / "sub"), [{"repo": str(link)}])
+    assert fr._inside(str(link), [{"repo": str(link)}])
+    assert not fr._inside(str(tmp_path), [{"repo": str(link)}])
+
+
+# --- C5 fix round 2 (L3 r2): no replay under the dispatch lock; escalate re-reads the question -----------------------
+def _held(monkeypatch, store, act=None):
+    """Mark while ``store._write`` holds the dispatch lock; run ``act`` (once) just before it opens."""
+    import contextlib
+
+    orig, held, fired = store._write, [False], [False]
+
+    @contextlib.contextmanager
+    def write(*a, **k):
+        if act is not None and not fired[0]:
+            fired[0] = True
+            act()
+        with orig(*a, **k) as got:
+            held[0] = True
+            try:
+                yield got
+            finally:
+                held[0] = False
+
+    monkeypatch.setattr(store, "_write", write)
+    return held
+
+
+def _counting(monkeypatch, held):
+    """Count signature verifications in all and while the dispatch lock is held."""
+    from levain import authority as auth
+
+    real, n = auth.verify_link_sig, {"all": 0, "locked": 0}
+
+    def verify(*a, **k):
+        n["all"] += 1
+        n["locked"] += held[0]
+        return real(*a, **k)
+
+    monkeypatch.setattr(auth, "verify_link_sig", verify)
+    return n
+
+
+def _cold_log(tmp_path, keys):  # noqa: F811
+    from levain.authority import ReplayCache
+    from levain.consent.queue import authority_source
+
+    (tmp_path / "auth3").mkdir()
+    lg = Log(tmp_path / "auth3", keys)
+    lg.enrol("laptop", "laptop-presence")
+    lg.enrol("phone", "display-phone")
+    return lg, authority_source(lg.path, anchor=None, cache=ReplayCache())     # this process has verified nothing
+
+
+def _cli_answer(band, q):
+    from levain.coordinator import cli as ccli
+
+    args = argparse.Namespace(coord_cmd="answer", ref=str(q.n), option="a", text=None, token=band.token,
+                              data_root=None, json=False)
+    return ccli._coord_first_reader(args, io.StringIO(), band.store)
+
+
+def test_answer_verifies_no_signature_while_it_holds_the_dispatch_lock(band, keys, tmp_path, monkeypatch):  # noqa: F811
+    """L3 r2 consensus MED: ``answer`` replayed the whole authority log (one ssh-keygen per uncached link) inside the
+    ``dispatch.db`` write lock, so every other writer waited. The replay runs before the lock; inside it only the log's
+    head is compared."""
+    from levain.coordinator import cli as ccli
+
+    _lg, cold = _cold_log(tmp_path, keys)
+    snaps = []
+    monkeypatch.setattr(ccli, "_snapshot", lambda args, store: snaps.append(1) or cold())
+    monkeypatch.setattr(ccli, "_head_reader", lambda args, store: cold.head, raising=False)
+    q = band.ask()
+    held = _held(monkeypatch, band.store)
+    n = _counting(monkeypatch, held)
+    assert _cli_answer(band, q) == 0
+    assert band.reads() == [(q.id, "know")]
+    assert n["all"] > 0 and n["locked"] == 0, n
+    assert len(snaps) == 1
+
+
+def test_a_log_that_moves_between_the_snapshot_and_the_lock_is_replayed_outside_it(band, keys, tmp_path, monkeypatch):  # noqa: F811
+    """The head moved (a link appended) between the snapshot and the lock: the transaction is abandoned, the log is
+    replayed again OUTSIDE the lock, and the answer is filed on the new head; no signature is verified under it."""
+    from levain.coordinator import cli as ccli
+
+    lg, cold = _cold_log(tmp_path, keys)
+    snaps = []
+    monkeypatch.setattr(ccli, "_snapshot", lambda args, store: snaps.append(1) or cold())
+    monkeypatch.setattr(ccli, "_head_reader", lambda args, store: cold.head, raising=False)
+    q = band.ask()
+    held = _held(monkeypatch, band.store, act=lambda: lg.enrol("presence", "presence"))
+    n = _counting(monkeypatch, held)
+    assert _cli_answer(band, q) == 0
+    assert band.reads() == [(q.id, "know")]
+    assert len(snaps) == 2 and n["locked"] == 0, (snaps, n)
+
+
+def test_a_log_that_never_stops_moving_is_refused_without_a_know(band, keys, tmp_path, monkeypatch):  # noqa: F811
+    from levain.coordinator import cli as ccli
+
+    _lg, cold = _cold_log(tmp_path, keys)
+    monkeypatch.setattr(ccli, "_snapshot", lambda args, store: cold())
+    monkeypatch.setattr(ccli, "_head_reader", lambda args, store: (lambda: (10**6, "elsewhere")), raising=False)
+    q = band.ask()
+    with pytest.raises(CoordError, match="kept moving"):
+        _cli_answer(band, q)
+    assert band.reads() == [] and band.c.rows("SELECT COUNT(*) FROM replies WHERE kind = 'know'") == [(0,)]
+
+
+def test_escalating_a_question_the_operator_answered_meanwhile_is_refused(band, monkeypatch):
+    """L3 r2 complement LOW: ``escalate`` read the question before its transaction and never checked it was still
+    open. The operator answers in that gap: nothing is filed."""
+    q = band.ask()
+    _seam(monkeypatch, band.store, lambda: band.qs.answer(q.id, option="b", channel="cli"))
+    with pytest.raises(CoordError, match="answered"):
+        fr.escalate(band.store, q.id, "outside", token=band.token)
+    assert band.reads() == [] and band.c.rows("SELECT COUNT(*) FROM replies WHERE kind = 'answer'") == [(0,)]

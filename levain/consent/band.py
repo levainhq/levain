@@ -15,6 +15,10 @@ it runs as the agent, and the agent, session and queue directory it names are th
 The coordinator reads the band first (C5, :mod:`levain.coordinator.first_reader`). Its answer is a KNOW in its own
 store, never an answer here: the hook delivers it labelled as the coordinator's (:func:`know_line`, :data:`KNOW_TAIL`)
 while the question stays open, and ``levain question answer`` refuses a session Levain started as the coordinator.
+While a coordinator holds a live lease, ``levain ask`` holds its ping (C5-1, Phill's *"4a"*): the operator is pinged
+when the coordinator escalates the question or has not read it within 10 minutes (:func:`release_held_pings`, checked
+by the gate hook, ``levain coord watch``, ``levain ask`` and ``levain coord escalate``; the first reader's known
+edges say what that does not cover).
 
 The answer is claimed by the session's MAIN thread only (a hook session key with no ``#agent:`` part), keyed by the
 session id ``levain ask`` read from the agent's environment: a subagent's context is discarded when it ends, and
@@ -74,8 +78,8 @@ from levain.cockpit.consent import ConsentError
 from levain.consent.questions import Link, Question, QuestionStore, QuestionStoreError
 
 __all__ = ["AGENT_LINE", "ANSWER_TAIL", "KNOW_TAIL", "NO_SESSION", "QUOTED_NOTE", "add_parsers", "answer_line", "ask_resume_meta",
-           "deliver_answer", "deliver_answers", "file_question", "know_line", "question_context", "run_ask", "run_question",
-           "transcript_facts"]
+           "deliver_answer", "deliver_answers", "file_question", "know_line", "question_context", "release_held_pings",
+           "run_ask", "run_question", "transcript_facts"]
 
 # the session a question names when the environment names none (no hook's session is ever this)
 NO_SESSION = "levain-ask"
@@ -162,6 +166,7 @@ def question_context(directory: Path | str, agent: str, session: str | None) -> 
     """The answers not yet delivered to this session, one line each and :data:`ANSWER_TAIL` last (claimed: each
     reaches the session once), or ``None``. Only a main-thread session key claims; a store that does not exist yet
     is read as no answers and is not created."""
+    _release_quietly(directory)          # every hook checks the held pings (C5-1), whoever's session it is
     if not isinstance(session, str) or not session or _SUBAGENT in session or session == NO_SESSION:
         return None
     store = QuestionStore(directory)
@@ -203,9 +208,48 @@ def _coordinator_lines(directory: Path | str, agent: str, session: str) -> list[
     try:
         from levain.coordinator.first_reader import claim_knows
 
-        return [know_line(q, body) for q, body in claim_knows(directory, agent, session)]
+        # each line is formatted inside the claim, before its KNOW is marked delivered (never marked unseen)
+        return claim_knows(directory, agent, session, know_line)
     except Exception:  # noqa: BLE001 - the hook carries the operator's answers whatever the coordinator's store does
         return []
+
+
+def _send_ping(agent: str, q: Question, qdir: Path, extra: str = "") -> bool:
+    """Ping the operator about question ``q`` through the agent's notify seam; False when nothing was sent. Never
+    raises: a ping is a ping."""
+    try:
+        adapter = _agents()[agent]
+        send = getattr(adapter, "notify", _agents()["claude_code"].notify)   # Codex shares Claude Code's notify seam
+        return bool(send(adapter.load_settings(qdir), _ping_text(agent, q, qdir) + extra, cwd=qdir, kind="question",
+                         ref=f"question:{q.n}"))
+    except Exception:  # noqa: BLE001 - see the docstring
+        return False
+
+
+def release_held_pings(directory: Path | str) -> list[str]:
+    """Send every held ping now due (C5-1, :func:`levain.coordinator.first_reader.claim_held`), each once; one line per
+    release. Never raises: a store that cannot be read now is checked at the next call."""
+    try:
+        from levain.coordinator.first_reader import UNREAD_AFTER, claim_held
+
+        due = claim_held(directory)
+    except Exception:  # noqa: BLE001 - see the docstring
+        return []
+    minutes = int(UNREAD_AFTER.total_seconds() // 60)
+    lines = []
+    for q, cause in due:
+        extra = ("\nThe coordinator escalated it to you." if cause == "escalated" else
+                 f"\nThe coordinator has not read it in {minutes} minutes; it waits on you.")
+        pinged = _send_ping(q.agent, q, Path(directory), extra)
+        lines.append(f"question #{q.n} ({cause}): the operator was {'pinged' if pinged else 'NOT pinged'}")
+    return lines
+
+
+def _release_quietly(directory: Path | str) -> None:
+    try:
+        release_held_pings(directory)
+    except Exception:  # noqa: BLE001 - the hook carries the answers whatever the held pings do
+        pass
 
 
 def _ancestors() -> Iterator[tuple[int, list[str]]]:
@@ -290,6 +334,15 @@ def _ping_text(agent: str, q: Question, qdir: Path) -> str:
     where = "" if Path(qdir) == default_queue_dir() else f" --queue-dir {shlex.quote(str(qdir))}"
     return (f"levain: {agent} asks (question #{q.n}): {q.what}\nOptions: {opts}.\nBlocks: {q.blocks}.\n"
             f"Answer: levain question answer {q.n}{where} --option <key> (or --text \"...\").")
+
+
+def _hold(qdir: Path, question_id: str) -> bool:
+    try:
+        from levain.coordinator.first_reader import hold_ping
+
+        return hold_ping(qdir, question_id)
+    except Exception:  # noqa: BLE001 - a fault pings, as before C5-1
+        return False
 
 
 class _PushFiled(ValueError):
@@ -409,20 +462,22 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
     # is never announced as a one-tap option
     state = None if link is None else _push_state(agent, qdir, link.request_id)
     tappable = link is not None and state in ("undecided", "unknown")
-    adapter = _agents()[agent]
-    send = getattr(adapter, "notify", _agents()["claude_code"].notify)   # Codex shares Claude Code's notify seam
-    try:
-        ping_text = _ping_text(agent, q, qdir)
+    _release_quietly(qdir)                       # earlier held pings now due go first (C5-1)
+    # C5-1: while a coordinator holds a live lease it reads first and the ping is held; a question tied to a consent
+    # request is the operator's ruling alone and is never held
+    held = link is None and _hold(qdir, q.id)
+    pinged = False
+    if not held:
+        extra = ""
         if state == "undecided":                 # the ping claims the tap only on a state actually read
-            ping_text += (f"\nOption {link.option} is tied to the {push_words}: picking it on the phone page with a "
-                          "passkey also allows that push (or rule it with `levain consent rule`).")
-        pinged = send(adapter.load_settings(qdir), ping_text, cwd=qdir, kind="question", ref=f"question:{q.n}")
-    except Exception:  # noqa: BLE001 - a ping is a ping: it never fails the question
-        pinged = False
+            extra = (f"\nOption {link.option} is tied to the {push_words}: picking it on the phone page with a "
+                     "passkey also allows that push (or rule it with `levain consent rule`).")
+        pinged = _send_ping(agent, q, qdir, extra)
     where = ("the answer arrives in your context at a later tool call" if session != NO_SESSION else
              "no session was found in your environment, so the answer will be recorded but not delivered to you "
              + no_session_hint)
-    ping = ("pinged" if pinged else
+    ping = ("not pinged yet: a coordinator holds the live lease and reads it first; the operator is pinged if it "
+            "escalates the question or has not read it within 10 minutes" if held else "pinged" if pinged else
             "NOT pinged (no notify command is configured and no phone has pings on; the question is listed in "
             "`levain question list`)")
     text = (f"levain ask: question #{q.n} filed ({q.id}); the operator was {ping}. Keep working on what it does "
