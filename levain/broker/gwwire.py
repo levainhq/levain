@@ -16,7 +16,7 @@ import os
 import re
 from typing import Iterable, Optional, Union
 
-from levain.broker.norm import STATUS
+from levain.broker.norm import is_name
 
 #: V10's per-type caps. The empty frames carry nothing.
 CAPS = {b"H": 4096, b"A": 4096, b"F": 4096, b"Q": 65536, b"R": 65536, b"U": 65536,
@@ -98,7 +98,7 @@ def _headers(v: object) -> bool:
 _SCHEMAS = {
     b"H": {"v": lambda v: v == 1 and _uint(v), "session": lambda v: _str(v) and bool(v), "incarnation": _uint},
     b"A": {},
-    b"F": {"refused": lambda v: _str(v) and v in STATUS},
+    b"F": {"refused": lambda v: _str(v) and is_name(v)},
     b"Q": {"v": lambda v: v == 1 and _uint(v), "token": _str, "route": _str, "method": _str, "path": _str,
            "query": _str, "headers": _headers, "body": lambda v: _str(v) and bool(_BODY.match(v)),
            "upgrade": lambda v: v in ("none", "websocket")},

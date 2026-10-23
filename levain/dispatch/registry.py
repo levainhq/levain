@@ -70,6 +70,7 @@ from typing import Any, Protocol
 
 from levain.contracts.canon import canonical_bytes, parse
 from levain.dispatch import DispatchError
+from levain.dispatch import routemap_rules
 from levain.dispatch.contract import ResolvedTemplate
 from levain.dispatch.policy import PolicyError, ProviderPolicy, match, path_text_problem
 from levain.dispatch.verifier_report import _steps_problem, artifact_digest
@@ -107,8 +108,8 @@ CRITERION_INT_MAX = {"max_changed_lines": 1_000_000, "max_bytes": 1 << 30, "max_
                      "max_age_hours": 24 * 366}
 _BRANCH_MAX = 255
 ROUTE_KEYS = frozenset({"route", "provider", "upstream", "credential", "models", "body_policy", "retention_claim"})
-_ENTRIES_MAX = 256
-_TEXT_MAX = 1024
+_ENTRIES_MAX = routemap_rules.ENTRIES_MAX
+_TEXT_MAX = routemap_rules.TEXT_MAX
 _SHA256_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 # a verifier id and a driver template name, as the S1 contract writes them; a template's verifier_id has the same shape
 _VERIFIER_ID = re.compile(r"[a-z0-9-]{1,48}")
@@ -191,10 +192,7 @@ def r0_write_refusal(path: str) -> str | None:
     return None
 
 
-def _text(value: Any, what: str) -> str | None:
-    if not isinstance(value, str) or not value or len(value) > _TEXT_MAX:
-        return f"{what} must be 1 to {_TEXT_MAX} characters of text"
-    return path_text_problem(value, what)
+_text = routemap_rules.text_problem
 
 
 # --- templates -----------------------------------------------------------------------------------------------------
@@ -418,8 +416,9 @@ def _routemap(body: Any) -> str | None:
     if not isinstance(body, dict) or set(body) != {"routes"}:
         return 'a routemap body is exactly {"routes": [...]}'
     routes = body["routes"]
-    if not isinstance(routes, list) or len(routes) > _ENTRIES_MAX:
-        return f"routes is a list of at most {_ENTRIES_MAX} routes"
+    problem = routemap_rules.routes_count_problem(routes)
+    if problem is not None:
+        return problem
     seen: set[str] = set()
     for r in routes:
         if not isinstance(r, dict) or set(r) != ROUTE_KEYS:
@@ -431,10 +430,11 @@ def _routemap(body: Any) -> str | None:
         if r["route"] in seen:
             return f"route {r['route']} is listed twice"
         seen.add(r["route"])
-        models = r["models"]
-        if not isinstance(models, list) or not models or len(models) > _ENTRIES_MAX:
-            return f"route {r['route']}: models is a non-empty list"
+        problem = routemap_rules.models_count_problem(r["route"], r["models"])
+        if problem is not None:
+            return problem
         requested: set[str] = set()
+        models = r["models"]
         for m in models:
             if not isinstance(m, dict) or set(m) != {"requested", "backend"}:
                 return f"route {r['route']}: a model is exactly requested, backend"
@@ -445,20 +445,9 @@ def _routemap(body: Any) -> str | None:
             if m["requested"] in requested:
                 return f"route {r['route']}: model {m['requested']} is listed twice"
             requested.add(m["requested"])
-        bp = r["body_policy"]
-        if not isinstance(bp, dict) or len(bp) > _ENTRIES_MAX:
-            return f"route {r['route']}: body_policy is a mapping"
-        for key, value in bp.items():
-            problem = _text(key, "a body_policy key")
-            if problem is not None:
-                return f"route {r['route']}: {problem}"
-            values = value if isinstance(value, list) else [value]
-            if isinstance(value, list) and len(value) > _ENTRIES_MAX:
-                return f"route {r['route']}: body_policy {key} lists too many values"
-            for v in values:
-                problem = _text(v, f"body_policy {key}")
-                if problem is not None:
-                    return f"route {r['route']}: {problem} (a value is text or a list of text)"
+        problem = routemap_rules.body_policy_problem(r["route"], r["body_policy"])
+        if problem is not None:
+            return problem
     return None
 
 

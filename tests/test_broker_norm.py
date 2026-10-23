@@ -117,7 +117,7 @@ def test_norm_corpus(i):
                 parse_route(_route(**over), source="session")
         return
     # the refusal table: every name has a status, every status a reason, and an F naming each one decodes
-    assert len(norm.STATUS) == 19
+    assert len(norm.STATUS) == 21
     for name, status in norm.STATUS.items():
         assert status in norm.REASON
         assert gwwire.decode(b"F", gwwire.encode(b"F", {"refused": name})[5:]) == {"refused": name}
