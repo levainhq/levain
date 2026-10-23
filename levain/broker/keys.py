@@ -9,7 +9,11 @@ the request through `Upstream.write`); and the UPSTREAM half (session 3b-4): the
 `ledger.py`): the request check's last step admits a hold against the route's per-session cap, the head goes only
 behind its durable `reserved` line and the ledger's send gate, and every exit resolves the hold; and the metered
 request path (S1 3c-2a, R4 §1.7, `codec.py`): the body buffered under a keys-wide budget, parsed, checked against the
-route's price table, its output ceiling written in, held at its estimate, and forwarded as keys' own serialization.
+route's price table, its output ceiling written in, held at its estimate, and forwarded as keys' own serialization;
+and the attachment (S1 3c-3, CONTRACT §4.5): keys' one long-lived `KEYS-ATTACH` connection to CONTROL, on which it
+sends `FRONT-LOST` (a front gone without keys' `K`, or a registration unclaimed V23 after FRONT-ARM), `SPEND-OVERRUN`
+(the overrun stop, R4 §1.4) and the `SESSIONS` reconcile; with no attachment keys refuses every token, and the
+attachment's EOF is the admin EOF's fail-closed clear and closes the admin connection (each EOF closes the other).
 
 Known edges of the ledger wiring (3c-1 B1 L2, 10-23; not built, never a loss):
 - before Python 3.12 a cancel landing in the loop turn the durable wait completes is lost (bpo-42130; reproduced on
@@ -29,7 +33,7 @@ The admin server (design 1.5 "The admin connection", "Fencing", "Order inside on
   upstream write is refused) and stop reading the old one; cancel its request tasks and
   await them, bounded; the fail-closed clear in two phases (`reg_high` kept); close the old connection; adopt.
 - the adopted connection's EOF fails closed: the epoch is bumped (its in-flight tasks are stale from that instant) and
-  every registration is detached, `K` sent on each STATUS connection.
+  every registration is detached, `K` sent on each STATUS connection, and the attachment closed.
 
 Who may connect, decided at accept, after `peer.peer_of` and before the first frame:
 1. the peer's uid must be a `_levain_gw<n>` uid and its `(uid, pid, start)` must name a registration, else the
@@ -121,6 +125,7 @@ NOFILE_TERMS = {
     "dns": DNS_CONCURRENCY * DNS_FDS_PER_LOOKUP,
     "transient": TRANSIENT_NAMED + 2 * ACCEPT_BACKLOG,
     "admin": ADMIN_CONNS,
+    "attach": 1,   # the one KEYS-ATTACH connection to CONTROL
 }
 
 #: the `F` path's drain: every `F` is followed by SHUT_WR, then the front's frames are read and discarded until `E`,
@@ -166,6 +171,20 @@ ADMIN_VERBS = {
 }
 #: RELOAD's answer until keys serves a dispatch map: there is no generation it could now serve.
 RELOAD_REFUSED = "reload-unsupported"
+
+#: CONTRACT §11 V23, the value `levain.slot.control_client.V23_SECONDS` holds (keys imports no `levain.slot` module, so
+#: it is restated here; a test pins the two equal): the unclaimed registration's clock from `armed_at` (§4.5), and the
+#: wait for an answer to each request keys sends on its attachment.
+V23_S = 10.0
+#: 3c design r3 §2.1 (e): keys sends SESSIONS on every attachment's open and this often on the open attachment.
+RECONCILE_S = 60.0
+#: R4 §0 (r3 §2.1 (e) amended): this many CONSECUTIVE SESSIONS sends with no answer is the attachment's EOF.
+RECONCILE_MISSES = 3
+#: DECISION: the attach client's reconnect backoff, doubling from the first value to the cap.
+ATTACH_RETRY_FIRST_S = 0.25
+ATTACH_RETRY_MAX_S = 5.0
+#: DECISION: the digests one SESSIONS carries (CONTROL's `SESSIONS_DIGESTS_MAX`); more are sent as several.
+SESSIONS_CHUNK = 512
 
 GW_ACCOUNT = "_levain_gw{}"
 KEYS_ACCOUNT = "_levain_keys"
@@ -519,6 +538,22 @@ class AdminConn:
         self.wlock = asyncio.Lock()
 
 
+class Attachment:
+    """keys' one `KEYS-ATTACH` connection to CONTROL's socket (§4.5), multiplexed by `id`: the attachment's number (from
+    1), the answer futures per request id, one write at a time, and the count of consecutive unanswered SESSIONS."""
+
+    __slots__ = ("reader", "writer", "no", "pending", "next_id", "wlock", "misses", "ended")
+
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, no: int) -> None:
+        self.reader, self.writer, self.no = reader, writer, no
+        self.pending: Dict[int, asyncio.Future] = {}
+        self.next_id = 1   # id 1 was the KEYS-ATTACH itself
+        self.wlock = asyncio.Lock()
+        self.misses = 0
+        #: set once its EOF has been handled (`Keys._attach_lost`): nothing is sent on it after that
+        self.ended = False
+
+
 class AdminMalformed(Exception):
     """An admin frame that is not a `levain-control/1` request: the connection is closed, which is its EOF."""
 
@@ -565,6 +600,37 @@ async def read_control_answer(reader: asyncio.StreamReader) -> dict:
     obj = canon.parse(data)
     if type(obj) is not dict:
         raise AdminMalformed("not a JSON object")
+    return obj
+
+
+async def read_attach_answer(reader: asyncio.StreamReader) -> Optional[dict]:
+    """One answer on the attachment, or None at a clean EOF between frames: a 4-byte length within ADMIN_FRAME_MAX,
+    then one canonical JSON object `{"id":<int>,"ok":<bool>,...}` (`refused` a string when not ok), the rest of the
+    frame within ADMIN_FRAME_S of its first byte. Anything else raises AdminMalformed."""
+    try:
+        first = await reader.readexactly(1)
+    except asyncio.IncompleteReadError:
+        return None
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + ADMIN_FRAME_S
+    try:
+        head = first + await asyncio.wait_for(reader.readexactly(3), ADMIN_FRAME_S)
+        n = int.from_bytes(head, "big")
+        if n == 0 or n > ADMIN_FRAME_MAX:
+            raise AdminMalformed(f"answer length {n}")
+        data = await asyncio.wait_for(reader.readexactly(n), max(0.0, deadline - loop.time()))
+    except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+        raise AdminMalformed("an answer cut short or stalled") from None
+    try:
+        obj = canon.parse(data)
+    except ContractError as e:
+        raise AdminMalformed(str(e)) from None
+    if type(obj) is not dict or canon.canonical_bytes(obj) != data:
+        raise AdminMalformed("not a canonical JSON object")
+    if type(obj.get("id")) is not int or type(obj.get("ok")) is not bool:
+        raise AdminMalformed("an answer carries an integer id and a boolean ok")
+    if obj["ok"] is False and type(obj.get("refused")) is not str:
+        raise AdminMalformed("a refusal names itself")
     return obj
 
 
@@ -700,7 +766,21 @@ class Keys:
                  control_path: Optional[str] = None, lib_root: Optional[str] = None,
                  cred_lifecycle: Optional[CredLifecycle] = None, control_uid: Optional[int] = None,
                  ledger: Optional[ledger.Ledger] = None, dispatch_policy: object = None,
-                 creds: Optional[CredStore] = None) -> None:
+                 creds: Optional[CredStore] = None, attach: bool = False) -> None:
+        #: keys holds a KEYS-ATTACH connection to CONTROL (`main()` always passes True). While attached is None keys
+        #: refuses every token: FRONT-REGISTER is refused `keys-unavailable` and no `Q` is admitted, so every
+        #: registration lives inside one attachment, whose EOF clears it (§4.5). False: an in-process harness with no
+        #: CONTROL, which never attaches and gates nothing.
+        self.attach = attach
+        self.attached: Optional[Attachment] = None
+        self.attach_no = 0
+        #: the clocks of the attachment, attributes so a test can scale them down
+        self.attach_answer_s = V23_S
+        self.reconcile_s = RECONCILE_S
+        self.unclaimed_s = V23_S
+        self._attach_task: Optional[asyncio.Task] = None
+        #: the attach sends in flight (FRONT-LOST, SPEND-OVERRUN), kept so none is collected mid-send
+        self._attach_sends: Set[asyncio.Task] = set()
         #: the reservation ledger (`main()` opens it; `_serve` attaches and closes it). None refuses every admit
         #: `budget-exhausted` "no ledger" (design 3c-1 §2.5, Q6)
         self.ledger = ledger
@@ -750,8 +830,9 @@ class Keys:
         #: the sessions an overrun stopped (R4 §1.4): `_settle` adds one whose settle cost more than its hold, and
         #: `_check_q` and the pre-admit statement refuse its every later `Q` `budget-overrun`. Keyed by SESSION, never
         #: by a cache entry, so a re-registration or reattach that drops and re-resolves the session's claims keeps
-        #: the stop. Only DROP-SESSION (`drop_session`, registered or not) takes a session out; the fail-closed clear
-        #: keeps it; a restart loses it with the rest of memory.
+        #: the stop. Only DROP-SESSION (`drop_session`, registered or not, or the reconcile's drop of the session's
+        #: digest, which is one) takes a session out; the fail-closed clear keeps it, so an attachment's EOF and a
+        #: re-attach never lose it; a restart loses it with the rest of memory.
         self.budget_stopped: Set[str] = set()
         #: digests keys itself saw dropped (bounded, oldest first): `token-revoked` without asking
         self.dropped: "OrderedDict[str, None]" = OrderedDict()
@@ -887,6 +968,11 @@ class Keys:
                     if t is not None and t is not asyncio.current_task() and not t.done():
                         t.cancel()
                         admin_tasks.add(t)
+            self._attach_close(self.attached)   # (2b) the attachment too, its client and its sends cancelled
+            for t in {self._attach_task} | set(self._attach_sends):
+                if t is not None and t is not asyncio.current_task() and not t.done():
+                    t.cancel()
+                    admin_tasks.add(t)
             try:                            # (3)
                 self.cred_lifecycle.cancel_detached()
             except Exception as e:
@@ -912,6 +998,9 @@ class Keys:
         async with self.state_lock:
             if epoch != self.admin_epoch or self.closing:
                 return None
+            if self.attach and self.attached is None:
+                # no attachment, no registration (§4.5): one made now could outlive no EOF that clears it
+                return {"refused": "keys-unavailable"}
             high = self.reg_high.get(front_uid, 0)
             cur = self.regs.get(front_uid)
             if reg_token > high:
@@ -940,24 +1029,269 @@ class Keys:
             if reg is None or reg.reg_token != reg_token or self.regs.get(reg.front_uid) is not reg:
                 return {"refused": "registration-stale"}
             if reg.armed_at is None:   # the FIRST accepted FRONT-ARM stamps; a duplicate keeps the stamp
-                reg.armed_at = asyncio.get_running_loop().time()
+                loop = asyncio.get_running_loop()
+                reg.armed_at = loop.time()
                 reg.state = "armed"
+                if self.attach:   # §4.5: V23 from `armed_at` with no `H` is a lost front
+                    loop.call_later(self.unclaimed_s, self._unclaimed_due, reg, reg.armed_at)
             return {}
+
+    def _unclaimed_due(self, reg: Registration, armed_at: float) -> None:
+        self._attach_send_task(self._unclaimed_expire(reg, armed_at))
+
+    async def _unclaimed_expire(self, reg: Registration, armed_at: float) -> None:
+        """The unclaimed registration clock ran out (§4.5; s3b: "3c measures V23 from it"): a
+        registration still the session's, still ARMED (no `H` claimed it) with the same stamp, is lost: detached here,
+        then `FRONT-LOST` sent so CONTROL revokes the session."""
+        assert self.state_lock is not None
+        async with self.state_lock:
+            if (self.closing or reg.state != "armed" or reg.armed_at != armed_at
+                    or self.regs.get(reg.front_uid) is not reg or self.by_session.get(reg.session) is not reg):
+                return
+            victims = self._detach(reg)
+        self._effects(victims)
+        _note(logging.WARNING, "levain gw-keys: front-unclaimed session=%s", reg.session)
+        await self._front_lost(reg.session)
 
     async def drop_session(self, epoch: int, session: str) -> Optional[dict]:
         assert self.state_lock is not None
-        victims: List[Victim] = []
         async with self.state_lock:
             if epoch != self.admin_epoch or self.closing:
                 return None
-            reg = self.by_session.get(session)
-            if reg is not None:
-                victims = self._detach(reg, revoke=True)
-            # whether or not a registration is held (the fail-closed clear keeps the set and removes every
-            # registration): the one place a session leaves `budget_stopped`
-            self.budget_stopped.discard(session)
+            held, victims = self._drop_locked(session)
         self._effects(victims)
-        return {"dropped": reg is not None}   # false = nothing held: still success
+        return {"dropped": held}   # false = nothing held: still success
+
+    def _drop_locked(self, session: str) -> Tuple[bool, List[Victim]]:
+        """DROP-SESSION's phase 1 (caller holds state_lock; no await), which the reconcile's drop is too: the session's
+        registration detached with its digests marked dropped, and the session out of `budget_stopped` whether or not
+        a registration is held (the fail-closed clear keeps the set and removes every registration): the one place a
+        session leaves it. Returns whether a registration was held, and the victims for phase 2."""
+        reg = self.by_session.get(session)
+        victims = self._detach(reg, revoke=True) if reg is not None else []
+        self.budget_stopped.discard(session)
+        return reg is not None, victims
+
+    # -- the attachment (§4.5; 3c design r3 §2.1 (e); R4 §1.4) --
+
+    def start_attach(self) -> None:
+        """Start the attach client once (`_serve` calls it after the listeners are served): connect to CONTROL's socket,
+        `KEYS-ATTACH`, serve the attachment until its EOF, fail closed, and connect again with backoff, until the
+        shutdown latch."""
+        self._in_loop()
+        if self.attach and self._attach_task is None and not self.closing:
+            self._attach_task = asyncio.ensure_future(self._attach_loop())
+
+    async def _attach_loop(self) -> None:
+        backoff = ATTACH_RETRY_FIRST_S
+        noted = False
+        while not self.closing:
+            try:
+                att = await self._attach_open()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if not noted:   # once per run of failures: CONTROL down is a state, not a stream of events
+                    _note(logging.WARNING, "levain gw-keys: KEYS-ATTACH failed (%s); retrying", type(e).__name__)
+                    noted = True
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, ATTACH_RETRY_MAX_S)
+                continue
+            backoff, noted = ATTACH_RETRY_FIRST_S, False
+            try:
+                await self._attach_serve(att)
+            finally:
+                await asyncio.shield(self._attach_lost(att))
+
+    async def _attach_open(self) -> Attachment:
+        """One connect and `KEYS-ATTACH`, stating the route-map generation keys serves: none (`null`, `null`) until keys
+        loads a dispatch map (R4 §2). The answer must come within `attach_answer_s`; only an `ok` answer makes the
+        connection the attachment, and only while the latch is not set."""
+        if self.control_path is None:
+            raise OSError("no CONTROL socket")
+        assert self.state_lock is not None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.attach_answer_s
+        reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(self.control_path), self.attach_answer_s)
+        try:
+            writer.write(encode_admin({"v": 1, "op": "KEYS-ATTACH", "id": 1, "generation": None,
+                                       "item_sha256": None}))
+            await asyncio.wait_for(writer.drain(), max(0.0, deadline - loop.time()))
+            ans = await asyncio.wait_for(read_attach_answer(reader), max(0.0, deadline - loop.time()))
+            if ans is None or ans["id"] != 1 or ans["ok"] is not True:
+                raise AdminMalformed("KEYS-ATTACH was not answered ok")
+            async with self.state_lock:
+                if self.closing:
+                    raise AdminMalformed("closing")
+                self.attach_no += 1
+                att = Attachment(reader, writer, self.attach_no)
+                self.attached = att
+        except BaseException:
+            writer.transport.abort()
+            raise
+        print(f"levain gw-keys: attached n={att.no}", file=sys.stderr, flush=True)
+        return att
+
+    async def _attach_serve(self, att: Attachment) -> None:
+        """The attachment's read loop (each answer to its request's future) beside its reconcile ticker; returns at the
+        connection's EOF or a frame the wire does not allow."""
+        ticker = asyncio.ensure_future(self._reconcile_loop(att))
+        try:
+            while True:
+                ans = await read_attach_answer(att.reader)
+                if ans is None:
+                    return
+                fut = att.pending.get(ans["id"])
+                if fut is not None and not fut.done():
+                    fut.set_result(ans)
+        except (OSError, EOFError, AdminMalformed, asyncio.IncompleteReadError):
+            return
+        finally:
+            ticker.cancel()
+            await asyncio.gather(ticker, return_exceptions=True)
+
+    async def _attach_lost(self, att: Attachment) -> None:
+        """The attachment ended (§4.5): keys refuses every token, sends `K` to every front AND closes the other of the
+        two connections. In ONE mutation section: the attachment cleared, the admin epoch bumped (the admin connection's
+        tasks in flight change nothing after it) and the admin connection let go, and every registration detached (the
+        fail-closed clear: `reg_high` and `budget_stopped` kept). Then every waiter on the attachment is answered None,
+        both connections aborted, and phase 2 run. Once per attachment."""
+        assert self.state_lock is not None
+        victims: List[Victim] = []
+        adm: Optional[AdminConn] = None
+        async with self.state_lock:
+            if att.ended:
+                return
+            att.ended = True
+            if self.attached is att:
+                self.attached = None
+                self.admin_epoch += 1
+                adm, self.admin = self.admin, None
+                victims = self._detach_all()
+        for fut in att.pending.values():
+            if not fut.done():
+                fut.set_result(None)
+        try:
+            att.writer.transport.abort()
+        except Exception:
+            pass
+        self._effects(victims)
+        if adm is not None:
+            try:
+                adm.writer.transport.abort()   # its handler's EOF path finds it no longer adopted: nothing more
+            except Exception as e:
+                _note(logging.WARNING, "levain gw-keys: closing the admin connection failed (%s)", type(e).__name__)
+        if not self.closing:
+            print(f"levain gw-keys: detached n={att.no}", file=sys.stderr, flush=True)
+
+    def _attach_close(self, att: Optional[Attachment]) -> None:
+        """End `att` from keys' side (a FRONT-LOST CONTROL did not ack, the reconcile's third miss, the admin EOF): its
+        read loop reads the abort, and `_attach_lost` runs the EOF rule."""
+        if att is not None and not att.ended:
+            try:
+                att.writer.transport.abort()
+            except Exception:
+                pass
+
+    async def _attach_call(self, att: Attachment, op: str, args: dict) -> Optional[dict]:
+        """`op` on `att`; its answer, or None when the attachment is not (or no longer) the current one or no answer
+        came within `attach_answer_s` of the send."""
+        if att.ended or self.attached is not att:
+            return None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.attach_answer_s
+        att.next_id += 1
+        rid = att.next_id
+        fut: asyncio.Future = loop.create_future()
+        att.pending[rid] = fut
+        try:
+            data = encode_admin({"v": 1, "op": op, "id": rid, **args})
+            async with att.wlock:
+                if att.ended:
+                    return None
+                att.writer.write(data)
+                await asyncio.wait_for(att.writer.drain(), max(0.0, deadline - loop.time()))
+            return await asyncio.wait_for(asyncio.shield(fut), max(0.0, deadline - loop.time()))
+        except (asyncio.TimeoutError, OSError, EOFError):
+            return None
+        finally:
+            att.pending.pop(rid, None)
+
+    async def _attach_notify(self, op: str, args: dict) -> bool:
+        """`op` on the current attachment; True when CONTROL acked it."""
+        att = self.attached
+        if att is None:
+            return False
+        ans = await self._attach_call(att, op, args)
+        if ans is None or ans["ok"] is not True:
+            _note(logging.WARNING, "levain gw-keys: %s not acked (%s)", op,
+                  "no answer" if ans is None else ans.get("refused"))
+            return False
+        return True
+
+    async def _front_lost(self, session: str) -> None:
+        """`FRONT-LOST {session}` (§4.5): CONTROL revokes the session. With no ack, keys ends the attachment, whose EOF
+        rule makes CONTROL revoke every egress-class session: the one sure way left to reach the same end."""
+        att = self.attached
+        if att is None:
+            return   # unattached: keys holds no registration, and the attachment's EOF already revoked them all
+        if not await self._attach_notify("FRONT-LOST", {"session": session}):
+            self._attach_close(att)
+
+    def _attach_send_task(self, coro: Awaitable[None]) -> None:
+        """Run an attach send on its own task (a call site that cannot await it: a `finally`, the settle, a timer)."""
+        if not self.attach or self.closing:
+            close = getattr(coro, "close", None)
+            if close is not None:
+                close()
+            return
+        t = asyncio.ensure_future(coro)
+        self._attach_sends.add(t)
+        t.add_done_callback(self._attach_send_done)
+
+    def _attach_send_done(self, t: asyncio.Task) -> None:
+        self._attach_sends.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            _note(logging.WARNING, "levain gw-keys: an attach send failed (%s)", type(t.exception()).__name__)
+
+    async def _reconcile_loop(self, att: Attachment) -> None:
+        """SESSIONS on the attachment's open, then every `reconcile_s` while it stays the attachment."""
+        while self.attached is att and not att.ended:
+            await self._reconcile_tick(att)
+            await asyncio.sleep(self.reconcile_s)
+
+    async def _reconcile_tick(self, att: Attachment) -> None:
+        """One reconcile (3c design r3 §2.1 (e), R4 §0): the token digests keys holds a cached resolve for go in
+        `SESSIONS`, and every digest CONTROL answers in `drop` is treated exactly as a DROP-SESSION of its session (and
+        marked dropped). A send with no answer (or not an `ok` one) is a miss; RECONCILE_MISSES consecutive misses end
+        the attachment; an answered tick resets the count."""
+        digests = sorted(self.cache)
+        chunks = [digests[i:i + SESSIONS_CHUNK] for i in range(0, len(digests), SESSIONS_CHUNK)] or [[]]
+        drop: Set[str] = set()
+        for chunk in chunks:
+            ans = await self._attach_call(att, "SESSIONS", {"digests": chunk})
+            got = ans.get("drop") if ans is not None and ans["ok"] is True else None
+            if type(got) is not list or any(type(d) is not str for d in got):
+                att.misses += 1
+                if att.misses >= RECONCILE_MISSES:
+                    _note(logging.WARNING, "levain gw-keys: %d SESSIONS unanswered; the attachment ends", att.misses)
+                    self._attach_close(att)
+                return
+            drop.update(d for d in got if d in chunk)
+        att.misses = 0
+        if not drop:
+            return
+        assert self.state_lock is not None
+        victims: List[Victim] = []
+        async with self.state_lock:
+            if self.attached is not att or self.closing:
+                return
+            for d in sorted(drop):
+                entry = self.cache.get(d)
+                if entry is not None:
+                    victims += self._drop_locked(entry["session"])[1]
+                self._mark_dropped(d)
+        self._effects(victims)
 
     # -- transitions --
 
@@ -1145,6 +1479,7 @@ class Keys:
         for t in list(conn.tasks):
             t.cancel()
         self._effects(victims)
+        self._attach_close(self.attached)   # §4.5: and the other of the two connections
 
     async def _admin_read(self, conn: AdminConn) -> None:
         """The read loop. Each request's place in its session's chain is taken HERE, between the read and the spawn,
@@ -1312,6 +1647,9 @@ class Keys:
             if not conn.detached and self.regs.get(reg.front_uid) is reg:
                 reg.state = "lost"   # the claim ended without keys' `K`: refused from now on
                 _note(logging.WARNING, "levain gw-keys: front-lost session=%s", reg.session)
+                # §4.5: CONTROL revokes the session. Never after keys' own `K` (a DROP-SESSION, a clear): the
+                # connection is detached then, and this branch is not reached
+                self._attach_send_task(self._front_lost(reg.session))
 
     async def _exchange(self, conn: Conn, frames: FrameReader, side: KeysSide, q: dict) -> None:
         """THE FRAME (design 1.2): the ONE admission check at `Q` and the epoch stamp, then entry into the
@@ -1324,7 +1662,8 @@ class Keys:
             if conn.detached:
                 return
             admitted = (self.regs.get(reg.front_uid) is reg and reg.state == "claimed" and not self.closing
-                        and reg.admin_epoch == self.admin_epoch and len(reg.exchanges) < self.exchanges_per_session)
+                        and reg.admin_epoch == self.admin_epoch and len(reg.exchanges) < self.exchanges_per_session
+                        and (not self.attach or self.attached is not None))
             if admitted:
                 conn.kind = "exchange"
                 conn.admin_epoch = self.admin_epoch
@@ -1432,7 +1771,7 @@ class Keys:
             ff.close()
 
     async def _serve_held(self, conn: Conn, ff: "FrontFrames", side: KeysSide, pol: RoutePolicy, rec: dict,
-                          meter: "Tuple[codec.Codec, Price, Dict[str, str]]", hold: ledger.Hold, head: bytes,
+                          meter: "Tuple[codec.Codec, Price, Dict[str, str], str, bool]", hold: ledger.Hold, head: bytes,
                           hconn: "h11.Connection", cred: Optional[Credential], tpl: norm.Template, data: bytes,
                           buf: "BodyTake") -> None:
         """The exchange from its admitted hold on (R4 §1.7 steps 6-8): the upstream, the durable wait, the head behind
@@ -1498,11 +1837,12 @@ class Keys:
             if not await self._against_front(ff, side, up, work()):
                 return   # the front aborted, or the exchange was cut short: `_serve_q`'s `end()` resolves the hold
             assert reader is not None   # a completed relay made one
-            self._settle(conn.reg, meter[1], hold, reader)
+            self._settle(conn.reg, meter[1], hold, reader, route=pol.route, model=meter[3], unproven=meter[4])
         finally:
             rec["redactions"] = scanner.count
 
-    def _settle(self, reg: Registration, price: Price, hold: ledger.Hold, reader: codec.UsageReader) -> None:
+    def _settle(self, reg: Registration, price: Price, hold: ledger.Hold, reader: codec.UsageReader, *,
+                route: str = "", model: str = "", unproven: bool = False) -> None:
         """A completed relay's resolution (R4 §1.2, §1.4): its reported usage priced by class, settled in full (the
         ledger books what passes the hold as `overrun`); with none, `uncertain` charged its hold, the reason the
         reader's (`usage-over-cap` when a cap stopped it, else `no-usage`). A cost above the hold stops the session: it
@@ -1510,15 +1850,25 @@ class Keys:
         `budget-overrun` until DROP-SESSION. It enters only while `reg`, the registration the exchange started on, is
         still the session's (a dropped or replaced one stops no later registration of the id), and BEFORE the ledger's
         settle, so a settle that raises still leaves the session stopped. Nothing in flight is touched: each other
-        exchange settles from its own usage."""
+        exchange settles from its own usage. The stop is then reported: `SPEND-OVERRUN {session, route, model, ref,
+        overrun, unproven}` on the attachment (R4 §1.4 step 2), sent after the settle and whether or not it raised;
+        CONTROL records it for the card and revokes nothing."""
         usage = reader.result()
         if usage is None:
             hold.uncertain(reader.reason)
             return
         cost = codec.price_usage(usage, price)
-        if cost > hold.amount and self.by_session.get(reg.session) is reg:
+        stopped = cost > hold.amount and self.by_session.get(reg.session) is reg
+        if stopped:
             self.budget_stopped.add(reg.session)
-        hold.settle(cost, usage.meta())
+        try:
+            hold.settle(cost, usage.meta())
+        finally:
+            if stopped and self.attach:
+                ledger_id, epoch, seq = hold.ref
+                self._attach_send_task(self._attach_notify("SPEND-OVERRUN", {
+                    "session": reg.session, "route": route, "model": model, "ref": [ledger_id, epoch, seq],
+                    "overrun": cost - hold.amount, "unproven": unproven}))
 
     async def _open_upstream(self, conn: Conn, ff: "FrontFrames", side: KeysSide, pol: RoutePolicy,
                              rec: dict) -> Optional[Upstream]:
@@ -1802,7 +2152,7 @@ class Keys:
 
     def _check_request(self, reg: Registration, pol: RoutePolicy, req: tuple, raw: "_OneShot",
                        buf: "BodyTake") -> Tuple[bytes, "h11.Connection", object, norm.Template, bytes,
-                                                 Tuple[codec.Codec, Price, Dict[str, str]], ledger.Hold]:
+                                                 Tuple[codec.Codec, Price, Dict[str, str], str, bool], ledger.Hold]:
         """R4 §1.7 steps 4-5, ONE synchronous call (no `await` anywhere in it): the body codec's parse of the buffered
         body, its `check` (the model has a price entry; on a dispatch-shaped route, one with no per-session cap, the
         unboundable shapes are `body-unbounded:<what>`), the ceiling written in where absent and, beside it, a streamed
@@ -1812,8 +2162,9 @@ class Keys:
         declared), and the ledger's admit LAST (a hold is admitted only for a request that
         goes out). A `RecursionError` anywhere in these steps is `body-json`, with no hold taken. Returns the request
         head, the h11 client that wrote it (it frames the body and parses the response), the credential (or None),
-        the matched template, the body bytes, the codec, the price entry and the request's `call_names` the settle
-        reads (the meter), and the admitted hold. `req` is `_check_q`'s answer."""
+        the matched template, the body bytes, the codec, the price entry, the request's `call_names` the settle
+        reads, the priced model and whether the hold is unproven (the meter), and the admitted hold. `req` is
+        `_check_q`'s answer."""
         method, path, query, fwd, tpl, cred = req
         c = codec.CODECS[pol.body_codec]   # a priced route's codec is never `none` (`policy.parse_base_map`)
         obj = c.parse(raw.take())   # the raw bytes are unreferenced once parsed: only `data` below is kept
@@ -1829,8 +2180,9 @@ class Keys:
         head, hconn = request_head(pol, method, path, query, fwd, "length:%d" % len(data), cred)
         # an interactive route admits content the estimate cannot see, marked on its `reserved` line (R4 §1.6)
         meta = {"bound": "unproven"} if checked.unproven else {}
+        meter = (c, checked.price, names, checked.model, bool(checked.unproven))
         hold = self._admit_hold(reg, pol, estimate, checked.model, meta)   # the last step: see `_serve_q`
-        return head, hconn, cred, tpl, data, (c, checked.price, names), hold
+        return head, hconn, cred, tpl, data, meter, hold
 
     def _admit_hold(self, reg: Registration, pol: RoutePolicy, estimate: int, price_ref: str,
                     meta: dict) -> ledger.Hold:
@@ -2170,6 +2522,7 @@ async def _serve(keys: Keys, front_path: str, gid: Optional[int], admin_path: st
         await keys.start(socks[:1], admin=socks[1])
         if keys.servers and not keys.closing:   # a trigger before or during start: nothing is served
             print(f"levain gw-keys: ready front={front_path} admin={admin_path}", file=sys.stderr, flush=True)
+            keys.start_attach()
         await keys.wait_done()
         print("levain gw-keys: stopped", file=sys.stderr, flush=True)
         return 0
@@ -2248,7 +2601,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(e.line, file=sys.stderr)
             return 3
         keys = Keys(gw_uids=gw_uids, single_uid=single_uid, control_path=a.control, lib_root=a.lib_root,
-                    control_uid=control_uid, ledger=led, cred_lifecycle=cred_writer)
+                    control_uid=control_uid, ledger=led, cred_lifecycle=cred_writer, attach=True)
         try:
             keys.gw_log = install_log(a.lib_root)   # before _serve counts the fds: the log's fd is a fixed one
         except OSError as e:

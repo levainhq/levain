@@ -35,7 +35,9 @@ ALL_VERBS = ("LEASE-OPEN", "STATUS", "ATTACH", "CAS", "MINT", "FRONT-ARM", "SECR
              "NOT-A-VERB")
 SESSION2 = {"operator": {"LEASE-OPEN", "STATUS"},
             "root": {"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET"},
-            "qbroker": {"QUEUE-RESOLVE"}, "keys": {"TOKEN-RESOLVE"}}
+            "qbroker": {"QUEUE-RESOLVE"},
+            # S1 3c-3 adds keys' attachment verbs (CONTRACT §4.5; 3c design r3 §2.1)
+            "keys": {"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS"}}
 
 
 def attach_claims(**kw) -> dict:
