@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -686,3 +688,13 @@ def test_f2_two_concurrent_first_sends_of_one_outbox_id_store_one_drop_and_wake_
     (won,) = [o for o in out if o["created"]]
     assert [d.outbox_id for d in EnvelopeStore(world["qdir"]).drops()] == [oid]
     assert launcher.calls == [won["woken"]] and len(_wakes(world, won["drop"]["drop_id"])) == 1
+
+
+def test_f3_a_sent_at_ahead_of_the_store_clock_is_refused_with_the_gap_named(world) -> None:
+    # L3 r3 LOW 5: the 422 names how far ahead the sending clock runs, so the person can tell a clock gap from a bad drop
+    cp = coord_for(world)
+    ahead = (datetime.now(timezone.utc) + timedelta(minutes=47)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+    with pytest.raises(CoordRefused) as exc:
+        drop(cp, "from a fast clock", "ph-" + "f3" * 16, sent_at=ahead)
+    assert exc.value.status == 422 and "ahead of the store's clock" in str(exc.value)
+    assert re.search(r"4[5-8] minutes ahead", str(exc.value)), str(exc.value)

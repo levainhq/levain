@@ -59,7 +59,7 @@
   const writeIns = new Map(); // sign request id -> {sha256, words}: the write-in being typed, kept across redraws
                               // for the version it was typed on only
 
-  function draw(data) {
+  function draw(data, seq) {
     rpId = data.rp_id || rpId;
     const list = $("requests");
     const rows = Array.isArray(data.pending) ? data.pending : [];
@@ -118,7 +118,7 @@
         : "no passkey is enrolled for " + rpId + " yet. Make one here, then enrol it from the laptop.";
     if (!usable) $("status").textContent += " · this browser cannot use a passkey here (needs https)";
     drawGrants(data);
-    drawDrops(data);
+    drawDrops(data, seq);
   }
 
   // a question: text only (never HTML) for everything the agent wrote. No passkey: the answer is unsigned and
@@ -1047,10 +1047,11 @@
       grantsUnread("this page has no token (open it from the link `levain consent phone` printed)");
       return;
     }
+    const seq = storeSeq;     // the identity changes this page had made when the listing was asked for
     call("GET", "/consent.json").then((r) => {
       // re-checked here, not only before the GET: any hold that began while it was in flight keeps the list still
       if (held()) return;
-      if (r.ok) draw(r.body); else { $("status").textContent = why(r); grantsUnread(why(r)); }
+      if (r.ok) draw(r.body, seq); else { $("status").textContent = why(r); grantsUnread(why(r)); }
     });
   }
 
@@ -1237,6 +1238,7 @@
   let dropLast = "";          // the last delivery said here, kept across redraws
   let storeRead = false;      // this page load has read the store identity (flush waits for it)
   let storeId = null;         // that identity (null: no store yet)
+  let storeSeq = 0;           // counts the identity changes this page made itself (a reply that made the store)
   const rememberedStore = () => { const v = store.get("localStorage", STORE_KEY); return v === null ? undefined : v === "" ? null : v; };
   const stamp = () => new Date().toISOString().replace(/\.(\d{3})Z$/, ".$1000Z");   // the store's fixed-width UTC form
   const outboxId = () => {
@@ -1272,6 +1274,7 @@
   const unasked = (x) => foreign(x) && x.store_id === null && x.asked !== storeId;
   // a reply whose request made the store: every item made while there was none belongs to it
   function adoptStore(sid) {
+    storeSeq++;
     storeId = sid;
     storeRead = true;
     store.set("localStorage", STORE_KEY, sid);
@@ -1311,7 +1314,7 @@
         // an item made while there was no store, accepted: this reply's request made the store, so every other item
         // this phone made here before any store existed belongs to it
         const made = next.store_id === null && sid !== null;
-        if (made) { storeId = sid; store.set("localStorage", STORE_KEY, sid); }
+        if (made) { storeSeq++; storeId = sid; store.set("localStorage", STORE_KEY, sid); }
         const e = a.body.envelope;
         const d = a.body.drop || {};
         dropLast = "delivered " + d.drop_id + (a.body.created ? "" : " (it had arrived before: filed once)")
@@ -1327,9 +1330,10 @@
         });
       }
       const x0 = { why: why(a), error: a.body.error || "" };
-      if (a.body.error === "other_store") {
-        // nothing was written: this identity has answered for the item (it shows as another Levain's once the
-        // listing names the store), and the identity is read again
+      if (a.body.error === "other_store" && next.store_id === null) {
+        // an item made while there was no store, nothing written: this identity has answered for the item (it shows as
+        // another Levain's once the listing names the store), and the identity is read again. An item bound to a store
+        // is refused below with the server's words: it cannot be sent as it stands
         setTimeout(load, 0);
         return outboxEdit(next.outbox_id, (x) => Object.assign({}, x, { asked: storeId }, x0));
       }
@@ -1373,10 +1377,11 @@
       else if (x.why) card.appendChild(el("div", "note " + (refused ? "bad" : ""), (refused ? "refused: " : "not delivered yet (") + x.why + (refused ? "" : "); it is sent again")));
       const acts = el("div", "acts");
       if (refused && x.envelope) {
-        // Sign again: the same words and outbox id, reviewed and signed afresh (a stale signature's remedy)
+        // Sign again: the same words and outbox id, reviewed and signed afresh (a stale signature's remedy); both
+        // retries take a fresh sent_at, as Send again does (the refusal may be of the time it was typed)
         if (x.spec && x.signer_fp) acts.appendChild(button("Sign again", () => envelopeSheet(x.signer_fp, x.raw_id || null, x.words, x.spec, x.outbox_id)));
         acts.appendChild(button("Send as a plain drop", () => {
-          outboxEdit(x.outbox_id, (y) => Object.assign({}, y, { state: "waiting", why: "", error: "", envelope: null })).then(() => { drawOutbox(); flush(); });
+          outboxEdit(x.outbox_id, (y) => Object.assign({}, y, { state: "waiting", why: "", error: "", envelope: null, sent_at: stamp() })).then(() => { drawOutbox(); flush(); });
         }));
       } else if (refused) {
         // a new send moment: the server's refusal may be of the time it was typed (a phone clock ahead of the laptop's)
@@ -1413,7 +1418,7 @@
     if (!receipts.some((r) => r.stage === "split")) card.appendChild(el("div", "where", "not split into threads yet"));
     return card;
   }
-  function drawDrops(data) {
+  function drawDrops(data, seq) {
     dropData = data;
     const list = $("drop-recent");
     if (!list) return;
@@ -1424,8 +1429,10 @@
     const repos = Array.isArray(data.coord_repos) ? data.coord_repos : [];
     $("drop-repos").replaceChildren(...repos.map((r) => { const o = el("option"); o.value = r; return o; }));
     if (dropLast && !$("drop-note").textContent) dropSay(dropLast, "ok");
-    // the identity is taken only from a listing that read the store (an unreadable store says nothing about it)
-    if (data.coord_store_read === true) {
+    // the identity is taken only from a listing that read the store (an unreadable store says nothing about it), and
+    // only when this page has not learned the identity from a reply since the listing was asked for: that listing read
+    // the store before the reply that made it, and the next one names it
+    if (data.coord_store_read === true && (seq === undefined || seq === storeSeq)) {
       storeRead = true;
       storeId = typeof data.coord_store_id === "string" ? data.coord_store_id : null;
       store.set("localStorage", STORE_KEY, storeId === null ? "" : storeId);
@@ -1527,7 +1534,7 @@
             const prior = again ? outboxRead().find((x) => x.outbox_id === again) : null;
             // Sign again keeps its item's binding, unless the review made the store it was made without
             const bound = prior ? (prior.store_id === null && c.body.store_created === true ? rsid : prior.store_id) : sid;
-            enqueue({ outbox_id: id, words: words, sent_at: prior ? prior.sent_at : stamp(), state: "waiting", envelope: envelope,
+            enqueue({ outbox_id: id, words: words, sent_at: stamp(), state: "waiting", envelope: envelope,
                       store_id: bound, spec: spec, signer_fp: fp, raw_id: rawId || null });
           }, (e) => { signing = false; dropSay(declined(e, "nothing was signed; sign again or dismiss"), "bad"); });
         }, () => { signing = false; dropSay("the phone port could not be reached; nothing was signed", "bad"); });
