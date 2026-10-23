@@ -1,6 +1,7 @@
 """tests/ci/shard.py: the CI shard plan covers every collected file once and can fail."""
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -77,47 +78,53 @@ def test_plan_covers_every_file_exactly_once(n):
     assert sorted(f for s in shards for f in s) == EXPECTED
 
 
-def test_plan_cli_writes_github_outputs(tmp_path):
+def test_shards_cli_writes_the_matrix_list(tmp_path):
     out = tmp_path / "gh_output"
-    env = {**__import__("os").environ, "GITHUB_OUTPUT": str(out)}
-    r = _run("plan", "--shards", "3", stdin=NODE_IDS, env=env)
+    env = {**os.environ, "GITHUB_OUTPUT": str(out)}
+    r = _run("shards", "--shards", "3", env=env)
     assert r.returncode == 0, r.stderr
-    kv = dict(line.split("=", 1) for line in out.read_text().splitlines())
-    assert json.loads(kv["shards"]) == [0, 1, 2]
-    assert sorted(f for s in json.loads(kv["files"]) for f in s) == EXPECTED
+    assert out.read_text() == "shards=[0, 1, 2]\n"
 
 
-def test_plan_fails_when_a_shard_would_be_empty():
-    r = _run("plan", "--shards", str(len(EXPECTED) + 1), stdin=NODE_IDS)
+def test_pick_shards_together_cover_every_file_once():
+    picked = []
+    for k in range(3):
+        r = _run("pick", "--shards", "3", "--shard", str(k), stdin=NODE_IDS)
+        assert r.returncode == 0, r.stderr
+        picked += r.stdout.splitlines()
+    assert sorted(picked) == EXPECTED
+
+
+def test_pick_prints_paths_with_spaces_and_brackets_literally():
+    r = _run("pick", "--shards", "1", "--shard", "0", stdin=NODE_IDS)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == EXPECTED
+
+
+def test_pick_fails_when_a_shard_would_be_empty():
+    n = len(EXPECTED) + 1
+    r = _run("pick", "--shards", str(n), "--shard", "0", stdin=NODE_IDS)
     assert r.returncode != 0
     assert "empty_shards" in r.stderr
+    assert r.stdout == ""
 
 
 @pytest.mark.parametrize("text", ["", "\n", "no tests ran in 0.01s\n", "ERROR collecting tests/x.py\n"])
-def test_plan_fails_on_input_without_node_ids(text):
-    r = _run("plan", "--shards", "2", stdin=text)
+def test_pick_fails_on_input_without_node_ids(text):
+    r = _run("pick", "--shards", "2", "--shard", "0", stdin=text)
     assert r.returncode != 0
     assert "no test node ids" in r.stderr
 
 
-def test_plan_fails_on_a_nonsense_shard_count():
-    assert _run("plan", "--shards", "0", stdin=NODE_IDS).returncode != 0
-    assert _run("plan", "--shards", "x", stdin=NODE_IDS).returncode != 0
-
-
-def test_files_mode_round_trips_spaces_and_brackets_literally():
-    paths = ["tests/test d [x].py", "tests/test_a.py", "tests/$(id)*.py"]
-    env = {"SHARD_FILES": json.dumps(paths)}
-    r = _run("files", env=env)
-    assert r.returncode == 0
-    assert r.stdout.splitlines() == paths
-
-
-@pytest.mark.parametrize("value", ["", "not json", "[]", "{}", '["a", 3]', '[""]'])
-def test_files_mode_fails_on_anything_but_a_nonempty_path_list(value):
-    assert _run("files", env={"SHARD_FILES": value}).returncode != 0
+@pytest.mark.parametrize("args", [("shards", "--shards", "0"), ("shards", "--shards", "x"),
+                                  ("pick", "--shards", "0", "--shard", "0"), ("pick", "--shards", "2", "--shard", "2"),
+                                  ("pick", "--shards", "2", "--shard", "-1"), ("pick", "--shards", "2", "--shard", "x")])
+def test_nonsense_counts_and_indexes_fail(args):
+    assert _run(*args, stdin=NODE_IDS).returncode == 1
 
 
 def test_unknown_usage_exits_2():
     assert _run("4", "0").returncode == 2
     assert _run("--check", "4").returncode == 2
+    assert _run("plan", "--shards", "2").returncode == 2
+    assert _run("files").returncode == 2

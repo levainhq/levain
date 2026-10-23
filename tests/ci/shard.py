@@ -1,17 +1,16 @@
 """Split the pytest suite into N shards for CI, from pytest's own collection.
 
-    pytest --collect-only -q | python tests/ci/shard.py plan --shards N
-    SHARD_FILES='["tests/test_a.py", ...]' python tests/ci/shard.py files
+    python tests/ci/shard.py shards --shards N
+    pytest --collect-only -q > nodes.txt
+    python tests/ci/shard.py pick --shards N --shard K < nodes.txt > files.txt
 
-`plan` reads node ids on stdin (the output of `pytest --collect-only -q`, so the repo's real
-config decides what is collected), takes the unique file paths, partitions them into N shards
-and writes two outputs: `shards` (JSON list [0..N-1]) and `files` (JSON list of lists, one per
-shard). Outputs go to the file named by $GITHUB_OUTPUT, or to stdout when it is unset. It exits
-non-zero when no node ids were read, when the shards do not hold the collected files exactly
-once, or when any shard is empty (N larger than the file count).
-
-`files` prints the paths in the JSON list in $SHARD_FILES, one per line, for `mapfile -t`.
-It exits non-zero on anything but a non-empty list of strings.
+`shards` writes `shards=[0, .., N-1]` (the matrix list) to the file named by $GITHUB_OUTPUT, or to
+stdout when it is unset. `pick` reads node ids on stdin, the output of `pytest --collect-only -q` run
+in the SAME job and Python as the tests (so the repo's real config, under that interpreter, decides
+what is collected), partitions the unique files into N shards, and prints shard K's files, one per
+line. It exits non-zero when no node ids were read, when the shards do not hold the collected files
+exactly once, when any shard is empty, or when K is not in 0..N-1. Every shard job plans the same
+partition from its own collection, so the shards of one Python cover what that Python collects.
 
 The weight of a file is its count of `def test_` lines (async included), at least 1; a file
 that is not on disk weighs 1. Assignment is greedy: heaviest file first, onto the lightest
@@ -81,39 +80,42 @@ def plan(text, n, weigh=weight):
     return shards
 
 
-def _emit(shards):
-    lines = [
-        "shards=" + json.dumps(list(range(len(shards)))),
-        "files=" + json.dumps(shards, separators=(",", ":")),
-    ]
-    target = os.environ.get("GITHUB_OUTPUT")
+def _write_output(line, environ):
+    target = environ.get("GITHUB_OUTPUT")
     if target:
         with open(target, "a", encoding="utf-8") as fh:
-            fh.write("\n".join(lines) + "\n")
+            fh.write(line + "\n")
     else:
-        print("\n".join(lines))
+        print(line)
+
+
+def _count(value):
+    n = int(value)
+    if n < 1:
+        raise ValueError("N must be at least 1")
+    return n
 
 
 def main(argv, stdin=None, environ=None):
     environ = os.environ if environ is None else environ
-    if len(argv) == 4 and argv[1] == "plan" and argv[2] == "--shards":
+    if len(argv) == 4 and argv[1:3] == ["shards", "--shards"]:
         try:
-            shards = plan((stdin or sys.stdin).read(), int(argv[3]))
-        except (AssertionError, ValueError) as e:
-            print(f"shard.py plan: {e}", file=sys.stderr)
+            n = _count(argv[3])
+        except ValueError as e:
+            print(f"shard.py shards: {e}", file=sys.stderr)
             return 1
-        _emit(shards)
+        _write_output("shards=" + json.dumps(list(range(n))), environ)
         return 0
-    if len(argv) == 2 and argv[1] == "files":
+    if len(argv) == 6 and argv[1] == "pick" and argv[2] == "--shards" and argv[4] == "--shard":
         try:
-            paths = json.loads(environ.get("SHARD_FILES", ""))
-        except json.JSONDecodeError as e:
-            print(f"shard.py files: SHARD_FILES is not JSON: {e}", file=sys.stderr)
+            n, k = _count(argv[3]), int(argv[5])
+            if not 0 <= k < n:
+                raise ValueError(f"shard {k} is not in 0..{n - 1}")
+            shards = plan((stdin or sys.stdin).read(), n)
+        except (AssertionError, ValueError) as e:
+            print(f"shard.py pick: {e}", file=sys.stderr)
             return 1
-        if not (isinstance(paths, list) and paths and all(isinstance(p, str) and p for p in paths)):
-            print("shard.py files: SHARD_FILES must be a non-empty JSON list of paths", file=sys.stderr)
-            return 1
-        print("\n".join(paths))
+        print("\n".join(shards[k]))
         return 0
     print(__doc__, file=sys.stderr)
     return 2

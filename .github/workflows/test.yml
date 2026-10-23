@@ -19,22 +19,22 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The one place the shard count is written. The `plan` job reads it and emits the shard list the matrix uses.
+  # The one place the shard count is written. The `plan` job emits the matrix's shard list from it, and each
+  # shard job partitions its own collection with it.
   # 4 shards: the 3.12 job ran ~55-67 min unsharded, so four shards of ~15-17 min leave headroom under the cap
   # while the per-job install (~1 min) stays small. Rebalance from the per-shard durations in a run's job list.
   TEST_SHARDS: "4"
 
 jobs:
   plan:
-    # Ground truth for what the suite is: pytest's own collection under the repo's real config. tests/ci/shard.py
-    # partitions the collected files and fails the job if the shards do not hold each file exactly once, if any
-    # shard is empty, or if collection yielded nothing. pipefail makes a failed collection fail the step.
+    # Emits the shard list [0..TEST_SHARDS-1] the `test` matrix runs. It does not collect: each shard job collects
+    # under its own Python and picks its own files (see that job's last step), so a file one Python collects and
+    # another does not is still in that Python's shards.
     name: plan test shards
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
-      files: ${{ steps.plan.outputs.files }}
     steps:
       - uses: actions/checkout@v6
 
@@ -43,16 +43,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install package with dev and openhands extras
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,openhands]" hatchling
-
-      - name: Collect the suite and plan the shards
+      - name: Emit the shard list
         id: plan
-        run: |
-          set -o pipefail
-          pytest --collect-only -q | python tests/ci/shard.py plan --shards "$TEST_SHARDS"
+        run: python tests/ci/shard.py shards --shards "$TEST_SHARDS"
 
   test:
     name: pytest (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
@@ -89,12 +82,15 @@ jobs:
           pip install -e ".[dev,openhands]" hatchling
 
       - name: Run pytest shard ${{ matrix.shard }} of ${{ env.TEST_SHARDS }}
-        # The file list arrives as JSON in an env var, becomes one path per line, and is loaded into an array,
-        # so no path is word-split or globbed. An empty list fails here instead of running the whole suite.
-        env:
-          SHARD_FILES: ${{ toJSON(fromJSON(needs.plan.outputs.files)[matrix.shard]) }}
+        # Collect under THIS Python with the repo's real config, then pick this shard's files: shard.py fails on no
+        # node ids, a file in no shard or two, an empty shard. Each command's exit is checked (bash -e, pipefail),
+        # and the files go to pytest as one quoted array, so no path is word-split or globbed and an empty list
+        # fails here instead of running the whole suite.
         run: |
-          mapfile -t files < <(python tests/ci/shard.py files)
+          set -o pipefail
+          pytest --collect-only -q > "$RUNNER_TEMP/nodes.txt"
+          python tests/ci/shard.py pick --shards "$TEST_SHARDS" --shard "${{ matrix.shard }}" < "$RUNNER_TEMP/nodes.txt" > "$RUNNER_TEMP/files.txt"
+          mapfile -t files < "$RUNNER_TEMP/files.txt"
           test "${#files[@]}" -gt 0 || { echo "shard ${{ matrix.shard }} has no files"; exit 1; }
           pytest -q "${files[@]}"
 
