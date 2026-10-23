@@ -17,6 +17,7 @@ credential verbs through a forked child that drops to keys before it opens anyth
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -1132,15 +1133,18 @@ def _extend_shape_steps(host: HostOS, shape: gen_mod.InstallShape | None, made: 
                  "completed_txn kept)", call=lambda: gen_mod.write_record_durably(path, text))]
 
 
-def check_records(facts: HostFacts, operator: str | None) -> None:
+def check_records(facts: HostFacts, operator: str | None, *, journal_kinds: bool = True) -> None:
     """U15 (HEAD 1022-12), the one preflight every mutating verb (repair, replenish, undo) runs before step one: every
     record ``install-shape`` holds, and every write-ahead record of an UNFINISHED journal (a finished one's txn is the
     record's ``completed_txn``: what it named is settled in the record), is of a kind this code can remove and within
     its bound, else ``downgrade-unsupported:<kind>`` / ``bad-record`` (§1.1 rules c, e). The operator then runs the
-    newer code's verb. A record that does not PARSE never reaches here: undo reads it as absent, the rest refuse it."""
+    newer code's verb. A record that does not PARSE never reaches here: undo reads it as absent, the rest refuse it.
+    ``journal_kinds=False``: repair's phase A [r5: codex HIGH 2], which hands the journal to the STAGED code: its
+    records are checked only as parsed (``<kind>/<v>`` tokens, by :func:`parse_intent`), never against this code's
+    table; the probe's ``kinds`` and phase B's plan judge them."""
     shape, journal = facts.install_shape, facts.intent
     recs = sorted(shape.managed, key=repr) if shape is not None else []
-    if journal is not None and not (shape is not None and journal.txn == shape.completed_txn):
+    if journal_kinds and journal is not None and not (shape is not None and journal.txn == shape.completed_txn):
         recs += sorted(journal.managed, key=repr)
     gen_mod.check_managed(facts.host, recs, operator=operator)
 
@@ -1357,11 +1361,12 @@ def _recognised_groups(host: HostOS, facts: HostFacts, rf: RepairFacts, journale
 
 
 def _repair_journal(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts,
-                    txn: Callable[[], str]) -> tuple[Intent | None, Intent | None, str, str]:
+                    txn: Callable[[], str], *, journal_kinds: bool = True) -> tuple[Intent | None, Intent | None, str, str]:
     """The checks every repair plan (phase A's stage and the whole plan) runs first, before any act: another verb's
     journal refused, setup's stale one dropped, a FINISHED repair journal (``txn == record.completed_txn``) set aside
     to be removed (R1 [F2]), the preflight, the records and skips, a foreign account at a journaled name. Returns
-    ``(the unfinished repair journal or None, the finished one or None, the operator, the run's txn)``."""
+    ``(the unfinished repair journal or None, the finished one or None, the operator, the run's txn)``.
+    ``journal_kinds``: :func:`check_records`'s (False in phase A only)."""
     if cmd.verb != "repair":
         raise Refused("wrong-verb", cmd.verb)
     shape = facts.install_shape
@@ -1377,7 +1382,7 @@ def _repair_journal(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts,
     rec = facts.operator_record
     assert rec is not None
     operator = str(rec["name"])
-    check_records(facts, operator)                                     # U15: the preflight every mutating verb runs
+    check_records(facts, operator, journal_kinds=journal_kinds)        # U15: the preflight every mutating verb runs
     check_install_skips(facts.host, rf.skips, operator=operator)        # R1b-6: before any act
     if journal is not None:
         _, foreign = _journal_presence(facts)
@@ -1421,7 +1426,8 @@ def plan_repair_stage(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     generation (R3a) and execs into it (R4); everything from R4b on is planned by THAT code (:func:`repair_continue`).
     """
     host = facts.host
-    journal, finished, operator, run_txn = _repair_journal(cmd, facts, rf, txn)
+    # [r5: codex HIGH 2] the incumbent judges the journal's kinds generically only: the staged code is the judge
+    journal, finished, operator, run_txn = _repair_journal(cmd, facts, rf, txn, journal_kinds=False)
     if rf.source is None or rf.h11 is None:
         raise Refused("bad-source", "no h11 beside the levain package" if rf.source is not None else "no --source")
     root_tree.check_sources(rf.source, rf.h11)
@@ -2339,6 +2345,9 @@ PROBE_OUT_CAP = 64 * 1024
 #: ``repair_probe`` could not read the host's records.
 PROBE_EXIT_NO_IMPORT = 3
 PROBE_EXIT_UNSUPPORTED = 4
+#: The handover's ABI [r5: codex MED 3]: what phase A's exec passes to ``repair_continue`` (the call shape of
+#: :func:`phase_b_text`) and what phase B adopts. The probe answers it; phase A execs only into its own.
+HANDOVER_ABI = 1
 
 
 def probe_text(host: HostOS, gen: str, *, tree: Path | None = None) -> str:
@@ -2357,8 +2366,8 @@ def probe_text(host: HostOS, gen: str, *, tree: Path | None = None) -> str:
 def repair_probe(*, stdin=None, out: TextIO | None = None, host: HostOS | None = None) -> int:
     """R3a, run by the STAGED generation in a child (§2.2 [r3: X2-M5, X2-H1]): stdin holds the host's
     ``install-shape`` and journal texts (``{"journal": <text|null>, "shape": <text|null>}``, canonical). Exactly one
-    canonical ``{"kinds":[...],"ok":true}`` line on ``out`` (the kinds this code can REMOVE, so the caller can check
-    every recorded and journalled one) and 0; :data:`PROBE_EXIT_UNSUPPORTED` with nothing printed when either record
+    canonical ``{"handover":<HANDOVER_ABI>,"kinds":[...],"ok":true}`` line on ``out`` (the kinds this code can
+    REMOVE, so the caller can check every recorded and journalled one, and the handover ABI it takes) and 0; :data:`PROBE_EXIT_UNSUPPORTED` with nothing printed when either record
     does not parse here."""
     host = host or _host()
     raw = (stdin if stdin is not None else sys.stdin.buffer).read(4 * gen_mod.MAX_RECORD_BYTES + 1)
@@ -2373,7 +2382,7 @@ def repair_probe(*, stdin=None, out: TextIO | None = None, host: HostOS | None =
     except (Refused, canon.ContractError, TypeError, ValueError):
         return PROBE_EXIT_UNSUPPORTED
     o = out or sys.stdout
-    o.write(canon.canonical({"ok": True, "kinds": sorted(gen_mod.KINDS)}) + "\n")
+    o.write(canon.canonical({"ok": True, "kinds": sorted(gen_mod.KINDS), "handover": HANDOVER_ABI}) + "\n")
     o.flush()
     return 0
 
@@ -2382,7 +2391,9 @@ def _bounded_child(argv: Sequence[str], data: bytes, *, timeout: float, cap: int
                    clock: Callable[[], float] = time.monotonic) -> tuple[int | None, bytes]:
     """``argv`` with ``data`` on stdin (from an unlinked temp file, so a child that never reads cannot wedge the
     write), stdout read to at most ``cap`` + 1 bytes before ``timeout`` (stderr discarded, ``close_fds``, its own
-    process group, cwd ``/``). ``(None, out)`` when it ran out of time or printed past the cap: the group is killed."""
+    process group, cwd ``/``). ``(None, out)`` when it ran out of time or printed past the cap. The group is killed
+    on EVERY exit [r5: L3 r1 complement LOW 7], so nothing the child left in it outlives the call (a process that made
+    its own session escapes that; the probe is the staged code phase A is about to exec into anyway)."""
     import tempfile
 
     with tempfile.TemporaryFile() as fin:
@@ -2425,6 +2436,11 @@ def _bounded_child(argv: Sequence[str], data: bytes, *, timeout: float, cap: int
             except (ProcessLookupError, PermissionError):
                 pass
             rc, over = p.wait(), True
+        # After the leader is reaped its pid cannot be reused while any member keeps the group alive.
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
     return (None, out) if over else (rc, out)
 
 
@@ -2433,14 +2449,19 @@ def run_probe(host: HostOS, gen: str, shape: gen_mod.InstallShape | None, journa
               cap: int = PROBE_OUT_CAP) -> tuple[str, ...]:
     """R3a in phase A: the staged ``gen`` asked, in a bounded child (:func:`_bounded_child`), whether it can take this
     host over. Returns its ``kinds``. A timeout, an exit other than 0, or anything but exactly one canonical
-    ``{"kinds":[...],"ok":true}`` line refuses ``source-broken``; a package with no handover (from before row 33) or
-    one that cannot read the records refuses ``downgrade-unsupported``; a kind in the record's ``managed`` or the
-    journal's write-ahead ``managed`` that it cannot remove refuses ``downgrade-unsupported:<kind>``."""
+    ``{"handover":<n>,"kinds":[...],"ok":true}`` line (``handover`` may be absent), or a probe that cannot be
+    started, refuses ``source-broken``; a package with no handover (from before row 33) or one that cannot read the
+    records refuses ``downgrade-unsupported``; an ABI other than :data:`HANDOVER_ABI` (or none) refuses
+    ``downgrade-unsupported:handover``; a kind in the record's ``managed`` or the journal's write-ahead ``managed``
+    that it cannot remove refuses ``downgrade-unsupported:<kind>``."""
     python = python or root_tree.ROOT_PYTHON[host]
     data = canon.canonical({"shape": gen_mod.shape_text(shape) if shape is not None else None,
                             "journal": intent_text(journal) if journal is not None else None}).encode()
-    rc, out = _bounded_child([python, root_tree.PY_FLAGS, "-c", probe_text(host, gen, tree=tree)], data,
-                             timeout=timeout, cap=cap)
+    try:
+        rc, out = _bounded_child([python, root_tree.PY_FLAGS, "-c", probe_text(host, gen, tree=tree)], data,
+                                 timeout=timeout, cap=cap)
+    except OSError as e:                  # [r5: both seats MED] e.g. the interpreter gone, EMFILE
+        raise Refused("source-broken", f"the probe of {gen} could not start ({e.strerror or e})") from None
     if rc == PROBE_EXIT_UNSUPPORTED:
         raise Refused("downgrade-unsupported", f"{gen} cannot take this host over (it has no repair handover, or "
                                                "it cannot read the install record or the journal)")
@@ -2452,10 +2473,15 @@ def run_probe(host: HostOS, gen: str, shape: gen_mod.InstallShape | None, journa
         rec = canon.parse(out[:-1]) if out.endswith(b"\n") else None
     except canon.ContractError:
         rec = None
-    kinds = rec.get("kinds") if isinstance(rec, dict) and set(rec) == {"ok", "kinds"} and rec["ok"] is True else None
+    shaped = isinstance(rec, dict) and set(rec) - {"handover"} == {"ok", "kinds"} and rec["ok"] is True
+    kinds = rec.get("kinds") if shaped else None
     if (not isinstance(kinds, list) or not all(isinstance(k, str) and gen_mod.KIND_RE.fullmatch(k) for k in kinds)
-            or out != (canon.canonical({"ok": True, "kinds": kinds}) + "\n").encode()):
+            or out != (canon.canonical(rec) + "\n").encode()):
         raise Refused("source-broken", f"the probe of {gen} answered {out[:120]!r}, not one canonical record")
+    abi = rec.get("handover")
+    if type(abi) is not int or abi != HANDOVER_ABI:
+        raise Refused("downgrade-unsupported:handover", f"{gen} takes handover ABI {abi!r}; this code execs "
+                                                        f"{HANDOVER_ABI}")
     held = set(kinds)
     for kind in sorted({k for k, _ in (*(shape.managed if shape else ()), *(journal.managed if journal else ()))}):
         if kind not in held:
@@ -2488,59 +2514,114 @@ def exec_phase_b(host: HostOS, gen: str, lock_fd: int, pool_fd: int, caller_uid:
     text = phase_b_text(host, gen, lock_fd, pool_fd, caller_uid, tree=tree, call=call)
     os.set_inheritable(lock_fd, True)
     os.set_inheritable(pool_fd, True)
-    sys.stdout.flush()
-    sys.stderr.flush()
-    execv(python, [python, root_tree.PY_FLAGS, "-c", text])
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        execv(python, [python, root_tree.PY_FLAGS, "-c", text])
+    except BaseException:
+        os.set_inheritable(lock_fd, False)    # the exec did not happen: nothing may inherit them now
+        os.set_inheritable(pool_fd, False)
+        raise
 
 
-def _restore_after_handover_refusal(host: HostOS, cell: root_tree.Staged, prior: Intent | None, current: str | None,
-                                    *, intent_path: Path | None = None, tree: Path | None = None) -> None:
-    """A probe (or hash) refusal leaves the host as phase A found it [judged by r2s2, 10-22, against §5 R2 DONE row
-    1 "host unchanged"]: the staged generation removed (never ``current``), and the journal back to what it was (the
-    run's own fresh journal removed; an earlier unfinished one rewritten as it was read)."""
+def _fsync_dir(path: Path) -> str | None:
+    """``path`` (a directory) fsynced; the failure as text, else None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        return f"{path} not synced ({e.strerror or e})"
+    return None
+
+
+def _restore_phase_a(host: HostOS, cell: root_tree.Staged, prior: Intent | None, current: str | None,
+                     *, intent_path: Path | None = None, tree: Path | None = None) -> list[str]:
+    """[r5: both seats MED] The host put back as phase A found it, after ANY phase-A failure or exception before the
+    exec: ``staging.partial`` and the staged generation removed (never ``current``, never a generation that was there
+    before :func:`root_tree._place` replaced it, ``cell.existed``), the import tree fsynced, and the journal back to
+    what phase A read (``prior`` rewritten, a finished one included; none -> the run's own removed, the state dir
+    fsynced). Every op is checked: returns what could NOT be put back (empty when all of it was)."""
     import shutil
 
     tree = tree if tree is not None else root_tree.current_path(host).parent
-    for name in (root_tree.STAGING, cell.target):
-        if name and name != current and os.path.lexists(tree / name):
-            shutil.rmtree(tree / name, ignore_errors=True)
+    undone: list[str] = []
+    removed = False
+    names = [root_tree.STAGING] + ([cell.target] if cell.target and not cell.existed else [])
+    for name in names:
+        p = tree / name
+        if name == current or not os.path.lexists(p):
+            continue
+        try:
+            shutil.rmtree(p)
+            removed = True
+        except OSError as e:
+            undone.append(f"{p} not removed ({e.strerror or e})")
+    if cell.target and cell.existed and not os.path.isdir(tree / cell.target):
+        undone.append(f"{tree / cell.target} was there before this run and is gone")
+    if removed:
+        undone += [w for w in (_fsync_dir(tree),) if w]
     path = Path(intent_path or INTENT_PATH[host])
     if prior is None:
         try:
             os.unlink(path)
+            undone += [w for w in (_fsync_dir(path.parent),) if w]
         except FileNotFoundError:
             pass
+        except OSError as e:
+            undone.append(f"the run's journal {path} not removed ({e.strerror or e})")
     else:
-        write_intent_atomically(path, intent_text(prior))
+        try:
+            ok, why = write_intent_atomically(path, intent_text(prior))
+        except OSError as e:
+            ok, why = False, f"could not write the intent journal {path}: {e.strerror or e}"
+        if not ok:
+            undone.append(f"the earlier journal not put back ({why})")
+    return undone
 
 
 def repair_handover(plan: InstallPlan, g: Gathered, lock_fd: int, caller_uid: int, err: TextIO, *,
+                    apply: Callable[[InstallPlan, TextIO], Optional[str]] = apply_steps,
                     probe: Callable[..., tuple[str, ...]] = run_probe,
                     execv: Callable[[str, Sequence[str]], object] = os.execv, python: str | None = None,
                     tree: Path | None = None, intent_path: Path | None = None, call: str | None = None) -> None:
-    """Phase A's end (§2.2): the staged generation probed (R3a); refused -> the host restored, the refusal raised;
-    ok -> the exec into phase B (R4), with the install lock and the pool lock carried across it. ``python``,
-    ``tree``, ``intent_path``, ``call``: a test's interpreter, import tree, journal and phase B entry."""
+    """``repair --source``'s PHASE A, from its first act to the exec (§2.2): the pool lock proven held BEFORE any act
+    (so that refusal has nothing to undo), then phase A's steps (``apply``), the staged generation probed (R3a), and
+    the exec into phase B (R4) with the install lock and the pool lock carried across it. [r5: both seats MED] ANY
+    failure or exception in between (a failed step, the hash's refusal, the probe's, an OSError) restores the host
+    (:func:`_restore_phase_a`) and is raised; a restore that could not finish appends ``rollback-incomplete: <what>``
+    to the refusal's detail. ``python``, ``tree``, ``intent_path``, ``call``: a test's interpreter, import tree,
+    journal and phase B entry."""
     host, cell = plan.host, plan.handover
     assert cell is not None
-    prior = g.facts.intent if g.facts.intent is not None and g.facts.intent.verb == "repair" else None
-    if prior is not None and g.facts.install_shape is not None and prior.txn == g.facts.install_shape.completed_txn:
-        prior = None                     # a finished journal phase A removed: nothing to put back
-    current = g.repair.current if g.repair is not None else None
-    if cell.refused is not None or cell.target is None:
-        _restore_after_handover_refusal(host, cell, prior, current, intent_path=intent_path, tree=tree)
-        raise cell.refused or Refused("internal", "phase A staged no generation")
-    journal = replace(plan.intent, generation=cell.target) if plan.intent is not None else None
-    try:
-        probe(host, cell.target, g.facts.install_shape, journal)
-    except Refused:
-        _restore_after_handover_refusal(host, cell, prior, current, intent_path=intent_path, tree=tree)
-        raise
     q = g.quiesce
     if q is None or not q.held:
-        raise Refused("bad-root", "no pool lock held to hand over")
-    err.write(f"levain install-helper: {cell.target} staged and probed; handing over to it\n")
-    exec_phase_b(host, cell.target, lock_fd, q.fd, caller_uid, python=python, tree=tree, call=call, execv=execv)
+        raise Refused("bad-root", "no pool lock held to hand over")      # [r5: codex 5] before any act
+    prior = g.facts.intent               # as phase A found it (a finished journal too: phase A's R1 removes it)
+    current = g.repair.current if g.repair is not None else None
+    try:
+        failed = apply(plan, err)
+        if cell.refused is not None:
+            raise cell.refused
+        if failed is not None:
+            raise Refused("step-failed", failed)
+        if cell.target is None:
+            raise Refused("internal", "phase A staged no generation")
+        journal = replace(plan.intent, generation=cell.target) if plan.intent is not None else None
+        probe(host, cell.target, g.facts.install_shape, journal)
+        err.write(f"levain install-helper: {cell.target} staged and probed; handing over to it\n")
+        exec_phase_b(host, cell.target, lock_fd, q.fd, caller_uid, python=python, tree=tree, call=call, execv=execv)
+    except BaseException as e:
+        undone = _restore_phase_a(host, cell, prior, current, intent_path=intent_path, tree=tree)
+        if not undone:
+            raise
+        note = "rollback-incomplete: " + "; ".join(undone)
+        err.write(f"levain install-helper: {note}\n")
+        if isinstance(e, Refused):
+            raise Refused(e.name, f"{e.detail}; {note}" if e.detail else note) from None
+        raise
 
 
 @dataclass
@@ -2563,7 +2644,9 @@ class ContinueSeams:
 def adopt_lock(fd: int, path: Path, *, owner_ok: Callable[[os.stat_result], bool]) -> None:
     """R4a [r2: X-4]: ``fd`` (inherited across the exec) must be the lock file at ``path``: ``path`` opened
     ``O_NOFOLLOW`` and both ``fstat``-ed to the same ``st_dev``/``st_ino``, a regular file with the expected owner and
-    mode 0600. Else ``bad-root`` (a descriptor that did not survive the exec, or names another file)."""
+    mode 0600, and the flock HELD [r5: L3 r1 complement LOW 5]: a ``LOCK_EX|LOCK_NB`` on that second description
+    must meet ``BlockingIOError``. Else ``bad-root`` (a descriptor that did not survive the exec, names another file,
+    or holds no lock)."""
     try:
         held = os.fstat(fd)
     except OSError as e:
@@ -2574,11 +2657,19 @@ def adopt_lock(fd: int, path: Path, *, owner_ok: Callable[[os.stat_result], bool
         raise Refused("bad-root", f"{path}: {e.strerror}") from None
     try:
         st = os.fstat(check)
+        if ((held.st_dev, held.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(st.st_mode) or not owner_ok(st)
+                or stat.S_IMODE(st.st_mode) != 0o600):
+            raise Refused("bad-root", f"descriptor {fd} is not the lock {path} (regular, root's, 0600)")
+        try:
+            fcntl.flock(check, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass                     # held, by ``fd``'s description (this process's, or no other run's: same file)
+        except OSError as e:
+            raise Refused("bad-root", f"{path}: {e.strerror}") from None
+        else:
+            raise Refused("bad-root", f"descriptor {fd} for {path} holds no lock")
     finally:
         os.close(check)              # a second description: its close never drops the flock on ``fd``'s
-    if ((held.st_dev, held.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(st.st_mode) or not owner_ok(st)
-            or stat.S_IMODE(st.st_mode) != 0o600):
-        raise Refused("bad-root", f"descriptor {fd} is not the lock {path} (regular, root's, 0600)")
 
 
 def _continue(lock_fd: int, pool_fd: int, gen: str, caller_uid: int, cs: ContinueSeams, err: TextIO) -> dict:
@@ -2658,7 +2749,7 @@ class Seams:
     purge: Callable[[str, int, HostOS], dict] = run_purge
     stdin: Callable[[int], bytes] = _read_stdin
     credential: Callable[..., dict] = run_credential
-    #: repair --source, after phase A's steps: the probe and the exec into phase B (:func:`repair_handover`).
+    #: repair --source's phase A: its steps (with ``apply``), the probe and the exec into phase B (:func:`repair_handover`).
     handover: Callable[..., None] = repair_handover
 
 
@@ -2693,11 +2784,13 @@ def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextI
             plan = seams.plan(cmd, gathered)
             for line in plan.pending:
                 err.write(f"levain install-helper: pending: {line}\n")
-            failed = seams.apply(plan, err)
-            if plan.handover is not None and (failed is None or plan.handover.refused is not None):
-                # repair --source: phase A ran; the probe, then the exec into the staged code (never returns). A
-                # hash-step refusal goes through it too, so the host is put back and the refusal named.
-                seams.handover(plan, gathered, lock_fd, caller_uid, err)
+            if plan.handover is not None:
+                # repair --source: phase A (its steps, the probe, the exec into the staged code; never returns). Any
+                # failure in it puts the host back and is raised [r5: both seats MED].
+                seams.handover(plan, gathered, lock_fd, caller_uid, err, apply=seams.apply)
+                failed = None
+            else:
+                failed = seams.apply(plan, err)
         finally:
             if gathered.quiesce is not None:
                 gathered.quiesce.release()     # the pool lock, after the last act and before the install lock
@@ -2738,7 +2831,7 @@ INSTALL_ENTRY_ENV = ("SUDO_UID",)
 
 
 __all__ = ["ContinueSeams", "PROBE_OUT_CAP", "PROBE_TIMEOUT_S", "adopt_lock", "exec_phase_b", "phase_b_text",
-           "plan_repair_stage", "probe_text", "repair_continue", "repair_handover", "repair_probe", "run_probe",
+           "plan_repair_stage", "probe_text", "repair_continue", "repair_handover", "HANDOVER_ABI", "repair_probe", "run_probe",
            "RepairFacts", "desired_managed", "install_shape_path", "plan_only_report", "plan_repair", "BUILT_VERBS", "CHILD_MARGIN_S", "CREDENTIAL_VERBS", "INSTALL_ENTRY_ENV", "KEYS_ACCOUNT", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
            "apply_steps", "check_account_ids", "drop_to_keys", "load_creds", "read_credential", "run_credential", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",

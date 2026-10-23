@@ -139,10 +139,19 @@ with install_lock(path=Path(cfg["lock"]), owner_ok=lambda st: st.st_uid == os.ge
 
 
 def _line(p: subprocess.Popen, timeout: float = 60.0) -> dict:
+    """One line from the child, read a byte at a time from the unbuffered pipe (fix1 ruling 6: no wrapper buffers a
+    second line behind ``select``'s back)."""
+    import time
+
     assert p.stdout is not None
-    r, _, _ = select.select([p.stdout], [], [], timeout)
-    assert r, "no line from the child in time"
-    return json.loads(p.stdout.readline())
+    fd, buf, deadline = p.stdout.fileno(), b"", time.monotonic() + timeout
+    while not buf.endswith(b"\n"):
+        r, _, _ = select.select([fd], [], [], max(0.0, deadline - time.monotonic()))
+        assert r, "no line from the child in time"
+        b = os.read(fd, 1)
+        assert b, "the child closed its stdout before a whole line"
+        buf += b
+    return json.loads(buf)
 
 
 def _phase_b_run(tmp: Path, mutant: str) -> tuple[subprocess.Popen, dict, Path, Path]:
@@ -157,7 +166,7 @@ def _phase_b_run(tmp: Path, mutant: str) -> tuple[subprocess.Popen, dict, Path, 
                lock=str(state / "install.lock"), mutant=mutant)
     env = {**os.environ, "R2S2_CFG": json.dumps(cfg)}
     p = subprocess.Popen([sys.executable, str(tmp / "phase_a.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, text=True, env=env)
+                         stderr=subprocess.PIPE, bufsize=0, env=env)
     a = _line(p)
     assert a["phase"] == "A"
     return p, a, state / "install.lock", L / "slots" / "pool.lock"
@@ -175,8 +184,8 @@ def _pool_free(path: Path) -> bool:
 
 
 def _finish(p: subprocess.Popen) -> tuple[dict, int, str]:
-    out, err = p.communicate("\n", timeout=60)
-    return json.loads(out.strip().splitlines()[-1]), p.returncode, err
+    out, err = p.communicate(b"\n", timeout=60)
+    return json.loads(out.strip().splitlines()[-1]), p.returncode, err.decode(errors="replace")
 
 
 def test_phase_b_adopts_both_locks(tmp_path: Path) -> None:
@@ -214,34 +223,45 @@ _HANDOVER = 'def repair_continue(*a, **k):\n    return 0\n'
 
 
 def _phase_a(tmp: Path, gen_maker, *, prior: Intent | None = None, shape: G.InstallShape | None = None,
-             timeout: float = 30.0):
+             timeout: float = 30.0, apply=None, hold: bool = True, python: str = sys.executable):
     """A phase A that has staged ``GEN`` (the plan's hash step ran), holding a real install lock and pool lock, run
-    through :func:`IH.run`'s own lock/release order with the real :func:`IH.repair_handover` and probe."""
+    through :func:`IH.run`'s own lock/release order with the real :func:`IH.repair_handover` and probe. ``prior``:
+    the journal on disk before phase A (the default ``apply`` then stands in for R1 and R2-R3: it writes the run's
+    fresh journal unless ``prior`` is unfinished, and leaves ``gen_maker``'s generation as the staged one)."""
     tree, state = tmp / "tree", tmp / "state"
     state.mkdir()
     gen_maker(tree)
     L = _store(tmp)
     jpath = state / "install-intent"
     first = prior or Intent("repair", OP, txn=TXN)
-    jpath.write_text(intent_text(first))                    # R1 ran
+    if prior is not None:
+        jpath.write_text(intent_text(prior))                # on disk before phase A
     cell = root_tree.Staged(target=GEN)
     plan = IH.InstallPlan("repair", HOST, (), intent=first, handover=cell)
     q = IH.Quiesce(L, waits=IH.RH.Seams(host=HOST, store=L, trusted=lambda st: True, lock_wait_s=0.05))
     facts = IH.HostFacts(host=HOST, caller_uid=os.getuid(), intent=prior, install_shape=shape)
     rf = IH.RepairFacts(current=None)
     execs: list = []
+    acts: list = []
 
     def gather(cmd, host, uid):
-        q.hold()
+        if hold:
+            q.hold()
         return IH.Gathered(facts, quiesce=q, repair=rf)
+
+    def r1(p, e):
+        acts.append("apply")
+        jpath.write_text(intent_text(first))                # R1 ran
+        return None
 
     seams = IH.Seams(euid=lambda: 0, host=lambda: HOST,
                      lock=lambda host: install_lock(path=state / "install.lock", owner_ok=_mine),
-                     gather=gather, plan=lambda cmd, g: plan, apply=lambda p, e: None,
+                     gather=gather, plan=lambda cmd, g: plan, apply=apply or r1,
                      handover=functools.partial(IH.repair_handover, tree=tree, intent_path=jpath,
-                                                probe=functools.partial(IH.run_probe, python=sys.executable,
+                                                probe=functools.partial(IH.run_probe, python=python,
                                                                         tree=tree, timeout=timeout),
                                                 execv=lambda *a: execs.append(a)))
+    seams.acts = acts                                        # type: ignore[attr-defined]
     return seams, q, state, L, tree, jpath, execs
 
 
@@ -291,8 +311,7 @@ def test_the_probe_holds_every_recorded_kind_and_restores_an_earlier_journal(tmp
     """A recorded kind the staged code lacks refuses ``downgrade-unsupported:<kind>``; an unfinished journal that was
     there before phase A is put back as it was read."""
     _monkey_built(monkeypatch)
-    lacks = ("import json\ndef repair_probe():\n    print(json.dumps({'kinds': ['unit/1'], 'ok': True}, "
-             "separators=(',', ':'), sort_keys=True))\n    return 0\n" + _HANDOVER)
+    lacks = _answers(["unit/1"])
     prior = Intent("repair", OP, txn=TXN, managed=(("netns/1", "levain-e0"),))
     seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(t, GEN, lacks),
                                                       prior=prior)
@@ -323,7 +342,7 @@ def test_repair_probe_reads_both_records(tmp_path: Path) -> None:
     good = json.dumps({"shape": G.shape_text(shape), "journal": intent_text(j)}).encode()
     out = io.StringIO()
     assert IH.repair_probe(stdin=io.BytesIO(good), out=out, host=HOST) == 0
-    assert json.loads(out.getvalue()) == {"ok": True, "kinds": sorted(G.KINDS)}
+    assert json.loads(out.getvalue()) == {"ok": True, "kinds": sorted(G.KINDS), "handover": IH.HANDOVER_ABI}
     for bad in (b"{}", json.dumps({"shape": "{}", "journal": None}).encode(), b"not json"):
         assert IH.repair_probe(stdin=io.BytesIO(bad), out=io.StringIO(), host=HOST) == IH.PROBE_EXIT_UNSUPPORTED
 
@@ -402,6 +421,7 @@ def test_adopt_lock_refuses_another_file_or_a_closed_descriptor(tmp_path: Path) 
         p.write_text("")
         os.chmod(p, 0o600)
     fd = os.open(a, os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)                           # adopted only while held (fix1 ruling 5)
     try:
         IH.adopt_lock(fd, a, owner_ok=_mine)
         for path in (b, tmp_path / "missing"):
@@ -416,6 +436,193 @@ def test_adopt_lock_refuses_another_file_or_a_closed_descriptor(tmp_path: Path) 
     with pytest.raises(Refused) as e:
         IH.adopt_lock(fd, a, owner_ok=_mine)
     assert e.value.name == "bad-root" and "did not survive" in e.value.detail
+
+
+# --- L3 r1 fix1 (head 1022+21 rulings 1-7, DESIGN §2.2's [r5] paragraphs) -------------------------------------------
+
+def _answers(kinds, handover=IH.HANDOVER_ABI) -> str:
+    """A staged ``install_helper`` whose probe answers ``kinds`` and the ``handover`` ABI (omitted when None)."""
+    rec = {"kinds": sorted(kinds), "ok": True}
+    if handover is not None:
+        rec["handover"] = handover
+    return ("import json\ndef repair_probe():\n"
+            f"    print(json.dumps({rec!r}, separators=(',', ':'), sort_keys=True))\n    return 0\n" + _HANDOVER)
+
+
+NEW_KIND = ("newkind/1", G.Opaque('"levain-x"'))
+
+
+def test_phase_a_validates_an_unfinished_journal_generically(tmp_path: Path) -> None:
+    """Ruling 1 (codex HIGH 2): a journal naming a kind the INCUMBENT's table lacks still plans phase A (the staged
+    code judges kind capability); bare repair, in-process in the incumbent, still refuses it."""
+    from dataclasses import replace
+
+    from tests.test_repair_plan import OP as POP, _pre_change
+
+    facts, rf = _pre_change(tmp_path)
+    facts = replace(facts, intent=Intent("repair", POP, txn=TXN, managed=(NEW_KIND,)))
+    plan = IH.plan_for(parse_install_argv(["repair", "--source", "/opt/x/levain"]), IH.Gathered(facts, repair=rf))
+    assert plan.handover is not None and plan.intent.managed == (NEW_KIND,)    # carried into R1's journal as read
+    with pytest.raises(Refused) as e:
+        IH.plan_repair(parse_install_argv(["repair"]), facts, replace(rf, source=None, h11=None),
+                       program_exists=lambda p: True)
+    assert e.value.name == "downgrade-unsupported:newkind/1"
+    shape = G.InstallShape("gen-" + "0" * 16, "0.9.0", "0.16.0", "d" * 32, {}, (NEW_KIND,))
+    with pytest.raises(Refused) as e:                       # the record (not the journal) is still checked here
+        IH.plan_for(parse_install_argv(["repair", "--source", "/opt/x/levain"]),
+                    IH.Gathered(replace(facts, install_shape=shape), repair=rf))
+    assert e.value.name in ("downgrade-unsupported:newkind/1", "bad-record")
+
+
+@pytest.mark.parametrize("staged_kinds, refused", [(("unit/1", "newkind/1"), None),
+                                                   (("unit/1",), "downgrade-unsupported:newkind/1")])
+def test_the_staged_probe_judges_a_journalled_kind(tmp_path: Path, monkeypatch, staged_kinds, refused) -> None:
+    """Ruling 1's row through the real probe: a staged package that knows the kind takes the host over; one that
+    lacks it refuses by the kind's name."""
+    _monkey_built(monkeypatch)
+    prior = Intent("repair", OP, txn=TXN, managed=(NEW_KIND,))
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(t, GEN,
+                                                                                          _answers(staged_kinds)),
+                                                      prior=prior)
+    if refused is None:
+        _go(seams)
+        assert len(execs) == 1
+    else:
+        with pytest.raises(Refused) as e:
+            _go(seams)
+        assert e.value.name == refused and not execs and read_intent(HOST, path=jpath) == prior
+
+
+@pytest.mark.parametrize("handover", [None, 2])
+def test_a_probe_with_another_handover_abi_refuses_before_the_exec(tmp_path: Path, monkeypatch, handover) -> None:
+    """Ruling 2 (codex MED 3): the probe answers a ``handover`` ABI; any other (or none) refuses
+    ``downgrade-unsupported:handover`` before the exec, the host restored."""
+    _monkey_built(monkeypatch)
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(
+        t, GEN, _answers(G.KINDS, handover)))
+    with pytest.raises(Refused) as e:
+        _go(seams)
+    assert e.value.name == "downgrade-unsupported:handover" and not execs
+    assert not (tree / GEN).exists() and not jpath.exists() and not q.held
+
+
+def test_a_failed_phase_a_step_restores_the_host(tmp_path: Path, monkeypatch) -> None:
+    """Ruling 3: a failed step (here R2's copy, after R1 journalled and the partial was made) puts the host back."""
+    _monkey_built(monkeypatch)
+
+    def failing(p, e):
+        (tree / root_tree.STAGING).mkdir(parents=True)
+        jpath.write_text(intent_text(Intent("repair", OP, txn=TXN)))
+        return "[3/14] copy the levain package FAILED: cp exited 1"
+
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: t.mkdir(), apply=lambda p, e: failing(p, e))
+    with pytest.raises(Refused) as e:
+        _go(seams)
+    assert e.value.name == "step-failed" and "cp exited 1" in e.value.detail and not execs
+    assert not jpath.exists() and not (tree / root_tree.STAGING).exists() and not q.held
+
+
+def test_a_probe_that_cannot_start_restores_the_host(tmp_path: Path, monkeypatch) -> None:
+    """Ruling 3 (both seats): an OSError launching the probe (its interpreter gone) is ``source-broken``, host put
+    back (the staged generation and the run's journal removed)."""
+    _monkey_built(monkeypatch)
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(t, GEN, _answers(G.KINDS)),
+                                                      python=str(tmp_path / "no-such-python"))
+    with pytest.raises(Refused) as e:
+        _go(seams)
+    assert e.value.name == "source-broken" and "could not start" in e.value.detail and not execs
+    assert not (tree / GEN).exists() and not jpath.exists() and not q.held
+
+
+def test_no_pool_lock_refuses_before_any_phase_a_act(tmp_path: Path, monkeypatch) -> None:
+    """Ruling 3 (codex 5): the pool-lock check runs BEFORE phase A's first act, so it has nothing to undo."""
+    _monkey_built(monkeypatch)
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(t, GEN, _answers(G.KINDS)),
+                                                      hold=False)
+    with pytest.raises(Refused) as e:
+        _go(seams)
+    assert e.value.name == "bad-root" and seams.acts == [] and not execs and not jpath.exists()   # type: ignore[attr-defined]
+
+
+def test_a_restore_that_cannot_rewrite_the_journal_says_so(tmp_path: Path, monkeypatch) -> None:
+    """Ruling 3 (complement LOW 3): a restore whose journal write fails appends ``rollback-incomplete: <what>``."""
+    _monkey_built(monkeypatch)
+    prior = Intent("repair", OP, txn=TXN, managed=(("netns/1", "levain-e0"),))
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(t, GEN,
+                                                                                          _answers(["unit/1"])),
+                                                      prior=prior)
+    monkeypatch.setattr(IH, "write_intent_atomically", lambda path, text: (False, "disk full (test)"))
+    with pytest.raises(Refused) as e:
+        _go(seams)
+    assert e.value.name == "downgrade-unsupported:netns/1"
+    assert "rollback-incomplete:" in e.value.detail and "disk full (test)" in e.value.detail
+
+
+def test_the_restore_keeps_a_generation_that_was_there_before(tmp_path: Path, monkeypatch) -> None:
+    """Ruling 4 (complement LOW 4): ``gen-<id>`` existed (a retained rollback target); ``_place`` replaced it with the
+    same content; a probe refusal after that keeps it."""
+    import shutil
+
+    _monkey_built(monkeypatch)
+
+    def stage_and_place(p, e):
+        jpath.write_text(intent_text(Intent("repair", OP, txn=TXN)))
+        shutil.copytree(tree / GEN, tree / root_tree.STAGING)            # the staged copy: the same content
+        return None if root_tree._place(HOST, tree, tree / root_tree.STAGING, cell, None)[0] else "place failed"
+
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(t, GEN, "def setup():\n"
+                                                                                                  "    pass\n"),
+                                                      apply=lambda p, e: stage_and_place(p, e))
+    cell = seams.plan(None, None).handover
+    with pytest.raises(Refused) as e:
+        _go(seams)
+    assert e.value.name == "downgrade-unsupported" and cell.existed
+    assert (tree / GEN / "levain" / "slot" / "install_helper.py").is_file() and not jpath.exists()
+
+
+def test_adopt_lock_refuses_a_descriptor_that_holds_no_lock(tmp_path: Path) -> None:
+    """Ruling 5 (complement LOW 5): the right file, but no flock held on it -> ``bad-root``; held -> adopted."""
+    a = tmp_path / "a"
+    a.write_text("")
+    os.chmod(a, 0o600)
+    fd = os.open(a, os.O_RDWR)
+    try:
+        with pytest.raises(Refused) as e:
+            IH.adopt_lock(fd, a, owner_ok=_mine)
+        assert e.value.name == "bad-root" and "no lock" in e.value.detail
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        IH.adopt_lock(fd, a, owner_ok=_mine)
+        assert not _pool_free(a)                             # the check's own description did not drop it
+    finally:
+        os.close(fd)
+
+
+def test_the_bounded_child_kills_what_the_probe_left_behind(tmp_path: Path) -> None:
+    """Ruling 7 (complement LOW 7): a probe that exits cleanly but leaves a grandchild in its group: gone after."""
+    import time
+
+    prog = ("import subprocess, sys\n"
+            "p = subprocess.Popen(['sleep', '30'], stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL)\n"
+            "print(p.pid, flush=True)\n")
+    rc, out = IH._bounded_child([sys.executable, "-c", prog], b"", timeout=20.0, cap=1024)
+    assert rc == 0
+    pid = int(out)
+    deadline = time.monotonic() + 5.0
+    gone = False
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+            st = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+            if st.startswith("Z") or not st:
+                gone = True
+                break
+        except ProcessLookupError:
+            gone = True
+            break
+        time.sleep(0.05)
+    if not gone:
+        os.kill(pid, 9)
+    assert gone, f"the probe's grandchild {pid} outlived the probe"
 
 
 # --- test 2: the flip, killed between its acts ------------------------------------------------------------------------

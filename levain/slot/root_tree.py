@@ -340,6 +340,9 @@ class Staged:
 
     target: Optional[str] = None
     refused: Optional[Refused] = None
+    #: ``<tree>/<target>`` was there before :func:`_place` replaced it (same id, same content: a retained generation),
+    #: so a phase-A restore keeps it [r5: L3 r1 complement LOW 4].
+    existed: bool = False
 
 
 def _hash_staged(cell: Staged, partial: Path, source: Path, h11_dir: Path, pinned: Optional[str]) -> tuple[bool, str]:
@@ -378,6 +381,7 @@ def _place(host: HostOS, tree: Path, partial: Path, cell: Staged, current: Optio
         r = subprocess.run((rm, "-rf", str(partial)), capture_output=True, text=True, cwd="/")
         return r.returncode == 0, (f"{target} is already current" if r.returncode == 0 else r.stderr.strip())
     gen = tree / target
+    cell.existed = cell.existed or os.path.lexists(gen)
     r = subprocess.run((rm, "-rf", str(gen)), capture_output=True, text=True, cwd="/")
     if r.returncode != 0:
         return False, r.stderr.strip()
