@@ -7,6 +7,7 @@ Root runs these under ``ROOT_PYTHON`` (``/usr/bin/python3``, 3.9.6 on macOS), wh
     python tests/ci/root_closure.py modules-hop1  # plus one hop of function-local imports (informational)
     python tests/ci/root_closure.py modules-all   # every lazy import followed to a fixpoint (informational)
     python tests/ci/root_closure.py compile       # byte-compile the ``modules`` set (exit 1 on any failure)
+    python tests/ci/root_closure.py compile-wide  # byte-compile (syntax only) the function-local closure of the same roots
     python tests/ci/root_closure.py tests         # the tests/test_*.py files that import a ``modules`` member
 
 Function-local imports are not followed by default: they are where code the root helpers must not reach is kept behind
@@ -18,6 +19,7 @@ module, function-local ones included (a lazy import still runs as root), and imp
 packages' ``__init__`` too, so those are members as well.
 """
 import ast
+import re
 import sys
 import tempfile
 import py_compile
@@ -25,16 +27,44 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 PKG = "levain"
+_WARNED: set = set()
+
+
+def _table(rel: str, name: str):
+    """A module-level literal assigned to ``name``, read from source: importing the module would need the
+    3.9-incompatible code this job exists to find."""
+    src = (ROOT / PKG / rel).read_text(encoding="utf-8")
+    for node in ast.parse(src).body:
+        target = node.target if isinstance(node, ast.AnnAssign) else (node.targets[0] if isinstance(node, ast.Assign) else None)
+        if isinstance(target, ast.Name) and target.id == name:
+            return node.value
+    raise SystemExit("root_closure: %s not found in levain/%s" % (name, rel))
+
+
+def _service_names() -> list:
+    """The ``name`` of every ``Service(...)`` in ``levain.slot.units.SERVICES`` (first positional or ``name=``)."""
+    names = []
+    for call in _table("slot/units.py", "SERVICES").elts:
+        kw = {k.arg: k.value for k in call.keywords}
+        arg = call.args[0] if call.args else kw.get("name")
+        names.append(ast.literal_eval(arg))
+    return names
 
 
 def _entry_modules() -> list:
-    # Read the table from source: importing root_tree would need the 3.9-incompatible code this job exists to find.
-    src = (ROOT / PKG / "slot" / "root_tree.py").read_text(encoding="utf-8")
-    for node in ast.parse(src).body:
-        target = node.target if isinstance(node, ast.AnnAssign) else (node.targets[0] if isinstance(node, ast.Assign) else None)
-        if isinstance(target, ast.Name) and target.id == "ENTRY_MODULES":
-            return sorted(ast.literal_eval(node.value).values())
-    raise SystemExit("root_closure: ENTRY_MODULES not found in levain/slot/root_tree.py")
+    """The roots: the install helper's ENTRY_MODULES plus one ``levain.slot.services.<name>`` per service
+    (``service_boot`` runs each as root with ``runpy.run_module``). A service with no module is printed, not dropped."""
+    roots = set(ast.literal_eval(_table("slot/root_tree.py", "ENTRY_MODULES")).values())
+    for name in _service_names():
+        mod = "levain.slot.services." + name
+        if _path(mod) is None:
+            if mod in _WARNED:
+                continue
+            _WARNED.add(mod)
+            print("root_closure: no module for service %r (%s): handled elsewhere or missing" % (name, mod), file=sys.stderr)
+        else:
+            roots.add(mod)
+    return sorted(roots)
 
 
 def _path(mod: str):
@@ -153,22 +183,30 @@ def _test_files(mods: list) -> list:
     return out
 
 
+def _compile(mods: list, label: str) -> int:
+    bad = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, mod in enumerate(mods):
+            try:
+                py_compile.compile(str(_path(mod)), cfile=str(Path(tmp) / (str(i) + ".pyc")), doraise=True)
+            except py_compile.PyCompileError as e:
+                bad += 1
+                print("FAIL " + mod + ": " + e.msg.strip().splitlines()[-1])
+    print("compiled %d %s modules under %s, %d failed" % (len(mods), label, sys.version.split()[0], bad))
+    return 1 if bad else 0
+
+
 def main(argv: list) -> int:
     cmd = argv[1] if len(argv) > 1 else "modules"
     mods = closure(None if cmd == "modules-all" else 1 if cmd == "modules-hop1" else 0)
     if cmd in ("modules", "modules-hop1", "modules-all"):
         print("\n".join(mods))
     elif cmd == "compile":
-        bad = 0
-        with tempfile.TemporaryDirectory() as tmp:
-            for i, mod in enumerate(mods):
-                try:
-                    py_compile.compile(str(_path(mod)), cfile=str(Path(tmp) / (str(i) + ".pyc")), doraise=True)
-                except py_compile.PyCompileError as e:
-                    bad += 1
-                    print("FAIL " + mod + ": " + e.msg.strip().splitlines()[-1])
-        print("compiled %d modules under %s, %d failed" % (len(mods), sys.version.split()[0], bad))
-        return 1 if bad else 0
+        return _compile(mods, "import-time")
+    elif cmd == "compile-wide":
+        # Syntax only, never import: the function-local closure of the same roots (code a root process can import at
+        # run time). Informational on its own; the CI step gates on it so a 3.9 syntax error cannot hide behind a lazy import.
+        return _compile(closure(None), "wide")
     elif cmd == "tests":
         print("\n".join(_test_files(mods)))
     else:
