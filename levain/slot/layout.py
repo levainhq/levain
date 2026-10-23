@@ -408,9 +408,10 @@ def entry_state(host: HostOS, name: str, live) -> str:
 
 def remove_entry_steps(host: HostOS, name: str, *, live) -> list[Step]:
     """``entry/1`` (R10, after the flip; its sudoers rule went at R5): ``rm -f`` the recorded entry under HELPER_DIR."""
-    from levain.slot.removal import chain, point, remove_step
+    from levain.slot.removal import at, chain, point, remove_step
 
     path = HELPER_DIR[host] / name
     rm = "/bin/rm" if host == "darwin" else _abs("rm")
     return [remove_step(f"remove the entry {path}", ("entry/1", name), live, lambda: entry_state(host, name, live),
-                        chain(lambda: live.act((rm, "-f", str(path))), point(live, "entry/1:after-rm")))]
+                        chain(lambda: live.act((rm, "-f", at(live, path))), point(live, "entry/1:after-rm")),
+                        tools=(rm,))]

@@ -56,6 +56,7 @@ class FakeHost:
         self.groups: dict = {}                 # name -> [gid, label, set(members)]
         self.users: dict = {"root": [0, "System Administrator"]}
         self.fail: set = set()                 # tool basenames whose reads fail
+        self.kws: list = []                    # each run's keyword arguments
 
     def acts(self) -> list:
         reads = ("print", "show", "-list", "list", "passwd", "group", "-sr")
@@ -68,6 +69,7 @@ class FakeHost:
     def run(self, argv, **kw):
         a = list(argv)
         self.log.append(tuple(a))
+        self.kws.append(kw)
         tool = os.path.basename(a[0])
         if tool in self.fail:
             return _Proc(5)
@@ -81,8 +83,11 @@ class FakeHost:
             if a[1] == "show":
                 st = self.systemd.get(a[-1], ["not-found", "inactive"])
                 return _Proc(0, (st[0] if a[3] == "LoadState" else st[1]) + "\n")
+            if a[1] == "disable" and not (self.root / "etc/systemd/system" / a[-1]).exists():
+                return _Proc(1)                # no unit file: disable fails before its --now stops anything [C1;
+                                               # the pessimistic model, the real systemctl is the U12 round's]
             if a[1] in ("disable", "stop"):
-                if a[-1] in self.systemd:
+                if a[-1] in self.systemd and (a[1] == "stop" or "--now" in a):
                     self.systemd[a[-1]][1] = "inactive"
             if a[1] == "daemon-reload":
                 for u in list(self.systemd):
@@ -130,7 +135,9 @@ class FakeHost:
             self.users[a[-1]][1] = a[a.index("--comment") + 1]
             return _Proc(0)
         if tool == "rm":
-            p = self.root / a[-1].lstrip("/")
+            p = Path(a[-1])                    # as named: never re-rooted, so an argv off Live.root fails [X2]
+            if not str(p).startswith(str(self.root) + "/"):
+                return _Proc(1)
             if p.is_symlink() or p.is_file():
                 p.unlink()
             return _Proc(0)
@@ -465,7 +472,56 @@ def test_install_skips_is_written_before_the_shape(tmp_path: Path) -> None:
     assert got == [["sudoers/1", "levain-kept"], ["sudoers/1", "levain-mine"]]   # the gone alias dropped out
 
 
-# --- L3 r1 X3 + HEAD ruling R1b-6 (1022-18 r1b/L3_r1_TRIAGE.md) --------------------------------------------------
+# --- L3 r1 fixes (1022-18 r1b/L3_r1_TRIAGE.md X1-X4, C1-C4) -----------------------------------------------------------
+
+#: One record per kind and host the table can remove, every other kind's object present (``_everything``).
+ALONE = (
+    ("linux", "apparmor/1", "levain-slot-bwrap"), ("darwin", "pf-anchor/1", (pf.ANCHOR, str(pf.ANCHOR_FILE))),
+    ("darwin", "unit/1", "old-svc"), ("linux", "unit/1", "old-svc"), ("darwin", "pf-alias/1", "127.0.1.9"),
+    ("darwin", "sudoers/1", "levain-old"), ("linux", "sudoers/1", "levain-old"),
+    ("darwin", "member/1", ("_levain_keys", "levain-gone", GID)), ("linux", "member/1", ("_levain_keys", "levain-gone", LGID)),
+    ("darwin", "group/1", ("levain-gone", GID)), ("linux", "group/1", ("levain-gone", LGID)),
+    ("darwin", "account/1", ("_levain_s7", 3990)), ("linux", "account/1", ("_levain_s7", 3990)),
+    ("darwin", "pf-enable/1", str(pf.PF_TOKEN)), ("linux", "bwrap-copy/1", (str(bwrap.LEVAIN_BWRAP), str(bwrap.BWRAP_DIGEST))),
+    ("linux", "netns/1", "levain-e7"), ("darwin", "entry/1", "old-helper"), ("linux", "entry/1", "old-helper"),
+)
+
+
+def test_every_program_a_remove_step_runs_reaches_the_tool_preflight(tmp_path: Path) -> None:
+    """X1: a remove step is a ``call``, so its argv were invisible to ``plan_tools``; a host missing a removal-only
+    tool (``apparmor_parser``, ``gpasswd``, ``ip``...) passed ``check_tools`` and failed part-way. Every program each
+    kind's steps RAN (the fake's log) is in ``plan_tools`` of those steps, and a missing one refuses before step 1."""
+    assert {k for _, k, _ in ALONE} == IH.SHIPPED_KINDS
+    for host, kind, ident in ALONE:
+        h, live = _host(tmp_path / f"{kind.replace('/', '')}-{host}", host)
+        _everything(h, live)
+        steps = _steps(host, kind, ident, live)
+        assert steps and all(isinstance(s, RM.RemoveStep) and s.tools for s in steps), (kind, host)
+        assert all(ok for ok, _ in _run_all(steps)), (kind, host)
+        ran = {a[0] for a in h.log if a[0] != "fsync"}
+        assert ran and ran <= set(IH.plan_tools(steps)), (kind, host, ran - set(IH.plan_tools(steps)))
+    # a host whose apparmor_parser is gone: refused by name at the preflight (before the journal, before any act)
+    h, live = _host(tmp_path / "pre", "linux")
+    steps = _steps("linux", "apparmor/1", "levain-slot-bwrap", live)
+    facts = type("F", (), {"host": "linux", "tool_present": staticmethod(lambda t: "apparmor_parser" not in t),
+                           "xcode_ready": staticmethod(lambda: True)})()
+    with pytest.raises(Refused) as ei:
+        IH.check_tools(facts, steps, verb="repair")
+    assert ei.value.name == "tool-missing" and "apparmor_parser" in ei.value.detail and not h.log
+
+
+def test_removal_argv_name_the_path_the_live_read_classified(tmp_path: Path) -> None:
+    """X2: every file a removal argv names sits under ``Live.root``, the object the live read classified (the fake no
+    longer re-roots argv, and refuses one off its root, so the outcome tests above go red without it)."""
+    for host, kind, ident in ALONE:
+        h, live = _host(tmp_path / f"{kind.replace('/', '')}-{host}", host)
+        _everything(h, live)
+        assert all(ok for ok, _ in _run_all(_steps(host, kind, ident, live))), (kind, host)
+        paths = [x for a in h.acts() if os.path.basename(a[0]) in ("rm", "apparmor_parser")
+                 for x in a[1:] if x.startswith("/")]
+        assert all(p.startswith(str(h.root) + "/") for p in paths), (kind, host, paths)
+    assert paths                                         # the last kind (entry/1) removes a file
+
 
 def test_install_skips_malformed_or_out_of_bound_refuses_before_any_act(tmp_path: Path) -> None:
     """X3 + HEAD ruling R1b-6: an ``install-skips`` that does not parse, or holds a known kind's identity outside its
@@ -507,3 +563,87 @@ def test_a_malformed_install_skips_refuses_repair_at_the_gather(tmp_path: Path) 
         IH.gather_facts(parse_install_argv(["repair"]), "darwin", OP_UID, run=run, store_seams=_store_seams(L),
                         state_dir=state, user_name=lambda uid: MOP)
     assert ei.value.name == "install-skips-malformed"
+
+
+def test_the_darwin_tombstone_acts_only_through_live(tmp_path: Path, monkeypatch) -> None:
+    """X4: the macOS tombstone's "out of every group" ran ``hands._darwin_leave_groups`` on the host's own
+    ``subprocess``. Every read and act now goes through ``Live``: with the host's ``subprocess.run`` poisoned, the
+    account leaves every group that lists it (Levain's and a foreign one), ends labelled retired, and a re-run acts
+    on nothing."""
+    import levain.firing.hands as HANDS
+
+    def poisoned(*a, **kw):
+        raise AssertionError(f"a host touch outside Live: {a}")
+
+    monkeypatch.setattr(HANDS.subprocess, "run", poisoned)
+    h, live = _host(tmp_path / "t")
+    h.users["_levain_s7"] = [3990, SLOT_MARKER]
+    h.groups["levain-gone"] = [GID, SLOT_MARKER, {"_levain_s7", "_levain_keys"}]
+    h.groups["staff"] = [20, "", {"_levain_s7"}]
+    assert all(ok for ok, _ in _run_all(_steps(HOST, "account/1", ("_levain_s7", 3990), live))), h.log
+    left = sorted(a[-1] for a in h.log if a[0] == "/usr/sbin/dseditgroup")
+    assert left == ["levain-gone", "staff"] and not [g for g, v in h.groups.items() if "_levain_s7" in v[2]]
+    assert h.users["_levain_s7"][1] == SLOT_RETIRED_MARKER["darwin"]
+    before = len(h.acts())
+    assert all(ok for ok, _ in _run_all(_steps(HOST, "account/1", ("_levain_s7", 3990), live)))
+    assert len(h.acts()) == before
+
+
+def test_a_linux_unit_running_with_its_file_gone_is_stopped(tmp_path: Path) -> None:
+    """C1: ``disable --now`` needs the unit file and may fail before it stops anything, so a unit whose file was
+    deleted by hand while it runs read OURS on every re-run and wedged repair at R5. With no file: ``stop``, then a
+    best-effort ``disable``; the verdict is ActiveState."""
+    h, live = _host(tmp_path / "c1", "linux")
+    h.systemd["levain-old-svc.service"] = ["loaded", "active"]
+    step, = IH.removal_steps("linux", [("unit/1", "old-svc")], "R5", live=live)
+    assert step.call() == (True, "") and h.systemd["levain-old-svc.service"][1] == "inactive"
+    sc = [a[1] for a in h.acts() if os.path.basename(a[0]) == "systemctl"]
+    assert sc[:2] == ["stop", "disable"], sc
+    # with the file present, disable --now as before
+    h, live = _host(tmp_path / "c1f", "linux")
+    _put(live, units.SYSTEMD_DIR / "levain-old-svc.service")
+    h.systemd["levain-old-svc.service"] = ["loaded", "active"]
+    step, = IH.removal_steps("linux", [("unit/1", "old-svc")], "R5", live=live)
+    assert step.call() == (True, "") and [a for a in h.acts() if a[1:3] == ("disable", "--now")]
+
+
+def test_the_sudoers_check_runs_whatever_the_drop_in_reads(tmp_path: Path) -> None:
+    """C2: ``visudo -c`` failing after the ``rm`` used to pass on the re-run (the drop-in now reads ABSENT, so the
+    chained check never ran). The check is its own step: it fails the re-run too, until the config checks clean."""
+    h, live = _host(tmp_path / "c2")
+    _put(live, SUDOERS_DIR / "levain-old")
+    h.fail.add("visudo")
+    first = _run_all(IH.removal_steps(HOST, [("sudoers/1", "levain-old")], "R5", live=live))
+    rerun = _run_all(IH.removal_steps(HOST, [("sudoers/1", "levain-old")], "R5", live=live))
+    assert first[0][0] and not first[1][0] and not live.at(SUDOERS_DIR / "levain-old").exists(), first
+    assert rerun[0] == (True, "") and not rerun[1][0], rerun
+    h.fail.clear()
+    assert all(ok for ok, _ in _run_all(IH.removal_steps(HOST, [("sudoers/1", "levain-old")], "R5", live=live)))
+
+
+def test_an_empty_pf_token_file_is_removed(tmp_path: Path) -> None:
+    """C3 (refuted on disk, pinned): ``pf._read_token`` removes a token file that holds no token, so the removal
+    leaves nothing behind. Green on b8a59db0 too (``fix/repro_b8a59db0.txt``)."""
+    h, live = _host(tmp_path / "c3")
+    _put(live, pf.PF_TOKEN, b"")
+    step, = IH.removal_steps(HOST, [("pf-enable/1", str(pf.PF_TOKEN))], "R8", live=live)
+    assert step.call()[0] and not os.path.lexists(live.at(pf.PF_TOKEN))
+
+
+def test_every_live_run_is_bounded(tmp_path: Path) -> None:
+    """C4: every argv a remove step runs carries ``timeout=`` (a hung ``launchctl print`` / ``systemctl show`` hung the
+    whole plan), and a run past it is a failed read, never ABSENT."""
+    import subprocess
+
+    for host, kind, ident in ALONE:
+        h, live = _host(tmp_path / f"{kind.replace('/', '')}-{host}", host)
+        _everything(h, live)
+        _run_all(_steps(host, kind, ident, live))
+        assert h.kws and all(kw.get("timeout") for kw in h.kws), (kind, host, h.kws)
+
+    def hang(argv, **kw):
+        raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+
+    step, = IH.removal_steps("linux", [("netns/1", "levain-e7")], "R8", live=RM.Live(run=hang, root=tmp_path))
+    ok, why = step.call()
+    assert not ok and "live read failed" in why and "timed out" in why

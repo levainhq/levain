@@ -86,12 +86,16 @@ def sudoers_paths() -> tuple[Path, Path]:
 
 def remove_dropin_steps(host: HostOS, name: str, *, live: "Live") -> list[Step]:
     """Row 33 R1b, ``sudoers/1`` (§1.1 table row 2, R5): the recorded drop-in ``_SUDOERS_DIR/<name>`` removed when it
-    is a regular root file, then ``visudo -c`` of the whole config. Never a current name looked up."""
-    from levain.slot.removal import chain, point, remove_step, root_file
+    is a regular root file, then ``visudo -c`` of the whole config as its OWN step, run whatever the drop-in's
+    outcome: a re-run after a failed check finds the drop-in ABSENT and must still check, never pass silently. Never
+    a current name looked up."""
+    from levain.slot.removal import RemoveStep, at, chain, point, remove_step, root_file
 
     path = _SUDOERS_DIR / name
-    check = (_visudo(host)[0], "-c")
-    return [remove_step(f"remove {path} (then visudo -c)", ("sudoers/1", name), live,
+    rm, check = _rm(host), (_visudo(host)[0], "-c")
+    return [remove_step(f"remove {path} (visudo -c checks the config next)", ("sudoers/1", name), live,
                         lambda: root_file(live, path),
-                        chain(lambda: live.act((_rm(host), "-f", str(path))), point(live, "sudoers/1:after-rm"),
-                              lambda: live.act(check)))]
+                        chain(lambda: live.act((rm, "-f", at(live, path))), point(live, "sudoers/1:after-rm")),
+                        tools=(rm,)),
+            RemoveStep(f"check the sudoers config with visudo -c (after {path})", call=lambda: live.act(check),
+                       tools=(check[0],))]

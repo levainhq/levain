@@ -175,17 +175,18 @@ def remove_apparmor_profile_steps(name: str, *, live: "Live") -> list[Step]:
     """``apparmor/1`` (R8): unload the recorded profile ONLY while it is LOADED (whether ``apparmor_parser -R`` of an
     unloaded profile exits 0 is unmeasured, so nothing depends on it), then ``rm -f`` its file. Never the bwrap copy
     or its digest (``bwrap-copy/1``'s), never hands' ``levain-bwrap``."""
-    from levain.slot.removal import chain, point, remove_step
+    from levain.slot.removal import at, chain, point, remove_step
 
     path = Path("/etc/apparmor.d") / name
     record = ("apparmor/1", name)
     state = lambda: apparmor_state(name, live)   # noqa: E731
+    parser, rm = _abs("apparmor_parser"), _abs("rm")
 
     def unload() -> tuple[bool, str]:
         if not _profile_loaded(name, live):
             return True, ""
         if live.at(path).exists():
-            return live.act((_abs("apparmor_parser"), "-R", str(path)))
+            return live.act((parser, "-R", at(live, path)))
         try:
             live.at(APPARMOR_REMOVE).write_text(name, encoding="ascii")
         except OSError as e:
@@ -194,8 +195,8 @@ def remove_apparmor_profile_steps(name: str, *, live: "Live") -> list[Step]:
 
     return [
         remove_step(f"unload the AppArmor profile {name}", record, live, state,
-                    chain(unload, point(live, "apparmor/1:after-unload"))),
-        remove_step(f"remove {path}", record, live, state, lambda: live.act((_abs("rm"), "-f", str(path)))),
+                    chain(unload, point(live, "apparmor/1:after-unload")), tools=(parser,)),
+        remove_step(f"remove {path}", record, live, state, lambda: live.act((rm, "-f", at(live, path))), tools=(rm,)),
     ]
 
 
@@ -211,12 +212,15 @@ def bwrap_copy_state(copy: str, digest: str, live: "Live") -> str:
 
 def remove_bwrap_copy_steps(copy: str, digest: str, *, live: "Live") -> list[Step]:
     """``bwrap-copy/1`` (R8): ``rm -f`` the recorded copy, then its digest record (U2: the identity names both)."""
-    from levain.slot.removal import chain, point, remove_step
+    from levain.slot.removal import at, chain, point, remove_step
 
     record = ("bwrap-copy/1", (copy, digest))
     state = lambda: bwrap_copy_state(copy, digest, live)   # noqa: E731
+    rm = _abs("rm")
     return [
         remove_step(f"remove {copy}", record, live, state,
-                    chain(lambda: live.act((_abs("rm"), "-f", copy)), point(live, "bwrap-copy/1:after-copy-rm"))),
-        remove_step(f"remove {digest}", record, live, state, lambda: live.act((_abs("rm"), "-f", digest))),
+                    chain(lambda: live.act((rm, "-f", at(live, Path(copy)))), point(live, "bwrap-copy/1:after-copy-rm")),
+                    tools=(rm,)),
+        remove_step(f"remove {digest}", record, live, state, lambda: live.act((rm, "-f", at(live, Path(digest)))),
+                    tools=(rm,)),
     ]

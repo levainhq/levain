@@ -18,6 +18,7 @@ program, so no unit here carries a timer or a start interval (§23).
 """
 from __future__ import annotations
 
+import os
 import plistlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -381,7 +382,10 @@ def unit_state(host: HostOS, n: str, live: "Live") -> str:
 def stop_unit_act(host: HostOS, n: str, live: "Live", *, disable: bool) -> tuple[bool, str]:
     """The ONE stop body (repair's R5 stops and a removed unit's revoke): the verdict is the END STATE, never the
     stop's exit status. macOS boots out a loaded job and waits for launchd to unload it; Linux stops it (``disable
-    --now`` for a unit leaving the install) and reads ``ActiveState`` again."""
+    --now`` for a unit leaving the install) and reads ``ActiveState`` again. A leaving unit whose FILE is gone while
+    systemd still runs it gets ``systemctl stop``, then a best-effort ``disable``: ``disable`` needs the file and may
+    fail before its ``--now`` stops anything (unmeasured: the owed Linux round, U12), and that state would read OURS on
+    every re-run."""
     if host == "darwin":
         label = f"com.levain.{n}"
         if _launchd_state(label, live) == "absent":
@@ -391,10 +395,17 @@ def stop_unit_act(host: HostOS, n: str, live: "Live", *, disable: bool) -> tuple
     unit, systemctl = f"levain-{n}.service", _abs("systemctl")
     if not disable and _systemd_state("ActiveState", unit, live) in ("inactive", "failed"):
         return True, ""
-    live.out((systemctl, "disable", "--now", unit) if disable else (systemctl, "stop", unit))
+    if disable and os.path.lexists(live.at(SYSTEMD_DIR / unit)):
+        live.out((systemctl, "disable", "--now", unit))                 # its status is not the verdict: checked next
+        how = "disable --now"
+    else:
+        live.out((systemctl, "stop", unit))
+        if disable:
+            live.out((systemctl, "disable", unit))                      # best effort: with no file it may fail
+        how = "stop"
     state = _systemd_state("ActiveState", unit, live)
     if state not in ("inactive", "failed"):
-        return False, f"{unit} is {state or 'in an unknown state'} after systemctl {'disable --now' if disable else 'stop'}"
+        return False, f"{unit} is {state or 'in an unknown state'} after systemctl {how}"
     return True, ""
 
 
@@ -403,20 +414,23 @@ def stop_unit_by_name(host: HostOS, n: str, *, live: "Live") -> list[Step]:
     from levain.slot.removal import chain, point, remove_step
 
     why = f"stop com.levain.{n}" if host == "darwin" else f"stop and disable levain-{n}.service"
+    tools = ("/bin/launchctl",) if host == "darwin" else (_abs("systemctl"),)
     return [remove_step(why, ("unit/1", n), live, lambda: unit_state(host, n, live),
-                        chain(lambda: stop_unit_act(host, n, live, disable=True), point(live, "unit/1:after-stop")))]
+                        chain(lambda: stop_unit_act(host, n, live, disable=True), point(live, "unit/1:after-stop")),
+                        tools=tools)]
 
 
 def remove_unit_file_by_name(host: HostOS, n: str, *, live: "Live") -> list[Step]:
     """``unit/1`` destroy (R12): ``rm -f`` the recorded unit file; Linux then ``daemon-reload`` and ``reset-failed``
     (a file gone while systemd still holds the unit loaded reads OURS, so a re-run reloads)."""
-    from levain.slot.removal import chain, point, remove_step
+    from levain.slot.removal import at, chain, point, remove_step
 
     if host == "darwin":
         path = LAUNCHD_DIR / f"com.levain.{n}.plist"
         return [remove_step(f"remove {path}", ("unit/1", n), live, lambda: unit_state(host, n, live),
-                            chain(lambda: live.act(("/bin/rm", "-f", str(path))), point(live, "unit/1:after-rm")))]
-    unit, systemctl = f"levain-{n}.service", _abs("systemctl")
+                            chain(lambda: live.act(("/bin/rm", "-f", at(live, path))), point(live, "unit/1:after-rm")),
+                            tools=("/bin/launchctl", "/bin/rm"))]
+    unit, systemctl, rm = f"levain-{n}.service", _abs("systemctl"), _abs("rm")
     path = SYSTEMD_DIR / unit
 
     def reset() -> tuple[bool, str]:
@@ -425,5 +439,6 @@ def remove_unit_file_by_name(host: HostOS, n: str, *, live: "Live") -> list[Step
 
     return [remove_step(f"remove {path} (then daemon-reload, reset-failed)", ("unit/1", n), live,
                         lambda: unit_state(host, n, live),
-                        chain(lambda: live.act((_abs("rm"), "-f", str(path))), point(live, "unit/1:after-rm"),
-                              lambda: live.act((systemctl, "daemon-reload")), reset))]
+                        chain(lambda: live.act((rm, "-f", at(live, path))), point(live, "unit/1:after-rm"),
+                              lambda: live.act((systemctl, "daemon-reload")), reset),
+                        tools=(systemctl, rm))]

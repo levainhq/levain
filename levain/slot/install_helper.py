@@ -181,8 +181,10 @@ def preflight(cmd: InstallCommand, facts: HostFacts) -> None:
 
 
 def plan_tools(steps: Sequence[Step]) -> tuple[str, ...]:
-    """Every host program a step runs: its argv's, its ``skip_if``'s and its validator's."""
-    return tuple(sorted({x[0] for s in steps for x in (s.argv, s.skip_if, s.validate) if x}))
+    """Every host program a step runs: its argv's, its ``skip_if``'s and its validator's, and the ``tools`` a remove
+    step (:class:`removal.RemoveStep`, a ``call`` whose argv no field names) declares."""
+    return tuple(sorted({x[0] for s in steps for x in (s.argv, s.skip_if, s.validate) if x}
+                        | {t for s in steps for t in getattr(s, "tools", ())}))
 
 
 def extra_tools(host: HostOS, verb: str) -> tuple[str, ...]:

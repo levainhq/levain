@@ -10,8 +10,11 @@ identity and touches nothing else. Each act of a builder is a ``call`` step that
 * a read whose tool FAILS raises :class:`ReadFailed`: the step fails, the run stops, the re-run reads again. A failed
   read is never taken as ABSENT.
 
-:class:`Live` carries every host touch a remove step makes (argv runs, the root its file paths sit under, the fsync,
-the fault hook), so a test drives the whole table against a fake runner and a tmp root. :data:`REMOVE_POINTS` are the
+:class:`Live` carries every host touch a remove step makes (argv runs, each bounded by :attr:`Live.timeout`; the root
+its file paths sit under, which the removal argv name too, through :meth:`Live.at`; the fsync; the fault hook), so a
+test drives the whole table against a fake runner and a tmp root. Every remove step is a :class:`RemoveStep` that
+names the programs its read and its acts run (``tools``), so the plan's tool preflight refuses a missing one before
+step 1 (a ``call`` step's argv is otherwise invisible to it). :data:`REMOVE_POINTS` are the
 crash table's ``<kind>:<point>`` names; ``Live.fault`` is called at each and is a no-op outside the staged-tree
 launcher (R2 wires ``Seams.fault`` to it).
 
@@ -62,9 +65,20 @@ def _fsync(fd: int) -> None:
     _full_fsync(fd)
 
 
+@dataclass(frozen=True)
+class RemoveStep(Step):
+    """A remove step: ``tools`` are the host programs its live read and its acts run, which no ``argv`` names."""
+
+    tools: Tuple[str, ...] = ()
+
+
+#: The bound on one argv a remove step runs (a hung ``launchctl print`` or ``systemctl show`` must not hang the run).
+RUN_TIMEOUT_S = 60.0
+
+
 @dataclass
 class Live:
-    #: Every argv a remove step reads with or acts with, ``subprocess.run``-shaped.
+    #: Every argv a remove step reads with or acts with, ``subprocess.run``-shaped (called with ``timeout=``).
     run: Callable[..., object] = _run
     #: The root every file path a remove step reads or removes sits under (``/`` on a host).
     root: Path = Path("/")
@@ -74,13 +88,24 @@ class Live:
     fsync: Callable[[int], None] = _fsync
     #: The NOT_OURS records this run met: ``(kind, identity)``.
     skips: set = field(default_factory=set)
+    #: Seconds each argv may run before it counts as failed.
+    timeout: float = RUN_TIMEOUT_S
 
     def at(self, path: Path) -> Path:
         p = Path(path)
         return self.root / p.relative_to("/") if p.is_absolute() else self.root / p
 
+    def timed(self, argv: Sequence[str], **kw: object) -> object:
+        """:attr:`run` with :attr:`timeout` unless the caller bounds it itself (the runner a callee gets)."""
+        kw.setdefault("timeout", self.timeout)
+        return self.run(list(argv), **kw)
+
     def out(self, argv: Sequence[str]) -> Tuple[int, str, str]:
-        r = self.run(list(argv))
+        """``(exit, stdout, stderr)``; a run past :attr:`timeout` answers exit 124, a failure like any other."""
+        try:
+            r = self.timed(argv)
+        except subprocess.TimeoutExpired:
+            return 124, "", f"timed out after {self.timeout:g}s"
         return (getattr(r, "returncode", 1), getattr(r, "stdout", "") or "", getattr(r, "stderr", "") or "")
 
     def read(self, argv: Sequence[str]) -> str:
@@ -127,8 +152,10 @@ Classify = Callable[[], str]
 Act = Callable[[], Tuple[bool, str]]
 
 
-def remove_step(why: str, record: tuple, live: Live, classify: Classify, act: Act) -> Step:
-    """One act of a remove step: the live read first (§1.1 rule e), then the act only for OURS."""
+def remove_step(why: str, record: tuple, live: Live, classify: Classify, act: Act, *,
+                tools: Sequence[str]) -> RemoveStep:
+    """One act of a remove step: the live read first (§1.1 rule e), then the act only for OURS. ``tools``: every
+    program ``classify`` and ``act`` run (required, so no builder leaves the preflight blind)."""
     def go() -> Tuple[bool, str]:
         try:
             state = classify()
@@ -140,7 +167,7 @@ def remove_step(why: str, record: tuple, live: Live, classify: Classify, act: Ac
         if state == ABSENT:
             return True, ""
         return act()
-    return Step(why, call=go)
+    return RemoveStep(why, call=go, tools=tuple(tools))
 
 
 def chain(*acts: Act) -> Act:
@@ -162,5 +189,11 @@ def point(live: Live, name: str) -> Act:
     return go
 
 
-__all__ = ["ABSENT", "Live", "NOT_OURS", "OURS", "REMOVE_POINTS", "ReadFailed", "chain", "point", "remove_step",
-           "root_file"]
+def at(live: Live, path: Path) -> str:
+    """A recorded path as a removal argv names it: under :attr:`Live.root`, the same object the live read classified
+    (``path`` itself on a host)."""
+    return str(live.at(Path(path)))
+
+
+__all__ = ["ABSENT", "Live", "NOT_OURS", "OURS", "REMOVE_POINTS", "RUN_TIMEOUT_S", "ReadFailed", "RemoveStep", "at",
+           "chain", "point", "remove_step", "root_file"]

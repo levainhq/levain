@@ -78,5 +78,7 @@ def remove_netns_steps(name: str, *, live: "Live") -> list[Step]:
     """Row 33 R1b, ``netns/1`` (R8): ``ip netns delete`` the RECORDED namespace."""
     from levain.slot.removal import chain, point, remove_step
 
+    ip = _ip()
     return [remove_step(f"delete the network namespace {name}", ("netns/1", name), live, lambda: netns_state(name, live),
-                        chain(lambda: live.act((_ip(), "netns", "delete", name)), point(live, "netns/1:after-delete")))]
+                        chain(lambda: live.act((ip, "netns", "delete", name)), point(live, "netns/1:after-delete")),
+                        tools=(ip,))]

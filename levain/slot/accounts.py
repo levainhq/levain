@@ -243,13 +243,25 @@ __all__ = ["Account", "Group", "OPERATOR_GROUPS", "SINGLETONS", "SLOT_MARKER", "
 
 
 def _directory(host: HostOS, live: "Live"):   # -> install_helper.Directory
+    import subprocess
+
     from levain.slot.install_helper import read_directory
     from levain.slot.removal import ReadFailed
 
     try:
-        return read_directory(host, run=live.run)
+        return read_directory(host, run=live.timed)
     except Refused as e:
         raise ReadFailed(f"{e.name}: {e.detail}") from None
+    except subprocess.TimeoutExpired:
+        raise ReadFailed(f"the directory read timed out after {live.timeout:g}s") from None
+
+
+def _directory_tools(host: HostOS) -> tuple[str, ...]:
+    """The programs :func:`_directory` runs (``read_directory``'s)."""
+    return ("/usr/bin/dscl",) if host == "darwin" else (_abs("getent"),)
+
+
+_DSEDITGROUP = "/usr/sbin/dseditgroup"
 
 
 def _group_ours(host: HostOS, d, name: str, gid: int) -> str:
@@ -278,11 +290,12 @@ def remove_member_steps(host: HostOS, account: str, group: str, gid: int, *, liv
     """``member/1`` (R7): macOS ``dseditgroup -o edit -d``, Linux ``gpasswd -d``."""
     from levain.slot.removal import chain, point, remove_step
 
-    argv = (("/usr/sbin/dseditgroup", "-o", "edit", "-d", account, "-t", "user", group) if host == "darwin"
+    argv = ((_DSEDITGROUP, "-o", "edit", "-d", account, "-t", "user", group) if host == "darwin"
             else (_abs("gpasswd"), "-d", account, group))
     return [remove_step(f"take {account} out of {group}", ("member/1", (account, group, gid)), live,
                         lambda: member_state(host, account, group, gid, live),
-                        chain(lambda: live.act(argv), point(live, "member/1:after-remove")))]
+                        chain(lambda: live.act(argv), point(live, "member/1:after-remove")),
+                        tools=(*_directory_tools(host), argv[0]))]
 
 
 def group_state(host: HostOS, name: str, gid: int, live: "Live") -> str:
@@ -296,7 +309,7 @@ def remove_group_steps(host: HostOS, name: str, gid: int, *, live: "Live", retir
     NOT_OURS (left alone) and ABSENT when ``record_held`` (a completed run had it, so rows may carry it); an ABSENT
     group the write-ahead journal alone held was never made and is dropped unretired. ``retire=False``: undo."""
     from levain.slot.ids import RETIRED_IDS_PATH, retire_ids_durably
-    from levain.slot.removal import ABSENT, NOT_OURS, OURS, ReadFailed
+    from levain.slot.removal import ABSENT, NOT_OURS, OURS, ReadFailed, RemoveStep
 
     record = ("group/1", (name, gid))
     argv = (*_DSCL, "-delete", f"/Groups/{name}") if host == "darwin" else (_abs("groupdel"), name)
@@ -322,8 +335,8 @@ def remove_group_steps(host: HostOS, name: str, gid: int, *, live: "Live", retir
             live.fault("group/1:after-delete")
         return ok, why
 
-    return [Step(f"delete the group {name} (its gid {gid} retired first)" if retire else f"delete the group {name}",
-                 call=go)]
+    return [RemoveStep(f"delete the group {name} (its gid {gid} retired first)" if retire else f"delete the group {name}",
+                       call=go, tools=(*_directory_tools(host), argv[0]))]
 
 
 def account_state(host: HostOS, name: str, uid: int, live: "Live") -> str:
@@ -346,12 +359,26 @@ def remove_account_steps(host: HostOS, name: str, uid: int, *, live: "Live",
                          end: "Callable[[int, str], tuple[bool, str]]", retire: bool = True) -> list[Step]:
     """``account/1`` (R7): the uid retired durably, every process ended (``end``: the caller's proven end), then the
     tombstone (never a delete). Each act re-reads the live label first, so a run killed inside the tombstone re-runs
-    it from its first act while the label is still live."""
+    it from its first act while the label is still live. Every act goes through ``live``: the macOS tombstone's
+    "out of every group" is read and acted here, never :func:`levain.firing.hands._darwin_leave_groups` (the host's
+    own ``subprocess``)."""
     from levain.slot.ids import RETIRED_IDS_PATH, retire_ids_durably
-    from levain.slot.removal import remove_step
+    from levain.slot.removal import ReadFailed, remove_step
 
     record = ("account/1", (name, uid))
     classify = lambda: account_state(host, name, uid, live)   # noqa: E731
+    reads = _directory_tools(host)
+
+    def leave_groups() -> tuple[bool, str]:
+        try:
+            d = _directory(host, live)
+        except ReadFailed as e:
+            return False, str(e)
+        for g in sorted(g for g, members in d.group_members.items() if name in members):
+            ok, why = live.act((_DSEDITGROUP, "-o", "edit", "-d", name, "-t", "user", g))
+            if not ok:
+                return False, why
+        return True, ""
 
     def retire_then_end() -> tuple[bool, str]:
         if retire:
@@ -363,12 +390,17 @@ def remove_account_steps(host: HostOS, name: str, uid: int, *, live: "Live",
         return end(uid, name)
 
     steps = [remove_step(f"retire {name}'s uid {uid}, then stop every process of {name}", record, live, classify,
-                         retire_then_end)]
+                         retire_then_end, tools=reads)]
     for i, s in enumerate(tombstone_steps(host, name)):
-        def act(s: Step = s, first: bool = i == 0) -> tuple[bool, str]:
-            ok, why = s.call() if s.call is not None else live.act(s.argv)
+        if s.call is not None and s.why != f"take {name} out of every group":   # a new callback needs a live body here
+            raise AssertionError(f"tombstone step {s.why!r} has a callback remove_account_steps cannot route")
+        body = leave_groups if s.call is not None else (lambda s=s: live.act(s.argv))
+        tools = (*reads, _DSEDITGROUP) if s.call is not None else (*reads, s.argv[0])
+
+        def act(body: "Callable[[], tuple[bool, str]]" = body, first: bool = i == 0) -> tuple[bool, str]:
+            ok, why = body()
             if ok and first:
                 live.fault("account/1:after-first-act")
             return ok, why
-        steps.append(remove_step(s.why, record, live, classify, act))
+        steps.append(remove_step(s.why, record, live, classify, act, tools=tools))
     return steps

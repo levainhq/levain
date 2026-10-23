@@ -313,7 +313,8 @@ def remove_alias_steps(addr: str, *, live: "Live") -> list[Step]:
     from levain.slot.removal import chain, point, remove_step
 
     return [remove_step(f"remove the lo0 alias {addr}", ("pf-alias/1", addr), live, lambda: alias_state(addr, live),
-                        chain(lambda: live.act((IFCONFIG, "lo0", "-alias", addr)), point(live, "pf-alias/1:after-remove")))]
+                        chain(lambda: live.act((IFCONFIG, "lo0", "-alias", addr)), point(live, "pf-alias/1:after-remove")),
+                        tools=(IFCONFIG,))]
 
 
 def anchor_state(anchor: str, file: str, live: "Live") -> str:
@@ -331,14 +332,16 @@ def remove_anchor_steps(anchor: str, file: str, *, live: "Live") -> list[Step]:
     """``pf-anchor/1`` (R8): flush the recorded anchor, then ``rm -f`` its rules file. Never pf's enable reference
     (that is ``pf-enable/1``'s): an anchor rename must not release the reference this run just took. A non-zero
     ``pfctl -F all`` fails the step (whether it exits 0 on an empty anchor is the crash table's to measure)."""
-    from levain.slot.removal import chain, point, remove_step
+    from levain.slot.removal import at, chain, point, remove_step
 
     record = ("pf-anchor/1", (anchor, file))
     state = lambda: anchor_state(anchor, file, live)   # noqa: E731
     return [
         remove_step(f"flush the pf anchor {anchor}", record, live, state,
-                    chain(lambda: live.act((PFCTL, "-a", anchor, "-F", "all")), point(live, "pf-anchor/1:after-flush"))),
-        remove_step(f"remove {file}", record, live, state, lambda: live.act(("/bin/rm", "-f", file))),
+                    chain(lambda: live.act((PFCTL, "-a", anchor, "-F", "all")), point(live, "pf-anchor/1:after-flush")),
+                    tools=(PFCTL,)),
+        remove_step(f"remove {file}", record, live, state, lambda: live.act(("/bin/rm", "-f", at(live, Path(file)))),
+                    tools=(PFCTL, "/bin/rm")),
     ]
 
 
@@ -350,10 +353,16 @@ def enable_state(token: str, live: "Live") -> str:
 
 def remove_enable_steps(token: str, *, live: "Live") -> list[Step]:
     """``pf-enable/1`` (R8, after every ``pf-anchor/1``): :func:`release_enable_reference` on the recorded token
-    path, which removes the file only once pf confirms the reference gone."""
+    path, which removes the file only once pf confirms the reference gone (a file holding no token names nothing pf
+    could release, and :func:`_read_token` removes it). ``pfctl -X`` runs bounded by ``live.timeout``."""
     from levain.slot.removal import remove_step
 
+    def release() -> tuple[bool, str]:
+        try:
+            return release_enable_reference(live.at(Path(token)), run=live.timed,
+                                            after_release=lambda: live.fault("pf-enable/1:after-release"))
+        except subprocess.TimeoutExpired:
+            return False, f"pfctl -X timed out after {live.timeout:g}s, token kept"
+
     return [remove_step(f"release pf's enable reference (the token in {token})", ("pf-enable/1", token), live,
-                        lambda: enable_state(token, live),
-                        lambda: release_enable_reference(live.at(Path(token)), run=live.run,
-                                                         after_release=lambda: live.fault("pf-enable/1:after-release")))]
+                        lambda: enable_state(token, live), release, tools=(PFCTL,))]
