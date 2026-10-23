@@ -94,6 +94,36 @@ jobs:
           test "${#files[@]}" -gt 0 || { echo "shard ${{ matrix.shard }} has no files"; exit 1; }
           pytest -q "${files[@]}"
 
+  root-py39:
+    # The code root runs is executed by `ROOT_PYTHON` (levain/slot/root_tree.py): /usr/bin/python3, which is 3.9.6 on
+    # macOS, while the `test` matrix is 3.12 / 3.13. This job runs that code on 3.9. tests/ci/root_closure.py derives
+    # the set from ENTRY_MODULES at run time (no list is kept by hand): (i) byte-compile the import-time closure,
+    # (ii) run the test files that import only that closure. The package is not installed (it needs a newer Python):
+    # the files import from the checkout, and --noconftest keeps the repo conftest, which is written for 3.12+, out.
+    name: root-run code (Python 3.9)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.9"
+
+      - name: Byte-compile the root-run import closure
+        run: python tests/ci/root_closure.py compile
+
+      - name: Run the tests that exercise only that closure
+        run: |
+          set -o pipefail
+          python -m pip install --upgrade pip pytest
+          python tests/ci/root_closure.py tests > "$RUNNER_TEMP/root_tests.txt"
+          mapfile -t files < "$RUNNER_TEMP/root_tests.txt"
+          test "${#files[@]}" -gt 0 || { echo "the closure selected no test files"; exit 1; }
+          echo "${#files[@]} test files"
+          PYTHONPATH="$PWD" pytest --noconftest -q -p no:cacheprovider --rootdir="$PWD" "${files[@]}"
+
   linux-live:
     # The bwrap floor RUN, not read as data. GitHub's ubuntu runners refuse unprivileged user
     # namespaces through AppArmor by default, so the `linux_live` tests skip in the job above.
