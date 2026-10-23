@@ -333,7 +333,9 @@ def _threads_line(store: EnvelopeStore | None, thread_id: str, rev: int | None) 
 def _effect_text(kind: str, e: dict[str, Any]) -> str:
     if kind == "lands":
         crit = ", ".join(json.dumps(c, sort_keys=True) for c in e["criteria"])
-        src = "the branch the drop was made from" if e["from"] == "source" else "named"
+        # onto_from is signed: an inferred branch says so in the words read before signing (C0 §1, his 10-20 item 1)
+        src = "the branch the drop was made from" if e["from"] == "source" else \
+            "inferred, not where you dropped from" if e["onto_from"] == "inferred" else "named"
         return f"{e['repo']}  onto {e['onto']}  ({src}; {'criteria: ' + crit if crit else 'may land with no conditions'})"
     if kind == "pushes":
         return f"{e['repo']}  {e['remote']} {e['url']}  branch {e['branch']}"
