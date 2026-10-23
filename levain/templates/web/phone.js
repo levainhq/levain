@@ -842,8 +842,9 @@
   // server's STORED record, fetched by the pending's id (GET /cockpit/pending/<id>), never from bytes this page holds;
   // review(pending, sign, dismiss) shows that same record and calls sign() from its own Sign tap (a fresh gesture for the
   // passkey prompt), and is required: there is no signing without it. The page stays held (busy) while the sheet is up,
-  // until sign() settles or the sheet calls dismiss(), so a refresh never redraws it away; sign() runs one ceremony at
-  // a time (a second tap does nothing; a failure lets the sheet sign again). A pending the server no longer holds
+  // until a sign() gets the server's terminal answer or the sheet calls dismiss() (a dismiss during an in-flight sign
+  // waits for that sign to settle), so a refresh never redraws it away; sign() runs one ceremony at a time (a second
+  // tap does nothing; a non-terminal failure lets the sheet sign again, still held; after dismiss it does nothing). A pending the server no longer holds
   // WAITING (expired, or decided elsewhere) gets no sheet and no prompt. The broker verifies the signature over its own
   // copy and decides; the outcome names the signer the server persisted. done(answer) gets every outcome. This page decides nothing:
   // what it shows is the server's words.
@@ -865,13 +866,20 @@
           return say("the write is " + c.body.state + (c.body.reason ? " (" + c.body.reason + ")" : "") + "; nothing to sign", "bad");
         }
         return new Promise((settle, fail) => {
-          let signing = false;
+          // one sign lifecycle per review. signing: a ceremony or its POST is in flight (one at a time); dismissed: the
+          // sheet closed; released: the hold (busy) is given back, which happens exactly once: on a terminal answer
+          // (the server's own 2xx), on dismiss when no sign is in flight, or when the sign in flight at a dismiss
+          // settles. A non-terminal failure (a 4xx, a cancelled passkey, an unknown outcome) re-arms Sign and keeps the
+          // hold while the sheet is open. After dismiss or release, sign() does nothing, however late it is called
+          let signing = false, dismissed = false, released = false;
+          const release = () => { if (released) return; released = true; settle(); };
+          const dismiss = () => { if (released) return; dismissed = true; if (!signing) release(); };
           const sign = () => {
-            if (signing) return;
+            if (signing || dismissed || released) return;
             signing = true;
             // sent: the signature has gone to the server, so only its own answer says what happened; told: done() has
-            // this attempt's answer
-            let sent = false, told = false;
+            // this attempt's answer; terminal: the server answered 2xx, so this review is decided
+            let sent = false, told = false, terminal = false;
             say("confirm with your passkey to apply " + c.body.verb + " (" + c.body.tier + ")…");
             const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
             if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
@@ -881,7 +889,7 @@
               sent = true;
               return call("POST", base + "/signature", assertion);
             }).then((a) => {
-              if (!a.ok) signing = false;
+              terminal = a.ok;
               told = true;
               finish(a);
               // the passkey signed: once it is sent, only the server's own refusal (a 4xx) says nothing was applied
@@ -891,7 +899,6 @@
               say(a.body.state + (a.body.reason ? " (" + a.body.reason + ")" : "") + (a.body.signer_fp ? " · signed by " + a.body.signer_fp : ""),
                   a.body.state === "COMMITTED" ? "ok" : "bad");
             }).catch((e) => {
-              signing = false;
               if (!sent) {
                 if (rawId && e && e.name === "NotAllowedError") forget(fp);
                 finish(failed(e));
@@ -900,9 +907,9 @@
               // a fault after the send: the server may have applied it, so this page never says it did not
               say("result unknown (the page failed: " + ((e && e.name) || "error") + "): reload to see whether it applied", "bad");
               if (!told) finish(failed(e));
-            }).finally(settle);
+            }).finally(() => { signing = false; if (terminal || dismissed) release(); });
           };
-          try { review(c.body, sign, settle); } catch (e) { fail(e); }
+          try { review(c.body, sign, dismiss); } catch (e) { released = true; fail(e); }
         });
       });
     }).catch((e) => { finish(failed(e)); say("the page failed (" + ((e && e.name) || "error") + ")", "bad"); })

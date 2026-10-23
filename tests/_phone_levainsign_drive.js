@@ -18,14 +18,20 @@ function elem() {
            replaceChildren() {} };
 }
 
-// one page: ``pending`` is GET /cockpit/pending/<id>'s body, ``signed`` the POST .../signature answer's body
-function page(pending, signed) {
-  const log = { issued: 0, webauthn: 0, reviewed: 0, said: [], done: [] };
+// one page: ``pending`` is GET /cockpit/pending/<id>'s body, ``signed`` the POST .../signature answer's body, or a
+// list of [status, body] answers taken one per POST; ``gate``, when given, is a promise each POST's answer waits on
+function page(pending, signed, gate) {
+  const log = { issued: 0, webauthn: 0, reviewed: 0, posts: 0, said: [], done: [] };
   const answer = (status, body) => Promise.resolve({ ok: status < 400, status, json: () => Promise.resolve(body) });
   const fetch = (route, opts) => {
     if (route === "/consent.json") return answer(503, { message: "no queue here" });
     if (/^\/cockpit\/pending\/[^/]+$/.test(route)) return answer(200, pending);
-    if (/\/signature$/.test(route)) { log.posted = JSON.parse(opts.body); return answer(200, signed); }
+    if (/\/signature$/.test(route)) {
+      log.posted = JSON.parse(opts.body);
+      const [status, body] = Array.isArray(signed) ? signed[log.posts] : [200, signed];
+      log.posts++;
+      return Promise.resolve(gate).then(() => answer(status, body));
+    }
     return answer(404, { message: "no route " + route });
   };
   const buf = (n) => new Uint8Array([n]).buffer;
@@ -44,7 +50,14 @@ function page(pending, signed) {
   const say = (text, kind) => { log.said.push([text, kind || ""]); };
   const issue = () => { log.issued++; return Promise.resolve({ ok: true, status: 200,
                                                                body: { state: "WAITING", pending_id: "cp" + "0".repeat(32) } }); };
-  return { window, log, say, issue };
+  // probe(): does a second write get filed right now? It files only when the page is not held (busy is 0); its own
+  // review dismisses at once, so a probe that got in leaves the page as it found it
+  const probe = () => {
+    const before = log.issued;
+    window.levainSign(["SHA256:a"], say, elem(), issue, (_b, _s, dismiss) => dismiss(), () => {});
+    return tick().then(() => log.issued > before);
+  };
+  return { window, log, say, issue, probe };
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 30));
@@ -132,6 +145,56 @@ async function main() {
     p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, done);
     await tick();
     out.dismissed = p.log;
+  }
+  // one state machine per review (L3 r2): a Sign tap that comes after dismiss is a no-op, however late
+  {
+    const p = page(WAITING, { state: "COMMITTED", signer_fp: "SHA256:a" });
+    const held = {};
+    const review = (_body, sign, dismiss) => { p.log.reviewed++; held.sign = sign; held.dismiss = dismiss; };
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, (a) => p.log.done.push(a));
+    await tick();
+    held.dismiss();
+    await tick();
+    held.sign();
+    await tick();
+    p.log.free_after = await p.probe();
+    out.stale_sign = p.log;
+  }
+  // a dismiss while a sign is in flight keeps the page held until that sign settles, then releases it once
+  {
+    let open;
+    const gate = new Promise((r) => { open = r; });
+    const p = page(WAITING, { state: "COMMITTED", signer_fp: "SHA256:a" }, gate);
+    const held = {};
+    const review = (_body, sign, dismiss) => { p.log.reviewed++; held.sign = sign; held.dismiss = dismiss; };
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, (a) => p.log.done.push(a));
+    await tick();
+    held.sign();
+    await tick();
+    held.dismiss();
+    await tick();
+    p.log.free_in_flight = await p.probe();
+    open();
+    await tick();
+    p.log.free_after = await p.probe();
+    p.log.free_again = await p.probe();   // a double release would leave busy below 0, which holds the page forever
+    out.dismiss_in_flight = p.log;
+  }
+  // a 4xx re-arms Sign for a retry and the page stays held across both attempts while the sheet is open
+  {
+    const p = page(WAITING, [[409, { message: "stale" }], [200, { state: "COMMITTED", signer_fp: "SHA256:a" }]]);
+    const held = {};
+    const review = (_body, sign, dismiss) => { p.log.reviewed++; held.sign = sign; held.dismiss = dismiss; };
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, (a) => p.log.done.push(a));
+    await tick();
+    held.sign();
+    await tick();
+    p.log.free_after_4xx = await p.probe();
+    held.sign();
+    await tick();
+    p.log.free_after_retry = await p.probe();
+    p.log.free_again = await p.probe();
+    out.retry_held = p.log;
   }
   out.unhandled = unhandled;
   process.stdout.write(JSON.stringify(out));

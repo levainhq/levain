@@ -862,3 +862,22 @@ def test_levainsign_signs_once_tells_unknown_after_a_send_and_holds_an_open_revi
     # K-7: a review dismissed without signing releases the page, with no passkey prompt
     d = got["dismissed"]
     assert d["issued_while_open"] == 1 and d["issued"] == 2 and d["webauthn"] == 0, d
+
+
+def test_levainsign_runs_one_sign_lifecycle_per_review():
+    """L3 r2 (codex MED, complement item 1): sign / dismiss / busy are one state machine per review."""
+    got = _drive_levainsign()
+    assert got["unhandled"] == [], got["unhandled"]
+    # a Sign tap after dismiss runs no passkey ceremony and posts nothing; the page is free
+    s = got["stale_sign"]
+    assert s["webauthn"] == 0 and s["posts"] == 0 and s["free_after"] is True, s
+    # a dismiss during an in-flight sign: the page stays held until that sign settles, then is released exactly once
+    d = got["dismiss_in_flight"]
+    assert d["free_in_flight"] is False and d["webauthn"] == 1, d
+    assert d["free_after"] is True and d["free_again"] is True and len(d["done"]) == 1, d
+    # a 4xx re-arms Sign without releasing the page; the retry signs and its terminal outcome releases it once
+    r = got["retry_held"]
+    assert r["free_after_4xx"] is False, r
+    assert r["webauthn"] == 2 and r["posts"] == 2, r
+    assert [a["status"] for a in r["done"]] == [409, 200] and r["done"][1]["body"]["state"] == "COMMITTED", r
+    assert r["free_after_retry"] is True and r["free_again"] is True, r
