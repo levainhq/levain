@@ -468,7 +468,9 @@ def test_install_writes_the_export_importer_entry_the_launch_names(host):
     steps = {s.write[0]: s.write for s in root_tree.entry_steps(host)}
     assert path in steps and steps[path][2] == 0o755
     assert 'runpy.run_module(\'levain.slot.importer\', run_name="__main__"' in steps[path][1]
-    assert "export-verifier" not in root_tree.ENTRY_MODULES
+    # 5d-i session 1 added the verifier entry: an ENTRY, never a sudo helper.
+    assert root_tree.ENTRY_MODULES["export-verifier"] == "levain.slot.verify_run"
+    assert "export-verifier" not in root_tree.HELPER_MODULES
 
 
 # --- fix round 1 (L3 r1): each row built red against 58e5e3f2 -------------------------------------------------------
