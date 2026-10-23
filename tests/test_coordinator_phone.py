@@ -743,3 +743,58 @@ def test_f4_a_null_bound_review_takes_the_store_only_when_it_made_it(world) -> N
     with pytest.raises(CoordRefused) as exc:
         review(world, cp, "bad id", "ph-" + "f5" * 16, _land_spec(str(world["repo"][0])), store_id=7)
     assert exc.value.status == 400
+
+
+# --- 10. L3 r4 (both seats): the challenge is bound to the store its review was (coordphone fix5) ----------------------
+
+def _move_store_away(qdir: Path, aside: Path) -> None:
+    """The store file (and its sqlite sidecars) leaves the directory, so the name answers for no store, or for a new one."""
+    aside.mkdir(mode=0o700)
+    for p in qdir.iterdir():
+        if p.name.startswith(DB_NAME):
+            p.rename(aside / p.name)
+
+
+def test_f5_a_store_replaced_between_review_and_sign_is_409_and_signs_nothing(world, tmp_path) -> None:
+    # the review was bound to store A; before Sign is tapped the directory answers for replacement store B. The
+    # challenge is refused other_store: no payload, no passkey challenge, and nothing is written to B
+    cp = coord_for(world)
+    drop(cp, "made against A", "ph-" + "a5" * 16)
+    store_a = sid(cp)
+    oid = "ph-" + "b5" * 16
+    r = review(world, cp, "reviewed for A", oid, _land_spec(str(world["repo"][0])))
+    assert r["store_id"] == store_a
+    _move_store_away(world["qdir"], tmp_path / "aside")
+    store_b = EnvelopeStore(world["qdir"]).store_id()
+    assert store_b != store_a
+    with pytest.raises(CoordRefused) as exc:
+        cp.step("envelope-challenge", {"review_id": r["review_id"]}, device=DEV)
+    assert (exc.value.status, exc.value.error) == (409, "other_store"), exc.value.message
+    assert EnvelopeStore(world["qdir"]).drops() == [] and sid(cp) == store_b
+
+
+def test_f5_a_store_gone_between_review_and_sign_makes_no_new_store(world, tmp_path) -> None:
+    # the challenge never creates a store: with A gone it is refused other_store and the directory still holds none
+    cp = coord_for(world)
+    drop(cp, "made against A", "ph-" + "c5" * 16)
+    r = review(world, cp, "reviewed for A", "ph-" + "d5" * 16, _land_spec(str(world["repo"][0])))
+    _move_store_away(world["qdir"], tmp_path / "aside")
+    with pytest.raises(CoordRefused) as exc:
+        cp.step("envelope-challenge", {"review_id": r["review_id"]}, device=DEV)
+    assert (exc.value.status, exc.value.error) == (409, "other_store"), exc.value.message
+    assert not any(p.name.startswith(DB_NAME) for p in world["qdir"].iterdir()) and sid(cp) is None
+
+
+def test_f5_the_store_a_fresh_install_s_review_made_is_the_one_its_challenge_binds(world, tmp_path) -> None:
+    # the review on a fresh install made the store, so its kept identity is that store's (never the request's None):
+    # the challenge passes on it, and a store made in its place after the review is refused
+    cp = coord_for(world)
+    r = review(world, cp, "the first drop ever", "ph-" + "e5" * 16, _land_spec(str(world["repo"][0])), store_id=None)
+    assert r["store_created"] is True
+    c, _ = sign(world, cp, r)
+    assert c["store_id"] == r["store_id"]
+    _move_store_away(world["qdir"], tmp_path / "aside")
+    EnvelopeStore(world["qdir"])
+    with pytest.raises(CoordRefused) as exc:
+        cp.step("envelope-challenge", {"review_id": r["review_id"]}, device=DEV)
+    assert (exc.value.status, exc.value.error) == (409, "other_store")

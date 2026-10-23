@@ -21,7 +21,10 @@ The phone port (:mod:`levain.phone_server`) carries the coordinator's phone half
   The REVIEW carries the page's ``store_id`` too and passes the same :meth:`CoordPhone._bound_store` the drop does
   (L3 r3 codex HIGH): a page that read store A while the name now answers for store B is refused ``other_store``
   before anything is built or kept, so its reply never names B and no envelope is signed for a store the page did
-  not read. A None identity becomes the reply's only when this review made the store (``store_created``).
+  not read. A None identity becomes the reply's only when this review made the store (``store_created``). The
+  CHALLENGE binds to the store id KEPT with its review (L3 r4, both seats), never one a request names: a store replaced
+  or gone between the review and Sign is ``other_store`` with no payload minted, and the challenge never makes a store
+  (its ``store_created`` is always false).
 - **The outbox** (gap 6): the page keeps a drop until this route answers 2xx. The page picks the ``outbox_id`` once,
   when the drop is made, and resends it unchanged. A resend is looked up FIRST (:meth:`CoordStore.resent_drop`, the
   words and surface compared) and answered with the stored drop (``created: false``) with nothing else checked, so a
@@ -143,11 +146,6 @@ class CoordPhone:
             except FileNotFoundError:
                 return None
         return EnvelopeStore(self.dispatch_dir, clock=self._clock)
-
-    def _made_store(self) -> tuple[Any, bool]:
-        """The store, created when there is none; True when this call created it (the review on a fresh install)."""
-        store = self._store(create=False)
-        return (self._store(create=True), True) if store is None else (store, False)
 
     def _signers(self) -> tuple[list[str], str]:
         """The passkeys that may sign an envelope here (class covering the envelope's floor), and a note when none."""
@@ -335,6 +333,9 @@ class CoordPhone:
         text = canonical(body)
         body = store.check_body(text)          # a body the store can only refuse is never put to the passkey
         review_id = "rv-" + secrets.token_hex(16)
+        # the store this review was bound to, after it was made if this review made it: the challenge binds to this id
+        # (L3 r4, both seats), never to one a later request names
+        bound = store.store_id()
         now = self._clock()
         with self._lock:
             for rid in [r for r, v in self._reviews.items() if v["until"] <= now]:
@@ -342,10 +343,11 @@ class CoordPhone:
             while len(self._reviews) >= REVIEWS_KEPT:
                 del self._reviews[next(iter(self._reviews))]
             self._reviews[review_id] = {"device": device, "body": body, "outbox_id": req["outbox_id"],
-                                        "signer_fp": key.fingerprint, "until": now + REVIEW_TTL}
+                                        "signer_fp": key.fingerprint, "store_id": bound,
+                                        "until": now + REVIEW_TTL}
         return {"review_id": review_id, "body_text": text, "digest": env.envelope_digest(body), "rp_id": self.rp_id,
                 "view": ccli._view(body, store, words=words).split("\n"),
-                "store_id": store.store_id(), "store_created": created}
+                "store_id": bound, "store_created": created}
 
     def _challenge(self, req: dict[str, Any], device: str) -> dict[str, Any]:
         """Sign tapped: the payload over the KEPT body, signed_at now (L3 r1 codex MED: a long read of the sheet is
@@ -362,14 +364,16 @@ class CoordPhone:
             raise CoordRefused(409, "review_gone", "this envelope's review is no longer held here (it expired, or the "
                                                    "phone port restarted): review it again, then sign")
         key = self._key(kept["signer_fp"])         # still an active passkey covering the envelope's floor
-        store, created = self._made_store()
+        # the review's own store (L3 r4, both seats): one replaced since is other_store and one gone is other_store too,
+        # since the kept id is never None and _bound_store creates a store only for None; the challenge never makes one
+        store = self._bound_store(kept["store_id"])
         if (sent := store.drop_by_outbox(kept["outbox_id"])) is not None:
             raise CoordRefused(409, "conflict", f"this drop is already delivered as {sent.drop_id}; nothing new is "
                                                 "signed for it")
         payload = env.sign_payload(kept["body"], signer_fp=key.fingerprint, signed_at=now)
         return {"payload": payload, "rp_id": self.rp_id,
                 "challenge": _b64u(challenge(env.sign_message(payload), namespace=env.SIGN_NAMESPACE)),
-                "store_id": store.store_id(), "store_created": created}
+                "store_id": store.store_id(), "store_created": False}
 
     def _drop(self, req: dict[str, Any]) -> dict[str, Any]:
         from levain.consent.passkey import b64url_decode, to_sshsig
