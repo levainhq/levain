@@ -2574,10 +2574,13 @@ def single_uid_refusal(keys_uid: Optional[int], ids: Sequence[int]) -> Optional[
 
 
 async def _serve(keys: Keys, front_path: str, gid: Optional[int], admin_path: str, admin_gid: Optional[int]) -> int:
+    # the triggers are armed BEFORE the first listen(): a connect the kernel queues once front.sock listens can be
+    # followed at once by a SIGINT, and until the loop's handler is installed that signal is a KeyboardInterrupt. A
+    # trigger that fires before or during start is the "nothing is served" path below.
+    keys.arm_triggers()
     socks = bind_listeners([(front_path, gid), (admin_path, admin_gid)])
     started = False
     try:
-        keys.arm_triggers()
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         fixed = count_open_fds()
         need = fixed + bounded()
