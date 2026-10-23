@@ -25,12 +25,16 @@ then ``os._exit(137)``. The environment is never read for it.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import contextlib
 import enum
 import fcntl
 import logging
 import os
+import re
 import sqlite3
+import struct
 import tempfile
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -41,6 +45,7 @@ from typing import TYPE_CHECKING, Any
 
 from levain.autonomic.confirm import (
     COCKPIT_NAMESPACE,
+    COCKPIT_PHONE_NAMESPACE,
     DEFAULT_SSH_KEYGEN,
     UNAVAILABLE,
     VERIFIED,
@@ -98,10 +103,10 @@ from levain.cockpit.firejournal import (
 )
 from levain.cockpit.install import REPORTED, decide_install, network_fs_problem
 from levain.cockpit.labels import BrokerLabeller, LabelSnapshot, label_class
-from levain.authority import PASSKEY, AnchorError, advance_anchor, anchor_path, presence_missing
+from levain.authority import DISPLAY_PHONE, PASSKEY, AnchorError, advance_anchor, anchor_path, presence_missing
 from levain.cockpit.authority import RequestAuthority, bound, current, inactive
 from levain.cockpit.results import Absent, Fault
-from levain.cockpit.verbs import KERNEL_VERBS
+from levain.cockpit.verbs import DEVICE_VERBS, KERNEL_VERBS
 
 if TYPE_CHECKING:
     from levain.authority import AuthoritySnapshot
@@ -119,6 +124,10 @@ INTERNAL_VERBS = ("pending_cancel", "token_rotate")
 # the internal verbs that honour a standing-policy floor: ``token_rotate`` is always T3, so a raise of it means nothing
 FLOOR_INTERNAL_VERBS = ("pending_cancel",)
 _TIERS = ("C1", "T2", "T3")
+# K8: the verbs a phone passkey may sign a pending of: the kernel's device verbs and a device's own cancel
+PASSKEY_VERBS = DEVICE_VERBS | {"pending_cancel"}
+# the transport a device request came over (the phone port's run token or a paired device), kept in its principal
+_TRANSPORT = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
 class Lifecycle(str, enum.Enum):
@@ -599,19 +608,38 @@ class Broker:
                 raise BrokerError("credential_required", 403, "a token credential names its surface")
             return f"token:{name}:{db.ensure_token(name)}"
         if cls == "device":
-            fp = credential.get("fingerprint")
-            if not isinstance(fp, str) or not fp:
-                raise BrokerError("credential_required", 403, "a device credential names its key")
-            return f"device:{fp}"
+            base = self.principal_base_of(credential)
+            if base is None:
+                raise BrokerError("credential_required", 403, "a device credential names its key (and a well-formed "
+                                                              "transport, when it names one)")
+            return base
         raise BrokerError("credential_required", 403, "a write needs a credential")
 
     @staticmethod
     def principal_base_of(credential: Mapping[str, Any]) -> str | None:
+        """A token's ``token:<name>``; a device's ``device:<fingerprint>``, or ``device:<fingerprint>@<transport>``
+        when the request names the transport it came over (the phone port does). The fingerprint is CLAIMED until a
+        signature verifies: the transport keeps one transport's unsigned pendings (and their cap) apart from
+        another's that claims the same key (K8, B5 condition 4); the passkey that signs decides whose they are."""
         if credential.get("class") == "token" and isinstance(credential.get("name"), str):
             return f"token:{credential['name']}"
-        if credential.get("class") == "device" and isinstance(credential.get("fingerprint"), str):
-            return f"device:{credential['fingerprint']}"
+        if credential.get("class") == "device":
+            fp, transport = credential.get("fingerprint"), credential.get("transport")
+            if not isinstance(fp, str) or not fp or "@" in fp:
+                return None
+            if transport is None:
+                return f"device:{fp}"
+            if not isinstance(transport, str) or _TRANSPORT.fullmatch(transport) is None:
+                return None
+            return f"device:{fp}@{transport}"
         return None
+
+    @staticmethod
+    def claimed_fingerprint(principal: str) -> str | None:
+        """The key a ``device:`` principal names (claimed until signed); None for any other principal."""
+        if not principal.startswith("device:"):
+            return None
+        return principal[len("device:"):].partition("@")[0] or None
 
     def replay(self, *, verb: str, params: Mapping[str, Any], intent: str | None,
                credential: Mapping[str, Any], idempotency_key: str,
@@ -908,8 +936,9 @@ class Broker:
         intent = "sign" if intent is None else intent
         if intent not in ("sign", "reported"):
             raise BrokerError("bad_request", 400, f"'intent' must be sign or reported, not {intent!r}")
-        if tier not in ("T2", "T3"):
-            raise BrokerError("bad_request", 400, f"the broker takes T2/T3 writes, not {tier!r}")
+        if tier not in ("T2", "T3") and not (tier == "C1" and credential.get("class") == "device"):
+            # a device's C1 is a pending its passkey signs, applied once the signature verifies (K8)
+            raise BrokerError("bad_request", 400, f"the broker takes T2/T3 writes (and a device's C1), not {tier!r}")
         if idempotency_key is not None and (not isinstance(idempotency_key, str) or not idempotency_key):
             raise BrokerError("bad_request", 400, "'idempotency_key' must be a non-empty string")
         with self._admitted() as db:
@@ -948,7 +977,10 @@ class Broker:
         try:
             res = db.issue(record_bytes=raw, principal=principal,
                            idempotency_key=idempotency_key or ("auto:" + pid), now=now,
-                           harness=harness, cap_exempt=intent == "reported")
+                           harness=harness, cap_exempt=intent == "reported",
+                           # a device's cancels are all of its own phone's pendings (``cancel``); the journal reserves
+                           # one per target only when the target is this same full principal's (transport included)
+                           own_cancel=verb == "pending_cancel" and credential.get("class") == "device")
         except PendingCapExceeded as exc:
             raise BrokerError("pending_cap", 429, str(exc), {"occupying": [
                 {"idempotency_key": o.idempotency_key, "verb": o.verb, "issued_at": o.issued_at}
@@ -981,9 +1013,11 @@ class Broker:
 
     # -- DECIDE (§3.2) ----------------------------------------------------------------------------
 
-    def submit(self, pending_id: str, signature: Any) -> dict[str, Any]:
+    def submit(self, pending_id: str, signature: Any, *, page_origin: str | None = None) -> dict[str, Any]:
         """A signature over a ``sign`` pending's STORED bytes. A signature that does not verify is a
-        4xx and spends nothing: the pending stays WAITING (§3.2.1)."""
+        4xx and spends nothing: the pending stays WAITING (§3.2.1). ``page_origin`` is the phone port's own
+        origin (``http://localhost:<port>``) when it carried the signature: a passkey made on ``localhost`` then
+        verifies only from that port's page (:func:`levain.consent.passkey.answer_signature_problem`)."""
         with self._admitted() as db:
             db.expire_due(self._now())
             view = self._load(db, pending_id)
@@ -998,23 +1032,49 @@ class Broker:
                 # the signature is unspent: the pending stays WAITING
                 raise self._authority_refusal(auth)
             with bound(auth):
-                fp = self._verify(auth.authority, view.record_bytes, signature)
+                fp = self._verify(auth.authority, view.record_bytes, signature, pending=view, db=db,
+                                  page_origin=page_origin)
                 return self._decide(db, auth, pending_id, "ALLOWED", fp, signature)
 
-    def _verify(self, authority: AuthoritySnapshot, message: bytes, signature: str) -> str:
+    def _verify(self, authority: AuthoritySnapshot, message: bytes, signature: str, *,
+                pending: Any = None, db: CockpitDB | None = None, page_origin: str | None = None) -> str:
         """The verified signer's fingerprint (§6.5), against a signers file generated from the
         request's authority snapshot (its unrevoked keys) for this verification into a fresh
-        ``mkstemp`` file in the data root."""
-        # a passkey is never a signer of a pending (it signs consent answers, and in the authority log a revoke)
-        keys = sorted((k.principal, k.public_key) for k in authority.active_keys() if k.custody != PASSKEY)
+        ``mkstemp`` file in the data root.
+
+        A passkey (custody ``passkey``, Q6b) signs a pending only on the phone's terms (K8, B5's conditions): its
+        signer line names ONLY ``levain-cockpit-phone`` and every other key's only ``levain-cockpit``, so a
+        passkey's signature never verifies as a laptop's (nor a laptop key's as a phone's). Which checks run is
+        picked by the stored custody of the enrolled key whose public key the signature CARRIES; that carried key
+        is the request's choice, which is safe because each signer line names only its own namespace, the stored
+        custody must equal the custody the key material shows (:meth:`_derived_passkey`: an sk-ecdsa key made on
+        an rp host, not ``ssh:``), and after ssh-keygen verifies, the verified key's custody is asserted to be the
+        one that picked the checks. Before ssh-keygen runs, :meth:`_passkey_refusal` holds the pending to the
+        phone's set and the signature to WebAuthn's terms. Why the passkey was kept off this file before
+        (405ed513): display-phone's rank covers renew/tighten links, so a passkey's signature over an authority
+        record could replay as a link. That stays closed where it was really closed, ``authority._step`` refusing
+        any link a passkey signed but a consent or inert grant's revoke, and the namespace split closes the
+        cross-protocol replay here: a link verifies only in ``levain-authority``."""
+        signer = self._carried_key(authority, signature)
+        if signer is not None and self._derived_passkey(signer.public_key) != (signer.custody == PASSKEY):
+            raise BrokerError("bad_signature", 400, "the signing key's stored custody is not the custody its key "
+                                                    "material shows")
+        phone = signer is not None and signer.custody == PASSKEY
+        if phone:
+            why = self._passkey_refusal(signer, signature, pending, db, page_origin)
+            if why is not None:
+                raise BrokerError("bad_signature", 400, why)
+        keys = sorted((k.principal, k.public_key, k.custody == PASSKEY) for k in authority.active_keys())
         fd, path = tempfile.mkstemp(prefix=".signers-", dir=self.data_root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                for principal, public_key in keys:
-                    fh.write(f'{principal} namespaces="{COCKPIT_NAMESPACE}" {public_key}\n')
+                for principal, public_key, passkey in keys:
+                    ns = COCKPIT_PHONE_NAMESPACE if passkey else COCKPIT_NAMESPACE
+                    fh.write(f'{principal} namespaces="{ns}" {public_key}\n')
             verdict = verify_cockpit_signature(message, signature, path,
                                                owners=frozenset({0, os.getuid()}),
-                                               ssh_keygen=self.ssh_keygen)
+                                               ssh_keygen=self.ssh_keygen,
+                                               namespace=COCKPIT_PHONE_NAMESPACE if phone else COCKPIT_NAMESPACE)
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(path)
@@ -1025,12 +1085,88 @@ class Broker:
         key = authority.key(verdict.fingerprint) if verdict.fingerprint is not None else None
         if key is None or not key.active or key.principal != verdict.principal:
             raise BrokerError("bad_signature", 400, "the signing key is not the enrolled key")
+        if (key.custody == PASSKEY) != phone or self._derived_passkey(key.public_key) != phone:
+            # the custody that chose the namespace and the checks is the verified key's own, stored and derived from
+            # its key material alike (B5 condition 7)
+            raise BrokerError("bad_signature", 400, "the signing key's custody is not the one it was checked as")
         if presence_missing(signature, key.public_key):
             # the authority links' rule (levain.authority.presence_missing): a FIDO key made
             # no-touch-required signs a T2/T3 act only with a touch, like its links (Diogenes LOW 2026-10-13)
             raise BrokerError("bad_signature", 400, "a FIDO signature without user presence (no touch)")
         assert verdict.fingerprint is not None
         return verdict.fingerprint
+
+    @staticmethod
+    def _carried_key(authority: AuthoritySnapshot, signature: str) -> Any:
+        """The active key of ``authority`` whose public key the SSHSIG ``signature`` carries, or None (a signature
+        that cannot be read, or a key not enrolled: ssh-keygen then refuses it). This only picks the namespace and
+        the passkey checks; ssh-keygen still decides who signed."""
+        try:
+            text = signature.strip()
+            head, tail = "-----BEGIN SSH SIGNATURE-----", "-----END SSH SIGNATURE-----"
+            if not (text.startswith(head) and text.endswith(tail)):
+                return None
+            blob = base64.b64decode("".join(text[len(head):-len(tail)].split()), validate=True)
+            if blob[:6] != b"SSHSIG" or len(blob) < 14:
+                return None
+            (n,) = struct.unpack(">I", blob[10:14])
+            carried = blob[14:14 + n]
+            if len(carried) != n:
+                return None
+        except (ValueError, struct.error, binascii.Error, UnicodeError):
+            return None
+        for k in authority.active_keys():
+            parts = k.public_key.split()
+            try:
+                if len(parts) >= 2 and base64.b64decode(parts[1], validate=True) == carried:
+                    return k
+            except (ValueError, binascii.Error):
+                continue
+        return None
+
+    @staticmethod
+    def _derived_passkey(public_key: str) -> bool:
+        """Whether a key's own material is a WebAuthn passkey's: an ``sk-ecdsa-sha2-nistp256@openssh.com`` key whose
+        application is an rp host, where an OpenSSH FIDO key's is ``ssh:...`` (B6: the custody is derived, then
+        held equal to the stored one)."""
+        from levain.consent.passkey import PasskeyError, key_application
+
+        try:
+            return not key_application(public_key).startswith("ssh:")
+        except PasskeyError:
+            return False
+
+    def _passkey_refusal(self, key: Any, signature: str, pending: Any, db: CockpitDB | None = None,
+                         page_origin: str | None = None) -> str | None:
+        """Why a passkey ``key`` may not sign ``pending`` with ``signature``, or None (K8, B5 conditions 1, 4, 5):
+        a display-phone key; a pending a device issued under that same key (the verified signer is whose it is,
+        never the fingerprint a request claimed); one of the phone's verbs (:data:`PASSKEY_VERBS`); a cancel only of
+        a pending that same key's phone issued (B5 Q2, own-pending cancel only); T2 at most, read off the stored
+        record; and a WebAuthn signature with user verification from the key's own origin, pinned to the phone
+        port's ``page_origin`` when it carried the signature (:func:`levain.consent.passkey.answer_signature_problem`),
+        checked here before ssh-keygen runs."""
+        from levain.consent.passkey import answer_signature_problem
+
+        if key.key_class != DISPLAY_PHONE:
+            return f"a passkey signs as {DISPLAY_PHONE} only"
+        if pending is None:
+            return "a passkey signs a phone pending only"
+        if self.claimed_fingerprint(str(pending.principal)) != key.fingerprint:
+            return "a passkey signs only a pending its own phone issued"
+        rec = pending.record
+        if rec.get("verb") not in PASSKEY_VERBS:
+            return f"{rec.get('verb')!r} is not a phone verb: it is signed on the laptop"
+        if rec.get("verb") == "pending_cancel":
+            target = rec.get("target") if isinstance(rec.get("target"), dict) else {}
+            try:
+                owner = db.load(str(target.get("pending_id"))).principal if db is not None else None
+            except (UnknownPending, JournalCorruptError):
+                owner = None
+            if owner is None or self.claimed_fingerprint(str(owner)) != key.fingerprint:
+                return "a passkey cancels only a pending its own phone issued"
+        if rec.get("tier") not in ("C1", "T2"):
+            return f"a passkey never signs a {rec.get('tier')}: it needs the laptop"
+        return answer_signature_problem(signature, key.public_key, page_origin)
 
     def _recompute(self, db: CockpitDB, view: Any, policy: Any) -> tuple[bytes | None, list[Any]]:
         """§3.2.1: every effect's object read again, tier and canonical effects recomputed, the
@@ -1108,15 +1244,29 @@ class Broker:
         tier whose one effect cancels it (§3.5). Either is raised to the standing policy's floor for
         ``pending_cancel``, read from the authority captured here before anything else (trust-tiering
         DESIGN §4.1): an own cancellation the floor lifts above C1 is a pending of that tier too, and
-        under an unknown policy (a refused log) every cancellation is T3 and refused for want of a fence."""
+        under an unknown policy (a refused log) every cancellation is T3 and refused for want of a fence.
+        A ``device`` credential (K8) cancels only a pending its own phone issued, always as a pending its passkey
+        signs; one such cancel per target is outside the pending cap when the target came over this same transport (the
+        same full principal, B5 condition 4), so a device at the cap can still free a slot; a cancel from another
+        transport counts against that transport's own cap."""
         with self._admitted() as db:
             auth = self._request_authority(db)
             with bound(auth):
                 principal = self.principal_of(db, credential)
                 view = self._load(db, pending_id)
+                if credential.get("class") == "device" \
+                        and self.claimed_fingerprint(str(view.principal)) != credential.get("fingerprint"):
+                    # B5 Q2, a kernel rule: a device cancels only a pending its own phone issued (any transport it
+                    # came over: the passkey that signs the cancel is the same key), never a laptop's or another's.
+                    # Known edge: a phone-port restart makes a fresh run transport, so the phone's older pendings are
+                    # another transport's: their cancel takes the target's tier (a signature, as every device cancel
+                    # needs) and the canceller's own cap, never C1 or the reserved slot (B5 4; K8a L3 r1 K-2)
+                    raise BrokerError("refused", 403, "a device cancels only a pending its own phone issued")
                 base = principal.rpartition(":")[0] if principal.startswith("token:") else principal
                 tier = self._cancel_tier(view, base, auth.policy)
-                if tier == "C1":
+                # a device's own cancel is a pending its passkey signs (K8): the fingerprint it names is a claim,
+                # so a cancel on it alone would let any token holder claiming the phone's key cancel its pendings
+                if tier == "C1" and credential.get("class") != "device":
                     out = db.cancel(pending_id, principal, self._now())
                     if out.state != "CANCELLED":
                         raise BrokerError("refused", 409, f"pending {pending_id} is {out.state}; "

@@ -215,9 +215,9 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
     with what it answered and the line that revokes it: ``{"root", "note", "grants", "inert_note"}``. ``root`` is the
     ONE cockpit those hooks verify against (the log the queue finds a grant in at decision time); none or more than
     one is a ``note`` and no rows. What a grant answered is read from the queue (the requests it allowed) and the
-    ledger (whether each such call then ran): ``answered`` is ``{"count", "last_at", "recent"}``, ``recent`` the
-    newest ``recent`` calls, each ``{"request_id", "at", "tool", "cwd", "outcome"}``, counted for this instance of
-    the grant only (``instance``, :func:`grant_instance`: an answer by an earlier grant under the same id, or by
+    ledger (whether each such call then ran): ``answered`` is ``{"count", "last_at", "recent", "refused_count"}``,
+    ``recent`` the newest ``recent`` calls, each ``{"request_id", "at", "tool", "cwd", "outcome"}``,
+    ``refused_count`` how many of ALL its calls were then refused; both counted for this instance of the grant only (``instance``, :func:`grant_instance`: an answer by an earlier grant under the same id, or by
     this one before a renew changed it, is not its own). Read-only: nothing is created. Every string a grant's
     creator or an agent wrote is shown through ``visible``; ``id`` is also given as is, the name a revoke route
     takes, and ``instance`` is what that route's challenge names."""
@@ -243,7 +243,7 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
     rows: list[dict[str, Any]] = []
 
     def answered(gid: str) -> dict[str, Any]:
-        got = evidence.get(gid) or {"count": 0, "last_at": "", "recent": []}
+        got = evidence.get(gid) or {"count": 0, "last_at": "", "recent": [], "refused_count": 0}
         return {**got, "recent": [{**c, "tool": visible(c["tool"]), "cwd": visible(c["cwd"])} for c in got["recent"]]}
 
     def common(gid: str, kind: str, expires_at: str, seq: int | None) -> dict[str, Any]:

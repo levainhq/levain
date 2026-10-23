@@ -34,6 +34,12 @@ it serves only these:
   - ``GET /consent.json`` also lists ``notes`` (the open ones, :mod:`levain.consent.notes`: an agent telling the
     operator something that needs no answer) and ``POST /note/<n>/dismiss`` marks one read, once. A dismissal is
     unsigned, authorises nothing and is delivered to nobody.
+  - K8, the phone as a mobile cockpit: ``POST /cockpit/verb`` (the laptop's verb body plus the signing passkey's
+    ``fingerprint``), ``GET /cockpit/pending/<id>`` (a phone pending's stored record and its challenge),
+    ``POST /cockpit/pending/<id>/signature`` (the passkey's assertion) and ``.../cancel``: proxied in-process into the
+    SAME ``verbs.dispatch`` and broker as the laptop's (:mod:`levain.phone_app`), with a ``device`` credential. The
+    token here is still only the transport: every such write is a broker pending that applies once the passkey's
+    signature verifies. No tier logic lives on this port.
 
 A proxy the operator runs (``tailscale serve``) puts it on an https name. Every data route needs this server's own
 token (``X-Levain-Phone-Token``), printed in the phone link's fragment (new each run, unless ``--token-file`` keeps
@@ -93,6 +99,10 @@ _GRANT_PREFIX = "/grant/"
 _GRANT_ACTIONS = ("revoke-challenge", "revoke")
 _MAX_BODY = 16 * 1024          # an assertion is well under 2 KB, an answer record under 1 KB
 _MAX_INFLIGHT = 4              # each answer replays the authority log; past this a caller gets 503, never a queue
+# a cockpit write (a verb, a signature, a cancel) runs one at a time on its own gate, never a read slot: a signature's
+# check is two ssh-keygen runs of 10 s each at most. A queued writer waits this long at most, then answers busy (503);
+# past _MAX_INFLIGHT writers (the running one included) one is busy at once, so waiting threads stay bounded
+_WRITE_WAIT = 5.0
 # how long a ruling's response waits for its delivery, which runs on its own thread holding no request slot (a
 # listing and a resume's settle each take seconds to tens of seconds); past this the page says it is still running
 _DELIVERY_WAIT = 45.0
@@ -148,6 +158,23 @@ def _grant_route(route: str) -> "tuple[str, str] | None":
 
 # the phone app's own routes (levain.phone_app), each with the one method it answers
 _APP_ROUTES = {"/app/state.json": "GET", "/app/board.json": "GET", "/app/verb": "POST"}
+# K8: the cockpit write routes the phone proxies into the laptop's kernel and broker
+_COCKPIT_VERB = "/cockpit/verb"
+_COCKPIT_PENDING = re.compile(r"/cockpit/pending/(cp[0-9a-f]{32})(?:/(signature|cancel))?")
+
+
+def _cockpit_route(method: str, route: str) -> "tuple[str, str | None] | None":
+    """``(action, pending id)`` for a K8 cockpit route asked with its one method (``verb``; ``read`` a pending by GET;
+    ``signature`` or ``cancel`` it by POST), else None."""
+    if route == _COCKPIT_VERB:
+        return ("verb", None) if method == "POST" else None
+    m = _COCKPIT_PENDING.fullmatch(route)
+    if m is None:
+        return None
+    action = m.group(2) or "read"
+    return (action, m.group(1)) if (action == "read") == (method in ("GET", "HEAD")) else None
+
+
 # failed unauthenticated pairing redeems a single process takes per minute. A long code is 128 bits and a short one 40,
 # so beside the short code's own lock this is a second bound on guessing and keeps a caller from holding the push
 # store's write lock with a stream of guesses
@@ -245,11 +272,32 @@ class _PhoneHandler(GuardedHandler):
     def _app_route(self, method: str, route: str, body: bytes, *, head: bool = False) -> bool:
         """Serve one phone-app route (:mod:`levain.webpush.routes`, :mod:`levain.phone_app`); False when the path is
         not one of them. Every fault is an answer, never a dead connection."""
-        from levain.phone_app import PhoneAppError
+        from levain.phone_app import PhoneAppError, transport_of
         from levain.webpush import routes as push_routes
 
         try:
             cred = None if route in push_routes.STATIC_PATHS else self._credential()
+            cockpit = _cockpit_route(method, route)
+            if cockpit is not None:
+                if cred is None:
+                    self._json({"error": "forbidden", "message": f"this page's token is needed, sent as {PHONE_TOKEN_HEADER}"},
+                               403, head=head)
+                    return True
+                action, pid = cockpit
+                app = self.server.phone_app()
+                transport = transport_of(cred[0], cred[1], run_token=self.server.phone_token)
+                if action == "verb":
+                    self._json(app.device_verb(_json_or_none(body), transport=transport))
+                elif action == "read":
+                    assert pid is not None
+                    self._json({**app.pending(pid), "rp_id": self.server.rp_id}, head=head)
+                elif action == "signature":
+                    assert pid is not None
+                    self._json(app.pending_signature(pid, _json_or_none(body), page_origin=self.server.page_origin))
+                else:
+                    assert pid is not None
+                    self._json(app.pending_cancel(pid, _json_or_none(body), transport=transport))
+                return True
             if route.startswith("/app/"):
                 if route not in _APP_ROUTES or _APP_ROUTES[route] != method:
                     return False
@@ -299,7 +347,7 @@ class _PhoneHandler(GuardedHandler):
     def _app_post(self, route: str) -> bool:
         """A POST to a phone-app route: the same origin, JSON and size gates as the consent routes, then
         :meth:`_app_route`. False when the path is not one of them (nothing of the body is read)."""
-        if not (route.startswith("/webpush/") or route in _APP_ROUTES):
+        if not (route.startswith("/webpush/") or route in _APP_ROUTES or _cockpit_route("POST", route) is not None):
             return False
         if self._refuse_non_json():
             return True
@@ -307,6 +355,8 @@ class _PhoneHandler(GuardedHandler):
         if clen is None or self._refuse_oversize(clen, _MAX_BODY, _MAX_BODY * 4):
             return True
         body = self.rfile.read(clen)
+        if _cockpit_route("POST", route) is not None:
+            return self._cockpit_write(route, body)
         if not self.server.request_gate.acquire(blocking=False):
             self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503)
             return True
@@ -314,6 +364,25 @@ class _PhoneHandler(GuardedHandler):
             return self._app_route("POST", route, body)
         finally:
             self.server.request_gate.release()
+
+    def _cockpit_write(self, route: str, body: bytes) -> bool:
+        """A cockpit write on the write gate (``_WRITE_WAIT``): it takes no read slot, so the board and pending reads
+        answer while a signature's ssh-keygen runs; a signature carries a passkey ceremony the person just made, so a
+        writer waits a bounded moment for the gate rather than throw it away, then hears busy."""
+        busy = {"error": "busy", "message": "the phone port is busy with another write; try again"}
+        if not self.server.write_waiters.acquire(blocking=False):
+            self._json(busy, 503)
+            return True
+        try:
+            if not self.server.write_gate.acquire(timeout=_WRITE_WAIT):
+                self._json(busy, 503)
+                return True
+            try:
+                return self._app_route("POST", route, body)
+            finally:
+                self.server.write_gate.release()
+        finally:
+            self.server.write_waiters.release()
 
     # -- writes ------------------------------------------------------------------------------------------
 
@@ -408,6 +477,9 @@ class _PhoneServer(ThreadingHTTPServer):
         self.phone_token = token
         self.allowed_hosts = _LOOPBACK_HOSTS | {str(self.server_address[0]).lower(), rp_id}
         self.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
+        # the cockpit writes' own gate (one at a time) and the bound on writers holding or waiting for it (K8a K-3)
+        self.write_gate = threading.BoundedSemaphore(1)
+        self.write_waiters = threading.BoundedSemaphore(_MAX_INFLIGHT)
         # one replay cache for every request this server answers: a replay re-verifies only the links past what it
         # already holds, so a page that asks again costs one ssh-keygen run per new link, not one per link
         self.replay_cache = ReplayCache()

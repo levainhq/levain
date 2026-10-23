@@ -88,3 +88,5 @@ button.go { background: var(--accent); color: var(--on-accent); border-color: va
 .ping .outcome.wait { color: var(--warn); }
 .ping .outcome.done { color: var(--ok); }
 .ping .title { margin-top: var(--sp-2); }
+/* four tabs (M17 added Grants): each tab is as wide as its word, never broken inside one ("Notificati|ons" at 390) */
+.tabs button { flex: 1 1 auto; overflow-wrap: normal; white-space: nowrap; padding-inline: 8px; }

@@ -308,7 +308,7 @@ def test_a_details_retry_after_a_failed_read_reuses_its_slot(tmp_path, monkeypat
     # the first body fetch answers 500, so "details" shows an error and re-enables; the retry reads the body
     # the stub records the url it failed, so the test reads back WHICH fetch consumed the single failure
     stub = ("(() => { const real = window.fetch.bind(window); let n = 0; window.__failed = []; window.fetch = (u, o) =>"
-            " String(u).includes('/cockpit/consent/') && !String(u).includes('/proposals.json') && n++ < 1"
+            " String(u).includes('/cockpit/consent/') && !String(u).includes('/proposals.json') && !String(u).includes('/grants.json') && n++ < 1"
             " ? (window.__failed.push(String(u)), Promise.resolve({ ok: false, status: 500 })) : real(u, o); return 1; })()")
     row = "[...document.querySelectorAll('#levain-modal .consent-row')].find(x => x.querySelector('.consent-audit'))"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):

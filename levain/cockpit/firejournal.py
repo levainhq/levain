@@ -81,7 +81,11 @@ _PLANNED_STATES = ("DECIDED", "COMMITTED", "COMMITTED_INCOMPLETE")
 # Key classes in ascending authority, and the least class each tier needs (flow design §9 K2b: T2 fires
 # on laptop-presence or display-phone, T3 on laptop-presence only, presence on neither)
 _CLASS_RANK = {"presence": 1, "display-phone": 2, "laptop-presence": 3}
+# the tiers a consent request and a signed pending carry (levain.consent.queue reads this one: it takes no C1)
 _TIER_NEEDS = {"T2": 2, "T3": 3}
+# a pending's tier as a decision reads it: a C1 reaches the journal only as a device's signed pending (K8), which
+# any enrolled key covers
+_RECORD_TIER_NEEDS = {"C1": 1, **_TIER_NEEDS}
 
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -433,8 +437,9 @@ def _parse_record(op: str | None, blob: Any, sha: Any) -> dict[str, Any]:
     # the fields a decision reads off the record (its authority), each checked here, at the one parse
     if record.get("intent") not in ("sign", "reported"):
         raise _corrupt(op, f"record intent {record.get('intent')!r} is neither sign nor reported")
-    if record.get("tier") not in ("T2", "T3"):
-        raise _corrupt(op, f"record tier {record.get('tier')!r} is neither T2 nor T3")
+    # a C1 is journalled only as a device's signed pending (K8): never a reported one
+    if record.get("tier") not in ("T2", "T3") and not (record.get("tier") == "C1" and record.get("intent") == "sign"):
+        raise _corrupt(op, f"record tier {record.get('tier')!r} is neither T2 nor T3 (nor a signed C1)")
     for name in ("issued_at", "expires_at"):
         _check_stamp(str(op), f"record {name}", record.get(name), nullable=False)
     if parse_stamp(record["issued_at"]) >= parse_stamp(record["expires_at"]):
@@ -470,6 +475,43 @@ def _expire(conn: sqlite3.Connection, now: datetime) -> list[str]:
                          "WHERE pending_id = ? AND state = 'WAITING'", (record["expires_at"], row[0]))
             ended.append(row[0])
     return ended
+
+
+def _cancel_waiting(conn: sqlite3.Connection, principal: str, target_id: Any) -> bool:
+    """Whether ``principal`` already holds a ``WAITING`` ``pending_cancel`` of ``target_id``, read off the signed
+    records (the ``verb`` column is a mirror, as ``expires_at`` is in :func:`_expire`). A row whose record does not
+    parse counts as one, so the cap applies (fail closed)."""
+    for row in conn.execute("SELECT pending_id, record, record_sha256 FROM pendings "
+                            "WHERE principal = ? AND state = 'WAITING'", (principal,)).fetchall():
+        try:
+            record = _parse_record(row[0], row[1], row[2])
+        except JournalCorruptError:
+            return True
+        target = record.get("target") if isinstance(record.get("target"), dict) else {}
+        if record.get("verb") == "pending_cancel" and target.get("pending_id") == target_id:
+            return True
+    return False
+
+
+def _frees_a_write(conn: sqlite3.Connection, target_id: Any, principal: str) -> bool:
+    """Whether ``principal`` cancelling ``target_id`` frees a held write of its own: the target is ``WAITING``, was
+    issued by this same FULL principal (a device's transport included, K8 B5 condition 4: a cancel from another
+    transport claiming the same key is never own, so it meets its own cap), and its signed record is not itself a
+    ``pending_cancel``. A cancel of a cancel, or of a pending already ended, frees nothing, so it gets no reserved slot
+    (else each would be "the first for its target" and a chain of them would pass the cap). A target whose record does
+    not parse frees nothing either (fail closed: the cap applies)."""
+    if not isinstance(target_id, str):
+        return False
+    row = conn.execute("SELECT pending_id, record, record_sha256 FROM pendings "
+                       "WHERE pending_id = ? AND state = 'WAITING' AND principal = ?",
+                       (target_id, principal)).fetchone()
+    if row is None:
+        return False
+    try:
+        record = _parse_record(row[0], row[1], row[2])
+    except JournalCorruptError:
+        return False
+    return record.get("verb") != "pending_cancel"
 
 
 def _effect_rows(op: str, record: dict[str, Any], rows: list[sqlite3.Row],
@@ -688,11 +730,14 @@ class CockpitDB:
     # -- issue (§3.1 step 2) -------------------------------------------------------------------
 
     def issue(self, *, record_bytes: bytes, principal: str, idempotency_key: str, now: datetime,
-              harness: str = "cockpit", cap_exempt: bool = False) -> IssueResult:
+              harness: str = "cockpit", cap_exempt: bool = False, own_cancel: bool = False) -> IssueResult:
         """Record a new ``WAITING`` pending holding ``record_bytes`` (the JCS bytes of a
         :func:`~levain.cockpit.consent.build_record` record), or return the pending an earlier
         request with this idempotency key made. ``cap_exempt`` is for a pending that takes
-        ALLOWED-REPORTED in this same request, which never counts toward the cap."""
+        ALLOWED-REPORTED in this same request, which never counts toward the cap. ``own_cancel`` is for a
+        device's cancel of its own pending (K8): the FIRST waiting ``pending_cancel`` this principal holds for a
+        ``WAITING`` target this same principal issued (transport included) that is not itself a cancel is outside the cap, checked in this transaction
+        (:func:`_frees_a_write`); a second for the same target, or a cancel that frees no write, meets the cap."""
         record = _parse_record(None, record_bytes, record_sha256(record_bytes))
         pid = record["operation_id"]
         intent = record.get("intent")
@@ -715,7 +760,11 @@ class CockpitDB:
                         f"idempotency key {idempotency_key!r} is bound to another request")
                 return IssueResult(pending_id=prior["pending_id"], record=prior["record"],
                                    replay=True, outcome=_outcome(prior))
-            if not cap_exempt:
+            target = record.get("target") if isinstance(record.get("target"), dict) else {}
+            reserved = own_cancel and record.get("verb") == "pending_cancel" \
+                and _frees_a_write(conn, target.get("pending_id"), principal) \
+                and not _cancel_waiting(conn, principal, target.get("pending_id"))
+            if not (cap_exempt or reserved):
                 held = conn.execute(
                     "SELECT pending_id, idempotency_key, verb, issued_at FROM pendings "
                     "WHERE principal = ? AND state = 'WAITING' ORDER BY issued_at, rowid",
@@ -1310,7 +1359,7 @@ def _key_problem(conn: sqlite3.Connection, authority: AuthoritySnapshot | None, 
         return "key not enrolled", None
     if not key.active:
         return "key revoked", None
-    need = _TIER_NEEDS.get(tier)
+    need = _RECORD_TIER_NEEDS.get(tier)
     have = _CLASS_RANK.get(key.key_class)
     if need is None or have is None or have < need:
         return f"key class {key.key_class} does not cover {tier}", None
