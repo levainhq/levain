@@ -13,7 +13,8 @@ copies of the bundle and of ``verify/q.idx`` (§6 setup, S4). It MIGRATES and do
    step 0's, else ``take-bytes-changed``), then the ``.idx`` LAST (a pack is invisible to git until its idx exists),
    each to an ``O_CREAT|O_EXCL`` 0444 temp in his ``objects/pack/``, fsynced, then linked to ``pack-<trailer>.<ext>``
    (never replacing a file there) and the dir fsynced. Both final names are looked at before anything is written: one
-   already holding equal bytes is skipped; different bytes = ``take-pack-collision``; an OSError =
+   already holding equal bytes is skipped (the dir is fsynced again before :func:`migrate` returns, both skipped
+   included, so a final another take linked is durable before this take's ref); different bytes = ``take-pack-collision``; an OSError =
    ``take-failed:<errno name>``; a link that fails otherwise (hard links refused included) is ``take-failed:<errno
    name>`` too, never a rename. On ANY failure, an interrupt included, the temps are removed. A final name already
    linked stays: a pack whose idx did not land is invisible to git, a retry finds it present with equal bytes, and
@@ -318,12 +319,13 @@ def _check_idx(idx: Path, d: Derived) -> str:
 
 def git_env() -> Dict[str, str]:
     """§6a's env for his git: levain's child environment with every ``GIT_*`` removed, then
-    ``GIT_CONFIG_GLOBAL=/dev/null``, ``GIT_CONFIG_NOSYSTEM=1``, ``GIT_NO_LAZY_FETCH=1``, ``LC_ALL=C``."""
+    ``GIT_CONFIG_GLOBAL=/dev/null``, ``GIT_CONFIG_NOSYSTEM=1``, ``GIT_NO_LAZY_FETCH=1``, ``GIT_NO_REPLACE_OBJECTS=1``
+    (his git reads literal objects, never one a ``refs/replace/`` ref stands in for), ``LC_ALL=C``."""
     from levain.launch import child_env
 
     env = {k: v for k, v in child_env().items() if not k.upper().startswith("GIT_")}
     env.update({"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_NO_LAZY_FETCH": "1",
-                "LC_ALL": "C"})
+                "GIT_NO_REPLACE_OBJECTS": "1", "LC_ALL": "C"})
     return env
 
 
@@ -478,7 +480,8 @@ def _finalize(dirfd: int, tmp: str, final: str, want: str, m: Migrated, log: Log
 
 def migrate(git: str, repo: Path, bundle: Path, idx: Path, d: Derived, idx_sha256: str, *,
             log: Log = None) -> Migrated:
-    """Step 1: the private copies' pack then idx into his ``objects/pack/``. Both final names are looked at before
+    """Step 1: the private copies' pack then idx into his ``objects/pack/``; ``objects/pack`` is fsynced before every
+    return, both finals skipped included. Both final names are looked at before
     anything is written (a stale idx at the idx's name would otherwise go live the moment the pack is linked). Any
     failure, an interrupt included, removes this take's temps and is re-raised; an OSError is raised as
     ``take-failed:<errno name>``. A final name already linked stays: a pack whose idx did not land is invisible to git
@@ -509,6 +512,7 @@ def migrate(git: str, repo: Path, bundle: Path, idx: Path, d: Derived, idx_sha25
                 _finalize(pack_fd, tmp, final, want, m, log)
                 tmps.remove(tmp)
                 _full_fsync(pack_fd)
+            _full_fsync(pack_fd)    # every return, both skipped included: a final another take linked may be unsynced
             return m
         except OSError as e:
             raise _failed(e, "objects/pack") from None
