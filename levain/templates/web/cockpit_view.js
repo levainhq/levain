@@ -999,8 +999,9 @@
       const fig = m.value == null ? "" : m.value + (m.unit ? " " + m.unit : "");
       // a state is never colour alone: with no figure and no reading, the word stands in
       row.appendChild(el("span", "v", [fig, m.read || ""].filter(Boolean).join(" · ") || st));
-      if (typeof m.detail === "string" && m.detail) row.title = m.label + ": " + m.detail;   // the long reading lives in the tooltip; the row stays one line
-      else if (fig || m.read) row.title = m.label + ": " + [fig, m.read || ""].filter(Boolean).join(" · ");   // a cut reading is whole on hover
+      // the row stays one line and a tile cuts its reading: the tooltip holds the whole reading, then the detail
+      const whole = [[fig, m.read || ""].filter(Boolean).join(" · "), typeof m.detail === "string" ? m.detail : ""].filter(Boolean).join(" · ");
+      if (whole) row.title = m.label + ": " + whole;
       host.appendChild(row);
     }
   }

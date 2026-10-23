@@ -2524,6 +2524,8 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
   body.ke .band-meta .wx:not(:has(.wx-air)) { grid-template-areas: "main" "foot" "wrap"; }
   body.ke .band-meta .wx .wx-wrap { grid-area: wrap; justify-self: start; padding-top: 0; }
 }
+/* the phone keeps its one column (the 560px rule's stack), with the wrap line under the foot (L3 r1: the rule above re-made two columns there) */
+@media (max-width: 560px) { body.ke .band-meta .wx { grid-template-areas: "main" "air" "foot" "wrap"; } }   /* a card with no air reading: the rule above's own line, already one column */
 /* A tile's lines never run past its edge: a status row keeps its label and cuts its reading with an ellipsis (the row's title holds
    the whole of it), and a big figure's label drops under it when they do not fit side by side. Tiles only, and not the phone's
    half-width tile (its own rule above wraps the reading instead). */
@@ -2533,9 +2535,10 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
   body.ke .ck-widgets[data-shape="tiles"] .w .bigrow { flex-wrap: wrap; row-gap: 0; }
 }
 /* A row too narrow for its meta line and its verbs together (they overlapped: the verbs, right-aligned, spilled left over the meta):
-   the verbs take the line under the meta, right-aligned. Container width, so it holds in a half-screen column and not in a wide one. */
-@container (min-width: 341px) and (max-width: 520px) {   /* at 340 and under the inline verbs already fold into the ··· menu */
-  body.ke .row .verb-actions:not(:has(.verb-form)):not(:has(.edit-msg)) { grid-column: 1 / -1; grid-row: 4; }
+   the verbs take a line of their own under the meta, right-aligned, below an open form or a session's transcript control (both in
+   row 4). Only the grid rows (a clampable clause), which are themselves the container, so the width read is the row's own. */
+@container (340px < width <= 520px) {   /* at 340 and under the inline verbs already fold into the ··· menu */
+  body.ke .row:has(> .clause.clampable) > .verb-actions:not(:has(.verb-form)):not(:has(.edit-msg)) { grid-column: 1 / -1; grid-row: 5; }
 }
 /* The strip (fewer than four tiles) is one row that shrinks its segments to fit; below the width where they fit it squeezed the
    first segment until its figure had 2px to stand in and ran out of it. The segments now wrap to a second row instead (the
