@@ -334,3 +334,44 @@ def test_warnings_shown_escaped_and_typed() -> None:
     with pytest.raises(Refused) as e:      # L3 s4a r2 complement LOW: a lone surrogate outside surrogateescape's range
         AVW.show_warnings({"warnings": ["\ud800"]}, "adopt-open", io.StringIO())
     assert e.value.name == "adopt-answer-malformed"
+
+
+# --- S4b (1023+13): the prompt, the removal line, the store-verb walls; each from a row that failed on bac69c2a
+# (project_memory/1023-13/adopt/s4b_red_base_git2540.txt: I1-I4, RM, W1) ----------------------------------------------
+
+
+class _Tty(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def test_the_prompt_offers_only_the_carried_refs_reasks_and_reads_eof_as_none() -> None:
+    out = io.StringIO()
+    assert AVW.ask_take(["head"], _Tty("wip\nhead\n"), out) == "head"      # row I4: wip not offered, so asked again
+    assert out.getvalue().count("take head / none? ") == 2
+    out = io.StringIO()
+    assert AVW.ask_take(["head", "wip"], _Tty("bogus\n"), out) == "none"    # rows I2 + I3: re-asked, then EOF
+    assert out.getvalue().count("take head / wip / none? ") == 2
+
+
+def test_the_removal_line_removes_the_private_dir(tmp_path: Path) -> None:
+    import shlex
+
+    priv = tmp_path / "levain-adopt-x y"          # a space: the printed command quotes it
+    (priv).mkdir()
+    (priv / "preview.txt").write_text("p")
+    line = AVW.removal_line(priv)
+    subprocess.run(shlex.split(line.split("with: ", 1)[1]), check=True)
+    assert not priv.exists()
+
+
+def test_store_verb_walls_derive_from_control_bounds_not_v7() -> None:
+    import inspect
+
+    from levain.slot.control_client import ControlClient
+
+    answer = inspect.signature(ControlClient.__init__).parameters["timeout"].default
+    want = answer + AVW.STORE_VERB_CAS_CALLS * (ControlClient.retry_window_s + answer) + AVW.STORE_SLACK_S
+    assert AVW.helper_timeout("discard") == AVW.helper_timeout("restore") == want
+    assert AVW.helper_timeout("status") == AVW.STORE_SLACK_S
+    assert max(want, AVW.STORE_SLACK_S) < RH.V7_SECONDS
