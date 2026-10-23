@@ -43,11 +43,11 @@ def test_team_fingerprint_delegates_to_fp_of_blob(v):
 
 
 @pytest.mark.parametrize("vid", ["fingerprint-sk-ssh-ed25519", "fingerprint-sk-ecdsa-sha2-nistp256"])
-def test_team_allowlist_still_refuses_what_f7_fingerprints(vid):
+def test_team_fingerprint_of_a_fido_key_agrees_with_f7(vid):
+    """T accepts the two FIDO types since team entries need a presence key, and fingerprints them as F7 does."""
     v = {x["id"]: x for x in VECTORS}[vid]
     assert K.fingerprint_line(v["input"]["line"]) == v["expect"]["levain"]["fp"]
-    with pytest.raises(S.SigningError):
-        S.fingerprint(v["input"]["line"])
+    assert S.fingerprint(v["input"]["line"]) == v["expect"]["levain"]["fp"]
 
 
 def test_certificates_are_outside_f7():

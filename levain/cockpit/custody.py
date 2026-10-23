@@ -377,7 +377,7 @@ def declared_custody(key_file: Path, given: str | None, key_class: str, public_k
                             "windows-hello), or make the key with `levain cockpit key create`")
         custody = UNSTATED
     normal = normalise_public_key(public_key)
-    problem = custody_problem(key_class, custody, normal.split()[0])
+    problem = custody_problem(key_class, custody, normal.split()[0], public_key=normal)
     if problem is not None:
         raise KeyError_(problem)
     if custody == PASSPHRASE:

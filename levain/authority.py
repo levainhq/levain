@@ -27,13 +27,14 @@ import math
 import os
 import re
 import secrets
+import shlex
 import sqlite3
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -48,14 +49,18 @@ __all__ = [
     "CONSENT_MCP_GRANT_KIND", "CONSENT_MCP_READ_ONLY_TOOLS",
     "CONSENT_GRANTABLE_TOOLS", "CONSENT_POSTURES", "CONSENT_SHELL_TOOLS",
     "CUSTODIES", "DISPLAY_PHONE", "FIDO_ATTESTED", "FORMAT", "PASSKEY", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
-    "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
+    "Anchor", "AnchorError", "ForeignAnchor", "KEY_WORD", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
-    "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify",
+    "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_data_root", "anchor_path",
+    "check_anchor", "classify", "foreign_anchor",
     "consent_grant", "consent_grant_tool_problem", "consent_revocable", "consent_tool_shape_problem",
     "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem",
-    "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_problem",
-    "genesis_policy", "inert_grant", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
-    "presence_missing", "snapshot", "sshsig_public_key", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
+    "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_mismatch",
+    "custody_problem", "is_passkey_material",
+    "genesis_policy", "inert_grant", "conn_data_root", "conn_init_hint", "init_hint", "log_head", "prepare", "read_anchor",
+    "reset_anchor", "reset_hint", "reset_lock", "reset_message", "sign_and_append",
+    "presence_missing", "quarantined", "signing_laptops", "snapshot", "sshsig_public_key", "UNSTATED",
+    "verify_anchor_reset", "verify_link_sig",
 ]
 
 FORMAT = "levain-authority/1"
@@ -102,11 +107,24 @@ _CUSTODY_KEY_TYPES: Mapping[str, frozenset[str]] = MappingProxyType({
 _LAPTOP_KEY_TYPES = frozenset().union(*_CUSTODY_KEY_TYPES.values())
 
 
-def custody_problem(key_class: str, custody: Any, key_type: str, *, legacy: bool = False) -> str | None:
+def custody_problem(key_class: str, custody: Any, key_type: str, *, public_key: str,
+                    legacy: bool = False) -> str | None:
     """Why ``custody`` cannot be declared for a ``key_class`` key of ``key_type`` (None when it can): the
     one rule the replay enforces and the CLI checks before anything is signed. ``legacy``: the key is
     carried from a levain-cockpit/2 store (its record has ``legacy_enrolled_at``), the one laptop-presence
-    key that may leave its custody ``unstated``."""
+    key that may leave its custody ``unstated``. ``public_key`` (required, so no caller can skip the rule): a key
+    whose material is a WebAuthn passkey's (:func:`is_passkey_material`) is declared ``passkey`` or not at all."""
+    if not isinstance(custody, str) or custody not in CUSTODIES:
+        return f"unknown custody {str(custody)[:40]!r}; one of {', '.join(CUSTODIES)}"
+    if custody != PASSKEY and is_passkey_material(public_key):
+        return (f"the key is a WebAuthn passkey (an {_PASSKEY_KEY_TYPE} key made on a web origin, not ssh:); "
+                f"its custody is {PASSKEY}, never {custody}")
+    return _custody_rule_problem(key_class, custody, key_type, legacy)
+
+
+def _custody_rule_problem(key_class: str, custody: Any, key_type: str, legacy: bool) -> str | None:
+    """Every rule of :func:`custody_problem` but the key-material one. Private: its one other caller is the replay's
+    quarantine of an enrolment recorded before the door (:func:`_enrolled_key`), which holds every other rule."""
     if not isinstance(custody, str) or custody not in CUSTODIES:
         return f"unknown custody {str(custody)[:40]!r}; one of {', '.join(CUSTODIES)}"
     if custody == FIDO_ATTESTED:
@@ -128,6 +146,51 @@ def custody_problem(key_class: str, custody: Any, key_type: str, *, legacy: bool
     if key_type not in admits:
         return f"custody {custody} needs a key of type {', '.join(sorted(admits))}, not {key_type}"
     return None
+
+
+_PASSKEY_KEY_TYPE = "sk-ecdsa-sha2-nistp256@openssh.com"
+
+
+def is_passkey_material(public_key: object) -> bool:
+    """Whether ``public_key``'s own material is a WebAuthn passkey's: an ``sk-ecdsa-sha2-nistp256@openssh.com``
+    key whose application is a web rpId (``levain.consent.passkey.public_key_line`` puts it there), where an
+    OpenSSH FIDO key's is ``ssh:...``. Anything else, or a key line that cannot be read, is not. Stdlib only."""
+    parts = public_key.split() if isinstance(public_key, str) else []
+    if len(parts) < 2 or parts[0] != _PASSKEY_KEY_TYPE:
+        return False
+    try:
+        wire = _Wire(base64.b64decode(parts[1], validate=True))
+        if wire.string() != _PASSKEY_KEY_TYPE.encode("ascii"):
+            return False
+        wire.string()                  # curve
+        wire.string()                  # point
+        application = wire.string()
+        wire.end()
+    except (ValueError, struct.error):
+        return False
+    return not application.startswith(b"ssh:")
+
+
+def custody_mismatch(public_key: str, custody: object) -> str | None:
+    """Why a key whose stored custody is ``custody`` may not have its signature checked as that custody, or None:
+    the custody its material shows (:func:`is_passkey_material`) must be the stored one, passkey or not. Every
+    levain verifier that picks a passkey's checks (user verification, the exact origin, what it may sign) by the
+    stored custody runs this first. :func:`custody_problem` refuses such an enrolment at the door; this holds the
+    same at every verification, for a log or snapshot from before that door, or one built past it."""
+    derived = is_passkey_material(public_key)
+    if derived == (custody == PASSKEY):
+        return None
+    return (f"the signing key's stored custody {str(custody)[:40]!r} is not the custody its key material shows "
+            f"({'a passkey' if derived else 'not a passkey'})")
+
+
+def _quarantinable(key_class: str, custody: Any, key_type: str, legacy: bool, public_key: str) -> bool:
+    """Whether an enrolment refused only by the door's key-material rule (WebAuthn material at a custody but
+    ``passkey``) and by no other rule is one the replay keeps, QUARANTINED, when it is already in the log (a log
+    written before the door). It is never a new link's way in: :func:`_enrolled_key` asks only for history."""
+    return (custody != PASSKEY and is_passkey_material(public_key)
+            and _custody_rule_problem(key_class, custody, key_type, legacy) is None)
+
 
 # Delta kinds the recompute classifier returns (§4.3).
 NOOP, TIGHTEN, LOOSEN, RENEW, GRANT_REVOKE = "noop", "tighten", "loosen", "renew", "grant_revoke"
@@ -348,6 +411,11 @@ class AnchorError(AuthorityError):
     """The anchor refuses this log."""
 
 
+class ForeignAnchor(AnchorError):
+    """The anchor names another store than this log's: an anchor reset refuses it (it is for a rollback of the
+    same store, DESIGN §3.8), so the refusal names the file to check or move instead."""
+
+
 def _ranks() -> Mapping[str, int]:
     # imported at use: the cockpit modules will import this one
     from levain.cockpit.firejournal import _CLASS_RANK
@@ -422,6 +490,26 @@ class AuthorityKey:
     @property
     def active(self) -> bool:
         return self.revoked_seq is None
+
+
+def quarantined(keys: Iterable[AuthorityKey]) -> list[tuple[AuthorityKey, str]]:
+    """The QUARANTINED keys among ``keys``, each with why: active, and its stored custody is not the one its key
+    material shows (:func:`custody_mismatch`). The one definition: :meth:`AuthoritySnapshot.quarantined_keys`,
+    the revoke guard, ``levain doctor``, ``levain cockpit keys`` and the broker's verify all read it."""
+    out = []
+    for k in keys:
+        why = custody_mismatch(k.public_key, k.custody) if k.active else None
+        if why is not None:
+            out.append((k, why))
+    return out
+
+
+def signing_laptops(keys: Iterable[AuthorityKey]) -> list[AuthorityKey]:
+    """The laptop-presence keys among ``keys`` that can sign a new link: active and not :func:`quarantined`. Every
+    "is a laptop-presence key left that can sign" count is this one."""
+    laptops = [k for k in keys if k.active and k.key_class == LAPTOP]
+    held = {k.fingerprint for k, _why in quarantined(laptops)}
+    return [k for k in laptops if k.fingerprint not in held]
 
 
 def _freeze(value: Any) -> Any:
@@ -516,6 +604,19 @@ class AuthoritySnapshot:
 
     def active_keys(self) -> list[AuthorityKey]:
         return [k for k in self.keys.values() if k.active]
+
+    def quarantined_keys(self) -> list[tuple[AuthorityKey, str]]:
+        """The active keys whose stored custody is not the one their key material shows (:func:`custody_mismatch`),
+        each with why: derived from the stored fields alone, never a field of its own. Two shapes: WebAuthn material
+        at a custody but ``passkey`` (only from a log written before the enrol door, :func:`_quarantinable`), and
+        material that is not a passkey's stored at custody ``passkey`` (an OpenSSH sk-ecdsa key; the door does not
+        refuse that enrolment). Every verify site refuses either one's new signatures. A revoke ends it;
+        re-enrolling the same material is refused (a revoked key stays revoked). :func:`quarantined` of its keys."""
+        return quarantined(self.keys.values())
+
+    def signing_laptop_keys(self) -> list[AuthorityKey]:
+        """The laptop-presence keys that can sign a new link (:func:`signing_laptops`): none QUARANTINED."""
+        return signing_laptops(self.keys.values())
 
     def hash_at(self, seq: int) -> str | None:
         return self._hashes[seq - 1] if 1 <= seq <= len(self._hashes) else None
@@ -1180,7 +1281,10 @@ def _parse_record(row: _Row) -> dict[str, Any]:
 
 
 def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, AuthorityKey],
-                  ssh_keygen: Path | str) -> AuthorityKey:
+                  ssh_keygen: Path | str, *, new_link: bool) -> AuthorityKey:
+    """The key an ``enrol`` record adds. ``new_link``: the record is being prepared or appended now (the door binds
+    whole); otherwise it is a link already in the log, and an enrolment refused only by the door's key-material rule
+    is kept as a QUARANTINED key (:func:`_quarantinable`; :meth:`AuthoritySnapshot.quarantined_keys`)."""
     from levain.cockpit.keys import KeyError_, fingerprint_of, normalise_public_key
     fp, public_key, cls = rec["fingerprint"], rec["public_key"], rec["class"]
     if not isinstance(cls, str) or cls not in _ranks():
@@ -1200,8 +1304,10 @@ def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, Authority
     if legacy is not None and not isinstance(legacy, str):
         raise AuthorityError("legacy_enrolled_at must be text")
     custody = rec["custody"]
-    problem = custody_problem(cls, custody, public_key.split()[0], legacy=legacy is not None)
-    if problem is not None:
+    key_type = public_key.split()[0]
+    problem = custody_problem(cls, custody, key_type, legacy=legacy is not None, public_key=public_key)
+    if problem is not None and (new_link or not _quarantinable(cls, custody, key_type, legacy is not None,
+                                                                public_key)):
         raise AuthorityError(problem)
     old = keys.get(fp)
     if old is not None:
@@ -1214,8 +1320,10 @@ def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, Authority
 
 
 def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
-          check_signature: bool = True) -> AuthoritySnapshot:
-    """The state after ``row``, judged against ``state`` (its predecessor), or :class:`ReplayError`."""
+          check_signature: bool = True, new_link: bool = False) -> AuthoritySnapshot:
+    """The state after ``row``, judged against ``state`` (its predecessor), or :class:`ReplayError`. ``new_link``:
+    ``row`` is being prepared or appended now, never a link already in the log; a QUARANTINED key (one a log from
+    before the enrol door holds, :func:`_quarantinable`) is then neither enrolled nor taken as a signer."""
     expected = 1 if state is None else state.seq + 1
     seq = row.seq
     if type(seq) is not int or seq != expected:
@@ -1252,6 +1360,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
     keys = {} if state is None else dict(state.keys)
     policy = genesis_policy() if state is None else state.policy
     grant_seqs = {} if state is None else dict(state.grant_seqs)
+    quarantined_history = False
     try:
         if state is None:
             # TOFU genesis (§3.2): the first link enrols a laptop-presence key, signed by that key
@@ -1259,8 +1368,11 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                 raise AuthorityError(f"the first link must enrol a {LAPTOP} key")
             if row.signer_fp != rec["fingerprint"]:
                 raise AuthorityError("the first link must be signed by the key it enrols")
-            signer = _enrolled_key(rec, seq, keys, ssh_keygen)
+            signer = _enrolled_key(rec, seq, keys, ssh_keygen, new_link=new_link)
             keys[signer.fingerprint] = signer
+            # a quarantined genesis key (only ever history: _enrolled_key refuses it on a new link) signed this
+            # link: re-checked below as the passkey its material shows
+            quarantined_history = custody_mismatch(signer.public_key, signer.custody) is not None
         else:
             found = keys.get(row.signer_fp)
             if found is None:
@@ -1268,8 +1380,21 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             signer = found
             if not signer.active:
                 raise AuthorityError(f"signer {row.signer_fp} was revoked at seq {signer.revoked_seq}")
+            # the custody that picks the rule below and the passkey checks after the signature is the stored one,
+            # held equal to the one the signer's key material shows (an enrolment from before the door at
+            # custody_problem could hold a passkey at custody fido). The one exception is a QUARANTINED key's link
+            # already in the log: WebAuthn material at another custody, so the link is re-checked below as the
+            # passkey its material shows (user verification, the exact origin). A new link it signs is refused
+            why = custody_mismatch(signer.public_key, signer.custody)
+            if why is not None and (new_link or not is_passkey_material(signer.public_key)):
+                raise AuthorityError(why + ("; the key is quarantined: it signs nothing new" if new_link and
+                                            is_passkey_material(signer.public_key) else ""))
+            quarantined_history = why is not None
+            # known edge, kept: a quarantined key's links already in the log meet UV + origin only, not the op rule
+            # below (stored custody fido/unstated), since holding them to it refuses existing logs (Phill's (a))
             if signer.custody == PASSKEY:
-                # a passkey signs consent answers (its own namespace, the consent queue's check) and, in this log,
+                # a passkey signs consent answers (its own namespace, the consent queue's check), since K8 a cockpit
+                # pending of T2 at most in the phone namespace (the broker's check), and, in this log,
                 # one op: the removal of a consent or inert grant, which only ever narrows what an agent may do (a
                 # synced passkey stolen with its account can cost the operator prompts, never widen anything). Every
                 # other link it signed is refused whatever its class's rank would allow, and so is a revoke of any
@@ -1282,7 +1407,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                 if target is not None and not consent_revocable(target):
                     raise AuthorityError(f"a {PASSKEY} key revokes a consent grant or an inert one only, never "
                                          f"grant {gid[:80]!r}")
-            need = _apply_op(rec, seq, state, keys, ssh_keygen)
+            need = _apply_op(rec, seq, state, keys, ssh_keygen, new_link=new_link)
             if isinstance(need, StandingPolicy):
                 delta = classify(policy, need)
                 if delta == NOOP:
@@ -1311,27 +1436,30 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                              fingerprint=signer.fingerprint, ssh_keygen=ssh_keygen)
         if not ok:
             raise ReplayError(seq, f"the signature does not verify as {signer.fingerprint}")
-        if signer.custody == PASSKEY:
+        if signer.custody == PASSKEY or quarantined_history:
             # the checks ssh-keygen does not make on a WebAuthn signature (user verification, an origin that is
-            # exactly the key's own https name, not cross-origin), run at every replay
+            # exactly the key's own https name, not cross-origin), run at every replay, and on a quarantined key's
+            # link as on any passkey's: the stored signature carries its flags and origin
             from levain.consent.passkey import authority_signature_problem
 
             problem = authority_signature_problem(row.signature, signer.public_key)
             if problem is not None:
-                raise ReplayError(seq, f"the passkey signature is refused: {problem}")
+                raise ReplayError(seq, f"the passkey signature is refused: {problem}"
+                                       + (f" (signed by {signer.fingerprint}, quarantined: WebAuthn material stored "
+                                          f"at custody {signer.custody})" if quarantined_history else ""))
     hashes = (() if state is None else state._hashes) + (row.hash,)
     return AuthoritySnapshot(rec["store_id"], seq, row.hash, MappingProxyType(keys), policy, hashes, head_at=at,
                              grant_seqs=MappingProxyType(grant_seqs))
 
 
 def _apply_op(rec: Mapping[str, Any], seq: int, state: AuthoritySnapshot, keys: dict[str, AuthorityKey],
-              ssh_keygen: Path | str) -> int | StandingPolicy:
+              ssh_keygen: Path | str, *, new_link: bool) -> int | StandingPolicy:
     """Applies a key op to ``keys`` and returns the signer rank it needs, or returns the new policy for
     a policy op (whose rank follows from its computed delta)."""
     op = rec["op"]
     ranks = _ranks()
     if op == "enrol":
-        key = _enrolled_key(rec, seq, keys, ssh_keygen)
+        key = _enrolled_key(rec, seq, keys, ssh_keygen, new_link=new_link)
         keys[key.fingerprint] = key
         return ranks[LAPTOP]
     if op == "revoke_key":
@@ -1344,10 +1472,16 @@ def _apply_op(rec: Mapping[str, Any], seq: int, state: AuthoritySnapshot, keys: 
         since = rec.get("compromised_since")
         if since is not None and (type(since) is not int or not target.enrolled_seq <= since <= state.seq):
             raise AuthorityError(f"compromised_since must be a seq between {target.enrolled_seq} and {state.seq}")
-        if target.key_class == LAPTOP and since is None and not any(
-                k.active and k.key_class == LAPTOP and k.fingerprint != fp for k in keys.values()):
-            raise AuthorityError(f"{fp} is the last unrevoked {LAPTOP} key; enrol another first, or "
-                                 "revoke it with compromised_since if it is lost or stolen")
+        others = [k for k in keys.values() if k.fingerprint != fp]
+        # A new link counts the laptop-presence keys that can sign (signing_laptops: a QUARANTINED one signs nothing
+        # new, so it is no survivor). A link already in the log keeps the count the replay that took it made (any
+        # unrevoked laptop-presence key): a log from before the enrol door still loads, and doctor names its dead end
+        if target.key_class == LAPTOP and since is None and not (
+                signing_laptops(others) if new_link else [k for k in others if k.active and k.key_class == LAPTOP]):
+            held = ", ".join(k.fingerprint for k, _why in quarantined(others) if k.key_class == LAPTOP)
+            raise AuthorityError(f"{fp} is the last unrevoked {LAPTOP} key"
+                                 + (f" that can sign (quarantined, signing nothing new: {held})" if held else "")
+                                 + "; enrol another first, or revoke it with compromised_since if it is lost or stolen")
         keys[fp] = replace(target, revoked_seq=seq, compromised_since=since)
         return ranks[target.key_class]
     return _apply_policy_op(state.policy, rec)
@@ -1470,8 +1604,17 @@ def snapshot(conn: sqlite3.Connection, *, cache: ReplayCache | None = None,
     inside the caller's read transaction so it and the caller's other reads see one head)."""
     state = _replay(conn, PROCESS_CACHE if cache is None else cache, ssh_keygen)
     if state is None:
-        raise NotInitialised("the authority log is empty: run `levain cockpit ledger init`")
+        raise NotInitialised(f"the authority log is empty: {conn_init_hint(conn)}")
     return state
+
+
+def log_head(conn: sqlite3.Connection) -> tuple[int, str] | None:
+    """``(seq, hash)`` of the log's last stored link, unverified (one indexed read, no replay); None when the log is
+    empty. Equal to a verified snapshot's ``(seq, head_hash)`` exactly when no link was appended at, or replaced in,
+    the head since that replay: a caller that verified a snapshot outside a lock compares only this inside it. A row
+    rewritten below an unchanged head row is not seen here; the next full replay and the anchor refuse it."""
+    row = conn.execute("SELECT seq, hash FROM authority_log ORDER BY seq DESC LIMIT 1").fetchone()
+    return None if row is None else (row[0], row[1])
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -1676,7 +1819,7 @@ def prepare(conn: sqlite3.Connection, op: Mapping[str, Any], *, signer_fp: str, 
     except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
         # not JSON, a lone surrogate (no UTF-8 form), or nested too deeply
         raise AuthorityError(f"the op has no canonical UTF-8 form ({type(exc).__name__})") from None
-    _step(state, row, ssh_keygen=ssh_keygen, check_signature=False)
+    _step(state, row, ssh_keygen=ssh_keygen, check_signature=False, new_link=True)
     if state is not None:
         _append_only_checks(state, json.loads(record), now)
     return UnsignedLink(seq, prev, record, signer_fp)
@@ -1704,17 +1847,19 @@ def append(conn: sqlite3.Connection, link: UnsignedLink, signature: str, *, now:
         if anchor is not None:
             current = read_anchor(anchor)
             if state is None and current is not None:
+                # not a reset: an empty log holds no key a reset could verify against (verify_anchor_reset)
                 raise AnchorError(f"the authority log is empty but its anchor names store {current.store_id} at "
                                   f"seq {current.seq}; a new genesis here would fork it. If this store was "
-                                  f"emptied on purpose, run {_RESET_HINT}")
+                                  f"emptied on purpose, move {anchor} aside, then run "
+                                  f"{init_hint(anchor_data_root(anchor))}")
             if state is not None:
-                check_anchor(state, current)
+                check_anchor(state, current, path=anchor)
         head = (0, "") if state is None else (state.seq, state.head_hash)
         if head != (link.seq - 1, link.prev_hash):
             raise StaleHead(f"the authority log's head moved to seq {head[0]} since this link was prepared")
         row = _Row(link.seq, link.prev_hash, link.record, link.signer_fp, signature,
                    _link_hash(link.prev_hash, link.record))
-        new = _step(state, row, ssh_keygen=ssh_keygen)
+        new = _step(state, row, ssh_keygen=ssh_keygen, new_link=True)
         if state is not None:
             _append_only_checks(state, json.loads(link.record), now)
         conn.execute("INSERT INTO authority_log (seq, prev_hash, record, signer_fp, signature, hash) "
@@ -1766,13 +1911,51 @@ class Anchor:
         return {"store_id": self.store_id, "seq": self.seq, "head_hash": self.head_hash}
 
 
-_RESET_HINT = "`levain cockpit anchor reset`"
+# the one word of a printed remedy the operator fills in: which of their laptop-presence key files signs (levain.doctor
+# prints the same word)
+KEY_WORD = "YOUR_LAPTOP_PRESENCE_KEY"
+
+
+def reset_hint(data_root: Path | str) -> str:
+    """The remedy an anchor refusal of a same-store rollback prints: the whole `levain cockpit anchor reset` argv,
+    this data root filled in, so the operator runs it as printed with their key file in place of :data:`KEY_WORD`
+    (tests/test_cockpit_anchor_reset.py runs each one through levain.cli's parser)."""
+    return f"`levain cockpit anchor reset --signing-key {KEY_WORD} --data-root {shlex.quote(str(data_root))}`"
+
+
+def init_hint(data_root: Path | str, signing_key: Path | str = KEY_WORD) -> str:
+    """The remedy for an empty log: the whole `levain cockpit ledger init` argv, this data root filled in (and the
+    signing key, where the caller holds one: `levain cockpit key create` has just made it)."""
+    argv = ["levain", "cockpit", "ledger", "init", "--signing-key", str(signing_key), "--data-root", str(data_root)]
+    return f"`{shlex.join(argv)}`"
+
+
+def conn_data_root(conn: sqlite3.Connection) -> Path | None:
+    """The data root whose ``cockpit.db`` is ``conn``'s main database, or None for a database with no file
+    (``:memory:``, a temp database): there the code cannot name a cockpit."""
+    file = conn.execute("PRAGMA database_list").fetchone()[2]     # (seq, name, file): the main database first
+    return Path(file).parent if file else None
+
+
+def conn_init_hint(conn: sqlite3.Connection) -> str:
+    """:func:`init_hint` for ``conn``'s own data root. A fileless database has no root to name, so it says in prose
+    what the command needs and pastes nothing."""
+    root = conn_data_root(conn)
+    if root is None:
+        return ("levain cockpit ledger init, with its --signing-key (a laptop-presence key) and --data-root "
+                "(the cockpit directory)")
+    return init_hint(root)
 
 
 def anchor_path(data_root: Path | str) -> Path:
     """``<data_root>/anchor/authority.anchor``: its own directory, so a backup can leave it out while it
     takes the store (:func:`_anchor_dir`)."""
     return Path(data_root) / ANCHOR_DIR / ANCHOR_NAME
+
+
+def anchor_data_root(path: Path | str) -> Path:
+    """The data root whose anchor is ``path`` (:func:`anchor_path` inverted)."""
+    return Path(path).parent.parent
 
 
 def _exclude_from_time_machine(directory: Path) -> None:
@@ -1806,7 +1989,7 @@ def read_anchor(path: Path) -> Anchor | None:
         return None
     except OSError as exc:
         raise AnchorError(f"the authority anchor {path} cannot be read ({type(exc).__name__}); "
-                          f"after checking the log, run {_RESET_HINT}") from None
+                          f"after checking the log, run {reset_hint(anchor_data_root(path))}") from None
     try:
         data = json.loads(raw.decode("utf-8"))
         if data.get("format") != ANCHOR_FORMAT:
@@ -1817,19 +2000,38 @@ def read_anchor(path: Path) -> Anchor | None:
             raise ValueError
     except (ValueError, KeyError, AttributeError, UnicodeDecodeError, RecursionError):
         raise AnchorError(f"the authority anchor {path} is unreadable; after checking the log, run "
-                          f"{_RESET_HINT}") from None
+                          f"{reset_hint(anchor_data_root(path))}") from None
     return Anchor(store_id, seq, head)
 
 
-def check_anchor(snap: AuthoritySnapshot, anchor: Anchor | None) -> None:
-    """Refuse a log behind ``anchor``: another store, fewer links, or another hash at the anchor's seq."""
+def foreign_anchor(snap: AuthoritySnapshot, anchor: Mapping[str, Any] | Anchor | None,
+                   path: Path | str) -> ForeignAnchor | None:
+    """The refusal of an anchor at ``path`` that names another store than ``snap``'s, or None (no anchor, an
+    unreadable one, or this store's). Its remedy is the file to check or move, never a reset: a reset is for a
+    rollback of the same store (DESIGN §3.8), and signing over another store's anchor with this log's keys would
+    let a substituted log adopt the anchor that exists to refuse it."""
+    store = anchor.store_id if isinstance(anchor, Anchor) else None if anchor is None else anchor.get("store_id")
+    if store is None or store == snap.store_id:
+        return None
+    return ForeignAnchor(f"the authority anchor {path} names store {store}, but this log is store {snap.store_id}: "
+                         f"the anchor belongs to another store, and an anchor reset refuses it. Check that "
+                         f"{anchor_data_root(path)} holds the store you meant; if you replaced that store on purpose, "
+                         f"move {path} aside (the next signed link writes this store's anchor)")
+
+
+def check_anchor(snap: AuthoritySnapshot, anchor: Anchor | None, *, path: Path | str) -> None:
+    """Refuse a log behind ``anchor`` (the anchor file at ``path``): another store (:class:`ForeignAnchor`),
+    fewer links, or another hash at the anchor's seq."""
     if anchor is None:
         return
+    foreign = foreign_anchor(snap, anchor, path)
+    if foreign is not None:
+        raise foreign
     here = f"log store {snap.store_id} at seq {snap.seq} ({snap.head_hash[:12]})"
     there = f"anchor store {anchor.store_id} at seq {anchor.seq} ({anchor.head_hash[:12]})"
-    if anchor.store_id != snap.store_id or snap.seq < anchor.seq or snap.hash_at(anchor.seq) != anchor.head_hash:
+    if snap.seq < anchor.seq or snap.hash_at(anchor.seq) != anchor.head_hash:
         raise AnchorError(f"the authority log is behind its anchor: {here}, {there}. If this store was "
-                          f"restored on purpose, run {_RESET_HINT}")
+                          f"restored on purpose, run {reset_hint(anchor_data_root(path))}")
 
 
 def _write_anchor(path: Path, payload: Mapping[str, Any]) -> None:
@@ -1877,7 +2079,7 @@ def advance_anchor(path: Path, snap: AuthoritySnapshot) -> Anchor:
         current = read_anchor(path)
         if current is not None and current.store_id == snap.store_id and current.seq > snap.seq:
             return current
-        check_anchor(snap, current)
+        check_anchor(snap, current, path=path)
         new = Anchor(snap.store_id, snap.seq, snap.head_hash)
         if current != new:
             _write_anchor(path, {"format": ANCHOR_FORMAT, **new.as_dict()})
@@ -1912,6 +2114,11 @@ def verify_anchor_reset(snap: AuthoritySnapshot, old_anchor: Mapping[str, Any] |
         raise AnchorError(f"{signer_fp} is not an unrevoked key of this log at seq {snap.seq}")
     if key.key_class != LAPTOP:
         raise AnchorError(f"an anchor reset needs a {LAPTOP} key, not {key.key_class}")
+    # the one custody rule, as at every verify site: a snapshot from a replay cache warmed before the enrol door can
+    # hold WebAuthn material at a laptop custody, whose signature ssh-keygen takes without user verification
+    why = custody_mismatch(key.public_key, key.custody)
+    if why is not None:
+        raise AnchorError(f"the anchor reset signer {signer_fp}: {why}")
     message = reset_message(snap.store_id, old_anchor, snap.seq, snap.head_hash)
     try:
         ok = verify_link_sig(message, signature, public_key=key.public_key, fingerprint=key.fingerprint,
@@ -1932,26 +2139,60 @@ def _no_live_cockpit(path: Path) -> Iterator[None]:
     for: a server still holding the abandoned store could advance the anchor back onto it."""
     from levain.cockpit.broker import LOCK_NAME
     lock = Path(path).parent.parent / LOCK_NAME
-    fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    except OSError as exc:            # a read-only or missing data root: a refusal, not a traceback (S3a-2 MUST)
+        raise AnchorError(f"the store lock {lock} cannot be opened ({type(exc).__name__}); a reset needs it") from None
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise AnchorError(f"a cockpit server holds {lock}: stop it, then run {_RESET_HINT}") from None
+            raise AnchorError(f"a cockpit server holds {lock}: stop it, then run "
+                              f"{reset_hint(anchor_data_root(path))}") from None
         yield
     finally:
         os.close(fd)
 
 
+class ResetLock:
+    """Both locks a reset holds (:func:`reset_lock`), while its ``with`` block runs."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.live = True
+
+
+@contextmanager
+def reset_lock(path: Path | str) -> Iterator[ResetLock]:
+    """The store lock (:func:`_no_live_cockpit`, refused while a cockpit server holds it) and the anchor's lock,
+    held together: a caller that reads the old anchor, has the reset signed and writes it holds this across all
+    three (``levain.cockpit.keys.anchor_reset``), so no server starts and no advance lands between them."""
+    held = ResetLock(Path(path))
+    try:
+        with _no_live_cockpit(held.path), _anchor_lock(held.path):
+            yield held
+    finally:
+        held.live = False
+
+
 def reset_anchor(path: Path, snap: AuthoritySnapshot, *, signer_fp: str, signature: str,
-                 ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> Anchor:
+                 ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN, held: ResetLock | None = None) -> Anchor:
     """Move the anchor at ``path`` to ``snap``'s head on a verified reset signature, storing the proof
-    in the anchor file (the log refuses to open, so it cannot be a log link). Refused while a cockpit
-    server is live on the store (:func:`_no_live_cockpit`)."""
-    with _no_live_cockpit(path), _anchor_lock(path):
-        old = _old_anchor_view(path)
-        verify_anchor_reset(snap, old, signer_fp=signer_fp, signature=signature, ssh_keygen=ssh_keygen)
-        new = Anchor(snap.store_id, snap.seq, snap.head_hash)
-        _write_anchor(path, {"format": ANCHOR_FORMAT, **new.as_dict(),
-                             "reset": {"old_anchor": old, "signer_fp": signer_fp, "signature": signature}})
-        return new
+    in the anchor file (the log refuses to open, so it cannot be a log link). Runs under :func:`reset_lock`:
+    ``held``, the caller's, or else taken here (refused while a cockpit server is live on the store). An anchor
+    of another store is refused (:func:`foreign_anchor`), whatever the signature."""
+    if held is None:
+        with reset_lock(path) as mine:
+            return reset_anchor(path, snap, signer_fp=signer_fp, signature=signature, ssh_keygen=ssh_keygen,
+                                held=mine)
+    if not held.live or held.path != Path(path):
+        raise AnchorError(f"reset_anchor needs the reset lock of {path}, held")
+    old = _old_anchor_view(path)
+    foreign = foreign_anchor(snap, old, path)
+    if foreign is not None:
+        raise foreign
+    verify_anchor_reset(snap, old, signer_fp=signer_fp, signature=signature, ssh_keygen=ssh_keygen)
+    new = Anchor(snap.store_id, snap.seq, snap.head_hash)
+    _write_anchor(path, {"format": ANCHOR_FORMAT, **new.as_dict(),
+                         "reset": {"old_anchor": old, "signer_fp": signer_fp, "signature": signature}})
+    return new

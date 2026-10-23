@@ -133,7 +133,7 @@ from typing import Any
 
 from levain.authority import (
     _WEBAUTHN_SIG_TYPE, PASSKEY, AuthorityError, AuthoritySnapshot, ReplayCache, VerifierUnavailable,
-    sshsig_public_key, verify_link_sig,
+    custody_mismatch, sshsig_public_key, verify_link_sig,
 )
 from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
@@ -716,6 +716,10 @@ def _signature_refusal(public_key: str, fingerprint: str, custody: str | None, p
     fingerprint is ``fingerprint``); ``None`` when it does. A passkey's (``custody``) own checks run first."""
     if not isinstance(signature, str) or not signature:
         return f"the {noun} carries no signature"
+    # the custody that picks the checks below is the stored one, held equal to the one the key material shows
+    problem = custody_mismatch(public_key, custody)
+    if problem is not None:
+        return problem
     if custody == PASSKEY:
         # a passkey's checks that ssh-keygen does not make (user verification, the page's origin), on every
         # verification, not only where the phone port converted the assertion
@@ -775,6 +779,18 @@ class AuthoritySource:
         if got.authority is None or got.authority_error is not None:
             raise AuthorityError(got.authority_error or "the authority log yields no head")
         return got.authority
+
+    def head(self) -> tuple[int, str] | None:
+        """The log's stored head ``(seq, hash)``, read without a replay (:func:`levain.authority.log_head`): cheap
+        enough to compare inside another store's write lock against a snapshot this source returned before it."""
+        from levain.authority import log_head
+
+        # a short timeout: this read runs inside another store's write lock, and a head it cannot read is "moved"
+        conn = sqlite3.connect(self._uri, uri=True, isolation_level=None, timeout=2.0)
+        try:
+            return log_head(conn)
+        finally:
+            conn.close()
 
 
 def authority_source(cockpit_db: Path | str, *, anchor: Path | None, cache: ReplayCache | None = None,

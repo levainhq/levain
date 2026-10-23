@@ -167,3 +167,78 @@ def test_a_draft_holding_hidden_text_is_refused_and_an_older_one_shows_escaped(w
     assert "summary must be text that shows as itself" in err
     assert git("rev-parse", "levain-team-ledger", cwd=ana) == before
     assert T.get_draft(store, d["draft_id"])["state"] == "drafted"
+
+
+def test_no_coordinator_path_reaches_the_signer(world, tmp_path, monkeypatch, capsys):
+    """C8's never-sign property, as an assertion: every signing entry of the ledger records a call and raises, and the
+    coordinator does everything its door lets it do about a draft. A draft path that ever grew a call to the signer
+    fails here, not in a review. The calls list is the assertion (a broad except between the stub and the test cannot
+    hide it); the operator-side control at the end proves the stubs fire when the signer is reached."""
+    from levain.team.transport import GitLedger
+
+    ana, qdir, store, token = world
+    calls = []
+
+    def reached(name):
+        def boom(*a, **k):
+            calls.append(name)
+            raise AssertionError(f"a coordinator path reached the signer: GitLedger.{name}")
+        return boom
+    for name in ("append", "write_canon", "update_counted", "init", "join"):
+        monkeypatch.setattr(GitLedger, name, reached(name))
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path))
+    monkeypatch.chdir(_coordinator_workspace(tmp_path))
+    before = git("rev-parse", "levain-team-ledger", cwd=ana)
+    d = T.add_draft(store, "decision", words="use the queue", kind="practice", paths=["a.py"], by="coordinator",
+                    token=token)
+    assert T.get_draft(store, d["draft_id"])["state"] == "drafted" and T.list_drafts(store)
+    assert levain_main(["team", "draft", "add", "finding", "--summary", "s", "--token", str(token)]) == 0
+    for argv in (["team", "draft", "list"], ["team", "draft", "show", d["draft_id"]],
+                 ["team", "status", "--repo", str(ana)], ["team", "verify", "--repo", str(ana)],
+                 ["team", "export", "--repo", str(ana)]):
+        levain_main(argv)                    # reads: whatever they print, none may sign
+    for argv in (["team", "draft", "promote", d["draft_id"], "--yes", "--repo", str(ana)],
+                 ["team", "draft", "promote", d["draft_id"], "--resume", "--yes", "--repo", str(ana)],
+                 ["team", "record", "decision", "--kind", "practice", "--words", "w", "--repo", str(ana)]):
+        assert levain_main(argv) == 1, argv
+    T.withdraw_draft(store, d["draft_id"], by="coordinator", token=token)
+    assert calls == []
+    assert git("rev-parse", "levain-team-ledger", cwd=ana) == before
+    assert "reached the signer" not in capsys.readouterr().err
+    # positive control: the operator's own promote, outside the coordinator workspace, reaches a stub
+    op = T.add_draft(store, "decision", words="operator draft", kind="practice", paths=["a.py"], by="operator")
+    monkeypatch.chdir(ana.parent)
+    try:
+        levain_main(["team", "draft", "promote", op["draft_id"], "--yes", "--no-push", "--repo", str(ana),
+                     "--queue-dir", str(qdir)])
+    except AssertionError:
+        pass
+    assert calls, "the tripwires never fired for the operator's promote: the stubs sit on the wrong seam"
+
+
+def test_the_draft_module_cannot_import_the_ledger_writer():
+    """The only team module the draft store imports is the entry schema (what it validates against); the signer's
+    modules are never named in it, so a draft row can only become an entry through the operator's verb. Known edge:
+    this reads teamdrafts alone, so a transitive import through another module is not caught here."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(T))
+    named = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            named |= {a.name for a in n.names}
+        elif isinstance(n, ast.ImportFrom):
+            if n.level:                      # relative: `..team`, `. import team` resolve against levain.coordinator
+                base = ["levain", "coordinator"][: max(0, 2 - (n.level - 1))]
+                mod = ".".join(base + ([n.module] if n.module else []))
+            else:
+                mod = n.module or ""
+            named |= {mod + "." + a.name for a in n.names}
+    team_imports = {m for m in named if m == "levain.team" or m.startswith("levain.team.")}
+    assert team_imports <= {"levain.team.entry"}, team_imports
+    for n in ast.walk(tree):         # dynamic imports are not allowed to name the team package at all
+        if isinstance(n, ast.Name) and n.id in ("importlib", "__import__"):
+            raise AssertionError("teamdrafts imports dynamically: " + n.id)
+        if isinstance(n, ast.Attribute) and n.attr == "import_module":
+            raise AssertionError("teamdrafts imports dynamically: import_module")

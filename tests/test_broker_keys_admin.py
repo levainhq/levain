@@ -731,7 +731,7 @@ def test_revoke_at_every_suspension(monkeypatch, transition, delivery, cached):
         st["transports"] += [raw.transport, plain.transport]
         return object(), raw, plain
 
-    async def read_response(up, *rest):
+    async def read_response(up, *rest, **kw):
         await asyncio.sleep(0)   # the response wait
         raise NotImplementedError
 

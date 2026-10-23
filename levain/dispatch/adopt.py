@@ -55,7 +55,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from levain.authority import PASSKEY, AuthoritySnapshot, verify_link_sig
+from levain.authority import PASSKEY, AuthoritySnapshot, custody_mismatch, verify_link_sig
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.consent import push
 from levain.consent.queue import class_covers
@@ -522,6 +522,9 @@ def authorise_refusal(payload: Any, signature: Any, authority: AuthoritySnapshot
         return "the authorise signature is empty"
     if len(signature) > SIGNATURE_MAX:
         return f"the authorise signature is over {SIGNATURE_MAX} characters"
+    problem = custody_mismatch(key.public_key, key.custody)
+    if problem is not None:
+        return problem
     if key.custody == PASSKEY:
         from levain.consent.passkey import answer_signature_problem
 

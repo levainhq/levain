@@ -330,13 +330,15 @@ class CoordStore:
         conn = self._jobs._connect()
         if not self._ready:
             from levain.coordinator.lease import LEASE_SCHEMA
+            from levain.coordinator.first_reader import FIRST_READER_SCHEMA
+            from levain.coordinator.review import REVIEW_SCHEMA
             from levain.coordinator.teamdrafts import DRAFT_SCHEMA
 
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     # the lease is checked by every opener's coordinator writes, so its tables are every opener's
-                    for stmt in (*self._SCHEMA, *LEASE_SCHEMA, *DRAFT_SCHEMA):
+                    for stmt in (*self._SCHEMA, *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA):
                         conn.execute(stmt)
                     conn.execute("COMMIT")
                 except BaseException:
@@ -413,7 +415,9 @@ class CoordStore:
                 except ConsentError as exc:
                     raise CoordError(f"sent_at: {exc}") from None
                 if sent > parse_stamp(now) + _SENT_SKEW:
-                    raise CoordError(f"sent_at {sent_at} is ahead of the store's clock ({now})")
+                    gap = round((sent - parse_stamp(now)).total_seconds() / 60)
+                    raise CoordError(f"sent_at {sent_at} is ahead of the store's clock ({now}): the sending device's "
+                                     f"clock runs about {gap} minutes ahead of this Levain's, so set it right")
             if _carry is not None:
                 # a drop carrying an envelope (C2): the carrier inserts it, after its own checks, in this transaction
                 return _carry(conn, now, words=words, sha=sha, surface=surface, outbox_id=outbox_id, sent_at=sent_at,
@@ -710,10 +714,19 @@ class CoordStore:
         return self._woken.pop(drop_id, None)
 
     def launch_claim_spawn(self, launch_id: str, pid: int) -> Any:
-        """The one-spawner compare-and-set (:func:`levain.coordinator.lease.claim_spawn`), one transaction."""
+        """The one-spawner compare-and-set (:func:`levain.coordinator.lease.claim_spawn`), one transaction. Every
+        spawner takes it BEFORE it spawns, so the budget gauge is read here first (C6 L3 r1 B2): a worker for a thread
+        whose gauge is crossed is refused with nothing started, written ``failed`` (budget crossed) with its SIGN
+        filed, exactly as at activation. Activation reads the gauge again and stays the authoritative check (usage can
+        move between the two)."""
         from levain.coordinator import lease
 
         with self._write() as (conn, now):
+            if conn.execute("SELECT 1 FROM launch_spawns WHERE launch_id = ?", (launch_id,)).fetchone() is None:
+                # a spawn already claimed is another process's, mid-spawn: its activation reads the gauge
+                refused = self._budget_refusal(conn, now, launch_id)
+                if refused is not None:
+                    return refused
             return lease.claim_spawn(conn, now, launch_id, pid)
 
     def launch_request(self, token: int, *, harness: str, role: str = "worker", threads: Sequence[str] = (),
@@ -728,8 +741,41 @@ class CoordStore:
         from levain.coordinator import lease
 
         with self._write() as (conn, now):
+            # C6, T6: the activation is the pin's transaction, so a leg's budget gauge is read here, in it. This is the
+            # authoritative check; the spawn claim read it first so a crossed thread starts nothing (L3 r1 B2)
+            refused = self._budget_refusal(conn, now, launch_id)
+            if refused is not None:
+                return refused
             return lease.activate(conn, now, launch_id, harness_session_id=harness_session_id,
                                   argv_sha256=argv_sha256)
+
+    def _budget_refusal(self, conn: sqlite3.Connection, now: str, launch_id: str) -> Any:
+        """A pending one-thread worker whose thread's budget gauge is crossed (:mod:`levain.coordinator.budget`): the
+        launch is written ``failed`` (cause ``budget crossed``) and the SIGN to extend filed (not for a gauge that is
+        unreadable, which no extension unblocks), both in this transaction,
+        and ``(launch, reason)`` returned as :func:`levain.coordinator.lease.activate` returns a refusal. None
+        otherwise, and for a launch whose lease token is no longer live (the claim or the activation then decides as
+        before). A worker holding several threads is not read
+        here: :func:`levain.coordinator.lease.refuse_several` refuses it at both the claim and the activation."""
+        from levain.coordinator import budget, lease
+
+        ln = lease.launch(conn, launch_id)
+        if ln is None or ln.state != "pending" or ln.role != "worker" or len(ln.threads) != 1 or \
+                ln.until is None or now >= ln.until:
+            return None
+        # the asker's lease is read before the budget (C6 L3 r2): a pending launch whose token is no longer the live
+        # lease's is the claim's or the activation's to write `lease lost before active`, with no SIGN to extend
+        held = lease.lease(conn, now)
+        if held is None or not held.live or held.token != ln.token:
+            return None
+        g = budget.gauge(conn, self.directory, ln.threads[0])
+        if g is None or g.refusal is None:
+            return None
+        lease._launch_event(conn, now, launch_id, "failed", lease.BUDGET_CROSSED)
+        if g.unreadable is None:
+            # an unreadable meter is no crossing: a SIGN to extend could not unblock it (L3 r1 U1)
+            budget.file_sign(self, conn, now, g)
+        return lease.launch(conn, launch_id), g.refusal
 
     def launch_end(self, launch_id: str, kind: str, cause: str) -> Any:
         from levain.coordinator import lease
@@ -793,6 +839,31 @@ class CoordStore:
         with read_transaction(self._connect) as conn:
             row = conn.execute("SELECT drop_id FROM drops WHERE outbox_id = ?", (outbox_id,)).fetchone()
             return None if row is None else self._drop(conn, row[0])
+
+    def resent_drop(self, outbox_id: str, words: str, *, surface: str) -> Drop | None:
+        """C1's outbox rule as a read, in ONE transaction: the drop stored under ``outbox_id`` when it holds these words
+        from this surface (a resend: the caller answers with it and checks nothing else), None when the id is unused.
+        The same id holding other words or another surface raises :class:`DropConflict`, as :meth:`accept_drop` does."""
+        sha = _words_sha256(_check_words(words))
+        with read_transaction(self._connect) as conn:
+            row = conn.execute("SELECT drop_id FROM drops WHERE outbox_id = ?", (outbox_id,)).fetchone()
+            if row is None:
+                return None
+            stored = self._drop(conn, row[0])
+        if stored.words_sha256 != sha or stored.surface != surface:
+            raise DropConflict(f"outbox_id {outbox_id} is already stored for a different drop ({stored.drop_id}); "
+                               "nothing was written")
+        return stored
+
+    def record_wake(self, drop_id: str, launch_id: str, *, started: bool, said: str) -> None:
+        """A ``woken`` drop receipt: how the coordinator launch ``drop_id``'s own transaction asked for went when its
+        starter ran it (``started``, and the starter's words). Written by a starter that runs after the drop's reply
+        (the phone port's), so a failed start is on the drop's receipt, never lost."""
+        with self._write() as (conn, now):
+            self._must_drop(conn, drop_id)
+            self._reply(conn, None, "drop_receipt", "drops", drop_id,
+                        {"stage": "woken", "drop_id": drop_id, "launch_id": launch_id, "started": bool(started),
+                         "said": str(said)[:800]}, now)
 
     def drops(self, limit: int = 50) -> list[Drop]:
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:

@@ -36,8 +36,14 @@ VENDOR_PREFIX: Mapping[str, Path] = {"darwin": Path("/usr/local/lib/levain-vendo
 
 #: entry script name -> the module it runs as ``__main__``.
 ENTRY_MODULES = {"install-helper": "levain.slot.install_helper", "runtime-helper": "levain.slot.runtime_helper",
-                 "service-entry": "levain.slot.service_boot"}
-HELPER_MODULES = {k: v for k, v in ENTRY_MODULES.items() if k != "service-entry"}
+                 "service-entry": "levain.slot.service_boot",
+                 # s5 §5b (head ruling 1022+19 Q4): the importer's entry, the argv[0] wall.export_launch_spec builds
+                 # (HELPER_DIR/export-importer); the verifier's (HELPER_DIR/export-verifier, 5d-i).
+                 "export-importer": "levain.slot.importer", "export-verifier": "levain.slot.verify_run"}
+#: The sudo helpers only: the service's boot entry and an export target's entry are not helpers (head ruling
+#: 1022+19 session-1 Q2).
+HELPER_MODULES = {k: v for k, v in ENTRY_MODULES.items()
+                  if k not in ("service-entry", "export-importer", "export-verifier")}
 
 
 #: The one link in the import tree (row 33, DESIGN 1022-8/upgrade §2.3): ``<tree>/current -> gen-<id>``, a RELATIVE
@@ -495,11 +501,14 @@ def flip_step(host: HostOS, target: str, *, fault: Optional[Callable[[str], None
 
 
 def entry_steps(host: HostOS) -> list[Step]:
-    """The three entry scripts (§2.3 R10: written AFTER the flip, so none ever names a ``current`` not there yet)."""
+    """Every :data:`ENTRY_MODULES` entry script (§2.3 R10: written AFTER the flip, so none ever names a ``current``
+    not there yet)."""
     return [Step(f"write the {entry} entry script {path}", write=(path, entry_text(host, entry), 0o755))
             for entry, path in (("install-helper", install_helper_path(host)),
                                 ("runtime-helper", runtime_helper_path(host)),
-                                ("service-entry", service_entry_path(host)))]
+                                ("service-entry", service_entry_path(host)),
+                                ("export-importer", HELPER_DIR[host] / "export-importer"),
+                                ("export-verifier", HELPER_DIR[host] / "export-verifier"))]
 
 
 def _gc(tree: Path, keep: frozenset[str], rm: str) -> tuple[bool, str]:

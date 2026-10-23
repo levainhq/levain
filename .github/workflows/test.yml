@@ -21,8 +21,10 @@ jobs:
     name: pytest (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     # Raised from 40 on 10-21: green runs had reached 29-37 min and two land branches were cut at the cap
-    # mid-suite (not hung). A hang still ends here; splitting the suite is the durable fix.
-    timeout-minutes: 60
+    # mid-suite (not hung). Raised from 60 on 10-22: run 39881613545's pytest 3.12 was cancelled at the 60-min cap
+    # at 96% with no failure, and main's 7bcfabdd took 59:43. A hang still ends here; splitting the suite is the
+    # durable fix.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
