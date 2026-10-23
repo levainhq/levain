@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import dataclasses
+import json
 import logging
 import os
 import shutil
@@ -21,19 +22,22 @@ from pathlib import Path
 
 import pytest
 
-from levain.broker import gwwire, norm
+from levain.broker import codec, gwwire, norm
 from levain.broker import keys as K
 from levain.broker import ledger as L
 from levain.contracts import canon
 from tests.ledger_support import FlushCtl, file_lines, keys_ledger, resolutions, until
-from tests.test_broker_keys_upstream import _Rig, _Up, _lib, _q, _run, _scripted, _types, base_route, body_frames
+from levain.broker.policy import parse_price
+from tests.test_broker_keys_upstream import (BODY, PRICE, _Rig, _Up, _lib, _q, _run, _scripted, _types, base_route,
+                                             body_frames)
 
 pytestmark = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="unix sockets")
 
 ROOT = Path(__file__).resolve().parents[1]
 KEYS_PY = ROOT / "levain" / "broker" / "keys.py"
 SCOPE = ("session-route", "s1", "r")
-AMOUNT = 1000      # `_lib`'s route: max_call 1000, max_session 100000
+#: the hold of `_lib`'s exchange: the R4 §1.2 estimate of the fixture body at the `m1` price entry
+AMOUNT = codec.CODECS["anthropic-messages"].estimate(json.loads(BODY), parse_price("m1", PRICE))
 
 
 def _capture(rig) -> list:
@@ -84,6 +88,8 @@ def _durable_seen(monkeypatch) -> asyncio.Event:
 
 
 # --- T2: a cancel at each await point of §5 rows 1-6 ----------------------------------------------------------------
+# Under R4 §1.7 `A` and the body come BEFORE the admit, so row 1 (`A`'s drain) cancels an exchange that holds nothing
+# yet; rows 2-6 hold the estimate from the admit on.
 
 ROWS = ["1-after-A", "2-connect", "3-durable-pending", "3-durable-reserved", "4-head-drain", "5-upload-and-head",
         "6-relay"]
@@ -91,8 +97,9 @@ ROWS = ["1-after-A", "2-connect", "3-durable-pending", "3-durable-reserved", "4-
 
 @pytest.mark.parametrize("row", ROWS)
 def test_cancel_at_each_await_resolves(monkeypatch, caplog, row):
-    # T2 [prescription: reasoned]: rows 1-3 end `released`, rows 4-6 `uncertain {ended}`, exactly one resolution per
-    # ref, `charged` back to its start only for the released rows, and no LedgerMisuse on any path.
+    # T2 [prescription: reasoned]: row 1 admits nothing (no `reserved` line, nothing upstream); rows 2-3 end
+    # `released`, rows 4-6 `uncertain {ended}`, exactly one resolution per ref, `charged` back to its start only for
+    # the released rows, and no LedgerMisuse on any path.
     up = _Up(stall_at=1 if row == "4-head-drain" else 0)
     gate = asyncio.Event if row == "2-connect" else None
     holder: dict = {}
@@ -128,8 +135,8 @@ def test_cancel_at_each_await_resolves(monkeypatch, caplog, row):
             if row == "1-after-A":
                 gw = _GatedWriter(rig.conn.writer)
                 rig.conn.writer = gw
+            rig.front.feed_data(body_frames())
             if row in ("6-relay",):
-                rig.front.feed_data(body_frames())
                 up.feed(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabcde")
             task = rig.run(_q())
             state_at_cancel = None
@@ -157,7 +164,7 @@ def test_cancel_at_each_await_resolves(monkeypatch, caplog, row):
             elif row == "6-relay":
                 await until(lambda: up.reads >= 2)
             if not task.cancelled() and state_at_cancel is None:
-                state_at_cancel = holds[0].state
+                state_at_cancel = holds[0].state if holds else None
                 task.cancel()
             if ctl is not None:
                 ctl.gate.set()
@@ -167,7 +174,8 @@ def test_cancel_at_each_await_resolves(monkeypatch, caplog, row):
                 hs_gate.set()
             await asyncio.wait([task])
             charged_before_close = None
-            await until(lambda: holds[0].state in (L.RESOLVED, L.STRANDED))
+            if holds:
+                await until(lambda: holds[0].state in (L.RESOLVED, L.STRANDED))
             charged_before_close = led.charged(SCOPE)
             out = {"cancelled": task.cancelled(), "state_at_cancel": state_at_cancel,
                    "charged": charged_before_close, "path": led.path, "head": up.writes[:1]}
@@ -177,7 +185,7 @@ def test_cancel_at_each_await_resolves(monkeypatch, caplog, row):
 
     with caplog.at_level(logging.WARNING):
         out = _run(go)
-    released_rows = ("1-after-A", "2-connect", "3-durable-pending", "3-durable-reserved")
+    released_rows = ("2-connect", "3-durable-pending", "3-durable-reserved")
     if row == "3-durable-reserved" and sys.version_info < (3, 12):
         # before 3.12, `asyncio.wait_for` returns the result and drops a cancel that lands in the turn its awaited
         # future completed (bpo-42130), so `durable()` returns: the cancel is lost, and the detached flag is what stops
@@ -185,6 +193,11 @@ def test_cancel_at_each_await_resolves(monkeypatch, caplog, row):
         assert out["cancelled"] in (True, False)
     else:
         assert out["cancelled"] is True
+    if row == "1-after-A":
+        assert out["seqs"] == [] and out["res"] == [], out   # cancelled before its body: nothing admitted
+        assert out["charged"] == 0 and out["head"] == []
+        assert "misuse" not in caplog.text
+        return
     assert len(out["seqs"]) == 1
     seq = out["seqs"][0]
     if row in released_rows:
@@ -232,7 +245,8 @@ def test_completed_relay_settles_at_the_full_hold(monkeypatch):
 
 # --- T20 / T20b: every non-settle exit resolves while the task still runs; the backstop catches a missed one --------
 
-EXITS = ["detached", "connect-lost", "front-aborted", "resp-none", "refused-before-r", "upstream-failed",
+#: (R4 §1.7: the upload is keys' buffer, so the front's abort during it, the old `resp-none` exit, has no path)
+EXITS = ["detached", "connect-lost", "front-aborted", "refused-before-r", "upstream-failed",
          "unavailable-at-durable", "unavailable-at-send-gate", "cancel", "stale"]
 #: the two `LedgerUnavailable -> keys-unavailable` sites in `_serve_held`: the ledger closes before the durable wait,
 #: or after it returns and before `send_gate` (B1 L1 #1)
@@ -300,8 +314,8 @@ def _exit_case(monkeypatch, exit_: str, *, end_stubbed: bool = False) -> dict:
             if exit_ == "detached":
                 real_admit = rig.k._admit_hold
 
-                def admit_then_detach(reg, pol):
-                    h = real_admit(reg, pol)
+                def admit_then_detach(*a):
+                    h = real_admit(*a)
                     rig.conn.detached = True   # a phase 1 landing right after the admit
                     return h
 
@@ -315,11 +329,10 @@ def _exit_case(monkeypatch, exit_: str, *, end_stubbed: bool = False) -> dict:
                     raise norm.Refused("upstream-error", "a response head keys refuses")
 
                 rig.k._response_frame = refuse_head
-                rig.front.feed_data(body_frames())
                 up.feed(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
             if exit_ == "upstream-failed":
-                rig.front.feed_data(body_frames())
                 up.feed(b"")   # EOF before a head
+            rig.front.feed_data(body_frames())
             task = box["task"] = rig.run(_q())
             if exit_ == "connect-lost":
                 await until(lambda: st["handshakes"] == 1)
@@ -332,10 +345,6 @@ def _exit_case(monkeypatch, exit_: str, *, end_stubbed: bool = False) -> dict:
                 for _ in range(20):
                     await asyncio.sleep(0)
                 ctl.gate.set()
-            elif exit_ == "resp-none":
-                await until(lambda: up.reads >= 1)
-                rig.front.feed_data(gwwire.encode(b"X"))
-                rig.front.feed_eof()
             elif exit_ == "cancel":
                 await until(lambda: up.reads >= 1)   # the head is sent: the hold is SENT
                 task.cancel()
@@ -362,7 +371,7 @@ def _exit_case(monkeypatch, exit_: str, *, end_stubbed: bool = False) -> dict:
     return _run(go)
 
 
-_SENT_EXITS = ("resp-none", "refused-before-r", "upstream-failed", "cancel")
+_SENT_EXITS = ("refused-before-r", "upstream-failed", "cancel")
 
 
 @pytest.mark.parametrize("exit_", EXITS)
@@ -432,32 +441,27 @@ def test_a_fenced_http_relay_is_uncertain_not_settled(monkeypatch):
     assert out["outcome"] == (L.UNCERTAIN, "ended")
 
 
-def test_a_fenced_websocket_is_uncertain_not_settled(monkeypatch):
-    # the websocket branch of the same: `_websocket` returns on "detached", and the hold is booked `uncertain {ended}`
+def test_a_websocket_upgrade_on_a_metered_route_is_refused_before_a_hold(monkeypatch):
+    # R4 §1.6 (b1_expected's websocket row): one exchange carries many responses, so no single usage settles it; the
+    # upgrade is refused at §1.7 step 1, before `A`: no connection, no `reserved` line, `F{body-unbounded:websocket}`
     from tests import test_broker_ws as WS
     up = _Up()
 
     async def go(d: str) -> dict:
-        _scripted(monkeypatch, up)
+        st = _scripted(monkeypatch, up)
         async with _Rig(d) as rig:
             holds = _capture(rig)
-            rig.front.feed_data(WS._gw(b"E"))   # the request's end; the front stays open
-            up.feed(WS._h101())
-            task = rig.run(WS._q())
-            await until(lambda: up.reads >= 2)   # the relay's `down` waits on the upstream after the 101
-            rig.k._fence_exchanges()
-            up.feed(WS._frame(1, b"after the fence"))
-            await asyncio.wait_for(task, 5)
-            await until(lambda: holds[0].state is L.RESOLVED)
-            out = {"frames": await rig.got(), "path": rig.ledger.path, "outcome": holds[0].outcome}
-        out["res"] = resolutions(out["path"])
-        out["seqs"] = [o["seq"] for o in file_lines(out["path"]) if o["kind"] == "reserved"]
+            rig.front.feed_data(WS._gw(b"E"))
+            await asyncio.wait_for(rig.run(dict(WS._q(), path="/v1/messages")), 5)
+            out = {"frames": await rig.got(), "path": rig.ledger.path, "holds": len(holds),
+                   "handshakes": st["handshakes"]}
+        out["kinds"] = [o["kind"] for o in file_lines(out["path"])]
         return out
 
-    out = WS._run(go)
-    assert _types(out["frames"]) == b"AU", out["frames"]   # the frame after the fence never reached the front
-    assert out["res"] == [("uncertain", out["seqs"][0], "ended")], out
-    assert out["outcome"] == (L.UNCERTAIN, "ended")
+    out = _run(go)
+    assert out["frames"] == [(b"F", gwwire.encode(b"F", {"refused": "body-unbounded:websocket"})[5:])], out["frames"]
+    assert out["holds"] == 0 and "reserved" not in out["kinds"]
+    assert out["handshakes"] == 0 and up.writes == []
 
 
 def test_a_misuse_at_the_send_gate_is_keys_unavailable(monkeypatch, caplog):
@@ -475,7 +479,6 @@ def test_a_misuse_at_the_send_gate_is_keys_unavailable(monkeypatch, caplog):
         async with _Rig(d) as rig:
             holds = _capture(rig)
             rig.front.feed_data(body_frames())
-            rig.front.feed_eof()
             task = rig.run(_q())
             await asyncio.wait([task], timeout=5)
             out = {"raised": None if task.cancelled() else task.exception(), "frames": await rig.got(),
@@ -531,7 +534,6 @@ def test_end_in_the_refusal_handler_does_not_raise(monkeypatch, ledger_state):
             holds = _capture(rig)
             hook["ledger"] = rig.ledger
             rig.front.feed_data(body_frames())
-            rig.front.feed_eof()
             up.feed(b"")   # EOF before a head
             task = rig.run(_q())
             await asyncio.wait([task], timeout=5)
@@ -585,9 +587,10 @@ def test_route_caps_are_per_route():
             pa, pb = k._route_policy(claims, "a"), k._route_policy(claims, "b")
             reg = types.SimpleNamespace(session="s1")
             seq = []
-            for pol in (pb, pa, pa, pb, pb):
+            # the holds are the calls' estimates: 900 on `b`, 100 on `a`, 100 on `b` (the ledger never shrinks one)
+            for pol, est in ((pb, 900), (pa, 100), (pa, 1), (pb, 100), (pb, 1)):
                 try:
-                    h = k._admit_hold(reg, pol)
+                    h = k._admit_hold(reg, pol, {}, est, "m1", {})
                     seq.append(h.amount)
                 except norm.Refused as r:
                     seq.append((r.name, r.status))
@@ -631,7 +634,7 @@ def test_no_ledger_and_ledger_errors_are_refusals(caplog):
                 else:
                     await led.aclose(2.0)
             try:
-                k._admit_hold(reg, pol)
+                k._admit_hold(reg, pol, {}, 1, "m1", {})
                 out.append("admitted")
             except norm.Refused as r:
                 out.append((r.name, r.detail))
@@ -664,7 +667,7 @@ def test_a_capless_route_is_no_scope():
             k = K.Keys(ledger=led, lib_root=d)
             pol = dataclasses.replace(k._route_policy({"routes": ["a"]}, "a"), max_session_microdollars=None)
             try:
-                k._admit_hold(types.SimpleNamespace(session="s1"), pol)
+                k._admit_hold(types.SimpleNamespace(session="s1"), pol, {}, 1, "m1", {})
                 got = "admitted"
             except norm.Refused as r:
                 got = (r.name, r.detail)

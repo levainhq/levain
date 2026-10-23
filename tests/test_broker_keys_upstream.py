@@ -272,7 +272,6 @@ def test_a_malformed_response_echoing_the_secret_never_reaches_a_log(monkeypatch
             async with _Rig(d) as rig:
                 rig.k.gw_log = log
                 rig.front.feed_data(body_frames())
-                rig.front.feed_eof()   # the front half-closes on reading `F`, which ends keys' drain
                 up.feed(_MALFORMED[where])
                 up.feed(b"")
                 await rig.run(_q())
@@ -404,7 +403,6 @@ def test_an_early_413_then_a_reset_relays_the_413(monkeypatch):
             big = big_body(4000)
             rig.front.feed_data(gwwire.encode(b"B", big[:3000]) + gwwire.encode(b"B", big[3000:])
                                 + gwwire.encode(b"E"))
-            rig.front.feed_eof()   # ends a refusal's drain, so the failure shows as `F`, not a hang
             await asyncio.wait_for(rig.run(_q("length:4000")), 5)
             return await rig.got()
 

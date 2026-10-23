@@ -712,10 +712,9 @@ def _keys_case(env, expires_at: int, vendor: bytes, *, seams=None, on_vendor_con
             setup(mp, cdir)
         w = C.CredWriter(cdir, seams=seams)
         async with kup._Rig(d, cred_lifecycle=w) as rig:
-            rig.front.feed_data(kup.gwwire.encode(b"E"))
-            rig.front.feed_eof()   # a refusal drains the front until EOF
+            rig.front.feed_data(kup.body_frames())
             up.feed(vendor)
-            await asyncio.wait_for(rig.run(kup._q("length:0")), 10)
+            await asyncio.wait_for(rig.run(kup._q()), 10)
             frames = await rig.got()
             await _settle(w)
             after = json.loads(open(os.path.join(cdir, "c1.json"), "rb").read())

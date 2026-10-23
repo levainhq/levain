@@ -2,12 +2,14 @@
 (design 1.5, session 3b-3a): keys' `R/keys/front.sock` server, the registration table, the two admission pools, the
 `F` path, the NOFILE floor, the process entry and its one shutdown trigger; and WHO MAY ASK (session 3b-3b): the admin
 server on `R/keys/admin.sock`; and the `Q` handler: its frame, token states and request path (the route against the
-token's claims, keys' own policy load, the re-checks, the 3c seams at their refusing defaults, the credential, and the
-request through `Upstream.write`); and the UPSTREAM half (session 3b-4): the address check, TLS through `upstream.py`,
-the h11 request and response, the relay `R` `b`* `e` through the redaction scanner, and keys' log `gw.jsonl` (one
-record per exchange, plus the `levain.broker` notes); and the reservation ledger's wiring (S1 3c-1, `ledger.py`): the
-request check's last step admits a hold against the route's per-session cap, the head goes only behind its durable
-`reserved` line and the ledger's send gate, and every exit resolves the hold.
+token's claims, keys' own policy load, the re-checks, the dispatch seam at its refusing default, the credential, and
+the request through `Upstream.write`); and the UPSTREAM half (session 3b-4): the address check, TLS through
+`upstream.py`, the h11 request and response, the relay `R` `b`* `e` through the redaction scanner, and keys' log
+`gw.jsonl` (one record per exchange, plus the `levain.broker` notes); and the reservation ledger's wiring (S1 3c-1,
+`ledger.py`): the request check's last step admits a hold against the route's per-session cap, the head goes only
+behind its durable `reserved` line and the ledger's send gate, and every exit resolves the hold; and the metered
+request path (S1 3c-2a, R4 §1.7, `codec.py`): the body buffered under a keys-wide budget, parsed, checked against the
+route's price table, its output ceiling written in, held at its estimate, and forwarded as keys' own serialization.
 
 Known edges of the ledger wiring (3c-1 B1 L2, 10-23; not built, never a loss):
 - before Python 3.12 a cancel landing in the loop turn the durable wait completes is lost (bpo-42130; reproduced on
@@ -74,7 +76,7 @@ from typing import Awaitable, Dict, List, Optional, Sequence, Set, Tuple, TypeVa
 
 import h11
 
-from levain.broker import gwwire, ledger, norm, upstream
+from levain.broker import codec, gwwire, ledger, norm, upstream
 from levain.broker.creds import (COMMIT_FDS, REFRESH_CONNS, CredLifecycle, CredStore, Credential, CredWriter,
                                  FakeCredLifecycle, check_host, fresh, on_upstream_401, unexpired)
 from levain.broker.gwwire import FrameReader, KeysSide, WireError
@@ -200,6 +202,15 @@ GW_LOG = ("keys", "log", "gw.jsonl")
 #: the reservation ledger, under the lib root (design 3c-1 §2.5): opened by `main()` before anything is bound
 LEDGER = ("keys", "ledger.jsonl")
 
+#: the keys-wide budget for buffered request bodies (R4 §1.7 step 2, r3 §2.2 c step 2), taken by actual bytes as they
+#: arrive. [judged by 1023+8 head, 10-23: one max-size body per session] r3 gives no value; the session share is a
+#: quarter of it and must be at least `policy.BODY_CAP_MAX`, or a max-size body could never be admitted.
+BODY_BUFFER_BUDGET = 128 * 1024 * 1024
+#: one session's share of BODY_BUFFER_BUDGET: a take past it ends that session's exchange, never another session's
+BODY_BUFFER_SESSION_MAX = BODY_BUFFER_BUDGET // 4
+#: the whole request body must arrive within this many seconds of `A`, else `body-timeout` (408)
+BODY_READ_S = 60.0
+
 
 def _at(t: float) -> str:
     return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -265,7 +276,7 @@ def install_log(lib_root: str) -> GwLog:
     return log
 
 
-# --- the seams 3c fills (design 1.11), with their refusing production defaults ------------------------------------
+# --- the seam 3c-4 fills (design 1.11) with its refusing production default; the body buffer ------------------------
 
 def no_dispatch_route(route: str) -> Optional[RoutePolicy]:
     """`dispatch_policy`'s production default until 3c: no dispatch map is loaded (RELOAD is refused), so it knows
@@ -273,14 +284,49 @@ def no_dispatch_route(route: str) -> Optional[RoutePolicy]:
     return None
 
 
-class NoCodec:
-    """`codec`'s production default until 3c: no codec exists, so a body passes through untouched and a ticketed
-    session's `Q` (its claims carry a `ticket`, a run) is refused `model-not-allowed`: no run goes out with an
-    unchecked model."""
+class BodyBuffer:
+    """The keys-wide budget for buffered request bodies (R4 §1.7 step 2): `used` bytes in all and per session. Every
+    take is a non-blocking try: one that cannot be granted ends THAT exchange `keys-unavailable` (503) and keeps
+    nothing, so no exchange waits holding bytes (no hold-and-wait, so no deadlock)."""
 
-    def check(self, run: object, route: RoutePolicy) -> None:
-        if run is not None:
-            raise norm.Refused("model-not-allowed", "no codec")
+    def __init__(self, budget: int = BODY_BUFFER_BUDGET, session_max: int = BODY_BUFFER_SESSION_MAX) -> None:
+        self.budget, self.session_max = budget, session_max
+        self.used = 0
+        self.by_session: Dict[str, int] = {}
+
+    def taker(self, session: str) -> "BodyTake":
+        return BodyTake(self, session)
+
+
+class BodyTake:
+    """One exchange's bytes in its BodyBuffer. `give_back` returns them all and is idempotent (not `release`: T4 reads
+    that name as a ledger call)."""
+
+    __slots__ = ("buf", "session", "n")
+
+    def __init__(self, buf: BodyBuffer, session: str) -> None:
+        self.buf, self.session, self.n = buf, session, 0
+
+    def take(self, n: int) -> None:
+        b = self.buf
+        mine = b.by_session.get(self.session, 0)
+        if b.used + n > b.budget or mine + n > b.session_max:
+            raise norm.Refused("keys-unavailable", "body buffer")
+        b.used += n
+        b.by_session[self.session] = mine + n
+        self.n += n
+
+    def give_back(self) -> None:
+        n, self.n = self.n, 0
+        if not n:
+            return
+        b = self.buf
+        b.used -= n
+        left = b.by_session.get(self.session, 0) - n
+        if left > 0:
+            b.by_session[self.session] = left
+        else:
+            b.by_session.pop(self.session, None)
 
 
 #: what an upstream connection's failure raises, each answered `upstream-error` (`upstream-timeout` for a deadline):
@@ -620,13 +666,16 @@ class Keys:
                  control_path: Optional[str] = None, lib_root: Optional[str] = None,
                  cred_lifecycle: Optional[CredLifecycle] = None, control_uid: Optional[int] = None,
                  ledger: Optional[ledger.Ledger] = None, dispatch_policy: object = None,
-                 codec: object = None, creds: Optional[CredStore] = None) -> None:
+                 creds: Optional[CredStore] = None) -> None:
         #: the reservation ledger (`main()` opens it; `_serve` attaches and closes it). None refuses every admit
         #: `budget-exhausted` "no ledger" (design 3c-1 §2.5, Q6)
         self.ledger = ledger
-        #: the seams 3c fills; each defaults to its refusing production default
+        #: the seam 3c-4 fills; it defaults to its refusing production default
         self.dispatch_policy = dispatch_policy if dispatch_policy is not None else no_dispatch_route
-        self.codec = codec if codec is not None else NoCodec()
+        #: the buffered request bodies' budget (R4 §1.7 step 2) and the body's read deadline from `A`; attributes so a
+        #: test can scale them down
+        self.body_buffer = BodyBuffer()
+        self.body_read_s = BODY_READ_S
         #: the credentials under `L/keys/cred`, opened at the first exchange that names one
         self.creds = creds
         #: gw.jsonl (`main()` opens it); None writes no exchange record
@@ -1257,17 +1306,22 @@ class Keys:
                 and self.regs.get(reg.front_uid) is reg and self.by_session.get(reg.session) is reg)
 
     async def _serve_q(self, conn: Conn, frames: FrameReader, side: KeysSide, q: dict) -> None:
-        """The `Q` handler: the token state, then the route against the token's claims and keys' OWN policy, the
-        request re-checked against that policy, the seams and the credential, then the request through the
-        exchange's `Upstream.write`. A stale or detached exchange ends with NO answer (its front connection is one of
-        phase 1's victims, which phase 2 closes)."""
+        """The `Q` handler: the token state, then the route against the token's claims and keys' OWN policy, then the
+        metered request path of R4 §1.7, in this order: (1) the `Q` re-checked against that policy, the credential and
+        the session's `budget-stopped` flag (`_check_q`); (2) the body buffer's take for a declared length; (3) `A`,
+        then the body collected into memory within `body_read_s` (`_collect_body`); (4)-(5) parse, check, the
+        ceiling written in, keys' own serialization, the head, the estimate and the ledger's admit, last
+        (`_check_request`, one synchronous call); (6)-(8) the upstream, the durable `reserved` line, the head and
+        body through `Upstream.write`, and the relay (`_serve_held`). A stale or detached exchange ends with NO
+        answer (its front connection is one of phase 1's victims, which phase 2 closes)."""
         out = await self._token_state(conn, q["token"])
         if out is None or conn.detached:
             return
         if "refused" in out:
             await self._refuse(conn, frames, side, out["refused"], UNTRUSTED_DRAIN_CAP)
             return
-        claims = out["answer"]["claims"]
+        entry = out["answer"]   # the claims-cache entry itself (3c-2b sets `budget_stopped` on it)
+        claims = entry["claims"]
         rec = conn.rec if conn.rec is not None else new_record(conn.reg.session, q)
         slot = claims.get("slot")
         rec["slot"] = slot if type(slot) is int else None
@@ -1277,6 +1331,9 @@ class Keys:
             await self._refuse(conn, frames, side, r.name, UNTRUSTED_DRAIN_CAP)
             return
         ff = FrontFrames(frames)
+        # the body's bytes in the keys-wide buffer: returned on every exit of this handler (the refusal before its
+        # drain), and by `_serve_held` once the body is written upstream
+        buf = self.body_buffer.taker(conn.reg.session)
         try:
             observed = None
             if pol.credential is not None:
@@ -1284,17 +1341,29 @@ class Keys:
                 # cancelling this exchange never cancels it); the credential `fresh` checked is the one the request
                 # is built with
                 observed = await fresh(self.cred_lifecycle, self._cred_store(), pol.credential)
-            head, hconn, cred, tpl, ws, hold = self._check_request(conn.reg, claims, pol, q,
-                                                                   observed)   # the ledger's admit is last
+            req = self._check_q(claims, entry, pol, q, observed)
+            raw = await self._collect_body(conn, ff, side, q, pol, buf, rec)
+            if raw is None:
+                buf.give_back()
+                ff.close()
+                return   # detached, or the front aborted before its `E`: nothing was reserved, nothing sent
+            head, hconn, cred, tpl, data, hold = self._check_request(conn.reg, entry, pol, req,
+                                                                     raw)   # the ledger's admit is last
         except norm.Refused as r:
-            await self._refuse(conn, frames, side, r.name, pol.body_cap)
+            buf.give_back()
+            await self._refuse(conn, ff, side, r.name, pol.body_cap)
+            ff.close()
             return
+        except BaseException:
+            buf.give_back()
+            ff.close()
+            raise
         # The hold is resolved explicitly on every exit, before anything after the exchange's work runs (the refusal's
         # drain, `release_exchange`, the record): `end()` releases an unsent hold and books a sent one `uncertain
         # {ended}`, and is a no-op after the relay's settle. No statement runs between the admit above and this try
         # (a tripwire holds it), and no ledger call sits in a `finally`; the ledger's owner callback is the backstop.
         try:
-            await self._serve_held(conn, ff, side, pol, rec, hold, head, hconn, cred, tpl, ws, q)
+            await self._serve_held(conn, ff, side, pol, rec, hold, head, hconn, cred, tpl, data, buf)
         except (norm.Refused, UpstreamFailed) as r:
             hold.end()
             if ff.responded:
@@ -1306,30 +1375,32 @@ class Keys:
             hold.end()   # a cancel, StaleExchange, any other raise: the same call, then the raise goes on
             raise
         else:
-            hold.end()   # every normal return (detached, connect lost, FrontAborted, no response); after a settle, a no-op
+            hold.end()   # every normal return (detached, connect lost, FrontAborted); after a settle, a no-op
         finally:
+            buf.give_back()
             ff.close()
 
     async def _serve_held(self, conn: Conn, ff: "FrontFrames", side: KeysSide, pol: RoutePolicy, rec: dict,
                           hold: ledger.Hold, head: bytes, hconn: "h11.Connection", cred: Optional[Credential],
-                          tpl: norm.Template, ws: Optional[Tuple[str, List[str]]], q: dict) -> None:
-        """The exchange from its admitted hold on: `A`, the upstream, the durable wait, the head behind the ledger's
-        send gate, the body and the response. A completed relay settles the hold at its full amount (3c-1: no cost
-        yet); every other exit is resolved by `_serve_q`. Once `R` is sent no `F` may follow (the wire's order), so a
-        failure after it ends the exchange with the front's connection closed mid-body (`ff.responded`)."""
+                          tpl: norm.Template, data: bytes, buf: "BodyTake") -> None:
+        """The exchange from its admitted hold on (R4 §1.7 steps 6-8): the upstream, the durable wait, the head behind
+        the ledger's send gate, keys' own serialization of the body (`data`, the length the head declared) and the
+        response. `A` and the body came before the admit (`_collect_body`). A completed relay settles the hold at its
+        full amount (3c-2b settles from usage); every other exit is resolved by `_serve_q`. Once `R` is sent no `F`
+        may follow (the wire's order), so a failure after it ends the exchange with the front's connection closed
+        mid-body (`ff.responded`)."""
         rec["template"] = tpl.path
         scanner = Scanner([cred.secret.encode("latin-1")] if cred is not None else [])
+        ws: Optional[Tuple[str, List[str]]] = None   # a metered route refuses every upgrade at `_check_q`
         try:
             if conn.detached:   # a detached exchange answers nothing
                 return
-            # `A` once the exchange is accepted and before the upstream opens (design 1.3); from here keys reads the
-            # front while it connects, so an abort that arrives before the head is written stops the request
-            conn.writer.write(_A)
-            await conn.writer.drain()
+            # from here keys reads the front while it connects, so an abort that arrives before the head is written
+            # stops the request
             up = await self._open_upstream(conn, ff, side, pol, rec)
             if up is None:
                 return   # the front aborted (`X`) or went away during the connect: nothing went upstream
-            # the hold's `reserved` line durable before the head can go (its flush overlaps `A` and the connect)
+            # the hold's `reserved` line durable before the head can go (its flush overlaps the connect)
             try:
                 await hold.durable()
             except ledger.LedgerUnavailable as e:
@@ -1357,10 +1428,8 @@ class Keys:
                 await upstream_step(send_head())
             except FrontAborted:
                 return
-            upgrade = q["upgrade"] == "websocket"
-            resp = await self._upload_and_head(ff, side, up, hconn, q["body"], pol.body_cap, rec, upgrade=upgrade)
-            if resp is None:
-                return   # the front aborted (`X`) or went away before `E`: nothing to answer
+            resp = await self._upload_and_head(up, hconn, data, rec)
+            buf.give_back()   # the body is written: its bytes leave the buffer budget
             if isinstance(resp, h11.InformationalResponse):   # a 101, returned only to a websocket request
                 assert ws is not None   # a 101 is returned only to a websocket request
                 u_frame = self._upgrade_frame(resp, pol, ws, scanner)
@@ -1394,8 +1463,8 @@ class Keys:
                              rec: dict) -> Optional[Upstream]:
         """The exchange's `Upstream`, or None when the front aborted first: the resolve, the connect and the TLS
         handshake run as one task, raced with the front's next frame. `X`, EOF or a bad frame cancels them (a
-        connection already made is stored on the exchange, which the release aborts); a `B` or `E` is left for the
-        upload, so keys holds no more than that one frame."""
+        connection already made is stored on the exchange, which the release aborts). The body's `E` was read before
+        the admit (R4 §1.7), so the only frame the wire still allows is `X`."""
         assert pol.upstream is not None   # a brokered route always names one
         host = pol.upstream.host
         loop = asyncio.get_running_loop()
@@ -1422,31 +1491,23 @@ class Keys:
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)   # a race lost to the abort: its outcome is dropped
 
-    async def _upload_and_head(self, ff: "FrontFrames", side: KeysSide, up: Upstream, hconn: "h11.Connection",
-                               body: str, cap: int, rec: dict, *, upgrade: bool = False) -> Optional[object]:
-        """The request body up and the response head down, AT ONCE: an upstream may answer before it has read the
-        body (a 401 or a 413) and stop reading, so the final head ends the upload. Returns that head (for a websocket
-        request, an upstream's 101 is the head returned), or None when the front aborted before its body ended. The
-        head's deadline starts at the request's last byte (design 1.6); while the body is still going up, the head
-        waits as long as the upload does. A 101 never ends the upload: the front's request `E` must be read first
-        (else it would be taken as the websocket's own end), within `head_timeout_s`, else `upstream-error`."""
-        upload = asyncio.ensure_future(self._forward_body(ff, side, up, hconn, body, cap, rec))
-        head = asyncio.ensure_future(upstream.read_head(up, hconn, None, upgrade=upgrade))
+    async def _upload_and_head(self, up: Upstream, hconn: "h11.Connection", data: bytes,
+                               rec: dict) -> object:
+        """The request body (keys' buffered serialization, `data`) up and the response head down, AT ONCE: an upstream
+        may answer before it has read the body (a 401 or a 413) and stop reading, so the final head ends the upload.
+        Returns that head. The head's deadline starts at the request's last byte (design 1.6); while the body is
+        still going up, the head waits as long as the upload does."""
+        upload = asyncio.ensure_future(self._send_body(up, hconn, data, rec))
+        head = asyncio.ensure_future(upstream.read_head(up, hconn, None))
         try:
             await asyncio.wait({upload, head}, return_when=asyncio.FIRST_COMPLETED)
-            if (not upload.done() and head.done() and not head.cancelled() and head.exception() is None
-                    and isinstance(head.result(), h11.InformationalResponse)):
-                await asyncio.wait({upload}, timeout=self.head_timeout_s)   # neither cancels nor raises the upload
-                if not upload.done():
-                    raise norm.Refused("upstream-error", "upgrade before the request ended")
             if upload.done():
                 # an upstream that answers (a 413) and then resets fails the upload too; when its head has already
-                # been read, the head wins over that failure (the front's abort and keys' own refusal still stand)
+                # been read, the head wins over that failure (keys' own refusal still stands)
                 if (isinstance(upload.exception(), UpstreamFailed) and head.done() and not head.cancelled()
                         and head.exception() is None):
                     return head.result()
-                if not upload.result():   # the body's own refusal or upstream failure raises here
-                    return None
+                upload.result()   # the upload's failure raises here
                 if not head.done():
                     await upstream_step(asyncio.wait_for(asyncio.shield(head), self.head_timeout_s))
             return await upstream_step(head)
@@ -1725,35 +1786,33 @@ class Keys:
                           type(e).__name__)
         return self.creds is not None
 
-    def _check_request(self, reg: Registration, claims: dict, pol: RoutePolicy, q: dict,
-                       observed: Optional[Credential]
-                       ) -> Tuple[bytes, "h11.Connection", object, norm.Template, Optional[Tuple[str, List[str]]],
-                                  ledger.Hold]:
-        """keys' own re-check of the `Q` against ITS policy (the front's verdict is never taken), then the seams and
-        the credential; returns the request head, the h11 client that wrote it (it frames the body and parses the
-        response), the credential (or None), the matched template, for a websocket `Q` the handshake's (key,
-        offered protocols) read from the re-checked headers (`ws_handshake`; None otherwise), which the 101 is
-        checked against, and the admitted hold. Order: target and template, headers (strict: a forbidden, consumed
-        or off-list name is `policy-header`), the declared length against `body_cap`, the codec, the credential and
-        its host binding, the ledger's admit last (a hold is admitted only for a request that goes out). The
-        credential is `observed`, the one `fresh` observed and checked for the route's `credential`: it is not
-        observed again."""
+    def _check_q(self, claims: dict, entry: dict, pol: RoutePolicy, q: dict,
+                 observed: Optional[Credential]) -> tuple:
+        """R4 §1.7 step 1: keys' own re-check of the `Q` against ITS policy (the front's verdict is never taken), with
+        no reservation and no request head. Order: a route with no price table (a base `/1` map's) is
+        `model-not-allowed`, and a ticketed run is `model-not-allowed` until its model is checked against the ticket
+        (3c-5); a websocket upgrade is `body-unbounded:websocket` (one exchange carries many responses, no one usage
+        settles it); target and template; headers (strict: a forbidden, consumed or off-list name is
+        `policy-header`); the declared length against `body_cap`; the credential and its host binding; the session's
+        `budget-stopped` flag (`budget-overrun`). Returns (method, path, query, the re-checked headers, the template,
+        the credential or None). The credential is `observed`, the one `fresh` observed and checked for the route's
+        `credential`: it is not observed again."""
+        if pol.prices is None:
+            raise norm.Refused("model-not-allowed", "route is not priced")
+        if claims.get("ticket") is not None:
+            raise norm.Refused("model-not-allowed", "a ticketed run's model is checked from 3c-5")
+        if q["upgrade"] == "websocket":
+            codec.refuse_upgrade()
         try:
             method, path = q["method"].encode("ascii"), q["path"].encode("ascii")
             query = q["query"].encode("ascii") or None
         except UnicodeEncodeError:
             raise norm.Refused("malformed", "target") from None
         tpl = norm.match_template(pol.templates, method, path, query)
-        upgrade = q["upgrade"] == "websocket"
-        if upgrade and tpl.upgrade != "websocket":
-            raise norm.Refused("malformed", "upgrade")
         fwd = norm.check_headers([(n, v) for n, v in q["headers"]], pol.headers or {}, upgrade_ok=False, strict=True)
         body = q["body"]
-        # keys re-checks the handshake it will send (the front's verdict is not taken), once, on the lowercased names
-        ws = ws_handshake(fwd, body) if upgrade else None
         if body.startswith("length:") and int(body[len("length:"):]) > pol.body_cap:
             raise norm.Refused("body-cap", "length")
-        self.codec.check(claims.get("ticket"), pol)
         cred = None
         if pol.credential is not None:
             if observed is None or observed.name != pol.credential:
@@ -1763,29 +1822,55 @@ class Keys:
             check_host(cred, pol.upstream.host, pol.route)
             if any(n == cred.header for n, _ in fwd):
                 raise norm.Refused("policy-header", cred.header)
-        head, hconn = request_head(pol, method, path, query, fwd, body, cred, upgrade=upgrade)
-        hold = self._admit_hold(reg, pol)   # the last step: see `_serve_q`
-        return head, hconn, cred, tpl, ws, hold
+        if entry.get("budget_stopped"):
+            raise norm.Refused("budget-overrun", "the session is stopped")
+        return method, path, query, fwd, tpl, cred
 
-    def _admit_hold(self, reg: Registration, pol: RoutePolicy) -> ledger.Hold:
-        """The ledger's synchronous admit against the route's per-session cap, scope ("session-route", session,
-        route). The bound is the frozen rule `min(max_call, room)` (the room alone with no `max_call`); `price_ref`
-        is the route id until 3c-2a prices a call. The ledger's own errors become refusals: `budget-exhausted` (402),
-        and `keys-unavailable` (503) for an unhealthy or closing ledger and, noted, for a misuse."""
+    def _check_request(self, reg: Registration, entry: dict, pol: RoutePolicy, req: tuple,
+                       raw: bytes) -> Tuple[bytes, "h11.Connection", object, norm.Template, bytes, ledger.Hold]:
+        """R4 §1.7 steps 4-5, ONE synchronous call (no `await` anywhere in it): the body codec's parse of the buffered
+        body, its `check` (the model has a price entry; on a dispatch-shaped route, one with no per-session cap, the
+        unboundable shapes are `body-unbounded:<what>`), the ceiling written in where absent, the estimate, keys' own
+        serialization (the bytes that go upstream), the request head (`content-length` = that serialization's length,
+        whatever framing the `Q` declared), and the ledger's admit LAST (a hold is admitted only for a request that
+        goes out). A `RecursionError` anywhere in these steps is `body-json`, with no hold taken. Returns the request
+        head, the h11 client that wrote it (it frames the body and parses the response), the credential (or None),
+        the matched template, the body bytes, and the admitted hold. `req` is `_check_q`'s answer."""
+        method, path, query, fwd, tpl, cred = req
+        c = codec.CODECS[pol.body_codec]   # a priced route's codec is never `none` (`policy.parse_base_map`)
+        obj = c.parse(raw)
+        checked = codec.guarded(c.check, obj, pol.prices, dispatch=pol.max_session_microdollars is None)
+        codec.guarded(c.write_ceiling, obj, checked.price)
+        estimate = codec.guarded(c.estimate, obj, checked.price)
+        data = codec.guarded(codec.serialize, obj)
+        head, hconn = request_head(pol, method, path, query, fwd, "length:%d" % len(data), cred)
+        # an interactive route admits content the estimate cannot see, marked on its `reserved` line (R4 §1.6)
+        meta = {"bound": "unproven"} if checked.unproven else {}
+        hold = self._admit_hold(reg, pol, entry, estimate, checked.model, meta)   # the last step: see `_serve_q`
+        return head, hconn, cred, tpl, data, hold
+
+    def _admit_hold(self, reg: Registration, pol: RoutePolicy, entry: dict, estimate: int, price_ref: str,
+                    meta: dict) -> ledger.Hold:
+        """The ledger's synchronous admit of `estimate` (R4 §1.2's estimate, never shrunk: a hold that does not fit the
+        room is `budget-exhausted`) against the route's per-session cap, scope ("session-route", session, route);
+        `price_ref` is the priced model. The session's `budget-stopped` flag is read again as the statement right
+        before the admit, with no `await` since `_check_q` read it, because the body read can take up to
+        `body_read_s` in between. The ledger's own errors become refusals: `budget-exhausted` (402), and
+        `keys-unavailable` (503) for an unhealthy or closing ledger and, noted, for a misuse."""
         if self.ledger is None:
             raise norm.Refused("budget-exhausted", "no ledger")
         cap = pol.max_session_microdollars
-        if cap is None:   # a dispatch route (unreachable in 3c-1: no dispatch map is loaded)
+        if cap is None:   # a dispatch route (unreachable in 3c-2a: no dispatch map is loaded)
             raise norm.Refused("budget-exhausted", "no scope")
-        max_call = pol.max_call_microdollars
-        if max_call is not None:
-            def bound(room: int) -> int:
-                return min(max_call, room)
-        else:
-            def bound(room: int) -> int:
-                return room
+
+        def bound(room: int) -> int:
+            return estimate   # above the room, the ledger refuses it `budget-exhausted`
+
+        if entry.get("budget_stopped"):
+            raise norm.Refused("budget-overrun", "the session is stopped")
         try:
-            return self.ledger.admit(("session-route", reg.session, pol.route), cap, bound, price_ref=pol.route)
+            return self.ledger.admit(("session-route", reg.session, pol.route), cap, bound, price_ref=price_ref,
+                                     meta=meta)
         except ledger.Refused as e:
             raise norm.Refused(e.name, e.detail) from None
         except ledger.LedgerUnavailable as e:
@@ -1794,39 +1879,68 @@ class Keys:
             _note(logging.WARNING, "levain gw-keys: ledger misuse at admit (%s)", e)
             raise norm.Refused("keys-unavailable", "ledger misuse") from None
 
-    async def _forward_body(self, frames: "FrontFrames", side: KeysSide, up: Upstream, hconn: "h11.Connection",
-                            body: str, cap: int, rec: dict) -> bool:
-        """The front's `B` frames through `up.write`, framed as the head declared, until `E` (True) or `X` / EOF
-        (False); an upstream failure raises UpstreamFailed. keys counts the bytes itself: past `cap` is `body-cap`, a
-        `length:n` body of any other size, or any
-        body on a `none` request, is `malformed`."""
+    async def _collect_body(self, conn: Conn, ff: "FrontFrames", side: KeysSide, q: dict, pol: RoutePolicy,
+                            buf: "BodyTake", rec: dict) -> Optional[bytes]:
+        """R4 §1.7 steps 2-3: the buffer budget, `A`, then the front's `B` frames into memory until `E` (the body) or
+        `X` / EOF / a frame the wire refuses (None, nothing reserved); None too for a detached exchange (no `A`). A
+        declared length is taken from `buf` before `A`, a chunked body per `B` frame as it arrives (`keys-unavailable`
+        when the take cannot be granted). keys counts the bytes itself: past `body_cap` is `body-cap`, a `length:n`
+        body of any other size, or any body on a `none` request, is `malformed`; the whole body must arrive within
+        `body_read_s` of `A`, else `body-timeout`."""
+        body = q["body"]
         want = int(body[len("length:"):]) if body.startswith("length:") else None
+        if want is not None:
+            buf.take(want)
+        if conn.detached:   # a detached exchange answers nothing
+            return None
+        # `A` once the exchange is accepted (design 1.3): the front's body follows it
+        conn.writer.write(_A)
+        await conn.writer.drain()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.body_read_s
+        parts: List[bytes] = []
         got = 0
         while True:
-            fr = await frames.read(side.allowed())
+            left = deadline - loop.time()
+            if left <= 0:
+                raise norm.Refused("body-timeout", "body read")
+            try:
+                fr = await asyncio.wait_for(ff.read(side.allowed()), left)
+            except asyncio.TimeoutError:
+                raise norm.Refused("body-timeout", "body read") from None
+            except (WireError, asyncio.IncompleteReadError, ConnectionError):
+                return None   # a read that failed is the front's abort (`FrontFrames.aborted`)
             if fr is None:
-                return False
+                return None
             ftype, payload = fr
             side.got(ftype)
             if ftype == b"X":
-                return False
+                return None
             if ftype == b"E":
                 break
             assert isinstance(payload, bytes)
             got += len(payload)
             if body == "none" or (want is not None and got > want):
                 raise norm.Refused("malformed", "body length")
-            if got > cap:
+            if got > pol.body_cap:
                 raise norm.Refused("body-cap", "body")
+            if want is None:
+                buf.take(len(payload))
+            parts.append(payload)
             rec["bytes_up"] = got
-            if payload:
-                await upstream_send(up, h11_bytes(hconn, h11.Data(data=payload)))   # framed as the head declared
         if want is not None and got != want:
             raise norm.Refused("malformed", "body length")
-        tail = h11_bytes(hconn, h11.EndOfMessage())   # the last chunk of a chunked body; nothing for the other framings
+        return b"".join(parts)
+
+    async def _send_body(self, up: Upstream, hconn: "h11.Connection", data: bytes, rec: dict) -> None:
+        """`data` through `up.write`, framed as the head declared (`content-length` = its length), then h11's end of
+        message; an upstream failure raises UpstreamFailed."""
+        if data:
+            await upstream_send(up, h11_bytes(hconn, h11.Data(data=data)))
+        tail = h11_bytes(hconn, h11.EndOfMessage())   # nothing for a content-length body; kept for the framing's sake
         if tail:
             await upstream_send(up, tail)
-        return True
+        rec["bytes_up"] = len(data)
 
     async def _token_state(self, conn: Conn, token: str) -> Optional[dict]:
         """`{"answer": {"session", "claims"}}`, `{"refused": name}`, or None for a stale exchange (no answer). A
@@ -1927,8 +2041,9 @@ class Keys:
     async def _refuse(self, conn: Conn, frames: Union[FrameReader, "FrontFrames"], side: KeysSide, name: str,
                       cap: int) -> None:
         """The `F` path: `F`, SHUT_WR, then read and discard the front's frames until `E`, `X`, EOF, `cap` body bytes
-        read after the `F`, or DRAIN_S; the caller closes. So `F` is never cut off by a close with unread bytes. A
-        detached exchange is answered nothing (phase 2 closes its connection)."""
+        read after the `F`, or DRAIN_S (no drain once the front's `E` was read); the caller closes. So `F` is never
+        cut off by a close with unread bytes. A detached exchange is answered nothing (phase 2 closes its
+        connection)."""
         if conn.detached:
             return
         if conn.rec is not None and conn.rec["refused"] is None:
@@ -1937,6 +2052,8 @@ class Keys:
         w.write(gwwire.encode(b"F", {"refused": name}))
         if w.can_write_eof():
             w.write_eof()
+        if b"E" not in side.allowed():
+            return   # the front's request already ended (§1.7 reads the body before any upstream step): nothing to drain
         loop = asyncio.get_running_loop()
         deadline, got = loop.time() + DRAIN_S, 0
         while got < cap:
