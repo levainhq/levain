@@ -45,8 +45,8 @@ from levain.slot.root_intent import PhaseFailed
 from levain.slot.intent import (INTENT_PATH, Intent, install_lock, intent_remove_step, intent_text, intent_write_step,
                                 read_intent, write_intent_atomically)
 from levain.slot.accounts import (SLOT_MARKER, SLOT_RETIRED_MARKER, Account, Group, account_steps, accounts_of,
-                                  delete_group_steps, membership_pairs, membership_steps, revive_steps,
-                                  shared_group_steps, shared_groups_of, tombstone_steps, member_state, group_state,
+                                  membership_pairs, membership_steps, revive_steps,
+                                  shared_group_steps, shared_groups_of, member_state, group_state,
                                   account_state, remove_member_steps, remove_group_steps, remove_account_steps)
 from levain.slot.grammar import LEASE_EXEMPT, SESSION_RE, VERBS, InstallCommand, check_roots, parse_install_argv
 from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS, SLOT_NAME_RE, Allocation,
@@ -59,7 +59,7 @@ from levain.slot.layout import (STORE, Row, base_routes_steps, base_run_rows, ba
                                 pool_config_undo_steps, reserve_row, reserve_steps, roots_steps, row_steps,
                                 run_dir_undo_steps, single_filesystem_steps, slot_rows, tmpfiles_steps,
                                 tmpfiles_undo_steps, ungroup_steps, entry_state, remove_entry_steps)
-from levain.slot.sudoers import (remove_dropin_steps, remove_install_sudoers_steps, remove_runtime_sudoers_steps,
+from levain.slot.sudoers import (INSTALL_SUDOERS, RUNTIME_SUDOERS, remove_dropin_steps,
                                  sudoers_paths, sudoers_steps)
 
 OPERATOR_FORMAT = "levain-operator/1"
@@ -763,19 +763,36 @@ def _end_processes(host: HostOS, uid: int, name: str, *,
     return True, ""
 
 
+def _undo_unit_order(host: HostOS, names: Iterable[str]) -> list[str]:
+    """Undo stops units in reverse start order: a recorded name this code does not ship first (sorted), then the
+    shipped ones in reverse of :data:`units.SERVICES`."""
+    shipped = [s.name for s in reversed(units.services_for(host))]
+    names = set(names)
+    return sorted(names - set(shipped)) + [n for n in shipped if n in names]
+
+
 def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, int],
-              shared_groups: Iterable[str]) -> InstallPlan:
+              shared_groups: Mapping[str, int], live: RM.Live | None = None,
+              end: Callable[[int, str], tuple[bool, str]] | None = None) -> InstallPlan:
     """``accounts``: every live Levain account the directory service holds, name -> uid (== gid);
-    ``shared_groups``: the shared groups present. Order (§23): the runtime sudoers rule first (no new
-    runtime-helper calls), every service stopped and its unit removed, ids retired, processes stopped,
-    accounts tombstoned, every dir naming a shared group given back to root's group, the shared groups
-    deleted, slot confinement removed (Linux netns + the slots' bwrap + tmpfiles.d; macOS the slots'
-    lo0 aliases, the pf rules and pf's enable reference), the install sudoers rule, the intent journal,
-    the operator record LAST. Every step is safe to re-run. The store and the root import tree stay.
-    With a journal (§25), the accounts and groups it names that are present at their journaled ids are
-    tombstoned and deleted with the rest. With no operator record and a SETUP journal (the setup died
-    before its record), undo runs against the journal alone, for its operator, and ends by removing the
-    journal: there is no record to remove."""
+    ``shared_groups``: the shared groups present, name -> their live gid.
+
+    Row 33 R1b: undo removes ``record.managed ∪ journal.managed`` plus its own desired set (what this code would manage
+    for those accounts and groups, so a host with no record undoes as before), each record through its kind's
+    per-identity remove step with ``retire=False`` (§1.1 g: undo retires no gid), in the order of CONTRACT §23: the
+    runtime sudoers rule first (and every other recorded drop-in but the install rule: no new runtime-helper calls),
+    every unit stopped (reverse start order) before any unit file is removed, slot state and pool config, the account
+    ids retired, each account's processes ended and proven then the account tombstoned, every dir naming a shared
+    group given back to root's group, the memberships, the groups deleted, slot confinement (macOS the lo0 aliases,
+    the pf anchor and pf's enable reference; Linux the AppArmor profile, the bwrap copy, the netns, then tmpfiles.d
+    and R), the install record, the install sudoers rule, the intent journal, the operator record LAST. A live read
+    precedes every act (ABSENT: nothing run; NOT_OURS: left in place), so every step is safe to re-run. The store and
+    the root import tree stay: ``entry/1`` records are not undo's. ``live``: every live read and act of the remove
+    steps; ``end``: the account kind's proven process end.
+
+    With a journal (§25), the accounts and groups it names that are present at their journaled ids are undone with
+    the rest. With no operator record and a SETUP journal (the setup died before its record), undo runs against the
+    journal alone, for its operator, and ends by removing the journal: there is no record to remove."""
     if cmd.verb != "undo":
         raise Refused("wrong-verb", cmd.verb)
     abandoned = _abandoned_setup(facts)
@@ -788,12 +805,12 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         # §25 (c7.7a): only the journal speaks for what that setup made, so the directory service's
         # reports are set aside and the journal's own names, at their journaled ids, are undone.
         operator = abandoned.operator
-        accounts, shared_groups = {}, ()
+        accounts, shared_groups = {}, {}
     check_records(facts, operator)
     host = facts.host
     check_account_ids(host, accounts)
     accounts = dict(accounts)
-    journaled_groups: list[str] = []
+    groups = {g: i for g, i in shared_groups.items() if g in SHARED_GROUPS}
     if facts.intent is not None:
         # §25: whatever an interrupted run made at its journaled ids goes with the rest, a Linux shared
         # group with no label included. A journaled name present at another id is not ours: left alone.
@@ -801,41 +818,56 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         for name, i in ours.items():
             if name in facts.intent.accounts:
                 accounts.setdefault(name, i)
-            else:
-                journaled_groups.append(name)
+            elif name in SHARED_GROUPS:
+                groups.setdefault(name, i)
         check_account_ids(host, accounts)
-    groups = list(dict.fromkeys(g for g in (*shared_groups, *journaled_groups) if g in SHARED_GROUPS))
-    retired_after = frozenset(facts.retired) | frozenset(accounts.values())
+    desired = desired_managed(host, accounts=accounts, shared=groups, operator=operator,
+                              services=[s.name for s in units.services_for(host)], slots=slots_of(accounts),
+                              apparmor=host == "linux")
+    shape, journal = facts.install_shape, facts.intent
+    every = (set(shape.managed) if shape is not None else set()) | (set(journal.managed) if journal else set()) | desired
+    every = {r for r in every if r[0] != "entry/1"}               # the root import tree stays (§23)
+    live = live if live is not None else RM.Live()
+    end = end or (lambda uid, name: _end_processes(host, uid, name))
+
+    def of(kind: str) -> list:
+        return sorted((r for r in every if r[0] == kind), key=repr)
+
+    def remove(records: Iterable, phase: str) -> list[Step]:
+        return [s for k, i in records
+                for s in _kind_steps(host, k, i, phase, live, retire=False, held=False, end=end)]
+
+    install_rule = ("sudoers/1", INSTALL_SUDOERS.name)
+    grants = sorted((r for r in of("sudoers/1") if r != install_rule), key=lambda r: (r[1] != RUNTIME_SUDOERS.name, r[1]))
+    unit_recs = [("unit/1", n) for n in _undo_unit_order(host, (i for _, i in of("unit/1")))]
+    uids = {i[0]: i[1] for _, i in of("account/1")}
+    retired_after = frozenset(facts.retired) | frozenset(uids.values())
     path = RETIRED_IDS_PATH[host]
     mkdir = "/bin/mkdir" if host == "darwin" else _abs("mkdir")
     rm = "/bin/rm" if host == "darwin" else _abs("rm")
     steps: list[Step] = [
-        *remove_runtime_sudoers_steps(host),
-        # Every service stops before anything is removed; their unit files go with them.
-        *units.uninstall_steps(host),
+        *remove(grants, "R5"),                      # the runtime rule first: no new runtime-helper calls
+        *remove(unit_recs, "R5"),                   # every unit stopped before anything is removed
+        *remove(unit_recs, "R12"),                  # then their files
         # With the services stopped nothing rewrites them: no slot reads as reusable from here on.
-        *slot_state_undo_steps(host, slots_of(accounts)),
+        *slot_state_undo_steps(host, slots_of(uids)),
         *pool_config_undo_steps(host),
         Step(f"create {path.parent}", (mkdir, "-p", "-m", "755", str(path.parent))),
         Step("retire every account id so none is reissued", write=(path, retired_ids_text(retired_after), 0o644)),
+        *remove(of("account/1"), "R7"),             # per account: its processes ended and proven, then the tombstone
+        *ungroup_steps(host, operator),
+        *remove(of("member/1"), "R7"),
+        *remove(of("group/1"), "R7"),               # retire=False: undo never retires a gid (§1.1 g)
     ]
-    for name, uid in sorted(accounts.items()):
-        steps.append(Step(f"stop every process of {name}, and check they are gone",
-                          call=lambda u=uid, n=name: _end_processes(host, u, n)))
-    for name in sorted(accounts):
-        steps += tombstone_steps(host, name)
-    steps += ungroup_steps(host, operator)
-    steps += delete_group_steps(host, groups)
-    # Slot confinement goes only after every slot process is stopped and its account tombstoned.
+    # Slot confinement goes only after every slot process is stopped and its account tombstoned; the lo0 aliases
+    # before the pf rules guarding them are flushed (§24), and the anchor before pf's enable reference.
+    steps += removal_steps(host, [r for r in every if REMOVE_PHASES[r[0]] == ("R8",)], "R8", live=live, retire=False,
+                           end=end)
     if host == "linux":
-        steps += (netns.netns_undo_steps(slots_of(accounts)) + bwrap.bwrap_undo_steps() + tmpfiles_undo_steps()
-                  + run_dir_undo_steps(host))
-    else:
-        # The slots' lo0 aliases go before the rules guarding them are flushed (§24).
-        steps += pf.alias_undo_steps(slots_of(accounts)) + pf.unload_steps()
+        steps += tmpfiles_undo_steps() + run_dir_undo_steps(host)
     # Row 33 §1.1: the install record goes before the last three acts (the install rule, the journal, the record).
     steps.append(Step("remove the install record", (rm, "-f", str(install_shape_path(host)))))
-    steps += remove_install_sudoers_steps(host)
+    steps += remove([install_rule], "R5")           # the install rule LAST: until it goes, a failed undo re-runs
     # Just before the record (§25): until undo is complete a re-run still reads what the journal names.
     steps.append(intent_remove_step(host))
     if abandoned is None:
@@ -989,7 +1021,8 @@ def _slot_managed(host: HostOS, accts: Iterable[Account], shared: Mapping[str, i
     setup's and repair's desired set and for what replenish adds (U16)."""
     accts = tuple(accts)
     out: set = {("account/1", (a.name, a.uid)) for a in accts}
-    out |= {("member/1", (a, g, shared[g])) for a, g in membership_pairs(accts, operator)}
+    # A group with no gid here has none to name (an undo re-run after the groups went): its pairs went with it.
+    out |= {("member/1", (a, g, shared[g])) for a, g in membership_pairs(accts, operator) if g in shared}
     if host == "darwin":
         out |= {("pf-alias/1", loopback_alias(s)) for s in slots if s.slot_class == "egress"}
     else:
@@ -1704,7 +1737,7 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
         repair = _repair_facts(cmd, host, d, accounts, in_service or {}, skips=skips)
         return Gathered(facts, accounts, quiesce=q, repair=repair)
     if cmd.verb == "undo":
-        return Gathered(facts, accounts, shared, quiesce=q)
+        return Gathered(facts, accounts, {g: d.groups[g] for g in shared}, quiesce=q)
     if in_service is not None:
         wanted = {n for cls, idx in in_service.items() for i in idx for n in SlotId(cls, i).accounts}  # type: ignore[arg-type]
         return Gathered(facts, {n: u for n, u in accounts.items() if n in wanted}, live=in_service, quiesce=q,

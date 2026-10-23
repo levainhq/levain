@@ -198,6 +198,12 @@ def membership_pairs(accounts: Iterable[Account], operator: str | None) -> list[
     return pairs
 
 
+@dataclass(frozen=True)
+class LeaveGroupsStep(Step):
+    """The macOS tombstone's "out of every group" act: the one callback :func:`tombstone_steps` emits, marked by its
+    type so :func:`remove_account_steps` routes it to its live body by type, never by matching its ``why`` text."""
+
+
 def tombstone_steps(host: HostOS, name: str) -> list[Step]:
     """Retire an account in place: its id stays reserved, it can never log in, it is in no group but
     its own (CONTRACT §1.1 'never reissued'). The retired label is the LAST act: until it is on, the
@@ -213,7 +219,7 @@ def tombstone_steps(host: HostOS, name: str) -> list[Step]:
                  (*_DSCL, "-create", u, "AuthenticationAuthority", ";DisabledUser;")),
             Step(f"tombstone {name}: hidden", (*_DSCL, "-create", u, "IsHidden", "1")),
             Step(f"tombstone {name}: no home", (*_DSCL, "-create", u, "NFSHomeDirectory", NO_HOME[host])),
-            Step(f"take {name} out of every group", call=lambda n=name: _darwin_leave_groups(n)),
+            LeaveGroupsStep(f"take {name} out of every group", call=lambda n=name: _darwin_leave_groups(n)),
             Step(f"tombstone {name}: labelled (last)", (*_DSCL, "-create", u, "RealName", SLOT_RETIRED_MARKER[host])),
         ]
     return [
@@ -224,17 +230,8 @@ def tombstone_steps(host: HostOS, name: str) -> list[Step]:
     ]
 
 
-def delete_group_steps(host: HostOS, names: Iterable[str]) -> list[Step]:
-    steps = []
-    for g in names:
-        argv = (*_DSCL, "-delete", f"/Groups/{g}") if host == "darwin" else (_abs("groupdel"), g)
-        # Skipped when already gone, so a failed undo re-runs (CONTRACT §23).
-        steps.append(Step(f"delete the shared group {g}", argv, skip_if=_absent("group", host, g)))
-    return steps
-
-
-__all__ = ["Account", "Group", "OPERATOR_GROUPS", "SINGLETONS", "SLOT_MARKER", "SLOT_RETIRED_MARKER",
-           "accounts_of", "account_steps", "delete_group_steps", "group_members", "membership_pairs",
+__all__ = ["Account", "Group", "LeaveGroupsStep", "OPERATOR_GROUPS", "SINGLETONS", "SLOT_MARKER", "SLOT_RETIRED_MARKER",
+           "accounts_of", "account_steps", "group_members", "membership_pairs",
            "membership_steps", "revive_steps", "shared_group_steps", "shared_groups_of", "supplementary_groups",
            "tombstone_steps"]
 
@@ -389,10 +386,12 @@ def remove_account_steps(host: HostOS, name: str, uid: int, *, live: "Live",
             live.fault("account/1:after-retire")
         return end(uid, name)
 
-    steps = [remove_step(f"retire {name}'s uid {uid}, then stop every process of {name}", record, live, classify,
+    first = f"retire {name}'s uid {uid}, then stop every process of {name}" if retire else \
+        f"stop every process of {name}, and check they are gone"
+    steps = [remove_step(first, record, live, classify,
                          retire_then_end, tools=reads)]
     for i, s in enumerate(tombstone_steps(host, name)):
-        if s.call is not None and s.why != f"take {name} out of every group":   # a new callback needs a live body here
+        if s.call is not None and not isinstance(s, LeaveGroupsStep):   # a new callback needs a live body here
             raise AssertionError(f"tombstone step {s.why!r} has a callback remove_account_steps cannot route")
         body = leave_groups if s.call is not None else (lambda s=s: live.act(s.argv))
         tools = (*reads, _DSEDITGROUP) if s.call is not None else (*reads, s.argv[0])

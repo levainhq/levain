@@ -121,20 +121,8 @@ def bwrap_steps(*, apparmor_userns_restricted: bool, source: str | None = None) 
     return steps
 
 
-def bwrap_undo_steps() -> list[Step]:
-    """Unload and remove OUR profile only (never hands' ``levain-bwrap``), then the copy and its record."""
-    test = _abs("test")
-    return [
-        Step(f"unload the AppArmor profile {APPARMOR_PROFILE_NAME}",
-             (_abs("apparmor_parser"), "-R", str(APPARMOR_PROFILE)), skip_if=(test, "!", "-e", str(APPARMOR_PROFILE))),
-        Step(f"remove {APPARMOR_PROFILE}", (_abs("rm"), "-f", str(APPARMOR_PROFILE))),
-        Step(f"remove {LEVAIN_BWRAP}", (_abs("rm"), "-f", str(LEVAIN_BWRAP))),
-        Step(f"remove {BWRAP_DIGEST}", (_abs("rm"), "-f", str(BWRAP_DIGEST))),
-    ]
-
-
 __all__ = ["APPARMOR_PROFILE", "APPARMOR_PROFILE_NAME", "BWRAP_DIGEST", "BWRAP_GROUP", "BWRAP_MODE", "LEVAIN_BWRAP", "USERNS_SYSCTL",
-           "apparmor_profile_text", "bwrap_steps", "bwrap_undo_steps", "copy_steps", "digest_record_text",
+           "apparmor_profile_text", "bwrap_steps", "copy_steps", "digest_record_text",
            "file_sha256", "record_digest", "system_bwrap", "userns_restricted"]
 
 

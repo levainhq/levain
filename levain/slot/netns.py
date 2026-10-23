@@ -54,15 +54,7 @@ def netns_steps(slots: Iterable[SlotId]) -> list[Step]:
     return steps
 
 
-def netns_undo_steps(slots: Iterable[SlotId]) -> list[Step]:
-    """Delete each slot's namespace if present. Run after every slot process is stopped."""
-    ip = _ip()
-    return [Step(f"delete the network namespace {s.netns}", (ip, "netns", "delete", s.netns),
-                 skip_if=netns_absent(s.netns))
-            for s in sorted(set(slots))]
-
-
-__all__ = ["netns_absent", "netns_present", "netns_steps", "netns_undo_steps"]
+__all__ = ["netns_absent", "netns_present", "netns_steps"]
 
 
 def netns_state(name: str, live: "Live") -> str:

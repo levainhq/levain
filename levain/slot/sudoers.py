@@ -69,17 +69,6 @@ def _rm(host: HostOS) -> str:
     return "/bin/rm" if host == "darwin" else _abs("rm")
 
 
-def remove_runtime_sudoers_steps(host: HostOS) -> list[Step]:
-    """Undo's FIRST step (CONTRACT §23): no new runtime-helper calls."""
-    return [Step(f"remove {RUNTIME_SUDOERS} (no new runtime-helper calls)", (_rm(host), "-f", str(RUNTIME_SUDOERS)))]
-
-
-def remove_install_sudoers_steps(host: HostOS) -> list[Step]:
-    """Undo's last removal before the operator record (CONTRACT §23): until it goes, a failed undo
-    re-runs through the install helper."""
-    return [Step(f"remove {INSTALL_SUDOERS} (the install helper's rule, last)", (_rm(host), "-f", str(INSTALL_SUDOERS)))]
-
-
 def sudoers_paths() -> tuple[Path, Path]:
     return RUNTIME_SUDOERS, INSTALL_SUDOERS
 

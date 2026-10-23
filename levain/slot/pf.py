@@ -270,26 +270,9 @@ def alias_steps(slots: Iterable[SlotId]) -> list[Step]:
             for s in sorted(set(slots)) if s.slot_class == "egress"]
 
 
-def alias_undo_steps(slots: Iterable[SlotId]) -> list[Step]:
-    """Remove each egress slot's lo0 alias if lo0 still has it. Run after every slot process is stopped."""
-    return [Step(f"remove the lo0 alias {loopback_alias(s)} of {s.tag}", (IFCONFIG, "lo0", "-alias", loopback_alias(s)),
-                 skip_if=alias_absent(loopback_alias(s)))
-            for s in sorted(set(slots)) if s.slot_class == "egress"]
-
-
-def unload_steps() -> list[Step]:
-    """Flush the sub-anchor, release Levain's enable reference, remove both files."""
-    return [
-        Step(f"flush the pf anchor {ANCHOR}", (PFCTL, "-a", ANCHOR, "-F", "all")),
-        Step(f"release pf's enable reference (the token in {PF_TOKEN})", call=lambda: release_enable_reference()),
-        Step(f"remove {ANCHOR_FILE}", ("/bin/rm", "-f", str(ANCHOR_FILE))),
-        Step(f"remove {PF_TOKEN}", ("/bin/rm", "-f", str(PF_TOKEN))),
-    ]
-
-
 __all__ = ["ANCHOR", "ANCHOR_FILE", "GWPORT_BASE", "IFCONFIG", "PFCTL", "PF_OPTIMIZE", "PF_TOKEN", "PF_TOKEN_GONE", "alias_absent", "alias_present",
-           "alias_steps", "alias_undo_steps", "anchor_rules", "anchor_text", "gwport", "load_steps",
-           "release_enable_reference", "take_enable_reference", "unload_steps"]
+           "alias_steps", "anchor_rules", "anchor_text", "gwport", "load_steps",
+           "release_enable_reference", "take_enable_reference"]
 
 
 # --- row 33 R1b: removal by the RECORDED identity (§1.1 table rows 6-8) --------------------------------------------

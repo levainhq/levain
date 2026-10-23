@@ -297,35 +297,9 @@ def install_steps(host: HostOS, services: Iterable[Service], *, run: Callable[..
     return steps
 
 
-def uninstall_steps(host: HostOS) -> list[Step]:
-    """Stop every service in reverse start order, then remove the unit files. Every service, installed
-    or not: each step is a no-op for one that is absent, so a failed undo re-runs."""
-    steps: list[Step] = []
-    if host == "darwin":
-        for s in reversed(services_for(host)):
-            label = launchd_label(s)
-            steps += [
-                Step(f"stop {label}", ("/bin/launchctl", "bootout", f"system/{label}"), allow_fail=True),
-                Step(f"check {label} is stopped", call=lambda lb=label: _launchd_job_absent(lb, wait_s=LAUNCHD_UNLOAD_WAIT_S)),
-            ]
-        steps += [Step(f"remove {launchd_path(s)}", ("/bin/rm", "-f", str(launchd_path(s)))) for s in services_for(host)]
-        return steps
-    systemctl, test, rm = _abs("systemctl"), _abs("test"), _abs("rm")
-    for name in reversed(start_order(host)):
-        steps.append(Step(f"stop and disable {name}", (systemctl, "disable", "--now", name),
-                          skip_if=(test, "!", "-e", str(systemd_path(name)))))
-    steps += [Step(f"remove {systemd_path(n)}", (rm, "-f", str(systemd_path(n)))) for n in start_order(host)]
-    steps.append(Step("tell systemd", (systemctl, "daemon-reload")))
-    # A unit whose last run failed keeps a `failed` row after its file is gone (the 1d VM run); clearing it
-    # is best-effort: a unit systemd holds no record of answers non-zero, and nothing later depends on it.
-    steps += [Step(f"clear systemd's failed record of {n}", (systemctl, "reset-failed", n), allow_fail=True)
-              for n in start_order(host)]
-    return steps
-
-
 __all__ = ["SERVICES", "Service", "argv", "built_services", "by_name", "install_steps", "launchd_label",
            "launchd_plist_text", "program_relpath", "program_source", "services_for", "start_order",
-           "systemd_name", "systemd_unit_text", "uninstall_steps"]
+           "systemd_name", "systemd_unit_text"]
 
 
 # --- row 33 R1b: a unit removed by its RECORDED name (§1.1 table row 1) -------------------------------------------
