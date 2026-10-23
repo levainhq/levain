@@ -25,6 +25,7 @@
   <button type="button" role="tab" id="tab-board" data-view="board" aria-selected="false">Board</button>
   <button type="button" role="tab" id="tab-notes" data-view="notes" aria-selected="false">Notifications</button>
   <button type="button" role="tab" id="tab-grants" data-view="grants" aria-selected="false">Grants</button>
+  <button type="button" role="tab" id="tab-drop" data-view="drop" aria-selected="false">Drop</button>
 </nav>
 <div id="view-needs">
 <p id="status" class="status" role="status">reading the queue…</p>
@@ -44,6 +45,40 @@
 <section id="grants" class="view" hidden>
   <p id="grants-status" class="status" role="status">reading the grants…</p>
   <div id="grants-list"></div>
+</section>
+<section id="drop" class="view" hidden>
+  <div class="card warm drop-sheet">
+    <h2>drop to the coordinator</h2>
+    <textarea id="drop-words" class="drop-words" rows="4" aria-label="your words to the coordinator"
+              placeholder="what you want done; send it and go"></textarea>
+    <details id="drop-env" class="drop-env">
+      <summary>with an envelope, signed with your passkey</summary>
+      <label class="field">where it may work (a repo on the laptop)
+        <input id="drop-repo" list="drop-repos" type="text" autocapitalize="off" autocorrect="off" spellcheck="false"
+               placeholder="/absolute/path/to/repo"></label>
+      <datalist id="drop-repos"></datalist>
+      <label class="field">land onto (a branch; leave empty for no land)
+        <input id="drop-onto" type="text" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="main"></label>
+      <label class="field">stop after
+        <select id="drop-stop"><option>1h</option><option selected>2h</option><option>4h</option><option>8h</option>
+          <option>12h</option><option>24h</option></select></label>
+      <div class="field-row">
+        <label class="field">tool calls <input id="drop-calls" type="number" min="0" inputmode="numeric" placeholder="0"></label>
+        <label class="field">tokens <input id="drop-tokens" type="number" min="0" inputmode="numeric" placeholder="0"></label>
+        <label class="field">hours <input id="drop-hours" type="number" min="0" inputmode="numeric" placeholder="0"></label>
+      </div>
+      <div id="drop-review" class="drop-review" hidden></div>
+    </details>
+    <div class="acts" id="drop-acts">
+      <button type="button" id="drop-send" class="go">Send</button>
+      <button type="button" id="drop-sign">Review envelope</button>
+    </div>
+    <div id="drop-note" class="note" role="status"></div>
+  </div>
+  <div class="panel-head"><h2>outbox</h2><span id="drop-outbox-meta" class="meta"></span></div>
+  <div id="drop-outbox"></div>
+  <div class="panel-head"><h2>sent from the phone</h2><span id="drop-recent-meta" class="meta"></span></div>
+  <div id="drop-recent"></div>
 </section>
 <script src="/phone_app.js"></script>
 <script src="/phone.js"></script>

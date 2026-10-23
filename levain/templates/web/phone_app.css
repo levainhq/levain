@@ -90,3 +90,24 @@ button.go { background: var(--accent); color: var(--on-accent); border-color: va
 .ping .title { margin-top: var(--sp-2); }
 /* four tabs (M17 added Grants): each tab is as wide as its word, never broken inside one ("Notificati|ons" at 390) */
 .tabs button { flex: 1 1 auto; overflow-wrap: normal; white-space: nowrap; padding-inline: 8px; }
+/* the Drop tab (coordinator C1/C2): the sheet reuses the card, the request inputs and the row cards; nothing new to look at */
+.drop-sheet textarea.drop-words, .drop-sheet input, .drop-sheet select { width: 100%; box-sizing: border-box; min-height: var(--hit-min);
+  margin-top: var(--sp-2); font: 15px/1.4 var(--round); color: inherit; background: var(--card-2); border: 1px solid var(--hair-2);
+  border-radius: var(--r-md); padding: 10px; }
+.drop-sheet textarea.drop-words { margin-top: var(--sp-3); }
+.drop-sheet details.drop-env { margin-top: var(--sp-4); }
+.drop-sheet details.drop-env > summary { min-height: var(--hit-min); display: flex; align-items: center; cursor: pointer;
+  font: 600 14px/1.3 var(--round); color: var(--label); }
+.drop-sheet .field { display: block; margin-top: var(--sp-3); font-size: 13px; color: var(--label); }
+.drop-sheet .field-row { display: flex; gap: var(--sp-3); }
+.drop-sheet .field-row .field { flex: 1 1 0; min-width: 0; }
+.drop-sheet .acts { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin-top: var(--sp-4); }
+.drop-sheet .acts button { flex: 1 1 8rem; }
+.drop-review { margin-top: var(--sp-4); padding-top: var(--sp-4); border-top: 1px dashed var(--hair-2); }
+.drop-review .display { user-select: text; }   /* what the passkey signs: selectable, so it can be copied out and checked */
+.row.drop.outbox { border-top: 2px solid var(--accent); }   /* not delivered yet: it still waits on this phone */
+.row.drop.outbox.refused { border-top-color: var(--warn); }
+.row.drop .receipt { margin-top: var(--sp-2); }
+/* five tabs (the Drop tab): the row scrolls sideways inside itself before a word breaks or the page widens */
+.tabs { overflow-x: auto; }
+.tabs button { padding-inline: 6px; }

@@ -22,6 +22,10 @@ it serves only these:
     cancelled, or a recommended one's run authorised and landed, with a passkey, verified by the job store against the same one
     cockpit as the sign requests; ``consent.json`` lists the live jobs as ``dispatch_pending``, with ``dispatch_note``
     (why the store could not be read) and ``dispatch_overflow`` (:mod:`levain.dispatch.phone`).
+  - ``POST /coord/drop`` and ``/coord/envelope-challenge``: the drop sheet (coordinator C1/C2): a drop delivered to the
+    store ``levain drop`` writes, resent from the phone's outbox under its one ``outbox_id`` until it is delivered,
+    optionally carrying a structured envelope signed with a passkey and verified by that store; ``consent.json`` lists
+    the newest phone drops and their drop receipts as ``coord_drops`` (:mod:`levain.coordinator.phone`).
   - ``POST /grant/<id>/revoke-challenge`` and ``.../revoke``: a consent grant revoked with a passkey made on the
     https name (the one authority link a passkey may sign), the challenge naming the grant's ``instance`` as listed,
     the link built and held here and verified by the authority log itself;
@@ -95,6 +99,7 @@ _SIGN_PREFIX = "/sign/"
 _SIGN_ACTIONS = ("challenge", "answer", "deny")
 _DISPATCH_ROUTE = re.compile(
     r"/dispatch/(dj-[0-9a-f]{32})/(challenge|answer|cancel-challenge|cancel|authorise-challenge|authorise)")
+_COORD_ROUTE = re.compile(r"/coord/(drop|envelope-challenge)")
 _GRANT_PREFIX = "/grant/"
 _GRANT_ACTIONS = ("revoke-challenge", "revoke")
 _MAX_BODY = 16 * 1024          # an assertion is well under 2 KB, an answer record under 1 KB
@@ -395,9 +400,10 @@ class _PhoneHandler(GuardedHandler):
         question = _QUESTION_ROUTE.fullmatch(route)
         note = _NOTE_ROUTE.fullmatch(route)
         dispatch = _DISPATCH_ROUTE.fullmatch(route)
+        coord = _COORD_ROUTE.fullmatch(route)
         grant = _grant_route(route)
         if (consent is None and sign is None and question is None and note is None and dispatch is None
-                and grant is None and route != _KEY_LINE):
+                and coord is None and grant is None and route != _KEY_LINE):
             if not self._app_post(route):
                 self._reject(404, "not_found", "no such route")
             return
@@ -425,6 +431,8 @@ class _PhoneHandler(GuardedHandler):
         waits = ((consent is not None and consent[1] in ("answer", "rule")) or (sign is not None and sign[1] == "answer")
                  or (question is not None and question.group(2) == "rule")
                  or (dispatch is not None and dispatch.group(2) in ("answer", "cancel", "authorise"))
+                 # a drop waits too: the outbox resends it anyway, but one carrying a signed envelope holds a ceremony
+                 or (coord is not None and coord.group(1) == "drop")
                  or (grant is not None and grant[1] == "revoke"))
         if not (self.server.request_gate.acquire(timeout=5) if waits else self.server.request_gate.acquire(blocking=False)):
             self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503)
@@ -436,6 +444,8 @@ class _PhoneHandler(GuardedHandler):
                 result = self.server.sign_step(sign[0], sign[1], req)
             elif dispatch is not None:
                 result = self.server.dispatch_step(dispatch.group(1), dispatch.group(2), req)
+            elif coord is not None:
+                result = self.server.coord_step(coord.group(1), req)
             elif grant is not None:
                 result = self.server.grant_step(grant[0], grant[1], req)
             elif question is not None and question.group(2) == "rule":
@@ -495,6 +505,9 @@ class _PhoneServer(ThreadingHTTPServer):
         from levain.consent.grant_phone import GrantPhone
 
         self.grants = GrantPhone(queue_dir, rp_id, self.page_origin, self._sign_keys, self._sign_root)
+        from levain.coordinator.phone import CoordPhone
+
+        self.coord = CoordPhone(dispatch_dir, rp_id, self.page_origin, self._sign_keys)
         self._phone_app: Any = None
         self._app_lock = threading.Lock()
         self._redeems: list[float] = []
@@ -646,7 +659,7 @@ class _PhoneServer(ThreadingHTTPServer):
                 "pending": rows, "undecided": undecided, "overflow": listing.overflow,
                 "enrolled": self._enrolled(memo), "sign_pending": sign_pending, "sign_note": sign_note,
                 "sign_overflow": sign_overflow, "dispatch_pending": dispatch_pending, "dispatch_note": dispatch_note,
-                "dispatch_overflow": dispatch_overflow, **self.grants.listing()}
+                "dispatch_overflow": dispatch_overflow, **self.grants.listing(), **self.coord.listing()}
 
     def _questions(self) -> "tuple[list[dict[str, Any]], int, str]":
         """The open questions (oldest first, capped like the pending list), how many were left out, and a note when
@@ -883,6 +896,15 @@ class _PhoneServer(ThreadingHTTPServer):
         try:
             return self.dispatch.step(job_id, action, req)
         except DispatchRefused as exc:
+            raise PhoneError(exc.status, exc.error, exc.message) from None
+
+    def coord_step(self, action: str, req: Any) -> dict[str, Any]:
+        """``/coord/<action>`` (:meth:`levain.coordinator.phone.CoordPhone.step`)."""
+        from levain.coordinator.phone import CoordRefused
+
+        try:
+            return self.coord.step(action, req)
+        except CoordRefused as exc:
             raise PhoneError(exc.status, exc.error, exc.message) from None
 
     def _enrolled(self, memo: "dict[Path, list[str] | str]") -> list[str]:
