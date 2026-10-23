@@ -32,12 +32,17 @@ huge blob named as a directory is refused from its probe and never streamed [jud
 §6.1 2a's "``--batch-check`` then ``--batch``": the same two answers from one process per store, git >= 2.36, the floor
 is 2.39.4]. A commit is parsed only up to its ``tree`` line; the rest of its one response is drained unparsed; a
 commit whose probed size passes :data:`verify_caps.COMMIT_OBJECT_MAX` is refused ``preview-cap:commits`` (detail
-``object-size``) from its probe. There is no work cap: V30's time and memory caps bound a hostile fan (§6.1 2a "Cost").
+``object-size``) from its probe. Every tree ``contents`` counts against V30's expanded-output cap
+(:data:`verify_caps.EXPANDED_OUTPUT_CAP`, read at each check): before each ``contents`` request for a tree, the reader
+refuses ``preview-cap:output`` if that tree's whole response (``<oid> tree <size>\n<payload>\n``, from its probe), added
+to every tree response it already read, would pass the cap, so no tree past it is ever streamed (L3 r1, codex +
+complement MED). There is no work cap: V30's time and memory caps bound a hostile fan (§6.1 2a "Cost").
 """
 from __future__ import annotations
 
 import re
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
@@ -101,6 +106,7 @@ class Stats:
     reparses: int = 0           # a tree parsed a second time (always 0: the memo)
     memo_hits: int = 0
     bytes_parsed: int = 0       # tree payloads + commit header lines
+    bytes_out: int = 0          # tree responses counted against the expanded-output cap
     bytes_drained: int = 0      # the rest of each commit's response, read unparsed
     max_frames: int = 0
     max_pending: int = 0        # the peak pending frontier: subtree oids waiting in every frame
@@ -125,8 +131,19 @@ class _Store:
         self.label = label
         self.hexlen = hexlen
         self._head = re.compile(rb"([0-9a-f]{%d}) (commit|tree|blob|tag) (0|[1-9][0-9]{0,19})\n" % hexlen)
-        self.p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        self.p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                   env=importer.git_env(runner.work), cwd=str(runner.work), close_fds=True)
+        self._err: List[bytes] = []
+        self._drain = threading.Thread(target=importer._drain, args=(self.p.stderr, self._err), daemon=True)
+        self._drain.start()
+
+    def _fatal(self, detail: str) -> importer.Fatal:
+        """A failure with cat-file's last stderr line (``GitRunner``'s bounded stderr reader, the ``_must`` tail): the
+        process is reaped first, so its stderr is whole."""
+        self.close()
+        err = b"".join(self._err).decode("utf-8", "replace")
+        last = (err.strip().splitlines() or [""])[-1][:300]
+        return importer.Fatal(None, f"{detail}; stderr: {last}" if last else detail)
 
     def _ask(self, cmd: str, oid: str) -> Optional[Tuple[str, int]]:
         assert self.p.stdin is not None and self.p.stdout is not None
@@ -134,13 +151,13 @@ class _Store:
             self.p.stdin.write(f"{cmd} {oid}\n".encode("ascii"))
             self.p.stdin.flush()
         except (BrokenPipeError, OSError):
-            raise importer.Fatal(None, f"cat-file ({self.label}) is gone") from None
+            raise self._fatal(f"cat-file ({self.label}) is gone") from None
         line = self.p.stdout.readline(self.hexlen + 32)
         if line == f"{oid} missing\n".encode("ascii"):
             return None
         m = self._head.fullmatch(line)
         if m is None or m.group(1).decode("ascii") != oid:
-            raise importer.Fatal(None, f"cat-file ({self.label}) answered {line[:80]!r}")
+            raise self._fatal(f"cat-file ({self.label}) answered {line[:80]!r}")
         return m.group(2).decode("ascii"), int(m.group(3))
 
     def info(self, oid: str) -> Optional[Tuple[str, int]]:
@@ -149,18 +166,18 @@ class _Store:
     def _open(self, oid: str, kind: str, size: int) -> None:
         got = self._ask("contents", oid)
         if got != (kind, size):
-            raise importer.Fatal(None, f"cat-file ({self.label}) contents {got!r} after probe {(kind, size)!r}")
+            raise self._fatal(f"cat-file ({self.label}) contents {got!r} after probe {(kind, size)!r}")
 
     def _read(self, n: int) -> bytes:
         assert self.p.stdout is not None
         out = self.p.stdout.read(n)
         if len(out) != n:
-            raise importer.Fatal(None, f"cat-file ({self.label}) ended inside an object")
+            raise self._fatal(f"cat-file ({self.label}) ended inside an object")
         return out
 
     def _end(self) -> None:
         if self._read(1) != b"\n":
-            raise importer.Fatal(None, f"cat-file ({self.label}) object not followed by a newline")
+            raise self._fatal(f"cat-file ({self.label}) object not followed by a newline")
 
     def tree(self, oid: str, size: int) -> bytes:
         self._open(oid, "tree", size)
@@ -182,7 +199,7 @@ class _Store:
         self._end()
         if len(head) != want or not head.startswith(b"tree ") or head[-1:] != b"\n" \
                 or not re.fullmatch(rb"[0-9a-f]+", head[5:-1]):
-            raise importer.Fatal(None, f"commit {oid}: no tree line first")   # index-pack's fsck refuses this first
+            raise Refused("fsck:other", f"commit {oid}: no tree line first")   # index-pack's fsck refuses it first
         return head[5:-1].decode("ascii")
 
     def close(self) -> None:
@@ -197,6 +214,7 @@ class _Store:
         except subprocess.TimeoutExpired:
             self.p.kill()
             self.p.wait()
+        self._drain.join()
 
 
 @dataclass
@@ -227,7 +245,8 @@ def read_trees(q: importer.GitRunner, b: importer.GitRunner, inventory: Path, he
                ids: Optional[Sequence[str]] = None, max_depth: int = walkframe.MAX_DEPTH,
                offset: Optional[int] = None, log=None) -> Stats:
     """2a over Q (and B for lookups): returns the counts, or raises :class:`Refused` (``fsck:<id>``,
-    ``fsck:other``, ``preview-cap:tree-depth``, ``preview-cap:commits``, ``preview-graph-unresolved``)."""
+    ``fsck:other``, ``preview-cap:tree-depth``, ``preview-cap:commits``, ``preview-cap:output``,
+    ``preview-graph-unresolved``)."""
     ids = tuple(fsck_ids.reader_ids() if ids is None else ids)
     unknown = set(ids) - CHECKED_IDS
     if unknown:
@@ -247,10 +266,13 @@ def read_trees(q: importer.GitRunner, b: importer.GitRunner, inventory: Path, he
             bs.close()
     finally:
         qs.close()
-        if log is not None:
+        if log is not None:                 # the log never changes the verdict (L3 r1: ENOSPC here replaced it)
             from levain.contracts import canon
-            log.write(b"reader: " + canon.canonical_bytes(stats.as_dict()) + b"\n")
-            log.flush()
+            try:
+                log.write(b"reader: " + canon.canonical_bytes(stats.as_dict()) + b"\n")
+                log.flush()
+            except OSError:
+                pass
     return stats
 
 
@@ -277,6 +299,12 @@ def _walk(qs: _Store, bs: _Store, commits: List[str], q_tree_objs: List[str], id
         if oid in parsed:
             stats.reparses += 1
         parsed.add(oid)
+        cost = len(oid) + len(" tree ") + len(str(size)) + 1 + size + 1
+        cap = verify_caps.EXPANDED_OUTPUT_CAP
+        if stats.bytes_out + cost > cap:
+            raise Refused("preview-cap:output", f"tree {oid}: the reader's tree output would reach "
+                                                f"{stats.bytes_out + cost} bytes > {cap}")
+        stats.bytes_out += cost
         payload = store.tree(oid, size)
         stats.parses += 1
         stats.bytes_parsed += len(payload)

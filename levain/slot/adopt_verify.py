@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
@@ -189,6 +190,83 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+class _Inventory:
+    """The ONE writer of every oid inventory in ``scratch/`` (the files :data:`verify_caps.INVENTORY_LINE_EXTRA`
+    names): a write that takes the file past its :func:`verify_caps.inventory_share` of the image budget is
+    ``preview-cap:output`` (L3 r1 codex MED: a tree in a tiny pack can name millions of absent oids, which ``closure``
+    lists). ``objects``: both packs' header counts, the sum root sized the image from."""
+
+    def __init__(self, path: Path, objects: int, hexlen: int) -> None:
+        self.path = path
+        self.cap = verify_caps.inventory_share(path.name, objects, hexlen)
+        self.n = 0
+        self._buf = bytearray()
+        self.fd = importer._new_file(path)
+
+    def write(self, data: bytes) -> None:
+        self.n += len(data)
+        if self.n > self.cap:
+            raise Refused("preview-cap:output", f"scratch/{self.path.name} passes its share of the image, "
+                                                f"{self.cap} bytes")
+        self._buf += data
+        if len(self._buf) >= _CHUNK:
+            self.flush()
+
+    def flush(self) -> None:
+        view = memoryview(self._buf)
+        while view:
+            view = view[os.write(self.fd, view):]
+        del view
+        self._buf.clear()
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            try:
+                self.flush()
+            finally:
+                os.close(self.fd)
+                self.fd = -1
+
+    def __enter__(self) -> "_Inventory":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def _to_inventory(r: importer.GitRunner, inv: _Inventory, *args: str, stdin: Optional[Path] = None) -> None:
+    """A git's stdout into ``inv`` through a pipe, so the bounded writer sees every byte. Past the share the pump stops
+    reading and closes the pipe (git dies on it); the refusal, or the writer's own OSError (ENOSPC), wins over git's
+    exit."""
+    rfd, wfd = os.pipe()
+    failed: List[BaseException] = []
+
+    def pump() -> None:
+        try:
+            while True:
+                b = os.read(rfd, _CHUNK)
+                if not b:
+                    break
+                inv.write(b)
+        except (Refused, OSError) as e:
+            failed.append(e)
+        finally:
+            os.close(rfd)
+
+    t = threading.Thread(target=pump, daemon=True)
+    t.start()
+    try:
+        rc, _out, err = _g(r, *args, stdout_fd=wfd, stdin=stdin)
+    finally:
+        os.close(wfd)
+        t.join()
+    if failed:
+        raise failed[0]
+    if rc != 0:
+        last = (err.strip().splitlines() or [""])[-1]
+        raise importer.Fatal(None, f"git {args[0]} rc {rc}: {last[:300]}")
+
+
 def _to_file(r: importer.GitRunner, path: Path, *args: str, stdin: Optional[Path] = None) -> None:
     fd = importer._new_file(path)
     try:
@@ -205,12 +283,13 @@ def _oid_lines(path: Path, hexlen: int, what: str) -> Iterator[str]:
             yield line.decode("ascii")
 
 
-def _commit_gate(q: importer.GitRunner, scratch: Path) -> Tuple[int, Path]:
+def _commit_gate(q: importer.GitRunner, scratch: Path, objects: int, hexlen: int) -> Tuple[int, Path]:
     """2a's gate: Cq, the commits in Q, from Q's inventory (``%(objectname) %(objecttype)``, no content read); above
     :data:`MAX_COMMITS` = ``preview-cap:commits`` before any commit is read. Returns Cq and the inventory, the tree
     reader's roots (its commits and tree objects)."""
     inv = scratch / "q-types"
-    _to_file(q, inv, "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)")
+    with _Inventory(inv, objects, hexlen) as w:
+        _to_inventory(q, w, "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)")
     with importer._read_own(inv) as fh:
         cq = sum(1 for line in importer._lines(fh, "the inventory") if line.endswith(b" commit"))
     if cq > MAX_COMMITS:
@@ -219,7 +298,7 @@ def _commit_gate(q: importer.GitRunner, scratch: Path) -> Tuple[int, Path]:
 
 
 def _required(p: importer.GitRunner, q: importer.GitRunner, scratch: Path, tips: Sequence[str], *, result: str,
-              base_oid: str, hexlen: int) -> Tuple[Path, set, bool]:
+              base_oid: str, hexlen: int, objects: int) -> Tuple[Path, set, bool]:
     """Step 4's REQUIRED set, written sorted (``LC_ALL=C sort -T <scratch>``) to a file; returns it and the
     special oids and whether the walk met an absent object. DELTA: ``closure_P(tips) - closure_P(base)`` plus the
     adopt special set over the trees of that closure (:func:`special_paths.adopt_specials`, the importer's own function: one function, both callers);
@@ -230,49 +309,30 @@ def _required(p: importer.GitRunner, q: importer.GitRunner, scratch: Path, tips:
     differs: 2.43.0 dies (rc 128, ``fatal: bad object``) where 2.50.1 prints ``?<tip>``. That case never reaches
     this walk: :func:`quarantine_verify` runs ``cat-file -t`` on every tip first and refuses
     ``bundle-tip-not-commit`` (row ``test_an_absent_tip_parent_or_tree_refuses_by_name_not_verifier_failed[tip-absent]``)
-    [judged by linuxvm, 10-22, against the probe in that raw file]. Other git versions are not measured."""
+    [judged by linuxvm, 10-22, against the probe in that raw file]. Other git versions are not measured. Every
+    inventory here goes through :class:`_Inventory` (``objects``: its share's count)."""
     raw = scratch / "closure"
     r, extra = (p, ("--not", base_oid)) if result == "delta" else (q, ())
-    _to_file(r, raw, "rev-list", "--objects", "--no-object-names", "--missing=print", *tips, *extra)
+    with _Inventory(raw, objects, hexlen) as w:
+        _to_inventory(r, w, "rev-list", "--objects", "--no-object-names", "--missing=print", *tips, *extra)
     present = scratch / "closure-present"
     req = scratch / "required-unsorted"
     absent = False
-    with importer._read_own(raw) as fh, open(present, "xb") as pf, open(req, "xb") as rf:
-        for line in importer._lines(fh, "rev-list"):
-            oid = line[1:] if line[:1] == b"?" else line
-            if len(oid) != hexlen or not re.fullmatch(rb"[0-9a-f]+", oid):
-                raise importer.Fatal(None, "rev-list printed a line that is not an oid")
-            rf.write(oid + b"\n")
-            if line[:1] == b"?":
-                absent = True
-            else:
-                pf.write(oid + b"\n")
-    specials: set = set()
-    if result == "delta":
-        types = scratch / "closure-types"
-        _to_file(p, types, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)", stdin=present)
-        trees = scratch / "closure-tree-oids"
-        expanded = 0                               # cat-file --batch's bytes: "<oid> tree <size>\n<payload>\n" each
-        with importer._read_own(types) as fh, open(trees, "xb") as tf:
-            for line in importer._lines(fh, "cat-file --batch-check"):
-                oid, kind, size = (line.split(b" ") + [b"", b""])[:3]
-                if kind == b"tree":
-                    if not size.isdigit():
-                        raise importer.Fatal(None, "cat-file --batch-check printed a size that is not a number")
-                    expanded += len(oid) + len(b" tree ") + len(size) + 1 + int(size) + 1
-                    tf.write(oid + b"\n")
-        if expanded > verify_caps.TREE_SCRATCH_CAP:
-            raise Refused("preview-cap:output",
-                          f"the closure's trees expand to {expanded} bytes > {verify_caps.TREE_SCRATCH_CAP}")
-        payloads = scratch / "closure-trees"
-        _to_file(p, payloads, "cat-file", "--batch", stdin=trees)
-        try:
-            specials = special_paths.adopt_specials(importer._tree_payloads(payloads, hexlen), hexlen)
-        except ValueError as e:
-            raise Refused("fsck:other", f"a tree Levain's reader refuses: {e}"[:300]) from None
-        with open(req, "ab") as rf:
-            for oid in sorted(specials):
-                rf.write(oid.encode("ascii") + b"\n")
+    rf = _Inventory(req, objects, hexlen)           # open until the specials are appended, closed before the sort
+    try:
+        with importer._read_own(raw) as fh, _Inventory(present, objects, hexlen) as pf:
+            for line in importer._lines(fh, "rev-list"):
+                oid = line[1:] if line[:1] == b"?" else line
+                if len(oid) != hexlen or not re.fullmatch(rb"[0-9a-f]+", oid):
+                    raise importer.Fatal(None, "rev-list printed a line that is not an oid")
+                rf.write(oid + b"\n")
+                if line[:1] == b"?":
+                    absent = True
+                else:
+                    pf.write(oid + b"\n")
+        specials = _delta_specials(p, scratch, present, rf, hexlen, objects) if result == "delta" else set()
+    finally:
+        rf.close()
     out = scratch / "required"
     import subprocess
     with open(out, "xb") as of:
@@ -281,6 +341,41 @@ def _required(p: importer.GitRunner, q: importer.GitRunner, scratch: Path, tips:
     if rc != 0:
         raise importer.Fatal(None, f"sort rc {rc}")
     return out, specials, absent
+
+
+def _delta_specials(p: importer.GitRunner, scratch: Path, present: Path, rf: _Inventory, hexlen: int,
+                    objects: int) -> set:
+    """DELTA's adopt special set over the closure's trees, appended to the required list ``rf``."""
+    types = scratch / "closure-types"
+    with _Inventory(types, objects, hexlen) as w:
+        _to_inventory(p, w, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)", stdin=present)
+    trees = scratch / "closure-tree-oids"
+    expanded = 0                               # cat-file --batch's bytes: "<oid> tree <size>\n<payload>\n" each
+    with importer._read_own(types) as fh, _Inventory(trees, objects, hexlen) as tf:
+        for line in importer._lines(fh, "cat-file --batch-check"):
+            oid, kind, size = (line.split(b" ") + [b"", b""])[:3]
+            if kind == b"tree":
+                if not size.isdigit():
+                    raise importer.Fatal(None, "cat-file --batch-check printed a size that is not a number")
+                expanded += len(oid) + len(b" tree ") + len(size) + 1 + int(size) + 1
+                tf.write(oid + b"\n")
+    if expanded > verify_caps.TREE_SCRATCH_CAP:
+        raise Refused("preview-cap:output",
+                      f"the closure's trees expand to {expanded} bytes > {verify_caps.TREE_SCRATCH_CAP}")
+    payloads = scratch / "closure-trees"
+    _to_file(p, payloads, "cat-file", "--batch", stdin=trees)
+    try:
+        specials = special_paths.adopt_specials(importer._tree_payloads(payloads, hexlen), hexlen)
+    except ValueError as e:
+        raise Refused("fsck:other", f"a tree Levain's reader refuses: {e}"[:300]) from None
+    # Only the specials the closure lacks: each present oid is then on the list once, so it stays within its share (a
+    # delta adding symlinks to a small base wrote each target twice and went past its share: this lane's own row)
+    new = set(specials)
+    for oid in _oid_lines(present, hexlen, "closure-present"):
+        new.discard(oid)
+    for oid in sorted(new):
+        rf.write(oid.encode("ascii") + b"\n")
+    return specials
 
 
 def _exact_set(sent: Path, required: Path, specials: set, hexlen: int) -> None:
@@ -332,6 +427,10 @@ def quarantine_verify(bundle: Path, base_bundle: Path, *, session: str, base_oid
     if bh.object_format != object_format or boid != base_oid:
         raise Refused("base-bundle-mismatch", "the base bundle's HEAD is not alloc.base's oid")
     bsize = os.stat(base_bundle, follow_symlinks=False).st_size
+    try:
+        base_count = pack_count(base_bundle, bh.size, bsize - bh.size)   # root's own count for the image (§6.3)
+    except Refused as e:
+        raise Refused("base-bundle-mismatch", f"{e.name}: {e.detail}") from None
     _must(b, "index-pack", "--stdin", "--no-rev-index", "--threads=2", f"--max-input-size={bsize}",
           stdin=(_Region(base_bundle), bh.size, bsize - bh.size))
     rc, out, _ = _g(b, "cat-file", "-t", base_oid)
@@ -346,6 +445,7 @@ def quarantine_verify(bundle: Path, base_bundle: Path, *, session: str, base_oid
     refs = {n[len(prefix):].decode("ascii"): o for o, n in h.refs}
     size = os.stat(bundle, follow_symlinks=False).st_size
     count = pack_count(bundle, h.size, size - h.size)
+    objects = count + base_count                    # the inventories' shares: root's image sum, both packs' counts
     # 2. Q
     q = _runner(git, scratch, "q", log)
     _init(q, object_format)
@@ -358,7 +458,7 @@ def quarantine_verify(bundle: Path, base_bundle: Path, *, session: str, base_oid
     if os.path.lexists(_objects_dir(q) / "info" / "alternates"):
         raise importer.Fatal(None, "Q has an alternates file")
     # 2a. the gate, then the tree reader (the below-ERROR ids and frame (a)'s depth bound), before any P or rev-list
-    _cq, inventory = _commit_gate(q, scratch)
+    _cq, inventory = _commit_gate(q, scratch, objects, hexlen)
     fsck_reader.read_trees(q, b, inventory, hexlen, log=log)
     # 3. P
     p = _runner(git, scratch, "p", log)
@@ -377,8 +477,10 @@ def quarantine_verify(bundle: Path, base_bundle: Path, *, session: str, base_oid
     for name, oid in refs.items():
         _must(p, "update-ref", f"refs/levain-preview/{name}", oid)
     sent = scratch / "sent"
-    _to_file(q, sent, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)")
-    required, specials, absent = _required(p, q, scratch, tips, result=result, base_oid=base_oid, hexlen=hexlen)
+    with _Inventory(sent, objects, hexlen) as w:
+        _to_inventory(q, w, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)")
+    required, specials, absent = _required(p, q, scratch, tips, result=result, base_oid=base_oid, hexlen=hexlen,
+                                           objects=objects)
     if not absent:                      # an absent object: the exact set below names it (graph-unresolved / unsent)
         for t in tips:
             rc, _o, err = _g(p, "merge-base", "--is-ancestor", t, base_oid)

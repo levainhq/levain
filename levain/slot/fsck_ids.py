@@ -197,7 +197,7 @@ def _last(stderr: str) -> str:
     return (stderr.strip().splitlines() or [""])[-1][:200]
 
 
-__all__ = ["CONFIG_IDS", "DEFAULT_ERROR_NAMED", "ID_PATTERN", "FLOOR", "FLOOR_FSCK_H_SHA256", "FLOOR_SEVERITIES", "FLOOR_TAG",
-           "FSCK_PROBE_FAILED", "FSCK_TIMEOUT", "GitVersion", "LARGE_PATHNAME", "SCRUBBED_ENV", "UNPARSED",
+__all__ = ["CONFIG_IDS", "DEFAULT_ERROR_NAMED", "FLOOR", "FLOOR_FSCK_H_SHA256", "FLOOR_SEVERITIES", "FLOOR_TAG",
+           "FSCK_PROBE_FAILED", "FSCK_TIMEOUT", "GitVersion", "ID_PATTERN", "LARGE_PATHNAME", "SCRUBBED_ENV", "UNPARSED",
            "VERSION_TIMEOUT", "check_config_ids", "check_floor", "closed_ids", "git_version_text", "parse_fsck_h",
            "parse_version", "reader_ids", "snake_to_id"]

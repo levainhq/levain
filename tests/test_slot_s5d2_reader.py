@@ -149,15 +149,7 @@ def test_each_reader_id_refuses_by_its_name_from_verify_and_from_the_reader_alon
     bun = r.export(r.tree(READER_ROWS[case](r) + [(b"100644", b"README", r.readme)]))
     if case != "hasDotgit-backslash":       # a backslash name: index-pack's own check differs per git; reader only
         assert r.verify(bun)[0] == want
-    d = tmp_path / "direct"
-    d.mkdir()
-    q, b = AV._runner(GIT, d, "q", None), AV._runner(GIT, d, "b", None)
-    for runner, src in ((q, bun), (b, r.base_bundle)):
-        AV._init(runner, "sha1")
-        h = AV.read_header(src)
-        size = src.stat().st_size
-        AV._must(runner, "index-pack", "--stdin", "--no-rev-index", stdin=(AV._Region(src), h.size, size - h.size))
-    _cq, inv = AV._commit_gate(q, d)
+    q, b, inv = direct(tmp_path, bun, r.base_bundle)
     with pytest.raises(Refused) as e:
         FR.read_trees(q, b, inv, 40)
     assert e.value.name == want
@@ -185,3 +177,184 @@ def test_the_image_budget_counts_every_scratch_inventory():
     names = set(re.findall(r'scratch / "([a-z-]+)"', src))
     assert names - {"required", "closure-trees"} == set(VC.INVENTORY_LINE_EXTRA)
     assert VC.inventory_bytes(2, 40) == 2 * sum(40 + x for x in VC.INVENTORY_LINE_EXTRA.values())
+
+
+# --- 5d-ii S1 L3 r1 fixes (lane adopt5dii-fix1, findings 1022-21/adopt5dii/L3_r1.txt) ------------------------------
+
+def direct(tmp: Path, bun: Path, base_bundle: Path):
+    """Q and B indexed WITHOUT ``--fsck-objects`` (the reader alone judges), and Q's inventory written by the rig."""
+    d = tmp / "direct"
+    d.mkdir()
+    q, b = AV._runner(GIT, d, "q", None), AV._runner(GIT, d, "b", None)
+    for runner, src in ((q, bun), (b, base_bundle)):
+        AV._init(runner, "sha1")
+        h = AV.read_header(src)
+        size = src.stat().st_size
+        AV._must(runner, "index-pack", "--stdin", "--no-rev-index", stdin=(AV._Region(src), h.size, size - h.size))
+    inv = d / "inventory"
+    inv.write_bytes(g("--git-dir", str(q.work / "repo.git"), "cat-file", "--batch-all-objects",
+                      "--batch-check=%(objectname) %(objecttype)"))
+    return q, b, inv
+
+
+def tree_cost(r: Repo, oid: str) -> int:
+    """What the reader counts for one tree: cat-file's whole response, ``<oid> tree <size>\\n<payload>\\n``."""
+    size = int(g("cat-file", "-s", oid, cwd=r.path))
+    return len(f"{oid} tree {size}\n") + size + 1
+
+
+def asks(monkeypatch) -> list:
+    seen: list = []
+    real = FR._Store._ask
+
+    def spy(self, cmd, oid):
+        seen.append((cmd, oid))
+        return real(self, cmd, oid)
+    monkeypatch.setattr(FR._Store, "_ask", spy)
+    return seen
+
+
+def files(r: Repo, n: int, tag: bytes):
+    return [(b"100644", b"%s%05d" % (tag, i), r.put(b"blob", b"%s %d\n" % (tag, i))) for i in range(n)]
+
+
+@needs_git
+@pytest.mark.parametrize("over", [0, 1])
+def test_one_tree_at_the_output_cap_passes_and_one_byte_over_refuses_before_its_contents(tmp_path, monkeypatch, over):
+    # L3 r1 MED (codex + complement): the reader read a tree's whole expanded payload with no cap. Now the probe's size
+    # is checked against verify_caps.EXPANDED_OUTPUT_CAP BEFORE ``contents``: at the cap it passes, one byte under its
+    # cost it is ``preview-cap:output`` and the tree's contents are never requested.
+    r = Repo(tmp_path)
+    root = r.tree(files(r, 200, b"f"))
+    bun = r.export(root)
+    q, b, inv = direct(tmp_path, bun, r.base_bundle)
+    monkeypatch.setattr(VC, "EXPANDED_OUTPUT_CAP", tree_cost(r, root) - over)
+    seen = asks(monkeypatch)
+    if over:
+        with pytest.raises(Refused) as e:
+            FR.read_trees(q, b, inv, 40)
+        assert e.value.name == "preview-cap:output"
+        assert ("info", root) in seen and ("contents", root) not in seen
+    else:
+        assert FR.read_trees(q, b, inv, 40).uq == 1
+        assert ("contents", root) in seen
+
+
+@needs_git
+@pytest.mark.parametrize("over", [0, 1])
+def test_the_reader_output_cap_is_cumulative_over_every_tree_it_reads(tmp_path, monkeypatch, over):
+    # The running total: three trees each well under the cap, together over it, refuse ``preview-cap:output`` at the
+    # tree whose contents would pass it (never requested); at exactly their sum they pass.
+    r = Repo(tmp_path)
+    a, c = r.tree(files(r, 100, b"a")), r.tree(files(r, 100, b"c"))
+    root = r.tree([(b"40000", b"a", a), (b"40000", b"c", c)])
+    bun = r.export(root)
+    q, b, inv = direct(tmp_path, bun, r.base_bundle)
+    costs = {t: tree_cost(r, t) for t in (root, a, c)}
+    total = sum(costs.values())
+    assert max(costs.values()) < total - 1
+    monkeypatch.setattr(VC, "EXPANDED_OUTPUT_CAP", total - over)
+    seen = asks(monkeypatch)
+    if over:
+        with pytest.raises(Refused) as e:
+            FR.read_trees(q, b, inv, 40)
+        assert e.value.name == "preview-cap:output"
+        read = [o for cmd, o in seen if cmd == "contents" and o in costs]
+        assert len(read) == 2
+        last = next(t for t in costs if t not in read)
+        assert ("info", last) in seen
+    else:
+        assert FR.read_trees(q, b, inv, 40).uq == 3
+
+
+@needs_git
+def test_absent_oids_named_by_a_tiny_pack_refuse_by_the_inventory_share_not_by_space(tmp_path):
+    # L3 r1 codex MED (the lane's own Q5, ruled FIX): a 2-object pack whose tree names many distinct ABSENT blobs grows
+    # step 4's ``closure`` (``--missing=print``) far past its share of the image budget root sized from the packs'
+    # object counts. Every inventory now goes through one bounded writer: ``preview-cap:output``, never space.
+    r = Repo(tmp_path)
+    fake = [(b"100644", b"x%05d" % i, hashlib.sha1(b"absent %d" % i).hexdigest()) for i in range(2000)]
+    got, _st, _log = r.verify(r.export(r.tree(fake + [(b"100644", b"README", r.readme)])))
+    assert got == "preview-cap:output"
+
+
+@needs_git
+def test_a_delta_of_many_symlinks_over_a_tiny_base_stays_within_every_share(tmp_path):
+    # The bounded writer must never refuse a real bundle: symlink targets are adopt specials AND closure objects, and
+    # appending each one again put ``required-unsorted`` past its share for 60 symlinks over a 3-object base (this
+    # lane's build, before the specials were filtered against the closure).
+    r = Repo(tmp_path)
+    links = [(b"120000", b"l%03d" % i, r.put(b"blob", b"target-%d" % i)) for i in range(60)]
+    assert r.verify(r.export(r.tree(links + [(b"100644", b"README", r.readme)])))[0] == "Verified"
+
+
+def test_the_inventory_writer_refuses_past_its_share(tmp_path):
+    # The one bounded writer by itself: its share is verify_caps.inventory_share for its file name; one byte past it
+    # is ``preview-cap:output``; the shares sum to the image budget's inventory term.
+    share = VC.inventory_share("sent", 3, 40)
+    assert share == 3 * 41 and VC.inventory_bytes(3, 40) == sum(
+        VC.inventory_share(n, 3, 40) for n in VC.INVENTORY_LINE_EXTRA)
+    with AV._Inventory(tmp_path / "sent", 3, 40) as w:
+        w.write(b"a" * share)
+        with pytest.raises(Refused) as e:
+            w.write(b"a")
+    assert e.value.name == "preview-cap:output"
+
+
+class FullLog:
+    def write(self, b):
+        raise OSError(28, "No space left on device")
+
+    def flush(self):
+        raise OSError(28, "No space left on device")
+
+
+@needs_git
+@pytest.mark.parametrize("deep", [False, True])
+def test_the_stats_line_never_changes_the_verdict(tmp_path, deep):
+    # L3 r1 complement LOW: the stats write in read_trees' ``finally`` raised ENOSPC over the verdict. A log that
+    # raises leaves a pass a pass and a refusal its own name.
+    r = Repo(tmp_path)
+    root = chain(r, walkframe.MAX_DEPTH + 1, "blob") if deep else r.tree([(b"100644", b"README", r.readme)])
+    q, b, inv = direct(tmp_path, r.export(root), r.base_bundle)
+    if deep:
+        with pytest.raises(Refused) as e:
+            FR.read_trees(q, b, inv, 40, log=FullLog())
+        assert e.value.name == "preview-cap:tree-depth"
+    else:
+        assert FR.read_trees(q, b, inv, 40, log=FullLog()).uq == 1
+
+
+def test_a_cat_file_failure_carries_its_stderr_tail(tmp_path):
+    # L3 r1 complement LOW: _Store discarded cat-file's stderr. A cat-file that dies names its last stderr line.
+    fake = tmp_path / "git"
+    fake.write_text("#!/bin/sh\necho 'fatal: the boom line' >&2\nexit 128\n")
+    fake.chmod(0o755)
+    work = tmp_path / "w"
+    work.mkdir()
+    st = FR._Store(importer.GitRunner(str(fake), work), "Q", 40)
+    try:
+        with pytest.raises(importer.Fatal) as e:
+            st.info("ab" * 20)
+    finally:
+        st.close()
+    assert "the boom line" in e.value.detail
+
+
+@needs_git
+def test_a_commit_without_a_leading_tree_line_is_fsck_other(tmp_path):
+    # L3 r1 complement LOW: it raised Fatal(None, ...) (root's generic verifier-failed); now ``fsck:other``.
+    r = Repo(tmp_path)
+    bad = r.put(b"commit", b"parent %s\nauthor a <a@a> 0 +0000\ncommitter a <a@a> 0 +0000\n\nm\n" % r.base.encode())
+    pk = g("pack-objects", "-q", "--stdout", cwd=r.path, stdin=bad.encode() + b"\n")
+    bun = tmp_path / "bad.bundle"
+    bun.write_bytes(BF.write_header("sha1", [(bad, f"refs/levain/{S}/head".encode())], [r.base]) + pk)
+    q, b, inv = direct(tmp_path, bun, r.base_bundle)
+    with pytest.raises(Refused) as e:
+        FR.read_trees(q, b, inv, 40)
+    assert e.value.name == "fsck:other"
+
+
+def test_fsck_ids_all_is_sorted():
+    from levain.slot import fsck_ids as FI
+    assert FI.__all__ == sorted(FI.__all__)

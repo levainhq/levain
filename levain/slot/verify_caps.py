@@ -7,6 +7,13 @@ The expanded-output rule (§6.3: every git output byte-capped, 256 MiB = ``previ
 :data:`TREE_SCRATCH_CAP`, the delta closure's tree payloads in ``scratch/`` (checked from ``%(objectsize)`` before a
 byte of them is written), and :data:`PREVIEW_OUTPUT_CAP`, ``out/preview.txt`` (root's publish cap for it). Both are
 V30's one 256 MiB value [judged by s5-fold-r4, against §6.3; kept separate names so the image budget counts both].
+The A10 tree reader (:mod:`levain.slot.fsck_reader`) counts its tree responses against :data:`EXPANDED_OUTPUT_CAP`
+itself: they are the same rule's git output, held in the verifier's memory, not written to the image, so no image term
+counts them and they need no name of their own [judged by adopt5dii-fix1, 10-22, against §6.3 and L3 r1's MED].
+
+Each inventory's share of the image budget (:func:`inventory_share`) is what the verifier's one bounded writer
+(``adopt_verify._Inventory``) holds that file to: root reserves :func:`inventory_bytes`, the shares' sum, so a file past
+its share is ``preview-cap:output`` before the image can fill (L3 r1 codex MED: ``closure`` can name absent oids).
 """
 from __future__ import annotations
 
@@ -37,11 +44,16 @@ INVENTORY_LINE_EXTRA: Mapping[str, int] = {
 }
 
 
+def inventory_share(name: str, objects: int, hexlen: int) -> int:
+    """One inventory's bytes for ``objects`` objects (both packs' header counts, root's own sum): one line per object."""
+    return objects * (hexlen + INVENTORY_LINE_EXTRA[name])
+
+
 def inventory_bytes(objects: int, hexlen: int) -> int:
-    """The inventories' bytes for ``objects`` objects: one line per object in each (L3 s2 r2: about ``hex + 20`` bytes
+    """The inventories' bytes for ``objects`` objects: every :func:`inventory_share` (L3 s2 r2: about ``hex + 20`` bytes
     per object per file, which the fixed margin alone held only up to a few hundred thousand objects)."""
-    return objects * sum(hexlen + extra for extra in INVENTORY_LINE_EXTRA.values())
+    return sum(inventory_share(name, objects, hexlen) for name in INVENTORY_LINE_EXTRA)
 
 
 __all__ = ["COMMIT_OBJECT_MAX", "EXPANDED_OUTPUT_CAP", "INVENTORY_LINE_EXTRA", "PREVIEW_OUTPUT_CAP", "TREE_SCRATCH_CAP",
-           "inventory_bytes"]
+           "inventory_bytes", "inventory_share"]
