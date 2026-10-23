@@ -8,7 +8,9 @@ the verifier's idx is ``index-pack -o`` of the same pack (what Q holds), and the
 says, so each row edits exactly one thing.
 
 The tests after "the S3 fix round" are that round's (lane adopt5dii-s3-fix1): each goes red with its fix reverted
-(``1023-6/adopt/s3f1_mutate.py``, output ``s3f1_mutate.txt``).
+(``1023-6/adopt/s3f1_mutate.py``, output ``s3f1_mutate.txt``). The second fix round (lane adopt5dii-s3-fix2, L3 r1)
+deleted the pack rollback and the rename fallback and added the prerequisite check; its tests are red on 16b75842
+(``1023-6/adopt/s3f2_red_312.txt``).
 """
 import errno
 import hashlib
@@ -148,6 +150,7 @@ def test_take_create_only(ex, tmp_path, ref_format, monkeypatch):
     ref = f"refs/heads/levain/{S}"
     assert t.ref == ref and t.oid == ex["head"]
     assert plog.read_text().splitlines() == [
+        f"-c core.hooksPath=/dev/null cat-file -e {ex['base']}",
         "-c core.hooksPath=/dev/null rev-parse --git-path objects",
         "-c core.hooksPath=/dev/null -c hook.reference-transaction.enabled=false "
         f"update-ref --no-deref --create-reflog {ref} {ex['head']} {'0' * 40}"]
@@ -355,9 +358,9 @@ def _prep(ex, tmp_path):
 
 
 @pytest.mark.parametrize("at", [1, 2])
-def test_take_interrupt_mid_copy_leaves_nothing(ex, tmp_path, monkeypatch, at):
-    """A KeyboardInterrupt in the pack's copy (1) or the idx's, after the pack landed (2): the temps and the pack
-    this take created are removed, and the interrupt is re-raised."""
+def test_take_interrupt_mid_copy_removes_temps(ex, tmp_path, monkeypatch, at):
+    """A KeyboardInterrupt in the pack's copy (1) or the idx's, after the pack landed (2): the temps are removed, a
+    pack already linked stays (no idx, so git does not see it), and the interrupt is re-raised."""
     repo, pd, b, i, d, isha = _prep(ex, tmp_path)
     real, seen = SLOT.write_all, []
 
@@ -370,33 +373,61 @@ def test_take_interrupt_mid_copy_leaves_nothing(ex, tmp_path, monkeypatch, at):
     with pytest.raises(KeyboardInterrupt):
         AT.migrate(GIT, repo, b, i, d, isha)
     assert any(n.endswith(".pack") and not n.startswith("tmp_") for n in seen[-1]) == (at == 2)
-    assert os.listdir(pd) == []
+    assert os.listdir(pd) == ([f"pack-{ex['pack'][-20:].hex()}.pack"] if at == 2 else [])
 
 
-def test_take_idx_stage_failure_rolls_back_created_pack_only(ex, tmp_path, monkeypatch):
-    """S3 Q2 (head KEEP): the idx stage fails after the pack landed = the pack this take created is removed; a pack
-    that was already present is untouched."""
-    repo, pd, b, i, d, isha = _prep(ex, tmp_path)
-    real = SLOT.write_all
+def _enospc_on_idx(monkeypatch, before=None):
+    """``write_all`` raises ENOSPC on the idx's first write, after running ``before`` once (no seam inside it)."""
+    real, busy = SLOT.write_all, []
 
-    def enospc_on_idx(fd, data):
-        if data[:4] == AT.IDX_MAGIC:
+    def write(fd, data):
+        if data[:4] == AT.IDX_MAGIC and not busy:
+            busy.append(1)
+            if before is not None:
+                before()
             raise OSError(errno.ENOSPC, "seam")
         real(fd, data)
-    monkeypatch.setattr(SLOT, "write_all", enospc_on_idx)
-    assert refused(lambda: AT.migrate(GIT, repo, b, i, d, isha)) == "take-failed:ENOSPC"
-    assert os.listdir(pd) == []
-    there = pd / f"pack-{ex['pack'][-20:].hex()}.pack"
-    there.write_bytes(ex["pack"])
-    there.chmod(0o444)
-    ino = there.stat().st_ino
-    assert refused(lambda: AT.migrate(GIT, repo, b, i, d, isha)) == "take-failed:ENOSPC"
-    assert os.listdir(pd) == [there.name] and there.stat().st_ino == ino and there.read_bytes() == ex["pack"]
+    monkeypatch.setattr(SLOT, "write_all", write)
 
 
-def test_take_failed_temp_unlink_after_link_rolls_back(ex, tmp_path, monkeypatch):
-    """The pack counts as created the moment its link lands: an unlink of its temp that fails right after still
-    removes the created pack (and the temp)."""
+def _intact(repo: Path, ref: str, oid: str) -> None:
+    """His ref resolves to ``oid``, the tip is readable, and every object it reaches is there."""
+    assert g("rev-parse", "--verify", ref, cwd=repo).decode().strip() == oid
+    for args in (("cat-file", "-e", oid), ("fsck", "--connectivity-only")):
+        assert subprocess.run([GIT, *args], cwd=repo, env=ENV, capture_output=True).returncode == 0, args
+
+
+def test_take_idx_stage_failure_leaves_pack_retry_completes(ex, tmp_path, monkeypatch):
+    """L3 r1 (S3 Q2 reversed: no pack rollback): the idx stage fails after the pack landed = the pack stays, alone (no
+    idx, so git does not see it; no temp); a retry finds it present with equal bytes and completes."""
+    repo, pd, b, i, d, isha = _prep(ex, tmp_path)
+    _enospc_on_idx(monkeypatch)
+    assert refused(lambda: AT.migrate(GIT, repo, b, i, d, isha)) == "take-failed:ENOSPC"
+    assert os.listdir(pd) == [f"pack-{ex['pack'][-20:].hex()}.pack"]
+    monkeypatch.undo()
+    t = take(ex, repo, tmp_path)
+    assert t.migrated.skipped == [t.migrated.pack] and t.migrated.written == [t.migrated.idx]
+    assert sorted(os.listdir(pd)) == sorted([t.migrated.pack, t.migrated.idx])
+    _intact(repo, t.ref, ex["head"])
+
+
+def test_take_concurrent_take_keeps_the_pack_it_adopted(ex, tmp_path, monkeypatch):
+    """L3 r1 (codex HIGH + complement MED): take A links the pack; take B, inside A's idx stage, finds it present with
+    equal bytes, links the idx and creates its ref; A's idx stage then fails. A leaves the pack, so B's repo is whole:
+    its ref resolves, its tip is readable, ``fsck --connectivity-only`` passes."""
+    repo, pd, b, i, d, isha = _prep(ex, tmp_path)
+    inner: list = []
+    _enospc_on_idx(monkeypatch, lambda: inner.append(take(ex, repo, tmp_path)))
+    assert refused(lambda: AT.migrate(GIT, repo, b, i, d, isha)) == "take-failed:ENOSPC"
+    t = inner[0]
+    assert t.migrated.skipped == [t.migrated.pack] and t.migrated.written == [t.migrated.idx]
+    assert sorted(os.listdir(pd)) == sorted([t.migrated.pack, t.migrated.idx])
+    _intact(repo, t.ref, ex["head"])
+
+
+def test_take_failed_temp_unlink_after_link_removes_temp(ex, tmp_path, monkeypatch):
+    """An unlink of the pack's temp that fails right after its link landed = ``take-failed:EIO``; the temp is still
+    removed on the way out, and the linked pack stays (no idx)."""
     repo, pd, b, i, d, isha = _prep(ex, tmp_path)
     real, fired = os.unlink, []
 
@@ -407,7 +438,7 @@ def test_take_failed_temp_unlink_after_link_rolls_back(ex, tmp_path, monkeypatch
         return real(path, *a, **k)
     monkeypatch.setattr(os, "unlink", unlink)
     assert refused(lambda: AT.migrate(GIT, repo, b, i, d, isha)) == "take-failed:EIO"
-    assert fired and os.listdir(pd) == []
+    assert fired and os.listdir(pd) == [f"pack-{ex['pack'][-20:].hex()}.pack"]
 
 
 def test_take_spawn_and_read_failures_named(ex, tmp_path, monkeypatch):
@@ -477,36 +508,30 @@ def test_take_both_final_names_checked_before_any_write(ex, tmp_path, monkeypatc
     assert writes == [] and os.listdir(pd) == [stale.name]
 
 
-def test_take_rename_fallback(ex, tmp_path, monkeypatch):
-    """A filesystem that refuses hard links: each file is renamed into place after its final name is looked at;
-    a final name that appeared meanwhile with equal bytes is skipped, never ``take-failed:EPERM``."""
+def test_take_link_refused_is_named(ex, tmp_path, monkeypatch):
+    """L3 r1 (no rename fallback): an ``os.link`` failure other than EEXIST is ``take-failed:<errno name>``; the temp
+    is removed and nothing reaches a final name."""
     repo, pd, b, i, d, isha = _prep(ex, tmp_path)
-    lines: list = []
 
     def no_link(src, dst, *a, **k):
         raise OSError(errno.EPERM, "seam: no hard links")
     monkeypatch.setattr(os, "link", no_link)
-    m = AT.migrate(GIT, repo, b, i, d, isha, log=lines.append)
-    assert m.written == [m.pack, m.idx] and sorted(os.listdir(pd)) == sorted([m.pack, m.idx])
-    assert [x.endswith("(rename)") for x in lines if x.startswith("finalise ")] == [True, True]
-    for name in (m.pack, m.idx):
-        assert stat.S_IMODE((pd / name).stat().st_mode) == 0o444
-    assert subprocess.run([GIT, "cat-file", "-e", ex["head"]], cwd=repo, env=ENV).returncode == 0
-    for name in (m.pack, m.idx):
-        (pd / name).unlink()
+    assert refused(lambda: AT.migrate(GIT, repo, b, i, d, isha)) == "take-failed:EPERM"
+    assert os.listdir(pd) == []
 
-    def racing(src, dst, *, src_dir_fd=None, dst_dir_fd=None, follow_symlinks=True):
-        if dst.endswith(".pack"):                   # the same bytes arrive at the final name first
-            fd = os.open(src, os.O_RDONLY, dir_fd=src_dir_fd)
-            out = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444, dir_fd=dst_dir_fd)
-            os.write(out, os.read(fd, len(ex["pack"]) + 1))
-            os.close(fd)
-            os.close(out)
-        raise OSError(errno.EPERM, "seam: no hard links")
-    monkeypatch.setattr(os, "link", racing)
-    m = AT.migrate(GIT, repo, b, i, d, isha)
-    assert m.skipped == [m.pack] and m.written == [m.idx]
-    assert sorted(os.listdir(pd)) == sorted([m.pack, m.idx])
+
+def test_take_prerequisite_absent_refused(ex, tmp_path):
+    """L3 r1 (codex MED): a delta taken into a same-format repo that lacks its prerequisite = ``base-missing``, checked
+    in his repo before anything is written: no pack, no ref (a ref there is a disconnected branch)."""
+    repo = tmp_path / "other"
+    g("init", "-q", str(repo))
+    (repo / "b.txt").write_text("not the base\n")
+    g("add", "b.txt", cwd=repo)
+    g("commit", "-q", "-m", "other", cwd=repo)
+    assert subprocess.run([GIT, "cat-file", "-e", ex["base"]], cwd=repo, env=ENV).returncode != 0
+    assert refused(lambda: take(ex, repo, tmp_path)) == "base-missing"
+    assert os.listdir(repo / ".git" / "objects" / "pack") == []
+    assert g("for-each-ref", "refs/heads/levain", cwd=repo) == b""
 
 
 @pytest.mark.parametrize("bad", ["s-" + "E4" * 8, "s-" + "e4" * 7, "s-" + "e4" * 8 + "0", "../x", "s-e4e4/../e4e4"])
