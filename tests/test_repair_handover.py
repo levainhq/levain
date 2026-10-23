@@ -95,7 +95,7 @@ def _run(argv, **kw):
         out = "root:x:0:\n"
     return subprocess.CompletedProcess(argv, 0, out, "")
 
-def main(lock_fd, pool_fd, gen):
+def main(lock_fd, pool_fd, gen, *, caller_uid, fault=None):
     cfg = json.loads(os.environ["R2S2_CFG"])
     L = Path(cfg["store"])
     rs = RH.Seams(host=cfg["host"], store=L, trusted=lambda st: True, lock_wait_s=0.2)
@@ -112,11 +112,19 @@ def main(lock_fd, pool_fd, gen):
                           "registered": IH._QUIESCING.get(IH._store_key(L)) is q and q.fd == pool_fd,
                           "journal": g.facts.intent.generation if g.facts.intent else None}), flush=True)
         sys.stdin.readline()                # the parent's second run happens here, while phase B holds both
+    def mark(n):                            # test 3: one marker file per R-step that ran
+        return IH.Step(f"mark {n}", call=lambda: (Path(cfg["marks"], n).write_text(""), (True, ""))[1])
+
+    def plan(c, g, fault=None):
+        if not cfg.get("marks"):
+            return InstallPlan("repair", cfg["host"], ())
+        return InstallPlan("repair", cfg["host"], tuple(
+            st for r in ("R4b", "R5", "R6") for st in IH._faulted(fault, r, [mark(r)])))
     cs = ContinueSeams(host=cfg["host"], lock_path=Path(cfg["lock"]), owner_ok=lambda st: st.st_uid == os.getuid(),
                        store_seams=rs, state_dir=Path(cfg["state"]), run=_run, user_name=lambda uid: "op",
-                       after_gather=seen, plan=lambda c, g: InstallPlan("repair", cfg["host"], ()),
-                       apply=lambda p, e: None)
-    raise SystemExit(IH.repair_continue(lock_fd, pool_fd, gen, caller_uid=os.getuid(), seams=cs))
+                       after_gather=seen, plan=plan,
+                       apply=IH.apply_steps if cfg.get("marks") else (lambda p, e: None))
+    raise SystemExit(IH.repair_continue(lock_fd, pool_fd, gen, caller_uid=caller_uid, fault=fault, seams=cs))
 '''
 
 _PHASE_A = r'''
@@ -132,9 +140,9 @@ print(json.dumps({"phase": "A", "pid": os.getpid()}), flush=True)
 with install_lock(path=Path(cfg["lock"]), owner_ok=lambda st: st.st_uid == os.getuid()) as lock_fd:
     pool = os.open(os.path.join(cfg["store"], "slots", "pool.lock"), os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
     fcntl.flock(pool, fcntl.LOCK_EX)
-    call = f"import _phase_b; _phase_b.main({lock_fd}, {pool}, {cfg['gen']!r})"
+    fault = tuple(cfg["fault"]) if cfg.get("fault") and cfg["mutant"] != "inprocess" else None
     IH.exec_phase_b(cfg["host"], cfg["gen"], lock_fd, pool, os.getuid(), python=sys.executable,
-                    tree=Path(cfg["tree"]), call=call)
+                    tree=Path(cfg["tree"]), entry="__import__('_phase_b').main", fault=fault)
 '''
 
 
@@ -154,7 +162,7 @@ def _line(p: subprocess.Popen, timeout: float = 60.0) -> dict:
     return json.loads(buf)
 
 
-def _phase_b_run(tmp: Path, mutant: str) -> tuple[subprocess.Popen, dict, Path, Path]:
+def _phase_b_run(tmp: Path, mutant: str, **extra) -> tuple[subprocess.Popen, dict, Path, Path]:
     tree = tmp / "tree"
     g = _real_generation(tree)
     (g / "_phase_b.py").write_text(_PHASE_B)
@@ -163,7 +171,7 @@ def _phase_b_run(tmp: Path, mutant: str) -> tuple[subprocess.Popen, dict, Path, 
     (state / "install-intent").write_text(intent_text(Intent("repair", OP, txn=TXN, generation=GEN)))
     (tmp / "phase_a.py").write_text(_PHASE_A)
     cfg = dict(wt=str(WT), host=HOST, gen=GEN, tree=str(tree), store=str(L), state=str(state),
-               lock=str(state / "install.lock"), mutant=mutant)
+               lock=str(state / "install.lock"), mutant=mutant, **extra)
     env = {**os.environ, "R2S2_CFG": json.dumps(cfg)}
     p = subprocess.Popen([sys.executable, str(tmp / "phase_a.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, bufsize=0, env=env)
@@ -273,7 +281,7 @@ def _go(seams) -> dict:
 
 
 def _monkey_built(monkeypatch) -> None:
-    monkeypatch.setattr(IH, "BUILT_VERBS", IH.BUILT_VERBS + ("repair",))   # S3 adds it; main() answers verb-unbuilt
+    assert "repair" in IH.BUILT_VERBS                                      # S3 built it (S2's rows patched it in)
 
 
 def test_a_probe_past_its_timeout_is_source_broken_and_both_locks_are_released(tmp_path: Path, monkeypatch) -> None:
@@ -754,3 +762,132 @@ def test_flip_survives_a_kill_between_its_acts(tmp_path: Path, monkeypatch) -> N
     assert e.value.name == "bad-root"
     ok, why = root_tree._flip(tree, old)
     assert not ok and why.startswith("bad-root") and os.readlink(tree / "current") == new
+
+
+# --- S3: the resume into a journaled staged generation (§2.2 r4 X3-M1; §5 R2 test 1's resume row) --------------------
+
+def _resume(tmp: Path, monkeypatch, *, torn: bool):
+    """A host killed after R3 (the journal names ``generation:<id>``, ``gen-<id>`` placed, ``current`` the old one),
+    then a bare ``repair``: phase A's plan, then :func:`IH.repair_handover` with a recording probe and execv."""
+    import io
+    import shutil
+    from dataclasses import replace
+
+    from tests.test_repair_plan import OP as POP, _pre_change
+
+    facts, rf = _pre_change(tmp)
+    gid = G.generation_id(rf.source, rf.h11)
+    tree = tmp / "tree"
+    for name, src in (("levain", rf.source), ("h11", rf.h11)):
+        shutil.copytree(src, tree / gid / name)
+    if torn:
+        (tree / gid / "levain" / "__init__.py").write_text('__version__ = "1.0.0"\n#')   # one byte more
+    monkeypatch.setitem(root_tree.IMPORT_TREE, HOST, tree)
+    j = Intent("repair", POP, txn=TXN, generation=gid)
+    jpath = tmp / "install-intent"
+    jpath.write_text(intent_text(j))
+    facts = replace(facts, intent=j)
+    rf = replace(rf, source=None, h11=None, current="gen-" + "0" * 16)
+    plan = IH.plan_for(parse_install_argv(["repair"]), IH.Gathered(facts, repair=rf))
+    L = _store(tmp)
+    q = IH.Quiesce(L, waits=IH.RH.Seams(host=HOST, store=L, trusted=lambda st: True, lock_wait_s=0.05))
+    q.hold()
+    probes, execs = [], []
+
+    def probe(host, gen, shape, journal, **kw):
+        probes.append((gen, journal))
+        return tuple(sorted(G.KINDS))
+    try:
+        IH.repair_handover(plan, IH.Gathered(facts, quiesce=q, repair=rf), 3, os.getuid(), io.StringIO(),
+                           probe=probe, execv=lambda *a: execs.append(a), tree=tree, intent_path=jpath)
+        refused = None
+    except Refused as e:
+        refused = e
+    finally:
+        q.release()
+    return plan, gid, tree, jpath, j, probes, execs, refused
+
+
+def test_a_bare_repair_resumes_into_the_journalled_generation(tmp_path: Path, monkeypatch) -> None:
+    """Intact ``gen-<id>``: no step (R1-R3 ran, there is no source), probed and exec'd into, kept, journal as found."""
+    plan, gid, tree, jpath, j, probes, execs, refused = _resume(tmp_path, monkeypatch, torn=False)
+    assert refused is None and plan.steps == () and plan.handover.target == gid
+    assert probes == [(gid, j)] and len(execs) == 1 and f"{gid!r}" in execs[0][1][3]
+    assert (tree / gid / "levain" / "__init__.py").is_file() and read_intent(HOST, path=jpath) == j
+
+
+def test_a_torn_journalled_generation_is_removed_and_source_required(tmp_path: Path, monkeypatch) -> None:
+    """One byte of ``gen-<id>`` changed: removed, refused ``source-required:<id>``, never probed, journal kept."""
+    plan, gid, tree, jpath, j, probes, execs, refused = _resume(tmp_path, monkeypatch, torn=True)
+    assert refused is not None and refused.name == f"source-required:{gid}"
+    assert not probes and not execs and not (tree / gid).exists() and read_intent(HOST, path=jpath) == j
+
+
+# --- S3: the fault seam (§5 [F7], [r4: X3-H1]; design R2 test 3) -----------------------------------------------------
+
+@pytest.mark.parametrize("mutant", ["", "inprocess"])
+def test_phase_b_honours_the_launcher_fault(tmp_path: Path, mutant: str) -> None:
+    """A launcher-set fault at ``("R5","after")`` crosses the real ``execv`` as a literal and SIGKILLs phase B after
+    R5's acts and before R6's; both flocks die with it. ``inprocess`` (the red): the fault left in phase A's
+    :class:`Seams` only, never in phase B's program -> phase B runs to the end."""
+    import signal
+
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    p, _, lock, pool = _phase_b_run(tmp_path, mutant, fault=["R5", "after"], marks=str(marks))
+    _line(p)
+    out, err = p.communicate(b"\n", timeout=60)
+    ran = sorted(x.name for x in marks.iterdir())
+    if mutant:
+        assert p.returncode == 0 and ran == ["R4b", "R5", "R6"], err
+    else:
+        assert p.returncode == -signal.SIGKILL and ran == ["R4b", "R5"], err
+    with install_lock(path=lock, owner_ok=_mine):
+        assert _pool_free(pool)
+
+
+def test_the_fault_literal_exists_only_when_the_launcher_sets_one(tmp_path: Path) -> None:
+    """``main()``'s default :class:`Seams` carries no fault, so phase B's program names none; a launcher's point
+    outside ``Seams.POINTS`` (or a bad step id) refuses ``bad-token`` before the lock or any read."""
+    assert IH.Seams().fault_at is None and "fault" not in IH.phase_b_text(HOST, GEN, 3, 4, 501)
+    assert "fault=('R9', 'a')" in IH.phase_b_text(HOST, GEN, 3, 4, 501, fault=("R9", "a"))
+    assert {"before", "after", "a", "b", "mid-copy", "group/1:after-retire"} <= IH.Seams.POINTS
+    for bad in (("R5", "middle"), ("X5", "after"), ("R5", "after\n"), ["R5", "after"]):
+        calls: list = []
+        seams = IH.Seams(euid=lambda: 0, host=lambda: HOST, lock=lambda h: calls.append("lock"),
+                         gather=lambda *a: calls.append("gather"), fault_at=bad)  # type: ignore[arg-type]
+        with pytest.raises(Refused) as e:
+            _go(seams)
+        assert e.value.name == "bad-token" and calls == []
+        with pytest.raises(Refused):
+            IH.phase_b_text(HOST, GEN, 3, 4, 501, fault=bad)  # type: ignore[arg-type]
+
+
+def test_the_plan_places_every_fault_point(tmp_path: Path, monkeypatch) -> None:
+    """With a hook, each R-step sits between its ``before``/``after`` points (R5's after its stops, before R6), R2's
+    ``mid-copy`` between the two copies, R9's ``a`` between the flip's symlink and its rename; without one, no point
+    step is planned at all."""
+    from tests.test_repair_plan import _plan, _pre_change
+
+    facts, rf = _pre_change(tmp_path)
+    seen: list = []
+    plain = _plan(facts, rf, txn=lambda: TXN)
+    faulted = _plan(facts, rf, txn=lambda: TXN, fault=lambda step, pt: seen.append((step, pt)))
+    assert not [s for s in plain.steps if s.why.startswith("fault point")]
+    whys = [s.why for s in faulted.steps]
+    assert [w for w in whys if not w.startswith("fault point")] == [s.why for s in plain.steps]
+    i = whys.index("fault point R5 after")
+    assert whys[i - 1].startswith("stop") and whys[i + 1] == "fault point R6 before"
+    j = whys.index("fault point R2 mid-copy")
+    assert whys[j - 1].startswith("copy the levain") and whys[j + 1].startswith("copy the h11")
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    os.symlink("gen-" + "1" * 16, tree / "current")
+
+    def kill(pt):
+        if pt == "a":
+            raise KeyboardInterrupt("SIGKILL at R9 a")
+    with pytest.raises(KeyboardInterrupt):
+        root_tree._flip(tree, "gen-" + "2" * 16, fault=kill)
+    assert os.readlink(tree / "current") == "gen-" + "1" * 16 and os.readlink(tree / "current.new") == "gen-" + "2" * 16
+    assert root_tree._flip(tree, "gen-" + "2" * 16) == (True, "") and os.readlink(tree / "current") == "gen-" + "2" * 16

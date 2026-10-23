@@ -117,7 +117,7 @@ def test_refusals_before_the_lock_read_nothing():
     assert o.calls == []
 
 
-@pytest.mark.parametrize("argv", [["repair"], ["set-retention", "30"], ["set-dispatch-retain", "3"], ["set-ceiling"],
+@pytest.mark.parametrize("argv", [["set-retention", "30"], ["set-dispatch-retain", "3"], ["set-ceiling"],
                                   ["set-signers"], ["force-retire", "egress", "0"]])
 def test_unbuilt_verbs_refuse_by_name_before_the_lock(argv):
     o = _Order()

@@ -18,6 +18,7 @@ credential verbs through a forked child that drops to keys before it opens anyth
 from __future__ import annotations
 
 import fcntl
+import functools
 import json
 import os
 import re
@@ -31,7 +32,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, ContextManager, Iterable, Iterator, Mapping, Optional, Sequence, TextIO
+from typing import Callable, ClassVar, ContextManager, Iterable, Iterator, Mapping, Optional, Sequence, TextIO, Tuple
 
 from levain.contracts import canon
 from levain.firing.hands import OPERATOR_RE, HandsSetupError, HostOS, Step, _abs, _kill_all, host_os, run_plan
@@ -222,7 +223,7 @@ def check_tools(facts: HostFacts, steps: Sequence[Step], *, verb: str, python: b
 
 
 #: The verbs :func:`main` applies; every other verb of the §5.2 grammar answers ``verb-unbuilt:<verb>``.
-BUILT_VERBS = ("setup", "undo", "replenish", "purge", "set-credential", "remove-credential")
+BUILT_VERBS = ("setup", "undo", "replenish", "purge", "set-credential", "remove-credential", "repair")
 
 
 def helper_pending() -> tuple[str, ...]:
@@ -1307,6 +1308,56 @@ def write_install_skips(host: HostOS, live: RM.Live, earlier: Iterable = ()) -> 
     return gen_mod.write_record_durably(live.at(path), text)
 
 
+# --- the fault seam (§5 "The crash seam" [r2: X-10, C-F9], [r3: F7], [r4: X3-H1]) -------------------------------------
+
+#: A fault's step id: an R-step of §2.3 (``R5``, ``R4b``).
+FAULT_STEP_RE = re.compile(r"R[0-9]+[a-z]?")
+#: Every point a fault may name, by MEMBERSHIP (never a pattern): an R-step's ``before`` and ``after``, R9's ``a``
+#: (after the ``current.new`` symlink) and ``b`` (after the rename), R2's ``mid-copy`` (between the levain and the h11
+#: copy), and every remove step's act boundary (:data:`removal.REMOVE_POINTS`).
+FAULT_POINTS = frozenset({"before", "after", "a", "b", "mid-copy"}) | RM.REMOVE_POINTS
+#: ``(step id, point) -> None``: called at each named point of a plan built with one (a launcher run only).
+FaultHook = Callable[[str, str], None]
+
+
+def check_fault(fault: object) -> Optional[Tuple[str, str]]:
+    """A launcher's fault, or None: a ``(step id, point)`` pair of strings, the id :data:`FAULT_STEP_RE`, the point a
+    member of :data:`FAULT_POINTS`. Else ``bad-token``, before any act. Phase A embeds it in phase B's program as a
+    literal only after this check, so nothing but those two shapes of text reaches it."""
+    if fault is None:
+        return None
+    if not (isinstance(fault, tuple) and len(fault) == 2 and all(type(x) is str for x in fault)
+            and FAULT_STEP_RE.fullmatch(fault[0]) and fault[1] in FAULT_POINTS):
+        raise Refused("bad-token", f"fault: {fault!r} (a step id R<n>[a-z], a point in Seams.POINTS)")
+    return fault[0], fault[1]
+
+
+def _kill_self() -> None:
+    """The launcher's default fault: this process killed where it stands (SIGKILL: no handler, no cleanup)."""
+    sys.stderr.flush()
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
+def fault_hook(fault: Optional[Tuple[str, str]], act: Optional[Callable[[], None]] = None) -> Optional[FaultHook]:
+    """The hook a plan calls at its points: ``act`` (default :func:`_kill_self`) at ``fault`` and nothing anywhere
+    else; None (no point steps planned at all) without a fault."""
+    if fault is None:
+        return None
+    at = check_fault(fault)
+    return lambda step, point: (act or _kill_self)() if (step, point) == at else None
+
+
+def _faulted(fault: Optional[FaultHook], step: str, steps: Iterable[Step]) -> list[Step]:
+    """R-step ``step``'s ``steps`` between its ``before`` and ``after`` points (a call step each, planned only with a
+    ``fault``, so a run without one plans exactly what it did before the seam)."""
+    if fault is None:
+        return list(steps)
+
+    def point(where: str) -> Step:
+        return Step(f"fault point {step} {where}", call=lambda: (fault(step, where), (True, ""))[1])
+    return [point("before"), *steps, point("after")]
+
+
 def _journal_step(host: HostOS, why: str, intent: Intent) -> Step:
     path, text = INTENT_PATH[host], intent_text(intent)
     return Step(why, call=lambda: write_intent_atomically(path, text))
@@ -1418,7 +1469,7 @@ def _repair_slots(rf: RepairFacts) -> tuple[SlotId, ...]:
 
 
 def plan_repair_stage(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
-                      txn: Callable[[], str] = gen_mod.new_txn) -> InstallPlan:
+                      txn: Callable[[], str] = gen_mod.new_txn, fault: Optional[FaultHook] = None) -> InstallPlan:
     """``repair --source PATH``'s PHASE A (§2.2), in the installed generation's code: every check a plan runs before
     any act, then R1 (the journal FIRST, generation unset unless an unfinished journal fixed it), R2 (the copy and its
     checks, then the id hashed over the STAGED copy and the same hash over the source), R3 (the generation placed and
@@ -1448,11 +1499,57 @@ def plan_repair_stage(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     if finished is not None:
         steps.append(Step(f"remove the finished repair journal {INTENT_PATH[host]} (its txn is install-shape's "
                           "completed_txn)", (root_tree._tools(host)["rm"], "-f", str(INTENT_PATH[host]))))
-    steps.append(intent_write_step(host, first))                                                  # R1
-    steps += root_tree.stage_hashing_steps(host, rf.source, rf.h11, cell, current=rf.current, pinned=pinned)  # R2-R3
-    steps.append(Step(f"journal the staged generation id (same txn {run_txn})", call=journal_generation))      # R3
+    steps += _faulted(fault, "R1", [intent_write_step(host, first)])                              # R1
+    staging = root_tree.stage_hashing_steps(host, rf.source, rf.h11, cell, current=rf.current, pinned=pinned,
+                                            fault=(lambda pt: fault("R2", pt)) if fault else None)
+    steps += _faulted(fault, "R2", staging[:-1])                                                  # R2: copy, hash
+    steps += _faulted(fault, "R3", [staging[-1], Step(f"journal the staged generation id (same txn {run_txn})",
+                                                      call=journal_generation)])                  # R3
     check_tools(facts, steps, verb="repair", python=True)
     return InstallPlan("repair", host, tuple(steps), intent=first, handover=cell)
+
+
+def _resumes_staged(facts: HostFacts, rf: RepairFacts) -> bool:
+    """A bare repair meets an UNFINISHED repair journal (its txn is not the record's ``completed_txn``) whose
+    journalled generation is not ``current``: a pre-flip repair, which resumes into its own generation (§2.2 r4)."""
+    j, shape = facts.intent, facts.install_shape
+    return (j is not None and j.verb == "repair" and j.generation is not None
+            and not (shape is not None and j.txn == shape.completed_txn) and j.generation != rf.current)
+
+
+def plan_repair_resume(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
+                       tree: Path | None = None) -> InstallPlan:
+    """§2.2 [r4: X3-M1, C3-F5], a bare ``repair`` in phase A (:func:`_resumes_staged`): the journal names
+    ``generation:<id>`` (written at R3, after the staged copy was made durable) and ``current`` still names the old
+    one, so the code that journalled the run's kinds must finish it. Every check a phase-A plan runs first, then
+    ``<tree>/gen-<id>`` re-hashed with the §1.1 id function. Equal: that generation is the target, already placed
+    (``Staged.existed``, never ``placed``: a restore keeps it); the plan has no step (R1-R3 ran; there is no source to
+    read), and :func:`repair_handover` probes it and execs into it exactly as after a fresh stage. Unequal (power loss
+    tore it): one step removes it and the run refuses ``source-required:<id>`` (``Staged.refused``); the journal stays
+    as found, so the next ``repair --source`` re-stages it. Absent: ``source-required:<id>``, no act."""
+    host = facts.host
+    journal, _finished, _operator, _txn = _repair_journal(cmd, facts, rf, gen_mod.new_txn, journal_kinds=False)
+    assert journal is not None and journal.generation is not None
+    check_account_ids(host, rf.accounts)
+    _check_rendered_accounts(rf, _repair_slots(rf))
+    target = journal.generation
+    gen_dir = (tree if tree is not None else root_tree.current_path(host).parent) / target
+    if not os.path.isdir(gen_dir) or os.path.islink(gen_dir):
+        raise Refused(f"source-required:{target}", f"the interrupted repair is moving to {target}, which is not in "
+                                                    "the import tree: repair --source <that levain package>")
+    try:
+        got = gen_mod.generation_id(gen_dir / "levain", gen_dir / "h11")
+    except Refused as e:
+        got = f"unreadable ({e.name})"
+    if got == target:
+        return InstallPlan("repair", host, (), intent=journal, handover=root_tree.Staged(target=target, existed=True))
+    cell = root_tree.Staged(refused=Refused(f"source-required:{target}", f"{gen_dir} hashes to {got}, not {target} "
+                                                                         "(torn), and was removed: repair --source "
+                                                                         "<that levain package>"))
+    steps = [Step(f"remove the torn generation {gen_dir} (it hashes to {got})",
+                  (root_tree._tools(host)["rm"], "-rf", str(gen_dir)))]
+    check_tools(facts, steps, verb="repair", python=True)
+    return InstallPlan("repair", host, tuple(steps), intent=journal, handover=cell)
 
 
 def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
@@ -1460,7 +1557,7 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
                 read_sysctl: Callable[[str], str] | None = None,
                 program_exists: Callable[[Path], bool] = Path.is_file, live: RM.Live | None = None,
                 end: Callable[[int, str], tuple[bool, str]] | None = None,
-                continuing: str | None = None) -> InstallPlan:
+                continuing: str | None = None, fault: Optional[FaultHook] = None) -> InstallPlan:
     """``repair [--source PATH]`` (§2.1, §2.3), the ADDITION path: setup's own plan re-applied against what is
     installed, every step idempotent, the levain + h11 pair staged as ONE generation behind one flip of ``current``.
     Order: the journal (a finished repair journal, ``txn == record.completed_txn``, is removed first and a fresh
@@ -1478,7 +1575,9 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     The whole plan in one process is the plan layer's view (its tests, ``--plan-only``). A run with ``--source``
     applies :func:`plan_repair_stage` (phase A) and then this plan with ``continuing`` = the staged generation, in
     that generation's own code (phase B, :func:`repair_continue`): the journalled generation is the target although it
-    is not ``current`` yet, and R1-R3 (phase A's) are not planned again."""
+    is not ``current`` yet, and R1-R3 (phase A's) are not planned again. ``fault``: the launcher's hook (§5 [F7]):
+    every R-step gets its ``before``/``after`` points, R9 its ``a``/``b``, R2 its ``mid-copy`` and each remove step its
+    act boundaries (the remove phase is the step id)."""
     host = facts.host
     shape = facts.install_shape
     journal, finished, operator, run_txn = _repair_journal(cmd, facts, rf, txn)
@@ -1539,7 +1638,9 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     live = live if live is not None else RM.Live()
 
     def removals(phase: str) -> list[Step]:
-        return removal_steps(host, remove, phase, live=live, held=previous, end=end)
+        # one Live per phase only for its fault hook: ``skips`` is the same set, so R14 still writes every skip
+        at = replace(live, fault=lambda pt: fault(phase, pt)) if fault is not None else live
+        return removal_steps(host, remove, phase, live=at, held=previous, end=end)
     accts = accounts_of(Allocation(host, (), (), dict(rf.accounts), {}))
     missing_groups = [Group(g, gid, ()) for g, gid in alloc.shared.items() if g not in present]
     missing_pairs = [(a, g) for a, g in membership_pairs(accts, operator) if a not in rf.members.get(g, frozenset())]
@@ -1574,33 +1675,36 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     if finished is not None:
         steps.append(Step(f"remove the finished repair journal {INTENT_PATH[host]} (its txn is install-shape's "
                           "completed_txn)", (root_tree._tools(host)["rm"], "-f", str(INTENT_PATH[host]))))
+    F = functools.partial(_faulted, fault)
     if continuing is None:                          # phase B starts at R4b: phase A journalled R1-R3
-        steps.append(intent_write_step(host, first))                                              # R1
+        steps += F("R1", [intent_write_step(host, first)])                                        # R1
         if rf.source is not None:
-            steps += root_tree.stage_steps(host, rf.source, rf.h11, target, current=rf.current)  # type: ignore[arg-type]
-        steps.append(_journal_step(host, f"journal the generation {target} (same txn)", staged))  # R3
-    steps.append(_journal_step(host, "journal the shared-group gids and the write-ahead managed set (same txn)",
-                               final))                                                            # R4b
-    steps += _stop_steps(host, stop, noted, clock, live=live)                                     # R5
-    steps += removals("R5")                         # R1b: recorded units stopped by name, then sudoers (grants first)
-    steps += shared_group_steps(host, missing_groups)                                             # R6
-    steps += membership_steps(host, missing_pairs)                                                # R7
-    steps += removals("R7")                         # R1b: members, then groups (gid retired first), then accounts
-    steps += removals("R8")                         # R1b: the confinement kinds' removals first, then the re-render
-    steps += [*row_steps(host, rows), *reserve_steps(host), *base_routes_steps(host),             # R8
-              *single_filesystem_steps(host, slots), *confinement]
+            steps += F("R2", root_tree.stage_steps(host, rf.source, rf.h11, target, current=rf.current,  # type: ignore[arg-type]
+                                                   fault=(lambda pt: fault("R2", pt)) if fault else None))
+        steps += F("R3", [_journal_step(host, f"journal the generation {target} (same txn)", staged)])  # R3
+    steps += F("R4b", [_journal_step(host, "journal the shared-group gids and the write-ahead managed set (same "
+                                           "txn)", final)])                                       # R4b
+    steps += F("R5", [*_stop_steps(host, stop, noted, clock, live=live),                          # R5
+                      *removals("R5")])             # R1b: recorded units stopped by name, then sudoers (grants first)
+    steps += F("R6", shared_group_steps(host, missing_groups))                                    # R6
+    steps += F("R7", [*membership_steps(host, missing_pairs),                                     # R7
+                      *removals("R7")])             # R1b: members, then groups (gid retired first), then accounts
+    steps += F("R8", [*removals("R8"),              # R1b: the confinement kinds' removals first, then the re-render
+                      *row_steps(host, rows), *reserve_steps(host), *base_routes_steps(host),     # R8
+                      *single_filesystem_steps(host, slots), *confinement])
     if rf.current != target:
-        steps.append(root_tree.flip_step(host, target))                                          # R9
-    steps += root_tree.entry_steps(host)                                                          # R10
-    steps += removals("R10")                        # R1b: entries after the flip (their sudoers rule went at R5)
-    steps += sudoers_steps(host, operator)                                                        # R11
-    steps += removals("R12")                        # R1b: the removed units' files
-    steps += units.install_steps(host, services)                                                  # R12
+        steps += F("R9", [root_tree.flip_step(host, target,                                       # R9
+                                              fault=(lambda pt: fault("R9", pt)) if fault else None)])
+    steps += F("R10", [*root_tree.entry_steps(host),                                              # R10
+                       *removals("R10")])           # R1b: entries after the flip (their sudoers rule went at R5)
+    steps += F("R11", sudoers_steps(host, operator))                                              # R11
+    steps += F("R12", [*removals("R12"),            # R1b: the removed units' files
+                       *units.install_steps(host, services)])                                     # R12
     if rf.legacy or gen_change:
-        steps.append(root_tree.gc_step(host, keep))                                               # R13
-    steps.append(Step(f"write the install record {shape_path} (completed_txn {run_txn}, last host act)",
-                      call=record))                                                               # R14
-    steps.append(intent_remove_step(host))                                                        # R15
+        steps += F("R13", [root_tree.gc_step(host, keep)])                                        # R13
+    steps += F("R14", [Step(f"write the install record {shape_path} (completed_txn {run_txn}, last host act)",
+                            call=record)])                                                        # R14
+    steps += F("R15", [intent_remove_step(host)])                                                 # R15
     check_tools(facts, steps, verb="repair", python=True)
     return InstallPlan("repair", host, tuple(steps), alloc, accts, tuple(missing_groups), tuple(rows),
                        retired_after=facts.retired, pending=helper_pending() + skipped,
@@ -2011,9 +2115,10 @@ def operator_only_gids(d: Directory, operator_uid: int) -> frozenset:
     return frozenset(out)
 
 
-def plan_for(cmd: InstallCommand, g: Gathered, **setup_kw) -> InstallPlan:
+def plan_for(cmd: InstallCommand, g: Gathered, *, fault: Optional[FaultHook] = None, **setup_kw) -> InstallPlan:
     """The verb's plan from what was gathered. ``setup_kw`` reaches :func:`plan_setup` (tests: its host seams).
-    Replenish fills to ``L/policy/pool`` (head ruling 8) and refuses ``pool-config-missing`` without it."""
+    Replenish fills to ``L/policy/pool`` (head ruling 8) and refuses ``pool-config-missing`` without it. ``fault``:
+    the launcher's hook, given to repair's plans (:func:`run` passes it only when :class:`Seams` carries a fault)."""
     if cmd.verb == "setup":
         return plan_setup(cmd, g.facts, **setup_kw)
     if cmd.verb == "undo":
@@ -2023,9 +2128,11 @@ def plan_for(cmd: InstallCommand, g: Gathered, **setup_kw) -> InstallPlan:
         return plan_replenish(cmd, g.facts, slots=slots, verifier_slots=verifier_slots, live=g.live,
                               accounts=g.accounts, configured=g.configured)
     if cmd.verb == "repair" and g.repair is not None and cmd.source is not None:
-        return plan_repair_stage(cmd, g.facts, g.repair)          # phase A; phase B plans in the staged code
+        return plan_repair_stage(cmd, g.facts, g.repair, fault=fault)   # phase A; phase B plans in the staged code
+    if cmd.verb == "repair" and g.repair is not None and _resumes_staged(g.facts, g.repair):
+        return plan_repair_resume(cmd, g.facts, g.repair)         # phase A, no source: into the journalled generation
     if cmd.verb == "repair" and g.repair is not None:
-        return plan_repair(cmd, g.facts, g.repair)                # bare repair: in-process, no exec, no probe
+        return plan_repair(cmd, g.facts, g.repair, fault=fault)   # bare repair: in-process, no exec, no probe
     raise Refused(f"verb-unbuilt:{cmd.verb}", cmd.verb)
 
 
@@ -2356,13 +2463,16 @@ PROBE_EXIT_BAD_RECORD = 6
 HANDOVER_ABI = 1
 
 
-def _handover_args(lock_fd: int, pool_fd: int, gen: str, caller_uid: int) -> str:
+def _handover_args(lock_fd: int, pool_fd: int, gen: str, caller_uid: int,
+                   fault: Optional[Tuple[str, str]] = None) -> str:
     """The argument list of phase A's call into ``repair_continue``: the exec's (:func:`phase_b_text`) and the probe's
-    ``inspect.signature(...).bind`` of it (:func:`probe_text`) are this one string."""
-    return f"{lock_fd}, {pool_fd}, {gen!r}, caller_uid={caller_uid}"
+    ``inspect.signature(...).bind`` of it (:func:`probe_text`) are this one string. ``fault`` [F7]: the launcher's,
+    as a literal (checked by :func:`check_fault` first); without one the text names no fault at all."""
+    at = check_fault(fault)
+    return f"{lock_fd}, {pool_fd}, {gen!r}, caller_uid={caller_uid}" + (f", fault={at!r}" if at else "")
 
 
-def probe_text(host: HostOS, gen: str, *, tree: Path | None = None) -> str:
+def probe_text(host: HostOS, gen: str, *, tree: Path | None = None, fault: Optional[Tuple[str, str]] = None) -> str:
     """The R3a probe program for ``gen``: its code on ``sys.path`` (:func:`root_tree.generation_boot_code`), then
     :func:`repair_probe` if the staged package has the handover and its ``repair_continue`` binds the exact call
     phase B's program makes (:func:`_handover_args`). Written by phase A, so every exit code but ``repair_probe``'s
@@ -2376,7 +2486,7 @@ def probe_text(host: HostOS, gen: str, *, tree: Path | None = None) -> str:
             f"    raise SystemExit({PROBE_EXIT_UNSUPPORTED})\n"
             "import inspect\n"
             "try:\n"
-            f"    inspect.signature(M.repair_continue).bind({_handover_args(0, 0, gen, 0)})\n"
+            f"    inspect.signature(M.repair_continue).bind({_handover_args(0, 0, gen, 0, fault)})\n"
             "except (TypeError, ValueError):\n"
             f"    raise SystemExit({PROBE_EXIT_HANDOVER})\n"
             "raise SystemExit(M.repair_probe())\n")
@@ -2476,7 +2586,7 @@ def _bounded_child(argv: Sequence[str], data: bytes, *, timeout: float, cap: int
 
 def run_probe(host: HostOS, gen: str, shape: gen_mod.InstallShape | None, journal: Intent | None, *,
               python: str | None = None, tree: Path | None = None, timeout: float = PROBE_TIMEOUT_S,
-              cap: int = PROBE_OUT_CAP) -> tuple[str, ...]:
+              cap: int = PROBE_OUT_CAP, fault: Optional[Tuple[str, str]] = None) -> tuple[str, ...]:
     """R3a in phase A: the staged ``gen`` asked, in a bounded child (:func:`_bounded_child`), whether it can take this
     host over. Returns its ``kinds``. A timeout, an exit other than 0, or anything but exactly one canonical
     ``{"handover":<n>,"kinds":[...],"ok":true}`` line (``handover`` may be absent), or a probe that cannot be
@@ -2490,7 +2600,7 @@ def run_probe(host: HostOS, gen: str, shape: gen_mod.InstallShape | None, journa
                             "journal": intent_text(journal) if journal is not None else None,
                             "operator": journal.operator if journal is not None else None}).encode()
     try:
-        rc, out = _bounded_child([python, root_tree.PY_FLAGS, "-c", probe_text(host, gen, tree=tree)], data,
+        rc, out = _bounded_child([python, root_tree.PY_FLAGS, "-c", probe_text(host, gen, tree=tree, fault=fault)], data,
                                  timeout=timeout, cap=cap)
     except OSError as e:                  # [r5: both seats MED] e.g. the interpreter gone, EMFILE
         raise Refused("source-broken", f"the probe of {gen} could not start ({e.strerror or e})") from None
@@ -2529,27 +2639,27 @@ def run_probe(host: HostOS, gen: str, shape: gen_mod.InstallShape | None, journa
 
 
 def phase_b_text(host: HostOS, gen: str, lock_fd: int, pool_fd: int, caller_uid: int, *, tree: Path | None = None,
-                 call: str | None = None) -> str:
+                 entry: str | None = None, fault: Optional[Tuple[str, str]] = None) -> str:
     """The R4 program: ``gen``'s code on ``sys.path``, then :func:`repair_continue` with the two inherited lock
-    descriptors. Every value in it is phase A's own (ints, a ``GEN_RE`` id): nothing the sudoers rule passes reaches
-    it, so the grammar gains no hidden verb. ``call``: a test's own entry instead (it still runs in ``gen``'s code)."""
+    descriptors (and the launcher's ``fault`` as a literal [F7], only when it set one). Every value in it is phase A's
+    own (ints, a ``GEN_RE`` id, a checked fault): nothing the sudoers rule passes reaches it, so the grammar gains no
+    hidden verb. ``entry``: a test's own callable instead of ``M.repair_continue``, called with the same arguments
+    (it still runs in ``gen``'s code)."""
     if not all(type(x) is int and x >= 0 for x in (lock_fd, pool_fd, caller_uid)):
         raise Refused("bad-token", "phase B's descriptors and caller")
-    call = call if call is not None else (f"raise SystemExit(M.repair_continue("
-                                          f"{_handover_args(lock_fd, pool_fd, gen, caller_uid)}))")
     return (f"{root_tree.generation_boot_code(host, gen, tree=tree)}\n"
             "from levain.slot import install_helper as M\n"
-            f"{call}\n")
+            f"raise SystemExit({entry or 'M.repair_continue'}({_handover_args(lock_fd, pool_fd, gen, caller_uid, fault)}))\n")
 
 
 def exec_phase_b(host: HostOS, gen: str, lock_fd: int, pool_fd: int, caller_uid: int, *, python: str | None = None,
-                 tree: Path | None = None, call: str | None = None,
+                 tree: Path | None = None, entry: str | None = None, fault: Optional[Tuple[str, str]] = None,
                  execv: Callable[[str, Sequence[str]], object] = os.execv) -> None:
     """R4 [r2: X-4]: both lock descriptors made inheritable (a flock belongs to the open file description, so it
     survives the exec), then ``execv`` into ``gen``: same PID, so sudo still waits on it. Returns only through a test's
     ``execv``."""
     python = python or root_tree.ROOT_PYTHON[host]
-    text = phase_b_text(host, gen, lock_fd, pool_fd, caller_uid, tree=tree, call=call)
+    text = phase_b_text(host, gen, lock_fd, pool_fd, caller_uid, tree=tree, entry=entry, fault=fault)
     os.set_inheritable(lock_fd, True)
     os.set_inheritable(pool_fd, True)
     try:
@@ -2626,14 +2736,17 @@ def repair_handover(plan: InstallPlan, g: Gathered, lock_fd: int, caller_uid: in
                     apply: Callable[[InstallPlan, TextIO], Optional[str]] = apply_steps,
                     probe: Callable[..., tuple[str, ...]] = run_probe,
                     execv: Callable[[str, Sequence[str]], object] = os.execv, python: str | None = None,
-                    tree: Path | None = None, intent_path: Path | None = None, call: str | None = None) -> None:
+                    tree: Path | None = None, intent_path: Path | None = None, entry: str | None = None,
+                    fault: Optional[Tuple[str, str]] = None) -> None:
     """``repair --source``'s PHASE A, from its first act to the exec (§2.2): the pool lock proven held BEFORE any act
     (so that refusal has nothing to undo), then phase A's steps (``apply``), the staged generation probed (R3a), and
     the exec into phase B (R4) with the install lock and the pool lock carried across it. [r5: both seats MED] ANY
     failure or exception in between (a failed step, the hash's refusal, the probe's, an OSError) restores the host
     (:func:`_restore_phase_a`) and is raised; a restore that could not finish appends ``rollback-incomplete: <what>``
-    to the refusal's detail. ``python``, ``tree``, ``intent_path``, ``call``: a test's interpreter, import tree,
-    journal and phase B entry."""
+    to the refusal's detail. ``fault``: the launcher's, carried into the probe's bind and phase B's program as a literal
+    [F7]. A resume (:func:`plan_repair_resume`) arrives here with its target already placed, or with its refusal set
+    once its one step removed a torn generation. ``python``, ``tree``, ``intent_path``, ``entry``: a test's
+    interpreter, import tree, journal and phase B entry."""
     host, cell = plan.host, plan.handover
     assert cell is not None
     q = g.quiesce
@@ -2650,9 +2763,10 @@ def repair_handover(plan: InstallPlan, g: Gathered, lock_fd: int, caller_uid: in
         if cell.target is None:
             raise Refused("internal", "phase A staged no generation")
         journal = replace(plan.intent, generation=cell.target) if plan.intent is not None else None
-        probe(host, cell.target, g.facts.install_shape, journal)
+        probe(host, cell.target, g.facts.install_shape, journal, fault=fault)
         err.write(f"levain install-helper: {cell.target} staged and probed; handing over to it\n")
-        exec_phase_b(host, cell.target, lock_fd, q.fd, caller_uid, python=python, tree=tree, call=call, execv=execv)
+        exec_phase_b(host, cell.target, lock_fd, q.fd, caller_uid, python=python, tree=tree, entry=entry, fault=fault,
+                     execv=execv)
     except BaseException as e:
         undone = _restore_phase_a(host, cell, prior, current, intent_path=intent_path, tree=tree)
         if not undone:
@@ -2720,10 +2834,12 @@ def adopt_lock(fd: int, path: Path, *, owner_ok: Callable[[os.stat_result], bool
         os.close(check)              # a second description: its close never drops the flock on ``fd``'s
 
 
-def _continue(lock_fd: int, pool_fd: int, gen: str, caller_uid: int, cs: ContinueSeams, err: TextIO) -> dict:
+def _continue(lock_fd: int, pool_fd: int, gen: str, caller_uid: int, cs: ContinueSeams, err: TextIO,
+              fault: Optional[Tuple[str, str]] = None) -> dict:
     host = cs.host or _host()
     if not gen_mod.GEN_RE.fullmatch(gen):
         raise Refused("bad-token", f"generation: {gen!r}")
+    hook = fault_hook(check_fault(fault))       # [F7] the launcher's literal: a kill at that point, nothing else
     rs = cs.store_seams or RH.Seams(host=host)
     L = rs.L
     adopt_lock(lock_fd, Path(cs.lock_path or INSTALL_LOCK[host]), owner_ok=cs.owner_ok)
@@ -2743,7 +2859,8 @@ def _continue(lock_fd: int, pool_fd: int, gen: str, caller_uid: int, cs: Continu
         if j is None or j.verb != "repair" or j.generation != gen:
             raise Refused("handover-mismatch", f"phase B was handed {gen}; the journal names "
                                                f"{j.generation if j is not None else 'nothing'}")
-        plan = (cs.plan or (lambda c, gg: plan_repair(c, gg.facts, gg.repair, continuing=gen)))(cmd, g)  # type: ignore[arg-type]
+        plan = (cs.plan or (lambda c, gg, **kw: plan_repair(c, gg.facts, gg.repair, continuing=gen, **kw)))(  # type: ignore[arg-type]
+            cmd, g, **({"fault": hook} if hook else {}))
         for line in plan.pending:
             err.write(f"levain install-helper: pending: {line}\n")
         failed = (cs.apply or apply_steps)(plan, err)
@@ -2758,17 +2875,18 @@ def _continue(lock_fd: int, pool_fd: int, gen: str, caller_uid: int, cs: Continu
     return {"verb": "repair", "steps": len(plan.steps), "generation": gen}
 
 
-def repair_continue(lock_fd: int, pool_fd: int, gen: str, *, caller_uid: int, seams: ContinueSeams | None = None,
-                    out: TextIO | None = None, err: TextIO | None = None) -> int:
+def repair_continue(lock_fd: int, pool_fd: int, gen: str, *, caller_uid: int, fault: Optional[Tuple[str, str]] = None,
+                    seams: ContinueSeams | None = None, out: TextIO | None = None, err: TextIO | None = None) -> int:
     """PHASE B (§2.2, §2.3 R4a on), entered only through :func:`exec_phase_b`'s ``-c`` program, in the staged
     generation's code: ADOPT the two inherited locks (:func:`adopt_lock`; non-inheritable; the pool lock's
     :class:`Quiesce` built on the descriptor and registered), re-gather under them with :func:`_gather_held` (never
     :func:`gather_facts`, which would wait on its own pool lock, never :func:`install_lock`, which would refuse
-    ``install-busy`` against itself), then plan from R4b on and apply. One canonical line on ``out``, as :func:`main`."""
+    ``install-busy`` against itself), then plan from R4b on and apply. One canonical line on ``out``, as :func:`main`.
+    ``fault``: the launcher's literal from phase A's program [F7] (SIGKILL at that point); never set by :func:`main`."""
     out = out or sys.stdout
     err = err or sys.stderr
     try:
-        line = ok_line(_continue(lock_fd, pool_fd, gen, caller_uid, seams or ContinueSeams(), err))
+        line = ok_line(_continue(lock_fd, pool_fd, gen, caller_uid, seams or ContinueSeams(), err, fault))
     except Refused as e:
         err.write(f"levain install-helper: refused {e.name}: {e.detail!r}\n")
         out.write(refusal_line(e))
@@ -2799,6 +2917,19 @@ class Seams:
     credential: Callable[..., dict] = run_credential
     #: repair --source's phase A: its steps (with ``apply``), the probe and the exec into phase B (:func:`repair_handover`).
     handover: Callable[..., None] = repair_handover
+    #: [F7] The staged-tree launcher's fault, ``(step id, point)``: set by a test harness, never by :func:`main`'s
+    #: defaults, never read from the environment, argv, the grammar or a file. :func:`run` checks it before any act.
+    fault_at: Optional[Tuple[str, str]] = None
+    #: What happens at ``fault_at`` in THIS process (default: SIGKILL). A harness action (R2's mid-copy source edit)
+    #: runs only in phase A; across the exec only the kill crosses, as the literal.
+    fault_act: Optional[Callable[[], None]] = None
+    #: The points a fault may name (membership, :data:`FAULT_POINTS`).
+    POINTS: ClassVar[frozenset] = FAULT_POINTS
+
+    def fault(self, step_id: str, point: str) -> None:
+        """The hook every planned point calls: ``fault_act`` at ``fault_at``, nothing anywhere else."""
+        if self.fault_at is not None and (step_id, point) == tuple(self.fault_at):
+            (self.fault_act or _kill_self)()
 
 
 def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextIO) -> dict[str, object]:
@@ -2810,6 +2941,7 @@ def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextI
     Inside it, the gather's :class:`Quiesce` (the pool lock) is held through the last act too."""
     if seams.euid() != 0:
         raise Refused("not-root", "the install helper runs as root")
+    fault = check_fault(seams.fault_at)          # [F7] a launcher's point outside Seams.POINTS: refused before any act
     cmd = parse_install_argv(argv)
     if cmd.verb not in BUILT_VERBS:
         raise Refused(f"verb-unbuilt:{cmd.verb}", cmd.verb)
@@ -2829,13 +2961,13 @@ def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextI
     with seams.lock(host) as lock_fd:
         gathered = seams.gather(cmd, host, caller_uid)
         try:
-            plan = seams.plan(cmd, gathered)
+            plan = seams.plan(cmd, gathered, **({"fault": seams.fault} if fault else {}))
             for line in plan.pending:
                 err.write(f"levain install-helper: pending: {line}\n")
             if plan.handover is not None:
                 # repair --source: phase A (its steps, the probe, the exec into the staged code; never returns). Any
                 # failure in it puts the host back and is raised [r5: both seats MED].
-                seams.handover(plan, gathered, lock_fd, caller_uid, err, apply=seams.apply)
+                seams.handover(plan, gathered, lock_fd, caller_uid, err, apply=seams.apply, fault=fault)
                 failed = None
             else:
                 failed = seams.apply(plan, err)
@@ -2879,7 +3011,7 @@ INSTALL_ENTRY_ENV = ("SUDO_UID",)
 
 
 __all__ = ["ContinueSeams", "PROBE_OUT_CAP", "PROBE_TIMEOUT_S", "adopt_lock", "exec_phase_b", "phase_b_text",
-           "plan_repair_stage", "probe_text", "repair_continue", "repair_handover", "HANDOVER_ABI", "repair_probe", "run_probe",
+           "plan_repair_stage", "plan_repair_resume", "check_fault", "fault_hook", "FAULT_POINTS", "probe_text", "repair_continue", "repair_handover", "HANDOVER_ABI", "repair_probe", "run_probe",
            "RepairFacts", "desired_managed", "install_shape_path", "plan_only_report", "plan_repair", "BUILT_VERBS", "CHILD_MARGIN_S", "CREDENTIAL_VERBS", "INSTALL_ENTRY_ENV", "KEYS_ACCOUNT", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
            "apply_steps", "check_account_ids", "drop_to_keys", "load_creds", "read_credential", "run_credential", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",

@@ -289,7 +289,8 @@ def _rename(src: Path, dst: Path) -> tuple[bool, str]:
     return True, ""
 
 
-def stage_steps(host: HostOS, source: Path, h11_dir: Path, target: str, *, current: str | None) -> list[Step]:
+def stage_steps(host: HostOS, source: Path, h11_dir: Path, target: str, *, current: str | None,
+                fault: Optional[Callable[[str], None]] = None) -> list[Step]:
     """§2.3 R2 + R3: stage ``source`` (a ``levain`` package dir) and ``h11_dir`` together into
     ``<tree>/staging.partial``, check it (no link before any chown or chmod; root's plain files after; h11's floor read
     as text; the id recomputed over the staged copy equals ``target``), then rename it to ``<tree>/<target>`` and make
@@ -298,7 +299,7 @@ def stage_steps(host: HostOS, source: Path, h11_dir: Path, target: str, *, curre
     t = _tools(host)
     tree = IMPORT_TREE[host]
     partial, gen = tree / STAGING, tree / target
-    steps = _copy_steps(host, source, h11_dir, partial) + [
+    steps = _copy_steps(host, source, h11_dir, partial, fault=fault) + [
         Step(f"check the staged copy hashes to {target}", call=lambda: _staged_is(target, partial)),
     ]
     if current == target:
@@ -310,15 +311,19 @@ def stage_steps(host: HostOS, source: Path, h11_dir: Path, target: str, *, curre
     ]
 
 
-def _copy_steps(host: HostOS, source: Path, h11_dir: Path, partial: Path) -> list[Step]:
-    """R2's copy and its checks into ``partial``, up to (not including) the hash."""
+def _copy_steps(host: HostOS, source: Path, h11_dir: Path, partial: Path, *,
+                fault: Optional[Callable[[str], None]] = None) -> list[Step]:
+    """R2's copy and its checks into ``partial``, up to (not including) the hash. ``fault``: the launcher's hook
+    (§5 [F7]), called with ``mid-copy`` after the levain copy and before the h11 copy; no step without it."""
     t = _tools(host)
     owner = f"root:{ROOT_GROUP[host]}"
+    mid = [Step("fault point R2 mid-copy", call=lambda: (fault("mid-copy"), (True, ""))[1])] if fault else []
     return [
         Step(f"clear {partial} (left by an interrupted run)", (t["rm"], "-rf", str(partial))),
         Step(f"create {partial}", (t["mkdir"], "-m", "700", str(partial))),
         Step(f"copy the levain package to {partial / 'levain'} (symlinks copied as links, then refused)",
              (t["cp"], "-R", "-P", str(source), str(partial / "levain"))),
+        *mid,
         Step(f"copy the h11 package to {partial / 'h11'} (symlinks copied as links, then refused)",
              (t["cp"], "-R", "-P", str(h11_dir), str(partial / "h11"))),
         Step(f"drop compiled files copied into {partial}",
@@ -395,13 +400,14 @@ def _place(host: HostOS, tree: Path, partial: Path, cell: Staged, current: Optio
 
 
 def stage_hashing_steps(host: HostOS, source: Path, h11_dir: Path, cell: Staged, *, current: Optional[str],
-                        pinned: Optional[str] = None, tree: Optional[Path] = None) -> list[Step]:
+                        pinned: Optional[str] = None, tree: Optional[Path] = None,
+                        fault: Optional[Callable[[str], None]] = None) -> list[Step]:
     """Repair's phase A stage (§2.3 R2 + R3, r3 X2-M3): :func:`stage_steps`'s copy and checks, then the id hashed
     over the STAGED copy (into ``cell``) and checked against the source, then the generation placed and made durable.
     The R3 journal of ``generation:<id>`` is the caller's next step, so it always follows the hash."""
     tree = tree if tree is not None else IMPORT_TREE[host]
     partial = tree / STAGING
-    return _copy_steps(host, source, h11_dir, partial) + [
+    return _copy_steps(host, source, h11_dir, partial, fault=fault) + [
         Step(f"hash the staged copy {partial}; the same hash over {source} must equal it",
              call=lambda: _hash_staged(cell, partial, source, h11_dir, pinned)),
         Step(f"place the staged generation in {tree} (dropped if it is current; else renamed to gen-<id> and made "
@@ -420,10 +426,11 @@ def generation_boot_code(host: HostOS, gen: str, *, tree: Optional[Path] = None)
     return f"import os, sys; sys.path.insert(0, os.path.realpath({str(path)!r}))"
 
 
-def _flip(tree: Path, target: str) -> tuple[bool, str]:
+def _flip(tree: Path, target: str, *, fault: Optional[Callable[[str], None]] = None) -> tuple[bool, str]:
     """§2.3 R9: ``current.new`` -> ``target``, renamed over ``current`` (rename(2) replaces it atomically: there is
     no instant at which ``current`` names a mixed pair or nothing), then the tree fsynced. Never ``mv``: BSD ``mv``
-    onto a link to a directory moves the source INTO it."""
+    onto a link to a directory moves the source INTO it. ``fault`` (§5 [F7]): called with ``a`` after the symlink and
+    before the rename, ``b`` after the rename and before the fsync."""
     new, cur = tree / f"{CURRENT}.new", tree / CURRENT
     try:
         st = os.lstat(new)
@@ -440,7 +447,11 @@ def _flip(tree: Path, target: str) -> tuple[bool, str]:
     except FileNotFoundError:
         pass
     os.symlink(target, new)
+    if fault is not None:
+        fault("a")
     os.replace(new, cur)
+    if fault is not None:
+        fault("b")
     fd = os.open(str(tree), os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(fd)
@@ -473,9 +484,9 @@ def read_current(tree: Path) -> str | None:
     return out
 
 
-def flip_step(host: HostOS, target: str) -> Step:
+def flip_step(host: HostOS, target: str, *, fault: Optional[Callable[[str], None]] = None) -> Step:
     tree = IMPORT_TREE[host]
-    return Step(f"flip {current_path(host)} -> {target}", call=lambda: _flip(tree, target))
+    return Step(f"flip {current_path(host)} -> {target}", call=lambda: _flip(tree, target, fault=fault))
 
 
 def entry_steps(host: HostOS) -> list[Step]:
