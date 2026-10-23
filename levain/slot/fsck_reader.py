@@ -185,6 +185,17 @@ class _Store:
         self._end()
         return payload
 
+    def head(self, oid: str, kind: str, size: int, keep: int) -> bytes:
+        """The first ``keep`` bytes of a ``kind`` object the probe sized at ``size``; the rest of its one response
+        drained unparsed (the preview's reads, :mod:`levain.slot.adopt_preview`)."""
+        self._open(oid, kind, size)
+        out = self._read(min(keep, size))
+        left = size - len(out)
+        while left > 0:
+            left -= len(self._read(min(_CHUNK, left)))
+        self._end()
+        return out
+
     def commit_tree(self, oid: str, size: int, stats: Stats) -> str:
         """The commit's ``tree`` oid from its first line; the rest of the response drained unparsed."""
         self._open(oid, "commit", size)
