@@ -354,6 +354,8 @@ def _ceil_mul(tokens: int, rate_per_million: int) -> int:
 #: the one SSE event the side reader holds, and the non-stream body it copies; past either the exchange has no usage
 USAGE_EVENT_MAX = 1 << 20
 USAGE_COPY_MAX = 1 << 20
+#: the side reader's `stopped` values that are a cap hit
+_CAP_STOPS = ("body-over-cap", "event-over-cap")
 
 
 @dataclass(frozen=True)
@@ -433,6 +435,12 @@ class UsageReader:
                 self._buf += part
         except Exception as e:   # the side reader never fails the relay
             self._stop(type(e).__name__)
+
+    @property
+    def reason(self) -> str:
+        """The `uncertain` reason of an exchange whose `result` is None: `usage-over-cap` when either cap stopped the
+        reader (a large call whose real cost may pass its hold unseen), else `no-usage`."""
+        return "usage-over-cap" if self.stopped in _CAP_STOPS else "no-usage"
 
     def _stop(self, why: str) -> None:
         self.stopped = why

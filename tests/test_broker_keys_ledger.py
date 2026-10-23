@@ -224,12 +224,17 @@ USAGE_30 = b'{"type":"message","usage":{"input_tokens":20,"output_tokens":5}}'
     (USAGE_30, b"application/json", ("settled", 30, {"usage": {"in": 20, "out": 5, "cache_write": 0,
                                                                "cache_read": 0}})),
     (b"abcde", b"text/plain", ("uncertain", "no-usage", {})),
+    # L3 r1 complement 3: a body past USAGE_COPY_MAX (scaled down to one byte under it here) is its own
+    # reason, `usage-over-cap`
+    pytest.param(USAGE_30, b"application/json", ("uncertain", "usage-over-cap", {}), id="over-cap"),
 ])
 def test_completed_relay_settles_from_usage(monkeypatch, body, ctype, want):
     # R4 §1.2 (3c-2b): a relay that ends normally settles from its reported usage priced by class, its meta the usage;
     # one with none is `uncertain {no-usage}`, charged its hold. The `else: end()` after it is a no-op, and the owner
     # callback adds nothing. (3c-1's cut settled every completed relay at its full hold.)
     up = _Up()
+    if want[1] == "usage-over-cap":
+        monkeypatch.setattr(codec, "USAGE_COPY_MAX", len(body) - 1)
 
     async def go(d: str) -> dict:
         _scripted(monkeypatch, up)
@@ -257,8 +262,8 @@ def test_completed_relay_settles_from_usage(monkeypatch, body, ctype, want):
         assert (line["kind"], line["settled"], line["overrun"]) == ("settled", 30, 0)
         assert out["outcome"] == (L.SETTLED, 30, 0) and out["charged"] == 30
     else:
-        assert (line["kind"], line["reason"]) == ("uncertain", "no-usage")
-        assert out["outcome"] == (L.UNCERTAIN, "no-usage") and out["charged"] == AMOUNT
+        assert (line["kind"], line["reason"]) == ("uncertain", want[1])
+        assert out["outcome"] == (L.UNCERTAIN, want[1]) and out["charged"] == AMOUNT
     assert out["stopped"] == set()    # under the hold: the session is not stopped
 
 

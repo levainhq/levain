@@ -685,3 +685,26 @@ def test_codec_usage_anthropic_delta_nulls_never_override_the_start():
               ("message_delta", dict(e[1], usage={"output_tokens": 15, "input_tokens": 480}))
               for e in UR.ANTHROPIC_SSE]
     assert _read("anthropic-messages", UR._sse(events), True) == _u(480, 15, 100, 200)
+
+
+@pytest.mark.parametrize("cname", sorted(codec.CODECS))
+def test_codec_usage_cap_hit_has_its_own_reason(cname):
+    # L3 r1 complement 3: a side reader stopped by either cap answers `usage-over-cap`, distinct from `no-usage`
+    ev = codec.CODECS[cname].usage(CT_SSE)
+    ev.feed(b"data: " + b"x" * (codec.USAGE_EVENT_MAX + 1) + b"\n\n")
+    data = UR.body(cname, False)
+    body = codec.CODECS[cname].usage(CT_JSON)
+    body.feed(data[:-1] + b" " * (codec.USAGE_COPY_MAX - len(data) + 1) + data[-1:])
+    assert (ev.result(), ev.reason) == (None, "usage-over-cap")
+    assert (body.result(), body.reason) == (None, "usage-over-cap")
+    cut = codec.CODECS[cname].usage(CT_JSON)
+    cut.feed(data[:-1])
+    assert (cut.result(), cut.reason) == (None, "no-usage")
+    whole = codec.CODECS[cname].usage(CT_JSON)
+    whole.feed(data)
+    assert whole.result() is not None
+
+
+def test_usage_over_cap_reason_is_a_ledger_reason():
+    from levain.broker import ledger
+    assert ledger._REASON_RE.fullmatch("usage-over-cap") and "usage-over-cap" not in ledger.RESERVED_REASONS
