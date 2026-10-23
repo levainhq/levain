@@ -232,6 +232,45 @@ def test_wrap_success_writes_the_neocortex_into_the_entity_tree(tmp_path, capsys
         assert store.get_wrap_started_at() is None  # completed, not left hanging
 
 
+def test_wrap_report_carries_no_associations_line_and_names_the_wrap_when_the_save_does(
+        tmp_path, capsys, monkeypatch):
+    ent = _openhands_entity(tmp_path)
+    _with_store(ent, episodes=2)
+    monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
+    assert wrap_entity(ent) == 0
+    out = capsys.readouterr().out
+    assert "associations:" not in out and "formed" not in out and "strengthened" not in out
+    assert "deprecated" not in out                       # no affect flag passed: no deprecation line
+
+
+def test_report_prints_the_wrap_id_only_when_the_save_result_has_one(capsys):
+    wrapmod._report({"path": "p", "chars": 1, "episodes_compressed": 2, "wrap_id": 7}, Path("ent"))
+    assert "wrap:         #7" in capsys.readouterr().out
+    wrapmod._report({"path": "p", "chars": 1, "episodes_compressed": 2}, Path("ent"))   # anneal 1.0.1
+    assert "wrap:         #" not in capsys.readouterr().out
+
+
+def test_the_affect_flags_are_a_deprecated_pass_through_that_says_so_once(tmp_path, capsys, monkeypatch):
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent, episodes=2)
+    monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
+    seen: dict = {}
+    import anneal_memory.continuity as cont
+    real = cont.validated_save_continuity
+
+    def spy(*a, **k):
+        seen.update(k)
+        return real(*a, **k)
+
+    monkeypatch.setattr(cont, "validated_save_continuity", spy)
+    assert wrap_entity(ent, affect_tag="engaged", affect_intensity=0.9) == 0
+    out = capsys.readouterr().out
+    assert out.count("--affect-tag / --affect-intensity are deprecated and ignored") == 1
+    assert "affective_state" not in seen                 # never built, never sent
+    with Store(str(db), section_schema=None) as store:
+        assert store.get_wrap_started_at() is None       # and the wrap still completed
+
+
 def test_wrap_names_a_hard_maximum_refusal_and_leaves_no_wrap_open(tmp_path, capsys, monkeypatch):
     """anneal 0.9.33 refuses a continuity above `hard_max_chars(schema)` and leaves the wrap open;
     `levain wrap` cancels its own wrap and says the memory is too long (reproduced 2026-10-04)."""

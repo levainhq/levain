@@ -849,8 +849,8 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         dest="affect_tag",
         help=(
-            "Optional emergent affective state during this consolidation (free-text, e.g. "
-            "'engaged') — tags the Hebbian associations formed this wrap. Omit for no modulation."
+            "DEPRECATED and ignored: anneal no longer tags associations with an affective state. "
+            "Still accepted so existing scripts keep working; it prints one line and does nothing."
         ),
     )
     wrap_p.add_argument(
@@ -858,7 +858,7 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.5,
         dest="affect_intensity",
-        help="How strongly the --affect-tag state was felt, 0.0-1.0 (default 0.5). Ignored without --affect-tag.",
+        help="DEPRECATED and ignored, like --affect-tag.",
     )
     wrap_p.add_argument(
         "--max-seconds",
