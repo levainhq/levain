@@ -534,6 +534,41 @@ def test_take_prerequisite_absent_refused(ex, tmp_path):
     assert g("for-each-ref", "refs/heads/levain", cwd=repo) == b""
 
 
+def test_take_prerequisite_replaced_refused(ex, tmp_path):
+    """L3 r2 (codex OPEN): a repo lacking the prerequisite but holding ``refs/replace/<prerequisite>`` onto a commit it
+    has = ``base-missing``, no pack, no ref. Every take git reads literal objects (``GIT_NO_REPLACE_OBJECTS=1``):
+    ``cat-file -t`` honours the replace ref under a plain env and not under :func:`git_env`. (``cat-file -e`` answered
+    rc 1 here on both measured gits with or without it: ``1023-6/adopt/s3f3_replace_probe.txt``.)"""
+    repo = tmp_path / "other"
+    g("init", "-q", str(repo))
+    (repo / "b.txt").write_text("not the base\n")
+    g("add", "b.txt", cwd=repo)
+    g("commit", "-q", "-m", "other", cwd=repo)
+    g("update-ref", f"refs/replace/{ex['base']}", g("rev-parse", "HEAD", cwd=repo).decode().strip(), cwd=repo)
+    probe = [GIT, "cat-file", "-t", ex["base"]]
+    assert subprocess.run(probe, cwd=repo, env=ENV, capture_output=True).stdout == b"commit\n"   # git honours it
+    assert subprocess.run(probe, cwd=repo, env=AT.git_env(), capture_output=True).returncode != 0
+    assert refused(lambda: take(ex, repo, tmp_path)) == "base-missing"
+    assert os.listdir(repo / ".git" / "objects" / "pack") == []
+    assert g("for-each-ref", "refs/heads/levain", cwd=repo) == b""
+
+
+def test_take_both_skipped_fsyncs_pack_dir_before_ref(ex, tmp_path, monkeypatch):
+    """L3 r2 (codex HIGH): both final names already present (another take linked them, its dir fsync maybe not yet
+    run) = ``migrate`` still fsyncs ``objects/pack`` once, and before the ref is created."""
+    repo = tmp_path / "his"
+    make_his(repo)
+    take(ex, repo, tmp_path)
+    events: list = []
+    real_ref = AT.create_ref
+    monkeypatch.setattr(AT, "_full_fsync",
+                        lambda fd: events.append("dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"))
+    monkeypatch.setattr(AT, "create_ref", lambda *a, **k: (events.append("ref"), real_ref(*a, **k))[1])
+    t = take(ex, repo, tmp_path, which="wip")
+    assert t.migrated.skipped == [t.migrated.pack, t.migrated.idx] and t.migrated.written == []
+    assert events == ["dir", "ref"]
+
+
 @pytest.mark.parametrize("bad", ["s-" + "E4" * 8, "s-" + "e4" * 7, "s-" + "e4" * 8 + "0", "../x", "s-e4e4/../e4e4"])
 def test_take_session_id_refused(ex, tmp_path, bad):
     """A session id outside the design's form (``^s-[0-9a-f]{16}$``) is refused before anything is read."""
