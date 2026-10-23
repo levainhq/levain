@@ -14,8 +14,15 @@ from pathlib import Path
 import pytest
 
 from levain.slot import wall
+from tests.execve_guard import refuse_real_execve
 
 pytestmark = pytest.mark.skipif(os.getuid() == 0, reason="the stage refuses uid 0 by design")
+
+@pytest.fixture(autouse=True)
+def _no_real_execve(monkeypatch):
+    """The stage runs only in the RUNNER's own process here; nothing in this one may exec."""
+    yield from refuse_real_execve(monkeypatch, wall.os)
+
 
 ROOT = str(Path(wall.__file__).resolve().parents[2])
 
@@ -38,11 +45,13 @@ if r != 3:                # the pipe may already sit on fd 3
     os.dup2(r, 3)
     os.close(r)
 
+real_execve = os.execve
+
 
 def execve(path, argv, env):
     if "sandbox-exec" in path or any("sandbox-exec" in a for a in argv):
         raise SystemExit("refusing to run a profile in a unit test")
-    os.execve(path, argv, env)
+    real_execve(path, argv, env)
 
 
 calls = wall.real_os_calls()
@@ -50,7 +59,7 @@ calls.setgroups = lambda gs: None
 calls.setgid = lambda g: None
 calls.setuid = lambda u: None
 calls.getgroups = lambda: list(groups)
-calls.execve = execve
+wall.os.execve = execve   # wall calls os.execve itself
 sys.exit(wall.stage_main(3, calls))
 """
 

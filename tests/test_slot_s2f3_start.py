@@ -26,6 +26,7 @@ from levain.slot import start as SS
 from levain.slot.ids import SlotId
 from levain.slot.layout import STORE
 from levain.slot.root_tree import VENDOR_PREFIX
+from tests.execve_guard import refuse_real_execve, using
 from tests.test_slot_s2c_end import mine, thread_run_as
 from tests.test_slot_s2f2_runtime_helper import OP_UID, World, _blob, _prepared
 
@@ -452,10 +453,12 @@ class StageFake:
             getuid=lambda: self.r[0], geteuid=lambda: self.r[1], getgid=lambda: spec.gid, getegid=lambda: spec.gid,
             getgroups=lambda: list(self.groups), seteuid=self._eperm, setegid=self._eperm,
             getrlimit=lambda w: (2048, 2048), setrlimit=lambda w, l: None,
-            read_fd=lambda fd, cap: spec.to_json(), read_file=self._read, chdir=lambda p: None,
+            read_fd=self._spec, read_file=self._read, chdir=lambda p: None,
             list_fds=lambda: sorted(self.fds), close=self.fds.discard, set_inheritable=self._inh,
             write_fd=lambda fd, b: self.written.append((fd, b)), access_x=lambda p: True,
-            execve=self._exec, dup2=lambda a, b: None, getpid=lambda: 1)
+            dup2=lambda a, b: None, getpid=lambda: 1)
+        self.spec = spec
+        self.execve = self._exec     # wall calls os.execve itself: the module's guard routes it here
 
     @staticmethod
     def _eperm(x):
@@ -467,13 +470,23 @@ class StageFake:
             raise FileNotFoundError(path)
         return self.files[path]
 
+    def _spec(self, fd, cap):
+        using(self)
+        return self.spec.to_json()
+
     def _inh(self, fd, v):
+        using(self)
         (self.inheritable.add if v else self.inheritable.discard)(fd)
 
     def _exec(self, path, argv, env):
         self.at_exec = {"fds": set(self.fds), "inheritable": set(self.inheritable) & self.fds, "env": env,
                         "path": path, "argv": list(argv), "written": list(self.written)}
         raise Execd()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_execve(monkeypatch):
+    yield from refuse_real_execve(monkeypatch, wall.os, route=True)
 
 
 @pytest.fixture

@@ -38,6 +38,7 @@ from levain.slot import runtime_helper as H
 from levain.slot import start as SS
 from levain.slot.ids import RANGES, SlotId
 from levain.slot.root_tree import VENDOR_PREFIX
+from tests.execve_guard import refuse_real_execve
 from tests.test_slot_s2d_forwarder import sockdir  # noqa: F401,F811 - the short /tmp socket dir fixture
 from tests.test_slot_s2f2_runtime_helper import OP_UID
 from tests.test_slot_s2f3_start import (DARWIN_IDS, E0, S0, Execd, StageFake, _rendered, _S, _world)
@@ -146,6 +147,11 @@ def _vendor_spec(host):
                             extra_env={"ANTHROPIC_API_KEY": "tok"}, exec_fd=wall.EXEC_FD)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_execve(monkeypatch):
+    yield from refuse_real_execve(monkeypatch, wall.os, route=True)
+
+
 def _env_bytes(sp):
     return b"HOME=" + sp.cwd.rsplit("/", 1)[0].encode() + b"\n"
 
@@ -169,7 +175,7 @@ def test_linux_execve_failing_after_the_marker_writes_the_refusal(monkeypatch):
 
     def enoexec(path, argv, env):
         raise OSError(errno.ENOEXEC, "exec format error")
-    fake.calls.execve = enoexec
+    fake.execve = enoexec
     assert wall.stage_main(3, fake.calls) == wall.STAGE_EXIT
     assert fake.written == [(wall.EXEC_FD, b"+"), (wall.EXEC_FD, b"!")]
 
@@ -192,11 +198,11 @@ def test_macos_stage_hands_the_marker_to_the_trampoline_under_the_profile(monkey
 
     def enoent(path, argv, env):
         raise FileNotFoundError(errno.ENOENT, path)
-    bad.calls.execve = enoent
+    bad.execve = enoent
     assert wall.stage_main(3, bad.calls) == wall.STAGE_EXIT and bad.written == [(wall.EXEC_FD, b"!")]
 
 
-def test_trampoline_marker_order_and_refusals():
+def test_trampoline_marker_order_and_refusals(monkeypatch):
     log = []
     tw = lambda fd, b: log.append(("write", fd, b))
     ti = lambda fd, v: log.append(("cloexec", fd, v))
@@ -204,13 +210,14 @@ def test_trampoline_marker_order_and_refusals():
     def ex(path, argv, env):
         log.append(("execve", path, argv, dict(env)))
         raise OSError(errno.ENOENT, "gone")
+    monkeypatch.setattr(wall.os, "execve", ex)
     argv = ["--exec-fd", "4", "--", "/v/claude", "--x"]
-    assert wall.trampoline_main(argv, write=tw, set_inheritable=ti, execve=ex, environ={b"K": b"v"}) == wall.STAGE_EXIT
+    assert wall.trampoline_main(argv, write=tw, set_inheritable=ti, environ={b"K": b"v"}) == wall.STAGE_EXIT
     assert log[:2] == [("cloexec", 4, False), ("write", 4, b"+")]
     assert log[2] == ("execve", b"/v/claude", [b"/v/claude", b"--x"], {b"K": b"v"}) and log[3] == ("write", 4, b"!")
     for bad in (["--exec-fd", "5", "--", "/v"], ["--exec-fd", "4", "/v"], ["--exec-fd", "4", "--", "rel"]):
         log.clear()
-        assert wall.trampoline_main(bad, write=tw, set_inheritable=ti, execve=ex) == wall.STAGE_EXIT
+        assert wall.trampoline_main(bad, write=tw, set_inheritable=ti) == wall.STAGE_EXIT
         assert ("execve" not in [x[0] for x in log]) and all(x[2] != b"+" for x in log if x[0] == "write")
         assert [x for x in log if x[0] == "write"] == ([] if bad[1] != "4" else [("write", 4, b"!")])
 
@@ -236,11 +243,13 @@ if r != 3:
     os.dup2(r, 3)
     os.close(r)
 
+real_execve = os.execve
+
 
 def execve(path, argv, env):
     if "sandbox-exec" in path or any("sandbox-exec" in a for a in argv):
         raise SystemExit("refusing to run a profile in a unit test")
-    os.execve(path, argv, env)
+    real_execve(path, argv, env)
 
 
 calls = wall.real_os_calls()
@@ -249,7 +258,7 @@ calls.setgid = lambda g: None
 calls.setuid = lambda u: None
 calls.getgroups = lambda: [os.getgid()]
 calls.set_nnp = None      # a test user's stage: the host's prctl is not this test's subject
-calls.execve = execve
+wall.os.execve = execve   # wall calls os.execve itself
 sys.exit(wall.stage_main(3, calls))
 """
 

@@ -30,6 +30,7 @@ from levain.slot import install_helper as IH
 from levain.slot import root_tree
 from levain.slot.grammar import parse_install_argv
 from levain.slot.intent import Intent, install_lock, intent_text, read_intent
+from tests.execve_guard import refuse_real_execve
 
 HOST = "darwin" if sys.platform == "darwin" else "linux"
 GEN = "gen-" + "ab" * 8
@@ -141,12 +142,19 @@ with install_lock(path=Path(cfg["lock"]), owner_ok=lambda st: st.st_uid == os.ge
     pool = os.open(os.path.join(cfg["store"], "slots", "pool.lock"), os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
     fcntl.flock(pool, fcntl.LOCK_EX)
     fault = tuple(cfg["fault"]) if cfg.get("fault") and cfg["mutant"] != "inprocess" else None
+    real_execve = os.execve
     def execve(path, argv, env):            # the real exec, with the env exec_phase_b chose plus this test's config
         assert "R2S2_CFG" not in env        # child_env(): never this process's whole environment
-        os.execve(path, argv, {**env, "R2S2_CFG": os.environ["R2S2_CFG"]})
+        real_execve(path, argv, {**env, "R2S2_CFG": os.environ["R2S2_CFG"]})
+    IH.os.execve = execve                   # exec_phase_b calls os.execve itself
     IH.exec_phase_b(cfg["host"], cfg["gen"], lock_fd, pool, os.getuid(), python=sys.executable,
-                    tree=Path(cfg["tree"]), entry="__import__('_phase_b').main", fault=fault, execve=execve)
+                    tree=Path(cfg["tree"]), entry="__import__('_phase_b').main", fault=fault)
 '''
+
+
+@pytest.fixture(autouse=True)
+def _no_real_execve(monkeypatch):
+    yield from refuse_real_execve(monkeypatch, IH.os)
 
 
 def _line(p: subprocess.Popen, timeout: float = 60.0) -> dict:
@@ -233,7 +241,7 @@ def test_phase_b_adopts_both_locks_red_mutants(tmp_path: Path, mutant: str, refu
 _HANDOVER = 'def repair_continue(*a, **k):\n    return 0\n'
 
 
-def _phase_a(tmp: Path, gen_maker, *, prior: Intent | None = None, shape: G.InstallShape | None = None,
+def _phase_a(tmp: Path, monkeypatch, gen_maker, *, prior: Intent | None = None, shape: G.InstallShape | None = None,
              timeout: float = 30.0, apply=None, hold: bool = True, python: str = sys.executable):
     """A phase A that has staged ``GEN`` (the plan's hash step ran), holding a real install lock and pool lock, run
     through :func:`IH.run`'s own lock/release order with the real :func:`IH.repair_handover` and probe. ``prior``:
@@ -253,6 +261,7 @@ def _phase_a(tmp: Path, gen_maker, *, prior: Intent | None = None, shape: G.Inst
     facts = IH.HostFacts(host=HOST, caller_uid=os.getuid(), intent=prior, install_shape=shape)
     rf = IH.RepairFacts(current=None)
     execs: list = []
+    monkeypatch.setattr(IH.os, "execve", lambda *a: execs.append(a))   # returns: run() goes on
     acts: list = []
 
     def gather(cmd, host, uid):
@@ -270,8 +279,7 @@ def _phase_a(tmp: Path, gen_maker, *, prior: Intent | None = None, shape: G.Inst
                      gather=gather, plan=lambda cmd, g: plan, apply=apply or r1,
                      handover=functools.partial(IH.repair_handover, tree=tree, intent_path=jpath,
                                                 probe=functools.partial(IH.run_probe, python=python,
-                                                                        tree=tree, timeout=timeout),
-                                                execve=lambda *a: execs.append(a)))
+                                                                        tree=tree, timeout=timeout)))
     seams.acts = acts                                        # type: ignore[attr-defined]
     return seams, q, state, L, tree, jpath, execs
 
@@ -290,7 +298,7 @@ def _monkey_built(monkeypatch) -> None:
 def test_a_probe_past_its_timeout_is_source_broken_and_both_locks_are_released(tmp_path: Path, monkeypatch) -> None:
     _monkey_built(monkeypatch)
     sleeper = "import time\ndef repair_probe():\n    time.sleep(30)\n    return 0\n" + _HANDOVER
-    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(t, GEN, sleeper),
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, monkeypatch, lambda t: _fake_generation(t, GEN, sleeper),
                                                       timeout=1.0)
     with pytest.raises(Refused) as e:
         _go(seams)
@@ -312,7 +320,7 @@ def test_a_probe_past_its_timeout_is_source_broken_and_both_locks_are_released(t
 ])
 def test_the_probe_refuses_by_name(tmp_path: Path, monkeypatch, helper: str, refused: str) -> None:
     _monkey_built(monkeypatch)
-    seams, q, *_rest = _phase_a(tmp_path, lambda t: _fake_generation(t, GEN, helper))
+    seams, q, *_rest = _phase_a(tmp_path, monkeypatch, lambda t: _fake_generation(t, GEN, helper))
     with pytest.raises(Refused) as e:
         _go(seams)
     assert e.value.name == refused and not q.held
@@ -324,7 +332,7 @@ def test_the_probe_holds_every_recorded_kind_and_restores_an_earlier_journal(tmp
     _monkey_built(monkeypatch)
     lacks = _answers(["unit/1"])
     prior = Intent("repair", OP, txn=TXN, managed=(("netns/1", "levain-e0"),))
-    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(t, GEN, lacks),
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, monkeypatch, lambda t: _fake_generation(t, GEN, lacks),
                                                       prior=prior)
     with pytest.raises(Refused) as e:
         _go(seams)
@@ -337,7 +345,7 @@ def test_the_real_staged_code_passes_the_probe_and_phase_a_execs(tmp_path: Path,
     lock descriptors to the exec (inheritable) instead of releasing them."""
     _monkey_built(monkeypatch)
     shape = G.InstallShape("gen-" + "0" * 16, "0.9.0", "0.16.0", TXN, {}, (("unit/1", "keys"),))
-    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, _real_generation, shape=shape)
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, monkeypatch, _real_generation, shape=shape)
     assert IH.run_probe(HOST, GEN, shape, None, python=sys.executable, tree=tree) == tuple(sorted(G.KINDS))
     _go(seams)                                               # the fake execve returns, so run() goes on
     (python, argv, env), = execs
@@ -495,7 +503,7 @@ def test_the_staged_probe_judges_a_journalled_kind(tmp_path: Path, monkeypatch, 
     lacks it refuses by the kind's name."""
     _monkey_built(monkeypatch)
     prior = Intent("repair", OP, txn=TXN, managed=(NEW_KIND,))
-    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(t, GEN,
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, monkeypatch, lambda t: _fake_generation(t, GEN,
                                                                                           _answers(staged_kinds)),
                                                       prior=prior)
     if refused is None:
@@ -512,7 +520,7 @@ def test_a_probe_with_another_handover_abi_refuses_before_the_exec(tmp_path: Pat
     """Ruling 2 (codex MED 3): the probe answers a ``handover`` ABI; any other (or none) refuses
     ``downgrade-unsupported:handover`` before the exec, the host restored."""
     _monkey_built(monkeypatch)
-    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, monkeypatch, lambda t: _fake_generation(
         t, GEN, _answers(G.KINDS, handover)))
     with pytest.raises(Refused) as e:
         _go(seams)
@@ -529,7 +537,7 @@ def test_a_failed_phase_a_step_restores_the_host(tmp_path: Path, monkeypatch) ->
         jpath.write_text(intent_text(Intent("repair", OP, txn=TXN)))
         return "[3/14] copy the levain package FAILED: cp exited 1"
 
-    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: t.mkdir(), apply=lambda p, e: failing(p, e))
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, monkeypatch, lambda t: t.mkdir(), apply=lambda p, e: failing(p, e))
     with pytest.raises(Refused) as e:
         _go(seams)
     assert e.value.name == "step-failed" and "cp exited 1" in e.value.detail and not execs
@@ -540,7 +548,7 @@ def test_a_probe_that_cannot_start_restores_the_host(tmp_path: Path, monkeypatch
     """Ruling 3 (both seats): an OSError launching the probe (its interpreter gone) is ``source-broken``, host put
     back (the staged generation and the run's journal removed)."""
     _monkey_built(monkeypatch)
-    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(t, GEN, _answers(G.KINDS)),
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, monkeypatch, lambda t: _fake_generation(t, GEN, _answers(G.KINDS)),
                                                       python=str(tmp_path / "no-such-python"))
     with pytest.raises(Refused) as e:
         _go(seams)
@@ -551,7 +559,7 @@ def test_a_probe_that_cannot_start_restores_the_host(tmp_path: Path, monkeypatch
 def test_no_pool_lock_refuses_before_any_phase_a_act(tmp_path: Path, monkeypatch) -> None:
     """Ruling 3 (codex 5): the pool-lock check runs BEFORE phase A's first act, so it has nothing to undo."""
     _monkey_built(monkeypatch)
-    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(t, GEN, _answers(G.KINDS)),
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, monkeypatch, lambda t: _fake_generation(t, GEN, _answers(G.KINDS)),
                                                       hold=False)
     with pytest.raises(Refused) as e:
         _go(seams)
@@ -562,7 +570,7 @@ def test_a_restore_that_cannot_rewrite_the_journal_says_so(tmp_path: Path, monke
     """Ruling 3 (complement LOW 3): a restore whose journal write fails appends ``rollback-incomplete: <what>``."""
     _monkey_built(monkeypatch)
     prior = Intent("repair", OP, txn=TXN, managed=(("netns/1", "levain-e0"),))
-    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(t, GEN,
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, monkeypatch, lambda t: _fake_generation(t, GEN,
                                                                                           _answers(["unit/1"])),
                                                       prior=prior)
     monkeypatch.setattr(IH, "write_intent_atomically", lambda path, text: (False, "disk full (test)"))
@@ -584,7 +592,7 @@ def test_the_restore_keeps_a_generation_that_was_there_before(tmp_path: Path, mo
         shutil.copytree(tree / GEN, tree / root_tree.STAGING)            # the staged copy: the same content
         return None if root_tree._place(HOST, tree, tree / root_tree.STAGING, cell, None)[0] else "place failed"
 
-    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(t, GEN, "def setup():\n"
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, monkeypatch, lambda t: _fake_generation(t, GEN, "def setup():\n"
                                                                                                   "    pass\n"),
                                                       apply=lambda p, e: stage_and_place(p, e))
     cell = seams.plan(None, None).handover
@@ -664,7 +672,7 @@ def test_a_probe_whose_repair_continue_takes_another_call_shape_refuses_handover
     ``downgrade-unsupported:handover`` before the exec, host restored."""
     _monkey_built(monkeypatch)
     wrong = _answers(G.KINDS).replace(_HANDOVER, "def repair_continue(lock_fd, gen):\n    return 0\n")
-    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, lambda t: _fake_generation(t, GEN, wrong))
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, monkeypatch, lambda t: _fake_generation(t, GEN, wrong))
     with pytest.raises(Refused) as e:
         _go(seams)
     assert e.value.name == "downgrade-unsupported:handover" and not execs
@@ -695,7 +703,7 @@ def test_an_exception_between_the_hash_and_the_place_keeps_a_pre_existing_target
         for name, src in (("levain", lv), ("h11", h11)):
             shutil.copytree(src, t / gid / name)
 
-    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, retained, apply=lambda p, e: hash_then_raise(p, e))
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, monkeypatch, retained, apply=lambda p, e: hash_then_raise(p, e))
     cell = seams.plan(None, None).handover
     with pytest.raises(BrokenPipeError):
         _go(seams)
@@ -708,7 +716,7 @@ def test_the_staged_probe_refuses_an_out_of_bound_identity(tmp_path: Path, monke
     gid outside the shared range) is refused AT THE PROBE (``bad-record``), the host restored, never in phase B."""
     _monkey_built(monkeypatch)
     prior = Intent("repair", OP, txn=TXN, managed=(("group/1", ("levain-keysadmin", 80)),))
-    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, _real_generation, prior=prior)
+    seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, monkeypatch, _real_generation, prior=prior)
     with pytest.raises(Refused) as e:
         _go(seams)
     assert e.value.name == "bad-record" and not execs and not q.held
@@ -801,6 +809,7 @@ def _resume(tmp: Path, monkeypatch, *, torn: bool, stuck: bool = False):
     q = IH.Quiesce(L, waits=IH.RH.Seams(host=HOST, store=L, trusted=lambda st: True, lock_wait_s=0.05))
     q.hold()
     probes, execs = [], []
+    monkeypatch.setattr(IH.os, "execve", lambda *a: execs.append(a))
 
     def probe(host, gen, shape, journal, **kw):
         probes.append((gen, journal))
@@ -810,7 +819,7 @@ def _resume(tmp: Path, monkeypatch, *, torn: bool, stuck: bool = False):
     try:
         errbuf = io.StringIO()
         IH.repair_handover(plan, IH.Gathered(facts, quiesce=q, repair=rf), 3, os.getuid(), errbuf,
-                           probe=probe, execve=lambda *a: execs.append(a), tree=tree, intent_path=jpath)
+                           probe=probe, tree=tree, intent_path=jpath)
         refused = None
     except Refused as e:
         refused = e

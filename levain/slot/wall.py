@@ -1279,7 +1279,6 @@ class OsCalls:
     set_inheritable: Callable = os.set_inheritable
     write_fd: Callable = os.write
     access_x: Callable = _access_x
-    execve: Callable = os.execve
     dup2: Callable = os.dup2
     getpid: Callable = os.getpid
     write_file: Callable = _write_text   # the Linux cgroup join (exec_launch)
@@ -1496,7 +1495,7 @@ def stage_main(spec_fd: int = SPEC_FD, os_calls: Optional[OsCalls] = None, *, er
         if spec.exec_fd is not None and spec.profile is None:
             c.set_inheritable(spec.exec_fd, False)     # the vendor never holds it
             c.write_fd(spec.exec_fd, EXEC_OK)          # the last act before the execve
-        c.execve(path, argv, env)
+        os.execve(path, argv, env)
     except Refused as e:
         _say(err, f"levain wall: refused {e.name}" + (f": {e.detail}" if e.detail else ""))
         _exec_failed(spec, c)
@@ -1546,11 +1545,11 @@ def exec_launch(argv: Sequence[str], spec_read_fd: int, *, cgroup: Optional[str]
         want = "0::" + cgroup[len("/sys/fs/cgroup"):]
         if want not in c.read_text("/proc/self/cgroup").splitlines():
             raise Refused("cgroup-not-joined", cgroup)
-    c.execve(argv[0], list(argv), {})
+    os.execve(argv[0], list(argv), {})
 
 
 def trampoline_main(argv: Sequence[str], *, write: Callable = os.write, set_inheritable: Callable = os.set_inheritable,
-                    execve: Callable = os.execve, environ: Optional[Mapping[bytes, bytes]] = None, err=None) -> int:
+                    environ: Optional[Mapping[bytes, bytes]] = None, err=None) -> int:
     """macOS, the vendor's last hop (``--exec-fd 4 -- <vendor argv>``), run by ``sandbox-exec`` AFTER it applied
     the profile, as the dropped slot: :data:`EXEC_FD` close-on-exec -> :data:`EXEC_OK` -> execve the vendor with
     the env it was given (the stage's). A failed execve after the marker writes :data:`EXEC_REFUSED`. A ``+``
@@ -1573,7 +1572,7 @@ def trampoline_main(argv: Sequence[str], *, write: Callable = os.write, set_inhe
         _say(err, f"levain wall: refused stage-error: exec marker errno {e.errno}")
         return STAGE_EXIT
     try:
-        execve(target[0], target, os.environb if environ is None else environ)
+        os.execve(target[0], target, os.environb if environ is None else environ)
     except OSError as e:
         _say(err, f"levain wall: refused exec-failed: errno {e.errno}")
     try:
