@@ -47,7 +47,8 @@ from levain.coordinator.store import (
 from levain.dispatch.adopt import GitFault, branch_problem
 from levain.dispatch.contract import MAX_LIFETIME, git_env
 
-__all__ = ["ATTENUATIONS", "ENVELOPE_SCHEMA", "NOT_IN_FORCE", "Envelope", "EnvelopeConflict", "EnvelopeStore"]
+__all__ = ["ATTENUATIONS", "ENVELOPE_SCHEMA", "NOT_IN_FORCE", "Envelope", "EnvelopeConflict", "EnvelopeStale",
+           "EnvelopeStore"]
 
 ATTENUATIONS = ("kill", "stop_earlier", "drop_effect", "thread_done")
 NOT_IN_FORCE = ("before S1 places the control principal the coordinator grants nothing (C0 §2): this effect is a "
@@ -87,6 +88,10 @@ ENVELOPE_SCHEMA: tuple[str, ...] = (
 
 class EnvelopeConflict(CoordError):
     """An ``envelope_id`` already stored with a different body, payload or signature: never an overwrite."""
+
+
+class EnvelopeStale(CoordError):
+    """An envelope signed more than :data:`SIGN_SKEW` from the store's clock: signing it again is the remedy."""
 
 
 @dataclass(frozen=True)
@@ -196,7 +201,7 @@ class EnvelopeStore(CoordStore):
         clock = parse_stamp(now)
         signed = parse_stamp(payload["signed_at"])
         if abs(signed - clock) > SIGN_SKEW:
-            raise CoordError(f"the envelope was signed at {payload['signed_at']}, more than "
+            raise EnvelopeStale(f"the envelope was signed at {payload['signed_at']}, more than "
                              f"{int(SIGN_SKEW.total_seconds())} s from the store's clock ({now}); sign it again")
         stop = parse_stamp(body["stop_at"])
         if stop <= signed:
@@ -285,17 +290,29 @@ class EnvelopeStore(CoordStore):
 
     def accept_drop(self, words: str, *, surface: str, outbox_id: str | None = None, sent_at: str | None = None,
                     source: Source = Source(), envelope: tuple[str, Mapping[str, Any], str] | None = None,
-                    authority: AuthoritySnapshot | None = None) -> tuple[Drop, bool]:
+                    authority: AuthoritySnapshot | None = None, keep_plain: bool = True) -> tuple[Drop, bool]:
         """A drop, optionally carrying a STRUCTURED envelope signed at send (T4): ``envelope = (body_text, payload,
         signature)``, whose body names the drop id. Drop and envelope are written in one transaction. An envelope that
         fails any check never costs the words: the drop is stored plain and its delivered drop receipt says why the
         envelope was not taken (:meth:`envelope_refused`). A resend of the same ``outbox_id`` returns the stored drop
         as it was (C1's outbox rule), so "sign it again" for a stored drop is the coordinator's WORDED echo over its
-        thread [seat: a structured envelope is only ever written in the drop's insert, C0 §3.1]."""
+        thread [seat: a structured envelope is only ever written in the drop's insert, C0 §3.1].
+
+        ``keep_plain=False`` (the phone port, whose outbox still holds the words): an envelope that is not taken writes
+        NOTHING and raises instead, so a drop that carries a signature is never stored without it. The refusal is the
+        check's own: :class:`EnvelopeStale` for a signature past the skew, :class:`EnvelopeConflict` for a drop or
+        envelope id already stored, :class:`~levain.authority.VerifierUnavailable` for a verifier that did not answer,
+        any other :class:`CoordError` otherwise. A resend of a stored ``outbox_id`` still returns the stored drop."""
         if envelope is None:
             return super().accept_drop(words, surface=surface, outbox_id=outbox_id, sent_at=sent_at, source=source)
         if not isinstance(authority, AuthoritySnapshot):
             raise CoordError("a drop carrying an envelope needs the authority snapshot to verify it against")
+        if not keep_plain and isinstance(outbox_id, str):
+            # a resend before any check of its carrier: the strict refusals below must never turn a delivered drop
+            # into a refusal (the default path gets this from the outbox lookup, which runs before its carry)
+            stored = self.resent_drop(outbox_id, words, surface=surface)
+            if stored is not None:
+                return stored, False
         refused: str | None = None
         body: dict[str, Any] | None = None
         try:
@@ -304,8 +321,14 @@ class EnvelopeStore(CoordStore):
             if body["origin"] != "structured":
                 raise CoordError("a drop carries only a structured envelope; a worded one is the coordinator's echo")
         except (CoordError, ValueError, TypeError) as exc:
+            if not keep_plain:
+                if isinstance(exc, CoordError):
+                    raise
+                raise CoordError(f"an envelope this store cannot read: {type(exc).__name__}") from None
             refused, body = str(exc)[:300], None
         except VerifierUnavailable as exc:
+            if not keep_plain:
+                raise
             # a fault on this machine, never a verdict: the words are still kept, and the receipt says why
             refused, body = f"the signature could not be checked on this machine ({str(exc)[:200]})", None
 
@@ -323,6 +346,8 @@ class EnvelopeStore(CoordStore):
                                            "(for another drop or another body)")
                 self._admit(conn, now, body, payload, probe)
             except CoordError as exc:
+                if not keep_plain:
+                    raise          # rolls the transaction back: the drop is not written without its envelope
                 return self._insert_drop(conn, now, **drop, receipt={"envelope_refused": str(exc)[:300]})
             stored = self._insert_drop(conn, now, **drop, drop_id=body["drop_id"], envelope_id=body["envelope_id"])
             self._insert(conn, now, body, payload, signature, signer_class)

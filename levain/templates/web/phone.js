@@ -118,6 +118,7 @@
         : "no passkey is enrolled for " + rpId + " yet. Make one here, then enrol it from the laptop.";
     if (!usable) $("status").textContent += " · this browser cannot use a passkey here (needs https)";
     drawGrants(data);
+    drawDrops(data);
   }
 
   // a question: text only (never HTML) for everything the agent wrote. No passkey: the answer is unsigned and
@@ -1203,6 +1204,347 @@
   // the hook point a view change calls (the phone app's tab/view switch): dismiss every open review, under the same
   // rule as the sheet's own dismiss (a sign in flight releases when it settles). Answers how many it dismissed
   window.levainDismissReviews = dismissReviews;
+
+  // ---- the drop sheet (coordinator C1/C2: levain.coordinator.phone) ---------------------------------------------------
+  // A drop is your words to the coordinator, the same drop `levain drop` makes. Send puts it in this phone's OUTBOX
+  // first, under an outbox id picked once, then sends it; it leaves the outbox only on the server's 2xx, which IS the
+  // delivered receipt. A send whose answer never came (no network, a 5xx) stays and is sent again under the SAME id, so
+  // the store files it once however often it arrives (a resend answers created:false). A refusal (a 4xx) stays,
+  // marked, until you send it again or discard it. An ENVELOPE (where it may work, a land, a budget, a stop) is built
+  // by the server with the CLI's own builder; the sheet shows the server's own words for it, and only the sheet's Sign
+  // asks for the passkey, over the challenge the server built. The signed envelope rides in the outbox with its drop.
+  // A land named here is always marked "inferred, not where you dropped from": the phone records no branch it dropped
+  // from, and that mark is inside what the passkey signs. This page decides nothing: every verdict is the server's.
+  // WHO: the coordinator routes take a PAIRED device's token only; this run's phone link is refused (device_required),
+  // said on the outbox card as why it is not delivered yet. WHERE: every outbox item is bound to the coordinator store
+  // identity this page held when the item was made (coord_store_id, null while there is no store). Nothing is sent
+  // until this page load has READ the current identity, and an item bound to another identity is shown as "from
+  // another Levain", never sent: a phone name that now answers for another dispatch directory never files it. On a
+  // fresh install the envelope REVIEW makes the store: the signed drop is bound to the id the review's reply names,
+  // and a reply that says its request made the store (store_created) rebinds every item made while there was none.
+  // An item made while there was no store that meets one it never saw made gets ONE receipt-only retry per identity:
+  // the server answers it from its resend lookup (its own first send made the store, and the reply was lost) or
+  // refuses it other_store with nothing written, and then it is "from another Levain".
+  // CROSS-TAB: every outbox change runs under one Web Lock (navigator.locks) and re-reads the outbox inside it, and a
+  // change another tab made (the storage event) redraws this one. A SIGNED drop the server refuses is never filed
+  // plain behind your back: a stale signature (envelope-stale) offers Sign again, and every refused signed drop offers
+  // Send as a plain drop (the same outbox id, the envelope dropped, your words unchanged).
+  const OUTBOX_KEY = "levain-outbox:" + location.hostname;
+  const STORE_KEY = "levain-store-id:" + location.hostname;
+  let outboxMem = null;       // the outbox when this browser keeps no storage (private mode): this visit only
+  let flushing = false;
+  let dropData = null;        // the last listing's coord_* keys
+  let dropLast = "";          // the last delivery said here, kept across redraws
+  let storeRead = false;      // this page load has read the store identity (flush waits for it)
+  let storeId = null;         // that identity (null: no store yet)
+  const rememberedStore = () => { const v = store.get("localStorage", STORE_KEY); return v === null ? undefined : v === "" ? null : v; };
+  const stamp = () => new Date().toISOString().replace(/\.(\d{3})Z$/, ".$1000Z");   // the store's fixed-width UTC form
+  const outboxId = () => {
+    const b = new Uint8Array(16);
+    crypto.getRandomValues(b);
+    return "ph-" + Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  };
+  function outboxRead() {
+    if (outboxMem) return outboxMem.slice();
+    try { const v = JSON.parse(window.localStorage.getItem(OUTBOX_KEY) || "[]"); return Array.isArray(v) ? v : []; }
+    catch (e) { return []; }
+  }
+  function outboxWrite(items) {
+    try { window.localStorage.setItem(OUTBOX_KEY, JSON.stringify(items)); outboxMem = null; }
+    catch (e) { outboxMem = items.slice(); }
+  }
+  // the one way the outbox changes: f(all) edits the array read INSIDE the lock, then it is written back
+  function withOutbox(f) {
+    const run = () => { const all = outboxRead(); f(all); outboxWrite(all); };
+    if (navigator.locks && typeof navigator.locks.request === "function") return navigator.locks.request(OUTBOX_KEY, run);
+    return Promise.resolve().then(run);
+  }
+  function outboxEdit(id, f) {
+    return withOutbox((all) => {
+      const i = all.findIndex((x) => x.outbox_id === id);
+      if (i < 0) return;
+      const next = f(all[i]);
+      if (next === null) all.splice(i, 1); else all[i] = next;
+    });
+  }
+  const foreign = (x) => storeRead && x.store_id !== storeId;     // made against another store identity
+  // a foreign item made while there was no store, not yet asked of this identity: its one receipt-only retry
+  const unasked = (x) => foreign(x) && x.store_id === null && x.asked !== storeId;
+  // a reply whose request made the store: every item made while there was none belongs to it
+  function adoptStore(sid) {
+    storeId = sid;
+    storeRead = true;
+    store.set("localStorage", STORE_KEY, sid);
+    return withOutbox((all) => { for (const x of all) if (x.store_id === null) x.store_id = sid; });
+  }
+  function dropSay(text, kind) {
+    const n = $("drop-note");
+    if (!n) return;
+    n.textContent = text;
+    n.className = "note " + (kind || "");
+  }
+  function enqueue(item) {
+    return withOutbox((all) => {
+      const i = all.findIndex((x) => x.outbox_id === item.outbox_id);
+      if (i < 0) all.push(item); else all[i] = item;          // Sign again replaces its own item, same outbox id
+    }).then(() => { drawOutbox(); flush(); });
+  }
+  // the identity an item made now is bound to: this load's, else the last one this phone read here
+  function boundStore() {
+    if (storeRead) return storeId;
+    return rememberedStore();
+  }
+  // a refusal is a 4xx the server named (the words, the outbox id, the envelope, another store): sending it unchanged
+  // gets the same answer, so it waits for you. Anything else (no answer, a 5xx, the token refused) is "not delivered yet"
+  const refusal = (status) => status === 400 || status === 409 || status === 413 || status === 422;
+  function flush() {
+    if (flushing || !token || !storeRead) return;
+    const next = outboxRead().find((x) => x.state === "waiting" && (!foreign(x) || unasked(x)));
+    if (!next) return;
+    flushing = true;
+    let again = false;
+    const req = { words: next.words, outbox_id: next.outbox_id, sent_at: next.sent_at, store_id: next.store_id };
+    if (next.envelope) req.envelope = next.envelope;
+    call("POST", "/coord/drop", req).then((a) => {
+      if (a.ok) {
+        const sid = typeof a.body.store_id === "string" ? a.body.store_id : null;
+        // an item made while there was no store, accepted: this reply's request made the store, so every other item
+        // this phone made here before any store existed belongs to it
+        const made = next.store_id === null && sid !== null;
+        if (made) { storeId = sid; store.set("localStorage", STORE_KEY, sid); }
+        const e = a.body.envelope;
+        const d = a.body.drop || {};
+        dropLast = "delivered " + d.drop_id + (a.body.created ? "" : " (it had arrived before: filed once)")
+          + (e ? (e.taken ? " · envelope " + e.envelope_id + " taken" : " · envelope NOT taken: " + e.refused) : "")
+          + (a.body.woken ? " · coordinator launch " + a.body.woken + " asked for" : "");
+        dropSay(dropLast, e && !e.taken ? "bad" : "ok");
+        again = true;
+        setTimeout(load, 0);
+        return withOutbox((all) => {
+          const i = all.findIndex((x) => x.outbox_id === next.outbox_id);
+          if (i >= 0) all.splice(i, 1);
+          if (made) for (const x of all) if (x.store_id === null) x.store_id = sid;
+        });
+      }
+      const x0 = { why: why(a), error: a.body.error || "" };
+      if (a.body.error === "other_store") {
+        // nothing was written: this identity has answered for the item (it shows as another Levain's once the
+        // listing names the store), and the identity is read again
+        setTimeout(load, 0);
+        return outboxEdit(next.outbox_id, (x) => Object.assign({}, x, { asked: storeId }, x0));
+      }
+      if (refusal(a.status)) {
+        again = true;
+        return outboxEdit(next.outbox_id, (x) => Object.assign({}, x, { state: "refused" }, x0));
+      }
+      return outboxEdit(next.outbox_id, (x) => Object.assign({}, x, { tries: (x.tries || 0) + 1 }, x0));
+    }).finally(() => { flushing = false; drawOutbox(); if (again) flush(); });
+  }
+  function firstLine(words, n) {
+    const line = String(words || "").split("\n")[0];
+    return line.length > n ? line.slice(0, n) + "…" : line;
+  }
+  function button(text, f) {
+    const b = el("button", null, text);
+    b.type = "button";
+    b.addEventListener("click", f);
+    return b;
+  }
+  function drawOutbox() {
+    const box = $("drop-outbox");
+    if (!box) return;
+    const items = outboxRead();
+    $("drop-outbox-meta").textContent = (items.length ? items.length + " not delivered" : "empty")
+      + (outboxMem ? " · this browser keeps no storage: the outbox lasts this visit only" : "")
+      + (navigator.locks ? "" : " · one tab at a time: this browser cannot lock the outbox between tabs");
+    box.replaceChildren(...items.map((x) => {
+      const other = foreign(x);
+      const refused = !other && x.state === "refused";
+      const card = el("article", "row drop outbox" + (refused || other ? " refused" : ""));
+      card.dataset.outbox = x.outbox_id;
+      card.appendChild(el("div", "title", firstLine(x.words, 80)));
+      const chips = el("div", "chips");
+      const state = other ? "from another Levain" : refused ? "refused" : "waiting to be delivered";
+      for (const text of [state, x.envelope ? "with a signed envelope" : "plain", "typed " + readable(x.sent_at)])
+        chips.appendChild(el("span", "chip" + (refused || other ? " warn" : ""), text));
+      card.appendChild(chips);
+      if (other) card.appendChild(el("div", "note bad", "made for another Levain than the one answering here now; "
+        + "it is not sent here. Your words are above: copy them into a new drop, or discard this one"));
+      else if (x.why) card.appendChild(el("div", "note " + (refused ? "bad" : ""), (refused ? "refused: " : "not delivered yet (") + x.why + (refused ? "" : "); it is sent again")));
+      const acts = el("div", "acts");
+      if (refused && x.envelope) {
+        // Sign again: the same words and outbox id, reviewed and signed afresh (a stale signature's remedy)
+        if (x.spec && x.signer_fp) acts.appendChild(button("Sign again", () => envelopeSheet(x.signer_fp, x.raw_id || null, x.words, x.spec, x.outbox_id)));
+        acts.appendChild(button("Send as a plain drop", () => {
+          outboxEdit(x.outbox_id, (y) => Object.assign({}, y, { state: "waiting", why: "", error: "", envelope: null })).then(() => { drawOutbox(); flush(); });
+        }));
+      } else if (refused) {
+        // a new send moment: the server's refusal may be of the time it was typed (a phone clock ahead of the laptop's)
+        acts.appendChild(button("Send again", () => {
+          outboxEdit(x.outbox_id, (y) => Object.assign({}, y, { state: "waiting", why: "", error: "", sent_at: stamp() })).then(() => { drawOutbox(); flush(); });
+        }));
+      }
+      acts.appendChild(button("Discard", () => { outboxEdit(x.outbox_id, () => null).then(drawOutbox); }));
+      card.appendChild(acts);
+      return card;
+    }));
+  }
+  const RECEIPT = { delivered: "delivered", split: "split", resplit: "regrouped", woken: "coordinator" };
+  function dropCard(d) {
+    const card = el("article", "row drop sent");
+    card.dataset.drop = d.drop_id;
+    card.appendChild(el("div", "title", firstLine(d.words, 120)));
+    const chips = el("div", "chips");
+    for (const text of ["drop " + d.drop_id, "delivered " + readable(d.received_at)]) chips.appendChild(el("span", "chip", text));
+    if (d.envelope_id) chips.appendChild(el("span", "chip", "envelope " + d.envelope_id));
+    else if (d.envelope_refused) chips.appendChild(el("span", "chip warn", "envelope not taken"));
+    card.appendChild(chips);
+    // every drop receipt, oldest first, in the store's own words: the split names its threads, the wake how it went
+    const receipts = Array.isArray(d.receipts) ? d.receipts : [];
+    for (const r of receipts) {
+      const threads = Array.isArray(r.threads) ? r.threads : [];
+      const named = threads.map((t) => String(t.kind || "").toUpperCase() + " " + (t.title || t.thread_id)).join("; ");
+      let line = "receipt: " + (RECEIPT[r.stage] || r.stage) + " " + readable(r.at);
+      if (r.stage === "woken") line += " · launch " + r.launch_id + (r.started ? " started: " : " not started: ") + (r.said || "");
+      else if (r.stage !== "delivered") line += " · " + threads.length + (threads.length === 1 ? " thread" : " threads") + (named ? ": " + named : "");
+      if (r.envelope_refused) line += " · envelope not taken: " + r.envelope_refused;
+      card.appendChild(el("div", "where receipt" + (r.stage === "woken" && !r.started ? " bad" : ""), line));
+    }
+    if (!receipts.some((r) => r.stage === "split")) card.appendChild(el("div", "where", "not split into threads yet"));
+    return card;
+  }
+  function drawDrops(data) {
+    dropData = data;
+    const list = $("drop-recent");
+    if (!list) return;
+    const drops = Array.isArray(data.coord_drops) ? data.coord_drops : [];
+    const note = typeof data.coord_note === "string" && data.coord_note ? data.coord_note : "";
+    $("drop-recent-meta").textContent = note ? "can't read the coordinator's store: " + note : drops.length ? "newest first" : "none yet";
+    list.replaceChildren(...drops.map(dropCard));
+    const repos = Array.isArray(data.coord_repos) ? data.coord_repos : [];
+    $("drop-repos").replaceChildren(...repos.map((r) => { const o = el("option"); o.value = r; return o; }));
+    if (dropLast && !$("drop-note").textContent) dropSay(dropLast, "ok");
+    // the identity is taken only from a listing that read the store (an unreadable store says nothing about it)
+    if (data.coord_store_read === true) {
+      storeRead = true;
+      storeId = typeof data.coord_store_id === "string" ? data.coord_store_id : null;
+      store.set("localStorage", STORE_KEY, storeId === null ? "" : storeId);
+    }
+    drawOutbox();
+    flush();
+  }
+  function dropWords() {
+    const w = $("drop-words").value;          // stored verbatim: only an empty drop is refused here
+    if (!w.trim()) { dropSay("type your words first", "bad"); return null; }
+    return w;
+  }
+  if ($("drop-send")) $("drop-send").addEventListener("click", () => {   // a page without the Drop tab wires none
+    const words = dropWords();
+    if (words === null) return;
+    const sid = boundStore();
+    if (sid === undefined) return dropSay("still reading which Levain answers here; send it in a moment", "bad");
+    $("drop-words").value = "";
+    dropSay("in the outbox; sending…");
+    enqueue({ outbox_id: outboxId(), words: words, sent_at: stamp(), state: "waiting", envelope: null, store_id: sid });
+  });
+  function dropSpec() {
+    const repo = $("drop-repo").value.trim(), onto = $("drop-onto").value.trim();
+    if (!repo) return null;
+    const n = (id) => { const v = $(id).value.trim(); return v === "" ? 0 : Number(v); };
+    const spec = { where: [{ repo: repo, paths: ["."] }], lands: onto ? [{ repo: repo, onto: onto }] : [],
+                   stop: $("drop-stop").value, budget: { tool_calls: n("drop-calls"), tokens: n("drop-tokens"), hours: n("drop-hours") } };
+    return spec;
+  }
+  let closeSheet = null;      // the open envelope sheet's dismiss (it holds busy while it is up)
+  if ($("drop-sign")) $("drop-sign").addEventListener("click", () => {
+    const words = dropWords();
+    if (words === null) return;
+    const spec = dropSpec();
+    if (!spec) { $("drop-env").open = true; return dropSay("name the repo the envelope lets it work in", "bad"); }
+    const signers = dropData && Array.isArray(dropData.coord_signers) ? dropData.coord_signers : [];
+    if (!usable) return dropSay("this browser cannot use a passkey here (needs https)", "bad");
+    if (!signers.length) return dropSay((dropData && dropData.coord_signer_note) || "no passkey enrolled for this name can sign an envelope", "bad");
+    start(null, null, signers, dropSay, $("drop-acts"), false, (fp, rawId) => envelopeSheet(fp, rawId, words, spec, null), "to SIGN this drop's envelope");
+  });
+  // the review (the server keeps the body it shows), then Sign: the server mints the payload, signed_at now, and the
+  // passkey signs its challenge. `again` is the outbox id of a refused signed drop being signed again (same words)
+  function envelopeSheet(fp, rawId, words, spec, again) {
+    if (busy || closeSheet) return;
+    let sid = again ? (outboxRead().find((x) => x.outbox_id === again) || {}).store_id : boundStore();
+    if (sid === undefined) return dropSay("still reading which Levain answers here; sign it in a moment", "bad");
+    busy++;
+    const id = again || outboxId();      // picked before the review: the server refuses one already delivered
+    const box = $("drop-review");
+    const text = $("drop-words");
+    dropSay(again ? "building the envelope to sign again…" : "building the envelope to sign…");
+    let signing = false, closed = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      closeSheet = null;
+      openReviews.delete(close);
+      box.hidden = true;
+      box.replaceChildren();
+      text.disabled = false;
+      $("drop-send").disabled = $("drop-sign").disabled = false;
+      busy--;
+    };
+    call("POST", "/coord/envelope-review", { words: words, outbox_id: id, spec: spec, signer_fp: fp }).then((c) => {
+      if (!c.ok) { close(); return dropSay("nothing to sign: " + why(c), "bad"); }
+      // the store this envelope was built against: the signed drop is bound to it (a fresh install's review made it)
+      const rsid = typeof c.body.store_id === "string" ? c.body.store_id : null;
+      if (rsid !== null && c.body.store_created === true) adoptStore(rsid).then(drawOutbox);
+      if (!again && rsid !== null) sid = rsid;
+      closeSheet = close;
+      openReviews.add(close);   // a view change or a hidden page dismisses it (window.levainViewChanged)
+      text.disabled = true;     // the words the envelope names are frozen while it is reviewed
+      // and the sheet's own Sign / Dismiss are the only acts: a Send now would file the same words a second time
+      $("drop-send").disabled = $("drop-sign").disabled = true;
+      $("drop-env").open = true;
+      const view = Array.isArray(c.body.view) ? c.body.view.join("\n") : "";
+      const acts = el("div", "acts");
+      const sign = el("button", "go", "Sign with passkey");
+      sign.type = "button";
+      const dismiss = el("button", null, "Dismiss");
+      dismiss.type = "button";
+      dismiss.addEventListener("click", () => { if (!signing) { close(); dropSay("not signed; your words are still here"); } });
+      sign.addEventListener("click", () => {
+        if (signing || closed) return;
+        signing = true;
+        dropSay("confirm with your passkey to sign the envelope…");
+        call("POST", "/coord/envelope-challenge", { review_id: c.body.review_id }).then((ch) => {
+          if (!ch.ok) { signing = false; return dropSay("nothing was signed: " + why(ch), "bad"); }
+          const pk = { challenge: unb64u(ch.body.challenge), rpId: ch.body.rp_id, userVerification: "required", timeout: 60000 };
+          if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
+          return navigator.credentials.get({ publicKey: pk }).then((cred) => {
+            const envelope = { body_text: c.body.body_text, payload: ch.body.payload,
+                               authenticator_data: b64u(cred.response.authenticatorData),
+                               client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
+            signing = false;
+            close();
+            if (!again) text.value = "";
+            dropSay("signed; in the outbox, sending…");
+            const prior = again ? outboxRead().find((x) => x.outbox_id === again) : null;
+            // Sign again keeps its item's binding, unless the review made the store it was made without
+            const bound = prior ? (prior.store_id === null && c.body.store_created === true ? rsid : prior.store_id) : sid;
+            enqueue({ outbox_id: id, words: words, sent_at: prior ? prior.sent_at : stamp(), state: "waiting", envelope: envelope,
+                      store_id: bound, spec: spec, signer_fp: fp, raw_id: rawId || null });
+          }, (e) => { signing = false; dropSay(declined(e, "nothing was signed; sign again or dismiss"), "bad"); });
+        }, () => { signing = false; dropSay("the phone port could not be reached; nothing was signed", "bad"); });
+      });
+      acts.append(sign, dismiss);
+      box.replaceChildren(el("h2", null, "what your passkey signs"), el("pre", "display", view),
+                          digestLine("envelope digest", c.body.digest), acts);
+      box.hidden = false;
+      dropSay("read the envelope, then sign it");
+    }, () => { close(); dropSay("the phone port could not be reached; nothing was signed", "bad"); });
+  }
+  // another tab changed the outbox (or the identity): redraw from storage, and send what is now this tab's to send
+  window.addEventListener("storage", (e) => { if (e.key === OUTBOX_KEY || e.key === null) { drawOutbox(); flush(); } });
+  window.addEventListener("online", flush);
+  drawOutbox();
+  flush();
+  setInterval(flush, 10000);
 
   $("refresh").addEventListener("click", load);
   $("enrol-btn").addEventListener("click", enrol);

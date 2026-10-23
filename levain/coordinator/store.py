@@ -838,6 +838,31 @@ class CoordStore:
             row = conn.execute("SELECT drop_id FROM drops WHERE outbox_id = ?", (outbox_id,)).fetchone()
             return None if row is None else self._drop(conn, row[0])
 
+    def resent_drop(self, outbox_id: str, words: str, *, surface: str) -> Drop | None:
+        """C1's outbox rule as a read, in ONE transaction: the drop stored under ``outbox_id`` when it holds these words
+        from this surface (a resend: the caller answers with it and checks nothing else), None when the id is unused.
+        The same id holding other words or another surface raises :class:`DropConflict`, as :meth:`accept_drop` does."""
+        sha = _words_sha256(_check_words(words))
+        with read_transaction(self._connect) as conn:
+            row = conn.execute("SELECT drop_id FROM drops WHERE outbox_id = ?", (outbox_id,)).fetchone()
+            if row is None:
+                return None
+            stored = self._drop(conn, row[0])
+        if stored.words_sha256 != sha or stored.surface != surface:
+            raise DropConflict(f"outbox_id {outbox_id} is already stored for a different drop ({stored.drop_id}); "
+                               "nothing was written")
+        return stored
+
+    def record_wake(self, drop_id: str, launch_id: str, *, started: bool, said: str) -> None:
+        """A ``woken`` drop receipt: how the coordinator launch ``drop_id``'s own transaction asked for went when its
+        starter ran it (``started``, and the starter's words). Written by a starter that runs after the drop's reply
+        (the phone port's), so a failed start is on the drop's receipt, never lost."""
+        with self._write() as (conn, now):
+            self._must_drop(conn, drop_id)
+            self._reply(conn, None, "drop_receipt", "drops", drop_id,
+                        {"stage": "woken", "drop_id": drop_id, "launch_id": launch_id, "started": bool(started),
+                         "said": str(said)[:800]}, now)
+
     def drops(self, limit: int = 50) -> list[Drop]:
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
             raise CoordError("limit is 1 to 1000")
