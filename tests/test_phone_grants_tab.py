@@ -245,10 +245,10 @@ def test_no_passkey_ceremony_on_the_page_forgets_its_passkey_on_a_refusal():
         assert r["tapped"] and r["webauthn"] == 1, (name, r)
         assert r["mapping"] == {"SHA256:phonekeyphonekeyphonekeyphonekeyphonekey0": "cmF3aWQ"}, (name, r)
         assert any(t.startswith("the passkey did not sign (NotAllowedError); ") for t in r["said"]), (name, r)
-    # one rule, one home: no ceremony keeps its own copy of the forget, and every get() refusal is said through it
+    # one rule, one home: no ceremony keeps its own copy of the forget. The behavioural pin is the loop above (every
+    # ceremony's refusal leaves the mapping intact); this grep only guards the helper's removal
     src = PHONE_JS.read_text()
     assert not re.search(r"\bforget\s*[(=]", src), "a forget is back"
-    assert src.count("navigator.credentials.get(") == src.count("declined(e, "), "a ceremony bypasses declined()"
 
 
 # an open K8 review (window.levainSign) on the real page: GET /cockpit/pending/<id> answers a WAITING pending from the

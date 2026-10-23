@@ -1064,7 +1064,8 @@
   // tap does nothing; a non-terminal failure lets the sheet sign again, still held; after dismiss it does nothing). A pending the server no longer holds
   // WAITING (expired, or decided elsewhere) gets no sheet and no prompt. The broker verifies the signature over its own
   // copy and decides; the outcome names the signer the server persisted. done(answer) gets every outcome, and a review
-  // that ends without the server's terminal answer ends with a DISMISSED answer. review() may answer the sheet's
+  // that ends without the server's terminal answer ends with a DISMISSED answer: it is one terminal answer, and a
+  // non-terminal result (a 4xx, say) may precede DISMISSED, so a caller treats DISMISSED, not the first answer, as the end. review() may answer the sheet's
   // closed(reason): it is called once when the review ends ("answered" or "dismissed"), so the sheet takes its Sign
   // away; a dismissal from outside the sheet (the page hiding, the view change) is also said. This page decides nothing:
   // what it shows is the server's words.
@@ -1115,16 +1116,28 @@
           // DISMISSED answer (so a caller awaiting it never hangs), a dismissal from outside the sheet is said, and the
           // sheet's closed() is told either way. Nothing here says nothing was signed: an earlier attempt may have sent
           // its signature with an unknown result
+          // Each notification (done, say, closed) is isolated: one that throws must never keep the hold (busy), so
+          // settle() runs in a finally whatever they do
+          const isolated = (f) => { try { f(); } catch (e) { try { console.error("levainSign: a review callback threw", e); } catch (_) { /* no console */ } } };
+          let closedTold = false;
+          const tellClosed = () => {
+            if (closedTold || typeof closed !== "function") return;
+            closedTold = true;
+            isolated(() => closed(answered ? "answered" : "dismissed"));
+          };
           const release = () => {
             if (released) return;
             released = true;
-            unhook();
-            if (!answered) {
-              finish({ ok: false, status: 0, body: { state: "DISMISSED", message: "the review was dismissed" } });
-              if (away) say(said && said[1] === "bad" && said[0] !== DEAD ? said[0] + " · " + DEAD : DEAD, "bad");
+            try {
+              unhook();
+              if (!answered) {
+                isolated(() => finish({ ok: false, status: 0, body: { state: "DISMISSED", message: "the review was dismissed" } }));
+                if (away) isolated(() => say(said && said[1] === "bad" && said[0] !== DEAD ? said[0] + " · " + DEAD : DEAD, "bad"));
+              }
+              tellClosed();
+            } finally {
+              settle();
             }
-            if (typeof closed === "function") { try { closed(answered ? "answered" : "dismissed"); } catch (e) { /* the sheet's own fault */ } }
-            settle();
           };
           const dismiss = () => { if (released) return; dismissed = true; if (!signing) release(); };
           const leave = () => { if (released) return; away = true; dismiss(); };
@@ -1166,7 +1179,10 @@
               if (!told) finish(failed(e));
             }).finally(() => { signing = false; if (terminal) answered = true; if (terminal || dismissed) release(); });
           };
-          try { closed = review(c.body, sign, dismiss); } catch (e) { if (!released) { released = true; unhook(); } fail(e); }
+          try {
+            closed = review(c.body, sign, dismiss);
+            if (released) tellClosed();      // a review that released during review() itself (a sync dismiss) is told once, now
+          } catch (e) { if (!released) { released = true; unhook(); } fail(e); }
         });
       });
     }).catch((e) => { finish(failed(e)); say("the page failed (" + ((e && e.name) || "error") + ")", "bad"); })

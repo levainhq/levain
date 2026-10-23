@@ -929,6 +929,13 @@ def test_levainsign_tells_the_sheet_and_the_caller_when_a_review_is_dismissed():
     # a review that ends with the server's terminal answer tells the sheet "answered" and never "dismissed"
     d = got["dismiss_in_flight"]
     assert len(d["done"]) == 1 and d["done"][0]["body"]["state"] == "COMMITTED", d
+    # L3 r1 (codex MED): a done() that throws during a hide never keeps the hold
+    x = got["done_throws"]
+    assert x["free_after_done_fault"] is True and x["closed"] == ["dismissed"], x
+    # L3 r1 (codex LOW): a sync dismiss() inside review() still tells the returned closed handler, once
+    y = got["sync_dismiss"]
+    assert y["closed"] == ["dismissed"] and y["free_after"] is True, y
+    assert [a["body"].get("state") for a in y["done"]] == ["DISMISSED"], y
     r = got["refused_keeps"]
     assert r["webauthn"] == 1 and r["mapping"] == {"SHA256:a": "cmF3aWQ"}, r
     assert "did not sign (NotAllowedError)" in r["said"][-1][0], r

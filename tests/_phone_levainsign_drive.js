@@ -315,6 +315,29 @@ async function main() {
     p.log.mapping = p.mapping();
     out.refused_keeps = p.log;
   }
+  // L3 r1 (codex MED): a done()/say()/closed() that throws during a hide must never keep the hold
+  {
+    const p = page(WAITING, { state: "COMMITTED", signer_fp: "SHA256:a" });
+    p.log.closed = [];
+    const review = (_body, _sign, _dismiss) => { p.log.reviewed++; return (why) => p.log.closed.push(why); };
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, () => { throw new Error("done fault"); });
+    await tick();
+    p.visibility(true);
+    await tick();
+    p.visibility(false);
+    p.log.free_after_done_fault = await p.probe();
+    out.done_throws = p.log;
+  }
+  // L3 r1 (codex LOW): a sheet that dismisses synchronously inside review() and returns its closed handler is told once
+  {
+    const p = page(WAITING, { state: "COMMITTED", signer_fp: "SHA256:a" });
+    p.log.closed = [];
+    const review = (_body, _sign, dismiss) => { p.log.reviewed++; dismiss(); return (why) => p.log.closed.push(why); };
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, (a) => p.log.done.push(a));
+    await tick();
+    p.log.free_after = await p.probe();
+    out.sync_dismiss = p.log;
+  }
   out.unhandled = unhandled;
   process.stdout.write(JSON.stringify(out));
 }
