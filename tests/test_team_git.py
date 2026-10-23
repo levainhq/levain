@@ -99,7 +99,7 @@ def two(tmp_path):
     (pack / "judgment.toml").write_text(JUDGMENT)
     assert team("init", "--project", "ledgerline", "--owner", "ana", "--signing-key", str(KEYS["ana"]),
                 "--member", "ana=ana@ex.com", "--member", f"ben=ben@ex.com={KEYS['ben']}", "--client-owner", "Dana",
-                "--pack", str(pack), repo=ana) == 0
+                "--pack", str(pack), "--allow-file-keys", repo=ana) == 0   # file keys sign here, hooks run as children
     ben = clone(tmp_path, "ben", "ben@ex.com")
     assert join(ben, "ben") == 0
     return tmp_path, ana, ben
@@ -145,6 +145,9 @@ def test_init_join_record_reaches_the_other_clone(two):
 
 def test_concurrent_writers_in_both_clones_converge(two):
     tmp, ana, ben = two
+    # the writers are subprocesses, outside conftest's file-key seam: this team allows file keys, as one using them must
+    assert team("file-keys", "allow", repo=ana) == 0
+    assert team("sync", repo=ben) == 0
     jobs = [(ana if i % 2 else ben, f"src/f{i}.py") for i in range(8)]
     with ThreadPoolExecutor(8) as ex:
         results = list(ex.map(lambda j: subprocess.run(

@@ -749,6 +749,23 @@ def _looked(conn: sqlite3.Connection) -> int:
                         "('takeover', 'release')").fetchone()[0] or 0
 
 
+def launch_death(conn: sqlite3.Connection, ln: Launch) -> bool | None:
+    """Did this launch die? ``True`` it died; ``None`` nobody tried to start it, so it says nothing either way (a watcher
+    down, a refusal before the spawn claim; ruled L3 r1 G6); ``False`` it did not. The one rule: the wake backoff
+    (:func:`_deaths`) and the review queue's dead-seat feed both call it."""
+    # a launch asked for under a lease its asker lost is not the launch's fault; one that lost the lease without ever
+    # writing as coordinator died idle
+    wrote = _wrote_since(conn, ln.session_key)
+    died = ln.state in ("failed", "expired") and ln.cause != "lease lost before active" \
+        or ln.state == "ended" and (ln.cause == "0 turns" or ln.cause == "lost the lease" and not wrote)
+    if not died:
+        return False
+    if ln.state in ("failed", "expired") and conn.execute(
+            "SELECT 1 FROM launch_spawns WHERE launch_id = ?", (ln.launch_id,)).fetchone() is None:
+        return None
+    return True
+
+
 def _deaths(conn: sqlite3.Connection) -> tuple[int, str | None]:
     """Coordinator deaths in a row since you last looked (a take or release of yours) or a coordinator last ran:
     ``(count, at of the latest)``."""
@@ -759,18 +776,10 @@ def _deaths(conn: sqlite3.Connection) -> tuple[int, str | None]:
             "SELECT l.launch_id FROM launches l WHERE l.role = 'coordinator' AND l.gseq > ? ORDER BY "
             "(SELECT MAX(e.gseq) FROM launch_events e WHERE e.launch_id = l.launch_id) DESC", (looked,)).fetchall():
         ln = _launch_row(conn, "launch_id", launch_id)
-        # a launch voided by your take or release is older than your look; one asked for under a lease its asker
-        # lost is not the launch's fault; one that lost the lease without ever writing as coordinator died idle
-        wrote = _wrote_since(conn, ln.session_key)
-        died = ln.state in ("failed", "expired") and ln.cause != "lease lost before active" \
-            or ln.state == "ended" and (ln.cause == "0 turns" or ln.cause == "lost the lease" and not wrote)
-        if not died:
+        death = launch_death(conn, ln)
+        if death is False:
             break
-        if ln.state in ("failed", "expired") and conn.execute(
-                "SELECT 1 FROM launch_spawns WHERE launch_id = ?", (launch_id,)).fetchone() is None:
-            # ruled (L3 r1 G6): nobody tried to start it (a watcher down, a refusal before the spawn claim), so it
-            # says nothing of whether a coordinator dies. [seat] it is passed over, neither a death nor a run: the
-            # deaths either side of it still count in a row
+        if death is None:
             continue
         count += 1
         if latest is None:

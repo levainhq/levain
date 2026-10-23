@@ -24,6 +24,11 @@ class Team:
     client_owners: list[str] = field(default_factory=list)
     mode: str = "ask-once"
     fetch_interval: int = 300
+    # whether an entry signed by a key with no user presence (a file or agent key) counts. Three states: True (the owner
+    # allowed file keys), False (refused: an entry counts only with a FIDO key's touch; a new team's choice), None
+    # (the line is absent: a team from before the rule, read as it always was, file keys counting, until its owner
+    # chooses; nothing a team already recorded stops counting on upgrade)
+    allow_file_keys: bool | None = None
 
     def handle_for_email(self, email: str) -> str | None:
         email = (email or "").strip().lower()
@@ -57,7 +62,10 @@ def _q(s: str) -> str:
 def dump_team(t: Team) -> str:
     lines = [f"project = {_q(t.project)}", f"owner = {_q(t.owner)}", f"mode = {_q(t.mode)}",
              f"fetch_interval = {int(t.fetch_interval)}",
-             "client_owners = [" + ", ".join(_q(c) for c in t.client_owners) + "]", "", "[members]"]
+             "client_owners = [" + ", ".join(_q(c) for c in t.client_owners) + "]"]
+    if t.allow_file_keys is not None:       # absent when unchosen: a team.toml from before the field dumps the same bytes
+        lines.append(f"allow_file_keys = {'true' if t.allow_file_keys else 'false'}")
+    lines += ["", "[members]"]
     lines += [f"{_q(h)} = {_q(m)}" for h, m in t.members.items()]
     return "\n".join(lines) + "\n"
 
@@ -75,7 +83,8 @@ def parse_team(text: str, where: str = "team.toml") -> Team:
         t = Team(project=project, owner=str(raw["owner"]),
                  members={str(k): str(v) for k, v in dict(raw.get("members", {})).items()},
                  client_owners=raw.get("client_owners", []),
-                 mode=str(raw.get("mode", "ask-once")), fetch_interval=int(raw.get("fetch_interval", 300)))
+                 mode=str(raw.get("mode", "ask-once")), fetch_interval=int(raw.get("fetch_interval", 300)),
+                 allow_file_keys=raw.get("allow_file_keys"))
     except (KeyError, TypeError, ValueError) as exc:
         raise RolesError(f"{where} is missing or has a bad field: {exc}") from None
     validate_team(t, where)
@@ -102,6 +111,8 @@ def validate_team(t: Team, where: str = "team.toml") -> None:
         # The project name heads PROJECT.md and the hooks' lines: a line break or a hidden character in it would
         # let whoever edits team.toml draw text that reads as levain's own, or other than it is.
         raise RolesError(f"{where}: project must be a single line of printable text")
+    if t.allow_file_keys is not None and not isinstance(t.allow_file_keys, bool):
+        raise RolesError(f"{where}: allow_file_keys must be true or false")
     if t.fetch_interval < 0:
         raise RolesError(f"{where}: fetch_interval must be >= 0 seconds")
     for h, mail in t.members.items():

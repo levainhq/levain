@@ -83,7 +83,9 @@ class LedgerTransport(Protocol):
 
     # ---- writes -----------------------------------------------------------------------------------------------
     def append(self, entry: dict, *, push: bool = True, lock_timeout: float = 30.0) -> dict:
-        """Seal one entry into this clone's own chain and publish it when asked; returns the entry as written."""
+        """Seal one entry into this clone's own chain and publish it when asked; returns the entry as written.
+        Where the team refuses file keys, an entry counts only with user presence, judged on every read; the caller
+        cannot waive it."""
         ...
 
     def write_canon(self, text: str, *, push: bool = True) -> str:
