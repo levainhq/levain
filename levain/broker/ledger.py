@@ -750,7 +750,10 @@ class Ledger:
             raise LedgerMisuse("a malformed meta")
         if not callable(bound) or inspect.iscoroutinefunction(bound) or asyncio.iscoroutinefunction(bound):
             raise LedgerMisuse("bound must be a plain function")
-        owner = asyncio.current_task()
+        try:
+            owner = asyncio.current_task()
+        except RuntimeError:                     # no running loop
+            owner = None
         if owner is None:
             raise LedgerMisuse("admit outside a task")
         room = cap - self._charged(scope)
