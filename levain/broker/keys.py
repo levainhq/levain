@@ -79,7 +79,7 @@ from levain.broker.creds import (COMMIT_FDS, REFRESH_CONNS, CredLifecycle, CredS
                                  FakeCredLifecycle, check_host, fresh, on_upstream_401, unexpired)
 from levain.broker.gwwire import FrameReader, KeysSide, WireError
 from levain.broker.peer import PeerUnknown, peer_of, peer_uid
-from levain.broker.policy import PolicyError, RoutePolicy, parse_base_map
+from levain.broker.policy import PolicyError, Price, RoutePolicy, parse_base_map
 from levain.broker.redact import Scanner
 from levain.broker.upstream import (GRACE, StaleExchange, Upstream, _note, h11_bytes, open_exchange,
                                     pick_address)
@@ -218,6 +218,14 @@ UPLOAD_CHUNK = 64 * 1024
 
 def _at(t: float) -> str:
     return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _header(headers: Sequence[Tuple[bytes, bytes]], name: bytes) -> bytes:
+    """The first value of header `name` (lower-case) in an h11 head, b"" when absent."""
+    for raw_name, raw_value in headers:
+        if bytes(raw_name).lower() == name:
+            return bytes(raw_value)
+    return b""
 
 
 def new_record(session: str, q: dict) -> dict:
@@ -1346,7 +1354,7 @@ class Keys:
         if "refused" in out:
             await self._refuse(conn, frames, side, out["refused"], UNTRUSTED_DRAIN_CAP)
             return
-        entry = out["answer"]   # the claims-cache entry itself (3c-2b sets `budget_stopped` on it)
+        entry = out["answer"]   # the claims-cache entry itself (`_settle` sets `budget_stopped` on it)
         claims = entry["claims"]
         rec = conn.rec if conn.rec is not None else new_record(conn.reg.session, q)
         slot = claims.get("slot")
@@ -1377,8 +1385,8 @@ class Keys:
                 # the body read can take up to `body_read_s` after `fresh`'s observation: a token that expired
                 # meanwhile is refused here, before anything is checked or held (the head's write checks it again)
                 unexpired(self.cred_lifecycle, observed)
-            head, hconn, cred, tpl, data, hold = self._check_request(conn.reg, entry, pol, req, raw,
-                                                                     buf)   # the ledger's admit is last
+            head, hconn, cred, tpl, data, meter, hold = self._check_request(conn.reg, entry, pol, req, raw,
+                                                                            buf)   # the ledger's admit is last
         except norm.Refused as r:
             buf.give_back()
             try:
@@ -1395,7 +1403,7 @@ class Keys:
         # {ended}`, and is a no-op after the relay's settle. No statement runs between the admit above and this try
         # (a tripwire holds it), and no ledger call sits in a `finally`; the ledger's owner callback is the backstop.
         try:
-            await self._serve_held(conn, ff, side, pol, rec, hold, head, hconn, cred, tpl, data, buf)
+            await self._serve_held(conn, ff, side, pol, rec, entry, meter, hold, head, hconn, cred, tpl, data, buf)
         except (norm.Refused, UpstreamFailed) as r:
             hold.end()
             if ff.responded:
@@ -1413,15 +1421,17 @@ class Keys:
             ff.close()
 
     async def _serve_held(self, conn: Conn, ff: "FrontFrames", side: KeysSide, pol: RoutePolicy, rec: dict,
-                          hold: ledger.Hold, head: bytes, hconn: "h11.Connection", cred: Optional[Credential],
-                          tpl: norm.Template, data: bytes, buf: "BodyTake") -> None:
+                          entry: dict, meter: "Tuple[codec.Codec, Price]", hold: ledger.Hold, head: bytes,
+                          hconn: "h11.Connection", cred: Optional[Credential], tpl: norm.Template, data: bytes,
+                          buf: "BodyTake") -> None:
         """The exchange from its admitted hold on (R4 §1.7 steps 6-8): the upstream, the durable wait, the head behind
         the ledger's send gate, keys' own serialization of the body (`data`, the length the head declared) and the
-        response. `A` and the body came before the admit (`_collect_body`). A completed relay settles the hold at its
-        full amount (3c-2b settles from usage); every other exit is resolved by `_serve_q`. Once `R` is sent no `F`
-        may follow (the wire's order), so a failure after it ends the exchange with the front's connection closed
-        mid-body (`ff.responded`)."""
+        response, relayed unbuffered while the codec's usage reader reads it on the side. A completed relay settles
+        from that usage (`_settle`); every other exit is resolved by `_serve_q`. Once `R` is sent no `F` may follow
+        (the wire's order), so a failure after it ends the exchange with the front's connection closed mid-body
+        (`ff.responded`)."""
         rec["template"] = tpl.path
+        reader: Optional[codec.UsageReader] = None
         scanner = Scanner([cred.secret.encode("latin-1")] if cred is not None else [])
         try:
             if conn.detached:   # a detached exchange answers nothing
@@ -1457,6 +1467,7 @@ class Keys:
 
             async def work() -> bool:
                 """The head, the upload, the response head and the relay; True when the relay completed."""
+                nonlocal reader
                 try:
                     await upstream_step(send_head())
                 except FrontAborted:
@@ -1469,14 +1480,31 @@ class Keys:
                 ff.responded = True
                 rec["status"] = resp.status_code
                 await conn.writer.drain()
-                await self._relay_body(conn, up, hconn, scanner, rec)
+                reader = meter[0].usage(_header(resp.headers, b"content-type"))
+                await self._relay_body(conn, up, hconn, scanner, rec, reader)
                 return not conn.detached   # fenced mid-relay: cut short, so `_serve_q`'s `end()` books it
 
             if not await self._against_front(ff, side, up, work()):
                 return   # the front aborted, or the exchange was cut short: `_serve_q`'s `end()` resolves the hold
-            hold.settle(hold.amount)   # a completed relay settles at its full hold (no usage read until 3c-2b)
+            assert reader is not None   # a completed relay made one
+            self._settle(entry, meter[1], hold, reader.result())
         finally:
             rec["redactions"] = scanner.count
+
+    @staticmethod
+    def _settle(entry: dict, price: Price, hold: ledger.Hold, usage: Optional[codec.Usage]) -> None:
+        """A completed relay's resolution (R4 §1.2, §1.4): its reported usage priced by class, settled in full (the
+        ledger books what passes the hold as `overrun`); with none, `uncertain {no-usage}`, charged its hold. A cost
+        above the hold stops the session: `budget_stopped` is set on the session's claims-cache entry ITSELF, the dict
+        `_check_q` and `_admit_hold` read, so every later `Q` of the session is `budget-overrun` and the flag dies
+        with the entry. Nothing in flight is touched: each other exchange settles from its own usage."""
+        if usage is None:
+            hold.uncertain("no-usage")
+            return
+        cost = codec.price_usage(usage, price)
+        hold.settle(cost, usage.meta())
+        if cost > hold.amount:
+            entry["budget_stopped"] = True
 
     async def _open_upstream(self, conn: Conn, ff: "FrontFrames", side: KeysSide, pol: RoutePolicy,
                              rec: dict) -> Optional[Upstream]:
@@ -1604,13 +1632,17 @@ class Keys:
         return out
 
     async def _relay_body(self, conn: Conn, up: Upstream, hconn: "h11.Connection", scanner: Scanner,
-                          rec: dict) -> None:
+                          rec: dict, reader: "codec.UsageReader") -> None:
         """`b`* `e`: each body read relayed at once through the scanner (no buffering but the held possible start of a
-        secret), each frame drained before the next read, so a slow front pauses the upstream's reader. A detached
-        exchange relays nothing more: `detached` is checked before every frame, after each read and each drain."""
+        secret), each frame drained before the next read, so a slow front pauses the upstream's reader. Each read is
+        handed to the usage `reader` first, which keeps its own bounded side copy and never changes or holds the
+        relayed bytes. A detached exchange relays nothing more: `detached` is checked before every frame, after each
+        read and each drain."""
         w = conn.writer
         while True:
             part = await upstream_step(upstream.read_body(up, hconn, self.idle_s))
+            if part is not None:
+                reader.feed(part)
             out = scanner.feed(part) if part is not None else scanner.flush()
             for i in range(0, len(out), BODY_FRAME):
                 if conn.detached:
@@ -1755,7 +1787,8 @@ class Keys:
         return method, path, query, fwd, tpl, cred
 
     def _check_request(self, reg: Registration, entry: dict, pol: RoutePolicy, req: tuple, raw: "_OneShot",
-                       buf: "BodyTake") -> Tuple[bytes, "h11.Connection", object, norm.Template, bytes, ledger.Hold]:
+                       buf: "BodyTake") -> Tuple[bytes, "h11.Connection", object, norm.Template, bytes,
+                                                 Tuple[codec.Codec, Price], ledger.Hold]:
         """R4 §1.7 steps 4-5, ONE synchronous call (no `await` anywhere in it): the body codec's parse of the buffered
         body, its `check` (the model has a price entry; on a dispatch-shaped route, one with no per-session cap, the
         unboundable shapes are `body-unbounded:<what>`), the ceiling written in where absent, the estimate, keys' own
@@ -1764,7 +1797,8 @@ class Keys:
         declared), and the ledger's admit LAST (a hold is admitted only for a request that
         goes out). A `RecursionError` anywhere in these steps is `body-json`, with no hold taken. Returns the request
         head, the h11 client that wrote it (it frames the body and parses the response), the credential (or None),
-        the matched template, the body bytes, and the admitted hold. `req` is `_check_q`'s answer."""
+        the matched template, the body bytes, the codec and price entry the settle reads (the meter), and the admitted
+        hold. `req` is `_check_q`'s answer."""
         method, path, query, fwd, tpl, cred = req
         c = codec.CODECS[pol.body_codec]   # a priced route's codec is never `none` (`policy.parse_base_map`)
         obj = c.parse(raw.take())   # the raw bytes are unreferenced once parsed: only `data` below is kept
@@ -1779,7 +1813,7 @@ class Keys:
         # an interactive route admits content the estimate cannot see, marked on its `reserved` line (R4 §1.6)
         meta = {"bound": "unproven"} if checked.unproven else {}
         hold = self._admit_hold(reg, pol, entry, estimate, checked.model, meta)   # the last step: see `_serve_q`
-        return head, hconn, cred, tpl, data, hold
+        return head, hconn, cred, tpl, data, (c, checked.price), hold
 
     def _admit_hold(self, reg: Registration, pol: RoutePolicy, entry: dict, estimate: int, price_ref: str,
                     meta: dict) -> ledger.Hold:

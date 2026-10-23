@@ -49,6 +49,20 @@ def lib(d: str, cap: int, codec: str = "anthropic-messages") -> None:
                             "inject": {"header": "x-api-key", "scheme": ""}, "kind": "static", "secret": SECRET}))
 
 
+def usage_response(usage: dict) -> bytes:
+    """A complete anthropic-messages JSON 200 reporting `usage`, with `connection: close`."""
+    body = json.dumps({"type": "message", "usage": usage}).encode()
+    return (b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\nconnection: close\r\n\r\n"
+            % len(body) + body)
+
+
+#: usage that prices at exactly the rig body's hold: the estimate holds the input at max(in, cache_write) and the
+#: output at `max_tokens`, so a call that writes its whole estimated input to the cache and answers its whole ceiling
+#: is charged that hold, by class (R4 §1.3: "an honest call that writes its whole context to the cache cannot overrun")
+AT_HOLD = usage_response({"input_tokens": 0, "cache_creation_input_tokens": len(BODY) + PRICE["overhead_tokens"],
+                          "output_tokens": json.loads(BODY)["max_tokens"]})
+
+
 def short_dir() -> str:
     return tempfile.mkdtemp(prefix="b2r", dir="/tmp")     # a unix socket path is capped near 104 bytes
 
@@ -86,9 +100,10 @@ class FakeControl:
 class FakeUpstream:
     """Plain TCP on 127.0.0.1. `conns` counts accepted connections, `heads` request heads fully received, `bodies`
     each request's body as received (read by its `content-length`). Responses wait on `release` (cleared = hold every
-    response open); then a 200 with a 2-byte body."""
+    response open); then `response`, by default a 200 whose usage prices at exactly the rig body's hold (`AT_HOLD`)."""
 
-    def __init__(self) -> None:
+    def __init__(self, response: Optional[bytes] = None) -> None:
+        self.response = AT_HOLD if response is None else response
         self.conns = self.heads = 0
         self.bodies: List[bytes] = []
         self.server: Any = None
@@ -117,7 +132,7 @@ class FakeUpstream:
                     n = int(value.strip())
             self.bodies.append(await r.readexactly(n))
             await self.release.wait()
-            w.write(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+            w.write(self.response)
             await w.drain()
         except (asyncio.IncompleteReadError, ConnectionError):
             pass

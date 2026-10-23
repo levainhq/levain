@@ -216,9 +216,19 @@ def test_cancel_at_each_await_resolves(monkeypatch, caplog, row):
     assert "misuse" not in caplog.text
 
 
-def test_completed_relay_settles_at_the_full_hold(monkeypatch):
-    # §2.5 / Q5 (3c-1's cut): a relay that ends normally settles the hold at its full amount; the `else: end()` after
-    # it is a no-op, and the owner callback adds nothing
+#: a usage body below the hold: 20 input tokens at 1 microdollar each + 5 output at 2 (the `m1` entry) = 30
+USAGE_30 = b'{"type":"message","usage":{"input_tokens":20,"output_tokens":5}}'
+
+
+@pytest.mark.parametrize("body,ctype,want", [
+    (USAGE_30, b"application/json", ("settled", 30, {"usage": {"in": 20, "out": 5, "cache_write": 0,
+                                                               "cache_read": 0}})),
+    (b"abcde", b"text/plain", ("uncertain", "no-usage", {})),
+])
+def test_completed_relay_settles_from_usage(monkeypatch, body, ctype, want):
+    # R4 §1.2 (3c-2b): a relay that ends normally settles from its reported usage priced by class, its meta the usage;
+    # one with none is `uncertain {no-usage}`, charged its hold. The `else: end()` after it is a no-op, and the owner
+    # callback adds nothing. (3c-1's cut settled every completed relay at its full hold.)
     up = _Up()
 
     async def go(d: str) -> dict:
@@ -226,21 +236,36 @@ def test_completed_relay_settles_at_the_full_hold(monkeypatch):
         async with _Rig(d) as rig:
             holds = _capture(rig)
             rig.front.feed_data(body_frames())
-            up.feed(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nabcde")
+            up.feed(b"HTTP/1.1 200 OK\r\ncontent-type: " + ctype + b"\r\ncontent-length: %d\r\n\r\n" % len(body)
+                    + body)
             up.feed(b"")
             await asyncio.wait_for(rig.run(_q()), 5)
             frames = await rig.got()
             await until(lambda: holds[0].state is L.RESOLVED)
             out = {"frames": frames, "charged": rig.ledger.charged(SCOPE), "path": rig.ledger.path,
-                   "outcome": holds[0].outcome}
-        out["res"] = resolutions(out["path"])
+                   "outcome": holds[0].outcome, "stopped": rig.k.cache[_digest()].get("budget_stopped")}
+        out["lines"] = [o for o in file_lines(out["path"]) if o["kind"] in ("settled", "uncertain")]
         out["seqs"] = [o["seq"] for o in file_lines(out["path"]) if o["kind"] == "reserved"]
         return out
 
     out = _run(go)
     assert _types(out["frames"]) == b"ARbe", out["frames"]
-    assert out["res"] == [("settled", out["seqs"][0], AMOUNT)]
-    assert out["outcome"] == (L.SETTLED, AMOUNT, 0) and out["charged"] == AMOUNT
+    assert b"".join(p for t, p in out["frames"] if t == b"b") == body      # relayed unchanged
+    (line,) = out["lines"]
+    assert line["ref"] == out["seqs"][0] and line["meta"] == want[2]
+    if want[0] == "settled":
+        assert (line["kind"], line["settled"], line["overrun"]) == ("settled", 30, 0)
+        assert out["outcome"] == (L.SETTLED, 30, 0) and out["charged"] == 30
+    else:
+        assert (line["kind"], line["reason"]) == ("uncertain", "no-usage")
+        assert out["outcome"] == (L.UNCERTAIN, "no-usage") and out["charged"] == AMOUNT
+    assert out["stopped"] is None    # under the hold: the session is not stopped
+
+
+def _digest():
+    from levain.broker.norm import digest_of_token
+    from tests.test_broker_keys_upstream import TOKEN
+    return digest_of_token(TOKEN)
 
 
 # --- T20 / T20b: every non-settle exit resolves while the task still runs; the backstop catches a missed one --------
