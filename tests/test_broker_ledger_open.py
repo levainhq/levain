@@ -7,6 +7,7 @@ import ast
 import asyncio
 import errno
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -145,6 +146,28 @@ def test_format_newer_refused(tmp_path, extra):
     write_file(path, line("header", 0, format="levain-reservation-ledger/3", ledger_id=LID,
                           created_at="2026-10-23T01:02:03Z", lineage=True), *extra)
     assert _refusal(path).name == "ledger-format-newer"
+
+
+def _newer_header() -> bytes:
+    return line("header", 0, format="levain-reservation-ledger/3", ledger_id=LID, created_at="2026-10-23T01:02:03Z")
+
+
+def _digest(path) -> str:
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+@pytest.mark.parametrize("name,parts", [
+    ("ledger-format-newer", [_newer_header()[:-12]]),                              # a torn newer-format first line
+    ("ledger-format-newer", [_newer_header(), b'{"kind":"opened","se']),             # a newer header, then a torn tail
+    ("ledger-corrupt:json:2", [header(), b"{not json\n", b'{"kind":"opened","se']),  # a corrupt line, then a torn tail
+], ids=["torn-newer-first-line", "newer-header-torn-tail", "corrupt-torn-tail"])
+def test_a_refused_torn_file_is_never_written(tmp_path, name, parts):
+    path = ledger_path(tmp_path)
+    write_file(path, *parts)
+    before = _digest(path)
+    assert _refusal(path).name == name
+    assert _digest(path) == before                  # no truncation, no header rewrite before the checks pass
 
 
 def test_replay_rebuilds_every_term(tmp_path):

@@ -15,6 +15,11 @@ line with no resolution is booked `uncertain {restart}` at its full amount.
 The flush is strict: `F_FULLFSYNC` on darwin with no fallback, `os.fsync` elsewhere, and neither flush function holds
 an `except`. Every open-time I/O error refuses the open by name (`ledger-io:<stage>:<errno>`).
 
+Known edges (L3 build-a r1, complement LOW 2; not built, conservative, never a loss): the stall rule is evaluated only
+when a `durable()` wait times out. "If the writer hangs while only resolution lines are in flight (every hold already
+SENT, then settled), nothing ever evaluates the stall rule. The ledger stays "healthy" and those holds sit RESOLVING at
+full amount until a new admit's `durable()` times out." Charged never drops early.
+
 Runs on the root interpreter (3.9): no `match`, no 3.10+ API. Standard library imports only (a tripwire holds it).
 """
 from __future__ import annotations
@@ -450,6 +455,24 @@ def _newer(raw: bytes) -> bool:
     return bool(m) and int(m.group(1)) > FORMAT_VERSION
 
 
+#: a torn first line still names its format when the cut falls after the version's closing quote
+_TORN_FORMAT_RE = re.compile(rb'"format":"levain-reservation-ledger/([0-9]{1,9})"')
+
+
+def _torn_newer(torn: bytes) -> bool:
+    """The zero-complete-lines case (§4.2 recreates it): a torn line that still names a later format is refused
+    `ledger-format-newer` and left untouched, since the newer build's rule for its own file is not ours to apply. A cut
+    before the version's closing quote names no version, and §4.2's recreate stands: no acknowledged line is lost,
+    since nothing is admitted before the header and the first `opened` line are durable."""
+    m = _TORN_FORMAT_RE.search(torn)
+    return bool(m) and int(m.group(1)) > FORMAT_VERSION
+
+
+def _newer_error(path: str) -> "LedgerOpenError":
+    return LedgerOpenError("ledger-format-newer", "levain gw-keys: ledger refused: ledger-format-newer "
+                           "(%s names a format above %s)" % (path, FORMAT))
+
+
 def _read_all(fd: int) -> bytes:
     parts = []
     off = 0
@@ -499,7 +522,7 @@ class Ledger:
 
     @classmethod
     def open(cls, path: str) -> "Ledger":
-        """Lock, torn tail, replay, directory flush, a new epoch: synchronous, before the loop. Every refusal is a
+        """Lock, replay, torn tail, directory flush, a new epoch: synchronous, before the loop. Every refusal is a
         `LedgerOpenError`; the fd is closed on every refusal."""
         path = os.path.abspath(path)
         dirpath = os.path.dirname(path)
@@ -534,13 +557,22 @@ class Ledger:
         except OSError as e:
             raise _io_error("open", e, path)
         data = b""
+        torn = b""
+        rp: Optional[_Replay] = None
         if not created:
             try:
                 data = _read_all(fd)
             except OSError as e:
                 raise _io_error("read", e, path)
-            if data and not data.endswith(b"\n"):          # the torn tail: the one line a kill or short write leaves
-                keep = data.rfind(b"\n") + 1
+            keep = data.rfind(b"\n") + 1                   # the torn tail: the one line a kill or short write leaves
+            data, torn = data[:keep], data[keep:]
+            # No byte is written before the checks pass: the complete lines are checked first (newer format, then
+            # every corruption rule), and only then is the torn tail truncated or the header recreated.
+            if data:
+                rp = cls._replay(path, data)
+            elif _torn_newer(torn):
+                raise _newer_error(path)
+            if torn:
                 try:
                     os.ftruncate(fd, keep)
                 except OSError as e:
@@ -549,7 +581,6 @@ class Ledger:
                     _flush(fd)
                 except OSError as e:
                     raise _io_error("flush-truncate", e, path)
-                data = data[:keep]
         if not data:                                       # create, or a file with zero complete lines
             header = _encode({"kind": "header", "seq": 0, "format": FORMAT, "ledger_id": secrets.token_hex(16),
                               "created_at": _now()})
@@ -561,14 +592,8 @@ class Ledger:
                 _flush(fd)
             except OSError as e:
                 raise _io_error("flush-header", e, path)
-            data = header
-        lines = data.split(b"\n")[:-1]
-        if _newer(lines[0]):
-            raise LedgerOpenError("ledger-format-newer", "levain gw-keys: ledger refused: ledger-format-newer "
-                                  "(%s names a format above %s)" % (path, FORMAT))
-        rp = _Replay(path)
-        for i, raw in enumerate(lines):
-            rp.line(i + 1, raw)
+            rp = cls._replay(path, header)
+        assert rp is not None
         # step 5: the directory, then the `opened` batch
         try:
             dirfd = os.open(dirpath, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
@@ -608,6 +633,17 @@ class Ledger:
         except OSError as e:
             raise _io_error("flush-opened", e, path)
         return cls(path, fd, rp.ledger_id, epoch, seq + 1, rp.acc)
+
+    @staticmethod
+    def _replay(path: str, data: bytes) -> "_Replay":
+        """Step 3 on complete lines only: the header version first, then every corruption rule. Writes nothing."""
+        lines = data.split(b"\n")[:-1]
+        if _newer(lines[0]):
+            raise _newer_error(path)
+        rp = _Replay(path)
+        for i, raw in enumerate(lines):
+            rp.line(i + 1, raw)
+        return rp
 
     # -- attach and the writer -----------------------------------------------------------------------------------
 
