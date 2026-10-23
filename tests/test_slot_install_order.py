@@ -419,7 +419,7 @@ def test_tree_links_refused_before_chown_and_renamed_into_place(host):
     assert steps[into].call and steps[flip].call and not steps[flip].argv          # rename(2), never mv
     assert not [a for a in argvs if a[0].endswith("/mv")]
     entries = {s.write[0].name for s in steps if s.write}
-    assert entries == {"install-helper", "runtime-helper", "service-entry"}
+    assert entries == {"install-helper", "runtime-helper", "service-entry", "export-importer", "export-verifier"}
     # a re-run whose target is already current drops the partial and touches no generation
     again = root_tree.tree_steps(host, Path("/src/levain"), generation=gen, current=gen)
     again_rms = [s.argv[-1] for s in again if s.argv and s.argv[0].endswith("/rm")]

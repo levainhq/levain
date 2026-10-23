@@ -6,9 +6,9 @@
 :mod:`levain.slot.runtime_grammar` and runs the verb. Every refusal is :func:`runtime_grammar.refusal_line` and a
 non-zero exit, raised before the next act: nothing after the refusing check acts.
 
-Verbs built here: ``prepare``, ``render``, ``resume``, ``status``; ``start`` and ``teardown`` dispatch to
-:mod:`levain.slot.start`. ``confirm-identity`` (session 2f's) and ``adopt-open`` / ``discard`` / ``restore``
-(session 5's) answer ``verb-unbuilt:<verb>``. A ticketed (dispatch) ``prepare`` answers ``verb-unbuilt:ticket``
+Verbs built here: ``prepare``, ``render``, ``resume``, ``status``, ``adopt-open`` and ``adopt-verify`` (session 5's);
+``start`` and ``teardown`` dispatch to :mod:`levain.slot.start`. Every other verb (derive: ``VERBS`` less
+``VERB_HANDLERS``) answers ``verb-unbuilt:<verb>``. A ticketed (dispatch) ``prepare`` answers ``verb-unbuilt:ticket``
 (session 2f's).
 
 Every root filesystem act goes through a dirfd: the store root is opened once with ``O_DIRECTORY|O_NOFOLLOW`` and
@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import errno
 import fcntl
+import hashlib
 import os
 import re
 import selectors
@@ -40,10 +41,12 @@ from typing import Callable, ContextManager, Dict, Iterable, Iterator, List, Map
 from levain.contracts import ContractError, canon
 from levain.slot import Refused, wall, write_all
 from levain.slot import bundlefmt as BF
+from levain.slot import fsck_ids as FI
 from levain.slot import proc as PR
 from levain.slot import records as R
 from levain.slot import render as RD
 from levain.slot import stage as ST
+from levain.slot import verify_caps as VC
 from levain.slot.end import V5_FLOOR_BYTES
 from levain.slot.grammar import SESSION_RE
 from levain.slot.ids import SlotId, in_own_range
@@ -568,6 +571,13 @@ class Seams:
     proc_seams: Optional[object] = None
     #: EndSeams fields a test replaces (owner_ok, meta_reader, strip, chown, run_as, ...); empty in production.
     end_overrides: Mapping[str, object] = field(default_factory=dict)
+    #: adopt-open's seams (None = the real ones): steps 1-5 (``AdoptSeams``) and steps 6-12 (``AdoptRunSeams``).
+    adopt: Optional["AdoptSeams"] = None
+    adopt_run: Optional["AdoptRunSeams"] = None
+    #: adopt-verify's seams (None = the real ones): its own facts (``VerifySeams``) and the sealed run's
+    #: (``AdoptRunSeams``, whose real ``launch`` for this verb is :func:`verify_launch_default`).
+    verify: Optional["VerifySeams"] = None
+    verify_run: Optional["AdoptRunSeams"] = None
 
     @property
     def L(self) -> Path:
@@ -1785,15 +1795,21 @@ def _alloc_base_field(a: R.Alloc) -> Optional[Mapping[str, object]]:
     return None if a.base is None else R.base_obj(a.base)
 
 
+def _root_git_version() -> str:
+    return FI.git_version_text(wall.GIT)
+
+
 @dataclass
 class AdoptSeams:
     """adopt-open's own injected facts: the alloc's ``base`` (render writes it; ``None`` = unrecorded), V7's wall
-    in seconds (one absolute deadline over the adopt-lock wait and the walk) and the walker caps."""
+    in seconds (one absolute deadline over the adopt-lock wait and the walk), the walker caps, and ``git_version()``
+    (root's git's ``git --version``, read against the floor)."""
 
     alloc_base: Callable[[R.Alloc], Optional[Mapping[str, object]]] = _alloc_base_field
     lock_wait_s: float = V7_SECONDS
     max_bytes: int = V7_BYTES
     max_entries: int = V7_ENTRIES
+    git_version: Callable[[], str] = _root_git_version
 
 
 @dataclass(frozen=True)
@@ -2041,25 +2057,822 @@ def adopt_step5_precaps(ctx: Ctx, front: AdoptFront, adopt: AdoptSeams) -> None:
 @contextmanager
 def adopt_open_front(ctx: Ctx, session: str, adopt: Optional[AdoptSeams] = None) -> Iterator[AdoptFront]:
     """adopt-open steps 1-5: the caller and kind, the session lock (TRY, ``session-busy``), root facts, the adopt
-    lock (bounded wait, ``adopt-busy``), the pre-caps. Both locks are held while the caller runs steps 6-12 and are
-    released adopt lock first, then the session lock."""
+    lock (bounded wait, ``adopt-busy``), the pre-caps, then the git floor (``git-below-floor:<version>``, CONTRACT
+    §5.1 adopt-open; :func:`fsck_ids.check_floor`, the one function adopt-verify calls too), before any seal-in. Both
+    locks are held while the caller runs steps 6-12 and are released adopt lock first, then the session lock."""
     adopt = adopt or AdoptSeams()
     deadline = ctx.seams.monotonic() + adopt.lock_wait_s   # V7's one wall: the lock wait and the walk
     a = adopt_step1_caller(ctx, session)
     ctx.seams.at("adopt:2")
-    with session_lock(ctx, session):
-        ctx.seams.at("adopt:3")
-        front = adopt_step3_root_facts(ctx, a, adopt, deadline=deadline)
-        ctx.seams.at("adopt:4")
-        with adopt_lock_wait(ctx, front.deadline):
-            ctx.seams.at("adopt:5")
-            adopt_step5_precaps(ctx, front, adopt)
-            yield front
+    try:
+        with session_lock(ctx, session):
+            ctx.seams.at("adopt:3")
+            front = adopt_step3_root_facts(ctx, a, adopt, deadline=deadline)
+            ctx.seams.at("adopt:4")
+            try:
+                with adopt_lock_wait(ctx, front.deadline):
+                    ctx.seams.at("adopt:5")
+                    adopt_step5_precaps(ctx, front, adopt)
+                    FI.check_floor(adopt.git_version())
+                    ctx.seams.at("adopt:floor")
+                    yield front
+            finally:
+                ctx.seams.at("adopt:adopt-unlocked")
+    finally:
+        ctx.seams.at("adopt:session-unlocked")
+
+
+# --- adopt-open steps 6-12: the sealed import run (DESIGN §1 steps 6-12, §4.1, §4.5, §5b; 5c-ii-c) ----------------
+
+#: V31's memory cap for the importer (the Linux leaf's ``memory.max``, the macOS watchdog's cap) [judged by adopt-cc,
+#: 10-22, against DESIGN §4.9's 5g row "a one-shot allocation past 4 GiB"; no ruling names the number].
+ADOPT_MEMORY_CAP = 4 << 30
+#: V31's ``pids.max`` on the run leaf: the same count as the stage's ``RLIMIT_NPROC`` (``wall.EXPORT_NPROC``).
+ADOPT_PIDS_MAX = wall.EXPORT_NPROC
+#: Step 10: root waits for the result line until V7's time + this grace (DESIGN §1 step 10, "V7 time + 60 s").
+RESULT_GRACE_S = 60.0
+#: The export class adopt-open publishes into (an operator's adopt; the reaper's artifact step is ``dispatch``).
+ADOPT_CLASS = "operator"
+_O_LOG = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+
+def export_rlimits(image_bytes: int, cpu_s: float = V7_SECONDS) -> Tuple[Tuple[int, int], ...]:
+    """§5b "Both" (head ruling 1022+19 Q3): ``(resource, limit)`` pairs root sets in the forked export child, soft =
+    hard, so the target cannot raise them back: ``RLIMIT_CORE`` 0, ``RLIMIT_FSIZE`` V31's image bytes (no file the
+    importer writes can outgrow the image; the logs included), ``RLIMIT_CPU`` V7's seconds. ``RLIMIT_NPROC`` is the
+    stage's (``Spec.nproc``); there is no ``RLIMIT_AS`` (A5: memory is the leaf's or the watchdog's)."""
+    import resource
+    return ((resource.RLIMIT_CORE, 0), (resource.RLIMIT_FSIZE, int(image_bytes)),
+            (resource.RLIMIT_CPU, int(cpu_s)))
+
+
+def apply_rlimits(limits: Sequence[Tuple[int, int]], *, getrlimit: Optional[Callable] = None,
+                  setrlimit: Optional[Callable] = None) -> None:
+    """Each limit as soft AND hard, never above the hard limit already in force (lowering a hard limit needs no
+    privilege; raising one would fail EPERM for a non-root caller and is never wanted). ``getrlimit`` /
+    ``setrlimit``: the ``resource`` module's (a seam log stands in for them in a unit row)."""
+    import resource
+    get = getrlimit or resource.getrlimit
+    put = setrlimit or resource.setrlimit
+    for res, want in limits:
+        _soft, hard = get(res)
+        v = want if hard == resource.RLIM_INFINITY or hard < 0 else min(want, hard)
+        put(res, (v, v))
+
+
+@dataclass(frozen=True)
+class ExportCmd:
+    """One export target's launch: ``argv`` (macOS ``launchctl asuser`` -> the stage; Linux bwrap -> the stage),
+    the stage's ``spec_json``, the Linux leaf the child joins (``cgroup``), ``cwd`` (None in production: the stage
+    changes to the spec's cwd after the drop; a seam run with no stage sets it here) and ``exec_child(argv,
+    spec_fd, cgroup)``, the child's last act (:func:`wall.exec_launch`)."""
+
+    argv: Tuple[str, ...]
+    spec_json: bytes
+    cgroup: Optional[str] = None
+    cwd: Optional[str] = None
+    exec_child: Callable[..., None] = wall.exec_launch
+
+
+def export_launch_default(ctx: Ctx, args: Sequence[str], export_class: str) -> ExportCmd:
+    """The importer's product launch (§5b): its spec (:func:`wall.export_launch_spec`, the principal
+    ``_levain_export`` with the class's group) and the host's launch argv."""
+    return _export_launch(ctx, "importer", args, export_class)
+
+
+def verify_launch_default(ctx: Ctx, args: Sequence[str], export_class: str) -> ExportCmd:
+    """The verifier's product launch (§5b, §6.0): the principal ``_levain_verify`` with ``levain-verify`` (no
+    class: the verifier reads its two inputs only, whichever class publishes its outputs)."""
+    return _export_launch(ctx, "verifier", args, None)
+
+
+def _export_launch(ctx: Ctx, role: str, args: Sequence[str], export_class: Optional[str]) -> ExportCmd:
+    host = ctx.seams.host
+    group = wall.EXPORT_GROUPS[(role, export_class)]
+    ids = {wall.EXPORT_ACCOUNT[role]: ctx.seams.account_uid(wall.EXPORT_ACCOUNT[role])}
+    shared = {group: ctx.seams.group_gid(group)}
+    spec = wall.export_launch_spec(host, role, ids=ids, shared=shared, args=args, export_class=export_class)
+    if host == "darwin":
+        return ExportCmd(wall.macos_launch_argv(spec), spec.to_json())
+    launch = wall.export_linux_launch_argv(spec, host_links=ctx.seams.host_links())
+    return ExportCmd(launch.argv, spec.to_json(), cgroup=launch.cgroup)
+
+
+def spawn_export(cmd: ExportCmd, *, frame_r: int, stdout_fd: int, stderr_fd: int, result_w: int,
+                 rlimits: Sequence[Tuple[int, int]]) -> int:
+    """§1 step 7's fork: the child ``setsid``s, puts the frame pipe's read end on 0, the two log files on 1 and 2,
+    the result pipe's write end on :data:`wall.RESULT_FD` (4), keeps the spec pipe (moved to ``SPEC_FD`` by
+    ``exec_launch``, read and closed by the stage before its exec) and closes every other fd; sets
+    :func:`export_rlimits` (they survive the exec chain and the drop); then ``cmd.exec_child``. The parent writes the
+    spec, closes its spec end and returns the pid. A child that fails before its exec exits 70 with no result line."""
+    spec_r, spec_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:   # pragma: no cover - the forked child; the seam run drives it, the root path is a 5g row
+        try:
+            os.setsid()
+            hi = [fcntl.fcntl(fd, fcntl.F_DUPFD, 32) for fd in (frame_r, stdout_fd, stderr_fd, result_w, spec_r)]
+            for src, dst in zip(hi[:4], (0, 1, 2, wall.RESULT_FD)):
+                os.dup2(src, dst)          # dup2 leaves the target inheritable
+            _close_fds_except([wall.RESULT_FD, hi[4]])
+            apply_rlimits(rlimits)
+            if cmd.cwd is not None:
+                os.chdir(cmd.cwd)
+            cmd.exec_child(cmd.argv, hi[4], cgroup=cmd.cgroup)
+        except BaseException:   # noqa: BLE001 - the child never returns into the helper's stack
+            pass
+        os._exit(70)
+    os.close(spec_r)
+    try:
+        write_all(spec_w, cmd.spec_json)
+    except OSError:
+        pass                    # a child that died before reading its spec: its exit says so
+    finally:
+        os.close(spec_w)
+    return pid
+
+
+def collect_export(pid: int, result_r: int, deadline_s: float, *, cap: int,
+                   monotonic: Callable[[], float] = time.monotonic,
+                   on_reap: Optional[Callable[[], None]] = None) -> Tuple[str, Optional[int], Optional[bytes], bool]:
+    """§1 step 10: the result line read from fd 4 as DATA while the importer runs, at most ``cap`` + 1 bytes (the
+    classifier refuses the extra byte by size), until the importer EXITS (polled ``WNOHANG``), never until the pipe's
+    EOF: a process the importer left behind can hold fd 4 open, and seal-out kills it. Returns ``(exit, code, line,
+    reaped)``: ``exit`` ``"exit"`` (``code`` its status) or ``"signal"``, or ``"time"`` past ``deadline_s`` with the
+    importer NOT reaped (seal-out's domain proof kills and reaps it as a child). ``on_reap`` is called as soon as the
+    ``waitpid`` has reaped the importer, before anything else here can raise, so a caller never hands a reaped (and
+    possibly recycled) pid to seal-out (L3 r1 L2)."""
+    end = monotonic() + deadline_s
+    buf = bytearray()
+    open_ = True
+    os.set_blocking(result_r, False)
+
+    def take() -> bool:            # one read; False at EOF or nothing ready
+        nonlocal open_
+        if not open_ or len(buf) > cap:
+            return False
+        try:
+            b = os.read(result_r, min(65536, cap + 1 - len(buf)))
+        except BlockingIOError:
+            return False
+        if not b:
+            open_ = False
+            return False
+        buf.extend(b)
+        return True
+
+    with selectors.DefaultSelector() as sel:
+        sel.register(result_r, selectors.EVENT_READ)
+        while True:
+            try:
+                done, status = os.waitpid(pid, os.WNOHANG)
+            except InterruptedError:
+                continue
+            if done:
+                if on_reap is not None:
+                    on_reap()
+                while take():
+                    pass
+                line = bytes(buf) if buf else None
+                if os.WIFSIGNALED(status):
+                    return "signal", None, line, True
+                return "exit", os.WEXITSTATUS(status), line, True
+            left = end - monotonic()
+            if left <= 0:
+                return "time", None, (bytes(buf) if buf else None), False
+            if open_ and len(buf) <= cap:
+                if sel.select(min(left, 0.05)):
+                    take()
+            else:
+                time.sleep(min(left, 0.05))
+
+
+@dataclass
+class AdoptRunSeams:
+    """Steps 6-12's injected facts, each with its real default. ``seal(facts) -> export_run.SealSeams`` (None: the
+    real domain prover of ``_levain_export``); ``launch(ctx, args, export_class) -> ExportCmd``; ``spawn``
+    (:func:`spawn_export`); ``walk_seams() -> walker.WalkSeams`` (None: root's, owner uid 0); ``publish_gid(ctx,
+    export_class)`` (None: the class group's gid; a seam run as an unprivileged uid answers None from it, no chown);
+    ``memory_cap`` / ``pids_max`` (V31); ``result_grace_s`` (step 10)."""
+
+    seal: Optional[Callable[[object], object]] = None
+    launch: Callable[[Ctx, Sequence[str], str], ExportCmd] = export_launch_default
+    spawn: Callable[..., int] = spawn_export
+    walk_seams: Optional[Callable[[], object]] = None
+    publish_gid: Optional[Callable[[Ctx, str], Optional[int]]] = None
+    memory_cap: int = ADOPT_MEMORY_CAP
+    pids_max: int = ADOPT_PIDS_MAX
+    result_grace_s: float = RESULT_GRACE_S
+
+
+def make_work(ctx: Ctx, work: str, object_format: str, export_uid: int) -> Tuple[int, int]:
+    """Seal-in's ``.work/`` skeleton (§4.1): :func:`importer.make_skeleton` (modes set, root's), then the export
+    uid made the owner of ``repo.git/objects``, ``repo.git/refs``, ``spool``, ``out``, ``log`` and the two log files
+    (``repo.git`` itself, ``config`` and ``HEAD`` stay root's), each opened ``O_NOFOLLOW`` before its ``fchown``.
+    Returns the two log files opened for writing (fds 1 and 2 of the child, A7). Nothing runs in the domain yet."""
+    from levain.slot import importer as IM
+
+    IM.make_skeleton(Path(work), object_format)
+    for rel in ("repo.git/objects", "repo.git/refs", "spool", "out", "log"):
+        fd = os.open(os.path.join(work, rel), _O_DIR)
+        try:
+            ctx.seams.chown(fd, export_uid, -1, f"export/.work/{rel}")
+        finally:
+            os.close(fd)
+    logs = []
+    try:
+        for name in ("stdout", "stderr"):
+            fd = os.open(os.path.join(work, "log", name), _O_LOG)
+            logs.append(fd)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise Refused(ER_UNAVAILABLE, f".work/log/{name} is not a regular file")
+            ctx.seams.chown(fd, export_uid, -1, f"export/.work/log/{name}")
+    except BaseException:
+        for fd in logs:
+            os.close(fd)
+        raise
+    return logs[0], logs[1]
+
+
+ER_UNAVAILABLE = "export-image-unavailable"
+
+
+def importer_args(session: str, base: Mapping[str, object], adopt: AdoptSeams) -> Tuple[str, ...]:
+    """The importer's fixed argv (``importer._parser``); ``wall.export_launch_spec`` refuses it past the spec's
+    string cap (``spec-malformed``), so a longer argv can never launch."""
+    return ("--git", wall.GIT, "--session", session, "--object-format", str(base["object_format"]),
+            "--base-oid", str(base["oid"]), "--max-bytes", str(adopt.max_bytes),
+            "--max-input-size", str(adopt.max_bytes))
+
+
+def adopt_answer(ctx: Ctx, front: AdoptFront, result: str, pub: object, export_class: str) -> Dict[str, object]:
+    """§4.5: ``result`` and ``refs`` from root's own header parse (never the importer's line), ``base_oid`` and
+    ``object_format`` from ``alloc.base``, the digests of the bytes root copied; head ruling A2: the transaction's
+    ``warnings`` (a class-dir fsync that failed after the commit) ride beside ``ok: true`` when there are any."""
+    s = front.alloc.session
+    prefix = f"refs/levain/{s}/".encode()
+    refs: List[str] = []
+    header = getattr(pub, "header", None)
+    if header is not None:
+        names = {n[len(prefix):].decode("ascii") for _oid, n in header.refs if n.startswith(prefix)}
+        refs = [r for r in ("head", "wip") if r in names]
+    digests = getattr(pub, "digests")
+    out: Dict[str, object] = {
+        "result": result, "repo": str(ctx.seams.L / "export" / export_class / s),
+        "bundle_digest": ("sha256:" + digests["bundle"]) if "bundle" in digests else None,
+        "report_digest": "sha256:" + digests["report.json"],
+        "base_oid": front.base["oid"], "object_format": front.base["object_format"], "refs": refs}
+    warnings = tuple(getattr(pub, "warnings", ()))
+    if warnings:
+        out["warnings"] = list(warnings)
+    return out
+
+
+def detach_before_commit(run: object, seal: object, work_dfd: int) -> Callable[[], None]:
+    """The publish's ``before_commit`` for a sealed run (adopt-open and adopt-verify): root's fd on the image root
+    closed (D2: no fd of root's into the image survives the detach), then the image detached and unlinked; a detach
+    that did not happen REFUSES ``export-image-unavailable`` before the commit (L3 r1 H1), so the transaction removes
+    its staging and publishes nothing. ``release_image`` itself is best-effort by design (teardown retries it)."""
+    def release() -> None:
+        if work_dfd in run.fds:                                     # type: ignore[attr-defined]
+            run.fds.remove(work_dfd)                                # type: ignore[attr-defined]
+            os.close(work_dfd)
+        run.release_image()                                         # type: ignore[attr-defined]
+        if not run.released:                                        # type: ignore[attr-defined]
+            img = run.image                                         # type: ignore[attr-defined]
+            raise Refused(ER_UNAVAILABLE, "the per-run image could not be detached and removed before the "
+                          f"commit (mount {img.mount if img else None}, still mounted: "
+                          f"{seal.image.is_mounted(img.mount) if img else None}); "  # type: ignore[attr-defined]
+                          "nothing is published")
+    return release
+
+
+def adopt_sealed_run(ctx: Ctx, front: AdoptFront, adopt: AdoptSeams, run_seams: AdoptRunSeams,
+                     export_class: str = ADOPT_CLASS) -> Dict[str, object]:
+    """Steps 6-12 inside both locks. Seal-in (``SealedRun.seal_in``) -> the skeleton and its owners -> (macOS) the
+    importer profile written -> spawn -> the watchdog -> the walk into the frame pipe, whose write end is CLOSED as
+    soon as the walker returns or refuses (the importer sees EOF at once, never its trailing wait) -> the result line
+    and the reap -> seal-out ALWAYS (it kills anything the importer left) -> the ONE classification -> the publish
+    (``before_commit`` = the image released) -> the §4.5 answer; teardown in a ``finally``. A walker refusal (head
+    ruling Q5): seal-out still runs, ``export-domain-unproven`` from it wins, else the walker's own name; nothing is
+    published. The locks are the caller's (:func:`adopt_open_front`), released after this returns."""
+    from levain.slot import export_run as ER
+    from levain.slot import importer as IM
+    from levain.slot import walker as WK
+
+    at, host, s = ctx.seams.at, ctx.seams.host, front.alloc.session
+    export_dir = str(ctx.seams.L / "export")
+    uid = ctx.seams.account_uid(wall.EXPORT_ACCOUNT["importer"])
+    bundle_bytes = int(front.base["bundle_bytes"])   # type: ignore[call-overload]
+    image_bytes = adopt_image_bytes(host, entries=front.entries, nbytes=front.nbytes,
+                                    manifest_bytes=front.manifest_bytes, bundle_bytes=bundle_bytes)
+    facts = ER.SealFacts(host=host, role_key="importer", export_dir=export_dir, uid=uid, image_bytes=image_bytes,
+                         image_inodes=2 * front.entries + IMAGE_INODES_FIXED, memory_cap=run_seams.memory_cap,
+                         pids_max=run_seams.pids_max)
+    seal = run_seams.seal(facts) if run_seams.seal is not None else ER.SealSeams(
+        prove=ER.export_domain_prover(host, "importer", uid))
+    run = ER.SealedRun(facts, seal)   # type: ignore[arg-type]
+    gid = (run_seams.publish_gid or (lambda c, k: c.seams.group_gid(wall.EXPORT_GROUPS[("importer", k)])))(
+        ctx, export_class)
+    with ctx.store.dir("export", export_class) as class_dfd:
+        at("adopt:6")
+        run.seal_in(class_dfd, s + ER.STAGING_SUFFIX)      # a refusal here has torn down what it made
+        pid: Optional[int] = None
+        reaped = [False]                   # L2: set by collect_export the moment its waitpid reaps the importer
+        sealed_out = False
+        try:
+            work = ER.mount_path(export_dir, "importer")
+            out_fd, err_fd = make_work(ctx, work, str(front.base["object_format"]), uid)
+            run.fds += [out_fd, err_fd]
+            if host == "darwin":
+                with ctx.store.dir("export") as efd:
+                    replace_at(efd, "importer.sb", RD.render_importer_profile(host), mode=0o644,
+                               fsync=ctx.seams.fsync)
+            cmd = run_seams.launch(ctx, importer_args(s, front.base, adopt), export_class)
+            # L1: each pair is in run.fds the moment it exists, so a failed second pipe() leaks nothing of the first
+            frame_r, frame_w = pair = os.pipe()
+            run.fds += pair
+            result_r, result_w = pair = os.pipe()
+            run.fds += pair
+            at("adopt:7")
+            try:
+                pid = run_seams.spawn(cmd, frame_r=frame_r, stdout_fd=out_fd, stderr_fd=err_fd, result_w=result_w,
+                                      rlimits=export_rlimits(image_bytes))
+            finally:
+                # the child's now: root keeps only frame_w and result_r, and no fd into the image past the spawn
+                for fd in (frame_r, result_w, out_fd, err_fd):
+                    run.fds.remove(fd)
+                    os.close(fd)
+            run.start_watchdog()
+            at("adopt:8")
+            walk_refusal: Optional[Refused] = None
+            try:
+                WK.walk_frames(front.retained / "tree", front.retained / "manifest.jsonl", frame_w,
+                               depth=front.depth, caps=adopt_walk_caps(front, adopt),
+                               base_bundle_sha256=str(front.base["bundle_sha256"]),
+                               seams=run_seams.walk_seams() if run_seams.walk_seams is not None else None)
+            except Refused as e:
+                walk_refusal = e
+            finally:
+                run.fds.remove(frame_w)
+                os.close(frame_w)          # 5b1 carry 3: EOF right after the terminal frame (or the refusal)
+                at("adopt:frame-closed")
+            at("adopt:10")
+            wait_s = max(0.0, front.deadline - ctx.seams.monotonic()) + run_seams.result_grace_s
+            exit_kind, code, line, _ = collect_export(pid, result_r, wait_s, cap=IM.RESULT_CAP,
+                                                      on_reap=lambda: reaped.__setitem__(0, True))
+            run.fds.remove(result_r)
+            os.close(result_r)
+            at("adopt:11")
+            sealed_out = True              # ONE seal-out: an unproven one raises and is not run again below
+            reading = run.seal_out(() if reaped[0] else (pid,))
+            if walk_refusal is not None:
+                raise walk_refusal
+            at("adopt:classify")
+            outcome = ER.classify(ER.RunObservation(exit_kind, code, reading.memory_killed, reading.memory_unreadable,
+                                                    reading.host_short, line))
+            at("adopt:publish")
+            work_dfd = os.open(work, _O_DIR)
+            run.fds.append(work_dfd)
+            result, pub = ER.publish_if_success(
+                outcome, work_dfd, class_dfd, s, object_format=str(front.base["object_format"]), owner_uid=uid,
+                caps={"bundle": image_bytes, "report.json": IM.REPORT_CAP}, seams=seal.publish,  # type: ignore[attr-defined]
+                gid=gid, before_commit=detach_before_commit(run, seal, work_dfd))
+            at("adopt:12")
+            return adopt_answer(ctx, front, result, pub, export_class)
+        finally:
+            try:
+                if not sealed_out:
+                    # anything that failed after seal-in: the domain is still killed and proven before the locks go.
+                    # L3 r1 M1 / ruling Q5: an unproven seal-out here RAISES export-domain-unproven, which replaces
+                    # the pending failure (Python chains that one as its __context__); teardown still runs below and
+                    # leaves the image for the next seal-in. Known edge (L3 r2, codex MED / complement LOW): a pending
+                    # KeyboardInterrupt or SystemExit is replaced the same way, so a signal mid-adopt answers
+                    # export-domain-unproven instead of interrupting; nothing publishes and the helper still exits.
+                    run.seal_out(() if (pid is None or reaped[0]) else (pid,))
+            finally:
+                at("adopt:teardown")
+                run.teardown()
+
+
+def adopt_open(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
+    """``adopt-open <session>`` (CONTRACT §5.1; DESIGN §1 steps 1-12): steps 1-5 (:func:`adopt_open_front`) hold
+    the session lock, then the adopt lock; steps 6-12 run inside both (:func:`adopt_sealed_run`); the adopt lock is
+    released first, then the session lock."""
+    assert req.session is not None
+    adopt = ctx.seams.adopt if ctx.seams.adopt is not None else AdoptSeams()
+    run_seams = ctx.seams.adopt_run if ctx.seams.adopt_run is not None else AdoptRunSeams()
+    with adopt_open_front(ctx, req.session, adopt) as front:
+        return adopt_sealed_run(ctx, front, adopt, run_seams)
+
+
+# --- adopt-verify: the confined verifier's root verb (DESIGN §6.0, §6.3, §4.1; CONTRACT §5.1; 5d-i session 2) ------
+
+#: V30 (§6.3): the analysis wall, ``VERIFY_WALL_BASE_S`` + ``VERIFY_WALL_PER_GIB_S`` per GiB of (base bundle + bundle)
+#: bytes; ``RLIMIT_CPU`` takes the same value, and root waits for the line that long + :data:`RESULT_GRACE_S`.
+VERIFY_WALL_BASE_S = 300.0
+VERIFY_WALL_PER_GIB_S = 120.0
+#: The verify image's fixed margin (§6.3, judged there); V30's output caps are :mod:`verify_caps`' (one module the
+#: verifier child and root both import).
+VERIFY_MARGIN_BYTES = 64 << 20
+#: ``verified.json``'s cap: a record whose only unbounded part is the prerequisites, which come from a bundle header
+#: of at most ``bundlefmt.HEADER_MAX`` bytes [judged by adopt-5di-s2, 10-22, against ``adopt_verify.Verified.to_json``].
+VERIFIED_CAP = 2 * BF.HEADER_MAX + (64 << 10)
+#: The staged name of the verify publish inside ``<class>/<s>/`` (``transact`` stages ``<name>.new``).
+VERIFY_DIR = "verify"
+_NEW_FILE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+_COPY_CHUNK = 1 << 20
+
+
+def idx_bound(objects: int, object_format: str) -> int:
+    """A pack idx's bound from its pack header's object count (§6.3, CONTRACT §10.3): ``8 + 1024 + objects x (oid
+    bytes + 16) + 2 x oid bytes``."""
+    ob = BF.OID_HEX[object_format] // 2
+    return 8 + 1024 + objects * (ob + 16) + 2 * ob
+
+
+def verify_image_bytes(*, bundle_bytes: int, base_bytes: int, bundle_objects: int, base_objects: int,
+                       object_format: str) -> int:
+    """V30's verify image (§6.3): ``2 x (bundle + base bundle)`` (the copies in, and the pack each ``index-pack
+    --stdin`` writes into Q and B), both idx bounds, the expanded-output cap, the required oid list and its ``sort``
+    temp files (``2 x objects x (oid hex + 1)``, ``objects`` here BOTH packs' counts, a superset of the bundle's
+    [judged by adopt-5di-s2, 10-22, against §6.3's "objects from the pack header's count"]), the verifier's other
+    oid inventories in ``scratch/`` (``verify_caps.inventory_bytes`` over the same count: one line per object in each,
+    L3 s2 r2), the closure's tree payloads at their cap (``verify_caps.TREE_SCRATCH_CAP``, which the verifier enforces
+    before writing them; L3 s2 r1 codex MED: §6.3's formula has no term for them [judged by adopt-s2fix, 10-22]) and
+    the fixed margin."""
+    hexlen = BF.OID_HEX[object_format]
+    objects = bundle_objects + base_objects
+    return (2 * (bundle_bytes + base_bytes) + idx_bound(bundle_objects, object_format)
+            + idx_bound(base_objects, object_format) + VC.PREVIEW_OUTPUT_CAP + VC.TREE_SCRATCH_CAP
+            + 2 * objects * (hexlen + 1) + VC.inventory_bytes(objects, hexlen) + VERIFY_MARGIN_BYTES)
+
+
+def verify_wall_s(bundle_bytes: int, base_bytes: int) -> float:
+    """V30's analysis wall in seconds (§6.3)."""
+    return VERIFY_WALL_BASE_S + VERIFY_WALL_PER_GIB_S * (bundle_bytes + base_bytes) / (1 << 30)
+
+
+def _pf_unbuilt(uid: int) -> bool:
+    raise Refused("verifier-network-unisolated", "the live pf check of the _levain_verify rule is not built (5g); "
+                  "adopt-verify refuses rather than run the verifier unchecked")
+
+
+@dataclass
+class VerifySeams:
+    """adopt-verify's own injected facts: ``git_version()`` (root's git's ``git --version``, read against the floor);
+    ``pf_live(uid)`` (macOS: pf enabled and the ``user _levain_verify`` rule live; the real default REFUSES
+    ``verifier-network-unisolated``, because no live check is built yet, 5g); the adopt-lock wait (adopt-open's,
+    V7's wall)."""
+
+    git_version: Callable[[], str] = _root_git_version
+    pf_live: Callable[[int], bool] = _pf_unbuilt
+    lock_wait_s: float = V7_SECONDS
+
+
+def verify_caller(ctx: Ctx, session: str) -> Tuple[R.Alloc, str]:
+    """(1) The caller, split by class (CONTRACT §5.1 adopt-verify; c7.10 fix1 F2, head 1022+20 Q1). Returns the
+    alloc and the export class the verify publishes into. An OPERATOR session (no ticket, kind ``interactive|login``)
+    answers its operator (``SUDO_UID`` == alloc ``operator_uid``) -> ``operator``; on its own uid's ticketed or
+    other-kind session the operator answers ``adopt-kind:<kind>``. A DISPATCH-CLASS session (the alloc carries a
+    ticket) answers only ``_levain_dispatch``, and only as the lease peer that prepared it with that ticket
+    (``supervisor_uid`` == ``SUDO_UID``, :func:`read_alloc`'s ticket-bound rule) -> ``dispatch``. Every other pairing
+    answers ``no-session``, so a caller learns nothing of another's sessions."""
+    data = ctx.store.read(("alloc",), f"{session}.json")
+    if data is None:
+        raise Refused("no-session", session)
+    try:
+        a = R.parse_alloc(data)
+    except (ContractError, Refused) as e:
+        raise Refused("no-session", session) from e
+    if a.session != session:
+        raise Refused("no-session", session)
+    if ctx.caller == OPERATOR and a.operator_uid == ctx.sudo_uid:
+        if a.ticket is not None or a.kind not in ADOPT_KINDS:
+            raise Refused(f"adopt-kind:{a.kind}", session)
+        return a, ADOPT_CLASS
+    if ctx.caller == DISPATCH and a.ticket is not None and a.supervisor_uid == ctx.sudo_uid:
+        return a, "dispatch"
+    raise Refused("no-session", session)
+
+
+def verify_caller_locked(ctx: Ctx, session: str, before: R.Alloc, export_class: str) -> R.Alloc:
+    """(1) again, under the session lock (L3 s2 r1 complement MED): the alloc re-read and the caller re-checked by
+    :func:`verify_caller`, then refused ``no-session`` when its owner (``operator_uid``, ``supervisor_uid``), class
+    (kind, ticket, the export class) or ``base`` differs from the pre-lock read. The pre-lock read stays only so a
+    caller with no claim on the session learns nothing of it (not even ``session-busy``)."""
+    a, k = verify_caller(ctx, session)
+    if (k, a.kind, a.ticket, a.operator_uid, a.supervisor_uid, a.base) != (
+            export_class, before.kind, before.ticket, before.operator_uid, before.supervisor_uid, before.base):
+        raise Refused("no-session", f"{session}: the alloc changed between the caller check and the session lock")
+    return a
+
+
+def _open_source(dfd: int, name: str, refusal: str, ctx: Ctx) -> Tuple[int, os.stat_result]:
+    """One input root copies into the verify image, opened ``O_NOFOLLOW|O_NONBLOCK`` below a dirfd it already
+    checked: regular, root's (``seams.trusted``), one link; else ``refusal`` by name."""
+    try:
+        fd = os.open(name, _O_READ, dir_fd=dfd)
+    except OSError as e:
+        raise Refused(refusal, f"{name}: {errno.errorcode.get(e.errno or 0, e.errno)}") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or not ctx.seams.trusted(st) or st.st_nlink != 1:
+            raise Refused(refusal, f"{name}: not a regular root-owned file of one link")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, st
+
+
+def _fd_sha256(fd: int, size: int) -> str:
+    """``sha256:<hex>`` of an open file's first ``size`` + 1 bytes at most, by ``pread``. An OSError reading it (EIO)
+    = ``export-image-unavailable``, the name copy-in gives the same read (L3 s2 r2 introduced LOW: it was ``internal``)."""
+    h = hashlib.sha256()
+    off = 0
+    try:
+        while off <= size:
+            chunk = os.pread(fd, min(_COPY_CHUNK, size + 1 - off), off)
+            if not chunk:
+                break
+            h.update(chunk)
+            off += len(chunk)
+    except OSError as e:
+        raise Refused(ER_UNAVAILABLE, f"the digest scan: {errno.errorcode.get(e.errno or 0, e.errno)}") from e
+    return "sha256:" + h.hexdigest()
+
+
+def copy_in(src: int, size: int, dst_dfd: int, name: str, *, want: str, refusal: str,
+            fsync: Callable[[int], None]) -> None:
+    """Root's copy of one input into the verify image's ``in/`` (root 0644, ``O_EXCL``), hashed while copying, read by
+    ``pread`` from offset 0 to at most ``size`` + 1 bytes: a length other than ``size`` or a digest other than
+    ``want`` (``sha256:<hex>``) = ``refusal``. An OSError writing into the image: ENOSPC or EDQUOT =
+    ``preview-space-exhausted``, any other = ``export-image-unavailable``."""
+    h = hashlib.sha256()
+    off = 0
+    try:
+        dst = os.open(name, _NEW_FILE, 0o644, dir_fd=dst_dfd)
+        try:
+            os.fchmod(dst, 0o644)
+            while off <= size:
+                chunk = os.pread(src, min(_COPY_CHUNK, size + 1 - off), off)
+                if not chunk:
+                    break
+                h.update(chunk)
+                write_all(dst, chunk)
+                off += len(chunk)
+            fsync(dst)
+        finally:
+            os.close(dst)
+    except OSError as e:
+        what = errno.errorcode.get(e.errno or 0, str(e.errno))
+        if e.errno in (errno.ENOSPC, errno.EDQUOT):
+            raise Refused("preview-space-exhausted", f"copy-in of {name}: {what}") from e
+        raise Refused(ER_UNAVAILABLE, f"copy-in of {name}: {what}") from e
+    if off != size:
+        raise Refused(refusal, f"{name}: {off} bytes copied, the file held {size} when opened")
+    if "sha256:" + h.hexdigest() != want:
+        raise Refused(refusal, f"{name}: the copied bytes digest to sha256:{h.hexdigest()}, not {want}")
+
+
+def make_verify_work(ctx: Ctx, work: str, verify_uid: int) -> Tuple[int, int, int]:
+    """Seal-in's ``.verify/`` layout (head ruling 1022+20 Q4, §4.1): ``in/`` root 0755 (root's copies, 0644: the
+    verifier reads them and cannot change them), ``scratch/``, ``out/``, ``log/`` the verify uid's 0700, and
+    ``log/stdout`` / ``log/stderr`` root-created, the verify uid's 0600 (fds 1 and 2 of the child, A7). Returns
+    ``(in/ dirfd, stdout fd, stderr fd)``; the caller holds all three in ``run.fds``."""
+    made: List[int] = []
+    try:
+        os.mkdir(os.path.join(work, "in"), 0o755)
+        fd = os.open(os.path.join(work, "in"), _O_DIR)
+        made.append(fd)
+        os.fchmod(fd, 0o755)
+        for rel in ("scratch", "out", "log"):
+            os.mkdir(os.path.join(work, rel), 0o700)
+            d = os.open(os.path.join(work, rel), _O_DIR)
+            try:
+                os.fchmod(d, 0o700)
+                ctx.seams.chown(d, verify_uid, -1, f"export/.verify/{rel}")
+            finally:
+                os.close(d)
+        for name in ("stdout", "stderr"):
+            f = os.open(os.path.join(work, "log", name), _NEW_FILE | os.O_NONBLOCK, 0o600)
+            made.append(f)
+            os.fchmod(f, 0o600)
+            ctx.seams.chown(f, verify_uid, -1, f"export/.verify/log/{name}")
+    except OSError as e:
+        for fd in made:
+            os.close(fd)
+        raise Refused(ER_UNAVAILABLE, f".verify/ layout: {errno.errorcode.get(e.errno or 0, e.errno)}") from e
+    except BaseException:
+        for fd in made:
+            os.close(fd)
+        raise
+    return made[0], made[1], made[2]
+
+
+def verifier_args(session: str, base: Mapping[str, object], result: str, max_input: int) -> Tuple[str, ...]:
+    """The verifier's fixed argv (``verify_run._parser``), within the spec's string cap (``wall._FRONT_ARGS``;
+    ``wall.export_launch_spec`` refuses a longer one, ``spec-malformed``). ``result`` is root's own
+    reading of the published header (prerequisites = ``delta``), never the importer's word."""
+    return ("--git", wall.GIT, "--session", session, "--object-format", str(base["object_format"]),
+            "--base-oid", str(base["oid"]), "--result", result, "--max-input-size", str(max_input))
+
+
+def verify_sealed_run(ctx: Ctx, front: AdoptFront, export_class: str, bundle_digest: str, run_seams: AdoptRunSeams,
+                      vseams: VerifySeams) -> Dict[str, object]:
+    """adopt-verify inside both locks (DESIGN §6.0): the two inputs opened, checked and hashed against their digests
+    (the published ``bundle`` against the one asked for, ``export-changed``; the retained base bundle against
+    ``alloc.base``, ``base-bundle-mismatch``), root's own header reading (the result,
+    the pack counts) -> V30's space (``preview-space``) -> SEAL-IN on ``_levain_verify`` with ``<class>/<s>/`` as the
+    staging dir (a stale ``verify.new`` deleted, ``verifier-failed:publish`` / ``stale-staging`` when it cannot be;
+    the early exchange probe there) -> the ``.verify/`` layout -> the copies in, hashed -> (macOS) the profile and
+    the live pf check -> spawn -> the watchdog -> the line and the reap -> seal-out ALWAYS -> the ONE classification
+    (the verifier's names VERBATIM, head ruling Q1) -> the publish of the three outputs (``verify.new`` ->
+    ``verify``, ``before_commit`` = the detach) -> the answer; teardown in a ``finally``."""
+    from levain.slot import adopt_verify as AV
+    from levain.slot import export_run as ER
+    from levain.slot import importer as IM
+
+    at, host, s = ctx.seams.at, ctx.seams.host, front.alloc.session
+    export_dir = str(ctx.seams.L / "export")
+    uid = ctx.seams.account_uid(wall.EXPORT_ACCOUNT["verifier"])
+    fmt = str(front.base["object_format"])
+    base_bytes = int(front.base["bundle_bytes"])   # type: ignore[call-overload]
+    held: List[int] = []                           # root's fds OUTSIDE the image, closed last
+    try:
+        try:
+            s_dfd = ctx.store.open_dir("export", export_class, s)
+        except Refused as e:
+            if e.name != "store-missing":
+                raise
+            raise Refused("export-changed", f"no published export at L/export/{export_class}/{s}") from None
+        held.append(s_dfd)
+        src, sst = _open_source(s_dfd, "bundle", "export-changed", ctx)
+        held.append(src)
+        # L3 s2 r1 codex MED: the digest asked for, checked on the open file right after its fstat, before any header
+        # read, sizing or seal-in, so a published file that is not the one asked for is export-changed whatever else
+        # it would fail; the copy-in hashes again (a change after this read).
+        if _fd_sha256(src, sst.st_size) != bundle_digest:
+            raise Refused("export-changed", "bundle: not the digest asked for")
+        try:
+            with ctx.store.dir("retained", s, "tree", "in") as rin_dfd:
+                base_fd, bst = _open_source(rin_dfd, "repo.bundle", "base-bundle-mismatch", ctx)
+        except Refused as e:
+            if e.name == "base-bundle-mismatch":
+                raise
+            raise Refused("base-bundle-mismatch", f"the retained base bundle: {e.name}") from None
+        held.append(base_fd)
+        if bst.st_size != base_bytes:
+            raise Refused("base-bundle-mismatch", f"{bst.st_size} bytes, alloc.base says {base_bytes}")
+        if _fd_sha256(base_fd, base_bytes) != str(front.base["bundle_sha256"]):    # the same, for the pinned base
+            raise Refused("base-bundle-mismatch", "the retained base bundle: not alloc.base's digest")
+        bundle_bytes = sst.st_size
+        h = AV.read_header_at(src)                 # root's grammar over the importer's bytes (bundle-header-mismatch)
+        ER.importer_bundle_check(s, fmt)(h)
+        objects = AV.pack_count_at(src, h.size, bundle_bytes - h.size)
+        result = "delta" if h.prerequisites else "unrelated"
+        try:
+            bh = AV.read_header_at(base_fd)
+            base_objects = AV.pack_count_at(base_fd, bh.size, base_bytes - bh.size)
+        except Refused as e:
+            raise Refused("base-bundle-mismatch", f"the base bundle's header: {e.name}") from None
+        image_bytes = verify_image_bytes(bundle_bytes=bundle_bytes, base_bytes=base_bytes, bundle_objects=objects,
+                                         base_objects=base_objects, object_format=fmt)
+        caps = {"verified.json": VERIFIED_CAP, "q.idx": idx_bound(objects, fmt), "preview.txt": VC.PREVIEW_OUTPUT_CAP}
+        need = V5_FLOOR_BYTES + image_bytes + sum(caps.values())
+        with ctx.store.dir("export") as efd:
+            free = ctx.seams.free_bytes(efd)
+        if free < need:
+            raise Refused("preview-space", f"{free} bytes free < V30 {need}")
+        wall_s = verify_wall_s(bundle_bytes, base_bytes)
+        facts = ER.SealFacts(host=host, role_key="verifier", export_dir=export_dir, uid=uid, image_bytes=image_bytes,
+                             image_inodes=IMAGE_INODES_FIXED, memory_cap=run_seams.memory_cap,
+                             pids_max=run_seams.pids_max)
+        seal = run_seams.seal(facts) if run_seams.seal is not None else ER.SealSeams(
+            prove=ER.export_domain_prover(host, "verifier", uid))
+        run = ER.SealedRun(facts, seal)   # type: ignore[arg-type]
+        gid = (run_seams.publish_gid or (lambda c, k: c.seams.group_gid(wall.EXPORT_GROUPS[("importer", k)])))(
+            ctx, export_class)
+        at("verify:6")
+        run.seal_in(s_dfd, VERIFY_DIR + ER.STAGING_SUFFIX)    # stale verify.new + the early probe, inside <s>/
+        pid: Optional[int] = None
+        reaped = [False]
+        sealed_out = False
+        try:
+            work = ER.mount_path(export_dir, "verifier")
+            in_dfd, out_fd, err_fd = make_verify_work(ctx, work, uid)
+            run.fds += [in_dfd, out_fd, err_fd]
+            at("verify:copy-in")
+            copy_in(src, bundle_bytes, in_dfd, "bundle", want=bundle_digest, refusal="export-changed",
+                    fsync=ctx.seams.fsync)
+            copy_in(base_fd, base_bytes, in_dfd, "base.bundle", want=str(front.base["bundle_sha256"]),
+                    refusal="base-bundle-mismatch", fsync=ctx.seams.fsync)
+            run.fds.remove(in_dfd)
+            os.close(in_dfd)
+            if host == "darwin":
+                with ctx.store.dir("export") as efd:
+                    replace_at(efd, "verifier.sb", RD.render_verifier_profile(host), mode=0o644,
+                               fsync=ctx.seams.fsync)
+                if not vseams.pf_live(uid):
+                    raise Refused("verifier-network-unisolated", "pf is off or the user _levain_verify rule is not live")
+            cmd = run_seams.launch(ctx, verifier_args(s, front.base, result, bundle_bytes), export_class)
+            frame_r, frame_w = pair = os.pipe()    # fd 0: a pipe at EOF (the verifier reads no stdin)
+            run.fds += pair
+            run.fds.remove(frame_w)
+            os.close(frame_w)
+            result_r, result_w = pair = os.pipe()
+            run.fds += pair
+            at("verify:7")
+            try:
+                pid = run_seams.spawn(cmd, frame_r=frame_r, stdout_fd=out_fd, stderr_fd=err_fd, result_w=result_w,
+                                      rlimits=export_rlimits(image_bytes, wall_s))
+            finally:
+                for fd in (frame_r, result_w, out_fd, err_fd):   # the child's now; root keeps only result_r
+                    run.fds.remove(fd)
+                    os.close(fd)
+            run.start_watchdog()
+            at("verify:10")
+            exit_kind, code, line, _ = collect_export(pid, result_r, wall_s + run_seams.result_grace_s,
+                                                      cap=IM.RESULT_CAP, on_reap=lambda: reaped.__setitem__(0, True))
+            run.fds.remove(result_r)
+            os.close(result_r)
+            at("verify:11")
+            sealed_out = True
+            reading = run.seal_out(() if reaped[0] else (pid,))
+            at("verify:classify")
+            outcome = ER.classify(ER.RunObservation(exit_kind, code, reading.memory_killed, reading.memory_unreadable,
+                                                    reading.host_short, line), ER.VERIFIER, parse=AV.parse_verifier_line)
+            if outcome.success and outcome.line is not None and outcome.line.result != result:
+                outcome = ER.Outcome(False, "verifier-failed:result-malformed",
+                                     f"the line's result {outcome.line.result} is not root's {result}", outcome.line)
+            at("verify:publish")
+            work_dfd = os.open(work, _O_DIR)
+            run.fds.append(work_dfd)
+            _res, pub = ER.publish_if_success(outcome, work_dfd, s_dfd, VERIFY_DIR, object_format=fmt, owner_uid=uid,
+                                              caps=caps, seams=seal.publish, gid=gid,  # type: ignore[attr-defined]
+                                              before_commit=detach_before_commit(run, seal, work_dfd),
+                                              role=ER.VERIFIER)
+            at("verify:12")
+            d = pub.digests
+            out: Dict[str, object] = {"verified_digest": "sha256:" + d["verified.json"],
+                                      "idx_digest": "sha256:" + d["q.idx"],
+                                      "preview_digest": "sha256:" + d["preview.txt"]}
+            if pub.warnings:               # adopt-open's rule (A2; head 1022+20 S2-Q6): only a post-commit failure
+                out["warnings"] = list(pub.warnings)
+            return out
+        finally:
+            try:
+                if not sealed_out:
+                    # adopt-open's rule (L3 r1 M1 / ruling Q5): the domain is killed and proven before the locks go;
+                    # an unproven seal-out raises export-domain-unproven over the pending failure.
+                    run.seal_out(() if (pid is None or reaped[0]) else (pid,))
+            finally:
+                at("verify:teardown")
+                run.teardown()
+    finally:
+        for fd in reversed(held):
+            os.close(fd)
+
+
+def adopt_verify(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
+    """``adopt-verify <session> --bundle-digest sha256:<hex>`` (CONTRACT §5.1; DESIGN §6.0): the caller by class
+    (:func:`verify_caller`), the alloc session lock (TRY, ``session-busy``), the alloc re-read under it and the caller
+    re-checked (:func:`verify_caller_locked`: a changed alloc = ``no-session``), the root facts as adopt-open step 3
+    (RETAINED, SCRUBBED, ``alloc.base``), the adopt lock (adopt-open's bounded wait, ``adopt-busy``: one sealed run
+    machine-wide, importer or verifier), the git floor (``git-below-floor:<version>``), then the sealed verify run
+    (:func:`verify_sealed_run`). Answers ``{ok, verified_digest, idx_digest, preview_digest, warnings?}``
+    (``warnings`` only when the publish recorded a post-commit failure, adopt-open's rule); the adopt lock is
+    released first, then the session lock."""
+    assert req.session is not None and req.bundle_digest is not None
+    vseams = ctx.seams.verify if ctx.seams.verify is not None else VerifySeams()
+    run_seams = (ctx.seams.verify_run if ctx.seams.verify_run is not None
+                 else AdoptRunSeams(launch=verify_launch_default))
+    adopt = ctx.seams.adopt if ctx.seams.adopt is not None else AdoptSeams()
+    at, s = ctx.seams.at, req.session
+    deadline = ctx.seams.monotonic() + vseams.lock_wait_s
+    a, export_class = verify_caller(ctx, s)
+    at("verify:2")
+    try:
+        with session_lock(ctx, s):
+            a = verify_caller_locked(ctx, s, a, export_class)
+            at("verify:3")
+            front = adopt_step3_root_facts(ctx, a, adopt, deadline=deadline)
+            at("verify:4")
+            try:
+                with adopt_lock_wait(ctx, deadline):
+                    at("verify:5")
+                    FI.check_floor(vseams.git_version())
+                    at("verify:floor")
+                    return verify_sealed_run(ctx, front, export_class, req.bundle_digest, run_seams, vseams)
+            finally:
+                at("verify:adopt-unlocked")
+    finally:
+        at("verify:session-unlocked")
 
 
 VERB_HANDLERS: Dict[str, Callable[[Ctx, RuntimeRequest, object], Dict[str, object]]] = {
     "prepare": prepare, "render": render, "resume": resume, "status": status,
-    "start": _start, "teardown": _teardown,
+    "start": _start, "teardown": _teardown, "adopt-open": adopt_open, "adopt-verify": adopt_verify,
 }
 
 

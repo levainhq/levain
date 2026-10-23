@@ -222,7 +222,7 @@ class RequestAuthority:
         A ``sqlite3.Error`` reading the journal does escape; at broker start (``Broker._advance_anchor``)
         it fails that start attempt (a busy journal is retried, any other error disables the broker)."""
         from levain import authority as auth
-        from levain.cockpit.firejournal import INIT_HINT, UNINITIALISED, _meta
+        from levain.cockpit.firejournal import UNINITIALISED, _meta, conn_init_hint
 
         kw: dict[str, Any] = {"cache": cache}
         if ssh_keygen is not None:
@@ -239,12 +239,15 @@ class RequestAuthority:
                 snap = auth.snapshot(conn, **kw)
             except auth.NotInitialised:
                 if pinned is not None:
+                    # the remedy as levain.authority.append names it: an empty log holds no key a reset verifies
                     raise auth.AnchorError(f"the authority log is empty but its anchor names store "
-                                           f"{pinned.store_id} at seq {pinned.seq}") from None
+                                           f"{pinned.store_id} at seq {pinned.seq}; if this store was emptied on "
+                                           f"purpose, move {anchor} aside, then run "
+                                           f"{auth.init_hint(auth.anchor_data_root(anchor))}") from None
                 empty = True
-                error = f"authority not initialised: run {INIT_HINT}"
+                error = f"authority not initialised: run {conn_init_hint(conn)}"
             if snap is not None and anchor is not None:
-                auth.check_anchor(snap, pinned)
+                auth.check_anchor(snap, pinned, path=anchor)
         except auth.VerifierUnavailable as exc:
             snap, empty, verifier_down = None, False, True
             error = f"the authority log could not be verified: {exc}"
@@ -254,7 +257,7 @@ class RequestAuthority:
         if snap is not None:
             marker = _meta(conn, UNINITIALISED)
             if marker is not None:
-                error = f"authority not initialised ({marker}): run {INIT_HINT}"
+                error = f"authority not initialised ({marker}): run {conn_init_hint(conn)}"
         labels = NO_LABELS if labeller is None else labeller.snapshot(conn, snap)
         return cls(now, labels, snap, error, source, empty, verifier_unavailable=verifier_down)
 

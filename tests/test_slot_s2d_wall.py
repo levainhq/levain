@@ -83,6 +83,17 @@ class FakeOS:
             execve=self._w("execve", lambda p, a, e: None), dup2=self._w("dup2", lambda a, b: None),
             getpid=lambda: 4242, write_file=self._w("write_file", lambda p, t: None),
             read_text=self._w("read_text", lambda p: self.files.get(p, "")))
+        # s5 §5b A6: the fake kernel's session keyring (an export stage on Linux joins a fresh one before the drop)
+        self.session_keyring = 100
+        self.calls.keyctl = self._w("keyctl", self._keyctl)
+
+    def _keyctl(self, op, arg2, arg3=0):
+        if op == 1 and arg2 == 0:                  # KEYCTL_JOIN_SESSION_KEYRING, anonymous
+            self.session_keyring += 1
+            return self.session_keyring
+        if op == 0 and arg2 == -3:                 # KEYCTL_GET_KEYRING_ID of KEY_SPEC_SESSION_KEYRING
+            return self.session_keyring
+        raise OSError(errno.EINVAL, "keyctl")
 
     def _w(self, name, fn):
         def call(*a):

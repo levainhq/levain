@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from levain.authority import init_hint
 from levain.cockpit import consent
 from levain.cockpit.consent import ConsentError, build_record, encode, utc_stamp
 from levain.cockpit.firejournal import (
@@ -293,7 +294,7 @@ def test_decide_after_expiry_is_expired(db):
 @pytest.mark.parametrize("setup, fp, tier, reason", [
     ("UPDATE tokens SET generation = 2", FP_PHONE, "T2", "token rotated"),
     ("revoke phone", FP_PHONE, "T2", "key revoked"),
-    ("mark uninitialised", FP_LAPTOP, "T2", "authority not initialised: run `levain cockpit ledger init`"),
+    ("mark uninitialised", FP_LAPTOP, "T2", None),
     ("", "SHA256:nobody", "T2", "key not enrolled"),
     ("", FP_WEAK, "T2", "key class presence does not cover T2"),
     ("", FP_PHONE, "T3", "key class display-phone does not cover T3"),
@@ -310,6 +311,8 @@ def test_decide_refuses_on_authority_and_policy(db, setup, fp, tier, reason):
         with db.write() as conn:
             conn.execute(setup)
     out = _decide(db, pid, raw, fp=fp)
+    if reason is None:      # the whole remedy, this journal's data root in it (tests/test_cockpit_init_hint.py parses it)
+        reason = f"authority not initialised: run {init_hint(db.data_root)}"
     assert (out.state, out.reason) == ("REFUSED", reason)
     assert db.load(pid).effects == ()
 

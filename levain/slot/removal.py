@@ -51,8 +51,8 @@ def _run(argv: Sequence[str], **kw: object) -> "subprocess.CompletedProcess[str]
     kw.setdefault("capture_output", True)
     kw.setdefault("text", True)
     kw.setdefault("cwd", "/")
-    kw.setdefault("env", child_env())
-    return subprocess.run(list(argv), **kw)  # type: ignore[call-overload]
+    env = kw.pop("env") if "env" in kw else child_env()
+    return subprocess.run(list(argv), env=env, **kw)  # type: ignore[call-overload]
 
 
 def _no_fault(point: str) -> None:
