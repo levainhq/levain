@@ -171,3 +171,60 @@ def test_a_frozen_box_takes_no_pick_from_the_graph(tmp_path, monkeypatch):
              "return JSON.stringify([b.ckPick(['seat:ledgerline']), window.LevainDashboard.messageTo('seat:ledgerline'), %s]); })()") % (BOX, PRESSED)
     out = _run(tmp_path, src, [{"eval": probe}], page="#write_token=T")
     assert json.loads(out[-1]) == [False, False, ["fanin"]], out
+
+
+# the departed-seat refusal as the kernel's words reach the page, and a refetch the test holds open or answers as it likes
+REFUSE = ("const f = window.fetch; window.fetch = (u, o) => (o && o.method === 'POST' && /cockpit\\/verb/.test(String(u && u.url || u))) "
+          "? Promise.resolve(new Response(JSON.stringify({error: 'no_live_seat'}), {status: 422, headers: {'content-type': 'application/json'}})) : f(u, o); ")
+TWO = ["cli", "fanin", "seat:ledgerline", "seat:other"]
+SAY = "(%s.querySelector('.edit-msg') || {}).textContent" % BOX
+GONE = "that seat is gone, choose again"
+
+
+@needs_browser
+def test_the_box_stays_frozen_while_the_departed_seat_recovery_waits_and_clears_only_the_failed_sends_seats(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    hold = "window.LevainCockpitView.refetchPanel = () => new Promise((r) => { window.__rel = r; }); " + REFUSE + "1"
+    during = ("JSON.stringify([%s.querySelector('.tray-dump-btn').disabled, %s.every(c => c.disabled), %s.disabled, %s.ckPick(['seat:other']), %s])"
+              % (BOX, CHIPS, PICK, BOX, PRESSED))
+    # a seat that was not in the failed send's snapshot (pressed behind the frozen box's back) must outlive the recovery
+    out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_value(), "agents")}, {"eval": hold}, {"eval": _tap("n3")},
+                               {"until": "document.activeElement.classList.contains('tray-dump-ta') && JSON.stringify(%s) == '[\"seat:ledgerline\"]'" % PRESSED},
+                               {"eval": SEND}, {"until": "window.__rel"},
+                               {"eval": during},
+                               {"eval": CHIPS + ".find(c => c.dataset.value === 'seat:other').setAttribute('aria-pressed', 'true'); window.__rel(false); 1"},
+                               {"until": SAY + " == '%s'" % GONE},
+                               {"eval": "JSON.stringify([%s, %s.querySelector('.tray-dump-btn').disabled, %s.querySelector('.tray-dump-ta').value])" % (PRESSED, BOX, BOX)}],
+               enum=TWO)
+    btn, chips, pick, took, pressed = json.loads(out[-4])
+    assert btn is True and chips is True and pick is True and took is False and pressed == ["seat:ledgerline"], out     # frozen, and a pick is refused
+    pressed, btn, draft = json.loads(out[-1])
+    assert pressed == ["seat:other"] and btn is False and draft == "hi", out
+
+
+@needs_browser
+def test_an_applied_refetch_that_did_not_rebuild_the_box_still_unpresses_the_dead_seat(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    stub = "window.LevainCockpitView.refetchPanel = () => Promise.resolve('applied'); " + REFUSE + "1"
+    out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_value(), "agents")}, {"eval": stub}, {"eval": _tap("n3")},
+                               {"until": "document.activeElement.classList.contains('tray-dump-ta') && JSON.stringify(%s) == '[\"seat:ledgerline\"]'" % PRESSED},
+                               {"eval": SEND}, {"until": SAY + " == '%s'" % GONE},
+                               {"eval": "JSON.stringify(%s)" % PRESSED}])
+    assert json.loads(out[-1]) == [], out
+
+
+@needs_browser
+def test_a_recovery_a_later_send_overtook_says_nothing_on_the_fresh_box(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    # the refusal's recovery is held; a later send (the box is unfrozen by hand, as a poll rebuild would hand over a live one) lands and
+    # rebuilds the board, then the held recovery answers
+    hold = ("window.__f0 = window.fetch; window.LevainCockpitView.refetchPanel = () => new Promise((r) => { window.__rel = r; }); " + REFUSE + "1")
+    heal = "window.fetch = window.__f0; %s.querySelector('.tray-dump-btn').disabled = false; 1" % BOX
+    out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_value(), "agents")}, {"eval": hold}, {"eval": _tap("n3")},
+                               {"until": "document.activeElement.classList.contains('tray-dump-ta') && JSON.stringify(%s) == '[\"seat:ledgerline\"]'" % PRESSED},
+                               {"eval": SEND}, {"until": "window.__rel"},
+                               {"eval": "window.__old = %s; %s" % (BOX, heal)},
+                               {"eval": SEND}, {"until": "%s !== window.__old" % BOX},
+                               {"eval": "window.__rel(false); 1"},
+                               {"eval": "new Promise((r) => setTimeout(() => r(%s), 300))" % SAY}])
+    assert out[-1] != GONE, out

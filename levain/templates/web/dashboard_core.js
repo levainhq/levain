@@ -3616,6 +3616,7 @@
   const DESK_CHIP = "fanin";
   const SEVERAL_VALUE = "*several";
   const composePick = Object.create(null);
+  const composeGen = Object.create(null);     // per compose key: bumped by every send, so a slow departed-seat recovery can tell a later send overtook it
 
   function buildActionBox(action, spec) {
     const box = el("div", "tray-dump");
@@ -3694,7 +3695,8 @@
         const inEnum = new Set(chips.map((c) => c.dataset.value));
         const keptNow = Array.isArray(kept) ? kept.filter((v) => inEnum.has(v)) : null;
         const start = keptNow && (keptNow.length || !kept.length) ? keptNow : (inEnum.has(DESK_CHIP) ? [DESK_CHIP] : []);
-        controls.push({ f: f, nodes: chips.concat([pick]), read: pressedNow, set: setTo, chips: chips, pickKey: pickKey, initial: start });
+        controls.push({ f: f, nodes: chips.concat([pick]), read: pressedNow, set: setTo, chips: chips, pickKey: pickKey, initial: start,
+                        desk: inEnum.has(DESK_CHIP) ? [DESK_CHIP] : [] });
         continue;
       }
       if (f.kind === "multiselect") {
@@ -3766,29 +3768,39 @@
     // fresh box must start from the desk, not from the pick it just used. The returned restore puts it back if the send fails.
     const takePick = () => {
       if (!chipCtl) return null;
+      composeGen[chipCtl.pickKey] = (composeGen[chipCtl.pickKey] || 0) + 1;
       const had = chipCtl.pickKey in composePick, snap = composePick[chipCtl.pickKey];
       delete composePick[chipCtl.pickKey];
       return () => { if (had && !(chipCtl.pickKey in composePick)) composePick[chipCtl.pickKey] = snap; };
     };
+    // Returns true when the box is HELD disabled for the departed-seat recovery (the caller must not re-enable it; seatGone does).
     const failed = (res, restore) => {
-      setDisabled(false);
       if (restore) restore();
       showFail(msg, res, "failed");
       // a seat that left the roster since the chips were drawn: the serving app's refusal names "no live seat" (code or words, whichever
       // transport carried it)
       const text = res ? [res.error, res.message].map((x) => String(x || "")).join(" ") : "";
-      if (chipCtl && /no[ _]live[ _]seat/i.test(text)) seatGone();
+      if (chipCtl && /no[ _]live[ _]seat/i.test(text)) { seatGone(); return true; }
+      setDisabled(false);
+      return false;
     };
     async function seatGone() {
       const notice = "that seat is gone, choose again";
-      const currentBox = () => box.isConnected ? box : document.querySelector('.tray-dump[data-compose-key="' + String(chipCtl.pickKey).replace(/["\\]/g, "") + '"]');
-      const say = () => { const b = currentBox(), m = b ? b.querySelector(".edit-msg") : null; if (m) { m.className = "edit-msg err"; m.textContent = notice; } };
+      const startBox = box, gen = composeGen[chipCtl.pickKey];
+      const snap = chipCtl.read().filter((v) => /^seat:/.test(v));     // the failed send's own seats: the only ones this recovery may clear
       const V = window.LevainCockpitView;
       let r = false;
+      // the recipient controls and the send stay frozen until the refetch answers: a pick made in the wait would be wiped or sent to everyone
       if (V && typeof V.refetchPanel === "function" && action.panel) { try { r = await V.refetchPanel(action.panel); } catch (_) { r = "fault"; } }
-      // not rebuilt (the refetch declined, faulted or never ran): un-press the seat chips here and leave the draft where it is
-      if (r !== "applied" && box.isConnected) chipCtl.set(chipCtl.read().filter((v) => !/^seat:/.test(v)));
-      say();
+      if (startBox.isConnected) {
+        // this box survived (declined, faulted, never ran, or "applied" without a rebuild): un-press the snapshot's seats, leave the draft
+        chipCtl.set(chipCtl.read().filter((v) => snap.indexOf(v) < 0));
+        setDisabled(false);
+      }
+      if (composeGen[chipCtl.pickKey] !== gen) return;                  // a later send overtook this recovery: say nothing
+      const b = startBox.isConnected ? startBox : document.querySelector('.tray-dump[data-compose-key="' + String(chipCtl.pickKey).replace(/["\\]/g, "") + '"]');
+      const m = b ? b.querySelector(".edit-msg") : null;
+      if (m) { m.className = "edit-msg err"; m.textContent = notice; }
     }
 
     // ── async-job (spec.job) result area + poll loop ──
@@ -3834,8 +3846,10 @@
     const startJob = async (params, key, restore) => {
       msg.className = "edit-msg busy"; msg.textContent = "starting…";
       const res = await commitJob(action.verb, params, true, key);
-      if (!(res && res.ok)) { failed(res, restore); return; }
+      if (!(res && res.ok)) return failed(res, restore);
       msg.className = "edit-msg"; msg.textContent = "";
+      // a job start rebuilds nothing: put this live box's chips back to its start state so the shown pick is the kept one
+      if (chipCtl && box.isConnected) chipCtl.set(chipCtl.desk, false);
       setJob("running", null);
       startPoll(res.job_id);
     };
@@ -3847,7 +3861,7 @@
       if (!spec.confirm_required) {
         setDisabled(true); msg.className = "edit-msg busy"; msg.textContent = "…";
         const restore = takePick();
-        if (spec.job) { startJob(c.params, sendKey, restore).then(() => setDisabled(false)); return; }
+        if (spec.job) { startJob(c.params, sendKey, restore).then((held) => { if (!held) setDisabled(false); }); return; }
         commitAction(action.verb, c.params, false, sendKey, action.panel).then((res) => { if (!(res && res.ok)) failed(res, restore); });
         return;
       }
@@ -3868,8 +3882,8 @@
       row.insertBefore(form, msg);
       no.focus();
       msg.className = "edit-msg"; msg.textContent = "";
-      const close = () => { form.remove(); go.style.display = ""; setDisabled(false); };
-      no.addEventListener("click", close);
+      const close = (keepFrozen) => { form.remove(); go.style.display = ""; if (!keepFrozen) setDisabled(false); };
+      no.addEventListener("click", () => close());
       form.addEventListener("keydown", (ev) => {
         if (ev.key !== "Escape") return;
         ev.preventDefault(); ev.stopPropagation();
@@ -3882,13 +3896,13 @@
         if (spec.job) {
           // A job verb PROPOSES (no board reload), then polls in-box. Close the confirm form
           // (restores the compose box + re-enables it for a next run); the result renders below.
-          await startJob(c.params, sendKey, restore);
-          close();
+          const held = await startJob(c.params, sendKey, restore);
+          close(held);
           return;
         }
         const res = await commitAction(action.verb, c.params, true, sendKey, action.panel);
         if (res && res.ok) return;  // re-rendered → this box is gone, replaced fresh
-        close(); failed(res, restore);
+        close(true); failed(res, restore);
       });
     });
 
