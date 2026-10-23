@@ -1204,7 +1204,14 @@ def _thaw_scope(c: object, bound_s: float) -> None:
         return
     except OSError as e:
         raise Refused(UNAVAILABLE, f"{path}: the thaw failed ({_errname(e)})") from e
-    if c._poll("frozen", "0", bound_s) is False:      # type: ignore[attr-defined]  (None = the scope is gone)
+    try:
+        # None = the scope is gone: CgroupProcs.events() turns FileNotFoundError into None, so every OSError that
+        # reaches here is not ENOENT and the thaw cannot be confirmed (codex L3 r2 B-1).
+        got = c._poll("frozen", "0", bound_s)          # type: ignore[attr-defined]
+    except OSError as e:
+        events = f"{c.cgroup}/cgroup.events"           # type: ignore[attr-defined]
+        raise Refused(UNAVAILABLE, f"{events}: the thaw poll failed ({_errname(e)})") from e
+    if got is False:
         raise Refused(UNAVAILABLE, f"{path}: written 0, cgroup.events still reads frozen 1")
 
 

@@ -863,6 +863,43 @@ def test_b1_a_thaw_that_cannot_be_confirmed_fails_closed(monkeypatch, fail_thaw,
     assert ei.value.name == "export-image-unavailable" and "cgroup.freeze" in ei.value.detail
 
 
+class FsScopeEventsFail(FsScope):
+    """After the thaw write (``cgroup.freeze`` 0), reading ``cgroup.events`` raises ``OSError(read_errno)``."""
+
+    def __init__(self, read_errno):
+        super().__init__()
+        self.read_errno, self.thawed = read_errno, False
+
+    def write(self, p, text):
+        super().write(p, text)
+        if p == f"{SCOPE}/cgroup.freeze" and text == "0":
+            self.thawed = True
+
+    def read(self, p):
+        if self.thawed and p == f"{SCOPE}/cgroup.events":
+            if self.read_errno == errno.ENOENT:
+                raise FileNotFoundError(errno.ENOENT, "absent", p)
+            raise OSError(self.read_errno, os.strerror(self.read_errno), p)
+        return super().read(p)
+
+
+@pytest.mark.parametrize("read_errno", [errno.EACCES, errno.EIO])
+def test_b1_an_unreadable_cgroup_events_during_the_thaw_poll_is_export_image_unavailable(monkeypatch, read_errno):
+    # codex L3 r2 B-1: an EACCES/EIO reading cgroup.events after the thaw write escaped as a raw OSError.
+    _sweep_ok(monkeypatch)
+    fs = FsScopeEventsFail(read_errno)
+    with pytest.raises(Refused) as ei:
+        X.export_domain_prover("linux", "importer", 299, seams=fs.seams())(())
+    assert ei.value.name == "export-image-unavailable"
+    assert "cgroup.events" in ei.value.detail and errno.errorcode[read_errno] in ei.value.detail
+
+
+def test_b1_a_scope_gone_during_the_thaw_poll_still_held_nothing_to_thaw(monkeypatch):
+    _sweep_ok(monkeypatch)
+    fs = FsScopeEventsFail(errno.ENOENT)
+    assert X.export_domain_prover("linux", "importer", 299, seams=fs.seams())(()) is PROVEN
+
+
 def _darwin_rig(tmp_path, footprint, prove):
     import dataclasses
     r = Rig(tmp_path, host="darwin", watchdog=lambda uid, cap, end, log: X.FootprintWatchdog(
