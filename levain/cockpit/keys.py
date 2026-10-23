@@ -209,7 +209,7 @@ def enroll(data_root: Path | str, public_key_text: str, key_class: str, *, signe
     if key_class not in _CLASS_RANK:
         raise KeyError_(f"unknown key class {key_class!r}; one of {', '.join(KEY_CLASSES)}")
     public_key = normalise_public_key(public_key_text)
-    problem = _authority.custody_problem(key_class, custody, public_key.split()[0])
+    problem = _authority.custody_problem(key_class, custody, public_key.split()[0], public_key=public_key)
     if problem is not None:
         raise KeyError_(problem)
     fp = fingerprint_of(public_key, ssh_keygen=ssh_keygen)
@@ -390,7 +390,8 @@ def _legacy_row(raw: Any, state: AuthoritySnapshot | None, ssh_keygen: Path | st
         # A carried row is re-enrolled with its custody unstated (/2 never recorded one), which the replay
         # admits for a laptop-presence key only on a record carrying legacy_enrolled_at (its enrol time).
         if problem is None:
-            problem = _authority.custody_problem(cls, UNSTATED, key_type, legacy=isinstance(enrolled_at, str))
+            problem = _authority.custody_problem(cls, UNSTATED, key_type, legacy=isinstance(enrolled_at, str),
+                                                 public_key=normal)
     held = None if state is None else state.key(fp)
     return LegacyRow(fp, str(cls), key_type, enrolled_at if isinstance(enrolled_at, str) else None,
                      revoked_at is not None, compromised is not None, normal, problem,
@@ -471,7 +472,7 @@ def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str
     signer_key = normalise_public_key(signer_public_key)
     if fingerprint_of(signer_key, ssh_keygen=ssh_keygen) != signer_fp:
         raise KeyError_("the signing key's public half is not the key that signs")
-    problem = _authority.custody_problem(LAPTOP, signer_custody, signer_key.split()[0])
+    problem = _authority.custody_problem(LAPTOP, signer_custody, signer_key.split()[0], public_key=signer_key)
     if problem is not None:
         raise KeyError_(f"the signing key: {problem}")
     confirmed = set(confirmed)

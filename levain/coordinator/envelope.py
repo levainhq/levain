@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from levain import unshowable
-from levain.authority import PASSKEY, AuthoritySnapshot, verify_link_sig
+from levain.authority import PASSKEY, AuthoritySnapshot, custody_mismatch, verify_link_sig
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.consent.queue import class_covers
 from levain.contracts.canon import canonical, canonical_bytes, parse
@@ -380,8 +380,12 @@ def refusal(payload: Any, signature: Any, authority: AuthoritySnapshot, body: Ma
         return "the envelope signature is empty"
     if len(signature) > SIGNATURE_MAX:
         return f"the envelope signature is over {SIGNATURE_MAX} characters"
+    # one rule for a passkey on every path: the custody its key material shows is the stored one, then the consent
+    # path's WebAuthn checks (user verification, origin)
+    problem = custody_mismatch(key.public_key, key.custody)
+    if problem is not None:
+        return problem
     if key.custody == PASSKEY:
-        # one rule for a passkey on every path: the consent path's WebAuthn checks (user verification, origin)
         from levain.consent.passkey import answer_signature_problem
 
         problem = answer_signature_problem(signature, key.public_key)

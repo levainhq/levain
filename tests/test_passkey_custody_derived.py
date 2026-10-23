@@ -163,6 +163,40 @@ def dispatch_verdict(tmp: Path, custody: str, which: str = "sign", **sig) -> str
                                 snapshot, job)
 
 
+def envelope_verdict(tmp: Path, custody: str, **sig) -> str | None:
+    """``None`` when the coordinator takes ``pk``'s envelope signature (``pk`` display-phone at ``custody``)."""
+    from levain.coordinator import envelope as env
+    from tests.test_dispatch_contract import NOW
+
+    pk = WebAuthnKey()
+    snapshot = _log(tmp, pk, "display-phone", custody).source()
+    body = {"store_id": "st-custody", "envelope_id": "ev-custody", "words_sha256": "sha256:" + "0" * 64}
+    payload = env.sign_payload(body, signer_fp=pk.fp, signed_at=NOW)
+    return env.refusal(payload, pk.sign(env.sign_message(payload), env.SIGN_NAMESPACE, **sig), snapshot, body)
+
+
+def adopt_verdict(tmp: Path, custody: str, **sig) -> str | None:
+    """``None`` when adoption takes ``pk``'s authorisation to land a run (``pk`` display-phone at ``custody``)."""
+    from levain.dispatch import adopt
+    from levain.dispatch.jobs import JobStore
+    from tests.test_dispatch_contract import NOW, POLICY, make_repo, registry, submission
+
+    pk = WebAuthnKey()
+    snapshot = _log(tmp, pk, "display-phone", custody).source()
+    repo, base = make_repo(tmp / "repo")
+    d = tmp / "dispatch"
+    d.mkdir(mode=0o700)
+    os.chmod(d, 0o700)
+    job, _cap = JobStore(d, clock=Clock(NOW)).file(submission(repo, base), resolve_template=registry(), policy=POLICY,
+                                                   filer_session="sess-1")
+    artifact = "sha256:" + "a" * 64
+    payload = {"format": adopt.AUTHORISE_FORMAT, "store_id": job.store_id, "job_id": job.id, "run": "0",
+               "contract_digest": job.digest, "artifact_digest": artifact, "onto": "main", "signer_fp": pk.fp,
+               "signed_at": utc_stamp(NOW + timedelta(minutes=1))}
+    signature = pk.sign(adopt.authorise_message(payload), adopt.DISPATCH_AUTHORISE_NAMESPACE, **sig)
+    return adopt.authorise_refusal(payload, signature, snapshot, job, run=0, artifact=artifact, onto="main", tier="T2")
+
+
 def control_verdict(tmp: Path, custody: str, **sig) -> str | None:
     """``None`` when a dispatch configuration store pinned to ``pk`` (laptop-presence at ``custody``) takes ``pk``'s
     configuration item, else the refusal (at init or at accept)."""
@@ -241,7 +275,8 @@ def test_a_log_holding_such_an_enrolment_from_before_the_door_fails_closed(tmp_p
 
 def test_a_passkey_at_custody_passkey_is_taken_with_uv_from_its_own_origin_only(tmp_path):
     for name, sig in SIGS.items():
-        for site, verdict in (("consent", consent_verdict), ("sign", dispatch_verdict)):
+        for site, verdict in (("consent", consent_verdict), ("sign", dispatch_verdict),
+                              ("envelope", envelope_verdict), ("adopt", adopt_verdict)):
             got = verdict(tmp_path / f"{site}-{name}", auth.PASSKEY, **sig)
             assert (got is None) == (name == "good"), (site, name, got)
     assert "verify the user" in consent_verdict(tmp_path / "c-uv", auth.PASSKEY, uv=False)
@@ -262,6 +297,16 @@ def test_the_consent_queue_refuses_a_passkey_stored_at_another_custody(tmp_path,
 @pytest.mark.parametrize("name", list(SIGS))
 def test_dispatch_refuses_a_passkey_stored_at_another_custody(tmp_path, old_log, which, custody, name):
     got = dispatch_verdict(tmp_path, custody, which, **SIGS[name])
+    assert got is not None and "custody" in got, got
+
+
+@pytest.mark.parametrize("site", ["envelope", "adopt"])
+@pytest.mark.parametrize("custody", [auth.UNSTATED, "fido"])
+@pytest.mark.parametrize("name", list(SIGS))
+def test_an_envelope_or_an_authorisation_refuses_a_passkey_stored_at_another_custody(tmp_path, old_log, site, custody,
+                                                                                    name):
+    verdict = envelope_verdict if site == "envelope" else adopt_verdict
+    got = verdict(tmp_path, custody, **SIGS[name])
     assert got is not None and "custody" in got, got
 
 
@@ -295,3 +340,82 @@ def test_an_openssh_fido_key_at_custody_fido_still_signs(tmp_path):
     for custody in (auth.UNSTATED, "fido", "touch-id", None):
         assert custody_mismatch(sk, custody) is not None, custody
     assert custody_mismatch("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA==", "passphrase") is None
+
+
+# --- the CLI shows the door's refusal before anything is signed --------------------------------------------------------
+
+def _cockpit(tmp: Path, monkeypatch):
+    """A reported cockpit journal whose log's genesis enrols an ssh laptop-presence key, and a counter of every link
+    signature that key makes (through the CLI's own signer)."""
+    from levain.cockpit import install
+    from levain.cockpit import keys as ckeys
+    from levain.cockpit.firejournal import CockpitDB
+    from tests.cockpit_authority_rig import RealKey, enrol as genesis_enrol
+    from tests.test_cockpit_keys import NOW as KNOW
+
+    monkeypatch.setattr(install, "marker_dir", lambda: tmp / "m")   # no real governed marker dir
+    root = tmp / "cockpit"
+    root.mkdir()
+    CockpitDB(root).set_install_class("reported")
+    laptop = RealKey(tmp, "laptop")
+    genesis_enrol(CockpitDB(root), laptop, "laptop-presence", now=KNOW)
+    signed = []
+    real = ckeys.ssh_signer
+
+    def counting(*a, **kw):
+        fp, sign = real(*a, **kw)
+
+        def wrapped(message):
+            signed.append(message)
+            return sign(message)
+        return fp, wrapped
+
+    monkeypatch.setattr(ckeys, "ssh_signer", counting)
+    return root, laptop, signed
+
+
+@pytest.mark.parametrize("given", [None, "fido"])
+def test_the_cli_refuses_to_enrol_a_passkey_at_another_custody_before_signing(tmp_path, monkeypatch, capsys, given):
+    """Its pre-sign check (``declared_custody``) refuses now; before it did, ``enroll`` ran the replay's step (the
+    door) on the unsigned link, so this held on the base as well and is pinned here, not proven red."""
+    from levain import cli
+
+    root, laptop, signed = _cockpit(tmp_path, monkeypatch)
+    pub = tmp_path / "phone.pub"
+    pub.write_text(WebAuthnKey().public_key + "\n")
+    extra = [] if given is None else ["--custody", given]
+    rc = cli.main(["cockpit", "enroll", str(pub), "--class", "display-phone", "--signing-key", str(laptop.path),
+                   *extra, "--data-root", str(root)])
+    err = capsys.readouterr().err
+    assert rc == 1 and "WebAuthn passkey" in err and f"custody is {auth.PASSKEY}" in err, err
+    assert signed == [], "the enrolment was signed before the refusal"
+    assert cli.main(["cockpit", "enroll", str(pub), "--class", "display-phone", "--signing-key", str(laptop.path),
+                     "--custody", auth.PASSKEY, "--data-root", str(root)]) == 0
+    assert len(signed) == 1 and "custody passkey" in capsys.readouterr().out
+
+
+def test_enroll_refuses_a_passkey_at_another_custody_before_it_signs(tmp_path, monkeypatch):
+    """``enroll`` and the CLI's pre-sign check (``declared_custody``, also the ledger init signer's) refuse before
+    signing. ``declared_custody`` took such a key at the base (red there)."""
+    from levain.cockpit.custody import declared_custody
+    from levain.cockpit.keys import KeyError_, enroll
+    from tests.test_cockpit_keys import NOW as KNOW
+
+    root, laptop, _signed = _cockpit(tmp_path, monkeypatch)
+    pk = WebAuthnKey()
+    calls = []
+
+    def sign(message):
+        calls.append(message)
+        return laptop.sign_link(message)
+    with pytest.raises(KeyError_, match="WebAuthn passkey"):
+        enroll(root, pk.public_key, "display-phone", custody=auth.UNSTATED, signer_fp=laptop.fingerprint, sign=sign,
+               clock=lambda: KNOW, marker_directory=tmp_path / "m")
+    assert calls == []
+    pub = tmp_path / "p.pub"
+    pub.write_text(pk.public_key + "\n")
+    with pytest.raises(KeyError_, match="WebAuthn passkey"):
+        declared_custody(pub, None, "display-phone", pk.public_key)
+    assert declared_custody(pub, auth.PASSKEY, "display-phone", pk.public_key) == auth.PASSKEY
+    with pytest.raises(KeyError_, match="WebAuthn passkey"):
+        declared_custody(pub, "fido", "laptop-presence", pk.public_key)   # the ledger init signer's check
