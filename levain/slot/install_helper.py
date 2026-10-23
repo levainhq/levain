@@ -2681,10 +2681,10 @@ def phase_b_text(host: HostOS, gen: str, lock_fd: int, pool_fd: int, caller_uid:
 
 def exec_phase_b(host: HostOS, gen: str, lock_fd: int, pool_fd: int, caller_uid: int, *, python: str | None = None,
                  tree: Path | None = None, entry: str | None = None, fault: Optional[Tuple[str, str]] = None,
-                 execv: Callable[[str, Sequence[str]], object] = os.execv) -> None:
+                 execve: Callable[[str, Sequence[str], Mapping[str, str]], object] = os.execve) -> None:
     """R4 [r2: X-4]: both lock descriptors made inheritable (a flock belongs to the open file description, so it
-    survives the exec), then ``execv`` into ``gen``: same PID, so sudo still waits on it. Returns only through a test's
-    ``execv``."""
+    survives the exec), then ``execve`` into ``gen`` with :func:`levain.launch.child_env` (never this process's whole
+    environment): same PID, so sudo still waits on it. Returns only through a test's ``execve``."""
     python = python or root_tree.ROOT_PYTHON[host]
     text = phase_b_text(host, gen, lock_fd, pool_fd, caller_uid, tree=tree, entry=entry, fault=fault)
     os.set_inheritable(lock_fd, True)
@@ -2692,7 +2692,7 @@ def exec_phase_b(host: HostOS, gen: str, lock_fd: int, pool_fd: int, caller_uid:
     try:
         sys.stdout.flush()
         sys.stderr.flush()
-        execv(python, [python, root_tree.PY_FLAGS, "-c", text])
+        execve(python, [python, root_tree.PY_FLAGS, "-c", text], child_env())
     except BaseException:
         os.set_inheritable(lock_fd, False)    # the exec did not happen: nothing may inherit them now
         os.set_inheritable(pool_fd, False)
@@ -2762,7 +2762,8 @@ def _restore_phase_a(host: HostOS, cell: root_tree.Staged, prior: Intent | None,
 def repair_handover(plan: InstallPlan, g: Gathered, lock_fd: int, caller_uid: int, err: TextIO, *,
                     apply: Callable[[InstallPlan, TextIO], Optional[str]] = apply_steps,
                     probe: Callable[..., tuple[str, ...]] = run_probe,
-                    execv: Callable[[str, Sequence[str]], object] = os.execv, python: str | None = None,
+                    execve: Callable[[str, Sequence[str], Mapping[str, str]], object] = os.execve,
+                    python: str | None = None,
                     tree: Path | None = None, intent_path: Path | None = None, entry: str | None = None,
                     fault: Optional[Tuple[str, str]] = None) -> None:
     """``repair --source``'s PHASE A, from its first act to the exec (§2.2): the pool lock proven held BEFORE any act
@@ -2795,7 +2796,7 @@ def repair_handover(plan: InstallPlan, g: Gathered, lock_fd: int, caller_uid: in
         probe(host, cell.target, g.facts.install_shape, journal, fault=fault)
         err.write(f"levain install-helper: {cell.target} staged and probed; handing over to it\n")
         exec_phase_b(host, cell.target, lock_fd, q.fd, caller_uid, python=python, tree=tree, entry=entry, fault=fault,
-                     execv=execv)
+                     execve=execve)
     except BaseException as e:
         undone = _restore_phase_a(host, cell, prior, current, intent_path=intent_path, tree=tree)
         if not undone:
@@ -2816,7 +2817,9 @@ class ContinueSeams:
     owner_ok: Callable[[os.stat_result], bool] = lambda st: st.st_uid == 0
     store_seams: Optional[RH.Seams] = None
     state_dir: Optional[Path] = None
-    run: Callable[..., object] = subprocess.run
+    #: None: :func:`read_directory`'s own default, which passes ``env=`` (a held ``subprocess.run`` here is one the
+    #: spawn scan cannot follow).
+    run: Optional[Callable[..., object]] = None
     user_name: Callable[[int], Optional[str]] = _user_name
     #: Called with the re-gather's result before the plan (a test observes the adopted locks there).
     after_gather: Optional[Callable[["Gathered"], None]] = None
@@ -2880,7 +2883,7 @@ def _continue(lock_fd: int, pool_fd: int, gen: str, caller_uid: int, cs: Continu
     _QUIESCING[_store_key(L)] = q
     cmd = parse_install_argv(["repair"])
     try:
-        d = read_directory(host, run=cs.run)
+        d = read_directory(host) if cs.run is None else read_directory(host, run=cs.run)
         g = _gather_held(cmd, host, caller_uid, d, rs, L, q, state_dir=cs.state_dir, user_name=cs.user_name)
         if cs.after_gather is not None:
             cs.after_gather(g)

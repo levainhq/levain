@@ -385,17 +385,19 @@ def _place(host: HostOS, tree: Path, partial: Path, cell: Staged, current: Optio
     ``gen-<id>`` an interrupted run left is removed, the partial renamed to it, and the generation made durable."""
     import subprocess
 
+    from levain.launch import child_env
+
     target = cell.target
     if target is None:
         return False, "no staged id (the hash step did not run)"
     rm = _tools(host)["rm"]
     if target == current:
-        r = subprocess.run((rm, "-rf", str(partial)), capture_output=True, text=True, cwd="/")
+        r = subprocess.run((rm, "-rf", str(partial)), capture_output=True, text=True, cwd="/", env=child_env())
         return r.returncode == 0, (f"{target} is already current" if r.returncode == 0 else r.stderr.strip())
     gen = tree / target
     cell.existed = cell.existed or os.path.lexists(gen)
     cell.placed = True                                       # from the rm on, the target is this run's
-    r = subprocess.run((rm, "-rf", str(gen)), capture_output=True, text=True, cwd="/")
+    r = subprocess.run((rm, "-rf", str(gen)), capture_output=True, text=True, cwd="/", env=child_env())
     if r.returncode != 0:
         return False, r.stderr.strip()
     _rename(partial, gen)
@@ -503,9 +505,11 @@ def entry_steps(host: HostOS) -> list[Step]:
 def _gc(tree: Path, keep: frozenset[str], rm: str) -> tuple[bool, str]:
     import subprocess
 
+    from levain.launch import child_env
+
     gone = sorted(n for n in os.listdir(tree) if (n.startswith("gen-") and n not in keep) or n in ("levain", "h11"))
     for n in gone:
-        r = subprocess.run([rm, "-rf", str(tree / n)], capture_output=True, text=True, cwd="/")
+        r = subprocess.run([rm, "-rf", str(tree / n)], capture_output=True, text=True, cwd="/", env=child_env())
         if r.returncode != 0:
             return False, (r.stderr or r.stdout).strip()
     return True, ", ".join(gone)

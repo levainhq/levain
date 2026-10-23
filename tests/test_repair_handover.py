@@ -141,8 +141,11 @@ with install_lock(path=Path(cfg["lock"]), owner_ok=lambda st: st.st_uid == os.ge
     pool = os.open(os.path.join(cfg["store"], "slots", "pool.lock"), os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
     fcntl.flock(pool, fcntl.LOCK_EX)
     fault = tuple(cfg["fault"]) if cfg.get("fault") and cfg["mutant"] != "inprocess" else None
+    def execve(path, argv, env):            # the real exec, with the env exec_phase_b chose plus this test's config
+        assert "R2S2_CFG" not in env        # child_env(): never this process's whole environment
+        os.execve(path, argv, {**env, "R2S2_CFG": os.environ["R2S2_CFG"]})
     IH.exec_phase_b(cfg["host"], cfg["gen"], lock_fd, pool, os.getuid(), python=sys.executable,
-                    tree=Path(cfg["tree"]), entry="__import__('_phase_b').main", fault=fault)
+                    tree=Path(cfg["tree"]), entry="__import__('_phase_b').main", fault=fault, execve=execve)
 '''
 
 
@@ -268,7 +271,7 @@ def _phase_a(tmp: Path, gen_maker, *, prior: Intent | None = None, shape: G.Inst
                      handover=functools.partial(IH.repair_handover, tree=tree, intent_path=jpath,
                                                 probe=functools.partial(IH.run_probe, python=python,
                                                                         tree=tree, timeout=timeout),
-                                                execv=lambda *a: execs.append(a)))
+                                                execve=lambda *a: execs.append(a)))
     seams.acts = acts                                        # type: ignore[attr-defined]
     return seams, q, state, L, tree, jpath, execs
 
@@ -336,8 +339,10 @@ def test_the_real_staged_code_passes_the_probe_and_phase_a_execs(tmp_path: Path,
     shape = G.InstallShape("gen-" + "0" * 16, "0.9.0", "0.16.0", TXN, {}, (("unit/1", "keys"),))
     seams, q, state, L, tree, jpath, execs = _phase_a(tmp_path, _real_generation, shape=shape)
     assert IH.run_probe(HOST, GEN, shape, None, python=sys.executable, tree=tree) == tuple(sorted(G.KINDS))
-    _go(seams)                                               # the fake execv returns, so run() goes on
-    (python, argv), = execs
+    _go(seams)                                               # the fake execve returns, so run() goes on
+    (python, argv, env), = execs
+    from levain.launch import child_env
+    assert env == child_env()                                # the allowlist, never this process's whole environment
     assert argv[:3] == [python, "-IS", "-c"] and f"repair_continue(" in argv[3] and repr(GEN) in argv[3]
     assert str(tree / GEN) in argv[3] and "current" not in argv[3]
 
@@ -783,7 +788,9 @@ def _resume(tmp: Path, monkeypatch, *, torn: bool, stuck: bool = False):
         shutil.copytree(src, tree / gid / name)
     if torn:
         (tree / gid / "levain" / "__init__.py").write_text('__version__ = "1.0.0"\n#')   # one byte more
-    monkeypatch.setitem(root_tree.IMPORT_TREE, HOST, tree)
+    # The plan reads the tree of facts.host, which test_repair_plan pins to "darwin"; this module's HOST is the
+    # running platform's, so patching HOST's tree left a Linux run reading the real darwin path (CI red, 1023-1 fix2).
+    monkeypatch.setitem(root_tree.IMPORT_TREE, facts.host, tree)
     j = Intent("repair", POP, txn=TXN, generation=gid)
     jpath = tmp / "install-intent"
     jpath.write_text(intent_text(j))
@@ -803,7 +810,7 @@ def _resume(tmp: Path, monkeypatch, *, torn: bool, stuck: bool = False):
     try:
         errbuf = io.StringIO()
         IH.repair_handover(plan, IH.Gathered(facts, quiesce=q, repair=rf), 3, os.getuid(), errbuf,
-                           probe=probe, execv=lambda *a: execs.append(a), tree=tree, intent_path=jpath)
+                           probe=probe, execve=lambda *a: execs.append(a), tree=tree, intent_path=jpath)
         refused = None
     except Refused as e:
         refused = e
