@@ -1,7 +1,8 @@
 """The body codecs of a metered brokered route (3c R4 §1.3, §1.6): one class per `body_codec` of `policy.BODY_CODECS`
 that can be metered (every one but `none`). keys runs them on the buffered body in §1.7 step 4-5's order:
 `parse` (one JSON parse), `check` (the model, the ticket, the unboundable shapes), `write_ceiling` (openai-* only),
-`estimate` (the admitted hold). The usage reader is 3c-2b's.
+`estimate` (the admitted hold). After the relay, `usage` (R4 §1.7 step 8) reads the response on the side and
+`price_usage` prices what it reported, by class, at the same entry and the same rounding as the estimate.
 
 Every refusal is a `norm.Refused`. Any `RecursionError` in these steps is `body-json` (R4 §10), raised by `parse`
 for the parse and by `guarded` for the walks after it, so no hold is taken for a body keys cannot walk.
@@ -260,6 +261,26 @@ class Codec:
         total += self._uses(obj, price)
         return total
 
+    # -- usage ---------------------------------------------------------------------------------------------------
+
+    def usage(self, content_type: bytes) -> "UsageReader":
+        """The side reader for one response (R4 §1.7 step 8): SSE when the response's `content-type` is
+        `text/event-stream`, else one JSON body. It reads the bytes the relay passes and never changes them."""
+        ct = content_type.split(b";", 1)[0].strip().lower()
+        return UsageReader(self, ct == b"text/event-stream")
+
+    def _usage_event(self, obj: Mapping[str, Any], st: Dict[str, Any]) -> None:
+        """One parsed SSE event; the usage it reports, if any, kept in `st`."""
+        raise NotImplementedError
+
+    def _usage_stream(self, st: Mapping[str, Any]) -> Optional[Usage]:
+        """The usage of a whole stream from what `_usage_event` kept; None when it reported none."""
+        raise NotImplementedError
+
+    def _usage_body(self, obj: Mapping[str, Any]) -> Optional[Usage]:
+        """The usage of a non-stream JSON response; None when it reports none."""
+        raise NotImplementedError
+
     def _uses(self, obj: Mapping[str, Any], price: Price) -> int:
         tools = obj.get("tools")
         total = 0
@@ -328,6 +349,153 @@ def _ceil_mul(tokens: int, rate_per_million: int) -> int:
     return -(-(tokens * rate_per_million) // 1_000_000)
 
 
+# -- usage (R4 §1.2 "cost = usage priced by class", §1.7 step 8) -----------------------------------------------------
+
+#: the one SSE event the side reader holds, and the non-stream body it copies; past either the exchange has no usage
+USAGE_EVENT_MAX = 1 << 20
+USAGE_COPY_MAX = 1 << 20
+
+
+@dataclass(frozen=True)
+class Usage:
+    """A response's reported usage, by price class: input tokens at the plain rate, output, cache writes, cache reads,
+    and the uses of each priced server tool (named as `per_use` names it)."""
+    in_: int
+    out: int
+    cache_write: int
+    cache_read: int
+    uses: Tuple[Tuple[str, int], ...] = ()
+
+    def meta(self) -> Dict[str, Any]:
+        """The usage as the `settled` line's `meta` records it."""
+        out: Dict[str, Any] = {"in": self.in_, "out": self.out, "cache_write": self.cache_write,
+                               "cache_read": self.cache_read}
+        if self.uses:
+            out["uses"] = dict(self.uses)
+        return {"usage": out}
+
+
+def price_usage(u: Usage, price: Price) -> int:
+    """`u` priced by class at the entry's rates, in integer microdollars, each product rounded up (`_ceil_mul`, the
+    estimate's rounding). A tool use with no `per_use` rate costs nothing here: the estimate held nothing for it."""
+    total = (_ceil_mul(u.in_, price.in_) + _ceil_mul(u.out, price.out) + _ceil_mul(u.cache_write, price.cache_write)
+             + _ceil_mul(u.cache_read, price.cache_read))
+    for tool, n in u.uses:
+        total += n * price.per_use.get(tool, 0)
+    return total
+
+
+class _NoUsage(Exception):
+    """A usage object that is not the shape its codec documents: the exchange has no usage."""
+
+
+def _count(d: Any, key: str, required: bool = False) -> int:
+    v = d.get(key) if isinstance(d, dict) else None
+    if v is None and not required:
+        return 0
+    if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+        raise _NoUsage(key)
+    return v
+
+
+def _or_none(fn: Callable[[], Usage]) -> Optional[Usage]:
+    try:
+        return fn()
+    except _NoUsage:
+        return None
+
+
+class UsageReader:
+    """One response's side reader. `feed` takes each body read the relay passes (b"" never; the relay's end is
+    `result`), keeps at most one SSE event (`USAGE_EVENT_MAX`) or a copy of a non-stream body (`USAGE_COPY_MAX`),
+    and never raises: past a cap, or on any error, it stops reading and `result` is None. It buffers only on the
+    side; the relayed bytes are the relay's own."""
+    __slots__ = ("_codec", "_stream", "_buf", "_data", "_held", "_st", "stopped")
+
+    def __init__(self, c: "Codec", stream: bool) -> None:
+        self._codec = c
+        self._stream = stream
+        self._buf = bytearray()          # non-stream: the copied body; SSE: the line not yet ended
+        self._data: List[bytes] = []     # SSE: the current event's `data` lines
+        self._held = 0                   # SSE: the bytes of those lines
+        self._st: Dict[str, Any] = {}    # SSE: what the codec kept from the events so far
+        self.stopped: Optional[str] = None
+
+    def feed(self, part: bytes) -> None:
+        if self.stopped is not None:
+            return
+        try:
+            if self._stream:
+                self._feed_sse(part)
+            elif len(self._buf) + len(part) > USAGE_COPY_MAX:
+                self._stop("body-over-cap")
+            else:
+                self._buf += part
+        except Exception as e:   # the side reader never fails the relay
+            self._stop(type(e).__name__)
+
+    def _stop(self, why: str) -> None:
+        self.stopped = why
+        self._buf = bytearray()
+        self._data = []
+        self._st = {}
+
+    def _feed_sse(self, part: bytes) -> None:
+        buf = self._buf
+        buf += part
+        pos = 0
+        while True:
+            i = buf.find(b"\n", pos)
+            if i < 0:
+                break
+            line = bytes(buf[pos:i])
+            pos = i + 1
+            if line.endswith(b"\r"):
+                line = line[:-1]
+            if not line:
+                self._dispatch()
+            elif not line.startswith(b":"):   # a comment line is skipped
+                field, _, value = line.partition(b":")
+                if field == b"data":
+                    value = value[1:] if value.startswith(b" ") else value
+                    self._data.append(value)
+                    self._held += len(value) + 1
+            if self._held > USAGE_EVENT_MAX:
+                self._stop("event-over-cap")
+                return
+        del buf[:pos]
+        if self._held + len(buf) > USAGE_EVENT_MAX:
+            self._stop("event-over-cap")
+
+    def _dispatch(self) -> None:
+        if not self._data:
+            return
+        data = b"\n".join(self._data)
+        self._data = []
+        self._held = 0
+        try:
+            obj = json.loads(data)
+        except (ValueError, RecursionError):
+            return   # not a JSON event (openai-chat's `[DONE]`): it reports no usage
+        if isinstance(obj, dict):
+            self._codec._usage_event(obj, self._st)
+
+    def result(self) -> Optional[Usage]:
+        """The reported usage once the relay has ended, or None (no usage: cut, past a cap, none reported). An event
+        not ended by a blank line is discarded, as SSE discards it."""
+        if self.stopped is not None:
+            return None
+        try:
+            if self._stream:
+                return _or_none(lambda: self._codec._usage_stream(self._st))
+            obj = json.loads(bytes(self._buf))
+            return _or_none(lambda: self._codec._usage_body(obj)) if isinstance(obj, dict) else None
+        except (ValueError, RecursionError):
+            return None
+        finally:
+            self._buf = bytearray()
+
+
 class AnthropicMessages(Codec):
     name = "anthropic-messages"
     # `messages[].content[]`, and a `tool_result` block's own `content[]` inside it.
@@ -348,6 +516,40 @@ class AnthropicMessages(Codec):
         if isinstance(src, dict) and "data" in src:
             return dict(d, source=dict(src, data=""))
         return d
+
+    # Usage (https://platform.claude.com/docs/en/build-with-claude/streaming): `message_start.message.usage`, then the
+    # LAST `message_delta.usage`, whose counts "are cumulative", over it. `input_tokens` excludes the cache classes;
+    # `server_tool_use.<tool>_requests` counts a server tool's uses.
+    def _usage_event(self, obj: Mapping[str, Any], st: Dict[str, Any]) -> None:
+        t = obj.get("type")
+        if t == "message_start" and isinstance(obj.get("message"), dict):
+            st["start"] = obj["message"].get("usage")
+        elif t == "message_delta":
+            st["delta"] = obj.get("usage")
+
+    def _usage_stream(self, st: Mapping[str, Any]) -> Optional[Usage]:
+        start, delta = st.get("start"), st.get("delta")
+        if not isinstance(start, dict) or not isinstance(delta, dict):
+            return None   # a stream with no final `message_delta` reported no final count
+        return self._usage(dict(start, **delta))
+
+    def _usage_body(self, obj: Mapping[str, Any]) -> Optional[Usage]:
+        return self._usage(obj["usage"]) if isinstance(obj.get("usage"), dict) else None
+
+    def _usage(self, u: Mapping[str, Any]) -> Usage:
+        stu = u.get("server_tool_use")
+        uses: List[Tuple[str, int]] = []
+        if isinstance(stu, dict):
+            for k in sorted(stu):
+                if k.endswith("_requests"):
+                    n = _count(stu, k)
+                    if n:
+                        uses.append((k[:-len("_requests")], n))
+        elif stu is not None:
+            raise _NoUsage("server_tool_use")
+        return Usage(in_=_count(u, "input_tokens", True), out=_count(u, "output_tokens", True),
+                     cache_write=_count(u, "cache_creation_input_tokens"),
+                     cache_read=_count(u, "cache_read_input_tokens"), uses=tuple(uses))
 
 
 class _OpenAI(Codec):
@@ -378,6 +580,30 @@ class OpenAIChat(_OpenAI):
             return 1
         return max(1, _ceiling_value("n", obj["n"]))
 
+    # Usage: a non-stream body's `usage`; a stream's final chunk's `usage` (OpenAI sends it only with
+    # `stream_options.include_usage`; OpenRouter always). `prompt_tokens` counts every input token: the cached ones
+    # (`prompt_tokens_details.cached_tokens`) and OpenRouter's cache writes (`cache_write_tokens`,
+    # https://openrouter.ai/docs/use-cases/usage-accounting) are priced at their own rates, the rest at `in`
+    # [judged by lane 3c2b, 2026-10-23, against those docs: neither page says outright that cache writes are inside
+    # `prompt_tokens`; if they are not, the plain input is charged low by them].
+    def _usage_event(self, obj: Mapping[str, Any], st: Dict[str, Any]) -> None:
+        if isinstance(obj.get("usage"), dict):
+            st["usage"] = obj["usage"]
+
+    def _usage_stream(self, st: Mapping[str, Any]) -> Optional[Usage]:
+        return self._usage(st["usage"]) if "usage" in st else None
+
+    def _usage_body(self, obj: Mapping[str, Any]) -> Optional[Usage]:
+        return self._usage(obj["usage"]) if isinstance(obj.get("usage"), dict) else None
+
+    def _usage(self, u: Mapping[str, Any]) -> Usage:
+        det = u.get("prompt_tokens_details")
+        if det is not None and not isinstance(det, dict):
+            raise _NoUsage("prompt_tokens_details")
+        cached, written = _count(det, "cached_tokens"), _count(det, "cache_write_tokens")
+        return Usage(in_=max(0, _count(u, "prompt_tokens", True) - cached - written),
+                     out=_count(u, "completion_tokens", True), cache_write=written, cache_read=cached)
+
 
 class OpenAIResponses(_OpenAI):
     name = "openai-responses"
@@ -397,6 +623,30 @@ class OpenAIResponses(_OpenAI):
     server_tools = ("web_search", "web_search_preview", "file_search", "code_interpreter", "computer_use_preview",
                     "mcp", "image_generation")
     ceiling_fields = ("max_output_tokens",)
+
+    # Usage: a non-stream body's `usage`; a stream's `response.completed` `response.usage`, and
+    # `response.incomplete`'s (the call that stopped at its ceiling ends with that event, not `completed`)
+    # [judged by lane 3c2b, 2026-10-23, against the Responses streaming reference]. `input_tokens` counts the cached
+    # ones (`input_tokens_details.cached_tokens`), priced at `cache_read`.
+    _FINAL = ("response.completed", "response.incomplete")
+
+    def _usage_event(self, obj: Mapping[str, Any], st: Dict[str, Any]) -> None:
+        if obj.get("type") in self._FINAL and isinstance(obj.get("response"), dict):
+            st["usage"] = obj["response"].get("usage")
+
+    def _usage_stream(self, st: Mapping[str, Any]) -> Optional[Usage]:
+        return self._usage(st["usage"]) if isinstance(st.get("usage"), dict) else None
+
+    def _usage_body(self, obj: Mapping[str, Any]) -> Optional[Usage]:
+        return self._usage(obj["usage"]) if isinstance(obj.get("usage"), dict) else None
+
+    def _usage(self, u: Mapping[str, Any]) -> Usage:
+        det = u.get("input_tokens_details")
+        if det is not None and not isinstance(det, dict):
+            raise _NoUsage("input_tokens_details")
+        cached = _count(det, "cached_tokens")
+        return Usage(in_=max(0, _count(u, "input_tokens", True) - cached), out=_count(u, "output_tokens", True),
+                     cache_write=0, cache_read=cached)
 
 
 #: `body_codec` -> its codec. Every name of `policy.BODY_CODECS` but `none` (a test asserts the equality).

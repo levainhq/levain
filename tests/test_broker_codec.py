@@ -536,3 +536,137 @@ def test_estimate_serializes_once_when_nothing_is_stripped(monkeypatch, cname, b
     monkeypatch.setattr(codec, "serialize", lambda o: calls.append(1) or real(o))
     c.estimate(body, EO)
     assert len(calls) == 1
+
+
+# --- 3c-2b: the usage reader and the price by class (R4 §1.2, §1.3, §1.7 step 8) -------------------------------------
+# The responses are `tests/usage_responses.py`, the bytes lane 3c2b's step-1 run relayed through keys as a child
+# process (`project_memory/1023-15/3c2b/run1_main_ledger.json`). Expected usages written from the fixtures' numbers
+# before the reader ran.
+
+from tests import usage_responses as UR  # noqa: E402
+
+CT_JSON, CT_SSE = b"application/json", b"text/event-stream; charset=utf-8"
+
+
+def _read(cname, data, stream, step=None):
+    """The usage `cname`'s side reader reports for `data`, fed in reads of `step` bytes (all at once when None)."""
+    r = codec.CODECS[cname].usage(CT_SSE if stream else CT_JSON)
+    step = step or max(1, len(data))
+    for i in range(0, len(data), step):
+        r.feed(data[i:i + step])
+    return r.result()
+
+
+def _u(i, o, cw, cr, uses=()):
+    return codec.Usage(in_=i, out=o, cache_write=cw, cache_read=cr, uses=tuple(uses))
+
+
+STEPS = [None, 1, 7, 4096]
+
+
+@pytest.mark.parametrize("step", STEPS)
+@pytest.mark.parametrize("stream,want", [
+    (False, _u(2095, 503, 2051, 4000, [("web_search", 2)])),
+    # message_start's counts with the last message_delta's (cumulative) over them
+    (True, _u(472, 15, 100, 200)),
+])
+def test_codec_usage_anthropic_messages(stream, want, step):
+    assert _read("anthropic-messages", UR.body("anthropic-messages", stream), stream, step) == want
+
+
+@pytest.mark.parametrize("step", STEPS)
+@pytest.mark.parametrize("stream,want", [
+    (False, _u(1117 - 1024, 46, 0, 1024)),   # prompt_tokens holds the cached ones
+    (True, _u(300 - 128, 40, 0, 128)),       # the final chunk's usage; `[DONE]` is no JSON event
+])
+def test_codec_usage_openai_chat(stream, want, step):
+    assert _read("openai-chat", UR.body("openai-chat", stream), stream, step) == want
+
+
+@pytest.mark.parametrize("step", STEPS)
+@pytest.mark.parametrize("stream", [False, True])
+def test_codec_usage_openai_responses(stream, step):
+    assert _read("openai-responses", UR.body("openai-responses", stream), stream, step) == _u(328 - 64, 52, 0, 64)
+
+
+def test_codec_usage_openrouter_cache_writes_priced_apart():
+    # OpenRouter's `prompt_tokens_details.cache_write_tokens` (its usage-accounting page's example): out of `in`
+    body = json.dumps({"usage": {"prompt_tokens": 194, "completion_tokens": 2, "cost": 0.95,
+                                 "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 100}}}).encode()
+    assert _read("openai-chat", body, False) == _u(94, 2, 100, 0)
+
+
+def test_codec_usage_responses_incomplete_reports_usage():
+    ev = UR._sse([("response.incomplete", {"type": "response.incomplete", "response": {
+        "status": "incomplete", "usage": {"input_tokens": 5, "output_tokens": 10}}})])
+    assert _read("openai-responses", ev, True) == _u(5, 10, 0, 0)
+
+
+def test_codec_usage_crlf_lines():
+    data = UR.body("anthropic-messages", True).replace(b"\n", b"\r\n")
+    assert _read("anthropic-messages", data, True, 5) == _u(472, 15, 100, 200)
+
+
+@pytest.mark.parametrize("cname", sorted(codec.CODECS))
+def test_codec_usage_over_cap_event_is_no_usage(cname):
+    # one SSE event past USAGE_EVENT_MAX stops the side reader; the usage after it is never read
+    big = b"data: " + b"x" * (codec.USAGE_EVENT_MAX + 1) + b"\n\n"
+    r = codec.CODECS[cname].usage(CT_SSE)
+    r.feed(big[:100])
+    r.feed(big[100:])
+    r.feed(UR.body(cname, True))
+    assert r.result() is None and r.stopped == "event-over-cap"
+
+
+@pytest.mark.parametrize("cname", sorted(codec.CODECS))
+def test_codec_usage_over_cap_event_in_many_lines_is_no_usage(cname):
+    # the cap is on the EVENT held, not one line: many short `data:` lines with no blank line between them
+    line = b"data: " + b"y" * 1000 + b"\n"
+    r = codec.CODECS[cname].usage(CT_SSE)
+    for _ in range(codec.USAGE_EVENT_MAX // 1000 + 2):
+        r.feed(line)
+    r.feed(b"\n" + UR.body(cname, True))
+    assert r.result() is None and r.stopped == "event-over-cap"
+
+
+@pytest.mark.parametrize("cname", sorted(codec.CODECS))
+def test_codec_usage_over_cap_body_is_no_usage(cname):
+    # a non-stream body past USAGE_COPY_MAX is not copied whole, so its usage is never read
+    data = UR.body(cname, False)
+    pad = b" " * (codec.USAGE_COPY_MAX - len(data) + 1)   # JSON whitespace: the body still parses, it is just long
+    assert _read(cname, data[:-1] + pad + data[-1:], False, 65536) is None
+    assert _read(cname, data[:-1] + pad[:-1] + data[-1:], False, 65536) is not None   # at the cap exactly: read
+
+
+@pytest.mark.parametrize("cname,data,stream", [
+    ("anthropic-messages", UR.body("anthropic-messages", True).split(b"event: message_delta")[0], True),  # cut
+    ("openai-chat", UR._sse(UR.OPENAI_CHAT_SSE[:2] + [(None, "[DONE]")]), True),   # no include_usage
+    ("openai-responses", UR._sse(UR.OPENAI_RESPONSES_SSE[:2]), True),               # no response.completed
+    ("openai-chat", b'{"usage":{"prompt_tokens":-1,"completion_tokens":2}}', False),
+    ("openai-chat", b'{"usage":{"prompt_tokens":true,"completion_tokens":2}}', False),
+    ("anthropic-messages", b'{"usage":{"input_tokens":1}}', False),                 # no output count
+    ("anthropic-messages", b'{"type":"error","error":{"type":"overloaded_error"}}', False),
+    ("openai-responses", b'{"usage":{"input_tokens":1,"output_tokens":2', False),   # cut mid-body
+    ("anthropic-messages", b'[' * 100000 + b']' * 100000, False),                   # RecursionError
+    ("openai-chat", b"data: " + b"[" * 100000 + b"\n\n", True),
+])
+def test_codec_usage_none_reported(cname, data, stream):
+    assert _read(cname, data, stream) is None
+
+
+def test_codec_usage_last_event_without_blank_line_is_discarded():
+    data = UR.body("openai-chat", True)
+    cut = data[:data.index(b"data: [DONE]")].rstrip(b"\n")   # the usage chunk not ended by its blank line
+    assert _read("openai-chat", cut, True) is None
+
+
+def test_price_usage_by_class_rounded_up():
+    # 2095 x 3 + 503 x 15 + ceil(2051 x 3.75) + 4000 x 0.3 + 2 x 10000 = 6285 + 7545 + 7692 + 1200 + 20000
+    u = _read("anthropic-messages", UR.body("anthropic-messages", False), False)
+    assert codec.price_usage(u, EA) == 42722
+    assert u.meta() == {"usage": {"in": 2095, "out": 503, "cache_write": 2051, "cache_read": 4000,
+                                  "uses": {"web_search": 2}}}
+    # a tool use with no per_use rate costs nothing (the estimate held nothing for it)
+    assert codec.price_usage(_u(0, 0, 0, 0, [("web_fetch", 3)]), EA) == 0
+    # one rounding: a class's product is rounded up on its own (1 token x 0.3 microdollars = 1)
+    assert codec.price_usage(_u(0, 0, 0, 1), EA) == 1
