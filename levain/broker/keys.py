@@ -55,11 +55,9 @@ Runs on the root interpreter (3.9): every lock and event is made inside the runn
 from __future__ import annotations
 
 import asyncio
-import base64
 import datetime
 import errno
 import functools
-import hashlib
 import json
 import logging
 import os
@@ -82,7 +80,7 @@ from levain.broker.creds import (COMMIT_FDS, REFRESH_CONNS, CredLifecycle, CredS
 from levain.broker.gwwire import FrameReader, KeysSide, WireError
 from levain.broker.peer import PeerUnknown, peer_of, peer_uid
 from levain.broker.policy import PolicyError, RoutePolicy, parse_base_map
-from levain.broker.redact import BAD_FRAME, REDACTED, Scanner
+from levain.broker.redact import Scanner
 from levain.broker.upstream import (GRACE, StaleExchange, Upstream, _note, h11_bytes, open_exchange,
                                     pick_address)
 from levain.contracts import ContractError, canon
@@ -193,10 +191,6 @@ REDIRECTS = frozenset({301, 302, 303, 307, 308})
 BODY_FRAME = gwwire.CAPS[b"b"]
 #: a header value the wire carries: visible ASCII and tab
 _HVALUE = re.compile(r"[\t\x20-\x7e]*\Z")
-#: the largest `D` frame keys writes (the wire's cap for `D`)
-WS_FRAME = gwwire.CAPS[b"D"]
-#: RFC 6455 §1.3: the GUID `sec-websocket-accept` is computed with
-_WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 #: keys' log, under the lib root (design 1.9): one JSON line per exchange and per diagnostic note
 GW_LOG = ("keys", "log", "gw.jsonl")
 #: the reservation ledger, under the lib root (design 3c-1 §2.5): opened by `main()` before anything is bound
@@ -1391,7 +1385,6 @@ class Keys:
         mid-body (`ff.responded`)."""
         rec["template"] = tpl.path
         scanner = Scanner([cred.secret.encode("latin-1")] if cred is not None else [])
-        ws: Optional[Tuple[str, List[str]]] = None   # a metered route refuses every upgrade at `_check_q`
         try:
             if conn.detached:   # a detached exchange answers nothing
                 return
@@ -1430,21 +1423,6 @@ class Keys:
                 return
             resp = await self._upload_and_head(up, hconn, data, rec)
             buf.give_back()   # the body is written: its bytes leave the buffer budget
-            if isinstance(resp, h11.InformationalResponse):   # a 101, returned only to a websocket request
-                assert ws is not None   # a 101 is returned only to a websocket request
-                u_frame = self._upgrade_frame(resp, pol, ws, scanner)
-                if conn.detached:
-                    return
-                conn.writer.write(u_frame)
-                ff.responded = True
-                side.upgraded()
-                rec["status"] = 101
-                await conn.writer.drain()
-                await self._websocket(conn, ff, side, up, hconn, scanner, rec)
-                if conn.detached:   # fenced mid-relay: cut short, so `_serve_q`'s `end()` books it, never a settle
-                    return
-                hold.settle(hold.amount)
-                return
             r_frame = self._response_frame(resp, pol, cred, scanner)
             if conn.detached:
                 return
@@ -1455,7 +1433,7 @@ class Keys:
             await self._relay_body(conn, up, hconn, scanner, rec)
             if conn.detached:   # fenced mid-relay: cut short, so `_serve_q`'s `end()` books it, never a settle
                 return
-            hold.settle(hold.amount)   # 3c-1: a completed relay settles at its full hold (no cost until 3c-2a)
+            hold.settle(hold.amount)   # a completed relay settles at its full hold (no usage read until 3c-2b)
         finally:
             rec["redactions"] = scanner.count
 
@@ -1560,120 +1538,6 @@ class Keys:
                 continue
             out.append([name, text])
         return out
-
-    def _upgrade_frame(self, resp: "h11.InformationalResponse", pol: RoutePolicy, ws: Tuple[str, List[str]],
-                       scanner: Scanner) -> bytes:
-        """The `U` frame for an upstream's 101 to a websocket request, or the refusal (design 1.6): the 101 must be
-        the websocket keys asked for (`ws_upgrade_refusal`: the accept against the key keys sent, no extension, a
-        protocol keys offered), else `upstream-error`. `ws` is the (key, offered protocols) `_check_request` read
-        from the request it sent, never re-read from the `Q`. `U` carries the allow-listed response headers; the
-        front writes the slot's 101 itself (1.3 step 7)."""
-        key, offered = ws
-        out = self._relayed_headers(resp.headers, pol, scanner)
-        why = ws_upgrade_refusal(resp, key, offered, [v for n, v in out if n == "sec-websocket-protocol"])
-        if why is not None:
-            _note(logging.WARNING, "levain gw-keys: websocket upgrade refused (%s)", why)
-            raise norm.Refused("upstream-error", why)
-        try:
-            return gwwire.encode(b"U", {"v": 1, "headers": out})
-        except WireError:
-            raise norm.Refused("upstream-error", "upgrade head over the frame cap") from None
-
-    async def _websocket(self, conn: Conn, ff: "FrontFrames", side: KeysSide, up: Upstream,
-                         hconn: "h11.Connection", scanner: Scanner, rec: dict) -> None:
-        """After `U`: `D` frames both ways (design 1.6), h11's `trailing_data` (bytes the upstream sent after its 101)
-        first. Front -> upstream: each `D` payload through `Upstream.write`, unchanged (the client's frames are
-        masked; nothing is scanned that way). Upstream -> front: through the scanner's FRAME-AWARE form, each frame's
-        bytes forwarded unchanged; a secret in a payload cuts the frame where it begins and closes the websocket. The
-        exchange's idle clock (`idle_s`) is shared by both directions. It ends at the front's `E`, `X` or EOF (keys
-        sends nothing more), or at the upstream's EOF, a redaction, a server frame keys does not relay, an upstream
-        failure or the idle clock, each of which sends the front `E`; the release then closes the upstream."""
-        fs = scanner.frames()
-        early = bytes(hconn.trailing_data[0])
-        loop = asyncio.get_running_loop()
-        last = [loop.time()]
-        w = conn.writer
-
-        async def down() -> str:
-            data = early
-            while True:
-                if data:
-                    last[0] = loop.time()
-                    out, end = fs.feed(data)
-                    for i in range(0, len(out), WS_FRAME):
-                        if conn.detached:
-                            return "detached"
-                        piece = out[i:i + WS_FRAME]
-                        w.write(gwwire.encode(b"D", piece))
-                        rec["bytes_down"] += len(piece)
-                        await w.drain()
-                    if end is not None:
-                        return end
-                data = await upstream_step(up.read(upstream.READ_CHUNK))
-                if not data:
-                    return "upstream-eof"
-
-        async def to_upstream() -> str:
-            while True:
-                fr = await ff.read(side.allowed())
-                if fr is None:
-                    return "front-eof"
-                ftype, payload = fr
-                side.got(ftype)
-                if ftype != b"D":
-                    return "front-end"   # `E` or `X`
-                assert isinstance(payload, bytes)
-                last[0] = loop.time()
-                rec["bytes_up"] += len(payload)
-                if payload:
-                    await upstream_send(up, payload)   # the gate: nothing goes up once the exchange is detached
-
-        d, u = asyncio.ensure_future(down()), asyncio.ensure_future(to_upstream())
-        idle = False
-        try:
-            while True:
-                left = last[0] + self.idle_s - loop.time()
-                done, _ = await asyncio.wait({d, u}, timeout=max(0.0, left), return_when=asyncio.FIRST_COMPLETED)
-                if done:
-                    break
-                if loop.time() - last[0] >= self.idle_s:
-                    idle = True
-                    break
-        finally:
-            for t in (d, u):
-                if not t.done():
-                    t.cancel()
-            await asyncio.gather(d, u, return_exceptions=True)
-        for t in (d, u):   # a detached exchange ends with no answer, as everywhere else in the exchange
-            if not t.cancelled() and isinstance(t.exception(), StaleExchange):
-                raise StaleExchange()
-        # the side that ended decides; a direction cancelled above did not end on its own
-        ended = d if not d.cancelled() else u if not u.cancelled() else None
-        exc = ended.exception() if ended is not None else None
-        if idle:
-            end = "upstream-timeout"
-        elif isinstance(exc, UpstreamFailed):
-            end = exc.name
-        elif ended is d and exc is None:
-            end = d.result()
-        else:
-            # the front ended its side (`E`, `X`, EOF, a frame the wire refuses) or a write to it failed: keys has
-            # nothing more to tell it
-            if exc is not None and not isinstance(exc, (OSError, WireError, EOFError)):
-                _note(logging.WARNING, "levain gw-keys: websocket relay ended (%s)", type(exc).__name__)
-            return
-        if end == "detached":
-            return
-        if end == REDACTED:
-            _note(logging.WARNING, "levain gw-keys: websocket closed on a redaction route=%s", rec.get("route"))
-        elif end == BAD_FRAME:
-            rec["refused"] = "upstream-error"
-            _note(logging.WARNING, "levain gw-keys: websocket closed on a server frame keys does not relay")
-        elif end != "upstream-eof":
-            rec["refused"] = end   # upstream-timeout (the idle clock or a read) or upstream-error
-        if not conn.detached:
-            w.write(gwwire.encode(b"E"))
-            await w.drain()
 
     async def _relay_body(self, conn: Conn, up: Upstream, hconn: "h11.Connection", scanner: Scanner,
                           rec: dict) -> None:
@@ -2073,71 +1937,16 @@ class Keys:
             got += len(payload)
 
 
-def ws_handshake(fwd: Sequence[Tuple[str, str]], body: str) -> Tuple[str, List[str]]:
-    """keys' own check of a websocket `Q`'s handshake (RFC 6455 §4.1), on the headers it re-checked (`fwd`: names
-    already lowercased by `norm.check_headers`): no body, exactly one `sec-websocket-version` of 13, and exactly one
-    `sec-websocket-key` that is the canonical base64 of 16 bytes. Returns that key and the protocols offered (the
-    upstream's 101 is checked against both); anything else is `malformed`."""
-    keys = [v for n, v in fwd if n == "sec-websocket-key"]
-    vers = [v for n, v in fwd if n == "sec-websocket-version"]
-    if body != "none" or vers != ["13"] or len(keys) != 1:
-        raise norm.Refused("malformed", "websocket-handshake")
-    try:
-        raw = base64.b64decode(keys[0], validate=True)
-    except ValueError:
-        raw = b""
-    if len(raw) != 16 or base64.b64encode(raw).decode("ascii") != keys[0]:
-        raise norm.Refused("malformed", "websocket-key")
-    offered = [t.strip() for n, v in fwd if n == "sec-websocket-protocol" for t in v.split(",") if t.strip()]
-    return keys[0], offered
-
-
-def ws_accept(key: str) -> str:
-    """RFC 6455 §4.2.2: base64(SHA-1(key + GUID))."""
-    return base64.b64encode(hashlib.sha1(key.encode("ascii") + _WS_GUID).digest()).decode("ascii")
-
-
-def ws_upgrade_refusal(resp: "h11.InformationalResponse", key: str, offered: Sequence[str],
-                       relayed: Sequence[str]) -> Optional[str]:
-    """Why an upstream's 101 is not a websocket keys relays (RFC 6455 §4.1's client checks), or None: HTTP/1.1, exactly
-    one `sec-websocket-accept` equal to `ws_accept(key)`, `upgrade: websocket`, `upgrade` among the `connection` options,
-    no `sec-websocket-extensions` (keys offered none), and at most one `sec-websocket-protocol`, one keys offered.
-    `relayed` is the `sec-websocket-protocol` values `U` would carry (after the route's response allow-list and the
-    scanner): the selection must arrive whole, or the client and the upstream disagree on the protocol."""
-    if resp.http_version != b"1.1":   # h11 takes an HTTP/1.0 101 as a switch; the websocket handshake is 1.1's
-        return "websocket-http-version"
-    hs: Dict[str, List[str]] = {}
-    for n, v in resp.headers:
-        hs.setdefault(bytes(n).decode("latin-1").lower(), []).append(bytes(v).decode("latin-1").strip())
-    if hs.get("sec-websocket-accept") != [ws_accept(key)]:
-        return "websocket-accept"
-    if [v.lower() for v in hs.get("upgrade", [])] != ["websocket"]:
-        return "websocket-upgrade"
-    if "upgrade" not in [t for v in hs.get("connection", []) for t in norm.connection_tokens(v)]:
-        return "websocket-connection"
-    if "sec-websocket-extensions" in hs:
-        return "websocket-extensions"
-    proto = hs.get("sec-websocket-protocol", [])
-    if len(proto) > 1 or (proto and proto[0] not in offered):
-        return "websocket-protocol"
-    if list(relayed) != proto:
-        return "websocket-protocol-unrelayed"
-    return None
-
-
 def request_head(pol: RoutePolicy, method: bytes, path: bytes, query: Optional[bytes], fwd: Sequence[Tuple[str, str]],
-                 body: str, cred: object, *, upgrade: bool = False) -> Tuple[bytes, "h11.Connection"]:
+                 body: str, cred: object) -> Tuple[bytes, "h11.Connection"]:
     """The request head keys writes through `Upstream.write`, built from keys' own policy by an h11 client, and that
     client (it frames the body and parses the response): target = `upstream.base_path` + path (+ `?query`), `host`,
-    the re-checked headers, `connection: upgrade` and `upgrade: websocket` for a websocket `Q` (design 1.6; h11 then
-    takes a 101 as the switch), `accept-encoding: identity`, the framing the `Q` declared, then the ONE credential
-    header. A head h11 refuses to write is `malformed`."""
+    the re-checked headers, `accept-encoding: identity`, the framing given in `body` (keys passes its serialization's
+    `length:n`), then the ONE credential header. A head h11 refuses to write is `malformed`."""
     assert pol.upstream is not None
     target = pol.upstream.base_path.encode("ascii") + path + (b"?" + query if query is not None else b"")
     headers = [(b"host", pol.upstream.host.encode("ascii"))]
     headers += [(n.encode("ascii"), v.encode("ascii")) for n, v in fwd]
-    if upgrade:
-        headers += [(b"connection", b"upgrade"), (b"upgrade", b"websocket")]
     headers.append((b"accept-encoding", b"identity"))
     if body.startswith("length:"):
         headers.append((b"content-length", body[len("length:"):].encode("ascii")))

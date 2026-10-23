@@ -444,15 +444,16 @@ def test_a_fenced_http_relay_is_uncertain_not_settled(monkeypatch):
 def test_a_websocket_upgrade_on_a_metered_route_is_refused_before_a_hold(monkeypatch):
     # R4 §1.6 (b1_expected's websocket row): one exchange carries many responses, so no single usage settles it; the
     # upgrade is refused at §1.7 step 1, before `A`: no connection, no `reserved` line, `F{body-unbounded:websocket}`
-    from tests import test_broker_ws as WS
     up = _Up()
 
     async def go(d: str) -> dict:
         st = _scripted(monkeypatch, up)
         async with _Rig(d) as rig:
             holds = _capture(rig)
-            rig.front.feed_data(WS._gw(b"E"))
-            await asyncio.wait_for(rig.run(dict(WS._q(), path="/v1/messages")), 5)
+            rig.front.feed_data(gwwire.encode(b"E"))
+            ws_q = dict(_q("none"), upgrade="websocket", headers=[["sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="],
+                                                                ["sec-websocket-version", "13"]])
+            await asyncio.wait_for(rig.run(ws_q), 5)
             out = {"frames": await rig.got(), "path": rig.ledger.path, "holds": len(holds),
                    "handshakes": st["handshakes"]}
         out["kinds"] = [o["kind"] for o in file_lines(out["path"])]
