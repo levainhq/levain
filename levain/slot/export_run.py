@@ -540,7 +540,8 @@ def transact(class_dfd: int, session: str, sources: Sequence[Tuple[str, int]], r
 
     Order (r12 S15-3), asserted by the log: ``fsync <name>`` per file, ``fsync staged``, ``exchange`` or
     ``noreplace``, ``fsync class``, ``delete older``. ``before_commit`` runs between ``fsync staged`` and the commit
-    (5c-ii-b's detach); the caller makes it never raise. After the commit call returns, the run is COMMITTED: a
+    (5c-ii-b's detach); a :class:`Refused` it raises is a pre-commit refusal like any other (``<s>.new`` removed,
+    ``<s>`` as it was): adopt-open's raises ``export-image-unavailable`` when the detach failed. After the commit call returns, the run is COMMITTED: a
     failed class-dir fsync or older-tree delete is logged and does not withhold the answer (an older tree left at
     ``<s>.new`` is the next seal-in's stale delete); the failed fsync also puts a warning in ``warnings`` (A2) and
     skips the older-tree delete, so a crash that reverts the exchange still finds the older tree whole (B-7)."""
@@ -1283,9 +1284,10 @@ class SealedRun:
     for the next seal-in), then the memory observation (Linux the leaf's ``oom_kill`` after ``populated 0``; macOS
     the watchdog's flags), the leaf removed (a failure leaves it for the next seal-in), the host reading.
     :meth:`teardown`: the order domain empty -> fds closed -> umount -> backing unlinked (r6 build note).
-    :meth:`release_image` is idempotent and never raises, so it serves as :func:`transact`'s ``before_commit`` (the
-    outputs already closed, D2) AND teardown's last step: a detach that fails there (any fd root still holds into the
-    image, for one) is retried by teardown once every fd in :attr:`fds` is closed."""
+    :meth:`release_image` is idempotent and never raises, so it serves inside :func:`transact`'s ``before_commit``
+    (the outputs already closed, D2) AND as teardown's last step: a detach that fails there (any fd root still holds
+    into the image, for one) is retried by teardown once every fd in :attr:`fds` is closed. A publish path must not
+    commit on that failure: it reads :attr:`released` after the call and refuses (adopt-open: L3 r1 H1)."""
 
     def __init__(self, facts: SealFacts, seams: SealSeams) -> None:
         self.f, self.s = facts, seams

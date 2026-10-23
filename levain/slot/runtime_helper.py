@@ -2162,12 +2162,15 @@ def spawn_export(cmd: ExportCmd, *, frame_r: int, stdout_fd: int, stderr_fd: int
 
 
 def collect_export(pid: int, result_r: int, deadline_s: float, *, cap: int,
-                   monotonic: Callable[[], float] = time.monotonic) -> Tuple[str, Optional[int], Optional[bytes], bool]:
+                   monotonic: Callable[[], float] = time.monotonic,
+                   on_reap: Optional[Callable[[], None]] = None) -> Tuple[str, Optional[int], Optional[bytes], bool]:
     """§1 step 10: the result line read from fd 4 as DATA while the importer runs, at most ``cap`` + 1 bytes (the
     classifier refuses the extra byte by size), until the importer EXITS (polled ``WNOHANG``), never until the pipe's
     EOF: a process the importer left behind can hold fd 4 open, and seal-out kills it. Returns ``(exit, code, line,
     reaped)``: ``exit`` ``"exit"`` (``code`` its status) or ``"signal"``, or ``"time"`` past ``deadline_s`` with the
-    importer NOT reaped (seal-out's domain proof kills and reaps it as a child)."""
+    importer NOT reaped (seal-out's domain proof kills and reaps it as a child). ``on_reap`` is called as soon as the
+    ``waitpid`` has reaped the importer, before anything else here can raise, so a caller never hands a reaped (and
+    possibly recycled) pid to seal-out (L3 r1 L2)."""
     end = monotonic() + deadline_s
     buf = bytearray()
     open_ = True
@@ -2195,6 +2198,8 @@ def collect_export(pid: int, result_r: int, deadline_s: float, *, cap: int,
             except InterruptedError:
                 continue
             if done:
+                if on_reap is not None:
+                    on_reap()
                 while take():
                     pass
                 line = bytes(buf) if buf else None
@@ -2324,7 +2329,7 @@ def adopt_sealed_run(ctx: Ctx, front: AdoptFront, adopt: AdoptSeams, run_seams: 
         at("adopt:6")
         run.seal_in(class_dfd, s + ER.STAGING_SUFFIX)      # a refusal here has torn down what it made
         pid: Optional[int] = None
-        reaped = False
+        reaped = [False]                   # L2: set by collect_export the moment its waitpid reaps the importer
         sealed_out = False
         try:
             work = ER.mount_path(export_dir, "importer")
@@ -2335,18 +2340,18 @@ def adopt_sealed_run(ctx: Ctx, front: AdoptFront, adopt: AdoptSeams, run_seams: 
                     replace_at(efd, "importer.sb", RD.render_importer_profile(host), mode=0o644,
                                fsync=ctx.seams.fsync)
             cmd = run_seams.launch(ctx, importer_args(s, front.base, adopt), export_class)
-            frame_r, frame_w = os.pipe()
-            result_r, result_w = os.pipe()
-            for fd in (frame_w, result_r):
-                run.fds.append(fd)
+            # L1: each pair is in run.fds the moment it exists, so a failed second pipe() leaks nothing of the first
+            frame_r, frame_w = pair = os.pipe()
+            run.fds += pair
+            result_r, result_w = pair = os.pipe()
+            run.fds += pair
             at("adopt:7")
             try:
                 pid = run_seams.spawn(cmd, frame_r=frame_r, stdout_fd=out_fd, stderr_fd=err_fd, result_w=result_w,
                                       rlimits=export_rlimits(image_bytes))
             finally:
-                os.close(frame_r)
-                os.close(result_w)
-                for fd in (out_fd, err_fd):    # the child's now: root holds no fd into the image past the spawn
+                # the child's now: root keeps only frame_w and result_r, and no fd into the image past the spawn
+                for fd in (frame_r, result_w, out_fd, err_fd):
                     run.fds.remove(fd)
                     os.close(fd)
             run.start_watchdog()
@@ -2365,12 +2370,13 @@ def adopt_sealed_run(ctx: Ctx, front: AdoptFront, adopt: AdoptSeams, run_seams: 
                 at("adopt:frame-closed")
             at("adopt:10")
             wait_s = max(0.0, front.deadline - ctx.seams.monotonic()) + run_seams.result_grace_s
-            exit_kind, code, line, reaped = collect_export(pid, result_r, wait_s, cap=IM.RESULT_CAP)
+            exit_kind, code, line, _ = collect_export(pid, result_r, wait_s, cap=IM.RESULT_CAP,
+                                                      on_reap=lambda: reaped.__setitem__(0, True))
             run.fds.remove(result_r)
             os.close(result_r)
             at("adopt:11")
             sealed_out = True              # ONE seal-out: an unproven one raises and is not run again below
-            reading = run.seal_out(() if reaped else (pid,))
+            reading = run.seal_out(() if reaped[0] else (pid,))
             if walk_refusal is not None:
                 raise walk_refusal
             at("adopt:classify")
@@ -2384,7 +2390,13 @@ def adopt_sealed_run(ctx: Ctx, front: AdoptFront, adopt: AdoptSeams, run_seams: 
                 if work_dfd in run.fds:
                     run.fds.remove(work_dfd)
                     os.close(work_dfd)
-                run.release_image()
+                run.release_image()        # best-effort by design (teardown retries it); the publish is not
+                if not run.released:       # L3 r1 H1: a refusal here is before the commit; transact removes <s>.new
+                    img = run.image
+                    raise Refused(ER_UNAVAILABLE, "the per-run image could not be detached and removed before the "
+                                  f"commit (mount {img.mount if img else None}, still mounted: "
+                                  f"{seal.image.is_mounted(img.mount) if img else None}); "  # type: ignore[attr-defined]
+                                  "nothing is published")
 
             result, pub = ER.publish_if_success(
                 outcome, work_dfd, class_dfd, s, object_format=str(front.base["object_format"]), owner_uid=uid,
@@ -2393,14 +2405,16 @@ def adopt_sealed_run(ctx: Ctx, front: AdoptFront, adopt: AdoptSeams, run_seams: 
             at("adopt:12")
             return adopt_answer(ctx, front, result, pub, export_class)
         finally:
-            if not sealed_out:
-                # anything that failed after seal-in: the domain is still killed and proven before the locks go
-                try:
-                    run.seal_out(() if (pid is None or reaped) else (pid,))
-                except Refused:
-                    pass           # unproven: teardown leaves the image for the next seal-in
-            at("adopt:teardown")
-            run.teardown()
+            try:
+                if not sealed_out:
+                    # anything that failed after seal-in: the domain is still killed and proven before the locks go.
+                    # L3 r1 M1 / ruling Q5: an unproven seal-out here RAISES export-domain-unproven, which replaces
+                    # the pending failure (Python chains that one as its __context__); teardown still runs below and
+                    # leaves the image for the next seal-in.
+                    run.seal_out(() if (pid is None or reaped[0]) else (pid,))
+            finally:
+                at("adopt:teardown")
+                run.teardown()
 
 
 def adopt_open(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:

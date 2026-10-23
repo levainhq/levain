@@ -126,9 +126,11 @@ class GroupProver:
     def __init__(self, log, fail_at: int = 0) -> None:
         self.pgs: set = set()
         self.log, self.fail_at, self.calls = log, fail_at, 0
+        self.children: list = []        # the children each call was handed, in call order
 
     def __call__(self, children):
         self.calls += 1
+        self.children.append(tuple(children))
         for pg in self.pgs:
             try:
                 os.killpg(pg, signal.SIGKILL)
@@ -204,8 +206,9 @@ class Rig:
     """One store + the seams; ``run()`` answers ``(exit, stdout line, stderr)`` of ``runtime_helper.main``."""
 
     def __init__(self, tmp: Path, kind: str = "delta", *, argv_wrap=None, fail_prove_at: int = 0,
-                 fault=None) -> None:
+                 fault=None, image_run=None) -> None:
         self.tmp, self.L = tmp, make_store(tmp, kind)
+        self.image_run = image_run      # None: the real hdiutil runner
         self.fault = fault or (lambda point: None)
         self.log: list = []
         self.prover = GroupProver(self.log.append, fail_prove_at)
@@ -237,7 +240,8 @@ class Rig:
 
     def seal(self, facts):
         return ER.SealSeams(prove=self.prover, watchdog=QuietWatchdog, log=self.log.append,
-                            image=ER.ImageSeams(log=self.log.append),
+                            image=(ER.ImageSeams(log=self.log.append) if self.image_run is None
+                                   else ER.ImageSeams(log=self.log.append, run=self.image_run)),
                             publish=ER.PublishSeams(log=self.log.append, fault=self.fault))
 
     def seams(self) -> RH.Seams:
@@ -465,3 +469,97 @@ def test_install_writes_the_export_importer_entry_the_launch_names(host):
     assert path in steps and steps[path][2] == 0o755
     assert 'runpy.run_module(\'levain.slot.importer\', run_name="__main__"' in steps[path][1]
     assert "export-verifier" not in root_tree.ENTRY_MODULES
+
+
+# --- fix round 1 (L3 r1): each row built red against 58e5e3f2 -------------------------------------------------------
+
+def _failing_detach(argv, umask):
+    """The real hdiutil, except ``detach`` answers rc 1 and leaves the image mounted (a busy mount, say)."""
+    if len(argv) > 1 and argv[1] == "detach":
+        return 1, "hdiutil: detach failed - Resource busy (seam)"
+    return ER._run_cmd(argv, umask)
+
+
+def test_a_failed_detach_before_the_commit_publishes_nothing(rigs):
+    # L3 r1 codex HIGH: release_image is best-effort; the publish path requires the image RELEASED before the commit.
+    rig = rigs("delta", image_run=_failing_detach)
+    rc, line, err = rig.run()
+    a = _answer(line)
+    pub = rig.L / "export" / "operator" / S
+    assert (rc, a.get("refused")) == (RH.EXIT_REFUSED, "export-image-unavailable"), (line, pub.exists(), rig.log)
+    assert "detach" in err, err
+    exp = rig.L / "export"
+    assert not (exp / "operator" / S).exists() and not (exp / "operator" / (S + ".new")).exists()
+    assert "noreplace" not in rig.log and "exchange" not in rig.log
+    assert rig.log[-2:] == ["adopt:adopt-unlocked", "adopt:session-unlocked"]
+
+
+@pytest.mark.parametrize("fail_prove_at,name", [(2, "export-domain-unproven"), (0, "internal")])
+def test_a_cleanup_seal_out_that_is_unproven_replaces_the_earlier_failure(rigs, monkeypatch, fail_prove_at, name):
+    # L3 r1 codex MED / ruling Q5: a failure before step 11 (here a BrokenPipeError once the frames are closed) still
+    # runs seal-out in the finally; an unproven domain there REPLACES the earlier error, which rides as its context.
+    rig = rigs("delta", fail_prove_at=fail_prove_at)
+
+    def broken():
+        raise BrokenPipeError(32, "seam")
+    rig.hooks["adopt:frame-closed"] = broken
+    seen = []
+    orig = RH.VERB_HANDLERS["adopt-open"]
+
+    def wrapped(ctx, req, blob):
+        try:
+            return orig(ctx, req, blob)
+        except BaseException as e:
+            seen.append(e)
+            raise
+    monkeypatch.setitem(RH.VERB_HANDLERS, "adopt-open", wrapped)
+    rc, line, err = rig.run()
+    assert _answer(line)["refused"] == name, (line, err, rig.log)
+    assert not (rig.L / "export" / "operator" / S).exists()
+    assert "adopt:11" not in rig.log and "adopt:teardown" in rig.log
+    if fail_prove_at:
+        assert isinstance(seen[0].__context__, BrokenPipeError), repr(seen[0].__context__)
+        assert os.path.ismount(rig.L / "export" / ".work")      # unproven: the image is left for the next seal-in
+
+
+def _open_fds() -> set:
+    return set(int(n) for n in os.listdir("/dev/fd"))
+
+
+def test_a_failed_second_pipe_leaks_no_fd_of_the_first(rigs, monkeypatch):
+    # L3 r1 complement LOW 1: the two pipes and their four fds are registered in one guarded block.
+    rig = rigs("delta")
+    real, calls = os.pipe, []
+
+    def pipe():
+        calls.append(1)
+        if len(calls) == 2:
+            monkeypatch.setattr(os, "pipe", real)     # one failure only: teardown's hdiutil runs pipe() too
+            raise OSError(errno.EMFILE, "seam")
+        return real()
+    launch = rig.launch
+
+    def launch_then_patch(ctx, args, export_class):   # the launch is root's last act before the two pipes
+        cmd = launch(ctx, args, export_class)
+        monkeypatch.setattr(os, "pipe", pipe)
+        return cmd
+    rig.launch = launch_then_patch
+    before = _open_fds()
+    rc, line, err = rig.run()
+    assert _answer(line)["refused"] == "internal" and "Errno 24" in err, (line, err)
+    assert len(calls) == 2
+    assert _open_fds() == before
+
+
+def test_an_importer_reaped_before_collect_export_fails_is_never_handed_to_seal_out(rigs, monkeypatch):
+    # L3 r1 complement LOW 2: once collect_export's waitpid has reaped the importer, the pid is never signalled again.
+    rig = rigs("delta")
+    real = os.WIFSIGNALED
+
+    def once(status):
+        monkeypatch.setattr(os, "WIFSIGNALED", real)
+        raise RuntimeError("seam: after the reap")
+    rig.hooks["adopt:10"] = lambda: monkeypatch.setattr(os, "WIFSIGNALED", once)
+    rc, line, err = rig.run()
+    assert _answer(line)["refused"] == "internal" and "after the reap" in err, (line, err)
+    assert rig.prover.children[-1] == (), rig.prover.children
