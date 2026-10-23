@@ -45,7 +45,7 @@ def _lib(d: str) -> None:
                           "headers": {"content-type": "application/json"}, "body_cap": 4096, "body_codec": "none"},
              "max_call_microdollars": 1000, "max_session_microdollars": 100000}
     with open(os.path.join(d, "routes", "base.json"), "wb") as f:
-        f.write(canon.canonical_bytes({"format": K.BASE_MAP_FORMAT, "routes": [route]}))
+        f.write(canon.canonical_bytes({"format": "levain-routes-base/1", "routes": [route]}))
     with open(os.path.join(d, "keys", "cred", "c1.json"), "w") as f:
         f.write(json.dumps({"format": CR.FORMAT, "name": "c1", "rev": "0" * 32, "hosts": ["api.example.com"],
                             "inject": {"header": "x-api-key", "scheme": ""}, "kind": "static", "secret": SECRET}))

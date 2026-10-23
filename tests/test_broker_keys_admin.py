@@ -579,7 +579,7 @@ def _frame_lib(d: str) -> None:
                           "headers": {"content-type": "application/json"}, "body_cap": 1024, "body_codec": "none"},
              "max_call_microdollars": 1000, "max_session_microdollars": 100000}
     with open(os.path.join(d, "routes", "base.json"), "wb") as f:
-        f.write(canon.canonical_bytes({"format": K.BASE_MAP_FORMAT, "routes": [route]}))
+        f.write(canon.canonical_bytes({"format": "levain-routes-base/1", "routes": [route]}))
     with open(os.path.join(d, "keys", "cred", "c1.json"), "w") as f:
         f.write('{"format": "levain-keys-credential/1", "name": "c1", "rev": "%s", "hosts": ["api.example.com"], '
                 '"inject": {"header": "x-api-key", "scheme": ""}, "kind": "static", "secret": "%s"}'
@@ -957,7 +957,7 @@ def test_base_map_unusable_anywhere_refuses_every_route(routes):
              "overflow": [dict(route, route="z", requests=dict(route["requests"],
                                                                 headers={"content-type": "a{99999999999}"}))]}[routes]
     with open(path, "wb") as f:
-        f.write(canon.canonical_bytes({"format": K.BASE_MAP_FORMAT, "routes": [route] + extra}))
+        f.write(canon.canonical_bytes({"format": "levain-routes-base/1", "routes": [route] + extra}))
     try:
         got = asyncio.run(_one_q(d))
         kinds = [o["kind"] for o in file_lines(os.path.join(d, "keys", "ledger.jsonl"))]

@@ -571,7 +571,7 @@ def _two_route_lib(d: str) -> None:
                 "max_call_microdollars": max_call, "max_session_microdollars": cap}
 
     with open(os.path.join(d, "routes", "base.json"), "wb") as f:
-        f.write(canon.canonical_bytes({"format": K.BASE_MAP_FORMAT,
+        f.write(canon.canonical_bytes({"format": "levain-routes-base/1",
                                        "routes": [route("a", 100, 100), route("b", 900, 1000)]}))
 
 

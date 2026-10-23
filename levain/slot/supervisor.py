@@ -627,7 +627,7 @@ def read_base_map(path: Path, *, read: Callable[[Path], bytes] = Path.read_bytes
         obj = canon.parse(raw)
     except ContractError:
         raise Refused("base-map-malformed", str(path)) from None
-    if type(obj) is not dict or obj.get("format") != layout.BASE_ROUTES_FORMAT or type(obj.get("routes")) is not list:
+    if type(obj) is not dict or obj.get("format") not in layout.BASE_ROUTES_FORMATS or type(obj.get("routes")) is not list:
         raise Refused("base-map-malformed", str(path))
     return [r for r in obj["routes"] if type(r) is dict]
 

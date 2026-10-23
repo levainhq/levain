@@ -79,7 +79,7 @@ from levain.broker.creds import (COMMIT_FDS, REFRESH_CONNS, CredLifecycle, CredS
                                  FakeCredLifecycle, check_host, fresh, on_upstream_401, unexpired)
 from levain.broker.gwwire import FrameReader, KeysSide, WireError
 from levain.broker.peer import PeerUnknown, peer_of, peer_uid
-from levain.broker.policy import PolicyError, RoutePolicy, parse_route
+from levain.broker.policy import PolicyError, RoutePolicy, parse_base_map
 from levain.broker.redact import BAD_FRAME, REDACTED, Scanner
 from levain.broker.upstream import (GRACE, StaleExchange, Upstream, _note, h11_bytes, open_exchange,
                                     pick_address)
@@ -181,9 +181,8 @@ _A = gwwire.encode(b"A")
 
 #: a brokered route's upstream is `https` (policy refuses any other scheme) and names no port
 UPSTREAM_PORT = 443
-#: CONTRACT §4.3's base route map, `L/routes/base.json`: its format, and the size keys reads at most (DECISION: far
-#: above a real map; a larger file is refused unread past the cap)
-BASE_MAP_FORMAT = "levain-routes-base/1"
+#: CONTRACT §4.3's base route map, `L/routes/base.json` (its formats: `policy.BASE_MAP_FORMATS`): the size keys reads
+#: at most (DECISION: far above a real map; a larger file is refused unread past the cap)
 BASE_MAP_CAP = 1024 * 1024
 
 #: an upstream redirect is never followed: `upstream-redirect` (design 1.6); other 3xx (304) pass
@@ -1668,11 +1667,12 @@ class Keys:
         return pol
 
     def _base_route(self, route: str) -> Optional[RoutePolicy]:
-        """`route`'s object in `L/routes/base.json`, opened at every `Q` and parsed (`policy.parse_route`, source
-        `base`) whenever the opened file's (st_dev, st_ino, st_mtime_ns, st_size) differs from the last map that
-        parsed whole, or None when the map has none. EVERY entry is parsed before one is selected: a map keys cannot
-        read, any entry that does not parse, or any route id named twice anywhere in the map refuses
-        `keys-unavailable` (logged), never a pass for the route asked about; a refused map is never cached."""
+        """`route`'s object in `L/routes/base.json`, opened at every `Q` and parsed (`policy.parse_base_map`: `/1`
+        as main read it, `/2` with its `prices`) whenever the opened file's (st_dev, st_ino, st_mtime_ns, st_size)
+        differs from the last map that parsed whole, or None when the map has none. EVERY entry is parsed before one
+        is selected: a map keys cannot read, any entry that does not parse, or any route id named twice anywhere in
+        the map refuses `keys-unavailable` (logged), never a pass for the route asked about; a refused map is never
+        cached."""
         if self.lib_root is None:
             raise norm.Refused("keys-unavailable", "no lib root")
         path = os.path.join(self.lib_root, "routes", "base.json")
@@ -1686,17 +1686,10 @@ class Keys:
             if len(data) > BASE_MAP_CAP:
                 raise PolicyError("over the size cap")
             doc = canon.parse(data)
-            if type(doc) is not dict or doc.get("format") != BASE_MAP_FORMAT or type(doc.get("routes")) is not list:
-                raise PolicyError("format or routes")
-            parsed: Dict[str, RoutePolicy] = {}
-            for entry in doc["routes"]:
-                try:
-                    pol = parse_route(entry, source="base")
-                except Exception as e:   # any entry's parse failure, of whatever type, refuses the map whole
-                    raise PolicyError(f"an entry does not parse ({type(e).__name__})") from None
-                if pol.route in parsed:
-                    raise PolicyError("a route named twice")
-                parsed[pol.route] = pol
+            try:
+                parsed: Dict[str, RoutePolicy] = parse_base_map(doc)
+            except Exception as e:   # any entry's parse failure, of whatever type, refuses the map whole
+                raise PolicyError(f"the map does not parse ({type(e).__name__})") from None
             self._base = (key, parsed)
             return parsed.get(route)
         except (OSError, ValueError, ContractError, RecursionError) as e:
