@@ -131,7 +131,7 @@ def test_timeout_stops_waiting_on_a_pipe_holder(tmp_path: Path, monkeypatch: pyt
     gpid, hpid = tmp_path / "g.pid", tmp_path / "h.pid"
     helper = tmp_path / "helper.sh"
     helper.write_text(f"#!/bin/sh\ntrap '' TERM\necho $$ > '{hpid}'\n'{sys.executable}' -I '{holder}' '{gpid}' &\n"
-                      "sleep 60\n")
+                      "exec sleep 60\n")
     helper.chmod(0o755)
     seams = AVW.Seams(helper=(str(helper),), store=Path("/nonexistent"), helper_timeout_s=1.0)
     got: list = []
@@ -159,6 +159,138 @@ def test_timeout_stops_waiting_on_a_pipe_holder(tmp_path: Path, monkeypatch: pyt
                 os.kill(int(f.read_text()), 9)
             except (OSError, ValueError):
                 pass
+
+
+# --- fix3 (L3 s4a r3): the CLI never signals root; his own git is TERMed then KILLed ----------------------------
+
+RECORDER = """
+import os, signal, sys, time
+log = sys.argv[1]
+def got(n, _f):
+    with open(log, "a") as f:
+        f.write(signal.Signals(n).name + "\\n")
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT, signal.SIGUSR1):
+    signal.signal(sig, got)                   # records every signal it gets, and so ignores each one
+with open(log + ".pid", "w") as f:
+    f.write(str(os.getpid()))
+end = time.monotonic() + 60
+while time.monotonic() < end:
+    time.sleep(0.05)
+"""
+
+
+def _recorder(tmp_path: Path) -> "tuple[Path, Path]":
+    script = tmp_path / "rec.py"
+    script.write_text(RECORDER)
+    log = tmp_path / "signals"
+    exe = tmp_path / "rec"
+    exe.write_text(f"#!/bin/sh\nexec '{sys.executable}' -I '{script}' '{log}'\n")
+    exe.chmod(0o755)
+    return exe, log
+
+
+def _pid(log: Path) -> int:
+    end = time.monotonic() + 10
+    while time.monotonic() < end:
+        try:
+            return int((log.parent / (log.name + ".pid")).read_text())
+        except (OSError, ValueError):
+            time.sleep(0.05)
+    raise AssertionError("the fake never started")
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _signals(log: Path) -> "list[str]":
+    try:
+        return log.read_text().split()
+    except FileNotFoundError:
+        return []
+
+
+def test_helper_timeout_sends_no_signal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # L3 s4a r3 codex HIGH: on 8fa0203e the CLI SIGTERMed the helper on its timeout (sudo relays it to root, which dies
+    # before its seal-out). The CLI signals nothing and returns within wall + grace.
+    monkeypatch.setattr(AVW, "STOP_GRACE_S", 1.0, raising=False)
+    exe, log = _recorder(tmp_path)
+    seams = AVW.Seams(helper=(str(exe),), store=Path("/nonexistent"), helper_timeout_s=2.0)
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(Refused) as e:
+            AVW.call_helper(seams, "status", S, err=io.StringIO())
+        took = time.monotonic() - t0
+        pid = _pid(log)
+        time.sleep(0.5)                          # a signal sent at the stop has time to land in the log
+        assert e.value.name == "helper-timeout"
+        assert took < 2.0 + 1.0 + 5, took
+        assert _signals(log) == [] and _alive(pid), _signals(log)
+    finally:
+        try:
+            os.kill(_pid(log), 9)
+        except (OSError, AssertionError):
+            pass
+
+
+def test_helper_interrupt_sends_no_signal(tmp_path: Path) -> None:
+    # L3 s4a r3 codex HIGH, its Ctrl-C half: on 8fa0203e the interrupt's stop SIGTERMed the helper too. The
+    # KeyboardInterrupt is re-raised and the helper got nothing from the CLI (the SIGINT here is sent to the test's
+    # own pid only; the terminal's Ctrl-C reaching the helper's group is root's to ignore, ``runtime_helper.wait_child``).
+    import signal
+    import threading
+
+    exe, log = _recorder(tmp_path)
+    seams = AVW.Seams(helper=(str(exe),), store=Path("/nonexistent"), helper_timeout_s=30.0)
+
+    def interrupt() -> None:
+        _pid(log)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    threading.Thread(target=interrupt, daemon=True).start()
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            AVW.call_helper(seams, "status", S, err=io.StringIO())
+        took = time.monotonic() - t0
+        pid = _pid(log)
+        time.sleep(0.5)
+        assert _signals(log) == [] and _alive(pid), _signals(log)
+        assert took < 10, took
+    finally:
+        try:
+            os.kill(_pid(log), 9)
+        except (OSError, AssertionError):
+            pass
+
+
+def test_local_git_ignoring_term_is_killed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # L3 s4a r3 codex MED: on 8fa0203e his own git that ignored TERM was never KILLed and ran on past the CLI's
+    # repo-unreadable:timeout. It gets TERM, then KILL within the grace, and is reaped before the CLI returns.
+    monkeypatch.setattr(AVW, "STOP_GRACE_S", 1.0, raising=False)
+    monkeypatch.setattr(AVW, "REPO_GIT_TIMEOUT", 1.0, raising=False)
+    exe, log = _recorder(tmp_path)
+    (tmp_path / "repo" / ".git").mkdir(parents=True)
+    seams = AVW.Seams(helper=("FAKE",), store=Path("/nonexistent"), git=str(exe))
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(Refused) as e:
+            AVW._git(seams, tmp_path / "repo", "config", "--local")
+        took = time.monotonic() - t0
+        pid = _pid(log)
+        assert e.value.name == "repo-unreadable:timeout"
+        assert took < 1.0 + 2 * 1.0 + 5, took
+        assert _signals(log) == ["SIGTERM"], _signals(log)
+        assert not _alive(pid)                   # KILLed and reaped (a zombie would still answer kill 0)
+    finally:
+        try:
+            os.kill(_pid(log), 9)
+        except (OSError, AssertionError):
+            pass
 
 
 def test_run_stays_in_the_callers_session() -> None:

@@ -93,15 +93,18 @@ def _errno_name(e: OSError) -> str:
 
 
 def _run(argv: Sequence[str], *, env: Mapping[str, str], timeout: float, stdin: object = subprocess.DEVNULL,
-         cwd: Optional[str] = None, **kw: object) -> "subprocess.CompletedProcess[bytes]":
+         cwd: Optional[str] = None, signal_child: bool = True,
+         **kw: object) -> "subprocess.CompletedProcess[bytes]":
     """Every child this module starts: ``env`` is required (the spawn scan, ``tests/test_launch.py``). The child stays
     in the operator's session and tty (a ``requiretty`` / ``tty_tickets`` sudoers policy that works from his shell
-    works here). Every wait is bounded: past ``timeout`` the DIRECT child gets SIGTERM (``sudo`` relays it to the
-    root helper), the CLI closes its pipe ends, waits at most :data:`STOP_GRACE_S` for the child, and then
-    ``TimeoutExpired`` is raised whether or not it exited. The CLI does not own root's processes: root's own wall
-    reaps its sealed child (``runtime_helper.verify_wall_s``; ``export_run``'s ``importer-failed:time`` /
-    ``verifier-failed:*``) [judged by adopt-s4a-fix2, 10-23, against sudo(8)'s signal relay; not run under a real
-    sudo here]."""
+    works here). Every wait is bounded; past ``timeout``, or on an interrupt, :func:`_stop` ends the wait and then
+    ``TimeoutExpired`` (or the interrupt) is raised. ``signal_child`` picks the stop: True (his own git, :func:`_git`)
+    = SIGTERM, :data:`STOP_GRACE_S`, SIGKILL, one more bounded wait; False (the root helper, :func:`call_helper`) = NO
+    signal: the CLI closes its pipe ends and stops waiting. The root helper is built to outlive the operator's
+    signals (``runtime_helper.wait_child``: "the helper must outlive it to answer its one line"), because it alone
+    runs the bounded collect and seal-out of its sealed child; a SIGTERM relayed by ``sudo`` would kill it before that
+    cleanup. A closed pipe can cut only its answer: ``runtime_helper.main`` writes the line after ``run`` returns,
+    and each verb's seal-out runs inside ``run`` (its ``finally``)."""
     stdout = kw.pop("stdout", subprocess.PIPE)
     stderr = kw.pop("stderr", subprocess.PIPE)
     if kw.pop("capture_output", False):
@@ -112,31 +115,35 @@ def _run(argv: Sequence[str], *, env: Mapping[str, str], timeout: float, stdin: 
     try:
         out, err = p.communicate(timeout=timeout)
     except BaseException:           # the timeout, and an interrupt: stop waiting, bounded
-        _stop(p)
+        _stop(p, signal_child=signal_child)
         raise
     return subprocess.CompletedProcess(p.args, p.returncode, out, err)
 
 
-#: After a timeout's SIGTERM to the direct child, how long the CLI waits for it before it stops waiting
-#: [judged by adopt-s4a-fix2, 10-23, against the helper's own cleanup being fd closes and a lock release].
+#: After a timeout's SIGTERM to his own git, how long the CLI waits for it before SIGKILL, and again after the SIGKILL
+#: [judged by adopt-s4a-fix2, 10-23, against git's own cleanup being lock-file unlinks].
 STOP_GRACE_S = 10.0
 
 
-def _stop(p: "subprocess.Popen[bytes]") -> None:
-    try:
-        p.terminate()
-    except OSError:                 # already reaped, or not ours to signal: either way not waited on
-        pass
+def _stop(p: "subprocess.Popen[bytes]", *, signal_child: bool) -> None:
     for f in (p.stdin, p.stdout, p.stderr):
         if f is not None:
             try:
                 f.close()
             except OSError:
                 pass
-    try:
-        p.wait(timeout=STOP_GRACE_S)
-    except subprocess.TimeoutExpired:   # a child that ignored TERM: named by the caller's helper-timeout, never waited on
-        pass
+    if not signal_child:            # the root helper: no signal, no wait (it answers into a closed pipe, or not at all)
+        return
+    for send in (p.terminate, p.kill):
+        try:
+            send()
+        except OSError:             # already reaped: nothing left to signal
+            return
+        try:
+            p.wait(timeout=STOP_GRACE_S)
+            return
+        except subprocess.TimeoutExpired:   # TERM ignored: KILL; KILL not reaped in the grace (a D-state git): stop
+            pass
 
 
 #: The setup slack of one helper verb beyond its own named bounds: root's copies-in, hashes and publish around the
@@ -200,10 +207,10 @@ def call_helper(seams: Seams, *args: str, err: IO[str], timeout: Optional[float]
     _note(seams.log, "helper " + " ".join(args))
     try:
         p = seams.spawn(argv, env=child_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE, timeout=wall)
+                        stderr=subprocess.PIPE, timeout=wall, signal_child=False)
     except subprocess.TimeoutExpired:
-        raise Refused("helper-timeout", f"{args[0]} ran past {wall:.0f} s; the CLI stopped waiting, and root's own "
-                                        "wall reaps its sealed child") from None
+        raise Refused("helper-timeout", f"{args[0]} ran past {wall:.0f} s; the CLI stopped waiting and signalled "
+                                        "nothing, and root's own wall reaps its sealed child") from None
     except OSError as e:
         raise Refused("helper-unrunnable", f"{args[0]}: {e.strerror or e}") from None
     for line in (p.stderr or b"").splitlines()[-5:]:
