@@ -142,13 +142,23 @@ def test_websocket_refused_on_metered_route():
     assert e.value.name == "body-unbounded:websocket" and e.value.status == 403
 
 
-def test_recursion_in_a_later_step_is_body_json():
+def test_recursion_in_a_later_step_is_body_json(monkeypatch):
+    # the image strip walks content positions only, so no later step recurses on the body's depth itself; the one
+    # recursive step left is json.dumps, whose C limit is not sys.getrecursionlimit on 3.12. Either way, never bare.
     deep: object = "x"
     for _ in range(sys.getrecursionlimit() + 50):
         deep = {"a": deep}
     obj = {"model": "m1", "max_tokens": 1, "messages": [deep]}
+    try:
+        assert isinstance(codec.guarded(codec.CODECS["anthropic-messages"].estimate, obj, EA), int)
+    except norm.Refused as e:
+        assert e.name == "body-json"
+
+    def deep_dumps(*a, **k):
+        raise RecursionError
+    monkeypatch.setattr(codec.json, "dumps", deep_dumps)
     with pytest.raises(norm.Refused) as e:
-        codec.guarded(codec.CODECS["anthropic-messages"].estimate, obj, EA)
+        codec.guarded(codec.CODECS["anthropic-messages"].estimate, {"model": "m1", "max_tokens": 1}, EA)
     assert e.value.name == "body-json"
 
 
@@ -274,3 +284,153 @@ def test_vendor_table_parses_and_names_its_derivation():
     table = vendor_prices.prices()
     assert all(p.source.startswith("https://") for p in table.values())
     assert "git grep -nE" in (vendor_prices.__doc__ or "")
+
+
+# --- 3c2a-i L3 r1 (1023-8/3c2a/L3_a1_r1.txt): each test is its finding's own failure ------------------------------
+
+
+@pytest.mark.parametrize("cname,body,what", [
+    # codex + glm HIGH: `{}` ENABLES Chat Completions web search; presence is what turns it on
+    ("openai-chat", '{"model":"m1","messages":[],"web_search_options":{}}', "web_search_options"),
+    ("openai-chat", '{"model":"m1","messages":[],"web_search_options":null}', "web_search_options"),
+    # complement LOW 6: 0 compared == to False, so it read as absent
+    ("openai-chat", '{"model":"m1","messages":[],"plugins":0}', "plugins"),
+    ("openai-responses", '{"model":"m1","input":"x","previous_response_id":0}', "previous_response_id"),
+    ("openai-responses", '{"model":"m1","input":"x","conversation":{}}', "conversation"),
+    ("anthropic-messages", '{"model":"m1","max_tokens":10,"messages":[],"mcp_servers":0}', "mcp_servers"),
+    ("anthropic-messages", '{"model":"m1","max_tokens":10,"messages":[],"mcp_servers":{}}', "mcp_servers"),
+])
+def test_unbounded_field_by_what_disables_it(cname, body, what):
+    assert _go(cname, body, EA if cname.startswith("anthropic") else EO, dispatch=True) == f"body-unbounded:{what}"
+
+
+@pytest.mark.parametrize("cname,body", [
+    ("openai-chat", '{"model":"m1","messages":[],"plugins":[]}'),
+    ("openai-responses", '{"model":"m1","input":"x","previous_response_id":null,"conversation":null}'),
+    ("anthropic-messages", '{"model":"m1","max_tokens":10,"messages":[],"mcp_servers":[]}'),
+])
+def test_disabled_spellings_stay_bounded(cname, body):
+    got = _go(cname, body, EA if cname.startswith("anthropic") else EO, dispatch=True)
+    assert not isinstance(got, str) and got[1] == ()
+
+
+@pytest.mark.parametrize("tool", ["web_search_2025_08_26", "web_search_preview_2025_03_11"])
+def test_dated_snapshot_tool_refused_on_dispatch(tool):
+    # codex HIGH 2: OpenAI's snapshot names are `_YYYY_MM_DD`, which `_\d{8}` missed
+    body = '{"model":"m1","input":"x","tools":[{"type":"%s"}]}' % tool
+    assert _go("openai-responses", body, EO, dispatch=True) == "body-unbounded:" + tool.rsplit("_", 3)[0]
+
+
+def test_dated_snapshot_tool_priced_per_use():
+    entry = parse_price("EO", dict(EO_RAW, per_use={"web_search": 10_000}))
+    dated = '{"model":"m1","input":"x","max_output_tokens":10,"tools":[{"type":"web_search_2025_08_26","max_uses":2}]}'
+    assert _go("openai-responses", dated, entry)[0] - _go("openai-responses", dated, EO)[0] == 2 * 10_000
+
+
+@pytest.mark.parametrize("lit", ["1e999", "-1e999", "1E400"])
+def test_non_finite_number_is_body_json(lit):
+    # complement + codex MED: an overflowing literal parses to inf without calling parse_constant
+    body = '{"model":"m1","max_tokens":10,"temperature":%s,"messages":[]}' % lit
+    assert _go("anthropic-messages", body, EA) == "body-json"
+
+
+def test_serialize_failure_is_body_json():
+    with pytest.raises(norm.Refused) as e:
+        codec.serialize({"x": float("inf")})
+    assert e.value.name == "body-json"
+    with pytest.raises(norm.Refused) as e:
+        codec.serialize({"x": "\ud800"})
+    assert e.value.name == "body-json"
+
+
+_FAKE = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A" * 4000}}
+
+
+@pytest.mark.parametrize("where", ["schema", "tool_use"])
+def test_fake_image_off_position_counts_in_full(where):
+    # complement MED 2: only a content position is an image; elsewhere the provider reads the bytes as text
+    if where == "schema":
+        body = {"model": "m1", "max_tokens": 10, "messages": [],
+                "tools": [{"name": "t", "input_schema": {"type": "object", "default": _FAKE}}]}
+    else:
+        body = {"model": "m1", "max_tokens": 10, "messages": [{"role": "assistant", "content": [
+            {"type": "tool_use", "id": "a", "name": "t", "input": {"x": _FAKE}}]}]}
+    est, _, fwd = _go("anthropic-messages", json.dumps(body), EA)
+    in_est = len(fwd.encode()) + EA.overhead_tokens            # every forwarded byte, no image term
+    assert est == -(-(in_est * EA.cache_write) // 1_000_000) + -(-(10 * EA.out) // 1_000_000)
+
+
+def test_images_at_content_positions_are_stripped():
+    img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A" * 4000}}
+    body = {"model": "m1", "max_tokens": 10, "messages": [{"role": "user", "content": [
+        img, {"type": "tool_result", "tool_use_id": "a", "content": [img]}]}]}
+    est, _, fwd = _go("anthropic-messages", json.dumps(body), EA)
+    stripped = fwd.replace("A" * 4000, "")
+    in_est = len(stripped.encode()) + 2 * EA.image_tokens + EA.overhead_tokens
+    assert est == -(-(in_est * EA.cache_write) // 1_000_000) + -(-(10 * EA.out) // 1_000_000)
+    chat = {"model": "m1", "max_tokens": 10, "messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 4000}}]}],
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": {
+            "default": {"type": "image_url", "image_url": "data:" + "B" * 4000}}}}]}
+    est, _, fwd = _go("openai-chat", json.dumps(chat), EO)
+    in_est = len(fwd.replace("data:image/png;base64," + "A" * 4000, "").encode()) + EO.image_tokens + EO.overhead_tokens
+    assert est == -(-(in_est * EO.in_) // 1_000_000) + -(-(10 * EO.out) // 1_000_000)
+
+
+def test_non_ascii_serialized_as_utf8():
+    # complement MED 3: ensure_ascii escaped each CJK char to 6 bytes
+    body = '{"model":"m1","max_tokens":10,"messages":[{"role":"user","content":"' + "中" * 100 + '"}]}'
+    est, _, fwd = _go("anthropic-messages", body, EA)
+    assert "中" * 100 in fwd and len(codec.serialize(json.loads(fwd))) == len(fwd.encode("utf-8"))
+    lone = '{"model":"m1","max_tokens":10,"messages":[{"role":"user","content":"\\ud800"}]}'
+    assert _go("anthropic-messages", lone, EA) == "body-json"
+
+
+def test_serialized_body_above_cap_max_refused(monkeypatch):
+    monkeypatch.setattr(policy, "BODY_CAP_MAX", 200)
+    body = '{"model":"m1","max_tokens":10,"messages":[{"role":"user","content":"' + "x" * 300 + '"}]}'
+    assert _go("anthropic-messages", body, EA) == "body-cap"
+
+
+def test_base_v2_brokered_codec_none_refused():
+    # codex MED 3
+    req = dict(_brokered()["requests"], body_codec="none")
+    with pytest.raises(PolicyError):
+        parse_base_map({"format": "levain-routes-base/2", "routes": [_brokered(prices={"m1": EA_RAW}, requests=req)]})
+
+
+@pytest.mark.parametrize("over", [
+    {"body_policy": {"zdr": 1}},                                       # codex MED 5: a value is text or a list of text
+    {"body_policy": {"k" + str(i): "v" for i in range(257)}},          # the 256-entry cap
+    {"provider": "x‮y"},                                          # /2's text rule on a text field
+    {"models": [{"requested": "m%d" % i, "backend": "b", "price": EO_RAW} for i in range(257)]},
+])
+def test_routemap_v3_keeps_v2_validators(over):
+    with pytest.raises(PolicyError):
+        parse_routemap({"format": "levain-dispatch-routemap/3", "routes": [_dispatch_route(**over)]})
+
+
+def test_routemap_v3_route_count_cap():
+    routes = [_dispatch_route(policy=dict(_dispatch_route()["policy"], route="r%d" % i)) for i in range(257)]
+    with pytest.raises(PolicyError):
+        parse_routemap({"format": "levain-dispatch-routemap/3", "routes": routes})
+
+
+def test_null_ceiling_is_absent_and_written_over():
+    # complement LOW 4
+    _, _, fwd = _go("openai-chat", '{"model":"m1","messages":[],"max_tokens":null}', EO)
+    assert json.loads(fwd)["max_tokens"] == EO.default_output and "max_completion_tokens" not in json.loads(fwd)
+    got = _go("openai-chat", '{"model":"m1","messages":[],"max_tokens":null,"max_completion_tokens":null}', EO)
+    fwd = json.loads(got[2])
+    assert fwd["max_completion_tokens"] == EO.default_output and fwd.get("max_tokens") is None and "max_tokens" not in fwd
+
+
+def test_price_is_hashable_and_per_use_immutable():
+    # complement LOW 5
+    assert hash(EA) == hash(parse_price("EA", EA_RAW)) and {EA, EO}
+    with pytest.raises(TypeError):
+        EA.per_use["web_search"] = 1
+
+
+def test_every_unbounded_field_has_a_disabled_by_row():
+    assert {f for c in codec.CODECS.values() for f in c.unbounded_fields} == set(codec._DISABLED_BY)

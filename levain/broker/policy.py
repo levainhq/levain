@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import re
 import socket
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import Mapping, Optional, Pattern
 
 from levain.broker import norm
@@ -257,8 +258,12 @@ class Price:
     default_output: int
     overhead_tokens: int
     image_tokens: int
-    per_use: Mapping[str, int]
+    #: tool name -> microdollars per use, read-only; left out of the hash (a Price hashes on its rates and source).
+    per_use: Mapping[str, int] = field(hash=False)
     source: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "per_use", MappingProxyType(dict(self.per_use)))
 
 
 def _price_int(where: str, key: str, v: object, *, positive: bool) -> int:
@@ -324,6 +329,9 @@ def parse_base_map(doc: object) -> dict:
             rest = {k: v for k, v in entry.items() if k != "prices"}
             pol = parse_route(rest, source="base", per_call=False)
             if pol.type == "brokered":
+                if pol.body_codec == "none":
+                    # a priced route is metered, and `none` has no codec to parse or estimate the body with
+                    raise PolicyError(f"route {pol.route}: a base /2 brokered route needs a body_codec")
                 if "prices" not in entry:
                     raise PolicyError(f"route {pol.route}: a base /2 brokered route needs prices")
                 pol = replace(pol, prices=parse_prices(pol.route, entry["prices"]))
@@ -354,10 +362,17 @@ _ROUTEMAP_ROUTE_KEYS = frozenset({"policy", "provider", "models", "body_policy",
 def parse_routemap(body: object) -> list:
     """The BODY of a `routemap` config item at `levain-dispatch-routemap/3` = `/2` (1019-dispatch/SCHEMAS.md §1b)
     + `price` per model − `max_call_microdollars`. Signature, store and generation are CONTROL's (3c-4); this reads
-    the body. The frozen `/2` is not read here: a `/2` body is refused (`format`)."""
+    the body. The frozen `/2` is not read here: a `/2` body is refused (`format`). `/2`'s own checks (the text rule on
+    each text field, a body_policy value is text or a list of text, the entry caps) are `/2`'s validators in
+    `levain.dispatch.routemap_rules`, called here, then the price on each model."""
+    # imported here, not at the top: only the routemap reader needs the text rule, and the front never reads a routemap.
+    from levain.dispatch import routemap_rules as rules
     if not isinstance(body, dict) or set(body) != {"format", "routes"} or body["format"] != ROUTEMAP_FORMAT \
             or not isinstance(body["routes"], list):
         raise PolicyError(f"a routemap body is exactly {{format: {ROUTEMAP_FORMAT}, routes: [..]}}")
+    problem = rules.routes_count_problem(body["routes"])
+    if problem is not None:
+        raise PolicyError(problem)
     out: list[DispatchRoute] = []
     seen: set[str] = set()
     for r in body["routes"]:
@@ -368,21 +383,24 @@ def parse_routemap(body: object) -> list:
             raise PolicyError(f"route {pol.route}: named twice")
         seen.add(pol.route)
         for name in ("provider", "retention_claim"):
-            if not isinstance(r[name], str) or not r[name]:
-                raise PolicyError(f"route {pol.route}: {name} must be a non-empty string")
-        if not isinstance(r["body_policy"], dict):
-            raise PolicyError(f"route {pol.route}: body_policy must be an object")
+            problem = rules.text_problem(r[name], f"a route's {name}")
+            if problem is not None:
+                raise PolicyError(f"route {pol.route}: {problem}")
+        problem = rules.body_policy_problem(pol.route, r["body_policy"]) or rules.models_count_problem(pol.route, r["models"])
+        if problem is not None:
+            raise PolicyError(problem)
         models = r["models"]
-        if not isinstance(models, list) or not models:
-            raise PolicyError(f"route {pol.route}: models is a non-empty list")
         prices: dict[str, Price] = {}
         backends: dict[str, str] = {}
         for m in models:
             if not isinstance(m, dict) or set(m) != {"requested", "backend", "price"}:
                 raise PolicyError(f"route {pol.route}: a model is exactly requested, backend, price")
             req, back = m["requested"], m["backend"]
-            for v in (req, back):
-                if not isinstance(v, str) or not _MODEL_ID.match(v):
+            for name, v in (("requested", req), ("backend", back)):
+                problem = rules.text_problem(v, f"a model's {name}")
+                if problem is not None:
+                    raise PolicyError(f"route {pol.route}: {problem}")
+                if not _MODEL_ID.match(v):
                     raise PolicyError(f"route {pol.route}: model id {v!r}")
             if req in prices:
                 raise PolicyError(f"route {pol.route}: model {req} named twice")
