@@ -886,6 +886,20 @@ def test_send_gate_write_mark_sent_order():
     assert not [c for st in nxt.finalbody for c in _calls_in(st, "end")]
 
 
+def test_budget_stopped_is_reread_right_before_the_admit():
+    # R4 §10 (3c-2a): `_check_request` and `_admit_hold` are plain functions (no `await` can sit between the re-read
+    # and the admit), and in `_admit_hold` the statement right before the `try:` that calls `self.ledger.admit` is the
+    # `budget_stopped` check.
+    defs = dict(_defs(_tree()))
+    for name in ("Keys._check_request", "Keys._admit_hold"):
+        assert isinstance(defs[name], ast.FunctionDef), name
+    body = defs["Keys._admit_hold"].body
+    at = [i for i, st in enumerate(body) if isinstance(st, ast.Try) and _calls_in(st, "admit")]
+    assert len(at) == 1 and at[0] > 0
+    check = body[at[0] - 1]
+    assert isinstance(check, ast.If) and "budget_stopped" in ast.dump(check.test)
+
+
 def test_unmetered_is_gone():
     # T16: the unmetered seam and its names are gone from levain/ and tests/; no keys or CONTROL unit is installed
     # before 3c-9 (levain/slot/services/ holds neither)

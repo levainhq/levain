@@ -1718,8 +1718,8 @@ class Keys:
         """The ledger's synchronous admit of `estimate` (R4 §1.2's estimate, never shrunk: a hold that does not fit the
         room is `budget-exhausted`) against the route's per-session cap, scope ("session-route", session, route);
         `price_ref` is the priced model. The session's `budget-stopped` flag is read again as the statement right
-        before the admit, with no `await` since `_check_q` read it, because the body read can take up to
-        `body_read_s` in between. The ledger's own errors become refusals: `budget-exhausted` (402), and
+        before the admit (no `await` between the two), because the body read after `_check_q`'s read can take up
+        to `body_read_s`. The ledger's own errors become refusals: `budget-exhausted` (402), and
         `keys-unavailable` (503) for an unhealthy or closing ledger and, noted, for a misuse."""
         if self.ledger is None:
             raise norm.Refused("budget-exhausted", "no ledger")
