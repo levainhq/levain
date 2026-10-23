@@ -6,7 +6,16 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
-## [0.11.18] — 2026-10-22
+## [0.11.19] — 2026-10-23
+
+This release carries the changes prepared as 0.11.17 and 0.11.18, which were never published, and everything merged since.
+
+### Security
+- **A phone passkey enrolled at a custody other than `passkey` skipped the passkey checks (0.11.1 to 0.11.16; upgrade to fix).**
+  Levain chose a key's checks by its stored custody, so such a passkey's signatures were taken without Face ID or the PIN,
+  from any page origin, and, enrolled as a `laptop-presence` key at custody `fido`, at the laptop's rank. Levain now judges a key
+  by its key material and refuses that enrolment. A key an older release enrolled this way is quarantined: the log still loads,
+  the key signs nothing new, and `levain doctor` names the revoke and re-enrol commands.
 
 ### Added
 - **Notes: an agent can send you a reply that needs no answer.** Through the band's tools an agent files a note: one
@@ -16,7 +25,75 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   (100 in total, and 25 per agent session when the session is known). The cockpit and phone show the oldest notes
   first and say how many they are not showing.
 
-### Groundwork for isolation (no `levain` subcommand calls these yet)
+- **Standing grants can be revoked from the phone, and the cockpit page gives you the revoke line.** The phone page has a
+  Grants tab. Each card shows the grant's tools, state, agent, workspace and expiry, what it answered, and its newest
+  calls with refused ones first; a grant with a refused call leads the list. "revoke with passkey" shows the exact line
+  that will be signed, and Face ID is asked only when you tap the sheet's own button. It reports the outcome in the
+  server's words, and says "result unknown" when the answer never arrived after the signature was sent. The cockpit page
+  has a matching card per grant beside the rule proposals, with a "revoke" button that copies the exact
+  `levain consent grant revoke` line to run in a terminal: that page signs nothing.
+- **`levain cockpit anchor reset --signing-key KEY` moves the authority log's anchor after a restore on purpose.** The
+  anchor refuses a log that was rolled back; the refusal used to print this command, which did not exist. `KEY` is a
+  `laptop-presence` key the log holds unrevoked (a private key file, or the `.pub` of a key an agent holds) and it may
+  ask for a touch. The command signs the old anchor and the new head and keeps the signature in the anchor file. It
+  refuses while a cockpit server holds the store, refuses an anchor that names another store (the refusal names the file
+  to check), and leaves an anchor that already agrees with the log alone. Every key or grant that the rolled-back links
+  held is gone from the log.
+- **Drop to the coordinator from your phone.** The phone page has a Drop tab: type your words and send them, as
+  `levain drop` does. The drop goes into an outbox on the phone first and is resent unchanged until the server answers,
+  so a lost reply files it once; a refused drop stays marked, with "Send again" and "Discard". Under "with an envelope"
+  you set where it may work, a branch to land onto, a stop time and a budget, review the server's own words for it, and
+  sign it with your passkey. A land made from the phone is marked "inferred, not where you dropped from" in what you
+  sign and in what `levain envelope` shows. A drop made from one Levain is never sent to another: the page shows "from
+  another Levain" with Discard only. A signed drop is never stored unsigned: a stale or widened one is refused, and the
+  card offers "Sign again" or "Send as a plain drop". Only a paired device can use these routes; the run token cannot.
+  An accepted drop wakes the coordinator, and the receipt says whether it started.
+  - Known edges: a browser without Web Locks edits the outbox unlocked, so two tabs can overwrite each other's change;
+    the page says "one tab at a time" there.
+- **The coordinator reads your agents' questions first.** `levain coord questions` lists the questions you have not
+  read, each marked MAY ANSWER (asked by a worker Levain started under a live envelope, from inside a repo it names,
+  with no option tied to a consent request) or ESCALATE. `levain coord answer N --option KEY --token N` (or `--text
+  WORDS`) files the coordinator's answer as a KNOW in your review queue. The asking session gets it labelled as the
+  coordinator's own reading, and the question stays open: your answer is the one that counts. `levain question answer`
+  refuses a session Levain started as the coordinator. `levain coord escalate N --why WHY --token N` leaves a question
+  to you. While a coordinator holds a live lease, `levain ask` holds its ping to you until the coordinator escalates the
+  question or has not read it in 10 minutes.
+  - Known edges: "asked from inside the envelope" is a label, not proof, because a question's directory and session are
+    the asking process's own word. A KNOW reaches a live session at its next tool call only. An answer or revocation
+    that lands between the coordinator's last re-read and its commit still files a KNOW; it grants nothing and waits in
+    your queue.
+- **The coordinator carries a morning card, an away switch and thread budgets.** `levain coord morning` prints what
+  waits for you after a night away: whether away is on, what waits UNDECIDED, each thread's budget, what waits on you,
+  and the open review items. `levain coord away DROP --token N` reads a drop as your word that you are away and turns
+  away ON for both agents, so every SIGN waits for the card; only you can turn it off. `levain coord budget [THREAD]`
+  shows each thread's budget against what its worker sessions used (tool calls, tokens and hours; dollars are not
+  metered). Once a budget is crossed no new worker starts for that thread. A worker that holds several threads is
+  refused, because no one budget could meter it. `levain envelope extend THREAD --budget K=N,...` writes the body that
+  raises a thread's budget; keys you leave out keep the current value, a named value may not be below it, and at least
+  one must be higher. You sign it with `levain envelope sign`; nothing else extends a budget.
+- **A team's entries need a touch.** A new team refuses file keys: an entry counts only if its commit is signed by a
+  FIDO key (`ssh-keygen -t ecdsa-sk` or `-t ed25519-sk`, a security key or Touch ID) with the user-presence flag set,
+  which Levain checks itself. `levain team record` refuses a file key or an ssh-agent key before it writes anything.
+  An entry that does not count is not in force, `levain team verify` reports it, and `levain team sync` holds it back
+  with the entries that depend on it and publishes the rest; run in a terminal, `sync` names each held entry and asks
+  one touch for it. The owner can allow file keys at the start (`levain team init --allow-file-keys`) or later with
+  `levain team file-keys allow`, which needs a touch while the team refuses them; `levain team file-keys refuse` takes it
+  back. A team made before this rule keeps working as it did, and `levain team record`, `status` and `doctor` say it has
+  not chosen until its owner runs `levain team file-keys refuse` (recommended) or `allow`. An entry counted without
+  presence is shown as `file key, no presence`.
+
+### Changed
+- **`levain doctor` and `levain cockpit keys` name a quarantined key.** `doctor` fails once per quarantined key, with its
+  fingerprint, why, and the commands to run with this cockpit's `--data-root` filled in: for a phone key, revoke it and
+  enrol a fresh passkey at custody `passkey`; for another class, enrol a replacement at its real custody first, then
+  revoke. A revoked key stays revoked, so the same key cannot be enrolled again. If every `laptop-presence` key is
+  quarantined, `doctor` fails and says no in-product recovery exists in this build. `levain cockpit keys` marks the row
+  `QUARANTINED`. A quarantined key is not counted as a `laptop-presence` key that can sign.
+- **`levain envelope echo --budget` must name every key the budget gauge measures** (`tool_calls`, `tokens`, `hours`). A
+  key left out used to read as 0, and 0 stops the first worker. Name a key with `K=0` to mean none; `dollars_cents` may
+  still be left out.
+
+### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
 - **The install helper can set and remove a credential.** `set-credential <name>` takes the credential on stdin and
   checks it before the install lock is taken or anything is written; `remove-credential <name>` removes it. Each write
   runs in a child that has dropped to the keys service's own account (`_levain_keys`) before it touches the
@@ -24,7 +101,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   lock. If the file is in place but its directory entry cannot be synced, the write succeeds with a warning that a
   crash may undo it (a removal warns that the credential may come back). The command gives up after 30 seconds,
   stops the child and refuses `credential-child-timeout`. The keys service uses a new credential on its next exchange,
-  and has its own one-thread writer for the token refresh that comes later; nothing calls that writer yet.
+  and the token refresh below writes through its own one-thread writer.
 - **The keys service refreshes an expiring sign-in token.** Before an exchange goes upstream, an access token that
   expires within 60 seconds waits for its refresh. An expired one is refused as `credential-unavailable` and is never
   sent. A 401 from the vendor starts a refresh. The request that got the 401 is answered `credential-unavailable`: the
@@ -33,7 +110,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   refresh writes through the credential writer above, and a credential the operator replaced during a refresh is kept.
 - **The installed tree moves to versioned generations.** Setup installs levain's root-owned code as one content-addressed
   generation behind a single `current` link. It records the install's shape so a later repair can plan the upgrade of
-  an existing install. The `repair` verb that will use this plan is not built yet.
+  an existing install. The install helper's `repair` (below) uses this plan; no `levain` command runs it yet.
 - **The keys service carries a websocket.** A route that permits an upgrade now gets one. The keys service checks the
   client's handshake itself and asks the vendor to upgrade. It accepts the vendor's 101 only when it is HTTP/1.1 with the
   right accept value, no extensions, and a subprotocol the route can relay back. It then relays frames both ways under one
@@ -42,6 +119,22 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   not caught. A masked, reserved-bit or reserved-opcode frame from the vendor, or one with an invalid length, also
   closes it. Nothing calls this path yet. The isolation layer that will route a client through it is still groundwork,
   and its design runs Codex with websockets off for 1.0.
+- **The phone can file and sign cockpit writes, but no page offers it yet.** `POST /cockpit/verb` (the laptop's verb
+  body plus the signing passkey's `fingerprint`), `GET /cockpit/pending/<id>` and `POST /cockpit/pending/<id>/signature`
+  and `.../cancel` take a write for a short list of device verbs (spore edits). Every write is a pending that applies
+  only once the passkey's signature verifies, through the same dispatch and broker as the laptop's. A paired device's
+  credential is required; the phone page's signing hook is in place and nothing calls it. The phone's write waits as
+  `standby` while the laptop's `levain serve --write` holds the write lock.
+- **The coordinator's review queue exists.** It holds the three review modes, a KNOW filed with its reply in one
+  transaction, a push record per SIGN or ANSWER, and feeds (no-split, dead seats, near-limit envelopes, end of work, the
+  weekly digest). Only `levain coord morning` reads it, for what waits on you and the open items; nothing yet runs the feeds.
+- **The install helper's `repair` and `undo` are rebuilt on per-identity removal.** `repair` stages a new generation,
+  probes it, and hands both locks to it by `exec`, and resumes a staged generation after a crash. `undo` removes each
+  recorded item by its identity in a fixed order and retires no group id twice. Neither is reachable from a `levain`
+  subcommand.
+- **Session adopt's later stages are built as library code.** The sealed export run (its image, run leaf, watchdog and
+  one outcome classifier), the publish that exchanges the result tree in atomically, a root verification verb with a
+  bounded `git fsck` output reader, and a tree reader. Nothing calls them from `levain adopt` yet.
 
 ### Fixed
 - **The isolation install helper no longer refuses on a service that is still unloading.** This happened in `undo` right
@@ -50,6 +143,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   A job counts as absent only on launchd's "no such service" answer. Any other answer, or a `launchctl print`
   that hangs past its time limit, counts as "could not be checked", and the step refuses rather than carrying on with a root
   service possibly still loaded.
+- **The remedies Levain prints for an uninitialised cockpit are complete commands.** The refusals that told you to run
+  `levain cockpit ledger init`, the default-grant offer, and the "next:" line `levain cockpit key create` prints now name
+  `--signing-key` and `--data-root` with the real paths, shell-quoted. Where the install has no cockpit journal yet, no
+  complete command exists to print: `key create` says to start the cockpit (`levain serve --write --install-class
+  reported`), open it once, and then run the init, and the default-grant offer names the init and its two flags,
+  instead of printing a command that could only fail. The printed `levain consent` phone help now names
+  `levain dispatch file --dispatch-dir`, which is the real flag.
 
 ## [0.11.16] — 2026-10-22
 
