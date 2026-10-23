@@ -336,7 +336,7 @@ def test_aclose_finalizes_live_holds(tmp_path, monkeypatch):
         p = await Owner(led).start()                   # PENDING: its line is behind a gated flush
         await until(ctl.entered.is_set)
         g.hold.release()                               # RESOLVING at aclose
-        # a straggler still inside a gated release_exchange when aclose runs
+        # a straggler: its hold RESERVED and its exchange still running (awaiting `straggle`) when aclose runs
         straggle = asyncio.Event()
         st_hold = []
 

@@ -60,21 +60,24 @@ def wait_thread(cond: Callable[[], bool], timeout: float = 5.0) -> None:
 
 
 class _Gate(threading.Event):
-    """The flush gate. Closing it also clears `entered`, so a wait on `entered` after `gate.clear()` waits for a flush
-    that starts after the clear, never one that ran before it."""
+    """The flush gate. `mu` makes closing it and a flush's arrival at it atomic with each other: `clear()` resets
+    `entered` and closes the gate in one step, and a flush decides under the same lock whether it must wait, setting
+    `entered` only then. So `entered` after `gate.clear()` always means a flush is waiting at this closed gate."""
 
     def __init__(self, entered: threading.Event) -> None:
         super().__init__()
         self._entered = entered
+        self.mu = threading.Lock()
 
     def clear(self) -> None:
-        self._entered.clear()
-        super().clear()
+        with self.mu:
+            self._entered.clear()
+            super().clear()
 
 
 class FlushCtl:
     """Replaces `ledger._flush` after open: each call is recorded, may wait on a gate, sleep, or raise a scripted
-    error, then runs the real flush. `entered` is set by the first flush call since the gate last closed."""
+    error, then runs the real flush. `entered` is set by a flush that reaches the gate while it is closed."""
 
     def __init__(self) -> None:
         self.real = L._flush
@@ -91,8 +94,12 @@ class FlushCtl:
         with self.lock:
             self.calls += 1
             err = self.errors.pop(0) if self.errors else None
-        self.entered.set()
-        self.gate.wait(30)
+        with self.gate.mu:
+            blocked = not self.gate.is_set()
+            if blocked:
+                self.entered.set()
+        if blocked:
+            self.gate.wait(30)
         if self.delay:
             time.sleep(self.delay)
         if err is not None:
