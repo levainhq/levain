@@ -564,6 +564,26 @@ def main(argv: list[str] | None = None) -> int:
                          help="Drop every listed key not named by --confirm.")
     _ck_common(ck_init)
     ck_init.set_defaults(func=_cmd_cockpit_ledger_init)
+    ck_anchor = ck_sub.add_parser("anchor", help="The authority log's anchor, the rollback backstop.")
+    ck_anchor_sub = ck_anchor.add_subparsers(dest="anchor_cmd", required=True)
+    ck_reset = ck_anchor_sub.add_parser(
+        "reset",
+        help="Move the anchor to the log's head, after a restore on purpose or an unreadable anchor.",
+        description=(
+            "The anchor records the authority log's head, so a log rolled back (a restored backup, a truncated "
+            "store) refuses to open. When the operator restored it on purpose, or the anchor file is unreadable, "
+            "this moves the anchor to the log as it stands now: --signing-key (a laptop-presence key the log "
+            "itself holds unrevoked at its head; it may ask for a touch) signs the old anchor and the new head, "
+            "and the signature is kept in the anchor file. Every key or grant the rolled-back links held is "
+            "gone from the log. Refused while a cockpit server holds the store: stop it first. An anchor that "
+            "already agrees with the log is left alone and nothing is signed."
+        ),
+    )
+    ck_reset.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                          help="A laptop-presence key the log holds unrevoked (its private key file, or the .pub "
+                               "of a key an agent holds).")
+    _ck_common(ck_reset)
+    ck_reset.set_defaults(func=_cmd_cockpit_anchor_reset)
 
     cs_p = subparsers.add_parser(
         "consent",
@@ -2227,6 +2247,30 @@ def _cmd_cockpit_revoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_cockpit_anchor_reset(args: argparse.Namespace) -> int:
+    from levain.authority import RESET_NAMESPACE
+    from levain.cockpit.keys import anchor_reset, ssh_signer
+
+    try:
+        signer_fp, sign = ssh_signer(args.signing_key, namespace=RESET_NAMESPACE)
+        old, new = anchor_reset(_cockpit_root(args), signer_fp=signer_fp, sign=sign)
+    except KeyboardInterrupt:
+        print("anchor reset cancelled", file=sys.stderr)
+        return 1
+    except _cockpit_refusals() as exc:
+        print(f"anchor reset refused: {exc}", file=sys.stderr)
+        return 1
+    if new is None:
+        print("nothing to reset: " + ("there is no anchor yet (the next signed act writes it)" if old is None else
+                                      f"the log stands at or ahead of its anchor (seq {old['seq']})"))
+        return 0
+    was = ("no anchor" if old is None else f"an unreadable anchor (sha256 {old['sha256'][:12]})" if "sha256" in old
+           else f"store {old['store_id']} at seq {old['seq']}")
+    print(f"anchor reset: store {new.store_id} at seq {new.seq} ({new.head_hash[:12]}), was {was}; signed by "
+          f"{signer_fp}")
+    return 0
+
+
 def _cmd_cockpit_policy_raise(args: argparse.Namespace) -> int:
     from levain.cockpit.keys import policy_raise, ssh_signer
 
@@ -2514,7 +2558,7 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
                           help=f"The loopback port (default {_phone_port_default()}).")
     cs_phone.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
                           help=queue_help + " Dispatch jobs are read from the same directory: file them with "
-                          "`levain dispatch --dispatch-dir` set to it.")
+                          "`levain dispatch file --dispatch-dir` set to it.")
     cs_phone.add_argument("--sign-namespace", dest="sign_namespaces", action="append", default=None,
                           type=_sign_namespace, metavar="NS",
                           help="Also list the sign requests filed in the queue's sign/ directory in namespace NS "

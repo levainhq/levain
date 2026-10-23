@@ -1829,9 +1829,10 @@ def append(conn: sqlite3.Connection, link: UnsignedLink, signature: str, *, now:
         if anchor is not None:
             current = read_anchor(anchor)
             if state is None and current is not None:
+                # not a reset: an empty log holds no key a reset could verify against (verify_anchor_reset)
                 raise AnchorError(f"the authority log is empty but its anchor names store {current.store_id} at "
                                   f"seq {current.seq}; a new genesis here would fork it. If this store was "
-                                  f"emptied on purpose, run {_RESET_HINT}")
+                                  f"emptied on purpose, move {anchor} aside, then run `levain cockpit ledger init`")
             if state is not None:
                 check_anchor(state, current)
         head = (0, "") if state is None else (state.seq, state.head_hash)
@@ -1891,7 +1892,10 @@ class Anchor:
         return {"store_id": self.store_id, "seq": self.seq, "head_hash": self.head_hash}
 
 
-_RESET_HINT = "`levain cockpit anchor reset`"
+# the remedy every anchor refusal prints: the argv `levain cockpit anchor reset` parses (levain.cli), so a test can
+# run it (tests/test_cockpit_anchor_reset.py)
+_RESET_HINT = ("`levain cockpit anchor reset --signing-key <an enrolled laptop-presence key>` (with the install's "
+               "--path or --data-root)")
 
 
 def anchor_path(data_root: Path | str) -> Path:
@@ -2062,7 +2066,10 @@ def _no_live_cockpit(path: Path) -> Iterator[None]:
     for: a server still holding the abandoned store could advance the anchor back onto it."""
     from levain.cockpit.broker import LOCK_NAME
     lock = Path(path).parent.parent / LOCK_NAME
-    fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    except OSError as exc:            # a read-only or missing data root: a refusal, not a traceback (S3a-2 MUST)
+        raise AnchorError(f"the store lock {lock} cannot be opened ({type(exc).__name__}); a reset needs it") from None
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

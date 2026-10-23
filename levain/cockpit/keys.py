@@ -31,7 +31,7 @@ import struct
 import subprocess
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -46,7 +46,8 @@ from levain.cockpit.install import REPORTED, marker_path, marker_present, marker
 if TYPE_CHECKING:
     from levain.cockpit.verbs import VerbRegistry
 
-__all__ = ["KEY_CLASSES", "InitPlan", "InitResult", "KeyError_", "KeyRow", "LegacyRow", "Signer", "enroll", "keys",
+__all__ = ["KEY_CLASSES", "InitPlan", "InitResult", "KeyError_", "KeyRow", "LegacyRow", "Signer", "anchor_reset",
+           "enroll", "keys",
            "fingerprint_of", "init_plan", "ledger_init", "normalise_public_key", "policy_raise", "principal_of", "revoke",
            "signing_public_key", "ssh_signer"]
 
@@ -330,6 +331,58 @@ def keys(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAU
     rows = sorted(auth.authority.keys.values(), key=lambda k: k.enrolled_seq)
     held = {k.fingerprint: why for k, why in auth.authority.quarantined_keys()}
     return [_row(k, held.get(k.fingerprint)) for k in rows], auth.authority_error
+
+
+# ---------------------------------------------------------------------------------------------------
+# `levain cockpit anchor reset` (DESIGN §3.8)
+
+
+def anchor_reset(data_root: Path | str, *, signer_fp: str, sign: Signer, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+                 marker_directory: Path | None = None) -> tuple[Mapping[str, Any] | None, _authority.Anchor | None]:
+    """Move the anchor to the log's head on a laptop-presence signature over ``{store_id, old_anchor, new_head}``
+    (namespace ``levain-authority-reset``; ``sign`` must sign in it), verified against the log's OWN keys as of
+    that head (:func:`levain.authority.reset_anchor`, which stores the proof in the anchor file). Returns
+    ``(old_anchor, new)``; ``new`` is None, and nothing is signed, when the anchor is absent or already agrees
+    with the log. The log is replayed in full with a fresh cache: this is the trust decision, so no chain this
+    process verified earlier stands in for it. The signer's class and a live cockpit server are checked before
+    the signature too, so those refusals spend no touch; the custody rule and the signature itself are judged
+    after it, by :func:`levain.authority.verify_anchor_reset`."""
+    db = _journal(data_root, marker_directory=marker_directory)
+    path = anchor_path(db.data_root)
+    with db.read() as conn:
+        # anchor=None: the log as it stands, which the anchor is about to be judged against, not by
+        auth = RequestAuthority.capture(conn, now=datetime.now(timezone.utc), anchor=None, source=str(db.path),
+                                        cache=_authority.ReplayCache(), ssh_keygen=ssh_keygen)
+        _check_reported(conn)
+    if auth.authority is None:
+        if auth.log_empty:
+            raise KeyError_(f"the authority log is empty, so it holds no key a reset can verify against; if this "
+                            f"store was emptied on purpose, move {path} aside, then run `levain cockpit ledger init`")
+        raise KeyError_(str(auth.authority_error))
+    snap = auth.authority
+    try:
+        current = _authority.read_anchor(path)
+        # absent, at the head, or behind it: the next open or append writes or advances it, so nothing to reset
+        _authority.check_anchor(snap, current)
+        return (None if current is None else current.as_dict()), None
+    except AnchorError:
+        pass                                    # unreadable, or the log is behind it: the case a reset is for
+    key = snap.key(signer_fp)
+    if key is None or not key.active:
+        raise KeyError_(f"{signer_fp} is not an unrevoked key of this log at seq {snap.seq} (nothing signed)")
+    if key.key_class != LAPTOP:
+        raise KeyError_(f"an anchor reset needs a {LAPTOP} key, not {key.key_class} (nothing signed)")
+    with _authority._no_live_cockpit(path):
+        pass                                    # checked again, under the lock, by reset_anchor
+    old = _authority._old_anchor_view(path)
+    signature = sign(_authority.reset_message(snap.store_id, old, snap.seq, snap.head_hash))
+    try:
+        new = _authority.reset_anchor(path, snap, signer_fp=signer_fp, signature=signature, ssh_keygen=ssh_keygen)
+    except VerifierUnavailable:
+        raise
+    except AuthorityError as exc:
+        raise KeyError_(str(exc)) from None
+    return old, new
 
 
 # ---------------------------------------------------------------------------------------------------
