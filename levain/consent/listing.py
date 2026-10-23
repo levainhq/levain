@@ -287,12 +287,26 @@ def read_grant_evidence(directory: Path | str | None, grants: "list[tuple[str, i
     conn = _open_ro(directory) if wanted_grants else None
     if conn is None:
         return out
+    from levain.consent.ledger import DB_NAME as LEDGER_DB
+
     base = Path(directory) if directory is not None else _default_dir()
+    ledger_path = base / LEDGER_DB
+    ledger_attached = False
     try:
+        if ledger_path.is_file():
+            # ATTACH is refused inside a transaction: it comes first, read-only, so the queue and the ledger are then
+            # read in the ONE transaction below (one snapshot: a count and a row can never disagree)
+            try:
+                conn.execute("ATTACH DATABASE ? AS l", (ledger_path.resolve().as_uri() + "?mode=ro",))
+                ledger_attached = True
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc) and "busy" not in str(exc):
+                    raise
         conn.execute("BEGIN")
         _check_format(conn)
         match = ("via = 'grant' AND state = 'allowed' AND json_extract(answer, '$.grant_id') = ? "
                  "AND json_extract(answer, '$.grant_seq') = ? AND json_extract(answer, '$.grant_hash') = ?")
+        links: dict[str, tuple[int, str]] = {}
         for gid, seq, link_hash in wanted_grants:
             n, last = conn.execute(f"SELECT COUNT(*), MAX(decided_at) FROM requests WHERE {match}",
                                    (gid, seq, link_hash)).fetchone()
@@ -304,23 +318,20 @@ def read_grant_evidence(directory: Path | str | None, grants: "list[tuple[str, i
             out[gid] = {"count": int(n), "last_at": last or "",
                         "recent": [{"request_id": rid, "at": at, "tool": tool, "cwd": cwd, "outcome": "unknown"}
                                    for rid, at, tool, cwd in calls], "refused_count": 0}
+            links[gid] = (seq, link_hash)        # the same iteration as ``out``: count and refusals name ONE instance
+        if out and ledger_attached:
+            try:
+                _read_ledger_into(conn, out, links)
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc) and "busy" not in str(exc):
+                    raise
+                for g in out.values():           # a ledger still locked after the short wait: no outcome, none refused
+                    g["refused_count"] = 0
+                    for c in g["recent"]:
+                        c["outcome"] = "unknown"
         conn.execute("COMMIT")
     finally:
         conn.close()
-    if out:
-        from levain.consent.ledger import request_outcomes
-
-        # the newest ``recent`` calls only (bounded by ``recent`` per grant): their outcomes decorate the rows
-        shown = [c["request_id"] for g in out.values() for c in g["recent"]]
-        outcomes = request_outcomes(base, shown) if shown else {}
-        for g in out.values():
-            for c in g["recent"]:
-                c["outcome"] = outcomes.get(c["request_id"], "unknown")
-        # the refusals are counted over the WHOLE instance by the database, one aggregate per grant: no request id
-        # of the instance is ever brought into Python (requests are never deleted, so that set only grows)
-        refused = _refused_counts(base, {gid: (seq, h) for gid, seq, h in wanted_grants if gid in out}, match)
-        for gid, g in out.items():
-            g["refused_count"] = refused.get(gid, 0)
     return out
 
 
@@ -330,42 +341,50 @@ def _default_dir() -> Path:
     return default_queue_dir()
 
 
-def _refused_counts(base: Path, links: "dict[str, tuple[int, str]]", match: str) -> dict[str, int]:
-    """``{grant id: how many of the requests its instance answered the authority ledger reads as refused}``, one
-    aggregate query per grant over the ledger with the queue attached read-only (``match`` is the instance's
-    request filter, the same text the caller counted with). Same rules as
-    :func:`levain.consent.ledger.request_outcomes`: no ledger is no outcome (zero), a ledger still locked after a
-    short wait answers zero, a ledger of another format raises :class:`~levain.consent.ledger.LedgerStoreError`.
-    A request counts once however many ledger rows name it."""
-    from levain.consent.ledger import _PER_CALL, DB_NAME as LEDGER_DB, STORE_FORMAT as LEDGER_FORMAT, LedgerStoreError
-    from levain.consent.queue import DB_NAME
+def _read_ledger_into(conn: sqlite3.Connection, out: "dict[str, dict[str, Any]]",
+                      links: "dict[str, tuple[int, str]]") -> None:
+    """Fill the outcomes of the shown rows and every grant's ``refused_count`` from the ledger attached as ``l`` to
+    ``conn``, inside the caller's one read transaction (the queue rows were read in it). A ledger of another format
+    raises :class:`~levain.consent.ledger.LedgerStoreError` (the same check as
+    :func:`levain.consent.ledger.request_outcomes`). ``calls`` below is unqualified on purpose: the per-call view
+    text names it bare and only the attached ledger has that table.
+    The refusal count is ONE grouped query over the requests of the listed grants only, joined per request to the
+    ledger's per-call ``pre`` rows (the refused ones are collected once, not rescanned per request). A request counts refused if ANY of its ``pre`` rows reads refused: a deliberate
+    choice [judged by m17 fix3 lane, 2026-10-22, against the old last-row-wins dict, which was arbitrary here], and
+    it counts once however many rows name it."""
+    from levain.consent.ledger import _PER_CALL, STORE_FORMAT as LEDGER_FORMAT, LedgerStoreError
 
-    path = base / LEDGER_DB
-    if not links or not path.is_file():
-        return {}
-    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=0.25)
-    try:
-        conn.execute("ATTACH DATABASE ? AS q", ((base / DB_NAME).resolve().as_uri() + "?mode=ro",))
-        conn.execute("BEGIN")
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        fmt = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if "meta" in tables else None
-        if fmt is None or fmt[0] != LEDGER_FORMAT or "calls" not in tables or "outcome" not in {
-                r[1] for r in conn.execute("PRAGMA table_info(calls)")}:
-            raise LedgerStoreError(f"store format {None if fmt is None else fmt[0]!r} is not {LEDGER_FORMAT!r}")
-        out: dict[str, int] = {}
-        # ``match`` names bare columns: they resolve against q.requests because only the attached queue has one
-        sql = (f"SELECT COUNT(*) FROM q.requests WHERE {match} AND id IN "
-               f"(SELECT request_id FROM {_PER_CALL} WHERE phase = 'pre' AND outcome = 'refused')")
-        for gid, (seq, link_hash) in links.items():
-            out[gid] = int(conn.execute(sql, (gid, seq, link_hash)).fetchone()[0])
-        conn.execute("COMMIT")
-        return out
-    except sqlite3.OperationalError as exc:
-        if "locked" in str(exc) or "busy" in str(exc):
-            return {}
-        raise
-    finally:
-        conn.close()
+    tables = {r[0] for r in conn.execute("SELECT name FROM l.sqlite_master WHERE type = 'table'")}
+    fmt = conn.execute("SELECT value FROM l.meta WHERE key = 'format'").fetchone() if "meta" in tables else None
+    if fmt is None or fmt[0] != LEDGER_FORMAT or "calls" not in tables or "outcome" not in {
+            r[1] for r in conn.execute("PRAGMA l.table_info(calls)")}:
+        raise LedgerStoreError(f"store format {None if fmt is None else fmt[0]!r} is not {LEDGER_FORMAT!r}")
+    shown = sorted({c["request_id"] for g in out.values() for c in g["recent"]})
+    outcomes: dict[str, str] = {}
+    for i in range(0, len(shown), 500):          # bounded by ``recent`` per grant
+        chunk = shown[i:i + 500]
+        outcomes.update(conn.execute(
+            f"SELECT request_id, outcome FROM {_PER_CALL} WHERE phase = 'pre' AND request_id IN "
+            f"({', '.join('?' for _ in chunk)})", chunk).fetchall())
+    for g in out.values():
+        for c in g["recent"]:
+            c["outcome"] = outcomes.get(c["request_id"], "unknown")
+    instances = sorted({(gid, seq, h) for gid, (seq, h) in links.items()})
+    for i in range(0, len(instances), 200):
+        chunk = instances[i:i + 200]
+        params = [v for inst in chunk for v in inst]
+        rows = conn.execute(
+            "SELECT json_extract(r.answer, '$.grant_id'), json_extract(r.answer, '$.grant_seq'), "
+            "json_extract(r.answer, '$.grant_hash'), COUNT(*) FROM requests r "
+            f"JOIN (SELECT DISTINCT request_id FROM {_PER_CALL} WHERE phase = 'pre' AND outcome = 'refused') f "
+            "ON f.request_id = r.id "
+            "WHERE r.via = 'grant' AND r.state = 'allowed' AND (json_extract(r.answer, '$.grant_id'), "
+            "json_extract(r.answer, '$.grant_seq'), json_extract(r.answer, '$.grant_hash')) IN (VALUES "
+            + ", ".join("(?, ?, ?)" for _ in chunk) + ") GROUP BY 1, 2, 3", params).fetchall()
+        got = {(gid, seq, h): int(n) for gid, seq, h, n in rows}
+        for gid, g in out.items():
+            seq, h = links[gid]
+            g["refused_count"] = got.get((gid, seq, h), g["refused_count"])
 
 
 def _open_ro(directory: Path | str | None) -> sqlite3.Connection | None:

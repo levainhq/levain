@@ -123,17 +123,63 @@ def test_the_count_stays_one_query_at_scale(world):
         dt = time.perf_counter() - t0
     finally:
         listing.sqlite3 = _s
-    refused_queries = [s for s in seen if "COUNT(*) FROM q.requests" in s]
+    refused_queries = [s for s in seen if "GROUP BY 1, 2, 3" in s]
     assert len(refused_queries) == 1
     assert not any(s.strip().startswith("SELECT id FROM requests") for s in seen)     # the id list is never read
     gid = link[0][0]
     assert got[gid]["count"] == 6 + n and len(got[gid]["recent"]) == 5
     assert got[gid]["refused_count"] == 2 + n // 4
-    t1 = time.perf_counter()
     assert got[gid]["refused_count"] == _oracle(world.qdir, *link[0])
-    old = time.perf_counter() - t1
     assert dt < 10
-    Path("/Users/phillipclapham/Briefcase/levain/project_memory/1022-18/m17/fix2_timing.txt").write_text(
-        f"{n + 6} requests answered by one grant, refused_count only\n"
-        f"before (per-id materialize + chunked IN, the oracle above): {old:.3f}s\n"
-        f"after (read_grant_evidence whole, one aggregate): {dt:.3f}s, count queries: {len(refused_queries)}\n")
+
+
+def test_two_links_of_one_grant_id_count_the_instance_they_list(world):
+    """Complement LOW 3: the same gid listed under two (seq, hash) links. ``count`` and ``refused_count`` must name the
+    SAME instance: the one that answered, never the last link listed."""
+    _grant(world, "cg-0000000000aa", "Write")
+    for i in range(4):
+        _answered(world, "Write", f"w{i}.txt", "refused" if i < 3 else "accepted")
+    (_, seq, h), = _links(world.qdir, ["cg-0000000000aa"]).values()
+    # sorted() puts (gid, seq+1, ...) after the real link: the dead link is the last one listed
+    got = read_grant_evidence(world.qdir, [("cg-0000000000aa", seq, h), ("cg-0000000000aa", seq + 1, "dead")])
+    assert got["cg-0000000000aa"]["count"] == 4 and got["cg-0000000000aa"]["refused_count"] == 3
+
+
+def test_refused_never_exceeds_count_when_an_answer_lands_between_reads(world):
+    """Codex MED: a grant answer landing after the count was read must not reach the refusal count. The seam answers a
+    new refused call right after the instance's count query ran; one snapshot keeps count and refusals together."""
+    _grant(world, "cg-0000000000aa", "Write")
+    for i in range(3):
+        _answered(world, "Write", f"w{i}.txt", "refused")
+    links = list(_links(world.qdir, ["cg-0000000000aa"]).values())
+    import levain.consent.listing as listing
+    real = sqlite3.connect
+    fired: list[int] = []
+
+    class _Seam:
+        def __init__(self, c): self._c = c
+        def execute(self, sql, *a):
+            r = self._c.execute(sql, *a)
+            if "COUNT(*), MAX(decided_at)" in sql and not fired:
+                fired.append(1)
+                r = r.fetchall()
+                _answered(world, "Write", "late.txt", "refused")
+                return iter(r) if False else _Rows(r)
+            return r
+        def __getattr__(self, k): return getattr(self._c, k)
+
+    class _Rows(list):
+        def fetchone(self): return self[0] if self else None
+        def fetchall(self): return list(self)
+
+    listing.sqlite3 = type("S", (), {"connect": staticmethod(lambda *a, **k: _Seam(real(*a, **k))),
+                                     "OperationalError": sqlite3.OperationalError, "Connection": sqlite3.Connection,
+                                     "Error": sqlite3.Error})
+    try:
+        got = read_grant_evidence(world.qdir, links)
+    finally:
+        listing.sqlite3 = sqlite3
+    assert fired
+    g = got["cg-0000000000aa"]
+    assert g["count"] == 3 and g["refused_count"] <= g["count"]
+    assert g["refused_count"] == 3
