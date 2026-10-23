@@ -25,6 +25,7 @@ from levain.consent.ledger import Ledger
 from levain.consent import policy
 from levain.consent.queue import ConsentQueue, authority_source
 from levain.phone_server import make_phone_server
+from tests.test_cockpit_flip_parity import _drive as _page_drive, needs_browser
 from tests.test_grant_phone import ORIGIN, RP, _now, world  # noqa: F401  (world is a fixture)
 
 HERE = Path(__file__).resolve().parent
@@ -88,6 +89,84 @@ def test_the_grants_tab_shows_refused_first_and_signs_only_the_link_it_showed():
     n = got["nosigner"]
     assert n["disabled"] is True and any("localhost" in t for t in n["notes"]), n
     assert got["empty"]["cards"] == 0 and "no standing grants" in got["empty"]["status"], got["empty"]
+
+
+@needs_node
+def test_the_l3_r1_fixes_hold_on_the_grants_tab():
+    """M17 L3 r1 M-1, M-3..M-9. Each scenario reproduced its finding on 7ae3def0's phone.js
+    (``node tests/_phone_grants_drive.js <7ae3def0 phone.js> scripted``, saved as m17/fix/red_drive_on_7ae3def0.json):
+    bound/noprev signed (webauthn 1, the revoke posted); viewMid/viewSheet kept the sheet and held the list; failRead
+    kept the old status and enabled buttons; noToken left the status empty; refusedCount neither led nor flagged OLD;
+    badRaw threw InvalidCharacterError out of the tap and left the sheet up; notes carried the old note to the new
+    instance; cancelKeep forgot the mapping; nullCred said "result unknown"."""
+    got = _drive("scripted")
+    # M-1: Face ID is asked for the challenge the page recomputed from the line it shows, and nothing else
+    c = got["ceremony"]
+    assert c["challenge"] == c["want"] and c["webauthn"] == 1, c
+    for name, why in (("bound", "not over the link it shows"), ("noprev", "which log head")):
+        b = got[name]
+        assert b["webauthn"] == 0 and not b["faceId"] and b["posts"] == ["/grant/cg-bbbbbbbbbbbb/revoke-challenge"], b
+        assert any(why in t and "nothing was signed" in t for t in b["notes"]), b
+    # M-3: leaving the view while the challenge is in flight, or with the sheet up, drops the ask and frees the list
+    assert got["viewMid"] == {"sheet": 0, "webauthn": 0, "moved": True, "posts": 1}, got["viewMid"]
+    assert got["viewSheet"] == {"up": 1, "sheet": 0, "webauthn": 0, "moved": True}, got["viewSheet"]
+    # M-4: a failed read is said on the Grants tab and turns revoke off until a good read; no token is said too
+    f = got["failRead"]
+    assert f["before"] is False and f["after"] is False and f["during"]["disabled"] is True, f
+    assert f["during"]["status"].startswith("the grants could not be read: this page's token is needed"), f
+    assert "no token" in got["noToken"]["status"] and got["noToken"]["gets"] == 0, got["noToken"]
+    # M-5: the server's count flags and orders a grant whose refusals are older than the calls it sends
+    r = got["refusedCount"]
+    assert r["order"] == ["cg-aaaaaaaaaaaa", "cg-cccccccccccc"] and r["demote"] is True, r
+    assert "1 with a refused call" in r["status"] and "2 refused, 2 of them older than the calls below" in r["text"], r
+    # M-6: a credential id that does not decode: the sheet goes, nothing is put to the passkey, the list moves again
+    k = got["badRaw"]
+    assert k["threw"] == "" and k["sheet"] == 0 and k["webauthn"] == 0 and k["moved"], k
+    assert k["posts"] == ["/grant/cg-bbbbbbbbbbbb/revoke-challenge"] and "nothing was signed" in k["notes"][0], k
+    # M-7: the note said about one instance is not carried to the grant made again under the same id
+    assert got["notes"]["first"][0].startswith("not revoked") and got["notes"]["renewed"] == [""], got["notes"]
+    # M-8: a cancelled Face ID keeps this browser's passkey mapping
+    fp = "SHA256:phonekeyphonekeyphonekeyphonekeyphonekey0"
+    assert got["cancelKeep"]["mapping"] == {fp: "cmF3aWQ"}, got["cancelKeep"]
+    assert "nothing was revoked" in got["cancelKeep"]["notes"][0], got["cancelKeep"]
+    # M-9: a passkey that gives nothing: nothing is sent, and the page says nothing was revoked (not "unknown")
+    n = got["nullCred"]
+    assert n["posts"] == ["/grant/cg-bbbbbbbbbbbb/revoke-challenge"] and "nothing was revoked" in n["notes"][0], n
+    assert not n["notes"][0].startswith("result unknown"), n
+
+
+_SHEET = "document.querySelectorAll('#grants-list .sheet').length"
+
+
+@needs_browser
+def test_a_tab_switch_in_the_phone_app_drops_an_open_revoke_sheet(world, tmp_path):
+    """M17 L3 r1 M-3, through the real tabs (phone_app.js's show) in headless Chrome against a real phone port.
+    Reproduced red on 7ae3def0's phone.js + phone_app.js: after the Board tap the sheet was still in the hidden
+    Grants view (1), and back on Grants the card's revoke button was still disabled (the list held)."""
+    _grant(world, "cg-0000000000aa", "Write")
+    httpd = make_phone_server(world.qdir, RP, port=0, token=_TOK, dispatch_dir=world.qdir)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        url = f"http://127.0.0.1:{httpd.server_address[1]}/?view=grants#phone_token={_TOK}"
+        out = _page_drive(tmp_path, url, [
+            {"until": "document.querySelectorAll('#grants-list article').length === 1"},
+            {"eval": "document.querySelector('#grants-list article .deny').click(), 1"},
+            {"until": "!!document.querySelector('#grants-list .sheet pre.line')"},
+            {"eval": "document.querySelector('#tabs button[data-view=\"board\"]').click(), 1"},
+            {"eval": f"new Promise(r => setTimeout(() => r({_SHEET}), 300))"},
+            {"eval": "document.querySelector('#tabs button[data-view=\"grants\"]').click(), 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(document.querySelector('#grants-list article .deny').disabled), 2500))"},
+        ])
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)
+    sheet_after_leave, button_disabled = out["values"][-3], out["values"][-1]
+    assert sheet_after_leave == 0 and button_disabled is False, out["values"]
+    # nothing was signed: the only write was the challenge
+    assert [p for p in out["posts"] if "/grant/" in str(p)] and all("revoke-challenge" in str(p)
+                                                                    for p in out["posts"] if "/grant/" in str(p)), out
 
 
 def _grant(world, gid: str, tool: str) -> None:

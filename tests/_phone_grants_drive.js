@@ -77,7 +77,7 @@ function page(fetchImpl, opts) {
   const window = { isSecureContext: true, PublicKeyCredential: function () {}, localStorage: memStore(),
                    sessionStorage: memStore(), addEventListener() {} };
   window.window = window;
-  window.sessionStorage.setItem("levain-phone-token", opts.token || "T");
+  if (opts.token !== null) window.sessionStorage.setItem("levain-phone-token", opts.token || "T");
   if (opts.mine) window.localStorage.setItem("levain-passkeys:" + opts.rpId, JSON.stringify(opts.mine));
   const fetch = (route, init) => {
     if ((init && init.method) === "POST") log.posts.push([route, JSON.parse(init.body)]);
@@ -87,13 +87,14 @@ function page(fetchImpl, opts) {
   const timers = [];
   const ctx = { window, navigator, fetch, document, location: { hash: "", hostname: opts.rpId, pathname: "/" },
                 history: { replaceState() {} }, setInterval: () => 0, setTimeout: (fn, ms) => { timers.push(setTimeout(fn, Math.min(ms, 50))); return 0; },
-                btoa, atob, Uint8Array, JSON, Promise, Array, Object, Number, String, Map, Date, isNaN, encodeURIComponent };
+                btoa, atob, Uint8Array, JSON, Promise, Array, Object, Number, String, Map, Set, Date, isNaN, encodeURIComponent,
+                crypto: globalThis.crypto, TextEncoder };
   vm.createContext(ctx);
   vm.runInContext(src, ctx);
   const cards = () => byId["grants-list"].children;
   const card = (id) => cards().find((c) => c.dataset.grant === id) || null;
   const button = (root, re) => root.querySelectorAll("button").find((b) => re.test(b.textContent)) || null;
-  return { log, byId, document, cards, card, button, timers };
+  return { log, byId, document, cards, card, button, timers, window };
 }
 
 const tick = (ms) => new Promise((r) => setTimeout(r, ms || 120));
@@ -112,6 +113,15 @@ const DEMOTE = { id: "cg-bbbbbbbbbbbb", id_shown: "cg-bbbbbbbbbbbb", kind: "cons
                  expires_at: "2026-10-30T12:00:00.000000+00:00", link_seq: 4, instance: "4:bbbb", signers: [FP],
                  answered: { count: 7, last_at: "2026-10-22T15:00:00.000000+00:00",
                              recent: [call(5, "Edit", "accepted"), call(4, "Write", "refused"), call(3, "Edit", "unknown")] } };
+const sshStr = (b) => { const n = Buffer.alloc(4); n.writeUInt32BE(b.length); return Buffer.concat([n, b]); };
+const CHAL = (prev, line) => Buffer.concat([Buffer.from("SSHSIG"), sshStr(Buffer.from("levain-authority")), sshStr(Buffer.alloc(0)),
+                                            sshStr(Buffer.from("sha512")),
+                                            sshStr(crypto.createHash("sha512").update(prev + "\n" + line).digest())])
+  .toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const PREV = "9f".repeat(32);
+// a revoke-challenge reply as the server sends it: the line, the head it chains to and the challenge over both
+const REPLY = (gid, extra) => Object.assign({ grant_id: gid, rp_id: "phone.example", signer_fp: FP, line: LINE(gid), prev_hash: PREV,
+                                              challenge: CHAL(PREV, LINE(gid)) }, extra || {});
 const LINE = (gid) => JSON.stringify({ at: "2026-10-22T20:00:00.000000Z", format: 1, grant_id: gid, op: "revoke_grant", seq: 9, store_id: "s" });
 
 function scriptedFetch(listing, answers) {
@@ -146,8 +156,7 @@ async function scripted() {
   // the ceremony: the challenge names the instance shown, the link is shown BEFORE any passkey prompt, and only the
   // sheet's own tap asks for Face ID; the revoke sends the assertion and nothing else
   {
-    const ans = { challenge: (route, b) => ok(200, { grant_id: DEMOTE.id, rp_id: "phone.example", signer_fp: b.signer_fp,
-                                                     line: LINE(DEMOTE.id), challenge: "AAEC" }),
+    const ans = { challenge: (route, b) => ok(200, REPLY(DEMOTE.id, { signer_fp: b.signer_fp })),
                   revoke: () => ok(200, { revoked: DEMOTE.id, seq: 9, warning: "" }) };
     const p = page(scriptedFetch(listing([QUIET, DEMOTE]), ans), Object.assign({ webauthn: fakeCred }, base));
     await tick();
@@ -163,13 +172,15 @@ async function scripted() {
     p.button(c, /Face ID/).click();
     await tick();
     out.ceremony = { shownBefore, heldStill, posts: p.log.posts, webauthn: p.log.webauthn.length,
+                     challenge: p.log.webauthn[0] ? Buffer.from(p.log.webauthn[0].challenge).toString("base64").replace(/\+/g, "-")
+                       .replace(/\//g, "_").replace(/=+$/, "") : "", want: CHAL(PREV, LINE(DEMOTE.id)),
                      allow: p.log.webauthn[0] ? (p.log.webauthn[0].allowCredentials || []).length : -1,
                      uv: p.log.webauthn[0] ? p.log.webauthn[0].userVerification : "", rpId: p.log.webauthn[0] ? p.log.webauthn[0].rpId : "",
                      notes: notesOf(p.card(DEMOTE.id)), status: read(p.byId["grants-status"]) };
   }
   // a link that does not name this grant is never put to the passkey
   {
-    const ans = { challenge: () => ok(200, { grant_id: DEMOTE.id, rp_id: "phone.example", line: LINE("cg-other"), challenge: "AAEC" }),
+    const ans = { challenge: () => ok(200, REPLY(DEMOTE.id, { line: LINE("cg-other"), challenge: CHAL(PREV, LINE("cg-other")) })),
                   revoke: () => ok(200, {}) };
     const p = page(scriptedFetch(listing([DEMOTE]), ans), Object.assign({ webauthn: fakeCred }, base));
     await tick();
@@ -180,7 +191,7 @@ async function scripted() {
   }
   // the server's own refusal of the signed revoke (the log moved) is shown as its words: nothing was revoked
   {
-    const ans = { challenge: () => ok(200, { grant_id: DEMOTE.id, rp_id: "phone.example", line: LINE(DEMOTE.id), challenge: "AAEC" }),
+    const ans = { challenge: () => ok(200, REPLY(DEMOTE.id)),
                   revoke: () => ok(409, { error: "stale", message: "the authority log moved since this revoke was asked for: revoke again" }) };
     const p = page(scriptedFetch(listing([DEMOTE]), ans), Object.assign({ webauthn: fakeCred }, base));
     await tick();
@@ -192,7 +203,7 @@ async function scripted() {
   }
   // a reply that is not the server's refusal (no reply, a 5xx) after the signature was sent: not knowable, said so
   {
-    const ans = { challenge: () => ok(200, { grant_id: DEMOTE.id, rp_id: "phone.example", line: LINE(DEMOTE.id), challenge: "AAEC" }),
+    const ans = { challenge: () => ok(200, REPLY(DEMOTE.id)),
                   revoke: () => ok(502, {}) };
     const p = page(scriptedFetch(listing([DEMOTE]), ans), Object.assign({ webauthn: fakeCred }, base));
     await tick();
@@ -204,7 +215,7 @@ async function scripted() {
   }
   // cancel at the sheet: no passkey prompt, no revoke sent, and the list moves again
   {
-    const ans = { challenge: () => ok(200, { grant_id: DEMOTE.id, rp_id: "phone.example", line: LINE(DEMOTE.id), challenge: "AAEC" }),
+    const ans = { challenge: () => ok(200, REPLY(DEMOTE.id)),
                   revoke: () => ok(200, {}) };
     const p = page(scriptedFetch(listing([DEMOTE]), ans), Object.assign({ webauthn: fakeCred }, base));
     await tick();
@@ -219,7 +230,7 @@ async function scripted() {
   }
   // the page put away with the sheet up dismisses it (it would otherwise hold every consent card still)
   {
-    const ans = { challenge: () => ok(200, { grant_id: DEMOTE.id, rp_id: "phone.example", line: LINE(DEMOTE.id), challenge: "AAEC" }),
+    const ans = { challenge: () => ok(200, REPLY(DEMOTE.id)),
                   revoke: () => ok(200, {}) };
     const p = page(scriptedFetch(listing([DEMOTE]), ans), Object.assign({ webauthn: fakeCred }, base));
     await tick();
@@ -245,6 +256,138 @@ async function scripted() {
     const p = page(scriptedFetch(listing([]), {}), Object.assign({ webauthn: fakeCred }, base));
     await tick();
     out.empty = { status: read(p.byId["grants-status"]), cards: p.cards().length };
+  }
+  // ---- L3 r1 (M-1, M-3..M-9): each scenario reproduced one finding on 7ae3def0's phone.js ----------------------------
+  const flush = async () => { await tick(); await tick(); };
+  const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
+  const leave = (p, v) => { if (typeof p.window.levainViewChanged === "function") p.window.levainViewChanged(v); };
+  // M-1: a line for this grant, a challenge over ANOTHER line: the shown line is not what Face ID would sign, so the page
+  // refuses before any prompt. A reply without the head the line chains to cannot be checked, so it is refused too
+  for (const [name, reply] of [["bound", REPLY(DEMOTE.id, { challenge: CHAL(PREV, LINE("cg-other")) })],
+                               ["noprev", REPLY(DEMOTE.id, { prev_hash: undefined })]]) {
+    const ans = { challenge: () => ok(200, reply), revoke: () => ok(200, { revoked: DEMOTE.id, seq: 9, warning: "" }) };
+    const p = page(scriptedFetch(listing([DEMOTE]), ans), Object.assign({ webauthn: fakeCred }, base));
+    await tick();
+    p.button(p.card(DEMOTE.id), /revoke with passkey/i).click();
+    await flush();
+    const faceId = !!p.button(p.card(DEMOTE.id), /Face ID/);
+    if (faceId) { p.button(p.card(DEMOTE.id), /Face ID/).click(); await flush(); }
+    out[name] = { faceId, webauthn: p.log.webauthn.length, posts: p.log.posts.map((x) => x[0]), notes: notesOf(p.card(DEMOTE.id)) };
+  }
+  // M-3: the view changed while the challenge was in flight, then while the sheet was up: the ask is dropped, nothing is
+  // signed, and the list moves again (busy released)
+  {
+    const d = deferred();
+    const ans = { challenge: () => d.promise, revoke: () => ok(200, {}) };
+    const p = page(scriptedFetch(listing([DEMOTE]), ans), Object.assign({ webauthn: fakeCred }, base));
+    await tick();
+    p.button(p.card(DEMOTE.id), /revoke with passkey/i).click();
+    await tick();
+    leave(p, "board");
+    d.resolve(ok(200, REPLY(DEMOTE.id)));
+    await flush();
+    const gets = p.log.gets;
+    p.byId.refresh.click();
+    await tick();
+    out.viewMid = { sheet: p.card(DEMOTE.id) ? p.card(DEMOTE.id).querySelectorAll("pre.line").length : -1,
+                    webauthn: p.log.webauthn.length, moved: p.log.gets > gets, posts: p.log.posts.length };
+  }
+  {
+    const ans = { challenge: () => ok(200, REPLY(DEMOTE.id)), revoke: () => ok(200, {}) };
+    const p = page(scriptedFetch(listing([DEMOTE]), ans), Object.assign({ webauthn: fakeCred }, base));
+    await tick();
+    p.button(p.card(DEMOTE.id), /revoke with passkey/i).click();
+    await flush();
+    const up = p.card(DEMOTE.id).querySelectorAll("pre.line").length;
+    leave(p, "board");
+    const gets = p.log.gets;
+    p.byId.refresh.click();
+    await tick();
+    out.viewSheet = { up, sheet: p.card(DEMOTE.id) ? p.card(DEMOTE.id).querySelectorAll("pre.line").length : -1,
+                      webauthn: p.log.webauthn.length, moved: p.log.gets > gets };
+  }
+  // M-4: a read that fails after a good one (a revoked device token: 403) says so on the Grants tab and turns its revoke
+  // buttons off until a read succeeds; a page with no token says it on the Grants tab too
+  {
+    let fail = false;
+    const fetchImpl = (route, init) => (route === "/consent.json" && fail ? ok(403, { message: "this page's token is needed" })
+                                                                         : scriptedFetch(listing([DEMOTE]), {})(route, init));
+    const p = page(fetchImpl, Object.assign({ webauthn: fakeCred }, base));
+    await tick();
+    const before = p.button(p.card(DEMOTE.id), /revoke with passkey/i).disabled;
+    fail = true;
+    p.byId.refresh.click();
+    await tick();
+    const c = p.card(DEMOTE.id);
+    const during = { status: read(p.byId["grants-status"]), disabled: c ? p.button(c, /revoke with passkey/i).disabled : null };
+    fail = false;
+    p.byId.refresh.click();
+    await tick();
+    out.failRead = { before, during, after: p.button(p.card(DEMOTE.id), /revoke with passkey/i).disabled };
+  }
+  {
+    const p = page(scriptedFetch(listing([DEMOTE]), {}), Object.assign({ webauthn: fakeCred, token: null }, base));
+    await tick();
+    out.noToken = { status: read(p.byId["grants-status"]), gets: p.log.gets };
+  }
+  // M-5: a refusal older than the calls the server sends still leads the list and is said on the card
+  {
+    // PLAIN answered nothing refused; OLD's two refusals are older than its two newest (accepted) calls
+    const PLAIN = Object.assign({}, QUIET, { id: "cg-cccccccccccc", id_shown: "cg-cccccccccccc",
+                                             answered: Object.assign({}, QUIET.answered, { refused_count: 0 }) });
+    const OLD = Object.assign({}, QUIET, { answered: Object.assign({}, QUIET.answered, { count: 9, refused_count: 2 }) });
+    const p = page(scriptedFetch(listing([PLAIN, OLD]), {}), Object.assign({ webauthn: fakeCred }, base));
+    await tick();
+    out.refusedCount = { order: p.cards().map((c) => c.dataset.grant), status: read(p.byId["grants-status"]),
+                         text: read(p.card(QUIET.id)), demote: p.card(QUIET.id).classList.contains("demote") };
+  }
+  // M-6: a stored credential id that does not decode throws at the Face ID tap: the sheet goes, nothing is signed, the
+  // list moves again
+  {
+    const ans = { challenge: () => ok(200, REPLY(DEMOTE.id)), revoke: () => ok(200, {}) };
+    const p = page(scriptedFetch(listing([DEMOTE]), ans), Object.assign({}, base, { webauthn: fakeCred, mine: { [FP]: "%" } }));
+    await tick();
+    p.button(p.card(DEMOTE.id), /revoke with passkey/i).click();
+    await flush();
+    let threw = "";
+    try { p.button(p.card(DEMOTE.id), /Face ID/).click(); } catch (e) { threw = String((e && e.name) || e); }
+    await flush();
+    const gets = p.log.gets;
+    p.byId.refresh.click();
+    await tick();
+    out.badRaw = { threw, sheet: p.card(DEMOTE.id).querySelectorAll("pre.line").length, webauthn: p.log.webauthn.length,
+                   posts: p.log.posts.map((x) => x[0]), notes: notesOf(p.card(DEMOTE.id)), moved: p.log.gets > gets };
+  }
+  // M-7: a note belongs to the grant INSTANCE it was said on: the same id made again (a new instance) starts clean
+  {
+    let shown = listing([DEMOTE]);
+    const ans = { challenge: () => ok(409, { error: "grant_changed", message: "the grant was renewed; nothing was signed" }),
+                  revoke: () => ok(200, {}) };
+    const fetchImpl = (route, init) => scriptedFetch(shown, ans)(route, init);
+    const p = page(fetchImpl, Object.assign({ webauthn: fakeCred }, base));
+    await tick();
+    p.button(p.card(DEMOTE.id), /revoke with passkey/i).click();
+    await flush();
+    const first = notesOf(p.card(DEMOTE.id));
+    shown = listing([Object.assign({}, DEMOTE, { instance: "11:cccc" })]);
+    p.byId.refresh.click();
+    await flush();
+    await tick(1700);                                     // past the re-read after the outcome
+    out.notes = { first, renewed: notesOf(p.card(DEMOTE.id)) };
+  }
+  // M-8: a cancelled Face ID (NotAllowedError, what a cancel and a missing key both raise) keeps this browser's mapping
+  // M-9: a passkey that resolves with nothing sends nothing and says nothing was revoked
+  for (const [name, webauthn] of [["cancelKeep", () => Promise.reject(Object.assign(new Error("cancel"), { name: "NotAllowedError" }))],
+                                  ["nullCred", () => Promise.resolve(null)]]) {
+    const ans = { challenge: () => ok(200, REPLY(DEMOTE.id)), revoke: () => ok(200, { revoked: DEMOTE.id, seq: 9, warning: "" }) };
+    const p = page(scriptedFetch(listing([DEMOTE]), ans), Object.assign({ webauthn }, base));
+    await tick();
+    p.button(p.card(DEMOTE.id), /revoke with passkey/i).click();
+    await flush();
+    p.button(p.card(DEMOTE.id), /Face ID/).click();
+    await flush();
+    out[name] = { mapping: JSON.parse(p.window.localStorage.getItem("levain-passkeys:phone.example") || "{}"),
+                  posts: p.log.posts.map((x) => x[0]), notes: notesOf(p.card(DEMOTE.id)) };
   }
   return out;
 }
