@@ -38,7 +38,9 @@ ENTRY_MODULES = {"install-helper": "levain.slot.install_helper", "runtime-helper
                  # s5 §5b (head ruling 1022+19 Q4): the importer's entry, the argv[0] wall.export_launch_spec builds
                  # (HELPER_DIR/export-importer). export-verifier joins with its module (5d-i).
                  "export-importer": "levain.slot.importer"}
-HELPER_MODULES = {k: v for k, v in ENTRY_MODULES.items() if k != "service-entry"}
+#: The sudo helpers only: the service's boot entry and an export target's entry are not helpers (head ruling
+#: 1022+19 session-1 Q2). ``export-verifier`` joins this exclusion when it joins ENTRY_MODULES (5d-i).
+HELPER_MODULES = {k: v for k, v in ENTRY_MODULES.items() if k not in ("service-entry", "export-importer")}
 
 
 #: The one link in the import tree (row 33, DESIGN 1022-8/upgrade §2.3): ``<tree>/current -> gen-<id>``, a RELATIVE

@@ -2090,14 +2090,18 @@ def export_rlimits(image_bytes: int, cpu_s: float = V7_SECONDS) -> Tuple[Tuple[i
             (resource.RLIMIT_CPU, int(cpu_s)))
 
 
-def apply_rlimits(limits: Sequence[Tuple[int, int]]) -> None:
+def apply_rlimits(limits: Sequence[Tuple[int, int]], *, getrlimit: Optional[Callable] = None,
+                  setrlimit: Optional[Callable] = None) -> None:
     """Each limit as soft AND hard, never above the hard limit already in force (lowering a hard limit needs no
-    privilege; raising one would fail EPERM for a non-root caller and is never wanted)."""
+    privilege; raising one would fail EPERM for a non-root caller and is never wanted). ``getrlimit`` /
+    ``setrlimit``: the ``resource`` module's (a seam log stands in for them in a unit row)."""
     import resource
+    get = getrlimit or resource.getrlimit
+    put = setrlimit or resource.setrlimit
     for res, want in limits:
-        _soft, hard = resource.getrlimit(res)
+        _soft, hard = get(res)
         v = want if hard == resource.RLIM_INFINITY or hard < 0 else min(want, hard)
-        resource.setrlimit(res, (v, v))
+        put(res, (v, v))
 
 
 @dataclass(frozen=True)

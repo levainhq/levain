@@ -1461,6 +1461,12 @@ def stage_main(spec_fd: int = SPEC_FD, os_calls: Optional[OsCalls] = None, *, er
     spec = None
     try:
         spec = parse_spec(c.read_fd(spec_fd, SPEC_CAP))
+        if spec.target in EXPORT_TARGETS and sys.platform.startswith("linux"):
+            # s5 §5b A6 (head ruling 1022+19 Q2): a fresh session keyring, joined while still root and proved,
+            # between the spec and the drop (a step the docstring's order list does not name yet: one wall hunk). The real keyctl only on the real path (no os_calls); an injected OsCalls carries its
+            # own ``keyctl`` or the join refuses: no path skips it.
+            from levain.slot.keyring_join import join_session_keyring, real_keyctl
+            join_session_keyring(real_keyctl if os_calls is None else getattr(c, "keyctl", None))
         drop_and_assert(spec.uid, spec.gid, spec.groups, nproc=spec.nproc, os_calls=c,
                         clear_inheritable=spec.target in EXPORT_TARGETS)
         set_no_new_privs(c)
