@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -149,7 +150,8 @@ def _sources() -> list[Path]:
     return [p for p in PKG.rglob("*.py") if "templates" not in p.relative_to(PKG).parts]
 
 
-def _spawn_problems(path: Path, root: Path = ROOT) -> list[str]:
+def _spawn_problems(path: Path, root: Path = ROOT, sites: dict | None = None,
+                    matched: Counter | None = None) -> list[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"))
     out = []
     for node in ast.walk(tree):
@@ -188,7 +190,8 @@ def _spawn_problems(path: Path, root: Path = ROOT) -> list[str]:
                 out.append(problem)
         elif key[0] == "os" and key[1] in _ENV_EXEC and path.name != "launch.py":
             out.append(f"{where} os.{key[1]}: only levain/launch.py re-executes")
-    return out + _alias_problems(tree, path.relative_to(root))
+    return out + _alias_problems(tree, path.relative_to(root), _PASS_THROUGH if sites is None else sites,
+                                 Counter() if matched is None else matched)
 
 
 # Where the env argument sits in the env-taking exec family: a fixed positional index, or (for the `l`
@@ -197,15 +200,29 @@ _ENV_AT = {"execve": 2, "execvpe": 2, "posix_spawn": 2, "posix_spawnp": 2, "spaw
 _ENV_LAST_AFTER = {"execle": 2, "execlpe": 2, "spawnle": 3, "spawnlpe": 3}
 
 
-def _env_problem(call: ast.Call, what: str, name: str = "") -> str | None:
+# The named pass-through sites: (module, function, the name it calls, the env expression it passes) -> why.
+# Each must match exactly ONE call across the package (test_every_child_..., and the self-test for a miss).
+_PASS_THROUGH = {
+    ("levain/slot/wall.py", "trampoline_main", "execve", "os.environb if environ is None else environ"):
+        "the macOS last hop, run by the Seatbelt launcher after the profile: its env IS the one the stage "
+        "built explicitly, because its caller execs it with an explicit env",
+}
+
+
+def _env_arg(call: ast.Call, name: str = "") -> ast.AST | None:
     env = next((k.value for k in call.keywords if k.arg == "env"), None)
-    if env is None and name in _ENV_EXEC:
-        if any(isinstance(a, ast.Starred) for a in call.args):
-            return f"{what} with a starred argument: the scan cannot find its env"
+    if env is None and name in _ENV_EXEC and not any(isinstance(a, ast.Starred) for a in call.args):
         if name in _ENV_AT and len(call.args) > _ENV_AT[name]:
             env = call.args[_ENV_AT[name]]
         elif name in _ENV_LAST_AFTER and len(call.args) > _ENV_LAST_AFTER[name]:
             env = call.args[-1]
+    return env
+
+
+def _env_problem(call: ast.Call, what: str, name: str = "") -> str | None:
+    env = _env_arg(call, name)
+    if env is None and name in _ENV_EXEC and any(isinstance(a, ast.Starred) for a in call.args):
+        return f"{what} with a starred argument: the scan cannot find its env"
     if env is None:
         return f"{what} without env="
     if ast.unparse(env) == "None" or "os.environ" in ast.unparse(env):
@@ -213,7 +230,7 @@ def _env_problem(call: ast.Call, what: str, name: str = "") -> str | None:
     return None
 
 
-def _alias_problems(tree: ast.Module, rel: Path) -> list[str]:
+def _alias_problems(tree: ast.Module, rel: Path, sites: dict, matched: Counter) -> list[str]:
     """Spawners held as a VALUE (`run: Run = subprocess.run`, `run = run or subprocess.run`,
     `(run or subprocess.run)(...)`): the scan above sees only `subprocess.run(...)`, so it follows the
     alias instead. Every call through it must pass env (`env=`, or the env-taking exec family's own positional
@@ -238,6 +255,7 @@ def _alias_problems(tree: ast.Module, rel: Path) -> list[str]:
 
     funcs = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
     out: list[str] = []
+    fields: list[tuple[str, str, str]] = []   # class-body `name: T = os.execve` (field, what it holds, spawner)
     todo: list[tuple[ast.AST, str, str, str]] = []   # (scope, alias name, what it holds, the spawner's name)
     for n in ast.walk(tree):
         if not (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)) or id(n) in annotations:
@@ -265,6 +283,9 @@ def _alias_problems(tree: ast.Module, rel: Path) -> list[str]:
             else:
                 arg = holder.kwonlyargs[holder.kw_defaults.index(node)]
             todo.append((parent[holder], arg.arg, what, key[1]))
+        elif isinstance(holder, ast.AnnAssign) and isinstance(parent.get(holder), ast.ClassDef) \
+                and isinstance(holder.target, ast.Name) and holder.value is n:
+            fields.append((holder.target.id, what, key[1]))
         elif isinstance(holder, ast.Assign) and len(holder.targets) == 1 and isinstance(holder.targets[0], ast.Name):
             todo.append((scope_of(holder), holder.targets[0].id, what, key[1]))
         else:
@@ -282,7 +303,13 @@ def _alias_problems(tree: ast.Module, rel: Path) -> list[str]:
             if isinstance(p, ast.Call) and p.func is u:
                 problem = _env_problem(p, f"{rel}:{u.lineno} {name}(...) (holds {what})", spawner)
                 if problem:
-                    out.append(problem)
+                    env = _env_arg(p, spawner)
+                    site = (rel.as_posix(), getattr(scope_of(u), "name", ""), name,
+                            ast.unparse(env) if env is not None else "")
+                    if site in sites:
+                        matched[site] += 1
+                    else:
+                        out.append(problem)
                 continue
             q = parent.get(p) if isinstance(p, ast.BoolOp) else p
             if isinstance(q, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in q.targets):
@@ -299,11 +326,29 @@ def _alias_problems(tree: ast.Module, rel: Path) -> list[str]:
                     todo.append((callee, params[p.args.index(u)].arg, what, spawner))
                     continue
             out.append(f"{rel}:{u.lineno} `{name}` (holds {what}) used where the scan cannot follow it")
+    by_name = {f: (w, sp) for f, w, sp in reversed(fields)}   # one field name, one walk, whatever class holds it
+    for field, (what, spawner) in by_name.items():
+        # A dataclass field holding the spawner: every `<obj>.<field>(...)` in the module is a call through it.
+        for u in ast.walk(tree):
+            if not (isinstance(u, ast.Attribute) and u.attr == field and isinstance(u.ctx, ast.Load)):
+                continue
+            if isinstance(u.value, ast.Name) and u.value.id == "os":
+                continue   # the spawner itself, checked above
+            p = parent[u]
+            if isinstance(p, ast.Call) and p.func is u:
+                problem = _env_problem(p, f"{rel}:{u.lineno} .{field}(...) (holds {what})", spawner)
+                if problem:
+                    out.append(problem)
+            else:
+                out.append(f"{rel}:{u.lineno} `.{field}` (holds {what}) used where the scan cannot follow it")
     return out
 
 
 def test_every_child_levain_starts_is_given_an_explicit_environment() -> None:
-    problems = [p for src in _sources() for p in _spawn_problems(src)]
+    matched: Counter = Counter()
+    problems = [p for src in _sources() for p in _spawn_problems(src, matched=matched)]
+    problems += [f"pass-through site {site} matched {matched[site]} calls, not exactly one"
+                 for site in _PASS_THROUGH if matched[site] != 1]
     assert problems == [], "\n".join(problems)
 
 
@@ -358,6 +403,36 @@ def test_the_scan_follows_an_execve_held_as_a_value(tmp_path: Path) -> None:
     problems = _spawn_problems(bad, tmp_path)
     assert len(problems) == 6, "\n".join(problems)
     assert not any(f"bad.py:{n} " in p for n in range(14, 25) for p in problems), "\n".join(problems)
+
+
+def test_the_scan_follows_a_class_body_default_into_its_uses(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.py"
+    bad.write_text("import os\n"
+                   "class A:\n    ex: object = os.execve\n"
+                   "    def go(self):\n        self.ex('x', ['x'])\n"                 # no env: flagged
+                   "class B:\n    ok: object = os.execve\n"
+                   "    def go(self):\n        self.ok('x', ['x'], {})\n"              # env: clean
+                   "class C:\n    bare: object = os.execve\n"
+                   "    def go(self):\n        return self.bare\n")                      # unfollowable: refused
+    problems = _spawn_problems(bad, tmp_path, sites={})
+    assert len(problems) == 2, "\n".join(problems)
+    assert any("bad.py:5 " in p for p in problems) and any("bad.py:11 " in p for p in problems), problems
+
+
+def test_a_named_pass_through_site_must_match_exactly_one_call(tmp_path: Path) -> None:
+    src = ("import os\n"
+           "def hop(execve=os.execve, environ=None):\n"
+           "    execve('x', ['x'], os.environb if environ is None else environ)\n")
+    site = ("m.py", "hop", "execve", "os.environb if environ is None else environ")
+    m = tmp_path / "m.py"
+    m.write_text(src)
+    hit: Counter = Counter()
+    assert _spawn_problems(m, tmp_path, sites={site: "why"}, matched=hit) == [] and hit[site] == 1
+    miss: Counter = Counter()                      # an unnamed site is still flagged, and the table matches zero
+    assert len(_spawn_problems(m, tmp_path, sites={}, matched=miss)) == 1 and miss[site] == 0
+    m.write_text(src + src)                        # two calls match the one named site: the full scan fails on it
+    two: Counter = Counter()
+    assert _spawn_problems(m, tmp_path, sites={site: "why"}, matched=two) == [] and two[site] == 2
 
 
 # --- the console entry --------------------------------------------------------------------------
