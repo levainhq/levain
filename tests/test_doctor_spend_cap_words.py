@@ -4,17 +4,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from levain.doctor import SPEND_CAP_SIZING_LINE, SPEND_CAP_WORDS, _check_spend_cap_words
+from levain.doctor import SPEND_CAP_SIZING_LINE, SPEND_CAP_WORDS, spend_cap_note
 
 _CHANGELOG = Path(__file__).resolve().parent.parent / "CHANGELOG.md"
 
 
-def test_doctor_row_carries_both_strings_verbatim_as_info():
-    (row,) = _check_spend_cap_words()
-    assert row.ok and not row.warn and row.hint is None
-    assert SPEND_CAP_WORDS in row.detail
-    assert SPEND_CAP_SIZING_LINE in row.detail
-    assert "refused 402 before they start" in row.detail
+def test_doctor_note_carries_both_strings_verbatim_and_no_badge():
+    # The note checks nothing, so it must not look like a passing check: no OK / WARN / FAIL badge.
+    from levain import doctor
+    note = spend_cap_note()
+    assert SPEND_CAP_WORDS in note
+    assert SPEND_CAP_SIZING_LINE in note
+    assert "refused 402 before they start" in note
+    assert not any(b in note for b in (doctor._OK, doctor._WARN, doctor._FAIL))
 
 
 def test_changelog_unreleased_carries_the_same_strings():

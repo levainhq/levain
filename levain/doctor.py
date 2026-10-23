@@ -144,11 +144,11 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_compat_set(install))
     core.extend(_check_consent_hooks(install))
     core.extend(_check_consent_limits())
-    core.extend(_check_spend_cap_words())
     core.extend(_check_dispatch_adoption_rules())
     core.extend(_check_dispatch_verifiers())
     for r in core:
         _emit(r)
+    print(spend_cap_note())
 
     # Adapter detection. A hookless install (openhands) is identified by its config
     # marker (it lays down no CLAUDE.md/AGENTS.md tag-file); a hosted-harness install by
@@ -300,14 +300,15 @@ SPEND_CAP_WORDS = (
 )
 SPEND_CAP_SIZING_LINE = (
     "a route's per-session cap should be at least the concurrent calls × their output ceiling × the model's output "
-    "rate, or calls are refused 402 before they start (refuse-never-shrink, §1.3)."
+    "rate, or calls are refused 402 before they start."
 )
 
 
-def _check_spend_cap_words() -> list[CheckResult]:
-    """One INFO row under the keys/broker section: what the authorized-spend cap is and how to size it. Never a
-    WARN and never a refusal; the per-credential KEY-LIMIT rows are not here."""
-    return [CheckResult("authorized-spend cap", True, f"{SPEND_CAP_WORDS} Sizing: {SPEND_CAP_SIZING_LINE}")]
+def spend_cap_note() -> str:
+    """What the authorized-spend cap is and how to size it, printed as a NOTE after the checks: it checks nothing,
+    so it carries no OK / WARN / FAIL badge and never touches the exit code. The per-credential KEY-LIMIT rows are
+    not here."""
+    return f"  note: {SPEND_CAP_WORDS} Sizing: {SPEND_CAP_SIZING_LINE}"
 
 
 def _check_consent_limits() -> list[CheckResult]:

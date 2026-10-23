@@ -19,7 +19,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
   Levain enforces an authorized-spend cap: a route's per-session cap on what Levain lets an agent spend. It is a budget, not a ceiling on your bill. Calls already running when the cap is reached can finish past it. To put a hard ceiling on what a provider can bill, set a spending limit on the API key itself.
 
-  Sizing: a route's per-session cap should be at least the concurrent calls × their output ceiling × the model's output rate, or calls are refused 402 before they start (refuse-never-shrink, §1.3).
+  Sizing: a route's per-session cap should be at least the concurrent calls × their output ceiling × the model's output rate, or calls are refused 402 before they start.
 
 ## [0.11.20] — 2026-10-23
 
