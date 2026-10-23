@@ -1,4 +1,5 @@
-"""``levain session claude|codex --repo PATH``: the launcher in front of :mod:`levain.slot.supervisor` (CONTRACT §1
+"""``levain session claude|codex --repo PATH`` (and ``adopt|discard|restore <session>``, handed whole to
+:func:`levain.slot.adopt_view.main`): the launcher in front of :mod:`levain.slot.supervisor` (CONTRACT §1
 "interactive supervisor", §5.1 prepare's argv; BUILD_PLAN §4 row 2).
 
 :func:`main` parses the operator's words and hands one :class:`levain.slot.supervisor.Request` to the supervisor.
@@ -68,6 +69,10 @@ def main(argv: Optional[Sequence[str]] = None, *, run: Optional[Callable[[Any], 
          err: Optional[IO[str]] = None) -> int:
     err = err or sys.stderr
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("adopt", "discard", "restore"):     # §4.8: the operator's adopt verbs, no cli.py line
+        from levain.slot import adopt_view
+
+        return adopt_view.main(argv, err=err)
     try:
         req = parse(argv)
     except SystemExit as e:     # --help (usage errors raise Refused, never exit)
