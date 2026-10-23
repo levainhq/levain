@@ -350,7 +350,7 @@ def test_buffer_budget_floor_admits_one_max_size_body_per_session():
 
 @pytest.mark.parametrize("when", ["before-q", "during-body"])
 def test_budget_stopped_session_is_refused_at_both_reads(monkeypatch, when):
-    # R4 §1.4 / §10: the flag on the session's claims-cache entry (3c-2b sets it; here the test does). Set before the
+    # R4 §1.4 / §10: the session in keys' `budget_stopped` set (3c-2b adds it; here the test does). Set before the
     # `Q`: `budget-overrun` (402) at step 1, no `A`. Set while the body is being read (after step 1): the re-read
     # right before `ledger.admit` refuses it. Neither holds anything or reaches upstream.
     up = _Up()
@@ -358,9 +358,8 @@ def test_budget_stopped_session_is_refused_at_both_reads(monkeypatch, when):
     async def go(d: str) -> dict:
         st = _scripted(monkeypatch, up)
         async with _Rig(d) as rig:
-            entry = rig.k.cache[digest_of_token(TOKEN)]
             if when == "before-q":
-                entry["budget_stopped"] = True
+                rig.k.budget_stopped.add("s1")
                 rig.front.feed_data(gwwire.encode(b"B", BODY) + gwwire.encode(b"E"))
                 await asyncio.wait_for(rig.run(_q()), 5)
             else:
@@ -376,7 +375,7 @@ def test_budget_stopped_session_is_refused_at_both_reads(monkeypatch, when):
                 rig.front.feed_data(gwwire.encode(b"B", BODY[:5]))
                 task = rig.run(_q())
                 await asyncio.wait_for(entered.wait(), 5)   # step 1 passed; the body read waits for the rest
-                entry["budget_stopped"] = True
+                rig.k.budget_stopped.add("s1")
                 rig.front.feed_data(gwwire.encode(b"B", BODY[5:]) + gwwire.encode(b"E"))
                 await asyncio.wait_for(task, 5)
             out = {"frames": await rig.got(), "handshakes": st["handshakes"], "path": rig.ledger.path}

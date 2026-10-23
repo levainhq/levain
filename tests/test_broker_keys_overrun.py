@@ -1,10 +1,10 @@
 """3c-2b: an overrun (3c R4 §1.4, §8 tests 1 and 2). A settle whose reported usage costs more than its hold is charged
-in full and stops the SESSION: `budget_stopped` on its claims-cache entry, so every later `Q` of it is 402
+in full and stops the SESSION: its id enters keys' `budget_stopped` set, so every later `Q` of it is 402
 `budget-overrun`. Nothing in flight is aborted; each in-flight exchange settles from its own usage. CONTROL is not
 told and does not revoke (that wire is 3c-3).
 
 Tests 1 and 2 run keys as a real child process (`tests/b2_keys_rig.py`) against a fake upstream that reports usage;
-the in-place test runs keys in-process, where the claims-cache entry can be looked at."""
+the set's lifetime tests run keys in-process, where the set and the claims cache can be looked at."""
 from __future__ import annotations
 
 import asyncio
@@ -181,40 +181,109 @@ def test_inflight_calls_finish_after_overrun(py):
     assert out["rc"] == 0
 
 
-def test_budget_stopped_is_set_on_the_cache_entry_itself(monkeypatch):
-    # The ruling (1023-13 ii-b L3 r1 complement 5): the overrun MUTATES the session's claims-cache entry, the same
-    # dict `_check_q` and the pre-admit statement read, so it dies with the entry; a copy or a parallel set is the
-    # defect. A second `Q` on the SAME session sees it: 402 `budget-overrun`, no `A`, nothing held, no second upstream.
+def _response(usage: dict) -> bytes:
+    body = json.dumps({"type": "message", "usage": usage}).encode()
+    return b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n" % len(body) + body
+
+
+async def _overrun(s: "_Sessions", up: _Up) -> list:
+    """Session s0's first exchange, answered with usage above its hold: the session is stopped."""
+    front, task, got = await s.start(0, _q())
+    front.feed_data(gwwire.encode(b"B", BODY) + gwwire.encode(b"E"))
+    up.feed(_response(OVER))
+    up.feed(b"")
+    await asyncio.wait_for(task, 5)
+    return await got()
+
+
+async def _reregister(s: "_Sessions", reg_token: int) -> None:
+    """s0's front registers again with a greater `reg_token` (a replaced registration: `_detach` without revoke)."""
+    await s.k.front_register(s.k.admin_epoch, "s0", 70000, 1, 1, 1, reg_token)
+    await s.k.front_arm(s.k.admin_epoch, "s0", reg_token)
+    s.k.regs[70000].state = "claimed"
+
+
+def _fresh_resolves(s: "_Sessions") -> list:
+    """CONTROL's TOKEN-RESOLVE stand-in: every digest answers s0's claims as a FRESH dict, as a real resolve does."""
+    calls: list = []
+
+    async def resolve(digest: str) -> tuple:
+        calls.append(digest)
+        return ("answer", {"session": "s0", "claims": {"routes": ["r"], "front": {"uid": 70000, "pid": 1, "start": 1},
+                                                       "incarnation": 1}})
+    s.k._token_resolve = resolve
+    return calls
+
+
+def test_budget_stopped_outlives_the_cache_entry(monkeypatch):
+    # L3 r1 complement 1 (head ruling 1023+15): the stop is keys' per-SESSION set, not a flag on the claims-cache
+    # entry. A re-registration of the session's front (`_detach` without revoke) drops the session's cache entries, and
+    # the next `Q` re-resolves a fresh entry from CONTROL: that `Q` is still 402 `budget-overrun`, no `A`, nothing held,
+    # no second upstream. The fail-closed clear (`_detach_all`) keeps the set too.
     up = _Up()
-    body = json.dumps({"type": "message", "usage": OVER}).encode()
 
     async def go(d: str) -> dict:
         st = _scripted(monkeypatch, up)
         async with _Sessions(d, 1) as s:
             digest = digest_of_token(s.token(0))
-            entry = s.k.cache[digest]
-            before = dict(entry)
-            front, task, got = await s.start(0, _q())
-            front.feed_data(gwwire.encode(b"B", BODY) + gwwire.encode(b"E"))
-            up.feed(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n" % len(body)
-                    + body)
-            up.feed(b"")
-            await asyncio.wait_for(task, 5)
-            first = await got()
-            out = {"same": s.k.cache[digest] is entry, "flag": entry.get("budget_stopped"), "before": before,
-                   "keys": sorted(s.k.cache[digest])}
+            before = dict(s.k.cache[digest])
+            first = await _overrun(s, up)
+            stopped = set(s.k.budget_stopped)
+            await _reregister(s, 2)
+            out = {"cached_after_rereg": digest in s.k.cache, "stopped": stopped}
+            calls = _fresh_resolves(s)
             front2, task2, got2 = await s.start(0, _q(BODY_Q))
             front2.feed_data(gwwire.encode(b"B", BODY) + gwwire.encode(b"E"))
             await asyncio.wait_for(task2, 5)
-            out.update(first=first, second=await got2(), handshakes=st["handshakes"], path=s.ledger.path)
+            out.update(first=first, second=await got2(), resolves=list(calls), entry=dict(s.k.cache[digest]),
+                       before=before, after_rereg=set(s.k.budget_stopped))
+            async with s.k.state_lock:
+                s.k._detach_all()
+            out.update(after_clear=set(s.k.budget_stopped), handshakes=st["handshakes"], path=s.ledger.path)
         out["kinds"] = [o["kind"] for o in file_lines(out["path"])]
         return out
 
     out = _run(go)
-    assert "budget_stopped" not in out["before"]
     assert [t for t, _ in out["first"]][:2] == [b"A", b"R"] and out["first"][-1][0] == b"e"
-    assert out["same"] is True and out["flag"] is True
-    assert out["keys"] == sorted(list(out["before"]) + ["budget_stopped"])    # the entry gained the flag, nothing else
+    assert out["stopped"] == {"s0"}
+    assert out["cached_after_rereg"] is False          # the re-registration dropped the entry
+    assert len(out["resolves"]) == 1                   # the second `Q` re-resolved a fresh one
+    assert out["entry"] == out["before"]               # nothing rides on the entry: it is CONTROL's answer, unchanged
     assert [t for t, _ in out["second"]] == [b"F"], out["second"]
     assert json.loads(out["second"][0][1])["refused"] == "budget-overrun"
+    assert out["after_rereg"] == {"s0"} and out["after_clear"] == {"s0"}
     assert out["handshakes"] == 1 and out["kinds"].count("reserved") == 1
+
+
+def test_drop_session_clears_budget_stopped(monkeypatch):
+    # DROP-SESSION (`_detach(..., revoke=True)`) is the one thing that takes a session out of the set. After it the
+    # session, registered again with a new token, is served and settles from its own usage.
+    up = _Up()
+
+    async def go(d: str) -> dict:
+        st = _scripted(monkeypatch, up)
+        async with _Sessions(d, 1) as s:
+            first = await _overrun(s, up)
+            stopped = set(s.k.budget_stopped)
+            await s.k.drop_session(s.k.admin_epoch, "s0")
+            out = {"first": first, "stopped": stopped, "after_drop": set(s.k.budget_stopped)}
+            await _reregister(s, 2)
+            _fresh_resolves(s)
+            s.token = lambda i: "c" * 43      # the dropped token's digest is `token-revoked`; a new one resolves
+            up2 = _Up()
+            _scripted(monkeypatch, up2)
+            front2, task2, got2 = await s.start(0, _q(BODY_Q))
+            front2.feed_data(gwwire.encode(b"B", BODY) + gwwire.encode(b"E"))
+            up2.feed(_response(UNDER))
+            up2.feed(b"")
+            await asyncio.wait_for(task2, 5)
+            out.update(second=await got2(), after=set(s.k.budget_stopped), path=s.ledger.path)
+        out["res"] = [o for o in file_lines(out["path"]) if o["kind"] in ("settled", "uncertain", "released")]
+        return out
+
+    out = _run(go)
+    assert out["stopped"] == {"s0"} and out["after_drop"] == set()
+    assert [t for t, _ in out["second"]][:2] == [b"A", b"R"] and out["second"][-1][0] == b"e", out["second"]
+    assert [(o["kind"], o["overrun"]) for o in out["res"]] == [("settled", OVER_COST - HOLD), ("settled", 0)]
+    assert out["res"][1]["settled"] == UNDER_COST
+    assert out["after"] == set()

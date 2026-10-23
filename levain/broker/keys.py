@@ -747,6 +747,12 @@ class Keys:
         #: token_digest -> CONTROL's answer `{"session", "claims"}`; cleared by DROP-SESSION (that session's) and by
         #: every fail-closed clear
         self.cache: Dict[str, dict] = {}
+        #: the sessions an overrun stopped (R4 §1.4): `_settle` adds one whose settle cost more than its hold, and
+        #: `_check_q` and the pre-admit statement refuse its every later `Q` `budget-overrun`. Keyed by SESSION, never
+        #: by a cache entry, so a re-registration or reattach that drops and re-resolves the session's claims keeps
+        #: the stop. Only DROP-SESSION (`_detach` with `revoke`) takes a session out; the fail-closed clear keeps it;
+        #: a restart loses it with the rest of memory.
+        self.budget_stopped: Set[str] = set()
         #: digests keys itself saw dropped (bounded, oldest first): `token-revoked` without asking
         self.dropped: "OrderedDict[str, None]" = OrderedDict()
         #: the per-digest single-flight: (admin_epoch, registration, digest) -> the table-owned resolve task. Keyed by
@@ -957,11 +963,14 @@ class Keys:
         attributed to it, each marked detached, preceded by the `Upstream` OBJECT of each detached exchange that holds
         one (phase 2 aborts it: an abort drops the transport's buffer, where a close would flush credential-bearing
         bytes); an exchange's task is cancelled (delivery only, never the guarantee). The session's cached claims
-        leave the token cache; with `revoke` (DROP-SESSION) their digests enter the dropped set."""
+        leave the token cache; with `revoke` (DROP-SESSION) their digests enter the dropped set and the session leaves
+        `budget_stopped` (the one place it does)."""
         if self.regs.get(reg.front_uid) is reg:
             del self.regs[reg.front_uid]
         if self.by_session.get(reg.session) is reg:
             del self.by_session[reg.session]
+        if revoke:
+            self.budget_stopped.discard(reg.session)
         for digest in [d for d, a in self.cache.items() if a["session"] == reg.session]:
             del self.cache[digest]
             if revoke:
@@ -987,7 +996,8 @@ class Keys:
         """Phase 1 of the fail-closed clear (caller holds state_lock; no await): every registration detached, every
         `Upstream` ahead of every connection, the token cache and the dropped set cleared, and every resolve task
         cancelled (the table is empty after it, so no resolve has a registration left to answer, whatever its epoch).
-        `reg_high` is kept: a clear never lowers a fence."""
+        `reg_high` is kept: a clear never lowers a fence. `budget_stopped` is kept: a clear never restarts a session's
+        spend."""
         regs = {id(r): r for r in list(self.regs.values()) + list(self.by_session.values())}
         got: List[Victim] = []
         for reg in regs.values():
@@ -1342,7 +1352,7 @@ class Keys:
     async def _serve_q(self, conn: Conn, frames: FrameReader, side: KeysSide, q: dict) -> None:
         """The `Q` handler: the token state, then the route against the token's claims and keys' OWN policy, then the
         metered request path of R4 §1.7, in this order: (1) the `Q` re-checked against that policy, the credential and
-        the session's `budget-stopped` flag (`_check_q`); (2) the body buffer's take for a declared length; (3) `A`,
+        the session in `budget_stopped` (`_check_q`); (2) the body buffer's take for a declared length; (3) `A`,
         then the body collected into memory within `body_read_s` (`_collect_body`); (4)-(5) parse, check, the
         ceiling written in, keys' own serialization, the head, the estimate and the ledger's admit, last
         (`_check_request`, one synchronous call); (6)-(8) the upstream, the durable `reserved` line, the head and
@@ -1354,8 +1364,8 @@ class Keys:
         if "refused" in out:
             await self._refuse(conn, frames, side, out["refused"], UNTRUSTED_DRAIN_CAP)
             return
-        entry = out["answer"]   # the claims-cache entry itself (`_settle` sets `budget_stopped` on it)
-        claims = entry["claims"]
+        claims = out["answer"]["claims"]
+        session = conn.reg.session   # the answer's session (`front_binding` held it equal): the `budget_stopped` key
         rec = conn.rec if conn.rec is not None else new_record(conn.reg.session, q)
         slot = claims.get("slot")
         rec["slot"] = slot if type(slot) is int else None
@@ -1375,7 +1385,7 @@ class Keys:
                 # cancelling this exchange never cancels it); the credential `fresh` checked is the one the request
                 # is built with
                 observed = await fresh(self.cred_lifecycle, self._cred_store(), pol.credential)
-            req = self._check_q(claims, entry, pol, q, observed)
+            req = self._check_q(claims, session, pol, q, observed)
             raw = await self._collect_body(conn, ff, side, q, pol, buf, rec)
             if raw is None:
                 buf.give_back()
@@ -1385,7 +1395,7 @@ class Keys:
                 # the body read can take up to `body_read_s` after `fresh`'s observation: a token that expired
                 # meanwhile is refused here, before anything is checked or held (the head's write checks it again)
                 unexpired(self.cred_lifecycle, observed)
-            head, hconn, cred, tpl, data, meter, hold = self._check_request(conn.reg, entry, pol, req, raw,
+            head, hconn, cred, tpl, data, meter, hold = self._check_request(conn.reg, pol, req, raw,
                                                                             buf)   # the ledger's admit is last
         except norm.Refused as r:
             buf.give_back()
@@ -1403,7 +1413,7 @@ class Keys:
         # {ended}`, and is a no-op after the relay's settle. No statement runs between the admit above and this try
         # (a tripwire holds it), and no ledger call sits in a `finally`; the ledger's owner callback is the backstop.
         try:
-            await self._serve_held(conn, ff, side, pol, rec, entry, meter, hold, head, hconn, cred, tpl, data, buf)
+            await self._serve_held(conn, ff, side, pol, rec, meter, hold, head, hconn, cred, tpl, data, buf)
         except (norm.Refused, UpstreamFailed) as r:
             hold.end()
             if ff.responded:
@@ -1421,7 +1431,7 @@ class Keys:
             ff.close()
 
     async def _serve_held(self, conn: Conn, ff: "FrontFrames", side: KeysSide, pol: RoutePolicy, rec: dict,
-                          entry: dict, meter: "Tuple[codec.Codec, Price]", hold: ledger.Hold, head: bytes,
+                          meter: "Tuple[codec.Codec, Price]", hold: ledger.Hold, head: bytes,
                           hconn: "h11.Connection", cred: Optional[Credential], tpl: norm.Template, data: bytes,
                           buf: "BodyTake") -> None:
         """The exchange from its admitted hold on (R4 §1.7 steps 6-8): the upstream, the durable wait, the head behind
@@ -1487,24 +1497,23 @@ class Keys:
             if not await self._against_front(ff, side, up, work()):
                 return   # the front aborted, or the exchange was cut short: `_serve_q`'s `end()` resolves the hold
             assert reader is not None   # a completed relay made one
-            self._settle(entry, meter[1], hold, reader.result())
+            self._settle(conn.reg.session, meter[1], hold, reader.result())
         finally:
             rec["redactions"] = scanner.count
 
-    @staticmethod
-    def _settle(entry: dict, price: Price, hold: ledger.Hold, usage: Optional[codec.Usage]) -> None:
+    def _settle(self, session: str, price: Price, hold: ledger.Hold, usage: Optional[codec.Usage]) -> None:
         """A completed relay's resolution (R4 §1.2, §1.4): its reported usage priced by class, settled in full (the
         ledger books what passes the hold as `overrun`); with none, `uncertain {no-usage}`, charged its hold. A cost
-        above the hold stops the session: `budget_stopped` is set on the session's claims-cache entry ITSELF, the dict
-        `_check_q` and `_admit_hold` read, so every later `Q` of the session is `budget-overrun` and the flag dies
-        with the entry. Nothing in flight is touched: each other exchange settles from its own usage."""
+        above the hold stops the session: it enters `budget_stopped`, which `_check_q` and `_admit_hold` read, so every
+        later `Q` of the session is `budget-overrun` until DROP-SESSION. Nothing in flight is touched: each other
+        exchange settles from its own usage."""
         if usage is None:
             hold.uncertain("no-usage")
             return
         cost = codec.price_usage(usage, price)
         hold.settle(cost, usage.meta())
         if cost > hold.amount:
-            entry["budget_stopped"] = True
+            self.budget_stopped.add(session)
 
     async def _open_upstream(self, conn: Conn, ff: "FrontFrames", side: KeysSide, pol: RoutePolicy,
                              rec: dict) -> Optional[Upstream]:
@@ -1746,15 +1755,15 @@ class Keys:
                           type(e).__name__)
         return self.creds is not None
 
-    def _check_q(self, claims: dict, entry: dict, pol: RoutePolicy, q: dict,
+    def _check_q(self, claims: dict, session: str, pol: RoutePolicy, q: dict,
                  observed: Optional[Credential]) -> tuple:
         """R4 §1.7 step 1: keys' own re-check of the `Q` against ITS policy (the front's verdict is never taken), with
         no reservation and no request head. Order: a route with no price table (a base `/1` map's) is
         `model-not-allowed`, and a ticketed run is `model-not-allowed` until its model is checked against the ticket
         (3c-5); a websocket upgrade is `body-unbounded:websocket` (one exchange carries many responses, no one usage
         settles it); target and template; headers (strict: a forbidden, consumed or off-list name is
-        `policy-header`); the declared length against `body_cap`; the credential and its host binding; the session's
-        `budget-stopped` flag (`budget-overrun`). Returns (method, path, query, the re-checked headers, the template,
+        `policy-header`); the declared length against `body_cap`; the credential and its host binding; the session in
+        `budget_stopped` (`budget-overrun`). Returns (method, path, query, the re-checked headers, the template,
         the credential or None). The credential is `observed`, the one `fresh` observed and checked for the route's
         `credential`: it is not observed again."""
         if pol.prices is None:
@@ -1782,11 +1791,11 @@ class Keys:
             check_host(cred, pol.upstream.host, pol.route)
             if any(n == cred.header for n, _ in fwd):
                 raise norm.Refused("policy-header", cred.header)
-        if entry.get("budget_stopped"):
+        if session in self.budget_stopped:
             raise norm.Refused("budget-overrun", "the session is stopped")
         return method, path, query, fwd, tpl, cred
 
-    def _check_request(self, reg: Registration, entry: dict, pol: RoutePolicy, req: tuple, raw: "_OneShot",
+    def _check_request(self, reg: Registration, pol: RoutePolicy, req: tuple, raw: "_OneShot",
                        buf: "BodyTake") -> Tuple[bytes, "h11.Connection", object, norm.Template, bytes,
                                                  Tuple[codec.Codec, Price], ledger.Hold]:
         """R4 §1.7 steps 4-5, ONE synchronous call (no `await` anywhere in it): the body codec's parse of the buffered
@@ -1812,14 +1821,14 @@ class Keys:
         head, hconn = request_head(pol, method, path, query, fwd, "length:%d" % len(data), cred)
         # an interactive route admits content the estimate cannot see, marked on its `reserved` line (R4 §1.6)
         meta = {"bound": "unproven"} if checked.unproven else {}
-        hold = self._admit_hold(reg, pol, entry, estimate, checked.model, meta)   # the last step: see `_serve_q`
+        hold = self._admit_hold(reg, pol, estimate, checked.model, meta)   # the last step: see `_serve_q`
         return head, hconn, cred, tpl, data, (c, checked.price), hold
 
-    def _admit_hold(self, reg: Registration, pol: RoutePolicy, entry: dict, estimate: int, price_ref: str,
+    def _admit_hold(self, reg: Registration, pol: RoutePolicy, estimate: int, price_ref: str,
                     meta: dict) -> ledger.Hold:
         """The ledger's synchronous admit of `estimate` (R4 §1.2's estimate, never shrunk: a hold that does not fit the
         room is `budget-exhausted`) against the route's per-session cap, scope ("session-route", session, route);
-        `price_ref` is the priced model. The session's `budget-stopped` flag is read again as the statement right
+        `price_ref` is the priced model. The session's place in `budget_stopped` is read again as the statement right
         before the admit (no `await` between the two), because the body read after `_check_q`'s read can take up
         to `body_read_s`. The ledger's own errors become refusals: `budget-exhausted` (402), and
         `keys-unavailable` (503) for an unhealthy or closing ledger and, noted, for a misuse."""
@@ -1832,7 +1841,7 @@ class Keys:
         def bound(room: int) -> int:
             return estimate   # above the room, the ledger refuses it `budget-exhausted`
 
-        if entry.get("budget_stopped"):
+        if reg.session in self.budget_stopped:
             raise norm.Refused("budget-overrun", "the session is stopped")
         try:
             return self.ledger.admit(("session-route", reg.session, pol.route), cap, bound, price_ref=price_ref,

@@ -243,7 +243,7 @@ def test_completed_relay_settles_from_usage(monkeypatch, body, ctype, want):
             frames = await rig.got()
             await until(lambda: holds[0].state is L.RESOLVED)
             out = {"frames": frames, "charged": rig.ledger.charged(SCOPE), "path": rig.ledger.path,
-                   "outcome": holds[0].outcome, "stopped": rig.k.cache[_digest()].get("budget_stopped")}
+                   "outcome": holds[0].outcome, "stopped": set(rig.k.budget_stopped)}
         out["lines"] = [o for o in file_lines(out["path"]) if o["kind"] in ("settled", "uncertain")]
         out["seqs"] = [o["seq"] for o in file_lines(out["path"]) if o["kind"] == "reserved"]
         return out
@@ -259,7 +259,7 @@ def test_completed_relay_settles_from_usage(monkeypatch, body, ctype, want):
     else:
         assert (line["kind"], line["reason"]) == ("uncertain", "no-usage")
         assert out["outcome"] == (L.UNCERTAIN, "no-usage") and out["charged"] == AMOUNT
-    assert out["stopped"] is None    # under the hold: the session is not stopped
+    assert out["stopped"] == set()    # under the hold: the session is not stopped
 
 
 def _digest():
@@ -616,7 +616,7 @@ def test_route_caps_are_per_route():
             # the holds are the calls' estimates: 900 on `b`, 100 on `a`, 100 on `b` (the ledger never shrinks one)
             for pol, est in ((pb, 900), (pa, 100), (pa, 1), (pb, 100), (pb, 1)):
                 try:
-                    h = k._admit_hold(reg, pol, {}, est, "m1", {})
+                    h = k._admit_hold(reg, pol, est, "m1", {})
                     seq.append(h.amount)
                 except norm.Refused as r:
                     seq.append((r.name, r.status))
@@ -660,7 +660,7 @@ def test_no_ledger_and_ledger_errors_are_refusals(caplog):
                 else:
                     await led.aclose(2.0)
             try:
-                k._admit_hold(reg, pol, {}, 1, "m1", {})
+                k._admit_hold(reg, pol, 1, "m1", {})
                 out.append("admitted")
             except norm.Refused as r:
                 out.append((r.name, r.detail))
@@ -693,7 +693,7 @@ def test_a_capless_route_is_no_scope():
             k = K.Keys(ledger=led, lib_root=d)
             pol = dataclasses.replace(k._route_policy({"routes": ["a"]}, "a"), max_session_microdollars=None)
             try:
-                k._admit_hold(types.SimpleNamespace(session="s1"), pol, {}, 1, "m1", {})
+                k._admit_hold(types.SimpleNamespace(session="s1"), pol, 1, "m1", {})
                 got = "admitted"
             except norm.Refused as r:
                 got = (r.name, r.detail)
