@@ -75,9 +75,9 @@ VENDOR: Dict[str, dict] = {
         "choice": "max over every provider endpoint row: in 2.31 (alibaba/fast), out 8.00 (wafer, cloudflare, decart), read 0.48 (decart)",
         "price": {
             "in": 2_310_000, "out": 8_000_000, "cache_write": 0, "cache_read": 480_000,
-            "default_output": 943_718,   # top_provider.max_completion_tokens in the models API (context 1,048,576)
+            "default_output": 32_768,    # [judged by 1023+8 head, 10-23: the written-in ceiling; 943,718 is a context-sized figure that would estimate ~$7.55/call; a lower written-in ceiling is forwarded, so it cannot under-reserve]
             "overhead_tokens": 0,        # no documented tool-prompt overhead on OpenRouter
-            "image_tokens": 1,           # architecture modality text->text: no image input; the field must be positive
+            "image_tokens": 4_784,       # [judged by 1023+8 head, 10-23: text-only model; conservative so an image block can never under-reserve]
             "source": "https://openrouter.ai/z-ai/glm-5.2",
         },
     },
