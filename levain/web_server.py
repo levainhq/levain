@@ -183,7 +183,6 @@ def _is_write_route(route: str) -> bool:
 _SIGN_LIST_PATH = "/cockpit/sign.json"
 _SIGN_PREFIX = "/cockpit/sign/"
 _SIGN_ACTIONS = ("challenge", "answer", "deny")
-_SIGN_ERRORS = {400: "bad_request", 404: "not_found", 409: "conflict", 503: "unavailable"}   # the phone port's words
 # one extra Host value (make_server extra_hosts): a DNS name or IPv4 literal and an optional trailing dot, never a port
 _EXTRA_HOST = re.compile(r"(?=[^:]{1,253}\Z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
                          r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?")
@@ -1067,8 +1066,8 @@ class _Handler(GuardedHandler):
 
     def _sign_post(self, request_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
         """``POST /cockpit/sign/<id>/<action>``: the Signer's own reply, or its refusal as ``{error, message}``
-        with the refusal's status, in the phone port's words for it."""
-        from levain.consent.sign import SignRefused
+        with the refusal's status, in the words of :func:`levain.consent.sign.error_word` (the phone port's table too)."""
+        from levain.consent.sign import SignRefused, error_word
 
         signer = self.server.signer
         if signer is None:     # the route is not served without one; an explicit check survives `python -O`
@@ -1076,7 +1075,7 @@ class _Handler(GuardedHandler):
         try:
             return getattr(signer, action)(request_id, req), 200
         except SignRefused as exc:
-            return {"error": _SIGN_ERRORS.get(exc.status, "sign_refused"), "message": str(exc)}, exc.status
+            return {"error": error_word(exc.status), "message": str(exc)}, exc.status
 
     def _serve_note_body(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/note/<n>.json``: one note's body (what, detail, agent, filed_at, and its dismissal if any),

@@ -123,14 +123,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from levain import unshowable
 
-__all__ = ["CHOICE_FORMAT", "CHOICE_MARK", "LIST_MAX", "MESSAGE_MAX", "OPTIONS_MAX", "REFUSED_NAMESPACES",
-           "REQUEST_FORMAT", "SIGN_DIR", "WRITE_IN_KEY", "SignRefused", "SignRequest", "Signer", "choice_line",
-           "deep_link", "namespace_problem", "parse_choice", "read_request", "sign_dir", "signed_bytes", "state_of",
-           "write_in_problem"]
+__all__ = ["CHOICE_FORMAT", "CHOICE_MARK", "ERROR_WORDS", "LIST_MAX", "MESSAGE_MAX", "OPTIONS_MAX",
+           "REFUSED_NAMESPACES", "REQUEST_FORMAT", "SIGN_DIR", "WRITE_IN_KEY", "SignRefused", "SignRequest", "Signer",
+           "choice_line", "deep_link", "error_word", "namespace_problem", "parse_choice", "passkey_key_source",
+           "read_request", "sign_dir", "sign_root", "signed_bytes", "state_of", "write_in_problem"]
 
 REQUEST_FORMAT = "levain-sign-request/1"
 CHOICE_FORMAT = "levain-sign-choice/1"
@@ -160,6 +160,57 @@ class SignRefused(Exception):
     def __init__(self, message: str, status: int = 422) -> None:
         super().__init__(message)
         self.status = status
+
+
+# the error word a port answers a SignRefused with, by its status; any other status is "sign_refused". ONE table: the
+# phone port (levain.phone_server) and the cockpit (levain.web_server) both import it, so the two cannot drift
+ERROR_WORDS = {400: "bad_request", 404: "not_found", 409: "conflict", 503: "unavailable"}
+
+
+def error_word(status: int) -> str:
+    """The error word for a :class:`SignRefused` of ``status`` (:data:`ERROR_WORDS`, else ``sign_refused``)."""
+    return ERROR_WORDS.get(status, "sign_refused")
+
+
+def sign_root(queue_dir: Path) -> Path:
+    """The ONE cockpit the queue's consent hooks name, whose passkeys sign a sign request or a dispatch job.
+    SignRefused (503) when no hook names one, or when they name several (which passkeys sign is then not one
+    answer)."""
+    from levain.consent.answering import hook_roots
+
+    roots = hook_roots(queue_dir)
+    if not roots:
+        raise SignRefused("no consent hook names a cockpit, so no passkey can sign here: this queue dir names no "
+                          "cockpit: write claude_code.json with cockpit_data_root", 503)
+    if len(roots) > 1:
+        raise SignRefused("the consent hooks name more than one cockpit, so which passkeys sign is not one "
+                          "answer: nothing is signed", 503)
+    return roots[0]
+
+
+def passkey_key_source(queue_dir: Path, rp_id: str, *, cache: Any = None) -> "Callable[[], dict[str, Any]]":
+    """What may sign a sign request, as the ``keys`` a :class:`Signer` takes: a callable returning the active passkey
+    keys (fingerprint -> :class:`levain.authority.AuthorityKey`) enrolled on ``rp_id`` in :func:`sign_root`'s
+    cockpit, re-read on every call (the hooks and the authority log both, never a snapshot). A laptop key never
+    signs. SignRefused (503) when no single cockpit is named or its keys cannot be read now. ``cache`` is a
+    :class:`levain.authority.ReplayCache` shared with the caller's other replays; None keeps one for this source."""
+    import sqlite3
+
+    from levain.authority import AuthorityError, ReplayCache, anchor_path
+    from levain.consent.answering import passkey_keys
+    from levain.consent.queue import authority_source
+
+    replay = ReplayCache() if cache is None else cache
+
+    def keys() -> "dict[str, Any]":
+        root = sign_root(queue_dir)
+        try:
+            source = authority_source(root / "cockpit.db", anchor=anchor_path(root), cache=replay)
+            return {k.fingerprint: k for k in passkey_keys(source(), rp_id)}
+        except (AuthorityError, OSError, sqlite3.Error) as exc:
+            raise SignRefused(f"the cockpit's keys cannot be read now: {exc}", 503) from None
+
+    return keys
 
 
 def namespace_problem(namespace: object) -> str | None:
