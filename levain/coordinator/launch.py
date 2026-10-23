@@ -646,7 +646,8 @@ def watch_once(store: CoordStore) -> list[str]:
           A pending launch's session is never stopped: its start may be in flight in another process. A session
           matched by name alone is stopped only when its row's ``cwd`` is that launch's realpath directory (a name is
           a string anyone can choose); every ``agents`` and ``stop`` call runs in the store's directory;
-      (e) the brief of every launch that is over is deleted (:func:`_remove_briefs`).
+      (e) the brief of every launch that is over is deleted (:func:`_remove_briefs`);
+      (f) every held question ping now due is sent (C5-1, :func:`levain.consent.band.release_held_pings`).
 
     Any other row in the list is never read further. When the list cannot be read, (b)-(d) do nothing: an unread list
     is no evidence of anything. A list read with no row is a listing like any other (L3 r1 G2): an active launch
@@ -748,6 +749,9 @@ def watch_once(store: CoordStore) -> list[str]:
                      f"{_stop(exe, hid, cwd=str(store.directory), env=env)}")
     # again after this pass's own ends, so a session found gone above loses its brief in the same pass (L3 r2)
     lines.extend(_remove_briefs(store))
+    from levain.consent.band import release_held_pings
+
+    lines.extend(release_held_pings(store.directory))
     return lines
 
 

@@ -1121,9 +1121,13 @@ def _coord_first_reader(args: argparse.Namespace, out: Any, store: EnvelopeStore
 
     cmd = args.coord_cmd
     if cmd == "escalate":
+        from levain.consent.band import release_held_pings
+
         reply_id = fr.escalate(store, args.ref, args.why, token=args.token)
-        _emit(out, args.json, {"reply_id": reply_id}, f"escalated: question {args.ref} waits on the operator "
-                                                      f"(ANSWER {reply_id}); the question is untouched")
+        released = release_held_pings(store.directory)        # a ping held for it goes now (C5-1)
+        _emit(out, args.json, {"reply_id": reply_id, "pings": released},
+              f"escalated: question {args.ref} waits on the operator (ANSWER {reply_id}); the question is untouched"
+              + "".join(f"\n{line}" for line in released))
         return 0
     if cmd == "questions":
         authority, unchecked = _band_snapshot(args, store)

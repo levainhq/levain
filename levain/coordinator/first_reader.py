@@ -21,6 +21,16 @@ What that means here:
   open (re-read inside the delivery transaction; a KNOW is formatted before it is marked delivered).
 - **Escalating** (:func:`escalate`): an ANSWER record (the grammar's push, C0 §3.3) pointing at the question, which then
   shows in "waiting on you"; the question stays open for the operator.
+- **The held ping** (C5-1, Phill 10-22 *"4a"*: hold ``levain ask``'s ping while a coordinator holds a live lease; any
+  question it has not read within 10 min pings him and lands in his review queue). :func:`hold_ping`, at filing:
+  while a coordinator (an ``active`` coordinator launch, never the operator) holds the lease and it is live, the ping
+  is held (a ``held_pings`` row) instead of sent; no store, no lease, a lapsed or expired lease, or any fault: the
+  ping goes as before. :func:`claim_held` releases a held ping once (a ``held_ping_releases`` row): ``escalated`` when
+  the coordinator escalated it, ``unread`` when it has no first read :data:`UNREAD_AFTER` after filing (that one also
+  files the escalation's ANSWER record, so it shows in "waiting on you"), ``answered`` (no ping) when the operator
+  answered it meanwhile. A KNOW holds it for good: the KNOW is the review item. Nothing runs on a clock: the release is
+  checked by :func:`levain.consent.band.release_held_pings`, which the gate hook (every tool call of every session
+  in the store's directory), ``levain coord watch``'s pass, ``levain ask`` and ``levain coord escalate`` call.
 
 **The verdict** (:func:`verdict`) is necessary, never sufficient. The coordinator may answer only when ALL hold, read
 again inside the fenced ``dispatch.db`` transaction that writes the KNOW (the question re-read from ``questions.db``,
@@ -61,11 +71,16 @@ Known edges:
   from inside the envelope" is a label, never proof;
 - a KNOW whose line cannot be formatted stays undelivered (tried again at each hook) and waits in the review queue;
 - a KNOW reaches a live session at its next tool call only (an ENDED session is not resumed for it);
-- a question filed before a coordinator reads it was already pinged to you at filing (``levain ask`` pings, as before
-  C5);
+- a question filed while no coordinator held the live lease was pinged to you at filing (as before C5-1), and a
+  coordinator's later KNOW to it does not unsend that ping;
 - a session Levain did not start (yours, and today every seat: :mod:`levain.coordinator.launch` starts coordinator
   launches only) always escalates;
-- while a coordinator store exists, each hook reads ``questions.db`` once more for this session's open questions.
+- while a coordinator store exists, each hook reads ``questions.db`` once more for this session's open questions;
+- a held ping is released only when something checks (above): with every session idle, no watch running and no
+  ``levain`` command run, a question unread past 10 minutes waits, silent, until the next check;
+- a released ping is claimed before it is sent: a notify that fails after the claim is not sent again (an ``unread``
+  one still shows in "waiting on you");
+- a question tied to a consent request (``--would-push``) is never held: only the operator rules it.
 """
 from __future__ import annotations
 
@@ -74,19 +89,23 @@ import os
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 from levain.autonomic.durable_sqlite import read_transaction, write_transaction
 from levain.coordinator.store import CoordError, CoordStore, _append_only
 
-__all__ = ["FIRST_READER_SCHEMA", "Reading", "answer", "claim_knows", "escalate", "is_coordinator_session",
-           "read_band", "verdict"]
+__all__ = ["FIRST_READER_SCHEMA", "UNREAD_AFTER", "Reading", "answer", "claim_held", "claim_knows", "escalate",
+           "hold_ping", "is_coordinator_session", "read_band", "verdict"]
 
 # the question band names the agent; a launch names the harness
 _HARNESS_OF = {"claude_code": "claude", "codex": "codex"}
 _TEXT_MAX = 4000
 _WHY_MAX = 1000
+# ruled (Phill 10-22, "4a"): a held question the coordinator has not read within 10 min pings him
+UNREAD_AFTER = timedelta(minutes=10)
+RELEASE_CAUSES = ("unread", "escalated", "answered")
 
 FIRST_READER_SCHEMA: tuple[str, ...] = (
     # one reading per question: the coordinator's KNOW or its escalation, written once
@@ -104,6 +123,20 @@ FIRST_READER_SCHEMA: tuple[str, ...] = (
     "CREATE TRIGGER IF NOT EXISTS know_deliveries_no_replace BEFORE INSERT ON know_deliveries WHEN EXISTS (SELECT 1 "
     "FROM know_deliveries WHERE reply_id = NEW.reply_id OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a KNOW is delivered once'); END",
+    # C5-1: a question whose filing ping was held because a coordinator held the live lease (its token): once
+    "CREATE TABLE IF NOT EXISTS held_pings (question_id TEXT PRIMARY KEY, lease_token INTEGER NOT NULL, "
+    "at TEXT NOT NULL)",
+    *_append_only("held_pings", "a held ping is written once"),
+    "CREATE TRIGGER IF NOT EXISTS held_pings_no_replace BEFORE INSERT ON held_pings WHEN EXISTS (SELECT 1 FROM "
+    "held_pings WHERE question_id = NEW.question_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a ping is held once'); END",
+    # ... and its release: once
+    "CREATE TABLE IF NOT EXISTS held_ping_releases (question_id TEXT PRIMARY KEY REFERENCES held_pings(question_id), "
+    f"cause TEXT NOT NULL CHECK (cause IN ({', '.join(repr(c) for c in RELEASE_CAUSES)})), at TEXT NOT NULL)",
+    *_append_only("held_ping_releases", "a held ping is released once"),
+    "CREATE TRIGGER IF NOT EXISTS held_ping_releases_no_replace BEFORE INSERT ON held_ping_releases WHEN EXISTS "
+    "(SELECT 1 FROM held_ping_releases WHERE question_id = NEW.question_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a held ping is released once'); END",
 )
 
 
@@ -370,6 +403,103 @@ def claim_knows(directory: Path | str, agent: str, session: str,
             conn.execute("INSERT INTO know_deliveries (reply_id, agent_session_id, at) VALUES (?, ?, ?)",
                          (reply_id, session, now))
             out.append(line)
+    return out
+
+
+# --- the held ping (C5-1) --------------------------------------------------------------------------------------------
+def _coord_store(directory: Path) -> CoordStore:
+    """The store a held ping is written in (a seam: the tests' store runs on a fixed clock)."""
+    return CoordStore(directory)
+
+
+def _coordinator_token(conn: sqlite3.Connection, now: str) -> int | None:
+    """The live lease's token when a coordinator holds it: live (``now`` before its until), not the operator's, its
+    holder an ``active`` coordinator launch (the same holder rule as :func:`levain.coordinator.lease.fence`)."""
+    from levain.coordinator import lease
+
+    held = lease.lease(conn, now)
+    if held is None or not held.live or held.holder == "operator":
+        return None
+    ln = lease._launch_by_key(conn, held.holder)
+    return held.token if ln is not None and ln.state == "active" and ln.role == "coordinator" else None
+
+
+def hold_ping(directory: Path | str, question_id: str) -> bool:
+    """Hold question ``question_id``'s filing ping when a coordinator holds the live lease (checked inside the write
+    that records the hold): True when held, so the caller does not ping. False, and the caller pings as before, when
+    there is no coordinator store, no live coordinator lease, or anything fails (a ping is never lost to a fault)."""
+    d = Path(directory)
+    if not (d / "dispatch.db").exists():
+        return False
+    try:
+        store = _coord_store(d)
+        with write_transaction(store._connect) as conn:
+            now = store._stamp()
+            token = _coordinator_token(conn, now)
+            if token is None:
+                return False
+            conn.execute("INSERT INTO held_pings (question_id, lease_token, at) VALUES (?, ?, ?)",
+                         (question_id, token, now))
+            return True
+    except Exception:  # noqa: BLE001 - see the docstring: a fault pings
+        return False
+
+
+_DUE_SQL = ("SELECT h.question_id, h.at, f.outcome FROM held_pings h LEFT JOIN first_reads f ON "
+            "f.question_id = h.question_id WHERE NOT EXISTS (SELECT 1 FROM held_ping_releases r WHERE "
+            "r.question_id = h.question_id) AND (f.outcome IS NULL OR f.outcome = 'escalated') ORDER BY h.rowid")
+
+
+def claim_held(directory: Path | str, *, after: timedelta | None = None) -> list[tuple[Any, str]]:
+    """Release every held ping now due, once: ``[(question, cause)]`` for the caller to ping, cause ``escalated`` or
+    ``unread`` (module docstring). An ``unread`` release also files the escalation's ANSWER record (once per question,
+    as :func:`escalate` does), in the same transaction as the release. A question the operator answered meanwhile is
+    released as ``answered`` and returned to nobody. Cheap when nothing waits: one read-only query."""
+    from levain.cockpit.consent import parse_stamp
+    from levain.coordinator import lease
+
+    after = UNREAD_AFTER if after is None else after
+    d = Path(directory)
+    db = d / "dispatch.db"
+    if not db.exists():
+        return []
+    try:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
+        try:
+            if not conn.execute(_DUE_SQL).fetchall():
+                return []
+        finally:
+            conn.close()
+    except sqlite3.Error:        # no held_pings table yet: nothing was ever held
+        return []
+    qs = _questions(d)
+    store = _coord_store(d)
+    out: list[tuple[Any, str]] = []
+    with write_transaction(store._connect) as conn:
+        now = store._stamp()
+        for question_id, at, outcome in conn.execute(_DUE_SQL).fetchall():
+            q = qs.get(question_id)
+            if q is None or q.answer is not None:
+                cause = "answered"
+            elif outcome == "escalated":
+                cause = "escalated"
+            elif parse_stamp(now) - parse_stamp(at) >= after:
+                cause = "unread"
+            else:
+                continue
+            conn.execute("INSERT INTO held_ping_releases (question_id, cause, at) VALUES (?, ?, ?)",
+                         (question_id, cause, now))
+            if cause == "unread" and conn.execute(
+                    "SELECT 1 FROM replies WHERE kind = 'answer' AND ref_store = 'questions.db' AND ref_id = ?",
+                    (q.id,)).fetchone() is None:
+                ln = lease.by_harness_session(conn, q.agent_session_id)
+                store._reply(conn, ln.threads[0] if ln is not None and len(ln.threads) == 1 else None, "answer",
+                             "questions.db", q.id,
+                             {"text": f"question #{q.n}: {q.what}"[:_TEXT_MAX], "by": "service",
+                              "why": f"the coordinator had not read it {int(after.total_seconds() // 60)} minutes "
+                                     "after it was filed"}, now)
+            if cause != "answered":
+                out.append((q, cause))
     return out
 
 
