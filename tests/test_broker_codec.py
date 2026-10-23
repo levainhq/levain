@@ -434,3 +434,75 @@ def test_price_is_hashable_and_per_use_immutable():
 
 def test_every_unbounded_field_has_a_disabled_by_row():
     assert {f for c in codec.CODECS.values() for f in c.unbounded_fields} == set(codec._DISABLED_BY)
+
+
+# codex MED (L3_a1_r2.txt): image positions in Responses tool OUTPUTS and prompt variables, from the Responses
+# create reference (1023-8/3c2a/A1_FIX2_RETURN.md names the pages). Each position: a small URL image counts one
+# image at image_tokens; a large data-URL image there has its data out of the byte term.
+_BIG = "data:image/png;base64," + "A" * 4000
+
+
+def _resp_at(pos, image_url):
+    img = {"type": "input_image", "image_url": image_url}
+    body = {"model": "m1", "max_output_tokens": 10}
+    if pos == "function_call_output":
+        body["input"] = [{"type": "function_call_output", "call_id": "c", "output": [img]}]
+    elif pos == "custom_tool_call_output":
+        body["input"] = [{"type": "custom_tool_call_output", "call_id": "c", "output": [img]}]
+    elif pos == "computer_call_output":
+        body["input"] = [{"type": "computer_call_output", "call_id": "c",
+                          "output": {"type": "computer_screenshot", "image_url": image_url}}]
+    else:
+        body["input"] = "x"
+        body["prompt"] = {"id": "pmpt_1", "variables": {"pic": img, "who": "a"}}
+    return body
+
+
+_RESP_POSITIONS = ["function_call_output", "custom_tool_call_output", "computer_call_output", "prompt_variable"]
+
+
+def _resp_est(fwd_bytes, n):
+    in_est = fwd_bytes + n * EO.image_tokens + EO.overhead_tokens
+    return -(-(in_est * EO.in_) // 1_000_000) + -(-(10 * EO.out) // 1_000_000)
+
+
+@pytest.mark.parametrize("pos", _RESP_POSITIONS)
+def test_responses_small_url_image_counts_at_image_tokens(pos):
+    body = _resp_at(pos, "https://example.test/a.png")
+    assert codec.CODECS["openai-responses"]._strip_images(body)[1] == 1
+    est, _, fwd = _go("openai-responses", json.dumps(body), EO)
+    assert est == _resp_est(len(fwd.encode()), 1)
+
+
+@pytest.mark.parametrize("pos", _RESP_POSITIONS)
+def test_responses_data_url_image_data_out_of_bytes(pos):
+    body = _resp_at(pos, _BIG)
+    est, _, fwd = _go("openai-responses", json.dumps(body), EO)
+    assert _BIG in fwd
+    assert est == _resp_est(len(fwd.replace(_BIG, "").encode()), 1)
+
+
+def test_responses_image_shape_off_a_tool_output_item_counts_in_full():
+    # the position is the item's documented type, not the shape: an input_image under `output` of an item that is
+    # not a tool-call output is text the provider reads.
+    body = {"model": "m1", "max_output_tokens": 10,
+            "input": [{"type": "function_call", "call_id": "c", "name": "f", "arguments": "{}",
+                       "output": [{"type": "input_image", "image_url": _BIG}]}]}
+    assert codec.CODECS["openai-responses"]._strip_images(body)[1] == 0
+    est, _, fwd = _go("openai-responses", json.dumps(body), EO)
+    assert est == _resp_est(len(fwd.encode()), 0)
+
+
+@pytest.mark.parametrize("cname,body", [
+    ("openai-chat", {"model": "m1", "max_tokens": 10, "messages": [{"role": "user", "content": "x"}]}),
+    ("openai-responses", {"model": "m1", "max_output_tokens": 10, "input": [
+        {"role": "user", "content": [{"type": "input_image", "image_url": "https://example.test/a.png"}]}]}),
+])
+def test_estimate_serializes_once_when_nothing_is_stripped(monkeypatch, cname, body):
+    # complement LOW (L3_a1_r2.txt): reuse the cap check's serialization when no image data was emptied.
+    c = codec.CODECS[cname]
+    calls = []
+    real = codec.serialize
+    monkeypatch.setattr(codec, "serialize", lambda o: calls.append(1) or real(o))
+    c.estimate(body, EO)
+    assert len(calls) == 1

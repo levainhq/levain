@@ -120,9 +120,9 @@ class Checked:
 class Codec:
     """One `body_codec`. Subclasses name the codec and its shapes; the walk and the arithmetic are shared."""
     name = ""
-    #: the content-block `type`s that are an image AT A CONTENT POSITION (`_strip_images`), counted at `image_tokens`
-    #: each with their data excluded.
-    image_types: Tuple[str, ...] = ()
+    #: the PATH table: every position the provider's reference documents as image-bearing, as (path, the `type`s that
+    #: are an image there). An image at one is counted at `image_tokens` with its data excluded (`_strip_images`).
+    image_paths: Tuple[Tuple[Tuple[Any, ...], Tuple[str, ...]], ...] = ()
     #: the content-block `type`s the estimate cannot see (documents, provider-fetched files): unproven / refused.
     unbounded_blocks: Tuple[str, ...] = ()
     #: top-level fields that make the provider add content the estimate cannot see, unless `_DISABLED_BY` disables them.
@@ -229,60 +229,32 @@ class Codec:
     # -- the estimate --------------------------------------------------------------------------------------------
 
     def _strip_images(self, obj: Any) -> Tuple[Any, int]:
-        """A copy of `obj` with the data string of each image at a CONTENT POSITION emptied, and the number of those
-        images. Only a content position is an image to the provider; an image-shaped dict anywhere else (a tool's
-        schema, a tool call's input) is text it tokenizes, so its bytes count in full."""
-        raise NotImplementedError
-
-    def _empty_image(self, d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """`d` with its image data emptied when `d` is one of this codec's image blocks, else None."""
-        raise NotImplementedError
-
-    def _strip_blocks(self, blocks: Any, nested: str = "") -> Tuple[Any, int]:
-        # one `content[]` list: each image block emptied; a block of type `nested` holds its own `content[]` list.
-        if not isinstance(blocks, list):
-            return blocks, 0
-        out: List[Any] = []
+        """`obj` with the data string of each image at one of this codec's `image_paths` emptied, and the number of
+        those images. Only a documented image position is an image to the provider; an image-shaped dict anywhere else
+        (a tool's schema, a tool call's input) is text it tokenizes, so its bytes count in full. Copy-on-write: when
+        nothing is emptied the answer IS `obj`, so `estimate` can reuse its serialization."""
         n = 0
-        for b in blocks:
-            e = self._empty_image(b) if isinstance(b, dict) else None
-            if e is not None:
-                out.append(e)
-                n += 1
-            elif nested and isinstance(b, dict) and b.get("type") == nested and "content" in b:
-                inner, m = self._strip_blocks(b["content"])
-                out.append(dict(b, content=inner))
-                n += m
-            else:
-                out.append(b)
-        return out, n
+        for path, types in self.image_paths:
+            obj, m = _strip_path(obj, path, types, self._empty_image)
+            n += m
+        return obj, n
 
-    def _strip_items(self, obj: Any, key: str, nested: str = "") -> Tuple[Any, int]:
-        # `obj[key][].content[]`: messages (anthropic, chat) or input items (responses).
-        items = obj.get(key) if isinstance(obj, dict) else None
-        if not isinstance(items, list):
-            return obj, 0
-        out: List[Any] = []
-        n = 0
-        for it in items:
-            if isinstance(it, dict) and "content" in it:
-                c, m = self._strip_blocks(it["content"], nested)
-                out.append(dict(it, content=c))
-                n += m
-            else:
-                out.append(it)
-        return dict(obj, **{key: out}), n
+    def _empty_image(self, d: Dict[str, Any]) -> Dict[str, Any]:
+        """`d`, an image at an image position, with its image data emptied (`d` itself when it has none to empty)."""
+        raise NotImplementedError
 
     def estimate(self, obj: Mapping[str, Any], price: Price) -> int:
         """R4 §1.2 / §1.3, in integer microdollars, each product rounded up:
         in_est × max(in, cache_write) + ceiling × out + Σ max_uses × per_use, where in_est = the forwarded bytes
         with each image's data excluded + n_images × image_tokens + overhead_tokens. Run it on the object AFTER
         `write_ceiling`, the object keys forwards."""
-        if len(serialize(obj)) > policy.BODY_CAP_MAX:
+        fwd = len(serialize(obj))
+        if fwd > policy.BODY_CAP_MAX:
             # the forwarded bytes, after write_ceiling: no metered body leaves keys above the provider-side bound.
             raise norm.Refused("body-cap", "serialized body above BODY_CAP_MAX")
         stripped, n_images = self._strip_images(obj)
-        in_est = len(serialize(stripped)) + n_images * price.image_tokens + price.overhead_tokens
+        in_est = (fwd if stripped is obj else len(serialize(stripped))) + n_images * price.image_tokens \
+            + price.overhead_tokens
         total = _ceil_mul(in_est, max(price.in_, price.cache_write))
         total += _ceil_mul(self.ceiling(obj, price), price.out)
         total += self._uses(obj, price)
@@ -302,13 +274,67 @@ class Codec:
         return total
 
 
+#: PATH steps: a str is that key of an object; EACH is every element of a list; VALUES is every value of an object;
+#: `_Is(...)` continues only on an object whose `type` is one of its names.
+EACH = "[]"
+VALUES = "{}"
+
+
+@dataclass(frozen=True)
+class _Is:
+    types: Tuple[str, ...]
+
+
+def _strip_path(v: Any, path: Tuple[Any, ...], types: Tuple[str, ...],
+                empty: Callable[[Dict[str, Any]], Dict[str, Any]]) -> Tuple[Any, int]:
+    """`v` with each image at the end of `path` (an object whose `type` is in `types`) passed through `empty`, and
+    their count. A step that does not match (a missing key, a list where an object is expected) ends that branch with
+    nothing stripped. Copy-on-write: an unchanged branch is returned as the same object."""
+    if not path:
+        if isinstance(v, dict) and v.get("type") in types:
+            return empty(v), 1
+        return v, 0
+    step, rest = path[0], path[1:]
+    if isinstance(step, _Is):
+        if isinstance(v, dict) and v.get("type") in step.types:
+            return _strip_path(v, rest, types, empty)
+        return v, 0
+    if step == EACH:
+        if not isinstance(v, list):
+            return v, 0
+        out: List[Any] = []
+        n = 0
+        for x in v:
+            y, m = _strip_path(x, rest, types, empty)
+            out.append(y)
+            n += m
+        return (v if all(a is b for a, b in zip(out, v)) else out), n
+    if step == VALUES:
+        if not isinstance(v, dict):
+            return v, 0
+        new: Dict[str, Any] = {}
+        n = 0
+        for k, x in v.items():
+            new[k], m = _strip_path(x, rest, types, empty)
+            n += m
+        return (v if all(new[k] is v[k] for k in v) else new), n
+    if not isinstance(v, dict) or step not in v:
+        return v, 0
+    y, n = _strip_path(v[step], rest, types, empty)
+    return (v if y is v[step] else dict(v, **{step: y})), n
+
+
 def _ceil_mul(tokens: int, rate_per_million: int) -> int:
     return -(-(tokens * rate_per_million) // 1_000_000)
 
 
 class AnthropicMessages(Codec):
     name = "anthropic-messages"
-    image_types = ("image",)
+    # `messages[].content[]`, and a `tool_result` block's own `content[]` inside it.
+    image_paths = (
+        (("messages", EACH, "content", EACH), ("image",)),
+        (("messages", EACH, "content", EACH, _Is(("tool_result",)), "content", EACH), ("image",)),
+    )
     # document blocks (PDF, text, URL-fetched) and files a container fetches are content the estimate cannot see.
     unbounded_blocks = ("document", "container_upload")
     # the MCP connector feeds remote tool results back.
@@ -317,25 +343,17 @@ class AnthropicMessages(Codec):
     ceiling_fields = ("max_tokens",)
     writes_ceiling = False
 
-    def _empty_image(self, d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if d.get("type") != "image":
-            return None
+    def _empty_image(self, d: Dict[str, Any]) -> Dict[str, Any]:
         src = d.get("source")
         if isinstance(src, dict) and "data" in src:
             return dict(d, source=dict(src, data=""))
         return d
 
-    def _strip_images(self, obj: Any) -> Tuple[Any, int]:
-        # `messages[].content[]`, and a `tool_result` block's own `content[]` inside it.
-        return self._strip_items(obj, "messages", nested="tool_result")
-
 
 class _OpenAI(Codec):
     writes_ceiling = True
 
-    def _empty_image(self, d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if d.get("type") not in self.image_types:
-            return None
+    def _empty_image(self, d: Dict[str, Any]) -> Dict[str, Any]:
         v = d.get("image_url")
         if isinstance(v, str) and v.startswith("data:"):
             return dict(d, image_url="")
@@ -346,7 +364,9 @@ class _OpenAI(Codec):
 
 class OpenAIChat(_OpenAI):
     name = "openai-chat"
-    image_types = ("image_url",)
+    # `messages[].content[]`. A `tool` message's content is text parts only (openai-python
+    # `ChatCompletionToolMessageParam`), so a tool output holds no image position.
+    image_paths = ((("messages", EACH, "content", EACH), ("image_url",)),)
     unbounded_blocks = ("file", "input_audio")
     # `web_search_options` (search models) and OpenRouter's `plugins` add content the estimate cannot see.
     unbounded_fields = ("web_search_options", "plugins")
@@ -358,22 +378,25 @@ class OpenAIChat(_OpenAI):
             return 1
         return max(1, _ceiling_value("n", obj["n"]))
 
-    def _strip_images(self, obj: Any) -> Tuple[Any, int]:
-        return self._strip_items(obj, "messages")
-
 
 class OpenAIResponses(_OpenAI):
     name = "openai-responses"
-    image_types = ("input_image",)
+    # the Responses create reference: a message item's `content[]`; a function / custom tool call output's
+    # `output[]` ("string or array of ResponseInputText or ResponseInputImage or ResponseInputFile"); a computer call
+    # output's `output` (one `computer_screenshot`); a prompt variable's value ("map[string or ResponseInputText or
+    # ResponseInputImage or ResponseInputFile]"). `instructions` is "string or null": no image position.
+    image_paths = (
+        (("input", EACH, "content", EACH), ("input_image",)),
+        (("input", EACH, _Is(("function_call_output", "custom_tool_call_output")), "output", EACH), ("input_image",)),
+        (("input", EACH, _Is(("computer_call_output",)), "output"), ("computer_screenshot",)),
+        (("prompt", "variables", VALUES), ("input_image",)),
+    )
     unbounded_blocks = ("input_file",)
     # server-held state the estimate cannot see, and OpenRouter's `plugins`.
     unbounded_fields = ("previous_response_id", "conversation", "plugins")
     server_tools = ("web_search", "web_search_preview", "file_search", "code_interpreter", "computer_use_preview",
                     "mcp", "image_generation")
     ceiling_fields = ("max_output_tokens",)
-
-    def _strip_images(self, obj: Any) -> Tuple[Any, int]:
-        return self._strip_items(obj, "input")
 
 
 #: `body_codec` -> its codec. Every name of `policy.BODY_CODECS` but `none` (a test asserts the equality).
