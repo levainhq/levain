@@ -6,7 +6,9 @@ A launch row (:mod:`levain.coordinator.lease`) is what was asked for; this modul
 does, in order:
 
   1. the one-spawner compare-and-set (:func:`levain.coordinator.lease.claim_spawn`): still pending, in time, under the
-     live lease's token, and nobody else started it. A loser spawns nothing;
+     live lease's token, and nobody else started it. A loser spawns nothing. The claim
+     (:meth:`levain.coordinator.store.CoordStore.launch_claim_spawn`) also refuses a worker whose thread's budget
+     gauge is crossed, or one holding several threads, writing it failed with nothing started (C6);
   2. the hook check (L2): doctor's own Claude Code check of the launch's directory must report the consent hook
      "wired to this install", and no row of that check may report the hooks turned off (``disableAllHooks`` in any
      settings file a session there loads). Anything else (not wired, off, no install) refuses: a session there would
@@ -291,6 +293,26 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         f"{tail}` (KIND is work, ask, note or relay; one intent per thread);",
         f"- move or fix a thread: `{lv} thread state|set|merge|detach|add ... --by coordinator --token N {tail}`;",
         f"- read: `{lv} drops list {tail}`, `{lv} drops show DROP_ID {tail}`, `{lv} thread list {tail}`.",
+        "",
+        "## The seats' questions (you read them first)",
+        "",
+        f"`{lv} coord questions {tail}` lists the questions you have not read, each marked MAY ANSWER or ESCALATE. "
+        "Your answer is YOUR OWN, never the operator's: it goes to his review queue as a KNOW, the seat gets it "
+        "labelled as yours, and the question stays open for him. Never answer through the question band's own answer "
+        "verb: that is his channel, and it refuses this session. A question's directory and session are the asking "
+        "process's own word, so MAY ANSWER (asked from inside the envelope) is a label, not proof.",
+        "",
+        f"- answer one marked MAY ANSWER, only when its subject is inside the envelope: `{lv} coord answer N "
+        f"--option KEY --token N {tail}` (or `--text WORDS`);",
+        f"- leave the rest to him: `{lv} coord escalate N --why WHY --token N {tail}`.",
+        "",
+        "## Away and budgets",
+        "",
+        f"- when a drop says he is away (\"closing my eyes\"): `{lv} coord away DROP_ID --token N {tail}`. It sets away "
+        "ON only; leaving it is his, signed. While he is away every SIGN waits UNDECIDED for his morning card "
+        f"(`{lv} coord morning {tail}`); you never rule on one.",
+        f"- a thread's budget is a gauge (`{lv} coord budget {tail}`): once crossed, no new worker starts for it, and a "
+        "SIGN to extend waits on his morning card. Only his signature extends it.",
         "",
         "## The drops waiting",
         "",
@@ -634,12 +656,27 @@ def watch_once(store: CoordStore) -> list[str]:
           A pending launch's session is never stopped: its start may be in flight in another process. A session
           matched by name alone is stopped only when its row's ``cwd`` is that launch's realpath directory (a name is
           a string anyone can choose); every ``agents`` and ``stop`` call runs in the store's directory;
-      (e) the brief of every launch that is over is deleted (:func:`_remove_briefs`).
+      (e) the brief of every launch that is over is deleted (:func:`_remove_briefs`);
+      (f) every held question ping now due is sent (C5-1, :func:`levain.consent.band.release_held_pings`), on EVERY
+          pass, whatever ended (a)-(e) early (no ``claude`` on PATH, an unreadable list, a fault): in a Codex-only
+          install this pass may be the only checker (L3 r3).
 
     Any other row in the list is never read further. When the list cannot be read, (b)-(d) do nothing: an unread list
     is no evidence of anything. A list read with no row is a listing like any other (L3 r1 G2): an active launch
     missing from it, and from a second read UNLISTED_RECHECK seconds later, ends."""
+    from levain.consent.band import release_held_pings
+
     lines: list[str] = []
+    try:
+        _watch_pass(store, lines)
+    finally:
+        lines.extend(release_held_pings(store.directory))      # never raises
+    return lines
+
+
+def _watch_pass(store: CoordStore, lines: list[str]) -> None:
+    """(a)-(e) of :func:`watch_once`, its lines appended to ``lines``; it returns early when ``claude`` cannot be
+    read."""
     # lapses and expiries are written first: a launch whose starter was killed outright stays pending until someone
     # writes it expired, and only then does (d) stop the session it left
     store.coord_status()
@@ -671,11 +708,11 @@ def watch_once(store: CoordStore) -> list[str]:
     exe, env = _harness()
     if exe is None:
         lines.append("claude is not on PATH: no session observed")
-        return lines
+        return
     rows = _observed(exe, env, str(store.directory))
     if rows is None:
         lines.append("claude agents --json could not be read: no session observed")
-        return lines
+        return
     missing = [ln for ln in active if ln.harness_session_id not in _by_session(rows)]
     if missing:
         # one read that misses a row is not enough to call a death: a launch ends only when a second read agrees
@@ -736,7 +773,6 @@ def watch_once(store: CoordStore) -> list[str]:
                      f"{_stop(exe, hid, cwd=str(store.directory), env=env)}")
     # again after this pass's own ends, so a session found gone above loses its brief in the same pass (L3 r2)
     lines.extend(_remove_briefs(store))
-    return lines
 
 
 def _minutes(delta: Any) -> int:

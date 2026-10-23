@@ -89,7 +89,7 @@ def make_thread(run, repo, monkeypatch, words="synthetic words one"):
 def echo(run, repo, thread, tmp_path, *extra):
     f = tmp_path / "body.json"
     got = run.json("envelope", "echo", thread, "--where", f"{repo}=README,docs/", "--land", f"{repo}=main",
-                   "--stop", "2h", "--budget", "tool_calls=50,hours=1", "-o", str(f), *extra)
+                   "--stop", "2h", "--budget", "tool_calls=50,tokens=0,hours=1", "-o", str(f), *extra)
     return f, got
 
 
@@ -381,7 +381,7 @@ def test_m7_plain_words(run, repo, tmp_path, monkeypatch):
     err = run("envelope", "echo", thread, "--where", repo, rc=1).err
     assert "REPO=." in err
     text = run("envelope", "echo", thread, "--where", f"{repo}=.", "--land", f"{repo}=main", "--budget",
-               "tool_calls=50,hours=1").out
+               "tool_calls=50,tokens=0,hours=1").out
     assert "the WHOLE repo (every file)" in text and "may land with no conditions" in text
     assert "tool calls: 50 allowed" in text and "hours: 1 allowed" in text and "tokens: 0 allowed" in text
     assert text.count("the budget is a gauge") == 1

@@ -776,6 +776,18 @@ class AuthoritySource:
             raise AuthorityError(got.authority_error or "the authority log yields no head")
         return got.authority
 
+    def head(self) -> tuple[int, str] | None:
+        """The log's stored head ``(seq, hash)``, read without a replay (:func:`levain.authority.log_head`): cheap
+        enough to compare inside another store's write lock against a snapshot this source returned before it."""
+        from levain.authority import log_head
+
+        # a short timeout: this read runs inside another store's write lock, and a head it cannot read is "moved"
+        conn = sqlite3.connect(self._uri, uri=True, isolation_level=None, timeout=2.0)
+        try:
+            return log_head(conn)
+        finally:
+            conn.close()
+
 
 def authority_source(cockpit_db: Path | str, *, anchor: Path | None, cache: ReplayCache | None = None,
                      ssh_keygen: Path | str | None = None) -> AuthoritySource:
