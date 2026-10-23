@@ -10,7 +10,9 @@ Modes (`gate` modes block a writer-thread primitive; `scenario` is the hold scri
   w1-torn        write HALF of that batch, then block (a torn resolution line)
   w2             block after `os.write`, before the flush, of that batch
   w3             run the batch's flush to the end, block before the writer posts the callback
-  row3           an owner task awaiting `durable()` is cancelled while the `reserved` flush is blocked
+  row3           an owner task awaiting `durable()` is cancelled while the `reserved` flush is blocked: the driver cancels
+                 and awaits the owner, waits for its hold to be RESOLVING (the release queued), and only then emits the
+                 `gate` event the parent SIGKILLs on (the flush's own `blocked` event is private to the driver)
   row4           a hold past `send_gate` and `mark_sent`, then block (the await on the upstream drain)
   replay-seed    admit three holds, all durable and unresolved, then block (the file a replay will read)
   replay-gate    (opens the file `replay-seed` left) block replay's `flush-opened`, after its batch was written
@@ -38,6 +40,7 @@ _events_fd = -1
 
 def ev(**kw) -> None:
     kw["t"] = time.time()
+    kw["m"] = time.monotonic()   # durations are measured on this one, never on the wall clock
     os.write(_events_fd, (json.dumps(kw, sort_keys=True) + "\n").encode())
 
 
@@ -74,10 +77,12 @@ def install(mode: str) -> None:
             return real_write(fd, data)
         L._os_write = os_write
     elif mode in ("w2", "row3"):
+        # row3's event is `blocked`, not `gate`: the parent kills on `gate` and the driver emits that only after the
+        # cancel it is testing has run
         def flush(fd):
             if gate.armed:
                 gate.armed = False
-                ev(at="gate", mode=mode)
+                ev(at="gate" if mode == "w2" else "blocked", mode=mode)
                 block_forever()
             return real_flush(fd)
         L._flush = flush
@@ -133,10 +138,10 @@ async def run(mode: str, path: str, arg: str) -> None:
         await h.durable()
         gate.armed = True
         # a hold whose resolution line the blocked flush will never confirm: aclose resolves it, the writer blocks
-        t0 = time.time()
+        t0 = time.monotonic()
         ev(at="aclose-start")
         await led.aclose(float(arg))
-        ev(at="aclose-end", took=time.time() - t0, states=[h.state.name])
+        ev(at="aclose-end", took=time.monotonic() - t0, states=[h.state.name])
         return
     await prelude(led)
     if mode == "prelude-only":
@@ -154,16 +159,29 @@ async def run(mode: str, path: str, arg: str) -> None:
         async def owner() -> None:
             h = led.admit(SCOPE, CAP, bound, "r")
             got.set_result(h)
-            await h.durable()
+            try:
+                await h.durable()
+            except asyncio.CancelledError:
+                ev(at="owner-cancelled", ref=h.seq)
+                h.end()                      # the owner-end column: RELEASED while unsent
+                raise
 
         gate.arm()
         t = asyncio.ensure_future(owner())
         h = await got
         ev(at="admitted", ref=h.seq)
-        while not gate_hit():
+        while not event_seen("blocked"):
             await asyncio.sleep(0.005)
         t.cancel()
+        await asyncio.gather(t, return_exceptions=True)
         ev(at="cancelled", ref=h.seq)
+        for _ in range(2000):                # the release is queued once the hold is RESOLVING
+            if h.state is L.RESOLVING:
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise SystemExit("the cancelled owner's hold never reached RESOLVING: %r" % (h.state,))
+        ev(at="gate", mode=mode, state=h.state.name)
     elif mode == "row4":
         h2 = led.admit(SCOPE, CAP, bound, "r")
         await h2.durable()
@@ -180,9 +198,9 @@ async def run(mode: str, path: str, arg: str) -> None:
     await asyncio.sleep(3600)
 
 
-def gate_hit() -> bool:
+def event_seen(at: str) -> bool:
     with open(_events_path, "rb") as f:
-        return b'"at": "gate"' in f.read()
+        return ('"at": "%s"' % at).encode() in f.read()
 
 
 _events_path = ""

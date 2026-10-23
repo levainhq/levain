@@ -230,7 +230,9 @@ class Front:
 
     async def q(self, attempts: int = 1) -> Dict[str, Any]:
         """One exchange. A connection keys closed with no frame (its pending cap, at accept) is retried, up to
-        `attempts`; `retries` in the result counts them."""
+        `attempts`; `retries` in the result counts them. The retry is valid ONLY for that accept-time close: had keys
+        admitted a hold and then dropped the connection before the first frame, the retry would reserve a second hold
+        (T12 would then fail loudly on an extra `reserved` line)."""
         retries = 0
         while True:
             out = await self._q_once()
@@ -277,8 +279,12 @@ class Front:
 
 
 def ledger_lines(path: str) -> List[dict]:
+    """The ledger's complete lines. The writer may be mid-batch while a test polls, so a trailing line without its
+    `\n` is dropped (replay's torn-tail rule), never parsed."""
     with open(path, "rb") as f:
-        return [json.loads(x) for x in f.read().split(b"\n") if x]
+        raw = f.read()
+    raw = raw[: raw.rfind(b"\n") + 1]
+    return [json.loads(x) for x in raw.split(b"\n") if x]
 
 
 def account_home() -> str:

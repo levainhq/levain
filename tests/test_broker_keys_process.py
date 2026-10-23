@@ -10,6 +10,7 @@ import asyncio
 import os
 import shutil
 import socket
+import sys
 
 import pytest
 
@@ -20,7 +21,7 @@ pytestmark = [pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="unix so
               pytest.mark.skipif(os.geteuid() == 0, reason="keys refuses to run as root (it runs as _levain_keys)")]
 
 SYS_PY = "/usr/bin/python3"
-PYS = [__import__("sys").executable] + ([SYS_PY] if os.path.exists(SYS_PY) else [])
+PYS = [sys.executable] + ([SYS_PY] if os.path.exists(SYS_PY) and sys.executable != SYS_PY else [])
 CAP = 3000
 MAX_CALL = CAP // 3
 N = 20

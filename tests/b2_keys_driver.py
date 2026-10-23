@@ -37,12 +37,16 @@ U._handshake = _handshake
 
 
 def _measure(path: str):
+    """The hooks go in inside `Ledger.attach`, just before the writer thread starts: `Ledger.open`'s own header,
+    directory and `opened` flushes (synchronous, on the opening thread) are never sampled as writer traffic. The
+    sampler thread is stopped and joined before the dump."""
     flush_s: list = []
     depth: list = []
     batch_bytes: list = []
     real_flush, real_write_all = L._flush, L._write_all
-    leds: list = []
     real_attach = L.Ledger.attach
+    stop = threading.Event()
+    samplers: list = []
 
     def flush(fd):
         t = time.perf_counter()
@@ -56,18 +60,23 @@ def _measure(path: str):
         return real_write_all(fd, data)
 
     def attach(self, loop, **kw):
-        leds.append(self)
-        real_attach(self, loop, **kw)
+        L._flush, L._write_all = flush, write_all
 
         def sample():
-            while True:
+            while not stop.is_set():
                 depth.append(self._q.qsize())
-                time.sleep(0.002)
-        threading.Thread(target=sample, daemon=True).start()
+                stop.wait(0.002)
+        real_attach(self, loop, **kw)
+        th = threading.Thread(target=sample, daemon=True)
+        samplers.append(th)
+        th.start()
 
-    L._flush, L._write_all, L.Ledger.attach = flush, write_all, attach
+    L.Ledger.attach = attach
 
     def dump():
+        stop.set()
+        for th in samplers:
+            th.join(5)
         with open(path, "w") as f:
             json.dump({"flush_s": flush_s, "queue_depth_samples": depth, "batch_bytes": batch_bytes}, f)
     return dump
