@@ -107,7 +107,7 @@ def _signer(entry: Any) -> AllowedSigner:
     except ContractError as exc:
         raise SignersError(f"a signer's key does not parse: {exc}") from None
     # the authority's enrol rule for a declared custody (a snapshot entry is never a carried legacy key)
-    problem = custody_problem(key_class, custody, key_type)
+    problem = custody_problem(key_class, custody, key_type, public_key=public_key)
     if problem is not None:
         raise SignersError(f"a signer's custody: {problem}")
     return AllowedSigner(principal=principal, public_key=public_key, fingerprint=fp, key_class=key_class,

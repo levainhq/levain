@@ -102,8 +102,9 @@ def pre_door():
 
     real = auth.custody_problem
 
-    def without_door(key_class, custody, key_type, *, legacy=False, public_key=None):
-        return real(key_class, custody, key_type, legacy=legacy)
+    def without_door(key_class, custody, key_type, *, public_key, legacy=False):
+        # the door's other rules, with key material that is never a passkey's (an empty line)
+        return real(key_class, custody, key_type, legacy=legacy, public_key="")
 
     with mock.patch.object(auth, "custody_problem", without_door):
         yield
@@ -419,3 +420,99 @@ def test_enroll_refuses_a_passkey_at_another_custody_before_it_signs(tmp_path, m
     assert declared_custody(pub, auth.PASSKEY, "display-phone", pk.public_key) == auth.PASSKEY
     with pytest.raises(KeyError_, match="WebAuthn passkey"):
         declared_custody(pub, "fido", "laptop-presence", pk.public_key)   # the ledger init signer's check
+
+
+# --- the 1022+18 L3 r1 sites: the cockpit broker's pending ALLOW, the anchor reset, the signers snapshot door ----------
+
+def cockpit_verdict(home: Path, spores: Path, keydir: Path, custody: str, **sig) -> str | None:
+    """``None`` when the cockpit broker takes ``pk``'s signature over a waiting pending (``pk`` display-phone at
+    ``custody`` in the broker's own signed log, beside an ssh laptop-presence genesis key), else the refusal."""
+    from levain.autonomic.confirm import COCKPIT_NAMESPACE
+    from levain.cockpit.broker import BrokerError
+    from tests.cockpit_authority_rig import RealKey, enrol, link
+    from tests.test_cockpit_k2b_broker import _broker, _move
+
+    b = _broker(home, spores)
+    try:
+        root = RealKey(keydir, "root")
+        enrol(b.db, root, "laptop-presence")
+        pk = WebAuthnKey()
+        link(b.db, {"op": "enrol", "fingerprint": pk.fp, "public_key": pk.public_key, "class": "display-phone",
+                    "custody": custody}, root)
+        pid = _move(b, spores)["pending_id"]
+        signature = pk.sign(b.outcome(pid)["record"].encode(), COCKPIT_NAMESPACE, **sig)
+        try:
+            out = b.submit(pid, signature)
+        except BrokerError as exc:
+            return f"{exc.code}: {exc}"
+        return None if out["state"] == "COMMITTED" else f"state {out['state']}"
+    finally:
+        b.stop()
+
+
+@pytest.fixture
+def broker_home():
+    from tests.test_cockpit_k2b_broker import account_home
+    import tempfile
+
+    d = Path(tempfile.mkdtemp(prefix=".levain-custody-broker-", dir=account_home()))
+    try:
+        (d / "keys").mkdir(mode=0o700)
+        from anneal_memory.spores import SporeStore
+
+        st = SporeStore(d / "spores.json")
+        st.add(type="thought", text="a tray seed", disposition="seed", origin_key="k.seed")
+        yield d
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@pytest.mark.parametrize("custody", [auth.UNSTATED, "fido"])
+@pytest.mark.parametrize("name", list(SIGS))
+def test_the_cockpit_broker_never_takes_a_passkey_stored_at_another_custody(broker_home, old_log, custody, name):
+    """A WebAuthn key never enters the pending ALLOW's signers file, whatever custody the log stores for it."""
+    got = cockpit_verdict(broker_home, broker_home / "spores.json", broker_home / "keys", custody, **SIGS[name])
+    assert got is not None and "custody its key material shows" in got, got
+
+
+def anchor_reset_verdict(tmp: Path, custody: str, **sig) -> str | None:
+    """``None`` when :func:`levain.authority.verify_anchor_reset` takes ``pk``'s reset signature (``pk``
+    laptop-presence at ``custody``), the snapshot read through a replay cache warmed before the door (the log
+    itself would not replay fresh now)."""
+    pk = WebAuthnKey()
+    with pre_door():
+        lg = _log(tmp, pk, "laptop-presence", custody)
+        lg.source()
+    snap = lg.source()                      # the warmed cache: its verified prefix, no fresh replay
+    assert snap.key(pk.fp) is not None
+    message = auth.reset_message(snap.store_id, None, snap.seq, snap.head_hash)
+    try:
+        auth.verify_anchor_reset(snap, None, signer_fp=pk.fp, signature=pk.sign(message, auth.RESET_NAMESPACE, **sig))
+    except auth.AnchorError as exc:
+        return str(exc)
+    return None
+
+
+@pytest.mark.parametrize("name", list(SIGS))
+def test_an_anchor_reset_refuses_a_passkey_stored_at_custody_fido(tmp_path, name):
+    got = anchor_reset_verdict(tmp_path, "fido", **SIGS[name])
+    assert got is not None and "custody its key material shows" in got, got
+
+
+def test_the_enrol_door_has_no_form_without_the_public_key():
+    """The door's key-material rule cannot be skipped by leaving ``public_key`` out: it is a required argument."""
+    with pytest.raises(TypeError):
+        auth.custody_problem("display-phone", "fido", "sk-ecdsa-sha2-nistp256@openssh.com")  # type: ignore[call-arg]
+
+
+def test_a_signers_snapshot_refuses_webauthn_material_at_another_custody():
+    from levain.qbroker.signers import SignersError, _signer
+
+    pk = WebAuthnKey()
+    key_type, key_b64 = pk.public_key.split()
+    entry = {"principal": "phone", "key_type": key_type, "key_b64": key_b64, "key_class": "display-phone",
+             "namespaces": [ANSWER_NAMESPACE]}
+    for custody in (auth.UNSTATED, "fido"):
+        with pytest.raises(SignersError, match="WebAuthn passkey"):
+            _signer({**entry, "custody": custody})
+    assert _signer({**entry, "custody": auth.PASSKEY}).custody == auth.PASSKEY

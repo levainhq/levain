@@ -103,16 +103,16 @@ _CUSTODY_KEY_TYPES: Mapping[str, frozenset[str]] = MappingProxyType({
 _LAPTOP_KEY_TYPES = frozenset().union(*_CUSTODY_KEY_TYPES.values())
 
 
-def custody_problem(key_class: str, custody: Any, key_type: str, *, legacy: bool = False,
-                    public_key: str | None = None) -> str | None:
+def custody_problem(key_class: str, custody: Any, key_type: str, *, public_key: str,
+                    legacy: bool = False) -> str | None:
     """Why ``custody`` cannot be declared for a ``key_class`` key of ``key_type`` (None when it can): the
     one rule the replay enforces and the CLI checks before anything is signed. ``legacy``: the key is
     carried from a levain-cockpit/2 store (its record has ``legacy_enrolled_at``), the one laptop-presence
-    key that may leave its custody ``unstated``. ``public_key`` (the replay always passes it): a key whose
-    material is a WebAuthn passkey's (:func:`is_passkey_material`) is declared ``passkey`` or not at all."""
+    key that may leave its custody ``unstated``. ``public_key`` (required, so no caller can skip the rule): a key
+    whose material is a WebAuthn passkey's (:func:`is_passkey_material`) is declared ``passkey`` or not at all."""
     if not isinstance(custody, str) or custody not in CUSTODIES:
         return f"unknown custody {str(custody)[:40]!r}; one of {', '.join(CUSTODIES)}"
-    if public_key is not None and custody != PASSKEY and is_passkey_material(public_key):
+    if custody != PASSKEY and is_passkey_material(public_key):
         return (f"the key is a WebAuthn passkey (an {_PASSKEY_KEY_TYPE} key made on a web origin, not ssh:); "
                 f"its custody is {PASSKEY}, never {custody}")
     if custody == FIDO_ATTESTED:
@@ -1960,6 +1960,11 @@ def verify_anchor_reset(snap: AuthoritySnapshot, old_anchor: Mapping[str, Any] |
         raise AnchorError(f"{signer_fp} is not an unrevoked key of this log at seq {snap.seq}")
     if key.key_class != LAPTOP:
         raise AnchorError(f"an anchor reset needs a {LAPTOP} key, not {key.key_class}")
+    # the one custody rule, as at every verify site: a snapshot from a replay cache warmed before the enrol door can
+    # hold WebAuthn material at a laptop custody, whose signature ssh-keygen takes without user verification
+    why = custody_mismatch(key.public_key, key.custody)
+    if why is not None:
+        raise AnchorError(f"the anchor reset signer {signer_fp}: {why}")
     message = reset_message(snap.store_id, old_anchor, snap.seq, snap.head_hash)
     try:
         ok = verify_link_sig(message, signature, public_key=key.public_key, fingerprint=key.fingerprint,
