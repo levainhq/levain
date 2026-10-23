@@ -58,7 +58,7 @@ __all__ = [
     "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_mismatch",
     "custody_problem", "is_passkey_material",
     "genesis_policy", "inert_grant", "conn_data_root", "conn_init_hint", "init_hint", "prepare", "read_anchor", "reset_anchor", "reset_hint", "reset_lock",
-    "reset_message", "serve_hint", "sign_and_append",
+    "reset_message", "sign_and_append",
     "presence_missing", "quarantined", "signing_laptops", "snapshot", "sshsig_public_key", "UNSTATED",
     "verify_anchor_reset", "verify_link_sig",
 ]
@@ -1935,12 +1935,6 @@ def conn_init_hint(conn: sqlite3.Connection) -> str:
         return ("levain cockpit ledger init, with its --signing-key (a laptop-presence key) and --data-root "
                 "(the cockpit directory)")
     return init_hint(root)
-
-
-def serve_hint(install: Path | str) -> str:
-    """The command that starts a reported install's cockpit, which is what creates its ``cockpit.db``."""
-    argv = ["levain", "serve", "--write", "--install-class", "reported", "--no-open", "--path", str(install)]
-    return f"`{shlex.join(argv)}`"
 
 
 def anchor_path(data_root: Path | str) -> Path:

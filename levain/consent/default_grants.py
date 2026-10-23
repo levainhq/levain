@@ -128,21 +128,9 @@ def _after_stop(word: str, state: dict) -> str:
     return f"{word}, not signed" if word else "not signed"
 
 
-def _serves(install: Path, root: Path) -> bool:
-    """Starting ``install``'s cockpit (``levain serve --write``) creates the journal at ``root``: ``root`` is its
-    ledger's ``cockpit/``. False for an embedder's root, or an install with no writable ledger."""
-    from levain.dashboard import _resolve_source
-
-    try:
-        scope = _resolve_source(install).write_scope
-        return scope is not None and Path(os.path.realpath(scope.ledger_root / "cockpit")) == Path(os.path.realpath(root))
-    except Exception:  # noqa: BLE001 - unknown is "no": the offer then prints prose and no command
-        return False
-
-
 def _offer(install: Path, adapter: str, *, interactive: bool, emit: Callable[[str], None],
            input_fn: Callable[[str], str], clock: Callable[[], datetime] | None, state: dict) -> None:
-    from levain.authority import init_hint, serve_hint
+    from levain.authority import init_hint
     from levain.cockpit.consent import utc_stamp
     from levain.cockpit.keys import KeyError_, keys
     from levain.consent.grants import list_grants
@@ -170,14 +158,10 @@ def _offer(install: Path, adapter: str, *, interactive: bool, emit: Callable[[st
             emit(f"  default grant: not offered: the authority log at {root} is unusable ({exc})")
             return
         # an absent journal is not an empty log: `ledger init` refuses until the cockpit has been started once
-        if _serves(install, root):
-            emit(f"  default grant: not offered: it would cover {covers}; there is no cockpit journal at {root} yet: "
-                 f"start the cockpit once ({serve_hint(workspace)}), run {init_hint(root)}, then `{force}` offers it")
-        else:
-            emit(f"  default grant: not offered: it would cover {covers}; there is no cockpit journal at {root} yet "
-                 f"and this install does not start it: start the cockpit that uses that directory, give it an "
-                 f"authority log (levain cockpit ledger init, with its --signing-key and --data-root), then "
-                 f"`{force}` offers it")
+        emit(f"  default grant: not offered: it would cover {covers}; there is no cockpit journal at {root} yet: "
+             f"start the cockpit that uses that directory (levain serve --write) and open it once in the browser, "
+             f"then run levain cockpit ledger init (with its --signing-key and --data-root), then `{force}` "
+             f"offers it")
         return
     except Exception as exc:  # noqa: BLE001 - an unreadable log never fails init
         emit(f"  default grant: not offered: the authority log at {root} could not be read "

@@ -92,22 +92,23 @@ def _key_create(tmp_path: Path, monkeypatch, capsys, key: Path) -> str:
     return next(line for line in capsys.readouterr().out.splitlines() if line.startswith("next"))
 
 
-def test_key_create_names_ledger_init_and_enroll_only_for_a_journal_that_exists(tmp_path: Path, monkeypatch,
-                                                                                capsys) -> None:
+def _make_install(inst: Path) -> None:
+    (inst / ".levain").mkdir(parents=True, exist_ok=True)
+    (inst / ".levain" / "memory.db").write_bytes(b"")
+
+
+def test_key_create_pastes_a_command_only_for_a_real_install_with_a_journal(tmp_path: Path, monkeypatch, capsys) -> None:
     inst = tmp_path / "inst dir"
     inst.mkdir()
+    _make_install(inst)
     monkeypatch.chdir(inst)
     key = tmp_path / "k ey" / "made"
     root = inst.resolve() / ".levain" / "cockpit"
-    # the install has no cockpit yet: the command that creates it, then the init, and no init pasted before it
+    # a real install with no journal yet: prose only (no serve paste, no init before the journal exists)
     nxt = _key_create(tmp_path, monkeypatch, capsys, key)
-    first, second = _spans(nxt)
-    ns = _parsed(_argv_of(first, key), monkeypatch)
-    assert ns.func.__name__ == "_cmd_serve" and ns.write and ns.install_class == "reported", nxt
-    assert not (root / "cockpit.db").exists() and "<" not in nxt, nxt
-    assert (_parsed(_argv_of(second, key), monkeypatch).data_root, ) == (root,), nxt
-    # the journal exists: the init for a new log, or the enrol into an existing one (this key's public half,
-    # the one placeholder for the signing key, the same data root), every span quoted through a shell split
+    assert _spans(nxt) == [] and "`" not in nxt and "<" not in nxt and "serve" in nxt, nxt
+    assert not (root / "cockpit.db").exists()
+    # the journal exists: the init for a new log, or the enrol into an existing one
     root.mkdir(parents=True)
     CockpitDB(root).set_install_class("reported")
     nxt = _key_create(tmp_path, monkeypatch, capsys, key)
@@ -118,6 +119,25 @@ def test_key_create_names_ledger_init_and_enroll_only_for_a_journal_that_exists(
     assert (ns.func.__name__, ns.data_root, ns.signing_key, ns.key) == (
         "_cmd_cockpit_enroll", root, key, Path(str(key) + ".pub")), nxt
     assert "<" not in nxt, nxt
+
+
+def test_key_create_in_a_dir_with_no_install_store_pastes_no_command(tmp_path: Path, monkeypatch, capsys) -> None:
+    """codex OPEN 6: a directory with no .levain/memory.db resolves a root that serve would refuse: prose only."""
+    d = tmp_path / "repo"
+    d.mkdir()
+    monkeypatch.chdir(d)
+    nxt = _key_create(tmp_path, monkeypatch, capsys, tmp_path / "k" / "made")
+    assert "`" not in nxt and _spans(nxt) == [], nxt
+
+
+def test_key_create_survives_any_error_resolving_the_cockpit(tmp_path: Path, monkeypatch, capsys) -> None:
+    """complement LOW-MED: the key is made; a hint failure is prose, never a traceback."""
+    from levain import cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_cockpit_root", lambda args: (_ for _ in ()).throw(KeyError("odd")))
+    nxt = _key_create(tmp_path, monkeypatch, capsys, tmp_path / "k" / "made")
+    assert _spans(nxt) == [], nxt
 
 
 def test_key_create_outside_an_install_pastes_no_command(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -148,28 +168,19 @@ def _offer(inst: Path) -> list[str]:
     return said
 
 
-def test_default_grant_with_no_journal_starts_the_cockpit_first_and_pastes_no_ledger_init(tmp_path: Path,
-                                                                                         monkeypatch) -> None:
-    """codex MED: `ledger init` refuses a root with no cockpit.db, so an absent journal is not an empty log."""
-    inst, root = _grant_install(tmp_path, monkeypatch)
-    (line,) = _offer(inst)
-    spans = _spans(line)
-    serve, init, force = spans
-    assert _parsed(_argv_of(serve, tmp_path / "k"), monkeypatch).func.__name__ == "_cmd_serve", line
-    ns = _parsed(_argv_of(force, tmp_path / "k"), monkeypatch)
-    assert (ns.func.__name__, ns.path, ns.adapter, ns.force) == ("_cmd_init", inst.resolve(), "claude-code", True), line
-    # the printed serve target is the install whose ledger's cockpit/ is the root that was reported
-    from levain.cli import _cockpit_root
-    import argparse
-    assert _cockpit_root(argparse.Namespace(path=_parsed(_argv_of(serve, tmp_path / "k"), monkeypatch).path,
-                                            data_root=None)) == root
-
-
-def test_default_grant_for_an_embedders_root_pastes_no_serve_command(tmp_path: Path, monkeypatch) -> None:
-    inst, _ = _grant_install(tmp_path, monkeypatch, root=tmp_path / "elsewhere" / "cockpit")
-    (line,) = _offer(inst)
-    assert not any(" serve " in span for span in _spans(line)), line
-    assert "<" not in line and len(_spans(line)) == 1, line      # only the complete --force re-offer
+def test_default_grant_with_no_journal_is_prose_about_starting_the_cockpit_and_pastes_only_the_force(
+        tmp_path: Path, monkeypatch) -> None:
+    """codex MED: the serve paste-command does not create cockpit.db (the broker starts on the first request), so
+    nothing is printed that claims to; `ledger init` is not pasted before a journal exists either."""
+    for root in (None, tmp_path / "elsewhere" / "cockpit"):
+        inst, rt = _grant_install(tmp_path, monkeypatch, root=root)
+        (line,) = _offer(inst)
+        (force,) = _spans(line)
+        ns = _parsed(_argv_of(force, tmp_path / "k"), monkeypatch)
+        assert (ns.func.__name__, ns.path, ns.adapter, ns.force) == ("_cmd_init", inst.resolve(), "claude-code", True), line
+        assert "serve" not in force and "ledger" not in force and "<" not in line, line
+        assert "no cockpit journal" in line and "levain serve --write" in line, line
+        (tmp_path / "an install").rmdir()
 
 
 def test_the_printed_ledger_init_runs_once_the_journal_exists_and_the_force_remedy_keeps_the_install(
