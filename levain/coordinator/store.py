@@ -415,7 +415,9 @@ class CoordStore:
                 except ConsentError as exc:
                     raise CoordError(f"sent_at: {exc}") from None
                 if sent > parse_stamp(now) + _SENT_SKEW:
-                    raise CoordError(f"sent_at {sent_at} is ahead of the store's clock ({now})")
+                    gap = round((sent - parse_stamp(now)).total_seconds() / 60)
+                    raise CoordError(f"sent_at {sent_at} is ahead of the store's clock ({now}): the sending device's "
+                                     f"clock runs about {gap} minutes ahead of this Levain's, so set it right")
             if _carry is not None:
                 # a drop carrying an envelope (C2): the carrier inserts it, after its own checks, in this transaction
                 return _carry(conn, now, words=words, sha=sha, surface=surface, outbox_id=outbox_id, sent_at=sent_at,
