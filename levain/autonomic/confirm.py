@@ -37,13 +37,16 @@ from pathlib import Path
 
 from levain.autonomic.pending import PendingAction
 
-__all__ = ["NAMESPACE", "COCKPIT_NAMESPACE", "DEFAULT_SSH_KEYGEN", "CockpitVerdict", "challenge",
+__all__ = ["NAMESPACE", "COCKPIT_NAMESPACE", "COCKPIT_PHONE_NAMESPACE", "DEFAULT_SSH_KEYGEN", "CockpitVerdict", "challenge",
            "ssh_keygen_problem", "trust_anchor_problem", "verify_cockpit_signature", "verify_signature",
            "verify_signature_status", "VERIFIED", "NOT_VERIFIED", "UNAVAILABLE"]
 
 NAMESPACE = "levain-confirm"
 # the cockpit broker's namespace (K2b design §6.5): a signature in one namespace never verifies in the other
 COCKPIT_NAMESPACE = "levain-cockpit"
+# a phone passkey's signature over a cockpit pending (K8): the broker gives a passkey's signer line this namespace
+# only, so a passkey's signature never verifies as a laptop's cockpit signature, and no laptop key's as a phone's
+COCKPIT_PHONE_NAMESPACE = "levain-cockpit-phone"
 CHALLENGE_FORMAT = "levain-confirm/2"
 # the verifier: an absolute path, never a PATH lookup (a binary planted earlier on PATH could print the
 # "Good signature" line for any signer). Overridable only by an explicit gate argument.
@@ -201,17 +204,20 @@ class CockpitVerdict:
     fingerprint: str | None = None
 
 
-_GOOD_COCKPIT = re.compile(r'Good "' + re.escape(COCKPIT_NAMESPACE)
-                           + r'" signature for (\S+) with (\S+) key (SHA256:[A-Za-z0-9+/]{43})')
+_GOOD_COCKPIT = {ns: re.compile(r'Good "' + re.escape(ns)
+                                + r'" signature for (\S+) with (\S+) key (SHA256:[A-Za-z0-9+/]{43})')
+                 for ns in (COCKPIT_NAMESPACE, COCKPIT_PHONE_NAMESPACE)}
 
 
 def verify_cockpit_signature(message: bytes, signature: str | None, signers_file: Path | str, *,
                              owners: frozenset[int] = _ROOT, timeout: float = 10.0,
-                             ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> CockpitVerdict:
-    """Who signed ``message`` in :data:`COCKPIT_NAMESPACE`, named by the signature itself (K2b design
+                             ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+                             namespace: str = COCKPIT_NAMESPACE) -> CockpitVerdict:
+    """Who signed ``message`` in ``namespace`` (:data:`COCKPIT_NAMESPACE`, or :data:`COCKPIT_PHONE_NAMESPACE` for
+    a phone passkey; any other is NOT_VERIFIED), named by the signature itself (K2b design
     §6.5): ``ssh-keygen -Y find-principals`` must print exactly one principal of ``signers_file``,
     ``-Y verify`` as that principal must succeed, and its output must hold exactly one anchored
-    ``Good "levain-cockpit" signature for <principal> with <type> key SHA256:...`` line, whose
+    ``Good "<namespace>" signature for <principal> with <type> key SHA256:...`` line, whose
     fingerprint is returned for the caller to look up (class, revocation). ``owners`` is who may own
     the signers file and its directories: the caller states it, and until the governed start check
     (K2b-3) exists the broker passes the reported set ``{0, its uid}`` for every install. The
@@ -219,7 +225,7 @@ def verify_cockpit_signature(message: bytes, signature: str | None, signers_file
     try:
         if not isinstance(signature, str) or len(signature) > _MAX_SIGNATURE or _BEGIN not in signature:
             return CockpitVerdict(NOT_VERIFIED)
-        if not isinstance(message, bytes):
+        if not isinstance(message, bytes) or namespace not in _GOOD_COCKPIT:
             return CockpitVerdict(NOT_VERIFIED)
         problem, keygen = trust_anchor_problem(ssh_keygen, what="ssh-keygen")
         if problem is None:
@@ -248,7 +254,7 @@ def verify_cockpit_signature(message: bytes, signature: str | None, signers_file
             principal = names[0]
             cp = subprocess.run(
                 [str(keygen), "-Y", "verify", "-f", str(real_signers), "-I", principal,
-                 "-n", COCKPIT_NAMESPACE, "-s", sig_path],
+                 "-n", namespace, "-s", sig_path],
                 input=message, capture_output=True, timeout=timeout, env=dict(_VERIFY_ENV))
         finally:
             if sig_path is not None:
@@ -259,7 +265,7 @@ def verify_cockpit_signature(message: bytes, signature: str | None, signers_file
         if cp.returncode != 0:
             return CockpitVerdict(NOT_VERIFIED)
         out = (cp.stdout or b"").decode("utf-8", "replace") + "\n" + (cp.stderr or b"").decode("utf-8", "replace")
-        good = [m for m in (_GOOD_COCKPIT.fullmatch(ln.strip()) for ln in out.splitlines()) if m]
+        good = [m for m in (_GOOD_COCKPIT[namespace].fullmatch(ln.strip()) for ln in out.splitlines()) if m]
         if len(good) != 1 or good[0].group(1) != principal:
             return CockpitVerdict(NOT_VERIFIED)
         return CockpitVerdict(VERIFIED, principal, good[0].group(3))

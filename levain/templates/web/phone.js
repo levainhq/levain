@@ -33,7 +33,12 @@
   // which enrolled passkey THIS browser made: fingerprint -> credential id, so the OS prompt is asked for that one
   const mapKey = () => "levain-passkeys:" + rpId;
   const mine = () => { try { return JSON.parse(store.get("localStorage", mapKey()) || "{}") || {}; } catch (e) { return {}; } };
-  const forget = (fp) => { const all = mine(); delete all[fp]; store.set("localStorage", mapKey(), JSON.stringify(all)); };
+  // the ONE rule for a passkey prompt that did not sign, said by every navigator.credentials.get ceremony on this
+  // page: a cancelled Face ID and a passkey this phone no longer holds both read NotAllowedError, and this browser
+  // cannot tell them apart, so this browser's record of its passkey is never forgotten on a refusal (M17 L3 r1 M-8,
+  // ruled for every ceremony at 1022+19 Q2). There is no forget: a passkey deleted from the phone stays pinned until
+  // this page's storage is cleared (a known 1.0 edge, 1022+19 Q1). `what` says what did not happen
+  const declined = (e, what) => "the passkey did not sign (" + ((e && e.name) || "cancelled") + "); " + what;
   const remember = (fp, rawId) => { const all = mine(); all[fp] = rawId; store.set("localStorage", mapKey(), JSON.stringify(all)); };
 
   function call(method, route, body) {
@@ -54,7 +59,7 @@
   const writeIns = new Map(); // sign request id -> {sha256, words}: the write-in being typed, kept across redraws
                               // for the version it was typed on only
 
-  function draw(data) {
+  function draw(data, seq) {
     rpId = data.rp_id || rpId;
     const list = $("requests");
     const rows = Array.isArray(data.pending) ? data.pending : [];
@@ -112,6 +117,8 @@
         ? "a passkey is enrolled for " + rpId + ", not one this browser made. Make one here if this phone has none."
         : "no passkey is enrolled for " + rpId + " yet. Make one here, then enrol it from the laptop.";
     if (!usable) $("status").textContent += " · this browser cannot use a passkey here (needs https)";
+    drawGrants(data);
+    drawDrops(data, seq);
   }
 
   // a question: text only (never HTML) for everything the agent wrote. No passkey: the answer is unsigned and
@@ -305,6 +312,13 @@
   document.addEventListener("visibilitychange", () => {
     if (document.hidden && closePick && closePick()) setTimeout(load, 0);
   });
+  // so does leaving its view (phone_app.js's tabs): a picker or a revoke still being asked for, left on a hidden tab,
+  // would hold every list still where nobody can see it. A ceremony past its Face ID prompt is not dismissed
+  // and so does any open K8 review (signPending): the view change dismisses every one (dismissReviews, below)
+  window.levainViewChanged = () => {
+    const picked = !!(closePick && closePick());
+    if (dismissReviews() || picked) setTimeout(load, 0);
+  };
 
   function start(r, decision, signers, say, actions, ruling, go, what) {
     const run = go || ((fp, rawId) => answer(r, decision, fp, rawId, say, ruling));
@@ -385,9 +399,8 @@
           say(head + " \u00b7 signed by " + ((a.body.ruling || {}).signer_fp || "") + " \u00b7 delivery " + (d.route || "") + ": " + (d.reason || ""),
               a.body.answered && d.route !== "failed" && d.route !== "none" ? "ok" : "bad");
         }, (e) => {
-          if (rawId && e && e.name === "NotAllowedError") forget(fp);
           again();
-          say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was answered or allowed", "bad");
+          say(declined(e, "nothing was answered or allowed"), "bad");
         });
     }).catch((e) => say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
       .finally(() => { busy--; setTimeout(load, 1500); });
@@ -415,12 +428,7 @@
           // the ruling stands either way; a delivery that failed or had nothing to deliver is shown as a failure
           say(done + " · signed by " + a.body.signer_fp + where, d.route === "failed" || d.route === "none" ? "bad" : "ok");
         },
-              (e) => {
-                // asked for one credential and the OS had none it would use: forget it here, so the next tap is not
-                // pinned to a passkey this phone no longer holds
-                if (rawId && e && e.name === "NotAllowedError") forget(fp);
-                say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was answered", "bad");
-              });
+              (e) => say(declined(e, "nothing was answered"), "bad"));
     }).catch((e) => say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
       .finally(() => { busy--; setTimeout(load, 1500); });
   }
@@ -598,10 +606,7 @@
           say("signed" + (a.body.choice ? " (" + a.body.choice + ")" : "") + " · by " + a.body.signer_fp + " in "
               + a.body.namespace, "ok");
         });
-      }, (e) => {
-        if (rawId && e && e.name === "NotAllowedError") forget(fp);
-        say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was signed", "bad");
-      });
+      }, (e) => say(declined(e, "nothing was signed"), "bad"));
     }).catch((e) => {
       const name = (e && e.name) || "error";
       if (sent) return unsure("not sure this was signed (the page failed: " + name + "): check the list");
@@ -755,12 +760,220 @@
         if (cancel) reasons.delete(r.id);
         last = (cancel ? "cancelled " : "signed ") + (r.template && r.template.id || r.id);
         say((cancel ? "cancelled" : "signed") + " \u00b7 by " + a.body.signer_fp + " \u00b7 job " + a.body.state, "ok");
-      }), (e) => {
-        if (rawId && e && e.name === "NotAllowedError") forget(fp);
-        say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); " + (cancel ? "the job is not cancelled" : "nothing was signed"), "bad");
-      });
+      }), (e) => say(declined(e, cancel ? "the job is not cancelled" : "nothing was signed"), "bad"));
     }).catch((e) => say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
       .finally(() => { busy--; setTimeout(load, 1500); });
+  }
+
+  // M17: the Grants tab. consent.json carries `grants` (levain.consent.grant_phone): every standing grant the cockpit
+  // the consent hook names holds, what it answered (a count and the newest calls, each with the outcome the ledger
+  // read) and the passkeys that may revoke it. A revoke is ONE authority link the server builds and holds: the page
+  // sends the grant's `instance` as listed, shows the link's record (`line`, exactly what is signed), and only the
+  // sheet's own tap asks for Face ID. The page never sends a link; the log verifies the signature and every refusal
+  // shown is the server's words. A grant that answered a call which was then refused is the one to look at for a
+  // demotion: it leads the list, and its refused calls lead its card. Whether it has one is the server's count over all
+  // its calls (`answered.refused_count`), never read off the newest calls it sends
+  const grantNotes = new Map();   // grant id + instance -> [text, kind], kept across redraws of that instance only
+  let grantLast = "";             // the last revoke made here: the revoked grant leaves the list, its result stays
+  const grantCalls = (g) => (g.answered && Array.isArray(g.answered.recent) ? g.answered.recent : []);
+  const refusedShown = (g) => grantCalls(g).filter((c) => c && c.outcome === "refused").length;
+  const refusedCalls = (g) => Math.max(g.answered && Number.isInteger(g.answered.refused_count) ? g.answered.refused_count : 0,
+                                       refusedShown(g));
+  // a note is said about one grant instance: the same id made again starts with none
+  const noteKey = (g) => (typeof g.id === "string" ? g.id : "") + "\u0000" + (typeof g.instance === "string" ? g.instance : "");
+
+  // a read that failed (no token, a revoked device, the port unreachable) is said on the Grants tab too, and the cards
+  // still there are from an earlier read: their revoke buttons are off until a read succeeds and draws them again
+  function grantsUnread(text) {
+    const list = $("grants-list"), status = $("grants-status");
+    if (status) status.textContent = "the grants could not be read: " + text
+      + (list && list.children.length ? " · the grants below are from an earlier read; revoke is off until a read succeeds" : "");
+    if (list) list.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+  }
+
+  function drawGrants(data) {
+    const list = $("grants-list"), status = $("grants-status");
+    if (!list || !status) return;
+    // sort is stable: the server's order holds among grants with and among grants without a refused call
+    const rows = (Array.isArray(data.grants) ? data.grants.slice() : [])
+      .sort((a, b) => (refusedCalls(b) > 0 ? 1 : 0) - (refusedCalls(a) > 0 ? 1 : 0));
+    const listed = new Set(rows.map(noteKey));
+    for (const k of Array.from(grantNotes.keys())) if (!listed.has(k)) grantNotes.delete(k);
+    const flagged = rows.filter((g) => refusedCalls(g) > 0).length;
+    const note = typeof data.grants_note === "string" ? data.grants_note : "";
+    // a read the server could not make is said as that, never as "no standing grants"
+    status.textContent = (rows.length ? rows.length + (rows.length === 1 ? " standing grant" : " standing grants")
+                                        + (flagged ? " · " + flagged + " with a refused call" : "")
+                                      : note ? "the grants: " + note : "no standing grants")
+      + (grantLast ? " · last: " + grantLast : "");
+    const inert = typeof data.inert_note === "string" ? data.inert_note : "";
+    list.replaceChildren(...rows.map((g) => grantCard(g, note, inert)));
+  }
+
+  function grantCard(g, signerNote, inertNote) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const state = sv(g.state);
+    const card = el("article", "req grant" + (state === "live" ? "" : " " + (state || "unknown")) + (refusedCalls(g) ? " demote" : ""));
+    card.dataset.grant = sv(g.id);
+    const tools = Array.isArray(g.tools) ? g.tools.filter((t) => typeof t === "string").join(", ") : "";
+    const head = el("div", "req-head");
+    head.append(el("span", "tool", tools || sv(g.kind) || "(grant)"), el("span", "tier" + (state === "live" ? "" : " off"), state),
+                el("span", "meta", sv(g.agent) || sv(g.kind)));
+    card.appendChild(head);
+    if (sv(g.workspace)) card.appendChild(el("div", "where", "in " + g.workspace));
+    if (Array.isArray(g.postures) && g.postures.length) card.appendChild(el("div", "where", "modes " + g.postures.join(", ")));
+    if (g.mcp_fields && typeof g.mcp_fields === "object") {
+      for (const [tool, fields] of Object.entries(g.mcp_fields)) {
+        const f = fields && typeof fields === "object" ? Object.entries(fields).map(([k, v]) => k + "=" + v).join(", ") : "";
+        card.appendChild(el("div", "where", tool + ": " + f));
+      }
+    }
+    card.appendChild(el("div", "where", (state === "expired" ? "expired " : "until ") + readable(g.expires_at)
+                        + " · " + sv(g.kind) + " · " + sv(g.id_shown)));
+    if (state === "inert" && inertNote) card.appendChild(el("div", "where", inertNote));
+    // what it answered: the count, how many were refused, then the newest calls the server sent, refused ones first
+    // (sort is stable, so each group stays newest first). A refused call older than those is counted, not listed
+    const a = g.answered && typeof g.answered === "object" ? g.answered : {};
+    const count = Number.isInteger(a.count) ? a.count : 0;
+    const refused = refusedCalls(g), older = refused - refusedShown(g);
+    const calls = grantCalls(g).slice().sort((x, y) => (y.outcome === "refused" ? 1 : 0) - (x.outcome === "refused" ? 1 : 0));
+    card.appendChild(el("div", "where answered", count ? "answered " + count + (count === 1 ? " call" : " calls")
+                        + (a.last_at ? ", last " + readable(a.last_at) : "")
+                        + (refused ? " · " + refused + " refused" + (older > 0 ? ", " + older + " of them older than the calls below" : "") : "")
+                        + (calls.length < count ? " · the newest " + calls.length + " of " + count + " below" : "")
+                                                      : "answered nothing yet"));
+    for (const c of calls) {
+      const o = sv(c.outcome) || "unknown";
+      card.appendChild(el("div", "call " + o, o + " · " + sv(c.tool) + " · " + readable(c.at) + (sv(c.cwd) ? " · in " + c.cwd : "")));
+    }
+    const note = el("div", "note");
+    const key = noteKey(g);
+    const say = (text, kind) => { grantNotes.set(key, [text, kind || ""]); note.textContent = text; note.className = "note " + (kind || ""); };
+    if (grantNotes.has(key)) say(grantNotes.get(key)[0], grantNotes.get(key)[1]);
+    const signers = Array.isArray(g.signers) ? g.signers : [];
+    if (!signers.length && !grantNotes.has(key)) { note.textContent = signerNote || "no passkey here may revoke this grant"; }
+    const actions = el("div", "actions");
+    const b = el("button", "deny", "revoke with passkey");
+    b.type = "button";
+    b.disabled = !usable || !signers.length;
+    b.addEventListener("click", () => start(g, null, signers, say, actions, false,
+                                            (fp, rawId) => revokeAsk(g, fp, rawId, say, actions), "to REVOKE grant " + sv(g.id_shown)));
+    actions.appendChild(b);
+    card.append(actions, note);
+    return card;
+  }
+
+  // the bytes a passkey signs to sign the authority link `line` chained to `prevHash` (WebAuthn challenge = the SSHSIG
+  // signed-data blob in the levain-authority namespace: "SSHSIG", then namespace, reserved, hash name and the SHA-512 of
+  // prevHash + "\n" + line, each as an SSH string), exactly as levain.consent.passkey.challenge builds it
+  function linkChallenge(prevHash, line) {
+    const enc = (t) => new TextEncoder().encode(t);
+    const str = (b) => { const n = b.length, out = new Uint8Array(4 + n); out.set([n >>> 24 & 255, n >>> 16 & 255, n >>> 8 & 255, n & 255]); out.set(b, 4); return out; };
+    return crypto.subtle.digest("SHA-512", enc(prevHash + "\n" + line)).then((h) => {
+      const parts = [enc("SSHSIG"), str(enc("levain-authority")), str(new Uint8Array(0)), str(enc("sha512")), str(new Uint8Array(h))];
+      const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+      parts.reduce((at, p) => { out.set(p, at); return at + p.length; }, 0);
+      return out;
+    });
+  }
+
+  // the challenge, then the sheet: the link's record and the tap that asks for Face ID. The page recomputes the
+  // challenge from the line it shows and the head the server says it chains to, and puts only that to the passkey: a
+  // challenge over anything else is refused, so the line on the sheet is what Face ID signs. From the tap until Face
+  // ID is asked, the ask holds the list still (busy) and is this page's closePick: leaving the view or the page drops
+  // it (a reply that comes back after that is ignored, and the server's held link lapses unsigned)
+  function revokeAsk(g, fp, rawId, say, actions) {
+    if (busy) return;
+    busy++;
+    let released = false, dropped = false, closer = null;
+    const release = () => {
+      if (released) return;
+      released = true;
+      if (closePick && closePick === closer) closePick = null;
+      busy--;
+      setTimeout(load, 1500);
+    };
+    const drop = () => { if (released) return false; dropped = true; say(""); release(); return true; };
+    closePick = closer = drop;
+    const base = "/grant/" + encodeURIComponent(g.id) + "/";
+    say("asking for the revoke to sign…");
+    call("POST", base + "revoke-challenge", { signer_fp: fp, instance: g.instance }).then((c) => {
+      if (dropped) return;
+      if (!c.ok) { say("not revoked: " + why(c), "bad"); return release(); }
+      let link = null;
+      try { link = JSON.parse(c.body.line); } catch (e) { link = null; }
+      // the server builds the link itself; one that does not name this grant is not put to the passkey
+      if (!link || link.op !== "revoke_grant" || link.grant_id !== g.id || typeof c.body.challenge !== "string") {
+        say("not revoked: the link the server sent does not name this grant, so nothing was signed", "bad");
+        return release();
+      }
+      if (typeof c.body.prev_hash !== "string") {
+        say("not revoked: the server did not say which log head the link chains to, so the page cannot check what Face ID would sign; nothing was signed", "bad");
+        return release();
+      }
+      return linkChallenge(c.body.prev_hash, c.body.line).then((want) => {
+        if (dropped) return;
+        if (b64u(want) !== c.body.challenge) {
+          say("not revoked: the challenge the server sent is not over the link it shows, so nothing was signed", "bad");
+          return release();
+        }
+        sheet(c, want);
+      });
+    }).catch((e) => { if (dropped) return; say("the page failed (" + ((e && e.name) || "error") + "); nothing was signed", "bad"); release(); });
+
+    function sheet(c, want) {
+      const box = el("div", "sheet");
+      box.append(el("div", "where", "Face ID signs exactly this authority link (it removes grant " + (g.id_shown || g.id) + "):"),
+                 el("pre", "display line", c.body.line));
+      const row = el("div", "actions");
+      const go = el("button", "deny", "revoke with Face ID");
+      go.type = "button";
+      const no = el("button", "quiet", "cancel");
+      no.type = "button";
+      row.append(go, no);
+      box.appendChild(row);
+      actions.after(box);
+      say("check the link, then revoke with Face ID");
+      const dismiss = () => { if (released) return false; box.remove(); say(""); release(); return true; };
+      closePick = closer = dismiss;
+      no.addEventListener("click", dismiss);
+      go.addEventListener("click", () => {
+        if (released || go.disabled) return;
+        go.disabled = no.disabled = true;
+        if (closePick === dismiss) closePick = null;   // Face ID is being asked: leaving the page no longer dismisses
+        closer = null;
+        say("confirm with your passkey to revoke…");
+        // sent: the assertion has gone to the server, so only its answer says what happened. Everything before that
+        // (a credential id that does not decode, a passkey that gives nothing) is said as nothing revoked
+        let sent = false, setup = true, asked;
+        try {
+          const pk = { challenge: want, rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+          if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
+          asked = Promise.resolve(navigator.credentials.get({ publicKey: pk }));
+          setup = false;
+        } catch (e) {
+          asked = Promise.reject(e);
+        }
+        asked.then((cred) => {
+          if (!cred || !cred.response) return say("not revoked: the passkey gave nothing to send; nothing was revoked", "bad");
+          const assertion = { authenticator_data: b64u(cred.response.authenticatorData),
+                              client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
+          sent = true;
+          return call("POST", base + "revoke", assertion).then((r) => {
+            // the passkey signed: once it is sent, only the server's own refusal (a 4xx) says nothing was revoked
+            if (!r.ok && (r.status === 0 || r.status >= 500)) return say("result unknown (" + why(r) + "): the list re-reads to show whether the grant is still there", "bad");
+            if (!r.ok) return say("not revoked: " + why(r), "bad");
+            grantLast = "revoked " + (g.id_shown || g.id);
+            say("revoked · link seq " + r.body.seq + (r.body.warning ? " · " + r.body.warning : ""), "ok");
+          });
+        }, (e) => {
+          if (setup) return say("not revoked: the page could not ask the passkey (" + ((e && e.name) || "error") + "); nothing was signed", "bad");
+          say(declined(e, "nothing was revoked"), "bad");
+        }).catch((e) => say(sent ? "result unknown (the page failed: " + ((e && e.name) || "error") + "): the list re-reads to show where it stands"
+                                 : "not revoked: the page failed before anything was sent (" + ((e && e.name) || "error") + "); nothing was revoked", "bad"))
+          .finally(() => { box.remove(); release(); });
+      });
+    }
   }
 
   // enrolment: the created credential is kept, so a failed key-line call retries only that call, never makes another
@@ -829,13 +1042,522 @@
 
   function load() {
     if (held()) return;
-    if (!token) { $("status").textContent = "open this page from the link `levain consent phone` printed (it carries the token)"; return; }
+    if (!token) {
+      $("status").textContent = "open this page from the link `levain consent phone` printed (it carries the token)";
+      grantsUnread("this page has no token (open it from the link `levain consent phone` printed)");
+      return;
+    }
+    const seq = storeSeq;     // the identity changes this page had made when the listing was asked for
     call("GET", "/consent.json").then((r) => {
       // re-checked here, not only before the GET: any hold that began while it was in flight keeps the list still
       if (held()) return;
-      if (r.ok) draw(r.body); else $("status").textContent = why(r);
+      if (r.ok) draw(r.body, seq); else { $("status").textContent = why(r); grantsUnread(why(r)); }
     });
   }
+
+  // K8: a cockpit write signed by this phone's passkey. issue(fp) files the write as a pending under that passkey (the
+  // phone app's POST /cockpit/verb, or a cancel) and resolves to the server's answer; the challenge then comes from the
+  // server's STORED record, fetched by the pending's id (GET /cockpit/pending/<id>), never from bytes this page holds;
+  // review(pending, sign, dismiss) shows that same record and calls sign() from its own Sign tap (a fresh gesture for the
+  // passkey prompt), and is required: there is no signing without it. The page stays held (busy) while the sheet is up,
+  // until a sign() gets the server's terminal answer or dismiss() is called: by the sheet, by the page hiding, or by
+  // the phone app's view change through window.levainDismissReviews (a dismiss during an in-flight sign
+  // waits for that sign to settle), so a refresh never redraws it away; sign() runs one ceremony at a time (a second
+  // tap does nothing; a non-terminal failure lets the sheet sign again, still held; after dismiss it does nothing). A pending the server no longer holds
+  // WAITING (expired, or decided elsewhere) gets no sheet and no prompt. The broker verifies the signature over its own
+  // copy and decides; the outcome names the signer the server persisted. done(answer) gets every outcome, and a review
+  // that ends without the server's terminal answer ends with a DISMISSED answer: it is one terminal answer, and a
+  // non-terminal result (a 4xx, say) may precede DISMISSED, so a caller treats DISMISSED, not the first answer, as the end. review() may answer the sheet's
+  // closed(reason): it is called once when the review ends ("answered" or "dismissed"), so the sheet takes its Sign
+  // away; a dismissal from outside the sheet (the page hiding, the view change) is also said. This page decides nothing:
+  // what it shows is the server's words.
+  // every open review's dismiss, so a view change can close them all (window.levainDismissReviews below)
+  const openReviews = new Set();
+  function dismissReviews() {
+    const open = Array.from(openReviews);
+    open.forEach((d) => d());
+    return open.length;
+  }
+  function signPending(issue, fp, rawId, say, review, done) {
+    if (busy) return;
+    busy++;
+    const finish = (a) => { if (done) done(a); };
+    const failed = (e) => ({ ok: false, status: 0, body: { message: (e && e.name) || "error" } });
+    say("filing the write to sign…");
+    Promise.resolve(issue(fp)).then((p) => {
+      if (!p || !p.ok) { finish(p || failed()); return say(p ? why(p) : "the write was not filed", "bad"); }
+      if (p.body.state !== "WAITING") { finish(p); return say("the write is " + p.body.state, "bad"); }
+      const base = "/cockpit/pending/" + encodeURIComponent(p.body.pending_id);
+      return call("GET", base).then((c) => {
+        if (!c.ok) { finish(c); return say(why(c), "bad"); }
+        // the server's own state, re-read: an expired or already decided pending is never put to the passkey
+        if (c.body.state !== "WAITING" || !c.body.challenge) {
+          finish(c);
+          return say("the write is " + c.body.state + (c.body.reason ? " (" + c.body.reason + ")" : "") + "; nothing to sign", "bad");
+        }
+        return new Promise((settle, fail) => {
+          // one sign lifecycle per review. signing: a ceremony or its POST is in flight (one at a time); dismissed: the
+          // sheet closed; released: the hold (busy) is given back, which happens exactly once: on a terminal answer
+          // (the server's own 2xx), on dismiss when no sign is in flight, or when the sign in flight at a dismiss
+          // settles. A non-terminal failure (a 4xx, a cancelled passkey, an unknown outcome) re-arms Sign and keeps the
+          // hold while the sheet is open. After dismiss or release, sign() does nothing, however late it is called
+          // answered: the server's terminal answer ended this review; away: it was dismissed from outside the sheet
+          // (the page hid, the view changed); closed: what review() answered, the sheet's own closed(reason), told
+          // once at release so the sheet never shows a live Sign over a review that is over; said: the last line this
+          // review said, kept so a dismissal that waited on an in-flight sign is said with that sign's result
+          let signing = false, dismissed = false, released = false, answered = false, away = false, closed = null, said = null;
+          const tell = (text, kind) => { said = [text, kind]; say(text, kind); };
+          const DEAD = "this review was dismissed (the page was hidden or the view changed), so its Sign does nothing: "
+            + "start the write again to sign it";
+          // L3 r3: for the review's lifetime a hidden page (a switched tab, a backgrounded PWA) dismisses it, and so
+          // does the phone app's view change (window.levainDismissReviews), so the hold never freezes the list
+          // behind a sheet nobody can see. Both hooks go at release, exactly once
+          const onHide = () => { if (document.hidden) leave(); };
+          const unhook = () => { document.removeEventListener("visibilitychange", onHide); openReviews.delete(leave); };
+          // release: exactly once. A review that ends without the server's terminal answer was dismissed: done() gets a
+          // DISMISSED answer (so a caller awaiting it never hangs), a dismissal from outside the sheet is said, and the
+          // sheet's closed() is told either way. Nothing here says nothing was signed: an earlier attempt may have sent
+          // its signature with an unknown result
+          // Each notification (done, say, closed) is isolated: one that throws must never keep the hold (busy), so
+          // settle() runs in a finally whatever they do
+          const isolated = (f) => { try { f(); } catch (e) { try { console.error("levainSign: a review callback threw", e); } catch (_) { /* no console */ } } };
+          let closedTold = false;
+          const tellClosed = () => {
+            if (closedTold || typeof closed !== "function") return;
+            closedTold = true;
+            isolated(() => closed(answered ? "answered" : "dismissed"));
+          };
+          const release = () => {
+            if (released) return;
+            released = true;
+            try {
+              unhook();
+              if (!answered) {
+                isolated(() => finish({ ok: false, status: 0, body: { state: "DISMISSED", message: "the review was dismissed" } }));
+                if (away) isolated(() => say(said && said[1] === "bad" && said[0] !== DEAD ? said[0] + " · " + DEAD : DEAD, "bad"));
+              }
+              tellClosed();
+            } finally {
+              settle();
+            }
+          };
+          const dismiss = () => { if (released) return; dismissed = true; if (!signing) release(); };
+          const leave = () => { if (released) return; away = true; dismiss(); };
+          document.addEventListener("visibilitychange", onHide);
+          openReviews.add(leave);
+          const sign = () => {
+            const say = tell;        // what this review says is kept (said), for a dismissal that waits on this sign
+            if (released && away && !answered) return say(DEAD, "bad");   // a stale Sign over a review dismissed from outside says so
+            if (signing || dismissed || released) return;
+            signing = true;
+            // sent: the signature has gone to the server, so only its own answer says what happened; told: done() has
+            // this attempt's answer; terminal: the server answered 2xx, so this review is decided
+            let sent = false, told = false, terminal = false;
+            say("confirm with your passkey to apply " + c.body.verb + " (" + c.body.tier + ")…");
+            const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+            if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
+            return navigator.credentials.get({ publicKey: pk }).then((cred) => {
+              const assertion = { fingerprint: fp, authenticator_data: b64u(cred.response.authenticatorData),
+                                  client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
+              sent = true;
+              return call("POST", base + "/signature", assertion);
+            }).then((a) => {
+              terminal = a.ok;
+              told = true;
+              finish(a);
+              // the passkey signed: once it is sent, only the server's own refusal (a 4xx) says nothing was applied
+              if (!a.ok && (a.status === 0 || a.status >= 500)) return say("result unknown (" + why(a) + "): reload to see whether it applied", "bad");
+              if (!a.ok) return say("not applied: " + why(a), "bad");
+              // the signer named is the one the server persisted, never the fingerprint this page sent
+              say(a.body.state + (a.body.reason ? " (" + a.body.reason + ")" : "") + (a.body.signer_fp ? " · signed by " + a.body.signer_fp : ""),
+                  a.body.state === "COMMITTED" ? "ok" : "bad");
+            }).catch((e) => {
+              if (!sent) {
+                finish(failed(e));
+                return say(declined(e, "nothing was applied"), "bad");
+              }
+              // a fault after the send: the server may have applied it, so this page never says it did not
+              say("result unknown (the page failed: " + ((e && e.name) || "error") + "): reload to see whether it applied", "bad");
+              if (!told) finish(failed(e));
+            }).finally(() => { signing = false; if (terminal) answered = true; if (terminal || dismissed) release(); });
+          };
+          try {
+            closed = review(c.body, sign, dismiss);
+            if (released) tellClosed();      // a review that released during review() itself (a sync dismiss) is told once, now
+          } catch (e) { if (!released) { released = true; unhook(); } fail(e); }
+        });
+      });
+    }).catch((e) => { finish(failed(e)); say("the page failed (" + ((e && e.name) || "error") + ")", "bad"); })
+      .finally(() => { busy--; });
+  }
+  // the ONE hook the phone app signs through (Q4 ruling b): the consent ceremony's own start (the passkey picker), with
+  // signPending as its continuation. No second copy of the ceremony lives in phone_app.js.
+  window.levainSign = (signers, say, actions, issue, review, done) => {
+    // the passkey signs only what a review sheet showed (B5 condition 3): with no review there is no signature, and
+    // nothing is filed
+    if (typeof review !== "function") {
+      say("nothing was signed: a write is signed only from its review sheet", "bad");
+      if (done) done({ ok: false, status: 0, body: { message: "no review sheet" } });
+      return;
+    }
+    start(null, null, signers, say, actions, false, (fp, rawId) => signPending(issue, fp, rawId, say, review, done));
+  };
+  // the hook point a view change calls (the phone app's tab/view switch): dismiss every open review, under the same
+  // rule as the sheet's own dismiss (a sign in flight releases when it settles). Answers how many it dismissed
+  window.levainDismissReviews = dismissReviews;
+
+  // ---- the drop sheet (coordinator C1/C2: levain.coordinator.phone) ---------------------------------------------------
+  // A drop is your words to the coordinator, the same drop `levain drop` makes. Send puts it in this phone's OUTBOX
+  // first, under an outbox id picked once, then sends it; it leaves the outbox only on the server's 2xx, which IS the
+  // delivered receipt. A send whose answer never came (no network, a 5xx) stays and is sent again under the SAME id, so
+  // the store files it once however often it arrives (a resend answers created:false). A refusal (a 4xx) stays,
+  // marked, until you send it again or discard it. An ENVELOPE (where it may work, a land, a budget, a stop) is built
+  // by the server with the CLI's own builder; the sheet shows the server's own words for it, and only the sheet's Sign
+  // asks for the passkey, over the challenge the server built. The signed envelope rides in the outbox with its drop.
+  // A land named here is always marked "inferred, not where you dropped from": the phone records no branch it dropped
+  // from, and that mark is inside what the passkey signs. This page decides nothing: every verdict is the server's.
+  // WHO: the coordinator routes take a PAIRED device's token only; this run's phone link is refused (device_required),
+  // said on the outbox card as why it is not delivered yet. WHERE: every outbox item is bound to the coordinator store
+  // identity this page held when the item was made (coord_store_id, null while there is no store). Nothing is sent
+  // until this page load has READ the current identity, and an item bound to another identity is shown as "from
+  // another Levain", never sent: a phone name that now answers for another dispatch directory never files it. On a
+  // fresh install the envelope REVIEW makes the store: the signed drop is bound to the id the review's reply names,
+  // and a reply that says its request made the store (store_created) rebinds every item made while there was none.
+  // The review carries the identity the page read and is held to the drop's rule, so a non-null identity the page
+  // read is never replaced from a review reply: a name that now answers for another store refuses the review.
+  // An item made while there was no store that meets one it never saw made gets ONE receipt-only retry per identity:
+  // the server answers it from its resend lookup (its own first send made the store, and the reply was lost) or
+  // refuses it other_store with nothing written, and then it is "from another Levain".
+  // CROSS-TAB: every outbox change runs under one Web Lock (navigator.locks) and re-reads the outbox inside it, and a
+  // change another tab made (the storage event) redraws this one. A SIGNED drop the server refuses is never filed
+  // plain behind your back: a stale signature (envelope-stale) offers Sign again, and every refused signed drop offers
+  // Send as a plain drop (the same outbox id, the envelope dropped, your words unchanged).
+  const OUTBOX_KEY = "levain-outbox:" + location.hostname;
+  const STORE_KEY = "levain-store-id:" + location.hostname;
+  let outboxMem = null;       // the outbox when this browser keeps no storage (private mode): this visit only
+  let flushing = false;
+  let dropData = null;        // the last listing's coord_* keys
+  let dropLast = "";          // the last delivery said here, kept across redraws
+  let storeRead = false;      // this page load has read the store identity (flush waits for it)
+  let storeId = null;         // that identity (null: no store yet)
+  let storeSeq = 0;           // counts the identity changes this page made itself (a reply that made the store)
+  const rememberedStore = () => { const v = store.get("localStorage", STORE_KEY); return v === null ? undefined : v === "" ? null : v; };
+  const stamp = () => new Date().toISOString().replace(/\.(\d{3})Z$/, ".$1000Z");   // the store's fixed-width UTC form
+  const outboxId = () => {
+    const b = new Uint8Array(16);
+    crypto.getRandomValues(b);
+    return "ph-" + Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  };
+  function outboxRead() {
+    if (outboxMem) return outboxMem.slice();
+    try { const v = JSON.parse(window.localStorage.getItem(OUTBOX_KEY) || "[]"); return Array.isArray(v) ? v : []; }
+    catch (e) { return []; }
+  }
+  function outboxWrite(items) {
+    try { window.localStorage.setItem(OUTBOX_KEY, JSON.stringify(items)); outboxMem = null; }
+    catch (e) { outboxMem = items.slice(); }
+  }
+  // the one way the outbox changes: f(all) edits the array read INSIDE the lock, then it is written back
+  function withOutbox(f) {
+    const run = () => { const all = outboxRead(); f(all); outboxWrite(all); };
+    if (navigator.locks && typeof navigator.locks.request === "function") return navigator.locks.request(OUTBOX_KEY, run);
+    return Promise.resolve().then(run);
+  }
+  function outboxEdit(id, f) {
+    return withOutbox((all) => {
+      const i = all.findIndex((x) => x.outbox_id === id);
+      if (i < 0) return;
+      const next = f(all[i]);
+      if (next === null) all.splice(i, 1); else all[i] = next;
+    });
+  }
+  const foreign = (x) => storeRead && x.store_id !== storeId;     // made against another store identity
+  // a foreign item made while there was no store, not yet asked of this identity: its one receipt-only retry
+  const unasked = (x) => foreign(x) && x.store_id === null && x.asked !== storeId;
+  // a reply whose request made the store: every item made while there was none belongs to it
+  function adoptStore(sid) {
+    storeSeq++;
+    storeId = sid;
+    storeRead = true;
+    store.set("localStorage", STORE_KEY, sid);
+    return withOutbox((all) => { for (const x of all) if (x.store_id === null) x.store_id = sid; });
+  }
+  function dropSay(text, kind) {
+    const n = $("drop-note");
+    if (!n) return;
+    n.textContent = text;
+    n.className = "note " + (kind || "");
+  }
+  function enqueue(item) {
+    return withOutbox((all) => {
+      const i = all.findIndex((x) => x.outbox_id === item.outbox_id);
+      if (i < 0) all.push(item); else all[i] = item;          // Sign again replaces its own item, same outbox id
+    }).then(() => { drawOutbox(); flush(); });
+  }
+  // the identity an item made now is bound to: this load's, else the last one this phone read here
+  function boundStore() {
+    if (storeRead) return storeId;
+    return rememberedStore();
+  }
+  // a refusal is a 4xx the server named (the words, the outbox id, the envelope, another store): sending it unchanged
+  // gets the same answer, so it waits for you. Anything else (no answer, a 5xx, the token refused) is "not delivered yet"
+  const refusal = (status) => status === 400 || status === 409 || status === 413 || status === 422;
+  function flush() {
+    if (flushing || !token || !storeRead) return;
+    const next = outboxRead().find((x) => x.state === "waiting" && (!foreign(x) || unasked(x)));
+    if (!next) return;
+    flushing = true;
+    let again = false;
+    const req = { words: next.words, outbox_id: next.outbox_id, sent_at: next.sent_at, store_id: next.store_id };
+    if (next.envelope) req.envelope = next.envelope;
+    call("POST", "/coord/drop", req).then((a) => {
+      if (a.ok) {
+        const sid = typeof a.body.store_id === "string" ? a.body.store_id : null;
+        // an item made while there was no store, accepted: this reply's request made the store, so every other item
+        // this phone made here before any store existed belongs to it
+        const made = next.store_id === null && sid !== null;
+        if (made) { storeSeq++; storeId = sid; store.set("localStorage", STORE_KEY, sid); }
+        const e = a.body.envelope;
+        const d = a.body.drop || {};
+        dropLast = "delivered " + d.drop_id + (a.body.created ? "" : " (it had arrived before: filed once)")
+          + (e ? (e.taken ? " · envelope " + e.envelope_id + " taken" : " · envelope NOT taken: " + e.refused) : "")
+          + (a.body.woken ? " · coordinator launch " + a.body.woken + " asked for" : "");
+        dropSay(dropLast, e && !e.taken ? "bad" : "ok");
+        again = true;
+        setTimeout(load, 0);
+        return withOutbox((all) => {
+          const i = all.findIndex((x) => x.outbox_id === next.outbox_id);
+          if (i >= 0) all.splice(i, 1);
+          if (made) for (const x of all) if (x.store_id === null) x.store_id = sid;
+        });
+      }
+      const x0 = { why: why(a), error: a.body.error || "" };
+      if (a.body.error === "other_store" && next.store_id === null) {
+        // an item made while there was no store, nothing written: this identity has answered for the item (it shows as
+        // another Levain's once the listing names the store), and the identity is read again. An item bound to a store
+        // is refused below with the server's words: it cannot be sent as it stands
+        setTimeout(load, 0);
+        return outboxEdit(next.outbox_id, (x) => Object.assign({}, x, { asked: storeId }, x0));
+      }
+      if (refusal(a.status)) {
+        again = true;
+        return outboxEdit(next.outbox_id, (x) => Object.assign({}, x, { state: "refused" }, x0));
+      }
+      return outboxEdit(next.outbox_id, (x) => Object.assign({}, x, { tries: (x.tries || 0) + 1 }, x0));
+    }).finally(() => { flushing = false; drawOutbox(); if (again) flush(); });
+  }
+  function firstLine(words, n) {
+    const line = String(words || "").split("\n")[0];
+    return line.length > n ? line.slice(0, n) + "…" : line;
+  }
+  function button(text, f) {
+    const b = el("button", null, text);
+    b.type = "button";
+    b.addEventListener("click", f);
+    return b;
+  }
+  function drawOutbox() {
+    const box = $("drop-outbox");
+    if (!box) return;
+    const items = outboxRead();
+    $("drop-outbox-meta").textContent = (items.length ? items.length + " not delivered" : "empty")
+      + (outboxMem ? " · this browser keeps no storage: the outbox lasts this visit only" : "")
+      + (navigator.locks ? "" : " · one tab at a time: this browser cannot lock the outbox between tabs");
+    box.replaceChildren(...items.map((x) => {
+      const other = foreign(x);
+      const refused = !other && x.state === "refused";
+      const card = el("article", "row drop outbox" + (refused || other ? " refused" : ""));
+      card.dataset.outbox = x.outbox_id;
+      card.appendChild(el("div", "title", firstLine(x.words, 80)));
+      const chips = el("div", "chips");
+      const state = other ? "from another Levain" : refused ? "refused" : "waiting to be delivered";
+      for (const text of [state, x.envelope ? "with a signed envelope" : "plain", "typed " + readable(x.sent_at)])
+        chips.appendChild(el("span", "chip" + (refused || other ? " warn" : ""), text));
+      card.appendChild(chips);
+      if (other) card.appendChild(el("div", "note bad", "made for another Levain than the one answering here now; "
+        + "it is not sent here. Your words are above: copy them into a new drop, or discard this one"));
+      else if (x.why) card.appendChild(el("div", "note " + (refused ? "bad" : ""), (refused ? "refused: " : "not delivered yet (") + x.why + (refused ? "" : "); it is sent again")));
+      const acts = el("div", "acts");
+      if (refused && x.envelope) {
+        // Sign again: the same words and outbox id, reviewed and signed afresh (a stale signature's remedy); both
+        // retries take a fresh sent_at, as Send again does (the refusal may be of the time it was typed)
+        if (x.spec && x.signer_fp) acts.appendChild(button("Sign again", () => envelopeSheet(x.signer_fp, x.raw_id || null, x.words, x.spec, x.outbox_id)));
+        acts.appendChild(button("Send as a plain drop", () => {
+          outboxEdit(x.outbox_id, (y) => Object.assign({}, y, { state: "waiting", why: "", error: "", envelope: null, sent_at: stamp() })).then(() => { drawOutbox(); flush(); });
+        }));
+      } else if (refused) {
+        // a new send moment: the server's refusal may be of the time it was typed (a phone clock ahead of the laptop's)
+        acts.appendChild(button("Send again", () => {
+          outboxEdit(x.outbox_id, (y) => Object.assign({}, y, { state: "waiting", why: "", error: "", sent_at: stamp() })).then(() => { drawOutbox(); flush(); });
+        }));
+      }
+      acts.appendChild(button("Discard", () => { outboxEdit(x.outbox_id, () => null).then(drawOutbox); }));
+      card.appendChild(acts);
+      return card;
+    }));
+  }
+  const RECEIPT = { delivered: "delivered", split: "split", resplit: "regrouped", woken: "coordinator" };
+  function dropCard(d) {
+    const card = el("article", "row drop sent");
+    card.dataset.drop = d.drop_id;
+    card.appendChild(el("div", "title", firstLine(d.words, 120)));
+    const chips = el("div", "chips");
+    for (const text of ["drop " + d.drop_id, "delivered " + readable(d.received_at)]) chips.appendChild(el("span", "chip", text));
+    if (d.envelope_id) chips.appendChild(el("span", "chip", "envelope " + d.envelope_id));
+    else if (d.envelope_refused) chips.appendChild(el("span", "chip warn", "envelope not taken"));
+    card.appendChild(chips);
+    // every drop receipt, oldest first, in the store's own words: the split names its threads, the wake how it went
+    const receipts = Array.isArray(d.receipts) ? d.receipts : [];
+    for (const r of receipts) {
+      const threads = Array.isArray(r.threads) ? r.threads : [];
+      const named = threads.map((t) => String(t.kind || "").toUpperCase() + " " + (t.title || t.thread_id)).join("; ");
+      let line = "receipt: " + (RECEIPT[r.stage] || r.stage) + " " + readable(r.at);
+      if (r.stage === "woken") line += " · launch " + r.launch_id + (r.started ? " started: " : " not started: ") + (r.said || "");
+      else if (r.stage !== "delivered") line += " · " + threads.length + (threads.length === 1 ? " thread" : " threads") + (named ? ": " + named : "");
+      if (r.envelope_refused) line += " · envelope not taken: " + r.envelope_refused;
+      card.appendChild(el("div", "where receipt" + (r.stage === "woken" && !r.started ? " bad" : ""), line));
+    }
+    if (!receipts.some((r) => r.stage === "split")) card.appendChild(el("div", "where", "not split into threads yet"));
+    return card;
+  }
+  function drawDrops(data, seq) {
+    dropData = data;
+    const list = $("drop-recent");
+    if (!list) return;
+    const drops = Array.isArray(data.coord_drops) ? data.coord_drops : [];
+    const note = typeof data.coord_note === "string" && data.coord_note ? data.coord_note : "";
+    $("drop-recent-meta").textContent = note ? "can't read the coordinator's store: " + note : drops.length ? "newest first" : "none yet";
+    list.replaceChildren(...drops.map(dropCard));
+    const repos = Array.isArray(data.coord_repos) ? data.coord_repos : [];
+    $("drop-repos").replaceChildren(...repos.map((r) => { const o = el("option"); o.value = r; return o; }));
+    if (dropLast && !$("drop-note").textContent) dropSay(dropLast, "ok");
+    // the identity is taken only from a listing that read the store (an unreadable store says nothing about it), and
+    // only when this page has not learned the identity from a reply since the listing was asked for: that listing read
+    // the store before the reply that made it, and the next one names it
+    if (data.coord_store_read === true && (seq === undefined || seq === storeSeq)) {
+      storeRead = true;
+      storeId = typeof data.coord_store_id === "string" ? data.coord_store_id : null;
+      store.set("localStorage", STORE_KEY, storeId === null ? "" : storeId);
+    }
+    drawOutbox();
+    flush();
+  }
+  function dropWords() {
+    const w = $("drop-words").value;          // stored verbatim: only an empty drop is refused here
+    if (!w.trim()) { dropSay("type your words first", "bad"); return null; }
+    return w;
+  }
+  if ($("drop-send")) $("drop-send").addEventListener("click", () => {   // a page without the Drop tab wires none
+    const words = dropWords();
+    if (words === null) return;
+    const sid = boundStore();
+    if (sid === undefined) return dropSay("still reading which Levain answers here; send it in a moment", "bad");
+    $("drop-words").value = "";
+    dropSay("in the outbox; sending…");
+    enqueue({ outbox_id: outboxId(), words: words, sent_at: stamp(), state: "waiting", envelope: null, store_id: sid });
+  });
+  function dropSpec() {
+    const repo = $("drop-repo").value.trim(), onto = $("drop-onto").value.trim();
+    if (!repo) return null;
+    const n = (id) => { const v = $(id).value.trim(); return v === "" ? 0 : Number(v); };
+    const spec = { where: [{ repo: repo, paths: ["."] }], lands: onto ? [{ repo: repo, onto: onto }] : [],
+                   stop: $("drop-stop").value, budget: { tool_calls: n("drop-calls"), tokens: n("drop-tokens"), hours: n("drop-hours") } };
+    return spec;
+  }
+  let closeSheet = null;      // the open envelope sheet's dismiss (it holds busy while it is up)
+  if ($("drop-sign")) $("drop-sign").addEventListener("click", () => {
+    const words = dropWords();
+    if (words === null) return;
+    const spec = dropSpec();
+    if (!spec) { $("drop-env").open = true; return dropSay("name the repo the envelope lets it work in", "bad"); }
+    const signers = dropData && Array.isArray(dropData.coord_signers) ? dropData.coord_signers : [];
+    if (!usable) return dropSay("this browser cannot use a passkey here (needs https)", "bad");
+    if (!signers.length) return dropSay((dropData && dropData.coord_signer_note) || "no passkey enrolled for this name can sign an envelope", "bad");
+    start(null, null, signers, dropSay, $("drop-acts"), false, (fp, rawId) => envelopeSheet(fp, rawId, words, spec, null), "to SIGN this drop's envelope");
+  });
+  // the review (the server keeps the body it shows), then Sign: the server mints the payload, signed_at now, and the
+  // passkey signs its challenge. `again` is the outbox id of a refused signed drop being signed again (same words)
+  function envelopeSheet(fp, rawId, words, spec, again) {
+    if (busy || closeSheet) return;
+    let sid = again ? (outboxRead().find((x) => x.outbox_id === again) || {}).store_id : boundStore();
+    if (sid === undefined) return dropSay("still reading which Levain answers here; sign it in a moment", "bad");
+    busy++;
+    const id = again || outboxId();      // picked before the review: the server refuses one already delivered
+    const box = $("drop-review");
+    const text = $("drop-words");
+    dropSay(again ? "building the envelope to sign again…" : "building the envelope to sign…");
+    let signing = false, closed = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      closeSheet = null;
+      openReviews.delete(close);
+      box.hidden = true;
+      box.replaceChildren();
+      text.disabled = false;
+      $("drop-send").disabled = $("drop-sign").disabled = false;
+      busy--;
+    };
+    // the review carries the identity this page read and the server holds it to the drop's rule: a name that now
+    // answers for another store refuses it (other_store), so nothing is signed for a store this page did not read
+    call("POST", "/coord/envelope-review", { words: words, outbox_id: id, spec: spec, signer_fp: fp, store_id: sid }).then((c) => {
+      if (!c.ok) { close(); return dropSay("nothing to sign: " + why(c), "bad"); }
+      // a fresh install's review made the store: only then does a null identity take the reply's (a non-null one the
+      // page read is never replaced from a reply)
+      const rsid = typeof c.body.store_id === "string" ? c.body.store_id : null;
+      const made = rsid !== null && c.body.store_created === true;
+      if (made) adoptStore(rsid).then(drawOutbox);
+      if (sid === null && made) sid = rsid;
+      closeSheet = close;
+      openReviews.add(close);   // a view change or a hidden page dismisses it (window.levainViewChanged)
+      text.disabled = true;     // the words the envelope names are frozen while it is reviewed
+      // and the sheet's own Sign / Dismiss are the only acts: a Send now would file the same words a second time
+      $("drop-send").disabled = $("drop-sign").disabled = true;
+      $("drop-env").open = true;
+      const view = Array.isArray(c.body.view) ? c.body.view.join("\n") : "";
+      const acts = el("div", "acts");
+      const sign = el("button", "go", "Sign with passkey");
+      sign.type = "button";
+      const dismiss = el("button", null, "Dismiss");
+      dismiss.type = "button";
+      dismiss.addEventListener("click", () => { if (!signing) { close(); dropSay("not signed; your words are still here"); } });
+      sign.addEventListener("click", () => {
+        if (signing || closed) return;
+        signing = true;
+        dropSay("confirm with your passkey to sign the envelope…");
+        call("POST", "/coord/envelope-challenge", { review_id: c.body.review_id }).then((ch) => {
+          if (!ch.ok) { signing = false; return dropSay("nothing was signed: " + why(ch), "bad"); }
+          const pk = { challenge: unb64u(ch.body.challenge), rpId: ch.body.rp_id, userVerification: "required", timeout: 60000 };
+          if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
+          return navigator.credentials.get({ publicKey: pk }).then((cred) => {
+            const envelope = { body_text: c.body.body_text, payload: ch.body.payload,
+                               authenticator_data: b64u(cred.response.authenticatorData),
+                               client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
+            signing = false;
+            close();
+            if (!again) text.value = "";
+            dropSay("signed; in the outbox, sending…");
+            const prior = again ? outboxRead().find((x) => x.outbox_id === again) : null;
+            // Sign again keeps its item's binding, unless the review made the store it was made without
+            const bound = prior ? (prior.store_id === null && c.body.store_created === true ? rsid : prior.store_id) : sid;
+            enqueue({ outbox_id: id, words: words, sent_at: stamp(), state: "waiting", envelope: envelope,
+                      store_id: bound, spec: spec, signer_fp: fp, raw_id: rawId || null });
+          }, (e) => { signing = false; dropSay(declined(e, "nothing was signed; sign again or dismiss"), "bad"); });
+        }, () => { signing = false; dropSay("the phone port could not be reached; nothing was signed", "bad"); });
+      });
+      acts.append(sign, dismiss);
+      box.replaceChildren(el("h2", null, "what your passkey signs"), el("pre", "display", view),
+                          digestLine("envelope digest", c.body.digest), acts);
+      box.hidden = false;
+      dropSay("read the envelope, then sign it");
+    }, () => { close(); dropSay("the phone port could not be reached; nothing was signed", "bad"); });
+  }
+  // another tab changed the outbox (or the identity): redraw from storage, and send what is now this tab's to send
+  window.addEventListener("storage", (e) => { if (e.key === OUTBOX_KEY || e.key === null) { drawOutbox(); flush(); } });
+  window.addEventListener("online", flush);
+  drawOutbox();
+  flush();
+  setInterval(flush, 10000);
 
   $("refresh").addEventListener("click", load);
   $("enrol-btn").addEventListener("click", enrol);

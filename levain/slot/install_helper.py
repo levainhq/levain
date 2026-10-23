@@ -17,10 +17,13 @@ credential verbs through a forked child that drops to keys before it opens anyth
 """
 from __future__ import annotations
 
+import fcntl
+import functools
 import json
 import os
 import re
 import select
+import selectors
 import signal
 import stat
 import subprocess
@@ -29,23 +32,25 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, ContextManager, Iterable, Iterator, Mapping, Optional, Sequence, TextIO
+from typing import Callable, ClassVar, ContextManager, Iterable, Iterator, Mapping, Optional, Sequence, TextIO, Tuple
 
 from levain.contracts import canon
 from levain.firing.hands import OPERATOR_RE, HandsSetupError, HostOS, Step, _abs, _kill_all, host_os, run_plan
 from levain.launch import child_env
 from levain.slot import Refused, bwrap, netns, pf, root_tree, units
+from levain.slot import removal as RM
 from levain.slot import generation as gen_mod
 from levain.slot import proc as PR
 from levain.slot import records as R
 from levain.slot import runtime_helper as RH
 from levain.slot import store_verbs as SV
 from levain.slot.root_intent import PhaseFailed
-from levain.slot.intent import (INTENT_PATH, Intent, install_lock, intent_remove_step, intent_text, intent_write_step,
-                                read_intent, write_intent_atomically)
+from levain.slot.intent import (INSTALL_LOCK, INTENT_PATH, Intent, install_lock, intent_remove_step, intent_text, intent_write_step,
+                                parse_intent, read_intent, write_intent_atomically)
 from levain.slot.accounts import (SLOT_MARKER, SLOT_RETIRED_MARKER, Account, Group, account_steps, accounts_of,
-                                  delete_group_steps, membership_pairs, membership_steps, revive_steps,
-                                  shared_group_steps, shared_groups_of, tombstone_steps)
+                                  membership_pairs, membership_steps, revive_steps,
+                                  shared_group_steps, shared_groups_of, member_state, group_state, uid_retires,
+                                  account_state, remove_member_steps, remove_group_steps, remove_account_steps)
 from levain.slot.grammar import LEASE_EXEMPT, SESSION_RE, VERBS, InstallCommand, check_roots, parse_install_argv
 from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS, SLOT_NAME_RE, Allocation,
                              SlotClass, SlotId, allocate, check_capacity, choose_indices, in_own_range,
@@ -56,8 +61,9 @@ from levain.slot.layout import (STORE, Row, base_routes_steps, base_run_rows, ba
                                 parse_pool_config, policy_rows, pool_config_row, pool_config_steps,
                                 pool_config_undo_steps, reserve_row, reserve_steps, roots_steps, row_steps,
                                 run_dir_undo_steps, single_filesystem_steps, slot_rows, tmpfiles_steps,
-                                tmpfiles_undo_steps, ungroup_steps)
-from levain.slot.sudoers import remove_install_sudoers_steps, remove_runtime_sudoers_steps, sudoers_paths, sudoers_steps
+                                tmpfiles_undo_steps, ungroup_steps, entry_state, remove_entry_steps)
+from levain.slot.sudoers import (INSTALL_SUDOERS, RUNTIME_SUDOERS, config_check_step, dropin_state,
+                                 remove_dropin_steps, sudoers_paths, sudoers_steps)
 
 OPERATOR_FORMAT = "levain-operator/1"
 
@@ -106,6 +112,9 @@ class HostFacts:
     live_sessions: tuple[str, ...] = ()
     #: ``L/policy/install-shape`` parsed (row 33), or None: a host set up before it, or never set up.
     install_shape: gen_mod.InstallShape | None = None
+    #: Every user on the host, name -> uid, whatever its label: undo reads whether a recorded account is absent and
+    #: whether another account holds its uid (L3 r2 codex HIGH).
+    user_ids: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -126,6 +135,7 @@ class InstallPlan:
     intent: Intent | None = None         # what the plan's first step journals (§25)
     generation: str | None = None        # the generation the plan makes current (row 33)
     generation_change: bool = False      # repair: the record is absent or names another generation (§2.3)
+    handover: "root_tree.Staged | None" = None   # repair phase A: the staged id, filled by its hash step (§2.2)
 
 
 # --- the operator record ---------------------------------------------------------------------------
@@ -178,8 +188,10 @@ def preflight(cmd: InstallCommand, facts: HostFacts) -> None:
 
 
 def plan_tools(steps: Sequence[Step]) -> tuple[str, ...]:
-    """Every host program a step runs: its argv's, its ``skip_if``'s and its validator's."""
-    return tuple(sorted({x[0] for s in steps for x in (s.argv, s.skip_if, s.validate) if x}))
+    """Every host program a step runs: its argv's, its ``skip_if``'s and its validator's, and the ``tools`` a remove
+    step (:class:`removal.RemoveStep`, a ``call`` whose argv no field names) declares."""
+    return tuple(sorted({x[0] for s in steps for x in (s.argv, s.skip_if, s.validate) if x}
+                        | {t for s in steps for t in getattr(s, "tools", ())}))
 
 
 def extra_tools(host: HostOS, verb: str) -> tuple[str, ...]:
@@ -211,7 +223,7 @@ def check_tools(facts: HostFacts, steps: Sequence[Step], *, verb: str, python: b
 
 
 #: The verbs :func:`main` applies; every other verb of the §5.2 grammar answers ``verb-unbuilt:<verb>``.
-BUILT_VERBS = ("setup", "undo", "replenish", "purge", "set-credential", "remove-credential")
+BUILT_VERBS = ("setup", "undo", "replenish", "purge", "set-credential", "remove-credential", "repair")
 
 
 def helper_pending() -> tuple[str, ...]:
@@ -725,7 +737,9 @@ def _abandoned_setup(facts: HostFacts) -> Intent | None:
     setup died before writing it), or None when undo takes its ordinary path. With no record, only the
     journal's operator may run it, by the name the caller's uid resolves to; a live lease still refuses."""
     j = facts.intent
-    if facts.operator_record is not None or j is None or j.verb != "setup":
+    # An UNDO journal with no operator record is an interrupted undo of such a setup (undo removes its journal before
+    # the record, so an ordinary undo's journal never outlives the record).
+    if facts.operator_record is not None or j is None or j.verb not in ("setup", "undo"):
         return None
     if facts.live_leases > 0:
         raise Refused("live-lease", _live_lease_why("undo", facts))
@@ -758,19 +772,74 @@ def _end_processes(host: HostOS, uid: int, name: str, *,
     return True, ""
 
 
+def _undo_journal_step(host: HostOS, intent: Intent, live: RM.Live) -> Step:
+    """Undo's own journal (FIX1 M2), written whole and durably under :attr:`removal.Live.root` (``/`` on a host)."""
+    path, text = live.at(INTENT_PATH[host]), intent_text(intent)
+    return Step(f"journal what this undo will remove in {INTENT_PATH[host]} (txn {intent.txn})",
+                call=lambda: write_intent_atomically(path, text))
+
+
+def _check_journal_reads_back(host: HostOS, intent: Intent) -> None:
+    """L3 r2 codex MED: undo's journal unions three sets, each within :data:`generation.MAX_MANAGED`, so the union can
+    exceed what :func:`read_intent` accepts. It is parsed back by that reader's own rules (its byte cap, then
+    :func:`parse_intent`) before step one; one that does not read back as itself refuses ``undo-journal-unreadable``
+    with nothing removed, never written to strand the re-run."""
+    data = intent_text(intent).encode()
+    try:
+        if len(data) > gen_mod.MAX_RECORD_BYTES:
+            raise Refused("record-too-large", f"{len(data)} bytes, over {gen_mod.MAX_RECORD_BYTES}")
+        same = parse_intent(data, host) == intent
+    except Refused as e:
+        raise Refused("undo-journal-unreadable", f"undo's journal of {len(intent.managed)} records would not read "
+                                                 f"back ({e.name}: {e.detail}); undo has removed nothing") from None
+    if not same:
+        raise Refused("undo-journal-unreadable", "undo's journal does not read back as written; undo has removed "
+                                                 "nothing")
+
+
+def _uid_is_undos(facts: HostFacts, accounts: Mapping[str, int], name: str, uid: int) -> bool:
+    """Whether undo retires a recorded account's ``uid``: :func:`accounts.uid_retires`, the rule repair's account step
+    also runs (r1b-fix3), over this host's users with Levain's own (``accounts``: live or journal-present; our
+    tombstones)."""
+    return uid_retires(name, uid, users=facts.user_ids, levain={**facts.levain_tombstones, **accounts})
+
+
+def _undo_unit_order(host: HostOS, names: Iterable[str]) -> list[str]:
+    """Undo stops units in reverse start order: a recorded name this code does not ship first (sorted), then the
+    shipped ones in reverse of :data:`units.SERVICES`."""
+    shipped = [s.name for s in reversed(units.services_for(host))]
+    names = set(names)
+    return sorted(names - set(shipped)) + [n for n in shipped if n in names]
+
+
 def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, int],
-              shared_groups: Iterable[str]) -> InstallPlan:
+              shared_groups: Mapping[str, int], live: RM.Live | None = None,
+              end: Callable[[int, str], tuple[bool, str]] | None = None) -> InstallPlan:
     """``accounts``: every live Levain account the directory service holds, name -> uid (== gid);
-    ``shared_groups``: the shared groups present. Order (§23): the runtime sudoers rule first (no new
-    runtime-helper calls), every service stopped and its unit removed, ids retired, processes stopped,
-    accounts tombstoned, every dir naming a shared group given back to root's group, the shared groups
-    deleted, slot confinement removed (Linux netns + the slots' bwrap + tmpfiles.d; macOS the slots'
-    lo0 aliases, the pf rules and pf's enable reference), the install sudoers rule, the intent journal,
-    the operator record LAST. Every step is safe to re-run. The store and the root import tree stay.
-    With a journal (§25), the accounts and groups it names that are present at their journaled ids are
-    tombstoned and deleted with the rest. With no operator record and a SETUP journal (the setup died
-    before its record), undo runs against the journal alone, for its operator, and ends by removing the
-    journal: there is no record to remove."""
+    ``shared_groups``: the shared groups present, name -> their live gid.
+
+    Row 33 R1b: undo removes ``record.managed ∪ journal.managed`` plus its own desired set (what this code would manage
+    for those accounts and groups, so a host with no record undoes as before; a FINISHED repair journal's records are
+    the record's, and undo reads none of them), each record through its kind's per-identity remove step with
+    ``retire=False`` (§1.1 g: undo retires no gid). FIX1: first ``visudo -c`` (a config that does not parse refuses
+    undo with nothing removed), then undo's OWN journal of that whole set (a re-run plans from it, so what this run
+    derived from accounts it then tombstones is not lost). Then, in the order of CONTRACT §23: the
+    runtime sudoers rule first (and every other recorded drop-in but the install rule: no new runtime-helper calls),
+    every unit stopped (reverse start order) before any unit file is removed, slot state and pool config, the account
+    ids retired, each account's processes ended and proven then the account tombstoned, every dir naming a shared
+    group given back to root's group, the memberships, the groups deleted, slot confinement (macOS the lo0 aliases,
+    the pf anchor and pf's enable reference; Linux the AppArmor profile, the bwrap copy, the netns, then tmpfiles.d
+    and R), the install record, ``visudo -c``, the install sudoers rule, the intent journal, the operator record, and
+    the ``visudo -c`` after the install rule as the very last step (it can fail without stranding undo). Every remove
+    step reads its live object before it acts (ABSENT: nothing run; NOT_OURS: left in place), and the other steps
+    are idempotent, so every step is safe to re-run. The store and
+    the root import tree stay: ``entry/1`` records are not undo's. ``live``: every live read and act of the remove
+    steps; ``end``: the account kind's proven process end.
+
+    With a journal (§25), the accounts and groups it names that are present at their journaled ids are undone with
+    the rest. With no operator record and a SETUP journal (the setup died before its record), or the UNDO journal an
+    interrupted undo of that setup wrote, undo runs against the journal alone, for its operator, and removes the
+    journal last of its removals: there is no record to remove."""
     if cmd.verb != "undo":
         raise Refused("wrong-verb", cmd.verb)
     abandoned = _abandoned_setup(facts)
@@ -783,12 +852,12 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         # §25 (c7.7a): only the journal speaks for what that setup made, so the directory service's
         # reports are set aside and the journal's own names, at their journaled ids, are undone.
         operator = abandoned.operator
-        accounts, shared_groups = {}, ()
+        accounts, shared_groups = {}, {}
     check_records(facts, operator)
     host = facts.host
     check_account_ids(host, accounts)
     accounts = dict(accounts)
-    journaled_groups: list[str] = []
+    groups = {g: i for g, i in shared_groups.items() if g in SHARED_GROUPS}
     if facts.intent is not None:
         # §25: whatever an interrupted run made at its journaled ids goes with the rest, a Linux shared
         # group with no label included. A journaled name present at another id is not ours: left alone.
@@ -796,47 +865,94 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         for name, i in ours.items():
             if name in facts.intent.accounts:
                 accounts.setdefault(name, i)
-            else:
-                journaled_groups.append(name)
+            elif name in SHARED_GROUPS:
+                groups.setdefault(name, i)
         check_account_ids(host, accounts)
-    groups = list(dict.fromkeys(g for g in (*shared_groups, *journaled_groups) if g in SHARED_GROUPS))
-    retired_after = frozenset(facts.retired) | frozenset(accounts.values())
+    desired = desired_managed(host, accounts=accounts, shared=groups, operator=operator,
+                              services=[s.name for s in units.services_for(host)], slots=slots_of(accounts),
+                              apparmor=host == "linux", partial_groups=True)
+    shape, journal = facts.install_shape, facts.intent
+    # A FINISHED repair journal (its txn is the record's completed_txn) is settled in the record: undo reads none of its
+    # records, as check_records checks none (an unknown kind there is kept, never read).
+    if journal is not None and shape is not None and journal.txn == shape.completed_txn:
+        journal = None
+    every = (set(shape.managed) if shape is not None else set()) | (set(journal.managed) if journal else set()) | desired
+    every = {r for r in every if r[0] != "entry/1"}               # the root import tree stays (§23)
+    # M2: what this run derived goes into ITS journal before the first removal, and a re-run plans from it (with the
+    # rest): a pre-row-33 install's slot confinement is derived from live accounts, which this run tombstones.
+    # Only records within their bound are journaled, so the re-run's check_records cannot refuse its own journal.
+    txn = facts.intent.txn if facts.intent is not None and facts.intent.verb == "undo" and facts.intent.txn \
+        else gen_mod.new_txn()
+    undo_intent = Intent("undo", operator,
+                         {n: i for n, i in accounts.items() if in_own_range(host, n, i)},
+                         {g: i for g, i in groups.items() if i in RANGES[host].shared}, txn, None,
+                         _shape_of(r for r in every if _in_bound(host, r, operator)))
+    _check_journal_reads_back(host, undo_intent)
+    live = live if live is not None else RM.Live()
+    end = end or (lambda uid, name: _end_processes(host, uid, name))
+
+    def of(kind: str) -> list:
+        return sorted((r for r in every if r[0] == kind), key=repr)
+
+    def remove(records: Iterable, phase: str) -> list[Step]:
+        return [s for k, i in records
+                for s in _kind_steps(host, k, i, phase, live, retire=False, held=False, end=end)]
+
+    install_rule = ("sudoers/1", INSTALL_SUDOERS.name)
+    grants = sorted((r for r in of("sudoers/1") if r != install_rule), key=lambda r: (r[1] != RUNTIME_SUDOERS.name, r[1]))
+    unit_recs = [("unit/1", n) for n in _undo_unit_order(host, (i for _, i in of("unit/1")))]
+    uids = {i[0]: i[1] for _, i in of("account/1")}
+    retired_after = frozenset(facts.retired) | frozenset(u for n, u in uids.items()
+                                                         if _uid_is_undos(facts, accounts, n, u))
     path = RETIRED_IDS_PATH[host]
     mkdir = "/bin/mkdir" if host == "darwin" else _abs("mkdir")
     rm = "/bin/rm" if host == "darwin" else _abs("rm")
     steps: list[Step] = [
-        *remove_runtime_sudoers_steps(host),
-        # Every service stops before anything is removed; their unit files go with them.
-        *units.uninstall_steps(host),
-        # With the services stopped nothing rewrites them: no slot reads as reusable from here on.
-        *slot_state_undo_steps(host, slots_of(accounts)),
+        # M1: a config that does not parse refuses undo here, with nothing removed (every drop-in's own check after its
+        # removal would otherwise stop undo part-way).
+        config_check_step(host, "check the sudoers config with visudo -c before undo removes anything", live=live,
+                          refusal="the sudoers config does not parse: undo has removed nothing; fix what visudo "
+                                  "names, then run undo again", remedy=True),
+        _undo_journal_step(host, undo_intent, live),
+        *remove(grants, "R5"),                      # the runtime rule first: no new runtime-helper calls
+        *remove(unit_recs, "R5"),                   # every unit stopped before anything is removed
+        *remove(unit_recs, "R12"),                  # then their files
+        # With the services stopped nothing rewrites them: no slot reads as reusable from here on. The store under
+        # Live.root, as every other act here (the store itself on a host).
+        *slot_state_undo_steps(host, slots_of(uids), store=live.at(STORE[host])),
         *pool_config_undo_steps(host),
         Step(f"create {path.parent}", (mkdir, "-p", "-m", "755", str(path.parent))),
         Step("retire every account id so none is reissued", write=(path, retired_ids_text(retired_after), 0o644)),
+        *remove(of("account/1"), "R7"),             # per account: its processes ended and proven, then the tombstone
+        *ungroup_steps(host, operator),
+        *remove(of("member/1"), "R7"),
+        *remove(of("group/1"), "R7"),               # retire=False: undo never retires a gid (§1.1 g)
     ]
-    for name, uid in sorted(accounts.items()):
-        steps.append(Step(f"stop every process of {name}, and check they are gone",
-                          call=lambda u=uid, n=name: _end_processes(host, u, n)))
-    for name in sorted(accounts):
-        steps += tombstone_steps(host, name)
-    steps += ungroup_steps(host, operator)
-    steps += delete_group_steps(host, groups)
-    # Slot confinement goes only after every slot process is stopped and its account tombstoned.
+    # Slot confinement goes only after every slot process is stopped and its account tombstoned; the lo0 aliases
+    # before the pf rules guarding them are flushed (§24), and the anchor before pf's enable reference.
+    steps += removal_steps(host, [r for r in every if REMOVE_PHASES[r[0]] == ("R8",)], "R8", live=live, retire=False,
+                           end=end)
     if host == "linux":
-        steps += (netns.netns_undo_steps(slots_of(accounts)) + bwrap.bwrap_undo_steps() + tmpfiles_undo_steps()
-                  + run_dir_undo_steps(host))
-    else:
-        # The slots' lo0 aliases go before the rules guarding them are flushed (§24).
-        steps += pf.alias_undo_steps(slots_of(accounts)) + pf.unload_steps()
+        steps += tmpfiles_undo_steps() + run_dir_undo_steps(host)
     # Row 33 §1.1: the install record goes before the last three acts (the install rule, the journal, the record).
     steps.append(Step("remove the install record", (rm, "-f", str(install_shape_path(host)))))
-    steps += remove_install_sudoers_steps(host)
+    # The install rule LAST: until it goes, a failed undo re-runs. M1: so nothing may fail between its removal and the
+    # end. The config is checked while the rule still stands (a failure there leaves undo re-runnable through the
+    # helper), and the check after its removal runs as the plan's LAST step, after the journal and the operator record
+    # are gone: a failure there reports a config broken during undo and strands nothing.
+    rm_rule, after_rule = remove([install_rule], "R5")
+    steps.append(config_check_step(host, f"check the sudoers config with visudo -c before {INSTALL_SUDOERS} goes",
+                                   live=live, refusal=f"the sudoers config does not parse: {INSTALL_SUDOERS} is "
+                                                      "still in place, so undo can run again once visudo checks "
+                                                      "clean"))
+    steps.append(rm_rule)
     # Just before the record (§25): until undo is complete a re-run still reads what the journal names.
     steps.append(intent_remove_step(host))
     if abandoned is None:
         steps.append(Step("remove the operator record (last)", (rm, "-f", str(operator_record_path(host)))))
+    steps.append(after_rule)
     check_tools(facts, steps, verb="undo")
-    return InstallPlan("undo", host, tuple(steps), retired_after=retired_after)
+    return InstallPlan("undo", host, tuple(steps), retired_after=retired_after, intent=undo_intent)
 
 
 # --- replenish -------------------------------------------------------------------------------------
@@ -865,6 +981,8 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
     check_account_ids(host, accounts)
     check_capacity(host, slots, verifier_slots, facts.retired)
     journal = facts.intent
+    if journal is not None and journal.verb == "undo":
+        raise Refused("install-interrupted", journal.verb)      # undo finishes it: run undo again
     if journal is not None and journal.verb == "repair":
         # Row 33 (§8 N1/N1a): the ONLY proof a repair finished is install-shape's completed_txn == its txn.
         shape = facts.install_shape
@@ -950,6 +1068,11 @@ class RepairFacts:
     #: ``--source``: the RESOLVED levain package dir and its sibling ``h11`` (§2.1 (e)); None without ``--source``.
     source: Path | None = None
     h11: Path | None = None
+    #: The earlier ``L/policy/install-skips`` entries (:func:`parse_install_skips`; R14 re-reads each live).
+    skips: tuple = ()
+    #: L3 r1: each live account's same-named group, name -> gid, present only at the directory's gid for that name
+    #: (macOS: under Levain's label). The plan requires it at the account's uid (§1.1: gid == uid).
+    account_groups: Mapping[str, int] = field(default_factory=dict)
 
 
 def install_shape_path(host: HostOS) -> Path:
@@ -957,14 +1080,16 @@ def install_shape_path(host: HostOS) -> Path:
 
 
 def desired_managed(host: HostOS, *, accounts: Mapping[str, int], shared: Mapping[str, int], operator: str,
-                    services: Iterable[str], slots: Iterable[SlotId], apparmor: bool = False) -> frozenset:
+                    services: Iterable[str], slots: Iterable[SlotId], apparmor: bool = False,
+                    partial_groups: bool = False) -> frozenset:
     """§1.1 ``managed``: what an install with these accounts, shared groups, services and slots manages, typed, one
-    record per resource, derived from the plan (never typed by hand)."""
+    record per resource, derived from the plan (never typed by hand). ``partial_groups``: undo's alone (a re-run after
+    its groups went has no gid to name for them); every other caller passes every group and a missing one raises."""
     accts = accounts_of(Allocation(host, (), (), dict(accounts), {}))
     out: set = {("unit/1", s) for s in services}
     out |= {("sudoers/1", p.name) for p in sudoers_paths()}
     out |= {("group/1", (g, gid)) for g, gid in shared.items()}
-    out |= _slot_managed(host, accts, shared, operator, slots)
+    out |= _slot_managed(host, accts, shared, operator, slots, partial_groups=partial_groups)
     out |= {("entry/1", e) for e in root_tree.ENTRY_MODULES}
     if host == "darwin":
         out |= {("pf-anchor/1", (pf.ANCHOR, str(pf.ANCHOR_FILE))), ("pf-enable/1", str(pf.PF_TOKEN))}
@@ -976,13 +1101,16 @@ def desired_managed(host: HostOS, *, accounts: Mapping[str, int], shared: Mappin
 
 
 def _slot_managed(host: HostOS, accts: Iterable[Account], shared: Mapping[str, int], operator: str | None,
-                  slots: Iterable[SlotId]) -> set:
+                  slots: Iterable[SlotId], *, partial_groups: bool = False) -> set:
     """The records that come with accounts and slots: each account, each of its memberships (and the operator's, when
     named) at the group's gid, and per slot its lo0 alias (macOS egress) or its netns (Linux). ONE derivation for
     setup's and repair's desired set and for what replenish adds (U16)."""
     accts = tuple(accts)
     out: set = {("account/1", (a.name, a.uid)) for a in accts}
-    out |= {("member/1", (a, g, shared[g])) for a, g in membership_pairs(accts, operator)}
+    # partial_groups (undo only): a group with no gid here has none to name (a re-run after the groups went); its
+    # pairs went with it. Every other caller passes every group, and a missing one raises KeyError.
+    out |= {("member/1", (a, g, shared[g])) for a, g in membership_pairs(accts, operator)
+            if not partial_groups or g in shared}
     if host == "darwin":
         out |= {("pf-alias/1", loopback_alias(s)) for s in slots if s.slot_class == "egress"}
     else:
@@ -1007,21 +1135,243 @@ def _extend_shape_steps(host: HostOS, shape: gen_mod.InstallShape | None, made: 
                  "completed_txn kept)", call=lambda: gen_mod.write_record_durably(path, text))]
 
 
-def check_records(facts: HostFacts, operator: str | None) -> None:
+def check_records(facts: HostFacts, operator: str | None, *, journal_kinds: bool = True) -> None:
     """U15 (HEAD 1022-12), the one preflight every mutating verb (repair, replenish, undo) runs before step one: every
     record ``install-shape`` holds, and every write-ahead record of an UNFINISHED journal (a finished one's txn is the
     record's ``completed_txn``: what it named is settled in the record), is of a kind this code can remove and within
     its bound, else ``downgrade-unsupported:<kind>`` / ``bad-record`` (§1.1 rules c, e). The operator then runs the
-    newer code's verb. A record that does not PARSE never reaches here: undo reads it as absent, the rest refuse it."""
+    newer code's verb. A record that does not PARSE never reaches here: undo reads it as absent, the rest refuse it.
+    ``journal_kinds=False``: repair's phase A [r5: codex HIGH 2], which hands the journal to the STAGED code: its
+    records are checked only as parsed (``<kind>/<v>`` tokens, by :func:`parse_intent`), never against this code's
+    table; the probe's ``kinds`` and phase B's plan judge them."""
     shape, journal = facts.install_shape, facts.intent
     recs = sorted(shape.managed, key=repr) if shape is not None else []
-    if journal is not None and not (shape is not None and journal.txn == shape.completed_txn):
+    if journal_kinds and journal is not None and not (shape is not None and journal.txn == shape.completed_txn):
         recs += sorted(journal.managed, key=repr)
     gen_mod.check_managed(facts.host, recs, operator=operator)
 
 
+def _in_bound(host: HostOS, record, operator: str | None) -> bool:
+    """One record within its kind's bound (:func:`generation.check_managed`'s test, record by record)."""
+    kind, ident = record
+    return kind in gen_mod.KINDS and not isinstance(ident, gen_mod.Opaque) and gen_mod.KINDS[kind](host, ident, operator)
+
+
 def _shape_of(records: Iterable) -> tuple:
     return tuple(sorted(records, key=lambda r: (r[0], canon.canonical(gen_mod.managed_json([r])))))
+
+
+# --- the remove-step table (row 33 R1b; DESIGN §1.1, the per-identity steps in their phases) -----------------------
+
+#: Each kind's phases: its revoke and destroy R-steps (§1.1 table, "revoke @" / "destroy @"). Row order is the
+#: table's: within one R-step, kinds go in this order.
+REMOVE_PHASES: Mapping[str, tuple[str, ...]] = {
+    "unit/1": ("R5", "R12"), "sudoers/1": ("R5",), "member/1": ("R7",), "group/1": ("R7",), "account/1": ("R7",),
+    "pf-alias/1": ("R8",), "pf-anchor/1": ("R8",), "pf-enable/1": ("R8",), "apparmor/1": ("R8",),
+    "bwrap-copy/1": ("R8",), "netns/1": ("R8",), "entry/1": ("R10",),
+}
+#: §1.1 rule b2: every kind ever shipped keeps its remove step forever (a test pins this set).
+SHIPPED_KINDS = frozenset(REMOVE_PHASES)
+if SHIPPED_KINDS != frozenset(gen_mod.KINDS):   # a bound with no remove step, or a remove step with no bound
+    raise ImportError(f"remove-step table and kind bounds differ: {sorted(SHIPPED_KINDS ^ frozenset(gen_mod.KINDS))}")
+
+
+def _kind_steps(host: HostOS, kind: str, ident, phase: str, live: RM.Live, *, retire: bool, held: bool,
+                end: Callable[[int, str], tuple[bool, str]]) -> list[Step]:
+    """One record's steps for ``phase``: its kind's per-identity builder, given the RECORDED identity only."""
+    if kind == "unit/1":
+        return (units.stop_unit_by_name(host, ident, live=live) if phase == "R5"
+                else units.remove_unit_file_by_name(host, ident, live=live))
+    if kind == "sudoers/1":
+        return remove_dropin_steps(host, ident, live=live)
+    if kind == "member/1":
+        return remove_member_steps(host, *ident, live=live)
+    if kind == "group/1":
+        return remove_group_steps(host, *ident, live=live, retire=retire, record_held=held)
+    if kind == "account/1":
+        return remove_account_steps(host, *ident, live=live, end=end, retire=retire)
+    if kind == "pf-alias/1":
+        return pf.remove_alias_steps(ident, live=live)
+    if kind == "pf-anchor/1":
+        return pf.remove_anchor_steps(*ident, live=live)
+    if kind == "pf-enable/1":
+        return pf.remove_enable_steps(ident, live=live)
+    if kind == "apparmor/1":
+        return bwrap.remove_apparmor_profile_steps(ident, live=live)
+    if kind == "bwrap-copy/1":
+        return bwrap.remove_bwrap_copy_steps(*ident, live=live)
+    if kind == "netns/1":
+        return netns.remove_netns_steps(ident, live=live)
+    if kind == "entry/1":
+        return remove_entry_steps(host, ident, live=live)
+    raise Refused(f"downgrade-unsupported:{kind}", "this code holds no remove step for that kind")
+
+
+def kind_state(host: HostOS, kind: str, ident, live: RM.Live) -> str:
+    """The live outcome of one record (ABSENT / OURS / NOT_OURS); a failed read raises :class:`removal.ReadFailed`."""
+    if kind == "unit/1":
+        return units.unit_state(host, ident, live)
+    if kind == "sudoers/1":
+        return dropin_state(ident, live)
+    if kind == "member/1":
+        return member_state(host, *ident, live)
+    if kind == "group/1":
+        return group_state(host, *ident, live)
+    if kind == "account/1":
+        return account_state(host, *ident, live)
+    if kind == "pf-alias/1":
+        return pf.alias_state(ident, live)
+    if kind == "pf-anchor/1":
+        return pf.anchor_state(*ident, live)
+    if kind == "pf-enable/1":
+        return pf.enable_state(ident, live)
+    if kind == "apparmor/1":
+        return bwrap.apparmor_state(ident, live)
+    if kind == "bwrap-copy/1":
+        return bwrap.bwrap_copy_state(*ident, live)
+    if kind == "netns/1":
+        return netns.netns_state(ident, live)
+    if kind == "entry/1":
+        return entry_state(host, ident, live)
+    raise Refused(f"downgrade-unsupported:{kind}", "this code holds no remove step for that kind")
+
+
+def removal_steps(host: HostOS, records: Iterable, phase: str, *, live: RM.Live, held: frozenset = frozenset(),
+                  retire: bool = True, end: Callable[[int, str], tuple[bool, str]] | None = None) -> list[Step]:
+    """Every record in ``records`` whose kind has a phase at ``phase``, in the table's row order (records of one kind
+    in a fixed order), each through its kind's per-identity step. ``held``: the records ``install-shape`` holds (the
+    gid rule retires an ABSENT group only when the record held it). ``retire=False``: undo (§1.1 g)."""
+    end = end or (lambda uid, name: _end_processes(host, uid, name))
+    recs = list(records)
+    steps: list[Step] = []
+    for kind, phases in REMOVE_PHASES.items():
+        if phase not in phases:
+            continue
+        for k, ident in sorted((r for r in recs if r[0] == kind), key=repr):
+            steps += _kind_steps(host, k, ident, phase, live, retire=retire, held=(k, ident) in held, end=end)
+    return steps
+
+
+SKIPS_FORMAT = "levain-install-skips/1"
+
+
+def install_skips_path(host: HostOS) -> Path:
+    return operator_record_path(host).parent / "install-skips"
+
+
+def parse_install_skips(raw: bytes | None) -> tuple:
+    """The earlier ``install-skips`` entries, from the bytes R0 read through the store under the install lock (None:
+    no file, so none). Bytes that are not a ``levain-install-skips/1`` record holding a well-formed managed list
+    refuse ``install-skips-malformed`` (HEAD ruling R1b-6): read as empty, its NOT_OURS entries would be lost, and
+    doctor would go green over a foreign object left in place. The per-kind bounds are :func:`check_install_skips`',
+    at plan time."""
+    if raw is None:
+        return ()
+    bad = "install-skips-malformed"
+    try:
+        obj = canon.parse(raw)
+    except canon.ContractError as e:
+        raise Refused(bad, str(e)) from None
+    if not isinstance(obj, dict) or set(obj) != {"format", "skips"} or obj["format"] != SKIPS_FORMAT:
+        raise Refused(bad, f"not a {SKIPS_FORMAT} record")
+    return gen_mod.parse_managed(obj["skips"], what="install-skips")
+
+
+def check_install_skips(host: HostOS, skips: Iterable, *, operator: str) -> None:
+    """Every earlier entry of a kind this code holds passes that kind's bound (§1.1), else ``install-skips-malformed``
+    before any act: R14 re-reads each entry through its kind's live read, which takes only a bounded identity. An
+    unknown kind's entry is kept as it is and never read (it names nothing this code can inspect)."""
+    for kind, ident in skips:
+        if kind in gen_mod.KINDS and (isinstance(ident, gen_mod.Opaque) or not gen_mod.KINDS[kind](host, ident, operator)):
+            raise Refused("install-skips-malformed", f"{kind} {canon.canonical(gen_mod._thaw(ident))} breaks its bound")
+
+
+def _skips_now(host: HostOS, live: RM.Live, earlier: Iterable) -> list:
+    """§2.3 R14: this run's NOT_OURS records plus every earlier entry (read at R0, bound-checked at plan time) whose
+    object is still present (re-read live; a read that fails keeps it). An entry the operator removed by hand drops
+    out."""
+    keep = set(live.skips)
+    for kind, ident in earlier:
+        try:
+            if kind not in SHIPPED_KINDS or kind_state(host, kind, ident, live) != RM.ABSENT:
+                keep.add((kind, ident))
+        except RM.ReadFailed:
+            keep.add((kind, ident))
+    return gen_mod.managed_json(keep)
+
+
+def write_install_skips(host: HostOS, live: RM.Live, earlier: Iterable = ()) -> tuple[bool, str]:
+    """``L/policy/install-skips`` (root 0644), durably, BEFORE ``install-shape`` (DESIGN X4-M2), so the shape's
+    write stays the one completion commit. ``earlier``: :func:`parse_install_skips`' entries (``RepairFacts.skips``)."""
+    path = install_skips_path(host)
+    text = canon.canonical({"format": SKIPS_FORMAT, "skips": _skips_now(host, live, earlier)})
+    return gen_mod.write_record_durably(live.at(path), text)
+
+
+# --- the fault seam (§5 "The crash seam" [r2: X-10, C-F9], [r3: F7], [r4: X3-H1]) -------------------------------------
+
+#: [r6: L3 s3 r1 codex LOW] A fault's step id, by MEMBERSHIP: the R-steps of §2.3 a plan places points around
+#: (:func:`_faulted`'s ``before``/``after``; R4 is the exec, which has none).
+FAULT_STEPS = frozenset({"R1", "R2", "R3", "R4b", *(f"R{n}" for n in range(5, 16))})
+#: Every point a fault may name, by MEMBERSHIP (never a pattern): an R-step's ``before`` and ``after``, R9's ``a``
+#: (after the ``current.new`` symlink) and ``b`` (after the rename), R2's ``mid-copy`` (between the levain and the h11
+#: copy), and every remove step's act boundary (:data:`removal.REMOVE_POINTS`).
+FAULT_POINTS = frozenset({"before", "after", "a", "b", "mid-copy"}) | RM.REMOVE_POINTS
+#: ``(step id, point) -> None``: called at each named point of a plan built with one (a launcher run only).
+FaultHook = Callable[[str, str], None]
+
+
+def _reachable(step: str, point: str) -> bool:
+    """[r6: L3 s3 r1 codex LOW] ``(step, point)`` is a pair a plan places: ``before``/``after`` on any of
+    :data:`FAULT_STEPS`, ``a``/``b`` on R9 (the flip), ``mid-copy`` on R2, a remove point on its kind's phases
+    (:data:`REMOVE_PHASES`)."""
+    if step not in FAULT_STEPS or point not in FAULT_POINTS:
+        return False
+    if point in ("a", "b"):
+        return step == "R9"
+    if point == "mid-copy":
+        return step == "R2"
+    if point in RM.REMOVE_POINTS:
+        return step in REMOVE_PHASES[point.split(":", 1)[0]]
+    return True
+
+
+def check_fault(fault: object) -> Optional[Tuple[str, str]]:
+    """A launcher's fault, or None: a ``(step id, point)`` pair of strings that a plan places (:func:`_reachable`),
+    so a harness run cannot finish without the crash it asked for. Else ``bad-token``, before any act. Phase A embeds
+    it in phase B's program as a literal only after this check, so nothing but those two shapes of text reaches it."""
+    if fault is None:
+        return None
+    if not (isinstance(fault, tuple) and len(fault) == 2 and all(type(x) is str for x in fault)
+            and _reachable(fault[0], fault[1])):
+        raise Refused("bad-token", f"fault: {fault!r} (a step in FAULT_STEPS and a point its plan places)")
+    return fault[0], fault[1]
+
+
+def _kill_self() -> None:
+    """The launcher's default fault: this process killed where it stands (SIGKILL: no handler, no cleanup)."""
+    sys.stderr.flush()
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
+def fault_hook(fault: Optional[Tuple[str, str]], act: Optional[Callable[[], None]] = None) -> Optional[FaultHook]:
+    """The hook a plan calls at its points: ``act`` (default :func:`_kill_self`) at ``fault`` and nothing anywhere
+    else; None (no point steps planned at all) without a fault."""
+    if fault is None:
+        return None
+    at = check_fault(fault)
+    return lambda step, point: (act or _kill_self)() if (step, point) == at else None
+
+
+def _faulted(fault: Optional[FaultHook], step: str, steps: Iterable[Step]) -> list[Step]:
+    """R-step ``step``'s ``steps`` between its ``before`` and ``after`` points (a call step each, planned only with a
+    ``fault``, so a run without one plans exactly what it did before the seam)."""
+    if fault is None:
+        return list(steps)
+
+    def point(where: str) -> Step:
+        return Step(f"fault point {step} {where}", call=lambda: (fault(step, where), (True, ""))[1])
+    return [point("before"), *steps, point("after")]
 
 
 def _journal_step(host: HostOS, why: str, intent: Intent) -> Step:
@@ -1030,48 +1380,29 @@ def _journal_step(host: HostOS, why: str, intent: Intent) -> Step:
 
 
 def _stop_steps(host: HostOS, services: Sequence[units.Service], noted: dict[str, int],
-                clock: Callable[[], float]) -> list[Step]:
+                clock: Callable[[], float], *, live: RM.Live | None = None) -> list[Step]:
     """§2.3 R5: stop ``services`` in reverse start order, noting ``floor(now)`` for each just BEFORE its stop (R14
-    writes it to ``started_after``). U18: the verdict is the END STATE, never the stop's exit status, and only a
-    service that runs is stopped: macOS boots out only a job launchd holds, then checks it is gone; Linux reads
-    ``ActiveState`` (``inactive`` or ``failed`` is stopped, which is also what a unit systemd has no file for reads,
-    the damage a repair is there to fix), else stops it and reads it again. Never ``LoadState`` alone: after a
-    daemon-reload a unit whose file was deleted reads ``not-found`` while its process still runs."""
-    def note_then(name: str, act: Callable[[], tuple[bool, str]]) -> Callable[[], tuple[bool, str]]:
+    writes it to ``started_after``). The stop body is :func:`units.stop_unit_act`, the ONE body a removed unit's
+    revoke runs too (R1b). U18: the verdict is the END STATE, never the stop's exit status, and only a service that
+    runs is stopped: macOS boots out only a job launchd holds, then checks it is gone (a ``launchctl print`` exit that
+    is neither 0 nor launchd's not-found fails the step, DESIGN X4-M1); Linux reads ``ActiveState`` (``inactive`` or
+    ``failed`` is stopped), else stops it and reads it again. Never ``LoadState`` alone: after a daemon-reload a unit
+    whose file was deleted reads ``not-found`` while its process still runs."""
+    lv = live or RM.Live()
+
+    def note_then(name: str) -> Callable[[], tuple[bool, str]]:
         def go() -> tuple[bool, str]:
             noted[name] = int(clock())
-            return act()
+            try:
+                return units.stop_unit_act(host, name, lv, disable=False)
+            except RM.ReadFailed as e:
+                return False, str(e)
         return go
-
-    def out(argv: tuple[str, ...]) -> str:
-        r = subprocess.run(list(argv), capture_output=True, text=True, cwd="/", env=child_env())
-        return (r.stdout or "").strip()
 
     steps: list[Step] = []
     for s in reversed([x for x in units.services_for(host) if x in services]):
-        if host == "darwin":
-            label = units.launchd_label(s)
-
-            def bootout(lb: str = label) -> tuple[bool, str]:
-                if units._launchd_job_absent(lb)[0]:
-                    return True, ""
-                out(("/bin/launchctl", "bootout", f"system/{lb}"))   # its status is not the verdict: checked next
-                return units._launchd_job_absent(lb, wait_s=units.LAUNCHD_UNLOAD_WAIT_S)   # launchd unloads after bootout returns
-
-            steps.append(Step(f"stop {label}", call=note_then(s.name, bootout)))
-        else:
-            name, systemctl = units.systemd_name(s), _abs("systemctl")
-
-            def stop(n: str = name, sc: str = systemctl) -> tuple[bool, str]:
-                if out((sc, "show", "-p", "ActiveState", "--value", n)) in ("inactive", "failed"):
-                    return True, ""
-                out((sc, "stop", n))                                  # its status is not the verdict: checked next
-                state = out((sc, "show", "-p", "ActiveState", "--value", n))
-                if state not in ("inactive", "failed"):
-                    return False, f"{n} is {state or 'in an unknown state'} after systemctl stop"
-                return True, ""
-
-            steps.append(Step(f"stop {name}", call=note_then(s.name, stop)))
+        unit = units.launchd_label(s) if host == "darwin" else units.systemd_name(s)
+        steps.append(Step(f"stop {unit}", call=note_then(s.name)))
     return steps
 
 
@@ -1097,27 +1428,19 @@ def _recognised_groups(host: HostOS, facts: HostFacts, rf: RepairFacts, journale
     return ours
 
 
-def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
-                txn: Callable[[], str] = gen_mod.new_txn, clock: Callable[[], float] = time.time,
-                read_sysctl: Callable[[str], str] | None = None,
-                program_exists: Callable[[Path], bool] = Path.is_file) -> InstallPlan:
-    """``repair [--source PATH]`` (§2.1, §2.3), the ADDITION path: setup's own plan re-applied against what is
-    installed, every step idempotent, the levain + h11 pair staged as ONE generation behind one flip of ``current``.
-    Order: the journal (a finished repair journal, ``txn == record.completed_txn``, is removed first and a fresh
-    ``txn`` minted; an unfinished one is resumed at its ``txn``, gids and write-ahead ``managed``); the stage (R2-R3);
-    the gids and write-ahead ``managed`` journaled (R4b); every affected service STOPPED (R5); new shared groups (R6);
-    the missing memberships (R7); rows and confinement (R8); THE FLIP (R9); entries (R10); sudoers (R11); units and
-    every start (R12); GC (R13); ``install-shape`` (R14, the completion commit); the journal removed (R15).
-
-    The removal path (a recorded resource the code no longer desires) is R1b's: until it lands such a plan refuses
-    ``removal-unbuilt:<kind>`` before any act. The phase A / phase B handover (probe, exec) is R2's."""
+def _repair_journal(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts,
+                    txn: Callable[[], str], *, journal_kinds: bool = True) -> tuple[Intent | None, Intent | None, str, str]:
+    """The checks every repair plan (phase A's stage and the whole plan) runs first, before any act: another verb's
+    journal refused, setup's stale one dropped, a FINISHED repair journal (``txn == record.completed_txn``) set aside
+    to be removed (R1 [F2]), the preflight, the records and skips, a foreign account at a journaled name. Returns
+    ``(the unfinished repair journal or None, the finished one or None, the operator, the run's txn)``.
+    ``journal_kinds``: :func:`check_records`'s (False in phase A only)."""
     if cmd.verb != "repair":
         raise Refused("wrong-verb", cmd.verb)
-    host = facts.host
     shape = facts.install_shape
     journal = facts.intent
     finished: Intent | None = None
-    if journal is not None and journal.verb == "replenish":
+    if journal is not None and journal.verb in ("replenish", "undo"):
         raise Refused("install-interrupted", journal.verb)      # U7: setup's shape (plan_setup above)
     if journal is not None and journal.verb == "setup":
         journal = None    # stale: the operator record proves that setup finished (preflight refuses without one)
@@ -1127,14 +1450,156 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     rec = facts.operator_record
     assert rec is not None
     operator = str(rec["name"])
-    previous = frozenset(shape.managed) if shape is not None else frozenset()
-    journaled = frozenset(journal.managed) if journal is not None else frozenset()
-    check_records(facts, operator)                                     # U15: the preflight every mutating verb runs
+    check_records(facts, operator, journal_kinds=journal_kinds)        # U15: the preflight every mutating verb runs
+    check_install_skips(facts.host, rf.skips, operator=operator)        # R1b-6: before any act
     if journal is not None:
         _, foreign = _journal_presence(facts)
         if foreign:
             raise Refused("account-exists", ", ".join(foreign))
     run_txn = journal.txn if journal is not None and journal.txn else txn()
+    return journal, finished, operator, run_txn
+
+
+def _check_rendered_accounts(rf: RepairFacts, slots: Sequence[SlotId]) -> None:
+    """R2 entry (1022+20 Linux VM, `userdel _levain_s7`): desired holds only the LIVE accounts, so a recorded one that
+    is gone is removed at R7 while R8 still renders its slot's rows for it. §2.4: repair never creates or removes a
+    slot, so it can neither re-create the account nor drop the slot. Every account the rendered plan names (the
+    singletons, every in-service slot's pair) must be live, else refused before any act."""
+    missing = [n for n in (*SINGLETONS, *(n for s in slots for n in s.accounts)) if n not in rf.accounts]
+    if missing:
+        raise Refused("account-missing", f"{', '.join(missing)}: no live Levain account by that name, and repair "
+                                         "never creates one (it never creates or removes a slot). Run undo, then "
+                                         "setup")
+    # L3 r1 (codex): R8 renders `chown <owner>:<account>` against each account's same-named primary group, so a
+    # group deleted (or moved, or relabelled on macOS) by hand while its user stays is the same gap; refused here.
+    ungrouped = [n for n in (*SINGLETONS, *(n for s in slots for n in s.accounts))
+                 if rf.account_groups.get(n) != rf.accounts[n]]
+    if ungrouped:
+        raise Refused("group-missing", f"{', '.join(ungrouped)}: no Levain group of that name at the account's id, "
+                                       "and repair never creates one (it never creates or removes a slot). Run undo, "
+                                       "then setup")
+
+
+def _repair_slots(rf: RepairFacts) -> tuple[SlotId, ...]:
+    return tuple(SlotId("egress", i) for i in rf.egress) + tuple(SlotId("none", i) for i in rf.verifier)
+
+
+def plan_repair_stage(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
+                      txn: Callable[[], str] = gen_mod.new_txn, fault: Optional[FaultHook] = None) -> InstallPlan:
+    """``repair --source PATH``'s PHASE A (§2.2), in the installed generation's code: every check a plan runs before
+    any act, then R1 (the journal FIRST, generation unset unless an unfinished journal fixed it), R2 (the copy and its
+    checks, then the id hashed over the STAGED copy and the same hash over the source), R3 (the generation placed and
+    made durable, THEN ``generation:<id>`` journalled, same ``txn``). The id is the staged copy's, so the plan carries
+    it in ``handover`` (:class:`root_tree.Staged`), filled when the hash step runs. :func:`run` then probes the staged
+    generation (R3a) and execs into it (R4); everything from R4b on is planned by THAT code (:func:`repair_continue`).
+    """
+    host = facts.host
+    # [r5: codex HIGH 2] the incumbent judges the journal's kinds generically only: the staged code is the judge
+    journal, finished, operator, run_txn = _repair_journal(cmd, facts, rf, txn, journal_kinds=False)
+    if rf.source is None or rf.h11 is None:
+        raise Refused("bad-source", "no h11 beside the levain package" if rf.source is not None else "no --source")
+    root_tree.check_sources(rf.source, rf.h11)
+    check_account_ids(host, rf.accounts)
+    _check_rendered_accounts(rf, _repair_slots(rf))
+    pinned = journal.generation if journal is not None else None
+    first = Intent("repair", operator, {}, dict(journal.groups) if journal else {}, run_txn, pinned,
+                   tuple(journal.managed) if journal else ())
+    cell = root_tree.Staged()
+
+    def journal_generation() -> tuple[bool, str]:
+        if cell.target is None:
+            return False, "no staged id to journal"
+        return write_intent_atomically(INTENT_PATH[host], intent_text(replace(first, generation=cell.target)))
+
+    steps: list[Step] = []
+    if finished is not None:
+        steps.append(Step(f"remove the finished repair journal {INTENT_PATH[host]} (its txn is install-shape's "
+                          "completed_txn)", (root_tree._tools(host)["rm"], "-f", str(INTENT_PATH[host]))))
+    steps += _faulted(fault, "R1", [intent_write_step(host, first)])                              # R1
+    staging = root_tree.stage_hashing_steps(host, rf.source, rf.h11, cell, current=rf.current, pinned=pinned,
+                                            fault=(lambda pt: fault("R2", pt)) if fault else None)
+    steps += _faulted(fault, "R2", staging[:-1])                                                  # R2: copy, hash
+    steps += _faulted(fault, "R3", [staging[-1], Step(f"journal the staged generation id (same txn {run_txn})",
+                                                      call=journal_generation)])                  # R3
+    check_tools(facts, steps, verb="repair", python=True)
+    return InstallPlan("repair", host, tuple(steps), intent=first, handover=cell)
+
+
+def _resumes_staged(facts: HostFacts, rf: RepairFacts) -> bool:
+    """A bare repair meets an UNFINISHED repair journal (its txn is not the record's ``completed_txn``) whose
+    journalled generation is not ``current``: a pre-flip repair, which resumes into its own generation (§2.2 r4)."""
+    j, shape = facts.intent, facts.install_shape
+    return (j is not None and j.verb == "repair" and j.generation is not None
+            and not (shape is not None and j.txn == shape.completed_txn) and j.generation != rf.current)
+
+
+def plan_repair_resume(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
+                       tree: Path | None = None) -> InstallPlan:
+    """§2.2 [r4: X3-M1, C3-F5], a bare ``repair`` in phase A (:func:`_resumes_staged`): the journal names
+    ``generation:<id>`` (written at R3, after the staged copy was made durable) and ``current`` still names the old
+    one, so the code that journalled the run's kinds must finish it. Every check a phase-A plan runs first, then
+    ``<tree>/gen-<id>`` re-hashed with the §1.1 id function. Equal: that generation is the target, already placed
+    (``Staged.existed``, never ``placed``: a restore keeps it); the plan has no step (R1-R3 ran; there is no source to
+    read), and :func:`repair_handover` probes it and execs into it exactly as after a fresh stage. Unequal (power loss
+    tore it): one step removes it and, only once that step succeeded, the run refuses ``source-required:<id>``
+    (``Staged.then_refuse``; a failed removal is ``step-failed`` naming it); the journal stays as found, so the next
+    ``repair --source`` re-stages it. Absent: ``source-required:<id>``, no act."""
+    host = facts.host
+    journal, _finished, _operator, _txn = _repair_journal(cmd, facts, rf, gen_mod.new_txn, journal_kinds=False)
+    assert journal is not None and journal.generation is not None
+    check_account_ids(host, rf.accounts)
+    _check_rendered_accounts(rf, _repair_slots(rf))
+    target = journal.generation
+    gen_dir = (tree if tree is not None else root_tree.current_path(host).parent) / target
+    if not os.path.isdir(gen_dir) or os.path.islink(gen_dir):
+        raise Refused(f"source-required:{target}", f"the interrupted repair is moving to {target}, which is not in "
+                                                    "the import tree: repair --source <that levain package>")
+    try:
+        got = gen_mod.generation_id(gen_dir / "levain", gen_dir / "h11")
+    except Refused as e:
+        got = f"unreadable ({e.name})"
+    if got == target:
+        return InstallPlan("repair", host, (), intent=journal, handover=root_tree.Staged(target=target, existed=True))
+    cell = root_tree.Staged(then_refuse=Refused(f"source-required:{target}", f"{gen_dir} hashes to {got}, not "
+                                                                             f"{target} (torn), and was removed: "
+                                                                             "repair --source <that levain package>"))
+    steps = [Step(f"remove the torn generation {gen_dir} (it hashes to {got})",
+                  (root_tree._tools(host)["rm"], "-rf", str(gen_dir)))]
+    check_tools(facts, steps, verb="repair", python=True)
+    return InstallPlan("repair", host, tuple(steps), intent=journal, handover=cell)
+
+
+def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
+                txn: Callable[[], str] = gen_mod.new_txn, clock: Callable[[], float] = time.time,
+                read_sysctl: Callable[[str], str] | None = None,
+                program_exists: Callable[[Path], bool] = Path.is_file, live: RM.Live | None = None,
+                end: Callable[[int, str], tuple[bool, str]] | None = None,
+                continuing: str | None = None, fault: Optional[FaultHook] = None) -> InstallPlan:
+    """``repair [--source PATH]`` (§2.1, §2.3), the ADDITION path: setup's own plan re-applied against what is
+    installed, every step idempotent, the levain + h11 pair staged as ONE generation behind one flip of ``current``.
+    Order: the journal (a finished repair journal, ``txn == record.completed_txn``, is removed first and a fresh
+    ``txn`` minted; an unfinished one is resumed at its ``txn``, gids and write-ahead ``managed``); the stage (R2-R3);
+    the gids and write-ahead ``managed`` journaled (R4b); every affected service STOPPED (R5); new shared groups (R6);
+    the missing memberships (R7); rows and confinement (R8); THE FLIP (R9); entries (R10); sudoers (R11); units and
+    every start (R12); GC (R13); ``install-shape`` (R14, the completion commit); the journal removed (R15).
+
+    The removal path (R1b): ``remove = (record.managed ∪ journal.managed ∪ desired) − desired``, each record through
+    its kind's per-identity step in its phases (:data:`REMOVE_PHASES`: R5 unit stops and sudoers, R7 members, groups
+    and accounts, R8 the confinement kinds BEFORE the re-render, R10 entries, R12 unit files), with the three outcomes
+    (``live``: every live read and act; ``end``: the account kind's proven process end). ``install-skips`` is written
+    durably before ``install-shape`` (R14).
+
+    The whole plan in one process is the plan layer's view (its tests, ``--plan-only``). A run with ``--source``
+    applies :func:`plan_repair_stage` (phase A) and then this plan with ``continuing`` = the staged generation, in
+    that generation's own code (phase B, :func:`repair_continue`): the journalled generation is the target although it
+    is not ``current`` yet, and R1-R3 (phase A's) are not planned again. ``fault``: the launcher's hook (§5 [F7]):
+    every R-step gets its ``before``/``after`` points, R9 its ``a``/``b``, R2 its ``mid-copy`` and each remove step its
+    act boundaries (the remove phase is the step id)."""
+    host = facts.host
+    shape = facts.install_shape
+    journal, finished, operator, run_txn = _repair_journal(cmd, facts, rf, txn)
+    previous = frozenset(shape.managed) if shape is not None else frozenset()
+    journaled = frozenset(journal.managed) if journal is not None else frozenset()
 
     # The target generation (R2). U13: an UNFINISHED repair's target is its journal's. Once journaled (R3) it is fixed:
     # a --source must hash to it. Before R3 only a --source may establish it, never the record or current (that would
@@ -1156,7 +1621,9 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
             target = pinned
         else:
             target = shape.generation if shape is not None else None
-        if target is None or target != rf.current:
+        if continuing is not None and target != continuing:
+            raise Refused("handover-mismatch", f"phase B was handed {continuing}; the journal names {target}")
+        if target is None or (target != rf.current and target != continuing):
             raise Refused(f"source-required:{target or 'none'}", "this host needs repair --source <levain package>")
         # U17: the record's versions are the TARGET generation's own, read as text from its tree (never an older
         # record's: after a crash past the flip the record may still describe the generation it replaced).
@@ -1169,10 +1636,14 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     jgroups = dict(journal.groups) if journal is not None else {}
     present = _recognised_groups(host, facts, rf, jgroups)
     keep_shared = {**{g: i for g, i in jgroups.items() if g in SHARED_GROUPS}, **present}
-    alloc = allocate(host, egress=(), verifier=(), used=facts.used_ids, retired=facts.retired, shared=True,
+    # R1b: a recorded or journaled group this code no longer names is on its way out, and its gid is retired at R7
+    # (§1.1 g); R6 runs first, so that gid must never be handed to a new group here, even when no group holds it now.
+    leaving = {i[1] for k, i in previous | journaled if k == "group/1" and i[0] not in SHARED_GROUPS}
+    alloc = allocate(host, egress=(), verifier=(), used=facts.used_ids | leaving, retired=facts.retired, shared=True,
                      keep_shared=keep_shared)
     check_account_ids(host, rf.accounts)
-    slots = tuple(SlotId("egress", i) for i in rf.egress) + tuple(SlotId("none", i) for i in rf.verifier)
+    slots = _repair_slots(rf)
+    _check_rendered_accounts(rf, slots)
     services, skipped = units.built_services(host, package, exists=program_exists)
     restricted = False
     if host == "linux":
@@ -1181,9 +1652,12 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
                               services=[s.name for s in services], slots=slots, apparmor=restricted)
     reconcile = previous | journaled | desired
     remove = reconcile - desired
-    if remove:
-        raise Refused(f"removal-unbuilt:{sorted(remove, key=repr)[0][0]}",
-                      "removing a recorded resource is row 33 R1b; this code only adds")
+    live = live if live is not None else RM.Live()
+
+    def removals(phase: str) -> list[Step]:
+        # one Live per phase only for its fault hook: ``skips`` is the same set, so R14 still writes every skip
+        at = replace(live, fault=lambda pt: fault(phase, pt)) if fault is not None else live
+        return removal_steps(host, remove, phase, live=at, held=previous, end=end)
     accts = accounts_of(Allocation(host, (), (), dict(rf.accounts), {}))
     missing_groups = [Group(g, gid, ()) for g, gid in alloc.shared.items() if g not in present]
     missing_pairs = [(a, g) for a, g in membership_pairs(accts, operator) if a not in rf.members.get(g, frozenset())]
@@ -1202,6 +1676,9 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     def record() -> tuple[bool, str]:
         new = gen_mod.InstallShape(target, versions[0], versions[1], run_txn, {**carried, **noted},
                                    _shape_of(desired))
+        ok, why = write_install_skips(host, live, rf.skips)    # X4-M2: before the shape, the one completion commit
+        if not ok:
+            return ok, why
         return gen_mod.write_record_durably(shape_path, gen_mod.shape_text(new))
 
     rows = base_store_rows(host, operator) + base_run_rows(host) + slot_rows(host, slots)
@@ -1215,27 +1692,36 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     if finished is not None:
         steps.append(Step(f"remove the finished repair journal {INTENT_PATH[host]} (its txn is install-shape's "
                           "completed_txn)", (root_tree._tools(host)["rm"], "-f", str(INTENT_PATH[host]))))
-    steps.append(intent_write_step(host, first))                                                  # R1
-    if rf.source is not None:
-        steps += root_tree.stage_steps(host, rf.source, rf.h11, target, current=rf.current)   # type: ignore[arg-type]
-    steps.append(_journal_step(host, f"journal the generation {target} (same txn)", staged))      # R3
-    steps.append(_journal_step(host, "journal the shared-group gids and the write-ahead managed set (same txn)",
-                               final))                                                            # R4b
-    steps += _stop_steps(host, stop, noted, clock)                                                # R5
-    steps += shared_group_steps(host, missing_groups)                                             # R6
-    steps += membership_steps(host, missing_pairs)                                                # R7
-    steps += [*row_steps(host, rows), *reserve_steps(host), *base_routes_steps(host),             # R8
-              *single_filesystem_steps(host, slots), *confinement]
+    F = functools.partial(_faulted, fault)
+    if continuing is None:                          # phase B starts at R4b: phase A journalled R1-R3
+        steps += F("R1", [intent_write_step(host, first)])                                        # R1
+        if rf.source is not None:
+            steps += F("R2", root_tree.stage_steps(host, rf.source, rf.h11, target, current=rf.current,  # type: ignore[arg-type]
+                                                   fault=(lambda pt: fault("R2", pt)) if fault else None))
+        steps += F("R3", [_journal_step(host, f"journal the generation {target} (same txn)", staged)])  # R3
+    steps += F("R4b", [_journal_step(host, "journal the shared-group gids and the write-ahead managed set (same "
+                                           "txn)", final)])                                       # R4b
+    steps += F("R5", [*_stop_steps(host, stop, noted, clock, live=live),                          # R5
+                      *removals("R5")])             # R1b: recorded units stopped by name, then sudoers (grants first)
+    steps += F("R6", shared_group_steps(host, missing_groups))                                    # R6
+    steps += F("R7", [*membership_steps(host, missing_pairs),                                     # R7
+                      *removals("R7")])             # R1b: members, then groups (gid retired first), then accounts
+    steps += F("R8", [*removals("R8"),              # R1b: the confinement kinds' removals first, then the re-render
+                      *row_steps(host, rows), *reserve_steps(host), *base_routes_steps(host),     # R8
+                      *single_filesystem_steps(host, slots), *confinement])
     if rf.current != target:
-        steps.append(root_tree.flip_step(host, target))                                          # R9
-    steps += root_tree.entry_steps(host)                                                          # R10
-    steps += sudoers_steps(host, operator)                                                        # R11
-    steps += units.install_steps(host, services)                                                  # R12
+        steps += F("R9", [root_tree.flip_step(host, target,                                       # R9
+                                              fault=(lambda pt: fault("R9", pt)) if fault else None)])
+    steps += F("R10", [*root_tree.entry_steps(host),                                              # R10
+                       *removals("R10")])           # R1b: entries after the flip (their sudoers rule went at R5)
+    steps += F("R11", sudoers_steps(host, operator))                                              # R11
+    steps += F("R12", [*removals("R12"),            # R1b: the removed units' files
+                       *units.install_steps(host, services)])                                     # R12
     if rf.legacy or gen_change:
-        steps.append(root_tree.gc_step(host, keep))                                               # R13
-    steps.append(Step(f"write the install record {shape_path} (completed_txn {run_txn}, last host act)",
-                      call=record))                                                               # R14
-    steps.append(intent_remove_step(host))                                                        # R15
+        steps += F("R13", [root_tree.gc_step(host, keep)])                                        # R13
+    steps += F("R14", [Step(f"write the install record {shape_path} (completed_txn {run_txn}, last host act)",
+                            call=record)])                                                        # R14
+    steps += F("R15", [intent_remove_step(host)])                                                 # R15
     check_tools(facts, steps, verb="repair", python=True)
     return InstallPlan("repair", host, tuple(steps), alloc, accts, tuple(missing_groups), tuple(rows),
                        retired_after=facts.retired, pending=helper_pending() + skipped,
@@ -1303,6 +1789,12 @@ class Directory:
     group_labels: Mapping[str, str] = field(default_factory=dict)
     #: Each group's listed members (macOS ``GroupMembership``; Linux ``getent group`` field 4). Row 33 §3.
     group_members: Mapping[str, frozenset] = field(default_factory=dict)
+    #: Each user's primary gid (Linux ``getent passwd`` field 4; macOS :func:`read_primary_groups`, read only for a
+    #: ``repair --source``): a group's members include every user whose primary group it is, whom no member list
+    #: names (§2.1, the source writer check).
+    user_gids: Mapping[str, int] = field(default_factory=dict)
+    #: macOS: each group that nests others (``NestedGroups``), whose members no list here enumerates. Linux: none.
+    nested: frozenset = frozenset()
 
 
 def _lines(run: Callable[..., object], argv: Sequence[str]) -> list[str]:
@@ -1327,6 +1819,7 @@ def read_directory(host: HostOS, *, run: Callable[..., object] = subprocess.run)
     ulab: dict[str, str] = {}
     glab: dict[str, str] = {}
     gmem: dict[str, frozenset] = {}
+    ugid: dict[str, int] = {}
     if host == "darwin":
         dscl = "/usr/bin/dscl"
         for kind, key, into in (("/Users", "UniqueID", users), ("/Groups", "PrimaryGroupID", groups)):
@@ -1355,6 +1848,7 @@ def read_directory(host: HostOS, *, run: Callable[..., object] = subprocess.run)
             if len(p) != 7:
                 raise Refused("host-read-failed", f"getent passwd: {ln[:120]!r}")
             users[p[0]] = _id(p[2], ln)
+            ugid[p[0]] = _id(p[3], ln)
             ulab[p[0]] = p[4]
         for ln in _lines(run, (getent, "group")):
             if not ln:
@@ -1368,7 +1862,24 @@ def read_directory(host: HostOS, *, run: Callable[..., object] = subprocess.run)
         raise Refused("unsupported-host", repr(host))
     if users.get("root") != 0:
         raise Refused("host-read-failed", "the directory service lists no root at uid 0")
-    return Directory(users, groups, ulab, glab, gmem)
+    return Directory(users, groups, ulab, glab, gmem, ugid)
+
+
+def read_primary_groups(d: Directory, *, run: Callable[..., object] = subprocess.run) -> Directory:
+    """macOS: ``d`` with each user's primary gid and the groups that nest others, the two reads a group's COMPLETE
+    membership needs beyond ``GroupMembership`` (L3 r1, the ``--source`` writer check). A failed read refuses
+    ``host-read-failed``; a user with no ``PrimaryGroupID`` is in no group by it."""
+    dscl = "/usr/bin/dscl"
+    ugid: dict[str, int] = {}
+    for ln in _lines(run, (dscl, ".", "-list", "/Users", "PrimaryGroupID")):
+        p = ln.split()
+        if len(p) > 2:
+            raise Refused("host-read-failed", f"dscl /Users PrimaryGroupID: {ln[:120]!r}")
+        if len(p) == 2:
+            ugid[p[0]] = _id(p[1], ln)
+    nested = frozenset(p[0] for p in (ln.split() for ln in _lines(run, (dscl, ".", "-list", "/Groups", "NestedGroups")))
+                       if len(p) > 1)
+    return replace(d, user_gids=ugid, nested=nested)
 
 
 def live_lease_sessions(sessions: Path) -> tuple[str, ...]:
@@ -1429,12 +1940,12 @@ def slots_in_service(store: RH.Store) -> dict[str, tuple[int, ...]]:
 @dataclass(frozen=True)
 class Gathered:
     """What :func:`gather_facts` read under the install lock: the facts every plan takes, plus each verb's own
-    inputs (undo: every live Levain account and the shared groups present; replenish: the slots in service, by
-    class, and their accounts)."""
+    inputs (undo: every live Levain account and the shared groups present, name -> live gid; replenish: the slots in
+    service, by class, and their accounts)."""
 
     facts: HostFacts
     accounts: Mapping[str, int] = field(default_factory=dict)
-    shared_groups: tuple[str, ...] = ()
+    shared_groups: Mapping[str, int] = field(default_factory=dict)
     live: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
     #: The pool-lock hold taken before the live-lease count, released by :func:`run` after the last act.
     quiesce: Quiesce | None = None
@@ -1477,6 +1988,8 @@ def gather_facts(cmd: InstallCommand, host: HostOS, caller_uid: int, *,
     Accounts and groups are Levain's by label (§23) or, with a journal, by name AND journaled id (§25: a Linux
     group carries no label)."""
     d = read_directory(host, run=run)
+    if host == "darwin" and cmd.verb == "repair" and cmd.source is not None:
+        d = read_primary_groups(d, run=run)
     rs = store_seams or RH.Seams(host=host)
     L = rs.L
     q = Quiesce(L, waits=rs) if cmd.verb not in LEASE_EXEMPT else None
@@ -1495,7 +2008,7 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
         q.hold()        # before the live-lease count below, so the count is one no prepare can change
     retired_path = Path(state_dir) / RETIRED_IDS_PATH[host].name if state_dir else RETIRED_IDS_PATH[host]
     intent_path = Path(state_dir) / INTENT_PATH[host].name if state_dir else INTENT_PATH[host]
-    orec, in_service, pool, configured, shape = None, None, None, {}, None
+    orec, in_service, pool, configured, shape, skips = None, None, None, {}, None, ()
     if os.path.lexists(L):
         # Read as the runtime helper reads the store: one dirfd, every component O_NOFOLLOW, root's dirs only.
         store = RH.Store(rs)
@@ -1517,6 +2030,8 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
                 configured = {cls: tuple(sorted(i)) for cls, i in RH.configured_slots(store).items()}
                 raw = store.read(("policy",), "pool")
                 pool = parse_pool_config(raw) if raw is not None else None
+            if cmd.verb == "repair" and orec is not None:     # R1b-6: a malformed one refuses here, before any act
+                skips = parse_install_skips(store.read(("policy",), "install-skips", cap=gen_mod.MAX_RECORD_BYTES))
         finally:
             store.close()
     journal = read_intent(host, path=intent_path)
@@ -1545,11 +2060,14 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
         live_leases=len(leased), live_sessions=leased,
         used_ids=frozenset(d.users.values()) | frozenset(d.groups.values()),
         existing_names=frozenset(d.users) | frozenset(d.groups), retired=read_retired_ids(retired_path),
-        levain_tombstones=tombs, levain_live=live, intent=journal, host_ids=host_ids, install_shape=shape)
+        levain_tombstones=tombs, levain_live=live, intent=journal, host_ids=host_ids, install_shape=shape,
+        user_ids=dict(d.users))
     if cmd.verb == "repair":
-        return Gathered(facts, accounts, quiesce=q, repair=_repair_facts(cmd, host, d, accounts, in_service or {}))
+        repair = _repair_facts(cmd, host, d, accounts, in_service or {}, skips=skips,
+                               operator_uid=int(orec["uid"]) if orec is not None else None)
+        return Gathered(facts, accounts, quiesce=q, repair=repair)
     if cmd.verb == "undo":
-        return Gathered(facts, accounts, shared, quiesce=q)
+        return Gathered(facts, accounts, {g: d.groups[g] for g in shared}, quiesce=q)
     if in_service is not None:
         wanted = {n for cls, idx in in_service.items() for i in idx for n in SlotId(cls, i).accounts}  # type: ignore[arg-type]
         return Gathered(facts, {n: u for n, u in accounts.items() if n in wanted}, live=in_service, quiesce=q,
@@ -1558,28 +2076,66 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
 
 
 def _repair_facts(cmd: InstallCommand, host: HostOS, d: Directory, accounts: Mapping[str, int],
-                  in_service: Mapping[str, tuple[int, ...]]) -> RepairFacts:
+                  in_service: Mapping[str, tuple[int, ...]], *, skips: tuple = (),
+                  operator_uid: int | None = None) -> RepairFacts:
     """Row 33 §2.3 R0: the directory's ``levain-*`` groups and their members, the slots in service, what
     ``<tree>/current`` names, whether the legacy tree is there, and ``--source`` RESOLVED (§2.1 (e): every later read
-    names the resolved parent). The source-ownership check on that chain is R2's (phase A)."""
+    names the resolved parent), its names checked and then who may write it (§2.1, :func:`root_tree.
+    check_source_writers`) before any other root read of it. ``operator_uid`` None (no operator record) with a
+    ``--source``: ``not-set-up`` here, before the resolve (L3 r1: the first root read of the source).
+
+    ``account_groups``: each live account's same-named group at its gid (macOS: under Levain's label), for the
+    plan's ``group-missing`` refusal (L3 r1)."""
     from levain.slot.intent import GROUP_RE
 
+    if cmd.source is not None and operator_uid is None:
+        raise Refused("not-set-up", cmd.verb)
     groups = {g: i for g, i in d.groups.items() if GROUP_RE.fullmatch(g)}
+    own = {n: d.groups[n] for n in accounts
+           if n in d.groups and (host != "darwin" or d.group_labels.get(n) == SLOT_MARKER)}
     tree = root_tree.current_path(host).parent
     current = root_tree.read_current(tree)
     source = h11 = None
     if cmd.source is not None:
         parent = Path(os.path.realpath(os.path.dirname(cmd.source)))
         source, h11 = parent / os.path.basename(cmd.source), parent / "h11"
+        assert operator_uid is not None
+        root_tree.check_sources(source, h11)
+        root_tree.check_source_writers(parent, operator_uid=operator_uid,
+                                       operator_gids=operator_only_gids(d, operator_uid),
+                                       group_names={i: g for g, i in sorted(d.groups.items(), reverse=True)})
     return RepairFacts(accounts=dict(accounts), groups=groups, members={g: d.group_members.get(g, frozenset())
                                                                         for g in groups},
                        egress=tuple(in_service.get("egress", ())), verifier=tuple(in_service.get("none", ())),
-                       current=current, legacy=os.path.isdir(tree / "levain"), source=source, h11=h11)
+                       current=current, legacy=os.path.isdir(tree / "levain"), source=source, h11=h11,
+                       skips=skips, account_groups=own)
 
 
-def plan_for(cmd: InstallCommand, g: Gathered, **setup_kw) -> InstallPlan:
+def operator_only_gids(d: Directory, operator_uid: int) -> frozenset:
+    """L3 r1 (§2.1, the source writer check): the gids whose COMPLETE membership is the operator alone: every group
+    holding that gid lists no one but the operator and nests no group (macOS), no other user holds it as primary
+    group, and the operator IS in it (listed or by primary gid). A listed name the directory does not resolve counts
+    as another account. Ubuntu's user-private group passes; macOS ``staff`` (gid 20, every local user's primary group,
+    listing ``root``) never does. The operator must be found in it because an EMPTY membership proves nothing on
+    macOS: its computed groups (``everyone``, ``localaccounts``, ``authedusers``...) list no one and hold everyone
+    [measured by r2repair-fix1, 10-22, `dscl . -list /Groups GroupMembership` on Phill's Mac]."""
+    by_gid: dict[int, list[str]] = {}
+    for g, i in d.groups.items():
+        by_gid.setdefault(i, []).append(g)
+    out = set()
+    for i, gs in by_gid.items():
+        if any(g in d.nested for g in gs):
+            continue
+        names = {n for g in gs for n in d.group_members.get(g, ())} | {n for n, pg in d.user_gids.items() if pg == i}
+        if names and all(d.users.get(n) == operator_uid for n in names):
+            out.add(i)
+    return frozenset(out)
+
+
+def plan_for(cmd: InstallCommand, g: Gathered, *, fault: Optional[FaultHook] = None, **setup_kw) -> InstallPlan:
     """The verb's plan from what was gathered. ``setup_kw`` reaches :func:`plan_setup` (tests: its host seams).
-    Replenish fills to ``L/policy/pool`` (head ruling 8) and refuses ``pool-config-missing`` without it."""
+    Replenish fills to ``L/policy/pool`` (head ruling 8) and refuses ``pool-config-missing`` without it. ``fault``:
+    the launcher's hook, given to repair's plans (:func:`run` passes it only when :class:`Seams` carries a fault)."""
     if cmd.verb == "setup":
         return plan_setup(cmd, g.facts, **setup_kw)
     if cmd.verb == "undo":
@@ -1588,8 +2144,12 @@ def plan_for(cmd: InstallCommand, g: Gathered, **setup_kw) -> InstallPlan:
         slots, verifier_slots = g.pool if g.pool is not None else (None, None)
         return plan_replenish(cmd, g.facts, slots=slots, verifier_slots=verifier_slots, live=g.live,
                               accounts=g.accounts, configured=g.configured)
+    if cmd.verb == "repair" and g.repair is not None and cmd.source is not None:
+        return plan_repair_stage(cmd, g.facts, g.repair, fault=fault)   # phase A; phase B plans in the staged code
+    if cmd.verb == "repair" and g.repair is not None and _resumes_staged(g.facts, g.repair):
+        return plan_repair_resume(cmd, g.facts, g.repair)         # phase A, no source: into the journalled generation
     if cmd.verb == "repair" and g.repair is not None:
-        return plan_repair(cmd, g.facts, g.repair)
+        return plan_repair(cmd, g.facts, g.repair, fault=fault)   # bare repair: in-process, no exec, no probe
     raise Refused(f"verb-unbuilt:{cmd.verb}", cmd.verb)
 
 
@@ -1900,6 +2460,480 @@ def run_credential(verb: str, name: str, caller_uid: int, host: HostOS, *, read:
     raise RuntimeError(f"the credential child: status {status:#x}, {line[:80]!r}")
 
 
+# --- repair's handover: the probe (R3a), the exec (R4), phase B (R4a on) (row 33 §2.2) ---------------------------
+
+#: R3a's bounds [r3: X2-M5]: the probe child's wall clock and the most it may print.
+PROBE_TIMEOUT_S = 60.0
+PROBE_OUT_CAP = 64 * 1024
+#: The probe program's own exits (phase A writes that program, so they mean the same in every generation): the
+#: staged code did not import, or it imported but lacks the handover (any package from before row 33), or its
+#: ``repair_probe`` could not read the host's records.
+PROBE_EXIT_NO_IMPORT = 3
+PROBE_EXIT_UNSUPPORTED = 4
+#: [r5: L3 r2 codex] the staged ``repair_continue`` cannot bind the call :func:`phase_b_text` makes (phase A's own
+#: program checks it, so a self-reported ABI is never the only evidence).
+PROBE_EXIT_HANDOVER = 5
+#: [r5: L3 r2 codex MED] the staged code's own bounds refuse a record or a journal identity (``bad-record``).
+PROBE_EXIT_BAD_RECORD = 6
+#: The handover's ABI [r5: codex MED 3]: what phase A's exec passes to ``repair_continue`` (the call shape of
+#: :func:`phase_b_text`) and what phase B adopts. The probe answers it; phase A execs only into its own.
+#: [r6: L3 s3 r1 codex HIGH, bounded] It also freezes the probe's wire: the request's keys (:func:`run_probe`'s
+#: ``journal``, ``operator``, ``shape``) and the reply's (:func:`repair_probe`'s ``handover``, ``kinds``, ``ok``). ANY
+#: change to either key set bumps this number, so a probe across versions refuses ``downgrade-unsupported:handover``
+#: (the designed path) and never needs a second schema; ``test_the_probe_wire_is_frozen_at_handover_abi_1`` pins both.
+HANDOVER_ABI = 1
+
+
+def _handover_args(lock_fd: int, pool_fd: int, gen: str, caller_uid: int,
+                   fault: Optional[Tuple[str, str]] = None) -> str:
+    """The argument list of phase A's call into ``repair_continue``: the exec's (:func:`phase_b_text`) and the probe's
+    ``inspect.signature(...).bind`` of it (:func:`probe_text`) are this one string. ``fault`` [F7]: the launcher's,
+    as a literal (checked by :func:`check_fault` first); without one the text names no fault at all."""
+    at = check_fault(fault)
+    return f"{lock_fd}, {pool_fd}, {gen!r}, caller_uid={caller_uid}" + (f", fault={at!r}" if at else "")
+
+
+def probe_text(host: HostOS, gen: str, *, tree: Path | None = None, fault: Optional[Tuple[str, str]] = None) -> str:
+    """The R3a probe program for ``gen``: its code on ``sys.path`` (:func:`root_tree.generation_boot_code`), then
+    :func:`repair_probe` if the staged package has the handover and its ``repair_continue`` binds the exact call
+    phase B's program makes (:func:`_handover_args`). Written by phase A, so every exit code but ``repair_probe``'s
+    own is phase A's."""
+    return (f"{root_tree.generation_boot_code(host, gen, tree=tree)}\n"
+            "try:\n"
+            "    from levain.slot import install_helper as M\n"
+            "except BaseException:\n"
+            f"    raise SystemExit({PROBE_EXIT_NO_IMPORT})\n"
+            "if not (callable(getattr(M, 'repair_probe', None)) and callable(getattr(M, 'repair_continue', None))):\n"
+            f"    raise SystemExit({PROBE_EXIT_UNSUPPORTED})\n"
+            "import inspect\n"
+            "try:\n"
+            f"    inspect.signature(M.repair_continue).bind({_handover_args(0, 0, gen, 0, fault)})\n"
+            "except (TypeError, ValueError):\n"
+            f"    raise SystemExit({PROBE_EXIT_HANDOVER})\n"
+            "raise SystemExit(M.repair_probe())\n")
+
+
+def repair_probe(*, stdin=None, out: TextIO | None = None, host: HostOS | None = None) -> int:
+    """R3a, run by the STAGED generation in a child (§2.2 [r3: X2-M5, X2-H1]): stdin holds the host's
+    ``install-shape`` and journal texts and the operator's name (``{"journal": <text|null>, "operator": <name|null>,
+    "shape": <text|null>}``, canonical). Exactly one canonical ``{"handover":<HANDOVER_ABI>,"kinds":[...],"ok":true}``
+    line on ``out`` (the kinds this code can REMOVE, so the caller can check every recorded and journalled one, and
+    the handover ABI it takes) and 0; :data:`PROBE_EXIT_UNSUPPORTED` with nothing printed when either record does
+    not parse here; [r5: L3 r2 codex MED] :data:`PROBE_EXIT_BAD_RECORD` when a record of a kind this code holds fails
+    its bound (:func:`generation.check_managed`, the check phase B's plan runs first). A kind it lacks is left to the
+    caller's ``kinds`` check, which names it."""
+    host = host or _host()
+    raw = (stdin if stdin is not None else sys.stdin.buffer).read(4 * gen_mod.MAX_RECORD_BYTES + 1)
+    try:
+        records = canon.parse(raw)
+        if not isinstance(records, dict) or set(records) != {"journal", "operator", "shape"}:
+            return PROBE_EXIT_UNSUPPORTED
+        operator = records["operator"]
+        if operator is not None and not (isinstance(operator, str) and OPERATOR_RE.fullmatch(operator)):
+            return PROBE_EXIT_UNSUPPORTED
+        shape = gen_mod.parse_shape(str(records["shape"]).encode()) if records["shape"] is not None else None
+        journal = parse_intent(str(records["journal"]).encode(), host) if records["journal"] is not None else None
+    except (Refused, canon.ContractError, TypeError, ValueError):
+        return PROBE_EXIT_UNSUPPORTED
+    held = [r for r in (*(shape.managed if shape else ()), *(journal.managed if journal else ())) if r[0] in gen_mod.KINDS]
+    try:
+        gen_mod.check_managed(host, held, operator=operator)
+    except Refused:
+        return PROBE_EXIT_BAD_RECORD
+    o = out or sys.stdout
+    o.write(canon.canonical({"ok": True, "kinds": sorted(gen_mod.KINDS), "handover": HANDOVER_ABI}) + "\n")
+    o.flush()
+    return 0
+
+
+def _bounded_child(argv: Sequence[str], data: bytes, *, timeout: float, cap: int,
+                   clock: Callable[[], float] = time.monotonic) -> tuple[int | None, bytes]:
+    """``argv`` with ``data`` on stdin (from an unlinked temp file, so a child that never reads cannot wedge the
+    write), stdout read to at most ``cap`` + 1 bytes before ``timeout`` (stderr discarded, ``close_fds``, its own
+    process group, cwd ``/``). ``(None, out)`` when it ran out of time or printed past the cap. The group is killed
+    on EVERY exit [r5: L3 r1 complement LOW 7], so nothing the child left in it outlives the call (a process that made
+    its own session escapes that; the probe is the staged code phase A is about to exec into anyway)."""
+    import tempfile
+
+    with tempfile.TemporaryFile() as fin:
+        fin.write(data)
+        fin.flush()
+        fin.seek(0)
+        p = subprocess.Popen(list(argv), stdin=fin, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             close_fds=True, cwd="/", env=child_env(), start_new_session=True)
+    assert p.stdout is not None
+    out, deadline, over = b"", clock() + timeout, False
+    fd = p.stdout.fileno()
+    sel = None
+    try:
+        # [r6: L3 s3 r1 complement LOW] made inside the try, so a register that raises (EMFILE) still kills the group
+        sel = selectors.DefaultSelector()        # [r5: L3 r2 OBS] select.select refuses an fd >= FD_SETSIZE
+        sel.register(fd, selectors.EVENT_READ)
+        while True:
+            left = deadline - clock()
+            if left <= 0:
+                over = True
+                break
+            if not sel.select(left):
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            out += chunk
+            if len(out) > cap:
+                over = True
+                break
+    except BaseException:
+        over = True                              # the group killed now, not after the wait's grace
+        raise
+    finally:
+        if sel is not None:
+            sel.close()
+        p.stdout.close()
+        if over:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        try:
+            rc = p.wait(timeout=max(0.0, deadline - clock()) + 5.0)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            rc, over = p.wait(), True
+        # After the leader is reaped its pid cannot be reused while any member keeps the group alive.
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return (None, out) if over else (rc, out)
+
+
+def run_probe(host: HostOS, gen: str, shape: gen_mod.InstallShape | None, journal: Intent | None, *,
+              python: str | None = None, tree: Path | None = None, timeout: float = PROBE_TIMEOUT_S,
+              cap: int = PROBE_OUT_CAP, fault: Optional[Tuple[str, str]] = None) -> tuple[str, ...]:
+    """R3a in phase A: the staged ``gen`` asked, in a bounded child (:func:`_bounded_child`), whether it can take this
+    host over. Returns its ``kinds``. A timeout, an exit other than 0, or anything but exactly one canonical
+    ``{"handover":<n>,"kinds":[...],"ok":true}`` line (``handover`` may be absent), or a probe that cannot be
+    started, refuses ``source-broken``; a package with no handover (from before row 33) or one that cannot read the
+    records refuses ``downgrade-unsupported``; an ABI other than :data:`HANDOVER_ABI` (or none), or a
+    ``repair_continue`` that cannot bind the exec's call, refuses ``downgrade-unsupported:handover``; a record the
+    staged code's bounds refuse, ``bad-record``; a kind in the record's ``managed`` or the journal's write-ahead ``managed``
+    that it cannot remove refuses ``downgrade-unsupported:<kind>``."""
+    python = python or root_tree.ROOT_PYTHON[host]
+    data = canon.canonical({"shape": gen_mod.shape_text(shape) if shape is not None else None,
+                            "journal": intent_text(journal) if journal is not None else None,
+                            "operator": journal.operator if journal is not None else None}).encode()
+    try:
+        rc, out = _bounded_child([python, root_tree.PY_FLAGS, "-c", probe_text(host, gen, tree=tree, fault=fault)], data,
+                                 timeout=timeout, cap=cap)
+    except OSError as e:                  # [r5: both seats MED] e.g. the interpreter gone, EMFILE
+        raise Refused("source-broken", f"the probe of {gen} could not start ({e.strerror or e})") from None
+    if rc == PROBE_EXIT_UNSUPPORTED:
+        raise Refused("downgrade-unsupported", f"{gen} cannot take this host over (it has no repair handover, or "
+                                               "it cannot read the install record or the journal)")
+    if rc == PROBE_EXIT_HANDOVER:
+        raise Refused("downgrade-unsupported:handover", f"{gen}'s repair_continue does not take the call this "
+                                                        "code's exec makes")
+    if rc == PROBE_EXIT_BAD_RECORD:
+        raise Refused("bad-record", f"{gen} finds a record of the install record or the journal outside its "
+                                    "kind's bound")
+    if rc is None:
+        raise Refused("source-broken", f"the probe of {gen} ran past {timeout:g} s or printed past {cap} bytes")
+    if rc != 0:
+        raise Refused("source-broken", f"the probe of {gen} exited {rc} (its code does not import)")
+    try:
+        rec = canon.parse(out[:-1]) if out.endswith(b"\n") else None
+    except canon.ContractError:
+        rec = None
+    shaped = isinstance(rec, dict) and set(rec) - {"handover"} == {"ok", "kinds"} and rec["ok"] is True
+    kinds = rec.get("kinds") if shaped else None
+    if (not isinstance(kinds, list) or not all(isinstance(k, str) and gen_mod.KIND_RE.fullmatch(k) for k in kinds)
+            or out != (canon.canonical(rec) + "\n").encode()):
+        raise Refused("source-broken", f"the probe of {gen} answered {out[:120]!r}, not one canonical record")
+    abi = rec.get("handover")
+    if type(abi) is not int or abi != HANDOVER_ABI:
+        raise Refused("downgrade-unsupported:handover", f"{gen} takes handover ABI {abi!r}; this code execs "
+                                                        f"{HANDOVER_ABI}")
+    held = set(kinds)
+    for kind in sorted({k for k, _ in (*(shape.managed if shape else ()), *(journal.managed if journal else ()))}):
+        if kind not in held:
+            raise Refused(f"downgrade-unsupported:{kind}", f"{gen} holds no remove step for {kind}, which this host "
+                                                           "records")
+    return tuple(kinds)
+
+
+def phase_b_text(host: HostOS, gen: str, lock_fd: int, pool_fd: int, caller_uid: int, *, tree: Path | None = None,
+                 entry: str | None = None, fault: Optional[Tuple[str, str]] = None) -> str:
+    """The R4 program: ``gen``'s code on ``sys.path``, then :func:`repair_continue` with the two inherited lock
+    descriptors (and the launcher's ``fault`` as a literal [F7], only when it set one). Every value in it is phase A's
+    own (ints, a ``GEN_RE`` id, a checked fault): nothing the sudoers rule passes reaches it, so the grammar gains no
+    hidden verb. ``entry``: a test's own callable instead of ``M.repair_continue``, called with the same arguments
+    (it still runs in ``gen``'s code)."""
+    if not all(type(x) is int and x >= 0 for x in (lock_fd, pool_fd, caller_uid)):
+        raise Refused("bad-token", "phase B's descriptors and caller")
+    return (f"{root_tree.generation_boot_code(host, gen, tree=tree)}\n"
+            "from levain.slot import install_helper as M\n"
+            f"raise SystemExit({entry or 'M.repair_continue'}({_handover_args(lock_fd, pool_fd, gen, caller_uid, fault)}))\n")
+
+
+def exec_phase_b(host: HostOS, gen: str, lock_fd: int, pool_fd: int, caller_uid: int, *, python: str | None = None,
+                 tree: Path | None = None, entry: str | None = None, fault: Optional[Tuple[str, str]] = None,
+                 execve: Callable[[str, Sequence[str], Mapping[str, str]], object] = os.execve) -> None:
+    """R4 [r2: X-4]: both lock descriptors made inheritable (a flock belongs to the open file description, so it
+    survives the exec), then ``execve`` into ``gen`` with :func:`levain.launch.child_env` (never this process's whole
+    environment): same PID, so sudo still waits on it. Returns only through a test's ``execve``."""
+    python = python or root_tree.ROOT_PYTHON[host]
+    text = phase_b_text(host, gen, lock_fd, pool_fd, caller_uid, tree=tree, entry=entry, fault=fault)
+    os.set_inheritable(lock_fd, True)
+    os.set_inheritable(pool_fd, True)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        execve(python, [python, root_tree.PY_FLAGS, "-c", text], child_env())
+    except BaseException:
+        os.set_inheritable(lock_fd, False)    # the exec did not happen: nothing may inherit them now
+        os.set_inheritable(pool_fd, False)
+        raise
+
+
+def _fsync_dir(path: Path) -> str | None:
+    """``path`` (a directory) fsynced; the failure as text, else None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        return f"{path} not synced ({e.strerror or e})"
+    return None
+
+
+def _restore_phase_a(host: HostOS, cell: root_tree.Staged, prior: Intent | None, current: str | None,
+                     *, intent_path: Path | None = None, tree: Path | None = None) -> list[str]:
+    """[r5: both seats MED] The host put back as phase A found it, after ANY phase-A failure or exception before the
+    exec: ``staging.partial`` and the staged generation removed (never ``current``, never a generation that was there
+    before :func:`root_tree._place` replaced it, ``cell.existed``), the import tree fsynced, and the journal back to
+    what phase A read (``prior`` rewritten, a finished one included; none -> the run's own removed, the state dir
+    fsynced). [r5: L3 r2 codex MED] The target is removed only when THIS run placed it (``cell.placed``) and it was
+    not there before (``cell.existed``, recorded by the hash step before anything can raise). Every op is checked:
+    returns what could NOT be put back (empty when all of it was)."""
+    import shutil
+
+    tree = tree if tree is not None else root_tree.current_path(host).parent
+    undone: list[str] = []
+    removed = False
+    names = [root_tree.STAGING] + ([cell.target] if cell.target and cell.placed and not cell.existed else [])
+    for name in names:
+        p = tree / name
+        if name == current or not os.path.lexists(p):
+            continue
+        try:
+            shutil.rmtree(p)
+            removed = True
+        except OSError as e:
+            undone.append(f"{p} not removed ({e.strerror or e})")
+    if cell.target and cell.existed and not os.path.isdir(tree / cell.target):
+        undone.append(f"{tree / cell.target} was there before this run and is gone")
+    if removed:
+        undone += [w for w in (_fsync_dir(tree),) if w]
+    path = Path(intent_path or INTENT_PATH[host])
+    if prior is None:
+        try:
+            os.unlink(path)
+            undone += [w for w in (_fsync_dir(path.parent),) if w]
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            undone.append(f"the run's journal {path} not removed ({e.strerror or e})")
+    else:
+        try:
+            ok, why = write_intent_atomically(path, intent_text(prior))
+        except OSError as e:
+            ok, why = False, f"could not write the intent journal {path}: {e.strerror or e}"
+        if not ok:
+            undone.append(f"the earlier journal not put back ({why})")
+    return undone
+
+
+def repair_handover(plan: InstallPlan, g: Gathered, lock_fd: int, caller_uid: int, err: TextIO, *,
+                    apply: Callable[[InstallPlan, TextIO], Optional[str]] = apply_steps,
+                    probe: Callable[..., tuple[str, ...]] = run_probe,
+                    execve: Callable[[str, Sequence[str], Mapping[str, str]], object] = os.execve,
+                    python: str | None = None,
+                    tree: Path | None = None, intent_path: Path | None = None, entry: str | None = None,
+                    fault: Optional[Tuple[str, str]] = None) -> None:
+    """``repair --source``'s PHASE A, from its first act to the exec (§2.2): the pool lock proven held BEFORE any act
+    (so that refusal has nothing to undo), then phase A's steps (``apply``), the staged generation probed (R3a), and
+    the exec into phase B (R4) with the install lock and the pool lock carried across it. [r5: both seats MED] ANY
+    failure or exception in between (a failed step, the hash's refusal, the probe's, an OSError) restores the host
+    (:func:`_restore_phase_a`) and is raised; a restore that could not finish appends ``rollback-incomplete: <what>``
+    to the refusal's detail. ``fault``: the launcher's, carried into the probe's bind and phase B's program as a literal
+    [F7]. A resume (:func:`plan_repair_resume`) arrives here with its target already placed, or with a refusal raised
+    only after its one step removed a torn generation (``Staged.then_refuse``, after ``failed``). ``python``, ``tree``, ``intent_path``, ``entry``: a test's
+    interpreter, import tree, journal and phase B entry."""
+    host, cell = plan.host, plan.handover
+    assert cell is not None
+    q = g.quiesce
+    if q is None or not q.held:
+        raise Refused("bad-root", "no pool lock held to hand over")      # [r5: codex 5] before any act
+    prior = g.facts.intent               # as phase A found it (a finished journal too: phase A's R1 removes it)
+    current = g.repair.current if g.repair is not None else None
+    try:
+        failed = apply(plan, err)
+        if cell.refused is not None:
+            raise cell.refused
+        if failed is not None:
+            raise Refused("step-failed", failed)
+        if cell.then_refuse is not None:
+            raise cell.then_refuse
+        if cell.target is None:
+            raise Refused("internal", "phase A staged no generation")
+        journal = replace(plan.intent, generation=cell.target) if plan.intent is not None else None
+        probe(host, cell.target, g.facts.install_shape, journal, fault=fault)
+        err.write(f"levain install-helper: {cell.target} staged and probed; handing over to it\n")
+        exec_phase_b(host, cell.target, lock_fd, q.fd, caller_uid, python=python, tree=tree, entry=entry, fault=fault,
+                     execve=execve)
+    except BaseException as e:
+        undone = _restore_phase_a(host, cell, prior, current, intent_path=intent_path, tree=tree)
+        if not undone:
+            raise
+        note = "rollback-incomplete: " + "; ".join(undone)
+        err.write(f"levain install-helper: {note}\n")
+        if isinstance(e, Refused):
+            raise Refused(e.name, f"{e.detail}; {note}" if e.detail else note) from None
+        raise
+
+
+@dataclass
+class ContinueSeams:
+    """Every input :func:`repair_continue` reads that a non-root test must replace, with its real default."""
+
+    host: Optional[HostOS] = None
+    lock_path: Optional[Path] = None
+    owner_ok: Callable[[os.stat_result], bool] = lambda st: st.st_uid == 0
+    store_seams: Optional[RH.Seams] = None
+    state_dir: Optional[Path] = None
+    #: None: :func:`read_directory`'s own default, which passes ``env=`` (a held ``subprocess.run`` here is one the
+    #: spawn scan cannot follow).
+    run: Optional[Callable[..., object]] = None
+    user_name: Callable[[int], Optional[str]] = _user_name
+    #: Called with the re-gather's result before the plan (a test observes the adopted locks there).
+    after_gather: Optional[Callable[["Gathered"], None]] = None
+    plan: Optional[Callable[[InstallCommand, "Gathered"], InstallPlan]] = None
+    apply: Optional[Callable[[InstallPlan, TextIO], Optional[str]]] = None
+
+
+def adopt_lock(fd: int, path: Path, *, owner_ok: Callable[[os.stat_result], bool]) -> None:
+    """R4a [r2: X-4]: ``fd`` (inherited across the exec) must be the lock file at ``path``: ``path`` opened
+    ``O_NOFOLLOW`` and both ``fstat``-ed to the same ``st_dev``/``st_ino``, a regular file with the expected owner and
+    mode 0600, and the flock HELD by ``fd`` itself [r5: L3 r1 complement LOW 5, L3 r2 codex]: a ``LOCK_EX|LOCK_NB`` on
+    that second description must meet ``BlockingIOError`` (someone holds it), and then the same on ``fd`` must succeed
+    (a description that holds the lock re-takes it; one that does not meets the other holder). Else ``bad-root`` (a
+    descriptor that did not survive the exec, names another file, or holds no lock)."""
+    try:
+        held = os.fstat(fd)
+    except OSError as e:
+        raise Refused("bad-root", f"descriptor {fd} for {path} did not survive the exec ({e.strerror})") from None
+    try:
+        check = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    except OSError as e:
+        raise Refused("bad-root", f"{path}: {e.strerror}") from None
+    try:
+        st = os.fstat(check)
+        if ((held.st_dev, held.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(st.st_mode) or not owner_ok(st)
+                or stat.S_IMODE(st.st_mode) != 0o600):
+            raise Refused("bad-root", f"descriptor {fd} is not the lock {path} (regular, root's, 0600)")
+        try:
+            fcntl.flock(check, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass                     # held by some description: ``fd``'s, or another run's (proved next)
+        except OSError as e:
+            raise Refused("bad-root", f"{path}: {e.strerror}") from None
+        else:
+            raise Refused("bad-root", f"descriptor {fd} for {path} holds no lock")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)    # a no-op on the description that holds it
+        except BlockingIOError:
+            raise Refused("bad-root", f"descriptor {fd} for {path} holds no lock (another description holds "
+                                      "it)") from None
+        except OSError as e:
+            raise Refused("bad-root", f"{path}: {e.strerror}") from None
+    finally:
+        os.close(check)              # a second description: its close never drops the flock on ``fd``'s
+
+
+def _continue(lock_fd: int, pool_fd: int, gen: str, caller_uid: int, cs: ContinueSeams, err: TextIO,
+              fault: Optional[Tuple[str, str]] = None) -> dict:
+    host = cs.host or _host()
+    if not gen_mod.GEN_RE.fullmatch(gen):
+        raise Refused("bad-token", f"generation: {gen!r}")
+    hook = fault_hook(check_fault(fault))       # [F7] the launcher's literal: a kill at that point, nothing else
+    rs = cs.store_seams or RH.Seams(host=host)
+    L = rs.L
+    adopt_lock(lock_fd, Path(cs.lock_path or INSTALL_LOCK[host]), owner_ok=cs.owner_ok)
+    adopt_lock(pool_fd, L / "slots" / "pool.lock", owner_ok=cs.owner_ok)
+    os.set_inheritable(lock_fd, False)    # children never inherit either (subprocess closes fds by default anyway)
+    os.set_inheritable(pool_fd, False)
+    q = Quiesce(L, waits=rs)
+    q.fd = pool_fd                        # ADOPTED: never opened again, never waited on (that would wait on itself)
+    _QUIESCING[_store_key(L)] = q
+    cmd = parse_install_argv(["repair"])
+    try:
+        d = read_directory(host) if cs.run is None else read_directory(host, run=cs.run)
+        g = _gather_held(cmd, host, caller_uid, d, rs, L, q, state_dir=cs.state_dir, user_name=cs.user_name)
+        if cs.after_gather is not None:
+            cs.after_gather(g)
+        j = g.facts.intent
+        if j is None or j.verb != "repair" or j.generation != gen:
+            raise Refused("handover-mismatch", f"phase B was handed {gen}; the journal names "
+                                               f"{j.generation if j is not None else 'nothing'}")
+        plan = (cs.plan or (lambda c, gg, **kw: plan_repair(c, gg.facts, gg.repair, continuing=gen, **kw)))(  # type: ignore[arg-type]
+            cmd, g, **({"fault": hook} if hook else {}))
+        for line in plan.pending:
+            err.write(f"levain install-helper: pending: {line}\n")
+        failed = (cs.apply or apply_steps)(plan, err)
+    finally:
+        q.release()                       # the pool lock, then the install lock (§2.3's last row)
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+    if failed is not None:
+        raise Refused("step-failed", failed)
+    return {"verb": "repair", "steps": len(plan.steps), "generation": gen}
+
+
+def repair_continue(lock_fd: int, pool_fd: int, gen: str, *, caller_uid: int, fault: Optional[Tuple[str, str]] = None,
+                    seams: ContinueSeams | None = None, out: TextIO | None = None, err: TextIO | None = None) -> int:
+    """PHASE B (§2.2, §2.3 R4a on), entered only through :func:`exec_phase_b`'s ``-c`` program, in the staged
+    generation's code: ADOPT the two inherited locks (:func:`adopt_lock`; non-inheritable; the pool lock's
+    :class:`Quiesce` built on the descriptor and registered), re-gather under them with :func:`_gather_held` (never
+    :func:`gather_facts`, which would wait on its own pool lock, never :func:`install_lock`, which would refuse
+    ``install-busy`` against itself), then plan from R4b on and apply. One canonical line on ``out``, as :func:`main`.
+    ``fault``: the launcher's literal from phase A's program [F7] (SIGKILL at that point); never set by :func:`main`."""
+    out = out or sys.stdout
+    err = err or sys.stderr
+    try:
+        line = ok_line(_continue(lock_fd, pool_fd, gen, caller_uid, seams or ContinueSeams(), err, fault))
+    except Refused as e:
+        err.write(f"levain install-helper: refused {e.name}: {e.detail!r}\n")
+        out.write(refusal_line(e))
+        out.flush()
+        return RH.EXIT_REFUSED
+    except Exception as e:   # noqa: BLE001 - one line on stdout, whatever went wrong
+        err.write(f"levain install-helper: internal error: {type(e).__name__}: {e}\n")
+        out.write(refusal_line(Refused("internal")))
+        out.flush()
+        return RH.EXIT_INTERNAL
+    out.write(line)
+    out.flush()
+    return RH.EXIT_OK
+
+
 @dataclass
 class Seams:
     """Every act :func:`main` takes that a unit test cannot take as a non-root user, with its real default."""
@@ -1913,6 +2947,21 @@ class Seams:
     purge: Callable[[str, int, HostOS], dict] = run_purge
     stdin: Callable[[int], bytes] = _read_stdin
     credential: Callable[..., dict] = run_credential
+    #: repair --source's phase A: its steps (with ``apply``), the probe and the exec into phase B (:func:`repair_handover`).
+    handover: Callable[..., None] = repair_handover
+    #: [F7] The staged-tree launcher's fault, ``(step id, point)``: set by a test harness, never by :func:`main`'s
+    #: defaults, never read from the environment, argv, the grammar or a file. :func:`run` checks it before any act.
+    fault_at: Optional[Tuple[str, str]] = None
+    #: What happens at ``fault_at`` in THIS process (default: SIGKILL). A harness action (R2's mid-copy source edit)
+    #: runs only in phase A; across the exec only the kill crosses, as the literal.
+    fault_act: Optional[Callable[[], None]] = None
+    #: The points a fault may name (membership, :data:`FAULT_POINTS`).
+    POINTS: ClassVar[frozenset] = FAULT_POINTS
+
+    def fault(self, step_id: str, point: str) -> None:
+        """The hook every planned point calls: ``fault_act`` at ``fault_at``, nothing anywhere else."""
+        if self.fault_at is not None and (step_id, point) == tuple(self.fault_at):
+            (self.fault_act or _kill_self)()
 
 
 def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextIO) -> dict[str, object]:
@@ -1924,6 +2973,7 @@ def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextI
     Inside it, the gather's :class:`Quiesce` (the pool lock) is held through the last act too."""
     if seams.euid() != 0:
         raise Refused("not-root", "the install helper runs as root")
+    fault = check_fault(seams.fault_at)          # [F7] a launcher's point outside Seams.POINTS: refused before any act
     cmd = parse_install_argv(argv)
     if cmd.verb not in BUILT_VERBS:
         raise Refused(f"verb-unbuilt:{cmd.verb}", cmd.verb)
@@ -1940,13 +2990,19 @@ def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextI
         # run_credential takes the lock itself: the operator check and set's stdin come before it (H18, B7).
         return seams.credential(cmd.verb, cmd.credential, caller_uid, host, read=seams.stdin,
                                 lock=lambda: seams.lock(host), err=err)
-    with seams.lock(host):
+    with seams.lock(host) as lock_fd:
         gathered = seams.gather(cmd, host, caller_uid)
         try:
-            plan = seams.plan(cmd, gathered)
+            plan = seams.plan(cmd, gathered, **({"fault": seams.fault} if fault else {}))
             for line in plan.pending:
                 err.write(f"levain install-helper: pending: {line}\n")
-            failed = seams.apply(plan, err)
+            if plan.handover is not None:
+                # repair --source: phase A (its steps, the probe, the exec into the staged code; never returns). Any
+                # failure in it puts the host back and is raised [r5: both seats MED].
+                seams.handover(plan, gathered, lock_fd, caller_uid, err, apply=seams.apply, fault=fault)
+                failed = None
+            else:
+                failed = seams.apply(plan, err)
         finally:
             if gathered.quiesce is not None:
                 gathered.quiesce.release()     # the pool lock, after the last act and before the install lock
@@ -1986,7 +3042,9 @@ def main(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams | None = N
 INSTALL_ENTRY_ENV = ("SUDO_UID",)
 
 
-__all__ = ["RepairFacts", "desired_managed", "install_shape_path", "plan_only_report", "plan_repair", "BUILT_VERBS", "CHILD_MARGIN_S", "CREDENTIAL_VERBS", "INSTALL_ENTRY_ENV", "KEYS_ACCOUNT", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
+__all__ = ["ContinueSeams", "PROBE_OUT_CAP", "PROBE_TIMEOUT_S", "adopt_lock", "exec_phase_b", "phase_b_text",
+           "plan_repair_stage", "plan_repair_resume", "check_fault", "fault_hook", "FAULT_POINTS", "FAULT_STEPS", "probe_text", "repair_continue", "repair_handover", "HANDOVER_ABI", "repair_probe", "run_probe",
+           "RepairFacts", "desired_managed", "install_shape_path", "plan_only_report", "plan_repair", "BUILT_VERBS", "CHILD_MARGIN_S", "CREDENTIAL_VERBS", "INSTALL_ENTRY_ENV", "KEYS_ACCOUNT", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
            "apply_steps", "check_account_ids", "drop_to_keys", "load_creds", "read_credential", "run_credential", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",
            "plan_for", "plan_replenish", "plan_setup", "plan_tools", "plan_undo", "pool_lock", "preflight", "Quiesce",

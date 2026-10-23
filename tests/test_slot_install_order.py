@@ -19,6 +19,7 @@ from levain.slot.install_helper import (HostFacts, check_tools, operator_record,
                                         plan_tools, plan_undo)
 from levain.slot.layout import (RESERVE_BYTES, RUN, STORE, TMPFILES_CONF, base_run_rows, roots_path,
                                 same_filesystem, single_filesystem_paths, slot_run_rows)
+from levain.slot.removal import RemoveStep
 from levain.slot.sudoers import INSTALL_SUDOERS, RUNTIME_SUDOERS
 
 HOSTS = ("linux", "darwin")
@@ -54,8 +55,14 @@ def _plan(host, n=8, m=2, **kw):
     return plan_setup(_setup(n, m), _facts(host, **kw), read_sysctl=lambda p: "1", program_exists=lambda p: True)
 
 
+def _gids(host, names):
+    """Shared group names -> the gids setup gives them (undo takes each group at its live gid)."""
+    return {g: RANGES[host].shared[SHARED_GROUPS.index(g)] for g in names}
+
+
 def _undo(host, accounts, shared=SHARED_GROUPS, **kw):
-    return plan_undo(parse_install_argv(["undo"]), _set_up(host, **kw), accounts=accounts, shared_groups=shared)
+    return plan_undo(parse_install_argv(["undo"]), _set_up(host, **kw), accounts=accounts,
+                     shared_groups=_gids(host, shared))
 
 
 def _refusal(fn, *a, **kw) -> str:
@@ -202,17 +209,21 @@ def test_undo_reruns_after_failure(host):
     plan = _plan(host, 2, 1)
     ids = dict(plan.allocation.ids)
     undo = _undo(host, ids)
-    assert undo.steps[0].argv[-1] == str(RUNTIME_SUDOERS)
-    assert undo.steps[-3].argv[-1] == str(INSTALL_SUDOERS)
-    assert [i for i, s in enumerate(undo.steps) if s.argv and str(INSTALL_SUDOERS) in s.argv] == [len(undo.steps) - 3]
+    def install_rule_at(p):   # the install rule's removal, then the journal, the record, the visudo -c (FIX1 M1)
+        whys = [s.why for s in p.steps]
+        hits = [i for i, w in enumerate(whys) if str(INSTALL_SUDOERS) in w and not w.startswith("check ")]
+        return hits == [len(whys) - 4]
+
+    # FIX1: the sudoers preflight and undo's own journal come first
+    assert undo.steps[2].why.startswith(f"remove {RUNTIME_SUDOERS} ") and install_rule_at(undo)
+    # R1b: every removal of a group, a profile or a namespace reads the live object first (a remove step), so a
+    # re-run acts only on what is still there
     for s in undo.steps:
-        if s.argv and Path(s.argv[0]).name in ("groupdel", "apparmor_parser") or "-delete" in s.argv:
-            assert s.skip_if, s.why
-        if s.argv and "netns" in s.argv and "delete" in s.argv:
-            assert s.skip_if, s.why
+        if s.why.startswith(("delete the group ", "unload the AppArmor ", "delete the network namespace ")):
+            assert isinstance(s, RemoveStep) and s.call is not None and not s.argv, s.why
     # the re-run after a failure past the tombstones: no live accounts left, half the groups gone
     again = _undo(host, {}, shared=SHARED_GROUPS[:3], retired=undo.retired_after)
-    assert again.steps[0].argv[-1] == str(RUNTIME_SUDOERS) and again.steps[-3].argv[-1] == str(INSTALL_SUDOERS)
+    assert again.steps[2].why.startswith(f"remove {RUNTIME_SUDOERS} ") and install_rule_at(again)
     assert again.retired_after == undo.retired_after
 
 
@@ -247,7 +258,7 @@ def test_undo_leaves_no_shared_gid_on_store(host):
     last_kill = max(i for i, s in enumerate(undo.steps) if "stop every process" in s.why)
     assert last_kill < min(chgrp.values())
     assert all(undo.steps[i].skip_if[-3:] == ("!", "-e", str(p)) for p, i in chgrp.items())
-    first_delete = next(i for i, s in enumerate(undo.steps) if "delete the shared group" in s.why)
+    first_delete = next(i for i, s in enumerate(undo.steps) if s.why.startswith("delete the group "))
     assert max(chgrp.values()) < first_delete
 
 
@@ -408,7 +419,7 @@ def test_tree_links_refused_before_chown_and_renamed_into_place(host):
     assert steps[into].call and steps[flip].call and not steps[flip].argv          # rename(2), never mv
     assert not [a for a in argvs if a[0].endswith("/mv")]
     entries = {s.write[0].name for s in steps if s.write}
-    assert entries == {"install-helper", "runtime-helper", "service-entry"}
+    assert entries == {"install-helper", "runtime-helper", "service-entry", "export-importer", "export-verifier"}
     # a re-run whose target is already current drops the partial and touches no generation
     again = root_tree.tree_steps(host, Path("/src/levain"), generation=gen, current=gen)
     again_rms = [s.argv[-1] for s in again if s.argv and s.argv[0].endswith("/rm")]
@@ -505,7 +516,7 @@ def test_bwrap_digest_recorded_and_apparmor_validated(tmp_path, monkeypatch):
     cp.write_bytes(b"other")
     assert bwrap.record_digest(str(src), out)[0] is False
     undo = _undo("linux", {"_levain_s0": RANGES["linux"].slots[0]})
-    assert [s for s in undo.steps if s.argv[-2:] == ("-f", str(bwrap.BWRAP_DIGEST))]
+    assert [s for s in undo.steps if s.why == f"remove {bwrap.BWRAP_DIGEST}"]   # bwrap-copy/1, by its identity
 
 
 def test_services_named_in_pending_line():

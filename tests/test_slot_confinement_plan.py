@@ -23,6 +23,7 @@ from levain.slot.grammar import parse_install_argv
 from levain.slot.ids import RANGES, SHARED_GROUPS, SINGLETONS, SlotId, loopback_alias
 from levain.slot.install_helper import HostFacts, operator_record, plan_replenish, plan_setup, plan_undo
 from levain.slot.layout import IMPORT_TREE, RUN, install_helper_path, runtime_helper_path, service_entry_path
+from levain.slot.sudoers import RUNTIME_SUDOERS
 
 HOSTS = ("linux", "darwin")
 
@@ -64,7 +65,8 @@ def _refusal(fn, *a, **kw) -> str:
 
 
 def _undo(host, accounts, **kw):
-    return plan_undo(parse_install_argv(["undo"]), _set_up(host, **kw), accounts=accounts, shared_groups=SHARED_GROUPS)
+    return plan_undo(parse_install_argv(["undo"]), _set_up(host, **kw), accounts=accounts,
+                     shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(SHARED_GROUPS)})
 
 
 # --- §20 re-setup after undo ------------------------------------------------------------------------
@@ -284,16 +286,19 @@ def test_services_start_order(host):
     # services start after the accounts, the import tree and the confinement they run under
     tree_write = next(i for i, s in enumerate(plan.steps) if s.write and s.write[0] == service_entry_path(host))
     assert tree_write < first_start
-    # undo: every service stopped right after the runtime sudoers rule, reverse order, before anything is removed
+    # undo: every service stopped right after the runtime sudoers rule (and its visudo -c), reverse order, before
+    # anything is removed (R1b: each unit/1 through its per-identity stop)
     undo = _undo(host, dict(plan.allocation.ids))
-    stops = [i for i, s in enumerate(undo.steps) if s.argv and ("bootout" in s.argv or "disable" in s.argv)]
-    assert stops and min(stops) == 1
+    whys = [s.why for s in undo.steps]
+    stops = [i for i, w in enumerate(whys) if w.startswith(("stop com.levain.", "stop and disable levain-"))]
+    # FIX1: the sudoers preflight [0] and undo's journal [1] first, then the runtime rule [2] and its check [3]
+    assert stops and min(stops) == 4 and whys[3].startswith("check the sudoers config") \
+        and whys[2].startswith(f"remove {RUNTIME_SUDOERS} ")
     first_removal = next(i for i, s in enumerate(undo.steps) if s.write or "tombstone" in s.why or
-                         (s.argv and s.argv[0].endswith("rm") and "sudoers" not in s.argv[-1]))
+                         (s.why.startswith("remove /") and "sudoers" not in s.why))
     assert max(stops) < first_removal
-    stopped = [undo.steps[i].argv[-1] for i in stops]
-    assert stopped == ([f"system/{lb}" for lb in reversed(units.start_order(host))] if host == "darwin"
-                       else list(reversed(units.start_order(host))))
+    stopped = [whys[i].split()[-1] for i in stops]
+    assert stopped == list(reversed(units.start_order(host)))
 
 
 # --- the shared service bootstrap (§22, §23) ------------------------------------------------------------
@@ -534,9 +539,7 @@ def test_pf_alias_skip_if_reads_ifconfig(tmp_path):
         assert rc(pf.alias_absent(other, str(fake))) == 0, other
     # the plan's steps use exactly these tests, on the real ifconfig path
     add = pf.alias_steps([SlotId("egress", 20)])
-    rem = pf.alias_undo_steps([SlotId("egress", 20)])
     assert add[0].skip_if == pf.alias_present("127.0.1.21") and pf.IFCONFIG in add[0].skip_if[2]
-    assert rem[0].skip_if == pf.alias_absent("127.0.1.21")
 
 
 def test_pf_alias_steps_in_plans():
@@ -560,11 +563,11 @@ def test_pf_alias_steps_in_plans():
     assert [a for a in rargv if a[:1] == ("/sbin/ifconfig",)] == [add(0), add(1), add(2)]
     assert rargv.index(add(2)) < next(i for i, s in enumerate(rep.steps) if s.write and s.write[0] == pf.ANCHOR_FILE)
     undo = _undo("darwin", ids)
-    uargv = [s.argv for s in undo.steps]
-    rems = [i for i, a in enumerate(uargv) if a[:3] == ("/sbin/ifconfig", "lo0", "-alias")]
-    assert [uargv[i][3] for i in rems] == ["127.0.1.1", "127.0.1.2"]
+    uwhys = [s.why for s in undo.steps]
+    rems = [i for i, w in enumerate(uwhys) if w.startswith("remove the lo0 alias ")]
+    assert [uwhys[i].split()[-1] for i in rems] == ["127.0.1.1", "127.0.1.2"]
     last_tomb = max(i for i, s in enumerate(undo.steps) if "tombstone" in s.why)
-    flush = uargv.index(("/sbin/pfctl", "-a", "com.apple/levain", "-F", "all"))
+    flush = uwhys.index("flush the pf anchor com.apple/levain")
     assert last_tomb < min(rems) and max(rems) < flush
     for p in _every_plan("linux"):
         assert not [s for s in p.steps if "ifconfig" in " ".join([*s.argv, *s.skip_if]) or "alias" in s.why]
@@ -584,12 +587,12 @@ def test_pf_anchor_plan_and_undo():
     assert last_acct < plan.steps.index(w[0])
     assert not [s for s in _plan("linux").steps if "pf" in s.why.split()]
     undo = _undo("darwin", dict(plan.allocation.ids))
-    uargv = [s.argv for s in undo.steps if s.argv]
-    flush = uargv.index(("/sbin/pfctl", "-a", "com.apple/levain", "-F", "all"))
-    assert ("/bin/rm", "-f", "/etc/pf.anchors/levain") in uargv[flush:]
-    assert ("/bin/rm", "-f", str(pf.PF_TOKEN)) in uargv[flush:]
+    uwhys = [s.why for s in undo.steps]
+    flush = uwhys.index("flush the pf anchor com.apple/levain")
+    assert "remove /etc/pf.anchors/levain" in uwhys[flush:]
+    assert f"release pf's enable reference (the token in {pf.PF_TOKEN})" in uwhys[flush:]   # it removes the token
     last_tomb = max(i for i, s in enumerate(undo.steps) if "tombstone" in s.why)
-    assert last_tomb < undo.steps.index(next(s for s in undo.steps if s.argv == uargv[flush]))
+    assert last_tomb < flush
     # replenish re-renders the rules for every slot in service plus the new one, by uid
     ids = dict(plan.allocation.ids)
     rep = plan_replenish(parse_install_argv(["replenish"]),
@@ -668,7 +671,7 @@ def test_pf_token_released_on_undo(tmp_path):
     # the plan steps call exactly these
     undo = _undo("darwin", {"_levain_s0": 3999})
     rel = [s for s in undo.steps if s.call and "release pf's enable reference" in s.why]
-    flush = next(i for i, s in enumerate(undo.steps) if s.argv[-2:] == ("-F", "all"))
+    flush = next(i for i, s in enumerate(undo.steps) if s.why.startswith("flush the pf anchor "))
     assert len(rel) == 1 and undo.steps.index(rel[0]) > flush
     setup = _plan("darwin")
     assert len([s for s in setup.steps if s.call and "take pf's enable reference" in s.why]) == 1
@@ -693,10 +696,10 @@ def test_netns_setup_boot_pass_and_undo():
     assert got == [s.argv for s in want]
     assert not [s for s in _plan("darwin").steps if s.argv and s.argv[0].endswith("/ip")]
     undo = _undo("linux", dict(plan.allocation.ids))
-    deleted = [s.argv[-1] for s in undo.steps if s.argv[1:3] == ("netns", "delete")]
+    deleted = [s.why.split()[-1] for s in undo.steps if s.why.startswith("delete the network namespace ")]
     assert deleted == names
     last_kill = max(i for i, s in enumerate(undo.steps) if "stop every process" in s.why)
-    first_del = next(i for i, s in enumerate(undo.steps) if s.argv[1:3] == ("netns", "delete"))
+    first_del = next(i for i, s in enumerate(undo.steps) if s.why.startswith("delete the network namespace "))
     assert last_kill < first_del
 
 
@@ -759,8 +762,8 @@ def test_bwrap_copy_and_apparmor_profile():
     assert not [s for s in _plan("darwin").steps if "bwrap" in s.why]
     # undo unloads and removes only ours
     undo = _undo("linux", {"_levain_s0": 899})
-    touched = [a for s in undo.steps if s.argv for a in s.argv if "apparmor.d" in a]
-    assert touched and all(a == "/etc/apparmor.d/levain-slot-bwrap" for a in touched)
+    aa = [s.why for s in undo.steps if "AppArmor" in s.why or "apparmor.d" in s.why]
+    assert aa == ["unload the AppArmor profile levain-slot-bwrap", "remove /etc/apparmor.d/levain-slot-bwrap"]
 
 
 # --- §2.1 the root import tree -----------------------------------------------------------------------

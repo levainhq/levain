@@ -31,7 +31,7 @@ import struct
 import subprocess
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -46,7 +46,8 @@ from levain.cockpit.install import REPORTED, marker_path, marker_present, marker
 if TYPE_CHECKING:
     from levain.cockpit.verbs import VerbRegistry
 
-__all__ = ["KEY_CLASSES", "InitPlan", "InitResult", "KeyError_", "KeyRow", "LegacyRow", "Signer", "enroll", "keys",
+__all__ = ["KEY_CLASSES", "InitPlan", "InitResult", "KeyError_", "KeyRow", "LegacyRow", "Signer", "anchor_reset",
+           "enroll", "keys",
            "fingerprint_of", "init_plan", "ledger_init", "normalise_public_key", "policy_raise", "principal_of", "revoke",
            "signing_public_key", "ssh_signer"]
 
@@ -75,6 +76,8 @@ class KeyRow:
     legacy_enrolled_at: str | None = None
     custody: str = UNSTATED          # what its enrol record declares (a declaration, never a proof)
     public_key: str | None = None
+    # why it is QUARANTINED (levain.authority.AuthoritySnapshot.quarantined_keys), or None
+    quarantined: str | None = None
 
 
 # what signs a link's message (namespace ``levain-authority``); returns the armored SSHSIG
@@ -163,9 +166,9 @@ def _check_reported(conn: object) -> None:
         raise KeyError_(f"this journal's install class is {cls!r}; enrolling here is for a reported install")
 
 
-def _row(k: AuthorityKey) -> KeyRow:
+def _row(k: AuthorityKey, quarantined: str | None = None) -> KeyRow:
     return KeyRow(k.fingerprint, k.principal, k.key_class, k.enrolled_seq, k.enrolled_at, k.revoked_seq,
-                  k.compromised_since, k.legacy_enrolled_at, k.custody, k.public_key)
+                  k.compromised_since, k.legacy_enrolled_at, k.custody, k.public_key, quarantined)
 
 
 def _capture(db: CockpitDB, now: datetime, ssh_keygen: Path | str) -> RequestAuthority:
@@ -209,7 +212,7 @@ def enroll(data_root: Path | str, public_key_text: str, key_class: str, *, signe
     if key_class not in _CLASS_RANK:
         raise KeyError_(f"unknown key class {key_class!r}; one of {', '.join(KEY_CLASSES)}")
     public_key = normalise_public_key(public_key_text)
-    problem = _authority.custody_problem(key_class, custody, public_key.split()[0])
+    problem = _authority.custody_problem(key_class, custody, public_key.split()[0], public_key=public_key)
     if problem is not None:
         raise KeyError_(problem)
     fp = fingerprint_of(public_key, ssh_keygen=ssh_keygen)
@@ -326,7 +329,91 @@ def keys(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAU
             raise KeyError_(str(auth.authority_error))
         return [], auth.authority_error
     rows = sorted(auth.authority.keys.values(), key=lambda k: k.enrolled_seq)
-    return [_row(k) for k in rows], auth.authority_error
+    held = {k.fingerprint: why for k, why in auth.authority.quarantined_keys()}
+    return [_row(k, held.get(k.fingerprint)) for k in rows], auth.authority_error
+
+
+# ---------------------------------------------------------------------------------------------------
+# `levain cockpit anchor reset` (DESIGN §3.8)
+
+
+def anchor_reset(data_root: Path | str, *, signer_fp: str, sign: Signer, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+                 marker_directory: Path | None = None) -> tuple[Mapping[str, Any] | None, _authority.Anchor | None]:
+    """Move the anchor to the log's head on a laptop-presence signature over ``{store_id, old_anchor, new_head}``
+    (namespace ``levain-authority-reset``; ``sign`` must sign in it), verified against the log's OWN keys as of
+    that head (:func:`levain.authority.reset_anchor`, which stores the proof in the anchor file). Returns
+    ``(old_anchor, new)``; ``new`` is None, and nothing is signed, when the anchor is absent or already agrees
+    with the log. The log is replayed in full with a fresh cache: this is the trust decision, so no chain this
+    process verified earlier stands in for it.
+
+    Everything that can refuse is judged before ``sign`` asks for a touch: an anchor of another store (a reset is
+    for a rollback of the same store, DESIGN §3.8), a signer that is not one of the log's laptop-presence keys that
+    can sign (:meth:`~levain.authority.AuthoritySnapshot.signing_laptop_keys`: unrevoked, not quarantined), and a
+    live cockpit server. The reset lock (:func:`levain.authority.reset_lock`) is held from the read of the old
+    anchor through the signature, a re-read of the log's head and the write, so no server starts, no advance lands
+    and no link is appended unseen in between; only the signature itself is judged after the touch."""
+    db = _journal(data_root, marker_directory=marker_directory)
+    path = anchor_path(db.data_root)
+    cache = _authority.ReplayCache()
+    with db.read() as conn:
+        # anchor=None: the log as it stands, which the anchor is about to be judged against, not by
+        auth = RequestAuthority.capture(conn, now=datetime.now(timezone.utc), anchor=None, source=str(db.path),
+                                        cache=cache, ssh_keygen=ssh_keygen)
+        _check_reported(conn)
+    if auth.authority is None:
+        if auth.log_empty:
+            init = _authority.init_hint(db.data_root)
+            if _authority._old_anchor_view(path) is None:
+                raise KeyError_(f"the authority log is empty and has no anchor: run {init}")
+            raise KeyError_(f"the authority log is empty, so it holds no key a reset can verify against; if this "
+                            f"store was emptied on purpose, move {path} aside, then run {init}")
+        raise KeyError_(str(auth.authority_error))
+    snap = auth.authority
+
+    def agrees() -> Mapping[str, Any] | None | bool:
+        """The anchor as it stands when it needs no reset (absent, at the head, or behind it: the next open or
+        append writes or advances it), else False (unreadable, or the log is behind it: the case a reset is for)."""
+        try:
+            current = _authority.read_anchor(path)
+            _authority.check_anchor(snap, current, path=path)
+        except _authority.ForeignAnchor as exc:
+            raise KeyError_(f"{exc} (nothing signed)") from None
+        except AnchorError:
+            return False
+        return None if current is None else current.as_dict()
+
+    # first without the lock, so an anchor that needs nothing is answered while a server runs
+    if (stands := agrees()) is not False:
+        return stands, None
+    with _authority.reset_lock(path) as held:
+        if (stands := agrees()) is not False:     # again under the lock: an advance may have landed
+            return stands, None
+        key = snap.key(signer_fp)
+        if key is None or not key.active:
+            raise KeyError_(f"{signer_fp} is not an unrevoked key of this log at seq {snap.seq} (nothing signed)")
+        if key.key_class != LAPTOP:
+            raise KeyError_(f"an anchor reset needs a {LAPTOP} key, not {key.key_class} (nothing signed)")
+        if signer_fp not in {k.fingerprint for k in snap.signing_laptop_keys()}:
+            why = dict((k.fingerprint, w) for k, w in snap.quarantined_keys()).get(signer_fp, "it cannot sign")
+            raise KeyError_(f"{signer_fp} is quarantined, so it cannot sign an anchor reset: {why} (nothing signed)")
+        old = _authority._old_anchor_view(path)
+        signature = sign(_authority.reset_message(snap.store_id, old, snap.seq, snap.head_hash))
+        with db.read() as conn:
+            # a CLI append between the capture and here (the store lock keeps out a server, not the CLI)
+            again = RequestAuthority.capture(conn, now=datetime.now(timezone.utc), anchor=None, source=str(db.path),
+                                             cache=cache, ssh_keygen=ssh_keygen).authority
+        if again is None or (again.seq, again.head_hash) != (snap.seq, snap.head_hash):
+            at = "unreadable" if again is None else f"at seq {again.seq}"
+            raise KeyError_(f"the authority log moved while the reset was signed (it was at seq {snap.seq}, now "
+                            f"{at}); nothing written, run the reset again")
+        try:
+            new = _authority.reset_anchor(path, snap, signer_fp=signer_fp, signature=signature,
+                                          ssh_keygen=ssh_keygen, held=held)
+        except VerifierUnavailable:
+            raise
+        except AuthorityError as exc:
+            raise KeyError_(str(exc)) from None
+    return old, new
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -390,7 +477,8 @@ def _legacy_row(raw: Any, state: AuthoritySnapshot | None, ssh_keygen: Path | st
         # A carried row is re-enrolled with its custody unstated (/2 never recorded one), which the replay
         # admits for a laptop-presence key only on a record carrying legacy_enrolled_at (its enrol time).
         if problem is None:
-            problem = _authority.custody_problem(cls, UNSTATED, key_type, legacy=isinstance(enrolled_at, str))
+            problem = _authority.custody_problem(cls, UNSTATED, key_type, legacy=isinstance(enrolled_at, str),
+                                                 public_key=normal)
     held = None if state is None else state.key(fp)
     return LegacyRow(fp, str(cls), key_type, enrolled_at if isinstance(enrolled_at, str) else None,
                      revoked_at is not None, compromised is not None, normal, problem,
@@ -471,7 +559,7 @@ def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str
     signer_key = normalise_public_key(signer_public_key)
     if fingerprint_of(signer_key, ssh_keygen=ssh_keygen) != signer_fp:
         raise KeyError_("the signing key's public half is not the key that signs")
-    problem = _authority.custody_problem(LAPTOP, signer_custody, signer_key.split()[0])
+    problem = _authority.custody_problem(LAPTOP, signer_custody, signer_key.split()[0], public_key=signer_key)
     if problem is not None:
         raise KeyError_(f"the signing key: {problem}")
     confirmed = set(confirmed)

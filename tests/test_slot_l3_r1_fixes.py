@@ -17,7 +17,7 @@ from levain.slot import Refused, accounts, netns, pf, root_tree, units
 from levain.slot import runtime_grammar as rg
 from levain.slot.accounts import SLOT_MARKER, SLOT_RETIRED_MARKER, Account
 from levain.slot.grammar import parse_install_argv
-from levain.slot.ids import SHARED_GROUPS
+from levain.slot.ids import RANGES, SHARED_GROUPS
 from levain.slot.install_helper import HostFacts, extra_tools, operator_record, plan_setup, plan_undo
 
 HOSTS = ("linux", "darwin")
@@ -47,7 +47,7 @@ def _plan(host, **kw):
 
 def _undo(host, accts, **kw):
     return plan_undo(parse_install_argv(["undo"]), _facts(host, operator_record=operator_record(OP, OP_UID), **kw),
-                     accounts=accts, shared_groups=SHARED_GROUPS)
+                     accounts=accts, shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(SHARED_GROUPS)})
 
 
 # --- F1 / F2: pf's enable reference ---------------------------------------------------------------------

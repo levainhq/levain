@@ -267,6 +267,7 @@
     const board = document.getElementById("board");
     if (!board) return;
     proposalRead = null;   // an authoritative reload: a denial or a grant answered since must withdraw its card, not wait out the 30 s
+    grantRead = null;      // and a grant revoked since leaves the grants slot
     // the typed panels about to be dropped end their timers and mounts first
     if (window.LevainCockpitKinds && window.LevainCockpitKinds.reset) window.LevainCockpitKinds.reset();
     const kept = captureKept(board);   // the rows the reader holds open, restored below once the board is drawn again
@@ -3851,7 +3852,7 @@
 
   function renderExternal(entry, view, opts) {
     const p = renderExternalBody(entry, view, opts);
-    if (p.dataset && p.dataset.proposalSlot != null && !p.querySelector(".proposal-slot")) p.appendChild(proposalSlot());
+    if (p.dataset && p.dataset.proposalSlot != null && !p.querySelector(".proposal-slot")) p.appendChild(standingSlots());
     return p;
   }
   function renderExternalBody(entry, view, opts) {
@@ -4962,6 +4963,111 @@
     return slot;
   }
 
+  // M17: the standing grants, beside the proposals (a proposal offers a grant, a grant card takes one away). Each card
+  // shows what the grant answered and a "revoke" button that copies the exact `levain consent grant revoke` line from
+  // /cockpit/consent/grants.json (levain.consent.grants.grant_view): the page never signs, the terminal does with the
+  // operator's key. A grant that answered a call which was then refused is the demotion signal: it leads the slot and
+  // its refused calls lead its card. Fetched and cached exactly as the proposals are; no token or a failed read: no slot
+  let grantRead = null, grantAt = 0;
+  function grantFetch() {
+    if (grantRead && Date.now() - grantAt < PROPOSAL_TTL_MS) return grantRead;
+    const t = window.LevainCockpitTransport;
+    const headers = t && typeof t.headers === "function" ? t.headers() : {};
+    if (!headers["X-Levain-Write-Token"]) return Promise.resolve(null);
+    grantAt = Date.now();
+    const got = consentQueued(() => fetchBounded("/cockpit/consent/grants.json", { cache: "no-store", headers: headers },
+      (res) => (res.ok ? res.json().then((b) => (b && Array.isArray(b.grants) ? b : null), () => null) : null),
+      () => null), "the standing grants could not be read").then((b) => {
+        // the queued read answers {error} on its own failures (a throw, a stall past the deadline): only a read that
+        // carries grants is kept, so a failed one is read again at the next repaint instead of hiding the slot for 30 s
+        if (!b || !Array.isArray(b.grants)) { if (grantRead === got) grantRead = null; return null; }
+        return b;
+      });
+    grantRead = got;
+    return got;
+  }
+  // how many of a grant's calls were refused: the server's count over all of them (`answered.refused_count`), never read
+  // off the newest calls it sends (a refusal older than those still counts)
+  const grantRefusedShown = (g) => (g && g.answered && Array.isArray(g.answered.recent) ? g.answered.recent : [])
+    .filter((c) => c && c.outcome === "refused").length;
+  const grantRefused = (g) => Math.max(g && g.answered && Number.isInteger(g.answered.refused_count) ? g.answered.refused_count : 0,
+                                       grantRefusedShown(g));
+  function grantCard(g, inertNote) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const state = sv(g.state);
+    const refused = grantRefused(g);
+    const row = el("div", "row consent-row grant-row" + (refused ? " ext-accent grant-demote" : "") + (state === "live" ? "" : " ext-dim"));
+    row.setAttribute("data-consent-grant", sv(g.id));
+    const head = el("div", "consent-head");
+    head.appendChild(el("span", "consent-agent", sv(g.agent) || sv(g.kind) || "grant"));
+    const tools = Array.isArray(g.tools) ? g.tools.filter((x) => typeof x === "string").join(", ") : "";
+    head.appendChild(el("b", "consent-tool", tools || sv(g.kind)));
+    head.appendChild(el("span", "ext-meta", "standing grant · " + state));
+    const a = g.answered && typeof g.answered === "object" ? g.answered : {};
+    const count = Number.isInteger(a.count) ? a.count : 0;
+    head.appendChild(el("span", "consent-left", count ? "answered " + count + "×" + (refused ? " · " + refused + " refused" : "")
+                                                      : "answered nothing yet"));
+    row.appendChild(head);
+    const facts = el("div", "consent-facts");
+    if (sv(g.workspace)) facts.appendChild(el("span", "ext-meta", "in " + g.workspace));
+    if (Array.isArray(g.postures) && g.postures.length) facts.appendChild(el("span", "ext-meta", g.postures.join(", ") + " mode"));
+    facts.appendChild(el("span", "ext-meta", (state === "expired" ? "expired " : "until ") + sv(g.expires_at)));
+    facts.appendChild(el("span", "ext-meta", sv(g.kind) + " " + sv(g.id_shown)));
+    row.appendChild(facts);
+    if (state === "inert" && inertNote) row.appendChild(el("div", "consent-note ext-meta", inertNote));
+    // the newest calls the server sent, refused ones first (sort is stable: each group stays newest first). A refused call
+    // older than those is not on the card; the counts say how many there were in all
+    const calls = (Array.isArray(a.recent) ? a.recent.slice() : [])
+      .sort((x, y) => (y.outcome === "refused" ? 1 : 0) - (x.outcome === "refused" ? 1 : 0));
+    if (calls.length) {
+      const box = el("div", "grant-calls");
+      for (const c of calls) {
+        const o = sv(c.outcome) || "unknown";
+        box.appendChild(el("div", "grant-call ext-meta grant-" + o, o + " · " + sv(c.tool) + " · " + sv(c.at)
+                           + (sv(c.cwd) ? " · in " + c.cwd : "")));
+      }
+      const older = refused - grantRefusedShown(g);
+      if (calls.length < count) box.appendChild(el("div", "grant-call ext-meta", "the newest " + calls.length + " of " + count
+                                                   + (older > 0 ? " · " + older + " refused call" + (older === 1 ? "" : "s") + " older than these" : "")));
+      row.appendChild(box);
+    }
+    const cmd = sv(g.revoke);
+    if (cmd) {
+      const line = el("div", "consent-cmd");
+      const code = el("code", "consent-code", cmd);
+      const btn = el("button", "undo-btn consent-copy", "revoke");
+      btn.type = "button";
+      btn.dataset.label = btn.textContent;
+      btn.title = "copy the revoke command; run it in a terminal with your signing key. This page signs nothing";
+      btn.addEventListener("click", () => copyText(cmd, code, btn));
+      line.append(code, btn);
+      row.appendChild(line);
+    }
+    return row;
+  }
+  function grantSlot() {
+    const slot = el("div", "grant-slot");
+    grantFetch().then((b) => {
+      if (!b) return;
+      // sort is stable: the server's order holds among grants with and among grants without a refused call
+      const rows = b.grants.slice().sort((x, y) => (grantRefused(y) ? 1 : 0) - (grantRefused(x) ? 1 : 0));
+      const note = typeof b.note === "string" ? b.note : "";
+      // a page whose consent hook names no cockpit (root "") and that holds no grant gets no slot, as with no proposals;
+      // a named cockpit that cannot be read is said
+      if (!rows.length && (!note || !b.root)) return;
+      const head = el("div", "ext-grouphead", "standing grants");
+      const inert = typeof b.inert_note === "string" ? b.inert_note : "";
+      slot.replaceChildren(head, ...(note ? [el("div", "consent-note ext-meta", note)] : []), ...rows.map((g) => grantCard(g, inert)));
+    }).catch(() => {});
+    return slot;
+  }
+  // the Decisions history's two standing-rule slots, drawn together wherever the proposals are
+  function standingSlots() {
+    const f = document.createDocumentFragment();
+    f.append(proposalSlot(), grantSlot());
+    return f;
+  }
+
   function appendExternalLines(host, lines) {
     let lastGroup = null;
     // the Decisions panel's proposal cards (see renderExternalBody) follow the live requests, which are on a clock, and come
@@ -4977,7 +5083,7 @@
       // rows that carry a group (a list drawn as a count) come in the kernel's order: a heading where the group changes
       if (typeof o.grp === "string" && o.grp !== lastGroup) {
         lastGroup = o.grp;
-        if (slotDue && (o.grp === "Resolved" || o.grp === "Outcomes")) { slotDue = false; host.appendChild(proposalSlot()); }
+        if (slotDue && (o.grp === "Resolved" || o.grp === "Outcomes")) { slotDue = false; host.appendChild(standingSlots()); }
         host.appendChild(el("div", "ext-grouphead", o.grp));
       }
       if (o.consent) { host.appendChild(consentRow(o)); continue; }
@@ -5005,7 +5111,7 @@
       if (o.cancel && cancelPending) appendRowVerbs(row, buildPendingCancel(o.cancel));
       host.appendChild(row);
     }
-    if (slotDue) host.appendChild(proposalSlot());
+    if (slotDue) host.appendChild(standingSlots());
   }
 
   function renderEdits(entry, view) {
@@ -5219,6 +5325,7 @@
     modalReturnFocus = triggerEl || null;
     modalEpisodeQuery = "";  // a fresh open starts with the recent list, not a stale query
     proposalRead = null;     // a fresh open reads the proposals again: a denial or a grant since withdraws its card
+    grantRead = null;        // and the grants again: a revoke since removes its card
     buildModal(entry);
   }
 

@@ -13,10 +13,14 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from levain.firing.hands import Step, _abs
+
+if TYPE_CHECKING:
+    from levain.slot.removal import Live
 
 LEVAIN_BWRAP = Path("/usr/libexec/levain/bwrap")
 #: The digests setup recorded (CONTRACT §23), beside the retired-ids file (§1.1's Linux dir).
@@ -118,18 +122,133 @@ def bwrap_steps(*, apparmor_userns_restricted: bool, source: str | None = None) 
     return steps
 
 
-def bwrap_undo_steps() -> list[Step]:
-    """Unload and remove OUR profile only (never hands' ``levain-bwrap``), then the copy and its record."""
-    test = _abs("test")
+__all__ = ["APPARMOR_PROFILE", "APPARMOR_PROFILE_NAME", "BWRAP_DIGEST", "BWRAP_GROUP", "BWRAP_MODE", "LEVAIN_BWRAP", "USERNS_SYSCTL",
+           "apparmor_profile_text", "bwrap_steps", "copy_steps", "digest_record_text",
+           "file_sha256", "record_digest", "system_bwrap", "userns_restricted"]
+
+
+# --- row 33 R1b: removal by the RECORDED identity (§1.1 table rows 9-10) -------------------------------------------
+
+#: The kernel's list of loaded profiles (``<name> (<mode>)`` per line); absent = AppArmor is not enabled, so nothing is
+#: loaded. Written to ``.remove`` (the kernel interface ``apparmor_parser -R`` uses) only when a profile is loaded
+#: with no profile file left to name it.
+APPARMOR_LOADED = Path("/sys/kernel/security/apparmor/profiles")
+APPARMOR_REMOVE = Path("/sys/kernel/security/apparmor/.remove")
+_PROFILE_HEADER = b"# Levain session slots' bubblewrap"
+
+
+def _profile_loaded(name: str, live: "Live") -> bool:
+    from levain.slot.removal import ReadFailed
+
+    try:
+        text = live.at(APPARMOR_LOADED).read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        raise ReadFailed(f"cannot read {APPARMOR_LOADED}: {e.strerror or e}") from None
+    return any(ln.split(" (", 1)[0] == name for ln in text.splitlines())
+
+
+def apparmor_state(name: str, live: "Live") -> str:
+    """OURS: ``/etc/apparmor.d/<name>`` is a regular root file whose first line is Levain's header, or the file is
+    gone and the profile is still loaded (the bound reserves ``levain-slot-*``). ABSENT: no file and not loaded."""
+    from levain.slot.removal import ABSENT, OURS, root_file
+
+    state = root_file(live, Path("/etc/apparmor.d") / name, check=lambda b: b.startswith(_PROFILE_HEADER))
+    if state != ABSENT:
+        return state
+    return OURS if _profile_loaded(name, live) else ABSENT
+
+
+def remove_apparmor_profile_steps(name: str, *, live: "Live") -> list[Step]:
+    """``apparmor/1`` (R8): unload the recorded profile ONLY while it is LOADED (whether ``apparmor_parser -R`` of an
+    unloaded profile exits 0 is unmeasured, so nothing depends on it), then ``rm -f`` its file. Never the bwrap copy
+    or its digest (``bwrap-copy/1``'s), never hands' ``levain-bwrap``."""
+    from levain.slot.removal import at, chain, point, remove_step
+
+    path = Path("/etc/apparmor.d") / name
+    record = ("apparmor/1", name)
+    state = lambda: apparmor_state(name, live)   # noqa: E731
+    parser, rm = _abs("apparmor_parser"), _abs("rm")
+
+    def unload() -> tuple[bool, str]:
+        if not _profile_loaded(name, live):
+            return True, ""
+        if live.at(path).exists():
+            return live.act((parser, "-R", at(live, path)))
+        try:
+            live.at(APPARMOR_REMOVE).write_text(name, encoding="ascii")
+        except OSError as e:
+            return False, f"could not unload {name} through {APPARMOR_REMOVE}: {e.strerror or e}"
+        return True, ""
+
     return [
-        Step(f"unload the AppArmor profile {APPARMOR_PROFILE_NAME}",
-             (_abs("apparmor_parser"), "-R", str(APPARMOR_PROFILE)), skip_if=(test, "!", "-e", str(APPARMOR_PROFILE))),
-        Step(f"remove {APPARMOR_PROFILE}", (_abs("rm"), "-f", str(APPARMOR_PROFILE))),
-        Step(f"remove {LEVAIN_BWRAP}", (_abs("rm"), "-f", str(LEVAIN_BWRAP))),
-        Step(f"remove {BWRAP_DIGEST}", (_abs("rm"), "-f", str(BWRAP_DIGEST))),
+        remove_step(f"unload the AppArmor profile {name}", record, live, state,
+                    chain(unload, point(live, "apparmor/1:after-unload")), tools=(parser,)),
+        remove_step(f"remove {path}", record, live, state, lambda: live.act((rm, "-f", at(live, path))), tools=(rm,)),
     ]
 
 
-__all__ = ["APPARMOR_PROFILE", "APPARMOR_PROFILE_NAME", "BWRAP_DIGEST", "BWRAP_GROUP", "BWRAP_MODE", "LEVAIN_BWRAP", "USERNS_SYSCTL",
-           "apparmor_profile_text", "bwrap_steps", "bwrap_undo_steps", "copy_steps", "digest_record_text",
-           "file_sha256", "record_digest", "system_bwrap", "userns_restricted"]
+#: One line of :func:`digest_record_text` (``sha256sum`` check format: a digest, two spaces, an absolute path).
+_DIGEST_LINE = re.compile(rb"([0-9a-f]{64})  (/[^\n]*)")
+
+
+def _digest_lines(data: bytes) -> dict | None:
+    """A digest record's ``path -> sha256``; None when the bytes are not one :func:`digest_record_text` wrote."""
+    lines = data.split(b"\n")
+    if lines[-1] != b"" or len(lines) < 2:
+        return None
+    out = {}
+    for ln in lines[:-1]:
+        m = _DIGEST_LINE.fullmatch(ln)
+        if m is None:
+            return None
+        out[m.group(2).decode("utf-8", "replace")] = m.group(1).decode()
+    return out
+
+
+def bwrap_copy_state(copy: str, digest: str, live: "Live") -> str:
+    """OURS: the copy or its digest record is present, each a regular root file Levain wrote: the digest record parses
+    as :func:`digest_record_text`'s, and the copy's sha256 is the one that record names for it. ABSENT: neither.
+    NOT_OURS when either is any other file (the bound admits every name under ``/var/lib/levain``, the retired-ids
+    file's included), so nothing is removed. Known edge: a copy whose digest record was never written (setup killed
+    between the ``install`` and the record) reads NOT_OURS and is left, logged; the next setup or repair re-records."""
+    from levain.slot.removal import ABSENT, NOT_OURS, OURS, ReadFailed, root_file
+
+    named: dict = {}
+
+    def record_ok(b: bytes) -> bool:
+        lines = _digest_lines(b)
+        if lines is not None:
+            named.update(lines)
+        return lines is not None
+
+    d = root_file(live, Path(digest), check=record_ok)
+    c = root_file(live, Path(copy))
+    if c == OURS:
+        try:
+            have = file_sha256(live.at(Path(copy)))
+        except OSError as e:
+            raise ReadFailed(f"cannot read {copy}: {e.strerror or e}") from None
+        if d != OURS or named.get(copy) != have:
+            c = NOT_OURS
+    states = {c, d}
+    if NOT_OURS in states:
+        return NOT_OURS
+    return OURS if OURS in states else ABSENT
+
+
+def remove_bwrap_copy_steps(copy: str, digest: str, *, live: "Live") -> list[Step]:
+    """``bwrap-copy/1`` (R8): ``rm -f`` the recorded copy, then its digest record (U2: the identity names both)."""
+    from levain.slot.removal import at, chain, point, remove_step
+
+    record = ("bwrap-copy/1", (copy, digest))
+    state = lambda: bwrap_copy_state(copy, digest, live)   # noqa: E731
+    rm = _abs("rm")
+    return [
+        remove_step(f"remove {copy}", record, live, state,
+                    chain(lambda: live.act((rm, "-f", at(live, Path(copy)))), point(live, "bwrap-copy/1:after-copy-rm")),
+                    tools=(rm,)),
+        remove_step(f"remove {digest}", record, live, state, lambda: live.act((rm, "-f", at(live, Path(digest)))),
+                    tools=(rm,)),
+    ]

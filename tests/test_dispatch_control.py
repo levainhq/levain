@@ -345,21 +345,34 @@ def test_a_t2_display_phone_root_is_refused(tmp_path, log, keys):
         ctl.ControlStore.init(_dir(tmp_path, "phone-root"), keys["phone"].fp, authority=log.source)
 
 
-def test_a_passkey_root_is_refused_at_init_and_at_verify(tmp_path, tmp_path_factory, log, keys):
+def test_a_passkey_root_is_refused_at_init_and_at_verify(tmp_path, tmp_path_factory, log, keys, monkeypatch):
+    from tests.test_passkey_custody_derived import pre_door
+
     pk = passkey_line()
+    fp = fingerprint_of(pk)
     with pytest.raises(ctl.ConfigRefused, match="passkey"):
-        ctl.ControlStore.init(_dir(tmp_path, "passkey-root"), fingerprint_of(pk), authority=log.source)
-    # the same public key enrolled at a presence custody pins; read under the log where it is a passkey, it refuses
+        ctl.ControlStore.init(_dir(tmp_path, "passkey-root"), fp, authority=log.source)
+    # the same public key is a passkey by its material (K1): the log refuses it at a presence custody
     fido = Log(tmp_path_factory.mktemp("fido-auth"), keys)
     fido.enrol("laptop", "laptop-presence")
-    fido.link({"op": "enrol", "fingerprint": fingerprint_of(pk), "public_key": pk, "class": "laptop-presence",
-               "custody": "fido"})
-    d = _dir(tmp_path, "fido-root")
-    ctl.ControlStore.init(d, fingerprint_of(pk), authority=fido.source)
-    store = ctl.ControlStore(d, authority=log.source, clock=Clock(NOW))
-    item = ctl.item_bytes("verifier", 1, VERIFIERS, NOW, prev="", store_id=store.store_id())
-    with pytest.raises(ctl.ConfigRefused, match="passkey"):
-        store.accept(item, "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n")
+    enrol = {"op": "enrol", "fingerprint": fp, "public_key": pk, "class": "laptop-presence", "custody": "fido"}
+    with pytest.raises(auth.AuthorityError, match="WebAuthn passkey"):
+        fido.link(enrol)
+    with pre_door():
+        # a log written before that door holds it: it still never pins, and a store pinned to it before this check
+        # (forced here) refuses at verify, under either log
+        fido.link(enrol)
+        with pytest.raises(ctl.ConfigRefused, match="custody its key material shows"):
+            ctl.ControlStore.init(_dir(tmp_path, "fido-refused"), fp, authority=fido.source)
+        d = _dir(tmp_path, "fido-root")
+        with monkeypatch.context() as m:
+            m.setattr(ctl, "custody_mismatch", lambda public_key, custody: None)
+            ctl.ControlStore.init(d, fp, authority=fido.source)
+        for source, match in ((log.source, "passkey"), (fido.source, "custody its key material shows")):
+            store = ctl.ControlStore(d, authority=source, clock=Clock(NOW))
+            item = ctl.item_bytes("verifier", 1, VERIFIERS, NOW, prev="", store_id=store.store_id())
+            with pytest.raises(ctl.ConfigRefused, match=match):
+                store.accept(item, "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n")
 
 
 def test_an_unstated_custody_root_is_refused_at_init_and_at_verify(tmp_path, tmp_path_factory):

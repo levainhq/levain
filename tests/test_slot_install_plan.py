@@ -126,7 +126,7 @@ def test_retired_id_never_reissued(host, tmp_path):
     # undo retires every account id it tombstones, keeping the old ones
     accounts = dict(plan.allocation.ids)
     undo = plan_undo(parse_install_argv(["undo"]), _set_up(host, retired=retired), accounts=accounts,
-                     shared_groups=SHARED_GROUPS)
+                     shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(SHARED_GROUPS)})
     assert undo.retired_after == retired | set(accounts.values())
     write = [s.write for s in undo.steps if s.write and s.write[0].name == "retired-session-ids"]
     assert write and write[0][1] == retired_ids_text(undo.retired_after) and write[0][2] == 0o644
@@ -180,13 +180,20 @@ def test_operator_record_written_last_and_removed_last(host):
         assert _refusal(parse_operator_record, bad) == "operator-record-malformed"
     uid = RANGES[host].slots[0]
     undo = plan_undo(parse_install_argv(["undo"]), _set_up(host), accounts={"_levain_s0": uid},
-                     shared_groups=SHARED_GROUPS)
-    assert undo.steps[-1].argv[1:] == ("-f", str(operator_record_path(host)))
-    assert undo.steps[0].argv[-1] == str(RUNTIME_SUDOERS)
-    assert undo.steps[-2].argv[1:] == ("-f", str(INTENT_PATH[host]))
-    assert undo.steps[-3].argv[-1] == str(INSTALL_SUDOERS)
-    assert [s.argv[-1] for s in undo.steps if s.argv and "sudoers" in s.argv[-1]] == [str(RUNTIME_SUDOERS),
-                                                                                       str(INSTALL_SUDOERS)]
+                     shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(SHARED_GROUPS)})
+    # FIX1 M1: the check after the install rule's removal is the LAST step, after the operator record
+    assert undo.steps[-1].why.startswith("check the sudoers config with visudo -c (after ")
+    assert undo.steps[-2].argv[1:] == ("-f", str(operator_record_path(host)))
+    # FIX1 M1/M2: the sudoers preflight, then undo's own journal, before the runtime rule
+    assert undo.steps[0].why.startswith("check the sudoers config with visudo -c before undo removes anything")
+    assert undo.steps[1].why.startswith("journal what this undo ")
+    assert undo.steps[2].why.startswith(f"remove {RUNTIME_SUDOERS} ")
+    assert undo.steps[-3].argv[1:] == ("-f", str(INTENT_PATH[host]))
+    # the install rule's removal (R1b: sudoers/1 through its per-identity step), checked while it still stands
+    assert undo.steps[-4].why.startswith(f"remove {INSTALL_SUDOERS} ")
+    assert undo.steps[-5].why == f"check the sudoers config with visudo -c before {INSTALL_SUDOERS} goes"
+    assert [s.why.split()[1] for s in undo.steps if s.why.startswith("remove /") and "sudoers" in s.why] == [
+        str(RUNTIME_SUDOERS), str(INSTALL_SUDOERS)]
     retire = next(i for i, s in enumerate(undo.steps) if s.write)
     first_tomb = next(i for i, s in enumerate(undo.steps) if "tombstone" in s.why)
     first_kill = next(i for i, s in enumerate(undo.steps) if s.call and "stop every process" in s.why)
@@ -402,15 +409,19 @@ def test_sudoers_text(host):
     assert f"\n{OP} ALL=(root) NOPASSWD: {h}/runtime-helper\n" in rt
     disp = next(line for line in rt.splitlines() if line.startswith("_levain_dispatch "))
     assert "NOPASSWD:" in disp
-    for verb in ("adopt-open", "discard", "restore", "confirm-identity"):
-        assert verb not in disp
-    for verb in ("prepare", "render", "start", "resume", "teardown", "status"):
-        assert f"{h}/runtime-helper {verb}" in disp
+    # adopt-s2fix (L3 s2 r1 codex HIGH): both sets derived from the grammar, never a hand list, so a verb the
+    # grammar admits for _levain_dispatch is a verb sudo admits (built red: adopt-verify was missing here)
+    from levain.slot import runtime_grammar as RG
+    from levain.slot import runtime_helper as RH
+    assert set(RH.VERB_HANDLERS) <= set(RG.VERBS) and RG.DISPATCH_FORBIDDEN <= set(RG.VERBS)
+    admitted = [v for v in RG.VERBS if v not in RG.DISPATCH_FORBIDDEN]
+    specs = disp.split("NOPASSWD: ", 1)[1].split(", ")
+    for verb in RG.DISPATCH_FORBIDDEN:
+        assert not any(s.split()[1] == verb for s in specs), verb
     # sudo's `<verb> *` needs at least one argument (measured in the 1c VM: bare `status` was denied by
     # `status *`), so bare `status` has a spec of its own
-    specs = disp.split("NOPASSWD: ", 1)[1].split(", ")
-    assert specs == [f"{h}/runtime-helper {v} *" for v in ("prepare", "render", "start", "resume", "teardown",
-                                                           "status")] + [f"{h}/runtime-helper status"]
+    assert sorted(specs[:-1]) == sorted(f"{h}/runtime-helper {v} *" for v in admitted)
+    assert specs[-1] == f"{h}/runtime-helper status"
     assert disp.rstrip().endswith(f", {h}/runtime-helper status")
     it = install_sudoers_text(host, OP)
     assert "NOPASSWD" not in it
@@ -448,7 +459,7 @@ def test_setup_refuses_existing_singleton_or_shared_group():
 
 def test_undo_refuses_a_foreign_account():
     assert _refusal(plan_undo, parse_install_argv(["undo"]), _set_up("linux"), accounts={"bob": 501},
-                    shared_groups=()) == "not-levain-name"
+                    shared_groups={}) == "not-levain-name"
 
 
 def test_plans_are_steps_only():

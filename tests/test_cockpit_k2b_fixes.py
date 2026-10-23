@@ -620,7 +620,7 @@ def test_a_dry_run_never_resumes_a_pending_a_dead_request_left(tmp_path):
         assert _rows(b, "SELECT state FROM pendings WHERE pending_id = ?", dead) == [("WAITING",)]
 
 
-@pytest.mark.parametrize("field,value", [("intent", "x"), ("intent", None), ("tier", "C1"),
+@pytest.mark.parametrize("field,value", [("intent", "x"), ("intent", None), ("tier", "T1"),
                                          ("expires_at", "9999"), ("issued_at", None),
                                          ("issued_at", "2026-02-31T20:00:00.000000Z"),
                                          ("expires_at", "2026-10-10T19:00:00.000000Z"),

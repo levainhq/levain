@@ -51,14 +51,19 @@ def test_the_precheck_does_not_wait():
 
 
 def test_undos_stop_check_is_the_waiting_one():
-    steps = [s for s in U.uninstall_steps("darwin") if s.why.startswith("check ") and s.why.endswith(" is stopped")]
-    assert steps, "undo has a stop check per launchd job"
+    """Undo stops each unit through unit/1's per-identity stop (R1b): a loaded job is booted out, then the check
+    that it is gone WAITS (LAUNCHD_UNLOAD_WAIT_S), never the no-wait precheck."""
+    from levain.slot.removal import Live
+
+    def run(argv, **kw):          # launchctl print: loaded (0); bootout: accepted (0)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
     seen: list[float] = []
     real = U._launchd_job_absent
     try:
         U._launchd_job_absent = lambda label, run=None, **kw: (seen.append(kw.get("wait_s", 0.0)), (True, ""))[1]
-        for s in steps:
-            s.call()
+        for s in U.services_for("darwin"):
+            assert U.stop_unit_act("darwin", s.name, Live(run=run), disable=True) == (True, "")
     finally:
         U._launchd_job_absent = real
     assert seen and all(w == U.LAUNCHD_UNLOAD_WAIT_S for w in seen)

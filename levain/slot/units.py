@@ -18,10 +18,11 @@ program, so no unit here carries a timer or a start interval (§23).
 """
 from __future__ import annotations
 
+import os
 import plistlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Literal
+from typing import TYPE_CHECKING, Callable, Iterable, Literal
 
 from levain.firing.hands import HostOS, Step, _abs
 from levain.launch import child_env
@@ -29,8 +30,14 @@ from levain.slot import Refused
 from levain.slot.layout import ROOT_GROUP, service_entry_path
 from levain.slot.root_tree import PY_FLAGS, ROOT_PYTHON
 
+if TYPE_CHECKING:
+    from levain.slot.removal import Live
+
 LAUNCHD_DIR = Path("/Library/LaunchDaemons")
 SYSTEMD_DIR = Path("/etc/systemd/system")
+#: The first line of every systemd unit :func:`systemd_unit_text` writes (every version since S1: ``git log -S`` on it
+#: in this file). :func:`unit_state` reads a unit file as Levain's only when its first line is this.
+SYSTEMD_HEADER = "# Written by the Levain install helper; removed by its undo verb."
 
 
 @dataclass(frozen=True)
@@ -144,7 +151,7 @@ def systemd_unit_text(svc: Service) -> str:
         unit += [f"After={deps}", f"Wants={deps}"]
     unit.append("StartLimitIntervalSec=0")   # "always" means always: no start-rate limit gives up on it
     lines = [
-        "# Written by the Levain install helper; removed by its undo verb.",
+        SYSTEMD_HEADER,
         "[Unit]", *unit, "",
         "[Service]", "Type=simple", f"User={svc.user}", f"Group={_group('linux', svc)}",
         f"ExecStart={' '.join(argv('linux', svc))}",
@@ -293,32 +300,127 @@ def install_steps(host: HostOS, services: Iterable[Service], *, run: Callable[..
     return steps
 
 
-def uninstall_steps(host: HostOS) -> list[Step]:
-    """Stop every service in reverse start order, then remove the unit files. Every service, installed
-    or not: each step is a no-op for one that is absent, so a failed undo re-runs."""
-    steps: list[Step] = []
-    if host == "darwin":
-        for s in reversed(services_for(host)):
-            label = launchd_label(s)
-            steps += [
-                Step(f"stop {label}", ("/bin/launchctl", "bootout", f"system/{label}"), allow_fail=True),
-                Step(f"check {label} is stopped", call=lambda lb=label: _launchd_job_absent(lb, wait_s=LAUNCHD_UNLOAD_WAIT_S)),
-            ]
-        steps += [Step(f"remove {launchd_path(s)}", ("/bin/rm", "-f", str(launchd_path(s)))) for s in services_for(host)]
-        return steps
-    systemctl, test, rm = _abs("systemctl"), _abs("test"), _abs("rm")
-    for name in reversed(start_order(host)):
-        steps.append(Step(f"stop and disable {name}", (systemctl, "disable", "--now", name),
-                          skip_if=(test, "!", "-e", str(systemd_path(name)))))
-    steps += [Step(f"remove {systemd_path(n)}", (rm, "-f", str(systemd_path(n)))) for n in start_order(host)]
-    steps.append(Step("tell systemd", (systemctl, "daemon-reload")))
-    # A unit whose last run failed keeps a `failed` row after its file is gone (the 1d VM run); clearing it
-    # is best-effort: a unit systemd holds no record of answers non-zero, and nothing later depends on it.
-    steps += [Step(f"clear systemd's failed record of {n}", (systemctl, "reset-failed", n), allow_fail=True)
-              for n in start_order(host)]
-    return steps
-
-
 __all__ = ["SERVICES", "Service", "argv", "built_services", "by_name", "install_steps", "launchd_label",
            "launchd_plist_text", "program_relpath", "program_source", "services_for", "start_order",
-           "systemd_name", "systemd_unit_text", "uninstall_steps"]
+           "systemd_name", "systemd_unit_text"]
+
+
+# --- row 33 R1b: a unit removed by its RECORDED name (§1.1 table row 1) -------------------------------------------
+
+
+def _launchd_state(label: str, live: "Live") -> str:
+    """``loaded`` / ``absent`` from ``launchctl print``: 113 (no such service) is the ONE absent answer; any other
+    non-zero exit is a failed read (DESIGN X4-M1), never absent."""
+    from levain.slot.removal import ReadFailed
+
+    rc, out, err = live.out(("/bin/launchctl", "print", f"system/{label}"))
+    if rc == 0:
+        return "loaded"
+    if rc == _LAUNCHCTL_NO_SUCH_SERVICE:
+        return "absent"
+    raise ReadFailed(f"launchctl print system/{label} exited {rc}: {(err or out).strip()[:200]}")
+
+
+def _systemd_state(prop: str, name: str, live: "Live") -> str:
+    """``systemctl show -p <prop> --value``; a failing ``systemctl show`` raises (never read as stopped or absent)."""
+    return live.read((_abs("systemctl"), "show", "-p", prop, "--value", name)).strip()
+
+
+def _plist_is(label: str) -> Callable[[bytes], bool]:
+    def check(data: bytes) -> bool:
+        try:
+            return plistlib.loads(data).get("Label") == label
+        except Exception:   # noqa: BLE001 — a file that is not our plist is not ours
+            return False
+    return check
+
+
+def _unit_is_ours(data: bytes) -> bool:
+    return data.split(b"\n", 1)[0] == SYSTEMD_HEADER.encode()
+
+
+def unit_state(host: HostOS, n: str, live: "Live") -> str:
+    """OURS: the unit file is a regular root file Levain wrote (macOS: its ``Label`` is ``com.levain.<n>``; Linux: its
+    first line is :data:`SYSTEMD_HEADER`), OR the file is gone and
+    the job is still loaded (the bound reserves the name). ABSENT: no file and not loaded. NOT_OURS: a file at the
+    name that is not ours."""
+    from levain.slot.removal import ABSENT, OURS, root_file
+
+    if host == "darwin":
+        label = f"com.levain.{n}"
+        state = root_file(live, LAUNCHD_DIR / f"{label}.plist", check=_plist_is(label))
+        if state != ABSENT:
+            return state
+        return OURS if _launchd_state(label, live) == "loaded" else ABSENT
+    unit = f"levain-{n}.service"
+    state = root_file(live, SYSTEMD_DIR / unit, check=_unit_is_ours)
+    if state != ABSENT:
+        return state
+    if _systemd_state("LoadState", unit, live) != "not-found":
+        return OURS
+    return ABSENT if _systemd_state("ActiveState", unit, live) in ("inactive", "failed") else OURS
+
+
+def stop_unit_act(host: HostOS, n: str, live: "Live", *, disable: bool) -> tuple[bool, str]:
+    """The ONE stop body (repair's R5 stops and a removed unit's revoke): the verdict is the END STATE, never the
+    stop's exit status. macOS boots out a loaded job and waits for launchd to unload it; Linux stops it (``disable
+    --now`` for a unit leaving the install) and reads ``ActiveState`` again. A leaving unit whose FILE is gone while
+    systemd still runs it gets ``systemctl stop``, then a best-effort ``disable``: ``disable`` needs the file and may
+    fail before its ``--now`` stops anything (unmeasured: the owed Linux round, U12), and that state would read OURS on
+    every re-run."""
+    if host == "darwin":
+        label = f"com.levain.{n}"
+        if _launchd_state(label, live) == "absent":
+            return True, ""
+        live.out(("/bin/launchctl", "bootout", f"system/{label}"))      # its status is not the verdict: checked next
+        return _launchd_job_absent(label, live.run, wait_s=LAUNCHD_UNLOAD_WAIT_S)
+    unit, systemctl = f"levain-{n}.service", _abs("systemctl")
+    if not disable and _systemd_state("ActiveState", unit, live) in ("inactive", "failed"):
+        return True, ""
+    if disable and os.path.lexists(live.at(SYSTEMD_DIR / unit)):
+        live.out((systemctl, "disable", "--now", unit))                 # its status is not the verdict: checked next
+        how = "disable --now"
+    else:
+        live.out((systemctl, "stop", unit))
+        if disable:
+            live.out((systemctl, "disable", unit))                      # best effort: with no file it may fail
+        how = "stop"
+    state = _systemd_state("ActiveState", unit, live)
+    if state not in ("inactive", "failed"):
+        return False, f"{unit} is {state or 'in an unknown state'} after systemctl {how}"
+    return True, ""
+
+
+def stop_unit_by_name(host: HostOS, n: str, *, live: "Live") -> list[Step]:
+    """``unit/1`` revoke (R5): the recorded unit stopped by NAME, never through :data:`SERVICES`."""
+    from levain.slot.removal import chain, point, remove_step
+
+    why = f"stop com.levain.{n}" if host == "darwin" else f"stop and disable levain-{n}.service"
+    tools = ("/bin/launchctl",) if host == "darwin" else (_abs("systemctl"),)
+    return [remove_step(why, ("unit/1", n), live, lambda: unit_state(host, n, live),
+                        chain(lambda: stop_unit_act(host, n, live, disable=True), point(live, "unit/1:after-stop")),
+                        tools=tools)]
+
+
+def remove_unit_file_by_name(host: HostOS, n: str, *, live: "Live") -> list[Step]:
+    """``unit/1`` destroy (R12): ``rm -f`` the recorded unit file; Linux then ``daemon-reload`` and ``reset-failed``
+    (a file gone while systemd still holds the unit loaded reads OURS, so a re-run reloads)."""
+    from levain.slot.removal import at, chain, point, remove_step
+
+    if host == "darwin":
+        path = LAUNCHD_DIR / f"com.levain.{n}.plist"
+        return [remove_step(f"remove {path}", ("unit/1", n), live, lambda: unit_state(host, n, live),
+                            chain(lambda: live.act(("/bin/rm", "-f", at(live, path))), point(live, "unit/1:after-rm")),
+                            tools=("/bin/launchctl", "/bin/rm"))]
+    unit, systemctl, rm = f"levain-{n}.service", _abs("systemctl"), _abs("rm")
+    path = SYSTEMD_DIR / unit
+
+    def reset() -> tuple[bool, str]:
+        live.out((systemctl, "reset-failed", unit))     # best effort: a unit systemd holds no record of answers non-zero
+        return True, ""
+
+    return [remove_step(f"remove {path} (then daemon-reload, reset-failed)", ("unit/1", n), live,
+                        lambda: unit_state(host, n, live),
+                        chain(lambda: live.act((rm, "-f", at(live, path))), point(live, "unit/1:after-rm"),
+                              lambda: live.act((systemctl, "daemon-reload")), reset),
+                        tools=(systemctl, rm))]

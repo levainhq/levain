@@ -26,6 +26,7 @@ import shlex
 import stat
 import threading
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -128,6 +129,25 @@ _NO_HOOKS = ["-c", "core.hooksPath=/dev/null"]
 _REPLAY_CONFIG = ["-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false"]
 
 
+def _interactive() -> bool:
+    """A person is at this command: stdin and stdout are terminals (a hook's or a background sync is not, so it is
+    never asked for a touch it cannot see)."""
+    try:
+        return bool(sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+# `levain team record` (every entry but the edit hook's ack) needs a signature with user presence where the team refuses
+# file keys (Phill 10-21 "12a"); the rule and its test seam are tenure's (``presence_required``), judged on read.
+PRESENCE_REFUSAL = (
+    "refused: a team entry is signed with a key that proves a person was present (Touch ID or a security key), and "
+    "{why}. Fix: make a FIDO key (`ssh-keygen -t ecdsa-sk` or `-t ed25519-sk`; Touch ID through an sk provider "
+    "works too), add it with `levain team key add <your handle> <its .pub>`, and sign with it "
+    "(`levain team join --signing-key <its .pub>`); or the team's owner allows file keys for the whole team with "
+    "`levain team file-keys allow` (the line `allow_file_keys = true` in team.toml). Nothing was written.")
+
+
 def ledger_env(**extra: str) -> dict[str, str]:
     """The environment for levain's local git plumbing on the ledger (signing and verifying included): the allowlist
     plus git's own settings (levain.launch: never a copy of os.environ), the identity and repository-location
@@ -140,8 +160,7 @@ def ledger_env(**extra: str) -> dict[str, str]:
     return env
 
 
-def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
-        input_text: str | None = None) -> subprocess.CompletedProcess:
+def _git_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
     # The allowlist plus what a fetch or push needs: proxies and CA bundles, git's own settings,
     # and the tokens gh's credential helper reads (levain.launch: never a copy of os.environ).
     env = child_env(*NETWORK, "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
@@ -152,6 +171,38 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
     env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C", GIT_EDITOR="true", GIT_NO_REPLACE_OBJECTS="1",
                GIT_GRAFT_FILE="/dev/null")
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never prompt on /dev/tty from a hook
+    env.update(extra_env or {})     # a signing call's environment (the FIDO provider, no passphrase prompt)
+    return env
+
+
+def _blobs(cwd: Path, shas: list[str], timeout: float = 120) -> dict[str, bytes]:
+    """The exact bytes of each blob, through one ``cat-file --batch`` (text mode would rewrite line endings)."""
+    if not shas:
+        return {}
+    try:
+        cp = subprocess.run(["git", *_NO_HOOKS, "cat-file", "--batch"], cwd=str(cwd), env=_git_env(),
+                            capture_output=True, input="\n".join(shas).encode() + b"\n", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise TeamError(f"git cat-file timed out after {timeout:.0f}s") from None
+    except FileNotFoundError:
+        raise TeamError("git is not on PATH") from None
+    if cp.returncode != 0:
+        raise TeamError(f"git cat-file failed: {cp.stderr.decode('utf-8', 'replace').strip()[-200:]}")
+    data, out, pos = cp.stdout, {}, 0
+    for sha in shas:
+        nl = data.index(b"\n", pos)
+        head = data[pos:nl].decode("utf-8", "replace").split()
+        pos = nl + 1
+        if len(head) != 3 or head[0] != sha or head[1] != "blob":
+            raise TeamError(f"git cat-file returned {' '.join(head)!r} for {sha[:10]}")
+        out[sha] = data[pos:pos + int(head[2])]
+        pos += int(head[2]) + 1
+    return out
+
+
+def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
+        input_text: str | None = None, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    env = _git_env(extra_env)
     try:
         cp = subprocess.run(["git", *_NO_HOOKS, *args], cwd=str(cwd), env=env, capture_output=True, text=True,
                             timeout=timeout, input=input_text,
@@ -214,6 +265,7 @@ class GitLedger:
     def __init__(self, repo: Repo):
         self.warnings = WARNINGS
         self._dcache: tuple[str, object] | None = None
+        self._acache: dict[str, tuple[list[tuple[str, str]], dict[str, str]]] | None = None   # `_appended`, per sync
         self.repo = repo
         self.base = repo.base
         self.wt = repo.worktree
@@ -491,9 +543,11 @@ class GitLedger:
             self.signing_pubkey()   # raises the how-to
         return S.sign_config(key)
 
-    def _sign_env(self) -> dict[str, str]:
+    def _sign_env(self, key: str | None = None) -> dict[str, str]:
+        """The signing environment for the key actually signing: ``key`` when given (init's genesis, before the key is
+        saved), else this clone's own. Pass it to every signing git call: a Touch ID key signs only with its provider."""
         from . import signing as S
-        return S.signing_env()
+        return S.signing_env(key or self.signing_key)
 
     def _remember_own_key(self) -> None:
         fps = list(self.state().get("own_keys") or [])
@@ -529,7 +583,7 @@ class GitLedger:
         tip = rev or self.head()
         clone = self.clone()
         key = json.dumps(["derive-v1", T.RULES, S.CACHE_SCHEMA, tip, clone.pinned_root, clone.anchor,
-                          sorted(clone.accepted.items()), sorted(clone.distrust)])
+                          sorted(clone.accepted.items()), sorted(clone.distrust), T._REQUIRE_PRESENCE])
         if self._dcache and self._dcache[0] == key:
             return self._dcache[1]
         try:
@@ -575,7 +629,8 @@ class GitLedger:
             problems.append(f"judged: partial: {d.frozen_why}; verdicts are frozen at {str(d.frozen_at)[:10]}"
                             + (f"; {d.waiting} line(s) after it are waiting" if d.waiting else ""))
         files = [(rel, lines) for rel, lines in sorted(d.files.items())]
-        return I.build(files, d.team.owner, problems, unenforced=d.unenforced, authority=d.owner_authority)
+        return I.build(files, d.team.owner, problems, unenforced=d.unenforced, authority=d.owner_authority,
+                       no_presence=frozenset(h for h, ok in d.line_presence.items() if not ok))
 
     # ---- the caller-facing surface (S0-b): ledger logic that used to live in callers, moved here whole ------------
 
@@ -781,7 +836,7 @@ class GitLedger:
         tree = git(["mktree"], top, input_text="\n".join(rows) + "\n").stdout.strip()
         cp = subprocess.run(["git", *_NO_HOOKS, *self._sign_cfg(key), "commit-tree", "-S", tree, "-m", message],
                             cwd=str(top), capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
-                            env=ledger_env(**self._sign_env()))
+                            env=ledger_env(**self._sign_env(key)))
         if cp.returncode != 0:
             raise TeamError(f"could not sign the genesis commit: {(cp.stderr or cp.stdout).strip()[-200:]}")
         return cp.stdout.strip()
@@ -1237,8 +1292,11 @@ class GitLedger:
         """Bring the worktree back to a committed state after an interrupted operation. Caller holds the lock.
 
         A rebase left in progress is aborted. This device's own entry files are committed (the entry was
-        written; only its commit was lost). An uncommitted team.toml, tenure.toml or PROJECT.md is discarded: those are
-        regenerated by re-running the command that failed. Anything else is refused for a person to inspect.
+        written; only its commit was lost). On a FIDO clone, a file holding a line the team needs a touch for is
+        committed only where a person is at the command, after each such entry is named; elsewhere it is left
+        uncommitted and the command stops, naming them (it is never swept into a later commit or discarded by a later
+        checkout). An uncommitted team.toml, tenure.toml or PROJECT.md is discarded: those are regenerated by re-running
+        the command that failed. Anything else is refused for a person to inspect.
         """
         for marker, op in (("rebase-merge", "rebase"), ("rebase-apply", "rebase"), ("CHERRY_PICK_HEAD", "cherry-pick")):
             p = git(["rev-parse", "--git-path", marker], self.wt).stdout.strip()
@@ -1262,9 +1320,53 @@ class GitLedger:
             raise TeamError("the ledger worktree has changes no levain command made: "
                             + ", ".join(foreign[:5]) + f" (inspect {self.wt})")
         mine = [p for p in dirty if own.match(p)]
-        if mine:
-            git(["add", "--", *mine], self.wt)
-            self._commit("levain team: recover an interrupted write")
+        if not mine:
+            return
+        # the commit is the entry's presence (H-6): an entry the team needs a touch for is named first, as `record`
+        # names it, and signed only where a person can see that line; never under an unnamed recovery touch
+        touch = self._dirty_needing_touch(mine)
+        if touch and not _interactive():
+            rest = [p for p in mine if p not in touch]
+            if rest:
+                git(["add", "--", *rest], self.wt)
+                self._commit("levain team: recover an interrupted write")
+            names = [f"{t} {i}" + (f": {s}" if s else "") for p in touch for t, i, s in touch[p]]
+            raise TeamError(f"an interrupted write left {len(names)} entr{'y' if len(names) == 1 else 'ies'} "
+                            "uncommitted that the team needs a touch for (" + "; ".join(names[:5])
+                            + (" ..." if len(names) > 5 else "") + "), and this command is not interactive, so it "
+                            "asked for none and committed nothing for them; they stay in the worktree "
+                            f"({self.wt}). Run `levain team sync` in a terminal: it names each entry and asks one "
+                            "touch for them")
+        for p in touch:
+            for t, i, s in touch[p]:
+                print(f"levain team: touch your security key or confirm with Touch ID to sign {t} {i}: {s}",
+                      file=sys.stderr, flush=True)
+        git(["add", "--", *mine], self.wt)
+        self._commit("levain team: recover an interrupted write")
+
+    def _dirty_needing_touch(self, paths: list[str]) -> dict[str, list[tuple[str, str, str]]]:
+        """For a clone that signs with a FIDO key: {path: [(type, id, summary)]} of each uncommitted line in ``paths``
+        whose type the team needs a touch for, by the counted policy at HEAD (empty for any other key: its commit is
+        judged on read as before). A whole file is listed: its other lines chain over these, so they wait with them."""
+        if self._presence_key_problem() is not None:
+            return {}
+        from . import tenure as T
+        self._dcache = None
+        allow = self.derivation().team.allow_file_keys
+        out: dict[str, list[tuple[str, str, str]]] = {}
+        for p in paths:
+            cp = git(["show", f"HEAD:{p}"], self.wt, check=False)
+            committed = set(cp.stdout.splitlines()) if cp.returncode == 0 else set()
+            try:
+                now = (self.wt / p).read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for ln in now:
+                o = T._parsed(ln) if ln.strip() and ln not in committed else {}
+                if o.get("type") and T.presence_required(allow, o.get("type")):
+                    summary = (str(o.get("words") or o.get("summary") or "").splitlines() or [""])[0][:80]
+                    out.setdefault(p, []).append((str(o.get("type")), str(o.get("id")), summary))
+        return out
 
     def _commit(self, message: str) -> None:
         """Every commit levain writes is SIGNED here (signing doc §5): no unsigned ledger commit is ever written.
@@ -1338,12 +1440,30 @@ class GitLedger:
 
         A refusal (EntryError) writes nothing. A push failure leaves the entry committed locally and
         raises TeamError saying so; the next write or `levain team sync` pushes it.
+
+        Presence (Phill 10-21 "12a"): where the team refuses file keys, an entry counts only if the commit adding it is
+        signed with user presence (a FIDO key's touch); the derivation decides that on every read
+        (``tenure.presence_required``), so no caller can waive it. Here it is the tidy path: a key that can never
+        touch is refused before anything is written, and a commit the derivation does not count is undone.
         """
         # the whole append is one op, waited for up to its own lock_timeout (the hook's ack gives up in seconds and says
         # so): a pin moved between its validation and its commit filed it under another ledger (code L3 r7 codex 1)
         deadline = time.monotonic() + lock_timeout     # one budget for both waits (code L3 r8 complement 1)
         with self.op(timeout=lock_timeout):
             return self._append_in_op(entry, push=push, deadline=deadline)
+
+    def _presence_key_problem(self) -> str | None:
+        """Why this clone's signing key can never sign with user presence (None for a FIDO key)."""
+        from . import signing as S
+        line = self.signing_pubkey()
+        kind = line.split()[0] if line.split() else "?"
+        if kind.startswith("sk-"):
+            return None
+        try:
+            fp = S.fingerprint(line)
+        except S.SigningError:
+            fp = "(unreadable)"
+        return f"this clone signs with the {kind} key {fp}, which any program running as you can use without you"
 
     def _append_in_op(self, entry: dict, *, push: bool, deadline: float) -> dict:
         self.require_joined()
@@ -1355,6 +1475,18 @@ class GitLedger:
         with self.lock(timeout=left):
             self._recover_dirty()
             self._dcache = None
+            from . import tenure as T
+            need_presence = T.presence_required(self.derivation().team.allow_file_keys, entry.get("type"))
+            fido = self._presence_key_problem() is None
+            if need_presence and not fido:
+                raise TeamError(PRESENCE_REFUSAL.format(why=self._presence_key_problem()))
+            if fido and entry.get("type") == "ack":
+                # the edit hook's ack: a FIDO key would wait (up to the commit timeout) for a touch nobody was asked for
+                raise TeamError("not recorded: this clone signs with a security key or Touch ID, which asks for a touch "
+                                "on every signature, and an automatic acknowledgement never asks for one")
+            if fido:
+                print(f"levain team: touch your security key or confirm with Touch ID to sign {entry.get('type')} "
+                      "into the ledger", file=sys.stderr, flush=True)
             ledger = self.ledger()
             E.validate(entry, known=ledger.by_id)
             for s in entry.get("supersedes", []):
@@ -1377,10 +1509,18 @@ class GitLedger:
                 fh.write(line.encode("utf-8"))
                 fh.flush()
                 os.fsync(fh.fileno())
+            before = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
             git(["add", "--", str(path.relative_to(self.wt))], self.wt)
             self._commit(f"levain team: {sealed['type']} {sealed['id']}")
             self._dcache = None
             d = self.derivation()
+            if sealed["hash"] in d.presence_refused:
+                # the derivation's own verdict, the one every reader reaches: not in force, so not kept (nothing pushed)
+                git(["reset", "-q", "--hard", before], self.wt, check=False)
+                self._dcache = None
+                raise TeamError(PRESENCE_REFUSAL.format(
+                    why="the commit was undone: the signature on it carries no user-presence flag (a key made with "
+                        "no-touch-required, or the touch was skipped)"))
             if d.judged != "full":
                 # frozen: an append still lands (it is WAITING, not enforced, until the owner resolves the freeze); the
                 # read-back is of the committed line itself
@@ -1521,7 +1661,12 @@ class GitLedger:
         self._replay_held(timeout, lock_timeout)
 
     def _pick_counts(self, d, c: str) -> bool:
-        """Re-signed by this clone's key, would commit ``c`` count in ``d``? The key must be in force for every folder
+        """Re-signed by this clone's key, would commit ``c`` count in ``d``? (``_pick_why`` says why not.)"""
+        return self._pick_why(d, c) is None
+
+    def _pick_why(self, d, c: str) -> str | None:
+        """Why commit ``c``, re-signed by this clone's key, would NOT count in ``d`` (``"frozen"``, ``"key"`` or
+        ``"presence"``), or None when it would. The key must be in force for every folder
         it writes, by the derivation's own rule (the owner for ``pack-*`` lines and PROJECT.md, else the member whose
         folder it is), not merely for some member (docs L3 r1 anansi: a held pack line replayed after this clone
         stopped being owner published without counting). A frozen ``d`` answers with the anchor's tenure, so it is
@@ -1539,9 +1684,9 @@ class GitLedger:
                                                                     distrust=c0.distrust),
                                  S.SigCache(self.base / "sigcache.json"))
             except T.Unjudgeable:
-                return False
+                return "frozen"
             if fresh.judged != "full":
-                return False
+                return "frozen"
             views.append(fresh)
         fp = self.own_fingerprint()
         files = git(["diff-tree", "--no-commit-id", "--name-only", "-r", c], self.wt).stdout.split()
@@ -1556,15 +1701,244 @@ class GitLedger:
                 elif f == CANON_FILE:
                     holders.add(v.team.owner)
             if not all(h is not None and fp in T.key_fps(v.tenure, h) for h in holders):
+                return "frozen" if d.judged != "full" else "key"
+        # re-signed with a key that can never touch, a line the policy at the new parent refuses without presence would
+        # publish without counting (codex HIGH 3): the same rule the derivation applies, asked before the re-sign
+        if self._presence_key_problem() is not None:
+            types = {T._parsed(text).get("type") for _rel, text in self._added_lines(c)}
+            if any(T.presence_required(v.team.allow_file_keys, t) for v in views for t in types):
+                return "presence"
+        return None
+
+    def _added_lines(self, c: str) -> list[tuple[str, str]]:
+        """(path, text) of every ledger line commit ``c`` appends, in file order (see ``_appended``)."""
+        return [(p, t) for p, t in self._appended(c)[0] if p.startswith("ledger/")]
+
+    def _appended(self, c: str) -> tuple[list[tuple[str, str]], dict[str, str]]:
+        """What commit ``c`` appends to each path it changes, read from the parent's and the child's blobs, never from
+        diff text (file content ``++ b/<path>`` renders as a ``+++ b/`` header, and a parser of the text then files the
+        lines after it under a path of the author's choosing: code L3 r5). Returns ([(path, line)], {path: why}): a path
+        is in the first only when it stays a regular file whose new bytes start with every byte of its old ones and add
+        a non-empty suffix of exactly as many lines as git counts added, with none removed (or, after a last line left
+        without its newline, a suffix that starts by closing it, which git counts as that one line removed and added);
+        any other path is in the second, with the reason. A commit id names fixed content, so within one sync each id
+        is read once."""
+        if self._acache is not None and c in self._acache:
+            return self._acache[c]
+        rows = git(["diff-tree", "-r", "-z", "--raw", "--no-abbrev", "--no-renames", "--no-commit-id", c],
+                   self.wt).stdout.split("\0")
+        counts: dict[str, tuple[str, str]] = {}
+        for row in git(["diff-tree", "-r", "-z", "--numstat", "--no-renames", "--no-commit-id", c],
+                       self.wt).stdout.split("\0"):
+            parts = row.split("\t", 2)
+            if len(parts) == 3:
+                counts[parts[2]] = (parts[0], parts[1])
+        def absent(oid: str) -> bool:     # the all-zero id at whatever width the repository hashes (SHA-1 or SHA-256)
+            return not oid.strip("0")
+        lines: list[tuple[str, str]] = []
+        bad: dict[str, str] = {}
+        changes = []
+        for i in range(0, len(rows) - 1, 2):
+            meta, path = rows[i][1:].split(" "), rows[i + 1]
+            if not rows[i].startswith(":"):
+                continue
+            if len(meta) != 5 or meta[1] not in ("100644", "100755") or meta[0] not in ("000000", meta[1]):
+                bad[path] = "not an append to a regular file (removed, a link, or a mode change)"
+            else:
+                changes.append((meta, path))
+        # only regular files' objects are read, so a submodule's commit id is never asked for as a blob
+        blobs = _blobs(self.wt, list(dict.fromkeys(s for meta, _p in changes for s in meta[2:4] if not absent(s))))
+        for meta, path in changes:
+            old = blobs[meta[2]] if not absent(meta[2]) else b""
+            new = blobs[meta[3]]
+            suffix = new[len(old):]
+            # a last line left without its newline (a torn write) is closed by the append's leading newline, which git
+            # counts as that line removed and added again; any other first byte would change that line
+            torn = bool(old) and not old.endswith(b"\n")
+            body = suffix[1:] if torn else suffix
+            n = body.count(b"\n") + (0 if body.endswith(b"\n") else 1)
+            if not new.startswith(old) or not body or (torn and not suffix.startswith(b"\n")):
+                bad[path] = "changes or removes bytes already in the file"
+            elif counts.get(path) != ((str(n + 1), "1") if torn else (str(n), "0")):
+                bad[path] = f"appends {n} line(s) where git counts {'/'.join(counts.get(path, ('?', '?')))}"
+            else:
+                try:
+                    texts = body.decode("utf-8").split("\n")
+                except UnicodeDecodeError:
+                    bad[path] = "appends bytes that are not UTF-8"
+                    continue
+                lines.extend((path, t) for t in (texts[:-1] if texts[-1] == "" else texts))
+        if self._acache is not None and len(c) >= 40 and not c.strip("0123456789abcdef"):     # an id, not a ref name
+            self._acache[c] = (lines, bad)
+        return lines, bad
+
+    def _ledger_wrong(self, c: str, *, entries: bool) -> dict[str, str]:
+        """{ledger path: why} for every ledger path commit ``c`` does anything to but append: the ONE test of whether
+        sync may act on ``c`` at all. Every place that moves, re-signs or replays a commit asks it first, so no reader of
+        ``_added_lines`` takes a commit it refuses as one that appends nothing (code L3 r6 codex MED: a held commit that
+        replaced a line was cherry-picked and published). With ``entries``, also every ledger path whose appended lines
+        are not all valid entries of the folder they are filed under: what a re-seal needs, since it writes each line
+        as an entry (a pick carries the bytes as they are, and levain's own recovery commits a torn line)."""
+        lines, bad = self._appended(c)
+        wrong = {p: why for p, why in bad.items() if p.startswith("ledger/")}
+        if entries:
+            added: dict[str, list[str]] = {}
+            for path, text in lines:
+                added.setdefault(path, []).append(text)
+            for p, texts in added.items():
+                if p.startswith("ledger/") and not self._entry_lines_ok(p, texts):
+                    wrong[p] = "appends a line that is not a valid entry of the folder it is filed under"
+        return wrong
+
+    def _held_why(self, why: str, d) -> str:
+        """The hold message for the reason ``_pick_why`` (or the replay's own read-back) gave."""
+        return {
+            "frozen": f"the ledger is frozen ({d.frozen_why}) and, replayed now, they would not count on the published "
+                      "history (this machine's key is not in force there, or it cannot be judged); the next sync "
+                      "retries them",
+            "key": "replayed now they would be re-signed with this machine's key, which is not in force for the folder "
+                   "they are filed under, and publish without counting. Confirm the key (`levain team key confirm`) "
+                   "from this machine, then `levain team sync`",
+            "presence": "the team refuses file keys and they are signed with no user presence, so they would publish "
+                        "without counting; the owner runs `levain team file-keys allow`, or record them again with a "
+                        "Touch ID or security key",
+            "depends": "they supersede or refer to an entry that is not in the ledger here (one kept back or refused "
+                       "above), so they wait for it",
+            "touch": "this clone signs with a Touch ID or security key and the team needs a touch for each of them, "
+                     "and this sync is not interactive, so it asked for none. Run `levain team sync` in a terminal: it "
+                     "names each entry and asks one touch for it",
+        }[why]
+
+    def _unsplittable(self, c: str) -> str:
+        """What own commit ``c``, which changes team.toml/tenure.toml, also changes OTHER than appended entry lines
+        (empty when its other half, if any, is entry lines only, which a re-seal carries whole). An appended line counts
+        only in an entry file (``ledger/<author>/<device>.jsonl``, the shape a holder is judged for) and only if it
+        parses and validates as its author's entry: anything else would be re-sealed into content no reader counts, or
+        throw after earlier lines were written. PROJECT.md is passed over: it is regenerated, never carried."""
+        from . import tenure as T
+        lines, bad = self._appended(c)
+        wrong = self._ledger_wrong(c, entries=True)
+        other = [p for p in dict.fromkeys([*bad, *(p for p, _t in lines)])
+                 if p not in (T.TEAM_FILE, T.TENURE_FILE, CANON_FILE) and (p in wrong or not p.startswith("ledger/"))]
+        return ", ".join(other[:5])
+
+    @staticmethod
+    def _entry_lines_ok(path: str, texts: list[str]) -> bool:
+        """``path`` is an entry file and every one of ``texts`` is a valid entry of the author it is filed under."""
+        parts = path.split("/")
+        if len(parts) != 3 or parts[0] != "ledger" or not parts[2].endswith(".jsonl") or parts[2] == ".jsonl":
+            return False
+        for text in texts:
+            try:
+                obj = E.parse_line(text)
+                if not isinstance(obj, dict) or E.safe_handle(str(obj.get("author") or "")) != parts[1]:
+                    return False
+                E.validate({k: v for k, v in obj.items() if k not in ("prev", "hash")}, scan=False)
+            except (ValueError, TypeError, KeyError, AttributeError):     # LineError and EntryError are ValueErrors
                 return False
         return True
 
+    def _refuse_unsplittable(self, commits: list[str]) -> None:
+        """Before any ref moves: an own commit mixing a team change with anything but appended ledger lines cannot be
+        split without losing a half, and one that changes a ledger file other than by appending to it is never
+        published (``_ledger_wrong``), so the sync stops by name (levain writes neither; it was made by hand)."""
+        from . import tenure as T
+        for c in commits:
+            touched = set(git(["diff-tree", "--no-commit-id", "--name-only", "-r", c], self.wt).stdout.split())
+            other = self._unsplittable(c) if touched & {T.TEAM_FILE, T.TENURE_FILE} else ""
+            if other:
+                raise TeamError(f"not pushed: the local commit {c[:10]} changes the team AND {other}, and sync cannot "
+                                "split it without losing one half; nothing was changed. See it with "
+                                f"`git -C {self.wt} show {c[:10]}`; make each change again with the levain CLI, then "
+                                "take that commit off the branch with git")
+            wrong = self._ledger_wrong(c, entries=False) if any(p.startswith("ledger/") for p in touched) else {}
+            if wrong:
+                p, why = next(iter(wrong.items()))
+                raise TeamError(f"not pushed: the local commit {c[:10]} changes {', '.join(list(wrong)[:5])} other "
+                                f"than by appending lines ({p}: {why}), and sync never publishes that; "
+                                f"nothing was changed. See it with `git -C {self.wt} show {c[:10]}`; make each entry "
+                                "again with the levain CLI, then take that commit off the branch with git")
+
+    def _refuse_outgoing(self, base: str | None, ref: str) -> str:
+        """The push is a point of use: every commit a push of ``ref`` would send (those after ``base``, the remote tip,
+        or all of them when the remote has no branch yet) goes through the own-commit refusal, and the id it checked
+        is returned for the push, so a ref that moves afterwards cannot send an unchecked commit. The earlier calls
+        stop refs moving; this one is the gate no push path can go around (code L3 r7 codex MED: with no remote
+        branch the rebase that runs the refusal was skipped, and a commit that replaced a ledger line published).
+        A merge in that list is refused here, on both ranges: the own-commit refusal reads a merge's paths with
+        ``diff-tree``, which lists none for a merge, so a merge whose own tree rewrote a ledger line went out unread
+        (code L3 r8 codex)."""
+        tip = git(["rev-parse", "--verify", f"{ref}^{{commit}}"], self.wt).stdout.strip()
+        rows = [r.split() for r in git(["rev-list", "--reverse", "--topo-order", "--parents", tip,
+                                        *([f"^{base}"] if base else [])], self.wt).stdout.splitlines() if r.strip()]
+        merge = next((r[0] for r in rows if len(r) > 2), None)
+        if merge:
+            raise TeamError(f"not pushed: the local commit {merge[:10]} is a merge; refusing to push a merge to the "
+                            f"team ledger (it must stay linear); nothing was changed. See it with "
+                            f"`git -C {self.wt} show {merge[:10]}`")
+        self._refuse_unsplittable([r[0] for r in rows])
+        return tip
+
+    def _strip_team(self, c: str, root: str | None, pending: list[dict]) -> bool:
+        """Queue own team/tenure commit ``c``'s change as a pending op (re-landed from the counted state, never replayed
+        as text). True when ``c`` ALSO appends ledger lines: the caller holds the whole commit under refs/levain/held/
+        and the replay re-seals those lines, so neither half is lost. A change that cannot be re-applied is kept under
+        refs/levain/unapplied/ (never pushed) and named. A restore op is not queued: it writes the counted state back
+        and decides nothing, and a re-land writes its own restore when one is needed."""
+        op = self._delta(c)
+        if op is None:
+            git(["update-ref", f"refs/levain/unapplied/{c}", c], self.wt, check=False)
+            self.warnings.append(f"a local team change {c[:10]} could not be re-applied (no levain trailer, or its "
+                                 "parent cannot be judged here); it is kept under refs/levain/unapplied/ and never "
+                                 "pushed. Make the change again with the levain CLI")
+        elif not op.get("restore"):
+            pending.append({**op, "root": root})
+        return bool(self._added_lines(c))
+
+    def _reseal(self, c: str, timeout: float, message: str | None = None) -> subprocess.CompletedProcess:
+        """Re-seal commit ``c``'s lines onto the current tip of their files and commit them with ``c``'s message (or
+        ``message``), signed by this clone's key: an entry kept back earlier in the same file, or published past since,
+        left the line's ``prev`` pointing at a line that is not the tip, so a plain cherry-pick would publish a broken
+        chain (or conflict). Only the ledger lines are written, so a commit that also changed the team re-lands that
+        half as an op, never as its text. The lines are what ``c`` appends, read from its blobs; a ledger path it does
+        anything else to, or an appended line that is not a valid entry of the folder it is filed under, fails the
+        re-seal by name before any file is written."""
+        wrong = self._ledger_wrong(c, entries=True)
+        if wrong:
+            return subprocess.CompletedProcess([], 1, "", f"{c[:10]} changes {', '.join(list(wrong)[:5])} other than "
+                                                          "by appending valid entry lines")
+        lines = self._added_lines(c)
+        self._dcache = None
+        tips = {f.rel: f.last_hash for f in self.ledger().files}
+        sealed_lines = []
+        for path, text in lines:     # every line is sealed before any file is written: a bad one throws with none
+            rel = path.split("/", 1)[1]
+            obj = {k: v for k, v in E.parse_line(text).items() if k not in ("prev", "hash")}
+            sealed = E.seal(obj, tips.get(rel, ""))
+            tips[rel] = sealed["hash"]
+            sealed_lines.append((path, sealed))
+        paths = []
+        for path, sealed in sealed_lines:
+            with os.fdopen(self._open_ledger_file(self.wt / path), "a+b") as fh:
+                fh.seek(0, os.SEEK_END)
+                if fh.tell() > 0:
+                    fh.seek(-1, os.SEEK_END)
+                    if fh.read(1) != b"\n":
+                        fh.write(b"\n")
+                fh.write((json.dumps(sealed, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+            paths.append(path)
+        git(["add", "--", *dict.fromkeys(paths)], self.wt)
+        how = ["-C", c] if message is None else ["-m", message]
+        return git([*_REPLAY_CONFIG, *self._sign_cfg(), "commit", "-q", "--no-verify", *how], self.wt,
+                   check=False, timeout=timeout, extra_env=self._sign_env())
+
     def _replay_held(self, timeout: float, lock_timeout: float) -> None:
-        """Replay entries held back by ``_rebase_moves`` (T42) once this machine's key is IN FORCE at the tip, so the
-        re-signed copies count. Each held ref is deleted only after its commit is on the branch; a crash leaves the
-        ref, and the next sync retries it (an already-applied pick comes out empty and is skipped). The root is read
-        ONCE, first under the worktree lock (which `join` holds while it moves the pin and the worktree): every held ref
-        this call lists or deletes is under that root (code L3 r5 codex 1)."""
+        """Replay entries held back by ``_rebase_moves`` (T42) or ``_hold_unpresent`` once they would count at the tip,
+        so the re-signed copies count; one that would not stays held, and the later ones still replay. Each held ref
+        is deleted only after its commit is on the branch; a crash leaves the ref, and the next sync retries it (an
+        already-applied pick comes out empty, and an already re-sealed entry is found by id, and is skipped). The root
+        is read ONCE, first under the worktree lock (which `join` holds while it moves the pin and the worktree):
+        every held ref this call lists or deletes is under that root (code L3 r5 codex 1)."""
         with self.lock(timeout=lock_timeout):
             root = self.pinned_root
             held = git(["for-each-ref", "--format=%(objectname)", self._held_ref(root)], self.wt,
@@ -1582,33 +1956,126 @@ class GitLedger:
                                      "nothing was replayed")
                 return
             order = [c for c in cp.stdout.split() if c in want]
-            for n, c in enumerate(order):
-                if not self._pick_counts(d, c):
-                    # in order: a later entry may supersede an earlier one, so nothing is replayed past the first
-                    # that would not count
-                    why = (f"the ledger is frozen ({d.frozen_why}) and, replayed now, they would not count on the "
-                           "published history (this machine's key is not in force there, or it cannot be judged); "
-                           "the next sync retries them" if d.judged != "full" else
-                           "replayed now they would be re-signed with this machine's key, which is not in force for "
-                           "the folder they are filed under, and publish without counting. Confirm the key (`levain "
-                           "team key confirm`) from this machine, then `levain team sync`")
-                    self.warnings.append(f"{len(order) - n} unpublished entr(y/ies) kept back under refs/levain/held/: "
-                                         + why)
-                    return
-                cp = git([*_REPLAY_CONFIG, *self._sign_cfg(), "cherry-pick", "--allow-empty", c], self.wt,
-                         check=False, timeout=timeout)
-                if cp.returncode != 0:
-                    if cp.returncode == 1 and not git(["diff", "--name-only", "--diff-filter=U"], self.wt,
-                                                      check=False).stdout.split() and \
+            from . import tenure as T
+            fido = self._presence_key_problem() is None
+            # in order, and past an entry that stays held (codex MED, r2): a later entry in the same file is re-sealed
+            # onto the published chain, and one that supersedes or refers to an entry not on the branch waits
+            kept: dict[str, list[str]] = {}
+
+            def refuse(c: str, ids: set[str], wrong: dict[str, str]) -> None:
+                # it stays held, named with the one remedy, and later entries still replay (no `break`)
+                p, w = next(iter(wrong.items()))
+                self.warnings.append(
+                    f"a held commit {c[:10]} ({', '.join(sorted(ids)[:5]) or 'no entry id'}) changes "
+                    f"{', '.join(list(wrong)[:5])} other than by appending valid entry lines ({p}: {w}), so sync never "
+                    f"publishes it. See it with `git -C {self.wt} show {c[:10]}`; record each entry again with the "
+                    f"levain CLI, then drop it with `git -C {self.wt} update-ref -d {self._held_ref(root, c)}`")
+
+            for c in order:
+                lines = self._added_lines(c)
+                objs = [T._parsed(text) for _p, text in lines]
+                ids = {str(o.get("id")) for o in objs if o.get("id")}
+                # asked before anything reads its lines as all it changes: a commit held by an earlier build that
+                # replaces, removes or forges a ledger line is never picked or re-sealed (code L3 r6 codex MED)
+                wrong = self._ledger_wrong(c, entries=False)
+                if wrong:
+                    refuse(c, ids, wrong)
+                    continue
+                why = self._pick_why(d, c)
+                if why is None:
+                    # judged as `record` judges a new entry, against the entries that EXIST on the branch (replayed
+                    # ones included) plus earlier lines of this commit, never against ids read from a commit kept
+                    # back: a refused one yields none (code L3 r7 codex MED)
+                    known = set(self.ledger().by_id)
+                    for o in objs:
+                        if (set(o.get("supersedes") or []) | set(o.get("refs") or [])) - known:
+                            why = "depends"
+                            break
+                        known.add(str(o.get("id")))
+                # the re-sign is the entry's presence (H-6): a person touches for THIS entry, named first as `record`
+                # names it, or it is not re-signed at all
+                named = fido and any(T.presence_required(d.team.allow_file_keys, o.get("type")) for o in objs)
+                if why is None and named and not _interactive():
+                    why = "touch"
+                if why is None:
+                    before = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
+                    touched = set(git(["diff-tree", "--no-commit-id", "--name-only", "-r", c], self.wt).stdout.split())
+                    mixed = bool(touched & {T.TEAM_FILE, T.TENURE_FILE})
+                    self._dcache = None
+                    # re-sealed when a file's current tip is not the line its first new line was sealed over (an earlier
+                    # line of it held, or published past since: complement A), and always for a commit that also
+                    # changed the team, whose team half re-lands as an op, never as its text
+                    tips = {f.rel: f.last_hash for f in self.ledger().files}
+                    sealed_over: dict[str, str] = {}
+                    for (p, _t), o in zip(lines, objs):
+                        sealed_over.setdefault(p.split("/", 1)[1], str(o.get("prev") or ""))
+                    reseal = mixed or any(prev != tips.get(rel, "") for rel, prev in sealed_over.items())
+                    if reseal:
+                        if ids and ids <= set(self.ledger().by_id):
+                            # replayed by a sync that died before deleting the ref: already on the branch
+                            git(["update-ref", "-d", self._held_ref(root, c)], self.wt, check=False)
+                            continue
+                        # what the re-seal would refuse is refused here, before a touch is asked for, so no sync asks
+                        # for a touch it cannot use (code L3 r6 complement LOW)
+                        wrong = self._ledger_wrong(c, entries=True)
+                        if wrong:
+                            refuse(c, ids, wrong)
+                            continue
+                    if named:
+                        for o in objs:
+                            summary = (str(o.get("words") or o.get("summary") or "").splitlines() or [""])[0][:80]
+                            print(f"levain team: touch your security key or confirm with Touch ID to sign "
+                                  f"{o.get('type')} {o.get('id')}: {summary}", file=sys.stderr, flush=True)
+                    if reseal:
+                        msg = None if not mixed else (
+                            f"levain team: {' '.join(sorted({str(o.get('type')) for o in objs}))} "
+                            f"{' '.join(sorted(ids))}\n\n{T.DEVICE_TRAILER}: {self.device}")
+                        cp = self._reseal(c, timeout, msg)
+                    else:
+                        cp = git([*_REPLAY_CONFIG, *self._sign_cfg(), "cherry-pick", "--allow-empty", c], self.wt,
+                                 check=False, timeout=timeout, extra_env=self._sign_env())
+                    if cp.returncode == 0:
+                        # read back as every clone will: a FIDO re-sign that came out with no presence stays held
+                        self._dcache = None
+                        refused = self.derivation().presence_refused
+                        if any(T._parsed(text).get("hash") in refused for _p, text in self._added_lines("HEAD")):
+                            git(["reset", "-q", "--hard", before], self.wt)
+                            self._dcache = None
+                            why = "presence"
+                        else:
+                            d = self.derivation()     # the next pick is judged at the tip this one made (complement B)
+                    elif reseal:
+                        git(["reset", "-q", "--hard", before], self.wt, check=False)
+                        self.warnings.append(f"a held entry {c[:10]} could not be re-sealed ({_tail(cp)}); it stays "
+                                             "under refs/levain/held/ and the next sync retries it")
+                        break
+                    elif cp.returncode == 1 and not git(["diff", "--name-only", "--diff-filter=U"], self.wt,
+                                                        check=False).stdout.split() and \
                             git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode == 0:
                         git(["cherry-pick", "--skip"], self.wt, timeout=60)     # already on the branch
+                    elif touched == {CANON_FILE} and set(git(["diff", "--name-only", "--diff-filter=U"], self.wt,
+                                                             check=False).stdout.split()) == {CANON_FILE}:
+                        # a regenerable PROJECT.md is dropped, as the divergence replay drops it, never left to block
+                        # every held entry after it
+                        git(["cherry-pick", "--abort"], self.wt, check=False)
+                        self.warnings.append("a local PROJECT.md conflicted with the remote and was dropped; re-run "
+                                             "`levain team consolidate`")
                     else:
                         git(["cherry-pick", "--abort"], self.wt, check=False)
                         self.warnings.append(f"a held entry {c[:10]} could not be replayed ({_tail(cp)}); it stays "
                                              "under refs/levain/held/ and the next sync retries it")
-                        return
+                        break
+                if why is not None:
+                    kept.setdefault(why, []).append(c)
+                    continue
                 git(["update-ref", "-d", self._held_ref(root, c)], self.wt, check=False)
             self._dcache = None
+            for why, cs in kept.items():
+                named = [i for c in cs for _p, t in self._added_lines(c) for i in [str(T._parsed(t).get("id") or "")]
+                         if i]
+                self.warnings.append(f"{len(cs)} unpublished entr(y/ies) kept back under refs/levain/held/ ("
+                                     + ", ".join(named[:5]) + (" ..." if len(named) > 5 else "") + "): "
+                                     + self._held_why(why, d))
 
     def _rebase_moves(self, rref: str, timeout: float, lock_timeout: float) -> None:
         """Put this clone's OWN unpublished commits on top of the remote, under the worktree lock.
@@ -1643,6 +2110,7 @@ class GitLedger:
                 git(["checkout", "-q", "-f", self.branch], self.wt, timeout=60)
                 return
             own, foreign = self._movable(orig, remote_tip)
+            self._refuse_unsplittable(own)
             if foreign:
                 self.warnings.append(f"{len(foreign)} unpublished ledger commit(s) here were not written by this "
                                      "clone (another key, or another clone of the same key) and were NOT moved or "
@@ -1655,31 +2123,27 @@ class GitLedger:
                 return     # own commits already on top of an unrewritten remote: nothing to replay
             pending: list[dict] = []     # THIS call's new ops only: added to, and on failure removed from, the current list
             picks: list[str] = []
+            mixed: list[str] = []
+            from . import tenure as T
             for c in own:
                 touched = set(git(["diff-tree", "--no-commit-id", "--name-only", "-r", c], self.wt).stdout.split())
-                if touched & {"team.toml", "tenure.toml"}:
-                    op = self._delta(c)
-                    if op is None:
-                        self.warnings.append(f"a local team change {c[:10]} could not be re-applied (no levain "
-                                             "trailer, or its parent cannot be judged here) and was dropped; re-run "
-                                             "it with the levain CLI")
-                    elif not op.get("restore"):
-                        pending.append({**op, "root": root})
-                    rest = touched - {"team.toml", "tenure.toml", CANON_FILE}
-                    if rest:
-                        self.warnings.append(f"local commit {c[:10]} mixes team and ledger changes; only its team "
-                                             "change is kept (re-landed)")
-                elif touched <= {CANON_FILE}:
-                    picks.append(c)    # PROJECT.md: replayed; dropped below only if it conflicts
+                if touched & {T.TEAM_FILE, T.TENURE_FILE}:
+                    if self._strip_team(c, root, pending):
+                        mixed.append(c)    # its ledger lines too: held whole below, re-sealed by the replay
                 else:
-                    picks.append(c)
+                    picks.append(c)        # an entry, or PROJECT.md (dropped below only if it conflicts)
             d_remote = self.derivation(remote_tip) if picks else None
-            if picks and not all(self._pick_counts(d_remote, c) for c in picks):
+            # an entry the team needs a touch for, re-signed by a FIDO key, goes through the replay, which names it and
+            # asks a touch for it (H-6), never through an unnamed pick here
+            named = bool(picks) and self._presence_key_problem() is None and any(
+                T.presence_required(d_remote.team.allow_file_keys, T._parsed(text).get("type"))
+                for c in picks for _p, text in self._added_lines(c))
+            if mixed or named or (picks and not all(self._pick_counts(d_remote, c) for c in picks)):
                 # re-signed now, with a key not in force at the remote (a rotation's still-PENDING key) or onto a remote
                 # this clone cannot judge in full, the entries could publish without counting (T42, RAN; code L3 r3
-                # codex 4, RAN). Held under a ref instead; `_replay_held` replays them
+                # codex 4, RAN). Held under a ref instead; `_replay_held` replays them in order
                 # after the held team ops (the confirm) re-land, and only once the key counts.
-                for c in picks:
+                for c in picks + mixed:
                     git(["update-ref", self._held_ref(root, c), c], self.wt)
                 picks = []
             published = added = False
@@ -1687,7 +2151,7 @@ class GitLedger:
                 git(["checkout", "-q", "--detach", remote_tip], self.wt, timeout=timeout)
                 for c in picks:
                     cp = git([*_REPLAY_CONFIG, *self._sign_cfg(), "cherry-pick", "--allow-empty", c],
-                             self.wt, check=False, timeout=timeout)
+                             self.wt, check=False, timeout=timeout, extra_env=self._sign_env())
                     if cp.returncode == 0:
                         continue
                     unmerged = git(["diff", "--name-only", "--diff-filter=U"], self.wt, check=False).stdout.split()
@@ -1888,8 +2352,74 @@ class GitLedger:
         with self.op(timeout=net_timeout):
             return self._sync_in_op(push=push, timeout=timeout, net_timeout=net_timeout, lock_timeout=lock_timeout)
 
+    def _hold_unpresent(self, rref: str, timeout: float, lock_timeout: float) -> None:
+        """The one publish gate for the presence rule (codex HIGH 2 + 3): an unpublished entry the derivation does not
+        count for want of user presence (a kill between its commit and the writer's check, or a pick re-signed onto a
+        parent that refuses file keys) is never pushed, and nothing is dropped (r2 H-5: a refusal whose remedy was a
+        hard reset lost every unpublished entry). From the FIRST such commit on, this clone's own entries are held
+        under refs/levain/held/ (one file's lines are one chain, so a later line cannot go out before the one it is
+        sealed over) and its team changes are stripped into pending ops; the branch goes back to that commit's parent,
+        the ops re-land, and the replay puts back every later entry that counts (re-sealed where its file kept an
+        earlier line back). The countable prefix then publishes."""
+        if not self.pinned_root:
+            return
+        d = self.derivation()
+        if not d.presence_refused:
+            return
+        with self.lock(timeout=lock_timeout):
+            root = self.pinned_root
+            self._recover_dirty()
+            orig = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
+            fresh = git(["rev-list", "--reverse", "--topo-order", f"{rref}..{orig}" if self._has(rref) else orig],
+                        self.wt).stdout.split()
+            bad = {d.walk[d.line_pos[h]] for h in d.presence_refused if h in d.line_pos}
+            # `presence_refused` covers the whole history (a published line the remote already carries is in it too);
+            # only a refused line in THIS clone's unpublished range is held. None there: nothing here to hold, and the
+            # push sends no line the rule refuses (complement D)
+            first = next((c for c in fresh if c in bad), None)
+            if first is None:
+                return
+            suffix = fresh[fresh.index(first):]
+            own, _foreign = self._movable(orig)
+            if not set(suffix) <= set(own):
+                # held refs are re-signed with this clone's key on replay, so only its own commits may be held
+                raise TeamError("not pushed: an unpublished entry carries no user presence and the team refuses file "
+                                "keys where it sits, and commits this clone did not write sit after it; nothing was "
+                                "changed. Run `levain team doctor`")
+            from . import tenure as T
+            self._refuse_unsplittable(suffix)
+            pending: list[dict] = []
+            for c in suffix:
+                touched = set(git(["diff-tree", "--no-commit-id", "--name-only", "-r", c], self.wt).stdout.split())
+                # a commit with a team change AND ledger lines is held WHOLE, its team half queued too (codex MED: its
+                # lines were left dangling when the branch moved back past it)
+                if not touched & {T.TEAM_FILE, T.TENURE_FILE} or self._strip_team(c, root, pending):
+                    git(["update-ref", self._held_ref(root, c), c], self.wt)
+            self._add_pending(pending)
+            try:
+                git(["update-ref", "-m", "levain team: hold entries that would not count", self.ref, f"{first}^",
+                     orig], self.wt)
+            except TeamError:
+                self._drop_pending(pending)
+                raise
+            git(["checkout", "-q", "-f", self.branch], self.wt, timeout=60)
+            self._dcache = None
+        self._reland()
+        self._replay_held(timeout, lock_timeout)
+
     def _sync_in_op(self, *, push: bool, timeout: float, net_timeout: float, lock_timeout: float,
                     retries: int = _PUSH_RETRIES) -> str:
+        """One sync, with ``_appended`` read once per commit id for its lifetime (code L3 r6 complement LOW: each
+        caller re-read the same commit's blobs)."""
+        self._acache = {}
+        try:
+            return self._sync_body(push=push, timeout=timeout, net_timeout=net_timeout, lock_timeout=lock_timeout,
+                                   retries=retries)
+        finally:
+            self._acache = None
+
+    def _sync_body(self, *, push: bool, timeout: float, net_timeout: float, lock_timeout: float,
+                   retries: int) -> str:
         """Fetch, rebase, optionally push. Must be called WITHOUT the worktree lock held.
 
         Network I/O runs under a separate ``net`` lock, so a hook reading the worktree never waits on a
@@ -1907,7 +2437,8 @@ class GitLedger:
             rref = f"refs/remotes/{remote}/{self.branch}"
             local = self.ref
             for attempt in range(retries):
-                if not self._fetch(remote, rref, timeout):
+                fetched = self._fetch(remote, rref, timeout)
+                if not fetched:
                     published = bool(self.state().get("anchor")) or bool(git(
                         ["for-each-ref", "--count=1", f"refs/levain/seen/{self.branch}/", f"refs/levain/gone/{self.branch}/"],
                         self.repo.toplevel, check=False).stdout.strip())
@@ -1931,9 +2462,12 @@ class GitLedger:
                     ahead = git(["rev-list", "--count", f"{rref}..{local}"], self.wt).stdout.strip()
                     if ahead == "0":
                         return "up to date"
-                    if git(["rev-list", "--merges", f"{rref}..{local}"], self.wt).stdout.strip():
-                        raise TeamError("refusing to push a merge to the team ledger (it must stay linear)")
-                cp = git(["push", "-q", "--no-verify", remote, f"{local}:{local}"], self.repo.toplevel,
+                # once before the hold too: it moves the branch, and a commit the push would refuse (a merge, a
+                # replaced ledger line) is refused while nothing has moved
+                self._refuse_outgoing(rref if fetched else None, local)
+                self._hold_unpresent(rref, timeout, lock_timeout)
+                tip = self._refuse_outgoing(rref if fetched else None, local)
+                cp = git(["push", "-q", "--no-verify", remote, f"{tip}:{local}"], self.repo.toplevel,
                          check=False, timeout=timeout)
                 if cp.returncode == 0:
                     try:
