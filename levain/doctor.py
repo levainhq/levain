@@ -1388,23 +1388,54 @@ def _check_cockpit_authority(install: Path) -> list[CheckResult]:
         return [CheckResult(name, True, str(auth.authority_error), warn=True)]
     if auth.authority_error is not None:              # a migrated store, its keys not yet re-enrolled
         return [CheckResult(name, True, auth.authority_error)]
-    laptops = [k.fingerprint for k in auth.authority.active_keys() if k.key_class == LAPTOP]
+    # a quarantined key signs nothing new, so it is not counted as a laptop-presence key that can sign
+    quarantined = auth.authority.quarantined_keys()
+    rows = [_quarantine_row(name, root, key, why) for key, why in quarantined]
+    held = {key.fingerprint for key, _why in quarantined}
+    laptops = [k.fingerprint for k in auth.authority.active_keys() if k.key_class == LAPTOP and k.fingerprint not in held]
     # re-genesis (§3.9) is S3a-2b-2's, not this build's: name it as missing, never as a command to run
     recovery = ("recovery after losing it, `levain cockpit ledger re-genesis` (a new authority log, every grant "
                 "void), is not in this build")
     if len(laptops) == 1:
-        return [CheckResult(
+        return rows + [CheckResult(
             name, True, f"one {LAPTOP} key is enrolled ({laptops[0]})",
             f"Enrol a second {LAPTOP} key now: make one with `levain cockpit key create`, then `levain cockpit "
             "enroll <key.pub> --signing-key <the enrolled key>`; "
             f"{recovery}.",
             warn=True)]
     if not laptops:
-        return [CheckResult(name, True, f"no unrevoked {LAPTOP} key: nothing can enrol a key or sign a T3 act",
-                            "Recovery, `levain cockpit ledger re-genesis` (a new authority log, every grant void), "
-                            "is not in this build.",
-                            warn=True)]
-    return [CheckResult(name, True, f"{len(laptops)} {LAPTOP} keys enrolled (head at seq {auth.authority.seq})")]
+        return rows + [CheckResult(name, True, f"no unrevoked {LAPTOP} key: nothing can enrol a key or sign a T3 act",
+                                   "Recovery, `levain cockpit ledger re-genesis` (a new authority log, every grant "
+                                   "void), is not in this build.",
+                                   warn=True)]
+    return rows + [CheckResult(name, True,
+                               f"{len(laptops)} {LAPTOP} keys enrolled (head at seq {auth.authority.seq})")]
+
+
+def _quarantine_row(name: str, root: Path, key: Any, why: str) -> CheckResult:
+    """A FAIL for one QUARANTINED key (``levain.authority.AuthoritySnapshot.quarantined_keys``: its stored custody is
+    not the one its key material shows). Every verify site refuses its new signatures; the remedy
+    names commands this levain has, with this cockpit's data root and the key's own fingerprint filled in."""
+    from levain.authority import DISPLAY_PHONE, is_passkey_material
+
+    dr = f"--data-root {shlex.quote(str(root))}"
+    fp = shlex.quote(key.fingerprint)
+    revoke = f"levain cockpit revoke {fp} --signing-key YOUR_LAPTOP_PRESENCE_KEY {dr}"
+    if key.key_class == DISPLAY_PHONE:
+        hint = (f"Revoke it: `{revoke}`. Then make a fresh passkey on the phone page (its enrol step writes the "
+                f"passkey .pub) and enrol it at custody passkey: `levain cockpit enroll <passkey .pub> --class "
+                f"{DISPLAY_PHONE} --custody passkey --signing-key YOUR_LAPTOP_PRESENCE_KEY {dr}`. The same key "
+                "cannot be enrolled again: a revoked key stays revoked.")
+    else:
+        hint = (f"Enrol a replacement {key.key_class} key at the custody it really has first, signed by a "
+                f"laptop-presence key that is not quarantined: `levain cockpit enroll <key.pub> --class "
+                f"{key.key_class} --custody <its custody> --signing-key YOUR_LAPTOP_PRESENCE_KEY {dr}` (`levain "
+                f"cockpit key create` makes one and records its custody). Then revoke this one: `{revoke}`. The same "
+                "key cannot be enrolled again: a revoked key stays revoked.")
+    how = (f"it was enrolled at custody {key.custody} before levain refused WebAuthn material there"
+           if is_passkey_material(key.public_key) else "its key material is not a passkey's")
+    return CheckResult(name, False, f"key {key.fingerprint} ({key.key_class}) is QUARANTINED: {why}; {how}, so "
+                                    "every levain check refuses its new signatures", hint)
 
 
 def _check_continuity_headroom(install: Path) -> list[CheckResult]:

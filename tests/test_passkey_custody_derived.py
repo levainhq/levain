@@ -19,8 +19,9 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import struct
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -107,6 +108,33 @@ def pre_door():
         return real(key_class, custody, key_type, legacy=legacy, public_key="")
 
     with mock.patch.object(auth, "custody_problem", without_door):
+        yield
+
+
+@contextlib.contextmanager
+def writes_pre_door():
+    """A log WRITTEN by a levain from before the enrol door and READ by this one: every append through
+    ``auth.sign_and_append`` (the consent tests' ``Log.link``) runs under :func:`pre_door`, and every read is this
+    replay, unpatched (``Log.source`` is a fresh replay cache). The key reaches a snapshot QUARANTINED."""
+    from unittest import mock
+
+    real = auth.sign_and_append
+
+    def written_pre_door(*a, **kw):
+        with pre_door():
+            return real(*a, **kw)
+
+    with mock.patch.object(auth, "sign_and_append", written_pre_door):
+        yield
+
+
+@contextlib.contextmanager
+def pre_mismatch():
+    """The replay before 10ae7276: no enrol door and no custody_mismatch rule, so a key holding WebAuthn material at
+    custody fido signed links with no user-verification or origin check at all (custody-fix measure_history)."""
+    from unittest import mock
+
+    with pre_door(), mock.patch.object(auth, "custody_mismatch", lambda *a, **kw: None):
         yield
 
 
@@ -246,7 +274,9 @@ def authority_link_verdict(tmp: Path, **sig) -> str | None:
 
 @pytest.fixture
 def old_log():
-    with pre_door():
+    """A log written before the door, read by this levain: the key is QUARANTINED, and every site refuses its new
+    signatures."""
+    with writes_pre_door():
         yield
 
 
@@ -260,16 +290,49 @@ def test_the_log_refuses_webauthn_material_enrolled_at_any_custody_but_passkey(t
         _log(tmp_path, WebAuthnKey(), cls, custody)
 
 
-def test_a_log_holding_such_an_enrolment_from_before_the_door_fails_closed(tmp_path):
-    """A fresh replay (a new process) refuses the log at that enrolment. A replay cache warmed before the door keeps
-    its verified prefix, which is why every verify site holds the same rule (:func:`levain.authority.custody_mismatch`)."""
+@pytest.mark.parametrize("cls, custody", [("display-phone", auth.UNSTATED), ("display-phone", "fido"),
+                                          ("laptop-presence", "fido")])
+def test_a_log_holding_such_an_enrolment_from_before_the_door_loads_with_the_key_quarantined(tmp_path, cls,
+                                                                                             custody):
+    """A fresh replay (a new process) KEEPS the log: the enrolment refused only by the door's key-material rule is a
+    QUARANTINED key, derived from its stored fields (the material shows a passkey, the stored custody is not). Was:
+    the replay refused the log whole (the custody-fix lane's lockout, recovery_measure.txt)."""
     from levain.consent import authority_source
 
+    pk = WebAuthnKey()
     with pre_door():
-        lg = _log(tmp_path, WebAuthnKey(), "display-phone", "fido")
-        lg.source()
+        lg = _log(tmp_path, pk, cls, custody)
+        warmed = lg.source().key(pk.fp)
+    snap = authority_source(lg.path, anchor=None, cache=auth.ReplayCache())()
+    assert snap.key(pk.fp) == warmed and snap.key(pk.fp).custody == custody
+    assert [(k.fingerprint, "custody its key material shows" in why) for k, why in snap.quarantined_keys()] == \
+        [(pk.fp, True)]
+    assert [k.key_class for k in snap.active_keys() if k.fingerprint != pk.fp] == ["laptop-presence"]
+
+
+def test_the_door_still_refuses_such_an_enrolment_as_a_new_link(tmp_path):
+    """The quarantine is for a link already in the log. A new enrol of WebAuthn material at another custody is
+    refused at prepare and at append, a log holding a quarantined key included."""
+    pk = WebAuthnKey()
+    with pre_door():
+        lg = _log(tmp_path, pk, "display-phone", auth.UNSTATED)
+    again = WebAuthnKey()
     with pytest.raises(auth.AuthorityError, match="WebAuthn passkey"):
-        authority_source(lg.path, anchor=None, cache=auth.ReplayCache())()
+        lg.link({"op": "enrol", "fingerprint": again.fp, "public_key": again.public_key, "class": "display-phone",
+                 "custody": "fido"})
+    # the append door on its own (a link prepared past prepare): the replay of the new row refuses it
+    conn = sqlite3.connect(lg.path, isolation_level=None)
+    try:
+        with pre_door():
+            link = auth.prepare(conn, {"op": "enrol", "fingerprint": again.fp, "public_key": again.public_key,
+                                       "class": "display-phone", "custody": "fido"},
+                                signer_fp=lg.keys["laptop"].fp, now=datetime.now(timezone.utc),
+                                cache=auth.ReplayCache())
+        signature = lg.keys["laptop"].sign(link.message, auth.NAMESPACE)
+        with pytest.raises(auth.AuthorityError, match="WebAuthn passkey"):
+            auth.append(conn, link, signature, now=datetime.now(timezone.utc), anchor=None, cache=auth.ReplayCache())
+    finally:
+        conn.close()
 
 
 # --- the stored custody agrees with the key material: the passkey's checks run, a good signature is taken ------------
@@ -319,8 +382,54 @@ def test_a_passkey_stored_at_custody_fido_is_never_a_configuration_root(tmp_path
 
 @pytest.mark.parametrize("name", list(SIGS))
 def test_the_replay_refuses_a_link_signed_by_a_passkey_stored_at_custody_fido(tmp_path, old_log, name):
+    """A NEW link a quarantined key signs is refused at append, whatever its signature."""
     got = authority_link_verdict(tmp_path, **SIGS[name])
-    assert got is not None and "custody its key material shows" in got, got
+    assert got is not None and "custody its key material shows" in got and "quarantined" in got, got
+
+
+def _history(tmp: Path, *sigs: dict):
+    """A log the replay before 10ae7276 wrote (:func:`pre_mismatch`): an ssh laptop genesis, ``pk`` (WebAuthn,
+    laptop-presence at custody fido), then one enrol link per entry of ``sigs`` signed by ``pk`` with those flags.
+    Returns the log, ``pk`` and the keys those links enrolled."""
+    pk = WebAuthnKey()
+    enrolled = []
+    with pre_mismatch():
+        lg = _log(tmp, pk, "laptop-presence", "fido")
+        for sig in sigs:
+            other = WebAuthnKey(f"other{len(enrolled)}.example.ts.net")
+            lg.keys["pk"] = _LinkSigner(pk, **sig)
+            lg.link({"op": "enrol", "fingerprint": other.fp, "public_key": other.public_key,
+                     "class": "laptop-presence", "custody": "fido"}, signer="pk")
+            enrolled.append(other)
+    return lg, pk, enrolled
+
+
+def _fresh(lg):
+    """The log's replay in a fresh cache (a new process), its ReplayError unwrapped."""
+    conn = sqlite3.connect(lg.path)
+    try:
+        return auth.snapshot(conn, cache=auth.ReplayCache())
+    finally:
+        conn.close()
+
+
+def test_a_quarantined_keys_past_link_with_user_verification_on_its_own_origin_stands(tmp_path):
+    lg, pk, (a,) = _history(tmp_path, SIGS["good"])
+    snap = _fresh(lg)
+    assert snap.seq == 3 and snap.key(a.fp) is not None
+    assert [k.fingerprint for k, _why in snap.quarantined_keys()] == [pk.fp, a.fp]
+
+
+@pytest.mark.parametrize("name, why", [("no-uv", "did not verify the user"), ("other-origin", f"not {ORIGIN}")])
+def test_a_quarantined_keys_past_link_without_uv_or_off_origin_is_refused_as_a_fresh_replay_refuses_it(
+        tmp_path, name, why):
+    """One good link and one bad link by the quarantined key: the good one (seq 3) stands, the bad one (seq 4) is
+    refused, and, as any refused link does today, the replay builds no state past it."""
+    lg, pk, (a, b) = _history(tmp_path, SIGS["good"], SIGS[name])
+    with pytest.raises(auth.ReplayError) as ei:
+        _fresh(lg)
+    assert ei.value.seq == 4, ei.value
+    assert why in str(ei.value) and "quarantined" in str(ei.value) and pk.fp in str(ei.value), ei.value
 
 
 def test_an_openssh_fido_key_at_custody_fido_still_signs(tmp_path):
@@ -424,9 +533,12 @@ def test_enroll_refuses_a_passkey_at_another_custody_before_it_signs(tmp_path, m
 
 # --- the 1022+18 L3 r1 sites: the cockpit broker's pending ALLOW, the anchor reset, the signers snapshot door ----------
 
-def cockpit_verdict(home: Path, spores: Path, keydir: Path, custody: str, **sig) -> str | None:
+def cockpit_verdict(home: Path, spores: Path, keydir: Path, custody: str, *, laptop_signs: bool = False,
+                    **sig) -> str | None:
     """``None`` when the cockpit broker takes ``pk``'s signature over a waiting pending (``pk`` display-phone at
-    ``custody`` in the broker's own signed log, beside an ssh laptop-presence genesis key), else the refusal."""
+    ``custody`` in the broker's own signed log, beside an ssh laptop-presence genesis key), else the refusal. The log
+    is written before the door (:func:`pre_door`) and the broker reads it fresh (the process replay cache cleared), so
+    ``pk`` is QUARANTINED. ``laptop_signs``: the laptop key signs the pending instead of ``pk``."""
     from levain.autonomic.confirm import COCKPIT_NAMESPACE
     from levain.cockpit.broker import BrokerError
     from tests.cockpit_authority_rig import RealKey, enrol, link
@@ -435,12 +547,15 @@ def cockpit_verdict(home: Path, spores: Path, keydir: Path, custody: str, **sig)
     b = _broker(home, spores)
     try:
         root = RealKey(keydir, "root")
-        enrol(b.db, root, "laptop-presence")
         pk = WebAuthnKey()
-        link(b.db, {"op": "enrol", "fingerprint": pk.fp, "public_key": pk.public_key, "class": "display-phone",
-                    "custody": custody}, root)
+        with pre_door():
+            enrol(b.db, root, "laptop-presence")
+            link(b.db, {"op": "enrol", "fingerprint": pk.fp, "public_key": pk.public_key, "class": "display-phone",
+                        "custody": custody}, root)
+        auth.PROCESS_CACHE.clear()
         pid = _move(b, spores)["pending_id"]
-        signature = pk.sign(b.outcome(pid)["record"].encode(), COCKPIT_NAMESPACE, **sig)
+        record = b.outcome(pid)["record"].encode()
+        signature = root.sign(record, COCKPIT_NAMESPACE) if laptop_signs else pk.sign(record, COCKPIT_NAMESPACE, **sig)
         try:
             out = b.submit(pid, signature)
         except BrokerError as exc:
@@ -469,10 +584,20 @@ def broker_home():
 
 @pytest.mark.parametrize("custody", [auth.UNSTATED, "fido"])
 @pytest.mark.parametrize("name", list(SIGS))
-def test_the_cockpit_broker_never_takes_a_passkey_stored_at_another_custody(broker_home, old_log, custody, name):
-    """A WebAuthn key never enters the pending ALLOW's signers file, whatever custody the log stores for it."""
+def test_the_cockpit_broker_never_takes_a_passkey_stored_at_another_custody(broker_home, custody, name):
+    """A quarantined key never enters the pending ALLOW's signers file, and a signature naming it is refused with why,
+    whatever custody the log stores for it."""
     got = cockpit_verdict(broker_home, broker_home / "spores.json", broker_home / "keys", custody, **SIGS[name])
-    assert got is not None and "custody its key material shows" in got, got
+    assert got is not None and got.startswith("bad_signature") and "quarantined" in got \
+        and "custody its key material shows" in got, got
+
+
+@pytest.mark.parametrize("custody", [auth.UNSTATED, "fido"])
+def test_the_cockpit_broker_still_takes_the_laptop_key_beside_a_quarantined_one(broker_home, custody):
+    """Per key, never the whole verify: the laptop key's ALLOW commits while the log holds a quarantined key. Was: the
+    custody-fix F1 refused every pending verify with 503 authority_unavailable until the revoke."""
+    assert cockpit_verdict(broker_home, broker_home / "spores.json", broker_home / "keys", custody,
+                           laptop_signs=True) is None
 
 
 def anchor_reset_verdict(tmp: Path, custody: str, **sig) -> str | None:
@@ -516,3 +641,59 @@ def test_a_signers_snapshot_refuses_webauthn_material_at_another_custody():
         with pytest.raises(SignersError, match="WebAuthn passkey"):
             _signer({**entry, "custody": custody})
     assert _signer({**entry, "custody": auth.PASSKEY}).custody == auth.PASSKEY
+
+
+# --- the operator's way out: doctor names a quarantined key and remedies that run ------------------------------------
+
+def test_doctor_fails_on_a_quarantined_key_and_every_remedy_it_names_runs(tmp_path, monkeypatch, capsys):
+    """``levain doctor``'s cockpit authority row FAILs per quarantined key, naming it and the commands that end it;
+    each command, with its placeholders filled, runs through the real CLI and exits 0, after which the row is clean.
+    The same key material cannot come back: its re-enrolment at custody passkey is refused (a revoked key stays
+    revoked)."""
+    import re
+    import shlex
+
+    from levain import cli, doctor
+    from levain.cockpit import install
+    from levain.cockpit.firejournal import CockpitDB
+    from tests.cockpit_authority_rig import RealKey, enrol, link
+
+    monkeypatch.setattr(install, "marker_dir", lambda: tmp_path / "m")   # no real governed marker dir
+    inst = tmp_path / "inst"
+    root = inst / ".levain" / "cockpit"
+    root.mkdir(parents=True)
+    CockpitDB(root).set_install_class("reported")
+    laptop = RealKey(tmp_path, "laptop")
+    pk = WebAuthnKey()
+    with pre_door():
+        enrol(CockpitDB(root), laptop, "laptop-presence")
+        link(CockpitDB(root), {"op": "enrol", "fingerprint": pk.fp, "public_key": pk.public_key,
+                               "class": "display-phone", "custody": auth.UNSTATED}, laptop)
+    auth.PROCESS_CACHE.clear()
+
+    bad = [r for r in doctor._check_cockpit_authority(inst) if not r.ok]
+    assert len(bad) == 1 and pk.fp in bad[0].detail and "QUARANTINED" in bad[0].detail, bad
+    assert cli.main(["cockpit", "keys", "--data-root", str(root)]) == 0
+    assert "QUARANTINED" in capsys.readouterr().out
+    commands = re.findall(r"`(levain [^`]+)`", bad[0].hint or "")
+    assert [c.split()[:3] for c in commands] == [["levain", "cockpit", "revoke"], ["levain", "cockpit", "enroll"]], \
+        commands
+    fresh = WebAuthnKey()
+    pub = tmp_path / "fresh.pub"
+    pub.write_text(fresh.public_key + "\n")
+    for command in commands:
+        argv = shlex.split(command.replace("YOUR_LAPTOP_PRESENCE_KEY", str(laptop.path))
+                           .replace("<passkey .pub>", str(pub)))
+        assert cli.main(argv[1:]) == 0, (command, capsys.readouterr())
+    assert all(r.ok for r in doctor._check_cockpit_authority(inst))
+    snap = CockpitDB(root)
+    with snap.read() as conn:
+        now = auth.snapshot(conn, cache=auth.ReplayCache())
+    assert now.quarantined_keys() == [] and now.key(fresh.fp).custody == auth.PASSKEY
+    assert not now.key(pk.fp).active
+    capsys.readouterr()
+    old = tmp_path / "old.pub"
+    old.write_text(pk.public_key + "\n")
+    assert cli.main(["cockpit", "enroll", str(old), "--class", "display-phone", "--custody", auth.PASSKEY,
+                     "--signing-key", str(laptop.path), "--data-root", str(root)]) == 1
+    assert "revoked" in capsys.readouterr().err

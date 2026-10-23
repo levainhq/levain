@@ -3102,12 +3102,19 @@ def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_cockpit_keys(args: argparse.Namespace) -> int:
+    from levain.authority import custody_mismatch
     from levain.cockpit.custody import custody_note
     from levain.cockpit.keys import keys
 
     try:
         rows, note = keys(_cockpit_root(args), now=_utc_now())
         notes = custody_note(rows)
+        for r in rows:
+            # a QUARANTINED key (levain.authority.AuthoritySnapshot.quarantined_keys): its new signatures are refused
+            why = custody_mismatch(r.public_key or "", r.custody) if r.revoked_seq is None else None
+            if why is not None:
+                notes[r.fingerprint] = "; ".join(filter(None, (f"QUARANTINED: {why}; `levain doctor` names the remedy",
+                                                               notes.get(r.fingerprint))))
     except _cockpit_refusals() as exc:
         print(f"keys: {exc}", file=sys.stderr)
         return 1

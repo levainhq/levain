@@ -115,6 +115,14 @@ def custody_problem(key_class: str, custody: Any, key_type: str, *, public_key: 
     if custody != PASSKEY and is_passkey_material(public_key):
         return (f"the key is a WebAuthn passkey (an {_PASSKEY_KEY_TYPE} key made on a web origin, not ssh:); "
                 f"its custody is {PASSKEY}, never {custody}")
+    return _custody_rule_problem(key_class, custody, key_type, legacy)
+
+
+def _custody_rule_problem(key_class: str, custody: Any, key_type: str, legacy: bool) -> str | None:
+    """Every rule of :func:`custody_problem` but the key-material one. Private: its one other caller is the replay's
+    quarantine of an enrolment recorded before the door (:func:`_enrolled_key`), which holds every other rule."""
+    if not isinstance(custody, str) or custody not in CUSTODIES:
+        return f"unknown custody {str(custody)[:40]!r}; one of {', '.join(CUSTODIES)}"
     if custody == FIDO_ATTESTED:
         return (f"custody {FIDO_ATTESTED} is refused until attestation at enrol is built (it comes with the "
                 "governed install); an unattested FIDO key is custody fido")
@@ -170,6 +178,16 @@ def custody_mismatch(public_key: str, custody: object) -> str | None:
         return None
     return (f"the signing key's stored custody {str(custody)[:40]!r} is not the custody its key material shows "
             f"({'a passkey' if derived else 'not a passkey'})")
+
+
+def _quarantinable(key_class: str, custody: Any, key_type: str, legacy: bool, public_key: str) -> bool:
+    """Whether an enrolment refused only by the door's key-material rule (WebAuthn material at a custody but
+    ``passkey``) and by no other rule is one the replay keeps, QUARANTINED, when it is already in the log (a log
+    written before the door). It is never a new link's way in: :func:`_enrolled_key` asks only for history."""
+    return (custody != PASSKEY and is_passkey_material(public_key)
+            and _custody_rule_problem(key_class, custody, key_type, legacy) is None)
+
+
 
 # Delta kinds the recompute classifier returns (§4.3).
 NOOP, TIGHTEN, LOOSEN, RENEW, GRANT_REVOKE = "noop", "tighten", "loosen", "renew", "grant_revoke"
@@ -558,6 +576,20 @@ class AuthoritySnapshot:
 
     def active_keys(self) -> list[AuthorityKey]:
         return [k for k in self.keys.values() if k.active]
+
+    def quarantined_keys(self) -> list[tuple[AuthorityKey, str]]:
+        """The active keys whose stored custody is not the one their key material shows (:func:`custody_mismatch`),
+        each with why: derived from the stored fields alone, never a field of its own. Two shapes: WebAuthn material
+        at a custody but ``passkey`` (only from a log written before the enrol door, :func:`_quarantinable`), and
+        material that is not a passkey's stored at custody ``passkey`` (an OpenSSH sk-ecdsa key; the door does not
+        refuse that enrolment). Every verify site refuses either one's new signatures. A revoke ends it;
+        re-enrolling the same material is refused (a revoked key stays revoked)."""
+        out = []
+        for k in self.active_keys():
+            why = custody_mismatch(k.public_key, k.custody)
+            if why is not None:
+                out.append((k, why))
+        return out
 
     def hash_at(self, seq: int) -> str | None:
         return self._hashes[seq - 1] if 1 <= seq <= len(self._hashes) else None
@@ -1222,7 +1254,10 @@ def _parse_record(row: _Row) -> dict[str, Any]:
 
 
 def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, AuthorityKey],
-                  ssh_keygen: Path | str) -> AuthorityKey:
+                  ssh_keygen: Path | str, *, new_link: bool) -> AuthorityKey:
+    """The key an ``enrol`` record adds. ``new_link``: the record is being prepared or appended now (the door binds
+    whole); otherwise it is a link already in the log, and an enrolment refused only by the door's key-material rule
+    is kept as a QUARANTINED key (:func:`_quarantinable`; :meth:`AuthoritySnapshot.quarantined_keys`)."""
     from levain.cockpit.keys import KeyError_, fingerprint_of, normalise_public_key
     fp, public_key, cls = rec["fingerprint"], rec["public_key"], rec["class"]
     if not isinstance(cls, str) or cls not in _ranks():
@@ -1242,8 +1277,10 @@ def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, Authority
     if legacy is not None and not isinstance(legacy, str):
         raise AuthorityError("legacy_enrolled_at must be text")
     custody = rec["custody"]
-    problem = custody_problem(cls, custody, public_key.split()[0], legacy=legacy is not None, public_key=public_key)
-    if problem is not None:
+    key_type = public_key.split()[0]
+    problem = custody_problem(cls, custody, key_type, legacy=legacy is not None, public_key=public_key)
+    if problem is not None and (new_link or not _quarantinable(cls, custody, key_type, legacy is not None,
+                                                                public_key)):
         raise AuthorityError(problem)
     old = keys.get(fp)
     if old is not None:
@@ -1256,8 +1293,10 @@ def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, Authority
 
 
 def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
-          check_signature: bool = True) -> AuthoritySnapshot:
-    """The state after ``row``, judged against ``state`` (its predecessor), or :class:`ReplayError`."""
+          check_signature: bool = True, new_link: bool = False) -> AuthoritySnapshot:
+    """The state after ``row``, judged against ``state`` (its predecessor), or :class:`ReplayError`. ``new_link``:
+    ``row`` is being prepared or appended now, never a link already in the log; a QUARANTINED key (one a log from
+    before the enrol door holds, :func:`_quarantinable`) is then neither enrolled nor taken as a signer."""
     expected = 1 if state is None else state.seq + 1
     seq = row.seq
     if type(seq) is not int or seq != expected:
@@ -1294,6 +1333,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
     keys = {} if state is None else dict(state.keys)
     policy = genesis_policy() if state is None else state.policy
     grant_seqs = {} if state is None else dict(state.grant_seqs)
+    quarantined_history = False
     try:
         if state is None:
             # TOFU genesis (§3.2): the first link enrols a laptop-presence key, signed by that key
@@ -1301,8 +1341,11 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                 raise AuthorityError(f"the first link must enrol a {LAPTOP} key")
             if row.signer_fp != rec["fingerprint"]:
                 raise AuthorityError("the first link must be signed by the key it enrols")
-            signer = _enrolled_key(rec, seq, keys, ssh_keygen)
+            signer = _enrolled_key(rec, seq, keys, ssh_keygen, new_link=new_link)
             keys[signer.fingerprint] = signer
+            # a quarantined genesis key (only ever history: _enrolled_key refuses it on a new link) signed this
+            # link: re-checked below as the passkey its material shows
+            quarantined_history = custody_mismatch(signer.public_key, signer.custody) is not None
         else:
             found = keys.get(row.signer_fp)
             if found is None:
@@ -1312,10 +1355,14 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                 raise AuthorityError(f"signer {row.signer_fp} was revoked at seq {signer.revoked_seq}")
             # the custody that picks the rule below and the passkey checks after the signature is the stored one,
             # held equal to the one the signer's key material shows (an enrolment from before the door at
-            # custody_problem could hold a passkey at custody fido)
+            # custody_problem could hold a passkey at custody fido). The one exception is a QUARANTINED key's link
+            # already in the log: WebAuthn material at another custody, so the link is re-checked below as the
+            # passkey its material shows (user verification, the exact origin). A new link it signs is refused
             why = custody_mismatch(signer.public_key, signer.custody)
-            if why is not None:
-                raise AuthorityError(why)
+            if why is not None and (new_link or not is_passkey_material(signer.public_key)):
+                raise AuthorityError(why + ("; the key is quarantined: it signs nothing new" if new_link and
+                                            is_passkey_material(signer.public_key) else ""))
+            quarantined_history = why is not None
             if signer.custody == PASSKEY:
                 # a passkey signs consent answers (its own namespace, the consent queue's check) and, in this log,
                 # one op: the removal of a consent or inert grant, which only ever narrows what an agent may do (a
@@ -1330,7 +1377,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                 if target is not None and not consent_revocable(target):
                     raise AuthorityError(f"a {PASSKEY} key revokes a consent grant or an inert one only, never "
                                          f"grant {gid[:80]!r}")
-            need = _apply_op(rec, seq, state, keys, ssh_keygen)
+            need = _apply_op(rec, seq, state, keys, ssh_keygen, new_link=new_link)
             if isinstance(need, StandingPolicy):
                 delta = classify(policy, need)
                 if delta == NOOP:
@@ -1359,27 +1406,30 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                              fingerprint=signer.fingerprint, ssh_keygen=ssh_keygen)
         if not ok:
             raise ReplayError(seq, f"the signature does not verify as {signer.fingerprint}")
-        if signer.custody == PASSKEY:
+        if signer.custody == PASSKEY or quarantined_history:
             # the checks ssh-keygen does not make on a WebAuthn signature (user verification, an origin that is
-            # exactly the key's own https name, not cross-origin), run at every replay
+            # exactly the key's own https name, not cross-origin), run at every replay, and on a quarantined key's
+            # link as on any passkey's: the stored signature carries its flags and origin
             from levain.consent.passkey import authority_signature_problem
 
             problem = authority_signature_problem(row.signature, signer.public_key)
             if problem is not None:
-                raise ReplayError(seq, f"the passkey signature is refused: {problem}")
+                raise ReplayError(seq, f"the passkey signature is refused: {problem}"
+                                       + (f" (signed by {signer.fingerprint}, quarantined: WebAuthn material stored "
+                                          f"at custody {signer.custody})" if quarantined_history else ""))
     hashes = (() if state is None else state._hashes) + (row.hash,)
     return AuthoritySnapshot(rec["store_id"], seq, row.hash, MappingProxyType(keys), policy, hashes, head_at=at,
                              grant_seqs=MappingProxyType(grant_seqs))
 
 
 def _apply_op(rec: Mapping[str, Any], seq: int, state: AuthoritySnapshot, keys: dict[str, AuthorityKey],
-              ssh_keygen: Path | str) -> int | StandingPolicy:
+              ssh_keygen: Path | str, *, new_link: bool) -> int | StandingPolicy:
     """Applies a key op to ``keys`` and returns the signer rank it needs, or returns the new policy for
     a policy op (whose rank follows from its computed delta)."""
     op = rec["op"]
     ranks = _ranks()
     if op == "enrol":
-        key = _enrolled_key(rec, seq, keys, ssh_keygen)
+        key = _enrolled_key(rec, seq, keys, ssh_keygen, new_link=new_link)
         keys[key.fingerprint] = key
         return ranks[LAPTOP]
     if op == "revoke_key":
@@ -1724,7 +1774,7 @@ def prepare(conn: sqlite3.Connection, op: Mapping[str, Any], *, signer_fp: str, 
     except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
         # not JSON, a lone surrogate (no UTF-8 form), or nested too deeply
         raise AuthorityError(f"the op has no canonical UTF-8 form ({type(exc).__name__})") from None
-    _step(state, row, ssh_keygen=ssh_keygen, check_signature=False)
+    _step(state, row, ssh_keygen=ssh_keygen, check_signature=False, new_link=True)
     if state is not None:
         _append_only_checks(state, json.loads(record), now)
     return UnsignedLink(seq, prev, record, signer_fp)
@@ -1762,7 +1812,7 @@ def append(conn: sqlite3.Connection, link: UnsignedLink, signature: str, *, now:
             raise StaleHead(f"the authority log's head moved to seq {head[0]} since this link was prepared")
         row = _Row(link.seq, link.prev_hash, link.record, link.signer_fp, signature,
                    _link_hash(link.prev_hash, link.record))
-        new = _step(state, row, ssh_keygen=ssh_keygen)
+        new = _step(state, row, ssh_keygen=ssh_keygen, new_link=True)
         if state is not None:
             _append_only_checks(state, json.loads(link.record), now)
         conn.execute("INSERT INTO authority_log (seq, prev_hash, record, signer_fp, signature, hash) "

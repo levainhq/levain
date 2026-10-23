@@ -99,7 +99,7 @@ from levain.cockpit.firejournal import (
 from levain.cockpit.install import REPORTED, decide_install, network_fs_problem
 from levain.cockpit.labels import BrokerLabeller, LabelSnapshot, label_class
 from levain.authority import (PASSKEY, AnchorError, advance_anchor, anchor_path, custody_mismatch,
-                              is_passkey_material, presence_missing)
+                              is_passkey_material, presence_missing, sshsig_public_key)
 from levain.cockpit.authority import RequestAuthority, bound, current, inactive
 from levain.cockpit.results import Absent, Fault
 from levain.cockpit.verbs import KERNEL_VERBS
@@ -1006,17 +1006,26 @@ class Broker:
         """The verified signer's fingerprint (§6.5), against a signers file generated from the
         request's authority snapshot (its unrevoked keys) for this verification into a fresh
         ``mkstemp`` file in the data root."""
-        # The one custody rule (levain.authority.custody_mismatch), before any key is written: a snapshot holding a
-        # key whose stored custody is not the one its material shows (a log from before the enrol door, read through
-        # a warmed replay cache) verifies nothing here, as a fresh replay of that log refuses it whole.
+        # The one custody rule (levain.authority.custody_mismatch), per key: a QUARANTINED key (its stored custody is
+        # not the one its material shows; a log from before the enrol door holds it) never enters the signers file,
+        # and a signature naming it is refused with that reason. Every other key verifies as before.
+        quarantined: dict[str, tuple[str, str]] = {}
         for k in authority.active_keys():
             why = custody_mismatch(k.public_key, k.custody)
             if why is not None:
-                raise BrokerError("authority_unavailable", 503, f"key {k.fingerprint}: {why}")
+                quarantined[k.public_key] = (k.fingerprint, why)
+        try:
+            named = sshsig_public_key(signature)[0]
+        except ValueError:
+            named = None                    # ssh-keygen below refuses what cannot be read
+        if named in quarantined:
+            fp, why = quarantined[named]
+            raise BrokerError("bad_signature", 400, f"key {fp} is quarantined ({why}); it signs nothing new")
         # a passkey is never a signer of a pending (it signs consent answers, and in the authority log a revoke):
         # neither a key stored at custody passkey nor WebAuthn key material enters the signers file
         keys = sorted((k.principal, k.public_key) for k in authority.active_keys()
-                      if k.custody != PASSKEY and not is_passkey_material(k.public_key))
+                      if k.public_key not in quarantined
+                      and k.custody != PASSKEY and not is_passkey_material(k.public_key))
         fd, path = tempfile.mkstemp(prefix=".signers-", dir=self.data_root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
