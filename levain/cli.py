@@ -3317,7 +3317,7 @@ def _cmd_cockpit_key_create(args: argparse.Namespace) -> int:
               f"`{_shlex.join(['levain', 'cockpit', 'enroll', str(made.public_path), '--signing-key', _KEY_WORD, '--data-root', str(root)])}` "
               "(the custody is read from the key's sidecar)")
     elif root is not None:
-        print("next: this install has no cockpit journal yet: start the cockpit (levain serve --write) and open it "
+        print("next: this install has no cockpit journal yet: start the cockpit (levain serve --write --install-class reported) and open it "
               "once in the browser, then run levain cockpit ledger init with --signing-key "
               f"{_shlex.quote(str(made.path))} and --data-root {_shlex.quote(str(root))} for a new log")
     else:

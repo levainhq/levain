@@ -159,7 +159,7 @@ def _offer(install: Path, adapter: str, *, interactive: bool, emit: Callable[[st
             return
         # an absent journal is not an empty log: `ledger init` refuses until the cockpit has been started once
         emit(f"  default grant: not offered: it would cover {covers}; there is no cockpit journal at {root} yet: "
-             f"start the cockpit that uses that directory (levain serve --write) and open it once in the browser, "
+             f"start the cockpit that uses that directory (levain serve --write --install-class reported) and open it once in the browser, "
              f"then run levain cockpit ledger init (with its --signing-key and --data-root), then `{force}` "
              f"offers it")
         return

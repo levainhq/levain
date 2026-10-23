@@ -179,7 +179,7 @@ def test_default_grant_with_no_journal_is_prose_about_starting_the_cockpit_and_p
         ns = _parsed(_argv_of(force, tmp_path / "k"), monkeypatch)
         assert (ns.func.__name__, ns.path, ns.adapter, ns.force) == ("_cmd_init", inst.resolve(), "claude-code", True), line
         assert "serve" not in force and "ledger" not in force and "<" not in line, line
-        assert "no cockpit journal" in line and "levain serve --write" in line, line
+        assert "no cockpit journal" in line and "levain serve --write --install-class reported" in line, line
         (tmp_path / "an install").rmdir()
 
 
