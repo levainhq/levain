@@ -1092,7 +1092,9 @@ class WatchdogBlind(Exception):
 def uid_pids(uid: int) -> Sequence[int]:
     """Every pid of ``uid`` (real, effective or saved), and only those (B-4: a foreign process is never a kill
     candidate). A process whose owner could not be read (``UNKNOWN``) may be the uid's, so it raises
-    :class:`WatchdogBlind`: blindness, never a candidate and never skipped."""
+    :class:`WatchdogBlind`: blindness, never a candidate and never skipped. Known edge: a pid reused by another
+    process between this listing and the footprint read can over-count one pass. That fails closed (a false cap at
+    worst, never a missed one) [judged by levain head 1022+18, 10-22, against codex L3 r2 B-4]."""
     from levain.slot import proc as P
     out = []
     for p in P.default_seams("darwin").listing():
