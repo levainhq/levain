@@ -8,6 +8,7 @@ import sqlite3
 import re
 import shlex
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 
 import pytest
@@ -179,7 +180,8 @@ def test_default_grant_with_no_journal_is_prose_about_starting_the_cockpit_and_p
         ns = _parsed(_argv_of(force, tmp_path / "k"), monkeypatch)
         assert (ns.func.__name__, ns.path, ns.adapter, ns.force) == ("_cmd_init", inst.resolve(), "claude-code", True), line
         assert "serve" not in force and "ledger" not in force and "<" not in line, line
-        assert "no cockpit journal" in line and "levain serve --write --install-class reported" in line, line
+        serve = shlex.join(["levain", "serve", "--path", os.path.realpath(inst), "--write", "--install-class", "reported"])
+        assert "no cockpit journal" in line and serve in line, line    # the serve names THIS install, quoted
         (tmp_path / "an install").rmdir()
 
 
