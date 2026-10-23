@@ -454,6 +454,13 @@ def _snapshot(args: argparse.Namespace, store: EnvelopeStore) -> Any:
     return _authority_source(store.directory, args.data_root)()
 
 
+def _head_reader(args: argparse.Namespace, store: EnvelopeStore) -> Any:
+    """The same authority source's head reader (``AuthoritySource.head``): the log's stored head, no replay."""
+    from levain.dispatch.cli import _authority_source
+
+    return _authority_source(store.directory, args.data_root).head
+
+
 def _need_terminal(args: argparse.Namespace, what: str) -> None:
     from levain.dispatch import cli as dcli
 
@@ -1133,9 +1140,15 @@ def _coord_first_reader(args: argparse.Namespace, out: Any, store: EnvelopeStore
         _emit(out, args.json, {"questions": obj, "unchecked": unchecked or None},
               "\n".join(lines) if rows else "no unread questions" + (f" ({unchecked})" if unchecked else ""))
         return 0
-    # the authority snapshot is taken inside the answer's fenced transaction, not before it (C5 L3 r1)
+    # the snapshot (a verified replay) is taken just before the answer's fenced transaction, and only the log's head is
+    # compared inside it (C5 L3 r1, r2); with no head reader the snapshot is never live-checked again, so none is used
+    try:
+        head = _head_reader(args, store)
+    except _faults():
+        head = None
     item, reply_id = fr.answer(store, args.ref, option=args.option, text=args.text, token=args.token,
-                               authority_source=lambda: _band_snapshot(args, store)[0])
+                               authority_source=(lambda: _band_snapshot(args, store)[0]) if head is not None
+                               else (lambda: None), authority_head=head)
     _emit(out, args.json, {"item_id": item.item_id, "reply_id": reply_id},
           f"KNOW {reply_id} filed for your review ({item.item_id}); the seat gets it labelled as the coordinator's "
           "own, and the question stays open for you")

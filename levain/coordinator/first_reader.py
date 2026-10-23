@@ -24,8 +24,10 @@ What that means here:
 
 **The verdict** (:func:`verdict`) is necessary, never sufficient. The coordinator may answer only when ALL hold, read
 again inside the fenced ``dispatch.db`` transaction that writes the KNOW (the question re-read from ``questions.db``,
-the authority snapshot taken there when the caller gives its source, the launch and envelope chain read on that
-transaction's own connection):
+the launch and envelope chain read on that transaction's own connection). The authority log is replayed and verified
+just BEFORE that transaction, never inside it (one ``ssh-keygen`` per link this process has not verified, and every
+other ``dispatch.db`` writer would wait on it); inside it only the log's stored head is compared with that snapshot's,
+and a head that moved abandons the transaction and replays again outside it:
 
 1. the question has no answer yet;
 2. no option of it is tied to a consent request (``levain ask --would-push``): that one is the operator's ruling;
@@ -48,9 +50,13 @@ Known edges:
 
 - the question and the authority log are other files, so their re-reads inside the ``dispatch.db`` transaction are
   not atomic with it: an operator answer or a revocation landing between that re-read and the commit still files a
-  KNOW. Accepted, not locked across databases: a KNOW grants nothing, delivery re-checks the question is open inside
-  its own transaction (a KNOW to an answered question never reaches the seat), and every KNOW waits in the operator's
-  review queue;
+  KNOW. Accepted, not locked across databases: a KNOW grants nothing, and every KNOW waits in the operator's review
+  queue;
+- delivery re-reads the question's openness inside its own transaction, which narrows but does not close the same
+  window: an operator answer landing between that re-read and the delivery's commit still delivers the KNOW once,
+  beside his answer (his is the one that counts);
+- the in-lock authority check compares the stored head row only: a row rewritten BELOW an unchanged head row between
+  the replay and the commit is not seen there (the next full replay and the anchor refuse it);
 - a question's ``cwd`` and session are the asking process's own word (``levain ask`` runs as the agent), so "asked
   from inside the envelope" is a label, never proof;
 - a KNOW whose line cannot be formatted stays undelivered (tried again at each hook) and waits in the review queue;
@@ -199,17 +205,45 @@ def _text(name: str, value: Any, high: int) -> str:
     return value
 
 
-def answer(store: Any, ref: Any, *, option: str | None = None, text: str | None = None, token: object,
-           authority: Any = None, authority_source: Callable[[], Any] | None = None) -> tuple[Any, str]:
-    """The coordinator's own answer to question ``ref``: a KNOW (reply + review item + first read) in ONE transaction
-    fenced by the lease ``token``, refused unless :func:`_verdict` holds inside it, on the question re-read there and,
-    given ``authority_source`` (a callable returning a snapshot, or None for none), on a snapshot taken there; else on
-    ``authority``. Returns ``(item, reply_id)``. ``questions.db`` is never written: the question stays open for the
-    operator. The re-reads narrow the window, they do not close it (the module's known edges)."""
-    from levain.coordinator.review import _insert
+class _HeadMoved(Exception):
+    """The authority log's head moved between the snapshot and the lock: abandon the transaction, replay outside it."""
 
+
+_HEAD_TRIES = 3
+
+
+def answer(store: Any, ref: Any, *, option: str | None = None, text: str | None = None, token: object,
+           authority: Any = None, authority_source: Callable[[], Any] | None = None,
+           authority_head: Callable[[], tuple[int, str] | None] | None = None) -> tuple[Any, str]:
+    """The coordinator's own answer to question ``ref``: a KNOW (reply + review item + first read) in ONE transaction
+    fenced by the lease ``token``, refused unless :func:`_verdict` holds inside it, on the question re-read there.
+
+    The authority: ``authority`` (a snapshot the caller took), or ``authority_source`` (a callable returning a verified
+    snapshot, or None for none) called just BEFORE the transaction, never inside it. With ``authority_head`` too (a
+    callable returning the log's stored ``(seq, hash)``, no replay), the head is compared inside the transaction; one
+    that moved, or cannot be read, rolls the transaction back and the source is called again outside it, at most
+    ``_HEAD_TRIES`` times, then the answer is refused. Returns ``(item, reply_id)``. ``questions.db`` is never written:
+    the question stays open for the operator. The re-reads narrow the window, they do not close it (the module's known
+    edges)."""
     if authority is not None and authority_source is not None:
         raise CoordError("give an authority snapshot or its source, not both")
+    if authority_head is not None and authority_source is None:
+        raise CoordError("a head check compares a snapshot its source took: give the source too")
+    for _try in range(_HEAD_TRIES):
+        snap = authority_source() if authority_source is not None else authority
+        try:
+            return _answer_once(store, ref, option, text, token, snap,
+                                authority_head if snap is not None else None)
+        except _HeadMoved:
+            continue
+    raise CoordError(f"the authority log kept moving while the coordinator answered ({_HEAD_TRIES} tries); nothing "
+                     "was filed, answer again")
+
+
+def _answer_once(store: Any, ref: Any, option: str | None, text: str | None, token: object, authority: Any,
+                 authority_head: Callable[[], tuple[int, str] | None] | None) -> tuple[Any, str]:
+    from levain.coordinator.review import _insert
+
     if (option is None) == (text is None):
         raise CoordError("the coordinator answers with exactly one of an option key or its own words")
     q = _questions(store.directory).get(ref)
@@ -223,13 +257,19 @@ def answer(store: Any, ref: Any, *, option: str | None = None, text: str | None 
         done = _read(conn, q.id)
         if done is not None:
             raise CoordError(f"question #{q.n} was already read first ({done[0]})")
-        # read again, inside the fenced transaction: the question (its answer and consent link) and the authority log
+        # read again, inside the fenced transaction: the question (its answer and consent link)
         fresh = _questions(store.directory).get(q.id)
         if fresh is None:
             raise CoordError(f"no question {q.id[:40]}")
         q = fresh
-        if authority_source is not None:
-            authority = authority_source()
+        if authority_head is not None:
+            # the head only (no replay, no signature): the snapshot was verified before this lock was taken
+            try:
+                head = authority_head()
+            except (sqlite3.Error, OSError):
+                head = None
+            if head != (authority.seq, authority.head_hash):
+                raise _HeadMoved
         got = _verdict(store, conn, now, q, authority)
         if not got.may_answer:
             raise CoordError(f"escalate question #{q.n}: {got.why}")
@@ -252,7 +292,8 @@ def answer(store: Any, ref: Any, *, option: str | None = None, text: str | None 
 
 def escalate(store: Any, ref: Any, why: str, *, token: object) -> str:
     """Leave question ``ref`` to the operator: an ANSWER record pointing at it (the grammar's push, C0 §3.3), and its
-    first read, in one fenced transaction. Returns the reply id. The question is not touched."""
+    first read, in one fenced transaction, refused when the question (re-read inside it) is answered already. Returns
+    the reply id. The question is not touched."""
     from levain.coordinator import lease
 
     _text("why", why, _WHY_MAX)
@@ -263,6 +304,12 @@ def escalate(store: Any, ref: Any, why: str, *, token: object) -> str:
         done = _read(conn, q.id)
         if done is not None:
             raise CoordError(f"question #{q.n} was already read first ({done[0]})")
+        # read again inside the fenced transaction: an answer the operator gave since needs no escalation
+        fresh = _questions(store.directory).get(q.id)
+        if fresh is None:
+            raise CoordError(f"no question {q.id[:40]}")
+        if fresh.answer is not None:
+            raise CoordError(f"question #{q.n} was answered by the operator; there is nothing to escalate")
         ln = lease.by_harness_session(conn, q.agent_session_id)
         thread_id = ln.threads[0] if ln is not None and len(ln.threads) == 1 else None
         same = conn.execute("SELECT reply_id FROM replies WHERE kind = 'answer' AND ref_store = 'questions.db' AND "
