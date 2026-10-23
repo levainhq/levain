@@ -270,17 +270,20 @@ def read_evidence(directory: Path | str | None = None, *, now: datetime, exclude
 
 def read_grant_evidence(directory: Path | str | None, grants: "list[tuple[str, int, str]]", *, recent: int = 5
                         ) -> dict[str, dict[str, Any]]:
-    """What each standing grant answered: ``{grant id: {"count", "last_at", "recent"}}`` for ``grants``, each
-    ``(id, seq, hash)`` of the link that created or last changed it. An answer counts for a grant only when its
+    """What each standing grant answered: ``{grant id: {"count", "last_at", "recent", "refused_count"}}`` for
+    ``grants``, each ``(id, seq, hash)`` of the link that created or last changed it. An answer counts for a grant only when its
     stored answer names all three (``grant_id``, ``grant_seq``, ``grant_hash``), so a grant revoked and made again
     under the same id starts with nothing. Read from the requests the queue allowed by a grant (``via = 'grant'``),
     over the queue's whole history. ``recent`` holds the newest ``recent`` of them, each ``{"request_id", "at",
     "tool", "cwd", "outcome"}``; ``outcome`` is the authority ledger's word for whether that call then ran
-    (``accepted``, ``refused``, ``unknown`` when the ledger holds no row for it). A grant that answered nothing is
-    absent. Same read-only rules as :func:`read_listing`, the ledger's too
+    (``accepted``, ``refused``, ``unknown`` when the ledger holds no row for it). ``refused_count`` is how many of
+    ALL its calls (not only the newest ``recent``) the ledger reads as refused, so a refusal older than those still
+    counts; a ledger that cannot be read now counts none (as ``recent`` then reads ``unknown``). A grant that
+    answered nothing is absent. Same read-only rules as :func:`read_listing`, the ledger's too
     (:func:`levain.consent.ledger.request_outcomes`); no queue (or no ledger) creates none. ``tool`` and ``cwd`` are
     the agent's text, as stored: the caller shows them through ``visible``."""
     out: dict[str, dict[str, Any]] = {}
+    every: dict[str, list[str]] = {}
     wanted_grants = sorted(set(grants))
     conn = _open_ro(directory) if wanted_grants else None
     if conn is None:
@@ -298,21 +301,24 @@ def read_grant_evidence(directory: Path | str | None, grants: "list[tuple[str, i
             calls = conn.execute(
                 f"SELECT id, decided_at, tool_name, cwd FROM requests WHERE {match} "
                 "ORDER BY decided_at DESC, rowid DESC LIMIT ?", (gid, seq, link_hash, max(recent, 0))).fetchall()
+            # every request this instance answered, in the same read: the refusals are counted over all of them
+            every[gid] = [r[0] for r in conn.execute(f"SELECT id FROM requests WHERE {match}", (gid, seq, link_hash))]
             out[gid] = {"count": int(n), "last_at": last or "",
                         "recent": [{"request_id": rid, "at": at, "tool": tool, "cwd": cwd, "outcome": "unknown"}
-                                   for rid, at, tool, cwd in calls]}
+                                   for rid, at, tool, cwd in calls], "refused_count": 0}
         conn.execute("COMMIT")
     finally:
         conn.close()
-    wanted = [c["request_id"] for g in out.values() for c in g["recent"]]
+    wanted = [rid for ids in every.values() for rid in ids]
     if wanted:
         from levain.consent.ledger import request_outcomes
         from levain.consent.queue import default_queue_dir
 
         outcomes = request_outcomes(Path(directory) if directory is not None else default_queue_dir(), wanted)
-        for g in out.values():
+        for gid, g in out.items():
             for c in g["recent"]:
                 c["outcome"] = outcomes.get(c["request_id"], "unknown")
+            g["refused_count"] = sum(1 for rid in every[gid] if outcomes.get(rid) == "refused")
     return out
 
 
