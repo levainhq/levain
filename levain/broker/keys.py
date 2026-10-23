@@ -1498,25 +1498,27 @@ class Keys:
             if not await self._against_front(ff, side, up, work()):
                 return   # the front aborted, or the exchange was cut short: `_serve_q`'s `end()` resolves the hold
             assert reader is not None   # a completed relay made one
-            self._settle(conn.reg.session, meter[1], hold, reader)
+            self._settle(conn.reg, meter[1], hold, reader)
         finally:
             rec["redactions"] = scanner.count
 
-    def _settle(self, session: str, price: Price, hold: ledger.Hold, reader: codec.UsageReader) -> None:
+    def _settle(self, reg: Registration, price: Price, hold: ledger.Hold, reader: codec.UsageReader) -> None:
         """A completed relay's resolution (R4 §1.2, §1.4): its reported usage priced by class, settled in full (the
         ledger books what passes the hold as `overrun`); with none, `uncertain` charged its hold, the reason the
         reader's (`usage-over-cap` when a cap stopped it, else `no-usage`). A cost above the hold stops the session: it
         enters `budget_stopped`, which `_check_q` and `_admit_hold` read, so every later `Q` of the session is
-        `budget-overrun` until DROP-SESSION. Nothing in flight is touched: each other exchange settles from its own
-        usage."""
+        `budget-overrun` until DROP-SESSION. It enters only while `reg`, the registration the exchange started on, is
+        still the session's (a dropped or replaced one stops no later registration of the id), and BEFORE the ledger's
+        settle, so a settle that raises still leaves the session stopped. Nothing in flight is touched: each other
+        exchange settles from its own usage."""
         usage = reader.result()
         if usage is None:
             hold.uncertain(reader.reason)
             return
         cost = codec.price_usage(usage, price)
+        if cost > hold.amount and self.by_session.get(reg.session) is reg:
+            self.budget_stopped.add(reg.session)
         hold.settle(cost, usage.meta())
-        if cost > hold.amount:
-            self.budget_stopped.add(session)
 
     async def _open_upstream(self, conn: Conn, ff: "FrontFrames", side: KeysSide, pol: RoutePolicy,
                              rec: dict) -> Optional[Upstream]:

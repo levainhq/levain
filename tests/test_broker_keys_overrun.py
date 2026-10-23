@@ -324,3 +324,76 @@ def test_drop_session_after_the_fail_closed_clear_still_clears_budget_stopped(mo
     assert [t for t, _ in out["second"]][:2] == [b"A", b"R"] and out["second"][-1][0] == b"e", out["second"]
     assert [(o["kind"], o["overrun"]) for o in out["res"]] == [("settled", OVER_COST - HOLD), ("settled", 0)]
     assert out["res"][1]["settled"] == UNDER_COST and out["after"] == set()
+
+
+class _Hold:
+    """A stand-in hold for `_settle`: its amount, and a `settle` that records or raises."""
+
+    def __init__(self, amount: int, fail: "Exception | None" = None) -> None:
+        self.amount, self.fail, self.settled = amount, fail, None
+
+    def settle(self, cost: int, meta: dict) -> None:
+        if self.fail is not None:
+            raise self.fail
+        self.settled = cost
+
+    def uncertain(self, reason: str) -> None:
+        raise AssertionError("not reached: the reader reports usage")
+
+
+class _Reader:
+    reason = "no-usage"
+
+    def result(self):
+        from levain.broker import codec
+        return codec.Usage(in_=OVER["input_tokens"], out=OVER["output_tokens"], cache_write=0, cache_read=0)
+
+
+def test_an_in_flight_settle_stops_only_the_registration_it_started_on(monkeypatch):
+    # L3 r2 complement LOW 2: an exchange admitted under a registration that has since left (DROP-SESSION, or a
+    # re-registration of the session's front) settles over its hold: charged in full, but the session id does not enter
+    # `budget_stopped`, so a later registration of the same id does not start stopped. Under the registration it
+    # started on, the same settle stops the session.
+    from levain.broker.policy import parse_price
+    from tests.test_broker_keys_upstream import PRICE
+    price = parse_price("m1", PRICE)
+
+    async def go(d: str) -> dict:
+        async with _Sessions(d, 1) as s:
+            out = {}
+            reg = s.k.by_session["s0"]
+            await s.k.drop_session(s.k.admin_epoch, "s0")
+            h = _Hold(HOLD)
+            s.k._settle(reg, price, h, _Reader())
+            out["dropped"] = (set(s.k.budget_stopped), h.settled)
+            await _reregister(s, 2)
+            h = _Hold(HOLD)
+            s.k._settle(reg, price, h, _Reader())                 # the old registration, the session re-registered
+            out["replaced"] = (set(s.k.budget_stopped), h.settled)
+            h = _Hold(HOLD)
+            s.k._settle(s.k.by_session["s0"], price, h, _Reader())   # the registration it started on
+            out["current"] = (set(s.k.budget_stopped), h.settled)
+        return out
+
+    out = _run(go)
+    assert out["dropped"] == (set(), OVER_COST)
+    assert out["replaced"] == (set(), OVER_COST)
+    assert out["current"] == ({"s0"}, OVER_COST)
+
+
+def test_a_settle_that_raises_still_stops_the_session(monkeypatch):
+    # L3 r2 complement LOW 3: a cost above the hold enters `budget_stopped` BEFORE `hold.settle`, so a settle that
+    # raises (an unhealthy ledger) still leaves the session stopped.
+    from levain.broker import ledger
+    from levain.broker.policy import parse_price
+    from tests.test_broker_keys_upstream import PRICE
+    price = parse_price("m1", PRICE)
+
+    async def go(d: str) -> dict:
+        async with _Sessions(d, 1) as s:
+            h = _Hold(HOLD, ledger.LedgerUnavailable("unhealthy"))
+            with pytest.raises(ledger.LedgerUnavailable):
+                s.k._settle(s.k.by_session["s0"], price, h, _Reader())
+            return {"stopped": set(s.k.budget_stopped)}
+
+    assert _run(go)["stopped"] == {"s0"}
