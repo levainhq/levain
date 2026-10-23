@@ -56,6 +56,7 @@ def test_every_verb_parses_for_the_operator():
         "prepare": ["prepare", "egress", "interactive", "claude", "brokered", "7"],
         "render": ["render", S], "start": ["start", S], "resume": ["resume", S], "teardown": ["teardown", S],
         "confirm-identity": ["confirm-identity", S, "yes"], "adopt-open": ["adopt-open", S],
+        "adopt-verify": ["adopt-verify", S, "--bundle-digest", "sha256:" + "0" * 64],
         "discard": ["discard", S], "restore": ["restore", S], "status": ["status", S],
     }
     assert set(good) == set(rg.VERBS)
@@ -80,6 +81,8 @@ def argv_for(verb):
         return argv(["prepare", "egress", "interactive", "claude", "brokered"])
     if verb == "confirm-identity":
         return argv([verb, S, "yes"])
+    if verb == "adopt-verify":
+        return argv([verb, S, "--bundle-digest", "sha256:" + "0" * 64])
     return argv([verb, S])
 
 

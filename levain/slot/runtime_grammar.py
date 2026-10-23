@@ -36,15 +36,18 @@ from levain.slot.grammar import INDEX_SPACE, SESSION_RE, SLOT_CLASSES
 # --- §5.1 verbs and enums -------------------------------------------------------------------------
 
 VERBS = ("prepare", "render", "start", "resume", "teardown", "confirm-identity",
-         "adopt-open", "discard", "restore", "status")
+         "adopt-open", "adopt-verify", "discard", "restore", "status")
 
 KINDS = ("interactive", "login", "dispatch", "planner", "verifier")   # §5.1 prepare
 VENDORS = ("claude", "codex")                                          # §5.1 prepare, §5.3 vendor
 AUTHS = ("brokered", "passthrough", "none")                            # §5.1 prepare
 CONFIRM_ANSWERS = ("yes", "no")                                        # §5.1 confirm-identity
+#: §5.1 adopt-verify: ``--bundle-digest sha256:<64 lowercase hex>``, the digest adopt-open's answer gave.
+BUNDLE_DIGEST_FLAG = "--bundle-digest"
+_BUNDLE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}", re.ASCII)
 
 #: §5.1 Lease column: these verbs run on a live lease (prepare's is the stdin nonce); the rest are
-#: lease-free (adopt-open, discard, restore are caller-bound; status is read-only).
+#: lease-free (adopt-open, adopt-verify, discard, restore are caller-bound; status is read-only).
 LEASE_VERBS = frozenset({"prepare", "render", "start", "resume", "teardown", "confirm-identity"})
 
 #: §5.1 verbs that read a stdin blob; every other verb takes none ("—").
@@ -53,7 +56,9 @@ STDIN_VERBS = frozenset({"prepare", "render"})
 OPERATOR, DISPATCH = "operator", "dispatch"
 CALLERS = (OPERATOR, DISPATCH)
 
-#: §5.1 the ``_levain_dispatch`` rule: every verb except these four.
+#: §5.1 the ``_levain_dispatch`` rule: every verb except these four. ``adopt-verify`` is NOT excepted (c7.10 fix1
+#: F2, head 1022+20 Q1): dispatch's consumer verifies a dispatch-class session's artifact; the verb layer splits the
+#: caller check by class (``runtime_helper.verify_caller``).
 DISPATCH_FORBIDDEN = frozenset({"adopt-open", "discard", "restore", "confirm-identity"})
 
 #: DECISION (narrowest reading of §3.1 + §3.5): the operator's leases carry no ticket, so the operator
@@ -100,7 +105,9 @@ _DISPLAY_CATEGORIES = frozenset({"Lu", "Ll", "Lt", "Lm", "Lo", "Mn", "Mc", "Me",
 _BIDI_CONTROLS = frozenset("‪‫‬‭‮⁦⁧⁨⁩")
 
 #: Output refusal names: the name is ours, never input bytes (attacker data rides ``detail`` only).
-_NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*(?::[a-z0-9]+(?:-[a-z0-9]+)*)?", re.ASCII)
+#: The qualifier (after ``:``) may also carry ASCII uppercase and ``.``, so ``fsck:<id>`` (git's camelCase ids,
+#: from the closed list) and ``git-below-floor:<version>`` ride verbatim (5d-i S2); the base stays lowercase.
+_NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*(?::[A-Za-z0-9]+(?:[-.][A-Za-z0-9]+)*)?", re.ASCII)
 
 
 # --- typed results ---------------------------------------------------------------------------------
@@ -116,6 +123,7 @@ class RuntimeRequest:
     auth: str | None = None
     slot: int | None = None
     answer: str | None = None      # confirm-identity yes|no
+    bundle_digest: str | None = None   # adopt-verify ``sha256:<hex>``
 
     @property
     def needs_lease(self) -> bool:
@@ -260,6 +268,13 @@ def parse_runtime_argv(argv: Sequence[str], *, configured_slots: SlotConfig, cal
         _arity(verb, rest, 2, 2)
         return RuntimeRequest(verb, caller, session=_session(rest[0]),
                               answer=_enum(rest[1], "answer", CONFIRM_ANSWERS))
+    if verb == "adopt-verify":   # exactly <session> --bundle-digest sha256:<hex>, in that order
+        _arity(verb, rest, 3, 3)
+        session = _session(rest[0])
+        _enum(rest[1], "flag", (BUNDLE_DIGEST_FLAG,))
+        if not _BUNDLE_DIGEST_RE.fullmatch(rest[2]):
+            raise Refused("bad-token", f"bundle digest: {rest[2][:80]!r}")
+        return RuntimeRequest(verb, caller, session=session, bundle_digest=rest[2])
     # render, start, resume, teardown, adopt-open, discard, restore: exactly <session>.
     # DECISION: §5.1's "`discard` / `restore <session>`" row reads as both taking <session>.
     _arity(verb, rest, 1, 1)
@@ -510,7 +525,7 @@ def ok_line(fields: Mapping[str, object]) -> str:
 def refusal_line(refused: Refused) -> str:
     """``{"ok":false,"refused":"<name>"}`` as one canonical JSON line. Only the NAME leaves (the detail
     can carry input bytes; it is for the human's stderr). A name that is not a plain lowercase
-    identifier (an optional ``:qualifier``, as ``no-baseline:<slot>``) becomes ``internal``, so no input byte ever reaches stdout."""
+    identifier (an optional ``:qualifier``, as ``no-baseline:<slot>``, ``fsck:hasDotgit``) becomes ``internal``, so no input byte ever reaches stdout."""
     name = refused.name if isinstance(refused, Refused) and isinstance(refused.name, str) else ""
     if not _NAME_RE.fullmatch(name) or len(name) > 64:
         name = "internal"

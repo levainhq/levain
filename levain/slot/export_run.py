@@ -47,6 +47,7 @@ from typing import Callable, Mapping, Optional, Sequence, Tuple
 from levain.contracts import ContractError, canon
 from levain.slot import Refused, write_all
 from levain.slot import bundlefmt as BF
+from levain.slot import fsck_ids as FI
 #: The importer's cap on its one line, the newline included: ONE constant, the writer's.
 from levain.slot.importer import RESULT_CAP
 from levain.slot.proc import V12K_SECONDS
@@ -107,7 +108,8 @@ def rename2(fd1: int, name1: str, fd2: int, name2: str, flag: int) -> None:
 class Role:
     """The names one sealed run answers with (CONTRACT_EDITS E20): the importer's under adopt-open, the verifier's
     under adopt-verify. ``missing`` is the reason a line that is valid but incomplete gets (the importer's terminal
-    frame, the verifier's outputs)."""
+    frame, the verifier's outputs). ``verbatim``: the role's own verdict names, answered AS THEY ARE (head ruling
+    1022+20 Q1); empty for the importer, whose refusals ride as ``importer-failed:<base>`` (A1b)."""
 
     failed: str
     memory: str
@@ -115,12 +117,23 @@ class Role:
     work_cap: str
     missing: str
     staged_help: str
+    verbatim: frozenset = frozenset()
 
 
 IMPORTER = Role("importer-failed", "adopt-cap:memory", "adopt-space-exhausted", "adopt-work-cap", "terminal-missing",
                 "L/export/<class>/<s>.new")
+#: The verifier's §6.1 verdict names (head ruling 1022+20 Q1, from 5d-i S1's Q1): every name
+#: ``adopt_verify.quarantine_verify`` raises (derive: ``grep -on 'Refused([^,]*' levain/slot/adopt_verify.py``, plus
+#: ``bundlefmt.MISMATCH`` from its header reads), ``fsck:<id>`` over :func:`fsck_ids.closed_ids` and ``fsck:other``.
+#: A refusal on the verifier's line outside this set is ``verifier-failed:result-malformed``: the set is closed.
+VERIFIER_NAMES = frozenset({
+    "base-bundle-mismatch", "base-mismatch", BF.MISMATCH, "bundle-extra-objects", "bundle-special-unsent",
+    "bundle-thin", "bundle-tip-in-base", "bundle-tip-not-commit", "export-result-mismatch", "fsck:other",
+    "preview-cap:commits", "preview-graph-unresolved"}) | frozenset(f"fsck:{i}" for i in FI.closed_ids())
 VERIFIER = Role("verifier-failed", "preview-cap:memory", "preview-space-exhausted", "preview-space-exhausted",
-                "output-missing", "<s>/verify.new")
+                "output-missing", "<s>/verify.new", VERIFIER_NAMES)
+#: The verifier's three outputs, in publish order (``verify_run.OUTPUTS``: the writer's names, one tuple).
+VERIFIER_OUTPUTS = ("verified.json", "q.idx", "preview.txt")
 
 # --- the result line --------------------------------------------------------------------------------------------
 
@@ -276,7 +289,8 @@ def classify(obs: RunObservation, role: Role = IMPORTER,
     ``role.work_cap`` only on a plain non-zero exit with a valid line carrying ``enospc: true``; (4)
     ``role.failed:<reason>``, reason ``signal``/``time`` > ``result-oversize`` > ``result-malformed`` >
     ``role.missing`` > the importer's refusal (its base, :func:`wire_reason`; the whole refusal in the detail, A1b)
-    > ``exit``."""
+    > ``exit``. A role with a ``verbatim`` set (the verifier) answers a listed refusal as ITSELF in that slot, and
+    one off the set as ``result-malformed`` (head ruling 1022+20 Q1)."""
     if obs.memory_unreadable:
         return Outcome(False, "export-image-unavailable", "the run leaf's memory.events.local could not be read", None)
     if obs.memory_killed:
@@ -308,6 +322,10 @@ def classify(obs: RunObservation, role: Role = IMPORTER,
         reason, detail = bad.reason, bad.detail
     elif line is not None and not line.terminal:
         reason, detail = role.missing, line.refused or ""
+    elif line is not None and line.refused and role.verbatim:
+        if line.refused in role.verbatim:
+            return Outcome(False, line.refused, "", line)      # Q1: the verifier's verdict, verbatim
+        reason, detail = "result-malformed", f"a refusal off the verifier's closed set: {line.refused[:200]}"
     elif line is not None and line.refused:
         reason, detail = wire_reason(role.failed, line.refused), line.refused     # A1b
     else:
@@ -677,18 +695,29 @@ def publish_if_success(outcome: Outcome, work_dfd: int, class_dfd: int, session:
     ``result`` derived from the copied header (prerequisites = ``delta``, none = ``unrelated``; root never
     evaluates ancestry) or ``adopt-nothing-new``.
 
-    Only the IMPORTER's outputs are published here: a verifier's SUCCESS refuses ``verifier-failed:publish`` /
-    ``verifier-unbuilt`` (a programming error) until 5d-i builds its own output set and transaction (L3 5c-ii-b r1
-    B-5); its DENIALS still answer with its own names. The output fds (files inside the image) are closed before
-    ``before_commit``, the detach, so DESIGN step 11's detach-then-commit order holds on Linux too, where an
-    ``umount`` with an open file is EBUSY (D2)."""
+    The VERIFIER (5d-i S2, DESIGN §6.0): ``class_dfd`` is ``<class>/<s>/`` and ``session`` is ``verify``, so the same
+    transaction stages ``verify.new`` and commits ``verify`` (the exchange over an older one); its outputs are
+    :data:`VERIFIER_OUTPUTS`, all required (one absent = ``verifier-failed:output-missing``), no header check; the
+    result is the line's. The output fds (files inside the image) are closed before ``before_commit``, the detach, so
+    DESIGN step 11's detach-then-commit order holds on Linux too, where an ``umount`` with an open file is EBUSY
+    (D2)."""
     if not outcome.success or outcome.line is None:
         raise Refused(outcome.name or f"{role.failed}:exit", outcome.detail)
-    if role != IMPORTER:
-        raise _publish_refusal(role, "verifier-unbuilt")
-    nothing_new = outcome.line.result == "adopt-nothing-new"
-    names = ("report.json",) if nothing_new else ("bundle", "report.json")
-    fds = check_outputs(work_dfd, names, ("bundle",) if nothing_new else (), owner_uid=owner_uid, caps=caps)
+    verifier = role is VERIFIER
+    if role is not IMPORTER and not verifier:
+        raise _publish_refusal(role, "role-unknown")
+    nothing_new = not verifier and outcome.line.result == "adopt-nothing-new"
+    if verifier:
+        names: Tuple[str, ...] = VERIFIER_OUTPUTS
+        try:
+            fds = check_outputs(work_dfd, names, (), owner_uid=owner_uid, caps=caps)
+        except Refused as e:
+            if e.name == "export-result-mismatch":      # check_outputs' "absent" name; the verifier's is its own
+                raise Refused(f"{role.failed}:{role.missing}", e.detail) from None
+            raise
+    else:
+        names = ("report.json",) if nothing_new else ("bundle", "report.json")
+        fds = check_outputs(work_dfd, names, ("bundle",) if nothing_new else (), owner_uid=owner_uid, caps=caps)
 
     def close_outputs() -> None:
         while fds:
@@ -701,9 +730,12 @@ def publish_if_success(outcome: Outcome, work_dfd: int, class_dfd: int, session:
 
     try:
         pub = transact(class_dfd, session, [(n, fds[n]) for n in names], role, seams, gid=gid,
-                       bundle_check=importer_bundle_check(session, object_format), before_commit=close_then_detach)
+                       bundle_check=None if verifier else importer_bundle_check(session, object_format),
+                       before_commit=close_then_detach)
     finally:
         close_outputs()
+    if verifier:
+        return str(outcome.line.result), pub
     if nothing_new:
         return "adopt-nothing-new", pub
     assert pub.header is not None

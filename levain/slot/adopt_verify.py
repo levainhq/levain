@@ -89,9 +89,15 @@ def read_header(path: Path) -> bundlefmt.BundleHeader:
     """The bundle's header by the shared grammar, from at most :data:`bundlefmt.HEADER_MAX` bytes."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
-        head = os.read(fd, bundlefmt.HEADER_MAX)
+        return read_header_at(fd)
     finally:
         os.close(fd)
+
+
+def read_header_at(fd: int) -> bundlefmt.BundleHeader:
+    """:func:`read_header` on an open fd, by ``pread`` from offset 0 (root's copy-in reads the published bundle and
+    the base bundle through the fds it checked, 5d-i S2)."""
+    head = os.pread(fd, bundlefmt.HEADER_MAX, 0)
     end = head.find(b"\n\n")
     if end < 0:
         raise Refused(bundlefmt.MISMATCH, "no blank line within the header cap")
@@ -102,10 +108,14 @@ def pack_count(path: Path, offset: int, size: int) -> int:
     """The 12-byte pack header's object count; a count the region could not hold = ``bundle-header-mismatch``."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
-        os.lseek(fd, offset, os.SEEK_SET)
-        h = os.read(fd, 12)
+        return pack_count_at(fd, offset, size)
     finally:
         os.close(fd)
+
+
+def pack_count_at(fd: int, offset: int, size: int) -> int:
+    """:func:`pack_count` on an open fd, by ``pread`` (root's copy-in, 5d-i S2)."""
+    h = os.pread(fd, 12, offset)
     if len(h) != 12 or h[:4] != _PACK_SIG or int.from_bytes(h[4:8], "big") not in (2, 3):
         raise Refused(bundlefmt.MISMATCH, "the pack region does not start with a v2/v3 pack header")
     n = int.from_bytes(h[8:12], "big")
@@ -197,8 +207,8 @@ def _oid_lines(path: Path, hexlen: int, what: str) -> Iterator[str]:
 
 
 def _commit_gate(q: importer.GitRunner, scratch: Path) -> int:
-    """2a's gate: Cq, the commits in Q, from Q's inventory (types only, no content read); above V30's 10,000 =
-    ``preview-cap:commits`` before any commit is read."""
+    """2a's gate: Cq, the commits in Q, from Q's inventory (types only, no content read); above V30's
+    :data:`MAX_COMMITS` = ``preview-cap:commits`` before any commit is read."""
     inv = scratch / "q-types"
     _to_file(q, inv, "cat-file", "--batch-all-objects", "--batch-check=%(objecttype)")
     with importer._read_own(inv) as fh:
@@ -399,4 +409,4 @@ def parse_verifier_line(raw: Optional[bytes]) -> export_run.Line:
 
 
 __all__ = ["GIT_C", "MAX_COMMITS", "PREVIEW_HEADER", "TREE_READER", "VERIFY_LINE_KEYS", "Verified",
-           "pack_count", "parse_verifier_line", "quarantine_verify", "read_header"]
+           "pack_count", "pack_count_at", "parse_verifier_line", "quarantine_verify", "read_header", "read_header_at"]
