@@ -3,14 +3,9 @@ URL it was read from (`source`) and, beside it, the highest-rate choice in one l
 or service mode set each rate). Review of this file is the one control on its accuracy (R4 §6). A model with no entry
 here is refused `model-not-allowed`.
 
-How the model list is derived (run it at every edit; the table holds exactly the models it prints):
-
-    git grep -nE '"(requested|model)": *"[^"]+"' -- levain/slot levain/broker levain/install*.py
-
-At 3c-2a session i (base 66115cde) it prints nothing: the shipped base map is `{"routes": []}`
-(`layout.base_routes_steps`) and no vendor brokered route exists yet (the install helper's `routes-base` verb that
-merges them is 3c-9's). The model list is therefore the head's ruling (1023+8 "3c-2a-i RETURNED"): Claude Opus 5.5,
-Sonnet 5.5, Haiku 5.5 and OpenRouter z-ai/glm-5.2. A model with no entry is refused.
+The model list is the head's ruling (1023+8 "3c-2a-i RETURNED"): Claude Opus 5.5, Sonnet 5.5, Haiku 5.5 and
+OpenRouter z-ai/glm-5.2. The shipped base map names no model itself (`{"routes": []}`, `layout.base_routes_steps`);
+the install helper's `routes-base` verb that merges the vendor routes is 3c-9's. A model with no entry is refused.
 
 READ 2026-10-23 (EDT, before 11:30) from the pages named in each `source`, plus:
   https://platform.claude.com/docs/en/about-claude/models/overview  (API ids, max output 128K)
@@ -70,11 +65,11 @@ VENDOR: Dict[str, dict] = {
     },
     # OpenRouter lists one price per upstream provider. Highest per class over the 33 endpoint rows read on 10-23:
     # in alibaba/fast $2.31, out wafer, cloudflare and decart $8, cache read decart $0.48. No row lists a cache write
-    # price, so cache_write is 0 (the estimate takes max(in, cache_write), so the input term is unaffected).
+    # price, so cache_write = in x 1.25. [judged by 1023+8 head, 10-23: no OpenRouter provider row lists a cache-write price; 0 would SETTLE reported cache-write tokens at $0; 1.25x in is the common premium, as insurance]
     "z-ai/glm-5.2": {
         "choice": "max over every provider endpoint row: in 2.31 (alibaba/fast), out 8.00 (wafer, cloudflare, decart), read 0.48 (decart)",
         "price": {
-            "in": 2_310_000, "out": 8_000_000, "cache_write": 0, "cache_read": 480_000,
+            "in": 2_310_000, "out": 8_000_000, "cache_write": 2_887_500, "cache_read": 480_000,
             "default_output": 32_768,    # [judged by 1023+8 head, 10-23: the written-in ceiling; 943,718 is a context-sized figure that would estimate ~$7.55/call; a lower written-in ceiling is forwarded, so it cannot under-reserve]
             "overhead_tokens": 0,        # no documented tool-prompt overhead on OpenRouter
             "image_tokens": 4_784,       # [judged by 1023+8 head, 10-23: text-only model; conservative so an image block can never under-reserve]
