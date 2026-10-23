@@ -9,6 +9,7 @@ verifies with the real ``ssh-keygen``."""
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -230,3 +231,75 @@ def test_the_page_revokes_a_grant_through_a_real_phone_port_and_the_log_takes_it
     assert "cg-0000000000bb" not in snap.policy.grants and "cg-0000000000aa" in snap.policy.grants
     assert snap.seq == line["seq"]
     assert [g.id for g in grant_listing(world.root, now=_now())[0]] == ["cg-0000000000aa"]
+
+
+@needs_node
+def test_no_passkey_ceremony_on_the_page_forgets_its_passkey_on_a_refusal():
+    """1022+19 Q2: the M-8 "don't forget" rule holds on every navigator.credentials.get ceremony, through one helper.
+    Reproduced red on the merge 182e43f6: the consent answer, the late ruling, the sign request, the dispatch contract
+    and the question's push each emptied this browser's mapping on NotAllowedError. (The revoke is cancelKeep above;
+    the cockpit write's signPending is pinned in test_cockpit_k8a_phone_authority.)"""
+    got = _drive("scripted")["keepAll"]
+    assert set(got) == {"consent", "ruling", "sign", "dispatch", "question"}, got
+    for name, r in got.items():
+        assert r["tapped"] and r["webauthn"] == 1, (name, r)
+        assert r["mapping"] == {"SHA256:phonekeyphonekeyphonekeyphonekeyphonekey0": "cmF3aWQ"}, (name, r)
+        assert any(t.startswith("the passkey did not sign (NotAllowedError); ") for t in r["said"]), (name, r)
+    # one rule, one home: no ceremony keeps its own copy of the forget, and every get() refusal is said through it
+    src = PHONE_JS.read_text()
+    assert not re.search(r"\bforget\s*[(=]", src), "a forget is back"
+    assert src.count("navigator.credentials.get(") == src.count("declined(e, "), "a ceremony bypasses declined()"
+
+
+# an open K8 review (window.levainSign) on the real page: GET /cockpit/pending/<id> answers a WAITING pending from the
+# page's own fetch (no cockpit write is filed), the review records what phone.js tells it, and a probe asks whether a
+# second write would be filed now (it is only when the page is not held)
+_OPEN_REVIEW = """(() => {
+  const real = window.fetch.bind(window);
+  const k = window.__k = { reviewed: 0, issued: 0, closed: [], done: [], said: [] };
+  window.fetch = (route, init) => /^\\/cockpit\\/pending\\//.test(String(route))
+    ? Promise.resolve(new Response(JSON.stringify({ state: "WAITING", verb: "spore_update", tier: "C1", challenge: "AAAA",
+                                                    rp_id: location.hostname }),
+                                   { status: 200, headers: { "Content-Type": "application/json" } }))
+    : real(route, init);
+  k.issue = () => { k.issued++; return Promise.resolve({ ok: true, status: 200,
+                                                         body: { state: "WAITING", pending_id: "cp" + "0".repeat(32) } }); };
+  const say = (t, kind) => k.said.push([t, kind || ""]);
+  window.levainSign(["SHA256:onlyone"], say, document.createElement("div"), k.issue,
+                    () => { k.reviewed++; return (why) => k.closed.push(why); }, (a) => k.done.push(a));
+  k.probe = () => { const before = k.issued;
+    window.levainSign(["SHA256:onlyone"], () => {}, document.createElement("div"), k.issue, (_b, _s, d) => d(), () => {});
+    return new Promise((r) => setTimeout(() => r(k.issued > before), 200)); };
+  return 1;
+})()"""
+
+
+@needs_browser
+def test_a_tab_switch_in_the_phone_app_dismisses_an_open_review(world, tmp_path):
+    """L3 r4 (codex MED): the view switch phone_app.js's show(v) makes, reached by a real tab tap in headless Chrome,
+    dismisses an open K8 review through levainViewChanged -> levainDismissReviews. Red with that one call removed from
+    levainViewChanged (m17k8a/wire_red.txt): the page stayed held, the sheet was never told and done never answered."""
+    httpd = make_phone_server(world.qdir, RP, port=0, token=_TOK, dispatch_dir=world.qdir)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        url = f"http://127.0.0.1:{httpd.server_address[1]}/?view=needs#phone_token={_TOK}"
+        out = _page_drive(tmp_path, url, [
+            {"until": "typeof window.levainSign === 'function' && !!document.querySelector('#tabs button[data-view=\"board\"]')"},
+            {"eval": _OPEN_REVIEW},
+            {"until": "window.__k.reviewed === 1"},
+            {"eval": "window.__k.probe()"},
+            {"eval": "document.querySelector('#tabs button[data-view=\"board\"]').click(), 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(JSON.stringify({ closed: window.__k.closed, "
+                     "done: window.__k.done.map(a => a.body && a.body.state), said: window.__k.said.slice(-1) })), 300))"},
+            {"eval": "window.__k.probe()"},
+        ])
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)
+    held_before, told, free_after = out["values"][3], json.loads(out["values"][5]), out["values"][6]
+    assert held_before is False, out["values"]          # the open review holds the page: a second write is not filed
+    assert told["closed"] == ["dismissed"] and told["done"] == ["DISMISSED"], told
+    assert "dismissed" in told["said"][0][0], told
+    assert free_after is True, out["values"]

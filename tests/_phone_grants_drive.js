@@ -389,6 +389,39 @@ async function scripted() {
     out[name] = { mapping: JSON.parse(p.window.localStorage.getItem("levain-passkeys:phone.example") || "{}"),
                   posts: p.log.posts.map((x) => x[0]), notes: notesOf(p.card(DEMOTE.id)) };
   }
+  // 1022+19 Q2: the same "don't forget" rule on every other passkey ceremony on the page: a consent answer, a late
+  // ruling, a sign request, a dispatch contract and a question's push. Each refuses with NotAllowedError, and this
+  // browser's record of its passkey is kept
+  {
+    const CARD = (id) => ({ id, tool: "Write", tier: "T1", agent: "claude_code", display: "write a.txt", signers: [FP] });
+    const asks = [
+      ["consent", { pending: [CARD("c-answer")] }, /^allow with passkey/],
+      ["ruling", { undecided: [Object.assign(CARD("c-rule"), { gap: 1, gap_label: "#1" })] }, /^rule allow with passkey/],
+      ["sign", { sign_pending: [{ id: "s-sign", title: "a statement", namespace: "levain-sign", message: "sign me",
+                                  sha256: "h", signers: [FP] }] }, /^sign with Face ID/],
+      ["dispatch", { dispatch_pending: [{ id: "j-job", state: "filed", can_sign: true, signers: [FP], template: {}, budget: {},
+                                          read: [], write: [], history: [] }] }, /^Sign with passkey/],
+      ["question", { questions: [{ n: 1, id: "q-one", agent: "claude_code", what: "which?", blocks: "the push",
+                                   options: [{ key: "a", label: "A" }],
+                                   link: { option: "a", card: CARD("c-push") } }] }, /allow the push with passkey/],
+    ];
+    const refuse = () => Promise.reject(Object.assign(new Error("cancel"), { name: "NotAllowedError" }));
+    const challenge = (route) => (/challenge$/.test(route)
+      ? ok(200, { challenge: "AAAA", rp_id: "phone.example", payload: "p", line: "l" }) : null);
+    out.keepAll = {};
+    for (const [name, extra, re] of asks) {
+      const shown = listing([], extra);
+      const f = (route, init) => (route === "/consent.json" ? ok(200, shown) : challenge(route) || ok(404, { message: "no route " + route }));
+      const p = page(f, Object.assign({ webauthn: refuse }, base));
+      await tick();
+      const b = p.button(p.byId.requests, re);
+      if (b) b.click();
+      await flush();
+      out.keepAll[name] = { tapped: !!b, webauthn: p.log.webauthn.length,
+                            mapping: JSON.parse(p.window.localStorage.getItem("levain-passkeys:phone.example") || "{}"),
+                            said: p.byId.requests.querySelectorAll("div.note").map((n) => n.textContent).filter(Boolean) };
+    }
+  }
   return out;
 }
 

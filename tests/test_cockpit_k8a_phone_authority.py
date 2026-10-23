@@ -903,3 +903,32 @@ def test_levainsign_review_is_dismissed_when_the_page_hides_or_the_view_changes(
     assert v["has_hook"] is True and v["free_before"] is False, v
     assert v["dismissed_count"] == 1 and v["free_after"] is True and v["listeners_after"] == 0, v
     assert v["dismissed_again"] == 0, v
+
+
+def test_levainsign_tells_the_sheet_and_the_caller_when_a_review_is_dismissed():
+    """L3 r4 (complement MED + LOW): a dismiss the sheet did not make (the page hid, the view changed) is never silent.
+    The sheet's closed() is told, so its Sign is never shown live over a dead review; done() gets a dismissed answer,
+    so an awaiting caller never hangs; and a refused passkey keeps this browser's record of it (1022+19 Q2)."""
+    got = _drive_levainsign()
+    assert got["unhandled"] == [], got["unhandled"]
+    h = got["hidden_review"]
+    assert h["closed"] == ["dismissed"], h
+    assert "dismissed" in h["said_at_hide"][0] and h["said_at_hide"][1] == "bad", h
+    # the stale Sign tap after the hide still signs nothing, and says why
+    assert h["webauthn"] == 0 and h["posts"] == 0 and "dismissed" in h["said"][-1][0], h
+    assert [a["body"].get("state") for a in h["done"]] == ["DISMISSED"] and h["done"][0]["ok"] is False, h
+    v = got["view_change"]
+    assert [a["body"].get("state") for a in v["done"]] == ["DISMISSED"], v
+    # a hide during an in-flight sign whose answer is a 4xx: the sheet is told only once it settles, the 409 is still
+    # said with the dismissal, done gets the 409 and then the dismissal, and a later tap signs nothing
+    f = got["hidden_in_flight_4xx"]
+    assert f["closed_in_flight"] == 0 and f["closed"] == ["dismissed"] and f["free_after"] is True, f
+    assert [a["status"] for a in f["done"]] == [409, 0] and f["done"][1]["body"]["state"] == "DISMISSED", f
+    assert any("stale" in t and "dismissed" in t for t, _k in f["said"]), f
+    assert f["webauthn"] == 1 and f["posts"] == 1, f
+    # a review that ends with the server's terminal answer tells the sheet "answered" and never "dismissed"
+    d = got["dismiss_in_flight"]
+    assert len(d["done"]) == 1 and d["done"][0]["body"]["state"] == "COMMITTED", d
+    r = got["refused_keeps"]
+    assert r["webauthn"] == 1 and r["mapping"] == {"SHA256:a": "cmF3aWQ"}, r
+    assert "did not sign (NotAllowedError)" in r["said"][-1][0], r

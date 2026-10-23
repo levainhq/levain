@@ -33,7 +33,12 @@
   // which enrolled passkey THIS browser made: fingerprint -> credential id, so the OS prompt is asked for that one
   const mapKey = () => "levain-passkeys:" + rpId;
   const mine = () => { try { return JSON.parse(store.get("localStorage", mapKey()) || "{}") || {}; } catch (e) { return {}; } };
-  const forget = (fp) => { const all = mine(); delete all[fp]; store.set("localStorage", mapKey(), JSON.stringify(all)); };
+  // the ONE rule for a passkey prompt that did not sign, said by every navigator.credentials.get ceremony on this
+  // page: a cancelled Face ID and a passkey this phone no longer holds both read NotAllowedError, and this browser
+  // cannot tell them apart, so this browser's record of its passkey is never forgotten on a refusal (M17 L3 r1 M-8,
+  // ruled for every ceremony at 1022+19 Q2). There is no forget: a passkey deleted from the phone stays pinned until
+  // this page's storage is cleared (a known 1.0 edge, 1022+19 Q1). `what` says what did not happen
+  const declined = (e, what) => "the passkey did not sign (" + ((e && e.name) || "cancelled") + "); " + what;
   const remember = (fp, rawId) => { const all = mine(); all[fp] = rawId; store.set("localStorage", mapKey(), JSON.stringify(all)); };
 
   function call(method, route, body) {
@@ -308,7 +313,11 @@
   });
   // so does leaving its view (phone_app.js's tabs): a picker or a revoke still being asked for, left on a hidden tab,
   // would hold every list still where nobody can see it. A ceremony past its Face ID prompt is not dismissed
-  window.levainViewChanged = () => { if (closePick && closePick()) setTimeout(load, 0); };
+  // and so does any open K8 review (signPending): the view change dismisses every one (dismissReviews, below)
+  window.levainViewChanged = () => {
+    const picked = !!(closePick && closePick());
+    if (dismissReviews() || picked) setTimeout(load, 0);
+  };
 
   function start(r, decision, signers, say, actions, ruling, go, what) {
     const run = go || ((fp, rawId) => answer(r, decision, fp, rawId, say, ruling));
@@ -389,9 +398,8 @@
           say(head + " \u00b7 signed by " + ((a.body.ruling || {}).signer_fp || "") + " \u00b7 delivery " + (d.route || "") + ": " + (d.reason || ""),
               a.body.answered && d.route !== "failed" && d.route !== "none" ? "ok" : "bad");
         }, (e) => {
-          if (rawId && e && e.name === "NotAllowedError") forget(fp);
           again();
-          say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was answered or allowed", "bad");
+          say(declined(e, "nothing was answered or allowed"), "bad");
         });
     }).catch((e) => say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
       .finally(() => { busy--; setTimeout(load, 1500); });
@@ -419,12 +427,7 @@
           // the ruling stands either way; a delivery that failed or had nothing to deliver is shown as a failure
           say(done + " · signed by " + a.body.signer_fp + where, d.route === "failed" || d.route === "none" ? "bad" : "ok");
         },
-              (e) => {
-                // asked for one credential and the OS had none it would use: forget it here, so the next tap is not
-                // pinned to a passkey this phone no longer holds
-                if (rawId && e && e.name === "NotAllowedError") forget(fp);
-                say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was answered", "bad");
-              });
+              (e) => say(declined(e, "nothing was answered"), "bad"));
     }).catch((e) => say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
       .finally(() => { busy--; setTimeout(load, 1500); });
   }
@@ -602,10 +605,7 @@
           say("signed" + (a.body.choice ? " (" + a.body.choice + ")" : "") + " · by " + a.body.signer_fp + " in "
               + a.body.namespace, "ok");
         });
-      }, (e) => {
-        if (rawId && e && e.name === "NotAllowedError") forget(fp);
-        say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was signed", "bad");
-      });
+      }, (e) => say(declined(e, "nothing was signed"), "bad"));
     }).catch((e) => {
       const name = (e && e.name) || "error";
       if (sent) return unsure("not sure this was signed (the page failed: " + name + "): check the list");
@@ -759,10 +759,7 @@
         if (cancel) reasons.delete(r.id);
         last = (cancel ? "cancelled " : "signed ") + (r.template && r.template.id || r.id);
         say((cancel ? "cancelled" : "signed") + " \u00b7 by " + a.body.signer_fp + " \u00b7 job " + a.body.state, "ok");
-      }), (e) => {
-        if (rawId && e && e.name === "NotAllowedError") forget(fp);
-        say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); " + (cancel ? "the job is not cancelled" : "nothing was signed"), "bad");
-      });
+      }), (e) => say(declined(e, cancel ? "the job is not cancelled" : "nothing was signed"), "bad"));
     }).catch((e) => say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
       .finally(() => { busy--; setTimeout(load, 1500); });
   }
@@ -970,9 +967,7 @@
           });
         }, (e) => {
           if (setup) return say("not revoked: the page could not ask the passkey (" + ((e && e.name) || "error") + "); nothing was signed", "bad");
-          // a cancelled Face ID and a passkey this phone no longer holds both read NotAllowedError: this browser's
-          // record of its passkey is kept either way (the consent ceremonies forget it on that error; this one never)
-          say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was revoked", "bad");
+          say(declined(e, "nothing was revoked"), "bad");
         }).catch((e) => say(sent ? "result unknown (the page failed: " + ((e && e.name) || "error") + "): the list re-reads to show where it stands"
                                  : "not revoked: the page failed before anything was sent (" + ((e && e.name) || "error") + "); nothing was revoked", "bad"))
           .finally(() => { box.remove(); release(); });
@@ -1068,10 +1063,18 @@
   // waits for that sign to settle), so a refresh never redraws it away; sign() runs one ceremony at a time (a second
   // tap does nothing; a non-terminal failure lets the sheet sign again, still held; after dismiss it does nothing). A pending the server no longer holds
   // WAITING (expired, or decided elsewhere) gets no sheet and no prompt. The broker verifies the signature over its own
-  // copy and decides; the outcome names the signer the server persisted. done(answer) gets every outcome. This page decides nothing:
+  // copy and decides; the outcome names the signer the server persisted. done(answer) gets every outcome, and a review
+  // that ends without the server's terminal answer ends with a DISMISSED answer. review() may answer the sheet's
+  // closed(reason): it is called once when the review ends ("answered" or "dismissed"), so the sheet takes its Sign
+  // away; a dismissal from outside the sheet (the page hiding, the view change) is also said. This page decides nothing:
   // what it shows is the server's words.
   // every open review's dismiss, so a view change can close them all (window.levainDismissReviews below)
   const openReviews = new Set();
+  function dismissReviews() {
+    const open = Array.from(openReviews);
+    open.forEach((d) => d());
+    return open.length;
+  }
   function signPending(issue, fp, rawId, say, review, done) {
     if (busy) return;
     busy++;
@@ -1095,17 +1098,41 @@
           // (the server's own 2xx), on dismiss when no sign is in flight, or when the sign in flight at a dismiss
           // settles. A non-terminal failure (a 4xx, a cancelled passkey, an unknown outcome) re-arms Sign and keeps the
           // hold while the sheet is open. After dismiss or release, sign() does nothing, however late it is called
-          let signing = false, dismissed = false, released = false;
+          // answered: the server's terminal answer ended this review; away: it was dismissed from outside the sheet
+          // (the page hid, the view changed); closed: what review() answered, the sheet's own closed(reason), told
+          // once at release so the sheet never shows a live Sign over a review that is over; said: the last line this
+          // review said, kept so a dismissal that waited on an in-flight sign is said with that sign's result
+          let signing = false, dismissed = false, released = false, answered = false, away = false, closed = null, said = null;
+          const tell = (text, kind) => { said = [text, kind]; say(text, kind); };
+          const DEAD = "this review was dismissed (the page was hidden or the view changed), so its Sign does nothing: "
+            + "start the write again to sign it";
           // L3 r3: for the review's lifetime a hidden page (a switched tab, a backgrounded PWA) dismisses it, and so
           // does the phone app's view change (window.levainDismissReviews), so the hold never freezes the list
           // behind a sheet nobody can see. Both hooks go at release, exactly once
-          const onHide = () => { if (document.hidden) dismiss(); };
-          const unhook = () => { document.removeEventListener("visibilitychange", onHide); openReviews.delete(dismiss); };
-          const release = () => { if (released) return; released = true; unhook(); settle(); };
+          const onHide = () => { if (document.hidden) leave(); };
+          const unhook = () => { document.removeEventListener("visibilitychange", onHide); openReviews.delete(leave); };
+          // release: exactly once. A review that ends without the server's terminal answer was dismissed: done() gets a
+          // DISMISSED answer (so a caller awaiting it never hangs), a dismissal from outside the sheet is said, and the
+          // sheet's closed() is told either way. Nothing here says nothing was signed: an earlier attempt may have sent
+          // its signature with an unknown result
+          const release = () => {
+            if (released) return;
+            released = true;
+            unhook();
+            if (!answered) {
+              finish({ ok: false, status: 0, body: { state: "DISMISSED", message: "the review was dismissed" } });
+              if (away) say(said && said[1] === "bad" && said[0] !== DEAD ? said[0] + " · " + DEAD : DEAD, "bad");
+            }
+            if (typeof closed === "function") { try { closed(answered ? "answered" : "dismissed"); } catch (e) { /* the sheet's own fault */ } }
+            settle();
+          };
           const dismiss = () => { if (released) return; dismissed = true; if (!signing) release(); };
+          const leave = () => { if (released) return; away = true; dismiss(); };
           document.addEventListener("visibilitychange", onHide);
-          openReviews.add(dismiss);
+          openReviews.add(leave);
           const sign = () => {
+            const say = tell;        // what this review says is kept (said), for a dismissal that waits on this sign
+            if (released && away && !answered) return say(DEAD, "bad");   // a stale Sign over a review dismissed from outside says so
             if (signing || dismissed || released) return;
             signing = true;
             // sent: the signature has gone to the server, so only its own answer says what happened; told: done() has
@@ -1131,16 +1158,15 @@
                   a.body.state === "COMMITTED" ? "ok" : "bad");
             }).catch((e) => {
               if (!sent) {
-                if (rawId && e && e.name === "NotAllowedError") forget(fp);
                 finish(failed(e));
-                return say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was applied", "bad");
+                return say(declined(e, "nothing was applied"), "bad");
               }
               // a fault after the send: the server may have applied it, so this page never says it did not
               say("result unknown (the page failed: " + ((e && e.name) || "error") + "): reload to see whether it applied", "bad");
               if (!told) finish(failed(e));
-            }).finally(() => { signing = false; if (terminal || dismissed) release(); });
+            }).finally(() => { signing = false; if (terminal) answered = true; if (terminal || dismissed) release(); });
           };
-          try { review(c.body, sign, dismiss); } catch (e) { if (!released) { released = true; unhook(); } fail(e); }
+          try { closed = review(c.body, sign, dismiss); } catch (e) { if (!released) { released = true; unhook(); } fail(e); }
         });
       });
     }).catch((e) => { finish(failed(e)); say("the page failed (" + ((e && e.name) || "error") + ")", "bad"); })
@@ -1160,11 +1186,7 @@
   };
   // the hook point a view change calls (the phone app's tab/view switch): dismiss every open review, under the same
   // rule as the sheet's own dismiss (a sign in flight releases when it settles). Answers how many it dismissed
-  window.levainDismissReviews = () => {
-    const open = Array.from(openReviews);
-    open.forEach((d) => d());
-    return open.length;
-  };
+  window.levainDismissReviews = dismissReviews;
 
   $("refresh").addEventListener("click", load);
   $("enrol-btn").addEventListener("click", enrol);

@@ -20,7 +20,8 @@ function elem() {
 
 // one page: ``pending`` is GET /cockpit/pending/<id>'s body, ``signed`` the POST .../signature answer's body, or a
 // list of [status, body] answers taken one per POST; ``gate``, when given, is a promise each POST's answer waits on
-function page(pending, signed, gate) {
+function page(pending, signed, gate, opts) {
+  opts = opts || {};
   const log = { issued: 0, webauthn: 0, reviewed: 0, posts: 0, said: [], done: [] };
   const answer = (status, body) => Promise.resolve({ ok: status < 400, status, json: () => Promise.resolve(body) });
   const fetch = (route, opts) => {
@@ -37,10 +38,13 @@ function page(pending, signed, gate) {
   const buf = (n) => new Uint8Array([n]).buffer;
   const navigator = { credentials: { get: () => {
     log.webauthn++;
+    if (opts.refuse) return Promise.reject(Object.assign(new Error("cancel"), { name: opts.refuse }));
     return Promise.resolve({ response: { authenticatorData: buf(1), clientDataJSON: buf(2), signature: buf(3) } });
   } } };
   const window = { isSecureContext: true, PublicKeyCredential: function () {}, localStorage: memStore(), addEventListener() {},
                    sessionStorage: memStore() };
+  // ``mine``: this browser's record of its passkeys (fingerprint -> credential id), as enrolment leaves it
+  if (opts.mine) window.localStorage.setItem("levain-passkeys:localhost", JSON.stringify(opts.mine));
   // the document keeps its listeners, so a test can hide the page (visibilitychange) and count what is registered
   const listeners = new Map();
   const document = { getElementById: () => elem(), createElement: () => elem(), querySelectorAll: () => [], hidden: false,
@@ -64,7 +68,8 @@ function page(pending, signed, gate) {
     window.levainSign(["SHA256:a"], say, elem(), issue, (_b, _s, dismiss) => dismiss(), () => {});
     return tick().then(() => log.issued > before);
   };
-  return { window, log, say, issue, probe, visibility, vcount };
+  const mapping = () => JSON.parse(window.localStorage.getItem("levain-passkeys:localhost") || "{}");
+  return { window, log, say, issue, probe, visibility, vcount, mapping };
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 30));
@@ -209,12 +214,16 @@ async function main() {
     const p = page(WAITING, { state: "COMMITTED", signer_fp: "SHA256:a" });
     const base = p.vcount();
     const held = {};
-    const review = (_body, sign, dismiss) => { p.log.reviewed++; held.sign = sign; held.dismiss = dismiss; };
+    // the sheet answers review() with its closed(reason): phone.js calls it when the review ends, so Sign goes dead
+    p.log.closed = [];
+    const review = (_body, sign, dismiss) => { p.log.reviewed++; held.sign = sign; held.dismiss = dismiss;
+                                               return (why) => p.log.closed.push(why); };
     p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, (a) => p.log.done.push(a));
     await tick();
     p.log.listeners_open = p.vcount() - base;
     p.visibility(true);
     await tick();
+    p.log.said_at_hide = p.log.said.slice(-1)[0];   // read before a probe, whose own write says on the same line
     p.visibility(false);
     p.log.free_after_hide = await p.probe();
     p.log.listeners_after = p.vcount() - base;
@@ -222,7 +231,7 @@ async function main() {
     await tick();
     p.visibility(false);
     p.log.free_again = await p.probe();
-    held.sign();                 // the sheet is gone: a stale tap signs nothing
+    held.sign();                 // the sheet is gone: a stale tap signs nothing, and says the review was dismissed
     await tick();
     out.hidden_review = p.log;
   }
@@ -270,6 +279,41 @@ async function main() {
     p.log.listeners_after = p.vcount() - base;
     if (p.log.has_hook) p.log.dismissed_again = p.window.levainDismissReviews();
     out.view_change = p.log;
+  }
+  // a hide while a sign is in flight whose answer is NOT terminal (a 4xx): the result is said, then the review is
+  // dismissed once it settles, the sheet is told, and Sign stays dead
+  {
+    let open;
+    const gate = new Promise((r) => { open = r; });
+    const p = page(WAITING, [[409, { message: "stale" }]], gate);
+    const held = {};
+    p.log.closed = [];
+    const review = (_body, sign, dismiss) => { p.log.reviewed++; held.sign = sign; held.dismiss = dismiss;
+                                               return (why) => p.log.closed.push(why); };
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, (a) => p.log.done.push(a));
+    await tick();
+    held.sign();
+    await tick();
+    p.visibility(true);
+    await tick();
+    p.visibility(false);
+    p.log.closed_in_flight = p.log.closed.length;
+    open();
+    await tick();
+    p.log.free_after = await p.probe();
+    held.sign();
+    await tick();
+    out.hidden_in_flight_4xx = p.log;
+  }
+  // the passkey refused (NotAllowedError: a cancelled Face ID or a passkey gone from the phone, which this browser
+  // cannot tell apart): this browser's record of its passkey is kept (the one "don't forget" rule, 1022+19 Q2)
+  {
+    const p = page(WAITING, { state: "COMMITTED" }, undefined, { refuse: "NotAllowedError", mine: { "SHA256:a": "cmF3aWQ" } });
+    const review = (_body, sign) => { p.log.reviewed++; sign(); };
+    p.window.levainSign(["SHA256:a"], p.say, elem(), p.issue, review, (a) => p.log.done.push(a));
+    await tick();
+    p.log.mapping = p.mapping();
+    out.refused_keeps = p.log;
   }
   out.unhandled = unhandled;
   process.stdout.write(JSON.stringify(out));
