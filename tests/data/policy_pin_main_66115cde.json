@@ -1,0 +1,842 @@
+[
+[
+0,
+"base",
+"OK route='v', type='brokered', hosts=(), upstream=('https', 'api.v.example', ''), credential='vendor-key', templates=[('POST', '/v1/messages', None)], headers=[('anthropic-version', '2023-06-01')], body_cap=1048576, body_codec='anthropic-messages', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=250000, max_session_microdollars=5000000"
+],
+[
+0,
+"dispatch",
+"PolicyError route v: a dispatch route carries no max_session_microdollars"
+],
+[
+0,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+0,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+1,
+"base",
+"OK route='v', type='brokered', hosts=(), upstream=('https', 'api.v.example', ''), credential=None, templates=[('POST', '/v1/messages', None)], headers=[('anthropic-version', '2023-06-01')], body_cap=1048576, body_codec='anthropic-messages', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=250000, max_session_microdollars=5000000"
+],
+[
+1,
+"dispatch",
+"PolicyError route v: a dispatch route carries no max_session_microdollars"
+],
+[
+1,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+1,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+2,
+"base",
+"OK route='v', type='brokered', hosts=(), upstream=('https', 'api.v.example', ''), credential=None, templates=[('POST', '/v1/messages', None)], headers=[('anthropic-version', '2023-06-01')], body_cap=1048576, body_codec='anthropic-messages', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=250000, max_session_microdollars=5000000"
+],
+[
+2,
+"dispatch",
+"PolicyError route v: a dispatch route carries no max_session_microdollars"
+],
+[
+2,
+"session",
+"OK route='v', type='brokered', hosts=(), upstream=('https', 'api.v.example', ''), credential=None, templates=[('POST', '/v1/messages', None)], headers=[('anthropic-version', '2023-06-01')], body_cap=1048576, body_codec='anthropic-messages', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=250000, max_session_microdollars=5000000"
+],
+[
+2,
+"dispatch-session",
+"PolicyError route v: a dispatch route carries no max_session_microdollars"
+],
+[
+3,
+"base",
+"PolicyError route v: a base-map brokered route needs max_session_microdollars"
+],
+[
+3,
+"dispatch",
+"OK route='v', type='brokered', hosts=(), upstream=('https', 'api.v.example', ''), credential='vendor-key', templates=[('POST', '/v1/messages', None)], headers=[('anthropic-version', '2023-06-01')], body_cap=1048576, body_codec='anthropic-messages', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=250000, max_session_microdollars=None"
+],
+[
+3,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+3,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+4,
+"base",
+"PolicyError route v: max_call_microdollars must be a positive integer"
+],
+[
+4,
+"dispatch",
+"PolicyError route v: max_call_microdollars must be a positive integer"
+],
+[
+4,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+4,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+5,
+"base",
+"PolicyError route v: max_call_microdollars must be a positive integer"
+],
+[
+5,
+"dispatch",
+"PolicyError route v: max_call_microdollars must be a positive integer"
+],
+[
+5,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+5,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+6,
+"base",
+"PolicyError route v: max_call_microdollars must be a positive integer"
+],
+[
+6,
+"dispatch",
+"PolicyError route v: max_call_microdollars must be a positive integer"
+],
+[
+6,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+6,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+7,
+"base",
+"PolicyError route v: max_session_microdollars must be a positive integer"
+],
+[
+7,
+"dispatch",
+"PolicyError route v: a dispatch route carries no max_session_microdollars"
+],
+[
+7,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+7,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+8,
+"base",
+"PolicyError route v: max_session_microdollars must be a positive integer"
+],
+[
+8,
+"dispatch",
+"PolicyError route v: a dispatch route carries no max_session_microdollars"
+],
+[
+8,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+8,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+9,
+"base",
+"OK route='v', type='brokered', hosts=('api.v.example',), upstream=('https', 'api.v.example', ''), credential='vendor-key', templates=[('POST', '/v1/messages', None)], headers=[('anthropic-version', '2023-06-01')], body_cap=1048576, body_codec='anthropic-messages', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=250000, max_session_microdollars=5000000"
+],
+[
+9,
+"dispatch",
+"PolicyError route v: a dispatch route carries no max_session_microdollars"
+],
+[
+9,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+9,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+10,
+"base",
+"PolicyError route v: hosts must be a non-empty list"
+],
+[
+10,
+"dispatch",
+"PolicyError route v: hosts must be a non-empty list"
+],
+[
+10,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+10,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+11,
+"base",
+"OK route='v', type='brokered', hosts=(), upstream=('https', 'api.v.example', ''), credential='vendor-key', templates=[('POST', '/v1/messages', None)], headers=[('anthropic-version', '2023-06-01')], body_cap=1048576, body_codec='anthropic-messages', response_headers=('content-type', 'x-ratelimit-remaining'), max_call_microdollars=250000, max_session_microdollars=5000000"
+],
+[
+11,
+"dispatch",
+"PolicyError route v: a dispatch route carries no max_session_microdollars"
+],
+[
+11,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+11,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+12,
+"base",
+"PolicyError route v: responses names the forbidden header set-cookie"
+],
+[
+12,
+"dispatch",
+"PolicyError route v: responses names the forbidden header set-cookie"
+],
+[
+12,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+12,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+13,
+"base",
+"PolicyError route v: unknown keys ['prices']"
+],
+[
+13,
+"dispatch",
+"PolicyError route v: unknown keys ['prices']"
+],
+[
+13,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+13,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+14,
+"base",
+"PolicyError route v: unknown keys ['price']"
+],
+[
+14,
+"dispatch",
+"PolicyError route v: unknown keys ['price']"
+],
+[
+14,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+14,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+15,
+"base",
+"OK route='v', type='brokered', hosts=(), upstream=('https', 'api.v.example', ''), credential='vendor-key', templates=[('POST', '/v1/messages', None)], headers=[], body_cap=1, body_codec='openai-chat', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=250000, max_session_microdollars=5000000"
+],
+[
+15,
+"dispatch",
+"PolicyError route v: a dispatch route carries no max_session_microdollars"
+],
+[
+15,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+15,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+16,
+"base",
+"OK route='v', type='brokered', hosts=(), upstream=('https', 'api.v.example', ''), credential='vendor-key', templates=[('POST', '/v1/messages', None)], headers=[], body_cap=1, body_codec='openai-responses', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=250000, max_session_microdollars=5000000"
+],
+[
+16,
+"dispatch",
+"PolicyError route v: a dispatch route carries no max_session_microdollars"
+],
+[
+16,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+16,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+17,
+"base",
+"OK route='v', type='brokered', hosts=(), upstream=('https', 'api.v.example', ''), credential='vendor-key', templates=[('POST', '/v1/messages', None)], headers=[], body_cap=1, body_codec='none', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=250000, max_session_microdollars=5000000"
+],
+[
+17,
+"dispatch",
+"PolicyError route v: a dispatch route needs a body_codec"
+],
+[
+17,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+17,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+18,
+"base",
+"PolicyError route v: body_codec 'bogus'"
+],
+[
+18,
+"dispatch",
+"PolicyError route v: body_codec 'bogus'"
+],
+[
+18,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+18,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+19,
+"base",
+"PolicyError route v: requests.body_cap must be a positive integer"
+],
+[
+19,
+"dispatch",
+"PolicyError route v: a dispatch route needs a body_codec"
+],
+[
+19,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+19,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+20,
+"base",
+"OK route='v', type='brokered', hosts=(), upstream=('https', 'api.v.example', ''), credential='vendor-key', templates=[('POST', '/v1/messages', None)], headers=[], body_cap=33554433, body_codec='none', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=250000, max_session_microdollars=5000000"
+],
+[
+20,
+"dispatch",
+"PolicyError route v: a dispatch route needs a body_codec"
+],
+[
+20,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+20,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+21,
+"base",
+"OK route='v', type='brokered', hosts=(), upstream=('https', 'api.v.example', ''), credential='vendor-key', templates=[('GET', '/v1/x', 'websocket')], headers=[], body_cap=1, body_codec='none', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=250000, max_session_microdollars=5000000"
+],
+[
+21,
+"dispatch",
+"PolicyError route v: a dispatch route needs a body_codec"
+],
+[
+21,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+21,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+22,
+"base",
+"PolicyError route v: only a GET template may carry upgrade: websocket"
+],
+[
+22,
+"dispatch",
+"PolicyError route v: a dispatch route needs a body_codec"
+],
+[
+22,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+22,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+23,
+"base",
+"PolicyError route v: template path '/v1/../x'"
+],
+[
+23,
+"dispatch",
+"PolicyError route v: a dispatch route needs a body_codec"
+],
+[
+23,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+23,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+24,
+"base",
+"PolicyError route v: requests.templates must be a non-empty list"
+],
+[
+24,
+"dispatch",
+"PolicyError route v: a dispatch route needs a body_codec"
+],
+[
+24,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+24,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+25,
+"base",
+"PolicyError route v: requests names the forbidden header x-api-key"
+],
+[
+25,
+"dispatch",
+"PolicyError route v: requests names the forbidden header x-api-key"
+],
+[
+25,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+25,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+26,
+"base",
+"PolicyError route v: requests.headers.anthropic-beta: missing ), unterminated subpattern at position 0"
+],
+[
+26,
+"dispatch",
+"PolicyError route v: requests.headers.anthropic-beta: missing ), unterminated subpattern at position 0"
+],
+[
+26,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+26,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+27,
+"base",
+"PolicyError route v: requests must be exactly ['body_cap', 'body_codec', 'headers', 'templates']"
+],
+[
+27,
+"dispatch",
+"PolicyError route v: requests must be exactly ['body_cap', 'body_codec', 'headers', 'templates']"
+],
+[
+27,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+27,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+28,
+"base",
+"PolicyError route v: base_path must be empty or start with / and not end with /"
+],
+[
+28,
+"dispatch",
+"PolicyError route v: base_path must be empty or start with / and not end with /"
+],
+[
+28,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+28,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+29,
+"base",
+"OK route='v', type='brokered', hosts=(), upstream=('https', 'api.v.example', '/api'), credential='vendor-key', templates=[('POST', '/v1/messages', None)], headers=[('anthropic-version', '2023-06-01')], body_cap=1048576, body_codec='anthropic-messages', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=250000, max_session_microdollars=5000000"
+],
+[
+29,
+"dispatch",
+"PolicyError route v: a dispatch route carries no max_session_microdollars"
+],
+[
+29,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+29,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+30,
+"base",
+"PolicyError route v: upstream scheme must be https"
+],
+[
+30,
+"dispatch",
+"PolicyError route v: upstream scheme must be https"
+],
+[
+30,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+30,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+31,
+"base",
+"PolicyError route v: host '127.0.0.1' is not a lowercase A-label host name"
+],
+[
+31,
+"dispatch",
+"PolicyError route v: host '127.0.0.1' is not a lowercase A-label host name"
+],
+[
+31,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+31,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+32,
+"base",
+"OK route='v', type='brokered', hosts=(), upstream=('https', 'openrouter.ai', '/api'), credential='vendor-key', templates=[('POST', '/v1/messages', None)], headers=[('anthropic-version', '2023-06-01')], body_cap=1048576, body_codec='anthropic-messages', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=250000, max_session_microdollars=5000000"
+],
+[
+32,
+"dispatch",
+"PolicyError route v: a dispatch route carries no max_session_microdollars"
+],
+[
+32,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+32,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+33,
+"base",
+"PolicyError bad route id 'Bad Route'"
+],
+[
+33,
+"dispatch",
+"PolicyError bad route id 'Bad Route'"
+],
+[
+33,
+"session",
+"PolicyError bad route id 'Bad Route'"
+],
+[
+33,
+"dispatch-session",
+"PolicyError bad route id 'Bad Route'"
+],
+[
+34,
+"base",
+"PolicyError route v: unknown keys ['unknown']"
+],
+[
+34,
+"dispatch",
+"PolicyError route v: unknown keys ['unknown']"
+],
+[
+34,
+"session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+34,
+"dispatch-session",
+"PolicyError route v: the front's policy carries no credential field"
+],
+[
+35,
+"base",
+"OK route='e', type='egress', hosts=('pypi.org', 'files.pythonhosted.org'), upstream=None, credential=None, templates=[], headers=None, body_cap=0, body_codec='none', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=None, max_session_microdollars=None"
+],
+[
+35,
+"dispatch",
+"PolicyError route e: a dispatch route must be brokered"
+],
+[
+35,
+"session",
+"OK route='e', type='egress', hosts=('pypi.org', 'files.pythonhosted.org'), upstream=None, credential=None, templates=[], headers=None, body_cap=0, body_codec='none', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=None, max_session_microdollars=None"
+],
+[
+35,
+"dispatch-session",
+"OK route='e', type='egress', hosts=('pypi.org', 'files.pythonhosted.org'), upstream=None, credential=None, templates=[], headers=None, body_cap=0, body_codec='none', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=None, max_session_microdollars=None"
+],
+[
+36,
+"base",
+"PolicyError route e: host '0x7f.0x1' is not a lowercase A-label host name"
+],
+[
+36,
+"dispatch",
+"PolicyError route e: a dispatch route must be brokered"
+],
+[
+36,
+"session",
+"PolicyError route e: host '0x7f.0x1' is not a lowercase A-label host name"
+],
+[
+36,
+"dispatch-session",
+"PolicyError route e: host '0x7f.0x1' is not a lowercase A-label host name"
+],
+[
+37,
+"base",
+"PolicyError route e: a egress route carries only route, type, hosts"
+],
+[
+37,
+"dispatch",
+"PolicyError route e: a dispatch route must be brokered"
+],
+[
+37,
+"session",
+"PolicyError route e: the front's policy carries no credential field"
+],
+[
+37,
+"dispatch-session",
+"PolicyError route e: the front's policy carries no credential field"
+],
+[
+38,
+"base",
+"OK route='p', type='subscription_passthrough', hosts=('api.anthropic.com',), upstream=None, credential=None, templates=[], headers=None, body_cap=0, body_codec='none', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=None, max_session_microdollars=None"
+],
+[
+38,
+"dispatch",
+"PolicyError route p: a dispatch route must be brokered"
+],
+[
+38,
+"session",
+"OK route='p', type='subscription_passthrough', hosts=('api.anthropic.com',), upstream=None, credential=None, templates=[], headers=None, body_cap=0, body_codec='none', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=None, max_session_microdollars=None"
+],
+[
+38,
+"dispatch-session",
+"OK route='p', type='subscription_passthrough', hosts=('api.anthropic.com',), upstream=None, credential=None, templates=[], headers=None, body_cap=0, body_codec='none', response_headers=('content-type', 'request-id', 'x-request-id', 'retry-after'), max_call_microdollars=None, max_session_microdollars=None"
+],
+[
+39,
+"base",
+"PolicyError route x: type 'other' not in ('egress', 'subscription_passthrough', 'brokered')"
+],
+[
+39,
+"dispatch",
+"PolicyError route x: type 'other' not in ('egress', 'subscription_passthrough', 'brokered')"
+],
+[
+39,
+"session",
+"PolicyError route x: type 'other' not in ('egress', 'subscription_passthrough', 'brokered')"
+],
+[
+39,
+"dispatch-session",
+"PolicyError route x: type 'other' not in ('egress', 'subscription_passthrough', 'brokered')"
+],
+[
+40,
+"base",
+"PolicyError a route must be an object"
+],
+[
+40,
+"dispatch",
+"PolicyError a route must be an object"
+],
+[
+40,
+"session",
+"PolicyError a route must be an object"
+],
+[
+40,
+"dispatch-session",
+"PolicyError a route must be an object"
+],
+[
+41,
+"base",
+"PolicyError a route must be an object"
+],
+[
+41,
+"dispatch",
+"PolicyError a route must be an object"
+],
+[
+41,
+"session",
+"PolicyError a route must be an object"
+],
+[
+41,
+"dispatch-session",
+"PolicyError a route must be an object"
+]
+]

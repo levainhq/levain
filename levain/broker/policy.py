@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping, Optional, Pattern
 
 from levain.broker import norm
@@ -35,6 +35,22 @@ _TEMPLATE_PATH = re.compile(r"(/([A-Za-z0-9._~:-]+|\{seg\}))+/?(\?\*)?\Z")
 _METHOD = re.compile(r"[A-Z]{1,16}\Z")
 #: the response allow-list when a route has no `responses`.
 DEFAULT_RESPONSE_HEADERS = ("content-type", "request-id", "x-request-id", "retry-after")
+#: the most a priced route may ask keys to buffer: the Messages API's own request ceiling (Claude API errors page,
+#: "Messages API 32 MB", https://platform.claude.com/docs/en/api/errors; r3 §2.2 c step 2, kept by R4 §1.7). Enforced
+#: on the priced formats (base `/2`, routemap `/3`); the `/1` readers keep main's behaviour (the pin test).
+BODY_CAP_MAX = 32 * 1024 * 1024
+BASE_MAP_FORMATS = ("levain-routes-base/1", "levain-routes-base/2")
+ROUTEMAP_FORMAT = "levain-dispatch-routemap/3"
+#: a price entry's keys (R4 §1.3). Rates are integer microdollars per million tokens; the token counts are tokens.
+PRICE_RATES = ("in", "out", "cache_write", "cache_read")
+PRICE_TOKENS = ("default_output", "overhead_tokens", "image_tokens")
+_PRICE_KEYS = frozenset(PRICE_RATES + PRICE_TOKENS + ("source",))
+#: a priced tool's name as `per_use` keys it: the tool type with any `_YYYYMMDD` version suffix removed.
+_TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,47}\Z")
+_MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}\Z")
+#: an upper bound on every integer in a price entry, so no product can leave exact float-free integer arithmetic
+#: unreadable: 10**12 microdollars per million tokens is $1M per million tokens.
+_PRICE_INT_MAX = 10 ** 12
 
 
 class PolicyError(ValueError):
@@ -62,6 +78,8 @@ class RoutePolicy:
     response_headers: tuple[str, ...] = DEFAULT_RESPONSE_HEADERS
     max_call_microdollars: Optional[int] = None
     max_session_microdollars: Optional[int] = None
+    #: model -> its price entry: base `/2` and routemap `/3` only (R4 §1.3). None on every `/1` and session-file read.
+    prices: Optional[Mapping[str, "Price"]] = None
 
 
 def _is_inet_aton_spelling(h: str) -> bool:
@@ -164,11 +182,14 @@ def _upstream(route: str, raw: object) -> Upstream:
     return Upstream("https", host, bp)
 
 
-def parse_route(pol: object, *, source: str) -> RoutePolicy:
+def parse_route(pol: object, *, source: str, per_call: bool = True) -> RoutePolicy:
     """One `levain-route-policy/1` object. `source` decides the per-map rules: `max_session_microdollars` REQUIRED
     on a base-map brokered route and FORBIDDEN on a dispatch-map one; a dispatch route is brokered with a codec and
     no websocket template; a session file's route (render's copy) carries no `credential`; a dispatch or planner
-    session file's brokered route (`dispatch-session`) keeps the dispatch rules."""
+    session file's brokered route (`dispatch-session`) keeps the dispatch rules.
+
+    `per_call=False` is the priced formats' reading (base `/2`, routemap `/3`, R4 §1.2): `max_call_microdollars` is
+    FORBIDDEN and `body_cap` is at most `BODY_CAP_MAX`. The default is main's `/1` reading, unchanged."""
     if source not in SOURCES:
         raise ValueError(source)
     if not isinstance(pol, dict):
@@ -203,7 +224,14 @@ def parse_route(pol: object, *, source: str) -> RoutePolicy:
         if not isinstance(r, dict) or set(r) != {"headers"} or not isinstance(r["headers"], list):
             raise PolicyError(f"route {route}: responses must be exactly {{headers: [names]}}")
         resp = tuple(_header_name(route, "responses", n) for n in r["headers"])
-    max_call = _posint(route, "max_call_microdollars", pol.get("max_call_microdollars"))
+    if per_call:
+        max_call: Optional[int] = _posint(route, "max_call_microdollars", pol.get("max_call_microdollars"))
+    else:
+        if "max_call_microdollars" in pol:
+            raise PolicyError(f"route {route}: a priced route carries no max_call_microdollars")
+        if req["body_cap"] > BODY_CAP_MAX:
+            raise PolicyError(f"route {route}: requests.body_cap is above BODY_CAP_MAX")
+        max_call = None
     max_sess = pol.get("max_session_microdollars")
     if source in DISPATCH_RULES and max_sess is not None:
         raise PolicyError(f"route {route}: a dispatch route carries no max_session_microdollars")
@@ -213,3 +241,153 @@ def parse_route(pol: object, *, source: str) -> RoutePolicy:
         max_sess = _posint(route, "max_session_microdollars", max_sess)
     return RoutePolicy(route, typ, hs, up, cred, req["templates"], req["headers"], req["body_cap"],
                        req["body_codec"], resp, max_call, max_sess)
+
+
+# --- the price entry and the priced formats (R4 §1.3, §1.6) --------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Price:
+    """One model's price entry. Each rate is the HIGHEST the model can be billed at over every tier and service mode
+    its provider lists, and `source` the pricing URL that choice was read from (R4 §1.3)."""
+    in_: int
+    out: int
+    cache_write: int
+    cache_read: int
+    default_output: int
+    overhead_tokens: int
+    image_tokens: int
+    per_use: Mapping[str, int]
+    source: str
+
+
+def _price_int(where: str, key: str, v: object, *, positive: bool) -> int:
+    if not isinstance(v, int) or isinstance(v, bool) or v < (1 if positive else 0) or v > _PRICE_INT_MAX:
+        raise PolicyError(f"{where}: price {key} must be an integer in [{1 if positive else 0}, {_PRICE_INT_MAX}]")
+    return v
+
+
+def parse_price(where: str, raw: object) -> Price:
+    """One price entry `{in, out, cache_write, cache_read, default_output, overhead_tokens, image_tokens, per_use?,
+    source}`. `in`, `out`, `default_output` and `image_tokens` are positive; the cache rates and `overhead_tokens` may
+    be 0. `per_use` maps a tool name to integer microdollars per use. `source` is an https URL."""
+    if not isinstance(raw, dict):
+        raise PolicyError(f"{where}: a price entry must be an object")
+    keys = set(raw)
+    if not _PRICE_KEYS <= keys <= _PRICE_KEYS | {"per_use"}:
+        raise PolicyError(f"{where}: a price entry is exactly {sorted(_PRICE_KEYS)} + per_use?")
+    vals = {k: _price_int(where, k, raw[k], positive=k in ("in", "out", "default_output", "image_tokens"))
+            for k in PRICE_RATES + PRICE_TOKENS}
+    per_use: dict[str, int] = {}
+    if "per_use" in raw:
+        pu = raw["per_use"]
+        if not isinstance(pu, dict):
+            raise PolicyError(f"{where}: price per_use must be an object")
+        for tool, v in pu.items():
+            if not isinstance(tool, str) or not _TOOL_NAME.match(tool):
+                raise PolicyError(f"{where}: price per_use tool name {tool!r}")
+            per_use[tool] = _price_int(where, f"per_use.{tool}", v, positive=True)
+    src = raw["source"]
+    if not isinstance(src, str) or not src.startswith("https://") or len(src) > 512 or any(c.isspace() for c in src):
+        raise PolicyError(f"{where}: price source must be an https URL")
+    return Price(vals["in"], vals["out"], vals["cache_write"], vals["cache_read"], vals["default_output"],
+                 vals["overhead_tokens"], vals["image_tokens"], per_use, src)
+
+
+def parse_prices(route: str, raw: object) -> dict:
+    """A `prices: {<model>: <entry>}` table (base `/2`)."""
+    if not isinstance(raw, dict):
+        raise PolicyError(f"route {route}: prices must be an object")
+    out: dict[str, Price] = {}
+    for model, entry in raw.items():
+        if not isinstance(model, str) or not _MODEL_ID.match(model):
+            raise PolicyError(f"route {route}: price model id {model!r}")
+        out[model] = parse_price(f"route {route} model {model}", entry)
+    return out
+
+
+def parse_base_map(doc: object) -> dict:
+    """A base route map, `/1` or `/2`, as `{route id: RoutePolicy}`; any defect refuses the map whole.
+
+    `/1` (main's): each entry is a policy object read by `parse_route(source="base")` exactly as on main.
+    `/2` (R4 §1.3): each entry is a policy object; a `brokered` one also carries `prices` (required) and no
+    `max_call_microdollars`, and its `body_cap` is at most `BODY_CAP_MAX`. `prices` is refused on any other type."""
+    if not isinstance(doc, dict) or doc.get("format") not in BASE_MAP_FORMATS or set(doc) != {"format", "routes"} \
+            or not isinstance(doc["routes"], list):
+        raise PolicyError("a base map is exactly {format: levain-routes-base/1|2, routes: [..]}")
+    v2 = doc["format"] == BASE_MAP_FORMATS[1]
+    parsed: dict[str, RoutePolicy] = {}
+    for entry in doc["routes"]:
+        if v2:
+            if not isinstance(entry, dict):
+                raise PolicyError("a route must be an object")
+            rest = {k: v for k, v in entry.items() if k != "prices"}
+            pol = parse_route(rest, source="base", per_call=False)
+            if pol.type == "brokered":
+                if "prices" not in entry:
+                    raise PolicyError(f"route {pol.route}: a base /2 brokered route needs prices")
+                pol = replace(pol, prices=parse_prices(pol.route, entry["prices"]))
+            elif "prices" in entry:
+                raise PolicyError(f"route {pol.route}: only a brokered route carries prices")
+        else:
+            pol = parse_route(entry, source="base")
+        if pol.route in parsed:
+            raise PolicyError(f"route {pol.route}: named twice")
+        parsed[pol.route] = pol
+    return parsed
+
+
+@dataclass(frozen=True)
+class DispatchRoute:
+    """One `levain-dispatch-routemap/3` route: routemap `/2`'s entry with a `price` on every model (R4 §1.6).
+    `policy.prices` maps each `requested` model to its price; `backends` maps it to its backend id."""
+    policy: RoutePolicy
+    provider: str
+    backends: Mapping[str, str]
+    body_policy: Mapping[str, object]
+    retention_claim: str
+
+
+_ROUTEMAP_ROUTE_KEYS = frozenset({"policy", "provider", "models", "body_policy", "retention_claim"})
+
+
+def parse_routemap(body: object) -> list:
+    """The BODY of a `routemap` config item at `levain-dispatch-routemap/3` = `/2` (1019-dispatch/SCHEMAS.md §1b)
+    + `price` per model − `max_call_microdollars`. Signature, store and generation are CONTROL's (3c-4); this reads
+    the body. The frozen `/2` is not read here: a `/2` body is refused (`format`)."""
+    if not isinstance(body, dict) or set(body) != {"format", "routes"} or body["format"] != ROUTEMAP_FORMAT \
+            or not isinstance(body["routes"], list):
+        raise PolicyError(f"a routemap body is exactly {{format: {ROUTEMAP_FORMAT}, routes: [..]}}")
+    out: list[DispatchRoute] = []
+    seen: set[str] = set()
+    for r in body["routes"]:
+        if not isinstance(r, dict) or set(r) != _ROUTEMAP_ROUTE_KEYS:
+            raise PolicyError(f"a routemap route is exactly {sorted(_ROUTEMAP_ROUTE_KEYS)}")
+        pol = parse_route(r["policy"], source="dispatch", per_call=False)
+        if pol.route in seen:
+            raise PolicyError(f"route {pol.route}: named twice")
+        seen.add(pol.route)
+        for name in ("provider", "retention_claim"):
+            if not isinstance(r[name], str) or not r[name]:
+                raise PolicyError(f"route {pol.route}: {name} must be a non-empty string")
+        if not isinstance(r["body_policy"], dict):
+            raise PolicyError(f"route {pol.route}: body_policy must be an object")
+        models = r["models"]
+        if not isinstance(models, list) or not models:
+            raise PolicyError(f"route {pol.route}: models is a non-empty list")
+        prices: dict[str, Price] = {}
+        backends: dict[str, str] = {}
+        for m in models:
+            if not isinstance(m, dict) or set(m) != {"requested", "backend", "price"}:
+                raise PolicyError(f"route {pol.route}: a model is exactly requested, backend, price")
+            req, back = m["requested"], m["backend"]
+            for v in (req, back):
+                if not isinstance(v, str) or not _MODEL_ID.match(v):
+                    raise PolicyError(f"route {pol.route}: model id {v!r}")
+            if req in prices:
+                raise PolicyError(f"route {pol.route}: model {req} named twice")
+            prices[req] = parse_price(f"route {pol.route} model {req}", m["price"])
+            backends[req] = back
+        out.append(DispatchRoute(replace(pol, prices=prices), r["provider"], backends, r["body_policy"],
+                                 r["retention_claim"]))
+    return out

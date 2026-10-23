@@ -181,7 +181,7 @@ def row_steps(host: HostOS, rows: Iterable[Row]) -> list[Step]:
     return steps
 
 
-BASE_ROUTES_FORMAT = "levain-routes-base/1"   # CONTRACT §4.3
+BASE_ROUTES_FORMAT = "levain-routes-base/2"   # CONTRACT §4.3; /2 = a prices table on each brokered route (3c R4 §1.3)
 
 
 def base_routes_path(host: HostOS) -> Path:

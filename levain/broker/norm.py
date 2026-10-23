@@ -22,7 +22,29 @@ STATUS = {
     "upstream-error": 502, "upstream-timeout": 504, "keys-unavailable": 503,
     "upstream-redirect": 502,
     "credential-unavailable": 503,
+    "body-json": 400, "body-unbounded": 403,
 }
+#: the names that carry a `:<what>` suffix on the wire (R4 §1.6: `body-unbounded:document`); the status is the prefix's.
+PARAMETERISED = ("body-unbounded",)
+_WHAT = re.compile(r"[a-z][a-z0-9_]{0,47}\Z")
+
+
+def status_of(name: str) -> int:
+    """A refusal name's status, `KeyError` for a name the table lacks. `body-unbounded:<what>` is `body-unbounded`'s."""
+    head, sep, what = name.partition(":")
+    if sep:
+        if head not in PARAMETERISED or not _WHAT.match(what):
+            raise KeyError(name)
+        return STATUS[head]
+    return STATUS[name]
+
+
+def is_name(name: str) -> bool:
+    try:
+        status_of(name)
+    except KeyError:
+        return False
+    return True
 REASON = {400: b"Bad Request", 401: b"Unauthorized", 402: b"Payment Required", 403: b"Forbidden",
           404: b"Not Found", 413: b"Payload Too Large", 502: b"Bad Gateway", 503: b"Service Unavailable",
           504: b"Gateway Timeout"}
@@ -36,7 +58,7 @@ class Refused(Exception):
 
     @property
     def status(self) -> int:
-        return STATUS[self.name]
+        return status_of(self.name)
 
 
 def digest_of_token(token: str) -> str:
