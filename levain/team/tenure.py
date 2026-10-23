@@ -37,6 +37,27 @@ class Unjudgeable(TeamError):
     """This clone cannot judge the ledger at all (a signature it cannot check, history it cannot read)."""
 
 
+# An entry counts only with user presence (Phill 10-21 "12a") when the team refuses file keys. A test-only seam: the
+# suite signs with throwaway file keys and turns it off; the rule's own tests set it back. A team turns the rule off
+# for itself only through its counted ``allow_file_keys``. It is judged where what is in force is derived, so every
+# reader reaches one verdict: a writer-side check alone cannot hold against code running as the user.
+_REQUIRE_PRESENCE = True
+
+
+FILE_KEYS_LOCKOUT = (
+    "allowing file keys needs a signature with user presence while the team refuses them. Fix: an owner whose key is "
+    "a file key adds a Touch ID or security key (`levain team key add`) and allows file keys with it, or starts the "
+    "team again with `levain team init --allow-file-keys`")
+
+
+def presence_required(allow_file_keys: bool | None, entry_type: object) -> bool:
+    """THE rule: does an entry of ``entry_type``, at a parent whose counted policy is ``allow_file_keys``, count only
+    when the commit adding it is signed with user presence? Only an explicit refusal (False) requires it; an unchosen
+    policy (None, a team from before the rule) reads as it always did. The edit hook's ack grants nothing and an agent
+    writes it on each acknowledged edit, so it never needs a touch."""
+    return _REQUIRE_PRESENCE and allow_file_keys is False and entry_type != "ack"
+
+
 # ---- tenure.toml ------------------------------------------------------------------------------------------
 
 
@@ -126,6 +147,8 @@ def flat(team: R.Team | None, ten: Tenure | None) -> dict[tuple, object]:
         out[("owner",)] = team.owner
         out[("mode",)] = team.mode
         out[("fetch_interval",)] = int(team.fetch_interval)
+        if team.allow_file_keys is not None:    # absent when unchosen: a ledger from before the field derives the same
+            out[("allow_file_keys",)] = bool(team.allow_file_keys)
         for c in team.client_owners:
             out[("client_owner", c)] = True
         for h, mail in team.members.items():
@@ -152,7 +175,8 @@ def unflat(f: dict[tuple, object]) -> tuple[R.Team, Tenure]:
     members = {k[1]: str(v) for k, v in f.items() if k[0] == "member"}
     team = R.Team(project=str(f.get(("project",), "")), owner=str(f.get(("owner",), "")), members=members,
                   client_owners=sorted(k[1] for k in f if k[0] == "client_owner"), mode=str(f.get(("mode",), "ask-once")),
-                  fetch_interval=int(f.get(("fetch_interval",), 300)))
+                  fetch_interval=int(f.get(("fetch_interval",), 300)),
+                  allow_file_keys=f.get(("allow_file_keys",)))
     ten = Tenure(rules=int(f.get(("rules",), RULES)), past_owner_links=bool(f.get(("past_owner_links",), True)))
     if ("offer",) in f:
         ten.offer = json.loads(str(f[("offer",)]))
@@ -394,6 +418,11 @@ class Derivation:
     canon_sha: str | None = None                    # the last PROJECT.md commit signed by the owner in force
     state: dict[tuple, object] = field(default_factory=dict)  # the counted flat state at the tip
     ever_keyed: set[str] = field(default_factory=set)         # handles that have held a key in force, at any point
+    # entry hash -> whether the commit that added it was signed with user presence (a FIDO key's touch); the display
+    # note on an entry that counts without it
+    line_presence: dict[str, bool] = field(default_factory=dict)
+    # entry hashes NOT in force because they carry no user presence where the policy at their parent refuses file keys
+    presence_refused: set[str] = field(default_factory=set)
 
     def retired(self, handle: str) -> bool:
         """A handle whose membership ended is never a member again: a re-invite takes a new handle."""
@@ -520,15 +549,18 @@ def parents_of_safe(top: Path, sha: str) -> dict[str, list[str]]:
         return {}
 
 
-def _signers(top: Path, shas: list[str], cache: S.SigCache) -> dict[str, str | None]:
+def _signers(top: Path, shas: list[str], cache: S.SigCache) -> tuple[dict[str, str | None], dict[str, bool]]:
+    """(signer fingerprint or None, signed with user presence) per commit."""
     verdicts = cache.verify(top, shas)
     out: dict[str, str | None] = {}
+    presence: dict[str, bool] = {}
     for sha in shas:
         v = verdicts[sha]
         if v.kind == "indeterminate":
             raise Unjudgeable(f"cannot verify the signature of {sha[:10]}: {v.reason}")
         out[sha] = v.fingerprint if v.kind == "signed" else None
-    return out
+        presence[sha] = bool(v.kind == "signed" and v.presence)
+    return out, presence
 
 
 def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[str]], freeze_end: int,
@@ -537,7 +569,7 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
     where = {s: i for i, s in enumerate(walk)}
     ch = changes(top, walk)
     meta = metas(top, live)
-    signer = _signers(top, live, cache)
+    signer, presence = _signers(top, live, cache)
     problems: list[str] = []
     touching = [sha for sha in live if ch.get(sha) and ch[sha].files & {TEAM_FILE, TENURE_FILE}]
     texts = file_texts(top, [f"{sha}:{name}" for sha in touching for name in (TEAM_FILE, TENURE_FILE)])
@@ -568,6 +600,8 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
     decided: dict[str, set[str]] = {}        # rel -> line hashes already judged (first occurrence decides)
     canon_sha: str | None = None
     stranger: dict[str, int] = {}            # rel -> lines in its chain not written by the member (owner) in force
+    bare: dict[str, int] = {}                # rel -> lines with no user presence where the team refuses file keys
+    presence_refused: set[str] = set()
     touched: dict[tuple, str] = {k: g for k in state}
     ever_keyed: set[str] = {k[1] for k in state if k[0] == "key"}
 
@@ -612,7 +646,13 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
                 good = ok(sha, state, owner)
             else:
                 good = handle is not None and ok(sha, state, handle)
-            if not good:
+            if good and not presence.get(sha) and \
+                    presence_required(state.get(("allow_file_keys",)), _parsed(text).get("type")):
+                # signed by a key in force, but with no touch, where the policy at its parent refuses file keys
+                unenforced.setdefault(rel, set()).add(h)
+                presence_refused.add(h)
+                bare[rel] = bare.get(rel, 0) + 1
+            elif not good:
                 unenforced.setdefault(rel, set()).add(h)
                 stranger[rel] = stranger.get(rel, 0) + 1
         if CANON_FILE in c.files and i > 0:
@@ -662,7 +702,7 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
         new_rev: dict[str, str] = {}
         applied, refused = _apply(state, before, after, changed, fp, sha, i, new_rev, problems, where=where,
                                   owner_since=run_start, ever_members={s_.handle for s_ in spells},
-                                  ever_keyed=ever_keyed)
+                                  ever_keyed=ever_keyed, presence=bool(presence.get(sha)))
         if sha in void:
             # a distrusted or revoked commit STAYS the Levain-Base link it would have been (so the commits naming it
             # still count; the 1007+19 run of L1's r5 caught a void confirm breaking every later team commit), while
@@ -754,28 +794,40 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
     for rel, n_ in sorted(stranger.items()):
         problems.append(f"ledger/{rel}: {n_} line(s) not signed by a key in force for the member (the owner, for "
                         "pack-*) it is filed under; those lines are not enforced")
+    for rel, n_ in sorted(bare.items()):
+        problems.append(f"ledger/{rel}: {n_} line(s) signed with no user presence while the team refuses file keys; not "
+                        "in force. Fix: the owner runs `levain team file-keys allow`, or the member records them again "
+                        "with a Touch ID or security key")
     t, n = unflat(state)
     n.prior = ten.prior
     return Derivation(tip=tip, walk=walk, team=t, tenure=n, counted_head=base, files=lines, unenforced=unenforced,
                       line_pos=line_pos, spells=spells, problems=problems, role_changes=role_changes,
                       waiting=sum(len(ch.get(s, Change()).added) for s in walk[freeze_end:]), void=new_void,
-                      touched=touched, state=dict(state), canon_sha=canon_sha, ever_keyed=set(ever_keyed))
+                      touched=touched, state=dict(state), canon_sha=canon_sha, ever_keyed=set(ever_keyed),
+                      line_presence={h: presence.get(walk[p], False) for h, p in line_pos.items()},
+                      presence_refused=presence_refused)
 
 
-def _hash_of(text: str) -> str | None:
+def _parsed(text: str) -> dict:
     try:
         obj = E.parse_line(text)
     except E.LineError:
-        return None
-    h = obj.get("hash") if isinstance(obj, dict) else None
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _hash_of(text: str) -> str | None:
+    h = _parsed(text).get("hash")
     return h if isinstance(h, str) else None
 
 
 def _apply(state: dict, before: dict, after: dict, changed: set, fp: str, sha: str, pos: int,
            revoked: dict[str, str], problems: list[str], *, where: dict[str, int] | None = None,
            owner_since: int | None = None, ever_members: set[str] | frozenset[str] = frozenset(),
-           ever_keyed: set[str] | frozenset[str] = frozenset()) -> tuple[dict | None, list[str]]:
+           ever_keyed: set[str] | frozenset[str] = frozenset(), presence: bool = False) -> tuple[dict | None, list[str]]:
     """Apply each changed field the signer may change (signing doc §3), field by field. Returns (new state, refused).
+
+    ``presence``: the commit is signed with user presence (it decides only the ``allow_file_keys`` switch).
 
     ``ever_members``: every handle that has had a spell; ``ever_keyed``: every handle that has held a key in force.
     The owner-impersonation rule (1007+25, traced) reads both: the owner may propose a key for a handle only while
@@ -802,7 +854,14 @@ def _apply(state: dict, before: dict, after: dict, changed: set, fp: str, sha: s
             continue      # a no-op against the counted state (a restore, an ignored field)
         kind = k[0]
         allowed = False
-        if kind in ("project", "mode", "fetch_interval", "client_owner", "past_owner_links", "veto"):
+        if kind == "allow_file_keys":
+            # the switch is judged by the rule it switches: where the policy at this commit's parent refuses file keys,
+            # loosening it counts only with a touch, or a same-uid program holding the owner's file key could turn the
+            # rule off and then write as the owner. Tightening, or moving from an unchosen policy, needs none.
+            allowed = is_owner and (presence or not presence_required(old, "allow_file_keys"))
+            if is_owner and not allowed:
+                problems.append(FILE_KEYS_LOCKOUT)
+        elif kind in ("project", "mode", "fetch_interval", "client_owner", "past_owner_links", "veto"):
             allowed = is_owner
         elif kind == "member":
             h = k[1]

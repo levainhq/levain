@@ -91,7 +91,9 @@ def cmd_init(args) -> int:
     try:
         members, keys = _members(args.member)
         team = R.Team(project=args.project or repo.toplevel.name, owner=args.owner, members=members,
-                      client_owners=_split(args.client_owner), mode=args.mode, fetch_interval=args.fetch_interval)
+                      client_owners=_split(args.client_owner), mode=args.mode, fetch_interval=args.fetch_interval,
+                      # chosen at the genesis, always written: a new team refuses file keys unless its owner says so
+                      allow_file_keys=bool(args.allow_file_keys))
         try:
             anneal_db = str(Path(args.anneal_db).expanduser().resolve()) if args.anneal_db else None
         except (OSError, RuntimeError) as exc:      # a loop or an unreadable path: a refusal, never a raw trace
@@ -205,6 +207,8 @@ def cmd_record(args) -> int:
                 supersedes=_split(args.supersedes), refs=_split(args.refs),
                 agent=args.agent or os.environ.get("LEVAIN_TEAM_AGENT") or "human",
                 session=args.session or os.environ.get("CLAUDE_SESSION_ID"))
+    if team.allow_file_keys is None:
+        print(f"levain team: {FILE_KEYS_UNCHOSEN}", file=sys.stderr)
     sealed = gl.append(e, push=not args.no_push)
     if args.json:
         print(json.dumps(sealed, ensure_ascii=False))
@@ -242,12 +246,17 @@ def cmd_status(args) -> int:
     handle = gl.handle(team)
     state = gl.state_hash(ledger, team)
     canon_text = gl.read_canon(sha)
+    unchosen = FILE_KEYS_UNCHOSEN if team.allow_file_keys is None else None
+    if unchosen and (args.path or args.json):
+        # the forms below return before the full listing's line, so the warning reaches them here (r2 codex OPEN)
+        print(f"levain team: {unchosen}", file=sys.stderr)
+    keys_json = {"allow_file_keys": team.allow_file_keys, "file_keys_warning": unchosen}
     if args.path:
         rel = _repo_paths(repo, [args.path])[0]
         d = decide(team, ledger, handle, rel, "", set())
         if args.json:
             print(json.dumps({"path": rel, "deny": bool(d and d.deny), "text": d.text if d else "",
-                              "entries": [e["id"] for e in ledger.applying_to(rel)]}))
+                              "entries": [e["id"] for e in ledger.applying_to(rel)], **keys_json}))
         else:
             print(d.text if d else f"nothing in the ledger governs {rel}")
             if d:
@@ -255,19 +264,20 @@ def cmd_status(args) -> int:
         return 0
     if args.json:
         print(json.dumps({"project": team.project, "you": handle, "in_force": ledger.in_force,
-                          "problems": ledger.problems, "canon": C.staleness(canon_text, state)},
+                          "problems": ledger.problems, "canon": C.staleness(canon_text, state), **keys_json},
                          ensure_ascii=False))
         return 0
     print(f"{team.project}: owner {team.owner}, you are {handle or 'NOT a member'}, mode {team.mode}")
     from .cli_tenure import status_lines
     for line in status_lines(gl):
         print(line)
+    print(_file_keys_line(team))
     print(C.staleness(canon_text, state))
     if ledger.problems:
         print(f"{len(ledger.problems)} integrity problem(s): run `levain team verify`")
     for e in ledger.in_force:
         print()
-        print(I.render(e))
+        print(I.render(e, ledger.presence_note(e)))
     if not ledger.in_force:
         print("nothing in force yet")
     return 0
@@ -287,6 +297,12 @@ def cmd_verify(args) -> int:
             problems.append(f"{e['id']}: owner {e['owner']!r} is not allowed by team.toml")
     files = len(ledger.files)
     print(f"{len(ledger.entries)} entries in {files} file(s); {len(ledger.in_force)} in force")
+    bare = [e for e in ledger.entries if ledger.presence_note(e)]
+    if bare:
+        # shown, never a problem: a line written before the presence rule, by a team that allows file keys, or by the
+        # edit hook's ack is still enforced as it always was
+        print(f"{len(bare)} entr{'y' if len(bare) == 1 else 'ies'} signed with no user presence ({I.NO_PRESENCE_NOTE}): "
+              + ", ".join(e["id"] for e in bare[:5]) + (" ..." if len(bare) > 5 else ""))
     print(C.staleness(canon_text, gl.state_hash(ledger, team)))
     for p in problems:
         print(f"PROBLEM: {p}")
@@ -380,6 +396,44 @@ def cmd_member_add(args) -> int:
     return 0
 
 
+FILE_KEYS_UNCHOSEN = ("file keys: this team has not chosen the presence rule, so an entry signed by a key any program "
+                      "running as its member can use still counts; owner: `levain team file-keys refuse` (recommended) "
+                      "| `levain team file-keys allow`")
+
+
+def _file_keys_line(team: R.Team) -> str:
+    if team.allow_file_keys is None:
+        return FILE_KEYS_UNCHOSEN
+    if team.allow_file_keys:
+        return ("file keys: ALLOWED for this team (allow_file_keys = true): an entry may be signed by a key any program "
+                "running as its member can use; `levain team file-keys refuse` (owner) turns the touch rule back on")
+    return ("file keys: refused: `levain team record` needs a Touch ID or security-key (sk-*) signature with a touch "
+            "(`levain team file-keys allow`, the owner's, opts the team out)")
+
+
+def cmd_file_keys(args) -> int:
+    """Owner only: the team's one presence switch, a counted line in team.toml every clone derives."""
+    gl = open_ledger(_repo(args))
+    gl.require_joined()
+    team, handle = _actor(gl)
+    if handle != team.owner:
+        raise TeamError(f"only the owner ({team.owner}) allows or refuses file keys for the team")
+    want = args.choice == "allow"
+
+    def change(t, _ten) -> None:
+        t.allow_file_keys = want
+    try:
+        print(gl.update_counted(change, f"levain team: {'allow' if want else 'refuse'} file keys",
+                                push=not args.no_push))
+    except TeamError as exc:
+        if want and "allow_file_keys" in str(exc):
+            from . import tenure as T
+            raise TeamError(f"{exc}. {T.FILE_KEYS_LOCKOUT[0].upper()}{T.FILE_KEYS_LOCKOUT[1:]}") from None
+        raise
+    print(_file_keys_line(gl.team()))
+    return 0
+
+
 def cmd_pack_sync(args) -> int:
     gl = open_ledger(_repo(args))
     gl.require_joined()
@@ -389,10 +443,13 @@ def cmd_pack_sync(args) -> int:
     return 0
 
 
+_WARN = object()     # a doctor row's third state: shown, not a failure
+
+
 def cmd_doctor(args) -> int:
     repo = _repo(args)
     gl = open_ledger(repo)
-    rows: list[tuple[bool, str]] = []
+    rows: list[tuple[object, str]] = []
     if not gl.joined():
         print(f"FAIL  this clone has not joined a team ledger ({repo.toplevel})")
         return 1
@@ -413,10 +470,17 @@ def cmd_doctor(args) -> int:
     py_ok, py_line = _hook_import_check(repo)
     rows.append((py_ok, py_line))
     rows.append(_anneal_row(gl))
+    try:
+        team = gl.team()
+        # a WARN row, never a failure (a team from before the rule still works as it always did)
+        rows.append((_WARN if team.allow_file_keys is None else True, _file_keys_line(team)))
+    except R.RolesError:
+        pass        # team.toml's own row above already failed
     bad = 0
     for ok, line in rows:
-        print(f"{'ok  ' if ok else 'FAIL'}  {line}")
-        bad += not ok
+        # WARN is its own state; every other falsy row is a failure and counted as one (r2 complement LOW 5)
+        print(f"{'WARN' if ok is _WARN else 'ok  ' if ok else 'FAIL'}  {line}")
+        bad += ok is not _WARN and not ok
     print("All team checks passed." if not bad else f"{bad} check(s) failed.")
     return 0 if not bad else 1
 
@@ -484,6 +548,9 @@ def register(subparsers) -> None:
     p.add_argument("--anneal-db", help="your anneal store, for the optional import at session start")
     p.add_argument("--no-push", action="store_true")
     p.add_argument("--no-install", action="store_true", help="do not wire the hooks into .claude/settings.local.json")
+    p.add_argument("--allow-file-keys", action="store_true",
+                   help="let entries signed by a key with no user presence (a file or agent key) count; by default a "
+                        "new team needs a Touch ID or security-key touch on every `levain team record`")
 
     p = add("join", cmd_join, "Join this clone to the team ledger already on the remote.")
     p.add_argument("--remote")
@@ -572,6 +639,10 @@ def register(subparsers) -> None:
     from . import cli_draft
     cli_draft.register(sub, add)
 
+    p = add("file-keys", cmd_file_keys, "Owner only: allow or refuse entries signed with no user presence (a file or "
+            "agent key) for the whole team; refused by default (Touch ID or a security key).")
+    p.add_argument("choice", choices=("allow", "refuse"))
+    p.add_argument("--no-push", action="store_true")
     p = add("pack-sync", cmd_pack_sync, "Owner only: seed or upgrade a pack's judgment.toml rules into the ledger.")
     p.add_argument("pack_dir")
     p.add_argument("--no-push", action="store_true")
