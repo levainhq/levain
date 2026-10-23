@@ -90,7 +90,8 @@ def test_i5_the_failing_doctor_check_rides_in_the_tooltip_not_the_row() -> None:
 
 def test_i5_a_dot_row_carries_the_detail_as_its_title(tmp_path: Path) -> None:
     src = (WEB / "cockpit_view.js").read_text(encoding="utf-8")
-    assert 'row.title = m.label + ": " + m.detail' in src
+    assert 'typeof m.detail === "string" ? m.detail : ""].filter(Boolean).join(" · ")' in src   # the reading, then the detail
+    assert 'row.title = m.label + ": " + whole' in src
     assert "m.detail == null || typeof m.detail" in src                       # the payload check admits it
 
 
