@@ -469,3 +469,20 @@ def test_a_held_or_failing_queue_lock_is_a_503_and_never_an_unlocked_write(cockp
     monkeypatch.undo()
     status, _ = _call(cockpit["url"], f"/cockpit/sign/{RID}/deny", {"request_sha256": _sha(cockpit)})
     assert status == 200 and (cockpit["qdir"] / "sign" / f"{RID}.denied").exists()
+
+
+def test_extra_hosts_with_a_chat_host_is_refused_before_binding(tmp_path: Path) -> None:
+    """Head ruling on S1b Q1: a chat host is loopback-only (it drives an entity's hands with no off-box factor), and
+    extra_hosts puts a loopback server on the tailnet through a proxy, so the two together are refused. An
+    install-bearing source with extra_hosts stays allowed (flow's cockpit shape; the off-box read gate covers it)."""
+    from tests.test_chat import _Factory, _host
+    from tests.test_chat import _source as _chat_source
+
+    with pytest.raises(ValueError, match="extra_hosts.*chat"):
+        make_server(_chat_source(tmp_path), host="127.0.0.1", port=0, chat_host=_host(tmp_path, _Factory([])),
+                    extra_hosts=[RP])
+    httpd = make_server(_chat_source(tmp_path), host="127.0.0.1", port=0, chat_host=_host(tmp_path, _Factory([])),
+                        extra_hosts=[])
+    httpd.server_close()                                   # an empty list names no proxy
+    with _serving(tmp_path / "inst", extra_hosts=[RP]) as (_url, httpd):
+        assert httpd.levain_source.write_scope.install_root is not None and RP in httpd.proxied_hosts

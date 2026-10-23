@@ -1804,9 +1804,10 @@ def make_server(
     ``extra_hosts`` names Host values the gate admits beside loopback and the bound address: the https name a
     reverse proxy on this machine forwards (tailscale serve passes the browser's ``Host`` through, port included).
     Each is a bare ``name`` (a port in an entry is refused); the gate compares names only, so a request Host of
-    ``name:8443`` is admitted. Anything else is a ``ValueError`` before binding. It changes no bind rule. A
-    request whose Host names one is OFF-BOX for the read gate: the substrate reads need the token exactly as on an
-    off-box bind, since the proxy delivers every tailnet request from loopback."""
+    ``name:8443`` is admitted. Anything else is a ``ValueError`` before binding, and so is any entry beside a
+    ``chat_host`` (chat is loopback-only). A request whose Host names one is OFF-BOX for the read gate: the
+    substrate reads need the token exactly as on an off-box bind, since the proxy delivers every tailnet request
+    from loopback."""
     # Wildcard / public binds are refused for ANY source — a non-loopback bind is for
     # ONE specific private/mesh interface, never every interface or the internet.
     reason = _rejected_bind_host(host)
@@ -1988,6 +1989,10 @@ def make_server(
         if problem is not None:
             raise ValueError(f"refusing signer: {problem}")
     proxied_hosts = _extra_hosts(extra_hosts)
+    if proxied_hosts and chat_host is not None:
+        # chat is loopback-only (above); a name a proxy forwards puts this loopback server on another network
+        raise ValueError("refusing extra_hosts with --chat: a proxied name reaches this server from off the box, "
+                         "and chat drives an entity's hands with no off-box auth")
 
     # The async-job runtime for I/O-BOUND (``job=True``) verbs. AUTO-CREATE one when a job verb is
     # registered and the caller didn't inject its own (tests inject; production auto-creates): the
