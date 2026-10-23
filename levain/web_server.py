@@ -184,9 +184,9 @@ _SIGN_LIST_PATH = "/cockpit/sign.json"
 _SIGN_PREFIX = "/cockpit/sign/"
 _SIGN_ACTIONS = ("challenge", "answer", "deny")
 _SIGN_ERRORS = {400: "bad_request", 404: "not_found", 409: "conflict", 503: "unavailable"}   # the phone port's words
-# one extra Host value (make_server extra_hosts): a DNS name or IPv4 literal, an optional trailing dot, an optional port
-_EXTRA_HOST = re.compile(r"(?P<name>(?=[^:]{1,253}(?::|\Z))[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-                         r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?)(?::(?P<port>[1-9][0-9]{0,4}))?")
+# one extra Host value (make_server extra_hosts): a DNS name or IPv4 literal and an optional trailing dot, never a port
+_EXTRA_HOST = re.compile(r"(?=[^:]{1,253}\Z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+                         r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?")
 
 
 def _sign_route(route: str) -> "tuple[str, str] | None":
@@ -203,8 +203,9 @@ def _sign_route(route: str) -> "tuple[str, str] | None":
 def _extra_hosts(hosts: object) -> frozenset[str]:
     """``extra_hosts`` as the Host gate compares names (:func:`levain.http_guards.host_header_allowed`: lowercase, no
     trailing dot, no port, since the gate compares host names only, for loopback too). ValueError for anything that
-    is not ``name`` or ``name:port``: a scheme, a path, userinfo, a wildcard, an IPv6 literal, or a bare string where
-    a list belongs (its letters would each become a host)."""
+    is not a bare ``name``: a port, a scheme, a path, userinfo, a wildcard, whitespace, an IPv6 literal, or a bare
+    string where a list belongs (its letters would each become a host). The port is the request's (a proxied Host
+    ``name:8443`` is admitted by name); an entry carrying one would read as a pin the gate never enforces."""
     if hosts is None:
         return frozenset()
     if isinstance(hosts, (str, bytes)):
@@ -216,10 +217,10 @@ def _extra_hosts(hosts: object) -> frozenset[str]:
     out = set()
     for h in items:
         m = _EXTRA_HOST.fullmatch(h) if isinstance(h, str) else None
-        if m is None or (m["port"] is not None and int(m["port"]) > 65535):
-            raise ValueError(f"refusing extra_hosts entry {str(h)[:80]!r}: it must be a host name with at most a "
-                             "port (no scheme, path, userinfo or wildcard)")
-        out.add(m["name"].rstrip(".").lower())
+        if m is None:
+            raise ValueError(f"refusing extra_hosts entry {str(h)[:80]!r}: it must be a bare host name (no port, "
+                             "scheme, path, userinfo, wildcard or whitespace)")
+        out.add(h.rstrip(".").lower())
     return frozenset(out)
 
 
@@ -1790,8 +1791,9 @@ def make_server(
 
     ``extra_hosts`` names Host values the gate admits beside loopback and the bound address: the https name a
     reverse proxy on this machine forwards (tailscale serve passes the browser's ``Host`` through, port included).
-    Each is ``name`` or ``name:port``; the gate compares names only, so a port is accepted and dropped. Anything
-    else is a ``ValueError`` before binding. It changes no bind rule and no token rule."""
+    Each is a bare ``name`` (a port in an entry is refused); the gate compares names only, so a request Host of
+    ``name:8443`` is admitted. Anything else is a ``ValueError`` before binding. It changes no bind rule and no
+    token rule."""
     # Wildcard / public binds are refused for ANY source — a non-loopback bind is for
     # ONE specific private/mesh interface, never every interface or the internet.
     reason = _rejected_bind_host(host)

@@ -308,9 +308,10 @@ def test_two_signers_racing_the_last_write_leave_a_sig_that_matches_its_record(c
 def test_an_extra_host_is_admitted_with_or_without_its_port_and_nothing_else_is(tmp_path: Path) -> None:
     """tailscale serve forwards the browser's own Host (measured 10-23 against ``tailscale serve --https=8447``: Host
     and X-Forwarded-Host were ``<name>:8447``, Origin unchanged), so the name must pass with its port; the gate
-    compares host names only, as it does for loopback."""
+    compares host names only, as it does for loopback. The ENTRY is a bare name: the port is the request's, never the
+    caller's (a port in an entry is refused below)."""
     name = "missinglayer.tail1c8687.ts.net"
-    with _serving(tmp_path, extra_hosts=[name.upper() + ".", "other.example:8443"]) as (url, httpd):
+    with _serving(tmp_path, extra_hosts=[name.upper() + ".", "other.example"]) as (url, httpd):
         assert {name, "other.example"} <= httpd.allowed_hosts
         for host in (name, f"{name}:8443", f"{name.upper()}:8443", "other.example", "other.example:8443"):
             assert _call(url, "/", host=host)[0] == 200, host
@@ -322,8 +323,8 @@ def test_an_extra_host_is_admitted_with_or_without_its_port_and_nothing_else_is(
 
 @pytest.mark.parametrize("junk", ["https://box.example", "box.example/", "box.example/x", "*.box.example",
                                   "box example", "", "box.example:99999", "box.example:0", "box.example:x",
-                                  "box.example:", "[::1]", "u@box.example", "box..example", "-box.example", 7,
-                                  None])
+                                  "box.example:", "box.example:8443", " box.example", "[::1]", "u@box.example",
+                                  "box..example", "-box.example", 7, None])
 def test_junk_extra_hosts_are_refused_before_binding(tmp_path: Path, junk: Any) -> None:
     with pytest.raises(ValueError, match="extra_hosts"):
         make_server(_source(tmp_path), host="127.0.0.1", port=0, write_token=TOK, extra_hosts=[junk])
