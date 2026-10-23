@@ -26,14 +26,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 _TEST_DEF = re.compile(r"^\s*(?:async\s+)?def test_", re.MULTILINE)
-# A node id is `<path>.py` or `<path>.py::<name>[<params>]`; the path holds no colon. Summary and
-# warning lines ("12 tests collected in 1s", "tests/x.py:3: Warning") do not match.
-# pytest's own status words ("ERROR collecting tests/x.py", "FAILED ...") lead with an uppercase word and a space.
-_NODE = re.compile(r"^(?![A-Z]+ )([^\s:][^:]*\.py)(?:::.*)?$")
+# `pytest --collect-only -q` prints each collected item as `<path>::<name>[<params>]`. A node id is a line holding
+# `::` whose part before the first `::` ends in `.py`; that part is its file. Every other line (the summary, a warning
+# "tests/x.py:3: Warning", "ERROR collecting tests/x.py") holds no `::` and is ignored; a collection error also fails
+# the plan step through `set -o pipefail`.
 
 
 def files_from_node_ids(text):
-    return sorted({m.group(1) for line in text.splitlines() if (m := _NODE.match(line.rstrip()))})
+    files = set()
+    for line in text.splitlines():
+        head, sep, _ = line.rstrip().partition("::")
+        if sep and head.endswith(".py"):
+            files.add(head)
+    return sorted(files)
 
 
 def weight(rel_path, root=ROOT):
