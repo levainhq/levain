@@ -127,7 +127,7 @@ from typing import Any, Callable, Iterator
 
 from levain import unshowable
 
-__all__ = ["CHOICE_FORMAT", "CHOICE_MARK", "ERROR_WORDS", "LIST_MAX", "MESSAGE_MAX", "OPTIONS_MAX",
+__all__ = ["CHOICE_FORMAT", "CHOICE_MARK", "ERROR_WORDS", "LIST_MAX", "LOCK_WAIT_S", "MESSAGE_MAX", "OPTIONS_MAX",
            "REFUSED_NAMESPACES", "REQUEST_FORMAT", "SIGN_DIR", "WRITE_IN_KEY", "SignRefused", "SignRequest", "Signer",
            "choice_line", "deep_link", "error_word", "namespace_problem", "parse_choice", "passkey_key_source",
            "read_request", "request_id_ok", "sign_dir", "sign_root", "signed_bytes", "state_of", "write_in_problem"]
@@ -151,6 +151,9 @@ _OPTION_KEY = re.compile(r"[a-z0-9]{1,8}")
 WRITE_IN_KEY = "*"                 # the key a write-in signs under: never an option key, which is [a-z0-9]{1,8}
 # ssh's conventional namespaces: git's commit signing (levain's team ledger verifies in it), file and email
 REFUSED_NAMESPACES = frozenset({"git", "file", "email"})
+# how long an answer or a deny waits for the queue lock another Signer holds (its writes take milliseconds), then a 503
+LOCK_WAIT_S = 5.0
+_LOCK_POLL_S = 0.02
 
 
 def request_id_ok(request_id: object) -> bool:
@@ -557,14 +560,28 @@ def _queue_lock(queue_dir: Path) -> Iterator[None]:
     """An exclusive ``flock`` on ``<queue_dir>/sign/.lock`` around the last check and the writes of an answer or a
     deny, held across every Signer on the queue in any process (a Signer's own lock orders only its own threads).
     A fresh open per acquisition, so two Signers in one process contend too; closing the descriptor releases it. A
-    sign directory that cannot hold the lock is a 503, never an unlocked write."""
+    sign directory that cannot hold the lock (flock's own OSError: ENOLCK, ENOTSUP) is a 503, never an unlocked
+    write, and so is a lock another holder keeps past :data:`LOCK_WAIT_S`; the descriptor is closed on every path."""
+    import time
+
     path = sign_dir(queue_dir) / ".lock"
     try:
         fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except OSError as exc:
         raise SignRefused(f"could not lock {path}: [Errno {exc.errno}] {exc.strerror or exc}", 503) from None
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        deadline = time.monotonic() + LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise SignRefused(f"could not lock {path}: another signer has held it past {LOCK_WAIT_S:g}s; "
+                                      "nothing was written, try again", 503) from None
+                time.sleep(_LOCK_POLL_S)
+            except OSError as exc:
+                raise SignRefused(f"could not lock {path}: [Errno {exc.errno}] {exc.strerror or exc}", 503) from None
         yield
     finally:
         os.close(fd)

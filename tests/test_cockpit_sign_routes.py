@@ -380,3 +380,92 @@ def test_a_signer_without_a_valid_page_origin_is_refused_before_binding(tmp_path
             make_server(_source(tmp_path), host="127.0.0.1", port=0, write_token=TOK, signer=signer)
     with pytest.raises(ValueError, match="signer"):
         make_server(_source(tmp_path), host="127.0.0.1", port=0, write_token=TOK, signer=object())
+
+
+# --- L3 r1 on cafcac36 (item 5) ---------------------------------------------------------------------------------
+
+
+def test_a_signer_on_a_server_with_no_token_to_carry_is_refused_before_binding(tmp_path: Path) -> None:
+    """codex MED: every sign route needs a surface token, so a signer on a server that has none (a read-only source
+    given no write_token and no surface_tokens) would be a permanent 403. It is refused, saying why."""
+    pk = _Passkey()
+    signer = Signer(tmp_path / "q", (NS,), RP, lambda: {pk.key.fingerprint: pk.key})
+    signer.page_origin = PINNED
+    read_only = SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "memory.db"), write_scope=None)
+    with pytest.raises(ValueError, match="refusing signer: .*no surface token"):
+        make_server(read_only, host="127.0.0.1", port=0, signer=signer)
+    httpd = make_server(read_only, host="127.0.0.1", port=0, signer=signer, surface_tokens={"browser": TOK})
+    httpd.server_close()                                   # a token given: served
+
+
+def test_a_page_origin_changed_after_construction_signs_nothing(cockpit) -> None:
+    """complement LOW 2: make_server keeps the page_origin it validated; a Signer whose page_origin moved since then
+    (wider, malformed or cleared) is refused on every sign POST, and nothing is written."""
+    signer, pk = cockpit["signer"], cockpit["pk"]
+    status, ch = _challenge(cockpit, "a")
+    assert status == 200
+    for moved in (f"https://{RP}:9999", "https://evil.example", None):
+        signer.page_origin = moved
+        status, out = _call(cockpit["url"], f"/cockpit/sign/{RID}/answer", pk.assertion(ch["challenge"], PINNED))
+        assert status == 503 and out["error"] == "unavailable" and "page_origin" in out["message"], (moved, out)
+        assert _challenge(cockpit, "a")[0] == 503
+        assert _call(cockpit["url"], f"/cockpit/sign/{RID}/deny", {"request_sha256": _sha(cockpit)})[0] == 503
+        assert _no_result(cockpit) and not (cockpit["qdir"] / "sign" / f"{RID}.denied").exists()
+    signer.page_origin = PINNED
+    status, ch = _challenge(cockpit, "a")
+    assert status == 200
+    assert _call(cockpit["url"], f"/cockpit/sign/{RID}/answer", pk.assertion(ch["challenge"], PINNED))[0] == 200
+    assert _verifies(cockpit)
+
+
+def test_a_held_or_failing_queue_lock_is_a_503_and_never_an_unlocked_write(cockpit, monkeypatch) -> None:
+    """complement LOW 1 + codex LOW: the queue lock is polled for a bounded wait, then a 503; flock's own OSError
+    (ENOLCK, ENOTSUP) is a 503 too; the lock's descriptor is closed on every path."""
+    import errno
+    import fcntl
+    import os
+    import time
+
+    from levain.consent import sign
+
+    monkeypatch.setattr(sign, "LOCK_WAIT_S", 0.3)
+    (cockpit["qdir"] / "sign").mkdir(exist_ok=True)
+    holder = os.open(cockpit["qdir"] / "sign" / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        t0 = time.monotonic()
+        status, out = _call(cockpit["url"], f"/cockpit/sign/{RID}/deny", {"request_sha256": _sha(cockpit)})
+        waited = time.monotonic() - t0
+        assert status == 503 and "lock" in out["message"], out
+        assert 0.25 <= waited < 5, waited
+        assert not (cockpit["qdir"] / "sign" / f"{RID}.denied").exists()
+    finally:
+        os.close(holder)
+
+    opened: list[int] = []
+    closed: list[int] = []
+    real_open, real_close = os.open, os.close
+
+    def track_open(*a: Any, **k: Any) -> int:
+        fd = real_open(*a, **k)
+        if str(a[0]).endswith(".lock"):
+            opened.append(fd)
+        return fd
+
+    def track_close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    def no_locks(fd: int, op: int) -> None:
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(sign.os, "open", track_open)
+    monkeypatch.setattr(sign.os, "close", track_close)
+    monkeypatch.setattr(sign.fcntl, "flock", no_locks)
+    status, out = _call(cockpit["url"], f"/cockpit/sign/{RID}/deny", {"request_sha256": _sha(cockpit)})
+    assert status == 503 and "No locks available" in out["message"], out
+    assert opened and set(opened) <= set(closed)
+    assert not (cockpit["qdir"] / "sign" / f"{RID}.denied").exists()
+    monkeypatch.undo()
+    status, _ = _call(cockpit["url"], f"/cockpit/sign/{RID}/deny", {"request_sha256": _sha(cockpit)})
+    assert status == 200 and (cockpit["qdir"] / "sign" / f"{RID}.denied").exists()

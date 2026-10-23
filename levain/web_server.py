@@ -772,6 +772,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # The caller's sign-request Signer (DESIGN_SIGN D4), its page_origin pinned to the page this cockpit is served on;
     # None serves no sign route.
     signer: "Signer | None" = None
+    signer_page_origin: "str | None" = None
     # The change stream (levain.cockpit.stream): set per instance in __init__, before the socket binds,
     # because a failed bind runs server_close and that reads these.
     stream_gate: threading.BoundedSemaphore
@@ -1072,6 +1073,12 @@ class _Handler(GuardedHandler):
         signer = self.server.signer
         if signer is None:     # the route is not served without one; an explicit check survives `python -O`
             return {"error": "not_found", "message": "no such route"}, 404
+        if signer.page_origin != self.server.signer_page_origin or self.server.signer_page_origin is None:
+            # the Signer verifies against its own attribute: one moved since make_server checked it would widen or
+            # break the pin with no error, so every sign POST stops until it is the validated page again
+            return {"error": error_word(503), "message": (
+                f"the signer's page_origin is not the page this cockpit was built for "
+                f"({self.server.signer_page_origin}): nothing is signed")}, 503
         try:
             return getattr(signer, action)(request_id, req), 200
         except SignRefused as exc:
@@ -2016,6 +2023,10 @@ def make_server(
         raise ValueError("refusing surface tokens: two surfaces share one token")
     if source.write_scope is not None and not tokens:
         tokens["browser"] = secrets.token_urlsafe(32)
+    if signer is not None and not tokens:
+        # every sign route needs a surface token (DESIGN_SIGN D4), so a signer here would be a permanent 403
+        raise ValueError("refusing signer: this server has no surface token for its sign routes to require (a "
+                         "read-only source given no write_token or surface_tokens); pass a write_token")
 
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     httpd = _LevainHTTPServer((host, port), _Handler)
@@ -2028,6 +2039,8 @@ def make_server(
     httpd.job_runtime = job_runtime
     httpd.chat_host = chat_host
     httpd.signer = signer
+    # the page_origin make_server validated above; a sign POST is refused if the Signer's has moved since
+    httpd.signer_page_origin = signer.page_origin if signer is not None else None
     # The shared cockpit (levain.cockpit). A downstream passes its own (the kernel's providers plus
     # its panels); None means the kernel's default over this substrate, built on first request.
     # Its start() (refresher threads) is the caller's when it passes its own.

@@ -123,7 +123,9 @@ def test_one_error_word_table_answers_for_the_phone_port_and_the_cockpit(qdir: P
             with pytest.raises(PhoneError) as refused:
                 srv.sign_step("np-sign-0001", "challenge", {})
             assert (refused.value.status, refused.value.error) == (status, word)
-            fake = SimpleNamespace(server=SimpleNamespace(signer=SimpleNamespace(challenge=refuse)))
+            pin = "https://phone.example:8443"
+            fake = SimpleNamespace(server=SimpleNamespace(signer=SimpleNamespace(challenge=refuse, page_origin=pin),
+                                                          signer_page_origin=pin))
             body, code = web_server._Handler._sign_post(fake, "np-sign-0001", "challenge", {})  # type: ignore[arg-type]
             assert (code, body["error"]) == (status, word)
     finally:
