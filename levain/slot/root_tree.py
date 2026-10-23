@@ -34,7 +34,10 @@ VENDOR_PREFIX: Mapping[str, Path] = {"darwin": Path("/usr/local/lib/levain-vendo
 
 #: entry script name -> the module it runs as ``__main__``.
 ENTRY_MODULES = {"install-helper": "levain.slot.install_helper", "runtime-helper": "levain.slot.runtime_helper",
-                 "service-entry": "levain.slot.service_boot"}
+                 "service-entry": "levain.slot.service_boot",
+                 # s5 §5b (head ruling 1022+19 Q4): the importer's entry, the argv[0] wall.export_launch_spec builds
+                 # (HELPER_DIR/export-importer). export-verifier joins with its module (5d-i).
+                 "export-importer": "levain.slot.importer"}
 HELPER_MODULES = {k: v for k, v in ENTRY_MODULES.items() if k != "service-entry"}
 
 
@@ -383,11 +386,13 @@ def flip_step(host: HostOS, target: str) -> Step:
 
 
 def entry_steps(host: HostOS) -> list[Step]:
-    """The three entry scripts (§2.3 R10: written AFTER the flip, so none ever names a ``current`` not there yet)."""
+    """Every :data:`ENTRY_MODULES` entry script (§2.3 R10: written AFTER the flip, so none ever names a ``current``
+    not there yet)."""
     return [Step(f"write the {entry} entry script {path}", write=(path, entry_text(host, entry), 0o755))
             for entry, path in (("install-helper", install_helper_path(host)),
                                 ("runtime-helper", runtime_helper_path(host)),
-                                ("service-entry", service_entry_path(host)))]
+                                ("service-entry", service_entry_path(host)),
+                                ("export-importer", HELPER_DIR[host] / "export-importer"))]
 
 
 def _gc(tree: Path, keep: frozenset[str], rm: str) -> tuple[bool, str]:

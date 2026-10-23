@@ -568,6 +568,9 @@ class Seams:
     proc_seams: Optional[object] = None
     #: EndSeams fields a test replaces (owner_ok, meta_reader, strip, chown, run_as, ...); empty in production.
     end_overrides: Mapping[str, object] = field(default_factory=dict)
+    #: adopt-open's seams (None = the real ones): steps 1-5 (``AdoptSeams``) and steps 6-12 (``AdoptRunSeams``).
+    adopt: Optional["AdoptSeams"] = None
+    adopt_run: Optional["AdoptRunSeams"] = None
 
     @property
     def L(self) -> Path:
@@ -2047,19 +2050,373 @@ def adopt_open_front(ctx: Ctx, session: str, adopt: Optional[AdoptSeams] = None)
     deadline = ctx.seams.monotonic() + adopt.lock_wait_s   # V7's one wall: the lock wait and the walk
     a = adopt_step1_caller(ctx, session)
     ctx.seams.at("adopt:2")
-    with session_lock(ctx, session):
-        ctx.seams.at("adopt:3")
-        front = adopt_step3_root_facts(ctx, a, adopt, deadline=deadline)
-        ctx.seams.at("adopt:4")
-        with adopt_lock_wait(ctx, front.deadline):
-            ctx.seams.at("adopt:5")
-            adopt_step5_precaps(ctx, front, adopt)
-            yield front
+    try:
+        with session_lock(ctx, session):
+            ctx.seams.at("adopt:3")
+            front = adopt_step3_root_facts(ctx, a, adopt, deadline=deadline)
+            ctx.seams.at("adopt:4")
+            try:
+                with adopt_lock_wait(ctx, front.deadline):
+                    ctx.seams.at("adopt:5")
+                    adopt_step5_precaps(ctx, front, adopt)
+                    yield front
+            finally:
+                ctx.seams.at("adopt:adopt-unlocked")
+    finally:
+        ctx.seams.at("adopt:session-unlocked")
+
+
+# --- adopt-open steps 6-12: the sealed import run (DESIGN §1 steps 6-12, §4.1, §4.5, §5b; 5c-ii-c) ----------------
+
+#: V31's memory cap for the importer (the Linux leaf's ``memory.max``, the macOS watchdog's cap) [judged by adopt-cc,
+#: 10-22, against DESIGN §4.9's 5g row "a one-shot allocation past 4 GiB"; no ruling names the number].
+ADOPT_MEMORY_CAP = 4 << 30
+#: V31's ``pids.max`` on the run leaf: the same count as the stage's ``RLIMIT_NPROC`` (``wall.EXPORT_NPROC``).
+ADOPT_PIDS_MAX = wall.EXPORT_NPROC
+#: Step 10: root waits for the result line until V7's time + this grace (DESIGN §1 step 10, "V7 time + 60 s").
+RESULT_GRACE_S = 60.0
+#: The export class adopt-open publishes into (an operator's adopt; the reaper's artifact step is ``dispatch``).
+ADOPT_CLASS = "operator"
+_O_LOG = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+
+def export_rlimits(image_bytes: int, cpu_s: float = V7_SECONDS) -> Tuple[Tuple[int, int], ...]:
+    """§5b "Both" (head ruling 1022+19 Q3): ``(resource, limit)`` pairs root sets in the forked export child, soft =
+    hard, so the target cannot raise them back: ``RLIMIT_CORE`` 0, ``RLIMIT_FSIZE`` V31's image bytes (no file the
+    importer writes can outgrow the image; the logs included), ``RLIMIT_CPU`` V7's seconds. ``RLIMIT_NPROC`` is the
+    stage's (``Spec.nproc``); there is no ``RLIMIT_AS`` (A5: memory is the leaf's or the watchdog's)."""
+    import resource
+    return ((resource.RLIMIT_CORE, 0), (resource.RLIMIT_FSIZE, int(image_bytes)),
+            (resource.RLIMIT_CPU, int(cpu_s)))
+
+
+def apply_rlimits(limits: Sequence[Tuple[int, int]]) -> None:
+    """Each limit as soft AND hard, never above the hard limit already in force (lowering a hard limit needs no
+    privilege; raising one would fail EPERM for a non-root caller and is never wanted)."""
+    import resource
+    for res, want in limits:
+        _soft, hard = resource.getrlimit(res)
+        v = want if hard == resource.RLIM_INFINITY or hard < 0 else min(want, hard)
+        resource.setrlimit(res, (v, v))
+
+
+@dataclass(frozen=True)
+class ExportCmd:
+    """One export target's launch: ``argv`` (macOS ``launchctl asuser`` -> the stage; Linux bwrap -> the stage),
+    the stage's ``spec_json``, the Linux leaf the child joins (``cgroup``), ``cwd`` (None in production: the stage
+    changes to the spec's cwd after the drop; a seam run with no stage sets it here) and ``exec_child(argv,
+    spec_fd, cgroup)``, the child's last act (:func:`wall.exec_launch`)."""
+
+    argv: Tuple[str, ...]
+    spec_json: bytes
+    cgroup: Optional[str] = None
+    cwd: Optional[str] = None
+    exec_child: Callable[..., None] = wall.exec_launch
+
+
+def export_launch_default(ctx: Ctx, args: Sequence[str], export_class: str) -> ExportCmd:
+    """The importer's product launch (§5b): its spec (:func:`wall.export_launch_spec`, the principal
+    ``_levain_export`` with the class's group) and the host's launch argv."""
+    host = ctx.seams.host
+    group = wall.EXPORT_GROUPS[("importer", export_class)]
+    ids = {wall.EXPORT_ACCOUNT["importer"]: ctx.seams.account_uid(wall.EXPORT_ACCOUNT["importer"])}
+    shared = {group: ctx.seams.group_gid(group)}
+    spec = wall.export_launch_spec(host, "importer", ids=ids, shared=shared, args=args, export_class=export_class)
+    if host == "darwin":
+        return ExportCmd(wall.macos_launch_argv(spec), spec.to_json())
+    launch = wall.export_linux_launch_argv(spec, host_links=ctx.seams.host_links())
+    return ExportCmd(launch.argv, spec.to_json(), cgroup=launch.cgroup)
+
+
+def spawn_export(cmd: ExportCmd, *, frame_r: int, stdout_fd: int, stderr_fd: int, result_w: int,
+                 rlimits: Sequence[Tuple[int, int]]) -> int:
+    """§1 step 7's fork: the child ``setsid``s, puts the frame pipe's read end on 0, the two log files on 1 and 2,
+    the result pipe's write end on :data:`wall.RESULT_FD` (4), keeps the spec pipe (moved to ``SPEC_FD`` by
+    ``exec_launch``, read and closed by the stage before its exec) and closes every other fd; sets
+    :func:`export_rlimits` (they survive the exec chain and the drop); then ``cmd.exec_child``. The parent writes the
+    spec, closes its spec end and returns the pid. A child that fails before its exec exits 70 with no result line."""
+    spec_r, spec_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:   # pragma: no cover - the forked child; the seam run drives it, the root path is a 5g row
+        try:
+            os.setsid()
+            hi = [fcntl.fcntl(fd, fcntl.F_DUPFD, 32) for fd in (frame_r, stdout_fd, stderr_fd, result_w, spec_r)]
+            for src, dst in zip(hi[:4], (0, 1, 2, wall.RESULT_FD)):
+                os.dup2(src, dst)          # dup2 leaves the target inheritable
+            _close_fds_except([wall.RESULT_FD, hi[4]])
+            apply_rlimits(rlimits)
+            if cmd.cwd is not None:
+                os.chdir(cmd.cwd)
+            cmd.exec_child(cmd.argv, hi[4], cgroup=cmd.cgroup)
+        except BaseException:   # noqa: BLE001 - the child never returns into the helper's stack
+            pass
+        os._exit(70)
+    os.close(spec_r)
+    try:
+        write_all(spec_w, cmd.spec_json)
+    except OSError:
+        pass                    # a child that died before reading its spec: its exit says so
+    finally:
+        os.close(spec_w)
+    return pid
+
+
+def collect_export(pid: int, result_r: int, deadline_s: float, *, cap: int,
+                   monotonic: Callable[[], float] = time.monotonic) -> Tuple[str, Optional[int], Optional[bytes], bool]:
+    """§1 step 10: the result line read from fd 4 as DATA while the importer runs, at most ``cap`` + 1 bytes (the
+    classifier refuses the extra byte by size), until the importer EXITS (polled ``WNOHANG``), never until the pipe's
+    EOF: a process the importer left behind can hold fd 4 open, and seal-out kills it. Returns ``(exit, code, line,
+    reaped)``: ``exit`` ``"exit"`` (``code`` its status) or ``"signal"``, or ``"time"`` past ``deadline_s`` with the
+    importer NOT reaped (seal-out's domain proof kills and reaps it as a child)."""
+    end = monotonic() + deadline_s
+    buf = bytearray()
+    open_ = True
+    os.set_blocking(result_r, False)
+
+    def take() -> bool:            # one read; False at EOF or nothing ready
+        nonlocal open_
+        if not open_ or len(buf) > cap:
+            return False
+        try:
+            b = os.read(result_r, min(65536, cap + 1 - len(buf)))
+        except BlockingIOError:
+            return False
+        if not b:
+            open_ = False
+            return False
+        buf.extend(b)
+        return True
+
+    with selectors.DefaultSelector() as sel:
+        sel.register(result_r, selectors.EVENT_READ)
+        while True:
+            try:
+                done, status = os.waitpid(pid, os.WNOHANG)
+            except InterruptedError:
+                continue
+            if done:
+                while take():
+                    pass
+                line = bytes(buf) if buf else None
+                if os.WIFSIGNALED(status):
+                    return "signal", None, line, True
+                return "exit", os.WEXITSTATUS(status), line, True
+            left = end - monotonic()
+            if left <= 0:
+                return "time", None, (bytes(buf) if buf else None), False
+            if open_ and len(buf) <= cap:
+                if sel.select(min(left, 0.05)):
+                    take()
+            else:
+                time.sleep(min(left, 0.05))
+
+
+@dataclass
+class AdoptRunSeams:
+    """Steps 6-12's injected facts, each with its real default. ``seal(facts) -> export_run.SealSeams`` (None: the
+    real domain prover of ``_levain_export``); ``launch(ctx, args, export_class) -> ExportCmd``; ``spawn``
+    (:func:`spawn_export`); ``walk_seams() -> walker.WalkSeams`` (None: root's, owner uid 0); ``publish_gid(ctx,
+    export_class)`` (None: the class group's gid; a seam run as an unprivileged uid answers None from it, no chown);
+    ``memory_cap`` / ``pids_max`` (V31); ``result_grace_s`` (step 10)."""
+
+    seal: Optional[Callable[[object], object]] = None
+    launch: Callable[[Ctx, Sequence[str], str], ExportCmd] = export_launch_default
+    spawn: Callable[..., int] = spawn_export
+    walk_seams: Optional[Callable[[], object]] = None
+    publish_gid: Optional[Callable[[Ctx, str], Optional[int]]] = None
+    memory_cap: int = ADOPT_MEMORY_CAP
+    pids_max: int = ADOPT_PIDS_MAX
+    result_grace_s: float = RESULT_GRACE_S
+
+
+def make_work(ctx: Ctx, work: str, object_format: str, export_uid: int) -> Tuple[int, int]:
+    """Seal-in's ``.work/`` skeleton (§4.1): :func:`importer.make_skeleton` (modes set, root's), then the export
+    uid made the owner of ``repo.git/objects``, ``repo.git/refs``, ``spool``, ``out``, ``log`` and the two log files
+    (``repo.git`` itself, ``config`` and ``HEAD`` stay root's), each opened ``O_NOFOLLOW`` before its ``fchown``.
+    Returns the two log files opened for writing (fds 1 and 2 of the child, A7). Nothing runs in the domain yet."""
+    from levain.slot import importer as IM
+
+    IM.make_skeleton(Path(work), object_format)
+    for rel in ("repo.git/objects", "repo.git/refs", "spool", "out", "log"):
+        fd = os.open(os.path.join(work, rel), _O_DIR)
+        try:
+            ctx.seams.chown(fd, export_uid, -1, f"export/.work/{rel}")
+        finally:
+            os.close(fd)
+    logs = []
+    try:
+        for name in ("stdout", "stderr"):
+            fd = os.open(os.path.join(work, "log", name), _O_LOG)
+            logs.append(fd)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise Refused(ER_UNAVAILABLE, f".work/log/{name} is not a regular file")
+            ctx.seams.chown(fd, export_uid, -1, f"export/.work/log/{name}")
+    except BaseException:
+        for fd in logs:
+            os.close(fd)
+        raise
+    return logs[0], logs[1]
+
+
+ER_UNAVAILABLE = "export-image-unavailable"
+
+
+def importer_args(session: str, base: Mapping[str, object], adopt: AdoptSeams) -> Tuple[str, ...]:
+    """The importer's fixed argv (``importer._parser``); ``wall.export_launch_spec`` refuses it past the spec's
+    string cap (``spec-malformed``), so a longer argv can never launch."""
+    return ("--git", wall.GIT, "--session", session, "--object-format", str(base["object_format"]),
+            "--base-oid", str(base["oid"]), "--max-bytes", str(adopt.max_bytes),
+            "--max-input-size", str(adopt.max_bytes))
+
+
+def adopt_answer(ctx: Ctx, front: AdoptFront, result: str, pub: object, export_class: str) -> Dict[str, object]:
+    """§4.5: ``result`` and ``refs`` from root's own header parse (never the importer's line), ``base_oid`` and
+    ``object_format`` from ``alloc.base``, the digests of the bytes root copied; head ruling A2: the transaction's
+    ``warnings`` (a class-dir fsync that failed after the commit) ride beside ``ok: true`` when there are any."""
+    s = front.alloc.session
+    prefix = f"refs/levain/{s}/".encode()
+    refs: List[str] = []
+    header = getattr(pub, "header", None)
+    if header is not None:
+        names = {n[len(prefix):].decode("ascii") for _oid, n in header.refs if n.startswith(prefix)}
+        refs = [r for r in ("head", "wip") if r in names]
+    digests = getattr(pub, "digests")
+    out: Dict[str, object] = {
+        "result": result, "repo": str(ctx.seams.L / "export" / export_class / s),
+        "bundle_digest": ("sha256:" + digests["bundle"]) if "bundle" in digests else None,
+        "report_digest": "sha256:" + digests["report.json"],
+        "base_oid": front.base["oid"], "object_format": front.base["object_format"], "refs": refs}
+    warnings = tuple(getattr(pub, "warnings", ()))
+    if warnings:
+        out["warnings"] = list(warnings)
+    return out
+
+
+def adopt_sealed_run(ctx: Ctx, front: AdoptFront, adopt: AdoptSeams, run_seams: AdoptRunSeams,
+                     export_class: str = ADOPT_CLASS) -> Dict[str, object]:
+    """Steps 6-12 inside both locks. Seal-in (``SealedRun.seal_in``) -> the skeleton and its owners -> (macOS) the
+    importer profile written -> spawn -> the watchdog -> the walk into the frame pipe, whose write end is CLOSED as
+    soon as the walker returns or refuses (the importer sees EOF at once, never its trailing wait) -> the result line
+    and the reap -> seal-out ALWAYS (it kills anything the importer left) -> the ONE classification -> the publish
+    (``before_commit`` = the image released) -> the §4.5 answer; teardown in a ``finally``. A walker refusal (head
+    ruling Q5): seal-out still runs, ``export-domain-unproven`` from it wins, else the walker's own name; nothing is
+    published. The locks are the caller's (:func:`adopt_open_front`), released after this returns."""
+    from levain.slot import export_run as ER
+    from levain.slot import importer as IM
+    from levain.slot import walker as WK
+
+    at, host, s = ctx.seams.at, ctx.seams.host, front.alloc.session
+    export_dir = str(ctx.seams.L / "export")
+    uid = ctx.seams.account_uid(wall.EXPORT_ACCOUNT["importer"])
+    bundle_bytes = int(front.base["bundle_bytes"])   # type: ignore[call-overload]
+    image_bytes = adopt_image_bytes(host, entries=front.entries, nbytes=front.nbytes,
+                                    manifest_bytes=front.manifest_bytes, bundle_bytes=bundle_bytes)
+    facts = ER.SealFacts(host=host, role_key="importer", export_dir=export_dir, uid=uid, image_bytes=image_bytes,
+                         image_inodes=2 * front.entries + IMAGE_INODES_FIXED, memory_cap=run_seams.memory_cap,
+                         pids_max=run_seams.pids_max)
+    seal = run_seams.seal(facts) if run_seams.seal is not None else ER.SealSeams(
+        prove=ER.export_domain_prover(host, "importer", uid))
+    run = ER.SealedRun(facts, seal)   # type: ignore[arg-type]
+    gid = (run_seams.publish_gid or (lambda c, k: c.seams.group_gid(wall.EXPORT_GROUPS[("importer", k)])))(
+        ctx, export_class)
+    with ctx.store.dir("export", export_class) as class_dfd:
+        at("adopt:6")
+        run.seal_in(class_dfd, s + ER.STAGING_SUFFIX)      # a refusal here has torn down what it made
+        pid: Optional[int] = None
+        reaped = False
+        sealed_out = False
+        try:
+            work = ER.mount_path(export_dir, "importer")
+            out_fd, err_fd = make_work(ctx, work, str(front.base["object_format"]), uid)
+            run.fds += [out_fd, err_fd]
+            if host == "darwin":
+                with ctx.store.dir("export") as efd:
+                    replace_at(efd, "importer.sb", RD.render_importer_profile(host), mode=0o644,
+                               fsync=ctx.seams.fsync)
+            cmd = run_seams.launch(ctx, importer_args(s, front.base, adopt), export_class)
+            frame_r, frame_w = os.pipe()
+            result_r, result_w = os.pipe()
+            for fd in (frame_w, result_r):
+                run.fds.append(fd)
+            at("adopt:7")
+            try:
+                pid = run_seams.spawn(cmd, frame_r=frame_r, stdout_fd=out_fd, stderr_fd=err_fd, result_w=result_w,
+                                      rlimits=export_rlimits(image_bytes))
+            finally:
+                os.close(frame_r)
+                os.close(result_w)
+                for fd in (out_fd, err_fd):    # the child's now: root holds no fd into the image past the spawn
+                    run.fds.remove(fd)
+                    os.close(fd)
+            run.start_watchdog()
+            at("adopt:8")
+            walk_refusal: Optional[Refused] = None
+            try:
+                WK.walk_frames(front.retained / "tree", front.retained / "manifest.jsonl", frame_w,
+                               depth=front.depth, caps=adopt_walk_caps(front, adopt),
+                               base_bundle_sha256=str(front.base["bundle_sha256"]),
+                               seams=run_seams.walk_seams() if run_seams.walk_seams is not None else None)
+            except Refused as e:
+                walk_refusal = e
+            finally:
+                run.fds.remove(frame_w)
+                os.close(frame_w)          # 5b1 carry 3: EOF right after the terminal frame (or the refusal)
+                at("adopt:frame-closed")
+            at("adopt:10")
+            wait_s = max(0.0, front.deadline - ctx.seams.monotonic()) + run_seams.result_grace_s
+            exit_kind, code, line, reaped = collect_export(pid, result_r, wait_s, cap=IM.RESULT_CAP)
+            run.fds.remove(result_r)
+            os.close(result_r)
+            at("adopt:11")
+            sealed_out = True              # ONE seal-out: an unproven one raises and is not run again below
+            reading = run.seal_out(() if reaped else (pid,))
+            if walk_refusal is not None:
+                raise walk_refusal
+            at("adopt:classify")
+            outcome = ER.classify(ER.RunObservation(exit_kind, code, reading.memory_killed, reading.memory_unreadable,
+                                                    reading.host_short, line))
+            at("adopt:publish")
+            work_dfd = os.open(work, _O_DIR)
+            run.fds.append(work_dfd)
+
+            def release() -> None:         # D2: no fd of root's into the image survives the detach
+                if work_dfd in run.fds:
+                    run.fds.remove(work_dfd)
+                    os.close(work_dfd)
+                run.release_image()
+
+            result, pub = ER.publish_if_success(
+                outcome, work_dfd, class_dfd, s, object_format=str(front.base["object_format"]), owner_uid=uid,
+                caps={"bundle": image_bytes, "report.json": IM.REPORT_CAP}, seams=seal.publish,  # type: ignore[attr-defined]
+                gid=gid, before_commit=release)
+            at("adopt:12")
+            return adopt_answer(ctx, front, result, pub, export_class)
+        finally:
+            if not sealed_out:
+                # anything that failed after seal-in: the domain is still killed and proven before the locks go
+                try:
+                    run.seal_out(() if (pid is None or reaped) else (pid,))
+                except Refused:
+                    pass           # unproven: teardown leaves the image for the next seal-in
+            at("adopt:teardown")
+            run.teardown()
+
+
+def adopt_open(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
+    """``adopt-open <session>`` (CONTRACT §5.1; DESIGN §1 steps 1-12): steps 1-5 (:func:`adopt_open_front`) hold
+    the session lock, then the adopt lock; steps 6-12 run inside both (:func:`adopt_sealed_run`); the adopt lock is
+    released first, then the session lock."""
+    assert req.session is not None
+    adopt = ctx.seams.adopt if ctx.seams.adopt is not None else AdoptSeams()
+    run_seams = ctx.seams.adopt_run if ctx.seams.adopt_run is not None else AdoptRunSeams()
+    with adopt_open_front(ctx, req.session, adopt) as front:
+        return adopt_sealed_run(ctx, front, adopt, run_seams)
 
 
 VERB_HANDLERS: Dict[str, Callable[[Ctx, RuntimeRequest, object], Dict[str, object]]] = {
     "prepare": prepare, "render": render, "resume": resume, "status": status,
-    "start": _start, "teardown": _teardown,
+    "start": _start, "teardown": _teardown, "adopt-open": adopt_open,
 }
 
 

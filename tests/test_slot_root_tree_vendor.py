@@ -50,7 +50,7 @@ def test_root_tree_vendors_deps(host):
     # nothing names the legacy top-level h11 or levain: the only tree paths touched are the partial and the generation
     assert not [a for a in argvs if any(x in (f"{tree}/h11", f"{tree}/levain") for x in a)]
     # the entries are unchanged: keys gets no installed entry in 3b
-    assert {s.write[0].name for s in steps if s.write} == {"install-helper", "runtime-helper", "service-entry"}
+    assert {s.write[0].name for s in steps if s.write} == {"install-helper", "runtime-helper", "service-entry", "export-importer"}
     # the real h11 the installing Levain imports is the default source, and it passes the floor
     real = root_tree.h11_source()
     assert real.name == "h11" and (real / "__init__.py").is_file()
