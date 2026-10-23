@@ -75,6 +75,8 @@ class KeyRow:
     legacy_enrolled_at: str | None = None
     custody: str = UNSTATED          # what its enrol record declares (a declaration, never a proof)
     public_key: str | None = None
+    # why it is QUARANTINED (levain.authority.AuthoritySnapshot.quarantined_keys), or None
+    quarantined: str | None = None
 
 
 # what signs a link's message (namespace ``levain-authority``); returns the armored SSHSIG
@@ -163,9 +165,9 @@ def _check_reported(conn: object) -> None:
         raise KeyError_(f"this journal's install class is {cls!r}; enrolling here is for a reported install")
 
 
-def _row(k: AuthorityKey) -> KeyRow:
+def _row(k: AuthorityKey, quarantined: str | None = None) -> KeyRow:
     return KeyRow(k.fingerprint, k.principal, k.key_class, k.enrolled_seq, k.enrolled_at, k.revoked_seq,
-                  k.compromised_since, k.legacy_enrolled_at, k.custody, k.public_key)
+                  k.compromised_since, k.legacy_enrolled_at, k.custody, k.public_key, quarantined)
 
 
 def _capture(db: CockpitDB, now: datetime, ssh_keygen: Path | str) -> RequestAuthority:
@@ -326,7 +328,8 @@ def keys(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAU
             raise KeyError_(str(auth.authority_error))
         return [], auth.authority_error
     rows = sorted(auth.authority.keys.values(), key=lambda k: k.enrolled_seq)
-    return [_row(k) for k in rows], auth.authority_error
+    held = {k.fingerprint: why for k, why in auth.authority.quarantined_keys()}
+    return [_row(k, held.get(k.fingerprint)) for k in rows], auth.authority_error
 
 
 # ---------------------------------------------------------------------------------------------------

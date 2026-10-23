@@ -33,7 +33,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -56,7 +56,8 @@ __all__ = [
     "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_mismatch",
     "custody_problem", "is_passkey_material",
     "genesis_policy", "inert_grant", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
-    "presence_missing", "snapshot", "sshsig_public_key", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
+    "presence_missing", "quarantined", "signing_laptops", "snapshot", "sshsig_public_key", "UNSTATED",
+    "verify_anchor_reset", "verify_link_sig",
 ]
 
 FORMAT = "levain-authority/1"
@@ -186,7 +187,6 @@ def _quarantinable(key_class: str, custody: Any, key_type: str, legacy: bool, pu
     written before the door). It is never a new link's way in: :func:`_enrolled_key` asks only for history."""
     return (custody != PASSKEY and is_passkey_material(public_key)
             and _custody_rule_problem(key_class, custody, key_type, legacy) is None)
-
 
 
 # Delta kinds the recompute classifier returns (§4.3).
@@ -484,6 +484,26 @@ class AuthorityKey:
         return self.revoked_seq is None
 
 
+def quarantined(keys: Iterable[AuthorityKey]) -> list[tuple[AuthorityKey, str]]:
+    """The QUARANTINED keys among ``keys``, each with why: active, and its stored custody is not the one its key
+    material shows (:func:`custody_mismatch`). The one definition: :meth:`AuthoritySnapshot.quarantined_keys`,
+    the revoke guard, ``levain doctor``, ``levain cockpit keys`` and the broker's verify all read it."""
+    out = []
+    for k in keys:
+        why = custody_mismatch(k.public_key, k.custody) if k.active else None
+        if why is not None:
+            out.append((k, why))
+    return out
+
+
+def signing_laptops(keys: Iterable[AuthorityKey]) -> list[AuthorityKey]:
+    """The laptop-presence keys among ``keys`` that can sign a new link: active and not :func:`quarantined`. Every
+    "is a laptop-presence key left that can sign" count is this one."""
+    laptops = [k for k in keys if k.active and k.key_class == LAPTOP]
+    held = {k.fingerprint for k, _why in quarantined(laptops)}
+    return [k for k in laptops if k.fingerprint not in held]
+
+
 def _freeze(value: Any) -> Any:
     if isinstance(value, Mapping):
         return MappingProxyType({k: _freeze(v) for k, v in value.items()})
@@ -583,13 +603,12 @@ class AuthoritySnapshot:
         at a custody but ``passkey`` (only from a log written before the enrol door, :func:`_quarantinable`), and
         material that is not a passkey's stored at custody ``passkey`` (an OpenSSH sk-ecdsa key; the door does not
         refuse that enrolment). Every verify site refuses either one's new signatures. A revoke ends it;
-        re-enrolling the same material is refused (a revoked key stays revoked)."""
-        out = []
-        for k in self.active_keys():
-            why = custody_mismatch(k.public_key, k.custody)
-            if why is not None:
-                out.append((k, why))
-        return out
+        re-enrolling the same material is refused (a revoked key stays revoked). :func:`quarantined` of its keys."""
+        return quarantined(self.keys.values())
+
+    def signing_laptop_keys(self) -> list[AuthorityKey]:
+        """The laptop-presence keys that can sign a new link (:func:`signing_laptops`): none QUARANTINED."""
+        return signing_laptops(self.keys.values())
 
     def hash_at(self, seq: int) -> str | None:
         return self._hashes[seq - 1] if 1 <= seq <= len(self._hashes) else None
@@ -1363,6 +1382,8 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                 raise AuthorityError(why + ("; the key is quarantined: it signs nothing new" if new_link and
                                             is_passkey_material(signer.public_key) else ""))
             quarantined_history = why is not None
+            # known edge, kept: a quarantined key's links already in the log meet UV + origin only, not the op rule
+            # below (stored custody fido/unstated), since holding them to it refuses existing logs (Phill's (a))
             if signer.custody == PASSKEY:
                 # a passkey signs consent answers (its own namespace, the consent queue's check) and, in this log,
                 # one op: the removal of a consent or inert grant, which only ever narrows what an agent may do (a
@@ -1442,10 +1463,16 @@ def _apply_op(rec: Mapping[str, Any], seq: int, state: AuthoritySnapshot, keys: 
         since = rec.get("compromised_since")
         if since is not None and (type(since) is not int or not target.enrolled_seq <= since <= state.seq):
             raise AuthorityError(f"compromised_since must be a seq between {target.enrolled_seq} and {state.seq}")
-        if target.key_class == LAPTOP and since is None and not any(
-                k.active and k.key_class == LAPTOP and k.fingerprint != fp for k in keys.values()):
-            raise AuthorityError(f"{fp} is the last unrevoked {LAPTOP} key; enrol another first, or "
-                                 "revoke it with compromised_since if it is lost or stolen")
+        others = [k for k in keys.values() if k.fingerprint != fp]
+        # A new link counts the laptop-presence keys that can sign (signing_laptops: a QUARANTINED one signs nothing
+        # new, so it is no survivor). A link already in the log keeps the count the replay that took it made (any
+        # unrevoked laptop-presence key): a log from before the enrol door still loads, and doctor names its dead end
+        if target.key_class == LAPTOP and since is None and not (
+                signing_laptops(others) if new_link else [k for k in others if k.active and k.key_class == LAPTOP]):
+            held = ", ".join(k.fingerprint for k, _why in quarantined(others) if k.key_class == LAPTOP)
+            raise AuthorityError(f"{fp} is the last unrevoked {LAPTOP} key"
+                                 + (f" that can sign (quarantined, signing nothing new: {held})" if held else "")
+                                 + "; enrol another first, or revoke it with compromised_since if it is lost or stolen")
         keys[fp] = replace(target, revoked_seq=seq, compromised_since=since)
         return ranks[target.key_class]
     return _apply_policy_op(state.policy, rec)

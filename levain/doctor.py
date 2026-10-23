@@ -1346,8 +1346,10 @@ def _check_store(install: Path) -> list[CheckResult]:
 
 def _check_cockpit_authority(install: Path) -> list[CheckResult]:
     """The cockpit's signing keys (trust-tiering DESIGN §3.9), read from ``<install>/.levain/cockpit``.
-    A WARNING, never a failure, while exactly one unrevoked laptop-presence key is enrolled: losing it
-    leaves nothing that can enrol a successor. No row at all without a cockpit journal. The journal is
+    A WARNING, never a failure, while exactly one laptop-presence key that can sign is enrolled: losing it
+    leaves nothing that can enrol a successor. A FAIL per QUARANTINED key, and a FAIL when unrevoked
+    laptop-presence keys remain but every one is quarantined (nothing in this levain can recover that).
+    No row at all without a cockpit journal. The journal is
     opened read-only (SQLite may add its WAL side files beside it): a ``levain-cockpit/2`` journal is
     reported, not migrated, and no schema is created; any other format but /3 fails. It reads
     ``<install>/.levain/cockpit`` only: a store at another data root (an embedder's) gets no row."""
@@ -1390,12 +1392,19 @@ def _check_cockpit_authority(install: Path) -> list[CheckResult]:
         return [CheckResult(name, True, auth.authority_error)]
     # a quarantined key signs nothing new, so it is not counted as a laptop-presence key that can sign
     quarantined = auth.authority.quarantined_keys()
-    rows = [_quarantine_row(name, root, key, why) for key, why in quarantined]
-    held = {key.fingerprint for key, _why in quarantined}
-    laptops = [k.fingerprint for k in auth.authority.active_keys() if k.key_class == LAPTOP and k.fingerprint not in held]
+    laptops = [k.fingerprint for k in auth.authority.signing_laptop_keys()]
+    stuck = [k.fingerprint for k, _why in quarantined if k.key_class == LAPTOP] if not laptops else []
+    rows = [_quarantine_row(name, root, key, why, stuck=bool(stuck)) for key, why in quarantined]
     # re-genesis (§3.9) is S3a-2b-2's, not this build's: name it as missing, never as a command to run
     recovery = ("recovery after losing it, `levain cockpit ledger re-genesis` (a new authority log, every grant "
                 "void), is not in this build")
+    if stuck:
+        return rows + [CheckResult(
+            name, False, f"no unrevoked {LAPTOP} key can sign: every one is QUARANTINED ({', '.join(stuck)})",
+            "There is no in-product recovery. The log still replays: its keys and grants stand, and links a key "
+            f"below {LAPTOP} may sign still append, but no key can be enrolled, no {LAPTOP} key revoked and no T3 "
+            "act signed. The way out, `levain cockpit ledger re-genesis` (a new authority log, every grant void), "
+            "is not in this build.")]
     if len(laptops) == 1:
         return rows + [CheckResult(
             name, True, f"one {LAPTOP} key is enrolled ({laptops[0]})",
@@ -1412,16 +1421,20 @@ def _check_cockpit_authority(install: Path) -> list[CheckResult]:
                                f"{len(laptops)} {LAPTOP} keys enrolled (head at seq {auth.authority.seq})")]
 
 
-def _quarantine_row(name: str, root: Path, key: Any, why: str) -> CheckResult:
+def _quarantine_row(name: str, root: Path, key: Any, why: str, *, stuck: bool = False) -> CheckResult:
     """A FAIL for one QUARANTINED key (``levain.authority.AuthoritySnapshot.quarantined_keys``: its stored custody is
     not the one its key material shows). Every verify site refuses its new signatures; the remedy
-    names commands this levain has, with this cockpit's data root and the key's own fingerprint filled in."""
-    from levain.authority import DISPLAY_PHONE, is_passkey_material
+    names commands this levain has, with this cockpit's data root and the key's own fingerprint filled in. With
+    ``stuck`` (no laptop-presence key can sign) every remedy needs a signer that does not exist, so none is named."""
+    from levain.authority import DISPLAY_PHONE, LAPTOP, is_passkey_material
 
     dr = f"--data-root {shlex.quote(str(root))}"
     fp = shlex.quote(key.fingerprint)
     revoke = f"levain cockpit revoke {fp} --signing-key YOUR_LAPTOP_PRESENCE_KEY {dr}"
-    if key.key_class == DISPLAY_PHONE:
+    if stuck:
+        hint = (f"No remedy can run: each one is signed by a {LAPTOP} key that can sign, and none is left "
+                "(the cockpit authority row says what that means).")
+    elif key.key_class == DISPLAY_PHONE:
         hint = (f"Revoke it: `{revoke}`. Then make a fresh passkey on the phone page (its enrol step writes the "
                 f"passkey .pub) and enrol it at custody passkey: `levain cockpit enroll <passkey .pub> --class "
                 f"{DISPLAY_PHONE} --custody passkey --signing-key YOUR_LAPTOP_PRESENCE_KEY {dr}`. The same key "

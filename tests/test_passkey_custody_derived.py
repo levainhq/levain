@@ -697,3 +697,100 @@ def test_doctor_fails_on_a_quarantined_key_and_every_remedy_it_names_runs(tmp_pa
     assert cli.main(["cockpit", "enroll", str(old), "--class", "display-phone", "--custody", auth.PASSKEY,
                      "--signing-key", str(laptop.path), "--data-root", str(root)]) == 1
     assert "revoked" in capsys.readouterr().err
+
+
+# --- 1022+20 L3 r1: a quarantined key is never a laptop-presence key that can sign -----------------------------------
+
+def test_the_last_laptop_key_that_can_sign_is_not_revoked_while_another_is_quarantined(tmp_path, old_log):
+    """codex HIGH: the last-key guard counted a quarantined laptop-presence key as a survivor, so revoking the one
+    laptop key that can sign succeeded and left a log nothing can extend. Now the count is of keys that can sign; the
+    refusal names the quarantined key. A revoke stating ``compromised_since`` (the key is lost) is still taken."""
+    pk = WebAuthnKey()
+    lg = _log(tmp_path, pk, "laptop-presence", "fido")
+    laptop = lg.keys["laptop"].fp
+    with pytest.raises(auth.AuthorityError) as ei:
+        lg.link({"op": "revoke_key", "fingerprint": laptop})
+    assert "last" in str(ei.value) and pk.fp in str(ei.value) and "quarantined" in str(ei.value), ei.value
+    snap = lg.source()
+    assert snap.key(laptop).active
+    assert [k.fingerprint for k in snap.signing_laptop_keys()] == [laptop]
+    lg.link({"op": "revoke_key", "fingerprint": laptop, "compromised_since": 1})
+    assert not lg.source().key(laptop).active
+
+
+def test_a_laptop_key_is_revoked_when_another_laptop_key_can_sign(tmp_path, old_log):
+    """The control: beside a quarantined key, a second laptop key that can sign lets the first one go."""
+    from tests.test_consent_queue import Key
+
+    pk = WebAuthnKey()
+    lg = _log(tmp_path, pk, "laptop-presence", "fido")
+    lg.keys["laptop2"] = Key(tmp_path / "keys", "laptop2")
+    lg.enrol("laptop2", "laptop-presence")
+    lg.link({"op": "revoke_key", "fingerprint": lg.keys["laptop"].fp})
+    assert [k.fingerprint for k in lg.source().signing_laptop_keys()] == [lg.keys["laptop2"].fp]
+
+
+def test_doctor_says_plainly_there_is_no_recovery_when_every_laptop_key_is_quarantined(tmp_path, monkeypatch):
+    """complement MED: when the only unrevoked laptop-presence keys are quarantined, nothing can sign a new laptop
+    link, so the quarantine row's remedy (enrol a replacement, signed by a laptop key that can sign) cannot run.
+    doctor says so: no in-product recovery, what the log still does, and that re-genesis is not built."""
+    from levain import doctor
+    from levain.cockpit import install
+    from levain.cockpit.firejournal import CockpitDB
+    from tests.cockpit_authority_rig import RealKey, enrol, link
+
+    monkeypatch.setattr(install, "marker_dir", lambda: tmp_path / "m")
+    inst = tmp_path / "inst"
+    root = inst / ".levain" / "cockpit"
+    root.mkdir(parents=True)
+    CockpitDB(root).set_install_class("reported")
+    laptop = RealKey(tmp_path, "laptop")
+    pk = WebAuthnKey()
+    with pre_door():
+        enrol(CockpitDB(root), laptop, "laptop-presence")
+        link(CockpitDB(root), {"op": "enrol", "fingerprint": pk.fp, "public_key": pk.public_key,
+                               "class": "laptop-presence", "custody": "fido"}, laptop)
+        link(CockpitDB(root), {"op": "revoke_key", "fingerprint": laptop.fingerprint, "compromised_since": 1}, laptop)
+    auth.PROCESS_CACHE.clear()
+
+    rows = doctor._check_cockpit_authority(inst)
+    quarantine = [r for r in rows if "is QUARANTINED:" in r.detail]
+    summary = [r for r in rows if "is QUARANTINED:" not in r.detail]
+    assert len(quarantine) == 1 and pk.fp in quarantine[0].detail, rows
+    assert "`levain cockpit" not in (quarantine[0].hint or ""), quarantine[0].hint   # no command that cannot run
+    assert len(summary) == 1 and not summary[0].ok, summary
+    text = f"{summary[0].detail} {summary[0].hint}"
+    for words in ("no unrevoked laptop-presence key can sign", pk.fp, "no in-product recovery", "still replays",
+                  "re-genesis", "is not in this build"):
+        assert words in text, (words, text)
+
+
+def test_cockpit_keys_labels_quarantined_from_the_snapshot_only(tmp_path, monkeypatch, capsys):
+    """complement LOW 2: the listing derived QUARANTINED itself, and a row with no public key at custody passkey was
+    labelled. The label now comes from :meth:`AuthoritySnapshot.quarantined_keys`, carried on the row."""
+    from levain import cli
+    from levain.cockpit import keys as ckeys
+
+    row = ckeys.KeyRow("SHA256:x", "phone", "display-phone", 2, None, None, None, None, auth.PASSKEY, None)
+    monkeypatch.setattr(ckeys, "keys", lambda *a, **kw: ([row], None))
+    assert cli.main(["cockpit", "keys", "--data-root", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "SHA256:x" in out and "QUARANTINED" not in out, out
+
+
+def test_the_broker_names_a_quarantined_key_by_fingerprint_not_by_its_key_string(tmp_path):
+    """complement LOW 3: the broker found a quarantined key by comparing key strings, so a stored line carrying a
+    comment missed it and the signature got the generic refusal. It compares fingerprints now."""
+    from types import SimpleNamespace
+
+    from levain.autonomic.confirm import COCKPIT_NAMESPACE
+    from levain.cockpit import broker as broker_mod
+
+    pk = WebAuthnKey()
+    key = SimpleNamespace(fingerprint=pk.fp, principal="phone", public_key=pk.public_key + " phone@old", active=True,
+                          custody="fido", key_class="display-phone")
+    authority = SimpleNamespace(active_keys=lambda: [key], key=lambda fp: key if fp == pk.fp else None)
+    me = SimpleNamespace(data_root=tmp_path, ssh_keygen=shutil.which("ssh-keygen"))
+    with pytest.raises(broker_mod.BrokerError) as ei:
+        broker_mod.Broker._verify(me, authority, b"m", pk.sign(b"m", COCKPIT_NAMESPACE))
+    assert ei.value.code == "bad_signature" and "quarantined" in str(ei.value) and pk.fp in str(ei.value), ei.value

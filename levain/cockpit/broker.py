@@ -98,7 +98,7 @@ from levain.cockpit.firejournal import (
 )
 from levain.cockpit.install import REPORTED, decide_install, network_fs_problem
 from levain.cockpit.labels import BrokerLabeller, LabelSnapshot, label_class
-from levain.authority import (PASSKEY, AnchorError, advance_anchor, anchor_path, custody_mismatch,
+from levain.authority import (PASSKEY, AnchorError, advance_anchor, anchor_path, quarantined,
                               is_passkey_material, presence_missing, sshsig_public_key)
 from levain.cockpit.authority import RequestAuthority, bound, current, inactive
 from levain.cockpit.results import Absent, Fault
@@ -1006,25 +1006,21 @@ class Broker:
         """The verified signer's fingerprint (§6.5), against a signers file generated from the
         request's authority snapshot (its unrevoked keys) for this verification into a fresh
         ``mkstemp`` file in the data root."""
-        # The one custody rule (levain.authority.custody_mismatch), per key: a QUARANTINED key (its stored custody is
-        # not the one its material shows; a log from before the enrol door holds it) never enters the signers file,
-        # and a signature naming it is refused with that reason. Every other key verifies as before.
-        quarantined: dict[str, tuple[str, str]] = {}
-        for k in authority.active_keys():
-            why = custody_mismatch(k.public_key, k.custody)
-            if why is not None:
-                quarantined[k.public_key] = (k.fingerprint, why)
+        # The one custody rule (levain.authority.quarantined), per key: a QUARANTINED key (its stored custody is not
+        # the one its material shows; a log from before the enrol door holds it) never enters the signers file, and a
+        # signature naming it (by fingerprint, never by key string) is refused with that reason. Every other key
+        # verifies as before.
+        held = {k.fingerprint: why for k, why in quarantined(authority.active_keys())}
         try:
-            named = sshsig_public_key(signature)[0]
+            named: str | None = sshsig_public_key(signature)[1]
         except ValueError:
             named = None                    # ssh-keygen below refuses what cannot be read
-        if named in quarantined:
-            fp, why = quarantined[named]
-            raise BrokerError("bad_signature", 400, f"key {fp} is quarantined ({why}); it signs nothing new")
+        if named in held:
+            raise BrokerError("bad_signature", 400, f"key {named} is quarantined ({held[named]}); it signs nothing new")
         # a passkey is never a signer of a pending (it signs consent answers, and in the authority log a revoke):
         # neither a key stored at custody passkey nor WebAuthn key material enters the signers file
         keys = sorted((k.principal, k.public_key) for k in authority.active_keys()
-                      if k.public_key not in quarantined
+                      if k.fingerprint not in held
                       and k.custody != PASSKEY and not is_passkey_material(k.public_key))
         fd, path = tempfile.mkstemp(prefix=".signers-", dir=self.data_root)
         try:
