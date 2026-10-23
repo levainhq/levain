@@ -265,3 +265,41 @@ def test_a_run_called_inside_an_except_block_still_succeeds(tmp_path):
     assert rc == 0, line
     assert AV.parse_verifier_line(line).result == "delta"
     assert sorted(os.listdir(v / "out")) == ["preview.txt", "q.idx", "verified.json"]
+
+
+@needs_git
+def test_a_small_tree_that_expands_past_the_tree_scratch_cap_is_preview_cap_output(tmp_path, monkeypatch):
+    # adopt-s2fix (L3 s2 r1 codex MED): the delta closure's tree payloads (scratch/closure-trees, cat-file --batch)
+    # were outside V30's image, so a small, highly compressible tree could expand past it and answer
+    # preview-space-exhausted. Built red: AV.TREE_SCRATCH_CAP did not exist and the tree ran into the image. The cap
+    # is scaled down here (the real one is V30's 256 MiB expanded-output cap) so the expansion is a test-sized tree.
+    fx = Fx(tmp_path)
+    wide = fx.repo / "wide"
+    wide.mkdir()
+    for i in range(4000):
+        (wide / f"f{i:05d}").write_text("same\n")
+    g("add", "wide", cwd=fx.repo)
+    g("commit", "-qm", "wide", cwd=fx.repo)
+    head = g("rev-parse", "HEAD", cwd=fx.repo).decode().strip()
+    listing = g("rev-list", "--objects", "--no-object-names", head, "--not", fx.base, cwd=fx.repo).split()
+    b = fx.bundle("wide.bundle", listing, refs=[(head, f"refs/levain/{S}/head".encode())])
+    tree_bytes = len(g("cat-file", "tree", f"{head}:wide", cwd=fx.repo))
+    cap = b.stat().st_size * 4
+    assert b.stat().st_size < cap < tree_bytes           # small on the wire, large expanded
+
+    def verify(name):
+        scratch = tmp_path / name
+        scratch.mkdir()
+        return AV.quarantine_verify(b, fx.base_bundle, session=S, base_oid=fx.base, object_format="sha1",
+                                    result="delta", scratch=scratch, git=GIT, max_input_size=1 << 30)
+    monkeypatch.setattr(AV, "TREE_SCRATCH_CAP", cap)
+    with pytest.raises(AV.Refused) as e:
+        verify("capped")
+    assert e.value.name == "preview-cap:output" and not (tmp_path / "capped" / "closure-trees").exists()
+    monkeypatch.setattr(AV, "TREE_SCRATCH_CAP", tree_bytes * 2)
+    assert verify("fits").result == "delta"
+    # the cap is a term of root's image budget, so the honest tree it admits fits the image it sized
+    got = RH.verify_image_bytes(bundle_bytes=1, base_bytes=1, bundle_objects=1, base_objects=1, object_format="sha1")
+    monkeypatch.setattr(AV, "TREE_SCRATCH_CAP", 0)
+    assert got - RH.verify_image_bytes(bundle_bytes=1, base_bytes=1, bundle_objects=1, base_objects=1,
+                                       object_format="sha1") == tree_bytes * 2

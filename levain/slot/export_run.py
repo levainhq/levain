@@ -129,7 +129,8 @@ IMPORTER = Role("importer-failed", "adopt-cap:memory", "adopt-space-exhausted", 
 VERIFIER_NAMES = frozenset({
     "base-bundle-mismatch", "base-mismatch", BF.MISMATCH, "bundle-extra-objects", "bundle-special-unsent",
     "bundle-thin", "bundle-tip-in-base", "bundle-tip-not-commit", "export-result-mismatch", "fsck:other",
-    "preview-cap:commits", "preview-graph-unresolved"}) | frozenset(f"fsck:{i}" for i in FI.closed_ids())
+    "preview-cap:commits", "preview-cap:output", "preview-graph-unresolved"}) | frozenset(
+        f"fsck:{i}" for i in FI.closed_ids())
 VERIFIER = Role("verifier-failed", "preview-cap:memory", "preview-space-exhausted", "preview-space-exhausted",
                 "output-missing", "<s>/verify.new", VERIFIER_NAMES)
 #: The verifier's three outputs, in publish order (``verify_run.OUTPUTS``: the writer's names, one tuple).
@@ -704,8 +705,8 @@ def publish_if_success(outcome: Outcome, work_dfd: int, class_dfd: int, session:
     (D2)."""
     if not outcome.success or outcome.line is None:
         raise Refused(outcome.name or f"{role.failed}:exit", outcome.detail)
-    verifier = role is VERIFIER
-    if role is not IMPORTER and not verifier:
+    verifier = role == VERIFIER                    # by value: a copy of a role is that role (L3 s2 r1 LOW 3)
+    if role != IMPORTER and not verifier:
         raise _publish_refusal(role, "role-unknown")
     nothing_new = not verifier and outcome.line.result == "adopt-nothing-new"
     if verifier:

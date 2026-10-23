@@ -92,10 +92,11 @@ def closed_ids() -> tuple[str, ...]:
 
 #: ``git version <v>``, ``<v>`` by git's own version grammar (``GIT-VERSION-GEN`` turns ``git describe``'s dashes
 #: into dots): a three- or four-number release; a prerelease ``.rc<N>``; a development build ``.<commits>.g<hex>``;
-#: ``.dirty``; Git for Windows' ``.windows.<N>``; and Apple's `` (Apple Git-<N>)``. Anything else does not parse.
+#: ``.dirty``; Git for Windows' ``.windows.<N>``; and Apple's `` (Apple Git-<N>)``, ``<N>`` dotted or not (Xcode 14's
+#: ``Apple Git-137.1``). Anything else does not parse.
 _VERSION = re.compile(r"git version (?P<v>(?P<rel>\d+\.\d+\.\d+(?:\.\d+)?)(?:\.rc(?P<rc>\d+))?"
                       r"(?:\.(?P<dev>\d+)\.g[0-9a-f]+)?(?:\.dirty)?(?:\.windows\.\d+)?)"
-                      r"(?: \(Apple Git-\d+\))?")
+                      r"(?: \(Apple Git-\d+(?:\.\d+)*\))?")
 UNPARSED = "git-below-floor:unparsed"
 #: The refusal of a fsck-id probe that failed for any reason but git not knowing the id.
 FSCK_PROBE_FAILED = "git-fsck-probe-failed"

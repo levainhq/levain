@@ -19,7 +19,7 @@ INSTALL_SUDOERS = _SUDOERS_DIR / "levain-install"
 
 #: CONTRACT §5.1: the runtime verbs ``_levain_dispatch`` may call (every verb but adopt-open,
 #: discard, restore, confirm-identity).
-DISPATCH_VERBS = ("prepare", "render", "start", "resume", "teardown", "status")
+DISPATCH_VERBS = ("prepare", "render", "start", "resume", "teardown", "adopt-verify", "status")
 
 
 def runtime_sudoers_text(host: HostOS, operator: str) -> str:

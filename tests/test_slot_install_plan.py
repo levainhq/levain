@@ -402,15 +402,19 @@ def test_sudoers_text(host):
     assert f"\n{OP} ALL=(root) NOPASSWD: {h}/runtime-helper\n" in rt
     disp = next(line for line in rt.splitlines() if line.startswith("_levain_dispatch "))
     assert "NOPASSWD:" in disp
-    for verb in ("adopt-open", "discard", "restore", "confirm-identity"):
-        assert verb not in disp
-    for verb in ("prepare", "render", "start", "resume", "teardown", "status"):
-        assert f"{h}/runtime-helper {verb}" in disp
+    # adopt-s2fix (L3 s2 r1 codex HIGH): both sets derived from the grammar, never a hand list, so a verb the
+    # grammar admits for _levain_dispatch is a verb sudo admits (built red: adopt-verify was missing here)
+    from levain.slot import runtime_grammar as RG
+    from levain.slot import runtime_helper as RH
+    assert set(RH.VERB_HANDLERS) <= set(RG.VERBS) and RG.DISPATCH_FORBIDDEN <= set(RG.VERBS)
+    admitted = [v for v in RG.VERBS if v not in RG.DISPATCH_FORBIDDEN]
+    specs = disp.split("NOPASSWD: ", 1)[1].split(", ")
+    for verb in RG.DISPATCH_FORBIDDEN:
+        assert not any(s.split()[1] == verb for s in specs), verb
     # sudo's `<verb> *` needs at least one argument (measured in the 1c VM: bare `status` was denied by
     # `status *`), so bare `status` has a spec of its own
-    specs = disp.split("NOPASSWD: ", 1)[1].split(", ")
-    assert specs == [f"{h}/runtime-helper {v} *" for v in ("prepare", "render", "start", "resume", "teardown",
-                                                           "status")] + [f"{h}/runtime-helper status"]
+    assert sorted(specs[:-1]) == sorted(f"{h}/runtime-helper {v} *" for v in admitted)
+    assert specs[-1] == f"{h}/runtime-helper status"
     assert disp.rstrip().endswith(f", {h}/runtime-helper status")
     it = install_sudoers_text(host, OP)
     assert "NOPASSWD" not in it

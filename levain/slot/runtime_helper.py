@@ -2495,10 +2495,13 @@ def verify_image_bytes(*, bundle_bytes: int, base_bytes: int, bundle_objects: in
     """V30's verify image (§6.3): ``2 x (bundle + base bundle)`` (the copies in, and the pack each ``index-pack
     --stdin`` writes into Q and B), both idx bounds, the expanded-output cap, the required oid list and its ``sort``
     temp files (``2 x objects x (oid hex + 1)``, ``objects`` here BOTH packs' counts, a superset of the bundle's
-    [judged by adopt-5di-s2, 10-22, against §6.3's "objects from the pack header's count"]) and the fixed margin."""
+    [judged by adopt-5di-s2, 10-22, against §6.3's "objects from the pack header's count"]), the closure's tree
+    payloads at their cap (``adopt_verify.TREE_SCRATCH_CAP``, which the verifier enforces before writing them; L3 s2 r1
+    codex MED: §6.3's formula has no term for them [judged by adopt-s2fix, 10-22]) and the fixed margin."""
+    from levain.slot import adopt_verify as AV
     hexlen = BF.OID_HEX[object_format]
     return (2 * (bundle_bytes + base_bytes) + idx_bound(bundle_objects, object_format)
-            + idx_bound(base_objects, object_format) + VERIFY_OUTPUT_CAP
+            + idx_bound(base_objects, object_format) + VERIFY_OUTPUT_CAP + AV.TREE_SCRATCH_CAP
             + 2 * (bundle_objects + base_objects) * (hexlen + 1) + VERIFY_MARGIN_BYTES)
 
 
@@ -2548,6 +2551,18 @@ def verify_caller(ctx: Ctx, session: str) -> Tuple[R.Alloc, str]:
     if ctx.caller == DISPATCH and a.ticket is not None and a.supervisor_uid == ctx.sudo_uid:
         return a, "dispatch"
     raise Refused("no-session", session)
+
+
+def verify_caller_locked(ctx: Ctx, session: str, before: R.Alloc, export_class: str) -> R.Alloc:
+    """(1) again, under the session lock (L3 s2 r1 complement MED): the alloc re-read and the caller re-checked by
+    :func:`verify_caller`, then refused ``no-session`` when its owner (``operator_uid``, ``supervisor_uid``), class
+    (kind, ticket, the export class) or ``base`` differs from the pre-lock read. The pre-lock read stays only so a
+    caller with no claim on the session learns nothing of it (not even ``session-busy``)."""
+    a, k = verify_caller(ctx, session)
+    if (k, a.kind, a.ticket, a.operator_uid, a.supervisor_uid, a.base) != (
+            export_class, before.kind, before.ticket, before.operator_uid, before.supervisor_uid, before.base):
+        raise Refused("no-session", f"{session}: the alloc changed between the caller check and the session lock")
+    return a
 
 
 def _open_source(dfd: int, name: str, refusal: str, ctx: Ctx) -> Tuple[int, os.stat_result]:
@@ -2658,8 +2673,9 @@ def verifier_args(session: str, base: Mapping[str, object], result: str, max_inp
 
 def verify_sealed_run(ctx: Ctx, front: AdoptFront, export_class: str, bundle_digest: str, run_seams: AdoptRunSeams,
                       vseams: VerifySeams) -> Dict[str, object]:
-    """adopt-verify inside both locks (DESIGN §6.0): the two inputs opened and checked (the published ``bundle``,
-    ``export-changed``; the retained base bundle, ``base-bundle-mismatch``), root's own header reading (the result,
+    """adopt-verify inside both locks (DESIGN §6.0): the two inputs opened, checked and hashed against their digests
+    (the published ``bundle`` against the one asked for, ``export-changed``; the retained base bundle against
+    ``alloc.base``, ``base-bundle-mismatch``), root's own header reading (the result,
     the pack counts) -> V30's space (``preview-space``) -> SEAL-IN on ``_levain_verify`` with ``<class>/<s>/`` as the
     staging dir (a stale ``verify.new`` deleted, ``verifier-failed:publish`` / ``stale-staging`` when it cannot be;
     the early exchange probe there) -> the ``.verify/`` layout -> the copies in, hashed -> (macOS) the profile and
@@ -2686,6 +2702,11 @@ def verify_sealed_run(ctx: Ctx, front: AdoptFront, export_class: str, bundle_dig
         held.append(s_dfd)
         src, sst = _open_source(s_dfd, "bundle", "export-changed", ctx)
         held.append(src)
+        # L3 s2 r1 codex MED: the digest asked for, checked on the open file right after its fstat, before any header
+        # read, sizing or seal-in, so a published file that is not the one asked for is export-changed whatever else
+        # it would fail; the copy-in hashes again (a change after this read).
+        if _fd_sha256(src, sst.st_size) != bundle_digest:
+            raise Refused("export-changed", "bundle: not the digest asked for")
         try:
             with ctx.store.dir("retained", s, "tree", "in") as rin_dfd:
                 base_fd, bst = _open_source(rin_dfd, "repo.bundle", "base-bundle-mismatch", ctx)
@@ -2696,16 +2717,12 @@ def verify_sealed_run(ctx: Ctx, front: AdoptFront, export_class: str, bundle_dig
         held.append(base_fd)
         if bst.st_size != base_bytes:
             raise Refused("base-bundle-mismatch", f"{bst.st_size} bytes, alloc.base says {base_bytes}")
+        if _fd_sha256(base_fd, base_bytes) != str(front.base["bundle_sha256"]):    # the same, for the pinned base
+            raise Refused("base-bundle-mismatch", "the retained base bundle: not alloc.base's digest")
         bundle_bytes = sst.st_size
-        try:                                       # root's grammar over the importer's bytes (bundle-header-mismatch)
-            h = AV.read_header_at(src)
-            ER.importer_bundle_check(s, fmt)(h)
-            objects = AV.pack_count_at(src, h.size, bundle_bytes - h.size)
-        except Refused:
-            # a published file that is not the one asked for is export-changed first, whatever its header says
-            if _fd_sha256(src, bundle_bytes) != bundle_digest:
-                raise Refused("export-changed", "bundle: not the digest asked for") from None
-            raise
+        h = AV.read_header_at(src)                 # root's grammar over the importer's bytes (bundle-header-mismatch)
+        ER.importer_bundle_check(s, fmt)(h)
+        objects = AV.pack_count_at(src, h.size, bundle_bytes - h.size)
         result = "delta" if h.prerequisites else "unrelated"
         try:
             bh = AV.read_header_at(base_fd)
@@ -2812,7 +2829,8 @@ def verify_sealed_run(ctx: Ctx, front: AdoptFront, export_class: str, bundle_dig
 
 def adopt_verify(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     """``adopt-verify <session> --bundle-digest sha256:<hex>`` (CONTRACT §5.1; DESIGN §6.0): the caller by class
-    (:func:`verify_caller`), the alloc session lock (TRY, ``session-busy``), the root facts as adopt-open step 3
+    (:func:`verify_caller`), the alloc session lock (TRY, ``session-busy``), the alloc re-read under it and the caller
+    re-checked (:func:`verify_caller_locked`: a changed alloc = ``no-session``), the root facts as adopt-open step 3
     (RETAINED, SCRUBBED, ``alloc.base``), the adopt lock (adopt-open's bounded wait, ``adopt-busy``: one sealed run
     machine-wide, importer or verifier), the git floor (``git-below-floor:<version>``), then the sealed verify run
     (:func:`verify_sealed_run`). Answers ``{ok, verified_digest, idx_digest, preview_digest, warnings?}``
@@ -2829,6 +2847,7 @@ def adopt_verify(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]
     at("verify:2")
     try:
         with session_lock(ctx, s):
+            a = verify_caller_locked(ctx, s, a, export_class)
             at("verify:3")
             front = adopt_step3_root_facts(ctx, a, adopt, deadline=deadline)
             at("verify:4")

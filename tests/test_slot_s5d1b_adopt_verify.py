@@ -344,8 +344,8 @@ def test_a_changed_export_is_refused_before_the_spawn(vrig):
     export = vrig.sdir / "bundle"
     real = export.read_bytes()
     h = AV.read_header(export)
-    # a byte in the pack header (root's own pack-count read refuses it first: still export-changed, the digest is
-    # checked on that path) and one mid pack (caught by the copy-in's hash)
+    # a byte in the pack header and one mid pack: both caught by the digest check right after the open (adopt-s2fix),
+    # before root reads the header
     for at in (h.size + 1, h.size + (len(real) - h.size) // 2):
         t = bytearray(real)
         t[at] ^= 0xFF
@@ -421,7 +421,7 @@ def test_v30_formulas():
     got = RH.verify_image_bytes(bundle_bytes=100, base_bytes=50, bundle_objects=3, base_objects=2,
                                 object_format="sha1")
     assert got == (300 + RH.idx_bound(3, "sha1") + RH.idx_bound(2, "sha1") + RH.VERIFY_OUTPUT_CAP + 2 * 5 * 41
-                   + RH.VERIFY_MARGIN_BYTES)
+                   + AV.TREE_SCRATCH_CAP + RH.VERIFY_MARGIN_BYTES)
     assert RH.verify_wall_s(1 << 30, 1 << 30) == 300 + 240
 
 
@@ -463,3 +463,127 @@ def test_adopt_verify_carries_warnings_only_when_the_publish_recorded_one(tmp_pa
         assert out["verified_digest"] == _sha(v / "verified.json") and r.clean()
     finally:
         r.rig.cleanup()
+
+
+# --- 1022+20 adopt-s2fix: L3 s2 r1 fixes ----------------------------------------------------------------------------
+
+def _verb(L, hooks):
+    """``runtime_helper.main(["adopt-verify", ...])`` over a fixture store (no export, no image), the operator caller,
+    ``hooks`` run at their ``at`` step; returns (answer, log)."""
+    log: list = []
+
+    def at(step):
+        log.append(step)
+        if step in hooks:
+            hooks[step]()
+    seams = RH.Seams(host="darwin", store=L, euid=lambda: 0, trusted=lambda st: True,
+                     account_uid=lambda name: fx.UID, at=at)
+    out, err = io.StringIO(), io.StringIO()
+    RH.main(["adopt-verify", S, "--bundle-digest", DIGEST], stdin=b"", env={"SUDO_UID": str(fx.UID)}, seams=seams,
+            out=out, err=err)
+    return canon.parse(out.getvalue().strip().encode()), log
+
+
+def _rewrite(L, fields):
+    def hook():
+        a = R.parse_alloc((L / "alloc" / f"{S}.json").read_bytes())
+        (L / "alloc" / f"{S}.json").write_bytes(R.alloc_bytes(dataclasses.replace(a, **fields(a))))
+    return hook
+
+
+@GIT_ONLY
+@pytest.mark.parametrize("change,name", [
+    (lambda a: {"base": dataclasses.replace(a.base, bundle_sha256="sha256:" + "0" * 64)}, "no-session"),
+    (lambda a: {"base": None}, "no-session"),
+    (lambda a: {"operator_uid": a.operator_uid + 1}, "no-session"),
+    (lambda a: {"kind": "dispatch", "ticket": TICKET, "supervisor_uid": DISPATCH_UID}, "adopt-kind:dispatch"),
+    (lambda a: {"supervisor_uid": a.supervisor_uid + 1}, "no-session"),
+])
+def test_an_alloc_changed_between_the_caller_check_and_the_session_lock_is_refused(tmp_path, change, name):
+    # complement MED: the alloc was read and the caller authorised before the session lock, and the verb ran on that
+    # read. Built red: a base rewritten in the gap ran on (export-changed, past verify:3).
+    L = fx.make_store(tmp_path, "delta")
+    out, log = _verb(L, {"verify:2": _rewrite(L, fields=change)})
+    assert out == {"ok": False, "refused": name} and "verify:3" not in log, (out, log)
+
+
+@GIT_ONLY
+def test_an_alloc_rewritten_unchanged_under_the_lock_runs_on(tmp_path):
+    L = fx.make_store(tmp_path, "delta")
+    out, log = _verb(L, {"verify:2": _rewrite(L, fields=lambda a: {})})
+    assert "verify:3" in log and out["refused"] != "no-session", (out, log)
+
+
+def _low_space(vrig):
+    seams = vrig.seams
+    vrig.seams = lambda: dataclasses.replace(seams(), free_bytes=lambda fd: 0)
+
+
+@SEAM
+def test_the_digest_is_checked_before_the_header_the_space_and_the_seal_in(vrig):
+    # codex MED: the digest asked for was checked only at copy-in, so a stale digest with too little space answered
+    # preview-space. Built red: preview-space here.
+    _low_space(vrig)
+    rc, out, err = vrig.verify("sha256:" + "0" * 64)
+    assert out == {"ok": False, "refused": "export-changed"} and "verify:6" not in vrig.rig.log, (out, err)
+    rc, out, err = vrig.verify()                         # the right digest: the space check answers (control)
+    assert out == {"ok": False, "refused": "preview-space"}, (out, err)
+
+
+@SEAM
+def test_the_pinned_base_digest_is_checked_before_the_space(vrig):
+    # codex MED, the same for the pinned base bundle (same size, a byte flipped mid pack). Built red: preview-space.
+    base = vrig.L / "retained" / S / "tree" / "in" / "repo.bundle"
+    real = base.read_bytes()
+    t = bytearray(real)
+    t[len(real) - 30] ^= 0xFF
+    base.write_bytes(bytes(t))
+    _low_space(vrig)
+    rc, out, err = vrig.verify()
+    assert out == {"ok": False, "refused": "base-bundle-mismatch"} and "verify:6" not in vrig.rig.log, (out, err)
+
+
+def test_the_verifier_role_is_compared_by_value(tmp_path):
+    # complement LOW 3: a dataclasses.replace copy of VERIFIER was role-unknown (identity compare). Built red.
+    wfd, sfd, sdir = _outputs(tmp_path, ER.VERIFIER_OUTPUTS)
+    ok = _vclassify(_vline(result="delta"), code=0)
+    try:
+        res, pub = ER.publish_if_success(ok, wfd, sfd, "verify", object_format="sha1", owner_uid=os.getuid(),
+                                         caps={n: 1 << 20 for n in ER.VERIFIER_OUTPUTS}, seams=ER.PublishSeams(),
+                                         role=dataclasses.replace(ER.VERIFIER))
+        with pytest.raises(Refused) as e:                # a role that is neither still refuses
+            ER.publish_if_success(ok, wfd, sfd, "verify", object_format="sha1", owner_uid=os.getuid(),
+                                  caps={n: 1 << 20 for n in ER.VERIFIER_OUTPUTS}, seams=ER.PublishSeams(),
+                                  role=dataclasses.replace(ER.VERIFIER, missing="other"))
+    finally:
+        os.close(wfd)
+        os.close(sfd)
+    assert res == "delta" and sorted(os.listdir(sdir / "verify")) == sorted(ER.VERIFIER_OUTPUTS)
+    assert "role-unknown" in e.value.name or "role-unknown" in e.value.detail
+
+
+@pytest.mark.parametrize("text,name", [
+    # Apple's (`git --version` on macOS: Xcode 14's git printed a dotted Apple build)
+    ("git version 2.37.1 (Apple Git-137.1)\n", "git-below-floor:2.37.1"),
+    ("git version 2.37.0 (Apple Git-136)\n", "git-below-floor:2.37.0"),
+    ("git version 2.50.1 (Apple Git-155)\n", None),
+    ("git version 2.39.5 (Apple Git-154)\n", None),
+    # distro and build spellings
+    ("git version 2.34.1\n", "git-below-floor:2.34.1"),            # Ubuntu 22.04
+    ("git version 2.39.2\n", "git-below-floor:2.39.2"),            # Debian 12
+    ("git version 2.43.0\n", None),                                 # Ubuntu 24.04
+    ("git version 2.38.1.windows.1\n", "git-below-floor:2.38.1.windows.1"),
+    ("git version 2.39.4.rc1\n", "git-below-floor:2.39.4.rc1"),
+    ("git version 2.38.0.123.gdeadbeef.dirty\n", "git-below-floor:2.38.0.123.gdeadbeef.dirty"),
+    ("git version banana\n", "git-below-floor:unparsed"),
+])
+def test_git_version_spellings_name_the_floor_on_the_wire(text, name):
+    # complement LOW 4: the name rides the wire, never `internal`. Built red: Apple's "Git-137.1" was unparsed.
+    from levain.slot import fsck_ids as FI
+    if name is None:
+        assert FI.check_floor(text) >= FI.FLOOR
+        return
+    with pytest.raises(Refused) as e:
+        FI.check_floor(text)
+    assert e.value.name == name
+    assert RG.refusal_line(e.value) == '{"ok":false,"refused":"%s"}\n' % name

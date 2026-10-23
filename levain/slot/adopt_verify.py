@@ -31,6 +31,12 @@ GIT_C = ("-c", "core.hooksPath=/dev/null", "-c", "core.protectHFS=true", "-c", "
          "-c", "pack.threads=2")
 #: V30: new commits above this = ``preview-cap:commits`` (§6.3).
 MAX_COMMITS = 10_000
+#: V30's expanded-output cap (§6.3: every git output byte-capped, 256 MiB = ``preview-cap:output``) over step 4's
+#: one uncompressed git output in ``scratch/``, the delta closure's tree payloads (``closure-trees``, ``cat-file
+#: --batch``): their size is summed from ``--batch-check``'s ``%(objectsize)`` BEFORE the payloads are written, so a
+#: small, highly compressible tree is refused by this name, never by the image filling. Root's image budget carries it
+#: as a term (``runtime_helper.verify_image_bytes``).
+TREE_SCRATCH_CAP = 256 << 20
 #: The A4 header line, always the first line of ``preview.txt`` (§6.2 step 0).
 PREVIEW_HEADER = ("PROPOSED by the session's importer: verified complete and exact, not verified faithful. Review it "
                   "as you would a patch from an untrusted contributor.")
@@ -252,13 +258,19 @@ def _required(p: importer.GitRunner, q: importer.GitRunner, scratch: Path, tips:
     specials: set = set()
     if result == "delta":
         types = scratch / "closure-types"
-        _to_file(p, types, "cat-file", "--batch-check=%(objectname) %(objecttype)", stdin=present)
+        _to_file(p, types, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)", stdin=present)
         trees = scratch / "closure-tree-oids"
+        expanded = 0                               # cat-file --batch's bytes: "<oid> tree <size>\n<payload>\n" each
         with importer._read_own(types) as fh, open(trees, "xb") as tf:
             for line in importer._lines(fh, "cat-file --batch-check"):
-                oid, _, kind = line.partition(b" ")
+                oid, kind, size = (line.split(b" ") + [b"", b""])[:3]
                 if kind == b"tree":
+                    if not size.isdigit():
+                        raise importer.Fatal(None, "cat-file --batch-check printed a size that is not a number")
+                    expanded += len(oid) + len(b" tree ") + len(size) + 1 + int(size) + 1
                     tf.write(oid + b"\n")
+        if expanded > TREE_SCRATCH_CAP:
+            raise Refused("preview-cap:output", f"the closure's trees expand to {expanded} bytes > {TREE_SCRATCH_CAP}")
         payloads = scratch / "closure-trees"
         _to_file(p, payloads, "cat-file", "--batch", stdin=trees)
         try:
@@ -428,5 +440,5 @@ def parse_verifier_line(raw: Optional[bytes]) -> export_run.Line:
     return export_run.Line(True, obj["enospc"], ref, obj["result"], (0, 0))
 
 
-__all__ = ["GIT_C", "MAX_COMMITS", "PREVIEW_HEADER", "TREE_READER", "VERIFY_LINE_KEYS", "Verified",
+__all__ = ["GIT_C", "MAX_COMMITS", "PREVIEW_HEADER", "TREE_READER", "TREE_SCRATCH_CAP", "VERIFY_LINE_KEYS", "Verified",
            "pack_count", "pack_count_at", "parse_verifier_line", "quarantine_verify", "read_header", "read_header_at"]
