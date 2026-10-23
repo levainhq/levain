@@ -766,9 +766,10 @@ def test_flip_survives_a_kill_between_its_acts(tmp_path: Path, monkeypatch) -> N
 
 # --- S3: the resume into a journaled staged generation (§2.2 r4 X3-M1; §5 R2 test 1's resume row) --------------------
 
-def _resume(tmp: Path, monkeypatch, *, torn: bool):
+def _resume(tmp: Path, monkeypatch, *, torn: bool, stuck: bool = False):
     """A host killed after R3 (the journal names ``generation:<id>``, ``gen-<id>`` placed, ``current`` the old one),
-    then a bare ``repair``: phase A's plan, then :func:`IH.repair_handover` with a recording probe and execv."""
+    then a bare ``repair``: phase A's plan, then :func:`IH.repair_handover` with a recording probe and execv.
+    ``stuck``: the import tree made read-only for the handover, so the torn generation's ``rm -rf`` fails."""
     import io
     import shutil
     from dataclasses import replace
@@ -797,14 +798,18 @@ def _resume(tmp: Path, monkeypatch, *, torn: bool):
     def probe(host, gen, shape, journal, **kw):
         probes.append((gen, journal))
         return tuple(sorted(G.KINDS))
+    if stuck:
+        os.chmod(tree, 0o555)
     try:
-        IH.repair_handover(plan, IH.Gathered(facts, quiesce=q, repair=rf), 3, os.getuid(), io.StringIO(),
+        errbuf = io.StringIO()
+        IH.repair_handover(plan, IH.Gathered(facts, quiesce=q, repair=rf), 3, os.getuid(), errbuf,
                            probe=probe, execv=lambda *a: execs.append(a), tree=tree, intent_path=jpath)
         refused = None
     except Refused as e:
         refused = e
     finally:
         q.release()
+        os.chmod(tree, 0o755)
     return plan, gid, tree, jpath, j, probes, execs, refused
 
 
@@ -821,6 +826,18 @@ def test_a_torn_journalled_generation_is_removed_and_source_required(tmp_path: P
     plan, gid, tree, jpath, j, probes, execs, refused = _resume(tmp_path, monkeypatch, torn=True)
     assert refused is not None and refused.name == f"source-required:{gid}"
     assert not probes and not execs and not (tree / gid).exists() and read_intent(HOST, path=jpath) == j
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root removes from a read-only directory")
+def test_a_torn_generation_that_cannot_be_removed_is_step_failed_never_was_removed(tmp_path: Path,
+                                                                                    monkeypatch) -> None:
+    """[r6: L3 s3 r1 codex MED] The torn generation's ``rm -rf`` fails: ``step-failed`` naming it, never the
+    ``source-required`` that says it was removed; it is still listed in the import tree (its contents may be part-gone:
+    ``rm -rf`` empties what it can), never probed, journal kept."""
+    plan, gid, tree, jpath, j, probes, execs, refused = _resume(tmp_path, monkeypatch, torn=True, stuck=True)
+    assert refused is not None and refused.name == "step-failed", refused
+    assert str(tree / gid) in refused.detail and "was removed" not in refused.detail
+    assert (tree / gid).is_dir() and not probes and not execs and read_intent(HOST, path=jpath) == j
 
 
 # --- S3: the fault seam (§5 [F7], [r4: X3-H1]; design R2 test 3) -----------------------------------------------------
@@ -891,3 +908,74 @@ def test_the_plan_places_every_fault_point(tmp_path: Path, monkeypatch) -> None:
         root_tree._flip(tree, "gen-" + "2" * 16, fault=kill)
     assert os.readlink(tree / "current") == "gen-" + "1" * 16 and os.readlink(tree / "current.new") == "gen-" + "2" * 16
     assert root_tree._flip(tree, "gen-" + "2" * 16) == (True, "") and os.readlink(tree / "current") == "gen-" + "2" * 16
+
+
+def test_only_a_fault_point_the_plan_can_reach_is_accepted(tmp_path: Path) -> None:
+    """[r6: L3 s3 r1 codex LOW] A fault is a PAIR the plan places: every ``fault point`` step of a faulted plan
+    passes :func:`IH.check_fault`; a pair no plan reaches (an unknown R-step, R9's points or R2's ``mid-copy`` on
+    another step, a remove point outside its kind's phases) refuses ``bad-token``, so a harness run cannot finish
+    without its crash."""
+    from tests.test_repair_plan import _plan, _pre_change
+
+    facts, rf = _pre_change(tmp_path)
+    faulted = _plan(facts, rf, txn=lambda: TXN, fault=lambda step, pt: None)
+    placed = [tuple(s.why.split()[2:4]) for s in faulted.steps if s.why.startswith("fault point")]
+    assert placed and all(IH.check_fault(p) == p for p in placed)
+    for ok in (("R9", "a"), ("R9", "b"), ("R2", "mid-copy"), ("R4b", "before"), ("R7", "group/1:after-retire"),
+               ("R5", "unit/1:after-stop"), ("R12", "unit/1:after-rm"), ("R10", "entry/1:after-rm")):
+        assert IH.check_fault(ok) == ok
+    for bad in (("R999", "after"), ("R4", "before"), ("R5", "a"), ("R5", "mid-copy"), ("R2", "b"),
+                ("R5", "entry/1:after-rm"), ("R8", "group/1:after-retire")):
+        with pytest.raises(Refused) as e:
+            IH.check_fault(bad)
+        assert e.value.name == "bad-token", bad
+
+
+def test_the_probe_wire_is_frozen_at_handover_abi_1(tmp_path: Path, monkeypatch) -> None:
+    """[r6: L3 s3 r1 codex HIGH, bounded] The probe's request and reply key sets ARE handover ABI 1. Any change to
+    either bumps :data:`IH.HANDOVER_ABI` (the probe then refuses ``downgrade-unsupported:handover`` across
+    versions, the designed path); this row goes red until both are changed together."""
+    import io
+
+    assert IH.HANDOVER_ABI == 1
+    sent: list = []
+
+    def child(argv, data, **kw):
+        sent.append(json.loads(data))
+        return 0, (json.dumps({"handover": 1, "kinds": [], "ok": True}, separators=(",", ":")) + "\n").encode()
+    monkeypatch.setattr(IH, "_bounded_child", child)
+    j = Intent("repair", OP, txn=TXN, generation=GEN)
+    IH.run_probe(HOST, GEN, None, j, tree=tmp_path)
+    IH.run_probe(HOST, GEN, None, None, tree=tmp_path)
+    assert [set(s) for s in sent] == [{"journal", "operator", "shape"}] * 2 and sent[0]["operator"] == OP
+    out = io.StringIO()
+    assert IH.repair_probe(stdin=io.BytesIO(json.dumps(sent[0]).encode()), out=out, host=HOST) == 0
+    assert set(json.loads(out.getvalue())) == {"handover", "kinds", "ok"}
+
+
+def test_a_bounded_child_whose_selector_fails_is_killed_and_reaped(tmp_path: Path, monkeypatch) -> None:
+    """[r6: L3 s3 r1 complement LOW] ``register`` raising (EMFILE on kqueue) still kills and reaps the child."""
+    import selectors
+
+    started: list = []
+    real = IH.subprocess.Popen
+
+    def popen(*a, **kw):
+        started.append(real(*a, **kw))
+        return started[-1]
+
+    class Broken(selectors.DefaultSelector):    # type: ignore[misc,valid-type]
+        def register(self, *a, **kw):
+            raise OSError(24, "Too many open files")
+    monkeypatch.setattr(IH.subprocess, "Popen", popen)
+    monkeypatch.setattr(IH.selectors, "DefaultSelector", Broken)
+    try:
+        with pytest.raises(OSError):
+            IH._bounded_child([sys.executable, "-c", "import time; time.sleep(30)"], b"", timeout=10, cap=10)
+        p, = started
+        assert p.returncode is not None and p.stdout.closed
+    finally:
+        for q in started:
+            if q.poll() is None:
+                q.kill()
+                q.wait()

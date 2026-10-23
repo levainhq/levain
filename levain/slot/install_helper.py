@@ -1310,8 +1310,9 @@ def write_install_skips(host: HostOS, live: RM.Live, earlier: Iterable = ()) -> 
 
 # --- the fault seam (§5 "The crash seam" [r2: X-10, C-F9], [r3: F7], [r4: X3-H1]) -------------------------------------
 
-#: A fault's step id: an R-step of §2.3 (``R5``, ``R4b``).
-FAULT_STEP_RE = re.compile(r"R[0-9]+[a-z]?")
+#: [r6: L3 s3 r1 codex LOW] A fault's step id, by MEMBERSHIP: the R-steps of §2.3 a plan places points around
+#: (:func:`_faulted`'s ``before``/``after``; R4 is the exec, which has none).
+FAULT_STEPS = frozenset({"R1", "R2", "R3", "R4b", *(f"R{n}" for n in range(5, 16))})
 #: Every point a fault may name, by MEMBERSHIP (never a pattern): an R-step's ``before`` and ``after``, R9's ``a``
 #: (after the ``current.new`` symlink) and ``b`` (after the rename), R2's ``mid-copy`` (between the levain and the h11
 #: copy), and every remove step's act boundary (:data:`removal.REMOVE_POINTS`).
@@ -1320,15 +1321,30 @@ FAULT_POINTS = frozenset({"before", "after", "a", "b", "mid-copy"}) | RM.REMOVE_
 FaultHook = Callable[[str, str], None]
 
 
+def _reachable(step: str, point: str) -> bool:
+    """[r6: L3 s3 r1 codex LOW] ``(step, point)`` is a pair a plan places: ``before``/``after`` on any of
+    :data:`FAULT_STEPS`, ``a``/``b`` on R9 (the flip), ``mid-copy`` on R2, a remove point on its kind's phases
+    (:data:`REMOVE_PHASES`)."""
+    if step not in FAULT_STEPS or point not in FAULT_POINTS:
+        return False
+    if point in ("a", "b"):
+        return step == "R9"
+    if point == "mid-copy":
+        return step == "R2"
+    if point in RM.REMOVE_POINTS:
+        return step in REMOVE_PHASES[point.split(":", 1)[0]]
+    return True
+
+
 def check_fault(fault: object) -> Optional[Tuple[str, str]]:
-    """A launcher's fault, or None: a ``(step id, point)`` pair of strings, the id :data:`FAULT_STEP_RE`, the point a
-    member of :data:`FAULT_POINTS`. Else ``bad-token``, before any act. Phase A embeds it in phase B's program as a
-    literal only after this check, so nothing but those two shapes of text reaches it."""
+    """A launcher's fault, or None: a ``(step id, point)`` pair of strings that a plan places (:func:`_reachable`),
+    so a harness run cannot finish without the crash it asked for. Else ``bad-token``, before any act. Phase A embeds
+    it in phase B's program as a literal only after this check, so nothing but those two shapes of text reaches it."""
     if fault is None:
         return None
     if not (isinstance(fault, tuple) and len(fault) == 2 and all(type(x) is str for x in fault)
-            and FAULT_STEP_RE.fullmatch(fault[0]) and fault[1] in FAULT_POINTS):
-        raise Refused("bad-token", f"fault: {fault!r} (a step id R<n>[a-z], a point in Seams.POINTS)")
+            and _reachable(fault[0], fault[1])):
+        raise Refused("bad-token", f"fault: {fault!r} (a step in FAULT_STEPS and a point its plan places)")
     return fault[0], fault[1]
 
 
@@ -1525,8 +1541,9 @@ def plan_repair_resume(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *
     ``<tree>/gen-<id>`` re-hashed with the §1.1 id function. Equal: that generation is the target, already placed
     (``Staged.existed``, never ``placed``: a restore keeps it); the plan has no step (R1-R3 ran; there is no source to
     read), and :func:`repair_handover` probes it and execs into it exactly as after a fresh stage. Unequal (power loss
-    tore it): one step removes it and the run refuses ``source-required:<id>`` (``Staged.refused``); the journal stays
-    as found, so the next ``repair --source`` re-stages it. Absent: ``source-required:<id>``, no act."""
+    tore it): one step removes it and, only once that step succeeded, the run refuses ``source-required:<id>``
+    (``Staged.then_refuse``; a failed removal is ``step-failed`` naming it); the journal stays as found, so the next
+    ``repair --source`` re-stages it. Absent: ``source-required:<id>``, no act."""
     host = facts.host
     journal, _finished, _operator, _txn = _repair_journal(cmd, facts, rf, gen_mod.new_txn, journal_kinds=False)
     assert journal is not None and journal.generation is not None
@@ -1543,9 +1560,9 @@ def plan_repair_resume(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *
         got = f"unreadable ({e.name})"
     if got == target:
         return InstallPlan("repair", host, (), intent=journal, handover=root_tree.Staged(target=target, existed=True))
-    cell = root_tree.Staged(refused=Refused(f"source-required:{target}", f"{gen_dir} hashes to {got}, not {target} "
-                                                                         "(torn), and was removed: repair --source "
-                                                                         "<that levain package>"))
+    cell = root_tree.Staged(then_refuse=Refused(f"source-required:{target}", f"{gen_dir} hashes to {got}, not "
+                                                                             f"{target} (torn), and was removed: "
+                                                                             "repair --source <that levain package>"))
     steps = [Step(f"remove the torn generation {gen_dir} (it hashes to {got})",
                   (root_tree._tools(host)["rm"], "-rf", str(gen_dir)))]
     check_tools(facts, steps, verb="repair", python=True)
@@ -2460,6 +2477,10 @@ PROBE_EXIT_HANDOVER = 5
 PROBE_EXIT_BAD_RECORD = 6
 #: The handover's ABI [r5: codex MED 3]: what phase A's exec passes to ``repair_continue`` (the call shape of
 #: :func:`phase_b_text`) and what phase B adopts. The probe answers it; phase A execs only into its own.
+#: [r6: L3 s3 r1 codex HIGH, bounded] It also freezes the probe's wire: the request's keys (:func:`run_probe`'s
+#: ``journal``, ``operator``, ``shape``) and the reply's (:func:`repair_probe`'s ``handover``, ``kinds``, ``ok``). ANY
+#: change to either key set bumps this number, so a probe across versions refuses ``downgrade-unsupported:handover``
+#: (the designed path) and never needs a second schema; ``test_the_probe_wire_is_frozen_at_handover_abi_1`` pins both.
 HANDOVER_ABI = 1
 
 
@@ -2543,9 +2564,11 @@ def _bounded_child(argv: Sequence[str], data: bytes, *, timeout: float, cap: int
     assert p.stdout is not None
     out, deadline, over = b"", clock() + timeout, False
     fd = p.stdout.fileno()
-    sel = selectors.DefaultSelector()            # [r5: L3 r2 OBS] select.select refuses an fd >= FD_SETSIZE
-    sel.register(fd, selectors.EVENT_READ)
+    sel = None
     try:
+        # [r6: L3 s3 r1 complement LOW] made inside the try, so a register that raises (EMFILE) still kills the group
+        sel = selectors.DefaultSelector()        # [r5: L3 r2 OBS] select.select refuses an fd >= FD_SETSIZE
+        sel.register(fd, selectors.EVENT_READ)
         while True:
             left = deadline - clock()
             if left <= 0:
@@ -2560,8 +2583,12 @@ def _bounded_child(argv: Sequence[str], data: bytes, *, timeout: float, cap: int
             if len(out) > cap:
                 over = True
                 break
+    except BaseException:
+        over = True                              # the group killed now, not after the wait's grace
+        raise
     finally:
-        sel.close()
+        if sel is not None:
+            sel.close()
         p.stdout.close()
         if over:
             try:
@@ -2744,8 +2771,8 @@ def repair_handover(plan: InstallPlan, g: Gathered, lock_fd: int, caller_uid: in
     failure or exception in between (a failed step, the hash's refusal, the probe's, an OSError) restores the host
     (:func:`_restore_phase_a`) and is raised; a restore that could not finish appends ``rollback-incomplete: <what>``
     to the refusal's detail. ``fault``: the launcher's, carried into the probe's bind and phase B's program as a literal
-    [F7]. A resume (:func:`plan_repair_resume`) arrives here with its target already placed, or with its refusal set
-    once its one step removed a torn generation. ``python``, ``tree``, ``intent_path``, ``entry``: a test's
+    [F7]. A resume (:func:`plan_repair_resume`) arrives here with its target already placed, or with a refusal raised
+    only after its one step removed a torn generation (``Staged.then_refuse``, after ``failed``). ``python``, ``tree``, ``intent_path``, ``entry``: a test's
     interpreter, import tree, journal and phase B entry."""
     host, cell = plan.host, plan.handover
     assert cell is not None
@@ -2760,6 +2787,8 @@ def repair_handover(plan: InstallPlan, g: Gathered, lock_fd: int, caller_uid: in
             raise cell.refused
         if failed is not None:
             raise Refused("step-failed", failed)
+        if cell.then_refuse is not None:
+            raise cell.then_refuse
         if cell.target is None:
             raise Refused("internal", "phase A staged no generation")
         journal = replace(plan.intent, generation=cell.target) if plan.intent is not None else None
@@ -3011,7 +3040,7 @@ INSTALL_ENTRY_ENV = ("SUDO_UID",)
 
 
 __all__ = ["ContinueSeams", "PROBE_OUT_CAP", "PROBE_TIMEOUT_S", "adopt_lock", "exec_phase_b", "phase_b_text",
-           "plan_repair_stage", "plan_repair_resume", "check_fault", "fault_hook", "FAULT_POINTS", "probe_text", "repair_continue", "repair_handover", "HANDOVER_ABI", "repair_probe", "run_probe",
+           "plan_repair_stage", "plan_repair_resume", "check_fault", "fault_hook", "FAULT_POINTS", "FAULT_STEPS", "probe_text", "repair_continue", "repair_handover", "HANDOVER_ABI", "repair_probe", "run_probe",
            "RepairFacts", "desired_managed", "install_shape_path", "plan_only_report", "plan_repair", "BUILT_VERBS", "CHILD_MARGIN_S", "CREDENTIAL_VERBS", "INSTALL_ENTRY_ENV", "KEYS_ACCOUNT", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
            "apply_steps", "check_account_ids", "drop_to_keys", "load_creds", "read_credential", "run_credential", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",

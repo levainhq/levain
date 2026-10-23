@@ -351,6 +351,9 @@ class Staged:
     existed: bool = False
     #: :func:`_place` began replacing ``<tree>/<target>`` (its ``rm -rf``): only then may a restore remove it.
     placed: bool = False
+    #: [r6: L3 s3 r1 codex MED] The refusal the run meets only once EVERY step succeeded (a torn resume's: "was
+    #: removed"). A failed step is ``step-failed`` instead, so a removal that did not happen is never reported done.
+    then_refuse: Optional[Refused] = None
 
 
 def _hash_staged(cell: Staged, partial: Path, source: Path, h11_dir: Path, pinned: Optional[str]) -> tuple[bool, str]:
