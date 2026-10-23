@@ -256,7 +256,7 @@ def test_budget_stopped_outlives_the_cache_entry(monkeypatch):
 
 
 def test_drop_session_clears_budget_stopped(monkeypatch):
-    # DROP-SESSION (`_detach(..., revoke=True)`) is the one thing that takes a session out of the set. After it the
+    # DROP-SESSION (`drop_session`) is the one thing that takes a session out of the set. After it the
     # session, registered again with a new token, is served and settles from its own usage.
     up = _Up()
 
@@ -287,3 +287,40 @@ def test_drop_session_clears_budget_stopped(monkeypatch):
     assert [(o["kind"], o["overrun"]) for o in out["res"]] == [("settled", OVER_COST - HOLD), ("settled", 0)]
     assert out["res"][1]["settled"] == UNDER_COST
     assert out["after"] == set()
+
+
+def test_drop_session_after_the_fail_closed_clear_still_clears_budget_stopped(monkeypatch):
+    # L3 r2 codex (a MED the r1 fix introduced): `_detach_all` keeps the set but removes every registration, so a
+    # DROP-SESSION that arrives before the session registers again finds no registration. It still takes the session
+    # out of the set: re-registered, the session's next `Q` is admitted and settles from its own usage.
+    up = _Up()
+
+    async def go(d: str) -> dict:
+        _scripted(monkeypatch, up)
+        async with _Sessions(d, 1) as s:
+            await _overrun(s, up)
+            async with s.k.state_lock:
+                s.k._detach_all()
+            out = {"after_clear": set(s.k.budget_stopped), "reg_after_clear": "s0" in s.k.by_session}
+            out["dropped"] = await s.k.drop_session(s.k.admin_epoch, "s0")
+            out["after_drop"] = set(s.k.budget_stopped)
+            await _reregister(s, 2)
+            _fresh_resolves(s)
+            up2 = _Up()
+            _scripted(monkeypatch, up2)
+            front2, task2, got2 = await s.start(0, _q(BODY_Q))
+            front2.feed_data(gwwire.encode(b"B", BODY) + gwwire.encode(b"E"))
+            up2.feed(_response(UNDER))
+            up2.feed(b"")
+            await asyncio.wait_for(task2, 5)
+            out.update(second=await got2(), after=set(s.k.budget_stopped), path=s.ledger.path)
+        out["res"] = [o for o in file_lines(out["path"]) if o["kind"] in ("settled", "uncertain", "released")]
+        return out
+
+    out = _run(go)
+    assert out["after_clear"] == {"s0"} and out["reg_after_clear"] is False
+    assert out["dropped"] == {"dropped": False}            # nothing held: still success
+    assert out["after_drop"] == set()
+    assert [t for t, _ in out["second"]][:2] == [b"A", b"R"] and out["second"][-1][0] == b"e", out["second"]
+    assert [(o["kind"], o["overrun"]) for o in out["res"]] == [("settled", OVER_COST - HOLD), ("settled", 0)]
+    assert out["res"][1]["settled"] == UNDER_COST and out["after"] == set()

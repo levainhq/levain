@@ -750,8 +750,8 @@ class Keys:
         #: the sessions an overrun stopped (R4 §1.4): `_settle` adds one whose settle cost more than its hold, and
         #: `_check_q` and the pre-admit statement refuse its every later `Q` `budget-overrun`. Keyed by SESSION, never
         #: by a cache entry, so a re-registration or reattach that drops and re-resolves the session's claims keeps
-        #: the stop. Only DROP-SESSION (`_detach` with `revoke`) takes a session out; the fail-closed clear keeps it;
-        #: a restart loses it with the rest of memory.
+        #: the stop. Only DROP-SESSION (`drop_session`, registered or not) takes a session out; the fail-closed clear
+        #: keeps it; a restart loses it with the rest of memory.
         self.budget_stopped: Set[str] = set()
         #: digests keys itself saw dropped (bounded, oldest first): `token-revoked` without asking
         self.dropped: "OrderedDict[str, None]" = OrderedDict()
@@ -953,6 +953,9 @@ class Keys:
             reg = self.by_session.get(session)
             if reg is not None:
                 victims = self._detach(reg, revoke=True)
+            # whether or not a registration is held (the fail-closed clear keeps the set and removes every
+            # registration): the one place a session leaves `budget_stopped`
+            self.budget_stopped.discard(session)
         self._effects(victims)
         return {"dropped": reg is not None}   # false = nothing held: still success
 
@@ -963,14 +966,12 @@ class Keys:
         attributed to it, each marked detached, preceded by the `Upstream` OBJECT of each detached exchange that holds
         one (phase 2 aborts it: an abort drops the transport's buffer, where a close would flush credential-bearing
         bytes); an exchange's task is cancelled (delivery only, never the guarantee). The session's cached claims
-        leave the token cache; with `revoke` (DROP-SESSION) their digests enter the dropped set and the session leaves
-        `budget_stopped` (the one place it does)."""
+        leave the token cache; with `revoke` (DROP-SESSION) their digests enter the dropped set (`drop_session` takes
+        the session out of `budget_stopped`, registered or not)."""
         if self.regs.get(reg.front_uid) is reg:
             del self.regs[reg.front_uid]
         if self.by_session.get(reg.session) is reg:
             del self.by_session[reg.session]
-        if revoke:
-            self.budget_stopped.discard(reg.session)
         for digest in [d for d, a in self.cache.items() if a["session"] == reg.session]:
             del self.cache[digest]
             if revoke:
