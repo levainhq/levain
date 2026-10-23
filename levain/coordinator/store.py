@@ -330,6 +330,7 @@ class CoordStore:
         conn = self._jobs._connect()
         if not self._ready:
             from levain.coordinator.lease import LEASE_SCHEMA
+            from levain.coordinator.first_reader import FIRST_READER_SCHEMA
             from levain.coordinator.review import REVIEW_SCHEMA
             from levain.coordinator.teamdrafts import DRAFT_SCHEMA
 
@@ -337,7 +338,7 @@ class CoordStore:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     # the lease is checked by every opener's coordinator writes, so its tables are every opener's
-                    for stmt in (*self._SCHEMA, *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA):
+                    for stmt in (*self._SCHEMA, *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA):
                         conn.execute(stmt)
                     conn.execute("COMMIT")
                 except BaseException:

@@ -998,6 +998,8 @@ def run_coord(args: argparse.Namespace, out: Any = None) -> int:
             return 0
         if cmd == "agent":
             return _coord_agent(args, out, store)
+        if cmd in ("questions", "answer", "escalate"):
+            return _coord_first_reader(args, out, store)
         if cmd == "launch":
             from levain.coordinator.launch import launch_session
 
@@ -1094,6 +1096,48 @@ def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
           f"coordinator agent: claude{f' ({got.model})' if got.model else ''} in {got.cwd}\n"
           "Claude Code starts a session only in a directory you trusted; run this once and accept the trust prompt:\n"
           f"{remedy}")
+    return 0
+
+
+def _band_snapshot(args: argparse.Namespace, store: EnvelopeStore) -> tuple[Any, str]:
+    """The authority snapshot the envelope check reads, or ``(None, why)``: with none, nothing is live and every
+    question escalates (an unchecked envelope never makes a question answerable)."""
+    try:
+        return _snapshot(args, store), ""
+    except _faults() as exc:
+        return None, str(exc)[:200]
+
+
+def _coord_first_reader(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
+    """``levain coord questions|answer|escalate`` (C5): the coordinator reads the question band first."""
+    from levain.coordinator import first_reader as fr
+
+    cmd = args.coord_cmd
+    if cmd == "escalate":
+        reply_id = fr.escalate(store, args.ref, args.why, token=args.token)
+        _emit(out, args.json, {"reply_id": reply_id}, f"escalated: question {args.ref} waits on the operator "
+                                                      f"(ANSWER {reply_id}); the question is untouched")
+        return 0
+    authority, unchecked = _band_snapshot(args, store)
+    if cmd == "questions":
+        rows = fr.read_band(store, authority=authority)
+        obj = [{"n": r.question.n, "id": r.question.id, "agent": r.question.agent,
+                "session": r.question.agent_session_id, "what": r.question.what,
+                "options": [{"key": k, "label": v} for k, v in r.question.options], "rec": r.question.rec,
+                "blocks": r.question.blocks, "may_answer": r.may_answer, "why": r.why, "launch_id": r.launch_id,
+                "thread_id": r.thread_id, "envelope_id": r.envelope_id} for r in rows]
+        lines = [f"#{r.question.n} {json.dumps(r.question.what, ensure_ascii=False)}\n  "
+                 + ("MAY ANSWER as a KNOW: " if r.may_answer else "ESCALATE: ") + r.why for r in rows]
+        if unchecked:
+            lines.append(f"(the envelopes were not checked: {unchecked})")
+        _emit(out, args.json, {"questions": obj, "unchecked": unchecked or None},
+              "\n".join(lines) if rows else "no unread questions" + (f" ({unchecked})" if unchecked else ""))
+        return 0
+    item, reply_id = fr.answer(store, args.ref, option=args.option, text=args.text, token=args.token,
+                               authority=authority)
+    _emit(out, args.json, {"item_id": item.item_id, "reply_id": reply_id},
+          f"KNOW {reply_id} filed for your review ({item.item_id}); the seat gets it labelled as the coordinator's "
+          "own, and the question stays open for you")
     return 0
 
 
@@ -1274,7 +1318,31 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "is over. Only sessions Levain started.")
     cwa.add_argument("--every", type=float, default=30.0, metavar="S", help="Seconds between passes (default 30).")
     cwa.add_argument("--once", action="store_true", help="One pass, then exit.")
-    for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa):
+    band_root = ("The cockpit data root whose authority log re-verifies the asking session's envelope (default: the one "
+                 "the consent hooks in the queue directory name).")
+    cq = c_sub.add_parser(
+        "questions", help="The seats' open questions you have not read yet, each with whether you may answer it.",
+        description="You read the question band first (Q17). You may answer a question only when it was asked by a "
+                    "worker Levain started under a live envelope, from inside a repo the envelope names, and no "
+                    "option of it is tied to a consent request; everything else you escalate. Whether its subject "
+                    "is inside the envelope is your judgement: the operator reviews every answer you give.")
+    cq.add_argument("--data-root", dest="data_root", type=Path, default=None, help=band_root)
+    can = c_sub.add_parser(
+        "answer", help="Answer a seat's question as your own KNOW (never the operator's answer).",
+        description="Files a KNOW (the operator's review queue, never a push) and delivers it to the asking session "
+                    "labelled as yours. The question stays open: the operator may still answer, and his answer is "
+                    "the one that counts. Refused (escalate instead) outside the envelope.")
+    can.add_argument("ref", help="The question's number or id.")
+    pick = can.add_mutually_exclusive_group(required=True)
+    pick.add_argument("--option", default=None, help="The option KEY you pick.")
+    pick.add_argument("--text", default=None, help="Your answer in your own words.")
+    can.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
+    can.add_argument("--data-root", dest="data_root", type=Path, default=None, help=band_root)
+    ces = c_sub.add_parser("escalate", help="Leave a seat's question to the operator (an ANSWER waiting on him).")
+    ces.add_argument("ref", help="The question's number or id.")
+    ces.add_argument("--why", required=True, help="Why it is the operator's, one line.")
+    ces.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
+    for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces):
         common(p)
         p.set_defaults(func=run_coord)
 

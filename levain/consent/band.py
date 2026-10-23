@@ -12,6 +12,10 @@ An answer authorises nothing (Phill's 26a): it is information for the agent, uns
 agent then makes still goes through the gate. The delivered text says so. ``levain ask`` is not a boundary either:
 it runs as the agent, and the agent, session and queue directory it names are the caller's word.
 
+The coordinator reads the band first (C5, :mod:`levain.coordinator.first_reader`). Its answer is a KNOW in its own
+store, never an answer here: the hook delivers it labelled as the coordinator's (:func:`know_line`, :data:`KNOW_TAIL`)
+while the question stays open, and ``levain question answer`` refuses a session Levain started as the coordinator.
+
 The answer is claimed by the session's MAIN thread only (a hook session key with no ``#agent:`` part), keyed by the
 session id ``levain ask`` read from the agent's environment: a subagent's context is discarded when it ends, and
 the answer has to reach the conversation that goes on.
@@ -69,8 +73,8 @@ from levain import unshowable
 from levain.cockpit.consent import ConsentError
 from levain.consent.questions import Link, Question, QuestionStore, QuestionStoreError
 
-__all__ = ["AGENT_LINE", "ANSWER_TAIL", "NO_SESSION", "QUOTED_NOTE", "add_parsers", "answer_line", "ask_resume_meta",
-           "deliver_answer", "deliver_answers", "file_question", "question_context", "run_ask", "run_question",
+__all__ = ["AGENT_LINE", "ANSWER_TAIL", "KNOW_TAIL", "NO_SESSION", "QUOTED_NOTE", "add_parsers", "answer_line", "ask_resume_meta",
+           "deliver_answer", "deliver_answers", "file_question", "know_line", "question_context", "run_ask", "run_question",
            "transcript_facts"]
 
 # the session a question names when the environment names none (no hook's session is ever this)
@@ -88,6 +92,9 @@ AGENT_LINE = ("When you need the operator's judgement and can keep working on so
 # the line every delivered block of answers ends with (26a)
 ANSWER_TAIL = ("An answer is information, not a permission: a gated call still goes through levain's gate, and "
                "levain has checked nothing about who recorded it.")
+# after the coordinator's KNOW answers (C5, gap 7: "its answers are KNOWs labelled as its own")
+KNOW_TAIL = ("Each coordinator answer above is its own reading, filed for the operator's review: the question stays "
+             "open, and an answer the operator records later reaches you too and is the one that counts.")
 EXIT_OK, EXIT_REFUSED = 0, 2
 # the agents a question can name (the parser lists them without importing either adapter)
 _AGENT_NAMES = ("claude_code", "codex")
@@ -161,7 +168,44 @@ def question_context(directory: Path | str, agent: str, session: str | None) -> 
     if not store.path.exists():
         return None
     lines = [line for line in (answer_line(q) for q in store.claim_answers_for(agent, session)) if line]
+    knows = _coordinator_lines(directory, agent, session)
+    if knows:
+        lines += [*knows, KNOW_TAIL]
     return "\n".join([*lines, ANSWER_TAIL]) if lines else None
+
+
+def know_line(question: Question, body: dict[str, Any]) -> str:
+    """The fixed text one coordinator KNOW is delivered as (C5): it names the COORDINATOR as the one who answered, on
+    its own reading, never the operator, and the value arrives quoted or escaped exactly as an answer's does."""
+    head = (f"levain: the coordinator, not the operator, answered question #{question.n} {_quoted(question.what)} "
+            "on its own reading")
+    if body.get("kind") == "option":
+        key = str(body.get("value", ""))
+        return f"{head}: option {key} {_quoted(dict(question.options).get(key, ''))}."
+    return f"{head}, in its own words: {_escaped(str(body.get('value', '')))}"
+
+
+def _coordinator_caller(directory: Path) -> bool:
+    """True when this process runs inside a session Levain started as the coordinator (its harness session id, read
+    from the environment, is a coordinator launch's). A label check, like every actor before S1: it keeps the
+    coordinator's pick from being recorded as the operator's answer (C5's run: ``via cli``, and the operator locked
+    out), it does not stop a process that hides its environment."""
+    from levain.coordinator.first_reader import is_coordinator_session
+
+    env = os.environ
+    return any(is_coordinator_session(directory, env.get(name)) for name in ("CLAUDE_CODE_SESSION_ID",
+                                                                             "CODEX_THREAD_ID"))
+
+
+def _coordinator_lines(directory: Path | str, agent: str, session: str) -> list[str]:
+    """The coordinator's KNOW answers for this session (claimed once), or none. Never raises: a store that cannot be
+    read now is read at the session's next hook."""
+    try:
+        from levain.coordinator.first_reader import claim_knows
+
+        return [know_line(q, body) for q, body in claim_knows(directory, agent, session)]
+    except Exception:  # noqa: BLE001 - the hook carries the operator's answers whatever the coordinator's store does
+        return []
 
 
 def _ancestors() -> Iterator[tuple[int, list[str]]]:
@@ -481,6 +525,10 @@ def run_question(args: argparse.Namespace, out: Any = None) -> int:
             return EXIT_OK
         if (args.option is None) == (args.text is None):
             raise ValueError("answer with exactly one of --option KEY or --text TEXT")
+        if _coordinator_caller(store.directory):
+            raise ValueError("this session is the coordinator: its answer is its own, never the operator's, so it "
+                             "goes `levain coord answer` (a KNOW the operator reviews, the question left open) or "
+                             "`levain coord escalate`")
         store.answer(q.id, option=args.option, text=args.text, channel="cli")
         say(f"levain question: #{q.n} answered. The answer authorises nothing.")
         if q.link is not None and args.option == q.link.option:
