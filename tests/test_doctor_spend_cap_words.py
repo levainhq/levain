@@ -24,3 +24,13 @@ def test_changelog_unreleased_carries_the_same_strings():
     unreleased = text.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
     assert SPEND_CAP_WORDS in unreleased
     assert SPEND_CAP_SIZING_LINE in unreleased
+
+
+def test_the_note_is_wired_into_run_doctor(tmp_path: Path, capsys):
+    # L3 words r1 complement LOW 3: both tests above call `spend_cap_note()` directly, so deleting doctor's `print`
+    # would survive them. The real entry point, on a scratch install: the note is printed exactly once, unbadged.
+    from levain.doctor import run_doctor
+
+    run_doctor(tmp_path)
+    out = capsys.readouterr().out
+    assert out.count(spend_cap_note()) == 1, out

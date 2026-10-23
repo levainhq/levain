@@ -15,7 +15,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   Levain's own re-serialization of the parsed JSON, not as the agent's bytes. A body that does not arrive within
   `BODY_READ_S` (in `levain/broker/keys.py`) is refused `body-timeout` (408). A websocket upgrade on a metered route
   is refused `body-unbounded:websocket` (403), because one exchange would carry many responses and no one usage would
-  settle it. `levain doctor` carries the same words in its `authorized-spend cap` row.
+  settle it. `levain doctor` prints the same words as a note after its checks (no badge, no effect on its exit code).
 
   Levain enforces an authorized-spend cap: a route's per-session cap on what Levain lets an agent spend. It is a budget, not a ceiling on your bill. Calls already running when the cap is reached can finish past it. To put a hard ceiling on what a provider can bill, set a spending limit on the API key itself.
 
