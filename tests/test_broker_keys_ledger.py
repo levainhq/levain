@@ -199,6 +199,7 @@ def test_cancel_at_each_await_resolves(monkeypatch, caplog, row):
         assert out["state_at_cancel"] is L.PENDING
     if row == "3-durable-reserved":
         assert out["state_at_cancel"] is L.RESERVED
+        assert out["head"] == []   # the detach withheld the head, whether or not the cancel was delivered
     assert "misuse" not in caplog.text
 
 
@@ -399,6 +400,161 @@ def test_backstop_catches_a_missed_exit(monkeypatch):
     seq = out["seqs"][0]
     assert out["res"] == [("uncertain", seq, "owner-ended")]
     assert out["outcome_after"] == (L.UNCERTAIN, "owner-ended")
+
+
+# --- B1 L3 r1: a fenced relay, a misuse at the send gate, `end()` on a closing or unhealthy ledger ------------------
+
+def test_a_fenced_http_relay_is_uncertain_not_settled(monkeypatch):
+    # codex MED + L1 #4: preemption's `_fence_exchanges` marks the exchange detached without cancelling it; the relay
+    # sees the flag and returns early, so the response was cut short: `uncertain {ended}`, never `settled`
+    up = _Up()
+
+    async def go(d: str) -> dict:
+        _scripted(monkeypatch, up)
+        async with _Rig(d) as rig:
+            holds = _capture(rig)
+            rig.front.feed_data(gwwire.encode(b"E"))
+            up.feed(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabcde")
+            task = rig.run(_q("none"))
+            await until(lambda: up.reads >= 2)   # the relay waits on the body's rest
+            rig.k._fence_exchanges()
+            up.feed(b"fghij")
+            await asyncio.wait_for(task, 5)
+            await until(lambda: holds[0].state is L.RESOLVED)
+            out = {"frames": await rig.got(), "path": rig.ledger.path, "outcome": holds[0].outcome}
+        out["res"] = resolutions(out["path"])
+        out["seqs"] = [o["seq"] for o in file_lines(out["path"]) if o["kind"] == "reserved"]
+        return out
+
+    out = _run(go)
+    assert _types(out["frames"]) == b"ARb", out["frames"]   # no `e`: the relay stopped at the fence
+    assert out["res"] == [("uncertain", out["seqs"][0], "ended")], out
+    assert out["outcome"] == (L.UNCERTAIN, "ended")
+
+
+def test_a_fenced_websocket_is_uncertain_not_settled(monkeypatch):
+    # the websocket branch of the same: `_websocket` returns on "detached", and the hold is booked `uncertain {ended}`
+    from tests import test_broker_ws as WS
+    up = _Up()
+
+    async def go(d: str) -> dict:
+        _scripted(monkeypatch, up)
+        async with _Rig(d) as rig:
+            holds = _capture(rig)
+            rig.front.feed_data(WS._gw(b"E"))   # the request's end; the front stays open
+            up.feed(WS._h101())
+            task = rig.run(WS._q())
+            await until(lambda: up.reads >= 2)   # the relay's `down` waits on the upstream after the 101
+            rig.k._fence_exchanges()
+            up.feed(WS._frame(1, b"after the fence"))
+            await asyncio.wait_for(task, 5)
+            await until(lambda: holds[0].state is L.RESOLVED)
+            out = {"frames": await rig.got(), "path": rig.ledger.path, "outcome": holds[0].outcome}
+        out["res"] = resolutions(out["path"])
+        out["seqs"] = [o["seq"] for o in file_lines(out["path"]) if o["kind"] == "reserved"]
+        return out
+
+    out = WS._run(go)
+    assert _types(out["frames"]) == b"AU", out["frames"]   # the frame after the fence never reached the front
+    assert out["res"] == [("uncertain", out["seqs"][0], "ended")], out
+    assert out["outcome"] == (L.UNCERTAIN, "ended")
+
+
+def test_a_misuse_at_the_send_gate_is_keys_unavailable(monkeypatch, caplog):
+    # complement LOW 1: `LedgerMisuse` from `send_gate` is noted and answered `F{keys-unavailable}`, as `_admit_hold`
+    # maps it; nothing goes upstream and the unsent hold is released
+    up = _Up()
+
+    def misuse(self, hold):
+        raise L.LedgerMisuse("a scripted misuse")
+
+    monkeypatch.setattr(L.Ledger, "_hold_send_gate", misuse)
+
+    async def go(d: str) -> dict:
+        _scripted(monkeypatch, up)
+        async with _Rig(d) as rig:
+            holds = _capture(rig)
+            rig.front.feed_data(gwwire.encode(b"E"))
+            rig.front.feed_eof()
+            task = rig.run(_q("none"))
+            await asyncio.wait([task], timeout=5)
+            out = {"raised": None if task.cancelled() else task.exception(), "frames": await rig.got(),
+                   "path": rig.ledger.path, "head": up.writes[:1]}
+            await until(lambda: holds[0].state is L.RESOLVED)
+        out["res"] = resolutions(out["path"])
+        out["seqs"] = [o["seq"] for o in file_lines(out["path"]) if o["kind"] == "reserved"]
+        return out
+
+    with caplog.at_level(logging.WARNING):
+        out = _run(go)
+    assert out["raised"] is None, out["raised"]
+    assert _types(out["frames"]) == b"AF", out["frames"]
+    assert out["frames"][-1] == (b"F", gwwire.encode(b"F", {"refused": "keys-unavailable"})[5:])
+    assert out["head"] == []
+    assert out["res"] == [("released", out["seqs"][0], None)]
+    assert "ledger misuse at the send gate" in caplog.text
+
+
+@pytest.mark.parametrize("ledger_state", ["closing", "unhealthy"])
+def test_end_in_the_refusal_handler_does_not_raise(monkeypatch, ledger_state):
+    # complement LOW 2, answered by ledger.py: `end()` on a closing ledger finds the hold already resolved by
+    # `aclose`'s `closed` column, and on an unhealthy one finds it STRANDED by `_fault`; either way `_end` is a no-op
+    # returning False, never a raise, so the refusal handler's `_refuse` still sends `F{name}`. The hold is SENT
+    # (the ledger turns after `mark_sent`) and the upstream ends before a head: `upstream-error`.
+    up = _Up()
+    hook: dict = {}
+    ends: list = []
+    real_mark_sent, real_end = L.Hold.mark_sent, L.Hold.end
+
+    def mark_sent(self):
+        real_mark_sent(self)
+        if ledger_state == "closing":
+            hook["close"] = asyncio.ensure_future(hook["ledger"].aclose(2.0))   # its synchronous part: the next turn
+        else:
+            hook["ledger"]._fault(None, "stall")
+
+    def end(self):
+        try:
+            r = real_end(self)
+        except BaseException as e:
+            ends.append(e)
+            raise
+        ends.append(r)
+        return r
+
+    monkeypatch.setattr(L.Hold, "mark_sent", mark_sent)
+    monkeypatch.setattr(L.Hold, "end", end)
+
+    async def go(d: str) -> dict:
+        _scripted(monkeypatch, up)
+        async with _Rig(d) as rig:
+            holds = _capture(rig)
+            hook["ledger"] = rig.ledger
+            rig.front.feed_data(gwwire.encode(b"E"))
+            rig.front.feed_eof()
+            up.feed(b"")   # EOF before a head
+            task = rig.run(_q("none"))
+            await asyncio.wait([task], timeout=5)
+            out = {"raised": None if task.cancelled() else task.exception(), "frames": await rig.got(),
+                   "path": rig.ledger.path, "head": up.writes[:1], "state": holds[0].state,
+                   "outcome": holds[0].outcome}
+            if "close" in hook:
+                await asyncio.wait_for(hook["close"], 5)
+        out["res"] = resolutions(out["path"])
+        out["seqs"] = [o["seq"] for o in file_lines(out["path"]) if o["kind"] == "reserved"]
+        return out
+
+    out = _run(go)
+    assert out["raised"] is None, out["raised"]
+    assert out["head"] != []                                  # the head went: the hold was SENT
+    assert ends == [False], ends                              # the handler's `end()`: a no-op, no raise
+    assert _types(out["frames"]) == b"AF", out["frames"]
+    assert out["frames"][-1] == (b"F", gwwire.encode(b"F", {"refused": "upstream-error"})[5:])
+    if ledger_state == "closing":
+        assert out["outcome"] == (L.UNCERTAIN, "closed")
+        assert out["res"] == [("uncertain", out["seqs"][0], "closed")]
+    else:
+        assert out["state"] is L.STRANDED and out["res"] == []
 
 
 # --- T21, keys' half: a route's per-session cap, per route ----------------------------------------------------------

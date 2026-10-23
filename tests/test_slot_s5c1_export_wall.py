@@ -9,8 +9,14 @@ import pytest
 from levain.slot import Refused
 from levain.slot import render as rd
 from levain.slot import wall
+from tests.execve_guard import refuse_real_execve
 from tests.test_slot_s2d_wall import E0, FakeOS
 from tests.test_slot_s2d_wall import spec as slot_spec
+
+@pytest.fixture(autouse=True)
+def _no_real_execve(monkeypatch):
+    yield from refuse_real_execve(monkeypatch, wall.os, route=True)
+
 
 #: The forbidden Seatbelt operation family, assembled at runtime so no file spells it (trg-069 guard).
 SC = "sys" + "call"

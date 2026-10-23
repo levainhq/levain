@@ -26,8 +26,14 @@ from levain.slot import keyring_join as KJ
 from levain.slot import root_tree
 from levain.slot import runtime_helper as RH
 from levain.slot import wall
+from tests.execve_guard import GUARD_EXIT, pid_locked_real_execve, refuse_real_execve
 from tests.test_slot_s2d_wall import FakeOS, fake_for
 from tests.test_slot_s2d_wall import spec as slot_spec
+
+@pytest.fixture(autouse=True)
+def _no_real_execve(monkeypatch):
+    yield from refuse_real_execve(monkeypatch, wall.os, route=True)
+
 
 IDS = {"_levain_export": 798, "_levain_verify": 797}
 SHARED = {"levain-export": 784, "levain-dispatch-export": 783, "levain-verify": 781, "levain-slots": 789}
@@ -198,7 +204,8 @@ def _probe_argv(out_path: str):
 
 
 @pytest.mark.parametrize("joined", [True, False])
-def test_the_forked_child_joins_the_leaf_through_exec_launch_and_execs_only_when_proven(joined, tmp_path):
+def test_the_forked_child_joins_the_leaf_through_exec_launch_and_execs_only_when_proven(joined, tmp_path,
+                                                                                         monkeypatch):
     """The real fork of ``spawn_export`` with ``wall.exec_launch`` as its last act; the cgroupfs is a fake (a
     file for ``cgroup.procs`` and the ``/proc/self/cgroup`` text), everything else is the real OS. Proven: the
     child writes its own pid, then execs. Not proven: it exits 70 and execs nothing."""
@@ -210,6 +217,8 @@ def test_the_forked_child_joins_the_leaf_through_exec_launch_and_execs_only_when
         assert path == f"{leaf}/cgroup.procs"
         procs.write_text(text)
 
+    # the forked child really execs the probe; the real execve is locked to every pid but pytest's
+    monkeypatch.setattr(wall.os, "execve", pid_locked_real_execve(os.getpid()))
     calls = wall.OsCalls(write_file=write_file, read_text=lambda p: member + "\n" if p == "/proc/self/cgroup" else "")
     seen = tmp_path / "fds.txt"
     cmd = RH.ExportCmd(_probe_argv(str(seen)), b"{}", cgroup=leaf,
@@ -231,6 +240,23 @@ def test_the_forked_child_joins_the_leaf_through_exec_launch_and_execs_only_when
         assert eval(seen.read_text()) == [0, 1, 2, 3, 4]       # noqa: S307 - our probe's repr
     else:
         assert os.WEXITSTATUS(status) == 70 and not seen.exists()
+
+
+def test_the_pid_locked_execve_raises_in_the_pytest_pid():
+    with pytest.raises(AssertionError, match="pytest process"):
+        pid_locked_real_execve(os.getpid())("/bin/true", ["/bin/true"], {})
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_a_guard_hit_in_a_forked_child_exits_with_the_distinctive_status():
+    pid = os.fork()
+    if pid == 0:   # pragma: no cover - the child
+        try:
+            wall.os.execve("/bin/true", ["/bin/true"], {})
+        finally:
+            os._exit(1)                                       # only reached if the guard did not exit
+    _done, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == GUARD_EXIT
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the keyctl syscall runs on a Linux kernel only")

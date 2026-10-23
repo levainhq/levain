@@ -13,8 +13,6 @@ Known edges of the ledger wiring (3c-1 B1 L2, 10-23; not built, never a loss):
 - before Python 3.12 a cancel landing in the loop turn the durable wait completes is lost (bpo-42130; reproduced on
   /usr/bin/python3 3.9.6); money-safe because `_detach` marks the exchange detached before it cancels, so
   `Upstream.write` raises StaleExchange and `mark_sent` is never reached.
-- keys installs no SIGINT handler, so a Ctrl-C on a foreground keys between `up.write(head)` and `mark_sent` releases
-  a hold whose head may be on the wire; launchd and systemd stop keys with SIGTERM, which is handled.
 
 The admin server (design 1.5 "The admin connection", "Fencing", "Order inside one connection"):
 - a connection is accepted only from the `_levain_control` uid, read from the kernel; any other peer is closed unread.
@@ -720,17 +718,21 @@ class Keys:
             self._starting.set()
 
     def arm_triggers(self) -> None:
-        """The ONE shutdown trigger: SIGTERM, and EOF on stdin when stdin is a pipe (the launcher's), both setting the
-        one latch. A stdin that is not a pipe (launchd's, `</dev/null`) is never read: EOF there means nothing."""
+        """The ONE shutdown trigger: SIGTERM or SIGINT, and EOF on stdin when stdin is a pipe (the launcher's), each
+        setting the one latch. A stdin that is not a pipe (launchd's, `</dev/null`) is never read: EOF there means
+        nothing. SIGINT is a loop handler, never a KeyboardInterrupt, so a Ctrl-C cannot land between `up.write(head)`
+        and `mark_sent` and release a hold whose head may be on the wire."""
         self._in_loop()
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGTERM, self.trigger)
+        loop.add_signal_handler(signal.SIGINT, self.trigger)
         try:
             fifo = stat.S_ISFIFO(os.fstat(0).st_mode)
         except OSError:
             fifo = False
         if not fifo:
-            print("levain gw-keys: stdin is not a pipe; the stdin-EOF shutdown trigger is not armed (SIGTERM only)",
+            print("levain gw-keys: stdin is not a pipe; the stdin-EOF shutdown trigger is not armed (SIGTERM and "
+                  "SIGINT only)",
                   file=sys.stderr, flush=True)
             return
         os.set_blocking(0, False)
@@ -1345,6 +1347,9 @@ class Keys:
                     hold.send_gate()   # the ledger's gate: a durable hold, the ledger healthy and open
                 except ledger.LedgerUnavailable as e:
                     raise norm.Refused("keys-unavailable", e.detail) from None
+                except ledger.LedgerMisuse as e:
+                    _note(logging.WARNING, "levain gw-keys: ledger misuse at the send gate (%s)", e)
+                    raise norm.Refused("keys-unavailable", "ledger misuse") from None
                 up.write(head)     # the gate: a refused or failed write handed nothing upstream
                 hold.mark_sent()   # from here the head may have reached the upstream
                 await up.drain()
@@ -1368,6 +1373,8 @@ class Keys:
                 rec["status"] = 101
                 await conn.writer.drain()
                 await self._websocket(conn, ff, side, up, hconn, scanner, rec)
+                if conn.detached:   # fenced mid-relay: cut short, so `_serve_q`'s `end()` books it, never a settle
+                    return
                 hold.settle(hold.amount)
                 return
             r_frame = self._response_frame(resp, pol, cred, scanner)
@@ -1378,6 +1385,8 @@ class Keys:
             rec["status"] = resp.status_code
             await conn.writer.drain()
             await self._relay_body(conn, up, hconn, scanner, rec)
+            if conn.detached:   # fenced mid-relay: cut short, so `_serve_q`'s `end()` books it, never a settle
+                return
             hold.settle(hold.amount)   # 3c-1: a completed relay settles at its full hold (no cost until 3c-2a)
         finally:
             rec["redactions"] = scanner.count
