@@ -1,24 +1,31 @@
 """The phone page's Drop tab, in headless Chrome at a phone's width (390), over the real phone server.
 
-One run through the page: a drop sent while its reply is lost (the page's fetch throws AFTER the server accepted), so it
-stays in the outbox and is sent again under the same outbox id, and the store files it once; then an envelope built by
-the server, shown on the sheet, signed with Chrome's virtual authenticator holding the SAME software passkey the cockpit
-enrolled, carried by its drop and verified by the store. Screenshots go to ``LEVAIN_SHOT_DIR`` when it is set (the
-lane's RUN), else the test's tmp dir."""
+One run through the page, from a PAIRED DEVICE's token (the coordinator routes refuse this run's phone token): a drop
+sent while its reply is lost (the page's fetch throws AFTER the server accepted), so it stays in the outbox and is sent
+again under the same outbox id, and the store files it once; that accepted drop wakes the coordinator through the CLI's
+own ``launch_session`` (here on an install whose hook is not live, so nothing starts) and the page shows the ``woken``
+receipt. Then an envelope reviewed on the server's sheet and signed with Chrome's virtual authenticator holding the SAME
+software passkey the cockpit enrolled, whose signature is made stale on the way (its ``signed_at`` minted five minutes
+back, once): the store refuses it ``envelope-stale`` and files nothing, the outbox card offers Sign again, and the second
+signature is stored with its envelope. Last, an outbox item bound to another store identity is shown as "from another
+Levain" and never sent. Screenshots go to ``LEVAIN_SHOT_DIR`` when it is set (the lane's RUN), else the test's tmp dir."""
 from __future__ import annotations
 
+import json
 import os
 import shutil
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 
+from levain.coordinator import envelope as env
 from levain.coordinator.envelopes import EnvelopeStore
 from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_coordinator_phone import device_token
 from tests.test_dispatch_phone import repo, world  # noqa: F401  (fixtures)
 from tests.test_phone_dispatch import _serve
 from tests.test_phone_page_dispatch import _authenticator
-from tests.test_phone_server import _TOK
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
@@ -28,39 +35,68 @@ LOSE_FIRST_REPLY = """(() => { const f = window.fetch; let lost = false; window.
   const p = f(u, o);
   if (!lost && String(u).endsWith('/coord/drop')) { lost = true; return p.then(() => { throw new TypeError('lost'); }); }
   return p; }; return 1; })()"""
+OTHER_STORE = "st-" + "0" * 32
+FOREIGN_ID = "ph-" + "f" * 32
+# an outbox item another Levain's store made (the phone name now answers for another dispatch directory), written to
+# storage as another tab would, and the storage event that tab's write fires here
+INJECT_FOREIGN = f"""(() => {{ const k = 'levain-outbox:' + location.hostname;
+  const all = JSON.parse(localStorage.getItem(k) || '[]');
+  all.push({{ outbox_id: '{FOREIGN_ID}', words: 'made for the other Levain', sent_at: '2026-10-22T10:00:00.000000Z',
+             state: 'waiting', envelope: null, store_id: '{OTHER_STORE}' }});
+  localStorage.setItem(k, JSON.stringify(all));
+  window.dispatchEvent(new StorageEvent('storage', {{ key: k }})); return 1; }})()"""
+OUTBOX_CARD = "(() => { const c = document.querySelector('#drop-outbox .row'); return c && c.textContent; })()"
 
 
 def _set(id_: str, value: str) -> str:
-    import json
-
     return (f"(() => {{ const e = document.getElementById({json.dumps(id_)}); e.value = {json.dumps(value)};"
             " e.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()")
 
 
+def _click(text_re: str, scope: str = "#drop-review") -> str:
+    return f"[...document.querySelectorAll('{scope} button')].find(b => /{text_re}/.test(b.textContent)).click() || 1"
+
+
 @needs_browser
-def test_drop_lost_reply_then_envelope_signed_through_the_page(world, tmp_path: Path) -> None:
+def test_drop_wake_stale_sign_again_and_another_levain_through_the_page(world, tmp_path: Path, monkeypatch) -> None:
     shots = Path(os.environ.get("LEVAIN_SHOT_DIR") or tmp_path)
     repo_path = str(world["repo"][0])
-    with _serve(world["qdir"], world["qdir"]) as (base, _):
+    install = tmp_path / "coord-install"
+    install.mkdir()
+    EnvelopeStore(world["qdir"]).coord_set_agent("claude", model="haiku", cwd=str(install.resolve()))
+    store_id = EnvelopeStore(world["qdir"]).store_id()
+    dev = device_token(world["qdir"])
+    # the FIRST payload the server mints is dated five minutes back: the signature the passkey then makes is valid and
+    # stale, as one held in the outbox past the store's skew is
+    real, shifted = env.sign_payload, []
+
+    def stale_once(body, *, signer_fp, signed_at):
+        if not shifted:
+            shifted.append(signed_at)
+            signed_at = signed_at - timedelta(minutes=5)
+        return real(body, signer_fp=signer_fp, signed_at=signed_at)
+
+    monkeypatch.setattr(env, "sign_payload", stale_once)
+    with _serve(world["qdir"], world["qdir"]) as (base, httpd):
         url = base.replace("127.0.0.1", "localhost")
-        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+        out = _drive(tmp_path, f"{url}/#phone_token={dev}", [
             {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
             _authenticator(world["phone"]),
             {"until": "document.getElementById('status').textContent !== 'reading the queue…' && 1"},
             {"eval": "document.getElementById('tab-drop').click() || 1"},
-            {"shot": str(shots / "drop_before.png")},
+            {"shot": str(shots / "fix1_drop_before.png")},
             {"eval": LOSE_FIRST_REPLY},
             {"eval": _set("drop-words", "seeing suite gate errors from the couch, please get them fixed")},
             {"eval": "document.getElementById('drop-send').click() || 1"},
             # the lost reply: the drop stays in the outbox, said as not delivered yet
             {"until": "(() => { const n = document.querySelector('#drop-outbox .row .note'); return n && n.textContent; })()"},
-            {"shot": str(shots / "drop_outbox_waiting.png")},
             {"eval": "window.dispatchEvent(new Event('online')) || 1"},
             {"until": f"/^delivered/.test({NOTE}) && {NOTE}"},
-            {"until": "document.querySelectorAll('#drop-recent .row.drop').length === 1 && "
-                      "document.querySelector('#drop-outbox').children.length === 0 && "
-                      "document.querySelector('#drop-recent .row.drop .receipt').textContent"},
-            # the envelope: the server builds it, the sheet shows its words, the sheet's Sign asks for the passkey
+            # the receipt the wake wrote after the reply (a thread the reply never waited on), as the page lists it
+            {"until": "(() => { const r = [...document.querySelectorAll('#drop-recent .row.drop .receipt')]"
+                      ".map(e => e.textContent).find(t => /^receipt: coordinator/.test(t)); return r || null; })()"},
+            {"shot": str(shots / "fix1_drop_woken.png"), "full": True},
+            # the envelope: reviewed on the server's sheet, signed at Sign (this first signature is made stale)
             {"eval": _set("drop-words", "build the fix and land it")},
             {"eval": "document.getElementById('drop-env').open = true; 1"},
             {"eval": _set("drop-repo", repo_path)},
@@ -68,32 +104,55 @@ def test_drop_lost_reply_then_envelope_signed_through_the_page(world, tmp_path: 
             {"eval": _set("drop-calls", "40")},
             {"eval": "document.getElementById('drop-sign').click() || 1"},
             {"until": "(() => { const p = document.querySelector('#drop-review pre.display'); return p && p.textContent; })()"},
-            {"eval": "document.getElementById('drop-send').disabled && document.getElementById('drop-sign').disabled"
-                     " && document.querySelector('#drop-review .dg-val').title"},
-            {"shot": str(shots / "drop_envelope_sheet.png"), "full": True},
-            {"eval": "[...document.querySelectorAll('#drop-review button')].find(b => /^Sign/.test(b.textContent)).click() || 1"},
+            {"eval": "document.querySelector('#drop-review .dg-val').title"},
+            {"eval": _click("^Sign")},
+            # refused, never filed plain: the card waits with Sign again and Send as a plain drop
+            {"until": f"(() => {{ const t = {OUTBOX_CARD}; return t && /refused/.test(t) && /Sign again/.test(t) && t; }})()"},
+            {"shot": str(shots / "fix1_stale_refused.png"), "full": True},
+            {"eval": _click("^Sign again$", "#drop-outbox")},
+            {"until": "(() => { const p = document.querySelector('#drop-review pre.display'); return p && p.textContent; })()"},
+            {"eval": _click("^Sign")},
             {"until": f"/envelope ev-[0-9a-f]{{32}} taken/.test({NOTE}) && {NOTE}"},
-            {"until": "document.querySelectorAll('#drop-recent .row.drop').length === 2 && 1"},
+            {"until": "document.querySelectorAll('#drop-recent .row.drop').length === 2 && "
+                      "document.querySelector('#drop-outbox').children.length === 0 && 1"},
+            {"shot": str(shots / "fix1_signed_again.png"), "full": True},
+            # another Levain's item: shown, never sent
+            {"eval": INJECT_FOREIGN},
+            {"until": f"(() => {{ const t = {OUTBOX_CARD}; return t && /from another Levain/.test(t) && t; }})()"},
+            {"eval": "window.dispatchEvent(new Event('online')) || 1"},
+            {"until": "new Promise(r => setTimeout(() => r(1), 1500))"},
+            {"eval": "JSON.parse(localStorage.getItem('levain-outbox:' + location.hostname)).map(x => x.outbox_id)"},
             {"eval": "document.documentElement.scrollWidth > innerWidth"},
-            {"shot": str(shots / "drop_after.png"), "full": True},
+            {"shot": str(shots / "fix1_another_levain.png"), "full": True},
         ])
+        httpd.coord.wait_wakes(30)
     vals = out["values"]
     # every eval, until and shot collects one value, in step order (emulate and authenticator collect none)
-    delivered, receipt, view, digest, taken, sideways = vals[9], vals[10], vals[17], vals[18], vals[21], vals[23]
-    assert "(it had arrived before: filed once)" in delivered, delivered
-    assert receipt.startswith("receipt: delivered"), receipt
-    assert "inferred, not where you dropped from" in view and "NOT IN FORCE YET" in view, view
-    routes = [p.split(" ", 1)[0] for p in out["posts"]]
-    assert routes.count("/coord/drop") == 3 and routes.count("/coord/envelope-challenge") == 1, routes
-    # the lost-reply drop and its resend carry ONE outbox id
-    first_two = [p for p in out["posts"] if p.startswith("/coord/drop ")][:2]
-    assert first_two[0].split(" ", 1)[1] == first_two[1].split(" ", 1)[1]
+    delivered, woken, digest, refused_card = vals[8], vals[9], vals[18], vals[20]
+    taken, foreign_card, left, sideways = vals[25], vals[29], vals[32], vals[33]
+    # the reply the page saw is the RESEND's, which wakes nothing; the lost first reply's drop woke the coordinator
+    assert "(it had arrived before: filed once)" in delivered and "coordinator launch" not in delivered, delivered
+    assert "not started" in woken, woken
+    assert "Send as a plain drop" in refused_card and "sign it again" in refused_card, refused_card
+    assert "from another Levain" in foreign_card and "Sign again" not in foreign_card, foreign_card
+    assert left == [FOREIGN_ID], left
+    posts = [(p.split(" ", 1)[0], json.loads(p.split(" ", 1)[1])) for p in out["posts"]]
+    drops = [b for r, b in posts if r == "/coord/drop"]
+    # lost reply + resend, the stale signed drop, the second signature: and never the foreign item
+    assert len(drops) == 4 and all(b["store_id"] == store_id for b in drops), [b["outbox_id"] for b in drops]
+    assert drops[0]["outbox_id"] == drops[1]["outbox_id"] and drops[2]["outbox_id"] == drops[3]["outbox_id"]
+    assert FOREIGN_ID not in {b["outbox_id"] for b in drops}
+    assert [r for r, _ in posts if r != "/coord/drop"] == ["/coord/envelope-review", "/coord/envelope-challenge"] * 2
     store = EnvelopeStore(world["qdir"])
-    drops = store.drops()
-    assert len(drops) == 2 and {d.surface for d in drops} == {"phone"}       # filed once each
-    signed = next(d for d in drops if d.envelope_id)
+    stored = store.drops()
+    assert len(stored) == 2 and {d.surface for d in stored} == {"phone"}       # filed once each, nothing plain
+    signed = next(d for d in stored if d.envelope_id)
+    plain = next(d for d in stored if not d.envelope_id)
+    assert signed.outbox_id == drops[2]["outbox_id"]
     e = store.envelope(signed.envelope_id)
-    assert e.digest == digest and e.signer_fp == world["phone"].fp and e.signer_class == "display-phone"
+    assert e.signer_fp == world["phone"].fp and e.signer_class == "display-phone"
     assert e.body["lands"][0]["onto_from"] == "inferred" and e.body["budget"]["tool_calls"] == 40
-    assert signed.envelope_id in taken
+    assert signed.envelope_id in taken and digest and digest != e.digest       # signed again: a fresh review, new ids
+    (w,) = [r.body for r in store.drop_receipts(plain.drop_id) if r.body.get("stage") == "woken"]
+    assert w["started"] is False and w["launch_id"] in woken and w["said"] in woken
     assert sideways is False

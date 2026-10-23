@@ -27,22 +27,41 @@ pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="need
 SENT = "2026-01-01T00:00:00.000000Z"      # a sent_at in the store's past: the store keeps it as the phone's claim
 
 
-def coord_for(world, *, page_origin: str | None = ORIGIN) -> CoordPhone:
+DEV = "d-0123456789ab"                     # the paired device a request carries (the route resolves it from its token)
+
+
+def coord_for(world, *, page_origin: str | None = ORIGIN, **kw) -> CoordPhone:
     d = phone_for(world, page_origin=page_origin)          # the same keys callable the dispatch card uses
-    return CoordPhone(world["qdir"], RP, page_origin, d._keys)
+    return CoordPhone(world["qdir"], RP, page_origin, kw.pop("keys", d._keys), **kw)
+
+
+def sid(cp: CoordPhone):
+    """The store identity the listing reports (None while there is no store), which the page binds an outbox item to."""
+    return cp.listing()["coord_store_id"]
 
 
 def drop(cp: CoordPhone, words: str, outbox_id: str, **extra):
-    return cp.step("drop", {"words": words, "outbox_id": outbox_id, "sent_at": SENT, **extra})
+    extra.setdefault("store_id", sid(cp))
+    return cp.step("drop", {"words": words, "outbox_id": outbox_id, "sent_at": SENT, **extra}, device=DEV)
+
+
+def review(world, cp: CoordPhone, words: str, outbox_id: str, spec: dict):
+    return cp.step("envelope-review", {"words": words, "outbox_id": outbox_id, "spec": spec,
+                                       "signer_fp": world["phone"].fp}, device=DEV)
+
+
+def sign(world, cp: CoordPhone, r: dict, **assert_kw):
+    """Sign tapped: the server mints the payload now, the passkey answers its challenge."""
+    c = cp.step("envelope-challenge", {"review_id": r["review_id"]}, device=DEV)
+    a = world["phone"].assertion(c["challenge"], **assert_kw)
+    return c, {"body_text": r["body_text"], "payload": c["payload"], **a}
 
 
 def signed_drop(world, cp: CoordPhone, words: str, outbox_id: str, spec: dict):
-    """The page's two calls: the challenge, the passkey's assertion over it, then the drop carrying the envelope."""
-    c = cp.step("envelope-challenge", {"words": words, "outbox_id": outbox_id, "spec": spec,
-                                       "signer_fp": world["phone"].fp})
-    a = world["phone"].assertion(c["challenge"])
-    envelope = {"body_text": c["body_text"], "payload": c["payload"], **a}
-    return c, envelope, drop(cp, words, outbox_id, envelope=envelope)
+    """The page's calls: the review, Sign (the challenge and the passkey's assertion), then the drop carrying it."""
+    r = review(world, cp, words, outbox_id, spec)
+    c, envelope = sign(world, cp, r)
+    return {**r, **c}, envelope, drop(cp, words, outbox_id, envelope=envelope)
 
 
 # --- 1. a phone drop reaches the store `levain drop` writes, and shows its receipt ------------------------------------
@@ -118,8 +137,7 @@ def test_a_challenge_for_an_outbox_id_already_delivered_signs_nothing(world) -> 
     cp = coord_for(world)
     drop(cp, "plain words", "ph-" + "f" * 32)
     with pytest.raises(CoordRefused) as exc:
-        cp.step("envelope-challenge", {"words": "plain words", "outbox_id": "ph-" + "f" * 32,
-                                       "spec": {"where": []}, "signer_fp": world["phone"].fp})
+        review(world, cp, "plain words", "ph-" + "f" * 32, {"where": []})
     assert exc.value.status == 409
 
 
@@ -191,10 +209,8 @@ def test_digest_cross_check_table(world, tmp_path: Path, capsys, row: int) -> No
 def test_a_phone_land_is_signed_as_inferred_and_says_so_in_the_view(world) -> None:
     cp = coord_for(world)
     repo_path = str(world["repo"][0])
-    c = cp.step("envelope-challenge", {"words": "and land it", "outbox_id": "ph-" + "1" * 32,
-                                       "spec": {"where": [{"repo": repo_path, "paths": ["."]}],
-                                                "lands": [{"repo": repo_path, "onto": "main"}]},
-                                       "signer_fp": world["phone"].fp})
+    c = review(world, cp, "and land it", "ph-" + "1" * 32, {"where": [{"repo": repo_path, "paths": ["."]}],
+                                                             "lands": [{"repo": repo_path, "onto": "main"}]})
     (land,) = env.parse_body(c["body_text"])["lands"]
     assert (land["from"], land["onto_from"]) == ("named", "inferred")
     assert any("onto main" in line and "inferred, not where you dropped from" in line for line in c["view"]), c["view"]
@@ -206,68 +222,359 @@ def test_the_phone_cannot_claim_a_land_is_where_it_dropped_from(world, land_extr
     cp = coord_for(world)
     repo_path = str(world["repo"][0])
     with pytest.raises(CoordRefused) as exc:
-        cp.step("envelope-challenge", {"words": "land it", "outbox_id": "ph-" + "2" * 32,
-                                       "spec": {"where": [{"repo": repo_path, "paths": ["."]}],
-                                                "lands": [{"repo": repo_path, "onto": "main", **land_extra}]},
-                                       "signer_fp": world["phone"].fp})
+        review(world, cp, "land it", "ph-" + "2" * 32, {"where": [{"repo": repo_path, "paths": ["."]}],
+                                                        "lands": [{"repo": repo_path, "onto": "main", **land_extra}]})
     assert exc.value.status == 422
 
 
-def test_a_widened_body_under_the_phone_signature_keeps_the_words_plain(world) -> None:
+def test_a_widened_body_under_the_phone_signature_is_refused_and_never_stored_plain(world) -> None:
+    # fix1 ruling 3: a drop that CARRIES a signed envelope is never stored plain (r1 stored it plain and said 200)
     cp = coord_for(world)
     repo_path = str(world["repo"][0])
-    c = cp.step("envelope-challenge", {"words": "narrow work", "outbox_id": "ph-" + "3" * 32,
-                                       "spec": {"where": [{"repo": repo_path, "paths": ["docs/"]}]},
-                                       "signer_fp": world["phone"].fp})
-    a = world["phone"].assertion(c["challenge"])
-    body = env.parse_body(c["body_text"])
+    r = review(world, cp, "narrow work", "ph-" + "3" * 32, {"where": [{"repo": repo_path, "paths": ["docs/"]}]})
+    _c, envelope = sign(world, cp, r)
+    body = env.parse_body(r["body_text"])
     wide = canonical({**body, "where": [{"repo": repo_path, "paths": ["."]}]})
-    got = drop(cp, "narrow work", "ph-" + "3" * 32, envelope={"body_text": wide, "payload": c["payload"], **a})
-    assert got["created"] is True and got["envelope"]["taken"] is False
-    assert "digest" in got["envelope"]["refused"]
-    stored = EnvelopeStore(world["qdir"]).drop(got["drop"]["drop_id"])
-    assert stored.words == "narrow work" and stored.envelope_id is None
+    with pytest.raises(CoordRefused) as exc:
+        drop(cp, "narrow work", "ph-" + "3" * 32, envelope={**envelope, "body_text": wide})
+    assert exc.value.status == 422 and "digest" in exc.value.message
+    assert EnvelopeStore(world["qdir"]).drops() == []
+    # "Send as a plain drop": the same outbox id, no envelope, the words unchanged, is then delivered
+    got = drop(cp, "narrow work", "ph-" + "3" * 32, envelope=None)
+    assert got["created"] is True and got["envelope"] is None
+    assert EnvelopeStore(world["qdir"]).drop(got["drop"]["drop_id"]).envelope_id is None
 
 
 def test_an_assertion_from_another_origin_signs_nothing_and_writes_nothing(world) -> None:
     cp = coord_for(world)
     repo_path = str(world["repo"][0])
-    c = cp.step("envelope-challenge", {"words": "w", "outbox_id": "ph-" + "4" * 32,
-                                       "spec": {"where": [{"repo": repo_path, "paths": ["."]}]},
-                                       "signer_fp": world["phone"].fp})
-    a = world["phone"].assertion(c["challenge"], origin="http://localhost:9999")
+    r = review(world, cp, "w", "ph-" + "4" * 32, {"where": [{"repo": repo_path, "paths": ["."]}]})
+    _c, envelope = sign(world, cp, r, origin="http://localhost:9999")
     with pytest.raises(CoordRefused) as exc:
-        drop(cp, "w", "ph-" + "4" * 32, envelope={"body_text": c["body_text"], "payload": c["payload"], **a})
+        drop(cp, "w", "ph-" + "4" * 32, envelope=envelope)
     assert exc.value.status == 422
     assert EnvelopeStore(world["qdir"]).drops() == []
 
 
 # --- 5. the routes, through the real server ----------------------------------------------------------------------------
 
-def test_the_drop_route_needs_the_token_and_delivers_through_the_server(world) -> None:
+def _post(base, path, body, token):
     import urllib.request
 
+    req = urllib.request.Request(base + path, data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", "X-Levain-Phone-Token": token,
+                                          "Origin": base})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b"{}")
+
+
+def _listing(base, token):
+    import urllib.request
+
+    with urllib.request.urlopen(urllib.request.Request(base + "/consent.json",
+                                                       headers={"X-Levain-Phone-Token": token}), timeout=10) as r:
+        return json.loads(r.read())
+
+
+def device_token(qdir: Path) -> str:
+    """A paired device's token, minted and redeemed as the page's pairing does (levain.webpush.devices)."""
+    from datetime import datetime, timezone
+
+    from levain.webpush import devices
+    from levain.webpush.store import PushStore
+
+    conn = PushStore(qdir).connection()
+    try:
+        now = datetime.now(timezone.utc)
+        _dev, token = devices.redeem(conn, devices.mint_pairing(conn, "phone", now), now)
+    finally:
+        conn.close()
+    return token
+
+
+def test_the_drop_route_needs_a_paired_device_and_delivers_through_the_server(world) -> None:
+    from tests.test_phone_dispatch import _serve
+
+    body = {"words": "from the couch", "outbox_id": "ph-" + "5" * 32, "sent_at": SENT, "store_id": None}
+    dev = device_token(world["qdir"])
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        assert _post(base, "/coord/drop", body, "wrong")[0] == 403
+        status, got = _post(base, "/coord/drop", body, dev)
+        assert status == 200 and got["created"] is True and got["drop"]["surface"] == "phone"
+        assert got["store_id"] == EnvelopeStore(world["qdir"]).store_id()
+        status, again = _post(base, "/coord/drop", {**body, "store_id": got["store_id"]}, dev)
+        assert status == 200 and again["created"] is False
+        listed = _listing(base, dev)
+    assert [d["drop_id"] for d in listed["coord_drops"]] == [got["drop"]["drop_id"]]
+    assert listed["coord_store_id"] == got["store_id"]
+
+
+# --- 6. fix1 (coordphone L3 r1), each row fail-first --------------------------------------------------------------------
+
+@pytest.mark.parametrize("action", ["drop", "envelope-review", "envelope-challenge"])
+def test_r1_the_run_token_is_refused_on_every_coordinator_route_and_writes_nothing(world, action) -> None:
+    # codex HIGH: the transient run token is a transport gate for the queue, never a paired device
     from tests.test_phone_dispatch import _serve
     from tests.test_phone_server import _TOK
 
-    def post(base, path, body, token):
-        req = urllib.request.Request(base + path, data=json.dumps(body).encode(), method="POST",
-                                     headers={"Content-Type": "application/json", "X-Levain-Phone-Token": token,
-                                              "Origin": base})
-        try:
-            with urllib.request.urlopen(req, timeout=10) as r:
-                return r.status, json.loads(r.read())
-        except urllib.error.HTTPError as e:
-            return e.code, json.loads(e.read() or b"{}")
-
-    body = {"words": "from the couch", "outbox_id": "ph-" + "5" * 32, "sent_at": SENT}
+    repo_path = str(world["repo"][0])
+    bodies = {"drop": {"words": "w", "outbox_id": "ph-" + "6" * 32, "sent_at": SENT, "store_id": None},
+              "envelope-review": {"words": "w", "outbox_id": "ph-" + "6" * 32, "signer_fp": world["phone"].fp,
+                                  "spec": {"where": [{"repo": repo_path, "paths": ["."]}]}},
+              "envelope-challenge": {"review_id": "rv-" + "0" * 32}}
     with _serve(world["qdir"], world["qdir"]) as (base, _):
-        assert post(base, "/coord/drop", body, "wrong")[0] == 403
-        status, got = post(base, "/coord/drop", body, _TOK)
-        assert status == 200 and got["created"] is True and got["drop"]["surface"] == "phone"
-        status, again = post(base, "/coord/drop", body, _TOK)
-        assert status == 200 and again["created"] is False
-        with urllib.request.urlopen(urllib.request.Request(base + "/consent.json",
-                                                           headers={"X-Levain-Phone-Token": _TOK}), timeout=10) as r:
-            listed = json.loads(r.read())
-    assert [d["drop_id"] for d in listed["coord_drops"]] == [got["drop"]["drop_id"]]
+        status, got = _post(base, f"/coord/{action}", bodies[action], _TOK)
+    assert status == 403 and got["error"] == "device_required", got
+    assert not (world["qdir"] / DB_NAME).exists()
+
+
+def test_r1_a_step_with_no_device_is_refused(world) -> None:
+    cp = coord_for(world)
+    with pytest.raises(CoordRefused) as exc:
+        cp.step("drop", {"words": "w", "outbox_id": "ph-" + "6" * 32, "sent_at": SENT, "store_id": None}, device=None)
+    assert exc.value.status == 403
+    assert not (world["qdir"] / DB_NAME).exists()
+
+
+def test_r2_an_outbox_item_for_another_store_is_refused_and_writes_nothing(world) -> None:
+    cp = coord_for(world)
+    first = drop(cp, "made here", "ph-" + "7" * 32)
+    here = first["store_id"]
+    assert here == sid(cp) == EnvelopeStore(world["qdir"]).store_id()
+    for other in ("st-" + "f" * 32, None):            # another store's id, and an item made before any store existed
+        with pytest.raises(CoordRefused) as exc:
+            drop(cp, "made for another Levain", "ph-" + "8" * 32, store_id=other)
+        assert (exc.value.status, exc.value.error) == (409, "other_store"), exc.value.message
+    assert len(EnvelopeStore(world["qdir"]).drops()) == 1
+
+
+def test_r2_an_item_bound_to_a_store_meets_no_store_and_is_refused(world) -> None:
+    # the dispatch directory was replaced (no store now): an item bound to the old one never creates a new one
+    cp = coord_for(world)
+    with pytest.raises(CoordRefused) as exc:
+        drop(cp, "old store", "ph-" + "9" * 32, store_id="st-" + "a" * 32)
+    assert exc.value.status == 409 and not (world["qdir"] / DB_NAME).exists()
+
+
+class _Clock:
+    def __init__(self, t):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def _land_spec(repo_path: str) -> dict:
+    return {"where": [{"repo": repo_path, "paths": ["."]}], "stop": "2h"}
+
+
+def test_r3_signed_at_is_minted_when_sign_is_tapped_not_at_review(world) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from levain.consent.queue import parse_stamp
+
+    clock = _Clock(datetime.now(timezone.utc))
+    cp = coord_for(world, clock=clock)
+    r = review(world, cp, "reviewed slowly", "ph-" + "a1" * 16, _land_spec(str(world["repo"][0])))
+    clock.t += timedelta(minutes=5)                   # a long read of the sheet, past the store's 2-minute skew
+    c, envelope = sign(world, cp, r)
+    assert parse_stamp(c["payload"]["signed_at"]) == clock.t
+    got = drop(cp, "reviewed slowly", "ph-" + "a1" * 16, envelope=envelope)
+    assert got["envelope"]["taken"] is True, got
+
+
+def test_r3_a_stale_signature_is_refused_envelope_stale_then_signed_again_and_stored(world) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    clock = _Clock(datetime.now(timezone.utc))
+    cp = coord_for(world, clock=clock)
+    spec = _land_spec(str(world["repo"][0]))
+    oid = "ph-" + "a2" * 16
+    r = review(world, cp, "signed offline", oid, spec)
+    _c, envelope = sign(world, cp, r)
+    # the store's clock is the real one: a signature older than its skew is what a long offline wait looks like
+    EnvelopeStore(world["qdir"])        # the store exists with its real clock
+    late = coord_for(world, clock=lambda: datetime.now(timezone.utc) + timedelta(minutes=5))
+    with pytest.raises(CoordRefused) as exc:
+        late.step("drop", {"words": "signed offline", "outbox_id": oid, "sent_at": SENT, "store_id": sid(cp),
+                           "envelope": envelope}, device=DEV)
+    assert (exc.value.status, exc.value.error) == (422, "envelope-stale"), exc.value.message
+    assert EnvelopeStore(world["qdir"]).drops() == []
+    # "Sign again": a fresh review and Sign over the same words and outbox id, then it is stored with its envelope
+    _c2, env2, got = signed_drop(world, coord_for(world), "signed offline", oid, spec)
+    assert got["created"] is True and got["envelope"]["taken"] is True
+
+
+def test_r3_a_verifier_that_is_unavailable_is_503_and_writes_nothing(world, monkeypatch) -> None:
+    from levain.authority import VerifierUnavailable
+
+    cp = coord_for(world)
+    r = review(world, cp, "verify me", "ph-" + "a3" * 16, _land_spec(str(world["repo"][0])))
+    _c, envelope = sign(world, cp, r)
+
+    def down(*a, **k):
+        raise VerifierUnavailable("ssh-keygen did not answer")
+
+    monkeypatch.setattr(env, "refusal", down)
+    with pytest.raises(CoordRefused) as exc:
+        drop(cp, "verify me", "ph-" + "a3" * 16, envelope=envelope)
+    assert exc.value.status == 503
+    assert EnvelopeStore(world["qdir"]).drops() == []
+
+
+def test_r4_a_resend_returns_the_stored_receipt_without_revalidating_the_old_carrier(world) -> None:
+    cp = coord_for(world)
+    oid = "ph-" + "a4" * 16
+    _c, envelope, first = signed_drop(world, cp, "delivered, reply lost", oid, _land_spec(str(world["repo"][0])))
+    assert first["envelope"]["taken"] is True
+    # the passkey is revoked (no active key) after the store accepted the drop and before the resend arrives
+    gone = coord_for(world, keys=lambda: {})
+    again = drop(gone, "delivered, reply lost", oid, envelope=envelope)
+    assert again["created"] is False and again["drop"]["drop_id"] == first["drop"]["drop_id"]
+    assert again["envelope"]["taken"] is True
+    # the same id with other words is still the conflict
+    with pytest.raises(CoordRefused) as exc:
+        drop(gone, "other words", oid, envelope=envelope)
+    assert exc.value.status == 409
+
+
+def test_r6_sign_refused_from_the_keys_is_a_structured_503(world) -> None:
+    from levain.consent.sign import SignRefused
+
+    def broken():
+        raise SignRefused("two cockpits are named by consent hooks", status=503)
+
+    good = coord_for(world)
+    r = review(world, good, "keys", "ph-" + "a6" * 16, _land_spec(str(world["repo"][0])))
+    _c, envelope = sign(world, good, r)
+    cp = coord_for(world, keys=broken)
+    for action, req in (("envelope-review", {"words": "keys", "outbox_id": "ph-" + "b6" * 16, "signer_fp": "x",
+                                             "spec": _land_spec(str(world["repo"][0]))}),
+                        ("drop", {"words": "keys", "outbox_id": "ph-" + "a6" * 16, "sent_at": SENT,
+                                  "store_id": sid(cp), "envelope": envelope})):
+        with pytest.raises(CoordRefused) as exc:
+            cp.step(action, req, device=DEV)
+        assert exc.value.status == 503, (action, exc.value.message)
+
+
+def test_r7_a_signed_envelope_replayed_under_another_outbox_id_is_409_never_filed_plain(world) -> None:
+    cp = coord_for(world)
+    _c, envelope, first = signed_drop(world, cp, "once only", "ph-" + "a7" * 16, _land_spec(str(world["repo"][0])))
+    assert first["envelope"]["taken"] is True
+    with pytest.raises(CoordRefused) as exc:
+        drop(cp, "once only", "ph-" + "b7" * 16, envelope=envelope)
+    assert exc.value.status == 409
+    assert len(EnvelopeStore(world["qdir"]).drops()) == 1
+
+
+# --- 7. an accepted phone drop wakes the coordinator through the CLI's own call (HEAD Q1) -------------------------------
+
+class _Launcher:
+    """Stands in for launch_session(store, launch_id): records the call, answers like an Outcome."""
+
+    def __init__(self, *, started=True, raises=None, gate=None):
+        import threading
+
+        self.calls, self.started, self.raises, self.gate = [], started, raises, gate
+        self.done = threading.Event()
+
+    def __call__(self, store, launch_id):
+        from levain.coordinator.launch import Outcome
+
+        self.calls.append(launch_id)
+        try:
+            if self.gate is not None:
+                assert self.gate.wait(10)
+            if self.raises is not None:
+                raise self.raises
+            return Outcome(launch_id, self.started, attach="claude attach h-1" if self.started else None,
+                           refusal=None if self.started else "the consent hook is not live")
+        finally:
+            self.done.set()
+
+
+def _coord_set(world, tmp_path) -> None:
+    d = tmp_path / "coord-install"
+    d.mkdir()
+    EnvelopeStore(world["qdir"]).coord_set_agent("claude", model="haiku", cwd=str(d.resolve()))
+
+
+def _wakes(world, drop_id):
+    return [r.body for r in EnvelopeStore(world["qdir"]).drop_receipts(drop_id) if r.body.get("stage") == "woken"]
+
+
+def test_r8_an_accepted_drop_wakes_once_and_the_reply_does_not_wait_on_it(world, tmp_path) -> None:
+    import threading
+
+    _coord_set(world, tmp_path)
+    gate = threading.Event()
+    launcher = _Launcher(gate=gate)
+    cp = coord_for(world, launcher=launcher)
+    oid = "ph-" + "a8" * 16
+    got = drop(cp, "wake up", oid)                     # returns while the launcher is still blocked on the gate
+    assert got["created"] is True and got["woken"] is not None
+    assert not launcher.done.is_set()
+    gate.set()
+    cp.wait_wakes(10)
+    assert launcher.calls == [got["woken"]]
+    (w,) = _wakes(world, got["drop"]["drop_id"])
+    assert w["launch_id"] == got["woken"] and w["started"] is True
+    # a resend returns the stored receipt and wakes nothing again
+    again = drop(cp, "wake up", oid)
+    cp.wait_wakes(10)
+    assert again["created"] is False and again["woken"] is None and launcher.calls == [got["woken"]]
+    # a refusal (the same id, other words) wakes nothing
+    with pytest.raises(CoordRefused):
+        drop(cp, "other words", oid)
+    cp.wait_wakes(10)
+    assert launcher.calls == [got["woken"]] and len(_wakes(world, got["drop"]["drop_id"])) == 1
+
+
+def test_r8_a_failed_wake_is_recorded_on_the_drops_receipt_never_a_500(world, tmp_path) -> None:
+    _coord_set(world, tmp_path)
+    for launcher, oid in ((_Launcher(raises=OSError("spawn failed")), "ph-" + "a9" * 16),):
+        cp = coord_for(world, launcher=launcher)
+        got = drop(cp, "wake, but it fails", oid)
+        cp.wait_wakes(10)
+        assert got["created"] is True and launcher.calls == [got["woken"]]
+        (w,) = _wakes(world, got["drop"]["drop_id"])
+        assert w["started"] is False and "spawn failed" in w["said"]
+        assert any(r["stage"] == "woken" and r["started"] is False
+                   for r in cp.listing()["coord_drops"][0]["receipts"])
+
+
+def test_r8_the_default_launcher_is_the_cli_s_own_launch_session(world) -> None:
+    from levain.coordinator.launch import launch_session
+
+    assert coord_for(world)._launcher is launch_session
+
+
+def test_r8_through_the_server_the_real_launch_session_records_its_refusal(world, tmp_path) -> None:
+    # the exact call `levain drop` makes, on an install whose hook is not live: nothing starts, the receipt says why
+    from tests.test_phone_dispatch import _serve
+
+    _coord_set(world, tmp_path)
+    dev = device_token(world["qdir"])
+    sid_now = EnvelopeStore(world["qdir"]).store_id()
+    with _serve(world["qdir"], world["qdir"]) as (base, httpd):
+        status, got = _post(base, "/coord/drop", {"words": "wake from the phone", "outbox_id": "ph-" + "c8" * 16,
+                                                  "sent_at": SENT, "store_id": sid_now}, dev)
+        assert status == 200 and got["woken"] is not None, got
+        httpd.coord.wait_wakes(30)
+    (w,) = _wakes(world, got["drop"]["drop_id"])
+    assert w["launch_id"] == got["woken"] and w["started"] is False and w["said"], w
+
+
+def test_r4_the_store_strict_carry_answers_a_resend_before_checking_its_carrier(world) -> None:
+    # EnvelopeStore.accept_drop(keep_plain=False) itself, not only the phone route: a resend is looked up first
+    cp = coord_for(world)
+    oid = "ph-" + "d4" * 16
+    _c, envelope, first = signed_drop(world, cp, "strict resend", oid, _land_spec(str(world["repo"][0])))
+    store = EnvelopeStore(world["qdir"])
+    again, created = store.accept_drop("strict resend", surface="phone", outbox_id=oid, sent_at=SENT,
+                                       envelope=(envelope["body_text"], envelope["payload"], "not a signature"),
+                                       authority=world["source"](), keep_plain=False)
+    assert created is False and again.drop_id == first["drop"]["drop_id"]

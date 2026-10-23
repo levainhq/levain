@@ -2,51 +2,82 @@
 
 The phone port (:mod:`levain.phone_server`) carries the coordinator's phone half (C1/C2, BUILD_PLAN rows C1 and C2):
 
-- **A drop** (``POST /coord/drop`` {words, outbox_id, sent_at}) goes into the SAME store call ``levain drop`` makes
-  (:meth:`levain.coordinator.envelopes.EnvelopeStore.accept_drop`), with ``surface="phone"``. There is no second write
-  path: the drop, its ``delivered`` drop receipt and any coordinator wake are that call's one transaction.
+- **Who may call** (L3 r1 codex HIGH): every coordinator route needs a PAIRED DEVICE's token. The phone port resolves
+  its credential once and passes the device id in (``step(..., device=)``); this run's transient phone token opens the
+  queue, never the coordinator store, and a step with no device is refused (403) before anything is read or written.
+- **A drop** (``POST /coord/drop`` {words, outbox_id, sent_at, store_id[, envelope]}) goes into the SAME store call
+  ``levain drop`` makes (:meth:`levain.coordinator.envelopes.EnvelopeStore.accept_drop`), with ``surface="phone"``.
+  There is no second write path: the drop, its ``delivered`` drop receipt and any coordinator wake are that call's one
+  transaction.
+- **The store identity** (L3 r1 codex HIGH): the listing reports ``coord_store_id`` (the store's random id, None while
+  there is no store). The page binds every outbox item to the identity it held when the item was made and sends it as
+  ``store_id``; a drop whose ``store_id`` is not this store's (or that names a store where there is none, or names none
+  where there is one) is refused 409 ``other_store`` with nothing written, so a drop made against one Levain is never
+  filed into another that later answers on the same name.
 - **The outbox** (gap 6): the page keeps a drop until this route answers 2xx. The page picks the ``outbox_id`` once,
-  when the drop is made, and resends it unchanged; the store's outbox rule makes a resend of a delivered id a no-op that
-  returns the stored drop (``created: false``), and the same id with other words a conflict (409). So a retry after a
-  lost reply never files twice, and the 2xx IS the delivered receipt.
-- **A structured envelope signed at send** (T4, C0 §4): ``POST /coord/envelope-challenge`` {words, outbox_id, spec,
-  signer_fp} builds the body with the CLI's own builder (:func:`levain.coordinator.cli._spec_body`, the one ``levain
-  drop --envelope`` signs), holds it to the store's disk checks (``check_body``) and answers its canonical text, its
-  digest, the plain-words view the CLI prints before signing (:func:`levain.coordinator.cli._view`), the payload
-  (:func:`levain.coordinator.envelope.sign_payload`) and the WebAuthn challenge over that payload in
-  :data:`~levain.coordinator.envelope.SIGN_NAMESPACE`. The drop then carries {body_text, payload, assertion}; the server
-  turns the assertion into an SSHSIG (:func:`levain.consent.passkey.to_sshsig`) and hands body, payload and signature
-  to the same ``accept_drop(envelope=...)`` the CLI calls, verified against the same authority source the CLI's
-  :func:`levain.coordinator.cli._snapshot` reads (:func:`levain.dispatch.cli._authority_source` over the store's
-  directory). No verification code lives here.
+  when the drop is made, and resends it unchanged. A resend is looked up FIRST (:meth:`CoordStore.resent_drop`, the
+  words and surface compared) and answered with the stored drop (``created: false``) with nothing else checked, so a
+  carrier that has since gone stale (a revoked passkey, an old signature) never turns a delivered drop into a refusal;
+  the same id with other words is a conflict (409). A retry after a lost reply never files twice, and the 2xx IS the
+  delivered receipt.
+- **A structured envelope signed at send** (T4, C0 §4), in two steps so the signature is as fresh as the tap:
+  ``POST /coord/envelope-review`` {words, outbox_id, spec, signer_fp} builds the body with the CLI's own builder
+  (:func:`levain.coordinator.cli._spec_body`, the one ``levain drop --envelope`` signs), holds it to the store's disk
+  checks (``check_body``), KEEPS it here under a ``review_id`` and answers its canonical text, its digest and the
+  plain-words view the CLI prints before signing (:func:`levain.coordinator.cli._view`). ``POST
+  /coord/envelope-challenge`` {review_id}, sent when Sign is tapped, mints the payload
+  (:func:`levain.coordinator.envelope.sign_payload`) with ``signed_at`` = now over the KEPT body and answers it with the
+  WebAuthn challenge over it in :data:`~levain.coordinator.envelope.SIGN_NAMESPACE`. The drop then carries {body_text,
+  payload, assertion}; the server turns the assertion into an SSHSIG (:func:`levain.consent.passkey.to_sshsig`) and
+  hands body, payload and signature to the same ``accept_drop(envelope=...)`` the CLI calls, verified against the same
+  authority source the CLI's :func:`levain.coordinator.cli._snapshot` reads
+  (:func:`levain.dispatch.cli._authority_source` over the store's directory). No verification code lives here.
+- **A signed drop is never stored plain** (L3 r1, both seats): the phone's outbox still holds the words, so the store
+  is asked with ``keep_plain=False`` and an envelope it would not take writes nothing: a stale signature is 422
+  ``envelope-stale`` (the page offers Sign again), a verifier that did not answer is 503 (the page sends it again), a
+  drop or envelope id already stored is 409, any other refusal 422. The page then offers Sign again or Send as a plain
+  drop (the same outbox id, ``envelope: null``).
+- **The wake** (head ruling Q1): a drop the store ACCEPTED whose own transaction asked for a coordinator launch is
+  started by the exact call ``levain drop`` makes (:func:`levain.coordinator.launch.launch_session`, the CLI's
+  ``_launch_woken``), once: only a drop this call created names one (``woken_launch`` is read once), so a resend, a
+  refusal and the run token wake nothing. It runs on its own thread, so the reply never waits on a spawn, and its
+  outcome, a failure included, is a ``woken`` drop receipt (:meth:`CoordStore.record_wake`).
 
 A land from the phone is always ``from: "named"``, ``onto_from: "inferred"``: the phone sheet has no repo/branch picker
 yet, so the drop records no source, and C0 §4.3 allows ``from: "source"`` only for a drop that recorded one. The body
 the passkey signs carries that ``inferred`` mark, and the view says it in words (C0 §1, Phill 10-20: *"for 4 I'll take
 your recs across all items"*, item 1).
 
-The page's token only opens the routes: an envelope's authority is the passkey's assertion, which the store verifies.
+A paired device's token only opens the routes: an envelope's authority is the passkey's assertion, which the store
+verifies.
 The listing (:meth:`CoordPhone.listing`) never creates the store; a drop does, exactly as ``levain drop`` does. Stdlib
 only.
 """
 from __future__ import annotations
 
 import base64
+import secrets
 import sqlite3
+import threading
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-__all__ = ["DROPS_SHOWN", "CoordPhone", "CoordRefused"]
+__all__ = ["DROPS_SHOWN", "REVIEWS_KEPT", "REVIEW_TTL", "CoordPhone", "CoordRefused"]
 
 # phone drops a listing shows, newest first
 DROPS_SHOWN = 10
 # repos the sheet suggests for an envelope's "where" (the store's own threads and drop sources)
 _REPOS_SHOWN = 20
-_DROP_KEYS = frozenset({"words", "outbox_id", "sent_at"})
+_DROP_KEYS = frozenset({"words", "outbox_id", "sent_at", "store_id"})
 _ENVELOPE_KEYS = frozenset({"body_text", "payload", "authenticator_data", "client_data_json", "signature"})
-_CHALLENGE_KEYS = frozenset({"words", "outbox_id", "spec", "signer_fp"})
+_REVIEW_KEYS = frozenset({"words", "outbox_id", "spec", "signer_fp"})
+_CHALLENGE_KEYS = frozenset({"review_id"})
+_ACTIONS = ("drop", "envelope-review", "envelope-challenge")
+# a reviewed body is kept this long for its Sign, and at most this many at once (oldest dropped first)
+REVIEW_TTL = timedelta(minutes=15)
+REVIEWS_KEPT = 32
 # what the phone sheet may set in an envelope (pushes and publishes stay the laptop's: a push's url is resolved there)
 _SPEC_KEYS = frozenset({"where", "lands", "budget", "stop"})
 
@@ -65,16 +96,25 @@ def _b64u(data: bytes) -> str:
 
 class CoordPhone:
     """The coordinator routes of one phone port, over the store in ``dispatch_dir``, for passkeys made on ``rp_id``.
-    ``keys`` is the server's callable over the active passkeys of the one cockpit its sign requests use."""
+    ``keys`` is the server's callable over the active passkeys of the one cockpit its sign requests use. ``launcher``
+    starts a woken coordinator launch; it is :func:`levain.coordinator.launch.launch_session` (what ``levain drop``
+    calls) unless a test hands in another."""
 
     def __init__(self, dispatch_dir: Path | str, rp_id: str, page_origin: str | None,
                  keys: Callable[[], dict[str, Any]], *,
-                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 launcher: Callable[[Any, str], Any] | None = None) -> None:
+        from levain.coordinator.launch import launch_session
+
         self.dispatch_dir = Path(dispatch_dir)
         self.rp_id = rp_id
         self.page_origin = page_origin
         self._keys = keys
         self._clock = clock
+        self._launcher = launch_session if launcher is None else launcher
+        self._lock = threading.Lock()
+        self._reviews: dict[str, dict[str, Any]] = {}
+        self._wakes: list[threading.Thread] = []
 
     # --- the store ---------------------------------------------------------------------------------------------------
     def _store(self, *, create: bool) -> Any:
@@ -124,9 +164,12 @@ class CoordPhone:
         from levain.cockpit.display_safe import visible
 
         b = r.body
-        return {"stage": b.get("stage"), "at": r.at, "envelope_refused": visible(b.get("envelope_refused")),
-                "threads": [{"thread_id": t.get("thread_id"), "kind": t.get("kind"), "title": visible(t.get("title"))}
-                            for t in b.get("threads", []) if isinstance(t, dict)]}
+        out = {"stage": b.get("stage"), "at": r.at, "envelope_refused": visible(b.get("envelope_refused")),
+               "threads": [{"thread_id": t.get("thread_id"), "kind": t.get("kind"), "title": visible(t.get("title"))}
+                           for t in b.get("threads", []) if isinstance(t, dict)]}
+        if b.get("stage") == "woken":          # how the coordinator launch this drop asked for went (record_wake)
+            out.update(launch_id=b.get("launch_id"), started=b.get("started") is True, said=visible(b.get("said")))
+        return out
 
     def drop_record(self, store: Any, drop_id: str) -> dict[str, Any]:
         """One drop as the sheet shows it: its words (display-safe), when, its outbox id, its envelope, every drop
@@ -148,12 +191,16 @@ class CoordPhone:
         envelope may name, and who may sign one. A store that cannot be read is ``coord_note``, never an empty list
         alone; no store yet is no drops and no note."""
         signers, signer_note = self._signers()
-        out: dict[str, Any] = {"coord_drops": [], "coord_note": None, "coord_repos": [],
-                               "coord_signers": signers, "coord_signer_note": signer_note}
+        # coord_store_read False: the identity is unknown, and the page sends nothing until it reads one
+        out: dict[str, Any] = {"coord_drops": [], "coord_note": None, "coord_repos": [], "coord_store_id": None,
+                               "coord_store_read": False, "coord_signers": signers, "coord_signer_note": signer_note}
         try:
             store = self._store(create=False)
             if store is None:
+                out["coord_store_read"] = True
                 return out
+            out["coord_store_id"] = store.store_id()
+            out["coord_store_read"] = True
             drops = [d for d in store.drops(limit=200) if d.surface == "phone"][:DROPS_SHOWN]
             out["coord_drops"] = [self.drop_record(store, d.drop_id) for d in drops]
             repos: list[str] = []
@@ -165,33 +212,48 @@ class CoordPhone:
                     repos.append(d.source.repo)
             out["coord_repos"] = repos[:_REPOS_SHOWN]
         except Exception as exc:  # noqa: BLE001 - any store fault is the listing's note, never the page's failure
+            out["coord_store_id"], out["coord_store_read"] = None, False
             out["coord_note"] = f"the coordinator store cannot be read: {type(exc).__name__}: {str(exc)[:200]}"
         return out
 
     # --- the routes --------------------------------------------------------------------------------------------------
-    def step(self, action: str, req: Any) -> dict[str, Any]:
-        """``drop`` {words, outbox_id, sent_at[, envelope]} -> the drop delivered (or the stored one, on a resend);
-        ``envelope-challenge`` {words, outbox_id, spec, signer_fp} -> the body to sign and its WebAuthn challenge.
-        Raises :class:`CoordRefused`: 400 a malformed request, 409 an outbox id already used otherwise, 422 a
-        refusal, 503 a fault on this machine (nothing written)."""
+    def step(self, action: str, req: Any, *, device: str | None) -> dict[str, Any]:
+        """``drop`` {words, outbox_id, sent_at, store_id[, envelope]} -> the drop delivered (or the stored one, on a
+        resend); ``envelope-review`` {words, outbox_id, spec, signer_fp} -> the body to sign, kept under a review id;
+        ``envelope-challenge`` {review_id} -> its payload, signed_at now, and the WebAuthn challenge. ``device`` is the
+        paired device the request's token belongs to (None for any other credential: refused). Raises
+        :class:`CoordRefused`: 400 a malformed request, 403 no paired device, 409 an outbox id already used otherwise or
+        another store's item, 422 a refusal, 503 a fault on this machine (nothing written)."""
         from levain.authority import AuthorityError, VerifierUnavailable
         from levain.consent.passkey import PasskeyError
+        from levain.consent.sign import SignRefused
         from levain.coordinator.envelope import EnvelopeError
+        from levain.coordinator.envelopes import EnvelopeConflict, EnvelopeStale
         from levain.coordinator.store import CoordError, DropConflict
         from levain.dispatch.cli import CockpitUnnamed
         from levain.dispatch.jobs import JobStoreError
 
-        if action not in ("drop", "envelope-challenge"):
+        if action not in _ACTIONS:
             raise CoordRefused(404, "not_found", "no such coordinator action")
+        if not isinstance(device, str) or not device:
+            raise CoordRefused(403, "device_required", "a drop is sent from a paired device (this run's phone link "
+                                                       "opens the queue only): pair this phone, then send it again")
         if not isinstance(req, dict):
             raise CoordRefused(400, "bad_request", "the request is a JSON object")
-        not_done = "nothing was signed" if action == "envelope-challenge" else "the drop was not delivered"
+        not_done = "the drop was not delivered" if action == "drop" else "nothing was signed"
         try:
+            if action == "envelope-review":
+                return self._review(req, device)
             if action == "envelope-challenge":
-                return self._challenge(req)
+                return self._challenge(req, device)
             return self._drop(req)
-        except DropConflict as exc:
-            raise CoordRefused(409, "conflict", f"{exc}") from None
+        except (DropConflict, EnvelopeConflict) as exc:
+            raise CoordRefused(409, "conflict", f"{exc}: {not_done}") from None
+        except EnvelopeStale as exc:
+            raise CoordRefused(422, "envelope-stale", f"{exc}: {not_done}") from None
+        except SignRefused as exc:
+            raise CoordRefused(503, "unavailable", f"the passkeys cannot be read now ({str(exc)[:200]}): "
+                                                   f"{not_done}") from None
         except CockpitUnnamed as exc:
             raise CoordRefused(503, "unavailable", f"{exc.door}: {not_done}") from None
         except PasskeyError as exc:
@@ -226,15 +288,14 @@ class CoordPhone:
                               "criteria": land.get("criteria", [])})
         return {**{k: spec[k] for k in ("budget", "stop") if k in spec}, "where": where, "lands": out_lands}
 
-    def _challenge(self, req: dict[str, Any]) -> dict[str, Any]:
-        from levain.consent.passkey import challenge
+    def _review(self, req: dict[str, Any], device: str) -> dict[str, Any]:
         from levain.contracts.canon import canonical
         from levain.coordinator import cli as ccli
         from levain.coordinator import envelope as env
         from levain.coordinator.store import CoordError, Source, check_words
 
-        if set(req) != _CHALLENGE_KEYS:
-            raise CoordRefused(400, "bad_request", f"request keys must be {sorted(_CHALLENGE_KEYS)}")
+        if set(req) != _REVIEW_KEYS:
+            raise CoordRefused(400, "bad_request", f"request keys must be {sorted(_REVIEW_KEYS)}")
         words = check_words(req["words"])          # a drop the store would refuse is never signed for
         key = self._key(req["signer_fp"])
         if not isinstance(req["outbox_id"], str):
@@ -247,9 +308,39 @@ class CoordPhone:
         body = ccli._spec_body(self._spec(req["spec"]), words, Source(), store)
         text = canonical(body)
         body = store.check_body(text)          # a body the store can only refuse is never put to the passkey
-        payload = env.sign_payload(body, signer_fp=key.fingerprint, signed_at=self._clock())
-        return {"body_text": text, "digest": env.envelope_digest(body), "payload": payload, "rp_id": self.rp_id,
-                "view": ccli._view(body, store, words=words).split("\n"),
+        review_id = "rv-" + secrets.token_hex(16)
+        now = self._clock()
+        with self._lock:
+            for rid in [r for r, v in self._reviews.items() if v["until"] <= now]:
+                del self._reviews[rid]
+            while len(self._reviews) >= REVIEWS_KEPT:
+                del self._reviews[next(iter(self._reviews))]
+            self._reviews[review_id] = {"device": device, "body": body, "outbox_id": req["outbox_id"],
+                                        "signer_fp": key.fingerprint, "until": now + REVIEW_TTL}
+        return {"review_id": review_id, "body_text": text, "digest": env.envelope_digest(body), "rp_id": self.rp_id,
+                "view": ccli._view(body, store, words=words).split("\n")}
+
+    def _challenge(self, req: dict[str, Any], device: str) -> dict[str, Any]:
+        """Sign tapped: the payload over the KEPT body, signed_at now (L3 r1 codex MED: a long read of the sheet is
+        never a stale signature)."""
+        from levain.consent.passkey import challenge
+        from levain.coordinator import envelope as env
+
+        if set(req) != _CHALLENGE_KEYS or not isinstance(req["review_id"], str):
+            raise CoordRefused(400, "bad_request", f"request keys must be {sorted(_CHALLENGE_KEYS)}")
+        now = self._clock()
+        with self._lock:
+            kept = self._reviews.get(req["review_id"])
+        if kept is None or kept["until"] <= now or kept["device"] != device:
+            raise CoordRefused(409, "review_gone", "this envelope's review is no longer held here (it expired, or the "
+                                                   "phone port restarted): review it again, then sign")
+        key = self._key(kept["signer_fp"])         # still an active passkey covering the envelope's floor
+        store = self._store(create=True)
+        if (sent := store.drop_by_outbox(kept["outbox_id"])) is not None:
+            raise CoordRefused(409, "conflict", f"this drop is already delivered as {sent.drop_id}; nothing new is "
+                                                "signed for it")
+        payload = env.sign_payload(kept["body"], signer_fp=key.fingerprint, signed_at=now)
+        return {"payload": payload, "rp_id": self.rp_id,
                 "challenge": _b64u(challenge(env.sign_message(payload), namespace=env.SIGN_NAMESPACE))}
 
     def _drop(self, req: dict[str, Any]) -> dict[str, Any]:
@@ -259,12 +350,18 @@ class CoordPhone:
         from levain.dispatch.cli import _authority_source
 
         signed = req.get("envelope")
-        if set(req) - {"envelope"} != _DROP_KEYS or ("envelope" in req and not isinstance(signed, dict)):
+        if set(req) - {"envelope"} != _DROP_KEYS or (signed is not None and not isinstance(signed, dict)):
             raise CoordRefused(400, "bad_request", f"request keys must be {sorted(_DROP_KEYS)} and an optional "
                                                    "envelope")
-        if not isinstance(req["sent_at"], str):
-            raise CoordRefused(400, "bad_request", "sent_at is a timestamp")
-        store = self._store(create=True)
+        if not isinstance(req["sent_at"], str) or not isinstance(req["outbox_id"], str):
+            raise CoordRefused(400, "bad_request", "sent_at is a timestamp and outbox_id is text")
+        if req["store_id"] is not None and not isinstance(req["store_id"], str):
+            raise CoordRefused(400, "bad_request", "store_id is the store identity the listing reported, or null")
+        store = self._bound_store(req["store_id"])
+        # a resend first, with nothing else checked: a delivered drop is answered as delivered, whatever has happened
+        # to its carrier since (L3 r1 codex MED)
+        if (again := store.resent_drop(req["outbox_id"], req["words"], surface="phone")) is not None:
+            return self._delivered(store, again, False, None if signed is None else signed.get("body_text"))
         if signed is None:
             drop, created = store.accept_drop(req["words"], surface="phone", outbox_id=req["outbox_id"],
                                               sent_at=req["sent_at"], source=Source())
@@ -279,18 +376,34 @@ class CoordPhone:
         # the CLI's own authority source (levain.coordinator.cli._snapshot with no --data-root), read right before the
         # write: a key revoked while the phone waited signs nothing
         authority = _authority_source(store.directory, None)()
+        # keep_plain=False: an envelope the store would not take writes nothing (the outbox still holds the words)
         drop, created = store.accept_drop(req["words"], surface="phone", outbox_id=req["outbox_id"],
                                           sent_at=req["sent_at"], source=Source(),
                                           envelope=(signed["body_text"], signed["payload"], signature),
-                                          authority=authority)
+                                          authority=authority, keep_plain=False)
         return self._delivered(store, drop, created, signed["body_text"])
 
+    def _bound_store(self, store_id: str | None) -> Any:
+        """The store, only when it is the one the outbox item was made against (L3 r1 codex HIGH). An item made while
+        there was no store (``store_id`` None) creates it, as ``levain drop`` does; an item bound to a store never
+        creates a new one."""
+        from levain.coordinator.envelopes import EnvelopeStore
+
+        store = self._store(create=False)
+        here = None if store is None else store.store_id()
+        if store_id != here:
+            raise CoordRefused(409, "other_store", (
+                f"this drop was made for another Levain (store {str(store_id)[:40]}), not this one "
+                f"({here or 'no store yet'}): it is not sent here"))
+        return store if store is not None else EnvelopeStore(self.dispatch_dir, clock=self._clock)
+
     def _delivered(self, store: Any, drop: Any, created: bool, body_text: str | None) -> dict[str, Any]:
-        # a coordinator launch this drop's transaction asked for is named, never started by the phone port: the
-        # laptop's `levain coord wake` (or its next CLI drop) starts it [judged by coordphone, 10-22, against the
-        # CLI's _launch_woken spawning a session in the caller's process]
+        # only a drop this call created can name a launch (woken_launch is read once, and only an insert sets it)
+        woken = store.woken_launch(drop.drop_id) if created else None
         out = {"created": created, "drop": self.drop_record(store, drop.drop_id), "envelope": None,
-               "woken": store.woken_launch(drop.drop_id)}
+               "woken": woken, "store_id": store.store_id()}
+        if woken is not None:
+            self._wake(drop.drop_id, woken)
         if body_text is not None:
             from levain.coordinator import envelope as env
 
@@ -307,3 +420,37 @@ class CoordPhone:
             out["envelope"] = {"taken": taken, "envelope_id": drop.envelope_id if taken else None,
                                "refused": refused}
         return out
+
+    # --- the wake ----------------------------------------------------------------------------------------------------
+    def _wake(self, drop_id: str, launch_id: str) -> None:
+        """Start ``launch_id`` with the CLI's own call on a daemon thread (a spawn may block; the reply never waits on
+        it), and write how it went as the drop's ``woken`` receipt."""
+        def run() -> None:
+            try:
+                store = self._store(create=True)
+            except Exception:  # noqa: BLE001 - nowhere to record it; the launch stays pending until LAUNCH_TTL
+                return
+            try:
+                got = self._launcher(store, launch_id)
+                started = bool(got.started)
+                said = (got.attach or "started") if started else (got.refusal or "not started")
+                if not started and getattr(got, "remedy", None):
+                    said += f"; run this once on the laptop: {got.remedy}"
+            except Exception as exc:  # noqa: BLE001 - a failed start is the receipt's words, never the drop's failure
+                started, said = False, f"not started: {type(exc).__name__}: {str(exc)[:200]}"
+            try:
+                store.record_wake(drop_id, launch_id, started=started, said=said)
+            except Exception:  # noqa: BLE001 - the drop is delivered either way
+                pass
+
+        t = threading.Thread(target=run, name=f"levain-coord-wake-{launch_id}", daemon=True)
+        with self._lock:
+            self._wakes = [w for w in self._wakes if w.is_alive()] + [t]
+        t.start()
+
+    def wait_wakes(self, timeout: float) -> None:
+        """Wait for the wakes started so far (tests, and a server shutting down)."""
+        with self._lock:
+            wakes = list(self._wakes)
+        for w in wakes:
+            w.join(timeout)

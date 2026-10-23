@@ -22,10 +22,13 @@ it serves only these:
     cancelled, or a recommended one's run authorised and landed, with a passkey, verified by the job store against the same one
     cockpit as the sign requests; ``consent.json`` lists the live jobs as ``dispatch_pending``, with ``dispatch_note``
     (why the store could not be read) and ``dispatch_overflow`` (:mod:`levain.dispatch.phone`).
-  - ``POST /coord/drop`` and ``/coord/envelope-challenge``: the drop sheet (coordinator C1/C2): a drop delivered to the
-    store ``levain drop`` writes, resent from the phone's outbox under its one ``outbox_id`` until it is delivered,
-    optionally carrying a structured envelope signed with a passkey and verified by that store; ``consent.json`` lists
-    the newest phone drops and their drop receipts as ``coord_drops`` (:mod:`levain.coordinator.phone`).
+  - ``POST /coord/drop``, ``/coord/envelope-review`` and ``/coord/envelope-challenge``: the drop sheet (coordinator
+    C1/C2), for a PAIRED DEVICE's token only (this run's phone token is refused 403 ``device_required``): a drop
+    delivered to the store ``levain drop`` writes, resent from the phone's outbox under its one ``outbox_id`` until it
+    is delivered, bound to the store identity it was made against, optionally carrying a structured envelope signed
+    with a passkey and verified by that store, and an accepted drop starting the coordinator launch it asked for;
+    ``consent.json`` lists the newest phone drops and their drop receipts as ``coord_drops`` and the store identity as
+    ``coord_store_id`` (:mod:`levain.coordinator.phone`).
   - ``POST /grant/<id>/revoke-challenge`` and ``.../revoke``: a consent grant revoked with a passkey made on the
     https name (the one authority link a passkey may sign), the challenge naming the grant's ``instance`` as listed,
     the link built and held here and verified by the authority log itself;
@@ -99,7 +102,7 @@ _SIGN_PREFIX = "/sign/"
 _SIGN_ACTIONS = ("challenge", "answer", "deny")
 _DISPATCH_ROUTE = re.compile(
     r"/dispatch/(dj-[0-9a-f]{32})/(challenge|answer|cancel-challenge|cancel|authorise-challenge|authorise)")
-_COORD_ROUTE = re.compile(r"/coord/(drop|envelope-challenge)")
+_COORD_ROUTE = re.compile(r"/coord/(drop|envelope-review|envelope-challenge)")
 _GRANT_PREFIX = "/grant/"
 _GRANT_ACTIONS = ("revoke-challenge", "revoke")
 _MAX_BODY = 16 * 1024          # an assertion is well under 2 KB, an answer record under 1 KB
@@ -408,13 +411,18 @@ class _PhoneHandler(GuardedHandler):
                 self._reject(404, "not_found", "no such route")
             return
         try:
-            ok = self._token_ok()
+            cred = self._credential()          # resolved once: the coordinator routes are handed the device it names
         except PhoneError as exc:
             self._json({"error": exc.error, "message": exc.message}, exc.status)
             return
-        if not ok:
+        if cred is None:
             # refused before a byte of the body is read
             self._reject(403, "credential_required", f"this page's token is needed, sent as {PHONE_TOKEN_HEADER}")
+            return
+        if coord is not None and cred[0] != "device":
+            # the coordinator store takes drops from a paired device only, never this run's transient phone token
+            self._reject(403, "device_required", "a drop is sent from a paired device; this run's phone link opens "
+                                                 "the queue only")
             return
         if self._refuse_non_json():
             return
@@ -445,7 +453,7 @@ class _PhoneHandler(GuardedHandler):
             elif dispatch is not None:
                 result = self.server.dispatch_step(dispatch.group(1), dispatch.group(2), req)
             elif coord is not None:
-                result = self.server.coord_step(coord.group(1), req)
+                result = self.server.coord_step(coord.group(1), req, device=cred[1])
             elif grant is not None:
                 result = self.server.grant_step(grant[0], grant[1], req)
             elif question is not None and question.group(2) == "rule":
@@ -898,12 +906,12 @@ class _PhoneServer(ThreadingHTTPServer):
         except DispatchRefused as exc:
             raise PhoneError(exc.status, exc.error, exc.message) from None
 
-    def coord_step(self, action: str, req: Any) -> dict[str, Any]:
-        """``/coord/<action>`` (:meth:`levain.coordinator.phone.CoordPhone.step`)."""
+    def coord_step(self, action: str, req: Any, *, device: "str | None") -> dict[str, Any]:
+        """``/coord/<action>`` (:meth:`levain.coordinator.phone.CoordPhone.step`), for the paired ``device``."""
         from levain.coordinator.phone import CoordRefused
 
         try:
-            return self.coord.step(action, req)
+            return self.coord.step(action, req, device=device)
         except CoordRefused as exc:
             raise PhoneError(exc.status, exc.error, exc.message) from None
 
