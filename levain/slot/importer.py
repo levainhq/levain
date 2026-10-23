@@ -974,7 +974,7 @@ def write_wip(runner: GitRunner, spool: Spool, frames: Sequence[Frame], *, objec
 
 # --- step 5: fsck and the no-ref check ----------------------------------------------------------------------------
 
-_FSCK_LINE = re.compile(r"^(?:error|warning) in [a-z]+ [0-9a-f]+: ([A-Za-z]+):", re.MULTILINE)
+_FSCK_LINE = re.compile(r"^(?:error|warning) in [a-z]+ [0-9a-f]+: (%s):" % fsck_ids.ID_PATTERN, re.MULTILINE)
 
 
 def has_session_git(frames: Sequence[Frame]) -> bool:

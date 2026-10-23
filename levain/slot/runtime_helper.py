@@ -46,6 +46,7 @@ from levain.slot import proc as PR
 from levain.slot import records as R
 from levain.slot import render as RD
 from levain.slot import stage as ST
+from levain.slot import verify_caps as VC
 from levain.slot.end import V5_FLOOR_BYTES
 from levain.slot.grammar import SESSION_RE
 from levain.slot.ids import SlotId, in_own_range
@@ -2471,8 +2472,8 @@ def adopt_open(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
 #: bytes; ``RLIMIT_CPU`` takes the same value, and root waits for the line that long + :data:`RESULT_GRACE_S`.
 VERIFY_WALL_BASE_S = 300.0
 VERIFY_WALL_PER_GIB_S = 120.0
-#: V30's cap on expanded output (``preview.txt``) and the verify image's fixed margin (§6.3, judged there).
-VERIFY_OUTPUT_CAP = 256 << 20
+#: The verify image's fixed margin (§6.3, judged there); V30's output caps are :mod:`verify_caps`' (one module the
+#: verifier child and root both import).
 VERIFY_MARGIN_BYTES = 64 << 20
 #: ``verified.json``'s cap: a record whose only unbounded part is the prerequisites, which come from a bundle header
 #: of at most ``bundlefmt.HEADER_MAX`` bytes [judged by adopt-5di-s2, 10-22, against ``adopt_verify.Verified.to_json``].
@@ -2495,14 +2496,16 @@ def verify_image_bytes(*, bundle_bytes: int, base_bytes: int, bundle_objects: in
     """V30's verify image (§6.3): ``2 x (bundle + base bundle)`` (the copies in, and the pack each ``index-pack
     --stdin`` writes into Q and B), both idx bounds, the expanded-output cap, the required oid list and its ``sort``
     temp files (``2 x objects x (oid hex + 1)``, ``objects`` here BOTH packs' counts, a superset of the bundle's
-    [judged by adopt-5di-s2, 10-22, against §6.3's "objects from the pack header's count"]), the closure's tree
-    payloads at their cap (``adopt_verify.TREE_SCRATCH_CAP``, which the verifier enforces before writing them; L3 s2 r1
-    codex MED: §6.3's formula has no term for them [judged by adopt-s2fix, 10-22]) and the fixed margin."""
-    from levain.slot import adopt_verify as AV
+    [judged by adopt-5di-s2, 10-22, against §6.3's "objects from the pack header's count"]), the verifier's other
+    oid inventories in ``scratch/`` (``verify_caps.inventory_bytes`` over the same count: one line per object in each,
+    L3 s2 r2), the closure's tree payloads at their cap (``verify_caps.TREE_SCRATCH_CAP``, which the verifier enforces
+    before writing them; L3 s2 r1 codex MED: §6.3's formula has no term for them [judged by adopt-s2fix, 10-22]) and
+    the fixed margin."""
     hexlen = BF.OID_HEX[object_format]
+    objects = bundle_objects + base_objects
     return (2 * (bundle_bytes + base_bytes) + idx_bound(bundle_objects, object_format)
-            + idx_bound(base_objects, object_format) + VERIFY_OUTPUT_CAP + AV.TREE_SCRATCH_CAP
-            + 2 * (bundle_objects + base_objects) * (hexlen + 1) + VERIFY_MARGIN_BYTES)
+            + idx_bound(base_objects, object_format) + VC.PREVIEW_OUTPUT_CAP + VC.TREE_SCRATCH_CAP
+            + 2 * objects * (hexlen + 1) + VC.inventory_bytes(objects, hexlen) + VERIFY_MARGIN_BYTES)
 
 
 def verify_wall_s(bundle_bytes: int, base_bytes: int) -> float:
@@ -2583,15 +2586,19 @@ def _open_source(dfd: int, name: str, refusal: str, ctx: Ctx) -> Tuple[int, os.s
 
 
 def _fd_sha256(fd: int, size: int) -> str:
-    """``sha256:<hex>`` of an open file's first ``size`` + 1 bytes at most, by ``pread``."""
+    """``sha256:<hex>`` of an open file's first ``size`` + 1 bytes at most, by ``pread``. An OSError reading it (EIO)
+    = ``export-image-unavailable``, the name copy-in gives the same read (L3 s2 r2 introduced LOW: it was ``internal``)."""
     h = hashlib.sha256()
     off = 0
-    while off <= size:
-        chunk = os.pread(fd, min(_COPY_CHUNK, size + 1 - off), off)
-        if not chunk:
-            break
-        h.update(chunk)
-        off += len(chunk)
+    try:
+        while off <= size:
+            chunk = os.pread(fd, min(_COPY_CHUNK, size + 1 - off), off)
+            if not chunk:
+                break
+            h.update(chunk)
+            off += len(chunk)
+    except OSError as e:
+        raise Refused(ER_UNAVAILABLE, f"the digest scan: {errno.errorcode.get(e.errno or 0, e.errno)}") from e
     return "sha256:" + h.hexdigest()
 
 
@@ -2731,7 +2738,7 @@ def verify_sealed_run(ctx: Ctx, front: AdoptFront, export_class: str, bundle_dig
             raise Refused("base-bundle-mismatch", f"the base bundle's header: {e.name}") from None
         image_bytes = verify_image_bytes(bundle_bytes=bundle_bytes, base_bytes=base_bytes, bundle_objects=objects,
                                          base_objects=base_objects, object_format=fmt)
-        caps = {"verified.json": VERIFIED_CAP, "q.idx": idx_bound(objects, fmt), "preview.txt": VERIFY_OUTPUT_CAP}
+        caps = {"verified.json": VERIFIED_CAP, "q.idx": idx_bound(objects, fmt), "preview.txt": VC.PREVIEW_OUTPUT_CAP}
         need = V5_FLOOR_BYTES + image_bytes + sum(caps.values())
         with ctx.store.dir("export") as efd:
             free = ctx.seams.free_bytes(efd)

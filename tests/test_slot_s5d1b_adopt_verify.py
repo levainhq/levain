@@ -32,6 +32,7 @@ from levain.slot import records as R
 from levain.slot import root_tree
 from levain.slot import runtime_grammar as RG
 from levain.slot import runtime_helper as RH
+from levain.slot import verify_caps as VC
 
 S = "s-" + "c2" * 8
 DIGEST = "sha256:" + "ab" * 32
@@ -420,8 +421,8 @@ def test_v30_formulas():
     assert RH.idx_bound(10, "sha256") == 8 + 1024 + 10 * 48 + 64
     got = RH.verify_image_bytes(bundle_bytes=100, base_bytes=50, bundle_objects=3, base_objects=2,
                                 object_format="sha1")
-    assert got == (300 + RH.idx_bound(3, "sha1") + RH.idx_bound(2, "sha1") + RH.VERIFY_OUTPUT_CAP + 2 * 5 * 41
-                   + AV.TREE_SCRATCH_CAP + RH.VERIFY_MARGIN_BYTES)
+    assert got == (300 + RH.idx_bound(3, "sha1") + RH.idx_bound(2, "sha1") + VC.PREVIEW_OUTPUT_CAP + 2 * 5 * 41
+                   + VC.inventory_bytes(5, 40) + VC.TREE_SCRATCH_CAP + RH.VERIFY_MARGIN_BYTES)
     assert RH.verify_wall_s(1 << 30, 1 << 30) == 300 + 240
 
 

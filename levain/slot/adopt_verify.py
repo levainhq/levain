@@ -8,9 +8,9 @@ global config, the C locale) with :data:`GIT_C` in front of each subcommand (DES
 Steps (§6.1): 1a the base store B from the base bundle's pack (no fsck: Levain's bytes, pinned by root to
 ``alloc.base.bundle_sha256``); 1 the header by :mod:`bundlefmt` and :func:`export_run.importer_bundle_check` (root's own
 grammar, one site); 2 the quarantine store Q, the pack by ``index-pack --stdin --fsck-objects --no-rev-index``; 2a the
-commit-count gate from Q's inventory (the tree reader of 2a is piece 5d-ii's, :data:`TREE_READER`); 3 the analysis repo P
+commit-count gate from Q's inventory, then the A10 tree reader (:func:`fsck_reader.read_trees`); 3 the analysis repo P
 (alternates B and Q); 4 the tips, the closure (connectivity first), the tip-in-base check, the EXACT SET; 5 ancestry
-of each prerequisite. Built in piece 5d-i session 1.
+of each prerequisite. Built in piece 5d-i session 1; 2a's reader in 5d-ii session 1.
 
 Every byte fact in :class:`Verified` is a CLAIM the take re-derives (S3); only the verdict is the verifier's.
 """
@@ -21,28 +21,19 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 from levain.contracts import ContractError, canon
-from levain.slot import Refused, bundlefmt, export_run, fsck_ids, importer, special_paths
+from levain.slot import Refused, bundlefmt, export_run, fsck_ids, fsck_reader, importer, special_paths, verify_caps
 
 #: The ``-c`` set in front of every verifier git (DESIGN §6 setup, A15; threads pinned to 2, §6.3's RLIMIT_NPROC).
 GIT_C = ("-c", "core.hooksPath=/dev/null", "-c", "core.protectHFS=true", "-c", "core.protectNTFS=true",
          "-c", "pack.threads=2")
 #: V30: new commits above this = ``preview-cap:commits`` (§6.3).
 MAX_COMMITS = 10_000
-#: V30's expanded-output cap (§6.3: every git output byte-capped, 256 MiB = ``preview-cap:output``) over step 4's
-#: one uncompressed git output in ``scratch/``, the delta closure's tree payloads (``closure-trees``, ``cat-file
-#: --batch``): their size is summed from ``--batch-check``'s ``%(objectsize)`` BEFORE the payloads are written, so a
-#: small, highly compressible tree is refused by this name, never by the image filling. Root's image budget carries it
-#: as a term (``runtime_helper.verify_image_bytes``).
-TREE_SCRATCH_CAP = 256 << 20
 #: The A4 header line, always the first line of ``preview.txt`` (§6.2 step 0).
 PREVIEW_HEADER = ("PROPOSED by the session's importer: verified complete and exact, not verified faithful. Review it "
                   "as you would a patch from an untrusted contributor.")
-#: Piece 5d-ii's 2a tree reader (the A10 reader: the below-ERROR ids and frame (a)'s depth bound). None until built:
-#: 5d-i's verify therefore proves fsck + the exact set + ancestry, NOT the depth bound, and nothing takes from it.
-TREE_READER: Optional[Callable[..., None]] = None
 _PACK_SIG = b"PACK"
 _CHUNK = 1 << 20
 
@@ -155,7 +146,7 @@ def _init(r: importer.GitRunner, fmt: str) -> None:
 
 
 #: Only ``error:`` / ``fatal:`` lines name the failure: a closed-list id on a ``warning:`` line is not the cause.
-_FSCK_ID = re.compile(r"^(?:error|fatal): (?:object [0-9a-f]+: )?([A-Za-z]+):", re.MULTILINE)
+_FSCK_ID = re.compile(r"^(?:error|fatal): (?:object [0-9a-f]+: )?(%s):" % fsck_ids.ID_PATTERN, re.MULTILINE)
 _UNRESOLVED = re.compile(r"pack has \d+ unresolved delta")
 
 
@@ -214,16 +205,17 @@ def _oid_lines(path: Path, hexlen: int, what: str) -> Iterator[str]:
             yield line.decode("ascii")
 
 
-def _commit_gate(q: importer.GitRunner, scratch: Path) -> int:
-    """2a's gate: Cq, the commits in Q, from Q's inventory (types only, no content read); above :data:`MAX_COMMITS` =
-    ``preview-cap:commits`` before any commit is read."""
+def _commit_gate(q: importer.GitRunner, scratch: Path) -> Tuple[int, Path]:
+    """2a's gate: Cq, the commits in Q, from Q's inventory (``%(objectname) %(objecttype)``, no content read); above
+    :data:`MAX_COMMITS` = ``preview-cap:commits`` before any commit is read. Returns Cq and the inventory, the tree
+    reader's roots (its commits and tree objects)."""
     inv = scratch / "q-types"
-    _to_file(q, inv, "cat-file", "--batch-all-objects", "--batch-check=%(objecttype)")
+    _to_file(q, inv, "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)")
     with importer._read_own(inv) as fh:
-        cq = sum(1 for line in importer._lines(fh, "the inventory") if line == b"commit")
+        cq = sum(1 for line in importer._lines(fh, "the inventory") if line.endswith(b" commit"))
     if cq > MAX_COMMITS:
         raise Refused("preview-cap:commits", f"{cq} commits in the bundle > {MAX_COMMITS}")
-    return cq
+    return cq, inv
 
 
 def _required(p: importer.GitRunner, q: importer.GitRunner, scratch: Path, tips: Sequence[str], *, result: str,
@@ -269,8 +261,9 @@ def _required(p: importer.GitRunner, q: importer.GitRunner, scratch: Path, tips:
                         raise importer.Fatal(None, "cat-file --batch-check printed a size that is not a number")
                     expanded += len(oid) + len(b" tree ") + len(size) + 1 + int(size) + 1
                     tf.write(oid + b"\n")
-        if expanded > TREE_SCRATCH_CAP:
-            raise Refused("preview-cap:output", f"the closure's trees expand to {expanded} bytes > {TREE_SCRATCH_CAP}")
+        if expanded > verify_caps.TREE_SCRATCH_CAP:
+            raise Refused("preview-cap:output",
+                          f"the closure's trees expand to {expanded} bytes > {verify_caps.TREE_SCRATCH_CAP}")
         payloads = scratch / "closure-trees"
         _to_file(p, payloads, "cat-file", "--batch", stdin=trees)
         try:
@@ -364,10 +357,9 @@ def quarantine_verify(bundle: Path, base_bundle: Path, *, session: str, base_oid
     _pack, idx = _one_pack(q)
     if os.path.lexists(_objects_dir(q) / "info" / "alternates"):
         raise importer.Fatal(None, "Q has an alternates file")
-    # 2a. the gate (the reader is 5d-ii's)
-    _commit_gate(q, scratch)
-    if TREE_READER is not None:
-        TREE_READER(q=q, b=b, scratch=scratch, hexlen=hexlen)
+    # 2a. the gate, then the tree reader (the below-ERROR ids and frame (a)'s depth bound), before any P or rev-list
+    _cq, inventory = _commit_gate(q, scratch)
+    fsck_reader.read_trees(q, b, inventory, hexlen, log=log)
     # 3. P
     p = _runner(git, scratch, "p", log)
     _init(p, object_format)
@@ -440,5 +432,5 @@ def parse_verifier_line(raw: Optional[bytes]) -> export_run.Line:
     return export_run.Line(True, obj["enospc"], ref, obj["result"], (0, 0))
 
 
-__all__ = ["GIT_C", "MAX_COMMITS", "PREVIEW_HEADER", "TREE_READER", "TREE_SCRATCH_CAP", "VERIFY_LINE_KEYS", "Verified",
+__all__ = ["GIT_C", "MAX_COMMITS", "PREVIEW_HEADER", "VERIFY_LINE_KEYS", "Verified",
            "pack_count", "pack_count_at", "parse_verifier_line", "quarantine_verify", "read_header", "read_header_at"]

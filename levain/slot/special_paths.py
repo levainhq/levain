@@ -151,6 +151,38 @@ def is_ntfs_dotgitattributes(name: bytes) -> bool:
     return _is_ntfs_dot(name, b"gitattributes", b"gi7d29")
 
 
+def is_hfs_dotgit(name: bytes) -> bool:
+    """git's ``is_hfs_dotgit`` (``utf8.c``: ``is_hfs_dot_str(path, "git")``)."""
+    return _is_hfs_dot(name, b"git")
+
+
+def is_ntfs_dotgit(name: bytes, start: int = 0) -> bool:
+    """git's ``is_ntfs_dotgit`` (``path.c``, byte-identical at v2.39.4 and v2.50.1) on the name that begins at
+    ``start``: ``.git`` or ``git~1``, case-insensitive, then only ``.`` or space up to the end, a ``/`` or ``\\``, or a
+    ``:``."""
+    def at(i: int) -> int:
+        return _at(name, start + i)
+
+    c = at(0)
+    if c == 0x2E:
+        if _lower(at(1)) != 0x67 or _lower(at(2)) != 0x69 or _lower(at(3)) != 0x74:
+            return False
+        i = 4
+    elif _lower(c) == 0x67:
+        if _lower(at(1)) != 0x69 or _lower(at(2)) != 0x74 or at(3) != 0x7E or at(4) != 0x31:
+            return False
+        i = 5
+    else:
+        return False
+    while True:
+        c = at(i)
+        i += 1
+        if c == 0 or c in (0x2F, 0x5C, 0x3A):
+            return True
+        if c not in (0x2E, 0x20):
+            return False
+
+
 def is_dotgitmodules(name: bytes) -> bool:
     return is_hfs_dotgitmodules(name) or is_ntfs_dotgitmodules(name)
 
@@ -159,10 +191,11 @@ def is_dotgitattributes(name: bytes) -> bool:
     return is_hfs_dotgitattributes(name) or is_ntfs_dotgitattributes(name)
 
 
-def tree_entries(payload: bytes, hexlen: int) -> Iterator[tuple[int, bytes, str]]:
-    """A tree object's entries, ``(mode, name, oid hex)``, in order. Bounded: a mode of 1 to
-    :data:`MODE_DIGITS_MAX` octal digits, a NUL ending the name, a whole raw oid of the format's length. Anything else
-    raises ValueError (the payload is not a tree this reader accepts), as does a ``hexlen`` that is not 40 or 64."""
+def tree_entries_raw(payload: bytes, hexlen: int) -> Iterator[tuple[bytes, bytes, str]]:
+    """A tree object's entries, ``(mode text, name, oid hex)``, in order: the mode as the tree spells it (git's fsck
+    reads its first byte for ``zeroPaddedFilemode``). Bounded: a mode of 1 to :data:`MODE_DIGITS_MAX` octal digits, a
+    NUL ending the name, a whole raw oid of the format's length. Anything else raises ValueError (the payload is not
+    a tree this reader accepts), as does a ``hexlen`` that is not 40 or 64."""
     if hexlen not in _HEXLENS:
         raise ValueError(f"hexlen {hexlen!r}: not an object format's (40 or 64)")
     raw = hexlen // 2
@@ -180,8 +213,14 @@ def tree_entries(payload: bytes, hexlen: int) -> Iterator[tuple[int, bytes, str]
             raise ValueError(f"tree entry at {i}: no NUL after the name")
         if nul + 1 + raw > end:
             raise ValueError(f"tree entry at {i}: a truncated oid")
-        yield int(mode_s, 8), payload[sp + 1:nul], payload[nul + 1:nul + 1 + raw].hex()
+        yield mode_s, payload[sp + 1:nul], payload[nul + 1:nul + 1 + raw].hex()
         i = nul + 1 + raw
+
+
+def tree_entries(payload: bytes, hexlen: int) -> Iterator[tuple[int, bytes, str]]:
+    """:func:`tree_entries_raw` with the mode as a number, ``(mode, name, oid hex)``."""
+    for mode_s, name, oid in tree_entries_raw(payload, hexlen):
+        yield int(mode_s, 8), name, oid
 
 
 def special_entry_oids(payload: bytes, hexlen: int) -> Iterator[str]:

@@ -129,7 +129,7 @@ IMPORTER = Role("importer-failed", "adopt-cap:memory", "adopt-space-exhausted", 
 VERIFIER_NAMES = frozenset({
     "base-bundle-mismatch", "base-mismatch", BF.MISMATCH, "bundle-extra-objects", "bundle-special-unsent",
     "bundle-thin", "bundle-tip-in-base", "bundle-tip-not-commit", "export-result-mismatch", "fsck:other",
-    "preview-cap:commits", "preview-cap:output", "preview-graph-unresolved"}) | frozenset(
+    "preview-cap:commits", "preview-cap:output", "preview-cap:tree-depth", "preview-graph-unresolved"}) | frozenset(
         f"fsck:{i}" for i in FI.closed_ids())
 VERIFIER = Role("verifier-failed", "preview-cap:memory", "preview-space-exhausted", "preview-space-exhausted",
                 "output-missing", "<s>/verify.new", VERIFIER_NAMES)

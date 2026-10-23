@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from levain.slot import adopt_verify as AV, bundlefmt as BF, export_run as ER, root_tree, verify_run as VR
-from levain.slot import runtime_helper as RH
+from levain.slot import runtime_helper as RH, verify_caps as VC
 
 GIT = shutil.which("git")
 S = "s-" + "d1" * 8
@@ -271,7 +271,7 @@ def test_a_run_called_inside_an_except_block_still_succeeds(tmp_path):
 def test_a_small_tree_that_expands_past_the_tree_scratch_cap_is_preview_cap_output(tmp_path, monkeypatch):
     # adopt-s2fix (L3 s2 r1 codex MED): the delta closure's tree payloads (scratch/closure-trees, cat-file --batch)
     # were outside V30's image, so a small, highly compressible tree could expand past it and answer
-    # preview-space-exhausted. Built red: AV.TREE_SCRATCH_CAP did not exist and the tree ran into the image. The cap
+    # preview-space-exhausted. Built red: the tree scratch cap did not exist and the tree ran into the image. The cap
     # is scaled down here (the real one is V30's 256 MiB expanded-output cap) so the expansion is a test-sized tree.
     fx = Fx(tmp_path)
     wide = fx.repo / "wide"
@@ -292,14 +292,14 @@ def test_a_small_tree_that_expands_past_the_tree_scratch_cap_is_preview_cap_outp
         scratch.mkdir()
         return AV.quarantine_verify(b, fx.base_bundle, session=S, base_oid=fx.base, object_format="sha1",
                                     result="delta", scratch=scratch, git=GIT, max_input_size=1 << 30)
-    monkeypatch.setattr(AV, "TREE_SCRATCH_CAP", cap)
+    monkeypatch.setattr(VC, "TREE_SCRATCH_CAP", cap)
     with pytest.raises(AV.Refused) as e:
         verify("capped")
     assert e.value.name == "preview-cap:output" and not (tmp_path / "capped" / "closure-trees").exists()
-    monkeypatch.setattr(AV, "TREE_SCRATCH_CAP", tree_bytes * 2)
+    monkeypatch.setattr(VC, "TREE_SCRATCH_CAP", tree_bytes * 2)
     assert verify("fits").result == "delta"
     # the cap is a term of root's image budget, so the honest tree it admits fits the image it sized
     got = RH.verify_image_bytes(bundle_bytes=1, base_bytes=1, bundle_objects=1, base_objects=1, object_format="sha1")
-    monkeypatch.setattr(AV, "TREE_SCRATCH_CAP", 0)
+    monkeypatch.setattr(VC, "TREE_SCRATCH_CAP", 0)
     assert got - RH.verify_image_bytes(bundle_bytes=1, base_bytes=1, bundle_objects=1, base_objects=1,
                                        object_format="sha1") == tree_bytes * 2

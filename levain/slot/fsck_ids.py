@@ -59,6 +59,11 @@ DEFAULT_ERROR_NAMED: tuple[str, ...] = ("gitattributesMissing", "gitmodulesMissi
 
 _RANK = {"IGNORE": 0, "INFO": 1, "WARN": 2, "ERROR": 3, "FATAL": 4}
 
+#: A message id as git prints it (``snake_to_id`` of a ``fsck.h`` macro): camelCase, digits allowed (``nullSha1``,
+#: ``badTreeSha1``). Every regex that reads an id out of git's stderr uses THIS, so an id with a digit is never read
+#: as ``fsck:other`` (5d-ii S1 run: ``[A-Za-z]+`` stopped at ``nullSha``).
+ID_PATTERN = r"[A-Za-z][A-Za-z0-9]*"
+
 
 def snake_to_id(name: str) -> str:
     """git's spelling of a message id from its ``fsck.h`` macro name: ``HAS_DOTGIT`` -> ``hasDotgit``."""
@@ -192,7 +197,7 @@ def _last(stderr: str) -> str:
     return (stderr.strip().splitlines() or [""])[-1][:200]
 
 
-__all__ = ["CONFIG_IDS", "DEFAULT_ERROR_NAMED", "FLOOR", "FLOOR_FSCK_H_SHA256", "FLOOR_SEVERITIES", "FLOOR_TAG",
+__all__ = ["CONFIG_IDS", "DEFAULT_ERROR_NAMED", "ID_PATTERN", "FLOOR", "FLOOR_FSCK_H_SHA256", "FLOOR_SEVERITIES", "FLOOR_TAG",
            "FSCK_PROBE_FAILED", "FSCK_TIMEOUT", "GitVersion", "LARGE_PATHNAME", "SCRUBBED_ENV", "UNPARSED",
            "VERSION_TIMEOUT", "check_config_ids", "check_floor", "closed_ids", "git_version_text", "parse_fsck_h",
            "parse_version", "reader_ids", "snake_to_id"]
