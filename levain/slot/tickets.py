@@ -34,12 +34,26 @@ and counts nothing again, else `attempt-closed`.
 `("run", run_id)` and `TOKEN-RESOLVE`'s `run.run_id`; a replay of the same attempt answers the same one. The ticket is a
 bearer handle for `LEASE-OPEN` and never leaves CONTROL past dispatch: the run is named by `run_id` everywhere else.
 
+ONE CONTROL (3c-5 fix 2, L3 r1 codex 1): the store holds an exclusive `flock` on `tickets.jsonl.lock` beside the
+journal from :meth:`TicketStore.acquire` (CONTROL's first start act) until :meth:`TicketStore.close`; a second CONTROL
+that cannot take it refuses to start `control-running` before it compacts, appends or binds its socket. The lock is on
+its own file, never the journal's fd (the compaction replaces the journal's inode) and the file is never removed.
+
+Every mint line is checked whole at the rebuild (fix 2, codex 2): exactly its fields, its facts re-checked by
+:func:`check_facts` and equal to what that returns, and :func:`request_digest` of them equal to the stored digest; any
+difference is `journal-inconsistent`. A line whose facts were altered under its old digest is never served.
+
+Expiry is derived (fix 2, complement 3): an unbound ticket past V16 READS as `expired` on every verb, but the `expire`
+line is journaled only by a verb that writes anyway (mint, bind, cancel) or by the start's compaction, so a read-only
+verb (STATUS, a replay, LEASE-OPEN's check) never appends and so can never poison the store.
+
 The reader refuses any op it does not hold (a slot releasing a ticket is journaled by the code that builds it, 3c-7,
 with the reader that holds it).
 
 Runs on the root interpreter (3.9)."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import re
@@ -98,6 +112,8 @@ _VERIFIER_FIELDS = ("verifier_generation", "verifier_id", "verifier_steps", "inp
 #: §3.3 RUN-TICKET-MINT's fields beside `attempt_id`.
 MINT_FIELDS = frozenset({"job_id", "run_index", "contract_digest", "kind", "model_requested", "egress_routes",
                          "reserved_microdollars", *_ROUTE_FIELDS, *_VERIFIER_FIELDS})
+#: a journal `mint` line's keys, exactly (fix 2: the rebuild refuses any other set)
+MINT_LINE_KEYS = frozenset({"op", "ticket", "attempt_id", "run_id", "request_digest", "facts", "minted_ms", "day"})
 
 
 def _field(name: str, detail: str = "") -> Refused:
@@ -259,6 +275,7 @@ class TicketStore:
                  ceiling_uid: int = 0) -> None:
         self.path = Path(path)
         self.new_path = self.path.with_name(self.path.name + ".new")
+        self.lock_path = self.path.with_name(self.path.name + ".lock")
         self.ceiling_path = Path(ceiling_path)
         self.ceiling_uid = ceiling_uid
         self._fsync = fsync
@@ -266,36 +283,82 @@ class TicketStore:
         self.fault = fault
         self.lock = threading.Lock()
         self._fd: Optional[int] = None
+        #: the held `flock` on :attr:`lock_path` (fix 2): one CONTROL per journal, from :meth:`acquire` to :meth:`close`
+        self._lock_fd: Optional[int] = None
         #: set by a failed append (fix 1): every verb refuses `journal-unavailable` until :meth:`start` runs again.
         self._poisoned = False
         self._by_attempt: Dict[str, Ticket] = {}
         self._by_ticket: Dict[str, Ticket] = {}
 
-    # -- the start: read, check, compact ----------------------------------------------------------------------------
+    # -- the start: lock, read, check, compact -----------------------------------------------------------------------
+
+    def acquire(self) -> None:
+        """Take the journal's single-CONTROL lock (module docstring, ONE CONTROL), held until :meth:`close`; idempotent
+        while held. CONTROL calls it as its first start act, before any route, record or journal is touched, and
+        :meth:`start` takes it too. Another holder: `control-running` (a second CONTROL; it must not start, compact or
+        bind the socket). A lock file it cannot open: `journal-unavailable`."""
+        with self.lock:
+            self._acquire()
+
+    def _acquire(self) -> None:
+        if self._lock_fd is not None:
+            return
+        try:
+            fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        except OSError as e:
+            raise Refused("journal-unavailable", f"the ticket-journal lock: {e.strerror}") from None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise Refused("control-running", f"another CONTROL holds {self.lock_path}") from None
+        except OSError as e:
+            os.close(fd)
+            raise Refused("journal-unavailable", f"the ticket-journal lock: {e.strerror}") from None
+        self._lock_fd = fd
+
+    def _release(self) -> None:
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)               # closing the only descriptor releases the flock
+            self._lock_fd = None
 
     def start(self, has_session: Optional[Callable[[str], bool]] = None) -> None:
         """`has_session(session)`: whether CONTROL's state store holds that session's record (CONTROL loads its records
         first). Head ruling H8 (1024+8): a ticket journaled BOUND to a session with no record (CONTROL died between
         the bind line and the record's write) is unbound back to minted here, before the compaction, which then writes
         it without its bind: no session existed, so nothing ran and nothing was charged. With no `has_session`, every
-        binding stands."""
+        binding stands. An unbound ticket already past V16 is expired here, so the compaction tombstones it (fix 2).
+
+        The single-CONTROL lock is taken first (:meth:`acquire`); a start that fails after taking it releases it (a
+        CONTROL that did not start holds nothing)."""
         with self.lock:
-            if self._fd is not None:
-                os.close(self._fd)
-                self._fd = None
+            held = self._lock_fd is not None
+            self._acquire()
             try:
-                os.unlink(self.new_path)          # a compaction that died before its rename: never adopted
-            except FileNotFoundError:
-                pass
-            self._by_attempt, self._by_ticket = self._rebuild(self._read())
-            if has_session is not None:
+                if self._fd is not None:
+                    os.close(self._fd)
+                    self._fd = None
+                try:
+                    os.unlink(self.new_path)          # a compaction that died before its rename: never adopted
+                except FileNotFoundError:
+                    pass
+                self._by_attempt, self._by_ticket = self._rebuild(self._read())
+                if has_session is not None:
+                    for t in self._by_ticket.values():
+                        if t.state == BOUND and t.session is not None and not has_session(t.session):
+                            t.state, t.session = UNBOUND, None
+                now_ms = self._now_ms()
                 for t in self._by_ticket.values():
-                    if t.state == BOUND and t.session is not None and not has_session(t.session):
-                        t.state, t.session = UNBOUND, None
-            self._compact()
-            self._fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
-                               0o600)
-            self._poisoned = False
+                    if self._due(t, now_ms):
+                        t.state = EXPIRED             # journaled by the compaction's tombstone
+                self._compact()
+                self._fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                   0o600)
+                self._poisoned = False
+            except BaseException:
+                if not held:
+                    self._release()
+                raise
 
     def _read(self) -> List[dict]:
         try:
@@ -349,6 +412,15 @@ class TicketStore:
             for obj in lines:
                 op = obj["op"]
                 if op == "mint":
+                    # fix 2 (codex 2): the line whole, its facts re-checked and its digest recomputed, so a line whose
+                    # facts were altered under the old digest is never served (the mint's checks would be bypassed)
+                    facts = obj["facts"]
+                    if set(obj) != MINT_LINE_KEYS or not isinstance(facts, dict) or not set(facts) <= MINT_FIELDS:
+                        raise _inconsistent("a mint line's fields are not exactly a mint's")
+                    if check_facts(facts) != facts:
+                        raise _inconsistent("a mint line's facts are not what check_facts reads")
+                    if obj["request_digest"] != request_digest(facts):
+                        raise _inconsistent("a mint line's request digest is not its facts' digest")
                     t = Ticket(obj["ticket"], check_attempt_id(obj["attempt_id"]), obj["request_digest"],
                                dict(obj["facts"]), _uint(obj["minted_ms"], "minted_ms"), obj["day"],
                                run_id=obj["run_id"])
@@ -480,11 +552,25 @@ class TicketStore:
                 raise Refused("journal-unavailable", f"a ticket-journal append failed ({type(e).__name__})") from None
             raise
 
+    def _now_ms(self) -> int:
+        return int(self._clock() * 1000)
+
+    @staticmethod
+    def _due(t: Ticket, now_ms: int) -> bool:
+        """An unbound ticket past V16 (whether or not its `expire` line is journaled yet)."""
+        return t.state == UNBOUND and now_ms - t.minted_ms >= TICKET_UNUSED_S * 1000
+
+    def _state(self, t: Ticket) -> str:
+        """`t`'s state as every verb reads it (fix 2, complement 3): derived from `minted_ms`, so a READ never appends
+        (caller holds the lock)."""
+        return EXPIRED if self._due(t, self._now_ms()) else t.state
+
     def _expire_due(self) -> None:
-        """Every unbound ticket past V16 becomes `expired`, journaled (caller holds the lock)."""
-        now_ms = int(self._clock() * 1000)
+        """Every unbound ticket past V16 becomes `expired`, journaled (caller holds the lock). WRITE paths only (mint,
+        bind, cancel): a read-only verb derives the state with :meth:`_state` and appends nothing."""
+        now_ms = self._now_ms()
         for t in list(self._by_ticket.values()):
-            if t.state == UNBOUND and now_ms - t.minted_ms >= TICKET_UNUSED_S * 1000:
+            if self._due(t, now_ms):
                 self._append({"op": "expire", "ticket": t.ticket})
                 t.state = EXPIRED
 
@@ -497,36 +583,41 @@ class TicketStore:
         digest = request_digest(facts)
         with self.lock:
             self._live()
-            self._expire_due()
-            t = self._by_attempt.get(attempt_id)
-            if t is None:
-                return None
-            if t.request_digest != digest:
-                raise Refused("attempt-conflict")
-            if t.state != UNBOUND:
-                raise Refused("attempt-closed", t.state)
-            return t
+            return self._replay(attempt_id, digest)
+
+    def _replay(self, attempt_id: str, digest: str) -> Optional[Ticket]:
+        """:meth:`replay`'s rule (caller holds the lock); appends nothing."""
+        t = self._by_attempt.get(attempt_id)
+        if t is None:
+            return None
+        if t.request_digest != digest:
+            raise Refused("attempt-conflict")
+        state = self._state(t)
+        if state != UNBOUND:
+            raise Refused("attempt-closed", state)
+        return t
 
     def mint(self, attempt_id: str, facts: Mapping[str, object], new_ticket: Callable[[], str]) -> Ticket:
         """A NEW attempt's mint, journaled before it answers: the ceiling read and checked against the rebuilt counts
         (the open tickets, the UTC day's mints), all under the store's lock, so two mints never both take the last
-        place. A replay that raced in first answers by :meth:`replay`'s rule."""
+        place. An attempt the index already names answers by :meth:`replay`'s rule BEFORE the ceiling is read (fix 2,
+        codex 3: a same-attempt retry that raced the first mint gets the first ticket, whatever the ceiling now says),
+        and again under the lock after it."""
+        digest = request_digest(facts)
         with self.lock:
             self._live()                          # a poisoned store answers that before the ceiling is read
+            again = self._replay(attempt_id, digest)
+            if again is not None:
+                return again
         ceiling = read_ceiling(self.ceiling_path, self.ceiling_uid)
         if facts["reserved_microdollars"] > ceiling.max_reserved_microdollars_per_run:   # type: ignore[operator]
             raise Refused("ticket-ceiling:max_reserved_microdollars_per_run")
-        digest = request_digest(facts)
         with self.lock:
             self._live()
+            again = self._replay(attempt_id, digest)
+            if again is not None:
+                return again
             self._expire_due()
-            if attempt_id in self._by_attempt:
-                t = self._by_attempt[attempt_id]
-                if t.request_digest != digest:
-                    raise Refused("attempt-conflict")
-                if t.state != UNBOUND:
-                    raise Refused("attempt-closed", t.state)
-                return t
             now = self._clock()
             day = _day(now)
             if sum(1 for t in self._by_ticket.values() if t.state in OPEN) >= ceiling.max_open_tickets:
@@ -548,17 +639,17 @@ class TicketStore:
         in CONTROL's memory only; `bind` is what the journal records."""
         with self.lock:
             self._live()
-            self._expire_due()
             return self._unbound(ticket)
 
     def _unbound(self, ticket: str) -> Ticket:
         t = self._by_ticket.get(ticket)
         if t is None:
             raise Refused("ticket-unknown")
-        if t.state == BOUND:
+        state = self._state(t)
+        if state == BOUND:
             raise Refused("ticket-bound")
-        if t.state != UNBOUND:
-            raise Refused("attempt-closed", t.state)
+        if state != UNBOUND:
+            raise Refused("attempt-closed", state)
         return t
 
     def bind(self, ticket: str, session: str) -> Ticket:
@@ -626,11 +717,10 @@ class TicketStore:
     def status(self, attempt_id: str) -> Dict[str, object]:
         with self.lock:
             self._live()
-            self._expire_due()
             t = self._by_attempt.get(attempt_id)
             if t is None:
                 raise Refused("attempt-unknown")
-            out: Dict[str, object] = {"ticket": t.ticket, "state": t.state}
+            out: Dict[str, object] = {"ticket": t.ticket, "state": self._state(t)}
             if t.session is not None and t.state in (BOUND, RELEASED):
                 out["session"] = t.session
             return out
@@ -639,14 +729,16 @@ class TicketStore:
         """The rebuilt counts (doctor / tests): open tickets and the current UTC day's mints."""
         with self.lock:
             day = _day(self._clock())
-            return {"open": sum(1 for t in self._by_ticket.values() if t.state in OPEN),
+            return {"open": sum(1 for t in self._by_ticket.values() if self._state(t) in OPEN),
                     "today": sum(1 for t in self._by_ticket.values() if t.day == day and t.facts)}
 
     def close(self) -> None:
+        """The appender and the single-CONTROL lock both released (CONTROL's stop)."""
         with self.lock:
             if self._fd is not None:
                 os.close(self._fd)
                 self._fd = None
+            self._release()
 
 
 def _write_all(fd: int, data: bytes) -> None:

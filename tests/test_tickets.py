@@ -192,7 +192,7 @@ def test_compaction_crash_atomic_and_journal_inconsistent(rig):
     new.write_bytes(new.read_bytes().replace(one.encode(), b"x" * len(one)))
     rig.restart()
     assert not new.exists()
-    assert [x["op"] for x in rig.lines()] == ["mint", "tombstone"]
+    assert [x["op"] for x in rig.lines()] == ["tombstone", "tombstone"]   # a-1 is past V16 a day on: expired here
     assert rig.ask("RUN-TICKET-STATUS", attempt_id="a-1")["ticket"] == one
     assert rig.ask("RUN-TICKET-STATUS", attempt_id="a-2")["state"] == "cancelled"
     # a journal holding one attempt with two tickets refuses the start
@@ -302,6 +302,7 @@ def test_mint_waits_for_keys_reload_ack(rig, keys_py, monkeypatch):
     from tests import c3_rig as R3
     three, sig3 = rig.st.signed(item(3, [route()]))
     assert _crash(rig.st, three, sig3, "after_current") == -9
+    rig.control.stop()                          # one CONTROL per journal (fix 2): the in-process one stops first
     args = mint_args("a-9", routemap_generation=3)
     req = {"v": 1, "op": "RUN-TICKET-MINT", "id": 1, **args}
     seen: dict = {}
@@ -700,6 +701,27 @@ def test_attach_record_failure_unbinds_the_ticket(rig, monkeypatch):
     rig.restart()
     assert [x["op"] for x in rig.lines()] == ["mint", "bind"]
     assert rig.ask("RUN-TICKET-STATUS", attempt_id="a-1")["state"] == "bound"
+    # fix 2 (codex 4 + complement 1): the record is renamed into place but its directory fsync fails (NotDurable):
+    # the record landed, so the bind stands (no unbind), the lease controls the session, and root's retry of the
+    # same ATTACH answers `session-exists`, never `ticket-bound`; the lease's EOF revokes the session
+    from levain.slot import records as R
+    two = ticket_of(rig.mint("a-2"))
+    c2, lo2 = lease(rig, two)
+    real_put = rig.control.store.put
+
+    def landed(rec):
+        real_put(rec)
+        raise R.NotDurable("the directory fsync failed after the rename")
+    monkeypatch.setattr(rig.control.store, "put", landed)
+    again = {"lease_nonce": lo2["lease_nonce"], "sudo_uid": DISPATCH_UID, "session": "s-00000000000000a2",
+             "claims": d_attach_claims(two)}
+    assert root(rig, "ATTACH", **again)["ok"] is False
+    monkeypatch.undo()
+    assert [x["op"] for x in rig.lines()][-2:] == ["mint", "bind"]
+    assert c2.lease.used and c2.lease.session == "s-00000000000000a2"
+    assert refused(root(rig, "ATTACH", **again)) == "session-exists"
+    rig.control.lease_eof(c2.lease).join(5)
+    assert rig.control.store.get("s-00000000000000a2").state == "REVOKED"
 
 
 def test_attach_after_the_ticket_closed_refused(rig):
@@ -716,4 +738,103 @@ def test_attach_after_the_ticket_closed_refused(rig):
     assert refused(root(rig, "ATTACH", lease_nonce=lo2["lease_nonce"], sudo_uid=DISPATCH_UID, session=SESSION,
                         claims=d_attach_claims(two))) == "attempt-closed"
     assert rig.control.store.get(SESSION) is None
-    assert [x["op"] for x in rig.lines()] == ["mint", "cancel", "mint", "expire"]
+    assert [x["op"] for x in rig.lines()] == ["mint", "cancel", "mint"]   # fix 2: a read-only check journals no expire
+
+
+# ---- 3c-5 fix 2 (L3 r1): one CONTROL per journal; mint lines checked whole; atomic idempotency; stale acks --------
+
+def test_second_control_refused_while_the_first_holds_the_journal(rig):
+    # codex 1: a second CONTROL on the same journal refuses `control-running` at its start, before it compacts the
+    # journal, touches a record or unlinks the first one's socket; the first keeps serving; once it stops, the second
+    # starts and serves the same tickets
+    first = rig.mint()
+    journal = (rig.sdir / T.JOURNAL).read_bytes()
+    sock = rig.st.L / "control.sock"
+    sock.write_bytes(b"the first CONTROL's socket")                     # a stand-in: it must survive the refusal
+    tickets = T.TicketStore(rig.sdir / T.JOURNAL, rig.st.L / "policy" / "dispatch_ceiling", clock=rig.clock,
+                            ceiling_uid=os.getuid())
+    two = C.Control(C.StateStore(rig.sdir), OP_UID, dispatch_uid=DISPATCH_UID, keys_uid=KEYS_UID,
+                    routes=RM.ControlRoutes(rig.st.routes), tickets=tickets, clock=rig.clock)
+    with pytest.raises(Refused) as e:
+        C.ControlServer(two, sock).start()
+    assert e.value.name == "control-running"
+    assert [x[0] for x in two.seam_errors] == ["start"]                  # noted by name
+    assert sock.read_bytes() == b"the first CONTROL's socket"            # never unlinked
+    assert (rig.sdir / T.JOURNAL).read_bytes() == journal and not (rig.sdir / (T.JOURNAL + ".new")).exists()
+    assert ticket_of(rig.mint("a-2"))                                    # the first still appends to the live journal
+    rig.control.stop()
+    two.start()
+    assert two.handle(C.Conn(DISPATCH_UID), {"v": 1, "op": "RUN-TICKET-MINT", "id": 1, **mint_args()}) == first
+    two.stop()
+
+
+def test_mint_line_with_altered_facts_refuses_the_start(rig):
+    # codex 2: a complete canonical mint line whose facts were altered (a larger reservation) under the original
+    # request digest is never served: CONTROL's start refuses `journal-inconsistent`
+    ticket_of(rig.mint())
+    rig.control.stop()
+    [line] = rig.lines()
+    line["facts"]["reserved_microdollars"] = 4_000_000
+    assert line["request_digest"] == T.request_digest(T.check_facts(mint_args()))   # the old digest kept
+    (rig.sdir / T.JOURNAL).write_bytes(canon.canonical_bytes(line) + b"\n")
+    with pytest.raises(Refused) as e:
+        rig.restart()
+    assert e.value.name == "journal-inconsistent"
+
+
+def test_concurrent_same_attempt_mints_both_get_the_first_ticket(rig, monkeypatch):
+    # codex 3: two requests for the same new attempt both pass the first replay; the first mints, the ceiling is
+    # lowered below the reservation, then the second goes on: it answers the first ticket (and run_id), never a ceiling
+    # refusal and never a second mint line
+    real = rig.control._await_keys_serving_head
+    go, waiting = threading.Event(), threading.Event()
+    calls = []
+
+    def await_head():
+        calls.append(1)
+        if len(calls) == 1:                                              # the second request, held after its replay
+            waiting.set()
+            assert go.wait(10)
+        real()
+    monkeypatch.setattr(rig.control, "_await_keys_serving_head", await_head)
+    out = []
+    th = threading.Thread(target=lambda: out.append(rig.mint()))
+    th.start()
+    assert waiting.wait(10)
+    first = rig.mint()                                                   # the other request mints meanwhile
+    ticket_of(first)
+    write_ceiling(rig.st.L, per_run=1)                                   # the ceiling lowered between the two
+    go.set()
+    th.join(10)
+    assert out == [first]
+    assert [x["op"] for x in rig.lines()] == ["mint"]
+
+
+class StaleAckShim(KeysShim):
+    """keys' admin wire whose RELOAD ack arrives after a newer attachment superseded the one it was sent on."""
+
+    def __init__(self, k, rig) -> None:
+        super().__init__(k)
+        self.rig, self.supersede = rig, True
+
+    def call(self, op: str, **kw) -> dict:
+        ans = super().call(op, **kw)
+        if self.supersede:
+            self.rig.attach({"generation": kw["generation"], "item_sha256": kw["item_sha256"]})
+        return ans
+
+    def abort(self, epoch=None) -> None:
+        pass
+
+
+def test_stale_attachment_ack_deletes_nothing(rig):
+    # codex 5: keys lets generation 1 go in its ack, but the ack came on an attachment a newer one superseded while
+    # the RELOAD was in flight: CONTROL deletes no file. The next ack on the current attachment prunes as H5 says.
+    k = keys_on_wire(rig)
+    rig.control.keys_admin = shim = StaleAckShim(k, rig)
+    submit_gen(rig, 2, [route(host="api.z.ai")])
+    assert shim.keeps[-1] == [2] and served_gens(rig) == [2]              # keys let 1 go
+    assert rig.st.gen_files() == ["1.json", "1.sig", "2.json", "2.sig"]   # the stale ack deleted nothing
+    shim.supersede = False
+    submit_gen(rig, 3, [route()])
+    assert served_gens(rig) == [3] and rig.st.gen_files() == ["3.json", "3.sig"]

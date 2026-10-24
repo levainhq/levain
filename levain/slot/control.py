@@ -882,7 +882,18 @@ class Control:
         then its drop and the wake like every other record past live.
 
         The route maps' start pass runs first (:meth:`levain.slot.routemaps.ControlRoutes.start_pass`: an interrupted
-        activation finished, under the activation lock); keys is sent the head by the attach-time ``RELOAD``."""
+        activation finished, under the activation lock); keys is sent the head by the attach-time ``RELOAD``.
+
+        Before all of it, the ticket journal's single-CONTROL lock (3c-5 fix 2, L3 r1 codex 1:
+        :meth:`levain.slot.tickets.TicketStore.acquire`): a second CONTROL refuses ``control-running`` (noted in
+        :attr:`seam_errors`) before it finishes an activation, revokes a record, compacts the journal or, in
+        :class:`ControlServer`, unlinks the first one's socket."""
+        if self.tickets is not None:
+            try:
+                self.tickets.acquire()
+            except Refused as e:
+                self.seam_errors.append(("start", "", e))
+                raise
         if self.routes is not None:
             self.routes.start_pass()
         loaded = self.store.load()
@@ -1298,7 +1309,9 @@ class Control:
             if not lease.live:
                 raise Refused("lease-dead")
             if lease.used:
-                raise Refused("nonce-used")
+                # fix 2 (codex 4 + complement 1): the retry of an ATTACH whose record landed (whole, or NotDurable)
+                # answers what the record says, `session-exists`, never a ticket refusal
+                raise Refused("session-exists" if lease.session == session else "nonce-used")
             if lease.peer_uid != sudo_uid:
                 raise Refused("nonce-uid-mismatch")
             # §3.3: the claims CONTROL can check against its own records. An operator lease carries no
@@ -1313,6 +1326,7 @@ class Control:
                 raise Refused("claims-mismatch")
             lease.used = True
         facts: dict[str, object] | None = None
+        landed: R.NotDurable | None = None
         try:
             if lease.ticket is not None:
                 held = self._ticket_store().holdable(lease.ticket)
@@ -1330,8 +1344,10 @@ class Control:
                                          lease_live=True, event_kind="state",
                                          updated_at=R.timestamp(self._clock()))
                     self.store.put(rec)
-                except R.NotDurable:
-                    raise                            # the record was renamed into place: it exists, the bind stands
+                except R.NotDurable as e:
+                    # the record was renamed into place: it exists and the bind stands, so the ATTACH is SETTLED
+                    # below as one that landed (fix 2, codex 4 + complement 1), then its failure is answered
+                    landed = e
                 except BaseException:
                     # 3c-5 fix 1 (L2 4a): no record was written, so the binding is undone and journaled; if that
                     # append fails the store is poisoned and the restart's H8 pass unbinds it instead
@@ -1347,12 +1363,16 @@ class Control:
                 if not lease.live and self._leases.get(nonce) is lease:
                     self._retire(lease)                  # its EOF came while ATTACH held it: nothing binds it now
             raise
+        # published for a record that landed, NotDurable included: the lease controls it (its EOF revokes it, a CAS
+        # reads the lease live) and `used` stays set, so a retry answers `session-exists`
         with self._mu:
             lease.session = session
             self._session_lease[session] = lease
             died = not lease.live
         if died:   # the lease read EOF between the nonce check and the bind: revoke as its EOF would
             self._spawn_revoke(session)
+        if landed is not None:
+            raise landed
         if facts is not None:
             return {"generation": 0, "ticket_facts": facts}   # §3.3: the ticket's facts, for render's check
         return {"generation": 0}
@@ -1844,17 +1864,22 @@ class Control:
             self.seam_errors.append(("reload", "", e))
             return
         acked = got.get("generation") == want["generation"] and got.get("item_sha256") == want["item_sha256"]
+        served = got.get("served")
+        prune = (acked and self.routes is not None and type(served) is list
+                 and all(type(g) is int for g in served) and want["generation"] in served)
         with self._mu:
-            if no is not None and self._attach is not None and self._attach.attach_no == no and acked:
+            current = no is not None and self._attach is not None and self._attach.attach_no == no
+            if current and acked:
                 self._keys_serves = want
                 self._serves_cv.notify_all()
-        served = got.get("served")
-        if (acked and self.routes is not None and type(served) is list
-                and all(type(g) is int for g in served) and want["generation"] in served):
-            try:
-                self.routes.delete_unserved(frozenset(served), keep)
-            except Exception as e:   # noqa: BLE001 - files left behind are deleted after a later ack
-                self.seam_errors.append(("reload-prune", "", e))
+            # fix 2 (codex 5): an ack deletes files only when it came on the CURRENT attachment, the same check that
+            # records `_keys_serves`; a superseded attachment's late ack deletes nothing (the newer keys may still
+            # serve a generation that ack no longer lists). Under `_mu`, so no attachment supersedes it mid-delete.
+            if current and prune:
+                try:
+                    self.routes.delete_unserved(frozenset(served), keep)   # type: ignore[union-attr, arg-type]
+                except Exception as e:   # noqa: BLE001 - files left behind are deleted after a later ack
+                    self.seam_errors.append(("reload-prune", "", e))
 
     def _keep_generations(self, head_gen: int) -> frozenset:
         """RELOAD's ``keep`` (head ruling H5): the active generation, plus every route-map generation an OPEN ticket
@@ -1899,8 +1924,22 @@ class Control:
             return {"ticket": again.ticket, "run_id": again.run_id}
         if facts["kind"] == "verifier":
             raise Refused("verifier-unknown", "no verifier generation is active")
-        self._await_keys_serving_head()
+        try:
+            self._await_keys_serving_head()
+        except Refused:
+            # fix 2 (codex 3): a same-attempt request that raced a mint in while this one waited answers the first
+            # ticket, never the route state's refusal
+            again = store.replay(attempt, facts)
+            if again is not None:
+                return {"ticket": again.ticket, "run_id": again.run_id}
+            raise
         with self._activation:
+            # fix 2 (codex 3): every mint runs under the activation lock, so this replay is atomic with the mint below:
+            # a same-attempt request that lost the race answers the first ticket BEFORE any route-state or ceiling
+            # check (an activation or a lowered ceiling between the two never refuses it)
+            again = store.replay(attempt, facts)
+            if again is not None:
+                return {"ticket": again.ticket, "run_id": again.run_id}
             self._check_route_facts(facts)
             t = store.mint(attempt, facts, new_handle)
             return {"ticket": t.ticket, "run_id": t.run_id}
@@ -1947,7 +1986,7 @@ class Control:
         if facts["model_requested"] not in entry.backends:
             raise Refused("ticket-field:model_requested", "not one of the route's models")
         assert self.routes is not None
-        types = routemaps.base_route_types(self.routes.dir)
+        types = routemaps.base_route_policy_types(self.routes.dir)   # the base map parsed whole (fix 2, codex 6)
         for rid in facts["egress_routes"]:            # type: ignore[union-attr]
             if types.get(rid) != "egress":
                 raise Refused("ticket-field:egress_routes", f"{rid} is not a base-map egress route")
@@ -2290,7 +2329,13 @@ def serve(config: ServeConfig) -> int:
         for sig in (signal.SIGTERM, signal.SIGINT):
             restore.append((sig, signal.signal(sig, lambda *_a: stop.set())))
     try:
-        server.start()
+        try:
+            server.start()
+        except Refused as e:
+            # 3c-5 fix 2: a refused start (``control-running``: another CONTROL holds the ticket journal) is logged
+            # by name; nothing was served and the other CONTROL's socket is untouched
+            print(f"levain CONTROL: start refused: {e.name}", file=sys.stderr, flush=True)
+            raise
         if config.ready is not None:
             config.ready(server)
         while not stop.wait(0.5):

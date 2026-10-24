@@ -712,7 +712,9 @@ def resolve_outcome(ans: dict) -> tuple:
                 if not run_ok(ans["run"]):
                     return ("failed",)
                 claims = {**claims, "run": dict(ans["run"])}
-            elif claims.get("kind") in RUN_KINDS:
+            elif ("kind" in claims and type(claims["kind"]) is not str) or claims.get("kind") in RUN_KINDS:
+                # 3c-5 fix 2 (complement 5): a `kind` that is not a string (an unhashable list would raise in the
+                # set test) is no plain session either
                 return ("refused", "run-unknown")
             return ("answer", {"session": session, "claims": claims})
         return ("failed",)

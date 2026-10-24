@@ -36,7 +36,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 from levain.authority_sig import VerifierUnavailable, verify_link_sig
 from levain.broker.policy import (BodyPolicyError, DispatchRoute, PolicyError, RoutePolicy, body_policy_problem,
-                                  parse_routemap)
+                                  parse_base_map, parse_routemap)
 from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
 from levain.dispatch.routemap_rules import envelope_problem
@@ -206,6 +206,25 @@ def base_route_types(routes_dir: Path) -> Dict[str, object]:
     if not isinstance(doc, dict) or not isinstance(doc.get("routes"), list):
         raise Refused("config-invalid:base", "base.json has no routes list")
     return {r["route"]: r.get("type") for r in doc["routes"] if isinstance(r, dict) and isinstance(r.get("route"), str)}
+
+
+def base_route_policy_types(routes_dir: Path) -> Dict[str, str]:
+    """Each route id `L/routes/base.json` names, with its type, from the map parsed WHOLE as keys parses it
+    (`policy.parse_base_map`: every entry, both formats, no id twice), for a ticket's `egress_routes` (3c-5 fix 2, L3 r1
+    codex 6): a base map keys would refuse never lets a mint accept an egress id. A map that is unreadable, does not
+    parse, or holds any defect refuses `config-invalid:base`. (:func:`base_route_types` stays the collision rule's
+    id read.)"""
+    try:
+        data = _read(Path(routes_dir) / "base.json", BASE_MAP_MAX)
+    except OSError:
+        data = None
+    if data is None:
+        raise Refused("config-invalid:base", "base.json is unreadable")
+    try:
+        parsed = parse_base_map(canon.parse(data))
+    except Exception as e:   # noqa: BLE001 - any entry's failure, of whatever type, refuses the map whole (as keys)
+        raise Refused("config-invalid:base", f"base.json does not parse whole ({type(e).__name__})") from None
+    return {rid: pol.type for rid, pol in parsed.items()}
 
 
 # --- the one checker -----------------------------------------------------------------------------------------------
@@ -682,5 +701,7 @@ class KeysRoutes:
 
 __all__ = ["CONFIG_FORMAT", "CONFIG_NAMESPACE", "CURRENT", "Checked", "ControlRoutes", "DISPATCH_DIR", "FAULT_POINTS",
            "HEAD", "ITEM_KEYS", "ITEM_MAX_BYTES", "KEYS_HEAD", "KEYS_HEAD_FORMAT", "KIND", "KeysRoutes", "Pin",
-           "SIGNATURE_MAX", "TRUST_FORMAT", "TRUST_JSON", "TRUST_PUB", "Trust", "base_route_ids", "base_route_types", "check_item",
+           "SIGNATURE_MAX", "TRUST_FORMAT", "TRUST_JSON", "TRUST_PUB", "Trust", "base_route_ids",
+           "base_route_policy_types",
+           "base_route_types", "check_item",
            "item_digest", "pin_of", "policy_digest", "read_trust"]
