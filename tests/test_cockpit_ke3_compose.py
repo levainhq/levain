@@ -239,12 +239,14 @@ def test_cx6_a_rediscovery_that_withdraws_the_compose_verb_cannot_leave_a_compos
     (1, {}, None),                                                                                  # absent keys: valid
     (1, {"default": ["daemon"], "transient_prefix": "seat:", "gone_match": "no live seat"}, None),
     (1, {"default": []}, None),
-    (1, {"default": ["cli", "nobody"]}, "not in the enum"),
-    (1, {"default": ["cli", " cli"]}, "repeated"),
+    (1, {"default": ["cli", "nobody"]}, "not an enum id"),
+    (1, {"default": [" cli"]}, "not an enum id"),                                                 # the page compares exactly
+    (1, {"default": ["cli", "cli"]}, "repeated"),
     (1, {"default": "cli"}, "list of ids"),
-    (1, {"transient_prefix": ""}, "non-empty"),
-    (1, {"gone_match": ""}, "non-empty"),
-    (1, {"gone_match": 3}, "non-empty"),
+    (1, {"transient_prefix": ""}, "other than whitespace"),
+    (1, {"transient_prefix": "  "}, "other than whitespace"),
+    (1, {"gone_match": " "}, "other than whitespace"),
+    (1, {"gone_match": 3}, "other than whitespace"),
     (0, {"default": ["cli"]}, "recipient field only"),                                               # on the text field
     (0, {"transient_prefix": "seat:"}, "recipient field only"),
     (0, {"gone_match": "gone"}, "recipient field only"),

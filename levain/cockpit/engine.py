@@ -2923,17 +2923,18 @@ def _v_form(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
                 dflt = f["default"]
                 if not (isinstance(dflt, list) and all(_is_str(x) for x in dflt)):
                     raise _bad(spec, f"{w}.default", "must be a list of ids from the enum")
+                # the page presses a default id only when it equals an enum id exactly (it compares the raw strings), so
+                # the check is exact too: a padded spelling would register here and press nothing there
                 picked: set[str] = set()
                 for j, x in enumerate(dflt):
-                    t = x.strip()
-                    if t not in seen_ids:
-                        raise _bad(spec, f"{w}.default[{j}]", f"{t!r} is not in the enum")
-                    if t in picked:
-                        raise _bad(spec, f"{w}.default[{j}]", f"{t!r} is repeated (after trimming)")
-                    picked.add(t)
+                    if x not in en:
+                        raise _bad(spec, f"{w}.default[{j}]", f"{x!r} is not an enum id (exactly as spelled there)")
+                    if x in picked:
+                        raise _bad(spec, f"{w}.default[{j}]", f"{x!r} is repeated")
+                    picked.add(x)
             for key in ("transient_prefix", "gone_match"):
-                if key in f and not (_is_str(f[key]) and f[key]):
-                    raise _bad(spec, f"{w}.{key}", "must be a non-empty string")
+                if key in f and not (_is_str(f[key]) and f[key].strip()):
+                    raise _bad(spec, f"{w}.{key}", "must be a string with something other than whitespace in it")
         else:
             for key in ("enum", "default", "transient_prefix", "gone_match"):
                 if key in f:

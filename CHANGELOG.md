@@ -6,15 +6,25 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+- **A compose card pre-selects only the readers its provider declares.** A provider that relied on 0.11.21's built-in
+  default reader, seat tap or departed-seat recovery must declare the keys below. Without them, the card starts with
+  nothing pressed, so a message goes to everyone. Tapping a seat on the agents graph opens its agent page, and a
+  departed reader's refusal is shown as it came back. The departed-reader notice now reads "that reader is gone, choose again".
+
 ### Fixed
 - **The cockpit message card's default reader and its departed-reader recovery are declared by the provider, not built
-  into the page.** 0.11.21 pre-selected one named agent and recognised one refusal wording in the page's own script. A
-  compose `recipient` field now takes three optional keys, validated beside `enum` and refused on any other field type:
-  `default` (a list of `enum` ids pressed at the start; none means nothing pressed, which sends to everyone),
-  `transient_prefix` (the ids that can leave the roster between draw and send) and `gone_match` (a case-insensitive
-  substring of the refusal that says one has). Without `transient_prefix` and `gone_match` the recovery never fires,
-  and the agents graph's tap on a seat reaches the message card only through the declared `transient_prefix`. This
-  corrects the 0.11.21 entry: the page pre-selects nothing a provider does not declare.
+  into the page.** 0.11.21 pre-selected one named agent and recognised one refusal wording in the page's own script,
+  and its entry described that agent as Levain's own. A compose `recipient` field now takes three optional keys,
+  validated beside `enum` and refused on any other field type:
+  - `default`: `enum` ids pressed at the start, spelled exactly as in `enum`. Empty or absent means nothing is pressed.
+  - `transient_prefix`: the start of every id that can leave the roster between draw and send. The agents graph
+    presses the chip whose id is `transient_prefix` followed by the seat's roster name.
+  - `gone_match`: a case-insensitive substring of the refusal that says a chosen id has left. It is matched against
+    the error code and the message together, as the page receives them. A stable error code is the safest thing to
+    match.
+  The departed-reader recovery needs both `transient_prefix` and `gone_match`. The graph tap needs only
+  `transient_prefix`.
 
 ### Known edges
 - A metered call is priced by the request's `model` alone. A fallback list (`models`) or a `route` in the body is not
