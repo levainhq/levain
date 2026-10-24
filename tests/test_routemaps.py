@@ -491,6 +491,8 @@ def keys_py(request):
     if not os.path.exists(request.param):
         pytest.skip("no " + request.param)
     if not B2.h11_available(request.param):
+        if os.environ.get("CI"):  # CI installs h11 for /usr/bin/python3 (test.yml): a skip there would hide the root run
+            pytest.fail("h11 is not importable by %s under CI" % request.param)
         pytest.skip("h11 is not importable by %s (named skip, not a pass)" % request.param)
     return request.param
 
