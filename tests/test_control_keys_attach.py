@@ -582,7 +582,7 @@ def test_admin_verbs_idempotent(py):
             reloads = []
             for _ in range(2):
                 try:
-                    reloads.append(await in_thread(lambda: admin.call("RELOAD", generation=1)))
+                    reloads.append(await in_thread(lambda: admin.call("RELOAD", generation=1, item_sha256="0" * 64)))
                 except C.AdminRefused as e:
                     reloads.append(e.answer)
             out["reload"] = reloads
@@ -611,8 +611,8 @@ def test_admin_verbs_idempotent(py):
 
     out = run(go())
     assert out["register"] == [{}, {}] and out["arm"] == [{}, {}], out
-    assert out["reload"] == [{"id": out["reload"][0]["id"], "ok": False, "refused": "reload-unsupported"},
-                             {"id": out["reload"][1]["id"], "ok": False, "refused": "reload-unsupported"}], out
+    assert out["reload"] == [{"id": out["reload"][0]["id"], "ok": False, "refused": "routemap-invalid:current"},
+                             {"id": out["reload"][1]["id"], "ok": False, "refused": "routemap-invalid:current"}], out
     assert out["no_k"] and out["q"].get("status") == 200, out
     assert out["drop"] == [{"dropped": True}, {"dropped": False}], out
     assert out["overrun"] == [{"id": 7, "ok": True}] * 2 and len(out["overrun_recs"]) == 1, out
