@@ -45,8 +45,9 @@ def _serving(root: Path, **kw: Any) -> Iterator[tuple[str, Any]]:
 
 
 def _call(url: str, path: str, body: Any = None, *, token: "str | None" = TOK, host: "str | None" = None,
-          sfs: "str | None" = None, ctype: str = "application/json") -> "tuple[int, Any]":
-    headers = {}
+          sfs: "str | None" = None, ctype: str = "application/json",
+          extra: "dict[str, str] | None" = None) -> "tuple[int, Any]":
+    headers = dict(extra or {})
     if token is not None:
         headers["X-Levain-Write-Token"] = token
     if host is not None:
@@ -398,24 +399,41 @@ def test_a_signer_on_a_server_with_no_token_to_carry_is_refused_before_binding(t
     httpd.server_close()                                   # a token given: served
 
 
-def test_a_page_origin_changed_after_construction_signs_nothing(cockpit) -> None:
-    """complement LOW 2: make_server keeps the page_origin it validated; a Signer whose page_origin moved since then
-    (wider, malformed or cleared) is refused on every sign POST, and nothing is written."""
+def test_a_page_origin_cannot_move_once_a_server_holds_the_signer(cockpit) -> None:
+    """codex L3 r2 item 2: the Signer's page_origin is pinned when make_server takes it (the one source of truth: the
+    Signer verifies against it, and nothing can change it under a running ceremony). A later set is refused, the
+    pin keeps verifying, and setting the same value again is harmless."""
     signer, pk = cockpit["signer"], cockpit["pk"]
     status, ch = _challenge(cockpit, "a")
     assert status == 200
     for moved in (f"https://{RP}:9999", "https://evil.example", None):
-        signer.page_origin = moved
-        status, out = _call(cockpit["url"], f"/cockpit/sign/{RID}/answer", pk.assertion(ch["challenge"], PINNED))
-        assert status == 503 and out["error"] == "unavailable" and "page_origin" in out["message"], (moved, out)
-        assert _challenge(cockpit, "a")[0] == 503
-        assert _call(cockpit["url"], f"/cockpit/sign/{RID}/deny", {"request_sha256": _sha(cockpit)})[0] == 503
-        assert _no_result(cockpit) and not (cockpit["qdir"] / "sign" / f"{RID}.denied").exists()
-    signer.page_origin = PINNED
+        with pytest.raises(ValueError, match="page_origin"):
+            signer.page_origin = moved
+        assert signer.page_origin == PINNED
+    signer.page_origin = PINNED                            # the same page: no change, no refusal
+    status, out = _call(cockpit["url"], f"/cockpit/sign/{RID}/answer", pk.assertion(ch["challenge"], f"https://{RP}:9999"))
+    assert status == 422 and _no_result(cockpit), out      # the pin, not a moved origin, judged the assertion
     status, ch = _challenge(cockpit, "a")
-    assert status == 200
     assert _call(cockpit["url"], f"/cockpit/sign/{RID}/answer", pk.assertion(ch["challenge"], PINNED))[0] == 200
     assert _verifies(cockpit)
+
+
+def test_a_refused_signer_is_not_pinned_and_a_pinned_one_is_checked_again(tmp_path: Path) -> None:
+    """make_server pins only a page_origin it accepted: one refused before binding can still be corrected. A Signer
+    already pinned by one server is checked again by the next, and pins nothing new."""
+    pk = _Passkey()
+    signer = Signer(tmp_path / "q", (NS,), RP, lambda: {pk.key.fingerprint: pk.key})
+    signer.page_origin = f"http://{RP}:8443"
+    with pytest.raises(ValueError, match="page_origin"):
+        make_server(_source(tmp_path), host="127.0.0.1", port=0, write_token=TOK, signer=signer)
+    signer.page_origin = PINNED
+    httpd = make_server(_source(tmp_path), host="127.0.0.1", port=0, write_token=TOK, signer=signer)
+    httpd.server_close()
+    with pytest.raises(ValueError, match="page_origin"):
+        signer.page_origin = f"https://{RP}"
+    httpd = make_server(_source(tmp_path), host="127.0.0.1", port=0, write_token=TOK, signer=signer)
+    httpd.server_close()
+    assert signer.page_origin == PINNED
 
 
 def test_a_held_or_failing_queue_lock_is_a_503_and_never_an_unlocked_write(cockpit, monkeypatch) -> None:
@@ -486,3 +504,121 @@ def test_extra_hosts_with_a_chat_host_is_refused_before_binding(tmp_path: Path) 
     httpd.server_close()                                   # an empty list names no proxy
     with _serving(tmp_path / "inst", extra_hosts=[RP]) as (_url, httpd):
         assert httpd.levain_source.write_scope.install_root is not None and RP in httpd.proxied_hosts
+
+
+# --- L3 r2 on 0867f2c0: ONE off-box rule (item 1), redundant extra hosts (item 3) ---------------------------------
+
+_PROXY_HEADERS = ({"X-Forwarded-For": "100.101.102.103"}, {"X-Forwarded-Host": f"{RP}:8447"},
+                  {"Forwarded": "for=100.101.102.103"}, {"Tailscale-User-Login": "someone@example.com"},
+                  {"tailscale-user-name": "Someone"})
+
+
+def test_a_proxy_header_makes_a_loopback_host_off_box_for_every_route(cockpit) -> None:
+    """complement MED (L3 r2): a tailnet peer through tailscale serve can send ``Host: 127.0.0.1``, which the Host gate
+    admits and the bind cannot tell from a local request. A proxy header says it came through a proxy: every route
+    then needs the token, reads included (tailscale serve adds X-Forwarded-Host and Tailscale-User-*, measured
+    10-23). Plain loopback with no proxy header keeps token-free reads."""
+    url = cockpit["url"]
+    st, manifest = _call(url, "/cockpit/manifest.json", token=None, host="127.0.0.1")
+    assert st == 200, manifest
+    panel = "/cockpit/panel/" + next(iter(manifest["panels"])) + ".json"
+    reads = ("/substrate.json", "/cockpit/manifest.json", panel, "/cockpit/sign.json")
+    posts = {f"/cockpit/sign/{RID}/challenge": {"signer_fp": cockpit["pk"].key.fingerprint, "request_sha256": "x"},
+             f"/cockpit/sign/{RID}/answer": {"authenticator_data": "", "client_data_json": "", "signature": ""},
+             f"/cockpit/sign/{RID}/deny": {"request_sha256": "x"}}
+    for proxy in _PROXY_HEADERS:
+        for host in ("127.0.0.1", "localhost", f"127.0.0.1:{url.rsplit(':', 1)[1]}"):
+            for path in reads:
+                st, body = _call(url, path, token=None, host=host, extra=proxy)
+                assert st == 403 and "token" in body["message"], (proxy, host, path, st, body)
+                assert _call(url, path, host=host, extra=proxy)[0] == 200, (proxy, host, path)
+            for path, req in posts.items():
+                assert _call(url, path, req, token=None, host=host, extra=proxy)[0] == 403, (proxy, host, path)
+                assert _call(url, path, req, host=host, extra=proxy)[0] != 403, (proxy, host, path)
+    for path in reads[:3]:
+        assert _call(url, path, token=None, host="127.0.0.1")[0] == 200, path      # today's local reads
+    st, sub = _call(url, "/substrate.json", extra=_PROXY_HEADERS[0])
+    assert sub["write_token_required"] is True
+
+
+def _read_only(root: Path) -> SubstrateSource:
+    return SubstrateSource(anneal=AnnealPaths.from_db(root / "memory.db"), write_scope=None)
+
+
+def test_a_read_only_source_through_an_extra_host_needs_the_token(tmp_path: Path) -> None:
+    """codex item 7 (L3 r2): off-box is off-box whether or not the source is writable. A read-only source served
+    through an extra host (or with a proxy header) needs the surface token on every route, reads included."""
+    httpd = make_server(_read_only(tmp_path), host="127.0.0.1", port=0, surface_tokens={"browser": TOK},
+                        extra_hosts=[RP])
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{httpd.server_address[1]}"
+        for path in ("/substrate.json", "/cockpit/manifest.json"):
+            assert _call(url, path, token=None, host="127.0.0.1")[0] == 200, path       # loopback: as today
+            for host, extra in ((RP, None), (f"{RP}:8447", None), ("127.0.0.1", _PROXY_HEADERS[0])):
+                st, body = _call(url, path, token=None, host=host, extra=extra)
+                assert st == 403 and "token" in body["message"], (path, host, st, body)
+                assert _call(url, path, host=host, extra=extra)[0] == 200, (path, host)
+        # a write route on a read-only source: the token first off-box, then its own read-only refusal
+        assert _call(url, "/edit", {}, token=None, host=RP)[0] == 403
+        assert _call(url, "/edit", {}, host=RP)[0] == 422
+        assert _call(url, "/", token=None, host=RP)[0] == 200                         # the app shell stays open
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_the_read_only_mesh_carve_out_does_not_reach_a_proxied_request(tmp_path: Path) -> None:
+    """Head ruling on Q1 (L3 r2, spore-220): a read-only no-install source bound off-loopback stays token-free for
+    reads (iPad viewing, test_web_server's carve-out test), but the carve-out is for the bare bind only. The same
+    source given extra_hosts and no surface token is refused before binding: every proxied request needs one, so
+    that server would answer every proxied request 403. With a token it binds; with no proxy named it binds as today."""
+    with pytest.raises(ValueError, match="extra_hosts.*no surface token"):
+        make_server(_read_only(tmp_path), host="127.0.0.1", port=0, extra_hosts=[RP])
+    httpd = make_server(_read_only(tmp_path), host="127.0.0.1", port=0, extra_hosts=[RP],
+                        surface_tokens={"browser": TOK})
+    httpd.server_close()
+    httpd = make_server(_read_only(tmp_path), host="127.0.0.1", port=0)
+    assert httpd.surface_tokens == {}
+    httpd.server_close()                                   # loopback, no proxy named: served as today
+
+
+def test_a_proxied_request_to_a_read_only_mesh_bind_needs_the_token(tmp_path: Path) -> None:
+    """The bare read-only mesh bind is token-free (spore-220); a request to it carrying a proxy header is not."""
+    httpd = make_server(_read_only(tmp_path), host="127.0.0.1", port=0, surface_tokens={"browser": TOK})
+    httpd.is_loopback_bind = False                          # what a real tailnet bind sets (no mesh interface here)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{httpd.server_address[1]}"
+        assert _call(url, "/substrate.json", token=None)[0] == 200                     # the carve-out, as today
+        assert _call(url, "/edit", {}, token=None)[0] == 422                            # its honest read_only refusal
+        for proxy in _PROXY_HEADERS:
+            assert _call(url, "/substrate.json", token=None, extra=proxy)[0] == 403, proxy
+            assert _call(url, "/substrate.json", extra=proxy)[0] == 200, proxy
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("name", ["localhost", "LOCALHOST.", "127.0.0.1"])
+def test_a_loopback_name_in_extra_hosts_is_refused_as_redundant(tmp_path: Path, name: str) -> None:
+    """codex LOW (L3 r2): a loopback name in extra_hosts would turn every ordinary local request into an off-box one.
+    The gate already admits it, so it is refused before binding as redundant. (``::1`` is refused by the name rule.)"""
+    with pytest.raises(ValueError, match="extra_hosts.*already"):
+        make_server(_source(tmp_path), host="127.0.0.1", port=0, write_token=TOK, extra_hosts=[name])
+
+
+def test_the_bound_name_in_extra_hosts_is_refused_as_redundant(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="extra_hosts.*already"):
+        make_server(_source(tmp_path), host="localhost", port=0, write_token=TOK, extra_hosts=["localhost"])
+    import dataclasses
+
+    src = _source(tmp_path)
+    no_install = dataclasses.replace(src, install_root=None,
+                                     write_scope=dataclasses.replace(src.write_scope, install_root=None))
+    with pytest.raises(ValueError, match="extra_hosts.*already"):
+        make_server(no_install, host="100.64.0.7", port=0, write_token=TOK, extra_hosts=["100.64.0.7"])

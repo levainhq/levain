@@ -505,6 +505,7 @@ class _PhoneServer(ThreadingHTTPServer):
         # serve a page on localhost under another port (on an https name the proxy's origin carries no port)
         self.page_origin = f"http://localhost:{self.server_address[1]}" if rp_id == "localhost" else None
         signer.page_origin = self.page_origin
+        signer.pin_page_origin(lambda _origin: None)     # this port's own page: no caller can move it afterwards
         self.signer = signer
         from levain.dispatch.phone import DispatchPhone
 

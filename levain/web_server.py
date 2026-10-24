@@ -48,7 +48,8 @@ Sovereignty boundary (load-bearing, not incidental):
   local uid, so every write carries a per-surface write token on every bind
   (``_WRITE_TOKEN_HEADER``; a writable serve with none given mints a per-launch one). The
   ``/chat`` routes take their own per-launch token (``_CHAT_TOKEN_HEADER``; spore-1310).
-  Reads on a loopback bind stay token-free. Around the token, a write still passes the
+  Reads on a loopback bind stay token-free unless the request came through a proxy (an
+  ``extra_hosts`` Host or a proxy header: then it is off-box and every route needs the token). Around the token, a write still passes the
   Host allowlist and two CSRF layers: (1) ``Sec-Fetch-Site`` must be absent (a non-browser client like the
   operator's own curl) or ``same-origin`` (our own dashboard page) — a hostile
   cross-site page's request carries ``cross-site`` and is refused; (2) the body
@@ -311,7 +312,8 @@ def _store_fault(what: str, exc: BaseException) -> dict[str, str]:
 # The write token header. spore-129 introduced it for an off-loopback writable bind; since K2a
 # (design §4.3) every write carries a surface token in it on EVERY bind, loopback included,
 # constant-time compared against the surface tokens ``make_server`` holds. Off-box, the same
-# token also gates the substrate-bearing reads (spore-220); loopback reads stay token-free.
+# token also gates the substrate-bearing reads (spore-220), and every route of a PROXIED request (an extra host or a
+# proxy header) whatever the source; loopback reads with no proxy header stay token-free.
 _WRITE_TOKEN_HEADER = "X-Levain-Write-Token"
 _HEADER_SAFE_TOKEN = re.compile(r"[\x21-\x7e]+")   # printable ASCII, no spaces: it travels in a header
 
@@ -330,6 +332,10 @@ _CHAT_TOKEN_HEADER = "X-Levain-Chat-Token"
 # The actual bound address is added to this set in ``make_server``. (Lowercase —
 # the Host check normalizes case before comparing, per RFC 7230 §2.7.3.)
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# A request carrying one of these came through a proxy (tailscale serve adds X-Forwarded-Host and Tailscale-User-*,
+# measured 10-23), so it is off-box whatever its Host says: a tailnet peer can send ``Host: 127.0.0.1`` through one
+_PROXY_HEADERS = frozenset({"x-forwarded-for", "x-forwarded-host", "forwarded"})
+_PROXY_HEADER_PREFIX = "tailscale-user-"
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -726,7 +732,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # ``surface_tokens`` name no browser surface, and None on a read-only server.
     is_loopback_bind: bool
     # the make_server extra_hosts: a request whose Host names one came through a proxy on this machine (from
-    # loopback, so is_loopback_bind cannot see it) and meets the off-box read gate (DESIGN_SIGN D3, head 1023+21)
+    # loopback, so is_loopback_bind cannot see it) and is off-box for the token gate (DESIGN_SIGN D3, L3 r2)
     proxied_hosts: frozenset[str]
     write_token: str | None
     # K2a (design §4.3, §9): one write token per surface (``browser``, ``flowconnect``), required on
@@ -772,6 +778,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # The caller's sign-request Signer (DESIGN_SIGN D4), its page_origin pinned to the page this cockpit is served on;
     # None serves no sign route.
     signer: "Signer | None" = None
+    # that pinned page_origin (the Signer refuses any other once make_server pins it), for what the page is told
     signer_page_origin: "str | None" = None
     # The change stream (levain.cockpit.stream): set per instance in __init__, before the socket binds,
     # because a failed bind runs server_close and that reads these.
@@ -869,19 +876,25 @@ class _Handler(GuardedHandler):
     server: _LevainHTTPServer  # narrow the type for typed attribute access
 
     def _write_token_required(self) -> bool:
-        """True iff this surface is writable AND the request is off-box (an off-loopback bind, or a Host
-        naming an ``extra_hosts`` entry): the off-box half of the token
-        rule, which gates the substrate-bearing READS (spore-220) and every non-write POST
-        (spore-129). Writes are gated by ``_writes_need_credential`` on every bind (K2a); the
-        frontend's ``write_token_required`` signal is the OR of the two. Loopback-bound or
-        read-only → False (a read-only mesh bind stays token-free — iPad/iPhone VIEWING is
-        unauthenticated by design). A request whose Host names an ``extra_hosts`` entry is off-box
-        whatever the bind: a proxy on this machine delivers it from loopback (head 1023+21)."""
-        return (
-            (not self.server.is_loopback_bind
-             or host_header_allowed(self.headers.get("Host"), self.server.proxied_hosts))
-            and self.server.levain_source.write_scope is not None
-        )
+        """True iff this request needs a surface token on EVERY route, the substrate-bearing READS included
+        (spore-220, spore-129): it is PROXIED, or it reaches a WRITABLE surface on an off-loopback bind.
+
+        PROXIED (L3 r2 on 0867f2c0, whatever the source's write scope): its Host names an ``extra_hosts`` entry, or
+        it carries a proxy header (``X-Forwarded-For``, ``X-Forwarded-Host``, ``Forwarded``, any
+        ``Tailscale-User-*``). A proxy on this machine delivers a tailnet peer's request from loopback, with whatever
+        Host the peer sent, so neither the bind nor the Host alone can tell it from a local one. make_server refuses
+        extra_hosts on a server with no surface token; a proxy header reaching a loopback server with no token at all
+        is refused (fail closed: a proxy nobody named gets nothing).
+
+        The spore-220 carve-out stays: a READ-ONLY source on an off-loopback bind, not proxied, serves reads
+        token-free (iPad/iPhone viewing; make_server allows that bind only for a no-install source). Writes are also
+        gated by ``_writes_need_credential`` on every bind (K2a); the frontend's ``write_token_required`` signal is
+        the OR of the two. Plain loopback with no proxy header stays token-free."""
+        if host_header_allowed(self.headers.get("Host"), self.server.proxied_hosts) or any(
+                k.lower() in _PROXY_HEADERS or k.lower().startswith(_PROXY_HEADER_PREFIX)
+                for k in self.headers.keys()):
+            return True
+        return not self.server.is_loopback_bind and self.server.levain_source.write_scope is not None
 
     def _credential(self) -> dict[str, Any]:
         """The credential THIS request carries, verified here and never claimed (design §5.1): a
@@ -1073,12 +1086,7 @@ class _Handler(GuardedHandler):
         signer = self.server.signer
         if signer is None:     # the route is not served without one; an explicit check survives `python -O`
             return {"error": "not_found", "message": "no such route"}, 404
-        if signer.page_origin != self.server.signer_page_origin or self.server.signer_page_origin is None:
-            # the Signer verifies against its own attribute: one moved since make_server checked it would widen or
-            # break the pin with no error, so every sign POST stops until it is the validated page again
-            return {"error": error_word(503), "message": (
-                f"the signer's page_origin is not the page this cockpit was built for "
-                f"({self.server.signer_page_origin}): nothing is signed")}, 503
+        # the Signer verifies against its own page_origin, which make_server pinned: nothing can move it under this call
         try:
             return getattr(signer, action)(request_id, req), 200
         except SignRefused as exc:
@@ -1272,13 +1280,13 @@ class _Handler(GuardedHandler):
             return
 
         # OFF-BOX READ GATE (spore-220): the substrate-bearing reads must carry the SAME device-held
-        # token the writes do WHEN this surface is writable AND bound off-loopback — else any tailnet
-        # node reads the full store (``/substrate.json`` / ``/recall.json`` / ``/job.json`` / a
-        # downstream ``extra_json`` view) token-free over plain HTTP. Same predicate + constant-time
+        # token the writes do WHEN ``_write_token_required``: a PROXIED request (an extra host or a
+        # proxy header; writable source or not, L3 r2), or a writable surface bound off-loopback —
+        # else any tailnet node reads the full store (``/substrate.json`` / ``/recall.json`` /
+        # ``/job.json`` / a downstream ``extra_json`` view) token-free. Same predicate + constant-time
         # compare as ``do_POST`` (the two shared helpers), so a read is never served under weaker auth
-        # than a write. Two deliberate carve-outs stay token-free: (1) a read-ONLY mesh bind
-        # (``write_scope`` None → not required) — iPad/iPhone VIEWING stays open, the whole point of a
-        # read-only mesh serve; (2) the APP-SHELL static assets (the built-in html/css/js + any
+        # than a write. Two deliberate carve-outs stay token-free: (1) a read-ONLY mesh bind, not
+        # proxied (spore-220: iPad/iPhone VIEWING); (2) the APP-SHELL static assets (the built-in html/css/js + any
         # downstream ``extra_asset``) — they carry NO substrate data, and the browser must load them
         # to supply the token on the data fetches (the bootstrap). Everything else off-box requires
         # the token, so a 404-class path returns a uniform 403 to an unauthed node (no path probing).
@@ -1593,11 +1601,11 @@ class _Handler(GuardedHandler):
         if self._refuse_write_origin():
             return
         # The write gate: a write route on a writable surface needs a surface token on every bind
-        # (K2a). Any other POST on an off-box writable surface needs it too (spore-129/220), with
-        # the same constant-time compare as the read gate in _route, so a write is never served
-        # under weaker auth than a read. Both predicates require write_scope (writability): a
-        # READ-ONLY surface has no write path, so it falls through to the 422 'read_only' refusal
-        # below, NOT a token-403 [codex L3].
+        # (K2a). Every POST for which _write_token_required holds needs it too (spore-129/220; a proxied
+        # one whatever the source, L3 r2), with the same constant-time compare as the read gate in _route,
+        # so a write is never served under weaker auth than a read. A READ-ONLY surface not proxied (loopback,
+        # or its token-free mesh bind) falls through to the 422 'read_only' refusal below, NOT a token-403
+        # [codex L3]; a proxied one needs the token first.
         route = self.path.split("?", 1)[0]
         if _is_write_route(route) and self._writes_need_credential() and not self._off_box_token_valid():
             # K2a (design §4.3): every write carries a credential on every bind, loopback included;
@@ -1608,8 +1616,7 @@ class _Handler(GuardedHandler):
         sign = _sign_route(route) if self.server.signer is not None else None
         if sign is not None and not self._off_box_token_valid():
             return self._reject(403, "credential_required", "missing or invalid write token")
-        if (self._write_token_required() and not _is_write_route(route)
-                and not self._off_box_token_valid()):
+        if self._write_token_required() and not self._off_box_token_valid():
             return self._reject(403, "forbidden", "missing or invalid write token")
         # CSRF layer 2: require application/json (a cross-origin page cannot send it
         # without a CORS preflight this server never answers).
@@ -1783,7 +1790,9 @@ def make_server(
     - a READ-ONLY, NO-INSTALL source (``write_scope is None`` AND ``install_root is None`` —
       e.g. the embedder's self-ops cockpit over a bare anneal store) MAY bind off-loopback: the write
       route 422s and there is no seed/config to expose, so the private mesh (Tailscale's
-      WireGuard) is the access boundary;
+      WireGuard) is the access boundary and its reads stay token-free (spore-220: iPad viewing).
+      That carve-out is for the bare bind only: a PROXIED request (an ``extra_hosts`` Host or a
+      proxy header) needs the token whatever the source (L3 r2 on 0867f2c0);
     - a WRITABLE source MAY bind off-loopback ONLY with ``write_token`` (spore-129) — the
       off-box governance factor that replaces loopback-is-auth. Then POST /edit requires the
       ``X-Levain-Write-Token`` header (constant-time compared). Since K2a every write needs
@@ -1805,9 +1814,10 @@ def make_server(
     reverse proxy on this machine forwards (tailscale serve passes the browser's ``Host`` through, port included).
     Each is a bare ``name`` (a port in an entry is refused); the gate compares names only, so a request Host of
     ``name:8443`` is admitted. Anything else is a ``ValueError`` before binding, and so is any entry beside a
-    ``chat_host`` (chat is loopback-only). A request whose Host names one is OFF-BOX for the read gate: the
-    substrate reads need the token exactly as on an off-box bind, since the proxy delivers every tailnet request
-    from loopback."""
+    ``chat_host`` (chat is loopback-only), any loopback name or the bound name (already admitted, and naming one would
+    make every local request off-box), and extra_hosts on a server with no surface token. A request whose Host names
+    one, or that carries a proxy header, is OFF-BOX: every route needs the token exactly as on an off-box bind, since
+    the proxy delivers every tailnet request from loopback."""
     # Wildcard / public binds are refused for ANY source — a non-loopback bind is for
     # ONE specific private/mesh interface, never every interface or the internet.
     reason = _rejected_bind_host(host)
@@ -1850,6 +1860,7 @@ def make_server(
                 "write_token=<shared secret the device holds>, or bind loopback "
                 "(127.0.0.1 / localhost), where the server mints a per-launch write token."
             )
+
     # Validate downstream routes BEFORE binding a socket — a collision is a packaging
     # bug, caught at registration, never a silent shadow at request time.
     extra_assets = dict(extra_assets or {})
@@ -1984,11 +1995,21 @@ def make_server(
 
         if not isinstance(signer, _Signer):
             raise ValueError("refusing signer: it must be a levain.consent.sign.Signer")
-        problem = (page_origin_problem(signer.rp_id, signer.page_origin) if signer.page_origin is not None
-                   else "its page_origin is not set (the page this cockpit is served on, which the caller pins)")
-        if problem is not None:
-            raise ValueError(f"refusing signer: {problem}")
+        rp_id = signer.rp_id
+
+        def problem(origin: "str | None") -> "str | None":
+            found = (page_origin_problem(rp_id, origin) if origin is not None
+                     else "its page_origin is not set (the page this cockpit is served on, which the caller pins)")
+            return None if found is None else f"refusing signer: {found}"
+
+        # checked and pinned under the Signer's own lock: from here no other page_origin can be set (L3 r2 item 2)
+        signer.pin_page_origin(problem)
     proxied_hosts = _extra_hosts(extra_hosts)
+    redundant = proxied_hosts & (_LOOPBACK_HOSTS | {str(host).rstrip(".").lower()})
+    if redundant:
+        # the gate admits loopback and the bound name already; named here, every local request would read as off-box
+        raise ValueError(f"refusing extra_hosts {sorted(redundant)}: the Host gate already admits loopback and the "
+                         "bound name; extra_hosts names only what a proxy on this machine forwards")
     if proxied_hosts and chat_host is not None:
         # chat is loopback-only (above); a name a proxy forwards puts this loopback server on another network
         raise ValueError("refusing extra_hosts with --chat: a proxied name reaches this server from off the box, "
@@ -2028,6 +2049,11 @@ def make_server(
         raise ValueError("refusing surface tokens: two surfaces share one token")
     if source.write_scope is not None and not tokens:
         tokens["browser"] = secrets.token_urlsafe(32)
+    if proxied_hosts and not tokens:
+        # a request through a proxied name is off-box and needs a surface token on every route (L3 r2)
+        raise ValueError("refusing extra_hosts: every request through a proxied name needs a surface token, reads "
+                         "included, and this server has no surface token (a read-only source given no write_token "
+                         "or surface_tokens); pass a write_token")
     if signer is not None and not tokens:
         # every sign route needs a surface token (DESIGN_SIGN D4), so a signer here would be a permanent 403
         raise ValueError("refusing signer: this server has no surface token for its sign routes to require (a "
@@ -2045,7 +2071,7 @@ def make_server(
     httpd.chat_host = chat_host
     httpd.signer = signer
     # the page_origin make_server validated above; a sign POST is refused if the Signer's has moved since
-    httpd.signer_page_origin = signer.page_origin if signer is not None else None
+    httpd.signer_page_origin = signer.page_origin if signer is not None else None     # pinned above
     # The shared cockpit (levain.cockpit). A downstream passes its own (the kernel's providers plus
     # its panels); None means the kernel's default over this substrate, built on first request.
     # Its start() (refresher threads) is the caller's when it passes its own.
@@ -2144,6 +2170,10 @@ def make_server(
             + ("" if _is_install_bearing(source) else " or pass a write_token for an off-box bind")
             + "."
         )
+    if str(httpd.server_address[0]).lower() in proxied_hosts:
+        bound = str(httpd.server_address[0])
+        httpd.server_close()
+        raise ValueError(f"refusing extra_hosts {[bound]}: the Host gate already admits the bound address ({bound})")
     # Allow the loopback names + the exact bound address (covers a 127.0.0.x bind) + the caller's extra_hosts,
     # normalized lowercase to match the Host check; any other Host is refused.
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()} | proxied_hosts
