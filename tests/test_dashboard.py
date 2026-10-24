@@ -1280,17 +1280,48 @@ class TestHealthOracles:
         now = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
         st = SimpleNamespace(last_wrap_at="2026-10-24T10:00:00", total_wraps=5, audit_enabled=True,
                              audit_write_failures=0, prune_behind=False)
-        ok = health_oracles(st, 900, 900, now=now)
+        ok = health_oracles(st, "a" * 64, "a" * 64, now=now)
         assert ok == {"save_age_hours": 2.0, "projection_converged": True, "audit_backlog": 0,
                       "audit_prune_behind": False}
-        assert health_oracles(st, 900, 1000, now=now)["projection_converged"] is False
+        assert health_oracles(st, "a" * 64, "b" * 64, now=now)["projection_converged"] is False
         # nothing to compare is None, never a guessed ok; a fresh store has no save age
         fresh = SimpleNamespace(last_wrap_at=None, total_wraps=0, audit_enabled=False,
                                 audit_write_failures=0, prune_behind=False)
         assert health_oracles(fresh, None, None, now=now) == {
             "save_age_hours": None, "projection_converged": None, "audit_backlog": None, "audit_prune_behind": None}
         st.audit_write_failures = 3
-        assert health_oracles(st, 900, 900, now=now)["audit_backlog"] == 3
+        assert health_oracles(st, "a" * 64, "a" * 64, now=now)["audit_backlog"] == 3
+
+    def test_convergence_is_the_content_hash_not_the_size(self, tmp_path: Path) -> None:
+        import hashlib
+        from anneal_memory import Store
+
+        from levain.dashboard import AnnealPaths, build_substrate_view
+
+        db = tmp_path / "memory.db"
+        with Store(db) as store:
+            a = store.record("episode A", "decision")
+            store.wrap_started(token="w1", episode_ids=[a.id])
+            store.wrap_completed(1, 20, wrap_token="w1", episode_ids=[a.id])
+        md = tmp_path / "memory.continuity.md"
+        md.write_text("## State\nfoc\n", encoding="utf-8")
+
+        def converged() -> bool | None:
+            v = build_substrate_view(AnnealPaths.from_db(db))
+            assert v.health is not None
+            return v.health.projection_converged
+
+        assert converged() is None  # the wrap row has no hash (an old row): unknown, never converged
+        with Store(db) as store:  # a second wrap, committed WITH the hash of the text it saved
+            b = store.record("episode B", "decision")
+            store.wrap_started(token="w2", episode_ids=[b.id])
+            store.wrap_completed(1, 20, wrap_token="w2", episode_ids=[b.id], pair_id="p2",
+                                 content_hash=hashlib.sha256(md.read_bytes()).hexdigest())
+        assert converged() is True
+        md.write_text("## State\nfoO\n", encoding="utf-8")  # same length, different text
+        assert converged() is False
+        md.unlink()
+        assert converged() is None
 
     def test_a_live_view_carries_the_oracle_keys_and_never_a_link_count_as_health(self, tmp_path: Path) -> None:
         from anneal_memory import Store

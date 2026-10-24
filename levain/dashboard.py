@@ -42,6 +42,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -302,7 +303,7 @@ class Health:
     # has no field: anneal refuses to open a newer-schema store, which lands in ``errors["store"]`` (a view with
     # no Health at all), so a Health that exists is a store that opened.
     save_age_hours: float | None = None  # age of the last COMMITTED save (last_wrap_at), not of any episode
-    projection_converged: bool | None = None  # the continuity file's size matches what the last wrap committed
+    projection_converged: bool | None = None  # sha256 of the continuity file == the last wrap's content_hash; None = unknown
     audit_backlog: int | None = None  # audit entries the trail LOST (durable, monotonic); None = audit not enabled
     audit_prune_behind: bool | None = None  # retention pruning is failing; the trail is growing past its bound
 
@@ -362,13 +363,37 @@ class AssociationGraph:
         }
 
 
+def _last_wrap_hash(db: Path) -> str | None:
+    """``wraps.content_hash`` of the last COMMITTED wrap (anneal >= 1.0.0: sha256 hex of the continuity text that
+    wrap saved), read-only. anneal's public API does not return it. None when there is no wrap, the column is
+    absent, the row predates it (NULL), or the db cannot be read: unknown, never a guess."""
+    try:
+        con = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
+        try:
+            row = con.execute("SELECT content_hash FROM wraps ORDER BY id DESC LIMIT 1").fetchone()
+        finally:
+            con.close()
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+    return row[0] if row and isinstance(row[0], str) and row[0] else None
+
+
+def _file_hash(path: Path) -> str | None:
+    """sha256 hex of the continuity file's bytes (what anneal hashed is the text it wrote); None if unreadable."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
 def health_oracles(
-    status: Any, last_wrap_chars: int | None, file_chars: int | None, *, now: datetime | None = None
+    status: Any, last_wrap_hash: str | None, file_hash: str | None, *, now: datetime | None = None
 ) -> dict[str, Any]:
     """The four substrate oracles from facts the store already states (works on anneal 1.0.0; nothing here needs
-    1.0.2). Recency is the last COMMITTED save, convergence is the file's size against the size that save wrote
-    (a mismatch means the file was changed or lost since: the DB and the projection disagree), the audit backlog
-    is what the trail lost. Each is None when it cannot be told, never a guessed ok."""
+    1.0.2). Recency is the last COMMITTED save, convergence is the sha256 of the continuity file against the
+    content_hash that save recorded (a mismatch means the file was changed or lost since: the DB and the
+    projection disagree; a same-length edit shows), the audit backlog is what the trail lost. Each is None when
+    it cannot be told, never a guessed ok."""
     age: float | None = None
     raw = getattr(status, "last_wrap_at", None)
     if raw:
@@ -380,8 +405,8 @@ def health_oracles(
         except ValueError:
             age = None
     converged: bool | None = None
-    if getattr(status, "total_wraps", 0) and last_wrap_chars is not None and file_chars is not None:
-        converged = last_wrap_chars == file_chars
+    if getattr(status, "total_wraps", 0) and last_wrap_hash and file_hash:
+        converged = last_wrap_hash == file_hash
     enabled = bool(getattr(status, "audit_enabled", False))
     failures = getattr(status, "audit_write_failures", None)
     return {
@@ -1815,8 +1840,8 @@ def build_substrate_view(
                     wrap_in_progress=status.wrap_in_progress,
                     **health_oracles(
                         status,
-                        max(wraps, key=lambda w: w.wrapped_at or "").continuity_chars if wraps else None,
-                        cont_chars,
+                        _last_wrap_hash(paths.episodic_db),
+                        _file_hash(paths.continuity_md),
                     ),
                 )
             except data_faults as exc:
