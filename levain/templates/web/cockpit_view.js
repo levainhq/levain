@@ -494,6 +494,16 @@
     for (const k of HEALTH_FIGURES) need(m.has(k) && isNum(m.get(k)), "metric " + k);
     need(WRITE_PATHS.indexOf(m.get("write path")) >= 0, "metric write path");
     const n = (k) => m.get(k);
+    // the substrate oracles are optional (the kernel omits one it could not read): carried only when well-formed
+    const age = m.has("last save (hours ago)") && isNum(m.get("last save (hours ago)")) ? m.get("last save (hours ago)") : null;
+    const proj = m.get("projection");
+    const projOk = proj === "converged" ? true : (proj === "diverged" || proj === "file missing" ? false : null);
+    // a present-but-unrecognised value is surfaced, never silently null; "unknown" carries the kernel's note
+    const projKnown = proj === undefined || proj === null || ["converged", "diverged", "file missing", "unknown"].indexOf(proj) >= 0;
+    const projNote0 = m.get("projection note");
+    const projNote = proj === "file missing" ? "continuity file missing"
+      : (!projKnown ? "unknown (unrecognised value)" : (typeof projNote0 === "string" && projNote0 ? projNote0 : null));
+    const audit = m.has("audit write failures") && isNum(m.get("audit write failures")) ? m.get("audit write failures") : null;
     const last = Array.isArray(wraps) && wraps[0] ? wraps[0] : null;
     return {
       write_path_live: writePathStatus(m.get("write path"), n("wraps")) === "live", status: writePathStatus(m.get("write path"), n("wraps")),
@@ -502,6 +512,9 @@
       graduations_validated_total: n("graduated"), graduations_demoted_total: n("demoted"),
       last_wrap_at: last ? last.wrapped_at : null, continuity_chars: last ? last.continuity_chars : null,
       wrap_history_unavailable: wraps === "unavailable",
+      save_age_hours: age, projection_converged: projOk,
+      projection_note: projNote,
+      audit_backlog: audit,
     };
   }
 

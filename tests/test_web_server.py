@@ -845,12 +845,28 @@ class TestHttpContract:
                 _s, headers, body = _get(base + route)
                 assert int(headers["Content-Length"]) == len(body), route
 
-    def test_head_sends_headers_and_framing_no_body(self, tmp_path: Path) -> None:
+    def test_head_sends_headers_and_framing_no_body(self, tmp_path: Path, monkeypatch) -> None:
         """HEAD must report the Content-Length the GET WOULD return, with no body —
-        or an HTTP/1.1 keep-alive connection desyncs."""
+        or an HTTP/1.1 keep-alive connection desyncs. /substrate.json is not static: it carries the store's
+        save age, an unrounded float whose repr length varies with the clock (1.7369444444444446e-05 vs
+        1.73694444444444e-05), so two GETs a millisecond apart differ in length. The test holds the clock the
+        health read uses fixed, so HEAD and GET are compared under the same state."""
+        import levain.dashboard as dashboard
+        from datetime import datetime as _dt, timedelta, timezone
+
+        frozen = _dt.now(timezone.utc) + timedelta(hours=1)
+
+        class _Frozen(_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return frozen if tz is None else frozen.astimezone(tz)
+
+        monkeypatch.setattr(dashboard, "datetime", _Frozen)
         with _serving(_store_with_data(tmp_path)) as (base, _):
             _gs, ghead, gbody = _get(base + "/substrate.json")
             hs, hhead, hbody = _request(base + "/substrate.json", method="HEAD")
+            _gs2, _gh2, gbody2 = _get(base + "/substrate.json")
+        assert gbody == gbody2  # the premise: under the frozen clock the body is stable
         assert hs == 200
         assert hbody == b""  # no body on HEAD
         # but the framing matches what the GET body would have been
