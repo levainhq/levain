@@ -12,8 +12,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   compose `recipient` field now takes three optional keys, validated beside `enum` and refused on any other field type:
   `default` (a list of `enum` ids pressed at the start; none means nothing pressed, which sends to everyone),
   `transient_prefix` (the ids that can leave the roster between draw and send) and `gone_match` (a case-insensitive
-  substring of the refusal that says one has). Without `transient_prefix` and `gone_match` the recovery never fires.
-  This corrects the 0.11.21 entry above: the page pre-selects nothing a provider does not declare.
+  substring of the refusal that says one has). Without `transient_prefix` and `gone_match` the recovery never fires,
+  and the agents graph's tap on a seat reaches the message card only through the declared `transient_prefix`. This
+  corrects the 0.11.21 entry: the page pre-selects nothing a provider does not declare.
+
+### Known edges
+- A metered call is priced by the request's `model` alone. A fallback list (`models`) or a `route` in the body is not
+  read, and neither is the model the provider's response says ran. No route in this release reaches a vendor that
+  honours them; the vendor routes that do will refuse both and settle from the model that ran.
 
 ## [0.11.22] — 2026-10-24
 

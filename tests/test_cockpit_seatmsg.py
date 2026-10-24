@@ -161,7 +161,7 @@ def test_a_departed_seat_refusal_unpresses_its_chip_and_keeps_the_draft_when_the
     out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_value(), "agents")}, {"eval": stub}, {"eval": _tap("n3")},
                                {"until": "document.activeElement.classList.contains('tray-dump-ta') && JSON.stringify(%s) == '[\"seat:ledgerline\"]'" % PRESSED},
                                {"eval": SEND},
-                               {"until": "(%s.querySelector('.edit-msg') || {}).textContent == 'that seat is gone, choose again'" % BOX},
+                               {"until": "(%s.querySelector('.edit-msg') || {}).textContent == 'that reader is gone, choose again'" % BOX},
                                {"eval": "JSON.stringify([%s, %s.querySelector('.tray-dump-ta').value])" % (PRESSED, BOX)}])
     pressed, draft = json.loads(out[-1])
     assert pressed == [] and draft == "hi", out
@@ -171,7 +171,7 @@ def test_a_departed_seat_refusal_unpresses_its_chip_and_keeps_the_draft_when_the
 def test_a_frozen_box_takes_no_pick_from_the_graph(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     probe = ("(() => { const b = %s; b.querySelector('.tray-dump-btn').disabled = true; "
-             "return JSON.stringify([b.ckPick(['seat:ledgerline']), window.LevainDashboard.messageTo('seat:ledgerline'), %s]); })()") % (BOX, PRESSED)
+             "return JSON.stringify([b.ckPick(['seat:ledgerline']), window.LevainDashboard.messageTo('ledgerline'), %s]); })()") % (BOX, PRESSED)
     out = _run(tmp_path, src, [{"eval": probe}], page="#write_token=T")
     assert json.loads(out[-1]) == [False, False, ["fanin"]], out
 
@@ -181,7 +181,7 @@ REFUSE = ("const f = window.fetch; window.fetch = (u, o) => (o && o.method === '
           "? Promise.resolve(new Response(JSON.stringify({error: 'no_live_seat'}), {status: 422, headers: {'content-type': 'application/json'}})) : f(u, o); ")
 TWO = ["cli", "fanin", "seat:ledgerline", "seat:other"]
 SAY = "(%s.querySelector('.edit-msg') || {}).textContent" % BOX
-GONE = "that seat is gone, choose again"
+GONE = "that reader is gone, choose again"
 
 
 @needs_browser

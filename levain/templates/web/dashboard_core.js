@@ -3776,6 +3776,7 @@
       box.dataset.composeKey = chipCtl.pickKey;
       box.ckBusy = () => go.disabled;                 // mid-send or at the confirm: the recipient is frozen
       box.ckPick = (values) => { if (go.disabled) return false; chipCtl.set(values); return true; };   // the agents graph's tap on a seat (messageTo, below)
+      box.ckPrefix = typeof chipCtl.f.transient_prefix === "string" ? chipCtl.f.transient_prefix : "";   // messageTo's name -> chip id
     }
     const msg = el("span", "edit-msg", "");
     row.append(go, msg);
@@ -3814,7 +3815,7 @@
       return false;
     };
     async function seatGone() {
-      const notice = "that seat is gone, choose again";
+      const notice = "that reader is gone, choose again";
       const startBox = box, gen = composeGen[chipCtl.pickKey];
       const tp = chipCtl.f.transient_prefix;
       const snap = chipCtl.read().filter((v) => v.startsWith(tp));     // the failed send's own transient readers: the only ones this recovery may clear
@@ -6184,12 +6185,17 @@
   }
 
   // The agents graph's tap on a seat: press exactly that seat's chip on the compose card, bring the card into view and focus its message
-  // box. A seat is messageable IFF its chip id is among the chips the card holds NOW (the enum changes with the roster; a lane, the
-  // desk and an exited seat are never in it): a false answer means "not a seat you can message", and the caller keeps its own click.
-  function messageTo(chipId) {
-    if (typeof chipId !== "string" || !chipId) return false;
-    const chip = Array.from(document.querySelectorAll('[data-ck-compose="recipient"]'))
-      .find((c) => c.dataset.value === chipId && !c.closest("#levain-modal") && !c.disabled);
+  // box. The graph passes the seat's NAME; its chip id is the card's declared `transient_prefix` + that name (a card that declares no
+  // prefix addresses no seat by name). A seat is messageable IFF that id is among the chips the card holds NOW (the enum changes with the
+  // roster): a false answer means "not a seat you can message", and the caller keeps its own click.
+  function messageTo(name) {
+    if (typeof name !== "string" || !name) return false;
+    const chip = Array.from(document.querySelectorAll('[data-ck-compose="recipient"]')).find((c) => {
+      const b = c.closest(".tray-dump");
+      return b && typeof b.ckPrefix === "string" && b.ckPrefix && c.dataset.value === b.ckPrefix + name
+        && !c.closest("#levain-modal") && !c.disabled;
+    });
+    const chipId = chip ? chip.dataset.value : "";
     const box = chip ? chip.closest(".tray-dump") : null;
     if (!chip || !box || typeof box.ckPick !== "function" || (typeof box.ckBusy === "function" && box.ckBusy())) return false;
     const panel = chip.closest("[data-ck-panel]");
