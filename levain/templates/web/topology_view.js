@@ -169,6 +169,7 @@
   // needs_first_what and needs_first are capped at 120 characters for the title and a data attribute; the card id is never cut: one that is not a
   // non-empty string or is longer than 120 is refused (display-only), never rewritten.
   const NEED_CAP = 120;
+  const needSeen = new Map();
   const capStr = (x) => (typeof x === "string" ? x.slice(0, NEED_CAP) : "");
   function needsOf(o) {
     if (!isObj(o) || !Number.isInteger(o.needs_open) || o.needs_open <= 0) return null;
@@ -178,14 +179,16 @@
   // inner goes inside the node (or hub) group; outer, set only when the badge is a button, is a sibling group at the same coordinates (no interactive
   // role nested in the node's role=button) drawn ABOVE every node, holding the pill; under is the transparent 44 CSS px tap pad (at the graph's scale),
   // drawn BENEATH every node so a tap on a node's own shape reaches the node (message the seat) and only the margin around the pill reaches the card.
-  function needMark(nd, cx, cy, rr, ang, opts, label, owner, scale) {
+  // deco, set only for the desk: {art, bx, by, rx}: the desk's own drawing (a group already placed at the hub) in place of the plain ring, and the badge's
+  // centre as an offset from the hub, with its corner radius. A seat's mark passes none and is the red ring it always was.
+  function needMark(nd, cx, cy, rr, ang, opts, label, owner, scale, deco) {
     const g = sv("g", { "data-needs": String(nd.n) }, "tv-need");
-    g.appendChild(sv("circle", { cx: num(cx), cy: num(cy), r: num(rr) }, "tv-needring"));
-    const bx = cx + Math.cos(ang) * rr, by = cy + Math.sin(ang) * rr, txt = "!" + (nd.n > 9 ? "9+" : String(nd.n)), w = txt.length > 2 ? 30 : 24;
+    if (deco) g.appendChild(deco.art); else g.appendChild(sv("circle", { cx: num(cx), cy: num(cy), r: num(rr) }, "tv-needring"));
+    const bx = deco ? cx + deco.bx : cx + Math.cos(ang) * rr, by = deco ? cy + deco.by : cy + Math.sin(ang) * rr, txt = "!" + (nd.n > 9 ? "9+" : String(nd.n)), w = txt.length > 2 ? 30 : 24;
     const b = sv("g", { "data-needbadge": nd.card, "data-needfirst": nd.first, "data-needfor": owner }, "tv-needbadge");
     const tip = nd.what || (nd.n + " decision" + (nd.n === 1 ? "" : "s") + " waiting on you");
     const openable = !!nd.card && !!opts && typeof opts.openCard === "function";
-    b.appendChild(sv("rect", { x: num(bx - w / 2), y: num(by - 10), width: w, height: 20, rx: 10 }, "tv-needpill"));
+    b.appendChild(sv("rect", { x: num(bx - w / 2), y: num(by - 10), width: w, height: 20, rx: deco ? deco.rx : 10 }, "tv-needpill"));
     b.appendChild(sv("text", { x: num(bx), y: num(by + 5), "text-anchor": "middle" }, "tv-needtxt", txt));
     b.appendChild(sv("title", null, null, tip));
     if (openable) {
@@ -205,6 +208,26 @@
     }
     g.appendChild(b);
     return { inner: g, outer: null, under: null };
+  }
+
+
+  // The desk's mark, direction B (annunciator): a segmented arc hugging the core, 12 slots with gaps, one lit per open need (the visual caps at 12; the badge
+  // carries the true count), unlit slots a faint track; the arc opens at 4 o'clock where the "!N" tag sits on it. Segments ease in once, only the ones that
+  // are new (all of them on arrival); a rebuild at the same count draws them still. The label rides HUB_LIFT px higher while the desk is marked.
+  const HUB_LIFT = 6;
+  const pol = (r, deg) => [num(r * Math.sin(deg * Math.PI / 180)), num(-r * Math.cos(deg * Math.PI / 180))];     // clockwise from 12 o'clock, relative to the centre
+  function hubDeco(nd, cx, cy, fresh) {
+    const art = sv("g", { transform: "translate(" + num(cx) + " " + num(cy) + ")" }, "tv-hubmark tv-annun");
+    const lit = Math.min(12, nd.n), from = fresh.prev === undefined ? 0 : Math.min(12, Math.max(0, fresh.prev)), R = 36, start = 140, slot = 320 / 12, gap = 4;
+    for (let i = 0; i < 12; i++) {
+      const a0 = start + i * slot + gap / 2, a1 = start + (i + 1) * slot - gap / 2, p0 = pol(R, a0), p1 = pol(R, a1);
+      const on = i < lit, arrives = on && i >= from;
+      const s = sv("path", { d: "M " + p0[0] + " " + p0[1] + " A " + R + " " + R + " 0 0 1 " + p1[0] + " " + p1[1] }, "tv-an-seg" + (on ? " on" : "") + (arrives ? " arrive" : ""));
+      if (arrives) s.style.setProperty("--i", String(i - from));
+      art.appendChild(s);
+    }
+    const p = pol(R, 120);
+    return { art, bx: p[0], by: p[1], rx: 4 };
   }
 
   function dot(state) { const d = el("i", "tv-dot " + state); d.setAttribute("aria-hidden", "true"); return d; }
@@ -915,7 +938,7 @@
   }
 
   // ---- the SVG ----
-  function drawGraph(v, L, edges, measure, opts, scale) {
+  function drawGraph(v, L, edges, measure, opts, scale, fresh) {
     const svg = sv("svg", { viewBox: "0 0 " + L.LW + " " + L.H, role: "group", "aria-label": "Agents graph", preserveAspectRatio: "xMidYMid meet" }, "tv-graph");
     const nodes = arr(v.nodes), byId = new Map(nodes.map((n) => [n.id, n]));
     const lost = lostMap(v), bxs = graphBoxes(v, L, measure);
@@ -951,11 +974,11 @@
     hg.appendChild(sv("circle", { cx: num(h.x), cy: num(h.y), r: h.r }, "tv-hubbody"));
     hg.appendChild(sv("circle", { cx: num(h.x), cy: num(h.y), r: 9 }, "tv-hubcore" + (running ? " run" : "")));
     const hsub = bxs.hubText, hr = bxs.hub;
-    hg.appendChild(sv("rect", { x: num(hr.x), y: num(hr.y), width: num(hr.w), height: hr.h, rx: 7 }, "tv-lblbg"));
-    hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 26), "text-anchor": "middle" }, "tv-hubname", hubLabel));
-    hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 10), "text-anchor": "middle" }, "tv-hubsub", hsub));
-    const hubNeed = needsOf(v.hub);
-    const hubMark = hubNeed ? needMark(hubNeed, h.x, h.y, h.r + 14, Math.PI / 4, opts, hubLabel || "the desk", "hub", scale) : null;
+    const hubNeed = needsOf(v.hub), lift = hubNeed ? HUB_LIFT : 0;          // a marked desk's label rides a few px higher so the mark never touches it
+    hg.appendChild(sv("rect", { x: num(hr.x), y: num(hr.y - lift), width: num(hr.w), height: hr.h, rx: 7 }, "tv-lblbg"));
+    hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 26 - lift), "text-anchor": "middle" }, "tv-hubname", hubLabel));
+    hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 10 - lift), "text-anchor": "middle" }, "tv-hubsub", hsub));
+    const hubMark = hubNeed ? needMark(hubNeed, h.x, h.y, h.r + 14, Math.PI / 4, opts, hubLabel || "the desk", "hub", scale, hubDeco(hubNeed, h.x, h.y, fresh || {})) : null;
     if (hubMark) hg.appendChild(hubMark.inner);
     svg.appendChild(hg);
     if (hubMark && hubMark.under) under.appendChild(hubMark.under);
@@ -1153,6 +1176,9 @@
   function agentsLens(v, opts) {
     release();
     const wrap = el("div", "tv-agents");
+    // what the desk's mark last showed: undefined = it just arrived, a number = the count it had (a rebuild at the same data replays nothing)
+    const fresh = { prev: needSeen.get("hub") };
+    if (!(opts && opts.still)) { const hn = needsOf(v.hub); if (hn) needSeen.set("hub", hn.n); else needSeen.delete("hub"); }
     const stage = el("div", "tv-stage");
     const hint = el("span", "tv-hint", "Click a node for its page. Hover for the face.");
     stage.appendChild(hint);
@@ -1203,7 +1229,7 @@
       if (streamStop) { streamStop(); streamStop = null; }
       if (svgNode && root.document.activeElement && svgNode.contains(root.document.activeElement)) pending = focusKey(root.document.activeElement) || pending;
       if (svgNode) svgNode.remove();
-      const g = drawGraph(v, L, edges, measure, opts, scale);
+      const g = drawGraph(v, L, edges, measure, opts, scale, fresh);
       svgNode = g.svg;
       if (phone) svgNode.style.width = Math.round(LW * scale) + "px";
       stage.insertBefore(svgNode, canvas);
