@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.23] — 2026-10-24
+
 ### Added
 - **The cockpit's grant "revoke" button signs with your passkey.** On a cockpit served with a `signer=` over the same
   consent queue its grant cards come from, the button
@@ -14,6 +16,16 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `GET /cockpit/grant/list.json` and `POST /cockpit/grant/<id>/revoke-challenge` and `.../revoke`, ride the sign
   routes' gate. Everywhere else the button still copies `levain consent grant revoke`, and the copy line stays under
   the signing button.
+- **A grant card says why a passkey cannot revoke it.** When the page you are on cannot ask your passkey for a revoke
+  (a passkey made on `localhost`, or a page address the passkey would refuse), the grant list names the reason and
+  points to `levain consent grant revoke` instead of offering a button that fails. The phone page's Grants tab and the
+  cockpit's grant card both do this.
+- **The agents graph marks who is waiting on you.** The desk and any seat with an open decision carry a red mark and a
+  "!N" count ("9+" past nine). The desk's mark is an engraved bezel that lights once when a decision arrives, with the
+  count on a short callout beside it; a seat's mark is a red ring. A provider sets `needs_open` on the hub or a node,
+  and may add `needs_first_card` (the id of the first decision's card): then the count is a button that opens that
+  card, and tapping the node itself still opens or messages the seat. Every animation stops by itself (the bezel
+  lights once, a seat's ring flashes a few times), and none runs under reduced motion.
 
 ### Changed
 - **A passkey revoke signed on a port is accepted.** The authority log now takes a passkey's `revoke_grant` signed on
@@ -23,8 +35,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `https://<name>`.
 - **A compose card pre-selects only the readers its provider declares.** A provider that relied on 0.11.21's built-in
   default reader, seat tap or departed-seat recovery must declare the keys below. Without them, the card starts with
-  nothing pressed, so a message goes to everyone. Tapping a seat on the agents graph opens its agent page, and a
-  departed reader's refusal is shown as it came back. The departed-reader notice now reads "that reader is gone, choose again".
+  nothing pressed, so a message goes to everyone. Tapping a seat on the agents graph presses that seat's chip only
+  when the card declares `transient_prefix` and the seat is among its readers; otherwise it opens the agent page, as
+  before. A departed reader's refusal is shown as the provider sent it. The departed-reader notice now reads "that
+  reader is gone, choose again".
 
 ### Fixed
 - **The cockpit message card's default reader and its departed-reader recovery are declared by the provider, not built

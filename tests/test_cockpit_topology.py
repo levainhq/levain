@@ -88,6 +88,14 @@ def test_the_spec_shape_is_accepted_whole():
     v = _good()
     v["conflicts"] = None                   # not tracked: null, never an empty list read as "no conflicts"
     assert _panel(v)["status"] == "ok"
+    m = copy.deepcopy(_good())          # the decision mark's keys are optional, null where unknown, and a good set is accepted
+    m["hub"].update(needs_open=2, needs_first="np-a1", needs_first_card="np:np-a1", needs_first_what="ship it? " * 13)
+    m["nodes"][0].update(needs_open=0)
+    m["nodes"][1].update(needs_open=1, needs_first=None, needs_first_card=None, needs_first_what=None)
+    assert _panel(m)["status"] == "ok", _panel(m)
+    # the two text strings are clipped by the page, never refused for length; a card id of exactly 120 code points (astral) is accepted
+    m["hub"].update(needs_first="x" * 500, needs_first_what="y" * 500, needs_first_card="\U0001f600" * 120)
+    assert _panel(m)["status"] == "ok", _panel(m)
     empty = {**_good(), "groups": [], "nodes": [], "conflicts": [], "tasks": [], "lost_if_closed": []}
     assert _panel(empty)["status"] == "empty"
 
@@ -153,6 +161,13 @@ MALFORMED = [
     ("lost_if_closed.0.dirty_names.0", "src/a.py", "basename"),
     ("lost_if_closed.0.branches", "main", "list of strings"),
     ("errors", "nope", "list of strings"),
+    ("hub.needs_open", -1, "value.hub.needs_open"),
+    ("hub.needs_open", 1.5, "value.hub.needs_open"),
+    ("hub.needs_open", "2", "value.hub.needs_open"),
+    ("hub.needs_first_card", "np:a\u202eb", "invisible or format character"),
+    ("nodes.0.needs_first_card", "x" * 121, "longer than 120"),
+    ("nodes.1.needs_first_what", "a\u200bb", "invisible or format character"),
+    ("nodes.1.needs_first_what", 7, "value.nodes[1].needs_first_what"),
 ]
 
 
