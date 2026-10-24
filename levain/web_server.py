@@ -2470,6 +2470,9 @@ def make_server(
             card_queue = (reader.directory if reader.directory is not None else default_queue_dir()) \
                 if hasattr(reader, "directory") else None
             if card_queue is not None and Path(card_queue).resolve() == Path(sign_queue).resolve():
+                # the cards' queue is PINNED to the one just compared: a default queue re-resolved per request (a
+                # LEVAIN_HOME changed after start) could otherwise move the cards off the queue the revoke is bound to
+                reader.directory = Path(card_queue).resolve()
                 httpd.grant_phone = GrantPhone(sign_queue, signer.rp_id, signer.page_origin, signer.keys,
                                                lambda: sign_root(sign_queue))
         if cockpit is not None:

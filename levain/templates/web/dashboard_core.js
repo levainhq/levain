@@ -5709,8 +5709,12 @@
       if (!sent && !revoked) return;
       // the grants again: a revoked grant leaves the slot, and the slot keeps what the revoke said
       grantRead = null;
-      const live = slot && slot.isConnected ? slot : document.querySelector(".grant-slot");
-      if (live) setTimeout(() => grantFill(live), 1500);
+      // the slot is resolved when the timer fires, not before: a redraw in the wait replaces it, and a fill into the
+      // detached one would also win the fill sequence over the live slot's own fill
+      setTimeout(() => {
+        const live = slot && slot.isConnected ? slot : document.querySelector(".grant-slot");
+        if (live) grantFill(live);
+      }, 1500);
     });
   }
   function grantSlot() {
