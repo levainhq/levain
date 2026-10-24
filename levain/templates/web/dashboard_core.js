@@ -1606,6 +1606,14 @@
     head.appendChild(vWrap);
     p.appendChild(head);
 
+    // the substrate oracles (facts, never an activity counter); absent on a manifest source or an older levain
+    {
+      const bits = [];
+      if (h.save_age_hours != null) bits.push("last save " + (h.save_age_hours >= 1 ? Math.round(h.save_age_hours) + "h ago" : "under 1h ago"));
+      if (h.projection_converged != null) bits.push(h.projection_converged ? "projection converged" : "PROJECTION DIVERGED (file differs from the last save)");
+      if (h.audit_backlog != null) bits.push(!h.audit_backlog && !h.audit_prune_behind ? "audit complete" : "AUDIT LOST " + h.audit_backlog + " entries" + (h.audit_prune_behind ? " · pruning behind" : ""));
+      if (bits.length) kv(p, "substrate", bits.join(" · "));
+    }
     // a manifest source may not carry every figure: show only what was sent, never a made-up 0.00
     kv(p, "graduations", `${fmt(h.graduations_validated_total)} validated / ${fmt(h.graduations_demoted_total)} demoted`);
     kv(p, "episodes", `${fmt(h.total_episodes)} (${fmt(h.episodes_since_wrap)} since wrap)`);

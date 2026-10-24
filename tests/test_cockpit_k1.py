@@ -1079,6 +1079,14 @@ class TestSession2Gaps:
         assert whole[:4] == ["wraps", "graduated", "demoted", "episodes"]
         assert {"episodes", "tombstones"} <= {m["label"] for m in ms}
 
+    def test_the_oracle_metrics_flag_only_a_real_fault(self, env) -> None:
+        """A store with nothing wrong (nothing graduated, nothing formed, no divergence) flags nothing."""
+        _r, _s, ck = env
+        ms = {m["label"]: m for m in ck.panel("health")["value"]["metrics"]}
+        for label in ("projection", "audit entries lost"):
+            if label in ms:
+                assert ms[label]["status"] in ("ok", "unknown")
+
     def test_the_write_path_is_live_or_no_wraps_yet_and_never_bad(self, env) -> None:
         _r, _s, ck = env
         wp = ck.panel("health")["value"]["metrics"][0]

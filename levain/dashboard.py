@@ -297,6 +297,14 @@ class Health:
     last_wrap_at: str | None
     wrap_in_progress: bool  # a wrap is mid-flight → this snapshot may be inconsistent
     status: str | None = None  # "live" | "no-wraps"; None derives it from write_path_live (an older caller)
+    # The substrate oracles (anneal-cut train step 2). Facts, never an activity counter: a healthy wrap can
+    # graduate nothing and form nothing. None = could not be read / nothing to compare. Schema compatibility
+    # has no field: anneal refuses to open a newer-schema store, which lands in ``errors["store"]`` (a view with
+    # no Health at all), so a Health that exists is a store that opened.
+    save_age_hours: float | None = None  # age of the last COMMITTED save (last_wrap_at), not of any episode
+    projection_converged: bool | None = None  # the continuity file's size matches what the last wrap committed
+    audit_backlog: int | None = None  # audit entries the trail LOST (durable, monotonic); None = audit not enabled
+    audit_prune_behind: bool | None = None  # retention pruning is failing; the trail is growing past its bound
 
     def __post_init__(self) -> None:
         # one truth, two spellings: a caller that built Health the old way (write_path_live only) gets the status it
@@ -352,6 +360,49 @@ class AssociationGraph:
             "truncated": self.truncated,
             "formation_off_at_wrap": self.formation_off_at_wrap,
         }
+
+
+def health_oracles(
+    status: Any, last_wrap_chars: int | None, file_chars: int | None, *, now: datetime | None = None
+) -> dict[str, Any]:
+    """The four substrate oracles from facts the store already states (works on anneal 1.0.0; nothing here needs
+    1.0.2). Recency is the last COMMITTED save, convergence is the file's size against the size that save wrote
+    (a mismatch means the file was changed or lost since: the DB and the projection disagree), the audit backlog
+    is what the trail lost. Each is None when it cannot be told, never a guessed ok."""
+    age: float | None = None
+    raw = getattr(status, "last_wrap_at", None)
+    if raw:
+        try:
+            when = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            age = max(0.0, ((now or datetime.now(timezone.utc)) - when).total_seconds() / 3600.0)
+        except ValueError:
+            age = None
+    converged: bool | None = None
+    if getattr(status, "total_wraps", 0) and last_wrap_chars is not None and file_chars is not None:
+        converged = last_wrap_chars == file_chars
+    enabled = bool(getattr(status, "audit_enabled", False))
+    failures = getattr(status, "audit_write_failures", None)
+    return {
+        "save_age_hours": age,
+        "projection_converged": converged,
+        "audit_backlog": int(failures) if enabled and isinstance(failures, int) else None,
+        "audit_prune_behind": bool(getattr(status, "prune_behind", False)) if enabled else None,
+    }
+
+
+def health_oracle_line(h: "Health") -> str | None:
+    """The one text line the renderers print for the oracles; None when none could be read."""
+    bits: list[str] = []
+    if h.save_age_hours is not None:
+        bits.append("last save " + (f"{h.save_age_hours:.0f}h ago" if h.save_age_hours >= 1 else "under 1h ago"))
+    if h.projection_converged is not None:
+        bits.append("projection converged" if h.projection_converged else "PROJECTION DIVERGED (file differs from the last save)")
+    if h.audit_backlog is not None:
+        bits.append("audit complete" if not h.audit_backlog and not h.audit_prune_behind
+                    else f"AUDIT LOST {h.audit_backlog} entries" + (" · pruning behind" if h.audit_prune_behind else ""))
+    return " · ".join(bits) if bits else None
 
 
 def graph_caption(g: "AssociationGraph") -> str:
@@ -1762,6 +1813,11 @@ def build_substrate_view(
                     total_wraps=status.total_wraps,
                     last_wrap_at=status.last_wrap_at,
                     wrap_in_progress=status.wrap_in_progress,
+                    **health_oracles(
+                        status,
+                        max(wraps, key=lambda w: w.wrapped_at or "").continuity_chars if wraps else None,
+                        cont_chars,
+                    ),
                 )
             except data_faults as exc:
                 view.errors["health"] = f"{type(exc).__name__}: {exc}"
@@ -1963,6 +2019,8 @@ def render_text(view: SubstrateView) -> str:
             out.append(f"  Write-path:   LIVE — last wrap {last_wrap or 'recorded'}")
         else:
             out.append("  Write-path:   no wraps yet")
+        if health_oracle_line(h):
+            out.append(f"  Substrate:    {health_oracle_line(h)}")
         out.append(
             f"  Graduations:  {h.graduations_validated_total} validated / "
             f"{h.graduations_demoted_total} demoted"
@@ -2083,6 +2141,8 @@ def render_summary(view: SubstrateView) -> str:
             lines.append("Health: write-path LIVE")
         else:
             lines.append("Health: no wraps yet")
+        if health_oracle_line(h):
+            lines.append(f"  {health_oracle_line(h)}")
         last = h.last_wrap_at.split("T")[0] if h.last_wrap_at else "never"
         lines.append(
             f"  {h.total_episodes:,} episodes ({h.episodes_since_wrap} since wrap) · "

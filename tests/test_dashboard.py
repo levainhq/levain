@@ -1266,3 +1266,40 @@ class TestHealthStatusFollowsTheOldKey:
         )
         g = _build_graph(stub, min_strength=0.0, max_nodes=300, max_edges=2000)
         assert g is not None and g.formation_off_at_wrap is None
+
+
+class TestHealthOracles:
+    """The substrate oracles are facts about the last committed save, never an activity counter."""
+
+    def test_recency_convergence_audit_from_the_store_facts(self) -> None:
+        from datetime import datetime, timezone
+        from types import SimpleNamespace
+
+        from levain.dashboard import health_oracles
+
+        now = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
+        st = SimpleNamespace(last_wrap_at="2026-10-24T10:00:00", total_wraps=5, audit_enabled=True,
+                             audit_write_failures=0, prune_behind=False)
+        ok = health_oracles(st, 900, 900, now=now)
+        assert ok == {"save_age_hours": 2.0, "projection_converged": True, "audit_backlog": 0,
+                      "audit_prune_behind": False}
+        assert health_oracles(st, 900, 1000, now=now)["projection_converged"] is False
+        # nothing to compare is None, never a guessed ok; a fresh store has no save age
+        fresh = SimpleNamespace(last_wrap_at=None, total_wraps=0, audit_enabled=False,
+                                audit_write_failures=0, prune_behind=False)
+        assert health_oracles(fresh, None, None, now=now) == {
+            "save_age_hours": None, "projection_converged": None, "audit_backlog": None, "audit_prune_behind": None}
+        st.audit_write_failures = 3
+        assert health_oracles(st, 900, 900, now=now)["audit_backlog"] == 3
+
+    def test_a_live_view_carries_the_oracle_keys_and_never_a_link_count_as_health(self, tmp_path: Path) -> None:
+        from anneal_memory import Store
+
+        db = tmp_path / "memory.db"
+        with Store(db):
+            pass
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        assert v.health is not None
+        d = v.health.to_dict()
+        assert {"save_age_hours", "projection_converged", "audit_backlog", "audit_prune_behind"} <= set(d)
+        assert d["save_age_hours"] is None and d["projection_converged"] is None  # no wrap committed yet
