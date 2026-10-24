@@ -190,9 +190,12 @@ def _journal_holds_paired_devices(data_root: Path) -> bool:
 
     from levain.cockpit.firejournal import DB_NAME
 
-    path = Path(data_root) / DB_NAME
-    if not path.exists():
-        return False
+    try:
+        path = (Path(data_root) / DB_NAME).resolve()
+        if not path.exists():
+            return False
+    except (OSError, ValueError):
+        return True
     try:
         conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=0.2)
         try:
