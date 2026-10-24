@@ -44,8 +44,7 @@ OVER = B2.usage_response({"input_tokens": 1, "output_tokens": 50000})
 
 @pytest.fixture(params=PYS, ids=lambda p: "usr-bin-python3" if p == SYS_PY else "venv")
 def py(request):
-    if not B2.h11_available(request.param):
-        pytest.skip("h11 is not importable by %s (named skip, not a pass)" % request.param)
+    B2.require_h11(request.param)
     return request.param
 
 
