@@ -82,10 +82,13 @@ class CheckResult:
     # Meaningful only when ``ok`` is True: a working install with an exposure the operator should
     # act on. It changes the badge and prints the hint, never the exit code.
     warn: bool = False
+    # A fact that is not there to read (no isolation install on this machine): said in words, counted as neither
+    # a pass nor a failure nor a warning.
+    neutral: bool = False
 
 
 def _emit(r: CheckResult) -> None:
-    badge = _FAIL if not r.ok else (_WARN if r.warn else _OK)
+    badge = "[--]" if r.neutral else _FAIL if not r.ok else (_WARN if r.warn else _OK)
     print(f"  {badge} {r.name}: {r.detail}")
     if (not r.ok or r.warn) and r.hint:
         print(f"      → {r.hint}")
@@ -146,6 +149,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_consent_limits())
     core.extend(_check_dispatch_adoption_rules())
     core.extend(_check_dispatch_verifiers())
+    core.extend(_check_slot_isolation())
     for r in core:
         _emit(r)
     print(spend_cap_note())
@@ -340,6 +344,138 @@ def _check_consent_limits() -> list[CheckResult]:
                             f"Look at {qdir / limits.DB_NAME}: a full disk, a store of another levain version or a "
                             "corrupt file. The next call is counted once it can be written.", warn=True)]
     return [CheckResult(name, True, detail)]
+
+
+# --- agent-session isolation: rows over facts root already writes (S1 session 6a) ---------------------------------
+
+#: Three missed passes of the reaper's tick is the line between "late" and "not running".
+SLOT_REAPER_STALE_S = 180.0
+_SLOT_USABLE = ("leased", "scrubbed", "reusable")
+
+
+def _slot_read(path: Path) -> tuple[bytes | None, str | None]:
+    """(bytes, None); (None, None) when the file is absent; (None, why) when it exists but cannot be read."""
+    try:
+        return path.read_bytes(), None
+    except FileNotFoundError:
+        return None, None
+    except PermissionError:
+        return None, "permission denied for your account"
+    except OSError as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _slot_ago(secs: float) -> str:
+    secs = max(0, int(secs))
+    if secs < 120:
+        return f"{secs}s ago"
+    if secs < 7200:
+        return f"{secs // 60}m ago"
+    return f"{secs // 3600}h ago" if secs < 172800 else f"{secs // 86400}d ago"
+
+
+def _check_slot_isolation(*, host: str | None = None, store: Path | None = None, run: Path | None = None,
+                          now: float | None = None, free_bytes: Any = None) -> list[CheckResult]:
+    """Read-only rows over the isolation install's facts: the reaper's pass record, the slots' state files and the
+    store volume's free space. Nothing is leased, probed or run as a slot user. A fact that is not there is a
+    neutral line; one that is there but unreadable is said as unreadable, never as healthy."""
+    import time
+
+    from levain.slot import layout
+    from levain.slot import records as R
+    from levain.slot.end import V5_FLOOR_BYTES
+
+    if host is None:
+        host = "darwin" if sys.platform == "darwin" else "linux"
+    store = store if store is not None else layout.STORE.get(host)
+    run = run if run is not None else layout.RUN.get(host)
+    now = time.time() if now is None else now
+    if store is None or run is None or not (store / "slots").is_dir():
+        return [CheckResult("agent sessions", True, "not installed (sudo levain setup-isolation --agent)",
+                            neutral=True)]
+    rows: list[CheckResult] = []
+
+    beat = run / "reaper" / "pass.json"
+    raw, why = _slot_read(beat)
+    rep: dict | None = None
+    if why is not None:
+        rows.append(CheckResult("agent reaper", True, f"cannot read the reaper's pass record ({why})",
+                                f"The record is {beat}; without it doctor cannot say whether retained sessions are "
+                                "being ended, braked and purged.", warn=True))
+    elif raw is None:
+        rows.append(CheckResult("agent reaper", False,
+                                "no pass record: the reaper has not completed a pass, so retained sessions are not "
+                                "being ended, braked or purged",
+                                "Run `sudo levain setup-isolation repair` and look at the reaper service."))
+    else:
+        try:
+            rep = json.loads(raw)
+            stamp = rep.get("ended_at") or rep["started_at"]
+            age = now - R.epoch_of(stamp)
+            if not isinstance(rep.get("held", []), list):
+                raise ValueError("held is not a list")
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            rep = None
+            rows.append(CheckResult("agent reaper", True, f"the reaper's pass record is unreadable ({exc})",
+                                    f"Look at {beat}; the reaper rewrites it on its next pass.", warn=True))
+        else:
+            if age > SLOT_REAPER_STALE_S:
+                rows.append(CheckResult("agent reaper", False,
+                                        f"last pass {_slot_ago(age)}; the reaper is not running, so retained "
+                                        "sessions are not being ended, braked or purged",
+                                        "Run `sudo levain setup-isolation repair` and look at the reaper service."))
+            else:
+                rows.append(CheckResult("agent reaper", True,
+                                        f"last pass {_slot_ago(age)} (pass {rep.get('pass_seq', '?')})"))
+    if rep is not None:
+        control = rep.get("control")
+        if control == "up":
+            rows.append(CheckResult("agent control", True, "up"))
+        else:
+            rows.append(CheckResult("agent control", False,
+                                    f"{control or 'unreported'} at the last pass; live sessions are ended at their "
+                                    "lease and their work retained",
+                                    "Run `sudo levain setup-isolation repair`."))
+        for s in rep.get("held", []):
+            rows.append(CheckResult(f"agent held session {s}", False,
+                                    f"session {s} is HELD: its end stopped part-way, the slot stays leased and the "
+                                    "tree is untouched; the reaper retries with growing delays",
+                                    "The step it stopped at is in a record only root reads."))
+
+    states: dict[str, str] = {}
+    for d in sorted((store / "slots").iterdir()):
+        if not (len(d.name) > 1 and d.name[0] in "ev" and d.name[1:].isdigit() and d.is_dir()):
+            continue
+        data, _why = _slot_read(d / "state")
+        try:
+            states[d.name] = R.parse_slot_state(data).state if data is not None else "missing"
+        except Exception:  # noqa: BLE001 - a state file that does not parse is a slot that is not usable
+            states[d.name] = "unreadable"
+    usable = sum(1 for v in states.values() if v in _SLOT_USABLE)
+    if not states:
+        rows.append(CheckResult("agent slots", False, "no slots are configured",
+                                "Run `sudo levain setup-isolation repair`."))
+    elif usable < len(states):
+        bad = ", ".join(f"{k} ({v})" for k, v in states.items() if v not in _SLOT_USABLE)
+        rows.append(CheckResult("agent slots", False, f"{usable} of {len(states)} usable; not usable: {bad}",
+                                "Restore with `sudo levain setup-isolation replenish`."))
+    else:
+        rows.append(CheckResult("agent slots", True, f"{usable} of {len(states)} usable"))
+
+    try:
+        free = (free_bytes or (lambda p: (lambda v: v.f_bavail * v.f_frsize)(os.statvfs(p))))(store)
+    except OSError as exc:
+        rows.append(CheckResult("agent store free space", True, f"could not be read ({exc})", warn=True))
+    else:
+        gib = free / (1 << 30)
+        if free < V5_FLOOR_BYTES:
+            rows.append(CheckResult("agent store free space", False,
+                                    f"{gib:.1f} GiB free, below the {V5_FLOOR_BYTES >> 30} GiB floor; new sessions "
+                                    "are refused and running ones are braked",
+                                    f"Free space on the volume that holds {store}."))
+        else:
+            rows.append(CheckResult("agent store free space", True, f"{gib:.1f} GiB free"))
+    return rows
 
 
 def _check_host_awake() -> list[CheckResult]:
