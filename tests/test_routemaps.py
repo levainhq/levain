@@ -951,3 +951,66 @@ def test_reload_executor_refusing_work_refuses(st):
     assert asyncio.run(run()) == {"refused": "keys-unavailable"}
     assert k.routes.stated() == (None, None) and k.routes.problem == "keys-unavailable"
     assert dispatch_refusal(k, "glm", pin) == "route-not-allowed|no dispatch map is served"
+
+
+# ---- L3 r3 (1023+26 fix3) -----------------------------------------------------------------------------------------
+
+def test_collision_unknown_ids_survive_a_refused_reload(st):
+    # complement MED: a head on disk that does not parse leaves the ids UNKNOWN, and a later refused RELOAD (whatever it
+    # names) must not make them known-empty: `glm`, pinned in the unreadable head, still refuses rather than resolving
+    # by the base policy. Only a RELOAD keys acks (a verified head) makes the ids known again.
+    import concurrent.futures
+
+    class Shut(concurrent.futures.ThreadPoolExecutor):
+        def submit(self, *a, **kw):
+            raise RuntimeError("cannot schedule new futures after shutdown")
+    cr = RM.ControlRoutes(st.routes)
+    one = st.signed(item(1))
+    submit(cr, *one)
+    assert reload(keys_of(st), 1, sha(one[0]))["generation"] == 1
+    (st.L / "keys" / "routemap.head").write_bytes(b"not a head")
+    _base_with(st, "glm", "zz")
+    k = keys_of(st)
+    claims = {"routes": ["glm", "zz"]}
+    assert k.routes.head is None and k.routes.route_ids() is None
+    assert reload(k, 2, "0" * 64) == {"refused": "routemap-invalid:current"}
+    assert k.routes.problem == "routemap-invalid:current" and k.routes.route_ids() is None
+    assert _resolved(k, claims, "glm") == "keys-unavailable|route-collision"
+
+    async def shut():
+        k._in_loop()
+        ex = Shut(max_workers=1)
+        asyncio.get_running_loop().set_default_executor(ex)
+        try:
+            return await k.reload(k.admin_epoch, 1, sha(one[0]))
+        finally:
+            ex.shutdown(wait=False)
+    assert asyncio.run(shut()) == {"refused": "keys-unavailable"}
+    assert k.routes.problem == "keys-unavailable" and k.routes.route_ids() is None
+    assert _resolved(k, claims, "glm") == "keys-unavailable|route-collision"
+    assert _resolved(k, claims, "zz") == "keys-unavailable|route-collision"
+    # the head repaired (here: removed), then a RELOAD keys acks (the base map clear of `glm` while it is checked, then
+    # `glm` added back): the ids are known again
+    (st.L / "keys" / "routemap.head").unlink()
+    _base_with(st, "zz")
+    assert reload(k, 1, sha(one[0]))["generation"] == 1
+    _base_with(st, "glm", "zz")
+    assert k.routes.ids_unknown is False and k.routes.route_ids() == frozenset({"glm"})
+    assert _resolved(k, claims, "glm") == "keys-unavailable|route-collision"
+    assert _resolved(k, claims, "zz") == "api.z.ai"
+
+
+def test_collision_unknown_ids_from_a_reload_that_reads_an_unverifiable_head(st):
+    # keys holds no head (none at its start), then a RELOAD reads keys' head on disk and it does not verify: the ids are
+    # unknown from then on, as at a start with that head, until a RELOAD keys acks
+    cr = RM.ControlRoutes(st.routes)
+    k = keys_of(st)
+    assert k.routes.head is None and k.routes.route_ids() == frozenset()
+    one = st.signed(item(1))
+    submit(cr, *one)
+    (st.L / "keys").mkdir(mode=0o700, exist_ok=True)
+    (st.L / "keys" / "routemap.head").write_bytes(b"not a head")
+    assert reload(k, 1, sha(one[0])) == {"refused": "routemap-head-unverifiable"}
+    assert k.routes.ids_unknown is True and k.routes.route_ids() is None
+    _base_with(st, "zz")
+    assert _resolved(k, {"routes": ["zz"]}, "zz") == "keys-unavailable|route-collision"

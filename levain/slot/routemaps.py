@@ -477,6 +477,10 @@ class KeysRoutes:
         self.maps: Dict[int, Checked] = {}
         self.usable = True
         self.problem: Optional[str] = None
+        #: the route ids a dispatch session may be pinned to are UNKNOWN (keys' head on disk does not verify, so no head
+        #: is held): set by :meth:`install` and :meth:`refuse`, cleared only by :meth:`accept` of a verified head, so a
+        #: later refused RELOAD, whatever it names, never reads unknown ids as none (:meth:`route_ids`)
+        self.ids_unknown = False
         #: THE RELOAD transaction lock: keys' `_reload_files` holds it from `check_reload` through `commit`, so one
         #: RELOAD's file work owns keys' disk head at a time, whatever happens to the asyncio task that started it (a
         #: preemption cancels the task, never the executor thread doing the work).
@@ -557,16 +561,20 @@ class KeysRoutes:
     def install(self, head: Optional[dict], maps: Mapping[int, Checked], problem: Optional[str]) -> None:
         self.head, self.maps, self.problem = head, dict(maps), problem
         self.usable = problem is None
+        self.ids_unknown = head is None and problem is not None   # `load`: a head on disk that does not verify
 
     def accept(self, checked: Checked, head: dict) -> None:
         """A RELOAD keys acks: `head` (already durable) installed and the generation served."""
         self.head = head
         self.maps[checked.generation] = checked
         self.usable, self.problem = True, None
+        self.ids_unknown = False
 
     def refuse(self, name: str) -> None:
         """A RELOAD keys refused: every dispatch route refused until a valid one (CONTRACT §4.3)."""
         self.usable, self.problem = False, name
+        if self.head is None and name == "routemap-head-unverifiable":
+            self.ids_unknown = True   # `check_reload` found keys' head on disk unreadable and none is held
 
     def route_ids(self) -> Optional[frozenset]:
         """Every route id a dispatch session may be pinned to: the union across EVERY generation keys' head serves
@@ -574,10 +582,10 @@ class KeysRoutes:
         route id may be one of them at the point of use (keys' `_route_policy`), however the base map changed since
         the RELOAD that checked it. An empty set only when there is no head; None when the ids are UNKNOWN (a head on
         disk that does not parse, or a served generation whose map is not loaded): the caller fails closed."""
+        if self.ids_unknown:
+            return None
         if self.head is None:
-            # `load` and `check_reload` name an unreadable head so. Otherwise no head is held only before keys acked
-            # any generation, and a pin exists only for an acked one
-            return None if self.problem == "routemap-head-unverifiable" else frozenset()
+            return frozenset()   # no head is held only before keys acked any generation, and a pin exists only for one
         ids: set = set()
         for e in self.head["served"]:
             m = self.maps.get(e["generation"])
