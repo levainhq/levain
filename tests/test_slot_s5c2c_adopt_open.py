@@ -42,7 +42,10 @@ GIT = shutil.which("git")
 WT = Path(__file__).resolve().parents[1]
 ENV = {"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "HOME": "/nonexistent",
        "LC_ALL": "C", "GIT_AUTHOR_NAME": "a", "GIT_AUTHOR_EMAIL": "a@a", "GIT_COMMITTER_NAME": "a",
-       "GIT_COMMITTER_EMAIL": "a@a"}
+       "GIT_COMMITTER_EMAIL": "a@a",
+       # no detached auto-maintenance/gc: it creates and removes .git/objects/maintenance.lock while a later copytree walks .git
+       "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "maintenance.auto", "GIT_CONFIG_VALUE_0": "false",
+       "GIT_CONFIG_KEY_1": "gc.auto", "GIT_CONFIG_VALUE_1": "0"}
 pytestmark = pytest.mark.skipif(sys.platform != "darwin" or GIT is None or not os.path.exists(ER.HDIUTIL),
                                 reason="the seam run needs macOS hdiutil and a git")
 
