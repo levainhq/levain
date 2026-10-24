@@ -856,7 +856,7 @@ def main(argv: list[str] | None = None) -> int:
     wrap_p.add_argument(
         "--affect-intensity",
         type=float,
-        default=0.5,
+        default=None,  # None = not passed, so the deprecation line can tell an explicit 0.5 from the default
         dest="affect_intensity",
         help="DEPRECATED and ignored, like --affect-tag.",
     )
@@ -2142,7 +2142,11 @@ def _resolve_unattended_consolidate_bound(
 
 
 def _cmd_wrap(args: argparse.Namespace) -> int:
-    from levain.wrap import wrap_entity
+    from levain.wrap import AFFECT_DEPRECATED, wrap_entity
+
+    # once, here, whenever either deprecated flag was given: before the key check, any early return and any compose
+    if (args.affect_tag is not None and str(args.affect_tag).strip()) or args.affect_intensity is not None:
+        print(AFFECT_DEPRECATED, flush=True)
 
     if not _resolve_api_key(args):
         return 2
@@ -2159,7 +2163,7 @@ def _cmd_wrap(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         reset=args.reset,
         affect_tag=args.affect_tag,
-        affect_intensity=args.affect_intensity,
+        affect_intensity=0.5 if args.affect_intensity is None else args.affect_intensity,
         # 0 means "explicitly unbounded" — normalized at the boundary so exactly ONE representation
         # of "no bound" reaches the deadline, matching `run`'s handling of the same flag. And an
         # unattended wrap with no bound named gets the finite default rather than running unbounded

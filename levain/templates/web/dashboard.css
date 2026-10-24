@@ -284,6 +284,7 @@
     border: 1px solid color-mix(in srgb, var(--mind) 40%, transparent); }
   .badge.dark { color: var(--label); background: var(--card-2); }
   .badge.dark::before { background: var(--warn); }
+  .badge.neutral { color: var(--label); background: var(--card-2); }
 
   .row { display: flex; flex-wrap: wrap; gap: var(--sp-3); align-items: baseline; padding: var(--sp-2) 0;
     border-top: 1px solid color-mix(in srgb, var(--line) 60%, transparent); }

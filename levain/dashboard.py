@@ -296,7 +296,14 @@ class Health:
     total_wraps: int
     last_wrap_at: str | None
     wrap_in_progress: bool  # a wrap is mid-flight → this snapshot may be inconsistent
-    status: str = "live"  # "live" | "no-wraps"; see the class docstring
+    status: str | None = None  # "live" | "no-wraps"; None derives it from write_path_live (an older caller)
+
+    def __post_init__(self) -> None:
+        # one truth, two spellings: a caller that built Health the old way (write_path_live only) gets the status it
+        # implies, and the deprecated key always follows the status, so to_dict() never contradicts itself
+        if self.status is None:
+            self.status = "live" if self.write_path_live else "no-wraps"
+        self.write_path_live = self.status == "live"
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -362,11 +369,14 @@ def graph_caption(g: "AssociationGraph") -> str:
 def _formation_off_at_wrap(store: Any) -> int | None:
     """``Store.association_formation()['off_at_wrap']`` when the installed anneal has the
     accessor and says formation is off; None otherwise (anneal 1.0.1 has no accessor, so
-    nothing is claimed). Never raises on a missing accessor or an odd shape."""
+    nothing is claimed). Never raises: a missing accessor, an odd shape or a failing read all mean no caption."""
     fn = getattr(store, "association_formation", None)
     if not callable(fn):
         return None
-    got = fn()
+    try:
+        got = fn()
+    except Exception:  # noqa: BLE001 — the caption is cosmetic; a failing accessor must not cost the graph it captions
+        return None
     if not isinstance(got, dict) or got.get("mode") != "disabled":
         return None
     off = got.get("off_at_wrap")

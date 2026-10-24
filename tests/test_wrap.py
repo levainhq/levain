@@ -263,9 +263,11 @@ def test_the_affect_flags_are_a_deprecated_pass_through_that_says_so_once(tmp_pa
         return real(*a, **k)
 
     monkeypatch.setattr(cont, "validated_save_continuity", spy)
-    assert wrap_entity(ent, affect_tag="engaged", affect_intensity=0.9) == 0
+    from levain.cli import main
+    monkeypatch.setattr("levain.cli._resolve_api_key", lambda args: True)
+    assert main(["wrap", str(ent), "--affect-tag", "engaged", "--affect-intensity", "0.9"]) == 0
     out = capsys.readouterr().out
-    assert out.count("--affect-tag / --affect-intensity are deprecated and ignored") == 1
+    assert out.count("--affect-tag / --affect-intensity are deprecated and ignored") == 1   # once, from the cli; wrap_entity adds none
     assert "affective_state" not in seen                 # never built, never sent
     with Store(str(db), section_schema=None) as store:
         assert store.get_wrap_started_at() is None       # and the wrap still completed
@@ -491,3 +493,25 @@ def test_a_schema_with_the_right_headings_but_a_wrong_role_is_refused(tmp_path, 
     _with_store(ent, schema=wrong, episodes=1)
     assert wrap_entity(ent, dry_run=True) == 2
     assert "not on the partnership schema" in capsys.readouterr().out
+
+
+def test_the_deprecation_line_fires_for_either_flag_alone_and_before_any_early_return(tmp_path, capsys, monkeypatch):
+    from unittest import mock
+
+    from levain.cli import main
+    line = "--affect-tag / --affect-intensity are deprecated and ignored"
+    monkeypatch.setattr("levain.cli._resolve_api_key", lambda args: True)
+    ent = str(tmp_path / "ent")
+    for flags in (["--affect-intensity", "0.9"], ["--affect-intensity", "0.5"], ["--affect-tag", "engaged", "--dry-run"],
+                  ["--affect-tag", "engaged"]):
+        with mock.patch("levain.wrap.wrap_entity", return_value=0):
+            assert main(["wrap", ent, *flags]) == 0
+        assert capsys.readouterr().out.count(line) == 1, flags
+    with mock.patch("levain.wrap.wrap_entity", return_value=0):
+        assert main(["wrap", ent]) == 0
+        assert line not in capsys.readouterr().out                    # neither flag: silent
+        assert main(["wrap", ent, "--affect-tag", "  "]) == 0
+        assert line not in capsys.readouterr().out                    # a blank tag is no flag
+    monkeypatch.setattr("levain.cli._resolve_api_key", lambda args: False)   # an early return (no key) still says it, once
+    assert main(["wrap", ent, "--affect-intensity", "0.9"]) == 2
+    assert capsys.readouterr().out.count(line) == 1

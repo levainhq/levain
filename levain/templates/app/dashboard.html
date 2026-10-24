@@ -32,6 +32,7 @@
     font-size: 11px; font-weight: 600; }
   .badge.live { background: rgba(126,224,192,.14); color: var(--good); }
   .badge.dark { background: rgba(240,122,122,.14); color: var(--bad); }
+  .badge.neutral { background: rgba(160,160,160,.14); color: var(--dim); }
   .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; padding: 3px 0;
     border-top: 1px solid var(--line); }
   .row:first-child { border-top: 0; }
@@ -113,7 +114,7 @@
     const head = el("div", "kv");
     head.appendChild(el("span", "k", "write-path"));
     const st = h.status || (h.write_path_live ? "live" : "no-wraps");
-    const b = el("span", "badge " + (st === "live" ? "live" : "dark"),
+    const b = el("span", "badge " + (st === "live" ? "live" : (st === "unreadable" ? "dark" : "neutral")),
       st === "live" ? "LIVE" : (st === "unreadable" ? "UNREADABLE" : "NO WRAPS YET"));
     const vWrap = el("span", "v"); vWrap.appendChild(b);
     head.appendChild(vWrap);
@@ -134,7 +135,7 @@
     if (!g || !g.nodes || g.nodes.length === 0) {
       p.appendChild(el("p", "empty",
         (view.errors && view.errors.graph) ? ("graph unavailable — " + view.errors.graph)
-                                           : "not formed"));
+                                           : "not formed" + ((g && g.formation_off_at_wrap != null) ? ` · no new links since wrap ${g.formation_off_at_wrap}` : "")));
       board.appendChild(p);
       return;
     }

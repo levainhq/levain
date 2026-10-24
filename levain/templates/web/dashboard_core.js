@@ -1600,7 +1600,7 @@
     const head = el("div", "kv");
     head.appendChild(el("span", "k", "write-path"));
     const st = h.status || (h.write_path_live ? "live" : "no-wraps");
-    const b = el("span", "badge " + (st === "live" ? "live" : "dark"),
+    const b = el("span", "badge " + (st === "live" ? "live" : (st === "unreadable" ? "dark" : "neutral")),
       st === "live" ? "LIVE" : (st === "unreadable" ? "UNREADABLE" : "NO WRAPS YET"));
     const vWrap = el("span", "v"); vWrap.appendChild(b);
     head.appendChild(vWrap);
@@ -1640,12 +1640,22 @@
     }
     const NS = "http://www.w3.org/2000/svg";
     const W = 480, H = 170, PAD = 10;
+    // anneal stopped forming links after wrap `off`: the Links channel keeps its historical points and draws no new ones
+    // (a post-cut zero is not a measurement), and a store that never formed any has no such channel at all. The wraps list
+    // is newest-first and capped, so a row's wrap number is counted back from the authoritative total.
+    const off = view.graph && Number.isInteger(view.graph.formation_off_at_wrap) ? view.graph.formation_off_at_wrap : null;
+    const totalWraps = memWrapTotal(view);
+    const wrapNo = new Map(series.map((w, k) => [w, (totalWraps !== null ? totalWraps : series.length) - k]));
+    const linkVal = (w) => num(w.associations_formed) + num(w.associations_strengthened);
     const CHANNELS = [
       { label: "Episodes", cls: "ch1", val: (w) => num(w.episodes_compressed) },
       { label: "Graduations", cls: "ch2", val: (w) => num(w.graduations_validated) },
-      { label: "Links", cls: "ch3",
-        val: (w) => num(w.associations_formed) + num(w.associations_strengthened) },
     ];
+    if (off === null) CHANNELS.push({ label: "Links", cls: "ch3", val: linkVal });
+    else if (series.some((w) => wrapNo.get(w) <= off && linkVal(w) > 0)) {
+      CHANNELS.push({ label: "links (formation off since wrap " + off + ")", cls: "ch3", val: linkVal,
+        drawn: (w) => wrapNo.get(w) <= off });
+    }
 
     // the instrument's read-side controls — the first real metal on the deck
     // (no-theater: both verbs act on the instrument NOW; write-side knobs land
@@ -1690,12 +1700,15 @@
         // off-grid (num() lets negatives through). gain floors at 1 to avoid /0, but
         // the legend reports the TRUE max so the calibration stays honest. [codex MED]
         const vals = wraps.map((w) => Math.max(0, ch.val(w)));
-        const actualMax = Math.max(0, ...vals);
+        const live = wraps.map((w) => !ch.drawn || ch.drawn(w));   // false: a wrap this channel no longer measures
+        const shown = vals.filter((_v, i) => live[i]);
+        const actualMax = Math.max(0, ...shown);
         const gain = Math.max(1, actualMax);
         const pts = vals
-          .map((v, i) => `${X(i).toFixed(1)},${(H - PAD - (v / gain) * (H - 2 * PAD)).toFixed(1)}`)
+          .map((v, i) => (live[i] ? `${X(i).toFixed(1)},${(H - PAD - (v / gain) * (H - 2 * PAD)).toFixed(1)}` : null))
+          .filter((x) => x !== null)
           .join(" ");
-        for (const layer of ["trace-glow", "trace-core"]) {
+        for (const layer of (pts ? ["trace-glow", "trace-core"] : [])) {
           const pl = document.createElementNS(NS, "polyline");
           pl.setAttribute("points", pts);
           pl.setAttribute("class", `${layer} ${ch.cls}`);
@@ -1705,7 +1718,7 @@
         }
         const chip = el("button", `scope-ch ${ch.cls}`);
         chip.appendChild(el("span", "scope-ch-l", ch.label));
-        chip.appendChild(el("span", "scope-ch-v", `${fmt(vals[vals.length - 1])} · max ${fmt(actualMax)}`));
+        chip.appendChild(el("span", "scope-ch-v", `${fmt(shown.length ? shown[shown.length - 1] : 0)} · max ${fmt(actualMax)}`));
         chip.type = "button";
         chip.title = "solo this channel (click again for all)";
         chip.setAttribute("aria-pressed", solo === ch.cls ? "true" : "false");

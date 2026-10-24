@@ -1225,3 +1225,44 @@ class TestBrandWhiteLabel:
             store.record("x", "decision")
         view = SubstrateSource.local(tmp_path).build()
         assert view.brand_wordmark is None and view.brand_model is None
+
+
+class TestHealthStatusFollowsTheOldKey:
+    """A caller that built Health the old way (write_path_live, no status) gets the status it implies."""
+
+    @staticmethod
+    def _health(**kw):
+        from levain.dashboard import Health
+
+        base = dict(total_links=0, avg_strength=0.0, max_strength=0.0, density=0.0, local_density=0.0, links_formed_total=0,
+                    links_strengthened_total=0, links_decayed_total=0, graduations_validated_total=0, graduations_demoted_total=0,
+                    total_episodes=0, episodes_since_wrap=0, episodes_by_type={}, tombstones=0, continuity_chars=None,
+                    total_wraps=0, last_wrap_at=None, wrap_in_progress=False)
+        return Health(**base, **kw)
+
+    def test_the_old_shape_never_contradicts_itself(self) -> None:
+        for live, want in ((True, "live"), (False, "no-wraps")):
+            d = self._health(write_path_live=live).to_dict()
+            assert d["status"] == want and d["write_path_live"] is live, d
+
+    def test_the_new_shape_keeps_the_deprecated_key_in_step(self) -> None:
+        for status, live in (("live", True), ("no-wraps", False), ("unreadable", False)):
+            d = self._health(write_path_live=not live, status=status).to_dict()
+            assert d["status"] == status and d["write_path_live"] is live, d
+
+    def test_a_failing_formation_accessor_costs_the_caption_never_the_graph(self) -> None:
+        from types import SimpleNamespace
+
+        from levain.dashboard import _build_graph
+
+        def boom():
+            raise RuntimeError("meta table unreadable")
+
+        ep = SimpleNamespace(id="e1", type=SimpleNamespace(value="observation"), content="x")
+        stub = SimpleNamespace(
+            recall=lambda limit: SimpleNamespace(episodes=[ep], total_matching=1),
+            get_associations=lambda chunk, min_strength, limit: [],
+            association_formation=boom,
+        )
+        g = _build_graph(stub, min_strength=0.0, max_nodes=300, max_edges=2000)
+        assert g is not None and g.formation_off_at_wrap is None

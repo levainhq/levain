@@ -165,7 +165,7 @@ def _unlock_wrap(handle: "int | None | object") -> None:
             pass
 
 
-_AFFECT_DEPRECATED = (
+AFFECT_DEPRECATED = (  # printed once by `levain wrap` (cli.py) when either flag was given
     "levain wrap: --affect-tag / --affect-intensity are deprecated and ignored (anneal no longer tags "
     "associations); the consolidate is unchanged."
 )
@@ -967,9 +967,7 @@ def _consolidate(
         # SAVE — the gated efferent write. FAIL-CLOSED: validated_save_continuity REFUSES (raises) a
         # malformed neocortex BEFORE writing, so a broken identity is never persisted.
         # The affect flags are a deprecated pass-through: anneal no longer tags associations, so the state is
-        # never built or sent. One line says so, only when the operator actually passed one.
-        if affect_tag and affect_tag.strip():
-            _say(_AFFECT_DEPRECATED)
+        # never built or sent. The one line saying so is printed at argument handling (cli.py), before any compose.
         # Read while OUR wrap is open (nothing else can complete a wrap now except by clearing ours
         # first), immediately before the save. Read before `prepare_wrap` it raced an ordinary peer
         # wrap completing in the gap, and a plain refused compose then looked like a peer's commit.
