@@ -519,3 +519,112 @@ def test_body_policy_refused_at_route_submit(rig):
     assert refused(rig.ask("ROUTE-SUBMIT", map=it, sig=sig)) == "route-invalid:body_policy"
     it, sig = rig.st.signed(item(gen, [good]))
     assert rig.ask("ROUTE-SUBMIT", map=it, sig=sig) == {"id": 1, "ok": True, "generation": gen}
+
+
+# ---- session 3: generation pruning (head ruling H5) and the ticket's reach (H8) --------------------------------------
+
+class KeysShim:
+    """CONTROL's keys admin wire over a real `Keys`: each RELOAD runs keys' own handler with the `keep` CONTROL sent."""
+
+    def __init__(self, k) -> None:
+        self.k, self.keeps = k, []
+
+    def call(self, op: str, **kw) -> dict:
+        assert op == "RELOAD", op
+        self.keeps.append(kw["keep"])
+        return reload(self.k, kw["generation"], kw["item_sha256"], keep=frozenset(kw["keep"]))
+
+    def close(self) -> None:
+        pass
+
+
+def keys_on_wire(rig):
+    """A real keys behind CONTROL's admin wire, loaded with CONTROL's head (generation 1) by CONTROL's own RELOAD."""
+    k = keys_of(rig.st)
+    rig.control.keys_admin = KeysShim(k)
+    with rig.control._activation:
+        rig.control._reload_keys(rig.cr.head())
+    assert [e["generation"] for e in rig.st.keys_head()["served"]] == [1]
+    return k
+
+
+def submit_gen(rig, g: int, routes) -> dict:
+    it, sig = rig.st.signed(item(g, routes))
+    assert rig.ask("ROUTE-SUBMIT", map=it, sig=sig)["ok"]
+    return it
+
+
+def served_gens(rig) -> list:
+    return [e["generation"] for e in rig.st.keys_head()["served"]]
+
+
+def test_reload_keeps_a_generation_an_open_ticket_references(rig):
+    # H5: generation 1 is named by an open ticket, so the RELOADs of 2 and 3 keep it (2 nobody references: pruned
+    # by keys, then its files deleted by CONTROL once keys' ack leaves it out). The ticket cancelled, the RELOAD of 4
+    # keeps only what keys' own cache still pins (a cached run on 3).
+    k = keys_on_wire(rig)
+    one = ticket_of(rig.mint())
+    submit_gen(rig, 2, [route(host="api.z.ai")])
+    submit_gen(rig, 3, [route()])
+    assert rig.control.keys_admin.keeps[-1] == [1, 3]
+    assert served_gens(rig) == [1, 3] and sorted(k.routes.maps) == [1, 3]
+    assert rig.st.gen_files() == ["1.json", "1.sig", "3.json", "3.sig"]
+    assert rig.ask("RUN-TICKET-CANCEL", ticket=one)["ok"]
+    k.cache["d" * 64] = {"session": SESSION, "claims": {"run": {"routemap_generation": 3}}}
+    submit_gen(rig, 4, [route(host="api.z.ai")])
+    assert rig.control.keys_admin.keeps[-1] == [4]
+    assert served_gens(rig) == [3, 4] and sorted(k.routes.maps) == [3, 4]
+    assert rig.st.gen_files() == ["3.json", "3.sig", "4.json", "4.sig"]   # 3 listed by keys' ack: never deleted
+
+
+def test_control_never_deletes_a_file_keys_ack_still_lists(rig):
+    # H5: CONTROL's own keep names only its head (no ticket), but keys' cache pins a run to generation 1, so keys'
+    # ack still lists 1 and CONTROL keeps its files. keys restarts after the prune: every generation its head lists
+    # loads, so the served ids are known and a base route still resolves (a missing file would fail them all closed).
+    from tests.test_routemaps import _base_with, _resolved
+    k = keys_on_wire(rig)
+    k.cache["d" * 64] = {"session": SESSION, "claims": {"run": {"routemap_generation": 1}}}
+    submit_gen(rig, 2, [route(host="api.z.ai")])
+    submit_gen(rig, 3, [route(rid="other")])
+    assert rig.control.keys_admin.keeps[-1] == [3]
+    assert served_gens(rig) == [1, 3]
+    assert rig.st.gen_files() == ["1.json", "1.sig", "3.json", "3.sig"]
+    _base_with(rig.st, "zz")
+    k2 = keys_of(rig.st)
+    assert sorted(k2.routes.maps) == [1, 3] and k2.routes.problem is None
+    assert k2.routes.route_ids() == frozenset({"glm", "other"})
+    assert _resolved(k2, {"routes": ["zz"]}, "zz") == "api.z.ai"
+    pinned = {"routes": ["glm"], "run": {"route": "glm", "routemap_generation": 1, "route_policy_digest": GLM_DIGEST}}
+    assert _resolved(k2, pinned, "glm") == "route-not-allowed|rule 2"   # 1 still served (rule 1 holds); 3 lacks glm
+
+
+def test_status_carries_no_ticket(rig):
+    # H8 (H1's reach): the operator's STATUS of a dispatch session never carries the ticket
+    one, _run, att = bound_session(rig)
+    assert att["ok"], att
+    ans = rig.control.handle(C.Conn(OP_UID), {"v": 1, "op": "STATUS", "id": 1, "session": SESSION})
+    assert ans["ok"] and len(ans["records"]) == 1, ans
+    assert "ticket" not in ans["records"][0]["claims"] and one not in json.dumps(ans)
+    assert ans["records"][0]["claims"]["kind"] == "dispatch"
+
+
+def test_crash_between_bind_and_session_record_unbinds(rig, monkeypatch):
+    # H8: the bind line is journaled, then the record's write fails (CONTROL dies before it): at the next start the
+    # ticket is unbound again (no session existed), the compaction drops the bind, and the ticket binds anew
+    one = ticket_of(rig.mint())
+    _c, lo = lease(rig, one)
+
+    def no_record(rec):
+        raise OSError("the record's write never happened")
+    monkeypatch.setattr(rig.control.store, "put", no_record)
+    ans = root(rig, "ATTACH", lease_nonce=lo["lease_nonce"], sudo_uid=DISPATCH_UID, session=SESSION,
+               claims=d_attach_claims(one))
+    assert ans["ok"] is False, ans
+    assert [x["op"] for x in rig.lines()] == ["mint", "bind"]
+    rig.restart()
+    assert [x["op"] for x in rig.lines()] == ["mint"]
+    assert rig.ask("RUN-TICKET-STATUS", attempt_id="a-1") == {"id": 1, "ok": True, "ticket": one, "state": "unbound"}
+    _c, lo = lease(rig, one)
+    att = root(rig, "ATTACH", lease_nonce=lo["lease_nonce"], sudo_uid=DISPATCH_UID, session=SESSION,
+               claims=d_attach_claims(one))
+    assert att["ok"] and "ticket_facts" in att, att

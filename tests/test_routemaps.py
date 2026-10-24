@@ -148,11 +148,20 @@ def keys_of(st: Store) -> K.Keys:
     return k
 
 
-def reload(k: K.Keys, gen: int, digest: str) -> dict:
+#: a RELOAD `keep` naming every generation these tests make, so nothing is pruned (H5's pruning has its own tests)
+KEEP_ALL = frozenset(range(1, 64))
+
+
+def reload(k: K.Keys, gen: int, digest: str, keep=KEEP_ALL) -> dict:
     async def run():
         k._in_loop()
-        return await k.reload(k.admin_epoch, gen, digest)
+        return await k.reload(k.admin_epoch, gen, digest, keep=keep)
     return asyncio.run(run())
+
+
+def acked(st: "Store", gen: int, digest: str) -> dict:
+    """keys' RELOAD ack: the generation it now serves and its `served` list, which is what keys' durable head lists."""
+    return {"generation": gen, "item_sha256": digest, "served": [e["generation"] for e in st.keys_head()["served"]]}
 
 
 def dispatch_refusal(k: K.Keys, rid: str, pin) -> str:
@@ -207,7 +216,7 @@ def test_same_generation_other_digest_refused(st):
     assert submit(cr, *a, reloads) == 2 and len(reloads) == 2
     # keys: the file swapped under it is refused at RELOAD, and at start
     k = keys_of(st)
-    assert reload(k, 2, sha(a[0])) == {"generation": 2, "item_sha256": sha(a[0])}
+    assert reload(k, 2, sha(a[0])) == acked(st, 2, sha(a[0]))
     (st.dispatch / "2.json").write_bytes(canon.canonical_bytes(b[0]))
     (st.dispatch / "2.sig").write_text(b[1])
     assert reload(k, 2, sha(a[0])) == {"refused": "routemap-invalid:item_sha256"}
@@ -237,7 +246,7 @@ def test_generation_gap_accepted(st):
     for g in (1, 5):
         it, sig = st.signed(item(g))
         assert submit(cr, it, sig) == g
-        assert reload(k, g, sha(it)) == {"generation": g, "item_sha256": sha(it)}
+        assert reload(k, g, sha(it)) == acked(st, g, sha(it))
         digests.append(sha(it))
     assert st.keys_head()["served"] == [{"generation": 1, "item_sha256": digests[0]},
                                         {"generation": 5, "item_sha256": digests[1]}]
@@ -288,7 +297,7 @@ def _two_generations(st: Store) -> tuple:
     for g in (1, 2):
         it, sig = st.signed(item(g))
         submit(cr, it, sig)
-        assert reload(k, g, sha(it)) == {"generation": g, "item_sha256": sha(it)}
+        assert reload(k, g, sha(it)) == acked(st, g, sha(it))
         out.append(it)
     return k, out
 
@@ -305,7 +314,7 @@ def test_keys_refuses_rolled_back_current(st):
     assert k.routes.stated() == (None, None)                          # KEYS-ATTACH states none: CONTROL re-sends
     assert st.keys_head()["generation"] == 2                          # keys' head never moved back
     (st.dispatch / "current").write_bytes(b"2")
-    assert reload(k, 2, sha(two)) == {"generation": 2, "item_sha256": sha(two)}
+    assert reload(k, 2, sha(two)) == acked(st, 2, sha(two))
     assert k.dispatch_policy("glm", pin).route == "glm"
 
 
@@ -335,7 +344,7 @@ def test_keys_head_written_before_ack(st):
     assert reload(k, 3, sha(three)) == {"refused": "keys-unavailable"}
     assert st.keys_head()["generation"] == 2 and k.routes.stated() == (None, None)
     k.routes._fsync = os.fsync
-    assert reload(k, 3, sha(three)) == {"generation": 3, "item_sha256": sha(three)}
+    assert reload(k, 3, sha(three)) == acked(st, 3, sha(three))
 
 
 # ---- pins, through dispatch_policy with an explicit pin -------------------------------------------------------------
@@ -435,10 +444,10 @@ def test_activation_serialized(st):
     async def interleave():
         k._in_loop()
         loop = asyncio.get_running_loop()
-        first = asyncio.ensure_future(k.reload(k.admin_epoch, 11, sha(eleven[0])))
+        first = asyncio.ensure_future(k.reload(k.admin_epoch, 11, sha(eleven[0]), keep=KEEP_ALL))
         assert await loop.run_in_executor(None, kentered.wait, 10)
         submit(cr0, *twelve)                                            # CONTROL moves on: current = 12
-        second = asyncio.ensure_future(k.reload(k.admin_epoch, 12, sha(twelve[0])))
+        second = asyncio.ensure_future(k.reload(k.admin_epoch, 12, sha(twelve[0]), keep=KEEP_ALL))
         await asyncio.sleep(0.3)
         kgate.set()
         return await first, await second
@@ -626,10 +635,10 @@ def test_keys_reload_transactions_never_overlap(st):
             active.pop(0)
     rm.check_reload, rm.commit = check, commit
     res: dict = {}
-    ta = threading.Thread(target=lambda: res.__setitem__("a", K.Keys._reload_files(rm, 3, sha(three[0]))))
+    ta = threading.Thread(target=lambda: res.__setitem__("a", K.Keys._reload_files(rm, 3, sha(three[0]), KEEP_ALL)))
     ta.start()
     assert held.wait(10)
-    tb = threading.Thread(target=lambda: res.__setitem__("b", K.Keys._reload_files(rm, 3, sha(three[0]))))
+    tb = threading.Thread(target=lambda: res.__setitem__("b", K.Keys._reload_files(rm, 3, sha(three[0]), KEEP_ALL)))
     tb.start()
     entered_while_held = second_in.wait(1.0)        # bounded: with the transaction lock it never enters while held
     release.set()
@@ -678,12 +687,12 @@ def test_keys_reload_cancelled_waits_out_its_work(st):
         k.state_lock = None             # this loop's own locks: 3.9 binds a lock to the loop that made it, and the
         k._in_loop()                    # RELOAD lock is contended here (the earlier RELOADs ran on other loops)
         loop = asyncio.get_running_loop()
-        first = asyncio.ensure_future(k.reload(k.admin_epoch, 3, sha(three[0])))
+        first = asyncio.ensure_future(k.reload(k.admin_epoch, 3, sha(three[0]), keep=KEEP_ALL))
         assert await loop.run_in_executor(None, a_held.wait, 10)
         first.cancel()                                            # the preemption's cancel of the request task
         await asyncio.sleep(0)
         submit(cr, *four)                                         # CONTROL moves on: current = 4
-        second = asyncio.ensure_future(k.reload(k.admin_epoch, 4, sha(four[0])))
+        second = asyncio.ensure_future(k.reload(k.admin_epoch, 4, sha(four[0]), keep=KEEP_ALL))
         seen["b_in_while_held"] = await loop.run_in_executor(None, b_in.wait, 1.0)
         a_go.set()
         try:
@@ -698,7 +707,7 @@ def test_keys_reload_cancelled_waits_out_its_work(st):
     asyncio.run(run())
     assert seen["first"] == "cancelled" and not seen["b_in_while_held"] and overlaps == [], seen
     assert seen["after_first"] == (3, 3, (3, sha(three[0]))), seen
-    assert seen["second"] == {"generation": 4, "item_sha256": sha(four[0])}
+    assert seen["second"] == acked(st, 4, sha(four[0]))
     assert k.routes.stated() == (4, sha(four[0])) and st.keys_head()["generation"] == 4
 
 
@@ -772,7 +781,7 @@ def test_keys_equal_generation_reload_converges(st):
     assert reload(k, 3, sha(three[0])) == {"refused": "keys-unavailable"}
     assert st.keys_head()["generation"] == 3 and k.routes.stated() == (None, None)
     del calls[1:]
-    assert reload(k, 3, sha(three[0])) == {"generation": 3, "item_sha256": sha(three[0])}
+    assert reload(k, 3, sha(three[0])) == acked(st, 3, sha(three[0]))
     assert True in calls[1:]                                      # settled again
     assert k.routes.head["generation"] == 3 and k.routes.stated() == (3, sha(three[0]))
     pin = RM.Pin(3, RM.policy_digest(route()["policy"]))
@@ -951,7 +960,7 @@ def test_reload_executor_refusing_work_refuses(st):
         ex = Shut(max_workers=1)
         asyncio.get_running_loop().set_default_executor(ex)
         try:
-            return await k.reload(k.admin_epoch, 3, sha(three[0]))
+            return await k.reload(k.admin_epoch, 3, sha(three[0]), keep=KEEP_ALL)
         finally:
             ex.shutdown(wait=False)
     assert asyncio.run(run()) == {"refused": "keys-unavailable"}
@@ -988,7 +997,7 @@ def test_collision_unknown_ids_survive_a_refused_reload(st):
         ex = Shut(max_workers=1)
         asyncio.get_running_loop().set_default_executor(ex)
         try:
-            return await k.reload(k.admin_epoch, 1, sha(one[0]))
+            return await k.reload(k.admin_epoch, 1, sha(one[0]), keep=KEEP_ALL)
         finally:
             ex.shutdown(wait=False)
     assert asyncio.run(shut()) == {"refused": "keys-unavailable"}

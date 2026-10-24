@@ -420,6 +420,39 @@ class ControlRoutes:
             finally:
                 os.close(dfd)
 
+    def delete_unserved(self, served: "frozenset[int]", keep: "frozenset[int]") -> List[int]:
+        """Head ruling H5 (1024+8), CONTROL's half; the caller holds the activation lock. Deletes the files of every
+        generation below the head that keys' RELOAD ack (`served`) no longer lists and that CONTROL's own `keep` does
+        not name: never from CONTROL's view alone, since keys re-loads every generation its head lists at its start
+        and a missing file there fails every base route closed (`route_ids()` None). Returns the generations
+        deleted."""
+        a = self._active
+        if a is None:
+            return []
+        try:
+            names = os.listdir(self.dispatch)
+        except FileNotFoundError:
+            return []
+        gone: set = set()
+        for n in names:
+            m = _GEN_FILE.match(n)
+            if m is None:
+                continue
+            g = int(m.group(1))
+            if g < a.generation and g not in served and g not in keep:
+                try:
+                    os.unlink(self.dispatch / n)
+                    gone.add(g)
+                except FileNotFoundError:
+                    pass
+        if gone:
+            dfd = os.open(self.dispatch, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                self._fsync(dfd)
+            finally:
+                os.close(dfd)
+        return sorted(gone)
+
     def submit(self, item: object, sig: object, reload: Callable[[Dict[str, object]], object],
                served: Optional[Callable[[], object]] = None) -> int:
         """`ROUTE-SUBMIT {map, sig}` (r3 §2.3 "Accept at CONTROL" + "Activation", R4 §2), under the activation lock from
@@ -563,6 +596,14 @@ class KeysRoutes:
         return checked, {"format": KEYS_HEAD_FORMAT, "store_id": trust.store_id, "generation": generation,
                          "item_sha256": item_sha256, "served": served}
 
+    @staticmethod
+    def pruned(head: dict, keep: "frozenset[int]") -> dict:
+        """`head` with every `served` entry below its generation dropped unless `keep` names it (head ruling H5,
+        1024+8): `keep` is the RELOAD's `keep` (what CONTROL's open tickets and live sessions reference) plus the
+        generations keys' own cached runs name. The head generation itself is always served."""
+        served = [e for e in head["served"] if e["generation"] == head["generation"] or e["generation"] in keep]
+        return {**head, "served": served}
+
     def commit(self, new_head: dict) -> None:
         """keys' head, durably, BEFORE the generation is served or acked (the same bytes again settle it)."""
         os.makedirs(self.head_path.parent, mode=0o700, exist_ok=True)
@@ -576,8 +617,11 @@ class KeysRoutes:
         self.ids_unknown = head is None and problem is not None   # `load`: a head on disk that does not verify
 
     def accept(self, checked: Checked, head: dict) -> None:
-        """A RELOAD keys acks: `head` (already durable) installed and the generation served."""
+        """A RELOAD keys acks: `head` (already durable) installed and the generation served; a generation the head no
+        longer lists (pruned) is no longer held."""
         self.head = head
+        listed = {e["generation"] for e in head["served"]}
+        self.maps = {g: m for g, m in self.maps.items() if g in listed}
         self.maps[checked.generation] = checked
         self.usable, self.problem = True, None
         self.ids_unknown = False

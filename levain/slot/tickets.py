@@ -251,7 +251,12 @@ class TicketStore:
 
     # -- the start: read, check, compact ----------------------------------------------------------------------------
 
-    def start(self) -> None:
+    def start(self, has_session: Optional[Callable[[str], bool]] = None) -> None:
+        """`has_session(session)`: whether CONTROL's state store holds that session's record (CONTROL loads its records
+        first). Head ruling H8 (1024+8): a ticket journaled BOUND to a session with no record (CONTROL died between
+        the bind line and the record's write) is unbound back to minted here, before the compaction, which then writes
+        it without its bind: no session existed, so nothing ran and nothing was charged. With no `has_session`, every
+        binding stands."""
         with self.lock:
             if self._fd is not None:
                 os.close(self._fd)
@@ -261,6 +266,10 @@ class TicketStore:
             except FileNotFoundError:
                 pass
             self._by_attempt, self._by_ticket = self._rebuild(self._read())
+            if has_session is not None:
+                for t in self._by_ticket.values():
+                    if t.state == BOUND and t.session is not None and not has_session(t.session):
+                        t.state, t.session = UNBOUND, None
             self._compact()
             self._fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
                                0o600)
@@ -520,6 +529,13 @@ class TicketStore:
                 if t.state == BOUND and t.session == session:
                     return t
             return None
+
+    def referenced_generations(self, sessions: "set[str]") -> "frozenset[int]":
+        """The route-map generations still referenced (head ruling H5, RELOAD's `keep`): every OPEN ticket's, and every
+        ticket's bound to one of `sessions` (the live ones), whatever its state."""
+        with self.lock:
+            return frozenset(int(t.facts["routemap_generation"]) for t in self._by_ticket.values()   # type: ignore
+                             if "routemap_generation" in t.facts and (t.state in OPEN or t.session in sessions))
 
     def cancel(self, ticket: str) -> None:
         """An UNBOUND ticket only (`ticket-bound` once a lease bound it; `ticket-unknown` for one never minted;

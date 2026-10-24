@@ -885,9 +885,11 @@ class Control:
         activation finished, under the activation lock); keys is sent the head by the attach-time ``RELOAD``."""
         if self.routes is not None:
             self.routes.start_pass()
+        loaded = self.store.load()
         if self.tickets is not None:
-            self.tickets.start()     # the compaction runs before any append is admitted (CONTRACT §3.5)
-        self.store.load()
+            # the compaction runs before any append is admitted (CONTRACT §3.5); the records are loaded first so a
+            # binding whose session record was never written is undone (head ruling H8)
+            self.tickets.start(has_session=lambda s: s in loaded)
         past = False
         for rec in sorted(self.store.all(), key=lambda r: r.session):
             if rec.state in R.LIVE_STATES:
@@ -1269,10 +1271,15 @@ class Control:
 
     def _op_status(self, conn: Conn, args: dict) -> dict[str, object]:
         """§3.3: the records whose ``claims.operator_uid`` is the peer. DECISION: the answer is an object,
-        so the list rides ``records``."""
+        so the list rides ``records``. Head ruling H8 (1024+8): a record's ``claims.ticket`` is left out (the ticket is
+        a bearer handle that reaches no record a non-root reader opens, H1)."""
         want = R.check_session(args["session"]) if "session" in args else None
-        recs = [R.state_record(r) for r in sorted(self.store.all(), key=lambda r: r.session)
-                if r.claims.get("operator_uid") == conn.peer_uid and (want is None or r.session == want)]
+        recs = []
+        for r in sorted(self.store.all(), key=lambda r: r.session):
+            if r.claims.get("operator_uid") == conn.peer_uid and (want is None or r.session == want):
+                rec = R.state_record(r)
+                rec["claims"] = {k: v for k, v in rec["claims"].items() if k != "ticket"}
+                recs.append(rec)
         return {"records": recs}
 
     # -- root verbs ----------------------------------------------------------------------------------------
@@ -1316,7 +1323,7 @@ class Control:
                     raise Refused("session-exists")
                 if lease.ticket is not None:
                     # journaled before the record exists: a crash between the two leaves the ticket bound and no
-                    # session, which runs nothing (the ticket stays open until 3c-7's release)
+                    # session, which runs nothing; CONTROL's next start unbinds it (head ruling H8)
                     facts = dict(self._ticket_store().bind(lease.ticket, session).facts)
                 rec = R.SessionState(session=session, generation=0, state=R.ALLOCATED, claims=claims,
                                      lease_live=True, event_kind="state",
@@ -1807,22 +1814,42 @@ class Control:
         keys' ack is recorded as what keys serves on the attachment that was current when it was sent, if that is
         still the current one (a newer attachment states its own); a refusal, or any other failure of the call, is
         noted in :attr:`seam_errors` and never raised (the head is already durable: the activation stands, and keys
-        is reached again by the attach-time RELOAD or a resubmission)."""
+        is reached again by the attach-time RELOAD or a resubmission).
+
+        Head ruling H5 (1024+8): the RELOAD carries ``keep`` (:meth:`_keep_generations`), and keys' ack lists what it
+        still serves; a generation file is deleted only once that ack no longer lists it
+        (:meth:`levain.slot.routemaps.ControlRoutes.delete_unserved`). An ack without a well-formed ``served`` list
+        deletes nothing."""
         if self.keys_admin is None:
             return
         want = {"generation": head["generation"], "item_sha256": head["item_sha256"]}
+        keep = self._keep_generations(int(head["generation"]))   # type: ignore[call-overload]
         with self._mu:
             no = None if self._attach is None else self._attach.attach_no
         try:
-            got = self.keys_admin.call("RELOAD", **want)
+            got = self.keys_admin.call("RELOAD", **want, keep=sorted(keep))
         except Exception as e:
             self.seam_errors.append(("reload", "", e))
             return
+        acked = got.get("generation") == want["generation"] and got.get("item_sha256") == want["item_sha256"]
         with self._mu:
-            if (no is not None and self._attach is not None and self._attach.attach_no == no
-                    and got.get("generation") == want["generation"] and got.get("item_sha256") == want["item_sha256"]):
+            if no is not None and self._attach is not None and self._attach.attach_no == no and acked:
                 self._keys_serves = want
                 self._serves_cv.notify_all()
+        served = got.get("served")
+        if (acked and self.routes is not None and type(served) is list
+                and all(type(g) is int for g in served) and want["generation"] in served):
+            try:
+                self.routes.delete_unserved(frozenset(served), keep)
+            except Exception as e:   # noqa: BLE001 - files left behind are deleted after a later ack
+                self.seam_errors.append(("reload-prune", "", e))
+
+    def _keep_generations(self, head_gen: int) -> frozenset:
+        """RELOAD's ``keep`` (head ruling H5): the active generation, plus every route-map generation an OPEN ticket
+        names, plus that of any ticket bound to a session whose record is still live."""
+        live = {r.session for r in self.store.in_memory() if r.state in R.LIVE_STATES}
+        refs = self.tickets.referenced_generations(live) if self.tickets is not None else frozenset()
+        return frozenset({head_gen, *refs})
 
     # -- dispatch's route maps (§4.3; 3c design r3 §2.3, R4 §2) ------------------------------------------------
 

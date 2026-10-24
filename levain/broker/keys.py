@@ -28,7 +28,7 @@ The admin server (design 1.5 "The admin connection", "Fencing", "Order inside on
 - each request runs as its own task carrying the admin epoch of its connection, so answers go out in any order; two
   requests naming one session run in frame order, the order assigned in the read loop with no `await` between the
   read and the append to that session's chain.
-- FRONT-REGISTER / FRONT-ARM / DROP-SESSION are the fenced table calls; RELOAD {generation, item_sha256} (S1 3c-4) loads
+- FRONT-REGISTER / FRONT-ARM / DROP-SESSION are the fenced table calls; RELOAD {generation, item_sha256, keep} loads
   a dispatch route map under keys' one RELOAD lock (RELOAD names no session, so the per-session order cannot order it):
   every check re-run by keys itself (`levain.slot.routemaps`), keys' own head written durably before it serves or acks;
   its file work is one transaction at a time (`KeysRoutes.txn`) and is waited out even when a preemption cancels it.
@@ -175,7 +175,7 @@ ADMIN_VERBS = {
     "FRONT-REGISTER": frozenset({"session", "front_uid", "pid", "start", "incarnation", "reg_token"}),
     "FRONT-ARM": frozenset({"session", "reg_token"}),
     "DROP-SESSION": frozenset({"session"}),
-    "RELOAD": frozenset({"generation", "item_sha256"}),
+    "RELOAD": frozenset({"generation", "item_sha256", "keep"}),
 }
 #: RELOAD's `item_sha256`: the hex SHA-256 of the route-map item (3c design r3 §2.3, R4 §2)
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
@@ -732,6 +732,10 @@ def check_admin_args(op: str, args: dict) -> Optional[str]:
                 return "wrong-type"
         elif k == "item_sha256":
             if type(x) is not str or not _SHA256_HEX.match(x):
+                return "wrong-type"
+        elif k == "keep":   # RELOAD's generations still referenced (head ruling H5): distinct positive integers
+            if type(x) is not list or any(type(g) is not int or not 1 <= g <= JSON_INT_MAX for g in x) \
+                    or len(set(x)) != len(x):
                 return "wrong-type"
         elif type(x) is not int or not 0 <= x <= JSON_INT_MAX:
             return "wrong-type"
@@ -1675,7 +1679,7 @@ class Keys:
         elif op == "DROP-SESSION":
             out = await self.drop_session(epoch, args["session"])
         else:
-            out = await self.reload(epoch, args["generation"], args["item_sha256"])
+            out = await self.reload(epoch, args["generation"], args["item_sha256"], keep=args["keep"])
         if out is None:
             return None
         if "refused" in out:
@@ -2210,10 +2214,13 @@ class Keys:
 
     # -- RELOAD (S1 3c-4; 3c design r3 §2.3 "Load at keys", R4 §2) --
 
-    async def reload(self, epoch: int, generation: int, item_sha256: str) -> Optional[dict]:
-        """`RELOAD {generation, item_sha256}`: under the RELOAD lock, the file work off the loop (`current`, the file and
-        its digest, every item check, the order against keys' own head on disk, then that head written durably, all
-        inside `KeysRoutes.txn`), then the generation served on the loop, then the ack `{generation, item_sha256}`. A
+    async def reload(self, epoch: int, generation: int, item_sha256: str, *, keep: Sequence[int]) -> Optional[dict]:
+        """`RELOAD {generation, item_sha256, keep}`: under the RELOAD lock, the file work off the loop (`current`, the
+        file and its digest, every item check, the order against keys' own head on disk, then that head written durably,
+        all inside `KeysRoutes.txn`), then the generation served on the loop, then the ack
+        `{generation, item_sha256, served: [generation]}`. Head ruling H5 (1024+8): the head written drops every
+        `served` entry below it that neither `keep` nor a `run` in keys' cache names, and `served` is what the
+        written head still lists (CONTROL deletes a generation's files only once this list leaves it out). A
         refusal leaves every dispatch route refused until a valid RELOAD. A request from a stale epoch, or after the
         shutdown latch, is not answered; a RELOAD that completed before its epoch went stale still stands (it was
         verified whole).
@@ -2229,8 +2236,9 @@ class Keys:
         assert self.reload_lock is not None
         loop = asyncio.get_running_loop()
         async with self.reload_lock:
+            held = frozenset(keep) | self._cached_run_generations()
             try:
-                fut = loop.run_in_executor(None, self._reload_files, rm, generation, item_sha256)
+                fut = loop.run_in_executor(None, self._reload_files, rm, generation, item_sha256, held)
             except Exception as e:   # the executor took no work (shut down, cannot schedule): a failed RELOAD
                 rm.refuse("keys-unavailable")
                 _note(logging.WARNING, "levain gw-keys: RELOAD %s failed (%s)", generation, type(e).__name__)
@@ -2263,19 +2271,31 @@ class Keys:
             else:
                 checked, head = fut.result()
                 rm.accept(checked, head)
-                out = {"generation": generation, "item_sha256": item_sha256}
+                out = {"generation": generation, "item_sha256": item_sha256,
+                       "served": [e["generation"] for e in head["served"]]}
         if cancelled:
             raise asyncio.CancelledError()
         return out
 
     @staticmethod
-    def _reload_files(rm: "routemaps.KeysRoutes", generation: int,
-                      item_sha256: str) -> "Tuple[routemaps.Checked, dict]":
-        """The synchronous RELOAD transaction, one at a time (`rm.txn`): the checks, then the head settled."""
+    def _reload_files(rm: "routemaps.KeysRoutes", generation: int, item_sha256: str,
+                      keep: "frozenset[int]") -> "Tuple[routemaps.Checked, dict]":
+        """The synchronous RELOAD transaction, one at a time (`rm.txn`): the checks, then the head pruned to `keep`
+        (H5) and settled."""
         with rm.txn:
             checked, head = rm.check_reload(generation, item_sha256)
+            head = rm.pruned(head, keep)
             rm.commit(head)
         return checked, head
+
+    def _cached_run_generations(self) -> "frozenset[int]":
+        """The route-map generations the `run`s in keys' cache are pinned to (H5: never pruned while cached)."""
+        out = set()
+        for entry in self.cache.values():
+            run = entry.get("claims", {}).get("run") if isinstance(entry, dict) else None
+            if isinstance(run, dict) and type(run.get("routemap_generation")) is int:
+                out.add(run["routemap_generation"])
+        return frozenset(out)
 
     def _base_route(self, route: str) -> Optional[RoutePolicy]:
         """`route`'s object in `L/routes/base.json`, opened at every `Q` and parsed (`policy.parse_base_map`: `/1`
