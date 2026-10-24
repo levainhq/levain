@@ -2935,6 +2935,12 @@ def _v_form(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
             for key in ("transient_prefix", "gone_match"):
                 if key in f and not (_is_str(f[key]) and f[key].strip()):
                     raise _bad(spec, f"{w}.{key}", "must be a string with something other than whitespace in it")
+            if "transient_prefix" in f and f["transient_prefix"] != f["transient_prefix"].strip():
+                # the page compares the prefix raw against the enum ids: a padded one would match none of them
+                raise _bad(spec, f"{w}.transient_prefix", "carries leading or trailing whitespace")
+            if "gone_match" in f and "transient_prefix" not in f:
+                # the recovery clears only ids under the prefix, so a match with no prefix could never act
+                raise _bad(spec, f"{w}.gone_match", "needs a transient_prefix beside it")
         else:
             for key in ("enum", "default", "transient_prefix", "gone_match"):
                 if key in f:

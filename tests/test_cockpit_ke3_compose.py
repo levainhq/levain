@@ -245,8 +245,10 @@ def test_cx6_a_rediscovery_that_withdraws_the_compose_verb_cannot_leave_a_compos
     (1, {"default": "cli"}, "list of ids"),
     (1, {"transient_prefix": ""}, "other than whitespace"),
     (1, {"transient_prefix": "  "}, "other than whitespace"),
-    (1, {"gone_match": " "}, "other than whitespace"),
-    (1, {"gone_match": 3}, "other than whitespace"),
+    (1, {"gone_match": " ", "transient_prefix": "seat:"}, "other than whitespace"),
+    (1, {"gone_match": 3, "transient_prefix": "seat:"}, "other than whitespace"),
+    (1, {"transient_prefix": " seat:"}, "leading or trailing whitespace"),
+    (1, {"gone_match": "gone"}, "needs a transient_prefix"),
     (0, {"default": ["cli"]}, "recipient field only"),                                               # on the text field
     (0, {"transient_prefix": "seat:"}, "recipient field only"),
     (0, {"gone_match": "gone"}, "recipient field only"),

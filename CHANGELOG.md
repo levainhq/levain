@@ -23,8 +23,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   - `gone_match`: a case-insensitive substring of the refusal that says a chosen id has left. It is matched against
     the error code and the message together, as the page receives them. A stable error code is the safest thing to
     match.
-  The departed-reader recovery needs both `transient_prefix` and `gone_match`. The graph tap needs only
-  `transient_prefix`.
+  The departed-reader recovery needs both `transient_prefix` and `gone_match`, so a `gone_match` without a prefix is
+  refused at registration. The graph tap needs only `transient_prefix`.
 
 ### Known edges
 - A metered call is priced by the request's `model` alone. A fallback list (`models`) or a `route` in the body is not

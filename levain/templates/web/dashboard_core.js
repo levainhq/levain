@@ -6209,9 +6209,12 @@
     }
     box.ckPick([chipId]);
     // a tab change redraws the board, which rebuilds this box (it keeps the pick): land again on the box that is there a frame later
+    // only the card that was pressed (its compose key), never another card that happens to offer the same chip id
+    const key = box.dataset.composeKey;
     const land = () => {
-      const c = Array.from(document.querySelectorAll('[data-ck-compose="recipient"]')).find((x) => x.dataset.value === chipId && !x.closest("#levain-modal"));
-      const b = c ? c.closest(".tray-dump") : null, ta = b ? b.querySelector(".tray-dump-ta") : null;
+      const b = Array.from(document.querySelectorAll(".tray-dump")).find((x) => x.dataset.composeKey === key && !x.closest("#levain-modal")
+        && Array.from(x.querySelectorAll('[data-ck-compose="recipient"]')).some((c) => c.dataset.value === chipId));
+      const ta = b ? b.querySelector(".tray-dump-ta") : null;
       if (!ta || document.activeElement === ta) return;
       if (typeof b.scrollIntoView === "function") b.scrollIntoView({ block: "center" });
       if (typeof ta.focus === "function") ta.focus({ preventScroll: true });
