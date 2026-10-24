@@ -6,6 +6,25 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **Per-device cockpit pairing (the server half).** A device that already holds a cockpit credential mints a one-time
+  code (`POST /cockpit/pair/offer`, 128-bit, ten minutes, single use); a new device trades it for its OWN token at
+  `POST /cockpit/pair/claim`, the one route that needs no credential. Each paired device is revocable alone
+  (`POST /cockpit/pair/revoke`), and a revoke takes the devices it paired with it, voids their open codes, cancels
+  their waiting requests and ends their open change streams. A paired token opens what the shared write token opens
+  and nothing more: every passkey-signed act still needs the passkey. Only token hashes are stored, in `cockpit.db`.
+  `levain cockpit pair` mints a code from the box itself (it refuses to print one into a pipe unless given
+  `--print`), and `levain cockpit pair --revoke-all` ends every paired device. The pairing page, the devices panel
+  and the QR code are not in this release; until they are, a code is claimed by a client calling the route.
+
+### Fixed
+- **The phone server no longer writes its token into its log.** With `--link-file`, the token goes only into that
+  0600 file, and the line naming the file is printed only after the file holds the link. Without `--link-file` the
+  link is printed as before, for a person at a terminal.
+- **A broker that is not running answers a paired device with 503, never a refusal that drops its token.** While the
+  broker is starting, owned by another process or disabled, a request carrying a paired token gets `503
+  broker_unavailable` with `Retry-After: 2`.
+
 ## [0.11.23] — 2026-10-24
 
 ### Added
