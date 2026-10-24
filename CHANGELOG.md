@@ -7,6 +7,47 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **The cockpit's grant "revoke" button signs with your passkey.** On a cockpit served with a `signer=` over the same
+  consent queue its grant cards come from, the button
+  runs the phone page's own revoke ceremony: one passkey prompt, and the grant is revoked in the authority log. The
+  server builds the link and the page checks the challenge is over that link before the prompt. The new routes,
+  `GET /cockpit/grant/list.json` and `POST /cockpit/grant/<id>/revoke-challenge` and `.../revoke`, ride the sign
+  routes' gate. Everywhere else the button still copies `levain consent grant revoke`, and the copy line stays under
+  the signing button.
+
+### Changed
+- **A compose card pre-selects only the readers its provider declares.** A provider that relied on 0.11.21's built-in
+  default reader, seat tap or departed-seat recovery must declare the keys below. Without them, the card starts with
+  nothing pressed, so a message goes to everyone. Tapping a seat on the agents graph opens its agent page, and a
+  departed reader's refusal is shown as it came back. The departed-reader notice now reads "that reader is gone, choose again".
+
+### Fixed
+- **The cockpit message card's default reader and its departed-reader recovery are declared by the provider, not built
+  into the page.** 0.11.21 pre-selected one named agent and recognised one refusal wording in the page's own script,
+  and its entry described that agent as Levain's own. A compose `recipient` field now takes three optional keys,
+  validated beside `enum` and refused on any other field type:
+  - `default`: `enum` ids pressed at the start, spelled exactly as in `enum`. Empty or absent means nothing is pressed.
+  - `transient_prefix`: the start of every id that can leave the roster between draw and send. The agents graph
+    presses the chip whose id is `transient_prefix` followed by the seat's roster name.
+  - `gone_match`: a case-insensitive substring of the refusal that says a chosen id has left. It is matched against
+    the error code and the message together, as the page receives them. A stable error code is the safest thing to
+    match.
+  The departed-reader recovery needs both `transient_prefix` and `gone_match`, so a `gone_match` without a prefix is
+  refused at registration. The graph tap needs only `transient_prefix`.
+
+### Known edges
+- The authority log takes a passkey's revoke only from the passkey's own https name with no port. A cockpit served
+  on a port, such as `https://<name>:8443`, lists no passkey that can revoke there, says why, and keeps the copy
+  button.
+- One revoke waits per grant on each page server: a second challenge for the same grant (another tab) replaces the
+  first, whose passkey answer is then refused, and you ask again.
+- A metered call is priced by the request's `model` alone. A fallback list (`models`) or a `route` in the body is not
+  read, and neither is the model the provider's response says ran. No route in this release reaches a vendor that
+  honours them; the vendor routes that do will refuse both and settle from the model that ran.
+
+## [0.11.22] — 2026-10-24
+
+### Added
 - **The cockpit can sign answers and messages with your passkey.** An embedder that files levain sign requests (the
   phone page's ceremony) can now have the cockpit page run the same ceremony. `make_server` takes `signer=` (a
   `levain.consent.sign.Signer` pinned to the page it is served on with `page_origin`), `extra_hosts=` (the bare https

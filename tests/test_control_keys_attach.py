@@ -44,8 +44,7 @@ OVER = B2.usage_response({"input_tokens": 1, "output_tokens": 50000})
 
 @pytest.fixture(params=PYS, ids=lambda p: "usr-bin-python3" if p == SYS_PY else "venv")
 def py(request):
-    if not B2.h11_available(request.param):
-        pytest.skip("h11 is not importable by %s (named skip, not a pass)" % request.param)
+    B2.require_h11(request.param)
     return request.param
 
 
@@ -674,11 +673,15 @@ def test_slow_admin_ack_does_not_revoke_others(monkeypatch, delay, closes):
             assert root(control, "REVOKE", session=S1)["ok"]
             took = time.monotonic() - t0
             control.join_eof(5)
-            drops = [r["op"] for _, r in keys.log].count("DROP-SESSION")
             if closes:
                 R3.until(lambda: control.store.get(S2).state == R.REVOKED, timeout=10, what="s2 revoked at V23")
             else:
+                # keys reads the resent drop only once its held answer is out, so a slow runner can read the log before
+                # the resend lands (CI run on 5982d9d3): wait for it, bounded, then hold a moment for a stray close
+                R3.until(lambda: [r["op"] for _, r in keys.log].count("DROP-SESSION") >= 2, timeout=5,
+                         what="the drop resent after its attempt deadline")
                 time.sleep(0.3)
+            drops = [r["op"] for _, r in keys.log].count("DROP-SESSION")
             s2 = control.store.get(S2)
             out = {"took": took, "drops": drops, "eofs": eofs, "connected": admin.connected(), "s2": s2.state,
                    "s2_handles": control.handles(S2) is not None}

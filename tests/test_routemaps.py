@@ -490,8 +490,7 @@ def keys_py(request):
     from tests import b2_keys_rig as B2
     if not os.path.exists(request.param):
         pytest.skip("no " + request.param)
-    if not B2.h11_available(request.param):
-        pytest.skip("h11 is not importable by %s (named skip, not a pass)" % request.param)
+    B2.require_h11(request.param)
     return request.param
 
 

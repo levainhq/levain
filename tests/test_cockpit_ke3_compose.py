@@ -233,3 +233,31 @@ def test_cx6_a_rediscovery_that_withdraws_the_compose_verb_cannot_leave_a_compos
     head = ck.panel("inbox")
     assert head["actions"] == []
     assert any(e["source"] == "discovery:inbox" for e in m["errors"]), m["errors"]
+
+
+@pytest.mark.parametrize("field,extra,needle", [
+    (1, {}, None),                                                                                  # absent keys: valid
+    (1, {"default": ["daemon"], "transient_prefix": "seat:", "gone_match": "no live seat"}, None),
+    (1, {"default": []}, None),
+    (1, {"default": ["cli", "nobody"]}, "not an enum id"),
+    (1, {"default": [" cli"]}, "not an enum id"),                                                 # the page compares exactly
+    (1, {"default": ["cli", "cli"]}, "repeated"),
+    (1, {"default": "cli"}, "list of ids"),
+    (1, {"transient_prefix": ""}, "other than whitespace"),
+    (1, {"transient_prefix": "  "}, "other than whitespace"),
+    (1, {"gone_match": " ", "transient_prefix": "seat:"}, "other than whitespace"),
+    (1, {"gone_match": 3, "transient_prefix": "seat:"}, "other than whitespace"),
+    (1, {"transient_prefix": " seat:"}, "leading or trailing whitespace"),
+    (1, {"gone_match": "gone"}, "needs a transient_prefix"),
+    (0, {"default": ["cli"]}, "recipient field only"),                                               # on the text field
+    (0, {"transient_prefix": "seat:"}, "recipient field only"),
+    (0, {"gone_match": "gone"}, "recipient field only"),
+])
+def test_a_recipient_field_declares_its_default_transient_prefix_and_gone_match(field, extra, needle) -> None:
+    c = copy.deepcopy(COMPOSE)
+    c["fields"][field].update(extra)
+    if needle is None:
+        Cockpit().register(_spec(compose=c))
+    else:
+        with pytest.raises(CockpitRegistrationError, match=needle):
+            Cockpit().register(_spec(compose=c))

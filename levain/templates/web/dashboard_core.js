@@ -3637,9 +3637,9 @@
     ta.style.height = (ta.scrollHeight + ta.offsetHeight - ta.clientHeight) + "px";
   }
 
-  // The reader chip that is the desk, pressed by default on a compose card that offers it; the value of the picker's option for
-  // a choice of several; and the pick a compose card keeps across the rebuild of its box (by panel), until a send lands.
-  const DESK_CHIP = "fanin";
+  // The value of the picker's option for a choice of several; and the pick a compose card keeps across the rebuild of its box (by
+  // panel), until a send lands. Which reader chips start pressed (`default`), which ids can leave the roster (`transient_prefix`)
+  // and the words of the refusal that says one has (`gone_match`) are declared by the provider on its recipient field.
   const SEVERAL_VALUE = "*several";
   const composePick = Object.create(null);
   const composeGen = Object.create(null);     // per compose key: bumped by every send, so a slow departed-seat recovery can tell a later send overtook it
@@ -3666,8 +3666,8 @@
     for (const f of fields) {
       if (!f || typeof f !== "object" || !f.name) continue;
       if (f.kind === "multiselect" && f.chips) {
-        // the KE compose card's recipient chips: toggle buttons. The desk (DESK_CHIP) is pressed when it is in the enum and nothing
-        // else was chosen; un-pressing it leaves none pressed = the field is omitted = everyone. The enum is the one the panel head
+        // the KE compose card's recipient chips: toggle buttons. The provider's declared `default` ids (those in the enum) are pressed
+        // when nothing else was chosen; un-pressing them leaves none pressed = the field is omitted = everyone. The enum is the one the panel head
         // carries NOW (this builds at every render and refetch): a seat chip that left the roster is not here, so it cannot be pressed.
         // At a phone width the same values are a <select> (a pick list holds a long roster; CSS shows one of the two), and every
         // change goes through one setter so chips, picker, address line and the kept pick agree.
@@ -3720,9 +3720,10 @@
         const kept = composePick[pickKey];
         const inEnum = new Set(chips.map((c) => c.dataset.value));
         const keptNow = Array.isArray(kept) ? kept.filter((v) => inEnum.has(v)) : null;
-        const start = keptNow && (keptNow.length || !kept.length) ? keptNow : (inEnum.has(DESK_CHIP) ? [DESK_CHIP] : []);
+        const dflt = Array.isArray(f.default) ? f.default.filter((v) => inEnum.has(v)) : [];
+        const start = keptNow && (keptNow.length || !kept.length) ? keptNow : dflt;
         controls.push({ f: f, nodes: chips.concat([pick]), read: pressedNow, set: setTo, chips: chips, pickKey: pickKey, initial: start,
-                        desk: inEnum.has(DESK_CHIP) ? [DESK_CHIP] : [] });
+                        default: dflt });
         continue;
       }
       if (f.kind === "multiselect") {
@@ -3775,6 +3776,7 @@
       box.dataset.composeKey = chipCtl.pickKey;
       box.ckBusy = () => go.disabled;                 // mid-send or at the confirm: the recipient is frozen
       box.ckPick = (values) => { if (go.disabled) return false; chipCtl.set(values); return true; };   // the agents graph's tap on a seat (messageTo, below)
+      box.ckPrefix = typeof chipCtl.f.transient_prefix === "string" ? chipCtl.f.transient_prefix : "";   // messageTo's name -> chip id
     }
     const msg = el("span", "edit-msg", "");
     row.append(go, msg);
@@ -3791,7 +3793,7 @@
       ({ name: c.f.name, kind: c.f.kind, required: c.f.required, label: c.f.label, value: c.read() })));
 
     // The kept pick is taken BEFORE a send goes out: a landed send rebuilds the board (and this box) before its promise resolves, and the
-    // fresh box must start from the desk, not from the pick it just used. The returned restore puts it back if the send fails.
+    // fresh box must start from the provider's declared default, not from the pick it just used. The returned restore puts it back if the send fails.
     const takePick = () => {
       if (!chipCtl) return null;
       composeGen[chipCtl.pickKey] = (composeGen[chipCtl.pickKey] || 0) + 1;
@@ -3803,17 +3805,20 @@
     const failed = (res, restore) => {
       if (restore) restore();
       showFail(msg, res, "failed");
-      // a seat that left the roster since the chips were drawn: the serving app's refusal names "no live seat" (code or words, whichever
-      // transport carried it)
+      // a transient reader that left the roster since the chips were drawn: the serving app's refusal carries the words the provider
+      // declared as `gone_match` (code or words, whichever transport carried it). A substring test, never a pattern built from them.
       const text = res ? [res.error, res.message].map((x) => String(x || "")).join(" ") : "";
-      if (chipCtl && /no[ _]live[ _]seat/i.test(text)) { seatGone(); return true; }
+      const gm = chipCtl ? chipCtl.f.gone_match : null;
+      if (chipCtl && typeof gm === "string" && gm && typeof chipCtl.f.transient_prefix === "string" && chipCtl.f.transient_prefix
+          && text.toLowerCase().includes(gm.toLowerCase())) { seatGone(); return true; }
       setDisabled(false);
       return false;
     };
     async function seatGone() {
-      const notice = "that seat is gone, choose again";
+      const notice = "that reader is gone, choose again";
       const startBox = box, gen = composeGen[chipCtl.pickKey];
-      const snap = chipCtl.read().filter((v) => /^seat:/.test(v));     // the failed send's own seats: the only ones this recovery may clear
+      const tp = chipCtl.f.transient_prefix;
+      const snap = chipCtl.read().filter((v) => v.startsWith(tp));     // the failed send's own transient readers: the only ones this recovery may clear
       const V = window.LevainCockpitView;
       let r = false;
       // the recipient controls and the send stay frozen until the refetch answers: a pick made in the wait would be wiped or sent to everyone
@@ -3875,7 +3880,7 @@
       if (!(res && res.ok)) return failed(res, restore);
       msg.className = "edit-msg"; msg.textContent = "";
       // a job start rebuilds nothing: put this live box's chips back to its start state so the shown pick is the kept one
-      if (chipCtl && box.isConnected) chipCtl.set(chipCtl.desk, false);
+      if (chipCtl && box.isConnected) chipCtl.set(chipCtl.default, false);
       setJob("running", null);
       startPoll(res.job_id);
     };
@@ -5541,7 +5546,7 @@
     .filter((c) => c && c.outcome === "refused").length;
   const grantRefused = (g) => Math.max(g && g.answered && Number.isInteger(g.answered.refused_count) ? g.answered.refused_count : 0,
                                        grantRefusedShown(g));
-  function grantCard(g, inertNote) {
+  function grantCard(g, inertNote, signList) {
     const sv = (x) => (typeof x === "string" ? x : "");
     const state = sv(g.state);
     const refused = grantRefused(g);
@@ -5580,35 +5585,167 @@
                                                    + (older > 0 ? " · " + older + " refused call" + (older === 1 ? "" : "s") + " older than these" : "")));
       row.appendChild(box);
     }
+    // the passkey can revoke here when the grants' sign listing names THIS card's grant (its id AND the instance the card
+    // shows: a grant renewed or re-made under the id, or one in another cockpit, is a different instance) and a passkey
+    // for it, and this page is the one the ceremony is pinned to; anywhere else the button copies the line, as it always did
+    const signed = signList && Array.isArray(signList.grants) && !signElsewhere(signList) && typeof g.instance === "string"
+      ? signList.grants.find((x) => x && x.id === g.id && x.instance === g.instance
+                                  && Array.isArray(x.signers) && x.signers.length) : null;
+    if (signed) {
+      const line = el("div", "consent-cmd grant-sign");
+      const btn = el("button", "undo-btn grant-revoke", "revoke");
+      btn.type = "button";
+      btn.title = "revoke with your passkey";
+      const note = el("span", "sign-note ext-meta");
+      const say = (text, kind) => { note.textContent = text; note.className = "sign-note ext-meta" + (kind ? " sign-" + kind : ""); };
+      btn.addEventListener("click", () => grantRevoke(g, signed, signList, btn, line, say));
+      line.append(btn, note);
+      row.appendChild(line);
+    }
     const cmd = sv(g.revoke);
     if (cmd) {
       const line = el("div", "consent-cmd");
       const code = el("code", "consent-code", cmd);
-      const btn = el("button", "undo-btn consent-copy", "revoke");
+      const btn = el("button", "undo-btn consent-copy", signed ? "copy" : "revoke");
       btn.type = "button";
       btn.dataset.label = btn.textContent;
-      btn.title = "copy the revoke command; run it in a terminal with your signing key. This page signs nothing";
+      btn.title = signed ? "copy the revoke command; run it in a terminal with your signing key"
+        : "copy the revoke command; run it in a terminal with your signing key. This page signs nothing";
       btn.addEventListener("click", () => copyText(cmd, code, btn));
       line.append(code, btn);
       row.appendChild(line);
     }
     return row;
   }
+  // PLAN M17 "9a": on the https cockpit the revoke button signs with the passkey, the phone's own ceremony
+  // (levain.consent.grant_phone.GrantPhone): /cockpit/grant/list.json names each grant's instance and the passkeys that
+  // may revoke it (a 404 is a cockpit with no signing, and the button copies), then /cockpit/grant/<id>/revoke-challenge
+  // -> navigator.credentials.get -> /revoke. The server builds and holds the link; the page recomputes the challenge from
+  // the line and head it is sent and puts only that to the passkey, so what the prompt signs is the link shown
+  const GRANT_SIGN_LIST = "/cockpit/grant/list.json";
+  let grantSaid = "";          // what the last revoke said, kept across the slot's redraw (a revoked grant leaves it)
+  function grantSignList() {
+    const headers = signHeaders(false);
+    if (!SIGN_USABLE || !headers["X-Levain-Write-Token"]) return Promise.resolve(null);
+    return fetchBounded(GRANT_SIGN_LIST, { cache: "no-store", headers: headers },
+      (res) => (res.ok ? res.json().then((b) => (b && Array.isArray(b.grants) ? b : null), () => null) : null),
+      () => null);
+  }
+  // the bytes a passkey signs for the authority link `line` chained to `prevHash`, as levain.consent.passkey.challenge
+  // builds them (the phone page's linkChallenge): "SSHSIG", then namespace, reserved, hash name and the SHA-512 of
+  // prevHash + "\n" + line, each but the first as an SSH string
+  function grantLinkChallenge(prevHash, line) {
+    const enc = (t) => new TextEncoder().encode(t);
+    const str = (b) => { const n = b.length, out = new Uint8Array(4 + n); out.set([n >>> 24 & 255, n >>> 16 & 255, n >>> 8 & 255, n & 255]); out.set(b, 4); return out; };
+    return crypto.subtle.digest("SHA-512", enc(prevHash + "\n" + line)).then((h) => {
+      const parts = [enc("SSHSIG"), str(enc("levain-authority")), str(new Uint8Array(0)), str(enc("sha512")), str(new Uint8Array(h))];
+      const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+      parts.reduce((at, p) => { out.set(p, at); return at + p.length; }, 0);
+      return out;
+    });
+  }
+  // One revoke: which passkey (signWho), the challenge, the passkey prompt (the gesture), the revoke, then the grants
+  // read again. As the phone says it: only the server's own 4xx after the assertion was sent is "not revoked"
+  function grantRevoke(g, signed, listing, btn, host, say) {
+    if (signBusy) { say(SIGN_BUSY.replace("signed", "revoked"), "bad"); return; }
+    signBusy++;
+    btn.disabled = true;
+    const base = "/cockpit/grant/" + encodeURIComponent(g.id) + "/";
+    const slot = host.closest(".grant-slot");     // at the click: a redraw during the ceremony detaches this card
+    let sent = false, revoked = false;
+    signWho({ signers: signed.signers, origin: listing.origin }, host, say).then((who) => {
+      if (!who) { say("nothing was revoked"); return; }
+      say("asking for the revoke to sign…");
+      return signCall(base + "revoke-challenge", { signer_fp: who.fp, instance: g.instance }).then((c) => {
+        if (!c.ok) { say("not revoked: " + signWhy(c), "bad"); return; }
+        let link = null;
+        try { link = JSON.parse(c.body.line); } catch (e) { link = null; }
+        // the server builds the link itself; one that does not name this grant is not put to the passkey
+        if (!link || link.op !== "revoke_grant" || link.grant_id !== g.id || typeof c.body.challenge !== "string"
+            || typeof c.body.prev_hash !== "string") {
+          say("not revoked: the link the server sent does not name this grant, so nothing was signed", "bad");
+          return;
+        }
+        return grantLinkChallenge(c.body.prev_hash, c.body.line).then((want) => {
+          if (signB64u(want) !== c.body.challenge) {
+            say("not revoked: the challenge the server sent is not over the link it shows, so nothing was signed", "bad");
+            return;
+          }
+          say("confirm with your passkey to revoke… " + c.body.line);
+          const pk = { challenge: want, rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+          if (who.rawId) pk.allowCredentials = [{ type: "public-key", id: signUnb64u(who.rawId) }];
+          return navigator.credentials.get({ publicKey: pk }).then((cred) => {
+            if (!cred || !cred.response) { say("not revoked: the passkey gave nothing to send; nothing was revoked", "bad"); return; }
+            say("verifying the signature…");
+            sent = true;
+            return signCall(base + "revoke", {
+              authenticator_data: signB64u(cred.response.authenticatorData), client_data_json: signB64u(cred.response.clientDataJSON),
+              signature: signB64u(cred.response.signature) }).then((r) => {
+              // the assertion has gone: only a 4xx carrying the server's own error word is a definite refusal; anything
+              // else (no answer, a 5xx, a 2xx/3xx whose body did not parse) may have revoked, so it is unknown. Each
+              // outcome is kept (grantSaid) so the redraw below does not erase it.
+              const refused = !r.ok && r.status >= 400 && r.status < 500 && r.body && typeof r.body.error === "string";
+              if (!r.ok && !refused) {
+                grantSaid = "result unknown for " + g.id + " (" + signWhy(r) + "): the grants were read again to show whether it is still there";
+                say(grantSaid, "bad");
+                return;
+              }
+              if (!r.ok) { grantSaid = "not revoked " + g.id + ": " + signWhy(r); say(grantSaid, "bad"); return; }
+              if (!who.rawId && cred.rawId && typeof c.body.rp_id === "string") signRemember(c.body.rp_id, who.fp, signB64u(cred.rawId));
+              revoked = true;
+              grantSaid = "revoked " + ((typeof g.id_shown === "string" && g.id_shown) || g.id) + " · link seq " + r.body.seq + (r.body.warning ? " · " + r.body.warning : "");
+              say(grantSaid, "ok");
+            });
+          }, (e) => say(signDeclined(e, "nothing was revoked"), "bad"));
+        });
+      });
+    }).catch((e) => {
+      const name = (e && e.name) || "error";
+      if (sent) grantSaid = "result unknown for " + g.id + " (the page failed: " + name + "): the grants were read again to show where it stands";
+      say(sent ? grantSaid : "the page failed (" + name + "); nothing was revoked", "bad");
+    }).finally(() => {
+      signBusy--;
+      btn.disabled = false;
+      if (!sent && !revoked) return;
+      // the grants again: a revoked grant leaves the slot, and the slot keeps what the revoke said
+      grantRead = null;
+      // the slot is resolved when the timer fires, not before: a redraw in the wait replaces it, and a fill into the
+      // detached one would also win the fill sequence over the live slot's own fill
+      setTimeout(() => {
+        const live = slot && slot.isConnected ? slot : document.querySelector(".grant-slot");
+        if (live) grantFill(live);
+      }, 1500);
+    });
+  }
   function grantSlot() {
     const slot = el("div", "grant-slot");
-    grantFetch().then((b) => {
-      if (!b) return;
+    grantFill(slot);
+    return slot;
+  }
+  let grantFillSeq = 0;        // the newest fill wins: an older read answering late never redraws over a newer one
+  function grantFill(slot) {
+    const n = ++grantFillSeq;
+    Promise.all([grantFetch(), grantSignList()]).then(([b, signList]) => {
+      if (!b || n !== grantFillSeq) return;
       // sort is stable: the server's order holds among grants with and among grants without a refused call
       const rows = b.grants.slice().sort((x, y) => (grantRefused(y) ? 1 : 0) - (grantRefused(x) ? 1 : 0));
       const note = typeof b.note === "string" ? b.note : "";
       // a page whose consent hook names no cockpit (root "") and that holds no grant gets no slot, as with no proposals;
       // a named cockpit that cannot be read is said
-      if (!rows.length && (!note || !b.root)) return;
+      // a revoke said here is kept (its grant has left the slot); the last grant revoked leaves the head and that line
+      const said = grantSaid ? [el("div", "consent-note ext-meta grant-said", grantSaid)] : [];
+      if (!rows.length && (!note || !b.root)) {
+        slot.replaceChildren(...(said.length ? [el("div", "ext-grouphead", "standing grants"), ...said] : []));
+        return;
+      }
       const head = el("div", "ext-grouphead", "standing grants");
       const inert = typeof b.inert_note === "string" ? b.inert_note : "";
-      slot.replaceChildren(head, ...(note ? [el("div", "consent-note ext-meta", note)] : []), ...rows.map((g) => grantCard(g, inert)));
+      // why no passkey can revoke on this page (a ported cockpit, a localhost one), in the server's words
+      const why = signList && typeof signList.grants_note === "string" && signList.grants_note ? signList.grants_note : "";
+      slot.replaceChildren(head, ...said, ...(note ? [el("div", "consent-note ext-meta", note)] : []),
+                           ...(why ? [el("div", "consent-note ext-meta grant-why", why)] : []),
+                           ...rows.map((g) => grantCard(g, inert, signList)));
     }).catch(() => {});
-    return slot;
   }
   // the Decisions history's two standing-rule slots, drawn together wherever the proposals are
   function standingSlots() {
@@ -6180,12 +6317,17 @@
   }
 
   // The agents graph's tap on a seat: press exactly that seat's chip on the compose card, bring the card into view and focus its message
-  // box. A seat is messageable IFF its chip id is among the chips the card holds NOW (the enum changes with the roster; a lane, the
-  // desk and an exited seat are never in it): a false answer means "not a seat you can message", and the caller keeps its own click.
-  function messageTo(chipId) {
-    if (typeof chipId !== "string" || !chipId) return false;
-    const chip = Array.from(document.querySelectorAll('[data-ck-compose="recipient"]'))
-      .find((c) => c.dataset.value === chipId && !c.closest("#levain-modal") && !c.disabled);
+  // box. The graph passes the seat's NAME; its chip id is the card's declared `transient_prefix` + that name (a card that declares no
+  // prefix addresses no seat by name). A seat is messageable IFF that id is among the chips the card holds NOW (the enum changes with the
+  // roster): a false answer means "not a seat you can message", and the caller keeps its own click.
+  function messageTo(name) {
+    if (typeof name !== "string" || !name) return false;
+    const chip = Array.from(document.querySelectorAll('[data-ck-compose="recipient"]')).find((c) => {
+      const b = c.closest(".tray-dump");
+      return b && typeof b.ckPrefix === "string" && b.ckPrefix && c.dataset.value === b.ckPrefix + name
+        && !c.closest("#levain-modal") && !c.disabled;
+    });
+    const chipId = chip ? chip.dataset.value : "";
     const box = chip ? chip.closest(".tray-dump") : null;
     if (!chip || !box || typeof box.ckPick !== "function" || (typeof box.ckBusy === "function" && box.ckBusy())) return false;
     const panel = chip.closest("[data-ck-panel]");
@@ -6199,9 +6341,12 @@
     }
     box.ckPick([chipId]);
     // a tab change redraws the board, which rebuilds this box (it keeps the pick): land again on the box that is there a frame later
+    // only the card that was pressed (its compose key), never another card that happens to offer the same chip id
+    const key = box.dataset.composeKey;
     const land = () => {
-      const c = Array.from(document.querySelectorAll('[data-ck-compose="recipient"]')).find((x) => x.dataset.value === chipId && !x.closest("#levain-modal"));
-      const b = c ? c.closest(".tray-dump") : null, ta = b ? b.querySelector(".tray-dump-ta") : null;
+      const b = Array.from(document.querySelectorAll(".tray-dump")).find((x) => x.dataset.composeKey === key && !x.closest("#levain-modal")
+        && Array.from(x.querySelectorAll('[data-ck-compose="recipient"]')).some((c) => c.dataset.value === chipId));
+      const ta = b ? b.querySelector(".tray-dump-ta") : null;
       if (!ta || document.activeElement === ta) return;
       if (typeof b.scrollIntoView === "function") b.scrollIntoView({ block: "center" });
       if (typeof ta.focus === "function") ta.focus({ preventScroll: true });

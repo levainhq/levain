@@ -339,3 +339,14 @@ def account_home() -> str:
 def h11_available(py: str) -> bool:
     cp = subprocess.run([py, "-c", "import h11"], capture_output=True, env={**os.environ, "HOME": account_home()})
     return cp.returncode == 0
+
+
+def require_h11(py: str) -> None:
+    """Return when ``py`` can import h11; else fail under CI, skip locally. CI installs h11 for /usr/bin/python3
+    (test.yml), so a skip there would hide the root run."""
+    import pytest
+    if h11_available(py):
+        return
+    if os.environ.get("CI"):
+        pytest.fail("h11 is not importable by %s under CI" % py)
+    pytest.skip("h11 is not importable by %s (named skip, not a pass)" % py)

@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-__all__ = ["HOLD", "GrantPhone", "GrantRefused"]
+__all__ = ["HOLD", "GrantPhone", "GrantRefused", "grant_route"]
 
 # how long a held link waits for its signature: a Face ID ceremony takes seconds
 HOLD = 120.0
@@ -48,6 +48,22 @@ class GrantRefused(Exception):
     def __init__(self, status: int, error: str, message: str) -> None:
         super().__init__(message)
         self.status, self.error, self.message = status, error, message
+
+
+def grant_route(route: str, prefix: str) -> "tuple[str, str] | None":
+    """``(grant_id, action)`` for ``<prefix><id>/<action>``, else None: the phone port's ``/grant/`` and the cockpit's
+    ``/cockpit/grant/``. A grant's id is its creator's choice, so the page sends encodeURIComponent(id); the decoded id
+    is looked up in the log, never trusted further. Its length is the log's to bound, not the route's: any id a grant
+    was made with can be revoked here."""
+    if not route.startswith(prefix):
+        return None
+    from urllib.parse import unquote
+
+    quoted, sep, action = route[len(prefix):].partition("/")
+    gid = unquote(quoted)
+    if not sep or not gid or action not in _NEED:
+        return None
+    return gid, action
 
 
 def _b64u(data: bytes) -> str:
@@ -79,6 +95,12 @@ class GrantPhone:
         if self.rp_id == "localhost":
             return {}, ("a passkey made on localhost cannot revoke a grant (the authority log takes a passkey's revoke "
                         "only from an https page): revoke from the laptop (levain consent grant revoke)")
+        if self.page_origin is not None and self.page_origin != f"https://{self.rp_id}":
+            # the replay verifies a revoke link against the key's own https name exactly, no port
+            # (levain.consent.passkey): a signature from this page would be refused there, so none is asked for
+            return {}, (f"the authority log takes a passkey's revoke only from https://{self.rp_id} exactly (no "
+                        f"port), and this page is {self.page_origin}: revoke from the phone page or the laptop "
+                        "(levain consent grant revoke)")
         try:
             keys = self._keys()
         except (SignRefused, AuthorityError, OSError, sqlite3.Error) as exc:

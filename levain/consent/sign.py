@@ -770,6 +770,12 @@ class Signer:
         self._challenged: dict[str, tuple[str, str, str | None, str | None]] = {}
 
     @property
+    def keys(self) -> "Callable[[], dict[str, Any]]":
+        """The ``keys`` callable this Signer was built with: what a server hosting it hands the grant revoke
+        (:class:`levain.consent.grant_phone.GrantPhone`), so both read one set of passkeys."""
+        return self._keys
+
+    @property
     def page_origin(self) -> str | None:
         """The page a passkey's assertion must come from exactly (see the class doc)."""
         return self._page_origin

@@ -425,8 +425,7 @@ PYS = [sys.executable] + ([SYS_PY] if os.path.exists(SYS_PY) and sys.executable 
 def py(request):
     if os.geteuid() == 0:
         pytest.skip("keys refuses to run as root (it runs as _levain_keys)")
-    if not R.h11_available(request.param):
-        pytest.skip("h11 is not importable by %s (named skip, not a pass)" % request.param)
+    R.require_h11(request.param)
     return request.param
 
 

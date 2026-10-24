@@ -2917,8 +2917,34 @@ def _v_form(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
                 if t in seen_ids:
                     raise _bad(spec, f"{w}.enum[{j}]", f"{t!r} is repeated (after trimming)")
                 seen_ids.add(t)
-        elif "enum" in f:
-            raise _bad(spec, f"{w}.enum", "belongs to a recipient field only")
+            # the provider, not the page, says which ids are pressed at the start and which can leave its roster
+            # (and the words its refusal uses when one has): Levain assigns no meaning to any of them
+            if "default" in f:
+                dflt = f["default"]
+                if not (isinstance(dflt, list) and all(_is_str(x) for x in dflt)):
+                    raise _bad(spec, f"{w}.default", "must be a list of ids from the enum")
+                # the page presses a default id only when it equals an enum id exactly (it compares the raw strings), so
+                # the check is exact too: a padded spelling would register here and press nothing there
+                picked: set[str] = set()
+                for j, x in enumerate(dflt):
+                    if x not in en:
+                        raise _bad(spec, f"{w}.default[{j}]", f"{x!r} is not an enum id (exactly as spelled there)")
+                    if x in picked:
+                        raise _bad(spec, f"{w}.default[{j}]", f"{x!r} is repeated")
+                    picked.add(x)
+            for key in ("transient_prefix", "gone_match"):
+                if key in f and not (_is_str(f[key]) and f[key].strip()):
+                    raise _bad(spec, f"{w}.{key}", "must be a string with something other than whitespace in it")
+            if "transient_prefix" in f and f["transient_prefix"] != f["transient_prefix"].strip():
+                # the page compares the prefix raw against the enum ids: a padded one would match none of them
+                raise _bad(spec, f"{w}.transient_prefix", "carries leading or trailing whitespace")
+            if "gone_match" in f and "transient_prefix" not in f:
+                # the recovery clears only ids under the prefix, so a match with no prefix could never act
+                raise _bad(spec, f"{w}.gone_match", "needs a transient_prefix beside it")
+        else:
+            for key in ("enum", "default", "transient_prefix", "gone_match"):
+                if key in f:
+                    raise _bad(spec, f"{w}.{key}", "belongs to a recipient field only")
     if v.get("verb") is not None and not _is_str(v["verb"]):
         raise _bad(spec, "value.verb", "must be a string")
     return v

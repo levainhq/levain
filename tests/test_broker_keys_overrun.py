@@ -42,8 +42,7 @@ CAP = 10_000_000   # far above every charge here: no refusal below is `budget-ex
 
 @pytest.fixture(params=PYS, ids=lambda p: "usr-bin-python3" if p == "/usr/bin/python3" else "venv")
 def py(request):
-    if not R.h11_available(request.param):
-        pytest.skip("h11 is not importable by %s (named skip, not a pass)" % request.param)
+    R.require_h11(request.param)
     return request.param
 
 

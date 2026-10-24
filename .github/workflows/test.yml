@@ -81,6 +81,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,openhands]" hatchling
 
+      - name: Install h11 for the runner's /usr/bin/python3
+        # tests/test_routemaps.py runs keys under /usr/bin/python3 too (the root-py param) and fails under CI when that
+        # interpreter cannot import h11, so the root run cannot quietly become a skip. pip, not apt, so the version is
+        # the floor root vendors (root_tree.H11_MIN) and not whatever the distro packages.
+        run: sudo /usr/bin/python3 -m pip install --break-system-packages "$(python tests/ci/root_closure.py h11-spec)"
+
       - name: Run pytest shard ${{ matrix.shard }} of ${{ env.TEST_SHARDS }}
         # Collect under THIS Python with the repo's real config, then pick this shard's files: shard.py fails on no
         # node ids, a file in no shard or two, an empty shard. Each command's exit is checked (bash -e, pipefail),
