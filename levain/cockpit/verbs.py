@@ -77,13 +77,15 @@ _ENVELOPE = frozenset({"verb", "panel_id", "row_id", "row_version", "panel_versi
 _INTENTS = ("reported", "sign")
 # The one param a signed verb (VerbSpec.sign, DESIGN_SIGN D5) takes beside its fields: the id of the sign request the
 # operator's passkey signed for these params. The kernel admits it only when the server says that request was filed by its
-# compose route for this verb and exactly these params and is signed (_require_sign_request, ``signed_for``); the verb's
-# own handler or effect still verifies the signature over the params, so the write token alone never sends a signed verb.
+# compose route for this verb and exactly these params and is signed, and the send's idempotency key is SIGN_KEY_PREFIX +
+# the draft id that compose was filed under (_require_sign_request, ``signed_for``); the verb's own handler or effect still
+# verifies the signature over the params, so the write token alone never sends a signed verb.
 SIGN_PARAM = "sign_request"
+SIGN_KEY_PREFIX = "sign-"
 GESTURES = ("direct", "direct-reported", "sign", "refused", "laptop-only")
-# ``signed_for(verb, request_id, params)``: whether the server's compose filed ``request_id`` for ``verb`` and exactly
-# ``params`` (the params without SIGN_PARAM) and its Signer holds that request signed
-SignedFor = Callable[[str, str, dict[str, Any]], bool]
+# ``signed_for(verb, request_id, params)``: the draft id (``client_txn``) the server's compose filed ``request_id`` under
+# for ``verb`` and exactly ``params`` (the params without SIGN_PARAM), when its Signer holds that request signed; else None
+SignedFor = Callable[[str, str, dict[str, Any]], "str | None"]
 
 
 def _param_names(verb: "VerbSpec") -> "set[str]":
@@ -97,19 +99,24 @@ def _at_most_once(verb: "VerbSpec") -> bool:
     return verb.idempotent or verb.sign
 
 
-def _require_sign_request(verb: "VerbSpec", params: dict[str, Any], signed_for: "SignedFor | None") -> None:
+def _require_sign_request(verb: "VerbSpec", params: dict[str, Any], signed_for: "SignedFor | None",
+                          key: Any) -> None:
     """A signed verb fails closed in the kernel: unless ``signed_for`` says its SIGN_PARAM names a request filed for this
-    verb and exactly these params and signed, it never reaches its handler or effect (a dry run included). A caller with
-    no ``signed_for`` (no Signer to ask) sends no signed verb at all. The door still verifies the signature."""
+    verb and exactly these params and signed, and the request's idempotency ``key`` is SIGN_KEY_PREFIX + the draft id it
+    was filed under, it never reaches its handler or effect (a dry run included). So one signed request is sent under one
+    key, which the at-most-once gate dedupes: a re-post under a fresh key, or none, is refused. A caller with no
+    ``signed_for`` (no Signer to ask) sends no signed verb at all. The door still verifies the signature."""
     from levain.sign_request_id import request_id_ok
 
     if not verb.sign:
         return
     rid = params.get(SIGN_PARAM)
     rest = {k: v for k, v in params.items() if k != SIGN_PARAM}
-    if not request_id_ok(rid) or signed_for is None or not signed_for(verb.name, rid, rest):
+    txn = signed_for(verb.name, rid, rest) if request_id_ok(rid) and signed_for is not None else None
+    if txn is None or key != SIGN_KEY_PREFIX + txn:
         raise _refuse("sign_required", 403, f"{verb.name!r} is sent only after the operator's passkey signs it: "
-                      f"{SIGN_PARAM!r} must name the sign request filed for these params and signed")
+                      f"{SIGN_PARAM!r} must name the sign request filed for these params and signed, and "
+                      f"'idempotency_key' must be its draft's")
 
 
 def tier_max(*tiers: Tier) -> Tier:
@@ -864,7 +871,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
         bad = sorted(set(params) - _param_names(verb)) if verb.fields is not None else []
         if bad:
             raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
-        _require_sign_request(verb, params, signed_for)
+        _require_sign_request(verb, params, signed_for, req.get("idempotency_key"))
         tier = verb.tier(params, None, auth.labels.label(None), today, policy=auth.policy)    # no row, no label
         _refuse_unless_c1(verb, tier, credential, install_class)
         return _fire_downstream(registry, verb, scope, params, req, job_runtime)
@@ -890,7 +897,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     bad = sorted(set(params) - _param_names(verb)) if verb.fields is not None else []
     if bad:
         raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
-    _require_sign_request(verb, params, signed_for)
+    _require_sign_request(verb, params, signed_for, req.get("idempotency_key"))
     if "dry_run" in req and not isinstance(req["dry_run"], bool):
         raise _refuse("bad_request", 400, "'dry_run' must be true or false")
     intent = req.get("intent")
@@ -1181,7 +1188,7 @@ def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope"
     bad = sorted(set(params) - set(verb.fields or ()))
     if bad:
         raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
-    _require_sign_request(verb, params, None)     # /edit asks no Signer: a signed verb never fires here
+    _require_sign_request(verb, params, None, None)     # /edit asks no Signer: a signed verb never fires here
     if (verb.tier_fn is None or _is_const(verb)) and (broker is None or not broker.enabled):
         # a verb whose tier does not depend on the row: refuse a T2/T3 before reading anything
         _refuse_unless_c1(verb, verb.tier(params, None, authority.labels.label(None), today, policy=authority.policy),

@@ -476,7 +476,8 @@
       let tier = "C1", gesture = action.gesture, intent = null;
       const mayEscalate = !(action.gesture === "direct" && (!Array.isArray(action.escalates) || action.escalates.length === 0));
       if (mayEscalate) {
-        const d = await send("/cockpit/verb", Object.assign({}, base, { dry_run: true }));
+        // a signed send's preview names its draft's key too: the kernel admits a signed request only under that key
+        const d = await send("/cockpit/verb", Object.assign({}, base, { dry_run: true }, txn ? { idempotency_key: "sign-" + txn } : {}));
         if (d.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };
         if (!d.ok) return fault(d, what);
         tier = d.data.tier; gesture = d.data.gesture;

@@ -131,11 +131,32 @@ def test_a_sign_request_must_be_signed_and_filed_for_this_verb_and_these_params(
         # the one it was filed and signed for passes the kernel, dry run and fire alike
         good = {"message": "hi", SIGN_PARAM: rid}
         status, out = _call(url, "/cockpit/verb", {"verb": "send_inbox", "panel_id": "inbox", "dry_run": True,
-                                                   "params": good}, token=TOK)
+                                                   "params": good, "idempotency_key": "sign-" + TXN}, token=TOK)
         assert status == 200 and out["dry_run"] is True, out
         status, out = _call(url, "/cockpit/verb", {**ENV, "params": good, "idempotency_key": "sign-" + TXN}, token=TOK)
         assert status == 200, out
     assert rig.notes() == ["hi"] and all(a == good for a in rig.applied), (rig.notes(), rig.applied, rig.refused)
+
+
+def test_a_signed_request_is_sent_only_under_its_drafts_key(tmp_path, monkeypatch) -> None:
+    """Q1 (head 1023+30): a signed request's key is "sign-" + the draft id its compose filed it under, so a re-post of
+    that request under a fresh key (or none) is refused, dry runs included, and its effect runs once."""
+    rig = _c1_rig(tmp_path, monkeypatch)
+    with rig.serving() as (url, _httpd):
+        rid = _compose(url, "hi", TXN)[1]["request"]
+        _signed(rig, rid)
+        good = {"verb": "send_inbox", "panel_id": "inbox", "params": {"message": "hi", SIGN_PARAM: rid}}
+        first = _call(url, "/cockpit/verb", {**good, "idempotency_key": "sign-" + TXN}, token=TOK)
+        assert first[0] == 200 and first[1]["ok"] is True, first
+        outs = []
+        for extra in ({"idempotency_key": "sign-draft-9999-zzzz"}, {"idempotency_key": "fresh-key-0001"}, {},
+                      {"idempotency_key": "sign-draft-9999-zzzz", "dry_run": True}, {"dry_run": True}):
+            status, out = _call(url, "/cockpit/verb", {**good, **extra}, token=TOK)
+            outs.append((extra, status, out.get("error")))
+        assert all(o[1:] == (403, "sign_required") for o in outs), outs
+        status, out = _call(url, "/cockpit/verb", {**good, "dry_run": True, "idempotency_key": "sign-" + TXN}, token=TOK)
+        assert status == 200 and out["dry_run"] is True, out
+    assert rig.handled == [{"message": "hi", SIGN_PARAM: rid}], rig.handled
 
 
 # --- F3: one draft's compose never holds up another's --------------------------------------------------------------

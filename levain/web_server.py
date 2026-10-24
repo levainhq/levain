@@ -1224,23 +1224,24 @@ class _Handler(GuardedHandler):
         settle(rid)
         return {"request": rid}, 200
 
-    def _signed_for(self, verb: str, request_id: str, params: "dict[str, Any]") -> bool:
-        """The kernel's sign check (``levain.cockpit.verbs.SignedFor``): whether this server's compose filed
-        ``request_id`` for ``verb`` and exactly ``params``, and its Signer holds that request signed. A request whose
-        compose this server no longer remembers (restarted, or past _COMPOSE_TXNS_MAX drafts) is refused: the operator
-        signs that draft again."""
+    def _signed_for(self, verb: str, request_id: str, params: "dict[str, Any]") -> "str | None":
+        """The kernel's sign check (``levain.cockpit.verbs.SignedFor``): the draft id (``client_txn``) under which this
+        server's compose filed ``request_id`` for ``verb`` and exactly ``params``, when its Signer holds that request
+        signed; else None. A request whose compose this server no longer remembers (restarted, or past
+        _COMPOSE_TXNS_MAX drafts) is refused: the operator signs that draft again."""
         from levain.consent.sign import state_of
 
         signer = self.server.signer
         if signer is None or not isinstance(request_id, str):
-            return False
+            return None
         try:
             fp = json.dumps(params, sort_keys=True, separators=(",", ":"))
         except (TypeError, ValueError):
-            return False
+            return None
         with self.server.compose_lock:
-            filed = any(k[0] == verb and v == (fp, request_id) for k, v in self.server.compose_txns.items())
-        return filed and state_of(signer.queue_dir, request_id) == "signed"
+            txn = next((k[1] for k, v in self.server.compose_txns.items()
+                        if k[0] == verb and v == (fp, request_id)), None)
+        return txn if txn is not None and state_of(signer.queue_dir, request_id) == "signed" else None
 
     def _serve_note_body(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/note/<n>.json``: one note's body (what, detail, agent, filed_at, and its dismissal if any),

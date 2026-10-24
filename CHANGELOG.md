@@ -44,7 +44,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   that request is open, and the send is keyed by it, so a lost reply, a retry or a reload files one request and sends
   once, at any tier: a signed verb is deduped by that key whatever its `idempotent` says. The kernel refuses a signed
   verb on every route, a dry run included, before its handler runs, unless its `sign_request` names a request this
-  server's compose route filed for that verb and exactly those params and the Signer holds signed; and
+  server's compose route filed for that verb and exactly those params and the Signer holds signed, and its
+  `idempotency_key` is `sign-` plus that draft's id (a signed request is sent under one key only); and
   `ActionVerb(sign=True, job=True)` is refused. `GET /cockpit/sign/<id>.json` reads one request whatever the listing's
   cap. Without a `compose_signer` a signed verb is not sent at all. A request through an `extra_hosts` name is treated as
   off the box: the cockpit's reads need the token there too. `levain.consent.sign.passkey_key_source` is the passkey
@@ -345,6 +346,8 @@ This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which
   (the same words sent from two tabs file two requests): after a restart, or past 256 drafts, a draft files a new
   request, and a draft signed but not yet sent is refused and signed again.
 - Nothing caps how many sign requests a write-token holder can file through the compose route.
+- A `make_server` that fails after it has pinned the Signer (attaching to the caller's cockpit) leaves the Signer
+  pinned; the cockpit is left as it was.
 - A proxy is recognised by the `extra_hosts` names and forwarding headers; a proxy that sends neither and names
   `127.0.0.1` reads as local.
 
