@@ -1050,7 +1050,9 @@ class _Handler(GuardedHandler):
     def _pairing_db(self) -> Any:
         """This server's journal for pairing, the broker started asynchronously and waited on for at most
         ``_PAIR_WAIT_S`` (RU-4). None where paired tokens cannot exist (no broker: a read-only source with no
-        ``ledger_root``; ``INSTALL_DISABLED``), RU-1. Raises :class:`_CredentialUnavailable` for a transient state."""
+        ``ledger_root``), RU-1. Raises :class:`_CredentialUnavailable` for a transient state and for
+        ``INSTALL_DISABLED`` (L3 r2: a journal that holds paired devices can be restarted without an install class, and
+        a definite miss there would make the page drop a good token)."""
         broker = self.server.broker
         if broker is None:
             return None
@@ -1059,8 +1061,6 @@ class _Handler(GuardedHandler):
         except Exception:  # noqa: BLE001 - G5: a starter thread that cannot start is the transient 503 (RT-1)
             raise _CredentialUnavailable("starter") from None
         state = broker.wait_settled(_PAIR_WAIT_S)
-        if state is Lifecycle.INSTALL_DISABLED:
-            return None
         db = broker.active_db() if state is Lifecycle.ACTIVE else None
         if db is None:
             # STANDBY (another process owns the ledger), ACTIVATING past the wait, DRAINING; CLOSED (the server is
