@@ -568,12 +568,23 @@ class KeysRoutes:
         """A RELOAD keys refused: every dispatch route refused until a valid one (CONTRACT §4.3)."""
         self.usable, self.problem = False, name
 
-    def head_route_ids(self) -> frozenset:
-        """The route ids of the head generation keys holds (served or refused alike), none before a map: no base
+    def route_ids(self) -> Optional[frozenset]:
+        """Every route id a dispatch session may be pinned to: the union across EVERY generation keys' head serves
+        (served or refused alike; a session pinned to an older generation keeps a route a newer one dropped). No base
         route id may be one of them at the point of use (keys' `_route_policy`), however the base map changed since
-        the RELOAD that checked it."""
-        top = None if self.head is None else self.maps.get(self.head["generation"])
-        return frozenset() if top is None else frozenset(top.routes)
+        the RELOAD that checked it. An empty set only when there is no head; None when the ids are UNKNOWN (a head on
+        disk that does not parse, or a served generation whose map is not loaded): the caller fails closed."""
+        if self.head is None:
+            # `load` and `check_reload` name an unreadable head so. Otherwise no head is held only before keys acked
+            # any generation, and a pin exists only for an acked one
+            return None if self.problem == "routemap-head-unverifiable" else frozenset()
+        ids: set = set()
+        for e in self.head["served"]:
+            m = self.maps.get(e["generation"])
+            if m is None:
+                return None
+            ids.update(m.routes)
+        return frozenset(ids)
 
     def stated(self) -> Tuple[Optional[int], Optional[str]]:
         """What KEYS-ATTACH states keys serves: its head, or `(None, None)` when it serves no map or refuses every

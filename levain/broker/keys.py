@@ -2128,11 +2128,14 @@ class Keys:
         if type(routes) is not list or route not in routes:
             raise norm.Refused("route-not-allowed", "not in the token's routes")
         pol = self._base_route(route)
-        if pol is not None and self.routes is not None and route in self.routes.head_route_ids():
+        ids = frozenset() if pol is None or self.routes is None else self.routes.route_ids()
+        if ids is None or route in ids:
             # the collision rule AT THE POINT OF USE: base.json is live-reloaded, so a base id added after the RELOAD
-            # that checked the map would otherwise route a pinned dispatch session by the base policy, unpinned
-            _note(logging.WARNING, "levain gw-keys: route %s is in both the base map and the dispatch head", route)
-            raise norm.Refused("keys-unavailable", f"route-collision: {route} is a base route and a dispatch route")
+            # that checked the map would otherwise route a pinned dispatch session by the base policy, unpinned. The
+            # ids are every served generation's; when they are unknown, every base route fails closed.
+            why = "the dispatch route ids are unknown" if ids is None else "a base route and a dispatch route"
+            _note(logging.WARNING, "levain gw-keys: route %s refused: %s", route, why)
+            raise norm.Refused("keys-unavailable", f"route-collision: {route}: {why}")
         if pol is None:
             pol = self.dispatch_policy(route, routemaps.pin_of(claims))
         if pol is None or pol.type != "brokered" or pol.upstream is None:
@@ -2170,7 +2173,12 @@ class Keys:
         assert self.reload_lock is not None
         loop = asyncio.get_running_loop()
         async with self.reload_lock:
-            fut = loop.run_in_executor(None, self._reload_files, rm, generation, item_sha256)
+            try:
+                fut = loop.run_in_executor(None, self._reload_files, rm, generation, item_sha256)
+            except Exception as e:   # the executor took no work (shut down, cannot schedule): a failed RELOAD
+                rm.refuse("keys-unavailable")
+                _note(logging.WARNING, "levain gw-keys: RELOAD %s failed (%s)", generation, type(e).__name__)
+                return {"refused": "keys-unavailable"}
             cancelled = False
             while True:
                 try:

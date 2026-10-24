@@ -846,3 +846,108 @@ def test_reload_keys_failure_never_raises(st):
     assert control.handle(C.Conn(DISPATCH_UID), {"v": 1, "op": "ROUTE-SUBMIT", "id": 1, "map": it, "sig": sig}) == \
         {"id": 1, "ok": True, "generation": 1}
     assert [(op, type(e).__name__) for op, _s, e in control.seam_errors] == [("reload", "ConnectionResetError")]
+
+
+# ---- L3 r2 (1023+26 fix2) -----------------------------------------------------------------------------------------
+
+def _base_with(st: Store, *rids: str) -> None:
+    """Root's live base map gains a brokered route for each of `rids` (beside the egress `pypi`)."""
+    extra = [dict(route(rid, host="api.z.ai")["policy"], prices={"z-ai/glm-5.2": PRICE},
+                  max_session_microdollars=10 ** 6) for rid in rids]
+    (st.routes / "base.json").write_bytes(canon.canonical_bytes(
+        {"format": "levain-routes-base/2", "routes": [{"route": "pypi", "type": "egress", "hosts": ["pypi.org"]}]
+         + extra}))
+
+
+def _resolved(k: K.Keys, claims: dict, rid: str) -> str:
+    """`_route_policy`'s outcome: the upstream host served, or `<name>|<detail's first word>`."""
+    try:
+        return k._route_policy(claims, rid).upstream.host
+    except norm.Refused as e:
+        return f"{e.name}|{e.detail.split(':')[0]}"
+
+
+def test_collision_checks_every_served_generation(st):
+    # complement N1: a session pinned to generation 1 (which has `glm`); generation 2 drops `glm`; root then adds a
+    # brokered `glm` to the live base map. The collision set is the union across every served generation, so the
+    # pinned id is refused, never routed by the base policy. A base id no served generation names is untouched.
+    cr = RM.ControlRoutes(st.routes)
+    k = keys_of(st)
+    for g, routes in ((1, [route()]), (2, [route(rid="other")])):
+        it, sig = st.signed(item(g, routes))
+        submit(cr, it, sig)
+        assert reload(k, g, sha(it))["generation"] == g
+    _base_with(st, "glm", "zz")
+    claims = {"routes": ["glm", "zz"],
+              "run": {"routemap_generation": 1, "route_policy_digest": RM.policy_digest(route()["policy"])}}
+    assert _resolved(k, claims, "glm") == "keys-unavailable|route-collision"
+    assert _resolved(k, claims, "zz") == "api.z.ai"
+    assert k.routes.route_ids() == frozenset({"glm", "other"})
+
+
+def test_collision_fails_closed_when_ids_unavailable(st):
+    # codex item 4: keys restarts after root added a colliding base `glm`; generation 1 (`glm`) no longer loads, so a
+    # head exists whose served ids are unknown. Every base route resolution refuses (fail closed), `zz` included, until
+    # the ids are known again.
+    cr = RM.ControlRoutes(st.routes)
+    k = keys_of(st)
+    for g, routes in ((1, [route()]), (2, [route(rid="other")])):
+        it, sig = st.signed(item(g, routes))
+        submit(cr, it, sig)
+        assert reload(k, g, sha(it))["generation"] == g
+    _base_with(st, "glm", "zz")
+    k2 = keys_of(st)                                                     # keys' start: generation 1 refused
+    assert sorted(k2.routes.maps) == [2] and k2.routes.problem is None    # the head generation itself serves
+    assert k2.routes.route_ids() is None
+    claims = {"routes": ["glm", "zz"],
+              "run": {"routemap_generation": 1, "route_policy_digest": RM.policy_digest(route()["policy"])}}
+    assert _resolved(k2, claims, "glm") == "keys-unavailable|route-collision"
+    assert _resolved(k2, claims, "zz") == "keys-unavailable|route-collision"
+    # the head generation itself unloadable (codex's case): the same
+    (st.dispatch / "2.json").write_bytes(b"{")
+    k3 = keys_of(st)
+    assert k3.routes.head is not None and k3.routes.maps == {} and k3.routes.route_ids() is None
+    assert _resolved(k3, claims, "glm") == "keys-unavailable|route-collision"
+
+
+def test_collision_absent_head_is_empty(st):
+    # only a genuinely absent head is an empty collision set: base routes resolve as before. A head on disk that does
+    # not parse is a head whose ids are unknown: fail closed.
+    k = keys_of(st)
+    _base_with(st, "glm")
+    claims = {"routes": ["glm"]}
+    assert k.routes.head is None and k.routes.route_ids() == frozenset()
+    assert _resolved(k, claims, "glm") == "api.z.ai"
+    (st.L / "keys" / "routemap.head").write_bytes(b"not a head")
+    k2 = keys_of(st)
+    assert k2.routes.head is None and k2.routes.route_ids() is None
+    assert _resolved(k2, claims, "glm") == "keys-unavailable|route-collision"
+
+
+def test_reload_executor_refusing_work_refuses(st):
+    # codex MED: the executor refusing the work (shut down, cannot accept) is a failed RELOAD: refused
+    # `keys-unavailable`, every dispatch route refused, never an escape that leaves the old head served
+    import concurrent.futures
+
+    class Shut(concurrent.futures.ThreadPoolExecutor):
+        def submit(self, *a, **kw):
+            raise RuntimeError("cannot schedule new futures after shutdown")
+    k, _ = _two_generations(st)
+    cr = RM.ControlRoutes(st.routes)
+    three = st.signed(item(3))
+    submit(cr, *three)
+    pin = RM.Pin(2, RM.policy_digest(route()["policy"]))
+    assert k.dispatch_policy("glm", pin).route == "glm"
+
+    async def run():
+        k.state_lock = None
+        k._in_loop()
+        ex = Shut(max_workers=1)
+        asyncio.get_running_loop().set_default_executor(ex)
+        try:
+            return await k.reload(k.admin_epoch, 3, sha(three[0]))
+        finally:
+            ex.shutdown(wait=False)
+    assert asyncio.run(run()) == {"refused": "keys-unavailable"}
+    assert k.routes.stated() == (None, None) and k.routes.problem == "keys-unavailable"
+    assert dispatch_refusal(k, "glm", pin) == "route-not-allowed|no dispatch map is served"
