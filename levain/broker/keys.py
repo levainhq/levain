@@ -30,7 +30,8 @@ The admin server (design 1.5 "The admin connection", "Fencing", "Order inside on
   read and the append to that session's chain.
 - FRONT-REGISTER / FRONT-ARM / DROP-SESSION are the fenced table calls; RELOAD {generation, item_sha256} (S1 3c-4) loads
   a dispatch route map under keys' one RELOAD lock (RELOAD names no session, so the per-session order cannot order it):
-  every check re-run by keys itself (`levain.slot.routemaps`), keys' own head written durably before it serves or acks.
+  every check re-run by keys itself (`levain.slot.routemaps`), keys' own head written durably before it serves or acks;
+  its file work is one transaction at a time (`KeysRoutes.txn`) and is waited out even when a preemption cancels it.
 - a newer connection PREEMPTS in five steps: bump the epoch, fence every live exchange (marked detached, so its next
   upstream write is refused) and stop reading the old one; cancel its request tasks and
   await them, bounded; the fail-closed clear in two phases (`reg_high` kept); close the old connection; adopt.
@@ -2127,6 +2128,11 @@ class Keys:
         if type(routes) is not list or route not in routes:
             raise norm.Refused("route-not-allowed", "not in the token's routes")
         pol = self._base_route(route)
+        if pol is not None and self.routes is not None and route in self.routes.head_route_ids():
+            # the collision rule AT THE POINT OF USE: base.json is live-reloaded, so a base id added after the RELOAD
+            # that checked the map would otherwise route a pinned dispatch session by the base policy, unpinned
+            _note(logging.WARNING, "levain gw-keys: route %s is in both the base map and the dispatch head", route)
+            raise norm.Refused("keys-unavailable", f"route-collision: {route} is a base route and a dispatch route")
         if pol is None:
             pol = self.dispatch_policy(route, routemaps.pin_of(claims))
         if pol is None or pol.type != "brokered" or pol.upstream is None:
@@ -2147,10 +2153,15 @@ class Keys:
 
     async def reload(self, epoch: int, generation: int, item_sha256: str) -> Optional[dict]:
         """`RELOAD {generation, item_sha256}`: under the RELOAD lock, the file work off the loop (`current`, the file and
-        its digest, every item check, the order against keys' own head on disk, then that head written durably), then
-        the generation served on the loop, then the ack `{generation, item_sha256}`. A refusal leaves every dispatch
-        route refused until a valid RELOAD. A request from a stale epoch, or after the shutdown latch, is not answered;
-        a RELOAD that completed before its epoch went stale still stands (it was verified whole)."""
+        its digest, every item check, the order against keys' own head on disk, then that head written durably, all
+        inside `KeysRoutes.txn`), then the generation served on the loop, then the ack `{generation, item_sha256}`. A
+        refusal leaves every dispatch route refused until a valid RELOAD. A request from a stale epoch, or after the
+        shutdown latch, is not answered; a RELOAD that completed before its epoch went stale still stands (it was
+        verified whole).
+
+        The file work is awaited to COMPLETION, a cancel of this task included (a preemption cancels the task; the
+        executor thread cannot be cancelled): its outcome is published in memory (served or refused, so memory matches
+        the disk head it left) before the lock is released, and only then is the cancel re-raised."""
         if self.closing or epoch != self.admin_epoch:
             return None
         rm = self.routes
@@ -2159,26 +2170,48 @@ class Keys:
         assert self.reload_lock is not None
         loop = asyncio.get_running_loop()
         async with self.reload_lock:
-            try:
-                checked, new_head = await loop.run_in_executor(None, self._reload_files, rm, generation, item_sha256)
-            except RouteRefused as e:
-                rm.refuse(e.name)
-                _note(logging.WARNING, "levain gw-keys: RELOAD %s refused (%s)", generation, e.name)
-                return {"refused": e.name}
-            except Exception as e:   # the head's write failed: nothing new is served, and the refusal is a fault
+            fut = loop.run_in_executor(None, self._reload_files, rm, generation, item_sha256)
+            cancelled = False
+            while True:
+                try:
+                    await asyncio.shield(fut)
+                    break
+                except asyncio.CancelledError:
+                    if not fut.cancelled():
+                        cancelled = True   # this task was cancelled (a preemption): the work is waited out all the same
+                    if fut.done():
+                        break
+                except Exception:
+                    break                  # the work raised: read below
+            out: dict
+            exc = None if fut.cancelled() else fut.exception()
+            if fut.cancelled():            # never the work's own outcome (the thread cannot be cancelled); fail closed
                 rm.refuse("keys-unavailable")
-                _note(logging.WARNING, "levain gw-keys: RELOAD %s failed (%s)", generation, type(e).__name__)
-                return {"refused": "keys-unavailable"}
-            rm.accept(checked, new_head)
-        return {"generation": generation, "item_sha256": item_sha256}
+                out = {"refused": "keys-unavailable"}
+            elif isinstance(exc, RouteRefused):
+                rm.refuse(exc.name)
+                _note(logging.WARNING, "levain gw-keys: RELOAD %s refused (%s)", generation, exc.name)
+                out = {"refused": exc.name}
+            elif exc is not None:   # the head's write failed: nothing new is served, and the refusal is a fault
+                rm.refuse("keys-unavailable")
+                _note(logging.WARNING, "levain gw-keys: RELOAD %s failed (%s)", generation, type(exc).__name__)
+                out = {"refused": "keys-unavailable"}
+            else:
+                checked, head = fut.result()
+                rm.accept(checked, head)
+                out = {"generation": generation, "item_sha256": item_sha256}
+        if cancelled:
+            raise asyncio.CancelledError()
+        return out
 
     @staticmethod
     def _reload_files(rm: "routemaps.KeysRoutes", generation: int,
-                      item_sha256: str) -> "Tuple[routemaps.Checked, Optional[dict]]":
-        checked, new_head = rm.check_reload(generation, item_sha256)
-        if new_head is not None:
-            rm.commit(new_head)
-        return checked, new_head
+                      item_sha256: str) -> "Tuple[routemaps.Checked, dict]":
+        """The synchronous RELOAD transaction, one at a time (`rm.txn`): the checks, then the head settled."""
+        with rm.txn:
+            checked, head = rm.check_reload(generation, item_sha256)
+            rm.commit(head)
+        return checked, head
 
     def _base_route(self, route: str) -> Optional[RoutePolicy]:
         """`route`'s object in `L/routes/base.json`, opened at every `Q` and parsed (`policy.parse_base_map`: `/1`

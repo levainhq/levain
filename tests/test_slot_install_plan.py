@@ -341,7 +341,7 @@ STORE_DIRS = {
     "contracts": ("_levain_dispatch", "levain-queue", 0o2750),
     "policy": ("R", "R", 0o755), "lineage": ("_levain_control", "levain-lineage", 0o750),
     "keys": ("_levain_keys", "_levain_keys", 0o700), "routes": ("R", "R", 0o755),
-    "routes/dispatch": ("_levain_control", "_levain_keys", 0o750),
+    "routes/dispatch": ("_levain_control", "_levain_keys", 0o2750),
     "routes/verifiers": ("_levain_control", "_levain_control", 0o700),
     "slots/e0": ("R", "R", 0o755), "slots/v0": ("R", "R", 0o755), "slots/e0/keep": ("R", "R", 0o700),
 }

@@ -96,13 +96,13 @@ from levain.authority import (
 )
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
-from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
+from levain.cockpit.consent import utc_stamp
 from levain.consent.queue import AuthoritySource, class_covers
 from levain.contracts import ContractError
 from levain.contracts.canon import canonical_bytes, parse
 from levain.contracts.grammar import JSON_INT_MAX
 from levain.dispatch import DispatchError
-from levain.dispatch import registry
+from levain.dispatch import registry, routemap_rules
 
 __all__ = [
     "CONFIG_NAMESPACE", "CONFIG_TIER", "DB_NAME", "FORMAT", "ITEM_KEYS", "ITEM_MAX_BYTES", "KINDS", "SIGNATURE_MAX",
@@ -126,7 +126,6 @@ SIGNATURE_MAX = 64 * 1024
 _ACCESS_BY_OTHERS = 0o077
 _FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
 _STORE_ID = re.compile(r"[0-9a-f]{32}")
-_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 class ConfigRefused(DispatchError):
@@ -193,14 +192,9 @@ def parse_item(raw: Any) -> ConfigItem:
     if type(gen) is not int or not 1 <= gen <= JSON_INT_MAX:
         raise ConfigRefused("generation is an integer from 1")
     prev = obj["prev"]
-    if gen == 1 and prev != "":
-        raise ConfigRefused("prev is empty at generation 1")
-    if gen > 1 and (not isinstance(prev, str) or _DIGEST.fullmatch(prev) is None):
-        raise ConfigRefused("prev is sha256:<64 hex>, the previous item's digest, from generation 2")
-    try:
-        parse_stamp(obj["issued_at"])
-    except ConsentError:
-        raise ConfigRefused("issued_at is a UTC stamp") from None
+    problem = routemap_rules.envelope_problem(gen, prev, obj["issued_at"])   # the checker's own envelope check
+    if problem is not None:
+        raise ConfigRefused(problem)
     if obj["kind"] not in KINDS and obj["kind"] not in registry.LEGACY_KINDS:
         raise ConfigRefused(f"kind {str(obj['kind'])[:64]!r} is not one of {KINDS}")
     if canonical_bytes(obj) != raw:

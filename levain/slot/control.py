@@ -1707,8 +1707,9 @@ class Control:
     def _reload_keys(self, head: Mapping[str, object]) -> None:
         """``RELOAD {generation, item_sha256}`` of ``head`` on keys' admin wire; the caller holds the activation lock.
         keys' ack is recorded as what keys serves on the attachment that was current when it was sent, if that is
-        still the current one (a newer attachment states its own); a refusal is noted, and keys then refuses every
-        dispatch route until a valid RELOAD."""
+        still the current one (a newer attachment states its own); a refusal, or any other failure of the call, is
+        noted in :attr:`seam_errors` and never raised (the head is already durable: the activation stands, and keys
+        is reached again by the attach-time RELOAD or a resubmission)."""
         if self.keys_admin is None:
             return
         want = {"generation": head["generation"], "item_sha256": head["item_sha256"]}
@@ -1716,7 +1717,7 @@ class Control:
             no = None if self._attach is None else self._attach.attach_no
         try:
             got = self.keys_admin.call("RELOAD", **want)
-        except Refused as e:
+        except Exception as e:
             self.seam_errors.append(("reload", "", e))
             return
         with self._mu:
@@ -1729,10 +1730,11 @@ class Control:
     def _op_route_submit(self, conn: Conn, args: dict) -> dict[str, object]:
         """``ROUTE-SUBMIT {map, sig}`` -> ``{generation}``: :meth:`levain.slot.routemaps.ControlRoutes.submit` under the
         activation lock, whose RELOAD to keys is :meth:`_reload_keys`. The answer is CONTROL's activation (its head and
-        ``current`` durable); keys' ack is what a mint checks (3c-5), never this answer."""
+        ``current`` durable); keys' ack is what a mint checks (3c-5), never this answer. A resubmission of the head is
+        the convergent repair, its RELOAD re-sent unless :meth:`keys_serves` already names the head."""
         if self.routes is None:
             raise Refused("routemap-verifier", "CONTROL holds no route store")
-        return {"generation": self.routes.submit(args["map"], args["sig"], self._reload_keys)}
+        return {"generation": self.routes.submit(args["map"], args["sig"], self._reload_keys, self.keys_serves)}
 
     def keys_attach_eof(self, conn: Conn) -> None:
         """The attachment's connection ended (:class:`ControlServer`): §4.5's "either EOF at CONTROL", unless a newer

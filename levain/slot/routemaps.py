@@ -38,6 +38,7 @@ from levain.authority import VerifierUnavailable, verify_link_sig
 from levain.broker.policy import DispatchRoute, PolicyError, RoutePolicy, parse_routemap
 from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
+from levain.dispatch.routemap_rules import envelope_problem
 from levain.slot import Refused
 from levain.slot.records import write_durably
 
@@ -207,7 +208,9 @@ def check_item(raw: bytes, sig: object, trust: Trust, base_ids: frozenset, *,
     """Every check an item must pass at CONTROL and again at keys (r3 §2.3 accept steps 1, 2 and 4, as R4 §2 strikes
     step 4's per-call cap), in this order: the size bounds; the signature against `trust` in `CONFIG_NAMESPACE`
     (`routemap-verifier` when the verifier cannot run, `routemap-signature` when it says no); the item's canonical
-    form and keys; `format` and `kind`; `store_id` == trust's (`routemap-store`); the generation; the body
+    form and keys; `format` and `kind`; `store_id` == trust's (`routemap-store`); the generation; the envelope's
+    `prev` and `issued_at` (`levain.dispatch.routemap_rules.envelope_problem`, the producer's own check: `parse_item`
+    calls it too, so this accepts exactly what dispatch emits); the body
     (`levain.broker.policy.parse_routemap`: every route brokered with a codec and a price on every model, no per-call
     cap, no session cap, no id twice); no route id that is a base id. The generation order is the caller's, against
     its own head."""
@@ -233,6 +236,9 @@ def check_item(raw: bytes, sig: object, trust: Trust, base_ids: frozenset, *,
         raise Refused("routemap-store", "the item was signed for another store")
     if not _gen(obj["generation"]):
         raise Refused("routemap-invalid:generation", "generation is an integer from 1")
+    problem = envelope_problem(obj["generation"], obj["prev"], obj["issued_at"])
+    if problem is not None:
+        raise Refused("routemap-invalid:envelope", problem)
     try:
         routes = parse_routemap(obj["body"])
     except PolicyError as e:
@@ -402,15 +408,21 @@ class ControlRoutes:
             finally:
                 os.close(dfd)
 
-    def submit(self, item: object, sig: object,
-               reload: Callable[[Dict[str, object]], object]) -> int:
+    def submit(self, item: object, sig: object, reload: Callable[[Dict[str, object]], object],
+               served: Optional[Callable[[], object]] = None) -> int:
         """`ROUTE-SUBMIT {map, sig}` (r3 §2.3 "Accept at CONTROL" + "Activation", R4 §2), under the activation lock from
         the head read through `current` and the RELOAD's result: `item` is the whole config item as a JSON object, its
         canonical bytes the signed ones. Accepted when its generation is above the head's (gaps allowed), or equal
-        with the same digest (a resubmission: acked, nothing written); any other equal or lower generation is
-        `routemap-generation`. Activation writes `<gen>.json` + `.sig`, then `head`, then `current`, then calls
-        `reload(head)` (CONTROL's RELOAD to keys; its outcome is CONTROL's, never this answer's). Returns the
-        generation."""
+        with the same digest; any other equal or lower generation is `routemap-generation`. Activation writes
+        `<gen>.json` + `.sig`, then `head`, then `current` (each settled: fsynced, its directory fsynced), publishes
+        the head as `_active`, then calls `reload(head)` (CONTROL's RELOAD to keys; its outcome is CONTROL's, never
+        this answer's). Returns the generation.
+
+        An equal-generation, equal-digest resubmission is a CONVERGENT REPAIR, never a bare ack (the one rule keys'
+        :meth:`KeysRoutes.check_reload` keeps too): the same writes run again, so an activation a failed write left
+        part-done (a `current` never written, a directory fsync that failed after its rename) is finished; `_active`
+        is published; and the RELOAD is sent again unless `served()` (what keys acked or stated) already names this
+        head (with no `served`, always)."""
         if not isinstance(item, dict):
             raise Refused("routemap-invalid:item", "map is the config item as one JSON object")
         try:
@@ -428,8 +440,7 @@ class ControlRoutes:
                         checked.generation == head["generation"] and checked.item_sha256 != head["item_sha256"]):
                     raise Refused("routemap-generation",
                                   f"generation {checked.generation} against the head's {head['generation']}")
-                if checked.generation == head["generation"]:
-                    return checked.generation          # a resubmission: nothing written
+            again = head is not None and checked.generation == head["generation"]
             jp, sp = _gen_paths(self.dispatch, checked.generation)
             assert isinstance(sig, str)
             self._write(jp, raw)
@@ -442,7 +453,9 @@ class ControlRoutes:
             self._active = checked
             self.problem = None
             self.fault("after_current")
-            reload({"generation": checked.generation, "item_sha256": checked.item_sha256})
+            want = {"generation": checked.generation, "item_sha256": checked.item_sha256}
+            if not again or served is None or served() != want:
+                reload(want)
             return checked.generation
 
 
@@ -464,6 +477,10 @@ class KeysRoutes:
         self.maps: Dict[int, Checked] = {}
         self.usable = True
         self.problem: Optional[str] = None
+        #: THE RELOAD transaction lock: keys' `_reload_files` holds it from `check_reload` through `commit`, so one
+        #: RELOAD's file work owns keys' disk head at a time, whatever happens to the asyncio task that started it (a
+        #: preemption cancels the task, never the executor thread doing the work).
+        self.txn = threading.Lock()
 
     # -- the file work (off the loop) --
 
@@ -502,11 +519,14 @@ class KeysRoutes:
             return head, maps, "routemap-head-unverifiable"
         return head, maps, None
 
-    def check_reload(self, generation: int, item_sha256: str) -> Tuple[Checked, Optional[dict]]:
+    def check_reload(self, generation: int, item_sha256: str) -> Tuple[Checked, dict]:
         """r3 §2.3 "Load at keys" (R4 §2): `current` == the RELOAD's generation == the file's == the envelope's; the
         file's SHA-256 == `item_sha256`; every item check, re-run here; and against keys' OWN head on disk: a greater
-        generation, or the same one with the same digest. Returns the checked item and the head to write (None: the
-        same generation, nothing to write)."""
+        generation, or the same one with the same digest. Returns the checked item and the head keys serves after
+        this RELOAD, which the caller always settles (:meth:`commit`) and then installs (:meth:`accept`): a new head
+        for a greater generation, or the disk head itself for the same one (the convergent repair: a head whose
+        directory fsync failed after its rename is settled again, and a head on disk that keys does not hold in
+        memory is installed)."""
         current = _read_current(self.routes_dir / DISPATCH_DIR)
         if current != generation:
             raise Refused("routemap-invalid:current", f"current is {current}, not {generation}")
@@ -521,14 +541,14 @@ class KeysRoutes:
                                                    and item_sha256 != head["item_sha256"]):
                 raise Refused("routemap-generation", f"generation {generation} against keys' {head['generation']}")
             if generation == head["generation"]:
-                return checked, None
+                return checked, head
         served = [] if head is None else list(head["served"])
         served.append({"generation": generation, "item_sha256": item_sha256})
         return checked, {"format": KEYS_HEAD_FORMAT, "store_id": trust.store_id, "generation": generation,
                          "item_sha256": item_sha256, "served": served}
 
     def commit(self, new_head: dict) -> None:
-        """keys' head, durably, BEFORE the new generation is served or acked."""
+        """keys' head, durably, BEFORE the generation is served or acked (the same bytes again settle it)."""
         os.makedirs(self.head_path.parent, mode=0o700, exist_ok=True)
         write_durably(self.head_path, canon.canonical_bytes(new_head), mode=0o600, fsync=self._fsync)
 
@@ -538,16 +558,22 @@ class KeysRoutes:
         self.head, self.maps, self.problem = head, dict(maps), problem
         self.usable = problem is None
 
-    def accept(self, checked: Checked, new_head: Optional[dict]) -> None:
-        """A RELOAD keys acks: the generation served (its head already durable when `new_head` is not None)."""
-        if new_head is not None:
-            self.head = new_head
+    def accept(self, checked: Checked, head: dict) -> None:
+        """A RELOAD keys acks: `head` (already durable) installed and the generation served."""
+        self.head = head
         self.maps[checked.generation] = checked
         self.usable, self.problem = True, None
 
     def refuse(self, name: str) -> None:
         """A RELOAD keys refused: every dispatch route refused until a valid one (CONTRACT §4.3)."""
         self.usable, self.problem = False, name
+
+    def head_route_ids(self) -> frozenset:
+        """The route ids of the head generation keys holds (served or refused alike), none before a map: no base
+        route id may be one of them at the point of use (keys' `_route_policy`), however the base map changed since
+        the RELOAD that checked it."""
+        top = None if self.head is None else self.maps.get(self.head["generation"])
+        return frozenset() if top is None else frozenset(top.routes)
 
     def stated(self) -> Tuple[Optional[int], Optional[str]]:
         """What KEYS-ATTACH states keys serves: its head, or `(None, None)` when it serves no map or refuses every
