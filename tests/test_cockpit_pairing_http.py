@@ -6,6 +6,7 @@ from __future__ import annotations
 import http.client
 import json
 import socket
+import sqlite3
 import threading
 import time
 from contextlib import contextmanager
@@ -228,8 +229,9 @@ def test_rt1_ru2_a_paired_request_through_every_gate_class_in_standby_is_503_wit
             ("POST", "/cockpit/sign/compose", {}, None, tok),                # sign / compose / grant
             ("POST", "/no-such-route", {}, PROXY, tok),                      # the general POST gate
             ("POST", "/cockpit/pair/offer", {}, None, tok),                  # an authed pair route
-            ("GET", "/cockpit/manifest.json", None, None, JUNK),             # a junk header on a loopback read
+            ("GET", "/cockpit/pair/devices.json", None, None, JUNK),         # a junk header on a token-every-bind read
         ]
+        # (a junk header on a loopback, unproxied read that needs no credential is class none since F2(c): its test)
         for method, path, body, headers, token in cases:
             st, out, hdrs = _call(port, method, path, body, token=token, headers=headers)
             assert (st, out.get("error")) == (503, "broker_unavailable"), (path, st, out)
@@ -239,9 +241,11 @@ def test_rt1_ru2_a_paired_request_through_every_gate_class_in_standby_is_503_wit
         assert _call(port, "GET", "/cockpit/manifest.json", token=T, headers=PROXY)[0] == 200
 
 
-def test_ru5_the_cockpit_read_path_with_its_inner_catch_answers_503_not_500(src, quick_wait) -> None:
+def test_ru5_the_cockpit_read_path_with_its_inner_catch_answers_503_not_500(src, quick_wait, monkeypatch) -> None:
     """RU-5: on a loopback read the credential is first computed INSIDE handle_cockpit_get's try (no gate before it);
-    its broad ``except`` must re-raise so the one outer catch answers."""
+    its broad ``except`` must re-raise so the one outer catch answers. Since F2(c) such a read needs no credential and
+    is answered as class none, so the request is marked as one that requires a credential to reach the re-raise."""
+    monkeypatch.setattr(web_server._Handler, "_credential_required", lambda self: True)
     with _standby(src) as (_live, port, tok, _h):
         st, out, _ = _call(port, "GET", "/cockpit/panel/tray.json", token=tok)
         assert (st, out.get("error")) == (503, "broker_unavailable"), (st, out)
@@ -393,7 +397,7 @@ def test_rp7_rs5_box_side_pair_and_revoke_all(src, capsys) -> None:
         assert main(["cockpit", "pair", "--data-root", str(root)]) == 1      # no journal yet: refused, nothing made
         assert "no cockpit journal" in capsys.readouterr().err and not (root / "cockpit.db").exists()
         assert _call(port, "GET", "/cockpit/manifest.json")[0] == 200       # the serve's first use opens it
-        assert main(["cockpit", "pair", "--data-root", str(root), "--label", "phone",
+        assert main(["cockpit", "pair", "--data-root", str(root), "--label", "phone", "--print",
                      "--url", f"http://127.0.0.1:{port}/"]) == 0
         link = capsys.readouterr().out.strip()
         assert link.startswith(f"http://127.0.0.1:{port}/pair#code=")
@@ -404,3 +408,143 @@ def test_rp7_rs5_box_side_pair_and_revoke_all(src, capsys) -> None:
         assert main(["cockpit", "pair", "--data-root", str(root), "--revoke-all"]) == 0
         assert "revoked 1" in capsys.readouterr().out
         assert _call(port, "GET", "/cockpit/manifest.json", token=cl["token"], headers=PROXY)[0] == 403
+
+
+# --- the L1/L2 fix round (1024-18/pair_p1/L1L2_findings.md, F1..F8) -------------------------------------------------
+
+def test_f1_a_held_writer_lock_does_not_hold_the_answer(src) -> None:
+    """F1: the last_seen stamp is fail-soft with no busy wait, after the answer: a writer holding cockpit.db's lock
+    costs a paired request nothing (it used to wait the 30 s busy_timeout inside a verify slot)."""
+    with _serve(src) as (port, httpd):
+        _d, tok = _pair(port)                         # last_seen is NULL: the next lookup is due a stamp
+        holder = sqlite3.connect(httpd.broker.data_root / "cockpit.db", isolation_level=None, timeout=5)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            t0 = time.monotonic()
+            st, out, _ = _call(port, "GET", "/cockpit/pair/devices.json", token=tok)
+            took = time.monotonic() - t0
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        assert st == 200 and len(out["devices"]) == 1, out
+        assert took < 3.0, took
+        assert httpd.pair_verify_gate.acquire(blocking=False)    # every verify slot came back
+        httpd.pair_verify_gate.release()
+
+
+def test_f2a_a_finished_starter_in_standby_answers_at_once(src, monkeypatch) -> None:
+    """F2(a): wait_settled waits only while ACTIVATING or while the starter runs; a broker settled in STANDBY (another
+    process holds the ledger) answers its 503 at once, not after the whole wait."""
+    monkeypatch.setattr(web_server, "_PAIR_WAIT_S", 5.0)
+    with _standby(src) as (_live, port, tok, _h):
+        t0 = time.monotonic()
+        st, out, _ = _call(port, "GET", "/cockpit/pair/devices.json", token=tok)
+        took = time.monotonic() - t0
+        assert (st, out.get("error")) == (503, "broker_unavailable"), out
+        assert took < 2.0, took
+
+
+def test_f2b_a_starter_that_raised_is_recorded_and_cleared_so_a_later_request_retries(src, monkeypatch) -> None:
+    from levain.cockpit import broker as broker_mod
+
+    real = broker_mod.decide_install
+    calls: list[int] = []
+
+    def flaky(*a: Any, **kw: Any) -> Any:
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("install check blew up")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(broker_mod, "decide_install", flaky)
+    with _serve(src) as (_port, httpd):
+        b = httpd.broker
+        b.start_async()
+        first = b._starter
+        assert first is not None
+        first.join(5)
+        assert b._starter is None, "a finished starter is cleared"
+        assert isinstance(b.starter_error, RuntimeError)
+        b.start_async()                                # the retry
+        assert b.wait_settled(5) is Lifecycle.ACTIVE
+        assert len(calls) == 2
+
+
+def test_f2c_a_request_needing_no_credential_treats_unavailable_as_none(src, quick_wait) -> None:
+    """F2(c), amending RT-1 / RU-1: a loopback, unproxied read on a STANDBY broker is answered as an unauthenticated
+    loopback read (class none) whatever token header it carries; every route that requires a credential keeps the
+    503."""
+    with _standby(src) as (_live, port, tok, _h):
+        for token in (JUNK, tok):
+            st, man, _ = _call(port, "GET", "/cockpit/manifest.json", token=token)
+            assert st == 200 and man["credential"]["class"] == "none", (st, man)
+        for method, path, body, headers in (("GET", "/cockpit/pair/devices.json", None, None),
+                                            ("GET", "/cockpit/manifest.json", None, PROXY),
+                                            ("POST", "/cockpit/verb", {"verb": "x"}, None)):
+            st, out, _ = _call(port, method, path, body, token=tok, headers=headers)
+            assert (st, out.get("error")) == (503, "broker_unavailable"), (path, st, out)
+
+
+def test_f5_every_pair_503_carries_retry_after_and_the_claims_closes(src, quick_wait) -> None:
+    with _standby(src) as (_live, port, _tok, _h):
+        for method, path, body in (("GET", "/cockpit/pair/devices.json", None),
+                                   ("POST", "/cockpit/pair/offer", {}),
+                                   ("POST", "/cockpit/pair/revoke", {"id": "d-0123456789ab"})):
+            st, out, hdrs = _call(port, method, path, body, token=T)
+            assert (st, out.get("error"), hdrs.get("retry-after")) == (503, "broker_unavailable", "2"), (path, hdrs)
+        st, out, hdrs = _call(port, "POST", "/cockpit/pair/claim", {"code": "x" * 22})
+        assert (st, hdrs.get("retry-after"), hdrs.get("connection")) == (503, "2", "close"), (out, hdrs)
+    with _serve(src) as (port, httpd):
+        for gate, path, body in ((httpd.pair_claim_gate, "/cockpit/pair/claim", {"code": "x"}),
+                                 (httpd.request_gate, "/cockpit/pair/offer", {})):
+            held = 0
+            while gate.acquire(blocking=False):
+                held += 1
+            try:
+                st, out, hdrs = _call(port, "POST", path, body, token=T)
+                assert (st, out.get("error"), hdrs.get("retry-after")) == (503, "busy", "2"), (path, out, hdrs)
+            finally:
+                for _ in range(held):
+                    gate.release()
+
+
+def test_f6_box_side_pair_refuses_a_non_tty_stdout_without_print(src, capsys) -> None:
+    from levain.cli import main
+    from levain.cockpit.firejournal import CockpitDB
+
+    with _serve(src) as (_port, httpd):
+        root = httpd.broker.data_root
+        root.mkdir(parents=True, exist_ok=True)
+        CockpitDB(root).meta("format")
+        capsys.readouterr()
+        assert main(["cockpit", "pair", "--data-root", str(root)]) == 1
+        cap = capsys.readouterr()
+        assert cap.out == "" and "not a terminal" in cap.err and "--print" in cap.err
+        assert CockpitDB(root).list_devices() == []
+        assert main(["cockpit", "pair", "--data-root", str(root), "--print"]) == 0
+        assert capsys.readouterr().out.startswith("/pair#code=")
+
+
+def test_f7_a_journal_fault_on_a_pair_route_is_a_500_json(src, monkeypatch) -> None:
+    from levain.cockpit.firejournal import CockpitDB
+
+    def boom(self: Any) -> Any:
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(CockpitDB, "list_devices", boom)
+    with _serve(src) as (port, _h):
+        st, out, _ = _call(port, "GET", "/cockpit/pair/devices.json", token=T)
+        assert (st, out.get("error")) == (500, "internal"), (st, out)
+
+
+def test_f8_a_stream_not_allowed_before_hello_writes_no_frame() -> None:
+    from types import SimpleNamespace
+
+    from levain.cockpit import stream as cockpit_stream
+
+    written: list[bytes] = []
+    import queue
+
+    sub = SimpleNamespace(hello={"x": 1}, hello_id="e:0", dead=False, q=queue.Queue())
+    cockpit_stream.run(written.append, sub, stop=threading.Event(), allowed=lambda beat: False)
+    assert written == []

@@ -218,10 +218,11 @@ class PendingCapExceeded(RuntimeError):
         self.occupying = tuple(occupying)
 
 
-class DeviceRevoked(PermissionError):
+class DeviceRevoked(Exception):
     """A ``paired-*`` principal whose device row is revoked (or gone) asked to file a pending or mint an offer
     (PAIR RS-4): refused inside the journal's own write transaction, so a request authenticated just before a revoke
-    cannot act after it."""
+    cannot act after it. A sibling of :class:`PairingError`, never an ``OSError``: no ``except OSError`` on the way
+    up may mistake it for an I/O fault."""
 
 
 class PairingError(ValueError):
@@ -660,6 +661,17 @@ class CockpitDB:
             if not self._ready:
                 self._ensure_schema(conn)
                 self._ready = True
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+
+    def _connect_nowait(self) -> sqlite3.Connection:
+        """:meth:`_connect` with ``busy_timeout = 0``: a write on it fails at once on a held lock (the fail-soft
+        ``last_seen`` stamp, F1)."""
+        conn = self._connect()
+        try:
+            conn.execute("PRAGMA busy_timeout = 0")
         except BaseException:
             conn.close()
             raise
@@ -1111,6 +1123,13 @@ class CockpitDB:
         if not isinstance(code, str) or not code or len(code) > 128:
             return None
         stamp = utc_stamp(now)
+        # F3: a code that names no live-looking row is answered from a read, so a credential-less junk claim never
+        # takes the journal's write lock; a live-looking one is re-checked below inside the write (single spend)
+        with self.read() as conn:
+            seen = conn.execute("SELECT used_at, expires FROM pair_offers WHERE code_hash = ?",
+                                (_sha256(code),)).fetchone()
+        if seen is None or seen["used_at"] is not None or seen["expires"] <= stamp:
+            return None
         with self.write() as conn:
             row = conn.execute("SELECT label, minted_by, expires, used_at FROM pair_offers WHERE code_hash = ?",
                                (_sha256(code),)).fetchone()
@@ -1131,22 +1150,34 @@ class CockpitDB:
 
     def verify_device(self, token: str, *, now: datetime) -> str | None:
         """The id of the unrevoked device ``token`` belongs to, or None (unknown or revoked): one indexed lookup of
-        its SHA-256. ``last_seen`` is stamped at most once per ``LAST_SEEN_EVERY``, fail-soft (a busy journal skips
-        the stamp, never the answer)."""
+        its SHA-256, a read and nothing else. ``now`` is unused here (kept for the caller's one clock); the
+        ``last_seen`` stamp is :meth:`stamp_last_seen`, which the caller runs AFTER this answer (F1)."""
+        del now
         with self.read() as conn:
-            row = conn.execute("SELECT id, last_seen, revoked_at FROM paired_devices WHERE token_hash = ?",
+            row = conn.execute("SELECT id, revoked_at FROM paired_devices WHERE token_hash = ?",
                                (_sha256(token),)).fetchone()
         if row is None or row["revoked_at"] is not None:
             return None
-        stamp = utc_stamp(now)
-        if row["last_seen"] is None or row["last_seen"] <= utc_stamp(now - LAST_SEEN_EVERY):
-            try:
-                with self.write() as conn:
-                    conn.execute("UPDATE paired_devices SET last_seen = ? WHERE id = ? AND revoked_at IS NULL",
-                                 (stamp, row["id"]))
-            except sqlite3.Error:
-                pass
         return str(row["id"])
+
+    def stamp_last_seen(self, device_id: str, *, now: datetime) -> bool:
+        """Stamp ``device_id``'s ``last_seen`` when it is due (at most once per ``LAST_SEEN_EVERY``), fail-soft: the
+        write runs on a connection with ``busy_timeout = 0``, so a journal whose write lock is held skips the stamp
+        at once instead of waiting (F1). True iff a row was stamped. Never part of any answer."""
+        stamp = utc_stamp(now)
+        due = utc_stamp(now - LAST_SEEN_EVERY)
+        try:
+            with self.read() as conn:
+                row = conn.execute("SELECT last_seen FROM paired_devices WHERE id = ? AND revoked_at IS NULL",
+                                   (device_id,)).fetchone()
+            if row is None or (row[0] is not None and row[0] > due):
+                return False
+            with write_transaction(self._connect_nowait) as conn:
+                return bool(conn.execute(
+                    "UPDATE paired_devices SET last_seen = ? WHERE id = ? AND revoked_at IS NULL "
+                    "AND (last_seen IS NULL OR last_seen <= ?)", (stamp, device_id, due)).rowcount)
+        except sqlite3.OperationalError:
+            return False        # busy (the lock is held) or locked: the stamp is skipped, nothing else moves
 
     def device_live(self, device_id: str) -> bool:
         """Whether ``device_id`` names an unrevoked device (the change stream's re-check, RU-3). Stamps nothing."""

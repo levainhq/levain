@@ -956,6 +956,7 @@ class _Handler(GuardedHandler):
     server: _LevainHTTPServer  # narrow the type for typed attribute access
     _credential_cache: Any = _UNSET
     _pair_epoch_seen = 0       # the revocation epoch read just before this request's paired lookup (RU-3)
+    _pair_body_read = False    # a pair POST's body was consumed (F4: a refusal drains only an unread one)
 
     def handle_one_request(self) -> None:
         """One request on this (possibly kept-alive) connection. PAIR RS-1: the credential cache is reset here, at the
@@ -964,11 +965,13 @@ class _Handler(GuardedHandler):
         connection closed (RU-2: like every refusal sent before a body is read). The body never says "token": the
         dashboard's token-drop paths match that word."""
         self._credential_cache = _UNSET
+        self._pair_body_read = False
         try:
             super().handle_one_request()
         except _CredentialUnavailable:
             self.close_connection = True
             try:
+                self._pair_drain()      # F4: a pair POST refused before its body was read
                 self._send(json.dumps({"error": "broker_unavailable",
                                        "message": "the cockpit is starting or busy; try again shortly"}).encode("utf-8"),
                            "application/json; charset=utf-8", status=503, head=self.command == "HEAD",
@@ -998,17 +1001,37 @@ class _Handler(GuardedHandler):
             return True
         return not self.server.is_loopback_bind and self.server.levain_source.write_scope is not None
 
-    def _credential(self) -> dict[str, Any]:
+    def _credential(self, *, required: "bool | None" = None) -> dict[str, Any]:
         """The credential THIS request carries, verified here and never claimed (design §5.1), computed once per
         request (RS-1: the cache is reset in ``handle_one_request``). First a surface token, compared in constant
         time against every surface's token (no early exit, so timing does not say which surface matched); on a
         miss with a header supplied, the PAIRED pass (``_paired_name``): a paired device's token, named
-        ``paired-<device id>`` (RP-1). Else nothing. Raises :class:`_CredentialUnavailable` (never cached) per RU-1."""
+        ``paired-<device id>`` (RP-1). Else nothing. Raises :class:`_CredentialUnavailable` (never cached) per RU-1.
+
+        F2(c), amending RT-1 / RU-1: where a credential is NOT required (``required`` False, or None and
+        :meth:`_credential_required` says so), "unavailable" is answered as class ``none`` instead, NOT cached, so a
+        gate later in the same request (``_off_box_token_valid`` passes ``required=True``) asks again and keeps its
+        503."""
         cached = self._credential_cache
-        if cached is _UNSET:
+        if cached is not _UNSET:
+            return cached
+        try:
             cached = self._resolve_credential()
-            self._credential_cache = cached
+        except _CredentialUnavailable:
+            if required is None:
+                required = self._credential_required()
+            if required:
+                raise
+            return {"class": "none", "device_class": None}
+        self._credential_cache = cached
         return cached
+
+    def _credential_required(self) -> bool:
+        """Whether THIS request needs a credential at all (F2(c)): False only for a loopback-bound, unproxied
+        (``not _write_token_required()``) GET / HEAD, which reaches no write route. Every route that requires a token
+        on every bind asks through ``_off_box_token_valid`` (``required=True``) instead, so it keeps its 503."""
+        return (not self.server.is_loopback_bind or self._write_token_required()
+                or self.command not in ("GET", "HEAD"))
 
     def _resolve_credential(self) -> dict[str, Any]:
         raw = self.headers.get(_WRITE_TOKEN_HEADER, "")
@@ -1024,7 +1047,7 @@ class _Handler(GuardedHandler):
         if raw:
             device = self._paired_device(raw)
             if device is not None:
-                return {"class": "token", "name": PAIRED_PREFIX + device, "device_class": "paired"}
+                return {"class": "token", "name": PAIRED_PREFIX + device, "device_class": None}
         return {"class": "none", "device_class": None}
 
     def _pairing_db(self) -> Any:
@@ -1063,12 +1086,21 @@ class _Handler(GuardedHandler):
             db = self._pairing_db()
             if db is None:
                 return None
+            now = datetime.now(timezone.utc)
             try:
-                return db.verify_device(raw, now=datetime.now(timezone.utc))
+                device = db.verify_device(raw, now=now)
             except Exception as exc:  # noqa: BLE001 - a journal fault is no definite "revoked": 503, the token kept
                 raise _CredentialUnavailable(f"{type(exc).__name__}") from exc
         finally:
             srv.pair_verify_gate.release()
+        # F1: the last_seen stamp runs AFTER the answer and after the verify slot is released, with no busy wait
+        # (busy_timeout 0), and nothing it does reaches the answer
+        if device is not None:
+            try:
+                db.stamp_last_seen(device, now=now)
+            except Exception:  # noqa: BLE001 - a display stamp never fails a request
+                _log.debug("paired device last_seen stamp skipped", exc_info=True)
+        return device
 
     def _transport(self) -> dict[str, bool]:
         """The manifest's ``transport``: the same two flags ``/substrate.json`` carries."""
@@ -1084,7 +1116,7 @@ class _Handler(GuardedHandler):
         shared by the read gate (``_route``) and the write gate (``do_POST``) so the two can never
         diverge on the auth check (``structural_invariants_beat_discipline``); each caller gates on
         its own predicate first. An empty surface token never matches."""
-        return self._credential()["class"] == "token"
+        return self._credential(required=True)["class"] == "token"
 
     def _cockpit(self) -> "Cockpit":
         """The server's cockpit; the kernel's default over this substrate is built on first use
@@ -1610,11 +1642,41 @@ class _Handler(GuardedHandler):
                        .encode("utf-8"), "application/json; charset=utf-8", status=403, head=head)
             return
         payload, status = self._pair_call(lambda db: {"devices": db.list_devices()})
-        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head)
+        self._pair_send(payload, status, head=head)
+
+    def _pair_send(self, payload: "dict[str, Any]", status: int, *, head: bool = False,
+                   cache_control: "str | None" = None) -> None:
+        """A pair route's JSON answer; every 503 carries ``Retry-After: 2`` (F5)."""
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=[("Retry-After", "2")] if status == 503 else None, cache_control=cache_control)
+
+    def _pair_drain(self) -> None:
+        """F4: before a pair POST is refused without its body read (the 503s, the 403s), drain up to
+        ``_PAIR_BODY_MAX`` of the declared body, so the client reads the refusal instead of a TCP RST on the close.
+        A body declared larger, or not declared, is not drained; a stalled one is given up on."""
+        if self.command != "POST" or self._pair_body_read:
+            return
+        if self.path.split("?", 1)[0] not in (_PAIR_CLAIM, *_PAIR_AUTHED_POST):
+            return
+        raw = self.headers.get("Content-Length", "")
+        if not (raw.isascii() and raw.isdigit()) or len(raw) > 6 or int(raw) > _PAIR_BODY_MAX:
+            return
+        self._pair_body_read = True
+        try:
+            self._drain(int(raw))
+        except OSError:
+            pass
+
+    def _pair_refuse(self, status: int, error: str, message: str) -> None:
+        """A pair POST refused before its body is read: drained (F4), closed, ``Retry-After`` on a 503 (F5)."""
+        self._pair_drain()
+        self.close_connection = True
+        self._pair_send({"error": error, "message": message}, status)
 
     def _pair_call(self, fn: "Callable[[Any], dict[str, Any]]") -> "tuple[dict[str, Any], int]":
         """Run ``fn(journal)`` for a pair route: 404 where pairing cannot exist (RP-3: no ledger_root, a read-only
-        source), the broker's refusal where it is disabled, 503 while it is transient (after the RU-4 wait)."""
+        source), the broker's refusal where it is disabled, 503 while it is transient (after the RU-4 wait), 500
+        ``internal`` on any other fault (F7), like every other handler."""
         broker = self.server.broker
         if broker is None:
             return {"error": "not_found", "message": "pairing needs a writable cockpit"}, 404
@@ -1631,6 +1693,11 @@ class _Handler(GuardedHandler):
             return {"error": "bad_request", "message": str(exc)}, 400
         except DeviceRevoked as exc:
             return {"error": "credential_required", "message": str(exc)}, 403
+        except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+            raise
+        except Exception as exc:  # noqa: BLE001 - F7: a journal fault is an answer, never a dead connection
+            _log.warning("pair route failed: %s: %s", type(exc).__name__, exc)
+            return {"error": "internal", "message": type(exc).__name__}, 500
 
     def _serve_stream(self, *, head: bool) -> None:
         """``GET /cockpit/events``: reached only through ``_route``, so the Host allowlist, the
@@ -2047,7 +2114,7 @@ class _Handler(GuardedHandler):
             return self._pair_claim()
         if route in _PAIR_AUTHED_POST:
             if not self._off_box_token_valid():
-                return self._reject(403, "credential_required", "missing or invalid write token")
+                return self._pair_refuse(403, "credential_required", "missing or invalid write token")
             return self._pair_authed_post(route)
         if _is_write_route(route) and self._writes_need_credential() and not self._off_box_token_valid():
             # K2a (design §4.3): every write carries a credential on every bind, loopback included;
@@ -2189,6 +2256,7 @@ class _Handler(GuardedHandler):
             return None
         if self._refuse_oversize(clen, _PAIR_BODY_MAX, _PAIR_BODY_MAX):
             return None
+        self._pair_body_read = True
         try:
             raw = self.rfile.read(clen)
         except OSError:
@@ -2210,7 +2278,7 @@ class _Handler(GuardedHandler):
         the code is the credential. Its own 2-slot semaphore (RP-4); the label is the offer's (RP-6); no lockout
         (RP-5); nothing of the body is ever logged."""
         if not self.server.pair_claim_gate.acquire(blocking=False):
-            return self._reject(503, "busy", "server busy")
+            return self._pair_refuse(503, "busy", "server busy")
         try:
             req = self._pair_body()
             if req is None:
@@ -2228,8 +2296,9 @@ class _Handler(GuardedHandler):
                                        "message": "this pairing code is not valid: used, expired or unknown"}, 403
                 else:
                     payload = {"device_id": claimed[0], "token": claimed[1]}
-            self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status,
-                       cache_control="no-store")
+            if status == 503:
+                self.close_connection = True     # F5: the claim's 503 closes, like its pre-body one
+            self._pair_send(payload, status, cache_control="no-store")
         finally:
             self.server.pair_claim_gate.release()
 
@@ -2240,7 +2309,7 @@ class _Handler(GuardedHandler):
         after the revoke's transaction commits (RU-3)."""
         srv = self.server
         if not srv.request_gate.acquire(blocking=False):
-            return self._reject(503, "busy", "server busy")
+            return self._pair_refuse(503, "busy", "server busy")
         try:
             req = self._pair_body()
             if req is None:
@@ -2272,13 +2341,12 @@ class _Handler(GuardedHandler):
                         srv.pair_epoch += 1
                 elif payload.get("error") == "bad_request" and "no such device" in payload.get("message", ""):
                     status = 404
-            self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status,
-                       cache_control="no-store")
+            self._pair_send(payload, status, cache_control="no-store")
         finally:
             srv.request_gate.release()
 
 
-_PENDING_KEYS ={"signature": frozenset({"signature"}),
+_PENDING_KEYS = {"signature": frozenset({"signature"}),
                  "cancel": frozenset({"intent", "idempotency_key"})}
 
 

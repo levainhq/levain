@@ -531,6 +531,9 @@ def main(argv: list[str] | None = None) -> int:
                               "without it the link is printed as a path to append to that address.")
     ck_pair.add_argument("--revoke-all", action="store_true", dest="revoke_all",
                          help="Revoke every paired device instead of minting a code.")
+    ck_pair.add_argument("--print", action="store_true", dest="print_link",
+                         help="Print the pair link even when stdout is not a terminal (a pipe, a file, a log): "
+                              "without it the link is refused there, since anyone who reads it can pair.")
     ck_pair.set_defaults(func=_cmd_cockpit_pair)
     ck_pending = ck_sub.add_parser("pending", help="List the cockpit's waiting pendings (read-only, no server).")
     _ck_common(ck_pending)
@@ -3222,6 +3225,11 @@ def _cmd_cockpit_pair(args: argparse.Namespace) -> int:
             gone = db.revoke_devices(None, by="box", now=now)
             print(f"revoked {len(gone)} paired device(s)" + (": " + ", ".join(gone) if gone else ""))
             return 0
+        if not args.print_link and not sys.stdout.isatty():
+            # F6: the link IS a credential for ten minutes; a pipe or a file is a log nobody meant to keep one in
+            print("pair: stdout is not a terminal, so the one-time link is not printed (anyone who reads it can "
+                  "pair a device); run it in a terminal, or pass --print to print it anyway", file=sys.stderr)
+            return 1
         code = db.mint_offer(label=args.label, minted_by="box", now=now)
     except (PairingError, *_cockpit_refusals()) as exc:
         print(f"pair: {_term_safe(exc)}", file=sys.stderr)

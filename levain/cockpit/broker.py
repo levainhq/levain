@@ -286,7 +286,8 @@ class Broker:
         self._thread: threading.Thread | None = None
         self._healer: threading.Thread | None = None
         self._stop = threading.Event()
-        self._starter: threading.Thread | None = None   # start_async's one thread (PAIR RU-4)
+        self._starter: threading.Thread | None = None   # start_async's one thread (PAIR RU-4), cleared when it ends
+        self.starter_error: BaseException | None = None   # the last exception a starter thread's start raised (F2(b))
 
     @staticmethod
     def check_downstream(downstream: Mapping[str, Any]) -> dict[str, DownstreamEffect]:
@@ -404,18 +405,38 @@ class Broker:
         with self._mu:
             if self._started or self._starter is not None:
                 return
-            self._starter = threading.Thread(target=self.start, name="cockpit-broker-start", daemon=True)
+            self._starter = threading.Thread(target=self._run_starter, name="cockpit-broker-start", daemon=True)
             self._starter.start()
 
+    def _run_starter(self) -> None:
+        """The starter thread's body (F2(b)): an exception out of :meth:`start` is logged and kept in
+        ``starter_error``, and a start that raised before anything moved (still STANDBY, no healer) is marked not
+        started; ``_starter`` is cleared in a ``finally`` either way, so a later :meth:`start_async` retries."""
+        try:
+            self.start()
+        except Exception as exc:  # noqa: BLE001 - a starter that dies silently would leave every paired request waiting
+            _log.exception("cockpit broker start failed")
+            with self._mu:
+                self.starter_error = exc
+                if self._state is Lifecycle.STANDBY and self._healer is None:
+                    self._started = False
+        finally:
+            with self._mu:
+                self._starter = None
+
     def wait_settled(self, timeout: float, *, poll: float = 0.02) -> Lifecycle:
-        """The broker's state once it is ACTIVE, INSTALL_DISABLED or CLOSED, or after ``timeout`` seconds of
-        STANDBY / ACTIVATING / DRAINING, whichever comes first."""
+        """The broker's state once it is ACTIVE, INSTALL_DISABLED or CLOSED, or after ``timeout`` seconds, whichever
+        comes first; but it waits only while the state is ACTIVATING or the starter thread is alive (F2(a)): a
+        finished starter that left STANDBY (another process holds the ledger) or DRAINING answers at once."""
         import time
 
         deadline = time.monotonic() + timeout
         while True:
             state = self.state
             if state in (Lifecycle.ACTIVE, Lifecycle.INSTALL_DISABLED, Lifecycle.CLOSED):
+                return state
+            starter = self._starter
+            if state is not Lifecycle.ACTIVATING and (starter is None or not starter.is_alive()):
                 return state
             left = deadline - time.monotonic()
             if left <= 0:

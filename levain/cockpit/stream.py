@@ -197,7 +197,10 @@ def run(
 
     ``allowed(at_heartbeat)`` (PAIR RU-3) is asked on EVERY loop pass, before any frame (data or heartbeat) is
     written, and the stream ends the moment it answers False: a revoked paired device's open stream writes nothing
-    after its revoke. ``at_heartbeat`` is True on the pass that would write a heartbeat."""
+    after its revoke. ``at_heartbeat`` is True on the pass that would write a heartbeat. It is asked before the hello
+    frame too (F8), so "before any frame" holds for the first one."""
+    if allowed is not None and not allowed(False):
+        return
     write(frame("hello", sub.hello, sub.hello_id))
     last_write = clock()
     while not stop.is_set() and not sub.dead:

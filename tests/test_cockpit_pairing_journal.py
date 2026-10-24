@@ -163,14 +163,44 @@ def test_verify_device_hash_only_and_throttled_last_seen(db: CockpitDB) -> None:
         dump = "\n".join(str(tuple(r)) for r in conn.execute("SELECT * FROM paired_devices"))
     assert tok not in dump
     assert db.verify_device(tok, now=NOW) == a
+    assert db.list_devices()[0]["last_seen"] is None          # F1: the answer stamps nothing
+    assert db.stamp_last_seen(a, now=NOW) is True
     first = db.list_devices()[0]["last_seen"]
-    assert db.verify_device(tok, now=NOW + timedelta(seconds=30)) == a
+    assert db.stamp_last_seen(a, now=NOW + timedelta(seconds=30)) is False
     assert db.list_devices()[0]["last_seen"] == first
-    assert db.verify_device(tok, now=NOW + timedelta(seconds=61)) == a
+    assert db.stamp_last_seen(a, now=NOW + timedelta(seconds=61)) is True
     assert db.list_devices()[0]["last_seen"] != first
+    holder = sqlite3.connect(db.path, isolation_level=None)   # F1: a held writer lock skips the stamp at once
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        assert db.stamp_last_seen(a, now=NOW + timedelta(minutes=5)) is False
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
     assert db.verify_device(tok + "x", now=NOW) is None
     db.revoke_devices([a], by="browser", now=NOW)
     assert db.verify_device(tok, now=NOW) is None and db.device_live(a) is False
+
+
+def test_f3_a_junk_code_takes_no_write_lock(db: CockpitDB, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F3: an unknown, used or expired code is answered from a read; only a live-looking row takes ``write()``."""
+    live = db.mint_offer(label="x", minted_by="browser", now=NOW)
+    used = db.mint_offer(label="y", minted_by="browser", now=NOW)
+    assert db.redeem_offer(used, now=NOW) is not None
+    stale = db.mint_offer(label="z", minted_by="browser", now=NOW - OFFER_TTL - timedelta(seconds=1))
+    writes: list[int] = []
+    real = CockpitDB.write
+
+    def counting(self: CockpitDB):  # type: ignore[no-untyped-def]
+        writes.append(1)
+        return real(self)
+
+    monkeypatch.setattr(CockpitDB, "write", counting)
+    for code in ("j" * 22, used, stale):
+        assert db.redeem_offer(code, now=NOW) is None
+    assert writes == []
+    assert db.redeem_offer(live, now=NOW) is not None and writes == [1]
+    assert db.redeem_offer(live, now=NOW) is None and writes == [1]       # single spend, still from the read
 
 
 def test_rs5_an_existing_3_journal_gains_the_two_tables_and_nothing_else_moves(tmp_path: Path) -> None:
