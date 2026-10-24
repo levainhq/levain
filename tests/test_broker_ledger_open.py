@@ -143,13 +143,13 @@ def test_corrupt_refuses(tmp_path, what, lines, n):
 @pytest.mark.parametrize("extra", [[], [b"garbage that would be corrupt\n"]])
 def test_format_newer_refused(tmp_path, extra):
     path = ledger_path(tmp_path)
-    write_file(path, line("header", 0, format="levain-reservation-ledger/3", ledger_id=LID,
+    write_file(path, line("header", 0, format="levain-reservation-ledger/4", ledger_id=LID,
                           created_at="2026-10-23T01:02:03Z", lineage=True), *extra)
     assert _refusal(path).name == "ledger-format-newer"
 
 
 def _newer_header() -> bytes:
-    return line("header", 0, format="levain-reservation-ledger/3", ledger_id=LID, created_at="2026-10-23T01:02:03Z")
+    return line("header", 0, format="levain-reservation-ledger/4", ledger_id=LID, created_at="2026-10-23T01:02:03Z")
 
 
 def _digest(path) -> str:
@@ -556,7 +556,9 @@ def test_off_darwin_every_flush_is_fsync(tmp_path, monkeypatch):
 
 STDLIB = {"__future__", "asyncio", "datetime", "enum", "errno", "fcntl", "functools", "inspect", "json", "logging",
           "os", "queue", "re", "secrets", "sys", "threading", "time", "typing"}
-FORBIDDEN = {"policy", "codec", "routemap", "generation", "pin", "lineage", "full_fsync", "dir_fsync"}
+#: `lineage` left this list at the `/3` bump (S1 3c-6a): C1_DESIGN's own 3c-6 row and R4 §3 put the `lineage-acked`
+#: kind, the payload and the outbox in this module; it still knows no record schema (the payload is keys' dict)
+FORBIDDEN = {"policy", "codec", "routemap", "generation", "pin", "full_fsync", "dir_fsync"}
 
 
 def test_ledger_imports_only_stdlib():
