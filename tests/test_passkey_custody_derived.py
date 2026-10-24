@@ -597,10 +597,9 @@ def cockpit_verdict(home: Path, spores: Path, keydir: Path, custody: str, *, lap
 
 @pytest.fixture
 def broker_home():
-    from tests.test_cockpit_k2b_broker import account_home
-    import tempfile
+    from tests.autonomic_confirm_keys import anchor_scratch
 
-    d = Path(tempfile.mkdtemp(prefix=".levain-custody-broker-", dir=account_home()))
+    d = anchor_scratch("custody-broker-")
     try:
         (d / "keys").mkdir(mode=0o700)
         from anneal_memory.spores import SporeStore

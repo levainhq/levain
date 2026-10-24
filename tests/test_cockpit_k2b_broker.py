@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
-import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -31,11 +30,11 @@ BROWSER = {"class": "token", "name": "browser"}
 PHONE = {"class": "token", "name": "flowconnect"}
 
 
-from tests.autonomic_confirm_keys import account_home
+from tests.autonomic_confirm_keys import anchor_scratch
 
 @pytest.fixture
 def home() -> Iterator[Path]:
-    d = Path(tempfile.mkdtemp(prefix=".levain-k2b-broker-", dir=account_home()))
+    d = anchor_scratch("k2b-broker-")
     try:
         yield d
     finally:
