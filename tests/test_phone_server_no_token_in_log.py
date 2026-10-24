@@ -32,9 +32,10 @@ def _run(tmp_path: Path, monkeypatch, link_file: Path | None) -> "tuple[str, str
         text = link_file.read_text(encoding="utf-8") if link_file is not None else ""
         return made[0].phone_token, text
     finally:
-        if made:
+        if made and t.is_alive():       # shutdown() waits forever on a server whose serve_forever never ran
             made[0].shutdown()
         t.join(10)
+        assert not t.is_alive(), "the server thread did not stop"
 
 
 def test_with_a_link_file_the_token_is_not_printed(tmp_path: Path, monkeypatch, capsys) -> None:
