@@ -362,22 +362,26 @@ def _slot_why(exc: BaseException) -> str:
     return f"{name}: {getattr(exc, 'detail', '')}".rstrip(": ") if name else f"{type(exc).__name__}: {exc}"
 
 
-def _read_slot_dirs(slots: Path) -> dict[str, tuple[str, str]]:
-    """tag -> (kind, why): kind is the state of an in-service slot, ``retired`` (a tombstone), ``nostate`` (the helper's
-    own reading: in service) or ``bad`` (not usable, ``why`` says why). Names and links are judged as the runtime
+def _read_slot_dirs(slots: Path) -> tuple[dict[str, tuple[str, str]], list[str]]:
+    """(tag -> (kind, why), ignored names): kind is the state of an in-service slot, ``retired`` (a tombstone),
+    ``nostate`` (no state file: the runtime reads an absent state as not reusable, ``read_view``) or ``bad`` (not
+    usable, ``why`` says why). ``ignored`` are entries the runtime does not count as slots (non-canonical names, links). Names and links are judged as the runtime
     helper judges them: a canonical tag naming a real directory, a state file that is a regular file naming this slot."""
     from levain.slot import Refused
     from levain.slot import records as R
     from levain.slot.ids import SlotId
 
     out: dict[str, tuple[str, str]] = {}
+    ignored: list[str] = []
     for name in sorted(os.listdir(slots)):
         if len(name) < 2 or name[0] not in "ev" or not name[1:].isdigit() or str(int(name[1:])) != name[1:] \
                 or int(name[1:]) >= 64:
+            ignored.append(name)
             continue
         d = slots / name
         if not stat.S_ISDIR(os.lstat(d).st_mode):
-            continue      # a link or a file: the runtime does not count it as a slot either
+            ignored.append(name)      # a link or a file: the runtime does not count it as a slot either
+            continue
         want = SlotId("egress" if name[0] == "e" else "none", int(name[1:]))
         try:
             data = R.read_record(d / "state", max_bytes=_SLOT_RECORD_CAP)
@@ -385,7 +389,7 @@ def _read_slot_dirs(slots: Path) -> dict[str, tuple[str, str]]:
             out[name] = ("bad", f"state unreadable: {_slot_why(exc)}")
             continue
         if data is None:
-            out[name] = ("nostate", "")
+            out[name] = ("bad", "state missing")
             continue
         try:
             rec = R.parse_slot_state(data)
@@ -396,7 +400,7 @@ def _read_slot_dirs(slots: Path) -> dict[str, tuple[str, str]]:
             out[name] = ("bad", f"state names {rec.slot.tag}")
         else:
             out[name] = (rec.state, "")
-    return out
+    return out, ignored
 
 
 def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
@@ -416,6 +420,15 @@ def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
     try:
         if store is None or not store.is_dir():
             return [CheckResult("agent sessions", True, "not installed", neutral=True)]
+        for part in (store, store / "slots"):      # the runtime opens these O_NOFOLLOW: a link is not the store
+            try:
+                is_link = stat.S_ISLNK(os.lstat(part).st_mode)
+            except FileNotFoundError:
+                continue
+            if is_link:
+                return [CheckResult("agent sessions", False, f"{part} is a symbolic link; the runtime refuses a "
+                                    "linked store, so no session can be started",
+                                    "Replace it with the real directory (the install helper creates it).")]
         if not (store / "slots").is_dir():
             return [CheckResult("agent sessions", False, f"partially installed: no slots directory at {store}",
                                 "The isolation install is incomplete; its install helper repairs it.")]
@@ -448,18 +461,19 @@ def _slot_rows(store: Path, layout: Any, R: Any, Refused: Any) -> list[CheckResu
     except (Refused, OSError) as exc:
         return [CheckResult("agent slots", False, f"the pool configuration cannot be read ({_slot_why(exc)})",
                             f"Look at {store / 'policy' / 'pool'}.")]
-    found = _read_slot_dirs(store / "slots")
+    found, ignored = _read_slot_dirs(store / "slots")
     live = {t: v for t, v in found.items() if v[0] != "retired"}
     tombs = sorted(t for t, v in found.items() if v[0] == "retired")
-    usable = {t for t, v in live.items() if v[0] in _SLOT_USABLE or v[0] == "nostate"}
+    usable = {t for t, v in live.items() if v[0] in _SLOT_USABLE}
     bad = [f"{t} ({v[1] or v[0]})" for t, v in live.items() if t not in usable]
-    note = (f"; {len(tombs)} retired, not counted" if tombs else "")
+    note = ((f"; {len(tombs)} retired, not counted" if tombs else "")
+            + (f"; ignored (not slots): {', '.join(ignored)}" if ignored else ""))
     if want is None:
-        n = len(usable)
-        return [CheckResult("agent slots", n > 0 and not bad,
-                            f"{n} usable, no pool configuration to judge against"
+        return [CheckResult("agent slots", False,
+                            "the pool configuration is missing, so capacity cannot be judged and replenishment "
+                            f"refuses; {len(usable)} usable"
                             + (f"; not usable: {', '.join(bad)}" if bad else "") + note,
-                            "The pool configuration (policy/pool) is missing; replenish refuses without it.")]
+                            f"Look at {store / 'policy' / 'pool'}; the install helper writes it.")]
     short = []
     for (_label, prefix, _cls), need in zip(_POOL_CLASSES, want):
         have = sum(1 for t in usable if t[0] == prefix)

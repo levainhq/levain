@@ -45,6 +45,16 @@ def test_doctor_slot_section_absent_without_install(tmp_path: Path):
     (tmp_path / "half").mkdir()    # the store is there and its slots directory is not: not the same as never installed
     half = doctor._check_slot_isolation(host="linux", store=tmp_path / "half", free_bytes=lambda p: 100 << 30)[0]
     assert not half.ok and "partially installed" in half.detail
+    real = tmp_path / "real"
+    (real / "slots").mkdir(parents=True)
+    os.symlink(real, tmp_path / "linkstore")        # a linked store root, then a linked slots/: both refused
+    for link in (tmp_path / "linkstore", ):
+        row = doctor._check_slot_isolation(host="linux", store=link, free_bytes=lambda p: 100 << 30)[0]
+        assert not row.ok and "symbolic link" in row.detail
+    (tmp_path / "ls").mkdir()
+    os.symlink(real / "slots", tmp_path / "ls" / "slots")
+    row = doctor._check_slot_isolation(host="linux", store=tmp_path / "ls", free_bytes=lambda p: 100 << 30)[0]
+    assert not row.ok and "symbolic link" in row.detail
 
 
 def test_doctor_slot_pool_is_judged_against_policy_pool_and_tombstones_are_not_counted(tmp_path: Path):
@@ -64,15 +74,29 @@ def test_doctor_slot_pool_is_judged_against_policy_pool_and_tombstones_are_not_c
 
 def test_doctor_slot_unreadable_state_is_not_missing_and_an_oserror_does_not_abort(tmp_path: Path):
     store = _store(tmp_path, {"e1": "reusable", "e2": "reusable"}, pool=(3, 0))
-    (store / "slots" / "e3").mkdir()      # no state file: in service, as the install helper reads it
+    (store / "slots" / "e3").mkdir()      # no state file: the runtime reads absent as not reusable
+    (store / "slots" / "e01").mkdir()     # non-canonical: ignored, and said so
     os.unlink(store / "slots" / "e2" / "state")
     os.symlink(store / "slots" / "e1" / "state", store / "slots" / "e2" / "state")   # a link: refused
     row = _rows(store)["agent slots"]
-    assert "e2 (state unreadable: bad-root" in row.detail and "missing" not in row.detail and not row.ok
+    assert "e2 (state unreadable: bad-root" in row.detail and "e2 (state missing" not in row.detail and not row.ok
+    assert "e3 (state missing)" in row.detail and "ignored (not slots): e01" in row.detail
     with mock.patch.object(os, "listdir", side_effect=PermissionError(13, "denied")):
         rows = doctor._check_slot_isolation(host="linux", store=store, free_bytes=lambda p: 100 << 30)
     assert rows[0].name == "agent slots" and rows[0].warn and "permission denied" in rows[0].detail
     assert rows[-1].name == "agent store free space"
+
+
+def test_doctor_slot_without_a_state_file_is_not_usable_and_turns_its_class_red(tmp_path: Path):
+    store = _store(tmp_path, {"e1": "reusable"}, pool=(2, 0))
+    (store / "slots" / "e2").mkdir()
+    row = _rows(store)["agent slots"]
+    assert not row.ok and "egress 1 of 2" in row.detail and "e2 (state missing)" in row.detail
+
+
+def test_doctor_slot_store_without_a_pool_configuration_is_a_failing_row(tmp_path: Path):
+    row = _rows(_store(tmp_path, {"e1": "reusable"}, pool=None))["agent slots"]
+    assert not row.ok and "pool configuration is missing" in row.detail and "capacity cannot be judged" in row.detail
 
 
 def test_doctor_slot_free_space_below_floor_is_red(tmp_path: Path):
