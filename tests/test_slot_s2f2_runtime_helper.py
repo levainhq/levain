@@ -23,6 +23,7 @@ from levain.slot import control as C
 from levain.slot import records as R
 from levain.slot import runtime_helper as H
 from levain.slot import stage as ST
+from levain.slot import tickets as T
 from levain.slot.end import V5_FLOOR_BYTES
 from levain.slot.ids import SlotId
 from levain.slot.install_helper import operator_record_text
@@ -612,10 +613,29 @@ def test_base_recorded_only_when_step3_completes(world):
 
 
 def test_none_class_no_front_no_handle(world):
-    """A verifier (none class) render: no front started, no FRONT-ARM, MINT claims with no front, no handle."""
+    """A verifier (none class) render: no front started, no FRONT-ARM, MINT claims with no front, no handle.
+
+    3c-5 fix 4: MINT checks a ticketed session's claims against the ticket CONTROL holds BOUND to it (``run-unknown``
+    for one it does not), and production only reaches a verifier session through ATTACH of a ticket-bound lease, which
+    binds the ticket in the journal. So the ticket is minted and bound in a real TicketStore, the store halves the
+    verbs call (``TicketStore.mint`` / ``bind``): ``RUN-TICKET-MINT`` itself answers ``verifier-unknown`` until a
+    verifier generation can be activated (3c-8), so the store's mint stands in for that verb here."""
     s = "s-00000000000000c1"
     slot = SlotId("none", 0)
-    ticket = C.new_handle()
+    (world.L / "policy" / "dispatch_ceiling").write_bytes(canon.canonical_bytes(
+        {"format": T.CEILING_FORMAT, "max_reserved_microdollars_per_run": 5_000_000, "max_open_tickets": 4,
+         "max_runs_per_day": 50}))
+    tickets = T.TicketStore(world.L / "sessions" / T.JOURNAL, world.L / "policy" / "dispatch_ceiling",
+                            ceiling_uid=os.getuid())
+    tickets.start()
+    world.control.tickets = tickets
+    facts = T.check_facts({"job_id": "job-1", "run_index": 0, "contract_digest": "sha256:" + "1" * 64,
+                           "kind": "verifier", "egress_routes": [], "reserved_microdollars": 0,
+                           "verifier_generation": 1, "verifier_id": "pytest-report",
+                           "verifier_steps": [{"argv": ["pytest", "-q"], "wall_s": 60}],
+                           "input_bundle_digest": "sha256:" + "2" * 64, "driver_input_digest": "sha256:" + "3" * 64})
+    ticket = tickets.mint("a-verifier-1", facts, C.new_handle).ticket
+    tickets.bind(ticket, s)                                              # what ATTACH of the ticket-bound lease journals
     a = R.Alloc(session=s, slot=slot, lease_seq=1, slot_rev=1, slot_uid=893, slot_gid=893, kind="verifier",
                 vendor="claude", auth="none", operator_uid=OP_UID, supervisor_uid=DISPATCH_UID,
                 staging_uid=OP_UID, created_at="2026-10-20T00:00:00Z", boot_id=BOOT, child_uid=892, ticket=ticket,
@@ -626,7 +646,7 @@ def test_none_class_no_front_no_handle(world):
               "ticket": ticket}
     world.control.store.put(R.SessionState(session=s, generation=0, state=R.ALLOCATED, claims=claims,
                                            lease_live=True, event_kind="state", updated_at="2026-10-20T00:00:00Z"))
-    lease = C.Lease(C.new_handle(), DISPATCH_UID, used=True, session=s)   # ticketed leases are session 3c's
+    lease = C.Lease(C.new_handle(), DISPATCH_UID, used=True, session=s, ticket=ticket)   # the dispatch lease holding it
     world.control._session_lease[s] = lease
     store = H.Store(world.seams)
     ctx = H.Ctx(world.seams, store, DISPATCH_UID, "dispatch", OP_UID, {})
@@ -646,6 +666,7 @@ def test_none_class_no_front_no_handle(world):
     assert world.chown_of(f"live/{s}/in/repo.bundle") == (0, 892)
     assert os.listdir(world.L / "staging" / s) == ["driver_input.json"]   # unstaged here (2f's): never removed
     store.close()
+    tickets.close()
 
 
 def test_render_refused_for_another_callers_session(world):
