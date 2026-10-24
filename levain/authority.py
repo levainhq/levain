@@ -234,8 +234,8 @@ CONSENT_AGENTS = ("claude_code", "codex")
 # credential Levain holds. It names the credential's SOURCE (a keychain item name the service reads at attach time),
 # never its value, which never enters a link. Fields: ``host`` (one plain-DNS name in its canonical form,
 # ``levain.chat_egress.parse.canonical_host``; no wildcard, no IP literal), ``placement`` (``{"scheme": "bearer"}`` or
-# ``{"scheme": "basic", "user": U}``, R15-9's closed set), ``repos`` (the declared repo paths the operator added,
-# beside the workspace's own remotes, item 4) and ``expires_at`` (at most 30 days past its link, the envelope an
+# ``{"scheme": "basic", "user": U}``, R15-9's closed set), ``repos`` (ALL the declared repo paths: the operator's
+# own plus the workspace's remotes read once at setup; a launch reads only this list, K-8, item 4) and ``expires_at`` (at most 30 days past its link, the envelope an
 # older levain holds an unknown kind to, so a log carrying one still replays there, inert). At most ONE LIVE record
 # per (entity, canonical host) (R15-21-4): a second is refused at append (:func:`_egress_key_append_check`), and
 # replacing a credential is one ``loosen`` link that removes the old record and adds the new (a supersession). The

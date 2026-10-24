@@ -3035,8 +3035,9 @@ def _add_chat_parser(subparsers: argparse._SubParsersAction, common: object) -> 
         description="A setup record names, for one entity's chat launches, ONE host whose https requests on port "
                     "443 carry a credential Levain holds, and the keychain item it is read from at attach time: the "
                     "value never enters the sandbox, an argv, an env, a record or a log, and this command never asks "
-                    "for it. On a git fetch the key rides only a declared repo (the workspace's own https remotes on "
-                    "that host, plus each --repo). One live record per entity and host; a new record or a "
+                    "for it. On a git fetch the key rides only a declared repo: each --repo plus the workspace's own "
+                    "https remotes on that host, read once at setup and signed into the record (a chat launch never "
+                    "reads the workspace's git config; adding a repo is a new setup with --replace). One live record per entity and host; a new record or a "
                     "replacement takes effect at the next chat launch, a revoke from the next request.")
     key_sub = key.add_subparsers(dest="chat_key_cmd", required=True)
     setup = key_sub.add_parser("setup", help="Sign a setup record (a laptop-presence key).")
@@ -3049,6 +3050,9 @@ def _add_chat_parser(subparsers: argparse._SubParsersAction, common: object) -> 
     setup.add_argument("--repo", dest="repos", action="append", default=[], metavar="PATH",
                        help="A repo path on that host to declare beside the workspace's remotes, as git spells it "
                             "(/owner/repo.git); repeatable.")
+    setup.add_argument("--workspace", type=Path, default=Path("."),
+                       help="The workspace repo whose https remotes on that host are read now and signed into the "
+                            "record as declared repos (default: the current directory).")
     setup.add_argument("--replace", action="store_true",
                        help="Supersede the live record for this entity and host, in the same signed link.")
     setup.add_argument("--expires", required=True, help="A duration (12h, 7d; at most 30d) or a UTC time.")
@@ -3077,14 +3081,16 @@ def _cmd_chat_key_setup(args: argparse.Namespace) -> int:
         signer_fp, sign = ssh_signer(args.signing_key)
         rec, warning = setup_key(_cockpit_root(args), entity=args.entity, host=args.host, source=args.source,
                                  placement=placement, repos=args.repos, expires=expires, signer_fp=signer_fp,
-                                 sign=sign, clock=_utc_now, replace=args.replace)
+                                 sign=sign, clock=_utc_now, replace=args.replace, workspace=args.workspace)
     except (ValueError, *_REFUSALS, *_cockpit_refusals()) as exc:
         print(f"setup refused: {exc}", file=sys.stderr)
         return 1
     how = "bearer" if rec["placement"]["scheme"] == "bearer" else f"basic as {rec['placement']['user']}"
+    from_ws = [r for r in rec["repos"] if r not in set(args.repos)]
     print(f"set up: {rec['id']} for {rec['entity']} on https://{rec['host']}:443 from keychain item "
-          f"{rec['source']!r} ({how}), declared repos {', '.join(rec['repos']) or '(the workspace remotes only)'}, "
-          f"until {rec['expires_at']}; it takes effect at the next chat launch")
+          f"{rec['source']!r} ({how}), declared repos {', '.join(rec['repos']) or '(none: a git fetch carries no key)'}"
+          f" (from {args.workspace}'s remotes: {', '.join(from_ws) or 'none'}), until {rec['expires_at']}; it takes "
+          "effect at the next chat launch")
     if warning:
         print(f"warning: {warning}", file=sys.stderr)
     return 0

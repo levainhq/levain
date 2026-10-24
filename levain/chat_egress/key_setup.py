@@ -2,8 +2,10 @@
 
 A setup record (`levain.authority.EGRESS_KEY_KIND`) names, for one entity's chat launches, ONE host whose https:443
 requests may carry a credential Levain holds, the keychain item the service reads it from (a NAME: the value is
-never asked for, passed or stored here), how srt places it (bearer, or basic with a user) and the repos the operator
-declares beside the workspace's own remotes. It is a `create_grant` link a laptop-presence key signs. At most one
+never asked for, passed or stored here), how srt places it (bearer, or basic with a user) and its declared repos: the
+operator's `--repo`s plus the workspace's https remotes on that host, read ONCE here and signed into the record. A
+launch reads only that signed list, never the workspace's `.git/config` (K-8: the sandbox can write it); adding a
+repo is a new setup (`replace=True`). It is a `create_grant` link a laptop-presence key signs. At most one
 record per (entity, canonical host) is live (R15-21-4): a second is refused here, before anything is signed, and by
 the log itself at append; `replace=True` is the supersession, one `loosen` link that drops the live record and adds
 the new one, so exactly one is live after that one write. A record made live, or a replacement, takes effect at the
@@ -19,6 +21,7 @@ from typing import Any
 
 from levain.authority import (EGRESS_KEY_KIND, AuthorityError, _thaw, egress_key_live, egress_key_record)
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
+from levain.chat_egress.keys import workspace_repos
 from levain.chat_egress.parse import canonical_host
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.keys import KeyError_, Signer, _append, _capture, _journal, _now, _signing_authority
@@ -41,12 +44,14 @@ def _host(host: str) -> str:
 def setup_key(data_root: Path | str, *, entity: str, host: str, source: str, placement: Mapping[str, str],
               repos: Iterable[str], expires: timedelta | datetime, signer_fp: str, sign: Signer,
               clock: Callable[[], datetime], replace: bool = False, record_id: str | None = None,
-              ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+              workspace: Path | str | None = None, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
               marker_directory: Path | None = None) -> tuple[dict[str, Any], str | None]:
     """Sign a setup record for `entity` and `host` (canonicalised: `Example.COM.` is `example.com`). `source` is the
-    keychain item's name. `replace`: supersede the live record for that (entity, host) in the same link; without it
-    a live one refuses the setup. Returns `(record, warning)`; `warning` says the link committed but its anchor did not
-    advance. The log's rules judge the record before anything is signed."""
+    keychain item's name. `repos` plus, when `workspace` is given, its https remotes on that host (read once, now)
+    are the record's declared repos. `replace`: supersede the live record for that (entity, host) in the same link;
+    without it a live one refuses the setup. Returns `(record, warning)`; `warning` says the link committed but its
+    anchor did not advance. The log's rules judge the record before anything is signed."""
+
     now = _now(clock)
     if isinstance(expires, timedelta):
         if expires <= timedelta(0):
@@ -58,8 +63,11 @@ def setup_key(data_root: Path | str, *, entity: str, host: str, source: str, pla
         raise SetupRefused("expires is a duration or an aware time")
     canon = _host(host)
     rid = record_id if record_id is not None else "ek-" + secrets.token_hex(6)
+    declared = set(repos)
+    if workspace is not None:
+        declared.update(workspace_repos(workspace, canon))
     record = {"id": rid, "kind": EGRESS_KEY_KIND, "entity": entity, "host": canon, "source": source,
-              "placement": dict(placement), "repos": sorted(set(repos)), "expires_at": utc_stamp(expires_at)}
+              "placement": dict(placement), "repos": sorted(declared), "expires_at": utc_stamp(expires_at)}
     db = _journal(data_root, marker_directory=marker_directory)
     state = _signing_authority(_capture(db, now, ssh_keygen))
     live = sorted(gid for gid, g in state.policy.grants.items()

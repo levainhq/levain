@@ -4,8 +4,10 @@ item 4, item 2 *Per request*, R-6, R-10's `attach` field; CH-D2 S6).
 At LAUNCH, :func:`build_route_set` reads the authority log's replay ONCE and builds one immutable
 :class:`RouteSnapshot` per keyed host from the entity's LIVE setup records (`levain.authority.egress_key_live`): the
 record id, the canonical host, the credential SOURCE (a keychain item name; never the value), the declared repo paths
-(the record's own plus the workspace's https remotes on that host) and attach yes/no. A store holding two live records
-for one canonical host refuses the launch, naming both (:class:`LaunchRefused`; R15-21-4: no merge, no pick).
+(the signed record's list, and nothing else: a launch never reads the workspace's `.git/config`, which the sandbox can
+write; the workspace's remotes are read once at SETUP, Phill present, and signed into the record, K-8) and attach
+yes/no. A store holding two live records for one canonical host refuses the launch, naming both
+(:class:`LaunchRefused`; R15-21-4: no merge, no pick).
 
 PER REQUEST the composer does ONE :func:`lookup` by canonical host (R15-18-L1) and hands that one result to every
 reader: classify's keyed-route rules (S3a: "keyed" = in the snapshot, R15-23-4) and :func:`decide_key` here. The
@@ -40,7 +42,7 @@ from levain.chat_egress.parse import _canonical_path, canonical_host
 __all__ = ["ATTACH_VALUES", "AuthorityLiveness", "CredentialStore", "CredentialUnreadable", "KeyDecision",
            "KeychainStore", "LaunchRefused", "LivenessUnreadable", "Placement", "RouteSet", "RouteSnapshot",
            "build_route_set", "credential_placements", "decide_key", "lookup", "upload_pack_prefix",
-           "workspace_remote_urls"]
+           "workspace_remote_urls", "workspace_repos"]
 
 NOT_EVALUATED, LIVENESS_UNREADABLE, REVOKED, NONE, ATTACHED = (
     "not-evaluated", "liveness-unreadable", "revoked", "none", "attached")
@@ -141,11 +143,11 @@ def _remote_repo(url: str, host: str) -> str | None:
     return canon if canon == path else None
 
 
-def build_route_set(authority: Any, *, entity: str, workspace_remotes: Iterable[str] = (),
-                    now: datetime) -> RouteSet:
+def build_route_set(authority: Any, *, entity: str, now: datetime) -> RouteSet:
     """The launch's route snapshot from one verified replay (`levain.authority.AuthoritySnapshot`): the live setup
-    records of `entity` (expired, revoked and superseded ones are not live), one route each. Two live records for one
-    canonical host (any entity: a store a foreign writer left so) refuses the launch naming both."""
+    records of `entity` (expired, revoked and superseded ones are not live), one route each, its declared repos the
+    record's signed list only (K-8: no workspace input). Two live records for one canonical host (any entity: a store
+    a foreign writer left so) refuses the launch naming both."""
     from levain.authority import egress_key_conflicts, egress_key_live
 
     grants = authority.policy.grants
@@ -154,17 +156,13 @@ def build_route_set(authority: Any, *, entity: str, workspace_remotes: Iterable[
         named = "; ".join(f"{host}: {', '.join(ids)}" for _e, host, ids in conflicts)
         raise LaunchRefused(f"two live setup records for one host, so this launch is refused (no merge, no pick): "
                             f"{named}. Revoke one of them (levain chat key revoke)")
-    remotes = tuple(workspace_remotes)
     routes: list[RouteSnapshot] = []
     placements: dict[str, Placement] = {}
     for gid, g in sorted(grants.items()):
         if not egress_key_live(g, now) or g["entity"] != entity:
             continue
-        host = g["host"]
-        repos = set(g["repos"])
-        repos.update(r for r in (_remote_repo(u, host) for u in remotes) if r is not None)
-        routes.append(RouteSnapshot(record_id=gid, canonical_host=host, credential_source=g["source"],
-                                    declared_repos=frozenset(repos), attach=True))
+        routes.append(RouteSnapshot(record_id=gid, canonical_host=g["host"], credential_source=g["source"],
+                                    declared_repos=frozenset(g["repos"]), attach=True))
         p = g["placement"]
         placements[gid] = Placement("basic", p["user"]) if p["scheme"] == "basic" else Placement("bearer")
     return RouteSet.of(routes, placements)
@@ -172,7 +170,7 @@ def build_route_set(authority: Any, *, entity: str, workspace_remotes: Iterable[
 
 def workspace_remote_urls(workspace: Path | str) -> tuple[str, ...]:
     """The workspace repo's own `remote.<name>.url` values (its local config only), or () when it is no repo. Read
-    once at launch: a remote added mid-launch is the next launch's (R15-21-6)."""
+    by SETUP only (:func:`workspace_repos`), never by a launch (K-8): the sandbox can write this file."""
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GIT_CONFIG_NOSYSTEM": "1",
            "GIT_CONFIG_GLOBAL": os.devnull, "HOME": os.devnull, "LC_ALL": "C"}
     try:
@@ -187,6 +185,13 @@ def workspace_remote_urls(workspace: Path | str) -> tuple[str, ...]:
         if b"\n" in entry:
             urls.append(entry.split(b"\n", 1)[1].decode("utf-8", "replace"))
     return tuple(urls)
+
+
+def workspace_repos(workspace: Path | str, host: str) -> tuple[str, ...]:
+    """The declared-repo paths the workspace's https remotes on canonical `host` (port 443) give, sorted and unique:
+    what `levain chat key setup` reads ONCE, shows and signs into the record (K-8). No launch calls this."""
+    return tuple(sorted({r for r in (_remote_repo(u, host) for u in workspace_remote_urls(workspace))
+                         if r is not None}))
 
 
 def credential_placements(snapshot_set: RouteSet) -> list[dict]:

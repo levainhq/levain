@@ -354,14 +354,41 @@ def test_build_route_set_reads_only_the_entitys_live_records(tmp_path):
     assert keys.build_route_set(ck.state(), entity="ent", now=NOW).routes == {}
 
 
-def test_declared_repos_include_the_workspaces_own_https_remotes_on_that_host(tmp_path):
+def test_setup_signs_the_workspaces_own_https_remotes_on_that_host_into_the_record(tmp_path):
+    """K-8: the workspace's remotes are read at SETUP and signed in; the launch reads the record."""
+    import subprocess
+
     ck = Cockpit(tmp_path)
-    key_setup.setup_key(ck.root, entity="ent", host="example.com", source=SOURCE,
-                        placement={"scheme": "bearer"}, repos=["/added.git"], expires=timedelta(days=7), **ck.kw())
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    subprocess.run(["git", "init", "-q", str(ws)], check=True, timeout=30)
     remotes = ["https://Example.com/o/r.git", "https://user@example.com:443/o/s/", "http://example.com/o/plain.git",
                "https://example.com:8443/o/port.git", "git@example.com:o/ssh.git", "https://other.example/o/x.git"]
-    s = keys.build_route_set(ck.state(), entity="ent", workspace_remotes=remotes, now=NOW)
+    for i, url in enumerate(remotes):
+        subprocess.run(["git", "-C", str(ws), "remote", "add", f"r{i}", url], check=True, timeout=30)
+    rec, _ = key_setup.setup_key(ck.root, entity="ent", host="example.com", source=SOURCE,
+                                 placement={"scheme": "bearer"}, repos=["/added.git"], expires=timedelta(days=7),
+                                 workspace=ws, **ck.kw())
+    assert rec["repos"] == ["/added.git", "/o/r.git", "/o/s"]
+    s = keys.build_route_set(ck.state(), entity="ent", now=NOW)
     assert s.routes["example.com"].declared_repos == frozenset({"/added.git", "/o/r.git", "/o/s"})
+
+
+def test_k8_a_record_with_no_repos_keys_the_host_and_attaches_on_no_upload_pack_prefix(tmp_path):
+    """A setup with no --repo and no repo for a workspace: the host is keyed, and every upload-pack exchange,
+    discovery and POST alike, goes keyless (no store read)."""
+    ck = Cockpit(tmp_path)
+    rec, _ = key_setup.setup_key(ck.root, entity="ent", host="example.com", source=SOURCE,
+                                 placement={"scheme": "bearer"}, repos=[], expires=timedelta(days=7),
+                                 workspace=tmp_path / "not-a-repo", **ck.kw())
+    assert rec["repos"] == []
+    s = keys.build_route_set(ck.state(), entity="ent", now=NOW)
+    store = FakeStore()
+    live = Live([rec["id"]])
+    for f in (frame(path=INFO_REFS, query=SVC), frame(method="POST", path="/o/r.git/git-upload-pack")):
+        d = keys.decide_key(keys.lookup(s, "example.com"), parse(f), liveness=live, store=store)
+        assert (d.keyed, d.attach, d.credential) == (True, "none", None)
+    assert store.reads == []
 
 
 def test_workspace_remote_urls_reads_the_repos_own_config(tmp_path):

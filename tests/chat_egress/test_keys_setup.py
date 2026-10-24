@@ -189,3 +189,30 @@ def test_setup_takes_no_value_anywhere(ck, opt):
         main(["chat", "key", "setup", "--entity", "ent", "--host", "example.com", "--source", SOURCE, "--expires",
               "7d", "--signing-key", str(ck.key), "--data-root", str(ck.root), opt, KEY])
     assert exc.value.code == 2
+
+
+# --- K-8: declared repos come ONLY from the signed record --------------------------------------------------------
+
+def _git(*args):
+    import subprocess
+
+    subprocess.run(["git", *args], check=True, capture_output=True, timeout=30)
+
+
+def test_k8_a_git_config_rewritten_after_setup_adds_no_declared_repo(ck, tmp_path):
+    """Setup (Phill present) reads the workspace's remotes ONCE and signs them into the record. The sandbox can write
+    the workspace's `.git/config`; a rewrite after setup (origin moved to B, a second remote C) declares nothing: the
+    launch reads the record's repo list only, and takes no workspace input at all."""
+    import inspect
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _git("init", "-q", str(ws))
+    _git("-C", str(ws), "remote", "add", "origin", "https://example.com/o/a.git")
+    rec, _ = _setup(ck, repos=[], workspace=ws)
+    assert rec["repos"] == ["/o/a.git"]                                  # signed into the record at setup
+    _git("-C", str(ws), "remote", "set-url", "origin", "https://example.com/o/b.git")
+    _git("-C", str(ws), "remote", "add", "c", "https://example.com/o/c.git")
+    assert "workspace_remotes" not in inspect.signature(keys.build_route_set).parameters
+    s = keys.build_route_set(ck.state(), entity="ent", now=datetime.now(timezone.utc))
+    assert s.routes["example.com"].declared_repos == frozenset({"/o/a.git"})
