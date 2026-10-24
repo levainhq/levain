@@ -58,6 +58,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `page_origin` of `https://<name>:<port>` for a name other than localhost; without one, the portless rule is
   unchanged for every existing verifier.
 
+### Known edges
+- A signed send refused outright for a reason other than its signature (a confirm, a stale row) drops its signed draft,
+  so sending it again asks the passkey once more.
+- Each tab gives a signed draft its own id, so the same words sent from two tabs file two requests.
+- Nothing caps how many sign requests a write-token holder can file through the compose route.
+- A proxy is recognised by the `extra_hosts` names and forwarding headers; a proxy that sends neither and names
+  `127.0.0.1` reads as local.
+
 ## [0.11.20] — 2026-10-23
 
 This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which were never published, and everything merged since.
@@ -344,12 +352,6 @@ This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which
   only; nothing reaches an agent).
 - A coordinator started by a different Levain than the one that set up `~/.levain/coordinator` asks before each of
   its commands; run `levain update --path ~/.levain/coordinator` from the Levain that starts it.
-- A signed send refused outright for a reason other than its signature (a confirm, a stale row) drops its signed draft,
-  so sending it again asks the passkey once more.
-- Each tab gives a signed draft its own id, so the same words sent from two tabs file two requests.
-- Nothing caps how many sign requests a write-token holder can file through the compose route.
-- A proxy is recognised by the `extra_hosts` names and forwarding headers; a proxy that sends neither and names
-  `127.0.0.1` reads as local.
 
 ## [0.11.14] — 2026-10-21
 
