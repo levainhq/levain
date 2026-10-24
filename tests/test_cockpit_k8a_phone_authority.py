@@ -14,7 +14,6 @@ import hashlib
 import json
 import shutil
 import struct
-import tempfile
 import threading
 import urllib.error
 import urllib.request
@@ -36,7 +35,7 @@ from levain.cockpit.firejournal import PENDING_CAP, CockpitDB  # noqa: E402
 from levain.cockpit.keys import fingerprint_of  # noqa: E402
 from levain.cockpit.verbs import DEVICE_VERBS, KERNEL_VERBS, gesture_for  # noqa: E402
 from levain.contracts.namespaces import REGISTRY  # noqa: E402
-from tests.autonomic_confirm_keys import account_home  # noqa: E402
+from tests.autonomic_confirm_keys import anchor_scratch  # noqa: E402
 from tests.cockpit_authority_rig import RealKey, enrol, enrol_any, root_of  # noqa: E402
 
 BROWSER = {"class": "token", "name": "browser"}
@@ -94,7 +93,7 @@ class SoftPasskey:
 
 @pytest.fixture
 def home() -> Iterator[Path]:
-    d = Path(tempfile.mkdtemp(prefix=".levain-k8a-", dir=account_home()))   # a signers dir needs ancestors nobody else writes
+    d = anchor_scratch("k8a-")   # a signers dir needs ancestors nobody else writes
     try:
         yield d
     finally:

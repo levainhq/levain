@@ -52,11 +52,11 @@ def test_sweep_dead_old_kept_live_and_fresh(fake_home):
     assert fresh_dead.exists() and live_old.exists() and d.exists()
 
 
-def test_legacy_top_level_sweep_only_three_prefixes_and_old(fake_home):
-    old = [_mk(fake_home, f"{p}abc", 3 * 3600) for p in (".levain-confirm-keys-", ".levain-k2b-broker-", ".levain-t3-")]
+def test_legacy_top_level_sweep_only_listed_prefixes_and_old(fake_home):
+    old = [_mk(fake_home, f"{p}abc", 3 * 3600) for p in (".levain-confirm-keys-", ".levain-k2b-broker-", ".levain-t3-", ".levain-k2b-crash-", ".levain-k8a-", ".levain-row12b-", ".levain-custody-broker-")]
     fresh = _mk(fake_home, ".levain-t3-new", 60)
     other = _mk(fake_home, ".levain-dbg-old", 3 * 3600)
-    other2 = _mk(fake_home, ".levain-k8a-old", 3 * 3600)
+    other2 = _mk(fake_home, ".levain-k8b-old", 3 * 3600)
     ck.anchor_scratch("t3-")
     assert not any(o.exists() for o in old)
     assert fresh.exists() and other.exists() and other2.exists()

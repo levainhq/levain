@@ -43,7 +43,8 @@ def account_home() -> str:
 
 
 SCRATCH_PARENT = ".levain-test-scratch"
-_LEGACY_PREFIXES = (".levain-confirm-keys-", ".levain-k2b-broker-", ".levain-t3-")   # the three leaked ones, ONLY these
+_LEGACY_PREFIXES = (".levain-confirm-keys-", ".levain-k2b-broker-", ".levain-t3-",
+                    ".levain-k2b-crash-", ".levain-k8a-", ".levain-row12b-", ".levain-custody-broker-")   # the leaked ones, ONLY these
 _DEAD_AFTER = 600          # a dead-pid entry is swept once this old (never a live run's, never a just-made one)
 _LEGACY_AFTER = 7200
 _PID_RE = re.compile(r"-(\d+)-[A-Za-z0-9_]{8}$")
