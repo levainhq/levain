@@ -41,6 +41,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   refused at registration. The graph tap needs only `transient_prefix`.
 
 ### Known edges
+- A grant revoke is accepted from the passkey's name on any port, so another program on that machine serving the same
+  name on another port (a second `tailscale serve` port) could ask the passkey for a revoke. You would see the Face ID
+  prompt, and a revoke only removes a grant.
 - One revoke waits per grant on each page server: a second challenge for the same grant (another tab) replaces the
   first, whose passkey answer is then refused, and you ask again.
 - A metered call is priced by the request's `model` alone. A fallback list (`models`) or a `route` in the body is not

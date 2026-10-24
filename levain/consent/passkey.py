@@ -185,7 +185,8 @@ def page_origin_problem(application: str, page_origin: object) -> str | None:
     schemes = ("https", "http") if application == "localhost" else ("https",)
     scheme, sep, rest = page_origin.partition("://")
     name, colon, port = rest.partition(":")
-    port_ok = not colon or (port.isascii() and port.isdigit() and not port.startswith("0") and 0 < int(port) < 65536
+    port_ok = not colon or (port.isascii() and port.isdigit() and len(port) <= 5 and not port.startswith("0")
+                            and 0 < int(port) < 65536
                             and not (scheme == "https" and port == "443") and not (scheme == "http" and port == "80"))
     if not (sep and scheme in schemes and name == application and port_ok):
         return (f"page_origin {page_origin[:80]!r} is not {' or '.join(s + '://' for s in schemes)}{application} with "

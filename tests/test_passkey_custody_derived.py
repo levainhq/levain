@@ -442,7 +442,8 @@ def test_a_quarantined_keys_past_link_without_uv_or_off_origin_is_refused_as_a_f
     (f"http://{RP}:8443", True, f"not {ORIGIN}"), (f"{ORIGIN}:443", True, f"not {ORIGIN}"),
     (f"{ORIGIN}:8443/x", True, f"not {ORIGIN}"), (f"https://u@{RP}:8443", True, f"not {ORIGIN}"),
     ((ORIGIN, f"{ORIGIN}:8443"), True, f"not {ORIGIN}"),                # SSH field and client data name two pages
-    ((f"{ORIGIN}:9999", f"{ORIGIN}:8443"), True, f"not {ORIGIN}:9999")])
+    ((f"{ORIGIN}:9999", f"{ORIGIN}:8443"), True, f"not {ORIGIN}:9999"),
+    (f"{ORIGIN}:{'9' * 5000}", True, f"not {ORIGIN}")])                  # codex r1: a refusal, never a ValueError
 def test_the_authority_takes_a_revoke_from_the_keys_own_name_on_any_port_and_nothing_wider(origin, revoke, why):
     """Phill 10-24 "2a": a ``revoke_grant`` signed on ``https://<the key's name>:<any port>`` verifies at replay; the
     same name only (no other name, scheme, default port, path or userinfo), and every other link stays exact."""
