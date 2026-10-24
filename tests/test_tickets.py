@@ -43,6 +43,7 @@ def write_ceiling(L: Path, per_run: int = 5_000_000, open_: int = 4, per_day: in
     (L / "policy" / "dispatch_ceiling").write_bytes(canon.canonical_bytes(
         {"format": T.CEILING_FORMAT, "max_reserved_microdollars_per_run": per_run, "max_open_tickets": open_,
          "max_runs_per_day": per_day}))
+    (L / "policy" / "dispatch_ceiling").chmod(0o644)                     # read_ceiling refuses g/o-write; not the umask's
 
 
 class Rig:

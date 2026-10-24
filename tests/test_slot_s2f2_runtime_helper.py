@@ -612,7 +612,7 @@ def test_base_recorded_only_when_step3_completes(world):
     assert world.alloc(s).base is None
 
 
-def test_none_class_no_front_no_handle(world):
+def test_none_class_no_front_no_handle(world, request):
     """A verifier (none class) render: no front started, no FRONT-ARM, MINT claims with no front, no handle.
 
     3c-5 fix 4: MINT checks a ticketed session's claims against the ticket CONTROL holds BOUND to it (``run-unknown``
@@ -625,9 +625,11 @@ def test_none_class_no_front_no_handle(world):
     (world.L / "policy" / "dispatch_ceiling").write_bytes(canon.canonical_bytes(
         {"format": T.CEILING_FORMAT, "max_reserved_microdollars_per_run": 5_000_000, "max_open_tickets": 4,
          "max_runs_per_day": 50}))
+    os.chmod(world.L / "policy" / "dispatch_ceiling", 0o644)      # read_ceiling refuses g/o-write; not the umask's call
     tickets = T.TicketStore(world.L / "sessions" / T.JOURNAL, world.L / "policy" / "dispatch_ceiling",
                             ceiling_uid=os.getuid())
     tickets.start()
+    request.addfinalizer(tickets.close)                                 # the journal flock and thread, pass or fail
     world.control.tickets = tickets
     facts = T.check_facts({"job_id": "job-1", "run_index": 0, "contract_digest": "sha256:" + "1" * 64,
                            "kind": "verifier", "egress_routes": [], "reserved_microdollars": 0,
@@ -649,6 +651,7 @@ def test_none_class_no_front_no_handle(world):
     lease = C.Lease(C.new_handle(), DISPATCH_UID, used=True, session=s, ticket=ticket)   # the dispatch lease holding it
     world.control._session_lease[s] = lease
     store = H.Store(world.seams)
+    request.addfinalizer(store.close)
     ctx = H.Ctx(world.seams, store, DISPATCH_UID, "dispatch", OP_UID, {})
     H.make_session_dirs(ctx, s, H.session_dir_rows(slot, {"_levain_v0": 893, "_levain_c0": 892}))
     (world.L / "staging" / s).mkdir()
@@ -665,8 +668,6 @@ def test_none_class_no_front_no_handle(world):
     assert world.chown_of(f"live/{s}/root") == (0, 0) and world.mode(f"live/{s}/root") == 0o755
     assert world.chown_of(f"live/{s}/in/repo.bundle") == (0, 892)
     assert os.listdir(world.L / "staging" / s) == ["driver_input.json"]   # unstaged here (2f's): never removed
-    store.close()
-    tickets.close()
 
 
 def test_render_refused_for_another_callers_session(world):
