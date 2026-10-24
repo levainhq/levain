@@ -615,9 +615,18 @@ class Cockpit:
         registry first (a verb it holds, panel-bound, not a job, fields inside its allowlist), and a
         refused one refuses the attach: the registry is known from here on."""
         with self._lock:
-            for spec in self._specs.values():
-                _check_compose_verbs(spec, view)
+            self._check_verbs(view)
             self._verb_view = view
+
+    def check_verbs(self, view: Any) -> None:
+        """The check :meth:`attach_verbs` runs, attaching nothing: a server runs it before it commits to the
+        cockpit (``make_server``), so a refused compose leaves the cockpit and everything else as they were."""
+        with self._lock:
+            self._check_verbs(view)
+
+    def _check_verbs(self, view: Any) -> None:
+        for spec in self._specs.values():
+            _check_compose_verbs(spec, view)
 
     def attach_labeller(self, fn: Callable[[], LabelSnapshot]) -> None:
         """Attach a labels-only source: ``fn()`` is ONE journal read, taken once per request (design

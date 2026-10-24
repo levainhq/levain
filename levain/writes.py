@@ -308,9 +308,11 @@ class ActionVerb:
     - ``sign`` — when True, the cockpit page sends this verb only after the operator's passkey signs it (DESIGN_SIGN
       D5): the page asks the server's ``compose_signer`` (``make_server``) to file a sign request for the params, runs
       the passkey ceremony on it, then posts the verb with the params plus ``sign_request: <id>``. The kernel admits
-      that one extra param on a signed verb and refuses a send whose ``sign_request`` is missing or not a sign
-      request id, on every route, before the handler runs; it checks nothing else about it: the verb's handler or
-      effect is the door, and it verifies the signature over the params before applying them. Without a
+      that one extra param on a signed verb and refuses a send whose ``sign_request`` does not name a request the
+      server's compose filed for this verb and exactly these params and its Signer holds signed, on every route,
+      before the handler runs; it does not verify the signature: the verb's handler or effect is the door, and it
+      verifies the signature over the params before applying them. A signed verb is at-most-once whatever
+      ``idempotent`` says: the page keys its post by the draft's identity and the kernel dedupes it. Without a
       ``compose_signer`` the page sends nothing for a signed verb (it never falls back to an unsigned send). A
       signed verb is never a ``job`` (refused here): the page's job path runs no ceremony."""
 

@@ -3866,7 +3866,7 @@
       const s = await signedCompose(action.verb, action.panel, params, say, row);
       if (!s.ok) return { ok: false, error: "unsigned", message: s.message };
       const signed = Object.assign({}, params, { sign_request: s.request });
-      const res = await commitAction(action.verb, signed, confirm, spec.idempotent ? "sign-" + s.txn : null, action.panel, s.txn);
+      const res = await commitAction(action.verb, signed, confirm, "sign-" + s.txn, action.panel, s.txn);
       if ((res && res.ok) || (res && typeof res.status === "number" && res.status >= 400 && res.status < 500)) {
         signDraftDrop(action.verb, action.panel, params);
       }
@@ -4732,6 +4732,12 @@
         signWho(Object.assign({}, listing, { signers: signers }), acts, say)
           .then((who) => (who ? signCeremony(r, who.fp, who.rawId, choice, words, say) : { done: "unsigned" }),
                 () => { say(SIGN_PICK_CLOSED, "bad"); return { done: "unsigned" }; })
+          // a ceremony that threw (past its own catch) may have sent the answer: "not sure", which reads the request
+          // again below and releases a write-in's words only if it is still open
+          .catch((e) => {
+            say("not sure this was signed (the page failed: " + ((e && e.name) || "error") + "): check the list", "bad");
+            return { done: "unsure" };
+          })
           .then((out) => {
             done = out.done;
             // only a signature spends the words. "Not sure" keeps them, frozen until a read of the request by its id

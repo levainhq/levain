@@ -468,7 +468,7 @@
 
   async function fire(base, head, label, action, fpKey, txn) {
     const what = { row_id: base.row_id, label: label };
-    // A T2+ fire (or an idempotent verb's) carries one key, minted for this request and kept with the whole
+    // A T2+ fire (or an idempotent or signed verb's) carries one key, minted for this request and kept with the whole
     // envelope until the kernel answers. A kept envelope is sent again BEFORE any new dry run: the write it
     // carries may have landed and moved the row, and only a replay under its own key gets that answer back.
     let env = (readKeys()[fpKey] || {}).envelope || null;
@@ -487,8 +487,9 @@
       }
       env = Object.assign({}, base);
       if (intent) { env.intent = intent; env.tier_seen = tier; env.gesture_seen = gesture; }
-      if (tier !== "C1" || head.idempotent === true) {
-        // a signed send's key is its draft's identity, so another tab or a reload of the same draft dedupes on it
+      if (txn || tier !== "C1" || head.idempotent === true) {
+        // every signed send carries its draft's identity as its key, whatever its tier (the kernel dedupes a signed
+        // verb's key at any tier), so a retry, another tab or a reload of the same draft applies it once
         env.idempotency_key = txn ? "sign-" + txn : newKey();
         const keys = readKeys(); keys[fpKey] = { envelope: env }; writeKeys(keys);
       }

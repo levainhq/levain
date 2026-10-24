@@ -191,6 +191,7 @@ _SIGN_ACTIONS = ("challenge", "answer", "deny")
 # without one it is 404.
 _SIGN_COMPOSE = "/cockpit/sign/compose"
 _COMPOSE_TXNS_MAX = 256       # drafts whose request one server remembers; past it the oldest identity is forgotten
+_COMPOSE_WAIT_S = 30.0        # how long a second compose of one draft waits for the first's compose_signer call
 # GET /cockpit/sign/<id>.json: ONE request's listing row, behind the listing's gate, so a page never reads "no longer
 # open" off a listing that stopped at its cap (Signer.row)
 _SIGN_ONE_SUFFIX = ".json"
@@ -814,9 +815,12 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self.stream_stop = threading.Event()
         self.stream_watcher = cockpit_stream.Watcher(self._watch_manifest, epoch=secrets.token_hex(4))
         # (verb, client_txn) -> (params fingerprint, request id): the request each signed draft's compose filed
-        # (_sign_compose), oldest first, at most _COMPOSE_TXNS_MAX; composes take the lock, so two at once file one
-        self.compose_txns: "OrderedDict[tuple[str, str], tuple[str, str]]" = OrderedDict()
+        # (_sign_compose), oldest first, at most _COMPOSE_TXNS_MAX filed ones. The request id is None while that draft's
+        # compose_signer call is in flight: a second compose of the same draft waits on compose_wake for it (so two at
+        # once file one), and a compose of any other draft never waits. The lock is never held across compose_signer.
+        self.compose_txns: "OrderedDict[tuple[str, str], tuple[str, str | None]]" = OrderedDict()
         self.compose_lock = threading.Lock()
+        self.compose_wake = threading.Condition(self.compose_lock)
         super().__init__(*args, **kwargs)
 
     def _watch_manifest(self) -> dict[str, Any]:
@@ -1139,7 +1143,9 @@ class _Handler(GuardedHandler):
         ``client_txn`` is the draft's one identity (the page mints it when the signed draft is first sent and keeps it
         with the draft): the same ``(verb, client_txn)`` names the SAME request while that request is open, so a lost
         reply, a retry, a reload or a second send of one draft files one request. The same id with other params is
-        refused (409): an identity names one draft. Composes are serialised, so two at once file one."""
+        refused (409): an identity names one draft. Two composes of one draft at once file one: the second waits for
+        the first's compose_signer call (up to _COMPOSE_WAIT_S, then 503). Composes of different drafts never wait on
+        each other: the compose_signer runs outside the server's lock."""
         from levain.consent.sign import request_id_ok
         from levain.cockpit.verbs import SIGN_PARAM
 
@@ -1166,27 +1172,75 @@ class _Handler(GuardedHandler):
         fp = json.dumps(params, sort_keys=True, separators=(",", ":"))
         signer = self.server.signer
         memo = self.server.compose_txns
-        with self.server.compose_lock:
-            held = memo.get((spec.name, txn))
-            if held is not None and held[0] != fp:
-                return {"error": "txn_conflict", "message": "this send's id already names other words: nothing was "
-                        "filed; send again"}, 409
+        wake = self.server.compose_wake
+        key = (spec.name, txn)
+        mine = (fp, None)       # this compose's in-flight entry; only its owner replaces or removes it
+        deadline = time.monotonic() + _COMPOSE_WAIT_S
+        with wake:
+            while True:
+                held = memo.get(key)
+                if held is not None and held[0] != fp:
+                    return {"error": "txn_conflict", "message": "this send's id already names other words: nothing "
+                            "was filed; send again"}, 409
+                if held is None or held[1] is not None:
+                    break
+                left = deadline - time.monotonic()      # the same draft's compose is filing: wait for its answer
+                if left <= 0:
+                    return {"error": "busy", "message": "this draft is still being filed: nothing more was filed; "
+                            "send again"}, 503
+                wake.wait(left)
             if held is not None and signer is not None:
                 row = signer.row(held[1], [])
                 if row is not None and not row.get("refused"):
-                    memo.move_to_end((spec.name, txn))
+                    memo.move_to_end(key)
                     return {"request": held[1]}, 200
-            try:
-                rid = compose(spec.name, dict(params))
-            except ValueError as exc:
-                return {"error": "bad_request", "message": str(exc) or "the message cannot be signed"}, 400
-            if not request_id_ok(rid):
-                return {"error": "internal", "message": "the compose signer named no sign request"}, 500
-            memo[(spec.name, txn)] = (fp, rid)
-            memo.move_to_end((spec.name, txn))
-            while len(memo) > _COMPOSE_TXNS_MAX:
-                memo.popitem(last=False)
+            memo[key] = mine
+            memo.move_to_end(key)
+
+        def settle(rid: "str | None") -> None:
+            """Publish this compose's request (None: it filed none) and wake the same draft's waiters."""
+            with wake:
+                if memo.get(key) is mine:
+                    if rid is None:
+                        del memo[key]
+                    else:
+                        memo[key] = (fp, rid)
+                        filed = [k for k, v in memo.items() if v[1] is not None]
+                        for old in filed[:max(0, len(filed) - _COMPOSE_TXNS_MAX)]:
+                            del memo[old]
+                wake.notify_all()
+
+        try:
+            rid = compose(spec.name, dict(params))
+        except ValueError as exc:
+            settle(None)
+            return {"error": "bad_request", "message": str(exc) or "the message cannot be signed"}, 400
+        except BaseException:
+            settle(None)
+            raise
+        if not request_id_ok(rid):
+            settle(None)
+            return {"error": "internal", "message": "the compose signer named no sign request"}, 500
+        settle(rid)
         return {"request": rid}, 200
+
+    def _signed_for(self, verb: str, request_id: str, params: "dict[str, Any]") -> bool:
+        """The kernel's sign check (``levain.cockpit.verbs.SignedFor``): whether this server's compose filed
+        ``request_id`` for ``verb`` and exactly ``params``, and its Signer holds that request signed. A request whose
+        compose this server no longer remembers (restarted, or past _COMPOSE_TXNS_MAX drafts) is refused: the operator
+        signs that draft again."""
+        from levain.consent.sign import state_of
+
+        signer = self.server.signer
+        if signer is None or not isinstance(request_id, str):
+            return False
+        try:
+            fp = json.dumps(params, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return False
+        with self.server.compose_lock:
+            filed = any(k[0] == verb and v == (fp, request_id) for k, v in self.server.compose_txns.items())
+        return filed and state_of(signer.queue_dir, request_id) == "signed"
 
     def _serve_note_body(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/note/<n>.json``: one note's body (what, detail, agent, filed_at, and its dismissal if any),
@@ -1802,7 +1856,8 @@ class _Handler(GuardedHandler):
                         registry=self.server.verb_registry, cockpit=self._cockpit(), scope=scope, req=req,
                         credential=self._credential(), install_class=self._install_class(),
                         route={"/edit": "edit", "/action": "action"}.get(route, "cockpit"),
-                        job_runtime=self.server.job_runtime, broker=self.server.broker)
+                        job_runtime=self.server.job_runtime, broker=self.server.broker,
+                        signed_for=self._signed_for)
             except EditError as exc:
                 self._send_json({**exc.extra, "error": exc.code, "message": str(exc)}, exc.http_status)
             except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
@@ -2194,43 +2249,16 @@ def make_server(
     httpd.job_runtime = job_runtime
     httpd.chat_host = chat_host
     httpd.signer = signer
-    # the page_origin make_server pins as its last act (below); nothing is served before then
+    # the page_origin make_server pins (below); nothing is served before then
     httpd.signer_page_origin = None
     httpd.compose_signer = compose_signer
     # The shared cockpit (levain.cockpit). A downstream passes its own (the kernel's providers plus
     # its panels); None means the kernel's default over this substrate, built on first request.
-    # Its start() (refresher threads) is the caller's when it passes its own.
+    # Its start() (refresher threads) is the caller's when it passes its own. Nothing is attached to it
+    # until every refusal below has passed and the Signer is pinned.
     httpd.cockpit = cockpit
     httpd.verb_registry = verb_registry
-    if cockpit is not None:
-        cockpit.attach_verbs(VerbView(verb_registry, cockpit, lambda: broker_install_class(httpd)))
     httpd._cockpit_lock = threading.Lock()
-    # K2b §6: `--install-class reported` is the only way to reported; no flag (and no governed
-    # marker) leaves the broker write-disabled, answering "run the installer"
-    httpd.broker = _build_broker(source, install_class, httpd, extra_effects)
-    if cockpit is not None and httpd.broker is not None:
-        cockpit.attach_authority(httpd.broker.capture)
-        cockpit.attach_edits_reader(httpd.broker.edits)
-        # a downstream that registered its own "decisions" keeps exactly that panel (K2b-3b §0.4)
-        cockpit.attach_decision_rows(httpd.broker.decision_rows)
-    # one reader over one queue directory for the decisions panel's rows and the consent body route alike
-    httpd.consent_reader = _consent_reader()
-    from levain.consent.questions import QuestionStore
-
-    # over the reader's own directory only (None is the default queue): a reader without the attribute gets no
-    # question store, never the default queue's (as the proposals route, _ConsentReader)
-    httpd.question_store = (QuestionStore(httpd.consent_reader.directory)
-                            if hasattr(httpd.consent_reader, "directory") else None)
-    from levain.consent.notes import NoteStore
-
-    httpd.note_store = (NoteStore(httpd.consent_reader.directory)
-                        if hasattr(httpd.consent_reader, "directory") else None)
-    if cockpit is not None:
-        cockpit.attach_consent_rows(httpd.consent_reader)      # agents waiting on the operator (Q6a)
-        if httpd.question_store is not None:
-            cockpit.attach_question_rows(httpd.question_store)     # and the questions they ask him (Q-2b)
-        if httpd.note_store is not None:
-            cockpit.attach_note_rows(httpd.note_store)             # and what they tell him (notes)
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
     httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
@@ -2309,15 +2337,46 @@ def make_server(
     httpd.read_gate = threading.BoundedSemaphore(max(1, _MAX_INFLIGHT - _RESERVED_SLOTS))
     httpd.read_waiters = 0
     httpd.read_waiters_lock = threading.Lock()
-    if signer is not None:
-        # after every refusal and the bind: pinned under the Signer's own lock with the check above run again there
-        # (a page_origin set since is caught), after which no other page_origin can be set; refused, nothing is served
-        try:
+    view = VerbView(verb_registry, cockpit, lambda: broker_install_class(httpd)) if cockpit is not None else None
+    try:
+        # K2b §6: `--install-class reported` is the only way to reported; no flag (and no governed
+        # marker) leaves the broker write-disabled, answering "run the installer"
+        httpd.broker = _build_broker(source, install_class, httpd, extra_effects)
+        # one reader over one queue directory for the decisions panel's rows and the consent body route alike
+        httpd.consent_reader = _consent_reader()
+        from levain.consent.questions import QuestionStore
+
+        # over the reader's own directory only (None is the default queue): a reader without the attribute gets no
+        # question store, never the default queue's (as the proposals route, _ConsentReader)
+        httpd.question_store = (QuestionStore(httpd.consent_reader.directory)
+                                if hasattr(httpd.consent_reader, "directory") else None)
+        from levain.consent.notes import NoteStore
+
+        httpd.note_store = (NoteStore(httpd.consent_reader.directory)
+                            if hasattr(httpd.consent_reader, "directory") else None)
+        if view is not None and callable(getattr(cockpit, "check_verbs", None)):
+            cockpit.check_verbs(view)       # the attach's own refusal, run before anything is committed
+        if signer is not None:
+            # after every refusal and the bind, before the cockpit is touched: pinned under the Signer's own lock with
+            # the check above run again there (a page_origin set since is caught), after which no other page_origin
+            # can be set; refused, nothing is served and the caller's cockpit is as it was
             signer.pin_page_origin(problem)
-        except ValueError:
-            httpd.server_close()
-            raise
-        httpd.signer_page_origin = signer.page_origin
+            httpd.signer_page_origin = signer.page_origin
+        if cockpit is not None:
+            cockpit.attach_verbs(view)
+            if httpd.broker is not None:
+                cockpit.attach_authority(httpd.broker.capture)
+                cockpit.attach_edits_reader(httpd.broker.edits)
+                # a downstream that registered its own "decisions" keeps exactly that panel (K2b-3b §0.4)
+                cockpit.attach_decision_rows(httpd.broker.decision_rows)
+            cockpit.attach_consent_rows(httpd.consent_reader)      # agents waiting on the operator (Q6a)
+            if httpd.question_store is not None:
+                cockpit.attach_question_rows(httpd.question_store)     # and the questions they ask him (Q-2b)
+            if httpd.note_store is not None:
+                cockpit.attach_note_rows(httpd.note_store)             # and what they tell him (notes)
+    except BaseException:
+        httpd.server_close()
+        raise
     # The names this server serves, beside its cockpit.db, for `levain cockpit policy raise` to check a
     # downstream verb against (levain.cockpit.verbs.SERVED_VERBS_NAME). Written last, so a server refused
     # above records nothing. Unwritable, an earlier server's record is removed so the raise of a downstream

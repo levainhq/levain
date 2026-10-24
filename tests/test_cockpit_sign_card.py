@@ -220,9 +220,10 @@ def test_a_signed_verb_takes_sign_request_beside_its_fields_and_an_unsigned_one_
                                                        "params": {"message": "hi", SIGN_PARAM: "np-nothing-signed"}},
                                 token=TOK)
             if sign:
-                # admitted by the kernel and refused by the door (nothing was signed): never a field refusal
-                assert out.get("error") != "field_not_allowed", (status, out)
-                assert rig.refused and not rig.applied
+                # a param the kernel admits, and then refuses: no request of that name was filed and signed (L3 r2 F2),
+                # so the door is never reached; never a field refusal
+                assert (status, out.get("error")) == (403, "sign_required"), (status, out)
+                assert not rig.refused and not rig.applied
             else:
                 assert status == 400 and out["error"] == "field_not_allowed" and SIGN_PARAM in out["message"], out
             status, out = _call(url, "/action", {"verb": "send_inbox", "confirm": True,
