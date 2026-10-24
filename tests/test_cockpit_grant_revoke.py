@@ -59,9 +59,10 @@ def _signer(world, rp: str = RP, origin: str = PAGE) -> Signer:
     return signer
 
 
-def test_the_grant_routes_ride_the_sign_gate_and_revoke_a_real_grant(world, tmp_path) -> None:
+def test_the_grant_routes_ride_the_sign_gate_and_revoke_a_real_grant(world, tmp_path, monkeypatch) -> None:
     """Reproduced red before the build: ``/cockpit/grant/list.json`` and ``.../revoke-challenge`` were 404 with a
     Signer attached."""
+    monkeypatch.setenv("LEVAIN_HOME", str(world.qdir.parent))   # the grant cards' queue is the Signer's
     _grant(world, GID, "Write")
     with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _httpd):
         q = urllib.parse.quote(GID, safe="")
@@ -92,10 +93,11 @@ def test_the_grant_routes_ride_the_sign_gate_and_revoke_a_real_grant(world, tmp_
     assert grant_listing(world.root, now=_now())[0] == []
 
 
-def test_a_cockpit_on_a_port_offers_no_passkey_revoke_and_says_why(world, tmp_path) -> None:
+def test_a_cockpit_on_a_port_offers_no_passkey_revoke_and_says_why(world, tmp_path, monkeypatch) -> None:
     """The replay refuses a revoke signed on ``https://<name>:8443`` (reproduced: 403 "the passkey signed on a page
     that is not https://phone.example (exactly: no port); nothing was revoked", after the Face ID). So the listing
     names no signer and says why, the page keeps the copy button, and a challenge is refused before any gesture."""
+    monkeypatch.setenv("LEVAIN_HOME", str(world.qdir.parent))
     _grant(world, GID, "Write")
     with _serving(tmp_path / "inst", signer=_signer(world, origin=PORTED), extra_hosts=[RP]) as (url, _httpd):
         status, listed = _call(url, "/cockpit/grant/list.json")
@@ -108,13 +110,19 @@ def test_a_cockpit_on_a_port_offers_no_passkey_revoke_and_says_why(world, tmp_pa
     assert [g.id for g in grant_listing(world.root, now=_now())[0]] == [GID]
 
 
-def test_without_a_signer_no_grant_route_exists(world, tmp_path) -> None:
+def test_without_a_signer_no_grant_route_exists(world, tmp_path, monkeypatch) -> None:
     _grant(world, GID, "Write")
     with _serving(tmp_path / "inst") as (url, _httpd):
         # the page reads "no signing here" off this 404 and keeps the copy button (the D5 listing's own channel)
         assert _call(url, "/cockpit/grant/list.json")[0] == 404
         for action in ("revoke-challenge", "revoke"):
             assert _call(url, f"/cockpit/grant/{GID}/{action}", {})[0] == 404
+    # a Signer over another queue than the one the grant cards are read from (L3 r1 codex MED): no grant route either,
+    # so a card from one cockpit can never revoke a same-id, same-instance grant in another
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "elsewhere"))
+    with _serving(tmp_path / "inst2", signer=_signer(world), extra_hosts=[RP]) as (url, _httpd):
+        assert _call(url, "/cockpit/grant/list.json")[0] == 404
+        assert _call(url, f"/cockpit/grant/{GID}/revoke-challenge", {"signer_fp": world.phone.fp, "instance": "x"})[0] == 404
     assert [g.id for g in grant_listing(world.root, now=_now())[0]] == [GID]
 
 

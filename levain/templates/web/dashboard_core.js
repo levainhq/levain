@@ -5681,11 +5681,16 @@
             return signCall(base + "revoke", {
               authenticator_data: signB64u(cred.response.authenticatorData), client_data_json: signB64u(cred.response.clientDataJSON),
               signature: signB64u(cred.response.signature) }).then((r) => {
-              if (!r.ok && (r.status === 0 || r.status >= 500)) {
-                say("result unknown (" + signWhy(r) + "): the grants are read again to show whether it is still there", "bad");
+              // the assertion has gone: only a 4xx carrying the server's own error word is a definite refusal; anything
+              // else (no answer, a 5xx, a 2xx/3xx whose body did not parse) may have revoked, so it is unknown. Each
+              // outcome is kept (grantSaid) so the redraw below does not erase it.
+              const refused = !r.ok && r.status >= 400 && r.status < 500 && r.body && typeof r.body.error === "string";
+              if (!r.ok && !refused) {
+                grantSaid = "result unknown for " + g.id + " (" + signWhy(r) + "): the grants were read again to show whether it is still there";
+                say(grantSaid, "bad");
                 return;
               }
-              if (!r.ok) { say("not revoked: " + signWhy(r), "bad"); return; }
+              if (!r.ok) { grantSaid = "not revoked " + g.id + ": " + signWhy(r); say(grantSaid, "bad"); return; }
               if (!who.rawId && cred.rawId && typeof c.body.rp_id === "string") signRemember(c.body.rp_id, who.fp, signB64u(cred.rawId));
               revoked = true;
               grantSaid = "revoked " + ((typeof g.id_shown === "string" && g.id_shown) || g.id) + " · link seq " + r.body.seq + (r.body.warning ? " · " + r.body.warning : "");
@@ -5696,8 +5701,8 @@
       });
     }).catch((e) => {
       const name = (e && e.name) || "error";
-      say(sent ? "result unknown (the page failed: " + name + "): the grants are read again to show where it stands"
-               : "the page failed (" + name + "); nothing was revoked", "bad");
+      if (sent) grantSaid = "result unknown for " + g.id + " (the page failed: " + name + "): the grants were read again to show where it stands";
+      say(sent ? grantSaid : "the page failed (" + name + "); nothing was revoked", "bad");
     }).finally(() => {
       signBusy--;
       btn.disabled = false;
@@ -5713,9 +5718,11 @@
     grantFill(slot);
     return slot;
   }
+  let grantFillSeq = 0;        // the newest fill wins: an older read answering late never redraws over a newer one
   function grantFill(slot) {
+    const n = ++grantFillSeq;
     Promise.all([grantFetch(), grantSignList()]).then(([b, signList]) => {
-      if (!b) return;
+      if (!b || n !== grantFillSeq) return;
       // sort is stable: the server's order holds among grants with and among grants without a refused call
       const rows = b.grants.slice().sort((x, y) => (grantRefused(y) ? 1 : 0) - (grantRefused(x) ? 1 : 0));
       const note = typeof b.note === "string" ? b.note : "";

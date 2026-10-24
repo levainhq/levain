@@ -7,7 +7,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
-- **The cockpit's grant "revoke" button signs with your passkey.** On a cockpit served with a `signer=`, the button
+- **The cockpit's grant "revoke" button signs with your passkey.** On a cockpit served with a `signer=` over the same
+  consent queue its grant cards come from, the button
   runs the phone page's own revoke ceremony: one passkey prompt, and the grant is revoked in the authority log. The
   server builds the link and the page checks the challenge is over that link before the prompt. The new routes,
   `GET /cockpit/grant/list.json` and `POST /cockpit/grant/<id>/revoke-challenge` and `.../revoke`, ride the sign

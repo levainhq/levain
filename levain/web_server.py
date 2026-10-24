@@ -2461,8 +2461,17 @@ def make_server(
             # the grants' passkey revoke over the Signer's own values: its queue (whose consent hook names the ONE
             # cockpit whose log takes the revoke, as on the phone port), rpId, the page origin just pinned, its keys
             sign_queue = signer.queue_dir
-            httpd.grant_phone = GrantPhone(sign_queue, signer.rp_id, signer.page_origin, signer.keys,
-                                           lambda: sign_root(sign_queue))
+            # only when the grant cards this page shows come from that same queue (/cockpit/consent/grants.json reads
+            # the consent reader's): two queues could name two cockpits whose grants share ids and instances, and a
+            # button on one card must never revoke the other's. Different queues: no grant route, the button copies.
+            from levain.consent.queue import default_queue_dir
+
+            reader = httpd.consent_reader
+            card_queue = (reader.directory if reader.directory is not None else default_queue_dir()) \
+                if hasattr(reader, "directory") else None
+            if card_queue is not None and Path(card_queue).resolve() == Path(sign_queue).resolve():
+                httpd.grant_phone = GrantPhone(sign_queue, signer.rp_id, signer.page_origin, signer.keys,
+                                               lambda: sign_root(sign_queue))
         if cockpit is not None:
             # one transaction: an attach that raises (a panel registered since check_verbs; a decisions panel the
             # registry refuses) undoes this server's attaches and keeps any other registration
