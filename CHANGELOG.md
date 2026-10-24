@@ -6,7 +6,40 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.21] — 2026-10-24
+
 ### Added
+- **`levain session adopt SESSION --repo PATH` takes a finished session's work into your repo, after showing you what it
+  is.** `levain session discard SESSION` and `levain session restore SESSION` move a retained session to trash and back.
+  The `session` command stays out of `levain --help`, and a session still needs the root helpers, which have no public
+  install path yet, so this reaches you through a build that has them. Levain checks the repo first: it must be a git
+  root (not a subdirectory, linked worktree or submodule), use the same object format as the session's, not be shallow
+  or partial, and carry the session's recorded base commit. A session that recorded no base is refused
+  `base-unrecorded`. Levain then opens the session's export in a confined child and prints a preview: the new commits
+  with author, committer and message, the changed paths from the base, config-surface files, symlinks and their
+  targets, and names that collide by case or Unicode form. Everything printed is escaped. Then it asks what to take:
+  `head`, `wip` (only the refs the export carries) or `none`. `--take head|wip|none` answers for a script; with no
+  terminal and no `--take` it refuses `bad-argument` before doing anything. The take copies objects into your repo and
+  moves the ref, never runs your repo's hooks, and never looks for a parent repo. After the preview Levain prints the
+  private copy's directory and the one command that removes it. An adopt that fails before the preview removes the
+  private copy; after it, Levain removes the bundle and index and leaves the directory for you to remove. `discard` and `restore`
+  answer `session-busy` while the session is in use, `not-retained:trash` for a session already in trash and
+  `not-trash:retained` for one not in trash; a discard or restore that stopped part-way is refused
+  `discard-incomplete:<phase>` (`restore-incomplete:<phase>` for a restore) and finishes when you run it again. This
+  replaces the 0.11.20 Groundwork line saying nothing calls the adopt stages. Tested on macOS.
+- **Message an agent from the agents graph in the cockpit.** Tapping an agent's node presses its recipient chip in the
+  message card, scrolls to the card and focuses the message box. `fanin`, the coordinating agent, is pre-selected, and
+  un-pressing every chip sends to everyone. At phone width (720 px and narrower) the chips give way to a picker with the
+  same choices. The pick survives the card's refresh and clears when a send lands; a send refused because the agent has
+  gone says the agent is gone, asks you to choose again and redraws the chips. Known edges: an agent waiting on a card keeps its
+  card-opening tap, so it is not messageable by tap; and an empty inbox card has no box to focus.
+- **A metered route's holds survive a restart of the credential-holding process.** Each hold is written to the hold
+  journal (`keys/ledger.jsonl`) and flushed to disk before the call it covers is sent. On the next start, every hold
+  with no recorded outcome is booked as uncertain at its full amount, so a restart cannot make a session's cap look
+  emptier than it is. If the journal cannot be opened, the credential-holding process refuses to start (exit 3). If the
+  journal's writer fails or stalls while running, it admits and sends nothing from then on, and every unresolved hold
+  stays charged at its full amount.
+
 - **Metered routes hold each call's estimated cost against the route's per-session cap.** On a metered base route
   (a `levain-routes-base/2` map with a price table) the credential-holding process buffers the request body, checks
   the model against the route's price table, writes the output ceiling into the body and holds the call's estimated
@@ -26,26 +59,78 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   A call that reports no usage, or whose usage could not be read, is charged its whole hold. When a call costs more
   than was held for it, it is charged in full and its session is stopped: the session's later calls are refused
   `budget-overrun` (402), while calls already running finish and are charged from their own usage. The stop lasts
-  until the session ends, or until the credential-holding process restarts (the stop is kept in its memory). A streamed openai-chat request that does not say whether it wants usage is sent asking for
-  it, so the provider adds one final chunk carrying the usage.
+  until the session ends, or until the credential-holding process restarts: the stop is kept in the process's memory,
+  not in the hold journal above, so holds persist across a restart and the stop does not. A streamed openai-chat
+  request that does not say whether it wants usage is sent asking for it, so the provider adds one final chunk
+  carrying the usage.
 
 ### Changed
-- **The memory no longer forms Hebbian links, and the dashboard stops reading them as health.** anneal-memory 1.0.2
-  stops forming associations between co-cited episodes and ignores the affective state a wrap could carry. Levain follows:
+- **Health, the graph panel and `levain wrap` stop treating Hebbian links as a sign of life.** Levain's anneal-memory
+  requirement is unchanged (`>=1.0.0,<2`); everything below holds with anneal-memory 1.0.1 installed except where it
+  says otherwise.
   - Health is now `live` (the store reads and at least one wrap committed) or `no wraps yet`. The date of the last wrap is
     shown as a fact. A fresh store no longer reads "DARK · 0 links". `write_path_live` stays in the health data for one
     more release (true when the status is live) so an older reader does not break.
   - The link count, strength and density figures leave the health panel. The graph panel keeps drawing the links already
-    there, says `not formed` when the graph is empty, and says `no new links since wrap N` when the installed anneal
-    reports it. With anneal 1.0.1 it says nothing extra.
+    there and says `not formed` when the graph is empty. When anneal-memory 1.0.2 or later is installed and reports that
+    it has stopped forming links, it also says `no new links since wrap N`; with 1.0.1 it says nothing extra.
   - Wrap rows show `+N links` only for older wraps that formed some.
-  - `levain wrap` no longer prints an `associations:` line (it would read 0 on every wrap) and prints `wrap: #N` when
-    anneal names the wrap it committed. `--affect-tag` and `--affect-intensity` still work, do nothing, and print one
-    line saying they are deprecated.
+  - `levain wrap` no longer prints an `associations:` line (it would read 0 on every wrap) and no longer sends an
+    affective state. It prints `wrap: #N` when the installed anneal names the wrap it committed (anneal-memory 1.0.2 or
+    later). `--affect-tag` and `--affect-intensity` still parse, do nothing, and print one line saying they are
+    deprecated.
   - The seed memory files teach two layers (episodes and continuity) with the immune system, and drop the Hebbian and
     limbic sections. Run `levain update` to see the proposed changes to your copy.
-  - Known edge: a process on anneal 1.0.1 can still open a store that a 1.0.2 process has touched, and it keeps forming
-    links on it. Move every install that shares a store (this one, flow, the uv tool, hub venvs) to anneal 1.0.2 or later.
+  - Known edge: once anneal-memory 1.0.2 or later is in use, a process still on 1.0.1 can open a store that a newer
+    process has touched and keeps forming links on it. Keep every install that shares a store (this one, other tools, the
+    uv tool, hub venvs) on the same anneal-memory version.
+- **The wheel ships the Unicode license** (`LICENSES/Unicode-3.0.txt`) with the confusables table the adopt preview uses.
+
+### Removed
+- **The keys service no longer relays websockets.** The relay added in 0.11.20 (see its Groundwork entry) is deleted:
+  every brokered route the keys service serves is now metered, and a metered route refuses an upgrade
+  (`body-unbounded:websocket`), so nothing could reach it. The front's own websocket path is unchanged.
+
+### Fixed
+- **The cockpit no longer breaks at half-screen widths.** At 864 to 1040 px the jar and live dot sat over the tabs; the
+  weather card's foot stacked three items in one place; a strip segment shrank to 2 px; tile status rows and big-figure
+  labels ran past the tile edge; and row verbs spilled over the meta line in a 341 to 520 px column. A status line that
+  is cut now has the full text as its tooltip.
+- **Drop from the phone survives a store change and a fast laptop clock.** A refusal because the phone's clock is ahead
+  of the laptop's now retries with a fresh send time, and the refusal names the gap in minutes. A drop listing that
+  arrives late no longer overwrites the store the page already adopted. A signed drop for another store on an item bound
+  to a store is refused `other_store`. The envelope review now carries the page's store id, and the signing challenge
+  binds to the store the review kept: a store replaced or gone between the review and Sign is refused `other_store`,
+  and the challenge never creates a store.
+- **The gateway log's `bytes_up` counts only the body bytes handed upstream.**
+- **The keys service arms its shutdown triggers before it first listens**, so a SIGINT arriving the moment its socket
+  appears takes the graceful path instead of ending the process with a signal exit.
+
+### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
+- **The install helper's `repair --source PATH` is built.** It upgrades an existing install to a new generation, and it
+  replaces 0.11.20's "not built yet". It checks that the `--source` package is writable by the operator alone and that
+  the accounts its plan renders still exist (`account-missing`), stages and hashes a copy of the new code
+  (`source-changed` if the source moved), places it, probes it, then execs into it so the new code finishes the work
+  holding both install locks. A run that stopped after placing a generation resumes into it; if the staged copy no
+  longer hashes the same it is removed and the run refuses `source-required:<id>`. No `levain` command runs it.
+- **The keys service attaches to the isolation controller.** It holds one long-lived attachment and refuses every token
+  while it is not attached. Losing the attachment fails closed on both sides: keys drops every front, and the
+  controller revokes every egress session. A front that disappears, or never claims its registration within 10
+  seconds of being armed, gets its session revoked. Keys reconciles its cached tokens with the controller once a
+  minute, and a reconcile that goes unanswered three times in a row ends the attachment. A session stopped for
+  spending past its hold is recorded by the controller for display and is not revoked. A failed read loop or reconcile
+  ends the attachment instead of leaving it half-alive; a short-lived attachment backs off before the next try; and a
+  spend-overrun notice is resent until acknowledged, or ends the attachment. The controller's service has a single
+  entry point, `levain.slot.control.serve`. Nothing starts either process from a `levain` command yet.
+- **Dispatch route maps.** The controller accepts a signed dispatch route map (`ROUTE-SUBMIT`), verifies it against the
+  routes trust anchor, activates it as a numbered generation behind a durable head, and tells the keys service to
+  reload it. Keys keeps its own durable head, refuses an older or rolled-back generation, and refuses every dispatch
+  route until a valid reload. An equal generation and digest resubmitted converges instead of failing. A route id
+  that is both a base route and a dispatch route is refused `keys-unavailable` (`route-collision`) when used, and so is
+  any route while the dispatch ids cannot be read. A map is refused `routemap-signature`, `routemap-store`,
+  `routemap-generation`, `routemap-invalid:<part>` or `routemap-verifier`. No session carries a dispatch pin yet, so
+  every dispatch route is still refused.
+- **The keys service's `--unmetered` flag is removed.** It was an internal flag on a process you do not start.
 
 ## [0.11.20] — 2026-10-23
 
