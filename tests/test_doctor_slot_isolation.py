@@ -21,6 +21,7 @@ NOW = 1_800_000_000.0
 def _store(tmp: Path, states: dict[str, str], pool: tuple[int, int] | None = None) -> Path:
     store = tmp / "store"
     (store / "slots").mkdir(parents=True)
+    (store / "slots" / layout.POOL_LOCK_NAME).write_text("")
     for tag, state in states.items():
         d = store / "slots" / tag
         d.mkdir()
@@ -137,6 +138,7 @@ def test_doctor_slot_every_printed_remedy_parses_in_the_real_cli(tmp_path: Path)
                                                                      free_bytes=lambda p: 0)]
     hints += [r.hint or "" for r in doctor._check_slot_isolation(host="linux", store=tmp_path / "nope")]
     cmds = [c for h in hints for c in re.findall(r"`(levain [^`]*)`", h)]
-    assert all(_parses(c) for c in cmds), cmds
+    assert any(hints)                      # the rig reached real remedy text
+    assert all(_parses(c) for c in cmds), cmds   # NB: the slot rows print no `levain ...` command today (cmds == [])
     assert not any("--agent" in h or "setup-isolation repair" in h or "setup-isolation replenish" in h
                    for h in hints)

@@ -370,10 +370,13 @@ def _read_slot_dirs(slots: Path) -> tuple[dict[str, tuple[str, str]], list[str]]
     from levain.slot import Refused
     from levain.slot import records as R
     from levain.slot.ids import SlotId
+    from levain.slot.layout import POOL_LOCK_NAME
 
     out: dict[str, tuple[str, str]] = {}
     ignored: list[str] = []
     for name in sorted(os.listdir(slots)):
+        if name == POOL_LOCK_NAME:      # install's own pool lock: infrastructure, not an entry to report
+            continue
         if len(name) < 2 or name[0] not in "ev" or not name[1:].isdigit() or str(int(name[1:])) != name[1:] \
                 or int(name[1:]) >= 64:
             ignored.append(name)
