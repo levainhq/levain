@@ -329,10 +329,10 @@ class TicketStore:
         it without its bind: no session existed, so nothing ran and nothing was charged. With no `has_session`, every
         binding stands. An unbound ticket already past V16 is expired here, so the compaction tombstones it (fix 2).
 
-        The single-CONTROL lock is taken first (:meth:`acquire`); a start that fails after taking it releases it (a
-        CONTROL that did not start holds nothing)."""
+        The single-CONTROL lock is taken first (:meth:`acquire`, idempotent when the caller took it already); a start
+        that fails releases it whoever took it (fix 3, L3 r2: a CONTROL that did not start holds nothing, so a
+        replacement in the same process is not refused `control-running`)."""
         with self.lock:
-            held = self._lock_fd is not None
             self._acquire()
             try:
                 if self._fd is not None:
@@ -356,8 +356,10 @@ class TicketStore:
                                    0o600)
                 self._poisoned = False
             except BaseException:
-                if not held:
-                    self._release()
+                if self._fd is not None:
+                    os.close(self._fd)
+                    self._fd = None
+                self._release()
                 raise
 
     def _read(self) -> List[dict]:
@@ -620,7 +622,7 @@ class TicketStore:
             self._expire_due()
             now = self._clock()
             day = _day(now)
-            if sum(1 for t in self._by_ticket.values() if t.state in OPEN) >= ceiling.max_open_tickets:
+            if sum(1 for t in self._by_ticket.values() if self._state(t) in OPEN) >= ceiling.max_open_tickets:
                 raise Refused("ticket-ceiling:max_open_tickets")
             if sum(1 for t in self._by_ticket.values() if t.day == day and t.facts) >= ceiling.max_runs_per_day:
                 raise Refused("ticket-ceiling:max_runs_per_day")
@@ -693,10 +695,12 @@ class TicketStore:
 
     def referenced_generations(self, sessions: "set[str]") -> "frozenset[int]":
         """The route-map generations still referenced (head ruling H5, RELOAD's `keep`): every OPEN ticket's, and every
-        ticket's bound to one of `sessions` (the live ones), whatever its state."""
+        ticket's bound to one of `sessions` (the live ones), whatever its state. OPEN is the derived state
+        (:meth:`_state`; fix 3, L3 r2): a ticket past V16 whose `expire` no write has journaled yet references
+        nothing, so its generation is let go and leaves the collision set."""
         with self.lock:
             return frozenset(int(t.facts["routemap_generation"]) for t in self._by_ticket.values()   # type: ignore
-                             if "routemap_generation" in t.facts and (t.state in OPEN or t.session in sessions))
+                             if "routemap_generation" in t.facts and (self._state(t) in OPEN or t.session in sessions))
 
     def cancel(self, ticket: str) -> None:
         """An UNBOUND ticket only (`ticket-bound` once a lease bound it; `ticket-unknown` for one never minted;
@@ -707,10 +711,11 @@ class TicketStore:
             t = self._by_ticket.get(ticket)
             if t is None:
                 raise Refused("ticket-unknown")
-            if t.state == BOUND:
+            state = self._state(t)
+            if state == BOUND:
                 raise Refused("ticket-bound")
-            if t.state != UNBOUND:
-                raise Refused("attempt-closed", t.state)
+            if state != UNBOUND:
+                raise Refused("attempt-closed", state)
             self._append({"op": "cancel", "ticket": ticket})
             t.state = CANCELLED
 
@@ -720,8 +725,9 @@ class TicketStore:
             t = self._by_attempt.get(attempt_id)
             if t is None:
                 raise Refused("attempt-unknown")
-            out: Dict[str, object] = {"ticket": t.ticket, "state": self._state(t)}
-            if t.session is not None and t.state in (BOUND, RELEASED):
+            state = self._state(t)
+            out: Dict[str, object] = {"ticket": t.ticket, "state": state}
+            if t.session is not None and state in (BOUND, RELEASED):
                 out["session"] = t.session
             return out
 

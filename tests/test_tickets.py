@@ -838,3 +838,58 @@ def test_stale_attachment_ack_deletes_nothing(rig):
     shim.supersede = False
     submit_gen(rig, 3, [route()])
     assert served_gens(rig) == [3] and rig.st.gen_files() == ["3.json", "3.sig"]
+
+
+# ---- fix 3 (L3 r2): a failed start holds no lock; expiry is derived wherever a ticket's state is read -----------------
+
+def test_failed_start_releases_the_journal_lock(rig):
+    # codex MED / complement LOW: CONTROL took the journal lock, then its start failed (`journal-inconsistent`). The
+    # failed CONTROL holds nothing: a replacement CONTROL in the same process, on the corrected journal, starts (never
+    # `control-running`) and serves the same ticket
+    first = rig.mint()
+    rig.control.stop()
+    good = (rig.sdir / T.JOURNAL).read_bytes()
+    (rig.sdir / T.JOURNAL).write_bytes(b'{"op": "nonsense"}\n')
+    with pytest.raises(Refused) as e:
+        rig.restart()
+    assert e.value.name == "journal-inconsistent"
+    failed = rig.tickets                                                 # kept alive: GC must not release it
+    (rig.sdir / T.JOURNAL).write_bytes(good)
+    rig.control = None                                                   # the failed CONTROL is never stopped
+    rig.restart()
+    assert failed is not rig.tickets
+    assert rig.mint() == first
+
+
+def test_ticket_store_start_failure_releases_a_lock_its_caller_took(rig):
+    # the store's own half: `acquire` by the caller, then `start` fails; the lock is released, so a second store on the
+    # same journal acquires it
+    rig.control.stop()
+    (rig.sdir / T.JOURNAL).write_bytes(b'{"op": "nonsense"}\n')
+    ceiling = rig.st.L / "policy" / "dispatch_ceiling"
+    one = T.TicketStore(rig.sdir / T.JOURNAL, ceiling, clock=rig.clock, ceiling_uid=os.getuid())
+    one.acquire()
+    with pytest.raises(Refused) as e:
+        one.start()
+    assert e.value.name == "journal-inconsistent"
+    two = T.TicketStore(rig.sdir / T.JOURNAL, ceiling, clock=rig.clock, ceiling_uid=os.getuid())
+    two.acquire()
+    two.close()
+
+
+def test_expired_ticket_no_longer_references_its_generation(rig):
+    # codex MED: a ticket past V16, expired lazily (no write since journaled it), no longer keeps its route-map
+    # generation: the next RELOAD lets generation 1 go, its files are deleted, and a base route `glm` that collided
+    # only with generation 1's dispatch `glm` is served
+    from tests.test_routemaps import _base_with
+    k = keys_on_wire(rig)
+    one = ticket_of(rig.mint())
+    rig.clock.t += T.TICKET_UNUSED_S
+    assert rig.ask("RUN-TICKET-STATUS", attempt_id="a-1")["state"] == T.EXPIRED
+    submit_gen(rig, 2, [route(rid="other")])
+    assert rig.control.keys_admin.keeps[-1] == [2]
+    assert served_gens(rig) == [2] and rig.st.gen_files() == ["2.json", "2.sig"]
+    assert k.routes.route_ids() == frozenset({"other"})
+    _base_with(rig.st, "glm")
+    assert _resolved(k, {"routes": ["glm"]}, "glm") == "api.z.ai"
+    assert rig.ask("RUN-TICKET-CANCEL", ticket=one)["refused"] == "attempt-closed"

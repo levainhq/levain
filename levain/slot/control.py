@@ -887,13 +887,26 @@ class Control:
         Before all of it, the ticket journal's single-CONTROL lock (3c-5 fix 2, L3 r1 codex 1:
         :meth:`levain.slot.tickets.TicketStore.acquire`): a second CONTROL refuses ``control-running`` (noted in
         :attr:`seam_errors`) before it finishes an activation, revokes a record, compacts the journal or, in
-        :class:`ControlServer`, unlinks the first one's socket."""
+        :class:`ControlServer`, unlinks the first one's socket. A start that fails after taking it (a route recovery,
+        the record load, a journal refused `journal-inconsistent`, the revoke pass) releases it before the failure
+        is raised (3c-5 fix 3, L3 r2): a CONTROL that did not start holds nothing, so a replacement in the same process
+        is never refused ``control-running``."""
         if self.tickets is not None:
             try:
                 self.tickets.acquire()
             except Refused as e:
                 self.seam_errors.append(("start", "", e))
                 raise
+        try:
+            self._start_pass()
+        except BaseException:
+            if self.tickets is not None:
+                self.tickets.close()
+            raise
+
+    def _start_pass(self) -> None:
+        """:meth:`start` after the journal lock: the route maps' start pass, the records, the ticket journal, the
+        revoke pass."""
         if self.routes is not None:
             self.routes.start_pass()
         loaded = self.store.load()
