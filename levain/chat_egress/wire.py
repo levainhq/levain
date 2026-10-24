@@ -140,7 +140,7 @@ def _load(line: bytes) -> dict:
         raise WireError("not one newline-terminated line")
     try:
         obj = json.loads(line.decode("utf-8"), object_pairs_hook=_no_dup_keys)
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+    except ValueError as e:     # UnicodeDecodeError, JSONDecodeError, and an int past Python's digit limit
         raise WireError(f"not JSON: {e}") from None
     if not isinstance(obj, dict):
         raise WireError("not an object")

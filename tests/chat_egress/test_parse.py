@@ -127,6 +127,9 @@ def test_options_star_is_a_path():
     {"host_header": "other.example"},
     {"host_header": "example.com:8443"},
     {"port": 80, "sni": None, "host_header": "other.example:80"},
+    # codex r1 LOW 6: a Host with no port means the scheme's default (RFC 9110 7.2), never "any port"
+    {"port": 8443, "sni": "example.com", "host_header": "example.com"},
+    {"port": 8080, "sni": None, "host_header": "example.com"},
 ])
 def test_r2_host_mismatch(kw):
     assert walls(parse.parse(frame(**kw))) == "host_mismatch"

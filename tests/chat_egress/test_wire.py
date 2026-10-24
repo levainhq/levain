@@ -239,3 +239,8 @@ def test_l2_lone_surrogate_is_a_wire_error(bad):
         wire.deny_frame(2, 403, bad)
     with pytest.raises(WireError):
         wire.encode_frame({"t": "verdict", "id": 2, "action": "deny", "status": 403, "reason": bad})
+
+
+def test_codex_r1_low7_an_integer_past_the_digit_limit_is_a_wire_error():
+    with pytest.raises(WireError):
+        wire.parse_obs_line(b'{"t": "x", "n": ' + b"9" * 5000 + b"}\n")

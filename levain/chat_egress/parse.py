@@ -424,7 +424,10 @@ def _host_header_mismatch(p: ParsedRequest) -> bool:
             return True
     except ValueError:
         return True
-    return port is not None and port != p.port
+    if port is None:
+        # a Host with no port names the scheme's default port (RFC 9110 7.2), never "whatever port was dialled"
+        port = 443 if p.scheme == "https" else 80
+    return port != p.port
 
 
 def _is_receive_pack(p: ParsedRequest) -> bool:
