@@ -163,6 +163,37 @@
     return true;
   }
 
+  // The decision mark (Phill 10-23): the desk (the hub) or a seat node that carries needs_open > 0 is drawn with a red ring and a "!" badge holding
+  // the count. The keys are optional: absent, zero, non-integer or negative draws nothing and is never an error. needs_first (the oldest open
+  // item's id) makes the badge a button that opens that needs card; needs_first_what is the badge's title.
+  function needsOf(o) {
+    if (!isObj(o) || !Number.isInteger(o.needs_open) || o.needs_open <= 0) return null;
+    return { n: o.needs_open, first: typeof o.needs_first === "string" && o.needs_first ? o.needs_first : "",
+             what: typeof o.needs_first_what === "string" ? o.needs_first_what.slice(0, 120) : "" };
+  }
+  // ring radius rr around (cx, cy), the badge on the ring at angle ang (radians); returns the group to append
+  function needMark(nd, cx, cy, rr, ang, opts, label) {
+    const g = sv("g", { "data-needs": String(nd.n) }, "tv-need");
+    g.appendChild(sv("circle", { cx: num(cx), cy: num(cy), r: num(rr) }, "tv-needring"));
+    const bx = cx + Math.cos(ang) * rr, by = cy + Math.sin(ang) * rr, txt = "!" + (nd.n > 9 ? "9+" : String(nd.n)), w = txt.length > 2 ? 30 : 24;
+    const b = sv("g", { "data-needbadge": nd.first }, "tv-needbadge");
+    b.appendChild(sv("rect", { x: num(bx - w / 2), y: num(by - 10), width: w, height: 20, rx: 10 }, "tv-needpill"));
+    b.appendChild(sv("text", { x: num(bx), y: num(by + 5), "text-anchor": "middle" }, "tv-needtxt", txt));
+    const tip = nd.what || (nd.n + " decision" + (nd.n === 1 ? "" : "s") + " waiting on you");
+    b.appendChild(sv("title", null, null, tip));
+    if (nd.first && opts && typeof opts.openCard === "function") {
+      const go = (ev) => { ev.stopPropagation(); opts.openCard(nd.first); };
+      b.classList.add("tv-needopen");
+      b.setAttribute("role", "button");
+      b.setAttribute("tabindex", "0");
+      b.setAttribute("aria-label", label + ": " + tip + ": open its card");
+      b.addEventListener("click", go);
+      b.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); go(ev); } });
+    }
+    g.appendChild(b);
+    return g;
+  }
+
   function dot(state) { const d = el("i", "tv-dot " + state); d.setAttribute("aria-hidden", "true"); return d; }
   function tag(state, text) { return el("span", "tv-tag " + state, text); }
   // what closing a live node would lose (the value's lost_if_closed), by node id; null counts are unknown, never zero
@@ -908,6 +939,8 @@
     hg.appendChild(sv("rect", { x: num(hr.x), y: num(hr.y), width: num(hr.w), height: hr.h, rx: 7 }, "tv-lblbg"));
     hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 26), "text-anchor": "middle" }, "tv-hubname", hubLabel));
     hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 10), "text-anchor": "middle" }, "tv-hubsub", hsub));
+    const hubNeed = needsOf(v.hub);
+    if (hubNeed) hg.appendChild(needMark(hubNeed, h.x, h.y, h.r + 14, Math.PI / 4, opts, hubLabel || "the desk"));
     svg.appendChild(hg);
     // the groups: "N agents · M running"
     for (const [k, gp] of L.gpos) {
@@ -967,6 +1000,8 @@
         g.addEventListener("click", go);
         g.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); go(); } });
       }
+      const need = needsOf(n);
+      if (need) g.appendChild(needMark(need, P.x, P.y, r + 8, dir === 1 ? Math.PI * 0.75 : Math.PI * 0.25, opts, n.label));
       svg.appendChild(g);
     }
     for (const g of chips) svg.appendChild(g);
