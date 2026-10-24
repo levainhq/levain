@@ -41,7 +41,8 @@ def _store_with_data(tmp_path: Path) -> AnnealPaths:
     with Store(db) as store:
         a = store.record("decided X because Y", "decision")
         b = store.record("noticed Z", "observation")
-        store.record_associations({(a.id, b.id)})
+        store.wrap_started(token="w1", episode_ids=[a.id, b.id])
+        store.wrap_completed(2, 20, wrap_token="w1", episode_ids=[a.id, b.id])
     SporeStore(tmp_path / "memory.spores.json").add(
         type="task", text="an open loop", tier="hot", salience=2
     )
@@ -62,14 +63,14 @@ class TestRenderSummary:
         with Store(db):
             pass
         s = render_summary(build_substrate_view(AnnealPaths.from_db(db)))
-        assert "DARK" in s
+        assert "no wraps yet" in s and "DARK" not in s
         assert "Crystallized patterns: 0" in s
         assert "Open loops: 0" in s
 
     def test_live_write_path_and_headlines(self, tmp_path: Path) -> None:
         s = render_summary(build_substrate_view(_store_with_data(tmp_path)))
         assert "LIVE" in s
-        assert "Hebbian links" in s
+        assert "Hebbian" not in s
         assert "Open loops: 1" in s
         # the entity's own State headline surfaces, not the whole dump
         assert "current state line" in s

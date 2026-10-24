@@ -2,8 +2,8 @@
 said "+7 more" cut off by the tile's bottom, and "why isn't this like the Decisions Waiting widget and clickable to load a modal that
 DOES show all data?").
 
-The default install's Health widget is a status-dots tile with twelve metrics, so it hides most of them: it is a button, the focus view
-lists every metric behind a filter box, and nothing in any tile is drawn outside the tile at the page's desktop width."""
+The default install's Health widget is a status-dots tile with seven metrics, so it hides most of them: it is a button, the focus view
+lists every metric, and nothing in any tile is drawn outside the tile at the page's desktop width."""
 
 from __future__ import annotations
 
@@ -36,7 +36,10 @@ def test_a_tile_that_holds_items_back_is_a_button_and_one_that_holds_none_is_not
 
 
 @needs_browser
-def test_the_focus_view_lists_every_metric_behind_a_filter_box(tmp_path: Path) -> None:
+def test_the_focus_view_lists_every_metric(tmp_path: Path) -> None:
+    """The tile draws four of the health metrics; the focus view draws all seven. Seven is under the filter box's
+    floor (FILTER_MIN, 8: the link figures left health with the anneal cut), so the view carries no filter, and
+    a box that filtered seven rows would be furniture."""
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
@@ -46,19 +49,12 @@ def test_the_focus_view_lists_every_metric_behind_a_filter_box(tmp_path: Path) -
             {"eval": f"(async () => {{ const t = {HEALTH}; const b = document.createElement('button'); b.textContent = 'inner'; t.querySelector('.k').appendChild(b); b.click(); "
                      "const underButton = !!document.getElementById('levain-modal'); b.remove(); return underButton; })()"},
             {"eval": f"(() => {{ {HEALTH}.dispatchEvent(new KeyboardEvent('keydown', {{key: 'Enter', bubbles: true}})); const m = document.getElementById('levain-modal'); "
-                     "return [m.querySelectorAll('.op').length, !!m.querySelector('.xfilter-input'), m.querySelector('.xfilter-count').textContent]; })()"},
-            {"eval": "(async () => { const i = document.querySelector('#levain-modal .xfilter-input'); i.value = 'strength'; i.dispatchEvent(new Event('input', {bubbles: true})); "
-                     "await new Promise(r => setTimeout(r, 300)); return [document.querySelectorAll('#levain-modal .op').length, document.querySelector('#levain-modal .xfilter-count').textContent]; })()"},
-            # the cockpit refreshing while he types rebuilds the open view: the query he typed is still there
-            {"eval": "(async () => { document.dispatchEvent(new Event('visibilitychange')); window.dispatchEvent(new Event('focus')); await new Promise(r => setTimeout(r, 600)); "
-                     "const i = document.querySelector('#levain-modal .xfilter-input'); return [i && i.value, document.querySelectorAll('#levain-modal .op').length]; })()"},
+                     "return [m.querySelectorAll('.op').length, !!m.querySelector('.xfilter-input')]; })()"},
             {"eval": f"(async () => {{ {ESC}; await new Promise(r => setTimeout(r, 200)); return !document.getElementById('levain-modal'); }})()"},
         ])["values"]
     assert out[1] is False, out                               # the click landed on a button inside the tile
-    assert out[2] == [12, True, "12 metrics"], out            # the tile drew four of them: the view draws all twelve
-    assert out[3] == [2, "2 of 12"], out                      # avg strength, max strength
-    assert out[4] == ["strength", 2], out
-    assert out[5] is True, out
+    assert out[2] == [7, False], out                          # the tile drew four of them: the view draws all seven
+    assert out[3] is True, out
 
 
 @needs_browser

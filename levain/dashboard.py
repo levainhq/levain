@@ -2,7 +2,7 @@
 
 The v2 spine is *the substrate escapes the session*. Today a Levain partnership
 entity only exists INSIDE a live Claude Code / Codex session — to see your memory,
-your open loops, the health of your Hebbian graph, who the entity is and how it
+your open loops, the health of your memory store, who the entity is and how it
 thinks, you have to be mid-conversation. This module is the first move out:
 assemble the entity's WHOLE substrate — the anneal stores AND the install's
 seed/config surface — into a single ``SubstrateView`` that renders from outside
@@ -269,9 +269,13 @@ class SubstrateSource:
 @dataclass
 class Health:
     """The "is this substrate alive and well?" panel — the dashboard's reason to
-    exist. ``write_path_live`` is the headline: a Hebbian graph with zero links
-    after real wraps is the silent-0-links death the operator can't see from
-    inside a session."""
+    exist. ``status`` is the headline: ``live`` (the store reads and at least one wrap
+    committed) or ``no-wraps`` (it reads, nothing committed yet; ``unreadable`` is a
+    view with no Health at all, named by its consumers). The age of the last wrap is a
+    fact the renderers display, never a gate. ``write_path_live`` is the DEPRECATED
+    key, ``status == "live"``, kept one release so an older reader does not KeyError.
+    ``total_links`` and the figures beside it describe the historical graph (anneal
+    stopped forming links in 1.0.2); they are never health."""
 
     write_path_live: bool
     total_links: int
@@ -292,6 +296,14 @@ class Health:
     total_wraps: int
     last_wrap_at: str | None
     wrap_in_progress: bool  # a wrap is mid-flight → this snapshot may be inconsistent
+    status: str | None = None  # "live" | "no-wraps"; None derives it from write_path_live (an older caller)
+
+    def __post_init__(self) -> None:
+        # one truth, two spellings: a caller that built Health the old way (write_path_live only) gets the status it
+        # implies, and the deprecated key always follows the status, so to_dict() never contradicts itself
+        if self.status is None:
+            self.status = "live" if self.write_path_live else "no-wraps"
+        self.write_path_live = self.status == "live"
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -322,20 +334,53 @@ class GraphEdge:
 
 @dataclass
 class AssociationGraph:
-    """The Hebbian co-citation graph — the visual heart of the dashboard. Nodes
-    are episodes that have at least one association above threshold; edges carry
-    strength + co-citation count + limbic (affective) tagging."""
+    """The historical co-citation graph. Nodes are episodes that have at least one
+    association above threshold; edges carry strength + co-citation count + the
+    affective tag old rows carry. anneal >= 1.0.2 forms no new links:
+    ``formation_off_at_wrap`` is the wrap after which none were (None on a store that
+    still forms them, or on an anneal that cannot say)."""
 
     nodes: list[GraphNode]
     edges: list[GraphEdge]
     truncated: bool = False  # nodes capped for render
+    formation_off_at_wrap: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "nodes": [n.to_dict() for n in self.nodes],
             "edges": [e.to_dict() for e in self.edges],
             "truncated": self.truncated,
+            "formation_off_at_wrap": self.formation_off_at_wrap,
         }
+
+
+def graph_caption(g: "AssociationGraph") -> str:
+    """The one line the text renderers print for the graph: its size, or ``not formed``
+    for an empty one (a fresh store never grows a graph), then the formation note."""
+    if not g.nodes and not g.edges:
+        line = "not formed"
+    else:
+        line = f"{len(g.nodes)} nodes, {len(g.edges)} edges" + (" (capped for display)" if g.truncated else "")
+    if g.formation_off_at_wrap is not None:
+        line += f" · no new links since wrap {g.formation_off_at_wrap}"
+    return line
+
+
+def _formation_off_at_wrap(store: Any) -> int | None:
+    """``Store.association_formation()['off_at_wrap']`` when the installed anneal has the
+    accessor and says formation is off; None otherwise (anneal 1.0.1 has no accessor, so
+    nothing is claimed). Never raises: a missing accessor, an odd shape or a failing read all mean no caption."""
+    fn = getattr(store, "association_formation", None)
+    if not callable(fn):
+        return None
+    try:
+        got = fn()
+    except Exception:  # noqa: BLE001 — the caption is cosmetic; a failing accessor must not cost the graph it captions
+        return None
+    if not isinstance(got, dict) or got.get("mode") != "disabled":
+        return None
+    off = got.get("off_at_wrap")
+    return off if isinstance(off, int) and not isinstance(off, bool) else None
 
 
 @dataclass
@@ -1380,7 +1425,7 @@ _ASSOC_ID_CHUNK = 400
 def _build_graph(
     store: Any, *, min_strength: float, max_nodes: int, max_edges: int = 2000
 ) -> AssociationGraph:
-    """Assemble the Hebbian association graph from a (read-only) store.
+    """Assemble the historical association graph from a (read-only) store.
 
     Chunks the corpus id fan-in (a whole-corpus single query overflows SQLite's
     bound-variable cap), BOUNDS materialization at ``max_edges`` (a dense store
@@ -1459,7 +1504,10 @@ def _build_graph(
         for p in pairs
         if p.episode_a in connected and p.episode_b in connected
     ]
-    return AssociationGraph(nodes=nodes, edges=edges, truncated=truncated)
+    return AssociationGraph(
+        nodes=nodes, edges=edges, truncated=truncated,
+        formation_off_at_wrap=_formation_off_at_wrap(store),
+    )
 
 
 def _episode_tags(ep: Any) -> list[str]:
@@ -1694,7 +1742,8 @@ def build_substrate_view(
                 except (OSError, ValueError):
                     cont_chars = None  # ValueError covers UnicodeDecodeError
                 view.health = Health(
-                    write_path_live=bool(a and a.total_links > 0),
+                    write_path_live=status.total_wraps > 0,
+                    status="live" if status.total_wraps > 0 else "no-wraps",
                     total_links=a.total_links if a else 0,
                     avg_strength=a.avg_strength if a else 0.0,
                     max_strength=a.max_strength if a else 0.0,
@@ -1909,16 +1958,11 @@ def render_text(view: SubstrateView) -> str:
     h = view.health
     if h is not None:
         out.append("Health")
+        last_wrap = h.last_wrap_at.split("T")[0] if h.last_wrap_at else None
         if h.write_path_live:
-            out.append(
-                f"  Write-path:   LIVE — {h.total_links} links "
-                f"(avg {h.avg_strength:.2f}, max {h.max_strength:.2f})"
-            )
+            out.append(f"  Write-path:   LIVE — last wrap {last_wrap or 'recorded'}")
         else:
-            out.append(
-                "  Write-path:   DARK — no associations (a graduated wrap should "
-                "form links; 0 = the silent-0-links death)"
-            )
+            out.append("  Write-path:   no wraps yet")
         out.append(
             f"  Graduations:  {h.graduations_validated_total} validated / "
             f"{h.graduations_demoted_total} demoted"
@@ -1943,8 +1987,7 @@ def render_text(view: SubstrateView) -> str:
 
     if view.graph is not None:
         g = view.graph
-        suffix = " (capped for display)" if g.truncated else ""
-        out.append(f"Association graph: {len(g.nodes)} nodes, {len(g.edges)} edges{suffix}")
+        out.append(f"Association graph: {graph_caption(g)}")
         out.append("")
 
     if view.crystal_index:
@@ -2000,7 +2043,8 @@ def render_text(view: SubstrateView) -> str:
             stamp = w.wrapped_at.split("T")[0] if w.wrapped_at else ""
             out.append(
                 f"  - {stamp}: {w.graduations_validated}↑/{w.graduations_demoted}↓ grad · "
-                f"+{w.associations_formed} links · {w.continuity_chars:,} chars"
+                + (f"+{w.associations_formed} links · " if w.associations_formed else "")
+                + f"{w.continuity_chars:,} chars"
             )
         out.append("")
 
@@ -2036,15 +2080,9 @@ def render_summary(view: SubstrateView) -> str:
     h = view.health
     if h is not None:
         if h.write_path_live:
-            lines.append(
-                f"Health: write-path LIVE — {h.total_links} Hebbian links "
-                f"(avg {h.avg_strength:.2f})"
-            )
+            lines.append("Health: write-path LIVE")
         else:
-            lines.append(
-                "Health: write-path DARK — 0 associations "
-                "(a graduated wrap should form links; 0 = the silent-0-links death)"
-            )
+            lines.append("Health: no wraps yet")
         last = h.last_wrap_at.split("T")[0] if h.last_wrap_at else "never"
         lines.append(
             f"  {h.total_episodes:,} episodes ({h.episodes_since_wrap} since wrap) · "
