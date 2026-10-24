@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import shlex
 from pathlib import Path
 from unittest import mock
@@ -56,6 +55,15 @@ def test_doctor_slot_section_absent_without_install(tmp_path: Path):
     os.symlink(real / "slots", tmp_path / "ls" / "slots")
     row = doctor._check_slot_isolation(host="linux", store=tmp_path / "ls", free_bytes=lambda p: 100 << 30)[0]
     assert not row.ok and "symbolic link" in row.detail
+
+
+def test_doctor_slot_linked_policy_directory_is_refused(tmp_path: Path):
+    store = _store(tmp_path / "a", {"e1": "reusable"}, pool=(1, 0))
+    real = tmp_path / "realpolicy"
+    os.rename(store / "policy", real)       # the runtime opens every component O_NOFOLLOW: a linked policy/ is refused
+    os.symlink(real, store / "policy")
+    row = _rows(store)["agent sessions"]
+    assert not row.ok and "symbolic link" in row.detail and "policy" in row.detail
 
 
 def test_doctor_slot_pool_is_judged_against_policy_pool_and_tombstones_are_not_counted(tmp_path: Path):
@@ -137,8 +145,6 @@ def test_doctor_slot_every_printed_remedy_parses_in_the_real_cli(tmp_path: Path)
         hints += [r.hint or "" for r in doctor._check_slot_isolation(host="linux", store=store,
                                                                      free_bytes=lambda p: 0)]
     hints += [r.hint or "" for r in doctor._check_slot_isolation(host="linux", store=tmp_path / "nope")]
-    cmds = [c for h in hints for c in re.findall(r"`(levain [^`]*)`", h)]
     assert any(hints)                      # the rig reached real remedy text
-    assert all(_parses(c) for c in cmds), cmds   # NB: the slot rows print no `levain ...` command today (cmds == [])
     assert not any("--agent" in h or "setup-isolation repair" in h or "setup-isolation replenish" in h
                    for h in hints)

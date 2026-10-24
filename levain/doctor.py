@@ -363,10 +363,11 @@ def _slot_why(exc: BaseException) -> str:
 
 
 def _read_slot_dirs(slots: Path) -> tuple[dict[str, tuple[str, str]], list[str]]:
-    """(tag -> (kind, why), ignored names): kind is the state of an in-service slot, ``retired`` (a tombstone),
-    ``nostate`` (no state file: the runtime reads an absent state as not reusable, ``read_view``) or ``bad`` (not
-    usable, ``why`` says why). ``ignored`` are entries the runtime does not count as slots (non-canonical names, links). Names and links are judged as the runtime
-    helper judges them: a canonical tag naming a real directory, a state file that is a regular file naming this slot."""
+    """(tag -> (kind, why), ignored names): kind is the state of an in-service slot, ``retired`` (a tombstone) or
+    ``bad`` (not usable, ``why`` says why; an absent state file is ``bad`` with "state missing", as the runtime
+    reads an absent state as not reusable). ``ignored`` are entries the runtime does not count as slots
+    (non-canonical names, links). Names and links are judged as the runtime helper judges them: a canonical tag
+    naming a real directory, a state file that is a regular file naming this slot."""
     from levain.slot import Refused
     from levain.slot import records as R
     from levain.slot.ids import SlotId
@@ -423,7 +424,7 @@ def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
     try:
         if store is None or not store.is_dir():
             return [CheckResult("agent sessions", True, "not installed", neutral=True)]
-        for part in (store, store / "slots"):      # the runtime opens these O_NOFOLLOW: a link is not the store
+        for part in (store, store / "slots", store / "policy"):   # the runtime opens each O_NOFOLLOW: a link is not it
             try:
                 is_link = stat.S_ISLNK(os.lstat(part).st_mode)
             except FileNotFoundError:
