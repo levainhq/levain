@@ -174,9 +174,10 @@
     if (!isObj(o) || !Number.isInteger(o.needs_open) || o.needs_open <= 0) return null;
     return { n: o.needs_open, first: capStr(o.needs_first), card: typeof o.needs_first_card === "string" && o.needs_first_card.length <= NEED_CAP ? o.needs_first_card : "", what: capStr(o.needs_first_what) };
   }
-  // ring radius rr around (cx, cy), the badge on the ring at angle ang (radians). Returns {inner, outer}: inner goes inside the node (or hub) group;
-  // outer, set only when the badge is a button, is a sibling group at the same coordinates (no interactive role nested in the node's role=button),
-  // padded by a transparent hit rect to 44 CSS px at the graph's scale.
+  // ring radius rr around (cx, cy), the badge on the ring at angle ang (radians); owner is the typed key "hub" or "node:<id>". Returns {inner, outer, under}:
+  // inner goes inside the node (or hub) group; outer, set only when the badge is a button, is a sibling group at the same coordinates (no interactive
+  // role nested in the node's role=button) drawn ABOVE every node, holding the pill; under is the transparent 44 CSS px tap pad (at the graph's scale),
+  // drawn BENEATH every node so a tap on a node's own shape reaches the node (message the seat) and only the margin around the pill reaches the card.
   function needMark(nd, cx, cy, rr, ang, opts, label, owner, scale) {
     const g = sv("g", { "data-needs": String(nd.n) }, "tv-need");
     g.appendChild(sv("circle", { cx: num(cx), cy: num(cy), r: num(rr) }, "tv-needring"));
@@ -184,10 +185,6 @@
     const b = sv("g", { "data-needbadge": nd.card, "data-needfirst": nd.first, "data-needfor": owner }, "tv-needbadge");
     const tip = nd.what || (nd.n + " decision" + (nd.n === 1 ? "" : "s") + " waiting on you");
     const openable = !!nd.card && !!opts && typeof opts.openCard === "function";
-    if (openable) {
-      const side = Math.max(44, Math.ceil(44 / (scale > 0 ? Math.min(1, scale) : 1)));
-      b.appendChild(sv("rect", { x: num(bx - side / 2), y: num(by - side / 2), width: side, height: side }, "tv-needhit"));
-    }
     b.appendChild(sv("rect", { x: num(bx - w / 2), y: num(by - 10), width: w, height: 20, rx: 10 }, "tv-needpill"));
     b.appendChild(sv("text", { x: num(bx), y: num(by + 5), "text-anchor": "middle" }, "tv-needtxt", txt));
     b.appendChild(sv("title", null, null, tip));
@@ -201,10 +198,13 @@
       b.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); go(ev); } });
       const out = sv("g", null, "tv-needout");
       out.appendChild(b);
-      return { inner: g, outer: out };
+      const side = Math.max(44, Math.ceil(44 / (scale > 0 ? Math.min(1, scale) : 1)));
+      const pad = sv("rect", { x: num(bx - side / 2), y: num(by - side / 2), width: side, height: side, "data-needhitfor": owner, "aria-hidden": "true" }, "tv-needhit");
+      pad.addEventListener("click", go);
+      return { inner: g, outer: out, under: pad };
     }
     g.appendChild(b);
-    return { inner: g, outer: null };
+    return { inner: g, outer: null, under: null };
   }
 
   function dot(state) { const d = el("i", "tv-dot " + state); d.setAttribute("aria-hidden", "true"); return d; }
@@ -944,6 +944,8 @@
     // the hub: the install, "N sessions · M running"
     const running = nodes.filter((n) => n.state === "running").length, h = L.hub;
     const hubLabel = isObj(v.hub) && typeof v.hub.label === "string" ? v.hub.label : "";
+    const under = sv("g", null, "tv-needunder"), outers = [];            // the badges' tap pads, beneath the hub and every node; their pills, above them all
+    svg.appendChild(under);
     const hg = sv("g", { "data-hub": isObj(v.hub) && typeof v.hub.id === "string" ? v.hub.id : "" }, "tv-ghub");
     hg.appendChild(sv("circle", { cx: num(h.x), cy: num(h.y), r: h.r + 8 }, "tv-hubhalo"));
     hg.appendChild(sv("circle", { cx: num(h.x), cy: num(h.y), r: h.r }, "tv-hubbody"));
@@ -956,7 +958,8 @@
     const hubMark = hubNeed ? needMark(hubNeed, h.x, h.y, h.r + 14, Math.PI / 4, opts, hubLabel || "the desk", "hub", scale) : null;
     if (hubMark) hg.appendChild(hubMark.inner);
     svg.appendChild(hg);
-    if (hubMark && hubMark.outer) svg.appendChild(hubMark.outer);
+    if (hubMark && hubMark.under) under.appendChild(hubMark.under);
+    if (hubMark && hubMark.outer) outers.push(hubMark.outer);
     // the groups: "N agents · M running"
     for (const [k, gp] of L.gpos) {
       const mem = nodes.filter((n) => L.gkey(n) === k);
@@ -1016,11 +1019,13 @@
         g.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); go(); } });
       }
       const need = needsOf(n);
-      const mark = need ? needMark(need, P.x, P.y, r + 8, dir === 1 ? Math.PI * 0.75 : Math.PI * 0.25, opts, n.label, n.id, scale) : null;
+      const mark = need ? needMark(need, P.x, P.y, r + 8, dir === 1 ? Math.PI * 0.75 : Math.PI * 0.25, opts, n.label, "node:" + n.id, scale) : null;
       if (mark) g.appendChild(mark.inner);
       svg.appendChild(g);
-      if (mark && mark.outer) svg.appendChild(mark.outer);
+      if (mark && mark.under) under.appendChild(mark.under);
+      if (mark && mark.outer) outers.push(mark.outer);
     }
+    for (const o of outers) svg.appendChild(o);
     for (const g of chips) svg.appendChild(g);
     return { svg, tickers };
   }
@@ -1144,7 +1149,7 @@
   }
 
   let pinned = null;                                                      // the fallback pin (no agent page in the page): {id, x, y, dx, dy} in stage px
-  let kbFocus = null;                                                     // the control the keyboard focus sits on ("n:<node id>" or "b:<owner id>" for a need badge), kept across a redraw
+  let kbFocus = null;                                                     // the control the keyboard focus sits on ("n:<node id>", or "b:hub" / "b:node:<node id>" for a need badge (the owner is typed, so a node whose id is "hub" is not the desk)), kept across a redraw
   function agentsLens(v, opts) {
     release();
     const wrap = el("div", "tv-agents");
@@ -1160,7 +1165,7 @@
     wrap.appendChild(stage);
     let LW = 0, svgNode = null, scale = 1, built = false;
     // keyboard focus follows its control across every rebuild of the graph (the card's own redraw, and a resize that redraws it after): the key is
-    // "n:<node id>" or "b:<owner id>" for a need badge; pending holds the key until a rebuilt element takes the focus
+    // "n:<node id>", or "b:hub" / "b:node:<node id>" for a need badge (the owner is typed, so a node whose id is "hub" is not the desk); pending holds the key until a rebuilt element takes the focus
     let pending = kbFocus && (kbFocus.startsWith("b:") || arr(v.nodes).some((n) => n.id === kbFocus.slice(2))) ? kbFocus : null;
     const focusKey = (t) => { const bd = t && t.closest ? t.closest("[data-needbadge][tabindex]") : null, g = t && t.closest ? t.closest("[data-node]") : null;
                               return bd ? "b:" + bd.getAttribute("data-needfor") : g ? "n:" + g.dataset.node : null; };
@@ -1173,7 +1178,9 @@
         const isBadge = pending.startsWith("b:"), key = pending.slice(2);
         const g = svgNode && (isBadge ? Array.from(svgNode.querySelectorAll("[data-needbadge][tabindex]")).find((x) => x.getAttribute("data-needfor") === key)
                                       : Array.from(svgNode.querySelectorAll("[data-node]")).find((x) => x.dataset.node === key));
-        if (g && g.focus) { g.focus({ preventScroll: true }); pending = null; }
+        if (g && g.focus) g.focus({ preventScroll: true });
+        else if (kbFocus === pending) kbFocus = null;          // its control is gone from this build: forget it, so a later rebuild that brings it back does not take the focus
+        pending = null;
       });
     };
     let reanchorPin = null;                                               // set once the card helpers exist: re-seats a pinned card on its node after every layout
