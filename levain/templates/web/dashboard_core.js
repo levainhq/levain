@@ -5585,10 +5585,11 @@
                                                    + (older > 0 ? " · " + older + " refused call" + (older === 1 ? "" : "s") + " older than these" : "")));
       row.appendChild(box);
     }
-    // the passkey can revoke here when the grants' sign listing names this grant (its instance) and a passkey for it,
-    // and this page is the one the ceremony is pinned to; anywhere else the button copies the line, as it always did
-    const signed = signList && Array.isArray(signList.grants) && !signElsewhere(signList)
-      ? signList.grants.find((x) => x && x.id === g.id && typeof x.instance === "string"
+    // the passkey can revoke here when the grants' sign listing names THIS card's grant (its id AND the instance the card
+    // shows: a grant renewed or re-made under the id, or one in another cockpit, is a different instance) and a passkey
+    // for it, and this page is the one the ceremony is pinned to; anywhere else the button copies the line, as it always did
+    const signed = signList && Array.isArray(signList.grants) && !signElsewhere(signList) && typeof g.instance === "string"
+      ? signList.grants.find((x) => x && x.id === g.id && x.instance === g.instance
                                   && Array.isArray(x.signers) && x.signers.length) : null;
     if (signed) {
       const line = el("div", "consent-cmd grant-sign");
@@ -5650,11 +5651,12 @@
     signBusy++;
     btn.disabled = true;
     const base = "/cockpit/grant/" + encodeURIComponent(g.id) + "/";
+    const slot = host.closest(".grant-slot");     // at the click: a redraw during the ceremony detaches this card
     let sent = false, revoked = false;
     signWho({ signers: signed.signers, origin: listing.origin }, host, say).then((who) => {
       if (!who) { say("nothing was revoked"); return; }
       say("asking for the revoke to sign…");
-      return signCall(base + "revoke-challenge", { signer_fp: who.fp, instance: signed.instance }).then((c) => {
+      return signCall(base + "revoke-challenge", { signer_fp: who.fp, instance: g.instance }).then((c) => {
         if (!c.ok) { say("not revoked: " + signWhy(c), "bad"); return; }
         let link = null;
         try { link = JSON.parse(c.body.line); } catch (e) { link = null; }
@@ -5702,8 +5704,8 @@
       if (!sent && !revoked) return;
       // the grants again: a revoked grant leaves the slot, and the slot keeps what the revoke said
       grantRead = null;
-      const slot = host.closest(".grant-slot");
-      if (slot) setTimeout(() => grantFill(slot), 1500);
+      const live = slot && slot.isConnected ? slot : document.querySelector(".grant-slot");
+      if (live) setTimeout(() => grantFill(live), 1500);
     });
   }
   function grantSlot() {
@@ -5727,7 +5729,10 @@
       }
       const head = el("div", "ext-grouphead", "standing grants");
       const inert = typeof b.inert_note === "string" ? b.inert_note : "";
+      // why no passkey can revoke on this page (a ported cockpit, a localhost one), in the server's words
+      const why = signList && typeof signList.grants_note === "string" && signList.grants_note ? signList.grants_note : "";
       slot.replaceChildren(head, ...said, ...(note ? [el("div", "consent-note ext-meta", note)] : []),
+                           ...(why ? [el("div", "consent-note ext-meta grant-why", why)] : []),
                            ...rows.map((g) => grantCard(g, inert, signList)));
     }).catch(() => {});
   }

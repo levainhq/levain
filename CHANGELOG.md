@@ -38,6 +38,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - The authority log takes a passkey's revoke only from the passkey's own https name with no port. A cockpit served
   on a port, such as `https://<name>:8443`, lists no passkey that can revoke there, says why, and keeps the copy
   button.
+- One revoke waits per grant on each page server: a second challenge for the same grant (another tab) replaces the
+  first, whose passkey answer is then refused, and you ask again.
 - A metered call is priced by the request's `model` alone. A fallback list (`models`) or a `route` in the body is not
   read, and neither is the model the provider's response says ran. No route in this release reaches a vendor that
   honours them; the vendor routes that do will refuse both and settle from the model that ran.
