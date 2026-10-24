@@ -166,7 +166,7 @@
   // The decision mark (Phill 10-23): the desk (the hub) or a seat node that carries needs_open > 0 is drawn with a red ring and a "!" badge holding
   // the count. The keys are optional: absent, zero, non-integer or negative draws nothing and is never an error. needs_first_card (the card id the
   // cockpit resolves, never derived from needs_first) makes the badge a button that opens that card; without it the badge is display-only.
-  // needs_first_what and needs_first are capped at 120 characters for the title and a data attribute; the card id is never cut: one that is not a
+  // needs_first_what and needs_first are clipped at 120 code points (never refused) for the title and a data attribute; the card id is never cut: one that is not a
   // non-empty string or is longer than 120 is refused (display-only), never rewritten.
   const NEED_CAP = 120;
   // what each marked owner ("hub", "node:<id>") last showed on a live lens: a mark plays its motion when it arrives or its count changes (a seat's: rises)
@@ -174,10 +174,10 @@
   // a seat with no id of its own (not a non-empty string) has no owner key to be remembered by: it gets no mark
   const nodeNeed = (n) => (isObj(n) && typeof n.id === "string" && n.id ? needsOf(n) : null);
   const needsSeenNow = (v) => { const m = new Map(); const h = needsOf(v.hub); if (h) m.set("hub", h.n); for (const n of arr(v.nodes)) { const k = nodeNeed(n); if (k) m.set("node:" + n.id, k.n); } return m; };
-  const capStr = (x) => (typeof x === "string" ? x.slice(0, NEED_CAP) : "");
+  const capStr = (x) => (typeof x === "string" ? Array.from(x).slice(0, NEED_CAP).join("") : "");
   function needsOf(o) {
     if (!isObj(o) || !Number.isInteger(o.needs_open) || o.needs_open <= 0) return null;
-    return { n: o.needs_open, first: capStr(o.needs_first), card: typeof o.needs_first_card === "string" && o.needs_first_card.length <= NEED_CAP ? o.needs_first_card : "", what: capStr(o.needs_first_what) };
+    return { n: o.needs_open, first: capStr(o.needs_first), card: typeof o.needs_first_card === "string" && Array.from(o.needs_first_card).length <= NEED_CAP ? o.needs_first_card : "", what: capStr(o.needs_first_what) };
   }
   // ring radius rr around (cx, cy), the badge on the ring at angle ang (radians); owner is the typed key "hub" or "node:<id>". Returns {inner, outer, under}:
   // inner goes inside the node (or hub) group; outer, set only when the badge is a button, is a sibling group at the same coordinates (no interactive

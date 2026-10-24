@@ -3023,12 +3023,14 @@ def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
 
     def needs(where: str, o: dict[str, Any]) -> None:
         """The decision mark's optional keys (all may be absent or null): a count, the first need's id and card id and first sentence, each a
-        display-safe string within the page's cap (``TOPOLOGY_NEEDS_MAX``)."""
+        display-safe string; the card id also stays within the page's cap (``TOPOLOGY_NEEDS_MAX``, code points)."""
         count(f"{where}.needs_open", o.get("needs_open"))
         for k in ("needs_first", "needs_first_card", "needs_first_what"):
             x = o.get(k)
             text(f"{where}.{k}", x, null=True)
-            if x is not None and len(x) > TOPOLOGY_NEEDS_MAX:
+            # only the card id has a hard cap (the page never cuts or rewrites it); the two text strings are clipped by the page, so an
+            # over-long one must never fail the whole topology value
+            if k == "needs_first_card" and x is not None and len(x) > TOPOLOGY_NEEDS_MAX:
                 raise _bad(spec, f"{where}.{k}", f"is longer than {TOPOLOGY_NEEDS_MAX} characters")
 
     needs("value.hub", hub)
