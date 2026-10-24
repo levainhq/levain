@@ -585,6 +585,24 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _row(rid: str, request: SignRequest, signers: "list[str]") -> dict[str, Any]:
+    """One listing row (:meth:`Signer.page`, :meth:`Signer.row`): a refused request carries ``refused``, its
+    ``sha256`` and none of its text."""
+    if request.refused is not None:
+        return {"id": rid, "namespace": request.namespace, "refused": request.refused, "sha256": request.sha256,
+                "signers": []}
+    row: dict[str, Any] = {"id": rid, "title": request.title, "message": request.message,
+                           "namespace": request.namespace, "requester": request.requester,
+                           "expires_at": request.expires_at.isoformat(), "sha256": request.sha256, "signers": signers}
+    if request.options:     # the exact line each option's signature appends, so the page shows what is signed
+        row["options"] = [{"key": k, "text": t, "line": choice_line(k, t)} for k, t in request.options]
+        if request.recommended is not None:
+            row["recommended"] = request.recommended      # marked on the page, never selected there
+        if request.write_in:   # the line a write-in's signature appends, the words in place of the empty end
+            row["write_in"] = {"key": WRITE_IN_KEY, "line": choice_line(WRITE_IN_KEY, ""), "max": _TEXT_MAX}
+    return row
+
+
 class Signer:
     """The phone port's sign side over the queue at ``queue_dir``: lists, challenges, verifies and records. ``keys()``
     returns the active passkey keys that may sign (fingerprint -> :class:`levain.authority.AuthorityKey`), or raises
@@ -668,7 +686,8 @@ class Signer:
         ``overflow`` counts the request files not read (at least that many when the directory holds more than one
         listing looks at). A refused one carries ``refused``, its ``sha256`` and none of its text: what cannot be
         shown truthfully is not shown, and a file that is not a sign request is listed as refused, never skipped.
-        A challenge whose request is no longer listed (gone, expired, answered or past the cap) is dropped."""
+        A challenge whose request this listing read and found no longer listable (gone, expired, answered) is
+        dropped; one past the cap or the directory scan was never read, so its challenge is kept."""
         if not self.namespaces:
             return {"rows": [], "overflow": 0}
         names: list[str] = []
@@ -703,25 +722,32 @@ class Signer:
                              "sha256": _stat_version(sign_dir(self.queue_dir) / f"{rid}.json"),
                              "refused": f"not a sign request: it cannot be read ({type(exc).__name__})"})
                 continue
-            if request.refused is not None:
-                rows.append({"id": rid, "namespace": request.namespace, "refused": request.refused,
-                             "sha256": request.sha256, "signers": []})
-                continue
-            row = {"id": rid, "title": request.title, "message": request.message, "namespace": request.namespace,
-                   "requester": request.requester, "expires_at": request.expires_at.isoformat(),
-                   "sha256": request.sha256, "signers": signers}
-            if request.options:     # the exact line each option's signature appends, so the page shows what is signed
-                row["options"] = [{"key": k, "text": t, "line": choice_line(k, t)} for k, t in request.options]
-                if request.recommended is not None:
-                    row["recommended"] = request.recommended      # marked on the page, never selected there
-                if request.write_in:   # the line a write-in's signature appends, the words in place of the empty end
-                    row["write_in"] = {"key": WRITE_IN_KEY, "line": choice_line(WRITE_IN_KEY, ""), "max": _TEXT_MAX}
-            rows.append(row)
+            rows.append(_row(rid, request, signers))
         listed = {r["id"] for r in rows if not r.get("refused")}
+        # a challenge is dropped only for a request this listing READ and did not list: one past the cap (or past the
+        # directory scan) was never looked at, so the listing says nothing about it
+        looked, scanned = set(names[:read]), set(names)
         with self._lock:
-            for rid in [rid for rid in self._challenged if rid not in listed]:
+            for rid in [rid for rid in self._challenged
+                        if rid not in listed and (rid in looked or (rid not in scanned and not more))]:
                 del self._challenged[rid]
         return {"rows": rows, "overflow": len(names) - read + (1 if more else 0)}
+
+    def row(self, request_id: str, signers: "list[str]") -> "dict[str, Any] | None":
+        """The one listing row for ``request_id`` (as :meth:`page` draws it, a refused request included), or None when
+        it is not an open, unexpired request in a namespace this port signs. Reads that one file, whatever the
+        listing's cap, so a page never decides "no longer open" from a listing that stopped short of it."""
+        if not self.namespaces or not request_id_ok(request_id):
+            return None
+        try:
+            if state_of(self.queue_dir, request_id) != "open":
+                return None
+            request = read_request(self.queue_dir, request_id)
+        except SignRefused:
+            return None
+        if not self._ours(request) or (request.expires_at is not None and request.expires_at <= _now()):
+            return None
+        return _row(request_id, request, signers)
 
     def challenge(self, request_id: str, req: Any) -> dict[str, Any]:
         """``{signer_fp, request_sha256}`` (and for a choice request ``choice``, the option's key, or

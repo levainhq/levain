@@ -40,7 +40,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   other answer. A verb declared with `ActionVerb(sign=True)` is sent from its compose box only after your passkey signs
   its params: the page asks `POST /cockpit/sign/compose` (the `compose_signer` files the request; its `ValueError` is
   shown to you), runs the ceremony, then posts the verb with `sign_request`, which the verb's own effect must verify.
-  Without a `compose_signer` a signed verb is not sent at all. A request through an `extra_hosts` name is treated as
+  Each draft carries one id (`client_txn`) for its whole life: the compose route names the same request for it while
+  that request is open, and the send is keyed by it, so a lost reply, a retry or a reload files one request and sends
+  once. The kernel refuses a signed verb that names no sign request on every route before its handler runs, and
+  `ActionVerb(sign=True, job=True)` is refused. `GET /cockpit/sign/<id>.json` reads one request whatever the listing's
+  cap. Without a `compose_signer` a signed verb is not sent at all. A request through an `extra_hosts` name is treated as
   off the box: the cockpit's reads need the token there too. `levain.consent.sign.passkey_key_source` is the passkey
   key source the phone page uses, for an embedder building the Signer.
 - **A passkey verifier can be pinned to an https page with a port.** `levain.consent.passkey` accepts an explicit

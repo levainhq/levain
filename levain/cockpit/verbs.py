@@ -75,8 +75,9 @@ _ENVELOPE = frozenset({"verb", "panel_id", "row_id", "row_version", "panel_versi
                        "intent", "dry_run", "confirm", "idempotency_key", "tier_seen", "gesture_seen"})
 _INTENTS = ("reported", "sign")
 # The one param a signed verb (VerbSpec.sign, DESIGN_SIGN D5) takes beside its fields: the id of the sign request the
-# operator's passkey signed for these params. The kernel admits it and checks nothing else about it: the verb's own
-# handler or effect verifies the signature over the params, so the write token alone never sends a signed verb.
+# operator's passkey signed for these params. The kernel requires it to be a sign request id (_require_sign_request) and
+# checks nothing else about it: the verb's own handler or effect verifies the signature over the params, so the write
+# token alone never sends a signed verb.
 SIGN_PARAM = "sign_request"
 GESTURES = ("direct", "direct-reported", "sign", "refused", "laptop-only")
 
@@ -84,6 +85,16 @@ GESTURES = ("direct", "direct-reported", "sign", "refused", "laptop-only")
 def _param_names(verb: "VerbSpec") -> "set[str]":
     """The params a verb takes: its fields, and on a signed verb the sign request it names (SIGN_PARAM)."""
     return set(verb.fields or ()) | ({SIGN_PARAM} if verb.sign else set())
+
+
+def _require_sign_request(verb: "VerbSpec", params: dict[str, Any]) -> None:
+    """A signed verb fails closed in the kernel: params without a sign request id never reach its handler or effect.
+    The door still verifies the signature; this only stops a send that names no request at all."""
+    from levain.sign_request_id import request_id_ok
+
+    if verb.sign and not request_id_ok(params.get(SIGN_PARAM)):
+        raise _refuse("sign_required", 403, f"{verb.name!r} is sent only after the operator's passkey signs it: "
+                      f"{SIGN_PARAM!r} must name the sign request it signed")
 
 
 def tier_max(*tiers: Tier) -> Tier:
@@ -529,6 +540,12 @@ class VerbRegistry:
             raise ValueError(f"verb {spec.name!r} is already registered")
         if getattr(spec, "route", "cockpit") != "cockpit":
             raise ValueError(f"verb {spec.name!r}: only route 'cockpit' verbs register here")
+        if type(spec.sign) is not bool:
+            raise ValueError(f"verb {spec.name!r}: sign must be True or False, got {spec.sign!r}")
+        if spec.sign and spec.job:
+            # a job's propose is posted by the page's job path, which no passkey ceremony precedes
+            raise ValueError(f"verb {spec.name!r} cannot be both sign and job: a signed verb is sent only after its "
+                             "ceremony")
         self._specs[spec.name] = spec
 
     def register_downstream(self, name: str, spec: ActionVerb | VerbSpec) -> None:
@@ -829,6 +846,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
         bad = sorted(set(params) - _param_names(verb)) if verb.fields is not None else []
         if bad:
             raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
+        _require_sign_request(verb, params)
         tier = verb.tier(params, None, auth.labels.label(None), today, policy=auth.policy)    # no row, no label
         _refuse_unless_c1(verb, tier, credential, install_class)
         return _fire_downstream(registry, verb, scope, params, req, job_runtime)
@@ -854,6 +872,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     bad = sorted(set(params) - _param_names(verb)) if verb.fields is not None else []
     if bad:
         raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
+    _require_sign_request(verb, params)
     if "dry_run" in req and not isinstance(req["dry_run"], bool):
         raise _refuse("bad_request", 400, "'dry_run' must be true or false")
     intent = req.get("intent")
@@ -1140,6 +1159,7 @@ def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope"
     bad = sorted(set(params) - set(verb.fields or ()))
     if bad:
         raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
+    _require_sign_request(verb, params)     # /edit takes no sign request: a signed verb never fires here
     if (verb.tier_fn is None or _is_const(verb)) and (broker is None or not broker.enabled):
         # a verb whose tier does not depend on the row: refuse a T2/T3 before reading anything
         _refuse_unless_c1(verb, verb.tier(params, None, authority.labels.label(None), today, policy=authority.policy),
