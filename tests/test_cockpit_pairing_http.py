@@ -253,9 +253,9 @@ def test_ru5_the_cockpit_read_path_with_its_inner_catch_answers_503_not_500(src,
 
 def test_ru1_where_paired_tokens_cannot_exist_a_junk_header_is_a_plain_miss(src, tmp_path) -> None:
     """RU-1: a read-only source (no ledger_root, no broker): an off-box read with a junk header is served token-free
-    (spore-220) as today, never a 503. A disabled broker (no install class) answers a header on a route that needs a
-    credential with the 503 (L3 r2): its journal may hold paired devices, and a 403 would make the page drop a good
-    token."""
+    (spore-220) as today, never a 503. A disabled broker (no install class) over a journal with no paired device keeps
+    a wrong token's definite 403; over one that holds a paired device, that device's token gets the 503 (L3 r2), since
+    a 403 would make the page drop a good token."""
     ro = SubstrateSource(anneal=src.anneal, write_scope=None, context_json=src.context_json)
     with _serve(ro, surface_tokens=None, install_class=None) as (port, httpd):
         httpd.is_loopback_bind = False
@@ -265,10 +265,16 @@ def test_ru1_where_paired_tokens_cannot_exist_a_junk_header_is_a_plain_miss(src,
         st, out, _ = _call(port, "POST", "/cockpit/pair/claim", {"code": "x"})
         assert st == 404           # RP-3
     with _serve(src, install_class=None) as (port, httpd):
-        st, out, hdrs = _call(port, "POST", "/cockpit/verb", {"verb": "x"}, token=JUNK)
+        st, out, _ = _call(port, "POST", "/cockpit/verb", {"verb": "x"}, token=JUNK)
+        assert (st, out["error"]) == (403, "credential_required"), out
+        assert httpd.broker.state is Lifecycle.INSTALL_DISABLED
+    with _serve(src) as (port, httpd):
+        _d, tok = _pair(port)
+    with _serve(src, install_class=None) as (port, httpd):
+        st, out, _ = _call(port, "POST", "/cockpit/verb", {"verb": "x"}, token=tok)
+        assert httpd.broker.state is Lifecycle.INSTALL_DISABLED
         assert (st, out["error"]) == (503, "broker_unavailable"), out
         assert "token" not in json.dumps(out).lower()
-        assert httpd.broker.state is Lifecycle.INSTALL_DISABLED
 
 
 # --- RT-3 ----------------------------------------------------------------------------------------------------------

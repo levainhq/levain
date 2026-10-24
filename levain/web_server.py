@@ -182,6 +182,30 @@ _PAIR_TOKEN_LEN = (16, 128)       # a header outside this length (or the header-
 _UNSET: Any = object()            # the per-request credential cache's empty mark (RS-1)
 
 
+def _journal_holds_paired_devices(data_root: Path) -> bool:
+    """Whether the cockpit journal under ``data_root`` holds any unrevoked paired device, read through a read-only
+    connection that never creates the file (the broker is disabled, so nothing else opens it). Unreadable is True:
+    an answer the page may drop a good token on is never given on a guess."""
+    import sqlite3
+
+    from levain.cockpit.firejournal import DB_NAME
+
+    path = Path(data_root) / DB_NAME
+    if not path.exists():
+        return False
+    try:
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=0.2)
+        try:
+            row = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'paired_devices'").fetchone()
+            if row is None:
+                return False
+            return conn.execute("SELECT 1 FROM paired_devices WHERE revoked_at IS NULL LIMIT 1").fetchone() is not None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return True
+
+
 class _CredentialUnavailable(Exception):
     """A token header was supplied, the surface pass missed it, and the broker that could verify it as a paired
     device's is in a TRANSIENT state (STANDBY, ACTIVATING, DRAINING) after the bounded wait, or the paired-lookup
@@ -1050,9 +1074,10 @@ class _Handler(GuardedHandler):
     def _pairing_db(self) -> Any:
         """This server's journal for pairing, the broker started asynchronously and waited on for at most
         ``_PAIR_WAIT_S`` (RU-4). None where paired tokens cannot exist (no broker: a read-only source with no
-        ``ledger_root``), RU-1. Raises :class:`_CredentialUnavailable` for a transient state and for
-        ``INSTALL_DISABLED`` (L3 r2: a journal that holds paired devices can be restarted without an install class, and
-        a definite miss there would make the page drop a good token)."""
+        ``ledger_root``; ``INSTALL_DISABLED`` over a journal with no unrevoked paired device), RU-1. Raises
+        :class:`_CredentialUnavailable` for a transient state, and for ``INSTALL_DISABLED`` over a journal that does hold
+        one (L3 r2: such a journal can be restarted without an install class, and a definite miss would make the page
+        drop a good token)."""
         broker = self.server.broker
         if broker is None:
             return None
@@ -1061,6 +1086,8 @@ class _Handler(GuardedHandler):
         except Exception:  # noqa: BLE001 - G5: a starter thread that cannot start is the transient 503 (RT-1)
             raise _CredentialUnavailable("starter") from None
         state = broker.wait_settled(_PAIR_WAIT_S)
+        if state is Lifecycle.INSTALL_DISABLED and not _journal_holds_paired_devices(broker.data_root):
+            return None         # no paired token can be valid here: a wrong token stays the definite 403
         db = broker.active_db() if state is Lifecycle.ACTIVE else None
         if db is None:
             # STANDBY (another process owns the ledger), ACTIVATING past the wait, DRAINING; CLOSED (the server is
