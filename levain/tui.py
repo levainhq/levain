@@ -615,8 +615,9 @@ def _render_health(view: SubstrateView) -> list[str]:
         lines.append(f"Write-path:  LIVE — last wrap {last}")
     else:
         lines.append("Write-path:  no wraps yet")
-    if health_oracle_line(h):
-        lines.append(f"Substrate:   {health_oracle_line(h)}")
+    oracle = health_oracle_line(h)
+    if oracle:
+        lines.append(f"Substrate:   {oracle}")
     lines.append(
         f"Graduations: {h.graduations_validated_total} validated / "
         f"{h.graduations_demoted_total} demoted"

@@ -1024,11 +1024,10 @@ def test_render_health_names_the_substrate_oracles_and_a_divergence():
     v.health.save_age_hours = 2.0
     v.health.projection_converged = True
     v.health.audit_backlog = 0
-    v.health.audit_prune_behind = False
     panel = next(p for p in v.layout() if p["kind"] == "health")
     text = "\n".join(tui.render_panel_lines(v, panel))
-    assert "Substrate:   last save 2h ago · projection converged · audit complete" in text
+    assert "Substrate:   last save 2h ago · projection converged · no audit write failures recorded" in text
     v.health.projection_converged = False
     v.health.audit_backlog = 2
     text = "\n".join(tui.render_panel_lines(v, panel))
-    assert "PROJECTION DIVERGED" in text and "AUDIT LOST 2 entries" in text
+    assert "PROJECTION DIVERGED" in text and "2 audit writes failed" in text

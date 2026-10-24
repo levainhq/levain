@@ -304,8 +304,11 @@ class Health:
     # no Health at all), so a Health that exists is a store that opened.
     save_age_hours: float | None = None  # age of the last COMMITTED save (last_wrap_at), not of any episode
     projection_converged: bool | None = None  # sha256 of the continuity file == the last wrap's content_hash; None = unknown
-    audit_backlog: int | None = None  # audit entries the trail LOST (durable, monotonic); None = audit not enabled
-    audit_prune_behind: bool | None = None  # retention pruning is failing; the trail is growing past its bound
+    # audit_backlog: the durable audit_write_failures count (what the trail LOST; bounded, so 0 means none RECORDED,
+    # never complete). levain opens the store read-only, where anneal never builds the audit trail, so only this
+    # durable counter is readable. None = could not be read.
+    audit_backlog: int | None = None
+    projection_note: str | None = None  # why the projection reads diverged (a missing file vs an edit); None otherwise
 
     def __post_init__(self) -> None:
         # one truth, two spellings: a caller that built Health the old way (write_path_live only) gets the status it
@@ -379,21 +382,47 @@ def _last_wrap_hash(db: Path) -> str | None:
 
 
 def _file_hash(path: Path) -> str | None:
-    """sha256 hex of the continuity file's bytes (what anneal hashed is the text it wrote); None if unreadable."""
+    """sha256 hex of the continuity file's bytes (what anneal hashed is the text it wrote). None when the file is
+    absent or unreadable; ``_file_missing`` tells the two apart."""
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError:
         return None
 
 
+def _file_missing(path: Path) -> bool:
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False  # unreadable is unknown, not missing
+    return False
+
+
+def _staged_sidecar(path: Path) -> bool:
+    """True while a wrap's continuity tmp sidecar sits beside the file. anneal v1.0.0 (store.py
+    ``_continuity_tmp_path``) writes ``<continuity_stem>.<token12>-<uuid8>.md.tmp`` in Phase 1, commits the wraps
+    row, and only then renames it over the file (continuity.py Phase 3), so the row can lead the file."""
+    try:
+        return any(path.parent.glob(f"{path.stem}.*.md.tmp"))
+    except OSError:
+        return False
+
+
+SETTLE_SECONDS = 120.0  # a wraps row this young may still be ahead of its rename
+
+
 def health_oracles(
-    status: Any, last_wrap_hash: str | None, file_hash: str | None, *, now: datetime | None = None
+    status: Any, last_wrap_hash: str | None, file_hash: str | None, *, now: datetime | None = None,
+    file_missing: bool = False, staged: bool = False,
 ) -> dict[str, Any]:
-    """The four substrate oracles from facts the store already states (works on anneal 1.0.0; nothing here needs
-    1.0.2). Recency is the last COMMITTED save, convergence is the sha256 of the continuity file against the
-    content_hash that save recorded (a mismatch means the file was changed or lost since: the DB and the
-    projection disagree; a same-length edit shows), the audit backlog is what the trail lost. Each is None when
-    it cannot be told, never a guessed ok."""
+    """The substrate oracles from facts the store already states (works on anneal 1.0.0; nothing here needs
+    1.0.2). Recency is the last COMMITTED save. Convergence is the sha256 of the continuity file against the
+    content_hash that save recorded: a mismatch (or a missing file) is a divergence, unless a staged sidecar exists
+    or the save is under SETTLE_SECONDS old, when the row may simply lead the rename (settling = None). The audit
+    backlog is the durable audit_write_failures count, the one audit fact a read-only open can see; 0 means none
+    recorded, not that the trail is complete. Each is None when it cannot be told, never a guessed ok."""
     age: float | None = None
     raw = getattr(status, "last_wrap_at", None)
     if raw:
@@ -405,15 +434,28 @@ def health_oracles(
         except ValueError:
             age = None
     converged: bool | None = None
-    if getattr(status, "total_wraps", 0) and last_wrap_hash and file_hash:
-        converged = last_wrap_hash == file_hash
-    enabled = bool(getattr(status, "audit_enabled", False))
+    note: str | None = None
+    if getattr(status, "total_wraps", 0) and last_wrap_hash:
+        if file_missing:
+            mismatch, note = True, "continuity file missing"
+        elif file_hash:
+            mismatch, note = file_hash != last_wrap_hash, "continuity file differs from the last wrap (edited since?)"
+        else:
+            mismatch, note = None, None  # unreadable: unknown
+        if mismatch is None:
+            converged = None
+        elif not mismatch:
+            converged, note = True, None
+        elif staged or (age is not None and age * 3600.0 < SETTLE_SECONDS):
+            converged, note = None, None  # settling: the committed row can lead the file rename
+        else:
+            converged = False
     failures = getattr(status, "audit_write_failures", None)
     return {
         "save_age_hours": age,
         "projection_converged": converged,
-        "audit_backlog": int(failures) if enabled and isinstance(failures, int) else None,
-        "audit_prune_behind": bool(getattr(status, "prune_behind", False)) if enabled else None,
+        "projection_note": note,
+        "audit_backlog": int(failures) if isinstance(failures, int) and not isinstance(failures, bool) else None,
     }
 
 
@@ -423,10 +465,11 @@ def health_oracle_line(h: "Health") -> str | None:
     if h.save_age_hours is not None:
         bits.append("last save " + (f"{h.save_age_hours:.0f}h ago" if h.save_age_hours >= 1 else "under 1h ago"))
     if h.projection_converged is not None:
-        bits.append("projection converged" if h.projection_converged else "PROJECTION DIVERGED (file differs from the last save)")
+        bits.append("projection converged" if h.projection_converged
+                    else "PROJECTION DIVERGED (" + (h.projection_note or "continuity file differs from the last wrap (edited since?)") + ")")
     if h.audit_backlog is not None:
-        bits.append("audit complete" if not h.audit_backlog and not h.audit_prune_behind
-                    else f"AUDIT LOST {h.audit_backlog} entries" + (" · pruning behind" if h.audit_prune_behind else ""))
+        bits.append("no audit write failures recorded" if not h.audit_backlog
+                    else f"AUDIT: {h.audit_backlog} audit writes failed")
     return " · ".join(bits) if bits else None
 
 
@@ -1842,6 +1885,8 @@ def build_substrate_view(
                         status,
                         _last_wrap_hash(paths.episodic_db),
                         _file_hash(paths.continuity_md),
+                        file_missing=_file_missing(paths.continuity_md),
+                        staged=_staged_sidecar(paths.continuity_md),
                     ),
                 )
             except data_faults as exc:
@@ -2044,8 +2089,9 @@ def render_text(view: SubstrateView) -> str:
             out.append(f"  Write-path:   LIVE — last wrap {last_wrap or 'recorded'}")
         else:
             out.append("  Write-path:   no wraps yet")
-        if health_oracle_line(h):
-            out.append(f"  Substrate:    {health_oracle_line(h)}")
+        oracle = health_oracle_line(h)
+        if oracle:
+            out.append(f"  Substrate:    {oracle}")
         out.append(
             f"  Graduations:  {h.graduations_validated_total} validated / "
             f"{h.graduations_demoted_total} demoted"
@@ -2166,8 +2212,9 @@ def render_summary(view: SubstrateView) -> str:
             lines.append("Health: write-path LIVE")
         else:
             lines.append("Health: no wraps yet")
-        if health_oracle_line(h):
-            lines.append(f"  {health_oracle_line(h)}")
+        oracle = health_oracle_line(h)
+        if oracle:
+            lines.append(f"  {oracle}")
         last = h.last_wrap_at.split("T")[0] if h.last_wrap_at else "never"
         lines.append(
             f"  {h.total_episodes:,} episodes ({h.episodes_since_wrap} since wrap) · "

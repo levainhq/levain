@@ -1079,13 +1079,30 @@ class TestSession2Gaps:
         assert whole[:4] == ["wraps", "graduated", "demoted", "episodes"]
         assert {"episodes", "tombstones"} <= {m["label"] for m in ms}
 
-    def test_the_oracle_metrics_flag_only_a_real_fault(self, env) -> None:
-        """A store with nothing wrong (nothing graduated, nothing formed, no divergence) flags nothing."""
-        _r, _s, ck = env
-        ms = {m["label"]: m for m in ck.panel("health")["value"]["metrics"]}
-        for label in ("projection", "audit entries lost"):
-            if label in ms:
-                assert ms[label]["status"] in ("ok", "unknown")
+    def test_the_oracle_metrics_flag_only_a_real_fault(self, env, monkeypatch) -> None:
+        """Over a store WITH a wrap: a converged projection is ok, a diverged one is bad."""
+        import hashlib
+        from anneal_memory import Store
+
+        root, src, ck = env
+        db, md = src.anneal.episodic_db, src.anneal.continuity_md
+        md.write_text("## State\nfoc\n", encoding="utf-8")
+        with Store(db) as store:
+            e = store.record("episode A", "decision")
+            store.wrap_started(token="w1", episode_ids=[e.id])
+            store.wrap_completed(1, 20, wrap_token="w1", episode_ids=[e.id], pair_id="p1",
+                                 content_hash=hashlib.sha256(md.read_bytes()).hexdigest())
+        monkeypatch.setattr("levain.dashboard.SETTLE_SECONDS", 0.0)  # past the settling window
+
+        def metrics() -> dict:
+            return {m["label"]: m for m in ck.panel("health")["value"]["metrics"]}
+
+        ms = metrics()
+        assert (ms["projection"]["value"], ms["projection"]["status"]) == ("converged", "ok")
+        assert ms["audit write failures"]["status"] == "ok"
+        md.write_text("## State\nfoO\n", encoding="utf-8")
+        ms = metrics()
+        assert (ms["projection"]["value"], ms["projection"]["status"]) == ("diverged", "bad")
 
     def test_the_write_path_is_live_or_no_wraps_yet_and_never_bad(self, env) -> None:
         _r, _s, ck = env

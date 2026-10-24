@@ -1278,21 +1278,19 @@ class TestHealthOracles:
         from levain.dashboard import health_oracles
 
         now = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
-        st = SimpleNamespace(last_wrap_at="2026-10-24T10:00:00", total_wraps=5, audit_enabled=True,
-                             audit_write_failures=0, prune_behind=False)
+        st = SimpleNamespace(last_wrap_at="2026-10-24T10:00:00", total_wraps=5, audit_write_failures=0)
         ok = health_oracles(st, "a" * 64, "a" * 64, now=now)
-        assert ok == {"save_age_hours": 2.0, "projection_converged": True, "audit_backlog": 0,
-                      "audit_prune_behind": False}
+        assert ok == {"save_age_hours": 2.0, "projection_converged": True, "projection_note": None,
+                      "audit_backlog": 0}
         assert health_oracles(st, "a" * 64, "b" * 64, now=now)["projection_converged"] is False
         # nothing to compare is None, never a guessed ok; a fresh store has no save age
-        fresh = SimpleNamespace(last_wrap_at=None, total_wraps=0, audit_enabled=False,
-                                audit_write_failures=0, prune_behind=False)
+        fresh = SimpleNamespace(last_wrap_at=None, total_wraps=0, audit_write_failures=None)
         assert health_oracles(fresh, None, None, now=now) == {
-            "save_age_hours": None, "projection_converged": None, "audit_backlog": None, "audit_prune_behind": None}
+            "save_age_hours": None, "projection_converged": None, "projection_note": None, "audit_backlog": None}
         st.audit_write_failures = 3
         assert health_oracles(st, "a" * 64, "a" * 64, now=now)["audit_backlog"] == 3
 
-    def test_convergence_is_the_content_hash_not_the_size(self, tmp_path: Path) -> None:
+    def test_convergence_is_the_content_hash_not_the_size(self, tmp_path: Path, monkeypatch) -> None:
         import hashlib
         from anneal_memory import Store
 
@@ -1319,9 +1317,11 @@ class TestHealthOracles:
                                  content_hash=hashlib.sha256(md.read_bytes()).hexdigest())
         assert converged() is True
         md.write_text("## State\nfoO\n", encoding="utf-8")  # same length, different text
+        assert converged() is None  # the wrap is seconds old: the row may lead the rename (settling)
+        monkeypatch.setattr("levain.dashboard.SETTLE_SECONDS", 0.0)  # past the settling window
         assert converged() is False
         md.unlink()
-        assert converged() is None
+        assert converged() is False  # a committed wrap and no file: diverged, "continuity file missing"
 
     def test_a_live_view_carries_the_oracle_keys_and_never_a_link_count_as_health(self, tmp_path: Path) -> None:
         from anneal_memory import Store
@@ -1332,5 +1332,44 @@ class TestHealthOracles:
         v = build_substrate_view(AnnealPaths.from_db(db))
         assert v.health is not None
         d = v.health.to_dict()
-        assert {"save_age_hours", "projection_converged", "audit_backlog", "audit_prune_behind"} <= set(d)
+        assert {"save_age_hours", "projection_converged", "audit_backlog"} <= set(d) and "audit_prune_behind" not in d
         assert d["save_age_hours"] is None and d["projection_converged"] is None  # no wrap committed yet
+
+
+class TestHealthOraclesRound2:
+    def test_a_read_only_store_reports_the_durable_audit_failures_as_a_fault(self, tmp_path: Path) -> None:
+        from anneal_memory import Store
+
+        from levain.dashboard import health_oracle_line
+
+        db = tmp_path / "memory.db"
+        with Store(db, audit=True) as store:
+            store._audit_failures_unpersisted = 7  # close() flushes it to the durable metadata row
+        v = build_substrate_view(AnnealPaths.from_db(db))  # read-only: audit_enabled is False here
+        assert v.health is not None and v.health.audit_backlog == 7
+        assert "7 audit writes failed" in (health_oracle_line(v.health) or "")
+
+    def test_a_row_ahead_of_the_rename_is_settling_not_diverged(self) -> None:
+        from datetime import datetime, timezone
+        from types import SimpleNamespace
+
+        from levain.dashboard import health_oracles
+
+        now = datetime(2026, 10, 24, 12, 0, 30, tzinfo=timezone.utc)
+        young = SimpleNamespace(last_wrap_at="2026-10-24T12:00:00Z", total_wraps=1, audit_write_failures=0)
+        assert health_oracles(young, "a" * 64, "b" * 64, now=now)["projection_converged"] is None
+        old = SimpleNamespace(last_wrap_at="2026-10-24T10:00:00Z", total_wraps=1, audit_write_failures=0)
+        assert health_oracles(old, "a" * 64, "b" * 64, now=now)["projection_converged"] is False
+        assert health_oracles(old, "a" * 64, "b" * 64, now=now, staged=True)["projection_converged"] is None
+
+    def test_a_missing_continuity_file_is_diverged_and_an_unreadable_one_is_unknown(self) -> None:
+        from datetime import datetime, timezone
+        from types import SimpleNamespace
+
+        from levain.dashboard import health_oracles
+
+        now = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
+        st = SimpleNamespace(last_wrap_at="2026-10-24T10:00:00Z", total_wraps=1, audit_write_failures=0)
+        gone = health_oracles(st, "a" * 64, None, now=now, file_missing=True)
+        assert gone["projection_converged"] is False and gone["projection_note"] == "continuity file missing"
+        assert health_oracles(st, "a" * 64, None, now=now)["projection_converged"] is None
