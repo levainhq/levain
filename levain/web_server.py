@@ -956,7 +956,6 @@ class _Handler(GuardedHandler):
     server: _LevainHTTPServer  # narrow the type for typed attribute access
     _credential_cache: Any = _UNSET
     _pair_epoch_seen = 0       # the revocation epoch read just before this request's paired lookup (RU-3)
-    _pair_body_read = False    # a pair POST's body was consumed (F4: a refusal drains only an unread one)
 
     def handle_one_request(self) -> None:
         """One request on this (possibly kept-alive) connection. PAIR RS-1: the credential cache is reset here, at the
@@ -965,13 +964,11 @@ class _Handler(GuardedHandler):
         connection closed (RU-2: like every refusal sent before a body is read). The body never says "token": the
         dashboard's token-drop paths match that word."""
         self._credential_cache = _UNSET
-        self._pair_body_read = False
         try:
             super().handle_one_request()
         except _CredentialUnavailable:
             self.close_connection = True
             try:
-                self._pair_drain()      # F4: a pair POST refused before its body was read
                 self._send(json.dumps({"error": "broker_unavailable",
                                        "message": "the cockpit is starting or busy; try again shortly"}).encode("utf-8"),
                            "application/json; charset=utf-8", status=503, head=self.command == "HEAD",
@@ -1057,7 +1054,10 @@ class _Handler(GuardedHandler):
         broker = self.server.broker
         if broker is None:
             return None
-        broker.start_async()
+        try:
+            broker.start_async()
+        except Exception:  # noqa: BLE001 - G5: a starter thread that cannot start is the transient 503 (RT-1)
+            raise _CredentialUnavailable("starter") from None
         state = broker.wait_settled(_PAIR_WAIT_S)
         if state is Lifecycle.INSTALL_DISABLED:
             return None
@@ -1610,9 +1610,11 @@ class _Handler(GuardedHandler):
 
     def _stream_allowed(self) -> "Callable[[bool], bool] | None":
         """The change stream's per-pass check for a PAIRED principal (RU-3, RT-2 as amended): the revocation epoch is
-        compared on every pass (an int read); a changed one re-runs the device check, as does every heartbeat pass
-        (so a revoke made by another process, ``levain cockpit pair --revoke-all``, ends the stream within one
-        heartbeat). Any other principal: None (a surface token is never revoked from the panel)."""
+        compared on every pass (an int read); a changed one re-runs the device check, as does every pass once a
+        heartbeat interval has passed since the last full check, the data path included (G2; so a revoke made by
+        another process, ``levain cockpit pair --revoke-all``, ends the stream within one heartbeat even under a
+        steady event flow). At most the one frame already past its check when the revoke commits is written (G3).
+        Any other principal: None (a surface token is never revoked from the panel)."""
         cred = self._credential()
         name = cred.get("name") if cred.get("class") == "token" else None
         if not isinstance(name, str) or not name.startswith(PAIRED_PREFIX):
@@ -1620,9 +1622,9 @@ class _Handler(GuardedHandler):
         srv, device = self.server, name[len(PAIRED_PREFIX):]
         seen = [self._pair_epoch_seen]
 
-        def allowed(at_heartbeat: bool) -> bool:
+        def allowed(recheck: bool) -> bool:
             epoch = srv.pair_epoch
-            if epoch == seen[0] and not at_heartbeat:
+            if epoch == seen[0] and not recheck:
                 return True
             seen[0] = epoch
             broker = srv.broker
@@ -1650,26 +1652,11 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Retry-After", "2")] if status == 503 else None, cache_control=cache_control)
 
-    def _pair_drain(self) -> None:
-        """F4: before a pair POST is refused without its body read (the 503s, the 403s), drain up to
-        ``_PAIR_BODY_MAX`` of the declared body, so the client reads the refusal instead of a TCP RST on the close.
-        A body declared larger, or not declared, is not drained; a stalled one is given up on."""
-        if self.command != "POST" or self._pair_body_read:
-            return
-        if self.path.split("?", 1)[0] not in (_PAIR_CLAIM, *_PAIR_AUTHED_POST):
-            return
-        raw = self.headers.get("Content-Length", "")
-        if not (raw.isascii() and raw.isdigit()) or len(raw) > 6 or int(raw) > _PAIR_BODY_MAX:
-            return
-        self._pair_body_read = True
-        try:
-            self._drain(int(raw))
-        except OSError:
-            pass
-
     def _pair_refuse(self, status: int, error: str, message: str) -> None:
-        """A pair POST refused before its body is read: drained (F4), closed, ``Retry-After`` on a 503 (F5)."""
-        self._pair_drain()
+        """A pair POST refused before its body is read: closed at once, the body never read (G1: draining an
+        unauthenticated or busy request's body outside any gate let a slow-body client hold a server thread; a
+        client may see a TCP RST before the refusal, and the page's one retry covers it), ``Retry-After`` on a 503
+        (F5)."""
         self.close_connection = True
         self._pair_send({"error": error, "message": message}, status)
 
@@ -1680,7 +1667,10 @@ class _Handler(GuardedHandler):
         broker = self.server.broker
         if broker is None:
             return {"error": "not_found", "message": "pairing needs a writable cockpit"}, 404
-        broker.start_async()
+        try:
+            broker.start_async()
+        except Exception:  # noqa: BLE001 - G5: a starter thread that cannot start is the controlled 503
+            return {"error": "broker_unavailable", "message": "the cockpit broker could not start; try again"}, 503
         state = broker.wait_settled(_PAIR_WAIT_S)
         db = broker.active_db() if state is Lifecycle.ACTIVE else None
         if db is None:
@@ -2256,7 +2246,6 @@ class _Handler(GuardedHandler):
             return None
         if self._refuse_oversize(clen, _PAIR_BODY_MAX, _PAIR_BODY_MAX):
             return None
-        self._pair_body_read = True
         try:
             raw = self.rfile.read(clen)
         except OSError:

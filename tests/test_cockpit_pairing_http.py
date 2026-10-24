@@ -548,3 +548,117 @@ def test_f8_a_stream_not_allowed_before_hello_writes_no_frame() -> None:
     sub = SimpleNamespace(hello={"x": 1}, hello_id="e:0", dead=False, q=queue.Queue())
     cockpit_stream.run(written.append, sub, stop=threading.Event(), allowed=lambda beat: False)
     assert written == []
+
+
+# --- the L3 r1 fix round (1024-18/pair_p1/L3_r1_findings.md, G1..G6) -------------------------------------------------
+
+def test_g1_a_pre_auth_pair_refusal_closes_without_reading_the_body(src) -> None:
+    """G1 (F4 deleted): a pair POST refused before its body is read answers and closes at once; it never waits on a
+    declared body that has not arrived (a slow-body client would hold a server thread outside any gate)."""
+    with _serve(src) as (port, _httpd):
+        s = socket.create_connection(("127.0.0.1", port), timeout=3)
+        try:
+            s.sendall((f"POST /cockpit/pair/offer HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                       "Content-Type: application/json\r\nContent-Length: 500\r\n\r\n").encode())   # no body follows
+            got = b""
+            t0 = time.monotonic()
+            while b"\r\n\r\n" not in got:
+                c = s.recv(65536)
+                if not c:
+                    break
+                got += c
+            took = time.monotonic() - t0
+        finally:
+            s.close()
+        head = got.split(b"\r\n\r\n", 1)[0].decode("latin-1").lower()
+        assert head.startswith("http/1.0 403") or head.startswith("http/1.1 403"), head
+        assert "connection: close" in head, head
+        assert took < 2.0, took
+
+
+def test_g2_a_cross_process_revoke_during_a_steady_event_flow_ends_the_stream_within_one_heartbeat(src) -> None:
+    """G2: the DB liveness re-check runs on its own deadline on EVERY pass, the data path included: events flowing
+    faster than the heartbeat no longer starve it, so a revoke written straight to the journal (no epoch bump)
+    still ends the stream within one heartbeat."""
+    from datetime import datetime, timezone
+
+    from levain.cockpit.firejournal import CockpitDB
+
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 0.4
+        _device, tok = _pair(port)
+        s, chunks, pump, done = _open_stream(port, tok)
+        w = httpd.stream_watcher
+        stop = threading.Event()
+
+        def publish() -> None:
+            while not stop.is_set():
+                with w._lock:
+                    w._publish_locked("panel-changed", {"id": "tray", "etag": str(time.monotonic())})
+                time.sleep(0.02)
+
+        pub = threading.Thread(target=publish, daemon=True)
+        deadline = time.monotonic() + 5
+        while w.stream_count == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        pub.start()
+        try:
+            time.sleep(0.3)
+            assert len(_ids(chunks)) > 3, "the flow is steady before the revoke"
+            CockpitDB(httpd.broker.data_root).revoke_devices(None, by="box", now=datetime.now(timezone.utc))
+            t0 = time.monotonic()
+            pump.join(3)
+            assert "at" in done, "the stream did not end under a steady event flow"
+            assert done["at"] - t0 < 0.4 + 0.6, done["at"] - t0
+        finally:
+            stop.set()
+            pub.join(2)
+            s.close()
+
+
+def test_g4_a_synchronous_start_in_progress_is_waited_on(src, monkeypatch) -> None:
+    """G4: one start-in-progress signal. A synchronous start() still before ACTIVATING (its install check running)
+    is waited on, not answered STANDBY at once; and once it ends the signal is clear."""
+    from levain.cockpit import broker as broker_mod
+
+    real = broker_mod.decide_install
+    entered, release = threading.Event(), threading.Event()
+
+    def slow(*a: Any, **kw: Any) -> Any:
+        entered.set()
+        release.wait(5)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(broker_mod, "decide_install", slow)
+    with _serve(src) as (_port, httpd):
+        b = httpd.broker
+        t = threading.Thread(target=b.start, daemon=True)
+        t.start()
+        assert entered.wait(5)
+        threading.Timer(0.3, release.set).start()
+        assert b.wait_settled(5) is Lifecycle.ACTIVE
+        t.join(5)
+        assert b._starting is False
+
+
+def test_g5_a_starter_thread_that_cannot_start_is_a_503_and_is_retried(src, monkeypatch) -> None:
+    """G5: Thread.start() failing in start_async clears the starter and the start signal, records starter_error,
+    and the pair route answers the controlled 503 (broker_unavailable, Retry-After: 2); the next request retries."""
+    from types import SimpleNamespace
+
+    from levain.cockpit import broker as broker_mod
+
+    class NoThread(threading.Thread):
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    with _serve(src) as (port, httpd):
+        b = httpd.broker
+        monkeypatch.setattr(broker_mod, "threading", SimpleNamespace(Thread=NoThread))
+        st, out, hdrs = _call(port, "GET", "/cockpit/pair/devices.json", token=T)
+        assert (st, out.get("error"), hdrs.get("retry-after")) == (503, "broker_unavailable", "2"), (st, out, hdrs)
+        assert b._starter is None and b._starting is False
+        assert isinstance(b.starter_error, RuntimeError)
+        monkeypatch.undo()
+        st, out, _ = _call(port, "GET", "/cockpit/pair/devices.json", token=T)
+        assert st == 200 and out["devices"] == [], out

@@ -195,28 +195,42 @@ def run(
     ``alive`` says the peer has hung up: a quiet stream would otherwise hold its slot, and keep the watcher
     running, until the next heartbeat write failed.
 
-    ``allowed(at_heartbeat)`` (PAIR RU-3) is asked on EVERY loop pass, before any frame (data or heartbeat) is
-    written, and the stream ends the moment it answers False: a revoked paired device's open stream writes nothing
-    after its revoke. ``at_heartbeat`` is True on the pass that would write a heartbeat. It is asked before the hello
-    frame too (F8), so "before any frame" holds for the first one."""
+    ``allowed(recheck)`` (PAIR RU-3) is asked on EVERY loop pass, before any frame (data or heartbeat) is
+    written, and the stream ends the moment it answers False: a revoked paired device's open stream writes at most
+    the one frame already past its check when the revoke commits (G3: no lock is held around the write).
+    ``recheck`` is True on any pass, the data path included, once ``heartbeat_s`` has passed since the last full
+    check (G2: its own deadline, so an event flow faster than the heartbeat cannot starve the DB liveness re-check
+    that sees a revoke made by another process); the cheap epoch-only check runs otherwise. It is asked before the
+    hello frame too (F8), so "before any frame" holds for the first one."""
     if allowed is not None and not allowed(False):
         return
     write(frame("hello", sub.hello, sub.hello_id))
-    last_write = clock()
+    last_write = last_check = clock()
+
+    def check() -> bool:
+        nonlocal last_check
+        if allowed is None:
+            return True
+        recheck = clock() - last_check >= heartbeat_s
+        if not allowed(recheck):
+            return False
+        if recheck:
+            last_check = clock()
+        return True
+
     while not stop.is_set() and not sub.dead:
         try:
             event, data, eid = sub.q.get(timeout=min(poll_s, heartbeat_s))
         except queue.Empty:
             if alive is not None and not alive():
                 return
-            beat = clock() - last_write >= heartbeat_s
-            if allowed is not None and not allowed(beat):
+            if not check():
                 return
-            if beat:
+            if clock() - last_write >= heartbeat_s:
                 write(b": hb\n\n")
                 last_write = clock()
             continue
-        if allowed is not None and not allowed(False):
+        if not check():
             return
         write(frame(event, data, eid))
         last_write = clock()

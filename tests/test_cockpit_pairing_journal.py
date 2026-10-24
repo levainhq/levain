@@ -120,7 +120,7 @@ def test_rs3_revoking_a_device_that_never_wrote_creates_and_bumps_its_generation
     assert _gen(db, a) == 2
 
 
-def test_rp10_4_revoke_cascades_to_the_family_only(db: CockpitDB) -> None:
+def test_rp10_4_revoke_cascades_to_the_family_only(db: CockpitDB, monkeypatch: pytest.MonkeyPatch) -> None:
     """RP-10 (4) journal half / RQ-2 / RS-5: the closure over paired_by = 'paired-' || id takes the child and
     grandchild, never a sibling minted by a surface token or the box."""
     a, _ = _pair(db)
@@ -134,8 +134,14 @@ def test_rp10_4_revoke_cascades_to_the_family_only(db: CockpitDB) -> None:
     assert live == {a: False, b: False, c: False, sib: True, boxed: True}
     assert db.redeem_offer(pending_offer, now=NOW) is None
     assert all(_gen(db, m) == 2 for m in (a, b, c)) and _gen(db, sib) is None
-    with pytest.raises(PairingError):
-        db.revoke_devices(["d-000000000000"], by="browser", now=NOW)
+    from levain.cockpit import firejournal
+
+    expired: list[int] = []
+    monkeypatch.setattr(firejournal, "_expire", lambda conn, now: expired.append(1) or [])
+    for bad in (["d-000000000000"], ["not an id"]):
+        with pytest.raises(PairingError):
+            db.revoke_devices(bad, by="browser", now=NOW)
+    assert expired == [], "G6: the ids are validated before _expire writes anything"
 
 
 def test_rs4_a_credential_authenticated_before_the_revoke_mints_and_files_nothing_after_it(db: CockpitDB) -> None:

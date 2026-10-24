@@ -1193,17 +1193,19 @@ class CockpitDB:
         already revoked is skipped silently: revoked and rotated commit together, so it was rotated then. Returns
         the ids this call revoked. An unknown id raises :class:`PairingError` and nothing moves."""
         stamp = utc_stamp(now)
+        roots: list[str] | None = None if device_ids is None else list(device_ids)
+        for d in roots or ():
+            if not isinstance(d, str) or _DEVICE_ID.fullmatch(d) is None:
+                raise PairingError(f"not a device id: {d!r}")
         with self.write() as conn:
-            _expire(conn, now)
-            if device_ids is None:
+            # G6: every id is validated before _expire, so a refusal writes nothing
+            if roots is None:
                 roots = [r[0] for r in conn.execute("SELECT id FROM paired_devices ORDER BY rowid")]
             else:
-                roots = list(device_ids)
                 for d in roots:
-                    if not isinstance(d, str) or _DEVICE_ID.fullmatch(d) is None:
-                        raise PairingError(f"not a device id: {d!r}")
                     if conn.execute("SELECT 1 FROM paired_devices WHERE id = ?", (d,)).fetchone() is None:
                         raise PairingError(f"no such device: {d}")
+            _expire(conn, now)
             # RS-5: the closure's join is the credential-name rule itself, stated once here
             assert PAIRED_PREFIX == "paired-", "the closure below joins on the literal 'paired-' prefix"
             family: list[str] = []
