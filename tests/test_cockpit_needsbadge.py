@@ -326,22 +326,18 @@ def test_a_tap_in_the_overlap_of_two_pads_opens_the_card_of_the_nearer_badge(tmp
     """codex L3 r1 MED2: pads overlap at small pitch and the later-drawn one took the tap wherever it landed."""
     from tests.test_cockpit_k7_build import _sessions_fixture
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    tap = ("(() => { const pads = [...%s.querySelectorAll('.tv-needhit')], r = (e) => e.getBoundingClientRect(), c = (e) => [r(e).left + r(e).width / 2, r(e).top + r(e).height / 2], "
-           "inside = (e, x, y) => x >= r(e).left && x <= r(e).right && y >= r(e).top && y <= r(e).bottom; "
-           "for (let i = 0; i < pads.length; i++) for (let j = i + 1; j < pads.length; j++) { const a = c(pads[i]), b = c(pads[j]); "
-           "for (let t = 0.49; t > 0.1; t -= 0.03) { const x = a[0] + (b[0] - a[0]) * t, y = a[1] + (b[1] - a[1]) * t; "
-           "if (inside(pads[i], x, y) && inside(pads[j], x, y)) { window.__opened = null; "
-           "pads[j].dispatchEvent(new MouseEvent('click', {bubbles: true, clientX: x, clientY: y})); "
-           "return JSON.stringify([pads[i].dataset.needhitfor, pads[j].dataset.needhitfor, window.__opened]); } } } return JSON.stringify(null); })()") % TV
-    seen = 0
-    for size in (DESKTOP, {"emulate": {"w": 640, "h": 900, "dpr": 1, "mobile": False}}, NARROW):      # a narrow desktop stage shrinks the graph, so the 44 CSS px pads grow in graph units
+    # layout-independent: after the build, slide the second pad half a pad over the first (SVG units), then tap a point inside both that is nearer the first badge
+    tap = ("(() => { const pads = [...%s.querySelectorAll('.tv-needhit')].filter(e => (e.dataset.needhitfor || '').startsWith('node:')); if (pads.length < 2) return JSON.stringify(null); const a = pads[0], b = pads[1], "
+           "s = parseFloat(a.getAttribute('width')), ax = parseFloat(a.getAttribute('x')), ay = parseFloat(a.getAttribute('y')); "
+           "b.setAttribute('width', String(s)); b.setAttribute('height', String(s)); b.setAttribute('x', String(ax + s / 2)); b.setAttribute('y', String(ay)); "
+           "const svg = a.ownerSVGElement, pt = svg.createSVGPoint(); pt.x = ax + s * 0.6; pt.y = ay + s / 2; const p = pt.matrixTransform(svg.getScreenCTM()); "
+           "window.__opened = null; b.dispatchEvent(new MouseEvent('click', {bubbles: true, clientX: p.x, clientY: p.y})); "
+           "return JSON.stringify([a.dataset.needhitfor, b.dataset.needhitfor, window.__opened]); })()") % TV
+    for size in (DESKTOP, {"emulate": {"w": 640, "h": 900, "dpr": 1, "mobile": False}}, NARROW):
         out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_all_needy(), "agents")}, WAIT, {"eval": tap}], first=size)
         got = json.loads(out[-1])
-        if got is None:
-            continue
-        seen += 1
+        assert got is not None, ("fewer than two pads were drawn", size, out)
         assert got[2] == "np:np-" + got[0].split(":d")[1].replace("_", "-"), (size, out)         # the tap was nearer the first pad's badge, though it landed on the later pad
-    assert seen, "no two pads overlap in the fixture"
 
 
 @needs_browser
