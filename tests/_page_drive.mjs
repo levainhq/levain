@@ -9,6 +9,7 @@
 // A failing wait also saves timeout-step-<n>.png (+ .txt, the page text) beside the steps file and names it on stderr.
 //   {"emulate": {"w": <px>, "h": <px>, "dpr": <n>, "mobile": <bool>}}   a device size, applied before the page is drawn again
 //   {"scheme": "dark"|"light"}              the phone's colour-scheme setting (prefers-color-scheme), applied before the next read
+//   {"motion": "reduce"|"no-preference"}    the phone's reduce-motion setting (prefers-reduced-motion); it keeps a scheme step's setting
 //   {"shot": "<abs path.png>", "full": <bool>}   saves a PNG screenshot there (the whole page when full); collected as {"shot": path}
 //   {"authenticator": {"rpId", "privateKey", "credentialId", "userHandle"}}   a virtual platform authenticator (user
 //                                            verification on) holding that one resident P-256 credential (base64
@@ -28,6 +29,7 @@ import { createServer } from "node:net";
 
 const [chromePath, url, stepsPath] = process.argv.slice(2);
 const steps = JSON.parse(readFileSync(stepsPath, "utf8"));
+const media = {};   // the emulated media features set so far: each setEmulatedMedia call replaces the whole list
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const port = await new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
 const prof = mkdtempSync(join(tmpdir(), "levain-page-drive-"));
@@ -125,7 +127,14 @@ for (const s of steps) {
     await send("Emulation.setDeviceMetricsOverride", { width: s.emulate.w, height: s.emulate.h, deviceScaleFactor: s.emulate.dpr || 1, mobile: !!s.emulate.mobile });
     await sleep(600);
   } else if (s.scheme !== undefined) {
-    await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: s.scheme }] });
+    media["prefers-color-scheme"] = s.scheme;
+    await send("Emulation.setEmulatedMedia", { features: Object.entries(media).map(([name, value]) => ({ name, value })) });
+    await sleep(300);
+  } else if (s.focus !== undefined) {
+    await send("Emulation.setFocusEmulationEnabled", { enabled: !!s.focus });         // a headless page is never the focused window: without this no focusin / focusout fires
+  } else if (s.motion !== undefined) {
+    media["prefers-reduced-motion"] = s.motion;
+    await send("Emulation.setEmulatedMedia", { features: Object.entries(media).map(([name, value]) => ({ name, value })) });
     await sleep(300);
   } else if (s.shot !== undefined) {
     // a page still being attached answers "Not attached to an active page": retry until the step's deadline
