@@ -49,6 +49,13 @@ def record(ref: int, *, ledger: str = LEDGER, epoch: str = EPOCH, **over) -> dic
     return rec
 
 
+def short_record(ref: int) -> dict:
+    """A well-formed record with every free string at one character: 64 of them fit H6-19's 48 KiB (49,053 bytes),
+    where 64 of :func:`record` (51,229) do not."""
+    return record(ref, job_id="d", route="r", model_requested="m", model_answered="m", provider_answered="p",
+                  tokens_in=1, tokens_out=1, cost_microdollars=1, hold_microdollars=1, run_cap_microdollars=None)
+
+
 def envelope(*records: dict, ledger: str = LEDGER, epoch: str = EPOCH) -> dict:
     return {"ledger_id": ledger, "epoch": epoch, "records": list(records)}
 
@@ -152,6 +159,9 @@ def test_lineage_out_of_order_kept(w):
     ({"seq": 3}, "seq"),                                    # seq is CONTROL's
     ({"color": "red"}, "color"),                            # a key the schema does not hold
     ({"Bad Key!": 1}, "record"),                            # ... named only when it reads as a field name
+    ({"model_answered": 5}, "model_answered"),              # H6-21: string | "unknown" | null, nothing else
+    ({"provider_answered": ""}, "provider_answered"),
+    ({"at": None}, "at"),                                   # a field SCHEMAS §2.1 does not mark |null stays non-null
 ])
 def test_lineage_poison_row_quarantined(w, bad, field):
     # r3 c2-F4 / R4 §3: a malformed record inside a VALID envelope is a quarantine row, acked, so the outbox drains and
@@ -159,11 +169,27 @@ def test_lineage_poison_row_quarantined(w, bad, field):
     ans = w.append(envelope(record(1), record(2, **bad)))
     assert ans == acked(1, 2, quarantined=[(2, field)]), ans
     rows = w.rows()
-    assert rows[1] == {"format": LN.FORMAT, "seq": 2, "source": triple(2), "quarantined": field, "session": None}
+    # H6-20: the quarantine row is {format, source, quarantined} (+ CONTROL's seq); no `session`
+    assert rows[1] == {"format": LN.FORMAT, "seq": 2, "source": triple(2), "quarantined": field}
     assert rows[0]["seq"] == 1 and rows[0]["source"] == triple(1) and "quarantined" not in rows[0]
     # the resend (keys lost the ack): acked by membership, its quarantine stated again, nothing appended
     assert w.append(envelope(record(2, **bad))) == acked(2, quarantined=[(2, field)])
     assert len(w.rows()) == 2
+
+
+def test_lineage_answered_null_vs_unknown(w):
+    # H6-21: `null` = no upstream call (a refused or released row); "unknown" = the call happened, the response did not
+    # say. Both are well-formed records, appended whole, never quarantined.
+    refused = record(1, model_answered=None, provider_answered=None, tokens_in=None, tokens_out=None,
+                     cost_microdollars=None, cost_reported=None, hold_microdollars=0, settled="no", status=0,
+                     refused="keys-unavailable", count=3)
+    released = record(2, model_answered=None, provider_answered=None, settled="no", status=0)
+    unknown = record(3, model_answered="unknown", provider_answered="unknown")
+    assert w.append(envelope(refused, released, unknown)) == acked(1, 2, 3)
+    rows = w.rows()
+    assert [(r["model_answered"], r["provider_answered"]) for r in rows] == \
+        [(None, None), (None, None), ("unknown", "unknown")]
+    assert all("quarantined" not in r for r in rows)
 
 
 def test_lineage_missing_field_quarantined(w):
@@ -192,6 +218,38 @@ def test_lineage_envelope_refused(w, env):
     assert w.append(env) == {"id": 7, "ok": False, "refused": "lineage-record:envelope"}
     assert w.path.read_bytes() == b""
     assert w.sink.next_seq == 1
+
+
+ENVELOPE_BYTES = 48 * 1024        # H6-19: FRAME_MAX 64 KiB less headroom
+
+
+def sized_envelope(n_bytes: int, n_records: int = 60) -> dict:
+    """An envelope of `n_records` well-formed records whose canonical encoding is exactly `n_bytes`, padded through
+    `provider_answered` (printable ASCII up to 128)."""
+    recs = [record(i, provider_answered="p") for i in range(n_records)]
+    short = n_bytes - len(canon.canonical_bytes(envelope(*recs)))
+    assert 0 <= short <= 127 * n_records, short
+    for rec in recs:
+        pad = min(short, 127)
+        rec["provider_answered"] += "p" * pad
+        short -= pad
+    env = envelope(*recs)
+    assert len(canon.canonical_bytes(env)) == n_bytes
+    return env
+
+
+def test_lineage_envelope_byte_bound(w):
+    # H6-19: at most 48 KiB encoded beside the 64-record bound; over it the WHOLE envelope is refused
+    # `lineage-record:envelope` and nothing is appended (keys never sends one: it packs greedily)
+    over = sized_envelope(ENVELOPE_BYTES + 1)
+    assert len(over["records"]) <= LN.ENVELOPE_MAX
+    assert w.append(over) == {"id": 7, "ok": False, "refused": "lineage-record:envelope"}
+    assert w.path.read_bytes() == b"" and w.sink.next_seq == 1
+    # exactly at the bound: appended whole
+    at = sized_envelope(ENVELOPE_BYTES)
+    assert w.append(at) == acked(*range(len(at["records"])))
+    assert len(w.rows()) == len(at["records"])
+    assert LN.ENVELOPE_BYTES_MAX == ENVELOPE_BYTES
 
 
 def test_lineage_append_needs_the_attachment(w):
@@ -362,10 +420,10 @@ def test_lineage_64_record_envelope_is_one_fsync(tmp):
 
     os.write = counting_write
     try:
-        ans = w.append(envelope(*[record(i) for i in range(LN.ENVELOPE_MAX)]))
+        ans = w.append(envelope(*[short_record(i) for i in range(LN.ENVELOPE_MAX)]))
         appended = (len(calls), len([x for x in writes if x == w.sink._fd]))
         calls.clear()
-        again = w.append(envelope(*[record(i) for i in range(LN.ENVELOPE_MAX)]))
+        again = w.append(envelope(*[short_record(i) for i in range(LN.ENVELOPE_MAX)]))
     finally:
         os.write = real_write
     assert ans == acked(*range(LN.ENVELOPE_MAX)) and again == ans

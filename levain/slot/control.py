@@ -2157,8 +2157,9 @@ class Control:
         ``lineage-acked`` line's H6-17 shape). No sink: ``lineage-unavailable``; a failed append poisons the sink and
         answers ``lineage-unavailable`` until CONTROL restarts.
 
-        DECISION: a quarantine row's ``session`` is ``null``: the envelope and the ``/3`` record carry no session
-        (routed to the head as an observation, 3c-6b RETURN)."""
+        The envelope is also bounded by bytes (H6-19: at most 64 records AND at most
+        :data:`~levain.slot.lineage.ENVELOPE_BYTES_MAX` encoded); over either it is refused ``lineage-record:envelope``
+        with nothing appended. A quarantine row is ``{format, seq, source, quarantined}`` (H6-20: no ``session``)."""
         self._require_attached(conn)
         envelope = args["envelope"]
         triples = LN.check_envelope(envelope)
@@ -2170,7 +2171,7 @@ class Control:
             if bad is None:
                 rows.append((t, {k: rec[k] for k in LN.RECORD_CHECKS}))
             else:
-                rows.append((t, {"format": LN.FORMAT, "quarantined": bad, "session": None}))
+                rows.append((t, {"format": LN.FORMAT, "quarantined": bad}))
         acked: list[dict[str, object]] = []
         quarantined: list[dict[str, object]] = []
         seen: set[LN.Triple] = set()
