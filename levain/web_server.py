@@ -78,6 +78,7 @@ Sovereignty boundary (load-bearing, not incidental):
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import hmac
 import re
 import urllib.parse
@@ -90,7 +91,6 @@ import logging
 import json
 import sys
 import threading
-from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
@@ -187,10 +187,10 @@ _SIGN_PREFIX = "/cockpit/sign/"
 _SIGN_ACTIONS = ("challenge", "answer", "deny")
 # POST /cockpit/sign/compose (DESIGN_SIGN D5, the compose contract): {verb, params, client_txn} -> {request}, the caller's
 # compose_signer filing a sign request for a signed verb's params (one per draft while it is open); the page then runs the
-# ceremony on that id. Served only when make_server was given a compose_signer (and a signer to run the ceremony):
-# without one it is 404.
+# ceremony on that id. Which request each draft filed is recorded durably beside the Signer's requests
+# (levain.consent.sign.bind_compose), the record the kernel's sign check reads. Served only when make_server was given a
+# compose_signer (and a signer to run the ceremony): without one it is 404.
 _SIGN_COMPOSE = "/cockpit/sign/compose"
-_COMPOSE_TXNS_MAX = 256       # drafts whose request one server remembers; past it the oldest identity is forgotten
 _COMPOSE_WAIT_S = 30.0        # how long a second compose of one draft waits for the first's compose_signer call
 # GET /cockpit/sign/<id>.json: ONE request's listing row, behind the listing's gate, so a page never reads "no longer
 # open" off a listing that stopped at its cap (Signer.row)
@@ -198,6 +198,13 @@ _SIGN_ONE_SUFFIX = ".json"
 # one extra Host value (make_server extra_hosts): a DNS name or IPv4 literal and an optional trailing dot, never a port
 _EXTRA_HOST = re.compile(r"(?=[^:]{1,253}\Z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
                          r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?")
+
+
+def _params_fingerprint(params: "dict[str, Any]") -> str:
+    """The fingerprint a compose binds a signed draft's params under, and the sign check compares: the SHA-256 of
+    their canonical JSON (sorted keys, no spaces). ``TypeError``/``ValueError`` for params JSON cannot hold."""
+    canonical = json.dumps(params, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _sign_route(route: str) -> "tuple[str, str] | None":
@@ -814,11 +821,12 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self.stream_heartbeat_s = cockpit_stream.DEFAULT_HEARTBEAT_S
         self.stream_stop = threading.Event()
         self.stream_watcher = cockpit_stream.Watcher(self._watch_manifest, epoch=secrets.token_hex(4))
-        # (verb, client_txn) -> (params fingerprint, request id): the request each signed draft's compose filed
-        # (_sign_compose), oldest first, at most _COMPOSE_TXNS_MAX filed ones. The request id is None while that draft's
-        # compose_signer call is in flight: a second compose of the same draft waits on compose_wake for it (so two at
-        # once file one), and a compose of any other draft never waits. The lock is never held across compose_signer.
-        self.compose_txns: "OrderedDict[tuple[str, str], tuple[str, str | None]]" = OrderedDict()
+        # (verb, client_txn) -> params fingerprint, for each draft whose compose_signer call is in flight here
+        # (_sign_compose): a second compose of the same draft waits on compose_wake for it (so two at once file one),
+        # and a compose of any other draft never waits. A concurrency primitive only, never the record: which request a
+        # draft filed is bound durably (levain.consent.sign.bind_compose) before its entry leaves. The lock is never
+        # held across compose_signer.
+        self.compose_inflight: "dict[tuple[str, str], str]" = {}
         self.compose_lock = threading.Lock()
         self.compose_wake = threading.Condition(self.compose_lock)
         super().__init__(*args, **kwargs)
@@ -1143,10 +1151,14 @@ class _Handler(GuardedHandler):
         ``client_txn`` is the draft's one identity (the page mints it when the signed draft is first sent and keeps it
         with the draft): the same ``(verb, client_txn)`` names the SAME request while that request is open, so a lost
         reply, a retry, a reload or a second send of one draft files one request. The same id with other params is
-        refused (409): an identity names one draft. Two composes of one draft at once file one: the second waits for
-        the first's compose_signer call (up to _COMPOSE_WAIT_S, then 503). Composes of different drafts never wait on
-        each other: the compose_signer runs outside the server's lock."""
-        from levain.consent.sign import request_id_ok
+        refused (409): an identity names one draft. Which request a draft filed is bound durably beside the Signer's
+        requests (``levain.consent.sign.bind_compose``) before the answer is sent, so this holds across a restart and
+        any number of other drafts, and the kernel's sign check (:meth:`_signed_for`) reads that binding; a request
+        filed but not bound is a 503 (the draft is sent again; the request it filed stays open until it expires). Two
+        composes of one draft at once file one: the second waits for the first's compose_signer call (up to
+        _COMPOSE_WAIT_S, then 503). Composes of different drafts never wait on each other: the compose_signer runs
+        outside the server's lock."""
+        from levain.consent.sign import SignRefused, bind_compose, compose_bindings, error_word, request_id_ok
         from levain.cockpit.verbs import SIGN_PARAM
 
         compose = self.server.compose_signer
@@ -1169,78 +1181,84 @@ class _Handler(GuardedHandler):
             bad = sorted(set(bad) | {SIGN_PARAM})      # what is signed is the message, never a request id
         if bad:
             return {"error": "field_not_allowed", "message": f"{spec.name!r} does not take {bad}"}, 400
-        fp = json.dumps(params, sort_keys=True, separators=(",", ":"))
+        try:
+            fp = _params_fingerprint(params)
+        except (TypeError, ValueError):
+            return {"error": "bad_request", "message": "'params' must be plain JSON (no NaN or Infinity)"}, 400
         signer = self.server.signer
-        memo = self.server.compose_txns
+        if signer is None:      # make_server refuses a compose_signer without one; an explicit check survives `python -O`
+            return {"error": "not_found", "message": "no such route"}, 404
+        inflight = self.server.compose_inflight
         wake = self.server.compose_wake
         key = (spec.name, txn)
-        mine = (fp, None)       # this compose's in-flight entry; only its owner replaces or removes it
+        conflict = {"error": "txn_conflict", "message": "this send's id already names other words: nothing was "
+                    "filed; send again"}, 409
         deadline = time.monotonic() + _COMPOSE_WAIT_S
         with wake:
             while True:
-                held = memo.get(key)
-                if held is not None and held[0] != fp:
-                    return {"error": "txn_conflict", "message": "this send's id already names other words: nothing "
-                            "was filed; send again"}, 409
-                if held is None or held[1] is not None:
+                held = inflight.get(key)
+                if held is None:
                     break
+                if held != fp:
+                    return conflict
                 left = deadline - time.monotonic()      # the same draft's compose is filing: wait for its answer
                 if left <= 0:
                     return {"error": "busy", "message": "this draft is still being filed: nothing more was filed; "
                             "send again"}, 503
                 wake.wait(left)
-            if held is not None and signer is not None:
-                row = signer.row(held[1], [])
+            try:
+                bound = [b for b in compose_bindings(signer.queue_dir) if b["verb"] == spec.name and b["txn"] == txn]
+            except SignRefused as exc:
+                return {"error": error_word(exc.status), "message": f"{exc}: nothing was filed; send again"}, exc.status
+            if any(b["params"] != fp for b in bound):
+                return conflict
+            for b in reversed(bound):           # the newest of this draft's requests that is still open
+                row = signer.row(b["request"], [])
                 if row is not None and not row.get("refused"):
-                    memo.move_to_end(key)
-                    return {"request": held[1]}, 200
-            memo[key] = mine
-            memo.move_to_end(key)
-
-        def settle(rid: "str | None") -> None:
-            """Publish this compose's request (None: it filed none) and wake the same draft's waiters."""
-            with wake:
-                if memo.get(key) is mine:
-                    if rid is None:
-                        del memo[key]
-                    else:
-                        memo[key] = (fp, rid)
-                        filed = [k for k, v in memo.items() if v[1] is not None]
-                        for old in filed[:max(0, len(filed) - _COMPOSE_TXNS_MAX)]:
-                            del memo[old]
-                wake.notify_all()
+                    return {"request": b["request"]}, 200
+            inflight[key] = fp      # this compose's in-flight entry; only its owner removes it (the finally below)
 
         try:
-            rid = compose(spec.name, dict(params))
-        except ValueError as exc:
-            settle(None)
-            return {"error": "bad_request", "message": str(exc) or "the message cannot be signed"}, 400
-        except BaseException:
-            settle(None)
-            raise
-        if not request_id_ok(rid):
-            settle(None)
-            return {"error": "internal", "message": "the compose signer named no sign request"}, 500
-        settle(rid)
-        return {"request": rid}, 200
+            try:
+                rid = compose(spec.name, dict(params))
+            except ValueError as exc:
+                return {"error": "bad_request", "message": str(exc) or "the message cannot be signed"}, 400
+            if not request_id_ok(rid):
+                return {"error": "internal", "message": "the compose signer named no sign request"}, 500
+            try:
+                bind_compose(signer.queue_dir, spec.name, txn, fp, rid)
+            except SignRefused as exc:
+                return {"error": error_word(exc.status), "message": f"sign request {rid} was filed but which draft "
+                        f"filed it could not be recorded ({exc}): it will not be sent; send again"}, exc.status
+            return {"request": rid}, 200
+        finally:
+            with wake:              # after the bind (or its refusal): the same draft's waiters then read the bindings
+                del inflight[key]
+                wake.notify_all()
 
     def _signed_for(self, verb: str, request_id: str, params: "dict[str, Any]") -> "str | None":
-        """The kernel's sign check (``levain.cockpit.verbs.SignedFor``): the draft id (``client_txn``) under which this
-        server's compose filed ``request_id`` for ``verb`` and exactly ``params``, when its Signer holds that request
-        signed; else None. A request whose compose this server no longer remembers (restarted, or past
-        _COMPOSE_TXNS_MAX drafts) is refused: the operator signs that draft again."""
-        from levain.consent.sign import state_of
+        """The kernel's sign check (``levain.cockpit.verbs.SignedFor``): the draft id (``client_txn``) under which a
+        compose on this Signer's queue filed ``request_id`` for ``verb`` and exactly ``params``, when the Signer holds
+        that request signed; else None. It reads the durable binding (``levain.consent.sign.compose_bindings``), so a
+        restart or any number of other drafts since never turns the retry of a send that landed into a refusal: the
+        at-most-once gate behind this check replays it. A binding file that cannot be read is an ``unavailable``
+        (503), never a refusal: a refusal drops the page's signed draft, and its re-sign would send a second time."""
+        from levain.consent.sign import SignRefused, compose_bindings, state_of
 
         signer = self.server.signer
         if signer is None or not isinstance(request_id, str):
             return None
         try:
-            fp = json.dumps(params, sort_keys=True, separators=(",", ":"))
+            fp = _params_fingerprint(params)
         except (TypeError, ValueError):
             return None
-        with self.server.compose_lock:
-            txn = next((k[1] for k, v in self.server.compose_txns.items()
-                        if k[0] == verb and v == (fp, request_id)), None)
+        try:
+            bindings = compose_bindings(signer.queue_dir)
+        except SignRefused as exc:
+            raise EditError("unavailable", 503, f"which sign request this draft filed could not be read ({exc}): "
+                            "nothing was sent; send again") from None
+        txn = next((b["txn"] for b in bindings
+                    if b["verb"] == verb and b["request"] == request_id and b["params"] == fp), None)
         return txn if txn is not None and state_of(signer.queue_dir, request_id) == "signed" else None
 
     def _serve_note_body(self, path: str, *, head: bool) -> None:
@@ -2339,6 +2357,8 @@ def make_server(
     httpd.read_waiters = 0
     httpd.read_waiters_lock = threading.Lock()
     view = VerbView(verb_registry, cockpit, lambda: broker_install_class(httpd)) if cockpit is not None else None
+    pinned = False
+    attached = None     # what the caller's cockpit held before this server attached to it, while that can be undone
     try:
         # K2b §6: `--install-class reported` is the only way to reported; no flag (and no governed
         # marker) leaves the broker write-disabled, answering "run the installer"
@@ -2360,10 +2380,14 @@ def make_server(
         if signer is not None:
             # after every refusal and the bind, before the cockpit is touched: pinned under the Signer's own lock with
             # the check above run again there (a page_origin set since is caught), after which no other page_origin
-            # can be set; refused, nothing is served and the caller's cockpit is as it was
+            # can be set while this server holds the pin; refused, nothing is served and the cockpit is as it was
             signer.pin_page_origin(problem)
+            pinned = True
             httpd.signer_page_origin = signer.page_origin
         if cockpit is not None:
+            if callable(getattr(cockpit, "attachments", None)) and callable(getattr(cockpit, "restore_attachments",
+                                                                                     None)):
+                attached = cockpit.attachments()
             cockpit.attach_verbs(view)
             if httpd.broker is not None:
                 cockpit.attach_authority(httpd.broker.capture)
@@ -2376,7 +2400,17 @@ def make_server(
             if httpd.note_store is not None:
                 cockpit.attach_note_rows(httpd.note_store)             # and what they tell him (notes)
     except BaseException:
-        httpd.server_close()
+        # an attach that raised (a panel registered between check_verbs and attach_verbs; a decisions panel the
+        # registry refuses) undoes every attach made before it, then this server's pin: it never served
+        try:
+            if attached is not None and cockpit is not None:
+                cockpit.restore_attachments(attached)
+        finally:
+            try:
+                if pinned and signer is not None:
+                    signer.release_pin()
+            finally:
+                httpd.server_close()
         raise
     # The names this server serves, beside its cockpit.db, for `levain cockpit policy raise` to check a
     # downstream verb against (levain.cockpit.verbs.SERVED_VERBS_NAME). Written last, so a server refused

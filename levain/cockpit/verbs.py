@@ -76,15 +76,17 @@ _ENVELOPE = frozenset({"verb", "panel_id", "row_id", "row_version", "panel_versi
                        "intent", "dry_run", "confirm", "idempotency_key", "tier_seen", "gesture_seen"})
 _INTENTS = ("reported", "sign")
 # The one param a signed verb (VerbSpec.sign, DESIGN_SIGN D5) takes beside its fields: the id of the sign request the
-# operator's passkey signed for these params. The kernel admits it only when the server says that request was filed by its
-# compose route for this verb and exactly these params and is signed, and the send's idempotency key is SIGN_KEY_PREFIX +
-# the draft id that compose was filed under (_require_sign_request, ``signed_for``); the verb's own handler or effect still
-# verifies the signature over the params, so the write token alone never sends a signed verb.
+# operator's passkey signed for these params. The kernel admits it only when the server says a compose route filed that
+# request for this verb and exactly these params (the durable binding beside the Signer's requests, which outlives a
+# restart) and it is signed, and the send's idempotency key is SIGN_KEY_PREFIX + the draft id that compose was filed under
+# (_require_sign_request, ``signed_for``); the verb's own handler or effect still verifies the signature over the params,
+# so the write token alone never sends a signed verb.
 SIGN_PARAM = "sign_request"
 SIGN_KEY_PREFIX = "sign-"
 GESTURES = ("direct", "direct-reported", "sign", "refused", "laptop-only")
-# ``signed_for(verb, request_id, params)``: the draft id (``client_txn``) the server's compose filed ``request_id`` under
-# for ``verb`` and exactly ``params`` (the params without SIGN_PARAM), when its Signer holds that request signed; else None
+# ``signed_for(verb, request_id, params)``: the draft id (``client_txn``) a compose bound ``request_id`` to, durably, for
+# ``verb`` and exactly ``params`` (the params without SIGN_PARAM), when the Signer holds that request signed; else None.
+# It may raise ``EditError`` (503) when that binding cannot be read: a refusal would drop a signed draft that may have sent
 SignedFor = Callable[[str, str, dict[str, Any]], "str | None"]
 
 
@@ -104,8 +106,10 @@ def _require_sign_request(verb: "VerbSpec", params: dict[str, Any], signed_for: 
     """A signed verb fails closed in the kernel: unless ``signed_for`` says its SIGN_PARAM names a request filed for this
     verb and exactly these params and signed, and the request's idempotency ``key`` is SIGN_KEY_PREFIX + the draft id it
     was filed under, it never reaches its handler or effect (a dry run included). So one signed request is sent under one
-    key, which the at-most-once gate dedupes: a re-post under a fresh key, or none, is refused. A caller with no
-    ``signed_for`` (no Signer to ask) sends no signed verb at all. The door still verifies the signature."""
+    key, which the at-most-once gate dedupes: a re-post under a fresh key, or none, is refused. This check runs before
+    that gate, so it reads the durable binding, never one server's memory: the retry of a send that landed passes it
+    after a restart and reaches the gate's replay. A caller with no ``signed_for`` (no Signer to ask) sends no signed
+    verb at all. The door still verifies the signature."""
     from levain.sign_request_id import request_id_ok
 
     if not verb.sign:

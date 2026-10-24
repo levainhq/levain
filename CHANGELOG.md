@@ -43,10 +43,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   Each draft carries one id (`client_txn`) for its whole life: the compose route names the same request for it while
   that request is open, and the send is keyed by it, so a lost reply, a retry or a reload files one request and sends
   once, at any tier: a signed verb is deduped by that key whatever its `idempotent` says. The kernel refuses a signed
-  verb on every route, a dry run included, before its handler runs, unless its `sign_request` names a request this
-  server's compose route filed for that verb and exactly those params and the Signer holds signed, and its
-  `idempotency_key` is `sign-` plus that draft's id (a signed request is sent under one key only); and
-  `ActionVerb(sign=True, job=True)` is refused. `GET /cockpit/sign/<id>.json` reads one request whatever the listing's
+  verb on every route, a dry run included, before its handler runs, unless its `sign_request` names a request a
+  compose route filed for that verb and exactly those params and the Signer holds signed, and its `idempotency_key` is
+  `sign-` plus that draft's id (a signed request is sent under one key only); and `ActionVerb(sign=True, job=True)` is
+  refused. Which request each draft filed is kept in the Signer's sign directory (`sign/.compose.json`), so a restart
+  or any number of other drafts never forgets it: a send that landed and lost its reply is answered with its first
+  reply when it is sent again within the at-most-once window (24 hours), and runs once. A record goes when its request is denied, removed or expires unsigned,
+  and at the latest 48 hours after its compose. A `make_server` that fails part way through attaching to the caller's
+  cockpit puts the cockpit back as it was and releases its pin on the Signer. `GET /cockpit/sign/<id>.json` reads one request whatever the listing's
   cap. Without a `compose_signer` a signed verb is not sent at all. A request through an `extra_hosts` name is treated as
   off the box: the cockpit's reads need the token there too. `levain.consent.sign.passkey_key_source` is the passkey
   key source the phone page uses, for an embedder building the Signer.
@@ -342,12 +346,8 @@ This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which
   its commands; run `levain update --path ~/.levain/coordinator` from the Levain that starts it.
 - A signed send refused outright for a reason other than its signature (a confirm, a stale row) drops its signed draft,
   so sending it again asks the passkey once more.
-- The cockpit remembers which request each signed draft filed in memory only, and each tab gives a draft its own id
-  (the same words sent from two tabs file two requests): after a restart, or past 256 drafts, a draft files a new
-  request, and a draft signed but not yet sent is refused and signed again.
+- Each tab gives a signed draft its own id, so the same words sent from two tabs file two requests.
 - Nothing caps how many sign requests a write-token holder can file through the compose route.
-- A `make_server` that fails after it has pinned the Signer (attaching to the caller's cockpit) leaves the Signer
-  pinned; the cockpit is left as it was.
 - A proxy is recognised by the `extra_hosts` names and forwarding headers; a proxy that sends neither and names
   `127.0.0.1` reads as local.
 

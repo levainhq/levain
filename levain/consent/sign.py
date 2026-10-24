@@ -47,6 +47,11 @@ refused, with the reason, never skipped. The result lands beside the request:
     with the deny, which a request changed since is refused. The request file is never deleted here, so a caller
     can tell a denial from an expiry.
 
+A cockpit's compose route (:func:`levain.web_server.make_server`'s ``compose_signer``) also records, in
+``<queue_dir>/sign/.compose.json`` (:data:`COMPOSE_BINDINGS`), which request each signed draft filed, for which verb and
+params (:func:`bind_compose`, :func:`compose_bindings`): the kernel's sign check reads it, so it outlives the server
+that wrote it, and a binding leaves only with its request or its age (:data:`BINDING_KEEP_S`).
+
 The rules, each a refusal before anything is signed:
 
   - a namespace is ``[a-z0-9][a-z0-9.-]{2,63}``, never begins ``levain``, is none of :data:`REFUSED_NAMESPACES`
@@ -126,12 +131,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from levain import unshowable
+from levain.idempotency import DEFAULT_WINDOW_S as _GATE_WINDOW_S
 from levain.sign_request_id import ID as _ID, request_id_ok
 
-__all__ = ["CHOICE_FORMAT", "CHOICE_MARK", "ERROR_WORDS", "LIST_MAX", "LOCK_WAIT_S", "MESSAGE_MAX", "OPTIONS_MAX",
-           "REFUSED_NAMESPACES", "REQUEST_FORMAT", "SIGN_DIR", "WRITE_IN_KEY", "SignRefused", "SignRequest", "Signer",
-           "choice_line", "deep_link", "error_word", "namespace_problem", "parse_choice", "passkey_key_source",
-           "read_request", "request_id_ok", "sign_dir", "sign_root", "signed_bytes", "state_of", "write_in_problem"]
+__all__ = ["BINDING_KEEP_S", "CHOICE_FORMAT", "CHOICE_MARK", "COMPOSE_BINDINGS", "ERROR_WORDS", "LIST_MAX",
+           "LOCK_WAIT_S", "MESSAGE_MAX", "OPTIONS_MAX", "REFUSED_NAMESPACES", "REQUEST_FORMAT", "SIGN_DIR",
+           "WRITE_IN_KEY", "SignRefused", "SignRequest", "Signer", "bind_compose", "choice_line", "compose_bindings",
+           "deep_link", "error_word", "namespace_problem", "parse_choice", "passkey_key_source", "read_request",
+           "request_id_ok", "sign_dir", "sign_root", "signed_bytes", "state_of", "write_in_problem"]
 
 REQUEST_FORMAT = "levain-sign-request/1"
 CHOICE_FORMAT = "levain-sign-choice/1"
@@ -154,6 +161,17 @@ REFUSED_NAMESPACES = frozenset({"git", "file", "email"})
 # how long an answer or a deny waits for the queue lock another Signer holds (its writes take milliseconds), then a 503
 LOCK_WAIT_S = 5.0
 _LOCK_POLL_S = 0.02
+# The compose route's bindings (levain.web_server, DESIGN_SIGN D5): which request each signed draft's compose filed, for
+# which verb and params, in one file in the sign directory. The leading dot is outside the request id grammar, so no
+# listing reads it as a request. Kept durably because the kernel's sign check reads it before the at-most-once gate
+# replays a signed send: a binding lost to a restart would refuse the retry of a send that landed.
+COMPOSE_BINDINGS = ".compose.json"
+_BINDING_KEYS = frozenset({"verb", "txn", "params", "request", "filed_at"})
+# A binding leaves when its request does (bind_compose), and at the latest this long after its compose: twice the
+# at-most-once gate's window (levain.idempotency.DEFAULT_WINDOW_S), so it outlasts the replay of any send made within
+# one window of its compose; past the gate's window a replay is gone anyway, and a refusal then asks the passkey
+BINDING_KEEP_S = 2 * _GATE_WINDOW_S
+_BINDINGS_MAX = 16 * 1024 * 1024        # bytes of the bindings file one read takes; past it the read is refused (503)
 
 
 class SignRefused(Exception):
@@ -585,6 +603,92 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _binding_problem(b: Any) -> str | None:
+    if not isinstance(b, dict) or set(b) != _BINDING_KEYS or not all(isinstance(v, str) for v in b.values()):
+        return f"a binding has exactly the string keys {sorted(_BINDING_KEYS)}"
+    if not (request_id_ok(b["txn"]) and request_id_ok(b["request"]) and b["verb"] and b["params"]):
+        return "a binding names a draft id, a request id, a verb and a params fingerprint"
+    try:
+        filed = datetime.fromisoformat(b["filed_at"])
+    except ValueError:
+        filed = None
+    if filed is None or filed.tzinfo is None:
+        return "a binding's filed_at is an ISO 8601 time with a zone"
+    return None
+
+
+def compose_bindings(queue_dir: Path) -> "list[dict[str, str]]":
+    """Every binding :func:`bind_compose` recorded on this queue, oldest first: ``{verb, txn, params, request,
+    filed_at}``. ``[]`` only when there is no file. A file that is there and cannot be read whole, or holds anything
+    but well-formed bindings, is :class:`SignRefused` (503), never read as empty: a binding it hid would turn a lost
+    answer's retry into a refusal, and the operator's next signature into a second send."""
+    path = sign_dir(queue_dir) / COMPOSE_BINDINGS
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise SignRefused(f"could not read {path}: [Errno {exc.errno}] {exc.strerror or exc}", 503) from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise SignRefused(f"{path} is not a regular file", 503)
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            raw = fh.read(_BINDINGS_MAX + 1)
+    except OSError as exc:
+        raise SignRefused(f"could not read {path}: [Errno {exc.errno}] {exc.strerror or exc}", 503) from None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > _BINDINGS_MAX:
+        raise SignRefused(f"{path} is over {_BINDINGS_MAX} bytes", 503)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise SignRefused(f"{path} is not UTF-8 JSON", 503) from None
+    if not isinstance(data, list):
+        raise SignRefused(f"{path} is not a list of bindings", 503)
+    for b in data:
+        problem = _binding_problem(b)
+        if problem is not None:
+            raise SignRefused(f"{path}: {problem}", 503)
+    return data
+
+
+def _binding_live(queue_dir: Path, b: "dict[str, str]", now: datetime) -> bool:
+    """A binding stays while its request may still be sent: signed, or open and unexpired (an open request whose file
+    cannot be read stays too, since nothing says it left). It leaves with its request (denied; gone; expired while
+    open, so never signable) and, whatever its request says, once filed more than :data:`BINDING_KEEP_S` ago."""
+    if (now - datetime.fromisoformat(b["filed_at"])).total_seconds() > BINDING_KEEP_S:
+        return False
+    state = state_of(queue_dir, b["request"])
+    if state != "open":
+        return state == "signed"
+    try:
+        request = read_request(queue_dir, b["request"])
+    except SignRefused:
+        return False                                  # gone
+    return request.expires_at is None or request.expires_at > now
+
+
+def bind_compose(queue_dir: Path, verb: str, txn: str, params: str, request_id: str) -> None:
+    """Record, durably, that the compose of draft ``txn`` filed ``request_id`` for ``verb`` and the params whose
+    fingerprint is ``params`` (``levain.web_server``'s compose route, DESIGN_SIGN D5): a new binding beside every
+    other, under the queue lock, written whole and flushed to disk before this returns, with the bindings whose
+    request left (:func:`_binding_live`) dropped in the same write. Never by count: a binding goes only with its
+    request or its age. :class:`SignRefused` (503) when the lock, the read or the write fails; the file is then
+    left as it was."""
+    path = sign_dir(queue_dir) / COMPOSE_BINDINGS
+    now = _now()
+    new = {"verb": verb, "txn": txn, "params": params, "request": request_id, "filed_at": now.isoformat()}
+    problem = _binding_problem(new)
+    if problem is not None:
+        raise ValueError(problem)
+    with _queue_lock(queue_dir):
+        kept = [b for b in compose_bindings(queue_dir) if _binding_live(queue_dir, b, now)]
+        _publish(_write_over, path, json.dumps(kept + [new], separators=(",", ":")), "")
+
+
 def _row(rid: str, request: SignRequest, signers: "list[str]") -> dict[str, Any]:
     """One listing row (:meth:`Signer.page`, :meth:`Signer.row`): a refused request carries ``refused``, its
     ``sha256`` and none of its text."""
@@ -610,8 +714,9 @@ class Signer:
     come from exactly, set by the caller: the phone port's own origin when its name is ``localhost`` (else None,
     which holds the page to ``https://<rp_id>``), or the https name and port a cockpit serves the ceremony on
     (:func:`levain.web_server.make_server` refuses a missing or malformed one). A server that takes the Signer pins
-    it (:meth:`pin_page_origin`): from then on a different ``page_origin`` is refused, so the origin every
-    verification reads is the one the server checked, and nothing can move it under a ceremony in flight."""
+    it (:meth:`pin_page_origin`): while any server holds a pin a different ``page_origin`` is refused, so the origin
+    every verification reads is the one the server checked, and nothing can move it under a ceremony in flight. Only a
+    server that failed before it served releases its pin (:meth:`release_pin`)."""
 
     def __init__(self, queue_dir: Path, namespaces: "tuple[str, ...]", rp_id: str, keys: Any) -> None:
         for ns in namespaces:
@@ -620,7 +725,7 @@ class Signer:
                 raise ValueError(f"--sign-namespace: {problem}")
         self.queue_dir, self.namespaces, self.rp_id, self._keys = Path(queue_dir), tuple(namespaces), rp_id, keys
         self._page_origin: str | None = None
-        self._pinned = False
+        self._pins = 0          # the servers holding it pinned (pin_page_origin, release_pin): pinned while any does
         self._lock = threading.Lock()
         # request id -> (file sha256, signer fp, chosen option key or None, the write-in's words or None) at challenge
         self._challenged: dict[str, tuple[str, str, str | None, str | None]] = {}
@@ -633,20 +738,30 @@ class Signer:
     @page_origin.setter
     def page_origin(self, value: str | None) -> None:
         with self._lock:
-            if self._pinned and value != self._page_origin:
+            if self._pins and value != self._page_origin:
                 raise ValueError(f"refusing page_origin {str(value)[:120]!r}: a server holds this Signer pinned to "
                                  f"{self._page_origin!r}; build a new Signer for another page")
             self._page_origin = value
 
     def pin_page_origin(self, problem: "Callable[[str | None], str | None]") -> None:
         """Pin ``page_origin`` as it is now, if ``problem`` (called on it under the same lock a set takes) says
-        nothing is wrong with it; else raise ``ValueError`` with the problem and pin nothing. Pinning an already
-        pinned Signer checks it again and changes nothing."""
+        nothing is wrong with it; else raise ``ValueError`` with the problem and pin nothing. Each pin is one holder's:
+        pinning an already pinned Signer checks it again, keeps its page_origin and adds a holder, and it stays pinned
+        until every holder has released its pin (:meth:`release_pin`)."""
         with self._lock:
             found = problem(self._page_origin)
             if found is not None:
                 raise ValueError(found)
-            self._pinned = True
+            self._pins += 1
+
+    def release_pin(self) -> None:
+        """Release one holder's pin: a server that pinned this Signer and then failed before it served anything
+        (:func:`levain.web_server.make_server`). The pins of other holders stay; with none left, ``page_origin`` may
+        be set again."""
+        with self._lock:
+            if self._pins <= 0:
+                raise ValueError("release_pin: this Signer holds no pin")
+            self._pins -= 1
 
     def _ours(self, request: SignRequest) -> bool:
         """A request in a namespace this port signs, or a refused one whose namespace no signer could own (malformed,

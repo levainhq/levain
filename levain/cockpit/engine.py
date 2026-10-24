@@ -420,6 +420,9 @@ class _Decisions:
     spec: "ProviderSpec | None" = None
 
 
+_DEC_FIELDS = ("source", "rows", "consent", "questions", "notes", "spec")     # every _Decisions field, for attachments
+
+
 def _composed(ctx: "ReadContext") -> Result:
     return Fault("the decisions panel is composed by the kernel; it has no read of its own")
 
@@ -627,6 +630,27 @@ class Cockpit:
     def _check_verbs(self, view: Any) -> None:
         for spec in self._specs.values():
             _check_compose_verbs(spec, view)
+
+    def attachments(self) -> tuple[Any, ...]:
+        """What a server's attaches change (the verb view, the broker's capture and edits reader, the decisions
+        panel's contributors and its registration), taken whole, for :meth:`restore_attachments`: a server that fails
+        part way through attaching (``make_server``) puts back exactly this, so the cockpit is as it was."""
+        with self._lock:
+            return (self._verb_view, self._capture, self._edits_reader,
+                    tuple(getattr(self._dec, f) for f in _DEC_FIELDS), self._specs, self._state,
+                    dict(self._rowsets), set(self._hero_yields))
+
+    def restore_attachments(self, taken: tuple[Any, ...]) -> None:
+        """Put back what :meth:`attachments` took. The registry is copy-on-write, so the dicts taken are the ones a
+        reader held then; the row-set owners and hero yields, changed in place, are put back in place."""
+        with self._lock:
+            self._verb_view, self._capture, self._edits_reader, dec, self._specs, self._state, rowsets, heroes = taken
+            for f, v in zip(_DEC_FIELDS, dec):
+                setattr(self._dec, f, v)
+            self._rowsets.clear()
+            self._rowsets.update(rowsets)
+            self._hero_yields.clear()
+            self._hero_yields.update(heroes)
 
     def attach_labeller(self, fn: Callable[[], LabelSnapshot]) -> None:
         """Attach a labels-only source: ``fn()`` is ONE journal read, taken once per request (design
