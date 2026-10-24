@@ -2443,6 +2443,14 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-needpill { fill: var(--bad); stroke: var(--base); stroke-width: 1.5px; }
 .tv-needtxt { fill: var(--on-accent); font: var(--fw-bold) 13px var(--round); pointer-events: none; }
 .tv-needopen { cursor: pointer; } .tv-needopen:focus-visible .tv-needpill { stroke: var(--text); stroke-width: 2px; }
+.tv-hubmark, .tv-hubmark * { pointer-events: none; }
+.tv-rt-ring { fill: none; stroke: var(--bad); stroke-width: 1; opacity: .38; }
+.tv-rt-card { stroke: var(--bad); stroke-width: 1.5; opacity: .75; }
+.tv-rt-b { fill: none; stroke: var(--bad); stroke-width: 2.4; stroke-linecap: butt; stroke-linejoin: miter; }
+.tv-rt-lead { fill: none; stroke: var(--bad); stroke-width: 1.2; opacity: .8; }
+.tv-rt-br { transform-box: fill-box; transform-origin: center; }
+@media (prefers-reduced-motion: no-preference) { .tv-reticle.arrive .tv-rt-br { animation: tv-rtclose .6s cubic-bezier(.2, .8, .2, 1) both; } }   /* finite, once on arrival (10-15) */
+@keyframes tv-rtclose { from { transform: scale(1.34); opacity: 0; } }
 .tv-needhit { fill: transparent; stroke: none; pointer-events: all; cursor: pointer; }
 .tv-facebg { fill: var(--base); fill-opacity: .82; }
 .tv-tagpill { fill: var(--accent); }
@@ -2496,7 +2504,7 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 @keyframes tv-breathe { 50% { box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 22%, transparent); } }
 @keyframes tv-needflash { 50% { opacity: .2; } }
 @keyframes tv-ring { 50% { transform: scale(0.82); opacity: .3; } }
-.tv-replaying .tv-task.waiting, .tv-replaying .tv-rec, .tv-replaying .tv-pulse, .tv-replaying .tv-needring { animation: none; }       /* a frame from the ledger is still: nothing breathes or pulses */
+.tv-replaying .tv-task.waiting, .tv-replaying .tv-rec, .tv-replaying .tv-pulse, .tv-replaying .tv-needring, .tv-replaying .tv-hubmark * { animation: none; }       /* a frame from the ledger is still: nothing breathes or pulses */
 @container (max-width: 520px) { .tv-right { margin-left: 0; } .tv-bar { align-items: flex-start; } .tv-task-h { flex-wrap: wrap; } }
 .tv-more { align-self: flex-start; border: 1px solid var(--hair-2); background: none; color: var(--label); border-radius: var(--r-md); padding: var(--sp-1) var(--sp-4); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
 .tv-more:hover { background: var(--card-2); color: var(--text); }

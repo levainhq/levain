@@ -28,7 +28,7 @@ def _needy() -> dict:
 
 BADGE = "%s.querySelector('.tv-needbadge[data-needfor=\"%%s\"]')" % TV
 HUB_MARK = ("JSON.stringify([...%s.querySelectorAll('.tv-needbadge[data-needfor=hub]')].map(b => [b.querySelector('.tv-needtxt').textContent, "
-            "b.querySelector('title').textContent, !!%s.querySelector('.tv-ghub .tv-needring')]))") % (TV, TV)
+            "b.querySelector('title').textContent, !!%s.querySelector('.tv-ghub .tv-hubmark')]))") % (TV, TV)
 ALL = "JSON.stringify({hub: %s.querySelectorAll('.tv-needbadge[data-needfor=hub]').length, nodes: Object.fromEntries(['n1','n2','n3','n4','n5'].map(i => [i, %s.querySelectorAll('.tv-needbadge[data-needfor=\"node:' + i + '\"]').length]))})" % (TV, TV)
 HIT = "%s.querySelector('.tv-needhit[data-needhitfor=\"%%s\"]')" % TV                       # the transparent tap pad: a separate layer BENEATH the nodes
 
@@ -171,7 +171,7 @@ def test_a_badge_with_no_card_id_at_all_is_a_label_not_a_button(tmp_path, monkey
 def test_the_ring_flashes_unless_the_phone_asks_for_reduced_motion(tmp_path, monkeypatch):
     from tests.test_cockpit_k7_build import _sessions_fixture
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    anim = "JSON.stringify(getComputedStyle(%s.querySelector('.tv-ghub .tv-needring')).animationName)" % TV
+    anim = "JSON.stringify(getComputedStyle(%s.querySelector('.tv-gnode[data-node=n3] .tv-needring')).animationName)" % TV     # a seat's ring: the desk's mark has its own cadence (a direction of its own)
     out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_needy(), "agents")}, {"motion": "no-preference"}, {"eval": anim},
                                {"motion": "reduce"}, {"eval": anim}])
     assert json.loads(out[-2]) == "tv-needflash" and json.loads(out[-1]) == "none", out
