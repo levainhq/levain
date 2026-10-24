@@ -760,6 +760,18 @@ def _health(source: SubstrateSource) -> Callable[[ReadContext], Result]:
             ("tombstones", h.tombstones),
         ):
             metrics.append({"label": label, "value": value, "unit": None, "status": "unknown", "read": None})
+        for label, value, status in (
+            ("last save (hours ago)", h.save_age_hours, "unknown"),  # unrounded: the renderers round once
+            ("projection", ("unknown" if h.projection_note else None) if h.projection_converged is None else (
+                "converged" if h.projection_converged else
+                ("file missing" if h.projection_note == "continuity file missing" else "diverged")),
+             "unknown" if h.projection_converged is None else ("ok" if h.projection_converged else "bad")),
+            ("projection note", h.projection_note, "unknown"),
+            ("audit write failures", h.audit_backlog,
+             "unknown" if h.audit_backlog is None else ("ok" if not h.audit_backlog else "bad")),
+        ):
+            if value is not None:
+                metrics.append({"label": label, "value": value, "unit": None, "status": status, "read": None})
         alerts = [{"message": "a wrap is in progress; this snapshot may be inconsistent", "severity": "warn"}] \
             if h.wrap_in_progress else []
         return Read(value={"metrics": metrics, "alerts": alerts})

@@ -24,6 +24,7 @@ HELPER_DIR: Mapping[str, Path] = {"darwin": Path("/usr/local/libexec/levain"),
                                   "linux": Path("/usr/libexec/levain")}                            # §2.1
 ROOT_GROUP = {"darwin": "wheel", "linux": "root"}
 
+POOL_LOCK_NAME = "pool.lock"         # the one file install writes in L/slots/ (CONTRACT §2.1)
 RESERVE_BYTES = 1_342_177_280          # CONTRACT §11 V6
 _MIB = 1 << 20
 
@@ -80,7 +81,7 @@ def base_store_rows(host: HostOS, operator: str) -> list[Row]:
         # §2.1: the per-front_uid registration counters (§4.9), CONTROL's like the session records beside them.
         Row(L / "sessions" / "front-reg", "_levain_control", "_levain_control", 0o700),
         _root(host, L / "slots", 0o755),
-        _root(host, L / "slots" / "pool.lock", 0o600, "file"),
+        _root(host, L / "slots" / POOL_LOCK_NAME, 0o600, "file"),
         _root(host, L / "retained", 0o700),
         _root(host, L / "trash", 0o700),
         _root(host, L / "staging", 0o711),
