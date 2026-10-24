@@ -91,3 +91,28 @@ def test_a_row_naming_a_malformed_request_is_refused_and_counted_never_drawn_uns
     p = ck.panel("decisions", credential_class="token")
     assert f"question:{a.n}" not in {r["id"] for r in p["rows"]}
     assert p["skipped"] == [{"count": 1, "reason": "row refused: a facet value of the wrong type"}], p
+
+
+def test_the_sign_facet_validator_needs_no_fcntl() -> None:
+    """complement LOW (L3 r2): the registry's ``sign`` validator imports the request-id rule lazily; it lives in a module
+    with no ``fcntl`` (``levain.consent`` imports it), so where ``fcntl`` is missing a bad facet is still a
+    ``FacetValueError``, never an ``ImportError``. Run in a child so the hidden module touches no other test."""
+    import subprocess
+    import sys
+
+    code = ("import sys; sys.modules['fcntl'] = None\n"
+            "from levain.cockpit.registry import FacetValueError, validate_facets\n"
+            f"validate_facets({{'sign': {{'request': {RID!r}}}}})\n"
+            "try:\n    validate_facets({'sign': {'request': 'x'}})\nexcept FacetValueError:\n    print('refused')\n"
+            "from levain.consent.sign import request_id_ok\n")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         cwd=Path(__file__).resolve().parent.parent)
+    assert out.stdout.strip() == "refused", out.stderr[-2000:]
+    assert "fcntl" in out.stderr                             # sign.py itself still needs fcntl: the re-export is its own
+
+
+def test_sign_re_exports_the_request_id_rule() -> None:
+    from levain import sign_request_id
+    from levain.consent import sign
+
+    assert sign.request_id_ok is sign_request_id.request_id_ok and sign._ID is sign_request_id.ID

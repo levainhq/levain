@@ -126,6 +126,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from levain import unshowable
+from levain.sign_request_id import ID as _ID, request_id_ok
 
 __all__ = ["CHOICE_FORMAT", "CHOICE_MARK", "ERROR_WORDS", "LIST_MAX", "LOCK_WAIT_S", "MESSAGE_MAX", "OPTIONS_MAX",
            "REFUSED_NAMESPACES", "REQUEST_FORMAT", "SIGN_DIR", "WRITE_IN_KEY", "SignRefused", "SignRequest", "Signer",
@@ -142,7 +143,6 @@ _TEXT_MAX = 200                    # characters of a title or a requester
 _FILE_MAX = 64 * 1024              # a request file past this is not read
 LIST_MAX = 50                      # open requests one listing shows; past it the page shows how many were left
 _SCAN_MAX = 4096                   # directory entries one listing looks at
-_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
 _NAMESPACE = re.compile(r"[a-z0-9][a-z0-9.-]{2,63}")
 _KEYS = frozenset({"format", "id", "namespace", "message", "title", "requester", "expires_at"})
 _CHOICE_KEYS = _KEYS | {"options"}
@@ -154,12 +154,6 @@ REFUSED_NAMESPACES = frozenset({"git", "file", "email"})
 # how long an answer or a deny waits for the queue lock another Signer holds (its writes take milliseconds), then a 503
 LOCK_WAIT_S = 5.0
 _LOCK_POLL_S = 0.02
-
-
-def request_id_ok(request_id: object) -> bool:
-    """True iff ``request_id`` is a sign request id (what a request file is named by, and a cockpit row's `sign` facet
-    carries)."""
-    return isinstance(request_id, str) and _ID.fullmatch(request_id) is not None
 
 
 class SignRefused(Exception):
@@ -597,7 +591,9 @@ class Signer:
     :class:`SignRefused` saying why there are none to ask. ``page_origin`` is the page a passkey's assertion must
     come from exactly, set by the caller: the phone port's own origin when its name is ``localhost`` (else None,
     which holds the page to ``https://<rp_id>``), or the https name and port a cockpit serves the ceremony on
-    (:func:`levain.web_server.make_server` refuses a missing or malformed one)."""
+    (:func:`levain.web_server.make_server` refuses a missing or malformed one). A server that takes the Signer pins
+    it (:meth:`pin_page_origin`): from then on a different ``page_origin`` is refused, so the origin every
+    verification reads is the one the server checked, and nothing can move it under a ceremony in flight."""
 
     def __init__(self, queue_dir: Path, namespaces: "tuple[str, ...]", rp_id: str, keys: Any) -> None:
         for ns in namespaces:
@@ -605,10 +601,34 @@ class Signer:
             if problem is not None:
                 raise ValueError(f"--sign-namespace: {problem}")
         self.queue_dir, self.namespaces, self.rp_id, self._keys = Path(queue_dir), tuple(namespaces), rp_id, keys
-        self.page_origin: str | None = None
+        self._page_origin: str | None = None
+        self._pinned = False
         self._lock = threading.Lock()
         # request id -> (file sha256, signer fp, chosen option key or None, the write-in's words or None) at challenge
         self._challenged: dict[str, tuple[str, str, str | None, str | None]] = {}
+
+    @property
+    def page_origin(self) -> str | None:
+        """The page a passkey's assertion must come from exactly (see the class doc)."""
+        return self._page_origin
+
+    @page_origin.setter
+    def page_origin(self, value: str | None) -> None:
+        with self._lock:
+            if self._pinned and value != self._page_origin:
+                raise ValueError(f"refusing page_origin {str(value)[:120]!r}: a server holds this Signer pinned to "
+                                 f"{self._page_origin!r}; build a new Signer for another page")
+            self._page_origin = value
+
+    def pin_page_origin(self, problem: "Callable[[str | None], str | None]") -> None:
+        """Pin ``page_origin`` as it is now, if ``problem`` (called on it under the same lock a set takes) says
+        nothing is wrong with it; else raise ``ValueError`` with the problem and pin nothing. Pinning an already
+        pinned Signer checks it again and changes nothing."""
+        with self._lock:
+            found = problem(self._page_origin)
+            if found is not None:
+                raise ValueError(found)
+            self._pinned = True
 
     def _ours(self, request: SignRequest) -> bool:
         """A request in a namespace this port signs, or a refused one whose namespace no signer could own (malformed,
@@ -762,14 +782,15 @@ class Signer:
         if key is None:
             raise SignRefused(f"{bound[1]} is no longer an active passkey enrolled for {self.rp_id}")
         message = signed_bytes(request, bound[2], bound[3])
+        page_origin = self.page_origin
         try:
             signature = to_sshsig(key.public_key, b64url_decode(req["authenticator_data"], "authenticator_data"),
                                   b64url_decode(req["client_data_json"], "client_data_json"),
                                   b64url_decode(req["signature"], "signature"), namespace=request.namespace,
-                                  page_origin=self.page_origin)
+                                  page_origin=page_origin)
         except PasskeyError as exc:
             raise SignRefused(str(exc)) from None
-        problem = answer_signature_problem(signature, key.public_key, self.page_origin)
+        problem = answer_signature_problem(signature, key.public_key, page_origin)
         if problem is not None:
             raise SignRefused(problem)
         try:

@@ -53,8 +53,9 @@ def _is_str_list(v: Any) -> bool:
 
 
 def _is_sign_facet(v: Any) -> bool:
-    """``{"request": <id>}`` and nothing else, the id as :mod:`levain.consent.sign` accepts one."""
-    from levain.consent.sign import request_id_ok
+    """``{"request": <id>}`` and nothing else, the id as :mod:`levain.consent.sign` accepts one (its rule lives in
+    :mod:`levain.sign_request_id`, which needs no ``fcntl``)."""
+    from levain.sign_request_id import request_id_ok
 
     return isinstance(v, dict) and set(v) == {"request"} and request_id_ok(v["request"])
 
