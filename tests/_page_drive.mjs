@@ -130,6 +130,8 @@ for (const s of steps) {
     media["prefers-color-scheme"] = s.scheme;
     await send("Emulation.setEmulatedMedia", { features: Object.entries(media).map(([name, value]) => ({ name, value })) });
     await sleep(300);
+  } else if (s.focus !== undefined) {
+    await send("Emulation.setFocusEmulationEnabled", { enabled: !!s.focus });         // a headless page is never the focused window: without this no focusin / focusout fires
   } else if (s.motion !== undefined) {
     media["prefers-reduced-motion"] = s.motion;
     await send("Emulation.setEmulatedMedia", { features: Object.entries(media).map(([name, value]) => ({ name, value })) });

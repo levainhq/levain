@@ -2435,6 +2435,7 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-needpill { fill: var(--bad); stroke: var(--base); stroke-width: 1.5px; }
 .tv-needtxt { fill: var(--on-accent); font: var(--fw-bold) 13px var(--round); pointer-events: none; }
 .tv-needopen { cursor: pointer; } .tv-needopen:focus-visible .tv-needpill { stroke: var(--text); stroke-width: 2px; }
+.tv-needhit { fill: transparent; stroke: none; pointer-events: all; }
 .tv-facebg { fill: var(--base); fill-opacity: .82; }
 .tv-tagpill { fill: var(--accent); }
 .tv-facetag { fill: var(--meta); font: var(--fw-bold) 10px var(--round); }
