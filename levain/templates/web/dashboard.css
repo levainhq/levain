@@ -481,6 +481,10 @@
   svg.scope .ch1 { stroke: var(--series-1); }
   svg.scope .ch2 { stroke: var(--accent); }
   svg.scope .ch3 { stroke: var(--series-2); }
+  svg.scope .trace-dot { stroke: none; }
+  svg.scope .trace-dot.ch1 { fill: var(--series-1); }
+  svg.scope .trace-dot.ch2 { fill: var(--accent); }
+  svg.scope .trace-dot.ch3 { fill: var(--series-2); }
   /* read-side instrument controls — METAL (materiality rule), real verbs only:
      timebase redraws the window; a channel chip solos its trace (CSS-only). */
   .scope-bar { display: flex; gap: var(--sp-2); align-items: center; margin: 0 0 var(--sp-3); }
@@ -509,8 +513,11 @@
   /* solo: hide the other traces (visibility, not opacity — the glow's breathe
      animation owns opacity and would override a static opacity rule) */
   .scope-wrap[data-solo="ch1"] svg.scope polyline:not(.ch1),
+  .scope-wrap[data-solo="ch1"] svg.scope circle:not(.ch1),
   .scope-wrap[data-solo="ch2"] svg.scope polyline:not(.ch2),
-  .scope-wrap[data-solo="ch3"] svg.scope polyline:not(.ch3) { visibility: hidden; }
+  .scope-wrap[data-solo="ch2"] svg.scope circle:not(.ch2),
+  .scope-wrap[data-solo="ch3"] svg.scope polyline:not(.ch3),
+  .scope-wrap[data-solo="ch3"] svg.scope circle:not(.ch3) { visibility: hidden; }
   .scope-wrap[data-solo="ch1"] .scope-ch:not(.ch1),
   .scope-wrap[data-solo="ch2"] .scope-ch:not(.ch2),
   .scope-wrap[data-solo="ch3"] .scope-ch:not(.ch3) { opacity: .4; }

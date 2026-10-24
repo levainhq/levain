@@ -439,3 +439,67 @@ out.old = trace({ wraps: wrapsOf([0, 0, 3]), health: { total_wraps: 3 } });
     assert labels(out["never"]) == ["Episodes", "Graduations"], out["never"]      # a store that never formed links has no such channel
     assert labels(out["old"]) == ["Episodes", "Graduations", "Links"], out["old"]  # an anneal that cannot say keeps the channel as it was
     assert out["old"]["links"] == [3]
+
+
+_TRACE_PRELUDE = r"""
+const num = (x) => { const n = +x; return Number.isFinite(n) ? n : 0; };
+const fmt = (n) => String(n), panel = () => el("div", "panel");
+const memWrapTotal = (view) => (view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : null);
+const wrapsOf = (links) => links.map((l) => ({ episodes_compressed: 5, graduations_validated: 1, associations_formed: l, associations_strengthened: 0 }));
+const trace = (view) => {
+  const p = renderGraph({}, view);
+  const legend = all(p, (x) => /\bscope-legend\b/.test(x.className))[0];
+  const chips = legend ? legend.kids.map((c) => c.kids.map((k) => k.textContent)) : [];
+  const dots = all(p, (x) => x.tag === "circle" && /ch3/.test(x.attrs.class || ""));
+  const lines = all(p, (x) => x.tag === "polyline" && /trace-core ch3/.test(x.attrs.class || ""));
+  const notes = all(p, (x) => /\bnote\b/.test(x.className)).map((x) => x.textContent);
+  return { chips, dots: dots.length, lines: lines.length, notes };
+};
+"""
+
+
+def test_a_one_point_links_series_is_drawn_as_a_visible_point(tmp_path: Path) -> None:
+    from tests.test_cockpit_k2_shell import _cut, _node
+    fn = _cut("  function renderGraph(entry, view) {", "  // a tier that faulted")
+    out = _node(_MOCK + _TRACE_PRELUDE + r"""
+// formation went off after wrap 1, which formed 4 links: exactly one drawn Links point
+out.one = trace({ wraps: wrapsOf([0, 0, 0, 4]), health: { total_wraps: 4 }, graph: { nodes: [], edges: [], formation_off_at_wrap: 1 } });
+out.many = trace({ wraps: wrapsOf([0, 0, 7, 4]), health: { total_wraps: 4 }, graph: { nodes: [], edges: [], formation_off_at_wrap: 2 } });
+""", tmp_path, fn)
+    assert out["one"]["dots"] == 1 and out["one"]["lines"] == 0, out["one"]       # a polyline of one point draws nothing: a circle does
+    assert out["many"]["dots"] == 0 and out["many"]["lines"] == 1, out["many"]
+
+
+def test_the_links_channel_never_invents_wrap_numbers_when_the_total_is_unknown(tmp_path: Path) -> None:
+    from tests.test_cockpit_k2_shell import _cut, _node
+    fn = _cut("  function renderGraph(entry, view) {", "  // a tier that faulted")
+    out = _node(_MOCK + _TRACE_PRELUDE + r"""
+// health failed (no total) but the capped history loaded, and formation is off after wrap 60
+out.nototal = trace({ wraps: wrapsOf([0, 0, 0, 5, 5, 5]), graph: { nodes: [], edges: [], formation_off_at_wrap: 60 } });
+""", tmp_path, fn)
+    labels = [c[0] for c in out["nototal"]["chips"]]
+    assert not any(l.lower().startswith("links") for l in labels), out["nototal"]          # no channel labelled by counted-back numbers
+    assert out["nototal"]["lines"] == 0 and out["nototal"]["dots"] == 0, out["nototal"]
+    assert any("wrap numbers unknown" in n for n in out["nototal"]["notes"]), out["nototal"]  # and it says why
+
+
+def test_a_timebase_with_no_link_samples_reads_no_samples_not_zero(tmp_path: Path) -> None:
+    from tests.test_cockpit_k2_shell import _cut, _node
+    fn = _cut("  function renderGraph(entry, view) {", "  // a tier that faulted")
+    out = _node(_MOCK + _TRACE_PRELUDE + r"""
+// 30 wraps, formation off after wrap 3: the newest 24 hold no pre-cut link sample
+const links = [...Array(27).fill(0), 7, 5, 2];
+const view = { wraps: wrapsOf(links), health: { total_wraps: 30 }, graph: { nodes: [], edges: [], formation_off_at_wrap: 3 } };
+const p = renderGraph({}, view);
+const tbs = all(p, (x) => /\bscope-tb\b/.test(x.className));
+out.tbs = tbs.length;
+const click = (b) => { for (const f of b.listeners || []) f(); };
+Node.prototype.addEventListener = function (t, f) { (this.listeners = this.listeners || []).push(f); };
+const p2 = renderGraph({}, view);
+const tb2 = all(p2, (x) => /\bscope-tb\b/.test(x.className));
+click(tb2[1]);   // the 24-wrap timebase
+const legend = all(p2, (x) => /\bscope-legend\b/.test(x.className))[0];
+out.chips = legend.kids.map((c) => c.kids.map((k) => k.textContent));
+""", tmp_path, fn)
+    link = [c for c in out["chips"] if c[0].lower().startswith("links")]
+    assert link and link[0][1] == "no samples", out["chips"]

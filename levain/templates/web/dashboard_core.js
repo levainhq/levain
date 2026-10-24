@@ -1645,13 +1645,16 @@
     // is newest-first and capped, so a row's wrap number is counted back from the authoritative total.
     const off = view.graph && Number.isInteger(view.graph.formation_off_at_wrap) ? view.graph.formation_off_at_wrap : null;
     const totalWraps = memWrapTotal(view);
+    // with the total unknown (health failed) the capped history cannot be numbered, so the cut cannot be placed on it
     const wrapNo = new Map(series.map((w, k) => [w, (totalWraps !== null ? totalWraps : series.length) - k]));
     const linkVal = (w) => num(w.associations_formed) + num(w.associations_strengthened);
     const CHANNELS = [
       { label: "Episodes", cls: "ch1", val: (w) => num(w.episodes_compressed) },
       { label: "Graduations", cls: "ch2", val: (w) => num(w.graduations_validated) },
     ];
+    let noteTail = "";
     if (off === null) CHANNELS.push({ label: "Links", cls: "ch3", val: linkVal });
+    else if (totalWraps === null) noteTail = " · links not drawn — wrap numbers unknown";
     else if (series.some((w) => wrapNo.get(w) <= off && linkVal(w) > 0)) {
       CHANNELS.push({ label: "links (formation off since wrap " + off + ")", cls: "ch3", val: linkVal,
         drawn: (w) => wrapNo.get(w) <= off });
@@ -1708,7 +1711,15 @@
           .map((v, i) => (live[i] ? `${X(i).toFixed(1)},${(H - PAD - (v / gain) * (H - 2 * PAD)).toFixed(1)}` : null))
           .filter((x) => x !== null)
           .join(" ");
-        for (const layer of (pts ? ["trace-glow", "trace-core"] : [])) {
+        if (shown.length === 1) {
+          // a one-point polyline draws nothing: a lone sample is a visible point
+          const m = pts.split(",");
+          const dot = document.createElementNS(NS, "circle");
+          dot.setAttribute("cx", m[0]); dot.setAttribute("cy", m[1]); dot.setAttribute("r", "3");
+          dot.setAttribute("class", `trace-dot ${ch.cls}`);
+          svg.appendChild(dot);
+        }
+        for (const layer of (pts && shown.length > 1 ? ["trace-glow", "trace-core"] : [])) {
           const pl = document.createElementNS(NS, "polyline");
           pl.setAttribute("points", pts);
           pl.setAttribute("class", `${layer} ${ch.cls}`);
@@ -1718,7 +1729,7 @@
         }
         const chip = el("button", `scope-ch ${ch.cls}`);
         chip.appendChild(el("span", "scope-ch-l", ch.label));
-        chip.appendChild(el("span", "scope-ch-v", `${fmt(shown.length ? shown[shown.length - 1] : 0)} · max ${fmt(actualMax)}`));
+        chip.appendChild(el("span", "scope-ch-v", shown.length ? `${fmt(shown[shown.length - 1])} · max ${fmt(actualMax)}` : "no samples"));
         chip.type = "button";
         chip.title = "solo this channel (click again for all)";
         chip.setAttribute("aria-pressed", solo === ch.cls ? "true" : "false");
@@ -1731,7 +1742,7 @@
         legend.appendChild(chip);
       }
       scopeBox.replaceChildren(svg);
-      note.textContent = `oldest → newest`;   // the consolidation / node / edge counts are the card's header line (composeMemory)
+      note.textContent = "oldest → newest" + noteTail;  // the consolidation / node / edge counts are the card's header line (composeMemory)
     }
 
     p.appendChild(wrap);

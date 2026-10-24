@@ -527,10 +527,12 @@ class TestManifestMapperParses:
         assert view["health"]["status"] == "live"
 
     def test_the_write_path_words_map_to_a_status(self) -> None:
-        for word, live, status in (("no wraps yet", False, "no-wraps"), ("unreadable", False, "unreadable"), ("dark", False, "unreadable")):
-            full = [self._metric("write path", word)] + [self._metric(k, 1) for k in self.FIGURES]
+        # legacy "dark" is decided by the wraps figure: wraps > 0 -> live, 0 -> no-wraps (fix1's ruled mapping)
+        for word, wraps, live, status in (("no wraps yet", 1, False, "no-wraps"), ("unreadable", 1, False, "unreadable"),
+                                          ("dark", 1, True, "live"), ("dark", 0, False, "no-wraps")):
+            full = [self._metric("write path", word)] + [self._metric(k, wraps if k == "wraps" else 1) for k in self.FIGURES]
             h = _view(snapshot(self._health(full)))["health"]
-            assert (h["write_path_live"], h["status"]) == (live, status), word
+            assert (h["write_path_live"], h["status"]) == (live, status), (word, wraps)
 
     def test_an_absent_health_figure_degrades_the_panel_not_a_printed_zero(self) -> None:
         for drop in ("tombstones", "write path"):
