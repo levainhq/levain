@@ -205,3 +205,37 @@ def test_encode_frame_is_length_prefixed_json():
     n = int.from_bytes(raw[:4], "big")
     assert n == len(raw) - 4 and json.loads(raw[4:]) == {"t": "hello", "proto": 1, "allowedDomains": [],
                                                          "deniedDomains": []}
+
+
+# --- L3 r1 fixes (chd2_s2/L3_r1_findings.md) ------------------------------------------------------------------------
+
+def test_m2_remove_headers_aggregate_bytes_limit():
+    assert wire.MAX_REMOVE_BYTES == 64 << 10
+    assert wire.allow_frame(1, ["x" * (64 << 10)])["removeHeaders"] == ["x" * (64 << 10)]
+    with pytest.raises(WireError):
+        wire.allow_frame(1, ["x" * ((64 << 10) + 1)])
+    with pytest.raises(WireError):
+        wire.allow_frame(1, ["a" * (32 << 10), "b" * ((32 << 10) + 1)])
+    # counted after fold + dedupe: two spellings of one name are one name
+    half = (40 << 10)
+    assert wire.allow_frame(1, ["a" * half, "A" * half])["removeHeaders"] == ["a" * half]
+
+
+@pytest.mark.parametrize("raw,n", [
+    ("0" * 5000, 0), ("0" * 5000 + "5", 5), ("9" * 5000, None), ("0" * 4000 + str(2 ** 63 - 1), 2 ** 63 - 1),
+    ("0" * 4000 + str(2 ** 63), None), ("1" + "0" * 19, None),
+])
+def test_m3_declared_length_never_raises_on_long_digits(raw, n):
+    assert wire.declared_length(raw) == n
+
+
+def test_l1_wire_fold_is_ascii_only():
+    assert wire.fold_name("Key") == "Key"
+
+
+@pytest.mark.parametrize("bad", ["a\ud800b", "\udfff"])
+def test_l2_lone_surrogate_is_a_wire_error(bad):
+    with pytest.raises(WireError):
+        wire.deny_frame(2, 403, bad)
+    with pytest.raises(WireError):
+        wire.encode_frame({"t": "verdict", "id": 2, "action": "deny", "status": 403, "reason": bad})

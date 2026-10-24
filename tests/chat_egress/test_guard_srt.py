@@ -59,11 +59,18 @@ def probe_addresses(ranges) -> list[str]:
         cands += [int(n[0]) - 1] if int(n[0]) > 0 else []
         cands += [int(n[-1]) + 1] if int(n[-1]) < top else []
         for c in cands:
-            out += _forms(ipaddress.ip_address(c) if n.version == 6 else ipaddress.IPv4Address(c))
+            out += _forms(ipaddress.IPv6Address(c) if n.version == 6 else ipaddress.IPv4Address(c))
     for a in PUBLIC_V4:
         out += _forms(ipaddress.ip_address(a))
     out += PUBLIC_V6
     return sorted(set(out), key=lambda s: (":" in s, s))
+
+
+def table_probes(table) -> list[str]:
+    """The per-address probe set: the table's networks AND every network Levain requires covered (front's set and
+    the running Python's non-global ranges, `guard.required_networks`), so a required network the table holds only
+    inside a supernet (`::1/128` inside `::/96`) is probed at its own edges too."""
+    return probe_addresses(list(table) + [str(n) for n in guard.required_networks()])
 
 
 def violations(verdicts: dict) -> list[str]:
@@ -81,7 +88,7 @@ def table() -> list[str]:
 
 
 def test_r15_17_3_asymmetric_complete_through_srt(tmp_path, table, verdict):
-    addrs = probe_addresses(table)
+    addrs = table_probes(table)
     v = srt_verdicts(tmp_path, {"generated": table}, addrs)["verdicts"]["generated"]
     assert violations(v) == []
     more = sorted(a for a, x in v.items() if x == "refused" and not guard.expected_dial_refusal(a))
@@ -147,3 +154,8 @@ def test_r15_10_a5_srt_refuses_the_ambiguous_targets(tmp_path, raw, srt_refuses,
     assert parse.walls(p) in {"path", "use_w2_push"}          # the Python layer walls every one of them
     verdict(f"S2 R15-10-A5 {raw}", "walls path / use_w2_push",
             f"srt refusal={t['refusal'] is not None}; python wall={parse.walls(p)}")
+
+
+def test_m4_v6_probes_stay_v6(table):
+    """L3 r1 M4: a v6 network's probes are IPv6 even below 2^32 (`ip_address(int)` would read `::1` as 0.0.0.1)."""
+    assert {"::", "::1", "::2"} <= set(table_probes(table))

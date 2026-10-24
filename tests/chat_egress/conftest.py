@@ -28,11 +28,16 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
-    srt_reason = envmod.srt_skip_reason()
+    # This hook sees the whole session's items, so the srt probe is lazy: it runs only when a collected item carries
+    # the chat_egress_srt marker (an unrelated run never shells out to node), and at most once.
+    srt_reason: list[str | None] = []
     in_ci = bool(os.environ.get("CI"))
     for item in items:
-        if item.get_closest_marker("chat_egress_srt") and srt_reason:
-            item.add_marker(pytest.mark.skip(reason=srt_reason))
+        if item.get_closest_marker("chat_egress_srt"):
+            if not srt_reason:
+                srt_reason.append(envmod.srt_skip_reason())
+            if srt_reason[0]:
+                item.add_marker(pytest.mark.skip(reason=srt_reason[0]))
         if item.get_closest_marker("chat_egress_network") and (in_ci or os.environ.get("CHD2_SKIP_NETWORK") == "1"):
             item.add_marker(pytest.mark.skip(reason="needs the public internet (CI or CHD2_SKIP_NETWORK=1)"))
         if item.get_closest_marker("chat_egress_slow") and in_ci and os.environ.get("CHD2_SLOW") != "1":

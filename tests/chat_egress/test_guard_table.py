@@ -164,3 +164,58 @@ def test_the_table_ships_in_the_wheel():
     from pathlib import Path
     cfg = tomllib.loads((Path(guard.__file__).resolve().parents[2] / "pyproject.toml").read_text())
     assert "chat_egress/denied_table.json" in cfg["tool"]["setuptools"]["package-data"]["levain"]
+
+
+# --- H2: load_table verifies SEMANTIC coverage at load (chd2_s2/L3_r1_findings.md) ----------------------------------
+
+def _write(tmp_path, table) -> "Path":
+    p = tmp_path / "denied_table.json"
+    p.write_text(json.dumps(table))
+    return p
+
+
+def test_h2_a_table_missing_10_8_is_refused_at_load(tmp_path):
+    t = copy.deepcopy(committed())
+    t["ranges"].remove("10.0.0.0/8")
+    with pytest.raises(guard.DeniedTableError, match="10.0.0.0/8"):
+        guard.load_table(_write(tmp_path, t))
+
+
+def test_h2_a_narrower_range_does_not_cover(tmp_path):
+    t = copy.deepcopy(committed())
+    t["ranges"][t["ranges"].index("10.0.0.0/8")] = "10.0.0.0/9"
+    with pytest.raises(guard.DeniedTableError, match="10.0.0.0/8"):
+        guard.load_table(_write(tmp_path, t))
+
+
+def test_h2_containment_not_string_compare(tmp_path):
+    """A wider range covers a narrower required one: semantic containment, so a supernet is enough."""
+    t = copy.deepcopy(committed())
+    t["ranges"] = [r for r in t["ranges"] if not r.startswith("10.")] + ["10.0.0.0/7"]
+    assert "10.0.0.0/7" in guard.load_table(_write(tmp_path, t))
+
+
+def test_h2_a_python_with_an_extra_non_global_range_is_refused(monkeypatch):
+    extra = ipaddress.ip_network("9.9.9.0/24")
+    real = guard.python_non_global
+    monkeypatch.setattr(guard, "python_non_global", lambda: real() + [extra])
+    with pytest.raises(guard.DeniedTableError, match="9.9.9.0/24"):
+        guard.load_table()
+
+
+def test_h2_a_front_range_missing_is_refused(monkeypatch):
+    monkeypatch.setattr(front, "_REFUSED_NETS", front._REFUSED_NETS + (ipaddress.ip_network("9.9.8.0/24"),))
+    with pytest.raises(guard.DeniedTableError, match="9.9.8.0/24"):
+        guard.load_table()
+
+
+def test_h2_malformed_table_is_the_typed_error(tmp_path):
+    t = copy.deepcopy(committed())
+    t["ranges"].append("nope")
+    with pytest.raises(guard.DeniedTableError):
+        guard.load_table(_write(tmp_path, t))
+    assert issubclass(guard.DeniedTableError, ValueError)
+
+
+def test_h2_the_committed_table_loads():
+    assert guard.load_table() == tuple(committed()["ranges"])

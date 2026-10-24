@@ -272,3 +272,50 @@ def test_one_fold_function():
     from levain.chat_egress import wire
     assert parse.fold_name is wire.fold_name
     assert fold_name("X_Api.Key") == "x-api-key"
+
+
+# --- L3 r1 fixes (chd2_s2/L3_r1_findings.md) ------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw", [
+    "faß.example", "faẞ.example", "FAẞ.example", "FAß.example",   # H1: U+1E9E lower-cases to ß; the codec maps it to ss
+    "ας.example", "ας.Example", "ΑΣ",                              # final sigma: spelled, and as lower() makes it
+    "a‍b.example", "a‌b.example",                        # ZWJ, ZWNJ
+])
+def test_h1_deviation_refused_after_case_normalisation(raw):
+    with pytest.raises(ValueError, match="deviation"):
+        canonical_host(raw)
+
+
+def test_h1_a_capital_sigma_followed_by_a_letter_is_not_a_deviation():
+    """lower() reads `Σ` as `σ` unless it is word-final, and the codec and UTS 46 both map it to `σ`: one A-label."""
+    assert canonical_host("Σα.example") == canonical_host("σα.example")
+    assert canonical_host("ΑΣ.example") == canonical_host("ασ.example")   # the `.e` that follows makes it non-final
+
+
+@pytest.mark.parametrize("raw", ["127.0x1", "0x7f.0x1", "1.0x", "a.0X1F", "example.0x"])
+def test_l3_whatwg_numeric_last_label_refused(raw):
+    with pytest.raises(ValueError):
+        canonical_host(raw)
+
+
+@pytest.mark.parametrize("raw", ["0xfoo.example", "a.0xg", "a.x0"])
+def test_l3_a_hex_looking_label_that_is_no_number_stays_dns(raw):
+    assert canonical_host(raw) == raw
+
+
+def test_m1_names_dedupe_is_linear():
+    import time
+    query = "&".join(f"k{i}=v" for i in range(40_000))
+    t0 = time.perf_counter()
+    p = parse.parse(frame(query=query))
+    took = time.perf_counter() - t0
+    assert len(p.query_keys) == 40_000 and list(p.query_keys)[:2] == ["k0", "k1"]
+    assert took < 1.0, took
+
+
+def test_l1_fold_is_ascii_only():
+    assert fold_name("K") == "K"                     # KELVIN SIGN: not `k`
+    assert fold_name("İ") == "İ" and fold_name("ſ") == "ſ"
+    assert fold_name("X_Api.Key") == "x-api-key"
+    p = parse.parse(frame(query="%E2%84%AAey=1"))
+    assert "key" not in p.query_keys and p.query_values("key") == ()

@@ -2,7 +2,7 @@
 R15-17-3). Run under the pinned Python (`guard.PINNED_PYTHON`); the output is a committed, reviewed artifact, so a
 run that changes it is a diff to review, never a silent refresh.
 
-usage: python tools/gen_denied_table.py [--check]
+usage: python scripts/gen_denied_table.py [--check]
   --check  exit 1, printing the problems, when the committed file is not the generated one; write nothing.
 """
 

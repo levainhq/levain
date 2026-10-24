@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Iterable, Iterator, Literal, Mapping
 
@@ -50,6 +51,8 @@ _LABEL = re.compile(r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?")
 #: Characters IDNA 2003 (the stdlib codec) maps where IDNA 2008 / UTS 46 non-transitional (what a client's URL
 #: parser uses) keeps them: one spelling would name two A-labels, so `canonical_host` refuses them.
 _IDNA_DEVIATIONS = frozenset("ßς‌‍")
+#: WHATWG's "ends in a number" last label (decimal, or `0x` hex, possibly empty): a URL parser reads the host as IPv4.
+_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
 _UNRESERVED = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 _HEX = frozenset(b"0123456789abcdefABCDEF")
 _PRINTABLE_PATH = re.compile(r"/[!-~]*")
@@ -81,12 +84,14 @@ class Names:
 
     def __init__(self, names: Iterable[str] = ()) -> None:
         order: list[str] = []
+        seen: set[str] = set()
         for n in names:
             f = fold_name(n)
-            if f not in order:
+            if f not in seen:   # a set beside the order list: O(1) per insert
+                seen.add(f)
                 order.append(f)
         self._order = tuple(order)
-        self._set = frozenset(order)
+        self._set = frozenset(seen)
 
     def __contains__(self, name: object) -> bool:
         return isinstance(name, str) and fold_name(name) in self._set
@@ -109,9 +114,11 @@ class Names:
     def matching(self, names: Iterable[str]) -> tuple[str, ...]:
         """The folded forms of `names` that are in this set, in `names`' order, each once."""
         out: list[str] = []
+        seen: set[str] = set()
         for n in names:
             f = fold_name(n)
-            if f in self._set and f not in out:
+            if f in self._set and f not in seen:
+                seen.add(f)
                 out.append(f)
         return tuple(out)
 
@@ -202,9 +209,11 @@ def canonical_host(host: str) -> str:
 
     An IP literal (IPv6 with or without brackets) comes back in Python's compressed form. Refused (ValueError): an
     empty name or label, a label over 63 or a name over 253 characters, anything but letters, digits, `-` and `_` in
-    a label (a label may not start or end with `-`), a port, a scope id, a name whose last label is all digits but is
-    no IP literal (a URL parser reads `1.2.3` as an IPv4 address), and a non-ASCII name holding a character IDNA 2003
-    and IDNA 2008 map differently (`ß`, final sigma, ZWJ, ZWNJ): one spelling must never name two hosts."""
+    a label (a label may not start or end with `-`), a port, a scope id, a name whose last label is a WHATWG number
+    but is no IP literal (decimal digits or `0x` hex: a URL parser reads `1.2.3` and `127.0x1` as IPv4 addresses), and
+    a non-ASCII name holding a character IDNA 2003 and IDNA 2008 map differently (`ß`, final sigma, ZWJ, ZWNJ),
+    looked for AFTER NFKC and lower-casing, so `ẞ` (lower-cases to `ß`) and a word-final `Σ` (to `ς`) are refused
+    too: one spelling must never name two hosts."""
     if not isinstance(host, str) or not host:
         raise ValueError("empty host")
     h = host
@@ -232,7 +241,7 @@ def canonical_host(host: str) -> str:
     if not h:
         raise ValueError("empty host")
     if not h.isascii():
-        if _IDNA_DEVIATIONS & set(h):
+        if any(_IDNA_DEVIATIONS & set(form) for form in _case_forms(h)):
             raise ValueError("an IDNA deviation character: the host has two A-label forms")
         try:
             h = h.encode("idna").decode("ascii")
@@ -245,9 +254,17 @@ def canonical_host(host: str) -> str:
     for lab in labels:
         if not _LABEL.fullmatch(lab):
             raise ValueError(f"bad label {lab!r}")
-    if labels[-1].isdigit():
-        raise ValueError("last label is all digits but the host is no IP literal")
+    if _NUMERIC_LABEL.fullmatch(labels[-1]):
+        raise ValueError("last label is a number but the host is no IP literal")
     return h
+
+
+def _case_forms(h: str) -> tuple[str, ...]:
+    """`h` as spelled and under each normalisation the codec or a client's UTS 46 mapping would apply before the
+    deviation characters matter: NFKC and lower-casing, in both orders. (`casefold` is not one: it maps `ß` to `ss`,
+    hiding the deviation.)"""
+    nfkc = unicodedata.normalize("NFKC", h)
+    return (h, nfkc, nfkc.lower(), unicodedata.normalize("NFKC", h.lower()), h.lower())
 
 
 def _percent_decode(raw: str) -> str:

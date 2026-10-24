@@ -66,12 +66,17 @@ GLUE_WALL_REASONS = frozenset({"port", "non_dns_host", "scheme"})
 MAX_REASON_BYTES = 1 << 10
 MAX_BODY = 32 << 20
 MAX_REMOVE_NAMES = 190
+#: srt's aggregate bound on an allow's `removeHeaders`: the sum of the names' UTF-8 bytes (decider-client.js).
+MAX_REMOVE_BYTES = 64 << 10
 _NEVER_REMOVED = frozenset({"host", "content-length", "transfer-encoding", "connection", "upgrade", "te", "trailer",
                             "keep-alive", "proxy-connection"})
 _TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 _CREDENTIAL = re.compile(r"[\x21-\x7e]{1,8192}")
 _REQUEST_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 _MAX_ID = 2 ** 53 - 1
+_MAX_LENGTH = str(2 ** 63 - 1)
+#: ASCII only: upper-case to lower-case, `_` and `.` to `-` (a Unicode `lower()` would fold U+212A to `k`).
+_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ_.", "abcdefghijklmnopqrstuvwxyz--")
 
 
 class WireError(ValueError):
@@ -84,10 +89,11 @@ def is_request_id(value: object) -> bool:
 
 
 def fold_name(name: str) -> str:
-    """The one name fold of this package: ASCII-lower-cased, `_` and `.` read as `-`. Equal to srt 0.0.81's
-    `foldHeaderName`, so a folded name in an allow's `removeHeaders` matches every spelling srt would forward. Header
-    names and query keys are folded by this one function (`parse.fold_name` is this object)."""
-    return name.lower().replace("_", "-").replace(".", "-")
+    """The one name fold of this package: ASCII-lower-cased (no other character changes), `_` and `.` read as `-`.
+    Equal to srt 0.0.81's `foldHeaderName` on every name srt folds (header names are ASCII tokens there), so a folded
+    name in an allow's `removeHeaders` matches every spelling srt would forward. Header names and query keys are
+    folded by this one function (`parse.fold_name` is this object)."""
+    return name.translate(_FOLD)
 
 
 # --- the observation channel ------------------------------------------------------------------------------------
@@ -177,7 +183,10 @@ def declared_length(raw: str | None) -> int | None:
     ASCII decimal integer below 2^63 (no sign, no space, no list); otherwise None. The raw text is never stored."""
     if not isinstance(raw, str) or not raw or not raw.isascii() or not raw.isdigit():
         return None
-    n = int(raw)
+    digits = raw.lstrip("0") or "0"   # compared by length before int(): no int() of an unbounded digit string
+    if len(digits) > len(_MAX_LENGTH):
+        return None
+    n = int(digits)
     return n if n < 2 ** 63 else None
 
 
@@ -341,6 +350,8 @@ def allow_frame(srt_id: int, remove_headers: Iterable[str] = (), *, cred: str | 
             names.append(f)
     if len(names) > MAX_REMOVE_NAMES:
         raise WireError("removeHeaders over srt's limit")
+    if sum(len(n.encode("utf-8")) for n in names) > MAX_REMOVE_BYTES:
+        raise WireError("removeHeaders over srt's byte limit")
     if (cred is None) != (credential is None):
         raise WireError("cred and credential go together")
     f: dict = {"t": "verdict", "id": _id(srt_id), "action": "allow"}
@@ -357,7 +368,11 @@ def deny_frame(srt_id: int, status: int, reason: str) -> dict:
     """A deny verdict: status 400..599, a reason of 1..1024 UTF-8 bytes with no control character but tab."""
     if not _int(status, 400, 599):
         raise WireError("deny status")
-    if not isinstance(reason, str) or not reason or len(reason.encode("utf-8")) > MAX_REASON_BYTES \
+    try:
+        size = len(reason.encode("utf-8")) if isinstance(reason, str) else 0
+    except UnicodeEncodeError:   # a lone surrogate
+        raise WireError("deny reason") from None
+    if not isinstance(reason, str) or not reason or size > MAX_REASON_BYTES \
             or any((ord(c) < 0x20 and c != "\t") or 0x7F <= ord(c) <= 0x9F for c in reason):
         raise WireError("deny reason")
     return {"t": "verdict", "id": _id(srt_id), "action": "deny", "status": status, "reason": reason}
@@ -372,5 +387,8 @@ def need_body_frame(srt_id: int, max_bytes: int) -> dict:
 
 def encode_frame(msg: Mapping[str, object]) -> bytes:
     """srt's framing: a 4-byte big-endian length, then that many bytes of one UTF-8 JSON object."""
-    raw = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    try:
+        raw = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8", "strict")
+    except UnicodeEncodeError:   # a lone surrogate somewhere in the message
+        raise WireError("frame is not UTF-8 encodable") from None
     return struct.pack(">I", len(raw)) + raw
