@@ -2443,6 +2443,13 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-needpill { fill: var(--bad); stroke: var(--base); stroke-width: 1.5px; }
 .tv-needtxt { fill: var(--on-accent); font: var(--fw-bold) 13px var(--round); pointer-events: none; }
 .tv-needopen { cursor: pointer; } .tv-needopen:focus-visible .tv-needpill { stroke: var(--text); stroke-width: 2px; }
+.tv-hubmark, .tv-hubmark * { pointer-events: none; }
+.tv-bz-track { fill: none; stroke: var(--hair-2); stroke-width: 1; opacity: .85; }
+.tv-bz-tick { stroke: var(--bad); stroke-width: 1; stroke-linecap: butt; opacity: .6; }
+.tv-bz-tick.maj { stroke-width: 1.7; opacity: 1; }
+.tv-bz-lub { fill: var(--bad); }
+@media (prefers-reduced-motion: no-preference) { .tv-bezel.sweep .tv-bz-tick { animation: tv-tickon .2s ease-out both; animation-delay: calc(var(--i) * 20ms); } }   /* finite: 60 x 20 ms, once; never loops (10-15) */
+@keyframes tv-tickon { from { stroke: var(--hair-2); opacity: .25; } }
 .tv-needhit { fill: transparent; stroke: none; pointer-events: all; cursor: pointer; }
 .tv-facebg { fill: var(--base); fill-opacity: .82; }
 .tv-tagpill { fill: var(--accent); }
@@ -2496,7 +2503,7 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 @keyframes tv-breathe { 50% { box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 22%, transparent); } }
 @keyframes tv-needflash { 50% { opacity: .2; } }
 @keyframes tv-ring { 50% { transform: scale(0.82); opacity: .3; } }
-.tv-replaying .tv-task.waiting, .tv-replaying .tv-rec, .tv-replaying .tv-pulse, .tv-replaying .tv-needring { animation: none; }       /* a frame from the ledger is still: nothing breathes or pulses */
+.tv-replaying .tv-task.waiting, .tv-replaying .tv-rec, .tv-replaying .tv-pulse, .tv-replaying .tv-needring, .tv-replaying .tv-hubmark * { animation: none; }       /* a frame from the ledger is still: nothing breathes or pulses */
 @container (max-width: 520px) { .tv-right { margin-left: 0; } .tv-bar { align-items: flex-start; } .tv-task-h { flex-wrap: wrap; } }
 .tv-more { align-self: flex-start; border: 1px solid var(--hair-2); background: none; color: var(--label); border-radius: var(--r-md); padding: var(--sp-1) var(--sp-4); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
 .tv-more:hover { background: var(--card-2); color: var(--text); }
