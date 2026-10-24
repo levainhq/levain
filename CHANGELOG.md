@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.22] — 2026-10-24
+
 ### Added
 - **The cockpit can sign answers and messages with your passkey.** An embedder that files levain sign requests (the
   phone page's ceremony) can now have the cockpit page run the same ceremony. `make_server` takes `signer=` (a
