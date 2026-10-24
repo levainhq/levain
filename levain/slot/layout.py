@@ -99,7 +99,9 @@ def base_store_rows(host: HostOS, operator: str) -> list[Row]:
         # levain-queue and the broker (a member) reads it; slots are not members.
         Row(L / "contracts", "_levain_dispatch", "levain-queue", 0o2750),
         _root(host, L / "policy", 0o755),
-        Row(L / "lineage", "_levain_control", "levain-lineage", 0o750),
+        # S1 3c-6 (H6-4): CONTROL's lineage sink. Setgid, so the sink CONTROL creates takes levain-lineage: on Linux a
+        # new file takes its creator's primary group (_levain_control) otherwise, and _levain_dispatch could not read it.
+        Row(L / "lineage", "_levain_control", "levain-lineage", 0o2750),
         Row(L / "keys", "_levain_keys", "_levain_keys", 0o700),
         _root(host, L / "routes", 0o755),
         # S1 3c-4: CONTROL writes the route maps here, keys reads them. Setgid, so every file CONTROL creates takes
