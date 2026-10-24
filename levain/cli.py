@@ -514,6 +514,24 @@ def main(argv: list[str] | None = None) -> int:
     ck_keys = ck_sub.add_parser("keys", help="List enrolled keys.")
     _ck_common(ck_keys)
     ck_keys.set_defaults(func=_cmd_cockpit_keys)
+    ck_pair = ck_sub.add_parser(
+        "pair",
+        help="Mint a one-time pairing link for a new device, from this box (or end every paired device).",
+        description=(
+            "Box-side pairing (the recovery path when no paired device or surface token is at hand): mints a "
+            "one-time code straight into the cockpit journal, minted by 'box', valid for 10 minutes, and prints the "
+            "pair link here, never to a log. Open it on the new device. --revoke-all ends every paired device "
+            "instead (each one's waiting pendings are cancelled)."),
+    )
+    _ck_common(ck_pair)
+    ck_pair.add_argument("--label", default=None,
+                         help="The new device's name in the devices panel (default: 'paired device').")
+    ck_pair.add_argument("--url", default=None,
+                         help="The cockpit's address as the device opens it (e.g. https://box.tailnet.ts.net:8443); "
+                              "without it the link is printed as a path to append to that address.")
+    ck_pair.add_argument("--revoke-all", action="store_true", dest="revoke_all",
+                         help="Revoke every paired device instead of minting a code.")
+    ck_pair.set_defaults(func=_cmd_cockpit_pair)
     ck_pending = ck_sub.add_parser("pending", help="List the cockpit's waiting pendings (read-only, no server).")
     _ck_common(ck_pending)
     ck_pending.set_defaults(func=_cmd_cockpit_pending)
@@ -3186,6 +3204,33 @@ def _sign_refusals() -> tuple[type[BaseException], ...]:
     from levain.cockpit.sign_client import SignRefused
 
     return (SignRefused, JournalCorruptError, ConsentError, *_cockpit_refusals())
+
+
+def _cmd_cockpit_pair(args: argparse.Namespace) -> int:
+    """``levain cockpit pair [--revoke-all]`` (PAIR RP-7, RP-8, RS-5): straight to the journal, as the box's own
+    user (its file permissions are the authority), minted by ``box``."""
+    from levain.cockpit.firejournal import CockpitDB, PairingError
+
+    try:
+        root = _cockpit_root(args)
+        if not (root / "cockpit.db").is_file():
+            print(f"pair: no cockpit journal under {root}: start `levain serve --write` once first", file=sys.stderr)
+            return 1
+        db = CockpitDB(root)
+        now = _utc_now()
+        if args.revoke_all:
+            gone = db.revoke_devices(None, by="box", now=now)
+            print(f"revoked {len(gone)} paired device(s)" + (": " + ", ".join(gone) if gone else ""))
+            return 0
+        code = db.mint_offer(label=args.label, minted_by="box", now=now)
+    except (PairingError, *_cockpit_refusals()) as exc:
+        print(f"pair: {_term_safe(exc)}", file=sys.stderr)
+        return 1
+    path = f"/pair#code={code}"
+    print(f"{args.url.rstrip('/')}{path}" if args.url else path)
+    print("one use, valid 10 minutes" + ("" if args.url else "; append the path to the cockpit's address"),
+          file=sys.stderr)
+    return 0
 
 
 def _cmd_cockpit_pending(args: argparse.Namespace) -> int:
