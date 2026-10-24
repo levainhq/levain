@@ -34,7 +34,8 @@ import levain.authority as auth  # noqa: E402
 from levain.cockpit.consent import utc_stamp  # noqa: E402
 from levain.cockpit.keys import fingerprint_of  # noqa: E402
 from levain.consent import ANSWER_NAMESPACE, AnswerRefused, ConsentQueue, answer_message, answer_payload  # noqa: E402
-from levain.consent.passkey import SIG_TYPE, _ecdsa_signature, _key_parts, challenge, public_key_line  # noqa: E402
+from levain.consent.passkey import (SIG_TYPE, _ecdsa_signature, _key_parts, authority_signature_problem, challenge,
+                                    public_key_line)  # noqa: E402
 from levain.consent.receipt_log import head as receipts_head  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
@@ -430,6 +431,28 @@ def test_a_quarantined_keys_past_link_without_uv_or_off_origin_is_refused_as_a_f
         _fresh(lg)
     assert ei.value.seq == 4, ei.value
     assert why in str(ei.value) and "quarantined" in str(ei.value) and pk.fp in str(ei.value), ei.value
+
+
+@pytest.mark.parametrize("origin, revoke, why", [
+    (f"{ORIGIN}:8443", True, None), (ORIGIN, True, None), (f"{ORIGIN}:65535", True, None),
+    (f"{ORIGIN}:8443", False, "exactly: no port"),                      # any link but a revoke: exactly, as before
+    ("https://other.example.ts.net:8443", True, f"not {ORIGIN}"),        # another name on a port
+    (f"http://{RP}:8443", True, f"not {ORIGIN}"), (f"{ORIGIN}:443", True, f"not {ORIGIN}"),
+    (f"{ORIGIN}:8443/x", True, f"not {ORIGIN}"), (f"https://u@{RP}:8443", True, f"not {ORIGIN}")])
+def test_the_authority_takes_a_revoke_from_the_keys_own_name_on_any_port_and_nothing_wider(origin, revoke, why):
+    """Phill 10-24 "2a": a ``revoke_grant`` signed on ``https://<the key's name>:<any port>`` verifies at replay; the
+    same name only (no other name, scheme, default port, path or userinfo), and every other link stays exact."""
+    pk = WebAuthnKey()
+    got = authority_signature_problem(pk.sign(b"m", auth.NAMESPACE, origin=origin), pk.public_key, revoke=revoke)
+    assert (got is None) if why is None else (got is not None and why in got), got
+
+
+def test_a_quarantined_keys_past_enrol_signed_on_a_port_is_refused_at_replay(tmp_path):
+    """The port is a revoke's only: the replay holds a quarantined key's past enrol link to the exact name."""
+    lg, pk, (a, b) = _history(tmp_path, SIGS["good"], {"origin": f"{ORIGIN}:8443"})
+    with pytest.raises(auth.ReplayError) as ei:
+        _fresh(lg)
+    assert ei.value.seq == 4 and "exactly: no port" in str(ei.value), ei.value
 
 
 def test_an_openssh_fido_key_at_custody_fido_still_signs(tmp_path):

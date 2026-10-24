@@ -42,7 +42,7 @@ from tests.test_phone_grants_tab import _grant
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
 NS = "flow-needs-phill"
-# the replay takes a passkey's revoke only from the key's own https name exactly, no port (levain.consent.passkey)
+# the replay takes a passkey's revoke from the key's own https name, on any port (Phill 10-24 "2a", levain.consent.passkey)
 PAGE = f"https://{RP}"
 PORTED = f"https://{RP}:8443"
 GID = "cg-0000000000d7"
@@ -93,21 +93,30 @@ def test_the_grant_routes_ride_the_sign_gate_and_revoke_a_real_grant(world, tmp_
     assert grant_listing(world.root, now=_now())[0] == []
 
 
-def test_a_cockpit_on_a_port_offers_no_passkey_revoke_and_says_why(world, tmp_path, monkeypatch) -> None:
-    """The replay refuses a revoke signed on ``https://<name>:8443`` (reproduced: 403 "the passkey signed on a page
-    that is not https://phone.example (exactly: no port); nothing was revoked", after the Face ID). So the listing
-    names no signer and says why, the page keeps the copy button, and a challenge is refused before any gesture."""
+def test_a_cockpit_on_a_port_signs_a_revoke_the_replay_takes(world, tmp_path, monkeypatch) -> None:
+    """Reproduced red before "2a" (Phill 10-24): the replay refused a revoke signed on ``https://<name>:8443`` (403 "the
+    passkey signed on a page that is not https://phone.example (exactly: no port); nothing was revoked", after the Face
+    ID), so the ported cockpit listed no signer. Now the listing names the passkey, the revoke lands, and a fresh replay
+    of the log verifies it. The page pin still holds: an assertion naming the unported page is refused here."""
     monkeypatch.setenv("LEVAIN_HOME", str(world.qdir.parent))
     _grant(world, GID, "Write")
     with _serving(tmp_path / "inst", signer=_signer(world, origin=PORTED), extra_hosts=[RP]) as (url, _httpd):
         status, listed = _call(url, "/cockpit/grant/list.json")
         assert status == 200 and listed["origin"] == PORTED, listed
         row = {g["id"]: g for g in listed["grants"]}[GID]
-        assert row["signers"] == [] and "exactly (no port)" in listed["grants_note"], listed
-        status, out = _call(url, f"/cockpit/grant/{GID}/revoke-challenge",
-                            {"signer_fp": world.phone.fp, "instance": row["instance"]})
-        assert (status, out["error"]) == (403, "not_a_signer") and "no port" in out["message"], out
-    assert [g.id for g in grant_listing(world.root, now=_now())[0]] == [GID]
+        assert row["signers"] == [world.phone.fp] and not listed["grants_note"], listed
+        q = urllib.parse.quote(GID, safe="")
+        status, c = _call(url, f"/cockpit/grant/{q}/revoke-challenge",
+                          {"signer_fp": world.phone.fp, "instance": row["instance"]})
+        assert status == 200, c
+        status, out = _call(url, f"/cockpit/grant/{q}/revoke", world.phone.assertion(c["challenge"], origin=PAGE))
+        assert (status, out["error"]) == (400, "bad_signature") and PORTED in out["message"], out
+        assert [g.id for g in grant_listing(world.root, now=_now())[0]] == [GID]
+        status, c = _call(url, f"/cockpit/grant/{q}/revoke-challenge",
+                          {"signer_fp": world.phone.fp, "instance": row["instance"]})
+        status, out = _call(url, f"/cockpit/grant/{q}/revoke", world.phone.assertion(c["challenge"], origin=PORTED))
+        assert status == 200 and out["revoked"] == GID, out
+    assert grant_listing(world.root, now=_now())[0] == []
 
 
 def test_without_a_signer_no_grant_route_exists(world, tmp_path, monkeypatch) -> None:

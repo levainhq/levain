@@ -1236,11 +1236,12 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             raise ReplayError(seq, f"the signature does not verify as {signer.fingerprint}")
         if signer.custody == PASSKEY or quarantined_history:
             # the checks ssh-keygen does not make on a WebAuthn signature (user verification, an origin that is
-            # exactly the key's own https name, not cross-origin), run at every replay, and on a quarantined key's
-            # link as on any passkey's: the stored signature carries its flags and origin
+            # the key's own https name, not cross-origin), run at every replay, and on a quarantined key's
+            # link as on any passkey's: the stored signature carries its flags and origin. A revoke_grant may come
+            # from that name on any port (a cockpit behind a proxy, Phill 10-24 "2a"); every other link, exactly
             from levain.consent.passkey import authority_signature_problem
 
-            problem = authority_signature_problem(row.signature, signer.public_key)
+            problem = authority_signature_problem(row.signature, signer.public_key, revoke=op == "revoke_grant")
             if problem is not None:
                 raise ReplayError(seq, f"the passkey signature is refused: {problem}"
                                        + (f" (signed by {signer.fingerprint}, quarantined: WebAuthn material stored "

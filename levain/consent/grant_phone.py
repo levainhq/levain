@@ -19,7 +19,8 @@ held link is taken on its first use, whatever the outcome.
 The page's token only opens the route: the authority is the passkey's signature, which the replay verifies. The one
 link a passkey may sign in the authority log is ``revoke_grant`` of a consent or inert grant (:mod:`levain.authority`);
 it only ever narrows what an agent may do. The log takes it only from a passkey made on an https name, so a phone
-port on ``localhost`` lists the grants with no signer and says why. ``keys`` and ``root`` are the server's callables
+port on ``localhost`` lists the grants with no signer and says why; from a page on that name, on any port (the
+cockpit's ``https://<name>:8443``), :func:`levain.consent.passkey.authority_signature_problem`. ``keys`` and ``root`` are the server's callables
 over the ONE cockpit the queue's consent hooks name; either may raise :class:`levain.consent.sign.SignRefused`,
 answered with its status. Stdlib only.
 """
@@ -95,12 +96,6 @@ class GrantPhone:
         if self.rp_id == "localhost":
             return {}, ("a passkey made on localhost cannot revoke a grant (the authority log takes a passkey's revoke "
                         "only from an https page): revoke from the laptop (levain consent grant revoke)")
-        if self.page_origin is not None and self.page_origin != f"https://{self.rp_id}":
-            # the replay verifies a revoke link against the key's own https name exactly, no port
-            # (levain.consent.passkey): a signature from this page would be refused there, so none is asked for
-            return {}, (f"the authority log takes a passkey's revoke only from https://{self.rp_id} exactly (no "
-                        f"port), and this page is {self.page_origin}: revoke from the phone page or the laptop "
-                        "(levain consent grant revoke)")
         try:
             keys = self._keys()
         except (SignRefused, AuthorityError, OSError, sqlite3.Error) as exc:

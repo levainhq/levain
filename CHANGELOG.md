@@ -16,6 +16,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   the signing button.
 
 ### Changed
+- **A passkey revoke signed on a port is accepted.** The authority log now takes a passkey's `revoke_grant` signed on
+  `https://<the passkey's own name>:<any port>`, as well as on `https://<name>`. So a cockpit served on a port, such
+  as `https://<name>:8443`, signs a grant revoke with the passkey instead of copying the command. Only the passkey's
+  own name is accepted, and only on a revoke. Every other passkey signature in the log must still come from exactly
+  `https://<name>`.
 - **A compose card pre-selects only the readers its provider declares.** A provider that relied on 0.11.21's built-in
   default reader, seat tap or departed-seat recovery must declare the keys below. Without them, the card starts with
   nothing pressed, so a message goes to everyone. Tapping a seat on the agents graph opens its agent page, and a
@@ -36,9 +41,6 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   refused at registration. The graph tap needs only `transient_prefix`.
 
 ### Known edges
-- The authority log takes a passkey's revoke only from the passkey's own https name with no port. A cockpit served
-  on a port, such as `https://<name>:8443`, lists no passkey that can revoke there, says why, and keeps the copy
-  button.
 - One revoke waits per grant on each page server: a second challenge for the same grant (another tab) replaces the
   first, whose passkey answer is then refused, and you ask again.
 - A metered call is priced by the request's `model` alone. A fallback list (`models`) or a `route` in the body is not

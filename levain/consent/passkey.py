@@ -257,6 +257,26 @@ def answer_signature_problem(signature: str, public_key: str, page_origin: "str 
     refusals therefore name a signature, never an answer."""
     try:
         _key_blob, application = _key_parts(public_key)
+    except (ValueError, struct.error, UnicodeError, binascii.Error, PasskeyError):
+        return "the passkey signature cannot be read"
+    read = _read_webauthn(signature)
+    if isinstance(read, str):
+        return read
+    flags, origin, client_data_json = read
+    if not flags & _FLAG_UV:
+        return "the passkey did not verify the user (Face ID, Touch ID or the device PIN)"
+    try:
+        if _client_origin(client_data_json, application, page_origin) != origin:
+            return "the signature's origin disagrees with its client data"
+    except PasskeyError as exc:
+        return str(exc)
+    return None
+
+
+def _read_webauthn(signature: str) -> "tuple[int, str, bytes] | str":
+    """``(flags, origin, clientDataJSON)`` of an armored SSHSIG carrying a WebAuthn signature, or why it is not one.
+    Reads only; it checks nothing a verifier decides on."""
+    try:
         text = signature.strip()
         head, tail = "-----BEGIN SSH SIGNATURE-----", "-----END SSH SIGNATURE-----"
         if not (text.startswith(head) and text.endswith(tail)):
@@ -294,23 +314,20 @@ def answer_signature_problem(signature: str, public_key: str, page_origin: "str 
         string()                       # extensions
         if at[0] != len(blob):
             return "the WebAuthn signature has trailing bytes"
-    except (ValueError, struct.error, UnicodeError, binascii.Error, PasskeyError):
+    except (ValueError, struct.error, UnicodeError, binascii.Error):
         return "the passkey signature cannot be read"
-    if not flags & _FLAG_UV:
-        return "the passkey did not verify the user (Face ID, Touch ID or the device PIN)"
-    try:
-        if _client_origin(client_data_json, application, page_origin) != origin:
-            return "the signature's origin disagrees with its client data"
-    except PasskeyError as exc:
-        return str(exc)
-    return None
+    return flags, origin, client_data_json
 
 
-def authority_signature_problem(signature: str, public_key: str) -> str | None:
+def authority_signature_problem(signature: str, public_key: str, *, revoke: bool = False) -> str | None:
     """Why ``signature`` is not a passkey signature the authority log takes, or None: :func:`answer_signature_problem`
     with no ``localhost`` key at all. A link in the log is re-verified at every replay with no page to pin, and a
     localhost origin then takes any port, so any program on this machine could have served the page that asked for
-    it. A key made on an https name is held to exactly ``https://<that name>``, the name its public key carries."""
+    it. A key made on an https name is held to ``https://<that name>``, the name its public key carries: exactly, or,
+    on a ``revoke`` link (``revoke_grant``, which only narrows what an agent may do), that same name on any port
+    (``https://<that name>:<port>``, as :func:`page_origin_problem` admits a pin: Phill 10-24 "2a", so a cockpit
+    served behind a proxy on a port can sign a revoke). The port is read from the signature's own origin and held
+    there exactly, so the client data must name it too; another name, another scheme or any other link is refused."""
     try:
         _key_blob, application = _key_parts(public_key)
     except (ValueError, struct.error, UnicodeError, binascii.Error, PasskeyError):
@@ -318,7 +335,13 @@ def authority_signature_problem(signature: str, public_key: str) -> str | None:
     if application == "localhost":
         return ("a passkey made on localhost signs no authority link (its page is http on this machine, which any "
                 "program here can serve); sign it with a passkey made on the phone page's https name")
-    return answer_signature_problem(signature, public_key)
+    page_origin = None
+    if revoke:
+        read = _read_webauthn(signature)
+        if (not isinstance(read, str) and read[1] != f"https://{application}"
+                and page_origin_problem(application, read[1]) is None):
+            page_origin = read[1]
+    return answer_signature_problem(signature, public_key, page_origin)
 
 
 def to_sshsig(public_key: str, authenticator_data: bytes, client_data_json: bytes, der_signature: bytes,
