@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -366,90 +367,88 @@ class AssociationGraph:
         }
 
 
-def _last_wrap_hash(db: Path) -> str | None:
-    """``wraps.content_hash`` of the last COMMITTED wrap (anneal >= 1.0.0: sha256 hex of the continuity text that
-    wrap saved), read-only. anneal's public API does not return it. None when there is no wrap, the column is
-    absent, the row predates it (NULL), or the db cannot be read: unknown, never a guess."""
+def _last_wrap_row(db: Path) -> tuple[str | None, str | None, str | None] | None:
+    """``(wrapped_at, content_hash, pair_id)`` of the last COMMITTED wraps row (anneal >= 1.0.0), read-only, in ONE
+    read, so the save age and the expected hash can never come from two different instants. ``content_hash`` is the
+    sha256 hex of the continuity text that wrap saved; ``pair_id`` names its tmp sidecar. Either may be NULL on a
+    migrated old row. None when there is no wrap, a column is absent, or the db cannot be read: unknown."""
     try:
         con = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
         try:
-            row = con.execute("SELECT content_hash FROM wraps ORDER BY id DESC LIMIT 1").fetchone()
+            row = con.execute("SELECT wrapped_at, content_hash, pair_id FROM wraps ORDER BY id DESC LIMIT 1").fetchone()
         finally:
             con.close()
     except (OSError, ValueError, sqlite3.Error):
         return None
-    return row[0] if row and isinstance(row[0], str) and row[0] else None
-
-
-def _file_hash(path: Path) -> str | None:
-    """sha256 hex of the continuity file's bytes (what anneal hashed is the text it wrote). None when the file is
-    absent or unreadable; ``_file_missing`` tells the two apart."""
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
+    if not row:
         return None
+    return tuple(v if isinstance(v, str) and v else None for v in row)  # type: ignore[return-value]
 
 
-def _file_missing(path: Path) -> bool:
+def _sha256_of(path: Path) -> tuple[str | None, bool]:
+    """``(hex, missing)``: sha256 of the file's bytes (what anneal hashed is the text it wrote). ``(None, True)``
+    when the file is absent; ``(None, False)`` when it exists but cannot be read (unknown, not missing)."""
     try:
-        path.stat()
+        return hashlib.sha256(path.read_bytes()).hexdigest(), False
     except FileNotFoundError:
-        return True
+        return None, True
     except OSError:
-        return False  # unreadable is unknown, not missing
-    return False
+        return None, False
 
 
-def _staged_sidecar(path: Path) -> bool:
-    """True while a wrap's continuity tmp sidecar sits beside the file. anneal v1.0.0 (store.py
-    ``_continuity_tmp_path``) writes ``<continuity_stem>.<token12>-<uuid8>.md.tmp`` in Phase 1, commits the wraps
-    row, and only then renames it over the file (continuity.py Phase 3), so the row can lead the file."""
-    try:
-        return any(path.parent.glob(f"{path.stem}.*.md.tmp"))
-    except OSError:
-        return False
-
-
-SETTLE_SECONDS = 120.0  # a wraps row this young may still be ahead of its rename
+def _sidecar_path(continuity: Path, pair_id: str) -> Path:
+    """anneal v1.0.0 ``Store._continuity_tmp_path``: ``final.with_name(f"{final.stem}.{suffix}.md.tmp")`` with the
+    wrap's ``<token12>-<uuid8>`` pair id as the suffix. Phase 1 writes it, the wraps row commits, Phase 3 renames
+    it over the file, so the row can lead the file by exactly this sidecar. Built, never globbed: another wrap's
+    leftover sidecar is not this wrap's."""
+    return continuity.with_name(f"{continuity.stem}.{pair_id}.md.tmp")
 
 
 def health_oracles(
-    status: Any, last_wrap_hash: str | None, file_hash: str | None, *, now: datetime | None = None,
-    file_missing: bool = False, staged: bool = False,
+    status: Any, row: tuple[str | None, str | None, str | None] | None, continuity: Path | None, *,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """The substrate oracles from facts the store already states (works on anneal 1.0.0; nothing here needs
-    1.0.2). Recency is the last COMMITTED save. Convergence is the sha256 of the continuity file against the
-    content_hash that save recorded: a mismatch (or a missing file) is a divergence, unless a staged sidecar exists
-    or the save is under SETTLE_SECONDS old, when the row may simply lead the rename (settling = None). The audit
-    backlog is the durable audit_write_failures count, the one audit fact a read-only open can see; 0 means none
-    recorded, not that the trail is complete. Each is None when it cannot be told, never a guessed ok."""
+    1.0.2). ``row`` is the latest wraps row, ``(wrapped_at, content_hash, pair_id)`` from ONE read: recency (the
+    last COMMITTED save) and the expected hash both come from it (status() supplies the audit counter, and the age
+    only when the row could not be read). Convergence is the sha256 of the continuity file against that
+    content_hash. A mismatch is "settling" (None) only when PROVEN: the exact sidecar for that row's pair_id exists
+    and hashes to the row's content_hash. Otherwise a missing file is False ("continuity file missing"), a
+    mismatch is False ("differs ... edited since?"), and anything unreadable or NULL where it is needed (hash,
+    pair_id) is None. The audit backlog is the durable audit_write_failures count, the one audit fact a read-only
+    open can see; 0 means none recorded, not that the trail is complete. Each is None when it cannot be told."""
+    wrapped_at, want, pair_id = row if row else (None, None, None)
     age: float | None = None
-    raw = getattr(status, "last_wrap_at", None)
+    raw = wrapped_at or getattr(status, "last_wrap_at", None)
     if raw:
         try:
             when = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
             if when.tzinfo is None:
                 when = when.replace(tzinfo=timezone.utc)
-            age = max(0.0, ((now or datetime.now(timezone.utc)) - when).total_seconds() / 3600.0)
+            ref = now if now is not None else datetime.now(timezone.utc)
+            if ref.tzinfo is None:  # a naive now compares in UTC, as build_substrate_view does
+                ref = ref.replace(tzinfo=timezone.utc)
+            age = max(0.0, (ref - when).total_seconds() / 3600.0)
         except ValueError:
             age = None
     converged: bool | None = None
     note: str | None = None
-    if getattr(status, "total_wraps", 0) and last_wrap_hash:
-        if file_missing:
-            mismatch, note = True, "continuity file missing"
-        elif file_hash:
-            mismatch, note = file_hash != last_wrap_hash, "continuity file differs from the last wrap (edited since?)"
+    if row and want and continuity is not None:
+        have, missing = _sha256_of(continuity)
+        if have is not None and have == want:
+            converged = True
+        elif have is None and not missing:
+            converged = None  # unreadable: unknown
+        elif not pair_id:
+            converged = None  # cannot prove settling without the pair id: unknown, never a guess
         else:
-            mismatch, note = None, None  # unreadable: unknown
-        if mismatch is None:
-            converged = None
-        elif not mismatch:
-            converged, note = True, None
-        elif staged or (age is not None and age * 3600.0 < SETTLE_SECONDS):
-            converged, note = None, None  # settling: the committed row can lead the file rename
-        else:
-            converged = False
+            side, _ = _sha256_of(_sidecar_path(continuity, pair_id))
+            if side is not None and side == want:
+                converged, note = None, "settling (wrap externalizing)"
+            elif missing:
+                converged, note = False, "continuity file missing"
+            else:
+                converged, note = False, "continuity file differs from the last wrap (edited since?)"
     failures = getattr(status, "audit_write_failures", None)
     return {
         "save_age_hours": age,
@@ -463,7 +462,7 @@ def health_oracle_line(h: "Health") -> str | None:
     """The one text line the renderers print for the oracles; None when none could be read."""
     bits: list[str] = []
     if h.save_age_hours is not None:
-        bits.append("last save " + (f"{h.save_age_hours:.0f}h ago" if h.save_age_hours >= 1 else "under 1h ago"))
+        bits.append("last save " + (f"{math.floor(h.save_age_hours + 0.5)}h ago" if h.save_age_hours >= 1 else "under 1h ago"))
     if h.projection_converged is not None:
         bits.append("projection converged" if h.projection_converged
                     else "PROJECTION DIVERGED (" + (h.projection_note or "continuity file differs from the last wrap (edited since?)") + ")")
@@ -1883,10 +1882,9 @@ def build_substrate_view(
                     wrap_in_progress=status.wrap_in_progress,
                     **health_oracles(
                         status,
-                        _last_wrap_hash(paths.episodic_db),
-                        _file_hash(paths.continuity_md),
-                        file_missing=_file_missing(paths.continuity_md),
-                        staged=_staged_sidecar(paths.continuity_md),
+                        _last_wrap_row(paths.episodic_db),
+                        paths.continuity_md,
+                        now=_now,
                     ),
                 )
             except data_faults as exc:

@@ -1092,7 +1092,6 @@ class TestSession2Gaps:
             store.wrap_started(token="w1", episode_ids=[e.id])
             store.wrap_completed(1, 20, wrap_token="w1", episode_ids=[e.id], pair_id="p1",
                                  content_hash=hashlib.sha256(md.read_bytes()).hexdigest())
-        monkeypatch.setattr("levain.dashboard.SETTLE_SECONDS", 0.0)  # past the settling window
 
         def metrics() -> dict:
             return {m["label"]: m for m in ck.panel("health")["value"]["metrics"]}

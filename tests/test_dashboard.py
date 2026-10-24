@@ -1271,24 +1271,32 @@ class TestHealthStatusFollowsTheOldKey:
 class TestHealthOracles:
     """The substrate oracles are facts about the last committed save, never an activity counter."""
 
-    def test_recency_convergence_audit_from_the_store_facts(self) -> None:
+    def test_recency_convergence_audit_from_the_store_facts(self, tmp_path: Path) -> None:
+        import hashlib
         from datetime import datetime, timezone
         from types import SimpleNamespace
 
         from levain.dashboard import health_oracles
 
+        md = tmp_path / "memory.continuity.md"
+        md.write_text("## State\nfoc\n", encoding="utf-8")
+        h = hashlib.sha256(md.read_bytes()).hexdigest()
         now = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
-        st = SimpleNamespace(last_wrap_at="2026-10-24T10:00:00", total_wraps=5, audit_write_failures=0)
-        ok = health_oracles(st, "a" * 64, "a" * 64, now=now)
+        st = SimpleNamespace(last_wrap_at="2026-10-24T09:00:00", total_wraps=5, audit_write_failures=0)
+        row = ("2026-10-24T10:00:00", h, "tok-1")  # age and hash come from the ONE row, not from status
+        ok = health_oracles(st, row, md, now=now)
         assert ok == {"save_age_hours": 2.0, "projection_converged": True, "projection_note": None,
                       "audit_backlog": 0}
-        assert health_oracles(st, "a" * 64, "b" * 64, now=now)["projection_converged"] is False
+        assert health_oracles(st, ("2026-10-24T10:00:00", "b" * 64, "tok-1"), md, now=now)["projection_converged"] is False
+        # a naive now compares in UTC instead of raising
+        assert health_oracles(st, row, md, now=now.replace(tzinfo=None))["save_age_hours"] == 2.0
         # nothing to compare is None, never a guessed ok; a fresh store has no save age
         fresh = SimpleNamespace(last_wrap_at=None, total_wraps=0, audit_write_failures=None)
-        assert health_oracles(fresh, None, None, now=now) == {
+        assert health_oracles(fresh, None, md, now=now) == {
             "save_age_hours": None, "projection_converged": None, "projection_note": None, "audit_backlog": None}
+        assert health_oracles(st, ("2026-10-24T10:00:00", None, None), md, now=now)["projection_converged"] is None
         st.audit_write_failures = 3
-        assert health_oracles(st, "a" * 64, "a" * 64, now=now)["audit_backlog"] == 3
+        assert health_oracles(st, row, md, now=now)["audit_backlog"] == 3
 
     def test_convergence_is_the_content_hash_not_the_size(self, tmp_path: Path, monkeypatch) -> None:
         import hashlib
@@ -1317,9 +1325,7 @@ class TestHealthOracles:
                                  content_hash=hashlib.sha256(md.read_bytes()).hexdigest())
         assert converged() is True
         md.write_text("## State\nfoO\n", encoding="utf-8")  # same length, different text
-        assert converged() is None  # the wrap is seconds old: the row may lead the rename (settling)
-        monkeypatch.setattr("levain.dashboard.SETTLE_SECONDS", 0.0)  # past the settling window
-        assert converged() is False
+        assert converged() is False  # no sidecar proves a rename pending: an edit, not a settle
         md.unlink()
         assert converged() is False  # a committed wrap and no file: diverged, "continuity file missing"
 
@@ -1349,27 +1355,51 @@ class TestHealthOraclesRound2:
         assert v.health is not None and v.health.audit_backlog == 7
         assert "7 audit writes failed" in (health_oracle_line(v.health) or "")
 
-    def test_a_row_ahead_of_the_rename_is_settling_not_diverged(self) -> None:
-        from datetime import datetime, timezone
-        from types import SimpleNamespace
+    @staticmethod
+    def _wrapped(tmp_path: Path, text: str = "## State\nfoc\n", pair: str = "tok1-aaaa1111"):
+        """A real store with one committed wrap whose content_hash is sha256(text); the continuity file holds text."""
+        import hashlib
+        from anneal_memory import Store
 
-        from levain.dashboard import health_oracles
+        db, md = tmp_path / "memory.db", tmp_path / "memory.continuity.md"
+        md.write_text(text, encoding="utf-8")
+        with Store(db) as store:
+            e = store.record("episode A", "decision")
+            store.wrap_started(token="w1", episode_ids=[e.id])
+            store.wrap_completed(1, 20, wrap_token="w1", episode_ids=[e.id], pair_id=pair,
+                                 content_hash=hashlib.sha256(text.encode()).hexdigest())
+        return db, md
 
-        now = datetime(2026, 10, 24, 12, 0, 30, tzinfo=timezone.utc)
-        young = SimpleNamespace(last_wrap_at="2026-10-24T12:00:00Z", total_wraps=1, audit_write_failures=0)
-        assert health_oracles(young, "a" * 64, "b" * 64, now=now)["projection_converged"] is None
-        old = SimpleNamespace(last_wrap_at="2026-10-24T10:00:00Z", total_wraps=1, audit_write_failures=0)
-        assert health_oracles(old, "a" * 64, "b" * 64, now=now)["projection_converged"] is False
-        assert health_oracles(old, "a" * 64, "b" * 64, now=now, staged=True)["projection_converged"] is None
+    def test_another_pairs_stale_sidecar_does_not_excuse_an_edited_file(self, tmp_path: Path) -> None:
+        db, md = self._wrapped(tmp_path)
+        (tmp_path / "memory.continuity.zzzzzzzzzzzz-deadbeef.md.tmp").write_text("old wrap", encoding="utf-8")
+        md.write_text("## State\nedited\n", encoding="utf-8")
+        h = build_substrate_view(AnnealPaths.from_db(db)).health
+        assert h is not None and h.projection_converged is False
+        assert "differs" in (h.projection_note or "")
 
-    def test_a_missing_continuity_file_is_diverged_and_an_unreadable_one_is_unknown(self) -> None:
-        from datetime import datetime, timezone
-        from types import SimpleNamespace
+    def test_the_latest_pairs_sidecar_with_the_matching_hash_is_settling(self, tmp_path: Path) -> None:
+        db, md = self._wrapped(tmp_path)
+        (tmp_path / "memory.continuity.tok1-aaaa1111.md.tmp").write_text("## State\nfoc\n", encoding="utf-8")
+        md.write_text("## State\nthe previous wrap\n", encoding="utf-8")  # the rename has not happened yet
+        h = build_substrate_view(AnnealPaths.from_db(db)).health
+        assert h is not None and h.projection_converged is None and "settling" in (h.projection_note or "")
 
-        from levain.dashboard import health_oracles
+    def test_a_file_deleted_seconds_after_a_wrap_with_no_sidecar_is_missing(self, tmp_path: Path) -> None:
+        db, md = self._wrapped(tmp_path)
+        md.unlink()
+        h = build_substrate_view(AnnealPaths.from_db(db)).health
+        assert h is not None and h.save_age_hours is not None and h.save_age_hours < 0.1  # seconds old, no window
+        assert h.projection_converged is False and h.projection_note == "continuity file missing"
 
-        now = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
-        st = SimpleNamespace(last_wrap_at="2026-10-24T10:00:00Z", total_wraps=1, audit_write_failures=0)
-        gone = health_oracles(st, "a" * 64, None, now=now, file_missing=True)
-        assert gone["projection_converged"] is False and gone["projection_note"] == "continuity file missing"
-        assert health_oracles(st, "a" * 64, None, now=now)["projection_converged"] is None
+    def test_the_age_rounds_half_up_like_the_web_renderers(self) -> None:
+        from levain.dashboard import Health, health_oracle_line
+
+        h = Health(write_path_live=True, total_links=0, avg_strength=0, max_strength=0, density=0, local_density=0,
+                   links_formed_total=0, links_strengthened_total=0, links_decayed_total=0,
+                   graduations_validated_total=0, graduations_demoted_total=0, total_episodes=0,
+                   episodes_since_wrap=0, episodes_by_type={}, tombstones=0, continuity_chars=None, total_wraps=1,
+                   last_wrap_at=None, wrap_in_progress=False)
+        for age, want in ((2.5, "3h ago"), (3.5, "4h ago"), (0.99, "under 1h ago")):
+            h.save_age_hours = age
+            assert want in (health_oracle_line(h) or "")
