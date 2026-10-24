@@ -1198,7 +1198,11 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
     page = f"http://localhost:{bound}/" if name == "localhost" else f"https://{name}/"
     lives = (f"it is kept in {token_file} across restarts: delete that file to make a new one" if token_file is not None
              else "it dies when this stops")
-    print(f"  open on the phone (a secret; {lives}): {page}#phone_token={httpd.phone_token}", flush=True)
+    if link_file is not None:
+        # stdout is a log under the LaunchAgent: the link (token included) goes only to the 0600 link file
+        print(f"  the phone link (a secret; {lives}) is in {link_file}: open {page} from it", flush=True)
+    else:
+        print(f"  open on the phone (a secret; {lives}): {page}#phone_token={httpd.phone_token}", flush=True)
     import signal
 
     def _stop(signum: int, frame: Any) -> None:

@@ -1043,8 +1043,8 @@
   function load() {
     if (held()) return;
     if (!token) {
-      $("status").textContent = "open this page from the link `levain consent phone` printed (it carries the token)";
-      grantsUnread("this page has no token (open it from the link `levain consent phone` printed)");
+      $("status").textContent = "open this page from the link `levain consent phone` printed or wrote to its --link-file (it carries the token)";
+      grantsUnread("this page has no token (open it from the link `levain consent phone` printed or wrote to its --link-file)");
       return;
     }
     const seq = storeSeq;     // the identity changes this page had made when the listing was asked for
