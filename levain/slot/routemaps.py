@@ -186,6 +186,12 @@ def base_route_ids(routes_dir: Path) -> frozenset:
     """The route ids `L/routes/base.json` names, for the collision rule (no dispatch id may be a base id). A base map
     that cannot be read as `{format, routes: [..]}` refuses `config-invalid:base`: no collision can then be ruled
     out. Only the ids are read here; keys parses the base map whole on its own `Q` path."""
+    return frozenset(base_route_types(routes_dir))
+
+
+def base_route_types(routes_dir: Path) -> Dict[str, object]:
+    """Each route id `L/routes/base.json` names, with its `type` as written (a ticket's `egress_routes` must each be
+    an `egress` one, CONTRACT §3.5). Read as :func:`base_route_ids` reads the file, with its refusals."""
     try:
         data = _read(Path(routes_dir) / "base.json", BASE_MAP_MAX)
     except OSError:
@@ -198,7 +204,7 @@ def base_route_ids(routes_dir: Path) -> frozenset:
         raise Refused("config-invalid:base", "base.json does not parse") from None
     if not isinstance(doc, dict) or not isinstance(doc.get("routes"), list):
         raise Refused("config-invalid:base", "base.json has no routes list")
-    return frozenset(r["route"] for r in doc["routes"] if isinstance(r, dict) and isinstance(r.get("route"), str))
+    return {r["route"]: r.get("type") for r in doc["routes"] if isinstance(r, dict) and isinstance(r.get("route"), str)}
 
 
 # --- the one checker -----------------------------------------------------------------------------------------------
@@ -622,5 +628,5 @@ class KeysRoutes:
 
 __all__ = ["CONFIG_FORMAT", "CONFIG_NAMESPACE", "CURRENT", "Checked", "ControlRoutes", "DISPATCH_DIR", "FAULT_POINTS",
            "HEAD", "ITEM_KEYS", "ITEM_MAX_BYTES", "KEYS_HEAD", "KEYS_HEAD_FORMAT", "KIND", "KeysRoutes", "Pin",
-           "SIGNATURE_MAX", "TRUST_FORMAT", "TRUST_JSON", "TRUST_PUB", "Trust", "base_route_ids", "check_item",
+           "SIGNATURE_MAX", "TRUST_FORMAT", "TRUST_JSON", "TRUST_PUB", "Trust", "base_route_ids", "base_route_types", "check_item",
            "item_digest", "pin_of", "policy_digest", "read_trust"]
