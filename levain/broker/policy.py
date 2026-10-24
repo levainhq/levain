@@ -61,6 +61,11 @@ class PolicyError(ValueError):
     """A policy object is unusable: refused whole."""
 
 
+class BodyPolicyError(PolicyError):
+    """A routemap route's `body_policy` fails `/2`'s validator (a non-text value, the entry caps): refused whole, and
+    named `route-invalid:body_policy` at `ROUTE-SUBMIT` like every other body_policy problem (head ruling H2)."""
+
+
 @dataclass(frozen=True)
 class Upstream:
     scheme: str
@@ -401,7 +406,10 @@ def parse_routemap(body: object) -> list:
             problem = rules.text_problem(r[name], f"a route's {name}")
             if problem is not None:
                 raise PolicyError(f"route {pol.route}: {problem}")
-        problem = rules.body_policy_problem(pol.route, r["body_policy"]) or rules.models_count_problem(pol.route, r["models"])
+        problem = rules.body_policy_problem(pol.route, r["body_policy"])
+        if problem is not None:
+            raise BodyPolicyError(problem)
+        problem = rules.models_count_problem(pol.route, r["models"])
         if problem is not None:
             raise PolicyError(problem)
         models = r["models"]

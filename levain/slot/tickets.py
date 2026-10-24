@@ -6,7 +6,8 @@ line, fsynced per append), and rebuilds everything it counts from that journal a
 day's mints, and the attempt index `RUN-TICKET-STATUS` answers from.
 
 Lines (`op`): `mint` (the ticket, its `attempt_id`, the `run_id` CONTROL minted with it, the request digest, the facts,
-the mint time and UTC day), `bind` (an unbound ticket bound to the session an `ATTACH` created), `cancel`, `expire` (an
+the mint time and UTC day), `bind` (an unbound ticket bound to the session an `ATTACH` created), `unbind` (that
+`ATTACH`'s session record was never written, so the ticket is unbound again: L2 4a, 3c-5 fix 1), `cancel`, `expire` (an
 unbound ticket past V16), `tombstone` (`{attempt_id, ticket, request_digest, state, session?}`, written only by the
 compaction). A tombstone is authoritative over every other line of its attempt. One `attempt_id` naming two
 tickets or two request digests, one ticket named by two attempts, or a whole line that does not parse, refuses the start
@@ -17,6 +18,13 @@ The compaction runs only at the start, before any append is admitted: the open t
 mints (the day count) and one tombstone per closed attempt, written to `tickets.jsonl.new`, fsynced, renamed over the
 journal (one atomic replace) and the directory fsynced. A leftover `.new` (a crash before the rename) is removed at the
 start, never adopted.
+
+A failed append POISONS the store (3c-5 fix 1, L1 W1 + L2 2a-2c): ANY exception while a line is written or fsynced
+leaves the journal ambiguous (the line may be on disk, whole or torn) while memory never took it, so the appender is
+closed and every ticket verb answers `journal-unavailable` until CONTROL restarts; nothing is appended after the failed
+line. The restart then reads that line as the truth (a complete last line: consistent, since nothing follows it) or
+drops it (a torn last line, never answered). `bound` and `referenced_generations` keep answering from memory, which
+holds only what was journaled.
 
 Idempotent mint: a mint whose `attempt_id` the index already names is compared on its request digest FIRST (any
 difference: `attempt-conflict`, whatever the ticket's state); an equal one answers the same ticket while it is unbound
@@ -77,6 +85,8 @@ RENDERS_AS = {"executor": ("dispatch", "egress"), "planner": ("planner", "egress
 
 def new_run_id() -> str:
     return "r-" + secrets.token_hex(8)
+
+
 #: DECISION: the most egress route ids a ticket may name (a base map's egress allow-list is short).
 EGRESS_ROUTES_MAX = 64
 #: CONTRACT §3.5 SIZES: `verifier_steps` is at most 32 KiB canonical.
@@ -179,17 +189,24 @@ class Ceiling:
     max_runs_per_day: int
 
 
-def read_ceiling(path: Path) -> Ceiling:
+def read_ceiling(path: Path, owner: int = 0) -> Ceiling:
     """`L/policy/dispatch_ceiling` (`levain-dispatch-ceiling/1`), read on every mint so a `set-ceiling` holds from the
     next one. DECISION: an absent, unreadable or malformed ceiling refuses every mint `ticket-ceiling:file` (the
-    ceiling is the operator's bound on dispatch; no default stands in for it)."""
+    ceiling is the operator's bound on dispatch; no default stands in for it). So does one not owned by `owner` (root;
+    a test passes its own uid) or writable by group or other (L1 note 8): a ceiling the dispatch uid could write is no
+    bound on it."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError:
         raise Refused("ticket-ceiling:file", "no dispatch ceiling") from None
     try:
-        if not (os.fstat(fd).st_mode & 0o170000) == 0o100000:
+        st = os.fstat(fd)
+        if not (st.st_mode & 0o170000) == 0o100000:
             raise Refused("ticket-ceiling:file", "the ceiling is not a regular file")
+        if st.st_uid != owner:
+            raise Refused("ticket-ceiling:file", f"the ceiling's owner is {st.st_uid}, not {owner}")
+        if st.st_mode & 0o022:
+            raise Refused("ticket-ceiling:file", "the ceiling is writable by group or other")
         data = os.read(fd, CEILING_MAX + 1)
     finally:
         os.close(fd)
@@ -234,18 +251,23 @@ class TicketStore:
     """The journal at `path` and what CONTROL rebuilds from it. `start()` (CONTROL's start pass) removes a leftover
     compaction file, reads the journal whole, compacts it and opens the appender; nothing is appended before it.
     Every public method takes the store's own lock. `clock` is wall time (the mint time and the UTC day are
-    persisted); `fault(point)` is the compaction crash test's seam (`before_rename`)."""
+    persisted); `fault(point)` is the compaction crash test's seam (`before_rename`); `ceiling_uid` the ceiling file's
+    required owner (root)."""
 
     def __init__(self, path: Path, ceiling_path: Path, *, fsync: Callable[[int], None] = os.fsync,
-                 clock: Callable[[], float] = time.time, fault: Callable[[str], None] = _nothing) -> None:
+                 clock: Callable[[], float] = time.time, fault: Callable[[str], None] = _nothing,
+                 ceiling_uid: int = 0) -> None:
         self.path = Path(path)
         self.new_path = self.path.with_name(self.path.name + ".new")
         self.ceiling_path = Path(ceiling_path)
+        self.ceiling_uid = ceiling_uid
         self._fsync = fsync
         self._clock = clock
         self.fault = fault
         self.lock = threading.Lock()
         self._fd: Optional[int] = None
+        #: set by a failed append (fix 1): every verb refuses `journal-unavailable` until :meth:`start` runs again.
+        self._poisoned = False
         self._by_attempt: Dict[str, Ticket] = {}
         self._by_ticket: Dict[str, Ticket] = {}
 
@@ -273,6 +295,7 @@ class TicketStore:
             self._compact()
             self._fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
                                0o600)
+            self._poisoned = False
 
     def _read(self) -> List[dict]:
         try:
@@ -350,6 +373,11 @@ class TicketStore:
                         # CONTROL binds only an unbound ticket, under the store's lock, journaled before it answers
                         raise _inconsistent(f"a bind line names a ticket already {t.state}")
                     t.state, t.session = BOUND, session
+                elif op == "unbind":
+                    t = by_ticket.get(obj["ticket"])
+                    if t is None or t.state != BOUND or t.session != obj["session"]:
+                        raise _inconsistent("an unbind line names no ticket bound to its session")
+                    t.state, t.session = UNBOUND, None
                 elif op in ("cancel", "expire"):
                     t = by_ticket.get(obj["ticket"])
                     if t is None:
@@ -423,11 +451,34 @@ class TicketStore:
     def _bind_line(t: Ticket) -> Dict[str, object]:
         return {"op": "bind", "ticket": t.ticket, "session": t.session}
 
-    def _append(self, obj: Mapping[str, object]) -> None:
+    def _live(self) -> None:
+        """Every verb's first check (caller holds the lock): the journal is open and not poisoned."""
+        if self._poisoned:
+            raise Refused("journal-unavailable", "a ticket-journal append failed; CONTROL must restart")
         if self._fd is None:
             raise Refused("journal-unavailable", "the ticket journal is not open (CONTROL's start has not run)")
-        _write_all(self._fd, canon.canonical_bytes(dict(obj)) + b"\n")
-        self._fsync(self._fd)
+
+    def _append(self, obj: Mapping[str, object]) -> None:
+        """One line, written and fsynced (caller holds the lock and updates memory only after this returns). ANY
+        exception poisons the store (module docstring): the appender is closed, the store refuses every verb
+        `journal-unavailable` until :meth:`start`, and the failure answers `journal-unavailable`, never
+        `internal-error`."""
+        self._live()
+        assert self._fd is not None
+        line = canon.canonical_bytes(dict(obj)) + b"\n"
+        try:
+            _write_all(self._fd, line)
+            self._fsync(self._fd)
+        except BaseException as e:
+            self._poisoned = True
+            fd, self._fd = self._fd, None
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            if isinstance(e, Exception):
+                raise Refused("journal-unavailable", f"a ticket-journal append failed ({type(e).__name__})") from None
+            raise
 
     def _expire_due(self) -> None:
         """Every unbound ticket past V16 becomes `expired`, journaled (caller holds the lock)."""
@@ -445,6 +496,7 @@ class TicketStore:
         difference, checked first) or `attempt-closed`."""
         digest = request_digest(facts)
         with self.lock:
+            self._live()
             self._expire_due()
             t = self._by_attempt.get(attempt_id)
             if t is None:
@@ -459,11 +511,14 @@ class TicketStore:
         """A NEW attempt's mint, journaled before it answers: the ceiling read and checked against the rebuilt counts
         (the open tickets, the UTC day's mints), all under the store's lock, so two mints never both take the last
         place. A replay that raced in first answers by :meth:`replay`'s rule."""
-        ceiling = read_ceiling(self.ceiling_path)
+        with self.lock:
+            self._live()                          # a poisoned store answers that before the ceiling is read
+        ceiling = read_ceiling(self.ceiling_path, self.ceiling_uid)
         if facts["reserved_microdollars"] > ceiling.max_reserved_microdollars_per_run:   # type: ignore[operator]
             raise Refused("ticket-ceiling:max_reserved_microdollars_per_run")
         digest = request_digest(facts)
         with self.lock:
+            self._live()
             self._expire_due()
             if attempt_id in self._by_attempt:
                 t = self._by_attempt[attempt_id]
@@ -492,6 +547,7 @@ class TicketStore:
         `ticket-bound` once an `ATTACH` bound it, `attempt-closed` for a cancelled or expired one). A lease holds it
         in CONTROL's memory only; `bind` is what the journal records."""
         with self.lock:
+            self._live()
             self._expire_due()
             return self._unbound(ticket)
 
@@ -511,6 +567,7 @@ class TicketStore:
         if type(session) is not str or not SESSION_RE.fullmatch(session):
             raise Refused("bad-token", "session")
         with self.lock:
+            self._live()
             self._expire_due()
             t = self._unbound(ticket)
             t.session = session
@@ -521,6 +578,19 @@ class TicketStore:
                 raise
             t.state = BOUND
             return t
+
+    def unbind(self, ticket: str, session: str) -> None:
+        """The failure path of the `ATTACH` that bound `ticket` to `session` (L2 4a, 3c-5 fix 1): its session record
+        was never written, so the binding is undone, journaled (`unbind`) before memory moves; the ticket is UNBOUND
+        and holdable again. A ticket not bound to `session` is left as it is. A failed append poisons the store
+        (:meth:`_append`): the restart's H8 pass then unbinds it, since no record exists."""
+        with self.lock:
+            self._live()
+            t = self._by_ticket.get(ticket)
+            if t is None or t.state != BOUND or t.session != session:
+                return
+            self._append({"op": "unbind", "ticket": ticket, "session": session})
+            t.state, t.session = UNBOUND, None
 
     def bound(self, session: str) -> Optional[Ticket]:
         """The ticket BOUND to `session`, or None (the run `TOKEN-RESOLVE`, `MINT` and `QUEUE-RESOLVE` answer from)."""
@@ -541,6 +611,7 @@ class TicketStore:
         """An UNBOUND ticket only (`ticket-bound` once a lease bound it; `ticket-unknown` for one never minted;
         DECISION: a ticket already closed answers `attempt-closed`)."""
         with self.lock:
+            self._live()
             self._expire_due()
             t = self._by_ticket.get(ticket)
             if t is None:
@@ -554,6 +625,7 @@ class TicketStore:
 
     def status(self, attempt_id: str) -> Dict[str, object]:
         with self.lock:
+            self._live()
             self._expire_due()
             t = self._by_attempt.get(attempt_id)
             if t is None:

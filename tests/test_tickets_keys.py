@@ -93,6 +93,19 @@ def test_resolve_outcome_carries_run_and_refuses_a_malformed_one():
     assert K.resolve_outcome({**ans, "claims": {"routes": ["glm"], "run": RUN}}) == ("failed",)
 
 
+def test_run_kind_without_run_refused():
+    # 3c-5 fix 1 (L1 note 4): a session of a kind a ticket renders as, resolved with no `run`, is never cached as a
+    # plain session (its `routes` could name a base route); it is refused, by name, and so is CONTROL's run-unknown
+    plain = {"id": 1, "ok": True, "session": "s1", "claims": {"routes": ["claude-sub"], "kind": "interactive"}}
+    assert K.resolve_outcome(plain)[0] == "answer"
+    for kind in ("dispatch", "planner", "verifier"):
+        ans = {**plain, "claims": {"routes": ["claude-sub"], "kind": kind}}
+        assert K.resolve_outcome(ans) == ("refused", "run-unknown"), kind
+        assert K.resolve_outcome({**ans, "run": RUN})[0] == "answer"
+    assert K.resolve_outcome({"id": 1, "ok": False, "refused": "run-unknown"}) == ("refused", "run-unknown")
+    assert K.RESOLVE_REFUSALS["run-unknown"] == "route-not-allowed"   # 403: no retry changes it
+
+
 # ---- the run's own checks ----------------------------------------------------------------------------------------
 
 def test_ticketed_q_wrong_model_refused(monkeypatch):

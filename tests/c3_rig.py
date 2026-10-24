@@ -59,7 +59,8 @@ class ControlThread:
         cfg = C.ServeConfig(store_dir=Path(self.d) / "sessions", socket_path=Path(self.socket_path),
                             operator_uid=OP_UID, keys_admin_path=Path(self.d) / "keys" / "admin.sock",
                             keys_uid=KEYS_UID, peer_uid=lambda sock: KEYS_UID, ready=self._ready_cb,
-                            stop=self.stop_event, routes_dir=self.routes_dir, dispatch_uid=self.dispatch_uid)
+                            stop=self.stop_event, routes_dir=self.routes_dir, dispatch_uid=self.dispatch_uid,
+                            ceiling_uid=os.getuid())
 
         def run() -> None:
             self._rc.append(C.serve(cfg))

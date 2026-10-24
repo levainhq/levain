@@ -35,7 +35,8 @@ from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 from levain.authority_sig import VerifierUnavailable, verify_link_sig
-from levain.broker.policy import DispatchRoute, PolicyError, RoutePolicy, body_policy_problem, parse_routemap
+from levain.broker.policy import (BodyPolicyError, DispatchRoute, PolicyError, RoutePolicy, body_policy_problem,
+                                  parse_routemap)
 from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
 from levain.dispatch.routemap_rules import envelope_problem
@@ -248,6 +249,8 @@ def check_item(raw: bytes, sig: object, trust: Trust, base_ids: frozenset, *,
         raise Refused("routemap-invalid:envelope", problem)
     try:
         routes = parse_routemap(obj["body"])
+    except BodyPolicyError as e:
+        raise Refused("route-invalid:body_policy", str(e)) from None    # head ruling H2's name (L1 note 9)
     except PolicyError as e:
         raise Refused("routemap-invalid:body", str(e)) from None
     except (RecursionError, TypeError, ValueError) as e:
@@ -571,8 +574,9 @@ class KeysRoutes:
     def check_reload(self, generation: int, item_sha256: str) -> Tuple[Checked, dict]:
         """r3 §2.3 "Load at keys" (R4 §2): `current` == the RELOAD's generation == the file's == the envelope's; the
         file's SHA-256 == `item_sha256`; every item check, re-run here; and against keys' OWN head on disk: a greater
-        generation, or the same one with the same digest. Returns the checked item and the head keys serves after
-        this RELOAD, which the caller always settles (:meth:`commit`) and then installs (:meth:`accept`): a new head
+        generation, or the same one with the same digest. Returns the checked item and the UNPRUNED head after this
+        RELOAD; the caller prunes it to the RELOAD's `keep` (:meth:`pruned`, head ruling H5), and the pruned head is the
+        one it always settles (:meth:`commit`), installs (:meth:`accept`) and serves. The unpruned head is: a new head
         for a greater generation, or the disk head itself for the same one (the convergent repair: a head whose
         directory fsync failed after its rename is settled again, and a head on disk that keys does not hold in
         memory is installed)."""

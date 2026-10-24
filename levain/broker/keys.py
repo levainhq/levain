@@ -157,7 +157,12 @@ DROPPED_MAX = 64 * 1024
 #: a session token as the front sends it: 43 base64url characters (the `Bearer` value).
 TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 #: CONTROL's TOKEN-RESOLVE refusals keys maps, and the name each maps to.
-RESOLVE_REFUSALS = {"token-unknown": "token-invalid", "token-revoked": "token-revoked"}
+#: CONTROL's `run-unknown` (a ticketed session with no bound ticket) and keys' own (a run kind resolved with no `run`)
+#: answer `route-not-allowed` (403): such a session may call no route, and no retry changes that (3c-5 fix 1).
+RESOLVE_REFUSALS = {"token-unknown": "token-invalid", "token-revoked": "token-revoked",
+                    "run-unknown": "route-not-allowed"}
+#: the session kinds a run ticket renders as (`levain.slot.tickets.RENDERS_AS`); such a session always carries a run.
+RUN_KINDS = frozenset({"dispatch", "planner", "verifier"})
 
 #: preemption's step (2): the old connection's request tasks are awaited this long after their cancel (DECISION,
 #: judged: a task's work is memory operations plus closing sockets); one still running is left to its epoch check.
@@ -697,7 +702,9 @@ def resolve_outcome(ans: dict) -> tuple:
     """CONTROL's `TOKEN-RESOLVE` answer as the resolve task's typed outcome: `("answer", {"session", "claims"})`, with
     a ticketed session's `run` (§3.3, CONTROL's from the ticket record) carried in the claims as `run`;
     `("refused", name)` for a refusal keys knows; else `("failed",)`, a malformed `run` or one already in the claims
-    included."""
+    included. A session whose claims' `kind` is one a run ticket renders as (:data:`RUN_KINDS`) but whose answer
+    carries no `run` is `("refused", "run-unknown")` (3c-5 fix 1, L1 note 4): keys never treats a dispatch session as
+    a plain one, whatever CONTROL answered."""
     if ans.get("ok") is True:
         session, claims = ans.get("session"), ans.get("claims")
         if type(session) is str and session and type(claims) is dict and "run" not in claims:
@@ -705,6 +712,8 @@ def resolve_outcome(ans: dict) -> tuple:
                 if not run_ok(ans["run"]):
                     return ("failed",)
                 claims = {**claims, "run": dict(ans["run"])}
+            elif claims.get("kind") in RUN_KINDS:
+                return ("refused", "run-unknown")
             return ("answer", {"session": session, "claims": claims})
         return ("failed",)
     if ans.get("ok") is False and ans.get("refused") in RESOLVE_REFUSALS:
@@ -2417,9 +2426,8 @@ class Keys:
         c = codec.CODECS[pol.body_codec]   # a priced route's codec is never `none` (`policy.parse_base_map`)
         obj = c.parse(raw.take())   # the raw bytes are unreferenced once parsed: only `data` below is kept
         dispatch = pol.max_session_microdollars is None
-        checked = codec.guarded(c.check, obj, pol.prices, dispatch=dispatch)
-        if run is not None and checked.model != run["model_requested"]:
-            raise norm.Refused("model-not-allowed", "not the run's model_requested")
+        checked = codec.guarded(c.check, obj, pol.prices, dispatch=dispatch,
+                                model_requested=None if run is None else run["model_requested"])
         if dispatch and pol.upstream is not None and pol.upstream.host == codec.OPENROUTER_HOST:
             codec.guarded(codec.write_body_policy, obj, pol.body_policy or {})
         codec.guarded(c.write_ceiling, obj, checked.price)
@@ -2591,8 +2599,8 @@ class Keys:
 
     async def _resolve(self, key: Tuple[int, Registration, str], reg: Registration, deadline: float) -> tuple:
         """The table-owned resolve task: its TYPED outcome is `("answer", {"session", "claims"})`,
-        `("refused", "token-unknown" | "token-revoked")` or `("failed",)` (any Exception, the deadline included); it
-        never raises one to its awaiters. It holds the permits itself, per-session FIRST, global second, each
+        `("refused", "token-unknown" | "token-revoked" | "run-unknown")` or `("failed",)` (any Exception, the deadline
+        included); it never raises one to its awaiters. It holds the permits itself, per-session FIRST, global second, each
         released on every exit; its `finally` pops its table entry."""
         try:
             if reg.resolve_sem is None:

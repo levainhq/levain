@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -70,7 +71,7 @@ class Rig:
             self.control.stop()                                           # a stop is a restart to every caller
         kw = {} if fault is None else {"fault": fault}
         self.tickets = T.TicketStore(self.sdir / T.JOURNAL, self.st.L / "policy" / "dispatch_ceiling",
-                                     clock=self.clock, **kw)
+                                     clock=self.clock, ceiling_uid=os.getuid(), **kw)
         self.cr = RM.ControlRoutes(self.st.routes)
         self.control = C.Control(C.StateStore(self.sdir), OP_UID, dispatch_uid=DISPATCH_UID, keys_uid=KEYS_UID,
                                  routes=self.cr, tickets=self.tickets, clock=self.clock)
@@ -218,7 +219,14 @@ def test_ticket_ceiling_refused(rig):
     a2 = rig.ask("RUN-TICKET-STATUS", attempt_id="a-2")
     assert rig.ask("RUN-TICKET-CANCEL", ticket=a2["ticket"])["ok"]
     assert refused(rig.mint("a-4")) == "ticket-ceiling:max_runs_per_day"
-    (rig.st.L / "policy" / "dispatch_ceiling").unlink()
+    ceiling = rig.st.L / "policy" / "dispatch_ceiling"
+    ceiling.chmod(0o664)                                                  # L1 note 8: group-writable is no bound
+    assert refused(rig.mint("a-5")) == "ticket-ceiling:file"
+    ceiling.chmod(0o644)
+    rig.tickets.ceiling_uid = os.getuid() + 1                             # not the required owner (root, in use)
+    assert refused(rig.mint("a-5")) == "ticket-ceiling:file"
+    rig.tickets.ceiling_uid = os.getuid()
+    ceiling.unlink()
     assert refused(rig.mint("a-5")) == "ticket-ceiling:file"
 
 
@@ -508,7 +516,8 @@ def test_body_policy_refused_at_route_submit(rig):
     good = route()
     good["body_policy"] = {"provider_only": ["z-ai"], "allow_fallbacks": "no", "zdr": "yes", "data_collection": "deny"}
     bads = [{"provider_only": "z-ai"}, {"allow_fallbacks": "false"}, {"zdr": "true"}, {"data_collection": "maybe"},
-            {"order": ["z-ai"]}, {"provider_only": []}]
+            {"order": ["z-ai"]}, {"provider_only": []},
+            {"zdr": True}, {"zdr": 1}]                                    # L1 note 9: a non-text value, H2's name
     gen = 2
     for bp in bads:
         bad = dict(route(), body_policy=bp)
@@ -614,13 +623,21 @@ def test_crash_between_bind_and_session_record_unbinds(rig, monkeypatch):
     one = ticket_of(rig.mint())
     _c, lo = lease(rig, one)
 
+    class Died(BaseException):
+        pass
+
     def no_record(rec):
         raise OSError("the record's write never happened")
+
+    def died(*a):
+        raise Died()                                                      # CONTROL dies: no unbind is journaled
     monkeypatch.setattr(rig.control.store, "put", no_record)
-    ans = root(rig, "ATTACH", lease_nonce=lo["lease_nonce"], sudo_uid=DISPATCH_UID, session=SESSION,
-               claims=d_attach_claims(one))
-    assert ans["ok"] is False, ans
+    monkeypatch.setattr(rig.tickets, "unbind", died)
+    with pytest.raises(Died):
+        root(rig, "ATTACH", lease_nonce=lo["lease_nonce"], sudo_uid=DISPATCH_UID, session=SESSION,
+             claims=d_attach_claims(one))
     assert [x["op"] for x in rig.lines()] == ["mint", "bind"]
+    monkeypatch.undo()
     rig.restart()
     assert [x["op"] for x in rig.lines()] == ["mint"]
     assert rig.ask("RUN-TICKET-STATUS", attempt_id="a-1") == {"id": 1, "ok": True, "ticket": one, "state": "unbound"}
@@ -628,3 +645,75 @@ def test_crash_between_bind_and_session_record_unbinds(rig, monkeypatch):
     att = root(rig, "ATTACH", lease_nonce=lo["lease_nonce"], sudo_uid=DISPATCH_UID, session=SESSION,
                claims=d_attach_claims(one))
     assert att["ok"] and "ticket_facts" in att, att
+
+
+# ---- 3c-5 fix 1: a failed append poisons the store; ATTACH's failure paths -----------------------------------------
+
+def test_failed_append_poisons_the_store(rig, monkeypatch):
+    # L1 W1 + L2 2a: the mint line is written, its fsync fails. The store is poisoned: the retry of the SAME attempt,
+    # STATUS and LEASE-OPEN answer journal-unavailable (never internal-error, never a second mint line). The restart
+    # reads the complete last line as the truth: the replay answers that one ticket.
+    def eio(fd):
+        raise OSError(5, "EIO")
+    rig.tickets._fsync = eio
+    assert refused(rig.mint()) == "journal-unavailable"
+    rig.tickets._fsync = os.fsync                                         # the disk is back; the store stays poisoned
+    assert refused(rig.mint()) == "journal-unavailable"
+    assert refused(rig.ask("RUN-TICKET-STATUS", attempt_id="a-1")) == "journal-unavailable"
+    assert refused(lease(rig, "A" * 43)[1]) == "journal-unavailable"
+    [line] = rig.lines()                                                  # nothing appended after the failed line
+    rig.restart()
+    first = rig.mint()
+    assert ticket_of(first) == line["ticket"] and first["run_id"] == line["run_id"]
+    assert rig.lines() == [line] and rig.tickets.counts() == {"open": 1, "today": 1}
+    # L2 2b: a write that fails part-way (ENOSPC) leaves a torn last line; the restart drops it
+    def torn(fd, data):
+        os.write(fd, data[:len(data) // 2])
+        raise OSError(28, "ENOSPC")
+    monkeypatch.setattr(T, "_write_all", torn)
+    assert refused(rig.mint("a-2")) == "journal-unavailable"
+    monkeypatch.undo()
+    assert not (rig.sdir / T.JOURNAL).read_bytes().endswith(b"\n")
+    rig.restart()
+    assert rig.lines() == [line]
+    ticket_of(rig.mint("a-2"))
+    assert rig.tickets.counts() == {"open": 2, "today": 2}
+
+
+def test_attach_record_failure_unbinds_the_ticket(rig, monkeypatch):
+    # L2 4a: the bind is journaled, then the session record's write fails (disk full): ATTACH's failure path unbinds
+    # the ticket, journaled, so it is not stranded BOUND until a restart; the retried ATTACH binds it
+    one = ticket_of(rig.mint())
+    _c, lo = lease(rig, one)
+
+    def no_room(rec):
+        raise OSError(28, "ENOSPC")
+    monkeypatch.setattr(rig.control.store, "put", no_room)
+    attach = {"lease_nonce": lo["lease_nonce"], "sudo_uid": DISPATCH_UID, "session": SESSION,
+              "claims": d_attach_claims(one)}
+    assert root(rig, "ATTACH", **attach)["ok"] is False
+    assert [x["op"] for x in rig.lines()] == ["mint", "bind", "unbind"]
+    assert rig.ask("RUN-TICKET-STATUS", attempt_id="a-1")["state"] == "unbound"
+    monkeypatch.undo()
+    att = root(rig, "ATTACH", **attach)
+    assert att["ok"] and "ticket_facts" in att, att
+    rig.restart()
+    assert [x["op"] for x in rig.lines()] == ["mint", "bind"]
+    assert rig.ask("RUN-TICKET-STATUS", attempt_id="a-1")["state"] == "bound"
+
+
+def test_attach_after_the_ticket_closed_refused(rig):
+    # L1 gap: the ticket is cancelled, or expires, between LEASE-OPEN and ATTACH; ATTACH binds nothing, writes no
+    # record
+    one = ticket_of(rig.mint())
+    _c, lo = lease(rig, one)
+    assert rig.ask("RUN-TICKET-CANCEL", ticket=one)["ok"]
+    assert refused(root(rig, "ATTACH", lease_nonce=lo["lease_nonce"], sudo_uid=DISPATCH_UID, session=SESSION,
+                        claims=d_attach_claims(one))) == "attempt-closed"
+    two = ticket_of(rig.mint("a-2"))
+    _c2, lo2 = lease(rig, two)
+    rig.clock.t += T.TICKET_UNUSED_S
+    assert refused(root(rig, "ATTACH", lease_nonce=lo2["lease_nonce"], sudo_uid=DISPATCH_UID, session=SESSION,
+                        claims=d_attach_claims(two))) == "attempt-closed"
+    assert rig.control.store.get(SESSION) is None
+    assert [x["op"] for x in rig.lines()] == ["mint", "cancel", "mint", "expire"]

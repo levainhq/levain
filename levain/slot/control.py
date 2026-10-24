@@ -1325,10 +1325,22 @@ class Control:
                     # journaled before the record exists: a crash between the two leaves the ticket bound and no
                     # session, which runs nothing; CONTROL's next start unbinds it (head ruling H8)
                     facts = dict(self._ticket_store().bind(lease.ticket, session).facts)
-                rec = R.SessionState(session=session, generation=0, state=R.ALLOCATED, claims=claims,
-                                     lease_live=True, event_kind="state",
-                                     updated_at=R.timestamp(self._clock()))
-                self.store.put(rec)
+                try:
+                    rec = R.SessionState(session=session, generation=0, state=R.ALLOCATED, claims=claims,
+                                         lease_live=True, event_kind="state",
+                                         updated_at=R.timestamp(self._clock()))
+                    self.store.put(rec)
+                except R.NotDurable:
+                    raise                            # the record was renamed into place: it exists, the bind stands
+                except BaseException:
+                    # 3c-5 fix 1 (L2 4a): no record was written, so the binding is undone and journaled; if that
+                    # append fails the store is poisoned and the restart's H8 pass unbinds it instead
+                    if facts is not None:
+                        try:
+                            self._ticket_store().unbind(str(lease.ticket), session)
+                        except Refused:
+                            pass
+                    raise
         except BaseException:
             with self._mu:
                 lease.used = False
@@ -1810,7 +1822,7 @@ class Control:
                 self._reload_keys(head)
 
     def _reload_keys(self, head: Mapping[str, object]) -> None:
-        """``RELOAD {generation, item_sha256}`` of ``head`` on keys' admin wire; the caller holds the activation lock.
+        """``RELOAD {generation, item_sha256, keep}`` of ``head`` on keys' admin wire; the caller holds the activation lock.
         keys' ack is recorded as what keys serves on the attachment that was current when it was sent, if that is
         still the current one (a newer attachment states its own); a refusal, or any other failure of the call, is
         noted in :attr:`seam_errors` and never raised (the head is already durable: the activation stands, and keys
@@ -2245,6 +2257,8 @@ class ServeConfig:
     #: ``L/policy/dispatch_ceiling`` (S1 3c-5); ``None`` with a ``routes_dir``: ``<routes_dir>/../policy/dispatch_ceiling``.
     #: The ticket journal is ``<store_dir>/tickets.jsonl``, kept whenever there is a route store.
     ceiling_path: Path | None = None
+    #: the ceiling file's required owner (root; a test rig passes its own uid)
+    ceiling_uid: int = 0
     host: str = "darwin" if sys.platform == "darwin" else "linux"
     peer_uid: Callable[[socket.socket], int | None] | None = None
     ready: Callable[[ControlServer], object] | None = None
@@ -2262,7 +2276,7 @@ def serve(config: ServeConfig) -> int:
     tickets = None
     if config.routes_dir is not None:
         ceiling = config.ceiling_path or Path(config.routes_dir).parent / "policy" / "dispatch_ceiling"
-        tickets = T.TicketStore(Path(config.store_dir) / T.JOURNAL, Path(ceiling))
+        tickets = T.TicketStore(Path(config.store_dir) / T.JOURNAL, Path(ceiling), ceiling_uid=config.ceiling_uid)
     control = Control(store, config.operator_uid, qbroker_uid=config.qbroker_uid, keys_uid=config.keys_uid,
                       keys_admin=admin, host=config.host, routes=routes, dispatch_uid=config.dispatch_uid,
                       tickets=tickets)
