@@ -28,7 +28,7 @@ The admin server (design 1.5 "The admin connection", "Fencing", "Order inside on
 - each request runs as its own task carrying the admin epoch of its connection, so answers go out in any order; two
   requests naming one session run in frame order, the order assigned in the read loop with no `await` between the
   read and the append to that session's chain.
-- FRONT-REGISTER / FRONT-ARM / DROP-SESSION are the fenced table calls; RELOAD {generation, item_sha256} (S1 3c-4) loads
+- FRONT-REGISTER / FRONT-ARM / DROP-SESSION are the fenced table calls; RELOAD {generation, item_sha256, keep} loads
   a dispatch route map under keys' one RELOAD lock (RELOAD names no session, so the per-session order cannot order it):
   every check re-run by keys itself (`levain.slot.routemaps`), keys' own head written durably before it serves or acks;
   its file work is one transaction at a time (`KeysRoutes.txn`) and is waited out even when a preemption cancels it.
@@ -157,7 +157,12 @@ DROPPED_MAX = 64 * 1024
 #: a session token as the front sends it: 43 base64url characters (the `Bearer` value).
 TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 #: CONTROL's TOKEN-RESOLVE refusals keys maps, and the name each maps to.
-RESOLVE_REFUSALS = {"token-unknown": "token-invalid", "token-revoked": "token-revoked"}
+#: CONTROL's `run-unknown` (a ticketed session with no bound ticket) and keys' own (a run kind resolved with no `run`)
+#: answer `route-not-allowed` (403): such a session may call no route, and no retry changes that (3c-5 fix 1).
+RESOLVE_REFUSALS = {"token-unknown": "token-invalid", "token-revoked": "token-revoked",
+                    "run-unknown": "route-not-allowed"}
+#: the session kinds a run ticket renders as (`levain.slot.tickets.RENDERS_AS`); such a session always carries a run.
+RUN_KINDS = frozenset({"dispatch", "planner", "verifier"})
 
 #: preemption's step (2): the old connection's request tasks are awaited this long after their cancel (DECISION,
 #: judged: a task's work is memory operations plus closing sockets); one still running is left to its epoch check.
@@ -175,7 +180,7 @@ ADMIN_VERBS = {
     "FRONT-REGISTER": frozenset({"session", "front_uid", "pid", "start", "incarnation", "reg_token"}),
     "FRONT-ARM": frozenset({"session", "reg_token"}),
     "DROP-SESSION": frozenset({"session"}),
-    "RELOAD": frozenset({"generation", "item_sha256"}),
+    "RELOAD": frozenset({"generation", "item_sha256", "keep"}),
 }
 #: RELOAD's `item_sha256`: the hex SHA-256 of the route-map item (3c design r3 §2.3, R4 §2)
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
@@ -665,6 +670,59 @@ def front_binding(answer: dict, reg: "Registration") -> bool:
             and _same_uint(claims.get("incarnation"), reg.incarnation))
 
 
+#: `TOKEN-RESOLVE`'s `run` (CONTRACT §3.3), exactly: name -> its check.
+_RUN_ID = re.compile(r"r-[0-9a-f]{16}\Z")
+_RUN_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_RUN_TEXT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}\Z")
+
+
+def _run_uint(v: object, low: int = 0) -> bool:
+    return type(v) is int and low <= v <= JSON_INT_MAX
+
+
+RUN_FIELDS = {
+    "run_id": lambda v: type(v) is str and _RUN_ID.match(v) is not None,
+    "job_id": lambda v: type(v) is str and _RUN_TEXT.match(v) is not None,
+    "run_index": _run_uint,
+    "contract_digest": lambda v: type(v) is str and _RUN_DIGEST.match(v) is not None,
+    "route": lambda v: type(v) is str and _RUN_TEXT.match(v) is not None,
+    "routemap_generation": lambda v: _run_uint(v, 1),
+    "route_policy_digest": lambda v: type(v) is str and _RUN_DIGEST.match(v) is not None,
+    "model_requested": lambda v: type(v) is str and _RUN_TEXT.match(v) is not None,
+    "reserved_microdollars": lambda v: _run_uint(v, 1),
+}
+
+
+def run_ok(run: object) -> bool:
+    """A `run` object keys can act on: exactly its fields, each of its type (a malformed one fails the resolve)."""
+    return type(run) is dict and set(run) == set(RUN_FIELDS) and all(RUN_FIELDS[k](v) for k, v in run.items())
+
+
+def resolve_outcome(ans: dict) -> tuple:
+    """CONTROL's `TOKEN-RESOLVE` answer as the resolve task's typed outcome: `("answer", {"session", "claims"})`, with
+    a ticketed session's `run` (§3.3, CONTROL's from the ticket record) carried in the claims as `run`;
+    `("refused", name)` for a refusal keys knows; else `("failed",)`, a malformed `run` or one already in the claims
+    included. A session whose claims' `kind` is one a run ticket renders as (:data:`RUN_KINDS`) but whose answer
+    carries no `run` is `("refused", "run-unknown")` (3c-5 fix 1, L1 note 4): keys never treats a dispatch session as
+    a plain one, whatever CONTROL answered."""
+    if ans.get("ok") is True:
+        session, claims = ans.get("session"), ans.get("claims")
+        if type(session) is str and session and type(claims) is dict and "run" not in claims:
+            if "run" in ans:
+                if not run_ok(ans["run"]):
+                    return ("failed",)
+                claims = {**claims, "run": dict(ans["run"])}
+            elif ("kind" in claims and type(claims["kind"]) is not str) or claims.get("kind") in RUN_KINDS:
+                # 3c-5 fix 2 (complement 5): a `kind` that is not a string (an unhashable list would raise in the
+                # set test) is no plain session either
+                return ("refused", "run-unknown")
+            return ("answer", {"session": session, "claims": claims})
+        return ("failed",)
+    if ans.get("ok") is False and ans.get("refused") in RESOLVE_REFUSALS:
+        return ("refused", ans["refused"])
+    return ("failed",)
+
+
 def encode_admin(answer: dict) -> bytes:
     data = canon.canonical_bytes(answer)
     return len(data).to_bytes(4, "big") + data
@@ -685,6 +743,10 @@ def check_admin_args(op: str, args: dict) -> Optional[str]:
                 return "wrong-type"
         elif k == "item_sha256":
             if type(x) is not str or not _SHA256_HEX.match(x):
+                return "wrong-type"
+        elif k == "keep":   # RELOAD's generations still referenced (head ruling H5): distinct positive integers
+            if type(x) is not list or any(type(g) is not int or not 1 <= g <= JSON_INT_MAX for g in x) \
+                    or len(set(x)) != len(x):
                 return "wrong-type"
         elif type(x) is not int or not 0 <= x <= JSON_INT_MAX:
             return "wrong-type"
@@ -1628,7 +1690,7 @@ class Keys:
         elif op == "DROP-SESSION":
             out = await self.drop_session(epoch, args["session"])
         else:
-            out = await self.reload(epoch, args["generation"], args["item_sha256"])
+            out = await self.reload(epoch, args["generation"], args["item_sha256"], keep=args["keep"])
         if out is None:
             return None
         if "refused" in out:
@@ -1818,8 +1880,8 @@ class Keys:
                 # the body read can take up to `body_read_s` after `fresh`'s observation: a token that expired
                 # meanwhile is refused here, before anything is checked or held (the head's write checks it again)
                 unexpired(self.cred_lifecycle, observed)
-            head, hconn, cred, tpl, data, meter, hold = self._check_request(conn.reg, pol, req, raw,
-                                                                            buf)   # the ledger's admit is last
+            head, hconn, cred, tpl, data, meter, hold = self._check_request(conn.reg, pol, req, raw, buf,
+                                                                            claims.get("run"))   # admit is last
         except norm.Refused as r:
             buf.give_back()
             try:
@@ -2136,6 +2198,15 @@ class Keys:
             why = "the dispatch route ids are unknown" if ids is None else "a base route and a dispatch route"
             _note(logging.WARNING, "levain gw-keys: route %s refused: %s", route, why)
             raise norm.Refused("keys-unavailable", f"route-collision: {route}: {why}")
+        run = claims.get("run")
+        if run is not None:
+            # a dispatch run (a ticketed session) calls its run's route only, and that route is a dispatch-map route:
+            # a run named on any base-map route (passthrough, egress or interactive brokered) is refused here, keys'
+            # own refusal beside CONTROL's `ticket-field:route` at mint
+            if route != run.get("route"):
+                raise norm.Refused("route-not-allowed", "not the run's route")
+            if pol is not None:
+                raise norm.Refused("passthrough-for-dispatch", route)
         if pol is None:
             pol = self.dispatch_policy(route, routemaps.pin_of(claims))
         if pol is None or pol.type != "brokered" or pol.upstream is None:
@@ -2154,10 +2225,13 @@ class Keys:
 
     # -- RELOAD (S1 3c-4; 3c design r3 §2.3 "Load at keys", R4 §2) --
 
-    async def reload(self, epoch: int, generation: int, item_sha256: str) -> Optional[dict]:
-        """`RELOAD {generation, item_sha256}`: under the RELOAD lock, the file work off the loop (`current`, the file and
-        its digest, every item check, the order against keys' own head on disk, then that head written durably, all
-        inside `KeysRoutes.txn`), then the generation served on the loop, then the ack `{generation, item_sha256}`. A
+    async def reload(self, epoch: int, generation: int, item_sha256: str, *, keep: Sequence[int]) -> Optional[dict]:
+        """`RELOAD {generation, item_sha256, keep}`: under the RELOAD lock, the file work off the loop (`current`, the
+        file and its digest, every item check, the order against keys' own head on disk, then that head written durably,
+        all inside `KeysRoutes.txn`), then the generation served on the loop, then the ack
+        `{generation, item_sha256, served: [generation]}`. Head ruling H5 (1024+8): the head written drops every
+        `served` entry below it that neither `keep` nor a `run` in keys' cache names, and `served` is what the
+        written head still lists (CONTROL deletes a generation's files only once this list leaves it out). A
         refusal leaves every dispatch route refused until a valid RELOAD. A request from a stale epoch, or after the
         shutdown latch, is not answered; a RELOAD that completed before its epoch went stale still stands (it was
         verified whole).
@@ -2173,8 +2247,9 @@ class Keys:
         assert self.reload_lock is not None
         loop = asyncio.get_running_loop()
         async with self.reload_lock:
+            held = frozenset(keep) | self._cached_run_generations()
             try:
-                fut = loop.run_in_executor(None, self._reload_files, rm, generation, item_sha256)
+                fut = loop.run_in_executor(None, self._reload_files, rm, generation, item_sha256, held)
             except Exception as e:   # the executor took no work (shut down, cannot schedule): a failed RELOAD
                 rm.refuse("keys-unavailable")
                 _note(logging.WARNING, "levain gw-keys: RELOAD %s failed (%s)", generation, type(e).__name__)
@@ -2207,19 +2282,31 @@ class Keys:
             else:
                 checked, head = fut.result()
                 rm.accept(checked, head)
-                out = {"generation": generation, "item_sha256": item_sha256}
+                out = {"generation": generation, "item_sha256": item_sha256,
+                       "served": [e["generation"] for e in head["served"]]}
         if cancelled:
             raise asyncio.CancelledError()
         return out
 
     @staticmethod
-    def _reload_files(rm: "routemaps.KeysRoutes", generation: int,
-                      item_sha256: str) -> "Tuple[routemaps.Checked, dict]":
-        """The synchronous RELOAD transaction, one at a time (`rm.txn`): the checks, then the head settled."""
+    def _reload_files(rm: "routemaps.KeysRoutes", generation: int, item_sha256: str,
+                      keep: "frozenset[int]") -> "Tuple[routemaps.Checked, dict]":
+        """The synchronous RELOAD transaction, one at a time (`rm.txn`): the checks, then the head pruned to `keep`
+        (H5) and settled."""
         with rm.txn:
             checked, head = rm.check_reload(generation, item_sha256)
+            head = rm.pruned(head, keep)
             rm.commit(head)
         return checked, head
+
+    def _cached_run_generations(self) -> "frozenset[int]":
+        """The route-map generations the `run`s in keys' cache are pinned to (H5: never pruned while cached)."""
+        out = set()
+        for entry in self.cache.values():
+            run = entry.get("claims", {}).get("run") if isinstance(entry, dict) else None
+            if isinstance(run, dict) and type(run.get("routemap_generation")) is int:
+                out.add(run["routemap_generation"])
+        return frozenset(out)
 
     def _base_route(self, route: str) -> Optional[RoutePolicy]:
         """`route`'s object in `L/routes/base.json`, opened at every `Q` and parsed (`policy.parse_base_map`: `/1`
@@ -2284,17 +2371,15 @@ class Keys:
                  observed: Optional[Credential]) -> tuple:
         """R4 §1.7 step 1: keys' own re-check of the `Q` against ITS policy (the front's verdict is never taken), with
         no reservation and no request head. Order: a route with no price table (a base `/1` map's) is
-        `model-not-allowed`, and a ticketed run is `model-not-allowed` until its model is checked against the ticket
-        (3c-5); a websocket upgrade is `body-unbounded:websocket` (one exchange carries many responses, no one usage
-        settles it); target and template; headers (strict: a forbidden, consumed or off-list name is
+        `model-not-allowed` (a ticketed run's model is checked against its ticket once the body is parsed,
+        `_check_request`); a websocket upgrade is `body-unbounded:websocket` (one exchange carries many responses,
+        no one usage settles it); target and template; headers (strict: a forbidden, consumed or off-list name is
         `policy-header`); the declared length against `body_cap`; the credential and its host binding; the session in
         `budget_stopped` (`budget-overrun`). Returns (method, path, query, the re-checked headers, the template,
         the credential or None). The credential is `observed`, the one `fresh` observed and checked for the route's
         `credential`: it is not observed again."""
         if pol.prices is None:
             raise norm.Refused("model-not-allowed", "route is not priced")
-        if claims.get("ticket") is not None:
-            raise norm.Refused("model-not-allowed", "a ticketed run's model is checked from 3c-5")
         if q["upgrade"] == "websocket":
             codec.refuse_upgrade()
         try:
@@ -2321,8 +2406,9 @@ class Keys:
         return method, path, query, fwd, tpl, cred
 
     def _check_request(self, reg: Registration, pol: RoutePolicy, req: tuple, raw: "_OneShot",
-                       buf: "BodyTake") -> Tuple[bytes, "h11.Connection", object, norm.Template, bytes,
-                                                 Tuple[codec.Codec, Price, Dict[str, str], str, bool], ledger.Hold]:
+                       buf: "BodyTake", run: Optional[dict] = None
+                       ) -> Tuple[bytes, "h11.Connection", object, norm.Template, bytes,
+                                  Tuple[codec.Codec, Price, Dict[str, str], str, bool], ledger.Hold]:
         """R4 §1.7 steps 4-5, ONE synchronous call (no `await` anywhere in it): the body codec's parse of the buffered
         body, its `check` (the model has a price entry; on a dispatch-shaped route, one with no per-session cap, the
         unboundable shapes are `body-unbounded:<what>`), the ceiling written in where absent and, beside it, a streamed
@@ -2334,11 +2420,18 @@ class Keys:
         head, the h11 client that wrote it (it frames the body and parses the response), the credential (or None),
         the matched template, the body bytes, the codec, the price entry, the request's `call_names` the settle
         reads, the priced model and whether the hold is unproven (the meter), and the admitted hold. `req` is
-        `_check_q`'s answer."""
+        `_check_q`'s answer. For a ticketed run (`run`, from CONTROL's resolve): the checked model must be the run's
+        `model_requested` (`model-not-allowed`), and the hold is the run's (`_admit_hold`). On a dispatch route to
+        OpenRouter, the route's `body_policy` is written in as the request's `provider` object, replacing the client's
+        (`codec.write_body_policy`), before the estimate and the serialization."""
         method, path, query, fwd, tpl, cred = req
         c = codec.CODECS[pol.body_codec]   # a priced route's codec is never `none` (`policy.parse_base_map`)
         obj = c.parse(raw.take())   # the raw bytes are unreferenced once parsed: only `data` below is kept
-        checked = codec.guarded(c.check, obj, pol.prices, dispatch=pol.max_session_microdollars is None)
+        dispatch = pol.max_session_microdollars is None
+        checked = codec.guarded(c.check, obj, pol.prices, dispatch=dispatch,
+                                model_requested=None if run is None else run["model_requested"])
+        if dispatch and pol.upstream is not None and pol.upstream.host == codec.OPENROUTER_HOST:
+            codec.guarded(codec.write_body_policy, obj, pol.body_policy or {})
         codec.guarded(c.write_ceiling, obj, checked.price)
         codec.guarded(c.write_stream_usage, obj)
         estimate = codec.guarded(c.estimate, obj, checked.price)
@@ -2351,21 +2444,27 @@ class Keys:
         # an interactive route admits content the estimate cannot see, marked on its `reserved` line (R4 §1.6)
         meta = {"bound": "unproven"} if checked.unproven else {}
         meter = (c, checked.price, names, checked.model, bool(checked.unproven))
-        hold = self._admit_hold(reg, pol, estimate, checked.model, meta)   # the last step: see `_serve_q`
+        hold = self._admit_hold(reg, pol, estimate, checked.model, meta, run)   # the last step: see `_serve_q`
         return head, hconn, cred, tpl, data, meter, hold
 
     def _admit_hold(self, reg: Registration, pol: RoutePolicy, estimate: int, price_ref: str,
-                    meta: dict) -> ledger.Hold:
+                    meta: dict, run: Optional[dict] = None) -> ledger.Hold:
         """The ledger's synchronous admit of `estimate` (R4 §1.2's estimate, never shrunk: a hold that does not fit the
-        room is `budget-exhausted`) against the route's per-session cap, scope ("session-route", session, route);
+        room is `budget-exhausted`) against the route's per-session cap, scope ("session-route", session, route), or,
+        for a ticketed run, the run's `reserved_microdollars`, scope ("run", run_id) (R4 §1.2);
         `price_ref` is the priced model. The session's place in `budget_stopped` is read again as the statement right
         before the admit (no `await` between the two), because the body read after `_check_q`'s read can take up
         to `body_read_s`. The ledger's own errors become refusals: `budget-exhausted` (402), and
         `keys-unavailable` (503) for an unhealthy or closing ledger and, noted, for a misuse."""
         if self.ledger is None:
             raise norm.Refused("budget-exhausted", "no ledger")
-        cap = pol.max_session_microdollars
-        if cap is None:   # a dispatch route (unreachable in 3c-2a: no dispatch map is loaded)
+        if run is not None:
+            scope: Tuple[str, ...] = ("run", run["run_id"])
+            cap = run["reserved_microdollars"]
+        else:
+            scope = ("session-route", reg.session, pol.route)
+            cap = pol.max_session_microdollars
+        if cap is None:   # a dispatch route with no run: a session with no ticket has no dispatch scope
             raise norm.Refused("budget-exhausted", "no scope")
 
         def bound(room: int) -> int:
@@ -2374,8 +2473,7 @@ class Keys:
         if reg.session in self.budget_stopped:
             raise norm.Refused("budget-overrun", "the session is stopped")
         try:
-            return self.ledger.admit(("session-route", reg.session, pol.route), cap, bound, price_ref=price_ref,
-                                     meta=meta)
+            return self.ledger.admit(scope, cap, bound, price_ref=price_ref, meta=meta)
         except ledger.Refused as e:
             raise norm.Refused(e.name, e.detail) from None
         except ledger.LedgerUnavailable as e:
@@ -2503,8 +2601,8 @@ class Keys:
 
     async def _resolve(self, key: Tuple[int, Registration, str], reg: Registration, deadline: float) -> tuple:
         """The table-owned resolve task: its TYPED outcome is `("answer", {"session", "claims"})`,
-        `("refused", "token-unknown" | "token-revoked")` or `("failed",)` (any Exception, the deadline included); it
-        never raises one to its awaiters. It holds the permits itself, per-session FIRST, global second, each
+        `("refused", "token-unknown" | "token-revoked" | "run-unknown")` or `("failed",)` (any Exception, the deadline
+        included); it never raises one to its awaiters. It holds the permits itself, per-session FIRST, global second, each
         released on every exit; its `finally` pops its table entry."""
         try:
             if reg.resolve_sem is None:
@@ -2538,14 +2636,7 @@ class Keys:
             writer.transport.abort()
         if ans.get("id") != 1:
             return ("failed",)
-        if ans.get("ok") is True:
-            session, claims = ans.get("session"), ans.get("claims")
-            if type(session) is str and session and type(claims) is dict:
-                return ("answer", {"session": session, "claims": claims})
-            return ("failed",)
-        if ans.get("ok") is False and ans.get("refused") in RESOLVE_REFUSALS:
-            return ("refused", ans["refused"])
-        return ("failed",)
+        return resolve_outcome(ans)
 
     async def _refuse(self, conn: Conn, frames: Union[FrameReader, "FrontFrames"], side: KeysSide, name: str,
                       cap: int) -> None:

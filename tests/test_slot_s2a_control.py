@@ -39,7 +39,11 @@ SESSION2 = {"operator": {"LEASE-OPEN", "STATUS"},
             # S1 3c-3 adds keys' attachment verbs (CONTRACT §4.5; 3c design r3 §2.1)
             "keys": {"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS"},
             # S1 3c-4 adds dispatch's ROUTE-SUBMIT (CONTRACT §4.3; 3c design r3 §2.3)
-            "dispatch": {"ROUTE-SUBMIT"}}
+            "dispatch": {"ROUTE-SUBMIT",
+                         # S1 3c-5 adds the ticket verbs (CONTRACT §3.3, §3.5)
+                         "RUN-TICKET-MINT", "RUN-TICKET-CANCEL", "RUN-TICKET-STATUS",
+                         # S1 3c-5 session 2: a ticket-bound lease (CONTRACT §3.1 step 1)
+                         "LEASE-OPEN"}}
 
 
 def attach_claims(**kw) -> dict:
@@ -311,7 +315,7 @@ def test_bad_args_refused_by_name(env):
     assert root.ask("REVOKE")["refused"] == "missing-key"
     assert root.ask("REVOKE", session=S1, extra=1)["refused"] == "unknown-key"
     assert root.ask("REVOKE", session="s-nope")["refused"] == "bad-token"
-    assert env.client("op").ask("LEASE-OPEN", ticket="x")["refused"] == "unknown-key"
+    assert env.client("op").ask("LEASE-OPEN", ticket="x")["refused"] == "ticket-not-allowed"   # the operator holds none
 
 
 # --- the lease and ATTACH (§3.1) ---------------------------------------------------------------------------

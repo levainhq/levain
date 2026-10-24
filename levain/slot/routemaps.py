@@ -35,7 +35,8 @@ from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 from levain.authority_sig import VerifierUnavailable, verify_link_sig
-from levain.broker.policy import DispatchRoute, PolicyError, RoutePolicy, parse_routemap
+from levain.broker.policy import (BodyPolicyError, DispatchRoute, PolicyError, RoutePolicy, body_policy_problem,
+                                  parse_base_map, parse_routemap)
 from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
 from levain.dispatch.routemap_rules import envelope_problem
@@ -186,6 +187,12 @@ def base_route_ids(routes_dir: Path) -> frozenset:
     """The route ids `L/routes/base.json` names, for the collision rule (no dispatch id may be a base id). A base map
     that cannot be read as `{format, routes: [..]}` refuses `config-invalid:base`: no collision can then be ruled
     out. Only the ids are read here; keys parses the base map whole on its own `Q` path."""
+    return frozenset(base_route_types(routes_dir))
+
+
+def base_route_types(routes_dir: Path) -> Dict[str, object]:
+    """Each route id `L/routes/base.json` names, with its `type` as written (a ticket's `egress_routes` must each be
+    an `egress` one, CONTRACT §3.5). Read as :func:`base_route_ids` reads the file, with its refusals."""
     try:
         data = _read(Path(routes_dir) / "base.json", BASE_MAP_MAX)
     except OSError:
@@ -198,7 +205,26 @@ def base_route_ids(routes_dir: Path) -> frozenset:
         raise Refused("config-invalid:base", "base.json does not parse") from None
     if not isinstance(doc, dict) or not isinstance(doc.get("routes"), list):
         raise Refused("config-invalid:base", "base.json has no routes list")
-    return frozenset(r["route"] for r in doc["routes"] if isinstance(r, dict) and isinstance(r.get("route"), str))
+    return {r["route"]: r.get("type") for r in doc["routes"] if isinstance(r, dict) and isinstance(r.get("route"), str)}
+
+
+def base_route_policy_types(routes_dir: Path) -> Dict[str, str]:
+    """Each route id `L/routes/base.json` names, with its type, from the map parsed WHOLE as keys parses it
+    (`policy.parse_base_map`: every entry, both formats, no id twice), for a ticket's `egress_routes` (3c-5 fix 2, L3 r1
+    codex 6): a base map keys would refuse never lets a mint accept an egress id. A map that is unreadable, does not
+    parse, or holds any defect refuses `config-invalid:base`. (:func:`base_route_types` stays the collision rule's
+    id read.)"""
+    try:
+        data = _read(Path(routes_dir) / "base.json", BASE_MAP_MAX)
+    except OSError:
+        data = None
+    if data is None:
+        raise Refused("config-invalid:base", "base.json is unreadable")
+    try:
+        parsed = parse_base_map(canon.parse(data))
+    except Exception as e:   # noqa: BLE001 - any entry's failure, of whatever type, refuses the map whole (as keys)
+        raise Refused("config-invalid:base", f"base.json does not parse whole ({type(e).__name__})") from None
+    return {rid: pol.type for rid, pol in parsed.items()}
 
 
 # --- the one checker -----------------------------------------------------------------------------------------------
@@ -212,7 +238,8 @@ def check_item(raw: bytes, sig: object, trust: Trust, base_ids: frozenset, *,
     `prev` and `issued_at` (`levain.dispatch.routemap_rules.envelope_problem`, the producer's own check: `parse_item`
     calls it too, so this accepts exactly what dispatch emits); the body
     (`levain.broker.policy.parse_routemap`: every route brokered with a codec and a price on every model, no per-call
-    cap, no session cap, no id twice); no route id that is a base id. The generation order is the caller's, against
+    cap, no session cap, no id twice); each route's `body_policy` (`route-invalid:body_policy`, head ruling H2); no route
+    id that is a base id. The generation order is the caller's, against
     its own head."""
     if not isinstance(raw, bytes) or len(raw) > ITEM_MAX_BYTES:
         raise Refused("routemap-invalid:item", f"an item is at most {ITEM_MAX_BYTES} bytes")
@@ -241,10 +268,17 @@ def check_item(raw: bytes, sig: object, trust: Trust, base_ids: frozenset, *,
         raise Refused("routemap-invalid:envelope", problem)
     try:
         routes = parse_routemap(obj["body"])
+    except BodyPolicyError as e:
+        raise Refused("route-invalid:body_policy", str(e)) from None    # head ruling H2's name (L1 note 9)
     except PolicyError as e:
         raise Refused("routemap-invalid:body", str(e)) from None
     except (RecursionError, TypeError, ValueError) as e:
         raise Refused("routemap-invalid:body", type(e).__name__) from None
+    for r in routes:
+        # head ruling H2: a body_policy is judged here, at ROUTE-SUBMIT (and keys' own load), never at request time
+        problem = body_policy_problem(r.policy, r.body_policy)
+        if problem is not None:
+            raise Refused("route-invalid:body_policy", problem)
     hit = sorted({r.policy.route for r in routes} & set(base_ids))
     if hit:
         raise Refused("routemap-invalid:route", f"route id {hit[0]} is a base route")
@@ -408,6 +442,39 @@ class ControlRoutes:
             finally:
                 os.close(dfd)
 
+    def delete_unserved(self, served: "frozenset[int]", keep: "frozenset[int]") -> List[int]:
+        """Head ruling H5 (1024+8), CONTROL's half; the caller holds the activation lock. Deletes the files of every
+        generation below the head that keys' RELOAD ack (`served`) no longer lists and that CONTROL's own `keep` does
+        not name: never from CONTROL's view alone, since keys re-loads every generation its head lists at its start
+        and a missing file there fails every base route closed (`route_ids()` None). Returns the generations
+        deleted."""
+        a = self._active
+        if a is None:
+            return []
+        try:
+            names = os.listdir(self.dispatch)
+        except FileNotFoundError:
+            return []
+        gone: set = set()
+        for n in names:
+            m = _GEN_FILE.match(n)
+            if m is None:
+                continue
+            g = int(m.group(1))
+            if g < a.generation and g not in served and g not in keep:
+                try:
+                    os.unlink(self.dispatch / n)
+                    gone.add(g)
+                except FileNotFoundError:
+                    pass
+        if gone:
+            dfd = os.open(self.dispatch, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                self._fsync(dfd)
+            finally:
+                os.close(dfd)
+        return sorted(gone)
+
     def submit(self, item: object, sig: object, reload: Callable[[Dict[str, object]], object],
                served: Optional[Callable[[], object]] = None) -> int:
         """`ROUTE-SUBMIT {map, sig}` (r3 §2.3 "Accept at CONTROL" + "Activation", R4 §2), under the activation lock from
@@ -526,8 +593,9 @@ class KeysRoutes:
     def check_reload(self, generation: int, item_sha256: str) -> Tuple[Checked, dict]:
         """r3 §2.3 "Load at keys" (R4 §2): `current` == the RELOAD's generation == the file's == the envelope's; the
         file's SHA-256 == `item_sha256`; every item check, re-run here; and against keys' OWN head on disk: a greater
-        generation, or the same one with the same digest. Returns the checked item and the head keys serves after
-        this RELOAD, which the caller always settles (:meth:`commit`) and then installs (:meth:`accept`): a new head
+        generation, or the same one with the same digest. Returns the checked item and the UNPRUNED head after this
+        RELOAD; the caller prunes it to the RELOAD's `keep` (:meth:`pruned`, head ruling H5), and the pruned head is the
+        one it always settles (:meth:`commit`), installs (:meth:`accept`) and serves. The unpruned head is: a new head
         for a greater generation, or the disk head itself for the same one (the convergent repair: a head whose
         directory fsync failed after its rename is settled again, and a head on disk that keys does not hold in
         memory is installed)."""
@@ -551,6 +619,14 @@ class KeysRoutes:
         return checked, {"format": KEYS_HEAD_FORMAT, "store_id": trust.store_id, "generation": generation,
                          "item_sha256": item_sha256, "served": served}
 
+    @staticmethod
+    def pruned(head: dict, keep: "frozenset[int]") -> dict:
+        """`head` with every `served` entry below its generation dropped unless `keep` names it (head ruling H5,
+        1024+8): `keep` is the RELOAD's `keep` (what CONTROL's open tickets and live sessions reference) plus the
+        generations keys' own cached runs name. The head generation itself is always served."""
+        served = [e for e in head["served"] if e["generation"] == head["generation"] or e["generation"] in keep]
+        return {**head, "served": served}
+
     def commit(self, new_head: dict) -> None:
         """keys' head, durably, BEFORE the generation is served or acked (the same bytes again settle it)."""
         os.makedirs(self.head_path.parent, mode=0o700, exist_ok=True)
@@ -564,8 +640,11 @@ class KeysRoutes:
         self.ids_unknown = head is None and problem is not None   # `load`: a head on disk that does not verify
 
     def accept(self, checked: Checked, head: dict) -> None:
-        """A RELOAD keys acks: `head` (already durable) installed and the generation served."""
+        """A RELOAD keys acks: `head` (already durable) installed and the generation served; a generation the head no
+        longer lists (pruned) is no longer held."""
         self.head = head
+        listed = {e["generation"] for e in head["served"]}
+        self.maps = {g: m for g, m in self.maps.items() if g in listed}
         self.maps[checked.generation] = checked
         self.usable, self.problem = True, None
         self.ids_unknown = False
@@ -622,5 +701,7 @@ class KeysRoutes:
 
 __all__ = ["CONFIG_FORMAT", "CONFIG_NAMESPACE", "CURRENT", "Checked", "ControlRoutes", "DISPATCH_DIR", "FAULT_POINTS",
            "HEAD", "ITEM_KEYS", "ITEM_MAX_BYTES", "KEYS_HEAD", "KEYS_HEAD_FORMAT", "KIND", "KeysRoutes", "Pin",
-           "SIGNATURE_MAX", "TRUST_FORMAT", "TRUST_JSON", "TRUST_PUB", "Trust", "base_route_ids", "check_item",
+           "SIGNATURE_MAX", "TRUST_FORMAT", "TRUST_JSON", "TRUST_PUB", "Trust", "base_route_ids",
+           "base_route_policy_types",
+           "base_route_types", "check_item",
            "item_digest", "pin_of", "policy_digest", "read_trust"]

@@ -581,7 +581,8 @@ def test_admin_verbs_idempotent(py):
             reloads = []
             for _ in range(2):
                 try:
-                    reloads.append(await in_thread(lambda: admin.call("RELOAD", generation=1, item_sha256="0" * 64)))
+                    reloads.append(await in_thread(lambda: admin.call("RELOAD", generation=1, item_sha256="0" * 64,
+                                                                      keep=[1])))
                 except C.AdminRefused as e:
                     reloads.append(e.answer)
             out["reload"] = reloads
