@@ -212,7 +212,7 @@
 
 
   // The desk's mark, direction M1 (bezel + callout): 60 engraved ticks (a major every 5) in the alert colour on a thin track hugging the core, a lubber notch at 12
-  // o'clock, the "!N" readout on a short leader line (C's aviation callout) to the lower right, clear of every label. On arrival the ticks light in sequence once (CSS, ~1.2 s), then hold; the label
+  // o'clock, the "!N" readout on a short leader line (C's aviation callout) to the lower right, clear of every label. On arrival the ticks light in sequence once (CSS: 60 ticks 20 ms apart, each .2 s), then hold; the label
   // rides HUB_LIFT px higher while the desk is marked. Every part is inert to the pointer: the desk's own tap is untouched.
   const HUB_LIFT = 9;
   const pol = (r, deg) => [num(r * Math.sin(deg * Math.PI / 180)), num(-r * Math.cos(deg * Math.PI / 180))];     // clockwise from 12 o'clock, relative to the centre
