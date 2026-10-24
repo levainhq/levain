@@ -330,13 +330,14 @@ class _Hold:
 
     def __init__(self, amount: int, fail: "Exception | None" = None) -> None:
         self.amount, self.fail, self.settled = amount, fail, None
+        self.base = None   # an interactive hold: no lineage row (S1 3c-6c)
 
     def settle(self, cost: int, meta: dict) -> None:
         if self.fail is not None:
             raise self.fail
         self.settled = cost
 
-    def uncertain(self, reason: str) -> None:
+    def uncertain(self, reason: str, meta: "dict | None" = None) -> None:
         raise AssertionError("not reached: the reader reports usage")
 
 

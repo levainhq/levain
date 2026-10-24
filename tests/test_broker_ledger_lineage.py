@@ -220,7 +220,7 @@ def test_released_carries_meta(tmp_path):
         a = await Owner(led, meta={"lineage_base": BASE}, then_durable=True).start()
         b = await Owner(led, then_durable=True).start()
         await until(lambda: a.hold.state is L.RESERVED and b.hold.state is L.RESERVED)
-        a.hold.release()
+        a.hold.release({"lineage": dict(BASE, settled="no")})   # H6-28: keys' own row on its own call
         b.hold.release()
         await until(lambda: a.hold.state is L.RESOLVED and b.hold.state is L.RESOLVED)
         out = led.unacked()
@@ -232,7 +232,7 @@ def test_released_carries_meta(tmp_path):
     ref, out = asyncio.run(go())
     rel = [o for o in file_lines(path) if o["kind"] == "released"]
     assert [sorted(o) for o in rel] == [["at", "kind", "meta", "ref", "seq"]] * 2
-    assert rel[0]["meta"]["lineage"] == dict(BASE, settled="no", ended_at=rel[0]["at"])
+    assert rel[0]["meta"]["lineage"] == dict(BASE, settled="no")
     assert rel[1]["meta"] == {}
     assert [r[2] for r, _ in out] == [ref]
 
@@ -331,7 +331,7 @@ def test_an_ack_is_not_counted_before_its_flush(tmp_path, monkeypatch):
         monkeypatch.setattr(L, "_flush", ctl)
         led.attach(asyncio.get_running_loop())
         o = await _sent_hold(led, meta={"lineage_base": BASE})
-        o.hold.settle(10)
+        o.hold.settle(10, {"lineage": dict(BASE, settled="yes")})
         await until(lambda: o.hold.state is L.RESOLVED)
         (t, _), = led.unacked()
         ctl.gate.clear()
@@ -363,7 +363,7 @@ def test_an_ack_whose_flush_fails_is_not_counted(tmp_path, monkeypatch):
         monkeypatch.setattr(L, "_flush", ctl)
         led.attach(asyncio.get_running_loop())
         o = await _sent_hold(led, meta={"lineage_base": BASE})
-        o.hold.settle(10)
+        o.hold.settle(10, {"lineage": dict(BASE, settled="yes")})
         await until(lambda: o.hold.state is L.RESOLVED)
         (t, _), = led.unacked()
         ctl.errors.append(OSError(5, "EIO"))
@@ -389,7 +389,7 @@ def test_ack_refuses_an_unknown_triple_and_writes_nothing(tmp_path):
         led._durable([o.hold.seq])
         o.hold.send_gate()
         o.hold.mark_sent()
-        o.hold.settle(5)
+        o.hold.settle(5, {"lineage": dict(BASE, settled="yes")})
         (res,) = [json.loads(x[1]) for x in _q(led)]
         t = (led.ledger_id, led.epoch, o.hold.seq)
         with pytest.raises(L.LedgerMisuse):
@@ -426,9 +426,9 @@ def test_unacked_is_in_ref_order_and_the_listener_sees_each_durable_line(tmp_pat
         led.on_outbox = lambda ref, pay: seen.append(ref)
         a = await _sent_hold(led, meta={"lineage_base": BASE})
         b = await _sent_hold(led, meta={"lineage_base": BASE})
-        b.hold.settle(1)
+        b.hold.settle(1, {"lineage": dict(BASE, settled="yes")})
         await until(lambda: b.hold.state is L.RESOLVED)
-        a.hold.uncertain("upstream-reset")
+        a.hold.uncertain("upstream-reset", {"lineage": dict(BASE, settled="uncertain")})
         await until(lambda: a.hold.state is L.RESOLVED)
         out = [r[2] for r, _ in led.unacked()]
         await a.finish()

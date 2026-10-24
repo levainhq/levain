@@ -153,7 +153,7 @@ async def run(mode: str, path: str, arg: str) -> None:
         await h2.durable()
         h2.send_gate()
         h2.mark_sent()
-        h2.settle(AMOUNT)
+        h2.settle(AMOUNT, {"lineage": {"run_id": "r-0123456789abcdef", "settled": "yes"}})   # H6-28
         await settle_resolved(h2)
         ((triple, _),) = led.unacked()
         ev(at="outbox", triple=list(triple), size=os.path.getsize(path))

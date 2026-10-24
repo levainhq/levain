@@ -25,9 +25,10 @@ H6-17) adds the lineage outbox. A new file is written `/3`; a `/2` file is read 
 lines (its header is never rewritten), so a `/2` build refuses that file `ledger-corrupt:key` once it holds one.
 - The lineage payload is a dict at `meta["lineage"]` on a resolution line or a `refused` line (a `/2` file carries it the
   same way, R4 §10); its schema is keys' (3c-6c), the ledger only carries it. A `reserved` line's
-  `meta["lineage_base"]` marks a ticketed hold: every resolution of it carries a payload, the caller's
-  `meta["lineage"]` when given, else `lineage_payload(base, outcome, at)` (so `released` (H6-5), `owner-ended`, `closed`
-  and replay's `restart` lines all have their row).
+  `meta["lineage_base"]` marks a ticketed hold: every resolution of it carries a payload. A keys-called settle /
+  uncertain / release / end MUST pass keys' full payload as `meta["lineage"]`, else `LedgerMisuse` (H6-28, 3c-6c: one
+  place computes a row); the ledger's OWN resolutions (`owner-ended`, `closed`, the durable wait's timeout, replay's
+  `restart`) carry `lineage_payload(base, outcome, at)`, so every resolution has its row.
 - `released` gains `meta` (a `/2` `released` line has none and is still read).
 - `refused {seq, epoch, session, run_id, route, reason, count, meta}` (H6-10: the current epoch; its triple's ref is the
   line's own seq). `run_id` is a string or null. keys writes it at a window's close.
@@ -372,12 +373,11 @@ class Hold:
     def mark_sent(self) -> None:
         self._ledger._hold_mark_sent(self)
 
-    def end(self) -> bool:
-        self._ledger._check_loop()
-        return self._ledger._end(self, "ended")
+    def end(self, meta: Optional[dict] = None) -> bool:
+        return self._ledger._hold_end(self, {} if meta is None else meta)
 
-    def release(self) -> bool:
-        return self._ledger._hold_release(self)
+    def release(self, meta: Optional[dict] = None) -> bool:
+        return self._ledger._hold_release(self, {} if meta is None else meta)
 
     def settle(self, cost: int, meta: Optional[dict] = None) -> bool:
         return self._ledger._hold_settle(self, cost, {} if meta is None else meta)
@@ -997,15 +997,35 @@ class Ledger:
         outbox = (hold.ref, meta["lineage"]) if "lineage" in meta else None
         self._submit(seq, data, hold, "resolution", outbox=outbox)
 
-    def _end(self, hold: Hold, reason: str) -> bool:
-        """The owner-end column: RELEASED if unsent, `uncertain {reason}` if sent, a no-op otherwise."""
+    def _end(self, hold: Hold, reason: str, meta: Optional[dict] = None) -> bool:
+        """The owner-end column: RELEASED if unsent, `uncertain {reason}` if sent, a no-op otherwise. `meta` is a
+        keys-called `end`'s (checked by `_hold_end`); the ledger's own ends (owner-ended, closed, the durable wait's
+        timeout) pass none, and a ticketed hold's row is then built from its base."""
         st = hold.state
         if st is PENDING or st is RESERVED:
-            self._resolve(hold, RELEASED)
+            self._resolve(hold, RELEASED, meta=meta)
             return True
         if st is SENT:
-            self._resolve(hold, UNCERTAIN, reason, {})
+            self._resolve(hold, UNCERTAIN, reason, {} if meta is None else meta)
             return True
+        return False
+
+    @staticmethod
+    def _keys_row(hold: Hold, meta: dict) -> None:
+        """H6-28 (3c-6, head 1024+13): ONE place computes a row. The ledger builds a payload only for its OWN
+        resolutions (restart, owner-ended, closed); a keys-called settle / uncertain / release / end of a TICKETED hold
+        (one whose `reserved` line carries `lineage_base`) must carry keys' full `/3` payload in `meta["lineage"]`."""
+        if hold.base is not None and "lineage" not in meta:
+            raise LedgerMisuse("a keys-called resolution of a ticketed hold carries meta['lineage'] (H6-28)")
+
+    def _hold_end(self, hold: Hold, meta: dict) -> bool:
+        self._check_loop()
+        st = hold.state
+        if st is PENDING or st is RESERVED or st is SENT:
+            self._keys_row(hold, meta)
+            if not self._fits(hold, UNCERTAIN if st is SENT else RELEASED, meta):
+                raise LedgerMisuse("a malformed meta")
+            return self._end(hold, "ended", json.loads(json.dumps(meta)))
         return False
 
     def _strand(self, hold: Hold) -> None:
@@ -1168,11 +1188,14 @@ class Ledger:
             return
         raise LedgerMisuse("mark_sent with no passing send_gate before it")
 
-    def _hold_release(self, hold: Hold) -> bool:
+    def _hold_release(self, hold: Hold, meta: dict) -> bool:
         self._check_loop()
         st = hold.state
         if st is PENDING or st is RESERVED:
-            self._resolve(hold, RELEASED)
+            self._keys_row(hold, meta)
+            if not self._fits(hold, RELEASED, meta):
+                raise LedgerMisuse("a malformed meta")
+            self._resolve(hold, RELEASED, meta=json.loads(json.dumps(meta)))
             return True
         if st is SENT:
             raise LedgerMisuse("release on a sent hold")
@@ -1193,6 +1216,7 @@ class Ledger:
         if st is SENT:
             if not _is_int(cost) or cost < 0:
                 raise LedgerMisuse("a malformed cost")
+            self._keys_row(hold, meta)
             if not self._fits(hold, SETTLED, meta):
                 raise LedgerMisuse("a malformed meta")
             self._resolve(hold, SETTLED, cost, json.loads(json.dumps(meta)))
@@ -1207,6 +1231,7 @@ class Ledger:
         if st is SENT:
             if type(reason) is not str or not _REASON_RE.fullmatch(reason) or reason in RESERVED_REASONS:
                 raise LedgerMisuse("a malformed or reserved reason")
+            self._keys_row(hold, meta)
             if not self._fits(hold, UNCERTAIN, meta):
                 raise LedgerMisuse("a malformed meta")
             self._resolve(hold, UNCERTAIN, reason, json.loads(json.dumps(meta)))
