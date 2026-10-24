@@ -1182,7 +1182,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             # held equal to the one the signer's key material shows (an enrolment from before the door at
             # custody_problem could hold a passkey at custody fido). The one exception is a QUARANTINED key's link
             # already in the log: WebAuthn material at another custody, so the link is re-checked below as the
-            # passkey its material shows (user verification, the exact origin). A new link it signs is refused
+            # passkey its material shows (user verification, the origin rule below). A new link it signs is refused
             why = custody_mismatch(signer.public_key, signer.custody)
             if why is not None and (new_link or not is_passkey_material(signer.public_key)):
                 raise AuthorityError(why + ("; the key is quarantined: it signs nothing new" if new_link and

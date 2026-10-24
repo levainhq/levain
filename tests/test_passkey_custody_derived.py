@@ -65,7 +65,8 @@ class WebAuthnKey:
         self.fp = fingerprint_of(self.public_key)
         self.counter = 0
 
-    def sign(self, message: bytes, namespace: str, *, uv: bool = True, origin: str = ORIGIN) -> str:
+    def sign(self, message: bytes, namespace: str, *, uv: bool = True, origin: str = ORIGIN,
+             ssh_origin: "str | None" = None) -> str:
         self.counter += 1
         chal = base64.urlsafe_b64encode(challenge(message, namespace)).decode("ascii").rstrip("=")
         cdj = json.dumps({"type": "webauthn.get", "challenge": chal, "origin": origin, "crossOrigin": False},
@@ -74,7 +75,8 @@ class WebAuthnKey:
         counter = struct.pack(">I", self.counter)
         auth_data = hashlib.sha256(self.rp_id.encode("ascii")).digest() + bytes([flags]) + counter
         der = self.priv.sign(auth_data + hashlib.sha256(cdj).digest(), ec.ECDSA(hashes.SHA256()))
-        inner = (_string(SIG_TYPE) + _string(_ecdsa_signature(der)) + bytes([flags]) + counter + _string(origin)
+        inner = (_string(SIG_TYPE) + _string(_ecdsa_signature(der)) + bytes([flags]) + counter
+                 + _string(origin if ssh_origin is None else ssh_origin)
                  + _string(cdj) + _string(b""))
         blob = (b"SSHSIG" + struct.pack(">I", 1) + _string(_key_parts(self.public_key)[0]) + _string(namespace)
                 + _string(b"") + _string("sha512") + _string(inner))
@@ -438,12 +440,16 @@ def test_a_quarantined_keys_past_link_without_uv_or_off_origin_is_refused_as_a_f
     (f"{ORIGIN}:8443", False, "exactly: no port"),                      # any link but a revoke: exactly, as before
     ("https://other.example.ts.net:8443", True, f"not {ORIGIN}"),        # another name on a port
     (f"http://{RP}:8443", True, f"not {ORIGIN}"), (f"{ORIGIN}:443", True, f"not {ORIGIN}"),
-    (f"{ORIGIN}:8443/x", True, f"not {ORIGIN}"), (f"https://u@{RP}:8443", True, f"not {ORIGIN}")])
+    (f"{ORIGIN}:8443/x", True, f"not {ORIGIN}"), (f"https://u@{RP}:8443", True, f"not {ORIGIN}"),
+    ((ORIGIN, f"{ORIGIN}:8443"), True, f"not {ORIGIN}"),                # SSH field and client data name two pages
+    ((f"{ORIGIN}:9999", f"{ORIGIN}:8443"), True, f"not {ORIGIN}:9999")])
 def test_the_authority_takes_a_revoke_from_the_keys_own_name_on_any_port_and_nothing_wider(origin, revoke, why):
     """Phill 10-24 "2a": a ``revoke_grant`` signed on ``https://<the key's name>:<any port>`` verifies at replay; the
     same name only (no other name, scheme, default port, path or userinfo), and every other link stays exact."""
     pk = WebAuthnKey()
-    got = authority_signature_problem(pk.sign(b"m", auth.NAMESPACE, origin=origin), pk.public_key, revoke=revoke)
+    ssh_origin, client_origin = origin if isinstance(origin, tuple) else (origin, origin)
+    sig = pk.sign(b"m", auth.NAMESPACE, origin=client_origin, ssh_origin=ssh_origin)
+    got = authority_signature_problem(sig, pk.public_key, revoke=revoke)
     assert (got is None) if why is None else (got is not None and why in got), got
 
 

@@ -19,9 +19,9 @@ held link is taken on its first use, whatever the outcome.
 The page's token only opens the route: the authority is the passkey's signature, which the replay verifies. The one
 link a passkey may sign in the authority log is ``revoke_grant`` of a consent or inert grant (:mod:`levain.authority`);
 it only ever narrows what an agent may do. The log takes it only from a passkey made on an https name, so a phone
-port on ``localhost`` lists the grants with no signer and says why; from a page on that name, on any port (the
-cockpit's ``https://<name>:8443``), :func:`levain.consent.passkey.authority_signature_problem`. ``keys`` and ``root`` are the server's callables
-over the ONE cockpit the queue's consent hooks name; either may raise :class:`levain.consent.sign.SignRefused`,
+port on ``localhost`` lists the grants with no signer and says why. It takes one signed on that name on any port
+(:func:`levain.consent.passkey.authority_signature_problem`), so a cockpit served on ``https://<name>:8443`` signs
+here too, held to its own page by ``page_origin``. ``keys`` and ``root`` are the server's callables over the ONE cockpit the queue's consent hooks name; either may raise :class:`levain.consent.sign.SignRefused`,
 answered with its status. Stdlib only.
 """
 from __future__ import annotations

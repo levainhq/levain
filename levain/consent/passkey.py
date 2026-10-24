@@ -8,7 +8,8 @@ rebuilds the challenge from the message being verified, requires clientDataJSON 
 from the key's application, then checks the ECDSA signature over all of it (flags and counter included). It checks
 neither the user-presence flag nor what the origin is: levain's own presence rule
 (:func:`levain.authority.presence_missing`) refuses a signature without presence, and :func:`to_sshsig` refuses one
-whose origin is not exactly the key's own ``https://<host>`` or that lacks user verification. So:
+whose origin is not exactly the key's own ``https://<host>`` (or exactly the pinned page it is given) or that lacks
+user verification. So:
 
   - :func:`challenge` is the challenge the page asks the passkey to sign: the whole SSHSIG signed-data blob for the
     answer's message (``"SSHSIG" || string(namespace) || string("") || string("sha512") || string(SHA-512(message))``,
@@ -248,7 +249,8 @@ def answer_signature_problem(signature: str, public_key: str, page_origin: "str 
     the key's own ``https://<host>`` (:func:`_client_origin`; exactly ``page_origin`` when one is given). Among
     levain's own verifiers, the consent queue accepts a passkey's signature only in its answer, ruling and away-leave
     namespaces (it runs this check for all three), the authority replay accepts it on a ``revoke_grant`` link only
-    (and runs :func:`authority_signature_problem`, this check with https required, at every replay), and the
+    (and runs :func:`authority_signature_problem`, this check with https required and, on that link, the key's own
+    name on any port, at every replay), and the
     cockpit broker accepts one only over a phone pending in ``levain-cockpit-phone``, T2 at most, running this
     check before ssh-keygen (K8). The phone port's sign requests (:mod:`levain.consent.sign`) also run this
     check, for a caller outside levain, in namespaces levain never verifies; so does dispatch
