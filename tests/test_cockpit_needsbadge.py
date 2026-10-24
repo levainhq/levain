@@ -109,15 +109,17 @@ def test_the_badge_sits_outside_its_node_and_a_tap_in_the_padding_opens_the_card
 
 
 @needs_browser
-def test_needs_first_and_the_card_id_are_capped_at_the_same_bound_as_the_title(tmp_path, monkeypatch):
+def test_needs_first_is_capped_and_a_card_id_over_the_bound_is_refused_never_cut(tmp_path, monkeypatch):
     from tests.test_cockpit_k7_build import _sessions_fixture
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     v = _needy()
-    v["hub"].update(needs_first="f" * 400, needs_first_card="c" * 400, needs_first_what="w" * 400)
-    out = _run(tmp_path, src, [*PRIME, {"eval": _paint(v, "agents")},
-                               {"eval": "(() => { const b = %s; return JSON.stringify([b.getAttribute('data-needbadge').length, b.querySelector('title').textContent.length]); })()" % (BADGE % "hub")},
+    v["hub"].update(needs_first="f" * 400, needs_first_card="np:" + "c" * 117, needs_first_what="w" * 400)          # the card id is exactly 120: kept whole
+    v["nodes"][2].update(needs_first_card="np:" + "c" * 118)                                                         # one over (n3): refused
+    probe = ("(() => { const b = %s, o = %s; return JSON.stringify([b.getAttribute('data-needfirst').length, b.querySelector('title').textContent.length, "
+             "o.getAttribute('role'), !!o.querySelector('.tv-needhit')]); })()") % (BADGE % "hub", BADGE % "n3")
+    out = _run(tmp_path, src, [*PRIME, {"eval": _paint(v, "agents")}, {"eval": probe},
                                {"eval": "%s.dispatchEvent(new MouseEvent('click', {bubbles: true})); window.__opened.length" % (BADGE % "hub")}])
-    assert json.loads(out[-2]) == [120, 120] and out[-1] == 120, out
+    assert json.loads(out[-2]) == [120, 120, None, False] and out[-1] == 120, out
 
 
 @needs_browser

@@ -166,12 +166,13 @@
   // The decision mark (Phill 10-23): the desk (the hub) or a seat node that carries needs_open > 0 is drawn with a red ring and a "!" badge holding
   // the count. The keys are optional: absent, zero, non-integer or negative draws nothing and is never an error. needs_first_card (the card id the
   // cockpit resolves, never derived from needs_first) makes the badge a button that opens that card; without it the badge is display-only.
-  // needs_first_what is the badge's title. Every string is capped at the same 120 characters.
+  // needs_first_what and needs_first are capped at 120 characters for the title and a data attribute; the card id is never cut: one that is not a
+  // non-empty string or is longer than 120 is refused (display-only), never rewritten.
   const NEED_CAP = 120;
   const capStr = (x) => (typeof x === "string" ? x.slice(0, NEED_CAP) : "");
   function needsOf(o) {
     if (!isObj(o) || !Number.isInteger(o.needs_open) || o.needs_open <= 0) return null;
-    return { n: o.needs_open, first: capStr(o.needs_first), card: capStr(o.needs_first_card), what: capStr(o.needs_first_what) };
+    return { n: o.needs_open, first: capStr(o.needs_first), card: typeof o.needs_first_card === "string" && o.needs_first_card.length <= NEED_CAP ? o.needs_first_card : "", what: capStr(o.needs_first_what) };
   }
   // ring radius rr around (cx, cy), the badge on the ring at angle ang (radians). Returns {inner, outer}: inner goes inside the node (or hub) group;
   // outer, set only when the badge is a button, is a sibling group at the same coordinates (no interactive role nested in the node's role=button),
@@ -180,7 +181,7 @@
     const g = sv("g", { "data-needs": String(nd.n) }, "tv-need");
     g.appendChild(sv("circle", { cx: num(cx), cy: num(cy), r: num(rr) }, "tv-needring"));
     const bx = cx + Math.cos(ang) * rr, by = cy + Math.sin(ang) * rr, txt = "!" + (nd.n > 9 ? "9+" : String(nd.n)), w = txt.length > 2 ? 30 : 24;
-    const b = sv("g", { "data-needbadge": nd.card, "data-needfor": owner }, "tv-needbadge");
+    const b = sv("g", { "data-needbadge": nd.card, "data-needfirst": nd.first, "data-needfor": owner }, "tv-needbadge");
     const tip = nd.what || (nd.n + " decision" + (nd.n === 1 ? "" : "s") + " waiting on you");
     const openable = !!nd.card && !!opts && typeof opts.openCard === "function";
     if (openable) {
