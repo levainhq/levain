@@ -322,7 +322,8 @@
                             options: isNum(f.question_options) ? f.question_options : 0,
                             age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "",
                             decidedAge: typeof f.decided_at === "string" ? ageLabel(f.decided_at, nowMs || Date.now(), "") : "",
-                            offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "question_answer" && a.gesture === "direct") };
+                            offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "question_answer" && a.gesture === "direct"),
+                            sign: signOf(f) };
         }
         // an agent's note: who filed it, when, and whether it was dismissed; its words are fetched with the page's token
         // (dashboard_core.js noteBody). It carries no answer and no authority: `offered` is only the kernel's dismiss
@@ -333,7 +334,8 @@
                         total: isNum(f.note_open_total) ? f.note_open_total : 0,
                         age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "",
                         decidedAge: typeof f.decided_at === "string" ? ageLabel(f.decided_at, nowMs || Date.now(), "") : "",
-                        offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "note_dismiss" && a.gesture === "direct") };
+                        offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "note_dismiss" && a.gesture === "direct"),
+                        sign: signOf(f) };
         }
         return line;
       });
@@ -419,6 +421,9 @@
   // an action a browser can perform: refused and laptop-only gestures have nothing to post
   const isPostable = (a) => isObj(a) && typeof a.verb === "string" && a.gesture !== "refused" && a.gesture !== "laptop-only";
   const isNum = (x) => typeof x === "number" && Number.isFinite(x);
+  // a question or note row's sign facet (DESIGN_SIGN D5): the id of the sign request its answer is signed through, the
+  // id only (the page reads the request with its token); "" when the row names none
+  const signOf = (f) => (isObj(f.sign) && typeof f.sign.request === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(f.sign.request) ? f.sign.request : "");
   function need(ok, what) { if (!ok) throw new Error("malformed " + what); }
   // a line list (line and visual kinds): absent is empty; each line is an object whose text is a string
   function labelled(x, what) {
@@ -791,7 +796,7 @@
         if (vh && !NATIVE.has(pid)) {
           // the action names its own panel: the send posts to THIS panel's offer, never another panel's
           view.extra_panels[pid].action = { verb: own.verb, panel: pid, fields: (Array.isArray(vh.fields) ? vh.fields : []).filter((n) => typeof n === "string").map(composeField) };
-          view.action_verbs[own.verb] = { label: vh.label, confirm_required: vh.confirm === true, idempotent: vh.idempotent === true, job: false };
+          view.action_verbs[own.verb] = { label: vh.label, confirm_required: vh.confirm === true, idempotent: vh.idempotent === true, job: false, sign: vh.sign === true };
           // a form panel names its own fields: they win over the widgets guessed from the verb head's names
           const form = view.extra_panels[pid].form;
           if (form && form.verb === own.verb) view.extra_panels[pid].action.fields = form.fields.map(formField);

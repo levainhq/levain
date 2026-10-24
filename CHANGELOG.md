@@ -6,6 +6,50 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **The cockpit can sign answers and messages with your passkey.** An embedder that files levain sign requests (the
+  phone page's ceremony) can now have the cockpit page run the same ceremony. `make_server` takes `signer=` (a
+  `levain.consent.sign.Signer` pinned to the page it is served on with `page_origin`), `extra_hosts=` (the bare https
+  name a reverse proxy such as `tailscale serve` forwards to it) and `compose_signer=`. With a signer the cockpit serves
+  `GET /cockpit/sign.json` and `POST /cockpit/sign/<id>/{challenge,answer,deny}`, each behind the write token, the
+  Host allowlist and same-origin rules a write has. A question or note whose caller sets `sign_request` shows that
+  request's own options as buttons; one tap asks your passkey and records a signature that `ssh-keygen -Y verify`
+  accepts, the first answer winning when the phone and the cockpit answer one request. A cancelled passkey signs
+  nothing and keeps what you typed. On any page other than the pinned one the card says where to sign and offers no
+  other answer. A verb declared with `ActionVerb(sign=True)` is sent from its compose box only after your passkey signs
+  its params: the page asks `POST /cockpit/sign/compose` (the `compose_signer` files the request; its `ValueError` is
+  shown to you), runs the ceremony, then posts the verb with `sign_request`, which the verb's own effect must verify.
+  Each draft carries one id (`client_txn`) for its whole life: the compose route names the same request for it while
+  that request is open, and the send is keyed by it, so a lost reply, a retry or a reload files one request and sends
+  once, at any tier: a signed verb is deduped by that key whatever its `idempotent` says. The kernel refuses a signed
+  verb on every route, a dry run included, before its handler runs, unless its `sign_request` names a request a
+  compose route filed for that verb and exactly those params and the Signer holds signed, and its `idempotency_key` is
+  `sign-` plus that draft's id (a signed request is sent under one key only); and `ActionVerb(sign=True, job=True)` is
+  refused. Which request each draft filed is kept in the Signer's sign directory (`sign/.compose.json`), so a restart
+  or any number of other drafts never forgets it: a send that landed and lost its reply is answered with its first
+  reply when it is sent again within the at-most-once window (24 hours), and runs once. A record goes when its request is denied, removed or expires unsigned,
+  and at the latest 48 hours after its compose; a record file grown past what a read takes is pruned by the next
+  compose once its requests have left. A `make_server` that fails part way through attaching to the caller's
+  cockpit undoes its own attaches, keeping any panel registered meanwhile, and releases its pin on the Signer. `GET /cockpit/sign/<id>.json` reads one request whatever the listing's
+  cap. Without a `compose_signer` a signed verb is not sent at all. A request through an `extra_hosts` name is treated as
+  off the box: the cockpit's reads need the token there too. `levain.consent.sign.passkey_key_source` is the passkey
+  key source the phone page uses, for an embedder building the Signer.
+- **A passkey verifier can be pinned to an https page with a port.** `levain.consent.passkey` accepts an explicit
+  `page_origin` of `https://<name>:<port>` for a name other than localhost; without one, the portless rule is
+  unchanged for every existing verifier.
+
+### Known edges
+- A signed send refused outright for a reason other than its signature (a confirm, a stale row) drops its signed draft,
+  so sending it again asks the passkey once more.
+- Each tab gives a signed draft its own id, so the same words sent from two tabs file two requests.
+- Once 1024 records are live on a queue (`COMPOSE_LIVE_MAX`), a new draft's compose is refused 429 `too_many_open`
+  ("finish or deny open requests first") and files nothing, while a draft already recorded is still answered. Composes
+  of new drafts running at once can each pass the check, so the count can pass 1024 by the composes in flight.
+- Each compose prunes the queue's records before it files, and other drafts' composes wait for it; with many live
+  records that wait grows.
+- A proxy is recognised by the `extra_hosts` names and forwarding headers; a proxy that sends neither and names
+  `127.0.0.1` reads as local.
+
 ## [0.11.21] — 2026-10-24
 
 ### Added

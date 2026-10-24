@@ -304,7 +304,17 @@ class ActionVerb:
     - ``label`` — a short human label for the audit trail + the operator affordance.
     - ``fields`` — the param names the verb takes. Declared, the cockpit allowlist refuses any other
       param and the manifest publishes them for the page's compose box; ``None`` leaves the handler
-      to validate its own params."""
+      to validate its own params.
+    - ``sign`` — when True, the cockpit page sends this verb only after the operator's passkey signs it (DESIGN_SIGN
+      D5): the page asks the server's ``compose_signer`` (``make_server``) to file a sign request for the params, runs
+      the passkey ceremony on it, then posts the verb with the params plus ``sign_request: <id>``. The kernel admits
+      that one extra param on a signed verb and refuses a send whose ``sign_request`` does not name a request the
+      server's compose filed for this verb and exactly these params and its Signer holds signed, on every route,
+      before the handler runs; it does not verify the signature: the verb's handler or effect is the door, and it
+      verifies the signature over the params before applying them. A signed verb is at-most-once whatever
+      ``idempotent`` says: the page keys its post by the draft's identity and the kernel dedupes it. Without a
+      ``compose_signer`` the page sends nothing for a signed verb (it never falls back to an unsigned send). A
+      signed verb is never a ``job`` (refused here): the page's job path runs no ceremony."""
 
     handler: Callable[[dict[str, Any]], dict[str, Any]]
     confirm_required: bool = True
@@ -312,8 +322,15 @@ class ActionVerb:
     job: bool = False
     label: str = ""
     fields: tuple[str, ...] | None = None
+    sign: bool = False
 
     def __post_init__(self) -> None:
+        # `sign` is published to two page views that read it differently ("yes" is true to one, false to the other)
+        if type(self.sign) is not bool:
+            raise ValueError(f"ActionVerb.sign must be True or False, got {self.sign!r}")
+        if self.sign and self.job:
+            # a job's propose is posted by the page's job path, which no passkey ceremony precedes
+            raise ValueError("ActionVerb cannot be both sign and job: a signed verb is sent only after its ceremony")
         f = self.fields
         if f is None:
             return

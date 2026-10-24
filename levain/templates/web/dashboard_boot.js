@@ -157,6 +157,7 @@
         ok: false,
         error: data.error || "HTTP " + res.status,
         message: data.message || "HTTP " + res.status,
+        status: res.status,   // an answer from the server: a 4xx is a definite refusal (a signed send is filed again)
       };
     } catch (e) {
       return { ok: false, error: "network", message: e && e.message ? e.message : String(e) };
@@ -407,6 +408,7 @@
     confirm_required: "That needs a confirmation. Try again and confirm it.",
     bad_request: "That request was not understood. Reload and try again.",
     bad_signature: "That signature was not accepted. Sign again.",
+    sign_required: "That is sent only after your passkey signs it; nothing was sent. Send it again.",
     credential_required: "Saving needs the write token for this page. Open the page from the link that carries it."
   };
   // Only a landed state is silent; a state this page does not know speaks too (never a quiet failure). Own-property lookups:
@@ -424,9 +426,9 @@
       notice = { key: what.row_id || null, text: text, cls: "err" };
       paintNow(notice);
       rereadLatched();   // a re-read that never discards an open form: it defers while one is dirty, and stays owed
-      return { ok: false, error: code, message: text };
+      return { ok: false, error: code, message: text, status: r.status };
     }
-    return { ok: false, error: code, message: text };
+    return { ok: false, error: code, message: text, status: r.status };
   }
 
   // One write per fingerprint at a time: a second identical submit while the first is still asking, firing or
@@ -450,18 +452,23 @@
     const pv = opts.panelVersion !== undefined && opts.panelVersion !== null ? opts.panelVersion : t.panel_version;
     if (typeof pv === "string") base.panel_version = pv;
     if (head.confirm === true && opts.confirm === true) base.confirm = true;
-    // the request as the operator asked it, before any tier is known: a stored envelope is found by it
+    // the request as the operator asked it, before any tier is known: a stored envelope is found by it. A signed send
+    // (opts.signTxn, the draft's one identity) is found by that identity and its words, never by the sign request it
+    // names: a reload that signs the same draft again replays the envelope (and the key) its first send kept
+    const txn = typeof opts.signTxn === "string" && opts.signTxn ? opts.signTxn : null;
+    const fpParams = Object.assign({}, base.params);
+    if (txn) delete fpParams.sign_request;
     const fpKey = canon([base.verb, base.panel_id, base.row_id || null, base.row_version || base.panel_version || null,
-                         base.params, base.confirm === true]);
+                         fpParams, base.confirm === true, txn]);
     if (writing.has(fpKey)) return writing.get(fpKey);
-    const run = fire(base, head, label, action, fpKey);
+    const run = fire(base, head, label, action, fpKey, txn);
     writing.set(fpKey, run);
     try { return await run; } finally { writing.delete(fpKey); }
   }
 
-  async function fire(base, head, label, action, fpKey) {
+  async function fire(base, head, label, action, fpKey, txn) {
     const what = { row_id: base.row_id, label: label };
-    // A T2+ fire (or an idempotent verb's) carries one key, minted for this request and kept with the whole
+    // A T2+ fire (or an idempotent or signed verb's) carries one key, minted for this request and kept with the whole
     // envelope until the kernel answers. A kept envelope is sent again BEFORE any new dry run: the write it
     // carries may have landed and moved the row, and only a replay under its own key gets that answer back.
     let env = (readKeys()[fpKey] || {}).envelope || null;
@@ -469,7 +476,8 @@
       let tier = "C1", gesture = action.gesture, intent = null;
       const mayEscalate = !(action.gesture === "direct" && (!Array.isArray(action.escalates) || action.escalates.length === 0));
       if (mayEscalate) {
-        const d = await send("/cockpit/verb", Object.assign({}, base, { dry_run: true }));
+        // a signed send's preview names its draft's key too: the kernel admits a signed request only under that key
+        const d = await send("/cockpit/verb", Object.assign({}, base, { dry_run: true }, txn ? { idempotency_key: "sign-" + txn } : {}));
         if (d.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };
         if (!d.ok) return fault(d, what);
         tier = d.data.tier; gesture = d.data.gesture;
@@ -480,8 +488,10 @@
       }
       env = Object.assign({}, base);
       if (intent) { env.intent = intent; env.tier_seen = tier; env.gesture_seen = gesture; }
-      if (tier !== "C1" || head.idempotent === true) {
-        env.idempotency_key = newKey();
+      if (txn || tier !== "C1" || head.idempotent === true) {
+        // every signed send carries its draft's identity as its key, whatever its tier (the kernel dedupes a signed
+        // verb's key at any tier), so a retry, another tab or a reload of the same draft applies it once
+        env.idempotency_key = txn ? "sign-" + txn : newKey();
         const keys = readKeys(); keys[fpKey] = { envelope: env }; writeKeys(keys);
       }
     }
@@ -549,8 +559,9 @@
 
   // a downstream verb's compose box. A box that names its panel posts THAT panel's offer, and refuses when the
   // panel no longer offers the verb: never another panel's offer of the same verb (KE3 L3 cx2). The idempotency
-  // key argument is the legacy route's; the cockpit route keys its own envelope.
-  async function manifestAction(verb, params, confirm, _idempotencyKey, panelId) {
+  // key argument is the legacy route's; the cockpit route keys its own envelope (a signed send's by `signTxn`, its
+  // draft's identity).
+  async function manifestAction(verb, params, confirm, _idempotencyKey, panelId, signTxn) {
     if (!live) return { ok: false, error: "not_ready", message: "the page has not finished reading" };
     let action = null;
     if (typeof panelId === "string") {
@@ -561,7 +572,7 @@
       action = panelActionFor(verb, null);
     }
     if (!action) return { ok: false, error: "not_offered", message: "the cockpit did not offer " + verb + " here" };
-    return postVerb(action, params, { confirm: confirm === true });
+    return postVerb(action, params, { confirm: confirm === true, signTxn: signTxn });
   }
 
   // cancel a waiting pending: the gesture's intent, no preview, and a key of its own. The whole envelope

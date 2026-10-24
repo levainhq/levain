@@ -1747,7 +1747,19 @@ body.ke .needs-card .question-answer .question-option:last-child:nth-child(odd) 
 body.ke .needs-card .question-option { line-height: 1.3; }
 body.ke .needs-qa { display: flex; flex-direction: column; gap: var(--sp-2); }
 body.ke .needs-q-title { font: var(--fw-bold) var(--fs-title)/1.35 var(--round); color: var(--text); overflow-wrap: anywhere; }
-body.ke .needs-q-blocks { overflow-wrap: anywhere; }
+body.ke .needs-q-blocks { overflow-wrap: anywhere; white-space: pre-wrap; }
+/* the sign card (DESIGN_SIGN D5): the request's own options as buttons, the line each signs under them, and one status line */
+.sign-facet { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+.sign-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+body.ke .needs-card .sign-actions { display: grid; grid-template-columns: 1fr 1fr; }
+body.ke .needs-card .sign-actions .sign-option:last-child:nth-child(odd) { grid-column: 1 / -1; }
+.sign-write-in { min-width: 0; font: inherit; }
+.sign-note:empty { display: none; }
+.sign-note { overflow-wrap: anywhere; }
+.sign-note.sign-bad::before { content: "▲ "; color: var(--bad); }
+.sign-note.sign-ok::before { content: "✓ "; color: var(--ok); }
+.sign-lines { display: flex; flex-direction: column; gap: var(--sp-1); }
+.sign-line { font-family: var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 body.ke .needs-rec { font-size: var(--fs-meta); color: var(--text); overflow-wrap: anywhere; }
 body.ke .needs-rec-tag { font: var(--fw-bold) var(--fs-micro)/1 var(--mono); letter-spacing: .08em; color: var(--accent); margin-right: var(--sp-1); }
 body.ke .needs-card .question-words { max-width: none; }

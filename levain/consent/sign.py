@@ -47,6 +47,12 @@ refused, with the reason, never skipped. The result lands beside the request:
     with the deny, which a request changed since is refused. The request file is never deleted here, so a caller
     can tell a denial from an expiry.
 
+A cockpit's compose route (:func:`levain.web_server.make_server`'s ``compose_signer``) also records, in
+``<queue_dir>/sign/.compose.json`` (:data:`COMPOSE_BINDINGS`), which request each signed draft filed, for which verb and
+params (:func:`bind_compose`, :func:`compose_bindings`): the kernel's sign check reads it, so it outlives the server
+that wrote it, and a binding leaves only with its request or its age (:data:`BINDING_KEEP_S`). While
+:data:`COMPOSE_LIVE_MAX` are live a new draft's compose is refused (:func:`draft_bindings`).
+
 The rules, each a refusal before anything is signed:
 
   - a namespace is ``[a-z0-9][a-z0-9.-]{2,63}``, never begins ``levain``, is none of :data:`REFUSED_NAMESPACES`
@@ -76,7 +82,8 @@ The rules, each a refusal before anything is signed:
     challenge, or that expired, is refused, checked again after the signature verifies and just before the result
     is written (the verify runs outside the lock, so a file changed or expired during it is refused too);
   - the signature passes the same checks as a consent answer's: user verification and a page whose origin is
-    exactly ``https://<rp id>``, or on ``localhost`` exactly the phone port's own ``http://localhost:<port>``
+    exactly ``https://<rp id>``, or exactly the Signer's ``page_origin`` when one is set (the phone port's own
+    ``http://localhost:<port>`` on ``localhost``; the https name and port a cockpit is served on)
     (:func:`levain.consent.passkey.answer_signature_problem`), then ``ssh-keygen`` in the request's namespace
     (:func:`levain.authority.verify_link_sig`).
 
@@ -90,8 +97,11 @@ Nothing here touches the consent queue's database or the authority log: the file
 
 Known edges:
 
-  - two phone servers on one queue dir can race a deny against a sign (the lock is per process): one server per
-    queue is the supported shape;
+  - two Signers on one queue dir (the phone port's, and the one a cockpit is given as
+    :func:`levain.web_server.make_server`'s ``signer``) may each challenge
+    one request; the last check and the writes of an answer or a deny run under an ``flock`` on ``sign/.lock``
+    held across processes, so the first decision wins whole and the other is refused (409), and a ``.sig`` always
+    belongs to the ``.signed.json`` beside it;
   - identical messages in one namespace share a challenge and so a signature: the caller embeds a unique id (a
     report id, a period) in the message, and its verifier checks it. A choice is no exception: "release 1.0?" with
     "(a): yes" signed once verifies on every later request with the same message;
@@ -106,6 +116,7 @@ Known edges:
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -114,17 +125,21 @@ import secrets
 import stat
 import threading
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 from levain import unshowable
+from levain.idempotency import DEFAULT_WINDOW_S as _GATE_WINDOW_S
+from levain.sign_request_id import ID as _ID, request_id_ok
 
-__all__ = ["CHOICE_FORMAT", "CHOICE_MARK", "LIST_MAX", "MESSAGE_MAX", "OPTIONS_MAX", "REFUSED_NAMESPACES",
-           "REQUEST_FORMAT", "SIGN_DIR", "WRITE_IN_KEY", "SignRefused", "SignRequest", "Signer", "choice_line",
-           "deep_link", "namespace_problem", "parse_choice", "read_request", "sign_dir", "signed_bytes", "state_of",
-           "write_in_problem"]
+__all__ = ["BINDING_KEEP_S", "CHOICE_FORMAT", "CHOICE_MARK", "COMPOSE_BINDINGS", "COMPOSE_LIVE_MAX", "ERROR_WORDS",
+           "LIST_MAX", "LOCK_WAIT_S", "MESSAGE_MAX", "OPTIONS_MAX", "REFUSED_NAMESPACES", "REQUEST_FORMAT", "SIGN_DIR",
+           "WRITE_IN_KEY", "SignRefused", "SignRequest", "Signer", "bind_compose", "choice_line", "compose_bindings",
+           "deep_link", "draft_bindings", "error_word", "namespace_problem", "parse_choice", "passkey_key_source", "read_request",
+           "request_id_ok", "sign_dir", "sign_root", "signed_bytes", "state_of", "write_in_problem"]
 
 REQUEST_FORMAT = "levain-sign-request/1"
 CHOICE_FORMAT = "levain-sign-choice/1"
@@ -136,7 +151,6 @@ _TEXT_MAX = 200                    # characters of a title or a requester
 _FILE_MAX = 64 * 1024              # a request file past this is not read
 LIST_MAX = 50                      # open requests one listing shows; past it the page shows how many were left
 _SCAN_MAX = 4096                   # directory entries one listing looks at
-_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
 _NAMESPACE = re.compile(r"[a-z0-9][a-z0-9.-]{2,63}")
 _KEYS = frozenset({"format", "id", "namespace", "message", "title", "requester", "expires_at"})
 _CHOICE_KEYS = _KEYS | {"options"}
@@ -145,6 +159,26 @@ _OPTION_KEY = re.compile(r"[a-z0-9]{1,8}")
 WRITE_IN_KEY = "*"                 # the key a write-in signs under: never an option key, which is [a-z0-9]{1,8}
 # ssh's conventional namespaces: git's commit signing (levain's team ledger verifies in it), file and email
 REFUSED_NAMESPACES = frozenset({"git", "file", "email"})
+# how long an answer or a deny waits for the queue lock another Signer holds (its writes take milliseconds), then a 503
+LOCK_WAIT_S = 5.0
+_LOCK_POLL_S = 0.02
+# The compose route's bindings (levain.web_server, DESIGN_SIGN D5): which request each signed draft's compose filed, for
+# which verb and params, in one file in the sign directory. The leading dot is outside the request id grammar, so no
+# listing reads it as a request. Kept durably because the kernel's sign check reads it before the at-most-once gate
+# replays a signed send: a binding lost to a restart would refuse the retry of a send that landed.
+COMPOSE_BINDINGS = ".compose.json"
+_BINDING_KEYS = frozenset({"verb", "txn", "params", "request", "filed_at"})
+# A binding leaves when its request does (bind_compose), and at the latest this long after its compose: twice the
+# at-most-once gate's window (levain.idempotency.DEFAULT_WINDOW_S), so it outlasts the replay of any send made within
+# one window of its compose; past the gate's window a replay is gone anyway, and a refusal then asks the passkey
+BINDING_KEEP_S = 2 * _GATE_WINDOW_S
+# The most live bindings a queue keeps (draft_bindings): past it a NEW draft's compose is refused 429, while a draft
+# already bound is still answered. Every binding is a request the operator signs with a passkey or that waits for him,
+# and a signed one stays BINDING_KEEP_S, so 1024 is one ceremony every three minutes for two days without a break: no
+# human reaches it, only a token holder filing in a loop. At about 250 bytes a binding it holds the file near 256 KiB,
+# far under _BINDINGS_MAX, and bounds the reads every compose and signed send makes under the queue lock.
+COMPOSE_LIVE_MAX = 1024
+_BINDINGS_MAX = 16 * 1024 * 1024        # bytes of the bindings file a reader takes; past it the read is refused (503)
 
 
 class SignRefused(Exception):
@@ -154,6 +188,57 @@ class SignRefused(Exception):
     def __init__(self, message: str, status: int = 422) -> None:
         super().__init__(message)
         self.status = status
+
+
+# the error word a port answers a SignRefused with, by its status; any other status is "sign_refused". ONE table: the
+# phone port (levain.phone_server) and the cockpit (levain.web_server) both import it, so the two cannot drift
+ERROR_WORDS = {400: "bad_request", 404: "not_found", 409: "conflict", 429: "too_many_open", 503: "unavailable"}
+
+
+def error_word(status: int) -> str:
+    """The error word for a :class:`SignRefused` of ``status`` (:data:`ERROR_WORDS`, else ``sign_refused``)."""
+    return ERROR_WORDS.get(status, "sign_refused")
+
+
+def sign_root(queue_dir: Path) -> Path:
+    """The ONE cockpit the queue's consent hooks name, whose passkeys sign a sign request or a dispatch job.
+    SignRefused (503) when no hook names one, or when they name several (which passkeys sign is then not one
+    answer)."""
+    from levain.consent.answering import hook_roots
+
+    roots = hook_roots(queue_dir)
+    if not roots:
+        raise SignRefused("no consent hook names a cockpit, so no passkey can sign here: this queue dir names no "
+                          "cockpit: write claude_code.json with cockpit_data_root", 503)
+    if len(roots) > 1:
+        raise SignRefused("the consent hooks name more than one cockpit, so which passkeys sign is not one "
+                          "answer: nothing is signed", 503)
+    return roots[0]
+
+
+def passkey_key_source(queue_dir: Path, rp_id: str, *, cache: Any = None) -> "Callable[[], dict[str, Any]]":
+    """What may sign a sign request, as the ``keys`` a :class:`Signer` takes: a callable returning the active passkey
+    keys (fingerprint -> :class:`levain.authority.AuthorityKey`) enrolled on ``rp_id`` in :func:`sign_root`'s
+    cockpit, re-read on every call (the hooks and the authority log both, never a snapshot). A laptop key never
+    signs. SignRefused (503) when no single cockpit is named or its keys cannot be read now. ``cache`` is a
+    :class:`levain.authority.ReplayCache` shared with the caller's other replays; None keeps one for this source."""
+    import sqlite3
+
+    from levain.authority import AuthorityError, ReplayCache, anchor_path
+    from levain.consent.answering import passkey_keys
+    from levain.consent.queue import authority_source
+
+    replay = ReplayCache() if cache is None else cache
+
+    def keys() -> "dict[str, Any]":
+        root = sign_root(queue_dir)
+        try:
+            source = authority_source(root / "cockpit.db", anchor=anchor_path(root), cache=replay)
+            return {k.fingerprint: k for k in passkey_keys(source(), rp_id)}
+        except (AuthorityError, OSError, sqlite3.Error) as exc:
+            raise SignRefused(f"the cockpit's keys cannot be read now: {exc}", 503) from None
+
+    return keys
 
 
 def namespace_problem(namespace: object) -> str | None:
@@ -489,15 +574,188 @@ def _publish(write: Any, path: Path, text: str, exists: str) -> None:
         raise SignRefused(f"could not write {path}: [Errno {exc.errno}] {exc.strerror or exc}", 503) from None
 
 
+@contextmanager
+def _queue_lock(queue_dir: Path) -> Iterator[None]:
+    """An exclusive ``flock`` on ``<queue_dir>/sign/.lock`` around the last check and the writes of an answer or a
+    deny, held across every Signer on the queue in any process (a Signer's own lock orders only its own threads).
+    A fresh open per acquisition, so two Signers in one process contend too; closing the descriptor releases it. A
+    sign directory that cannot hold the lock (flock's own OSError: ENOLCK, ENOTSUP) is a 503, never an unlocked
+    write, and so is a lock another holder keeps past :data:`LOCK_WAIT_S`; the descriptor is closed on every path."""
+    import time
+
+    path = sign_dir(queue_dir) / ".lock"
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as exc:
+        raise SignRefused(f"could not lock {path}: [Errno {exc.errno}] {exc.strerror or exc}", 503) from None
+    try:
+        deadline = time.monotonic() + LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise SignRefused(f"could not lock {path}: another signer has held it past {LOCK_WAIT_S:g}s; "
+                                      "nothing was written, try again", 503) from None
+                time.sleep(_LOCK_POLL_S)
+            except OSError as exc:
+                raise SignRefused(f"could not lock {path}: [Errno {exc.errno}] {exc.strerror or exc}", 503) from None
+        yield
+    finally:
+        os.close(fd)
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _binding_problem(b: Any) -> str | None:
+    if not isinstance(b, dict) or set(b) != _BINDING_KEYS or not all(isinstance(v, str) for v in b.values()):
+        return f"a binding has exactly the string keys {sorted(_BINDING_KEYS)}"
+    if not (request_id_ok(b["txn"]) and request_id_ok(b["request"]) and b["verb"] and b["params"]):
+        return "a binding names a draft id, a request id, a verb and a params fingerprint"
+    try:
+        filed = datetime.fromisoformat(b["filed_at"])
+    except ValueError:
+        filed = None
+    if filed is None or filed.tzinfo is None:
+        return "a binding's filed_at is an ISO 8601 time with a zone"
+    return None
+
+
+def compose_bindings(queue_dir: Path) -> "list[dict[str, str]]":
+    """Every binding :func:`bind_compose` recorded on this queue, oldest first: ``{verb, txn, params, request,
+    filed_at}``. ``[]`` only when there is no file. A file that is there and cannot be read whole (over
+    ``_BINDINGS_MAX`` bytes included), or holds anything but well-formed bindings, is :class:`SignRefused` (503), never
+    read as empty: a binding it hid would turn a lost answer's retry into a refusal, and the operator's next signature
+    into a second send."""
+    return _read_bindings(queue_dir, _BINDINGS_MAX)
+
+
+def _read_bindings(queue_dir: Path, limit: int | None) -> "list[dict[str, str]]":
+    """:func:`compose_bindings`, reading at most ``limit`` bytes, or the whole file when ``limit`` is None: the
+    writers' read (:func:`draft_bindings`, :func:`bind_compose`), under the queue lock, so a file over the readers'
+    limit is still pruned instead of refusing every compose until a hand removes it."""
+    path = sign_dir(queue_dir) / COMPOSE_BINDINGS
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise SignRefused(f"could not read {path}: [Errno {exc.errno}] {exc.strerror or exc}", 503) from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise SignRefused(f"{path} is not a regular file", 503)
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            raw = fh.read() if limit is None else fh.read(limit + 1)
+    except OSError as exc:
+        raise SignRefused(f"could not read {path}: [Errno {exc.errno}] {exc.strerror or exc}", 503) from None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if limit is not None and len(raw) > limit:
+        raise SignRefused(f"{path} is over {limit} bytes", 503)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise SignRefused(f"{path} is not UTF-8 JSON", 503) from None
+    if not isinstance(data, list):
+        raise SignRefused(f"{path} is not a list of bindings", 503)
+    for b in data:
+        problem = _binding_problem(b)
+        if problem is not None:
+            raise SignRefused(f"{path}: {problem}", 503)
+    return data
+
+
+def _binding_live(queue_dir: Path, b: "dict[str, str]", now: datetime) -> bool:
+    """A binding stays while its request may still be sent: signed, or open and unexpired (an open request whose file
+    cannot be read stays too, since nothing says it left). It leaves with its request (denied; gone; expired while
+    open, so never signable) and, whatever its request says, once filed more than :data:`BINDING_KEEP_S` ago."""
+    if (now - datetime.fromisoformat(b["filed_at"])).total_seconds() > BINDING_KEEP_S:
+        return False
+    state = state_of(queue_dir, b["request"])
+    if state != "open":
+        return state == "signed"
+    try:
+        request = read_request(queue_dir, b["request"])
+    except SignRefused:
+        return False                                  # gone
+    return request.expires_at is None or request.expires_at > now
+
+
+def bind_compose(queue_dir: Path, verb: str, txn: str, params: str, request_id: str) -> None:
+    """Record, durably, that the compose of draft ``txn`` filed ``request_id`` for ``verb`` and the params whose
+    fingerprint is ``params`` (``levain.web_server``'s compose route, DESIGN_SIGN D5): a new binding beside every
+    other, under the queue lock, written whole and flushed to disk before this returns, with the bindings whose
+    request left (:func:`_binding_live`) dropped in the same write. A binding goes only with its request or its age,
+    never to make room: the cap on how many there are is checked before the request is filed
+    (:func:`draft_bindings`), since a request already filed and then not bound could not be sent. :class:`SignRefused`
+    (503) when the lock, the read or the write fails; the file is then left as it was."""
+    path = sign_dir(queue_dir) / COMPOSE_BINDINGS
+    now = _now()
+    new = {"verb": verb, "txn": txn, "params": params, "request": request_id, "filed_at": now.isoformat()}
+    problem = _binding_problem(new)
+    if problem is not None:
+        raise ValueError(problem)
+    with _queue_lock(queue_dir):
+        kept = [b for b in _read_bindings(queue_dir, None) if _binding_live(queue_dir, b, now)]
+        _publish(_write_over, path, json.dumps(kept + [new], separators=(",", ":")), "")
+
+
+def draft_bindings(queue_dir: Path, verb: str, txn: str) -> "list[dict[str, str]]":
+    """The live bindings of draft ``txn`` for ``verb``, oldest first, read by the compose route before it files
+    anything (``levain.web_server``, DESIGN_SIGN D5). Under the queue lock the bindings whose request left
+    (:func:`_binding_live`) are pruned first, and written back when any were. Then a draft with none, so one whose
+    compose would file a new request, is refused :class:`SignRefused` (429) while :data:`COMPOSE_LIVE_MAX` bindings
+    are live: a draft already bound is never refused, so a lost answer's retry is still answered. Composes of new drafts
+    running at once can each pass the check before any binds, so the file may pass the cap by the composes in flight,
+    never more. :class:`SignRefused` (503) when the lock, the read or the write fails."""
+    path = sign_dir(queue_dir) / COMPOSE_BINDINGS
+    now = _now()
+    with _queue_lock(queue_dir):
+        found = _read_bindings(queue_dir, None)
+        kept = [b for b in found if _binding_live(queue_dir, b, now)]
+        if len(kept) != len(found):
+            _publish(_write_over, path, json.dumps(kept, separators=(",", ":")), "")
+    mine = [b for b in kept if b["verb"] == verb and b["txn"] == txn]
+    if not mine and len(kept) >= COMPOSE_LIVE_MAX:
+        raise SignRefused(f"{len(kept)} sign requests filed in the last {BINDING_KEEP_S // 3600} hours are open or "
+                          f"signed, the most this cockpit keeps: finish or deny open requests first; nothing was filed",
+                          429)
+    return mine
+
+
+def _row(rid: str, request: SignRequest, signers: "list[str]") -> dict[str, Any]:
+    """One listing row (:meth:`Signer.page`, :meth:`Signer.row`): a refused request carries ``refused``, its
+    ``sha256`` and none of its text."""
+    if request.refused is not None:
+        return {"id": rid, "namespace": request.namespace, "refused": request.refused, "sha256": request.sha256,
+                "signers": []}
+    row: dict[str, Any] = {"id": rid, "title": request.title, "message": request.message,
+                           "namespace": request.namespace, "requester": request.requester,
+                           "expires_at": request.expires_at.isoformat(), "sha256": request.sha256, "signers": signers}
+    if request.options:     # the exact line each option's signature appends, so the page shows what is signed
+        row["options"] = [{"key": k, "text": t, "line": choice_line(k, t)} for k, t in request.options]
+        if request.recommended is not None:
+            row["recommended"] = request.recommended      # marked on the page, never selected there
+        if request.write_in:   # the line a write-in's signature appends, the words in place of the empty end
+            row["write_in"] = {"key": WRITE_IN_KEY, "line": choice_line(WRITE_IN_KEY, ""), "max": _TEXT_MAX}
+    return row
 
 
 class Signer:
     """The phone port's sign side over the queue at ``queue_dir``: lists, challenges, verifies and records. ``keys()``
     returns the active passkey keys that may sign (fingerprint -> :class:`levain.authority.AuthorityKey`), or raises
-    :class:`SignRefused` saying why there are none to ask. ``page_origin`` is the phone port's own origin when its
-    name is ``localhost`` (a passkey's page must be exactly it), else None."""
+    :class:`SignRefused` saying why there are none to ask. ``page_origin`` is the page a passkey's assertion must
+    come from exactly, set by the caller: the phone port's own origin when its name is ``localhost`` (else None,
+    which holds the page to ``https://<rp_id>``), or the https name and port a cockpit serves the ceremony on
+    (:func:`levain.web_server.make_server` refuses a missing or malformed one). A server that takes the Signer pins
+    it (:meth:`pin_page_origin`): while any server holds a pin a different ``page_origin`` is refused, so the origin
+    every verification reads is the one the server checked, and nothing can move it under a ceremony in flight. Only a
+    server that failed before it served releases its pin (:meth:`release_pin`)."""
 
     def __init__(self, queue_dir: Path, namespaces: "tuple[str, ...]", rp_id: str, keys: Any) -> None:
         for ns in namespaces:
@@ -505,10 +763,44 @@ class Signer:
             if problem is not None:
                 raise ValueError(f"--sign-namespace: {problem}")
         self.queue_dir, self.namespaces, self.rp_id, self._keys = Path(queue_dir), tuple(namespaces), rp_id, keys
-        self.page_origin: str | None = None
+        self._page_origin: str | None = None
+        self._pins = 0          # the servers holding it pinned (pin_page_origin, release_pin): pinned while any does
         self._lock = threading.Lock()
         # request id -> (file sha256, signer fp, chosen option key or None, the write-in's words or None) at challenge
         self._challenged: dict[str, tuple[str, str, str | None, str | None]] = {}
+
+    @property
+    def page_origin(self) -> str | None:
+        """The page a passkey's assertion must come from exactly (see the class doc)."""
+        return self._page_origin
+
+    @page_origin.setter
+    def page_origin(self, value: str | None) -> None:
+        with self._lock:
+            if self._pins and value != self._page_origin:
+                raise ValueError(f"refusing page_origin {str(value)[:120]!r}: a server holds this Signer pinned to "
+                                 f"{self._page_origin!r}; build a new Signer for another page")
+            self._page_origin = value
+
+    def pin_page_origin(self, problem: "Callable[[str | None], str | None]") -> None:
+        """Pin ``page_origin`` as it is now, if ``problem`` (called on it under the same lock a set takes) says
+        nothing is wrong with it; else raise ``ValueError`` with the problem and pin nothing. Each pin is one holder's:
+        pinning an already pinned Signer checks it again, keeps its page_origin and adds a holder, and it stays pinned
+        until every holder has released its pin (:meth:`release_pin`)."""
+        with self._lock:
+            found = problem(self._page_origin)
+            if found is not None:
+                raise ValueError(found)
+            self._pins += 1
+
+    def release_pin(self) -> None:
+        """Release one holder's pin: a server that pinned this Signer and then failed before it served anything
+        (:func:`levain.web_server.make_server`). The pins of other holders stay; with none left, ``page_origin`` may
+        be set again."""
+        with self._lock:
+            if self._pins <= 0:
+                raise ValueError("release_pin: this Signer holds no pin")
+            self._pins -= 1
 
     def _ours(self, request: SignRequest) -> bool:
         """A request in a namespace this port signs, or a refused one whose namespace no signer could own (malformed,
@@ -533,6 +825,11 @@ class Signer:
             raise SignRefused(f"sign request {request_id} is refused: {request.refused}")
         return request
 
+    def signers(self) -> list[str]:
+        """The fingerprints of the active passkeys that may sign here (what a listing names as its signers), or
+        :class:`SignRefused` saying why there are none to ask."""
+        return list(self._keys())
+
     def listing(self, signers: "list[str]") -> list[dict[str, Any]]:
         """The rows of :meth:`page`."""
         return self.page(signers)["rows"]
@@ -543,7 +840,8 @@ class Signer:
         ``overflow`` counts the request files not read (at least that many when the directory holds more than one
         listing looks at). A refused one carries ``refused``, its ``sha256`` and none of its text: what cannot be
         shown truthfully is not shown, and a file that is not a sign request is listed as refused, never skipped.
-        A challenge whose request is no longer listed (gone, expired, answered or past the cap) is dropped."""
+        A challenge whose request this listing read and found no longer listable (gone, expired, answered) is
+        dropped; one past the cap or the directory scan was never read, so its challenge is kept."""
         if not self.namespaces:
             return {"rows": [], "overflow": 0}
         names: list[str] = []
@@ -578,25 +876,32 @@ class Signer:
                              "sha256": _stat_version(sign_dir(self.queue_dir) / f"{rid}.json"),
                              "refused": f"not a sign request: it cannot be read ({type(exc).__name__})"})
                 continue
-            if request.refused is not None:
-                rows.append({"id": rid, "namespace": request.namespace, "refused": request.refused,
-                             "sha256": request.sha256, "signers": []})
-                continue
-            row = {"id": rid, "title": request.title, "message": request.message, "namespace": request.namespace,
-                   "requester": request.requester, "expires_at": request.expires_at.isoformat(),
-                   "sha256": request.sha256, "signers": signers}
-            if request.options:     # the exact line each option's signature appends, so the page shows what is signed
-                row["options"] = [{"key": k, "text": t, "line": choice_line(k, t)} for k, t in request.options]
-                if request.recommended is not None:
-                    row["recommended"] = request.recommended      # marked on the page, never selected there
-                if request.write_in:   # the line a write-in's signature appends, the words in place of the empty end
-                    row["write_in"] = {"key": WRITE_IN_KEY, "line": choice_line(WRITE_IN_KEY, ""), "max": _TEXT_MAX}
-            rows.append(row)
+            rows.append(_row(rid, request, signers))
         listed = {r["id"] for r in rows if not r.get("refused")}
+        # a challenge is dropped only for a request this listing READ and did not list: one past the cap (or past the
+        # directory scan) was never looked at, so the listing says nothing about it
+        looked, scanned = set(names[:read]), set(names)
         with self._lock:
-            for rid in [rid for rid in self._challenged if rid not in listed]:
+            for rid in [rid for rid in self._challenged
+                        if rid not in listed and (rid in looked or (rid not in scanned and not more))]:
                 del self._challenged[rid]
         return {"rows": rows, "overflow": len(names) - read + (1 if more else 0)}
+
+    def row(self, request_id: str, signers: "list[str]") -> "dict[str, Any] | None":
+        """The one listing row for ``request_id`` (as :meth:`page` draws it, a refused request included), or None when
+        it is not an open, unexpired request in a namespace this port signs. Reads that one file, whatever the
+        listing's cap, so a page never decides "no longer open" from a listing that stopped short of it."""
+        if not self.namespaces or not request_id_ok(request_id):
+            return None
+        try:
+            if state_of(self.queue_dir, request_id) != "open":
+                return None
+            request = read_request(self.queue_dir, request_id)
+        except SignRefused:
+            return None
+        if not self._ours(request) or (request.expires_at is not None and request.expires_at <= _now()):
+            return None
+        return _row(request_id, request, signers)
 
     def challenge(self, request_id: str, req: Any) -> dict[str, Any]:
         """``{signer_fp, request_sha256}`` (and for a choice request ``choice``, the option's key, or
@@ -657,14 +962,15 @@ class Signer:
         if key is None:
             raise SignRefused(f"{bound[1]} is no longer an active passkey enrolled for {self.rp_id}")
         message = signed_bytes(request, bound[2], bound[3])
+        page_origin = self.page_origin
         try:
             signature = to_sshsig(key.public_key, b64url_decode(req["authenticator_data"], "authenticator_data"),
                                   b64url_decode(req["client_data_json"], "client_data_json"),
                                   b64url_decode(req["signature"], "signature"), namespace=request.namespace,
-                                  page_origin=self.page_origin)
+                                  page_origin=page_origin)
         except PasskeyError as exc:
             raise SignRefused(str(exc)) from None
-        problem = answer_signature_problem(signature, key.public_key, self.page_origin)
+        problem = answer_signature_problem(signature, key.public_key, page_origin)
         if problem is not None:
             raise SignRefused(problem)
         try:
@@ -674,8 +980,10 @@ class Signer:
             raise SignRefused(f"the signature could not be verified now: {exc}", 503) from None
         if not ok:
             raise SignRefused("the passkey's signature does not verify over this message")
-        with self._lock:
-            # what was verified is what is still there: the same challenge, the same bytes, open and unexpired now
+        with self._lock, _queue_lock(self.queue_dir):
+            # what was verified is what is still there: the same challenge, the same bytes, open and unexpired now,
+            # with every other Signer on the queue held off until both files are written (a .sig always belongs to
+            # the .signed.json beside it)
             if self._challenged.get(request_id) != bound:
                 raise SignRefused(f"sign request {request_id} was answered or re-challenged meanwhile: nothing was "
                                   "signed", 409)
@@ -703,7 +1011,9 @@ class Signer:
 
         if not isinstance(req, dict) or set(req) != {"request_sha256"} or not isinstance(req["request_sha256"], str):
             raise SignRefused("request keys must be ['request_sha256']", 400)
-        with self._lock:
+        if not self._ours(read_request(self.queue_dir, request_id)):
+            raise SignRefused("no such sign request", 404)
+        with self._lock, _queue_lock(self.queue_dir):      # what any Signer on the queue decided last is seen here
             request = read_request(self.queue_dir, request_id)
             if not self._ours(request):
                 raise SignRefused("no such sign request", 404)

@@ -505,6 +505,7 @@ class _PhoneServer(ThreadingHTTPServer):
         # serve a page on localhost under another port (on an https name the proxy's origin carries no port)
         self.page_origin = f"http://localhost:{self.server_address[1]}" if rp_id == "localhost" else None
         signer.page_origin = self.page_origin
+        signer.pin_page_origin(lambda _origin: None)     # this port's own page: no caller can move it afterwards
         self.signer = signer
         from levain.dispatch.phone import DispatchPhone
 
@@ -847,18 +848,11 @@ class _PhoneServer(ThreadingHTTPServer):
         return wait
 
     def _sign_root(self) -> Path:
-        """The ONE cockpit the queue's consent hooks name, whose passkeys sign a sign request or a dispatch job."""
-        from levain.consent.answering import hook_roots
-        from levain.consent.sign import SignRefused
+        """The ONE cockpit the queue's consent hooks name, whose passkeys sign a sign request or a dispatch job
+        (:func:`levain.consent.sign.sign_root`)."""
+        from levain.consent.sign import sign_root
 
-        roots = hook_roots(self.queue_dir)
-        if not roots:
-            raise SignRefused("no consent hook names a cockpit, so no passkey can sign here: this queue dir names no "
-                              "cockpit: write claude_code.json with cockpit_data_root", 503)
-        if len(roots) > 1:
-            raise SignRefused("the consent hooks name more than one cockpit, so which passkeys sign is not one "
-                              "answer: nothing is signed", 503)
-        return roots[0]
+        return sign_root(self.queue_dir)
 
     def _sign_authority(self) -> Any:
         """The authority source of :meth:`_sign_root`'s cockpit: what a dispatch signature is verified against."""
@@ -866,27 +860,20 @@ class _PhoneServer(ThreadingHTTPServer):
 
     def _sign_keys(self) -> "dict[str, Any]":
         """The active passkey keys enrolled on this name in the install's cockpit (the one the queue's consent hook
-        verifies against): what may sign a sign request. A laptop key never does."""
-        from levain.authority import AuthorityError
-        from levain.consent.answering import passkey_keys
-        from levain.consent.sign import SignRefused
+        verifies against): what may sign a sign request. A laptop key never does. The cockpit's own Signer reads the
+        same keys through the same function (:func:`levain.consent.sign.passkey_key_source`)."""
+        from levain.consent.sign import passkey_key_source
 
-        root = self._sign_root()
-        try:
-            return {k.fingerprint: k for k in passkey_keys(self._source(root)(), self.rp_id)}
-        except (AuthorityError, OSError, sqlite3.Error) as exc:
-            raise SignRefused(f"the cockpit's keys cannot be read now: {exc}", 503) from None
+        return passkey_key_source(self.queue_dir, self.rp_id, cache=self.replay_cache)()
 
     def sign_step(self, request_id: str, action: str, req: Any) -> dict[str, Any]:
         """``/sign/<id>/challenge``, ``answer`` and ``deny`` (:class:`levain.consent.sign.Signer`)."""
-        from levain.consent.sign import SignRefused
+        from levain.consent.sign import SignRefused, error_word
 
         try:
             return getattr(self.signer, action)(request_id, req)
         except SignRefused as exc:
-            word = {400: "bad_request", 404: "not_found", 409: "conflict", 503: "unavailable"}.get(exc.status,
-                                                                                                   "sign_refused")
-            raise PhoneError(exc.status, word, str(exc)) from None
+            raise PhoneError(exc.status, error_word(exc.status), str(exc)) from None
 
     def grant_step(self, grant_id: str, action: str, req: Any) -> dict[str, Any]:
         """``/grant/<id>/<action>`` (:meth:`levain.consent.grant_phone.GrantPhone.step`)."""
