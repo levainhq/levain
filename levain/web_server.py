@@ -117,6 +117,7 @@ from levain.cockpit.verbs import (SERVED_VERBS_NAME, VerbRegistry, VerbSpec, Ver
                                   record_served_verbs, retier)
 
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
+from levain.consent.grant_phone import grant_route
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
 from levain.http_guards import _WRITE_SEC_FETCH_ALLOWED as _SAME_ORIGIN, GuardedHandler
 from levain.http_guards import host_header_allowed  # the off-box read gate; importable here since before 2026-10-03
@@ -128,6 +129,7 @@ from levain.writes import (
 )
 
 if TYPE_CHECKING:
+    from levain.consent.grant_phone import GrantPhone
     from levain.consent.sign import Signer
 
 # The one write route of the shared cockpit (design §4.1). ``/edit`` and ``/action`` are its aliases:
@@ -195,6 +197,12 @@ _COMPOSE_WAIT_S = 30.0        # how long a second compose of one draft waits for
 # GET /cockpit/sign/<id>.json: ONE request's listing row, behind the listing's gate, so a page never reads "no longer
 # open" off a listing that stopped at its cap (Signer.row)
 _SIGN_ONE_SUFFIX = ".json"
+# PLAN M17 "9a": the grants' passkey revoke, the phone's own ceremony (levain.consent.grant_phone.GrantPhone, built by
+# make_server from the caller's Signer): GET /cockpit/grant/list.json lists each grant with the passkeys that may revoke
+# it, and POST /cockpit/grant/<id>/{revoke-challenge,revoke} runs it, behind the sign routes' gate exactly. Served only
+# beside a Signer: without one every path here is 404, and the page's revoke button copies the terminal line.
+_GRANT_LIST_PATH = "/cockpit/grant/list.json"
+_GRANT_PREFIX = "/cockpit/grant/"
 # one extra Host value (make_server extra_hosts): a DNS name or IPv4 literal and an optional trailing dot, never a port
 _EXTRA_HOST = re.compile(r"(?=[^:]{1,253}\Z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
                          r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?")
@@ -481,9 +489,11 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/edit",
     "/action",
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
+    _GRANT_LIST_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
-_RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX, _SIGN_PREFIX)
+_RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX, _SIGN_PREFIX,
+                                       _GRANT_PREFIX)
 
 
 def load_web_asset(filename: str) -> str:
@@ -806,6 +816,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     signer: "Signer | None" = None
     # that pinned page_origin (the Signer refuses any other once make_server pins it), for what the page is told
     signer_page_origin: "str | None" = None
+    # the grants' passkey revoke (PLAN M17 "9a"), built by make_server from that Signer once it is pinned; None serves no
+    # grant route
+    grant_phone: "GrantPhone | None" = None
     # the caller's compose_signer (DESIGN_SIGN D5): (verb, params) -> the id of the sign request it filed; None serves no
     # compose route
     compose_signer: "Callable[[str, dict[str, Any]], str] | None" = None
@@ -1087,19 +1100,7 @@ class _Handler(GuardedHandler):
             self._send(json.dumps({"error": "not_found", "message": "no such route"}).encode("utf-8"),
                        "application/json; charset=utf-8", status=404, head=head)
             return
-        if self.headers.get("Sec-Fetch-Site") not in (None, _SAME_ORIGIN):
-            self._send(json.dumps({"error": "forbidden", "message": "cross-origin read refused"}).encode("utf-8"),
-                       "application/json; charset=utf-8", status=403, head=head, headers=hdrs,
-                       cache_control="private, no-store")
-            return
-        if not self._off_box_token_valid():
-            self._send(json.dumps({"error": "forbidden", "message": (
-                f"the sign requests need this page's write token, sent as {_WRITE_TOKEN_HEADER}")}).encode("utf-8"),
-                "application/json; charset=utf-8", status=403, head=head, headers=hdrs,
-                cache_control="private, no-store")
-            return
-        if not self.server.request_gate.acquire(blocking=False):
-            self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+        if not self._sign_read_admitted(head=head, what="the sign requests"):
             return
         status: int
         try:
@@ -1126,6 +1127,61 @@ class _Handler(GuardedHandler):
             self.server.request_gate.release()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=hdrs, cache_control="private, no-store")
+
+    def _sign_read_admitted(self, *, head: bool, what: str) -> bool:
+        """The sign reads' gate past ``_route`` (the sign listing's and the grant listing's, one code path): same-origin
+        only (``Sec-Fetch-Site`` absent or ``same-origin``), a surface token on every bind, then the request gate,
+        which True leaves HELD for the caller to release. False: the refusal was sent."""
+        hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
+        if self.headers.get("Sec-Fetch-Site") not in (None, _SAME_ORIGIN):
+            self._send(json.dumps({"error": "forbidden", "message": "cross-origin read refused"}).encode("utf-8"),
+                       "application/json; charset=utf-8", status=403, head=head, headers=hdrs,
+                       cache_control="private, no-store")
+            return False
+        if not self._off_box_token_valid():
+            self._send(json.dumps({"error": "forbidden", "message": (
+                f"{what} need this page's write token, sent as {_WRITE_TOKEN_HEADER}")}).encode("utf-8"),
+                "application/json; charset=utf-8", status=403, head=head, headers=hdrs,
+                cache_control="private, no-store")
+            return False
+        if not self.server.request_gate.acquire(blocking=False):
+            self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+            return False
+        return True
+
+    def _serve_grant_list(self, *, head: bool) -> None:
+        """``GET /cockpit/grant/list.json``: :meth:`levain.consent.grant_phone.GrantPhone.listing` (each grant with
+        ``instance`` and ``signers``, the passkeys that may revoke it, and the notes) plus ``origin``, the page the
+        ceremony is pinned to, behind the sign listing's gate exactly. Without a Signer, 404."""
+        grants = self.server.grant_phone
+        hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
+        if grants is None:
+            self._send(json.dumps({"error": "not_found", "message": "no such route"}).encode("utf-8"),
+                       "application/json; charset=utf-8", status=404, head=head)
+            return
+        if not self._sign_read_admitted(head=head, what="the grants"):
+            return
+        try:
+            payload, status = {**grants.listing(), "origin": self.server.signer_page_origin}, 200
+        except Exception as exc:  # noqa: BLE001 - listing() says its own faults; anything else is an answer too
+            status, payload = 500, _store_fault("grant", exc)
+        finally:
+            self.server.request_gate.release()
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=hdrs, cache_control="private, no-store")
+
+    def _grant_post(self, grant_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
+        """``POST /cockpit/grant/<id>/<action>``: the GrantPhone's own reply, or its refusal as ``{error, message}``
+        with the refusal's status (the phone port's words)."""
+        from levain.consent.grant_phone import GrantRefused
+
+        grants = self.server.grant_phone
+        if grants is None:     # the route is not served without one; an explicit check survives `python -O`
+            return {"error": "not_found", "message": "no such route"}, 404
+        try:
+            return grants.step(grant_id, action, req), 200
+        except GrantRefused as exc:
+            return {"error": exc.error, "message": exc.message}, exc.status
 
     def _sign_post(self, request_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
         """``POST /cockpit/sign/<id>/<action>``: the Signer's own reply, or its refusal as ``{error, message}``
@@ -1449,6 +1505,9 @@ class _Handler(GuardedHandler):
         # below, so it is routed before it; without a signer it is 404 to everyone (the route's name is public).
         if path == _SIGN_LIST_PATH or _sign_one(path) is not None:
             self._serve_sign_list(head=head, one=_sign_one(path))
+            return
+        if path == _GRANT_LIST_PATH:      # the grants' revoke listing rides that gate exactly (PLAN M17 "9a")
+            self._serve_grant_list(head=head)
             return
 
         # OFF-BOX READ GATE (spore-220): the substrate-bearing reads must carry the SAME device-held
@@ -1788,7 +1847,9 @@ class _Handler(GuardedHandler):
         sign = _sign_route(route) if self.server.signer is not None else None
         # the compose route (DESIGN_SIGN D5) rides exactly that gate: it files a request the operator's passkey then signs
         compose = route == _SIGN_COMPOSE and self.server.compose_signer is not None
-        if (sign is not None or compose) and not self._off_box_token_valid():
+        # and the grants' passkey revoke (PLAN M17 "9a"): the same ceremony class, the same gate
+        grant = grant_route(route, _GRANT_PREFIX) if self.server.grant_phone is not None else None
+        if (sign is not None or compose or grant is not None) and not self._off_box_token_valid():
             return self._reject(403, "credential_required", "missing or invalid write token")
         if self._write_token_required() and not self._off_box_token_valid():
             return self._reject(403, "forbidden", "missing or invalid write token")
@@ -1802,7 +1863,7 @@ class _Handler(GuardedHandler):
         # write_scope, and action verbs REQUIRE a write_scope (make_server enforces it), so
         # it already covers /action with no change here.
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
-        if not _is_write_route(route) and not is_chat and sign is None and not compose:
+        if not _is_write_route(route) and not is_chat and sign is None and not compose and grant is None:
             return self._reject(404, "not_found", "no such route")
         if is_chat and not self._chat_token_valid():   # before a byte of the body is read
             return self._reject(403, "chat_token", (
@@ -1855,6 +1916,14 @@ class _Handler(GuardedHandler):
                 # the Signer's own ceremony, not the substrate's write scope: no read-only refusal applies to it
                 try:
                     payload, status = self._sign_post(sign[0], sign[1], req)
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
+                return
+            if grant is not None:
+                # the phone's grant ceremony (the passkey's signature is the authority): no read-only refusal applies
+                try:
+                    payload, status = self._grant_post(grant[0], grant[1], req)
                 except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
                     payload, status = {"error": "internal", "message": type(exc).__name__}, 500
                 self._send_json(payload, status)
@@ -2386,6 +2455,14 @@ def make_server(
             signer.pin_page_origin(problem)
             pinned = True
             httpd.signer_page_origin = signer.page_origin
+            from levain.consent.grant_phone import GrantPhone
+            from levain.consent.sign import sign_root
+
+            # the grants' passkey revoke over the Signer's own values: its queue (whose consent hook names the ONE
+            # cockpit whose log takes the revoke, as on the phone port), rpId, the page origin just pinned, its keys
+            sign_queue = signer.queue_dir
+            httpd.grant_phone = GrantPhone(sign_queue, signer.rp_id, signer.page_origin, signer.keys,
+                                           lambda: sign_root(sign_queue))
         if cockpit is not None:
             # one transaction: an attach that raises (a panel registered since check_verbs; a decisions panel the
             # registry refuses) undoes this server's attaches and keeps any other registration

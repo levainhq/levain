@@ -104,7 +104,6 @@ _DISPATCH_ROUTE = re.compile(
     r"/dispatch/(dj-[0-9a-f]{32})/(challenge|answer|cancel-challenge|cancel|authorise-challenge|authorise)")
 _COORD_ROUTE = re.compile(r"/coord/(drop|envelope-review|envelope-challenge)")
 _GRANT_PREFIX = "/grant/"
-_GRANT_ACTIONS = ("revoke-challenge", "revoke")
 _MAX_BODY = 16 * 1024          # an assertion is well under 2 KB, an answer record under 1 KB
 _MAX_INFLIGHT = 4              # each answer replays the authority log; past this a caller gets 503, never a queue
 # a cockpit write (a verb, a signature, a cancel) runs one at a time on its own gate, never a read slot: a signature's
@@ -150,18 +149,11 @@ def _sign_route(route: str) -> "tuple[str, str] | None":
 
 
 def _grant_route(route: str) -> "tuple[str, str] | None":
-    """``(grant_id, action)`` for ``/grant/<id>/<action>``, else None. A grant's id is its creator's choice, so the
-    page sends encodeURIComponent(id); the decoded id is looked up in the log, never trusted further. Its length is
-    the log's to bound, not the route's: any id a grant was made with can be revoked here."""
-    if not route.startswith(_GRANT_PREFIX):
-        return None
-    from urllib.parse import unquote
+    """``(grant_id, action)`` for ``/grant/<id>/<action>``, else None (:func:`levain.consent.grant_phone.grant_route`,
+    the cockpit's parse too)."""
+    from levain.consent.grant_phone import grant_route
 
-    quoted, sep, action = route[len(_GRANT_PREFIX):].partition("/")
-    gid = unquote(quoted)
-    if not sep or not gid or action not in _GRANT_ACTIONS:
-        return None
-    return gid, action
+    return grant_route(route, _GRANT_PREFIX)
 
 
 # the phone app's own routes (levain.phone_app), each with the one method it answers

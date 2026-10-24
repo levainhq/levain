@@ -6,6 +6,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **The cockpit's grant "revoke" button signs with your passkey.** On a cockpit served with a `signer=`, the button
+  runs the phone page's own revoke ceremony: one passkey prompt, and the grant is revoked in the authority log. The
+  server builds the link and the page checks the challenge is over that link before the prompt. The new routes,
+  `GET /cockpit/grant/list.json` and `POST /cockpit/grant/<id>/revoke-challenge` and `.../revoke`, ride the sign
+  routes' gate. Everywhere else the button still copies `levain consent grant revoke`, and the copy line stays under
+  the signing button.
+
 ### Changed
 - **A compose card pre-selects only the readers its provider declares.** A provider that relied on 0.11.21's built-in
   default reader, seat tap or departed-seat recovery must declare the keys below. Without them, the card starts with
@@ -27,6 +35,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   refused at registration. The graph tap needs only `transient_prefix`.
 
 ### Known edges
+- The authority log takes a passkey's revoke only from the passkey's own https name with no port. A cockpit served
+  on a port, such as `https://<name>:8443`, lists no passkey that can revoke there, says why, and keeps the copy
+  button.
 - A metered call is priced by the request's `model` alone. A fallback list (`models`) or a `route` in the body is not
   read, and neither is the model the provider's response says ran. No route in this release reaches a vendor that
   honours them; the vendor routes that do will refuse both and settle from the model that ran.

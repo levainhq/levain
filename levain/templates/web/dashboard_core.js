@@ -5546,7 +5546,7 @@
     .filter((c) => c && c.outcome === "refused").length;
   const grantRefused = (g) => Math.max(g && g.answered && Number.isInteger(g.answered.refused_count) ? g.answered.refused_count : 0,
                                        grantRefusedShown(g));
-  function grantCard(g, inertNote) {
+  function grantCard(g, inertNote, signList) {
     const sv = (x) => (typeof x === "string" ? x : "");
     const state = sv(g.state);
     const refused = grantRefused(g);
@@ -5585,35 +5585,151 @@
                                                    + (older > 0 ? " · " + older + " refused call" + (older === 1 ? "" : "s") + " older than these" : "")));
       row.appendChild(box);
     }
+    // the passkey can revoke here when the grants' sign listing names this grant (its instance) and a passkey for it,
+    // and this page is the one the ceremony is pinned to; anywhere else the button copies the line, as it always did
+    const signed = signList && Array.isArray(signList.grants) && !signElsewhere(signList)
+      ? signList.grants.find((x) => x && x.id === g.id && typeof x.instance === "string"
+                                  && Array.isArray(x.signers) && x.signers.length) : null;
+    if (signed) {
+      const line = el("div", "consent-cmd grant-sign");
+      const btn = el("button", "undo-btn grant-revoke", "revoke");
+      btn.type = "button";
+      btn.title = "revoke with your passkey";
+      const note = el("span", "sign-note ext-meta");
+      const say = (text, kind) => { note.textContent = text; note.className = "sign-note ext-meta" + (kind ? " sign-" + kind : ""); };
+      btn.addEventListener("click", () => grantRevoke(g, signed, signList, btn, line, say));
+      line.append(btn, note);
+      row.appendChild(line);
+    }
     const cmd = sv(g.revoke);
     if (cmd) {
       const line = el("div", "consent-cmd");
       const code = el("code", "consent-code", cmd);
-      const btn = el("button", "undo-btn consent-copy", "revoke");
+      const btn = el("button", "undo-btn consent-copy", signed ? "copy" : "revoke");
       btn.type = "button";
       btn.dataset.label = btn.textContent;
-      btn.title = "copy the revoke command; run it in a terminal with your signing key. This page signs nothing";
+      btn.title = signed ? "copy the revoke command; run it in a terminal with your signing key"
+        : "copy the revoke command; run it in a terminal with your signing key. This page signs nothing";
       btn.addEventListener("click", () => copyText(cmd, code, btn));
       line.append(code, btn);
       row.appendChild(line);
     }
     return row;
   }
+  // PLAN M17 "9a": on the https cockpit the revoke button signs with the passkey, the phone's own ceremony
+  // (levain.consent.grant_phone.GrantPhone): /cockpit/grant/list.json names each grant's instance and the passkeys that
+  // may revoke it (a 404 is a cockpit with no signing, and the button copies), then /cockpit/grant/<id>/revoke-challenge
+  // -> navigator.credentials.get -> /revoke. The server builds and holds the link; the page recomputes the challenge from
+  // the line and head it is sent and puts only that to the passkey, so what the prompt signs is the link shown
+  const GRANT_SIGN_LIST = "/cockpit/grant/list.json";
+  let grantSaid = "";          // what the last revoke said, kept across the slot's redraw (a revoked grant leaves it)
+  function grantSignList() {
+    const headers = signHeaders(false);
+    if (!SIGN_USABLE || !headers["X-Levain-Write-Token"]) return Promise.resolve(null);
+    return fetchBounded(GRANT_SIGN_LIST, { cache: "no-store", headers: headers },
+      (res) => (res.ok ? res.json().then((b) => (b && Array.isArray(b.grants) ? b : null), () => null) : null),
+      () => null);
+  }
+  // the bytes a passkey signs for the authority link `line` chained to `prevHash`, as levain.consent.passkey.challenge
+  // builds them (the phone page's linkChallenge): "SSHSIG", then namespace, reserved, hash name and the SHA-512 of
+  // prevHash + "\n" + line, each but the first as an SSH string
+  function grantLinkChallenge(prevHash, line) {
+    const enc = (t) => new TextEncoder().encode(t);
+    const str = (b) => { const n = b.length, out = new Uint8Array(4 + n); out.set([n >>> 24 & 255, n >>> 16 & 255, n >>> 8 & 255, n & 255]); out.set(b, 4); return out; };
+    return crypto.subtle.digest("SHA-512", enc(prevHash + "\n" + line)).then((h) => {
+      const parts = [enc("SSHSIG"), str(enc("levain-authority")), str(new Uint8Array(0)), str(enc("sha512")), str(new Uint8Array(h))];
+      const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+      parts.reduce((at, p) => { out.set(p, at); return at + p.length; }, 0);
+      return out;
+    });
+  }
+  // One revoke: which passkey (signWho), the challenge, the passkey prompt (the gesture), the revoke, then the grants
+  // read again. As the phone says it: only the server's own 4xx after the assertion was sent is "not revoked"
+  function grantRevoke(g, signed, listing, btn, host, say) {
+    if (signBusy) { say(SIGN_BUSY.replace("signed", "revoked"), "bad"); return; }
+    signBusy++;
+    btn.disabled = true;
+    const base = "/cockpit/grant/" + encodeURIComponent(g.id) + "/";
+    let sent = false, revoked = false;
+    signWho({ signers: signed.signers, origin: listing.origin }, host, say).then((who) => {
+      if (!who) { say("nothing was revoked"); return; }
+      say("asking for the revoke to sign…");
+      return signCall(base + "revoke-challenge", { signer_fp: who.fp, instance: signed.instance }).then((c) => {
+        if (!c.ok) { say("not revoked: " + signWhy(c), "bad"); return; }
+        let link = null;
+        try { link = JSON.parse(c.body.line); } catch (e) { link = null; }
+        // the server builds the link itself; one that does not name this grant is not put to the passkey
+        if (!link || link.op !== "revoke_grant" || link.grant_id !== g.id || typeof c.body.challenge !== "string"
+            || typeof c.body.prev_hash !== "string") {
+          say("not revoked: the link the server sent does not name this grant, so nothing was signed", "bad");
+          return;
+        }
+        return grantLinkChallenge(c.body.prev_hash, c.body.line).then((want) => {
+          if (signB64u(want) !== c.body.challenge) {
+            say("not revoked: the challenge the server sent is not over the link it shows, so nothing was signed", "bad");
+            return;
+          }
+          say("confirm with your passkey to revoke… " + c.body.line);
+          const pk = { challenge: want, rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+          if (who.rawId) pk.allowCredentials = [{ type: "public-key", id: signUnb64u(who.rawId) }];
+          return navigator.credentials.get({ publicKey: pk }).then((cred) => {
+            if (!cred || !cred.response) { say("not revoked: the passkey gave nothing to send; nothing was revoked", "bad"); return; }
+            say("verifying the signature…");
+            sent = true;
+            return signCall(base + "revoke", {
+              authenticator_data: signB64u(cred.response.authenticatorData), client_data_json: signB64u(cred.response.clientDataJSON),
+              signature: signB64u(cred.response.signature) }).then((r) => {
+              if (!r.ok && (r.status === 0 || r.status >= 500)) {
+                say("result unknown (" + signWhy(r) + "): the grants are read again to show whether it is still there", "bad");
+                return;
+              }
+              if (!r.ok) { say("not revoked: " + signWhy(r), "bad"); return; }
+              if (!who.rawId && cred.rawId && typeof c.body.rp_id === "string") signRemember(c.body.rp_id, who.fp, signB64u(cred.rawId));
+              revoked = true;
+              grantSaid = "revoked " + ((typeof g.id_shown === "string" && g.id_shown) || g.id) + " · link seq " + r.body.seq + (r.body.warning ? " · " + r.body.warning : "");
+              say(grantSaid, "ok");
+            });
+          }, (e) => say(signDeclined(e, "nothing was revoked"), "bad"));
+        });
+      });
+    }).catch((e) => {
+      const name = (e && e.name) || "error";
+      say(sent ? "result unknown (the page failed: " + name + "): the grants are read again to show where it stands"
+               : "the page failed (" + name + "); nothing was revoked", "bad");
+    }).finally(() => {
+      signBusy--;
+      btn.disabled = false;
+      if (!sent && !revoked) return;
+      // the grants again: a revoked grant leaves the slot, and the slot keeps what the revoke said
+      grantRead = null;
+      const slot = host.closest(".grant-slot");
+      if (slot) setTimeout(() => grantFill(slot), 1500);
+    });
+  }
   function grantSlot() {
     const slot = el("div", "grant-slot");
-    grantFetch().then((b) => {
+    grantFill(slot);
+    return slot;
+  }
+  function grantFill(slot) {
+    Promise.all([grantFetch(), grantSignList()]).then(([b, signList]) => {
       if (!b) return;
       // sort is stable: the server's order holds among grants with and among grants without a refused call
       const rows = b.grants.slice().sort((x, y) => (grantRefused(y) ? 1 : 0) - (grantRefused(x) ? 1 : 0));
       const note = typeof b.note === "string" ? b.note : "";
       // a page whose consent hook names no cockpit (root "") and that holds no grant gets no slot, as with no proposals;
       // a named cockpit that cannot be read is said
-      if (!rows.length && (!note || !b.root)) return;
+      // a revoke said here is kept (its grant has left the slot); the last grant revoked leaves the head and that line
+      const said = grantSaid ? [el("div", "consent-note ext-meta grant-said", grantSaid)] : [];
+      if (!rows.length && (!note || !b.root)) {
+        slot.replaceChildren(...(said.length ? [el("div", "ext-grouphead", "standing grants"), ...said] : []));
+        return;
+      }
       const head = el("div", "ext-grouphead", "standing grants");
       const inert = typeof b.inert_note === "string" ? b.inert_note : "";
-      slot.replaceChildren(head, ...(note ? [el("div", "consent-note ext-meta", note)] : []), ...rows.map((g) => grantCard(g, inert)));
+      slot.replaceChildren(head, ...said, ...(note ? [el("div", "consent-note ext-meta", note)] : []),
+                           ...rows.map((g) => grantCard(g, inert, signList)));
     }).catch(() => {});
-    return slot;
   }
   // the Decisions history's two standing-rule slots, drawn together wherever the proposals are
   function standingSlots() {
