@@ -26,7 +26,10 @@ admin wire (:class:`KeysAdmin`, §4.9: ``FRONT-REGISTER`` fenced by the per-``fr
 connection and the verbs it carries (``FRONT-LOST``, ``SPEND-OVERRUN``, ``SESSIONS``: §4.5, 3c design r3 §2.1 (e),
 R4 §1.4), whose EOF revokes every egress-class session, and :func:`serve`, the program's one entry; S1 3c-4 the
 ``_levain_dispatch`` peer's ``ROUTE-SUBMIT`` (§4.3, 3c design r3 §2.3 as R4 §2 amends it: :mod:`levain.slot.routemaps`),
-its start pass and the RELOADs to keys, each under the one activation lock. Root's ``SLOT-SYNC``, keys'
+its start pass and the RELOADs to keys, each under the one activation lock; S1 3c-5 its ``RUN-TICKET-MINT`` /
+``-CANCEL`` / ``-STATUS`` over the ticket journal (:mod:`levain.slot.tickets`), and the binding of a ticket: its
+``LEASE-OPEN {ticket}``, the ``ATTACH`` of a ticket-bound lease (``ticket_facts``), ``MINT``'s claims against the
+ticket and ``TOKEN-RESOLVE``'s ``run``, read from the ticket record and never from root's claims. Root's ``SLOT-SYNC``, keys'
 ``LINEAGE-APPEND`` and the other dispatch verbs (§3.3, §3.5, §3.6) are later 3c sessions': until then
 every other peer, and every other verb of a known one, is refused ``verb-not-allowed-for-peer`` (see
 :data:`PEER_VERBS`). Every act on keys and the reaper wake are seams: :class:`KeysAdmin` supplies the keys ones when
@@ -58,6 +61,7 @@ from levain.contracts import ContractError, canon
 from levain.slot import Refused
 from levain.slot import records as R
 from levain.slot import routemaps
+from levain.slot import tickets as T
 from levain.slot.layout import STORE, session_repo
 from levain.slot.runtime_grammar import HANDLE_BYTES, _handle, _keys
 
@@ -68,7 +72,7 @@ _LEN = struct.Struct(">I")
 ROOT_UID = 0
 
 #: §3.3's verbs per peer, as built so far. Later 3c sessions add root's ``SLOT-SYNC``, keys' ``LINEAGE-APPEND`` and
-#: the rest of the ``_levain_dispatch`` row (3c-4 builds its ``ROUTE-SUBMIT``; the peer is ``dispatch`` when
+#: the rest of the ``_levain_dispatch`` row (3c-4 builds its ``ROUTE-SUBMIT``, 3c-5 the three ticket verbs and ``LEASE-OPEN {ticket}``; the peer is ``dispatch`` when
 #: :meth:`Control.peer_kind` is given its uid, else ``foreign``). keys' ``FRONT-LOST`` / ``SPEND-OVERRUN`` / ``SESSIONS`` are answered only on the connection that
 #: holds the current ``KEYS-ATTACH`` (else ``not-attached``).
 PEER_VERBS: Mapping[str, frozenset[str]] = {
@@ -76,13 +80,13 @@ PEER_VERBS: Mapping[str, frozenset[str]] = {
     "root": frozenset({"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET"}),
     "qbroker": frozenset({"QUEUE-RESOLVE"}),
     "keys": frozenset({"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS"}),
-    "dispatch": frozenset({"ROUTE-SUBMIT"}),
+    "dispatch": frozenset({"LEASE-OPEN", "ROUTE-SUBMIT", "RUN-TICKET-MINT", "RUN-TICKET-CANCEL", "RUN-TICKET-STATUS"}),
     "foreign": frozenset(),
 }
 
 #: Each verb's request keys beside ``v``, ``op``, ``id``: (allowed, required).
 _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
-    "LEASE-OPEN": (frozenset(), frozenset()),
+    "LEASE-OPEN": (frozenset({"ticket"}), frozenset()),       # a ticket from dispatch only (§3.1 step 1)
     "STATUS": (frozenset({"session"}), frozenset()),
     "ATTACH": (frozenset({"lease_nonce", "sudo_uid", "session", "claims"}),) * 2,
     "CAS": (frozenset({"session", "generation", "from", "to", "fields"}),) * 2,
@@ -98,7 +102,15 @@ _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "SPEND-OVERRUN": (frozenset({"session", "route", "model", "ref", "overrun", "unproven"}),) * 2,
     "SESSIONS": (frozenset({"digests"}),) * 2,
     "ROUTE-SUBMIT": (frozenset({"map", "sig"}),) * 2,
+    # the per-kind required fields are the §3.5 table's (tickets.check_facts), refused by field name
+    "RUN-TICKET-MINT": (frozenset({"attempt_id"}) | T.MINT_FIELDS, frozenset({"attempt_id"})),
+    "RUN-TICKET-CANCEL": (frozenset({"ticket"}),) * 2,
+    "RUN-TICKET-STATUS": (frozenset({"attempt_id"}),) * 2,
 }
+
+#: DECISION: how long a mint waits for keys to serve CONTROL's route-map head on the current attachment (an
+#: attach-time or activation RELOAD in flight) before it answers ``keys-unavailable``, which dispatch retries.
+MINT_KEYS_WAIT_S = 2.0
 
 #: KEYS-ATTACH's ``item_sha256``: the hex SHA-256 of the route-map item keys loaded (3c design R4 §2).
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
@@ -116,6 +128,9 @@ SESSIONS_DIGESTS_MAX = 512
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 #: The run fields ``QUEUE-RESOLVE`` copies from the session's bound ticket (§3.3); ``repo_root`` is added by CONTROL.
 QUEUE_RUN_KEYS = frozenset({"run_id", "job_id", "run_index", "contract_digest", "model_requested"})
+#: ``TOKEN-RESOLVE``'s ``run`` (§3.3) beside ``run_id``: the bound ticket's own facts, never root's claims.
+RESOLVE_RUN_FACTS = ("job_id", "run_index", "contract_digest", "route", "routemap_generation", "route_policy_digest",
+                     "model_requested", "reserved_microdollars")
 
 #: DECISION: the backoff of the lease-EOF revoke's lock retry (§3.1 step 3 fixes only "with backoff
 #: until it is taken, never dropped").
@@ -390,6 +405,8 @@ class Lease:
     live: bool = True
     used: bool = False
     session: str | None = None
+    #: a dispatch lease's run ticket (§3.1 step 1); the operator's leases carry none
+    ticket: str | None = None
 
 
 @dataclass(eq=False)
@@ -734,19 +751,20 @@ class Control:
     timestamps only) · ``monotonic() -> seconds`` (every deadline and interval: a wall-clock step never moves one) ·
     ``sleep(seconds)`` (the EOF retry's backoff) · ``qbroker_uid`` (the ``_levain_qbroker`` peer; ``None``: no
     peer is the broker) · ``run_facts(session) -> {run_id, job_id, run_index, contract_digest, model_requested} |
-    None`` (the run a dispatch session's bound ticket names; session 3c's ticket records supply it, and the default
-    knows none, so a dispatch session's ``QUEUE-RESOLVE`` is refused ``run-unknown``) · ``host`` (whose store
+    None`` (the run a dispatch session's bound ticket names; the default, ``None``, reads it from ``tickets``, and with
+    no ticket store a dispatch session's ``QUEUE-RESOLVE`` is refused ``run-unknown``) · ``host`` (whose store
     ``repo_root`` names) · ``routemap_head() -> {generation, item_sha256} | None`` (CONTROL's active dispatch route-map
     head, R4 §2; ``routes`` supplies it when given, else the default ``None`` sends no attach-time ``RELOAD``) ·
     ``routes`` (a :class:`levain.slot.routemaps.ControlRoutes`: ``ROUTE-SUBMIT``, the start pass, and THE activation
     lock every RELOAD to keys is sent under; ``None``: ``ROUTE-SUBMIT`` refused ``routemap-verifier``) · ``dispatch_uid``
-    (the ``_levain_dispatch`` peer; ``None``: no peer is dispatch)."""
+    (the ``_levain_dispatch`` peer; ``None``: no peer is dispatch) · ``tickets`` (a :class:`levain.slot.tickets.TicketStore`:
+    the run-ticket journal, compacted by :meth:`start`; ``None``: every ticket verb refused ``journal-unavailable``)."""
 
     def __init__(self, store: StateStore, operator_uid: int, *,
                  qbroker_uid: int | None = None,
                  keys_uid: int | None = None,
                  keys_admin: KeysAdmin | None = None,
-                 run_facts: Callable[[str], Mapping[str, object] | None] = lambda s: None,
+                 run_facts: Callable[[str], Mapping[str, object] | None] | None = None,
                  host: str = "darwin" if sys.platform == "darwin" else "linux",
                  drop_session: Callable[[str], object] = _nothing,
                  wake_reaper: Callable[[], object] = _nothing,
@@ -759,7 +777,8 @@ class Control:
                  sleep: Callable[[float], None] = time.sleep,
                  routemap_head: Callable[[], Mapping[str, object] | None] | None = None,
                  routes: routemaps.ControlRoutes | None = None,
-                 dispatch_uid: int | None = None) -> None:
+                 dispatch_uid: int | None = None,
+                 tickets: T.TicketStore | None = None) -> None:
         if type(operator_uid) is not int or operator_uid <= ROOT_UID:
             raise Refused("bad-config", f"operator uid {operator_uid!r}")
         if qbroker_uid is not None and (type(qbroker_uid) is not int or qbroker_uid <= ROOT_UID
@@ -781,7 +800,7 @@ class Control:
         self.store = store
         self.qbroker_uid = qbroker_uid
         self.keys_uid = keys_uid
-        self._run_facts = run_facts
+        self._run_facts = run_facts if run_facts is not None else self._ticket_run_facts
         self._host = host
         self.operator_uid = operator_uid
         self._drop_session = drop_session
@@ -826,6 +845,9 @@ class Control:
         self._attach: Conn | None = None
         self._attach_no = 0
         self._keys_serves: dict[str, object] | None = None
+        #: notified whenever ``_keys_serves`` changes: a mint waits on it for keys to serve CONTROL's head (R4 §2)
+        self._serves_cv = threading.Condition(self._mu)
+        self.tickets = tickets
         #: (session, ref) -> the SPEND-OVERRUN record, oldest first (R4 §1.4, §4: the card's data; never a revoke).
         self._overruns: collections.OrderedDict[tuple[str, tuple], dict[str, object]] = collections.OrderedDict()
         #: the sessions keys reported FRONT-LOST for, oldest first, bounded (doctor / tests).
@@ -860,10 +882,38 @@ class Control:
         then its drop and the wake like every other record past live.
 
         The route maps' start pass runs first (:meth:`levain.slot.routemaps.ControlRoutes.start_pass`: an interrupted
-        activation finished, under the activation lock); keys is sent the head by the attach-time ``RELOAD``."""
+        activation finished, under the activation lock); keys is sent the head by the attach-time ``RELOAD``.
+
+        Before all of it, the ticket journal's single-CONTROL lock (3c-5 fix 2, L3 r1 codex 1:
+        :meth:`levain.slot.tickets.TicketStore.acquire`): a second CONTROL refuses ``control-running`` (noted in
+        :attr:`seam_errors`) before it finishes an activation, revokes a record, compacts the journal or, in
+        :class:`ControlServer`, unlinks the first one's socket. A start that fails after taking it (a route recovery,
+        the record load, a journal refused `journal-inconsistent`, the revoke pass) releases it before the failure
+        is raised (3c-5 fix 3, L3 r2): a CONTROL that did not start holds nothing, so a replacement in the same process
+        is never refused ``control-running``."""
+        if self.tickets is not None:
+            try:
+                self.tickets.acquire()
+            except Refused as e:
+                self.seam_errors.append(("start", "", e))
+                raise
+        try:
+            self._start_pass()
+        except BaseException:
+            if self.tickets is not None:
+                self.tickets.close()
+            raise
+
+    def _start_pass(self) -> None:
+        """:meth:`start` after the journal lock: the route maps' start pass, the records, the ticket journal, the
+        revoke pass."""
         if self.routes is not None:
             self.routes.start_pass()
-        self.store.load()
+        loaded = self.store.load()
+        if self.tickets is not None:
+            # the compaction runs before any append is admitted (CONTRACT §3.5); the records are loaded first so a
+            # binding whose session record was never written is undone (head ruling H8)
+            self.tickets.start(has_session=lambda s: s in loaded)
         past = False
         for rec in sorted(self.store.all(), key=lambda r: r.session):
             if rec.state in R.LIVE_STATES:
@@ -883,6 +933,8 @@ class Control:
         self._stopping.set()
         if self.keys_admin is not None:
             self.keys_admin.close()
+        if self.tickets is not None:
+            self.tickets.close()
 
     # -- the write primitive -------------------------------------------------------------------------------
 
@@ -1217,22 +1269,41 @@ class Control:
     # -- operator verbs ------------------------------------------------------------------------------------
 
     def _op_lease_open(self, conn: Conn, args: dict) -> dict[str, object]:
-        """§3.1 step 1 (interactive): the connection becomes the lease. A second ``LEASE-OPEN`` on a
-        connection whose lease is live is refused (DECISION: ``lease-exists``)."""
+        """§3.1 step 1: the connection becomes the lease. A second ``LEASE-OPEN`` on a connection whose lease is live
+        is refused (DECISION: ``lease-exists``). The operator's lease carries no ticket (``ticket-not-allowed``);
+        dispatch's carries a live UNBOUND ticket (``ticket-required`` without one; the store's ``ticket-unknown`` /
+        ``ticket-bound`` / ``attempt-closed``), held by no other live lease (``ticket-bound``: one ticket, one lease).
+        The hold is this lease's, in memory; the ``ATTACH`` that binds the ticket is what the journal records, so a
+        lease that dies before its ``ATTACH`` leaves the ticket unbound (§3.5 Pool, OPEN)."""
+        ticket = args.get("ticket")
+        if self.peer_kind(conn.peer_uid) == "dispatch":
+            if ticket is None:
+                raise Refused("ticket-required")
+            ticket = _handle(ticket, "ticket")
+            self._ticket_store().holdable(ticket)
+        elif ticket is not None:
+            raise Refused("ticket-not-allowed")
         with self._mu:
             if conn.lease is not None and conn.lease.live:
                 raise Refused("lease-exists")
-            lease = Lease(new_handle(), conn.peer_uid)
+            if ticket is not None and any(x.live and x.ticket == ticket for x in self._leases.values()):
+                raise Refused("ticket-bound")
+            lease = Lease(new_handle(), conn.peer_uid, ticket=ticket)
             self._leases[lease.nonce] = lease
             conn.lease = lease
         return {"lease_nonce": lease.nonce}
 
     def _op_status(self, conn: Conn, args: dict) -> dict[str, object]:
         """§3.3: the records whose ``claims.operator_uid`` is the peer. DECISION: the answer is an object,
-        so the list rides ``records``."""
+        so the list rides ``records``. Head ruling H8 (1024+8): a record's ``claims.ticket`` is left out (the ticket is
+        a bearer handle that reaches no record a non-root reader opens, H1)."""
         want = R.check_session(args["session"]) if "session" in args else None
-        recs = [R.state_record(r) for r in sorted(self.store.all(), key=lambda r: r.session)
-                if r.claims.get("operator_uid") == conn.peer_uid and (want is None or r.session == want)]
+        recs = []
+        for r in sorted(self.store.all(), key=lambda r: r.session):
+            if r.claims.get("operator_uid") == conn.peer_uid and (want is None or r.session == want):
+                rec = R.state_record(r)
+                rec["claims"] = {k: v for k, v in rec["claims"].items() if k != "ticket"}
+                recs.append(rec)
         return {"records": recs}
 
     # -- root verbs ----------------------------------------------------------------------------------------
@@ -1251,35 +1322,72 @@ class Control:
             if not lease.live:
                 raise Refused("lease-dead")
             if lease.used:
-                raise Refused("nonce-used")
+                # fix 2 (codex 4 + complement 1): the retry of an ATTACH whose record landed (whole, or NotDurable)
+                # answers what the record says, `session-exists`, never a ticket refusal
+                raise Refused("session-exists" if lease.session == session else "nonce-used")
             if lease.peer_uid != sudo_uid:
                 raise Refused("nonce-uid-mismatch")
             # §3.3: the claims CONTROL can check against its own records. An operator lease carries no
-            # ticket (§3.1) and prepares only the operator kinds (runtime_grammar.KINDS_FOR_CALLER).
-            if (claims["supervisor_uid"] != lease.peer_uid or claims["operator_uid"] != self.operator_uid
-                    or "ticket" in claims or claims["kind"] not in ("interactive", "login")):
+            # ticket (§3.1) and prepares only the operator kinds (runtime_grammar.KINDS_FOR_CALLER); a dispatch
+            # lease's claims name ITS ticket, and the kind and class that ticket renders as (§3.5).
+            if claims["supervisor_uid"] != lease.peer_uid or claims["operator_uid"] != self.operator_uid:
+                raise Refused("claims-mismatch")
+            if lease.ticket is None:
+                if "ticket" in claims or claims["kind"] not in ("interactive", "login"):
+                    raise Refused("claims-mismatch")
+            elif claims.get("ticket") != lease.ticket:
                 raise Refused("claims-mismatch")
             lease.used = True
+        facts: dict[str, object] | None = None
+        landed: R.NotDurable | None = None
         try:
+            if lease.ticket is not None:
+                held = self._ticket_store().holdable(lease.ticket)
+                if (claims["kind"], claims["class"]) != T.RENDERS_AS[str(held.facts["kind"])]:
+                    raise Refused("claims-mismatch")
             with self.store.lock(session):
                 if self.store.get(session) is not None:
                     raise Refused("session-exists")
-                rec = R.SessionState(session=session, generation=0, state=R.ALLOCATED, claims=claims,
-                                     lease_live=True, event_kind="state",
-                                     updated_at=R.timestamp(self._clock()))
-                self.store.put(rec)
+                if lease.ticket is not None:
+                    # journaled before the record exists: a crash between the two leaves the ticket bound and no
+                    # session, which runs nothing; CONTROL's next start unbinds it (head ruling H8)
+                    facts = dict(self._ticket_store().bind(lease.ticket, session).facts)
+                try:
+                    rec = R.SessionState(session=session, generation=0, state=R.ALLOCATED, claims=claims,
+                                         lease_live=True, event_kind="state",
+                                         updated_at=R.timestamp(self._clock()))
+                    self.store.put(rec)
+                except R.NotDurable as e:
+                    # the record was renamed into place: it exists and the bind stands, so the ATTACH is SETTLED
+                    # below as one that landed (fix 2, codex 4 + complement 1), then its failure is answered
+                    landed = e
+                except BaseException:
+                    # 3c-5 fix 1 (L2 4a): no record was written, so the binding is undone and journaled; if that
+                    # append fails the store is poisoned and the restart's H8 pass unbinds it instead
+                    if facts is not None:
+                        try:
+                            self._ticket_store().unbind(str(lease.ticket), session)
+                        except Refused:
+                            pass
+                    raise
         except BaseException:
             with self._mu:
                 lease.used = False
                 if not lease.live and self._leases.get(nonce) is lease:
                     self._retire(lease)                  # its EOF came while ATTACH held it: nothing binds it now
             raise
+        # published for a record that landed, NotDurable included: the lease controls it (its EOF revokes it, a CAS
+        # reads the lease live) and `used` stays set, so a retry answers `session-exists`
         with self._mu:
             lease.session = session
             self._session_lease[session] = lease
             died = not lease.live
         if died:   # the lease read EOF between the nonce check and the bind: revoke as its EOF would
             self._spawn_revoke(session)
+        if landed is not None:
+            raise landed
+        if facts is not None:
+            return {"generation": 0, "ticket_facts": facts}   # §3.3: the ticket's facts, for render's check
         return {"generation": 0}
 
     def _op_cas(self, conn: Conn, args: dict) -> dict[str, object]:
@@ -1384,6 +1492,8 @@ class Control:
             # DECISION: an egress session has exactly one front (§1 gw-front), a none class none (§5.1 5b).
             if ("front" in claims) != (rec.claims.get("class") == "egress"):
                 raise Refused("claims-mismatch")
+            if "ticket" in rec.claims:
+                self._check_mint_against_ticket(session, rec.claims["ticket"], claims)
             epoch = None
             lost = False
             if "front" in claims:
@@ -1412,6 +1522,35 @@ class Control:
             self._spawn_keys_revoke(session)             # runs once this verb releases the session lock
             raise Refused("keys-unavailable", f"{session}: keys' connection ended after FRONT-REGISTER")
         return {"generation": new.generation}
+
+    def _bound_ticket(self, session: str, ticket: object) -> T.Ticket:
+        """The ticket BOUND to ``session`` that its ATTACH claims named; ``run-unknown`` when there is none (no ticket
+        store, or a journal that no longer holds the binding)."""
+        t = self.tickets.bound(session) if self.tickets is not None else None
+        if t is None or not isinstance(ticket, str) or not hmac.compare_digest(t.ticket, ticket):
+            raise Refused("run-unknown", "no ticket is bound to the session")
+        return t
+
+    def _check_mint_against_ticket(self, session: str, ticket: object, claims: Mapping[str, object]) -> None:
+        """§3.5 "Ticket facts reach render": CONTROL compares MINT's claims with its own ticket record,
+        ``claims-mismatch`` on any difference. The routes are the ticket's ``route`` (none for a verifier) and its
+        ``egress_routes``; the egress subset is exactly ``egress_routes``; the model is exactly ``model_requested``
+        (none for a verifier)."""
+        facts = self._bound_ticket(session, ticket).facts
+        egress = set(facts["egress_routes"])                          # type: ignore[arg-type]
+        brokered = {facts["route"]} if "route" in facts else set()
+        routes, egress_claimed = set(claims["routes"]), set(claims["egress_routes"])   # type: ignore[arg-type]
+        if (routes != brokered | egress or egress_claimed != egress
+                or claims.get("model") != facts.get("model_requested")):
+            raise Refused("claims-mismatch")
+
+    def _ticket_run_facts(self, session: str) -> Mapping[str, object] | None:
+        """The default ``run_facts`` seam: the run of the ticket bound to ``session`` (``QUEUE-RESOLVE``'s fields)."""
+        t = self.tickets.bound(session) if self.tickets is not None else None
+        if t is None:
+            return None
+        return {"run_id": t.run_id, "job_id": t.facts["job_id"], "run_index": t.facts["run_index"],
+                "contract_digest": t.facts["contract_digest"], "model_requested": t.facts.get("model_requested")}
 
     def _register_front(self, rec: R.SessionState, claims: Mapping[str, object]) -> tuple[R.SessionState, object]:
         """MINT's steps 1-3 for a session with a front (caller holds the session lock); returns the TOKEN-ONLY
@@ -1628,7 +1767,9 @@ class Control:
         """§1.5 / E23 (d) ``TOKEN-RESOLVE {token_digest}``: the session a live session token belongs to and its
         PERSISTED claims WITHOUT ``reg_token`` (keys learns a token only from FRONT-REGISTER). ``token-unknown`` for a
         digest CONTROL never minted (or has forgotten, :data:`REVOKED_TOKENS_MAX`); ``token-revoked`` for a token
-        whose handles were dropped (lease EOF, REVOKED, keys' admin EOF) or whose session is past live."""
+        whose handles were dropped (lease EOF, REVOKED, keys' admin EOF) or whose session is past live.
+        A ticketed session's answer adds ``run`` (§3.3) from the ticket bound to it (``run-unknown`` when none is), and
+        no answer carries the ticket itself."""
         digest = args["token_digest"]
         if type(digest) is not str:
             raise Refused("wrong-type", "token_digest is a string")
@@ -1647,7 +1788,15 @@ class Control:
         with self._mu:
             if self._handles.get(session) is not handles:
                 raise Refused("token-revoked")         # dropped while the record was read
-        return {"session": session, "claims": {k: v for k, v in rec.claims.items() if k != R.REG_TOKEN}}
+        # the ticket is a bearer handle for LEASE-OPEN and stays CONTROL's (head ruling H1): keys is told the run
+        out: dict[str, object] = {"session": session,
+                                  "claims": {k: v for k, v in rec.claims.items() if k not in (R.REG_TOKEN, "ticket")}}
+        if "ticket" in rec.claims:
+            t = self._bound_ticket(session, rec.claims["ticket"])
+            if "route" not in t.facts:
+                raise Refused("run-unknown", "the bound ticket names no route")
+            out["run"] = {"run_id": t.run_id, **{k: t.facts[k] for k in RESOLVE_RUN_FACTS}}
+        return out
 
     # -- keys' attachment (§4.5; 3c design r3 §2.1 (e), §2.4; R4 §1.4, §2) ---------------------------------------
 
@@ -1678,6 +1827,7 @@ class Control:
             conn.attach_no = no
             self._attach = conn
             self._keys_serves = serves
+            self._serves_cv.notify_all()
         if old is not None:
             self._attach_revoke()                        # the superseded attachment's EOF rule
             if old.sock is not None:
@@ -1705,25 +1855,51 @@ class Control:
                 self._reload_keys(head)
 
     def _reload_keys(self, head: Mapping[str, object]) -> None:
-        """``RELOAD {generation, item_sha256}`` of ``head`` on keys' admin wire; the caller holds the activation lock.
+        """``RELOAD {generation, item_sha256, keep}`` of ``head`` on keys' admin wire; the caller holds the activation lock.
         keys' ack is recorded as what keys serves on the attachment that was current when it was sent, if that is
         still the current one (a newer attachment states its own); a refusal, or any other failure of the call, is
         noted in :attr:`seam_errors` and never raised (the head is already durable: the activation stands, and keys
-        is reached again by the attach-time RELOAD or a resubmission)."""
+        is reached again by the attach-time RELOAD or a resubmission).
+
+        Head ruling H5 (1024+8): the RELOAD carries ``keep`` (:meth:`_keep_generations`), and keys' ack lists what it
+        still serves; a generation file is deleted only once that ack no longer lists it
+        (:meth:`levain.slot.routemaps.ControlRoutes.delete_unserved`). An ack without a well-formed ``served`` list
+        deletes nothing."""
         if self.keys_admin is None:
             return
         want = {"generation": head["generation"], "item_sha256": head["item_sha256"]}
+        keep = self._keep_generations(int(head["generation"]))   # type: ignore[call-overload]
         with self._mu:
             no = None if self._attach is None else self._attach.attach_no
         try:
-            got = self.keys_admin.call("RELOAD", **want)
+            got = self.keys_admin.call("RELOAD", **want, keep=sorted(keep))
         except Exception as e:
             self.seam_errors.append(("reload", "", e))
             return
+        acked = got.get("generation") == want["generation"] and got.get("item_sha256") == want["item_sha256"]
+        served = got.get("served")
+        prune = (acked and self.routes is not None and type(served) is list
+                 and all(type(g) is int for g in served) and want["generation"] in served)
         with self._mu:
-            if (no is not None and self._attach is not None and self._attach.attach_no == no
-                    and got.get("generation") == want["generation"] and got.get("item_sha256") == want["item_sha256"]):
+            current = no is not None and self._attach is not None and self._attach.attach_no == no
+            if current and acked:
                 self._keys_serves = want
+                self._serves_cv.notify_all()
+            # fix 2 (codex 5): an ack deletes files only when it came on the CURRENT attachment, the same check that
+            # records `_keys_serves`; a superseded attachment's late ack deletes nothing (the newer keys may still
+            # serve a generation that ack no longer lists). Under `_mu`, so no attachment supersedes it mid-delete.
+            if current and prune:
+                try:
+                    self.routes.delete_unserved(frozenset(served), keep)   # type: ignore[union-attr, arg-type]
+                except Exception as e:   # noqa: BLE001 - files left behind are deleted after a later ack
+                    self.seam_errors.append(("reload-prune", "", e))
+
+    def _keep_generations(self, head_gen: int) -> frozenset:
+        """RELOAD's ``keep`` (head ruling H5): the active generation, plus every route-map generation an OPEN ticket
+        names, plus that of any ticket bound to a session whose record is still live."""
+        live = {r.session for r in self.store.in_memory() if r.state in R.LIVE_STATES}
+        refs = self.tickets.referenced_generations(live) if self.tickets is not None else frozenset()
+        return frozenset({head_gen, *refs})
 
     # -- dispatch's route maps (§4.3; 3c design r3 §2.3, R4 §2) ------------------------------------------------
 
@@ -1736,6 +1912,108 @@ class Control:
             raise Refused("routemap-verifier", "CONTROL holds no route store")
         return {"generation": self.routes.submit(args["map"], args["sig"], self._reload_keys, self.keys_serves)}
 
+    # -- dispatch's run tickets (§3.3, §3.5; 3c design r3 §2.1, R4 §2) ----------------------------------------------
+
+    def _ticket_store(self) -> T.TicketStore:
+        if self.tickets is None:
+            raise Refused("journal-unavailable", "CONTROL holds no ticket journal")
+        return self.tickets
+
+    def _op_run_ticket_mint(self, conn: Conn, args: dict) -> dict[str, object]:
+        """``RUN-TICKET-MINT`` -> ``{ticket, run_id}`` (``run_id`` CONTROL's own, head ruling H1). In this order: the
+        attempt id's grammar and the §3.5 table's shapes (:func:`levain.slot.tickets.check_facts`); a REPLAY of a journaled attempt answers by the idempotent rule
+        before anything else is read, so a route or config change between a crash and the replay does not alter it;
+        a ``verifier`` ticket is ``verifier-unknown`` while no verifier generation is active (CONTROL activates none
+        here: ``CONFIG-SUBMIT`` is not among its verbs);
+        then the wait for keys to serve CONTROL's head on the current attachment, and, under the activation lock,
+        the route facts checked against the ACTIVE generation (:meth:`_check_route_facts`) and the mint journaled
+        with the ceiling (:meth:`levain.slot.tickets.TicketStore.mint`). Holding the activation lock means no
+        activation moves the head between the check and the journal line."""
+        store = self._ticket_store()
+        attempt = T.check_attempt_id(args["attempt_id"])
+        facts = T.check_facts(args)
+        again = store.replay(attempt, facts)
+        if again is not None:
+            return {"ticket": again.ticket, "run_id": again.run_id}
+        if facts["kind"] == "verifier":
+            raise Refused("verifier-unknown", "no verifier generation is active")
+        try:
+            self._await_keys_serving_head()
+        except Refused:
+            # fix 2 (codex 3): a same-attempt request that raced a mint in while this one waited answers the first
+            # ticket, never the route state's refusal
+            again = store.replay(attempt, facts)
+            if again is not None:
+                return {"ticket": again.ticket, "run_id": again.run_id}
+            raise
+        with self._activation:
+            # fix 2 (codex 3): every mint runs under the activation lock, so this replay is atomic with the mint below:
+            # a same-attempt request that lost the race answers the first ticket BEFORE any route-state or ceiling
+            # check (an activation or a lowered ceiling between the two never refuses it)
+            again = store.replay(attempt, facts)
+            if again is not None:
+                return {"ticket": again.ticket, "run_id": again.run_id}
+            self._check_route_facts(facts)
+            t = store.mint(attempt, facts, new_handle)
+            return {"ticket": t.ticket, "run_id": t.run_id}
+
+    def _await_keys_serving_head(self) -> None:
+        """Waits, at most :data:`MINT_KEYS_WAIT_S`, until what keys stated or acked on the CURRENT attachment is
+        CONTROL's head (R4 §2: a ticket is never minted for a generation keys does not serve); else
+        ``keys-unavailable``. No route map at all is ``ticket-field:routemap_generation``. Holds no lock but the
+        condition's while it waits, so the attach-time RELOAD (under the activation lock) can land meanwhile."""
+        deadline = self._monotonic() + MINT_KEYS_WAIT_S
+        with self._serves_cv:
+            while True:
+                head = self._routemap_head()
+                if head is None:
+                    raise Refused("ticket-field:routemap_generation", "no route-map generation is active")
+                if self._keys_serves == dict(head):
+                    return
+                left = deadline - self._monotonic()
+                if left <= 0:
+                    raise Refused("keys-unavailable", "keys does not serve CONTROL's route-map head")
+                self._serves_cv.wait(left)
+
+    def _check_route_facts(self, facts: Mapping[str, object]) -> None:
+        """The §3.5 table's VALUE half for an executor or planner ticket; the caller holds the activation lock.
+        ``routemap_generation`` == the ACTIVE generation == CONTROL's head == what keys serves on the current
+        attachment (else ``keys-unavailable``, retryable); ``route`` a dispatch-map id of that generation (a base
+        map's passthrough or egress id is not one: ``ticket-field:route``); ``route_policy_digest`` == CONTROL's own
+        digest of that entry's ``policy``; ``model_requested`` one of that route's models; every ``egress_routes`` id
+        a base-map route of type ``egress``."""
+        active = self.routes.active() if self.routes is not None else None
+        if active is None:
+            raise Refused("ticket-field:routemap_generation", "no route-map generation is active")
+        if facts["routemap_generation"] != active.generation:
+            raise Refused("ticket-field:routemap_generation", f"the active generation is {active.generation}")
+        with self._mu:
+            serves = self._keys_serves
+        if serves != {"generation": active.generation, "item_sha256": active.item_sha256}:
+            raise Refused("keys-unavailable", "keys does not serve CONTROL's route-map head")
+        entry = active.routes.get(facts["route"])
+        if entry is None or entry.policy.type != "brokered":
+            raise Refused("ticket-field:route", "not a brokered route of the active dispatch map")
+        if not hmac.compare_digest(str(facts["route_policy_digest"]), active.digests[str(facts["route"])]):
+            raise Refused("ticket-field:route_policy_digest")
+        if facts["model_requested"] not in entry.backends:
+            raise Refused("ticket-field:model_requested", "not one of the route's models")
+        assert self.routes is not None
+        types = routemaps.base_route_policy_types(self.routes.dir)   # the base map parsed whole (fix 2, codex 6)
+        for rid in facts["egress_routes"]:            # type: ignore[union-attr]
+            if types.get(rid) != "egress":
+                raise Refused("ticket-field:egress_routes", f"{rid} is not a base-map egress route")
+
+    def _op_run_ticket_cancel(self, conn: Conn, args: dict) -> dict[str, object]:
+        """``RUN-TICKET-CANCEL {ticket}`` -> ``{}``: an UNBOUND ticket only (``ticket-bound`` once a lease bound it)."""
+        self._ticket_store().cancel(_handle(args["ticket"], "ticket"))
+        return {}
+
+    def _op_run_ticket_status(self, conn: Conn, args: dict) -> dict[str, object]:
+        """``RUN-TICKET-STATUS {attempt_id}`` -> ``{ticket, state, session?}`` from the journal's attempt index
+        (``ticket-field:attempt_id`` outside the grammar, ``attempt-unknown`` for an attempt never minted)."""
+        return self._ticket_store().status(T.check_attempt_id(args["attempt_id"]))
+
     def keys_attach_eof(self, conn: Conn) -> None:
         """The attachment's connection ended (:class:`ControlServer`): §4.5's "either EOF at CONTROL", unless a newer
         attachment already superseded it (whose KEYS-ATTACH ran the rule then)."""
@@ -1744,6 +2022,7 @@ class Control:
                 return
             self._attach = None
             self._keys_serves = None
+            self._serves_cv.notify_all()
         self._attach_revoke()
 
     def _attach_revoke(self) -> None:
@@ -2027,6 +2306,11 @@ class ServeConfig:
     #: ``L/routes`` (trust, base map, the dispatch route maps) and the ``_levain_dispatch`` peer: S1 3c-4
     routes_dir: Path | None = None
     dispatch_uid: int | None = None
+    #: ``L/policy/dispatch_ceiling`` (S1 3c-5); ``None`` with a ``routes_dir``: ``<routes_dir>/../policy/dispatch_ceiling``.
+    #: The ticket journal is ``<store_dir>/tickets.jsonl``, kept whenever there is a route store.
+    ceiling_path: Path | None = None
+    #: the ceiling file's required owner (root; a test rig passes its own uid)
+    ceiling_uid: int = 0
     host: str = "darwin" if sys.platform == "darwin" else "linux"
     peer_uid: Callable[[socket.socket], int | None] | None = None
     ready: Callable[[ControlServer], object] | None = None
@@ -2041,8 +2325,13 @@ def serve(config: ServeConfig) -> int:
     store = StateStore(Path(config.store_dir))
     admin = KeysAdmin(config.keys_admin_path) if config.keys_admin_path is not None else None
     routes = routemaps.ControlRoutes(Path(config.routes_dir)) if config.routes_dir is not None else None
+    tickets = None
+    if config.routes_dir is not None:
+        ceiling = config.ceiling_path or Path(config.routes_dir).parent / "policy" / "dispatch_ceiling"
+        tickets = T.TicketStore(Path(config.store_dir) / T.JOURNAL, Path(ceiling), ceiling_uid=config.ceiling_uid)
     control = Control(store, config.operator_uid, qbroker_uid=config.qbroker_uid, keys_uid=config.keys_uid,
-                      keys_admin=admin, host=config.host, routes=routes, dispatch_uid=config.dispatch_uid)
+                      keys_admin=admin, host=config.host, routes=routes, dispatch_uid=config.dispatch_uid,
+                      tickets=tickets)
     if config.peer_uid is not None:
         server = ControlServer(control, Path(config.socket_path), peer_uid=config.peer_uid)
     else:
@@ -2053,7 +2342,13 @@ def serve(config: ServeConfig) -> int:
         for sig in (signal.SIGTERM, signal.SIGINT):
             restore.append((sig, signal.signal(sig, lambda *_a: stop.set())))
     try:
-        server.start()
+        try:
+            server.start()
+        except Refused as e:
+            # 3c-5 fix 2: a refused start (``control-running``: another CONTROL holds the ticket journal) is logged
+            # by name; nothing was served and the other CONTROL's socket is untouched
+            print(f"levain CONTROL: start refused: {e.name}", file=sys.stderr, flush=True)
+            raise
         if config.ready is not None:
             config.ready(server)
         while not stop.wait(0.5):
