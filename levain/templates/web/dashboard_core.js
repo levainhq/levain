@@ -1611,6 +1611,7 @@
       const bits = [];
       if (h.save_age_hours != null) bits.push("last save " + (h.save_age_hours >= 1 ? Math.round(h.save_age_hours) + "h ago" : "under 1h ago"));
       if (h.projection_converged != null) bits.push(h.projection_converged ? "projection converged" : "PROJECTION DIVERGED (" + (h.projection_note || "continuity file differs from the last wrap (edited since?)") + ")");
+      else if (h.projection_note) bits.push("projection " + h.projection_note);
       if (h.audit_backlog != null) bits.push(!h.audit_backlog ? "no audit write failures recorded" : "AUDIT: " + h.audit_backlog + " audit writes failed");
       if (bits.length) kv(p, "substrate", bits.join(" · "));
     }

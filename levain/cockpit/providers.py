@@ -761,11 +761,12 @@ def _health(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         ):
             metrics.append({"label": label, "value": value, "unit": None, "status": "unknown", "read": None})
         for label, value, status in (
-            ("last save (hours ago)", None if h.save_age_hours is None else round(h.save_age_hours, 1), "unknown"),
-            ("projection", None if h.projection_converged is None else (
+            ("last save (hours ago)", h.save_age_hours, "unknown"),  # unrounded: the renderers round once
+            ("projection", ("unknown" if h.projection_note else None) if h.projection_converged is None else (
                 "converged" if h.projection_converged else
                 ("file missing" if h.projection_note == "continuity file missing" else "diverged")),
              "unknown" if h.projection_converged is None else ("ok" if h.projection_converged else "bad")),
+            ("projection note", h.projection_note, "unknown"),
             ("audit write failures", h.audit_backlog,
              "unknown" if h.audit_backlog is None else ("ok" if not h.audit_backlog else "bad")),
         ):

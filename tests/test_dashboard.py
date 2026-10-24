@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import time
+import os
 import pytest
 
 from levain.dashboard import (
@@ -1356,7 +1358,7 @@ class TestHealthOraclesRound2:
         assert "7 audit writes failed" in (health_oracle_line(v.health) or "")
 
     @staticmethod
-    def _wrapped(tmp_path: Path, text: str = "## State\nfoc\n", pair: str = "tok1-aaaa1111"):
+    def _wrapped(tmp_path: Path, text: str = "## State\nfoc\n", pair: str = "0123456789ab-aaaa1111"):
         """A real store with one committed wrap whose content_hash is sha256(text); the continuity file holds text."""
         import hashlib
         from anneal_memory import Store
@@ -1380,10 +1382,32 @@ class TestHealthOraclesRound2:
 
     def test_the_latest_pairs_sidecar_with_the_matching_hash_is_settling(self, tmp_path: Path) -> None:
         db, md = self._wrapped(tmp_path)
-        (tmp_path / "memory.continuity.tok1-aaaa1111.md.tmp").write_text("## State\nfoc\n", encoding="utf-8")
+        (tmp_path / "memory.continuity.0123456789ab-aaaa1111.md.tmp").write_text("## State\nfoc\n", encoding="utf-8")
         md.write_text("## State\nthe previous wrap\n", encoding="utf-8")  # the rename has not happened yet
         h = build_substrate_view(AnnealPaths.from_db(db)).health
         assert h is not None and h.projection_converged is None and "settling" in (h.projection_note or "")
+
+    def test_an_old_matching_sidecar_reads_incomplete_and_the_note_is_shown(self, tmp_path: Path) -> None:
+        from levain.dashboard import health_oracle_line
+
+        db, md = self._wrapped(tmp_path)
+        side = tmp_path / "memory.continuity.0123456789ab-aaaa1111.md.tmp"
+        side.write_text("## State\nfoc\n", encoding="utf-8")
+        old = time.time() - 3600
+        os.utime(side, (old, old))
+        md.write_text("## State\nthe previous wrap\n", encoding="utf-8")
+        h = build_substrate_view(AnnealPaths.from_db(db)).health
+        assert h is not None and h.projection_converged is False and "externalization incomplete" in (h.projection_note or "")
+        assert "externalization incomplete" in (health_oracle_line(h) or "")
+
+    def test_an_invalid_pair_id_is_no_settling_proof_never_a_fault(self, tmp_path: Path) -> None:
+        from levain.dashboard import health_oracles
+
+        md = tmp_path / "memory.continuity.md"
+        md.write_text("something else\n", encoding="utf-8")
+        for bad in ("../../etc/x", "a\x00b", "0123456789ab-aaaa1111"):
+            o = health_oracles(None, ("2026-01-01T00:00:00Z", "0" * 64, bad), md)
+            assert o["projection_converged"] is False and "differs" in o["projection_note"]
 
     def test_a_file_deleted_seconds_after_a_wrap_with_no_sidecar_is_missing(self, tmp_path: Path) -> None:
         db, md = self._wrapped(tmp_path)
