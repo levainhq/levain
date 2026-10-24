@@ -1157,8 +1157,10 @@ class _Handler(GuardedHandler):
         filed but not bound is a 503 (the draft is sent again; the request it filed stays open until it expires). Two
         composes of one draft at once file one: the second waits for the first's compose_signer call (up to
         _COMPOSE_WAIT_S, then 503). Composes of different drafts never wait on each other: the compose_signer runs
-        outside the server's lock."""
-        from levain.consent.sign import SignRefused, bind_compose, compose_bindings, error_word, request_id_ok
+        outside the server's lock. A draft with no live binding while ``COMPOSE_LIVE_MAX`` bindings are live is
+        refused 429 ``too_many_open`` before anything is filed (``levain.consent.sign.draft_bindings``); a draft
+        already bound is answered whatever the count."""
+        from levain.consent.sign import SignRefused, bind_compose, draft_bindings, error_word, request_id_ok
         from levain.cockpit.verbs import SIGN_PARAM
 
         compose = self.server.compose_signer
@@ -1207,9 +1209,10 @@ class _Handler(GuardedHandler):
                             "send again"}, 503
                 wake.wait(left)
             try:
-                bound = [b for b in compose_bindings(signer.queue_dir) if b["verb"] == spec.name and b["txn"] == txn]
+                bound = draft_bindings(signer.queue_dir, spec.name, txn)     # 429 for a new draft past the cap
             except SignRefused as exc:
-                return {"error": error_word(exc.status), "message": f"{exc}: nothing was filed; send again"}, exc.status
+                message = str(exc) if exc.status == 429 else f"{exc}: nothing was filed; send again"
+                return {"error": error_word(exc.status), "message": message}, exc.status
             if any(b["params"] != fp for b in bound):
                 return conflict
             for b in reversed(bound):           # the newest of this draft's requests that is still open
@@ -2358,7 +2361,6 @@ def make_server(
     httpd.read_waiters_lock = threading.Lock()
     view = VerbView(verb_registry, cockpit, lambda: broker_install_class(httpd)) if cockpit is not None else None
     pinned = False
-    attached = None     # what the caller's cockpit held before this server attached to it, while that can be undone
     try:
         # K2b §6: `--install-class reported` is the only way to reported; no flag (and no governed
         # marker) leaves the broker write-disabled, answering "run the installer"
@@ -2385,32 +2387,24 @@ def make_server(
             pinned = True
             httpd.signer_page_origin = signer.page_origin
         if cockpit is not None:
-            if callable(getattr(cockpit, "attachments", None)) and callable(getattr(cockpit, "restore_attachments",
-                                                                                     None)):
-                attached = cockpit.attachments()
-            cockpit.attach_verbs(view)
-            if httpd.broker is not None:
-                cockpit.attach_authority(httpd.broker.capture)
-                cockpit.attach_edits_reader(httpd.broker.edits)
+            # one transaction: an attach that raises (a panel registered since check_verbs; a decisions panel the
+            # registry refuses) undoes this server's attaches and keeps any other registration
+            broker = httpd.broker
+            cockpit.attach_server(
+                view, httpd.consent_reader,                     # agents waiting on the operator (Q6a)
+                capture=broker.capture if broker is not None else None,
+                edits=broker.edits if broker is not None else None,
                 # a downstream that registered its own "decisions" keeps exactly that panel (K2b-3b §0.4)
-                cockpit.attach_decision_rows(httpd.broker.decision_rows)
-            cockpit.attach_consent_rows(httpd.consent_reader)      # agents waiting on the operator (Q6a)
-            if httpd.question_store is not None:
-                cockpit.attach_question_rows(httpd.question_store)     # and the questions they ask him (Q-2b)
-            if httpd.note_store is not None:
-                cockpit.attach_note_rows(httpd.note_store)             # and what they tell him (notes)
+                decision_rows=broker.decision_rows if broker is not None else None,
+                questions=httpd.question_store,                 # and the questions they ask him (Q-2b)
+                notes=httpd.note_store)                         # and what they tell him (notes)
     except BaseException:
-        # an attach that raised (a panel registered between check_verbs and attach_verbs; a decisions panel the
-        # registry refuses) undoes every attach made before it, then this server's pin: it never served
+        # the cockpit put itself back (attach_server); this server's pin is released: it never served
         try:
-            if attached is not None and cockpit is not None:
-                cockpit.restore_attachments(attached)
+            if pinned and signer is not None:
+                signer.release_pin()
         finally:
-            try:
-                if pinned and signer is not None:
-                    signer.release_pin()
-            finally:
-                httpd.server_close()
+            httpd.server_close()
         raise
     # The names this server serves, beside its cockpit.db, for `levain cockpit policy raise` to check a
     # downstream verb against (levain.cockpit.verbs.SERVED_VERBS_NAME). Written last, so a server refused

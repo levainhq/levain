@@ -199,8 +199,8 @@ def test_a_slow_compose_for_one_draft_does_not_delay_another(tmp_path, monkeypat
 
 # --- F4: the Signer is pinned before the caller's cockpit is touched ---------------------------------------------------
 
-_ATTACH = ("attach_verbs", "attach_authority", "attach_edits_reader", "attach_decision_rows", "attach_consent_rows",
-           "attach_question_rows", "attach_note_rows")
+_ATTACH = ("attach_server", "attach_verbs", "attach_authority", "attach_edits_reader", "attach_decision_rows",
+           "attach_consent_rows", "attach_question_rows", "attach_note_rows")
 
 
 def test_a_server_refused_after_the_bind_leaves_the_cockpit_unmodified_and_closes(tmp_path, monkeypatch) -> None:
@@ -237,7 +237,10 @@ def test_a_server_refused_after_the_bind_leaves_the_cockpit_unmodified_and_close
     monkeypatch.setattr(web_server, "_build_broker", real_broker)
     with rig.serving() as (_url, httpd):
         assert httpd.signer_page_origin == rig.origin
-        assert calls[0] == "attach_verbs" and set(calls) == set(_ATTACH), calls
+        # one transaction attaches everything (the rig's serving() then attaches its own question store)
+        assert calls == ["attach_server", "attach_question_rows"], calls
+        ck, dec = rig.ck, rig.ck._dec
+        assert None not in (ck._verb_view, ck._capture, ck._edits_reader, dec.rows, dec.consent, dec.notes, dec.spec)
 
 
 # --- F5: a ceremony that throws is "not sure", and the write-in's words open again -----------------------------------

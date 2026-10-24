@@ -50,7 +50,8 @@ refused, with the reason, never skipped. The result lands beside the request:
 A cockpit's compose route (:func:`levain.web_server.make_server`'s ``compose_signer``) also records, in
 ``<queue_dir>/sign/.compose.json`` (:data:`COMPOSE_BINDINGS`), which request each signed draft filed, for which verb and
 params (:func:`bind_compose`, :func:`compose_bindings`): the kernel's sign check reads it, so it outlives the server
-that wrote it, and a binding leaves only with its request or its age (:data:`BINDING_KEEP_S`).
+that wrote it, and a binding leaves only with its request or its age (:data:`BINDING_KEEP_S`). While
+:data:`COMPOSE_LIVE_MAX` are live a new draft's compose is refused (:func:`draft_bindings`).
 
 The rules, each a refusal before anything is signed:
 
@@ -134,10 +135,10 @@ from levain import unshowable
 from levain.idempotency import DEFAULT_WINDOW_S as _GATE_WINDOW_S
 from levain.sign_request_id import ID as _ID, request_id_ok
 
-__all__ = ["BINDING_KEEP_S", "CHOICE_FORMAT", "CHOICE_MARK", "COMPOSE_BINDINGS", "ERROR_WORDS", "LIST_MAX",
-           "LOCK_WAIT_S", "MESSAGE_MAX", "OPTIONS_MAX", "REFUSED_NAMESPACES", "REQUEST_FORMAT", "SIGN_DIR",
+__all__ = ["BINDING_KEEP_S", "CHOICE_FORMAT", "CHOICE_MARK", "COMPOSE_BINDINGS", "COMPOSE_LIVE_MAX", "ERROR_WORDS",
+           "LIST_MAX", "LOCK_WAIT_S", "MESSAGE_MAX", "OPTIONS_MAX", "REFUSED_NAMESPACES", "REQUEST_FORMAT", "SIGN_DIR",
            "WRITE_IN_KEY", "SignRefused", "SignRequest", "Signer", "bind_compose", "choice_line", "compose_bindings",
-           "deep_link", "error_word", "namespace_problem", "parse_choice", "passkey_key_source", "read_request",
+           "deep_link", "draft_bindings", "error_word", "namespace_problem", "parse_choice", "passkey_key_source", "read_request",
            "request_id_ok", "sign_dir", "sign_root", "signed_bytes", "state_of", "write_in_problem"]
 
 REQUEST_FORMAT = "levain-sign-request/1"
@@ -171,7 +172,13 @@ _BINDING_KEYS = frozenset({"verb", "txn", "params", "request", "filed_at"})
 # at-most-once gate's window (levain.idempotency.DEFAULT_WINDOW_S), so it outlasts the replay of any send made within
 # one window of its compose; past the gate's window a replay is gone anyway, and a refusal then asks the passkey
 BINDING_KEEP_S = 2 * _GATE_WINDOW_S
-_BINDINGS_MAX = 16 * 1024 * 1024        # bytes of the bindings file one read takes; past it the read is refused (503)
+# The most live bindings a queue keeps (draft_bindings): past it a NEW draft's compose is refused 429, while a draft
+# already bound is still answered. Every binding is a request the operator signs with a passkey or that waits for him,
+# and a signed one stays BINDING_KEEP_S, so 1024 is one ceremony every three minutes for two days without a break: no
+# human reaches it, only a token holder filing in a loop. At about 250 bytes a binding it holds the file near 256 KiB,
+# far under _BINDINGS_MAX, and bounds the reads every compose and signed send makes under the queue lock.
+COMPOSE_LIVE_MAX = 1024
+_BINDINGS_MAX = 16 * 1024 * 1024        # bytes of the bindings file a reader takes; past it the read is refused (503)
 
 
 class SignRefused(Exception):
@@ -185,7 +192,7 @@ class SignRefused(Exception):
 
 # the error word a port answers a SignRefused with, by its status; any other status is "sign_refused". ONE table: the
 # phone port (levain.phone_server) and the cockpit (levain.web_server) both import it, so the two cannot drift
-ERROR_WORDS = {400: "bad_request", 404: "not_found", 409: "conflict", 503: "unavailable"}
+ERROR_WORDS = {400: "bad_request", 404: "not_found", 409: "conflict", 429: "too_many_open", 503: "unavailable"}
 
 
 def error_word(status: int) -> str:
@@ -619,9 +626,17 @@ def _binding_problem(b: Any) -> str | None:
 
 def compose_bindings(queue_dir: Path) -> "list[dict[str, str]]":
     """Every binding :func:`bind_compose` recorded on this queue, oldest first: ``{verb, txn, params, request,
-    filed_at}``. ``[]`` only when there is no file. A file that is there and cannot be read whole, or holds anything
-    but well-formed bindings, is :class:`SignRefused` (503), never read as empty: a binding it hid would turn a lost
-    answer's retry into a refusal, and the operator's next signature into a second send."""
+    filed_at}``. ``[]`` only when there is no file. A file that is there and cannot be read whole (over
+    ``_BINDINGS_MAX`` bytes included), or holds anything but well-formed bindings, is :class:`SignRefused` (503), never
+    read as empty: a binding it hid would turn a lost answer's retry into a refusal, and the operator's next signature
+    into a second send."""
+    return _read_bindings(queue_dir, _BINDINGS_MAX)
+
+
+def _read_bindings(queue_dir: Path, limit: int | None) -> "list[dict[str, str]]":
+    """:func:`compose_bindings`, reading at most ``limit`` bytes, or the whole file when ``limit`` is None: the
+    writers' read (:func:`draft_bindings`, :func:`bind_compose`), under the queue lock, so a file over the readers'
+    limit is still pruned instead of refusing every compose until a hand removes it."""
     path = sign_dir(queue_dir) / COMPOSE_BINDINGS
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
@@ -634,14 +649,14 @@ def compose_bindings(queue_dir: Path) -> "list[dict[str, str]]":
             raise SignRefused(f"{path} is not a regular file", 503)
         with os.fdopen(fd, "rb") as fh:
             fd = -1
-            raw = fh.read(_BINDINGS_MAX + 1)
+            raw = fh.read() if limit is None else fh.read(limit + 1)
     except OSError as exc:
         raise SignRefused(f"could not read {path}: [Errno {exc.errno}] {exc.strerror or exc}", 503) from None
     finally:
         if fd >= 0:
             os.close(fd)
-    if len(raw) > _BINDINGS_MAX:
-        raise SignRefused(f"{path} is over {_BINDINGS_MAX} bytes", 503)
+    if limit is not None and len(raw) > limit:
+        raise SignRefused(f"{path} is over {limit} bytes", 503)
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError):
@@ -675,9 +690,10 @@ def bind_compose(queue_dir: Path, verb: str, txn: str, params: str, request_id: 
     """Record, durably, that the compose of draft ``txn`` filed ``request_id`` for ``verb`` and the params whose
     fingerprint is ``params`` (``levain.web_server``'s compose route, DESIGN_SIGN D5): a new binding beside every
     other, under the queue lock, written whole and flushed to disk before this returns, with the bindings whose
-    request left (:func:`_binding_live`) dropped in the same write. Never by count: a binding goes only with its
-    request or its age. :class:`SignRefused` (503) when the lock, the read or the write fails; the file is then
-    left as it was."""
+    request left (:func:`_binding_live`) dropped in the same write. A binding goes only with its request or its age,
+    never to make room: the cap on how many there are is checked before the request is filed
+    (:func:`draft_bindings`), since a request already filed and then not bound could not be sent. :class:`SignRefused`
+    (503) when the lock, the read or the write fails; the file is then left as it was."""
     path = sign_dir(queue_dir) / COMPOSE_BINDINGS
     now = _now()
     new = {"verb": verb, "txn": txn, "params": params, "request": request_id, "filed_at": now.isoformat()}
@@ -685,8 +701,31 @@ def bind_compose(queue_dir: Path, verb: str, txn: str, params: str, request_id: 
     if problem is not None:
         raise ValueError(problem)
     with _queue_lock(queue_dir):
-        kept = [b for b in compose_bindings(queue_dir) if _binding_live(queue_dir, b, now)]
+        kept = [b for b in _read_bindings(queue_dir, None) if _binding_live(queue_dir, b, now)]
         _publish(_write_over, path, json.dumps(kept + [new], separators=(",", ":")), "")
+
+
+def draft_bindings(queue_dir: Path, verb: str, txn: str) -> "list[dict[str, str]]":
+    """The live bindings of draft ``txn`` for ``verb``, oldest first, read by the compose route before it files
+    anything (``levain.web_server``, DESIGN_SIGN D5). Under the queue lock the bindings whose request left
+    (:func:`_binding_live`) are pruned first, and written back when any were. Then a draft with none, so one whose
+    compose would file a new request, is refused :class:`SignRefused` (429) while :data:`COMPOSE_LIVE_MAX` bindings
+    are live: a draft already bound is never refused, so a lost answer's retry is still answered. Composes of new drafts
+    running at once can each pass the check before any binds, so the file may pass the cap by the composes in flight,
+    never more. :class:`SignRefused` (503) when the lock, the read or the write fails."""
+    path = sign_dir(queue_dir) / COMPOSE_BINDINGS
+    now = _now()
+    with _queue_lock(queue_dir):
+        found = _read_bindings(queue_dir, None)
+        kept = [b for b in found if _binding_live(queue_dir, b, now)]
+        if len(kept) != len(found):
+            _publish(_write_over, path, json.dumps(kept, separators=(",", ":")), "")
+    mine = [b for b in kept if b["verb"] == verb and b["txn"] == txn]
+    if not mine and len(kept) >= COMPOSE_LIVE_MAX:
+        raise SignRefused(f"{len(kept)} sign requests filed in the last {BINDING_KEEP_S // 3600} hours are open or "
+                          f"signed, the most this cockpit keeps: finish or deny open requests first; nothing was filed",
+                          429)
+    return mine
 
 
 def _row(rid: str, request: SignRequest, signers: "list[str]") -> dict[str, Any]:

@@ -182,14 +182,14 @@ def _attached(ck: Any) -> tuple:
             dict(ck._specs), dict(ck._rowsets))
 
 
-@pytest.mark.parametrize("which", ["attach_verbs", "attach_consent_rows", "attach_note_rows"])
+@pytest.mark.parametrize("which", ["_attach_verbs_locked", "_attach_consent_rows_locked", "_attach_note_rows_locked"])
 def test_an_attach_that_raises_after_the_pin_unpins_and_detaches(tmp_path, monkeypatch, which) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     before = _attached(rig.ck)
     real = getattr(rig.ck, which)
 
     def boom(*a: Any, **k: Any) -> Any:
-        if which != "attach_verbs":
+        if which != "_attach_verbs_locked":
             real(*a, **k)                      # half-applied: the attach changed the cockpit, then raised
         raise RuntimeError("a panel was registered between check_verbs and the attach")
 
@@ -211,7 +211,8 @@ def test_an_attach_that_raises_after_the_pin_unpins_and_detaches(tmp_path, monke
 def test_a_failed_server_never_unpins_a_signer_another_server_holds(tmp_path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving() as (_url, _httpd):
-        monkeypatch.setattr(rig.ck, "attach_consent_rows", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no")))
+        monkeypatch.setattr(rig.ck, "_attach_consent_rows_locked",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no")))
         kw = {**rig.kw, "port": 0}
         with pytest.raises(RuntimeError, match="no"):
             make_server(rig.src, host="127.0.0.1", **kw)
