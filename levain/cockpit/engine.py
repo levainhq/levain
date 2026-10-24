@@ -420,6 +420,9 @@ class _Decisions:
     spec: "ProviderSpec | None" = None
 
 
+_DEC_FIELDS = ("source", "rows", "consent", "questions", "notes", "spec")     # every _Decisions field, for attach_server
+
+
 def _composed(ctx: "ReadContext") -> Result:
     return Fault("the decisions panel is composed by the kernel; it has no read of its own")
 
@@ -615,9 +618,60 @@ class Cockpit:
         registry first (a verb it holds, panel-bound, not a job, fields inside its allowlist), and a
         refused one refuses the attach: the registry is known from here on."""
         with self._lock:
-            for spec in self._specs.values():
-                _check_compose_verbs(spec, view)
-            self._verb_view = view
+            self._attach_verbs_locked(view)
+
+    def _attach_verbs_locked(self, view: Any) -> None:
+        self._check_verbs(view)
+        self._verb_view = view
+
+    def check_verbs(self, view: Any) -> None:
+        """The check :meth:`attach_verbs` runs, attaching nothing: a server runs it before it commits to the
+        cockpit (``make_server``), so a refused compose leaves the cockpit and everything else as they were."""
+        with self._lock:
+            self._check_verbs(view)
+
+    def _check_verbs(self, view: Any) -> None:
+        for spec in self._specs.values():
+            _check_compose_verbs(spec, view)
+
+    def attach_server(self, view: Any, consent: Callable[[datetime], Any], *,
+                      capture: Callable[[datetime], RequestAuthority] | None = None,
+                      edits: Callable[[int], Any] | None = None, decision_rows: Callable[[datetime], Any] | None = None,
+                      questions: Any = None, notes: Any = None) -> None:
+        """Every attach a server makes (``make_server``), as ONE transaction under the cockpit's lock: the verb view
+        (:meth:`attach_verbs`), the broker's capture, edits reader and decisions rows when given, the consent reader,
+        then the question and note stores when given. One that raises puts back exactly what this call found, then
+        raises. Nothing else registers while the lock is held, so a panel another thread registers before this call or
+        after it is kept: the undo removes only this server's attaches."""
+        with self._lock:
+            before = (self._verb_view, self._capture, self._edits_reader,
+                      tuple(getattr(self._dec, f) for f in _DEC_FIELDS), self._specs, self._state,
+                      dict(self._rowsets), set(self._hero_yields))
+            try:
+                self._attach_verbs_locked(view)
+                if capture is not None:
+                    self._capture = capture
+                if edits is not None:
+                    self._edits_reader = edits
+                if decision_rows is not None:
+                    self._attach_decision_rows_locked(decision_rows)
+                self._attach_consent_rows_locked(consent)
+                if questions is not None:
+                    self._attach_question_rows_locked(questions)
+                if notes is not None:
+                    self._attach_note_rows_locked(notes)
+            except BaseException:
+                # the registry is copy-on-write, so the dicts taken are the ones a reader held then; the row-set
+                # owners and hero yields, changed in place, are put back in place
+                self._verb_view, self._capture, self._edits_reader, dec, self._specs, self._state, rowsets, heroes = (
+                    before)
+                for f, v in zip(_DEC_FIELDS, dec):
+                    setattr(self._dec, f, v)
+                self._rowsets.clear()
+                self._rowsets.update(rowsets)
+                self._hero_yields.clear()
+                self._hero_yields.update(heroes)
+                raise
 
     def attach_labeller(self, fn: Callable[[], LabelSnapshot]) -> None:
         """Attach a labels-only source: ``fn()`` is ONE journal read, taken once per request (design
@@ -672,36 +726,48 @@ class Cockpit:
         while the broker is not ACTIVE, or raises. With no downstream ``decisions`` registered the
         kernel registers its own panel; a downstream that registered one keeps exactly its panel."""
         with self._lock:
-            self._dec.rows = fn
-            if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
-                self._install_decisions_locked()
+            self._attach_decision_rows_locked(fn)
+
+    def _attach_decision_rows_locked(self, fn: Callable[[datetime], Any]) -> None:
+        self._dec.rows = fn
+        if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
+            self._install_decisions_locked()
 
     def attach_consent_rows(self, fn: Callable[[datetime], Any]) -> None:
         """The consent queue's reader (``fn(now)`` returns a ``ConsentListing``, or raises): agents' requests
         waiting on the operator (Q6a). Read-only, and independent of the broker: a read fault is a note on the
         panel, never a dark one."""
         with self._lock:
-            self._dec.consent = fn
-            if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
-                self._install_decisions_locked()
+            self._attach_consent_rows_locked(fn)
+
+    def _attach_consent_rows_locked(self, fn: Callable[[datetime], Any]) -> None:
+        self._dec.consent = fn
+        if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
+            self._install_decisions_locked()
 
     def attach_question_rows(self, store: Any) -> None:
         """The question band's store (``levain.consent.questions.QuestionStore``): agents' questions waiting on the
         operator (Q-2b), read at the source, as the consent queue is. Its rows carry no question text, and the
         panel offers ``question_answer`` on an open one. A read fault is a note, never a dark panel."""
         with self._lock:
-            self._dec.questions = store
-            if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
-                self._install_decisions_locked()
+            self._attach_question_rows_locked(store)
+
+    def _attach_question_rows_locked(self, store: Any) -> None:
+        self._dec.questions = store
+        if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
+            self._install_decisions_locked()
 
     def attach_note_rows(self, store: Any) -> None:
         """The note store (``levain.consent.notes.NoteStore``): what agents told the operator, read at the source. Its
         rows carry no words, and the panel offers ``note_dismiss`` on an open one. A read fault is a note on the
         panel, never a dark one."""
         with self._lock:
-            self._dec.notes = store
-            if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
-                self._install_decisions_locked()
+            self._attach_note_rows_locked(store)
+
+    def _attach_note_rows_locked(self, store: Any) -> None:
+        self._dec.notes = store
+        if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
+            self._install_decisions_locked()
 
     @property
     def note_store(self) -> Any:

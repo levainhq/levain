@@ -449,7 +449,9 @@ def test_seed_templates_carry_the_reconciled_guidance():
     # AM-HOP-RETIRED (0.9.26), the negative half: recall no longer reads links, so the seed must
     # not say co-citing keeps recall alive or that recall goes dark without it.
     for retired in ("associative recall goes dark", "that is what forms the Hebbian link",
-                    "Co-citing 2+ episodes in one graduation", "allow_unlinked"):
+                    "Co-citing 2+ episodes in one graduation", "allow_unlinked",
+                    # anneal 1.0.2 forms no links and ignores affect: the seed teaches two layers and the immune system
+                    "hebbian", "limbic", "affective_state", "four layers", "episode associations"):
         for name, text in seed_files.items():
             assert retired.lower() not in text.lower(), (
                 f"{name} still teaches the retired claim {retired!r}")

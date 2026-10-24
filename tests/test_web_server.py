@@ -44,7 +44,8 @@ def _store_with_data(tmp_path: Path) -> SubstrateSource:
     with Store(db) as store:
         a = store.record("decided X because Y", "decision")
         b = store.record("noticed Z", "observation")
-        store.record_associations({(a.id, b.id)})
+        store.wrap_started(token="w1", episode_ids=[a.id, b.id])
+        store.wrap_completed(2, 20, wrap_token="w1", episode_ids=[a.id, b.id])
     SporeStore(tmp_path / "memory.spores.json").add(
         type="task", text="an open loop", tier="hot", salience=2
     )

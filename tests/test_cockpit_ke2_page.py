@@ -129,7 +129,7 @@ out.w1 = w1.text;
 out.w1empty = draw("ops", "status-dots", { metrics: [] }, { widget: true }, { empty: "no dots" }).text;
 // W3: the write path read off a widget's own metrics
 const wv = (live) => draw("health", "status-dots", { metrics: [{ label: "write path", value: live, status: "ok" }] }, { widget: true }).v;
-out.w3 = [wv("live").write_path_live, wv("dark").write_path_live, draw("ops", "status-dots", { metrics: [] }, { widget: true }).v.write_path_live];
+out.w3 = [wv("live").write_path_live, wv("dark").write_path_live, draw("ops", "status-dots", { metrics: [] }, { widget: true }).v.write_path_live, wv("no wraps yet").write_path_live, wv("no wraps yet").write_path_status];
 // W4: a repeated label keeps its own heading and clamp
 const lines = [];
 for (let i = 0; i < 8; i++) lines.push({ label: "Tasks", text: "t" + i });
@@ -158,7 +158,7 @@ def test_widgets_draw_every_metric_and_the_brief_groups_by_label(tmp_path: Path)
     for needle in ("load", "3 of 4", "ratio", "0.25", "disk", "ok-ish"):
         assert needle in out["w1"], f"{needle!r} missing from the widget: {out['w1']!r}"
     assert "no dots" in out["w1empty"] and "nothing" not in out["w1"]
-    assert out["w3"] == [True, False, None], "liveness comes from the widget's own write-path metric, or is unknown"
+    assert out["w3"] == [True, False, None, False, "no-wraps"], "liveness comes from the widget's own write-path metric, or is unknown"
     assert out["w4"] == ["Tasks", "Risks"]
     assert out["w4side"] == [f"t{i}" for i in range(6)] + ["r0", "r1"]
     assert out["w4more"] == ["+2 more"]

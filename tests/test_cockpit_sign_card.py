@@ -44,6 +44,7 @@ from tests.test_cockpit_sign_routes import _call
 NS = "flow-needs-phill"
 QRID = "np-card-question-01"
 TOK = "T"
+TXN = "draft-0001-aaaa"
 DESKTOP = {"emulate": {"w": 1440, "h": 900, "dpr": 1}}
 needs_ssh = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
@@ -79,7 +80,8 @@ class _Rig:
     the door: it applies only params that name a sign request the passkey signed over exactly that message), an open
     question whose answer is signed through ``QRID``, and a Signer on rpId localhost pinned to this page."""
 
-    def __init__(self, tmp_path: Path, monkeypatch: Any, *, sign: bool = True, compose: bool = True) -> None:
+    def __init__(self, tmp_path: Path, monkeypatch: Any, *, sign: bool = True, compose: bool = True,
+                 two_keys: bool = False, fillers: int = 0) -> None:
         home = tmp_path / "levain_home"
         monkeypatch.setenv("LEVAIN_HOME", str(home))
         (home / "consent").mkdir(parents=True, mode=0o700)
@@ -91,10 +93,18 @@ class _Rig:
         _write_request(self.qdir, QRID, "Ship the sweep fix tonight or hold it?\nnonce: 9a1f",
                        options=[{"key": "a", "text": "Ship it tonight"}, {"key": "b", "text": "Hold for the morning"}],
                        write_in=True)
+        # open requests that sort before every other id here, so a listing's cap (50) is spent before it reaches them
+        for i in range(fillers):
+            _write_request(self.qdir, f"np-aaa-{i:04d}", f"filler {i}")
         self.port = _free_port()
         self.origin = f"http://localhost:{self.port}"
         self.pk = _Passkey("localhost")
-        self.signer = Signer(self.qdir, (NS,), "localhost", lambda: {self.pk.key.fingerprint: self.pk.key})
+        # a second enrolled passkey this browser does not hold: with no record of which it used, the page shows a pick list
+        self.other = _Passkey("localhost")
+        keys = {self.pk.key.fingerprint: self.pk.key}
+        if two_keys:
+            keys[self.other.key.fingerprint] = self.other.key
+        self.signer = Signer(self.qdir, (NS,), "localhost", lambda: dict(keys))
         self.signer.page_origin = self.origin
         (tmp_path / "allowed").write_text(f'x namespaces="{NS}" {self.pk.line}\n')
         self.allowed = tmp_path / "allowed"
@@ -110,8 +120,9 @@ class _Rig:
             read=lambda c: Read(rows=(RowIn("a", "hello", facets={"source": "bridge", "for": "cli",
                                                                    "at": "2026-10-23T11:00:00+00:00"},
                                             stored={"id": "a"}),))))
-        verb = ActionVerb(handler=lambda p: {"summary": "sent"}, label="Send to inbox", fields=("message", "for"),
-                          sign=sign)
+        self.handled: list[dict] = []
+        verb = ActionVerb(handler=lambda p: self.handled.append(dict(p)) or {"summary": "sent"}, label="Send to inbox",
+                          fields=("message", "for"), sign=sign)
         self.kw: dict[str, Any] = dict(
             cockpit=self.ck, extra_verbs={"send_inbox": verb},
             extra_effects={"send_inbox": DownstreamEffect(self.inbox, self._effect)}, surface_tokens={"browser": TOK},
@@ -127,6 +138,9 @@ class _Rig:
         rid = f"np-compose-{len(self.composed):04d}"
         _write_request(self.qdir, rid, str(params.get("message")))
         return rid
+
+    def notes(self) -> list[str]:
+        return [n["body"] for n in self.inbox.notes.values()]
 
     def _effect(self, params: Any, *, origin_key: str) -> Any:
         """The door: a send counts only when it names a request this rig filed, signed, over exactly its message."""
@@ -206,9 +220,10 @@ def test_a_signed_verb_takes_sign_request_beside_its_fields_and_an_unsigned_one_
                                                        "params": {"message": "hi", SIGN_PARAM: "np-nothing-signed"}},
                                 token=TOK)
             if sign:
-                # admitted by the kernel and refused by the door (nothing was signed): never a field refusal
-                assert out.get("error") != "field_not_allowed", (status, out)
-                assert rig.refused and not rig.applied
+                # a param the kernel admits, and then refuses: no request of that name was filed and signed (L3 r2 F2),
+                # so the door is never reached; never a field refusal
+                assert (status, out.get("error")) == (403, "sign_required"), (status, out)
+                assert not rig.refused and not rig.applied
             else:
                 assert status == 400 and out["error"] == "field_not_allowed" and SIGN_PARAM in out["message"], out
             status, out = _call(url, "/action", {"verb": "send_inbox", "confirm": True,
@@ -236,7 +251,7 @@ def test_a_compose_signer_needs_a_signer_and_a_callable(tmp_path, monkeypatch) -
 
 def test_the_compose_route_rides_the_write_gate(tmp_path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
-    body = {"verb": "send_inbox", "params": {"message": "hi"}}
+    body = {"verb": "send_inbox", "params": {"message": "hi"}, "client_txn": TXN}
     with rig.serving() as (url, _httpd):
         for token in (None, "wrong-token"):
             assert _call(url, "/cockpit/sign/compose", body, token=token)[0] == 403, token
@@ -253,13 +268,18 @@ def test_the_compose_route_rides_the_write_gate(tmp_path, monkeypatch) -> None:
 def test_the_compose_route_names_only_a_signed_verb_and_its_own_fields(tmp_path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving() as (url, _httpd):
+        t = {"client_txn": TXN}
         cases = [({"verb": "send_inbox"}, 400, "bad_request"),
                  ({"verb": "send_inbox", "params": [], "x": 1}, 400, "bad_request"),
-                 ({"verb": "no_such", "params": {}}, 404, "unknown_verb"),
-                 ({"verb": "question_answer", "params": {"option": "a"}}, 400, "not_signed"),
-                 ({"verb": "send_inbox", "params": "hi"}, 400, "bad_request"),
-                 ({"verb": "send_inbox", "params": {"message": "hi", "other": 1}}, 400, "field_not_allowed"),
-                 ({"verb": "send_inbox", "params": {"message": "hi", SIGN_PARAM: "np-compose-0001"}}, 400,
+                 # the draft's identity is required, and is an id
+                 ({"verb": "send_inbox", "params": {"message": "hi"}}, 400, "bad_request"),
+                 ({"verb": "send_inbox", "params": {"message": "hi"}, "client_txn": "short"}, 400, "bad_request"),
+                 ({"verb": "send_inbox", "params": {"message": "hi"}, "client_txn": 12345678}, 400, "bad_request"),
+                 ({"verb": "no_such", "params": {}, **t}, 404, "unknown_verb"),
+                 ({"verb": "question_answer", "params": {"option": "a"}, **t}, 400, "not_signed"),
+                 ({"verb": "send_inbox", "params": "hi", **t}, 400, "bad_request"),
+                 ({"verb": "send_inbox", "params": {"message": "hi", "other": 1}, **t}, 400, "field_not_allowed"),
+                 ({"verb": "send_inbox", "params": {"message": "hi", SIGN_PARAM: "np-compose-0001"}, **t}, 400,
                   "field_not_allowed")]
         for body, want, word in cases:
             status, out = _call(url, "/cockpit/sign/compose", body, token=TOK)
@@ -270,11 +290,12 @@ def test_the_compose_route_names_only_a_signed_verb_and_its_own_fields(tmp_path,
 def test_a_compose_signers_value_error_is_a_400_carrying_its_words_and_a_bad_id_is_a_500(tmp_path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving() as (url, httpd):
-        status, out = _call(url, "/cockpit/sign/compose", {"verb": "send_inbox", "params": {"message": "refuse me"}},
-                            token=TOK)
+        status, out = _call(url, "/cockpit/sign/compose",
+                            {"verb": "send_inbox", "params": {"message": "refuse me"}, "client_txn": TXN}, token=TOK)
         assert status == 400 and out["message"] == "the cockpit is not signing messages now", out
         httpd.compose_signer = lambda verb, params: "no good"
-        status, out = _call(url, "/cockpit/sign/compose", {"verb": "send_inbox", "params": {"message": "x"}}, token=TOK)
+        status, out = _call(url, "/cockpit/sign/compose",
+                            {"verb": "send_inbox", "params": {"message": "x"}, "client_txn": "draft-0002-bbbb"}, token=TOK)
         assert status == 500 and out["error"] == "internal", out
 
 

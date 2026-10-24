@@ -68,11 +68,12 @@ def short_dir() -> str:
 
 
 class FakeControl:
-    """CONTROL's socket: one request, one answer, `TOKEN-RESOLVE` only. Every digest resolves to session s1 and claims
-    that name this process as the front."""
+    """CONTROL's socket: `TOKEN-RESOLVE` one request, one answer, and keys' `KEYS-ATTACH` (S1 3c-3), held open and
+    answered `ok` for every later request (`SESSIONS` with nothing to drop). Every digest resolves to session s1 and
+    claims that name this process as the front."""
 
     def __init__(self, path: str) -> None:
-        self.path, self.server, self.resolves = path, None, 0
+        self.path, self.server, self.resolves, self.attaches = path, None, 0, 0
 
     async def start(self) -> None:
         self.server = await asyncio.start_unix_server(self._on, self.path)
@@ -81,6 +82,15 @@ class FakeControl:
         try:
             n = int.from_bytes(await r.readexactly(4), "big")
             req = json.loads(await r.readexactly(n))
+            if req.get("op") == "KEYS-ATTACH":
+                self.attaches += 1
+                while req is not None:
+                    extra = {"drop": []} if req.get("op") == "SESSIONS" else {}
+                    w.write(K.encode_admin({"id": req["id"], "ok": True, **extra}))
+                    await w.drain()
+                    n = int.from_bytes(await r.readexactly(4), "big")
+                    req = json.loads(await r.readexactly(n))
+                return
             self.resolves += 1
             claims = {"routes": ["r"], "incarnation": 1,
                       "front": {"uid": os.geteuid(), "pid": os.getpid(), "start": peer.start_of(os.getpid())}}
@@ -147,11 +157,14 @@ class FakeUpstream:
 
 
 class KeysProc:
-    """keys as a child process. `start()` returns once it printed its `ready` line; `kill()` is SIGKILL, `stop()` is
-    SIGTERM and waits for a clean exit."""
+    """keys as a child process. `start()` returns once it printed its `ready` line and then its `attached` one;
+    `kill()` is SIGKILL, `stop()` is SIGTERM and waits for a clean exit. `driver` and `env` (added to the child's
+    environment) let another rig run keys through its own launcher-form driver."""
 
-    def __init__(self, d: str, py: str, upstream_port: int, measure: Optional[str] = None) -> None:
+    def __init__(self, d: str, py: str, upstream_port: int, measure: Optional[str] = None,
+                 driver: str = DRIVER, env: Optional[Dict[str, str]] = None) -> None:
         self.d, self.py, self.port, self.measure = d, py, upstream_port, measure
+        self.driver, self.extra_env = driver, dict(env or {})
         self.p: Optional[subprocess.Popen] = None
         self.err: List[str] = []
         self.ready = threading.Event()
@@ -174,20 +187,21 @@ class KeysProc:
         for raw in self.p.stderr:
             line = raw.decode(errors="replace").rstrip()
             self.err.append(line)
-            if "gw-keys: ready" in line:
+            if "gw-keys: attached" in line:   # S1 3c-3: keys serves no token before its KEYS-ATTACH is answered
                 self.ready.set()
         self.exited.set()
         self.ready.set()
 
     async def start(self) -> "KeysProc":
-        env = {**os.environ, "PYTHONPATH": str(ROOT), "B2_UPSTREAM_PORT": str(self.port), "HOME": account_home()}
+        env = {**os.environ, "PYTHONPATH": str(ROOT), "B2_UPSTREAM_PORT": str(self.port), "HOME": account_home(),
+               **self.extra_env}
         if self.measure:
             env["B2_MEASURE"] = self.measure
         self.ready.clear()
         self.exited.clear()
         self.err = []
         self.p = subprocess.Popen(
-            [self.py, DRIVER, "--runtime-root", self.d, "--lib-root", self.d, "--control",
+            [self.py, self.driver, "--runtime-root", self.d, "--lib-root", self.d, "--control",
              os.path.join(self.d, "control.sock"), "--test-single-uid"],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
         threading.Thread(target=self._pump, daemon=True).start()

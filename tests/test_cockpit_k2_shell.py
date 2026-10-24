@@ -232,8 +232,7 @@ def test_panels_carry_the_subsystem_stripe_of_variant_b_and_orange_is_for_what_w
 
 # ---- L3 r1 (K2_L3r1.md): G the band's wrap line through the manifest, H the deep link after the token strip, C-F ----
 
-_FIGS = ["links", "avg strength", "max strength", "density", "local density", "episodes", "episodes since wrap", "tombstones",
-         "wraps", "graduated", "demoted"]
+_FIGS = ["episodes", "episodes since wrap", "tombstones", "wraps", "graduated", "demoted"]
 
 
 def _views(tmp_path: Path) -> dict:
@@ -402,3 +401,21 @@ def test_the_band_wrap_cap_is_the_kernels_wrap_history_limit():
 def test_the_glance_tiles_alone_ask_for_the_layout_again() -> None:
     src = (WEB / "dashboard_core.js").read_text(encoding="utf-8")
     assert re.search(r'new MutationObserver\(scheduleLayout\)\.observe\(region, \{ childList: true \}\)', src)
+
+
+def test_an_older_kernels_dark_write_path_is_read_by_the_wrap_count_never_as_unreadable(tmp_path: Path) -> None:
+    out = run_node(r"""
+const FIGS = %s;
+const mk = (word, wraps) => FIGS.map((l) => ({ label: l, value: l === "wraps" ? wraps : 1 })).concat([{ label: "write path", value: word }]);
+const st = (word, wraps) => {
+  const v = V.fromManifest(fixture({ health: head("health", "metric", "Health") }, { health: head("health", "metric", "Health", { value: { metrics: mk(word, wraps) } }) }));
+  return v.health.status + "/" + v.health.write_path_live;
+};
+out.darkWrapped = st("dark", 12);     // the old kernel said dark for ZERO LINKS on a store that has wrapped
+out.darkFresh = st("dark", 0);
+out.unreadable = st("unreadable", 12);
+out.live = st("live", 3);
+out.none = st("no wraps yet", 0);
+""" % json.dumps(_FIGS), tmp_path)
+    assert out == {"darkWrapped": "live/true", "darkFresh": "no-wraps/false", "unreadable": "unreadable/false",
+                   "live": "live/true", "none": "no-wraps/false"}, out

@@ -223,7 +223,8 @@ def test_admin_eof_kills_cached_tokens_and_fronts(monkeypatch):
             k.control_uid = os.getuid()
 
             r, w = await asyncio.open_unix_connection(admin)
-            await _send(w, 1, "RELOAD", generation=1)
+            # a RELOAD keys cannot serve is refused by name (this keys holds no route store: no lib root)
+            await _send(w, 1, "RELOAD", generation=1, item_sha256="0" * 64)
             await _send(w, 2, "FRONT-ARM", session="s-a", reg_token=1, extra=1)
             out["refusals"] = sorted([await _answer(r), await _answer(r)], key=lambda a: a["id"])
             # one session's requests run in frame order: the DROP read second runs second
@@ -265,7 +266,7 @@ def test_admin_eof_kills_cached_tokens_and_fronts(monkeypatch):
         shutil.rmtree(d, ignore_errors=True)
     print("EOF", out)
     assert out["foreign"] == b""
-    assert out["refusals"] == [{"id": 1, "ok": False, "refused": K.RELOAD_REFUSED},
+    assert out["refusals"] == [{"id": 1, "ok": False, "refused": "routemap-verifier"},
                                {"id": 2, "ok": False, "refused": "unknown-key"}]
     assert out["order"] == [3, 4] and out["after_order"] == []
     assert out["armed"] == [{"id": 5, "ok": True}, {"id": 6, "ok": True}]

@@ -101,7 +101,10 @@ def base_store_rows(host: HostOS, operator: str) -> list[Row]:
         Row(L / "lineage", "_levain_control", "levain-lineage", 0o750),
         Row(L / "keys", "_levain_keys", "_levain_keys", 0o700),
         _root(host, L / "routes", 0o755),
-        Row(L / "routes" / "dispatch", "_levain_control", "_levain_keys", 0o750),
+        # S1 3c-4: CONTROL writes the route maps here, keys reads them. Setgid, so every file CONTROL creates takes
+        # _levain_keys: on Linux a new file takes its creator's primary group (_levain_control) otherwise, and keys
+        # could read none of them. Re-applied by every setup and repair (``row_steps``: the chown, then the mode).
+        Row(L / "routes" / "dispatch", "_levain_control", "_levain_keys", 0o2750),
         Row(L / "routes" / "verifiers", "_levain_control", "_levain_control", 0o700),
     ]
 

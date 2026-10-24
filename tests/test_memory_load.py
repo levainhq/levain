@@ -427,7 +427,8 @@ def test_update_tells_what_to_remove_from_a_staged_old_memory_md(tmp_path, capsy
     lines: list[str] = []
     refresh_adapter(install, apply=True, emit=lines.append)
     text = "\n".join(lines)
-    assert "now lives in memory_workflow.md" in text and "## Hebbian associations" in text
+    assert "now lives in memory_workflow.md" in text and "## Pattern recall follows the evidence" in text
+    assert "## Hebbian associations" in text   # an older copy still carries the old heading
 
 
 # --- review round 2 --------------------------------------------------------------------------------------------

@@ -102,6 +102,38 @@ def test_sigint_takes_the_graceful_path():
         shutil.rmtree(d, ignore_errors=True)
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="keys refuses to run as root")
+def test_sigint_the_moment_front_sock_exists_takes_the_graceful_path():
+    # land3c3 CI flake (Linux 3.12): keys armed its triggers AFTER bind_listeners, so a SIGINT sent as soon as
+    # front.sock listens met Python's default handler and the child died of SIGINT (-2). Send it the moment the PATH
+    # exists (no connect), repeated: every run must end through the one close with exit 0.
+    env = {**os.environ, "PYTHONPATH": str(Path(levain.__file__).resolve().parents[1])}
+    for n in range(12):
+        d = tempfile.mkdtemp(prefix="lk", dir="/tmp")
+        try:
+            os.mkdir(os.path.join(d, "keys"))
+            front = os.path.join(d, "keys", "front.sock")
+            p = subprocess.Popen([sys.executable, "-m", "levain.broker.keys", "--runtime-root", d, "--lib-root", d,
+                                  "--control", os.path.join(d, "control.sock"), "--test-single-uid"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env,
+                                 preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+            try:
+                end = time.monotonic() + 20
+                while not os.path.exists(front):
+                    assert p.poll() is None, p.stderr.read().decode()
+                    assert time.monotonic() < end, "keys never bound front.sock"
+                p.send_signal(signal.SIGINT)
+                assert p.wait(10) == 0, f"run {n}: exit {p.returncode}"
+                err = p.stderr.read().decode()
+                assert "KeyboardInterrupt" not in err, err
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def test_shutdown_triggered_during_start_ends_keys():
     # a SIGTERM between arm_triggers() and start(): the latch's run finishes, nothing is served, the wait ends
     d = tempfile.mkdtemp(prefix="lk", dir="/tmp")

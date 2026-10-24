@@ -1379,7 +1379,7 @@
     }
     return out;
   }
-  // the Cognition header's figures, the same on both of its tabs. The write path speaks only when it is dark.
+  // the Cognition header's figures, the same on both of its tabs. The write path speaks only when it is unreadable.
   function memCogBits(view) {
     const g = view.graph, gn = g && Array.isArray(g.nodes) ? g.nodes.length : 0, ge = g && Array.isArray(g.edges) ? g.edges.length : 0;
     const listed = Array.isArray(view.wraps) ? view.wraps.length : 0, total = memWrapTotal(view);
@@ -1388,8 +1388,10 @@
     if (ws) bits.push((total === null && ws >= MEM_WRAP_CAP ? ws + "+" : String(ws)) + (ws === 1 ? " consolidation" : " consolidations"));
     if (gn) bits.push(gn + " nodes");
     if (ge) bits.push(ge + " edges");
-    // dark if either place the view can say so says so
-    if (view.write_path_live === false || (view.health && view.health.write_path_live === false)) bits.push("write path dark");
+    // the write path speaks when it cannot be read; a store with no wraps yet is not a fault. The graph says when links stopped.
+    const wst = (view.health && view.health.status) || view.write_path_status;
+    if (wst === "unreadable") bits.push("write path unreadable");
+    if (g && g.formation_off_at_wrap != null) bits.push("no new links since wrap " + g.formation_off_at_wrap);
     return bits;
   }
   function memCard(cls, title, meta, modes) {
@@ -1597,15 +1599,14 @@
     }
     const head = el("div", "kv");
     head.appendChild(el("span", "k", "write-path"));
-    const b = el("span", "badge " + (h.write_path_live ? "live" : "dark"),
-      h.write_path_live ? "LIVE" : "DARK · 0 links");
+    const st = h.status || (h.write_path_live ? "live" : "no-wraps");
+    const b = el("span", "badge " + (st === "live" ? "live" : (st === "unreadable" ? "dark" : "neutral")),
+      st === "live" ? "LIVE" : (st === "unreadable" ? "UNREADABLE" : "NO WRAPS YET"));
     const vWrap = el("span", "v"); vWrap.appendChild(b);
     head.appendChild(vWrap);
     p.appendChild(head);
 
     // a manifest source may not carry every figure: show only what was sent, never a made-up 0.00
-    kv(p, "Hebbian links", `${fmt(h.total_links)} (avg ${num(h.avg_strength).toFixed(2)}` + (h.max_strength != null ? `, max ${num(h.max_strength).toFixed(2)}` : "") + ")");
-    kv(p, "density", `${num(h.density).toFixed(3)}` + (h.local_density != null ? ` · local ${num(h.local_density).toFixed(3)}` : ""));
     kv(p, "graduations", `${fmt(h.graduations_validated_total)} validated / ${fmt(h.graduations_demoted_total)} demoted`);
     kv(p, "episodes", `${fmt(h.total_episodes)} (${fmt(h.episodes_since_wrap)} since wrap)`);
     if (h.wrap_history_unavailable) {
@@ -1639,12 +1640,25 @@
     }
     const NS = "http://www.w3.org/2000/svg";
     const W = 480, H = 170, PAD = 10;
+    // anneal stopped forming links after wrap `off`: the Links channel keeps its historical points and draws no new ones
+    // (a post-cut zero is not a measurement), and a store that never formed any has no such channel at all. The wraps list
+    // is newest-first and capped, so a row's wrap number is counted back from the authoritative total.
+    const off = view.graph && Number.isInteger(view.graph.formation_off_at_wrap) ? view.graph.formation_off_at_wrap : null;
+    const totalWraps = memWrapTotal(view);
+    // with the total unknown (health failed) the capped history cannot be numbered, so the cut cannot be placed on it
+    const wrapNo = new Map(series.map((w, k) => [w, (totalWraps !== null ? totalWraps : series.length) - k]));
+    const linkVal = (w) => num(w.associations_formed) + num(w.associations_strengthened);
     const CHANNELS = [
       { label: "Episodes", cls: "ch1", val: (w) => num(w.episodes_compressed) },
       { label: "Graduations", cls: "ch2", val: (w) => num(w.graduations_validated) },
-      { label: "Links", cls: "ch3",
-        val: (w) => num(w.associations_formed) + num(w.associations_strengthened) },
     ];
+    let noteTail = "";
+    if (off === null) CHANNELS.push({ label: "Links", cls: "ch3", val: linkVal });
+    else if (totalWraps === null) noteTail = " · links not drawn — wrap numbers unknown";
+    else if (series.some((w) => wrapNo.get(w) <= off && linkVal(w) > 0)) {
+      CHANNELS.push({ label: "links (formation off since wrap " + off + ")", cls: "ch3", val: linkVal,
+        drawn: (w) => wrapNo.get(w) <= off });
+    }
 
     // the instrument's read-side controls — the first real metal on the deck
     // (no-theater: both verbs act on the instrument NOW; write-side knobs land
@@ -1689,12 +1703,23 @@
         // off-grid (num() lets negatives through). gain floors at 1 to avoid /0, but
         // the legend reports the TRUE max so the calibration stays honest. [codex MED]
         const vals = wraps.map((w) => Math.max(0, ch.val(w)));
-        const actualMax = Math.max(0, ...vals);
+        const live = wraps.map((w) => !ch.drawn || ch.drawn(w));   // false: a wrap this channel no longer measures
+        const shown = vals.filter((_v, i) => live[i]);
+        const actualMax = Math.max(0, ...shown);
         const gain = Math.max(1, actualMax);
         const pts = vals
-          .map((v, i) => `${X(i).toFixed(1)},${(H - PAD - (v / gain) * (H - 2 * PAD)).toFixed(1)}`)
+          .map((v, i) => (live[i] ? `${X(i).toFixed(1)},${(H - PAD - (v / gain) * (H - 2 * PAD)).toFixed(1)}` : null))
+          .filter((x) => x !== null)
           .join(" ");
-        for (const layer of ["trace-glow", "trace-core"]) {
+        if (shown.length === 1) {
+          // a one-point polyline draws nothing: a lone sample is a visible point
+          const m = pts.split(",");
+          const dot = document.createElementNS(NS, "circle");
+          dot.setAttribute("cx", m[0]); dot.setAttribute("cy", m[1]); dot.setAttribute("r", "3");
+          dot.setAttribute("class", `trace-dot ${ch.cls}`);
+          svg.appendChild(dot);
+        }
+        for (const layer of (pts && shown.length > 1 ? ["trace-glow", "trace-core"] : [])) {
           const pl = document.createElementNS(NS, "polyline");
           pl.setAttribute("points", pts);
           pl.setAttribute("class", `${layer} ${ch.cls}`);
@@ -1704,7 +1729,7 @@
         }
         const chip = el("button", `scope-ch ${ch.cls}`);
         chip.appendChild(el("span", "scope-ch-l", ch.label));
-        chip.appendChild(el("span", "scope-ch-v", `${fmt(vals[vals.length - 1])} · max ${fmt(actualMax)}`));
+        chip.appendChild(el("span", "scope-ch-v", shown.length ? `${fmt(shown[shown.length - 1])} · max ${fmt(actualMax)}` : "no samples"));
         chip.type = "button";
         chip.title = "solo this channel (click again for all)";
         chip.setAttribute("aria-pressed", solo === ch.cls ? "true" : "false");
@@ -1717,7 +1742,7 @@
         legend.appendChild(chip);
       }
       scopeBox.replaceChildren(svg);
-      note.textContent = `oldest → newest`;   // the consolidation / node / edge counts are the card's header line (composeMemory)
+      note.textContent = "oldest → newest" + noteTail;  // the consolidation / node / edge counts are the card's header line (composeMemory)
     }
 
     p.appendChild(wrap);
@@ -2435,7 +2460,8 @@
       row.appendChild(el("span", "tier", datePart(w.wrapped_at)));
       row.appendChild(el("span", "clause",
         `${fmt(num(w.graduations_validated))}↑ / ${fmt(num(w.graduations_demoted))}↓ grad · ` +
-        `+${fmt(num(w.associations_formed))} links · ${fmt(num(w.continuity_chars))} chars`));
+        (num(w.associations_formed) ? `+${fmt(num(w.associations_formed))} links · ` : "") +
+        `${fmt(num(w.continuity_chars))} chars`));
       // digest-delta: how much the projection grew/shrank vs the previous (older)
       // regeneration — list is newest-first, so the older wrap is the next index.
       const older = list[i + 1];
@@ -3856,15 +3882,20 @@
 
     // A signed verb (spec.sign, DESIGN_SIGN D5) is posted only after the operator's passkey signed exactly these params
     // (signedCompose), with `sign_request` added; anything short of a signed result posts nothing, and the draft stays until
-    // a signed send lands (the board's rebuild after it is what clears the box). Any other verb posts as it always has.
+    // a signed send lands (the board's rebuild after it is what clears the box). The draft's one identity (its `txn`) keys
+    // the post, never the request it names: a lost answer retried, or retried after a reload, replays the first send. A
+    // definite refusal (a 4xx) forgets the draft's request, so the next send files and signs again; an answer that never
+    // came keeps it. Any other verb posts as it always has.
     const fire = async (params, confirm, key) => {
       if (!spec.sign) return commitAction(action.verb, params, confirm, key, action.panel);
       const say = (t, k) => { msg.className = "edit-msg" + (k === "bad" ? " err" : k === "ok" ? "" : " busy"); msg.textContent = t; };
-      const s = await signedCompose(action.verb, params, say, row);
+      const s = await signedCompose(action.verb, action.panel, params, say, row);
       if (!s.ok) return { ok: false, error: "unsigned", message: s.message };
       const signed = Object.assign({}, params, { sign_request: s.request });
-      const res = await commitAction(action.verb, signed, confirm, keyForSend(signed), action.panel);
-      if (res && res.ok) signedComposeDone(action.verb);
+      const res = await commitAction(action.verb, signed, confirm, "sign-" + s.txn, action.panel, s.txn);
+      if ((res && res.ok) || (res && typeof res.status === "number" && res.status >= 400 && res.status < 500)) {
+        signDraftDrop(action.verb, action.panel, params);
+      }
       return res;
     };
     go.addEventListener("click", () => {
@@ -4538,6 +4569,8 @@
   const SIGN_USABLE = window.isSecureContext === true && typeof window.PublicKeyCredential === "function"
     && !!(navigator.credentials && navigator.credentials.get);
   const SIGN_NO_TOKEN = "this page carries no token, so the sign request is not shown";
+  const SIGN_PICK_CLOSED = "the passkey pick was closed when the card was drawn again; nothing was signed";
+  const SIGN_BUSY = "a signature is already being asked for; nothing was signed here";
   const signB64u = (buf) => btoa(String.fromCharCode.apply(null, new Uint8Array(buf)))
     .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   const signUnb64u = (t) => Uint8Array.from(atob(t.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((t.length + 3) % 4)),
@@ -4589,6 +4622,21 @@
     got.then((b) => { if (b.error && signListed && signListed.got === got) signListed = null; });
     return got;
   }
+  // ONE request by its id, whatever the listing's cap: {request, signers, origin, note}, {request: null} when it is not
+  // open (answered, denied, expired or gone), or {error}
+  function signOne(id) {
+    const headers = signHeaders(false);
+    if (!headers["X-Levain-Write-Token"]) return Promise.resolve({ error: SIGN_NO_TOKEN });
+    return fetchBounded("/cockpit/sign/" + encodeURIComponent(id) + ".json", { cache: "no-store", headers: headers }, (res) => {
+      // the route answers `not_open` for a request it read and found closed; a 404 without it is no signing at all
+      if (res.status === 404) return res.json().then((b) => (b && b.error === "not_open" ? { request: null } : { error: "this cockpit hosts no signing" }),
+                                                     () => ({ error: "this cockpit hosts no signing" }));
+      if (res.status === 403) return { error: "this page's token was not accepted, so the sign request is not shown" };
+      if (!res.ok) return { error: "the sign request could not be read (HTTP " + res.status + ")" };
+      return res.json().then((b) => (b && typeof b === "object" && b.request && typeof b.request === "object" ? b : { error: "the sign request could not be read" }),
+                             () => ({ error: "the sign request could not be read" }));
+    }, () => ({ error: "the sign request could not be read (network)" }));
+  }
   // the one page this cockpit signs on, or "" when the listing names none; a page anywhere else cannot run the ceremony
   const signElsewhere = (listing) => (!SIGN_USABLE || typeof listing.origin !== "string" || listing.origin !== window.location.origin);
   const signWhere = (listing) => "sign on " + (typeof listing.origin === "string" && listing.origin ? listing.origin : "the cockpit's https page")
@@ -4633,7 +4681,8 @@
   }
   // Which passkey signs: the one this browser used before, else the only one enrolled; with several and no record, the
   // person picks (buttons put into `host`, the phone's pick list). Resolves {fp, rawId}, or null when the pick was dismissed
-  // by its dismiss button. The pick holds `signBusy` like a ceremony.
+  // by its dismiss button; rejects (an AbortError) when a redraw took `host` off the page with the pick still open, so the
+  // caller's `signBusy` is released on every path. The pick holds `signBusy` like a ceremony.
   function signWho(listing, host, say) {
     const signers = Array.isArray(listing.signers) ? listing.signers : [];
     const rp = (listing.origin || "").replace(/^https?:\/\//, "").replace(/:\d+$/, "");
@@ -4643,19 +4692,28 @@
     if (!known.length && signers.length === 1) return Promise.resolve({ fp: signers[0], rawId: null });
     const choices = known.length ? known : signers;
     say("more than one passkey is enrolled for this name; pick the one this device holds:");
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const picks = [];
+      // a panel refetch that replaces the card detaches these buttons, and nothing could ever press them again
+      const watch = setInterval(() => {
+        if (host.isConnected) return;
+        end();
+        const e = new Error("the passkey pick was closed when the card was drawn again");
+        e.name = "AbortError";
+        reject(e);
+      }, 250);
+      const end = () => { clearInterval(watch); picks.forEach((x) => x.remove()); };
       for (const fp of choices) {
         const p = el("button", "undo-btn sign-pick", fp.slice(0, 18) + "…");
         p.type = "button";
         p.title = fp;
-        p.addEventListener("click", () => { picks.forEach((x) => x.remove()); resolve({ fp: fp, rawId: known.length ? local[fp] : null }); });
+        p.addEventListener("click", () => { end(); resolve({ fp: fp, rawId: known.length ? local[fp] : null }); });
         picks.push(p);
         host.appendChild(p);
       }
       const no = el("button", "undo-btn sign-pick", "dismiss");
       no.type = "button";
-      no.addEventListener("click", () => { picks.forEach((x) => x.remove()); say("no passkey was picked; nothing was signed", "bad"); resolve(null); });
+      no.addEventListener("click", () => { end(); say("no passkey was picked; nothing was signed", "bad"); resolve(null); });
       picks.push(no);
       host.appendChild(no);
     });
@@ -4667,10 +4725,14 @@
     const note = el("div", "sign-note ext-meta", "reading the sign request…");
     wrap.appendChild(note);
     const show = (text, kind) => { note.textContent = text; note.className = "sign-note ext-meta" + (kind ? " sign-" + kind : ""); };
-    signListing(false).then((listing) => {
+    signListing(false).then(async (listing) => {
       if (listing.error) return show(listing.error, "bad");
       if (signElsewhere(listing)) return show(signWhere(listing), "bad");
-      const r = listing.requests.find((x) => x && x.id === id);
+      // a listing stops at its cap: a request it does not name is read by its own id before it is called closed
+      const listed = listing.requests.find((x) => x && x.id === id);
+      const one = listed ? { request: listed } : await signOne(id);
+      if (one.error) return show(one.error, "bad");
+      const r = one.request;
       const kept = signNotes.get(id);
       if (!r) {
         // answered here: its signed line stays until the row itself leaves; else it was answered, denied or expired elsewhere
@@ -4689,23 +4751,38 @@
       const lock = (on) => { for (const b of buttons) b.disabled = on || !signers.length; };
       let freeze = null;      // the write-in's frozen state while its ceremony runs (set below when it offers one)
       const run = (choice, words) => {
-        if (signBusy) return;
+        if (signBusy) return say(SIGN_BUSY, "bad");   // the lease holds a second tap, never a button drawn disabled
         signBusy++;
         lock(true);
-        signWho(Object.assign({}, listing, { signers: signers }), acts, say).then((who) => (who ? signCeremony(r, who.fp, who.rawId, choice, words, say) : { done: "unsigned" }))
-          .then((out) => {
-            if (out.done !== "unsigned") { signWriteIns.delete(id); return out; }
-            if (freeze) freeze.release();
-            return out;
+        let done = "unsigned";
+        signWho(Object.assign({}, listing, { signers: signers }), acts, say)
+          .then((who) => (who ? signCeremony(r, who.fp, who.rawId, choice, words, say) : { done: "unsigned" }),
+                () => { say(SIGN_PICK_CLOSED, "bad"); return { done: "unsigned" }; })
+          // a ceremony that threw (past its own catch) may have sent the answer: "not sure", which reads the request
+          // again below and releases a write-in's words only if it is still open
+          .catch((e) => {
+            say("not sure this was signed (the page failed: " + ((e && e.name) || "error") + "): check the list", "bad");
+            return { done: "unsure" };
           })
+          .then((out) => {
+            done = out.done;
+            // only a signature spends the words. "Not sure" keeps them, frozen until a read of the request by its id
+            // shows it still open (so nothing was signed); a request no longer open keeps them frozen, and a redrawn
+            // card offers them again only if it is still open
+            if (out.done === "signed") { signWriteIns.delete(id); return undefined; }
+            if (out.done === "unsigned") { if (freeze) freeze.release(); return undefined; }
+            return signOne(id).then((one) => { if (one.request && one.request.sha256 === r.sha256 && freeze) freeze.release(); });
+          })
+          .catch(() => { /* the ceremony said what happened; the lease is released below */ })
           .finally(() => {
             signBusy--;
             for (const p of acts.querySelectorAll(".sign-pick")) p.remove();
             lock(false);
             signListed = null;
-            // a signed (or not-knowable) answer leaves the request open no longer: the board's next read redraws the card
+            // a signed (or not-knowable) answer may have closed the request: the board reads again (a row its caller has
+            // answered leaves). A definite "nothing was signed" changed nothing, so nothing is read again under the operator
             const t = window.LevainCockpitTransport;
-            if (t && typeof t.reload === "function") setTimeout(() => t.reload(), 1500);
+            if (done !== "unsigned" && t && typeof t.reload === "function") setTimeout(() => t.reload(), 1500);
           });
       };
       const options = Array.isArray(r.options) ? r.options : [];
@@ -4741,7 +4818,7 @@
         // unfreezes them, so a retry is a new tap over the same words
         freeze = { release: () => { box.readOnly = box.disabled = false; } };
         b.addEventListener("click", () => {
-          if (signBusy) return;
+          if (signBusy) return say(SIGN_BUSY, "bad");
           const w = box.value.trim();
           if (!w) return say("type your answer first", "bad");
           box.value = w;
@@ -4752,7 +4829,7 @@
         buttons.push(b);
         acts.append(box, b);
       }
-      lock(signBusy > 0);
+      lock(false);
       wrap.appendChild(acts);
       if (options.length) {
         const lines = el("div", "sign-lines ext-meta", "an option signs the request's message with its line appended:");
@@ -4765,68 +4842,126 @@
   }
 
   // A signed verb's send (ActionVerb.sign): the server's compose_signer files a sign request for exactly these params, the
-  // passkey signs it, and only then does the caller post the verb with `sign_request`. Resolves {ok: true, request} or
-  // {ok: false, message}; nothing here clears a draft. A request this send already filed (or signed) for the same params is
-  // reused, so a cancelled passkey or a failed post is retried without filing again.
-  const composeSigned = Object.create(null);   // verb -> {key, request, signed}
-  async function signedCompose(verb, params, say, host) {
-    const listing = await signListing(true);
-    if (listing.error) { say(listing.error, "bad"); return { ok: false, message: listing.error }; }
-    if (signElsewhere(listing)) {
-      const m = signWhere(listing) + "; nothing was sent, and your draft is kept";
-      say(m, "bad");
-      return { ok: false, message: m };
+  // passkey signs it, and only then does the caller post the verb with `sign_request`. Resolves {ok: true, request, txn} or
+  // {ok: false, message}; nothing here clears a draft.
+  //
+  // A signed draft has ONE identity for its whole life, its `txn`: minted the first time those words are sent from that
+  // panel's compose box and kept with them in this tab's session storage (it survives a reload; a page without storage keeps it
+  // for this page only). The compose route answers the same request for the same txn while that request is open, so a
+  // lost reply, a retry or a reload files one request, and the verb post is keyed by the txn (see `fire`), never by the
+  // request it names. A signed request is remembered as signed until the send lands or is refused outright.
+  const SIGN_DRAFTS = "levain-signed-drafts";
+  const SIGN_DRAFT_TTL_MS = 24 * 3600 * 1000;   // a draft's identity outlives any request filed for it (they expire sooner)
+  let signDraftsMem = {};                         // the same records, for this page, when session storage is absent
+  const signCanon = (v) => (Array.isArray(v) ? "[" + v.map(signCanon).join(",") + "]"
+    : v && typeof v === "object" ? "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + signCanon(v[k])).join(",") + "}"
+    : JSON.stringify(v === undefined ? null : v));
+  const signDraftKey = (verb, panel, params) => signCanon([verb, panel || null, params]);
+  function signDrafts() {
+    let stored = null;
+    try { stored = JSON.parse(window.sessionStorage.getItem(SIGN_DRAFTS) || "{}"); } catch (e) { stored = null; }
+    const o = Object.assign({}, signDraftsMem, stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {});
+    const now = Date.now();
+    for (const k of Object.keys(o)) {
+      const d = o[k];
+      if (!d || typeof d !== "object" || typeof d.txn !== "string" || typeof d.at !== "number" || now - d.at > SIGN_DRAFT_TTL_MS) delete o[k];
     }
-    const key = JSON.stringify([verb, params]);
-    let st = composeSigned[verb] && composeSigned[verb].key === key ? composeSigned[verb] : null;
-    if (st && st.signed) return { ok: true, request: st.request };
-    let rows = listing.requests;
-    let r = st ? rows.find((x) => x && x.id === st.request && !x.refused) : null;
-    if (!r) {
-      say("asking the cockpit to file this for your signature…");
-      const c = await signCall("/cockpit/sign/compose", { verb: verb, params: params });
-      if (!c.ok) {
-        // the route itself absent (no compose_signer) is "not_found"; any other refusal carries the server's words
-        const m = c.status === 404 && (!c.body.error || c.body.error === "not_found")
-          ? "this cockpit cannot sign messages; nothing was sent" : "not sent: " + signWhy(c);
-        say(m, "bad");
-        return { ok: false, message: m };
-      }
-      st = composeSigned[verb] = { key: key, request: String(c.body.request || ""), signed: false };
-      const again = await signListing(true);
-      rows = Array.isArray(again.requests) ? again.requests : [];
-      r = rows.find((x) => x && x.id === st.request && !x.refused);
-      if (!r) {
-        const m = "the sign request was filed but is not listed; nothing was sent, send again";
-        say(m, "bad");
-        return { ok: false, message: m };
-      }
-      listing.signers = again.signers;
-      listing.note = again.note;
-    }
-    const signers = Array.isArray(r.signers) ? r.signers : [];
-    if (!signers.length) {
-      const m = (listing.note || "no passkey is enrolled for this name") + "; nothing was sent";
-      say(m, "bad");
-      return { ok: false, message: m };
-    }
-    if (signBusy) return { ok: false, message: "a signature is already being asked for" };
+    return o;
+  }
+  function signDraftsSave(o) {
+    signDraftsMem = o;
+    try { window.sessionStorage.setItem(SIGN_DRAFTS, JSON.stringify(o)); } catch (e) { /* kept for this page only */ }
+  }
+  function signNewTxn() {
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") return window.crypto.randomUUID();
+      const a = new Uint8Array(16);
+      window.crypto.getRandomValues(a);
+      return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
+    } catch (e) { return "txn-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 12); }
+  }
+  // the draft's record {txn, request, signed, at}, minted on its first send
+  function signDraft(verb, panel, params) {
+    const o = signDrafts();
+    const k = signDraftKey(verb, panel, params);
+    if (!o[k]) { o[k] = { txn: signNewTxn(), request: "", signed: false, at: Date.now() }; signDraftsSave(o); }
+    return o[k];
+  }
+  function signDraftSet(verb, panel, params, patch) {
+    const o = signDrafts();
+    const k = signDraftKey(verb, panel, params);
+    if (o[k]) { Object.assign(o[k], patch); signDraftsSave(o); }
+  }
+  // the send landed, or was refused outright: the next send of these words is a new draft (a new request, a new key)
+  function signDraftDrop(verb, panel, params) {
+    const o = signDrafts();
+    delete o[signDraftKey(verb, panel, params)];
+    signDraftsSave(o);
+  }
+  async function signedCompose(verb, panel, params, say, host) {
+    // the lease is held from before the compose write, so a second send (a double click, a second box) files nothing
+    if (signBusy) return { ok: false, message: "a signature is already being asked for; nothing was sent" };
     signBusy++;
     let last = "";
     const tell = (t, k) => { last = t; say(t, k); };
+    const kept = "; nothing was sent, and your draft is kept";
     try {
-      const who = await signWho(Object.assign({}, listing, { signers: signers }), host, tell);
-      if (!who) return { ok: false, message: last + "; nothing was sent, and your draft is kept" };
+      const listing = await signListing(true);
+      if (listing.error) { tell(listing.error, "bad"); return { ok: false, message: listing.error }; }
+      if (signElsewhere(listing)) {
+        const m = signWhere(listing) + kept;
+        tell(m, "bad");
+        return { ok: false, message: m };
+      }
+      const d = signDraft(verb, panel, params);
+      if (d.signed && d.request) return { ok: true, request: d.request, txn: d.txn };
+      tell("asking the cockpit to file this for your signature…");
+      const c = await signCall("/cockpit/sign/compose", { verb: verb, params: params, client_txn: d.txn });
+      if (!c.ok) {
+        // the route itself absent (no compose_signer) is "not_found"; any other refusal carries the server's words. The
+        // draft keeps its identity: a compose whose reply was lost is answered with the same request next time
+        const m = c.status === 404 && (!c.body.error || c.body.error === "not_found")
+          ? "this cockpit cannot sign messages; nothing was sent" : "not sent: " + signWhy(c);
+        tell(m, "bad");
+        return { ok: false, message: m };
+      }
+      const rid = String(c.body.request || "");
+      signDraftSet(verb, panel, params, { request: rid });
+      // read by its id: a listing past its cap would not name it
+      const one = await signOne(rid);
+      if (one.error || !one.request) {
+        const m = (one.error || "the sign request was filed but is not open") + kept;
+        tell(m, "bad");
+        return { ok: false, message: m };
+      }
+      const r = one.request;
+      if (r.refused) {
+        const m = "not signable: " + r.refused + kept;
+        tell(m, "bad");
+        return { ok: false, message: m };
+      }
+      const signers = Array.isArray(r.signers) ? r.signers : [];
+      if (!signers.length) {
+        const m = (one.note || listing.note || "no passkey is enrolled for this name") + kept;
+        tell(m, "bad");
+        return { ok: false, message: m };
+      }
+      let who;
+      try { who = await signWho(Object.assign({}, listing, { signers: signers }), host, tell); }
+      catch (e) { tell(SIGN_PICK_CLOSED, "bad"); return { ok: false, message: SIGN_PICK_CLOSED + kept }; }
+      if (!who) return { ok: false, message: last + kept };
       const out = await signCeremony(r, who.fp, who.rawId, undefined, undefined, tell);
-      if (out.done === "signed") { st.signed = true; return { ok: true, request: st.request }; }
-      return { ok: false, message: last + (out.done === "unsure" ? "" : "; nothing was sent, and your draft is kept") };
+      if (out.done === "signed") {
+        signDraftSet(verb, panel, params, { signed: true });
+        return { ok: true, request: rid, txn: d.txn };
+      }
+      return { ok: false, message: last + (out.done === "unsure" ? "" : kept) };
     } finally {
       signBusy--;
       for (const p of host.querySelectorAll(".sign-pick")) p.remove();
       signListed = null;
     }
   }
-  function signedComposeDone(verb) { delete composeSigned[verb]; }
 
   // ---- The Needs-you strip (K4, F4 a / F11 a) ----
   // What waits on the operator, drawn as cards under the now band: each PENDING consent request and each OPEN question of the

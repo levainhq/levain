@@ -42,7 +42,7 @@ The consolidate is anneal's three-beat move, and we COMPOSE with anneal's API (n
      stronger one per-wrap when the operator wants a higher-quality wrap, WITHOUT giving up the
      sovereign default.
   3. ``validated_save_continuity(store, text, wrap_token=…, crystal_store=…, allow_shrink=False)`` —
-     the gated efferent write: structure-validate → graduation → save → Hebbian → decay. FAIL-CLOSED:
+     the gated efferent write: structure-validate → graduation → save. FAIL-CLOSED:
      a malformed compose (a weak model dropping a required section or mis-citing episodes) RAISES and
      leaves the wrap in progress — a broken identity is never written. We then cancel it so a plain
      re-run works; the frozen episodes stay visible to the next wrap (``wrap_cancelled`` records no
@@ -163,6 +163,12 @@ def _unlock_wrap(handle: "int | None | object") -> None:
             os.close(handle)
         except OSError:
             pass
+
+
+AFFECT_DEPRECATED = (  # printed once by `levain wrap` (cli.py) when either flag was given
+    "levain wrap: --affect-tag / --affect-intensity are deprecated and ignored (anneal no longer tags "
+    "associations); the consolidate is unchanged."
+)
 
 
 def _wrap_in_progress(store: object) -> bool:
@@ -682,7 +688,6 @@ def _consolidate(
             prepare_wrap,
             validated_save_continuity,
         )
-        from anneal_memory.types import AffectiveState
 
         from levain.manifest import ANNEAL_SESSION_ID
     except ImportError as exc:  # anneal-memory is a BASE dep, so this is a broken install
@@ -961,11 +966,8 @@ def _consolidate(
 
         # SAVE — the gated efferent write. FAIL-CLOSED: validated_save_continuity REFUSES (raises) a
         # malformed neocortex BEFORE writing, so a broken identity is never persisted.
-        affective = (
-            AffectiveState(tag=affect_tag, intensity=affect_intensity)
-            if affect_tag and affect_tag.strip()
-            else None
-        )
+        # The affect flags are a deprecated pass-through: anneal no longer tags associations, so the state is
+        # never built or sent. The one line saying so is printed at argument handling (cli.py), before any compose.
         # Read while OUR wrap is open (nothing else can complete a wrap now except by clearing ours
         # first), immediately before the save. Read before `prepare_wrap` it raced an ordinary peer
         # wrap completing in the gap, and a plain refused compose then looked like a peer's commit.
@@ -976,7 +978,6 @@ def _consolidate(
                 neocortex,
                 wrap_token=wrap_token,
                 crystal_store=crystal,
-                affective_state=affective,
                 allow_shrink=False,
                 session_id=session_id,
             )
@@ -1233,10 +1234,8 @@ def _report(saved: Mapping[str, object], entity_dir: Path) -> None:
         f"  graduations:  {saved.get('graduations_validated')} validated, "
         f"{saved.get('graduations_demoted')} demoted"
     )
-    print(
-        f"  associations: {saved.get('associations_formed')} formed, "
-        f"{saved.get('associations_strengthened')} strengthened"
-    )
+    if saved.get("wrap_id") is not None:   # anneal >= 1.0.2 names the wrap the save committed
+        print(f"  wrap:         #{saved.get('wrap_id')}")
     print(
         f"\n  {entity_dir.name}'s memory consolidated — a fresh `levain run` now boots on this "
         "State/Context and recalls any crystallized patterns as they graduate."
