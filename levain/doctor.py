@@ -30,6 +30,7 @@ import re
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tomllib
@@ -349,59 +350,82 @@ def _check_consent_limits() -> list[CheckResult]:
 # --- agent-session isolation: rows over facts root already writes (S1 session 6a) ---------------------------------
 
 _SLOT_USABLE = ("leased", "scrubbed", "reusable")
+_SLOT_RECORD_CAP = 1 << 16
+#: The pool's configured class -> the slot class it counts (L/policy/pool: ``slots`` egress, ``verifier_slots`` none).
+_POOL_CLASSES = (("egress", "e", "egress"), ("verifier", "v", "none"))
 
 
-def _slot_read(path: Path) -> tuple[bytes | None, str | None]:
-    """(bytes, None); (None, None) when the file is absent; (None, why) when it exists but cannot be read."""
-    try:
-        return path.read_bytes(), None
-    except FileNotFoundError:
-        return None, None
-    except PermissionError:
-        return None, "permission denied for your account"
-    except OSError as exc:
-        return None, f"{type(exc).__name__}: {exc}"
+def _slot_why(exc: BaseException) -> str:
+    if isinstance(exc, PermissionError):
+        return "permission denied for your account"
+    name = getattr(exc, "name", None)
+    return f"{name}: {getattr(exc, 'detail', '')}".rstrip(": ") if name else f"{type(exc).__name__}: {exc}"
+
+
+def _read_slot_dirs(slots: Path) -> dict[str, tuple[str, str]]:
+    """tag -> (kind, why): kind is the state of an in-service slot, ``retired`` (a tombstone), ``nostate`` (the helper's
+    own reading: in service) or ``bad`` (not usable, ``why`` says why). Names and links are judged as the runtime
+    helper judges them: a canonical tag naming a real directory, a state file that is a regular file naming this slot."""
+    from levain.slot import Refused
+    from levain.slot import records as R
+    from levain.slot.ids import SlotId
+
+    out: dict[str, tuple[str, str]] = {}
+    for name in sorted(os.listdir(slots)):
+        if len(name) < 2 or name[0] not in "ev" or not name[1:].isdigit() or str(int(name[1:])) != name[1:] \
+                or int(name[1:]) >= 64:
+            continue
+        d = slots / name
+        if not stat.S_ISDIR(os.lstat(d).st_mode):
+            continue      # a link or a file: the runtime does not count it as a slot either
+        want = SlotId("egress" if name[0] == "e" else "none", int(name[1:]))
+        try:
+            data = R.read_record(d / "state", max_bytes=_SLOT_RECORD_CAP)
+        except (Refused, OSError) as exc:
+            out[name] = ("bad", f"state unreadable: {_slot_why(exc)}")
+            continue
+        if data is None:
+            out[name] = ("nostate", "")
+            continue
+        try:
+            rec = R.parse_slot_state(data)
+        except Exception as exc:  # noqa: BLE001 - a state file that does not parse is a slot that is not usable
+            out[name] = ("bad", f"state does not parse ({type(exc).__name__})")
+            continue
+        if rec.slot != want:
+            out[name] = ("bad", f"state names {rec.slot.tag}")
+        else:
+            out[name] = (rec.state, "")
+    return out
 
 
 def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
                           free_bytes: Any = None) -> list[CheckResult]:
     """Read-only rows over the isolation install's facts the OPERATOR can read (doctor runs as the operator): the
-    slots' state files (root:root 0644 in 0755 dirs) and the store volume's free space. Nothing is leased, probed or run as a slot user. A fact that is not there is a
-    neutral line; one that is there but unreadable is said as unreadable, never as healthy."""
-    from levain.slot import layout
+    pool's configured counts (``policy/pool``), the slots' state files (root-owned 0644 in 0755 dirs; the group is
+    ``wheel`` on macOS) and the store volume's free space. Nothing is leased, probed or run as a slot user. A fact that
+    is not there is said as not there, one that cannot be read as unreadable, never as healthy; no read here can
+    abort the doctor. Retired slot directories are tombstones (replenish never removes them): they are never counted."""
+    from levain.slot import Refused, layout
     from levain.slot import records as R
     from levain.slot.end import V5_FLOOR_BYTES
 
     if host is None:
         host = "darwin" if sys.platform == "darwin" else "linux"
     store = store if store is not None else layout.STORE.get(host)
-    if store is None or not (store / "slots").is_dir():
-        return [CheckResult("agent sessions", True, "not installed (sudo levain setup-isolation --agent)",
-                            neutral=True)]
-    rows: list[CheckResult] = []
-
-    states: dict[str, str] = {}
-    for d in sorted((store / "slots").iterdir()):
-        if not (len(d.name) > 1 and d.name[0] in "ev" and d.name[1:].isdigit() and d.is_dir()):
-            continue
-        data, _why = _slot_read(d / "state")
-        try:
-            states[d.name] = R.parse_slot_state(data).state if data is not None else "missing"
-        except Exception:  # noqa: BLE001 - a state file that does not parse is a slot that is not usable
-            states[d.name] = "unreadable"
-    usable = sum(1 for v in states.values() if v in _SLOT_USABLE)
-    if not states:
-        rows.append(CheckResult("agent slots", False, "no slots are configured",
-                                "Run `sudo levain setup-isolation repair`."))
-    elif usable < len(states):
-        bad = ", ".join(f"{k} ({v})" for k, v in states.items() if v not in _SLOT_USABLE)
-        rows.append(CheckResult("agent slots", False, f"{usable} of {len(states)} usable; not usable: {bad}",
-                                "Restore with `sudo levain setup-isolation replenish`."))
-    else:
-        rows.append(CheckResult("agent slots", True, f"{usable} of {len(states)} usable"))
+    try:
+        if store is None or not store.is_dir():
+            return [CheckResult("agent sessions", True, "not installed", neutral=True)]
+        if not (store / "slots").is_dir():
+            return [CheckResult("agent sessions", False, f"partially installed: no slots directory at {store}",
+                                "The isolation install is incomplete; its install helper repairs it.")]
+        rows = _slot_rows(store, layout, R, Refused)
+    except OSError as exc:
+        rows = [CheckResult("agent slots", True, f"could not be read ({_slot_why(exc)})", warn=True)]
 
     try:
-        free = (free_bytes or (lambda p: (lambda v: v.f_bavail * v.f_frsize)(os.statvfs(p))))(store)
+        free = (free_bytes if free_bytes is not None
+                else (lambda p: (lambda v: v.f_bavail * v.f_frsize)(os.statvfs(p))))(store)
     except OSError as exc:
         rows.append(CheckResult("agent store free space", True, f"could not be read ({exc})", warn=True))
     else:
@@ -414,6 +438,41 @@ def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
         else:
             rows.append(CheckResult("agent store free space", True, f"{gib:.1f} GiB free"))
     return rows
+
+
+def _slot_rows(store: Path, layout: Any, R: Any, Refused: Any) -> list[CheckResult]:
+    """The ``agent slots`` row: in-service usable slots per class against ``policy/pool``'s counts."""
+    try:
+        raw = R.read_record(store / "policy" / "pool", max_bytes=_SLOT_RECORD_CAP)
+        want = layout.parse_pool_config(raw) if raw is not None else None
+    except (Refused, OSError) as exc:
+        return [CheckResult("agent slots", False, f"the pool configuration cannot be read ({_slot_why(exc)})",
+                            f"Look at {store / 'policy' / 'pool'}.")]
+    found = _read_slot_dirs(store / "slots")
+    live = {t: v for t, v in found.items() if v[0] != "retired"}
+    tombs = sorted(t for t, v in found.items() if v[0] == "retired")
+    usable = {t for t, v in live.items() if v[0] in _SLOT_USABLE or v[0] == "nostate"}
+    bad = [f"{t} ({v[1] or v[0]})" for t, v in live.items() if t not in usable]
+    note = (f"; {len(tombs)} retired, not counted" if tombs else "")
+    if want is None:
+        n = len(usable)
+        return [CheckResult("agent slots", n > 0 and not bad,
+                            f"{n} usable, no pool configuration to judge against"
+                            + (f"; not usable: {', '.join(bad)}" if bad else "") + note,
+                            "The pool configuration (policy/pool) is missing; replenish refuses without it.")]
+    short = []
+    for (_label, prefix, _cls), need in zip(_POOL_CLASSES, want):
+        have = sum(1 for t in usable if t[0] == prefix)
+        if have < need:
+            short.append(f"{_label} {have} of {need}")
+    total = sum(want)
+    detail = f"{len(usable)} usable of {total} required"
+    if short:
+        return [CheckResult("agent slots", False, f"{detail}; short: {', '.join(short)}"
+                            + (f"; not usable: {', '.join(bad)}" if bad else "") + note,
+                            "The pool is below its configured counts; its install helper replenishes it.")]
+    return [CheckResult("agent slots", True, detail + (f"; not usable (extra): {', '.join(bad)}" if bad else "")
+                        + note)]
 
 
 def _check_host_awake() -> list[CheckResult]:
