@@ -289,3 +289,68 @@ def test_with_the_desk_marked_no_group_label_or_conflict_chip_sits_on_the_lifted
         out = _run(tmp_path, src, [*PRIME, {"eval": _paint(v, "agents")}, WAIT, {"eval": probe}], first=size)
         got = json.loads(out[-1])
         assert got and not any(got), (size, out)
+
+
+def _all_needy(per_group: int = 14) -> dict:
+    """Two groups of `per_group` seats, every one marked: the pitch is at its tightest."""
+    v = _needy()
+    proto = v["nodes"][0]
+    v["nodes"] = [dict(proto, id="d%d_%d" % (g, i), group="g%d" % g, parent=None, label="seat %d.%d" % (g, i), state=["running", "idle", "waiting"][i % 3], card=None,
+                       needs_open=1 + i % 3, needs_first="np-%d-%d" % (g, i), needs_first_card="np:np-%d-%d" % (g, i), needs_first_what="q")
+                  for g in (1, 2) for i in range(per_group)]
+    v["tasks"], v["lost_if_closed"] = [], []
+    return v
+
+
+@needs_browser
+def test_a_conflict_chip_never_sits_on_a_seat_badge_and_the_badges_are_drawn_after_the_chips(tmp_path, monkeypatch):
+    """codex L3 r1 MED1: the chip placer knew rings and labels but not the badges, so a chip could cover a pill and win the tap."""
+    from tests.test_cockpit_k7_build import _sessions_fixture
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    probe = ("(() => { const g = %s.querySelector('.tv-graph'), bb = (e) => { const b = e.getBBox(); return [b.x, b.y, b.x + b.width, b.y + b.height]; }, "
+             "hit = (a, b) => Math.min(a[2], b[2]) - Math.max(a[0], b[0]) > 0.5 && Math.min(a[3], b[3]) - Math.max(a[1], b[1]) > 0.5, "
+             "pills = [...g.querySelectorAll('.tv-needpill')].map(bb), chips = [...g.querySelectorAll('.tv-confchip')].map(bb), "
+             "kids = [...g.children], lastChip = Math.max(...[...g.querySelectorAll('.tv-gconf')].map(e => kids.indexOf(e))), firstOut = Math.min(...[...g.querySelectorAll('.tv-needout')].map(e => kids.indexOf(e))); "
+             "return JSON.stringify([pills.length, chips.length, chips.map(c => pills.some(p => hit(c, p))), lastChip < firstOut]); })()") % TV
+    v = _all_needy()
+    ids = [n["id"] for n in v["nodes"]]
+    v["conflicts"] = [{"path": "a-long-file-name-%d.py" % i, "nodes": [ids[i], ids[(i * 5 + 3) % len(ids)]]} for i in range(len(ids)) if ids[i] != ids[(i * 5 + 3) % len(ids)]]
+    for size in (DESKTOP, NARROW):
+        out = _run(tmp_path, src, [*PRIME, {"eval": _paint(v, "agents")}, WAIT, {"eval": probe}], first=size)
+        pills, chips, over, order = json.loads(out[-1])
+        assert pills >= 28 and chips >= 10 and not any(over) and order, (size, out)
+
+
+@needs_browser
+def test_a_tap_in_the_overlap_of_two_pads_opens_the_card_of_the_nearer_badge(tmp_path, monkeypatch):
+    """codex L3 r1 MED2: pads overlap at small pitch and the later-drawn one took the tap wherever it landed."""
+    from tests.test_cockpit_k7_build import _sessions_fixture
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    tap = ("(() => { const pads = [...%s.querySelectorAll('.tv-needhit')], r = (e) => e.getBoundingClientRect(), c = (e) => [r(e).left + r(e).width / 2, r(e).top + r(e).height / 2], "
+           "inside = (e, x, y) => x >= r(e).left && x <= r(e).right && y >= r(e).top && y <= r(e).bottom; "
+           "for (let i = 0; i < pads.length; i++) for (let j = i + 1; j < pads.length; j++) { const a = c(pads[i]), b = c(pads[j]); "
+           "for (let t = 0.49; t > 0.1; t -= 0.03) { const x = a[0] + (b[0] - a[0]) * t, y = a[1] + (b[1] - a[1]) * t; "
+           "if (inside(pads[i], x, y) && inside(pads[j], x, y)) { window.__opened = null; "
+           "pads[j].dispatchEvent(new MouseEvent('click', {bubbles: true, clientX: x, clientY: y})); "
+           "return JSON.stringify([pads[i].dataset.needhitfor, pads[j].dataset.needhitfor, window.__opened]); } } } return JSON.stringify(null); })()") % TV
+    seen = 0
+    for size in (DESKTOP, {"emulate": {"w": 640, "h": 900, "dpr": 1, "mobile": False}}, NARROW):      # a narrow desktop stage shrinks the graph, so the 44 CSS px pads grow in graph units
+        out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_all_needy(), "agents")}, WAIT, {"eval": tap}], first=size)
+        got = json.loads(out[-1])
+        if got is None:
+            continue
+        seen += 1
+        assert got[2] == "np:np-" + got[0].split(":d")[1].replace("_", "-"), (size, out)         # the tap was nearer the first pad's badge, though it landed on the later pad
+    assert seen, "no two pads overlap in the fixture"
+
+
+@needs_browser
+def test_a_lens_built_hidden_plays_its_entrance_when_first_shown(tmp_path, monkeypatch):
+    """complement L3 r1 1 + glm LOW1: only a build that is attached and has a width commits what was seen; a hidden lens built before it must not use it up."""
+    from tests.test_cockpit_k7_build import _sessions_fixture
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    mk = ("(() => { const R = window.LevainTopologyView.render, v = %s; window.__boxes = [0, 1].map(() => { const b = document.createElement('div'); b.style.display = 'none'; document.body.appendChild(b); "
+          "b.appendChild(R(v, {lens: 'agents', openCard: () => {}})); return b; }); return 1; })()") % json.dumps(_needy())
+    show = "(() => { window.__boxes[1].style.display = ''; return 1; })()"
+    out = _run(tmp_path, src, [*PRIME, {"eval": mk}, WAIT, {"eval": show}, WAIT, {"eval": "window.__boxes[1].querySelectorAll('.tv-bezel.sweep').length"}], first=DESKTOP)
+    assert out[-1] == 1, out

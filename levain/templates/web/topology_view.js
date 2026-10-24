@@ -171,7 +171,9 @@
   const NEED_CAP = 120;
   // what each marked owner ("hub", "node:<id>") last showed on a live lens: a mark plays its motion when it arrives or its count changes (a seat's: rises)
   const needSeen = new Map();
-  const needsSeenNow = (v) => { const m = new Map(); const h = needsOf(v.hub); if (h) m.set("hub", h.n); for (const n of arr(v.nodes)) { const k = needsOf(n); if (k && isObj(n)) m.set("node:" + n.id, k.n); } return m; };
+  // a seat with no id of its own (not a non-empty string) has no owner key to be remembered by: it gets no mark
+  const nodeNeed = (n) => (isObj(n) && typeof n.id === "string" && n.id ? needsOf(n) : null);
+  const needsSeenNow = (v) => { const m = new Map(); const h = needsOf(v.hub); if (h) m.set("hub", h.n); for (const n of arr(v.nodes)) { const k = nodeNeed(n); if (k) m.set("node:" + n.id, k.n); } return m; };
   const capStr = (x) => (typeof x === "string" ? x.slice(0, NEED_CAP) : "");
   function needsOf(o) {
     if (!isObj(o) || !Number.isInteger(o.needs_open) || o.needs_open <= 0) return null;
@@ -183,10 +185,32 @@
   // drawn BENEATH every node so a tap on a node's own shape reaches the node (message the seat) and only the margin around the pill reaches the card.
   // deco, set only for the desk: {art, bx, by, rx}: the desk's own drawing (a group already placed at the hub) in place of the plain ring, and the badge's
   // centre as an offset from the hub, with its corner radius. A seat's mark passes none and is the red ring it always was.
+  // the badge's geometry, one function for the drawing and for the conflict chips' placement: centre, pill width, the tap pad's side (44 CSS px at the graph's scale)
+  function needGeom(nd, cx, cy, rr, ang, scale, spot) {
+    const bx = spot ? cx + spot.bx : cx + Math.cos(ang) * rr, by = spot ? cy + spot.by : cy + Math.sin(ang) * rr, txt = "!" + (nd.n > 9 ? "9+" : String(nd.n));
+    return { bx, by, txt, w: txt.length > 2 ? 30 : 24, side: Math.max(44, Math.ceil(44 / (scale > 0 ? Math.min(1, scale) : 1))) };
+  }
+  // a tap in the overlap of pads goes to the badge whose centre is nearest the tap (in the graph's own coordinates); a tap with no usable point goes to the pad it hit
+  function nearestPad(pad, ev) {
+    try {
+      const svg = pad.ownerSVGElement, ctm = svg && svg.getScreenCTM && svg.getScreenCTM();
+      if (!ctm || typeof svg.createSVGPoint !== "function") return pad;
+      const pt = svg.createSVGPoint(); pt.x = ev.clientX; pt.y = ev.clientY;
+      const q = pt.matrixTransform(ctm.inverse());
+      let best = pad, bd = Infinity;
+      for (const o of Array.from(pad.parentNode.children)) {
+        const x = parseFloat(o.getAttribute("x")), y = parseFloat(o.getAttribute("y")), s = parseFloat(o.getAttribute("width"));
+        if (!(q.x >= x && q.x <= x + s && q.y >= y && q.y <= y + s) || typeof o.needGo !== "function") continue;
+        const d = Math.hypot(q.x - (x + s / 2), q.y - (y + s / 2));
+        if (d < bd) { bd = d; best = o; }
+      }
+      return best;
+    } catch (_) { return pad; }
+  }
   function needMark(nd, cx, cy, rr, ang, opts, label, owner, scale, deco, calm) {
     const g = sv("g", { "data-needs": String(nd.n) }, "tv-need");
     if (deco) g.appendChild(deco.art); else g.appendChild(sv("circle", { cx: num(cx), cy: num(cy), r: num(rr) }, "tv-needring" + (calm ? " calm" : "")));
-    const bx = deco ? cx + deco.bx : cx + Math.cos(ang) * rr, by = deco ? cy + deco.by : cy + Math.sin(ang) * rr, txt = "!" + (nd.n > 9 ? "9+" : String(nd.n)), w = txt.length > 2 ? 30 : 24;
+    const { bx, by, txt, w, side } = needGeom(nd, cx, cy, rr, ang, scale, deco);
     const b = sv("g", { "data-needbadge": nd.card, "data-needfirst": nd.first, "data-needfor": owner }, "tv-needbadge");
     const tip = nd.what || (nd.n + " decision" + (nd.n === 1 ? "" : "s") + " waiting on you");
     const openable = !!nd.card && !!opts && typeof opts.openCard === "function";
@@ -204,9 +228,9 @@
       b.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); if (!ev.repeat) go(ev); } });
       const out = sv("g", null, "tv-needout");
       out.appendChild(b);
-      const side = Math.max(44, Math.ceil(44 / (scale > 0 ? Math.min(1, scale) : 1)));
       const pad = sv("rect", { x: num(bx - side / 2), y: num(by - side / 2), width: side, height: side, "data-needhitfor": owner, "aria-hidden": "true" }, "tv-needhit");
-      pad.addEventListener("click", go);
+      pad.needGo = go;
+      pad.addEventListener("click", (ev) => nearestPad(pad, ev).needGo(ev));
       return { inner: g, outer: out, under: pad };
     }
     g.appendChild(b);
@@ -217,7 +241,7 @@
   // The desk's mark, direction M1 (bezel + callout): 60 engraved ticks (a major every 5) in the alert colour on a thin track hugging the core, a lubber notch at 12
   // o'clock, the "!N" readout on a short leader line (C's aviation callout) to the lower right, clear of every label. On arrival the ticks light in sequence once (CSS: 60 ticks 20 ms apart, each .2 s), then hold; the label
   // rides HUB_LIFT px higher while the desk is marked. Every part is inert to the pointer: the desk's own tap is untouched.
-  const HUB_LIFT = 9, HUB_CALLOUT_X = 82, HUB_CALLOUT_Y = 54;           // the callout pill's far edge from the hub's centre
+  const HUB_LIFT = 9, HUB_CALLOUT_X = 82, HUB_CALLOUT_Y = 54, HUB_BADGE = { bx: 64, by: 42 };           // the callout pill's far edge from the hub's centre
   const pol = (r, deg) => [num(r * Math.sin(deg * Math.PI / 180)), num(-r * Math.cos(deg * Math.PI / 180))];     // clockwise from 12 o'clock, relative to the centre
   function hubDeco(nd, cx, cy, sweep) {
     const art = sv("g", { transform: "translate(" + num(cx) + " " + num(cy) + ")" }, "tv-hubmark tv-bezel" + (sweep ? " sweep" : ""));
@@ -231,7 +255,7 @@
     art.appendChild(sv("path", { d: "M -3 -43.4 L 3 -43.4 L 0 -38.8 Z" }, "tv-bz-lub"));
     const s = pol(39.6, 135);
     art.appendChild(sv("path", { d: "M " + s + " L 42 42 L 52 42" }, "tv-bz-lead"));
-    return { art, bx: 64, by: 42, rx: 4 };
+    return { art, bx: HUB_BADGE.bx, by: HUB_BADGE.by, rx: 4 };
   }
 
   function dot(state) { const d = el("i", "tv-dot " + state); d.setAttribute("aria-hidden", "true"); return d; }
@@ -739,12 +763,15 @@
   // The boxes the graph draws text and nodes in, in graph coordinates: one place computes them, the drawing and the conflict chip's placement
   // both read them (two pieces of code never restate a label's size). `hub` and each group's label, each node's face, each node's ring.
   const box = (x, y, w, h) => ({ x, y, w, h });
-  function graphBoxes(v, L, measure) {
+  const nodeSpot = (P) => ({ ang: P.side === 1 ? Math.PI * 0.75 : Math.PI * 0.25 });
+  const nodeR = (n) => (n.state === "waiting" ? 11 : 9);
+  function graphBoxes(v, L, measure, scale) {
     const nodes = arr(v.nodes), running = nodes.filter((n) => n.state === "running").length, h = L.hub;
     const hsub = nodes.length + (nodes.length === 1 ? " session" : " sessions") + " \u00b7 " + running + " running";
     const hw = Math.max(measure(hsub, "l2"), 70);
     const marked = !!needsOf(v.hub), lift = marked ? HUB_LIFT : 0;
-    const out = { hubText: hsub, hub: box(h.x - hw / 2 - 7, h.y - h.r - 42 - lift, hw + 14, 40), hubMark: marked ? [box(h.x - 44, h.y - 44, 88, 88), box(h.x + 42, h.y + 30, HUB_CALLOUT_X - 38, HUB_CALLOUT_Y - 30)] : [], hubBody: box(h.x - h.r - 8, h.y - h.r - 8, 2 * (h.r + 8), 2 * (h.r + 8)), groups: new Map(), faces: new Map(), rings: [] };
+    const out = { hubText: hsub, hub: box(h.x - hw / 2 - 7, h.y - h.r - 42 - lift, hw + 14, 40), hubMark: marked ? [box(h.x - 44, h.y - 44, 88, 88), box(h.x + 42, h.y + 30, HUB_CALLOUT_X - 38, HUB_CALLOUT_Y - 30)] : [], hubBody: box(h.x - h.r - 8, h.y - h.r - 8, 2 * (h.r + 8), 2 * (h.r + 8)), pills: [], groups: new Map(), faces: new Map(), rings: [] };
+    if (marked) { const hn = needsOf(v.hub), g = needGeom(hn, h.x, h.y, h.r + 14, Math.PI / 4, scale, HUB_BADGE); out.pills.push(box(g.bx - g.w / 2, g.by - 10, g.w, 20)); out.hubMark.push(box(g.bx - g.side / 2, g.by - g.side / 2, g.side, g.side)); }
     for (const [k, gp] of L.gpos) {
       const mem = nodes.filter((n) => L.gkey(n) === k), run = mem.filter((n) => n.state === "running").length;
       const sub = mem.length + (mem.length === 1 ? " agent" : " agents") + " \u00b7 " + run + " running";
@@ -756,6 +783,8 @@
       const tx = P.x + dir * (wait ? 26 : 17), bw = P.tw + 8, bh = f.tag ? 64 : 46, bx = dir === 1 ? tx - 5 : tx - P.tw - 3;
       out.faces.set(n.id, box(bx, P.y - (f.tag ? 30 : 13), bw, bh));
       out.rings.push(box(P.x - 17, P.y - 17, 34, 34));
+      const nn = nodeNeed(n);
+      if (nn) { const g = needGeom(nn, P.x, P.y, nodeR(n) + 8, nodeSpot(P).ang, scale); out.pills.push(box(g.bx - g.w / 2, g.by - 10, g.w, 20)); out.rings.push(box(g.bx - g.side / 2, g.by - g.side / 2, g.side, g.side)); }
     }
     return out;
   }
@@ -771,10 +800,10 @@
     while (tail.length > 4 && measure("…" + tail, "chip") > 150) tail = tail.slice(1);
     return "…" + tail;
   }
-  function conflictArcs(v, L, measure, boxes) {
+  function conflictArcs(v, L, measure, boxes, scale) {
     const out = [], byId = new Map(arr(v.nodes).map((n) => [n.id, n]));
-    const bx = boxes || graphBoxes(v, L, measure);
-    const obstacles = [bx.hub, bx.hubBody, ...(bx.hubMark || []), ...Array.from(bx.groups.values()).map((g) => g.rect), ...Array.from(bx.faces.values()), ...bx.rings];
+    const bx = boxes || graphBoxes(v, L, measure, scale);
+    const obstacles = [bx.hub, bx.hubBody, ...(bx.hubMark || []), ...Array.from(bx.groups.values()).map((g) => g.rect), ...Array.from(bx.faces.values()), ...bx.rings, ...bx.pills];
     for (const c of arr(v.conflicts)) {
       if (!isObj(c) || typeof c.path !== "string") continue;
       const ids = arr(c.nodes).filter((id) => L.pos.has(id) && byId.has(id));
@@ -793,7 +822,7 @@
           search: for (const off of CHIP_OFF) {
             for (const t of CHIP_AT) {
               const q = at(t), p = { x: q.x + (-dy / ln) * off, y: q.y + (dx / ln) * off }, r = box(p.x - w / 2, p.y - 10, w, 20);
-              const cost = obstacles.reduce((s, o) => s + overlap(r, o, 3), 0);
+              const cost = obstacles.reduce((s, o) => s + overlap(r, o, 3), 0) + 40 * bx.pills.reduce((s, o) => s + overlap(r, o, 3), 0);     // a pill outweighs any label: a chip never sits on a badge while a free place exists
               if (best === null || cost < best.cost) best = { cost, p };
               if (cost === 0) break search;
             }
@@ -951,7 +980,7 @@
     fresh.shown = shown;
     const svg = sv("svg", { viewBox: "0 0 " + L.LW + " " + L.H, role: "group", "aria-label": "Agents graph", preserveAspectRatio: "xMidYMid meet" }, "tv-graph");
     const nodes = arr(v.nodes), byId = new Map(nodes.map((n) => [n.id, n]));
-    const lost = lostMap(v), bxs = graphBoxes(v, L, measure);
+    const lost = lostMap(v), bxs = graphBoxes(v, L, measure, scale);
     svg.appendChild(drawGlow(v, L));
     for (const k of RING_H) svg.appendChild(sv("ellipse", { cx: num(L.hub.x), cy: num(L.hub.y), rx: num(L.LW * k * 1.15), ry: num(L.H * k * 1.05) }, "tv-gring"));
     const eg = sv("g", null, "tv-edges");
@@ -963,7 +992,7 @@
     svg.appendChild(eg);
     // file conflicts: the arc runs under the plates, but its chip (the file's name) is drawn after the nodes, so a plate never hides it
     const chips = [];
-    for (const a of conflictArcs(v, L, measure, bxs)) {
+    for (const a of conflictArcs(v, L, measure, bxs, scale)) {
       svg.appendChild(sv("path", { d: "M" + num(a.A.x) + " " + num(a.A.y) + " Q" + num(a.cx) + " " + num(a.cy) + " " + num(a.B.x) + " " + num(a.B.y), "data-conflict": a.path }, "tv-confline"));
       if (a.chip) {
         const g = sv("g", { "data-conflict": a.path, "data-nodes": a.ids.join(",") }, "tv-gconf");
@@ -1052,7 +1081,7 @@
         g.addEventListener("click", go);
         g.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); go(); } });
       }
-      const need = needsOf(n);
+      const need = nodeNeed(n);
       const owner = "node:" + n.id, prevN = fresh.prev.get(owner);
       const mark = need ? needMark(need, P.x, P.y, r + 8, dir === 1 ? Math.PI * 0.75 : Math.PI * 0.25, opts, n.label, owner, scale, undefined, fresh.still || !(prevN === undefined || need.n > prevN)) : null;
       if (need) shown.set(owner, need.n);
@@ -1061,8 +1090,8 @@
       if (mark && mark.under) under.appendChild(mark.under);
       if (mark && mark.outer) outers.push(mark.outer);
     }
-    for (const o of outers) svg.appendChild(o);
     for (const g of chips) svg.appendChild(g);
+    for (const o of outers) svg.appendChild(o);                              // the badges last: where a chip still overlaps one, the badge wins the tap
     return { svg, tickers };
   }
 
@@ -1192,7 +1221,6 @@
     // what the desk's mark last showed: undefined = it just arrived, a number = the count it had (a rebuild at the same data replays nothing)
     const still = !!(opts && opts.still);
     const fresh = { prev: new Map(needSeen), still, shown: null };
-    if (!still) { needSeen.clear(); for (const [k, n] of needsSeenNow(v)) needSeen.set(k, n); }
     const stage = el("div", "tv-stage");
     const hint = el("span", "tv-hint", "Click a node for its page. Hover for the face.");
     stage.appendChild(hint);
@@ -1245,7 +1273,12 @@
       if (svgNode) svgNode.remove();
       const g = drawGraph(v, L, edges, measure, opts, scale, fresh);
       svgNode = g.svg;
-      if ((fresh.real || typeof ResizeObserver !== "function") && fresh.shown) for (const [k, n] of fresh.shown) fresh.prev.set(k, n);       // the build the person sees has played its motion: a redraw of the same lens stays still
+      // only a build the person can see (attached, with a width) has played its motion: it REPLACES the seen snapshot with what it showed, so a mark that
+      // vanished is forgotten and one that returns arrives anew; a hidden or pre-attach build commits nothing, and the lens still plays when first shown
+      if (fresh.shown && stage.isConnected && stage.getBoundingClientRect().width > 0) {
+        fresh.prev = new Map(fresh.shown);
+        if (!still) { needSeen.clear(); for (const [k, n] of fresh.shown) needSeen.set(k, n); }
+      }
       if (phone) svgNode.style.width = Math.round(LW * scale) + "px";
       stage.insertBefore(svgNode, canvas);
       // the canvas keeps the graph's own proportions: CSS size follows the SVG, the backing store follows the device
@@ -1273,7 +1306,7 @@
     if (typeof ResizeObserver === "function") {
       linkObserver = new ResizeObserver(() => {
         const w = Math.round(stage.getBoundingClientRect().width);
-        if (w > 0 && (w !== seen || !built)) { const first = seen === 0; seen = w; fresh.real = true; if (first || Math.abs(w - LW) > 1 || scale < 1) build(w); }
+        if (w > 0 && (w !== seen || !built)) { const first = seen === 0; seen = w; if (first || Math.abs(w - LW) > 1 || scale < 1) build(w); }
       });
       linkObserver.observe(stage);
     }

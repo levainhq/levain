@@ -2967,6 +2967,7 @@ TOPOLOGY_TASK_STATES = ("waiting", "stuck", "running", "open", "done", "failed")
 TOPOLOGY_TASK_HEATS = ("hot", "warm", "cold", "parked")
 TOPOLOGY_COST_SOURCES = ("dispatch", "ledger")
 TOPOLOGY_LABEL_MAX = 48
+TOPOLOGY_NEEDS_MAX = 120      # the decision mark's strings (needs_first, needs_first_card, needs_first_what): the page's own cap (topology_view.js NEED_CAP)
 
 
 def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
@@ -3019,6 +3020,18 @@ def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
         raise _bad(spec, "value.hub", "must be an object {id, label}")
     text("value.hub.id", hub.get("id"), blank=False)
     text("value.hub.label", hub.get("label"), label=True)
+
+    def needs(where: str, o: dict[str, Any]) -> None:
+        """The decision mark's optional keys (all may be absent or null): a count, the first need's id and card id and first sentence, each a
+        display-safe string within the page's cap (``TOPOLOGY_NEEDS_MAX``)."""
+        count(f"{where}.needs_open", o.get("needs_open"))
+        for k in ("needs_first", "needs_first_card", "needs_first_what"):
+            x = o.get(k)
+            text(f"{where}.{k}", x, null=True)
+            if x is not None and len(x) > TOPOLOGY_NEEDS_MAX:
+                raise _bad(spec, f"{where}.{k}", f"is longer than {TOPOLOGY_NEEDS_MAX} characters")
+
+    needs("value.hub", hub)
     groups = _need_list(spec, v, "groups")
     group_ids = unique("value.groups", groups)
     for i, g in enumerate(groups):
@@ -3037,6 +3050,7 @@ def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
         if n.get("state") not in TOPOLOGY_NODE_STATES:
             raise _bad(spec, f"{w}.state", f"must be one of {list(TOPOLOGY_NODE_STATES)}, got {n.get('state')!r}")
         count(f"{w}.tokens", n.get("tokens"))
+        needs(w, n)
         for k in ("started", "last_event"):
             if not _is_iso(n.get(k)):
                 raise _bad(spec, f"{w}.{k}", "must be an ISO-8601 timestamp")
