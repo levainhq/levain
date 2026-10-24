@@ -29,6 +29,24 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   until the session ends, or until the credential-holding process restarts (the stop is kept in its memory). A streamed openai-chat request that does not say whether it wants usage is sent asking for
   it, so the provider adds one final chunk carrying the usage.
 
+### Changed
+- **The memory no longer forms Hebbian links, and the dashboard stops reading them as health.** anneal-memory 1.0.2
+  stops forming associations between co-cited episodes and ignores the affective state a wrap could carry. Levain follows:
+  - Health is now `live` (the store reads and at least one wrap committed) or `no wraps yet`. The date of the last wrap is
+    shown as a fact. A fresh store no longer reads "DARK · 0 links". `write_path_live` stays in the health data for one
+    more release (true when the status is live) so an older reader does not break.
+  - The link count, strength and density figures leave the health panel. The graph panel keeps drawing the links already
+    there, says `not formed` when the graph is empty, and says `no new links since wrap N` when the installed anneal
+    reports it. With anneal 1.0.1 it says nothing extra.
+  - Wrap rows show `+N links` only for older wraps that formed some.
+  - `levain wrap` no longer prints an `associations:` line (it would read 0 on every wrap) and prints `wrap: #N` when
+    anneal names the wrap it committed. `--affect-tag` and `--affect-intensity` still work, do nothing, and print one
+    line saying they are deprecated.
+  - The seed memory files teach two layers (episodes and continuity) with the immune system, and drop the Hebbian and
+    limbic sections. Run `levain update` to see the proposed changes to your copy.
+  - Known edge: a process on anneal 1.0.1 can still open a store that a 1.0.2 process has touched, and it keeps forming
+    links on it. Move every install that shares a store (this one, flow, the uv tool, hub venvs) to anneal 1.0.2 or later.
+
 ## [0.11.20] — 2026-10-23
 
 This release carries the changes prepared as 0.11.17, 0.11.18 and 0.11.19, which were never published, and everything merged since.

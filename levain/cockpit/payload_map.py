@@ -76,7 +76,7 @@ _add(S, "map", "crystals panel facets crystal_level, permanence, last_activated_
      "crystal_index[].tags")
 _add(S, "map", "crystals row Row.id / title / body", False,
      "crystal_index[].name", "crystal_index[].one_clause", "crystal_index[].activation_mode")
-_add(S, "map", "metric health (each counter a metric; write_path_live a status)", True, "health.**")
+_add(S, "map", "metric health (each counter a metric; the write path a status: live / no wraps yet)", True, "health.**")
 _add(S, "map", "visual cognition-graph data + text projection", True, "graph.**")
 _add(S, "map", "visual wrap-history data + text projection", True, "wraps[].*")
 _add(S, "map", "prose panels, one per heading, action section_edit", True,

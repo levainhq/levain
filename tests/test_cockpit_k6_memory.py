@@ -301,25 +301,30 @@ out.few = memWrapsLine({ wraps: wr(3) });
 // the newest stamp wins wherever it sits in the list
 const shuffled = [{ wrapped_at: "2026-10-01T06:00:00" }, { wrapped_at: "2026-10-19T06:02:00" }, { wrapped_at: "2026-10-10T06:00:00" }];
 out.lastIsMax = memWrapsLine({ wraps: shuffled }).endsWith("06:02");
-out.dark = memCogBits({ write_path_live: false, wraps: wr(2), graph: { nodes: [1], edges: [] } });
-out.darkHealth = memCogBits({ health: { write_path_live: false }, wraps: [] });
-out.live = memCogBits({ write_path_live: true, wraps: wr(2) });
+out.dark = memCogBits({ write_path_status: "unreadable", wraps: wr(2), graph: { nodes: [1], edges: [] } });
+out.darkHealth = memCogBits({ health: { status: "unreadable" }, wraps: [] });
+out.noWraps = memCogBits({ health: { status: "no-wraps", write_path_live: false }, write_path_status: "no-wraps", wraps: [] });
+out.formation = memCogBits({ wraps: [], graph: { nodes: [], edges: [], formation_off_at_wrap: 12 } });
+out.live = memCogBits({ write_path_status: "live", wraps: wr(2) });
 out.capBits = memCogBits({ wraps: wr(50) });
 out.totalBits = memCogBits({ wraps: wr(50), health: { total_wraps: 212 } });
 out.totalFew = memCogBits({ wraps: wr(3), health: { total_wraps: 3 } });
-out.darkEither = memCogBits({ write_path_live: true, health: { write_path_live: false }, wraps: [] });
-out.darkTop = memCogBits({ write_path_live: false, health: { write_path_live: true }, wraps: [] });
+out.darkEither = memCogBits({ write_path_status: "live", health: { status: "unreadable" }, wraps: [] });
+out.darkTop = memCogBits({ write_path_status: "unreadable", health: { status: "live" }, wraps: [] });
 """, tmp_path, fn)
     assert out["capped"].startswith("50+ wraps"), out["capped"]                  # the list is capped at 50: it never claims a total of 50
     assert out["total"].startswith("212 wraps"), out["total"]                    # the authoritative figure wins when the view has it
     assert out["few"].startswith("3 wraps"), out["few"]
     assert out["lastIsMax"] is True
-    assert "write path dark" in out["dark"] and "write path dark" in out["darkHealth"], out
-    assert "write path dark" not in out["live"], out
+    assert "write path unreadable" in out["dark"] and "write path unreadable" in out["darkHealth"], out
+    assert "write path unreadable" not in out["live"], out
+    assert not [b for b in out["noWraps"] if "write path" in b], out                    # no wraps yet is not a fault
+    assert "no new links since wrap 12" in out["formation"], out["formation"]
     assert any(b.startswith("50+") for b in out["capBits"]), out["capBits"]
     assert out["totalBits"][0] == "212 consolidations", out["totalBits"]            # the same total as the wraps line, never the capped list's length
     assert out["totalFew"][0] == "3 consolidations", out["totalFew"]
-    assert "write path dark" in out["darkEither"] and "write path dark" in out["darkTop"], out   # dark if EITHER place says so
+    assert "write path unreadable" in out["darkEither"], out                       # the health's own word wins over the top-level one
+    assert "write path unreadable" not in out["darkTop"], out
 
 
 @needs_browser
@@ -363,3 +368,138 @@ def test_an_identity_row_keeps_its_degradation_note_visible(tmp_path: Path) -> N
         ])["values"]
     r = out[1]
     assert r["shown"] and r["inside"] and r["text"] == "stale: read 3 days ago", r      # a stale / partial / held-back row never reads as a healthy one
+
+
+# ───────────────────────── L3 r1 fixes: the anneal cut must never draw "zero" as "dead" ─────────────────────────
+_MOCK = r"""
+Object.assign(Node.prototype, { setAttribute(k, v) { (this.attrs = this.attrs || {})[k] = String(v); }, addEventListener() {},
+  replaceChildren(...ks) { this.kids = []; this.append(...ks); }, querySelectorAll() { return []; } });
+Object.defineProperty(Node.prototype, "children", { get() { return this.kids; } });
+Object.defineProperty(Node.prototype, "classList", { get() { return { toggle() {}, contains: () => false }; } });
+const document = { createElementNS: (_ns, tag) => new Node(tag), createElement: (tag) => new Node(tag) };
+const walk = (n, f) => { f(n); for (const k of n.kids || []) walk(k, f); };
+const all = (n, pred) => { const r = []; walk(n, (x) => { if (pred(x)) r.push(x); }); return r; };
+"""
+
+
+def test_a_store_with_no_wraps_is_drawn_neutral_and_only_unreadable_is_drawn_dark(tmp_path: Path) -> None:
+    from tests.test_cockpit_k2_shell import _cut, _node
+    fn = _cut("  function renderHealth(entry, view) {", "  // The cognition trace")
+    out = _node(_MOCK + r"""
+const fmt = (n) => n, panel = () => el("div", "panel"), kv = () => {};
+const badge = (h) => { const p = renderHealth({}, { health: h }); return all(p, (x) => /\bbadge\b/.test(x.className))[0]; };
+const cls = (h) => badge(h).className;
+out.live = cls({ status: "live" });
+out.none = cls({ status: "no-wraps" });
+out.unreadable = cls({ status: "unreadable" });
+out.oldLive = cls({ write_path_live: true });
+out.oldNone = cls({ write_path_live: false });
+out.noneText = badge({ status: "no-wraps" }).textContent;
+""", tmp_path, fn)
+    assert out["live"] == "badge live" and out["oldLive"] == "badge live", out
+    assert out["none"] == "badge neutral" and out["oldNone"] == "badge neutral", out        # no wraps yet is not a fault
+    assert out["unreadable"] == "badge dark", out                                           # only a store that cannot be read is
+    assert out["noneText"] == "NO WRAPS YET"
+    html = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "app" / "dashboard.html").read_text(encoding="utf-8")
+    assert '(st === "unreadable" ? "dark" : "neutral")' in html and ".badge.neutral" in html     # the MCP-App page draws the same three classes
+    css = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "dashboard.css").read_text(encoding="utf-8")
+    assert ".badge.neutral" in css
+
+
+def test_the_apps_empty_graph_keeps_the_formation_note() -> None:
+    html = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "app" / "dashboard.html").read_text(encoding="utf-8")
+    empty = html[html.index('"not formed"') - 200: html.index('"not formed"') + 220]
+    assert "formation_off_at_wrap" in empty and "no new links since wrap" in empty, empty
+
+
+def test_the_cognition_trace_stops_drawing_links_after_formation_went_off(tmp_path: Path) -> None:
+    from tests.test_cockpit_k2_shell import _cut, _node
+    fn = _cut("  function renderGraph(entry, view) {", "  // a tier that faulted")
+    out = _node(_MOCK + r"""
+const num = (x) => { const n = +x; return Number.isFinite(n) ? n : 0; };
+const fmt = (n) => String(n), panel = () => el("div", "panel");
+const memWrapTotal = (view) => (view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : null);
+const wrapsOf = (links) => links.map((l) => ({ episodes_compressed: 5, graduations_validated: 1, associations_formed: l, associations_strengthened: 0 }));
+const trace = (view) => {
+  const p = renderGraph({}, view);
+  const legend = all(p, (x) => /\bscope-legend\b/.test(x.className))[0];
+  const chips = legend ? legend.kids.map((c) => c.kids.map((k) => k.textContent)) : [];
+  const poly = all(p, (x) => x.tag === "polyline" && /trace-core ch3/.test(x.attrs.class || ""));
+  return { chips, links: poly.map((x) => x.attrs.points.split(" ").length) };
+};
+// newest first: 4 post-cut zeros, then 3 historical wraps (wraps 3,2,1 formed 7,5,2 links); formation went off after wrap 3
+out.cut = trace({ wraps: wrapsOf([0, 0, 0, 0, 7, 5, 2]), health: { total_wraps: 7 }, graph: { nodes: [], edges: [], formation_off_at_wrap: 3 } });
+out.never = trace({ wraps: wrapsOf([0, 0, 0, 0]), health: { total_wraps: 4 }, graph: { nodes: [], edges: [], formation_off_at_wrap: 0 } });
+out.old = trace({ wraps: wrapsOf([0, 0, 3]), health: { total_wraps: 3 } });
+""", tmp_path, fn)
+    labels = lambda r: [c[0] for c in r["chips"]]
+    assert labels(out["cut"]) == ["Episodes", "Graduations", "links (formation off since wrap 3)"], out["cut"]
+    assert out["cut"]["links"] == [3], out["cut"]             # one core line, the three historical points only (no post-cut zeros)
+    assert out["cut"]["chips"][2][1] == "7 · max 7", out["cut"]   # the legend reads the last DRAWN point (wrap 3), not a post-cut zero
+    assert labels(out["never"]) == ["Episodes", "Graduations"], out["never"]      # a store that never formed links has no such channel
+    assert labels(out["old"]) == ["Episodes", "Graduations", "Links"], out["old"]  # an anneal that cannot say keeps the channel as it was
+    assert out["old"]["links"] == [3]
+
+
+_TRACE_PRELUDE = r"""
+const num = (x) => { const n = +x; return Number.isFinite(n) ? n : 0; };
+const fmt = (n) => String(n), panel = () => el("div", "panel");
+const memWrapTotal = (view) => (view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : null);
+const wrapsOf = (links) => links.map((l) => ({ episodes_compressed: 5, graduations_validated: 1, associations_formed: l, associations_strengthened: 0 }));
+const trace = (view) => {
+  const p = renderGraph({}, view);
+  const legend = all(p, (x) => /\bscope-legend\b/.test(x.className))[0];
+  const chips = legend ? legend.kids.map((c) => c.kids.map((k) => k.textContent)) : [];
+  const dots = all(p, (x) => x.tag === "circle" && /ch3/.test(x.attrs.class || ""));
+  const lines = all(p, (x) => x.tag === "polyline" && /trace-core ch3/.test(x.attrs.class || ""));
+  const notes = all(p, (x) => /\bnote\b/.test(x.className)).map((x) => x.textContent);
+  return { chips, dots: dots.length, lines: lines.length, notes };
+};
+"""
+
+
+def test_a_one_point_links_series_is_drawn_as_a_visible_point(tmp_path: Path) -> None:
+    from tests.test_cockpit_k2_shell import _cut, _node
+    fn = _cut("  function renderGraph(entry, view) {", "  // a tier that faulted")
+    out = _node(_MOCK + _TRACE_PRELUDE + r"""
+// formation went off after wrap 1, which formed 4 links: exactly one drawn Links point
+out.one = trace({ wraps: wrapsOf([0, 0, 0, 4]), health: { total_wraps: 4 }, graph: { nodes: [], edges: [], formation_off_at_wrap: 1 } });
+out.many = trace({ wraps: wrapsOf([0, 0, 7, 4]), health: { total_wraps: 4 }, graph: { nodes: [], edges: [], formation_off_at_wrap: 2 } });
+""", tmp_path, fn)
+    assert out["one"]["dots"] == 1 and out["one"]["lines"] == 0, out["one"]       # a polyline of one point draws nothing: a circle does
+    assert out["many"]["dots"] == 0 and out["many"]["lines"] == 1, out["many"]
+
+
+def test_the_links_channel_never_invents_wrap_numbers_when_the_total_is_unknown(tmp_path: Path) -> None:
+    from tests.test_cockpit_k2_shell import _cut, _node
+    fn = _cut("  function renderGraph(entry, view) {", "  // a tier that faulted")
+    out = _node(_MOCK + _TRACE_PRELUDE + r"""
+// health failed (no total) but the capped history loaded, and formation is off after wrap 60
+out.nototal = trace({ wraps: wrapsOf([0, 0, 0, 5, 5, 5]), graph: { nodes: [], edges: [], formation_off_at_wrap: 60 } });
+""", tmp_path, fn)
+    labels = [c[0] for c in out["nototal"]["chips"]]
+    assert not any(l.lower().startswith("links") for l in labels), out["nototal"]          # no channel labelled by counted-back numbers
+    assert out["nototal"]["lines"] == 0 and out["nototal"]["dots"] == 0, out["nototal"]
+    assert any("wrap numbers unknown" in n for n in out["nototal"]["notes"]), out["nototal"]  # and it says why
+
+
+def test_a_timebase_with_no_link_samples_reads_no_samples_not_zero(tmp_path: Path) -> None:
+    from tests.test_cockpit_k2_shell import _cut, _node
+    fn = _cut("  function renderGraph(entry, view) {", "  // a tier that faulted")
+    out = _node(_MOCK + _TRACE_PRELUDE + r"""
+// 30 wraps, formation off after wrap 3: the newest 24 hold no pre-cut link sample
+const links = [...Array(27).fill(0), 7, 5, 2];
+const view = { wraps: wrapsOf(links), health: { total_wraps: 30 }, graph: { nodes: [], edges: [], formation_off_at_wrap: 3 } };
+const p = renderGraph({}, view);
+const tbs = all(p, (x) => /\bscope-tb\b/.test(x.className));
+out.tbs = tbs.length;
+const click = (b) => { for (const f of b.listeners || []) f(); };
+Node.prototype.addEventListener = function (t, f) { (this.listeners = this.listeners || []).push(f); };
+const p2 = renderGraph({}, view);
+const tb2 = all(p2, (x) => /\bscope-tb\b/.test(x.className));
+click(tb2[1]);   // the 24-wrap timebase
+const legend = all(p2, (x) => /\bscope-legend\b/.test(x.className))[0];
+out.chips = legend.kids.map((c) => c.kids.map((k) => k.textContent));
+""", tmp_path, fn)
+    link = [c for c in out["chips"] if c[0].lower().startswith("links")]
+    assert link and link[0][1] == "no samples", out["chips"]

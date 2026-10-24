@@ -23,7 +23,7 @@ tombstoning an episode) requires an explicit ``confirm: true`` — the per-write
 confirm gate, enforced server-side (a raw client without it is refused too).
 
 What is NOT writable here, by construction: the five felt-layer neocortex
-sections + the Hebbian/limbic/crystal layers (Class C — the consolidate's own
+sections + the crystal layer (Class C — the consolidate's own
 conclusions), and the Class C-view seed docs. **Crystals (graduated patterns)
 are deliberately Class-B-EXCLUDED**: a crystal is the entity's own consolidated
 wisdom, not an operator input — retiring one would overwrite the entity's

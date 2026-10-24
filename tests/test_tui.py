@@ -64,6 +64,7 @@ def _view() -> SubstrateView:
         nodes=[GraphNode("a", "episode", "A"), GraphNode("b", "episode", "B")],
         edges=[GraphEdge("a", "b", 0.9, 3, "engaged", 0.7)],
         truncated=False,
+        formation_off_at_wrap=50,
     )
     config_docs = [
         ConfigDoc(
@@ -527,7 +528,15 @@ def test_render_health_shows_live_writepath_and_counts():
     v = _view()
     panel = next(p for p in v.layout() if p["kind"] == "health")
     text = "\n".join(tui.render_panel_lines(v, panel))
-    assert "LIVE" in text and "42 links" in text and "4,462" in text
+    assert "LIVE" in text and "last wrap 2026-06-15" in text and "4,462" in text
+    assert "links" not in text
+
+
+def test_render_graph_names_when_links_stopped():
+    v = _view()
+    lines = tui._render_cognition_trace(v)
+    text = "\n".join(lines)
+    assert "Association graph: 2 nodes, 1 edges · no new links since wrap 50" in text
 
 
 def test_render_spores_one_line_per_loop_with_id():

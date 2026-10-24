@@ -1379,7 +1379,7 @@
     }
     return out;
   }
-  // the Cognition header's figures, the same on both of its tabs. The write path speaks only when it is dark.
+  // the Cognition header's figures, the same on both of its tabs. The write path speaks only when it is unreadable.
   function memCogBits(view) {
     const g = view.graph, gn = g && Array.isArray(g.nodes) ? g.nodes.length : 0, ge = g && Array.isArray(g.edges) ? g.edges.length : 0;
     const listed = Array.isArray(view.wraps) ? view.wraps.length : 0, total = memWrapTotal(view);
@@ -1388,8 +1388,10 @@
     if (ws) bits.push((total === null && ws >= MEM_WRAP_CAP ? ws + "+" : String(ws)) + (ws === 1 ? " consolidation" : " consolidations"));
     if (gn) bits.push(gn + " nodes");
     if (ge) bits.push(ge + " edges");
-    // dark if either place the view can say so says so
-    if (view.write_path_live === false || (view.health && view.health.write_path_live === false)) bits.push("write path dark");
+    // the write path speaks when it cannot be read; a store with no wraps yet is not a fault. The graph says when links stopped.
+    const wst = (view.health && view.health.status) || view.write_path_status;
+    if (wst === "unreadable") bits.push("write path unreadable");
+    if (g && g.formation_off_at_wrap != null) bits.push("no new links since wrap " + g.formation_off_at_wrap);
     return bits;
   }
   function memCard(cls, title, meta, modes) {
@@ -1597,15 +1599,14 @@
     }
     const head = el("div", "kv");
     head.appendChild(el("span", "k", "write-path"));
-    const b = el("span", "badge " + (h.write_path_live ? "live" : "dark"),
-      h.write_path_live ? "LIVE" : "DARK · 0 links");
+    const st = h.status || (h.write_path_live ? "live" : "no-wraps");
+    const b = el("span", "badge " + (st === "live" ? "live" : (st === "unreadable" ? "dark" : "neutral")),
+      st === "live" ? "LIVE" : (st === "unreadable" ? "UNREADABLE" : "NO WRAPS YET"));
     const vWrap = el("span", "v"); vWrap.appendChild(b);
     head.appendChild(vWrap);
     p.appendChild(head);
 
     // a manifest source may not carry every figure: show only what was sent, never a made-up 0.00
-    kv(p, "Hebbian links", `${fmt(h.total_links)} (avg ${num(h.avg_strength).toFixed(2)}` + (h.max_strength != null ? `, max ${num(h.max_strength).toFixed(2)}` : "") + ")");
-    kv(p, "density", `${num(h.density).toFixed(3)}` + (h.local_density != null ? ` · local ${num(h.local_density).toFixed(3)}` : ""));
     kv(p, "graduations", `${fmt(h.graduations_validated_total)} validated / ${fmt(h.graduations_demoted_total)} demoted`);
     kv(p, "episodes", `${fmt(h.total_episodes)} (${fmt(h.episodes_since_wrap)} since wrap)`);
     if (h.wrap_history_unavailable) {
@@ -1639,12 +1640,25 @@
     }
     const NS = "http://www.w3.org/2000/svg";
     const W = 480, H = 170, PAD = 10;
+    // anneal stopped forming links after wrap `off`: the Links channel keeps its historical points and draws no new ones
+    // (a post-cut zero is not a measurement), and a store that never formed any has no such channel at all. The wraps list
+    // is newest-first and capped, so a row's wrap number is counted back from the authoritative total.
+    const off = view.graph && Number.isInteger(view.graph.formation_off_at_wrap) ? view.graph.formation_off_at_wrap : null;
+    const totalWraps = memWrapTotal(view);
+    // with the total unknown (health failed) the capped history cannot be numbered, so the cut cannot be placed on it
+    const wrapNo = new Map(series.map((w, k) => [w, (totalWraps !== null ? totalWraps : series.length) - k]));
+    const linkVal = (w) => num(w.associations_formed) + num(w.associations_strengthened);
     const CHANNELS = [
       { label: "Episodes", cls: "ch1", val: (w) => num(w.episodes_compressed) },
       { label: "Graduations", cls: "ch2", val: (w) => num(w.graduations_validated) },
-      { label: "Links", cls: "ch3",
-        val: (w) => num(w.associations_formed) + num(w.associations_strengthened) },
     ];
+    let noteTail = "";
+    if (off === null) CHANNELS.push({ label: "Links", cls: "ch3", val: linkVal });
+    else if (totalWraps === null) noteTail = " · links not drawn — wrap numbers unknown";
+    else if (series.some((w) => wrapNo.get(w) <= off && linkVal(w) > 0)) {
+      CHANNELS.push({ label: "links (formation off since wrap " + off + ")", cls: "ch3", val: linkVal,
+        drawn: (w) => wrapNo.get(w) <= off });
+    }
 
     // the instrument's read-side controls — the first real metal on the deck
     // (no-theater: both verbs act on the instrument NOW; write-side knobs land
@@ -1689,12 +1703,23 @@
         // off-grid (num() lets negatives through). gain floors at 1 to avoid /0, but
         // the legend reports the TRUE max so the calibration stays honest. [codex MED]
         const vals = wraps.map((w) => Math.max(0, ch.val(w)));
-        const actualMax = Math.max(0, ...vals);
+        const live = wraps.map((w) => !ch.drawn || ch.drawn(w));   // false: a wrap this channel no longer measures
+        const shown = vals.filter((_v, i) => live[i]);
+        const actualMax = Math.max(0, ...shown);
         const gain = Math.max(1, actualMax);
         const pts = vals
-          .map((v, i) => `${X(i).toFixed(1)},${(H - PAD - (v / gain) * (H - 2 * PAD)).toFixed(1)}`)
+          .map((v, i) => (live[i] ? `${X(i).toFixed(1)},${(H - PAD - (v / gain) * (H - 2 * PAD)).toFixed(1)}` : null))
+          .filter((x) => x !== null)
           .join(" ");
-        for (const layer of ["trace-glow", "trace-core"]) {
+        if (shown.length === 1) {
+          // a one-point polyline draws nothing: a lone sample is a visible point
+          const m = pts.split(",");
+          const dot = document.createElementNS(NS, "circle");
+          dot.setAttribute("cx", m[0]); dot.setAttribute("cy", m[1]); dot.setAttribute("r", "3");
+          dot.setAttribute("class", `trace-dot ${ch.cls}`);
+          svg.appendChild(dot);
+        }
+        for (const layer of (pts && shown.length > 1 ? ["trace-glow", "trace-core"] : [])) {
           const pl = document.createElementNS(NS, "polyline");
           pl.setAttribute("points", pts);
           pl.setAttribute("class", `${layer} ${ch.cls}`);
@@ -1704,7 +1729,7 @@
         }
         const chip = el("button", `scope-ch ${ch.cls}`);
         chip.appendChild(el("span", "scope-ch-l", ch.label));
-        chip.appendChild(el("span", "scope-ch-v", `${fmt(vals[vals.length - 1])} · max ${fmt(actualMax)}`));
+        chip.appendChild(el("span", "scope-ch-v", shown.length ? `${fmt(shown[shown.length - 1])} · max ${fmt(actualMax)}` : "no samples"));
         chip.type = "button";
         chip.title = "solo this channel (click again for all)";
         chip.setAttribute("aria-pressed", solo === ch.cls ? "true" : "false");
@@ -1717,7 +1742,7 @@
         legend.appendChild(chip);
       }
       scopeBox.replaceChildren(svg);
-      note.textContent = `oldest → newest`;   // the consolidation / node / edge counts are the card's header line (composeMemory)
+      note.textContent = "oldest → newest" + noteTail;  // the consolidation / node / edge counts are the card's header line (composeMemory)
     }
 
     p.appendChild(wrap);
@@ -2435,7 +2460,8 @@
       row.appendChild(el("span", "tier", datePart(w.wrapped_at)));
       row.appendChild(el("span", "clause",
         `${fmt(num(w.graduations_validated))}↑ / ${fmt(num(w.graduations_demoted))}↓ grad · ` +
-        `+${fmt(num(w.associations_formed))} links · ${fmt(num(w.continuity_chars))} chars`));
+        (num(w.associations_formed) ? `+${fmt(num(w.associations_formed))} links · ` : "") +
+        `${fmt(num(w.continuity_chars))} chars`));
       // digest-delta: how much the projection grew/shrank vs the previous (older)
       // regeneration — list is newest-first, so the older wrap is the next index.
       const older = list[i + 1];

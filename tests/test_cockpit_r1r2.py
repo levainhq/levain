@@ -164,8 +164,7 @@ def _view(snap: dict[str, Any]) -> dict[str, Any]:
 
 def _full_metrics(**figures: Any) -> list[dict[str, Any]]:
     """A complete health reading, as the kernel always sends one: every figure plus the write-path flag."""
-    names = ("links", "avg strength", "max strength", "density", "local density", "episodes", "episodes since wrap",
-             "tombstones", "wraps", "graduated", "demoted")
+    names = ("episodes", "episodes since wrap", "tombstones", "wraps", "graduated", "demoted")
     vals = {k: 1 for k in names} | figures
     return [{"label": "write path", "value": "live", "unit": None, "status": "ok", "read": None}] + [
         {"label": k, "value": vals[k], "unit": None, "status": "ok", "read": None} for k in names]
@@ -336,13 +335,14 @@ class TestManifestMapperAdversarial:
         # renderer's conversions after the board is cleared (reproduced in node: +o, Math.min(o), String(o))
         ck = Cockpit(entity=lambda ctx: {"name": "e", "governance": "x", "brand": {}, "store_label": "~/s.db",
                                          "jar": {"status": "ok", "label": "3 today", "level": 0.5, "today": 3, "day": "d"}})
-        ck.register(ProviderSpec("health", "metric", "Health", "gauge", lambda c: Read(value={"metrics": _full_metrics(**{"max strength": 1.3, "local density": 0.02})})))
+        ck.register(ProviderSpec("health", "metric", "Health", "gauge", lambda c: Read(value={"metrics": _full_metrics(**{"episodes": 13, "tombstones": 2})})))
         ck.register(ProviderSpec("crystals", "triage-list", "Crystals", "feed", lambda c: Read(rows=(
             RowIn("crystal:c1", "c1", {"at": "2026-10-01T00:00:00+00:00", "tags": ["a"]}, stored={"id": "c1"}),)),
             order="time.desc", facets=frozenset({"at", "tags"}), version_fields=("id",), region="mind"))
         good = _view(snapshot(ck))
         assert good["paths"] == {"episodic_db": "~/s.db"} and good["jar"]["level"] == 0.5
-        assert good["health"]["max_strength"] == 1.3 and good["health"]["local_density"] == 0.02
+        assert good["health"]["total_episodes"] == 13 and good["health"]["tombstones"] == 2
+        assert good["health"]["status"] == "live"
         snap = snapshot(ck)
         snap["manifest"]["entity"]["store_label"] = {"bad": True}
         snap["manifest"]["entity"]["jar"]["level"] = {"bad": True}
@@ -495,7 +495,7 @@ class TestManifestMapperParses:
         assert [e["id"] for e in view["layout"]].count("tray") == 1      # the others still render
 
     def test_a_malformed_health_metric_degrades_the_health_panel_not_a_zero(self) -> None:
-        snap = snapshot(self._health([self._metric("density", 0.1), self._metric("links", 4)]))
+        snap = snapshot(self._health([self._metric("tombstones", 0.1), self._metric("wraps", 4)]))
         snap["panels"]["health"]["value"]["metrics"][0]["value"] = {"bad": True}
         view = _view(snap)
         assert view["health"] is None
@@ -516,18 +516,26 @@ class TestManifestMapperParses:
             assert view["health"] is None
             self._degraded(view, "health")
 
-    FIGURES = ("links", "avg strength", "max strength", "density", "local density", "episodes", "episodes since wrap",
-               "tombstones", "wraps", "graduated", "demoted")
+    FIGURES = ("episodes", "episodes since wrap", "tombstones", "wraps", "graduated", "demoted")
 
     def _full_health(self) -> list[dict[str, Any]]:
         return [self._metric("write path", "live")] + [self._metric(k, 1) for k in self.FIGURES]
 
     def test_a_complete_health_reading_renders(self) -> None:
         view = _view(snapshot(self._health(self._full_health())))
-        assert view["health"]["density"] == 1 and view["health"]["write_path_live"] is True
+        assert view["health"]["tombstones"] == 1 and view["health"]["write_path_live"] is True
+        assert view["health"]["status"] == "live"
+
+    def test_the_write_path_words_map_to_a_status(self) -> None:
+        # legacy "dark" is decided by the wraps figure: wraps > 0 -> live, 0 -> no-wraps (fix1's ruled mapping)
+        for word, wraps, live, status in (("no wraps yet", 1, False, "no-wraps"), ("unreadable", 1, False, "unreadable"),
+                                          ("dark", 1, True, "live"), ("dark", 0, False, "no-wraps")):
+            full = [self._metric("write path", word)] + [self._metric(k, wraps if k == "wraps" else 1) for k in self.FIGURES]
+            h = _view(snapshot(self._health(full)))["health"]
+            assert (h["write_path_live"], h["status"]) == (live, status), (word, wraps)
 
     def test_an_absent_health_figure_degrades_the_panel_not_a_printed_zero(self) -> None:
-        for drop in ("density", "write path"):
+        for drop in ("tombstones", "write path"):
             view = _view(snapshot(self._health([m for m in self._full_health() if m["label"] != drop])))
             assert view["health"] is None, drop
             self._degraded(view, "health")
