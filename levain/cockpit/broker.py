@@ -93,6 +93,7 @@ from levain.cockpit.firejournal import (
     CockpitFormatError,
     DB_NAME,
     DecisionRows,
+    DeviceRevoked,
     EditsPage,
     IdempotencyConflict,
     PendingCapExceeded,
@@ -285,6 +286,7 @@ class Broker:
         self._thread: threading.Thread | None = None
         self._healer: threading.Thread | None = None
         self._stop = threading.Event()
+        self._starter: threading.Thread | None = None   # start_async's one thread (PAIR RU-4)
 
     @staticmethod
     def check_downstream(downstream: Mapping[str, Any]) -> dict[str, DownstreamEffect]:
@@ -390,6 +392,35 @@ class Broker:
         """Recent edits' broker rows (K2b-3b §0.6), served only while ACTIVE; None otherwise."""
         db = self._active_db()
         return None if db is None else db.edits(limit)
+
+    def active_db(self) -> CockpitDB | None:
+        """This broker's journal while ACTIVE, else None (the pairing routes' and the paired credential's one way in)."""
+        return self._active_db()
+
+    def start_async(self) -> None:
+        """Run :meth:`start` once on a single starter thread (PAIR RU-4): the caller never runs the start sequence
+        itself, so a paired request on a fresh serve waits on broker state (:meth:`wait_settled`) instead of on
+        recovery. A broker already started, or whose starter already runs, does nothing."""
+        with self._mu:
+            if self._started or self._starter is not None:
+                return
+            self._starter = threading.Thread(target=self.start, name="cockpit-broker-start", daemon=True)
+            self._starter.start()
+
+    def wait_settled(self, timeout: float, *, poll: float = 0.02) -> Lifecycle:
+        """The broker's state once it is ACTIVE, INSTALL_DISABLED or CLOSED, or after ``timeout`` seconds of
+        STANDBY / ACTIVATING / DRAINING, whichever comes first."""
+        import time
+
+        deadline = time.monotonic() + timeout
+        while True:
+            state = self.state
+            if state in (Lifecycle.ACTIVE, Lifecycle.INSTALL_DISABLED, Lifecycle.CLOSED):
+                return state
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return state
+            time.sleep(min(poll, left))
 
     def start(self) -> Lifecycle:
         """Run the start sequence once now; on a held lock stay STANDBY and heal in the background:
@@ -988,6 +1019,9 @@ class Broker:
                 for o in exc.occupying]}) from exc
         except IdempotencyConflict as exc:
             raise BrokerError("idempotency_conflict", 409, str(exc)) from exc
+        except DeviceRevoked as exc:
+            # PAIR RS-4: revoked after this request authenticated; refused in issue()'s own transaction
+            raise BrokerError("credential_required", 403, str(exc)) from exc
         self._kp("issued")
         if intent == "reported" and res.outcome.state == "WAITING":
             # a reported pending is decided by the request that issued it, or by its replay

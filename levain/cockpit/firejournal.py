@@ -51,7 +51,8 @@ from levain.autonomic.durable_sqlite import MIN_SQLITE, open_durable, read_trans
 _OPERATION_ID = re.compile(r"cp[0-9a-f]{32}")
 
 __all__ = [
-    "CAP_ATTEMPTS", "CockpitDB", "CockpitFormatError", "DB_NAME", "DecideOutcome", "DecisionRows",
+    "CAP_ATTEMPTS", "CockpitDB", "CockpitFormatError", "DB_NAME", "DecideOutcome", "DecisionRows", "DeviceRevoked",
+    "OFFER_TTL", "OFFERS_LIVE", "PAIRED_PREFIX", "PairingError",
     "EditRow", "EditsPage", "EffectRow", "FaultOutcome", "FIRST_RETRY_DELAY", "IdempotencyConflict",
     "IssueResult", "JournalCorruptError", "LabelRow", "OpView", "Outcome", "OUTCOME_WINDOW",
     "OUTCOMES_LIMIT", "OutcomeRow", "PENDING_CAP", "PendingCapExceeded", "PendingRow", "STORE_FORMAT", "UNINITIALISED", "authority_fence",
@@ -73,6 +74,13 @@ _MAX_BACKOFF = 120
 _OUTCOME_NAMES = {"COMMITTED_INCOMPLETE": "COMMITTED-INCOMPLETE", "CANCELLED": "cancelled"}
 OUTCOME_WINDOW = timedelta(days=7)     # the decisions panel's outcomes reach back this far (K2b-3b §3)
 OUTCOMES_LIMIT = 50                    # and show at most this many, newest first
+# per-device pairing (PAIR REV 3 RQ-1): its own constants, nothing borrowed from webpush's pairing
+PAIRED_PREFIX = "paired-"              # a paired device's credential name is PAIRED_PREFIX + its id (RP-1)
+OFFER_TTL = timedelta(minutes=10)      # a pairing offer's life
+OFFERS_LIVE = 3                        # live offers at once; a new one past this voids the oldest
+LAST_SEEN_EVERY = timedelta(minutes=1)  # a device's last_seen is stamped at most this often (fail-soft)
+_DEVICE_ID = re.compile(r"d-[0-9a-f]{12}")
+_LABEL_MAX = 64
 
 TERMINAL = ("COMMITTED", "COMMITTED_INCOMPLETE", "STALE", "REFUSED", "EXPIRED", "CANCELLED")
 _PLANNED_STATES = ("DECIDED", "COMMITTED", "COMMITTED_INCOMPLETE")
@@ -121,6 +129,16 @@ _SCHEMA = (
     " fired_at TEXT NOT NULL, epoch INTEGER NOT NULL,"
     " PRIMARY KEY (resource_key, field, operation_id))",
     "CREATE TABLE IF NOT EXISTS tokens (name TEXT PRIMARY KEY, generation INTEGER NOT NULL)",
+    # per-device cockpit pairing (PAIR, 1024+18 REV 3 RQ-1): a paired device's transport token, stored as its SHA-256
+    # only, and the one-time offers that mint one. Additive: an existing /3 journal gains them at its next open, and
+    # nothing else moves. ``paired_by`` / ``minted_by`` name the credential that minted the row (a surface name,
+    # ``paired-<id>`` or ``box``): the family a revoke takes whole (RQ-2, RS-5)
+    "CREATE TABLE IF NOT EXISTS paired_devices ("
+    " id TEXT PRIMARY KEY, label TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,"
+    " created TEXT NOT NULL, last_seen TEXT, revoked_at TEXT, paired_by TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS pair_offers ("
+    " code_hash TEXT PRIMARY KEY, label TEXT NOT NULL, minted_by TEXT NOT NULL,"
+    " expires TEXT NOT NULL, used_at TEXT)",
     # who may sign is a verified replay of this log (levain.authority), never a stored projection
     AUTHORITY_SCHEMA,
     "CREATE INDEX IF NOT EXISTS pendings_waiting ON pendings (state, expires_at)",
@@ -198,6 +216,16 @@ class PendingCapExceeded(RuntimeError):
     def __init__(self, message: str, occupying: Sequence[Occupant] = ()) -> None:
         super().__init__(message)
         self.occupying = tuple(occupying)
+
+
+class DeviceRevoked(PermissionError):
+    """A ``paired-*`` principal whose device row is revoked (or gone) asked to file a pending or mint an offer
+    (PAIR RS-4): refused inside the journal's own write transaction, so a request authenticated just before a revoke
+    cannot act after it."""
+
+
+class PairingError(ValueError):
+    """A pairing call's argument is malformed (a label, a device id)."""
 
 
 def new_pending_id() -> str:
@@ -749,6 +777,9 @@ class CockpitDB:
             raise ValueError("idempotency_key must be a non-empty string")
         with self.write() as conn:
             _expire(conn, now)
+            # PAIR RS-4: a paired device revoked since its request authenticated files nothing, checked in this
+            # transaction (the revoke is one transaction too, so the two are ordered), beside the cap below
+            _refuse_revoked_device(conn, principal)
             prior = conn.execute(
                 "SELECT * FROM pendings WHERE principal_base = ? AND idempotency_key = ?",
                 (base, idempotency_key)).fetchone()
@@ -1039,17 +1070,139 @@ class CockpitDB:
         stamp = utc_stamp(now)
         with self.write() as conn:
             _expire(conn, now)
-            row = conn.execute("SELECT generation FROM tokens WHERE name = ?", (name,)).fetchone()
-            if row is not None and row[0] == new_generation:
-                return "already"
-            if row is None or row[0] != expect_generation:
-                return "precondition_lost"
-            conn.execute("UPDATE tokens SET generation = ? WHERE name = ? AND generation = ?",
-                         (new_generation, name, expect_generation))
-            conn.execute("UPDATE pendings SET state = 'CANCELLED', reason = 'token rotated', "
-                         "cancelled_by = ?, terminal_at = ? WHERE principal = ? AND state = 'WAITING'",
-                         (by, stamp, f"token:{name}:{expect_generation}"))
-        return "applied"
+            return _rotate_in(conn, name, expect_generation=expect_generation, new_generation=new_generation,
+                              by=by, stamp=stamp)
+
+    # -- per-device pairing (PAIR REV 3 RQ-1..RQ-3, REV 4 RS-3..RS-5) ----------------------------
+    #
+    # Every pairing transition is one method and one ``BEGIN IMMEDIATE`` transaction of this journal, so a revoke's
+    # cascade, its offers' expiry and each member's generation rotation (which cancels its WAITING pendings) commit
+    # together or not at all. Codes and tokens are never stored: only their SHA-256.
+
+    def mint_offer(self, *, label: Any, minted_by: str, now: datetime) -> str:
+        """A one-time pairing code (128-bit, ``OFFER_TTL``), minted by the credential named ``minted_by`` (a surface
+        name, ``paired-<id>`` or ``box``). Past ``OFFERS_LIVE`` live offers the oldest is voided. A ``paired-*``
+        minter whose device is revoked is refused (:class:`DeviceRevoked`, RS-4)."""
+        import secrets
+
+        clean = _clean_label(label)
+        if not isinstance(minted_by, str) or not minted_by or ":" in minted_by:
+            raise PairingError(f"minted_by {minted_by!r} is empty or holds ':'")
+        code = secrets.token_urlsafe(16)
+        stamp = utc_stamp(now)
+        with self.write() as conn:
+            if _device_revoked(conn, minted_by):
+                raise DeviceRevoked(f"{minted_by} is revoked: it mints no offer")
+            live = conn.execute("SELECT code_hash FROM pair_offers WHERE used_at IS NULL AND expires > ? "
+                                "ORDER BY expires, rowid", (stamp,)).fetchall()
+            for (old,) in live[:max(0, len(live) - OFFERS_LIVE + 1)]:
+                conn.execute("UPDATE pair_offers SET expires = ? WHERE code_hash = ?", (stamp, old))
+            conn.execute("INSERT INTO pair_offers (code_hash, label, minted_by, expires, used_at) "
+                         "VALUES (?, ?, ?, ?, NULL)", (_sha256(code), clean, minted_by, utc_stamp(now + OFFER_TTL)))
+        return code
+
+    def redeem_offer(self, code: Any, *, now: datetime) -> "tuple[str, str] | None":
+        """Spend a live code: ``(device_id, token)`` for the new device, the token returned only here, or None for a
+        code that is unknown, used, expired, or minted by a device since revoked (RQ-2). The spend and the device's
+        insert (with ``paired_by`` = the offer's ``minted_by``) are one transaction: two claims of one code yield one
+        device, and no device exists without its lineage."""
+        import secrets
+
+        if not isinstance(code, str) or not code or len(code) > 128:
+            return None
+        stamp = utc_stamp(now)
+        with self.write() as conn:
+            row = conn.execute("SELECT label, minted_by, expires, used_at FROM pair_offers WHERE code_hash = ?",
+                               (_sha256(code),)).fetchone()
+            if row is None or row["used_at"] is not None or row["expires"] <= stamp:
+                return None
+            if _device_revoked(conn, row["minted_by"]):
+                return None
+            changed = conn.execute("UPDATE pair_offers SET used_at = ? WHERE code_hash = ? AND used_at IS NULL",
+                                   (stamp, _sha256(code))).rowcount
+            if not changed:
+                return None
+            token = secrets.token_urlsafe(32)
+            device_id = "d-" + secrets.token_hex(6)
+            conn.execute("INSERT INTO paired_devices (id, label, token_hash, created, last_seen, revoked_at, "
+                         "paired_by) VALUES (?, ?, ?, ?, NULL, NULL, ?)",
+                         (device_id, row["label"], _sha256(token), stamp, row["minted_by"]))
+        return device_id, token
+
+    def verify_device(self, token: str, *, now: datetime) -> str | None:
+        """The id of the unrevoked device ``token`` belongs to, or None (unknown or revoked): one indexed lookup of
+        its SHA-256. ``last_seen`` is stamped at most once per ``LAST_SEEN_EVERY``, fail-soft (a busy journal skips
+        the stamp, never the answer)."""
+        with self.read() as conn:
+            row = conn.execute("SELECT id, last_seen, revoked_at FROM paired_devices WHERE token_hash = ?",
+                               (_sha256(token),)).fetchone()
+        if row is None or row["revoked_at"] is not None:
+            return None
+        stamp = utc_stamp(now)
+        if row["last_seen"] is None or row["last_seen"] <= utc_stamp(now - LAST_SEEN_EVERY):
+            try:
+                with self.write() as conn:
+                    conn.execute("UPDATE paired_devices SET last_seen = ? WHERE id = ? AND revoked_at IS NULL",
+                                 (stamp, row["id"]))
+            except sqlite3.Error:
+                pass
+        return str(row["id"])
+
+    def device_live(self, device_id: str) -> bool:
+        """Whether ``device_id`` names an unrevoked device (the change stream's re-check, RU-3). Stamps nothing."""
+        with self.read() as conn:
+            row = conn.execute("SELECT revoked_at FROM paired_devices WHERE id = ?", (device_id,)).fetchone()
+        return row is not None and row[0] is None
+
+    def revoke_devices(self, device_ids: "Sequence[str] | None", *, by: str, now: datetime) -> list[str]:
+        """Revoke each named device (None: every device) and its whole family, in ONE transaction (RQ-2, RS-3):
+        the descendant closure over ``paired_by = 'paired-' || id``; each member not yet revoked gets
+        ``revoked_at`` (monotonic), every unused offer it minted expires, and its broker generation rotates by one,
+        which cancels its WAITING pendings (a member that never wrote gets its ``tokens`` row first). A member
+        already revoked is skipped silently: revoked and rotated commit together, so it was rotated then. Returns
+        the ids this call revoked. An unknown id raises :class:`PairingError` and nothing moves."""
+        stamp = utc_stamp(now)
+        with self.write() as conn:
+            _expire(conn, now)
+            if device_ids is None:
+                roots = [r[0] for r in conn.execute("SELECT id FROM paired_devices ORDER BY rowid")]
+            else:
+                roots = list(device_ids)
+                for d in roots:
+                    if not isinstance(d, str) or _DEVICE_ID.fullmatch(d) is None:
+                        raise PairingError(f"not a device id: {d!r}")
+                    if conn.execute("SELECT 1 FROM paired_devices WHERE id = ?", (d,)).fetchone() is None:
+                        raise PairingError(f"no such device: {d}")
+            # RS-5: the closure's join is the credential-name rule itself, stated once here
+            assert PAIRED_PREFIX == "paired-", "the closure below joins on the literal 'paired-' prefix"
+            family: list[str] = []
+            for root in roots:
+                for (member,) in conn.execute(
+                        "WITH RECURSIVE fam(id) AS (SELECT id FROM paired_devices WHERE id = ? "
+                        "UNION SELECT d.id FROM paired_devices d JOIN fam ON d.paired_by = 'paired-' || fam.id) "
+                        "SELECT id FROM fam", (root,)).fetchall():
+                    if member not in family:
+                        family.append(member)
+            revoked: list[str] = []
+            for member in family:
+                if not conn.execute("UPDATE paired_devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+                                    (stamp, member)).rowcount:
+                    continue
+                name = PAIRED_PREFIX + member
+                conn.execute("UPDATE pair_offers SET expires = ? WHERE minted_by = ? AND used_at IS NULL "
+                             "AND expires > ?", (stamp, name, stamp))
+                conn.execute("INSERT OR IGNORE INTO tokens (name, generation) VALUES (?, 1)", (name,))
+                (gen,) = conn.execute("SELECT generation FROM tokens WHERE name = ?", (name,)).fetchone()
+                _rotate_in(conn, name, expect_generation=int(gen), new_generation=int(gen) + 1, by=by, stamp=stamp)
+                revoked.append(member)
+        return revoked
+
+    def list_devices(self) -> list[dict[str, Any]]:
+        """Every paired device, oldest first: id, label, created, last_seen, revoked_at, paired_by. Never a hash."""
+        with self.read() as conn:
+            rows = conn.execute("SELECT id, label, created, last_seen, revoked_at, paired_by FROM paired_devices "
+                                "ORDER BY created, rowid").fetchall()
+        return [dict(r) for r in rows]
 
     def cancel_as_effect(self, target_id: str, *, by: str, now: datetime) -> str:
         """The cross-principal cancel's single effect on ``pend:<id>`` (§3.5): ``state`` WAITING ->
@@ -1331,6 +1484,59 @@ def _finish_due(row: sqlite3.Row) -> datetime:
         return parse_stamp(row["decided_at"])
     except ConsentError as exc:
         raise _corrupt(row["operation_id"], "a due time does not parse") from exc
+
+
+def _rotate_in(conn: sqlite3.Connection, name: str, *, expect_generation: int, new_generation: int, by: str,
+               stamp: str) -> str:
+    """Token rotation inside the caller's open write transaction (§13; PAIR RS-3): ``generation`` moves to
+    ``new_generation`` only from ``expect_generation``, and every WAITING pending of the old generation is cancelled.
+    ``already`` / ``precondition_lost`` / ``applied``, as :meth:`CockpitDB.rotate_token` answers."""
+    row = conn.execute("SELECT generation FROM tokens WHERE name = ?", (name,)).fetchone()
+    if row is not None and row[0] == new_generation:
+        return "already"
+    if row is None or row[0] != expect_generation:
+        return "precondition_lost"
+    conn.execute("UPDATE tokens SET generation = ? WHERE name = ? AND generation = ?",
+                 (new_generation, name, expect_generation))
+    conn.execute("UPDATE pendings SET state = 'CANCELLED', reason = 'token rotated', "
+                 "cancelled_by = ?, terminal_at = ? WHERE principal = ? AND state = 'WAITING'",
+                 (by, stamp, f"token:{name}:{expect_generation}"))
+    return "applied"
+
+
+def _sha256(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _clean_label(label: Any) -> str:
+    """A device label as typed on the offering device (RP-6): 1..64 printable characters once stripped; absent is
+    ``paired device``."""
+    if label is None:
+        return "paired device"
+    if not isinstance(label, str):
+        raise PairingError("a label is a string")
+    clean = " ".join(label.split())
+    if not clean or len(clean) > _LABEL_MAX or not clean.isprintable():
+        raise PairingError(f"a label is 1..{_LABEL_MAX} printable characters")
+    return clean
+
+
+def _device_revoked(conn: sqlite3.Connection, name: str) -> bool:
+    """Whether the credential ``name`` is a ``paired-*`` one whose device is revoked or gone (any other name: False)."""
+    if not name.startswith(PAIRED_PREFIX):
+        return False
+    row = conn.execute("SELECT revoked_at FROM paired_devices WHERE id = ?",
+                       (name[len(PAIRED_PREFIX):],)).fetchone()
+    return row is None or row[0] is not None
+
+
+def _refuse_revoked_device(conn: sqlite3.Connection, principal: str) -> None:
+    """PAIR RS-4: a ``token:paired-<id>:<gen>`` principal whose device is revoked raises :class:`DeviceRevoked`."""
+    tok = _token_parts(principal) if principal.startswith("token:") else None
+    if tok is not None and _device_revoked(conn, tok[0]):
+        raise DeviceRevoked(f"{tok[0]} is revoked: it files no pending")
 
 
 def _credential_problem(conn: sqlite3.Connection, principal: str) -> str | None:

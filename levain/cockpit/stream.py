@@ -189,12 +189,15 @@ class Watcher:
 def run(
     write: Callable[[bytes], None], sub: Subscription, *, stop: threading.Event,
     heartbeat_s: float = DEFAULT_HEARTBEAT_S, poll_s: float = 0.5, clock: Callable[[], float] = time.monotonic,
-    alive: Callable[[], bool] | None = None,
+    alive: Callable[[], bool] | None = None, allowed: Callable[[bool], bool] | None = None,
 ) -> None:
     """Drive one stream until ``stop`` is set, the subscription dies, ``write`` raises (a gone client), or
     ``alive`` says the peer has hung up: a quiet stream would otherwise hold its slot, and keep the watcher
-    running, until the next heartbeat write failed."""
-    last_write = clock()
+    running, until the next heartbeat write failed.
+
+    ``allowed(at_heartbeat)`` (PAIR RU-3) is asked on EVERY loop pass, before any frame (data or heartbeat) is
+    written, and the stream ends the moment it answers False: a revoked paired device's open stream writes nothing
+    after its revoke. ``at_heartbeat`` is True on the pass that would write a heartbeat."""
     write(frame("hello", sub.hello, sub.hello_id))
     last_write = clock()
     while not stop.is_set() and not sub.dead:
@@ -203,9 +206,14 @@ def run(
         except queue.Empty:
             if alive is not None and not alive():
                 return
-            if clock() - last_write >= heartbeat_s:
+            beat = clock() - last_write >= heartbeat_s
+            if allowed is not None and not allowed(beat):
+                return
+            if beat:
                 write(b": hb\n\n")
                 last_write = clock()
             continue
+        if allowed is not None and not allowed(False):
+            return
         write(frame(event, data, eid))
         last_write = clock()
