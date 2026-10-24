@@ -28,7 +28,6 @@ def tmp_path():
     pytest tmp_path there answers every signature `verifier_unavailable` (CI 2026-10-15, reproduced with --basetemp
     under /tmp). Overriding the name reaches the imported team fixtures too."""
     import shutil
-    import tempfile
     d = anchor_scratch("t3-")
     try:
         yield d

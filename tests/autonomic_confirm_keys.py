@@ -46,18 +46,22 @@ SCRATCH_PARENT = ".levain-test-scratch"
 _LEGACY_PREFIXES = (".levain-confirm-keys-", ".levain-k2b-broker-", ".levain-t3-",
                     ".levain-k2b-crash-", ".levain-k8a-", ".levain-row12b-", ".levain-custody-broker-")   # the leaked ones, ONLY these
 _DEAD_AFTER = 600          # a dead-pid entry is swept once this old (never a live run's, never a just-made one)
-_LEGACY_AFTER = 7200
-_PID_RE = re.compile(r"-(\d+)-[A-Za-z0-9_]{8}$")
+_LEGACY_AFTER = 86400      # legacy dirs carry no ownership marker, so the bound is a day, not a run's length
+_PID_RE = re.compile(r"-(\d+)-[A-Za-z0-9_]+$")
 _swept: set[str] = set()
 
 
 def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return True                      # pid 0 signals the process group: never judge it dead
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    except (OverflowError, ValueError):
+        return True                      # out of range: not ours to sweep
     return True
 
 
@@ -73,23 +77,30 @@ def _rm_old_dir(path: str, age: float, now: float) -> None:
 def sweep_scratch(parent: str, home: str, now: float | None = None) -> None:
     """Remove what killed runs left (their ``atexit`` / ``finally`` never ran): dirs under ``parent`` whose
     embedded pid is dead and which are older than 10 minutes, and top-level legacy dirs in ``home`` with one of
-    the three old prefixes older than 2 hours. Nothing else is touched."""
+    the old prefixes older than 24 hours. Nothing else is touched. Assumes one host per account home (a pid is
+    only meaningful in its own pid namespace). A sweep problem never fails a test."""
     now = time.time() if now is None else now
     try:
         names = os.listdir(parent)
     except OSError:
         names = []
     for n in names:
-        m = _PID_RE.search(n)
-        if m and not _pid_alive(int(m.group(1))):
-            _rm_old_dir(os.path.join(parent, n), _DEAD_AFTER, now)
+        try:
+            m = _PID_RE.search(n)
+            if m and not _pid_alive(int(m.group(1))):
+                _rm_old_dir(os.path.join(parent, n), _DEAD_AFTER, now)
+        except Exception:
+            pass
     try:
         names = os.listdir(home)
     except OSError:
         names = []
     for n in names:
-        if n.startswith(_LEGACY_PREFIXES):
-            _rm_old_dir(os.path.join(home, n), _LEGACY_AFTER, now)
+        try:
+            if n.startswith(_LEGACY_PREFIXES):
+                _rm_old_dir(os.path.join(home, n), _LEGACY_AFTER, now)
+        except Exception:
+            pass
 
 
 def anchor_scratch(prefix: str) -> Path:
@@ -107,6 +118,8 @@ def anchor_scratch(prefix: str) -> Path:
         pytest.skip(f"{parent!r} is a symlink or not a directory: refusing it as a trust-anchor parent")
     if st.st_uid != os.getuid() or st.st_mode & 0o022:
         pytest.skip(f"{parent!r} is not owned by this uid or is group/other-writable: refusing it")
+    if not os.access(parent, os.R_OK | os.W_OK | os.X_OK):
+        pytest.skip(f"{parent!r} lacks read/write/search access for this uid: refusing it as a trust-anchor parent")
     if parent not in _swept:
         _swept.add(parent)
         sweep_scratch(parent, home)

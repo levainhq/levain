@@ -34,7 +34,10 @@ def _age(path: Path, seconds: float) -> None:
 
 def _mk(parent: Path, name: str, age: float = 0) -> Path:
     d = parent / name
-    d.mkdir(parents=True)
+    if not parent.exists():
+        parent.mkdir(mode=0o700, parents=True)
+        parent.chmod(0o700)              # umask-free: the helper refuses a group/other-writable parent
+    d.mkdir()
     (d / "k").write_text("x")
     _age(d, age)
     return d
@@ -53,13 +56,35 @@ def test_sweep_dead_old_kept_live_and_fresh(fake_home):
 
 
 def test_legacy_top_level_sweep_only_listed_prefixes_and_old(fake_home):
-    old = [_mk(fake_home, f"{p}abc", 3 * 3600) for p in (".levain-confirm-keys-", ".levain-k2b-broker-", ".levain-t3-", ".levain-k2b-crash-", ".levain-k8a-", ".levain-row12b-", ".levain-custody-broker-")]
+    old = [_mk(fake_home, f"{p}abc", 25 * 3600) for p in (".levain-confirm-keys-", ".levain-k2b-broker-", ".levain-t3-", ".levain-k2b-crash-", ".levain-k8a-", ".levain-row12b-", ".levain-custody-broker-")]
     fresh = _mk(fake_home, ".levain-t3-new", 60)
-    other = _mk(fake_home, ".levain-dbg-old", 3 * 3600)
-    other2 = _mk(fake_home, ".levain-k8b-old", 3 * 3600)
+    mid = _mk(fake_home, ".levain-t3-mid", 3 * 3600)     # under the 24h legacy bound: kept
+    other = _mk(fake_home, ".levain-dbg-old", 25 * 3600)
+    other2 = _mk(fake_home, ".levain-k8b-old", 25 * 3600)
     ck.anchor_scratch("t3-")
     assert not any(o.exists() for o in old)
-    assert fresh.exists() and other.exists() and other2.exists()
+    assert fresh.exists() and mid.exists() and other.exists() and other2.exists()
+
+
+def test_out_of_range_and_zero_pid_entries_kept_and_anchor_still_works(fake_home):
+    parent = fake_home / ck.SCRATCH_PARENT
+    huge = _mk(parent, "x-99999999999999999999-abcd1234", 3600)
+    zero = _mk(parent, "x-0-abcd1234", 3600)
+    d = ck.anchor_scratch("t3-")
+    assert huge.exists() and zero.exists() and d.exists()
+
+
+def test_parent_without_access_refused(fake_home):
+    p = fake_home / ck.SCRATCH_PARENT
+    p.mkdir(mode=0o700)
+    p.chmod(0o000)
+    try:
+        if os.access(p, os.R_OK | os.W_OK | os.X_OK):
+            pytest.skip("running with privileges that ignore directory modes")
+        with pytest.raises(pytest.skip.Exception):
+            ck.anchor_scratch("t3-")
+    finally:
+        p.chmod(0o700)
 
 
 def test_parent_created_private(fake_home):
