@@ -57,7 +57,7 @@ DYNAMIC_SITES = {
     # the two comments name the explicit leaf maps; the firing / presence calls import only the blessed leaves of
     # ``_LAZY_FIRING_MODULES`` / ``_LAZY_PRESENCE_MODULES`` for the operator's daemon (a variable, not a root target);
     # the cockpit one is the operator's panel, importing ``levain.consent.limits`` (not a root-run module)
-    "levain/cockpit/providers.py:1174::" 'mod = importlib.import_module("levain.consent.limits")': (),
+    "levain/cockpit/providers.py:1180::" 'mod = importlib.import_module("levain.consent.limits")': (),
     "levain/firing/contract.py:193::" '# rather than ``import_module(f"{__name__}.{kind}")`` GOVERNS which leaves build_firing may': (),
     "levain/firing/contract.py:229::" 'importlib.import_module(module)  # blessed leaf — its own import errors propagate': (),
     "levain/firing/presence.py:136::" 'importlib.import_module(module)  # blessed leaf — its own import errors propagate': (),
