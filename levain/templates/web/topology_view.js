@@ -169,7 +169,9 @@
   // needs_first_what and needs_first are capped at 120 characters for the title and a data attribute; the card id is never cut: one that is not a
   // non-empty string or is longer than 120 is refused (display-only), never rewritten.
   const NEED_CAP = 120;
+  // what each marked owner ("hub", "node:<id>") last showed on a live lens: a mark plays its motion when it arrives or its count changes (a seat's: rises)
   const needSeen = new Map();
+  const needsSeenNow = (v) => { const m = new Map(); const h = needsOf(v.hub); if (h) m.set("hub", h.n); for (const n of arr(v.nodes)) { const k = needsOf(n); if (k && isObj(n)) m.set("node:" + n.id, k.n); } return m; };
   const capStr = (x) => (typeof x === "string" ? x.slice(0, NEED_CAP) : "");
   function needsOf(o) {
     if (!isObj(o) || !Number.isInteger(o.needs_open) || o.needs_open <= 0) return null;
@@ -181,9 +183,9 @@
   // drawn BENEATH every node so a tap on a node's own shape reaches the node (message the seat) and only the margin around the pill reaches the card.
   // deco, set only for the desk: {art, bx, by, rx}: the desk's own drawing (a group already placed at the hub) in place of the plain ring, and the badge's
   // centre as an offset from the hub, with its corner radius. A seat's mark passes none and is the red ring it always was.
-  function needMark(nd, cx, cy, rr, ang, opts, label, owner, scale, deco) {
+  function needMark(nd, cx, cy, rr, ang, opts, label, owner, scale, deco, calm) {
     const g = sv("g", { "data-needs": String(nd.n) }, "tv-need");
-    if (deco) g.appendChild(deco.art); else g.appendChild(sv("circle", { cx: num(cx), cy: num(cy), r: num(rr) }, "tv-needring"));
+    if (deco) g.appendChild(deco.art); else g.appendChild(sv("circle", { cx: num(cx), cy: num(cy), r: num(rr) }, "tv-needring" + (calm ? " calm" : "")));
     const bx = deco ? cx + deco.bx : cx + Math.cos(ang) * rr, by = deco ? cy + deco.by : cy + Math.sin(ang) * rr, txt = "!" + (nd.n > 9 ? "9+" : String(nd.n)), w = txt.length > 2 ? 30 : 24;
     const b = sv("g", { "data-needbadge": nd.card, "data-needfirst": nd.first, "data-needfor": owner }, "tv-needbadge");
     const tip = nd.what || (nd.n + " decision" + (nd.n === 1 ? "" : "s") + " waiting on you");
@@ -193,12 +195,13 @@
     b.appendChild(sv("title", null, null, tip));
     if (openable) {
       const go = (ev) => { ev.stopPropagation(); opts.openCard(nd.card); };
+      const who = typeof label === "string" && label ? label : "a seat";
       b.classList.add("tv-needopen");
       b.setAttribute("role", "button");
       b.setAttribute("tabindex", "0");
-      b.setAttribute("aria-label", label + ": " + tip + ": open its card");
+      b.setAttribute("aria-label", who + ": " + tip + ": open its card");
       b.addEventListener("click", go);
-      b.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); go(ev); } });
+      b.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); if (!ev.repeat) go(ev); } });
       const out = sv("g", null, "tv-needout");
       out.appendChild(b);
       const side = Math.max(44, Math.ceil(44 / (scale > 0 ? Math.min(1, scale) : 1)));
@@ -214,10 +217,10 @@
   // The desk's mark, direction M1 (bezel + callout): 60 engraved ticks (a major every 5) in the alert colour on a thin track hugging the core, a lubber notch at 12
   // o'clock, the "!N" readout on a short leader line (C's aviation callout) to the lower right, clear of every label. On arrival the ticks light in sequence once (CSS: 60 ticks 20 ms apart, each .2 s), then hold; the label
   // rides HUB_LIFT px higher while the desk is marked. Every part is inert to the pointer: the desk's own tap is untouched.
-  const HUB_LIFT = 9;
+  const HUB_LIFT = 9, HUB_CALLOUT_X = 82, HUB_CALLOUT_Y = 54;           // the callout pill's far edge from the hub's centre
   const pol = (r, deg) => [num(r * Math.sin(deg * Math.PI / 180)), num(-r * Math.cos(deg * Math.PI / 180))];     // clockwise from 12 o'clock, relative to the centre
-  function hubDeco(nd, cx, cy, fresh) {
-    const art = sv("g", { transform: "translate(" + num(cx) + " " + num(cy) + ")" }, "tv-hubmark tv-bezel" + (fresh.prev === undefined ? " sweep" : ""));
+  function hubDeco(nd, cx, cy, sweep) {
+    const art = sv("g", { transform: "translate(" + num(cx) + " " + num(cy) + ")" }, "tv-hubmark tv-bezel" + (sweep ? " sweep" : ""));
     art.appendChild(sv("circle", { cx: 0, cy: 0, r: 38.5 }, "tv-bz-track"));
     for (let i = 0; i < 60; i++) {
       const maj = i % 5 === 0, a = pol(maj ? 31.6 : 33.4, i * 6), b = pol(37.2, i * 6);
@@ -675,16 +678,18 @@
         y += Math.ceil(mine.length / ranks) * pitch + 26;
       }
     }
-    const short = settleGroups(gpos, hub, hubHalf, H);
+    const short = settleGroups(gpos, hub, hubHalf, H, !!needsOf(v.hub));
     return { LW, H, hub, gpos, pos, short, gkey: (n) => (gids.has(n.group) ? n.group : "") };
   }
   // A seat's node sits at the middle of its lanes, but its block (the node, then its two label lines) is 72 tall and must not lie on another
   // seat's block, on the hub's label or on the hub: where the middle is taken it slides along its own column to the nearest free row. The
   // biggest seats keep their middle (they have the most lanes tied to it); the smaller ones give way.
   const GROUP_BLOCK_H = 72, BLOCK_GAP = 6;
-  function settleGroups(gpos, hub, hubHalf, H) {
+  function settleGroups(gpos, hub, hubHalf, H, marked) {
     const blockOf = (gp, y) => ({ x: gp.x - gp.hw, y: y - gp.r, w: 2 * gp.hw, h: GROUP_BLOCK_H });
-    const hubBlock = { x: hub.x - hubHalf, y: hub.y - hub.r - 44, w: 2 * hubHalf, h: 44 + 2 * hub.r + 16 };
+    // a marked desk's label rides HUB_LIFT higher and its callout reaches right and below the hub: the block holds what is drawn
+    const up = marked ? HUB_LIFT : 0, right = marked ? Math.max(hubHalf, HUB_CALLOUT_X) : hubHalf, down = marked ? Math.max(hub.r + 16, HUB_CALLOUT_Y) : hub.r + 16;
+    const hubBlock = { x: hub.x - hubHalf, y: hub.y - hub.r - 44 - up, w: hubHalf + right, h: 44 + up + hub.r + down };
     const clear = (b, others) => others.every((o) => !(b.x < o.x + o.w + BLOCK_GAP && o.x < b.x + b.w + BLOCK_GAP && b.y < o.y + o.h + BLOCK_GAP && o.y < b.y + b.h + BLOCK_GAP));
     const placed = [hubBlock];
     const lo = 24, hi = Math.max(lo, H - GROUP_BLOCK_H - 8);
@@ -738,7 +743,8 @@
     const nodes = arr(v.nodes), running = nodes.filter((n) => n.state === "running").length, h = L.hub;
     const hsub = nodes.length + (nodes.length === 1 ? " session" : " sessions") + " \u00b7 " + running + " running";
     const hw = Math.max(measure(hsub, "l2"), 70);
-    const out = { hubText: hsub, hub: box(h.x - hw / 2 - 7, h.y - h.r - 42, hw + 14, 40), hubBody: box(h.x - h.r - 8, h.y - h.r - 8, 2 * (h.r + 8), 2 * (h.r + 8)), groups: new Map(), faces: new Map(), rings: [] };
+    const marked = !!needsOf(v.hub), lift = marked ? HUB_LIFT : 0;
+    const out = { hubText: hsub, hub: box(h.x - hw / 2 - 7, h.y - h.r - 42 - lift, hw + 14, 40), hubMark: marked ? [box(h.x - 44, h.y - 44, 88, 88), box(h.x + 42, h.y + 30, HUB_CALLOUT_X - 38, HUB_CALLOUT_Y - 30)] : [], hubBody: box(h.x - h.r - 8, h.y - h.r - 8, 2 * (h.r + 8), 2 * (h.r + 8)), groups: new Map(), faces: new Map(), rings: [] };
     for (const [k, gp] of L.gpos) {
       const mem = nodes.filter((n) => L.gkey(n) === k), run = mem.filter((n) => n.state === "running").length;
       const sub = mem.length + (mem.length === 1 ? " agent" : " agents") + " \u00b7 " + run + " running";
@@ -768,7 +774,7 @@
   function conflictArcs(v, L, measure, boxes) {
     const out = [], byId = new Map(arr(v.nodes).map((n) => [n.id, n]));
     const bx = boxes || graphBoxes(v, L, measure);
-    const obstacles = [bx.hub, bx.hubBody, ...Array.from(bx.groups.values()).map((g) => g.rect), ...Array.from(bx.faces.values()), ...bx.rings];
+    const obstacles = [bx.hub, bx.hubBody, ...(bx.hubMark || []), ...Array.from(bx.groups.values()).map((g) => g.rect), ...Array.from(bx.faces.values()), ...bx.rings];
     for (const c of arr(v.conflicts)) {
       if (!isObj(c) || typeof c.path !== "string") continue;
       const ids = arr(c.nodes).filter((id) => L.pos.has(id) && byId.has(id));
@@ -940,6 +946,9 @@
 
   // ---- the SVG ----
   function drawGraph(v, L, edges, measure, opts, scale, fresh) {
+    fresh = fresh || { prev: new Map(), still: true };
+    const shown = new Map();                                                // what this draw puts on screen, committed by the lens once it is the visible build
+    fresh.shown = shown;
     const svg = sv("svg", { viewBox: "0 0 " + L.LW + " " + L.H, role: "group", "aria-label": "Agents graph", preserveAspectRatio: "xMidYMid meet" }, "tv-graph");
     const nodes = arr(v.nodes), byId = new Map(nodes.map((n) => [n.id, n]));
     const lost = lostMap(v), bxs = graphBoxes(v, L, measure);
@@ -976,10 +985,11 @@
     hg.appendChild(sv("circle", { cx: num(h.x), cy: num(h.y), r: 9 }, "tv-hubcore" + (running ? " run" : "")));
     const hsub = bxs.hubText, hr = bxs.hub;
     const hubNeed = needsOf(v.hub), lift = hubNeed ? HUB_LIFT : 0;          // a marked desk's label rides a few px higher so the mark never touches it
-    hg.appendChild(sv("rect", { x: num(hr.x), y: num(hr.y - lift), width: num(hr.w), height: hr.h, rx: 7 }, "tv-lblbg"));
+    hg.appendChild(sv("rect", { x: num(hr.x), y: num(hr.y), width: num(hr.w), height: hr.h, rx: 7 }, "tv-lblbg"));
     hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 26 - lift), "text-anchor": "middle" }, "tv-hubname", hubLabel));
     hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 10 - lift), "text-anchor": "middle" }, "tv-hubsub", hsub));
-    const hubMark = hubNeed ? needMark(hubNeed, h.x, h.y, h.r + 14, Math.PI / 4, opts, hubLabel || "the desk", "hub", scale, hubDeco(hubNeed, h.x, h.y, fresh || {})) : null;
+    const hubMark = hubNeed ? needMark(hubNeed, h.x, h.y, h.r + 14, Math.PI / 4, opts, hubLabel || "the desk", "hub", scale, hubDeco(hubNeed, h.x, h.y, !fresh.still && fresh.prev.get("hub") !== hubNeed.n), false) : null;
+    if (hubNeed) shown.set("hub", hubNeed.n);
     if (hubMark) hg.appendChild(hubMark.inner);
     svg.appendChild(hg);
     if (hubMark && hubMark.under) under.appendChild(hubMark.under);
@@ -1033,17 +1043,19 @@
       // every node is a keyboard stop: Enter or Space opens its page as a click does (agentsLens binds the keys)
       g.setAttribute("role", "button");
       g.setAttribute("tabindex", "0");
-      g.setAttribute("aria-label", n.label + ", " + (NODE_WORDS[n.state] || n.state) + ": open its page");
+      g.setAttribute("aria-label", (typeof n.label === "string" && n.label ? n.label : n.id || "a seat") + ", " + (NODE_WORDS[n.state] || n.state) + ": open its page");
       if (wait && typeof n.card === "string" && n.card && opts && typeof opts.openCard === "function") {
         g.classList.add("tv-open");
-        g.setAttribute("aria-label", n.label + ", waiting on you: open its card");
+        g.setAttribute("aria-label", (typeof n.label === "string" && n.label ? n.label : n.id || "a seat") + ", waiting on you: open its card");
         g.dataset.card = n.card;
         const go = () => opts.openCard(n.card);
         g.addEventListener("click", go);
         g.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); go(); } });
       }
       const need = needsOf(n);
-      const mark = need ? needMark(need, P.x, P.y, r + 8, dir === 1 ? Math.PI * 0.75 : Math.PI * 0.25, opts, n.label, "node:" + n.id, scale) : null;
+      const owner = "node:" + n.id, prevN = fresh.prev.get(owner);
+      const mark = need ? needMark(need, P.x, P.y, r + 8, dir === 1 ? Math.PI * 0.75 : Math.PI * 0.25, opts, n.label, owner, scale, undefined, fresh.still || !(prevN === undefined || need.n > prevN)) : null;
+      if (need) shown.set(owner, need.n);
       if (mark) g.appendChild(mark.inner);
       svg.appendChild(g);
       if (mark && mark.under) under.appendChild(mark.under);
@@ -1178,8 +1190,9 @@
     release();
     const wrap = el("div", "tv-agents");
     // what the desk's mark last showed: undefined = it just arrived, a number = the count it had (a rebuild at the same data replays nothing)
-    const fresh = { prev: needSeen.get("hub") };
-    if (!(opts && opts.still)) { const hn = needsOf(v.hub); if (hn) needSeen.set("hub", hn.n); else needSeen.delete("hub"); }
+    const still = !!(opts && opts.still);
+    const fresh = { prev: new Map(needSeen), still, shown: null };
+    if (!still) { needSeen.clear(); for (const [k, n] of needsSeenNow(v)) needSeen.set(k, n); }
     const stage = el("div", "tv-stage");
     const hint = el("span", "tv-hint", "Click a node for its page. Hover for the face.");
     stage.appendChild(hint);
@@ -1232,6 +1245,7 @@
       if (svgNode) svgNode.remove();
       const g = drawGraph(v, L, edges, measure, opts, scale, fresh);
       svgNode = g.svg;
+      if ((fresh.real || typeof ResizeObserver !== "function") && fresh.shown) for (const [k, n] of fresh.shown) fresh.prev.set(k, n);       // the build the person sees has played its motion: a redraw of the same lens stays still
       if (phone) svgNode.style.width = Math.round(LW * scale) + "px";
       stage.insertBefore(svgNode, canvas);
       // the canvas keeps the graph's own proportions: CSS size follows the SVG, the backing store follows the device
@@ -1259,7 +1273,7 @@
     if (typeof ResizeObserver === "function") {
       linkObserver = new ResizeObserver(() => {
         const w = Math.round(stage.getBoundingClientRect().width);
-        if (w > 0 && (w !== seen || !built)) { const first = seen === 0; seen = w; if (first || Math.abs(w - LW) > 1 || scale < 1) build(w); }
+        if (w > 0 && (w !== seen || !built)) { const first = seen === 0; seen = w; fresh.real = true; if (first || Math.abs(w - LW) > 1 || scale < 1) build(w); }
       });
       linkObserver.observe(stage);
     }

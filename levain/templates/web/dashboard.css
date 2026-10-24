@@ -58,7 +58,7 @@
     --key-bg: linear-gradient(to bottom, color-mix(in oklch, var(--card-2), var(--contrast) 10%), color-mix(in oklch, var(--card-2), var(--contrast) 3%));
     --track-bg: color-mix(in oklch, var(--base), #000 18%);
     /* status: one each, none of them is the accent. A status shows as a dot plus neutral words. */
-    --ok: oklch(0.78 0.14 155); --warn: oklch(0.84 0.13 90); --bad: oklch(0.70 0.17 25);
+    --ok: oklch(0.78 0.14 155); --warn: oklch(0.84 0.13 90); --bad: oklch(0.70 0.17 25); --on-bad: var(--base);
     /* AQI ramp (EPA bands) in the same system */
     --aqi-moderate: oklch(0.86 0.14 100); --aqi-sensitive: oklch(0.78 0.15 60); --aqi-unhealthy: oklch(0.70 0.17 25);
     --aqi-very: oklch(0.66 0.17 320); --aqi-hazard: oklch(0.58 0.15 10);
@@ -99,7 +99,7 @@
       --meta: color-mix(in oklch, var(--contrast) 64%, var(--base));
       --on-accent: oklch(0.2 0.03 265);   /* dark text on the orange fill: white on it is 3.3:1 */
       --accent-soft: oklch(0.945 0.04 65); --accent-line: oklch(0.78 0.11 60);
-      --ok: oklch(0.45 0.12 155); --warn: oklch(0.48 0.12 70); --bad: oklch(0.5 0.17 25);
+      --ok: oklch(0.45 0.12 155); --warn: oklch(0.48 0.12 70); --bad: oklch(0.5 0.17 25); --on-bad: var(--base);
       --info: oklch(0.5 0.12 245); --violet: oklch(0.5 0.15 305);
       --aqi-moderate: oklch(0.55 0.12 90); --aqi-sensitive: oklch(0.55 0.15 55); --aqi-unhealthy: oklch(0.5 0.17 25);
       --aqi-very: oklch(0.45 0.17 320); --aqi-hazard: oklch(0.4 0.15 10);
@@ -125,7 +125,7 @@
     --meta: color-mix(in oklch, var(--contrast) 64%, var(--base));
     --on-accent: oklch(0.2 0.03 265);
     --accent-soft: oklch(0.945 0.04 65); --accent-line: oklch(0.78 0.11 60);
-    --ok: oklch(0.45 0.12 155); --warn: oklch(0.48 0.12 70); --bad: oklch(0.5 0.17 25);
+    --ok: oklch(0.45 0.12 155); --warn: oklch(0.48 0.12 70); --bad: oklch(0.5 0.17 25); --on-bad: var(--base);
     --info: oklch(0.5 0.12 245); --violet: oklch(0.5 0.15 305);
     --aqi-moderate: oklch(0.55 0.12 90); --aqi-sensitive: oklch(0.55 0.15 55); --aqi-unhealthy: oklch(0.5 0.17 25);
     --aqi-very: oklch(0.45 0.17 320); --aqi-hazard: oklch(0.4 0.15 10);
@@ -2441,7 +2441,7 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-gnode-risk { fill: var(--warn); }
 .tv-needring { fill: none; stroke: var(--bad); stroke-width: 3.5; opacity: 1; transform-box: fill-box; transform-origin: center; pointer-events: none; }
 .tv-needpill { fill: var(--bad); stroke: var(--base); stroke-width: 1.5px; }
-.tv-needtxt { fill: var(--on-accent); font: var(--fw-bold) 13px var(--round); pointer-events: none; }
+.tv-needtxt { fill: var(--on-bad); font: var(--fw-bold) 13px var(--round); pointer-events: none; }
 .tv-needopen { cursor: pointer; } .tv-needopen:focus-visible .tv-needpill { stroke: var(--text); stroke-width: 2px; }
 .tv-hubmark, .tv-hubmark * { pointer-events: none; }
 .tv-bz-track { fill: none; stroke: var(--hair-2); stroke-width: 1; opacity: .85; }
@@ -2500,11 +2500,11 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .lc-ok, .lc-unread { margin-left: auto; white-space: nowrap; color: var(--ok); }
 .lc-unread { color: var(--meta); }
 .lc-foot { margin: var(--sp-4) 0 0; padding-top: var(--sp-4); border-top: 1px solid var(--hair); font-size: var(--fs-micro); color: var(--meta); }
-@media (prefers-reduced-motion: no-preference) { .tv-task.waiting, .tv-rec { animation: tv-breathe 3.2s ease-in-out 3; } .tv-pulse { animation: tv-ring 2.6s ease-in-out 4; } .tv-needring { animation: tv-needflash 1.4s ease-in-out 8; }   /* finite, like traceBreathe: an infinite animation keeps the page compositing every frame (10-15) */ }
+@media (prefers-reduced-motion: no-preference) { .tv-task.waiting, .tv-rec { animation: tv-breathe 3.2s ease-in-out 3; } .tv-pulse { animation: tv-ring 2.6s ease-in-out 4; } .tv-needring:not(.calm) { animation: tv-needflash 1.4s ease-in-out 8; }   /* finite, like traceBreathe: an infinite animation keeps the page compositing every frame (10-15) */ }
 @keyframes tv-breathe { 50% { box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 22%, transparent); } }
 @keyframes tv-needflash { 50% { opacity: .2; } }
 @keyframes tv-ring { 50% { transform: scale(0.82); opacity: .3; } }
-.tv-replaying .tv-task.waiting, .tv-replaying .tv-rec, .tv-replaying .tv-pulse, .tv-replaying .tv-needring, .tv-replaying .tv-hubmark * { animation: none; }       /* a frame from the ledger is still: nothing breathes or pulses */
+.tv-replaying .tv-task.waiting, .tv-replaying .tv-rec, .tv-replaying .tv-pulse, .tv-replaying .tv-needring, .tv-replaying .tv-hubmark *, .tv-replaying .tv-bezel.sweep .tv-bz-tick { animation: none; }       /* a frame from the ledger is still: nothing breathes or pulses */
 @container (max-width: 520px) { .tv-right { margin-left: 0; } .tv-bar { align-items: flex-start; } .tv-task-h { flex-wrap: wrap; } }
 .tv-more { align-self: flex-start; border: 1px solid var(--hair-2); background: none; color: var(--label); border-radius: var(--r-md); padding: var(--sp-1) var(--sp-4); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
 .tv-more:hover { background: var(--card-2); color: var(--text); }

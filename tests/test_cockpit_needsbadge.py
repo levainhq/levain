@@ -241,3 +241,51 @@ def test_the_hit_pad_is_44_css_px_on_the_first_phone_width_build(tmp_path, monke
     first = "(() => { const h = %s; if (!h || !%s.querySelector('.tv-phone')) return false; window.__w = h.getBoundingClientRect().width; return true; })()" % (HIT % "node:n3", TV)
     out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_needy(), "agents")}, {"until": first}, {"eval": "window.__w"}], first=NARROW)
     assert out[-1] >= 43.5, out
+
+
+SWEEPS = "%s.querySelectorAll('.tv-bezel.sweep').length" % TV
+WAIT = {"eval": "new Promise(r => setTimeout(r, 200))"}
+
+
+@needs_browser
+def test_a_redraw_of_the_same_lens_at_the_same_count_does_not_replay_the_bezel_sweep(tmp_path, monkeypatch):
+    """L1 W1+W2: the sweep plays when the desk's mark arrives or its count changes, never when the same lens redraws at a new width."""
+    from tests.test_cockpit_k7_build import _sessions_fixture
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_needy(), "agents")}, WAIT, {"eval": SWEEPS},
+                               {"eval": "%s.querySelector('.tv-stage').style.width = '700px'; 1" % TV}, WAIT, {"eval": "%s.querySelector('.tv-stage').style.width = '640px'; 1" % TV}, WAIT,
+                               {"eval": "JSON.stringify([%s, %s.querySelectorAll('.tv-bezel').length])" % (SWEEPS, TV)}])
+    assert out[-6] == 1, out                                  # the first visible build plays it
+    assert json.loads(out[-1]) == [0, 1], out                 # a width change redraws the bezel and replays nothing
+
+
+@needs_browser
+def test_a_seat_ring_flashes_when_its_mark_arrives_or_its_count_rises_and_not_on_a_refresh(tmp_path, monkeypatch):
+    """L1 W4: the SVG is rebuilt on every refresh, so a ring that flashed on every build would blink for good."""
+    from tests.test_cockpit_k7_build import _sessions_fixture
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    anim = "JSON.stringify(getComputedStyle(%s.querySelector('.tv-gnode[data-node=n3] .tv-needring')).animationName)" % TV
+    more = _needy()
+    {n["id"]: n for n in more["nodes"]}["n3"].update(needs_open=2)
+    out = _run(tmp_path, src, [*PRIME, {"motion": "no-preference"}, {"eval": _paint(_needy(), "agents")}, WAIT, {"eval": anim},
+                               {"eval": _paint(_needy(), "agents")}, WAIT, {"eval": anim},
+                               {"eval": _paint(more, "agents")}, WAIT, {"eval": anim}])
+    assert [json.loads(out[-7]), json.loads(out[-4]), json.loads(out[-1])] == ["tv-needflash", "none", "tv-needflash"], out
+
+
+@needs_browser
+def test_with_the_desk_marked_no_group_label_or_conflict_chip_sits_on_the_lifted_label_or_the_callout(tmp_path, monkeypatch):
+    """L1 W3: a marked desk's label rides higher and its bezel and callout take room; the placer reserves what is drawn."""
+    from tests.test_cockpit_k7_build import _sessions_fixture
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    probe = ("(() => { const g = %s.querySelector('.tv-graph'), bb = (e) => { const b = e.getBBox(); return [b.x, b.y, b.x + b.width, b.y + b.height]; }, "
+             "hit = (a, b) => Math.min(a[2], b[2]) - Math.max(a[0], b[0]) > 0.5 && Math.min(a[3], b[3]) - Math.max(a[1], b[1]) > 0.5, "
+             "mine = [g.querySelector('.tv-ghub .tv-lblbg'), g.querySelector('.tv-needbadge[data-needfor=hub] .tv-needpill')].map(bb), "
+             "others = [...g.querySelectorAll('.tv-ggroup .tv-lblbg, .tv-confchip')].map(bb); "
+             "return JSON.stringify(others.map(o => mine.some(m => hit(o, m)))); })()") % TV
+    v = _needy()
+    v["conflicts"] = [{"path": "f%d.py" % i, "nodes": [a, b]} for i, (a, b) in enumerate([(a, b) for k, a in enumerate(["n1", "n2", "n3", "n4", "n5"]) for b in ["n1", "n2", "n3", "n4", "n5"][k + 1:]])]
+    for size in (DESKTOP, NARROW):
+        out = _run(tmp_path, src, [*PRIME, {"eval": _paint(v, "agents")}, WAIT, {"eval": probe}], first=size)
+        got = json.loads(out[-1])
+        assert got and not any(got), (size, out)
