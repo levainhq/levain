@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.23] — 2026-10-24
+
 ### Added
 - **The cockpit's grant "revoke" button signs with your passkey.** On a cockpit served with a `signer=` over the same
   consent queue its grant cards come from, the button
