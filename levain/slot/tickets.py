@@ -5,9 +5,10 @@ ticket it mints in ONE append-only journal, `L/sessions/tickets.jsonl` (CONTROL 
 line, fsynced per append), and rebuilds everything it counts from that journal at its start: the open tickets, the UTC
 day's mints, and the attempt index `RUN-TICKET-STATUS` answers from.
 
-Lines (`op`): `mint` (the ticket, its `attempt_id`, the request digest, the facts, the mint time and UTC day), `cancel`,
-`expire` (an unbound ticket past V16), `tombstone` (`{attempt_id, ticket, request_digest, state, session?}`, written only
-by the compaction). A tombstone is authoritative over every other line of its attempt. One `attempt_id` naming two
+Lines (`op`): `mint` (the ticket, its `attempt_id`, the `run_id` CONTROL minted with it, the request digest, the facts,
+the mint time and UTC day), `bind` (an unbound ticket bound to the session an `ATTACH` created), `cancel`, `expire` (an
+unbound ticket past V16), `tombstone` (`{attempt_id, ticket, request_digest, state, session?}`, written only by the
+compaction). A tombstone is authoritative over every other line of its attempt. One `attempt_id` naming two
 tickets or two request digests, one ticket named by two attempts, or a whole line that does not parse, refuses the start
 (`journal-inconsistent`): CONTROL never serves a ticket journal it cannot read whole. A last line with no newline is a
 torn append (a crash inside the write) and is dropped; the compaction then rewrites the journal without it.
@@ -21,8 +22,12 @@ Idempotent mint: a mint whose `attempt_id` the index already names is compared o
 difference: `attempt-conflict`, whatever the ticket's state); an equal one answers the same ticket while it is unbound
 and counts nothing again, else `attempt-closed`.
 
-The reader refuses any op it does not hold (a lease binding a ticket, and a slot releasing one, are journaled by the
-code that builds them, with the reader that holds them).
+`run_id` (head ruling H1, 1024+8): CONTROL's own opaque id for the run (`r-` + 16 lower-case hex), the ledger scope
+`("run", run_id)` and `TOKEN-RESOLVE`'s `run.run_id`; a replay of the same attempt answers the same one. The ticket is a
+bearer handle for `LEASE-OPEN` and never leaves CONTROL past dispatch: the run is named by `run_id` everywhere else.
+
+The reader refuses any op it does not hold (a slot releasing a ticket is journaled by the code that builds it, 3c-7,
+with the reader that holds it).
 
 Runs on the root interpreter (3.9)."""
 from __future__ import annotations
@@ -30,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -39,6 +45,7 @@ from typing import Callable, Dict, List, Mapping, Optional
 from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
 from levain.slot import Refused
+from levain.slot.grammar import SESSION_RE
 
 JOURNAL = "tickets.jsonl"
 CEILING_FORMAT = "levain-dispatch-ceiling/1"
@@ -62,6 +69,14 @@ _ROUTE = re.compile(r"[a-z0-9-]{1,48}")
 #: DECISION: a job id and a model name take the text form CONTROL already uses for names it records.
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}")
 _DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+#: head ruling H1: a run id is `r-` + 16 lower-case hex digits, CONTROL's to mint.
+RUN_ID_RE = re.compile(r"r-[0-9a-f]{16}")
+#: the session kind and class a ticket kind renders as (CONTRACT §3.5 table, "renders as").
+RENDERS_AS = {"executor": ("dispatch", "egress"), "planner": ("planner", "egress"), "verifier": ("verifier", "none")}
+
+
+def new_run_id() -> str:
+    return "r-" + secrets.token_hex(8)
 #: DECISION: the most egress route ids a ticket may name (a base map's egress allow-list is short).
 EGRESS_ROUTES_MAX = 64
 #: CONTRACT §3.5 SIZES: `verifier_steps` is at most 32 KiB canonical.
@@ -200,6 +215,7 @@ class Ticket:
     day: str
     state: str = UNBOUND
     session: Optional[str] = None
+    run_id: str = ""
 
 
 def _inconsistent(detail: str) -> Refused:
@@ -286,6 +302,7 @@ class TicketStore:
         by_attempt: Dict[str, Ticket] = {}
         by_ticket: Dict[str, Ticket] = {}
         tombs: List[dict] = []
+        runs: set = set()
 
         def claim(attempt: str, ticket: str, digest: str) -> Optional[Ticket]:
             t = by_attempt.get(attempt)
@@ -301,13 +318,29 @@ class TicketStore:
                 op = obj["op"]
                 if op == "mint":
                     t = Ticket(obj["ticket"], check_attempt_id(obj["attempt_id"]), obj["request_digest"],
-                               dict(obj["facts"]), _uint(obj["minted_ms"], "minted_ms"), obj["day"])
+                               dict(obj["facts"]), _uint(obj["minted_ms"], "minted_ms"), obj["day"],
+                               run_id=obj["run_id"])
                     if type(t.ticket) is not str or not _DIGEST.fullmatch(t.request_digest) \
-                            or not _DAY.fullmatch(t.day):
+                            or not _DAY.fullmatch(t.day) or type(t.run_id) is not str \
+                            or not RUN_ID_RE.fullmatch(t.run_id):
                         raise _inconsistent("a mint line is malformed")
                     old = claim(t.attempt_id, t.ticket, t.request_digest)
                     if old is None:
+                        if t.run_id in runs:
+                            raise _inconsistent("one run id named by two attempts")
+                        runs.add(t.run_id)
                         by_attempt[t.attempt_id] = by_ticket[t.ticket] = t
+                    elif old.run_id != t.run_id:
+                        raise _inconsistent(f"attempt {t.attempt_id} names two run ids")
+                elif op == "bind":
+                    t = by_ticket.get(obj["ticket"])
+                    session = obj["session"]
+                    if t is None or type(session) is not str or not SESSION_RE.fullmatch(session):
+                        raise _inconsistent("a bind line names no minted ticket, or no session")
+                    if t.state != UNBOUND:
+                        # CONTROL binds only an unbound ticket, under the store's lock, journaled before it answers
+                        raise _inconsistent(f"a bind line names a ticket already {t.state}")
+                    t.state, t.session = BOUND, session
                 elif op in ("cancel", "expire"):
                     t = by_ticket.get(obj["ticket"])
                     if t is None:
@@ -350,6 +383,8 @@ class TicketStore:
                 out.append(canon.canonical_bytes(tomb))
             if t.state in OPEN or (t.day == today and t.facts):
                 out.append(canon.canonical_bytes(self._mint_line(t)))
+            if t.state == BOUND:
+                out.append(canon.canonical_bytes(self._bind_line(t)))
         return b"".join(line + b"\n" for line in out)
 
     def _compact(self) -> None:
@@ -372,8 +407,12 @@ class TicketStore:
 
     @staticmethod
     def _mint_line(t: Ticket) -> Dict[str, object]:
-        return {"op": "mint", "ticket": t.ticket, "attempt_id": t.attempt_id, "request_digest": t.request_digest,
-                "facts": t.facts, "minted_ms": t.minted_ms, "day": t.day}
+        return {"op": "mint", "ticket": t.ticket, "attempt_id": t.attempt_id, "run_id": t.run_id,
+                "request_digest": t.request_digest, "facts": t.facts, "minted_ms": t.minted_ms, "day": t.day}
+
+    @staticmethod
+    def _bind_line(t: Ticket) -> Dict[str, object]:
+        return {"op": "bind", "ticket": t.ticket, "session": t.session}
 
     def _append(self, obj: Mapping[str, object]) -> None:
         if self._fd is None:
@@ -391,10 +430,10 @@ class TicketStore:
 
     # -- the verbs' halves ------------------------------------------------------------------------------------------
 
-    def replay(self, attempt_id: str, facts: Mapping[str, object]) -> Optional[str]:
-        """The idempotent half of a mint: None for an attempt the index does not name; its ticket when the request
-        digest matches and the ticket is still unbound; else `attempt-conflict` (any digest difference, checked
-        first) or `attempt-closed`."""
+    def replay(self, attempt_id: str, facts: Mapping[str, object]) -> Optional[Ticket]:
+        """The idempotent half of a mint: None for an attempt the index does not name; its ticket (and so its
+        `run_id`) when the request digest matches and the ticket is still unbound; else `attempt-conflict` (any digest
+        difference, checked first) or `attempt-closed`."""
         digest = request_digest(facts)
         with self.lock:
             self._expire_due()
@@ -405,9 +444,9 @@ class TicketStore:
                 raise Refused("attempt-conflict")
             if t.state != UNBOUND:
                 raise Refused("attempt-closed", t.state)
-            return t.ticket
+            return t
 
-    def mint(self, attempt_id: str, facts: Mapping[str, object], new_ticket: Callable[[], str]) -> str:
+    def mint(self, attempt_id: str, facts: Mapping[str, object], new_ticket: Callable[[], str]) -> Ticket:
         """A NEW attempt's mint, journaled before it answers: the ceiling read and checked against the rebuilt counts
         (the open tickets, the UTC day's mints), all under the store's lock, so two mints never both take the last
         place. A replay that raced in first answers by :meth:`replay`'s rule."""
@@ -423,17 +462,64 @@ class TicketStore:
                     raise Refused("attempt-conflict")
                 if t.state != UNBOUND:
                     raise Refused("attempt-closed", t.state)
-                return t.ticket
+                return t
             now = self._clock()
             day = _day(now)
             if sum(1 for t in self._by_ticket.values() if t.state in OPEN) >= ceiling.max_open_tickets:
                 raise Refused("ticket-ceiling:max_open_tickets")
             if sum(1 for t in self._by_ticket.values() if t.day == day and t.facts) >= ceiling.max_runs_per_day:
                 raise Refused("ticket-ceiling:max_runs_per_day")
-            t = Ticket(new_ticket(), attempt_id, digest, dict(facts), int(now * 1000), day)
+            runs = {x.run_id for x in self._by_ticket.values()}
+            run_id = new_run_id()
+            while run_id in runs:
+                run_id = new_run_id()
+            t = Ticket(new_ticket(), attempt_id, digest, dict(facts), int(now * 1000), day, run_id=run_id)
             self._append(self._mint_line(t))
             self._by_attempt[attempt_id] = self._by_ticket[t.ticket] = t
-            return t.ticket
+            return t
+
+    def holdable(self, ticket: str) -> Ticket:
+        """`LEASE-OPEN {ticket}`'s check: a minted ticket that is still UNBOUND (`ticket-unknown` for one never minted,
+        `ticket-bound` once an `ATTACH` bound it, `attempt-closed` for a cancelled or expired one). A lease holds it
+        in CONTROL's memory only; `bind` is what the journal records."""
+        with self.lock:
+            self._expire_due()
+            return self._unbound(ticket)
+
+    def _unbound(self, ticket: str) -> Ticket:
+        t = self._by_ticket.get(ticket)
+        if t is None:
+            raise Refused("ticket-unknown")
+        if t.state == BOUND:
+            raise Refused("ticket-bound")
+        if t.state != UNBOUND:
+            raise Refused("attempt-closed", t.state)
+        return t
+
+    def bind(self, ticket: str, session: str) -> Ticket:
+        """`ATTACH` of a ticket-bound lease: the UNBOUND ticket bound to `session`, journaled before it answers (the
+        refusals are :meth:`holdable`'s: a ticket cancelled or expired since its `LEASE-OPEN` is not bound)."""
+        if type(session) is not str or not SESSION_RE.fullmatch(session):
+            raise Refused("bad-token", "session")
+        with self.lock:
+            self._expire_due()
+            t = self._unbound(ticket)
+            t.session = session
+            try:
+                self._append(self._bind_line(t))
+            except BaseException:
+                t.session = None
+                raise
+            t.state = BOUND
+            return t
+
+    def bound(self, session: str) -> Optional[Ticket]:
+        """The ticket BOUND to `session`, or None (the run `TOKEN-RESOLVE`, `MINT` and `QUEUE-RESOLVE` answer from)."""
+        with self.lock:
+            for t in self._by_ticket.values():
+                if t.state == BOUND and t.session == session:
+                    return t
+            return None
 
     def cancel(self, ticket: str) -> None:
         """An UNBOUND ticket only (`ticket-bound` once a lease bound it; `ticket-unknown` for one never minted;
@@ -481,5 +567,6 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[os.write(fd, view):]
 
 
-__all__ = ["CANCELLED", "CEILING_FORMAT", "Ceiling", "EXPIRED", "JOURNAL", "KINDS", "MINT_FIELDS", "TICKET_UNUSED_S",
+__all__ = ["BOUND", "CANCELLED", "CEILING_FORMAT", "Ceiling", "EXPIRED", "JOURNAL", "KINDS", "MINT_FIELDS", "RENDERS_AS",
+           "RUN_ID_RE", "TICKET_UNUSED_S",
            "Ticket", "TicketStore", "UNBOUND", "check_attempt_id", "check_facts", "read_ceiling", "request_digest"]

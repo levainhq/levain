@@ -106,8 +106,9 @@ def test_absent_ceiling_written_in_no_shrink(monkeypatch):
 
 def test_unproven_content_interactive_admitted_dispatch_refused(monkeypatch):
     # A `document` block, and a `web_search` tool with `max_uses`: both forwarded on the interactive route, each
-    # `reserved` line's meta `{"bound": "unproven"}`, and the web_search hold includes max_uses × per_use. (The
-    # dispatch half, `body-unbounded:<what>` before upstream, is 3c-5's: no dispatch map is loaded in 3c-2a.)
+    # `reserved` line's meta `{"bound": "unproven"}`, and the web_search hold includes max_uses × per_use. The
+    # dispatch half (3c-5): the same two bodies on a ticketed run's dispatch route are `body-unbounded:<what>` before
+    # anything is held or sent upstream.
     priced = dict(PRICE, per_use={"web_search": 10_000})
     doc = (b'{"model":"m1","max_tokens":10,"messages":[{"role":"user","content":[{"type":"document",'
            b'"source":{"type":"text","media_type":"text/plain","data":"x"}}]}]}')
@@ -128,6 +129,18 @@ def test_unproven_content_interactive_admitted_dispatch_refused(monkeypatch):
     assert lines[0]["amount"] == ANTHROPIC.estimate(json.loads(doc), pp)
     no_tool_price = ANTHROPIC.estimate(json.loads(search), P)
     assert lines[1]["amount"] == ANTHROPIC.estimate(json.loads(search), pp) == no_tool_price + 3 * 10_000
+
+    # the dispatch half: a ticketed run (its claims as keys caches CONTROL's resolve) on a dispatch-shaped route
+    from tests.test_tickets_keys import MODEL, RUN, _claims, _exchange, dispatch_pol
+    run_bodies = [b.replace(b'"model":"m1"', b'"model":"%s"' % MODEL.encode()) for b in (doc, search)]
+
+    async def go_dispatch(d: str) -> list:
+        return [await _exchange(d, monkeypatch, b, _claims(RUN), dispatch_pol()) for b in run_bodies]
+
+    for out in _run(go_dispatch):
+        name = json.loads(out["frames"][-1][1])["refused"]
+        assert out["frames"][-1][0] == b"F" and name.startswith("body-unbounded:"), out["frames"]
+        assert out["handshakes"] == 0 and not [x for x in out["lines"] if x["kind"] == "reserved"]
 
 
 def test_a_bounded_call_has_no_unproven_mark(monkeypatch):

@@ -75,7 +75,8 @@ def route(rid: str = "glm", *, host: str = "openrouter.ai", typ: str = "brokered
                "credential": "or-key"}
     return {"policy": pol, "provider": "openrouter",
             "models": models or [{"requested": "z-ai/glm-5.2", "backend": "zhipu/glm-5.2", "price": PRICE}],
-            "body_policy": {"provider_only": ["z-ai"]}, "retention_claim": "recorded, never a guarantee"}
+            "body_policy": {"provider_only": ["z-ai"]} if host == "openrouter.ai" else {},
+            "retention_claim": "recorded, never a guarantee"}
 
 
 def item(gen: int, routes=None, *, store_id: str = STORE_ID, kind: str = "routemap") -> dict:
@@ -782,7 +783,7 @@ def test_base_dispatch_collision_refused_at_use(st):
     # codex HIGH 4: the dispatch head serves `glm`; root then adds a brokered `glm` to the live base map. keys refuses
     # the id at resolution time (fails closed, named), never routes it by the base policy.
     k, _ = _two_generations(st)
-    pin = {"routemap_generation": 2, "route_policy_digest": RM.policy_digest(route()["policy"])}
+    pin = {"route": "glm", "routemap_generation": 2, "route_policy_digest": RM.policy_digest(route()["policy"])}
     claims = {"routes": ["glm", "pypi"], "run": pin}
     assert k._route_policy(claims, "glm").upstream.host == "openrouter.ai"   # served from the dispatch map
     base_glm = dict(route(host="api.z.ai")["policy"], prices={"z-ai/glm-5.2": PRICE}, max_session_microdollars=10 ** 6)
@@ -881,9 +882,11 @@ def test_collision_checks_every_served_generation(st):
         assert reload(k, g, sha(it))["generation"] == g
     _base_with(st, "glm", "zz")
     claims = {"routes": ["glm", "zz"],
-              "run": {"routemap_generation": 1, "route_policy_digest": RM.policy_digest(route()["policy"])}}
+              "run": {"route": "glm", "routemap_generation": 1,
+                      "route_policy_digest": RM.policy_digest(route()["policy"])}}
     assert _resolved(k, claims, "glm") == "keys-unavailable|route-collision"
-    assert _resolved(k, claims, "zz") == "api.z.ai"
+    assert _resolved(k, {"routes": ["zz"]}, "zz") == "api.z.ai"           # an interactive session's base route
+    assert _resolved(k, claims, "zz") == "route-not-allowed|not the run's route"   # a run calls its own route only
     assert k.routes.route_ids() == frozenset({"glm", "other"})
 
 
@@ -902,7 +905,8 @@ def test_collision_fails_closed_when_ids_unavailable(st):
     assert sorted(k2.routes.maps) == [2] and k2.routes.problem is None    # the head generation itself serves
     assert k2.routes.route_ids() is None
     claims = {"routes": ["glm", "zz"],
-              "run": {"routemap_generation": 1, "route_policy_digest": RM.policy_digest(route()["policy"])}}
+              "run": {"route": "glm", "routemap_generation": 1,
+                      "route_policy_digest": RM.policy_digest(route()["policy"])}}
     assert _resolved(k2, claims, "glm") == "keys-unavailable|route-collision"
     assert _resolved(k2, claims, "zz") == "keys-unavailable|route-collision"
     # the head generation itself unloadable (codex's case): the same

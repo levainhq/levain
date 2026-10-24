@@ -665,6 +665,53 @@ def front_binding(answer: dict, reg: "Registration") -> bool:
             and _same_uint(claims.get("incarnation"), reg.incarnation))
 
 
+#: `TOKEN-RESOLVE`'s `run` (CONTRACT §3.3), exactly: name -> its check.
+_RUN_ID = re.compile(r"r-[0-9a-f]{16}\Z")
+_RUN_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_RUN_TEXT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}\Z")
+
+
+def _run_uint(v: object, low: int = 0) -> bool:
+    return type(v) is int and low <= v <= JSON_INT_MAX
+
+
+RUN_FIELDS = {
+    "run_id": lambda v: type(v) is str and _RUN_ID.match(v) is not None,
+    "job_id": lambda v: type(v) is str and _RUN_TEXT.match(v) is not None,
+    "run_index": _run_uint,
+    "contract_digest": lambda v: type(v) is str and _RUN_DIGEST.match(v) is not None,
+    "route": lambda v: type(v) is str and _RUN_TEXT.match(v) is not None,
+    "routemap_generation": lambda v: _run_uint(v, 1),
+    "route_policy_digest": lambda v: type(v) is str and _RUN_DIGEST.match(v) is not None,
+    "model_requested": lambda v: type(v) is str and _RUN_TEXT.match(v) is not None,
+    "reserved_microdollars": lambda v: _run_uint(v, 1),
+}
+
+
+def run_ok(run: object) -> bool:
+    """A `run` object keys can act on: exactly its fields, each of its type (a malformed one fails the resolve)."""
+    return type(run) is dict and set(run) == set(RUN_FIELDS) and all(RUN_FIELDS[k](v) for k, v in run.items())
+
+
+def resolve_outcome(ans: dict) -> tuple:
+    """CONTROL's `TOKEN-RESOLVE` answer as the resolve task's typed outcome: `("answer", {"session", "claims"})`, with
+    a ticketed session's `run` (§3.3, CONTROL's from the ticket record) carried in the claims as `run`;
+    `("refused", name)` for a refusal keys knows; else `("failed",)`, a malformed `run` or one already in the claims
+    included."""
+    if ans.get("ok") is True:
+        session, claims = ans.get("session"), ans.get("claims")
+        if type(session) is str and session and type(claims) is dict and "run" not in claims:
+            if "run" in ans:
+                if not run_ok(ans["run"]):
+                    return ("failed",)
+                claims = {**claims, "run": dict(ans["run"])}
+            return ("answer", {"session": session, "claims": claims})
+        return ("failed",)
+    if ans.get("ok") is False and ans.get("refused") in RESOLVE_REFUSALS:
+        return ("refused", ans["refused"])
+    return ("failed",)
+
+
 def encode_admin(answer: dict) -> bytes:
     data = canon.canonical_bytes(answer)
     return len(data).to_bytes(4, "big") + data
@@ -1818,8 +1865,8 @@ class Keys:
                 # the body read can take up to `body_read_s` after `fresh`'s observation: a token that expired
                 # meanwhile is refused here, before anything is checked or held (the head's write checks it again)
                 unexpired(self.cred_lifecycle, observed)
-            head, hconn, cred, tpl, data, meter, hold = self._check_request(conn.reg, pol, req, raw,
-                                                                            buf)   # the ledger's admit is last
+            head, hconn, cred, tpl, data, meter, hold = self._check_request(conn.reg, pol, req, raw, buf,
+                                                                            claims.get("run"))   # admit is last
         except norm.Refused as r:
             buf.give_back()
             try:
@@ -2136,6 +2183,15 @@ class Keys:
             why = "the dispatch route ids are unknown" if ids is None else "a base route and a dispatch route"
             _note(logging.WARNING, "levain gw-keys: route %s refused: %s", route, why)
             raise norm.Refused("keys-unavailable", f"route-collision: {route}: {why}")
+        run = claims.get("run")
+        if run is not None:
+            # a dispatch run (a ticketed session) calls its run's route only, and that route is a dispatch-map route:
+            # a run named on any base-map route (passthrough, egress or interactive brokered) is refused here, keys'
+            # own refusal beside CONTROL's `ticket-field:route` at mint
+            if route != run.get("route"):
+                raise norm.Refused("route-not-allowed", "not the run's route")
+            if pol is not None:
+                raise norm.Refused("passthrough-for-dispatch", route)
         if pol is None:
             pol = self.dispatch_policy(route, routemaps.pin_of(claims))
         if pol is None or pol.type != "brokered" or pol.upstream is None:
@@ -2284,17 +2340,15 @@ class Keys:
                  observed: Optional[Credential]) -> tuple:
         """R4 §1.7 step 1: keys' own re-check of the `Q` against ITS policy (the front's verdict is never taken), with
         no reservation and no request head. Order: a route with no price table (a base `/1` map's) is
-        `model-not-allowed`, and a ticketed run is `model-not-allowed` until its model is checked against the ticket
-        (3c-5); a websocket upgrade is `body-unbounded:websocket` (one exchange carries many responses, no one usage
-        settles it); target and template; headers (strict: a forbidden, consumed or off-list name is
+        `model-not-allowed` (a ticketed run's model is checked against its ticket once the body is parsed,
+        `_check_request`); a websocket upgrade is `body-unbounded:websocket` (one exchange carries many responses,
+        no one usage settles it); target and template; headers (strict: a forbidden, consumed or off-list name is
         `policy-header`); the declared length against `body_cap`; the credential and its host binding; the session in
         `budget_stopped` (`budget-overrun`). Returns (method, path, query, the re-checked headers, the template,
         the credential or None). The credential is `observed`, the one `fresh` observed and checked for the route's
         `credential`: it is not observed again."""
         if pol.prices is None:
             raise norm.Refused("model-not-allowed", "route is not priced")
-        if claims.get("ticket") is not None:
-            raise norm.Refused("model-not-allowed", "a ticketed run's model is checked from 3c-5")
         if q["upgrade"] == "websocket":
             codec.refuse_upgrade()
         try:
@@ -2321,8 +2375,9 @@ class Keys:
         return method, path, query, fwd, tpl, cred
 
     def _check_request(self, reg: Registration, pol: RoutePolicy, req: tuple, raw: "_OneShot",
-                       buf: "BodyTake") -> Tuple[bytes, "h11.Connection", object, norm.Template, bytes,
-                                                 Tuple[codec.Codec, Price, Dict[str, str], str, bool], ledger.Hold]:
+                       buf: "BodyTake", run: Optional[dict] = None
+                       ) -> Tuple[bytes, "h11.Connection", object, norm.Template, bytes,
+                                  Tuple[codec.Codec, Price, Dict[str, str], str, bool], ledger.Hold]:
         """R4 §1.7 steps 4-5, ONE synchronous call (no `await` anywhere in it): the body codec's parse of the buffered
         body, its `check` (the model has a price entry; on a dispatch-shaped route, one with no per-session cap, the
         unboundable shapes are `body-unbounded:<what>`), the ceiling written in where absent and, beside it, a streamed
@@ -2334,11 +2389,19 @@ class Keys:
         head, the h11 client that wrote it (it frames the body and parses the response), the credential (or None),
         the matched template, the body bytes, the codec, the price entry, the request's `call_names` the settle
         reads, the priced model and whether the hold is unproven (the meter), and the admitted hold. `req` is
-        `_check_q`'s answer."""
+        `_check_q`'s answer. For a ticketed run (`run`, from CONTROL's resolve): the checked model must be the run's
+        `model_requested` (`model-not-allowed`), and the hold is the run's (`_admit_hold`). On a dispatch route to
+        OpenRouter, the route's `body_policy` is written in as the request's `provider` object, replacing the client's
+        (`codec.write_body_policy`), before the estimate and the serialization."""
         method, path, query, fwd, tpl, cred = req
         c = codec.CODECS[pol.body_codec]   # a priced route's codec is never `none` (`policy.parse_base_map`)
         obj = c.parse(raw.take())   # the raw bytes are unreferenced once parsed: only `data` below is kept
-        checked = codec.guarded(c.check, obj, pol.prices, dispatch=pol.max_session_microdollars is None)
+        dispatch = pol.max_session_microdollars is None
+        checked = codec.guarded(c.check, obj, pol.prices, dispatch=dispatch)
+        if run is not None and checked.model != run["model_requested"]:
+            raise norm.Refused("model-not-allowed", "not the run's model_requested")
+        if dispatch and pol.upstream is not None and pol.upstream.host == codec.OPENROUTER_HOST:
+            codec.guarded(codec.write_body_policy, obj, pol.body_policy or {})
         codec.guarded(c.write_ceiling, obj, checked.price)
         codec.guarded(c.write_stream_usage, obj)
         estimate = codec.guarded(c.estimate, obj, checked.price)
@@ -2351,21 +2414,27 @@ class Keys:
         # an interactive route admits content the estimate cannot see, marked on its `reserved` line (R4 §1.6)
         meta = {"bound": "unproven"} if checked.unproven else {}
         meter = (c, checked.price, names, checked.model, bool(checked.unproven))
-        hold = self._admit_hold(reg, pol, estimate, checked.model, meta)   # the last step: see `_serve_q`
+        hold = self._admit_hold(reg, pol, estimate, checked.model, meta, run)   # the last step: see `_serve_q`
         return head, hconn, cred, tpl, data, meter, hold
 
     def _admit_hold(self, reg: Registration, pol: RoutePolicy, estimate: int, price_ref: str,
-                    meta: dict) -> ledger.Hold:
+                    meta: dict, run: Optional[dict] = None) -> ledger.Hold:
         """The ledger's synchronous admit of `estimate` (R4 §1.2's estimate, never shrunk: a hold that does not fit the
-        room is `budget-exhausted`) against the route's per-session cap, scope ("session-route", session, route);
+        room is `budget-exhausted`) against the route's per-session cap, scope ("session-route", session, route), or,
+        for a ticketed run, the run's `reserved_microdollars`, scope ("run", run_id) (R4 §1.2);
         `price_ref` is the priced model. The session's place in `budget_stopped` is read again as the statement right
         before the admit (no `await` between the two), because the body read after `_check_q`'s read can take up
         to `body_read_s`. The ledger's own errors become refusals: `budget-exhausted` (402), and
         `keys-unavailable` (503) for an unhealthy or closing ledger and, noted, for a misuse."""
         if self.ledger is None:
             raise norm.Refused("budget-exhausted", "no ledger")
-        cap = pol.max_session_microdollars
-        if cap is None:   # a dispatch route (unreachable in 3c-2a: no dispatch map is loaded)
+        if run is not None:
+            scope: Tuple[str, ...] = ("run", run["run_id"])
+            cap = run["reserved_microdollars"]
+        else:
+            scope = ("session-route", reg.session, pol.route)
+            cap = pol.max_session_microdollars
+        if cap is None:   # a dispatch route with no run: a session with no ticket has no dispatch scope
             raise norm.Refused("budget-exhausted", "no scope")
 
         def bound(room: int) -> int:
@@ -2374,8 +2443,7 @@ class Keys:
         if reg.session in self.budget_stopped:
             raise norm.Refused("budget-overrun", "the session is stopped")
         try:
-            return self.ledger.admit(("session-route", reg.session, pol.route), cap, bound, price_ref=price_ref,
-                                     meta=meta)
+            return self.ledger.admit(scope, cap, bound, price_ref=price_ref, meta=meta)
         except ledger.Refused as e:
             raise norm.Refused(e.name, e.detail) from None
         except ledger.LedgerUnavailable as e:
@@ -2538,14 +2606,7 @@ class Keys:
             writer.transport.abort()
         if ans.get("id") != 1:
             return ("failed",)
-        if ans.get("ok") is True:
-            session, claims = ans.get("session"), ans.get("claims")
-            if type(session) is str and session and type(claims) is dict:
-                return ("answer", {"session": session, "claims": claims})
-            return ("failed",)
-        if ans.get("ok") is False and ans.get("refused") in RESOLVE_REFUSALS:
-            return ("refused", ans["refused"])
-        return ("failed",)
+        return resolve_outcome(ans)
 
     async def _refuse(self, conn: Conn, frames: Union[FrameReader, "FrontFrames"], side: KeysSide, name: str,
                       cap: int) -> None:

@@ -88,6 +88,19 @@ def refuse_upgrade() -> None:
     raise norm.Refused("body-unbounded:websocket", "websocket upgrade on a metered route")
 
 
+#: re-exported for keys: a route is an OpenRouter route by its pinned upstream host (R4 §1.5).
+OPENROUTER_HOST = policy.OPENROUTER_HOST
+
+
+def write_body_policy(obj: Dict[str, Any], body_policy: Mapping[str, object]) -> None:
+    """Head ruling H2, on a dispatch route to OpenRouter: the request's `provider` object is the one the route's
+    `body_policy` maps to (`policy.provider_object`), REPLACING whatever `provider` the client sent: a client's object
+    is never merged, since a merge would let it widen routing. An empty `body_policy` leaves no `provider` key."""
+    obj.pop("provider", None)
+    if body_policy:
+        obj["provider"] = policy.provider_object(body_policy)
+
+
 def serialize(obj: Mapping[str, Any]) -> bytes:
     """The forwarded body: keys' own compact serialization of the parsed object (R4 §1.3), so the provider reads the
     object keys estimated. UTF-8, unescaped, so its length is the bytes the provider reads; a lone surrogate the

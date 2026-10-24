@@ -10,7 +10,7 @@ import re
 import socket
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Mapping, Optional, Pattern
+from typing import Mapping, Optional, Pattern, Tuple
 
 from levain.broker import norm
 
@@ -84,6 +84,9 @@ class RoutePolicy:
     max_session_microdollars: Optional[int] = None
     #: model -> its price entry: base `/2` and routemap `/3` only (R4 §1.3). None on every `/1` and session-file read.
     prices: Optional[Mapping[str, "Price"]] = None
+    #: a routemap `/3` route's `body_policy` (head ruling H2: keys writes it in as OpenRouter's `provider` object);
+    #: None on every base and session-file read.
+    body_policy: Optional[Mapping[str, object]] = None
 
 
 def _is_inet_aton_spelling(h: str) -> bool:
@@ -418,6 +421,49 @@ def parse_routemap(body: object) -> list:
                 raise PolicyError(f"route {pol.route}: model {req} named twice")
             prices[req] = parse_price(f"route {pol.route} model {req}", m["price"])
             backends[req] = back
-        out.append(DispatchRoute(replace(pol, prices=prices), r["provider"], backends, r["body_policy"],
-                                 r["retention_claim"]))
+        out.append(DispatchRoute(replace(pol, prices=prices, body_policy=dict(r["body_policy"])), r["provider"],
+                                 backends, r["body_policy"], r["retention_claim"]))
+    return out
+
+
+#: OpenRouter's API host: a route is an OpenRouter route by its pinned upstream host, never a label (R4 §1.5).
+OPENROUTER_HOST = "openrouter.ai"
+#: head ruling H2: a `body_policy` key -> (OpenRouter's `provider` field, the policy's allowed values -> the field's
+#: value). `provider_only` is a list of provider slugs, any non-empty text; the other three are fixed words.
+BODY_POLICY_FIELDS: Mapping[str, Tuple[str, Optional[Mapping[str, object]]]] = {
+    "provider_only": ("only", None),
+    "allow_fallbacks": ("allow_fallbacks", {"yes": True, "no": False}),
+    "zdr": ("zdr", {"yes": True, "no": False}),
+    "data_collection": ("data_collection", {"allow": "allow", "deny": "deny"}),
+}
+
+
+def body_policy_problem(pol: RoutePolicy, body_policy: object) -> Optional[str]:
+    """Head ruling H2's accept-time rule (`ROUTE-SUBMIT` refuses `route-invalid:body_policy`): a non-empty
+    `body_policy` only on an OpenRouter route; on one, only the four keys of :data:`BODY_POLICY_FIELDS`, each with a
+    value in its set (`provider_only` a list of text). Never judged at request time."""
+    if not isinstance(body_policy, Mapping):
+        return f"route {pol.route}: body_policy is an object"
+    if not body_policy:
+        return None
+    if pol.upstream is None or pol.upstream.host != OPENROUTER_HOST:
+        return f"route {pol.route}: a body_policy is written only for an OpenRouter route"
+    for k, v in body_policy.items():
+        if k not in BODY_POLICY_FIELDS:
+            return f"route {pol.route}: body_policy key {k!r}"
+        values = BODY_POLICY_FIELDS[k][1]
+        if values is None:
+            if not isinstance(v, list) or not v or not all(isinstance(x, str) and x for x in v):
+                return f"route {pol.route}: body_policy {k} is a list of provider slugs"
+        elif not isinstance(v, str) or v not in values:
+            return f"route {pol.route}: body_policy {k} is one of {sorted(values)}"
+    return None
+
+
+def provider_object(body_policy: Mapping[str, object]) -> dict:
+    """The OpenRouter `provider` object a checked `body_policy` maps to (head ruling H2)."""
+    out: dict = {}
+    for k, v in body_policy.items():
+        field, values = BODY_POLICY_FIELDS[k]
+        out[field] = list(v) if values is None else values[v]   # type: ignore[index, arg-type]
     return out

@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 from levain.authority_sig import VerifierUnavailable, verify_link_sig
-from levain.broker.policy import DispatchRoute, PolicyError, RoutePolicy, parse_routemap
+from levain.broker.policy import DispatchRoute, PolicyError, RoutePolicy, body_policy_problem, parse_routemap
 from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
 from levain.dispatch.routemap_rules import envelope_problem
@@ -218,7 +218,8 @@ def check_item(raw: bytes, sig: object, trust: Trust, base_ids: frozenset, *,
     `prev` and `issued_at` (`levain.dispatch.routemap_rules.envelope_problem`, the producer's own check: `parse_item`
     calls it too, so this accepts exactly what dispatch emits); the body
     (`levain.broker.policy.parse_routemap`: every route brokered with a codec and a price on every model, no per-call
-    cap, no session cap, no id twice); no route id that is a base id. The generation order is the caller's, against
+    cap, no session cap, no id twice); each route's `body_policy` (`route-invalid:body_policy`, head ruling H2); no route
+    id that is a base id. The generation order is the caller's, against
     its own head."""
     if not isinstance(raw, bytes) or len(raw) > ITEM_MAX_BYTES:
         raise Refused("routemap-invalid:item", f"an item is at most {ITEM_MAX_BYTES} bytes")
@@ -251,6 +252,11 @@ def check_item(raw: bytes, sig: object, trust: Trust, base_ids: frozenset, *,
         raise Refused("routemap-invalid:body", str(e)) from None
     except (RecursionError, TypeError, ValueError) as e:
         raise Refused("routemap-invalid:body", type(e).__name__) from None
+    for r in routes:
+        # head ruling H2: a body_policy is judged here, at ROUTE-SUBMIT (and keys' own load), never at request time
+        problem = body_policy_problem(r.policy, r.body_policy)
+        if problem is not None:
+            raise Refused("route-invalid:body_policy", problem)
     hit = sorted({r.policy.route for r in routes} & set(base_ids))
     if hit:
         raise Refused("routemap-invalid:route", f"route id {hit[0]} is a base route")

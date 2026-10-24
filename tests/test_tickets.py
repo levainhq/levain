@@ -21,7 +21,7 @@ from levain.slot import control as C
 from levain.slot import routemaps as RM
 from levain.slot import tickets as T
 from tests.test_routemaps import (DISPATCH_UID, OP_UID, Store, item, keys_py, route, sha, st, submit,  # noqa: F401
-                                  _crash)
+                                  _crash, _resolved, keys_of, reload)
 
 KEYS_UID = 7002
 DAY = 86400.0
@@ -103,7 +103,8 @@ def mint_args(attempt: str = "a-1", **kw) -> dict:
 
 
 def ticket_of(ans: dict) -> str:
-    assert ans.get("ok") is True and set(ans) == {"id", "ok", "ticket"}, ans
+    assert ans.get("ok") is True and set(ans) == {"id", "ok", "ticket", "run_id"}, ans
+    assert T.RUN_ID_RE.fullmatch(ans["run_id"]), ans
     return ans["ticket"]
 
 
@@ -120,17 +121,19 @@ def rig(st):
 # ---- idempotent mint ------------------------------------------------------------------------------------------------
 
 def test_mint_replay_same_attempt_same_ticket(rig):
-    one = ticket_of(rig.mint())
-    assert ticket_of(rig.mint()) == one                                   # a replay in the same process
+    first = rig.mint()
+    one = ticket_of(first)
+    assert rig.mint() == first                                            # a replay in the same process: same run_id
     assert rig.tickets.counts() == {"open": 1, "today": 1}
     rig.restart()                                                         # CONTROL restarted between
-    assert ticket_of(rig.mint()) == one
+    assert rig.mint() == first                                            # the same ticket and run_id
     assert rig.tickets.counts() == {"open": 1, "today": 1}                # the open and day counts +1 once
     assert [x["op"] for x in rig.lines()] == ["mint"]
 
 
 def test_mint_attempt_conflict_refused(rig):
-    one = ticket_of(rig.mint())
+    first = rig.mint()
+    one = ticket_of(first)
     assert refused(rig.mint(reserved_microdollars=2_000_000)) == "attempt-conflict"
     assert rig.ask("RUN-TICKET-CANCEL", ticket=one)["ok"]
     # facts are compared FIRST: a differing request is a conflict whatever the state; a matching one is closed
@@ -151,7 +154,8 @@ def test_mint_attempt_id_malformed_refused(rig, bad):
 
 
 def test_mint_closed_attempt_after_restart_and_rollover(rig):
-    one = ticket_of(rig.mint())
+    first = rig.mint()
+    one = ticket_of(first)
     assert rig.ask("RUN-TICKET-CANCEL", ticket=one) == {"id": 1, "ok": True}
     rig.clock.t += DAY                                                    # the UTC day rolled over
     rig.restart()                                                         # and the compaction ran
@@ -235,7 +239,8 @@ def test_ceiling_survives_control_restart(rig):
 
 
 def test_ticket_expires(rig):
-    one = ticket_of(rig.mint())
+    first = rig.mint()
+    one = ticket_of(first)
     rig.clock.t += T.TICKET_UNUSED_S - 1
     assert rig.ask("RUN-TICKET-STATUS", attempt_id="a-1")["state"] == "unbound"
     rig.clock.t += 1                                                       # V16 unused
@@ -323,3 +328,194 @@ def test_mint_waits_for_keys_reload_ack(rig, keys_py, monkeypatch):
     assert ticket_of(seen["with_keys"]) and seen["serves"] == {"generation": 3, "item_sha256": sha(three)}
     assert refused(seen["keys_down"]) == "keys-unavailable"
     assert ticket_of(seen["keys_back"])
+
+
+# ---- session 2: the binding (§3.1, §3.3, §3.5 "Ticket facts reach render"; head ruling H1) ----------------------------
+
+SESSION = "s-00000000000000a1"
+FRONT = {"uid": 3989, "pid": 4242, "start": 1700000000}
+
+
+def d_attach_claims(ticket: str, **kw) -> dict:
+    base = {"operator_uid": OP_UID, "supervisor_uid": DISPATCH_UID, "slot": {"class": "egress", "index": 1},
+            "class": "egress", "kind": "dispatch", "vendor": "claude", "auth": "brokered", "lease_seq": 1,
+            "slot_rev": 1, "ticket": ticket}
+    base.update(kw)
+    return base
+
+
+def d_mint_claims(**kw) -> dict:
+    base = {"routes": ["glm", "pypi"], "egress_routes": ["pypi"], "model": "z-ai/glm-5.2", "queue_grant": True,
+            "incarnation": 1, "front": dict(FRONT)}
+    base.update(kw)
+    return base
+
+
+def root(rig, op: str, **kw) -> dict:
+    return rig.control.handle(C.Conn(0), {"v": 1, "op": op, "id": 1, **kw})
+
+
+def lease(rig, ticket) -> tuple:
+    conn = C.Conn(DISPATCH_UID)
+    args = {} if ticket is None else {"ticket": ticket}
+    return conn, rig.control.handle(conn, {"v": 1, "op": "LEASE-OPEN", "id": 1, **args})
+
+
+def bound_session(rig, session: str = SESSION) -> tuple:
+    """A minted ticket, a dispatch lease on it, and root's ATTACH: (ticket, run_id, ATTACH's answer)."""
+    ans = rig.mint()
+    ticket = ticket_of(ans)
+    _conn, lo = lease(rig, ticket)
+    att = root(rig, "ATTACH", lease_nonce=lo["lease_nonce"], sudo_uid=DISPATCH_UID, session=session,
+               claims=d_attach_claims(ticket))
+    return ticket, ans["run_id"], att
+
+
+def to_rendering(rig, session: str = SESSION) -> int:
+    ans = root(rig, "CAS", session=session, generation=0, **{"from": "ALLOCATED", "to": "RENDERING"}, fields={})
+    assert ans["ok"], ans
+    return ans["generation"]
+
+
+def test_lease_open_takes_a_live_unbound_ticket(rig):
+    assert refused(lease(rig, None)[1]) == "ticket-required"
+    assert refused(lease(rig, "A" * 43)[1]) == "ticket-unknown"
+    one = ticket_of(rig.mint())
+    first, lo = lease(rig, one)
+    assert lo["ok"] and len(lo["lease_nonce"]) == 43
+    assert refused(lease(rig, one)[1]) == "ticket-bound"                 # one ticket, one live lease
+    rig.control.lease_eof(first.lease)                                   # the lease dies before its ATTACH
+    _c, again = lease(rig, one)
+    assert again["ok"], again                                            # the ticket is still unbound: held again
+    assert rig.ask("RUN-TICKET-STATUS", attempt_id="a-1")["state"] == "unbound"
+    two = ticket_of(rig.mint("a-2"))
+    assert rig.ask("RUN-TICKET-CANCEL", ticket=two)["ok"]
+    assert refused(lease(rig, two)[1]) == "attempt-closed"
+
+
+def test_attach_binds_and_answers_ticket_facts(rig):
+    one = ticket_of(rig.mint())
+    other = ticket_of(rig.mint("a-2"))
+    for claims in (d_attach_claims(other), d_attach_claims(one, kind="planner"),
+                   d_attach_claims(one, kind="interactive"), {k: v for k, v in d_attach_claims(one).items()
+                                                              if k != "ticket"}):
+        _c, lo = lease(rig, one)
+        ans = root(rig, "ATTACH", lease_nonce=lo["lease_nonce"], sudo_uid=DISPATCH_UID, session=SESSION,
+                   claims=claims)
+        assert refused(ans) == "claims-mismatch", claims
+        rig.control.lease_eof(_c.lease)                                   # leave no live lease holding the ticket
+    _c, lo = lease(rig, one)
+    att = root(rig, "ATTACH", lease_nonce=lo["lease_nonce"], sudo_uid=DISPATCH_UID, session=SESSION,
+               claims=d_attach_claims(one))
+    facts = T.check_facts(mint_args())
+    assert att == {"id": 1, "ok": True, "generation": 0, "ticket_facts": facts}
+    assert "run_id" not in att["ticket_facts"] and one not in json.dumps(att)
+    assert rig.lines()[-1] == {"op": "bind", "ticket": one, "session": SESSION}
+    assert refused(rig.ask("RUN-TICKET-CANCEL", ticket=one)) == "ticket-bound"
+    assert refused(rig.mint()) == "attempt-closed"                        # a bound attempt is no longer replayable
+    assert refused(lease(rig, one)[1]) == "ticket-bound"
+
+
+def test_status_keeps_session(rig):
+    # the bound half (CONTRACT §3.5): `released` is 3c-7's SLOT-SYNC
+    one, _run, att = bound_session(rig)
+    assert att["ok"], att
+    want = {"id": 1, "ok": True, "ticket": one, "state": "bound", "session": SESSION}
+    assert rig.ask("RUN-TICKET-STATUS", attempt_id="a-1") == want
+    rig.clock.t += DAY                                                    # the compaction keeps a bound ticket whole
+    rig.restart()
+    assert [x["op"] for x in rig.lines()] == ["mint", "bind"]
+    assert rig.ask("RUN-TICKET-STATUS", attempt_id="a-1") == want
+    assert rig.tickets.counts()["open"] == 1                              # bound is open (H4: until 3c-7's release)
+    assert refused(rig.ask("RUN-TICKET-CANCEL", ticket=one)) == "ticket-bound"
+
+
+def test_mint_claims_checked_against_the_ticket(rig):
+    one, run_id, att = bound_session(rig)
+    rig.control._keys_front_register = lambda *a: 1
+    for bad in (d_mint_claims(model="z-ai/other"), d_mint_claims(routes=["glm"]),
+                d_mint_claims(egress_routes=[], routes=["glm"]), d_mint_claims(routes=["glm", "pypi", "pypi2"]),
+                {k: v for k, v in d_mint_claims().items() if k != "model"}):
+        gen = rig.control.store.get(SESSION).generation
+        if rig.control.store.get(SESSION).state == "ALLOCATED":
+            gen = to_rendering(rig)
+        assert refused(root(rig, "MINT", session=SESSION, generation=gen, claims=bad)) == "claims-mismatch", bad
+    gen = rig.control.store.get(SESSION).generation
+    ans = root(rig, "MINT", session=SESSION, generation=gen, claims=d_mint_claims())
+    assert ans["ok"], ans
+    # TOKEN-RESOLVE: the run from the ticket record, and the ticket nowhere in the answer (head ruling H1)
+    h = rig.control.handles(SESSION)
+    res = rig.control.handle(C.Conn(KEYS_UID), {"v": 1, "op": "TOKEN-RESOLVE", "id": 1,
+                                                 "token_digest": h.token_digest})
+    assert res["ok"], res
+    assert res["run"] == {"run_id": run_id, "job_id": "job-1", "run_index": 0, "contract_digest": "sha256:" + "1" * 64,
+                          "route": "glm", "routemap_generation": 1, "route_policy_digest": GLM_DIGEST,
+                          "model_requested": "z-ai/glm-5.2", "reserved_microdollars": 1_000_000}
+    assert "ticket" not in res["claims"] and one not in json.dumps(res)
+    assert rig.control._run_facts(SESSION) == {"run_id": run_id, "job_id": "job-1", "run_index": 0,
+                                                "contract_digest": "sha256:" + "1" * 64,
+                                                "model_requested": "z-ai/glm-5.2"}
+
+
+def test_token_resolve_with_no_bound_ticket_refused(rig):
+    # a ticketed session whose binding the journal no longer holds is never resolved with a run (fail closed)
+    one, _run, att = bound_session(rig)
+    rig.control._keys_front_register = lambda *a: 1
+    root(rig, "MINT", session=SESSION, generation=to_rendering(rig), claims=d_mint_claims())
+    h = rig.control.handles(SESSION)
+    rig.tickets._by_ticket[one].state = T.CANCELLED                       # the binding gone from CONTROL's index
+    res = rig.control.handle(C.Conn(KEYS_UID), {"v": 1, "op": "TOKEN-RESOLVE", "id": 1,
+                                                 "token_digest": h.token_digest})
+    assert refused(res) == "run-unknown"
+
+
+def test_pin_holds_for_session_life(rig):
+    # R4 §8 test 6, through a real ticket: CONTROL mints, binds and resolves the session; keys holds what that resolve
+    # answers (keys.resolve_outcome) and serves each `Q`'s route by its own pin rule across new generations: N+1
+    # CHANGES the route (served from P), N+2 removes it (refused while absent), N+3 re-adds it (served from P again),
+    # then REVOKE (CONTROL answers token-revoked, so keys holds no claims to serve with)
+    from levain.broker import keys as K
+    one, run_id, _att = bound_session(rig)
+    rig.control._keys_front_register = lambda *a: 1
+    assert root(rig, "MINT", session=SESSION, generation=to_rendering(rig), claims=d_mint_claims())["ok"]
+    digest = rig.control.handles(SESSION).token_digest
+
+    def resolve() -> tuple:
+        return K.resolve_outcome(rig.control.handle(C.Conn(KEYS_UID), {"v": 1, "op": "TOKEN-RESOLVE", "id": 1,
+                                                                         "token_digest": digest}))
+    kind, answer = resolve()
+    assert kind == "answer" and answer["claims"]["run"]["routemap_generation"] == 1
+    claims = answer["claims"]
+    k = keys_of(rig.st)
+    assert reload(k, 1, sha(rig.one))["generation"] == 1
+    assert _resolved(k, claims, "glm") == "openrouter.ai"                     # P
+    seen = []
+    for g, routes in ((2, [route(host="api.z.ai")]), (3, [route(rid="other")]), (4, [route(host="api.z.ai")])):
+        it, sig = rig.st.signed(item(g, routes))
+        submit(rig.cr, it, sig)
+        assert reload(k, g, sha(it))["generation"] == g
+        seen.append(_resolved(k, claims, "glm"))
+    assert seen == ["openrouter.ai",                                            # N+1 changed it: still P
+                    "route-not-allowed|rule 2",                                 # removed from the head
+                    "openrouter.ai"]                                            # re-added: P again, not N+3's entry
+    assert root(rig, "REVOKE", session=SESSION)["ok"]
+    assert resolve() == ("refused", "token-revoked")
+
+
+def test_body_policy_refused_at_route_submit(rig):
+    # head ruling H2: a body_policy outside the four keys or their value sets, or a non-empty one on a route that is
+    # not an OpenRouter route, is refused at ROUTE-SUBMIT (`route-invalid:body_policy`), never at request time
+    good = route()
+    good["body_policy"] = {"provider_only": ["z-ai"], "allow_fallbacks": "no", "zdr": "yes", "data_collection": "deny"}
+    bads = [{"provider_only": "z-ai"}, {"allow_fallbacks": "false"}, {"zdr": "true"}, {"data_collection": "maybe"},
+            {"order": ["z-ai"]}, {"provider_only": []}]
+    gen = 2
+    for bp in bads:
+        bad = dict(route(), body_policy=bp)
+        it, sig = rig.st.signed(item(gen, [bad]))
+        assert refused(rig.ask("ROUTE-SUBMIT", map=it, sig=sig)) == "route-invalid:body_policy", bp
+    off = dict(route(host="api.z.ai"), body_policy={"zdr": "yes"})
+    it, sig = rig.st.signed(item(gen, [off]))
+    assert refused(rig.ask("ROUTE-SUBMIT", map=it, sig=sig)) == "route-invalid:body_policy"
+    it, sig = rig.st.signed(item(gen, [good]))
+    assert rig.ask("ROUTE-SUBMIT", map=it, sig=sig) == {"id": 1, "ok": True, "generation": gen}
