@@ -2917,8 +2917,27 @@ def _v_form(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
                 if t in seen_ids:
                     raise _bad(spec, f"{w}.enum[{j}]", f"{t!r} is repeated (after trimming)")
                 seen_ids.add(t)
-        elif "enum" in f:
-            raise _bad(spec, f"{w}.enum", "belongs to a recipient field only")
+            # the provider, not the page, says which ids are pressed at the start and which can leave its roster
+            # (and the words its refusal uses when one has): Levain assigns no meaning to any of them
+            if "default" in f:
+                dflt = f["default"]
+                if not (isinstance(dflt, list) and all(_is_str(x) for x in dflt)):
+                    raise _bad(spec, f"{w}.default", "must be a list of ids from the enum")
+                picked: set[str] = set()
+                for j, x in enumerate(dflt):
+                    t = x.strip()
+                    if t not in seen_ids:
+                        raise _bad(spec, f"{w}.default[{j}]", f"{t!r} is not in the enum")
+                    if t in picked:
+                        raise _bad(spec, f"{w}.default[{j}]", f"{t!r} is repeated (after trimming)")
+                    picked.add(t)
+            for key in ("transient_prefix", "gone_match"):
+                if key in f and not (_is_str(f[key]) and f[key]):
+                    raise _bad(spec, f"{w}.{key}", "must be a non-empty string")
+        else:
+            for key in ("enum", "default", "transient_prefix", "gone_match"):
+                if key in f:
+                    raise _bad(spec, f"{w}.{key}", "belongs to a recipient field only")
     if v.get("verb") is not None and not _is_str(v["verb"]):
         raise _bad(spec, "value.verb", "must be a string")
     return v

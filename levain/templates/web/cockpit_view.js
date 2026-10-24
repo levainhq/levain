@@ -541,8 +541,13 @@
   function formField(f) {
     const label = typeof f.label === "string" && f.label ? f.label : f.name;
     if (f.type === "recipient") {
+      // `default`, `transient_prefix` and `gone_match` are the provider's own declarations on its recipient field (the ids pressed at the
+      // start, the ids that can leave its roster, the words of its refusal when one has): carried through, given no meaning here
+      const str = (x) => (typeof x === "string" && x ? x : undefined);
       return { name: f.name, label: label, kind: "multiselect", chips: true, required: false,
-               options: Array.isArray(f.enum) ? f.enum.filter((x) => typeof x === "string") : [] };
+               options: Array.isArray(f.enum) ? f.enum.filter((x) => typeof x === "string") : [],
+               default: Array.isArray(f.default) ? f.default.filter((x) => typeof x === "string") : [],
+               transient_prefix: str(f.transient_prefix), gone_match: str(f.gone_match) };
     }
     const long = f.type === "text" && LONG_TEXT.has(f.name);
     return { name: f.name, label: f.type === "date" ? label + " (YYYY-MM-DD)" : label, kind: long ? "textarea" : "text", required: long, placeholder: long ? label : undefined };

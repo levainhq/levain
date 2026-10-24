@@ -72,7 +72,8 @@ def _write_request(qdir: Path, rid: str, message: str, *, options: "list[dict] |
 
 def _compose_card(enum: "list[str]") -> dict:
     return {"verb": "send_inbox", "fields": [{"name": "message", "type": "text", "label": "Message"},
-                                             {"name": "for", "type": "recipient", "label": "To", "enum": enum}]}
+                                             {"name": "for", "type": "recipient", "label": "To", "enum": enum,
+                                              "default": ["fanin"]}]}      # the provider declares its default reader; the page has none
 
 
 class _Rig:

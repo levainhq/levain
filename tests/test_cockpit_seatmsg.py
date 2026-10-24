@@ -18,9 +18,12 @@ from tests.test_cockpit_k7_build import BUILD, DESKTOP, _sessions_fixture
 
 ENUM = ["cli", "fanin", "seat:ledgerline"]          # the group label of n1..n3 is "ledgerline"; "tally" (n4, n5) is a lane: not in the enum
 
-def _compose(enum):
+DECLARED = {"default": ["fanin"], "transient_prefix": "seat:", "gone_match": "no_live_seat"}     # this provider's own words, declared on its field
+
+
+def _compose(enum, declared=DECLARED):
     return {"verb": "send_inbox", "fields": [{"name": "message", "type": "text", "label": "Message"},
-                                             {"name": "for", "type": "recipient", "label": "To (none = everyone)", "enum": enum}]}
+                                             {"name": "for", "type": "recipient", "label": "To (none = everyone)", "enum": enum, **declared}]}
 
 CHIPS = "[...document.querySelectorAll('[data-ck-compose=recipient]')]"
 PRESSED = CHIPS + ".filter(c => c.getAttribute('aria-pressed') === 'true').map(c => c.dataset.value)"
@@ -32,16 +35,16 @@ def _message_effect(params, *, origin_key):
     return send_inbox_effect({"body": params.get("message"), "for": params.get("for") or "cli"}, origin_key=origin_key)
 
 
-def _serve_inbox(src, enum=ENUM, handler=None):
+def _serve_inbox(src, enum=ENUM, handler=None, declared=DECLARED):
     ck = build_default_cockpit(src)
     ck.register(ProviderSpec(id="inbox", kind="list", title="Inbox", priority="feed", order="time.desc", version_fields=("id",),
-                             facets=frozenset({"source", "for", "at"}), verbs=("send_inbox",), compose=_compose(enum), read=lambda c: Read(rows=(RowIn("a", "hello", facets={"source": "bridge", "for": "cli", "at": "2026-10-23T11:00:00+00:00"}, stored={"id": "a"}),))))
+                             facets=frozenset({"source", "for", "at"}), verbs=("send_inbox",), compose=_compose(enum, declared), read=lambda c: Read(rows=(RowIn("a", "hello", facets={"source": "bridge", "for": "cli", "at": "2026-10-23T11:00:00+00:00"}, stored={"id": "a"}),))))
     verb = ActionVerb(handler=handler or (lambda p: {"summary": "sent"}), label="Send to inbox", fields=("message", "for"))
     return _serve(src, cockpit=ck, extra_verbs={"send_inbox": verb}, extra_effects={"send_inbox": DownstreamEffect(FakeInbox(), _message_effect)}, surface_tokens={"browser": "T"}, install_class="reported")
 
 
-def _run(tmp_path, src, steps, first=DESKTOP, page=BUILD, enum=ENUM, handler=None):
-    with _serve_inbox(src, enum, handler) as (url, _httpd):
+def _run(tmp_path, src, steps, first=DESKTOP, page=BUILD, enum=ENUM, handler=None, declared=DECLARED):
+    with _serve_inbox(src, enum, handler, declared) as (url, _httpd):
         return _drive(tmp_path, f"{url}/{page}", [first, {"until": "document.querySelector('[data-ck-compose=recipient]')"}, *steps])["values"]
 
 
@@ -228,3 +231,21 @@ def test_a_recovery_a_later_send_overtook_says_nothing_on_the_fresh_box(tmp_path
                                {"eval": "window.__rel(false); 1"},
                                {"eval": "new Promise((r) => setTimeout(() => r(%s), 300))" % SAY}])
     assert out[-1] != GONE, out
+
+
+@needs_browser
+def test_the_page_presses_and_recovers_only_what_the_provider_declares(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    none = {}          # a provider that declares nothing: the page has no default reader and no departed-reader recovery of its own
+    out = _run(tmp_path, src, [{"eval": "JSON.stringify(%s)" % PRESSED}], page="#write_token=T", declared=none)
+    assert json.loads(out[-1]) == [], out                                      # "fanin" is in the enum and is not pressed
+    out = _run(tmp_path, src, [{"eval": "JSON.stringify(%s)" % PRESSED}], page="#write_token=T", declared={"default": ["x", "cli"]}, enum=["cli", "x"])
+    assert json.loads(out[-1]) == ["cli", "x"], out                            # the declared default, as far as it is in the enum
+    # the refusal that used to trigger the recovery means nothing without the provider's declared match and prefix
+    out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_value(), "agents")}, {"eval": REFUSE + "1"}, {"eval": _tap("n3")},
+                               {"until": "document.activeElement.classList.contains('tray-dump-ta') && JSON.stringify(%s) == '[\"seat:ledgerline\"]'" % PRESSED},
+                               {"eval": SEND},
+                               {"eval": "new Promise((r) => setTimeout(() => r(JSON.stringify([%s, %s, %s.querySelector('.tray-dump-btn').disabled])), 500))" % (PRESSED, SAY, BOX)}],
+               declared={"transient_prefix": "seat:"})
+    pressed, said, frozen = json.loads(out[-1])
+    assert pressed == ["seat:ledgerline"] and said != GONE and frozen is False, out

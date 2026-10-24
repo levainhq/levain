@@ -6,6 +6,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+- **The cockpit message card's default reader and its departed-reader recovery are declared by the provider, not built
+  into the page.** 0.11.21 pre-selected one named agent and recognised one refusal wording in the page's own script. A
+  compose `recipient` field now takes three optional keys, validated beside `enum` and refused on any other field type:
+  `default` (a list of `enum` ids pressed at the start; none means nothing pressed, which sends to everyone),
+  `transient_prefix` (the ids that can leave the roster between draw and send) and `gone_match` (a case-insensitive
+  substring of the refusal that says one has). Without `transient_prefix` and `gone_match` the recovery never fires.
+  This corrects the 0.11.21 entry above: the page pre-selects nothing a provider does not declare.
+
 ## [0.11.22] — 2026-10-24
 
 ### Added
