@@ -21,7 +21,7 @@ def test_two_identical_site_lines_in_one_file_are_two_sites(tmp_path, monkeypatc
     (tmp_path / "levain").mkdir()
     (tmp_path / "levain" / "a.py").write_text("x = run_module(m)\ny = 1\nx = run_module(m)\n")
     monkeypatch.setattr(rc, "ROOT", tmp_path)
-    assert rc.dynamic_sites() == ["levain/a.py::x = run_module(m)", "levain/a.py::x = run_module(m)::#2"]
+    assert rc.dynamic_sites() == ["levain/a.py::<module>::x = run_module(m)", "levain/a.py::<module>::x = run_module(m)::#2"]
 
 
 def _site_tree(tmp_path, monkeypatch, body):
@@ -44,8 +44,8 @@ def test_a_changed_site_line_fails_its_row(tmp_path, monkeypatch):
     table = rc.dynamic_sites()
     _site_tree(tmp_path, monkeypatch, "x = run_module(other)\n")
     found = rc.dynamic_sites()
-    assert set(table) - set(found) == {"levain/a.py::x = run_module(m)"}
-    assert set(found) - set(table) == {"levain/a.py::x = run_module(other)"}
+    assert set(table) - set(found) == {"levain/a.py::<module>::x = run_module(m)"}
+    assert set(found) - set(table) == {"levain/a.py::<module>::x = run_module(other)"}
 
 
 def test_a_module_name_differing_only_in_case_is_not_a_module(tmp_path, monkeypatch):
@@ -113,25 +113,53 @@ def test_a_new_lazy_import_is_unclassified_until_the_table_names_it(tmp_path, mo
     _lazy_tree(tmp_path, monkeypatch, "def f():\n    from levain import lazy_a\n")
     monkeypatch.setattr(rc, "LAZY_SITES", {})
     found = rc.lazy_sites(rc.closure())
-    key = "levain/slot/forwarder.py::from levain import lazy_a"
+    key = "levain/slot/forwarder.py::f::from levain import lazy_a"
     assert sorted(found) == [key]
     assert sorted(set(found) - set(rc.LAZY_SITES)) == [key]  # the test above would fail on this tree
 
 
 def test_lazy_sites_are_keyed_by_content_with_an_ordinal_for_a_repeat(tmp_path, monkeypatch):
-    body = "def f():\n    from levain import lazy_a\n\n\ndef g():\n    from levain import lazy_a\n"
+    """The ordinal counts a repeat within one function; the same line in another function is a different key."""
+    body = ("def f(x):\n    if x:\n        from levain import lazy_a\n    else:\n        from levain import lazy_a\n\n\n"
+            "class C:\n    def g(self):\n        from levain import lazy_a\n")
     _lazy_tree(tmp_path, monkeypatch, body)
     keys = sorted(rc.lazy_sites(["levain.slot.forwarder"]))
-    assert keys == ["levain/slot/forwarder.py::from levain import lazy_a",
-                    "levain/slot/forwarder.py::from levain import lazy_a::#2"]
+    assert keys == ["levain/slot/forwarder.py::C.g::from levain import lazy_a",
+                    "levain/slot/forwarder.py::f::from levain import lazy_a",
+                    "levain/slot/forwarder.py::f::from levain import lazy_a::#2"]
     (tmp_path / "levain" / "slot" / "forwarder.py").write_text("\n\n" + body)  # an edit above both sites
     assert sorted(rc.lazy_sites(["levain.slot.forwarder"])) == keys
 
 
+def test_a_lazy_import_moved_to_another_function_fails_its_row(tmp_path, monkeypatch):
+    """A row is the site's enclosing function as well as its text: an unchanged import moved from an operator-only
+    function into a root-callable one must be re-classified, while an edit above it changes nothing."""
+    body = "def f():\n    from levain import lazy_a\n\n\ndef g():\n    pass\n"
+    _lazy_tree(tmp_path, monkeypatch, body)
+    table = sorted(rc.lazy_sites(["levain.slot.forwarder"]))
+    forwarder = tmp_path / "levain" / "slot" / "forwarder.py"
+    forwarder.write_text("\n\n" + body)
+    assert sorted(rc.lazy_sites(["levain.slot.forwarder"])) == table
+    forwarder.write_text("def f():\n    pass\n\n\ndef g():\n    from levain import lazy_a\n")
+    found = sorted(rc.lazy_sites(["levain.slot.forwarder"]))
+    assert set(table) - set(found) and set(found) - set(table)  # stale and unclassified: the classification test fails
+
+
+def test_a_dynamic_site_moved_to_another_function_fails_its_row(tmp_path, monkeypatch):
+    body = "def f():\n    x = run_module(m)\n\n\nclass C:\n    def g(self):\n        pass\n"
+    _site_tree(tmp_path, monkeypatch, body)
+    table = rc.dynamic_sites()
+    _site_tree(tmp_path, monkeypatch, "\n" + body)
+    assert rc.dynamic_sites() == table
+    _site_tree(tmp_path, monkeypatch, "def f():\n    pass\n\n\nclass C:\n    def g(self):\n        x = run_module(m)\n")
+    found = rc.dynamic_sites()
+    assert set(table) - set(found) and set(found) - set(table)
+
+
 def test_root_lazy_targets_join_the_closure_and_operator_ones_do_not(tmp_path, monkeypatch):
     _lazy_tree(tmp_path, monkeypatch, "def f():\n    from levain import lazy_a\n\n\ndef g():\n    import levain.lazy_b\n")
-    monkeypatch.setattr(rc, "LAZY_SITES", {"levain/slot/forwarder.py::from levain import lazy_a": "root",
-                                           "levain/slot/forwarder.py::import levain.lazy_b": "operator"})
+    monkeypatch.setattr(rc, "LAZY_SITES", {"levain/slot/forwarder.py::f::from levain import lazy_a": "root",
+                                           "levain/slot/forwarder.py::g::import levain.lazy_b": "operator"})
     mods = rc.closure()
     assert "levain.lazy_a" in mods and "levain.lazy_b" not in mods
 
@@ -146,5 +174,5 @@ def test_importlib_call_sites_are_dynamic_sites(tmp_path, monkeypatch):
     (tmp_path / "levain" / "a.py").write_text('import importlib\nx = importlib.import_module("levain.x")\ny = __import__("levain.y")\n')
     monkeypatch.setattr(rc, "ROOT", tmp_path)
     monkeypatch.setattr(rc, "DYNAMIC_SITES", {})
-    assert rc.dynamic_sites() == ['levain/a.py::x = importlib.import_module("levain.x")',
-                                  'levain/a.py::y = __import__("levain.y")']  # unclassified until a row names them
+    assert rc.dynamic_sites() == ['levain/a.py::<module>::x = importlib.import_module("levain.x")',
+                                  'levain/a.py::<module>::y = __import__("levain.y")']  # unclassified until a row names them
