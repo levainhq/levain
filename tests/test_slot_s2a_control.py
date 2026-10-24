@@ -37,7 +37,8 @@ SESSION2 = {"operator": {"LEASE-OPEN", "STATUS"},
             "root": {"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET"},
             "qbroker": {"QUEUE-RESOLVE"},
             # S1 3c-3 adds keys' attachment verbs (CONTRACT §4.5; 3c design r3 §2.1)
-            "keys": {"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS"},
+            # S1 3c-6b adds keys' LINEAGE-APPEND (CONTRACT §3.3 keys row; H6-2)
+            "keys": {"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS", "LINEAGE-APPEND"},
             # S1 3c-4 adds dispatch's ROUTE-SUBMIT (CONTRACT §4.3; 3c design r3 §2.3)
             "dispatch": {"ROUTE-SUBMIT",
                          # S1 3c-5 adds the ticket verbs (CONTRACT §3.3, §3.5)
