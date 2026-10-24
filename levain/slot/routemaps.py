@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
-from levain.authority import VerifierUnavailable, verify_link_sig
+from levain.authority_sig import VerifierUnavailable, verify_link_sig
 from levain.broker.policy import DispatchRoute, PolicyError, RoutePolicy, parse_routemap
 from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX

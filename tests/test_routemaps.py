@@ -487,8 +487,11 @@ def _restart_and_ack(st: Store, keys_py: str) -> dict:
 
 @pytest.fixture(params=[sys.executable, "/usr/bin/python3"], ids=["venv", "root-py"])
 def keys_py(request):
+    from tests import b2_keys_rig as B2
     if not os.path.exists(request.param):
         pytest.skip("no " + request.param)
+    if not B2.h11_available(request.param):
+        pytest.skip("h11 is not importable by %s (named skip, not a pass)" % request.param)
     return request.param
 
 

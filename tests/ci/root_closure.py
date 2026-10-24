@@ -107,29 +107,6 @@ LAZY_SITES = {
     'levain/slot/control.py:970::from levain.slot.control_client import V23_SECONDS   # lazy: a module-level import would be circular': 'root',
     # S1 3c-4: ``levain.slot.routemaps`` (CONTROL, keys) parses the dispatch route map with ``parse_routemap``
     'levain/broker/policy.py:380::from levain.dispatch import routemap_rules as rules': 'root',
-    # S1 3c-4: ``routemaps.check_item`` is the closure's one caller into ``levain.authority``, and it calls only
-    # ``verify_link_sig`` (``git grep -n 'authority\|verify_link_sig' -- levain/slot/routemaps.py``). Each row below
-    # is inside the authority STORE's own machinery (enrolment replay, appends, the cockpit lock), which no root
-    # process runs; the row's comment names the function and its callers in ``levain/authority.py``.
-    # operator: ``_enrolled_key`` <- ``_apply_op`` / ``_step`` (the authority chain's replay)
-    'levain/authority.py:1288::from levain.cockpit.keys import KeyError_, fingerprint_of, normalise_public_key': 'operator',
-    # operator: ``_step`` <- ``_replay_entry`` / ``append`` / ``prepare`` (the authority chain's writer and replay)
-    'levain/authority.py:1443::from levain.consent.passkey import authority_signature_problem': 'operator',
-    # operator: ``_no_live_cockpit`` <- ``reset_lock`` (the operator's anchor reset)
-    'levain/authority.py:2140::from levain.cockpit.broker import LOCK_NAME': 'operator',
-    # operator: ``_ranks`` <- ``_apply_op`` / ``_enrolled_key`` / ``_step``
-    'levain/authority.py:421::from levain.cockpit.firejournal import _CLASS_RANK': 'operator',
-    # operator: ``_tiers`` <- ``StandingPolicy.apply`` / ``_apply_policy_op`` / ``_validate_policy`` / ``classify``
-    'levain/authority.py:426::from levain.cockpit.verbs import TIERS': 'operator',
-    # operator: ``_stamp`` <- ``_parse_stamp`` / ``_step`` / ``prepare``
-    'levain/authority.py:431::from levain.cockpit.consent import utc_stamp': 'operator',
-    # operator: ``_parse_stamp`` <- the grant and policy validators and ``_step``
-    'levain/authority.py:436::from levain.cockpit.consent import parse_stamp': 'operator',
-    # operator: ``AuthorityKey.principal`` (a property of an enrolled key; ``verify_link_sig`` takes the key's strings)
-    'levain/authority.py:487::from levain.cockpit.keys import principal_of': 'operator',
-    # operator: ``RunJournal._barrier`` <- ``RunJournal`` admission (the autonomic run journal, imported by
-    # ``levain.authority``'s module body only; no root process opens a run journal)
-    'levain/autonomic/journal.py:444::from levain.autonomic.binding import registry_bars': 'operator',
     'levain/slot/export_run.py:349::from levain.slot import store_verbs as SV': 'root',
     'levain/slot/export_run.py:786::from levain.slot import wall': 'root',
     'levain/slot/export_run.py:997::from levain.slot import wall': 'root',

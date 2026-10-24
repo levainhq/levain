@@ -25,8 +25,10 @@ The membrane (load-bearing — the anti-grab-bag guard):
   - It decides HOW MUCH human an action needs; it does not decide that no human is needed by
     default. Which rungs exist and when each fires is ``levain.autonomic.posture``.
   - It is a LEAF: it imports the standard library and ``levain.autonomic`` only, never another
-    Levain module, anneal or a control-plane surface; adapters inject what it needs. The
-    anti-cycle rule; the dependency arrow stays down (asserted by ``tests/test_autonomic_leaf.py``).
+    Levain module, anneal or a control-plane surface; adapters inject what it needs. The one
+    exception is ``levain.trust_anchor`` (the trust-anchor rule, itself stdlib only and importing no
+    ``levain`` module), so root can run that rule without this package. The anti-cycle rule; the
+    dependency arrow stays down (asserted by ``tests/test_autonomic_leaf.py``).
 
 Architecture:
   The governance CORE (pure, no I/O, no model):

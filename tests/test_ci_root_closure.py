@@ -29,6 +29,14 @@ def test_roots_include_the_dynamically_run_modules():
     assert {"levain.slot.forwarder", "levain.slot.wall", "levain.broker.stub"} <= roots
 
 
+def test_root_verifies_a_route_map_without_the_authority_store_or_the_autonomic_package():
+    """S1 3c-4: CONTROL and keys verify a route map's signature with ``levain.authority_sig``; the authority store
+    (its replay reaches the cockpit) and ``levain.autonomic`` stay out of what root imports."""
+    mods = set(rc.closure())
+    assert {"levain.slot.routemaps", "levain.authority_sig", "levain.trust_anchor"} <= mods
+    assert "levain.authority" not in mods and not {m for m in mods if m.startswith("levain.autonomic")}
+
+
 def test_a_test_with_an_unparseable_helper_is_not_selected(tmp_path, monkeypatch, capsys):
     (tmp_path / "tests").mkdir()
     (tmp_path / "levain" / "slot").mkdir(parents=True)
