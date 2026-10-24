@@ -19,7 +19,7 @@ from tests.test_team_git import KEYS, _keys, clone, git, join, record_ruling, te
 PREVIEW = {"tier_seen": "T3", "gesture_seen": "laptop-only"}
 
 
-from tests.autonomic_confirm_keys import account_home
+from tests.autonomic_confirm_keys import anchor_scratch
 
 @pytest.fixture
 def tmp_path():
@@ -29,7 +29,7 @@ def tmp_path():
     under /tmp). Overriding the name reaches the imported team fixtures too."""
     import shutil
     import tempfile
-    d = Path(tempfile.mkdtemp(prefix=".levain-t3-", dir=account_home()))
+    d = anchor_scratch("t3-")
     try:
         yield d
     finally:

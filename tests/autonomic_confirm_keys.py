@@ -11,9 +11,12 @@ import atexit
 import functools
 import os
 import pwd
+import re
 import shutil
+import stat
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -39,13 +42,83 @@ def account_home() -> str:
     return home
 
 
+SCRATCH_PARENT = ".levain-test-scratch"
+_LEGACY_PREFIXES = (".levain-confirm-keys-", ".levain-k2b-broker-", ".levain-t3-")   # the three leaked ones, ONLY these
+_DEAD_AFTER = 600          # a dead-pid entry is swept once this old (never a live run's, never a just-made one)
+_LEGACY_AFTER = 7200
+_PID_RE = re.compile(r"-(\d+)-[A-Za-z0-9_]{8}$")
+_swept: set[str] = set()
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _rm_old_dir(path: str, age: float, now: float) -> None:
+    try:
+        st = os.lstat(path)
+        if stat.S_ISDIR(st.st_mode) and now - st.st_mtime > age:
+            shutil.rmtree(path, True)
+    except OSError:
+        pass
+
+
+def sweep_scratch(parent: str, home: str, now: float | None = None) -> None:
+    """Remove what killed runs left (their ``atexit`` / ``finally`` never ran): dirs under ``parent`` whose
+    embedded pid is dead and which are older than 10 minutes, and top-level legacy dirs in ``home`` with one of
+    the three old prefixes older than 2 hours. Nothing else is touched."""
+    now = time.time() if now is None else now
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        names = []
+    for n in names:
+        m = _PID_RE.search(n)
+        if m and not _pid_alive(int(m.group(1))):
+            _rm_old_dir(os.path.join(parent, n), _DEAD_AFTER, now)
+    try:
+        names = os.listdir(home)
+    except OSError:
+        names = []
+    for n in names:
+        if n.startswith(_LEGACY_PREFIXES):
+            _rm_old_dir(os.path.join(home, n), _LEGACY_AFTER, now)
+
+
+def anchor_scratch(prefix: str) -> Path:
+    """A private trust-anchor temp dir under the account home (see ``account_home``), inside ONE parent,
+    ``~/.levain-test-scratch``, instead of loose in the home. The name carries this process's pid, so the first
+    call per process can sweep what killed runs leaked. The caller still removes its own dir at exit."""
+    home = account_home()
+    parent = os.path.join(home, SCRATCH_PARENT)
+    try:
+        os.mkdir(parent, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(parent)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        pytest.skip(f"{parent!r} is a symlink or not a directory: refusing it as a trust-anchor parent")
+    if st.st_uid != os.getuid() or st.st_mode & 0o022:
+        pytest.skip(f"{parent!r} is not owned by this uid or is group/other-writable: refusing it")
+    if parent not in _swept:
+        _swept.add(parent)
+        sweep_scratch(parent, home)
+    return Path(tempfile.mkdtemp(prefix=f"{prefix}{os.getpid()}-", dir=parent))
+
+
 @functools.cache
 def _key() -> tuple[Path, Path]:
     # under the ACCOUNT's home (password database, not ``$HOME``), not the system temp directory: an
     # allowed-signers file is a trust anchor, and a world-writable ancestor (``/tmp`` on Linux) is refused
     # (``confirm.trust_anchor_problem``). The suite's scratch ``$HOME`` lives under the temp directory, so it
     # cannot hold this; the directory is private, holds only a throwaway key, and is removed at exit.
-    d = Path(tempfile.mkdtemp(prefix=".levain-confirm-keys-", dir=account_home()))
+    d = anchor_scratch("confirm-keys-")
     atexit.register(shutil.rmtree, d, True)
     key = d / "operator"
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", SIGNER, "-f", str(key)],
