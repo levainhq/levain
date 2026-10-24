@@ -847,16 +847,16 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                 built = build_default_cockpit(
                     self.levain_source,
                     job_store=self.job_runtime.store if self.job_runtime is not None else None)
-                built.attach_verbs(VerbView(self.verb_registry, built, lambda: broker_install_class(self)))
-                if self.broker is not None:
-                    built.attach_authority(self.broker.capture)    # authority, labels and tiers per request
-                    built.attach_edits_reader(self.broker.edits)  # Recent edits' broker rows (§0.6)
-                    built.attach_decision_rows(self.broker.decision_rows)   # the decisions panel (§3)
-                built.attach_consent_rows(self.consent_reader)    # agents waiting on the operator (Q6a)
-                if getattr(self, "question_store", None) is not None:
-                    built.attach_question_rows(self.question_store)   # and the questions they ask him (Q-2b)
-                if getattr(self, "note_store", None) is not None:
-                    built.attach_note_rows(self.note_store)           # and what they tell him (notes)
+                # the one attach list a server makes, the same call make_server makes: authority, labels and tiers per
+                # request, Recent edits' broker rows (§0.6), the decisions panel (§3), agents waiting on the operator
+                # (Q6a), the questions they ask him (Q-2b) and what they tell him (notes)
+                broker = self.broker
+                built.attach_server(
+                    VerbView(self.verb_registry, built, lambda: broker_install_class(self)), self.consent_reader,
+                    capture=broker.capture if broker is not None else None,
+                    edits=broker.edits if broker is not None else None,
+                    decision_rows=broker.decision_rows if broker is not None else None,
+                    questions=getattr(self, "question_store", None), notes=getattr(self, "note_store", None))
                 if self.extra_panels is not None:
                     # one callable call per refresh feeds the discovery and every adapted panel (design §6.2)
                     self.external_panels = ExternalPanels(self.extra_panels)
