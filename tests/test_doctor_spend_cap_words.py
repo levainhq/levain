@@ -19,11 +19,11 @@ def test_doctor_note_carries_both_strings_verbatim_and_no_badge():
     assert not any(b in note for b in (doctor._OK, doctor._WARN, doctor._FAIL))
 
 
-def test_changelog_unreleased_carries_the_same_strings():
+def test_changelog_carries_the_same_strings():
+    # The words must reach the changelog verbatim; which section holds them moves at every release, so the whole file is read.
     text = _CHANGELOG.read_text(encoding="utf-8")
-    unreleased = text.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
-    assert SPEND_CAP_WORDS in unreleased
-    assert SPEND_CAP_SIZING_LINE in unreleased
+    assert SPEND_CAP_WORDS in text
+    assert SPEND_CAP_SIZING_LINE in text
 
 
 def test_the_note_is_wired_into_run_doctor(tmp_path: Path, capsys):
