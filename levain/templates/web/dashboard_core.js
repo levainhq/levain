@@ -3854,6 +3854,19 @@
       startPoll(res.job_id);
     };
 
+    // A signed verb (spec.sign, DESIGN_SIGN D5) is posted only after the operator's passkey signed exactly these params
+    // (signedCompose), with `sign_request` added; anything short of a signed result posts nothing, and the draft stays until
+    // a signed send lands (the board's rebuild after it is what clears the box). Any other verb posts as it always has.
+    const fire = async (params, confirm, key) => {
+      if (!spec.sign) return commitAction(action.verb, params, confirm, key, action.panel);
+      const say = (t, k) => { msg.className = "edit-msg" + (k === "bad" ? " err" : k === "ok" ? "" : " busy"); msg.textContent = t; };
+      const s = await signedCompose(action.verb, params, say, row);
+      if (!s.ok) return { ok: false, error: "unsigned", message: s.message };
+      const signed = Object.assign({}, params, { sign_request: s.request });
+      const res = await commitAction(action.verb, signed, confirm, keyForSend(signed), action.panel);
+      if (res && res.ok) signedComposeDone(action.verb);
+      return res;
+    };
     go.addEventListener("click", () => {
       const c = collect();
       if (c.error) { msg.className = "edit-msg err"; msg.textContent = c.error; return; }
@@ -3862,7 +3875,7 @@
         setDisabled(true); msg.className = "edit-msg busy"; msg.textContent = "…";
         const restore = takePick();
         if (spec.job) { startJob(c.params, sendKey, restore).then((held) => { if (!held) setDisabled(false); }); return; }
-        commitAction(action.verb, c.params, false, sendKey, action.panel).then((res) => { if (!(res && res.ok)) failed(res, restore); });
+        fire(c.params, false, sendKey).then((res) => { if (!(res && res.ok)) failed(res, restore); });
         return;
       }
       // confirm step (the fat-finger gate): swap the send button for a confirm/cancel pair AND
@@ -3900,7 +3913,7 @@
           close(held);
           return;
         }
-        const res = await commitAction(action.verb, c.params, true, sendKey, action.panel);
+        const res = await fire(c.params, true, sendKey);
         if (res && res.ok) return;  // re-rendered → this box is gone, replaced fresh
         close(true); failed(res, restore);
       });
@@ -4294,6 +4307,15 @@
       slot.replaceChildren(...parts);
       return;
     }
+    if (open && q.sign) {
+      // answered by a signature (DESIGN_SIGN D5): the sign request's own options are the buttons, and no unsigned answer is
+      // drawn beside them (an unsigned tap on a row its caller asked to be signed is refused there, never his word)
+      const facet = signFacet(q.sign);
+      slot.replaceChildren(...parts);
+      if (card) { const bottom = el("div", "needs-actions needs-qa needs-sign"); bottom.appendChild(facet); card.appendChild(bottom); }
+      else slot.appendChild(facet);
+      return;
+    }
     if (!(open && q.offered && answerQuestion)) {
       for (const o of options) parts.push(el("div", "ext-meta", sv(o && o.key) + " — " + sv(o && o.label)));
       if (open) parts.push(copyLine(cli, "show command"));
@@ -4378,7 +4400,9 @@
   // An agent's note: something it tells the operator that needs no answer (Phill 10-22). The row carries who filed it, when and
   // whether it was dismissed; the words are the agent's, fetched from /cockpit/note/<n>.json with the page's token (the question
   // body's gate). A note is drawn apart from everything that decides: no REC, no options, no words box, no "sign" line, no
-  // accent; its one control is "dismiss", which tells the agent nothing. Every string is drawn with textContent, never as HTML.
+  // accent; its one control is "dismiss", which tells the agent nothing. The exception is a note whose caller filed a sign
+  // request for it (its `sign` facet): that request's own ceremony is drawn under its words (signFacet). Every string is
+  // drawn with textContent, never as HTML.
   // keyed `n|state`; renderNotes keeps only the notes the current view lists, and the strip's clearing empties it
   const noteBodies = new Map();
   function pruneNoteBodies(lines) {
@@ -4436,6 +4460,8 @@
       bar.append(btn, msg);
       parts.push(bar);
     }
+    // a note its caller filed a sign request for (DESIGN_SIGN D5) carries that request's ceremony under its words
+    if (!d && n.state === "open" && n.sign) parts.push(signFacet(n.sign));
     slot.replaceChildren(...parts);
   }
   function noteRow(o) {
@@ -4498,6 +4524,309 @@
     host.hidden = false;
     host.dataset.sig = sig;
   }
+
+  // ---- The sign card (DESIGN_SIGN D5) ----
+  // A question or note row whose facet names a sign request (`sign`, the request id) is answered through levain's own
+  // sign-request ceremony, hosted by this server for the caller's Signer: /cockpit/sign.json lists the request (its sha256,
+  // options, write-in, recommendation), and a tap is /cockpit/sign/<id>/challenge -> navigator.credentials.get -> /answer,
+  // ONE gesture. The request's own options are the buttons, since their lines are what is signed; the line shown after a
+  // signature is the server's (the challenge's `line`), never the page's copy. This is the phone page's signAnswer
+  // behaviour exactly: a cancelled passkey says so and signs nothing, a refusal after the assertion was sent is the server's
+  // 4xx only, anything else is "not sure", and a retry is the same button. The page is not a secure context on plain http
+  // and its passkey belongs to one https page: anywhere else the card says where to sign and draws no other answer. A
+  // signed verb in a compose box (signedCompose) runs the same ceremony on the request the server's compose_signer files.
+  const SIGN_USABLE = window.isSecureContext === true && typeof window.PublicKeyCredential === "function"
+    && !!(navigator.credentials && navigator.credentials.get);
+  const SIGN_NO_TOKEN = "this page carries no token, so the sign request is not shown";
+  const signB64u = (buf) => btoa(String.fromCharCode.apply(null, new Uint8Array(buf)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const signUnb64u = (t) => Uint8Array.from(atob(t.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((t.length + 3) % 4)),
+                                            (c) => c.charCodeAt(0));
+  // a cancelled Face ID and a passkey this device no longer holds both read NotAllowedError: one sentence for both
+  const signDeclined = (e, what) => "the passkey did not sign (" + ((e && e.name) || "cancelled") + "); " + what;
+  const signWhy = (r) => (r.body && typeof r.body.message === "string" && r.body.message) || ("refused (HTTP " + r.status + ")");
+  const signNotes = new Map();     // request id -> [text, kind, sha256]: what the last ceremony said, kept across redraws
+  const signWriteIns = new Map();  // request id -> {sha256, words}: a write-in being typed, kept for the version it was typed on
+  let signBusy = 0;                // a ceremony (or a passkey pick) in progress: a second tap anywhere does nothing
+  let signListed = null;           // {at, got}: the last listing, shared by every card of one render
+  // which enrolled passkey THIS browser used: fingerprint -> credential id, so the OS prompt asks for that one. Browser
+  // storage may be absent or throw; the ceremony works without it (the pick list, or the OS's own list)
+  const signMapKey = (rp) => "levain-passkeys:" + rp;
+  function signMine(rp) {
+    try { const m = JSON.parse(window.localStorage.getItem(signMapKey(rp)) || "{}"); return m && typeof m === "object" ? m : {}; }
+    catch (e) { return {}; }
+  }
+  function signRemember(rp, fp, rawId) {
+    try { const m = signMine(rp); m[fp] = rawId; window.localStorage.setItem(signMapKey(rp), JSON.stringify(m)); } catch (e) { /* kept nowhere */ }
+  }
+  function signHeaders(post) {
+    const t = window.LevainCockpitTransport;
+    const h = Object.assign({}, t && typeof t.headers === "function" ? t.headers() : {});
+    if (post) h["Content-Type"] = "application/json";
+    return h;
+  }
+  // {ok, status, body}; status 0 when the server could not be reached
+  function signCall(route, body) {
+    return fetchBounded(route, { method: "POST", cache: "no-store", headers: signHeaders(true), body: JSON.stringify(body) },
+      (res) => res.json().then((j) => ({ ok: res.ok, status: res.status, body: j && typeof j === "object" ? j : {} }),
+                               () => ({ ok: false, status: res.status, body: {} })),
+      () => ({ ok: false, status: 0, body: { message: "the cockpit could not be reached" } }));
+  }
+  // the listing: {requests, signers, origin, note} or {error}. One read serves every card drawn within a second or two;
+  // `fresh` reads again (after a ceremony, and before a compose)
+  function signListing(fresh) {
+    if (!fresh && signListed && Date.now() - signListed.at < 2000) return signListed.got;
+    const headers = signHeaders(false);
+    if (!headers["X-Levain-Write-Token"]) return Promise.resolve({ error: SIGN_NO_TOKEN });
+    const got = fetchBounded("/cockpit/sign.json", { cache: "no-store", headers: headers }, (res) => {
+      if (res.status === 403) return { error: "this page's token was not accepted, so the sign request is not shown" };
+      if (res.status === 404) return { error: "this cockpit hosts no signing" };
+      if (!res.ok) return { error: "the sign requests could not be read (HTTP " + res.status + ")" };
+      return res.json().then((b) => (b && typeof b === "object" && Array.isArray(b.requests) ? b : { error: "the sign requests could not be read" }),
+                             () => ({ error: "the sign requests could not be read" }));
+    }, () => ({ error: "the sign requests could not be read (network)" }));
+    signListed = { at: Date.now(), got: got };
+    got.then((b) => { if (b.error && signListed && signListed.got === got) signListed = null; });
+    return got;
+  }
+  // the one page this cockpit signs on, or "" when the listing names none; a page anywhere else cannot run the ceremony
+  const signElsewhere = (listing) => (!SIGN_USABLE || typeof listing.origin !== "string" || listing.origin !== window.location.origin);
+  const signWhere = (listing) => "sign on " + (typeof listing.origin === "string" && listing.origin ? listing.origin : "the cockpit's https page")
+    + ": this page cannot use your passkey";
+
+  // One ceremony on listing row `r` with passkey `fp`: resolves {done: "signed"|"unsigned"|"unsure", line}. Only a definite
+  // "nothing was signed" is "unsigned": a 4xx from the challenge or the answer, or anything before the answer was sent.
+  function signCeremony(r, fp, rawId, choice, words, say) {
+    const base = "/cockpit/sign/" + encodeURIComponent(r.id) + "/";
+    const body = { signer_fp: fp, request_sha256: r.sha256 };
+    if (choice !== undefined) body.choice = choice;
+    if (words !== undefined) body.write_in = words;
+    let sent = false, line;
+    say(choice !== undefined ? "asking for the challenge for (" + choice + ")…" : "asking for the challenge…");
+    return signCall(base + "challenge", body).then((c) => {
+      if (!c.ok) { say(signWhy(c), "bad"); return { done: "unsigned" }; }
+      // the exact line the signature appends, from the server's bytes: what is shown is what is signed
+      if (typeof c.body.line === "string") line = c.body.line;
+      say("confirm with your passkey to sign…" + (line ? " " + line : ""));
+      const pk = { challenge: signUnb64u(String(c.body.challenge || "")), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+      if (rawId) pk.allowCredentials = [{ type: "public-key", id: signUnb64u(rawId) }];
+      return navigator.credentials.get({ publicKey: pk }).then((cred) => {
+        say("verifying the signature…");
+        sent = true;
+        return signCall(base + "answer", {
+          authenticator_data: signB64u(cred.response.authenticatorData), client_data_json: signB64u(cred.response.clientDataJSON),
+          signature: signB64u(cred.response.signature) }).then((a) => {
+          if (!a.ok && a.status >= 400 && a.status < 500) { say("not signed: " + signWhy(a), "bad"); return { done: "unsigned" }; }
+          if (!a.ok) { say("not sure this was signed (" + signWhy(a) + "): check the list", "bad"); return { done: "unsure" }; }
+          if (!rawId && cred.rawId && typeof c.body.rp_id === "string") signRemember(c.body.rp_id, fp, signB64u(cred.rawId));
+          say("signed" + (a.body.choice ? " (" + a.body.choice + ")" : "") + " · by " + a.body.signer_fp + " in " + a.body.namespace
+              + (line ? ": " + line : ""), "ok");
+          return { done: "signed", line: line };
+        });
+      }, (e) => { say(signDeclined(e, "nothing was signed"), "bad"); return { done: "unsigned" }; });
+    }).catch((e) => {
+      const name = (e && e.name) || "error";
+      if (sent) { say("not sure this was signed (the page failed: " + name + "): check the list", "bad"); return { done: "unsure" }; }
+      say("the page failed (" + name + "); nothing was signed", "bad");
+      return { done: "unsigned" };
+    });
+  }
+  // Which passkey signs: the one this browser used before, else the only one enrolled; with several and no record, the
+  // person picks (buttons put into `host`, the phone's pick list). Resolves {fp, rawId}, or null when the pick was dismissed
+  // by its dismiss button. The pick holds `signBusy` like a ceremony.
+  function signWho(listing, host, say) {
+    const signers = Array.isArray(listing.signers) ? listing.signers : [];
+    const rp = (listing.origin || "").replace(/^https?:\/\//, "").replace(/:\d+$/, "");
+    const local = signMine(rp);
+    const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
+    if (known.length === 1) return Promise.resolve({ fp: known[0], rawId: local[known[0]] });
+    if (!known.length && signers.length === 1) return Promise.resolve({ fp: signers[0], rawId: null });
+    const choices = known.length ? known : signers;
+    say("more than one passkey is enrolled for this name; pick the one this device holds:");
+    return new Promise((resolve) => {
+      const picks = [];
+      for (const fp of choices) {
+        const p = el("button", "undo-btn sign-pick", fp.slice(0, 18) + "…");
+        p.type = "button";
+        p.title = fp;
+        p.addEventListener("click", () => { picks.forEach((x) => x.remove()); resolve({ fp: fp, rawId: known.length ? local[fp] : null }); });
+        picks.push(p);
+        host.appendChild(p);
+      }
+      const no = el("button", "undo-btn sign-pick", "dismiss");
+      no.type = "button";
+      no.addEventListener("click", () => { picks.forEach((x) => x.remove()); say("no passkey was picked; nothing was signed", "bad"); resolve(null); });
+      picks.push(no);
+      host.appendChild(no);
+    });
+  }
+  // the card's part for request `id`: a note line, then the request's own buttons, filled once the listing answers
+  function signFacet(id) {
+    const wrap = el("div", "sign-facet");
+    wrap.dataset.signRequest = id;
+    const note = el("div", "sign-note ext-meta", "reading the sign request…");
+    wrap.appendChild(note);
+    const show = (text, kind) => { note.textContent = text; note.className = "sign-note ext-meta" + (kind ? " sign-" + kind : ""); };
+    signListing(false).then((listing) => {
+      if (listing.error) return show(listing.error, "bad");
+      if (signElsewhere(listing)) return show(signWhere(listing), "bad");
+      const r = listing.requests.find((x) => x && x.id === id);
+      const kept = signNotes.get(id);
+      if (!r) {
+        // answered here: its signed line stays until the row itself leaves; else it was answered, denied or expired elsewhere
+        return show(kept && kept[1] === "ok" ? kept[0] : "this sign request is no longer open; the card updates on the next read", kept && kept[1]);
+      }
+      if (kept && kept[2] !== (r.sha256 || "")) signNotes.delete(id);
+      if (r.refused) return show("not signable: " + r.refused, "bad");
+      const say = (text, kind) => { signNotes.set(id, [text, kind || "", r.sha256 || ""]); show(text, kind); };
+      const signers = Array.isArray(r.signers) ? r.signers : [];
+      const k = signNotes.get(id);
+      if (k) show(k[0], k[1]);
+      else if (!signers.length) show(listing.note || "no passkey is enrolled for this name", "bad");
+      else show("");
+      const acts = el("div", "sign-actions");
+      const buttons = [];
+      const lock = (on) => { for (const b of buttons) b.disabled = on || !signers.length; };
+      let freeze = null;      // the write-in's frozen state while its ceremony runs (set below when it offers one)
+      const run = (choice, words) => {
+        if (signBusy) return;
+        signBusy++;
+        lock(true);
+        signWho(Object.assign({}, listing, { signers: signers }), acts, say).then((who) => (who ? signCeremony(r, who.fp, who.rawId, choice, words, say) : { done: "unsigned" }))
+          .then((out) => {
+            if (out.done !== "unsigned") { signWriteIns.delete(id); return out; }
+            if (freeze) freeze.release();
+            return out;
+          })
+          .finally(() => {
+            signBusy--;
+            for (const p of acts.querySelectorAll(".sign-pick")) p.remove();
+            lock(false);
+            signListed = null;
+            // a signed (or not-knowable) answer leaves the request open no longer: the board's next read redraws the card
+            const t = window.LevainCockpitTransport;
+            if (t && typeof t.reload === "function") setTimeout(() => t.reload(), 1500);
+          });
+      };
+      const options = Array.isArray(r.options) ? r.options : [];
+      if (!options.length) {
+        const b = el("button", "undo-btn question-option sign-option", "sign with your passkey");
+        b.type = "button";
+        b.addEventListener("click", () => run(undefined, undefined));
+        buttons.push(b);
+        acts.appendChild(b);
+      }
+      for (const o of options) {
+        const rec = o && o.key === r.recommended;
+        const b = el("button", "undo-btn question-option sign-option" + (rec ? " question-rec" : ""), "(" + String(o.key) + ") " + String(o.text));
+        b.type = "button";
+        b.title = "sign: " + String(o.line);
+        b.addEventListener("click", () => run(String(o.key), undefined));
+        buttons.push(b);
+        acts.appendChild(b);
+      }
+      const wi = options.length && r.write_in && typeof r.write_in === "object" ? r.write_in : null;
+      if (wi) {
+        const box = el("input", "sign-write-in");
+        box.type = "text";
+        box.maxLength = Number(wi.max) || 200;
+        box.placeholder = "or write your own answer";
+        const draft = signWriteIns.get(id);
+        if (draft && draft.sha256 !== (r.sha256 || "")) signWriteIns.delete(id);   // typed on a replaced version
+        box.value = signWriteIns.has(id) ? signWriteIns.get(id).words : "";
+        box.addEventListener("input", () => signWriteIns.set(id, { sha256: r.sha256 || "", words: box.value }));
+        const b = el("button", "undo-btn question-option sign-option", "(" + String(wi.key) + ") sign my words");
+        b.type = "button";
+        // the words being signed are frozen from the tap until the ceremony ends; only a definite "nothing was signed"
+        // unfreezes them, so a retry is a new tap over the same words
+        freeze = { release: () => { box.readOnly = box.disabled = false; } };
+        b.addEventListener("click", () => {
+          if (signBusy) return;
+          const w = box.value.trim();
+          if (!w) return say("type your answer first", "bad");
+          box.value = w;
+          signWriteIns.set(id, { sha256: r.sha256 || "", words: w });
+          box.readOnly = box.disabled = true;
+          run(String(wi.key), w);
+        });
+        buttons.push(b);
+        acts.append(box, b);
+      }
+      lock(signBusy > 0);
+      wrap.appendChild(acts);
+      if (options.length) {
+        const lines = el("div", "sign-lines ext-meta", "an option signs the request's message with its line appended:");
+        for (const o of options) lines.appendChild(el("div", "sign-line", String(o.line)));
+        if (wi) lines.appendChild(el("div", "sign-line", String(wi.line) + "<your words>"));
+        wrap.appendChild(lines);
+      }
+    });
+    return wrap;
+  }
+
+  // A signed verb's send (ActionVerb.sign): the server's compose_signer files a sign request for exactly these params, the
+  // passkey signs it, and only then does the caller post the verb with `sign_request`. Resolves {ok: true, request} or
+  // {ok: false, message}; nothing here clears a draft. A request this send already filed (or signed) for the same params is
+  // reused, so a cancelled passkey or a failed post is retried without filing again.
+  const composeSigned = Object.create(null);   // verb -> {key, request, signed}
+  async function signedCompose(verb, params, say, host) {
+    const listing = await signListing(true);
+    if (listing.error) { say(listing.error, "bad"); return { ok: false, message: listing.error }; }
+    if (signElsewhere(listing)) {
+      const m = signWhere(listing) + "; nothing was sent, and your draft is kept";
+      say(m, "bad");
+      return { ok: false, message: m };
+    }
+    const key = JSON.stringify([verb, params]);
+    let st = composeSigned[verb] && composeSigned[verb].key === key ? composeSigned[verb] : null;
+    if (st && st.signed) return { ok: true, request: st.request };
+    let rows = listing.requests;
+    let r = st ? rows.find((x) => x && x.id === st.request && !x.refused) : null;
+    if (!r) {
+      say("asking the cockpit to file this for your signature…");
+      const c = await signCall("/cockpit/sign/compose", { verb: verb, params: params });
+      if (!c.ok) {
+        // the route itself absent (no compose_signer) is "not_found"; any other refusal carries the server's words
+        const m = c.status === 404 && (!c.body.error || c.body.error === "not_found")
+          ? "this cockpit cannot sign messages; nothing was sent" : "not sent: " + signWhy(c);
+        say(m, "bad");
+        return { ok: false, message: m };
+      }
+      st = composeSigned[verb] = { key: key, request: String(c.body.request || ""), signed: false };
+      const again = await signListing(true);
+      rows = Array.isArray(again.requests) ? again.requests : [];
+      r = rows.find((x) => x && x.id === st.request && !x.refused);
+      if (!r) {
+        const m = "the sign request was filed but is not listed; nothing was sent, send again";
+        say(m, "bad");
+        return { ok: false, message: m };
+      }
+      listing.signers = again.signers;
+      listing.note = again.note;
+    }
+    const signers = Array.isArray(r.signers) ? r.signers : [];
+    if (!signers.length) {
+      const m = (listing.note || "no passkey is enrolled for this name") + "; nothing was sent";
+      say(m, "bad");
+      return { ok: false, message: m };
+    }
+    if (signBusy) return { ok: false, message: "a signature is already being asked for" };
+    signBusy++;
+    let last = "";
+    const tell = (t, k) => { last = t; say(t, k); };
+    try {
+      const who = await signWho(Object.assign({}, listing, { signers: signers }), host, tell);
+      if (!who) return { ok: false, message: last + "; nothing was sent, and your draft is kept" };
+      const out = await signCeremony(r, who.fp, who.rawId, undefined, undefined, tell);
+      if (out.done === "signed") { st.signed = true; return { ok: true, request: st.request }; }
+      return { ok: false, message: last + (out.done === "unsure" ? "" : "; nothing was sent, and your draft is kept") };
+    } finally {
+      signBusy--;
+      for (const p of host.querySelectorAll(".sign-pick")) p.remove();
+      signListed = null;
+    }
+  }
+  function signedComposeDone(verb) { delete composeSigned[verb]; }
 
   // ---- The Needs-you strip (K4, F4 a / F11 a) ----
   // What waits on the operator, drawn as cards under the now band: each PENDING consent request and each OPEN question of the

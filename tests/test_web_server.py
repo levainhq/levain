@@ -205,7 +205,7 @@ class TestSubstrateJson:
                                           confirm_required=True, label="Send to inbox")}
         data = json.loads(build_substrate_json(_store_with_data(tmp_path), extra_verbs=verbs))
         assert data["action_verbs"]["send_inbox"] == {
-            "confirm_required": True, "idempotent": False, "job": False, "label": "Send to inbox"}
+            "confirm_required": True, "idempotent": False, "job": False, "sign": False, "label": "Send to inbox"}
 
     def test_action_verbs_exposes_idempotent_flag(self, tmp_path: Path) -> None:
         # an idempotent verb advertises idempotent:true so the frontend mints + sends a client

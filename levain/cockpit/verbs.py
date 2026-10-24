@@ -66,7 +66,7 @@ UNVERIFIED = "unverified"
 # remote-control path (§4.6). Registering one as a cockpit verb is refused.
 BROKER_HEADS: dict[str, dict[str, Any]] = {
     "harness_approve": {"label": "approve", "tier": "T2", "confirm": True, "idempotent": True,
-                        "job": False, "reversible": False, "fields": [], "effect":
+                        "job": False, "reversible": False, "fields": [], "sign": False, "effect":
                         "answers a harness's pending tool call", "gesture": "sign", "route": "broker"},
 }
 
@@ -74,7 +74,16 @@ BROKER_HEADS: dict[str, dict[str, Any]] = {
 _ENVELOPE = frozenset({"verb", "panel_id", "row_id", "row_version", "panel_version", "params",
                        "intent", "dry_run", "confirm", "idempotency_key", "tier_seen", "gesture_seen"})
 _INTENTS = ("reported", "sign")
+# The one param a signed verb (VerbSpec.sign, DESIGN_SIGN D5) takes beside its fields: the id of the sign request the
+# operator's passkey signed for these params. The kernel admits it and checks nothing else about it: the verb's own
+# handler or effect verifies the signature over the params, so the write token alone never sends a signed verb.
+SIGN_PARAM = "sign_request"
 GESTURES = ("direct", "direct-reported", "sign", "refused", "laptop-only")
+
+
+def _param_names(verb: "VerbSpec") -> "set[str]":
+    """The params a verb takes: its fields, and on a signed verb the sign request it names (SIGN_PARAM)."""
+    return set(verb.fields or ()) | ({SIGN_PARAM} if verb.sign else set())
 
 
 def tier_max(*tiers: Tier) -> Tier:
@@ -132,6 +141,9 @@ class VerbSpec:
     # every verb unless named here: ``dispatch`` refuses a device credential on any other (a kernel allowlist, never
     # the phone's UI)
     device_ok: bool = False
+    # DESIGN_SIGN D5: the page sends this verb only once the operator's passkey signed its params (a sign request the
+    # server's compose_signer filed), adding the one param SIGN_PARAM; the verb's own handler or effect verifies it
+    sign: bool = False
 
     # ``policy`` is the request's standing policy (``RequestAuthority.policy``, trust-tiering DESIGN
     # §3.4, §4.1): it may raise a tier, never lower one
@@ -154,8 +166,8 @@ class VerbSpec:
     def head(self, gesture: str, *, policy: "TierPolicy") -> dict[str, Any]:
         return {"label": self.label, "tier": _raised(policy, self.name, self.floor if self.tier_fn else "T2"),
                 "confirm": self.confirm_required, "idempotent": self.idempotent, "job": self.job,
-                "reversible": self.reversible, "fields": list(self.fields or ()), "effect": self.effect,
-                "gesture": gesture, "route": self.route}
+                "reversible": self.reversible, "fields": list(self.fields or ()), "sign": self.sign,
+                "effect": self.effect, "gesture": gesture, "route": self.route}
 
 
 def gesture_for(tier: Tier, credential_class: str, install_class: str) -> str:
@@ -539,7 +551,7 @@ class VerbRegistry:
         self._add(VerbSpec(
             name, spec.label or name, spec.label or name, "panel", fields=spec.fields, floor="T2", tier_fn=None,
             confirm_required=spec.confirm_required, idempotent=spec.idempotent, job=spec.job,
-            reversible=False))
+            reversible=False, sign=spec.sign))
 
     def get(self, name: str) -> VerbSpec | None:
         return self._specs.get(name)
@@ -814,7 +826,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
         params = req.get("params", {})
         if not isinstance(params, dict):
             raise _refuse("bad_request", 400, "'params' must be a JSON object")
-        bad = sorted(set(params) - set(verb.fields)) if verb.fields is not None else []
+        bad = sorted(set(params) - _param_names(verb)) if verb.fields is not None else []
         if bad:
             raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
         tier = verb.tier(params, None, auth.labels.label(None), today, policy=auth.policy)    # no row, no label
@@ -839,7 +851,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     params = req.get("params", {})
     if not isinstance(params, dict):
         raise _refuse("bad_request", 400, "'params' must be a JSON object")
-    bad = sorted(set(params) - set(verb.fields)) if verb.fields is not None else []
+    bad = sorted(set(params) - _param_names(verb)) if verb.fields is not None else []
     if bad:
         raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
     if "dry_run" in req and not isinstance(req["dry_run"], bool):

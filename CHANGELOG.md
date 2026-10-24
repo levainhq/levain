@@ -28,6 +28,24 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `budget-overrun` (402), while calls already running finish and are charged from their own usage. The stop lasts
   until the session ends, or until the credential-holding process restarts (the stop is kept in its memory). A streamed openai-chat request that does not say whether it wants usage is sent asking for
   it, so the provider adds one final chunk carrying the usage.
+- **The cockpit can sign answers and messages with your passkey.** An embedder that files levain sign requests (the
+  phone page's ceremony) can now have the cockpit page run the same ceremony. `make_server` takes `signer=` (a
+  `levain.consent.sign.Signer` pinned to the page it is served on with `page_origin`), `extra_hosts=` (the bare https
+  name a reverse proxy such as `tailscale serve` forwards to it) and `compose_signer=`. With a signer the cockpit serves
+  `GET /cockpit/sign.json` and `POST /cockpit/sign/<id>/{challenge,answer,deny}`, each behind the write token, the
+  Host allowlist and same-origin rules a write has. A question or note whose caller sets `sign_request` shows that
+  request's own options as buttons; one tap asks your passkey and records a signature that `ssh-keygen -Y verify`
+  accepts, the first answer winning when the phone and the cockpit answer one request. A cancelled passkey signs
+  nothing and keeps what you typed. On any page other than the pinned one the card says where to sign and offers no
+  other answer. A verb declared with `ActionVerb(sign=True)` is sent from its compose box only after your passkey signs
+  its params: the page asks `POST /cockpit/sign/compose` (the `compose_signer` files the request; its `ValueError` is
+  shown to you), runs the ceremony, then posts the verb with `sign_request`, which the verb's own effect must verify.
+  Without a `compose_signer` a signed verb is not sent at all. A request through an `extra_hosts` name is treated as
+  off the box: the cockpit's reads need the token there too. `levain.consent.sign.passkey_key_source` is the passkey
+  key source the phone page uses, for an embedder building the Signer.
+- **A passkey verifier can be pinned to an https page with a port.** `levain.consent.passkey` accepts an explicit
+  `page_origin` of `https://<name>:<port>` for a name other than localhost; without one, the portless rule is
+  unchanged for every existing verifier.
 
 ## [0.11.20] — 2026-10-23
 

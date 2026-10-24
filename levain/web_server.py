@@ -183,6 +183,10 @@ def _is_write_route(route: str) -> bool:
 _SIGN_LIST_PATH = "/cockpit/sign.json"
 _SIGN_PREFIX = "/cockpit/sign/"
 _SIGN_ACTIONS = ("challenge", "answer", "deny")
+# POST /cockpit/sign/compose (DESIGN_SIGN D5, the compose contract): {verb, params} -> {request}, the caller's compose_signer
+# filing a sign request for a signed verb's params; the page then runs the ceremony on that id. Served only when
+# make_server was given a compose_signer (and a signer to run the ceremony): without one it is 404.
+_SIGN_COMPOSE = "/cockpit/sign/compose"
 # one extra Host value (make_server extra_hosts): a DNS name or IPv4 literal and an optional trailing dot, never a port
 _EXTRA_HOST = re.compile(r"(?=[^:]{1,253}\Z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
                          r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?")
@@ -651,7 +655,7 @@ def build_substrate_json(
             # never drift-prone.
             name: {"confirm_required": bool(spec.confirm_required),
                    "idempotent": bool(spec.idempotent), "job": bool(spec.job),
-                   "label": spec.label}
+                   "sign": bool(getattr(spec, "sign", False)), "label": spec.label}
             for name, spec in extra_verbs.items()
         }
     return json.dumps(payload).encode("utf-8")
@@ -773,6 +777,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # None serves no sign route.
     signer: "Signer | None" = None
     signer_page_origin: "str | None" = None
+    # the caller's compose_signer (DESIGN_SIGN D5): (verb, params) -> the id of the sign request it filed; None serves no
+    # compose route
+    compose_signer: "Callable[[str, dict[str, Any]], str] | None" = None
     # The change stream (levain.cockpit.stream): set per instance in __init__, before the socket binds,
     # because a failed bind runs server_close and that reads these.
     stream_gate: threading.BoundedSemaphore
@@ -1018,8 +1025,9 @@ class _Handler(GuardedHandler):
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
     def _serve_sign_list(self, *, head: bool) -> None:
-        """``GET /cockpit/sign.json``: ``{requests, signers}``, the Signer's own listing rows (sha256, options,
-        write_in, recommended) for the active passkeys that may sign, and those keys' fingerprints. Reached only
+        """``GET /cockpit/sign.json``: ``{requests, signers, origin}``, the Signer's own listing rows (sha256, options,
+        write_in, recommended) for the active passkeys that may sign, those keys' fingerprints, and the page origin the
+        ceremony is pinned to (a page served elsewhere sends the operator there). Reached only
         through ``_route`` (Host allowlist, cross-site refusal), then the write gate's other checks before the
         directory is read: same-origin only (``Sec-Fetch-Site`` absent or ``same-origin``), a surface token on every
         bind, the request gate. Without a signer, 404. Keys that cannot be read list no signers and say why in
@@ -1054,7 +1062,9 @@ class _Handler(GuardedHandler):
                 note = None
             except SignRefused as exc:
                 signers, note = [], str(exc)
-            payload = {"requests": signer.listing(signers), "signers": signers}
+            # `origin`: the one page the ceremony signs on (make_server checked it), so a page served anywhere else says
+            # where to sign rather than offering a gesture its browser would refuse
+            payload = {"requests": signer.listing(signers), "signers": signers, "origin": self.server.signer_page_origin}
             if note is not None:
                 payload["note"] = note
             status = 200
@@ -1083,6 +1093,41 @@ class _Handler(GuardedHandler):
             return getattr(signer, action)(request_id, req), 200
         except SignRefused as exc:
             return {"error": error_word(exc.status), "message": str(exc)}, exc.status
+
+    def _sign_compose(self, req: Any) -> "tuple[dict[str, Any], int]":
+        """``POST /cockpit/sign/compose`` ``{verb, params}`` -> ``{request}`` (DESIGN_SIGN D5): the caller's
+        ``compose_signer`` files a sign request for a SIGNED verb's params and names it; the page runs the ceremony on
+        that id and only then posts the verb with ``sign_request``. The verb must be one this server serves with
+        ``sign`` set, and the params its fields; a ``ValueError`` from the compose_signer is a 400 carrying its words
+        (the reason the operator reads). The kernel files nothing itself and signs nothing."""
+        from levain.consent.sign import request_id_ok
+        from levain.cockpit.verbs import SIGN_PARAM
+
+        compose = self.server.compose_signer
+        if compose is None:     # the route is not served without one; an explicit check survives `python -O`
+            return {"error": "not_found", "message": "no such route"}, 404
+        if not isinstance(req, dict) or set(req) != {"verb", "params"}:
+            return {"error": "bad_request", "message": "request keys must be ['params', 'verb']"}, 400
+        name, params = req["verb"], req["params"]
+        spec = self.server.verb_registry.get(name) if isinstance(name, str) else None
+        if spec is None:
+            return {"error": "unknown_verb", "message": f"no such verb: {str(name)[:80]!r}"}, 404
+        if not spec.sign:
+            return {"error": "not_signed", "message": f"{spec.name!r} is not a signed verb: it is sent as it is"}, 400
+        if not isinstance(params, dict):
+            return {"error": "bad_request", "message": "'params' must be a JSON object"}, 400
+        bad = sorted(set(params) - set(spec.fields)) if spec.fields is not None else []
+        if SIGN_PARAM in params:
+            bad = sorted(set(bad) | {SIGN_PARAM})      # what is signed is the message, never a request id
+        if bad:
+            return {"error": "field_not_allowed", "message": f"{spec.name!r} does not take {bad}"}, 400
+        try:
+            rid = compose(spec.name, dict(params))
+        except ValueError as exc:
+            return {"error": "bad_request", "message": str(exc) or "the message cannot be signed"}, 400
+        if not request_id_ok(rid):
+            return {"error": "internal", "message": "the compose signer named no sign request"}, 500
+        return {"request": rid}, 200
 
     def _serve_note_body(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/note/<n>.json``: one note's body (what, detail, agent, filed_at, and its dismissal if any),
@@ -1606,7 +1651,9 @@ class _Handler(GuardedHandler):
         # A sign route (DESIGN_SIGN D4) needs a surface token on every bind whatever the source's write scope: its
         # gesture is the operator's passkey, and the page that carries it must be this cockpit's own.
         sign = _sign_route(route) if self.server.signer is not None else None
-        if sign is not None and not self._off_box_token_valid():
+        # the compose route (DESIGN_SIGN D5) rides exactly that gate: it files a request the operator's passkey then signs
+        compose = route == _SIGN_COMPOSE and self.server.compose_signer is not None
+        if (sign is not None or compose) and not self._off_box_token_valid():
             return self._reject(403, "credential_required", "missing or invalid write token")
         if (self._write_token_required() and not _is_write_route(route)
                 and not self._off_box_token_valid()):
@@ -1621,7 +1668,7 @@ class _Handler(GuardedHandler):
         # write_scope, and action verbs REQUIRE a write_scope (make_server enforces it), so
         # it already covers /action with no change here.
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
-        if not _is_write_route(route) and not is_chat and sign is None:
+        if not _is_write_route(route) and not is_chat and sign is None and not compose:
             return self._reject(404, "not_found", "no such route")
         if is_chat and not self._chat_token_valid():   # before a byte of the body is read
             return self._reject(403, "chat_token", (
@@ -1661,6 +1708,14 @@ class _Handler(GuardedHandler):
                     self._send_json({"error": "not_found", "message": "no such route"}, 404)
                     return
                 self._send_chat(self._chat_post(route, host, req))
+                return
+            if compose:
+                # the caller's compose_signer files the request: like the ceremony, no read-only refusal applies to it
+                try:
+                    payload, status = self._sign_compose(req)
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
                 return
             if sign is not None:
                 # the Signer's own ceremony, not the substrate's write scope: no read-only refusal applies to it
@@ -1742,6 +1797,7 @@ def make_server(
     extra_effects: "Mapping[str, DownstreamEffect] | None" = None,
     signer: "Signer | None" = None,
     extra_hosts: "Iterable[str] | None" = None,
+    compose_signer: "Callable[[str, dict[str, Any]], str] | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -1807,7 +1863,14 @@ def make_server(
     ``name:8443`` is admitted. Anything else is a ``ValueError`` before binding, and so is any entry beside a
     ``chat_host`` (chat is loopback-only). A request whose Host names one is OFF-BOX for the read gate: the
     substrate reads need the token exactly as on an off-box bind, since the proxy delivers every tailnet request
-    from loopback."""
+    from loopback.
+
+    ``compose_signer`` (DESIGN_SIGN D5) is ``(verb, params) -> request id``: for a verb whose spec declares ``sign``,
+    the page posts ``{verb, params}`` to ``POST /cockpit/sign/compose`` (the write gate, as the sign routes), the
+    callable files a sign request for those params and names it, the page runs the ``signer``'s ceremony on it, and
+    only after a signed result posts the verb with the params plus ``sign_request: <id>``. A ``ValueError`` it raises
+    is a 400 carrying its words. It needs a ``signer`` (else ``ValueError``); without it the route is 404 and the page
+    sends no signed verb at all."""
     # Wildcard / public binds are refused for ANY source — a non-loopback bind is for
     # ONE specific private/mesh interface, never every interface or the internet.
     reason = _rejected_bind_host(host)
@@ -1993,6 +2056,10 @@ def make_server(
         # chat is loopback-only (above); a name a proxy forwards puts this loopback server on another network
         raise ValueError("refusing extra_hosts with --chat: a proxied name reaches this server from off the box, "
                          "and chat drives an entity's hands with no off-box auth")
+    if compose_signer is not None and (signer is None or not callable(compose_signer)):
+        # the page signs what compose files through the Signer's ceremony: a request with no ceremony to answer it
+        # would leave every signed send waiting on nothing
+        raise ValueError("refusing compose_signer: it must be a callable (verb, params) -> request id, beside a signer")
 
     # The async-job runtime for I/O-BOUND (``job=True``) verbs. AUTO-CREATE one when a job verb is
     # registered and the caller didn't inject its own (tests inject; production auto-creates): the
@@ -2046,6 +2113,7 @@ def make_server(
     httpd.signer = signer
     # the page_origin make_server validated above; a sign POST is refused if the Signer's has moved since
     httpd.signer_page_origin = signer.page_origin if signer is not None else None
+    httpd.compose_signer = compose_signer
     # The shared cockpit (levain.cockpit). A downstream passes its own (the kernel's providers plus
     # its panels); None means the kernel's default over this substrate, built on first request.
     # Its start() (refresher threads) is the caller's when it passes its own.

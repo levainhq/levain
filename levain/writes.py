@@ -304,7 +304,13 @@ class ActionVerb:
     - ``label`` — a short human label for the audit trail + the operator affordance.
     - ``fields`` — the param names the verb takes. Declared, the cockpit allowlist refuses any other
       param and the manifest publishes them for the page's compose box; ``None`` leaves the handler
-      to validate its own params."""
+      to validate its own params.
+    - ``sign`` — when True, the cockpit page sends this verb only after the operator's passkey signs it (DESIGN_SIGN
+      D5): the page asks the server's ``compose_signer`` (``make_server``) to file a sign request for the params, runs
+      the passkey ceremony on it, then posts the verb with the params plus ``sign_request: <id>``. The kernel admits
+      that one extra param on a signed verb and checks nothing about it: the verb's handler or effect is the door,
+      and it verifies the signature over the params before applying them. Without a ``compose_signer`` the page
+      sends nothing for a signed verb (it never falls back to an unsigned send)."""
 
     handler: Callable[[dict[str, Any]], dict[str, Any]]
     confirm_required: bool = True
@@ -312,6 +318,7 @@ class ActionVerb:
     job: bool = False
     label: str = ""
     fields: tuple[str, ...] | None = None
+    sign: bool = False
 
     def __post_init__(self) -> None:
         f = self.fields
