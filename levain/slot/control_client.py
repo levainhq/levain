@@ -221,6 +221,9 @@ class EventStream:
         self.hello = hello
         self.outcome: str | None = None
         self._hello_due = True
+        # a close() from another thread while a read is in flight only shuts the socket down; the reader closes the fd
+        self._mu = threading.Lock()
+        self._reading = False
 
     def __iter__(self) -> Iterator[Frame]:
         return self
@@ -229,9 +232,11 @@ class EventStream:
         if self._hello_due:
             self._hello_due = False
             return self.hello
-        sock = self._sock
-        if sock is None:
-            raise StopIteration
+        with self._mu:
+            sock = self._sock
+            if sock is None:
+                raise StopIteration
+            self._reading = True
         try:
             obj = read_frame(sock)
         except socket.timeout:
@@ -240,6 +245,9 @@ class EventStream:
         except (OSError, FrameMalformed, FrameTooLarge):
             self._end(BROKEN)
             raise StopIteration from None
+        finally:
+            with self._mu:
+                self._reading = False
         if obj is None:
             self._end(CLOSED)
             raise StopIteration
@@ -254,19 +262,27 @@ class EventStream:
         return frame
 
     def _end(self, outcome: str) -> None:
-        if self.outcome is None:
-            self.outcome = outcome
-        sock, self._sock = self._sock, None
-        if sock is not None:
-            # shut down before close: a reader blocked in recv on another thread wakes (close alone need not wake it)
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+        with self._mu:
+            if self.outcome is None:
+                self.outcome = outcome
+            sock = self._sock
+            if sock is None:
+                return
+            # a read in flight on another thread: shut down only. On Darwin a shutdown wakes a reader waiting in
+            # poll() (a timed recv) and a close of the fd under it need not, so that reader closes the fd on waking.
+            reading = self._reading and outcome == CANCELLED
+            if not reading:
+                self._sock = None
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        if not reading:
             sock.close()
 
     def close(self) -> None:
-        """Cancel the stream (CONTROL sees the EOF). Idempotent; a stream already ended keeps its outcome."""
+        """Cancel the stream (CONTROL sees the EOF); a reader blocked on another thread wakes and its iteration ends.
+        Idempotent; a stream already ended keeps its outcome."""
         self._hello_due = False
         self._end(CANCELLED)
 

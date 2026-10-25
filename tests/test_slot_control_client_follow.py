@@ -145,26 +145,33 @@ def test_a_stored_event_off_the_session_event_schema_is_no_frame(frame):
     assert CC._stream_frame(frame) is None
 
 
-def test_close_wakes_a_reader_blocked_in_recv():
-    """close() from another thread shuts the socket down before closing it, so a reader blocked in recv wakes."""
+@pytest.mark.parametrize("deadline", [None, 5.0])
+def test_close_wakes_a_reader_blocked_in_recv(deadline):
+    """close() from another thread wakes a reader blocked in recv, with or without a read deadline. With one, Python
+    waits in poll(): on Darwin a shutdown wakes that wait and a close of the fd under it need not (measured 10-25:
+    shutdown then close from the closing thread left the reader to its deadline in 8 of 10 trials), so the reader
+    closes the fd. Five trials, each bounded, because the old miss was not every time."""
     import socket
     import threading
 
-    a, b = socket.socketpair()
-    try:
-        s = CC.EventStream(a, CC.Hello("j", 0, 0, None))
-        next(s)                                                        # the hello
-        done = threading.Event()
+    for _ in range(5):
+        a, b = socket.socketpair()
+        a.settimeout(deadline)
+        try:
+            s = CC.EventStream(a, CC.Hello("j", 0, 0, None))
+            next(s)                                                    # the hello
+            done = threading.Event()
 
-        def read():
-            list(s)
-            done.set()
+            def read():
+                list(s)
+                done.set()
 
-        t = threading.Thread(target=read, daemon=True)
-        t.start()
-        t.join(0.2)
-        s.close()
-        assert done.wait(2.0)
-        assert s.outcome in (CC.CANCELLED, CC.BROKEN)
-    finally:
-        b.close()
+            t = threading.Thread(target=read, daemon=True)
+            t.start()
+            t.join(0.2)
+            s.close()
+            assert done.wait(2.0)
+            assert s.outcome == CC.CANCELLED
+            assert a.fileno() == -1                                    # the reader closed the fd it woke on
+        finally:
+            b.close()
