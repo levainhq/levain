@@ -263,3 +263,12 @@ def test_a_revoke_asked_from_a_listing_names_the_grant_it_showed(world) -> None:
                                                                                      "refused_count": 0}
     c = world.gp.step("cg-G", "revoke-challenge", world.shown("cg-G"))
     assert json.loads(c["line"])["grant_id"] == "cg-G"
+
+
+def test_a_revoke_challenge_for_no_revocable_grant_is_not_found(world) -> None:
+    """The revoke path's refusal for an id it does not revoke (levain.consent.grants._revocable, widened to the
+    graduation kinds in 14b S1 r1) keeps the prefix the phone reads as not_found."""
+    with pytest.raises(GrantRefused) as exc:
+        world.gp.step("cg-none", "revoke-challenge", {"signer_fp": world.phone.fp, "instance": ""})
+    assert (exc.value.status, exc.value.error) == (404, "not_found")
+    assert exc.value.message.startswith("no consent grant 'cg-none'")

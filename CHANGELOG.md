@@ -29,6 +29,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   default Levain home protected instead of denying every call. Shell commands are still not parsed.
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
+- **The authority log accepts a signed graduation policy and the graduation opt-in (`levain-authority/2`).** A policy
+  expires only by renewal, and `levain consent grant revoke` and the phone's revoke remove a policy or the opt-in;
+  before, both refused one with "no consent grant", though the authority log accepts the revoke.
 - **The coverage check for signed graduation policies exists.** It decides whether a policy you signed covers an
   autonomic action (same action and risk, a trigger and family it names, unexpired, signed by keys root lists, for this
   store only); anything not covered runs at confirm. The autonomic store gains its `/2` format and the migration to it,

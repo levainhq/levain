@@ -6,8 +6,10 @@ link a laptop-presence key signs (a loosen of the standing policy); ``revoke_gra
 The queue never trusts a grant it was handed: it finds it in a fresh replay of the log at decision time and again
 at delivery (:mod:`levain.consent.queue`). These are the operations ``levain consent grant`` runs; the data root,
 signing keys and refusals are the cockpit key commands' own (:mod:`levain.cockpit.keys`). A revoke can also be
-signed by a passkey on the phone (:mod:`levain.consent.grant_phone`), the one authority link a passkey may sign: the
-link is built here (:func:`prepare_revoke`), signed there, and appended here (:func:`append_revoke`).
+signed by a passkey on the phone (:mod:`levain.consent.grant_phone`): the link is built here (:func:`prepare_revoke`),
+signed there, and appended here (:func:`append_revoke`). Both revoke paths take what a passkey may revoke
+(:func:`levain.authority.passkey_revocable`): a consent grant, an inert one, a graduation policy or the graduation
+opt-in; a revoke only narrows, so the laptop takes the same set.
 :func:`grant_view` is what the cockpit page and the phone show: each grant, what it answered, and its revoke line.
 """
 from __future__ import annotations
@@ -22,7 +24,7 @@ from typing import Any
 
 from levain.authority import (CONSENT_GRANT_KIND, CONSENT_MCP_GRANT_KIND, AuthorityError, StaleHead, UnsignedLink,
                               VerifierUnavailable, anchor_path, append, consent_grant, consent_grant_tool_problem,
-                              consent_resolved_workspace, consent_revocable, inert_grant, prepare)
+                              consent_resolved_workspace, inert_grant, passkey_revocable, prepare)
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.keys import KeyError_, Signer, _append, _capture, _journal, _now, _signing_authority
@@ -118,9 +120,10 @@ def create_grant(data_root: Path | str, *, agent: str, tools: Iterable[str], wor
 def revoke_grant(data_root: Path | str, grant_id: str, *, signer_fp: str, sign: Signer,
                  clock: Callable[[], datetime], ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                  marker_directory: Path | None = None) -> tuple[int, str | None]:
-    """Sign a ``revoke_grant`` link removing the consent grant ``grant_id``, or one of a kind this levain does not
-    know (:func:`list_inert_grants`); any enrolled key may. From the next decision on it answers nothing, and an
-    answer it already gave is no longer delivered. Returns ``(seq, warning)``."""
+    """Sign a ``revoke_grant`` link removing the consent grant ``grant_id``, one of a kind this levain does not
+    know (:func:`list_inert_grants`), a graduation policy or the graduation opt-in; any enrolled key may. From the
+    next decision on it answers nothing, and an answer it already gave is no longer delivered. Returns
+    ``(seq, warning)``."""
     db, _state = _revocable(data_root, grant_id, clock, ssh_keygen, marker_directory)
     new = _append(db, {"op": "revoke_grant", "grant_id": grant_id}, signer_fp=signer_fp, sign=sign, clock=clock,
                   ssh_keygen=ssh_keygen)
@@ -129,12 +132,13 @@ def revoke_grant(data_root: Path | str, grant_id: str, *, signer_fp: str, sign: 
 
 def _revocable(data_root: Path | str, grant_id: str, clock: Callable[[], datetime], ssh_keygen: Path | str,
                marker_directory: Path | None) -> tuple[Any, Any]:
-    """The journal at ``data_root`` and its replay, once that replay holds ``grant_id`` as a consent grant or an inert
-    one (:func:`levain.authority.consent_revocable`, the rule the replay holds a passkey's revoke to)."""
+    """The journal at ``data_root`` and its replay, once that replay holds ``grant_id`` as a grant a passkey may
+    revoke (:func:`levain.authority.passkey_revocable`, the rule the replay holds a passkey's revoke to): a consent
+    grant, an inert one, a graduation policy or the graduation opt-in. Never an egress grant or a setup record."""
     db = _journal(data_root, marker_directory=marker_directory)
     state = _signing_authority(_capture(db, _now(clock), ssh_keygen))
-    if not consent_revocable(state.policy.grants.get(grant_id)):
-        raise KeyError_(f"no consent grant {grant_id!r}")
+    if not passkey_revocable(state.policy.grants.get(grant_id)):
+        raise KeyError_(f"no consent grant {grant_id!r}, nor a graduation policy or opt-in under that id")
     return db, state
 
 

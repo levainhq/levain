@@ -10,6 +10,9 @@ A policy link is classified by RECOMPUTE: the declared op is applied to the repl
 difference is classified on its own (:func:`classify`). A declared op that disagrees with the computed
 delta is refused, and so is a link that changes nothing.
 
+A link is written :data:`FORMAT` or, when it needs a rule an older replay does not have, :data:`FORMAT_V2`; each link
+has one form (:func:`_link_format`), and the replay refuses the other.
+
 The anchor (``anchor/authority.anchor`` in the store's data root, its directory excluded from Time Machine
 so a restore of the data root cannot roll it back with the log) is written only after a commit, so it lags
 and never leads, and only ever moves up. :func:`append` refuses a log behind it, and an empty log beside one; this
@@ -53,7 +56,9 @@ __all__ = [
     "ANCHOR_DIR", "ANCHOR_NAME", "CONSENT_AGENTS", "CONSENT_GRANT_KIND", "CONSENT_MCP_FIELD_KINDS",
     "CONSENT_MCP_GRANT_KIND", "CONSENT_MCP_READ_ONLY_TOOLS",
     "CONSENT_GRANTABLE_TOOLS", "CONSENT_POSTURES", "CONSENT_SHELL_TOOLS",
-    "CUSTODIES", "DISPLAY_PHONE", "EGRESS_KEY_KIND", "FIDO_ATTESTED", "FORMAT", "PASSKEY", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
+    "CUSTODIES", "DISPLAY_PHONE", "EGRESS_KEY_KIND", "FIDO_ATTESTED", "FORMAT", "FORMAT_V2", "GRADUATION_CREATE_RANK",
+    "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
+    "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "ForeignAnchor", "KEY_WORD", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_data_root", "anchor_path",
@@ -62,7 +67,8 @@ __all__ = [
     "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem",
     "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_mismatch",
     "custody_problem", "egress_key_conflicts", "egress_key_host_problem", "egress_key_incarnation", "egress_key_live",
-    "egress_key_record", "egress_key_repo_problem", "is_passkey_material",
+    "egress_key_record", "egress_key_repo_problem", "graduation_grant", "graduation_incarnation", "graduation_links",
+    "graduation_opt_in", "is_passkey_material", "passkey_revocable",
     "genesis_policy", "inert_grant", "conn_data_root", "conn_init_hint", "init_hint", "log_head", "prepare", "read_anchor",
     "reset_anchor", "reset_hint", "reset_lock", "reset_message", "sign_and_append",
     "presence_missing", "quarantined", "signing_laptops", "snapshot", "sshsig_public_key", "UNSTATED",
@@ -70,6 +76,11 @@ __all__ = [
 ]
 
 FORMAT = "levain-authority/1"
+# The format of a link that needs a rule a levain-authority/1 replay does not have (14b DESIGN_REV3 §7): a passkey's
+# renew or create_grant, and a link that brings in a graduation opt-in. Every other link is written FORMAT. This replay
+# takes both and holds each link to the one form :func:`_link_format` gives it; an older replay stops at the first
+# FORMAT_V2 link (its format check), so it never reads one as anything else.
+FORMAT_V2 = "levain-authority/2"
 RESET_FORMAT = "levain-authority-reset/1"
 RESET_NAMESPACE = "levain-authority-reset"
 ANCHOR_NAME = "authority.anchor"
@@ -403,6 +414,42 @@ _FP = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
 _RENEW_MAX = timedelta(days=30)
 _RENEW_SKEW = timedelta(minutes=10)
 
+# A graduation policy (14b DESIGN_REV3 §3): a signed envelope naming actions, each at a risk, the lowest rung an effect
+# it covers may run at (``lowest_posture``) and an expiry; what it covers is the coverage reader's (§4). What would
+# bind a writer of the levain home is the actions at their risk, the rung and the expiry; ``triggers``, ``families``
+# and ``store_id`` narrow what the honest engine reads (writable rows), and ``min_clean_fires`` is advisory (the
+# honest engine's walk). Its terms are fixed under its id: the one change is a renew (only a later expiry); anything
+# else is a revoke and a new id. It lasts at most GRADUATION_GRANT_MAX past its link, and a renew at most that past
+# its own. Created at the laptop (GRADUATION_CREATE_RANK), or by a passkey the live opt-in names
+# (GRADUATION_OPT_IN_RANK); renewed by any rank-2 key, a passkey included; revoked by any enrolled key.
+GRADUATION_KIND = "graduation"
+_GRADUATION_FIELDS = frozenset({"id", "kind", "actions", "lowest_posture", "expires_at", "triggers", "families",
+                                "store_id", "min_clean_fires"})
+_GRADUATION_ID = re.compile(r"gp-[0-9a-f]{12}")
+# the rungs a policy may lower an effect to: never ABOVE_LOOP (levain.autonomic.posture.Posture names)
+_GRADUATION_POSTURES = ("COOLING_OFF", "ON_LOOP")
+# the action and trigger names a policy may carry
+_GRADUATION_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}")
+_GRADUATION_FAMILY = re.compile(r"fam-[0-9a-f]{32}")
+_GRADUATION_STORE = re.compile(r"store-[0-9a-f]{32}")
+# a risk as levain.autonomic.gate._risk_dict renders an ActionRisk; the class ceiling is RiskClass.LOW
+_GRADUATION_RISK_FIELDS = frozenset({"cls", "reversible", "external", "financial"})
+_GRADUATION_RISK_CEILING = 1
+GRADUATION_GRANT_MAX = _CONSENT_GRANT_MAX
+GRADUATION_CREATE_RANK = 3
+# the rank the live opt-in lends a passkey it names, for a create_grant of one graduation policy
+GRADUATION_OPT_IN_RANK = 2
+_GRADUATION_FIXED = "a graduation policy's terms are fixed: revoke it and create another"
+_GRADUATION_EXPIRY = ("a graduation policy's expiry moves only by its own renew link, never inside another op: "
+                      "renew it, or revoke it and create another")
+# The opt-in (DESIGN_REV3 §7): signed once at the laptop, naming the passkeys (each an active passkey key when it is
+# signed) whose create_grant of one graduation policy the replay takes at GRADUATION_OPT_IN_RANK. No expiry, no
+# change, at most one in the policy; a revoke removes it, and a revoked or quarantined passkey signs nothing.
+GRADUATION_PHONE_KIND = "graduation-phone"
+_GRADUATION_PHONE_FIELDS = frozenset({"id", "kind", "passkeys"})
+_GRADUATION_PHONE_ID = re.compile(r"gpo-[0-9a-f]{12}")
+_GRADUATION_PHONE_FIXED = "the graduation opt-in has no change: revoke it and create another"
+
 
 class ReplayError(AuthorityError):
     """A link the replay refuses. ``seq`` is the link's position."""
@@ -613,6 +660,8 @@ class AuthoritySnapshot:
     # per standing grant, the seq of the link that brought its id into the policy (a create, or a loosen adding it):
     # a renew or a change keeps it; a revoke and a later create of the same id gives a new one (an incarnation)
     grant_born: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}), compare=False, repr=False)
+    # the signer fingerprint of every link, by seq - 1 (as ``_hashes``): :func:`graduation_links` reads it
+    link_signers: tuple[str, ...] = field(default=(), compare=False, repr=False)
 
     def key(self, fingerprint: str) -> AuthorityKey | None:
         return self.keys.get(fingerprint)
@@ -799,6 +848,83 @@ def _validate_inert_grant(grant: Mapping[str, Any], what: str, at: datetime | No
     return _thaw(grant)
 
 
+def _graduation_risk(risk: Any, where: str) -> None:
+    """A signed action risk: well-formed, and one a graduation policy may cover (class LOW or below, reversible,
+    not external, not financial). A replay rule as well as an append rule: it reads the link alone."""
+    if not isinstance(risk, Mapping) or set(risk) != _GRADUATION_RISK_FIELDS or type(risk["cls"]) is not int \
+            or not all(type(risk[k]) is bool for k in ("reversible", "external", "financial")):
+        raise AuthorityError(f"{where} must be a risk dict: exactly cls (an integer) and reversible, external and "
+                             "financial (booleans)")
+    if not 0 <= risk["cls"] <= _GRADUATION_RISK_CEILING:
+        raise AuthorityError(f"{where}.cls is {risk['cls']}: a graduation policy covers an action of risk class "
+                             f"LOW ({_GRADUATION_RISK_CEILING}) or below only")
+    for name, refused in (("reversible", False), ("external", True), ("financial", True)):
+        if risk[name] is refused:
+            raise AuthorityError(f"{where}.{name} is {str(refused).lower()}: a graduation policy covers a reversible, "
+                                 "internal, non-financial action only")
+
+
+def _graduation_names(items: Any, pattern: re.Pattern[str], where: str) -> None:
+    """``None``, or a non-empty sorted list of unique names ``pattern`` matches (equal sets are equal bytes)."""
+    if items is None:
+        return
+    if not isinstance(items, (list, tuple)) or not items \
+            or not all(isinstance(i, str) and pattern.fullmatch(i) for i in items):
+        raise AuthorityError(f"{where} is null or a non-empty list of names ({pattern.pattern})")
+    if list(items) != sorted(set(items)):
+        raise AuthorityError(f"{where} must be sorted and unique")
+
+
+def _validate_graduation(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
+    """A graduation policy's shape (:data:`GRADUATION_KIND`). ``at``: the link's own time; the policy lasts at most
+    :data:`GRADUATION_GRANT_MAX` past it."""
+    if set(grant) != _GRADUATION_FIELDS:
+        raise AuthorityError(f"{what} (a graduation policy) must carry exactly {', '.join(sorted(_GRADUATION_FIELDS))}")
+    if grant["kind"] != GRADUATION_KIND:
+        raise AuthorityError(f"{what}.kind must be {GRADUATION_KIND!r}")
+    if not isinstance(grant["id"], str) or not _GRADUATION_ID.fullmatch(grant["id"]):
+        raise AuthorityError(f"{what}.id must be gp- and 12 lowercase hex digits")
+    actions = grant["actions"]
+    if not isinstance(actions, Mapping) or not actions:
+        raise AuthorityError(f"{what}.actions must map at least one action name to its risk")
+    for name, risk in actions.items():
+        if not isinstance(name, str) or not _GRADUATION_NAME.fullmatch(name):
+            raise AuthorityError(f"{what}.actions names {str(name)[:80]!r}, not an action name "
+                                 f"({_GRADUATION_NAME.pattern})")
+        _graduation_risk(risk, f"{what}.actions[{name!r}]")
+    if grant["lowest_posture"] not in _GRADUATION_POSTURES:
+        raise AuthorityError(f"{what}.lowest_posture must be one of {', '.join(_GRADUATION_POSTURES)}")
+    expires = _parse_stamp(grant["expires_at"], f"{what}.expires_at")
+    if at is not None and expires - at > GRADUATION_GRANT_MAX:
+        raise AuthorityError(f"{what} may last at most {GRADUATION_GRANT_MAX.days} days past its link's time")
+    _graduation_names(grant["triggers"], _GRADUATION_NAME, f"{what}.triggers")
+    _graduation_names(grant["families"], _GRADUATION_FAMILY, f"{what}.families")
+    if not isinstance(grant["store_id"], str) or not _GRADUATION_STORE.fullmatch(grant["store_id"]):
+        raise AuthorityError(f"{what}.store_id must be store- and 32 lowercase hex digits")
+    fires = grant["min_clean_fires"]
+    if type(fires) is not int or fires < 0:
+        raise AuthorityError(f"{what}.min_clean_fires must be a non-negative integer")
+    return _thaw(grant)
+
+
+def _validate_graduation_phone(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
+    """The opt-in's shape (:data:`GRADUATION_PHONE_KIND`): an id and a non-empty sorted list of unique key
+    fingerprints. That each names an active passkey key is judged against the state (:func:`_graduation_step_checks`)."""
+    if set(grant) != _GRADUATION_PHONE_FIELDS:
+        raise AuthorityError(f"{what} (the graduation opt-in) must carry exactly "
+                             f"{', '.join(sorted(_GRADUATION_PHONE_FIELDS))}")
+    if grant["kind"] != GRADUATION_PHONE_KIND:
+        raise AuthorityError(f"{what}.kind must be {GRADUATION_PHONE_KIND!r}")
+    if not isinstance(grant["id"], str) or not _GRADUATION_PHONE_ID.fullmatch(grant["id"]):
+        raise AuthorityError(f"{what}.id must be gpo- and 12 lowercase hex digits")
+    keys = grant["passkeys"]
+    if not isinstance(keys, (list, tuple)) or not keys or not all(isinstance(k, str) and _FP.fullmatch(k) for k in keys):
+        raise AuthorityError(f"{what}.passkeys must be a non-empty list of key fingerprints")
+    if list(keys) != sorted(set(keys)):
+        raise AuthorityError(f"{what}.passkeys must be sorted and unique")
+    return _thaw(grant)
+
+
 def egress_key_host_problem(host: Any) -> str | None:
     """Why ``host`` cannot be a setup record's host, or None: it must be a DNS name (never an IP literal, never a
     wildcard) already in its canonical form, so the record, the one-live rule and the route lookup compare one
@@ -935,6 +1061,44 @@ def egress_key_incarnation(state: AuthoritySnapshot, record_id: str) -> str | No
     return f"{born}:{hashlib.sha256(meaning.encode()).hexdigest()}" if meaning is not None else None
 
 
+def graduation_grant(grant: Any) -> bool:
+    """Whether ``grant`` is a graduation policy this levain knows (:data:`GRADUATION_KIND`)."""
+    return isinstance(grant, Mapping) and grant.get("kind") == GRADUATION_KIND
+
+
+def graduation_opt_in(policy: StandingPolicy) -> Mapping[str, Any] | None:
+    """The graduation opt-in ``policy`` holds (the replay admits at most one), or None."""
+    found = [g for g in policy.grants.values() if isinstance(g, Mapping) and g.get("kind") == GRADUATION_PHONE_KIND]
+    return found[0] if len(found) == 1 else None
+
+
+def graduation_incarnation(state: AuthoritySnapshot, grant_id: str) -> str | None:
+    """The incarnation of graduation policy ``grant_id`` in ``state``, or None when ``state`` holds no such policy: the
+    seq of the link that brought the id into the policy, and a sha256 of everything it says but its expiry (the shape
+    of :func:`egress_key_incarnation`). A renew keeps it; a revoke and a create of the same id gives another."""
+    grant = state.policy.grants.get(grant_id)
+    born = state.grant_born.get(grant_id)
+    if not graduation_grant(grant) or born is None:
+        return None
+    meaning = _canonical(_thaw({k: v for k, v in grant.items() if k != "expires_at"}))
+    return f"{born}:{hashlib.sha256(meaning.encode()).hexdigest()}"
+
+
+def graduation_links(state: AuthoritySnapshot, grant_id: str) -> tuple[str, str] | None:
+    """``(born_signer_fp, current_signer_fp)`` of graduation policy ``grant_id`` in ``state``: the signer of the link
+    that brought it into the policy (``grant_born``) and of the link that last created or changed it (``grant_seqs``,
+    which a renew moves). With its terms fixed, those two links are every link that defines what it means now. None
+    when ``state`` holds no such policy, or does not carry one signer per link (``link_signers``, by seq)."""
+    if not graduation_grant(state.policy.grants.get(grant_id)):
+        return None
+    born, current = state.grant_born.get(grant_id), state.grant_seqs.get(grant_id)
+    signers = state.link_signers
+    if born is None or current is None or len(signers) != state.seq \
+            or not (1 <= born <= state.seq and 1 <= current <= state.seq):
+        return None
+    return signers[born - 1], signers[current - 1]
+
+
 def _egress_key_append_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
     """The one-live rule at append (R15-21-4): a create or a loosen that brings in or changes a setup record may not
     leave two live records for that record's (entity, host). A supersession is the loosen that drops the old one in
@@ -1027,6 +1191,16 @@ def _validate_timeouts(timeouts: Any) -> None:
         raise AuthorityError("timeouts values must be finite JSON (no NaN or Infinity)")
 
 
+def _renewable_kind(grant: Mapping[str, Any], gid: Any) -> _GrantKind:
+    """The kind of ``grant`` (id ``gid``), which a renew is about to extend; refused for a kind that does not expire
+    (the opt-in). The one rule for "never renewed", called by the replay (:func:`_apply_policy_op`) and by the
+    append-only checks (:func:`_append_only_checks`) before either reads ``expires_at``."""
+    kind = _grant_kind(grant)
+    if not kind.expires:
+        raise AuthorityError(f"grant {str(gid)[:80]!r} has no expiry, so it is never renewed")
+    return kind
+
+
 def _apply_policy_op(policy: StandingPolicy, rec: Mapping[str, Any]) -> StandingPolicy:
     """The policy after the declared op, refusing a malformed or impossible one. Does NOT judge the
     delta's kind: that is :func:`classify`, on the result alone."""
@@ -1047,7 +1221,8 @@ def _apply_policy_op(policy: StandingPolicy, rec: Mapping[str, Any]) -> Standing
         grant = _validate_grant(rec["grant"], "grant", at=at)
         if grant["id"] in data["grants"]:
             raise AuthorityError(f"grant {grant['id']!r} already exists")
-        if _grant_kind(grant) is not _EGRESS_KIND and _parse_stamp(grant["expires_at"], "expires_at") <= at:
+        kind = _grant_kind(grant)
+        if kind is not _EGRESS_KIND and kind.expires and _parse_stamp(grant["expires_at"], "expires_at") <= at:
             raise AuthorityError(f"a {str(grant['kind'])[:40]} grant must expire after the link that creates it")
         data["grants"][grant["id"]] = grant
     elif op in ("revoke_grant", "renew"):
@@ -1057,6 +1232,7 @@ def _apply_policy_op(policy: StandingPolicy, rec: Mapping[str, Any]) -> Standing
         if op == "revoke_grant":
             del data["grants"][gid]
         else:
+            kind = _renewable_kind(data["grants"][gid], gid)
             old = _parse_stamp(data["grants"][gid]["expires_at"], "the grant's expires_at")
             new = _parse_stamp(rec["expires_at"], "expires_at")
             signed = _parse_stamp(rec["signed_at"], "signed_at")
@@ -1066,12 +1242,17 @@ def _apply_policy_op(policy: StandingPolicy, rec: Mapping[str, Any]) -> Standing
                 raise AuthorityError("a renew's signed_at must equal its at")
             if old <= signed:
                 raise AuthorityError(f"grant {gid!r} has expired ({data['grants'][gid]['expires_at']}) by this "
-                                     "renew's signing time; a lapsed grant is re-created at the laptop")
+                                     "renew's signing time; a lapsed grant is never renewed, only created "
+                                     "again (at the laptop, or a graduation policy by a passkey the opt-in names)")
             if new <= old:
                 raise AuthorityError("a renew must move the grant's expiry later")
             # a difference, never `signed + 30 days`, which overflows near year 9999
             if new - signed > _RENEW_MAX:
                 raise AuthorityError("a renew may extend a grant at most 30 days past its signing time")
+            # a kind with its own cap holds every renew to it as well (R7: a graduation policy's renew)
+            if kind.max_life is not None and new - signed > kind.max_life:
+                raise AuthorityError(f"a renew may extend this grant at most {kind.max_life.days} days past its "
+                                     "signing time")
             data["grants"][gid]["expires_at"] = rec["expires_at"]
     else:
         raise AuthorityError(f"{op!r} is not a policy op")
@@ -1084,9 +1265,18 @@ def _grant_change(old: Mapping[str, Any], new: Mapping[str, Any]) -> str:
     if _canonical(o) == _canonical(n):
         return "same"
     if o.get("kind") != n.get("kind"):
+        # a kind whose terms are fixed under its id is never turned into another kind, nor another into it
+        for g in (o, n):
+            if _grant_kind(g).fixed is not None:
+                raise AuthorityError(_grant_kind(g).fixed)
         return "loose"
-    o_exp, n_exp = _parse_stamp(o["expires_at"], "expires_at"), _parse_stamp(n["expires_at"], "expires_at")
-    return _grant_kind(n).change(o, n, o_exp, n_exp)
+    # the opt-in has no expiry (its kind's ``expires`` is False); every other kind's validate requires one
+    o_exp = _parse_stamp(o["expires_at"], "expires_at") if "expires_at" in o else None
+    n_exp = _parse_stamp(n["expires_at"], "expires_at") if "expires_at" in n else None
+    kind = _grant_kind(n)
+    if kind.expires and (o_exp is None or n_exp is None):
+        raise AuthorityError(f"grant {str(n.get('id'))[:80]!r} carries no expires_at, which its kind requires")
+    return kind.change(o, n, o_exp, n_exp)
 
 
 def _egress_grant_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime, n_exp: datetime) -> str:
@@ -1141,6 +1331,21 @@ def _inert_grant_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datet
     return "renew" if rest(o) == rest(n) and n_exp > o_exp else "loose"
 
 
+def _graduation_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime, n_exp: datetime) -> str:
+    """A graduation policy's change: ``renew`` when only its expiry moved later; anything else is refused (its terms
+    are fixed under its id, at append and at replay)."""
+    rest = lambda g: _canonical({k: v for k, v in g.items() if k != "expires_at"})   # noqa: E731
+    if rest(o) == rest(n) and n_exp > o_exp:
+        return "renew"
+    raise AuthorityError(_GRADUATION_FIXED)
+
+
+def _graduation_phone_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime | None,
+                             n_exp: datetime | None) -> str:
+    """The opt-in has no change: every one is refused."""
+    raise AuthorityError(_GRADUATION_PHONE_FIXED)
+
+
 def _refuse_unknown_kind(grants: list[Any]) -> None:
     """At append: this levain writes no grant of a kind it does not know (it holds one a newer levain wrote, inert)."""
     for grant in grants:
@@ -1154,12 +1359,20 @@ def _refuse_unknown_kind(grants: list[Any]) -> None:
 class _GrantKind:
     """How one grant kind is read, compared and appended. ``consent``: the consent queue answers from a grant of it
     (:func:`consent_grant`). ``append_checks`` judge each grant of the kind a create or a loosen brings in or changes;
-    ``renew_checks`` the grant a renew extends (given the refusal's tail naming the grant)."""
+    ``renew_checks`` the grant a renew extends (given the refusal's tail naming the grant). ``passkey_revocable``: a
+    passkey may revoke a grant of it (:func:`passkey_revocable`). ``expires``: a grant of it carries ``expires_at``
+    (the opt-in does not, so it is never renewed). ``max_life``: the most a renew may set its expiry past the renew's
+    own time, beside the generic renew bound. ``fixed``: the refusal for any change to a grant of it but a renew
+    (its kind included), raised from ``change`` and from :func:`_grant_change`."""
     validate: Callable[[Mapping[str, Any], str, datetime | None], dict[str, Any]]
     change: Callable[[Mapping[str, Any], Mapping[str, Any], datetime, datetime], str]
     append_checks: tuple[Callable[[list[Any]], None], ...] = ()
     renew_checks: tuple[Callable[[list[Any], str], None], ...] = ()
     consent: bool = False
+    passkey_revocable: bool = False
+    expires: bool = True
+    max_life: timedelta | None = None
+    fixed: str | None = None
 
 
 # Every kind this levain knows, by the grant's ``kind`` (``None``: an egress grant, which carries none); any other
@@ -1168,18 +1381,23 @@ class _GrantKind:
 _GRANT_KIND_NAME = re.compile(r"[a-z][a-z0-9.-]{0,31}")
 _EGRESS_KIND = _GrantKind(validate=_validate_egress_grant, change=_egress_grant_change)
 _INERT_KIND = _GrantKind(validate=_validate_inert_grant, change=_inert_grant_change,
-                         append_checks=(_refuse_unknown_kind,))
+                         append_checks=(_refuse_unknown_kind,), passkey_revocable=True)
 _GRANT_KINDS: Mapping[str | None, _GrantKind] = MappingProxyType({
     None: _EGRESS_KIND,
     CONSENT_GRANT_KIND: _GrantKind(validate=_validate_consent_grant, change=_consent_grant_change,
                                    append_checks=(lambda g: _consent_home_check(g), lambda g: _consent_tool_check(g)),
-                                   renew_checks=(lambda g, after: _consent_tool_check(g, after),), consent=True),
+                                   renew_checks=(lambda g, after: _consent_tool_check(g, after),), consent=True,
+                                   passkey_revocable=True),
     CONSENT_MCP_GRANT_KIND: _GrantKind(validate=_validate_consent_mcp_grant, change=_consent_mcp_grant_change,
                                        append_checks=(lambda g: _consent_home_check(g),
                                                       lambda g: _consent_mcp_tool_check(g)),
                                        renew_checks=(lambda g, after: _consent_mcp_tool_check(g, after),),
-                                       consent=True),
+                                       consent=True, passkey_revocable=True),
     EGRESS_KEY_KIND: _GrantKind(validate=_validate_egress_key, change=_egress_key_change),
+    GRADUATION_KIND: _GrantKind(validate=_validate_graduation, change=_graduation_change, passkey_revocable=True,
+                                max_life=GRADUATION_GRANT_MAX, fixed=_GRADUATION_FIXED),
+    GRADUATION_PHONE_KIND: _GrantKind(validate=_validate_graduation_phone, change=_graduation_phone_change,
+                                      passkey_revocable=True, expires=False, fixed=_GRADUATION_PHONE_FIXED),
 })
 
 
@@ -1202,9 +1420,15 @@ def inert_grant(grant: Any) -> bool:
 
 
 def consent_revocable(grant: Any) -> bool:
-    """Whether ``grant`` is a consent grant or an inert one: what a consent revoke removes, and the only kinds a
-    passkey may revoke. An egress grant is neither."""
+    """Whether ``grant`` is a consent grant or an inert one: what a consent revoke removes. An egress grant is
+    neither. What a passkey may revoke is :func:`passkey_revocable`."""
     return consent_grant(grant) or inert_grant(grant)
+
+
+def passkey_revocable(grant: Any) -> bool:
+    """Whether a passkey may sign the revoke of ``grant``: a consent or consent-mcp grant, an inert one, a graduation
+    policy or the graduation opt-in (each kind's ``passkey_revocable``). Never an egress grant or a setup record."""
+    return isinstance(grant, Mapping) and _grant_kind(grant).passkey_revocable
 
 
 def classify(old: StandingPolicy, new: StandingPolicy) -> str:
@@ -1261,8 +1485,8 @@ def _parse_record(row: _Row) -> dict[str, Any]:
         raise ReplayError(seq, "the record is nested too deeply") from None
     if not canonical:
         raise ReplayError(seq, "the record is not a canonical JSON object")
-    if rec.get("format") != FORMAT:
-        raise ReplayError(seq, f"the record's format is not {FORMAT}")
+    if rec.get("format") not in (FORMAT, FORMAT_V2):
+        raise ReplayError(seq, f"the record's format is not {FORMAT} or {FORMAT_V2}")
     op = rec.get("op")
     if not isinstance(op, str) or op not in _OP_FIELDS:
         raise ReplayError(seq, f"unknown op {op!r}")
@@ -1315,6 +1539,89 @@ def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, Authority
     return AuthorityKey(fp, public_key, cls, seq, legacy_enrolled_at=legacy, enrolled_at=rec["at"], custody=custody)
 
 
+def _passkey_act(rec: Mapping[str, Any], policy: StandingPolicy, fingerprint: str) -> None:
+    """Refuse a link a passkey signs unless it is one act of the allow-list (DESIGN_REV3 §7). A passkey signs consent
+    answers (its own namespace, the consent queue's check), since K8 a cockpit pending of T2 at most in the phone
+    namespace (the broker's check), and, in this log, exactly one of: the revoke of a grant :func:`passkey_revocable`
+    takes (which only narrows); the renew of a graduation policy (Phill's Q2 ruling: the phone keeps a policy alive);
+    the create of one graduation policy while the live opt-in names it. Every other op is refused, whatever its
+    class's rank would allow, and a ``loosen`` with it, so no passkey link carries more than one act. The rule is the
+    replay's, so a link built past the phone's ceremonies is held to it."""
+    op = rec["op"]
+    if op in ("revoke_grant", "renew"):
+        gid = rec["grant_id"]
+        target = policy.grants.get(gid) if isinstance(gid, str) else None
+        if target is None:
+            raise AuthorityError(f"a {PASSKEY} key {'revokes' if op == 'revoke_grant' else 'renews'} a grant the "
+                                 f"policy holds: no grant {str(gid)[:80]!r}")
+        if op == "revoke_grant" and not passkey_revocable(target):
+            raise AuthorityError(f"a {PASSKEY} key revokes a consent grant or an inert one only, never grant "
+                                 f"{gid[:80]!r}, beyond a graduation policy and the graduation opt-in")
+        if op == "renew" and not graduation_grant(target):
+            raise AuthorityError(f"a {PASSKEY} key renews a graduation policy only, never grant {gid[:80]!r}")
+        return
+    refusal = (f"a {PASSKEY} key signs consent answers and grant revokes only, never another authority link, but for "
+               "one graduation act per link: a graduation policy's renew, or, named by the live opt-in, one graduation "
+               "policy's create")
+    if op == "create_grant":
+        grant = rec["grant"]
+        if not (isinstance(grant, Mapping) and grant.get("kind") == GRADUATION_KIND):
+            raise AuthorityError(refusal)
+        opt = graduation_opt_in(policy)
+        if opt is None or fingerprint not in opt["passkeys"]:
+            raise AuthorityError(f"a {PASSKEY} key creates a graduation policy only when the live graduation opt-in "
+                                 f"names it; {fingerprint} is not named")
+        return
+    raise AuthorityError(refusal)
+
+
+def _graduation_step_checks(old: StandingPolicy, new: StandingPolicy, keys: Mapping[str, AuthorityKey],
+                            op: str) -> None:
+    """The graduation rules a policy link (op ``op``) is judged by against the state: a graduation policy's expiry
+    changes only in a ``renew`` link, which alone holds the lapse rule and the renew caps (inside a loosen that also
+    adds a grant, an extension computes to LOOSEN and would bring a lapsed policy back under its old incarnation);
+    at most one opt-in in the policy; and an opt-in a link brings in names only active passkey keys whose material
+    is a passkey's (none quarantined)."""
+    if op != "renew":
+        for gid, g in old.grants.items():
+            n = new.grants.get(gid)
+            if graduation_grant(g) and n is not None and n.get("expires_at") != g.get("expires_at"):
+                raise AuthorityError(_GRADUATION_EXPIRY)
+    opt_ins = [g for g in new.grants.values() if g.get("kind") == GRADUATION_PHONE_KIND]
+    if len(opt_ins) > 1:
+        raise AuthorityError("at most one graduation opt-in: revoke the live one first")
+    for g in opt_ins:
+        if g["id"] in old.grants:
+            continue                    # carried: a change to it is refused by the kind (_graduation_phone_change)
+        for fp in g["passkeys"]:
+            key = keys.get(fp)
+            if key is None or not key.active or key.custody != PASSKEY \
+                    or custody_mismatch(key.public_key, key.custody) is not None:
+                raise AuthorityError(f"the graduation opt-in names {fp}, which is not an active passkey key")
+
+
+def _link_format(policy: StandingPolicy, rec: Mapping[str, Any], signer_custody: str) -> str:
+    """The one format a link carrying ``rec`` (its op fields), signed by a key of ``signer_custody``, is written in
+    after ``policy``: :data:`FORMAT_V2` for a passkey's renew or create_grant, and for a link that brings in a
+    graduation opt-in (by create_grant or loosen); :data:`FORMAT` for every other. :func:`prepare` writes it and the
+    replay holds every link to it. Known edge, kept: a hand-made ``/1`` loosen that changes a graduation policy's
+    terms is refused here and replays on a levain from before ``/2`` as an inert change; that levain never fires on a
+    graduation policy (a kind it does not know is inert there), so taking the link changes nothing it enforces."""
+    op = rec.get("op")
+    if signer_custody == PASSKEY and op in ("renew", "create_grant"):
+        return FORMAT_V2
+    if op == "create_grant":
+        brought = [rec.get("grant")]
+    elif op == "loosen":
+        grants = rec.get("policy", {}).get("grants") if isinstance(rec.get("policy"), Mapping) else None
+        brought = [g for gid, g in grants.items() if gid not in policy.grants] if isinstance(grants, Mapping) else []
+    else:
+        brought = []
+    if any(isinstance(g, Mapping) and g.get("kind") == GRADUATION_PHONE_KIND for g in brought):
+        return FORMAT_V2
+    return FORMAT
+
+
 def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
           check_signature: bool = True, new_link: bool = False) -> AuthoritySnapshot:
     """The state after ``row``, judged against ``state`` (its predecessor), or :class:`ReplayError`. ``new_link``:
@@ -1365,6 +1672,8 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                 raise AuthorityError(f"the first link must enrol a {LAPTOP} key")
             if row.signer_fp != rec["fingerprint"]:
                 raise AuthorityError("the first link must be signed by the key it enrols")
+            if rec["format"] != FORMAT:
+                raise AuthorityError(f"the first link carries {rec['format']}; it is written {FORMAT}")
             signer = _enrolled_key(rec, seq, keys, ssh_keygen, new_link=new_link)
             keys[signer.fingerprint] = signer
             # a quarantined genesis key (only ever history: _enrolled_key refuses it on a new link) signed this
@@ -1390,20 +1699,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             # known edge, kept: a quarantined key's links already in the log meet UV + origin only, not the op rule
             # below (stored custody fido/unstated), since holding them to it refuses existing logs (Phill's (a))
             if signer.custody == PASSKEY:
-                # a passkey signs consent answers (its own namespace, the consent queue's check), since K8 a cockpit
-                # pending of T2 at most in the phone namespace (the broker's check), and, in this log,
-                # one op: the removal of a consent or inert grant, which only ever narrows what an agent may do (a
-                # synced passkey stolen with its account can cost the operator prompts, never widen anything). Every
-                # other link it signed is refused whatever its class's rank would allow, and so is a revoke of any
-                # other kind of grant: the rule is the replay's, so a link built past the revoke command is held to it
-                if op != "revoke_grant":
-                    raise AuthorityError(f"a {PASSKEY} key signs consent answers and grant revokes only, never "
-                                         "another authority link")
-                gid = rec["grant_id"]
-                target = policy.grants.get(gid) if isinstance(gid, str) else None
-                if target is not None and not consent_revocable(target):
-                    raise AuthorityError(f"a {PASSKEY} key revokes a consent grant or an inert one only, never "
-                                         f"grant {gid[:80]!r}")
+                _passkey_act(rec, policy, signer.fingerprint)
             need = _apply_op(rec, seq, state, keys, ssh_keygen, new_link=new_link)
             if isinstance(need, StandingPolicy):
                 delta = classify(policy, need)
@@ -1415,11 +1711,18 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                 grant_seqs = {gid: (grant_seqs.get(gid, seq) if gid in policy.grants and _canonical(
                     _thaw(policy.grants[gid])) == _canonical(_thaw(g)) else seq) for gid, g in need.grants.items()}
                 grant_born = {gid: (grant_born.get(gid, seq) if gid in policy.grants else seq) for gid in need.grants}
+                if signer.custody == PASSKEY and op == "create_grant":
+                    rank = GRADUATION_OPT_IN_RANK       # _passkey_act let it through only as the opt-in names it
                 policy = need
             else:
                 rank = need
             if ranks[signer.key_class] < rank:
                 raise AuthorityError(f"a {signer.key_class} key cannot sign this {op}")
+            if isinstance(need, StandingPolicy):
+                _graduation_step_checks(state.policy, need, keys, op)
+            want = _link_format(state.policy, rec, signer.custody)
+            if rec["format"] != want:
+                raise AuthorityError(f"this {op} link carries {rec['format']}; a link like it is written {want}")
     except AuthorityError as exc:
         if isinstance(exc, (ReplayError, VerifierUnavailable)):
             raise
@@ -1447,8 +1750,10 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                                        + (f" (signed by {signer.fingerprint}, quarantined: WebAuthn material stored "
                                           f"at custody {signer.custody})" if quarantined_history else ""))
     hashes = (() if state is None else state._hashes) + (row.hash,)
+    signers = (() if state is None else state.link_signers) + (row.signer_fp,)
     return AuthoritySnapshot(rec["store_id"], seq, row.hash, MappingProxyType(keys), policy, hashes, head_at=at,
-                             grant_seqs=MappingProxyType(grant_seqs), grant_born=MappingProxyType(grant_born))
+                             grant_seqs=MappingProxyType(grant_seqs), grant_born=MappingProxyType(grant_born),
+                             link_signers=signers)
 
 
 def _apply_op(rec: Mapping[str, Any], seq: int, state: AuthoritySnapshot, keys: dict[str, AuthorityKey],
@@ -1783,17 +2088,22 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
     grant = state.policy.grants.get(rec["grant_id"])
     if grant is None:
         raise AuthorityError(f"no grant {rec['grant_id']!r}")
+    kind = _renewable_kind(grant, rec["grant_id"])
     after = (f"; grant {str(rec['grant_id'])[:80]!r} was signed before this rule: revoke it "
              "(levain consent grant revoke) and create a new one")
-    for check in _grant_kind(grant).renew_checks:
+    for check in kind.renew_checks:
         check([grant], after)       # a grant signed before a kind's rule is not extended past it
     signed = _parse_stamp(rec["signed_at"], "signed_at")
     if abs(now - signed) > _RENEW_SKEW:
         raise AuthorityError("a renew's signed_at must be within 10 minutes of now")
     if _parse_stamp(grant["expires_at"], "the grant's expires_at") <= now:
-        raise AuthorityError(f"grant {rec['grant_id']!r} has expired; a lapsed grant is re-created at the laptop")
+        raise AuthorityError(f"grant {rec['grant_id']!r} has expired; a lapsed grant is never renewed, only "
+                             "created again")
     if _parse_stamp(rec["expires_at"], "expires_at") - now > _RENEW_MAX:      # never now + 30 days: overflow
         raise AuthorityError("a renew may extend a grant at most 30 days from now")
+    cap = kind.max_life
+    if cap is not None and _parse_stamp(rec["expires_at"], "expires_at") - now > cap:
+        raise AuthorityError(f"a renew may extend this grant at most {cap.days} days from now")
 
 
 def prepare(conn: sqlite3.Connection, op: Mapping[str, Any], *, signer_fp: str, now: datetime,
@@ -1803,6 +2113,8 @@ def prepare(conn: sqlite3.Connection, op: Mapping[str, Any], *, signer_fp: str, 
     by every rule but the signature, so a doomed link is refused before anyone touches a key.
     ``store_id`` is for the genesis link only (a fresh one is drawn when it is None)."""
     _require_aware(now)
+    if not isinstance(op, Mapping):
+        raise AuthorityError("an op is a mapping of its fields, `op` among them")
     if "op" not in op or set(op) & (_BASE_FIELDS - {"op"}):
         raise AuthorityError("an op names `op` and its own fields, never format/store_id/seq/at")
     state = _replay(conn, PROCESS_CACHE if cache is None else cache, ssh_keygen)
@@ -1814,8 +2126,11 @@ def prepare(conn: sqlite3.Connection, op: Mapping[str, Any], *, signer_fp: str, 
         sid = state.store_id
     seq = 1 if state is None else state.seq + 1
     prev = "" if state is None else state.head_hash
+    signer = None if state is None else state.key(signer_fp)
+    # an unknown signer is refused by _step below; the format it would carry does not matter
+    fmt = FORMAT if state is None or signer is None else _link_format(state.policy, op, signer.custody)
     try:
-        record = _canonical({**op, "format": FORMAT, "store_id": sid, "seq": seq, "at": _stamp(now)})
+        record = _canonical({**op, "format": fmt, "store_id": sid, "seq": seq, "at": _stamp(now)})
         row = _Row(seq, prev, record, signer_fp, "", _link_hash(prev, record))
     except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
         # not JSON, a lone surrogate (no UTF-8 form), or nested too deeply
