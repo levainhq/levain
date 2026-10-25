@@ -822,8 +822,10 @@ def egress_key_host_problem(host: Any) -> str | None:
 
 def egress_key_repo_problem(repo: Any) -> str | None:
     """Why ``repo`` cannot be a declared repo path, or None: an origin-form path that starts with ``/``, holds more
-    than ``/``, does not end with ``/``, carries no query, and is already in R-2's canonical form (the decider
-    compares a request's prefix to it as a string)."""
+    than ``/``, does not end with ``/``, carries no query, is already in R-2's canonical form (the decider
+    compares a request's prefix to it as a string), and holds none of the escapes the key rule makes keyless
+    (``advert.KEYLESS_ESCAPES``: such a repo would be signed and then never attach)."""
+    from levain.chat_egress.advert import KEYLESS_ESCAPES
     from levain.chat_egress.parse import canonical_path
 
     if not isinstance(repo, str) or not repo.startswith("/") or repo == "/" or repo.endswith("/") or "?" in repo:
@@ -833,6 +835,9 @@ def egress_key_repo_problem(repo: Any) -> str | None:
         return f"a declared repo path walls ({why})"
     if canon != repo:
         return f"a declared repo path must be in its canonical form ({canon!r})"
+    held = [esc for esc in KEYLESS_ESCAPES if esc in canon]
+    if held:
+        return f"a declared repo path holding {', '.join(held)} never carries the key (such a path is keyless)"
     return None
 
 

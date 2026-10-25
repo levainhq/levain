@@ -517,3 +517,15 @@ def test_an_expiry_that_passes_while_confirming_never_prompts_the_signer(ck):
     with pytest.raises(key_setup.SetupRefused, match="passed while the record was being confirmed"):
         _setup(ck, expires=expires, clock=lambda: t[0], confirm=slow_confirm, sign=sign)
     assert signed == [] and ck.state().seq == seq_before
+
+
+@pytest.mark.parametrize("repo", ["/o/r%2Fs.git", "/o%2Fr.git", "/o/r%5Cs.git", "/o/r%25.git", "/o/r%252F.git",
+                                  "/o/r%3Bx.git", "/o/r.git%3B", "/o/r%2fs.git", "/o/r%3bx.git", "/o/r%25%32F.git"])
+def test_a_declared_repo_holding_an_escape_the_key_rule_refuses_is_refused(ck, repo):
+    """Item 19 (codex MED 2): a key never attaches to a path holding `%2F`, `%5C`, `%25` or `%3B` (any case), so a
+    declared repo holding one would be signed and then never attach: the log refuses it (any case: a lower-case
+    escape is also not R-2's canonical form)."""
+    assert auth.egress_key_repo_problem(repo) is not None, repo
+    with pytest.raises(key_setup.SetupRefused):
+        _setup(ck, repos=[repo])
+    assert auth.egress_key_repo_problem("/o/r.git") is None and auth.egress_key_repo_problem("/o/r%20s.git") is None
