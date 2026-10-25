@@ -747,8 +747,6 @@ def _host() -> str:
     raise Refused("unsupported-host", sys.platform)
 
 
-
-
 @dataclass(frozen=True)
 class Request:
     vendor: str                  # claude | codex

@@ -48,9 +48,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from levain.consent import limits as L
-from levain.slot import SUDO
 from levain.consent.adapters import claude_code, codex
 from levain.consent.queue import ConsentQueue, authority_source, default_queue_dir
+from levain.slot import SUDO
 
 __all__ = ["add_parser", "run"]
 
@@ -132,7 +132,6 @@ def _parse_value(kind: str, text: str) -> int | float:
 
 
 # --- the slot limits (--slots: root's L/policy/limits) -------------------------------------------------------------
-
 
 
 @dataclass(frozen=True)

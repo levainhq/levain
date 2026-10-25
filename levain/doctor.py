@@ -1406,6 +1406,8 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
     # operator cannot see it. Writing to the workspace AS the hands user tests the rule, the account
     # and its ownership of the workspace in one step.
     ok, out = _probe([SUDO, "-n", "-u", cfg.hands_user, "/bin/test", "-w", str(cfg.hands_workspace)])
+    if not ok and not os.access(SUDO, os.X_OK):
+        return [CheckResult(name, False, f"sudo is not at {SUDO}", hint=redo)]
     if not ok:
         return [CheckResult(name, False, f"{cfg.hands_user} cannot write its workspace "
                             f"{cfg.hands_workspace} ({out or 'refused'})", hint=redo)]
