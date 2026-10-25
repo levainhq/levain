@@ -29,6 +29,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   default Levain home protected instead of denying every call. Shell commands are still not parsed.
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
+- **The coverage check for signed graduation policies exists.** It decides whether a policy you signed covers an
+  autonomic action (same action and risk, a trigger and family it names, unexpired, signed by keys root lists, for this
+  store only); anything not covered runs at confirm. The autonomic store gains its `/2` format and the migration to it,
+  and a store opened at `/1` refuses to read or write once another process has migrated it. Nothing calls the check
+  and nothing migrates a store yet.
 - **The queue broker enforces slot limits.** A slot session's calls are counted against `L/policy/limits` (defaults
   when there is no file). A session that reaches a limit stays stopped until that limit is raised or a new session
   starts; a different call or a pause does not free it. An unreadable or tampered file, a failing limits database, or
