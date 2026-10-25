@@ -520,3 +520,80 @@ def test_served_control_streams_and_reemits():
         s.close()
     finally:
         _stop(p)
+
+
+# ---- ARTIFACT-ACK (CONTRACT §3.5 Retention) ------------------------------------------------------------------------
+
+def ack(rig, **kw) -> dict:
+    return rig.ask("ARTIFACT-ACK", **kw)
+
+
+def test_artifact_ack_needs_the_published_digest(erig):
+    """An executor ticket acks its artifact: only the digest the record carries (`artifact-not-published` before the
+    3b CAS, for another digest, for the verifier form); the ack writes `artifact_acked` (event_kind none, no event) and
+    wakes the reaper; a repeat answers `{}` and writes nothing."""
+    wakes = []
+    erig.control._wake_reaper = lambda: wakes.append(1)
+    ticket, _r, _a = bound_session(erig)
+    to_retained(erig)
+    assert refused(ack(erig, ticket=ticket, artifact_digest=DIG)) == "artifact-not-published"
+    assert refused(ack(erig, ticket=ticket)) == "artifact-not-published"
+    cas(erig, R.RETAINED, R.RETAINED, artifact_digest=DIG)
+    assert refused(ack(erig, ticket=ticket, artifact_digest="sha256:" + "b" * 64)) == "artifact-not-published"
+    assert refused(ack(erig, ticket=ticket, verifier_report_digest=DIG)) == "artifact-not-published"
+    assert refused(ack(erig, ticket=ticket)) == "artifact-not-published"          # a digest exists: name it
+    n_events, n_wakes = len(erig.kept()), len(wakes)
+    assert ack(erig, ticket=ticket, artifact_digest=DIG) == {"id": 1, "ok": True}
+    rec = erig.control.store.get(SESSION)
+    assert rec.fields["artifact_acked"] is True and rec.event_kind == "none" and rec.state == R.RETAINED
+    assert len(erig.kept()) == n_events and len(wakes) == n_wakes + 1
+    gen = rec.generation
+    assert ack(erig, ticket=ticket, artifact_digest=DIG) == {"id": 1, "ok": True}
+    assert erig.control.store.get(SESSION).generation == gen
+
+
+def test_artifact_ack_of_a_failed_artifact_names_no_digest(erig):
+    ticket, _r, _a = bound_session(erig)
+    to_retained(erig)
+    cas(erig, R.RETAINED, R.RETAINED, artifact_failed="adopt-path-too-long")
+    assert refused(ack(erig, ticket=ticket, artifact_digest=DIG)) == "artifact-not-published"
+    assert ack(erig, ticket=ticket)["ok"]
+    assert erig.control.store.get(SESSION).fields["artifact_acked"] is True
+
+
+def test_artifact_ack_refusals_by_name(erig):
+    ticket, _r, _a = bound_session(erig)
+    assert refused(ack(erig, ticket=C.new_handle())) == "ticket-unknown"
+    assert refused(ack(erig, ticket=ticket, artifact_digest=DIG, verifier_report_digest=DIG)) == "bad-value"
+    assert refused(ack(erig, ticket=ticket, artifact_digest="sha256:XYZ")) == "bad-token"
+    assert refused(ack(erig, ticket=ticket, artifact_digest=7)) == "wrong-type"
+    for uid in (0, OP_UID, KEYS_UID):
+        ans = erig.control.handle(C.Conn(uid), {"v": 1, "op": "ARTIFACT-ACK", "id": 1, "ticket": ticket})
+        assert refused(ans) == "verb-not-allowed-for-peer"
+
+
+@pytest.mark.parametrize("refusal", [False, True])
+def test_verifier_ticket_acks_its_report(st, refusal):  # noqa: F811
+    """A VERIFIER ticket (no artifact step) acks its report: the record's `verifier_report_digest`, or no digest when
+    `verifier_report_refused` is set; an `artifact_digest` from it is `artifact-not-published`."""
+    from tests.test_slot_3c8 import SESSION_V, VRig, vitem
+
+    rig = VRig(st, Clock())
+    assert rig.submit_v(vitem(1))["ok"]
+    ticket = ticket_of(rig.vmint())
+    assert rig.vattach(ticket)["ok"]
+    cas(rig, R.ALLOCATED, R.RENDERING, SESSION_V)
+    assert root(rig, "REVOKE", session=SESSION_V)["ok"]
+    for frm, to in END_CHAIN[:-1]:
+        cas(rig, frm, to, SESSION_V)
+    field = {"verifier_report_refused": "verifier-failed:exit"} if refusal else {"verifier_report_digest": DIG}
+    cas(rig, R.CREDENTIAL_PARKED, R.CREDENTIAL_PARKED, SESSION_V, **field)
+    cas(rig, R.CREDENTIAL_PARKED, R.RETAINED, SESSION_V)
+    assert refused(ack(rig, ticket=ticket, artifact_digest=DIG)) == "artifact-not-published"
+    if refusal:
+        assert refused(ack(rig, ticket=ticket, verifier_report_digest=DIG)) == "artifact-not-published"
+        assert ack(rig, ticket=ticket)["ok"]
+    else:
+        assert refused(ack(rig, ticket=ticket)) == "artifact-not-published"
+        assert ack(rig, ticket=ticket, verifier_report_digest=DIG)["ok"]
+    assert rig.control.store.get(SESSION_V).fields["artifact_acked"] is True

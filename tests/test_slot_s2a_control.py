@@ -51,7 +51,9 @@ SESSION2 = {"operator": {"LEASE-OPEN", "STATUS"},
                          # S1 3c-8: the verifier generations (CONTRACT §3.3 dispatch row, §3.5 VERIFIER IDENTITY)
                          "CONFIG-SUBMIT",
                          # S1 3c-8 slice 2: the event stream (CONTRACT §3.3 dispatch row, §3.6)
-                         "SESSION-EVENTS"}}
+                         "SESSION-EVENTS",
+                         # S1 3c-8 slice 2: the result's ack (CONTRACT §3.3 dispatch row, §3.5 Retention)
+                         "ARTIFACT-ACK"}}
 
 
 def attach_claims(**kw) -> dict:

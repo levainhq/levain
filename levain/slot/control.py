@@ -34,9 +34,9 @@ ticket and ``TOKEN-RESOLVE``'s ``run``, read from the ticket record and never fr
 the pool MIRROR (:class:`PoolMirror`, §3.5 Pool), the release of a bound ticket a sync shows over, ``RUN-TICKET-MINT``'s
 ``no-free-slot:<class>`` and dispatch's ``POOL``; S1 3c-8 dispatch's ``CONFIG-SUBMIT`` (the verifier generations,
 :class:`levain.slot.routemaps.ControlVerifiers`), the verifier ticket resolved at mint and re-checked at ``ATTACH``,
-and §3.6's event journal (:mod:`levain.slot.events`) with dispatch's ``SESSION-EVENTS`` stream.
-The other dispatch verbs (§3.3, §3.5) are later 3c sessions':
-until then every other peer, and every other verb of a known one, is refused ``verb-not-allowed-for-peer`` (see
+§3.6's event journal (:mod:`levain.slot.events`) with dispatch's ``SESSION-EVENTS`` stream, and dispatch's
+``ARTIFACT-ACK`` (§3.5 Retention). Every other peer, and every other verb of a known one, is refused
+``verb-not-allowed-for-peer`` (see
 :data:`PEER_VERBS`). Every act on keys and the reaper wake are seams: :class:`KeysAdmin` supplies the keys ones when
 CONTROL is given one.
 """
@@ -79,7 +79,7 @@ _LEN = struct.Struct(">I")
 ROOT_UID = 0
 
 #: §3.3's verbs per peer, as built so far (3c-6b adds keys' ``LINEAGE-APPEND``, 3c-7 root's ``SLOT-SYNC`` and dispatch's
-#: ``POOL``, 3c-8 dispatch's ``CONFIG-SUBMIT`` and ``SESSION-EVENTS``). Later 3c sessions add the rest of the ``_levain_dispatch`` row (3c-4 builds its ``ROUTE-SUBMIT``, 3c-5 the three ticket verbs and ``LEASE-OPEN {ticket}``; the peer is ``dispatch`` when
+#: ``POOL``, 3c-8 dispatch's ``CONFIG-SUBMIT``, ``SESSION-EVENTS`` and ``ARTIFACT-ACK``). The ``_levain_dispatch`` row (3c-4 builds its ``ROUTE-SUBMIT``, 3c-5 the three ticket verbs and ``LEASE-OPEN {ticket}``; the peer is ``dispatch`` when
 #: :meth:`Control.peer_kind` is given its uid, else ``foreign``). keys' ``FRONT-LOST`` / ``SPEND-OVERRUN`` / ``SESSIONS`` / ``LINEAGE-APPEND`` are answered only on the connection that
 #: holds the current ``KEYS-ATTACH`` (else ``not-attached``).
 PEER_VERBS: Mapping[str, frozenset[str]] = {
@@ -88,7 +88,7 @@ PEER_VERBS: Mapping[str, frozenset[str]] = {
     "qbroker": frozenset({"QUEUE-RESOLVE"}),
     "keys": frozenset({"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS", "LINEAGE-APPEND"}),
     "dispatch": frozenset({"LEASE-OPEN", "ROUTE-SUBMIT", "RUN-TICKET-MINT", "RUN-TICKET-CANCEL", "RUN-TICKET-STATUS",
-                           "POOL", "CONFIG-SUBMIT", "SESSION-EVENTS"}),
+                           "POOL", "CONFIG-SUBMIT", "SESSION-EVENTS", "ARTIFACT-ACK"}),
     "foreign": frozenset(),
 }
 
@@ -115,6 +115,8 @@ _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "ROUTE-SUBMIT": (frozenset({"map", "sig"}),) * 2,
     "CONFIG-SUBMIT": (frozenset({"item", "sig"}),) * 2,      # S1 3c-8: kind `verifier` (§3.5 VERIFIER IDENTITY)
     "SESSION-EVENTS": (frozenset({"after_seq"}),) * 2,        # S1 3c-8: §3.6, the connection becomes the stream
+    # S1 3c-8: §3.5 Retention; at most one of the two digests (refused `bad-value` with both)
+    "ARTIFACT-ACK": (frozenset({"ticket", "artifact_digest", "verifier_report_digest"}), frozenset({"ticket"})),
     # the per-kind required fields are the §3.5 table's (tickets.check_facts), refused by field name
     "RUN-TICKET-MINT": (frozenset({"attempt_id"}) | T.MINT_FIELDS, frozenset({"attempt_id"})),
     "RUN-TICKET-CANCEL": (frozenset({"ticket"}),) * 2,
@@ -2066,6 +2068,51 @@ class Control:
         return {}
 
     # -- SESSION-EVENTS (§3.6, S1 3c-8) ---------------------------------------------------------------------------
+
+    def _op_artifact_ack(self, conn: Conn, args: dict) -> dict[str, object]:
+        """§3.5 Retention ``ARTIFACT-ACK {ticket, artifact_digest? | verifier_report_digest?}`` -> ``{}``: dispatch has
+        read the session's result. The session is the record whose ``claims.ticket`` is ``ticket`` (``ticket-unknown``
+        when none is). An executor / planner ticket acks its artifact: the record must carry that same
+        ``artifact_digest``, or ``artifact_failed`` with no digest named; a VERIFIER ticket (claims ``kind`` verifier)
+        acks its report: the record's ``verifier_report_digest``, or ``verifier_report_refused`` with no digest named.
+        Anything else is ``artifact-not-published`` (the other kind's digest included). The ack is written as
+        ``artifact_acked: true`` (its own generation, ``event_kind: none``); an ack of a record already acked answers
+        ``{}`` and writes nothing. Then the reaper is woken: its retention step moves the RETAINED session to TRASH
+        (§7.7 3c)."""
+        ticket = _handle(args["ticket"], "ticket")
+        named = sorted({"artifact_digest", "verifier_report_digest"} & set(args))
+        if len(named) > 1:
+            raise Refused("bad-value", "at most one of artifact_digest and verifier_report_digest")
+        digest = None
+        if named:
+            digest = args[named[0]]
+            if type(digest) is not str:
+                raise Refused("wrong-type", f"{named[0]} is a string")
+            if _DIGEST_RE.fullmatch(digest) is None:
+                raise Refused("bad-token", named[0])
+        found = [r.session for r in self.store.all()
+                 if isinstance(r.claims.get("ticket"), str) and hmac.compare_digest(str(r.claims["ticket"]), ticket)]
+        if len(found) != 1:
+            raise Refused("ticket-unknown")
+        session = found[0]
+        with self.store.lock(session):
+            rec = self.store.get(session)
+            if rec is None:
+                raise Refused("ticket-unknown")
+            if rec.claims.get("kind") == "verifier":
+                have, failed = "verifier_report_digest", "verifier_report_refused"
+            else:
+                have, failed = "artifact_digest", "artifact_failed"
+            if named and named[0] != have:
+                raise Refused("artifact-not-published", f"a {named[0]} for a ticket that acks its {have}")
+            published = (rec.fields.get(have) == digest) if digest is not None else (failed in rec.fields)
+            if not published:
+                raise Refused("artifact-not-published")
+            if rec.fields.get("artifact_acked") is True:
+                return {}
+            self._write(rec, fields={**rec.fields, "artifact_acked": True}, event_kind="none")
+        self._wake()
+        return {}
 
     def _op_session_events(self, conn: Conn, args: dict) -> dict[str, object]:
         """``SESSION-EVENTS {after_seq}``: answered with the stream's ``hello`` (``{kind:"hello", journal_id, oldest_seq,
