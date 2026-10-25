@@ -1116,10 +1116,13 @@ class Control:
     def _write(self, rec: R.SessionState, **changes: object) -> R.SessionState:
         """``rec`` with ``changes`` at ``generation + 1``, durably, then its event (caller holds the session lock).
         An owed event of ``rec``'s generation is appended first (the class docstring's fence)."""
-        revoke_path = changes.get("state") == R.REVOKED or set(changes) == {"lease_live", "event_kind"}
-        if self._pay_owed(rec, revoke_path=revoke_path) and changes.get("event_kind") == "none":
-            # L3 r1 fix 7 (complement 1): an event-less revoke-path write over an owed generation carries that
-            # generation's kind, so the new generation bears its event (the start pass repairs it), never forgotten
+        changes = dict(changes)
+        lease_only = set(changes) == {"lease_live", "event_kind"}
+        if self._pay_owed(rec, revoke_path=changes.get("state") == R.REVOKED or lease_only) \
+                and lease_only and changes["event_kind"] == "none":
+            # L3 r1 fix 7 (complement 1): the revoke-after-EOF `lease_live` write over an owed generation carries that
+            # generation's kind, so the new generation bears its event (the start pass repairs it), never forgotten;
+            # a `state=REVOKED` write keeps the kind it names (L3 r2, deepseek 3)
             changes["event_kind"] = rec.event_kind
         new = replace(rec, generation=rec.generation + 1, updated_at=R.timestamp(self._clock()), **changes)
         self._put(new)
