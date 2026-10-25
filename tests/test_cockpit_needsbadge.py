@@ -10,10 +10,10 @@ from tests.test_cockpit_f12b_topology_view import NARROW, TV, _paint, _value
 from tests.test_cockpit_flip_parity import needs_browser
 from tests.test_cockpit_seatmsg import CHIPS, PRESSED, PRIME, _run, _tap
 
-# a tap on a seat's node opens its page holding a message box addressed to it (Phill 10-25, "61a")
-SEAT_PAGE = "(document.querySelector('#levain-modal .agent-msg .ck-addr') || {}).textContent == 'to seat:ledgerline'"
 from tests.test_cockpit_k7_build import DESKTOP
 
+# a tap on a seat's node opens its page holding a message box addressed to it (Phill 10-25, "61a")
+SEAT_PAGE = "(document.querySelector('#levain-modal .agent-msg .ck-addr') || {}).textContent == 'to seat:ledgerline'"
 WHAT = "ship 0.11.21 or hold for the CI sharding?"
 
 
