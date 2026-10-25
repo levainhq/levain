@@ -204,3 +204,59 @@ def test_tunnel_closes_its_socket_when_the_no_sni_handshake_fails(tmp_path) -> N
         th.join(5)
         srv.close()
     assert len(made) == 1 and made[0].fileno() == -1
+
+
+def test_a_wrapper_registered_after_close_began_is_closed_at_once() -> None:
+    """The race codex named: close() snapshots after wrap_socket detached the raw fd and before the worker registered the
+    wrapper. A hook parks the worker between the two until close() has snapshotted: no sleeps."""
+    import ssl
+    import tempfile
+    from pathlib import Path
+    from .tls_rig import UNKEYED, make_pki
+    with tempfile.TemporaryDirectory() as d:
+        ca, leaf, key = make_pki(Path(d) / "pki", [UNKEYED])
+        o = RecordingOrigin(tls=(str(leaf), str(key)))
+        wrapped = threading.Event()
+
+        def after_wrap(_c) -> None:
+            wrapped.set()
+            assert o.snapshotted.wait(10)
+
+        o.after_wrap = after_wrap
+        ctx = ssl.create_default_context(cafile=str(ca))
+        box: list[ssl.SSLSocket] = []
+        cl = threading.Thread(target=lambda: box.append(ctx.wrap_socket(
+            socket.create_connection(("127.0.0.1", o.port), timeout=10), server_hostname=UNKEYED)), daemon=True)
+        cl.start()
+        assert wrapped.wait(10)
+        o.close()                                            # snapshots, releases the worker, joins it
+        cl.join(10)
+        try:
+            assert not [t for t in o._threads if t.is_alive()]
+            assert o._socks == [] or all(s.fileno() == -1 for s in o._socks), o._socks
+        finally:
+            for s in box:
+                s.close()
+
+
+def test_leaky_relay_close_leaves_no_socket_or_thread_from_an_accept_that_raced_it() -> None:
+    from .rig import LeakyRelay
+    for dialect in ("raw", "connect"):
+        r = LeakyRelay(1, dialect)
+        accepted = threading.Event()
+
+        def after_accept(_c) -> None:
+            accepted.set()
+            assert r.stopping.wait(10)                       # parked in the accept thread until close() has begun
+
+        r.after_accept = after_accept
+        c = socket.create_connection(("127.0.0.1", r.port), timeout=10)
+        try:
+            assert accepted.wait(10)
+            r.close()
+            assert not [t for t in r._threads if t.is_alive()]
+            assert all(s.fileno() == -1 for s in r._socks), r._socks
+            c.settimeout(5)
+            assert c.recv(1) == b""                          # the raced connection was closed, not parked
+        finally:
+            c.close()

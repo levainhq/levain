@@ -54,6 +54,8 @@ class RecordingOrigin:
         self._srv.settimeout(0.2)          # the accept loop re-reads _stop; closing a listener does not wake accept everywhere
         self.port = self._srv.getsockname()[1]
         self._stop = False
+        self.after_wrap = None             # test hook: called with the wrapped socket, before the worker registers it
+        self.snapshotted = threading.Event()   # set by close() once it has taken its snapshot of sockets and threads
         self._socks: list[socket.socket] = []
         self._threads: list[threading.Thread] = []
         self._t = threading.Thread(target=self._accept, daemon=True)
@@ -120,7 +122,11 @@ class RecordingOrigin:
                         self.wrap_failures.append(type(exc).__name__)
                     raise
                 c = wrapped                                      # the wrap detached the original fd: track the new socket
+                if self.after_wrap is not None:
+                    self.after_wrap(c)
                 with self._lock:
+                    if self._stop:                               # close() snapshotted without this wrapper: close it here
+                        return
                     self._socks.append(c)
             while True:
                 while b"\r\n\r\n" not in buf:
@@ -186,6 +192,7 @@ class RecordingOrigin:
             pass
         with self._lock:
             socks, threads = list(self._socks), list(self._threads)
+        self.snapshotted.set()
         for c in socks:
             try:
                 c.shutdown(socket.SHUT_RDWR)
@@ -253,16 +260,31 @@ class LeakyRelay:
         self._srv.settimeout(0.2)
         self.port = self._srv.getsockname()[1]
         self._stop = False
+        self.after_accept = None           # test hook: called in the accept thread, after accept() and before registration
+        self.stopping = threading.Event()  # set by close() as it begins
         self._socks: list[socket.socket] = []
         self._lock = threading.Lock()
         self._threads: list[threading.Thread] = [threading.Thread(target=self._accept, daemon=True)]
         self._threads[0].start()
 
-    def _spawn(self, fn, *a) -> None:
+    def _spawn(self, fn, *a) -> bool:
+        """Starts a worker unless close() has begun (it sets `_stop` under this lock, then snapshots)."""
         t = threading.Thread(target=fn, args=a, daemon=True)
         with self._lock:
+            if self._stop:
+                return False
             self._threads.append(t)
-        t.start()
+            t.start()
+        return True
+
+    def _register(self, s: socket.socket) -> bool:
+        """Tracks `s` for close(); once close() has begun, closes it instead and says so."""
+        with self._lock:
+            if not self._stop:
+                self._socks.append(s)
+                return True
+        s.close()
+        return False
 
     def _accept(self) -> None:
         while not self._stop:
@@ -272,9 +294,13 @@ class LeakyRelay:
                 continue
             except OSError:
                 return
-            with self._lock:
-                self._socks.append(c)
-            self._spawn(self._serve, c)
+            if self.after_accept is not None:
+                self.after_accept(c)
+            if not self._register(c):
+                return
+            if not self._spawn(self._serve, c):
+                c.close()
+                return
 
     @staticmethod
     def _read_until_more(c: socket.socket, out: bytes, marker: bytes) -> bytes:
@@ -317,11 +343,12 @@ class LeakyRelay:
                     self._read_exact(c, (4 if req[3] == 1 else 16) + 2)
                 c.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
             o = socket.create_connection(("127.0.0.1", self.origin_port), timeout=10)
-            with self._lock:
-                self._socks.append(o)
+            if not self._register(o):
+                return
             if head:
                 o.sendall(head)
-            self._spawn(self._pipe, o, c)
+            if not self._spawn(self._pipe, o, c):
+                return
             self._pipe(c, o)
         except (OSError, EOFError):
             pass
@@ -342,15 +369,16 @@ class LeakyRelay:
             pass
 
     def close(self) -> None:
-        self._stop = True
         with self._lock:
-            socks, threads = list(self._socks), list(self._threads)
-        for t in threads[:1]:
-            t.join(5)
+            self._stop = True                                    # no registration or spawn succeeds after this
+        self.stopping.set()
+        self._threads[0].join(5)                                 # the accept thread, before the snapshot
         try:
             self._srv.close()
         except OSError:
             pass
+        with self._lock:
+            socks, threads = list(self._socks), list(self._threads)
         for s in socks:
             try:
                 s.shutdown(socket.SHUT_RDWR)
