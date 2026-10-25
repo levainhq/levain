@@ -208,17 +208,36 @@
       return best;
     } catch (_) { return pad; }
   }
-  // The open mark breathes (Phill 10-25) while it is drawn, for 8 cycles per paint (the cost is measured beside the keyframes in dashboard.css): the badge (and the desk's leader line) carry .tv-needpulse and the mark is drawn only while
-  // needs_open > 0, so answering the item removes the class with the mark; a repaint re-arms the cycles. A repaint rebuilds the nodes; a negative delay off one shared clock keeps the breath in phase
-  // across repaints instead of restarting it. PULSE_MS is the keyframe period in dashboard.css (tv-needpulse).
-  const PULSE_MS = 4000;
-  const pulsePhase = () => "-" + Math.round(((typeof performance !== "undefined" && performance.now ? performance.now() : Date.now()) % PULSE_MS)) + "ms";
+  // The open mark breathes (Phill 10-25), once per NEW open decision: the badge (and the desk's leader line) carry .tv-needpulse for the 8 cycles of the keyframe in dashboard.css (the cost is
+  // measured beside it), counted from the paint where the decision first showed; after that the mark is still until the next new one. A repaint rebuilds the nodes, so the cycles already played
+  // ride in as a negative delay (the breath continues in phase and ends on schedule instead of restarting). New = the owner had no mark, its count rose, or its first card changed without the count
+  // falling (answering the first of several is not new). PULSE_MS is the keyframe period in dashboard.css (tv-needpulse); PULSE_CYCLES its iteration count.
+  const PULSE_MS = 4000, PULSE_CYCLES = 8;
+  const nowMs = () => (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now());
+  const pulseAt = new Map();                                                // owner -> {n, card, t}: committed by the lens once it is the visible build, like needSeen
+  let pulseCtx = null;                                                      // the draw in progress (drawGraph is synchronous): its tentative records
+  // Dev only, for a look at the alternative: ?needpulse=continuous on the page's own URL breathes for as long as the mark is open (phase off one shared clock). Not a setting.
+  const pulseContinuous = () => { try { return /(?:^|[?&])needpulse=continuous(?:&|$)/.test(root.location.search); } catch (_) { return false; } };
+  function pulseOf(owner, nd) {
+    if (pulseContinuous()) return { on: true, inf: true, delay: "-" + Math.floor(nowMs() % PULSE_MS) + "ms" };
+    const t = nowMs();
+    let rec = pulseCtx && pulseCtx.pulse.get(owner);
+    if (!rec) {
+      const prev = pulseAt.get(owner);
+      const fresh = !prev || nd.n > prev.n || (nd.card !== prev.card && nd.n >= prev.n);
+      rec = { n: nd.n, card: nd.card, t: fresh ? t : prev.t };
+      if (pulseCtx) pulseCtx.pulse.set(owner, rec);
+    }
+    const played = Math.floor(t - rec.t);
+    return played < PULSE_MS * PULSE_CYCLES ? { on: true, inf: false, delay: "-" + played + "ms" } : { on: false, inf: false, delay: "" };
+  }
   function needMark(nd, cx, cy, rr, ang, opts, label, owner, scale, deco, calm) {
     const g = sv("g", { "data-needs": String(nd.n) }, "tv-need");
     if (deco) g.appendChild(deco.art); else g.appendChild(sv("circle", { cx: num(cx), cy: num(cy), r: num(rr) }, "tv-needring" + (calm ? " calm" : "")));
     const { bx, by, txt, w, side } = needGeom(nd, cx, cy, rr, ang, scale, deco);
-    const b = sv("g", { "data-needbadge": nd.card, "data-needfirst": nd.first, "data-needfor": owner }, "tv-needbadge tv-needpulse");
-    b.style.animationDelay = pulsePhase();
+    const pu = pulseOf(owner, nd);
+    const b = sv("g", { "data-needbadge": nd.card, "data-needfirst": nd.first, "data-needfor": owner }, "tv-needbadge" + (pu.on ? " tv-needpulse" : "") + (pu.inf ? " tv-needpulse-inf" : ""));
+    if (pu.on) b.style.animationDelay = pu.delay;
     const tip = nd.what || (nd.n + " decision" + (nd.n === 1 ? "" : "s") + " waiting on you");
     const openable = !!nd.card && !!opts && typeof opts.openCard === "function";
     b.appendChild(sv("rect", { x: num(bx - w / 2), y: num(by - 10), width: w, height: 20, rx: deco ? deco.rx : 10 }, "tv-needpill"));
@@ -261,8 +280,9 @@
     }
     art.appendChild(sv("path", { d: "M -3 -43.4 L 3 -43.4 L 0 -38.8 Z" }, "tv-bz-lub"));
     const s = pol(39.6, 135);
-    const lead = sv("path", { d: "M " + s + " L 42 42 L 52 42" }, "tv-bz-lead tv-needpulse");
-    lead.style.animationDelay = pulsePhase();
+    const pu = pulseOf("hub", nd);
+    const lead = sv("path", { d: "M " + s + " L 42 42 L 52 42" }, "tv-bz-lead" + (pu.on ? " tv-needpulse" : "") + (pu.inf ? " tv-needpulse-inf" : ""));
+    if (pu.on) lead.style.animationDelay = pu.delay;
     art.appendChild(lead);
     return { art, bx: HUB_BADGE.bx, by: HUB_BADGE.by, rx: 4 };
   }
@@ -985,6 +1005,7 @@
   // ---- the SVG ----
   function drawGraph(v, L, edges, measure, opts, scale, fresh) {
     fresh = fresh || { prev: new Map(), still: true };
+    fresh.pulse = new Map(); pulseCtx = fresh;
     const shown = new Map();                                                // what this draw puts on screen, committed by the lens once it is the visible build
     fresh.shown = shown;
     const svg = sv("svg", { viewBox: "0 0 " + L.LW + " " + L.H, role: "group", "aria-label": "Agents graph", preserveAspectRatio: "xMidYMid meet" }, "tv-graph");
@@ -1286,7 +1307,7 @@
       // vanished is forgotten and one that returns arrives anew; a hidden or pre-attach build commits nothing, and the lens still plays when first shown
       if (fresh.shown && stage.isConnected && stage.getBoundingClientRect().width > 0) {
         fresh.prev = new Map(fresh.shown);
-        if (!still) { needSeen.clear(); for (const [k, n] of fresh.shown) needSeen.set(k, n); }
+        if (!still) { needSeen.clear(); for (const [k, n] of fresh.shown) needSeen.set(k, n); pulseAt.clear(); for (const [k, r] of fresh.pulse) pulseAt.set(k, r); }
       }
       if (phone) svgNode.style.width = Math.round(LW * scale) + "px";
       stage.insertBefore(svgNode, canvas);
