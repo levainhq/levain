@@ -6,6 +6,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **`levain chat setup` installs chat's one Node dependency** (`@anthropic-ai/sandbox-runtime` 0.0.81, pinned by
+  integrity hash) into your Levain home, never globally, and records a hash of the whole installed tree. Chat needs
+  Node 26 on your PATH and refuses any other Node version by name; the rest of Levain stays Python. `levain doctor`
+  shows the Node and dependency versions, fails on a changed or damaged install, and reports an unreadable one as a
+  problem instead of crashing. Run `levain chat setup` again after upgrading.
+
 ### Fixed
 - **Two sessions making their first call at the same moment no longer have one call refused with `database is
   locked`.** On a store not yet created (the queue broker's `limits.db` on a fresh install, or any other Levain store),
@@ -16,6 +23,23 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **The queue broker's service program exists for an isolated install.** It serves every slot's queue socket, so slot
   sessions' tool-call limits are enforced, and picks up slots added later without a restart. No `levain` command
   installs or starts it yet.
+- **Graduation coverage in the autonomic gate.** Below confirm, a binding's effect (every link of it), a resolve of a
+  binding's held action and the silence default of a manual cooling-off action run only when a live graduation policy,
+  signed by a key root lists, covers that declared action at the risk Levain's manifest gives it; otherwise they wait
+  for your signed approval at confirm, and a policy revoked or lapsed after the decision stops the action at
+  admission. A binding's last action always waits at the rung you ratified it at. Re-ratifying a binding to a looser
+  rung below confirm needs the covering policy and is refused below the binding's risk floor. A clock or coverage read
+  that fails while a held action is being decided leaves it waiting instead of dropping it. The autonomic store
+  becomes format `levain-autonomic/2` (a `/1` store is upgraded in place when this version opens it; an older Levain
+  refuses a `/2` store). No `levain` command fires bindings yet.
+- **The chat network's egress launch.** Levain can start and stop a chat launch's egress proxy: the whole Node
+  dependency tree is checked against what `levain chat setup` recorded before anything starts; upstream servers are
+  trusted by the system roots only (an inherited `NODE_EXTRA_CA_CERTS` adds nothing) and the egress CA's key never
+  touches disk; a launch under `open network` says so on its header ("open network: network writes are not gated"),
+  taken from the launch's own network setting; a held key set up with `--basic-user` is placed as HTTP Basic; the
+  SOCKS port cannot be held open by a slow client; a launch that fails to start, or a stop whose steps fail, leaves no
+  sockets, pipes, threads or helper process behind; cleaning a launch's temporary files never follows a swapped-in
+  symlink (Linux: an entry with no safe way to change it is left and reported). No chat launch uses it yet.
 
 ## [0.11.25] — 2026-10-25
 
