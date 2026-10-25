@@ -694,6 +694,30 @@ def test_quarantine_and_a_refused_envelope_are_counted_in_keys_status(monkeypatc
     assert len(ack["refs"]) == 2 and [q["field"] for q in ack["quarantined"]] == ["tokens_in"]
 
 
+def test_flush_refusals_reaches_every_window_whatever_one_raises(monkeypatch):
+    # r1 complement LOW 5: a window whose line raises anything (not only the ledger's two errors) loses its own counts,
+    # noted; `flush_refusals` still reaches every other window
+    async def go(d):
+        async with KeysWorld(d, monkeypatch, refused_row_s=3600.0) as w:
+            w.k._note_refusal("s1", RUN, "route-not-allowed")
+            w.k._note_refusal("s1", RUN, "budget-exhausted")
+            real, calls = w.ledger.refused, []
+
+            def refused(*a, **kw):
+                calls.append(a[2])
+                if len(calls) == 1:
+                    raise RuntimeError("a test's failed window")
+                return real(*a, **kw)
+
+            w.ledger.refused = refused
+            w.k.flush_refusals()
+            await until(lambda: not w.ledger._lines, 5, "drained")
+            return calls, w.k._refusals, [o["reason"] for o in w.lines() if o["kind"] == "refused"]
+
+    calls, left, written = run_go(go)
+    assert len(calls) == 2 and left == {} and len(written) == 1 and written[0] == calls[1]
+
+
 def test_end_meta_never_raises_even_on_its_holds_own_reads():
     # r1 F8: `_end_meta` is evaluated in `except BaseException` before a raise goes on, so its contract is NEVER
     # raises; the reads of `hold.state` and `hold.base` are inside it too. A hold whose reads raise gets None; one

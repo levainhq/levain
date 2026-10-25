@@ -1319,7 +1319,14 @@ class Ledger:
         done-callback of the line's own future (R4 §3: keys counts an ack only after its line is fsynced); a failed
         flush counts nothing. A triple that is not a durable payload line is refused `LedgerMisuse` before anything
         is queued (its line would be `ack-orphan` to the next replay). Triples already acked, or in an ack line not
-        yet durable, are dropped; with none left, no line is written and the future is already resolved."""
+        yet durable, are dropped; with none left, no line is written and the future is already resolved.
+
+        Two consequences of that drop (r1 review, documented, no behavior change): a quarantine given for a dropped
+        triple is dropped with it, which loses nothing while CONTROL answers a triple's quarantine from its sink (the
+        in-flight line carries the same one; if that line fails, the triple stays unacked and its resend is answered
+        again); and `unacked()` still lists a triple whose ack line is in flight, so a sender that re-sends it (a new
+        attachment while the old one's ack line is not yet durable) gets an already-resolved future and sends again
+        at once, for as long as that line takes to become durable or the ledger faults."""
         self._check_loop()
         loop = self._loop
         assert loop is not None

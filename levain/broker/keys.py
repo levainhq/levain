@@ -1742,7 +1742,9 @@ class Keys:
             # the ledger's reason grammar is the refusal's name without its `:<what>` (`body-unbounded:document`);
             # the row keeps the whole name
             led.refused(session, run["route"], name.partition(":")[0], count, {"lineage": row}, run_id=run["run_id"])
-        except (ledger.LedgerUnavailable, ledger.LedgerMisuse) as e:
+        except Exception as e:
+            # any failure, not only the ledger's own two (r1 complement LOW 5): this runs from a timer callback and
+            # from `flush_refusals`' loop over every window, which must reach the rest
             _note(logging.WARNING, "levain gw-keys: a refusal window's line was not written (%s); %d %s lost",
                   type(e).__name__, count, name)
 
