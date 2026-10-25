@@ -662,9 +662,9 @@ class Reaper:
             ri = read_root_intent(facts.intent, owner_ok=self.seams.trusted)
             if ri is None or ri.intent != "discard":
                 return                                   # another verb's journal: its own caller finishes it
-            SV.reconcile_store(facts, SV.StoreSeams(cas=SV.control_cas(ctx, a.session), owner_ok=self.seams.trusted,
-                                                    now=lambda: R.timestamp(self.seams.clock())))
-            rep["reconciled"].append(a.session)                              # type: ignore[union-attr]
+            if SV.reconcile_store(facts, SV.StoreSeams(cas=SV.control_cas(ctx, a.session), owner_ok=self.seams.trusted,
+                                                       now=lambda: R.timestamp(self.seams.clock()))) is not None:
+                rep["reconciled"].append(a.session)                              # type: ignore[union-attr]
 
     # -- step 4: BRAKE below V5 (§7.7 4) -------------------------------------------------------------------------------
 

@@ -219,3 +219,16 @@ def test_the_store_verb_discard_runs_a_guard_under_the_session_lock(rw):
     assert "SV.discard(" in inspect.getsource(RP._retention_discard)
     assert "discard_plan" not in inspect.getsource(RP._retention_discard)
 
+
+
+def test_a_discard_journal_gone_before_the_reconcile_reports_nothing(rw, monkeypatch):
+    """R2 item d: `_finish_discard` reports a session only when `reconcile_store` did something (it answers None when
+    the journal was gone by the time it held the lock)."""
+    from levain.slot import root_intent as RI
+    from levain.slot import store_verbs as SV
+
+    rw.record(artifact_acked=True)
+    assert rw.step()["trashed"] == [S]
+    RI.write_root_intent(rw.L / "alloc" / f"{S}.intent.json", RI.RootIntent("discard", "commit", "2026-10-01T00:00:00Z"))
+    monkeypatch.setattr(SV, "reconcile_store", lambda facts, seams, **kw: None)
+    assert rw.step()["reconciled"] == []
