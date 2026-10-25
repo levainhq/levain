@@ -371,6 +371,37 @@ def test_a_raised_send_allow_measures_what_left(rig, left, expect) -> None:
         assert [x["action"] for x in v] == ["allow"]
 
 
+@pytest.mark.parametrize("left, expect", [(0, "owed-deny"), (5, "cut")])
+def test_a_raised_release_measures_what_left(rig, left, expect) -> None:
+    armed = {"on": False}
+
+    def fault(n: int):
+        if armed["on"]:
+            armed["on"] = False
+            return left
+        return None
+
+    r = rig(link_fault=fault)
+    p, rid = r.srt.req("POST", path="/held")
+    for _ in range(100):
+        if r.desk.filed:
+            break
+        time.sleep(0.02)
+    assert r.desk.filed
+    armed["on"] = True
+    r.obs_line(wire.obs_ended_line(rid))
+    time.sleep(0.5)
+    v = r.srt.got(p)
+    failed = [x for x in r.rows(rid) if x.kind == "egress_failed"]
+    assert [x.failed_effect for x in failed] == [Effect.RELEASE.value]
+    assert r.desk.ended == ["card-1"]
+    if expect == "owed-deny":
+        assert [(x["action"], x["status"]) for x in v] == [("deny", 503)]
+    else:
+        assert r.srt.eof and v == [] and len(r.srt.raw_tail) == 1
+        assert r.d.link.dead == "a verdict frame was cut mid-send"
+
+
 # --- C1: the standing default, read live -------------------------------------------------------------------------------
 
 def test_a_stale_read_of_the_standing_default_never_reopens_and_close_arms_nothing() -> None:
