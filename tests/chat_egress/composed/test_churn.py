@@ -95,24 +95,17 @@ def test_continuous_churn_is_bounded_and_a_valid_request_still_completes(make_or
     assert ok and all(s == 200 for s, _ in ok) and st_after == 200
     assert fds1 - fds0 <= FD_GROWTH, (fds0, fds1)
     assert rss1 - rss0 <= RSS_GROWTH_KB, (rss0, rss1)
-    # quiet = the decider holds no request in a decision (none live, none with a decision thread), the origin holds no
-    # connection and the row count is stable, over one interval (no upstream socket outlives its client: C2's observable)
-    quiet_since, last_rows = None, -1
+    # quiet = every request owed a row has its row (the /warm, the /during requests, /after and every whole head the churn
+    # sent) and the origin holds no connection (no upstream socket outlives its client: C2's observable)
+    owed = len(ok) + 2 + counts[1]
     end = time.monotonic() + 20
     while time.monotonic() < end:
-        n = len(L.records.rows(L.launch_id))
-        with L.d._live_lock:
-            deciding = len(L.d._active) + len(L.d._live)
-        if deciding == 0 and origin.open_conns == 0 and n == last_rows:
-            quiet_since = quiet_since or time.monotonic()
-            if time.monotonic() - quiet_since >= 1.5:
-                break
-        else:
-            quiet_since = None
-        last_rows = n
+        n = sum(1 for r in L.records.rows(L.launch_id) if r.kind == "egress_attempt")
+        if n >= owed and origin.open_conns == 0:
+            break
         time.sleep(0.2)
     else:
-        raise AssertionError(f"never quiet: deciding {deciding}, open_conns {origin.open_conns}, rows {last_rows}")
+        raise AssertionError(f"never quiet: attempt rows {n} of {owed} owed, open_conns {origin.open_conns}")
     assert origin.open_conns == 0, origin.open_conns
     assert L.stop() == 0
     assert L.stderr.stat().st_size <= STDERR_BYTES
@@ -121,10 +114,10 @@ def test_continuous_churn_is_bounded_and_a_valid_request_still_completes(make_or
     assert sum(1 for x in lines if '"t":"wall"' in x) <= 100
     assert sum(1 for x in lines if '"t":"summary"' in x) <= 3
     rows = L.records.rows(L.launch_id)
-    valid = counts[1] + len(ok) + 2              # whole heads churned, the /during requests, /warm and /after
+    valid = owed                                 # whole heads churned, the /during requests, /warm and /after
     attempts = [r for r in rows if r.kind == "egress_attempt"]
     print("C3 rows by kind:", {k: sum(1 for r in rows if r.kind == k) for k in {r.kind for r in rows}}, "valid", valid)
-    assert len(attempts) >= len(ok) + 2, (len(attempts), len(ok))   # every request the test waited on has its row
+    assert len(attempts) >= valid, (len(attempts), valid)   # every request owed a row, the churned whole heads included
     assert len(attempts) <= valid, (len(attempts), valid)   # an attempt row per decided request, not per connection
 
 

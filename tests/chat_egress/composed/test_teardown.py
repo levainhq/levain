@@ -38,9 +38,7 @@ def test_a_decider_close_that_returns_false_fails_the_teardown(make_origin, make
     L = make_launch_(make_origin())
     assert L.stop() == 0
     real = L.d.close
-    monkeypatch.setattr(L.d, "close", lambda *a, **k: (real(*a, **k), False)[1])
-    try:
+    with monkeypatch.context() as m:          # the patch ends with the block: the fixture's own teardown sees the real close
+        m.setattr(L.d, "close", lambda *a, **k: (real(*a, **k), False)[1])
         with pytest.raises(AssertionError, match="decider"):
             _shutdown(L)
-    finally:
-        monkeypatch.undo()                    # the fixture's own teardown must see the real close
