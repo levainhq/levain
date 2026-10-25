@@ -6,9 +6,11 @@ line, fsynced per append), and rebuilds everything it counts from that journal a
 day's mints, and the attempt index `RUN-TICKET-STATUS` answers from.
 
 Lines (`op`): `mint` (the ticket, its `attempt_id`, the `run_id` CONTROL minted with it, the request digest, the facts,
-the mint time and UTC day), `bind` (an unbound ticket bound to the session an `ATTACH` created), `unbind` (that
-`ATTACH`'s session record was never written, so the ticket is unbound again: L2 4a, 3c-5 fix 1), `cancel`, `expire` (an
-unbound ticket past V16), `tombstone` (`{attempt_id, ticket, request_digest, state, session?}`, written only by the
+the mint time and UTC day), `bind` (an unbound ticket bound to the session an `ATTACH` created, and, from 3c-7, to the
+slot lease that session holds: `slot` `{class, index}` + `lease_seq`, CONTRACT §3.5 BINDING), `unbind` (that
+`ATTACH`'s session record was never written, so the ticket is unbound again: L2 4a, 3c-5 fix 1), `release` (S1 3c-7: a
+`SLOT-SYNC` showed the bound lease over, §3.5 RELEASE), `cancel`, `expire` (an unbound ticket past V16), `tombstone`
+(`{attempt_id, ticket, request_digest, state, session?}`, written only by the
 compaction). A tombstone is authoritative over every other line of its attempt. One `attempt_id` naming two
 tickets or two request digests, one ticket named by two attempts, or a whole line that does not parse, refuses the start
 (`journal-inconsistent`): CONTROL never serves a ticket journal it cannot read whole. A last line with no newline is a
@@ -47,8 +49,14 @@ Expiry is derived (fix 2, complement 3): an unbound ticket past V16 READS as `ex
 line is journaled only by a verb that writes anyway (mint, bind, cancel) or by the start's compaction, so a read-only
 verb (STATUS, a replay, LEASE-OPEN's check) never appends and so can never poison the store.
 
-The reader refuses any op it does not hold (a slot releasing a ticket is journaled by the code that builds it, 3c-7,
-with the reader that holds it).
+The reader refuses any op it does not hold. A `bind` line with no `slot` (the 3c-5 form) binds a ticket no sync can
+release: it stays bound, holding its place under `max_open_tickets`, until a restart that finds its session gone (H8)
+[judged by 3c-7, 10-25, against `services/`: no CONTROL program exists before 3c-9, so no installed store wrote one].
+
+The pool (S1 3c-7, CONTRACT §3.5 Pool): :meth:`TicketStore.mint` refuses `no-free-slot:<class>` when (the free slots
+CONTROL's mirror counts for the class) - (the OPEN UNBOUND tickets of that class) - (1 for egress: the operator's) is not
+above 0, read under the store's lock with the ceiling checks, so two mints never both take the last free slot;
+:meth:`TicketStore.pool_free` is that same count for `POOL`.
 
 Runs on the root interpreter (3.9)."""
 from __future__ import annotations
@@ -62,12 +70,13 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional
+from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
 from levain.slot import Refused
-from levain.slot.grammar import SESSION_RE
+from levain.slot.grammar import INDEX_SPACE, SESSION_RE
+from levain.slot.runtime_grammar import _verifier_steps
 
 JOURNAL = "tickets.jsonl"
 CEILING_FORMAT = "levain-dispatch-ceiling/1"
@@ -91,6 +100,11 @@ _ROUTE = re.compile(r"[a-z0-9-]{1,48}")
 #: DECISION: a job id and a model name take the text form CONTROL already uses for names it records.
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}")
 _DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+#: CONTRACT §3.5 Pool: the slot states that end a lease at the same `lease_seq` (RELEASE).
+LEASE_OVER = frozenset({"reusable", "retired"})
+#: the slot classes and the highest index a `bind` line's slot may carry (the §1.1 index space).
+SLOT_CLASSES = ("egress", "none")
+SLOT_INDEX_MAX = INDEX_SPACE - 1
 #: head ruling H1: a run id is `r-` + 16 lower-case hex digits, CONTROL's to mint.
 RUN_ID_RE = re.compile(r"r-[0-9a-f]{16}")
 #: the session kind and class a ticket kind renders as (CONTRACT §3.5 table, "renders as").
@@ -172,7 +186,10 @@ def check_facts(args: Mapping[str, object]) -> Dict[str, object]:
         try:
             if type(steps) is not list or len(canon.canonical_bytes(steps)) > VERIFIER_STEPS_MAX:
                 raise _field("verifier_steps")
-        except (ContractError, TypeError, ValueError, RecursionError):
+            # 3c-7 fix (codex r1 HIGH 1): the §5.6 shape alloc's `ticket_facts` parses with, so no ticket binds whose
+            # facts root's alloc write would then refuse
+            _verifier_steps(steps)
+        except (ContractError, TypeError, ValueError, RecursionError, Refused):
             raise _field("verifier_steps") from None
         facts["verifier_steps"] = steps
         for k in ("input_bundle_digest", "driver_input_digest"):
@@ -249,6 +266,19 @@ class Ticket:
     state: str = UNBOUND
     session: Optional[str] = None
     run_id: str = ""
+    #: the slot lease a BOUND ticket is bound to: (class, index, lease_seq) (3c-7), or None (a 3c-5 `bind` line)
+    slot: Optional[Tuple[str, int, int]] = None
+
+
+def check_slot(value: object) -> Tuple[str, int, int]:
+    """A binding's slot `(class, index, lease_seq)`, each checked; `bad-value` otherwise."""
+    if not isinstance(value, tuple) or len(value) != 3:
+        raise Refused("bad-value", "slot binding")
+    cls, index, seq = value
+    if cls not in SLOT_CLASSES or type(index) is not int or not 0 <= index <= SLOT_INDEX_MAX \
+            or type(seq) is not int or not 0 <= seq <= JSON_INT_MAX:
+        raise Refused("bad-value", "slot binding")
+    return cls, index, seq
 
 
 def _inconsistent(detail: str) -> Refused:
@@ -346,7 +376,7 @@ class TicketStore:
                 if has_session is not None:
                     for t in self._by_ticket.values():
                         if t.state == BOUND and t.session is not None and not has_session(t.session):
-                            t.state, t.session = UNBOUND, None
+                            t.state, t.session, t.slot = UNBOUND, None, None
                 now_ms = self._now_ms()
                 for t in self._by_ticket.values():
                     if self._due(t, now_ms):
@@ -446,12 +476,28 @@ class TicketStore:
                     if t.state != UNBOUND:
                         # CONTROL binds only an unbound ticket, under the store's lock, journaled before it answers
                         raise _inconsistent(f"a bind line names a ticket already {t.state}")
-                    t.state, t.session = BOUND, session
+                    slot = None
+                    if "slot" in obj or "lease_seq" in obj:
+                        # the key set first (fix r1, complement 1): `lease_seq` without `slot` is named here
+                        if set(obj) != {"op", "ticket", "session", "slot", "lease_seq"}:
+                            raise _inconsistent("a bind line's slot is malformed")
+                        where = obj["slot"]
+                        if not isinstance(where, dict) or set(where) != {"class", "index"}:
+                            raise _inconsistent("a bind line's slot is malformed")
+                        slot = check_slot((where["class"], where["index"], obj["lease_seq"]))
+                    elif set(obj) != {"op", "ticket", "session"}:
+                        raise _inconsistent("a bind line's fields are not a bind's")
+                    t.state, t.session, t.slot = BOUND, session, slot
                 elif op == "unbind":
                     t = by_ticket.get(obj["ticket"])
                     if t is None or t.state != BOUND or t.session != obj["session"]:
                         raise _inconsistent("an unbind line names no ticket bound to its session")
-                    t.state, t.session = UNBOUND, None
+                    t.state, t.session, t.slot = UNBOUND, None, None
+                elif op == "release":
+                    t = by_ticket.get(obj["ticket"])
+                    if t is None or t.state != BOUND or t.session != obj["session"]:
+                        raise _inconsistent("a release line names no ticket bound to its session")
+                    t.state = RELEASED
                 elif op in ("cancel", "expire"):
                     t = by_ticket.get(obj["ticket"])
                     if t is None:
@@ -523,7 +569,11 @@ class TicketStore:
 
     @staticmethod
     def _bind_line(t: Ticket) -> Dict[str, object]:
-        return {"op": "bind", "ticket": t.ticket, "session": t.session}
+        line: Dict[str, object] = {"op": "bind", "ticket": t.ticket, "session": t.session}
+        if t.slot is not None:
+            line["slot"] = {"class": t.slot[0], "index": t.slot[1]}
+            line["lease_seq"] = t.slot[2]
+        return line
 
     def _live(self) -> None:
         """Every verb's first check (caller holds the lock): the journal is open and not poisoned."""
@@ -599,12 +649,15 @@ class TicketStore:
             raise Refused("attempt-closed", state)
         return t
 
-    def mint(self, attempt_id: str, facts: Mapping[str, object], new_ticket: Callable[[], str]) -> Ticket:
+    def mint(self, attempt_id: str, facts: Mapping[str, object], new_ticket: Callable[[], str], *,
+             slots_free: Optional[Callable[[str], int]] = None) -> Ticket:
         """A NEW attempt's mint, journaled before it answers: the ceiling read and checked against the rebuilt counts
         (the open tickets, the UTC day's mints), all under the store's lock, so two mints never both take the last
         place. An attempt the index already names answers by :meth:`replay`'s rule BEFORE the ceiling is read (fix 2,
         codex 3: a same-attempt retry that raced the first mint gets the first ticket, whatever the ceiling now says),
-        and again under the lock after it."""
+        and again under the lock after it. ``slots_free(class)``: the free slots CONTROL's mirror counts for a class
+        (3c-7); given, the mint is refused ``no-free-slot:<class>`` after the ceiling checks when :meth:`_free` is not
+        above 0 (CONTROL always passes it; None is this store's own tests')."""
         digest = request_digest(facts)
         with self.lock:
             self._live()                          # a poisoned store answers that before the ceiling is read
@@ -626,6 +679,10 @@ class TicketStore:
                 raise Refused("ticket-ceiling:max_open_tickets")
             if sum(1 for t in self._by_ticket.values() if t.day == day and t.facts) >= ceiling.max_runs_per_day:
                 raise Refused("ticket-ceiling:max_runs_per_day")
+            if slots_free is not None:
+                cls = RENDERS_AS[str(facts["kind"])][1]
+                if self._free(cls, slots_free) <= 0:
+                    raise Refused(f"no-free-slot:{cls}", "no free slot the mirror shows for another ticket")
             runs = {x.run_id for x in self._by_ticket.values()}
             run_id = new_run_id()
             while run_id in runs:
@@ -634,6 +691,42 @@ class TicketStore:
             self._append(self._mint_line(t))
             self._by_attempt[attempt_id] = self._by_ticket[t.ticket] = t
             return t
+
+    def _free(self, cls: str, slots_free: Callable[[str], int]) -> int:
+        """§3.5 Pool: the mirror's free slots of ``cls`` - this class's OPEN UNBOUND tickets (the derived state:
+        one past V16 holds nothing) - 1 for egress (the operator's slot). Caller holds the lock."""
+        unbound = sum(1 for t in self._by_ticket.values()
+                      if t.facts and RENDERS_AS[str(t.facts["kind"])][1] == cls and self._state(t) == UNBOUND)
+        return slots_free(cls) - unbound - (1 if cls == "egress" else 0)
+
+    def pool_free(self, slots_free: Callable[[str], int]) -> Dict[str, int]:
+        """``POOL``'s answer: :meth:`_free` for each class, the count the mint refuses at (DECISION: unclamped, so a
+        count below 0 shows how far the open tickets are past the free slots)."""
+        with self.lock:
+            self._live()          # fix r1 (codex 3): a poisoned journal answers no count from memory
+            return {"egress_free": self._free("egress", slots_free), "none_free": self._free("none", slots_free)}
+
+    def release_ended(self, entries: Mapping[Tuple[str, int], Tuple[int, str]]) -> List[str]:
+        """§3.5 RELEASE, for one ``SLOT-SYNC``: ``entries`` maps (class, index) -> (lease_seq, state) as that sync
+        reported it. Every BOUND ticket whose slot's entry has a GREATER ``lease_seq``, or the same one in state
+        ``reusable`` or ``retired``, is RELEASED, journaled (``release``) before memory moves, so a release survives any
+        states the syncs skipped and the restart rebuild counts it. Returns the released tickets' sessions. A ticket
+        bound with no slot (a 3c-5 ``bind`` line) is never released here. A failed append poisons the store
+        (:meth:`_append`) and stops the loop: what it did not journal stays bound for the next sync."""
+        out: List[str] = []
+        with self.lock:
+            self._live()
+            for t in list(self._by_ticket.values()):
+                if t.state != BOUND or t.slot is None or t.session is None:
+                    continue
+                cls, index, seq = t.slot
+                e = entries.get((cls, index))
+                if e is None or not (e[0] > seq or (e[0] == seq and e[1] in LEASE_OVER)):
+                    continue
+                self._append({"op": "release", "ticket": t.ticket, "session": t.session})
+                t.state = RELEASED
+                out.append(t.session)
+        return out
 
     def holdable(self, ticket: str) -> Ticket:
         """`LEASE-OPEN {ticket}`'s check: a minted ticket that is still UNBOUND (`ticket-unknown` for one never minted,
@@ -654,20 +747,24 @@ class TicketStore:
             raise Refused("attempt-closed", state)
         return t
 
-    def bind(self, ticket: str, session: str) -> Ticket:
-        """`ATTACH` of a ticket-bound lease: the UNBOUND ticket bound to `session`, journaled before it answers (the
-        refusals are :meth:`holdable`'s: a ticket cancelled or expired since its `LEASE-OPEN` is not bound)."""
+    def bind(self, ticket: str, session: str, slot: Optional[Tuple[str, int, int]] = None) -> Ticket:
+        """`ATTACH` of a ticket-bound lease: the UNBOUND ticket bound to `session` and to the slot lease `slot`
+        `(class, index, lease_seq)` it holds (§3.5 BINDING; CONTROL's ATTACH always passes it), journaled before it
+        answers (the refusals are :meth:`holdable`'s: a ticket cancelled or expired since its `LEASE-OPEN` is not
+        bound)."""
         if type(session) is not str or not SESSION_RE.fullmatch(session):
             raise Refused("bad-token", "session")
+        if slot is not None:
+            slot = check_slot(slot)
         with self.lock:
             self._live()
             self._expire_due()
             t = self._unbound(ticket)
-            t.session = session
+            t.session, t.slot = session, slot
             try:
                 self._append(self._bind_line(t))
             except BaseException:
-                t.session = None
+                t.session = t.slot = None
                 raise
             t.state = BOUND
             return t
@@ -683,7 +780,7 @@ class TicketStore:
             if t is None or t.state != BOUND or t.session != session:
                 return
             self._append({"op": "unbind", "ticket": ticket, "session": session})
-            t.state, t.session = UNBOUND, None
+            t.state, t.session, t.slot = UNBOUND, None, None
 
     def bound(self, session: str) -> Optional[Ticket]:
         """The ticket BOUND to `session`, or None (the run `TOKEN-RESOLVE`, `MINT` and `QUEUE-RESOLVE` answer from)."""
@@ -753,6 +850,6 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[os.write(fd, view):]
 
 
-__all__ = ["BOUND", "CANCELLED", "CEILING_FORMAT", "Ceiling", "EXPIRED", "JOURNAL", "KINDS", "MINT_FIELDS", "RENDERS_AS",
-           "RUN_ID_RE", "TICKET_UNUSED_S",
+__all__ = ["BOUND", "CANCELLED", "CEILING_FORMAT", "Ceiling", "EXPIRED", "JOURNAL", "KINDS", "LEASE_OVER", "MINT_FIELDS",
+           "RELEASED", "RENDERS_AS", "RUN_ID_RE", "TICKET_UNUSED_S", "check_slot",
            "Ticket", "TicketStore", "UNBOUND", "check_attempt_id", "check_facts", "read_ceiling", "request_digest"]

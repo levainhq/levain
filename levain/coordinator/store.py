@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Any
 
 from levain import unshowable
-from levain.autonomic.durable_sqlite import read_transaction, write_transaction
+from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.contracts.canon import canonical, canonical_bytes
@@ -170,6 +170,38 @@ SCHEMA: tuple[str, ...] = (
 def next_gseq(conn: sqlite3.Connection, now: str) -> int:
     """The next number of the store-wide sequence, taken inside the caller's writing transaction."""
     return conn.execute("INSERT INTO gseq (at) VALUES (?)", (now,)).lastrowid
+
+
+def _replies_gseq(conn: sqlite3.Connection) -> None:
+    """The additive migration (CH-D1 §2.8): ``replies`` gains ``gseq``, NULL on every reply written before it, so the
+    chat timeline can merge a reply into the store-wide order. SQLite adds no UNIQUE column, so uniqueness is an index,
+    and a replacing INSERT that reuses a gseq is refused by its own trigger (an INSERT OR REPLACE on a unique index
+    deletes the other row without firing a delete trigger). Runs in the opener's schema transaction."""
+    if "gseq" not in {r[1] for r in conn.execute("PRAGMA table_info(replies)")}:
+        conn.execute("ALTER TABLE replies ADD COLUMN gseq INTEGER")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS replies_gseq ON replies (gseq)")
+    conn.execute("CREATE TRIGGER IF NOT EXISTS replies_gseq_no_replace BEFORE INSERT ON replies WHEN NEW.gseq IS NOT "
+                 "NULL AND EXISTS (SELECT 1 FROM replies WHERE gseq = NEW.gseq) "
+                 "BEGIN SELECT RAISE(ABORT, 'a reply is never replaced'); END")
+
+
+_CREATES = re.compile(r"CREATE (?:UNIQUE )?(?:TABLE|INDEX|TRIGGER|VIEW) IF NOT EXISTS (\w+)")
+
+
+def _names(conn: sqlite3.Connection) -> set[str]:
+    return {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+
+
+def schema_present(conn: sqlite3.Connection, statements: Iterable[str]) -> bool:
+    """Whether every object ``statements`` creates is already in the file, by name: a reader that finds them all runs
+    none of them, so it never takes the write lock to create nothing. False for a statement this cannot name. A
+    present object is not re-checked against its statement, as ``CREATE ... IF NOT EXISTS`` itself never is."""
+    have = _names(conn)
+    for stmt in statements:
+        m = _CREATES.match(stmt)
+        if m is None or m.group(1) not in have:
+            return False
+    return True
 
 
 def members_sha256(members: Iterable[str]) -> str:
@@ -326,20 +358,24 @@ class CoordStore:
         self._woken: dict[str, str] = {}
 
     # --- store ---------------------------------------------------------------------------------------------------
+    def _statements(self) -> tuple[str, ...]:
+        from levain.coordinator.lease import LEASE_SCHEMA
+        from levain.coordinator.first_reader import FIRST_READER_SCHEMA
+        from levain.coordinator.review import REVIEW_SCHEMA
+        from levain.coordinator.teamdrafts import DRAFT_SCHEMA
+
+        # the lease is checked by every opener's coordinator writes, so its tables are every opener's
+        return (*self._SCHEMA, *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA)
+
     def _connect(self) -> sqlite3.Connection:
         conn = self._jobs._connect()
         if not self._ready:
-            from levain.coordinator.lease import LEASE_SCHEMA
-            from levain.coordinator.first_reader import FIRST_READER_SCHEMA
-            from levain.coordinator.review import REVIEW_SCHEMA
-            from levain.coordinator.teamdrafts import DRAFT_SCHEMA
-
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
-                    # the lease is checked by every opener's coordinator writes, so its tables are every opener's
-                    for stmt in (*self._SCHEMA, *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA):
+                    for stmt in self._statements():
                         conn.execute(stmt)
+                    _replies_gseq(conn)
                     conn.execute("COMMIT")
                 except BaseException:
                     _rollback(conn)
@@ -349,6 +385,36 @@ class CoordStore:
                 raise
             self._ready = True
         return conn
+
+    def _read_connect(self) -> sqlite3.Connection:
+        """A connection for a READ that takes no write lock (CH-D1a L3 r1): when every object of this opener's schema
+        and the dispatch store's is already in the file, at the dispatch store's current format, nothing is created,
+        so a reader (``levain chat show``, a composer's poll, each a fresh store) never waits on the coordinator's
+        writer. A file missing any of it is made by :meth:`_connect`, under the lock: a first use."""
+        if self._ready or not self.path.exists():
+            return self._connect()
+        self._jobs._check_directory()
+        conn = open_durable(self.path)
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            current = self._schema_current(conn)
+        except BaseException:
+            conn.close()
+            raise
+        if current:
+            return conn
+        conn.close()
+        return self._connect()
+
+    def _schema_current(self, conn: sqlite3.Connection) -> bool:
+        from levain.dispatch.jobs import _SCHEMA as JOB_SCHEMA, FORMAT
+
+        if not schema_present(conn, (*JOB_SCHEMA, *self._statements())) or "gseq" not in {
+                r[1] for r in conn.execute("PRAGMA table_info(replies)")} \
+                or not {"replies_gseq", "replies_gseq_no_replace"} <= _names(conn):
+            return False
+        meta = dict(conn.execute("SELECT key, value FROM meta WHERE key IN ('format', 'store_id')").fetchall())
+        return meta.get("format") == FORMAT and "store_id" in meta
 
     @contextmanager
     def _write(self, by: str | None = None, token: object = None) -> Iterator[tuple[sqlite3.Connection, str]]:
@@ -1097,9 +1163,10 @@ class CoordStore:
     def _reply(conn: sqlite3.Connection, thread_id: str | None, kind: str, ref_store: str, ref_id: str,
                body: dict[str, Any], now: str) -> str:
         reply_id = "rp-" + secrets.token_hex(16)
-        conn.execute("INSERT INTO replies (reply_id, thread_id, kind, ref_store, ref_id, body, at) "
-                     "VALUES (?, ?, ?, ?, ?, ?, ?)", (reply_id, thread_id, kind, ref_store, ref_id, canonical(body),
-                                                      now))
+        # every reply takes its place in the store-wide order (CH-D1 §2.8): the chat timeline merges it by gseq
+        conn.execute("INSERT INTO replies (reply_id, thread_id, kind, ref_store, ref_id, body, at, gseq) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (reply_id, thread_id, kind, ref_store, ref_id, canonical(body),
+                                                         now, next_gseq(conn, now)))
         return reply_id
 
     def _drop_receipt(self, conn: sqlite3.Connection, drop_id: str, stage: str, now: str) -> None:

@@ -45,6 +45,10 @@ open compares every `chat_egress_events` object in `sqlite_master` (table, trigg
 `EGRESS_SCHEMA` makes, and refuses the store with `EgressRecordError` on any difference: a store made by another
 revision is refused at open, never half-enforced.
 
+READ-ONLY READER: `EgressReader` is the cockpit card's view of one dispatch store (CH-D2 S7, the head's ruling 1 of
+1025+6). Every read opens `dispatch.db` with sqlite `mode=ro`: it never creates the file, the table or its triggers,
+and never writes. It reads one request's rows as `settled` does, and whether that request is still IN FLIGHT.
+
 The schema lives here, not in `CHAT_SCHEMA` (plan ruling P-7): `CHAT_SCHEMA` (`levain/coordinator/chat.py`) is on the
 unmerged CH-D1a branch, not on this base. `EGRESS_SCHEMA` is one tuple so it folds into it whole.
 """
@@ -54,6 +58,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
+from pathlib import Path
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -68,7 +73,8 @@ from levain.contracts.canon import canonical
 from levain.coordinator.store import _append_only, _in, next_gseq
 
 __all__ = ["ATTEMPT", "Attach", "Attempt", "CONTENT_TYPE_CLASSES", "CT_ABSENT", "CT_ADVERTISEMENT", "CT_OTHER",
-           "EGRESS_SCHEMA", "ENDED", "EgressRecordError", "EgressRecords", "EgressRow", "FAILED", "KINDS", "OUTCOME"]
+           "EGRESS_SCHEMA", "ENDED", "EgressReader", "EgressRecordError", "EgressRecords", "EgressRow", "FAILED", "KINDS",
+           "OUTCOME"]
 
 log = logging.getLogger(__name__)
 
@@ -266,6 +272,22 @@ def _expected_objects() -> list[tuple[str, str, str | None]]:
     return _EXPECTED
 
 
+def _settled(got: Sequence[EgressRow]) -> Settled | None:
+    """One request's rows read through `lifecycle.settle` (None: no row), the FAILED mark's effect as `failed_effect`."""
+    if not got:
+        return None
+    attempt = next((r for r in got if r.kind == ATTEMPT), None)
+    mark = next((r for r in got if r.kind == FAILED), None)
+    return settle(None if attempt is None else attempt.verdict, any(r.kind == OUTCOME for r in got),
+                  any(r.kind == ENDED for r in got),
+                  failed_effect=None if mark is None or mark.failed_effect is None else Effect(mark.failed_effect))
+
+
+_SELECT = f"SELECT {', '.join(_COLUMNS)} FROM chat_egress_events WHERE launch_id = ?"
+#: the launch states (`levain.coordinator.lease.LAUNCH_KINDS`) a launch is still running in
+_LIVE_LAUNCH = ("pending", "active")
+
+
 class EgressRecords:
     """`chat_egress_events` beside a coordinator store's tables, in its `dispatch.db`. `opener` is that store (any
     object with its `_connect()` and `_stamp()`, a `CoordStore` in use): this class adds its table to the file the
@@ -418,16 +440,51 @@ class EgressRecords:
 
         It reads one request by its id, so it never sees the `audit-missing` deny, whose `request_id` is NULL: that
         row is visible only through `rows(launch_id)`."""
-        got = self.rows(launch_id, request_id)
-        if not got:
-            return None
-        attempt = next((r for r in got if r.kind == ATTEMPT), None)
-        mark = next((r for r in got if r.kind == FAILED), None)
-        return settle(None if attempt is None else attempt.verdict, any(r.kind == OUTCOME for r in got),
-                      any(r.kind == ENDED for r in got),
-                      failed_effect=None if mark is None or mark.failed_effect is None else Effect(mark.failed_effect))
+        return _settled(self.rows(launch_id, request_id))
 
     def duplicate_rows(self, launch_id: str) -> int:
         """R15-28-5: the refused duplicate rows of `launch_id` this object counted (K1 surfaces it, R15-29-3)."""
         with self._lock:
             return self._duplicates.get(launch_id, 0)
+
+
+class EgressReader:
+    """`chat_egress_events` of `<directory>/dispatch.db`, read through sqlite `mode=ro` (the cockpit's consent route).
+    No file, or no table yet: no rows. A table or trigger that differs from `EGRESS_SCHEMA`'s raises
+    `EgressRecordError`, as `EgressRecords` refuses it at open; a file that cannot be read raises sqlite3's error."""
+
+    def __init__(self, directory: Path | str) -> None:
+        self.path = Path(directory) / "dispatch.db"
+
+    def reading(self, launch_id: str, request_id: str) -> tuple[Settled | None, bool]:
+        """One request, in one read snapshot: its rows as `EgressRecords.settled` reads them, and whether it is IN
+        FLIGHT. In flight is an ALLOW attempt with no end row and no FAILED mark whose launch's latest event is
+        pending or active: a request allowed and not yet answered. The launch's ended, failed or expired event is
+        the stop that makes the same rows AMBIGUOUS; so is a launch with no event to read."""
+        if not self.path.is_file():
+            return None, False
+        conn = sqlite3.connect(self.path.absolute().as_uri() + "?mode=ro", uri=True, timeout=2.0,
+                               isolation_level=None)
+        try:
+            conn.execute("BEGIN")
+            try:
+                found = _schema_objects(conn)
+                if not found:
+                    return None, False
+                if found != _expected_objects():
+                    raise EgressRecordError("this store's chat_egress_events table or triggers differ from this "
+                                            "module's schema (another revision made them); refusing the store")
+                got = [_row(r) for r in conn.execute(_SELECT + " AND request_id = ? ORDER BY gseq",
+                                                     (launch_id, request_id))]
+                settled = _settled(got)
+                if settled is not Settled.AMBIGUOUS or any(r.kind == FAILED for r in got):
+                    return settled, False
+                has_events = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND "
+                                          "name = 'launch_events'").fetchone() is not None
+                last = conn.execute("SELECT kind FROM launch_events WHERE launch_id = ? ORDER BY seq DESC LIMIT 1",
+                                    (launch_id,)).fetchone() if has_events else None
+                return settled, last is not None and last[0] in _LIVE_LAUNCH
+            finally:
+                conn.execute("COMMIT")
+        finally:
+            conn.close()

@@ -148,3 +148,29 @@ def test_doctor_slot_every_printed_remedy_parses_in_the_real_cli(tmp_path: Path)
     assert any(hints)                      # the rig reached real remedy text
     assert not any("--agent" in h or "setup-isolation repair" in h or "setup-isolation replenish" in h
                    for h in hints)
+
+
+def _store_row(store: Path):
+    return doctor._check_slot_isolation(host="linux", store=store, free_bytes=lambda p: 100 << 30)[0]
+
+
+def test_doctor_slot_store_that_is_not_a_directory_fails_instead_of_reading_not_installed(tmp_path: Path):
+    dangling = tmp_path / "dangling"
+    os.symlink(tmp_path / "nowhere", dangling)           # is_dir() follows links: a dangling one looked absent
+    to_file = tmp_path / "tofile"
+    (tmp_path / "afile").write_text("x")
+    os.symlink(tmp_path / "afile", to_file)
+    regular = tmp_path / "regular"
+    regular.write_text("x")
+    for link in (dangling, to_file):
+        row = _store_row(link)
+        assert not row.ok and not row.neutral and "symbolic link" in row.detail
+    row = _store_row(regular)
+    assert not row.ok and not row.neutral and "is not a directory" in row.detail and str(regular) in row.detail
+
+
+def test_doctor_slot_absent_store_stays_neutral_and_real_store_is_unchanged(tmp_path: Path):
+    row = _store_row(tmp_path / "absent")
+    assert row.ok and row.neutral and "not installed" in row.detail
+    store = _store(tmp_path / "a", {"e1": "reusable"}, pool=(1, 0))
+    assert _rows(store)["agent slots"].ok

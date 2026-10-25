@@ -747,6 +747,10 @@ def _host() -> str:
     raise Refused("unsupported-host", sys.platform)
 
 
+# The elevator by absolute path: a bare name would run whatever ``sudo`` the operator's PATH finds first.
+SUDO = "/usr/bin/sudo"
+
+
 @dataclass(frozen=True)
 class Request:
     vendor: str                  # claude | codex
@@ -784,7 +788,7 @@ class Seams:
 
     def __post_init__(self) -> None:
         if self.helper is None:
-            self.helper = ("sudo", "-n", str(layout.runtime_helper_path(self.host)))   # type: ignore[arg-type]
+            self.helper = (SUDO, "-n", str(layout.runtime_helper_path(self.host)))   # type: ignore[arg-type]
         if self.control_socket is None:
             self.control_socket = layout.RUN[self.host] / "control" / "control.sock"   # type: ignore[index]
         if self.store is None:

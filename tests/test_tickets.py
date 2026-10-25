@@ -4,7 +4,8 @@
 on disk; `test_mint_waits_for_keys_reload_ack` also runs CONTROL through `control.serve` with keys as a child process.
 
 Binding (`LEASE-OPEN {ticket}`, `ATTACH`), `TOKEN-RESOLVE` `run` and keys' run side are session 2's; pool, release and
-`no-free-slot` are 3c-7's; verifier generations 3c-8's."""
+`no-free-slot` are 3c-7's (`tests/test_pool.py`; the rig here syncs free slots first, since an empty mirror admits no
+mint); verifier generations 3c-8's."""
 from __future__ import annotations
 
 import asyncio
@@ -46,6 +47,17 @@ def write_ceiling(L: Path, per_run: int = 5_000_000, open_: int = 4, per_day: in
     (L / "policy" / "dispatch_ceiling").chmod(0o644)                     # read_ceiling refuses g/o-write; not the umask's
 
 
+def sync_free(control, egress: int = 8, none: int = 2) -> None:
+    """S1 3c-7: root's `SLOT-SYNC` of `egress` + `none` reusable, dispatch-eligible slots at `rev` 0, so the pool
+    admits mints (CONTROL's mirror starts empty: no slot is free until a sync) and an ATTACH's mark (`slot_rev` >= 1)
+    lands over them."""
+    slots = [{"format": "levain-slot-state/1", "class": cls, "index": i, "rev": 0, "lease_seq": 0, "state": "reusable",
+              "dispatch_eligible": True, "changed_at": "2026-10-20T00:00:00Z"}
+             for cls, n in (("egress", egress), ("none", none)) for i in range(n)]
+    ans = control.handle(C.Conn(0), {"v": 1, "op": "SLOT-SYNC", "id": 1, "slots": slots})
+    assert ans == {"id": 1, "ok": True}, ans
+
+
 class Rig:
     """CONTROL over `st`'s lib root with a ticket store, generation 1 active, and keys attached stating it (no keys
     process: the attachment is CONTROL's record of what keys stated)."""
@@ -77,6 +89,7 @@ class Rig:
         self.control = C.Control(C.StateStore(self.sdir), OP_UID, dispatch_uid=DISPATCH_UID, keys_uid=KEYS_UID,
                                  routes=self.cr, tickets=self.tickets, clock=self.clock)
         self.control.start()
+        sync_free(self.control)
         if attach:
             self.attach(self.cr.head())
 
@@ -312,6 +325,7 @@ def test_mint_waits_for_keys_reload_ack(rig, keys_py, monkeypatch):
         loop = asyncio.get_running_loop()
         ct = R3.ControlThread(str(rig.st.L), routes_dir=rig.st.routes, dispatch_uid=DISPATCH_UID).start()
         try:
+            sync_free(ct.control)                                         # a restarted CONTROL's mirror is empty
             monkeypatch.setattr(C, "MINT_KEYS_WAIT_S", 0.2)
             seen["before_keys"] = ct.control.handle(C.Conn(DISPATCH_UID), req)
             monkeypatch.setattr(C, "MINT_KEYS_WAIT_S", 10.0)
@@ -420,7 +434,8 @@ def test_attach_binds_and_answers_ticket_facts(rig):
     facts = T.check_facts(mint_args())
     assert att == {"id": 1, "ok": True, "generation": 0, "ticket_facts": facts}
     assert "run_id" not in att["ticket_facts"] and one not in json.dumps(att)
-    assert rig.lines()[-1] == {"op": "bind", "ticket": one, "session": SESSION}
+    assert rig.lines()[-1] == {"op": "bind", "ticket": one, "session": SESSION, "slot": {"class": "egress", "index": 1},
+                               "lease_seq": 1}
     assert refused(rig.ask("RUN-TICKET-CANCEL", ticket=one)) == "ticket-bound"
     assert refused(rig.mint()) == "attempt-closed"                        # a bound attempt is no longer replayable
     assert refused(lease(rig, one)[1]) == "ticket-bound"
