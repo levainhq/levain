@@ -222,3 +222,9 @@ def test_cap_walls_from_a_real_launch_are_counted(make_origin, make_launch_) -> 
     r = report.build_from_files(L.records.rows(L.launch_id), L.events)
     assert r.cap_walls == 2 and r.decider_walls.get("card_cap") == 1 and r.decider_walls.get("body_cap") == 1, r.text()
     assert r.cards == {"body:denied": 1}, r.cards
+
+
+def test_a_decider_busy_row_is_a_cap_wall() -> None:
+    """The decider stores `decider_busy` bare (no `wall:` prefix): `_on_req` hands `_inline` the step name itself."""
+    r = report.build([_row(1, "decider_busy"), _row(2, "wall:card_cap")], [])
+    assert r.cap_walls == 2 and r.decider_walls == {"decider_busy": 1, "card_cap": 1}, r.text()

@@ -31,6 +31,7 @@ from levain.chat_egress.records import EgressRow
 #: `deciding_step` values of a request the decider stopped at one of its bounds, as it records them (a row exists for
 #: each: the audit-cap deny is owed outside the machine and has none). Pinned against a live launch in test_k1_report.
 CAP_STEPS = frozenset({"wall:card_cap", "wall:body_cap", "wall:body_readers", "wall:body_timeout", "decider_busy"})
+_BUSY_STEP = "decider_busy"
 
 _CRED_WALL = "wall:credential_in_query"
 _PATH_WALL = "wall:path"
@@ -154,7 +155,10 @@ def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows
         step = r.deciding_step or ""
         if step == "audit-missing":
             missing += 1
-        if step.startswith(_WALL_PREFIX):
+        if step == _BUSY_STEP:                # stored bare, no `wall:` prefix; it is a deny the decider decided
+            dwalls[step] += 1
+            cap += 1
+        elif step.startswith(_WALL_PREFIX):
             dwalls[step[len(_WALL_PREFIX):]] += 1
             if step == _CRED_WALL:
                 cred_walls += 1
