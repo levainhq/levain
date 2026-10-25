@@ -216,10 +216,11 @@ class Seams:
 
     def __post_init__(self) -> None:
         from levain.slot import layout
+        from levain.slot.supervisor import SUDO
 
         host = "darwin" if sys.platform == "darwin" else "linux"
         if self.helper is None:
-            self.helper = ("sudo", "-n", str(layout.runtime_helper_path(host)))   # type: ignore[arg-type]
+            self.helper = (SUDO, "-n", str(layout.runtime_helper_path(host)))   # type: ignore[arg-type]
         if self.store is None:
             self.store = layout.STORE[host]                                         # type: ignore[index]
 
