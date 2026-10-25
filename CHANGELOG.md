@@ -19,6 +19,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   from. It fails when the file is unusable and warns when the queue broker is not running.
 
 ### Fixed
+- **`levain doctor`'s hands check runs sudo by its absolute path, like every other place Levain runs sudo.** The
+  path now has one home (`/usr/bin/sudo`), and when sudo is not there the check says so instead of reporting a
+  workspace problem.
 - **A Claude Code or Codex file edit inside the Levain home now asks for consent.** An edit to Levain's own state (for
   example the autonomic binding store) is agent config, matching what the confinement floor already denies. With
   `LEVAIN_HOME` set to a directory Levain cannot protect whole (`/tmp`, a top-level directory, or one that holds your
