@@ -57,7 +57,7 @@ def _churn(port: int, origin_port: int, stop: threading.Event, counts: list[int]
         finally:
             s.close()
         counts[0] += 1
-        time.sleep(0.02)        # ~200 connections/s over four threads: well inside the ephemeral port range per minute
+        time.sleep(0.02)        # a rate cap: an unthrottled loop exhausted this Mac's ephemeral ports (EADDRNOTAVAIL, TIME_WAIT)
 
 
 def test_continuous_churn_is_bounded_and_a_valid_request_still_completes(make_origin, make_launch_) -> None:

@@ -28,8 +28,9 @@ from dataclasses import dataclass, field
 from levain.chat_egress import wire
 from levain.chat_egress.records import EgressRow
 
-#: `deciding_step` values the decider gives a request stopped by one of its bounds (decider.py's `_deny` calls).
-CAP_STEPS = frozenset({"wall:card_cap", "wall:body_cap", "wall:body_readers", "wall:body_timeout", "wall:audit_cap"})
+#: `deciding_step` values of a request the decider stopped at one of its bounds, as it records them (a row exists for
+#: each: the audit-cap deny is owed outside the machine and has none). Pinned against a live launch in test_k1_report.
+CAP_STEPS = frozenset({"wall:card_cap", "wall:body_cap", "wall:body_readers", "wall:body_timeout", "decider_busy"})
 
 _CRED_WALL = "wall:credential_in_query"
 _PATH_WALL = "wall:path"

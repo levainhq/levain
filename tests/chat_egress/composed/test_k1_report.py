@@ -200,3 +200,25 @@ def test_path_and_credential_walls_from_a_real_launch_reach_the_report(make_orig
     assert st1 == 200 and st2 == 403
     assert r.credential_in_query_walls == 1
     assert head.startswith(b"HTTP/1.1 403") and r.path_walls == 1, r.text()
+
+
+@pytest.mark.chat_egress_srt
+def test_cap_walls_from_a_real_launch_are_counted(make_origin, make_launch_) -> None:
+    """The card cap and the body cap are rows with the step names `report.CAP_STEPS` lists."""
+    from levain.chat_egress import decider as dm
+    import threading
+    origin = make_origin()
+    L = make_launch_(origin, limits=dm.Limits(card_poll_s=0.1, max_cards=1, card_body_cap=1024, stop_drain_s=2.0))
+    t = threading.Thread(target=lambda: L.request("POST", "/held", body=b"x", timeout=60), daemon=True)
+    t.start()
+    end = time.monotonic() + 10
+    while not L.desk.filed and time.monotonic() < end:
+        time.sleep(0.05)
+    assert L.request("POST", "/second", body=b"y")[0] == 503                  # card_cap
+    L.desk.answer["card-1"] = "denied"
+    t.join(30)
+    assert L.request("POST", "/big", body=b"z" * 5000)[0] == 503              # body_cap
+    assert L.stop() == 0
+    r = report.build_from_files(L.records.rows(L.launch_id), L.events)
+    assert r.cap_walls == 2 and r.decider_walls.get("card_cap") == 1 and r.decider_walls.get("body_cap") == 1, r.text()
+    assert r.cards == {"body:denied": 1}, r.cards
