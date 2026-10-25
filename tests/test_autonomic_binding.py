@@ -407,7 +407,7 @@ def test_replace_atomic_adds_new_and_revokes_old(tmp_path):
     read = s.record_fire(old.binding_id, clean=True, fired_at=FIRED_AT)
     promoted = make_binding(posture=Posture.ON_LOOP)   # a re-ratification = different core = new id
     assert promoted.binding_id != old.binding_id
-    result = s.replace_atomic(read, promoted)
+    result = s.replace_atomic(read, promoted, coverage=lambda b, rung: True)  # a policy covers it (14b)
     assert result and result.reason == "replaced"
     old_got = s.get(old.binding_id)
     assert old_got is not None and old_got.status is BindingStatus.REVOKED   # superseded
@@ -521,7 +521,7 @@ def test_the_validator_runs_outside_the_store_lock(tmp_path):
     s = BindingStore(tmp_path / "b", validator=probe)
     a = make_binding(posture=Posture.ON_LOOP)
     s.add(a)
-    assert s.replace_atomic(a, make_binding(posture=Posture.ABOVE_LOOP))
+    assert s.replace_atomic(a, make_binding(posture=Posture.ABOVE_LOOP), coverage=lambda b, rung: True)
     assert probe.held == [False, False]
 
 

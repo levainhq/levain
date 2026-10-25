@@ -236,7 +236,7 @@ def test_replace_atomic_promotion_revokes_old_persists_new(tmp_path):
     p = _propose(src)
     promoted = p.build_promoted(status=BindingStatus.ACTIVE, created_at="2026-06-30T18:00:00")
     assert BindingStore.is_fireable(promoted)                  # the pre-persist defense-in-depth assert
-    assert store.replace_atomic(p.source, promoted)
+    assert store.replace_atomic(p.source, promoted, coverage=lambda b, rung: True)  # a policy covers it (14b)
     # old REVOKED, new ACTIVE + fireable + fresh evidence.
     assert store.get(src.binding_id).status is BindingStatus.REVOKED
     new = store.get(promoted.binding_id)
@@ -385,11 +385,13 @@ def test_replace_atomic_precondition_aborts_on_change(tmp_path):
     p = _propose(src)
     promoted = p.build_promoted(status=BindingStatus.ACTIVE, created_at="2026-06-30T18:00:00")
     # a precondition that always fails → abort, write NOTHING, old untouched.
-    assert not store.replace_atomic(p.source, promoted, precondition=lambda cur: False)
+    assert not store.replace_atomic(p.source, promoted, precondition=lambda cur: False,
+                                    coverage=lambda b, rung: True)
     assert store.get(src.binding_id).status is BindingStatus.ACTIVE   # NOT revoked
     assert store.get(promoted.binding_id) is None                     # NOT persisted
     # a precondition that passes → applies.
-    assert store.replace_atomic(p.source, promoted, precondition=lambda cur: True)
+    assert store.replace_atomic(p.source, promoted, precondition=lambda cur: True,
+                                coverage=lambda b, rung: True)
     assert store.get(src.binding_id).status is BindingStatus.REVOKED
     assert store.get(promoted.binding_id).status is BindingStatus.ACTIVE
 
