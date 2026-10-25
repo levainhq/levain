@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from levain.contracts import canon
+from levain.slot import Refused
 from levain.slot import control as C
 from levain.slot import events as EV
 from levain.slot import records as R
@@ -233,3 +234,43 @@ def test_a_cancel_byte_ends_a_stream_blocked_on_a_full_buffer(erig):
         c.close()
     finally:
         served.stop()
+
+
+# ---- item 7: an owed event carried over an event-less write ------------------------------------------------------------
+
+def test_an_eof_write_over_an_owed_generation_carries_its_event(erig):
+    """The RETAINED generation's append fails (owed); the lease then ends, and its `lease_live:false` write (the revoke
+    path, never fenced, `event_kind: none` on its own) lands over it. That write now carries the owed event's kind, so
+    the RETAINED event is owed by the new generation and the restart's repair appends it: it is never forgotten."""
+    from tests.test_tickets import d_attach_claims, lease, ticket_of
+
+    ticket = ticket_of(erig.mint())
+    conn, lo = lease(erig, ticket)
+    att = root(erig, "ATTACH", lease_nonce=lo["lease_nonce"], sudo_uid=DISPATCH_UID, session=SESSION,
+               claims=d_attach_claims(ticket))
+    assert att["ok"], att
+    cas(erig, R.ALLOCATED, R.RENDERING)
+    assert root(erig, "REVOKE", session=SESSION)["ok"]
+    for frm, to in [(R.REVOKED, R.FROZEN), (R.FROZEN, R.DEAD), (R.DEAD, R.CREDENTIAL_PARKED)]:
+        cas(erig, frm, to)
+    real = erig.events.append
+    armed = {"on": True}
+
+    def failing(ev):
+        if armed["on"] and ev.get("kind") != "pool":
+            raise Refused("events-unavailable", "injected")
+        return real(ev)
+
+    erig.events.append = failing
+    cas(erig, R.CREDENTIAL_PARKED, R.RETAINED)
+    rec = erig.control.store.get(SESSION)
+    assert rec.lease_live and erig.control.owed_events() == {SESSION: rec.generation}
+    erig.control._revoke_after_eof(SESSION)                             # the lease's EOF: lease_live:false
+    after = erig.control.store.get(SESSION)
+    assert not after.lease_live and after.generation == rec.generation + 1
+    assert erig.control.owed_events() == {SESSION: after.generation}
+    armed["on"] = False
+    erig.restart()
+    last = erig.session_events()[-1]
+    assert (last["kind"], last["state"], last["generation"]) == ("state", R.RETAINED, after.generation)
+    assert erig.control.owed_events() == {}

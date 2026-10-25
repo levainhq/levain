@@ -888,8 +888,10 @@ class Control:
     failed (or whose record write failed past its rename) is OWED: the session's next write first appends it from the
     record, and while that fails the write is refused ``events-unavailable``, so no later generation overwrites one
     whose event is unwritten. The revoke path is the exception (DECISION): ``lease_live:false`` and a move into REVOKED
-    still land on an owed session, so a broken journal never keeps a session live; the REVOKED generation is then the
-    one owed, and the generation it overwrote never gets its event. CONTROL's start re-emits, from each record, the
+    still land on an owed session, so a broken journal never keeps a session live. The ``lease_live:false`` write
+    carries the owed generation's ``event_kind``, so the generation it makes bears that event (appended with it, or owed
+    and repaired from it: L3 r1 fix 7); a move
+    into REVOKED makes the REVOKED generation the one owed, and the generation it overwrote never gets its event. CONTROL's start re-emits, from each record, the
     event its generation is owed by its stored ``event_kind`` (PURGED records skipped)."""
 
     def __init__(self, store: StateStore, operator_uid: int, *,
@@ -1114,7 +1116,10 @@ class Control:
         """``rec`` with ``changes`` at ``generation + 1``, durably, then its event (caller holds the session lock).
         An owed event of ``rec``'s generation is appended first (the class docstring's fence)."""
         revoke_path = changes.get("state") == R.REVOKED or set(changes) == {"lease_live", "event_kind"}
-        self._pay_owed(rec, revoke_path=revoke_path)
+        if self._pay_owed(rec, revoke_path=revoke_path) and changes.get("event_kind") == "none":
+            # L3 r1 fix 7 (complement 1): an event-less revoke-path write over an owed generation carries that
+            # generation's kind, so its event is owed by the new generation (and repaired from it), never forgotten
+            changes["event_kind"] = rec.event_kind
         new = replace(rec, generation=rec.generation + 1, updated_at=R.timestamp(self._clock()), **changes)
         self._put(new)
         return new
@@ -1168,24 +1173,26 @@ class Control:
         with self._mu:
             self._owed.pop(rec.session, None)
 
-    def _pay_owed(self, rec: R.SessionState, *, revoke_path: bool) -> None:
+    def _pay_owed(self, rec: R.SessionState, *, revoke_path: bool) -> bool:
         """Before a write over ``rec`` (caller holds the session lock): an owed event of ``rec``'s own generation is
-        appended now; while it cannot be, the write is refused ``events-unavailable`` unless it is on the revoke path.
-        An owed generation ``rec`` is no longer at (a reload moved the record) is forgotten."""
+        appended now; while it cannot be, the write is refused ``events-unavailable`` unless it is on the revoke path,
+        which goes on with True (the event still owed). An owed generation ``rec`` is no longer at (a reload moved the
+        record) is forgotten."""
         with self._mu:
             owed = self._owed.get(rec.session)
         if owed is None:
-            return
+            return False
         if owed != rec.generation:
             with self._mu:
                 if self._owed.get(rec.session) == owed:
                     del self._owed[rec.session]
-            return
+            return False
         self._emit(rec)
         with self._mu:
             still = self._owed.get(rec.session) == rec.generation
         if still and not revoke_path:
             raise Refused("events-unavailable", f"{rec.session}: generation {rec.generation}'s event is unwritten")
+        return still
 
     def _repair_events(self) -> None:
         """§3.6's start pass: every non-PURGED ticket-bearing record whose generation owes an event the journal does
