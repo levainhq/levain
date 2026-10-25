@@ -6,7 +6,8 @@ one of these ends it or moves it on:
   - ``allowed`` by a standing consent grant (:meth:`ConsentQueue.answer_by_grant`, Q4): a grant a fresh replay of
     the authority log holds, whose criteria (:func:`levain.consent.policy.grant_refusal`) hold for the request, the
     tool input it was filed for and the posture the agent reported. The row says it was answered by a grant
-    (``via``) and stores which grant and the authority link that created or last renewed it;
+    (``via``) and stores which grant and the authority link that created or last renewed it. Never a chat
+    launch's egress card (:data:`EGRESS_TOOL`, Q-R15-7): only a signed answer decides one;
   - ``allowed`` / ``denied``: an answer that VERIFIES (:meth:`ConsentQueue.answer`): a record binding this
     queue, the request's id, its digest, its expiry, the decision, when it was signed (before the expiry) and the
     head of the queue's receipt log when it was built (see the receipts paragraph below), signed in
@@ -233,6 +234,9 @@ REFUSED_UNENROLLED_PER_REQUEST = 4
 #: How long keeping a refused answer waits for the queue's write lock, in ms: a refusal is never held up for the
 #: 30 s every other write waits (:func:`levain.autonomic.durable_sqlite.open_durable`); past it, nothing is kept.
 REFUSED_BUSY_MS = 2000
+# a chat launch's egress card (chat_egress.cards.EGRESS_TOOL): filed with its card's own display, and decided only by
+# a signed answer, never a standing grant (Q-R15-7)
+EGRESS_TOOL = "levain_egress"
 
 def _requests_table(name: str) -> str:
     return (f"CREATE TABLE IF NOT EXISTS {name} (id TEXT PRIMARY KEY, agent TEXT NOT NULL, "
@@ -999,10 +1003,19 @@ class ConsentQueue:
             event = "hook:" + event_id
         else:
             raise ConsentError("event_id must be a non-empty string")
+        if tool_name == EGRESS_TOOL:
+            # a chat launch's egress card: its own display, in a fixed field order, never cut (chat_egress.cards)
+            from levain.chat_egress.cards import CardError, card_display
+            try:
+                display = card_display(tool_input)
+            except CardError as exc:
+                raise ConsentError(f"a {EGRESS_TOOL} request must be a card: {exc}") from None
+        else:
+            display = redact_display(tool_name, tool_input)
         now = _now_utc(self._clock)
         request = ExternalGateRequest.create(
             agent=agent, agent_session_id=agent_session_id, event_id=event, tool_name=tool_name,
-            tool_input_digest=tool_input_digest(tool_input), display=redact_display(tool_name, tool_input),
+            tool_input_digest=tool_input_digest(tool_input), display=display,
             cwd=cwd, tier=tier, received_at=utc_stamp(now), expires_at=utc_stamp(now + hold))
         try:
             with self._write() as conn:
@@ -2380,7 +2393,8 @@ class ConsentQueue:
         moved = False
         with self._write() as conn:
             request, state, stamp = self._settle(conn, request_id)
-            if request is not None and state == "pending" and request.expires_at > stamp:
+            if request is not None and state == "pending" and request.expires_at > stamp \
+                    and request.tool_name != EGRESS_TOOL:
                 found = self._matching_grant(authority, request, tool_input=tool_input, posture=posture,
                                              now=parse_stamp(stamp))
                 if found is not None:
@@ -2401,7 +2415,8 @@ class ConsentQueue:
         if set(payload) != _GRANT_ANSWER_KEYS or payload["format"] != GRANT_ANSWER_FORMAT \
                 or payload["queue_id"] != queue_id or payload["request_id"] != request.id \
                 or payload["request_digest"] != request.digest or payload["expires_at"] != request.expires_at \
-                or payload["decision"] != "allow" or row["state"] != "allowed" or row["signer_fp"] is not None:
+                or payload["decision"] != "allow" or row["state"] != "allowed" or row["signer_fp"] is not None \
+                or request.tool_name == EGRESS_TOOL:
             return None
         if tool_input is None or not isinstance(posture, str) or payload["posture"] != posture:
             return None
