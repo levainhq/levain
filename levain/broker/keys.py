@@ -13,7 +13,13 @@ route's price table, its output ceiling written in, held at its estimate, and fo
 and the attachment (S1 3c-3, CONTRACT §4.5): keys' one long-lived `KEYS-ATTACH` connection to CONTROL, on which it
 sends `FRONT-LOST` (a front gone without keys' `K`, or a registration unclaimed V23 after FRONT-ARM), `SPEND-OVERRUN`
 (the overrun stop, R4 §1.4) and the `SESSIONS` reconcile; with no attachment keys refuses every token, and the
-attachment's EOF is the admin EOF's fail-closed clear and closes the admin connection (each EOF closes the other).
+attachment's EOF is the admin EOF's fail-closed clear and closes the admin connection (each EOF closes the other);
+and the lineage outbox (S1 3c-6c; SCHEMAS §2.1 `levain-dispatch-lineage/3`, R4 §3, head rulings H6-3 .. H6-28): a
+ticketed exchange's `reserved` line carries its `lineage_base`, and every resolution keys makes of it carries keys' whole
+`/3` row (`lineage_row`, from the codec's ONE response-metadata reader); a ticketed `Q` refused before any hold is
+counted in its (session, reason) window, whose one `refused` line is written at the window's close; on each attachment
+the sender delivers every durable payload line not durably acked, in ref order, one paced envelope at a time
+(`LINEAGE-APPEND`), and applies CONTROL's acks and quarantines to the ledger; a full outbox refuses ticketed `Q`s.
 
 Known edges of the ledger wiring (3c-1 B1 L2, 10-23; not built, never a loss):
 - before Python 3.12 a cancel landing in the loop turn the durable wait completes is lost (bpo-42130; reproduced on
@@ -249,6 +255,164 @@ BODY_READ_S = 60.0
 #: head's arrival stops the next chunk. [judged by 3c2a-b2-fix1, 10-23, against asyncio's default 64 KiB write
 #: high-water mark: a chunk of that size reaches the drain that waits]
 UPLOAD_CHUNK = 64 * 1024
+
+# --- lineage (S1 3c-6c; SCHEMAS §2.1 `levain-dispatch-lineage/3`; R4 §3; head rulings H6-3 .. H6-28) -----------------
+LINEAGE_FORMAT = "levain-dispatch-lineage/3"
+#: H6-11: the outbox's bound, in records (a DECISION; a K1-style measurement can raise it). At it a TICKETED `Q` is
+#: refused `keys-unavailable` until acks drain; an interactive session writes no lineage and is never refused for it.
+LINEAGE_OUTBOX_MAX = 4096
+#: H6-11 / H6-19: one `LINEAGE-APPEND` envelope carries at most this many records AND at most this many bytes of its
+#: canonical encoding (`levain-control/1`'s 64 KiB frame cap less headroom); keys packs greedily and starts a new
+#: envelope at either bound, so CONTROL never sees an envelope over the frame cap (whose close would end the
+#: attachment). `levain.slot.lineage`'s ENVELOPE_MAX, and the byte bound its 6b fix round adds (keys imports no sink
+#: module; a test pins them equal).
+LINEAGE_ENVELOPE_RECORDS = 64
+LINEAGE_ENVELOPE_BYTES = 48 * 1024
+#: H6-10: one refusal window per (session, reason) of a TICKETED session: its count kept in memory, ONE `refused` line
+#: written at its close (kill -9 loses at most one window's counts per (session, reason): a known edge, no money)
+REFUSED_ROW_S = 60.0
+#: DECISION: the wait before an envelope CONTROL refused, or did not answer, is sent again (the attach backoff's cap)
+LINEAGE_RETRY_S = 5.0
+
+
+def _stamp(t: float) -> str:
+    """A lineage timestamp: UTC `YYYY-MM-DDTHH:MM:SSZ`, the shape CONTROL's sink checks (`records.check_timestamp`)."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(t)))
+
+
+def lineage_base(run: dict, at: str, hold: int, unproven: bool) -> dict:
+    """A ticketed exchange's `lineage_base` (its `reserved` line's `meta`): a WHOLE `/3` record but `source` (the
+    triple, added at send) and the outcome. Every field is present (H6-15); the outcome fields hold what a row the
+    LEDGER builds from it (owner-ended, closed, the durable wait's timeout, replay's restart: H6-28) can honestly
+    say: `settled` (the ledger's), the call's facts unknown (`"unknown"`, nulls), `status` 0. The run's facts are
+    TOKEN-RESOLVE's `run` (CONTRACT §3.3), renamed per H6-3: `hold_microdollars` this exchange's hold,
+    `run_cap_microdollars` the run's cap."""
+    return {"format": LINEAGE_FORMAT, "at": at, "ended_at": at,
+            "run_id": run["run_id"], "job_id": run["job_id"], "run_index": run["run_index"],
+            "contract_digest": run["contract_digest"], "route": run["route"],
+            "routemap_generation": run["routemap_generation"], "route_policy_digest": run["route_policy_digest"],
+            "model_requested": run["model_requested"], "model_answered": "unknown", "provider_answered": "unknown",
+            "tokens_in": None, "tokens_out": None, "cost_microdollars": None, "cost_reported": None,
+            "hold_microdollars": hold, "run_cap_microdollars": run["reserved_microdollars"],
+            "settled": "uncertain", "overrun": None, "unproven": bool(unproven), "status": 0, "refused": "",
+            "count": None}
+
+
+def lineage_row(base: dict, *, settled: str, ended_at: str, md: "Optional[codec.Metadata]",
+                usage: "Optional[codec.Usage]" = None, cost: Optional[int] = None, overrun: int = 0,
+                status: int = 0, refused: str = "") -> dict:
+    """keys' row for one resolution of a ticketed exchange (H6-28: keys computes it, the ledger carries it): `base`
+    plus the outcome. `md` is the response metadata reader's answer (`codec.UsageReader.metadata`, H6-6) when the call
+    happened, None when no upstream call was made (H6-21: `model_answered` / `provider_answered` / `cost_reported`
+    are then null; with a call, an unsaid string is `"unknown"` and an unsaid cost null). `usage` and `cost` are the
+    settle's: `tokens_in` counts every input class (plain, cache write, cache read), `cost_microdollars` the whole
+    priced cost, and `overrun` (H6-7: a `"yes"` row) the part past the hold, null when none."""
+    row = dict(base)
+    call = md is not None
+    row.update(ended_at=ended_at, settled=settled, status=status, refused=refused,
+               model_answered=((md.model or "unknown") if md is not None else None),
+               provider_answered=((md.provider or "unknown") if md is not None else None),
+               cost_reported=(md.cost_reported if md is not None else None),
+               tokens_in=None, tokens_out=None, cost_microdollars=None, overrun=None, count=None)
+    if call and usage is not None and cost is not None:
+        row.update(tokens_in=usage.in_ + usage.cache_write + usage.cache_read, tokens_out=usage.out,
+                   cost_microdollars=cost, overrun=overrun if overrun > 0 else None)
+    return row
+
+
+def refused_row(run: dict, *, reason: str, count: int, at: str, ended_at: str) -> dict:
+    """The row of one refusal window of a ticketed session (H6-16): no call (H6-21: the call's facts null), no money
+    (`hold_microdollars` 0), `settled` "no", `refused` the reason and `count` its count, `at` the window's first refusal
+    and `ended_at` its close; `status` 0, a local refusal (SCHEMAS §2.1)."""
+    row = lineage_base(run, at, 0, False)
+    row.update(ended_at=ended_at, settled="no", model_answered=None, provider_answered=None, refused=reason,
+               count=count)
+    return row
+
+
+def wire_record(triple: Tuple[str, str, int], payload: object) -> dict:
+    """One envelope element (H6-14): the payload the outbox holds, as it is on disk, with its `source` triple (every
+    stamp is already in CONTROL's second form: keys' `_stamp`, and the ledger's own rows, `ledger._second`, H6-31).
+    A payload that is not an object goes as its triple alone, which CONTROL quarantines (the outbox still drains)."""
+    rec = dict(payload) if isinstance(payload, dict) else {}
+    rec["source"] = {"ledger": triple[0], "epoch": triple[1], "ref": triple[2]}
+    return rec
+
+
+def lineage_envelope(items: Sequence[Tuple[Tuple[str, str, int], object]],
+                     max_records: int = LINEAGE_ENVELOPE_RECORDS,
+                     max_bytes: int = LINEAGE_ENVELOPE_BYTES) -> Optional[Tuple[List[Tuple[str, str, int]], dict]]:
+    """The next envelope from the outbox (`ledger.unacked()`, ref order), or None when it is empty: the records of
+    the FIRST item's (ledger, epoch) in ref order (H6-14: one ledger and epoch per envelope; an old epoch's restart
+    rows go in their own), packed greedily up to `max_records` AND `max_bytes` of the envelope's canonical encoding
+    (H6-19). Returns the triples it carries, in order, and the envelope."""
+    if not items:
+        return None
+    lid, ep = items[0][0][0], items[0][0][1]
+    size = len(canon.canonical_bytes({"ledger_id": lid, "epoch": ep, "records": []}))
+    records: List[dict] = []
+    sent: List[Tuple[str, str, int]] = []
+    for t, payload in items:
+        if t[0] != lid or t[1] != ep:
+            continue
+        rec = wire_record(t, payload)
+        try:
+            n = len(canon.canonical_bytes(rec))
+        except (ValueError, TypeError, RecursionError):
+            rec = wire_record(t, None)
+            n = len(canon.canonical_bytes(rec))
+        add = n + (1 if records else 0)   # compact JSON: elements joined by ","
+        if records and (len(records) >= max_records or size + add > max_bytes):
+            break
+        records.append(rec)
+        sent.append(t)
+        size += add
+    return sent, {"ledger_id": lid, "epoch": ep, "records": records}
+
+
+_LEDGER_FIELD = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
+_HEX32 = re.compile(r"[0-9a-f]{32}\Z")
+
+
+def read_lineage_ack(ans: dict, sent: Sequence[Tuple[str, str, int]]
+                     ) -> Optional[Tuple[List[Tuple[str, str, int]], Dict[Tuple[str, str, int], str]]]:
+    """CONTROL's `LINEAGE-APPEND` answer `{acked: [triple..], quarantined: [{source, field}..]}` as (the acked triples,
+    {triple: field}), or None when it is not one: not ok, a triple keys did not send, a quarantine of a triple not
+    acked, or nothing acked at all (an envelope that drains nothing is never sent again at once)."""
+    if ans.get("ok") is not True:
+        return None
+    acked, quar = ans.get("acked"), ans.get("quarantined")
+    if type(acked) is not list or type(quar) is not list:
+        return None
+    mine = set(sent)
+
+    def triple_of(v: object) -> Optional[Tuple[str, str, int]]:
+        # r1 F3: the on-disk triple shape only (32-hex ledger and epoch, an int ref >= 1), checked before the
+        # membership test, so a malformed answer is None and never a raise (an unhashable value once was)
+        if type(v) is not dict or set(v) != {"ledger", "epoch", "ref"}:
+            return None
+        lid, ep, ref = v["ledger"], v["epoch"], v["ref"]
+        if type(lid) is not str or _HEX32.fullmatch(lid) is None or type(ep) is not str \
+                or _HEX32.fullmatch(ep) is None or type(ref) is not int or ref < 1:
+            return None
+        t = (lid, ep, ref)
+        return t if t in mine else None
+
+    out: List[Tuple[str, str, int]] = []
+    for v in acked:
+        t = triple_of(v)
+        if t is None:
+            return None
+        if t not in out:
+            out.append(t)
+    q: Dict[Tuple[str, str, int], str] = {}
+    for e in quar:
+        t = triple_of(e.get("source")) if type(e) is dict else None
+        field = e.get("field") if type(e) is dict else None
+        if t is None or t not in out or type(field) is not str or _LEDGER_FIELD.match(field) is None:
+            return None
+        q[t] = field
+    return (out, q) if out else None
 
 
 def _at(t: float) -> str:
@@ -513,7 +677,7 @@ class Conn:
     `upstream` holds the exchange's `Upstream` from `open_exchange`'s store until the release drops it, so a phase 1
     always finds what it must abort."""
 
-    __slots__ = ("writer", "reg", "kind", "task", "detached", "upstream", "admin_epoch", "rec")
+    __slots__ = ("writer", "reg", "kind", "task", "detached", "upstream", "admin_epoch", "rec", "usage")
 
     def __init__(self, writer: asyncio.StreamWriter, reg: Registration, kind: str) -> None:
         self.writer, self.reg, self.kind = writer, reg, kind   # kind: candidate | status | pending | exchange
@@ -524,6 +688,8 @@ class Conn:
         self.admin_epoch: Optional[int] = None
         #: the exchange's gw.jsonl record, made at admission and written at its end (None before `Q` is admitted)
         self.rec: Optional[dict] = None
+        #: the response's side reader once its head arrived: its metadata is the lineage row's (H6-6), a cut one's too
+        self.usage: Optional[codec.UsageReader] = None
 
 
 #: one entry of a phase 1's detached-objects list: a connection to close, or a detached exchange's `Upstream` to abort
@@ -858,6 +1024,21 @@ class Keys:
         #: the reservation ledger (`main()` opens it; `_serve` attaches and closes it). None refuses every admit
         #: `budget-exhausted` "no ledger" (design 3c-1 §2.5, Q6)
         self.ledger = ledger
+        #: the lineage outbox (S1 3c-6c): its bound and its pacing, attributes so a test can scale them; the refusal
+        #: windows `(session, reason) -> [first refusal (wall clock), count, run, timer]`; the sender's wake (made in
+        #: the loop), set by the ledger's listener as each payload line becomes durable; H6-8's counter of envelopes
+        #: CONTROL refused and the last FAILURE note (`lineage_status`)
+        self.lineage_outbox_max = LINEAGE_OUTBOX_MAX
+        self.refused_row_s = REFUSED_ROW_S
+        self.lineage_retry_s = LINEAGE_RETRY_S
+        self._refusals: Dict[Tuple[str, str], list] = {}
+        self._lineage_wake: Optional[asyncio.Event] = None
+        self.lineage_envelopes_refused = 0
+        #: r1 F1: refusal-window records not written because the outbox was at its bound
+        self.lineage_dropped = 0
+        self.lineage_failure: Optional[str] = None
+        if ledger is not None:
+            ledger.on_outbox = self._lineage_due
         #: the dispatch route maps (S1 3c-4): keys' own head and every generation it verified; `main()` loads them
         #: before anything is served. None (no lib root): no dispatch map, every dispatch route refused.
         self.routes = routes if routes is not None else (
@@ -936,6 +1117,7 @@ class Keys:
             self.reload_lock = asyncio.Lock()
             self._done = asyncio.Event()
             self.resolve_sem = asyncio.Semaphore(RESOLVE_CONNS)
+            self._lineage_wake = asyncio.Event()
 
     async def start(self, socks: Sequence[socket.socket], admin: Optional[socket.socket] = None) -> None:
         """Serve `socks` as front listeners and `admin` as the admin listener (bind_listeners' output). start() alone
@@ -1229,9 +1411,10 @@ class Keys:
         return att
 
     async def _attach_serve(self, att: Attachment) -> None:
-        """The attachment's read loop (each answer to its request's future) beside its reconcile ticker; returns at the
-        connection's EOF or a frame the wire does not allow."""
+        """The attachment's read loop (each answer to its request's future) beside its reconcile ticker and its lineage
+        sender (S1 3c-6c); returns at the connection's EOF or a frame the wire does not allow."""
         ticker = asyncio.ensure_future(self._reconcile_loop(att))
+        sender = asyncio.ensure_future(self._lineage_loop(att))
         try:
             while True:
                 ans = await read_attach_answer(att.reader)
@@ -1244,7 +1427,8 @@ class Keys:
             return
         finally:
             ticker.cancel()
-            await asyncio.gather(ticker, return_exceptions=True)
+            sender.cancel()
+            await asyncio.gather(ticker, sender, return_exceptions=True)
 
     async def _attach_lost(self, att: Attachment) -> None:
         """The attachment ended (§4.5): keys refuses every token, sends `K` to every front AND closes the other of the
@@ -1433,6 +1617,141 @@ class Keys:
                     victims += self._drop_locked(entry["session"])[1]
                 self._mark_dropped(d)
         self._effects(victims)
+
+    # -- the lineage outbox (S1 3c-6c; R4 §3 "Delivery"; H6-8, H6-11, H6-19) --
+
+    def _lineage_due(self, triple: Tuple[str, str, int], payload: dict) -> None:
+        """The ledger's `on_outbox` listener (on the loop): a payload line became durable, so the sender has work."""
+        if self._lineage_wake is not None:
+            self._lineage_wake.set()
+
+    async def _lineage_loop(self, att: Attachment) -> None:
+        """The attachment's lineage sender (R4 §3 "Delivery", H6-11): from its open, every durable payload line with no
+        durable ack, in ref order, then each new one as its line becomes durable. ONE envelope in flight
+        (`lineage_envelope`: one ledger and epoch, at most LINEAGE_ENVELOPE_RECORDS records and LINEAGE_ENVELOPE_BYTES
+        bytes); the next is sent only after CONTROL's answer AND keys' own `lineage-acked` line is durable (R4 §3: an
+        ack counts only after its fsync; the ledger moves the refs out of the outbox in that line's callback). Its
+        sends share the attachment with the reconcile ticker, so a `SESSIONS` due meanwhile goes between two
+        envelopes, never behind a whole resend (CONTROL serves the connection in order and appends an envelope with
+        one fsync). An envelope CONTROL refuses (`lineage-record:envelope`: a keys bug; `lineage-unavailable`: its sink
+        is poisoned until it restarts) or an answer that is not an ack is counted (`lineage_envelopes_refused`) and
+        noted as a FAILURE (H6-8); no answer within V23 is noted only. Either way the envelope is sent again after
+        `lineage_retry_s`: the outbox keeps it, so nothing is lost and the attachment stays up. An ack the ledger does not
+        take or make durable is noted and its envelope sent again the same way (r1 F3); a cycle that ends with a clean
+        ack clears the FAILURE note."""
+        led = self.ledger
+        wake = self._lineage_wake
+        if led is None or wake is None:
+            return
+        led.on_outbox = self._lineage_due
+        try:
+            while self.attached is att and not att.ended:
+                wake.clear()      # before the read: a line made durable after it sets the wake again
+                got = lineage_envelope(led.unacked())
+                if got is None:
+                    await wake.wait()
+                    continue
+                sent, env = got
+                ans = await self._attach_call(att, "LINEAGE-APPEND", {"envelope": env})
+                if self.attached is not att or att.ended:
+                    return
+                read = read_lineage_ack(ans, sent) if ans is not None else None
+                if read is None:
+                    if ans is not None and ans.get("ok") is False:
+                        self.lineage_envelopes_refused += 1
+                        why = "CONTROL refused an envelope of %d record(s) (%s)" % (len(sent), ans.get("refused"))
+                    elif ans is None:
+                        why = "an envelope of %d record(s) was not answered" % len(sent)
+                    else:
+                        self.lineage_envelopes_refused += 1
+                        why = "CONTROL's answer to an envelope of %d record(s) is not an ack" % len(sent)
+                    self._lineage_trouble(why)
+                    await asyncio.sleep(self.lineage_retry_s)
+                    continue
+                triples, quarantined = read
+                try:
+                    await led.ack(triples, quarantined)
+                except Exception as e:
+                    # r1 F3: the ack line was not taken or not made durable: noted, and the envelope sent again
+                    # after `lineage_retry_s` (the outbox still holds its triples), never the sender's exit
+                    self._lineage_trouble("the ack of %d record(s) was not counted (%s)" % (len(triples),
+                                                                                           type(e).__name__))
+                    await asyncio.sleep(self.lineage_retry_s)
+                    continue
+                if quarantined:
+                    self._lineage_trouble("CONTROL quarantined %d record(s) (%s)" % (
+                        len(quarantined), ",".join(sorted(set(quarantined.values())))))
+                else:
+                    self.lineage_failure = None   # r1 F3: a whole clean cycle clears the last FAILURE note
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._lineage_trouble("the sender stopped (%s); the outbox waits" % type(e).__name__)
+
+    def _lineage_trouble(self, why: str) -> None:
+        """H6-8: a FAILURE note (gw.jsonl and stderr), kept as `lineage_failure` for keys' status (3c-9's doctor row)."""
+        self.lineage_failure = why
+        _note(logging.ERROR, "levain gw-keys: FAILURE lineage: %s", why)
+
+    def lineage_status(self) -> dict:
+        """keys' lineage status (H6-8; 3c-9 renders the doctor row from it): the outbox's size and bound, the records
+        CONTROL quarantined (durable: the ledger's `lineage-acked` lines, so a restart keeps the count), the envelopes
+        CONTROL refused since start, the refusal-window records dropped at a full outbox since start (r1 F1), and the
+        last FAILURE note (None: none)."""
+        led = self.ledger
+        return {"outbox": led.outbox_size if led is not None else 0, "outbox_max": self.lineage_outbox_max,
+                "quarantined": len(led.quarantined) if led is not None else 0,
+                "envelopes_refused": self.lineage_envelopes_refused, "dropped": self.lineage_dropped,
+                "failure": self.lineage_failure}
+
+    def _note_refusal(self, session: str, run: Optional[dict], name: str) -> None:
+        """One refusal of a TICKETED `Q` made before any hold (so no hold row records it): counted in its (session,
+        reason) window (H6-10), whose ONE `refused` line is written at its close, `refused_row_s` after its first
+        refusal. An interactive session's refusal writes none (Q9)."""
+        if run is None or self.ledger is None or self.closing:
+            return
+        key = (session, name)
+        w = self._refusals.get(key)
+        if w is None:
+            w = self._refusals[key] = [time.time(), 0, run, None]
+            w[3] = asyncio.get_running_loop().call_later(self.refused_row_s, self._refused_close, key)
+        w[1] += 1
+
+    def _refused_close(self, key: Tuple[str, str]) -> None:
+        """A refusal window's close: its `refused` line (H6-10: the current epoch, its own seq the triple's ref) carrying
+        its row (H6-16), queued for the writer; the payload enters the outbox once the line is durable. A ledger that
+        cannot take it loses that window's counts (noted): refusals carry no money."""
+        w = self._refusals.pop(key, None)
+        if w is None:
+            return
+        first, count, run, timer = w
+        if timer is not None:
+            timer.cancel()
+        session, name = key
+        row = refused_row(run, reason=name, count=count, at=_stamp(first), ended_at=_stamp(time.time()))
+        led = self.ledger
+        if led is None:
+            return
+        if led.outbox_committed >= self.lineage_outbox_max:
+            # r1 F1 (bound): the outbox never passes `lineage_outbox_max`; a window's record that does not fit is
+            # counted (`lineage_status()["dropped"]`), never written. Refusals carry no money.
+            self.lineage_dropped += 1
+            self._lineage_trouble("the outbox is full: a refusal window's record was dropped (%d %s)" % (count, name))
+            return
+        try:
+            # the ledger's reason grammar is the refusal's name without its `:<what>` (`body-unbounded:document`);
+            # the row keeps the whole name
+            led.refused(session, run["route"], name.partition(":")[0], count, {"lineage": row}, run_id=run["run_id"])
+        except Exception as e:
+            # any failure, not only the ledger's own two (r1 complement LOW 5): this runs from a timer callback and
+            # from `flush_refusals`' loop over every window, which must reach the rest
+            _note(logging.WARNING, "levain gw-keys: a refusal window's line was not written (%s); %d %s lost",
+                  type(e).__name__, count, name)
+
+    def flush_refusals(self) -> None:
+        """Every open refusal window closed now (keys' shutdown, before the ledger's close)."""
+        for key in list(self._refusals):
+            self._refused_close(key)
 
     # -- transitions --
 
@@ -1843,6 +2162,7 @@ class Keys:
         (`_check_request`, one synchronous call); (6)-(8) the upstream, the durable `reserved` line, the head and
         body through `Upstream.write`, and the relay (`_serve_held`). A stale or detached exchange ends with NO
         answer (its front connection is one of phase 1's victims, which phase 2 closes)."""
+        started = _stamp(time.time())   # the request's start, as its lineage row says it (`at`)
         out = await self._token_state(conn, q["token"])
         if out is None or conn.detached:
             return
@@ -1857,6 +2177,7 @@ class Keys:
         try:
             pol = self._route_policy(claims, q["route"])
         except norm.Refused as r:
+            self._note_refusal(session, claims.get("run"), r.name)   # a ticketed refusal's window (H6-10)
             await self._refuse(conn, frames, side, r.name, UNTRUSTED_DRAIN_CAP)
             return
         ff = FrontFrames(frames)
@@ -1881,9 +2202,10 @@ class Keys:
                 # meanwhile is refused here, before anything is checked or held (the head's write checks it again)
                 unexpired(self.cred_lifecycle, observed)
             head, hconn, cred, tpl, data, meter, hold = self._check_request(conn.reg, pol, req, raw, buf,
-                                                                            claims.get("run"))   # admit is last
+                                                                            claims.get("run"), at=started)   # admit last
         except norm.Refused as r:
             buf.give_back()
+            self._note_refusal(session, claims.get("run"), r.name)   # no hold was admitted: the window records it
             try:
                 await self._refuse(conn, ff, side, r.name, pol.body_cap)
             finally:
@@ -1900,17 +2222,18 @@ class Keys:
         try:
             await self._serve_held(conn, ff, side, pol, rec, meter, hold, head, hconn, cred, tpl, data, buf)
         except (norm.Refused, UpstreamFailed) as r:
-            hold.end()
+            hold.end(self._end_meta(conn, hold, r.name))
             if ff.responded:
                 rec["refused"] = r.name   # after `R`: the front's connection is closed with the body cut short
                 _note(logging.WARNING, "levain gw-keys: response cut short after its head (%s)", r.name)
             else:
                 await self._refuse(conn, ff, side, r.name, pol.body_cap)
         except BaseException:
-            hold.end()   # a cancel, StaleExchange, any other raise: the same call, then the raise goes on
+            hold.end(self._end_meta(conn, hold))   # a cancel, StaleExchange, any other raise: the same call, raised on
             raise
         else:
-            hold.end()   # every normal return (detached, connect lost, FrontAborted); after a settle, a no-op
+            hold.end(self._end_meta(conn, hold))   # every normal return (detached, connect lost, FrontAborted); a no-op
+                                                   # after a settle
         finally:
             buf.give_back()
             ff.close()
@@ -1976,18 +2299,20 @@ class Keys:
                 rec["status"] = resp.status_code
                 await conn.writer.drain()
                 reader = meter[0].usage(_header(resp.headers, b"content-type"), meter[2])
+                conn.usage = reader   # a cut relay's lineage row reads what the response said (H6-6)
                 await self._relay_body(conn, up, hconn, scanner, rec, reader)
                 return not conn.detached   # fenced mid-relay: cut short, so `_serve_q`'s `end()` books it
 
             if not await self._against_front(ff, side, up, work()):
                 return   # the front aborted, or the exchange was cut short: `_serve_q`'s `end()` resolves the hold
             assert reader is not None   # a completed relay made one
-            self._settle(conn.reg, meter[1], hold, reader, route=pol.route, model=meter[3], unproven=meter[4])
+            self._settle(conn.reg, meter[1], hold, reader, route=pol.route, model=meter[3], unproven=meter[4],
+                         status=rec["status"] if type(rec["status"]) is int else 0)
         finally:
             rec["redactions"] = scanner.count
 
     def _settle(self, reg: Registration, price: Price, hold: ledger.Hold, reader: codec.UsageReader, *,
-                route: str = "", model: str = "", unproven: bool = False) -> None:
+                route: str = "", model: str = "", unproven: bool = False, status: int = 0) -> None:
         """A completed relay's resolution (R4 §1.2, §1.4): its reported usage priced by class, settled in full (the
         ledger books what passes the hold as `overrun`); with none, `uncertain` charged its hold, the reason the
         reader's (`usage-over-cap` when a cap stopped it, else `no-usage`). A cost above the hold stops the session: it
@@ -1997,23 +2322,71 @@ class Keys:
         settle, so a settle that raises still leaves the session stopped. Nothing in flight is touched: each other
         exchange settles from its own usage. The stop is then reported: `SPEND-OVERRUN {session, route, model, ref,
         overrun, unproven}` on the attachment (R4 §1.4 step 2), sent after the settle and whether or not it raised;
-        CONTROL records it for the card and revokes nothing."""
+        CONTROL records it for the card and revokes nothing.
+
+        A ticketed exchange's resolution carries keys' whole `/3` row (H6-28; `lineage_row`): `uncertain` with the
+        call's metadata and no counts, or `settled: "yes"` with its counts, its cost and, past the hold, `overrun`
+        (H6-7). `status` is the upstream's (the relayed `R`)."""
         usage = reader.result()
         if usage is None:
-            hold.uncertain(reader.reason)
+            hold.uncertain(reader.reason, self._row_meta(hold, "uncertain", reader, status))
             return
         cost = codec.price_usage(usage, price)
         stopped = cost > hold.amount and self.by_session.get(reg.session) is reg
         if stopped:
             self.budget_stopped.add(reg.session)
         try:
-            hold.settle(cost, usage.meta())
+            hold.settle(cost, dict(usage.meta(), **self._row_meta(hold, "yes", reader, status, usage, cost)))
         finally:
             if stopped and self.attach:
                 ledger_id, epoch, seq = hold.ref
                 self._attach_send_task(self._spend_overrun({
                     "session": reg.session, "route": route, "model": model, "ref": [ledger_id, epoch, seq],
                     "overrun": cost - hold.amount, "unproven": unproven}))
+
+    @staticmethod
+    def _row_meta(hold: ledger.Hold, settled: str, reader: Optional[codec.UsageReader], status: int,
+                  usage: Optional[codec.Usage] = None, cost: Optional[int] = None) -> dict:
+        """`{"lineage": <keys' row>}` for a resolution of a ticketed hold after its call (H6-28), `{}` for an
+        interactive one (Q9: no lineage)."""
+        if hold.base is None:
+            return {}
+        md = reader.metadata() if reader is not None else codec.Metadata()
+        return {"lineage": lineage_row(hold.base, settled=settled, ended_at=_stamp(time.time()), md=md, usage=usage,
+                                       cost=cost, overrun=(cost - hold.amount) if cost is not None else 0,
+                                       status=status)}
+
+    def _end_meta(self, conn: Conn, hold: ledger.Hold, refused: str = "") -> Optional[dict]:
+        """The `meta` of `hold.end()` (H6-28): for a ticketed hold that `end` will resolve, keys' row: a SENT hold is
+        `uncertain {ended}` (the call happened: its metadata so far, `conn.usage`, and the upstream status if `R` was
+        relayed), an unsent one `released` (`settled: "no"`, the call's facts null, H6-21); `refused` is the refusal
+        that ended the exchange, if one did. None for an interactive hold or an `end` that is a no-op. NEVER raises
+        (it is evaluated in `except BaseException` before the raise goes on): a failure builds the row from the base
+        alone, as the ledger would, and a failure of that (or of the hold's own reads, r1 F8) is None."""
+        try:
+            st = hold.state
+            if hold.base is None or st not in (ledger.PENDING, ledger.RESERVED, ledger.SENT):
+                return None
+            now = _stamp(time.time())
+        except Exception as e:
+            _note(logging.WARNING, "levain gw-keys: a hold's end could not be read (%s)", type(e).__name__)
+            return None
+        try:
+            if st is ledger.SENT:
+                rec = conn.rec or {}
+                status = rec.get("status")
+                md = conn.usage.metadata() if conn.usage is not None else codec.Metadata()
+                row = lineage_row(hold.base, settled="uncertain", ended_at=now, md=md,
+                                  status=status if type(status) is int else 0, refused=refused)
+            else:
+                row = lineage_row(hold.base, settled="no", ended_at=now, md=None, refused=refused)
+        except Exception as e:
+            _note(logging.WARNING, "levain gw-keys: a lineage row was built from its base (%s)", type(e).__name__)
+            try:
+                row = dict(hold.base, settled="uncertain" if st is ledger.SENT else "no", ended_at=now)
+            except Exception:
+                return None
+        return {"lineage": row}
 
     async def _open_upstream(self, conn: Conn, ff: "FrontFrames", side: KeysSide, pol: RoutePolicy,
                              rec: dict) -> Optional[Upstream]:
@@ -2403,10 +2776,16 @@ class Keys:
                 raise norm.Refused("policy-header", cred.header)
         if session in self.budget_stopped:
             raise norm.Refused("budget-overrun", "the session is stopped")
+        if claims.get("run") is not None and self.ledger is not None \
+                and self.ledger.outbox_committed >= self.lineage_outbox_max:
+            # H6-11: a full lineage outbox refuses new TICKETED `Q`s until acks drain (an interactive session writes
+            # no lineage, so it is never refused for it). r1 F1: the measure counts the payloads already owed (lines
+            # not yet durable, ticketed holds not yet resolved), so concurrent admits cannot pass the bound
+            raise norm.Refused("keys-unavailable", "the lineage outbox is full")
         return method, path, query, fwd, tpl, cred
 
     def _check_request(self, reg: Registration, pol: RoutePolicy, req: tuple, raw: "_OneShot",
-                       buf: "BodyTake", run: Optional[dict] = None
+                       buf: "BodyTake", run: Optional[dict] = None, at: Optional[str] = None
                        ) -> Tuple[bytes, "h11.Connection", object, norm.Template, bytes,
                                   Tuple[codec.Codec, Price, Dict[str, str], str, bool], ledger.Hold]:
         """R4 §1.7 steps 4-5, ONE synchronous call (no `await` anywhere in it): the body codec's parse of the buffered
@@ -2444,23 +2823,31 @@ class Keys:
         # an interactive route admits content the estimate cannot see, marked on its `reserved` line (R4 §1.6)
         meta = {"bound": "unproven"} if checked.unproven else {}
         meter = (c, checked.price, names, checked.model, bool(checked.unproven))
-        hold = self._admit_hold(reg, pol, estimate, checked.model, meta, run)   # the last step: see `_serve_q`
+        hold = self._admit_hold(reg, pol, estimate, checked.model, meta, run, at=at,
+                                unproven=bool(checked.unproven))   # the last step: see `_serve_q`
         return head, hconn, cred, tpl, data, meter, hold
 
     def _admit_hold(self, reg: Registration, pol: RoutePolicy, estimate: int, price_ref: str,
-                    meta: dict, run: Optional[dict] = None) -> ledger.Hold:
+                    meta: dict, run: Optional[dict] = None, *, at: Optional[str] = None,
+                    unproven: bool = False) -> ledger.Hold:
         """The ledger's synchronous admit of `estimate` (R4 §1.2's estimate, never shrunk: a hold that does not fit the
         room is `budget-exhausted`) against the route's per-session cap, scope ("session-route", session, route), or,
         for a ticketed run, the run's `reserved_microdollars`, scope ("run", run_id) (R4 §1.2);
         `price_ref` is the priced model. The session's place in `budget_stopped` is read again as the statement right
         before the admit (no `await` between the two), because the body read after `_check_q`'s read can take up
         to `body_read_s`. The ledger's own errors become refusals: `budget-exhausted` (402), and
-        `keys-unavailable` (503) for an unhealthy or closing ledger and, noted, for a misuse."""
+        `keys-unavailable` (503) for an unhealthy or closing ledger and, noted, for a misuse.
+
+        A ticketed run's `reserved` line carries its `lineage_base` (S1 3c-6c, R4 §3: the record is on disk before it
+        is sent): the whole `/3` record but its outcome, `at` the request's start (`_serve_q`'s), `hold_microdollars`
+        the hold admitted (`bound` returns the estimate, never shrunk)."""
         if self.ledger is None:
             raise norm.Refused("budget-exhausted", "no ledger")
         if run is not None:
             scope: Tuple[str, ...] = ("run", run["run_id"])
             cap = run["reserved_microdollars"]
+            meta = dict(meta, lineage_base=lineage_base(run, at if at is not None else _stamp(time.time()), estimate,
+                                                        unproven))
         else:
             scope = ("session-route", reg.session, pol.route)
             cap = pol.max_session_microdollars
@@ -2470,6 +2857,10 @@ class Keys:
         def bound(room: int) -> int:
             return estimate   # above the room, the ledger refuses it `budget-exhausted`
 
+        if run is not None and self.ledger.outbox_committed >= self.lineage_outbox_max:
+            # r1 F1: `_check_q`'s outbox check read again before the admit (the body read sits between them; no
+            # `await` from here to the admit)
+            raise norm.Refused("keys-unavailable", "the lineage outbox is full")
         if reg.session in self.budget_stopped:
             raise norm.Refused("budget-overrun", "the session is stopped")
         try:
@@ -2797,6 +3188,8 @@ async def _serve(keys: Keys, front_path: str, gid: Optional[int], admin_path: st
                     s.close()
         finally:
             if keys.ledger is not None:
+                # the open refusal windows' lines first (H6-10), queued ahead of the close
+                keys.flush_refusals()
                 # after wait_done: every live hold resolved by the close column, the writer drained for at most
                 # SHUTDOWN_WAIT_S; lines past it are replay's (design 3c-1 §2.7). The one ledger call in a `finally`.
                 await keys.ledger.aclose(SHUTDOWN_WAIT_S)

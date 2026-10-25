@@ -11,16 +11,19 @@ import asyncio
 import json
 import os
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 from levain.broker import creds as CR
 from levain.broker import gwwire
 from levain.broker import keys as K
+from levain.broker import ledger as L
 from levain.broker.norm import digest_of_token
 from levain.broker.policy import parse_base_map
 from levain.contracts import canon
 from levain.slot import control as C
+from levain.slot import lineage as LN
 from tests.ledger_support import file_lines
 from tests.test_broker_keys_upstream import PRICE, SECRET, TOKEN, _q, _Rig, _run, _scripted, _types, _Up, base_route
 from tests.test_routemaps import Store, st  # noqa: F401
@@ -200,11 +203,27 @@ def test_ticket_string_in_no_ledger_or_log_line(st, monkeypatch):  # noqa: F811
             log = f.read()
         with open(out["ledger_path"], "rb") as f:
             ledger_bytes = f.read()
-        return out, log, ledger_bytes
+        # S1 3c-6c, H1's lineage half: the run's lineage row as keys sends it (the envelope built from the outbox)
+        # and as CONTROL's sink keeps it
+        led = L.Ledger.open(out["ledger_path"])
+        got = K.lineage_envelope(led.unacked())
+        await led.aclose(1)
+        assert got is not None
+        env = got[1]
+        os.makedirs(os.path.join(d, "lineage"))
+        sink = LN.LineageSink(Path(d) / "lineage" / LN.SINK)
+        sink.start()
+        sink.append([(t, {k: rec[k] for k in LN.RECORD_CHECKS})
+                     for t, rec in zip(LN.check_envelope(env), env["records"])])
+        sink.close()
+        sink_bytes = (Path(d) / "lineage" / LN.SINK).read_bytes()
+        return out, log, ledger_bytes, canon.canonical_bytes(env), sink_bytes
 
-    out, log, ledger_bytes = _run(go)
+    out, log, ledger_bytes, envelope, sink_bytes = _run(go)
     assert _types(out["frames"]) == b"ARbe", out["frames"]
-    assert log and ledger_bytes
+    assert log and ledger_bytes and envelope and sink_bytes
     assert run_id.encode() in ledger_bytes                                   # the line is about this run
-    for name, data in (("ledger", ledger_bytes), ("gw.jsonl", log), ("resolve answer", json.dumps(res).encode())):
+    assert run_id.encode() in envelope and run_id.encode() in sink_bytes    # and so is its lineage row
+    for name, data in (("ledger", ledger_bytes), ("gw.jsonl", log), ("resolve answer", json.dumps(res).encode()),
+                       ("LINEAGE-APPEND envelope", envelope), ("lineage sink", sink_bytes)):
         assert ticket.encode() not in data, name

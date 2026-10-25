@@ -29,8 +29,8 @@ R4 §1.4), whose EOF revokes every egress-class session, and :func:`serve`, the 
 its start pass and the RELOADs to keys, each under the one activation lock; S1 3c-5 its ``RUN-TICKET-MINT`` /
 ``-CANCEL`` / ``-STATUS`` over the ticket journal (:mod:`levain.slot.tickets`), and the binding of a ticket: its
 ``LEASE-OPEN {ticket}``, the ``ATTACH`` of a ticket-bound lease (``ticket_facts``), ``MINT``'s claims against the
-ticket and ``TOKEN-RESOLVE``'s ``run``, read from the ticket record and never from root's claims. Root's ``SLOT-SYNC``, keys'
-``LINEAGE-APPEND`` and the other dispatch verbs (§3.3, §3.5, §3.6) are later 3c sessions': until then
+ticket and ``TOKEN-RESOLVE``'s ``run``, read from the ticket record and never from root's claims; S1 3c-6b keys'
+``LINEAGE-APPEND {envelope}`` into the lineage sink (:mod:`levain.slot.lineage`). Root's ``SLOT-SYNC`` and the other dispatch verbs (§3.3, §3.5, §3.6) are later 3c sessions': until then
 every other peer, and every other verb of a known one, is refused ``verb-not-allowed-for-peer`` (see
 :data:`PEER_VERBS`). Every act on keys and the reaper wake are seams: :class:`KeysAdmin` supplies the keys ones when
 CONTROL is given one.
@@ -60,6 +60,7 @@ from levain.broker.stub import peer_uid as kernel_peer_uid
 from levain.contracts import ContractError, canon
 from levain.slot import Refused
 from levain.slot import records as R
+from levain.slot import lineage as LN
 from levain.slot import routemaps
 from levain.slot import tickets as T
 from levain.slot.layout import STORE, session_repo
@@ -71,15 +72,15 @@ _LEN = struct.Struct(">I")
 
 ROOT_UID = 0
 
-#: §3.3's verbs per peer, as built so far. Later 3c sessions add root's ``SLOT-SYNC``, keys' ``LINEAGE-APPEND`` and
+#: §3.3's verbs per peer, as built so far (3c-6b adds keys' ``LINEAGE-APPEND``). Later 3c sessions add root's ``SLOT-SYNC`` and
 #: the rest of the ``_levain_dispatch`` row (3c-4 builds its ``ROUTE-SUBMIT``, 3c-5 the three ticket verbs and ``LEASE-OPEN {ticket}``; the peer is ``dispatch`` when
-#: :meth:`Control.peer_kind` is given its uid, else ``foreign``). keys' ``FRONT-LOST`` / ``SPEND-OVERRUN`` / ``SESSIONS`` are answered only on the connection that
+#: :meth:`Control.peer_kind` is given its uid, else ``foreign``). keys' ``FRONT-LOST`` / ``SPEND-OVERRUN`` / ``SESSIONS`` / ``LINEAGE-APPEND`` are answered only on the connection that
 #: holds the current ``KEYS-ATTACH`` (else ``not-attached``).
 PEER_VERBS: Mapping[str, frozenset[str]] = {
     "operator": frozenset({"LEASE-OPEN", "STATUS"}),
     "root": frozenset({"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET"}),
     "qbroker": frozenset({"QUEUE-RESOLVE"}),
-    "keys": frozenset({"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS"}),
+    "keys": frozenset({"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS", "LINEAGE-APPEND"}),
     "dispatch": frozenset({"LEASE-OPEN", "ROUTE-SUBMIT", "RUN-TICKET-MINT", "RUN-TICKET-CANCEL", "RUN-TICKET-STATUS"}),
     "foreign": frozenset(),
 }
@@ -101,6 +102,7 @@ _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "FRONT-LOST": (frozenset({"session"}),) * 2,
     "SPEND-OVERRUN": (frozenset({"session", "route", "model", "ref", "overrun", "unproven"}),) * 2,
     "SESSIONS": (frozenset({"digests"}),) * 2,
+    "LINEAGE-APPEND": (frozenset({"envelope"}),) * 2,     # S1 3c-6b (H6-2): CONTRACT §3.3 keys row
     "ROUTE-SUBMIT": (frozenset({"map", "sig"}),) * 2,
     # the per-kind required fields are the §3.5 table's (tickets.check_facts), refused by field name
     "RUN-TICKET-MINT": (frozenset({"attempt_id"}) | T.MINT_FIELDS, frozenset({"attempt_id"})),
@@ -758,7 +760,9 @@ class Control:
     ``routes`` (a :class:`levain.slot.routemaps.ControlRoutes`: ``ROUTE-SUBMIT``, the start pass, and THE activation
     lock every RELOAD to keys is sent under; ``None``: ``ROUTE-SUBMIT`` refused ``routemap-verifier``) · ``dispatch_uid``
     (the ``_levain_dispatch`` peer; ``None``: no peer is dispatch) · ``tickets`` (a :class:`levain.slot.tickets.TicketStore`:
-    the run-ticket journal, compacted by :meth:`start`; ``None``: every ticket verb refused ``journal-unavailable``)."""
+    the run-ticket journal, compacted by :meth:`start`; ``None``: every ticket verb refused ``journal-unavailable``) ·
+    ``lineage`` (a :class:`levain.slot.lineage.LineageSink`: ``L/lineage/lineage.jsonl``, opened by :meth:`start`;
+    ``None``: ``LINEAGE-APPEND`` refused ``lineage-unavailable``)."""
 
     def __init__(self, store: StateStore, operator_uid: int, *,
                  qbroker_uid: int | None = None,
@@ -778,7 +782,8 @@ class Control:
                  routemap_head: Callable[[], Mapping[str, object] | None] | None = None,
                  routes: routemaps.ControlRoutes | None = None,
                  dispatch_uid: int | None = None,
-                 tickets: T.TicketStore | None = None) -> None:
+                 tickets: T.TicketStore | None = None,
+                 lineage: LN.LineageSink | None = None) -> None:
         if type(operator_uid) is not int or operator_uid <= ROOT_UID:
             raise Refused("bad-config", f"operator uid {operator_uid!r}")
         if qbroker_uid is not None and (type(qbroker_uid) is not int or qbroker_uid <= ROOT_UID
@@ -848,6 +853,7 @@ class Control:
         #: notified whenever ``_keys_serves`` changes: a mint waits on it for keys to serve CONTROL's head (R4 §2)
         self._serves_cv = threading.Condition(self._mu)
         self.tickets = tickets
+        self.lineage = lineage
         #: (session, ref) -> the SPEND-OVERRUN record, oldest first (R4 §1.4, §4: the card's data; never a revoke).
         self._overruns: collections.OrderedDict[tuple[str, tuple], dict[str, object]] = collections.OrderedDict()
         #: the sessions keys reported FRONT-LOST for, oldest first, bounded (doctor / tests).
@@ -902,6 +908,8 @@ class Control:
         except BaseException:
             if self.tickets is not None:
                 self.tickets.close()
+            if self.lineage is not None:
+                self.lineage.close()
             raise
 
     def _start_pass(self) -> None:
@@ -914,6 +922,10 @@ class Control:
             # the compaction runs before any append is admitted (CONTRACT §3.5); the records are loaded first so a
             # binding whose session record was never written is undone (head ruling H8)
             self.tickets.start(has_session=lambda s: s in loaded)
+        if self.lineage is not None:
+            # S1 3c-6b: the sink read whole (membership, seq), its torn tail cut, before any LINEAGE-APPEND is served;
+            # a corrupt sink refuses the start ``lineage-corrupt``
+            self.lineage.start()
         past = False
         for rec in sorted(self.store.all(), key=lambda r: r.session):
             if rec.state in R.LIVE_STATES:
@@ -935,6 +947,8 @@ class Control:
             self.keys_admin.close()
         if self.tickets is not None:
             self.tickets.close()
+        if self.lineage is not None:
+            self.lineage.close()
 
     # -- the write primitive -------------------------------------------------------------------------------
 
@@ -2127,6 +2141,49 @@ class Control:
                     drop.append(d)
         return {"drop": drop}
 
+    def _op_lineage_append(self, conn: Conn, args: dict) -> dict[str, object]:
+        """S1 3c-6b, CONTRACT §3.3 keys row ``LINEAGE-APPEND {envelope}`` (H6-2, H6-11, H6-14; SCHEMAS §2.1), on the
+        current attachment only (``not-attached``). The envelope ``{ledger_id, epoch, records}`` is checked FIRST and
+        whole (:func:`levain.slot.lineage.check_envelope`): any fault, including an element whose ``source`` names
+        another ledger or epoch than the envelope, refuses it ``lineage-record:envelope`` and nothing is appended (a keys
+        bug). Inside a valid envelope each record is checked by field name and type (:func:`~levain.slot.lineage.
+        check_record`); one that fails becomes a QUARANTINE row naming its first bad field (R4 §3), so it is acked and
+        the outbox drains. Every triple the sink already holds is acked without appending (membership, never a
+        high-water); the rest are appended in ONE write with ONE full fsync (group commit) before this answers.
+
+        Answers ``{acked: [{ledger, epoch, ref}..], quarantined: [{source: {ledger, epoch, ref}, field}..]}``: every
+        triple of the envelope once, in envelope order, and among them each one the sink holds as a quarantine row,
+        a member's included (a resend after a lost ack learns its quarantine again) (DECISION: the reply mirrors the
+        ``lineage-acked`` line's H6-17 shape). No sink: ``lineage-unavailable``; a failed append poisons the sink and
+        answers ``lineage-unavailable`` until CONTROL restarts.
+
+        The envelope is also bounded by bytes (H6-19: at most 64 records AND at most
+        :data:`~levain.slot.lineage.ENVELOPE_BYTES_MAX` encoded); over either it is refused ``lineage-record:envelope``
+        with nothing appended. A quarantine row is ``{format, seq, source, quarantined}`` (H6-20: no ``session``)."""
+        self._require_attached(conn)
+        envelope = args["envelope"]
+        if self.lineage is None:   # r1 F6: before the envelope's check (no sink: nothing is a keys bug yet)
+            raise Refused("lineage-unavailable", "CONTROL holds no lineage sink")
+        triples = LN.check_envelope(envelope)
+        rows: list[tuple[LN.Triple, dict[str, object]]] = []
+        for t, rec in zip(triples, envelope["records"]):
+            bad = LN.check_record(rec)
+            if bad is None:
+                rows.append((t, {k: rec[k] for k in LN.RECORD_CHECKS}))
+            else:
+                rows.append((t, {"format": LN.FORMAT, "quarantined": bad}))
+        acked: list[dict[str, object]] = []
+        quarantined: list[dict[str, object]] = []
+        seen: set[LN.Triple] = set()
+        for t, bad in self.lineage.append(rows):
+            if t in seen:
+                continue
+            seen.add(t)
+            acked.append(LN.source_of(t))
+            if bad is not None:
+                quarantined.append({"source": LN.source_of(t), "field": bad})
+        return {"acked": acked, "quarantined": quarantined}
+
     # -- test / service views --------------------------------------------------------------------------------
 
     def handles(self, session: str) -> Handles | None:
@@ -2311,6 +2368,9 @@ class ServeConfig:
     ceiling_path: Path | None = None
     #: the ceiling file's required owner (root; a test rig passes its own uid)
     ceiling_uid: int = 0
+    #: ``L/lineage`` (S1 3c-6b): CONTROL's lineage sink is ``<lineage_dir>/lineage.jsonl``; ``None``: no sink, and
+    #: ``LINEAGE-APPEND`` is refused ``lineage-unavailable``
+    lineage_dir: Path | None = None
     host: str = "darwin" if sys.platform == "darwin" else "linux"
     peer_uid: Callable[[socket.socket], int | None] | None = None
     ready: Callable[[ControlServer], object] | None = None
@@ -2329,9 +2389,10 @@ def serve(config: ServeConfig) -> int:
     if config.routes_dir is not None:
         ceiling = config.ceiling_path or Path(config.routes_dir).parent / "policy" / "dispatch_ceiling"
         tickets = T.TicketStore(Path(config.store_dir) / T.JOURNAL, Path(ceiling), ceiling_uid=config.ceiling_uid)
+    lineage = LN.LineageSink(Path(config.lineage_dir) / LN.SINK) if config.lineage_dir is not None else None
     control = Control(store, config.operator_uid, qbroker_uid=config.qbroker_uid, keys_uid=config.keys_uid,
                       keys_admin=admin, host=config.host, routes=routes, dispatch_uid=config.dispatch_uid,
-                      tickets=tickets)
+                      tickets=tickets, lineage=lineage)
     if config.peer_uid is not None:
         server = ControlServer(control, Path(config.socket_path), peer_uid=config.peer_uid)
     else:

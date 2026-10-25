@@ -69,11 +69,13 @@ def short_dir() -> str:
 
 class FakeControl:
     """CONTROL's socket: `TOKEN-RESOLVE` one request, one answer, and keys' `KEYS-ATTACH` (S1 3c-3), held open and
-    answered `ok` for every later request (`SESSIONS` with nothing to drop). Every digest resolves to session s1 and
-    claims that name this process as the front."""
+    answered `ok` for every later request (`SESSIONS` with nothing to drop; `LINEAGE-APPEND` (S1 3c-6c) acked whole,
+    nothing quarantined, every envelope kept in `envelopes`). Every digest resolves to session s1 and claims that name
+    this process as the front."""
 
     def __init__(self, path: str) -> None:
         self.path, self.server, self.resolves, self.attaches = path, None, 0, 0
+        self.envelopes: List[dict] = []
 
     async def start(self) -> None:
         self.server = await asyncio.start_unix_server(self._on, self.path)
@@ -85,7 +87,10 @@ class FakeControl:
             if req.get("op") == "KEYS-ATTACH":
                 self.attaches += 1
                 while req is not None:
-                    extra = {"drop": []} if req.get("op") == "SESSIONS" else {}
+                    extra: Dict[str, Any] = {"drop": []} if req.get("op") == "SESSIONS" else {}
+                    if req.get("op") == "LINEAGE-APPEND":
+                        self.envelopes.append(req["envelope"])
+                        extra = {"acked": [r["source"] for r in req["envelope"]["records"]], "quarantined": []}
                     w.write(K.encode_admin({"id": req["id"], "ok": True, **extra}))
                     await w.drain()
                     n = int.from_bytes(await r.readexactly(4), "big")
