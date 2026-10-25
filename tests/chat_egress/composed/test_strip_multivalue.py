@@ -58,7 +58,16 @@ def test_a_credential_header_with_a_space_before_the_colon_is_srts_400_and_reach
     resp = _send(L, [("Authorization ", "AUTHSPACEVAL")])
     assert L.stop() == 0
     assert resp.startswith(b"HTTP/1.1 400"), resp[:200]
-    assert origin.reqs == []
+    origin.assert_untouched()
+
+
+def test_the_oracle_is_red_when_the_space_before_the_colon_is_forwarded(make_origin, make_leaky_plain) -> None:
+    origin = make_origin()
+    L = make_leaky_plain(origin)
+    _send(L, [("Authorization ", "AUTHSPACEVAL")])
+    with pytest.raises(AssertionError) as red:
+        origin.assert_untouched()
+    print("RUN RED CONTROL space before the colon:", str(red.value)[:200])
 
 
 def test_a_control_header_the_strip_does_not_list_is_forwarded(make_origin, make_launch_) -> None:

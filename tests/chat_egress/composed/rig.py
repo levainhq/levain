@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import socket
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote
@@ -38,7 +39,10 @@ class RecordingOrigin:
             import ssl
             self.tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             self.tls_ctx.load_cert_chain(*tls)
-        self.conns = 0
+        self.conns = 0                     # every ACCEPTED connection, counted before any TLS wrap or parse
+        self.bytes_in = 0                  # every byte read: a TLS connection's first flight (peeked, before the wrap) + each later read
+        self.first_flights: list[bytes] = []
+        self.wrap_failures: list[str] = []
         self.open_conns = 0
         self.reflect = reflect
         self.content_type = content_type
@@ -74,20 +78,50 @@ class RecordingOrigin:
                 self._threads.append(t)
                 t.start()
 
-    @staticmethod
-    def _recv(c: socket.socket) -> bytes:
-        """One read; the peer's EOF ends the connection (raises) rather than spinning the caller's loop."""
+    def _recv(self, c: socket.socket) -> bytes:
+        """One read, counted; the peer's EOF ends the connection (raises) rather than spinning the caller's loop."""
         d = c.recv(65536)
         if not d:
             raise EOFError
+        self._count(len(d))
         return d
+
+    def _count(self, n: int) -> None:
+        with self._lock:
+            self.bytes_in += n
+
+    def touched(self) -> dict:
+        """What reached the origin at the connection and byte level; parsed requests are only the subset that survived
+        a TLS wrap and the origin's own parser."""
+        with self._lock:
+            return {"conns": self.conns, "bytes": self.bytes_in, "wrap_failures": list(self.wrap_failures),
+                    "reqs": [(r.method, r.target) for r in self.reqs]}
+
+    def assert_untouched(self, settle: float = 0.3) -> None:
+        """The "reaches nothing" oracle: zero accepted connections, zero bytes, no wrap failure and no parsed request,
+        after a short drain wait. Plaintext into the TLS port, a bare connect and a body the origin never framed all count."""
+        time.sleep(settle)
+        t = self.touched()
+        assert t["conns"] == 0 and t["bytes"] == 0 and not t["wrap_failures"] and not t["reqs"], t
 
     def _serve(self, c: socket.socket) -> None:       # noqa: C901 - one wire reader, kept in one place
         c.settimeout(10)
         buf = b""
         try:
             if self.tls_ctx is not None:
-                c = self.tls_ctx.wrap_socket(c, server_side=True)
+                first = c.recv(65536, socket.MSG_PEEK)           # the first flight, left in the buffer for the handshake
+                self._count(len(first))
+                with self._lock:
+                    self.first_flights.append(first)
+                try:
+                    wrapped = self.tls_ctx.wrap_socket(c, server_side=True)
+                except (OSError, ValueError) as exc:             # ssl.SSLError is an OSError
+                    with self._lock:
+                        self.wrap_failures.append(type(exc).__name__)
+                    raise
+                c = wrapped                                      # the wrap detached the original fd: track the new socket
+                with self._lock:
+                    self._socks.append(c)
             while True:
                 while b"\r\n\r\n" not in buf:
                     buf += self._recv(c)
@@ -201,3 +235,127 @@ def autoanswer(launch, answer: str = "denied") -> threading.Event:
 
     threading.Thread(target=run, daemon=True).start()
     return stop
+
+
+class LeakyRelay:
+    """TEST-ONLY negative control: a deliberately leaky stand-in for the proxy, so a "reaches nothing" probe can be shown
+    RED. It accepts a client, answers the dialect's handshake as an open proxy would (`connect`: a 200 to CONNECT;
+    `socks`: SOCKS5 no-auth then success; `raw`: nothing, the bytes simply go through), then relays every byte both ways to
+    the origin on `origin_port`."""
+
+    def __init__(self, origin_port: int, dialect: str) -> None:
+        assert dialect in ("connect", "socks", "raw"), dialect
+        self.origin_port, self.dialect = origin_port, dialect
+        self._srv = socket.socket()
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(16)
+        self._srv.settimeout(0.2)
+        self.port = self._srv.getsockname()[1]
+        self._stop = False
+        self._socks: list[socket.socket] = []
+        self._lock = threading.Lock()
+        self._threads: list[threading.Thread] = [threading.Thread(target=self._accept, daemon=True)]
+        self._threads[0].start()
+
+    def _spawn(self, fn, *a) -> None:
+        t = threading.Thread(target=fn, args=a, daemon=True)
+        with self._lock:
+            self._threads.append(t)
+        t.start()
+
+    def _accept(self) -> None:
+        while not self._stop:
+            try:
+                c, _ = self._srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with self._lock:
+                self._socks.append(c)
+            self._spawn(self._serve, c)
+
+    @staticmethod
+    def _read_until_more(c: socket.socket, out: bytes, marker: bytes) -> bytes:
+        while marker not in out:
+            d = c.recv(4096)
+            if not d:
+                raise EOFError
+            out += d
+        return out
+
+    @staticmethod
+    def _read_exact(c: socket.socket, n: int) -> bytes:
+        out = b""
+        while len(out) < n:
+            d = c.recv(n - len(out))
+            if not d:
+                raise EOFError
+            out += d
+        return out
+
+    def _serve(self, c: socket.socket) -> None:
+        c.settimeout(10)
+        o = None
+        try:
+            head = b""
+            if self.dialect == "connect":
+                head = c.recv(4096)                               # anything that is not a CONNECT is simply relayed
+                if head.startswith(b"CONNECT "):
+                    head = self._read_until_more(c, head, b"\r\n\r\n")
+                    tail = head.split(b"\r\n\r\n", 1)[1]
+                    c.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    head = tail
+            elif self.dialect == "socks":
+                self._read_exact(c, self._read_exact(c, 2)[1])    # greeting: VER NMETHODS METHODS...
+                c.sendall(b"\x05\x00")
+                req = self._read_exact(c, 4)
+                if req[3] == 3:
+                    self._read_exact(c, self._read_exact(c, 1)[0] + 2)
+                else:
+                    self._read_exact(c, (4 if req[3] == 1 else 16) + 2)
+                c.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+            o = socket.create_connection(("127.0.0.1", self.origin_port), timeout=10)
+            with self._lock:
+                self._socks.append(o)
+            if head:
+                o.sendall(head)
+            self._spawn(self._pipe, o, c)
+            self._pipe(c, o)
+        except (OSError, EOFError):
+            pass
+
+    @staticmethod
+    def _pipe(src: socket.socket, dst: socket.socket) -> None:
+        try:
+            while True:
+                d = src.recv(65536)
+                if not d:
+                    break
+                dst.sendall(d)
+        except OSError:
+            pass
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        self._stop = True
+        with self._lock:
+            socks, threads = list(self._socks), list(self._threads)
+        for t in threads[:1]:
+            t.join(5)
+        try:
+            self._srv.close()
+        except OSError:
+            pass
+        for s in socks:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            s.close()
+        for t in threads[1:]:
+            t.join(5)

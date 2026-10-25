@@ -111,3 +111,63 @@ def make_tls_launch(tmp_path, monkeypatch):
             failed.append(exc)
     if failed:
         raise failed[0]
+
+
+@pytest.fixture
+def make_leaky_tls(tmp_path):
+    """`make()` builds the TEST-ONLY leaky stand-in (`tls_rig.LeakyTls`): an open relay to a TLS recording origin, the
+    negative control for every "reaches nothing" oracle. Closed at teardown."""
+    from .tls_rig import LeakyTls
+    made: list[LeakyTls] = []
+
+    def make() -> LeakyTls:
+        L = LeakyTls(tmp_path / f"X{len(made)}")
+        made.append(L)
+        return L
+
+    yield make
+    for L in made:
+        L.close()
+
+
+class LeakyPlain:
+    """TEST-ONLY negative control for the plain path: the launch's `raw` / `origin_port` / `stop` surface over an open
+    relay straight to a plain recording origin."""
+
+    def __init__(self, origin: RecordingOrigin) -> None:
+        from .rig import LeakyRelay
+        self.relay = LeakyRelay(origin.port, "raw")
+        self.origin_port = origin.port
+        self.port = self.relay.port
+
+    def raw(self, text: bytes, timeout: float = 10.0) -> bytes:
+        import socket
+        s = socket.create_connection(("127.0.0.1", self.relay.port), timeout=timeout)
+        try:
+            s.sendall(text)
+            out = b""
+            while b"\r\n\r\n" not in out:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                out += chunk
+            return out
+        finally:
+            s.close()
+
+    def stop(self) -> int:
+        return 0
+
+
+@pytest.fixture
+def make_leaky_plain():
+    made: list[LeakyPlain] = []
+
+    def make(origin: RecordingOrigin) -> LeakyPlain:
+        L = LeakyPlain(origin)
+        made.append(L)
+        return L
+
+    yield make
+    for L in made:
+        L.relay.close()
