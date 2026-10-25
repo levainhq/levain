@@ -29,7 +29,10 @@ it serves only these:
     is delivered, bound to the store identity it was made against, optionally carrying a structured envelope signed
     with a passkey and verified by that store, and an accepted drop starting the coordinator launch it asked for;
     ``consent.json`` lists the newest phone drops and their drop receipts as ``coord_drops`` and the store identity as
-    ``coord_store_id`` (:mod:`levain.coordinator.phone`).
+    ``coord_store_id`` (:mod:`levain.coordinator.phone`). ``GET /coord.json`` (the same token gate) lists the
+    coordinator's review queue as ``coord_review`` and its morning card as ``coord_morning`` (each with a ``*_note``
+    when it cannot be read); the page asks for it only while its Review tab is shown. A read-only view, no route here
+    clears or reopens an item.
   - ``POST /grant/<id>/revoke-challenge`` and ``.../revoke``: a consent grant revoked with a passkey made on the
     https name (the one authority link a passkey may sign), the challenge naming the grant's ``instance`` as listed,
     the link built and held here and verified by the authority log itself;
@@ -251,7 +254,7 @@ class _PhoneHandler(GuardedHandler):
             return
         try:
             state = _SIGN_STATE.fullmatch(route)
-            if route != "/consent.json" and state is None:
+            if route not in ("/consent.json", "/coord.json") and state is None:
                 if not self._app_route("GET", route, b"", head=head):
                     self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
                 return
@@ -264,7 +267,9 @@ class _PhoneHandler(GuardedHandler):
                 self._json({"error": "forbidden", "message": f"this page's token is needed, sent as {PHONE_TOKEN_HEADER}"},
                            403, head=head)
                 return
-            self._json(self.server.listing() if state is None else self.server.signer.state(state.group(1)), head=head)
+            self._json(self.server.signer.state(state.group(1)) if state is not None
+                       else self.server.coord.coord_listing() if route == "/coord.json" else self.server.listing(),
+                       head=head)
         except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is an answer, never a dead connection
             self._json({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}, 500, head=head)
         finally:

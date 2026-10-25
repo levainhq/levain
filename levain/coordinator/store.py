@@ -36,9 +36,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import secrets
 import sqlite3
+import stat
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -47,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from levain import unshowable
-from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
+from levain.autonomic.durable_sqlite import BUSY_WAIT_S, open_durable, read_transaction, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.contracts.canon import canonical, canonical_bytes
@@ -97,6 +99,11 @@ _EDGES: dict[tuple[str, str], frozenset[str]] = {
 
 class CoordError(Exception):
     """A request the store refuses: a malformed drop, an unknown thread, a step the grammar does not allow."""
+
+
+class StoreAbsent(CoordError):
+    """A read-only open found no coordinator store to read: no directory, no file, or a file without the coordinator's
+    current tables. Nothing was created."""
 
 
 class DropConflict(CoordError):
@@ -358,14 +365,15 @@ class CoordStore:
         self._woken: dict[str, str] = {}
 
     # --- store ---------------------------------------------------------------------------------------------------
-    def _statements(self) -> tuple[str, ...]:
+    def _statements(self, *, base: bool = False) -> tuple[str, ...]:
+        """The schema this opener makes. ``base`` is the plain coordinator's alone, without a subclass's added tables."""
         from levain.coordinator.lease import LEASE_SCHEMA
         from levain.coordinator.first_reader import FIRST_READER_SCHEMA
         from levain.coordinator.review import REVIEW_SCHEMA
         from levain.coordinator.teamdrafts import DRAFT_SCHEMA
 
         # the lease is checked by every opener's coordinator writes, so its tables are every opener's
-        return (*self._SCHEMA, *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA)
+        return (*(SCHEMA if base else self._SCHEMA), *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA)
 
     def _connect(self) -> sqlite3.Connection:
         conn = self._jobs._connect()
@@ -406,10 +414,52 @@ class CoordStore:
         conn.close()
         return self._connect()
 
-    def _schema_current(self, conn: sqlite3.Connection) -> bool:
+    def _check_directory_readonly(self) -> None:
+        """:meth:`JobStore._check_directory`'s rule (a directory of this uid's own, not a link, closed to group and
+        others) read with ``lstat`` and never made: a directory removed between a check and an open stays removed.
+        Raises :class:`StoreAbsent` when there is none."""
+        from levain.dispatch.jobs import _ACCESS_BY_OTHERS, JobStoreError
+
+        try:
+            st = os.lstat(self.directory)
+        except FileNotFoundError:
+            raise StoreAbsent(f"no coordinator store at {self.path}") from None
+        if not stat.S_ISDIR(st.st_mode):
+            raise JobStoreError(f"dispatch store directory {self.directory} is not a directory")
+        if st.st_uid != os.getuid():
+            raise JobStoreError(f"dispatch store directory {self.directory} is not owned by uid {os.getuid()}")
+        if st.st_mode & _ACCESS_BY_OTHERS:
+            raise JobStoreError(f"dispatch store directory {self.directory} is reachable by group or others "
+                                f"(mode {st.st_mode & 0o777:o}); it must be 0700")
+
+    def open_readonly(self) -> sqlite3.Connection:
+        """The ONE read-only connection to the coordinator's file, for every surface that only displays it (the review
+        queue, "waiting on you", the morning card, the cockpit panels, the phone route). It runs the write path's
+        directory rule (:meth:`_check_directory_readonly`) but never makes the directory, the file or a table: opened
+        ``mode=ro`` through ``Path.as_uri()`` (a ``?`` or ``#`` in the path stays in the path) and ``query_only``, and it
+        takes no write lock, so a reader never waits on the coordinator's writer. Raises :class:`StoreAbsent` when
+        there is nothing current to read; the caller closes the connection."""
+        self._check_directory_readonly()
+        if not self.path.exists():
+            raise StoreAbsent(f"no coordinator store at {self.path}")
+        conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=BUSY_WAIT_S,
+                               isolation_level=None)
+        try:
+            conn.execute(f"PRAGMA busy_timeout = {int(BUSY_WAIT_S * 1000)}")
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA query_only = ON")
+            # a display reads only the base tables: a store a plain CoordStore made (team drafts) has no envelope tables
+            if not self._schema_current(conn, base=True):
+                raise StoreAbsent(f"{self.path} does not hold the coordinator's current tables")
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+
+    def _schema_current(self, conn: sqlite3.Connection, *, base: bool = False) -> bool:
         from levain.dispatch.jobs import _SCHEMA as JOB_SCHEMA, FORMAT
 
-        if not schema_present(conn, (*JOB_SCHEMA, *self._statements())) or "gseq" not in {
+        if not schema_present(conn, (*JOB_SCHEMA, *self._statements(base=base))) or "gseq" not in {
                 r[1] for r in conn.execute("PRAGMA table_info(replies)")} \
                 or not {"replies_gseq", "replies_gseq_no_replace"} <= _names(conn):
             return False

@@ -1574,6 +1574,11 @@ def build_default_cockpit(
     # the Team zone: read-only, over the team ledger found from ``team_start`` or, failing that, from the source's
     # own install root; NEVER from the process's working directory (an unrelated repo's ledger is not this
     # source's). A source with neither draws no Team zone. The panel set follows the ledger's state.
+    # the coordinator panels (C4-b review queue, C6-b morning card): read-only, drawn only while the coordinator's
+    # store file exists, in the directory the consent reader names (the topology's dispatch directory)
+    from levain.cockpit.coordinator_panels import coordinator_discoverer
+
+    ck.discover(coordinator_discoverer(lambda: _dispatch_dir(ck.consent_reader)), retire=True)
     start = team_start if team_start is not None else source.install_root
     if start is not None:
         from levain.cockpit.team_panels import TeamSource, team_discoverer

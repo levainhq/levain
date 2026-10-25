@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.autonomic.durable_sqlite import read_transaction
-from levain.coordinator import budget, review
+from levain.coordinator import budget, deliver, review
 from levain.coordinator.store import CoordError, CoordStore
 
 __all__ = ["AGENTS", "away_from_drop", "card", "render", "skipped_lines"]
@@ -138,8 +138,17 @@ def _thread_of(conn: sqlite3.Connection, store: CoordStore, request_id: str, ses
     return ln.threads[0] if ln is not None and ln.role == "worker" and len(ln.threads) == 1 else None
 
 
-def card(store: CoordStore, *, queue_dir: Path | str | None = None) -> dict[str, Any]:
-    """The morning card's data (display only; see the module docstring)."""
+def card(store: CoordStore, *, queue_dir: Path | str | None = None, items: Sequence[review.Item] | None = None,
+         review_total: int | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+    """The morning card's data (display only; see the module docstring). Every section of the coordinator's store is
+    read inside ONE read transaction on one read-only connection: ``conn`` when the caller holds one (its response is
+    then made from its snapshot), else the card's own. ``items`` is a review queue the caller has already read
+    (``review.list_items(store, include_cleared=True)`` or the open ones): the card shows its open items and does not
+    read the queue again. ``review_total`` is the queue's open count when ``items`` is only a page of it (the card
+    then counts the queue, not the page)."""
+    if conn is None:
+        with read_transaction(store.open_readonly) as own:
+            return card(store, queue_dir=queue_dir, items=items, review_total=review_total, conn=own)
     qdir = Path(queue_dir) if queue_dir is not None else Path(store.directory)
     errors: list[str] = []
     try:
@@ -148,34 +157,45 @@ def card(store: CoordStore, *, queue_dir: Path | str | None = None) -> dict[str,
         # never read as "not away": an unreadable store is shown as unknown
         away = {a: {"away": None} for a in AGENTS}
         errors.append(f"away: {exc}"[:_FIELD])
+    # the one place an entry that is not a record becomes unknown: every surface reads the card, none re-checks it
+    away = {a: s if isinstance(s, dict) else {"away": None} for a, s in away.items()}
     try:
         undecided = _undecided(qdir)
     except sqlite3.Error as exc:
         undecided = []
         errors.append(f"undecided: {exc}"[:_FIELD])
     budgets: list[dict[str, Any]] = []
-    open_threads = [t.thread_id for t in store.threads()]
-    with read_transaction(store._connect) as conn:
-        now = store._stamp()
-        for u in undecided:
-            u["thread_id"] = _thread_of(conn, store, u["request_id"], u["session"])
-        for t in open_threads:
-            g = budget.gauge(conn, qdir, t)
-            if g is None:
-                continue
-            row = g.as_dict()
-            ref = f"{t}/{g.envelope_id}"
-            sign = conn.execute("SELECT reply_id FROM replies WHERE kind = 'sign' AND ref_store = ? AND ref_id = ?",
-                                (budget.SIGN_REF, ref)).fetchone()
-            row["sign"] = None if sign is None else {"reply_id": sign[0], "open": budget.sign_open(conn, ref, now)}
-            budgets.append(row)
+    now = store._stamp()
+    # one statement: a thread is open unless its latest state event says closed (as Thread.state reads it)
+    open_threads = [r[0] for r in conn.execute(
+        "SELECT t.thread_id FROM threads t WHERE COALESCE((SELECT e.value FROM thread_events e WHERE e.thread_id = "
+        "t.thread_id AND e.field = 'state' ORDER BY e.seq DESC LIMIT 1), '') != 'closed' ORDER BY t.rowid")]
+    for u in undecided:
+        u["thread_id"] = _thread_of(conn, store, u["request_id"], u["session"])
+    for t in open_threads:
+        g = budget.gauge(conn, qdir, t)
+        if g is None:
+            continue
+        row = g.as_dict()
+        ref = f"{t}/{g.envelope_id}"
+        sign = conn.execute("SELECT reply_id FROM replies WHERE kind = 'sign' AND ref_store = ? AND ref_id = ?",
+                            (budget.SIGN_REF, ref)).fetchone()
+        row["sign"] = None if sign is None else {"reply_id": sign[0], "open": budget.sign_open(conn, ref, now)}
+        budgets.append(row)
     budgets.sort(key=lambda b: (not b["refusal"], b["thread_id"]))
     waiting = review.waiting_on_you(store, sign_open=review.queue_request_open(qdir),
-                                    answer_open=review.question_open(qdir))
-    items = [{"item_id": i.item_id, "feed": i.feed, "thread_id": i.thread_id, "authority_relevant": i.authority_relevant,
-              "text": str(i.body.get("text", ""))[:_FIELD]} for i in review.list_items(store)]
+                                    answer_open=review.question_open(qdir), conn=conn)
+    try:
+        queue = review.list_items(store, conn=conn) if items is None else [i for i in items if i.state == "open"]
+    except (sqlite3.Error, CoordError) as exc:
+        queue = []
+        errors.append(f"review: {exc}"[:_FIELD])
+    items_out = [{"item_id": i.item_id, "feed": i.feed, "thread_id": i.thread_id,
+                  "authority_relevant": i.authority_relevant, "text": str(i.body.get("text", ""))[:_FIELD]}
+                 for i in queue]
     return {"at": now, "away": away, "any_away": any(a.get("away") for a in away.values()),
-            "undecided": undecided, "budgets": budgets, "waiting": waiting, "review": items, "errors": errors}
+            "undecided": undecided, "budgets": budgets, "waiting": waiting, "delivery_ran": review.last_pass(conn), "review": items_out,
+            "review_total": len(items_out) if review_total is None else review_total, "errors": errors}
 
 
 def render(c: dict[str, Any]) -> str:
@@ -186,7 +206,9 @@ def render(c: dict[str, Any]) -> str:
     L.append("away: " + (f"ON for {', '.join(away)}: SIGNs wait UNDECIDED; leaving takes your signature "
                          "(levain consent away off --signing-key KEY)" if away else "off")
              + (f"; UNKNOWN for {', '.join(unknown)} (the store could not be read)" if unknown else ""))
-    L.append(f"undecided ({len(c['undecided'])}):")
+    # a section card() could not read is said so, never printed as the empty list it fell back to
+    unread = {e.split(":", 1)[0] for e in c["errors"]}
+    L.append("undecided: could not read" if "undecided" in unread else f"undecided ({len(c['undecided'])}):")
     for u in c["undecided"]:
         L.append(f"  gap #{u['gap']} {u['agent']} {u['tool']}: {u['what']}"
                  + (f"  [thread {u['thread_id']}]" if u.get("thread_id") else "") + f"\n    rule it: {u['rule']}")
@@ -205,12 +227,10 @@ def render(c: dict[str, Any]) -> str:
             L.append(f"    SIGN to extend waits: levain envelope extend {b['thread_id']} --budget K=N,... -o FILE, "
                      "then levain envelope sign FILE")
     w = c["waiting"]
-    n = sum(len(v) for v in w["threads"].values()) + len(w["loose"])
-    L.append(f"waiting on you: {n}" + (f" ({len(w['unresolved'])} unreadable)" if w["unresolved"] else ""))
-    for t, recs in w["threads"].items():
-        L += [f"  [{t}] {r['kind'].upper()}: {str(r['text'])[:160]}" for r in recs]
-    L += [f"  {r['kind'].upper()}: {str(r['text'])[:160]}" for r in w["loose"]]
-    L.append(f"review queue: {len(c['review'])} open")
+    L += deliver.waiting_lines(w)
+    L.append("  " + deliver.pass_line(c["delivery_ran"]))
+    L.append("review queue: could not read" if "review" in unread
+             else f"review queue: {c['review_total']} open item(s)")
     L += [f"  {i['feed']}{' (yours to clear)' if i['authority_relevant'] else ''}: {i['text'][:160]}"
           for i in c["review"]]
     L += [f"could not read: {e}" for e in c["errors"]]

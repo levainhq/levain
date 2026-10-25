@@ -95,6 +95,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.autonomic.durable_sqlite import read_transaction, write_transaction
+from levain.coordinator.review import _REF_STORE
 from levain.coordinator.store import CoordError, CoordStore, _append_only
 
 __all__ = ["FIRST_READER_SCHEMA", "UNREAD_AFTER", "Reading", "answer", "claim_held", "claim_knows", "escalate",
@@ -324,7 +325,7 @@ def _answer_once(store: Any, ref: Any, option: str | None, text: str | None, tok
                 "kind": "option" if option is not None else "text", "value": option if option is not None else text,
                 "launch_id": got.launch_id, "thread_id": got.thread_id, "envelope_id": got.envelope_id,
                 "text": summary[:_TEXT_MAX]}
-        reply_id = store._reply(conn, got.thread_id, "know", "questions.db", q.id, body, now)
+        reply_id = store._reply(conn, got.thread_id, "know", _REF_STORE["answer"], q.id, body, now)
         item, _new = _insert(conn, now, "know", {"text": body["text"], "reply_id": reply_id, "question_id": q.id,
                                                  "what": q.what, "envelope_id": got.envelope_id},
                              dedupe_key=f"know:question:{q.id}", thread_id=got.thread_id, authority_relevant=True,
@@ -356,10 +357,10 @@ def escalate(store: Any, ref: Any, why: str, *, token: object) -> str:
             raise CoordError(f"question #{q.n} was answered by the operator; there is nothing to escalate")
         ln = lease.by_harness_session(conn, q.agent_session_id)
         thread_id = ln.threads[0] if ln is not None and len(ln.threads) == 1 else None
-        same = conn.execute("SELECT reply_id FROM replies WHERE kind = 'answer' AND ref_store = 'questions.db' AND "
-                            "ref_id = ?", (q.id,)).fetchone()
+        same = conn.execute("SELECT reply_id FROM replies WHERE kind = 'answer' AND ref_store = ? AND ref_id = ?",
+                            (_REF_STORE["answer"], q.id)).fetchone()
         reply_id = same[0] if same is not None else store._reply(
-            conn, thread_id, "answer", "questions.db", q.id,
+            conn, thread_id, "answer", _REF_STORE["answer"], q.id,
             {"text": f"question #{q.n}: {q.what}"[:_TEXT_MAX], "why": why, "by": "coordinator"}, now)
         conn.execute("INSERT INTO first_reads (question_id, outcome, reply_id, at) VALUES (?, 'escalated', ?, ?)",
                      (q.id, reply_id, now))
@@ -438,7 +439,8 @@ def _coordinator_token(conn: sqlite3.Connection, now: str) -> int | None:
 def hold_ping(directory: Path | str, question_id: str) -> bool:
     """Hold question ``question_id``'s filing ping when a coordinator holds the live lease (checked inside the write
     that records the hold): True when held, so the caller does not ping. False, and the caller pings as before, when
-    there is no coordinator store, no live coordinator lease, or anything fails (a ping is never lost to a fault)."""
+    there is no coordinator store, no live coordinator lease, the question's ANSWER record already exists (the delivery
+    pass won the race), or anything fails (a ping is never lost to a fault)."""
     d = Path(directory)
     if not (d / "dispatch.db").exists():
         return False
@@ -449,6 +451,9 @@ def hold_ping(directory: Path | str, question_id: str) -> bool:
             token = _coordinator_token(conn, now)
             if token is None:
                 return False
+            if conn.execute("SELECT 1 FROM replies WHERE kind = 'answer' AND ref_store = ? AND ref_id = ?",
+                            (_REF_STORE["answer"], question_id)).fetchone() is not None:
+                return False        # the question's ANSWER is already filed: it waits on the operator, so his ping goes
             conn.execute("INSERT INTO held_pings (question_id, lease_token, at) VALUES (?, ?, ?)",
                          (question_id, token, now))
             return True
@@ -503,15 +508,15 @@ def claim_held(directory: Path | str, *, after: timedelta | None = None) -> list
             if cause == "unread":
                 # the release IS the question's first read (an escalation), so a later ``coord answer`` or
                 # ``coord escalate`` on it is refused by name (L3 r3): the KNOW would contradict the push to him
-                same = conn.execute("SELECT reply_id FROM replies WHERE kind = 'answer' AND ref_store = 'questions.db' "
-                                    "AND ref_id = ?", (q.id,)).fetchone()
+                same = conn.execute("SELECT reply_id FROM replies WHERE kind = 'answer' AND ref_store = ? "
+                                    "AND ref_id = ?", (_REF_STORE["answer"], q.id)).fetchone()
                 if same is not None:
                     reply_id = same[0]
                 else:
                     ln = lease.by_harness_session(conn, q.agent_session_id)
                     reply_id = store._reply(
                         conn, ln.threads[0] if ln is not None and len(ln.threads) == 1 else None, "answer",
-                        "questions.db", q.id,
+                        _REF_STORE["answer"], q.id,
                         {"text": f"question #{q.n}: {q.what}"[:_TEXT_MAX], "by": "service",
                          "why": f"the coordinator had not read it {int(after.total_seconds() // 60)} minutes "
                                 "after it was filed"}, now)

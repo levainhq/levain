@@ -1137,6 +1137,8 @@ def run_coord(args: argparse.Namespace, out: Any = None) -> int:
             return _coord_first_reader(args, out, store)
         if cmd in ("morning", "away", "budget"):
             return _coord_c6(args, out, store)
+        if cmd == "review":
+            return _coord_review(args, out, store)
         if cmd == "launch":
             from levain.coordinator.launch import launch_session
 
@@ -1326,6 +1328,46 @@ def _coord_c6(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
     return 0
 
 
+def _coord_review(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
+    """``levain coord review list|clear|reopen|feeds`` (C4-a): the review queue. ``list`` and ``feeds`` run the feed
+    runner first (:func:`levain.coordinator.deliver.run`, the one call a panel's read path will make too)."""
+    from levain.coordinator import deliver, review
+
+    cmd = args.review_cmd
+    if cmd in ("clear", "reopen"):
+        act = review.clear_item if cmd == "clear" else review.reopen_item
+        item = act(store, args.item_id, mode=args.mode, token=args.token)
+        _emit(out, args.json, {"item_id": item.item_id, "state": item.state, "mode": args.mode},
+              f"{item.item_id} {'cleared' if cmd == 'clear' else 'reopened'} ({args.mode})")
+        return 0
+    ran = deliver.run(store)
+    delivery = ran["delivery"]
+    faults = deliver.faults(ran)
+    if cmd == "feeds":
+        ran["new_items"] = len(ran["feeds"].get("created", []))
+        lines = [f"feeds: {ran['new_items']} new review item(s)",
+                 f"delivery: {len(delivery['signs'])} SIGN and {len(delivery['answers'])} ANSWER pointer(s) "
+                 f"reached, {delivery['created']} new"]
+        lines += [f"could not read: {f}" for f in faults]
+        _emit(out, args.json, ran, "\n".join(lines))
+        return 1 if faults else 0
+    waiting = review.waiting_on_you(store, sign_open=review.queue_request_open(store.directory),
+                                    answer_open=review.question_open(store.directory))
+    items = review.list_items(store, include_cleared=args.all, feed=args.feed)
+    rows = [{"item_id": i.item_id, "feed": i.feed, "thread_id": i.thread_id, "state": i.state,
+             "authority_relevant": i.authority_relevant, "at": i.at, "text": str(i.body.get("text", ""))[:500]}
+            for i in items]
+    lines = [f"review queue: {len(rows)} {'item(s)' if args.all else 'open item(s)'}"]
+    for r in rows:
+        lines.append(f"  {r['item_id']}  {r['feed']}{' (yours to clear)' if r['authority_relevant'] else ''}"
+                     f"{'' if r['state'] == 'open' else ' [cleared]'}"
+                     + (f"  [thread {r['thread_id']}]" if r["thread_id"] else "") + f": {r['text'][:160]}")
+    lines += deliver.waiting_lines(waiting)
+    lines += [f"could not read: {f}" for f in faults]
+    _emit(out, args.json, {"items": rows, "waiting": waiting, "errors": faults}, "\n".join(lines))
+    return 1 if faults else 0
+
+
 def _record_workspace(target: Path) -> None:
     """Put ``target`` in the coordinator record the door reads (head ruling R1), before any setting names it."""
     from levain.coordinator import door
@@ -1349,6 +1391,18 @@ def _coord_agent_codex(args: argparse.Namespace, out: Any, store: EnvelopeStore)
     _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "detail": detail},
           f"coordinator agent: codex{f' ({got.model})' if got.model else ''} in {got.cwd}\n{detail}")
     return 0
+
+
+def review_feeds() -> tuple[str, ...]:
+    from levain.coordinator import review
+
+    return review.FEEDS
+
+
+def review_modes() -> tuple[str, ...]:
+    from levain.coordinator import review
+
+    return review.MODES
 
 
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
@@ -1552,6 +1606,27 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         description="The budget is the thread's head envelope's; usage is Q13's count of the worker sessions pinned to "
                     "the thread's envelopes. Crossing it stops new steps; a SIGN extends it (levain envelope extend).")
     cbu.add_argument("thread", nargs="?", default=None, metavar="THREAD")
+    crv = c_sub.add_parser(
+        "review", help="The review queue: what waits for a look and never pushes (list, clear, reopen, feeds).",
+        description="list and feeds first run the feed runner: every mechanical feed, and the delivery pass that files a "
+                    "SIGN or ANSWER pointer for each open consent request or question of a coordinator thread. "
+                    "Running either again files nothing new. Clearing is yours (manual), a fresh session you asked "
+                    "(fresh), or the coordinator's own mode, which is refused for an authority-relevant item.")
+    rv_sub = crv.add_subparsers(dest="review_cmd", required=True)
+    rvl = rv_sub.add_parser("list", help="Open items and what waits on you.")
+    rvl.add_argument("--all", action="store_true", help="Cleared items too.")
+    rvl.add_argument("--feed", default=None, choices=review_feeds(), help="Only this feed.")
+    rvc = rv_sub.add_parser("clear", help="Clear an open item.")
+    rvo = rv_sub.add_parser("reopen", help="Open a cleared item again.")
+    for p in (rvc, rvo):
+        p.add_argument("item_id", metavar="ITEM")
+        p.add_argument("--mode", default="manual", choices=review_modes(),
+                       help="manual (you, the default), fresh (a fresh session you asked), coordinator (needs --token).")
+        token(p)
+    rvf = rv_sub.add_parser("feeds", help="Run the feeds and the delivery pass once and say what they reached.")
+    for p in (rvl, rvc, rvo, rvf):
+        common(p)
+        p.set_defaults(func=run_coord)
     for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces, cmo, caw, cbu):
         common(p)
         p.set_defaults(func=run_coord)

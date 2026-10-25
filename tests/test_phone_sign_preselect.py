@@ -1,5 +1,5 @@
 """Phone preselect (project_memory 1025-18/preselect/DESIGN.md §2): a sign link may carry ``choice=<key>``, the option
-the operator tapped on his phone. The page opens on that card with a "Sign (<key>) with Face ID" button and the exact
+the operator tapped on his phone. The page opens on that card with a "Sign (<key>) with your screen lock" button (headless Chrome is not an iPhone; an iPhone says Face ID) and the exact
 line it signs; the tap runs the same challenge as the option's own button, so the bytes signed are still built by the
 server from the request file. A key the card does not offer draws nothing and says so. A linked request no longer open
 says where it stands on the first listing (``GET /sign/<id>/state``).
@@ -207,7 +207,7 @@ def test_his_pick_opens_as_one_sign_button_whose_tap_signs_exactly_that_option(t
         _shot(tmp_path, "pick-b-signed-390.png")])
     seen = next(v for v in got["values"] if isinstance(v, dict) and "miss" in v)
     want = choice_line("b", "hold for the morning")
-    assert seen["picked"] == {"button": "Sign (b) with Face ID", "line": want,
+    assert seen["picked"] == {"button": "Sign (b) with your screen lock", "line": want,
                               "words": "you picked (b) on your phone; any other option below still signs instead"}, seen
     assert seen["miss"] is None and seen["options"] == 2 and seen["shownAbove"] and seen["first"], seen
     # r1 item 5: the card's first screen says the tap carried his pick, and where its button is
@@ -461,7 +461,7 @@ def test_the_app_built_link_sign_v_choice_draws_the_shortcut_and_v_alone_draws_n
     got = _drive(tmp_path, base + "&choice=b", steps)
     seen = [v for v in got["values"] if isinstance(v, dict) and "miss" in v]
     assert len(seen) == 2, got["values"]
-    assert seen[0]["picked"] is not None and seen[0]["picked"]["button"] == "Sign (b) with Face ID", seen
+    assert seen[0]["picked"] is not None and seen[0]["picked"]["button"] == "Sign (b) with your screen lock", seen
     assert seen[0]["top"] == "Your pick: (b). Read the item; Sign (b) is below it." and seen[0]["miss"] is None, seen
     assert seen[1]["picked"] is None and seen[1]["top"] is None and seen[1]["miss"] is None, seen
     assert seen[1]["options"] == 2 and seen[1]["first"], seen

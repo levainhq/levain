@@ -26,6 +26,7 @@
   <button type="button" role="tab" id="tab-notes" data-view="notes" aria-selected="false">Notifications</button>
   <button type="button" role="tab" id="tab-grants" data-view="grants" aria-selected="false">Grants</button>
   <button type="button" role="tab" id="tab-drop" data-view="drop" aria-selected="false">Drop</button>
+  <button type="button" role="tab" id="tab-review" data-view="review" aria-selected="false">Review</button>
 </nav>
 <div id="view-needs">
 <p id="status" class="status" role="status">reading the queue…</p>
@@ -79,6 +80,14 @@
   <div id="drop-outbox"></div>
   <div class="panel-head"><h2>sent from the phone</h2><span id="drop-recent-meta" class="meta"></span></div>
   <div id="drop-recent"></div>
+</section>
+<section id="review" class="view" hidden>
+  <div class="panel-head"><h2>morning card</h2><span id="morning-meta" class="meta"></span></div>
+  <div id="morning"></div>
+  <div class="panel-head"><h2>review queue</h2><span id="review-meta" class="meta"></span></div>
+  <div id="review-list"></div>
+  <div class="panel-head"><h2>cleared</h2><span id="review-cleared-meta" class="meta"></span></div>
+  <div id="review-cleared"></div>
 </section>
 <script src="/phone_app.js"></script>
 <script src="/phone.js"></script>
