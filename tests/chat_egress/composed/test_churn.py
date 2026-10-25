@@ -69,8 +69,9 @@ def test_continuous_churn_is_bounded_and_a_valid_request_still_completes(make_or
     assert L.request("GET", "/warm")[0] == 200
     fds0, rss0 = _fds(pid), _rss_kb(pid)
     stop = threading.Event()
-    counts = [0, 0]                 # connections made, whole heads sent
-    ths = [threading.Thread(target=_churn, args=(L.port, origin.port, stop, counts, i), daemon=True) for i in range(4)]
+    per_thread = [[0, 0] for _ in range(4)]     # per churn thread: connections made, whole heads sent (one writer each)
+    ths = [threading.Thread(target=_churn, args=(L.port, origin.port, stop, per_thread[i], i), daemon=True)
+           for i in range(4)]
     ok = []
     try:
         for t in ths:
@@ -85,6 +86,7 @@ def test_continuous_churn_is_bounded_and_a_valid_request_still_completes(make_or
         for t in ths:
             t.join(10)
     assert not any(t.is_alive() for t in ths)
+    counts = [sum(c[0] for c in per_thread), sum(c[1] for c in per_thread)]
     st_after = L.request("GET", "/after")[0]
     fds1, rss1 = _fds(pid), _rss_kb(pid)
     print(f"C3 churn: {counts[0]} connections in {CHURN_S}s; valid requests {len(ok)} all {sorted({s for s, _ in ok})}, "
@@ -93,13 +95,15 @@ def test_continuous_churn_is_bounded_and_a_valid_request_still_completes(make_or
     assert ok and all(s == 200 for s, _ in ok) and st_after == 200
     assert fds1 - fds0 <= FD_GROWTH, (fds0, fds1)
     assert rss1 - rss0 <= RSS_GROWTH_KB, (rss0, rss1)
-    # every submitted request reaches a terminal row, then the origin holds no connection over a quiet interval
-    # (no upstream socket outlives its client: C2's observable)
+    # quiet = the decider holds no request in a decision (none live, none with a decision thread), the origin holds no
+    # connection and the row count is stable, over one interval (no upstream socket outlives its client: C2's observable)
     quiet_since, last_rows = None, -1
     end = time.monotonic() + 20
     while time.monotonic() < end:
         n = len(L.records.rows(L.launch_id))
-        if origin.open_conns == 0 and n == last_rows:
+        with L.d._live_lock:
+            deciding = len(L.d._active) + len(L.d._live)
+        if deciding == 0 and origin.open_conns == 0 and n == last_rows:
             quiet_since = quiet_since or time.monotonic()
             if time.monotonic() - quiet_since >= 1.5:
                 break
@@ -108,7 +112,7 @@ def test_continuous_churn_is_bounded_and_a_valid_request_still_completes(make_or
         last_rows = n
         time.sleep(0.2)
     else:
-        raise AssertionError(f"never quiet: open_conns {origin.open_conns}, rows {last_rows}")
+        raise AssertionError(f"never quiet: deciding {deciding}, open_conns {origin.open_conns}, rows {last_rows}")
     assert origin.open_conns == 0, origin.open_conns
     assert L.stop() == 0
     assert L.stderr.stat().st_size <= STDERR_BYTES
@@ -120,6 +124,7 @@ def test_continuous_churn_is_bounded_and_a_valid_request_still_completes(make_or
     valid = counts[1] + len(ok) + 2              # whole heads churned, the /during requests, /warm and /after
     attempts = [r for r in rows if r.kind == "egress_attempt"]
     print("C3 rows by kind:", {k: sum(1 for r in rows if r.kind == k) for k in {r.kind for r in rows}}, "valid", valid)
+    assert len(attempts) >= len(ok) + 2, (len(attempts), len(ok))   # every request the test waited on has its row
     assert len(attempts) <= valid, (len(attempts), valid)   # an attempt row per decided request, not per connection
 
 
