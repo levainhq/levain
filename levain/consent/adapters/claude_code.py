@@ -1601,8 +1601,8 @@ def queue_unresolved(event: Any) -> dict[str, Any] | None:
     """:func:`main`'s answer for a PreToolUse when no queue directory could be resolved (:func:`default_queue_dir`
     raised: a ``$LEVAIN_HOME`` that cannot be expanded, or no home): with no queue and no settings, only the
     levain home is protected (:func:`levain_home_protected`, which never raises) and :func:`gate_class` classifies
-    the call: one that targets it, other agent config or an irreversible Bash call is denied with the hard stop, and
-    every other call has no decision, so a read is not an outage."""
+    the call: a file-tool call that targets it or other agent config is denied with the hard stop, and every other
+    call has no decision, so a read is not an outage. Bash is never parsed, so a Bash call gets no decision."""
     try:
         tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input") or {}, event.get("cwd")
         if not isinstance(tool_name, str) or not isinstance(cwd, str) or not os.path.isabs(cwd):
