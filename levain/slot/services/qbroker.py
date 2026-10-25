@@ -7,8 +7,8 @@ served on its §2.2 socket with the uid and group of the slot's primary account 
 A slot whose account, group or socket dir is not there yet is logged and tried again at the next scan; the scan repeats
 every :data:`RESCAN_S`, so a slot ``replenish`` adds is served without restarting the unit. A slot that
 :data:`MISSES_TO_STOP` scans in a row do not find in service (gone from ``L/slots/``, or retired) stops being served,
-the connections it holds closed. A scan that cannot read the slot list, or one slot's state record, changes nothing it
-could not read: what runs keeps running.
+the connections it holds closed; a slot whose state record cannot be read counts as a miss (fail closed, one bad read
+absorbed). A scan that cannot read the slot list itself changes nothing: what runs keeps running.
 
 Before it binds anything it takes the service-instance lock (``L/queue/requests/service.lock``): a listener unlinks a
 socket already at its path, so a second instance would otherwise take the first one's sockets from under it. Runs until
@@ -42,8 +42,8 @@ INSTANCE_LOCK = "service.lock"
 INSTANCE_WAIT_S = 10.0
 EX_INSTANCE_HELD = 75                                     # EX_TEMPFAIL
 EX_WRONG_USER = 77                                        # EX_NOPERM
-#: PROVISIONAL (head rules, L3 r1 item 6): consecutive scans that must miss a served slot before it is stopped, so a
-#: directory renamed for the moment one scan reads ``L/slots/`` does not drop its clients.
+#: PROVISIONAL (head rules, L3 r1 item 6): consecutive scans that must miss a served slot (not in service, or its
+#: state record unreadable) before it is stopped, so one scan that catches a rename or a rewrite does not drop its clients.
 MISSES_TO_STOP = 2
 
 
@@ -120,12 +120,11 @@ class Slots:
             return
         self._failed.pop(-1, None)
         for n, why in unreadable.items():
-            self._note(n, f"its state record could not be read ({why}); left as it is")
+            self._note(n, f"its state record could not be read ({why}); not served once it misses {MISSES_TO_STOP} scans")
         for n in list(self.running):
-            if n in want or n in unreadable:
+            if n in want:
                 self._missed.pop(n, None)
-                if n in want:
-                    self._failed.pop(n, None)
+                self._failed.pop(n, None)
                 continue
             self._missed[n] = self._missed.get(n, 0) + 1
             if self._missed[n] < MISSES_TO_STOP:

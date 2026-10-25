@@ -294,29 +294,47 @@ def test_the_served_set_is_install_helpers_slots_in_service(layout):
     assert SQ.scan(s)[0] == want == [0, 2, 3]
 
 
-def test_a_slot_whose_state_cannot_be_read_is_neither_started_nor_stopped(layout):
+def test_a_slot_whose_state_cannot_be_read_is_never_started_and_stopped_after_two_scans(layout):
     L, R = layout
     add_slot(L, R, 0)
     add_slot(L, R, 1)
     logs = []
     slots = SQ.Slots("broker", seams(L, R), log=logs.append, listener=FakeListener)
     slots.sync()
+    first = slots.running[0]
     (L / "slots" / "e0" / "state").write_bytes(b"not a state record")
     (L / "slots" / "e1" / "state").write_bytes(b"not a state record")
     del slots.running[1]                               # as if it had never started
-    slots.sync()
-    slots.sync()
-    assert sorted(slots.running) == [0] and not slots.running[0].stopped
+    slots.sync()                                      # one unreadable scan is absorbed
+    assert sorted(slots.running) == [0] and not first.stopped
+    slots.sync()                                      # the second fails closed: a miss like any other
+    assert slots.running == {} and first.stopped
     assert len([m for m in logs if m.startswith("slot 1: its state record could not be read")]) == 1
 
 
-def test_any_failure_reading_the_slot_list_keeps_what_runs(layout):
+def test_configured_slots_skips_a_name_whose_digits_are_not_ascii(layout):
+    L, R = layout
+    add_slot(L, R, 0)
+    (L / "slots" / "e\u00b2").mkdir()                 # "²".isdigit() is True and int("²") raises ValueError
+    (L / "slots" / "v\u0661").mkdir()                 # int("١") == 1: not the name "v1"
+    store = H.Store(seams(L, R))
+    try:
+        assert H.configured_slots(store) == {"egress": frozenset({0}), "none": frozenset()}
+    finally:
+        store.close()
+
+
+def test_any_failure_reading_the_slot_list_keeps_what_runs(layout, monkeypatch):
     L, R = layout
     add_slot(L, R, 0)
     logs = []
     slots = SQ.Slots("broker", seams(L, R), log=logs.append, listener=FakeListener)
     slots.sync()
-    (L / "slots" / "e²").mkdir()      # "²".isdigit() is True and int("²") raises ValueError: a corrupt store
+
+    def corrupt(store):
+        raise ValueError("a corrupt store")   # configured_slots raised this on L/slots/e² before its isascii() check
+
+    monkeypatch.setattr(H, "configured_slots", corrupt)
     slots.sync()
     slots.sync()
     assert sorted(slots.running) == [0] and not slots.running[0].stopped

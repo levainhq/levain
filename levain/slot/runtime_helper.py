@@ -838,7 +838,8 @@ def configured_slots(store: Store) -> Dict[str, frozenset]:
     with store.dir("slots") as fd:
         names = os.listdir(fd)
         for name in names:
-            if len(name) < 2 or name[0] not in "ev" or not name[1:].isdigit() or str(int(name[1:])) != name[1:]:
+            if len(name) < 2 or name[0] not in "ev" or not name[1:].isascii() or not name[1:].isdigit() \
+                    or str(int(name[1:])) != name[1:]:
                 continue
             try:
                 st = os.stat(name, dir_fd=fd, follow_symlinks=False)
