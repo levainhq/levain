@@ -34,7 +34,8 @@ ALL_VERBS = ("LEASE-OPEN", "STATUS", "ATTACH", "CAS", "MINT", "FRONT-ARM", "SECR
              "RUN-TICKET-CANCEL", "ROUTE-SUBMIT", "CONFIG-SUBMIT", "SESSION-EVENTS", "ARTIFACT-ACK", "POOL",
              "NOT-A-VERB")
 SESSION2 = {"operator": {"LEASE-OPEN", "STATUS"},
-            "root": {"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET"},
+            # S1 3c-7 adds root's SLOT-SYNC (CONTRACT §3.3 root row, §3.5 Pool)
+            "root": {"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET", "SLOT-SYNC"},
             "qbroker": {"QUEUE-RESOLVE"},
             # S1 3c-3 adds keys' attachment verbs (CONTRACT §4.5; 3c design r3 §2.1)
             # S1 3c-6b adds keys' LINEAGE-APPEND (CONTRACT §3.3 keys row; H6-2)
@@ -44,7 +45,9 @@ SESSION2 = {"operator": {"LEASE-OPEN", "STATUS"},
                          # S1 3c-5 adds the ticket verbs (CONTRACT §3.3, §3.5)
                          "RUN-TICKET-MINT", "RUN-TICKET-CANCEL", "RUN-TICKET-STATUS",
                          # S1 3c-5 session 2: a ticket-bound lease (CONTRACT §3.1 step 1)
-                         "LEASE-OPEN"}}
+                         "LEASE-OPEN",
+                         # S1 3c-7: the pool count (CONTRACT §3.3 dispatch row, §3.5 Pool)
+                         "POOL"}}
 
 
 def attach_claims(**kw) -> dict:
@@ -675,9 +678,9 @@ def test_alloc_only_orphan_reclaimed(env):
     assert root.ask("REVOKE", session=S3)["generation"] == 0
     rec = env.record(S3)
     assert (rec.state, rec.generation, rec.claims, rec.lease_live, rec.event_kind) == ("REVOKED", 0, {}, False, "state")
-    assert env.seams.calls == [("wake",), ("drop", S3)]
+    assert env.seams.calls == [("wake",), ("wake",), ("drop", S3)]   # the start's wake, then REVOKE's
     assert root.ask("REVOKE", session=S3)["generation"] == 0          # a no-op answering its generation
-    assert env.seams.calls == [("wake",), ("drop", S3)]
+    assert env.seams.calls == [("wake",), ("wake",), ("drop", S3)]
     assert S3 in root.ask("REVOKED-SET")["sessions"]
     assert cas(root, S3, 0, "REVOKED", "FROZEN")["generation"] == 1    # END runs from alloc as usual
 

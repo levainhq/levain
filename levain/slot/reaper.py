@@ -12,7 +12,8 @@ The pass (§4.3), in this fixed order; each step try-locks and skips what is bus
 and named in the heartbeat, never the end of the pass:
 0 the ``*.new`` sweep · 1 dead-holder REVOKE · 2 journal reconciliation · 3 END, the HELD retry, and SCRUB again for a
 RETAINED session whose slot is still leased to it (RH5) · 3a the orphan ``leased`` revert · 3b/3c, 5 seams · 4 BRAKE
-below V5 · 6 reserve refill · 7 pool health · 8 the heartbeat. With CONTROL down only the local steps run (0, 6, 8).
+below V5 · 6 reserve refill · 7 pool health and ``SLOT-SYNC`` · 8 the heartbeat. With CONTROL down only the local steps
+run (0, 6, 8).
 Lock order: pool -> slot -> session END lock; the reaper never takes the install lock.
 """
 from __future__ import annotations
@@ -605,11 +606,13 @@ class Reaper:
 
     def pool_health(self, ctx: H.Ctx, rep: Dict[str, object]) -> None:
         """``dispatch_eligible`` recomputed (false for a slot whose ``keep/`` holds a credential or that has a
-        baseline), written only where it changed, under the pool lock and the slot lock (both TRIED). ``SLOT-SYNC`` is
-        a seam until CONTROL serves it (session 3c)."""
+        baseline), written only where it changed, under the pool lock and the slot lock (both TRIED); then, still under
+        the pool lock, every state file read (:func:`levain.slot.runtime_helper.slot_snapshot`), and after the pool lock
+        is released that snapshot sent as ``SLOT-SYNC`` (§3.5 Pool: the pool lock is held only for state writes and the
+        snapshot read). A busy pool lock skips both: a lost sync costs one pass. A refused sync is named in the
+        heartbeat (``slot-sync:<refusal>``)."""
         from levain.slot.install_helper import _operator_held
 
-        rep["skipped"].append("slot-sync:seam-unbuilt")                 # type: ignore[union-attr]
         with _PoolLock(ctx.store) as pool:
             if not pool.held:
                 rep["skipped"].append("pool-health:pool-busy")          # type: ignore[union-attr]
@@ -626,6 +629,11 @@ class Reaper:
                         new = replace(st, rev=st.rev + 1, dispatch_eligible=want,
                                       changed_at=R.timestamp(self.seams.clock()))
                         ctx.store.replace(("slots", slot.tag), "state", R.slot_state_bytes(new), mode=0o644)
+            snapshot = H.slot_snapshot(ctx.store)
+        try:
+            ctx.call("SLOT-SYNC", slots=snapshot)
+        except Refused as e:
+            rep["skipped"].append(f"slot-sync:{e.name}")                # type: ignore[union-attr]
 
     # -- step 8: the heartbeat (DESIGN Q5) -----------------------------------------------------------------------------
 
