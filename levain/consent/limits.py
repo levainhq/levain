@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import stat
@@ -133,7 +134,8 @@ class Verdict:
 
     ``state``: ``ok`` (counted, under every limit) · ``crossed`` (counted, ``kind`` is past its limit: hold it) ·
     ``halted`` (the root has an unreleased limit halt: deny, nothing counted) · ``not_counting`` (the store failed:
-    the call proceeds) · ``fail_deny`` (the store failed :data:`FAIL_DENY_AFTER` times in a row: deny)."""
+    the call proceeds) · ``fail_deny`` (the store failed :data:`FAIL_DENY_AFTER` times in a row: deny) ·
+    ``other_agent`` (``count_call(one_agent=True)``: the root is counted under another agent; deny, nothing counted)."""
     state: str
     kind: str | None = None
     count: float | None = None
@@ -276,7 +278,8 @@ def _open_halt(conn: sqlite3.Connection, agent: str, root: str) -> dict[str, Any
 
 def count_call(queue_dir: Path | str, agent: str, session: str, event: Mapping[str, Any], *,
                tool_name: str, tool_input: Any, now: float | None = None,
-               limits: Mapping[str, float] | None = None, count_crossed: bool = True) -> Verdict:
+               limits: Mapping[str, float] | None = None, count_crossed: bool = True,
+               one_agent: bool = False) -> Verdict:
     """Count one ``PreToolUse`` call of ``session`` (Claude Code's subagent key included) and say whether it may go on.
     Never raises: a failure is ``not_counting`` (proceed) or, past :data:`FAIL_DENY_AFTER`, ``fail_deny``.
     ``count_crossed=False``: every failure is ``fail_deny``, and a call answered ``crossed`` is not counted, for a
@@ -285,7 +288,10 @@ def count_call(queue_dir: Path | str, agent: str, session: str, event: Mapping[s
     root, whatever it is and however long after, is answered ``crossed`` at that count and counts nothing, until the
     limit in force no longer crosses at it (the operator raised it); then the latch is dropped and the call is counted
     as any other. Without it a ``repeat`` would free the session at the next different call and ``active_hours`` after
-    a gap of :data:`ACTIVE_GAP`. A latch row that cannot be read is a store failure (it is kept, never dropped)."""
+    a gap of :data:`ACTIVE_GAP`. A latch row that cannot be read is a store failure (it is kept, never dropped).
+    ``one_agent=True``: a root the store holds a count or a latch for under another agent is answered
+    ``other_agent`` in the counting transaction, nothing counted, so the root's agent is the one its first counted call
+    named (the queue broker's GATE, whose frame names the agent)."""
     qdir = Path(queue_dir)
     root = session_root(session)
     fail = _fail_path(qdir, agent, root)
@@ -294,7 +300,7 @@ def count_call(queue_dir: Path | str, agent: str, session: str, event: Mapping[s
             raise ValueError(f"unknown agent {agent!r}")
         in_force = dict(limits) if limits is not None else _limits_or_defaults(qdir, agent)
         verdict = _count(qdir, agent, root, event, tool_name, tool_input,
-                         time.time() if now is None else now, in_force, count_crossed)
+                         time.time() if now is None else now, in_force, count_crossed, one_agent)
     except Exception as exc:  # noqa: BLE001 - a brake never stops work on its own failure, until it is a runaway's
         halt = _halt_read_only(qdir, agent, root)
         if halt is not None:            # a halt is never lifted by the store failing to take the count
@@ -402,7 +408,7 @@ def _limits_or_defaults(qdir: Path, agent: str) -> dict[str, float]:
 
 
 def _count(qdir: Path, agent: str, root: str, event: Mapping[str, Any], tool_name: str, tool_input: Any,
-           now: float, in_force: Mapping[str, float], count_crossed: bool = True) -> Verdict:
+           now: float, in_force: Mapping[str, float], count_crossed: bool = True, one_agent: bool = False) -> Verdict:
     from levain.cockpit.session_context import spend_step
 
     digest = hashlib.sha256(f"{tool_name}\0{tool_input_digest(tool_input)}".encode()).hexdigest()[:16]
@@ -411,6 +417,13 @@ def _count(qdir: Path, agent: str, root: str, event: Mapping[str, Any], tool_nam
     transcript = _transcript(event)
     with write_transaction(lambda: _connect(qdir)) as conn:
         _ensure(conn)
+        if one_agent:
+            others = sorted({a for a, in conn.execute("SELECT agent FROM sessions WHERE root = ? AND agent != ? UNION "
+                                                      "SELECT agent FROM latches WHERE root = ? AND agent != ?",
+                                                      (root, agent, root, agent))})
+            if others:
+                return Verdict("other_agent", reason=f"this session is counted under {', '.join(others)}; a call "
+                                                     f"naming {agent} is refused (a session has one agent)")
         halt = _open_halt(conn, agent, root)
         row = conn.execute("SELECT calls, active_s, first_at, last_at, fresh, cache_read, window, recent_ids, spend, "
                            "scale, transcript FROM sessions WHERE agent = ? AND root = ?", (agent, root)).fetchone()
@@ -484,13 +497,14 @@ def _over(kind: str, count: float, limit: float) -> bool:
 def _latched(conn: sqlite3.Connection, agent: str, root: str, lim: Mapping[str, float]) -> tuple[str, float] | None:
     """Inside the counting transaction: the root's first latch (in :data:`KINDS` order) that still crosses the limit
     in force, as (kind, count); every latch that no longer crosses is deleted. A row that cannot be read (a kind
-    outside :data:`KINDS` or the limits, a count that is not a number) raises :class:`LatchUnreadable`, so the
-    transaction rolls back with the row kept and the caller fails closed: deleting it would free a held session."""
+    outside :data:`KINDS` or the limits, a count that is not a number, or one no crossing writes: not finite,
+    negative, or not whole for a kind other than ``active_hours``) raises :class:`LatchUnreadable`, so the transaction
+    rolls back with the row kept and the caller fails closed: deleting it would free a held session."""
     held = []
     for kind, count in conn.execute("SELECT kind, count FROM latches WHERE agent = ? AND root = ?",
                                     (agent, root)).fetchall():
         if kind not in KINDS or kind not in lim or isinstance(count, bool) or not isinstance(count, (int, float)) \
-                or count != count:
+                or not math.isfinite(count) or count < 0 or (kind != "active_hours" and count != int(count)):
             raise LatchUnreadable(f"an unreadable latch row ({str(kind)[:40]!r}, {str(count)[:40]!r})")
         if _over(kind, count, lim[kind]):
             held.append((KINDS.index(kind), kind, float(count)))

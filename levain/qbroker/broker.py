@@ -51,7 +51,11 @@ session is the resolve's, never the frame's.
   counted, so a limit the operator raises later is not found spent by the calls it denied; the crossing LATCHES
   instead, so every later call of the session is over-limit until the limit in force is above the latched count),
   kept in ``requests/limits/limits.db`` (:meth:`Broker._limits_dir`), keyed by the
-  resolved session and the agent the frame names (its own hook's: it selects a count, never a lower one); the
+  resolved session and the agent the frame names. That agent is the hook's word, so the count is taken with
+  ``one_agent=True``: a session the store already counts under another agent is ``limits-failed``, nothing counted,
+  and a session's agent is the one its first counted GATE named, across broker restarts. One limited GATE of a
+  session root runs at a time, from the limits read to the count, so a GATE holding an older limit never judges a
+  latch a newer one wrote. The
   limits in force are ``limits(agent, session)``, the Broker's settings callable (production:
   :class:`levain.qbroker.limits.PolicyLimits`, read from ``L/policy/limits``; ``None``, a test's broker, every call
   GO, nothing counted). The callable raising :class:`~levain.qbroker.limits.LimitsUnavailable` answers
@@ -214,16 +218,17 @@ def slot_limits(in_force: Any) -> dict[str, float] | None:
     """What the counter runs with from the settings callable's answer: each of
     :data:`levain.slot.limits_doc.SLOT_KINDS` a number in its :data:`levain.slot.limits_doc.SLOT_RANGE` (the token kinds
     unlimited: a slot counts none), or ``None`` when the answer is not that (``None`` itself, a kind missing, a value
-    that is not a number or is outside its range, NaN and infinities included): a kind left out is never read as
-    unlimited (slot limits R1 F1). The range is compared before ``float()``, so an integer too large for a float is
-    refused here rather than raising."""
+    that is not a number, not a whole number (``2.0`` is one, ``1.5`` is not) or is outside its range, NaN and
+    infinities included): a kind left out is never read as unlimited (slot limits R1 F1). The range is compared before
+    ``float()`` and ``int()``, so an integer too large for a float and an infinity are refused here rather than
+    raising."""
     if not isinstance(in_force, Mapping):
         return None
     full = {k: float("inf") for k in limits_doc.KINDS}
     for kind in limits_doc.SLOT_KINDS:
         v = in_force.get(kind)
         lo, hi = limits_doc.SLOT_RANGE[kind]
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi or v != int(v):
             return None
         full[kind] = float(v)
     return full
@@ -348,6 +353,9 @@ class Broker:
         self._verdicts: OrderedDict[str, tuple[tuple[int, ...], SignersSnapshot | None, str | None]] = OrderedDict()
         # session -> its rows' request ids at HALT_TIER (an index of the rows, read back from them at every GATE)
         self._halting: dict[str, set[str]] = {}
+        # counted root (consent_limits.session_root) -> the lock its limited GATEs run under, held across the limits
+        # read and the count (Broker._gate)
+        self._root_locks: dict[str, threading.Lock] = {}
         started = clock()
         now = utc_stamp(started)
         filed = []
@@ -764,8 +772,19 @@ class Broker:
             return wire.answer(rid, gate="halted", request_id=halting)
         if self._limits is None:
             return wire.answer(rid, gate="go")
+        root = consent_limits.session_root(who.session)
+        with self._mutex:
+            lock = self._root_locks.setdefault(root, threading.Lock())
+        # one limited GATE of a root at a time, from its limits read to its count: a GATE holding an older limit never
+        # judges a latch a newer one wrote (stack L3 r1 codex HIGH)
+        with lock:
+            return self._gate_limited(slot, rid, agent, who.session, tool_name, digest, tid)
+
+    def _gate_limited(self, slot: int, rid: int, agent: str, session: str, tool_name: str, digest: str,
+                      tid: str | None) -> dict[str, Any]:
+        """GATE's limits step, under the root's lock (:meth:`_gate`)."""
         try:
-            in_force = self._limits(agent, who.session)
+            in_force = self._limits(agent, session)
         except LimitsUnavailable as exc:
             return wire.answer(rid, gate="limits-failed", reason=str(exc.reason)[:512])
         except Exception as exc:  # noqa: BLE001 - a settings source that breaks is a limits failure, never broker-error
@@ -779,8 +798,8 @@ class Broker:
         qdir = self._limits_dir()
         if qdir is None:
             return wire.answer(rid, gate="limits-failed", reason=LIMITS_DIR_FAILED)
-        verdict = consent_limits.count_call(qdir, agent, who.session, event, tool_name=tool_name,
-                                            tool_input=digest, limits=full, count_crossed=False,
+        verdict = consent_limits.count_call(qdir, agent, session, event, tool_name=tool_name,
+                                            tool_input=digest, limits=full, count_crossed=False, one_agent=True,
                                             now=self._clock().timestamp())
         if verdict.state in _GATE_OVER:
             return wire.answer(rid, gate="over-limit", kind=verdict.kind)
