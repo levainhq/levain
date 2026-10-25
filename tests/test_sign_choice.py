@@ -310,3 +310,33 @@ def test_the_challenge_carries_the_exact_line_the_signature_appends(tmp_path: Pa
     assert signed.split("\n")[-1] == c["line"] and signed == MESSAGE + "\n" + c["line"]
     plain = {"signer_fp": key.fingerprint, "request_sha256": rows["np-ln000002-aaaa"]["sha256"]}
     assert "line" not in signer.challenge("np-ln000002-aaaa", plain)
+
+
+def test_an_option_may_hold_1000_characters_and_a_write_in_still_200(tmp_path: Path, passkey) -> None:
+    """Phone preselect Q5 (a), ruled 1025-18: a desk option ran about 500 characters and was cut at 200 on the card,
+    so flow repeated every option whole in the message. An option's text may now be 1000 characters; a title, a
+    requester and a write-in (typed on a phone) stay at 200."""
+    from levain.consent.sign import OPTION_TEXT_MAX, WRITE_IN_MAX, read_request, write_in_problem
+
+    assert (OPTION_TEXT_MAX, WRITE_IN_MAX) == (1000, 200)
+    signer, key, sign = passkey
+    long_b = ("hold it: " + "a reason that runs the length of a desk option " * 30)[:OPTION_TEXT_MAX - 4] + " END"
+    assert len(long_b) == 1000
+    options = [{"key": "a", "text": "keep it"}, {"key": "b", "text": long_b}]
+    _file(tmp_path, "np-long0001-aaaa", options=options, write_in=True)
+    [row] = [r for r in signer.listing([key.fingerprint]) if r["id"] == "np-long0001-aaaa"]
+    assert "refused" not in row and row["options"][1]["line"] == choice_line("b", long_b)
+    assert row["write_in"]["max"] == WRITE_IN_MAX
+    assert sign("np-long0001-aaaa", "b")["choice"] == "b"
+    signed = json.loads((tmp_path / "sign" / "np-long0001-aaaa.signed.json").read_text())["signed_message"]
+    assert parse_choice(signed.encode()) == (MESSAGE, "b", long_b)
+    assert _verify(tmp_path, "np-long0001-aaaa", signed.encode()) == 0
+    _file(tmp_path, "np-long0002-aaaa", options=[{"key": "a", "text": "keep it"}, {"key": "b", "text": long_b + "x"}])
+    assert "over 1000 characters" in read_request(tmp_path, "np-long0002-aaaa").refused
+    assert write_in_problem("w" * WRITE_IN_MAX) is None
+    assert "over 200 characters" in write_in_problem("w" * (WRITE_IN_MAX + 1))
+    _file(tmp_path, "np-long0003-aaaa", write_in=True)
+    sha = next(r for r in signer.listing([key.fingerprint]) if r["id"] == "np-long0003-aaaa")["sha256"]
+    with pytest.raises(SignRefused, match="over 200 characters"):
+        signer.challenge("np-long0003-aaaa", {"signer_fp": key.fingerprint, "request_sha256": sha, "choice": "*",
+                                              "write_in": "w" * (WRITE_IN_MAX + 1)})

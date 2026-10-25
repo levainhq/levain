@@ -14,7 +14,7 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
-from levain.consent.sign import _TEXT_MAX, choice_line, sign_dir
+from levain.consent.sign import OPTION_TEXT_MAX, choice_line, sign_dir
 from levain.phone_server import make_phone_server
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 
@@ -22,7 +22,7 @@ NS = "flow-needs-phill"
 TOK = "t" * 43
 RID = "np-parity1-0badc0de"
 # each option at the most text an option may hold, so a page-side cut of any length shows as a mismatch
-OPTIONS = [{"key": k, "text": (f"option {k}: " + "a long reason that wraps on a phone " * 8)[: _TEXT_MAX - 4] + " END"}
+OPTIONS = [{"key": k, "text": (f"option {k}: " + "a long reason that wraps on a phone " * 30)[: OPTION_TEXT_MAX - 4] + " END"}
            for k in ("a", "b", "c")]
 MESSAGE = "\n".join(["flow needs-phill answer", "item: np-parity1", "repo: levain",
                      "asked: " + "the lead sentence and the analysis paragraph, long enough to wrap many times " * 12,
@@ -84,7 +84,7 @@ def test_a_long_multi_option_request_is_shown_whole_and_as_signed_at_390(tmp_pat
             {"eval": PROBE}, {"shot": str(shot), "full": True},
         ])
     got = out["values"][-2]
-    assert len(MESSAGE) > 1500 and all(len(o["text"]) == _TEXT_MAX for o in OPTIONS)
+    assert len(MESSAGE) > 1500 and all(len(o["text"]) == OPTION_TEXT_MAX for o in OPTIONS)
     # the message box: the signed message, byte for byte, drawn whole
     assert got["display"]["text"] == MESSAGE and got["display"]["inner"] == MESSAGE
     assert _unclipped(got["display"]), got["display"]

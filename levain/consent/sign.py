@@ -67,10 +67,11 @@ The rules, each a refusal before anything is signed:
     private-use or unassigned code point is listed as refused and never signed, since each can render differently
     from its bytes; no message holds :data:`CHOICE_MARK` (only levain writes the choice line, so a plain statement
     can never verify as a choice); a choice request has 2 to :data:`OPTIONS_MAX` options, each key
-    ``[a-z0-9]{1,8}`` and each text one line (no newline or tab, no space at either end) of at most 200 characters,
-    keys and texts distinct; a ``recommended`` that is not one of those keys, or a ``write_in`` that is not a
-    boolean, refuses the request; a write-in obeys the rules an option's text does (:func:`write_in_problem`), at
-    the challenge and again in :func:`parse_choice`, and only on a request filed with ``write_in: true``;
+    ``[a-z0-9]{1,8}`` and each text one line (no newline or tab, no space at either end) of at most
+    :data:`OPTION_TEXT_MAX` characters, keys and texts distinct; a ``recommended`` that is not one of those keys, or a
+    ``write_in`` that is not a boolean, refuses the request; a write-in obeys the rules an option's text does, at most
+    :data:`WRITE_IN_MAX` characters (:func:`write_in_problem`), at the challenge and again in :func:`parse_choice`, and
+    only on a request filed with ``write_in: true``;
   - the operator signs the option tapped: the challenge names the option's key, and the challenge, the answer and the
     files written are bound to that key; a challenge for a key the request does not offer, or a choice request's
     challenge naming none, is refused;
@@ -136,8 +137,8 @@ from levain.idempotency import DEFAULT_WINDOW_S as _GATE_WINDOW_S
 from levain.sign_request_id import ID as _ID, request_id_ok
 
 __all__ = ["BINDING_KEEP_S", "CHOICE_FORMAT", "CHOICE_MARK", "COMPOSE_BINDINGS", "COMPOSE_LIVE_MAX", "ERROR_WORDS",
-           "LIST_MAX", "LOCK_WAIT_S", "MESSAGE_MAX", "OPTIONS_MAX", "REFUSED_NAMESPACES", "REQUEST_FORMAT", "SIGN_DIR",
-           "WRITE_IN_KEY", "SignRefused", "SignRequest", "Signer", "bind_compose", "choice_line", "compose_bindings",
+           "LIST_MAX", "LOCK_WAIT_S", "MESSAGE_MAX", "OPTION_TEXT_MAX", "OPTIONS_MAX", "REFUSED_NAMESPACES",
+           "REQUEST_FORMAT", "SIGN_DIR", "WRITE_IN_KEY", "WRITE_IN_MAX", "SignRefused", "SignRequest", "Signer", "bind_compose", "choice_line", "compose_bindings",
            "deep_link", "draft_bindings", "error_word", "namespace_problem", "parse_choice", "passkey_key_source", "read_request",
            "request_id_ok", "sign_dir", "sign_root", "signed_bytes", "state_of", "write_in_problem"]
 
@@ -148,6 +149,8 @@ OPTIONS_MAX = 8                    # buttons on one card
 SIGN_DIR = "sign"
 MESSAGE_MAX = 8 * 1024             # bytes of UTF-8: a statement a person reads whole on a phone
 _TEXT_MAX = 200                    # characters of a title or a requester
+OPTION_TEXT_MAX = 1000             # characters of one option's text: a desk option is a paragraph, read whole on its button
+WRITE_IN_MAX = 200                 # characters of a write-in: words typed on a phone
 _FILE_MAX = 64 * 1024              # a request file past this is not read
 LIST_MAX = 50                      # open requests one listing shows; past it the page shows how many were left
 _SCAN_MAX = 4096                   # directory entries one listing looks at
@@ -308,12 +311,13 @@ def deep_link(page: str, request_id: str, token: str | None = None, *, choice: s
     return page.split("#", 1)[0] + "#" + "&".join(parts)
 
 
-def _option_text_problem(text: object, what: str) -> str | None:
+def _option_text_problem(text: object, what: str, most: int = OPTION_TEXT_MAX) -> str | None:
     """Why ``text`` cannot be one choice line's text (an option's or a write-in's, named ``what``), or None: one
-    line of 1 to :data:`_TEXT_MAX` characters, no space at either end, nothing that can show differently from its
-    bytes (no newline or tab either), and no :data:`CHOICE_MARK`."""
-    if not isinstance(text, str) or not text or len(text) > _TEXT_MAX:
-        return f"{what} is empty or over {_TEXT_MAX} characters"
+    line of 1 to ``most`` characters (an option's :data:`OPTION_TEXT_MAX`, a write-in's :data:`WRITE_IN_MAX`), no space
+    at either end, nothing that can show differently from its bytes (no newline or tab either), and no
+    :data:`CHOICE_MARK`."""
+    if not isinstance(text, str) or not text or len(text) > most:
+        return f"{what} is empty or over {most} characters"
     if text != text.strip(" "):
         return f"{what} begins or ends with a space, which a button does not show"
     hidden = unshowable.first_hidden(text, allow="")
@@ -326,8 +330,9 @@ def _option_text_problem(text: object, what: str) -> str | None:
 
 
 def write_in_problem(text: object) -> str | None:
-    """Why ``text`` cannot be signed as a write-in, or None: the rules an option's text obeys."""
-    return _option_text_problem(text, "the write-in")
+    """Why ``text`` cannot be signed as a write-in, or None: the rules an option's text obeys, at most
+    :data:`WRITE_IN_MAX` characters."""
+    return _option_text_problem(text, "the write-in", WRITE_IN_MAX)
 
 
 def _options_problem(options: object) -> "tuple[tuple[tuple[str, str], ...], str | None]":
@@ -485,8 +490,8 @@ def read_request(queue_dir: Path, request_id: str) -> SignRequest:
         problem = "write_in is true or false"
     problem = namespace_problem(namespace) or problem
     longest = max((len(("\n" + choice_line(k, t)).encode("utf-8")) for k, t in options), default=0)
-    if write_in is True:                # the longest write-in: _TEXT_MAX characters of at most 4 UTF-8 bytes each
-        longest = max(longest, len(("\n" + choice_line(WRITE_IN_KEY, "")).encode("utf-8")) + 4 * _TEXT_MAX)
+    if write_in is True:                # the longest write-in: WRITE_IN_MAX characters of at most 4 UTF-8 bytes each
+        longest = max(longest, len(("\n" + choice_line(WRITE_IN_KEY, "")).encode("utf-8")) + 4 * WRITE_IN_MAX)
     if problem is None and len(message.encode("utf-8", "surrogatepass")) + longest > MESSAGE_MAX:
         problem = f"the message{' with its longest choice line' if options else ''} is over {MESSAGE_MAX} bytes"
     if problem is None and not message:
@@ -749,7 +754,7 @@ def _row(rid: str, request: SignRequest, signers: "list[str]") -> dict[str, Any]
         if request.recommended is not None:
             row["recommended"] = request.recommended      # marked on the page, never selected there
         if request.write_in:   # the line a write-in's signature appends, the words in place of the empty end
-            row["write_in"] = {"key": WRITE_IN_KEY, "line": choice_line(WRITE_IN_KEY, ""), "max": _TEXT_MAX}
+            row["write_in"] = {"key": WRITE_IN_KEY, "line": choice_line(WRITE_IN_KEY, ""), "max": WRITE_IN_MAX}
     return row
 
 
