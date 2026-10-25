@@ -89,3 +89,35 @@ def test_a_basic_record_is_placed_as_basic_with_its_user(tmp_path, monkeypatch) 
 @pytest.mark.chat_egress_srt
 def test_a_bearer_record_is_placed_as_bearer(tmp_path, monkeypatch) -> None:
     assert _run(tmp_path, monkeypatch, keys.Placement("bearer")) == [f"Bearer {SECRET}"]
+
+
+@pytest.mark.chat_egress_srt
+def test_a_route_without_a_placement_is_refused_with_nothing_left_open(tmp_path, monkeypatch) -> None:
+    """S8b r1 item 4 (complement MED 1): the placements line refuses before the first allocation, so a refusal there
+    leaves no socket, pipe or glue behind. `RouteSet.of` gives every route a placement (bearer by default), so only a
+    RouteSet built directly reaches this line."""
+    import os
+    from types import MappingProxyType
+
+    from .test_launch import _node_children
+
+    def fds() -> set[int]:
+        return {int(x) for x in os.listdir("/dev/fd")} - {max(int(x) for x in os.listdir("/dev/fd"))}
+
+    monkeypatch.setenv(lm.TEST_SEAMS_ENV, "1")
+    route = keys.RouteSnapshot(record_id="rec-1", canonical_host=HOST, credential_source="svc",
+                               declared_repos=frozenset(), attach=True, credential_account="acct", incarnation="1:x")
+    store = EnvelopeStore(tmp_path / "dispatch")
+    lid = real_launch(store)
+    key_pem, cert_pem = spike.make_ca()
+    before, kids = fds(), _node_children()
+    with pytest.raises(KeyError) as got:
+        lm.start_egress(store=store, launch_id=lid, node=envmod.node_bin(), srt_prefix=envmod.srt_prefix(),
+                        events=tmp_path / "events.jsonl", ca_pem=key_pem + cert_pem,
+                        routes=keys.RouteSet(MappingProxyType({HOST: route}), MappingProxyType({})), liveness=Live(),
+                        credentials=keys.LaunchCredentials(NoStore()), cards=Desk(), mode=dm.Fixed(classify.GATED),
+                        seams=lm.TestSeams(lookup=Lookup()))
+    left = fds() - before
+    print(f"RUN S8D item 4: refused with {type(got.value).__name__} {got.value}; fds left {sorted(left)}")
+    assert not left and len(_node_children()) == len(kids)
+    assert not (tmp_path / "events.jsonl.glue-stderr").exists()
