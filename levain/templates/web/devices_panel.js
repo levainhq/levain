@@ -94,11 +94,14 @@
 
   function say(msg) { note.textContent = msg; note.hidden = !msg; }
 
+  // MUST equal pair.js shortId: the first 8 characters of the device id; the Paired screen's previous-key line names the row by it
+  function shortId(id) { return String(id).slice(0, 8); }
+
   function row(d) {
     const r = el("div", "dev-row" + (d.revoked_at ? " dev-revoked" : ""));
     const main = el("div", "dev-main");
     main.appendChild(el("div", "dev-name", d.label || d.id));
-    main.appendChild(el("div", "dev-meta", "paired " + when(d.created) + " · last seen " + when(d.last_seen) + (d.paired_by ? " · by " + d.paired_by : "")));
+    main.appendChild(el("div", "dev-meta", "paired " + when(d.created) + " · last seen " + when(d.last_seen) + (d.paired_by ? " · by " + d.paired_by : "") + " · " + shortId(d.id)));
     r.appendChild(main);
     if (d.revoked_at) {
       r.appendChild(el("span", "pill dev-pill", "revoked " + when(d.revoked_at)));

@@ -139,22 +139,61 @@ def test_pair_it_again_never_makes_a_revoke_request_and_its_only_write_is_the_cl
     assert all("GET" in c or c in posts for c in calls) and not re.search(r'method: "(PUT|DELETE|PATCH)"', js)
     assert "function pairAgain(code)" in js
     # Try again keeps the re-pair label, so the line survives a failed first claim
-    assert js.count("() => attempt(code, true, repaired)") == 1 and js.count(", repaired);") == 2
+    assert js.count("() => attempt(code, true, oldTok)") == 1 and js.count(", oldTok);") == 2
 
 
-def test_pair_it_again_reads_the_held_keys_device_label_before_claiming_and_shows_it_as_text() -> None:
+def test_pair_it_again_claims_first_and_looks_the_old_key_up_only_after_the_claim_succeeded() -> None:
+    # L3 r5 K2: no read ever sits before the claim POST (a short-lived code must not expire behind a slow list read).
     js = load_web_asset("pair.js")
-    # the read happens before the claim, with the held key, a GET of the manifest then the devices list
-    pair_again = js[js.index("async function pairAgain"): js.index("function run()")]
-    assert "previousKeyLabel(" in pair_again and pair_again.index("previousKeyLabel(") < pair_again.index("attempt(")
+    pair_again = js[js.index("function pairAgain"): js.index("function run()")]
+    assert "previousKey" not in pair_again and "await" not in pair_again, "pairAgain must go straight to the claim"
+    assert "attempt(code, false, storedToken())" in pair_again       # the held key is snapshotted before the claim replaces it
+    att = js[js.index("async function attempt"): js.index("async function previousKey")]
+    # inside attempt the lookup comes after the claim, after the new key was stored, and only for a snapshotted key
+    assert att.index("await claim(code)") < att.index("setItem(WRITE_TOKEN_KEY, data.token)") < att.index("previousKey(oldTok)")
+    assert "if (oldTok) {" in att and js.count("previousKey(") == 2          # the definition and the one call
+    # the lookup is GET-only with the snapshot, manifest then devices list
     assert "/cockpit/manifest.json" in js and "/cockpit/pair/devices.json" in js and "X-Levain-Write-Token" in js
-    # only a paired-<id> credential is looked up; an owner surface token yields no label
     assert 'startsWith(PAIRED_PREFIX)' in js and 'PAIRED_PREFIX = "paired-"' in js
     # the label reaches the screen through textContent (say), never innerHTML
     assert "innerHTML" not in js and "insertAdjacentHTML" not in js
-    assert "still listed in Devices as " in js and "Revoke it there." in js
-    # no label, no line: the screen with no previous label goes straight to the cockpit
-    assert re.search(r"if \(repaired\) \{", js) and "Opening the cockpit" in js
+
+
+def test_the_previous_key_result_is_tri_state_and_only_a_known_owner_or_revoked_key_is_silent() -> None:
+    # L3 r5 K1: a lookup failure used to drop the warning (fail-open). Now only "owner" and "revoked" say nothing.
+    js = load_web_asset("pair.js")
+    body = js[js.index("async function previousKey"): js.index("function pairAgain")]
+    assert body.count("return unknown") >= 5 and body.count("status !== 200") == 2 and "catch" in body
+    assert 'return { kind: "owner" }' in body and 'return { kind: "revoked" }' in body and "row.revoked_at" in body
+    # the owner verdict needs a 200 manifest whose credential name is a string without the paired prefix, nothing weaker
+    assert body.index("man.status !== 200") < body.index('kind: "owner"') and "typeof name !== \"string\"" in body
+    att = js[js.index("async function attempt"): js.index("async function previousKey")]
+    assert 'prev.kind === "owner" || prev.kind === "revoked"' in att and "PREVIOUS_MAYBE" in att
+    assert "may still be listed in Devices. Revoke it there." in js
+    assert "still listed in Devices as " in js
+    assert "previous key is still listed in Devices. Revoke it there." not in js
+
+
+def test_the_previous_key_line_names_the_label_with_the_same_short_id_the_devices_panel_shows() -> None:
+    # L3 r5 K3: labels are not unique; the line adds a short stable id, and the panel shows that same id on every row.
+    pj, dp = load_web_asset("pair.js"), load_web_asset("devices_panel.js")
+    rule = "function shortId(id) { return String(id).slice(0, 8); }"
+    assert rule in pj and rule in dp                                     # one rule, two copies, equal by this test
+    assert "shortId(id)" in pj and "shortId(d.id)" in dp
+    # the id the server mints is "d-" + 12 hex: 8 characters keep 24 random bits
+    assert re.search(r'"d-" \+ secrets\.token_hex\(6\)', Path(__file__).parent.parent.joinpath("levain/cockpit/firejournal.py").read_text())
+
+
+def test_the_label_in_the_line_is_quoted_and_bounded_and_the_lookup_cannot_block_the_page() -> None:
+    js = load_web_asset("pair.js")
+    assert "LABEL_MAX = 60" in js and "function boundLabel" in js and "\\u2026" in js
+    assert "\\u202a-\\u202e" in js and "\\u2066-\\u2069" in js                # bidi controls are stripped
+    assert "\\u201c" in js and "\\u201d" in js                                 # quoted
+    # K4: AbortController is built inside the try; a browser without it falls to the generic line
+    body = js[js.index("async function previousKey"): js.index("function pairAgain")]
+    assert body.index("try {") < body.index("new AbortController()")
+    # glm LOW 3: ids compare as strings
+    assert "String(d.id) === id" in js and "d.id === id" not in js
 
 
 def test_the_label_the_page_reads_is_what_the_server_exposes_for_a_paired_key_and_not_for_an_owner_token(src) -> None:
@@ -170,20 +209,10 @@ def test_the_label_the_page_reads_is_what_the_server_exposes_for_a_paired_key_an
         assert st == 200 and not man["credential"]["name"].startswith("paired-")
 
 
-def test_no_previous_key_line_unless_the_read_found_a_paired_label() -> None:
-    js = load_web_asset("pair.js")
-    body = js[js.index("async function previousKeyLabel"): js.index("async function pairAgain")]
-    # a non-200, a throw, a non-paired name, a missing row or an empty label each end in null
-    assert body.count("return null") >= 5 and body.count("status !== 200") == 2 and "catch" in body
-    assert "setTimeout" in body or "AbortController" in body            # a hung read never holds the claim
-    # the plain "still listed" line without a label is gone: only the labelled one remains
-    assert "previous key is still listed in Devices. Revoke it there." not in js
-
-
 def test_the_pair_script_words_the_retry_403_and_keeps_a_failed_mark_write_from_reading_as_a_lost_key() -> None:
     js = load_web_asset("pair.js")
     # G3: only a 403 AFTER a Try again says the first try may have spent the code
-    assert "attempt(code, true, repaired)" in js and "The first try may have used this code." in js
+    assert "attempt(code, true, oldTok)" in js and "The first try may have used this code." in js
     # G4: the mark's write is its own try, after the key's catch has returned
     assert re.search(r'try \{ window\.localStorage\.setItem\(PAIRED_MARK_KEY, "1"\); \} catch', js)
     key_try = js.index("window.localStorage.setItem(WRITE_TOKEN_KEY, data.token);")
