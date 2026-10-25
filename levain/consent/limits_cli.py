@@ -219,7 +219,7 @@ def _slot_doc_for_edit(seams: SlotSeams, replace: bool, retry: str,
         return {"format": L.LIMITS_FORMAT}
     try:
         with _quiet_broker():
-            doc = _reader(seams)._document()
+            doc = _reader(seams).document()
     except LimitsUnavailable as exc:
         if exc.reason.startswith("the policy directory"):
             say(f"levain limits: refused, nothing changed: {exc.reason} (`levain doctor` shows the store).")
@@ -289,7 +289,7 @@ def _slot_limits(seams: SlotSeams, agent: str | None) -> tuple[str, dict[str, di
     ``LimitsUnavailable``."""
     reader = _reader(seams)
     with _quiet_broker():
-        source = str(reader.path) if reader._document() is not None else "defaults (no file)"
+        source = str(reader.path) if reader.document() is not None else "defaults (no file)"
         return source, {a: {k: int(v) for k, v in reader(a, "levain-limits-show").items()}
                         for a in ([agent] if agent else list(L.AGENTS))}
 

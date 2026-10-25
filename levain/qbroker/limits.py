@@ -70,7 +70,7 @@ class PolicyLimits:
     def __call__(self, agent: str, session: str) -> dict[str, float]:
         """Raises only :class:`LimitsUnavailable`: any other failure here is wrapped into one naming it."""
         try:
-            doc = self._document()
+            doc = self.document()
             if doc is None:
                 return {k: float(limits_doc.DEFAULTS[k]) for k in limits_doc.SLOT_KINDS}
             try:
@@ -87,7 +87,7 @@ class PolicyLimits:
     def _unusable(self, why: str) -> str:
         return (f"{self.path} is not usable: {why}; the operator rewrites it with levain limits set --slots")
 
-    def _document(self) -> dict[str, Any] | None:
+    def document(self) -> dict[str, Any] | None:
         """The checked document, ``None`` when the file is missing; raises :class:`LimitsUnavailable`."""
         try:
             pfd = os.open(self._dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
