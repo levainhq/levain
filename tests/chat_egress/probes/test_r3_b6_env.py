@@ -8,12 +8,22 @@ C2 is the probe's NEGATIVE CONTROL: it is the failing shape, reproduced through 
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from ..fixtures import clients
 from ._util import client, facts
 
 pytestmark = pytest.mark.chat_egress_srt
+
+# The glue runs with a closed env; the keys node then sees are the ones the OS adds to an empty-env child. On macOS that
+# is __CF_USER_TEXT_ENCODING (`env -i node -e 'console.log(Object.keys(process.env))'`); on Linux none.
+CLOSED_ENV_KEYS = 1 if sys.platform == "darwin" else 0
+
+
+def _env_keys(stderr: str) -> int:
+    return int(stderr.split("env-keys=")[-1].split()[0])
 
 
 def _b6(rig, glue):
@@ -24,9 +34,9 @@ def _b6(rig, glue):
 
 def test_b6_b2_closed_env_origin_ca_only_refuses_the_bad_cert(r3, r3_glue, verdict):
     res, seen = _b6(r3, r3_glue)
-    verdict("R3 B6 run B2 (closed env, origin CA only)", "502 PASS (bad cert refused); stderr env-keys=1", f"{client(res)} | origin={seen.origin_bytes()}B | {r3_glue.stderr_first[-60:]!r}")
+    verdict("R3 B6 run B2 (closed env, origin CA only)", "502 PASS (bad cert refused); stderr env-keys=1 on macOS (__CF_USER_TEXT_ENCODING), 0 on Linux", f"{client(res)} | origin={seen.origin_bytes()}B | {r3_glue.stderr_first[-60:]!r}")
     assert res.status == 502 and seen.origin_bytes() == 0
-    assert "env-keys=1" in r3_glue.stderr_first, r3_glue.stderr_first        # node got the closed env (one key the OS adds)
+    assert _env_keys(r3_glue.stderr_first) == CLOSED_ENV_KEYS, r3_glue.stderr_first        # node got the closed env
     m = r3.mark(r3_glue)
     ctl = clients.curl(r3_glue.port, r3_glue.ca, f"https://s.rb.test:{r3.ports.tls}/b6-ctl")
     assert ctl.status == 200 and "origin-ok" in ctl.out          # the origin CA leaf IS trusted: the 502 above is the cert, not the rig
@@ -38,7 +48,7 @@ def test_b6_c1_closed_env_ignores_a_hostile_parent_variable(r3, verdict):
         res, seen = _b6(r3, g)
         verdict("R3 B6 run C1 (closed env, parent has NODE_EXTRA_CA_CERTS=bad-ca)", "502 PASS (stderr shows the var unset)",
                 f"{client(res)} | origin={seen.origin_bytes()}B | {g.stderr_first[-60:]!r}")
-        assert res.status == 502 and seen.origin_bytes() == 0 and "env-keys=1" in g.stderr_first
+        assert res.status == 502 and seen.origin_bytes() == 0 and _env_keys(g.stderr_first) == CLOSED_ENV_KEYS
     finally:
         g.stop()
 
