@@ -44,6 +44,8 @@ class RecordingOrigin:
         self._srv.listen(64)
         self.port = self._srv.getsockname()[1]
         self._stop = False
+        self._socks: list[socket.socket] = []
+        self._threads: list[threading.Thread] = []
         self._t = threading.Thread(target=self._accept, daemon=True)
         self._t.start()
 
@@ -53,10 +55,21 @@ class RecordingOrigin:
                 c, _ = self._srv.accept()
             except OSError:
                 return
+            t = threading.Thread(target=self._serve, args=(c,), daemon=True)
             with self._lock:
                 self.conns += 1
                 self.open_conns += 1
-            threading.Thread(target=self._serve, args=(c,), daemon=True).start()
+                self._socks.append(c)
+                self._threads.append(t)
+            t.start()
+
+    @staticmethod
+    def _recv(c: socket.socket) -> bytes:
+        """One read; the peer's EOF ends the connection (raises) rather than spinning the caller's loop."""
+        d = c.recv(65536)
+        if not d:
+            raise EOFError
+        return d
 
     def _serve(self, c: socket.socket) -> None:
         c.settimeout(10)
@@ -64,10 +77,7 @@ class RecordingOrigin:
         try:
             while True:
                 while b"\r\n\r\n" not in buf:
-                    d = c.recv(65536)
-                    if not d:
-                        return
-                    buf += d
+                    buf += self._recv(c)
                 head, _, buf = buf.partition(b"\r\n\r\n")
                 lines = head.split(b"\r\n")
                 method, target, _ = lines[0].decode("latin-1").split(" ", 2)
@@ -81,27 +91,27 @@ class RecordingOrigin:
                 if low.get("transfer-encoding", "").lower() == "chunked":
                     while True:
                         while b"\r\n" not in buf:
-                            buf += c.recv(65536)
+                            buf += self._recv(c)
                         size_line, _, buf = buf.partition(b"\r\n")
                         raw += size_line + b"\r\n"
                         n = int(size_line.split(b";")[0], 16)
                         if n == 0:
                             # the trailer section: header lines, ended by an empty line
                             while not (buf.startswith(b"\r\n") or b"\r\n\r\n" in buf):
-                                buf += c.recv(65536)
+                                buf += self._recv(c)
                             cut = 2 if buf.startswith(b"\r\n") else buf.index(b"\r\n\r\n") + 4
                             raw += buf[:cut]
                             buf = buf[cut:]
                             break
                         while len(buf) < n + 2:
-                            buf += c.recv(65536)
+                            buf += self._recv(c)
                         body += buf[:n]
                         raw += buf[:n + 2]
                         buf = buf[n + 2:]
                 elif "content-length" in low:
                     n = int(low["content-length"])
                     while len(buf) < n:
-                        buf += c.recv(65536)
+                        buf += self._recv(c)
                     body, buf = buf[:n], buf[n:]
                     raw += body
                 seen = Seen(method, target, hdrs, body, head, bytes(raw))
@@ -112,7 +122,7 @@ class RecordingOrigin:
                 out = b"HTTP/1.1 200 OK\r\nContent-Type: " + ct.encode("latin-1") + b"\r\nContent-Length: 2\r\n"
                 out += b"".join(x + b"\r\n" for x in extra) + b"\r\nok"
                 c.sendall(out)
-        except (OSError, ValueError):
+        except (OSError, ValueError, EOFError):
             return
         finally:
             c.close()
@@ -125,6 +135,15 @@ class RecordingOrigin:
             self._srv.close()
         except OSError:
             pass
+        with self._lock:
+            socks, threads = list(self._socks), list(self._threads)
+        for c in socks:
+            try:
+                c.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        for t in threads:
+            t.join(5)
 
 
 def variants(secret: str) -> list[bytes]:
