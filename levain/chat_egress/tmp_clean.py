@@ -2,7 +2,8 @@
 
 A worker-built tree can defeat a plain rmtree (a mode-000 directory, a directory without write permission) or point
 out of itself (a symlink). :func:`remove_tree` walks it fd-relative: each directory is opened `O_NOFOLLOW` from its
-parent's fd (one its owner cannot read is made 0700 first, `_open_dir`) and made 0700 through that fd before it is
+parent's fd (one its owner cannot read is made 0700 first, never through a symlink, or left and named where this
+platform has no such chmod: `_open_dir`) and made 0700 through that fd before it is
 listed, every entry that is not a directory is unlinked (a symlink is removed as itself, never followed), then the
 directory is removed. A failure is a logged leftover, never a crash; the leftovers are returned so the launch end can
 name them.
