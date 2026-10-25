@@ -121,6 +121,9 @@ def wall_total(events: Iterable[wire.GlueEvent]) -> tuple[WallTotal, wire.GlueSu
             after_last += 1
     if last is not None and last.final:
         return WallTotal(last.total, True, False, str(last.total)), last
+    if last is not None and last.total is None:       # typed int; a hand-built summary may not carry one
+        return WallTotal(None, False, True,
+                         f"unknown (a crashed launch's last summary has no total; at least {after_last} detailed walls after it)"), last
     if last is not None:
         text = f"{last.total} (from a crashed launch: the last summary, no final flush)"
         if after_last:                    # walls the glue wrote after that summary are in no total: a floor, not a count

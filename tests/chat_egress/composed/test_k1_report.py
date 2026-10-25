@@ -78,6 +78,16 @@ def test_walls_after_the_last_summary_make_the_number_a_floor_not_the_summarys_t
     assert r.walls.text.startswith("at least 5 ")
 
 
+@pytest.mark.parametrize("walls_after", [0, 3])
+def test_a_summary_with_no_total_keeps_the_total_unknown_not_a_crash(walls_after) -> None:
+    """`wire` refuses a summary line without an int total, so `build` never gets one; `wall_total` is public and typed
+    `GlueSummary`, so it must not raise on a hand-built one either."""
+    ev = [wire.GlueSummary(1_700_000_040, 0, None, {}, {}, 0, False)] + [wire.GlueWall(None, None, "a.test", "port")] * walls_after
+    got, _ = report.wall_total(ev)
+    assert (got.total, got.exact, got.crashed) == (None, False, True)
+    assert "None" not in got.text
+
+
 def test_a_line_the_wire_reader_refuses_is_counted_not_skipped() -> None:
     r = report.build([], [_summary(2, final=True), b'{"t":"wall","host":"x"}\n', b"not json\n"])
     assert r.unreadable_event_lines == 2
