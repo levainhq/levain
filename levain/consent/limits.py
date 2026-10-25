@@ -69,7 +69,8 @@ from levain.consent.record import tool_input_digest
 __all__ = ["ACTIVE_GAP", "DB_NAME", "DEFAULTS", "FAIL_DENY_AFTER", "GO", "KINDS", "LIMIT_TIER", "LIMIT_TOOL", "LIMITS_NAME",
            "Outcome", "REPEAT_WINDOW", "Verdict", "check", "file_extend", "release_if_extended", "retry_text", "stop_text",
            "verified_allow", "root_halted", "extended_by",
-           "count_call", "extend", "load_limits", "session_root", "snapshot"]
+           "count_call", "extend", "load_limits", "session_root", "snapshot",
+           "LimitsDocError", "SLOT_KINDS", "SLOT_LIMITS_MAX", "SLOT_RANGE", "parse_limits_doc", "slot_doc"]
 
 DB_NAME = "limits.db"
 LIMITS_NAME = "limits.json"
@@ -89,6 +90,14 @@ FAIL_DIR = "limits-fail"
 _FAIL_SIZE = 8
 SUBAGENT_MARK = "#agent:"
 AGENTS = ("claude_code", "codex")
+# what a queue-broker slot counts: its GATE frame carries no transcript path, so no token kind
+SLOT_KINDS = ("calls", "active_hours", "repeat")
+# a slot's limits document (L/policy/limits) is read whole up to this many bytes; a larger one is refused
+SLOT_LIMITS_MAX = 4 << 10
+# a slot value's inclusive range: an integer (the contracts canonicaliser refuses floats, so active_hours is whole hours),
+# repeat at least 2 (1 would hold every call) and at most REPEAT_WINDOW (a slot has no Extend to widen the window, so a
+# larger repeat limit could never be reached)
+SLOT_RANGE = {"calls": (1, 10**9), "active_hours": (1, 10**9), "repeat": (2, REPEAT_WINDOW)}
 
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -164,6 +173,91 @@ def _limit_value(kind: str, v: Any) -> float | None:
         return None
 
 
+class LimitsDocError(ValueError):
+    """A ``levain-limits/1`` document refused. ``code`` is the refusal's name: ``limits-oversize``,
+    ``limits-malformed`` (not canonical JSON, not an object, not this format), ``limits-key:<key>`` (a top-level key
+    or a kind no slot reads), ``limits-not-counted:<kind>`` (a token kind: a slot counts no tokens) or
+    ``limits-value:<block>[.<kind>]`` (a block not an object, a value not an integer in :data:`SLOT_RANGE`)."""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(f"{code} ({detail})" if detail else code)
+        self.code = code
+        self.detail = detail
+
+
+def parse_limits_doc(doc: Any, agent: str | None, *, slot: bool = False) -> tuple[dict[str, float], list[str]]:
+    """THE reading of a parsed ``levain-limits/1`` document, Q13's ``limits.json`` and a slot's ``L/policy/limits``
+    alike: (:data:`DEFAULTS` overlaid by the ``default`` block, then by ``agent``'s block; what was skipped).
+
+    ``slot=False`` (Q13's local file): a block that is not an object, or a kind or value :func:`_limit_value` refuses,
+    is skipped and named in the list; raises :class:`LimitsDocError` only when ``doc`` is not a ``levain-limits/1``
+    object. ``slot=True``: the WHOLE document is checked, every block whatever ``agent`` is, and its first fault
+    raises (top-level keys ``format`` and any of ``default`` / ``claude_code`` / ``codex``; each block an object over
+    :data:`SLOT_KINDS`; each value an integer in :data:`SLOT_RANGE`); the result is exactly :data:`SLOT_KINDS` and
+    the list is empty. ``agent=None`` reads the ``default`` block only (a writer validating the document)."""
+    if not isinstance(doc, dict) or doc.get("format") != LIMITS_FORMAT:
+        raise LimitsDocError("limits-malformed", f"not a {LIMITS_FORMAT} object")
+    blocks = ("default",) if agent is None else ("default", agent)
+    if not slot:
+        out = dict(DEFAULTS)
+        bad: list[str] = []
+        for block in blocks:
+            got = doc.get(block)
+            if got is None:
+                continue
+            if not isinstance(got, dict):
+                bad.append(block)
+                continue
+            for kind, v in got.items():
+                val = _limit_value(kind, v) if kind in DEFAULTS else None
+                if val is None:
+                    bad.append(f"{block}.{kind}")
+                else:
+                    out[kind] = val
+        return out, bad
+    for key in doc:
+        if key != "format" and key not in ("default", *AGENTS):
+            raise LimitsDocError(f"limits-key:{key}"[:128])
+    for block in ("default", *AGENTS):
+        got = doc.get(block)
+        if got is None:
+            continue
+        if not isinstance(got, dict):
+            raise LimitsDocError(f"limits-value:{block}", "a block is an object")
+        for kind, v in got.items():
+            if kind in KINDS and kind not in SLOT_KINDS:
+                raise LimitsDocError(f"limits-not-counted:{kind}", "a slot counts no tokens")
+            if kind not in SLOT_KINDS:
+                raise LimitsDocError(f"limits-key:{kind}"[:128])
+            lo, hi = SLOT_RANGE[kind]
+            if type(v) is not int or not lo <= v <= hi:
+                raise LimitsDocError(f"limits-value:{block}.{kind}", f"an integer from {lo} to {hi}")
+    out = {k: DEFAULTS[k] for k in SLOT_KINDS}
+    for block in blocks:
+        out.update(doc.get(block) or {})
+    return out, []
+
+
+def slot_doc(data: bytes, *, canonical: bool = True) -> dict[str, Any]:
+    """A slot's limits document from its bytes, checked whole (:func:`parse_limits_doc` ``slot=True``), or
+    :class:`LimitsDocError`: at most :data:`SLOT_LIMITS_MAX` bytes, parsed under the contracts refusals (duplicate
+    keys, floats, NaN, out-of-range integers, a BOM, non-UTF-8: :func:`levain.contracts.canon.parse`) and, with
+    ``canonical``, exactly its canonical bytes (the form the root writer writes, so one document has one byte form)."""
+    from levain.contracts import ContractError
+    from levain.contracts.canon import canonical_bytes, parse
+
+    if not isinstance(data, bytes) or len(data) > SLOT_LIMITS_MAX:
+        raise LimitsDocError("limits-oversize", f"over {SLOT_LIMITS_MAX} bytes")
+    try:
+        doc = parse(data)
+    except ContractError as exc:
+        raise LimitsDocError("limits-malformed", str(exc)[:200]) from None
+    parse_limits_doc(doc, None, slot=True)
+    if canonical and canonical_bytes(doc) != data:
+        raise LimitsDocError("limits-malformed", "not its canonical bytes")
+    return doc
+
+
 def load_limits(queue_dir: Path | str, agent: str) -> tuple[dict[str, float], str]:
     """(the limits in force for ``agent``, where they came from): :data:`DEFAULTS`, overlaid by
     ``<queue dir>/limits.json``'s ``default`` block and then its block for the agent. An unreadable or malformed file
@@ -182,22 +276,10 @@ def load_limits(queue_dir: Path | str, agent: str) -> tuple[dict[str, float], st
         doc = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, RecursionError) as exc:
         return out, f"defaults ({LIMITS_NAME} unreadable: {type(exc).__name__})"
-    if not isinstance(doc, dict) or doc.get("format") != LIMITS_FORMAT:
+    try:
+        out, bad = parse_limits_doc(doc, agent)
+    except LimitsDocError:
         return out, f"defaults ({LIMITS_NAME} is not {LIMITS_FORMAT})"
-    bad: list[str] = []
-    for block in ("default", agent):
-        got = doc.get(block)
-        if got is None:
-            continue
-        if not isinstance(got, dict):
-            bad.append(block)
-            continue
-        for kind, v in got.items():
-            val = _limit_value(kind, v) if kind in DEFAULTS else None
-            if val is None:
-                bad.append(f"{block}.{kind}")
-            else:
-                out[kind] = val
     src = LIMITS_NAME + (f" (skipped: {', '.join(bad)})" if bad else "")
     return out, src
 
