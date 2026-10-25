@@ -187,3 +187,35 @@ def test_a_discard_stopped_between_its_cas_and_its_journal_delete_is_finished(rw
     assert not journal.exists() and rep["reconciled"] == [S] and rep["skipped"] == []
     assert rw.where(S) == (R.TRASH, ["trash"]) and len(rw.control.calls) == calls   # the CAS was already done
     assert rw.step()["reconciled"] == []
+
+
+# ---- the 3c-8 slice 2 fix round 3 ----------------------------------------------------------------------------------
+
+def test_the_store_verb_discard_runs_a_guard_under_the_session_lock(rw):
+    """R2 item a: `store_verbs.discard(..., guard=)` calls the guard with the session lock held, a `Refused` it raises
+    ends the verb before anything moves, and the reaper's retention discard is that call (one home for the order)."""
+    import inspect
+
+    from levain.slot import store_verbs as SV
+
+    a = R.parse_alloc((rw.L / "alloc" / f"{S}.json").read_bytes())
+    facts = SV.facts_from_alloc(a, rw.L)
+    seams = SV.StoreSeams(cas=lambda *x, **k: None, owner_ok=rw.seams.trusted, now=lambda: R.timestamp(rw.now))
+    rw.record()
+    held = []
+
+    def guard():
+        try:
+            with SV.session_lock(facts, seams):
+                held.append(False)
+        except RP.Refused as e:
+            held.append(e.name == "session-busy")
+        raise RP.Refused("restored", S)
+
+    with pytest.raises(RP.Refused) as ei:
+        SV.discard(facts, seams, guard=guard)
+    assert ei.value.name == "restored" and held == [True]
+    assert rw.where(S) == (R.RETAINED, ["retained"])
+    assert "SV.discard(" in inspect.getsource(RP._retention_discard)
+    assert "discard_plan" not in inspect.getsource(RP._retention_discard)
+
