@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.24] — 2026-10-25
+
 ### Added
 - **A provider can report a task's spend as tokens from transcripts.** The topology contract accepts `cost.source: "transcript"`
   (tokens only, never a price) and the Work lens draws it as "N tokens from transcripts". Levain's own tasks still report no cost:
