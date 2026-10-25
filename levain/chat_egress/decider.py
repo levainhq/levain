@@ -134,29 +134,39 @@ def _strict_object(raw: bytes) -> dict:
 
 
 class Link:
-    """One end of srt's decider socket. Reads are the link thread's alone; sends are serialised. `fault` is a test
+    """One end of srt's decider socket. Reads are the link thread's alone; sends are serialised under the write lock.
+    `kill` takes only the dead-state lock, never the write lock, so a send blocked on a full buffer (srt stopped
+    reading) is interrupted by the kill's shutdown instead of holding the kill off. A send that fails after part of
+    its frame left cuts the link at once: the stream is misframed, and nothing may follow on it. `fault` is a test
     seam: `fault(frame_len) -> int | None`; an int N makes the send raise after N bytes left (S8 passes none)."""
 
     def __init__(self, sock: socket.socket, *, fault: Callable[[int], int | None] | None = None) -> None:
         self._sock = sock
         self._wlock = threading.Lock()
+        self._slock = threading.Lock()       # `_dead` only
         self._fault = fault
         self._dead: str | None = None
         self._buf = b""
 
     @property
     def dead(self) -> str | None:
-        return self._dead
+        with self._slock:
+            return self._dead
 
     def _exact(self, n: int) -> bytes | None:
-        while len(self._buf) < n:
-            try:
-                chunk = self._sock.recv(max(65536, n - len(self._buf)))
-            except OSError:
-                return None
-            if not chunk:
-                return None
-            self._buf += chunk
+        have = len(self._buf)
+        if have < n:
+            parts = [self._buf]
+            while have < n:
+                try:
+                    chunk = self._sock.recv(max(65536, n - have))
+                except OSError:
+                    return None
+                if not chunk:
+                    return None
+                parts.append(chunk)
+                have += len(chunk)
+            self._buf = b"".join(parts)
         out, self._buf = self._buf[:n], self._buf[n:]
         return out
 
@@ -175,8 +185,9 @@ class Link:
 
     def send_bytes(self, frame: bytes) -> None:
         with self._wlock:
-            if self._dead is not None:
-                raise SendFailed(0, len(frame), f"the link is dead ({self._dead})")
+            dead = self.dead
+            if dead is not None:
+                raise SendFailed(0, len(frame), f"the link is dead ({dead})")
             limit = self._fault(len(frame)) if self._fault is not None else None
             view = memoryview(frame)
             sent = 0
@@ -187,6 +198,8 @@ class Link:
                     end = len(frame) if limit is None else max(sent + 1, min(len(frame), limit))
                     sent += self._sock.send(view[sent:end])
             except OSError as exc:
+                if 0 < sent < len(frame):
+                    self.kill("a frame was cut mid-send")
                 raise SendFailed(sent, len(frame), type(exc).__name__) from None
 
     def send(self, msg: dict) -> None:
@@ -194,10 +207,12 @@ class Link:
         self.send_bytes(wire.encode_frame(msg))
 
     def kill(self, why: str) -> None:
-        with self._wlock:
-            if self._dead is None:
+        with self._slock:
+            first = self._dead is None
+            if first:
                 self._dead = why
-                log.error("decider link cut: %s", why)
+        if first:
+            log.error("decider link cut: %s", why)
         for fn in (lambda: self._sock.shutdown(socket.SHUT_RDWR), self._sock.close):
             try:
                 fn()
@@ -212,18 +227,27 @@ class LiveSetting:
     current value. Single flight: one read at a time; a request is answered only by a read that STARTED at or after
     it arrived (a revoke that landed before the request is seen by it); no answer inside `timeout_s`, an error, or
     a value outside `allowed` -> `fail_closed`. After `close()` every answer is `fail_closed` and no read starts:
-    a read finishing after the close arms nothing."""
+    a read finishing after the close arms nothing, and a `get()` waiting on a read is woken by the close.
+    `reader` is the read thread while it lives (the decider's close reports it: a read cannot be cancelled)."""
 
     def __init__(self, read: Callable[[], str], *, allowed: tuple[str, ...] = classify.MODES,
                  fail_closed: str = classify.GATED, timeout_s: float = 2.0) -> None:
         self._read, self._allowed, self._closed_value, self._timeout = read, allowed, fail_closed, timeout_s
         self._lock = threading.Lock()
         self._flight: tuple[float, threading.Event, dict] | None = None
+        self._thread: threading.Thread | None = None
         self._closed = False
+
+    @property
+    def reader(self) -> threading.Thread | None:
+        t = self._thread
+        return t if t is not None and t.is_alive() else None
 
     def close(self) -> None:
         with self._lock:
             self._closed = True
+            if self._flight is not None:
+                self._flight[1].set()        # wakes every waiting get(); each then reads `_closed`
 
     def _start(self, now: float) -> tuple[float, threading.Event, dict]:
         done, box = threading.Event(), {}
@@ -237,7 +261,8 @@ class LiveSetting:
                 done.set()
 
         self._flight = (now, done, box)
-        threading.Thread(target=work, name="levain-egress-setting", daemon=True).start()
+        self._thread = threading.Thread(target=work, name="levain-egress-setting", daemon=True)
+        self._thread.start()
         return self._flight
 
     def get(self) -> str:
@@ -254,10 +279,10 @@ class LiveSetting:
                     mine = f[0] >= arrived
             if not f[1].wait(max(0.0, deadline - time.monotonic())):
                 return self._closed_value
+            with self._lock:
+                if self._closed:
+                    return self._closed_value
             if mine:
-                with self._lock:
-                    if self._closed:
-                        return self._closed_value
                 v = f[2].get("v")
                 return v if "e" not in f[2] and v in self._allowed else self._closed_value
             if time.monotonic() >= deadline:
@@ -266,6 +291,8 @@ class LiveSetting:
 
 class Fixed:
     """A setting that does not change for the launch."""
+
+    reader = None
 
     def __init__(self, value: str) -> None:
         self.value = value
@@ -368,8 +395,11 @@ class Decider:
         self._decisions = threading.BoundedSemaphore(limits.max_decisions)
         self._card_slots = threading.BoundedSemaphore(limits.max_cards)
         self._readers = threading.BoundedSemaphore(limits.max_body_readers)
+        # `_live_lock` also covers `_closing`'s set, admission (`_threads`, `_active`) and `_spent`: close() stops
+        # admission under it, so its snapshot holds every decision thread there will be
         self._threads: set[threading.Thread] = set()
         self._active: set[_Req] = set()          # every request with a decision thread, live or not
+        self._spent: set[str] = set()            # every audit value this launch registered (one request each)
         self._closing = threading.Event()
         self._link_thread: threading.Thread | None = None
         self._obs_thread: threading.Thread | None = None
@@ -387,12 +417,14 @@ class Decider:
         every request still open gets CLOSE; card waits are woken; the link is cut; every thread of this service is
         joined. True when every thread ended inside the bound."""
         bound = time.monotonic() + (timeout_s if timeout_s is not None else self.limits.stop_drain_s + 5.0)
-        self._closing.set()
+        with self._live_lock:
+            self._closing.set()                  # admission stops here: no decision thread starts after it
         self._obs_eof.wait(max(0.0, min(self.limits.stop_drain_s, bound - time.monotonic())))
         self.drain()
         with self._live_lock:
             open_reqs = list(self._live.values())
             waiting = list(self._active)
+            threads = list(self._threads)
         for r in open_reqs:
             self._fire(r, Event.CLOSE)
         for r in open_reqs + waiting:
@@ -404,11 +436,11 @@ class Decider:
                 s.close()
             except OSError:
                 pass
-        for t in [self._link_thread, self._obs_thread, *list(self._threads)]:
+        everything = [self._link_thread, self._obs_thread, *threads, getattr(self.mode, "reader", None)]
+        for t in everything:
             if t is not None:
                 t.join(max(0.0, bound - time.monotonic()))
-        return not any(t is not None and t.is_alive() for t in [self._link_thread, self._obs_thread,
-                                                                    *list(self._threads)])
+        return not any(t is not None and t.is_alive() for t in everything)
 
     # --- the link thread ----------------------------------------------------------------------------------------
     def _link_loop(self) -> None:
@@ -443,24 +475,26 @@ class Decider:
         if type(srt_id) is not int or not 1 <= srt_id <= 2 ** 53 - 1:
             raise ProtocolViolation("a req frame without srt's id")
         r = _Req(srt_id, frame)
-        if self._closing.is_set():
-            return self._inline(r, 503, "closing", "decider: the launch is closing")
-        if not self._decisions.acquire(blocking=False):
-            return self._inline(r, 503, "decider_busy", "wall: decider_busy")
-        t = threading.Thread(target=self._decide, args=(r,), name=THREAD_DECIDE, daemon=True)
-        r.thread = t
-        self._threads = {x for x in self._threads if x.is_alive()}   # close joins every one still alive
-        self._threads.add(t)
         with self._live_lock:
-            self._active.add(r)
-        try:
-            t.start()
-        except BaseException:
-            self._threads.discard(t)
-            with self._live_lock:
-                self._active.discard(r)
-            self._decisions.release()
-            raise
+            if self._closing.is_set():
+                refused = (503, "closing", "decider: the launch is closing")
+            elif not self._decisions.acquire(blocking=False):
+                refused = (503, "decider_busy", "wall: decider_busy")
+            else:
+                t = threading.Thread(target=self._decide, args=(r,), name=THREAD_DECIDE, daemon=True)
+                r.thread = t
+                self._threads = {x for x in self._threads if x.is_alive()}   # close joins every one still alive
+                self._threads.add(t)
+                self._active.add(r)
+                try:
+                    t.start()
+                except BaseException:
+                    self._threads.discard(t)
+                    self._active.discard(r)
+                    self._decisions.release()
+                    raise
+                return
+        self._inline(r, *refused)
 
     def _inline(self, r: _Req, status: int, step_name: str, reason: str) -> None:
         """A deny decided on the link thread (no decision thread): parsed for its id, recorded, sent."""
@@ -470,7 +504,11 @@ class Decider:
             return
         r.step_name, r.deny = ("audit-missing" if r.rid is None else step_name), (status, reason)
         try:
-            self._register(r)
+            r.route = keys.lookup(self.routes, r.parsed.canonical_host)
+        except Exception:                      # noqa: BLE001: the row's path shape only; the deny stands
+            r.route = None
+        try:
+            self._register(r, closing_ok=True)
         except _Duplicate:
             return self._owe_deny(r, 403, "decider: a second request with one audit value")
         if r.lc.state in PENDING:
@@ -485,13 +523,16 @@ class Decider:
             data = base64.b64decode(msg["data"], validate=True)
         except (binascii.Error, ValueError):
             raise ProtocolViolation("a body frame's base64") from None
+        cut = bool(msg.get("cut"))
+        if len(data) > self.limits.card_body_cap:   # past the need_body max: srt's own cut, whatever it said
+            data, cut = b"", True
         q = self._bodies.get(msg["id"])
         if q is None:
             # a body for a request this end already denied (body_timeout raced srt's send): dropped
             self.counters["late_bodies"] += 1
             return
         try:
-            q.put_nowait((data, bool(msg.get("cut"))))
+            q.put_nowait((data, cut))
         except queue_mod.Full:
             raise ProtocolViolation("a second body frame for one request") from None
 
@@ -588,8 +629,7 @@ class Decider:
             except BaseException as exc:      # noqa: BLE001: totality (R15-12-B8)
                 log.error("decision for srt id %s raised %s: denied", r.srt_id, type(exc).__name__)
                 if r.lc.state in PENDING:
-                    r.step_name, r.deny = "internal", (500, "decider: internal error")
-                    self._fire(r, Event.DENY)
+                    self._deny(r, "internal", 500, "decider: internal error")
                 elif r.parsed is None:
                     self._owe_deny(r, 500, "decider: internal error")
         finally:
@@ -608,13 +648,18 @@ class Decider:
             raise _Done
         r.rid = r.parsed.request_id
 
-    def _register(self, r: _Req) -> None:
-        """Make the request reachable by its observation lines; an `ended` that came first is applied now."""
+    def _register(self, r: _Req, *, closing_ok: bool = False) -> None:
+        """Make the request reachable by its observation lines; an `ended` that came first is applied now. An audit
+        value is spent for the whole launch (`_Duplicate` for a second request with it, live or long done). After
+        close() began, `_Closing` (close's snapshot did not see this request: its caller CLOSEs it)."""
         if r.rid is None:
             return
         with self._live_lock:
-            if r.rid in self._live:
+            if self._closing.is_set() and not closing_ok:
+                raise _Closing
+            if r.rid in self._spent:
                 raise _Duplicate
+            self._spent.add(r.rid)
             self._live[r.rid] = r
             early = self._early_ended.pop(r.rid, "absent") is None
         if early:
@@ -626,14 +671,17 @@ class Decider:
         p = r.parsed
         if r.rid is None:
             return self._deny(r, "audit-missing", 403, "decider: the request carries no audit value")
+        r.route = keys.lookup(self.routes, p.canonical_host)   # before _register: an early ENDED row is shaped by it
         try:
             self._register(r)
         except _Duplicate:
             self._owe_deny(r, 403, "decider: a second request with one audit value")
             return
+        except _Closing:
+            self._fire(r, Event.CLOSE)
+            return
         if r.lc.state not in PENDING:
             return
-        r.route = keys.lookup(self.routes, p.canonical_host)
         r.mode = self.mode.get()
         w = parse.walls(p) or (_CONTROL if _has_control(p) else None)
         if w is not None:
@@ -715,9 +763,19 @@ class Decider:
             self._readers.release()
 
     # --- verdicts ---------------------------------------------------------------------------------------------
-    def _deny(self, r: _Req, step_name: str, status: int, reason: str) -> None:
+    def _deny(self, r: _Req, step_name: str, status: int, reason: str, *, withdraw: bool = True) -> None:
+        """DENY, then the request's filed card withdrawn (`withdraw=False`: the deny IS the queue's answer)."""
         r.step_name, r.deny = step_name, (status, reason)
         self._fire(r, Event.DENY)
+        if withdraw:
+            with r.card_lock:
+                if r.card_id is None or r.card_ended:
+                    return
+                r.card_ended = True
+                try:
+                    self.cards.end(r.card_id)
+                except Exception as exc:       # noqa: BLE001: the deny stands; the queue's own hold bounds the card
+                    log.error("request %s: its card could not be withdrawn (%s)", r.rid, type(exc).__name__)
 
     def _allow(self, r: _Req) -> None:
         """R-6, then the allow frame built (every deny check is behind us), then ALLOW."""
@@ -744,15 +802,19 @@ class Decider:
             if "body" in v.why_all:
                 if not self._spool(r):
                     return
-                if any(advert.media_type(ct) == _FORM for ct in r.parsed.header("content-type")):
+                cts = r.parsed.header("content-type")
+                if len(cts) == 1 and advert.media_type(cts[0]) == _FORM:   # one form type, or the wire method
                     try:
                         form = parse.parse_query(r.body.decode("utf-8"))
                     except (UnicodeDecodeError, parse.ParseError):
                         form = None
                     if form is not None:
                         v = self._classify(r, form)
-                        if v.kind != "card":
+                        if v.kind == "wall":
                             return self._deny(r, f"wall:{v.why}", 403, f"wall: {v.why}")
+                        if v.kind == "silent":
+                            r.step_name = "silent"
+                            return self._allow(r)
             card = cards.card_input(r.parsed, v, r.strip.stripped, body_len=len(r.body or b""),
                                     body_sha256=r.body_sha, launch_id=self.launch_id)
             if self._fire(r, Event.CARD) is None or r.lc.state is not State.CARD_HELD:
@@ -761,29 +823,31 @@ class Decider:
                 if r.card_ended:
                     return
                 r.card_id = self.cards.file(card)
-            answer = self._await_card(r)
-            if answer is None:
+            got = self._await_card(r)
+            if got is None:
                 return
+            answer, from_queue = got
             if answer == "allowed":
                 r.step_name = f"card:{v.why}:allowed"
                 return self._allow(r)
-            return self._deny(r, f"card:{v.why}:{answer}", 403, f"card: {answer}")
+            return self._deny(r, f"card:{v.why}:{answer}", 403, f"card: {answer}", withdraw=not from_queue)
         finally:
             self._card_slots.release()
 
-    def _await_card(self, r: _Req) -> str | None:
+    def _await_card(self, r: _Req) -> tuple[str, bool] | None:
+        """(the answer, whether the queue gave it), or None when the request ended or closed meanwhile."""
         deadline = time.monotonic() + self.limits.card_hold_s
         while True:
             left = deadline - time.monotonic()
             if left <= 0:
-                return "expired"
+                return "expired", False
             if r.wake.wait(min(self.limits.card_poll_s, left)):
-                return None if r.lc.state is not State.CARD_HELD else "expired"
+                return None if r.lc.state is not State.CARD_HELD else ("expired", False)
             state = self.cards.state(r.card_id)
             if state == "allowed":
-                return "allowed"
+                return "allowed", True
             if state != "pending":
-                return str(state or "unknown")
+                return str(state or "unknown"), True
 
     # --- lifecycle --------------------------------------------------------------------------------------------
     def _attempt(self, r: _Req) -> rec.Attempt:
@@ -807,7 +871,8 @@ class Decider:
                 if r.card_id is not None:
                     self.cards.end(r.card_id)
         elif effect is Effect.WRITE_ATTEMPT:
-            self.records.write_attempt(self.launch_id, r.rid, step.verdict, self._attempt(r))
+            if not self.records.write_attempt(self.launch_id, r.rid, step.verdict, self._attempt(r)):
+                raise RuntimeError("the attempt row was refused (one is stored for this request already)")
         elif effect is Effect.SEND_ALLOW:
             if r.allow is None:
                 raise RuntimeError("an ALLOW with no allow frame built")
@@ -858,12 +923,13 @@ class Decider:
             self._owe_deny(r, 503, "decider: this request failed")
 
     def _owe_deny(self, r: _Req, status: int, reason: str) -> None:
-        """A deny srt is owed outside the machine (no transition sends it). A failure to send cuts the link."""
+        """A deny srt is owed outside the machine (no transition sends it). Any send that did not deliver the whole
+        frame, none of it included, cuts the link (srt then refuses every request: fail closed)."""
         try:
             self.link.send(wire.deny_frame(r.srt_id, status, reason))
         except SendFailed as exc:
-            if exc.sent:
-                self.link.kill("an owed deny was cut mid-send")
+            if exc.sent < exc.total:
+                self.link.kill("an owed deny was not sent whole")
         except Exception:                      # noqa: BLE001
             self.link.kill("an owed deny could not be sent")
 
@@ -883,6 +949,10 @@ class _Done(Exception):
 
 class _Duplicate(Exception):
     pass
+
+
+class _Closing(Exception):
+    """close() began before this request registered."""
 
 
 def service_threads() -> list[threading.Thread]:

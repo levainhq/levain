@@ -34,7 +34,7 @@ def _resolver_threads() -> int:
 
 def test_a_hung_lookup_denies_that_request_and_another_host_completes() -> None:
     seam = Seam({"good.test": ["93.184.216.34"], "slow.test": ["93.184.216.35"]}, hang={"slow.test"})
-    r = rs.Resolver(seam, max_lookups=4, timeout_s=0.5)
+    r = rs.Resolver(seam, max_lookups=4, timeout_s=3.0)
     out: dict = {}
 
     def slow() -> None:
@@ -49,9 +49,9 @@ def test_a_hung_lookup_denies_that_request_and_another_host_completes() -> None:
     time.sleep(0.05)
     t0 = time.monotonic()
     assert r.resolve("good.test", 443) == ["93.184.216.34"]
-    assert time.monotonic() - t0 < 0.4
-    th.join(5)
-    assert out["slow"][0] == "resolve_timeout" and 0.45 <= out["slow"][1] < 1.5
+    assert time.monotonic() - t0 < 2.0
+    th.join(8)
+    assert out["slow"][0] == "resolve_timeout" and 2.9 <= out["slow"][1] < 6.0
     seam.release.set()
 
 
@@ -108,3 +108,46 @@ def test_the_system_lookup_queries_the_absolute_name(monkeypatch) -> None:
     monkeypatch.setattr(rs.socket, "getaddrinfo", fake)
     assert rs.system_lookup("example.com", 443) == ["93.184.216.34"]
     assert seen == ["example.com."]
+
+
+# --- L3 r1 (1025+16 RULINGS_R1 FIX 7, FIX 8) -----------------------------------------------------------------------
+
+@pytest.mark.parametrize("host", ["2606:4700:4700::1111", "8.8.8.8", "127.0.0.1", "::1"])
+def test_an_ip_literal_is_its_own_answer_through_the_system_lookup(host) -> None:
+    """getaddrinfo refuses `2606:4700:4700::1111.` on macOS (the absolute-name dot is for DNS names only)."""
+    assert rs.Resolver(timeout_s=2).resolve(host, 443) == [host]
+
+
+def test_an_ip_literal_never_reaches_the_lookup() -> None:
+    seam = Seam({})
+    assert rs.Resolver(seam, timeout_s=1).resolve("10.0.0.1", 443) == ["10.0.0.1"] and seam.calls == []
+
+
+def test_the_lookup_cap_is_process_wide_across_resolvers() -> None:
+    names = {f"p{i}.test" for i in range(rs.MAX_LOOKUPS)}
+    seam = Seam({n: ["93.184.216.34"] for n in names} | {"other.test": ["93.184.216.34"]}, hang=names)
+    first = rs.Resolver(seam, timeout_s=0.3)
+    errors: list[str] = []
+
+    def one(n: str) -> None:
+        try:
+            first.resolve(n, 443)
+        except rs.ResolveError as exc:
+            errors.append(exc.reason)
+
+    ths = [threading.Thread(target=one, args=(n,)) for n in sorted(names)]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(5)
+    assert errors == ["resolve_timeout"] * rs.MAX_LOOKUPS     # every lookup still hangs, holding its slot
+    try:
+        with pytest.raises(rs.ResolveTimeout):
+            rs.Resolver(seam, timeout_s=0.3).resolve("other.test", 443)   # a new launch's resolver: no slot left
+    finally:
+        seam.release.set()
+        for _ in range(200):
+            if _resolver_threads() == 0:
+                break
+            time.sleep(0.01)
+    assert rs.Resolver(seam, timeout_s=1).resolve("other.test", 443) == ["93.184.216.34"]

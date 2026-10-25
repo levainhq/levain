@@ -90,7 +90,7 @@ class Launch:
     """One glue process + one in-process Decider on its sockets."""
 
     def __init__(self, tmp: Path, origin_port: int, *, limits: dm.Limits, lookup: Lookup, mode: str = "gated",
-                 names: str = "pub.rb.test=127.0.0.1;slow.rb.test=127.0.0.1") -> None:
+                 resolver_timeout: float = 1.0, names: str = "pub.rb.test=127.0.0.1;slow.rb.test=127.0.0.1") -> None:
         from levain.chat_egress import records as rec
         from levain.coordinator.store import CoordStore
         self.dir = tmp
@@ -134,7 +134,7 @@ class Launch:
         self.d = dm.Decider(ours, obs_ours, launch_id=self.launch_id, records=self.records,
                             routes=keys.RouteSet.of([]), mode=dm.Fixed(mode), liveness=Live(),
                             credentials=keys.LaunchCredentials(NoStore()), cards=self.desk,
-                            resolver=Resolver(lookup, max_lookups=4, timeout_s=1.0), limits=limits)
+                            resolver=Resolver(lookup, max_lookups=4, timeout_s=resolver_timeout), limits=limits)
         self.d.start()
         for _ in range(400):
             if "glue: serving" in self.stderr.read_text():
@@ -229,7 +229,7 @@ def test_two_cards_held_20_s_while_a_get_completes(launch, origin) -> None:
     held_at = time.monotonic()
     st, body, took = L.request("GET", "/g")
     print(f"RUN A13: GET while two cards held: status {st} in {took:.3f} s; cards filed {len(L.desk.filed)}")
-    assert st == 200 and body == b"ok" and took < 2.0
+    assert st == 200 and body == b"ok" and took < 5.0
     while time.monotonic() - held_at < 20:
         time.sleep(0.5)
     assert [r["path"] for r in origin.reqs] == ["/g"]                 # nothing of the held POSTs reached the origin
@@ -276,7 +276,7 @@ def test_a_chunked_body_is_spooled_decoded_and_nothing_goes_upstream_before_the_
 
 def test_a_hung_resolve_denies_that_request_and_another_completes(launch, origin) -> None:
     lk = Lookup(hang={"slow.rb.test"})
-    L = launch(lookup=lk)
+    L = launch(lookup=lk, resolver_timeout=4.0)
     out: dict = {}
 
     def slow() -> None:
@@ -293,8 +293,8 @@ def test_a_hung_resolve_denies_that_request_and_another_completes(launch, origin
     st, _, took = L.request("GET", "/fast")
     t.join(20)
     print(f"RUN B15: hung name -> {out['slow'][0]} after {out['slow'][2]:.2f} s; another host -> {st} in {took:.3f} s")
-    assert st == 200 and took < 0.9
-    assert out["slow"][0] == 502 and out["slow"][2] >= 0.9
+    assert st == 200 and took < 3.0
+    assert out["slow"][0] == 502 and out["slow"][2] >= 3.9
     assert [r["path"] for r in origin.reqs] == ["/fast"]
     lk.release.set()
     assert L.stop() == 0

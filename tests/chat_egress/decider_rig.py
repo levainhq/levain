@@ -90,10 +90,11 @@ class SrtEnd:
         self.raw_tail = b""
         self._t = threading.Thread(target=self._read, daemon=True)
 
-    def handshake(self) -> None:
+    def handshake(self, *, reads: bool = True) -> None:
         self.send({"t": "hello", "proto": 1})
         assert self._frame() == {"t": "hello", "proto": 1, "allowedDomains": [], "deniedDomains": []}
-        self._t.start()
+        if reads:                                    # False: srt stops reading after the hello (its buffer fills)
+            self._t.start()
 
     def send(self, msg: dict) -> None:
         raw = json.dumps(msg).encode()
@@ -173,7 +174,7 @@ class SrtEnd:
 class Rig:
     def __init__(self, tmp: Path, *, mode: str = "gated", limits: dm.Limits | None = None,
                  lookup: Lookup | None = None, routes: keys.RouteSet | None = None, start_obs: bool = True,
-                 link_fault=None, resolver_timeout: float = 1.0) -> None:
+                 link_fault=None, resolver_timeout: float = 1.0, srt_reads: bool = True) -> None:
         self.store = CoordStore(Path(tmp) / "dispatch")
         self.records = rec.EgressRecords(self.store)
         self.launch = make_launch(self.store)
@@ -191,7 +192,7 @@ class Rig:
         self.srt = SrtEnd(b)
         self.obs = ob
         self.d.start()
-        self.srt.handshake()
+        self.srt.handshake(reads=srt_reads)
 
     def obs_line(self, line: bytes) -> None:
         self.obs.sendall(line)

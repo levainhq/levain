@@ -5,12 +5,15 @@ walls `non_public_address` and files no card (R15-10-A4); srt's resolved-address
 generated table, `guard.py`), so a rebinding between the two meets that guard. This module is the first half only:
 the lookup. `guard.address_wall` judges the answers.
 
-The lookup is the system resolver's `getaddrinfo` on the ABSOLUTE name (`host.`), as `levain.broker.front`'s
-`system_resolve` does: a dotless query would let the search list turn an allowed name into a name under another
-domain. It is synchronous (the decider is threaded per request), and getaddrinfo cannot be cancelled, so the pool is
-bounded by SLOTS, not by threads that finish on time:
-  * at most `max_lookups` lookups exist at once, each on its own daemon thread; a lookup that hangs keeps its slot
-    until the resolver returns, and its late answer is dropped;
+An IP literal is its own answer (no lookup): `guard.address_wall` judges it as it is. A DNS name is looked up by the
+system resolver's `getaddrinfo` on the ABSOLUTE name (`host.`), as `levain.broker.front`'s `system_resolve` does: a
+dotless query would let the search list turn an allowed name into a name under another domain (the dot is for names
+only: macOS's getaddrinfo refuses `2606:4700:4700::1111.`). It is synchronous (the decider is threaded per request),
+and getaddrinfo cannot be cancelled, so the pool is bounded by SLOTS, not by threads that finish on time:
+  * at most `max_lookups` lookups of one resolver exist at once, and at most MAX_LOOKUPS in the process (one slot set
+    every resolver shares, so lookups that still hang after their launch closed count against the next launch);
+    each lookup is on its own daemon thread; a lookup that hangs keeps its slots until the resolver returns, and its
+    late answer is dropped;
   * a resolve waits for a slot at most `timeout_s`, and for its answer at most what is left of the same `timeout_s`;
     either wait running out raises `ResolveTimeout` (the request is denied), whatever the other lookups do;
   * no answer (an error, or no address) raises `ResolveFailed`.
@@ -23,6 +26,7 @@ rig pass a map (a CH-D2 test seam; S8's launch passes none).
 
 from __future__ import annotations
 
+import ipaddress
 import socket
 import threading
 import time
@@ -30,8 +34,9 @@ from typing import Callable, Sequence
 
 #: [seat] `front`'s RESOLVE_TIMEOUT_S (design §3.8.5(a)'s cap table): one resolve's whole budget.
 RESOLVE_TIMEOUT_S = 5.0
-#: [seat] at most this many lookups at once (each one daemon thread).
+#: [seat] at most this many lookups at once, in one resolver and in the process (each one daemon thread).
 MAX_LOOKUPS = 16
+_PROCESS_SLOTS = threading.BoundedSemaphore(MAX_LOOKUPS)
 
 Lookup = Callable[[str, int], Sequence[str]]
 
@@ -49,9 +54,18 @@ class ResolveTimeout(ResolveError):
     reason = "resolve_timeout"
 
 
+def _literal(host: str) -> str | None:
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        return None
+
+
 def system_lookup(host: str, port: int) -> list[str]:
-    """getaddrinfo on the absolute name; the de-duplicated address strings, in the resolver's order."""
-    infos = socket.getaddrinfo(host + ".", port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+    """getaddrinfo on the absolute name (an IP literal as it is); the de-duplicated address strings, in the
+    resolver's order."""
+    name = host if _literal(host) is not None else host + "."
+    infos = socket.getaddrinfo(name, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
     out: list[str] = []
     for info in infos:
         addr = info[4][0]
@@ -73,9 +87,15 @@ class Resolver:
         self.max_lookups = max_lookups
 
     def resolve(self, host: str, port: int) -> list[str]:
+        literal = _literal(host)
+        if literal is not None:
+            return [literal]
         deadline = time.monotonic() + self._timeout
         if not self._slots.acquire(timeout=self._timeout):
             raise ResolveTimeout("every resolver slot is busy")
+        if not _PROCESS_SLOTS.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            self._slots.release()
+            raise ResolveTimeout("every process resolver slot is busy")
         done = threading.Event()
         box: dict = {}
 
@@ -85,12 +105,14 @@ class Resolver:
             except BaseException as exc:     # noqa: BLE001: any failure is "no answer"
                 box["error"] = exc
             finally:
-                self._slots.release()        # the slot is held until the lookup itself returns
+                _PROCESS_SLOTS.release()     # the slots are held until the lookup itself returns
+                self._slots.release()
                 done.set()
 
         try:
             threading.Thread(target=work, name="levain-egress-resolve", daemon=True).start()
         except BaseException:
+            _PROCESS_SLOTS.release()
             self._slots.release()
             raise
         if not done.wait(max(0.0, deadline - time.monotonic())):

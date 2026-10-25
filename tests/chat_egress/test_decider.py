@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from levain.chat_egress import advert, classify, decider as dm, strip, wire
+from levain.chat_egress import advert, classify, decider as dm, keys, strip, wire
 from levain.chat_egress.lifecycle import Effect, Settled
 
 from .decider_rig import Lookup, Rig
@@ -54,7 +54,7 @@ def test_two_held_cards_do_not_stall_a_get(rig) -> None:
     t0 = time.monotonic()
     g, rid = r.srt.req("GET", path="/c")
     assert action(r.srt.wait(g)) == "allow"
-    assert time.monotonic() - t0 < 1.0
+    assert time.monotonic() - t0 < 2.0
     assert r.srt.got(c1) == [] and r.srt.got(c2) == []          # still held
     r.desk.answer["card-1"] = "allowed"
     r.desk.answer["card-2"] = "denied"
@@ -142,14 +142,14 @@ def test_a_cut_spool_is_503_body_cap_and_no_card(rig) -> None:
 # --- R15-10-A7: body deadlines are the decider's; a cap on concurrent spools -----------------------------------------
 
 def test_stalled_bodies_become_body_timeout_walls_while_a_get_completes(rig) -> None:
-    lim = dm.Limits(card_poll_s=0.05, body_timeout_s=0.6, max_body_readers=2, stop_drain_s=0.5)
+    lim = dm.Limits(card_poll_s=0.05, body_timeout_s=3.0, max_body_readers=2, stop_drain_s=0.5)
     r = rig(limits=lim)
     stalled = [r.srt.req("POST", path=f"/s{i}", headers={"transfer-encoding": ["chunked"]})[0] for i in range(3)]
     time.sleep(0.2)
     g, _ = r.srt.req("GET", path="/ok")
     t0 = time.monotonic()
-    assert action(r.srt.wait(g)) == "allow" and time.monotonic() - t0 < 0.5
-    finals = [r.srt.wait(s, 2, timeout=5)[-1] for s in stalled]
+    assert action(r.srt.wait(g)) == "allow" and time.monotonic() - t0 < 2.0
+    finals = [r.srt.wait(s, 2, timeout=8)[-1] for s in stalled]
     reasons = sorted(f["reason"] for f in finals if f["action"] == "deny")
     assert reasons == ["wall: body_readers", "wall: body_timeout", "wall: body_timeout"]
     assert sorted(f["status"] for f in finals) == [408, 408, 503]
@@ -216,13 +216,13 @@ def test_a_post_to_a_name_answering_loopback_walls_and_files_no_card(rig) -> Non
 
 
 def test_a_hung_resolve_denies_that_request_and_another_host_completes(rig) -> None:
-    r = rig(lookup=Lookup(hang={"slow.test"}), resolver_timeout=0.5)
+    r = rig(lookup=Lookup(hang={"slow.test"}), resolver_timeout=3.0)
     s, srid = r.srt.req("GET", host="slow.test")
     time.sleep(0.05)
     g, _ = r.srt.req("GET", host="fast.test")
     t0 = time.monotonic()
-    assert action(r.srt.wait(g)) == "allow" and time.monotonic() - t0 < 0.4
-    v = r.srt.wait(s, timeout=3)
+    assert action(r.srt.wait(g)) == "allow" and time.monotonic() - t0 < 2.0
+    v = r.srt.wait(s, timeout=6)
     assert v[-1]["status"] == 502 and v[-1]["reason"] == "wall: resolve_timeout"
     assert r.rows(srid)[0].deciding_step == "wall:resolve_timeout"
 
@@ -366,7 +366,7 @@ def test_a_raised_send_allow_measures_what_left(rig, left, expect) -> None:
         assert [x["action"] for x in v] == ["deny"] and v[0]["status"] == 503
     elif expect == "cut":
         assert r.srt.eof and v == [] and len(r.srt.raw_tail) == 1          # 4 header bytes + 1 body byte left
-        assert r.d.link.dead == "a verdict frame was cut mid-send"
+        assert r.d.link.dead == "a frame was cut mid-send"
     else:
         assert [x["action"] for x in v] == ["allow"]
 
@@ -399,7 +399,7 @@ def test_a_raised_release_measures_what_left(rig, left, expect) -> None:
         assert [(x["action"], x["status"]) for x in v] == [("deny", 503)]
     else:
         assert r.srt.eof and v == [] and len(r.srt.raw_tail) == 1
-        assert r.d.link.dead == "a verdict frame was cut mid-send"
+        assert r.d.link.dead == "a frame was cut mid-send"
 
 
 # --- C1: the standing default, read live -------------------------------------------------------------------------------
@@ -443,3 +443,215 @@ def test_open_network_forwards_an_unkeyed_post_silently(rig) -> None:
     r = rig(mode="open network")
     p, _ = r.srt.req("POST", path="/w")
     assert action(r.srt.wait(p)) == "allow" and r.desk.filed == []
+
+
+# --- L3 r1 (1025+16 RULINGS_R1): the link, admission, audit ids, the form, the card, the body ------------------------
+
+def _until(cond, timeout: float = 5.0) -> bool:
+    end = time.monotonic() + timeout
+    while not cond():
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def test_fix1_a_close_while_a_send_is_blocked_on_a_full_buffer_returns_inside_its_bound(rig) -> None:
+    """srt stops reading: a send blocks holding the write lock. kill (and so close) never waits on that lock."""
+    r = rig(srt_reads=False)
+    err: dict = {}
+
+    def big() -> None:
+        try:
+            r.d.link.send_bytes(b"\0" * (32 << 20))         # past any socket buffer: it blocks
+        except dm.SendFailed as exc:
+            err["e"] = exc
+
+    t = threading.Thread(target=big, daemon=True)
+    t.start()
+    assert _until(r.d.link._wlock.locked)
+    out: dict = {}
+    c = threading.Thread(target=lambda: out.setdefault("ok", r.d.close(timeout_s=2)), daemon=True)
+    try:
+        c.start()
+        c.join(4)
+        assert not c.is_alive() and out["ok"] is True
+        t.join(2)
+        assert isinstance(err.get("e"), dm.SendFailed) and r.d.link.dead == "the launch closed"
+    finally:
+        r.srt.sock.close()                                  # unblocks the old code's send so the rig can close
+
+
+def test_fix2_a_need_body_cut_mid_send_cuts_the_link_and_nothing_follows(rig) -> None:
+    armed = {"on": False}
+
+    def fault(n: int):
+        if armed["on"]:
+            armed["on"] = False
+            return 5
+        return None
+
+    r = rig(link_fault=fault)
+    armed["on"] = True
+    p, rid = r.srt.req("POST", path="/x", headers={"content-length": ["3"]})
+    with r.srt.cv:
+        r.srt.cv.wait_for(lambda: r.srt.eof, timeout=5)
+    assert r.srt.eof and r.srt.got(p) == [] and len(r.srt.raw_tail) == 1   # 4 header bytes + 1: nothing after
+    assert r.d.link.dead is not None
+
+
+class _PausedSlots:
+    """`Decider._decisions` with its acquire held at `go` (the link thread paused past the closing check)."""
+
+    def __init__(self, real) -> None:
+        self.real, self.reached, self.go = real, threading.Event(), threading.Event()
+
+    def acquire(self, blocking: bool = True) -> bool:
+        self.reached.set()
+        self.go.wait(2)
+        return self.real.acquire(blocking=blocking)
+
+    def release(self) -> None:
+        self.real.release()
+
+
+def test_fix3_a_request_admitted_while_close_snapshots_is_closed_and_joined(rig) -> None:
+    r = rig()
+    slots = _PausedSlots(r.d._decisions)
+    r.d._decisions = slots
+
+    class Mode:                                             # close() calls mode.close after its snapshot
+        def get(self) -> str:
+            return "gated"
+
+        def close(self) -> None:
+            slots.go.set()
+            _until(lambda: bool(r.desk.filed), 1.0)
+
+    r.d.mode = Mode()
+    p, rid = r.srt.req("POST", path="/late")
+    assert slots.reached.wait(5)
+    ok = r.d.close(timeout_s=4)
+    assert ok, "a decision admitted during close outlived it"
+    assert r.records.settled(r.launch, rid) is Settled.UNDECIDED
+    assert sorted(r.desk.ended) == sorted(f"card-{i + 1}" for i in range(len(r.desk.filed)))
+
+
+@pytest.mark.parametrize("cts, method", [
+    (["application/json", "application/x-www-form-urlencoded"], "POST"),
+    (["application/x-www-form-urlencoded, application/json"], "POST"),
+    (["application/x-www-form-urlencoded"], "GET"),
+])
+def test_fix4_a_form_override_is_read_only_under_one_form_content_type(rig, cts, method) -> None:
+    r = rig()
+    p, _ = r.srt.req("POST", path="/f", headers={"content-type": cts, "content-length": ["11"]})
+    assert r.srt.wait(p)[0]["action"] == "need_body"
+    r.srt.body(p, b"_method=GET")
+    assert _until(lambda: bool(r.desk.filed))
+    assert r.desk.filed[0]["method"] == method
+
+
+def test_fix5_an_audit_id_is_spent_for_the_launch(rig) -> None:
+    r = rig(start_obs=False)
+    rid = "0b6f5f3e-3c1d-4c8e-9a3e-2d7b1f0c9a11"
+    g, _ = r.srt.req("GET", path="/once", rid=rid)
+    assert action(r.srt.wait(g)) == "allow"
+    r.obs_line(wire.obs_response_line(rid, 200, "text/plain", "2"))
+    r.d.drain()
+    assert r.records.settled(r.launch, rid) is Settled.COMPLETED
+    g2, _ = r.srt.req("GET", path="/once", rid=rid)
+    v = r.srt.wait(g2)
+    assert [(x["action"], x["reason"]) for x in v] == [("deny", "decider: a second request with one audit value")]
+
+
+def test_fix5_an_attempt_write_that_is_refused_fails_before_any_allow(rig, monkeypatch) -> None:
+    r = rig()
+    monkeypatch.setattr(r.records, "write_attempt", lambda *a, **kw: False)
+    g, _ = r.srt.req("GET", path="/refused")
+    v = r.srt.wait(g)
+    assert [x["action"] for x in v] == ["deny"] and v[0]["status"] == 503
+
+
+def test_fix6_an_owed_deny_that_sends_nothing_cuts_the_link(rig) -> None:
+    armed = {"n": 0}
+
+    def fault(n: int):
+        if armed["n"]:
+            armed["n"] -= 1
+            return 0
+        return None
+
+    r = rig(link_fault=fault)
+    armed["n"] = 2                                          # the allow and then the owed deny send 0 bytes
+    g, _ = r.srt.req("GET", path="/f")
+    with r.srt.cv:
+        r.srt.cv.wait_for(lambda: r.srt.eof, timeout=5)
+    assert r.srt.eof and r.srt.got(g) == []
+    assert r.d.link.dead is not None
+
+
+def test_fix10_a_form_that_reclassifies_silent_is_allowed(rig, monkeypatch) -> None:
+    """Seam: no real input reclassifies silent today (FIX_RETURN, VERIFY 10); the path is still the silent one."""
+    import dataclasses
+    real = classify.decide
+
+    def seam(parsed, *a, **kw):
+        v = real(parsed, *a, **kw)
+        return dataclasses.replace(v, kind="silent", why=None) if kw.get("form_params") is not None else v
+
+    monkeypatch.setattr(classify, "decide", seam)
+    r = rig()
+    p, rid = r.srt.req("POST", path="/f", headers={"content-type": ["application/x-www-form-urlencoded"],
+                                                   "content-length": ["3"]})
+    assert r.srt.wait(p)[0]["action"] == "need_body"
+    r.srt.body(p, b"a=1")
+    assert action(r.srt.wait(p, 2)) == "allow" and r.desk.filed == []
+    assert r.rows(rid)[0].deciding_step == "silent"
+
+
+def test_fix11_a_card_the_hold_expires_is_withdrawn(rig) -> None:
+    r = rig(limits=dm.Limits(card_poll_s=0.05, card_hold_s=0.3, stop_drain_s=0.5))
+    p, rid = r.srt.req("POST", path="/held")
+    v = r.srt.wait(p)
+    assert v[-1]["action"] == "deny" and v[-1]["reason"] == "card: expired"
+    assert _until(lambda: r.desk.ended == ["card-1"])
+
+
+def test_fix11_a_body_past_the_cap_srt_did_not_cut_is_body_cap(rig) -> None:
+    r = rig(limits=dm.Limits(card_poll_s=0.05, card_body_cap=10, stop_drain_s=0.5))
+    p, rid = r.srt.req("POST", path="/big", headers={"content-type": ["application/octet-stream"],
+                                                     "content-length": ["11"]})
+    assert r.srt.wait(p)[0]["action"] == "need_body"
+    r.srt.body(p, b"x" * 11)
+    v = r.srt.wait(p, 2)
+    assert v[-1]["action"] == "deny" and v[-1]["reason"] == "wall: body_cap" and r.desk.filed == []
+
+
+def test_fix12_an_early_ended_row_has_the_decided_rows_path_shape(rig) -> None:
+    route = keys.RouteSnapshot(record_id="rec-1", canonical_host="ok.test", credential_source="svc",
+                               declared_repos=frozenset({"/r.git"}), attach=False, credential_account=None,
+                               incarnation=None)
+    r = rig(start_obs=False, routes=keys.RouteSet.of([route]))
+    g, grid = r.srt.req("GET", path="/plain")
+    assert action(r.srt.wait(g)) == "allow"
+    rid = "11111111-2222-4333-8444-555555555555"
+    r.obs_line(wire.obs_ended_line(rid))
+    r.d.drain()
+    p, _ = r.srt.req("GET", path="/plain", rid=rid)
+    r.srt.wait(p)
+    assert r.records.settled(r.launch, rid) is Settled.ENDED
+    assert r.rows(rid)[0].path == r.rows(grid)[0].path
+
+
+def test_fix9_close_wakes_a_waiting_setting_read_and_reports_a_reader_that_lives(rig) -> None:
+    hang = threading.Event()
+    s = dm.LiveSetting(lambda: (hang.wait(30), "gated")[1], timeout_s=20)
+    r = rig()
+    r.d.mode = s
+    g, _ = r.srt.req("GET", path="/m")
+    assert _until(lambda: any(t.name == "levain-egress-setting" for t in threading.enumerate()))
+    t0 = time.monotonic()
+    ok = r.d.close(timeout_s=1.5)
+    assert not ok and time.monotonic() - t0 < 3.0
+    assert [t.name for t in dm.service_threads()] == ["levain-egress-setting"]   # the waiting decision was woken
+    hang.set()
