@@ -2788,13 +2788,18 @@ class ControlServer:
 
     def _stream(self, sock: socket.socket, opening: "tuple[dict[str, object] | None, int]") -> None:
         """The SESSION-EVENTS stream (:meth:`Control._op_session_events`) until the peer sends anything or ends, the
-        journal closes (CONTROL's stop) or a send fails. The gap first, then events by ``seq``."""
+        journal closes (CONTROL's stop) or a send fails. The gap first, then events by ``seq``; a journal poisoned
+        under the stream ends it with ``{kind:"error", error:"events-unavailable"}`` (L3 r1 fix 3)."""
         gap, cursor = opening
         journal = self.control.events
         if journal is None or (gap is not None and not self._send(sock, gap)):
             return
         while not self._stop.is_set():
-            got = journal.after(cursor, wait_s=STREAM_POLL_S)
+            try:
+                got = journal.after(cursor, wait_s=STREAM_POLL_S)
+            except Refused as e:
+                self._send(sock, {"kind": "error", "error": e.name})
+                return
             if got is None:
                 return
             for seq, data in got:

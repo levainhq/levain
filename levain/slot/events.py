@@ -13,9 +13,11 @@ The three kinds this module keeps (§3.6's tagged union; ``seq`` and ``at`` on e
 - ``artifact``: ``{seq, at, kind, session, ticket, generation, artifact_digest | artifact_failed}``
 - ``pool``: ``{seq, at, kind, egress_free, none_free}``
 
-and the two a stream sends but never stores: ``{kind:"hello", journal_id, oldest_seq, newest_seq}`` (CONTROL's answer
-to ``SESSION-EVENTS`` carries it) and ``{kind:"gap", oldest_seq}``, sent first when the cursor is older than the oldest
-kept event and an event past the cursor was pruned. ``oldest_seq`` / ``newest_seq`` are 0 while nothing is kept.
+and the ones a stream sends but never stores: ``{kind:"hello", journal_id, oldest_seq, newest_seq}`` (CONTROL's answer
+to ``SESSION-EVENTS`` carries it), ``{kind:"gap", oldest_seq}``, sent first when the cursor is older than the oldest
+kept event and an event past the cursor was pruned, and ``{kind:"error", error}``, the last frame of a stream that
+cannot go on (``events-unavailable``: the journal was poisoned). ``oldest_seq`` / ``newest_seq`` are 0 while nothing
+is kept.
 
 **Start** (:meth:`EventJournal.start`): the meta is read (absent: made; one that does not parse refuses
 ``events-corrupt``); the journal is opened ``O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW`` and read whole. A last line with
@@ -25,8 +27,9 @@ raise ``seq`` refuses the start ``events-corrupt``: CONTROL never serves a journ
 
 **Append**: a failed write or fsync POISONS the journal, as ``tickets.py`` and ``lineage.py`` do (the line may be on
 disk, whole or torn, while memory never took it): the appender is closed and every later append refuses
-``events-unavailable`` until CONTROL restarts; the restart reads a whole line as written and cuts a torn one. Readers
-of what memory holds (a stream, :meth:`last_generation`) keep working.
+``events-unavailable`` until CONTROL restarts; the restart reads a whole line as written and cuts a torn one.
+:meth:`last_generation` keeps answering from memory; a stream is never opened on a poisoned journal, and one already
+open gets what was kept past its cursor and then ends (:meth:`EventJournal.after`).
 
 **Prune** (:meth:`EventJournal.prune`, at CONTROL's start and every :data:`PRUNE_EVERY` appends, where a failure is
 handed to :attr:`EventJournal.on_error` and the append that ran it still returns its ``seq``): the ``state`` /
@@ -404,20 +407,28 @@ class EventJournal:
             return hello, gap, after_seq
 
     def _open_or_raise(self) -> None:
-        if self._closed or (self._fd is None and not self._poisoned):
+        if self._poisoned:
+            raise Refused("events-unavailable", "an event append failed; CONTROL must restart")
+        if self._closed or self._fd is None:
             raise Refused("events-unavailable", "the event journal is not open")
 
     def after(self, seq: int, *, wait_s: float = 0.0) -> Optional[List[Tuple[int, bytes]]]:
         """The kept events with ``seq`` greater than ``seq``, oldest first, waiting up to ``wait_s`` for one to be
-        appended when there is none; None once the journal is closed (CONTROL stopped)."""
+        appended when there is none; None once the journal is closed (CONTROL stopped). A poisoned journal (L3 r1
+        fix 3) still answers what it kept past ``seq``, then refuses ``events-unavailable``: no later event can come,
+        so a stream ends rather than waits."""
         with self.lock:
             deadline = time.monotonic() + wait_s
             while True:
                 if self._closed:
                     return None
                 out = [(k.seq, k.data) for k in self._kept if k.seq > seq]
+                if out:
+                    return out
+                if self._poisoned:
+                    raise Refused("events-unavailable", "an event append failed; CONTROL must restart")
                 left = deadline - time.monotonic()
-                if out or left <= 0:
+                if left <= 0:
                     return out
                 self.cond.wait(left)
 
