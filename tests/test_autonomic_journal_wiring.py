@@ -34,6 +34,7 @@ from levain.autonomic import (
 from tests.autonomic_confirm_keys import SIGNER, confirm_signers, sign, signed_yes
 from tests.autonomic_test_only_confinement import assume_confined_for_this_test
 from levain.autonomic.journal import EffectStatus
+from tests.test_autonomic_binding import reversible_floor
 from tests.test_autonomic_rawstore import registry_of, write_raw
 
 FIXED = _dt.datetime(2026, 10, 7, 12, 0, 0, tzinfo=_dt.timezone.utc)
@@ -338,8 +339,9 @@ def test_every_verb_that_stops_or_tightens_a_grant_fences_it(tmp_path, verb):
     elif verb == "replace":
         assert w.store.replace_atomic(w.store.get(b.binding_id), Binding.create(
             created_by="operator", created_at="2026-10-07T10:00:00", trigger=b.trigger, goal=b.goal,
-            tightness=b.tightness, posture=Posture.ABOVE_LOOP, guard=b.guard, status=BindingStatus.ACTIVE),
-            coverage=lambda binding, rung: True)   # a looser rung below CONFIRM: a policy covers it (14b)
+            tightness=b.tightness, posture=Posture.COOLING_OFF, guard=b.guard, status=BindingStatus.ACTIVE),
+            coverage=lambda binding, rung: True,   # a rung below CONFIRM: a policy covers it (14b)
+            risk_floor_of=reversible_floor)
     else:
         w.store.remove(b.binding_id)
     assert w.journal.generation(b.binding_id) == before + 1          # mirrored into the journal

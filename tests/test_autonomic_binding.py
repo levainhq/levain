@@ -23,6 +23,7 @@ import pytest
 from tests.test_autonomic_rawstore import dump, registry_of, write_raw
 
 from levain.autonomic import (
+    ActionRisk,
     AuthorityScope,
     Binding,
     BindingStatus,
@@ -30,10 +31,12 @@ from levain.autonomic import (
     Graduation,
     Posture,
     PredicateValidator,
+    RiskClass,
     SubGoal,
     TightnessVector,
     TriggerSpec,
     binding_invocation,
+    risk_floor,
     seal_binding_id,
 )
 
@@ -54,6 +57,15 @@ def make_goal(goal: str = "summarize into a Doc", tools=("mail.read", "gdrive.cr
 
 def make_tightness(g=0.9, t=0.8, p=1.0, o=0.9) -> TightnessVector:
     return TightnessVector(goal_spec=g, tool_min=t, pattern_precision=p, output_bound=o)
+
+
+def reversible_floor(binding: Binding) -> Posture:
+    """A real risk floor for ``replace_atomic``: the floor of a low-risk, reversible, internal action."""
+    return risk_floor(ActionRisk(cls=RiskClass.LOW, reversible=True, external=False, financial=False))
+
+
+def always_covered(binding: Binding, rung: Posture) -> bool:
+    return True
 
 
 def make_binding(*, posture: Posture = Posture.CONFIRM, status: BindingStatus = BindingStatus.ACTIVE,
@@ -407,7 +419,8 @@ def test_replace_atomic_adds_new_and_revokes_old(tmp_path):
     read = s.record_fire(old.binding_id, clean=True, fired_at=FIRED_AT)
     promoted = make_binding(posture=Posture.ON_LOOP)   # a re-ratification = different core = new id
     assert promoted.binding_id != old.binding_id
-    result = s.replace_atomic(read, promoted, coverage=lambda b, rung: True)  # a policy covers it (14b)
+    result = s.replace_atomic(read, promoted, coverage=lambda b, rung: True,  # a policy covers it (14b)
+                              risk_floor_of=reversible_floor)
     assert result and result.reason == "replaced"
     old_got = s.get(old.binding_id)
     assert old_got is not None and old_got.status is BindingStatus.REVOKED   # superseded
@@ -521,7 +534,9 @@ def test_the_validator_runs_outside_the_store_lock(tmp_path):
     s = BindingStore(tmp_path / "b", validator=probe)
     a = make_binding(posture=Posture.ON_LOOP)
     s.add(a)
-    assert s.replace_atomic(a, make_binding(posture=Posture.ABOVE_LOOP), coverage=lambda b, rung: True)
+    result = s.replace_atomic(a, make_binding(posture=Posture.ABOVE_LOOP), coverage=always_covered,
+                              risk_floor_of=reversible_floor)
+    assert not result and result.reason == "below_risk_floor"   # an action that does something is >= ON_LOOP
     assert probe.held == [False, False]
 
 
@@ -635,9 +650,11 @@ def test_replace_atomic_rejects_same_id(tmp_path):
     b = make_binding()
     s.add(b)
     with pytest.raises(ValueError):
-        s.replace_atomic(b, b)                 # identical core = identical id = not a re-ratification
+        # identical core = identical id = not a re-ratification
+        s.replace_atomic(b, b, coverage=always_covered, risk_floor_of=reversible_floor)
     with pytest.raises(TypeError):
-        s.replace_atomic(b.binding_id, b)      # the old signature: an id says nothing about what was read
+        # the old signature: an id says nothing about what was read
+        s.replace_atomic(b.binding_id, b, coverage=always_covered, risk_floor_of=reversible_floor)
 
 
 def test_replace_atomic_aborts_without_write_when_old_absent(tmp_path):
@@ -646,7 +663,7 @@ def test_replace_atomic_aborts_without_write_when_old_absent(tmp_path):
     s.add(existing)
     promoted = make_binding(posture=Posture.ON_LOOP)
     never_stored = make_binding(posture=Posture.ABOVE_LOOP, created_at="t-never")
-    result = s.replace_atomic(never_stored, promoted)
+    result = s.replace_atomic(never_stored, promoted, coverage=always_covered, risk_floor_of=reversible_floor)
     assert not result and result.reason == "old_absent"
     assert s.get(promoted.binding_id) is None                       # NOTHING written — no orphan grant
     assert {x.binding_id for x in s.list_all()} == {existing.binding_id}
@@ -667,7 +684,8 @@ def test_replace_atomic_never_supersedes_a_grant_that_is_not_live(tmp_path, make
     s.add(old)
     make_dead(s, old)
     current = s.get(old.binding_id)
-    result = s.replace_atomic(current, make_binding(posture=Posture.ABOVE_LOOP))
+    result = s.replace_atomic(current, make_binding(posture=Posture.ABOVE_LOOP),
+                              coverage=always_covered, risk_floor_of=reversible_floor)
     assert not result and result.reason == "old_not_fireable"
     assert s.list_active() == []
 
@@ -676,7 +694,8 @@ def test_replace_atomic_refuses_a_confirm_class_old_grant_with_no_sealed_kill(tm
     s = store(tmp_path)
     old = make_binding(posture=Posture.CONFIRM)        # barred from the fire view: no sealed kill
     s.add(old)
-    result = s.replace_atomic(old, make_binding(posture=Posture.ON_LOOP))
+    result = s.replace_atomic(old, make_binding(posture=Posture.ON_LOOP),
+                              coverage=always_covered, risk_floor_of=reversible_floor)
     assert not result and result.reason == "old_not_fireable"
 
 
@@ -686,7 +705,8 @@ def test_replace_atomic_refuses_when_the_old_grant_changed_since_the_read(tmp_pa
     s.add(old)
     stale = s.get(old.binding_id)
     s.tighten_guard(old.binding_id, _kill_guard())     # a concurrent tightening the caller never saw
-    result = s.replace_atomic(stale, make_binding(posture=Posture.ABOVE_LOOP))
+    result = s.replace_atomic(stale, make_binding(posture=Posture.ABOVE_LOOP),
+                              coverage=always_covered, risk_floor_of=reversible_floor)
     assert not result and result.reason == "old_changed"
     assert [b.binding_id for b in s.list_active()] == [old.binding_id]
 
@@ -695,7 +715,8 @@ def test_replace_atomic_precondition_is_an_extra_compare(tmp_path):
     s = store(tmp_path)
     old = make_binding(posture=Posture.ON_LOOP)
     s.add(old)
-    result = s.replace_atomic(old, make_binding(posture=Posture.ABOVE_LOOP), precondition=lambda b: False)
+    result = s.replace_atomic(old, make_binding(posture=Posture.ABOVE_LOOP),
+                              precondition=lambda b: False, coverage=always_covered, risk_floor_of=reversible_floor)
     assert not result and result.reason == "precondition_failed"
 
 

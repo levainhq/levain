@@ -38,6 +38,7 @@ from levain.autonomic import (
     one_rung_looser,
     propose_graduation,
 )
+from tests.test_autonomic_binding import reversible_floor
 
 # TEST ONLY: these tests exercise the binding fire path behind the up-front executor_not_confined refusal
 pytestmark = pytest.mark.usefixtures("test_only_confined_executor")
@@ -236,7 +237,8 @@ def test_replace_atomic_promotion_revokes_old_persists_new(tmp_path):
     p = _propose(src)
     promoted = p.build_promoted(status=BindingStatus.ACTIVE, created_at="2026-06-30T18:00:00")
     assert BindingStore.is_fireable(promoted)                  # the pre-persist defense-in-depth assert
-    assert store.replace_atomic(p.source, promoted, coverage=lambda b, rung: True)  # a policy covers it (14b)
+    assert store.replace_atomic(p.source, promoted, coverage=lambda b, rung: True,  # a policy covers it (14b)
+                                risk_floor_of=reversible_floor)
     # old REVOKED, new ACTIVE + fireable + fresh evidence.
     assert store.get(src.binding_id).status is BindingStatus.REVOKED
     new = store.get(promoted.binding_id)
@@ -386,12 +388,12 @@ def test_replace_atomic_precondition_aborts_on_change(tmp_path):
     promoted = p.build_promoted(status=BindingStatus.ACTIVE, created_at="2026-06-30T18:00:00")
     # a precondition that always fails → abort, write NOTHING, old untouched.
     assert not store.replace_atomic(p.source, promoted, precondition=lambda cur: False,
-                                    coverage=lambda b, rung: True)
+                                    coverage=lambda b, rung: True, risk_floor_of=reversible_floor)
     assert store.get(src.binding_id).status is BindingStatus.ACTIVE   # NOT revoked
     assert store.get(promoted.binding_id) is None                     # NOT persisted
     # a precondition that passes → applies.
     assert store.replace_atomic(p.source, promoted, precondition=lambda cur: True,
-                                coverage=lambda b, rung: True)
+                                coverage=lambda b, rung: True, risk_floor_of=reversible_floor)
     assert store.get(src.binding_id).status is BindingStatus.REVOKED
     assert store.get(promoted.binding_id).status is BindingStatus.ACTIVE
 
@@ -405,6 +407,6 @@ def test_replace_atomic_precondition_catches_concurrent_revoke(tmp_path):
     p = _propose(src)
     promoted = p.build_promoted(status=BindingStatus.ACTIVE, created_at="2026-06-30T18:00:00")
     store.set_status(src.binding_id, BindingStatus.REVOKED)   # concurrent revoke
-    result = store.replace_atomic(p.source, promoted)
+    result = store.replace_atomic(p.source, promoted, coverage=lambda b, rung: True, risk_floor_of=reversible_floor)
     assert not result and result.reason == "old_not_fireable"
     assert store.get(promoted.binding_id) is None             # the revoked grant was NOT resurrected looser

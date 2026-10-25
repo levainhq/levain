@@ -25,6 +25,7 @@ from levain.autonomic import (
     binding_invocation,
 )
 from levain.autonomic.receipt import build_gate_face, build_gate_verdict
+from tests.test_autonomic_binding import reversible_floor
 from tests.test_autonomic_rawstore import dump, registry_of, write_raw
 
 
@@ -130,7 +131,8 @@ def test_governed_lifecycle_over_a_real_store(tmp_path):
     # re-ratify (promote posture) atomically → old revoked, new active, exactly one fireable
     promoted = _binding(posture=Posture.ON_LOOP)
     assert promoted.binding_id != b.binding_id
-    assert store.replace_atomic(after, promoted, coverage=lambda b, rung: True)  # a policy covers it (14b)
+    assert store.replace_atomic(after, promoted, coverage=lambda b, rung: True,  # a policy covers it (14b)
+                                risk_floor_of=reversible_floor)
     assert store.get(b.binding_id).status is BindingStatus.REVOKED   # type: ignore[union-attr]
     assert {x.binding_id for x in store.list_active()} == {promoted.binding_id}
 
