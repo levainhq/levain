@@ -48,7 +48,7 @@ export const DROPPED_NAMES_SHOWN = 8;
 export const AUDIT_HEADER = 'x-levain-audit';
 export const LEVAIN_HEADER_PREFIX = 'x-levain-';
 export const UNPARSED = '<unparsed>';
-export const CONTENT_FIELD_LIMIT = 256;      // resp content_type / content_length (wire has no bound of its own)
+export const CONTENT_FIELD_LIMIT = 256;      // resp content_type / content_length; wire.py's reader bound is this
 export const OBS_QUEUE_LIMIT = 1 << 20;      // bytes queued in the glue for the obs peer; past it, fatal
 export const DRAIN_MS = 2000;                // the clean end's whole budget
 
@@ -295,6 +295,16 @@ export function createObsChannel({ stream, limit = OBS_QUEUE_LIMIT, onFatal }) {
   };
 }
 
+/**
+ * The lifeline: its EOF is the clean end (`cleanEnd`); a read error is `fatal(6, why)`, never a clean end (F2). `life`
+ * is the lifeline fd read as a socket; a fd that cannot be one throws at construction, before this runs.
+ */
+export function watchLifeline(life, { cleanEnd, fatal }) {
+  life.on('end', cleanEnd);
+  life.on('error', err => fatal(6, `lifeline error: ${err?.code ?? err}`));
+  life.resume();
+}
+
 // --- the launch (S8 spawns this with a closed env and explicit fds) ---------------------------------------------------
 async function main(argv) {
   const opt = (name, dflt) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : dflt);
@@ -387,9 +397,7 @@ async function main(argv) {
   // A pipe read as a socket (libuv, non-blocking). Not fs.createReadStream: that parks a threadpool worker in a
   // blocking read(2), and process.exit joins the threadpool, so every non-zero exit before the EOF would hang.
   const life = new NetSocket({ fd: Number(need('--lifeline-fd')), readable: true, writable: false });
-  life.on('end', cleanEnd);
-  life.on('error', err => fatal(6, `lifeline error: ${err?.code ?? err}`));
-  life.resume();
+  watchLifeline(life, { cleanEnd, fatal });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

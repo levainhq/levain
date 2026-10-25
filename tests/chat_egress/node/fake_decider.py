@@ -13,7 +13,8 @@ usage: fake_decider.py <out-dir> <script.json> -- <glue args...>
   scheme = https iff the frame has sni; https only on tls_ports, http only on http_ports, else deny "wall: port".
   literal_wall: a non-public IP-literal host -> deny (the decider's own wall; srt's guard never checks a literal).
   obs_close: the observation channel's peer is closed at once and never read (F1: the glue must fail closed).
-  lifeline_dir: the lifeline fd is a DIRECTORY, so the glue's first read of it errors (F2: an error is not a clean end).
+  lifeline_dir: the lifeline fd is a DIRECTORY, which the glue cannot read as a socket: it exits non-zero at start
+    (F2: only the lifeline's EOF is a clean end).
 Out: frames.jsonl (Link's log), obs.raw (the observation channel's bytes, exactly), proxy.stderr, ca.pem.
 Prints `READY <port> pid <node pid>`; a line or EOF on stdin is the clean end (the lifeline closes, the glue writes
 its final flush); then prints `EXIT <code>`.

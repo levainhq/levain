@@ -386,7 +386,9 @@ test('F2: lifeline EOF with a request pending at the decider -> its `ended` line
   assert.deepEqual([fin.t, fin.final], ['summary', true]);
 });
 
-test('F2: a lifeline read ERROR is not a clean end: non-zero, no final flush', { skip: SKIP }, async () => {
+// a read error on the lifeline (watchLifeline -> fatal(6)) is glue_unit.test.mjs's; this one is a lifeline fd the glue
+// cannot read as a socket at all (a directory), which throws before the handler exists
+test('F2: an unusable lifeline fd is not a clean end: non-zero, no final flush', { skip: SKIP }, async () => {
   const L = await launch('f2err', script({ lifeline_dir: true }), baseArgs());
   assert.ok(await untilGone(L.port), 'the glue kept serving on an unreadable lifeline');
   const code = await L.stop();

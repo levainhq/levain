@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  escapeText, jsonLine, createFlood, createFilter, wrapFilterRequest, foldHeaderName, ESCAPE_VECTORS_JS,
+  escapeText, jsonLine, createFlood, createFilter, wrapFilterRequest, foldHeaderName, ESCAPE_VECTORS_JS, watchLifeline,
 } from '../../../levain/chat_egress/node/glue.mjs';
 
 const ID = '0f0e0d0c-0b0a-4908-8706-050403020100';
@@ -424,4 +424,21 @@ test('F1: the obs channel: an error, an unexpected close or a queue past its bou
   assert.equal(run(s => s.emit('close')).length, 1);
   assert.equal(run((s, ch) => { s.destroyed = true; ch.write('x'); }).length, 1, 'a write to a destroyed stream');
   assert.deepEqual(run((s, ch) => { ch.end(() => {}); s.emit('close'); }), [], 'our own end');
+});
+
+test('F2: a lifeline read error is fatal(6), never the clean end; only its EOF is the clean end', async () => {
+  const { EventEmitter } = await import('node:events');
+  const watch = () => {
+    const life = Object.assign(new EventEmitter(), { resumed: false, resume() { this.resumed = true; } });
+    const calls = [];
+    watchLifeline(life, { cleanEnd: () => calls.push(['cleanEnd']), fatal: (code, why) => calls.push(['fatal', code, why]) });
+    return { life, calls };
+  };
+  const a = watch();
+  assert.equal(a.life.resumed, true);
+  a.life.emit('error', Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }));
+  assert.deepEqual(a.calls, [['fatal', 6, 'lifeline error: ECONNRESET']]);
+  const b = watch();
+  b.life.emit('end');
+  assert.deepEqual(b.calls, [['cleanEnd']]);
 });
