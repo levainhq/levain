@@ -563,6 +563,22 @@ def _terminal_event(event: Any, run: VerifierRun) -> tuple[str | None, str | Non
     return report_of(event)
 
 
+def _verified_at(at: str) -> str:
+    """A run record's ``verified_at`` from the terminal event's ``at``: CONTROL stamps events to the second
+    (:func:`levain.slot.records.timestamp`), re-written in the job store's stamp (:func:`utc_stamp`), losslessly; a
+    stamp already in the store's form is kept. Anything else is a :class:`DispatchError`."""
+    from levain.slot import records as SR
+
+    try:
+        return utc_stamp(parse_stamp(at))
+    except ConsentError:
+        pass
+    try:
+        return utc_stamp(datetime.fromtimestamp(SR.epoch_of(at), timezone.utc))
+    except (TypeError, ValueError):
+        raise DispatchError("the session event's at is not a timestamp") from None
+
+
 def report_of(event: Mapping[str, Any]) -> tuple[str | None, str | None]:
     """``(refusal name, None)`` or ``(None, envelope digest)`` from a verifier's terminal event's report fields, and a
     ``ticket`` that is a string: anything else is a :class:`DispatchError`. The one shape check of those fields, read
@@ -1416,7 +1432,7 @@ class JobStore:
                 name = exc.name
         record: ArtifactRecord | None = None
         if name is None:
-            verified_at = event["at"]
+            verified_at = _verified_at(event["at"])
             fields = dict(job_id=job.id, run=run.run, contract_digest=job.digest, base=contract.base, tree=tree,
                           verifier={"id": entry["verifier_id"], "hash": entry["verifier_artifact_digest"],
                                     "kind": entry["declared_kind"], "result": report.result},

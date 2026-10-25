@@ -1392,3 +1392,20 @@ def test_a_refusal_repeat_names_itself_and_a_job_failed_otherwise_is_a_plain_ref
     with pytest.raises(TransitionRefused) as exc:
         verify(store, repo, other, 0, ev=tvr.event(o, at=VERIFIED_AT, verifier_report_refused="verifier-failed:other"))
     assert type(exc.value) is TransitionRefused
+
+
+def test_a_control_stamped_event_records_with_the_stores_verified_at(store, repo):
+    """CONTROL stamps a session event to the second (records.timestamp); record_verification takes it as it arrives
+    and writes the instant in the job store's own stamp."""
+    from datetime import datetime, timezone
+
+    from levain.slot import records as SR
+    from tests import test_dispatch_verifier_report as tvr
+
+    job, _ = at_state(store, repo, "verifying")
+    r = tvr.vrun(job.id, 0)
+    raw, digest = tvr.envelope(r, tvr.body(("pass", "pass")))
+    at = SR.timestamp(SR.epoch_of(VERIFIED_AT[:19] + "Z"))
+    verify(store, repo, job, 0, raw=raw, ev=tvr.event(r, at=at, verifier_report_digest=digest))
+    [rec] = store.run_records(job.id)
+    assert rec.verified_at == utc_stamp(datetime.fromtimestamp(SR.epoch_of(at), timezone.utc))

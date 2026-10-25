@@ -27,18 +27,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from levain.cockpit.consent import utc_stamp
 from levain.dispatch import DispatchError
 from levain.dispatch.jobs import (_SESSION_TERMINAL, AlreadyRecorded, JobStore, RecordConflict, TransitionRefused,
                                   report_of)
 from levain.dispatch.verifier_report import VerifierRun
 from levain.slot import Refused
 from levain.slot import control_client as CC
-from levain.slot import records as SR
 
 log = logging.getLogger("levain.dispatch.follow")
 
@@ -145,14 +142,7 @@ class EventFollower:
             raise FollowStopped("ticket-unresolved", f"event {ev.seq}: no verifier run dispatch minted holds this "
                                                      "ticket")
         try:
-            at = SR.epoch_of(body["at"])
-        except (KeyError, TypeError, ValueError):
-            raise FollowStopped("event-at", f"event {ev.seq}: no CONTROL timestamp") from None
-        # CONTROL stamps events to the second (records.timestamp); a run record's verified_at is the job store's
-        # fixed-width stamp (consent.utc_stamp), so the event's instant is re-written in it, losslessly
-        dispatch_event = {**body, "at": utc_stamp(datetime.fromtimestamp(at, timezone.utc))}
-        try:
-            self.jobs.record_verification(call.run, envelope=call.envelope, event=dispatch_event, repo=call.repo,
+            self.jobs.record_verification(call.run, envelope=call.envelope, event=body, repo=call.repo,
                                           tree=call.tree, model=call.model)
         except AlreadyRecorded:
             pass                                       # an idempotent repeat: dispatch holds this outcome, so ACK
