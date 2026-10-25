@@ -289,15 +289,22 @@ def parse_choice(signed: bytes, *, write_in: bool = False) -> "tuple[str, str, s
     return message, m.group(1), m.group(2)
 
 
-def deep_link(page: str, request_id: str, token: str | None = None) -> str:
+def deep_link(page: str, request_id: str, token: str | None = None, *, choice: str | None = None) -> str:
     """The phone page link that opens straight onto sign request ``request_id``'s card: ``page`` (the printed
     ``https://<name>/``) with ``#sign=<id>``, and this run's ``phone_token`` first when given (a browser that has not
-    opened this run's link needs it; the fragment never reaches the server or its logs)."""
+    opened this run's link needs it; the fragment never reaches the server or its logs). ``choice``, an option key
+    (never the write-in's :data:`WRITE_IN_KEY`), is the option the operator already tapped elsewhere: the page offers
+    to sign that option with one tap. It is page state only, never what is signed: the bytes are built from the
+    request file (:func:`signed_bytes`), and a key the card does not offer draws nothing but a note."""
     from urllib.parse import quote
 
     if _ID.fullmatch(request_id or "") is None:
         raise ValueError(f"{str(request_id)[:80]!r} is not a sign request id")
+    if choice is not None and (not isinstance(choice, str) or _OPTION_KEY.fullmatch(choice) is None):
+        raise ValueError(f"{str(choice)[:20]!r} is not an option key ([a-z0-9]{{1,8}})")
     parts = ([f"phone_token={quote(token, safe='')}"] if token else []) + [f"sign={request_id}"]
+    if choice is not None:
+        parts.append(f"choice={choice}")
     return page.split("#", 1)[0] + "#" + "&".join(parts)
 
 
@@ -908,6 +915,44 @@ class Signer:
         if not self._ours(request) or (request.expires_at is not None and request.expires_at <= _now()):
             return None
         return _row(request_id, request, signers)
+
+    def state(self, request_id: str) -> dict[str, Any]:
+        """Where ``request_id`` stands, for a page that opened a link to it and does not find it listed:
+        ``{id, state}`` with state ``open``, ``signed`` (with ``choice`` when the record names a well-formed one),
+        ``denied``, ``expired`` or ``gone`` (no such file, or a request in a namespace this port does not sign: one
+        outside the flags is never said to exist). Display only: nothing here is read as a decision. The namespace of
+        a signed request is the one its record names when that record can be read, else its request file's."""
+        gone = {"id": request_id, "state": "gone"}
+        if not self.namespaces or not request_id_ok(request_id):
+            return gone
+        record: Any = None
+        signed = state_of(self.queue_dir, request_id) == "signed"
+        if signed:
+            try:
+                record = json.loads(_read_bytes(sign_dir(self.queue_dir) / f"{request_id}.signed.json"))
+            except (OSError, SignRefused, UnicodeDecodeError, ValueError, RecursionError):
+                record = None
+        if isinstance(record, dict) and isinstance(record.get("namespace"), str):
+            if record["namespace"] not in self.namespaces:
+                return gone
+        else:
+            try:
+                request = read_request(self.queue_dir, request_id)
+            except SignRefused:
+                return gone
+            if not self._ours(request):
+                return gone
+            if not signed:
+                if state_of(self.queue_dir, request_id) == "denied":
+                    return {"id": request_id, "state": "denied"}
+                if request.expires_at is not None and request.expires_at <= _now():
+                    return {"id": request_id, "state": "expired"}
+                return {"id": request_id, "state": "open"}
+        out = {"id": request_id, "state": "signed"}
+        choice = record.get("choice") if isinstance(record, dict) else None
+        if isinstance(choice, str) and (choice == WRITE_IN_KEY or _OPTION_KEY.fullmatch(choice) is not None):
+            out["choice"] = choice
+        return out
 
     def challenge(self, request_id: str, req: Any) -> dict[str, Any]:
         """``{signer_fp, request_sha256}`` (and for a choice request ``choice``, the option's key, or

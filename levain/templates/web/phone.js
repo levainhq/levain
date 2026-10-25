@@ -23,9 +23,15 @@
   const m = /(?:^#|&)phone_token=([^&]+)/.exec(location.hash);
   if (m) { token = decodeURIComponent(m[1]); store.set("sessionStorage", "levain-phone-token", token); }
   else token = store.get("sessionStorage", "levain-phone-token");
-  if (m || fm) history.replaceState(null, "", location.pathname);
+  // `choice=<key>` beside it is the option he already tapped on his phone (deep_link's choice): page state only. The
+  // linked card offers that option as one "Sign (<key>)" tap, built from the server's listing; the bytes signed are
+  // still the server's, and a key the card does not offer draws nothing but a note
+  const pm = fm ? /(?:^#|&)choice=([^&]*)(?:&|$)/.exec(location.hash) : null;
+  let pick = "";
+  if (pm) { try { pick = decodeURIComponent(pm[1]); } catch (e) { pick = pm[1]; } }
+  if (m || fm || pm) history.replaceState(null, "", location.pathname);
   // a link opened on a page already showing (a fragment-only navigation does not reload it): read it afresh
-  window.addEventListener("hashchange", () => { if (/(?:^#|&)(?:sign|phone_token)=/.test(location.hash)) location.reload(); });
+  window.addEventListener("hashchange", () => { if (/(?:^#|&)(?:sign|phone_token|choice)=/.test(location.hash)) location.reload(); });
 
   const usable = window.isSecureContext === true && typeof window.PublicKeyCredential === "function"
     && !!(navigator.credentials && navigator.credentials.get);
@@ -55,6 +61,8 @@
   let last = "";              // the last answer given here: an answered request leaves the list, its result stays
   let focusDone = false;      // the deep link's card was signed or denied here
   let focusMisses = 0;        // listings the linked card was not in: three, and the link is let go
+  let stateAsked = false;     // a picked link's card was not listed: where it stands was asked (GET /sign/<id>/state)
+  let linkNote = "";          // what that answer said, kept on the status line for this page
   const notes = new Map();    // request id -> [text, kind], kept across redraws
   const writeIns = new Map(); // sign request id -> {sha256, words}: the write-in being typed, kept across redraws
                               // for the version it was typed on only
@@ -88,7 +96,7 @@
     // a store fault is never "nothing waiting": the page says it cannot see the agents' questions or dispatch jobs
     $("status").textContent = (waiting ? waiting + " waiting on you" : qnote || dnote ? "can't tell what is waiting on you" : "nothing is waiting on you")
       + (qnote ? " \u00b7 agent questions unavailable: " + qnote : "") + (dnote ? " \u00b7 dispatch jobs unavailable: " + dnote : "")
-      + unread + (last ? " \u00b7 last: " + last : "");
+      + unread + (last ? " \u00b7 last: " + last : "") + linkNote;
     // a deep-linked sign request comes first and is scrolled to, once; one not listed is said, never silently lost
     const linked = focus ? signs.filter((r) => r.id === focus) : [];
     const rest = linked.length ? signs.filter((r) => r.id !== focus) : signs;
@@ -105,7 +113,29 @@
         $("status").textContent += " \u00b7 the linked sign request " + focus + " is not open here (signed, denied, expired or not filed)";
       focus = "";
     }
-    if (linked.length && !draw.scrolled) { draw.scrolled = true; list.firstChild.scrollIntoView({ block: "start" }); }
+    // a picked link (his own tap elsewhere) whose card is not listed: where it stands is said on this first listing,
+    // not after three. One still open but not listed (past the listing's cap, a passing fault) keeps the rule above
+    if (focus && pick && !linked.length && !busy && !focusDone && !stateAsked) {
+      stateAsked = true;
+      const id = focus;
+      call("GET", "/sign/" + encodeURIComponent(id) + "/state").then((s) => {
+        if (!s.ok || focus !== id || !s.body) return;
+        const st = s.body.state;
+        const said = st === "signed" ? "is already signed here" + (typeof s.body.choice === "string" ? " (" + s.body.choice + ")" : "")
+          : st === "denied" ? "was denied here"
+          : st === "expired" ? "expired: a fresh link comes with its next filing"
+          : st === "gone" ? "was replaced or withdrawn" : "";
+        if (!said) return;
+        linkNote = " \u00b7 the linked sign request " + id + " " + said;
+        $("status").textContent += linkNote;
+        focus = ""; pick = "";
+      });
+    }
+    // to the card's head: he reads the whole item before the button
+    if (linked.length && !draw.scrolled) {
+      draw.scrolled = true;
+      (list.firstChild.querySelector(".req-head") || list.firstChild).scrollIntoView({ block: "start" });
+    }
     const enrolled = Array.isArray(data.enrolled) ? data.enrolled : [];
     const local = mine();
     const ours = enrolled.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
@@ -474,6 +504,30 @@
         if (freeze) freeze.release();
         signWith(r, signers, say, show, actions, choice);
       };
+      // his pick from the link (linked card only): one button that signs that option, the exact line it appends under
+      // it (the listing's, then the challenge's own), drawn under the message so the item is read before the tap. The
+      // tap is the gesture: Face ID is never started on load. Every option below still signs on its own tap
+      const po = linked && pick && /^[a-z0-9]{1,8}$/.test(pick) ? options.find((o) => o.key === pick) : null;
+      if (po) {
+        const block = el("div", "picked");
+        const pb = el("button", "allow", "Sign (" + po.key + ") with Face ID");
+        pb.type = "button";
+        pb.disabled = !usable || !signers.length;
+        const pl = el("div", "line", po.line);
+        const echo = el("div", "note " + (kept ? kept[1] : ""), kept ? kept[0] : "");
+        const sayHere = (text, kind) => { say(text, kind); echo.textContent = text; echo.className = "note " + (kind || ""); };
+        const shown = { words: null, signing: (line) => { pl.textContent = line; }, unsure: () => {},
+                        release: () => { pl.textContent = po.line; } };
+        pb.addEventListener("click", () => {
+          if (busy) return;
+          if (freeze) freeze.release();
+          signWith(r, signers, sayHere, show, actions, po.key, shown);
+        });
+        block.append(pb, pl, el("div", "why", "you picked (" + po.key + ") on your phone; any other option below still signs instead"), echo);
+        card.appendChild(block);
+      } else if (linked && pick) {
+        card.appendChild(el("div", "where pick-miss", "the option in the link (" + pick.slice(0, 24) + ") is not on this card: pick one below"));
+      }
       if (!options.length) {
         const b = el("button", "allow", "sign with Face ID");
         b.type = "button";
@@ -581,7 +635,7 @@
     const base = "/sign/" + encodeURIComponent(r.id) + "/";
     const body = { signer_fp: fp, request_sha256: r.sha256 };
     if (choice !== undefined) body.choice = choice;
-    if (freeze) body.write_in = freeze.words;
+    if (freeze && freeze.words != null) body.write_in = freeze.words;   // a picked option's line holder carries no words
     say(choice !== undefined ? "asking for the challenge for (" + choice + ")…" : "asking for the challenge…");
     call("POST", base + "challenge", body).then((c) => {
       if (!c.ok) return say(why(c), "bad");

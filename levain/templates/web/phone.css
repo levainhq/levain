@@ -136,3 +136,12 @@ textarea.words { width: 100%; box-sizing: border-box; margin-top: var(--sp-4); f
 .req.grant .sheet { margin-top: var(--sp-4); padding-top: var(--sp-4); border-top: 1px dashed var(--hair-2); }
 .req.grant .sheet .line { user-select: text; }
 .req.grant .tier.off { color: var(--meta); border-style: dashed; }   /* expired or inert: said, not warned (warn is the demotion rule) */
+/* his pick from a link (#sign=<id>&choice=<key>): one Sign button for that option, the line it signs, and the words
+   that every other option still signs. Under the message, above the options; never pre-pressed */
+.req.sign .picked { margin-top: var(--sp-4); padding: var(--sp-4); border: 1px solid var(--hair-2); border-radius: var(--r-md);
+                    background: var(--card-2); }
+.req.sign .picked button { width: 100%; }
+.req.sign .picked .line { margin-top: var(--sp-3); font: 12px/1.4 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.req.sign .picked .why { margin-top: var(--sp-2); font-size: 13px; color: var(--label); }
+.req.sign .picked .note:empty { display: none; }
+.req.sign .pick-miss { margin-top: var(--sp-3); color: var(--warn); }

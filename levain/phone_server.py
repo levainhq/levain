@@ -16,7 +16,8 @@ it serves only these:
     never enrols itself: enrolment is signed by a laptop-presence key);
   - ``POST /sign/<id>/challenge``, ``.../answer`` and ``.../deny``: a statement a caller filed for the operator's
     passkey to sign, in a namespace the command was started with (``--sign-namespace``), listed in ``consent.json``
-    as ``sign_pending``, with ``sign_overflow`` the request files past the listing's cap (:mod:`levain.consent.sign`).
+    as ``sign_pending``, with ``sign_overflow`` the request files past the listing's cap (:mod:`levain.consent.sign`);
+    ``GET /sign/<id>/state`` says where one a link named stands (open, signed, denied, expired, gone), token-gated;
   - ``POST /dispatch/<job>/challenge``, ``.../answer``, ``.../cancel-challenge``, ``.../cancel``,
     ``.../authorise-challenge`` and ``.../authorise``: a filed dispatch job's contract signed, a live one
     cancelled, or a recommended one's run authorised and landed, with a passkey, verified by the job store against the same one
@@ -100,6 +101,7 @@ _NOTE_ROUTE = re.compile(r"/note/([0-9]{1,12})/dismiss")    # an agent's note, m
 _KEY_LINE = "/passkey/key-line"
 _SIGN_PREFIX = "/sign/"
 _SIGN_ACTIONS = ("challenge", "answer", "deny")
+_SIGN_STATE = re.compile(r"/sign/([A-Za-z0-9_-]{8,64})/state")    # GET: where a linked request stands (display only)
 _DISPATCH_ROUTE = re.compile(
     r"/dispatch/(dj-[0-9a-f]{32})/(challenge|answer|cancel-challenge|cancel|authorise-challenge|authorise)")
 _COORD_ROUTE = re.compile(r"/coord/(drop|envelope-review|envelope-challenge)")
@@ -248,7 +250,8 @@ class _PhoneHandler(GuardedHandler):
             self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503, head=head)
             return
         try:
-            if route != "/consent.json":
+            state = _SIGN_STATE.fullmatch(route)
+            if route != "/consent.json" and state is None:
                 if not self._app_route("GET", route, b"", head=head):
                     self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
                 return
@@ -261,7 +264,7 @@ class _PhoneHandler(GuardedHandler):
                 self._json({"error": "forbidden", "message": f"this page's token is needed, sent as {PHONE_TOKEN_HEADER}"},
                            403, head=head)
                 return
-            self._json(self.server.listing(), head=head)
+            self._json(self.server.listing() if state is None else self.server.signer.state(state.group(1)), head=head)
         except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is an answer, never a dead connection
             self._json({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}, 500, head=head)
         finally:
