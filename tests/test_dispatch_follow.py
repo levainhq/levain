@@ -290,3 +290,19 @@ def test_a_misshapen_verifier_event_stops_before_resolve_and_writes_nothing(stor
     assert exc.value.name == "event-shape" and d.resolved == []
     assert store.run_records(d.job.id) == [] and store.get(d.job.id).state == "verifying"
     f.close()
+
+
+def test_close_ends_a_step_blocked_on_its_stream_and_a_closed_follower_opens_none(store, repo, served):  # noqa: F811
+    import threading
+    import time
+
+    d = Dispatch(store, repo, served)
+    f = F.EventFollower.at(store, served.path, d.resolve, read_deadline=10.0)
+    # the store is this thread's, so the step runs here and close() comes from another thread once it reads live
+    t = threading.Timer(0.5, f.close)
+    t.start()
+    began = time.monotonic()
+    assert f.step() == CC.CANCELLED
+    assert time.monotonic() - began < 5.0
+    t.join()
+    assert f.step() == CC.CANCELLED                                    # closed: no stream is opened after close

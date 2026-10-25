@@ -26,6 +26,7 @@ only (``levain.slot.control.PEER_VERBS``), so the follower runs as the ``_levain
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -78,6 +79,10 @@ class EventFollower:
         self.resolve = resolve
         self._fault = fault
         self._ack_client: CC.ControlClient | None = None
+        # the stream a step is reading, so close() from another thread ends it; once closed, no stream opens
+        self._lock = threading.Lock()
+        self._active: CC.EventStream | None = None
+        self._closed = False
 
     @classmethod
     def at(cls, jobs: JobStore, socket_path: Path | str, resolve: Resolve, *, read_deadline: float | None = None,
@@ -87,7 +92,14 @@ class EventFollower:
                    lambda: CC.ControlClient(socket_path), resolve, **kw)
 
     def close(self) -> None:
-        client, self._ack_client = self._ack_client, None
+        """End the stream a step is reading (that step returns ``CANCELLED``) and the ACK connection; a step after
+        close opens no stream. Idempotent."""
+        with self._lock:
+            self._closed = True
+            stream, self._active = self._active, None
+            client, self._ack_client = self._ack_client, None
+        if stream is not None:
+            stream.close()
         if client is not None:
             client.close()
 
@@ -97,29 +109,43 @@ class EventFollower:
         :class:`FollowStopped` at an event it could not finish."""
         cur = self.jobs.event_cursor()
         jid, after = cur if cur is not None else (None, 0)
-        with self._stream(after, jid) as stream:
-            for frame in stream:
-                if isinstance(frame, CC.Hello):
-                    if frame.same_journal is False:
-                        log.warning("CONTROL's event journal is %s, the cursor's %s: replaying from 0",
-                                    frame.journal_id, jid)
-                        self.jobs.drop_event_cursor()
-                        return "journal-changed"
-                    jid = frame.journal_id
-                elif isinstance(frame, CC.Gap):
-                    log.warning("events before seq %d were pruned unread; they are lost", frame.oldest_seq)
-                elif isinstance(frame, CC.Reset):
-                    log.warning("the cursor %d is past the journal's newest seq %d: replaying from 0", after,
-                                frame.newest_seq)
+        stream = self._stream(after, jid)
+        with self._lock:
+            if self._closed:
+                stream.close()
+                return CC.CANCELLED
+            self._active = stream
+        try:
+            return self._read(stream, jid, after)
+        finally:
+            with self._lock:
+                if self._active is stream:
+                    self._active = None
+            stream.close()
+
+    def _read(self, stream: CC.EventStream, jid: str | None, after: int) -> str:
+        for frame in stream:
+            if isinstance(frame, CC.Hello):
+                if frame.same_journal is False:
+                    log.warning("CONTROL's event journal is %s, the cursor's %s: replaying from 0",
+                                frame.journal_id, jid)
                     self.jobs.drop_event_cursor()
-                    return "reset"
-                elif isinstance(frame, CC.StreamError):
-                    log.warning("CONTROL ended the event stream: %s", frame.error)
-                elif isinstance(frame, CC.Event):
-                    assert jid is not None
-                    self._handle(frame)
-                    self.jobs.set_event_cursor(jid, frame.seq)
-            return stream.outcome or CC.CLOSED
+                    return "journal-changed"
+                jid = frame.journal_id
+            elif isinstance(frame, CC.Gap):
+                log.warning("events before seq %d were pruned unread; they are lost", frame.oldest_seq)
+            elif isinstance(frame, CC.Reset):
+                log.warning("the cursor %d is past the journal's newest seq %d: replaying from 0", after,
+                            frame.newest_seq)
+                self.jobs.drop_event_cursor()
+                return "reset"
+            elif isinstance(frame, CC.StreamError):
+                log.warning("CONTROL ended the event stream: %s", frame.error)
+            elif isinstance(frame, CC.Event):
+                assert jid is not None
+                self._handle(frame)
+                self.jobs.set_event_cursor(jid, frame.seq)
+        return stream.outcome or CC.CLOSED
 
     # -- one event ------------------------------------------------------------------------------------------------
 
