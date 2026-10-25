@@ -231,12 +231,19 @@ def check_resolved(facts: Mapping[str, object], resolved: object) -> Dict[str, o
         if type(resolved[k]) is not str or not _DIGEST.fullmatch(resolved[k]):
             raise _field("verifier", k)
     if type(resolved["driver_template"]) is not str or not _TEMPLATE.fullmatch(resolved["driver_template"]) \
+            or resolved["driver_template"].startswith("_") \
             or resolved["declared_kind"] not in ("black-box", "in-process"):
         raise _field("verifier", "driver_template or declared_kind")
-    if (resolved["verifier_generation"] != facts["verifier_generation"]
-            or resolved["verifier_id"] != facts["verifier_id"]
+    if type(resolved["verifier_generation"]) is not int:     # `True == 1`: a bool never stands in for a generation
+        raise _field("verifier", "verifier_generation")
+    try:
+        mine = (facts["verifier_generation"], facts["verifier_id"], facts["driver_input_digest"])
+    except (KeyError, TypeError):
+        raise _field("verifier", "the ticket's verifier fields") from None
+    if (resolved["verifier_generation"] != mine[0]
+            or resolved["verifier_id"] != mine[1]
             or resolved["steps_digest"] != steps_digest
-            or resolved["driver_input_digest"] != facts["driver_input_digest"]):
+            or resolved["driver_input_digest"] != mine[2]):
         raise _field("verifier", "the resolved entry is not the ticket's")
     return dict(resolved)
 

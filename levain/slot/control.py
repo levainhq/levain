@@ -62,7 +62,7 @@ import fcntl
 
 from levain.broker.stub import peer_uid as kernel_peer_uid
 from levain.contracts import ContractError, canon
-from levain.slot import Refused
+from levain.slot import FRAME_MAX, Refused
 from levain.slot import records as R
 from levain.slot import lineage as LN
 from levain.slot import routemaps
@@ -72,7 +72,6 @@ from levain.slot.layout import STORE, session_repo
 from levain.slot.runtime_grammar import HANDLE_BYTES, _handle, _keys
 
 CONTROL_FORMAT = "levain-control/1"
-FRAME_MAX = 64 * 1024                      # §3.3: the frame cap
 _LEN = struct.Struct(">I")
 
 ROOT_UID = 0

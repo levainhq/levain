@@ -45,7 +45,7 @@ from levain.broker.policy import (BodyPolicyError, DispatchRoute, PolicyError, R
 from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
 from levain.dispatch.routemap_rules import ENTRIES_MAX, envelope_problem
-from levain.slot import Refused
+from levain.slot import FRAME_MAX, Refused
 from levain.slot.records import write_durably
 from levain.slot.runtime_grammar import _verifier_steps
 
@@ -559,9 +559,20 @@ VERIFIER_ENTRY_KEYS = frozenset({"verifier_id", "verifier_artifact_digest", "dec
 RESOLVED_ENTRY_KEYS = ("verifier_id", "verifier_artifact_digest", "declared_kind", "driver_template",
                        "driver_template_digest", "steps_digest", "driver_input_digest")
 DECLARED_KINDS = ("black-box", "in-process")
-#: CONTRACT §3.5 SIZES (`verifier_steps` at most 32 KiB canonical) and V25 (the driver input cap), as dispatch bounds them
+#: CONTRACT §3.5 SIZES (`verifier_steps` at most 32 KiB canonical), as dispatch bounds them
 VERIFIER_STEPS_MAX = 32 * 1024
-DRIVER_INPUT_MAX = 256 * 1024
+#: CONFIG-SUBMIT carries the item and its signature in ONE CONTROL frame (`FRAME_MAX`), never chunked, so a verifier
+#: item is bounded by what that frame leaves. The signature's share is its canonical JSON string (quotes and escapes
+#: counted), at most `VERIFIER_SIG_MAX` bytes: above an SSHSIG of the largest key ssh-keygen makes (RSA 16384)
+#: [judged by lane-3c8-fix, 10-25, against `ssh-keygen -Y sign` by ed25519, ecdsa-521, rsa-4096/8192/16384 keys];
+#: the request's own keys are counted at their widest (`id` at JSON_INT_MAX).
+VERIFIER_SIG_MAX = 8 * 1024
+CONFIG_SUBMIT_ENVELOPE = len(canon.canonical_bytes(
+    {"id": JSON_INT_MAX, "item": {}, "op": "CONFIG-SUBMIT", "sig": "", "v": 1})) - len(b"{}") - len(b'""')
+VERIFIER_ITEM_MAX_BYTES = FRAME_MAX - CONFIG_SUBMIT_ENVELOPE - VERIFIER_SIG_MAX
+#: an entry's `driver_input` (canonical) is bounded by the item that carries it: no larger one fits a CONFIG-SUBMIT.
+#: Below V25's driver input cap, which bounds what a run reads.
+DRIVER_INPUT_MAX = VERIFIER_ITEM_MAX_BYTES
 _VERIFIER_ID = re.compile(r"[a-z0-9-]{1,48}\Z")
 _DRIVER_TEMPLATE = re.compile(r"[a-z0-9_]{1,48}\Z")
 
@@ -630,7 +641,19 @@ def _verifier_entry_problem(e: object) -> Optional[Tuple[str, str]]:
 def check_verifier_item(raw: bytes, sig: object, trust: Trust, *, verify: Optional[Verify] = None) -> CheckedVerifiers:
     """A `verifier` item (CONFIG-SUBMIT), judged by the identity rule's shared envelope (:func:`_check_envelope`, the
     refusals named `config-*`) and then its body: exactly `{format, verifiers}`, `format` `levain-verifier-config/1`,
-    at most `routemap_rules.ENTRIES_MAX` entries, each one checked whole, no id twice (`config-invalid:<field>`)."""
+    at most `routemap_rules.ENTRIES_MAX` entries, each one checked whole, no id twice (`config-invalid:<field>`).
+    First, the bounds one CONFIG-SUBMIT frame holds: the item at most `VERIFIER_ITEM_MAX_BYTES`
+    (`config-invalid:item`), the signature ASCII (`config-invalid:item`) and at most `VERIFIER_SIG_MAX` bytes as the
+    frame carries it (`config-signature`)."""
+    if isinstance(raw, bytes) and len(raw) > VERIFIER_ITEM_MAX_BYTES:
+        raise Refused("config-invalid:item", f"a verifier item is at most {VERIFIER_ITEM_MAX_BYTES} bytes")
+    if isinstance(sig, str):
+        try:
+            sig.encode("ascii")
+        except UnicodeEncodeError:
+            raise Refused("config-invalid:item", "the signature is not ASCII") from None
+        if len(canon.canonical_bytes(sig)) > VERIFIER_SIG_MAX:
+            raise Refused("config-signature", f"a verifier item's signature is at most {VERIFIER_SIG_MAX} bytes")
     obj = _check_envelope(raw, sig, trust, VERIFIER_KIND, "config", verify)
     body = obj["body"]
     if not isinstance(body, dict) or set(body) != {"format", "verifiers"} or body["format"] != VERIFIER_FORMAT:
@@ -785,10 +808,13 @@ class ControlVerifiers:
             self.fault("before_head")
             self._write(self.dir / HEAD, canon.canonical_bytes(
                 {"generation": checked.generation, "item_sha256": checked.item_sha256, "store_id": checked.store_id}))
-            self.fault("after_head")
-            self._write(self.dir / CURRENT, str(checked.generation).encode("ascii"))
-            self._active = checked
+            self._active = checked              # the head is the authority: active from its write on
             self.problem = None
+            self.fault("after_head")
+            try:
+                self._write(self.dir / CURRENT, str(checked.generation).encode("ascii"))
+            except OSError:
+                pass                            # best effort: the start pass rewrites `current` from the head
             kept = keep()
             self._delete(lambda g: g < checked.generation and g not in kept)
             return checked.generation

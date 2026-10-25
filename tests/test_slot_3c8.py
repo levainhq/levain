@@ -561,3 +561,147 @@ def test_verifier_render_refuses_a_template_off_its_digest(dispatch):
     assert w.calls[calls:] == [] and w.state(s).state == R.ALLOCATED
     assert RD.read_driver_template("no_such_template") is None and RD.read_driver_template("__init__") is None
     assert RD.read_driver_template("output_compare") is not None
+
+
+# ---- 3c-8 r1 fixes 2-6 -----------------------------------------------------------------------------------------
+
+def _sized_item(gen: int, size: int) -> dict:
+    """A verifier item whose canonical bytes are exactly `size`: one entry, its driver_input padded by an
+    output_compare `stdout_equals` expectation (an input dispatch's own reader takes)."""
+    def make(n: int) -> dict:
+        return vitem(gen, [ventry(driver_input={"steps": [{"exit": 0, "stdout_equals": "x" * n}]})])
+
+    it = make(size - len(canon.canonical_bytes(make(0))))
+    assert len(canon.canonical_bytes(it)) == size
+    return it
+
+
+def test_config_submit_refuses_an_item_no_frame_carries(vrig):
+    """codex MED r1: CONTROL's own validation took a verifier item of up to 1 MiB (256 KiB of driver_input), which no
+    65,536-byte CONTROL frame can carry; here codex's 70,000-byte item, judged without the frame, refuses by name."""
+    assert refused(vrig.submit_v(_sized_item(1, 70_000))) == "config-invalid:item"
+    assert vrig.cv.active() is None
+
+
+def test_the_largest_verifier_item_fits_one_frame_with_the_largest_signature():
+    """The bound is derived from the frame cap: the largest item with a signature at `VERIFIER_SIG_MAX` as the frame
+    carries it, at the widest request id, is exactly one frame; a byte more in either is over it."""
+    from levain.contracts.grammar import JSON_INT_MAX
+
+    item = _sized_item(1, RM.VERIFIER_ITEM_MAX_BYTES)
+    sig = "A" * (RM.VERIFIER_SIG_MAX - 2)                  # its canonical JSON string is the quotes plus these
+    frame = C.encode_frame({"v": 1, "op": "CONFIG-SUBMIT", "id": JSON_INT_MAX, "item": item, "sig": sig})
+    assert len(frame) - 4 == C.FRAME_MAX
+    with pytest.raises(C.FrameTooLarge):
+        C.encode_frame({"v": 1, "op": "CONFIG-SUBMIT", "id": JSON_INT_MAX, "item": item, "sig": sig + "A"})
+    from levain.dispatch import registry
+
+    from levain.slot import stage
+
+    assert registry.MAX_DRIVER_INPUT_BYTES == RM.DRIVER_INPUT_MAX <= RM.VERIFIER_ITEM_MAX_BYTES
+    assert RM.DRIVER_INPUT_MAX < stage.DRIVER_INPUT_CAP                  # V25 bounds what a run reads; this is below it
+
+
+def test_config_submit_boundary_through_the_real_framed_client(vrig):
+    """codex MED r1, through the real `ControlClient` to a real `ControlServer`: the largest verifier item CONTROL
+    accepts is activated; one byte over is refused `config-invalid:item` by CONTROL's validation, never
+    `frame-too-large` (a real ed25519 signature leaves the frame room for it)."""
+    from levain.slot.control_client import ControlClient
+
+    vrig.control.stop()
+    vrig.control = None
+    d = Path(tempfile.mkdtemp(prefix="lv3c8f", dir="/tmp"))
+    cv = RM.ControlVerifiers(vrig.st.routes)
+    control = C.Control(C.StateStore(vrig.sdir), OP_UID, dispatch_uid=DISPATCH_UID, keys_uid=KEYS_UID,
+                        routes=RM.ControlRoutes(vrig.st.routes), tickets=vrig.tickets, clock=vrig.clock, verifiers=cv)
+    server = C.ControlServer(control, d / "c.sock", peer_uid=lambda s: DISPATCH_UID)
+    try:
+        server.start()
+        with ControlClient(d / "c.sock") as client:
+            it, sig = vrig.st.signed(_sized_item(1, RM.VERIFIER_ITEM_MAX_BYTES))
+            assert client.call("CONFIG-SUBMIT", item=it, sig=sig) == {"generation": 1}
+            it, sig = vrig.st.signed(_sized_item(2, RM.VERIFIER_ITEM_MAX_BYTES + 1))
+            with pytest.raises(Refused) as e:
+                client.call("CONFIG-SUBMIT", item=it, sig=sig)
+            assert e.value.name == "config-invalid:item"
+        assert cv.active().generation == 1
+    finally:
+        server.stop()
+        control.stop()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dispatch_refuses_a_verifier_item_control_cannot_be_handed():
+    """codex MED r1, dispatch's half: its accept judges the verifier item by S1's frame bounds, so it never stores a
+    verifier configuration no CONFIG-SUBMIT can carry."""
+    from levain.dispatch import registry
+
+    raw = canon.canonical_bytes(_sized_item(1, RM.VERIFIER_ITEM_MAX_BYTES))
+    sig = "A" * (RM.VERIFIER_SIG_MAX - 2)
+    assert registry.verifier_item_refusal(raw, sig) is None
+    assert "CONFIG-SUBMIT" in registry.verifier_item_refusal(canon.canonical_bytes(
+        _sized_item(1, RM.VERIFIER_ITEM_MAX_BYTES + 1)), sig)
+    assert registry.verifier_item_refusal(raw, sig + "A") is not None
+    assert registry.verifier_item_refusal(raw, "é") is not None
+
+
+def test_a_failing_current_write_leaves_mints_on_the_new_head(vrig):
+    """complement LOW 2 r1: the head is the authority. A `current` write that fails after the head is durable still
+    publishes the new generation (mints resolve against it), and the start pass repairs `current`."""
+    assert vrig.submit_v(vitem(1))["ok"]
+    real = vrig.cv._write
+
+    def write(path, data):
+        if path.name == RM.CURRENT:
+            raise OSError(28, "No space left on device")
+        real(path, data)
+
+    vrig.cv._write = write
+    ans = vrig.submit_v(vitem(2, [ventry(artifact="8")]))
+    vrig.cv._write = real
+    assert ans == {"id": 1, "ok": True, "generation": 2}
+    assert vrig.cv.active().generation == 2
+    assert (vrig.cv.dir / RM.CURRENT).read_bytes() == b"1"
+    assert refused(vrig.vmint(verifier_generation=1)) == "ticket-field:verifier_generation"
+    assert vrig.vmint("v-2", verifier_generation=2)["ok"]
+    vrig.restart()
+    assert (vrig.cv.dir / RM.CURRENT).read_bytes() == b"2"
+
+
+def test_config_submit_refuses_a_non_ascii_signature_by_name(vrig):
+    """deepseek LOW 2 r1: a signature string that is not ASCII is `config-invalid:item`, never an uncaught
+    UnicodeEncodeError (here one that a stand-in verifier would accept, so only the encode could catch it)."""
+    vrig.cv._verify = lambda *a, **k: True
+    ans = vrig.ask("CONFIG-SUBMIT", item=vitem(1), sig="é" * 8)
+    assert refused(ans) == "config-invalid:item", ans
+    assert vrig.cv.active() is None
+
+
+def _resolved_for(facts: dict) -> dict:
+    return {"verifier_generation": 1, "verifier_id": "pytest-report", "verifier_artifact_digest": "sha256:" + "5" * 64,
+            "declared_kind": "black-box", "driver_template": "output_compare",
+            "driver_template_digest": "sha256:" + "6" * 64, "steps_digest": RM.sha256_canonical(facts["verifier_steps"]),
+            "driver_input_digest": facts["driver_input_digest"]}
+
+
+@pytest.mark.parametrize("change", [
+    {"verifier_generation": True},                 # complement LOW 3: `True == 1`
+    {"driver_template": "_private"},               # complement LOW 3: CONFIG-SUBMIT and read_driver_template refuse it
+])
+def test_check_resolved_refuses_what_config_submit_refuses(change):
+    facts = T.check_facts({k: v for k, v in _vargs().items() if k != "attempt_id"})
+    assert T.check_resolved(facts, _resolved_for(facts))
+    with pytest.raises(Refused) as e:
+        T.check_resolved(facts, dict(_resolved_for(facts), **change))
+    assert e.value.name == "ticket-field:verifier"
+
+
+@pytest.mark.parametrize("missing", ["verifier_generation", "verifier_id", "driver_input_digest"])
+def test_check_resolved_names_missing_ticket_fields(missing):
+    """deepseek LOW 3 r1: a verifier ticket's facts short of a field the compare reads refuse
+    `ticket-field:verifier`, never KeyError."""
+    facts = T.check_facts({k: v for k, v in _vargs().items() if k != "attempt_id"})
+    resolved = _resolved_for(facts)
+    with pytest.raises(Refused) as e:
+        T.check_resolved({k: v for k, v in facts.items() if k != missing}, resolved)
+    assert e.value.name == "ticket-field:verifier"

@@ -144,7 +144,12 @@ def test_the_report_constants_mirror_dispatch():
     from levain.slot import runtime_grammar as rg
 
     assert oc.REPORT_FORMAT == vr.REPORT_FORMAT and oc.MAX_STEPS == vr.MAX_STEPS == rg.MAX_STEPS
-    assert oc.MAX_CAPTURE_BYTES == vr.MAX_REPORT_BYTES and oc.MAX_INPUT_BYTES == registry.MAX_DRIVER_INPUT_BYTES
+    from levain.slot import stage
+
+    # the driver reads input.json up to V25; S1 3c-8 r1: dispatch accepts a driver_input only up to what one
+    # CONFIG-SUBMIT frame carries, which is below it
+    assert oc.MAX_CAPTURE_BYTES == vr.MAX_REPORT_BYTES and oc.MAX_INPUT_BYTES == stage.DRIVER_INPUT_CAP
+    assert registry.MAX_DRIVER_INPUT_BYTES <= oc.MAX_INPUT_BYTES
     assert oc.EXIT_KEYS == vr.EXIT_KEYS
 
 
