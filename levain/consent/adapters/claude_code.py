@@ -213,16 +213,54 @@ def _absolute_root(root: Any) -> str | None:
         return None
 
 
-def protected_paths(queue_dir: Path, settings: AdapterSettings) -> tuple[Path, ...]:
+def protected_paths(queue_dir: Path, settings: AdapterSettings, *, home: Path | None = None,
+                    cwd: str | None = None) -> tuple[Path, ...]:
     """What the adapter itself trusts, so a file tool writing any of it is agent config (codex Q2 r1 #1): the
-    queue directory (the adapter settings and the queue database live in it) and, when a cockpit data root is
-    configured, its authority database (and sqlite's sidecars) and the authority anchor."""
-    out = [Path(os.path.abspath(queue_dir))]
+    queue directory (the adapter settings and the queue database live in it); the whole levain home, the
+    directory the confinement floor denies (:func:`levain.firing.confinement.levain_home_spellings`, one
+    derivation for both), so a write to the autonomic binding store or any other operator state there is a tagged
+    request (14b Q5); and, when a cockpit data root is configured, its authority database (and sqlite's sidecars)
+    and the authority anchor. ``home`` is the one :func:`targets_agent_config` expands ``~`` under (default the
+    user's); ``cwd``, when absolute, stands in for the workspace. A levain home the floor's own predicate finds too
+    wide to deny whole (:func:`levain.firing.confinement.too_wide_to_deny`: a filesystem root, a path of two parts
+    or fewer, a shared temp directory, or one holding the home or the cwd) is named by its state directories instead
+    (:data:`levain.firing.confinement.LEVAIN_HOME_STATE_DIRS`, the floor's fallback list), or every file under it
+    would be agent config. Never raises on the levain home: one that cannot be resolved is ``<home>/.levain``
+    (fail closed for the store, never an outage of every tool). Bash is still never parsed: a shell write there
+    is not tagged here."""
+    out = [Path(os.path.abspath(queue_dir)), *levain_home_protected(home, cwd)]
     if settings.cockpit_data_root:
         root = Path(settings.cockpit_data_root)
         db = root / "cockpit.db"
         out += [db, *(Path(f"{db}{s}") for s in ("-wal", "-shm", "-journal")), anchor_path(root).parent]
     return tuple(out)
+
+
+def levain_home_protected(home: Path | None, cwd: str | None) -> list[Path]:
+    """:func:`protected_paths`' share of the levain home; never raises. Also what :func:`queue_unresolved` (and
+    Codex's) classify with when no queue directory could be resolved."""
+    from levain.firing.confinement import LEVAIN_HOME_STATE_DIRS, levain_home_spellings, too_wide_to_deny  # lazy
+
+    try:
+        user_home = Path(home) if home is not None else Path.home()
+        base, spellings = levain_home_spellings(user_home)
+        try:
+            within = (Path(cwd),) if isinstance(cwd, str) and os.path.isabs(cwd) else ()
+            if any(too_wide_to_deny(d, user_home, *within) for d in spellings):
+                return [base / name for name in LEVAIN_HOME_STATE_DIRS]
+        except Exception:  # noqa: BLE001 - the base resolved: protect it whole, conservative
+            pass
+        return [base]
+    except Exception:  # noqa: BLE001 - any failure resolving the base: the default home, never a raise
+        pass
+    try:
+        user_home = Path(home) if home is not None else Path.home()
+    except Exception:  # noqa: BLE001 - no $HOME: the password database's
+        try:
+            user_home = operator_home()
+        except Exception:  # noqa: BLE001 - no home at all: nothing there to protect
+            return []
+    return [Path(os.path.abspath(user_home / ".levain"))]
 
 
 # --- ruling 3b item 1: agent config and hooks ----------------------------------------------------------------
@@ -790,11 +828,11 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     the event's ``permission_mode`` as ``posture`` (``None`` when absent: no grant matches) and the tool input the
     request was filed for, and never for a request filed at :data:`AGENT_CONFIG_TIER`: a direct caller cannot
     bypass ruling 3b item 1. What
-    the adapter trusts (:func:`protected_paths`) is taken from ``queue.directory`` and ``settings`` here, never
-    from the caller, so no call can leave it out; a queue without a directory raises before anything is filed."""
+    the adapter trusts (:func:`protected_paths`) is taken from ``queue.directory``, ``settings``, ``home`` and the
+    event's cwd here, never as a list from the caller, so no call can leave it out; a queue without a directory
+    raises before anything is filed."""
     if getattr(queue, "directory", None) is None:
         raise TypeError("the queue has no directory: the adapter's own files cannot be protected")
-    protected = protected_paths(Path(queue.directory), settings)
     deadline = clock() + max(0.0, float(max_hold)) - CLEANUP_RESERVE
     if not isinstance(event, Mapping) or event.get("hook_event_name") != EVENT:
         return None
@@ -813,6 +851,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     posture = mode if isinstance(mode, str) and mode else None
     if policy is None and nothing_can_decide(settings):
         return None
+    protected = protected_paths(Path(queue.directory), settings, home=home, cwd=cwd)
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected)
     if agent_config and unconfined(cwd, home=home):
         return None  # an unconfined session (Q10 D2): its dialog answers, as the gate left the call to its mode (L1-7)
@@ -1376,7 +1415,8 @@ def _limits(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSett
                        notify=lambda text: notify(settings, text, cwd=queue.directory), resume=resume_meta_of(event))
     if got.go:
         if got.extended and gate_class(tool_name, tool_input, cwd, home=home,
-                                       protected=protected_paths(Path(queue.directory), settings)) is not None:
+                                       protected=protected_paths(Path(queue.directory), settings, home=home,
+                                                                 cwd=cwd)) is not None:
             return _pre("deny", limits.retry_text(got.extended))
         return None
     stop = {"continue": False, "stopReason": "levain: stopped by a budget the operator set; it goes on when he "
@@ -1455,7 +1495,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         return gate_output(decision)
 
     tier = gate_class(tool_name, tool_input, cwd, home=home,
-                      protected=protected_paths(Path(queue.directory), settings))
+                      protected=protected_paths(Path(queue.directory), settings, home=home, cwd=cwd))
     if tier is None:
         return None
     what = _what(tool_name, tool_input)
@@ -1544,7 +1584,7 @@ def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[
         tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input") or {}, event.get("cwd")
         if not isinstance(tool_name, str) or not isinstance(cwd, str) or not cwd:
             return None
-        tier = gate_class(tool_name, tool_input, cwd, protected=protected_paths(queue_dir, settings))
+        tier = gate_class(tool_name, tool_input, cwd, protected=protected_paths(queue_dir, settings, cwd=cwd))
         what = _what(tool_name, tool_input)
     except Exception:
         tier, what = "irreversible", "this call"
@@ -1555,6 +1595,23 @@ def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[
         _ledger_note(queue_dir, event, session, str(event.get("tool_name")), event.get("tool_input") or {},
                      str(event.get("cwd") or ""), refused="failed")
     return could_not_run(tier, what)
+
+
+def queue_unresolved(event: Any) -> dict[str, Any] | None:
+    """:func:`main`'s answer for a PreToolUse when no queue directory could be resolved (:func:`default_queue_dir`
+    raised: a ``$LEVAIN_HOME`` that cannot be expanded, or no home): with no queue and no settings, only the
+    levain home is protected (:func:`levain_home_protected`, which never raises) and :func:`gate_class` classifies
+    the call: a file-tool call that targets it or other agent config is denied with the hard stop, and every other
+    call has no decision, so a read is not an outage. Bash is never parsed, so a Bash call gets no decision."""
+    try:
+        tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input") or {}, event.get("cwd")
+        if not isinstance(tool_name, str) or not isinstance(cwd, str) or not os.path.isabs(cwd):
+            return None
+        tier = gate_class(tool_name, tool_input, cwd, protected=tuple(levain_home_protected(None, cwd)))
+        what = _what(tool_name, tool_input)
+    except Exception:
+        tier, what = "irreversible", "this call"
+    return None if tier is None else could_not_run(tier, what)
 
 
 def could_not_run(tier: str | None, what: str) -> dict[str, Any]:
@@ -1745,7 +1802,8 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
     stdout = stdout if stdout is not None else sys.stdout
     event: Any = None
     queue_dir: Path | None = None
-    settings = AdapterSettings()
+    settings = AdapterSettings()   # set before the try: a raising load_settings leaves it, so gate_failed still
+    # classifies the call (a store write denied, an ordinary call no decision), never with None
     started = time.monotonic()
     if in_slot():
         return _slot_main(stdin, stdout)
@@ -1771,14 +1829,17 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
                 and time.monotonic() - started <= GATE_FILL_WITHIN:
             _ledger_fill(event, queue_dir)
     except BaseException as exc:  # noqa: BLE001 - every failure is no decision, never allow
-        if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT and queue_dir is not None:
-            try:
-                out = gate_failed(event, queue_dir, settings)
-                if out is not None:
-                    stdout.write(json.dumps(out) + "\n")
-                    stdout.flush()
-            except BaseException:
-                pass
+        try:
+            if event is None:
+                event = json.loads(stdin.read())   # not read yet: the failure came first
+            out = None
+            if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
+                out = gate_failed(event, queue_dir, settings) if queue_dir is not None else queue_unresolved(event)
+            if out is not None:
+                stdout.write(json.dumps(out) + "\n")
+                stdout.flush()
+        except BaseException:
+            pass
         try:
             print(f"levain consent hook: no decision ({type(exc).__name__}: {exc})"[:500], file=sys.stderr)
         except Exception:

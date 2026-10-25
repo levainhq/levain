@@ -2,11 +2,15 @@
 
 The governor that makes a sovereign entity *governed* rather than YOLO, stated as one invariant:
 
-    **Every EFFERENT action fans in to the human. AFFERENT runs ungated. NOTHING graduates.**
+    **Every EFFERENT action fans in to the human. AFFERENT runs ungated. Nothing graduates
+    without the operator's explicit ratification.**
 
-Perception is free; action on the world is not. That is the whole of K3. There are deliberately
-no stakes escalators, no per-domain curve, no capability recalibration and no graduation-to-
-unattended tier — that machinery is ``spore-417`` and it is **v2.x, off the release spine**. A
+Perception is free; action on the world is not. That is the whole of K3. This classifier has
+deliberately no stakes escalators, no per-domain curve, no capability recalibration and no
+graduation tier of its own: it never loosens itself. A standing grant's posture CAN be loosened
+(:mod:`levain.autonomic.graduation` proposes it from a clean track record), but only as a
+re-ratification the operator applies: a new sealed grant replacing the old one. The adaptive
+machinery is ``spore-417`` and it is **v2.x, off the release spine**. A
 gate that always says *"ask the human"* is not a research project, and gating HARDER than the
 ungoverned always-on runtimes is the wedge, not a gap.
 

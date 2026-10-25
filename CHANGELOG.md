@@ -6,6 +6,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+- **A Claude Code or Codex file edit inside the Levain home now asks for consent.** An edit to Levain's own state (for
+  example the autonomic binding store) is agent config, matching what the confinement floor already denies. With
+  `LEVAIN_HOME` set to a directory Levain cannot protect whole (`/tmp`, a top-level directory, or one that holds your
+  home or project), only Levain's own state directories there count; a `LEVAIN_HOME` that cannot be resolved keeps the
+  default Levain home protected instead of denying every call. Shell commands are still not parsed.
+
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
 - **Dispatch runs take their slot from a pool the isolation controller keeps in step with the machine's real slots.** A
   run ticket is refused (`no-free-slot`) when no free slot is left for it, one egress slot always stays yours, and `POOL`
