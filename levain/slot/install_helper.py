@@ -11,9 +11,9 @@ not), and what the interrupted run made is kept at the ids it holds (:attr:`Host
 Undo removes the runtime rule first and the install rule last, before the record, so a failed undo
 re-runs through the install helper.
 
-``purge``, ``set-credential`` and ``remove-credential`` are not plans: they act under the install lock (the
-credential verbs through a forked child that drops to keys before it opens anything below ``L/keys/``,
-:func:`run_credential`).
+``purge``, ``set-credential``, ``remove-credential`` and ``set-limits`` are not plans: they act under the install lock
+(the credential verbs through a forked child that drops to keys before it opens anything below ``L/keys/``,
+:func:`run_credential`; ``set-limits`` writes ``L/policy/limits`` in root, :func:`run_set_limits`).
 """
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS
 from levain.slot.runtime_grammar import VERBS as RUNTIME_VERBS
 from levain.slot.runtime_grammar import ok_line, refusal_line
 from levain.slot.layout import (STORE, Row, base_routes_steps, base_run_rows, base_store_rows, operator_record_path,
-                                parse_pool_config, policy_rows, pool_config_row, pool_config_steps,
+                                parse_pool_config, policy_limits_path, policy_rows, pool_config_row, pool_config_steps,
                                 pool_config_undo_steps, reserve_row, reserve_steps, roots_steps, row_steps,
                                 run_dir_undo_steps, single_filesystem_steps, slot_rows, tmpfiles_steps,
                                 tmpfiles_undo_steps, ungroup_steps, entry_state, remove_entry_steps)
@@ -223,7 +223,7 @@ def check_tools(facts: HostFacts, steps: Sequence[Step], *, verb: str, python: b
 
 
 #: The verbs :func:`main` applies; every other verb of the §5.2 grammar answers ``verb-unbuilt:<verb>``.
-BUILT_VERBS = ("setup", "undo", "replenish", "purge", "set-credential", "remove-credential", "repair")
+BUILT_VERBS = ("setup", "undo", "replenish", "purge", "set-credential", "remove-credential", "repair", "set-limits")
 
 
 def helper_pending() -> tuple[str, ...]:
@@ -921,6 +921,7 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         # Live.root, as every other act here (the store itself on a host).
         *slot_state_undo_steps(host, slots_of(uids), store=live.at(STORE[host])),
         *pool_config_undo_steps(host),
+        *policy_limits_undo_steps(host, live),
         Step(f"create {path.parent}", (mkdir, "-p", "-m", "755", str(path.parent))),
         Step("retire every account id so none is reissued", write=(path, retired_ids_text(retired_after), 0o644)),
         *remove(of("account/1"), "R7"),             # per account: its processes ended and proven, then the tombstone
@@ -2460,6 +2461,84 @@ def run_credential(verb: str, name: str, caller_uid: int, host: HostOS, *, read:
     raise RuntimeError(f"the credential child: status {status:#x}, {line[:80]!r}")
 
 
+# --- set-limits (slot limits DESIGN §3, 1025-6/limits; head rulings R0, R1 F5-F7) --------------------------------
+
+def read_limits(read: Callable[[int], bytes]) -> bytes:
+    """``set-limits``' stdin: one ``levain-limits/1`` document, at most the slot cap, checked WHOLE in root by the one
+    slot parser (:func:`levain.consent.limits.slot_doc`, the queue broker's) with non-canonical bytes accepted, and
+    returned as its canonical bytes, re-read through the broker's own check: root never writes the caller's bytes,
+    and never bytes the broker would refuse. A refusal is the parser's code (``limits-oversize``,
+    ``limits-malformed``, ``limits-key:<key>``, ``limits-not-counted:<kind>``, ``limits-value:<block>[.<kind>]``) with
+    its qualifier in the refusal wire's spelling (:func:`_limits_refusal`: ``active_hours`` -> ``active-hours``)."""
+    from levain.consent import limits as CL
+
+    raw = read(CL.SLOT_LIMITS_MAX + 1)
+    try:
+        data = canon.canonical_bytes(CL.slot_doc(raw, canonical=False))
+        CL.slot_doc(data)
+    except CL.LimitsDocError as e:
+        raise _limits_refusal(e.code, e.detail) from None
+    return data
+
+
+def _limits_refusal(code: str, detail: str) -> Refused:
+    """The parser's code as a refusal the wire carries: the refusal line keeps only a lowercase name and a qualifier of
+    letters and digits joined by ``-`` / ``.`` (any other name goes out as ``internal``), so each other run in the
+    qualifier becomes one ``-``. The exact code stays in the detail (stderr)."""
+    name, _, qual = code.partition(":")
+    if not qual:
+        return Refused(name, detail)
+    slug = re.sub(r"[^A-Za-z0-9.]+", "-", qual)
+    slug = re.sub(r"[-.]*([-.])[-.]*", r"\1", slug).strip("-.")[:40].strip("-.") or "key"
+    return Refused(f"{name}:{slug}", f"{code}: {detail}" if detail else code)
+
+
+def run_set_limits(caller_uid: int, host: HostOS, *, read: Callable[[int], bytes],
+                   lock: Callable[[], ContextManager[object]], store_seams: RH.Seams | None = None,
+                   err: TextIO | None = None, fsync: Callable[[int], None] | None = None) -> dict[str, object]:
+    """``set-limits``: the whole ``L/policy/limits`` replaced by stdin's document (one change, one password). Order
+    (as the credential verbs'): the operator check, stdin read and checked in root (:func:`read_limits`), both before
+    the install lock; UNDER the lock the operator check again (an undo between the two is seen), then the write:
+    ``limits.tmp`` (``O_EXCL | O_NOFOLLOW``, 0644, fsynced; macOS ``F_FULLFSYNC``), renamed over ``limits``, then
+    ``L/policy`` fsynced (:func:`levain.slot.records.write_durably`). The new entry is root's (the helper's euid): a
+    file of another owner or mode is replaced, never edited. A failure before the rename refuses
+    ``limits-write-failed`` with the old file in force; a failure of the directory fsync after it answers ok and warns
+    on ``err`` (in force now, it may not survive a crash). No pool hold and no live-lease count: the broker re-reads the
+    file on its next GATE. ``fsync``: a test's seam (default :func:`levain.slot.generation._full_fsync`)."""
+    import hashlib
+
+    rs = store_seams or RH.Seams(host=host)
+    _check_operator("set-limits", caller_uid, rs)
+    data = read_limits(read)
+    path = rs.L / policy_limits_path(host).relative_to(STORE[host])     # STORE on a host, a test's scratch L otherwise
+    with lock():
+        _check_operator("set-limits", caller_uid, rs)
+        try:
+            R.write_durably(path, data, mode=0o644, fsync=fsync or gen_mod._full_fsync)
+        except R.NotDurable as e:
+            (err or sys.stderr).write(f"levain install-helper: warning: {path} written but not durable ({e.strerror}): "
+                                      "it is in force now and may not survive a crash; run it again\n")
+        except OSError as e:
+            raise Refused("limits-write-failed", f"{path}: {e.strerror or e}; the earlier file stands") from None
+    return {"verb": "set-limits", "digest": "sha256:" + hashlib.sha256(data).hexdigest()}
+
+
+def policy_limits_state(host: HostOS, live: RM.Live) -> str:
+    """``L/policy/limits`` for undo: OURS by path and owner alone (a regular file of root's), WHATEVER its bytes, so an
+    unusable file goes too (R1 F7); a link or another owner's entry there is NOT_OURS and left."""
+    return RM.root_file(live, policy_limits_path(host))
+
+
+def policy_limits_undo_steps(host: HostOS, live: RM.Live) -> list[Step]:
+    """Undo's removal of ``L/policy/limits``: set under the operator record undo removes, so a later setup for
+    another operator does not inherit its limits. The live read first (ABSENT runs nothing)."""
+    path = policy_limits_path(host)
+    rm = "/bin/rm" if host == "darwin" else _abs("rm")
+    return [RM.remove_step(f"remove the slot limits {path}", ("policy-limits", str(path)), live,
+                           lambda: policy_limits_state(host, live),
+                           lambda: live.act((rm, "-f", RM.at(live, path))), tools=(rm,))]
+
+
 # --- repair's handover: the probe (R3a), the exec (R4), phase B (R4a on) (row 33 §2.2) ---------------------------
 
 #: R3a's bounds [r3: X2-M5]: the probe child's wall clock and the most it may print.
@@ -2944,6 +3023,8 @@ class Seams:
     purge: Callable[[str, int, HostOS], dict] = run_purge
     stdin: Callable[[int], bytes] = _read_stdin
     credential: Callable[..., dict] = run_credential
+    #: set-limits (R1 F5): its own branch in :func:`run`, never the install plan's generic path.
+    limits: Callable[..., dict] = run_set_limits
     #: repair --source's phase A: its steps (with ``apply``), the probe and the exec into phase B (:func:`repair_handover`).
     handover: Callable[..., None] = repair_handover
     #: [F7] The staged-tree launcher's fault, ``(step id, point)``: set by a test harness, never by :func:`main`'s
@@ -2965,8 +3046,8 @@ def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextI
     """The verb's ok fields, or :class:`Refused`. The order is §25's: the install lock is taken BEFORE the host's
     facts are gathered, and held through the plan, its first step (the journal), every act, the record and the
     journal's removal, so no second run plans against this one's half. Nothing before the lock reads the host, except
-    the credential verbs' operator record and ``set``'s stdin (:func:`run_credential` takes the lock after them and
-    checks the operator again under it).
+    the credential verbs' and ``set-limits``' operator record and their stdin (:func:`run_credential` and
+    :func:`run_set_limits` take the lock after them and check the operator again under it).
     Inside it, the gather's :class:`Quiesce` (the pool lock) is held through the last act too."""
     if seams.euid() != 0:
         raise Refused("not-root", "the install helper runs as root")
@@ -2987,6 +3068,10 @@ def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextI
         # run_credential takes the lock itself: the operator check and set's stdin come before it (H18, B7).
         return seams.credential(cmd.verb, cmd.credential, caller_uid, host, read=seams.stdin,
                                 lock=lambda: seams.lock(host), err=err)
+    if cmd.verb == "set-limits":
+        # As the credential verbs: no host plan, no pool hold, no live-lease count (a held slot session waits on this
+        # very raise); the operator check and the document's check come before the lock, which run_set_limits takes.
+        return seams.limits(caller_uid, host, read=seams.stdin, lock=lambda: seams.lock(host), err=err)
     with seams.lock(host) as lock_fd:
         gathered = seams.gather(cmd, host, caller_uid)
         try:
@@ -3042,7 +3127,7 @@ INSTALL_ENTRY_ENV = ("SUDO_UID",)
 __all__ = ["ContinueSeams", "PROBE_OUT_CAP", "PROBE_TIMEOUT_S", "adopt_lock", "exec_phase_b", "phase_b_text",
            "plan_repair_stage", "plan_repair_resume", "check_fault", "fault_hook", "FAULT_POINTS", "FAULT_STEPS", "probe_text", "repair_continue", "repair_handover", "HANDOVER_ABI", "repair_probe", "run_probe",
            "RepairFacts", "desired_managed", "install_shape_path", "plan_only_report", "plan_repair", "BUILT_VERBS", "CHILD_MARGIN_S", "CREDENTIAL_VERBS", "INSTALL_ENTRY_ENV", "KEYS_ACCOUNT", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
-           "apply_steps", "check_account_ids", "drop_to_keys", "load_creds", "read_credential", "run_credential", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
+           "apply_steps", "check_account_ids", "drop_to_keys", "load_creds", "read_credential", "run_credential", "read_limits", "run_set_limits", "policy_limits_state", "policy_limits_undo_steps", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",
            "plan_for", "plan_replenish", "plan_setup", "plan_tools", "plan_undo", "pool_lock", "preflight", "Quiesce",
            "quiesce_step",

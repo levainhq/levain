@@ -29,6 +29,7 @@ def test_every_verb_parses():
         "purge": ["purge", SESSION],
         "force-retire": ["force-retire", "egress", "63", "--max-inodes", "100", "--max-seconds", "30"],
         "set-credential": ["set-credential", "anthropic"], "remove-credential": ["remove-credential", "anthropic"],
+        "set-limits": ["set-limits"],
     }
     assert set(good) == set(VERBS)
     for verb, argv in good.items():

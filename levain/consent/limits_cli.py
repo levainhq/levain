@@ -10,10 +10,18 @@ the S1 sandbox an agent's Bash can rewrite it: a brake on a runaway, not a bound
 ``extend`` with no allow by the end of its hold marks its request undecided (a gap, no halt), so a late allow ruled on
 that gap is delivered and applied like any limit ruling. A resume runs under the question band's per-session lock.
 
+``--slots`` (slot limits, ``project_memory/1025-6/limits/DESIGN.md`` §3; head rulings R1 F7): the limits SLOT
+sessions run under, root's ``L/policy/limits``, which the operator's uid cannot write. ``set --slots <agent|default>
+<kind> <value>`` / ``unset --slots <agent|default> <kind>`` read the current document through the queue broker's own
+reader (:class:`levain.qbroker.limits.PolicyLimits`), make the one change, check the result with the slot parser
+(:func:`levain.consent.limits.slot_doc`) and pipe it to ``sudo <install helper> set-limits``, which asks the password
+and replaces the file whole. A file the broker would refuse is never merged: the command names ``--replace``, which
+writes a document holding only the change. ``show --slots`` prints the slot limits in force per agent.
+
 Known edges (one line each):
 
 - an extend's resume writes no lease or settle record (its allow is a timely answer, not a leased ruling).
-- ``set`` / ``unset`` take no lock: two at once can lose one of the two edits.
+- ``set`` / ``unset`` take no lock: two at once can lose one of the two edits (``--slots`` too: one password each).
 - two allows landing within the same moment (a late ruling on the halting request and this extend's allow) can each
   plan a resume: delivery does not hold this command's session lock.
 - a halt released and a NEW limit crossed between reading the halt and filing: the allow is verified against the
@@ -24,16 +32,20 @@ Stdlib only.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import logging
 import os
 import re
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from levain.consent import limits as L
 from levain.consent.adapters import claude_code, codex
@@ -116,6 +128,230 @@ def _parse_value(kind: str, text: str) -> int | float:
     if L._limit_value(kind, v) is None or v > (MAX_HOURS if hours else MAX_COUNT):
         raise ValueError(f"{kind} must be {want}; {text!r} is not")
     return v
+
+
+# --- the slot limits (--slots: root's L/policy/limits) -------------------------------------------------------------
+
+#: sudo by its absolute path: a ``sudo`` found first on the operator's PATH (where an agent session running as the
+#: operator can put one) would be handed the password.
+SUDO = "/usr/bin/sudo"
+
+
+@dataclass(frozen=True)
+class SlotSeams:
+    """Where the slot limits live and how root writes them. ``store``: the store root ``L``; ``owner``: the uid
+    ``L/policy`` and the file must belong to (root; a test passes its own); ``helper``: runs ``set-limits`` with a
+    document on stdin and returns (exit status, stdout, stderr); ``None`` is :func:`_sudo_set_limits`."""
+
+    host: str
+    store: Path
+    owner: int = 0
+    helper: Callable[[bytes], tuple[int, str, str]] | None = None
+
+
+def _host_slot_seams() -> SlotSeams:
+    from levain.slot import layout
+
+    host = "darwin" if sys.platform == "darwin" else "linux"
+    return SlotSeams(host=host, store=layout.STORE[host])
+
+
+def _sudo_set_limits(host: str, data: bytes) -> tuple[int, str, str]:
+    """``sudo <install helper> set-limits`` with ``data`` on stdin. sudo reads the password from the terminal, not
+    from the stdin this pipe holds."""
+    from levain.slot import layout
+
+    helper = str(layout.install_helper_path(host))    # type: ignore[arg-type]
+    if not os.path.isfile(helper):
+        return 127, "", f"the install helper {helper} is not installed: slots are not set up on this host\n"
+    p = subprocess.run([SUDO, helper, "set-limits"], input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       check=False)
+    return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+
+def _reader(seams: SlotSeams) -> Any:
+    from levain.qbroker.limits import PolicyLimits
+
+    return PolicyLimits(seams.store / "policy", owner=seams.owner)
+
+
+@contextlib.contextmanager
+def _quiet_broker() -> Iterator[None]:
+    """The reader logs an unusable file for the broker's log; the command says it instead."""
+    log = logging.getLogger("levain.qbroker")
+    was = log.disabled
+    log.disabled = True
+    try:
+        yield
+    finally:
+        log.disabled = was
+
+
+def _not_set_up(seams: SlotSeams) -> str | None:
+    policy = seams.store / "policy"
+    return None if policy.is_dir() else f"slots are not set up on this host ({policy} is absent)"
+
+
+def _parse_slot_value(kind: str, text: str) -> int:
+    """A slot limit as root stores it: an integer in :data:`levain.consent.limits.SLOT_RANGE`, typed as digits."""
+    if kind not in L.SLOT_KINDS:
+        raise ValueError(f"{kind} cannot be set with --slots: a slot counts no tokens (it counts "
+                         f"{', '.join(L.SLOT_KINDS)})")
+    lo, hi = L.SLOT_RANGE[kind]
+    hours = " of hours" if kind == "active_hours" else ""
+    want = f"a whole number{hours} from {lo:,} to {hi:,} (a fraction is refused, never rounded)"
+    if not re.fullmatch(r"[0-9]{1,12}", text) or not lo <= int(text) <= hi:
+        raise ValueError(f"{kind} in a slot must be {want}; {text!r} is not")
+    return int(text)
+
+
+def _slot_doc_for_edit(seams: SlotSeams, replace: bool, retry: str,
+                       say: Callable[[str], None]) -> dict[str, Any] | None:
+    """The document to change: a copy of the one in force, an empty one when there is no file or with
+    ``--replace``; ``None`` (said) when the file is unusable and ``--replace`` was not given (R1 F7: never merged)."""
+    from levain.qbroker.limits import LimitsUnavailable
+
+    missing = _not_set_up(seams)
+    if missing:
+        say(f"levain limits: refused, nothing changed: {missing}.")
+        return None
+    if replace:
+        return {"format": L.LIMITS_FORMAT}
+    try:
+        with _quiet_broker():
+            doc = _reader(seams)._document()
+    except LimitsUnavailable as exc:
+        if exc.reason.startswith("the policy directory"):
+            say(f"levain limits: refused, nothing changed: {exc.reason} (`levain doctor` shows the store).")
+        else:
+            say(f"levain limits: refused, nothing changed: {exc.reason}. A file the queue broker refuses is never "
+                f"merged: `{retry} --replace` writes a document holding only this change (every other slot limit "
+                "back to its default).")
+        return None
+    if doc is None:
+        return {"format": L.LIMITS_FORMAT}
+    return {k: dict(v) if isinstance(v, dict) else v for k, v in doc.items()}    # the reader's cache stays as read
+
+
+def _helper_answer(out: str) -> dict[str, Any] | None:
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    try:
+        got = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        return None
+    return got if isinstance(got, dict) else None
+
+
+def _slot_write(seams: SlotSeams, doc: dict[str, Any], what: str, say: Callable[[str], None]) -> int:
+    """Check ``doc`` as root will, hand it to ``set-limits`` and say its answer: ok (with any warning), the refusal
+    by name, or no answer. Root replaces the file whole with these bytes, re-checked and re-serialised."""
+    from levain.contracts.canon import canonical_bytes
+
+    data = canonical_bytes(doc)
+    try:
+        L.slot_doc(data)
+    except L.LimitsDocError as exc:
+        say(f"levain limits: refused, nothing changed: the install helper would refuse the document ({exc}).")
+        return 1
+    helper = seams.helper or (lambda d: _sudo_set_limits(seams.host, d))
+    try:
+        rc, out, err = helper(data)
+    except KeyboardInterrupt:
+        say("levain limits: interrupted; `levain limits show --slots` says what is in force.")
+        return 130
+    except OSError as exc:
+        say(f"levain limits: the install helper could not be run ({type(exc).__name__}: {exc}); nothing changed.")
+        return 1
+    answer = _helper_answer(out)
+    relay = [f"  {ln}" for ln in err.splitlines() if ln.strip()]
+    if answer is None:
+        say(f"levain limits: no answer from the install helper (exit {rc}); `levain limits show --slots` says what "
+            "is in force.")
+    elif answer.get("ok") is not True:
+        name = answer.get("refused")
+        if name == "internal":
+            say("levain limits: the install helper failed (internal); `levain limits show --slots` says what is in "
+                "force.")
+        else:
+            say(f"levain limits: refused by the install helper ({name}), nothing changed.")
+    else:
+        say(f"levain limits: {what} (L/policy/limits, {answer.get('digest')}).")
+    for ln in relay:
+        say(ln)
+    if answer is None or answer.get("ok") is not True:
+        return 1
+    _show_slots_text(seams, None, say)
+    return 0
+
+
+def _slot_limits(seams: SlotSeams, agent: str | None) -> tuple[str, dict[str, dict[str, int]]]:
+    """(the source, the slot limits in force per agent), through the broker's reader; raises its
+    ``LimitsUnavailable``."""
+    reader = _reader(seams)
+    with _quiet_broker():
+        source = str(reader.path) if reader._document() is not None else "defaults (no file)"
+        return source, {a: {k: int(v) for k, v in reader(a, "levain-limits-show").items()}
+                        for a in ([agent] if agent else list(L.AGENTS))}
+
+
+def _show_slots_text(seams: SlotSeams, agent: str | None, say: Callable[[str], None]) -> None:
+    source, lim = _slot_limits(seams, agent)
+    say(f"slot limits in force, from {source}:")
+    for a, got in lim.items():
+        say(f"  {a}: calls {got['calls']:,}, active hours {got['active_hours']:,}, repeat {got['repeat']}")
+
+
+def _cmd_show_slots(args: argparse.Namespace, say: Callable[[str], None], seams: SlotSeams) -> int:
+    from levain.qbroker.limits import LimitsUnavailable
+
+    missing = _not_set_up(seams)
+    if missing:
+        say(f"levain limits: {missing}; slot limits apply to slot sessions only.")
+        return 0
+    try:
+        if args.json:
+            source, lim = _slot_limits(seams, args.agent)
+            say(json.dumps({"source": source, "limits": lim}, indent=2, sort_keys=True))
+        else:
+            _show_slots_text(seams, args.agent, say)
+    except LimitsUnavailable as exc:
+        say(f"levain limits: {exc.reason}. Until it is, the queue broker refuses every slot tool call it gates "
+            "(limits-failed).")
+        return 1
+    return 0
+
+
+def _cmd_set_slots(args: argparse.Namespace, say: Callable[[str], None], seams: SlotSeams) -> int:
+    agent = args.slots
+    try:
+        value = _parse_slot_value(args.kind, args.value)
+    except ValueError as exc:
+        say(f"levain limits: refused, nothing changed: {exc}")
+        return 1
+    doc = _slot_doc_for_edit(seams, args.replace, f"levain limits set --slots {agent} {args.kind} {args.value}", say)
+    if doc is None:
+        return 1
+    doc.setdefault(agent, {})[args.kind] = value
+    what = f"slot limits written: {agent} {args.kind} = {value:,}"
+    return _slot_write(seams, doc, what + (", every other slot limit its default" if args.replace else ""), say)
+
+
+def _cmd_unset_slots(args: argparse.Namespace, say: Callable[[str], None], seams: SlotSeams) -> int:
+    agent = args.slots
+    doc = _slot_doc_for_edit(seams, args.replace, f"levain limits unset --slots {agent} {args.kind}", say)
+    if doc is None:
+        return 1
+    if not args.replace:
+        block = doc.get(agent) or {}
+        if args.kind not in block:
+            say(f"levain limits: the slot limits set no {args.kind} for {agent}; nothing changed.")
+            return 0
+        del block[args.kind]
+        if not block:
+            doc.pop(agent, None)
+    what = ("slot limits written: every slot limit its default" if args.replace
+            else f"slot limits written: {agent} {args.kind} unset")
+    return _slot_write(seams, doc, what, say)
 
 
 # --- show (output) -----------------------------------------------------------------------------------------
@@ -406,13 +642,27 @@ def _cmd_extend(args: argparse.Namespace, say: Callable[[str], None], *, queue: 
         return 0
 
 
-def run(args: argparse.Namespace, out: Any = None) -> int:
+def run(args: argparse.Namespace, out: Any = None, *, slots: SlotSeams | None = None) -> int:
+    """``slots``: where ``--slots`` reads and how it writes (default the host's store and ``sudo``)."""
     out = out if out is not None else sys.stdout
 
     def say(text: str) -> None:
         print(text, file=out, flush=True)
 
     sub = args.limits_cmd
+    if sub in ("show", "set", "unset") and getattr(args, "slots", None):
+        if sub != "show" and args.agent is not None:
+            say("levain limits: with --slots the agent is --slots' own value (`levain limits "
+                f"{sub} --slots <agent|default> ...`); --agent is not taken")
+            return 2
+        seams = slots or _host_slot_seams()
+        return {"show": _cmd_show_slots, "set": _cmd_set_slots, "unset": _cmd_unset_slots}[sub](args, say, seams)
+    if sub in ("set", "unset"):
+        if args.replace:
+            say("levain limits: --replace is for the slot limits only (`--slots <agent|default>`); nothing changed")
+            return 2
+        if args.agent is None:
+            args.agent = "default"
     if sub == "show":
         return _cmd_show(args, say)
     if sub == "set":
@@ -444,16 +694,28 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     sp = p.add_subparsers(dest="limits_cmd")
     kinds = list(L.KINDS)
     agents = list(L.AGENTS)
+    blocks = [*agents, "default"]
+    slots_help = ("The limits SLOT sessions run under (root's L/policy/limits, written through `sudo` and the "
+                  "install helper, which asks the password) instead of limits.json; its value is the agent or "
+                  "`default`. A slot reads calls, active_hours and repeat, in whole numbers.")
+    replace_help = ("With --slots: write a document holding only this change, every other slot limit back to its "
+                    "default (the way to replace a file the queue broker refuses, which is never merged).")
     s = sp.add_parser("show", help="Limits in force per agent, and every counted session.")
     s.add_argument("--agent", choices=agents, default=None)
     s.add_argument("--json", action="store_true", help="The cockpit panel's JSON instead of text.")
-    s = sp.add_parser("set", help="Set a limit in limits.json.")
+    s.add_argument("--slots", action="store_true", help="The limits slot sessions run under (L/policy/limits).")
+    s = sp.add_parser("set", help="Set a limit in limits.json, or with --slots in the slot limits.")
     s.add_argument("kind", choices=kinds)
     s.add_argument("value")
-    s.add_argument("--agent", choices=[*agents, "default"], default="default")
-    s = sp.add_parser("unset", help="Remove a limit from limits.json (the default applies again).")
+    s.add_argument("--agent", choices=blocks, default=None, help="The block to set (default: default).")
+    s.add_argument("--slots", choices=blocks, default=None, metavar="{" + ",".join(blocks) + "}", help=slots_help)
+    s.add_argument("--replace", action="store_true", help=replace_help)
+    s = sp.add_parser("unset", help="Remove a limit from limits.json, or with --slots from the slot limits (the "
+                                    "default applies again).")
     s.add_argument("kind", choices=kinds)
-    s.add_argument("--agent", choices=[*agents, "default"], default="default")
+    s.add_argument("--agent", choices=blocks, default=None, help="The block to unset from (default: default).")
+    s.add_argument("--slots", choices=blocks, default=None, metavar="{" + ",".join(blocks) + "}", help=slots_help)
+    s.add_argument("--replace", action="store_true", help=replace_help)
     s = sp.add_parser("extend", help="Ask for a signed Extend of a halted session, and resume it on an allow.")
     s.add_argument("session", help="The halted session id.")
     s.add_argument("--agent", choices=agents, default=None)
