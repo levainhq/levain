@@ -533,6 +533,29 @@ def test_f1_dumb_protocol_paths_under_a_git_segment_are_git_exchanges(tail):
     assert advert.key_allowed(_get("/o/undeclared" + tail), rt), "no *.git segment: not a dumb-protocol shape"
 
 
+def test_a_repo_at_the_root_has_the_prefix_slash_in_the_set_and_the_declared_set(adverts):
+    """S3 L3 r2 glm MED 1: a repo served at the host's root (`/info/refs`, `/git-upload-pack`) has the prefix "/",
+    never "": its advertisement and its POST compare equal, and a route declaring "/" carries the key to it."""
+    assert advert.discovery_key(discovery("")) == ("https", HOST, 443, "/")
+    assert advert.exchange_key(post("")) == ("https", HOST, 443, "/")
+    assert advert.git_exchange(discovery("")) == (True, "/")
+    assert advert.git_exchange(post("")) == (True, "/")
+    rt = route(declared=("/",))
+    assert advert.key_allowed(discovery(""), rt) and advert.key_allowed(post(""), rt)
+    assert not advert.key_allowed(post("/o/r.git"), rt), '"/" names the root repo only, never a prefix of others'
+    advertised(adverts, "")
+    assert verdict(post(""), adverts) == SILENT
+
+
+def test_one_home_for_exactly_one_upload_pack_service():
+    """S3 L3 r2 glm MED 2's class: discovery_key and git_exchange read "exactly one `service`, and it
+    `git-upload-pack`" from one helper."""
+    src = inspect.getsource(advert)
+    assert src.count("(SERVICE,)") == 1 and "[SERVICE]" not in src
+    for fn in (advert.discovery_key, advert.git_exchange):
+        assert "_one_upload_pack_service(parsed)" in inspect.getsource(fn), fn.__name__
+
+
 @pytest.mark.parametrize("path", [
     "/o/undeclared.git%2Fgit-upload-pack", "/o/undeclared.git%2finfo%2frefs", "/o%2Fundeclared.git/HEAD",
     "/o/declared.git%2FHEAD", "/o/declared.git/objects%2fab/cdef", "/api%2Fv4/projects", "/api/x%2f",

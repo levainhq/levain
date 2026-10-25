@@ -110,16 +110,24 @@ def content_type_class(content_type: str | None) -> str:
     return CT_ADVERTISEMENT if media_type(content_type) == ADVERTISEMENT_TYPE else CT_OTHER
 
 
+def _one_upload_pack_service(parsed: ParsedRequest) -> bool:
+    """THE clause "exactly one `service`, and it `git-upload-pack`", over R-1's folded query parse (discovery_key and
+    git_exchange both read it here)."""
+    return parsed.query_values(_SERVICE_KEY) == (SERVICE,)
+
+
 def _key(parsed: ParsedRequest, suffix: str) -> AdvertKey | None:
+    """The tuple of a request whose canonical path ends `suffix`. A repo at the host's root has the prefix "/" (as
+    `git_exchange` and a declared "/" spell it), never ""."""
     path = parsed.canonical_path
     if parsed.canonical_host is None or path is None or not path.endswith(suffix):
         return None
-    return (parsed.scheme, parsed.canonical_host, parsed.port, path[: -len(suffix)])
+    return (parsed.scheme, parsed.canonical_host, parsed.port, path[: -len(suffix)] or "/")
 
 
 def discovery_key(parsed: ParsedRequest) -> AdvertKey | None:
     """The tuple of a discovery request: `GET <prefix>/info/refs` with exactly one `service` and it `git-upload-pack`."""
-    if parsed.method != "GET" or parsed.query_values(_SERVICE_KEY) != (SERVICE,):
+    if parsed.method != "GET" or not _one_upload_pack_service(parsed):
         return None
     return _key(parsed, DISCOVERY_SUFFIX)
 
@@ -273,12 +281,12 @@ def git_exchange(parsed: ParsedRequest) -> tuple[bool, str | None]:
       (2) a dumb-protocol shape under a `*.git` segment: `/HEAD`, `/objects/...`, `/info/packs`, `/info/alternates`;
       (3) the query carries `service` at all (missing value, duplicated, any value).
     The prefix is the path up to the git suffix (up to and including the `*.git` segment for (2)), as spelled in the
-    canonical path. None (no declared repo can match, keyless) when: an `info/refs` path does not carry exactly one
+    canonical path; "/" for a repo at the host's root. None (no declared repo can match, keyless) when: an `info/refs` path does not carry exactly one
     `service` and it `git-upload-pack`; or only (3) holds (no repo path)."""
     path = parsed.canonical_path
     if path is None:
         return True, None
-    service = [q.value for q in parsed.params if q.folded == _SERVICE_KEY]
+    service = parsed.query_values(_SERVICE_KEY)
     raw = path.split("/")
     if len(raw) > 2 and raw[-1] == "":
         raw = raw[:-1]
@@ -298,9 +306,9 @@ def git_exchange(parsed: ParsedRequest) -> tuple[bool, str | None]:
                 break
     if prefix_raw is None:
         return bool(service), None
-    if discovery and service != [SERVICE]:
+    if discovery and not _one_upload_pack_service(parsed):
         return True, None
-    return True, "/".join(prefix_raw)
+    return True, "/".join(prefix_raw) or "/"
 
 
 def _canonical_repo(entry: str) -> str | None:
