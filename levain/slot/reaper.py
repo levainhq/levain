@@ -11,8 +11,8 @@ The reaper is root and acts through the helpers' own functions, never a second c
 The pass (§4.3), in this fixed order; each step try-locks and skips what is busy, and one item that fails is logged
 and named in the heartbeat, never the end of the pass:
 0 the ``*.new`` sweep · 1 dead-holder REVOKE · 2 journal reconciliation · 3 END, the HELD retry, and SCRUB again for a
-RETAINED session whose slot is still leased to it (RH5) · 3a the orphan ``leased`` revert · 3b/3c, 5 seams · 4 BRAKE
-below V5 · 6 reserve refill · 7 pool health and ``SLOT-SYNC`` · 8 the heartbeat. With CONTROL down only the local steps
+RETAINED session whose slot is still leased to it (RH5) · 3a the orphan ``leased`` revert · 3c dispatch retention
+(:meth:`Reaper.dispatch_retention`) · 3b, 5 seams · 4 BRAKE below V5 · 6 reserve refill · 7 pool health and ``SLOT-SYNC`` · 8 the heartbeat. With CONTROL down only the local steps
 run (0, 6, 8).
 Lock order: pool -> slot -> session END lock; the reaper never takes the install lock.
 """
@@ -35,6 +35,7 @@ from levain.slot import proc as PR
 from levain.slot import records as R
 from levain.slot import runtime_helper as H
 from levain.slot import start as SS
+from levain.slot import store_verbs as SV
 from levain.slot.grammar import SESSION_RE
 from levain.slot.ids import SlotId
 from levain.slot.layout import RESERVE_BYTES, RUN, Row, base_run_rows, slot_run_rows
@@ -58,6 +59,11 @@ REVOKER_RETRY_S = 0.25
 CONTROL_BOOT_WAIT_S = 30.0
 #: DECISION: the bound on one boot-pass ``ip netns`` command.
 NETNS_STEP_S = 30.0
+#: CONTRACT §3.5: ``L/policy/dispatch_retain_days``, default 2, floor 1.
+DISPATCH_RETAIN_DAYS = "dispatch_retain_days"
+DISPATCH_RETAIN_DAYS_DEFAULT = 2
+DISPATCH_RETAIN_DAYS_FLOOR = 1
+DAY_S = 24 * 3600
 
 #: ``create_at``'s temp below ``L/alloc/``: ``<session>.json.<16 hex>.new``.
 _TEMP_TAIL = len(".json.") + 16 + len(".new")
@@ -189,10 +195,28 @@ class _Item:
         return True
 
 
+def dispatch_retain_days(store: H.Store, log: Callable[[str], None]) -> int:
+    """``L/policy/dispatch_retain_days`` (root, §2.1): absent = the default. DECISION (the writer, install
+    ``set-retention``, is not built yet): the file is ASCII decimal days with at most one trailing newline; one that
+    does not read so is logged and the default used; a value below the floor is the floor."""
+    try:
+        data = store.read(("policy",), DISPATCH_RETAIN_DAYS)
+    except Refused as e:
+        log(f"policy {DISPATCH_RETAIN_DAYS}: {e.name}; the default {DISPATCH_RETAIN_DAYS_DEFAULT} is used")
+        return DISPATCH_RETAIN_DAYS_DEFAULT
+    if data is None:
+        return DISPATCH_RETAIN_DAYS_DEFAULT
+    text = data[:-1] if data.endswith(b"\n") else data
+    if not 1 <= len(text) <= 6 or not all(0x30 <= c <= 0x39 for c in text):
+        log(f"policy {DISPATCH_RETAIN_DAYS}: not decimal days; the default {DISPATCH_RETAIN_DAYS_DEFAULT} is used")
+        return DISPATCH_RETAIN_DAYS_DEFAULT
+    return max(int(text), DISPATCH_RETAIN_DAYS_FLOOR)
+
+
 def _new_report(boot_id: str, seq: int, started: float) -> Dict[str, object]:
     return {"boot_id": boot_id, "pass_seq": seq, "started_at": R.timestamp(started), "control": "up",
             "swept": [], "revoked": [], "reconciled": [], "ended": [], "scrubbed": [], "reverted": [], "braked": [],
-            "held": [], "skipped": []}
+            "held": [], "trashed": [], "skipped": []}
 
 
 class Reaper:
@@ -274,8 +298,8 @@ class Reaper:
             steps: List[Tuple[str, Callable[[H.Ctx, Dict[str, object]], None]]] = [("0", self.sweep_temps)]
             if up:
                 steps += [("1", self.revoke_dead_holders), ("2", self.reconcile_journals),
-                          ("3", self.end_and_scrub), ("3a", self.revert_orphans)]
-            for name in ("3b", "3c", "5"):
+                          ("3", self.end_and_scrub), ("3a", self.revert_orphans), ("3c", self.dispatch_retention)]
+            for name in ("3b", "5"):
                 rep["skipped"].append(f"step{name}:seam-unbuilt")     # type: ignore[union-attr]
             if up:
                 steps += [("4", self.brake_below_floor)]
@@ -571,6 +595,45 @@ class Reaper:
                 new = replace(st, rev=st.rev + 1, state=to, session=None, changed_at=R.timestamp(self.seams.clock()))
                 ctx.store.replace(("slots", slot.tag), "state", R.slot_state_bytes(new), mode=0o644)
         rep["reverted"].append(f"{slot.tag}:{s}:{to}")                     # type: ignore[union-attr]
+
+    # -- step 3c: dispatch retention (§3.5 Retention, §7.7 3c) --------------------------------------------------------
+
+    def dispatch_retention(self, ctx: H.Ctx, rep: Dict[str, object]) -> None:
+        """A RETAINED session whose alloc carries a ticket goes to TRASH (the store verb ``discard``, its CAS checked by
+        CONTROL) once dispatch acked its result (the record's ``artifact_acked``) or once ``dispatch_retain_days`` have
+        passed since root's ``L/retained/<s>/retained_at``, whichever is first, UNLESS ``L/retained/<s>/restored_at``
+        exists (the operator restored it: his, never auto-trashed again). The record is read as a HINT (§7.1); a forged
+        ``artifact_acked`` can only move a dispatch session to TRASH early, from where it is restorable until purge. A
+        busy session (``session-busy``) or any other refusal is skipped for the next pass; a retained object with no
+        readable ``retained_at`` is never trashed by age (``no-retained-at``)."""
+        allocs = self._allocs(ctx)
+        days: Optional[int] = None
+        now = R.epoch_of(R.timestamp(self.seams.clock()))
+        for s, rec in self._records(ctx).items():
+            a = allocs.get(s)
+            if rec.state != R.RETAINED or a is None or a.ticket is None:
+                continue
+            with self.item(rep, f"retain:{s}"):
+                facts = SV.facts_from_alloc(a, self.seams.L)
+                seams = SV.StoreSeams(cas=SV.control_cas(ctx, s), owner_ok=self.seams.trusted,
+                                      now=lambda: R.timestamp(self.seams.clock()))
+                if os.path.lexists(facts.retained / "restored_at"):
+                    continue
+                if rec.fields.get("artifact_acked") is not True:
+                    if days is None:
+                        days = dispatch_retain_days(ctx.store, self.log)
+                    stamp = SV.read_stamp(facts.retained / "retained_at", seams)
+                    if stamp is None:
+                        rep["skipped"].append(f"retain:{s}:no-retained-at")   # type: ignore[union-attr]
+                        continue
+                    if now - R.epoch_of(stamp) < days * DAY_S:
+                        continue
+                try:
+                    SV.discard(facts, seams)
+                except Refused as e:
+                    rep["skipped"].append(f"retain:{s}:{e.name}")            # type: ignore[union-attr]
+                    continue
+                rep["trashed"].append(s)                                      # type: ignore[union-attr]
 
     # -- step 4: BRAKE below V5 (§7.7 4) -------------------------------------------------------------------------------
 

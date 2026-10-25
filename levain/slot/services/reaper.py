@@ -163,7 +163,7 @@ def worker_loop(reaper: RP.Reaper, wake_fd: int, *, passes: Optional[int] = None
         else:
             log(f"worker pass {rep['pass_seq']}: control {rep['control']} swept {rep['swept']} "
                 f"revoked {rep['revoked']} ended {rep['ended']} scrubbed {rep['scrubbed']} "
-                f"reverted {rep['reverted']} held {rep['held']}")
+                f"reverted {rep['reverted']} held {rep['held']} trashed {rep.get('trashed', [])}")
         if passes is not None and n >= passes:
             return 0
         _wait(wake_fd, last + tick_s - mono())
