@@ -2623,9 +2623,11 @@ def serve(config: ServeConfig) -> int:
         ceiling = config.ceiling_path or Path(config.routes_dir).parent / "policy" / "dispatch_ceiling"
         tickets = T.TicketStore(Path(config.store_dir) / T.JOURNAL, Path(ceiling), ceiling_uid=config.ceiling_uid)
     lineage = LN.LineageSink(Path(config.lineage_dir) / LN.SINK) if config.lineage_dir is not None else None
+    # S1 3c-8: the verifier generations live beside the route maps (`L/routes/verifiers/`)
+    verifiers = routemaps.ControlVerifiers(Path(config.routes_dir)) if config.routes_dir is not None else None
     control = Control(store, config.operator_uid, qbroker_uid=config.qbroker_uid, keys_uid=config.keys_uid,
                       keys_admin=admin, host=config.host, routes=routes, dispatch_uid=config.dispatch_uid,
-                      tickets=tickets, lineage=lineage)
+                      tickets=tickets, lineage=lineage, verifiers=verifiers)
     if config.peer_uid is not None:
         server = ControlServer(control, Path(config.socket_path), peer_uid=config.peer_uid)
     else:
