@@ -103,8 +103,8 @@ class EventFollower:
                    lambda: CC.ControlClient(socket_path), resolve, **kw)
 
     def close(self) -> None:
-        """End the stream a step is reading (that step ends ``CANCELLED``) and the ACK connection; a step after
-        close opens no stream. Idempotent."""
+        """End the stream a step is reading or opening (that step ends ``CANCELLED``) and the ACK connection; a step
+        after close returns ``CANCELLED`` without opening a stream. Permanent and idempotent."""
         with self._lock:
             self._closed = True
             stream, self._active = self._active, None
@@ -117,6 +117,12 @@ class EventFollower:
     def step(self) -> Stepped:
         """One connection: replay and follow from the persisted cursor until the stream ends. Returns how it ended
         and the gaps it read (:class:`Stepped`); raises :class:`FollowStopped` at an event it could not finish."""
+        # one ordering against close(), both under _lock: _closed is read before the factory runs (a step after close
+        # opens nothing) and again before the opened stream is registered (a close that landed while it opened closes
+        # it here, unread); a close after registration finds it in _active
+        with self._lock:
+            if self._closed:
+                return Stepped(CC.CANCELLED)
         cur = self.jobs.event_cursor()
         jid, after = cur if cur is not None else (None, 0)
         stream = self._stream(after, jid)

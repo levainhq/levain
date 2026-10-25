@@ -363,3 +363,52 @@ def test_a_control_down_ack_stops_the_step_and_the_next_step_opens_a_stream(stor
     assert f.step().outcome == CC.DEADLINE
     assert len(opened) == 2 and acked(served)
     f.close()
+
+
+class HeldStream:
+    """A stream that records its close and must never be read."""
+
+    def __init__(self) -> None:
+        self.closed = 0
+
+    def __iter__(self):
+        raise AssertionError("a stream opened across a close was read")
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def test_a_step_after_close_never_opens_a_stream(store):  # noqa: F811
+    """RULINGS_OBS 14: close() before a step: the step is CANCELLED without calling the stream factory."""
+    calls: list = []
+    f = F.EventFollower(store, lambda after, jid: calls.append(after) or HeldStream(), lambda: DownClient(),
+                        lambda _ev: None)
+    f.close()
+    assert f.step().outcome == CC.CANCELLED and calls == []
+
+
+def test_a_close_landing_while_the_stream_opens_closes_what_was_opened(store):  # noqa: F811
+    """RULINGS_OBS 14: close() from another thread while the factory is opening the stream: the step ends CANCELLED
+    and closes the stream the factory returned, unread."""
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+    held = HeldStream()
+
+    def opening(after, jid):
+        entered.set()
+        assert release.wait(5.0)
+        return held
+
+    f = F.EventFollower(store, opening, lambda: DownClient(), lambda _ev: None)
+
+    def closer() -> None:
+        assert entered.wait(5.0)
+        f.close()
+        release.set()
+
+    t = threading.Thread(target=closer)
+    t.start()
+    assert f.step().outcome == CC.CANCELLED
+    t.join(5.0)
+    assert not t.is_alive() and held.closed >= 1
