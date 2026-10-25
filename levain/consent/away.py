@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.authority import anchor_path
-from levain.consent.adapters import claude_code, codex
+from levain.consent.adapters import claude_code
 from levain.consent.adapters.claude_code import (
     CLEANUP_RESERVE,
     DEFAULT_MAX_HOLD,
@@ -53,8 +53,21 @@ from levain.consent.record import AWAY_NAMESPACE, away_leave_message
 __all__ = ["AGENTS", "DEFAULT_HOLDS", "MAX_HOLD", "check_queue_dir", "read", "set_away", "settings",
            "why_unanswerable"]
 
-# agent -> its settings file name in the queue directory
-AGENTS = {"claude_code": claude_code.SETTINGS_NAME, "codex": codex.SETTINGS_NAME}
+
+
+def _agents() -> dict:
+    """agent -> its settings file name in the queue directory. The codex adapter imports ``tomllib`` (3.11+), so it is
+    imported here, at the call, and not at module load: the queue broker imports this module under root's 3.9."""
+    from levain.consent.adapters import codex
+    return {"claude_code": claude_code.SETTINGS_NAME, "codex": codex.SETTINGS_NAME}
+
+
+def __getattr__(name: str):
+    if name == "AGENTS":
+        return _agents()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 # the longest wait the hook makes: installed with DEFAULT_MAX_HOLD, it stops waiting CLEANUP_RESERVE before that
 MAX_HOLD = DEFAULT_MAX_HOLD - CLEANUP_RESERVE
 # a settings file is a few keys; anything larger is not one levain wrote
@@ -62,9 +75,10 @@ _MAX_BYTES = 64 * 1024
 
 
 def _settings_path(qdir: Path, agent: str) -> Path:
-    if agent not in AGENTS:
-        raise ValueError(f"unknown agent {agent!r} (one of: {', '.join(AGENTS)})")
-    return qdir / AGENTS[agent]
+    agents = _agents()
+    if agent not in agents:
+        raise ValueError(f"unknown agent {agent!r} (one of: {', '.join(agents)})")
+    return qdir / agents[agent]
 
 
 def check_queue_dir(qdir: Path) -> None:
@@ -236,7 +250,7 @@ def set_away(qdir: Path, agent: str, on: bool | None, hold: float | None = None,
         _check_signing_key(signing_key)
     got = _read_keyed(qdir, agent)
     if got is None:
-        raise ValueError(f"no {AGENTS[agent]} in {qdir}: `levain init` writes it (with the consent hook on) and "
+        raise ValueError(f"no {_agents()[agent]} in {qdir}: `levain init` writes it (with the consent hook on) and "
                          "names the install's cockpit; away mode is set in that file")
     data, key = got
     if on and hold is None:
