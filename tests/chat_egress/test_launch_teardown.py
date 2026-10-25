@@ -147,7 +147,7 @@ def test_stop_whose_glue_wait_times_out_still_closes_the_decider_and_socks(tmp_p
     print(f"RUN S8C stop + wait timeout: {out}")
     assert out.glue_exit is None and out.final_flush is None
     assert out.socks_clean and _egress_threads() == [] and dm.service_threads() == []
-    assert out.order == ("lifeline", "glue", "decider", "socks")
+    assert out.order == ("socks", "lifeline", "glue", "decider")
     assert [f.split(":")[0] for f in out.failures] == ["glue"]
 
 
@@ -165,6 +165,28 @@ def test_stop_whose_decider_close_raises_still_closes_socks(tmp_path, origin, mo
     assert out.glue_exit == 0 and out.socks_clean and not out.decider_clean
     assert _egress_threads() == [] and dm.service_threads() == []
     assert [f.split(":")[0] for f in out.failures] == ["decider"]
+
+
+@pytest.mark.chat_egress_srt
+def test_a_socks_refusal_landing_during_stop_is_counted_in_the_final_flush(tmp_path, origin, monkeypatch) -> None:
+    import socket
+    import time
+    e = _start(tmp_path, origin, monkeypatch)
+    real_close = e.socks.close
+
+    def close(*a, **k):
+        c = socket.create_connection(("127.0.0.1", e.socks_port), timeout=5)
+        try:
+            c.sendall(b"\x05\x01\x00")
+            assert c.recv(2) == b"\x05\x00"              # the refusal was reported before this answer
+        finally:
+            c.close()
+        return real_close(*a, **k)
+    monkeypatch.setattr(e.socks, "close", close)
+    out = lm.stop_egress(e)
+    print(f"RUN S1 refusal during stop: {out.final_flush}")
+    assert out.glue_exit == 0 and out.final_flush is not None
+    assert out.final_flush["total"] == 1 and out.final_flush["by_reason"] == {"socks": 1}
 
 
 # --- S8D r1 DS item 4: an OSError closing the glue's stderr file never leaves the glue unowned ---------------------

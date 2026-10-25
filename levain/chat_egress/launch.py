@@ -374,7 +374,9 @@ def stop_egress(e: EgressLaunch) -> StopResult:
         nonlocal socks_clean
         socks_clean = e.socks.close()
 
-    for what, step in (("lifeline", lifeline), ("glue", glue), ("decider", decider), ("socks", socks_)):
+    # The SOCKS refuser stops (thread joined, wall end closed: the glue's EOF on the wall channel) before the lifeline closes,
+    # so a refusal in flight is on the wall channel ahead of that EOF and the glue's final flush counts it.
+    for what, step in (("socks", socks_), ("lifeline", lifeline), ("glue", glue), ("decider", decider)):
         _guarded(failures, what, step)
         order.append(what)
     return StopResult(glue_exit=code, decider_clean=decider_clean, socks_clean=socks_clean,
