@@ -17,10 +17,10 @@ the entity's ``deny_subtrees``.
 Durability: :mod:`levain.autonomic.durable_sqlite` (every commit on disk before it returns; every write one
 ``BEGIN IMMEDIATE``, serialized by SQLite itself).
 
-The store carries a format marker; a database with another marker, or tables and no marker, is refused
-rather than read or taken over, and a store that disappears under a running object is refused rather
-than silently started empty. The directory is created ``0700``; an existing one keeps its mode. A
-registry kept in the earlier JSON file format (this package's or the vagus package's) enters only
+The store carries a format marker, read inside every transaction; a database with another marker, or
+tables and no marker, is refused rather than read or taken over, and a store that disappears under a
+running object is refused rather than silently started empty. The directory is created ``0700``; an
+existing one keeps its mode. A registry kept in the earlier JSON file format (this package's or the vagus package's) enters only
 through :meth:`levain.autonomic.binding.BindingStore.migrate_json`, a one-way import.
 
 Stdlib only.
@@ -41,7 +41,7 @@ __all__ = ["AutonomicDB", "StoreFormatError", "STORE_FORMAT", "STORE_FORMAT_V1",
 
 STORE_FORMAT_V1 = "levain-autonomic/1"
 # the format of a store whose bindings fire below CONFIRM only under a signed graduation policy: an older binary
-# refuses it at its own format check rather than fire below CONFIRM unclamped
+# that opens it refuses it at its own format check rather than fire below CONFIRM unclamped
 STORE_FORMAT_V2 = "levain-autonomic/2"
 STORE_FORMAT = STORE_FORMAT_V1
 DB_NAME = "autonomic.db"
@@ -92,29 +92,52 @@ class StoreFormatError(RuntimeError):
     """The database is not a store of this format (another marker, or not a store at all)."""
 
 
+def _marker(conn: sqlite3.Connection) -> str | None:
+    # the store's format marker, None when there is none (no meta table, or no format row); any other error of the
+    # read is raised as it is, never read as "no marker"
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
+    except sqlite3.OperationalError as exc:
+        if str(exc) == "no such table: meta":
+            return None
+        raise
+    return None if row is None else row[0]
+
+
+def _check_format(conn: sqlite3.Connection) -> None:
+    # inside the caller's transaction, after it began: a store migrated by another connection since this object
+    # opened it is refused here. A write holds the write lock from its BEGIN IMMEDIATE, so no migration commits
+    # before the block's own writes; a read's snapshot starts at this, its first read, so the block reads the
+    # state this check read
+    marker = _marker(conn)
+    if marker is None:
+        raise StoreFormatError("the store has no format marker")
+    if marker != STORE_FORMAT:
+        raise StoreFormatError(f"store format {marker!r} is not {STORE_FORMAT!r}")
+
+
 def migrate_to_v2(conn: sqlite3.Connection) -> bool:
     """Migrate a ``/1`` store to ``/2`` in place, inside the write transaction ``conn`` holds: add the
-    ``graduation_steps`` table and set the marker. ``True`` if it migrated, ``False`` for a store already ``/2``.
-    A store with no marker, or another one, raises :class:`StoreFormatError` and is left as it was. No other table
-    changes: a binding is read as it was written, and the rung it fires at is the gate's to decide, not this
-    function's.
+    ``graduation_steps`` table and set the marker. ``True`` if this call changed the store (it migrated a ``/1``
+    store, or added the missing ``graduation_steps`` table to a ``/2`` one), ``False`` for a ``/2`` store it left
+    as it was. A store with no marker, or another one, raises :class:`StoreFormatError` and is left as it was. No
+    other table changes: a binding is read as it was written, and the rung it fires at is the gate's to decide, not
+    this function's.
 
     The caller owns the transaction, so the table and the marker commit
     together or not at all."""
     if not conn.in_transaction:
         raise RuntimeError("migrate_to_v2 runs inside its caller's write transaction")
-    try:
-        row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
-    except sqlite3.OperationalError:
-        row = None
-    if row is None:
+    marker = _marker(conn)
+    if marker is None:
         raise StoreFormatError("the database has no store format marker: it is not migrated")
-    if row[0] == STORE_FORMAT_V2:
-        conn.execute(_GRADUATION_STEPS)
-        return False
-    if row[0] != STORE_FORMAT_V1:
-        raise StoreFormatError(f"store format {row[0]!r} is not {STORE_FORMAT_V1!r}: it is not migrated")
+    if marker not in (STORE_FORMAT_V1, STORE_FORMAT_V2):
+        raise StoreFormatError(f"store format {marker!r} is not {STORE_FORMAT_V1!r}: it is not migrated")
+    had_steps = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'graduation_steps'"
+                             ).fetchone() is not None
     conn.execute(_GRADUATION_STEPS)
+    if marker == STORE_FORMAT_V2:
+        return not had_steps
     conn.execute("UPDATE meta SET value = ? WHERE key = 'format'", (STORE_FORMAT_V2,))
     return True
 
@@ -188,14 +211,17 @@ class AutonomicDB:
     @contextmanager
     def write(self) -> Iterator[sqlite3.Connection]:
         """One write transaction (``BEGIN IMMEDIATE``): committed when the block exits, rolled back if it
-        raises. Writers are serialized by SQLite; a reader always sees a committed state."""
+        raises. Writers are serialized by SQLite; a reader always sees a committed state. A store whose format
+        marker is no longer this binary's is refused before the block runs."""
         with write_transaction(self._connect) as conn:
+            _check_format(conn)
             yield conn
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
-        """A consistent read snapshot."""
+        """A consistent read snapshot, of a store whose format marker is this binary's (else refused)."""
         with read_transaction(self._connect) as conn:
+            _check_format(conn)
             yield conn
 
     def meta(self, key: str) -> str | None:

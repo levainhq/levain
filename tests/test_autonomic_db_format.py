@@ -98,6 +98,107 @@ def test_the_migration_is_idempotent_on_a_v2_store(tmp_path):
     assert fmt(db.path) == STORE_FORMAT_V2
 
 
+def in_immediate(path, fn):
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            out = fn(conn)
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+        return out
+    finally:
+        conn.close()
+
+
+def test_a_v2_store_missing_its_audit_table_is_repaired_and_says_so(tmp_path):
+    # the boolean is "this call changed the store": the marker, or the audit table on a /2 store
+    db = v1_store(tmp_path)
+    with db.write() as conn:
+        migrate_to_v2(conn)
+    in_immediate(db.path, lambda c: c.execute("DROP TABLE graduation_steps"))
+    assert in_immediate(db.path, migrate_to_v2) is True
+    assert "graduation_steps" in tables(db.path) and fmt(db.path) == STORE_FORMAT_V2
+    assert in_immediate(db.path, migrate_to_v2) is False
+
+
+def test_an_operational_error_other_than_a_missing_meta_table_raises_as_itself(tmp_path):
+    # a meta table with no value column is not "no marker": the read's own error propagates
+    path = tmp_path / DB_NAME
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY)")
+        conn.execute("BEGIN IMMEDIATE")
+        with pytest.raises(sqlite3.OperationalError, match="no such column"):
+            migrate_to_v2(conn)
+        conn.execute("ROLLBACK")
+    finally:
+        conn.close()
+
+
+def test_a_database_with_no_meta_table_is_refused_as_unmarked(tmp_path):
+    path = tmp_path / DB_NAME
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        conn.execute("CREATE TABLE other (x)")
+        conn.execute("BEGIN IMMEDIATE")
+        with pytest.raises(StoreFormatError, match="no store format marker"):
+            migrate_to_v2(conn)
+        conn.execute("ROLLBACK")
+    finally:
+        conn.close()
+
+
+def test_a_ready_object_refuses_the_store_once_another_connection_migrates_it(tmp_path):
+    # codex HIGH r1: the marker is checked inside every read and write, not only when the object first opens
+    db = v1_store(tmp_path)
+    assert db.meta("format") == STORE_FORMAT_V1          # ready at /1
+    in_immediate(db.path, migrate_to_v2)                 # another connection (another process) migrates
+    with pytest.raises(StoreFormatError, match="levain-autonomic/2"):
+        with db.read() as conn:
+            conn.execute("SELECT 1").fetchone()
+    with pytest.raises(StoreFormatError, match="levain-autonomic/2"):
+        with db.write() as conn:
+            conn.execute("INSERT INTO bindings (binding_id, record, seq) VALUES ('b2', '{}', 2)")
+    with pytest.raises(StoreFormatError):
+        db.meta("store_id")
+    # the refused write wrote nothing
+    conn = sqlite3.connect(db.path)
+    try:
+        assert conn.execute("SELECT binding_id FROM bindings").fetchall() == [("b1",)]
+    finally:
+        conn.close()
+
+
+def test_a_read_reads_the_state_its_format_check_read(tmp_path):
+    # a migration committed after a read's check is not seen by that read: its snapshot began at the check
+    db = v1_store(tmp_path)
+    with db.read() as conn:
+        assert in_immediate(db.path, migrate_to_v2) is True
+        assert conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()[0] == STORE_FORMAT_V1
+        assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'graduation_steps'").fetchone() is None
+    assert fmt(db.path) == STORE_FORMAT_V2
+    with pytest.raises(StoreFormatError):
+        db.meta("format")
+
+
+def test_a_ready_object_refuses_after_its_own_migration_commits(tmp_path):
+    db = v1_store(tmp_path)
+    with db.write() as conn:
+        migrate_to_v2(conn)
+    with pytest.raises(StoreFormatError, match="levain-autonomic/2"):
+        db.meta("format")
+
+
+def test_a_ready_object_refuses_a_store_whose_marker_was_removed(tmp_path):
+    db = v1_store(tmp_path)
+    in_immediate(db.path, lambda c: c.execute("DELETE FROM meta WHERE key = 'format'"))
+    with pytest.raises(StoreFormatError):
+        db.meta("store_id")
+
+
 def test_another_format_is_refused_and_left_as_it_was(tmp_path):
     db = v1_store(tmp_path)
     with db.write() as conn:
