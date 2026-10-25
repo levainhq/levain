@@ -19,8 +19,9 @@ Slice 1 handles:
 - every other event (other states, ``pool``, a kind this module does not know): passed.
 
 A hello naming another journal than the cursor's, or a ``reset``, drops the cursor: the next :meth:`step` replays from
-0, and every event it re-delivers converges (the write and the ACK are idempotent). A ``gap`` is logged: the events
-pruned before they were read are lost. CONTROL answers ``SESSION-EVENTS`` and ``ARTIFACT-ACK`` to its dispatch peer
+0, and every event it re-delivers converges (the write and the ACK are idempotent). A ``gap`` is logged and returned
+in the step's :class:`Stepped`, with the count of events it skipped: those were pruned before they were read, and are
+lost. CONTROL answers ``SESSION-EVENTS`` and ``ARTIFACT-ACK`` to its dispatch peer
 only (``levain.slot.control.PEER_VERBS``), so the follower runs as the ``_levain_dispatch`` uid.
 """
 from __future__ import annotations
@@ -61,6 +62,16 @@ class VerifierCall:
     model: Mapping[str, str]
 
 
+@dataclass(frozen=True)
+class Stepped:
+    """How one :meth:`EventFollower.step` ended: ``outcome`` is an :class:`levain.slot.control_client.EventStream`
+    outcome, or ``"journal-changed"`` / ``"reset"`` after dropping the cursor; ``gaps`` the gap frames the step read,
+    ``lost`` the events they skipped unread (pruned before the follower reached them)."""
+    outcome: str
+    gaps: tuple[CC.Gap, ...] = ()
+    lost: int = 0
+
+
 #: the terminal state event of a verifier ticket -> its inputs; None when dispatch minted no such verifier ticket
 Resolve = Callable[[Mapping[str, Any]], "VerifierCall | None"]
 
@@ -92,7 +103,7 @@ class EventFollower:
                    lambda: CC.ControlClient(socket_path), resolve, **kw)
 
     def close(self) -> None:
-        """End the stream a step is reading (that step returns ``CANCELLED``) and the ACK connection; a step after
+        """End the stream a step is reading (that step ends ``CANCELLED``) and the ACK connection; a step after
         close opens no stream. Idempotent."""
         with self._lock:
             self._closed = True
@@ -103,17 +114,16 @@ class EventFollower:
         if client is not None:
             client.close()
 
-    def step(self) -> str:
+    def step(self) -> Stepped:
         """One connection: replay and follow from the persisted cursor until the stream ends. Returns how it ended
-        (an :class:`EventStream` outcome, or ``"journal-changed"`` / ``"reset"`` after dropping the cursor); raises
-        :class:`FollowStopped` at an event it could not finish."""
+        and the gaps it read (:class:`Stepped`); raises :class:`FollowStopped` at an event it could not finish."""
         cur = self.jobs.event_cursor()
         jid, after = cur if cur is not None else (None, 0)
         stream = self._stream(after, jid)
         with self._lock:
             if self._closed:
                 stream.close()
-                return CC.CANCELLED
+                return Stepped(CC.CANCELLED)
             self._active = stream
         try:
             return self._read(stream, jid, after)
@@ -123,29 +133,35 @@ class EventFollower:
                     self._active = None
             stream.close()
 
-    def _read(self, stream: CC.EventStream, jid: str | None, after: int) -> str:
+    def _read(self, stream: CC.EventStream, jid: str | None, after: int) -> Stepped:
+        gaps: list[CC.Gap] = []
+        lost, last = 0, after                          # last: the newest seq read or skipped so far
         for frame in stream:
             if isinstance(frame, CC.Hello):
                 if frame.same_journal is False:
                     log.warning("CONTROL's event journal is %s, the cursor's %s: replaying from 0",
                                 frame.journal_id, jid)
                     self.jobs.drop_event_cursor()
-                    return "journal-changed"
+                    return Stepped("journal-changed", tuple(gaps), lost)
                 jid = frame.journal_id
             elif isinstance(frame, CC.Gap):
                 log.warning("events before seq %d were pruned unread; they are lost", frame.oldest_seq)
+                gaps.append(frame)
+                lost += max(0, frame.oldest_seq - last - 1)
+                last = max(last, frame.oldest_seq - 1)
             elif isinstance(frame, CC.Reset):
                 log.warning("the cursor %d is past the journal's newest seq %d: replaying from 0", after,
                             frame.newest_seq)
                 self.jobs.drop_event_cursor()
-                return "reset"
+                return Stepped("reset", tuple(gaps), lost)
             elif isinstance(frame, CC.StreamError):
                 log.warning("CONTROL ended the event stream: %s", frame.error)
             elif isinstance(frame, CC.Event):
                 assert jid is not None
                 self._handle(frame)
                 self.jobs.set_event_cursor(jid, frame.seq)
-        return stream.outcome or CC.CLOSED
+                last = frame.seq
+        return Stepped(stream.outcome or CC.CLOSED, tuple(gaps), lost)
 
     # -- one event ------------------------------------------------------------------------------------------------
 
@@ -205,4 +221,4 @@ class EventFollower:
             self._fault(where, seq)
 
 
-__all__ = ["EventFollower", "FollowStopped", "Resolve", "VerifierCall"]
+__all__ = ["EventFollower", "FollowStopped", "Resolve", "Stepped", "VerifierCall"]

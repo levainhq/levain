@@ -125,14 +125,14 @@ def acked(rig) -> bool:
 def test_replay_records_the_verifier_once_acks_and_moves_the_cursor(store, repo, served):  # noqa: F811
     d = setup_verifier(store, repo, served)
     f = d.follower()
-    assert f.step() == CC.DEADLINE
+    assert f.step().outcome == CC.DEADLINE
     assert [r.run for r in store.run_records(d.job.id)] == [0]
     assert acked(served)
     newest = served.kept()[-1]["seq"]
     assert store.event_cursor() == (served.events.journal_id, newest)
     # a second connection resumes past the cursor: nothing is re-delivered
     d.resolved.clear()
-    assert f.step() == CC.DEADLINE and d.resolved == []
+    assert f.step().outcome == CC.DEADLINE and d.resolved == []
     f.close()
 
 
@@ -144,14 +144,14 @@ def test_a_live_event_reaches_the_follower(store, repo, served):  # noqa: F811
     d.bind(ticket)
     assert served.vattach(ticket)["ok"]
     f = d.follower()
-    assert f.step() == CC.DEADLINE                                     # the replay so far: nothing terminal
+    assert f.step().outcome == CC.DEADLINE                                     # the replay so far: nothing terminal
     cas(served, R.ALLOCATED, R.RENDERING, SESSION_V)
     assert root(served, "REVOKE", session=SESSION_V)["ok"]
     for frm, to in END_CHAIN[:-1]:
         cas(served, frm, to, SESSION_V)
     cas(served, R.CREDENTIAL_PARKED, R.CREDENTIAL_PARKED, SESSION_V, verifier_report_digest=d.digest)
     cas(served, R.CREDENTIAL_PARKED, R.RETAINED, SESSION_V)
-    assert f.step() == CC.DEADLINE
+    assert f.step().outcome == CC.DEADLINE
     assert [r.run for r in store.run_records(d.job.id)] == [0] and acked(served)
     f.close()
 
@@ -159,7 +159,7 @@ def test_a_live_event_reaches_the_follower(store, repo, served):  # noqa: F811
 def test_a_refused_report_fails_the_job_and_acks_with_no_digest(store, repo, served):  # noqa: F811
     d = setup_verifier(store, repo, served, refused="verifier-failed:exit")
     f = d.follower()
-    assert f.step() == CC.DEADLINE
+    assert f.step().outcome == CC.DEADLINE
     job = store.get(d.job.id)
     assert (job.state, job.history[-1].cause) == ("failed", "verifier_refused")
     assert acked(served)
@@ -179,7 +179,7 @@ def test_a_crash_re_delivers_and_converges(store, repo, served, where):  # noqa:
     assert acked(served) is (where == "acked")
     before = store.event_cursor()
     assert before is None or before[1] < served.kept()[-1]["seq"]
-    assert f.step() == CC.DEADLINE
+    assert f.step().outcome == CC.DEADLINE
     assert [r.run for r in store.run_records(d.job.id)] == [0] and acked(served)
     assert store.event_cursor() == (served.events.journal_id, served.kept()[-1]["seq"])
     f.close()
@@ -189,8 +189,8 @@ def test_another_journal_restarts_from_zero_and_converges(store, repo, served): 
     d = setup_verifier(store, repo, served)
     store.set_event_cursor("j-another", served.kept()[-1]["seq"])
     f = d.follower()
-    assert f.step() == "journal-changed" and store.event_cursor() is None
-    assert f.step() == CC.DEADLINE
+    assert f.step().outcome == "journal-changed" and store.event_cursor() is None
+    assert f.step().outcome == CC.DEADLINE
     assert [r.run for r in store.run_records(d.job.id)] == [0] and acked(served)
     f.close()
 
@@ -199,21 +199,25 @@ def test_a_reset_restarts_from_zero_and_converges(store, repo, served):  # noqa:
     d = setup_verifier(store, repo, served)
     store.set_event_cursor(served.events.journal_id, served.kept()[-1]["seq"] + 50)
     f = d.follower()
-    assert f.step() == "reset" and store.event_cursor() is None
-    assert f.step() == CC.DEADLINE
+    assert f.step().outcome == "reset" and store.event_cursor() is None
+    assert f.step().outcome == CC.DEADLINE
     assert [r.run for r in store.run_records(d.job.id)] == [0] and acked(served)
     f.close()
 
 
-def test_a_gap_is_logged_and_the_follower_continues(store, repo, served, caplog):  # noqa: F811
+def test_a_gap_is_returned_counted_and_the_follower_continues(store, repo, served, caplog):  # noqa: F811
+    """RULINGS_OBS 8: the step returns the gap it read and how many events it skipped unread, beside the log line."""
     d = Dispatch(store, repo, served)
     first = served.kept("pool")
+    assert served.kept() == first                                      # every event so far is one the prune drops
     served.clock.t += EV.POOL_KEEP_S + 10
     sync_free(served.control, egress=5)
     assert served.events.prune() == len(first)
     f = d.follower()
     with caplog.at_level(logging.WARNING, logger="levain.dispatch.follow"):
-        assert f.step() == CC.DEADLINE
+        out = f.step()
+    assert out.outcome == CC.DEADLINE
+    assert [g.oldest_seq for g in out.gaps] == [first[-1]["seq"] + 1] and out.lost == len(first)
     assert any("pruned unread" in r.getMessage() for r in caplog.records)
     assert store.event_cursor() == (served.events.journal_id, served.kept()[-1]["seq"])
     f.close()
@@ -228,7 +232,7 @@ def test_an_artifact_event_is_passed_and_never_acked(store, repo, served):  # no
     to_retained(served)
     cas(served, R.RETAINED, R.RETAINED, SESSION, artifact_digest="sha256:" + "a" * 64)
     f = d.follower()
-    assert f.step() == CC.DEADLINE
+    assert f.step().outcome == CC.DEADLINE
     assert "artifact_acked" not in served.control.store.get(SESSION).fields
     assert store.event_cursor()[1] == served.kept()[-1]["seq"] and served.kept()[-1]["kind"] == "artifact"
     assert d.resolved == []
@@ -271,7 +275,7 @@ def test_a_job_failed_elsewhere_is_passed_unacked_and_the_cursor_moves(store, re
     store.record_verification(run1, envelope=None, event=other, repo=str(repo[0]), tree=base_tree(repo),
                               model=model(1))
     f = d.follower()
-    assert f.step() == CC.DEADLINE
+    assert f.step().outcome == CC.DEADLINE
     assert store.get(d.job.id).history[-1].evidence == "verifier-failed:exit"
     assert not acked(served)
     assert store.event_cursor() == (served.events.journal_id, served.kept()[-1]["seq"])
@@ -323,7 +327,7 @@ def test_close_ends_a_step_blocked_on_its_stream_and_a_closed_follower_opens_non
     t = threading.Timer(0.5, f.close)
     t.start()
     began = time.monotonic()
-    assert f.step() == CC.CANCELLED
+    assert f.step().outcome == CC.CANCELLED
     assert time.monotonic() - began < 5.0
     t.join()
-    assert f.step() == CC.CANCELLED                                    # closed: no stream is opened after close
+    assert f.step().outcome == CC.CANCELLED                                    # closed: no stream is opened after close
