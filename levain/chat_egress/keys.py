@@ -395,13 +395,16 @@ def upload_pack_prefix(parsed: Any) -> str | None:
 
 
 def decide_key(route: RouteSnapshot | None, parsed: Any, *, liveness: Liveness,
-               store: LaunchCredentials | CredentialStore) -> KeyDecision:
+               credentials: LaunchCredentials) -> KeyDecision:
     """R-6 for one request, given the request's ONE lookup result `route` (R15-18-L1). The first value that applies
     (R15-28-3): no audit value -> `not-evaluated` (no liveness read); an unkeyed host -> `none`; then ONE liveness read
     of the route's record AND incarnation: no answer -> `liveness-unreadable`, not live (or another incarnation) ->
     `revoked`; then off (https, 443), a route that never attaches, or an upload-pack exchange for an undeclared prefix
-    -> `none`; else the value is read and `attached`. The launch passes its :class:`LaunchCredentials` (one keychain
-    read per record incarnation); a bare :class:`CredentialStore` is read on every attached request."""
+    -> `none`; else the value is read and `attached`. `credentials` is the launch's :class:`LaunchCredentials` (one
+    keychain read per record incarnation); anything else, a bare :class:`CredentialStore` included, is a TypeError at
+    the call, before any read."""
+    if not isinstance(credentials, LaunchCredentials):
+        raise TypeError(f"decide_key takes the launch's LaunchCredentials, not {type(credentials).__name__}")
     if parsed.request_id is None:
         return KeyDecision(None, NOT_EVALUATED)
     if route is None:
@@ -420,12 +423,7 @@ def decide_key(route: RouteSnapshot | None, parsed: Any, *, liveness: Liveness,
     if prefix is not None and prefix not in route.declared_repos:
         return KeyDecision(route, NONE)
     try:
-        if isinstance(store, LaunchCredentials):
-            value = store.read(route)
-        elif route.credential_account is None:
-            raise CredentialUnreadable("the route names no keychain account")
-        else:
-            value = store.read(route.credential_source, route.credential_account)
+        value = credentials.read(route)
     except Exception:                        # noqa: BLE001: no value is no key, whatever the store raised
         return KeyDecision(route, NONE, problem="credential-unreadable")
     if not isinstance(value, str) or not wire._CREDENTIAL.fullmatch(value):

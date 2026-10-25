@@ -3107,7 +3107,7 @@ def _confirm_setup(preview: object, yes: bool) -> bool:
     else:
         print(f"  workspace {visible(str(preview.workspace))}: remotes read once, now")  # type: ignore[attr-defined]
         for ex in preview.excluded:  # type: ignore[attr-defined]
-            print(f"    left out: {visible(ex.url)} ({ex.why})")
+            print(f"    left out: {visible(ex.url)} ({visible(ex.why)})")
     if yes:
         return True
     if not sys.stdin.isatty():

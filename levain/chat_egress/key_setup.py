@@ -50,7 +50,8 @@ class SetupDeclined(SetupRefused):
 
 @dataclass(frozen=True)
 class Excluded:
-    """A workspace remote on the setup's host that declares no repo, and why."""
+    """A workspace remote on the setup's host that declares no repo, and why. `url` carries no userinfo (a token in
+    a remote is never shown); both fields are sandbox-written text, shown only through `visible`."""
     url: str
     why: str
 
@@ -124,6 +125,22 @@ def _on_host(url: str, host: str) -> bool:
         return False
 
 
+def _without_userinfo(url: str) -> str:
+    """An on-host remote as the preview shows it: its userinfo (`user:token@`, scp-like `token@`) replaced by `***@`,
+    so a token a remote carries is never echoed; the host onward is kept as the same parse that put it on the host
+    read it."""
+    if "://" in url:
+        m = _ANY_URL.fullmatch(url)
+        prefix_end = m.end("scheme") + 3 if m else 0
+    else:
+        m = _SCP_LIKE.match(url)
+        prefix_end = 0
+    if m is None:
+        return "(a remote that does not parse)"
+    start = m.start("host")
+    return url if start == prefix_end else url[:prefix_end] + "***@" + url[start:]
+
+
 def _why_excluded(url: str) -> str:
     """Why a remote on the host declares no repo (`keys._remote_repo` made the decision; this only names it)."""
     m = _ANY_URL.fullmatch(url)
@@ -156,7 +173,7 @@ def _read_workspace(workspace: Path | str, host: str) -> tuple[tuple[str, ...], 
         if repo is not None:
             declared.add(repo)
         elif _on_host(url, host):
-            excluded.append(Excluded(url, _why_excluded(url)))
+            excluded.append(Excluded(_without_userinfo(url), _why_excluded(url)))
     return tuple(sorted(declared)), tuple(excluded)
 
 
@@ -235,11 +252,14 @@ def setup_key(data_root: Path | str, *, entity: str, host: str, source: str, acc
                                    "was built: run it again")
             if not confirm(preview):
                 raise SetupDeclined("not confirmed: nothing was signed")
-            if expires_at <= _now(clock):
-                raise SetupRefused(f"expires {utc_stamp(expires_at)} passed while the record was being confirmed")
             signature = sign(link.message)
-            new = append(conn, link, signature, now=_now(clock), ssh_keygen=ssh_keygen,
-                         anchor=anchor_path(db.data_root))
+            # the confirm and the sign (a touch, a passphrase) can each wait on a person: the expiry is judged at the
+            # `now` the append runs with, after both
+            at = _now(clock)
+            if expires_at <= at:
+                raise SetupRefused(f"expires {utc_stamp(expires_at)} passed while the record was being confirmed "
+                                   "and signed: nothing was appended")
+            new = append(conn, link, signature, now=at, ssh_keygen=ssh_keygen, anchor=anchor_path(db.data_root))
     except VerifierUnavailable:
         raise
     except AuthorityError as exc:

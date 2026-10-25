@@ -63,9 +63,14 @@ def _set(*routes):
     return keys.RouteSet.of(routes)
 
 
+def _creds(store=None):
+    """The launch's credentials over `store` (a FakeStore by default); a LaunchCredentials passes through."""
+    return store if isinstance(store, keys.LaunchCredentials) else keys.LaunchCredentials(store or FakeStore())
+
+
 def _decide(route, f, *, live=None, store=None):
     live = live if live is not None else Live([route.record_id] if route else [])
-    return keys.decide_key(route, parse(f), liveness=live, store=store or FakeStore())
+    return keys.decide_key(route, parse(f), liveness=live, credentials=_creds(store))
 
 
 def _verdict(d, f):
@@ -125,8 +130,6 @@ def test_a_route_built_without_account_or_incarnation_attaches_nothing():
     store = FakeStore()
     d = _decide(bare, frame(path="/x"), store=store)
     assert d.keyed and d.credential is None and d.problem == "credential-unreadable" and store.reads == []
-    d = _decide(bare, frame(path="/x"), store=keys.LaunchCredentials(store))
-    assert d.credential is None and store.reads == []
 
 
 def test_lookup_is_by_canonical_host_and_unknown_is_none():
@@ -294,6 +297,19 @@ def test_launch_credentials_hold_no_failed_or_unusable_read():
     assert bad.reads == [SOURCE, SOURCE]
 
 
+def test_h2_decide_key_takes_only_the_launchs_credentials():
+    """S6 r2 H2: a bare store (a keychain spawn per attached request) is refused at the call, before any read; there
+    is no raw-store path left to fall into."""
+    store = FakeStore()
+    for p in (parse(frame(path="/x")), parse(frame(path="/x", audit=False))):
+        with pytest.raises(TypeError, match="LaunchCredentials"):
+            keys.decide_key(_route(), p, liveness=Live([_route().record_id]), credentials=store)
+    assert store.reads == []
+    d = keys.decide_key(_route(), parse(frame(path="/x")), liveness=Live([_route().record_id]),
+                        credentials=keys.LaunchCredentials(store))
+    assert d.attach == "attached" and store.reads == [SOURCE]
+
+
 def test_f8_a_held_value_is_zero_bytes_after_a_revoke(tmp_path):
     ck = Cockpit(tmp_path)
     rec = _create(ck, "ek-000000000001")
@@ -362,7 +378,7 @@ def test_r15_24_1_an_error_attaches_nothing_and_stays_keyed(tmp_path):
 
     live = keys.AuthorityLiveness(broken, clock=lambda: datetime.now(timezone.utc), timeout_s=2.0)
     d = keys.decide_key(keys.lookup(s, "example.com"), parse(frame(path=INFO_REFS, query=SVC)), liveness=live,
-                        store=FakeStore())
+                        credentials=_creds())
     assert (d.attach, d.credential, d.keyed) == ("liveness-unreadable", None, True)
     assert reads == [1]                                             # one store read, no retry
 
@@ -379,7 +395,7 @@ def test_r15_24_1_a_timeout_attaches_nothing_within_its_bound():
     live = keys.AuthorityLiveness(hung, clock=lambda: datetime.now(timezone.utc), timeout_s=0.3)
     t0 = time.monotonic()
     try:
-        d = keys.decide_key(_route(), parse(frame(path=INFO_REFS, query=SVC)), liveness=live, store=FakeStore())
+        d = keys.decide_key(_route(), parse(frame(path=INFO_REFS, query=SVC)), liveness=live, credentials=_creds())
     finally:
         gate.set()
     assert time.monotonic() - t0 < 2.0
@@ -502,7 +518,7 @@ def launched(tmp_path):
 def _real(s, live, f, store=None):
     p = parse(f)
     route = keys.lookup(s, p.canonical_host)
-    return keys.decide_key(route, p, liveness=live, store=store or FakeStore())
+    return keys.decide_key(route, p, liveness=live, credentials=_creds(store))
 
 
 def test_r15_21_6_the_records_canonical_host_keys_example_com_on_https_443(launched):
@@ -614,7 +630,7 @@ def test_r15_18_l1_one_lookup_per_request_and_a_record_made_live_between_r5_and_
     route = keys.lookup(s, p.canonical_host)
     stripped = strip.strip(p)                                                      # R-5
     _create(ck, "ek-000000000002", "git.example.org")                              # the seam
-    d = keys.decide_key(route, p, liveness=live, store=FakeStore())                   # R-6
+    d = keys.decide_key(route, p, liveness=live, credentials=_creds())                # R-6
     assert calls == ["git.example.org"]
     assert (d.keyed, d.attach, d.credential) == (False, "none", None)
     assert "authorization" in stripped.stripped
@@ -664,7 +680,7 @@ def test_k8_a_record_with_no_repos_keys_the_host_and_attaches_on_no_upload_pack_
     store = FakeStore()
     live = Live([rec["id"]])
     for f in (frame(path=INFO_REFS, query=SVC), frame(method="POST", path="/o/r.git/git-upload-pack")):
-        d = keys.decide_key(keys.lookup(s, "example.com"), parse(f), liveness=live, store=store)
+        d = keys.decide_key(keys.lookup(s, "example.com"), parse(f), liveness=live, credentials=_creds(store))
         assert (d.keyed, d.attach, d.credential) == (True, "none", None)
     assert store.reads == []
 

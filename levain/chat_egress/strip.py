@@ -5,7 +5,7 @@ R-5 runs on EVERY request, read or write, silent or carded, under `open network`
            (the allow's `removeHeaders`, matched by srt's fold, so one folded name removes every spelling and every
            duplicate). The listed names always go in the removal, present or not; what is RECORDED (`stripped`) is
            only the names the request carried, never a value. A removal past srt's limit (`wire.MAX_REMOVE_NAMES`)
-           is a DENY (`StripResult.deny`), never a truncated list.
+           is a DENY: `strip` raises :class:`TooManyCredentialHeaders`, so no StripResult (no allow) exists for it.
   query    never rewritten (srt's decider protocol cannot rewrite a target, R15-10-A2): a listed or backstop-matched
            query NAME marks the request `credential_in_query`. This module says which names are credential names;
            the exemptions (the signed-URL read exemption, the Azure SAS read shape, the duplicate-name void, keyed
@@ -34,7 +34,8 @@ from levain.chat_egress import wire
 
 __all__ = ["AZURE_SAS_READ_SHAPE", "AZURE_STORAGE_HOST_SUFFIXES", "BACKSTOP", "BACKSTOP_WORDS", "CRED_STRIP_HEADERS",
            "CRED_STRIP_QUERY", "CRED_STRIP_VERSION", "DENY_TOO_MANY_CREDENTIAL_HEADERS", "PAGINATION_NOT_CREDENTIALS", "PINNED_POLICY_SHA256",
-           "QUERY_BACKSTOP_EXACT", "SIGNED_URL_READ_EXEMPT", "StripResult", "credential_query_names", "fold",
+           "QUERY_BACKSTOP_EXACT", "SIGNED_URL_READ_EXEMPT", "StripResult", "TooManyCredentialHeaders",
+           "credential_query_names", "fold",
            "header_is_credential", "query_name_is_credential", "query_name_is_listed", "strip", "strip_policy",
            "strip_policy_digest"]
 
@@ -111,21 +112,32 @@ class StripResult:
                     request carried, folded, each once (the wrapper adds its own plumbing after, item 2 step 5)
     stripped        the folded names the request CARRIED that are removed, first-seen order: the record's and the
                     card's names (never a value; never an `x-levain-` name, R15-24-2)
-    deny            None, or :data:`DENY_TOO_MANY_CREDENTIAL_HEADERS` when the removal would exceed srt's
-                    `wire.MAX_REMOVE_NAMES`: the request is DENIED (fail closed; `remove_headers` is then empty and
-                    no allow may be sent), never truncated, since a name left off the list would forward its value"""
+    A StripResult exists only for a request whose removal fits one allow; there is no deny form of it."""
     remove_headers: tuple[str, ...]
     stripped: tuple[str, ...]
-    deny: str | None = None
 
 
 #: the deny reason when a request carries more credential header names than one allow can remove
 DENY_TOO_MANY_CREDENTIAL_HEADERS = "too-many-credential-headers"
 
 
+class TooManyCredentialHeaders(Exception):
+    """The request carries more credential header names than srt's `wire.MAX_REMOVE_NAMES` lets one allow remove:
+    it is DENIED (`wire.deny_frame` with `reason`), never truncated, since a name left off the list would forward its
+    value. Raised, so a composer that does not handle it sends no allow at all (fail closed by construction).
+    `stripped` is the folded names the request carried, for the record (never a value)."""
+
+    reason = DENY_TOO_MANY_CREDENTIAL_HEADERS
+
+    def __init__(self, stripped: tuple[str, ...]) -> None:
+        super().__init__(f"{len(stripped)} credential header names: more than one allow can remove")
+        self.stripped = stripped
+
+
 def strip(parsed) -> StripResult:
     """R-5's header strip for a `parse.ParsedRequest`; the same on plain HTTP and TLS, keyed or not. Over srt's
-    removal limit (the listed names plus the carried ones past `wire.MAX_REMOVE_NAMES`) the result is a DENY."""
+    removal limit (the listed names plus the carried ones past `wire.MAX_REMOVE_NAMES`) it raises
+    :class:`TooManyCredentialHeaders`: the request is denied."""
     present: list[str] = []
     for h in parsed.headers:
         f = h.folded
@@ -136,7 +148,7 @@ def strip(parsed) -> StripResult:
     remove = sorted(_folded(CRED_STRIP_HEADERS))
     remove += [f for f in present if f not in remove]
     if len(remove) > wire.MAX_REMOVE_NAMES:
-        return StripResult(remove_headers=(), stripped=tuple(present), deny=DENY_TOO_MANY_CREDENTIAL_HEADERS)
+        raise TooManyCredentialHeaders(tuple(present))
     return StripResult(remove_headers=tuple(remove), stripped=tuple(present))
 
 

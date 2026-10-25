@@ -74,20 +74,21 @@ def test_the_removal_is_a_valid_allow():
     assert set(f["removeHeaders"]) == set(s.remove_headers)
 
 
-def test_a_removal_past_srts_limit_is_a_deny_never_a_truncation():
-    """179 carried backstop names plus the 12 listed ones are 191 > wire.MAX_REMOVE_NAMES: an explicit DENY (no
-    allow is built, so no WireError reaches the decider) with the carried names still recorded; one fewer fits."""
+def test_h1_an_overflowing_request_can_never_yield_an_allow():
+    """179 carried backstop names plus the 12 listed ones are 191 > wire.MAX_REMOVE_NAMES. S6 r2 H1: `strip` RAISES
+    (fail closed by construction): no StripResult exists for the request, so no composer can build an allow from one;
+    the exception carries the deny reason and the carried names for the record. One fewer fits."""
     n_listed = len(strip.CRED_STRIP_HEADERS)
     over = wire.MAX_REMOVE_NAMES - n_listed + 1
     p = parse(frame(headers={f"x-token-{i}": ["v"] for i in range(over)}))
-    s = strip.strip(p)
-    assert s.deny == strip.DENY_TOO_MANY_CREDENTIAL_HEADERS and s.remove_headers == ()
-    assert len(s.stripped) == over
-    deny = wire.deny_frame(p.srt_id, 403, s.deny)
-    assert deny["action"] == "deny"
+    with pytest.raises(strip.TooManyCredentialHeaders) as caught:
+        strip.strip(p)
+    assert caught.value.reason == strip.DENY_TOO_MANY_CREDENTIAL_HEADERS and len(caught.value.stripped) == over
+    assert not hasattr(strip.StripResult, "deny")             # no field can say "deny" beside an allow's names
+    assert wire.deny_frame(p.srt_id, 403, caught.value.reason)["action"] == "deny"
     fits = parse(frame(headers={f"x-token-{i}": ["v"] for i in range(over - 1)}))
     ok = strip.strip(fits)
-    assert ok.deny is None and len(ok.remove_headers) == wire.MAX_REMOVE_NAMES
+    assert len(ok.remove_headers) == wire.MAX_REMOVE_NAMES
     assert len(wire.allow_frame(fits.srt_id, ok.remove_headers)["removeHeaders"]) == wire.MAX_REMOVE_NAMES
 
 

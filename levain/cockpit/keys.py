@@ -714,6 +714,9 @@ def signing_public_key(key_path: Path) -> str:
     """The normal form (``<type> <base64>``) of the signing key's public half: ``<path>.pub``, or
     ``key_path`` itself when it is the ``.pub``."""
     key_path = Path(key_path).expanduser()
+    # `/` and `.` have no file name to take a `.pub` beside: a refusal, never with_name's ValueError traceback
+    if not key_path.name:
+        raise KeyError_(f"{key_path} names no key file")
     pub = key_path if key_path.suffix == ".pub" else key_path.with_name(key_path.name + ".pub")
     try:
         with pub.open("rb") as fh:

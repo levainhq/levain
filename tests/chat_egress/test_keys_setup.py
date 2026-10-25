@@ -199,6 +199,7 @@ def test_cli_setup_list_revoke(ck, capsys, tmp_path, one_item):
     assert main(["chat", "key", "list", *base]) == 0
     listing = capsys.readouterr().out
     assert new in listing and "live" in listing and rid not in listing
+    assert f"account {ACCOUNT}" in listing                       # S6 r2 H6: the list shows the record's account
     assert main(["chat", "key", "revoke", new, "--signing-key", str(ck.key), *base]) == 0
     assert _live(ck) == []
     assert artifact_hits(tmp_path) == []
@@ -295,9 +296,9 @@ def test_f6_the_preview_names_every_remote_on_the_host_it_left_out(tmp_path):
     declared, excluded = key_setup._read_workspace(ws, "example.com")
     assert declared == ("/o/a.git",)
     why = {e.url: e.why for e in excluded}
-    assert set(why) == {"git@example.com:o/s.git", "http://example.com/o/p.git", "https://example.com:8443/o/q.git",
+    assert set(why) == {"***@example.com:o/s.git", "http://example.com/o/p.git", "https://example.com:8443/o/q.git",
                         "https://example.com/", "https://example.com/o/../x.git"}      # not other.example's
-    assert "ssh" in why["git@example.com:o/s.git"] and "http " in why["http://example.com/o/p.git"]
+    assert "ssh" in why["***@example.com:o/s.git"] and "http " in why["http://example.com/o/p.git"]
     assert "8443" in why["https://example.com:8443/o/q.git"] and "no repo path" in why["https://example.com/"]
 
 
@@ -318,7 +319,7 @@ def test_f6_cli_no_on_a_terminal_appends_nothing_and_the_prompt_follows_the_list
                  "--data-root", str(ck.root)]) == 1
     (prompt, shown, seq_at_prompt), = asked
     assert "[y/N]" in prompt and seq_at_prompt == seq_before
-    assert "/o/a.git" in shown and "left out: git@example.com:o/s.git" in shown and ACCOUNT in shown
+    assert "/o/a.git" in shown and "left out: ***@example.com:o/s.git" in shown and ACCOUNT in shown
     assert "nothing was signed" in capsys.readouterr().err
     assert ck.state().seq == seq_before and _setup_records(ck) == []
 
@@ -364,6 +365,50 @@ def test_f6_a_remote_cannot_draw_a_line_of_its_own_in_the_preview(capsys):
     assert _confirm_setup(preview, yes=True) is True
     out = capsys.readouterr().out
     assert "\n    /o/fake.git" not in out and "⟨U+000A⟩" in out
+
+
+def test_h3_a_remote_shows_no_control_byte_and_no_userinfo_token(capsys, monkeypatch):
+    """S6 r2 H3: a sandbox-written remote reaches the confirm display. A port carrying terminal controls is shown
+    marked (it cannot clear or rewrite the screen above the prompt), and a remote carrying a userinfo token (https
+    `user:token@`, scp-like `token@`) is shown without it: the token is in no excluded field and in no output."""
+    from levain.cli import _confirm_setup
+
+    token = "ghp_" + "Z9" * 18
+    urls = ("https://example.com:4\x1b[2J\x1b[H43/o/q.git", f"https://user:{token}@example.com:8443/o/r.git",
+            f"{token}@example.com:o/s.git")
+    monkeypatch.setattr(key_setup, "workspace_remote_urls", lambda ws: urls)
+    declared, excluded = key_setup._read_workspace(Path("/w"), "example.com")
+    assert declared == () and len(excluded) == 3
+    assert all(token not in e.url and token not in e.why for e in excluded)
+    rec = {"id": "ek-000000000001", "entity": "ent", "host": "example.com", "source": SOURCE, "account": ACCOUNT,
+           "placement": {"scheme": "bearer"}, "repos": [], "expires_at": "2026-11-01T00:00:00Z"}
+    assert _confirm_setup(key_setup.SetupPreview(rec, Path("/w"), (), excluded, ()), yes=True) is True
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "⟨U+001B⟩" in out and token not in out
+    assert "example.com:8443/o/r.git" in out and "example.com:o/s.git" in out
+
+
+def test_h4_an_expiry_that_passes_while_signing_appends_nothing(ck):
+    """S6 r2 H4: `sign` can block (a touch, a passphrase) past the record's expiry; the expiry is checked again
+    immediately before the append, at the `now` the append runs with."""
+    t = [datetime.now(timezone.utc)]
+    expires = t[0] + timedelta(minutes=5)
+
+    def slow_sign(message):
+        t[0] = expires + timedelta(seconds=1)
+        return ck.sign(message)
+
+    seq_before = ck.state().seq
+    with pytest.raises(key_setup.SetupRefused, match="passed"):
+        _setup(ck, expires=expires, clock=lambda: t[0], sign=slow_sign)
+    assert ck.state().seq == seq_before
+
+
+@pytest.mark.parametrize("key", ["/", "."])
+def test_h5_a_signing_key_path_with_no_file_name_is_a_refusal(ck, capsys, key):
+    """S6 r2 H5: `--signing-key /` reached `Path('/').with_name(...)`, a ValueError traceback."""
+    assert main(["chat", "key", "revoke", "ek-000000000001", "--signing-key", key, "--data-root", str(ck.root)]) == 1
+    assert "revoke refused" in capsys.readouterr().err
 
 
 # --- F5: the keychain item is service AND account, and exactly one item --------------------------------------------
