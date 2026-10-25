@@ -252,13 +252,17 @@ def setup_key(data_root: Path | str, *, entity: str, host: str, source: str, acc
                                    "was built: run it again")
             if not confirm(preview):
                 raise SetupDeclined("not confirmed: nothing was signed")
+            # the confirm and the sign (a touch, a passphrase) can each wait on a person. After the confirm, a record
+            # already expired never prompts the signer; after the sign, the expiry is judged again at the `now` the
+            # append runs with
+            if expires_at <= _now(clock):
+                raise SetupRefused(f"expires {utc_stamp(expires_at)} passed while the record was being confirmed: "
+                                   "nothing was signed")
             signature = sign(link.message)
-            # the confirm and the sign (a touch, a passphrase) can each wait on a person: the expiry is judged at the
-            # `now` the append runs with, after both
             at = _now(clock)
             if expires_at <= at:
-                raise SetupRefused(f"expires {utc_stamp(expires_at)} passed while the record was being confirmed "
-                                   "and signed: nothing was appended")
+                raise SetupRefused(f"expires {utc_stamp(expires_at)} passed while the record was being signed: "
+                                   "nothing was appended")
             new = append(conn, link, signature, now=at, ssh_keygen=ssh_keygen, anchor=anchor_path(db.data_root))
     except VerifierUnavailable:
         raise

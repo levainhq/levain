@@ -399,7 +399,7 @@ def test_h4_an_expiry_that_passes_while_signing_appends_nothing(ck):
         return ck.sign(message)
 
     seq_before = ck.state().seq
-    with pytest.raises(key_setup.SetupRefused, match="passed"):
+    with pytest.raises(key_setup.SetupRefused, match="passed while the record was being signed"):
         _setup(ck, expires=expires, clock=lambda: t[0], sign=slow_sign)
     assert ck.state().seq == seq_before
 
@@ -495,3 +495,25 @@ def test_f9_a_replace_with_a_past_expiry_does_not_drop_the_live_record(ck):
     with pytest.raises(key_setup.SetupRefused, match="not after now"):
         _setup(ck, replace=True, expires=datetime.now(timezone.utc) - timedelta(hours=1))
     assert _live(ck) == [old["id"]]
+
+
+def test_an_expiry_that_passes_while_confirming_never_prompts_the_signer(ck):
+    """S6 codex LOW (r3): the confirm can wait on a person past the record's expiry; the expiry is checked after the
+    confirm and BEFORE sign, so the signer is never asked (no touch, no passphrase) for a record that is already
+    dead. The post-sign check before the append stays (H4)."""
+    t = [datetime.now(timezone.utc)]
+    expires = t[0] + timedelta(minutes=5)
+    signed = []
+
+    def slow_confirm(preview):
+        t[0] = expires + timedelta(seconds=1)
+        return True
+
+    def sign(message):
+        signed.append(message)
+        return ck.sign(message)
+
+    seq_before = ck.state().seq
+    with pytest.raises(key_setup.SetupRefused, match="passed while the record was being confirmed"):
+        _setup(ck, expires=expires, clock=lambda: t[0], confirm=slow_confirm, sign=sign)
+    assert signed == [] and ck.state().seq == seq_before
