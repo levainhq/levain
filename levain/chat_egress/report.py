@@ -12,8 +12,8 @@ What it counts, and the row that asks for it:
   * per-reason counters and the bounded host map from that summary (R15-28-1, R15-30-2).
   * `duplicate_rows` (R15-28-5, R15-29-3): K1 only.
   * the decider's `credential_in_query` walls and cards (R15-17-10), the signed-URL set names on
-    an attempt (a read the signed-URL exemption lifted stores the exempt parameter NAMES, never a value; Azure
-    SAS's `sig` exemption stores none, so it is not countable from the rows) and the names the backstop alone matched (the `backstop` flag of
+    an attempt (a read an exemption lifted stores the lifted parameter NAMES, never a value: the signed-URL set under
+    `signed_url_names`, Azure SAS's `sig` under `azure_sas_names`) and the names the backstop alone matched (the `backstop` flag of
     `shape.segment_token`), the cap walls and cards (R15-19-3) and the path walls (R15-10-A17), from the attempt
     rows' `deciding_step` and `names`.
 """
@@ -35,6 +35,7 @@ _BUSY_STEP = "decider_busy"
 _UPLOAD_PACK_CAP_CARD = "upload_pack_over_cap"   # decider.UPLOAD_PACK_OVER_CAP: the card reason of an over-cap pack body
 
 _SIGNED = strip.SIGNED_URL_READ_EXEMPT           # folded names, the form the rows store
+_AZURE_SIG = "sig"                               # the Azure SAS read exemption's lifted name; a marked `sig` is stored as a token
 _MALFORMED_CARD = "malformed_card_step"
 _CRED_WALL = "wall:credential_in_query"
 _PATH_WALL = "wall:path"
@@ -68,6 +69,7 @@ class LaunchReport:
     path_walls: int
     cards: dict[str, int]
     signed_url_names: dict[str, int]
+    azure_sas_names: int
     backstop_names: int
     attempts: int
     audit_missing: int
@@ -93,6 +95,7 @@ class LaunchReport:
         out.append("cards: " + (", ".join(f"{k}={v}" for k, v in sorted(self.cards.items())) or "none"))
         out.append("signed-URL names marked: "
                    + (", ".join(f"{k}={v}" for k, v in sorted(self.signed_url_names.items())) or "none"))
+        out.append(f"Azure SAS sig names marked: {self.azure_sas_names}")
         out.append(f"backstop-only names: {self.backstop_names}")
         out.append(f"audit-missing denies: {self.audit_missing}")
         out.append(f"duplicate_rows: {self.duplicate_rows}")
@@ -153,7 +156,7 @@ def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows
     dwalls: Counter[str] = Counter()
     cards: Counter[str] = Counter()
     sig_names: Counter[str] = Counter()
-    cred_walls = cred_cards = cap = cap_cards = path = backstop = attempts = missing = 0
+    cred_walls = cred_cards = cap = cap_cards = path = backstop = azure = attempts = missing = 0
     for r in rows:
         if r.kind != "egress_attempt":
             continue
@@ -187,6 +190,8 @@ def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows
         for n in _names(r):
             if n in signed:
                 sig_names[n] += 1
+            elif n == _AZURE_SIG:
+                azure += 1
             if n.endswith(_BACKSTOP_FLAG):
                 backstop += 1
     return LaunchReport(
@@ -194,7 +199,7 @@ def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows
         hosts=dict(summary.hosts) if summary else {}, host_overflow=summary.overflow if summary else 0,
         duplicate_rows=duplicate_rows, verdicts=dict(verdicts), decider_walls=dict(dwalls),
         credential_in_query_walls=cred_walls, credential_in_query_cards=cred_cards, cap_walls=cap, cap_cards=cap_cards, path_walls=path,
-        cards=dict(cards), signed_url_names=dict(sig_names), backstop_names=backstop, attempts=attempts,
+        cards=dict(cards), signed_url_names=dict(sig_names), azure_sas_names=azure, backstop_names=backstop, attempts=attempts,
         audit_missing=missing, unreadable_event_lines=unreadable)
 
 

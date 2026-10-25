@@ -895,9 +895,12 @@ class Decider:
             rec.Attach.NOT_EVALUATED if r.rid is None else rec.Attach.NONE)
         marked = tuple(q for q in p.params if r.verdict is not None and q.folded in r.verdict.query_names)
         names = list(r.strip.stripped if r.strip is not None else ()) + list(shape.query_name_shapes(marked))
-        if r.verdict is not None and r.verdict.exemption == "signed_url":
-            # the exemption lifted the mark, so no name was marked: keep the exempted NAMES (never a value) so K1 can count them
-            names += [q.folded for q in p.params if q.folded in classify._SIGNED_URL_READ_EXEMPT]
+        if r.verdict is not None and r.verdict.exemption is not None:
+            # an exemption lifted the mark, so no name was marked: keep the lifted NAMES (never a value) so K1 can count
+            # them. One rule for the signed-URL set, Azure SAS's `sig`, and both together.
+            azure = r.verdict.exemption == "azure_sas"
+            names += [q.folded for q in p.params
+                      if q.folded in classify._SIGNED_URL_READ_EXEMPT or (azure and q.folded == "sig")]
         return rec.Attempt(
             host=p.canonical_host or wire.escape_text(p.host, wire.HOST_LIMIT),
             method=r.verdict.method if r.verdict is not None else p.method,

@@ -7,6 +7,7 @@ the REAL glue and srt in `test_decider_glue.py`.
 
 from __future__ import annotations
 
+import json
 import socket
 import threading
 import time
@@ -792,3 +793,23 @@ def test_r2_d3_a_verdict_kind_outside_silent_card_wall_is_denied(rig, monkeypatc
     v = r.srt.wait(p, 2 if where == "form" else 1)
     assert (v[-1]["action"], v[-1]["status"], v[-1]["reason"]) == ("deny", 403, "wall: verdict_kind")
     assert r.desk.filed == [] and r.rows(rid)[0].deciding_step == "wall:verdict_kind"
+
+
+# --- S9 r2 item A: a lifted read stores the NAMES the exemption lifted (never a value) ---------------------------
+
+_AZ = "sig=AZV1&sv=2022-11-02&se=2030-01-01&sp=r"
+
+
+@pytest.mark.parametrize("host,query,expect", [
+    ("acct.blob.core.windows.net", _AZ, ["sig"]),
+    ("acct.blob.core.windows.net", _AZ + "&X-Amz-Signature=SV9", ["sig", "x-amz-signature"]),
+    ("ok.test", "X-Amz-Signature=SV9&X-Amz-Credential=SV8", ["x-amz-signature", "x-amz-credential"]),
+])
+def test_a_lifted_read_stores_the_lifted_names_and_no_value(rig, host, query, expect) -> None:
+    r = rig()
+    g, rid = r.srt.req("GET", host=host, path="/c/b", query=query)
+    assert action(r.srt.wait(g)) == "allow"
+    row = [x for x in r.rows(rid) if x.kind == "egress_attempt"][0]
+    stored = json.loads(row.names)
+    assert [n for n in stored if n in ("sig", "x-amz-signature", "x-amz-credential")] == expect
+    assert "SV9" not in row.names and "AZV1" not in row.names and "SV8" not in row.names
