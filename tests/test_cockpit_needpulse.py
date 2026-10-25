@@ -39,13 +39,13 @@ def test_the_pulse_runs_unless_the_phone_asks_for_reduced_motion(tmp_path, monke
 
 @needs_browser
 def test_the_delay_is_the_time_already_played_so_a_repaint_does_not_restart_the_breath(tmp_path, monkeypatch):
-    from tests.test_cockpit_k7_build import _sessions_fixture
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_needy(), "agents")}, {"motion": "no-preference"}, {"eval": DELAY}])
-    delays = [float(d.rstrip("s")) for d in json.loads(out[-1])]
-    period = float(re.search(r"tv-needpulse\s+([\d.]+)s", (WEB / "dashboard.css").read_text()).group(1))
-    cycles = int(re.search(r"tv-needpulse [\d.]+s ease-in-out (\d+)", (WEB / "dashboard.css").read_text()).group(1))
-    assert len(delays) == 3 and all(-period * cycles < d <= 0 for d in delays), (delays, period, cycles)       # the cycles already played, so a repaint continues the breath and it ends on schedule
+    got = _probe(tmp_path, monkeypatch, [
+        (None, {"eval": CLOCK}), (None, _drawn(_needy())), (None, {"eval": SKEW % 10_000}), (None, _drawn(_needy())), ("d", {"eval": DELAY})])
+    delays = [float(d.rstrip("s")) for d in json.loads(got["d"])]
+    css = (WEB / "dashboard.css").read_text()
+    period = float(re.search(r"tv-needpulse\s+([\d.]+)s", css).group(1))
+    cycles = int(re.search(r"tv-needpulse [\d.]+s ease-in-out (\d+)", css).group(1))
+    assert len(delays) == 3 and all(-period * cycles < d < -9.5 and d > -11 for d in delays), (delays, period, cycles)       # 10 s of the breath already played: a restart-from-zero repaint would read 0
 
 
 @needs_browser
