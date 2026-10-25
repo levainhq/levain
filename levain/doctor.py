@@ -422,8 +422,16 @@ def _check_slot_isolation(*, host: str | None = None, store: Path | None = None,
         host = "darwin" if sys.platform == "darwin" else "linux"
     store = store if store is not None else layout.STORE.get(host)
     try:
-        if store is None or not store.is_dir():
+        if store is None:
             return [CheckResult("agent sessions", True, "not installed", neutral=True)]
+        try:
+            store_mode = os.lstat(store).st_mode      # lstat, not is_dir(): is_dir() follows a link to nothing
+        except FileNotFoundError:
+            return [CheckResult("agent sessions", True, "not installed", neutral=True)]
+        if not stat.S_ISLNK(store_mode) and not stat.S_ISDIR(store_mode):
+            return [CheckResult("agent sessions", False, f"{store} is not a directory; the runtime refuses it, so "
+                                "no session can be started",
+                                "Remove it and let the install helper create the real directory.")]
         for part in (store, store / "slots", store / "policy"):   # the runtime opens each O_NOFOLLOW: a link is not it
             try:
                 is_link = stat.S_ISLNK(os.lstat(part).st_mode)
