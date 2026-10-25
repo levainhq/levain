@@ -93,14 +93,12 @@ class StoreFormatError(RuntimeError):
 
 
 def _marker(conn: sqlite3.Connection) -> str | None:
-    # the store's format marker, None when there is none (no meta table, or no format row); any other error of the
-    # read is raised as it is, never read as "no marker"
-    try:
-        row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
-    except sqlite3.OperationalError as exc:
-        if str(exc) == "no such table: meta":
-            return None
-        raise
+    # the store's format marker, None when there is none (no meta table in the schema, or no format row). Whether
+    # meta exists is asked of sqlite_master, never read from an error's wording; any error of the read itself is
+    # raised as it is, never read as "no marker"
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone() is None:
+        return None
+    row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
     return None if row is None else row[0]
 
 

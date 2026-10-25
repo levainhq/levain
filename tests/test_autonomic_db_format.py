@@ -151,6 +151,40 @@ def test_a_database_with_no_meta_table_is_refused_as_unmarked(tmp_path):
         conn.close()
 
 
+class OtherWording:
+    """A connection whose missing-table errors read as another SQLite build may word them."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def execute(self, sql, *args):
+        try:
+            return self._conn.execute(sql, *args)
+        except sqlite3.OperationalError as exc:
+            if str(exc).startswith("no such table: "):
+                raise sqlite3.OperationalError(str(exc).replace("no such table: ", "no such table: main.")) from None
+            raise
+
+
+def test_a_missing_meta_table_is_found_by_the_schema_not_the_error_text(tmp_path):
+    # deepseek LOW 5: the marker read asks sqlite_master whether meta exists, so the wording of the error is moot
+    path = tmp_path / DB_NAME
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        conn.execute("CREATE TABLE other (x)")
+        conn.execute("BEGIN IMMEDIATE")
+        with pytest.raises(StoreFormatError, match="no store format marker"):
+            migrate_to_v2(OtherWording(conn))
+        with pytest.raises(StoreFormatError, match="no format marker"):
+            dbmod._check_format(OtherWording(conn))
+        conn.execute("ROLLBACK")
+    finally:
+        conn.close()
+
+
 def test_a_ready_object_refuses_the_store_once_another_connection_migrates_it(tmp_path):
     # codex HIGH r1: the marker is checked inside every read and write, not only when the object first opens
     db = v1_store(tmp_path)
