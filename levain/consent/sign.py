@@ -301,23 +301,27 @@ def deep_link(page: str, request_id: str, token: str | None = None, *, choice: s
     opened this run's link needs it; the fragment never reaches the server or its logs). ``choice``, an option key
     (never the write-in's :data:`WRITE_IN_KEY`), is the option the operator already tapped elsewhere, and ``version``
     the request's ``sha256`` (the hex digest of its file's bytes, :attr:`SignRequest.sha256`, or the first 16 hex of
-    it) as filed when he tapped it; the two are given together or not at all. The link carries ``choice=<key>&v=<the
-    first 16 hex>``, and the page offers to sign that option with one tap only while the listed request has that
-    version. It is page state only, never what is signed: the bytes are built from the request file
-    (:func:`signed_bytes`), and a key the card does not offer, or another version, draws nothing but a line."""
+    it) as filed when he tapped it. A choice needs its version; a version alone is the base link an app adds
+    ``&choice=<key>`` to when he taps an option. The link carries ``v=<the first 16 hex>`` and then ``choice=<key>``
+    (the page reads them in any order), and the page offers to sign that option with one tap only while the listed
+    request has that version; ``v=`` alone draws the plain card. It is page state only, never what is signed: the
+    bytes are built from the request file (:func:`signed_bytes`), and a key the card does not offer, or another
+    version, draws nothing but a line."""
     from urllib.parse import quote
 
     if _ID.fullmatch(request_id or "") is None:
         raise ValueError(f"{str(request_id)[:80]!r} is not a sign request id")
-    if (choice is None) != (version is None):
-        raise ValueError("choice and version are given together: a pick holds only on the version it was made on")
+    if choice is not None and version is None:
+        raise ValueError("a choice needs the request's version: a pick holds only on the version it was made on")
     if choice is not None and (not isinstance(choice, str) or _OPTION_KEY.fullmatch(choice) is None):
         raise ValueError(f"{str(choice)[:20]!r} is not an option key ([a-z0-9]{{1,8}})")
     if version is not None and (not isinstance(version, str) or _VERSION.fullmatch(version) is None):
         raise ValueError(f"{str(version)[:80]!r} is not a request's sha256 (64 or its first 16 lower-case hex)")
     parts = ([f"phone_token={quote(token, safe='')}"] if token else []) + [f"sign={request_id}"]
-    if choice is not None and version is not None:
-        parts += [f"choice={choice}", f"v={version[:16]}"]
+    if version is not None:
+        parts.append(f"v={version[:16]}")
+    if choice is not None:
+        parts.append(f"choice={choice}")
     return page.split("#", 1)[0] + "#" + "&".join(parts)
 
 

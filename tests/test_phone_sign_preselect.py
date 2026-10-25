@@ -133,10 +133,12 @@ def _signed(qdir: Path, rid: str) -> "dict | None":
 
 def test_the_deep_link_carries_his_pick_and_its_version_after_the_card_and_only_an_option_key() -> None:
     sha = "0123456789abcdef" + "f" * 48
-    assert deep_link("https://h.ts.net/", RID, "a/b", choice="b", version=sha) == \
-        f"https://h.ts.net/#phone_token=a%2Fb&sign={RID}&choice=b&v=0123456789abcdef"
+    # the version alone is the base link an app adds `&choice=<key>` to; with a choice the link is that base plus it
+    base = deep_link("https://h.ts.net/", RID, "a/b", version=sha)
+    assert base == f"https://h.ts.net/#phone_token=a%2Fb&sign={RID}&v=0123456789abcdef"
+    assert deep_link("https://h.ts.net/", RID, "a/b", choice="b", version=sha) == base + "&choice=b"
     assert deep_link("https://h.ts.net/", RID, choice="b", version=sha[:16]) == \
-        f"https://h.ts.net/#sign={RID}&choice=b&v=0123456789abcdef"
+        f"https://h.ts.net/#sign={RID}&v=0123456789abcdef&choice=b"
     assert deep_link("https://h.ts.net/", RID) == f"https://h.ts.net/#sign={RID}"
     for bad in ("*", "", "B", "toolongkey", "a&sign=x", "a b"):
         with pytest.raises(ValueError):
@@ -144,10 +146,8 @@ def test_the_deep_link_carries_his_pick_and_its_version_after_the_card_and_only_
     for bad_v in ("", "0123", sha.upper(), sha[:17], "stat:" + sha, sha + "&x=1"):
         with pytest.raises(ValueError):
             deep_link("https://h.ts.net/", RID, choice="b", version=bad_v)
-    with pytest.raises(ValueError):                 # a pick holds only on a version: never one without the other
+    with pytest.raises(ValueError):                 # a pick holds only on a version: never a choice without one
         deep_link("https://h.ts.net/", RID, choice="b")
-    with pytest.raises(ValueError):
-        deep_link("https://h.ts.net/", RID, version=sha)
 
 
 # --- the state route -------------------------------------------------------------------------------------------------
@@ -442,3 +442,26 @@ def test_a_signed_request_whose_record_and_file_cannot_be_read_is_gone_which_the
     (port.qdir / "sign" / "np-lost0001-aaaa.signed.json").write_text("not json")
     (port.qdir / "sign" / "np-lost0001-aaaa.json").unlink()
     assert port.get("/sign/np-lost0001-aaaa/state")[1] == {"id": "np-lost0001-aaaa", "state": "gone"}
+
+
+@needs_browser
+def test_the_app_built_link_sign_v_choice_draws_the_shortcut_and_v_alone_draws_no_pick(tmp_path: Path, port: _Port) -> None:
+    """Cross-repo contract (head, 10-25): the ping's link is ``sign=<id>&v=<16 hex>`` and the app appends
+    ``&choice=<key>`` after it, so the page reads the fragment's keys in any order. ``v=`` alone is a plain card: no
+    shortcut, no pick line, no miss line."""
+    _file(port.qdir, RID)
+    base = deep_link(port.url, RID, TOK) + f"&v={_v(port.qdir, RID)}"     # by hand: the page is under test here
+    steps: list[dict] = [PHONE]
+    for n, frag in enumerate((f"sign={RID}&v={_v(port.qdir, RID)}&choice=b", f"sign={RID}&v={_v(port.qdir, RID)}")):
+        if n:
+            steps.append({"eval": f"location.hash = '{frag}', true"})
+        steps += [{"until": "(() => { const c = document.querySelector('.req.sign.linked'); "
+                            "return c && c.querySelector('.req-head') && location.hash === '' && c; })()"},
+                  {"eval": _PICKED}]
+    got = _drive(tmp_path, base + "&choice=b", steps)
+    seen = [v for v in got["values"] if isinstance(v, dict) and "miss" in v]
+    assert len(seen) == 2, got["values"]
+    assert seen[0]["picked"] is not None and seen[0]["picked"]["button"] == "Sign (b) with Face ID", seen
+    assert seen[0]["top"] == "Your pick: (b). Read the item; Sign (b) is below it." and seen[0]["miss"] is None, seen
+    assert seen[1]["picked"] is None and seen[1]["top"] is None and seen[1]["miss"] is None, seen
+    assert seen[1]["options"] == 2 and seen[1]["first"], seen
