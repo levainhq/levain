@@ -23,15 +23,22 @@
   const m = /(?:^#|&)phone_token=([^&]+)/.exec(location.hash);
   if (m) { token = decodeURIComponent(m[1]); store.set("sessionStorage", "levain-phone-token", token); }
   else token = store.get("sessionStorage", "levain-phone-token");
-  // `choice=<key>` beside it is the option he already tapped on his phone (deep_link's choice): page state only. The
-  // linked card offers that option as one "Sign (<key>)" tap, built from the server's listing; the bytes signed are
-  // still the server's, and a key the card does not offer draws nothing but a note
-  const pm = fm ? /(?:^#|&)choice=([^&]*)(?:&|$)/.exec(location.hash) : null;
+  // `choice=<key>` beside it is the option he already tapped on his phone (deep_link's choice), and `v=` the version of
+  // the request he tapped it on (the first 16 hex of the listing's sha256): page state only. The linked card offers
+  // that option as one "Sign (<key>)" tap, built from the server's listing, only while the listed version is the one
+  // he tapped; the bytes signed are still the server's, and anything else draws nothing but a line. A `choice=` with
+  // no `sign=` is never a pick: it is taken out of the address bar and ignored
+  const pm = /(?:^#|&)choice=([^&]*)(?:&|$)/.exec(location.hash);
+  const vm = fm ? /(?:^#|&)v=([0-9a-f]{16})(?:&|$)/.exec(location.hash) : null;
   let pick = "";
-  if (pm) { try { pick = decodeURIComponent(pm[1]); } catch (e) { pick = pm[1]; } }
+  const pickV = vm ? vm[1] : "";
+  if (fm && pm) { try { pick = decodeURIComponent(pm[1]); } catch (e) { pick = pm[1]; } }
   if (m || fm || pm) history.replaceState(null, "", location.pathname);
   // a link opened on a page already showing (a fragment-only navigation does not reload it): read it afresh
-  window.addEventListener("hashchange", () => { if (/(?:^#|&)(?:sign|phone_token|choice)=/.test(location.hash)) location.reload(); });
+  window.addEventListener("hashchange", () => {
+    if (/(?:^#|&)(?:sign|phone_token)=/.test(location.hash)) location.reload();
+    else if (/(?:^#|&)choice=/.test(location.hash)) history.replaceState(null, "", location.pathname);
+  });
 
   const usable = window.isSecureContext === true && typeof window.PublicKeyCredential === "function"
     && !!(navigator.credentials && navigator.credentials.get);
@@ -61,8 +68,8 @@
   let last = "";              // the last answer given here: an answered request leaves the list, its result stays
   let focusDone = false;      // the deep link's card was signed or denied here
   let focusMisses = 0;        // listings the linked card was not in: three, and the link is let go
-  let stateAsked = false;     // a picked link's card was not listed: where it stands was asked (GET /sign/<id>/state)
-  let linkNote = "";          // what that answer said, kept on the status line for this page
+  let stateAsking = false;    // a picked link's card was not listed: where it stands is being asked (GET /sign/<id>/state)
+  let linkNote = "";          // what a terminal answer to that said, kept on the status line for this page
   const notes = new Map();    // request id -> [text, kind], kept across redraws
   const writeIns = new Map(); // sign request id -> {sha256, words}: the write-in being typed, kept across redraws
                               // for the version it was typed on only
@@ -107,29 +114,31 @@
     // said once: after the linked card is signed or denied here the link goes without a note; otherwise it is let go
     // after three listings without it (a passing sign-side fault gets two more). A link opened mid-ceremony reloads
     // the page and the result shows on the reload
-    if (linked.length) focusMisses = 0;                                    // consecutive listings without it
+    if (linked.length) { focusMisses = 0; stateAsking = false; }           // consecutive listings without it
+    // a picked link (his own tap elsewhere) whose card is not listed: where it stands is asked on each such listing,
+    // before the rule below can let the link go (never while the sign side reports a fault). Only a terminal answer
+    // (signed, denied, expired) is said, and it lets the link go at once; open, gone or a failed ask leaves the rule
+    // below to run, and the next listing asks again
+    if (focus && pick && !linked.length && !busy && !focusDone && !stateAsking && !data.sign_note) {
+      stateAsking = true;
+      const id = focus;
+      call("GET", "/sign/" + encodeURIComponent(id) + "/state").then((s) => {
+        stateAsking = false;
+        const st = s.ok && s.body ? s.body.state : "";
+        const said = st === "signed" ? "is already signed here" + (typeof s.body.choice === "string" ? " (" + s.body.choice + ")" : "")
+          : st === "denied" ? "was denied here"
+          : st === "expired" ? "expired: a fresh link comes with its next filing" : "";
+        if (!said || linkNote) return;
+        linkNote = " \u00b7 the linked sign request " + id + " " + said;
+        $("status").textContent += linkNote;
+        if (focus === id) { focus = ""; pick = ""; }
+        setTimeout(load, 0);
+      });
+    }
     if (focus && !linked.length && !busy && (focusDone || ++focusMisses >= 3)) {
       if (!focusDone && !data.sign_note)
         $("status").textContent += " \u00b7 the linked sign request " + focus + " is not open here (signed, denied, expired or not filed)";
-      focus = "";
-    }
-    // a picked link (his own tap elsewhere) whose card is not listed: where it stands is said on this first listing,
-    // not after three. One still open but not listed (past the listing's cap, a passing fault) keeps the rule above
-    if (focus && pick && !linked.length && !busy && !focusDone && !stateAsked) {
-      stateAsked = true;
-      const id = focus;
-      call("GET", "/sign/" + encodeURIComponent(id) + "/state").then((s) => {
-        if (!s.ok || focus !== id || !s.body) return;
-        const st = s.body.state;
-        const said = st === "signed" ? "is already signed here" + (typeof s.body.choice === "string" ? " (" + s.body.choice + ")" : "")
-          : st === "denied" ? "was denied here"
-          : st === "expired" ? "expired: a fresh link comes with its next filing"
-          : st === "gone" ? "was replaced or withdrawn" : "";
-        if (!said) return;
-        linkNote = " \u00b7 the linked sign request " + id + " " + said;
-        $("status").textContent += linkNote;
-        focus = ""; pick = "";
-      });
+      focus = ""; pick = "";
     }
     // to the card's head: he reads the whole item before the button
     if (linked.length && !draw.scrolled) {
@@ -504,11 +513,17 @@
         if (freeze) freeze.release();
         signWith(r, signers, say, show, actions, choice);
       };
-      // his pick from the link (linked card only): one button that signs that option, the exact line it appends under
-      // it (the listing's, then the challenge's own), drawn under the message so the item is read before the tap. The
-      // tap is the gesture: Face ID is never started on load. Every option below still signs on its own tap
-      const po = linked && pick && /^[a-z0-9]{1,8}$/.test(pick) ? options.find((o) => o.key === pick) : null;
+      // his pick from the link, on the card the link names only: one button that signs that option, the exact line it
+      // appends under it (the listing's, then the challenge's own), drawn under the message so the item is read before
+      // the tap, and one line at the card's top saying so. The tap is the gesture: Face ID is never started on load.
+      // Every option below still signs on its own tap. The pick holds only on the version he tapped it on: a link
+      // without one, or a request changed since, draws no button, only a line
+      const isLinked = !!focus && r.id === focus;
+      const sameV = !!pickV && typeof r.sha256 === "string" && r.sha256.slice(0, 16) === pickV;
+      const po = isLinked && pick && sameV && /^[a-z0-9]{1,8}$/.test(pick) ? options.find((o) => o.key === pick) : null;
       if (po) {
+        card.insertBefore(el("div", "pick-top", "Your pick: (" + po.key + "). Read the item; Sign (" + po.key + ") is below it."),
+                          head.nextSibling);
         const block = el("div", "picked");
         const pb = el("button", "allow", "Sign (" + po.key + ") with Face ID");
         pb.type = "button";
@@ -525,8 +540,10 @@
         });
         block.append(pb, pl, el("div", "why", "you picked (" + po.key + ") on your phone; any other option below still signs instead"), echo);
         card.appendChild(block);
-      } else if (linked && pick) {
-        card.appendChild(el("div", "where pick-miss", "the option in the link (" + pick.slice(0, 24) + ") is not on this card: pick one below"));
+      } else if (isLinked && pick) {
+        card.appendChild(el("div", "where pick-miss", !pickV ? "the link does not say which version of this item you tapped: read it and pick below"
+          : !sameV ? "this item changed since your tap: read it and pick again"
+          : "the option in the link (" + pick.slice(0, 24) + ") is not on this card: pick one below"));
       }
       if (!options.length) {
         const b = el("button", "allow", "sign with Face ID");

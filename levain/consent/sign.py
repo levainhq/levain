@@ -138,9 +138,10 @@ from levain.sign_request_id import ID as _ID, request_id_ok
 
 __all__ = ["BINDING_KEEP_S", "CHOICE_FORMAT", "CHOICE_MARK", "COMPOSE_BINDINGS", "COMPOSE_LIVE_MAX", "ERROR_WORDS",
            "LIST_MAX", "LOCK_WAIT_S", "MESSAGE_MAX", "OPTION_TEXT_MAX", "OPTIONS_MAX", "REFUSED_NAMESPACES",
-           "REQUEST_FORMAT", "SIGN_DIR", "WRITE_IN_KEY", "WRITE_IN_MAX", "SignRefused", "SignRequest", "Signer", "bind_compose", "choice_line", "compose_bindings",
-           "deep_link", "draft_bindings", "error_word", "namespace_problem", "parse_choice", "passkey_key_source", "read_request",
-           "request_id_ok", "sign_dir", "sign_root", "signed_bytes", "state_of", "write_in_problem"]
+           "REQUEST_FORMAT", "SIGN_DIR", "WRITE_IN_KEY", "WRITE_IN_MAX", "SignRefused", "SignRequest", "Signer",
+           "bind_compose", "choice_line", "compose_bindings", "deep_link", "draft_bindings", "error_word",
+           "namespace_problem", "parse_choice", "passkey_key_source", "read_request", "request_id_ok", "sign_dir",
+           "sign_root", "signed_bytes", "state_of", "write_in_problem"]
 
 REQUEST_FORMAT = "levain-sign-request/1"
 CHOICE_FORMAT = "levain-sign-choice/1"
@@ -159,6 +160,7 @@ _KEYS = frozenset({"format", "id", "namespace", "message", "title", "requester",
 _CHOICE_KEYS = _KEYS | {"options"}
 _CHOICE_OPTIONAL = frozenset({"recommended", "write_in"})
 _OPTION_KEY = re.compile(r"[a-z0-9]{1,8}")
+_VERSION = re.compile(r"[0-9a-f]{64}|[0-9a-f]{16}")     # a request file's sha256, or the 16 hex a link carries of it
 WRITE_IN_KEY = "*"                 # the key a write-in signs under: never an option key, which is [a-z0-9]{1,8}
 # ssh's conventional namespaces: git's commit signing (levain's team ledger verifies in it), file and email
 REFUSED_NAMESPACES = frozenset({"git", "file", "email"})
@@ -292,22 +294,30 @@ def parse_choice(signed: bytes, *, write_in: bool = False) -> "tuple[str, str, s
     return message, m.group(1), m.group(2)
 
 
-def deep_link(page: str, request_id: str, token: str | None = None, *, choice: str | None = None) -> str:
+def deep_link(page: str, request_id: str, token: str | None = None, *, choice: str | None = None,
+              version: str | None = None) -> str:
     """The phone page link that opens straight onto sign request ``request_id``'s card: ``page`` (the printed
     ``https://<name>/``) with ``#sign=<id>``, and this run's ``phone_token`` first when given (a browser that has not
     opened this run's link needs it; the fragment never reaches the server or its logs). ``choice``, an option key
-    (never the write-in's :data:`WRITE_IN_KEY`), is the option the operator already tapped elsewhere: the page offers
-    to sign that option with one tap. It is page state only, never what is signed: the bytes are built from the
-    request file (:func:`signed_bytes`), and a key the card does not offer draws nothing but a note."""
+    (never the write-in's :data:`WRITE_IN_KEY`), is the option the operator already tapped elsewhere, and ``version``
+    the request's ``sha256`` (the hex digest of its file's bytes, :attr:`SignRequest.sha256`, or the first 16 hex of
+    it) as filed when he tapped it; the two are given together or not at all. The link carries ``choice=<key>&v=<the
+    first 16 hex>``, and the page offers to sign that option with one tap only while the listed request has that
+    version. It is page state only, never what is signed: the bytes are built from the request file
+    (:func:`signed_bytes`), and a key the card does not offer, or another version, draws nothing but a line."""
     from urllib.parse import quote
 
     if _ID.fullmatch(request_id or "") is None:
         raise ValueError(f"{str(request_id)[:80]!r} is not a sign request id")
+    if (choice is None) != (version is None):
+        raise ValueError("choice and version are given together: a pick holds only on the version it was made on")
     if choice is not None and (not isinstance(choice, str) or _OPTION_KEY.fullmatch(choice) is None):
         raise ValueError(f"{str(choice)[:20]!r} is not an option key ([a-z0-9]{{1,8}})")
+    if version is not None and (not isinstance(version, str) or _VERSION.fullmatch(version) is None):
+        raise ValueError(f"{str(version)[:80]!r} is not a request's sha256 (64 or its first 16 lower-case hex)")
     parts = ([f"phone_token={quote(token, safe='')}"] if token else []) + [f"sign={request_id}"]
-    if choice is not None:
-        parts.append(f"choice={choice}")
+    if choice is not None and version is not None:
+        parts += [f"choice={choice}", f"v={version[:16]}"]
     return page.split("#", 1)[0] + "#" + "&".join(parts)
 
 
@@ -931,7 +941,8 @@ class Signer:
         if not self.namespaces or not request_id_ok(request_id):
             return gone
         record: Any = None
-        signed = state_of(self.queue_dir, request_id) == "signed"
+        marker = state_of(self.queue_dir, request_id)      # read once: every branch below answers from this one read
+        signed = marker == "signed"
         if signed:
             try:
                 record = json.loads(_read_bytes(sign_dir(self.queue_dir) / f"{request_id}.signed.json"))
@@ -948,7 +959,7 @@ class Signer:
             if not self._ours(request):
                 return gone
             if not signed:
-                if state_of(self.queue_dir, request_id) == "denied":
+                if marker == "denied":
                     return {"id": request_id, "state": "denied"}
                 if request.expires_at is not None and request.expires_at <= _now():
                     return {"id": request_id, "state": "expired"}

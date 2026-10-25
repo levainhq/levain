@@ -113,7 +113,9 @@ def _shot(tmp_path: Path, name: str) -> dict:
 # the linked card's picked block, read off the page: what it says and what it would sign
 _PICKED = ("(() => { const c = document.querySelector('.req.sign.linked'); if (!c) return null; "
            "const p = c.querySelector('.picked'); const m = c.querySelector('.pick-miss'); "
-           "return { picked: p ? { button: p.querySelector('button').textContent, "
+           "const t = c.querySelector('.pick-top'); "
+           "return { top: t ? t.textContent : null, topAbove: !!t && !!(t.compareDocumentPosition("
+           "c.querySelector('pre.display')) & 4), picked: p ? { button: p.querySelector('button').textContent, "
            "line: p.querySelector('.line').textContent, words: p.querySelector('.why').textContent } : null, "
            "miss: m ? m.textContent : null, options: c.querySelectorAll('.actions .option').length, "
            "shownAbove: !!p && !!(c.querySelector('pre.display').compareDocumentPosition(p) & 4), "
@@ -128,13 +130,23 @@ def _signed(qdir: Path, rid: str) -> "dict | None":
 # --- the link --------------------------------------------------------------------------------------------------------
 
 
-def test_the_deep_link_carries_his_pick_after_the_card_and_only_an_option_key() -> None:
-    assert deep_link("https://h.ts.net/", RID, "a/b", choice="b") == \
-        f"https://h.ts.net/#phone_token=a%2Fb&sign={RID}&choice=b"
+def test_the_deep_link_carries_his_pick_and_its_version_after_the_card_and_only_an_option_key() -> None:
+    sha = "0123456789abcdef" + "f" * 48
+    assert deep_link("https://h.ts.net/", RID, "a/b", choice="b", version=sha) == \
+        f"https://h.ts.net/#phone_token=a%2Fb&sign={RID}&choice=b&v=0123456789abcdef"
+    assert deep_link("https://h.ts.net/", RID, choice="b", version=sha[:16]) == \
+        f"https://h.ts.net/#sign={RID}&choice=b&v=0123456789abcdef"
     assert deep_link("https://h.ts.net/", RID) == f"https://h.ts.net/#sign={RID}"
     for bad in ("*", "", "B", "toolongkey", "a&sign=x", "a b"):
         with pytest.raises(ValueError):
-            deep_link("https://h.ts.net/", RID, choice=bad)
+            deep_link("https://h.ts.net/", RID, choice=bad, version=sha)
+    for bad_v in ("", "0123", sha.upper(), sha[:17], "stat:" + sha, sha + "&x=1"):
+        with pytest.raises(ValueError):
+            deep_link("https://h.ts.net/", RID, choice="b", version=bad_v)
+    with pytest.raises(ValueError):                 # a pick holds only on a version: never one without the other
+        deep_link("https://h.ts.net/", RID, choice="b")
+    with pytest.raises(ValueError):
+        deep_link("https://h.ts.net/", RID, version=sha)
 
 
 # --- the state route -------------------------------------------------------------------------------------------------
@@ -183,7 +195,7 @@ def test_his_pick_opens_as_one_sign_button_whose_tap_signs_exactly_that_option(t
     _file(port.qdir, RID)
     for i in range(3):                       # cards that sort before it: the linked one must still come first
         _file(port.qdir, f"np-aaa0000{i}-aaaa", options=None, message=f"filler {i}")
-    link = deep_link(port.url, RID, TOK) + "&choice=b"     # built by hand: the page is under test, not deep_link
+    link = deep_link(port.url, RID, TOK) + f"&choice=b&v={_v(port.qdir, RID)}"   # by hand: the page is under test
     got = _drive(tmp_path, link, [
         PHONE, port.authenticator(),
         {"until": "document.querySelector('.req.sign.linked')"},
@@ -197,6 +209,8 @@ def test_his_pick_opens_as_one_sign_button_whose_tap_signs_exactly_that_option(t
     assert seen["picked"] == {"button": "Sign (b) with Face ID", "line": want,
                               "words": "you picked (b) on your phone; any other option below still signs instead"}, seen
     assert seen["miss"] is None and seen["options"] == 2 and seen["shownAbove"] and seen["first"], seen
+    # r1 item 5: the card's first screen says the tap carried his pick, and where its button is
+    assert seen["top"] == "Your pick: (b). Read the item; Sign (b) is below it." and seen["topAbove"], seen
     challenge = [p for p in got["posts"] if p.startswith(f"/sign/{RID}/challenge ")]
     assert len(challenge) == 1 and json.loads(challenge[0].split(" ", 1)[1])["choice"] == "b", got["posts"]
     record = _signed(port.qdir, RID)
@@ -211,7 +225,7 @@ def test_his_pick_opens_as_one_sign_button_whose_tap_signs_exactly_that_option(t
 @needs_ssh
 def test_with_a_pick_another_option_still_signs_instead(tmp_path: Path, port: _Port) -> None:
     _file(port.qdir, RID)
-    got = _drive(tmp_path, deep_link(port.url, RID, TOK) + "&choice=b", [
+    got = _drive(tmp_path, deep_link(port.url, RID, TOK) + f"&choice=b&v={_v(port.qdir, RID)}", [
         PHONE, port.authenticator(),
         {"until": "document.querySelector('.req.sign.linked .picked')"},
         {"eval": "[...document.querySelectorAll('.req.sign.linked .actions .option')]"
@@ -227,7 +241,8 @@ def test_with_a_pick_another_option_still_signs_instead(tmp_path: Path, port: _P
 def test_a_pick_the_card_does_not_offer_draws_nothing_and_says_so(tmp_path: Path, port: _Port) -> None:
     """A forged or stale ``choice=`` (a key not on the card, the write-in's ``*``, markup, a pick on a plain request)
     never draws a sign button: the card is drawn as without a pick, with one line saying the link's option is not on
-    it. Each link is opened in turn on the same tab (a fragment change reloads the page)."""
+    it. Each link carries the card's current version, so the key is what is refused. Each link is opened in turn on the
+    same tab (a fragment change reloads the page)."""
     _file(port.qdir, RID, write_in=True)
     plain = "np-pln00001-aaaa"
     _file(port.qdir, plain, options=None, message="I attest this.\nnonce: 41f0")
@@ -235,14 +250,14 @@ def test_a_pick_the_card_does_not_offer_draws_nothing_and_says_so(tmp_path: Path
     steps: list[dict] = [PHONE]
     for n, (rid, pick) in enumerate(cases):
         if n:
-            steps.append({"eval": f"location.hash = 'sign={rid}&choice={pick}', true"})
+            steps.append({"eval": f"location.hash = 'sign={rid}&choice={pick}&v={_v(port.qdir, rid)}', true"})
         steps += [{"until": f"(() => {{ const c = document.querySelector('.req.sign.linked'); "
                             f"return c && c.querySelector('.req-head') && document.getElementById('requests')"
                             f".firstChild === c && location.hash === '' && c; }})()"},
                   {"eval": _PICKED}]
         if n == 0:
             steps.append(_shot(tmp_path, "pick-forged-390.png"))
-    first = deep_link(port.url, cases[0][0], TOK) + "&choice=" + cases[0][1]
+    first = deep_link(port.url, cases[0][0], TOK) + "&choice=" + cases[0][1] + "&v=" + _v(port.qdir, cases[0][0])
     got = _drive(tmp_path, first, steps)
     seen = [v for v in got["values"] if isinstance(v, dict) and "miss" in v]
     assert len(seen) == 4, got["values"]
@@ -257,7 +272,8 @@ def test_a_pick_the_card_does_not_offer_draws_nothing_and_says_so(tmp_path: Path
 def test_a_picked_link_to_a_request_no_longer_open_says_where_it_stands_on_the_first_listing(
         tmp_path: Path, port: _Port) -> None:
     """Today's rule lets a linked id go after three listings (ten seconds apart) with one sentence for every case; with
-    a pick the page asks the state route and says which case on the first."""
+    a pick the page asks the state route and says a terminal case (signed, denied, expired) on the first. ``gone`` is
+    not terminal (r1 item 3): it is said by no word of its own, and the three-listing rule runs."""
     q = port.qdir
     _file(q, "np-sign0001-aaaa")
     (q / "sign" / "np-sign0001-aaaa.signed.json").write_text(json.dumps({"namespace": NS, "choice": "b"}) + "\n")
@@ -266,8 +282,7 @@ def test_a_picked_link_to_a_request_no_longer_open_says_where_it_stands_on_the_f
     _file(q, "np-expd0001-aaaa", expires_in=timedelta(minutes=-1))
     want = {"np-sign0001-aaaa": "the linked sign request np-sign0001-aaaa is already signed here (b)",
             "np-deny0001-aaaa": "the linked sign request np-deny0001-aaaa was denied here",
-            "np-expd0001-aaaa": "the linked sign request np-expd0001-aaaa expired: a fresh link comes with its next filing",
-            "np-gone0001-aaaa": "the linked sign request np-gone0001-aaaa was replaced or withdrawn"}
+            "np-expd0001-aaaa": "the linked sign request np-expd0001-aaaa expired: a fresh link comes with its next filing"}
     steps: list[dict] = [PHONE]
     for n, (rid, words) in enumerate(want.items()):
         if n:
@@ -278,3 +293,148 @@ def test_a_picked_link_to_a_request_no_longer_open_says_where_it_stands_on_the_f
         if n == 0:
             steps.append(_shot(tmp_path, "pick-signed-already-390.png"))
     _drive(tmp_path, deep_link(port.url, "np-sign0001-aaaa", TOK) + "&choice=b", steps)
+
+
+# --- L3 r1 (project_memory 1025-18/preselect/RULINGS_R1.md) -----------------------------------------------------------
+
+
+def _v(qdir: Path, rid: str) -> str:
+    """The version a link carries for ``rid`` as filed now: the first 16 hex of its listing ``sha256``."""
+    return read_request(qdir, rid).sha256[:16]
+
+
+def _asks(port: _Port, answers: "list[Any]") -> "list[str]":
+    """The port's state route answers ``answers`` in turn (the last one from then on; an exception is a 500), and the
+    ids it was asked for are returned, one per ask."""
+    asked: list[str] = []
+
+    def state(rid: str) -> dict:
+        asked.append(rid)
+        a = answers[min(len(asked), len(answers)) - 1]
+        if isinstance(a, Exception):
+            raise a
+        return {"id": rid, "state": a}
+
+    port.srv.signer.state = state
+    return asked
+
+
+_SLEEP = {"until": "false", "may_timeout": True}        # with "ms": the drive waits that long (a poll is ten seconds)
+_ALL_PICKS = ("(() => ({ picked: document.querySelectorAll('.picked').length, "
+              "miss: document.querySelectorAll('.pick-miss').length, top: document.querySelectorAll('.pick-top').length, "
+              "linked: document.querySelectorAll('.req.sign.linked').length, "
+              "cards: document.querySelectorAll('.req.sign').length }))()")
+
+
+@needs_browser
+def test_a_pick_for_a_request_not_listed_draws_nothing_on_another_card_offering_that_key(
+        tmp_path: Path, port: _Port) -> None:
+    """r1 item 1 (deepseek HIGH): the link names an id that is not listed (here kept open by the state route, as one
+    past the listing's cap), and another listed request offers the same key: no card draws the Sign shortcut, the pick
+    line or the miss line, on the first listing and on the next."""
+    _file(port.qdir, RID)                                           # offers (a) and (b)
+    asked = _asks(port, ["open"])
+    link = deep_link(port.url, "np-unls0001-aaaa", TOK) + "&choice=a&v=0123456789abcdef"
+    got = _drive(tmp_path, link, [
+        PHONE, {"until": "document.querySelector('.req.sign .req-head')"}, {"eval": _ALL_PICKS},
+        _shot(tmp_path, "pick-unlisted-r1-390.png"), {**_SLEEP, "ms": 11000}, {"eval": _ALL_PICKS}])
+    seen = [v for v in got["values"] if isinstance(v, dict) and "cards" in v]
+    assert seen == [{"picked": 0, "miss": 0, "top": 0, "linked": 0, "cards": 1}] * 2, seen
+    assert asked and set(asked) == {"np-unls0001-aaaa"}, asked
+
+
+@needs_browser
+def test_a_pick_made_on_an_earlier_version_of_the_item_draws_no_shortcut(tmp_path: Path, port: _Port) -> None:
+    """r1 item 2 (codex MED 1): the pick is bound to the request version it was tapped on (``v=``, the first 16 hex of
+    the listing's sha256). A same-id refile where (b) now means something else opens with no shortcut and one line;
+    a pick link carrying no version draws no shortcut either (fail closed)."""
+    _file(port.qdir, RID)
+    old = _v(port.qdir, RID)
+    _file(port.qdir, RID, options=[{"key": "a", "text": "ship it tonight"}, {"key": "b", "text": "delete the branch"}])
+    assert _v(port.qdir, RID) != old
+    steps: list[dict] = [PHONE]
+    for n, frag in enumerate((f"choice=b&v={old}", "choice=b")):
+        if n:
+            steps.append({"eval": f"location.hash = 'sign={RID}&{frag}', true"})
+        steps += [{"until": "(() => { const c = document.querySelector('.req.sign.linked'); "
+                            "return c && c.querySelector('.req-head') && location.hash === '' && c; })()"},
+                  {"eval": _PICKED}]
+        if n == 0:
+            steps.append(_shot(tmp_path, "pick-stale-version-r1-390.png"))
+    got = _drive(tmp_path, deep_link(port.url, RID, TOK) + f"&choice=b&v={old}", steps)
+    seen = [v for v in got["values"] if isinstance(v, dict) and "miss" in v]
+    assert len(seen) == 2, got["values"]
+    assert seen[0]["picked"] is None and seen[0]["miss"] == "this item changed since your tap: read it and pick again", seen
+    assert seen[1]["picked"] is None and seen[1]["miss"] == \
+        "the link does not say which version of this item you tapped: read it and pick below", seen
+    assert seen[0]["options"] == 2 and seen[1]["options"] == 2
+
+
+@needs_browser
+def test_only_a_terminal_state_lets_a_picked_link_go_and_a_failed_or_open_answer_is_asked_again(
+        tmp_path: Path, port: _Port) -> None:
+    """r1 item 3 (complement MED 1 + codex MED 2): the state route answers a 500, then ``gone``, then ``signed``: the
+    page asks again on each listing, says nothing for the first two (``gone`` keeps the three-listing rule), and says
+    the terminal one when it comes."""
+    asked = _asks(port, [RuntimeError("a passing fault"), "gone", "signed"])
+    rid = "np-late0001-aaaa"
+    words = f"the linked sign request {rid} is already signed here"
+    got = _drive(tmp_path, deep_link(port.url, rid, TOK) + f"&choice=b&v=0123456789abcdef", [
+        PHONE, {"until": "document.getElementById('status').textContent.includes('waiting on you')"},
+        {**_SLEEP, "ms": 2000}, {"eval": "document.getElementById('status').textContent"},
+        {"until": f"document.getElementById('status').textContent.includes({json.dumps(words)})", "ms": 30000},
+        {"eval": "document.getElementById('status').textContent"}])
+    first, last = [v for v in got["values"] if isinstance(v, str)]
+    assert "linked sign request" not in first, first
+    assert "replaced or withdrawn" not in last and words in last, last
+    assert asked == [rid] * 3, asked
+
+
+@needs_browser
+def test_a_picked_link_asks_nothing_while_the_sign_side_has_a_fault(tmp_path: Path, port: _Port) -> None:
+    """r1 item 3: while the listing carries ``sign_note`` (here: no passkey enrolled), the state route is not asked."""
+    asked = _asks(port, ["signed"])
+    port.srv._sign_keys = lambda: {}
+    _drive(tmp_path, deep_link(port.url, "np-flt00001-aaaa", TOK) + "&choice=b&v=0123456789abcdef", [
+        PHONE, {"until": "document.getElementById('status').textContent.includes('waiting on you')"},
+        {**_SLEEP, "ms": 11000}])
+    assert asked == [], asked
+
+
+def test_the_state_reads_the_marker_once(port: _Port, monkeypatch: pytest.MonkeyPatch) -> None:
+    """r1 item 4 (deepseek/codex LOW): one ``state_of`` read decides the answer (two reads could straddle a sign)."""
+    import levain.consent.sign as sign
+
+    _file(port.qdir, "np-race0001-aaaa")
+    seen: list[str] = []
+    real = sign.state_of
+
+    def once(qdir: Path, rid: str) -> str:
+        seen.append(rid)
+        return real(qdir, rid)
+
+    monkeypatch.setattr(sign, "state_of", once)
+    assert port.srv.signer.state("np-race0001-aaaa") == {"id": "np-race0001-aaaa", "state": "open"}
+    assert seen == ["np-race0001-aaaa"], seen
+
+
+@needs_browser
+def test_a_bare_choice_fragment_is_stripped_and_does_not_reload(tmp_path: Path, port: _Port) -> None:
+    """r1 item 4 (complement LOW 4): ``#choice=`` with no ``sign=`` is never a pick: it leaves the address bar and the
+    page is not reloaded."""
+    got = _drive(tmp_path, port.url + f"#phone_token={TOK}", [
+        PHONE, {"until": "document.getElementById('status').textContent.includes('waiting on you')"},
+        {"eval": "window.__kept = 1, location.hash = 'choice=b', true"},
+        {"until": "location.hash === ''", "ms": 3000, "may_timeout": True},
+        {**_SLEEP, "ms": 1500}, {"eval": "[location.hash, window.__kept === 1]"}])
+    assert got["values"][-1] == ["", True], got["values"]
+
+
+def test_a_signed_request_whose_record_and_file_cannot_be_read_is_gone_which_the_page_never_words(port: _Port) -> None:
+    """r1 item 4 (complement LOW 2): the marker says signed, its record is unreadable and the request file is gone:
+    the route answers ``gone`` (it says no more than it can read), and ``gone`` has no words of its own on the page:
+    the three-listing rule's sentence, which names no cause, is what he sees."""
+    _file(port.qdir, "np-lost0001-aaaa")
+    (port.qdir / "sign" / "np-lost0001-aaaa.signed.json").write_text("not json")
+    (port.qdir / "sign" / "np-lost0001-aaaa.json").unlink()
+    assert port.get("/sign/np-lost0001-aaaa/state")[1] == {"id": "np-lost0001-aaaa", "state": "gone"}

@@ -145,3 +145,5 @@ textarea.words { width: 100%; box-sizing: border-box; margin-top: var(--sp-4); f
 .req.sign .picked .why { margin-top: var(--sp-2); font-size: 13px; color: var(--label); }
 .req.sign .picked .note:empty { display: none; }
 .req.sign .pick-miss { margin-top: var(--sp-3); color: var(--warn); }
+/* the first screen of the linked card says the tap carried his pick, and that its button is below the item */
+.req.sign .pick-top { margin-top: var(--sp-3); font-weight: 600; color: var(--contrast); }
