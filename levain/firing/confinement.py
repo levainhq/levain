@@ -214,8 +214,10 @@ differently per drive:
 ⚠ **UNATTENDED OPERATION IS NOW A v1 CLAIM** (K4a — ``levain daemon install-seat`` runs a governed
 seat on a schedule). This paragraph used to say the opposite, and said it correctly while the gate
 was still a spec. What remains ABSENT is not the gate but the per-domain threshold POLICY
-(``spore-417``): the stakes/context escalators, capability recalibration, and any GRADUATION to
-unattended-efferent firing. **Nothing graduates; everything efferent gates.** So v1 = **structural
+(``spore-417``): the stakes/context escalators, capability recalibration, and a graduation tier of
+the gate's own. **Nothing graduates without the operator's explicit ratification; everything efferent
+gates** (a standing grant's posture is loosened only as a re-ratification the operator applies: a new
+sealed grant replacing the old, :mod:`levain.autonomic.graduation`). So v1 = **structural
 floor + the efferent gate + you-in-the-loop wherever you are present.**
 
 Pure stdlib (``os`` / ``platform`` / ``subprocess`` / ``tempfile`` / ``pathlib`` / ``threading``) —
