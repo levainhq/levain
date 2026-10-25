@@ -13,8 +13,9 @@
   // L3 r2 G1: ONE shared in-flight read. A caller that finds one running gets that promise back and queues exactly one
   // re-run (so a change made while it was in flight is read afterwards); reads run one at a time, so what paints is always
   // the newest read. No flag can stick: `running` is cleared in the same step the promise settles, and a read has a timeout.
-  // F7/G5: a 404 (no pairing here) or a 403 (no usable credential) is stable for this page: stop asking.
-  let running = null, rerun = false, gone = false;
+  // F7: a 404 (no pairing here) is stable for this page: stop asking. L3 r3 H2: a 403 refuses THAT token only; remember it and
+  // skip reads while the stored token is still it, so a fresh token (a new link, the prompt) brings the panel back.
+  let running = null, rerun = false, gone = false, refused = "";
   const READ_TIMEOUT_MS = 20000;
 
   function token() { try { return window.localStorage.getItem(WRITE_TOKEN_KEY) || ""; } catch (_) { return ""; } }
@@ -24,19 +25,21 @@
     if (text !== undefined) n.textContent = text;
     return n;
   }
-  async function api(method, path, body) {
+  async function api(method, path, body, timeoutMs) {
     const headers = {};
     const t = token();
     if (t) headers[H] = t;
     if (body !== undefined) headers["Content-Type"] = "application/json";
+    // H3: only the list read carries a timeout (a stalled answer must not hold the one shared read forever); a POST that the
+    // server committed but answered late must not read as unreachable and be repeated
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), READ_TIMEOUT_MS);   // a stalled answer must not hold the one shared read forever
+    const timer = timeoutMs ? setTimeout(() => ctl.abort(), timeoutMs) : null;
     try {
       const res = await fetch(path, { method: method, headers: headers, body: body === undefined ? undefined : JSON.stringify(body), cache: "no-store", signal: ctl.signal });
       let data = {};
       try { data = await res.json(); } catch (_) { /* a non-JSON answer is a refusal below */ }
       return { status: res.status, data: data };
-    } finally { clearTimeout(timer); }
+    } finally { if (timer) clearTimeout(timer); }
   }
   function when(iso) {
     if (!iso) return "never";
@@ -113,14 +116,17 @@
   // false when the read failed and said so.
   async function readOnce() {
     if (gone) return true;
-    if (!token()) { section.hidden = true; return true; }
+    const tok = token();
+    if (!tok) { section.hidden = true; return true; }
+    if (tok === refused) { section.hidden = true; return true; }
     let res;
-    try { res = await api("GET", "/cockpit/pair/devices.json"); }
+    try { res = await api("GET", "/cockpit/pair/devices.json", undefined, READ_TIMEOUT_MS); }
     catch (_) { if (!section.hidden) say("Couldn't refresh the device list."); return false; }
     if (res.status !== 200 || !Array.isArray(res.data.devices)) {
-      // 404: a read-only or ledger-less server (no pairing); 403: no usable credential. Either way nothing to show, and
-      // nothing to ask again (G5: the 403 stops the poll like the 404).
-      if (res.status === 404 || res.status === 403) { section.hidden = true; gone = true; return true; }
+      // 404: a read-only or ledger-less server (no pairing): stable, stop asking. 403: this token is refused; stop asking with
+      // it, ask again once the stored token is a different one.
+      if (res.status === 404) { section.hidden = true; gone = true; return true; }
+      if (res.status === 403) { section.hidden = true; refused = tok; return true; }
       say("Couldn't refresh the device list.");
       return false;
     }

@@ -62,14 +62,14 @@
 
   // A network error or a 5xx after the one RT-4 retry leaves the code UNSPENT (L3 r1 F4): offer to try it again rather
   // than send him back for a new one. A 403 is final (used, expired or wrong).
-  function tryAgain(code, title, msg) {
+  function tryAgain(code, title, msg, repaired) {
     say(title, msg, false);
-    actions([["Try again", true, () => attempt(code, true)]]);
+    actions([["Try again", true, () => attempt(code, true, repaired)]]);
   }
 
   // `again`: this is a second spend of the same code after a failure that may have reached the server (G3).
-  // `note`: a line appended to the "Paired" screen (G7: the old key could not be revoked).
-  async function attempt(code, again, note) {
+  // `repaired`: this browser held a key before (Pair it again); the "Paired" screen then says the old key is still listed.
+  async function attempt(code, again, repaired) {
     say("Pairing this device", "Claiming your one-time code…", false);
     let res;
     try {
@@ -82,7 +82,7 @@
         res = await claim(code);
       }
     } catch (_) {
-      tryAgain(code, "Could not reach the cockpit", "Check that this device is on the same network as the cockpit, then try again. The code is not used yet.");
+      tryAgain(code, "Could not reach the cockpit", "Check that this device is on the same network as the cockpit, then try again. The code is not used yet.", repaired);
       return;
     }
     if (res.status === 403) {
@@ -93,7 +93,7 @@
       return;
     }
     if (res.status >= 500) {
-      tryAgain(code, "The cockpit is busy", "It is still starting or another process holds it. Try again in a moment.");
+      tryAgain(code, "The cockpit is busy", "It is still starting or another process holds it. Try again in a moment.", repaired);
       return;
     }
     let data = null;
@@ -111,40 +111,21 @@
     // G4: the mark is a nicety (it only picks the unpaired card over a prompt later); a failed write of it never says the key was lost
     try { window.localStorage.setItem(PAIRED_MARK_KEY, "1"); } catch (_) { /* the key is kept; the mark is not */ }
     data = null;
-    if (note) {
-      // G7: stay on the page so the line is read; the cockpit is one click away
-      say("Paired", "This device is paired. " + note, true);
+    if (repaired) {
+      // stay on the page so the line is read; the cockpit is one click away
+      say("Paired", "This device is paired. " + OLD_KEY_LISTED, true);
       return;
     }
     say("Paired", "This device is paired. Opening the cockpit…", true);
     location.replace("/");
   }
 
-  // G7: "Pair it again" retires the key this browser holds before it takes the new one: the old device row would otherwise
-  // stay live. The held key names its own device (the manifest's credential, paired-<id>); an owner's surface token names
-  // none and is never revocable, so nothing is revoked then. A failed self-revoke still claims, and says so.
-  async function retireOldKey() {
-    const tok = storedToken();
-    if (!tok) return "";
-    const H = { "X-Levain-Write-Token": tok };
-    try {
-      const m = await fetch("/cockpit/manifest.json", { headers: H, cache: "no-store", referrerPolicy: "no-referrer" });
-      if (m.status === 403) return "";                       // the held key is already refused: nothing is listed under it to revoke
-      if (m.status !== 200) return OLD_KEY_LISTED;
-      const name = (((await m.json()) || {}).credential || {}).name || "";
-      if (!/^paired-./.test(name)) return "";                // not a device key (the owner's own, or none)
-      const r = await fetch("/cockpit/pair/revoke", { method: "POST", headers: { ...H, "Content-Type": "application/json" },
-        body: JSON.stringify({ id: name.slice(7) }), cache: "no-store", referrerPolicy: "no-referrer" });
-      return r.status === 200 || r.status === 404 ? "" : OLD_KEY_LISTED;
-    } catch (_) { return OLD_KEY_LISTED; }
-  }
-  const OLD_KEY_LISTED = "The old key is still listed; revoke it from Devices.";
+  // "Pair it again" only claims. The key this browser held is NOT revoked from here (L3 r3 H1): a client cannot do that safely
+  // (revoking first strands the browser when the claim fails; revoking after can cascade onto the device that issued the code).
+  // The old row stays listed in Devices; the Paired screen says so on every path, Try again included.
+  const OLD_KEY_LISTED = "This browser's previous key is still listed in Devices. Revoke it there.";
 
-  async function pairAgain(code) {
-    say("Pairing this device", "Retiring the old key…", false);
-    const note = await retireOldKey();
-    attempt(code, false, note);
-  }
+  function pairAgain(code) { attempt(code, false, true); }
 
   function run() {
     const code = takeCode();
