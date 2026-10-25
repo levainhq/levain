@@ -59,16 +59,25 @@ def _write_cert(d: Path, name: str, pem: bytes) -> Path:
             old.unlink(missing_ok=True)                 # unlink removes a symlink itself, never its target
     path = d / name
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    closed = False
     try:
         os.fchmod(fd, 0o644)
         rest = memoryview(pem)
         while rest:                                     # a short write is legal: the chat env must get the whole cert
-            rest = rest[os.write(fd, rest):]
-    except BaseException:
+            n = os.write(fd, rest)
+            if n <= 0:
+                raise OSError(f"writing {path} made no progress")
+            rest = rest[n:]
+        closed = True
         os.close(fd)
-        path.unlink(missing_ok=True)                    # O_EXCL made it ours: no partial cert is left behind
+    except BaseException:
+        if not closed:
+            os.close(fd)
+        try:
+            path.unlink(missing_ok=True)                # O_EXCL made it ours: no partial cert is left behind
+        except OSError:
+            pass                                        # the error that ended the write is the one raised
         raise
-    os.close(fd)
     return path
 
 
