@@ -30,6 +30,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from levain.launch import child_env
+
 __all__ = ["NODE_DIR", "SRT_PKG", "SrtProblem", "check", "default_prefix", "glue_imports", "setup", "srt_dist",
            "vendor_check"]
 
@@ -222,7 +224,7 @@ def setup(prefix: Path | None = None, *, npm: str | None = None, offline: bool =
     (prefix / STAMP).unlink(missing_ok=True)                 # a failed setup leaves no stamp a check would accept
     for name in ("package.json", "package-lock.json"):
         shutil.copyfile(NODE_DIR / name, prefix / name)
-    env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "USER", "LANG", "TMPDIR")}
+    env = child_env("PATH", "HOME", "USER", "LANG", "TMPDIR")
     argv = [npm, "ci", "--ignore-scripts", "--no-audit", "--no-fund", "--prefix", str(prefix)]
     try:
         out = subprocess.run(argv + (["--offline"] if offline else []) + (["--cache", str(cache)] if cache else []),
