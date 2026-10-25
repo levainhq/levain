@@ -369,6 +369,7 @@ class Decider:
         self._card_slots = threading.BoundedSemaphore(limits.max_cards)
         self._readers = threading.BoundedSemaphore(limits.max_body_readers)
         self._threads: set[threading.Thread] = set()
+        self._active: set[_Req] = set()          # every request with a decision thread, live or not
         self._closing = threading.Event()
         self._link_thread: threading.Thread | None = None
         self._obs_thread: threading.Thread | None = None
@@ -391,8 +392,10 @@ class Decider:
         self.drain()
         with self._live_lock:
             open_reqs = list(self._live.values())
+            waiting = list(self._active)
         for r in open_reqs:
             self._fire(r, Event.CLOSE)
+        for r in open_reqs + waiting:
             r.wake.set()
         self.mode.close()
         self.link.kill("the launch closed")
@@ -446,11 +449,16 @@ class Decider:
             return self._inline(r, 503, "decider_busy", "wall: decider_busy")
         t = threading.Thread(target=self._decide, args=(r,), name=THREAD_DECIDE, daemon=True)
         r.thread = t
+        self._threads = {x for x in self._threads if x.is_alive()}   # close joins every one still alive
         self._threads.add(t)
+        with self._live_lock:
+            self._active.add(r)
         try:
             t.start()
         except BaseException:
             self._threads.discard(t)
+            with self._live_lock:
+                self._active.discard(r)
             self._decisions.release()
             raise
 
@@ -567,8 +575,8 @@ class Decider:
                           else advert.content_type_class(o.content_type))
             self._fire(r, Event.RESPONSE)
         else:
+            self._fire(r, Event.ENDED)        # before the wake: a woken wait reads the ended state, never its own
             r.wake.set()
-            self._fire(r, Event.ENDED)
 
     # --- one decision (its own thread) -------------------------------------------------------------------------
     def _decide(self, r: _Req) -> None:
@@ -585,8 +593,9 @@ class Decider:
                 elif r.parsed is None:
                     self._owe_deny(r, 500, "decider: internal error")
         finally:
+            with self._live_lock:
+                self._active.discard(r)
             self._decisions.release()
-            self._threads.discard(threading.current_thread())
 
     def _parse(self, r: _Req) -> None:
         try:
@@ -609,8 +618,8 @@ class Decider:
             self._live[r.rid] = r
             early = self._early_ended.pop(r.rid, "absent") is None
         if early:
-            r.wake.set()
             self._fire(r, Event.ENDED)
+            r.wake.set()
 
     def _decide_inner(self, r: _Req) -> None:
         self._parse(r)
@@ -681,13 +690,15 @@ class Decider:
             item = None
             while item is None:
                 left = deadline - time.monotonic()
-                if left <= 0 or r.wake.is_set():
+                if left <= 0 or r.wake.is_set() or r.lc.state is not State.AWAITING_BODY:
                     break
                 try:
                     item = q.get(timeout=min(0.2, left))
                 except queue_mod.Empty:
                     continue
             if item is None:
+                # still awaiting the body at the deadline: denied here. Every wake fires its event first, so a woken
+                # spool is in a terminal state (which would absorb this DENY in any case)
                 if r.lc.state is State.AWAITING_BODY:
                     self._deny(r, "wall:body_timeout", 408, "wall: body_timeout")
                 return False

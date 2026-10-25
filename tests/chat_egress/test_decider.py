@@ -32,7 +32,8 @@ def rig(tmp_path):
 
     yield make
     for r in rigs:
-        r.close()
+        assert r.close(), "a decider thread outlived the close"
+    assert dm.service_threads() == []
 
 
 def action(v: list[dict]) -> str:
@@ -154,6 +155,26 @@ def test_stalled_bodies_become_body_timeout_walls_while_a_get_completes(rig) -> 
     assert sorted(f["status"] for f in finals) == [408, 408, 503]
     t1 = time.monotonic()
     assert r.close() and time.monotonic() - t1 < 3.0
+
+
+def test_an_ended_line_while_the_body_is_awaited_is_ended_never_body_timeout(rig, monkeypatch) -> None:
+    """ENDED fires before the spool is woken: a slow ENDED transition never reads as a body_timeout deny."""
+    real = dm.Decider._fire
+
+    def slow_ended(self, req, event):
+        if event is dm.Event.ENDED:
+            time.sleep(0.5)
+        return real(self, req, event)
+
+    monkeypatch.setattr(dm.Decider, "_fire", slow_ended)
+    r = rig(limits=dm.Limits(card_poll_s=0.05, body_timeout_s=5.0, stop_drain_s=0.5))
+    p, rid = r.srt.req("POST", path="/s", headers={"transfer-encoding": ["chunked"]})
+    first = r.srt.wait(p)
+    assert first[0]["action"] == "need_body", first
+    r.obs_line(wire.obs_ended_line(rid))
+    v = r.srt.wait(p, 2)
+    assert v[-1]["action"] == "deny" and v[-1]["reason"] == "decider: the client left before a verdict"
+    assert r.records.settled(r.launch, rid) is Settled.ENDED
 
 
 # --- R9-A4: caps --------------------------------------------------------------------------------------------------
