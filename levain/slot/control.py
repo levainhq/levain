@@ -2162,9 +2162,9 @@ class Control:
         with nothing appended. A quarantine row is ``{format, seq, source, quarantined}`` (H6-20: no ``session``)."""
         self._require_attached(conn)
         envelope = args["envelope"]
-        triples = LN.check_envelope(envelope)
-        if self.lineage is None:
+        if self.lineage is None:   # r1 F6: before the envelope's check (no sink: nothing is a keys bug yet)
             raise Refused("lineage-unavailable", "CONTROL holds no lineage sink")
+        triples = LN.check_envelope(envelope)
         rows: list[tuple[LN.Triple, dict[str, object]]] = []
         for t, rec in zip(triples, envelope["records"]):
             bad = LN.check_record(rec)

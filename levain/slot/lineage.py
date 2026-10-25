@@ -180,7 +180,7 @@ def source_of(t: Triple) -> Dict[str, object]:
 def check_envelope(envelope: object) -> Tuple[Triple, ...]:
     """H6-2 / H6-14 / H6-19: `{ledger_id, epoch, records}`, 1..:data:`ENVELOPE_MAX` records and at most
     :data:`ENVELOPE_BYTES_MAX` bytes canonically encoded, each record an object whose `source` is a valid triple naming
-    the envelope's `ledger_id` and `epoch`. Anything else refuses the WHOLE envelope ``lineage-record:envelope`` (a
+    the envelope's `ledger_id` and `epoch`, no triple twice (r1 F7: keys never sends one twice). Anything else refuses the WHOLE envelope ``lineage-record:envelope`` (a
     keys bug: nothing is appended). CONTROL sees only an envelope that fit the frame (an over-cap frame closes the
     connection before this runs); the byte bound refuses one that fit the frame but not H6-19. Returns each element's
     triple, in order."""
@@ -206,6 +206,8 @@ def check_envelope(envelope: object) -> Tuple[Triple, ...]:
             raise _envelope("an element's source is not a {ledger, epoch, ref} triple")
         if t[0] != ledger_id or t[1] != epoch:
             raise _envelope("an element's source names another ledger or epoch than the envelope (H6-14)")
+        if t in triples:
+            raise _envelope("an element's source repeats another element's triple (r1 F7)")
         triples.append(t)
     return tuple(triples)
 

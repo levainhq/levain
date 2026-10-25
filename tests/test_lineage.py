@@ -135,9 +135,9 @@ def test_lineage_resend_deduped(w):
     assert [(r["seq"], r["source"]) for r in rows] == [(1, triple(5))]
     want = dict(record(5), seq=1)
     assert rows[0] == want                    # the row is exactly the record plus CONTROL's seq
-    # inside one envelope too: a triple twice is one row, acked once
-    assert w.append(envelope(record(6), record(6))) == acked(6)
-    assert [r["source"]["ref"] for r in w.rows()] == [5, 6]
+    # r1 F7: inside one envelope a triple twice is a keys bug, refused whole `lineage-record:envelope`
+    assert w.append(envelope(record(6), record(6))) == {"id": 7, "ok": False, "refused": "lineage-record:envelope"}
+    assert [r["source"]["ref"] for r in w.rows()] == [5]
 
 
 def test_lineage_out_of_order_kept(w):
@@ -212,7 +212,8 @@ def test_lineage_missing_field_quarantined(w):
     envelope(dict(record(1), source={"ledger": LEDGER, "epoch": EPOCH, "ref": True})),  # a bool is no ref
     envelope("not a record"),
     [record(1)],
-], ids=["epoch", "ledger", "empty", "65", "keys-", "keys+", "hex", "noref", "boolref", "nondict", "list"])
+    envelope(record(1), record(2), record(1)),                      # r1 F7: the same triple twice
+], ids=["epoch", "ledger", "empty", "65", "keys-", "keys+", "hex", "noref", "boolref", "nondict", "list", "dup"])
 def test_lineage_envelope_refused(w, env):
     # H6-2 / H6-14 / R4 §3: a malformed envelope is refused WHOLE `lineage-record:envelope` (a keys bug): nothing is
     # appended, not even its good elements
@@ -268,6 +269,10 @@ def test_lineage_no_sink_is_unavailable(tmp):
     keys = C.Conn(KEYS_UID)
     assert control.handle(keys, {"v": 1, "op": "KEYS-ATTACH", "id": 1, "generation": None, "item_sha256": None})["ok"]
     ans = control.handle(keys, {"v": 1, "op": "LINEAGE-APPEND", "id": 2, "envelope": envelope(record(1))})
+    assert ans["refused"] == "lineage-unavailable"
+    # r1 F6: with no sink the answer is `lineage-unavailable` before the envelope is checked, so a malformed one
+    # is not counted as a keys bug while CONTROL holds no sink
+    ans = control.handle(keys, {"v": 1, "op": "LINEAGE-APPEND", "id": 3, "envelope": envelope()})
     assert ans["refused"] == "lineage-unavailable"
     control.stop()
 
