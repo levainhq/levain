@@ -2582,3 +2582,51 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
    first segment until its figure had 2px to stand in and ran out of it. The segments now wrap to a second row instead (the
    1px gap is the hairline between rows too). Above 1100px nothing changes. */
 @media (max-width: 1100px) { body.ke .ck-widgets:not([data-shape="tiles"]) { flex-wrap: wrap; } }   /* not wider: from 1101 the shrunk single row is the look he has */
+
+/* ---- Devices (per-device pairing): the cockpit's panel (devices_panel.js) and the new device's /pair page (pair.js). One look:
+   the existing .panel / .phead / .pbody, rows in the hairline-divided list shape, buttons in the needs-btn outline. ---- */
+.dev-zone { margin-top: var(--sec, var(--sp-7)); }
+.dev-zone[hidden] { display: none; }
+.dev-zone .zone-head { display: flex; align-items: baseline; gap: var(--sp-4); margin: 0 0 var(--sp-4); }
+.dev-grid { display: grid; grid-template-columns: minmax(0, 1fr); }
+.dev-body { padding: var(--sp-2) var(--sp-6) var(--sp-6); }
+.dev-list { display: flex; flex-direction: column; }
+.dev-row { display: flex; align-items: center; gap: var(--sp-4); padding: var(--sp-4) 0; border-bottom: 1px solid var(--hair); }
+.dev-row:last-child { border-bottom: 0; }
+.dev-main { flex: 1 1 auto; min-width: 0; }
+.dev-name { font: var(--fw-semibold) var(--fs-body)/1.3 var(--sans); color: var(--text); overflow-wrap: anywhere; }
+.dev-id { white-space: nowrap; }
+.dev-meta { margin-top: var(--sp-1); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); overflow-wrap: anywhere; }
+.dev-revoked .dev-name { color: var(--label); text-decoration: line-through; text-decoration-color: var(--faint); }
+.dev-pill { flex: none; }
+.dev-none { margin: 0; padding: var(--sp-4) 0; color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
+.dev-offer { display: flex; gap: var(--sp-3); margin-top: var(--sp-5); flex-wrap: wrap; }
+.dev-label, .dev-url { flex: 1 1 220px; min-width: 0; min-height: 38px; box-sizing: border-box; padding: var(--sp-2) var(--sp-4); border: 1px solid var(--hair-2); border-radius: var(--r-sm); background: var(--base); color: var(--text); font: var(--fw-regular) var(--fs-meta) var(--sans); }
+.dev-url { font-family: var(--mono); font-size: var(--fs-micro); }
+.dev-btn { flex: none; min-height: 38px; padding: var(--sp-2) var(--sp-4); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); color: var(--text); background: none; border: 1px solid var(--label); border-radius: var(--r-sm); cursor: pointer; }
+.dev-btn:hover { border-color: var(--text); }
+.dev-btn:disabled { opacity: .5; cursor: default; }
+.dev-primary { background: var(--card-2); }
+.dev-link { margin-top: var(--sp-5); padding: var(--sp-4) var(--sp-5); border: 1px dashed var(--hair-2); border-radius: var(--r-md); }
+.dev-link[hidden], .dev-note[hidden] { display: none; }
+.dev-link-h { font: var(--fw-semibold) var(--fs-meta) var(--sans); color: var(--text); margin-bottom: var(--sp-3); }
+.dev-url-row { display: flex; gap: var(--sp-3); flex-wrap: wrap; }
+.dev-link-n, .dev-link-w, .dev-note { margin: var(--sp-3) 0 0; color: var(--label); font: var(--fw-regular) var(--fs-micro)/1.5 var(--sans); }
+.dev-link-w { color: var(--text); }
+@media (max-width: 640px) {
+  .dev-body { padding-inline: var(--sp-5); }
+  .dev-btn, .dev-label, .dev-url { min-height: var(--hit-min, 44px); }
+  .dev-offer .dev-btn { flex: 1 1 100%; }
+}
+
+.pair-body { min-height: 100vh; display: grid; place-items: center; padding: var(--sp-6); box-sizing: border-box; }
+.pair-card { width: min(100%, 420px); background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); padding: var(--sp-7) var(--sp-6); }
+.pair-brand { display: flex; align-items: center; gap: var(--sp-3); font: var(--fw-bold) var(--fs-body) var(--round); color: var(--text); margin-bottom: var(--sp-5); }
+.pair-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); }
+.pair-card h1 { margin: 0 0 var(--sp-3); font: var(--fw-bold) var(--fs-title)/1.2 var(--round); color: var(--text); }
+.pair-card p { margin: 0 0 var(--sp-4); color: var(--label); font: var(--fw-regular) var(--fs-body)/1.5 var(--sans); }
+.pair-card a { color: var(--text); }
+.pair-actions { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin: 0 0 var(--sp-4); }
+.pair-actions[hidden] { display: none; }
+.pair-veil { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: var(--sp-6); box-sizing: border-box; background: var(--bg); }
+.pair-actions .dev-btn { min-height: var(--hit-min, 44px); }
