@@ -3,7 +3,9 @@ item 4, item 2 *Per request*, R-6, R-10's `attach` field; CH-D2 S6).
 
 At LAUNCH, :func:`build_route_set` reads the authority log's replay ONCE and builds one immutable
 :class:`RouteSnapshot` per keyed host from the entity's LIVE setup records (`levain.authority.egress_key_live`): the
-record id, the canonical host, the credential SOURCE (a keychain item name; never the value), the declared repo paths
+record id and its incarnation (`levain.authority.egress_key_incarnation`: the link that brought the id in, and a
+digest of everything the record says but its expiry), the canonical host, the credential SOURCE and ACCOUNT (the
+keychain item's service and account; never the value), the declared repo paths
 (the signed record's list, and nothing else: a launch never reads the workspace's `.git/config`, which the sandbox can
 write; the workspace's remotes are read once at SETUP, Phill present, and signed into the record, K-8) and attach
 yes/no. A store holding two live records for one canonical host refuses the launch, naming both
@@ -12,10 +14,13 @@ yes/no. A store holding two live records for one canonical host refuses the laun
 PER REQUEST the composer does ONE :func:`lookup` by canonical host (R15-18-L1) and hands that one result to every
 reader: classify's keyed-route rules (S3a: "keyed" = in the snapshot, R15-23-4) and :func:`decide_key` here. The
 snapshot is immutable for what it GRANTS and live for what REVOKES (R15-22-1): `decide_key` checks, once and bounded,
-that the snapshot's record id is still live (:class:`AuthorityLiveness`); a revoked or superseded record attaches
-nothing from the next request and the host stays keyed; a record made live, or a replacement, mid-launch attaches
-nothing until the next launch (R15-21-6, R15-25-4). The value is read from the credential store only when a key is
-chosen, in the service (it never enters the sandbox, an argv, an env, a record or a log), and it is never in a repr.
+that the snapshot's record is still live AS THE INCARNATION THE LAUNCH READ (:class:`AuthorityLiveness`; one read in
+flight at a time, and while that one is stuck past its bound every request is refused at once); a revoked or
+superseded record, or the same id revoked and created again, attaches nothing from the next request and the host
+stays keyed; a record made live, or a replacement, mid-launch attaches nothing until the next launch (R15-21-6,
+R15-25-4). The value is read from the credential store only when a key is chosen, in the service (it never enters
+the sandbox, an argv, an env, a record or a log), once per record incarnation per launch (:class:`LaunchCredentials`),
+and it is never in a repr.
 
 The key attaches only on (https, host, 443) (R15-10-A6, R15-12-B1 / B12): never on port 80, never on 8443. On an
 upload-pack exchange (the discovery `GET <prefix>/info/refs?service=git-upload-pack` and `POST
@@ -29,6 +34,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -40,7 +46,7 @@ from levain.chat_egress import wire
 from levain.chat_egress.parse import _canonical_path, canonical_host
 
 __all__ = ["ATTACH_VALUES", "AuthorityLiveness", "CredentialStore", "CredentialUnreadable", "KeyDecision",
-           "KeychainStore", "LaunchRefused", "LivenessUnreadable", "Placement", "RouteSet", "RouteSnapshot",
+           "KeychainStore", "LaunchCredentials", "LaunchRefused", "LivenessUnreadable", "Placement", "RouteSet", "RouteSnapshot",
            "build_route_set", "credential_placements", "decide_key", "lookup", "upload_pack_prefix",
            "workspace_remote_urls", "workspace_repos"]
 
@@ -61,16 +67,22 @@ _REMOTE_URL = re.compile(r"(?i:https)://(?:[^@/?#]*@)?(?P<host>[A-Za-z0-9._-]+)(
 @dataclass(frozen=True, slots=True)
 class RouteSnapshot:
     """One keyed host's route for one launch (R15-21-4), fixed by the build plan (S3a imports it):
-    record_id          the setup record the launch read (its liveness is checked per request)
-    canonical_host     `parse.canonical_host` of the record's host
-    credential_source  the keychain item name the service reads the value from at attach time (never the value)
-    declared_repos     the repo path prefixes an upload-pack exchange may carry the key for
-    attach             whether this route may attach at all (False: keyed for classification, never attaches)"""
+    record_id           the setup record the launch read (its liveness is checked per request)
+    canonical_host      `parse.canonical_host` of the record's host
+    credential_source   the keychain item's service the value is read from at attach time (never the value)
+    declared_repos      the repo path prefixes an upload-pack exchange may carry the key for
+    attach              whether this route may attach at all (False: keyed for classification, never attaches)
+    credential_account  the keychain item's account (with the service, one item); None reads no value
+    incarnation         the record's `levain.authority.egress_key_incarnation` at launch, compared on every
+                        liveness check; None is never live (both default to None, so a route built without them is
+                        keyed and attaches nothing)"""
     record_id: str
     canonical_host: str
     credential_source: str
     declared_repos: frozenset[str]
     attach: bool
+    credential_account: str | None = None
+    incarnation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,10 +157,11 @@ def _remote_repo(url: str, host: str) -> str | None:
 
 def build_route_set(authority: Any, *, entity: str, now: datetime) -> RouteSet:
     """The launch's route snapshot from one verified replay (`levain.authority.AuthoritySnapshot`): the live setup
-    records of `entity` (expired, revoked and superseded ones are not live), one route each, its declared repos the
-    record's signed list only (K-8: no workspace input). Two live records for one canonical host (any entity: a store
-    a foreign writer left so) refuses the launch naming both."""
-    from levain.authority import egress_key_conflicts, egress_key_live
+    records of `entity` (expired, revoked and superseded ones are not live), one route each, bound to the record's
+    incarnation, its declared repos the record's signed list only (K-8: no workspace input). Two live records of
+    `entity` for one canonical host (a store a foreign writer left so; the log refuses a second at append) refuse the
+    launch naming both; another entity's records are not this launch's and are not read."""
+    from levain.authority import egress_key_conflicts, egress_key_incarnation, egress_key_live
 
     grants = authority.policy.grants
     conflicts = [c for c in egress_key_conflicts(grants, now) if c[0] == entity]
@@ -162,7 +175,9 @@ def build_route_set(authority: Any, *, entity: str, now: datetime) -> RouteSet:
         if not egress_key_live(g, now) or g["entity"] != entity:
             continue
         routes.append(RouteSnapshot(record_id=gid, canonical_host=g["host"], credential_source=g["source"],
-                                    declared_repos=frozenset(g["repos"]), attach=True))
+                                    declared_repos=frozenset(g["repos"]), attach=True,
+                                    credential_account=g["account"],
+                                    incarnation=egress_key_incarnation(authority, gid)))
         p = g["placement"]
         placements[gid] = Placement("basic", p["user"]) if p["scheme"] == "basic" else Placement("bearer")
     return RouteSet.of(routes, placements)
@@ -210,67 +225,140 @@ def credential_placements(snapshot_set: RouteSet) -> list[dict]:
 # --- per request ------------------------------------------------------------------------------------------------
 
 class Liveness(Protocol):
-    def check(self, record_id: str) -> bool: ...
+    def check(self, record_id: str, incarnation: str | None) -> bool: ...
 
 
 class CredentialStore(Protocol):
-    def read(self, source: str) -> str: ...
+    def read(self, source: str, account: str) -> str: ...
+
+
+class _Flight:
+    """One liveness read: its start (monotonic), and its answer once done."""
+    __slots__ = ("started", "done", "snap", "err")
+
+    def __init__(self, started: float) -> None:
+        self.started = started
+        self.done = threading.Event()
+        self.snap: Any = None
+        self.err: BaseException | None = None
 
 
 class AuthorityLiveness:
-    """The per-request liveness check (R15-22-1): is the snapshot's record id still a live setup record in a fresh
-    verified replay? `source` returns that replay (production: `levain.consent.queue.authority_source(...)`). One read
-    per check, no retry, bounded by `timeout_s`: an error, a timeout or an exception raises
-    :class:`LivenessUnreadable` (R15-24-1). A read that outlives its bound finishes on a daemon thread and its answer
-    is dropped."""
+    """The per-request liveness check (R15-22-1): is the snapshot's record still a live setup record, AS THE
+    INCARNATION THE LAUNCH READ (`levain.authority.egress_key_incarnation`), in a fresh verified replay? `source`
+    returns that replay (production: `levain.consent.queue.authority_source(...)`). No retry, bounded by `timeout_s`:
+    an error, a timeout or an exception raises :class:`LivenessUnreadable` (R15-24-1).
+
+    SINGLE-FLIGHT: at most one read is in flight, on one daemon thread. A check answers only from a read that started
+    at or after the check did (a revoke that landed before the request is seen by it), so a check arriving while an
+    older read runs waits for that one to end, inside its own bound, then starts the next. While the read in flight
+    has outlived the bound (a wedged store), every check is refused at once, starting no thread; the next check after
+    that read ends starts a fresh one. A stuck read's answer is dropped."""
 
     def __init__(self, source: Callable[[], Any], *, clock: Callable[[], datetime], timeout_s: float = 2.0) -> None:
         self._source = source
         self._clock = clock
         self._timeout = timeout_s
+        self._lock = threading.Lock()
+        self._flight: _Flight | None = None
 
-    def check(self, record_id: str) -> bool:
-        from levain.authority import egress_key_live
-
-        box: dict[str, Any] = {}
+    def _start(self, now: float) -> _Flight:
+        f = _Flight(now)
 
         def read() -> None:
             try:
-                box["snap"] = self._source()
+                f.snap = self._source()
             except BaseException as exc:     # noqa: BLE001: any failure is "no answer"
-                box["err"] = exc
+                f.err = exc
+            finally:
+                f.done.set()
 
-        t = threading.Thread(target=read, name="levain-key-liveness", daemon=True)
-        t.start()
-        t.join(self._timeout)
-        if t.is_alive():
-            raise LivenessUnreadable("the setup-record store did not answer in time")
-        if "err" in box:
-            raise LivenessUnreadable(f"the setup-record store could not be read ({type(box['err']).__name__})")
+        self._flight = f
+        threading.Thread(target=read, name="levain-key-liveness", daemon=True).start()
+        return f
+
+    def _answer(self) -> Any:
+        arrived = time.monotonic()
+        deadline = arrived + self._timeout
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                f = self._flight
+                if f is not None and not f.done.is_set():
+                    if now - f.started >= self._timeout:
+                        raise LivenessUnreadable("the setup-record store is not answering (a read is stuck)")
+                    mine = f.started >= arrived
+                else:
+                    f, mine = self._start(now), True
+            if not f.done.wait(max(0.0, deadline - time.monotonic())):
+                raise LivenessUnreadable("the setup-record store did not answer in time")
+            if mine:
+                if f.err is not None:
+                    raise LivenessUnreadable(f"the setup-record store could not be read ({type(f.err).__name__})")
+                return f.snap
+            if time.monotonic() >= deadline:
+                raise LivenessUnreadable("the setup-record store did not answer in time")
+
+    def check(self, record_id: str, incarnation: str | None) -> bool:
+        from levain.authority import egress_key_incarnation, egress_key_live
+
+        snap = self._answer()
         try:
-            return egress_key_live(box["snap"].policy.grants.get(record_id), self._clock())
+            live = egress_key_live(snap.policy.grants.get(record_id), self._clock())
+            return live and incarnation is not None and egress_key_incarnation(snap, record_id) == incarnation
         except Exception as exc:             # noqa: BLE001: a malformed answer is no answer
             raise LivenessUnreadable(f"the setup-record store gave no usable answer ({type(exc).__name__})") from None
 
 
 class KeychainStore:
-    """The macOS login keychain: a generic password whose service is the source name (`security
-    find-generic-password -s <source> -w`). Read in the service, at attach time; the value is never logged. Tests
-    never construct this (a real item is a person's, S10)."""
+    """The macOS login keychain: the generic password with service `source` AND account `account` (`security
+    find-generic-password -s <source> -a <account> -w`; a service alone can name two items). Read in the service, at
+    attach time; the value is never logged. Tests construct it only over a fake `security` (a real item is a
+    person's, S10)."""
 
     def __init__(self, security: str = "/usr/bin/security", timeout_s: float = 5.0) -> None:
         self._security = security
         self._timeout = timeout_s
 
-    def read(self, source: str) -> str:
+    def read(self, source: str, account: str) -> str:
+        if not isinstance(account, str) or not account:
+            raise CredentialUnreadable("the setup record names no keychain account")
         try:
-            out = subprocess.run([self._security, "find-generic-password", "-s", source, "-w"], capture_output=True,
-                                 timeout=self._timeout, check=False, env={"PATH": "/usr/bin:/bin"})
+            out = subprocess.run([self._security, "find-generic-password", "-s", source, "-a", account, "-w"],
+                                 capture_output=True, timeout=self._timeout, check=False,
+                                 env={"PATH": "/usr/bin:/bin"})
         except (OSError, subprocess.TimeoutExpired):
             raise CredentialUnreadable("the keychain did not answer") from None
         if out.returncode != 0:
-            raise CredentialUnreadable(f"no keychain item {source[:80]!r}")
+            raise CredentialUnreadable(f"no keychain item {source[:80]!r} for account {account[:80]!r}")
         return out.stdout.decode("utf-8", "replace").rstrip("\n")
+
+
+class LaunchCredentials:
+    """One launch's credential values, read from `store` once per (record id, incarnation) and held for the launch,
+    so an attached request does not spawn a keychain read. Holding a value grants nothing: `decide_key` reaches it
+    only after that request's own liveness check passed for that incarnation (a revoke: zero key bytes from the next
+    request). A read that fails is not held (the next attached request reads again). Never in a repr."""
+
+    def __init__(self, store: CredentialStore) -> None:
+        self._store = store
+        self._lock = threading.Lock()
+        self._values: dict[tuple[str, str, str, str], str] = {}
+
+    def read(self, route: RouteSnapshot) -> str:
+        if route.incarnation is None or route.credential_account is None:
+            raise CredentialUnreadable("the route names no record incarnation or keychain account")
+        k = (route.record_id, route.incarnation, route.credential_source, route.credential_account)
+        with self._lock:
+            if k in self._values:
+                return self._values[k]
+            value = self._store.read(route.credential_source, route.credential_account)
+            if isinstance(value, str) and wire._CREDENTIAL.fullmatch(value):
+                self._values[k] = value
+            return value
+
+    def __repr__(self) -> str:
+        return f"LaunchCredentials({len(self._values)} held)"
 
 
 @dataclass(frozen=True)
@@ -313,17 +401,20 @@ def upload_pack_prefix(parsed: Any) -> str | None:
     return prefix or None
 
 
-def decide_key(route: RouteSnapshot | None, parsed: Any, *, liveness: Liveness, store: CredentialStore) -> KeyDecision:
+def decide_key(route: RouteSnapshot | None, parsed: Any, *, liveness: Liveness,
+               store: LaunchCredentials | CredentialStore) -> KeyDecision:
     """R-6 for one request, given the request's ONE lookup result `route` (R15-18-L1). The first value that applies
-    (R15-28-3): no audit value -> `not-evaluated` (no liveness read); an unkeyed host -> `none`; then ONE liveness read:
-    no answer -> `liveness-unreadable`, not live -> `revoked`; then off (https, 443), a route that never attaches, or
-    an upload-pack exchange for an undeclared prefix -> `none`; else the value is read and `attached`."""
+    (R15-28-3): no audit value -> `not-evaluated` (no liveness read); an unkeyed host -> `none`; then ONE liveness read
+    of the route's record AND incarnation: no answer -> `liveness-unreadable`, not live (or another incarnation) ->
+    `revoked`; then off (https, 443), a route that never attaches, or an upload-pack exchange for an undeclared prefix
+    -> `none`; else the value is read and `attached`. The launch passes its :class:`LaunchCredentials` (one keychain
+    read per record incarnation); a bare :class:`CredentialStore` is read on every attached request."""
     if parsed.request_id is None:
         return KeyDecision(None, NOT_EVALUATED)
     if route is None:
         return KeyDecision(None, NONE)
     try:
-        live = liveness.check(route.record_id)
+        live = liveness.check(route.record_id, route.incarnation)
     except LivenessUnreadable:
         return KeyDecision(route, LIVENESS_UNREADABLE)
     except Exception:                        # noqa: BLE001: a check that raises anything is unreadable
@@ -336,7 +427,12 @@ def decide_key(route: RouteSnapshot | None, parsed: Any, *, liveness: Liveness, 
     if prefix is not None and prefix not in route.declared_repos:
         return KeyDecision(route, NONE)
     try:
-        value = store.read(route.credential_source)
+        if isinstance(store, LaunchCredentials):
+            value = store.read(route)
+        elif route.credential_account is None:
+            raise CredentialUnreadable("the route names no keychain account")
+        else:
+            value = store.read(route.credential_source, route.credential_account)
     except Exception:                        # noqa: BLE001: no value is no key, whatever the store raised
         return KeyDecision(route, NONE, problem="credential-unreadable")
     if not isinstance(value, str) or not wire._CREDENTIAL.fullmatch(value):

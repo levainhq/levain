@@ -61,8 +61,8 @@ __all__ = [
     "consent_grant", "consent_grant_tool_problem", "consent_revocable", "consent_tool_shape_problem",
     "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem",
     "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_mismatch",
-    "custody_problem", "egress_key_conflicts", "egress_key_host_problem", "egress_key_live", "egress_key_record",
-    "egress_key_repo_problem", "is_passkey_material",
+    "custody_problem", "egress_key_conflicts", "egress_key_host_problem", "egress_key_incarnation", "egress_key_live",
+    "egress_key_record", "egress_key_repo_problem", "is_passkey_material",
     "genesis_policy", "inert_grant", "conn_data_root", "conn_init_hint", "init_hint", "log_head", "prepare", "read_anchor",
     "reset_anchor", "reset_hint", "reset_lock", "reset_message", "sign_and_append",
     "presence_missing", "quarantined", "signing_laptops", "snapshot", "sshsig_public_key", "UNSTATED",
@@ -231,18 +231,23 @@ _CONSENT_MCP_GRANT_FIELDS = _CONSENT_GRANT_FIELDS | {"mcp_fields"}
 CONSENT_AGENTS = ("claude_code", "codex")
 # A setup record (CH-D2, design §3.8.5(o) item 4, "re-attach: the setup record"): the operator names ONCE, under the
 # log's rule for a loosen (a laptop-presence key), a host whose requests from a chat launch of ``entity`` may carry a
-# credential Levain holds. It names the credential's SOURCE (a keychain item name the service reads at attach time),
-# never its value, which never enters a link. Fields: ``host`` (one plain-DNS name in its canonical form,
+# credential Levain holds. It names the credential's SOURCE (a keychain item name the service reads at attach time)
+# and its ``account`` (the keychain item's account: a service alone does not pick one item, two may share it, so
+# the read passes both and a record without an account is refused), never its value, which never enters a link.
+# Fields: ``host`` (one plain-DNS name in its canonical form,
 # ``levain.chat_egress.parse.canonical_host``; no wildcard, no IP literal), ``placement`` (``{"scheme": "bearer"}`` or
 # ``{"scheme": "basic", "user": U}``, R15-9's closed set), ``repos`` (ALL the declared repo paths: the operator's
 # own plus the workspace's remotes read once at setup; a launch reads only this list, K-8, item 4) and ``expires_at`` (at most 30 days past its link, the envelope an
 # older levain holds an unknown kind to, so a log carrying one still replays there, inert). At most ONE LIVE record
 # per (entity, canonical host) (R15-21-4): a second is refused at append (:func:`_egress_key_append_check`), and
-# replacing a credential is one ``loosen`` link that removes the old record and adds the new (a supersession). The
-# launch builds its route snapshot from the live records (``levain.chat_egress.keys``); "live" is
-# :func:`egress_key_live`, defined once. ``revoke_grant`` removes one (any enrolled key).
+# replacing a credential is one ``loosen`` link that removes the old record and adds the new (a supersession, a NEW
+# id): a record's id never changes meaning, so a same-id change to anything but ``expires_at`` is refused at append.
+# The launch builds its route snapshot from the live records (``levain.chat_egress.keys``), each bound to its
+# :func:`egress_key_incarnation`; "live" is :func:`egress_key_live`, defined once. ``revoke_grant`` removes one (any
+# enrolled key).
 EGRESS_KEY_KIND = "egress-key"
-_EGRESS_KEY_FIELDS = frozenset({"id", "kind", "entity", "host", "source", "placement", "repos", "expires_at"})
+_EGRESS_KEY_FIELDS = frozenset({"id", "kind", "entity", "host", "source", "account", "placement", "repos",
+                                "expires_at"})
 _EGRESS_KEY_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 # printable ASCII, no leading or trailing space, at most 255 characters
 _EGRESS_KEY_TEXT = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]{0,253}[\x21-\x7e])?")
@@ -605,6 +610,9 @@ class AuthoritySnapshot:
     anchor_warning: str | None = field(default=None, compare=False)
     # per standing grant, the seq of the link that last created or changed it (a create, a renew, a loosen)
     grant_seqs: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}), compare=False, repr=False)
+    # per standing grant, the seq of the link that brought its id into the policy (a create, or a loosen adding it):
+    # a renew or a change keeps it; a revoke and a later create of the same id gives a new one (an incarnation)
+    grant_born: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}), compare=False, repr=False)
 
     def key(self, fingerprint: str) -> AuthorityKey | None:
         return self.keys.get(fingerprint)
@@ -836,7 +844,7 @@ def _validate_egress_key(grant: Mapping[str, Any], what: str, at: datetime | Non
         raise AuthorityError(f"{what}.kind must be {EGRESS_KEY_KIND!r}")
     if not isinstance(grant["id"], str) or not _EGRESS_KEY_ID.fullmatch(grant["id"]):
         raise AuthorityError(f"{what}.id must match {_EGRESS_KEY_ID.pattern}")
-    for name in ("entity", "source"):
+    for name in ("entity", "source", "account"):
         if not isinstance(grant[name], str) or not _EGRESS_KEY_TEXT.fullmatch(grant[name]):
             raise AuthorityError(f"{what}.{name} must be 1 .. 255 printable ASCII characters (the {name}'s name)")
     problem = egress_key_host_problem(grant["host"])
@@ -867,7 +875,9 @@ def _validate_egress_key(grant: Mapping[str, Any], what: str, at: datetime | Non
 
 def _egress_key_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime, n_exp: datetime) -> str:
     """A setup record's change: ``renew`` when only its expiry moved later, anything else ``loose`` (a new host, a
-    new source, a new placement or a repo added or dropped is a new credential route, never narrower)."""
+    new source, account or placement, or a repo added or dropped is a new credential route, never narrower). The
+    replay's classification only: a new link that changes a record's id in place but its expiry is refused at
+    append (:func:`_egress_key_append_check`)."""
     rest = lambda g: _canonical({k: v for k, v in g.items() if k != "expires_at"})   # noqa: E731
     return "renew" if rest(o) == rest(n) and n_exp > o_exp else "loose"
 
@@ -899,11 +909,34 @@ def egress_key_conflicts(grants: Mapping[str, Any], now: datetime) -> list[tuple
     return [(e, h, tuple(sorted(ids))) for (e, h), ids in sorted(groups.items()) if len(ids) > 1]
 
 
+def _egress_key_meaning(grant: Any) -> str | None:
+    """A setup record's meaning: everything it says but its expiry, canonical (None: not a mapping)."""
+    if not isinstance(grant, Mapping):
+        return None
+    return _canonical(_thaw({k: v for k, v in grant.items() if k != "expires_at"}))
+
+
+def egress_key_incarnation(state: AuthoritySnapshot, record_id: str) -> str | None:
+    """The incarnation of setup record ``record_id`` in ``state``, or None when ``state`` holds no such record: the
+    seq of the link that brought the id into the policy, and a sha256 of its meaning (:func:`_egress_key_meaning`).
+    A launch's route carries it and every per-request liveness check compares it (``levain.chat_egress.keys``), so a
+    revoked id created again, or the same id holding another host, source, account, placement or repo list, is not
+    the record the launch read. A renew (only the expiry later) keeps it."""
+    grant = state.policy.grants.get(record_id)
+    born = state.grant_born.get(record_id)
+    if not egress_key_record(grant) or born is None:
+        return None
+    meaning = _egress_key_meaning(grant)
+    return f"{born}:{hashlib.sha256(meaning.encode()).hexdigest()}" if meaning is not None else None
+
+
 def _egress_key_append_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
     """The one-live rule at append (R15-21-4): a create or a loosen that brings in or changes a setup record may not
     leave two live records for that record's (entity, host). A supersession is the loosen that drops the old one in
-    the same link. Judged with the appender's clock (liveness reads expiry), so it is an append rule, not a replay
-    rule: a store a foreign writer left holding two is refused at LAUNCH, naming both (``levain.chat_egress.keys``)."""
+    the same link. And a record's id keeps its meaning: a loosen that keeps an id but changes anything of a setup
+    record there but its expiry (its host, source, account, placement, repos, entity or kind) is refused; that is a
+    supersession under a new id (a running launch's route is bound to the record it read). Judged with the
+    appender's clock (liveness reads expiry), so it is an append rule, not a replay rule: a store a foreign writer left holding two is refused at LAUNCH, naming both (``levain.chat_egress.keys``)."""
     if rec["op"] == "create_grant":
         grant = rec["grant"]
         after = {**state.policy.grants, grant["id"]: grant}
@@ -913,6 +946,11 @@ def _egress_key_append_check(state: AuthoritySnapshot, rec: Mapping[str, Any], n
         old = state.policy.grants
         brought = [g for gid, g in after.items()
                    if gid not in old or _canonical(_thaw(old[gid])) != _canonical(_thaw(g))]
+        for gid, g in after.items():
+            if gid in old and (egress_key_record(old[gid]) or egress_key_record(g)) \
+                    and _egress_key_meaning(old[gid]) != _egress_key_meaning(g):
+                raise AuthorityError(f"setup record {gid[:80]!r} keeps its meaning: a change to anything but its "
+                                     "expiry is a new record under a new id (a supersession), never the same id")
     else:
         return
     touched = {(g["entity"], g["host"]) for g in brought if egress_key_live(g, now)}
@@ -1313,6 +1351,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
     keys = {} if state is None else dict(state.keys)
     policy = genesis_policy() if state is None else state.policy
     grant_seqs = {} if state is None else dict(state.grant_seqs)
+    grant_born = {} if state is None else dict(state.grant_born)
     quarantined_history = False
     try:
         if state is None:
@@ -1370,6 +1409,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                 rank = _DELTA_RANK[delta]
                 grant_seqs = {gid: (grant_seqs.get(gid, seq) if gid in policy.grants and _canonical(
                     _thaw(policy.grants[gid])) == _canonical(_thaw(g)) else seq) for gid, g in need.grants.items()}
+                grant_born = {gid: (grant_born.get(gid, seq) if gid in policy.grants else seq) for gid in need.grants}
                 policy = need
             else:
                 rank = need
@@ -1403,7 +1443,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                                           f"at custody {signer.custody})" if quarantined_history else ""))
     hashes = (() if state is None else state._hashes) + (row.hash,)
     return AuthoritySnapshot(rec["store_id"], seq, row.hash, MappingProxyType(keys), policy, hashes, head_at=at,
-                             grant_seqs=MappingProxyType(grant_seqs))
+                             grant_seqs=MappingProxyType(grant_seqs), grant_born=MappingProxyType(grant_born))
 
 
 def _apply_op(rec: Mapping[str, Any], seq: int, state: AuthoritySnapshot, keys: dict[str, AuthorityKey],

@@ -17,18 +17,22 @@ AUDIT = "0b6f5f3e-3c1d-4c8e-9a3e-2d7b1f0c9a11"
 # a value no code in the repo spells, so a grep hit is this test's leak and nothing else
 KEY = "lvn-S6-HELD-KEY-7f3c9a2e5b1d4068"
 SOURCE = "levain-chat-test-item"
+ACCOUNT = "levain-chat-test-account"
 
 
 class FakeStore:
-    """The credential store a test hands the decider: the value by source name, and every read counted."""
+    """The credential store a test hands the decider: the value by source name, and every read counted (`reads` the
+    sources, `accounts` the accounts each read named)."""
 
     def __init__(self, values: dict[str, str] | None = None, *, fail: bool = False) -> None:
         self.values = dict(values if values is not None else {SOURCE: KEY})
         self.fail = fail
         self.reads: list[str] = []
+        self.accounts: list[str | None] = []
 
-    def read(self, source: str) -> str:
+    def read(self, source: str, account: str | None = None) -> str:
         self.reads.append(source)
+        self.accounts.append(account)
         if self.fail or source not in self.values:
             raise LookupError("no such item")
         return self.values[source]
@@ -77,9 +81,10 @@ class Cockpit:
 
 
 def record(rid: str, host: str, *, entity: str = "ent", source: str = SOURCE, repos=("/o/r.git",),
-           days: int = 7, placement=None) -> dict:
-    """A setup record as the log stores it (host already canonical)."""
-    return {"id": rid, "kind": auth.EGRESS_KEY_KIND, "entity": entity, "host": host, "source": source,
+           days: int = 7, placement=None, account: str | None = ACCOUNT) -> dict:
+    """A setup record as the log stores it (host already canonical); `account=None` leaves the account out."""
+    extra = {} if account is None else {"account": account}
+    return {"id": rid, "kind": auth.EGRESS_KEY_KIND, "entity": entity, "host": host, "source": source, **extra,
             "placement": placement or {"scheme": "bearer"}, "repos": sorted(repos),
             "expires_at": auth._stamp(datetime.now(timezone.utc) + timedelta(days=days))}
 

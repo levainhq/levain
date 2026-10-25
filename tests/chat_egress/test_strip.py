@@ -74,6 +74,23 @@ def test_the_removal_is_a_valid_allow():
     assert set(f["removeHeaders"]) == set(s.remove_headers)
 
 
+def test_a_removal_past_srts_limit_is_a_deny_never_a_truncation():
+    """179 carried backstop names plus the 12 listed ones are 191 > wire.MAX_REMOVE_NAMES: an explicit DENY (no
+    allow is built, so no WireError reaches the decider) with the carried names still recorded; one fewer fits."""
+    n_listed = len(strip.CRED_STRIP_HEADERS)
+    over = wire.MAX_REMOVE_NAMES - n_listed + 1
+    p = parse(frame(headers={f"x-token-{i}": ["v"] for i in range(over)}))
+    s = strip.strip(p)
+    assert s.deny == strip.DENY_TOO_MANY_CREDENTIAL_HEADERS and s.remove_headers == ()
+    assert len(s.stripped) == over
+    deny = wire.deny_frame(p.srt_id, 403, s.deny)
+    assert deny["action"] == "deny"
+    fits = parse(frame(headers={f"x-token-{i}": ["v"] for i in range(over - 1)}))
+    ok = strip.strip(fits)
+    assert ok.deny is None and len(ok.remove_headers) == wire.MAX_REMOVE_NAMES
+    assert len(wire.allow_frame(fits.srt_id, ok.remove_headers)["removeHeaders"]) == wire.MAX_REMOVE_NAMES
+
+
 @pytest.mark.parametrize("port, sni", [(80, None), (443, "default")])
 def test_r15_12_b12_the_strip_is_the_same_on_plain_http(port, sni):
     s = _strip({"authorization": ["Bearer x"], "cookie": ["a=1"], "x-api-key": ["k"], "x_api_key": ["k"]},

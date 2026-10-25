@@ -8,14 +8,18 @@ new record mid-launch attaches nothing until relaunch), R15-21-6 (made live mid-
 is keyed; a redirect to an undeclared repo goes keyless), R15-23-4 (keyed = snapshot membership, liveness gates
 attachment only), R15-24-1 (an unreadable liveness store: an error and, separately, a timeout), R15-25-4 (B supersedes
 A mid-launch: zero key bytes, B's included, until relaunch), R15-26-2 (the five `attach` values), R15-28-3 (their
-precedence).
+precedence). S6 L3 r1: the route bound to the record's incarnation (a revoked id created again, a same-id change
+refused at append), single-flight liveness under a hung store, the keychain read by service AND account, and one
+keychain read per record incarnation per launch.
 
 Where a row's red ends at a card or a wall (A11 under `open network`), the card is S3a's verdict: this file asserts
 what S6 owns, that the request is KEYED and carries zero key bytes. The credential store is a fake (keys_rig); the
-real keychain is never read.
+real keychain is never read. Records enter the log through the rig's own links (`Cockpit.link`), so these rows hold
+the log's and the decider's rules whatever `levain chat key setup` does in front of them (its own file covers it).
 """
 from __future__ import annotations
 
+import stat
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -23,14 +27,15 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import levain.authority as auth
-from levain.chat_egress import key_setup, keys, strip, wire
+from levain.chat_egress import keys, strip, wire
 from levain.chat_egress.parse import parse
 
-from .keys_rig import KEY, SOURCE, Cockpit, FakeStore, artifact_hits, frame, record
+from .keys_rig import ACCOUNT, KEY, SOURCE, Cockpit, FakeStore, artifact_hits, frame, record
 
 NOW = datetime.now(timezone.utc)
 INFO_REFS = "/o/r.git/info/refs"
 SVC = "service=git-upload-pack"
+INC = "1:" + "0" * 64
 
 
 class Live:
@@ -41,16 +46,17 @@ class Live:
         self.error, self.hang = error, hang
         self.calls: list[str] = []
 
-    def check(self, record_id: str) -> bool:
+    def check(self, record_id: str, incarnation: str | None) -> bool:
         self.calls.append(record_id)
         if self.error is not None:
             raise self.error
         return record_id in self.live
 
 
-def _route(rid="ek-000000000001", host="example.com", repos=("/o/r.git",), attach=True):
+def _route(rid="ek-000000000001", host="example.com", repos=("/o/r.git",), attach=True, inc=INC):
     return keys.RouteSnapshot(record_id=rid, canonical_host=host, credential_source=SOURCE,
-                              declared_repos=frozenset(repos), attach=attach)
+                              declared_repos=frozenset(repos), attach=attach, credential_account=ACCOUNT,
+                              incarnation=inc)
 
 
 def _set(*routes):
@@ -69,17 +75,58 @@ def _verdict(d, f):
     return wire.allow_frame(p.srt_id, s.remove_headers, cred=d.cred, credential=d.credential)
 
 
+def _create(ck, rid, host="example.com", **kw):
+    """A setup record created by one `create_grant` link; returns the record."""
+    rec = record(rid, host, **kw)
+    ck.link({"op": "create_grant", "grant": rec})
+    return rec
+
+
+def _revoke(ck, rid):
+    ck.link({"op": "revoke_grant", "grant_id": rid})
+
+
+def _supersede(ck, old_id, new_id, host="example.com", **kw):
+    """The supersession: one `loosen` link dropping `old_id` and adding `new_id`."""
+    policy = auth._thaw(ck.state().policy.as_dict())
+    del policy["grants"][old_id]
+    rec = record(new_id, host, **kw)
+    policy["grants"][new_id] = rec
+    ck.link({"op": "loosen", "policy": policy})
+    return rec
+
+
+def _launch(ck, entity="ent"):
+    return keys.build_route_set(ck.state(), entity=entity, now=datetime.now(timezone.utc))
+
+
+def _live(ck, timeout_s=10.0):
+    return keys.AuthorityLiveness(ck.source(), clock=lambda: datetime.now(timezone.utc), timeout_s=timeout_s)
+
+
 # --- RouteSnapshot: the type the plan fixes (S3a imports it) ------------------------------------------------------
 
 def test_route_snapshot_is_the_fixed_type():
     import dataclasses
 
     names = [f.name for f in dataclasses.fields(keys.RouteSnapshot)]
-    assert names == ["record_id", "canonical_host", "credential_source", "declared_repos", "attach"]
+    assert names == ["record_id", "canonical_host", "credential_source", "declared_repos", "attach",
+                     "credential_account", "incarnation"]
     r = _route()
     with pytest.raises(dataclasses.FrozenInstanceError):
         r.attach = False  # type: ignore[misc]
     assert isinstance(r.declared_repos, frozenset)
+
+
+def test_a_route_built_without_account_or_incarnation_attaches_nothing():
+    """The two fields default to None so a route built the old way still classifies as keyed; it never attaches."""
+    bare = keys.RouteSnapshot(record_id="ek-000000000001", canonical_host="example.com", credential_source=SOURCE,
+                              declared_repos=frozenset(), attach=True)
+    store = FakeStore()
+    d = _decide(bare, frame(path="/x"), store=store)
+    assert d.keyed and d.credential is None and d.problem == "credential-unreadable" and store.reads == []
+    d = _decide(bare, frame(path="/x"), store=keys.LaunchCredentials(store))
+    assert d.credential is None and store.reads == []
 
 
 def test_lookup_is_by_canonical_host_and_unknown_is_none():
@@ -203,7 +250,7 @@ def test_a_credential_store_that_cannot_answer_attaches_nothing():
     store = FakeStore(fail=True)
     d = _decide(_route(), frame(path="/x"), store=store)
     assert d.credential is None and d.attach == "none" and d.problem == "credential-unreadable"
-    assert store.reads == [SOURCE]
+    assert store.reads == [SOURCE] and store.accounts == [ACCOUNT]
 
 
 def test_a_value_srt_would_refuse_attaches_nothing():
@@ -218,14 +265,95 @@ def test_the_store_is_read_only_when_attaching():
     assert store.reads == []
 
 
+# --- F8: one keychain read per record incarnation per launch -----------------------------------------------------
+
+def test_launch_credentials_read_the_store_once_per_incarnation():
+    store = FakeStore()
+    creds = keys.LaunchCredentials(store)
+    r = _route()
+    for _ in range(3):
+        d = _decide(r, frame(path="/x"), store=creds)
+        assert (d.attach, d.credential) == ("attached", KEY)
+    assert store.reads == [SOURCE] and store.accounts == [ACCOUNT]
+    other = _route(inc="2:" + "1" * 64)                       # the same id, another incarnation: read afresh
+    assert _decide(other, frame(path="/x"), store=creds).credential == KEY
+    assert store.reads == [SOURCE, SOURCE]
+    assert KEY not in repr(creds)
+
+
+def test_launch_credentials_hold_no_failed_or_unusable_read():
+    store = FakeStore(fail=True)
+    creds = keys.LaunchCredentials(store)
+    for _ in range(2):
+        assert _decide(_route(), frame(path="/x"), store=creds).problem == "credential-unreadable"
+    assert store.reads == [SOURCE, SOURCE]
+    bad = FakeStore({SOURCE: "has space"})
+    creds = keys.LaunchCredentials(bad)
+    for _ in range(2):
+        assert _decide(_route(), frame(path="/x"), store=creds).problem == "credential-unusable"
+    assert bad.reads == [SOURCE, SOURCE]
+
+
+def test_f8_a_held_value_is_zero_bytes_after_a_revoke(tmp_path):
+    ck = Cockpit(tmp_path)
+    rec = _create(ck, "ek-000000000001")
+    s, live, store = _launch(ck), _live(ck), FakeStore()
+    creds = keys.LaunchCredentials(store)
+    f = frame(path=INFO_REFS, query=SVC)
+    for _ in range(2):
+        assert _real(s, live, f, creds).attach == "attached"
+    assert store.reads == [SOURCE]
+    _revoke(ck, rec["id"])
+    d = _real(s, live, f, creds)
+    assert (d.attach, d.credential, d.keyed) == ("revoked", None, True)
+
+
+# --- F5: the keychain item is service AND account -----------------------------------------------------------------
+
+def _fake_security(tmp_path, value="lvn-fake-value"):
+    """A stand-in `security` binary that records its argv and prints a value (never the real keychain)."""
+    fake = tmp_path / "security"
+    argv = tmp_path / "argv"
+    fake.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > '{argv}'\necho '{value}'\n")
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    return str(fake), argv
+
+
+def test_f5_the_keychain_read_names_service_and_account(tmp_path):
+    fake, argv = _fake_security(tmp_path)
+    assert keys.KeychainStore(fake).read(SOURCE, ACCOUNT) == "lvn-fake-value"
+    assert argv.read_text().splitlines() == ["find-generic-password", "-s", SOURCE, "-a", ACCOUNT, "-w"]
+
+
+@pytest.mark.parametrize("account", [None, ""])
+def test_f5_a_keychain_read_without_an_account_is_refused_unspawned(tmp_path, account):
+    fake, argv = _fake_security(tmp_path)
+    with pytest.raises(keys.CredentialUnreadable):
+        keys.KeychainStore(fake).read(SOURCE, account)  # type: ignore[arg-type]
+    assert not argv.exists()
+
+
+def test_f5_the_log_refuses_a_setup_record_without_an_account(tmp_path):
+    ck = Cockpit(tmp_path)
+    with pytest.raises(auth.AuthorityError, match="account"):
+        ck.link({"op": "create_grant", "grant": record("ek-000000000001", "example.com", account=None)})
+    with pytest.raises(auth.AuthorityError, match="account"):
+        ck.link({"op": "create_grant", "grant": record("ek-000000000001", "example.com", account=" padded")})
+
+
+def test_f5_the_route_carries_the_records_account(tmp_path):
+    ck = Cockpit(tmp_path)
+    _create(ck, "ek-000000000001", account="me@example.com")
+    r = _launch(ck).routes["example.com"]
+    assert (r.credential_source, r.credential_account) == (SOURCE, "me@example.com")
+
+
 # --- R15-24-1: the liveness store unreadable ---------------------------------------------------------------------
 
 def test_r15_24_1_an_error_attaches_nothing_and_stays_keyed(tmp_path):
     ck = Cockpit(tmp_path)
-    rec, _ = key_setup.setup_key(ck.root, entity="ent", host="example.com", source=SOURCE,
-                                 placement={"scheme": "bearer"}, repos=["/o/r.git"], expires=timedelta(days=7),
-                                 **ck.kw())
-    s = keys.build_route_set(ck.state(), entity="ent", now=NOW)
+    _create(ck, "ek-000000000001")
+    s = _launch(ck)
     reads = []
 
     def broken():
@@ -265,17 +393,110 @@ def test_r15_24_1_a_post_under_open_network_is_still_keyed():
     assert d.keyed and d.credential is None and d.attach == "liveness-unreadable"
 
 
+# --- F3: single-flight liveness under a hung store ----------------------------------------------------------------
+
+def _liveness_threads():
+    return sum(1 for t in threading.enumerate() if t.name == "levain-key-liveness" and t.is_alive())
+
+
+def test_f3_a_hung_store_holds_one_read_and_refuses_the_rest_at_once():
+    gate = threading.Event()
+    reads = []
+
+    def hung():
+        reads.append(1)
+        gate.wait(30)
+
+    live = keys.AuthorityLiveness(hung, clock=lambda: datetime.now(timezone.utc), timeout_s=0.2)
+    before = _liveness_threads()
+    try:
+        first = _decide(_route(), frame(path="/x"), live=live)            # waits its bound, then refuses
+        assert first.attach == "liveness-unreadable"
+        t0 = time.monotonic()
+        sequential = [_decide(_route(), frame(path="/x"), live=live) for _ in range(50)]
+        assert time.monotonic() - t0 < 0.5                                # refused at once, never 50 bounds
+        out: list = []
+        ts = [threading.Thread(target=lambda: out.append(_decide(_route(), frame(path="/x"), live=live)))
+              for _ in range(20)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(5)
+        assert {d.attach for d in sequential + out} == {"liveness-unreadable"}
+        assert all(d.credential is None for d in sequential + out) and len(out) == 20
+        assert reads == [1] and _liveness_threads() - before <= 1
+    finally:
+        gate.set()
+
+
+def test_f3_after_a_stuck_read_ends_the_next_check_reads_afresh(tmp_path):
+    ck = Cockpit(tmp_path)
+    _create(ck, "ek-000000000001")
+    s = _launch(ck)
+    gate = threading.Event()
+    real = ck.source()
+    calls = []
+
+    def source():
+        calls.append(1)
+        if len(calls) == 1:
+            gate.wait(30)
+        return real()
+
+    live = keys.AuthorityLiveness(source, clock=lambda: datetime.now(timezone.utc), timeout_s=0.2)
+    route = keys.lookup(s, "example.com")
+    assert _decide(route, frame(path="/x"), live=live).attach == "liveness-unreadable"
+    gate.set()
+    deadline = time.monotonic() + 5
+    while live._flight is not None and not live._flight.done.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert _decide(route, frame(path="/x"), live=live).attach == "attached"
+    assert len(calls) == 2
+
+
+def test_f3_a_check_never_answers_from_a_read_that_started_before_it(tmp_path):
+    """Request B arrives while A's read is in flight (not stuck) and a revoke lands between: B waits for A's read
+    to end and then reads afresh, so B sees the revoke (two reads, B revoked) and A's older answer is A's alone."""
+    ck = Cockpit(tmp_path)
+    rec = _create(ck, "ek-000000000001")
+    s = _launch(ck)
+    route = keys.lookup(s, "example.com")
+    real = ck.source()
+    first_started, release = threading.Event(), threading.Event()
+    calls = []
+
+    def source():
+        calls.append(1)
+        snap = real()
+        if len(calls) == 1:
+            first_started.set()
+            release.wait(10)
+        return snap
+
+    live = keys.AuthorityLiveness(source, clock=lambda: datetime.now(timezone.utc), timeout_s=5.0)
+    got: dict = {}
+    a = threading.Thread(target=lambda: got.update(a=_decide(route, frame(path="/x"), live=live)))
+    a.start()
+    assert first_started.wait(5)
+    _revoke(ck, rec["id"])
+    b = threading.Thread(target=lambda: got.update(b=_decide(route, frame(path="/x"), live=live)))
+    b.start()
+    time.sleep(0.1)
+    release.set()
+    a.join(10)
+    b.join(10)
+    assert got["a"].attach == "attached" and (got["b"].attach, got["b"].credential) == ("revoked", None)
+    assert len(calls) == 2
+
+
 # --- the launch snapshot against a real log: R15-21-4, R15-21-6, R15-23-4, R15-25-4, R15-18-L1 --------------------
 
 @pytest.fixture
 def launched(tmp_path):
     ck = Cockpit(tmp_path)
-    rec, _ = key_setup.setup_key(ck.root, entity="ent", host="Example.COM.", source=SOURCE,
-                                 placement={"scheme": "bearer"}, repos=["/o/r.git"], expires=timedelta(days=7),
-                                 **ck.kw())
-    s = keys.build_route_set(ck.state(), entity="ent", now=NOW)
-    live = keys.AuthorityLiveness(ck.source(), clock=lambda: datetime.now(timezone.utc), timeout_s=10.0)
-    return ck, rec, s, live
+    rec = _create(ck, "ek-000000000001")
+    s = _launch(ck)
+    return ck, rec, s, _live(ck)
 
 
 def _real(s, live, f, store=None):
@@ -284,12 +505,13 @@ def _real(s, live, f, store=None):
     return keys.decide_key(route, p, liveness=live, store=store or FakeStore())
 
 
-def test_r15_21_6_setup_host_Example_COM_dot_keys_example_com_on_https_443(launched):
+def test_r15_21_6_the_records_canonical_host_keys_example_com_on_https_443(launched):
     ck, rec, s, live = launched
     assert set(s.routes) == {"example.com"}
     r = s.routes["example.com"]
     assert (r.record_id, r.credential_source, r.declared_repos, r.attach) == (rec["id"], SOURCE,
                                                                               frozenset({"/o/r.git"}), True)
+    assert r.incarnation == auth.egress_key_incarnation(ck.state(), rec["id"]) and r.incarnation is not None
     d = _real(s, live, frame(host="example.com", path=INFO_REFS, query=SVC))
     assert d.attach == "attached" and d.credential == KEY
 
@@ -297,7 +519,7 @@ def test_r15_21_6_setup_host_Example_COM_dot_keys_example_com_on_https_443(launc
 def test_r15_21_4_r15_23_4_revoke_mid_launch_zero_bytes_still_keyed(launched):
     ck, rec, s, live = launched
     assert _real(s, live, frame(path=INFO_REFS, query=SVC)).attach == "attached"
-    key_setup.revoke_key(ck.root, rec["id"], **ck.kw())
+    _revoke(ck, rec["id"])
     d = _real(s, live, frame(path=INFO_REFS, query=SVC))
     assert (d.keyed, d.attach, d.credential) == (True, "revoked", None)
     post = _real(s, live, frame(method="POST", path="/api/x"))           # open network: still a keyed write (A11)
@@ -306,25 +528,77 @@ def test_r15_21_4_r15_23_4_revoke_mid_launch_zero_bytes_still_keyed(launched):
 
 def test_r15_21_4_r15_21_6_a_record_made_live_mid_launch_attaches_nothing_until_relaunch(launched):
     ck, rec, s, live = launched
-    key_setup.setup_key(ck.root, entity="ent", host="git.example.org", source=SOURCE,
-                        placement={"scheme": "bearer"}, repos=["/o/r.git"], expires=timedelta(days=7), **ck.kw())
+    _create(ck, "ek-000000000002", "git.example.org")
     f = frame(host="git.example.org", path=INFO_REFS, query=SVC)
     d = _real(s, live, f)
     assert (d.keyed, d.attach, d.credential) == (False, "none", None)
-    s2 = keys.build_route_set(ck.state(), entity="ent", now=datetime.now(timezone.utc))      # the next launch
+    s2 = _launch(ck)                                                      # the next launch
     assert _real(s2, live, f).attach == "attached"
 
 
 def test_r15_25_4_b_supersedes_a_mid_launch_zero_bytes_bs_included_until_relaunch(launched):
     ck, rec, s, live = launched
-    new, _ = key_setup.setup_key(ck.root, entity="ent", host="example.com", source=SOURCE,
-                                 placement={"scheme": "bearer"}, repos=["/o/r.git"], expires=timedelta(days=7),
-                                 replace=True, **ck.kw())
+    new = _supersede(ck, rec["id"], "ek-000000000002")
     d = _real(s, live, frame(path=INFO_REFS, query=SVC))
     assert (d.keyed, d.attach, d.credential) == (True, "revoked", None)
-    s2 = keys.build_route_set(ck.state(), entity="ent", now=datetime.now(timezone.utc))
+    s2 = _launch(ck)
     d2 = _real(s2, live, frame(path=INFO_REFS, query=SVC))
     assert d2.attach == "attached" and s2.routes["example.com"].record_id == new["id"]
+
+
+# --- F2: a route is bound to the record's incarnation ------------------------------------------------------------
+
+@pytest.mark.parametrize("change", [{}, {"source": "another-item"}, {"repos": ("/o/r.git", "/o/evil.git")},
+                                    {"account": "someone-else"}])
+def test_f2_revoke_then_recreate_the_same_id_leaves_the_stale_launch_keyless(launched, change):
+    """The id revoked and created again, identical or not, is another incarnation: the running launch's route
+    (the record it READ) attaches nothing from the next request, and stays keyed; the next launch attaches."""
+    ck, rec, s, live = launched
+    _revoke(ck, rec["id"])
+    _create(ck, rec["id"], **change)
+    store = FakeStore({SOURCE: KEY, "another-item": KEY})
+    d = _real(s, live, frame(path=INFO_REFS, query=SVC), store)
+    assert (d.keyed, d.attach, d.credential) == (True, "revoked", None) and store.reads == []
+    assert _real(_launch(ck), live, frame(path=INFO_REFS, query=SVC), store).attach == "attached"
+
+
+@pytest.mark.parametrize("change", [{"host": "evil.example"}, {"source": "another-item"}, {"account": "other"},
+                                    {"placement": {"scheme": "basic", "user": "x"}},
+                                    {"repos": ("/o/r.git", "/o/evil.git")}, {"repos": ()}, {"entity": "ent2"}])
+def test_f2_a_same_id_change_but_its_expiry_is_refused_at_append(launched, change):
+    ck, rec, s, live = launched
+    policy = auth._thaw(ck.state().policy.as_dict())
+    host = change.pop("host", "example.com")
+    policy["grants"][rec["id"]] = record(rec["id"], host, **change)
+    with pytest.raises(auth.AuthorityError, match="keeps its meaning"):
+        ck.link({"op": "loosen", "policy": policy})
+    assert _real(s, live, frame(path=INFO_REFS, query=SVC)).attach == "attached"
+
+
+def test_f2_a_renew_keeps_the_incarnation_and_the_launch_keyed(launched):
+    """Only the expiry moved later: the record the launch read, still; its liveness reads the new expiry."""
+    ck, rec, s, live = launched
+    before = auth.egress_key_incarnation(ck.state(), rec["id"])
+    at = datetime.now(timezone.utc)
+    ck.link({"op": "renew", "grant_id": rec["id"], "expires_at": auth._stamp(at + timedelta(days=20)),
+             "signed_at": auth._stamp(at)}, at=at)
+    assert ck.state().policy.grants[rec["id"]]["expires_at"] != rec["expires_at"]
+    assert auth.egress_key_incarnation(ck.state(), rec["id"]) == before
+    assert _real(s, live, frame(path=INFO_REFS, query=SVC)).attach == "attached"
+
+
+def test_f2_the_incarnation_is_none_for_no_record(launched):
+    ck, rec, s, live = launched
+    assert auth.egress_key_incarnation(ck.state(), "ek-nothing") is None
+    _revoke(ck, rec["id"])
+    assert auth.egress_key_incarnation(ck.state(), rec["id"]) is None
+
+
+def test_f2_the_liveness_check_compares_the_incarnation(launched):
+    ck, rec, s, live = launched
+    r = s.routes["example.com"]
+    assert live.check(r.record_id, r.incarnation) is True
+    assert live.check(r.record_id, "1:" + "f" * 64) is False and live.check(r.record_id, None) is False
 
 
 def test_r15_18_l1_one_lookup_per_request_and_a_record_made_live_between_r5_and_r6_changes_nothing(launched,
@@ -339,8 +613,7 @@ def test_r15_18_l1_one_lookup_per_request_and_a_record_made_live_between_r5_and_
     p = parse(f)
     route = keys.lookup(s, p.canonical_host)
     stripped = strip.strip(p)                                                      # R-5
-    key_setup.setup_key(ck.root, entity="ent", host="git.example.org", source=SOURCE,  # the seam
-                        placement={"scheme": "bearer"}, repos=["/o/r.git"], expires=timedelta(days=7), **ck.kw())
+    _create(ck, "ek-000000000002", "git.example.org")                              # the seam
     d = keys.decide_key(route, p, liveness=live, store=FakeStore())                   # R-6
     assert calls == ["git.example.org"]
     assert (d.keyed, d.attach, d.credential) == (False, "none", None)
@@ -349,13 +622,23 @@ def test_r15_18_l1_one_lookup_per_request_and_a_record_made_live_between_r5_and_
 
 def test_build_route_set_reads_only_the_entitys_live_records(tmp_path):
     ck = Cockpit(tmp_path)
-    key_setup.setup_key(ck.root, entity="other", host="example.com", source=SOURCE,
-                        placement={"scheme": "bearer"}, repos=[], expires=timedelta(days=7), **ck.kw())
-    assert keys.build_route_set(ck.state(), entity="ent", now=NOW).routes == {}
+    _create(ck, "ek-000000000001", entity="other", repos=())
+    assert _launch(ck).routes == {}
 
 
-def test_setup_signs_the_workspaces_own_https_remotes_on_that_host_into_the_record(tmp_path):
-    """K-8: the workspace's remotes are read at SETUP and signed in; the launch reads the record."""
+def test_build_route_set_refuses_two_live_records_of_the_entity_for_one_host_only(tmp_path, monkeypatch):
+    """The per-entity rule (F10): another entity's two live records for a host are not this launch's."""
+    ck = Cockpit(tmp_path)
+    monkeypatch.setattr(auth, "_egress_key_append_check", lambda state, rec, now: None)   # a foreign writer
+    _create(ck, "ek-000000000001", entity="other")
+    _create(ck, "ek-000000000002", entity="other")
+    assert _launch(ck).routes == {}
+    with pytest.raises(keys.LaunchRefused, match="ek-000000000001, ek-000000000002"):
+        _launch(ck, entity="other")
+
+
+def test_the_launch_reads_the_records_signed_repos_and_workspace_repos_reads_the_remotes(tmp_path):
+    """K-8: `workspace_repos` (SETUP's read) gives the https remotes on the host; the launch reads the record only."""
     import subprocess
 
     ck = Cockpit(tmp_path)
@@ -366,23 +649,19 @@ def test_setup_signs_the_workspaces_own_https_remotes_on_that_host_into_the_reco
                "https://example.com:8443/o/port.git", "git@example.com:o/ssh.git", "https://other.example/o/x.git"]
     for i, url in enumerate(remotes):
         subprocess.run(["git", "-C", str(ws), "remote", "add", f"r{i}", url], check=True, timeout=30)
-    rec, _ = key_setup.setup_key(ck.root, entity="ent", host="example.com", source=SOURCE,
-                                 placement={"scheme": "bearer"}, repos=["/added.git"], expires=timedelta(days=7),
-                                 workspace=ws, **ck.kw())
-    assert rec["repos"] == ["/added.git", "/o/r.git", "/o/s"]
-    s = keys.build_route_set(ck.state(), entity="ent", now=NOW)
-    assert s.routes["example.com"].declared_repos == frozenset({"/added.git", "/o/r.git", "/o/s"})
+    assert keys.workspace_repos(ws, "example.com") == ("/o/r.git", "/o/s")
+    _create(ck, "ek-000000000001", repos=("/added.git", "/o/r.git", "/o/s"))
+    subprocess.run(["git", "-C", str(ws), "remote", "add", "late", "https://example.com/o/late.git"], check=True,
+                   timeout=30)
+    assert _launch(ck).routes["example.com"].declared_repos == frozenset({"/added.git", "/o/r.git", "/o/s"})
 
 
 def test_k8_a_record_with_no_repos_keys_the_host_and_attaches_on_no_upload_pack_prefix(tmp_path):
-    """A setup with no --repo and no repo for a workspace: the host is keyed, and every upload-pack exchange,
-    discovery and POST alike, goes keyless (no store read)."""
+    """A record with no declared repo: the host is keyed, and every upload-pack exchange, discovery and POST alike,
+    goes keyless (no store read)."""
     ck = Cockpit(tmp_path)
-    rec, _ = key_setup.setup_key(ck.root, entity="ent", host="example.com", source=SOURCE,
-                                 placement={"scheme": "bearer"}, repos=[], expires=timedelta(days=7),
-                                 workspace=tmp_path / "not-a-repo", **ck.kw())
-    assert rec["repos"] == []
-    s = keys.build_route_set(ck.state(), entity="ent", now=NOW)
+    rec = _create(ck, "ek-000000000001", repos=())
+    s = _launch(ck)
     store = FakeStore()
     live = Live([rec["id"]])
     for f in (frame(path=INFO_REFS, query=SVC), frame(method="POST", path="/o/r.git/git-upload-pack")):
@@ -407,12 +686,10 @@ def test_workspace_remote_urls_reads_the_repos_own_config(tmp_path):
 
 def test_credential_placements_name_each_record_as_its_class(tmp_path):
     ck = Cockpit(tmp_path)
-    a, _ = key_setup.setup_key(ck.root, entity="ent", host="example.com", source=SOURCE,
-                               placement={"scheme": "bearer"}, repos=[], expires=timedelta(days=7), **ck.kw())
-    b, _ = key_setup.setup_key(ck.root, entity="ent", host="git.example.org", source=SOURCE,
-                               placement={"scheme": "basic", "user": "x-access-token"}, repos=[],
-                               expires=timedelta(days=7), **ck.kw())
-    s = keys.build_route_set(ck.state(), entity="ent", now=NOW)
+    a = _create(ck, "ek-000000000001", repos=())
+    b = _create(ck, "ek-000000000002", "git.example.org", repos=(),
+                placement={"scheme": "basic", "user": "x-access-token"})
+    s = _launch(ck)
     assert sorted(keys.credential_placements(s), key=lambda p: p["host"]) == [
         {"class": a["id"], "host": "example.com", "scheme": "bearer"},
         {"class": b["id"], "host": "git.example.org", "scheme": "basic", "user": "x-access-token"}]
@@ -422,10 +699,11 @@ def test_credential_placements_name_each_record_as_its_class(tmp_path):
 
 def test_k2_the_key_value_is_in_no_artifact(launched, tmp_path):
     ck, rec, s, live = launched
+    creds = keys.LaunchCredentials(FakeStore())
     for f in (frame(path=INFO_REFS, query=SVC), frame(host="b.example", path="/x"), frame(port=80, sni=None)):
-        d = _real(s, live, f)
-        (tmp_path / "decisions.log").open("a").write(repr(d) + "\n" + str(d) + "\n")
-    key_setup.revoke_key(ck.root, rec["id"], **ck.kw())
-    _real(s, live, frame(path=INFO_REFS, query=SVC))
+        d = _real(s, live, f, creds)
+        (tmp_path / "decisions.log").open("a").write(repr(d) + "\n" + str(d) + "\n" + repr(creds) + "\n")
+    _revoke(ck, rec["id"])
+    _real(s, live, frame(path=INFO_REFS, query=SVC), creds)
     assert artifact_hits(tmp_path) == []
     assert KEY not in repr(s) and KEY not in repr(s.routes)
