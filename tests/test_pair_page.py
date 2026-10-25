@@ -84,3 +84,41 @@ def test_a_pair_link_opened_from_another_site_loads_and_nothing_else_widens(src)
         # the claim POST is unchanged: cross-site refused
         st, _o, _h2 = _call(port, "POST", "/cockpit/pair/claim", {"code": "x"}, headers={**NAV, "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"})
         assert st == 403
+
+
+def test_the_panel_reads_through_one_shared_promise_and_no_flag_can_stick() -> None:
+    # L3 r2 G1: the gen/inFlight guard stuck (a no-token return left inFlight true: the panel never polled again). One shared
+    # in-flight promise with one queued re-run; a 403 stops the poll like a 404 (G5).
+    js = load_web_asset("devices_panel.js")
+    assert not re.search(r"\b(inFlight|gen)\b", js), "the generation/in-flight flags are back"
+    assert "let running = null, rerun = false, gone = false;" in js
+    assert "if (running) { rerun = true; return running; }" in js
+    assert re.search(r"finally \{ running = null;", js)
+    assert re.search(r"res\.status === 404 \|\| res\.status === 403\) \{ section\.hidden = true; gone = true;", js)
+    # G2: the revoke's button is re-enabled only when the revoke FAILED
+    assert "if (!revoked && btn.isConnected) btn.disabled = false;" in js
+
+
+def test_pair_it_again_revokes_its_own_device_first_by_the_name_the_manifest_gives_it(src) -> None:
+    # L3 r2 G7: the page learns its own device id from the manifest's credential (paired-<id>) and revokes it with its own key.
+    with _serve(src) as (port, _h):
+        st, off, _ = _call(port, "POST", "/cockpit/pair/offer", {"label": "Run iPad"}, token=T)
+        st, cl, _ = _call(port, "POST", "/cockpit/pair/claim", {"code": off["code"]})
+        assert st == 200
+        st, man, _ = _call(port, "GET", "/cockpit/manifest.json", token=cl["token"], headers=PROXY)
+        assert st == 200 and man["credential"]["name"] == "paired-" + cl["device_id"], man.get("credential")
+        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": cl["device_id"]}, token=cl["token"], headers=PROXY)
+        assert st == 200 and out["revoked"] == [cl["device_id"]], (st, out)
+    js = load_web_asset("pair.js")
+    assert '/^paired-./.test(name)' in js and "name.slice(7)" in js          # the id is the part after PAIRED_PREFIX
+    assert js.index("await retireOldKey()") < js.index("attempt(code, false, note)"), "the claim must come after the self-revoke"
+
+
+def test_the_pair_script_words_the_retry_403_and_keeps_a_failed_mark_write_from_reading_as_a_lost_key() -> None:
+    js = load_web_asset("pair.js")
+    # G3: only a 403 AFTER a Try again says the first try may have spent the code
+    assert "attempt(code, true)" in js and "The first try may have used this code." in js
+    # G4: the mark's write is its own try, after the key's catch has returned
+    assert re.search(r'try \{ window\.localStorage\.setItem\(PAIRED_MARK_KEY, "1"\); \} catch', js)
+    key_try = js.index("window.localStorage.setItem(WRITE_TOKEN_KEY, data.token);")
+    assert js.index("return;", key_try) < js.index("PAIRED_MARK_KEY, \"1\"")      # the key's catch ends in its own return

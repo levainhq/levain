@@ -64,10 +64,12 @@
   // than send him back for a new one. A 403 is final (used, expired or wrong).
   function tryAgain(code, title, msg) {
     say(title, msg, false);
-    actions([["Try again", true, () => attempt(code)]]);
+    actions([["Try again", true, () => attempt(code, true)]]);
   }
 
-  async function attempt(code) {
+  // `again`: this is a second spend of the same code after a failure that may have reached the server (G3).
+  // `note`: a line appended to the "Paired" screen (G7: the old key could not be revoked).
+  async function attempt(code, again, note) {
     say("Pairing this device", "Claiming your one-time code…", false);
     let res;
     try {
@@ -84,7 +86,10 @@
       return;
     }
     if (res.status === 403) {
-      say("This pairing code did not work", "This pairing code is used, expired or wrong; make a new one on a paired device.", false);
+      // G3: after a Try again the first try may have spent the code and lost only its answer; say so, in one line
+      say("This pairing code did not work", again
+        ? "The first try may have used this code. If this device is not paired, make a new code on a paired device."
+        : "This pairing code is used, expired or wrong; make a new one on a paired device.", false);
       return;
     }
     if (res.status >= 500) {
@@ -99,14 +104,46 @@
     }
     try {
       window.localStorage.setItem(WRITE_TOKEN_KEY, data.token);
-      window.localStorage.setItem(PAIRED_MARK_KEY, "1");
     } catch (_) {
       say("This browser will not keep the key", "Storage is blocked here (a private window?). Open this link in a normal window; the code is already spent, so make a new one.", false);
       return;
     }
+    // G4: the mark is a nicety (it only picks the unpaired card over a prompt later); a failed write of it never says the key was lost
+    try { window.localStorage.setItem(PAIRED_MARK_KEY, "1"); } catch (_) { /* the key is kept; the mark is not */ }
     data = null;
+    if (note) {
+      // G7: stay on the page so the line is read; the cockpit is one click away
+      say("Paired", "This device is paired. " + note, true);
+      return;
+    }
     say("Paired", "This device is paired. Opening the cockpit…", true);
     location.replace("/");
+  }
+
+  // G7: "Pair it again" retires the key this browser holds before it takes the new one: the old device row would otherwise
+  // stay live. The held key names its own device (the manifest's credential, paired-<id>); an owner's surface token names
+  // none and is never revocable, so nothing is revoked then. A failed self-revoke still claims, and says so.
+  async function retireOldKey() {
+    const tok = storedToken();
+    if (!tok) return "";
+    const H = { "X-Levain-Write-Token": tok };
+    try {
+      const m = await fetch("/cockpit/manifest.json", { headers: H, cache: "no-store", referrerPolicy: "no-referrer" });
+      if (m.status === 403) return "";                       // the held key is already refused: nothing is listed under it to revoke
+      if (m.status !== 200) return OLD_KEY_LISTED;
+      const name = (((await m.json()) || {}).credential || {}).name || "";
+      if (!/^paired-./.test(name)) return "";                // not a device key (the owner's own, or none)
+      const r = await fetch("/cockpit/pair/revoke", { method: "POST", headers: { ...H, "Content-Type": "application/json" },
+        body: JSON.stringify({ id: name.slice(7) }), cache: "no-store", referrerPolicy: "no-referrer" });
+      return r.status === 200 || r.status === 404 ? "" : OLD_KEY_LISTED;
+    } catch (_) { return OLD_KEY_LISTED; }
+  }
+  const OLD_KEY_LISTED = "The old key is still listed; revoke it from Devices.";
+
+  async function pairAgain(code) {
+    say("Pairing this device", "Retiring the old key…", false);
+    const note = await retireOldKey();
+    attempt(code, false, note);
   }
 
   function run() {
@@ -118,7 +155,7 @@
     if (storedToken()) {
       // L3 r1 F5: never replace a key this browser already holds without asking (it may be the owner's own)
       say("This browser is already paired", "Pairing it again replaces the key it holds now. The code is not used until you choose.", false);
-      actions([["Pair it again", true, () => attempt(code)], ["Keep the current key", false, () => location.replace("/")]]);
+      actions([["Pair it again", true, () => pairAgain(code)], ["Keep the current key", false, () => location.replace("/")]]);
       return;
     }
     attempt(code);
