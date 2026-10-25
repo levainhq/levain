@@ -156,13 +156,14 @@ def _host_slot_seams() -> SlotSeams:
 def _sudo_set_limits(host: str, data: bytes) -> tuple[int, str, str]:
     """``sudo <install helper> set-limits`` with ``data`` on stdin. sudo reads the password from the terminal, not
     from the stdin this pipe holds."""
+    from levain.launch import child_env
     from levain.slot import layout
 
     helper = str(layout.install_helper_path(host))    # type: ignore[arg-type]
     if not os.path.isfile(helper):
         return 127, "", f"the install helper {helper} is not installed: slots are not set up on this host\n"
     p = subprocess.run([SUDO, helper, "set-limits"], input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                       check=False)
+                       check=False, env=child_env())
     return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
 
 
