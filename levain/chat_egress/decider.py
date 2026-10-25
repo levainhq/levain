@@ -72,6 +72,8 @@ from levain.chat_egress.resolver import Resolver, ResolveError
 
 log = logging.getLogger("levain.chat_egress.decider")
 
+#: the card step's reason when an upload-pack body was past advert.UPLOAD_PACK_BODY_CAP (K1 counts it as a cap card)
+UPLOAD_PACK_OVER_CAP = "upload_pack_over_cap"
 THREAD_DECIDE = "levain-egress-decide"
 THREAD_LINK = "levain-egress-link"
 THREAD_OBS = "levain-egress-obs"
@@ -862,10 +864,11 @@ class Decider:
             if got is None:
                 return
             answer, from_queue = got
+            why = UPLOAD_PACK_OVER_CAP if r.body_cut else v.why   # the row's reason; the card itself shows v.why
             if answer == "allowed":
-                r.step_name = f"card:{v.why}:allowed"
+                r.step_name = f"card:{why}:allowed"
                 return self._allow(r)
-            return self._deny(r, f"card:{v.why}:{answer}", 403, f"card: {answer}", withdraw=not from_queue)
+            return self._deny(r, f"card:{why}:{answer}", 403, f"card: {answer}", withdraw=not from_queue)
         finally:
             self._card_slots.release()
 

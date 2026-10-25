@@ -32,6 +32,7 @@ from levain.chat_egress.records import EgressRow
 #: each: the audit-cap deny is owed outside the machine and has none). Pinned against a live launch in test_k1_report.
 CAP_STEPS = frozenset({"wall:card_cap", "wall:body_cap", "wall:body_readers", "wall:body_timeout", "decider_busy"})
 _BUSY_STEP = "decider_busy"
+_UPLOAD_PACK_CAP_CARD = "upload_pack_over_cap"   # decider.UPLOAD_PACK_OVER_CAP: the card reason of an over-cap pack body
 
 _CRED_WALL = "wall:credential_in_query"
 _PATH_WALL = "wall:path"
@@ -61,6 +62,7 @@ class LaunchReport:
     credential_in_query_walls: int
     credential_in_query_cards: int
     cap_walls: int
+    cap_cards: int
     path_walls: int
     cards: dict[str, int]
     signed_url_names: dict[str, int]
@@ -85,7 +87,7 @@ class LaunchReport:
         out.append(f"credential_in_query: {self.credential_in_query_walls} walls, "
                    f"{self.credential_in_query_cards} cards")
         out.append(f"path walls: {self.path_walls}")
-        out.append(f"cap walls: {self.cap_walls}")
+        out.append(f"cap walls: {self.cap_walls}, cap cards: {self.cap_cards}")
         out.append("cards: " + (", ".join(f"{k}={v}" for k, v in sorted(self.cards.items())) or "none"))
         out.append("signed-URL names marked: "
                    + (", ".join(f"{k}={v}" for k, v in sorted(self.signed_url_names.items())) or "none"))
@@ -146,7 +148,7 @@ def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows
     dwalls: Counter[str] = Counter()
     cards: Counter[str] = Counter()
     sig_names: Counter[str] = Counter()
-    cred_walls = cred_cards = cap = path = backstop = attempts = missing = 0
+    cred_walls = cred_cards = cap = cap_cards = path = backstop = attempts = missing = 0
     for r in rows:
         if r.kind != "egress_attempt":
             continue
@@ -172,6 +174,8 @@ def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows
             cards[f"{why}:{answer}"] += 1
             if why == "credential_in_query":
                 cred_cards += 1
+            elif why == _UPLOAD_PACK_CAP_CARD:
+                cap_cards += 1
         for n in _names(r):
             if n in signed:
                 sig_names[n] += 1
@@ -181,7 +185,7 @@ def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows
         walls=walls, by_reason=dict(summary.by_reason) if summary else {},
         hosts=dict(summary.hosts) if summary else {}, host_overflow=summary.overflow if summary else 0,
         duplicate_rows=duplicate_rows, verdicts=dict(verdicts), decider_walls=dict(dwalls),
-        credential_in_query_walls=cred_walls, credential_in_query_cards=cred_cards, cap_walls=cap, path_walls=path,
+        credential_in_query_walls=cred_walls, credential_in_query_cards=cred_cards, cap_walls=cap, cap_cards=cap_cards, path_walls=path,
         cards=dict(cards), signed_url_names=dict(sig_names), backstop_names=backstop, attempts=attempts,
         audit_missing=missing, unreadable_event_lines=unreadable)
 

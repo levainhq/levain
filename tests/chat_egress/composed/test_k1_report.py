@@ -95,7 +95,7 @@ def test_the_report_counts_path_credential_cap_and_card_rows() -> None:
         _row(4, "card:credential_in_query:allowed", verdict=Verdict.ALLOW),
         _row(5, "card:credential_in_query:denied"),
         _row(6, "card:body:expired"),
-        _row(7, "wall:card_cap"), _row(8, "wall:body_cap"),
+        _row(7, "wall:card_cap"), _row(8, "wall:body_cap"), _row(11, "card:upload_pack_over_cap:denied"),
         _row(9, "silent", verdict=Verdict.ALLOW,
              names='["x-amz-signature","x-amz-credential","<1-4:a:backstop>"]'),
         _row(10, "audit-missing"),
@@ -103,10 +103,11 @@ def test_the_report_counts_path_credential_cap_and_card_rows() -> None:
     r = report.build(rows, [_summary(0, final=True, by_reason={}, hosts={}, count=0)])
     assert r.path_walls == 2
     assert (r.credential_in_query_walls, r.credential_in_query_cards) == (1, 2)
-    assert r.cap_walls == 2
-    assert r.cards == {"credential_in_query:allowed": 1, "credential_in_query:denied": 1, "body:expired": 1}
+    assert r.cap_walls == 2 and r.cap_cards == 1
+    assert r.cards == {"credential_in_query:allowed": 1, "credential_in_query:denied": 1, "body:expired": 1,
+                       "upload_pack_over_cap:denied": 1}
     assert r.signed_url_names == {"x-amz-signature": 1, "x-amz-credential": 1}
-    assert r.backstop_names == 1 and r.audit_missing == 1 and r.attempts == 10
+    assert r.backstop_names == 1 and r.audit_missing == 1 and r.attempts == 11
     text = r.text()
     assert "path walls: 2" in text and "duplicate_rows: 0" in text
 

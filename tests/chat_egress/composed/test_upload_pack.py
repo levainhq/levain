@@ -84,6 +84,12 @@ def test_a_body_under_the_cap_is_read_shaped_and_reaches_the_origin_intact(make_
     assert L.desk.filed == [] and [p.body for p in _posts(origin)] == [body]
 
 
+def _assert_cap_card(L) -> None:
+    from levain.chat_egress import report
+    r = report.build_from_files(L.records.rows(L.launch_id), L.events)
+    assert r.cap_cards == 1 and r.cards.get("upload_pack_over_cap:denied") == 1, r.text()
+
+
 def test_a_chunked_body_over_the_cap_cards_and_the_origin_receives_zero_bytes(make_origin, make_launch_) -> None:
     origin = make_origin(content_type=_ct)
     L = make_launch_(origin)
@@ -95,6 +101,7 @@ def test_a_chunked_body_over_the_cap_cards_and_the_origin_receives_zero_bytes(ma
     finally:
         stop.set()
     print("RUN R15-17-2 chunked over cap:", resp[:40], "cards", len(L.desk.filed))
+    _assert_cap_card(L)
     assert len(L.desk.filed) == 1 and resp.startswith(b"HTTP/1.1 403"), resp[:200]
     assert _posts(origin) == []
 
@@ -112,6 +119,7 @@ def test_a_content_length_body_over_the_cap_cards_and_the_origin_receives_zero_b
         stop.set()
     assert len(L.desk.filed) == 1 and resp.startswith(b"HTTP/1.1 403"), resp[:200]
     assert _posts(origin) == []
+    _assert_cap_card(L)
 
 
 def test_a_gzip_body_is_counted_as_srt_counts_it(make_origin, make_launch_) -> None:
