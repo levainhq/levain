@@ -3,8 +3,8 @@
 CONTROL appends an event here BEFORE it pushes it to any ``SESSION-EVENTS`` stream: ``L/sessions/events.jsonl``, one
 canonical JSON object per line, ``seq`` assigned here (increasing per journal, from 1), each append written and fsynced
 before :meth:`EventJournal.append` returns. The journal's identity is ``L/sessions/events.meta`` = canonical
-``{journal_id}`` (a random 32-hex id made when the meta is created, written once: temp + fsync + rename + fsync of the
-directory); a stream's ``hello`` carries it, so a client holding a cursor from another journal (restored, recreated)
+``{journal_id}`` (a random 32-hex id made when the meta is created or the journal's lines are lost: temp + fsync +
+rename + fsync of the directory); a stream's ``hello`` carries it, so a client holding a cursor from another journal (restored, recreated)
 sees the id change. Both files are CONTROL's, 0600.
 
 The three kinds this module keeps (§3.6's tagged union; ``seq`` and ``at`` on every one):
@@ -20,7 +20,8 @@ cannot go on (``events-unavailable``: the journal was poisoned). ``oldest_seq`` 
 is kept.
 
 **Start** (:meth:`EventJournal.start`): the meta is read (absent: made; one that does not parse refuses
-``events-corrupt``); the journal is opened ``O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW`` and read whole. A last line with
+``events-corrupt``; a kept meta over a journal file that is absent or holds no complete line is replaced by a new
+id, since that journal's lines are lost and ``seq`` starts again from 1); the journal is opened ``O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW`` and read whole. A last line with
 no newline is a torn append that was never acknowledged: cut off (``ftruncate``, fsync) before anything is appended.
 Any other line that does not parse, is not its own canonical encoding, is not one of the three kinds, or does not
 raise ``seq`` refuses the start ``events-corrupt``: CONTROL never serves a journal it cannot read whole.
@@ -182,7 +183,8 @@ class EventJournal:
     def start(self) -> None:
         with self.lock:
             self._close()
-            self.journal_id = self._meta()
+            self.journal_id, made = self._meta()
+            existed = os.path.lexists(self.path)
             try:
                 fd = os.open(self.path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, MODE)
             except OSError as e:
@@ -196,6 +198,10 @@ class EventJournal:
                     os.ftruncate(fd, keep)            # the torn last line: never acknowledged, so never kept
                     self._fsync(fd)
                 _fsync_dir(self.dir, self._fsync)
+                if not made and (not existed or not kept):
+                    # L3 r1 fix 5: the lines a kept meta named are gone, so seq starts again from 1; a new id makes
+                    # every client's cursor into the lost journal visibly another journal's
+                    self.journal_id = self._new_meta()
             except BaseException:
                 os.close(fd)
                 raise
@@ -203,8 +209,9 @@ class EventJournal:
             self._set_kept(kept)
             self._since_prune = 0
 
-    def _meta(self) -> str:
-        """The journal id from ``events.meta``, made (written once, durably) when the file is absent."""
+    def _meta(self) -> Tuple[str, bool]:
+        """(the journal id from ``events.meta``, whether it was made now): made (written durably) when the file is
+        absent."""
         try:
             data = R.read_record(self.meta_path, max_bytes=4096)
         except Refused as e:
@@ -218,7 +225,10 @@ class EventJournal:
                     or _JOURNAL_ID_RE.fullmatch(obj["journal_id"]) is None
                     or canon.canonical_bytes(obj) != data):
                 raise _corrupt("events.meta is not a canonical {journal_id}")
-            return str(obj["journal_id"])
+            return str(obj["journal_id"]), False
+        return self._new_meta(), True
+
+    def _new_meta(self) -> str:
         jid = os.urandom(16).hex()
         try:
             R.write_durably(self.meta_path, canon.canonical_bytes({"journal_id": jid}), mode=MODE, fsync=self._fsync)

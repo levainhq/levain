@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from levain.contracts import canon
 from levain.slot import control as C
 from levain.slot import events as EV
 from levain.slot import records as R
@@ -143,3 +144,28 @@ def test_a_prune_after_the_hello_never_drops_an_advertised_event(served):
         time.sleep(0.01)
     assert pruned["n"], "the prune ran and dropped events"
     c.close()
+
+
+# ---- item 5: the data file lost, the meta kept -------------------------------------------------------------------------
+
+@pytest.mark.parametrize("loss", ["unlinked", "emptied"])
+def test_a_lost_journal_under_a_kept_meta_is_a_new_journal(erig, loss):
+    """`events.jsonl` absent (or holding no complete line) while `events.meta` survives: the start makes a new
+    `journal_id`, so a client holding a cursor into the lost journal sees the id change and resets, instead of
+    filtering out the new journal's seq 1..cursor. A journal that is whole keeps its id."""
+    bound_session(erig)
+    jid = erig.events.journal_id
+    erig.restart()
+    assert erig.events.journal_id == jid
+    path = erig.sdir / EV.JOURNAL
+    if loss == "unlinked":
+        path.unlink()
+    else:
+        path.write_bytes(b"")
+    erig.control.stop()
+    erig.restart()
+    assert erig.events.journal_id != jid
+    assert (erig.sdir / EV.META).read_bytes() == canon.canonical_bytes({"journal_id": erig.events.journal_id})
+    jid2 = erig.events.journal_id
+    erig.restart()
+    assert erig.events.journal_id == jid2                              # the new journal holds lines now: kept
