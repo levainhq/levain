@@ -73,7 +73,7 @@ class PolicyLimits:
             return {k: float(consent_limits.DEFAULTS[k]) for k in consent_limits.SLOT_KINDS}
         try:
             got, _ = consent_limits.parse_limits_doc(doc, agent, slot=True)
-        except consent_limits.LimitsDocError as exc:    # checked at read; kept so a change there cannot pass
+        except consent_limits.LimitsDocError as exc:    # slot_doc checked the whole document at read: not expected
             raise LimitsUnavailable(self._unusable(exc.code)) from None
         return {k: float(got[k]) for k in consent_limits.SLOT_KINDS}
 
