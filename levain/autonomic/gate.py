@@ -882,11 +882,17 @@ class EfferentGate:
         signature by an enrolled key over :meth:`confirm_challenge`; without one it is refused and the
         decision stays open. ``decision.first_estimate`` is the operator's forced pre-truth read → the
         receipt's ``actor_first_estimate``."""
+        return self._resolve_pending(pending_id, decision, chain_owned=chain_owned)
+
+    def _resolve_pending(self, pending_id: str, decision: ConfirmDecision, *, chain_owned: bool = False,
+                         at: _dt.datetime | None = None) -> GateOutcome:
+        """:meth:`resolve`; ``at`` is the sweep's time, which a manual pending is adjudicated at instead of a
+        clock read (RULINGS_R2 1)."""
         try:
             hold = self._journal.find_pending(pending_id) if self._journal is not None else None
             if hold is not None:
                 return self._resolve_hold(hold, decision, chain_owned=chain_owned)
-            return self._resolve_manual(pending_id, decision)
+            return self._resolve_manual(pending_id, decision, at)
         except Exception as e:  # noqa: BLE001 — resolve, like gate, never raises into the caller
             _log.error("efferent gate resolve UNEXPECTED error (%s): %s — failing closed",
                        type(e).__name__, e)
@@ -1161,9 +1167,11 @@ class EfferentGate:
         except (KeyError, TypeError, ValueError, AttributeError):
             return None
 
-    def _resolve_manual(self, pending_id: str, decision: ConfirmDecision) -> GateOutcome:
+    def _resolve_manual(self, pending_id: str, decision: ConfirmDecision,
+                        at: _dt.datetime | None = None) -> GateOutcome:
         """A manual (non-journaled) pending: claimed from the pending store FIRST (the claim is the
-        at-most-once gate), then fired or dropped."""
+        at-most-once gate), then fired or dropped. It is adjudicated at ONE time, ``at`` (the sweep's) or
+        else one clock read, taken before the claim (RULINGS_R2 1)."""
         if self._pending_store is None:
             return GateOutcome(
                 posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
@@ -1188,22 +1196,37 @@ class EfferentGate:
                     posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
                     reason="confirm:not_signed_by_an_enrolled_key", receipt_id=None, execution=None,
                 )
-        # An unattended approval reads its coverage ONCE, here, before the claim (RULINGS_R1 2): that one view is
-        # what the check after the claim judges (``_manual_cover_refusal``, which only peeks to re-check it).
-        # While the coverage cannot be read (R9 A1) the pending is left open for the next sweep instead of spent
-        # on a deny, until it is a whole window past its expiry: then it is claimed and denied, so it never fires
-        # late (RULINGS_R0, ``cover:unreadable``).
+        # The one adjudication time (RULINGS_R2 1), read before the claim: nothing after the claim reads the clock,
+        # so a clock that fails cannot spend the pending.
+        now: _dt.datetime | None = at
+        if now is None:
+            try:
+                now = self._clock()
+            except Exception as e:  # noqa: BLE001 — no time: nothing can be decided now
+                _log.error("efferent gate resolve: clock FAILED (%s): %s — %s left open",
+                           type(e).__name__, e, pending_id)
+        # An unattended approval of a pending that exists (RULINGS_R2 2) reads its coverage ONCE, here, before the
+        # claim (RULINGS_R1 2): that one view is what the check after the claim judges (``_manual_cover_refusal``,
+        # which only peeks to re-check it). With no time, or while the coverage cannot be read (R9 A1), the pending
+        # is left open for the next sweep instead of spent on a deny, until it is a whole window past its expiry:
+        # then it is claimed and denied, so it never fires late (RULINGS_R0, ``cover:unreadable``).
         view: CoverageView | None = None
         unreadable = False
         if decision.approved and decision.by != "human":
             looked_up = self._pending_store.get(pending_id)
-            view, unreadable, read_at = self._manual_cover_read()
-            if unreadable and (looked_up is None or read_at is None
-                               or not self._past_cover_grace(looked_up, read_at)):
-                return GateOutcome(
-                    posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
-                    reason="cover:unavailable", receipt_id=None, execution=None,
-                )
+            if looked_up is not None:
+                if now is not None:
+                    view, unreadable = self._manual_cover_read()
+                if now is None or (unreadable and not self._past_cover_grace(looked_up, now)):
+                    return GateOutcome(
+                        posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
+                        reason="cover:unavailable", receipt_id=None, execution=None,
+                    )
+        if now is None:
+            return GateOutcome(
+                posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
+                reason="clock:unavailable", receipt_id=None, execution=None,
+            )
         pending = self._pending_store.claim(pending_id)
         if pending is None:
             # already claimed/resolved/swept, or never existed — nothing to fire; surface, don't crash.
@@ -1212,7 +1235,7 @@ class EfferentGate:
                 posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
                 reason="unknown_pending", receipt_id=None, execution=None,
             )
-        created_at = self._clock().isoformat()  # the receipt records WHEN the decision was made
+        created_at = now.isoformat()  # the receipt records WHEN the decision was made
 
         # INTEGRITY: the claimed record must still match its content-fingerprint id (L3 codex H1/H2 +
         # complement MED-1). A mismatch ⇒ a field was altered after propose (tampered/corrupt/drifted) ⇒
@@ -1268,7 +1291,8 @@ class EfferentGate:
         # RISEN above the posture the human saw, and that the payload still passes the §1.5 screen (a
         # tampered/injection payload fires NOTHING). A guard failure denies (records a denied receipt).
         guard = self._guard_resolve_fire(pending, posture, decision)
-        if guard is None and decision.by != "human" and not self._unattended_approval_allowed(pending, posture):
+        if (guard is None and decision.by != "human"
+                and not self._unattended_approval_allowed(pending, posture, now)):
             guard = "unattended_approval_not_allowed"
         if guard is not None:
             return self._deny_fields(
@@ -1280,10 +1304,10 @@ class EfferentGate:
             )
         if decision.by != "human":
             # DESIGN_REV3_1 D1: an unattended manual effect runs below CONFIRM only under a live anchored
-            # policy covering it now: the view read before the claim, judged at a clock read here and re-checked
+            # policy covering it now: the view read before the claim, judged at the adjudication time and re-checked
             # by a peek, after the claim and immediately before the fire. A conjunct beside
             # ``_unattended_approval_allowed``, never inside it (that also serves the journal's check).
-            refusal = "cover:unreadable" if unreadable else self._manual_cover_refusal(pending, posture, view)
+            refusal = "cover:unreadable" if unreadable else self._manual_cover_refusal(pending, posture, view, now)
             if refusal is not None:
                 _log.warning("efferent gate resolve: unattended %r on %s not covered (%s) — denied",
                              pending.action_name, pending_id, refusal)
@@ -1353,9 +1377,12 @@ class EfferentGate:
         binding, now, why = self._binding_risk_now(binding_id, hold["effect_id"], hold.get("chain"))
         if now is None:
             return (None if why == _REGISTRY_UNREADABLE else Posture.REFUSE_ESCALATE), why, None, False
+        if binding is None:
+            # a risk with no binding it was derived from: fail closed by name (RULINGS_R2 3; never an ``assert``,
+            # which ``python -O`` removes)
+            return Posture.REFUSE_ESCALATE, "revalidate:binding_risk_unavailable:binding", None, False
         rung = max(posture, floor, risk_floor(now))
         sealed_why: str | None = None
-        assert binding is not None   # a risk was derived from it
         if _is_terminal(binding, hold["effect_id"]) and binding.posture > rung:
             # the terminal link's ratified rung is the sealed binding's, whatever the pending says (RULINGS_R1 1)
             rung, sealed_why = binding.posture, "revalidate:sealed_posture"
@@ -1512,14 +1539,15 @@ class EfferentGate:
             _log.error("efferent gate: coverage refresh RAISED (%s): %s — uncovered", type(e).__name__, e)
             return None
 
-    def _cover_peek(self, effect: Effect) -> str:
-        """The cover value ``peek`` gives ``effect`` now: :data:`~levain.autonomic.coverage.COVER_NONE`
-        with no source wired (as the decision gave), :data:`~levain.autonomic.coverage.COVER_MOVED` when the
-        source raised or answered no value (it equals no decided fence, so the effect is decided again)."""
+    def _cover_peek(self, effect: Effect, now: _dt.datetime | None = None) -> str:
+        """The cover value ``peek`` gives ``effect`` at ``now`` (a clock read when not given):
+        :data:`~levain.autonomic.coverage.COVER_NONE` with no source wired (as the decision gave),
+        :data:`~levain.autonomic.coverage.COVER_MOVED` when the source or the clock raised or the source answered
+        no value (it equals no decided fence, so the effect is decided again)."""
         if self._coverage is None:
             return COVER_NONE
         try:
-            value = self._coverage.peek(effect, self._clock())
+            value = self._coverage.peek(effect, now if now is not None else self._clock())
         except Exception as e:  # noqa: BLE001 — forces a re-decide
             _log.warning("efferent gate: coverage peek RAISED (%s): %s", type(e).__name__, e)
             return COVER_MOVED
@@ -1540,20 +1568,15 @@ class EfferentGate:
         rung, value = operative(candidate, effect, view, now)
         return rung, (value if value is not None else COVER_NONE)
 
-    def _manual_cover_read(self) -> tuple[CoverageView | None, bool, _dt.datetime | None]:
+    def _manual_cover_read(self) -> tuple[CoverageView | None, bool]:
         """The one coverage read of an unattended manual resolve, before its claim (R9 A1, RULINGS_R1 2): the
-        view (``None`` with no source wired, which covers nothing), whether the coverage cannot be read (a source
-        is wired and its refresh failed, or the clock did), and the time it was read at. Coverage that reads and
-        covers nothing (no source wired included) is readable: that pending is claimed and denied (``cover:none``)."""
+        view (``None`` with no source wired, which covers nothing) and whether the coverage cannot be read (a
+        source is wired and its refresh failed). Coverage that reads and covers nothing (no source wired
+        included) is readable: that pending is claimed and denied (``cover:none``)."""
         if self._coverage is None:
-            return None, False, None
-        try:
-            now: _dt.datetime | None = self._clock()
-        except Exception as e:  # noqa: BLE001 — no clock: the coverage cannot be judged now
-            _log.error("efferent gate: clock FAILED before a manual cover read (%s): %s", type(e).__name__, e)
-            now = None
+            return None, False
         view = self._coverage_view()
-        return view, now is None or view is None or isinstance(view, Uncovered), now
+        return view, view is None or isinstance(view, Uncovered)
 
     @staticmethod
     def _past_cover_grace(pending: PendingAction, now: _dt.datetime) -> bool:
@@ -1574,23 +1597,18 @@ class EfferentGate:
             return True
 
     def _manual_cover_refusal(self, pending: PendingAction, posture: Posture,
-                              view: CoverageView | None) -> str | None:
+                              view: CoverageView | None, now: _dt.datetime) -> str | None:
         """DESIGN_REV3_1 D1, on a claimed manual pending an unattended approval would fire, judged on ``view``,
-        the one read before the claim (never a second refresh that could disagree with it): ``None`` only when a
-        live anchored policy in it covers ``Effect(action, its manifest risk, None, None, None)`` now at a rung no
-        stricter than ``posture``, and a peek gives the same cover value (the authority it was read from has
-        not moved since). Trigger and family are ``None``, so only a policy that lists neither covers a manual
-        effect."""
+        the one read before the claim (never a second refresh that could disagree with it), at ``now``, the
+        resolve's one adjudication time: ``None`` only when a live anchored policy in it covers
+        ``Effect(action, its manifest risk, None, None, None)`` at ``now`` at a rung no stricter than ``posture``,
+        and a peek at ``now`` gives the same cover value (the authority it was read from has not moved since).
+        Trigger and family are ``None``, so only a policy that lists neither covers a manual effect."""
         effect = self._effect(pending.action_name, self._manifest_risk(pending.action_name), None, None)
-        try:
-            now = self._clock()
-        except Exception as e:  # noqa: BLE001 — no clock, no proof a policy is live
-            _log.error("efferent gate: clock FAILED in the manual cover check (%s): %s", type(e).__name__, e)
-            return "cover:none"
         rung, value = operative(posture, effect, view, now)
         if value is None or value == COVER_NONE or rung > posture:
             return "cover:none"
-        if self._cover_peek(effect) != value:
+        if self._cover_peek(effect, now) != value:
             return "cover:moved"
         return None
 
@@ -1610,15 +1628,18 @@ class EfferentGate:
         return _Fence(value, lambda conn: self._fence_now(conn, request.action_name, binding_id, effect_id,
                                                           chain, with_binding=with_binding, clamped=clamped))
 
-    def _unattended_approval_allowed(self, pending: PendingAction, posture: Posture) -> bool:
+    def _unattended_approval_allowed(self, pending: PendingAction, posture: Posture,
+                                     now: _dt.datetime | None = None) -> bool:
         """An approval no human gave (``by != "human"``) is the silence default of a cooling-off rung,
         and nothing else: the posture must fail open, the action must be in the code-side auto-fire
-        allowlist, and the pending must have expired. Checked in ``resolve`` itself, so a caller other
-        than the sweep cannot approve a confirm-class pending on nobody's behalf."""
-        try:
-            now = self._clock()
-        except Exception:  # noqa: BLE001 — no clock, no proof of expiry
-            return False
+        allowlist, and the pending must have expired at ``now`` (a clock read when not given). Checked in
+        ``resolve`` itself, so a caller other than the sweep cannot approve a confirm-class pending on nobody's
+        behalf."""
+        if now is None:
+            try:
+                now = self._clock()
+            except Exception:  # noqa: BLE001 — no clock, no proof of expiry
+                return False
         return (posture.fail_open and pending.action_name in self._auto_fire_actions
                 and self._expired(pending, now))
 
@@ -1734,7 +1755,7 @@ class EfferentGate:
             decision = ConfirmDecision(approved=True, by="on-loop", reason="cooling_off_window_elapsed")
         else:
             decision = ConfirmDecision(approved=False, by="on-loop", reason="confirm_window_elapsed")
-        outcome = self.resolve(pending.pending_id, decision)  # resolve CLAIMS + re-verifies the seal
+        outcome = self._resolve_pending(pending.pending_id, decision, at=now)  # resolve CLAIMS + re-verifies the seal
         if outcome.refused and outcome.reason in ("unknown_pending", "journal:already_decided"):
             return None   # snapshot-vs-claim race (another resolver won) — a non-decision
         if outcome.refused and outcome.reason == "cover:unavailable":
