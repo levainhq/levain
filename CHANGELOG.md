@@ -62,6 +62,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   text that looks like one of Levain's own markers or cut notes, show as visible markers. The card is decided only by
   your signed answer, never by a standing consent grant, and it shows what the request became, read from Levain's record
   of it: waiting, allowed, in flight, sent, denied, expired, ended, ambiguous or failed. No chat launch files one yet.
+- **The chat egress decider answers the sandbox's network requests.** Each request is decided on its own thread: a body
+  that never arrives is denied (408), a client that leaves mid-upload is recorded as ended, a write that fails partway
+  cuts the connection so nothing misframed follows, and closing a launch never waits on a verdict stuck behind a
+  sandbox that stopped reading. An audit id is used once per launch, and one launch keeps at most 131,072 of them
+  (past that, new requests are refused with `audit_cap`); a request to a literal IPv6 address resolves; a consent card
+  is withdrawn when its request is denied for any other reason. No chat launch starts the decider yet.
 
 ## [0.11.24] — 2026-10-25
 

@@ -11,6 +11,7 @@ The suite runs the SPIKE glue (`fixtures/spike_glue/`) over a real @anthropic-ai
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -42,6 +43,21 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.skip(reason="needs the public internet (CI or CHD2_SKIP_NETWORK=1)"))
         if item.get_closest_marker("chat_egress_slow") and in_ci and os.environ.get("CHD2_SLOW") != "1":
             item.add_marker(pytest.mark.skip(reason="minutes-long dump; CI skips it unless CHD2_SLOW=1"))
+
+
+@pytest.fixture(autouse=True)
+def _resolver_slots_come_back():
+    """After every test: release every lookup seam it left hung, then wait (bounded) for the resolver's
+    process-wide slots to come back, so a hung seam cannot starve a later test's resolves."""
+    yield
+    from levain.chat_egress import resolver as rs
+
+    from .decider_rig import release_seams
+    release_seams()
+    end = time.monotonic() + 5.0
+    while rs._PROCESS_SLOTS._value < rs.MAX_LOOKUPS and time.monotonic() < end:
+        time.sleep(0.01)
+    assert rs._PROCESS_SLOTS._value == rs.MAX_LOOKUPS, "a lookup this test started still holds a resolver slot"
 
 
 @pytest.fixture
