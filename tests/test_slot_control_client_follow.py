@@ -143,3 +143,28 @@ def test_a_stored_event_off_the_session_event_schema_is_no_frame(frame):
     """An event frame is checked against levain-session-event/1 (events.check_event, one home): an unknown kind, a
     seq below 1 or a missing field is off the wire's shape, so the stream ends BROKEN with the cursor unmoved."""
     assert CC._stream_frame(frame) is None
+
+
+def test_close_wakes_a_reader_blocked_in_recv():
+    """close() from another thread shuts the socket down before closing it, so a reader blocked in recv wakes."""
+    import socket
+    import threading
+
+    a, b = socket.socketpair()
+    try:
+        s = CC.EventStream(a, CC.Hello("j", 0, 0, None))
+        next(s)                                                        # the hello
+        done = threading.Event()
+
+        def read():
+            list(s)
+            done.set()
+
+        t = threading.Thread(target=read, daemon=True)
+        t.start()
+        t.join(0.2)
+        s.close()
+        assert done.wait(2.0)
+        assert s.outcome in (CC.CANCELLED, CC.BROKEN)
+    finally:
+        b.close()

@@ -258,6 +258,11 @@ class EventStream:
             self.outcome = outcome
         sock, self._sock = self._sock, None
         if sock is not None:
+            # shut down before close: a reader blocked in recv on another thread wakes (close alone need not wake it)
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             sock.close()
 
     def close(self) -> None:
