@@ -51,7 +51,7 @@ def srt_package(prefix: Path) -> Path:
 
 
 def srt_dist(prefix: Path) -> Path:
-    """The `dist/sandbox` directory `launch.start_egress(srt_dist=...)` takes."""
+    """srt's `dist/sandbox` directory under `prefix` (the glue's `--srt-dist`)."""
     return srt_package(prefix) / "dist" / "sandbox"
 
 
@@ -163,6 +163,12 @@ def setup(prefix: Path | None = None, *, npm: str | None = None, offline: bool =
     missing = vendor_check(srt_dist(prefix))
     if missing:
         raise SrtProblem(f"srt's import names moved: {', '.join(missing)}")
-    (prefix / STAMP).write_text(json.dumps({"lock_sha256": _sha256(NODE_DIR / "package-lock.json"),
-                                            "tree_sha256": tree_hash(srt_package(prefix))}, sort_keys=True) + "\n")
+    write_stamp(prefix)
     return check(prefix)
+
+
+def write_stamp(prefix: Path) -> None:
+    """The stamp `check` verifies against, over what is installed at `prefix` now (setup's last step)."""
+    (Path(prefix) / STAMP).write_text(json.dumps({"lock_sha256": _sha256(NODE_DIR / "package-lock.json"),
+                                                  "tree_sha256": tree_hash(srt_package(prefix))},
+                                                 sort_keys=True) + "\n")

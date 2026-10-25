@@ -121,7 +121,7 @@ def _start(tmp: Path, port: int, monkeypatch, *, node: str, extra: tuple[str, ..
                                     "--resolve-map", f"{HOST}=127.0.0.1", *extra), lookup=Lookup())
     key_pem, cert_pem = spike.make_ca()
     e = lm.start_egress(store=store, launch_id=real_launch(store), node=node,
-                        srt_dist=envmod.srt_package_dir() / "dist" / "sandbox", events=tmp / "events.jsonl",
+                        srt_prefix=envmod.srt_prefix(), events=tmp / "events.jsonl",
                         ca_pem=key_pem + cert_pem, routes=keys.RouteSet.of([]), liveness=Live(),
                         credentials=keys.LaunchCredentials(NoStore()), cards=Desk(), mode=dm.Fixed(classify.GATED),
                         limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0), seams=seams)

@@ -115,7 +115,7 @@ def test_twenty_leaves_minted_leave_no_private_key_on_disk_or_open(tmp_path, mon
     monkeypatch.setenv(lm.TEST_SEAMS_ENV, "1")
     store = EnvelopeStore(state / "dispatch")
     e = lm.start_egress(store=store, launch_id=real_launch(store), node=envmod.node_bin(),
-                        srt_dist=envmod.srt_package_dir() / "dist" / "sandbox", events=state / "events.jsonl",
+                        srt_prefix=envmod.srt_prefix(), events=state / "events.jsonl",
                         ca_pem=a.glue_pem(), routes=keys.RouteSet.of([]), liveness=Live(),
                         credentials=keys.LaunchCredentials(NoStore()), cards=Desk(), mode=dm.Fixed(classify.GATED),
                         limits=dm.Limits(card_poll_s=0.1, stop_drain_s=2.0),

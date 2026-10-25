@@ -176,7 +176,8 @@ class Origin:
 
 
 def _start(tmp: Path, origin: Origin, monkeypatch, *, open_network: bool = False, launch_id: str | None = None,
-           store: EnvelopeStore | None = None, node: str | None = None, mode=None, cards=None, events=None):
+           store: EnvelopeStore | None = None, node: str | None = None, mode=None, cards=None, events=None,
+           srt_prefix: Path | None = None):
     monkeypatch.setenv(lm.TEST_SEAMS_ENV, "1")
     store = store or EnvelopeStore(tmp / "dispatch")
     lid = launch_id or real_launch(store)
@@ -186,7 +187,7 @@ def _start(tmp: Path, origin: Origin, monkeypatch, *, open_network: bool = False
                          lookup=Lookup())
     key_pem, cert_pem = spike.make_ca()
     return lm.start_egress(store=store, launch_id=lid, node=node or envmod.node_bin(),
-                           srt_dist=envmod.srt_package_dir() / "dist" / "sandbox",
+                           srt_prefix=srt_prefix or envmod.srt_prefix(),
                            events=events or tmp / "events.jsonl",
                            ca_pem=key_pem + cert_pem, routes=keys.RouteSet.of([]), liveness=Live(),
                            credentials=keys.LaunchCredentials(NoStore()), cards=cards or Desk(),
@@ -291,7 +292,7 @@ def test_production_launch_refuses_seams_before_spawning(tmp_path, origin, monke
     key_pem, cert_pem = spike.make_ca()
     with pytest.raises(lm.EgressRefused):
         lm.start_egress(store=store, launch_id=lid, node=envmod.node_bin(),
-                        srt_dist=envmod.srt_package_dir() / "dist" / "sandbox", events=tmp_path / "ev.jsonl",
+                        srt_prefix=envmod.srt_prefix(), events=tmp_path / "ev.jsonl",
                         ca_pem=key_pem + cert_pem, routes=keys.RouteSet.of([]), liveness=Live(),
                         credentials=keys.LaunchCredentials(NoStore()), cards=Desk(), mode=dm.Fixed(classify.GATED),
                         seams=lm.TestSeams(glue_args=("--carve", "127.0.0.1:1")))

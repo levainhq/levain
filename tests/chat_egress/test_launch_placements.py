@@ -58,7 +58,7 @@ def _run(tmp_path, monkeypatch, placement: keys.Placement) -> list[str | None]:
     P = origin.port
     key_pem, cert_pem = spike.make_ca()
     e = lm.start_egress(store=store, launch_id=real_launch(store), node=envmod.node_bin(),
-                        srt_dist=envmod.srt_package_dir() / "dist" / "sandbox", events=tmp_path / "events.jsonl",
+                        srt_prefix=envmod.srt_prefix(), events=tmp_path / "events.jsonl",
                         ca_pem=key_pem + cert_pem, routes=keys.RouteSet.of([route], {"rec-1": placement}),
                         liveness=Live(), credentials=keys.LaunchCredentials(NoStore()), cards=Desk(),
                         mode=dm.Fixed(classify.GATED),

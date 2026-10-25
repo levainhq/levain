@@ -45,6 +45,12 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.skip(reason="minutes-long dump; CI skips it unless CHD2_SLOW=1"))
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _srt_prefix_factory(tmp_path_factory):
+    """Hands `envmod.srt_prefix` the session's tmp factory; nothing is built until a test asks for the prefix."""
+    envmod._FACTORY = tmp_path_factory
+
+
 @pytest.fixture(autouse=True)
 def _resolver_slots_come_back():
     """After every test: release every lookup seam it left hung, then wait (bounded) for the resolver's

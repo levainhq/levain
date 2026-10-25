@@ -6,8 +6,9 @@
   2. the launch id must name a row of the dispatch store's `launches` table (the egress rows reference it);
   3. Node: `<node> --version` under an empty env must read `v<major>.<minor>.<patch>` with the major in
      `ACCEPTED_NODE_MAJORS` (R15-17-4: the probe suite has passed on 26 only), else refused naming the version;
-  4. srt: the package at `srt_dist` must say version `SRT_VERSION` (R15-10-R2 (4); the install-time vendor check of
-     its import names is not this module's);
+  4. srt: the install at `srt_prefix` verified by `srt_pin.check` (the stamp `levain chat setup` wrote, every locked
+     package's tree hash, the version `SRT_VERSION`, the vendor check: R15-10-R2 (4)); the glue runs only the `dist`
+     that check returns;
   4a. the mode read once (`launch_mode`): a value outside `classify.MODES` is refused. The session header and the
      egress digest are derived from that read, never from a second input (the digest fixes the mode at launch; a
      `LiveSetting` is still read live per request by the decider: Q-R15-9);
@@ -50,7 +51,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from levain.chat_egress import advert, classify, keys, renew, strip
+from levain.chat_egress import advert, classify, keys, renew, srt_pin, strip
 from levain.chat_egress import decider as dm
 from levain.chat_egress import records as rec
 from levain.chat_egress.resolver import Resolver, system_lookup
@@ -122,14 +123,6 @@ def check_node(node: str) -> str:
     return got
 
 
-def srt_version(srt_dist: Path) -> str | None:
-    """The version srt's package.json says, for its `dist/sandbox` directory."""
-    try:
-        return json.loads((Path(srt_dist).parent.parent / "package.json").read_text()).get("version")
-    except (OSError, ValueError, AttributeError):
-        return None
-
-
 def launch_mode(mode: Any) -> str:
     """The launch's mode, read once from the decider's own setting (`Fixed` / `LiveSetting`): the one home of
     `open network` for the header and the digest. A value outside `classify.MODES` is refused."""
@@ -189,7 +182,7 @@ class StopResult:
     failures: tuple[str, ...] = ()          # "<step>: <exception type>" for each teardown step that raised
 
 
-def start_egress(*, store: Any, launch_id: str, node: str, srt_dist: Path, events: Path, ca_pem: bytes, routes: Any,
+def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, events: Path, ca_pem: bytes, routes: Any,
                  liveness: Any, credentials: Any, cards: Any, mode: Any,
                  limits: dm.Limits = dm.Limits(), seams: TestSeams | None = None, authority: Any = None,
                  on_renew_due: Callable[[str, list[renew.RenewDue]], None] | None = None,
@@ -199,9 +192,10 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_dist: Path, event
     if store.launch(launch_id) is None:
         raise EgressRefused(f"no launches row for {launch_id!r}: the egress rows of a launch reference it")
     node_version = check_node(node)
-    if srt_version(srt_dist) != SRT_VERSION:
-        raise EgressRefused(f"chat network needs @anthropic-ai/sandbox-runtime {SRT_VERSION}; {srt_dist} is "
-                            f"{srt_version(srt_dist)!r}")
+    try:
+        srt_dist = srt_pin.check(srt_prefix).dist
+    except srt_pin.SrtProblem as exc:
+        raise EgressRefused(f"chat network refused: {exc}") from None
     open_network = launch_mode(mode) == classify.OPEN_NETWORK
     events = Path(events)
     if not events.name:
