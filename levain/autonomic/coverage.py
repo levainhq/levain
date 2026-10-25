@@ -11,9 +11,10 @@ envelope in the authority log that signs ``actions`` (each at its whole risk dic
 - :func:`covered` (the policy signs this action at this risk, and its trigger and family lists admit it),
   :func:`anchored` (both signers root-listed), :func:`live` (anchored, unexpired, inside the cap at ``now``).
 - :func:`operative`: the rung a candidate below ``CONFIRM`` runs at, and the fence's cover value.
-- :class:`CoverageSnapshot`: what a source caches. Its ``token`` is a property over its own ``head`` and the digest
-  of the root-file bytes it holds, and its signers are parsed from those same bytes, so no caller can label one
-  replay with another's token (DESIGN_REV3_1 D2). :class:`Uncovered` is what a failed refresh caches.
+- :class:`CoverageSnapshot`: what a source caches. Its ``token`` is a property over its own ``head``, the digest
+  of the root-file bytes it holds and its ``store_id``, and its signers are parsed from those same bytes, so no
+  caller can label one replay with another's token, or one store's snapshot with another store's (DESIGN_REV3_1
+  D2). :class:`Uncovered` is what a failed refresh caches.
 - :func:`parse_root_signers`: the root file's lines; any option but ``namespaces=`` means not listed.
 
 What binds a writer of the levain home is the action, its risk, the rung, the expiry and the store: a policy covers
@@ -154,6 +155,29 @@ class GraduationPolicy:
     current_signer: str | None
     store_id: str
 
+    def __post_init__(self) -> None:
+        # a policy built directly, not through from_record, is held to the shape from_record builds: any other is a
+        # ValueError, so no caller can hand the snapshot a rung, an expiry or an action from_record refuses
+        if not isinstance(self.grant_id, str) or not self.grant_id:
+            raise ValueError("a graduation policy's id is a non-empty string")
+        if not isinstance(self.incarnation, str) or not self.incarnation:
+            raise ValueError("a graduation policy's incarnation is a non-empty string")
+        _check_actions(self.actions)
+        if not isinstance(self.lowest_posture, Posture) or self.lowest_posture not in _LOWEST.values():
+            raise ValueError(f"lowest_posture {self.lowest_posture!r} is not one of {sorted(_LOWEST)}")
+        if (not isinstance(self.expires_at, datetime) or self.expires_at.tzinfo is None
+                or self.expires_at.utcoffset() is None):
+            raise ValueError("expires_at is an aware datetime")
+        for what, names in (("triggers", self.triggers), ("families", self.families)):
+            if names is not None and not (isinstance(names, frozenset) and names
+                                          and all(isinstance(n, str) and n for n in names)):
+                raise ValueError(f"{what} is None or a non-empty frozenset of names")
+        for what, key in (("born_signer", self.born_signer), ("current_signer", self.current_signer)):
+            if key is not None and not isinstance(key, str):
+                raise ValueError(f"{what} is None or a public key string")
+        if not isinstance(self.store_id, str) or not self.store_id:
+            raise ValueError(f"store_id {str(self.store_id)[:40]!r} is not a store's id")
+
     @classmethod
     def from_record(cls, record: Mapping[str, Any], *, incarnation: str, born_signer: str | None,
                     current_signer: str | None) -> "GraduationPolicy":
@@ -165,7 +189,8 @@ class GraduationPolicy:
         if not _REQUIRED <= names:
             raise ValueError(f"a graduation policy needs {sorted(_REQUIRED - names)}")
         if names - _REQUIRED - _OPTIONAL:
-            raise ValueError(f"a graduation policy carries no {sorted(names - _REQUIRED - _OPTIONAL)}")
+            # by repr: a key that is not a string is named, never compared with one
+            raise ValueError(f"a graduation policy carries no {sorted(names - _REQUIRED - _OPTIONAL, key=repr)}")
         if record["kind"] != "graduation":
             raise ValueError(f"kind {record['kind']!r} is not a graduation policy")
         gid = record["id"]
@@ -216,6 +241,29 @@ class GraduationPolicy:
     def cover_value(self) -> str:
         """``<incarnation>@<expires_at>``: a renew (a later expiry) changes it, so a decided fence goes stale."""
         return f"{self.incarnation}@{_stamp(self.expires_at)}"
+
+
+def _check_actions(actions: Any) -> None:
+    # a non-empty tuple of (name, risk text) pairs, one per name, each text the canonical rendering of a JSON object
+    # with string keys: what from_record builds, and the only text covered() can match
+    if not isinstance(actions, tuple) or not actions:
+        raise ValueError("a graduation policy signs at least one action, as a tuple of pairs")
+    seen: set[str] = set()
+    for pair in actions:
+        if not (isinstance(pair, tuple) and len(pair) == 2 and isinstance(pair[0], str) and pair[0]
+                and isinstance(pair[1], str)):
+            raise ValueError("each signed action is a (name, risk text) pair")
+        name, text = pair
+        if name in seen:
+            raise ValueError(f"the action {name!r} is signed twice")
+        seen.add(name)
+        try:
+            risk = json.loads(text)
+            ok = isinstance(risk, dict) and _canonical(risk) == text
+        except (TypeError, ValueError, RecursionError):
+            ok = False
+        if not ok:
+            raise ValueError(f"the risk text of {name!r} is not the canonical text of a risk dict")
 
 
 def _names(value: Any, what: str) -> frozenset[str] | None:
@@ -282,18 +330,22 @@ _UNCOVERED = Cover(None, COVER_NONE)
 
 
 def _is_cover(cover: Any) -> bool:
-    # what a view answered is a Cover whose fields are of their types: anything else covers nothing
-    return (isinstance(cover, Cover) and isinstance(cover.value, str)
-            and (cover.posture is None or isinstance(cover.posture, Posture)))
+    # what a view answered is a Cover that keeps this module's invariants: no rung with exactly COVER_NONE, or a rung a
+    # policy may sign with a value holding an "@" (so never COVER_NONE or COVER_MOVED). Anything else covers nothing
+    if not isinstance(cover, Cover) or not isinstance(cover.value, str):
+        return False
+    if cover.posture is None:
+        return cover.value == COVER_NONE
+    return isinstance(cover.posture, Posture) and cover.posture in _LOWEST.values() and "@" in cover.value
 
 
 @runtime_checkable
 class CoverageView(Protocol):
     """A fixed coverage state: what one refresh produced. ``token`` names the state it was built from
-    (``(head, signers_digest)``); :meth:`cover` is pure and re-runs expiry at its own ``now``."""
+    (``(head, signers_digest, store_id)``); :meth:`cover` is pure and re-runs expiry at its own ``now``."""
 
     @property
-    def token(self) -> tuple[tuple[int, str], str]: ...
+    def token(self) -> tuple[tuple[int, str], str, str]: ...
 
     def cover(self, effect: Effect, now: datetime) -> Cover: ...
 
@@ -309,7 +361,8 @@ class CoverageSource(Protocol):
     A failed refresh caches and returns :class:`Uncovered` at the token a peek would read.
 
     :meth:`peek` reads the root file's digest and then the authority head (the last authority read), and returns
-    :func:`peek_snapshot` of the cached view at that token: the cover value, or :data:`COVER_MOVED`."""
+    :func:`peek_snapshot` of the cached view at the token of those two and the store's own id: the cover value, or
+    :data:`COVER_MOVED`."""
 
     def refresh(self) -> CoverageView: ...
 
@@ -356,8 +409,8 @@ class CoverageSnapshot:
         object.__setattr__(self, "_root_keys", authority_keys(signers))
 
     @property
-    def token(self) -> tuple[tuple[int, str], str]:
-        return (self.head, self.signers_digest)
+    def token(self) -> tuple[tuple[int, str], str, str]:
+        return (self.head, self.signers_digest, self.store_id)
 
     def cover(self, effect: Effect, now: datetime) -> Cover:
         now = _aware(now)
@@ -373,19 +426,22 @@ class CoverageSnapshot:
 @dataclass(frozen=True)
 class Uncovered:
     """What a failed refresh caches: nothing is covered at ``token``. Never stale in the loosening direction, so it
-    needs no coherence between its two halves."""
+    needs no coherence between its fields."""
 
     head: tuple[int, str]
     signers_digest: str
+    store_id: str
 
     def __post_init__(self) -> None:
         _check_head(self.head)
         if not isinstance(self.signers_digest, str):
             raise TypeError("signers_digest is a string")
+        if not isinstance(self.store_id, str) or not self.store_id:
+            raise TypeError("store_id is the current store's id")
 
     @property
-    def token(self) -> tuple[tuple[int, str], str]:
-        return (self.head, self.signers_digest)
+    def token(self) -> tuple[tuple[int, str], str, str]:
+        return (self.head, self.signers_digest, self.store_id)
 
     def cover(self, effect: Effect, now: datetime) -> Cover:
         _aware(now)
@@ -397,8 +453,9 @@ def operative(candidate: Posture, effect: Effect, view: CoverageView | None,
     """The rung ``effect`` runs at, and the fence's cover value (``None`` when the clamp was not consulted).
 
     A candidate at or above ``CONFIRM`` keeps its rung, with no cover value (the clamp is not consulted).
-    Below ``CONFIRM``: uncovered (no view, a view that raises or answers anything but a :class:`Cover`, no live
-    anchored policy covering the effect) is ``CONFIRM``; covered is the stricter of the candidate and the strictest
+    Below ``CONFIRM``: uncovered (no view, a view that raises or answers anything but a :class:`Cover` keeping the
+    module's invariants (``None`` with :data:`COVER_NONE`, or a rung a policy may sign with a value holding an
+    "@"), no live anchored policy covering the effect) is ``CONFIRM``; covered is the stricter of the candidate and the strictest
     covering policy's ``lowest_posture``. On every path the floor of the stricter of the action's and the tools'
     risk can only raise the rung."""
     floor_risk = stricter_risk(effect.action_risk, effect.tools_risk)
@@ -415,11 +472,12 @@ def operative(candidate: Posture, effect: Effect, view: CoverageView | None,
     return max(rung, floor), cover.value
 
 
-def peek_snapshot(view: CoverageView | None, token: tuple[tuple[int, str], str], effect: Effect,
+def peek_snapshot(view: CoverageView | None, token: tuple[tuple[int, str], str, str], effect: Effect,
                   now: datetime) -> str:
-    """The pure half of a peek: the cover value ``view`` gives ``effect`` at ``now`` when ``token`` (the digest and
-    head just read) is the view's own, else :data:`COVER_MOVED`. A view that raises or answers anything but a
-    :class:`Cover` is :data:`COVER_MOVED` too: it equals no decided fence, so the effect is decided again."""
+    """The pure half of a peek: the cover value ``view`` gives ``effect`` at ``now`` when ``token`` (the head and
+    digest just read, and the current store's id) is the view's own, else :data:`COVER_MOVED`. A view that raises or
+    answers anything but a :class:`Cover` keeping the module's invariants is :data:`COVER_MOVED` too: it equals no
+    decided fence, so the effect is decided again."""
     if view is None:
         return COVER_MOVED
     try:

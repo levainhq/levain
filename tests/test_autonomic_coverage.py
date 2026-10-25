@@ -229,6 +229,67 @@ def test_a_record_missing_a_binding_term_is_refused():
             GraduationPolicy.from_record(rec, incarnation="1:x", born_signer=K1, current_signer=K1)
 
 
+def test_an_unknown_key_that_is_not_a_string_is_a_value_error():
+    # deepseek LOW 6: the message sorts the extra keys by repr, so a non-str key cannot raise TypeError
+    rec = record()
+    rec[1] = "x"
+    rec["unknown_term"] = 2
+    with pytest.raises(ValueError, match="carries no"):
+        GraduationPolicy.from_record(rec, incarnation="1:x", born_signer=K1, current_signer=K1)
+
+
+# deepseek HIGH 2: a policy built directly, not through from_record, is held to the same shape
+@pytest.mark.parametrize("over", [
+    {"lowest_posture": Posture.ABOVE_LOOP},
+    {"lowest_posture": Posture.CONFIRM},
+    {"lowest_posture": "ON_LOOP"},
+    {"lowest_posture": 1},
+    {"expires_at": datetime(2026, 11, 1)},
+    {"expires_at": "2026-11-01T00:00:00.000000Z"},
+    {"actions": ()},
+    {"actions": [("doc.append", '{"cls":1}')]},
+    {"actions": (("doc.append",),)},
+    {"actions": (("", '{"cls":1}'),)},
+    {"actions": (("doc.append", {"cls": 1}),)},
+    {"actions": (("doc.append", "not json"),)},
+    {"actions": (("doc.append", '{"cls": 1}'),)},    # JSON, but not the canonical text: it could never match
+    {"actions": (("doc.append", "[1]"),)},
+    {"actions": (("doc.append", '{"cls":1}'), ("doc.append", '{"cls":2}'))},
+    {"triggers": frozenset()},
+    {"triggers": {"email"}},
+    {"triggers": ["email"]},
+    {"families": frozenset({3})},
+    {"families": frozenset({""})},
+    {"born_signer": 7},
+    {"current_signer": b"ssh-ed25519 AAAA"},
+    {"store_id": ""},
+    {"store_id": None},
+    {"grant_id": ""},
+    {"incarnation": None},
+])
+def test_a_policy_built_directly_is_held_to_the_records_shape(over):
+    with pytest.raises(ValueError):
+        dataclasses.replace(policy(), **over)
+
+
+def test_a_directly_built_above_loop_policy_never_reaches_a_snapshot():
+    # the fail-open the HIGH names: an ABOVE_LOOP policy would make operative return ABOVE_LOOP
+    with pytest.raises(ValueError):
+        GraduationPolicy(grant_id="gp-1", incarnation="1:a",
+                         actions=(("doc.append", cov._canonical(risk_dict(LOW))),),
+                         lowest_posture=Posture.ABOVE_LOOP, expires_at=NOW + timedelta(days=1), triggers=None,
+                         families=None, born_signer=K1, current_signer=K1, store_id=STORE)
+
+
+def test_a_directly_built_policy_of_the_records_shape_is_the_records_policy():
+    p = policy(triggers=["email"], families=["fam-x"])
+    assert dataclasses.replace(p) == p
+    q = GraduationPolicy(grant_id=p.grant_id, incarnation=p.incarnation, actions=p.actions,
+                         lowest_posture=p.lowest_posture, expires_at=p.expires_at, triggers=p.triggers,
+                         families=p.families, born_signer=None, current_signer=None, store_id=p.store_id)
+    assert q.cover_value == p.cover_value
+
+
 def test_the_stamp_form_is_the_cockpits():
     from levain.cockpit.consent import parse_stamp, utc_stamp
     text = utc_stamp(NOW + timedelta(days=3, microseconds=7))
@@ -391,6 +452,42 @@ def test_a_view_that_answers_anything_but_a_cover_is_uncovered(answer):
     assert operative(Posture.ON_LOOP, effect(), Answers(answer), NOW) == (Posture.CONFIRM, COVER_NONE)
 
 
+# deepseek HIGH 1: a Cover that breaks the module's own invariants is no cover
+_BROKEN_COVERS = [
+    Cover(Posture.ON_LOOP, COVER_NONE),        # a rung with the uncovered value
+    Cover(Posture.COOLING_OFF, COVER_NONE),
+    Cover(None, "1:a@x"),                      # no rung with a covered value
+    Cover(None, COVER_MOVED),
+    Cover(Posture.ON_LOOP, COVER_MOVED),       # the peek's value is never a cover value
+    Cover(Posture.ON_LOOP, "no-delimiter"),    # a covered value holds an "@"
+    Cover(Posture.ABOVE_LOOP, "1:a@x"),        # no policy signs ABOVE_LOOP
+    Cover(Posture.CONFIRM, "1:a@x"),           # nor anything at or above CONFIRM
+]
+
+
+@pytest.mark.parametrize("answer", _BROKEN_COVERS)
+def test_a_cover_that_breaks_the_invariants_is_uncovered(answer):
+    assert operative(Posture.ON_LOOP, effect(), Answers(answer), NOW) == (Posture.CONFIRM, COVER_NONE)
+    assert operative(Posture.ABOVE_LOOP, effect(), Answers(answer), NOW) == (Posture.CONFIRM, COVER_NONE)
+
+
+@pytest.mark.parametrize("answer", _BROKEN_COVERS)
+def test_a_peek_at_a_cover_that_breaks_the_invariants_is_moved(answer):
+    view = Answers(answer)
+    assert peek_snapshot(view, view.token, effect(), NOW) == COVER_MOVED
+
+
+def test_a_cover_of_the_invariants_shape_is_taken():
+    assert operative(Posture.ON_LOOP, effect(), Answers(Cover(Posture.COOLING_OFF, "1:a@x")), NOW) == (
+        Posture.COOLING_OFF, "1:a@x")
+    assert operative(Posture.ABOVE_LOOP, effect(), Answers(Cover(Posture.ON_LOOP, "1:a@x")), NOW) == (
+        Posture.ON_LOOP, "1:a@x")
+    assert operative(Posture.ON_LOOP, effect(), Answers(Cover(None, COVER_NONE)), NOW) == (
+        Posture.CONFIRM, COVER_NONE)
+    view = Answers(Cover(None, COVER_NONE))
+    assert peek_snapshot(view, view.token, effect(), NOW) == COVER_NONE
+
+
 @pytest.mark.parametrize("answer", [None, "1:a@x", LooksLikeACover(), Cover(Posture.ON_LOOP, 7)])
 def test_a_peek_at_a_view_that_answers_anything_but_a_cover_is_moved(answer):
     view = Answers(answer)
@@ -410,7 +507,7 @@ def test_a_peek_at_a_view_that_raises_is_moved():
 
 def test_the_token_is_built_from_the_snapshots_own_fields():
     s = snapshot(policy())
-    assert s.token == (HEAD, signers_digest(ROOT))
+    assert s.token == (HEAD, signers_digest(ROOT), STORE)
     assert s.signers_digest == "sha256:" + hashlib.sha256(ROOT).hexdigest()
     assert s.signers == parse_root_signers(ROOT)
     fields = {f.name for f in dataclasses.fields(CoverageSnapshot) if f.init}
@@ -431,14 +528,30 @@ def test_a_snapshot_refuses_a_bad_head_or_non_bytes_root():
 
 
 def test_uncovered_covers_nothing_at_its_token():
-    u = Uncovered(head=HEAD, signers_digest="sha256:abc")
-    assert u.token == (HEAD, "sha256:abc")
+    u = Uncovered(head=HEAD, signers_digest="sha256:abc", store_id=STORE)
+    assert u.token == (HEAD, "sha256:abc", STORE)
     assert u.cover(effect(), NOW) == Cover(None, COVER_NONE)
-    assert peek_snapshot(u, (HEAD, "sha256:abc"), effect(), NOW) == COVER_NONE
+    assert peek_snapshot(u, (HEAD, "sha256:abc", STORE), effect(), NOW) == COVER_NONE
+    assert peek_snapshot(u, (HEAD, "sha256:abc", OTHER_STORE), effect(), NOW) == COVER_MOVED
+
+
+@pytest.mark.parametrize("store", ["", None, 7])
+def test_uncovered_needs_a_stores_id(store):
+    with pytest.raises(TypeError):
+        Uncovered(head=HEAD, signers_digest="sha256:abc", store_id=store)
+
+
+def test_the_token_binds_the_store():
+    # deepseek LOW 7: a snapshot built for another store, at the same head and root bytes, is a moved state here
+    mine, theirs = snapshot(policy()), snapshot(policy(store_id=OTHER_STORE), store=OTHER_STORE)
+    assert mine.token != theirs.token
+    assert operative(Posture.ON_LOOP, effect(), theirs, NOW)[0] == Posture.ON_LOOP   # it covers in its own store
+    assert peek_snapshot(theirs, mine.token, effect(), NOW) == COVER_MOVED
+    assert peek_snapshot(mine, mine.token, effect(), NOW) != COVER_MOVED
 
 
 def test_uncovered_refuses_a_naive_now_like_the_snapshot():
-    u = Uncovered(head=HEAD, signers_digest="sha256:abc")
+    u = Uncovered(head=HEAD, signers_digest="sha256:abc", store_id=STORE)
     for view in (u, snapshot(policy())):
         with pytest.raises(ValueError):
             view.cover(effect(), NOW.replace(tzinfo=None))
