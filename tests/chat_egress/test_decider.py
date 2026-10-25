@@ -813,3 +813,19 @@ def test_a_lifted_read_stores_the_lifted_names_and_no_value(rig, host, query, ex
     stored = json.loads(row.names)
     assert [n for n in stored if n in ("sig", "x-amz-signature", "x-amz-credential")] == expect
     assert "SV9" not in row.names and "AZV1" not in row.names and "SV8" not in row.names
+
+
+# --- S9 r2 item B: the over-cap reason labels the over-cap card only ----------------------------------------------
+
+@pytest.mark.parametrize("query,why", [(None, "upload_pack_over_cap"), ("token=QV1", "credential_in_query")])
+def test_a_cut_pack_body_labels_its_row_by_the_card_it_filed(rig, query, why) -> None:
+    r = rig()
+    _advertise(r)
+    p, rid = r.srt.req("POST", path="/r.git/git-upload-pack", query=query,
+                       headers=UP_CT | {"transfer-encoding": ["chunked"]})
+    assert r.srt.wait(p)[0]["action"] == "need_body"
+    r.srt.body(p, b"x" * (advert.UPLOAD_PACK_BODY_CAP + 1))
+    assert _until(lambda: r.desk.filed)
+    r.desk.answer["card-1"] = "denied"
+    assert _until(lambda: [x for x in r.rows(rid) if x.kind == "egress_attempt"])
+    assert [x.deciding_step for x in r.rows(rid) if x.kind == "egress_attempt"] == [f"card:{why}:denied"]

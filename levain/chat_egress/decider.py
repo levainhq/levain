@@ -864,7 +864,9 @@ class Decider:
             if got is None:
                 return
             answer, from_queue = got
-            why = UPLOAD_PACK_OVER_CAP if r.body_cut else v.why   # the row's reason; the card itself shows v.why
+            # the row's reason; the card itself shows v.why. A credential mark outranks the body in classify, so a cut pack
+            # body carrying one is that card (its credential count stays); any other card on a cut body is the cap card.
+            why = UPLOAD_PACK_OVER_CAP if r.body_cut and v.why != "credential_in_query" else v.why
             if answer == "allowed":
                 r.step_name = f"card:{why}:allowed"
                 return self._allow(r)
