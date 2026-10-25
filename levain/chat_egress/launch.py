@@ -223,7 +223,10 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, eve
         def own(what: str, step: Callable[[], Any]) -> None:
             owned.callback(_guarded, failures, what, step)
         try:
-            socks_srv = SocksRefuser()
+            wall_ours, wall_theirs = socket.socketpair()
+            own("socks wall channel", wall_theirs.close)
+            own("socks wall channel (Levain's end)", wall_ours.close)
+            socks_srv = SocksRefuser(refusals=wall_ours)       # owns its end: closed by its close()
             own("socks", socks_srv.close)
             # `spawn` holds the glue's ends and the CA pipe: closed in this process once the glue is spawned and the CA
             # written (the glue holds its own copies), or on a refusal
@@ -241,6 +244,7 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, eve
                 obs_ours, obs_theirs = socket.socketpair()
                 own("observation socket", obs_ours.close)
                 theirs_("glue observation socket", obs_theirs.close)
+                theirs_("glue socks wall channel", wall_theirs.close)
                 ca_r, ca_w = os.pipe()
                 theirs_("CA pipe", lambda: os.close(ca_r))
                 theirs_("CA pipe write end", lambda: os.close(ca_w))
@@ -248,11 +252,12 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, eve
                 theirs_("glue lifeline end", lambda: os.close(life_r))
                 own("lifeline", lambda: os.close(life_w))
                 own("decider", lambda: [d.close(timeout_s=GLUE_EXIT_TIMEOUT_S) for d in deciders])
-                child = (lsock.fileno(), theirs.fileno(), obs_theirs.fileno(), ca_r, life_r)
+                child = (lsock.fileno(), theirs.fileno(), obs_theirs.fileno(), wall_theirs.fileno(), ca_r, life_r)
                 for fd in child:
                     os.set_inheritable(fd, True)
                 argv = [node, str(GLUE), "--srt-dist", str(srt_dist), "--listen-fd", str(lsock.fileno()),
                         "--decider-fd", str(theirs.fileno()), "--obs-fd", str(obs_theirs.fileno()),
+                        "--wall-fd", str(wall_theirs.fileno()),
                         "--ca-fd", str(ca_r), "--lifeline-fd", str(life_r), "--events", str(events),
                         "--denied-table", str(DENIED_TABLE), "--credential-placements", placements,
                         *(seams.glue_args if seams else ())]

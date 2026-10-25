@@ -68,9 +68,6 @@ def test_the_http_listener_does_not_speak_socks(make_tls_launch) -> None:
     _origin_quiet(L)
 
 
-@pytest.mark.xfail(strict=True, reason="OBSERVATION (S9 s2a): design C-1 says the SOCKS answer 'records a wall'; socks.py records "
-                   "nothing by its docstring and the report reads 0 walls after a refused SOCKS5 request "
-                   "(assert ((0 or 0) + 0) >= 1). Routes to the head: a design/implementation disagreement.")
 def test_a_socks_refusal_records_a_wall(make_tls_launch) -> None:
     """The design's C-1 says the SOCKS answer 'records a wall'; this runs it and reads the report."""
     from levain.chat_egress import report
@@ -86,7 +83,7 @@ def test_a_socks_refusal_records_a_wall(make_tls_launch) -> None:
     L.stop()
     r = report.build_from_files(L.e.records.rows(L.e.launch_id), L.e.events)
     print("RUN C-1 SOCKS wall in the report:", r.text())
-    assert (r.walls.total or 0) + sum(r.decider_walls.values()) >= 1
+    assert r.walls.total == 1 and r.by_reason == {"socks": 1}
 
 
 # --- CONNECT corners -----------------------------------------------------------------------------------------------
