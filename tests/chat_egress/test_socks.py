@@ -102,3 +102,13 @@ def test_a_socks4_client_reads_end_of_stream_not_a_reset(refuser) -> None:
             assert s.recv(16) == b""
         finally:
             s.close()
+
+
+def test_a_client_that_does_not_offer_no_auth_gets_no_acceptable_method(refuser) -> None:
+    s = socket.create_connection(("127.0.0.1", refuser.port), timeout=5)
+    try:
+        s.sendall(b"\x05\x01\x02")                             # username/password only
+        assert s.recv(2) == b"\x05\xff"
+        assert s.recv(1) == b""
+    finally:
+        s.close()

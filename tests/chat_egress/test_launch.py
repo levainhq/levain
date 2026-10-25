@@ -340,6 +340,17 @@ def test_a_mode_outside_the_known_modes_is_refused_before_anything_spawns(tmp_pa
     assert {p.pid for p in _node_children()} == before and not (tmp_path / "x" / "events.jsonl").exists()
 
 
+@pytest.mark.chat_egress_srt
+def test_a_bare_node_name_is_found_on_the_services_path(tmp_path, origin, monkeypatch) -> None:
+    """The glue runs under env={}, where a bare `node` would be looked up on the default path only."""
+    monkeypatch.setenv("PATH", f"{Path(envmod.node_bin()).parent}:/usr/bin:/bin")
+    e = _start(tmp_path, origin, monkeypatch, node="node")
+    try:
+        assert e.node_version.startswith("v26.") and e.proc.args[0] == str(Path(envmod.node_bin()))
+    finally:
+        assert lm.stop_egress(e).glue_exit == 0
+
+
 def _node_children():
     class P:
         def __init__(self, pid):

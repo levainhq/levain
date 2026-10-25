@@ -41,6 +41,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket
 import subprocess
 import time
@@ -194,6 +195,7 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_dist: Path, event
                  on_renew_due: Callable[[str, list[renew.RenewDue]], None] | None = None,
                  now: datetime | None = None) -> EgressLaunch:
     refuse_seams(seams)
+    node = shutil.which(node) or node       # the glue runs under env={}: a bare name resolves on the service's PATH
     if store.launch(launch_id) is None:
         raise EgressRefused(f"no launches row for {launch_id!r}: the egress rows of a launch reference it")
     node_version = check_node(node)
@@ -252,7 +254,9 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_dist: Path, event
                     proc = subprocess.Popen(argv, pass_fds=child, env={}, stdin=subprocess.DEVNULL,
                                             stdout=subprocess.DEVNULL, stderr=err)
                 own("glue", lambda: _end_glue(proc))
-                os.write(ca_w, ca_pem)
+                pem = memoryview(ca_pem)
+                while pem:                       # a short write would hand the glue a truncated CA
+                    pem = pem[os.write(ca_w, pem):]
         except OSError as exc:
             raise EgressRefused(f"the egress glue did not start: {type(exc).__name__}") from None
         decider = dm.Decider(ours, obs_ours, launch_id=launch_id, records=records, routes=routes, mode=mode,

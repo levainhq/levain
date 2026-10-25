@@ -2,7 +2,8 @@
 
 The design's `chat_sandbox_block(egress="proxy")` points the sandbox's SOCKS port here. A SOCKS5
 client is offered no-auth, its request read, and answered with reply `0x02` (connection not allowed by ruleset),
-then closed; anything else (SOCKS4, garbage) is closed with nothing answered. One connection is served at a time,
+then closed; a SOCKS5 client not offering no-auth is answered "no acceptable methods" (`0xff`) and closed; anything
+else (SOCKS4, garbage) is closed with nothing answered. One connection is served at a time,
 and the whole exchange (draining included) has one absolute deadline, `IO_TIMEOUT_S` from the accept, so a client
 trickling bytes holds the listener no longer than that; `close()` shuts the connection being served. No connection
 is ever made and nothing the client sent is recorded or logged.
@@ -41,7 +42,11 @@ def _exact(conn: socket.socket, n: int, deadline: float) -> bytes | None:
 
 def _serve(conn: socket.socket, deadline: float) -> None:
     head = _exact(conn, 2, deadline)
-    if head is None or head[0] != 5 or head[1] == 0 or _exact(conn, head[1], deadline) is None:
+    methods = None if head is None or head[0] != 5 or head[1] == 0 else _exact(conn, head[1], deadline)
+    if methods is None:
+        return
+    if 0 not in methods:                     # no-auth not offered: "no acceptable methods", then closed
+        conn.sendall(b"\x05\xff")
         return
     conn.sendall(b"\x05\x00")
     req = _exact(conn, 4, deadline)
