@@ -2,9 +2,10 @@
 
 A worker-built tree can defeat a plain rmtree (a mode-000 directory, a directory without write permission) or point
 out of itself (a symlink). :func:`remove_tree` walks it fd-relative: each directory is opened `O_NOFOLLOW` from its
-parent's fd and made 0700 before it is listed, every entry that is not a directory is unlinked (a symlink is removed
-as itself, never followed), then the directory is removed. A failure is a logged leftover, never a crash; the
-leftovers are returned so the launch end can name them.
+parent's fd (one its owner cannot read is made 0700 first, `_open_dir`) and made 0700 through that fd before it is
+listed, every entry that is not a directory is unlinked (a symlink is removed as itself, never followed), then the
+directory is removed. A failure is a logged leftover, never a crash; the leftovers are returned so the launch end can
+name them.
 """
 
 from __future__ import annotations
@@ -19,6 +20,25 @@ __all__ = ["remove_tree"]
 log = logging.getLogger(__name__)
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+#: os.chmod can refuse to follow a symlink (lchmod: macOS, the BSDs). A Linux CPython has no lchmod, and its
+#: fchmodat(AT_SYMLINK_NOFOLLOW) stand-in raises ValueError / NotImplementedError where libc lacks it, so there the
+#: chmod is a plain one (see `_open_dir`)
+_CHMOD_NOFOLLOW = os.chmod in os.supports_follow_symlinks
+
+
+def _open_dir(dfd: int, name: str) -> int:
+    """`name` under `dfd` (lstat said a directory) opened O_NOFOLLOW. One its owner cannot read is made 0700 by name
+    and opened again; where os.chmod cannot refuse a symlink, a symlink swapped in after the lstat has its target's
+    mode changed by that chmod, and the second open still refuses it (O_NOFOLLOW)."""
+    try:
+        return os.open(name, _DIR_FLAGS, dir_fd=dfd)
+    except PermissionError:
+        pass
+    if _CHMOD_NOFOLLOW:
+        os.chmod(name, 0o700, dir_fd=dfd, follow_symlinks=False)
+    else:
+        os.chmod(name, 0o700, dir_fd=dfd)
+    return os.open(name, _DIR_FLAGS, dir_fd=dfd)
 
 
 def _clear(dfd: int, label: str, leftovers: list[str]) -> None:
@@ -35,8 +55,7 @@ def _clear(dfd: int, label: str, leftovers: list[str]) -> None:
             if not stat.S_ISDIR(st.st_mode):
                 os.unlink(name, dir_fd=dfd)
                 continue
-            os.chmod(name, 0o700, dir_fd=dfd, follow_symlinks=False)
-            cfd = os.open(name, _DIR_FLAGS, dir_fd=dfd)
+            cfd = _open_dir(dfd, name)
             try:
                 _clear(cfd, where, leftovers)
             finally:
