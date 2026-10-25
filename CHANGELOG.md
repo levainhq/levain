@@ -19,11 +19,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   them, the lowest rung, and an expiry at most 30 days out. A policy covers only while its signing keys are listed in
   root's allowed-signers file and are not revoked; `create` prints what it hands over before anything is signed, and
   the command it prints names its store and cockpit by absolute path, so it signs the same store from any directory.
-- **`levain binding graduate` takes the graduation steps a policy covers,** records each, and prints the one
-  `levain binding policy create` line for a step none covers. It needs the binding driver, which this release does not
-  wire, so for now it says nothing graduates. If a step fails (the authority log is locked, say), the steps already
-  taken are still printed, the failed one is named, and the command exits 1; a binding that changed while the run was
-  in progress (revoked, paused, fired, or graduated by another run) is reported as `stale` and nothing is written for it.
+- **`levain binding graduate` exists, and in this release says that nothing graduates and exits 1:** the binding
+  driver it needs is not wired yet.
 - **The cockpit and the phone show the coordinator's review queue and morning card, read-only.** The cockpit shows them
   on the Morning and Board tabs: what needs a look, newest first, how long ago, and which items only you clear. The phone
   page has a Review tab with the morning card, the open items (what each is, what it says, how old it is) and the ones
@@ -31,7 +28,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   creates or changes the coordinator's store. They say when the review check last ran, or that it has not run yet or
   could not read the queue, and never "Nothing is waiting on you" in those cases; a section the morning card could not
   read says so instead of showing zero. A command too long for a cockpit row is cut with a visible "shortened" mark.
-  On Android the phone page says "your screen lock" where it said Face ID.
+  On a phone other than an iPhone the page says "your screen lock" where it said Face ID.
 - **`levain doctor` reports the brokered-spend install.** New rows: whether the dispatch route trust is pinned (and to
   which key; `trust.pub` is checked with `ssh-keygen` the way Levain verifies a route map, so a damaged key file fails),
   whether the keys service runs (an install with no egress slot says so instead of failing), the spend ledger's size,
@@ -50,6 +47,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   refilled,** so a keys failure cannot leave the pool short.
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
+- **The graduation engine behind `levain binding graduate`.** Once the binding driver is wired, it takes the steps a
+  policy covers, records each, and prints the one `levain binding policy create` line for a step none covers; the steps
+  already taken stay printed when a later one fails, and a binding that changed during the run (revoked, paused,
+  fired, or graduated by another run) is reported as `stale` with nothing written for it.
 - **The queue broker's service program exists for an isolated install.** It serves every slot's queue socket, so slot
   sessions' tool-call limits are enforced, and picks up slots added later without a restart. No `levain` command
   installs or starts it yet.
