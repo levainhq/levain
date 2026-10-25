@@ -33,7 +33,10 @@ def _node() -> str:
 
 
 def _run_node_test(path: Path, env: dict, timeout: int) -> subprocess.CompletedProcess:
-    return subprocess.run([_node(), "--test", "--test-concurrency=1", "--test-timeout=120000", str(path)],
+    # The reporter is pinned: the default differs by Node version and TTY (TAP on CI's runner), and the
+    # assertions below read the spec reporter's summary lines.
+    return subprocess.run([_node(), "--test", "--test-reporter=spec", "--test-concurrency=1",
+                           "--test-timeout=120000", str(path)],
                           capture_output=True, text=True, timeout=timeout, env=env)
 
 
