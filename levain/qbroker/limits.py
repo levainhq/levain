@@ -2,8 +2,9 @@
 
 Slot limits design (``project_memory/1025-6/limits/DESIGN.md`` §3; head rulings R0 and R1). :class:`PolicyLimits` is
 the broker's :data:`levain.qbroker.broker.LimitsSource`: called with (agent, session) on every limited GATE, it returns
-exactly :data:`levain.consent.limits.SLOT_KINDS`, or raises :class:`LimitsUnavailable`. It never returns ``None`` (the
-broker reads ``None`` from its callable as a fault too, never as "no limits").
+exactly :data:`levain.consent.limits.SLOT_KINDS`, or raises :class:`LimitsUnavailable` (any other exception inside it
+is wrapped into one). It never returns ``None`` (the broker reads ``None`` from its callable as a fault too, never as
+"no limits").
 
 - The file MISSING (the policy directory itself sound): :data:`~levain.consent.limits.DEFAULTS` for the slot kinds
   (Q13 F5b: on by default; R0 ruling 1).
@@ -68,14 +69,21 @@ class PolicyLimits:
         return self._dir / POLICY_LIMITS
 
     def __call__(self, agent: str, session: str) -> dict[str, float]:
-        doc = self._document()
-        if doc is None:
-            return {k: float(consent_limits.DEFAULTS[k]) for k in consent_limits.SLOT_KINDS}
+        """Raises only :class:`LimitsUnavailable`: any other failure here is wrapped into one naming it."""
         try:
-            got, _ = consent_limits.parse_limits_doc(doc, agent, slot=True)
-        except consent_limits.LimitsDocError as exc:    # slot_doc checked the whole document at read: not expected
-            raise LimitsUnavailable(self._unusable(exc.code)) from None
-        return {k: float(got[k]) for k in consent_limits.SLOT_KINDS}
+            doc = self._document()
+            if doc is None:
+                return {k: float(consent_limits.DEFAULTS[k]) for k in consent_limits.SLOT_KINDS}
+            try:
+                got, _ = consent_limits.parse_limits_doc(doc, agent, slot=True)
+            except consent_limits.LimitsDocError as exc:   # slot_doc checked the document; an agent with no block
+                raise LimitsUnavailable(self._unusable(exc.code)) from None
+            return {k: float(got[k]) for k in consent_limits.SLOT_KINDS}
+        except LimitsUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 - an fstat, a read or the parser failing is the same fail-closed answer
+            raise LimitsUnavailable(self._unusable(f"it could not be read ({type(exc).__name__}: {exc})"[:200])) \
+                from None
 
     def _unusable(self, why: str) -> str:
         return (f"{self.path} is not usable: {why}; the operator rewrites it with levain limits set --slots")

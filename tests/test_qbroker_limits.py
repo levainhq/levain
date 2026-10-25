@@ -40,17 +40,24 @@ def test_repeat_crossing_then_different_call_is_still_over_limit(L, resolver, cl
         assert got["gate"] == "over-limit" and got["kind"] == "repeat"
 
 
+def hours_of(b, clock, d, hours, step=500):
+    """Calls ``step`` s apart (under ACTIVE_GAP: all active) until ``hours`` of active time; the last answer."""
+    for i in range(int(hours * 3600 // step) + 1):
+        clock["now"] = NOW + timedelta(seconds=i * step)
+        got = gate(b, input_digest=next(d))
+    return got, i * step
+
+
 def test_active_hours_crossing_then_gap_is_still_over_limit(L, resolver, clock):
-    # the broker's clock is the counter's (Broker(clock=...) -> count_call(now=...))
-    b = make_broker(L, resolver, clock, limits=lambda a, s: BIG | {"active_hours": 0.1})
+    # the broker's clock is the counter's (Broker(clock=...) -> count_call(now=...)); a slot limit is whole hours
+    b = make_broker(L, resolver, clock, limits=lambda a, s: BIG | {"active_hours": 1})
     d = digests()
-    assert gate(b, input_digest=next(d))["gate"] == "go"
-    clock["now"] = NOW + timedelta(seconds=300)
-    assert gate(b, input_digest=next(d))["gate"] == "go"            # 300 s active: under 0.1 h
-    clock["now"] = NOW + timedelta(seconds=600)
-    got = gate(b, input_digest=next(d))                              # 600 s active: past 0.1 h
+    got, t = hours_of(b, clock, d, 1)                                # 3500 s active: under 1 h
+    assert got["gate"] == "go" and t == 3500
+    clock["now"] = NOW + timedelta(seconds=t + 500)
+    got = gate(b, input_digest=next(d))                              # 4000 s active: past 1 h
     assert got["gate"] == "over-limit" and got["kind"] == "active_hours"
-    clock["now"] = NOW + timedelta(seconds=600 + consent_limits.ACTIVE_GAP + 100)   # a gap adding no active time
+    clock["now"] = NOW + timedelta(seconds=t + 500 + consent_limits.ACTIVE_GAP + 100)   # a gap adding no active time
     got = gate(b, input_digest=next(d))
     assert got["gate"] == "over-limit" and got["kind"] == "active_hours"
 
@@ -77,15 +84,14 @@ def test_raising_the_limit_past_the_latch_frees_the_session(L, resolver, clock):
 
 
 def test_a_lowered_then_restored_active_hours_limit(L, resolver, clock):
-    lim = BIG | {"active_hours": 0.1}
+    lim = BIG | {"active_hours": 1}
     b = make_broker(L, resolver, clock, limits=lambda a, s: dict(lim))
     d = digests()
-    for t in (0, 300, 600):
-        clock["now"] = NOW + timedelta(seconds=t)
-        last = gate(b, input_digest=next(d))
-    assert last["gate"] == "over-limit"
-    lim["active_hours"] = 0.2                                        # above the latched 600 s
-    clock["now"] = NOW + timedelta(seconds=700)
+    last, t = hours_of(b, clock, d, 1)
+    clock["now"] = NOW + timedelta(seconds=t + 500)
+    assert gate(b, input_digest=next(d))["gate"] == "over-limit"     # latched at 4000 s
+    lim["active_hours"] = 2                                          # above the latched 4000 s
+    clock["now"] = NOW + timedelta(seconds=t + 600)
     assert gate(b, input_digest=next(d))["gate"] == "go"
 
 

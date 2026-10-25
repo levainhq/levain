@@ -56,12 +56,14 @@ session is the resolve's, never the frame's.
   :class:`levain.qbroker.limits.PolicyLimits`, read from ``L/policy/limits``; ``None``, a test's broker, every call
   GO, nothing counted). The callable raising :class:`~levain.qbroker.limits.LimitsUnavailable` answers
   ``limits-failed`` with its reason, and so does an answer that is not every kind of
-  :data:`levain.consent.limits.SLOT_KINDS` as a positive number (:func:`slot_limits`: a kind left out is never
-  unlimited). A ``crossed`` or ``halted`` verdict answers over-limit, ``fail_deny`` answers
-  ``limits-failed`` with the counter's reason (the store failed, not a budget: the operator repairs or moves the
-  limits database); ``ok`` and ``not_counting`` (the counter's own bounded fail-open) answer GO. A counter directory that cannot be established
-  as the broker's own 0700 one answers ``limits-failed`` on every limited call (the counter could not even persist
-  its failure count, so its fail-open would never end). Tokens are not counted in a slot (the frame
+  :data:`levain.consent.limits.SLOT_KINDS` in its :data:`levain.consent.limits.SLOT_RANGE` (:func:`slot_limits`: a
+  kind left out is never unlimited); the callable raising anything else answers ``limits-failed`` naming the
+  exception, never ``broker-error``. A ``crossed`` or ``halted`` verdict answers over-limit, ``ok`` answers GO, and
+  every other verdict answers ``limits-failed`` with the counter's reason (the store failed, not a budget: the operator
+  repairs or moves the limits database). The counter's bounded fail-open is the local gate's alone: with
+  ``count_crossed=False`` a store failure is ``fail_deny`` on the first call. A counter directory that cannot be
+  established as the broker's own 0700 one (permission bits; the setgid bit a setgid parent gives is allowed)
+  answers ``limits-failed`` on every limited call. Tokens are not counted in a slot (the frame
   carries no transcript path, and the broker reads none of the session's files). KNOWN EDGE: the Extend / End hold
   of :func:`~levain.consent.limits.check` needs a ConsentQueue the broker does not have, so over-limit stands until
   the operator changes the limits the callable returns.
@@ -104,7 +106,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import math
 import os
 import posixpath
 import re
@@ -201,17 +202,27 @@ LIMITS_DIR_FAILED = "the limits directory requests/limits could not be used as t
 LIMITS_SETTINGS_FAILED = "the broker's limits settings did not name calls, active_hours and repeat"
 
 
+def _private_dir(st: os.stat_result) -> bool:
+    """A directory of the broker's uid whose permission bits are 0700. The setgid bit is not a permission:
+    ``levain.slot.layout`` installs ``L/queue/requests`` 0o2750, and a ``mkdir(0o700)`` beneath a setgid directory on
+    Linux takes the bit from it (0o2700)."""
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and st.st_mode & 0o777 == 0o700
+
+
 def slot_limits(in_force: Any) -> dict[str, float] | None:
     """What the counter runs with from the settings callable's answer: each of
-    :data:`levain.consent.limits.SLOT_KINDS` a positive real number (the token kinds unlimited: a slot counts none), or
-    ``None`` when the answer is not that (``None`` itself, a kind missing, a value that is not a number): a kind
-    left out is never read as unlimited (slot limits R1 F1)."""
+    :data:`levain.consent.limits.SLOT_KINDS` a number in its :data:`levain.consent.limits.SLOT_RANGE` (the token kinds
+    unlimited: a slot counts none), or ``None`` when the answer is not that (``None`` itself, a kind missing, a value
+    that is not a number or is outside its range, NaN and infinities included): a kind left out is never read as
+    unlimited (slot limits R1 F1). The range is compared before ``float()``, so an integer too large for a float is
+    refused here rather than raising."""
     if not isinstance(in_force, Mapping):
         return None
     full = {k: float("inf") for k in consent_limits.KINDS}
     for kind in consent_limits.SLOT_KINDS:
         v = in_force.get(kind)
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or not (v > 0 and math.isfinite(v)):
+        lo, hi = consent_limits.SLOT_RANGE[kind]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
             return None
         full[kind] = float(v)
     return full
@@ -756,6 +767,10 @@ class Broker:
             in_force = self._limits(agent, who.session)
         except LimitsUnavailable as exc:
             return wire.answer(rid, gate="limits-failed", reason=str(exc.reason)[:512])
+        except Exception as exc:  # noqa: BLE001 - a settings source that breaks is a limits failure, never broker-error
+            log.exception("qbroker: the limits settings failed on slot %s", slot)
+            return wire.answer(rid, gate="limits-failed",
+                               reason=f"the broker's limits settings failed ({type(exc).__name__}: {exc})"[:512])
         full = slot_limits(in_force)
         if full is None:
             return wire.answer(rid, gate="limits-failed", reason=LIMITS_SETTINGS_FAILED)
@@ -768,7 +783,7 @@ class Broker:
                                             now=self._clock().timestamp())
         if verdict.state in _GATE_OVER:
             return wire.answer(rid, gate="over-limit", kind=verdict.kind)
-        if verdict.state == "fail_deny":
+        if verdict.state != "ok":       # fail_deny, and anything else: a slot has no fail-open (S-a r1 MED 1)
             return wire.answer(rid, gate="limits-failed", reason=str(verdict.reason or "the limits store failed")[:512])
         return wire.answer(rid, gate="go")
 
@@ -784,8 +799,7 @@ class Broker:
                 path.mkdir(mode=0o700)
             except FileExistsError:
                 pass
-            st = os.lstat(path)
-            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o700:
+            if not _private_dir(os.lstat(path)):
                 raise OSError(f"{path} is not a 0700 directory of uid {os.geteuid()}")
         except OSError:
             if not self._limits_dir_logged:

@@ -31,7 +31,9 @@ proceeds and the verdict says ``not_counting``. A runaway that filled the disk i
 after :data:`FAIL_DENY_AFTER` consecutive failed writes in one root every call is denied until a write succeeds. The
 failure count lives in a small fixed-size file per root, pre-allocated at the root's first counted call and overwritten
 in place, so updating it needs no new disk blocks. A failure whose count cannot be written at all is denied at once:
-the bound could not be held otherwise.
+the bound could not be held otherwise. This is the local gate's rule alone: a caller that counts no crossing (the queue
+broker's GATE, ``count_crossed=False``) is denied ``fail_deny`` at the first failure, since a slot that proceeds
+uncounted could also lose the latch its crossing would have written.
 
 Known edges (one line each):
 
@@ -193,8 +195,8 @@ def parse_limits_doc(doc: Any, agent: str | None, *, slot: bool = False) -> tupl
     is skipped and named in the list; raises :class:`LimitsDocError` only when ``doc`` is not a ``levain-limits/1``
     object. ``slot=True``: the WHOLE document is checked, every block whatever ``agent`` is, and its first fault
     raises (top-level keys ``format`` and any of ``default`` / ``claude_code`` / ``codex``; each block an object over
-    :data:`SLOT_KINDS`; each value an integer in :data:`SLOT_RANGE`); the result is exactly :data:`SLOT_KINDS` and
-    the list is empty. ``agent=None`` reads the ``default`` block only (a writer validating the document)."""
+    :data:`SLOT_KINDS`; each value an integer in :data:`SLOT_RANGE`), as does an ``agent`` outside :data:`AGENTS`
+    (never read as a block); the result is exactly :data:`SLOT_KINDS` and the list is empty. ``agent=None`` reads the ``default`` block only (a writer validating the document)."""
     if not isinstance(doc, dict) or doc.get("format") != LIMITS_FORMAT:
         raise LimitsDocError("limits-malformed", f"not a {LIMITS_FORMAT} object")
     blocks = ("default",) if agent is None else ("default", agent)
@@ -232,9 +234,11 @@ def parse_limits_doc(doc: Any, agent: str | None, *, slot: bool = False) -> tupl
             lo, hi = SLOT_RANGE[kind]
             if type(v) is not int or not lo <= v <= hi:
                 raise LimitsDocError(f"limits-value:{block}.{kind}", f"an integer from {lo} to {hi}")
+    if agent is not None and agent not in AGENTS:
+        raise LimitsDocError(f"limits-key:{agent}"[:128], "not an agent with a block")
     out = {k: DEFAULTS[k] for k in SLOT_KINDS}
     for block in blocks:
-        out.update(doc.get(block) or {})
+        out.update(doc.get(block) or {})       # each block checked an object above
     return out, []
 
 
@@ -250,8 +254,8 @@ def slot_doc(data: bytes, *, canonical: bool = True) -> dict[str, Any]:
         raise LimitsDocError("limits-oversize", f"over {SLOT_LIMITS_MAX} bytes")
     try:
         doc = parse(data)
-    except ContractError as exc:
-        raise LimitsDocError("limits-malformed", str(exc)[:200]) from None
+    except (ContractError, RecursionError) as exc:
+        raise LimitsDocError("limits-malformed", str(exc)[:200] or type(exc).__name__) from None
     parse_limits_doc(doc, None, slot=True)
     if canonical and canonical_bytes(doc) != data:
         raise LimitsDocError("limits-malformed", "not its canonical bytes")
@@ -383,12 +387,13 @@ def count_call(queue_dir: Path | str, agent: str, session: str, event: Mapping[s
                limits: Mapping[str, float] | None = None, count_crossed: bool = True) -> Verdict:
     """Count one ``PreToolUse`` call of ``session`` (Claude Code's subagent key included) and say whether it may go on.
     Never raises: a failure is ``not_counting`` (proceed) or, past :data:`FAIL_DENY_AFTER`, ``fail_deny``.
-    ``count_crossed=False``: a call answered ``crossed`` is not counted, for a caller that denies it with no halt (the
-    queue broker's GATE), so a limit the operator raises later is not found already spent. What it writes instead is a
-    LATCH, the first crossing's kind and count: every later call of the root, whatever it is and however long after,
-    is answered ``crossed`` at that count and counts nothing, until the limit in force no longer crosses at it (the
-    operator raised it); then the latch is dropped and the call is counted as any other. Without it a ``repeat`` would
-    free the session at the next different call and ``active_hours`` after a gap of :data:`ACTIVE_GAP`."""
+    ``count_crossed=False``: every failure is ``fail_deny``, and a call answered ``crossed`` is not counted, for a
+    caller that denies it with no halt (the queue broker's GATE), so a limit the operator raises later is not found
+    already spent. What it writes instead is a LATCH, the first crossing's kind and count: every later call of the
+    root, whatever it is and however long after, is answered ``crossed`` at that count and counts nothing, until the
+    limit in force no longer crosses at it (the operator raised it); then the latch is dropped and the call is counted
+    as any other. Without it a ``repeat`` would free the session at the next different call and ``active_hours`` after
+    a gap of :data:`ACTIVE_GAP`. A latch row that cannot be read is a store failure (it is kept, never dropped)."""
     qdir = Path(queue_dir)
     root = session_root(session)
     fail = _fail_path(qdir, agent, root)
@@ -408,8 +413,9 @@ def count_call(queue_dir: Path | str, agent: str, session: str, event: Mapping[s
         # bound cannot be held and the call is denied now (L3 r2 codex F2)
         kept = _fail_write(fail, n, create=True)
         why = f"{type(exc).__name__}: {exc}"[:300]
-        if not kept or n >= FAIL_DENY_AFTER:
-            times = f"failed {n} times in a row" if kept else "failed and its failure count could not be written"
+        if not kept or n >= FAIL_DENY_AFTER or not count_crossed:
+            times = ("failed and its failure count could not be written" if not kept
+                     else "failed" if not count_crossed else f"failed {n} times in a row")
             return Verdict("fail_deny", reason=f"the limits store {qdir / DB_NAME} {times} ({why}); "
                                                "the operator fixes or moves that file aside (a full disk, a store of "
                                                "another levain version, a corrupt file) and the next call is counted")
@@ -585,15 +591,24 @@ def _over(kind: str, count: float, limit: float) -> bool:
 
 def _latched(conn: sqlite3.Connection, agent: str, root: str, lim: Mapping[str, float]) -> tuple[str, float] | None:
     """Inside the counting transaction: the root's first latch (in :data:`KINDS` order) that still crosses the limit
-    in force, as (kind, count); every latch that no longer crosses (or names no kind in force) is deleted."""
+    in force, as (kind, count); every latch that no longer crosses is deleted. A row that cannot be read (a kind
+    outside :data:`KINDS` or the limits, a count that is not a number) raises :class:`LatchUnreadable`, so the
+    transaction rolls back with the row kept and the caller fails closed: deleting it would free a held session."""
     held = []
     for kind, count in conn.execute("SELECT kind, count FROM latches WHERE agent = ? AND root = ?",
                                     (agent, root)).fetchall():
-        if kind in KINDS and kind in lim and isinstance(count, (int, float)) and _over(kind, count, lim[kind]):
+        if kind not in KINDS or kind not in lim or isinstance(count, bool) or not isinstance(count, (int, float)) \
+                or count != count:
+            raise LatchUnreadable(f"an unreadable latch row ({str(kind)[:40]!r}, {str(count)[:40]!r})")
+        if _over(kind, count, lim[kind]):
             held.append((KINDS.index(kind), kind, float(count)))
         else:
             conn.execute("DELETE FROM latches WHERE agent = ? AND root = ? AND kind = ?", (agent, root, kind))
     return min(held)[1:] if held else None
+
+
+class LatchUnreadable(RuntimeError):
+    """A ``latches`` row :func:`_latched` cannot read: a store fault, kept for the operator, never dropped."""
 
 
 def _num0(v: Any) -> int:
