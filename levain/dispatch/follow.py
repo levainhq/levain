@@ -4,7 +4,9 @@
 (:meth:`levain.dispatch.jobs.JobStore.event_cursor`) and, per event, in this order: (1) dispatch's durable write,
 (2) ``ARTIFACT-ACK``, (3) the cursor moved past the event in its own transaction. A crash between any two re-delivers
 the event on the next connection; the write and the ACK are both idempotent, so the repeat converges. The cursor never
-moves past an event whose write or ACK failed: :class:`FollowStopped` names why, and the follower stops there.
+moves past an event whose write or ACK failed: :class:`FollowStopped` names why, and the follower stops there. A
+:meth:`EventFollower.close` that lands while a step handles an event ends that step ``CANCELLED`` before the cursor
+moves, and the next follower's re-delivery converges the same way.
 
 Slice 1 handles:
 
@@ -121,7 +123,8 @@ class EventFollower:
 
     def step(self) -> Stepped:
         """One connection: replay and follow from the persisted cursor until the stream ends. Returns how it ended
-        and the gaps it read (:class:`Stepped`); raises :class:`FollowStopped` at an event it could not finish."""
+        and the gaps it read (:class:`Stepped`), ``CANCELLED`` once :meth:`close` ran; raises :class:`FollowStopped`
+        at an event it could not finish."""
         # one ordering against close(), both under _lock: _closed is read before the factory runs (a step after close
         # opens nothing) and again before the opened stream is registered (a close that landed while it opened closes
         # it here, unread); a close after registration finds it in _active
