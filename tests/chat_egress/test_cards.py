@@ -93,7 +93,7 @@ def test_the_worst_case_card_is_still_under_the_display_limit():
                    launch_id="L" * 200)
     assert len(card_display(c)) <= DISPLAY_MAX
     assert c["stripped"][-1] == f"(+{190 - cards.NAMES_SHOWN} more)" and len(c["stripped"]) == cards.NAMES_SHOWN + 1
-    assert c["header_names"][-1].startswith("(+") and c["query_names"][-1].startswith("(+")
+    assert c["header_names"][-1].startswith("(+") and c["query_keys"][-1].startswith("(+")
 
 
 # --- R15-10-A16: control and bidi characters ------------------------------------------------------------------------
@@ -111,7 +111,7 @@ def _hostile_card(bad: str) -> dict:
     return card_input(p, v, ["s" + bad], body_len=0, body_sha256=None, launch_id=LAUNCH)
 
 
-AGENT_FIELDS = ("method", "host", "path", "reattached", "stripped", "header_names", "query_names")
+AGENT_FIELDS = ("method", "host", "path", "reattached", "stripped", "header_names", "query_keys")
 
 
 def _field(c: dict, k: str) -> str:
@@ -158,7 +158,7 @@ def test_the_query_names_are_on_the_card_as_sent_and_no_value_is_anywhere_on_it(
     c = _card(frame(method="POST", path="/p", query="q=SECRETQUERYVALUE&%71x=2&q=again",
                     headers={"authorization": "Bearer TOPSECRETTOKEN", "cookie": "s=COOKIEVALUE",
                              "x-levain-thing": "1", "content-type": "text/plain"}))
-    assert c["query_names"] == ["q", "%71x"]
+    assert c["query_keys"] == ["q", "%71x"]
     display = card_display(c)
     for value in ("SECRETQUERYVALUE", "again", "TOPSECRETTOKEN", "COOKIEVALUE", "text/plain"):
         assert value not in display, value

@@ -75,11 +75,11 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MARK = "⟨U+{:04X}⟩"
 #: the card's keys, in display order. `path_chars` / `path_sha256` are present only when the path was cut.
 _KEYS = ("method", "scheme", "host", "port", "reattached", "stripped", "why", "hold", "body_len", "body_sha256",
-         "header_names", "query_names", "path", "path_chars", "path_sha256", "launch", "request")
+         "header_names", "query_keys", "path", "path_chars", "path_sha256", "launch", "request")
 _OPTIONAL = frozenset({"path_chars", "path_sha256"})
 #: each key's type in a filed card (a key not named here is a string)
 _KIND = {"port": "int", "body_len": "int", "path_chars": "int", "stripped": "names", "header_names": "names",
-         "query_names": "names", "reattached": "str?", "body_sha256": "str?"}
+         "query_keys": "names", "reattached": "str?", "body_sha256": "str?"}
 _TYPE_OK = {
     "int": lambda v: type(v) is int and v >= 0,
     "names": lambda v: type(v) is list and all(type(n) is str for n in v),
@@ -180,7 +180,7 @@ def card_input(parsed: "ParsedRequest", verdict: "Verdict", stripped: Sequence[s
         "body_len": body_len,
         "body_sha256": None if body_sha256 is None else "sha256:" + body_sha256,
         "header_names": _names(verdict.card_header_names),
-        "query_names": _names([q.raw_key for q in parsed.params]),
+        "query_keys": _names([q.raw_key for q in parsed.params]),
         "path": path,
     }
     if cut:

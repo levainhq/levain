@@ -4194,7 +4194,7 @@
   const EGRESS_TOOL = "levain_egress";
   const EGRESS_LABEL = { method: "method", scheme: "scheme", host: "host", port: "port", reattached: "Levain adds your key for",
     stripped: "removed", why: "why it asks", hold: "held", body_len: "body bytes", body_sha256: "body", header_names: "header names",
-    query_names: "query names", path: "path", path_chars: "whole path length", path_sha256: "whole path", launch: "launch",
+    query_keys: "query names", path: "path", path_chars: "whole path length", path_sha256: "whole path", launch: "launch",
     request: "request" };
   // the words for chat_egress.cards.CardState. A body carrying `egress_state` (card_state over the request's egress
   // rows) is drawn as that; a body without one is drawn from the queue's state alone
