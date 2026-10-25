@@ -213,8 +213,16 @@ class EventFollower:
             self._ack_client.call("ARTIFACT-ACK", **args)
         except Refused as e:
             if e.name == "control-down":
-                self.close()
+                self._drop_ack()
             raise FollowStopped(e.name, f"ARTIFACT-ACK of event {seq}") from None
+
+    def _drop_ack(self) -> None:
+        """Close the ACK connection alone, so the next ACK connects again; the follower stays open (close() is the
+        caller's permanent shutdown, never a transient control-down's)."""
+        with self._lock:
+            client, self._ack_client = self._ack_client, None
+        if client is not None:
+            client.close()
 
     def _hit(self, where: str, seq: int) -> None:
         if self._fault is not None:

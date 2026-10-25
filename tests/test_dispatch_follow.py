@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from levain.dispatch import follow as F
+from levain.slot import Refused
 from levain.slot import control as C
 from levain.slot import control_client as CC
 from levain.slot import events as EV
@@ -331,3 +332,34 @@ def test_close_ends_a_step_blocked_on_its_stream_and_a_closed_follower_opens_non
     assert time.monotonic() - began < 5.0
     t.join()
     assert f.step().outcome == CC.CANCELLED                                    # closed: no stream is opened after close
+
+
+class DownClient:
+    """An ACK connection whose every call finds CONTROL down."""
+
+    def call(self, *_a, **_k):
+        raise Refused("control-down", "the test's ACK connection")
+
+    def close(self) -> None:
+        pass
+
+
+def test_a_control_down_ack_stops_the_step_and_the_next_step_opens_a_stream(store, repo, served):  # noqa: F811
+    """RULINGS_OBS 13: one control-down during an ARTIFACT-ACK stops that step by name and drops only the ACK
+    connection, never the follower: the next step opens a stream, re-delivers the event and acks it."""
+    d = setup_verifier(store, repo, served)
+    opened: list = []
+    clients = [DownClient()]
+
+    def stream(after, jid):
+        opened.append(after)
+        return CC.follow_events(served.path, after, jid, read_deadline=0.5)
+
+    f = F.EventFollower(store, stream, lambda: clients.pop() if clients else CC.ControlClient(served.path),
+                        d.resolve)
+    with pytest.raises(F.FollowStopped) as exc:
+        f.step()
+    assert exc.value.name == "control-down" and not acked(served)
+    assert f.step().outcome == CC.DEADLINE
+    assert len(opened) == 2 and acked(served)
+    f.close()
