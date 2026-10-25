@@ -650,24 +650,37 @@ def test_the_fence_sees_a_planted_snapshot_call(tmp_path):
     assert sorted(_uses(probe, ("snapshot",))) == [("snapshot", "reader", 4), ("snapshot", "reader", 4)]
 
 
-def test_every_appender_is_the_short_lived_cli_path():
-    """S3a-2 MUST (a): a long-lived process may append only by opening the journal by path for that one
-    act, holding nothing across calls; any other long-lived appender goes through the broker or holds
-    cockpit.lock (an anchor reset refuses only while a live broker holds it). The appenders are the key
-    acts in levain.cockpit.keys (callers: the CLI's commands) and the phone revoke, which builds its
-    journal inside the function and whose one caller keeps no journal."""
+def _key_setup_callers(tree: ast.AST) -> bool:
+    """Whether ``tree`` reaches ``levain.chat_egress.key_setup``'s setup_key or revoke_key: a from-import of
+    either, or a call through any alias of the module."""
+    acts = ("setup_key", "revoke_key")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "levain.chat_egress.key_setup" \
+                and {a.name for a in node.names} & set(acts):
+            return True
+    return bool(_uses_in(tree, acts, "levain.chat_egress.key_setup"))
+
+
+def _check_the_appenders(root: Path) -> None:
+    """The S3a-2 MUST (a) guard over the package at ``root`` (the installed one, or a planted copy)."""
     appenders = []
-    for path in sorted(LEVAIN.rglob("*.py")):
-        if path == LEVAIN / "authority.py":
+    for path in sorted(root.rglob("*.py")):
+        if path == root / "authority.py":
             continue
         for name, fn, _line in _uses(path, ("append", "sign_and_append", "prepare")):
-            appenders.append((str(path.relative_to(LEVAIN)), fn, name))
-    assert sorted(appenders) == [("cockpit/keys.py", "_append", "sign_and_append"),
+            appenders.append((str(path.relative_to(root)), fn, name))
+    assert sorted(appenders) == [("chat_egress/key_setup.py", "setup_key", "append"),
+                                 ("chat_egress/key_setup.py", "setup_key", "prepare"),
+                                 ("cockpit/keys.py", "_append", "sign_and_append"),
                                  ("consent/grants.py", "append_revoke", "append"),
                                  ("consent/grants.py", "prepare_revoke", "prepare")]
-    callers = [str(path.relative_to(LEVAIN)) for path in sorted(LEVAIN.rglob("*.py"))
+    callers = [str(path.relative_to(root)) for path in sorted(root.rglob("*.py"))
                if _key_act_callers(ast.parse(path.read_text(encoding="utf-8")))]
     assert callers == ["cli.py"]
+    # the egress key acts are reached only from the CLI's commands, like the cockpit key acts
+    setup_callers = [str(path.relative_to(root)) for path in sorted(root.rglob("*.py"))
+                     if _key_setup_callers(ast.parse(path.read_text(encoding="utf-8")))]
+    assert setup_callers == ["cli.py"]
 
     holders = ("_journal", "CockpitDB")
 
@@ -676,25 +689,57 @@ def test_every_appender_is_the_short_lived_cli_path():
                    and _dotted(n.func).split(".")[-1] in holders for n in ast.walk(node))
     # append_revoke's only caller in the package is the phone grant surface
     revoke_callers = sorted(
-        str(p.relative_to(LEVAIN)) for p in LEVAIN.rglob("*.py") if p != LEVAIN / "consent" / "grants.py"
+        str(p.relative_to(root)) for p in root.rglob("*.py") if p != root / "consent" / "grants.py"
         and any(isinstance(n, ast.Name) and n.id == "append_revoke"
                 or isinstance(n, ast.Attribute) and n.attr == "append_revoke"
                 or isinstance(n, ast.alias) and n.name == "append_revoke"
                 for n in ast.walk(ast.parse(p.read_text(encoding="utf-8")))))
     assert revoke_callers == ["consent/grant_phone.py"]
     # the journal is built inside append_revoke's body, and grants.py builds none at module level
-    grants = ast.parse((LEVAIN / "consent" / "grants.py").read_text(encoding="utf-8"))
+    grants = ast.parse((root / "consent" / "grants.py").read_text(encoding="utf-8"))
     fn = next(n for n in grants.body if isinstance(n, ast.FunctionDef) and n.name == "append_revoke")
     assert any(isinstance(n, ast.Call) and _dotted(n.func) == "_journal" for n in ast.walk(fn))
     module_level = [n for n in grants.body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
                     and builds_journal(n)]
     assert module_level == []
+    # key_setup builds its journal inside each act's body, and none at module level
+    setup = ast.parse((root / "chat_egress" / "key_setup.py").read_text(encoding="utf-8"))
+    for act in ("setup_key", "revoke_key"):
+        fn = next(n for n in setup.body if isinstance(n, ast.FunctionDef) and n.name == act)
+        assert any(isinstance(n, ast.Call) and _dotted(n.func) == "_journal" for n in ast.walk(fn)), act
+    assert [n for n in setup.body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and builds_journal(n)] == []
     # and the phone surface keeps no journal on itself between requests
-    phone = ast.parse((LEVAIN / "consent" / "grant_phone.py").read_text(encoding="utf-8"))
+    phone = ast.parse((root / "consent" / "grant_phone.py").read_text(encoding="utf-8"))
     kept = [n.lineno for n in ast.walk(phone) if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign))
             and builds_journal(n.value if n.value is not None else n)
             and any(isinstance(t, ast.Attribute) for t in (n.targets if isinstance(n, ast.Assign) else [n.target]))]
     assert kept == []
+
+
+def test_every_appender_is_the_short_lived_cli_path():
+    """S3a-2 MUST (a): a long-lived process may append only by opening the journal by path for that one
+    act, holding nothing across calls; any other long-lived appender goes through the broker or holds
+    cockpit.lock (an anchor reset refuses only while a live broker holds it). The appenders are the key
+    acts in levain.cockpit.keys and the egress key acts in levain.chat_egress.key_setup (callers of each:
+    the CLI's commands; key_setup opens its journal per act), and the phone revoke, which builds its
+    journal inside the function and whose one caller keeps no journal."""
+    _check_the_appenders(LEVAIN)
+
+
+def test_the_appender_guard_sees_a_planted_second_caller_of_setup_key(tmp_path):
+    # the guard is not vacuous: a second caller of key_setup's acts (a long-lived surface, say) fails it
+    root = tmp_path / "levain"
+    shutil.copytree(LEVAIN, root, ignore=shutil.ignore_patterns("__pycache__"))
+    _check_the_appenders(root)
+    for i, source in enumerate((
+            "from levain.chat_egress.key_setup import setup_key\ndef serve(r):\n    return setup_key(r)\n",
+            "from levain.chat_egress import key_setup as ks\ndef serve(r):\n    return ks.revoke_key(r, 'x')\n")):
+        planted = root / "cockpit" / f"planted_{i}.py"
+        planted.write_text(source, encoding="utf-8")
+        with pytest.raises(AssertionError, match=f"planted_{i}"):
+            _check_the_appenders(root)
+        planted.unlink()
 
 
 def test_the_fences_see_a_nested_module_call_and_a_module_import_of_keys():
