@@ -133,3 +133,31 @@ def test_a_blocking_renew_ping_does_not_hold_the_launch(tmp_path, origin, monkey
         out = lm.stop_egress(e)
     e.renew_ping.join(5.0)
     assert not e.renew_ping.is_alive() and out.glue_exit == 0
+
+
+# --- S8D r1 fix item 1: a ping thread that cannot start never orphans the launch -----------------------------------
+
+class _NoStartThread(threading.Thread):
+    def start(self) -> None:
+        raise RuntimeError("can't start new thread")
+
+
+@pytest.mark.chat_egress_srt
+def test_a_ping_thread_that_cannot_start_still_returns_the_launch(tmp_path, origin, monkeypatch) -> None:
+    real = lm.start_egress
+    seen = []
+
+    def start(**kw):
+        return real(**{**kw, "routes": ROUTES, "authority": _authority(**{"k-soon": timedelta(days=2)}),
+                       "on_renew_due": lambda lid, due: seen.append(lid), "now": NOW})
+    monkeypatch.setattr(lm, "start_egress", start)
+    monkeypatch.setattr(lm, "threading", SimpleNamespace(Thread=_NoStartThread))
+    kids = _node_children()
+    e = _start(tmp_path, origin, monkeypatch)
+    try:
+        print(f"RUN S8D fix 1: launch returned with renew_ping={e.renew_ping}; glue alive={e.proc.poll() is None}")
+        assert e.proc.poll() is None and e.renew_ping is None and seen == []
+        assert [d.record_id for d in e.renew_due] == ["k-soon"]
+    finally:
+        out = lm.stop_egress(e)
+    assert out.glue_exit == 0 and len(_node_children()) == len(kids)

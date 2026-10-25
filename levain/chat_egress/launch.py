@@ -21,7 +21,7 @@
   7. the decider service (`decider.Decider`) on Levain's ends, then the glue's `serving` line awaited;
   8. once the EgressLaunch owns everything: a non-empty 4b list goes to `on_renew_due` once, on its own daemon
      thread (`EgressLaunch.renew_ping`), waited for at most `RENEW_PING_WAIT_S`; a callback that raises or is still
-     running then is logged, and the launch stands either way.
+     running then, or a thread that cannot start (renew_ping None), is logged, and the launch stands either way.
 A failure at or after step 5's first allocation releases everything allocated so far (the glue killed and reaped
 first, then the decider, then every descriptor and the SOCKS listener), each close attempted whatever an earlier one
 raised; an OSError up to the CA write is refused as EgressRefused, a later failure propagates as itself.
@@ -289,17 +289,22 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, eve
 
 
 def _renew_ping(on_renew_due: Callable[[str, list[renew.RenewDue]], None], launch_id: str,
-                due: list[renew.RenewDue]) -> threading.Thread:
+                due: list[renew.RenewDue]) -> threading.Thread | None:
     """`on_renew_due(launch_id, due)` on its own daemon thread, waited for at most `RENEW_PING_WAIT_S`: a ping that
-    raises, or is still running then, is logged and never ends the launch."""
+    raises, or is still running then, is logged and never ends the launch. The launch is already owned by the caller's
+    EgressLaunch here, so a thread that cannot be made or started is logged and None returned, never raised."""
     def run() -> None:
         try:
             on_renew_due(launch_id, list(due))
         except BaseException as exc:  # noqa: BLE001 - a ping never ends the launch
             log.warning("renew-due ping for %s failed: %s", launch_id, type(exc).__name__)
 
-    t = threading.Thread(target=run, name="levain-renew-ping", daemon=True)
-    t.start()
+    try:
+        t = threading.Thread(target=run, name="levain-renew-ping", daemon=True)
+        t.start()
+    except Exception as exc:  # noqa: BLE001 - e.g. RuntimeError "can't start new thread": the launch goes on
+        log.warning("renew-due ping for %s did not start: %s", launch_id, type(exc).__name__)
+        return None
     t.join(RENEW_PING_WAIT_S)
     if t.is_alive():
         log.warning("renew-due ping for %s still running after %ss; the launch goes on", launch_id, RENEW_PING_WAIT_S)
