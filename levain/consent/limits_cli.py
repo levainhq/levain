@@ -246,6 +246,7 @@ def _slot_write(seams: SlotSeams, doc: dict[str, Any], what: str, say: Callable[
     """Check ``doc`` as root will, hand it to ``set-limits`` and say its answer: ok (with any warning), the refusal
     by name, or no answer. Root replaces the file whole with these bytes, re-checked and re-serialised."""
     from levain.contracts.canon import canonical_bytes
+    from levain.qbroker.limits import LimitsUnavailable
 
     data = canonical_bytes(doc)
     try:
@@ -280,7 +281,10 @@ def _slot_write(seams: SlotSeams, doc: dict[str, Any], what: str, say: Callable[
         say(ln)
     if answer is None or answer.get("ok") is not True:
         return 1
-    _show_slots_text(seams, None, say)
+    try:
+        _show_slots_text(seams, None, say)
+    except LimitsUnavailable as exc:      # the write stands: only the read-back failed
+        say(f"levain limits: the slot limits were written, but could not be read back: {exc.reason}")
     return 0
 
 
