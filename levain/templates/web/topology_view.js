@@ -225,7 +225,7 @@
       rec = { n: nd.n, card: nd.card, t: fresh ? t : prev.t };
       if (pulseCtx) pulseCtx.pulse.set(owner, rec);
     }
-    const played = Math.floor(t - rec.t);
+    const played = Math.max(0, Math.floor(t - rec.t));
     return played < PULSE_MS * PULSE_CYCLES ? { on: true, delay: "-" + played + "ms" } : { on: false, delay: "" };
   }
   function needMark(nd, cx, cy, rr, ang, opts, label, owner, scale, deco, calm) {
