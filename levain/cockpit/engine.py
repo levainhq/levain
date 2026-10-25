@@ -468,7 +468,7 @@ def _decision_rows_in(got: Any) -> list[RowIn]:
     return rows
 
 
-PANEL_EGRESS_BUSY_TIMEOUT = 0.2   # seconds: a write-locked dispatch store reads "unreadable" for the panel, never a ~2 s poll stall
+PANEL_EGRESS_BUSY_TIMEOUT = 0.2   # seconds a panel read waits on a locked dispatch store; the body route keeps EgressReader's own default
 
 
 def _egress_lookup_of(reader: Any) -> Callable[[str, str], tuple[Any, bool]] | None:
