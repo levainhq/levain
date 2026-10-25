@@ -599,7 +599,9 @@ class UsageReader:
 
     def metadata(self) -> Metadata:
         """What the response said about itself so far (H6-6). A non-stream body is read once, whole, when this or
-        `result` first runs after the relay; a body past the copy cap, or one cut short, said nothing readable."""
+        `result` first runs after the relay; a body past the copy cap, or one cut short, said nothing readable.
+        Known edge (r1 review): called on a non-stream body still being fed, the partial body does not parse and is
+        marked read, so the whole body's metadata is never read after it; every caller calls it after the relay."""
         if not self._stream and not self._body_read and self.stopped is None and self._buf:
             try:
                 self._read_body_metadata(json.loads(bytes(self._buf)))
