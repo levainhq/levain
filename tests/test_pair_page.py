@@ -196,6 +196,36 @@ def test_the_label_in_the_line_is_quoted_and_bounded_and_the_lookup_cannot_block
     assert "String(d.id) === id" in js and "d.id === id" not in js
 
 
+def test_a_refused_held_key_is_silent_not_may_still_be_listed() -> None:
+    # L3 r6 M1: measured on the rig, a REVOKED paired key's manifest GET answers 200 with credential {class: "none"} and no name
+    # (an unknown key the same); a 401/403 is also a refusal. Both mean the held key is dead: no previous-key line.
+    js = load_web_asset("pair.js")
+    body = js[js.index("async function previousKey"): js.index("function pairAgain")]
+    assert re.search(r'man\.status === 401 \|\| man\.status === 403\) return \{ kind: "revoked" \}', body)
+    assert 'm.credential.class === "none"' in body and 'return { kind: "revoked" }' in body
+    assert body.index("man.status === 401") < body.index("man.status !== 200") < body.index('class === "none"') < body.index("typeof name")
+
+
+def test_the_label_is_isolated_in_a_bdi_built_with_text_content_and_the_id_cannot_wrap() -> None:
+    # L3 r6 M2 + M4: untrusted RTL label text sits in a <bdi> inside the quotes (textContent only); the short id is a no-wrap span
+    # in the Paired line and in every Devices row.
+    js, dp = load_web_asset("pair.js"), load_web_asset("devices_panel.js")
+    fn = js[js.index("function sayLive"): js.index("async function previousKey")]
+    assert 'createElement("bdi")' in fn and "bdi.textContent = prev.label" in fn and "msgEl.append(" in fn
+    assert "\\u201c\", bdi, \"\\u201d (\", id," in fn
+    assert "innerHTML" not in js and "innerHTML" not in dp
+    assert 'id.className = "dev-id"' in fn and 'el("span", "dev-id", shortId(d.id))' in dp
+    assert re.search(r"\.dev-id \{[^}]*white-space: nowrap", load_web_asset("dashboard.css"))
+
+
+def test_the_label_strip_class_holds_the_zero_width_and_arabic_mark_and_an_empty_label_falls_back() -> None:
+    # L3 r6 M3: U+061C, U+200B-U+200D, U+FEFF are stripped; a label of only those is "paired device".
+    js = load_web_asset("pair.js")
+    for part in ("\\u061c", "\\u200b-\\u200f", "\\ufeff"):
+        assert part in js
+    assert 'label || "paired device"' in js
+
+
 def test_the_label_the_page_reads_is_what_the_server_exposes_for_a_paired_key_and_not_for_an_owner_token(src) -> None:
     with _serve(src) as (port, _h):
         st, off, _ = _call(port, "POST", "/cockpit/pair/offer", {"label": "Run iPad"}, token=T)

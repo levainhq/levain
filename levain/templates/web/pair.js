@@ -117,9 +117,8 @@
       say("Paired", "This device is paired. Checking the key this browser held before…", true);
       const prev = await previousKey(oldTok);
       if (prev.kind === "owner" || prev.kind === "revoked") { say("Paired", "This device is paired. Opening the cockpit…", true); location.replace("/"); return; }
-      say("Paired", "This device is paired. " + (prev.kind === "live"
-        ? "This browser's previous key is still listed in Devices as \u201c" + prev.label + "\u201d (" + prev.short + "). Revoke it there."
-        : PREVIOUS_MAYBE), true);
+      if (prev.kind === "live") { sayLive(prev); return; }
+      say("Paired", "This device is paired. " + PREVIOUS_MAYBE, true);
       return;
     }
     say("Paired", "This device is paired. Opening the cockpit…", true);
@@ -141,8 +140,20 @@
   function shortId(id) { return String(id).slice(0, 8); }
   // quote-safe and bounded: bidi/control characters out, 60 characters and an ellipsis at most
   function boundLabel(label) {
-    const chars = Array.from(String(label).replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "").trim());
+    const chars = Array.from(String(label).replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "").trim());
     return chars.length > LABEL_MAX ? chars.slice(0, LABEL_MAX).join("") + "\u2026" : chars.join("");
+  }
+
+  // The previous-key line for a live row. The label is untrusted text (the server allows RTL scripts), so it sits inside the quotes in a
+  // <bdi> (its own direction, isolated from the sentence), built with textContent only; the short id is a no-wrap span.
+  function sayLive(prev) {
+    say("Paired", "", true);
+    const bdi = document.createElement("bdi");
+    bdi.textContent = prev.label;
+    const id = document.createElement("span");
+    id.className = "dev-id";
+    id.textContent = prev.short;
+    msgEl.append("This device is paired. This browser's previous key is still listed in Devices as \u201c", bdi, "\u201d (", id, "). Revoke it there.");
   }
 
   async function previousKey(token) {
@@ -153,8 +164,11 @@
       timer = setTimeout(() => ctl.abort(), LOOKUP_MS);
       const get = (path) => fetch(path, { method: "GET", headers: { [TOKEN_HEADER]: token }, cache: "no-store", referrerPolicy: "no-referrer", signal: ctl.signal });
       const man = await get("/cockpit/manifest.json");
+      if (man.status === 401 || man.status === 403) return { kind: "revoked" };   // M1: a refused key is dead: no line
       if (man.status !== 200) return unknown;
       const m = await man.json();
+      // M1 (measured): a revoked or unknown key is NOT refused by the manifest: it answers 200 with credential.class "none" and no name
+      if (m && m.credential && m.credential.class === "none") return { kind: "revoked" };
       const name = m && m.credential && m.credential.name;
       if (typeof name !== "string") return unknown;
       if (!name.startsWith(PAIRED_PREFIX)) return { kind: "owner" };

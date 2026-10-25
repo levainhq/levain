@@ -101,7 +101,9 @@
     const r = el("div", "dev-row" + (d.revoked_at ? " dev-revoked" : ""));
     const main = el("div", "dev-main");
     main.appendChild(el("div", "dev-name", d.label || d.id));
-    main.appendChild(el("div", "dev-meta", "paired " + when(d.created) + " · last seen " + when(d.last_seen) + (d.paired_by ? " · by " + d.paired_by : "") + " · " + shortId(d.id)));
+    const meta = el("div", "dev-meta", "paired " + when(d.created) + " · last seen " + when(d.last_seen) + (d.paired_by ? " · by " + d.paired_by : "") + " · ");
+    meta.appendChild(el("span", "dev-id", shortId(d.id)));          // no-wrap: the id never breaks at its hyphen on a phone
+    main.appendChild(meta);
     r.appendChild(main);
     if (d.revoked_at) {
       r.appendChild(el("span", "pill dev-pill", "revoked " + when(d.revoked_at)));
