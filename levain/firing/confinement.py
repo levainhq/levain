@@ -272,6 +272,7 @@ __all__ = [
     "CrownJewelsPolicy",
     "build_policy",
     "crown_jewel_reason",
+    "levain_home_base",
     "ConfinementConfig",
     "load_confinement_config",
     "ShellResult",
@@ -2114,6 +2115,22 @@ LEVAIN_HOME_STATE_DIRS = (AUTONOMIC_STORE_DIR, COCKPIT_KEY_DIR, "consent", GRANT
                           _ssh_agent.HOST_KEYS_DIR, "coordinator")
 
 
+def levain_home_base(home: Path) -> Path:
+    """The levain home the floor denies, ``$LEVAIN_HOME`` else ``<home>/.levain``, absolute (an empty
+    ``$LEVAIN_HOME`` is unset, a relative one is taken against the cwd now), not resolved: the floor adds
+    the other spellings. The consent adapters protect the same directory from file tools
+    (``levain.consent.adapters.claude_code.protected_paths``). Raises :class:`ConfinementError` when it
+    cannot be resolved (fail-closed)."""
+    raw = os.environ.get("LEVAIN_HOME")
+    try:
+        base = Path(raw).expanduser() if raw else home / ".levain"
+        return Path(os.path.abspath(base))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfinementError(
+            f"$LEVAIN_HOME={raw!r} cannot be resolved ({exc}) — refusing to build the floor (fail-closed)."
+        ) from exc
+
+
 def _levain_home_jewels(home: Path, entity_dir: Path, workspace: Path) -> tuple[Path, list[Path]]:
     """The floor's subtrees for the levain home, ``$LEVAIN_HOME`` else ``~/.levain``, made absolute as its
     readers make it (``levain.autonomic.db.default_store_dir``, ``levain.consent.queue.default_queue_dir``:
@@ -2127,14 +2144,12 @@ def _levain_home_jewels(home: Path, entity_dir: Path, workspace: Path) -> tuple[
     name: the shape before the whole-home deny plus the consent queue, so that layout keeps the old class
     edge (a new directory must add itself to the tuple). Refuses (fail-closed) a home that cannot be
     resolved, or a named directory that would hide the entity's own home, entity or workspace."""
-    raw = os.environ.get("LEVAIN_HOME")
+    base = levain_home_base(home)
     try:
-        base = Path(raw).expanduser() if raw else home / ".levain"
-        base = Path(os.path.abspath(base))
         whole = _spellings(base)
     except (OSError, RuntimeError, ValueError) as exc:
         raise ConfinementError(
-            f"$LEVAIN_HOME={raw!r} cannot be resolved ({exc}) — refusing to build the floor (fail-closed)."
+            f"the levain home {base} cannot be resolved ({exc}) — refusing to build the floor (fail-closed)."
         ) from exc
     if not any(_hides_the_entity(d, home, entity_dir, workspace) for d in whole):
         return base, whole

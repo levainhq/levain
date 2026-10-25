@@ -215,9 +215,21 @@ def _absolute_root(root: Any) -> str | None:
 
 def protected_paths(queue_dir: Path, settings: AdapterSettings) -> tuple[Path, ...]:
     """What the adapter itself trusts, so a file tool writing any of it is agent config (codex Q2 r1 #1): the
-    queue directory (the adapter settings and the queue database live in it) and, when a cockpit data root is
-    configured, its authority database (and sqlite's sidecars) and the authority anchor."""
+    queue directory (the adapter settings and the queue database live in it); the whole levain home, the
+    directory the confinement floor denies (:func:`levain.firing.confinement.levain_home_base`, one derivation
+    for both), so a write to the autonomic binding store or any other operator state there is a tagged request
+    (14b Q5); and, when a cockpit data root is configured, its authority database (and sqlite's sidecars) and the
+    authority anchor. A levain home that is the user's home or holds it is named by its state directories
+    instead (:data:`levain.firing.confinement.LEVAIN_HOME_STATE_DIRS`, the floor's fallback list), or every file
+    in the home would be agent config. Bash is still never parsed: a shell write there is not tagged here."""
+    from levain.firing.confinement import LEVAIN_HOME_STATE_DIRS, levain_home_base   # lazy: the floor's module
+
     out = [Path(os.path.abspath(queue_dir))]
+    user_home = Path.home()
+    base = levain_home_base(user_home)
+    holds_home = any(Path(h).is_relative_to(b) for h in (os.path.normpath(user_home), os.path.realpath(user_home))
+                     for b in (os.path.normpath(base), os.path.realpath(base)))
+    out += [base / name for name in LEVAIN_HOME_STATE_DIRS] if holds_home else [base]
     if settings.cockpit_data_root:
         root = Path(settings.cockpit_data_root)
         db = root / "cockpit.db"
