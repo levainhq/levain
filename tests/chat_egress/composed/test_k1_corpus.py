@@ -41,6 +41,8 @@ def test_the_lists_are_the_pinned_ones() -> None:
     assert strip.CRED_STRIP_HEADERS == PINNED_HEADERS
     assert {strip.fold(n) for n in strip.CRED_STRIP_QUERY} == {strip.fold(n) for n in PINNED_QUERY}
     assert strip.SIGNED_URL_READ_EXEMPT == PINNED_SIGNED
+    from levain.chat_egress import classify
+    assert classify._SIGNED_URL_READ_EXEMPT == strip.SIGNED_URL_READ_EXEMPT   # the decider stores by one, the report counts by the other
     assert strip.PAGINATION_NOT_CREDENTIALS == PINNED_PAGINATION
 
 

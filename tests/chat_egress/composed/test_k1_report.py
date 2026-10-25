@@ -72,6 +72,12 @@ def test_a_malformed_card_row_still_counts_its_names() -> None:
     assert r.signed_url_names == {"x-amz-signature": 1} and r.azure_sas_names == 1 and r.backstop_names == 1
 
 
+def test_walls_after_the_last_summary_make_the_number_a_floor_not_the_summarys_total() -> None:
+    r = report.build([], [_summary(2, final=False)] + [_wall() for _ in range(3)])
+    assert r.walls.total == 5 and not r.walls.exact and r.walls.crashed
+    assert r.walls.text.startswith("at least 5 ")
+
+
 def test_a_line_the_wire_reader_refuses_is_counted_not_skipped() -> None:
     r = report.build([], [_summary(2, final=True), b'{"t":"wall","host":"x"}\n', b"not json\n"])
     assert r.unreadable_event_lines == 2

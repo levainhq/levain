@@ -46,7 +46,7 @@ _BACKSTOP_FLAG = ":backstop>"
 
 @dataclass(frozen=True, slots=True)
 class WallTotal:
-    """The glue's wall total. `exact` is the clean end's flush; otherwise `text` says what is known and no more."""
+    """The glue's wall total. `exact` is the clean end's flush; otherwise `total` is a floor (None: unknown) and `text` says what is known."""
     total: int | None
     exact: bool
     crashed: bool
@@ -125,7 +125,7 @@ def wall_total(events: Iterable[wire.GlueEvent]) -> tuple[WallTotal, wire.GlueSu
         text = f"{last.total} (from a crashed launch: the last summary, no final flush)"
         if after_last:                    # walls the glue wrote after that summary are in no total: a floor, not a count
             text = f"at least {last.total + after_last} (last summary {last.total}, plus {after_last} detailed walls after it; crashed launch, no final flush)"
-        return WallTotal(last.total, False, True, text), last
+        return WallTotal(last.total + after_last, False, True, text), last
     return WallTotal(None, False, True,
                      f"unknown (launch crashed before its first summary; at least {detailed})"), None
 
