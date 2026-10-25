@@ -138,6 +138,8 @@ LAZY_SITES = {
     'levain/slot/layout.py::shared_group_rows::from levain.slot.ids import SHARED_GROUPS': 'root',
     'levain/slot/layout.py::entry_state::from levain.slot.removal import root_file': 'root',
     'levain/slot/layout.py::remove_entry_steps::from levain.slot.removal import at, chain, point, remove_step': 'root',
+    'levain/slot/limits_doc.py::slot_doc::from levain.contracts import ContractError': 'root',
+    'levain/slot/limits_doc.py::slot_doc::from levain.contracts.canon import canonical_bytes, parse': 'root',
     'levain/slot/netns.py::netns_state::from levain.slot.removal import ABSENT, OURS': 'root',
     'levain/slot/netns.py::remove_netns_steps::from levain.slot.removal import chain, point, remove_step': 'root',
     'levain/slot/pf.py::alias_state::from levain.slot.removal import ABSENT, OURS': 'root',

@@ -55,6 +55,7 @@ from levain.slot.grammar import LEASE_EXEMPT, SESSION_RE, VERBS, InstallCommand,
 from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS, SLOT_NAME_RE, Allocation,
                              SlotClass, SlotId, allocate, check_capacity, choose_indices, in_own_range,
                              is_levain_account, loopback_alias, read_retired_ids, retired_ids_text, spent_indices)
+from levain.slot import limits_doc as LD
 from levain.slot.runtime_grammar import VERBS as RUNTIME_VERBS
 from levain.slot.runtime_grammar import ok_line, refusal_line
 from levain.slot.layout import (STORE, Row, base_routes_steps, base_run_rows, base_store_rows, operator_record_path,
@@ -2465,18 +2466,16 @@ def run_credential(verb: str, name: str, caller_uid: int, host: HostOS, *, read:
 
 def read_limits(read: Callable[[int], bytes]) -> bytes:
     """``set-limits``' stdin: one ``levain-limits/1`` document, at most the slot cap, checked WHOLE in root by the one
-    slot parser (:func:`levain.consent.limits.slot_doc`, the queue broker's) with non-canonical bytes accepted, and
+    slot parser (:func:`levain.slot.limits_doc.slot_doc`, the queue broker's) with non-canonical bytes accepted, and
     returned as its canonical bytes, re-read through the broker's own check: root never writes the caller's bytes,
     and never bytes the broker would refuse. A refusal is the parser's code (``limits-oversize``,
     ``limits-malformed``, ``limits-key:<key>``, ``limits-not-counted:<kind>``, ``limits-value:<block>[.<kind>]``) with
     its qualifier in the refusal wire's spelling (:func:`_limits_refusal`: ``active_hours`` -> ``active-hours``)."""
-    from levain.consent import limits as CL
-
-    raw = read(CL.SLOT_LIMITS_MAX + 1)
+    raw = read(LD.SLOT_LIMITS_MAX + 1)
     try:
-        data = canon.canonical_bytes(CL.slot_doc(raw, canonical=False))
-        CL.slot_doc(data)
-    except CL.LimitsDocError as e:
+        data = canon.canonical_bytes(LD.slot_doc(raw, canonical=False))
+        LD.slot_doc(data)
+    except LD.LimitsDocError as e:
         raise _limits_refusal(e.code, e.detail) from None
     return data
 

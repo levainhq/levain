@@ -527,9 +527,10 @@ def _check_slot_limits(*, host: str | None = None, store: Path | None = None, ow
     they live in the broker's own 0700 directory. ``owner``/``running``: a test's seams."""
     import logging
 
-    from levain.consent import limits as CL
+    from levain.consent.limits import _num_text
     from levain.qbroker.limits import LimitsUnavailable, PolicyLimits
     from levain.slot import layout
+    from levain.slot import limits_doc as LD
 
     name = "slot limits"
     if host is None:
@@ -544,10 +545,10 @@ def _check_slot_limits(*, host: str | None = None, store: Path | None = None, ow
     broker_log.disabled = True        # the reader logs an unusable file for the broker's log; this row says it instead
     try:
         shown = []
-        for agent in CL.AGENTS:
+        for agent in LD.AGENTS:
             lim = reader(agent, "doctor")
-            shown.append(f"{agent}: " + ", ".join(f"{k.replace('_', ' ')} {CL._num_text(k, lim[k])}"
-                                                  for k in CL.SLOT_KINDS))
+            shown.append(f"{agent}: " + ", ".join(f"{k.replace('_', ' ')} {_num_text(k, lim[k])}"
+                                                  for k in LD.SLOT_KINDS))
     except LimitsUnavailable as exc:
         return [CheckResult(name, False, f"{exc.reason}. Until it is, the queue broker refuses every slot tool call "
                                          "it gates (limits-failed)",
