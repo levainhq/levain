@@ -174,3 +174,56 @@ def test_a_dead_wall_channel_does_not_end_the_refusal() -> None:
         assert _attempt(r.port, b"\x05\x01\x00\x05\x01\x00\x01\x7f\x00\x00\x01\x00\x50")[:2] == b"\x05\x00"
     finally:
         r.close()
+
+
+def _fill(sock: socket.socket) -> None:
+    """Fill `sock`'s send buffer so the next write blocks."""
+    sock.setblocking(False)
+    try:
+        while True:
+            sock.send(b"\x00" * 65536)
+    except BlockingIOError:
+        pass
+    sock.setblocking(True)
+
+
+def test_a_wall_write_with_a_full_buffer_does_not_hold_the_connection_past_its_deadline(monkeypatch) -> None:
+    monkeypatch.setattr(socks, "IO_TIMEOUT_S", DEADLINE_S)
+    ours, theirs = socket.socketpair()
+    _fill(ours)
+    r = socks.SocksRefuser(refusals=ours)
+    r.start()
+    try:
+        t0 = time.monotonic()
+        s = socket.create_connection(("127.0.0.1", r.port), timeout=10)
+        s.sendall(b"\x05\x01\x00")
+        s.settimeout(10)
+        while s.recv(16):
+            pass                                          # to the refuser's close of this connection
+        held = time.monotonic() - t0
+        s.close()
+        assert held < DEADLINE_S + 1.0, held
+        assert r.wall_failures == 1
+    finally:
+        r.close()
+        theirs.close()
+
+
+def test_a_close_that_outlasts_an_inflight_wall_write_leaves_the_wall_end_to_the_refuser_thread(monkeypatch) -> None:
+    monkeypatch.setattr(socks, "IO_TIMEOUT_S", 1.5)
+    ours, theirs = socket.socketpair()
+    _fill(ours)
+    r = socks.SocksRefuser(refusals=ours)
+    r.start()
+    try:
+        s = socket.create_connection(("127.0.0.1", r.port), timeout=10)
+        s.sendall(b"\x05")
+        time.sleep(0.3)                                   # the refuser is inside its blocked wall write
+        assert r.close(timeout_s=0.1) is False
+        assert ours.fileno() != -1                        # not closed under the write that is still using it
+        s.close()
+        r._thread.join(5)
+        assert not r._thread.is_alive()
+        assert ours.fileno() == -1                        # the thread closed it on its way out
+    finally:
+        theirs.close()
