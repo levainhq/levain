@@ -97,7 +97,7 @@ def test_check_refuses_a_changed_srt_file(installed, tmp_path) -> None:
     prefix = _clone(installed, tmp_path)
     f = srt_pin.srt_dist(prefix) / "http-proxy.js"
     f.write_text(f.read_text() + "\n// tampered\n")
-    with pytest.raises(srt_pin.SrtProblem, match="hash mismatch: srt's files"):
+    with pytest.raises(srt_pin.SrtProblem, match="hash mismatch: node_modules/@anthropic-ai/sandbox-runtime's files"):
         srt_pin.check(prefix)
 
 
@@ -143,3 +143,36 @@ def test_doctor_reports_node_and_srt_and_refuses_a_hash_mismatch(installed, tmp_
     f.write_text(f.read_text() + "\n")
     [bad] = doctor._check_chat_network()
     assert not bad.ok and "hash mismatch" in bad.detail
+
+
+# --- S8b r1 item 2: every package the lock names, and nothing beside them -------------------------------------------
+
+@pytest.mark.chat_egress_srt
+def test_check_refuses_a_changed_transitive_dependency_file(tmp_path) -> None:
+    prefix = envmod.srt_prefix_copy(tmp_path / "chat-node")
+    f = prefix / "node_modules/node-forge/lib/forge.js"
+    f.write_text(f.read_text() + "\n// tampered after setup\n")
+    with pytest.raises(srt_pin.SrtProblem, match="hash mismatch: node_modules/node-forge") as got:
+        srt_pin.check(prefix)
+    print(f"RUN S8D item 2: node-forge forge.js changed -> {got.value}")
+
+
+@pytest.mark.chat_egress_srt
+def test_check_refuses_a_package_planted_where_node_resolves_before_the_locked_one(tmp_path) -> None:
+    prefix = envmod.srt_prefix_copy(tmp_path / "chat-node")
+    # srt's `require('node-forge')` looks in node_modules/@anthropic-ai/node_modules before node_modules/
+    shutil.copytree(prefix / "node_modules/node-forge", prefix / "node_modules/@anthropic-ai/node_modules/node-forge")
+    with pytest.raises(srt_pin.SrtProblem, match="outside every package the lock names"):
+        srt_pin.check(prefix)
+
+
+@pytest.mark.chat_egress_srt
+def test_check_refuses_a_locked_file_swapped_for_a_symlink(tmp_path) -> None:
+    prefix = envmod.srt_prefix_copy(tmp_path / "chat-node")
+    f = prefix / "node_modules/node-forge/lib/forge.js"
+    evil = tmp_path / "forge.js"
+    evil.write_text(f.read_text() + "\n// elsewhere\n")
+    f.unlink()
+    f.symlink_to(evil)
+    with pytest.raises(srt_pin.SrtProblem, match="hash mismatch: node_modules/node-forge"):
+        srt_pin.check(prefix)

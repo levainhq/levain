@@ -7,11 +7,12 @@ prefix under the levain home (`$LEVAIN_HOME/chat-node`, else `~/.levain/chat-nod
 `npm ci --ignore-scripts` there (npm checks every tarball against the lock's integrity), then the install-time VENDOR
 CHECK: every module the glue deep-imports from srt's `dist/sandbox` and every name it takes from each must still be
 there, read from the glue's own import lines (:func:`glue_imports`, the one home of that list) and matched against
-each module's `export` statements without running them. Then it writes a stamp: the shipped lock's sha256 and a
-sha256 over srt's installed files.
+each module's `export` statements without running them. Then it writes a stamp: the shipped lock's sha256 and
+:func:`tree_hashes` of what is installed (one hash per package the lock names, one over everything else under
+`node_modules`), so the whole tree the glue loads is covered, srt's dependencies (node-forge holds the CA key) included.
 
 :func:`check` is what doctor and a launch read: the stamp present, the lock it was made from still the shipped one,
-npm's own record (`node_modules/.package-lock.json`) naming the shipped integrity for every package, the tree hash
+npm's own record (`node_modules/.package-lock.json`) naming the shipped integrity for every package, every tree hash
 unchanged, the version `launch.SRT_VERSION`, and the vendor check passing. Any mismatch is a refusal naming it.
 """
 
@@ -22,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,13 +91,40 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def tree_hash(pkg: Path) -> str:
-    """sha256 over srt's installed files: each regular file's relative path and its bytes, in path order."""
-    h = hashlib.sha256()
-    for p in sorted(q for q in Path(pkg).rglob("*") if q.is_file() and not q.is_symlink()):
-        h.update(p.relative_to(pkg).as_posix().encode() + b"\0")
-        h.update(_sha256(p).encode() + b"\n")
-    return h.hexdigest()
+#: the tree-hash key of every entry under `node_modules` that no locked package holds (npm's record, `.bin`, and
+#: anything planted where Node resolves a name before the locked package, e.g. `node_modules/@scope/node_modules/x`)
+OUTSIDE = "(outside every package the lock names)"
+
+
+def locked_packages() -> list[str]:
+    """The package paths the shipped lock names (`node_modules/...`), in the lock's order."""
+    return [k for k in json.loads((NODE_DIR / "package-lock.json").read_text())["packages"] if k]
+
+
+def tree_hashes(prefix: Path, packages: list[str]) -> dict[str, str]:
+    """{package path: sha256 over its entries} for each of `packages`, plus `OUTSIDE` over every other entry under
+    `<prefix>/node_modules`. An entry is its path relative to `prefix` and what it is: a file's sha256, a symlink's
+    target text (never followed), a directory's mark. Each entry belongs to the longest package path holding it, so a
+    nested package's files are its own."""
+    prefix = Path(prefix)
+    owners = sorted(packages, key=len, reverse=True)
+    entries: dict[str, list[bytes]] = {p: [] for p in [*packages, OUTSIDE]}
+    for top, dirs, files in os.walk(prefix / "node_modules"):
+        for name in dirs + files:
+            path = Path(top) / name
+            rel = path.relative_to(prefix).as_posix()
+            st = path.lstat()
+            if stat.S_ISLNK(st.st_mode):
+                what = b"L" + os.fsencode(os.readlink(path))
+            elif stat.S_ISREG(st.st_mode):
+                what = b"F" + _sha256(path).encode()
+            elif stat.S_ISDIR(st.st_mode):
+                what = b"D"
+            else:
+                what = b"?" + oct(stat.S_IFMT(st.st_mode)).encode()
+            owner = next((p for p in owners if rel.startswith(p + "/")), OUTSIDE)
+            entries[owner].append(rel.encode() + b"\0" + what + b"\n")
+    return {p: hashlib.sha256(b"".join(sorted(lines))).hexdigest() for p, lines in entries.items()}
 
 
 @dataclass(frozen=True)
@@ -125,8 +154,17 @@ def check(prefix: Path | None = None) -> SrtState:
     for path, entry in shipped["packages"].items():
         if path and (npm_record.get(path) or {}).get("integrity") != entry["integrity"]:
             raise SrtProblem(f"hash mismatch: {path} is not the integrity the shipped lock pins")
-    if stamp.get("tree_sha256") != tree_hash(pkg):
-        raise SrtProblem(f"hash mismatch: srt's files under {pkg} changed since `levain chat setup`")
+    packages = locked_packages()
+    recorded = stamp.get("trees")
+    if not isinstance(recorded, dict) or set(recorded) != {*packages, OUTSIDE}:
+        raise SrtProblem("the setup stamp does not record every package the shipped lock names "
+                         "(run `levain chat setup`)")
+    now = tree_hashes(prefix, packages)
+    for path in [*packages, OUTSIDE]:
+        if recorded[path] != now[path]:
+            where = ("a file under node_modules outside every package the lock names" if path == OUTSIDE
+                     else f"{path}'s files")
+            raise SrtProblem(f"hash mismatch: {where} changed since `levain chat setup`")
     try:
         version = json.loads((pkg / "package.json").read_text())["version"]
     except (OSError, ValueError, KeyError, TypeError):
@@ -170,5 +208,5 @@ def setup(prefix: Path | None = None, *, npm: str | None = None, offline: bool =
 def write_stamp(prefix: Path) -> None:
     """The stamp `check` verifies against, over what is installed at `prefix` now (setup's last step)."""
     (Path(prefix) / STAMP).write_text(json.dumps({"lock_sha256": _sha256(NODE_DIR / "package-lock.json"),
-                                                  "tree_sha256": tree_hash(srt_package(prefix))},
+                                                  "trees": tree_hashes(prefix, locked_packages())},
                                                  sort_keys=True) + "\n")
