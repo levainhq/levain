@@ -70,7 +70,6 @@ import shutil
 import subprocess
 import sys
 import time
-import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
@@ -1171,6 +1170,7 @@ def trust_status(workspace: Path | str, *, home: Path | None = None, codex_bin: 
     intact = script_intact(script, queue_dir=queue_dir) if intact_checked else None
     chome = home if home is not None else codex_home()
     trusted_hash = None
+    import tomllib   # 3.11+: imported at the call so this module loads under root's 3.9; a TOML read there fails closed
     try:
         with open(Path(chome) / "config.toml", "rb") as fh:
             state = tomllib.load(fh).get("hooks", {}).get("state", {}).get(key, {})
@@ -1417,6 +1417,7 @@ def write_hook_trust(hooks_path: Path, expected_text: str, *, home: Path | None 
 def _trust_states(home: Path | None) -> dict[str, Any]:
     """CODEX_HOME's ``hooks.state`` table (empty when config.toml is missing). Raises ``OSError`` /
     ``tomllib.TOMLDecodeError`` when it cannot be read."""
+    import tomllib   # 3.11+: imported at the call so this module loads under root's 3.9; a TOML read there fails closed
     chome = Path(home) if home is not None else codex_home()
     try:
         with open(chome / "config.toml", "rb") as fh:
@@ -1439,6 +1440,7 @@ def untrusted_hooks(hooks_path: Path, expected_text: str, *, home: Path | None =
     """Without starting Codex: the events of the hooks in ``hooks_path`` that config.toml does not trust exactly
     as :func:`hook_trusted_hash` computes them (or that it disables); ``None`` when the file is not
     ``expected_text`` or a file cannot be read."""
+    import tomllib   # 3.11+: imported at the call so this module loads under root's 3.9; a TOML read there fails closed
     try:
         if hooks_path.read_text(encoding="utf-8") != expected_text:
             return None
@@ -1488,6 +1490,7 @@ def gate_trust(hooks_path: Path, script: Path, *, home: Path | None = None, code
                            "command, not the script)", None, None, digest, False)
     why = ""
     states: dict[str, Any] | None
+    import tomllib   # 3.11+: imported at the call so this module loads under root's 3.9; a TOML read there fails closed
     try:
         states = _trust_states(home)
     except (OSError, tomllib.TOMLDecodeError) as exc:
