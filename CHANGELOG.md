@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.25] — 2026-10-25
+
 ### Added
 - **`levain limits set --slots`, `unset --slots` and `show --slots`: the limits agent-session slots run under.**
   `set --slots <agent|default> <kind> <value>` and `unset --slots <agent|default> <kind>` change tool calls, active hours
