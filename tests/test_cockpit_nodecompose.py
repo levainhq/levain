@@ -60,6 +60,7 @@ def test_the_box_sends_through_the_panels_verb_to_that_seat_and_clears_on_landin
 @needs_browser
 def test_the_box_does_not_need_the_seats_chip_on_the_compose_card(tmp_path, monkeypatch):
     # the defect (lane-nodetap): the chip was missing from the card at tap time, and the tap fell into a page with nothing to type into
+    # (the card no longer draws seat chips at all; this removes any that a provider-less enum would still draw)
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     drop = CHIPS + ".filter(c => c.dataset.value === 'seat:ledgerline').forEach(c => c.remove()); 1"
     out = _out(tmp_path, src, [{"eval": drop}, *_open("n3"), {"eval": "JSON.stringify([%s, !!%s.querySelector('textarea.tray-dump-ta')])" % (ADDR, MBOX)}])
@@ -97,8 +98,20 @@ def test_a_departed_seat_refusal_holds_the_box_says_so_and_never_falls_back_to_e
                                    MBOX, MBOX, ADDR, PRESSED)}])
     frozen, draft, addr, pressed, refetched = json.loads(out["values"][-1])
     assert frozen is True and draft == "hello seat" and addr == "to seat:ledgerline", out["values"][-2:]
-    assert pressed == ["fanin"] and refetched is False, out["values"][-2:]     # the compose card's recovery is the card's, not the box's
+    assert pressed == ["fanin"] and refetched is False, out["values"][-2:]     # no refetch: the box says so and holds
 
+
+
+@needs_browser
+def test_the_compose_card_offers_no_seat_and_the_seats_page_does(tmp_path, monkeypatch):
+    # "the separate card stays only for messages to the desk or everyone" (the option Phill chose, 61a)
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    pick = "[...document.querySelector('[data-ck-compose=recipient-pick]').options].filter(o => !o.disabled).map(o => o.value)"
+    for size in (DESKTOP, NARROW):
+        out = _out(tmp_path, src, [{"eval": "JSON.stringify([%s, %s])" % (CHIPS + ".map(c => c.dataset.value)", pick)}, *_open("n3"), {"eval": ADDR}], first=size)
+        chips, opts = next(json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith("[["))
+        assert chips == ["cli", "fanin"] and opts == ["", "cli", "fanin"], out["values"]
+        assert out["values"][-1] == "to seat:ledgerline", out["values"]
 
 # --- the signed path, end to end over the sign card's rig (a virtual passkey, a real Signer, the door that applies only what was signed)
 

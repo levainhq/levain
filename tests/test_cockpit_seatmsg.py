@@ -1,6 +1,6 @@
-"""Message a seat from the cockpit (Phill 10-23, "2a"): the inbox compose card's recipient chips, the desk (`fanin`) pressed by default;
-at a phone width the chips are a picker holding the same values. A tap on a seat's node no longer presses a chip (Phill 10-25, "61a"): it
-opens the seat's page with its own message box (tests/test_cockpit_nodecompose.py); here a lane's or an ambiguous label's page has no box. Real page in headless Chrome over the real kernel: the inbox panel declares a typed compose (the roster's chips are its enum),
+"""The inbox compose card's recipient chips (Phill 10-23, "2a"): the desk (`fanin`) pressed by default; at a phone width the chips are a
+picker holding the same values. Since Phill 10-25 ("61a") a seat is messaged from its node's page (tests/test_cockpit_nodecompose.py): the
+card draws no seat chip (an id under the provider's declared `transient_prefix`), and a lane's or an ambiguous label's page has no box. Real page in headless Chrome over the real kernel: the inbox panel declares a typed compose (the roster's chips are its enum),
 and a literal topology value is painted into the header the way the Agents-lens tests do."""
 from __future__ import annotations
 
@@ -52,10 +52,7 @@ def _tap(node: str) -> str:
     return "%s.querySelector('.tv-gnode[data-node=%s]').dispatchEvent(new MouseEvent('click', {bubbles: true})); 1" % (TV, node)
 
 
-# the compose card's own pick set to that one seat by hand, through its picker (the graph's tap no longer reaches the card)
-PICK_SEAT = ("(() => { const p = document.querySelector('[data-ck-compose=recipient-pick]'); p.value = 'seat:ledgerline'; "
-             "p.dispatchEvent(new Event('change', {bubbles: true})); return 1; })()")
-SEAT_PRESSED = "JSON.stringify(%s) == '[\"seat:ledgerline\"]'" % PRESSED
+CARD = ["cli", "fanin"]                              # the enum less its seat: what the card draws
 NODE_BOX = "document.querySelector('#levain-modal .agent-msg')"
 
 
@@ -66,7 +63,7 @@ def test_the_desk_is_pressed_by_default_and_unpressing_it_leaves_none(tmp_path, 
     out = _run(tmp_path, src, [{"eval": "JSON.stringify([%s, %s, %s])" % (PRESSED, CHIPS + ".map(c => c.dataset.value)", addr)},
                                {"eval": CHIPS + ".find(c => c.dataset.value === 'fanin').click(); JSON.stringify([%s, %s])" % (PRESSED, addr)}], page="#write_token=T")
     pressed, values, text = json.loads(out[-2])
-    assert pressed == ["fanin"] and values == ENUM and text == "to fanin", out
+    assert pressed == ["fanin"] and values == CARD and text == "to fanin", out
     pressed, text = json.loads(out[-1])
     assert pressed == [] and text == "to everyone", out                        # none pressed still means everyone
 
@@ -76,13 +73,13 @@ def test_a_phone_width_holds_the_same_values_in_a_picker_that_agrees_with_the_ch
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     probe = ("JSON.stringify({w: window.innerWidth, opts: [...%s.options].filter(o => !o.disabled).map(o => o.value), sel: %s.value, "
              "pickShown: getComputedStyle(%s).display !== 'none', chipsShown: %s.some(c => getComputedStyle(c).display !== 'none')})") % (PICK, PICK, PICK, CHIPS)
-    choose = "%s.value = 'seat:ledgerline'; %s.dispatchEvent(new Event('change', {bubbles: true})); JSON.stringify([%s, %s.value])" % (PICK, PICK, PRESSED, PICK)
+    choose = "%s.value = 'cli'; %s.dispatchEvent(new Event('change', {bubbles: true})); JSON.stringify([%s, %s.value])" % (PICK, PICK, PRESSED, PICK)
     every = "%s.value = ''; %s.dispatchEvent(new Event('change', {bubbles: true})); %s" % (PICK, PICK, PRESSED)
     out = _run(tmp_path, src, [{"eval": probe}, {"eval": choose}, {"eval": every}], first=NARROW, page="#write_token=T")
     got = json.loads(out[-3])
-    assert got["w"] < 720 and got["opts"] == ["", *ENUM] and got["sel"] == "fanin", got          # "everyone" first, the desk chosen
+    assert got["w"] < 720 and got["opts"] == ["", *CARD] and got["sel"] == "fanin", got          # "everyone" first, the desk chosen
     assert got["pickShown"] is True and got["chipsShown"] is False, got
-    assert json.loads(out[-2]) == [["seat:ledgerline"], "seat:ledgerline"], out                   # the picker presses the chip
+    assert json.loads(out[-2]) == [["cli"], "cli"], out                                         # the picker presses the chip
     assert out[-1] == [], out                                                          # "everyone" presses none
 
 
@@ -101,10 +98,10 @@ SEND = ("(() => { const b = %s; b.querySelector('.tray-dump-ta').value = 'hi'; b
 
 
 @needs_browser
-def test_a_landed_send_rebuilds_the_box_on_the_desk_not_on_the_seat_it_just_used(tmp_path, monkeypatch):
+def test_a_landed_send_rebuilds_the_box_on_the_desk_not_on_the_reader_it_just_used(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_value(), "agents")}, {"eval": PICK_SEAT},
-                               {"until": SEAT_PRESSED},
+    pick = "%s.value = 'cli'; %s.dispatchEvent(new Event('change', {bubbles: true})); 1" % (PICK, PICK)
+    out = _run(tmp_path, src, [{"eval": pick}, {"until": "JSON.stringify(%s) == '[\"cli\"]'" % PRESSED},
                                {"eval": "window.__old = %s; 1" % BOX}, {"eval": SEND},
                                {"until": "%s !== window.__old" % BOX},          # the first fresh box after the send landed, read at once
                                {"eval": "JSON.stringify(%s)" % PRESSED}])
@@ -140,93 +137,13 @@ def test_a_roster_id_equal_to_the_synthetic_option_value_picks_one_reader(tmp_pa
 
 
 @needs_browser
-def test_a_departed_seat_refusal_unpresses_its_chip_and_keeps_the_draft_when_the_refetch_declines(tmp_path, monkeypatch):
+def test_the_page_presses_only_what_the_provider_declares_and_hides_only_its_declared_seats(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-
-    # the kernel's own words for a refused write reach the page rewritten (fault() in the boot layer keeps the CODE and swaps the message):
-    # answer every write with the refusal code, and the refetch with "declined"
-    stub = ("window.LevainCockpitView.refetchPanel = () => Promise.resolve(false); const f = window.fetch; "
-            "window.fetch = (u, o) => (o && o.method === 'POST' && /cockpit\\/verb/.test(String(u && u.url || u))) "
-            "? Promise.resolve(new Response(JSON.stringify({error: 'no_live_seat'}), {status: 422, headers: {'content-type': 'application/json'}})) : f(u, o); 1")
-    out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_value(), "agents")}, {"eval": stub}, {"eval": PICK_SEAT},
-                               {"until": SEAT_PRESSED},
-                               {"eval": SEND},
-                               {"until": "(%s.querySelector('.edit-msg') || {}).textContent == 'that reader is gone, choose again'" % BOX},
-                               {"eval": "JSON.stringify([%s, %s.querySelector('.tray-dump-ta').value])" % (PRESSED, BOX)}])
-    pressed, draft = json.loads(out[-1])
-    assert pressed == [] and draft == "hi", out
-
-
-# the departed-seat refusal as the kernel's words reach the page, and a refetch the test holds open or answers as it likes
-REFUSE = ("const f = window.fetch; window.fetch = (u, o) => (o && o.method === 'POST' && /cockpit\\/verb/.test(String(u && u.url || u))) "
-          "? Promise.resolve(new Response(JSON.stringify({error: 'no_live_seat'}), {status: 422, headers: {'content-type': 'application/json'}})) : f(u, o); ")
-TWO = ["cli", "fanin", "seat:ledgerline", "seat:other"]
-SAY = "(%s.querySelector('.edit-msg') || {}).textContent" % BOX
-GONE = "that reader is gone, choose again"
-
-
-@needs_browser
-def test_the_box_stays_frozen_while_the_departed_seat_recovery_waits_and_clears_only_the_failed_sends_seats(tmp_path, monkeypatch):
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    hold = "window.LevainCockpitView.refetchPanel = () => new Promise((r) => { window.__rel = r; }); " + REFUSE + "1"
-    during = ("JSON.stringify([%s.querySelector('.tray-dump-btn').disabled, %s.every(c => c.disabled), %s.disabled, %s])"
-              % (BOX, CHIPS, PICK, PRESSED))
-    # a seat that was not in the failed send's snapshot (pressed behind the frozen box's back) must outlive the recovery
-    out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_value(), "agents")}, {"eval": hold}, {"eval": PICK_SEAT},
-                               {"until": SEAT_PRESSED},
-                               {"eval": SEND}, {"until": "window.__rel"},
-                               {"eval": during},
-                               {"eval": CHIPS + ".find(c => c.dataset.value === 'seat:other').setAttribute('aria-pressed', 'true'); window.__rel(false); 1"},
-                               {"until": SAY + " == '%s'" % GONE},
-                               {"eval": "JSON.stringify([%s, %s.querySelector('.tray-dump-btn').disabled, %s.querySelector('.tray-dump-ta').value])" % (PRESSED, BOX, BOX)}],
-               enum=TWO)
-    btn, chips, pick, pressed = json.loads(out[-4])
-    assert btn is True and chips is True and pick is True and pressed == ["seat:ledgerline"], out     # frozen
-    pressed, btn, draft = json.loads(out[-1])
-    assert pressed == ["seat:other"] and btn is False and draft == "hi", out
-
-
-@needs_browser
-def test_an_applied_refetch_that_did_not_rebuild_the_box_still_unpresses_the_dead_seat(tmp_path, monkeypatch):
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    stub = "window.LevainCockpitView.refetchPanel = () => Promise.resolve('applied'); " + REFUSE + "1"
-    out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_value(), "agents")}, {"eval": stub}, {"eval": PICK_SEAT},
-                               {"until": SEAT_PRESSED},
-                               {"eval": SEND}, {"until": SAY + " == '%s'" % GONE},
-                               {"eval": "JSON.stringify(%s)" % PRESSED}])
-    assert json.loads(out[-1]) == [], out
-
-
-@needs_browser
-def test_a_recovery_a_later_send_overtook_says_nothing_on_the_fresh_box(tmp_path, monkeypatch):
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    # the refusal's recovery is held; a later send (the box is unfrozen by hand, as a poll rebuild would hand over a live one) lands and
-    # rebuilds the board, then the held recovery answers
-    hold = ("window.__f0 = window.fetch; window.LevainCockpitView.refetchPanel = () => new Promise((r) => { window.__rel = r; }); " + REFUSE + "1")
-    heal = "window.fetch = window.__f0; %s.querySelector('.tray-dump-btn').disabled = false; 1" % BOX
-    out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_value(), "agents")}, {"eval": hold}, {"eval": PICK_SEAT},
-                               {"until": SEAT_PRESSED},
-                               {"eval": SEND}, {"until": "window.__rel"},
-                               {"eval": "window.__old = %s; %s" % (BOX, heal)},
-                               {"eval": SEND}, {"until": "%s !== window.__old" % BOX},
-                               {"eval": "window.__rel(false); 1"},
-                               {"eval": "new Promise((r) => setTimeout(() => r(%s), 300))" % SAY}])
-    assert out[-1] != GONE, out
-
-
-@needs_browser
-def test_the_page_presses_and_recovers_only_what_the_provider_declares(tmp_path, monkeypatch):
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    none = {}          # a provider that declares nothing: the page has no default reader and no departed-reader recovery of its own
+    none = {}          # a provider that declares nothing: the page has no default reader of its own
     out = _run(tmp_path, src, [{"eval": "JSON.stringify(%s)" % PRESSED}], page="#write_token=T", declared=none)
     assert json.loads(out[-1]) == [], out                                      # "fanin" is in the enum and is not pressed
     out = _run(tmp_path, src, [{"eval": "JSON.stringify(%s)" % PRESSED}], page="#write_token=T", declared={"default": ["x", "cli"]}, enum=["cli", "x"])
     assert json.loads(out[-1]) == ["cli", "x"], out                            # the declared default, as far as it is in the enum
-    # the refusal that used to trigger the recovery means nothing without the provider's declared match and prefix
-    out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_value(), "agents")}, {"eval": REFUSE + "1"}, {"eval": PICK_SEAT},
-                               {"until": SEAT_PRESSED},
-                               {"eval": SEND},
-                               {"eval": "new Promise((r) => setTimeout(() => r(JSON.stringify([%s, %s, %s.querySelector('.tray-dump-btn').disabled])), 500))" % (PRESSED, SAY, BOX)}],
-               declared={"transient_prefix": "seat:"})
-    pressed, said, frozen = json.loads(out[-1])
-    assert pressed == ["seat:ledgerline"] and said != GONE and frozen is False, out
+    # no declared prefix: every id is a chip, "seat:ledgerline" included
+    out = _run(tmp_path, src, [{"eval": CHIPS + ".map(c => c.dataset.value)"}], page="#write_token=T", declared={})
+    assert out[-1] == ENUM, out

@@ -3647,11 +3647,11 @@
   }
 
   // The value of the picker's option for a choice of several; and the pick a compose card keeps across the rebuild of its box (by
-  // panel), until a send lands. Which reader chips start pressed (`default`), which ids can leave the roster (`transient_prefix`)
-  // and the words of the refusal that says one has (`gone_match`) are declared by the provider on its recipient field.
+  // panel), until a send lands. Which reader chips start pressed (`default`), which ids are seats (`transient_prefix`: messaged from
+  // the seat's own page, never drawn as a chip on the card) and the words of the refusal that says one has left (`gone_match`) are
+  // declared by the provider on its recipient field.
   const SEVERAL_VALUE = "*several";
   const composePick = Object.create(null);
-  const composeGen = Object.create(null);     // per compose key: bumped by every send, so a slow departed-seat recovery can tell a later send overtook it
 
   // `stay` (optional) is a box addressed to ONE reader that outlives its own send (the agent page's message box, which no board reload
   // rebuilds): {pickKey, gone}. Its recipient field holds that one id; no chip or picker is drawn, so it can never fall back to everyone;
@@ -3680,15 +3680,17 @@
       if (f.kind === "multiselect" && f.chips) {
         // the KE compose card's recipient chips: toggle buttons. The provider's declared `default` ids (those in the enum) are pressed
         // when nothing else was chosen; un-pressing them leaves none pressed = the field is omitted = everyone. The enum is the one the panel head
-        // carries NOW (this builds at every render and refetch): a seat chip that left the roster is not here, so it cannot be pressed.
+        // carries NOW (this builds at every render and refetch). An id under the declared `transient_prefix` is a seat: the card draws no
+        // chip for it (Phill 10-25, "61a": a seat is messaged from its node's page, the card is for the desk, the other readers or everyone).
         // At a phone width the same values are a <select> (a pick list holds a long roster; CSS shows one of the two), and every
         // change goes through one setter so chips, picker, address line and the kept pick agree.
         const group = el("div", "ck-to");
         group.appendChild(el("span", "ck-to-label", "To"));
         const chips = [];
+        const seatPrefix = !stay && typeof f.transient_prefix === "string" ? f.transient_prefix : "";
         for (const opt of (Array.isArray(f.options) ? f.options : [])) {
           const value = typeof opt === "string" ? opt : (opt && opt.value);
-          if (typeof value !== "string" || !value) continue;
+          if (typeof value !== "string" || !value || (seatPrefix && value.startsWith(seatPrefix))) continue;
           const chip = el("button", "rc-chip", typeof opt === "string" ? opt : (opt.label || value));
           chip.type = "button";
           chip.dataset.value = value;
@@ -3785,7 +3787,6 @@
     if (addr) { chipAddr(); row.appendChild(addr); }
     if (chipCtl) {
       chipCtl.set(chipCtl.initial, false);
-      box.dataset.composeKey = chipCtl.pickKey;
     }
     const msg = el("span", "edit-msg", "");
     row.append(go, msg);
@@ -3805,23 +3806,21 @@
     // fresh box must start from the provider's declared default, not from the pick it just used. The returned restore puts it back if the send fails.
     const takePick = () => {
       if (!chipCtl) return null;
-      composeGen[chipCtl.pickKey] = (composeGen[chipCtl.pickKey] || 0) + 1;
       const had = chipCtl.pickKey in composePick, snap = composePick[chipCtl.pickKey];
       delete composePick[chipCtl.pickKey];
       return () => { if (had && !(chipCtl.pickKey in composePick)) composePick[chipCtl.pickKey] = snap; };
     };
-    // Returns true when the box is HELD disabled for the departed-seat recovery (the caller must not re-enable it; seatGone does).
+    // Returns true when the box is HELD disabled after the departed-seat refusal (the caller must not re-enable it).
     const failed = (res, restore) => {
       if (restore) restore();
       showFail(msg, res, "failed");
-      // a transient reader that left the roster since the chips were drawn: the serving app's refusal carries the words the provider
+      // a seat's box whose seat left the roster since its page was drawn: the serving app's refusal carries the words the provider
       // declared as `gone_match` (code or words, whichever transport carried it). A substring test, never a pattern built from them.
       const text = res ? [res.error, res.message].map((x) => String(x || "")).join(" ") : "";
       const gm = chipCtl ? chipCtl.f.gone_match : null;
-      if (chipCtl && typeof gm === "string" && gm && typeof chipCtl.f.transient_prefix === "string" && chipCtl.f.transient_prefix
-          && text.toLowerCase().includes(gm.toLowerCase())) {
-        if (stay) { if (typeof stay.gone === "function") stay.gone(msg); return true; }
-        seatGone(); return true;
+      if (stay && typeof gm === "string" && gm && text.toLowerCase().includes(gm.toLowerCase())) {
+        if (typeof stay.gone === "function") stay.gone(msg);
+        return true;
       }
       setDisabled(false);
       return false;
@@ -3836,26 +3835,6 @@
       setDisabled(false);
       msg.className = "edit-msg"; msg.textContent = "sent";
     };
-    async function seatGone() {
-      const notice = "that reader is gone, choose again";
-      const startBox = box, gen = composeGen[chipCtl.pickKey];
-      const tp = chipCtl.f.transient_prefix;
-      const snap = chipCtl.read().filter((v) => v.startsWith(tp));     // the failed send's own transient readers: the only ones this recovery may clear
-      const V = window.LevainCockpitView;
-      let r = false;
-      // the recipient controls and the send stay frozen until the refetch answers: a pick made in the wait would be wiped or sent to everyone
-      if (V && typeof V.refetchPanel === "function" && action.panel) { try { r = await V.refetchPanel(action.panel); } catch (_) { r = "fault"; } }
-      if (startBox.isConnected) {
-        // this box survived (declined, faulted, never ran, or "applied" without a rebuild): un-press the snapshot's seats, leave the draft
-        chipCtl.set(chipCtl.read().filter((v) => snap.indexOf(v) < 0));
-        setDisabled(false);
-      }
-      if (composeGen[chipCtl.pickKey] !== gen) return;                  // a later send overtook this recovery: say nothing
-      const b = startBox.isConnected ? startBox : document.querySelector('.tray-dump[data-compose-key="' + String(chipCtl.pickKey).replace(/["\\]/g, "") + '"]');
-      const m = b ? b.querySelector(".edit-msg") : null;
-      if (m) { m.className = "edit-msg err"; m.textContent = notice; }
-    }
-
     // ── async-job (spec.job) result area + poll loop ──
     // A job verb PROPOSES (commitJob — NO board reload) then polls /job.json. The result lives in
     // MODULE state (_jobState[verb], rendered by refreshJobBoxes); THIS box just hosts a result-wrap
