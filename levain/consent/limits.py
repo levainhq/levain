@@ -56,7 +56,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import sqlite3
 import stat
@@ -69,7 +68,9 @@ from levain.autonomic.durable_sqlite import open_durable, write_transaction
 from levain.consent.record import tool_input_digest
 # the document layer has one home, importable under ROOT_PYTHON (3.9); re-exported here unchanged
 from levain.slot.limits_doc import (AGENTS, DEFAULTS, KINDS, LIMITS_FORMAT, REPEAT_WINDOW, SLOT_KINDS, SLOT_LIMITS_MAX,
-                                    SLOT_RANGE, LimitsDocError, slot_doc, slot_values)
+                                    SLOT_RANGE, LimitsDocError, parse_limits_doc, slot_doc,
+                                    slot_values)
+from levain.slot.limits_doc import _limit_value  # noqa: F401 - limits_cli reads it as L._limit_value
 
 __all__ = ["ACTIVE_GAP", "DB_NAME", "DEFAULTS", "FAIL_DENY_AFTER", "GO", "KINDS", "LIMIT_TIER", "LIMIT_TOOL", "LIMITS_NAME",
            "Outcome", "REPEAT_WINDOW", "Verdict", "check", "file_extend", "release_if_extended", "retry_text", "stop_text",
@@ -152,47 +153,6 @@ def session_root(session: str) -> str:
 
 
 # --- the limits in force (F4a) -------------------------------------------------------------------------------------
-
-def _limit_value(kind: str, v: Any) -> float | None:
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
-        return None
-    try:                            # an integer past float range raises here, and is a bad value like any other
-        if not math.isfinite(v) or v <= 0 or (kind != "active_hours" and v != int(v)):
-            return None
-        return float(v)
-    except (OverflowError, ValueError):
-        return None
-
-
-def parse_limits_doc(doc: Any, agent: str | None, *, slot: bool = False) -> tuple[dict[str, float], list[str]]:
-    """THE reading of a parsed ``levain-limits/1`` document, Q13's ``limits.json`` and a slot's ``L/policy/limits``
-    alike: (:data:`DEFAULTS` overlaid by the ``default`` block, then by ``agent``'s block; what was skipped).
-
-    ``slot=False`` (Q13's local file): a block that is not an object, or a kind or value :func:`_limit_value` refuses,
-    is skipped and named in the list; raises :class:`LimitsDocError` only when ``doc`` is not a ``levain-limits/1``
-    object. ``slot=True``: :func:`levain.slot.limits_doc.slot_values` (the whole document checked, its first fault
-    raised; exactly :data:`SLOT_KINDS`), and the list is empty. ``agent=None`` reads the ``default`` block only."""
-    if slot:
-        return slot_values(doc, agent), []
-    if not isinstance(doc, dict) or doc.get("format") != LIMITS_FORMAT:
-        raise LimitsDocError("limits-malformed", f"not a {LIMITS_FORMAT} object")
-    out = dict(DEFAULTS)
-    bad: list[str] = []
-    for block in ("default",) if agent is None else ("default", agent):
-        got = doc.get(block)
-        if got is None:
-            continue
-        if not isinstance(got, dict):
-            bad.append(block)
-            continue
-        for kind, v in got.items():
-            val = _limit_value(kind, v) if kind in DEFAULTS else None
-            if val is None:
-                bad.append(f"{block}.{kind}")
-            else:
-                out[kind] = val
-    return out, bad
-
 
 def load_limits(queue_dir: Path | str, agent: str) -> tuple[dict[str, float], str]:
     """(the limits in force for ``agent``, where they came from): :data:`DEFAULTS`, overlaid by
