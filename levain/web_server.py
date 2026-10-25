@@ -1180,16 +1180,11 @@ class _Handler(GuardedHandler):
         )
 
     def _egress_lookup(self) -> Any:
-        """A read-only reading of the chat egress rows for a consent body (``EgressReader.reading``) over the dispatch
-        store beside the queue the decisions panel reads (``dispatch.db`` lives in the consent directory), or None
-        for a reader naming no queue: never the default queue's then, as the proposals route."""
-        from levain.chat_egress.records import EgressReader
-        from levain.consent.queue import default_queue_dir
+        """The read-only egress reading for a consent body, over the queue the decisions panel reads
+        (``listing.egress_reading``, the one the panel's rows use too)."""
+        from levain.consent.listing import egress_reading
 
-        reader = self.server.consent_reader
-        if not hasattr(reader, "directory"):
-            return None
-        return EgressReader(reader.directory if reader.directory is not None else default_queue_dir()).reading
+        return egress_reading(self.server.consent_reader)
 
     def _serve_consent_body(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/consent/<request_id>.json``: one listed consent request's body (``entry_body``). Reached

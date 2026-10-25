@@ -4211,7 +4211,8 @@
     ended: "ended before a result: the request's client left, or its launch or Levain closed; nothing was sent after that",
     ambiguous: "you allowed it, then Levain or its launch stopped before the result: it may or may not have been sent",
     failed: "Levain failed partway: its record of this request is incomplete",
-    inconsistent: "the queue and the egress record disagree" };
+    inconsistent: "the queue and the egress record disagree",
+    unreadable: "the egress record could not be read: whether anything was sent is not known" };
   // the states a card stays in: a body showing one of these is kept (consentBody); the rest are read again
   const EGRESS_FINAL = new Set(["completed", "denied", "expired", "denied_or_expired", "ended", "ambiguous", "failed"]);
   // with no egress rows read, the queue's state alone (cards.card_state(queue_state, None), pinned by its test)
@@ -4297,9 +4298,11 @@
       head.appendChild(left);
       if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
     } else {
-      // an egress card's header says what the card says it became (its body, once read, says it from the rows)
+      // an egress card's header says what the card became: the listing's egress_state (the server's reading of the
+      // rows), else, when the row carries none, the queue's state alone
       const word = c.tool === EGRESS_TOOL
-        ? egressLabel(Object.prototype.hasOwnProperty.call(EGRESS_FROM_QUEUE, c.state) ? EGRESS_FROM_QUEUE[c.state] : "inconsistent")
+        ? egressLabel(typeof c.egressState === "string" && Object.prototype.hasOwnProperty.call(EGRESS_WORDS, c.egressState) ? c.egressState
+          : Object.prototype.hasOwnProperty.call(EGRESS_FROM_QUEUE, c.state) ? EGRESS_FROM_QUEUE[c.state] : "inconsistent")
         : c.state;
       head.appendChild(el("span", "consent-audit", word));
     }

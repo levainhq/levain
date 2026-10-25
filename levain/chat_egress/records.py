@@ -453,8 +453,9 @@ class EgressReader:
     No file, or no table yet: no rows. A table or trigger that differs from `EGRESS_SCHEMA`'s raises
     `EgressRecordError`, as `EgressRecords` refuses it at open; a file that cannot be read raises sqlite3's error."""
 
-    def __init__(self, directory: Path | str) -> None:
+    def __init__(self, directory: Path | str, busy_timeout: float = 2.0) -> None:
         self.path = Path(directory) / "dispatch.db"
+        self.busy_timeout = busy_timeout
 
     def reading(self, launch_id: str, request_id: str) -> tuple[Settled | None, bool]:
         """One request, in one read snapshot: its rows as `EgressRecords.settled` reads them, and whether it is IN
@@ -463,7 +464,7 @@ class EgressReader:
         the stop that makes the same rows AMBIGUOUS; so is a launch with no event to read."""
         if not self.path.is_file():
             return None, False
-        conn = sqlite3.connect(self.path.absolute().as_uri() + "?mode=ro", uri=True, timeout=2.0,
+        conn = sqlite3.connect(self.path.absolute().as_uri() + "?mode=ro", uri=True, timeout=self.busy_timeout,
                                isolation_level=None)
         try:
             conn.execute("BEGIN")

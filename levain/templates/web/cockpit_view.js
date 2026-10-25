@@ -308,7 +308,7 @@
           const f = r.facets || {};
           const sv = (x) => (typeof x === "string" ? x : "");
           line.consent = { id: r.id.slice("consent:".length), agent: sv(f.agent), tool: sv(f.tool), state: sv(f.consent_state),
-                           tier: sv(f.consent_tier), expiresAt: sv(f.expires_at),
+                           tier: sv(f.consent_tier), egressState: sv(f.egress_state), expiresAt: sv(f.expires_at),
                            age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "",
                            decidedAge: typeof f.decided_at === "string" ? ageLabel(f.decided_at, nowMs || Date.now(), "") : "" };
         }
