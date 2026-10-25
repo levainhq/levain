@@ -22,11 +22,11 @@ a tuple that passed the predicate refreshes it to newest; a reply that fails the
 removes (R15-24-3, R15-26-1). Only the enum `content_type_class` is ever stored about a response (R15-21-3).
 
 Keys (R15-17-1): `key_allowed` is the ONE home of "is this a git exchange that needs a declared repo?" (S6's
-`keys.decide_key` calls it, and holds no rule of its own). On a keyed route it narrows
-the attach on a GIT EXCHANGE (`git_exchange`: an endpoint or discovery path, a dumb-protocol path under a `*.git`
-segment, or any `service` query; matched case-folded, `;...` stripped per segment, one trailing `/` stripped) to the
-route's declared repo set, and an encoded separator (`%2F`, `%5C`) in a keyed route's path is keyless outright;
-it ANDs into classify's `reattached`. Any other non-git request keeps the snapshot's rule.
+`keys.decide_key` calls it, and holds no rule of its own). On a keyed route it narrows the attach on a GIT EXCHANGE
+(`git_exchange`: an endpoint or discovery path, a dumb-protocol path under a `*.git` segment, or any `service` query;
+matched case-folded, `;...` stripped per segment, one trailing `/` stripped) to the route's declared repo set, and an
+escape in KEYLESS_ESCAPES (`%2F`, `%5C`, `%25`, `%3B`) in a keyed route's path is keyless outright; it ANDs into
+classify's `reattached`. Any other non-git request keeps the snapshot's rule.
 
 Order (B11) is classify's: walls, R-7, R-5's query mark, then this predicate (never asked about a marked request).
 The decider binds the launch state: `functools.partial(read_shaped, adverts=<the set>, body_cut=<spool result>)`.
@@ -323,23 +323,26 @@ def _canonical_repo(entry: str) -> str | None:
     return None if problem else canon
 
 
-#: An encoded path separator: R-2's canonical form upper-cases every escape it keeps, so these two spellings cover
-#: every case (`%5C` already walls `path`; it is named here too so this rule does not lean on the wall).
-_ENCODED_SEPARATORS = ("%2F", "%5C")
+#: The escapes that make a keyed route's path keyless: an encoded separator (`%2F`, `%5C`), an encoded `%` (`%25`: a
+#: double-encoded separator such as `%252F` is `%2F` to a server that decodes twice) and an encoded `;` (`%3B`: the
+#: git rule strips `;...` per segment only when it is literal). R-2's canonical form upper-cases every escape it
+#: keeps, so these spellings cover every case (`%5C` already walls `path`; it is named here too so this rule does not
+#: lean on the wall).
+KEYLESS_ESCAPES = ("%2F", "%5C", "%25", "%3B")
 
 
 def key_allowed(parsed: ParsedRequest, route: "RouteSnapshot | None") -> bool:
     """R15-17-1, the ONE home (S6's `decide_key` calls this): on a keyed route, a git exchange (`git_exchange`)
     carries the held key only for a repo in the route's declared set (matched by prefix exactly as spelled, in R-2's
-    canonical form). A walled path: False. A path holding an encoded separator (`%2F`, `%5C`, any case): False, git
-    exchange or not, declared repo or not (a server that decodes before routing would see a git path this rule never
-    read). Any other request: True (the snapshot's rule, S6's liveness and classify's `reattached` decide). The
+    canonical form). A walled path: False. A path holding a KEYLESS_ESCAPES escape (`%2F`, `%5C`, `%25`, `%3B`, any
+    case): False, git exchange or not, declared repo or not (a server that decodes before routing would see a git path
+    this rule never read). Any other request: True (the snapshot's rule, S6's liveness and classify's `reattached` decide). The
     discovery GET of an undeclared repo is keyless too."""
     if route is None:
         return True
     if parsed.canonical_path is None:
         return False
-    if any(sep in parsed.canonical_path for sep in _ENCODED_SEPARATORS):
+    if any(esc in parsed.canonical_path for esc in KEYLESS_ESCAPES):
         return False
     exchange, prefix = git_exchange(parsed)
     if not exchange:

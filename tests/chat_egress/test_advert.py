@@ -593,3 +593,16 @@ def test_f5_a_capacity_above_the_cap_is_refused():
     with pytest.raises(ValueError):
         AdvertisementSet(capacity=advert.ADVERTISEMENT_SET_CAP + 1)
     assert len(AdvertisementSet(capacity=advert.ADVERTISEMENT_SET_CAP)) == 0
+
+
+@pytest.mark.parametrize("path", [
+    "/o/r.git%252Finfo%252Frefs", "/o/r.git%252fgit-upload-pack", "/o/r.git/info/refs%25", "/o/r.git%25/HEAD",
+    "/o/r.git%3Bx/git-upload-pack", "/o/r.git%3binfo/refs", "/o/r.git/objects%3Bab/cdef", "/api%3Bv4/projects"])
+def test_an_encoded_percent_or_semicolon_on_a_keyed_route_is_keyless(path):
+    """Item 14 (session A L1-1): beside `%2F` / `%5C`, a `%25` (a double-encoded separator, `%252F`, decodes to `%2F`
+    at a server that decodes twice) or a `%3B` (an encoded `;`, which the git rule strips per segment only when
+    literal) anywhere in a keyed route's path, any case, carries no key, git exchange or not, declared or not."""
+    rt = route(declared=("/o/r.git",))
+    assert not advert.key_allowed(_get(path), rt), path
+    assert not advert.key_allowed(_post_at(path), rt), path
+    assert advert.key_allowed(_get(path), None), path
