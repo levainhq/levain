@@ -456,6 +456,10 @@ _SCHEMA = (
     "CREATE TRIGGER IF NOT EXISTS handoffs_no_replace BEFORE INSERT ON handoffs "
     "WHEN EXISTS (SELECT 1 FROM handoffs WHERE job_id = NEW.job_id OR bundle_id = NEW.bundle_id "
     "OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a handoff row is never replaced'); END",
+    # dispatch's SESSION-EVENTS cursor (CONTRACT §3.6 "dispatch persists its cursor"): at most one row, the journal
+    # the cursor belongs to and the last seq the follower finished (levain.dispatch.follow); rewritten, never appended
+    "CREATE TABLE IF NOT EXISTS event_cursor (one INTEGER PRIMARY KEY CHECK (one = 1), journal_id TEXT NOT NULL, "
+    "seq INTEGER NOT NULL CHECK (seq >= 0))",
     "CREATE TRIGGER IF NOT EXISTS cancel_signatures_no_replace BEFORE INSERT ON cancel_signatures "
     "WHEN EXISTS (SELECT 1 FROM cancel_signatures WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a cancel is never replaced'); END",
@@ -708,6 +712,29 @@ class JobStore:
     def stamp(self) -> str:
         """Now, on the store's own clock: the one clock a land judges expiry and record age by."""
         return self._stamp()
+
+    # --- the SESSION-EVENTS cursor (levain.dispatch.follow) --------------------------------------------------------
+    def event_cursor(self) -> tuple[str, int] | None:
+        """``(journal_id, seq)``: the journal and the last event seq the follower finished; None before the first."""
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT journal_id, seq FROM event_cursor WHERE one = 1").fetchone()
+        finally:
+            conn.close()
+        return None if row is None else (row[0], row[1])
+
+    def set_event_cursor(self, journal_id: str, seq: int) -> None:
+        """Persist the cursor past event ``seq`` of journal ``journal_id`` in its own write transaction."""
+        if type(journal_id) is not str or not journal_id or type(seq) is not int or seq < 0:
+            raise DispatchError("an event cursor is a journal id and a seq >= 0")
+        with self._write() as conn:
+            conn.execute("INSERT INTO event_cursor (one, journal_id, seq) VALUES (1, ?, ?) ON CONFLICT (one) "
+                         "DO UPDATE SET journal_id = excluded.journal_id, seq = excluded.seq", (journal_id, seq))
+
+    def drop_event_cursor(self) -> None:
+        """Forget the cursor (its journal is gone: the follower restarts from 0)."""
+        with self._write() as conn:
+            conn.execute("DELETE FROM event_cursor")
 
     @contextmanager
     def _swept(self) -> Iterator[tuple[sqlite3.Connection, str]]:
