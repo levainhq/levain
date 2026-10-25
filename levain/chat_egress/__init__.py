@@ -7,4 +7,9 @@ Modules are split by owner so no two build sessions share a file. The leaf modul
          glue's event file) and the verdict-frame builders.
   guard  the denied-address table srt's resolved-address guard is configured with, generated from
          `levain.broker.front`, and the decider's own address wall.
+  lifecycle  C0 read per request: one egress request's state machine (attempt, then outcome XOR
+         ended-before-outcome; FAILED when an effect raised), its effects and `settle` (AMBIGUOUS, FAILED and the
+         other read-side values).
+  records  the `chat_egress_events` rows lifecycle asks for (UNIQUE, the refused-duplicate count `duplicate_rows`,
+         the durable FAILED mark), in the dispatch store's `dispatch.db`.
 """
