@@ -72,6 +72,22 @@ def test_the_adapter_and_the_floor_name_the_same_levain_home(lhome, tmp_path, mo
     assert not any(p == lhome / ".levain" for p in got)
 
 
+def test_protected_paths_and_the_floor_agree_on_a_non_default_levain_home(lhome, tmp_path, monkeypatch):
+    """The floor (:func:`build_policy`, the deny list a confined shell runs under) and the adapter name one base."""
+    from levain.firing.confinement import build_policy
+
+    elsewhere = tmp_path / "state" / "lv"
+    elsewhere.mkdir(parents=True)
+    monkeypatch.setenv("LEVAIN_HOME", str(elsewhere))
+    ent = tmp_path / "entities" / "coyote"
+    (ent / ".levain").mkdir(parents=True)
+    (ent / "workspace").mkdir()
+    base = levain_home_base(Path.home())
+    assert base == Path(os.path.abspath(elsewhere))
+    assert base in build_policy(ent).deny_read_write
+    assert base in cc.protected_paths(tmp_path / "q", cc.AdapterSettings())
+
+
 def test_a_levain_home_at_or_above_the_users_home_falls_back_to_its_state_dirs(lhome, monkeypatch):
     """As the floor does for a home it cannot hide whole: $LEVAIN_HOME=$HOME must not tag every file in the home."""
     monkeypatch.setenv("LEVAIN_HOME", str(lhome))

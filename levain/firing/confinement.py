@@ -2121,10 +2121,17 @@ def levain_home_base(home: Path) -> Path:
     the other spellings. The consent adapters protect the same directory from file tools
     (``levain.consent.adapters.claude_code.protected_paths``). Raises :class:`ConfinementError` when it
     cannot be resolved (fail-closed)."""
+    return _levain_home_spellings(home)[0]
+
+
+def _levain_home_spellings(home: Path) -> tuple[Path, list[Path]]:
+    """:func:`levain_home_base` and its :func:`_spellings`, under one ``ConfinementError`` naming
+    ``$LEVAIN_HOME`` as written when either step fails."""
     raw = os.environ.get("LEVAIN_HOME")
     try:
         base = Path(raw).expanduser() if raw else home / ".levain"
-        return Path(os.path.abspath(base))
+        base = Path(os.path.abspath(base))
+        return base, _spellings(base)
     except (OSError, RuntimeError, ValueError) as exc:
         raise ConfinementError(
             f"$LEVAIN_HOME={raw!r} cannot be resolved ({exc}) — refusing to build the floor (fail-closed)."
@@ -2144,13 +2151,7 @@ def _levain_home_jewels(home: Path, entity_dir: Path, workspace: Path) -> tuple[
     name: the shape before the whole-home deny plus the consent queue, so that layout keeps the old class
     edge (a new directory must add itself to the tuple). Refuses (fail-closed) a home that cannot be
     resolved, or a named directory that would hide the entity's own home, entity or workspace."""
-    base = levain_home_base(home)
-    try:
-        whole = _spellings(base)
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise ConfinementError(
-            f"the levain home {base} cannot be resolved ({exc}) — refusing to build the floor (fail-closed)."
-        ) from exc
+    base, whole = _levain_home_spellings(home)
     if not any(_hides_the_entity(d, home, entity_dir, workspace) for d in whole):
         return base, whole
     out: list[Path] = []
