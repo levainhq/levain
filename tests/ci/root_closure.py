@@ -195,6 +195,7 @@ LAZY_SITES = {
     'levain/slot/sudoers.py::_written_by_us::from levain.slot.removal import OURS, ReadFailed': 'root',
     'levain/slot/sudoers.py::remove_dropin_steps::from levain.slot.removal import at, chain, point, remove_step': 'root',
     'levain/slot/units.py::_launchd_state::from levain.slot.removal import ReadFailed': 'root',
+    'levain/slot/units.py::keys_start_steps.stop::from levain.slot.removal import Live, ReadFailed': 'root',
     'levain/slot/units.py::unit_state::from levain.slot.removal import ABSENT, OURS, root_file': 'root',
     'levain/slot/units.py::stop_unit_by_name::from levain.slot.removal import chain, point, remove_step': 'root',
     'levain/slot/units.py::remove_unit_file_by_name::from levain.slot.removal import at, chain, point, remove_step': 'root',
