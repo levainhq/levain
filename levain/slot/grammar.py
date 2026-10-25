@@ -22,8 +22,8 @@ VERBS = ("setup", "repair", "undo", "replenish", "set-retention", "set-dispatch-
 
 #: Verbs that run with a live lease (CONTRACT §5.2); every other verb refuses ``live-lease``. The credential verbs
 #: too: keys reads a credential on demand, so a rotation takes effect on the next exchange (design 1.8 Bootstrap).
-#: ``set-limits`` too: a slot session held over a limit goes on only when the operator raises that limit, which is
-#: exactly while its lease is live (slot limits DESIGN §3).
+#: ``set-limits`` too: a slot session held over a limit goes on when the operator raises that limit, which happens
+#: while its lease is live (slot limits DESIGN §3).
 LEASE_EXEMPT = frozenset({"purge", "force-retire", "set-credential", "remove-credential", "set-limits"})
 
 #: A credential's name: the pattern of :data:`levain.broker.creds.NAME_RE`, written here because the broker module
