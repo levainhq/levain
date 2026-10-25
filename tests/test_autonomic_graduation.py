@@ -339,7 +339,7 @@ def test_requested_upgrade_still_honored(tmp_path):
     # a requested-UPGRADE binding (ratified=CONFIRM, above earned=COOLING_OFF) still pauses at CONFIRM —
     # max(risk_floor=ON_LOOP, CONFIRM) == CONFIRM (ratified dominates; behavior-identical to the old form).
     g = _gate(tmp_path)
-    o = g.gate(_req(g, risk=LOW_INTERNAL, ratified=Posture.CONFIRM))
+    o = g.gate(_req(g, risk=LOW_INTERNAL, ratified=Posture.CONFIRM, sealed=Posture.CONFIRM))
     assert o.fired is False and o.posture is Posture.CONFIRM
 
 

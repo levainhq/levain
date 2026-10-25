@@ -67,12 +67,19 @@ def rig(path) -> tuple[Any, Any]:
     return _RIGS[key]
 
 
-def admit_binding_run(journal) -> tuple[str, Any]:
+def admit_binding_run(journal, posture=None) -> tuple[str, Any]:
     """A real, fireable binding in ``journal``'s store and an admitted run of it: ``(binding_id, RunRef)``,
     what a gate-level binding fire request carries. The gate's own posture logic reads the request's
-    risk and ratified posture, not this binding's."""
-    from levain.autonomic import (Binding, BindingStatus, BindingStore, Posture, RunRef, SubGoal,
+    risk and ratified posture, not this binding's. ``posture``: seal the binding at that rung (a terminal
+    link's ``ratified_posture`` must equal its sealed binding's posture), default ON_LOOP; above ON_LOOP a
+    binding needs a sealed kill guard, so one is added."""
+    from levain.autonomic import (Binding, BindingStatus, BindingStore, Guard, Posture, RunRef, SubGoal,
                                   TightnessVector, TriggerSpec)
+    posture = Posture.ON_LOOP if posture is None else posture
+    guard = () if posture <= Posture.ON_LOOP else (
+        Guard(rationale="spoofable", dissent_author="codex",
+              kill_predicate={"op": "==", "field": "blocked", "value": True},
+              kill_drill={"blocked": True}, kill_authored_by="phill"),)
     store = BindingStore(journal.db.directory, journal=journal)
     n = next(_SEQ)
     b = Binding.create(
@@ -80,7 +87,7 @@ def admit_binding_run(journal) -> tuple[str, Any]:
         trigger=TriggerSpec(type="email", pattern={"op": "exists", "field": "from"}),
         goal=(SubGoal(goal="g", tools=("t",), output="o"),),
         tightness=TightnessVector(goal_spec=0.9, tool_min=0.9, pattern_precision=0.9, output_bound=0.9),
-        posture=Posture.ON_LOOP, guard=(), status=BindingStatus.ACTIVE)
+        posture=posture, guard=guard, status=BindingStatus.ACTIVE)
     store.add(b)
     run = f"run-test-{n}"
     assert store.admit(b.binding_id, run) is not None

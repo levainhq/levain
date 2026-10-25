@@ -106,19 +106,20 @@ def _binding_authority(binding_id="bind-x"):
     return AuthorityScope(grantor="binding", grant="binding:time@on_loop", binding_id=binding_id, hops=0)
 
 
-def _bound(gate):
+def _bound(gate, sealed=None):
     """``(authority, run)`` for a gate-level binding fire: a real binding and an admitted run of it in the
-    gate's journal (every binding fire is a journaled run)."""
-    binding_id, run = admit_binding_run(gate.journal)
+    gate's journal (every binding fire is a journaled run), sealed at ``sealed`` (default ON_LOOP)."""
+    binding_id, run = admit_binding_run(gate.journal, sealed)
     return _binding_authority(binding_id), run
 
 
 def _fire_request(gate, *, risk=LOW_INTERNAL, ratified=None, kill_predicates=(), trigger_event=None,
                   signal=SignalAuth.STRONG, predicted_trajectory=None, action="deliver",
-                  confidence=1.0):
+                  confidence=1.0, sealed=None):
     """An autonomous binding fire request on an admitted run: intent-free, human-absent
-    (STRONG+INTENT_FREE → ON_LOOP)."""
-    authority, run = _bound(gate)
+    (STRONG+INTENT_FREE → ON_LOOP). ``sealed``: the rung the admitted binding is sealed at (a ratified
+    posture must be its binding's)."""
+    authority, run = _bound(gate, sealed)
     return ActionRequest(
         action_name=action, payload="do it", context_id="ctx-1", query_text="q", query_date="2026-06-30",
         trust=TrustContext(signal_auth=signal, intent_provenance=IntentProvenance.INTENT_FREE,
@@ -189,7 +190,7 @@ def test_ratified_posture_floors_up_a_lowered_risk(tmp_path):
     g = _gate(tmp_path, auto_fire=None)
     # risk re-resolves to ON_LOOP (fires immediately), but the binding was ratified at CONFIRM →
     # max(ON_LOOP, CONFIRM) = CONFIRM → needs the confirm transport (none wired) → DEFER, never fire.
-    out = g.gate(_fire_request(g, risk=LOW_INTERNAL, ratified=Posture.CONFIRM))
+    out = g.gate(_fire_request(g, risk=LOW_INTERNAL, ratified=Posture.CONFIRM, sealed=Posture.CONFIRM))
     assert not out.fired and out.deferred and out.posture is Posture.CONFIRM
 
 
