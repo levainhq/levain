@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.docs import DocsError, chapters_payload
-from levain.http_guards import GuardedHandler
+from levain.http_guards import LISTEN_BACKLOG, GuardedHandler
 from levain.web_server import (
     _LOOPBACK_HOSTS,
     _is_loopback_host,
@@ -59,6 +59,7 @@ class _DocsServer(ThreadingHTTPServer):
     """A ``ThreadingHTTPServer`` carrying the composed docs JSON (built once), the
     cached static assets, and the Host allowlist. Typed so the handler's access is
     checked and can't silently break."""
+    request_queue_size = LISTEN_BACKLOG   # the stdlib's 5 resets a page load's burst on macOS (http_guards)
 
     docs_json: bytes
     assets: dict[str, bytes]

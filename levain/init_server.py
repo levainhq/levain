@@ -58,7 +58,7 @@ from levain.install import (
 from levain.answers import validate_answers
 from levain.interview import build_field_plan
 from levain.packs import PackError, load_pack_manifest, order_activation_roots
-from levain.http_guards import GuardedHandler
+from levain.http_guards import LISTEN_BACKLOG, GuardedHandler
 from levain.web_server import (
     _LOOPBACK_HOSTS,
     _WRITE_TOKEN_HEADER,
@@ -116,6 +116,7 @@ class _InitServer(ThreadingHTTPServer):
     """A ``ThreadingHTTPServer`` carrying the fixed install config, cached static
     assets, the Host allowlist, and the install serialization lock. Typed so the
     handler's access is checked and can't silently break."""
+    request_queue_size = LISTEN_BACKLOG   # the stdlib's 5 resets a page load's burst on macOS (http_guards)
 
     install: Path
     force: bool

@@ -26,7 +26,7 @@ from http.server import ThreadingHTTPServer
 from typing import Any
 
 from levain.cockpit import display_safe
-from levain.http_guards import GuardedHandler
+from levain.http_guards import LISTEN_BACKLOG, GuardedHandler
 from levain.web_server import load_web_asset
 
 from . import canon as C
@@ -397,6 +397,7 @@ JS = """\
 # ---- the server --------------------------------------------------------------------------------------------
 
 class _ViewServer(ThreadingHTTPServer):
+    request_queue_size = LISTEN_BACKLOG   # the stdlib's 5 resets a page load's burst on macOS (http_guards)
     # Explicit: if a supported Python ever defaulted this to True, two views could bind one port.
     allow_reuse_port = False
     allowed_hosts: frozenset[str]

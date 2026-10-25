@@ -80,7 +80,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
 
-from levain.http_guards import GuardedHandler
+from levain.http_guards import LISTEN_BACKLOG, GuardedHandler
 
 __all__ = ["DEFAULT_PHONE_PORT", "PHONE_TOKEN_HEADER", "PhoneError", "make_phone_server", "run_phone_server",
            "tailscale_name"]
@@ -475,6 +475,7 @@ class _PhoneHandler(GuardedHandler):
 
 
 class _PhoneServer(ThreadingHTTPServer):
+    request_queue_size = LISTEN_BACKLOG   # the stdlib's 5 resets a page load's burst on macOS (http_guards)
     daemon_threads = True
 
     def __init__(self, address: tuple[str, int], *, queue_dir: Path, rp_id: str, token: str,

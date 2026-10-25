@@ -120,7 +120,7 @@ from levain.cockpit.verbs import (SERVED_VERBS_NAME, VerbRegistry, VerbSpec, Ver
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
 from levain.consent.grant_phone import grant_route
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
-from levain.http_guards import _WRITE_SEC_FETCH_ALLOWED as _SAME_ORIGIN, GuardedHandler
+from levain.http_guards import _WRITE_SEC_FETCH_ALLOWED as _SAME_ORIGIN, LISTEN_BACKLOG, GuardedHandler
 from levain.http_guards import host_header_allowed  # the off-box read gate; importable here since before 2026-10-03
 from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
@@ -810,6 +810,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     attributes on a plain server) so the handler's access is type-checked and
     can't silently break into an unhandled ``AttributeError`` if construction
     ever moves."""
+    request_queue_size = LISTEN_BACKLOG   # the stdlib's 5 resets a page load's burst on macOS (http_guards)
 
     levain_source: SubstrateSource
     levain_assets: dict[str, bytes]
