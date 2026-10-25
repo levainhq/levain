@@ -7,6 +7,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **A provider can report a task's spend as tokens from transcripts.** The topology contract accepts `cost.source: "transcript"`
+  (tokens only, never a price) and the Work lens draws it as "N tokens from transcripts". Levain's own tasks still report no cost:
+  none of them names the session that works it.
 - **Per-device cockpit pairing (the server half).** A device that already holds a cockpit credential mints a one-time
   code (`POST /cockpit/pair/offer`, 128-bit, ten minutes, single use); a new device trades it for its OWN token at
   `POST /cockpit/pair/claim`, the one route that needs no credential. Each paired device is revocable alone
