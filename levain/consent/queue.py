@@ -1004,10 +1004,11 @@ class ConsentQueue:
         else:
             raise ConsentError("event_id must be a non-empty string")
         if tool_name == EGRESS_TOOL:
-            # a chat launch's egress card: its own display, in a fixed field order, never cut (chat_egress.cards)
-            from levain.chat_egress.cards import CardError, card_display
+            # a chat launch's egress card: its own display, in a fixed field order, never cut, after the card's whole
+            # check and its filing's agent, tier, hold and event id (chat_egress.cards.filed_display)
+            from levain.chat_egress.cards import CardError, filed_display
             try:
-                display = card_display(tool_input)
+                display = filed_display(tool_input, agent=agent, tier=tier, hold=hold, event_id=event_id)
             except CardError as exc:
                 raise ConsentError(f"a {EGRESS_TOOL} request must be a card: {exc}") from None
         else:

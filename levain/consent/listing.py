@@ -23,7 +23,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.consent.record import ExternalGateRequest
@@ -171,11 +171,17 @@ def home_relative(cwd: str) -> str:
     return "~" + cwd[len(home):] if cwd.startswith(home + os.sep) else cwd
 
 
-def entry_body(entry: ConsentEntry) -> dict[str, Any]:
+def entry_body(entry: ConsentEntry, settled_lookup: Callable[[str, str], tuple[Any, bool]] | None = None
+               ) -> dict[str, Any]:
     """What the page shows of one request beyond its panel row: the request as filed, where, what it names, how
     to answer it from a terminal, and, once decided, how it was. Served only to a caller holding a surface token
     (``web_server``'s consent route), never in the token-free panel. A request whose display is cut at its limit
-    offers no commands: ``levain consent answer`` refuses to sign what it cannot show."""
+    offers no commands: ``levain consent answer`` refuses to sign what it cannot show.
+
+    ``settled_lookup(launch, request)`` is a READ-ONLY reading of a chat launch's egress rows
+    (``levain.chat_egress.records.EgressReader.reading``). Given one, a ``levain_egress`` card's body also says what
+    the request became (``egress_state``, ``chat_egress.cards.card_state``), or, when the rows cannot be read, says so
+    (``egress_note``). Without one (the default) the body is as it was for every caller."""
     r = entry.request
     pending = entry.state == "pending"
     shown = filed_input(r)
@@ -196,7 +202,24 @@ def entry_body(entry: ConsentEntry) -> dict[str, Any]:
             # Q12: the two values the terminal prints before signing; Q16: hints, which inform and never authorise
             "tool_input_digest": r.tool_input_digest, "digest": r.digest,
             "hints": hints,
-            "audit": "" if pending else visible(audit_line(entry))}
+            "audit": "" if pending else visible(audit_line(entry)),
+            **(_egress(entry, shown, settled_lookup) if settled_lookup is not None else {})}
+
+
+def _egress(entry: ConsentEntry, shown: object, lookup: Callable[[str, str], tuple[Any, bool]]) -> dict[str, str]:
+    """``egress_state`` for a ``levain_egress`` card (nothing for another tool); ``egress_note`` when its egress rows
+    cannot be read, so the page never shows a queue-only word as if the rows had been read."""
+    from levain.chat_egress.cards import EGRESS_TOOL, card_state
+
+    if entry.request.tool_name != EGRESS_TOOL:
+        return {}
+    if not (isinstance(shown, dict) and isinstance(shown.get("launch"), str) and isinstance(shown.get("request"), str)):
+        return {"egress_note": "this card names no launch and request to read its egress record by"}
+    try:
+        settled, in_flight = lookup(shown["launch"], shown["request"])
+        return {"egress_state": card_state(entry.state, settled, in_flight=in_flight).value}
+    except Exception as exc:  # noqa: BLE001 - an unreadable record is said on the card, never a dead consent body
+        return {"egress_note": f"the egress record could not be read ({type(exc).__name__})"}
 
 
 def _check_directory(directory: Path) -> None:

@@ -1179,6 +1179,18 @@ class _Handler(GuardedHandler):
             supplied.encode("utf-8"), expected.encode("utf-8")
         )
 
+    def _egress_lookup(self) -> Any:
+        """A read-only reading of the chat egress rows for a consent body (``EgressReader.reading``) over the dispatch
+        store beside the queue the decisions panel reads (``dispatch.db`` lives in the consent directory), or None
+        for a reader naming no queue: never the default queue's then, as the proposals route."""
+        from levain.chat_egress.records import EgressReader
+        from levain.consent.queue import default_queue_dir
+
+        reader = self.server.consent_reader
+        if not hasattr(reader, "directory"):
+            return None
+        return EgressReader(reader.directory if reader.directory is not None else default_queue_dir()).reading
+
     def _serve_consent_body(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/consent/<request_id>.json``: one listed consent request's body (``entry_body``). Reached
         only through ``_route`` (Host allowlist, cross-site refusal, off-box gate), then a surface token is
@@ -1227,7 +1239,7 @@ class _Handler(GuardedHandler):
                 else:
                     entry = find_entry(self.server.consent_reader(datetime.now(timezone.utc)), request_id)
                     if entry is not None:
-                        status, payload = 200, entry_body(entry)
+                        status, payload = 200, entry_body(entry, settled_lookup=self._egress_lookup())
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                 raise
             except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is an answer, never a dead connection

@@ -90,7 +90,7 @@ def test_the_worst_case_card_is_still_under_the_display_limit():
     v = dataclasses.replace(classify.decide(p, None, classify.GATED), kind="card", method="‮" * 40,
                             reattached="r" * 300, why="override:" + "⁦" * 40)
     c = card_input(p, v, [f"cookie-{i}" + "​" * 30 for i in range(190)], body_len=1 << 30, body_sha256=SHA,
-                   launch_id="L" * 200)
+                   launch_id="L" * cards.LAUNCH_MAX)
     assert len(card_display(c)) <= DISPLAY_MAX
     assert c["stripped"][-1] == f"(+{190 - cards.NAMES_SHOWN} more)" and len(c["stripped"]) == cards.NAMES_SHOWN + 1
     assert c["header_names"][-1].startswith("(+") and c["query_keys"][-1].startswith("(+")
@@ -298,7 +298,7 @@ TABLE = {
     Settled.AMBIGUOUS:  (I,                  CardState.AMBIGUOUS, I,                   I,                   I),
     Settled.ENDED:      (CardState.ENDED,) * 5,
     Settled.UNDECIDED:  (CardState.ENDED,) * 5,
-    Settled.DENIED:     (CardState.EXPIRED,  CardState.EXPIRED,   CardState.DENIED,    CardState.EXPIRED,   I),
+    Settled.DENIED:     (CardState.DENIED_OR_EXPIRED, CardState.DENIED_OR_EXPIRED, CardState.DENIED, CardState.EXPIRED, I),
     Settled.FAILED:     (CardState.FAILED,) * 5,
     Settled.INCONSISTENT: (I,) * 5,
 }
