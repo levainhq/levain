@@ -54,9 +54,11 @@ def test_the_checker_finds_a_marker_and_ignores_a_change_note() -> None:
     assert cut("nothing here", r"^- \*\*R-3 ", r"^- \*\*R-4 ") == ""
 
 
-@pytest.mark.skipif(not (DOCS / "DESIGN_REV15.md").is_file(), reason=f"{DOCS} is not on this machine (CHD2_DOCS_DIR)")
 @pytest.mark.parametrize("name,start,end", SECTIONS, ids=[f"{s[0][:6]}:{s[1][-12:]}" for s in SECTIONS])
 def test_no_open_pointer_survives_in_the_named_sections(name, start, end) -> None:
-    section = cut((DOCS / name).read_text(), start, end)
+    path = DOCS / name
+    if not path.is_file():
+        pytest.skip(f"{path} is not on this machine (CHD2_DOCS_DIR)")
+    section = cut(path.read_text(), start, end)
     assert len(section) > 200, f"{name}: the section {start!r} was not found"
     assert open_markers(section) == [], open_markers(section)

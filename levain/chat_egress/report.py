@@ -25,7 +25,7 @@ from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 
-from levain.chat_egress import wire
+from levain.chat_egress import strip, wire
 from levain.chat_egress.records import EgressRow
 
 #: `deciding_step` values of a request the decider stopped at one of its bounds, as it records them (a row exists for
@@ -34,6 +34,8 @@ CAP_STEPS = frozenset({"wall:card_cap", "wall:body_cap", "wall:body_readers", "w
 _BUSY_STEP = "decider_busy"
 _UPLOAD_PACK_CAP_CARD = "upload_pack_over_cap"   # decider.UPLOAD_PACK_OVER_CAP: the card reason of an over-cap pack body
 
+_SIGNED = strip.SIGNED_URL_READ_EXEMPT           # folded names, the form the rows store
+_MALFORMED_CARD = "malformed_card_step"
 _CRED_WALL = "wall:credential_in_query"
 _PATH_WALL = "wall:path"
 _CARD_PREFIX = "card:"
@@ -106,17 +108,21 @@ class LaunchReport:
 def wall_total(events: Iterable[wire.GlueEvent]) -> tuple[WallTotal, wire.GlueSummary | None]:
     """R15-29-2 / R15-30-3 over the parsed glue events, in file order."""
     last: wire.GlueSummary | None = None
-    detailed = 0
+    detailed = after_last = 0
     for e in events:
         if isinstance(e, wire.GlueSummary):
             last = e
+            after_last = 0
         elif isinstance(e, wire.GlueWall):
             detailed += 1
+            after_last += 1
     if last is not None and last.final:
         return WallTotal(last.total, True, False, str(last.total)), last
     if last is not None:
-        return WallTotal(last.total, False, True,
-                         f"{last.total} (from a crashed launch: the last summary, no final flush)"), last
+        text = f"{last.total} (from a crashed launch: the last summary, no final flush)"
+        if after_last:                    # walls the glue wrote after that summary are in no total: a floor, not a count
+            text = f"at least {last.total + after_last} (last summary {last.total}, plus {after_last} detailed walls after it; crashed launch, no final flush)"
+        return WallTotal(last.total, False, True, text), last
     return WallTotal(None, False, True,
                      f"unknown (launch crashed before its first summary; at least {detailed})"), None
 
@@ -142,8 +148,7 @@ def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows
             unreadable += 1
     walls, summary = wall_total(events)
 
-    from levain.chat_egress import classify
-    signed = classify._SIGNED_URL_READ_EXEMPT
+    signed = _SIGNED
     verdicts: Counter[str] = Counter()
     dwalls: Counter[str] = Counter()
     cards: Counter[str] = Counter()
@@ -171,6 +176,9 @@ def build(rows: Sequence[EgressRow], glue_lines: Iterable[bytes], duplicate_rows
         elif step.startswith(_CARD_PREFIX):
             _, _, rest = step.partition(":")
             why, _, answer = rest.rpartition(":")
+            if not why or not answer:
+                cards[_MALFORMED_CARD] += 1
+                continue
             cards[f"{why}:{answer}"] += 1
             if why == "credential_in_query":
                 cred_cards += 1

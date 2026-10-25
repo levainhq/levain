@@ -92,6 +92,7 @@ def run_curl(L, tmp_path):
 
 
 def run_requests(L, tmp_path):
+    pytest.importorskip("requests")
     code = ("import requests,sys; h=dict(); \n"
             "import json; hs=json.loads(sys.argv[2]); s=requests.Session(); s.trust_env=False\n"
             "r=s.get(sys.argv[1], headers=hs, proxies={'http': sys.argv[3]}, timeout=20); print(r.status_code)")

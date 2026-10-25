@@ -159,8 +159,12 @@ def test_a_killed_glue_leaves_no_final_flush_and_the_report_says_unknown(make_or
     os.close(L.life_w)
     L.d.close(timeout_s=10)
     r = report.build_from_files(L.records.rows(L.launch_id), L.events)
-    assert r.walls.crashed and r.walls.total is None
-    assert r.walls.text == "unknown (launch crashed before its first summary; at least 5)"
+    # the glue flushes a summary at a minute boundary: a kill after one reads as that summary (plus the later walls)
+    assert r.walls.crashed and not r.walls.exact
+    if r.walls.total is None:
+        assert r.walls.text == "unknown (launch crashed before its first summary; at least 5)"
+    else:
+        assert r.walls.text.startswith(("at least 5 ", f"{r.walls.total} (from a crashed launch")), r.walls.text
 
 
 @pytest.mark.chat_egress_srt
@@ -229,3 +233,14 @@ def test_a_decider_busy_row_is_a_cap_wall() -> None:
     """The decider stores `decider_busy` bare (no `wall:` prefix): `_on_req` hands `_inline` the step name itself."""
     r = report.build([_row(1, "decider_busy"), _row(2, "wall:card_cap")], [])
     assert r.cap_walls == 2 and r.decider_walls == {"decider_busy": 1, "card_cap": 1}, r.text()
+
+
+def test_walls_after_the_last_summary_of_a_crashed_launch_read_as_at_least() -> None:
+    lines = [_summary(2, final=False), _wall(), _wall(), _wall()]
+    r = report.build([], lines)
+    assert r.walls.crashed and not r.walls.exact and r.walls.text.startswith("at least 5 "), r.walls.text
+
+
+def test_a_malformed_card_step_counts_under_its_own_key() -> None:
+    r = report.build([_row(1, "card:"), _row(2, "card:nocolon"), _row(3, "card:body:denied")], [])
+    assert r.cards == {"malformed_card_step": 2, "body:denied": 1}, r.cards
