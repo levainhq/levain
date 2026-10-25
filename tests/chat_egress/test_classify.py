@@ -487,3 +487,31 @@ def test_f4_an_override_is_shown_as_its_rfc_9110_token():
     assert run(frame(headers={"x-http-method-override": "x.y_z~1"}), GATED, False).method == "X.Y_Z~1"
     for bad in ("DE LETE", "A" * 21, "POſT", "GET,PUT", ""):
         assert run(frame(headers={"x-http-method-override": bad}), GATED, False).method == classify.AMBIGUOUS_METHOD, bad
+
+
+def test_every_name_strip_treats_as_a_query_credential_classify_marks_too():
+    """Item 5 (head ruling on session A): classify keeps its private query-credential backstop, which matches MORE
+    names than strip.py's (`x auth`, `x-sig`, `x-amz-date`), and the wider set fails closed. The two copies may
+    drift only in that direction: every name strip.py's `query_name_is_credential` takes, classify marks. One signed
+    table for both is post-1.0."""
+    from levain.chat_egress import strip
+
+    def marks(name: str) -> bool:
+        return classify._credential_like(parse.fold_name(name))
+
+    # the listed names, the exact names and the backstop words are each in classify's reading
+    listed = set(strip.CRED_STRIP_QUERY) | set(strip.QUERY_BACKSTOP_EXACT) | set(strip.SIGNED_URL_READ_EXEMPT)
+    assert [n for n in sorted(listed) if strip.query_name_is_credential(n) and not marks(n)] == []
+    # a pagination name classify spares, strip spares too (else strip would take a name classify lets through)
+    assert classify._PAGINATION_NOT_CREDENTIALS <= {parse.fold_name(n) for n in strip.PAGINATION_NOT_CREDENTIALS}
+    # the backstop: each word at each boundary strip's `(?:^|-)` accepts, with and without a tail
+    heads = ("", "-", "x-", "a-b-", "X-", "1-", "x_-", "-x-")
+    tails = ("", "x", "-x", "_1", "s", " y", "Z")
+    words = [w for w in strip.BACKSTOP_WORDS] + [w.upper() for w in strip.BACKSTOP_WORDS] + sorted(listed)
+    corpus = [h + w + t for h in heads for w in words for t in tails]
+    taken = [n for n in corpus if strip.query_name_is_credential(n)]
+    assert len(taken) > len(corpus) // 2          # the sweep is not vacuous
+    assert [n for n in taken if not marks(n)] == []
+    # and the drift that exists is the safe one: classify marks these, strip does not
+    for wider in ("x auth", "x*token", "x-sig", "x-amz-date"):
+        assert marks(wider) and not strip.query_name_is_credential(wider), wider
