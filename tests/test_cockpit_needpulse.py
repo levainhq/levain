@@ -1,4 +1,4 @@
-"""The open decision mark breathes (Phill 10-25): the badge (and the desk's leader line) carry .tv-needpulse while a decision is open, the class is
+"""The open decision mark breathes (Phill 10-25): the badge (and the desk's leader line) carry .tv-needpulse once per NEW open decision (the badge breathes for the keyframe's cycles, then sits still), the class is
 on nothing once needs_open is 0 or absent, and a reduced-motion phone gets today's still mark. Real page in headless Chrome."""
 from __future__ import annotations
 
