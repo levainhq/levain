@@ -4,8 +4,8 @@ CONTROL appends an event here BEFORE it pushes it to any ``SESSION-EVENTS`` stre
 canonical JSON object per line, ``seq`` assigned here (increasing per journal, from 1), each append written and fsynced
 before :meth:`EventJournal.append` returns. The journal's identity is ``L/sessions/events.meta`` = canonical
 ``{journal_id}`` (a random 32-hex id made when the meta is created or the journal's lines are lost: temp + fsync +
-rename + fsync of the directory); a stream's ``hello`` carries it, so a client holding a cursor from another journal (restored, recreated)
-sees the id change. Both files are CONTROL's, 0600.
+rename + fsync of the directory); a stream's ``hello`` carries it, so a client holding a cursor from another journal
+(restored, recreated) sees the id change. Both files are CONTROL's, 0600.
 
 The three kinds this module keeps (§3.6's tagged union; ``seq`` and ``at`` on every one):
 
@@ -17,13 +17,14 @@ and the ones a stream sends but never stores: ``{kind:"hello", journal_id, oldes
 to ``SESSION-EVENTS`` carries it), ``{kind:"gap", oldest_seq}``, sent first when the cursor is older than the oldest
 kept event and an event past the cursor was pruned, ``{kind:"reset", newest_seq}``, the only frame after the hello
 of a stream whose cursor is past the newest seq (the client starts again from 0), and ``{kind:"error", error}``, the
-last frame of a stream that cannot go on (``events-unavailable``: the journal was poisoned). ``oldest_seq`` / ``newest_seq`` are 0 while nothing
-is kept.
+last frame of a stream that cannot go on (``events-unavailable``: the journal was poisoned). ``oldest_seq`` /
+``newest_seq`` are 0 while nothing is kept.
 
 **Start** (:meth:`EventJournal.start`): the meta is read (absent: made; one that does not parse refuses
 ``events-corrupt``; a kept meta over a journal file that is absent or holds no complete line is replaced by a new
-id, since that journal's lines are lost and ``seq`` starts again from 1); the journal is opened ``O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW`` and read whole. A last line with
-no newline is a torn append that was never acknowledged: cut off (``ftruncate``, fsync) before anything is appended.
+id, since that journal's lines are lost and ``seq`` starts again from 1); the journal is opened
+``O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW`` and read whole. A last line with no newline is a torn append that was
+never acknowledged: cut off (``ftruncate``, fsync) before anything is appended.
 Any other line that does not parse, is not its own canonical encoding, is not one of the three kinds, or does not
 raise ``seq`` refuses the start ``events-corrupt``: CONTROL never serves a journal it cannot read whole.
 
@@ -417,13 +418,13 @@ class EventJournal:
 
     def open_stream(self, after_seq: int) -> Tuple[Dict[str, object], Optional[Dict[str, object]],
                                                    List[Tuple[int, bytes]], int]:
-        """``SESSION-EVENTS {after_seq}``'s opening, read at one instant: (the hello, the lead frame or None, the replay = every
-        kept event with ``seq > after_seq`` as (seq, line), the cursor the stream continues from = the replay's last
-        seq, else ``after_seq``). The replay is copied under the lock the hello is read under (L3 r1 fix 4), so a
-        prune before the stream sends it cannot drop an event the hello advertised. The lead frame is the gap, due when
-        an event with ``seq > after_seq`` was pruned (the cursor is older than the oldest kept event and the journal's
-        first seq (1) is past it), or ``{kind:"reset", newest_seq}`` when the cursor is past the newest seq, with no
-        replay: the stream sends it and ends."""
+        """``SESSION-EVENTS {after_seq}``'s opening, read at one instant: (the hello, the lead frame or None, the
+        replay = every kept event with ``seq > after_seq`` as (seq, line), the cursor the stream continues from = the
+        replay's last seq, else ``after_seq``). The replay is copied under the lock the hello is read under (L3 r1
+        fix 4), so a prune before the stream sends it cannot drop an event the hello advertised. The lead frame is the
+        gap, due when an event with ``seq > after_seq`` was pruned (the cursor is older than the oldest kept event and
+        the journal's first seq (1) is past it), or ``{kind:"reset", newest_seq}`` when the cursor is past the newest
+        seq, with no replay: the stream sends it and ends."""
         with self.lock:
             self._open_or_raise()
             hello = self._hello()

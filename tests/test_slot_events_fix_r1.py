@@ -147,7 +147,7 @@ def test_a_prune_after_the_hello_never_drops_an_advertised_event(served):
     c.close()
 
 
-# ---- item 5: the data file lost, the meta kept -------------------------------------------------------------------------
+# ---- item 5: the data file lost, the meta kept ---------------------------------------------------------------------
 
 @pytest.mark.parametrize("loss", ["unlinked", "emptied"])
 def test_a_lost_journal_under_a_kept_meta_is_a_new_journal(erig, loss):
@@ -236,7 +236,7 @@ def test_a_cancel_byte_ends_a_stream_blocked_on_a_full_buffer(erig):
         served.stop()
 
 
-# ---- item 7: an owed event carried over an event-less write ------------------------------------------------------------
+# ---- item 7: an owed event carried over an event-less write --------------------------------------------------------
 
 def test_an_eof_write_over_an_owed_generation_carries_its_event(erig):
     """The RETAINED generation's append fails (owed); the lease then ends, and its `lease_live:false` write (the revoke

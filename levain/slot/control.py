@@ -891,8 +891,8 @@ class Control:
     whose event is unwritten. The revoke path is the exception (DECISION): ``lease_live:false`` and a move into REVOKED
     still land on an owed session, so a broken journal never keeps a session live. The ``lease_live:false`` write
     carries the owed generation's ``event_kind``, so the generation it makes bears that event (appended with it, or owed
-    and repaired from it: L3 r1 fix 7); a move
-    into REVOKED makes the REVOKED generation the one owed, and the generation it overwrote never gets its event. CONTROL's start re-emits, from each record, the
+    and repaired from it: L3 r1 fix 7); a move into REVOKED makes the REVOKED generation the one owed, and the
+    generation it overwrote never gets its event. CONTROL's start re-emits, from each record, the
     event its generation is owed by its stored ``event_kind`` (PURGED records skipped)."""
 
     def __init__(self, store: StateStore, operator_uid: int, *,
@@ -1119,7 +1119,7 @@ class Control:
         revoke_path = changes.get("state") == R.REVOKED or set(changes) == {"lease_live", "event_kind"}
         if self._pay_owed(rec, revoke_path=revoke_path) and changes.get("event_kind") == "none":
             # L3 r1 fix 7 (complement 1): an event-less revoke-path write over an owed generation carries that
-            # generation's kind, so its event is owed by the new generation (and repaired from it), never forgotten
+            # generation's kind, so the new generation bears its event (the start pass repairs it), never forgotten
             changes["event_kind"] = rec.event_kind
         new = replace(rec, generation=rec.generation + 1, updated_at=R.timestamp(self._clock()), **changes)
         self._put(new)
@@ -2130,11 +2130,11 @@ class Control:
     def _op_session_events(self, conn: Conn, args: dict) -> dict[str, object]:
         """``SESSION-EVENTS {after_seq}``: answered with the stream's ``hello`` (``{kind:"hello", journal_id, oldest_seq,
         newest_seq}`` beside ``id`` / ``ok``), after which the connection is the stream (:class:`ControlServer`): the
-        ``gap`` frame when one is due, then every kept event with ``seq > after_seq`` (read when the hello is), then each
-        new one as it is appended, one canonical JSON object per frame, byte-equal to its journal line; an ``after_seq``
-        past the newest seq gets ``{kind:"reset", newest_seq}`` alone, and a journal poisoned under the stream
-        ``{kind:"error", error}`` last. Nothing the peer sends is read as a verb again: any byte, or its EOF, ends the
-        stream (DECISION). No journal, or a poisoned one: ``events-unavailable``."""
+        ``gap`` frame when one is due, then every kept event with ``seq > after_seq`` (read when the hello is), then
+        each new one as it is appended, one canonical JSON object per frame, byte-equal to its journal line; an
+        ``after_seq`` past the newest seq gets ``{kind:"reset", newest_seq}`` alone, and a journal poisoned under the
+        stream ``{kind:"error", error}`` last. Nothing the peer sends is read as a verb again: any byte, or its EOF,
+        ends the stream (DECISION). No journal, or a poisoned one: ``events-unavailable``."""
         after = R._uint(args["after_seq"], "after_seq")
         if self.events is None:
             raise Refused("events-unavailable", "CONTROL keeps no event journal")
@@ -2805,8 +2805,8 @@ class ControlServer:
                 opening: "tuple[dict[str, object] | None, list[tuple[int, bytes]], int]") -> None:
         """The SESSION-EVENTS stream (:meth:`Control._op_session_events`) until the peer sends anything or ends, the
         journal closes (CONTROL's stop) or a send fails. The gap first, then the replay the opening pinned, then events
-        by ``seq`` (a reset lead frame is sent alone, then the stream ends); a journal poisoned under the stream ends it with ``{kind:"error", error:"events-unavailable"}``
-        (L3 r1 fix 3)."""
+        by ``seq`` (a reset lead frame is sent alone, then the stream ends); a journal poisoned under the stream ends
+        it with ``{kind:"error", error:"events-unavailable"}`` (L3 r1 fix 3)."""
         lead, replay, cursor = opening
         journal = self.control.events
         # non-blocking from here to the close: macOS blocks a unix-socket send() on a full buffer even with
