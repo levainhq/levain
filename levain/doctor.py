@@ -151,6 +151,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_dispatch_adoption_rules())
     core.extend(_check_dispatch_verifiers())
     core.extend(_check_slot_isolation())
+    core.extend(_check_slot_limits())
     for r in core:
         _emit(r)
     print(spend_cap_note())
@@ -491,6 +492,82 @@ def _slot_rows(store: Path, layout: Any, R: Any, Refused: Any) -> list[CheckResu
                             "The pool is below its configured counts; its install helper replenishes it.")]
     return [CheckResult("agent slots", True, detail + (f"; not usable (extra): {', '.join(bad)}" if bad else "")
                         + note)]
+
+
+def _qbroker_running(host: str) -> bool | None:
+    """Whether the queue broker's unit runs, as the operator can see it: ``systemctl is-active`` (Linux) or
+    ``launchctl print system/<label>``'s ``state = running`` (macOS). ``None`` when it cannot be told."""
+    import subprocess
+
+    from levain.launch import child_env
+    from levain.slot import units
+
+    svc = units.by_name("qbroker")
+    argv = (["systemctl", "is-active", "--quiet", units.systemd_name(svc)] if host == "linux"
+            else ["/bin/launchctl", "print", f"system/{units.launchd_label(svc)}"])
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=10, env=child_env())
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if host == "linux":
+        return r.returncode == 0 if r.returncode in (0, 3) else None    # 3: inactive or failed; others: unknown
+    if r.returncode != 0:
+        return False if r.returncode == 113 else None                    # 113: no such service loaded
+    return any(line.strip() == "state = running" for line in r.stdout.splitlines())
+
+
+def _check_slot_limits(*, host: str | None = None, store: Path | None = None, owner: int = 0,
+                       running: Any = None) -> list[CheckResult]:
+    """The ``slot limits`` row: the limits each agent's slot sessions run under, read by the queue broker's own
+    reader (:class:`levain.qbroker.limits.PolicyLimits`) from ``L/policy/limits`` (root 0644, readable by the
+    operator), so the row and the broker cannot disagree: per agent, and whether they come from the file or the
+    defaults. FAIL when the file is present but unusable (the broker then refuses every limited slot call), with the
+    broker's own reason. WARN when the host has a slot pool and the queue broker is not running (stated, not
+    enforced). No row before the isolation install (the ``agent sessions`` row says so). The counts are not read:
+    they live in the broker's own 0700 directory. ``owner``/``running``: a test's seams."""
+    import logging
+
+    from levain.consent import limits as CL
+    from levain.qbroker.limits import LimitsUnavailable, PolicyLimits
+    from levain.slot import layout
+
+    name = "slot limits"
+    if host is None:
+        host = "darwin" if sys.platform == "darwin" else "linux"
+    store = store if store is not None else layout.STORE.get(host)
+    if store is None or not (store / "policy").is_dir():
+        return []
+    path = store / "policy" / layout.policy_limits_path(host).name
+    reader = PolicyLimits(store / "policy", owner=owner)
+    broker_log = logging.getLogger("levain.qbroker")
+    quiet = broker_log.disabled
+    broker_log.disabled = True        # the reader logs an unusable file for the broker's log; this row says it instead
+    try:
+        shown = []
+        for agent in CL.AGENTS:
+            lim = reader(agent, "doctor")
+            shown.append(f"{agent}: " + ", ".join(f"{k.replace('_', ' ')} {CL._num_text(k, lim[k])}"
+                                                  for k in CL.SLOT_KINDS))
+    except LimitsUnavailable as exc:
+        return [CheckResult(name, False, f"{exc.reason}. Until it is, the queue broker refuses every slot tool call "
+                                         "it gates (limits-failed)",
+                            "Write the limits again with `levain limits set --slots <agent|default> <kind> <value>` "
+                            "(the install helper replaces the file whole).")]
+    except Exception as exc:  # noqa: BLE001 - a row that cannot be built is said, never a crash
+        return [CheckResult(name, True, f"could not be read ({type(exc).__name__}: {exc})",
+                            f"Look at {path}.", warn=True)]
+    finally:
+        broker_log.disabled = quiet
+    src = str(path) if os.path.lexists(path) else "defaults (no file)"
+    detail = f"{'; '.join(shown)} [{src}]"
+    if (store / "policy" / "pool").exists():
+        up = (running or _qbroker_running)(host)
+        if up is not True:
+            why = "is not running" if up is False else "could not be checked"
+            return [CheckResult(name, True, f"{detail}; the queue broker {why}, so these limits are not enforced",
+                                "Start the Levain queue broker unit (levain-qbroker on Linux, com.levain.qbroker on macOS).",
+                                warn=True)]
+    return [CheckResult(name, True, detail)]
 
 
 def _check_host_awake() -> list[CheckResult]:
