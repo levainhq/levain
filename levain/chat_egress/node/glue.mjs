@@ -317,7 +317,7 @@ async function main(argv) {
   const { createDecider } = await import(SRT + 'decider-client.js');
   const { keepFlushedHeaderBatches, writeHeadsAsLatin1 } = await import(SRT + 'emitted-connection.js');
   const { createHttpProxyServer, markHandedInConnection } = await import(SRT + 'http-proxy.js');
-  const { createMitmCA } = await import(SRT + 'mitm-ca.js');
+  const { createMitmCA, disposeMitmCASync } = await import(SRT + 'mitm-ca.js');
   const { canonicalizeHost } = await import(SRT + 'parent-proxy.js');
   const { createResolvedAddressGuard } = await import(SRT + 'resolved-address-guard.js');
   const { createServer: createNetServer, Socket: NetSocket } = await import('node:net');
@@ -360,6 +360,9 @@ async function main(argv) {
     caCertPem: /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/.exec(pem)[0] + '\n',
     caKeyPem: /-----BEGIN (?:RSA )?PRIVATE KEY-----[\s\S]+?-----END (?:RSA )?PRIVATE KEY-----/.exec(pem)[0] + '\n',
   });
+  // srt writes a trust bundle (certificates only) into a fresh mkdtemp for every CA it is given; it is removed at
+  // every exit that runs handlers (process.exit included), never left per launch. A SIGKILL leaves it.
+  process.on('exit', () => disposeMitmCASync(mitmCA));
   const up = opt('--upstream-ca');
   await decider.hello;
 
@@ -380,7 +383,7 @@ async function main(argv) {
   const listener = createNetServer(s => {
     accepted.add(s); s.once('close', () => accepted.delete(s));
     markHandedInConnection(s); writeHeadsAsLatin1(s); server.emit('connection', s); keepFlushedHeaderBatches(s);
-  }).listen({ fd: Number(need('--listen-fd')) }, () => console.error(`glue: serving node=${process.version}`));
+  }).listen({ fd: Number(need('--listen-fd')) }, () => console.error(`glue: serving node=${process.version} bundle=${mitmCA.trustBundlePath}`));
 
   // The clean end (the lifeline's EOF; S8 closes its end) and its order are in the header. The bound timer is NOT
   // unref'd: the process never runs out of handles into a silent exit 0 without the final flush.
