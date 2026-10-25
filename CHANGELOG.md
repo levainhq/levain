@@ -21,6 +21,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   replaces a key this browser already holds. No QR code is drawn: the link is the offer.
 
 ### Changed
+- **The seed memory files no longer count layers.** `memory.md` and `partnership.md` now say the agent's memory is never a log
+  plus a memory file: a governed, versioned state machine (an append-only episode log, consolidated by one writer into
+  continuity, an immune system that decides what may graduate, and a pattern tier recalled on cue).
 - **Levain now requires anneal-memory 1.0.2.** anneal 1.0.2 forms no association links and ignores the affect
   input; the seed's wrap steps no longer say `prepare_wrap` returns association context, so a fresh install
   reads its 1.0.2 migration proposal as already reconciled instead of pending.
