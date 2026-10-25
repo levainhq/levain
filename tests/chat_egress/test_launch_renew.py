@@ -6,6 +6,9 @@ within `RENEW_DUE` reaches `on_renew_due` once, with the launch id; a failing ca
 
 from __future__ import annotations
 
+import os
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -15,7 +18,7 @@ from levain.chat_egress import keys, renew
 from levain.chat_egress import launch as lm
 from levain.cockpit.consent import utc_stamp
 
-from .test_launch import Origin, _start
+from .test_launch import Origin, _node_children, _start
 
 NOW = datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)
 
@@ -78,3 +81,55 @@ def test_a_launch_pings_once_for_a_key_due_and_a_failing_ping_does_not_end_it(tm
     e2 = _start(tmp_path / "b", origin, monkeypatch)
     out = lm.stop_egress(e2)
     assert out.glue_exit == 0
+
+
+# --- S8b r1 item 3: renewal data validated before any allocation; the ping off the start path ----------------------
+
+def _fds() -> set[int]:
+    return {int(x) for x in os.listdir("/dev/fd")} - {max(int(x) for x in os.listdir("/dev/fd"))}
+
+
+@pytest.mark.chat_egress_srt
+@pytest.mark.parametrize("bad", ["naive-now", "no-policy"])
+def test_bad_renewal_data_is_refused_before_anything_is_allocated(bad, tmp_path, origin, monkeypatch) -> None:
+    real = lm.start_egress
+    auth = _authority(**{"k-soon": timedelta(days=2)}) if bad == "naive-now" else SimpleNamespace()
+    when = NOW.replace(tzinfo=None) if bad == "naive-now" else NOW
+
+    def start(**kw):
+        return real(**{**kw, "routes": ROUTES, "authority": auth, "on_renew_due": lambda lid, due: None, "now": when})
+    monkeypatch.setattr(lm, "start_egress", start)
+    before, kids = _fds(), _node_children()
+    with pytest.raises(lm.EgressRefused, match="renew") as got:
+        lm.stop_egress(_start(tmp_path, origin, monkeypatch))
+    print(f"RUN S8D item 3 {bad}: {got.value}")
+    assert _fds() == before and len(_node_children()) == len(kids)
+    assert not (tmp_path / "events.jsonl.glue-stderr").exists()        # refused before the glue's files exist
+
+
+@pytest.mark.chat_egress_srt
+def test_a_blocking_renew_ping_does_not_hold_the_launch(tmp_path, origin, monkeypatch) -> None:
+    real = lm.start_egress
+    release, seen = threading.Event(), []
+
+    def slow(lid, due):
+        seen.append(lid)
+        release.wait(20.0)
+        raise RuntimeError("push timed out")
+
+    def start(**kw):
+        return real(**{**kw, "routes": ROUTES, "authority": _authority(**{"k-soon": timedelta(days=2)}),
+                       "on_renew_due": slow, "now": NOW})
+    monkeypatch.setattr(lm, "start_egress", start)
+    t0 = time.monotonic()
+    e = _start(tmp_path, origin, monkeypatch)
+    took = time.monotonic() - t0
+    try:
+        print(f"RUN S8D item 3 blocking ping: start_egress returned after {took:.2f}s; ping called {len(seen)}x")
+        assert took < lm.RENEW_PING_WAIT_S + 5.0 and seen == [e.launch_id]
+        assert e.renew_ping is not None and e.renew_ping.is_alive()
+    finally:
+        release.set()
+        out = lm.stop_egress(e)
+    e.renew_ping.join(5.0)
+    assert not e.renew_ping.is_alive() and out.glue_exit == 0

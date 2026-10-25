@@ -12,13 +12,16 @@
   4a. the mode read once (`launch_mode`): a value outside `classify.MODES` is refused. The session header and the
      egress digest are derived from that read, never from a second input (the digest fixes the mode at launch; a
      `LiveSetting` is still read live per request by the decider: Q-R15-9);
+  4b. 19a: given the authority replay the routes were built from, the keyed records expiring within
+     `renew.RENEW_DUE` are computed (a naive `now` or an authority that does not read is refused here);
   5. the listener pair: the HTTP(S) listener (handed to the glue as an fd) and the SOCKS refuser (`socks`), both on
      127.0.0.1; the decider and observation socket pairs, the CA pipe and the lifeline pipe;
   6. the glue spawned with `env={}` (R15-10-A10, R15-12-B6) and only those fds; the CA (key + cert PEM, held by the
      caller in memory) written into its pipe and the pipe closed, so the key never touches the file system here;
   7. the decider service (`decider.Decider`) on Levain's ends, then the glue's `serving` line awaited;
-  8. 19a: given the authority replay the routes were built from, the keyed records expiring within
-     `renew.RENEW_DUE` go to `on_renew_due` once (a failing callback is logged, the launch stands).
+  8. once the EgressLaunch owns everything: a non-empty 4b list goes to `on_renew_due` once, on its own daemon
+     thread (`EgressLaunch.renew_ping`), waited for at most `RENEW_PING_WAIT_S`; a callback that raises or is still
+     running then is logged, and the launch stands either way.
 A failure at or after step 5's first allocation releases everything allocated so far (the glue killed and reaped
 first, then the decider, then every descriptor and the SOCKS listener), each close attempted whatever an earlier one
 raised; an OSError up to the CA write is refused as EgressRefused, a later failure propagates as itself.
@@ -45,6 +48,7 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -72,6 +76,7 @@ GLUE_SEAMS = frozenset({"--tls-ports", "--http-ports", "--carve", "--resolve-map
 NODE_VERSION_TIMEOUT_S = 10.0
 SERVING_TIMEOUT_S = 10.0
 GLUE_EXIT_TIMEOUT_S = 10.0
+RENEW_PING_WAIT_S = 2.0         # [judged by lane-chd2-s8d, 10-25]: a push's round trip, not its timeout
 
 log = logging.getLogger(__name__)
 
@@ -170,6 +175,7 @@ class EgressLaunch:
     stderr: Path
     life_w: int | None = field(default=None, repr=False)
     renew_due: tuple[renew.RenewDue, ...] = ()
+    renew_ping: threading.Thread | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -201,6 +207,12 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, eve
     if not events.name:
         raise EgressRefused(f"the events path names no file: {str(events)!r}")
     stderr = events.with_name(events.name + ".glue-stderr")
+    due: list[renew.RenewDue] = []
+    if authority is not None:
+        try:
+            due = renew.renew_due(authority, routes, now=now or datetime.now(timezone.utc))
+        except Exception as exc:  # noqa: BLE001 - nothing is allocated yet: refused whole
+            raise EgressRefused(f"the launch's renew-due data did not read: {type(exc).__name__}: {exc}") from None
     records = rec.EgressRecords(store)
     placements = json.dumps(keys.credential_placements(routes), separators=(",", ":"))
     failures: list[str] = []
@@ -265,20 +277,33 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_prefix: Path, eve
             if proc.poll() is not None or time.monotonic() > deadline:
                 raise EgressRefused(f"the egress glue did not serve (exit {proc.poll()})")
             time.sleep(0.025)
-        # 19a: each keyed record's expiry read from the authority replay the routes came from (its one home)
-        due = renew.renew_due(authority, routes, now=now or datetime.now(timezone.utc)) if authority is not None else []
         owned.pop_all()
-    # a renew ping that fails is logged and never ends the launch
+    e = EgressLaunch(launch_id=launch_id, store=store, records=records, proc=proc, decider=decider,
+                     socks=socks_srv, http_port=http_port, socks_port=socks_srv.port, node_version=node_version,
+                     header=session_header(open_network=open_network, node_version=node_version),
+                     egress_digest=egress_digest(open_network=open_network), events=events, stderr=stderr,
+                     life_w=life_w, renew_due=tuple(due))
     if due and on_renew_due is not None:
+        e.renew_ping = _renew_ping(on_renew_due, launch_id, due)
+    return e
+
+
+def _renew_ping(on_renew_due: Callable[[str, list[renew.RenewDue]], None], launch_id: str,
+                due: list[renew.RenewDue]) -> threading.Thread:
+    """`on_renew_due(launch_id, due)` on its own daemon thread, waited for at most `RENEW_PING_WAIT_S`: a ping that
+    raises, or is still running then, is logged and never ends the launch."""
+    def run() -> None:
         try:
-            on_renew_due(launch_id, due)
-        except Exception as exc:  # noqa: BLE001
+            on_renew_due(launch_id, list(due))
+        except BaseException as exc:  # noqa: BLE001 - a ping never ends the launch
             log.warning("renew-due ping for %s failed: %s", launch_id, type(exc).__name__)
-    return EgressLaunch(launch_id=launch_id, store=store, records=records, proc=proc, decider=decider,
-                        socks=socks_srv, http_port=http_port, socks_port=socks_srv.port, node_version=node_version,
-                        header=session_header(open_network=open_network, node_version=node_version),
-                        egress_digest=egress_digest(open_network=open_network), events=events, stderr=stderr,
-                        life_w=life_w, renew_due=tuple(due))
+
+    t = threading.Thread(target=run, name="levain-renew-ping", daemon=True)
+    t.start()
+    t.join(RENEW_PING_WAIT_S)
+    if t.is_alive():
+        log.warning("renew-due ping for %s still running after %ss; the launch goes on", launch_id, RENEW_PING_WAIT_S)
+    return t
 
 
 def _guarded(failures: list[str], what: str, step: Callable[[], Any]) -> None:
