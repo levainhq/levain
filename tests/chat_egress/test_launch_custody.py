@@ -52,17 +52,19 @@ def private_key_files(root: Path) -> list[Path]:
 
 
 def open_regular_files(pid: int) -> list[Path]:
-    """The regular files ``pid`` holds open: ``/proc/<pid>/fd`` where it exists (Linux has no ``/usr/sbin/lsof``
-    on a stock runner), else ``lsof``."""
-    fds = Path("/proc") / str(pid) / "fd"
-    if fds.is_dir():
-        paths = []
-        for fd in fds.iterdir():
+    """The regular files ``pid`` holds open: through procfs where this host has it (Linux has no
+    ``/usr/sbin/lsof`` on a stock runner), else ``lsof``. On procfs each result is the ``/proc/<pid>/fd/N``
+    link itself, so reading it reads the open inode: a key unlinked while held open is still found. A pid
+    with no fd directory on a procfs host raises (an exited process fails the test, never skips it)."""
+    if Path("/proc/self/fd").is_dir():
+        held = []
+        for fd in (Path("/proc") / str(pid) / "fd").iterdir():
             try:
-                paths.append(Path(os.readlink(fd)))
+                if stat.S_ISREG(fd.stat().st_mode):
+                    held.append(fd)
             except OSError:
-                pass
-        return [p for p in paths if p.is_file()]
+                pass                                   # closed between the listing and the stat
+        return held
     lsof = "/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else shutil.which("lsof")
     if lsof is None:
         pytest.skip("neither /proc/<pid>/fd nor lsof is here")
