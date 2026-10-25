@@ -150,6 +150,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_compat_set(install))
     core.extend(_check_consent_hooks(install))
     core.extend(_check_consent_limits())
+    core.extend(_check_chat_network())
     core.extend(_check_dispatch_adoption_rules())
     core.extend(_check_dispatch_verifiers())
     core.extend(_check_slot_isolation())
@@ -317,6 +318,33 @@ def spend_cap_note() -> str:
     so it carries no OK / WARN / FAIL badge and never touches the exit code. The per-credential KEY-LIMIT rows are
     not here."""
     return f"  note: {SPEND_CAP_WORDS} Sizing: {SPEND_CAP_SIZING_LINE}"
+
+
+def _check_chat_network() -> list[CheckResult]:
+    """Chat network's Node dependency (P-5): the Node major and the srt version, a hash mismatch refused. Not set up
+    is said in words (only chat needs Node), never a failure."""
+    import shutil
+
+    from levain.chat_egress import srt_pin
+    from levain.chat_egress.launch import EgressRefused, check_node
+
+    name = "chat network"
+    fix = "Run `levain chat setup` again (with Node 26 on PATH)."
+    try:
+        prefix = srt_pin.default_prefix()
+        set_up = (prefix / srt_pin.STAMP).exists()
+    except (OSError, RuntimeError) as exc:              # RuntimeError: a symlink loop under Python 3.12's resolve
+        return [CheckResult(name, False, f"the chat network install could not be read: {type(exc).__name__}: {exc}",
+                            fix)]
+    if not set_up:
+        return [CheckResult(name, True, f"not set up at {prefix} (only chat needs Node 26; `levain chat setup` "
+                                        "installs its pinned dependency)", neutral=True)]
+    try:
+        node = check_node(shutil.which("node") or "node")
+        st = srt_pin.check(prefix)
+    except (EgressRefused, srt_pin.SrtProblem) as exc:
+        return [CheckResult(name, False, str(exc), fix)]
+    return [CheckResult(name, True, f"node {node}, srt {st.version} at {st.prefix}")]
 
 
 def _check_consent_limits() -> list[CheckResult]:

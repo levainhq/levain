@@ -1,0 +1,9 @@
+{
+  "name": "levain-chat-egress",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The pinned Node dependency of Levain's chat egress (installed by `npm ci --ignore-scripts`).",
+  "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "0.0.81"
+  }
+}

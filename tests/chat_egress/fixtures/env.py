@@ -51,6 +51,35 @@ def srt_skip_reason() -> str | None:
     return None
 
 
+#: set once per session by conftest's `_srt_prefix_factory` (pytest's tmp_path_factory); `srt_prefix` builds under it
+_FACTORY = None
+_PREFIX: list[Path] = []
+
+
+def srt_prefix() -> Path:
+    """A Levain-shaped srt install `srt_pin.check` accepts, built once per session: the real installed tree that
+    `srt_package_dir` names (its whole `node_modules`), copied beside the shipped package.json + lock, and stamped by
+    `srt_pin.write_stamp` (setup's own last step). A test that changes it works on its own copy."""
+    if not _PREFIX:
+        from levain.chat_egress import srt_pin
+
+        pkg = srt_package_dir()
+        prefix = _FACTORY.mktemp("srt-prefix") / "chat-node"
+        shutil.copytree(pkg.parents[1], prefix / "node_modules", symlinks=True)     # <prefix>/node_modules/@scope/pkg
+        for name in ("package.json", "package-lock.json"):
+            shutil.copyfile(srt_pin.NODE_DIR / name, prefix / name)
+        srt_pin.write_stamp(prefix)
+        srt_pin.check(prefix)
+        _PREFIX.append(prefix)
+    return _PREFIX[0]
+
+
+def srt_prefix_copy(dest: Path) -> Path:
+    """Its own copy of `srt_prefix()` at `dest`, for a test that changes files in it."""
+    shutil.copytree(srt_prefix(), dest, symlinks=True)
+    return dest
+
+
 def git_backend() -> str | None:
     import subprocess
     git = shutil.which("git")

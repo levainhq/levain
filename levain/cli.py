@@ -3098,6 +3098,15 @@ def _add_chat_parser(subparsers: argparse._SubParsersAction, common: object) -> 
     lst = key_sub.add_parser("list", help="List the setup records the authority log holds.")
     common(lst)
     lst.set_defaults(func=_cmd_chat_key_list)
+    csetup = chat_sub.add_parser(
+        "setup", help="Install the pinned Node dependency chat network needs (Node 26 and npm on PATH).",
+        description="Installs @anthropic-ai/sandbox-runtime exactly as the lockfile this Levain ships pins it (each "
+                    "package by its sha512 integrity) with `npm ci --ignore-scripts` into $LEVAIN_HOME/chat-node "
+                    "(else ~/.levain/chat-node), never globally, then checks every name Levain's glue imports from "
+                    "it. `levain doctor` re-checks the install. Only chat needs Node; the rest of Levain is Python.")
+    csetup.add_argument("--offline", action="store_true", help="Install from the npm cache only.")
+    common(csetup)
+    csetup.set_defaults(func=_cmd_chat_setup)
 
 
 def _confirm_setup(preview: object, yes: bool) -> bool:
@@ -3176,6 +3185,22 @@ def _cmd_chat_key_revoke(args: argparse.Namespace) -> int:
     print(f"revoked: {args.record_id} at seq {seq}; a running chat launch stops attaching its key from its next request")
     if warning:
         print(f"warning: {warning}", file=sys.stderr)
+    return 0
+
+
+def _cmd_chat_setup(args: argparse.Namespace) -> int:
+    import shutil
+
+    from levain.chat_egress import srt_pin
+    from levain.chat_egress.launch import EgressRefused, check_node
+
+    try:
+        node = check_node(shutil.which("node") or "node")
+        st = srt_pin.setup(offline=args.offline)
+    except (EgressRefused, srt_pin.SrtProblem) as exc:
+        print(f"chat setup refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"chat network: node {node}, srt {st.version} at {st.prefix}")
     return 0
 
 

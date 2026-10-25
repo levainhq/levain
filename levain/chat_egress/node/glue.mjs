@@ -31,12 +31,17 @@
 //
 // usage (S8's launcher): node glue.mjs --srt-dist <dist/sandbox dir> --listen-fd N --decider-fd N --obs-fd N
 //          --ca-fd N --lifeline-fd N --events <jsonl> --denied-table <denied_table.json>
+//          --credential-placements <json> (srt's credentialPlacements: one {class, host, scheme[, user]} per keyed
+//          record, no value; a record with no rule would go as srt's default, Bearer)
 // TEST SEAMS (never product; S8 passes none of them): --tls-ports, --http-ports (port stand-ins: macOS refuses a
 // non-root bind of 80/443), --carve (srt's allowedDomains literal-address carve-outs, for a 127.0.0.1 origin),
 // --resolve-map name=addr[,addr];..., --upstream-ca <pem>, --fifth-arg off and --terminate-ports (R15-14-3's
-// per-layer reds).
+// per-layer reds), --system-roots off (R15-16-Q2's env-alone red: srt's upstream trust left to Node's defaults).
+// The upstream trust (R15-16-Q2): `tls.rootCertificates` explicitly, beside the closed env (R15-12-B6), so an
+// inherited NODE_EXTRA_CA_CERTS never joins it; --upstream-ca replaces it with one test PEM.
 import { appendFileSync, readFileSync } from 'node:fs';
 import { randomUUID as cryptoRandomUUID } from 'node:crypto';
+import { rootCertificates } from 'node:tls';
 import { pathToFileURL } from 'node:url';
 
 // --- wire.py's bounds and reasons -------------------------------------------------------------------------------------
@@ -314,7 +319,7 @@ async function main(argv) {
   const { createDecider } = await import(SRT + 'decider-client.js');
   const { keepFlushedHeaderBatches, writeHeadsAsLatin1 } = await import(SRT + 'emitted-connection.js');
   const { createHttpProxyServer, markHandedInConnection } = await import(SRT + 'http-proxy.js');
-  const { createMitmCA } = await import(SRT + 'mitm-ca.js');
+  const { createMitmCA, disposeMitmCASync } = await import(SRT + 'mitm-ca.js');
   const { canonicalizeHost } = await import(SRT + 'parent-proxy.js');
   const { createResolvedAddressGuard } = await import(SRT + 'resolved-address-guard.js');
   const { createServer: createNetServer, Socket: NetSocket } = await import('node:net');
@@ -350,13 +355,18 @@ async function main(argv) {
   const sock = new NetSocket({ fd: Number(need('--decider-fd')), readable: true, writable: true });
   const obs = createObsChannel({ stream: new NetSocket({ fd: Number(need('--obs-fd')), readable: false, writable: true }),
     onFatal: why => fatal(7, why) });
-  const decider = createDecider({ input: sock, output: sock, timeoutMs: 130_000,
+  const placements = JSON.parse(opt('--credential-placements', '[]'));   // S8 always passes it; rigs may not
+  if (!Array.isArray(placements)) throw new Error('glue: --credential-placements is not a list');
+  const decider = createDecider({ input: sock, output: sock, timeoutMs: 130_000, credentialPlacements: placements,
     onDead: why => { console.error(`glue: decider dead: ${why}`); process.exit(3); } });
   const pem = readFileSync(Number(need('--ca-fd')), 'utf8');
   const mitmCA = createMitmCA({
     caCertPem: /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/.exec(pem)[0] + '\n',
     caKeyPem: /-----BEGIN (?:RSA )?PRIVATE KEY-----[\s\S]+?-----END (?:RSA )?PRIVATE KEY-----/.exec(pem)[0] + '\n',
   });
+  // srt writes a trust bundle (certificates only) into a fresh mkdtemp for every CA it is given; it is removed at
+  // every exit that runs handlers (process.exit included), never left per launch. A SIGKILL leaves it.
+  process.on('exit', () => disposeMitmCASync(mitmCA));
   const up = opt('--upstream-ca');
   await decider.hello;
 
@@ -370,13 +380,14 @@ async function main(argv) {
     requireHostMatch: true, denyHeader: 'X-Deny-Reason', requestTargetAsSpelled: false,
     ambiguousRequestTarget: 'refuse', requireAsciiHost: true, foldHopByHop: true, plaintextHeaderSet: false,
     filterRequest, lookupFor: port => guard.lookupFor(port),
-    ...(up ? { tlsTerminateUpstreamCA: readFileSync(up, 'utf8') } : {}),
+    ...(up ? { tlsTerminateUpstreamCA: readFileSync(up, 'utf8') }
+      : opt('--system-roots', 'on') === 'off' ? {} : { tlsTerminateUpstreamCA: [...rootCertificates] }),
   });
   const accepted = new Set();
   const listener = createNetServer(s => {
     accepted.add(s); s.once('close', () => accepted.delete(s));
     markHandedInConnection(s); writeHeadsAsLatin1(s); server.emit('connection', s); keepFlushedHeaderBatches(s);
-  }).listen({ fd: Number(need('--listen-fd')) }, () => console.error(`glue: serving node=${process.version}`));
+  }).listen({ fd: Number(need('--listen-fd')) }, () => console.error(`glue: serving node=${process.version} bundle=${mitmCA.trustBundlePath}`));
 
   // The clean end (the lifeline's EOF; S8 closes its end) and its order are in the header. The bound timer is NOT
   // unref'd: the process never runs out of handles into a silent exit 0 without the final flush.
