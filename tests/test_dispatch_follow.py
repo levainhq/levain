@@ -278,6 +278,26 @@ def test_a_job_failed_elsewhere_is_passed_unacked_and_the_cursor_moves(store, re
     f.close()
 
 
+def test_a_ticket_that_failed_the_job_with_another_outcome_stops_the_follower(store, repo, served):  # noqa: F811
+    """This ticket already failed the job with a refusal, and CONTROL's event for it carries a report: the store
+    holds another outcome for this run, so the follower stops (record-conflict) with no ACK and the cursor before the
+    event."""
+    d = setup_verifier(store, repo, served)
+    other = {"kind": "state", "session": SESSION_V, "ticket": d.ticket, "state": "RETAINED",
+             "at": "2026-10-25T00:00:00.000000Z", "verifier_report_refused": "verifier-failed:exit"}
+    store.record_verification(d.run, envelope=None, event=other, repo=str(repo[0]), tree=base_tree(repo),
+                              model=model(0))
+    f = d.follower()
+    with pytest.raises(F.FollowStopped) as exc:
+        f.step()
+    assert exc.value.name == "record-conflict"
+    assert not acked(served)
+    [done] = [e for e in served.kept("state") if e.get("ticket") == d.ticket and "verifier_report_digest" in e]
+    cur = store.event_cursor()
+    assert cur is None or cur[1] < done["seq"]
+    f.close()
+
+
 @pytest.mark.parametrize("bad", [{"ticket": 7}, {"verifier_report_digest": "sha256:nothex"},
                                  {"verifier_report_refused": ""},
                                  {"verifier_report_refused": "x", "verifier_report_digest": "sha256:" + "0" * 64}])
