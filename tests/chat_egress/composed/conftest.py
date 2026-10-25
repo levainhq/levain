@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
 
 import pytest
 
@@ -51,6 +53,22 @@ def make_origin():
         o.close()
 
 
+def _shutdown(L: Launch) -> None:
+    """Always closes the launch's decider, whether the glue is still running, exited by itself or was stopped by the
+    test already; a second call is harmless."""
+    try:
+        os.close(L.life_w)
+    except OSError:
+        pass                                   # the test's own stop() closed it
+    try:
+        L.proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        L.proc.kill()
+        L.proc.wait(timeout=5)
+    finally:
+        L.d.close(timeout_s=10)
+
+
 @pytest.fixture
 def make_launch_(tmp_path):
     made: list[Launch] = []
@@ -64,5 +82,4 @@ def make_launch_(tmp_path):
 
     yield make
     for L in made:
-        if L.proc.poll() is None:
-            L.stop()
+        _shutdown(L)
