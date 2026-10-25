@@ -8,6 +8,7 @@ are proved at host level through the sink's one fault seam (H6-9); CONTROL-as-a-
 of `test_lineage_unreadable_to_slot_and_gw` (real uids, EACCES) is 3c-10's."""
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import stat
@@ -357,10 +358,12 @@ def test_lineage_membership_rebuilt_from_the_sink(tmp):
     w.control.stop()
 
 
-@pytest.mark.parametrize("damage", ["garbage", "gap", "dup", "foreign"])
+@pytest.mark.parametrize("damage", ["garbage", "gap", "dup", "foreign", "schema", "noncanonical", "quarantine-noncanonical"])
 def test_lineage_corrupt_middle_refuses_start(tmp, damage):
     # a line that does not parse, a seq gap, a repeated triple or a row CONTROL does not write, anywhere but a torn
-    # tail, refuses the start `lineage-corrupt`: CONTROL never serves a sink it cannot read whole
+    # tail, refuses the start `lineage-corrupt`: CONTROL never serves a sink it cannot read whole. r1 F4: a full row
+    # that fails the record check a fresh record gets (`tokens_in: "corrupt"`), or any line that is not its own
+    # canonical encoding, is one CONTROL does not write: refused too, never taken into membership
     w = World(tmp)
     assert w.append(envelope(record(1), record(2))) == acked(1, 2)
     w.control.stop()
@@ -371,8 +374,17 @@ def test_lineage_corrupt_middle_refuses_start(tmp, damage):
         lines[1] = canon.canonical_bytes(dict(record(2), seq=3))
     elif damage == "dup":
         lines[1] = canon.canonical_bytes(dict(record(1), seq=2))
-    else:
+    elif damage == "foreign":
         lines.insert(1, canon.canonical_bytes({"format": LN.FORMAT, "seq": 2, "source": triple(9)}))
+    elif damage == "schema":
+        lines[1] = canon.canonical_bytes(dict(record(2), seq=2, tokens_in="corrupt"))
+    elif damage == "noncanonical":
+        lines[1] = json.dumps(dict(record(2), seq=2), indent=None).encode()     # ", " and ": ": not canonical
+        assert canon.parse(lines[1])["seq"] == 2                                 # it parses: only the bytes differ
+    else:
+        q = {"format": LN.FORMAT, "seq": 2, "source": triple(2), "quarantined": "tokens_in"}
+        lines[1] = json.dumps(q).encode()
+        assert canon.parse(lines[1]) == q
     w.path.write_bytes(b"".join(x + b"\n" for x in lines))
     sink = LN.LineageSink(w.path)
     control = C.Control(C.StateStore(tmp / "s"), OP_UID, keys_uid=KEYS_UID, lineage=sink)

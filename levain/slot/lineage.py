@@ -17,8 +17,9 @@ whose triple is a member is acked without appending; order of arrival does not m
 directory's setgid gives it `levain-lineage`), `flock`ed exclusively (one CONTROL per sink, ``control-running``), read
 whole. A last line with no newline is a torn append (a crash inside the write): it was never acked, so it is cut off
 (`ftruncate` to the last newline, then a full fsync) before anything is appended after it. Any other line that does
-not parse, is not a lineage row, breaks `seq`'s contiguity, or repeats a member's triple refuses the start
-`lineage-corrupt`: CONTROL never serves a sink it cannot read whole.
+not parse, is not its own canonical encoding, is not a lineage row (a full row must pass :func:`check_record`, as a
+fresh record must), breaks `seq`'s contiguity, or repeats a member's triple refuses the start `lineage-corrupt`:
+CONTROL never serves a sink it cannot read whole.
 
 **Append** (:meth:`LineageSink.append`): the rows of ONE envelope (at most :data:`ENVELOPE_MAX`) are written as one
 `write` and made durable with ONE full fsync (`F_FULLFSYNC` on darwin, no fallback, as the ledger's flush; `fsync`
@@ -315,6 +316,16 @@ class LineageSink:
             got = _row_triple(obj)
             if got is None:
                 raise _corrupt(f"the line after seq {seq} is not a lineage row")
+            # r1 F4: only a row CONTROL writes is taken into membership: its own canonical encoding, and a full row
+            # passes the record check a fresh record gets (a quarantine row's one field `_row_triple` checked)
+            try:
+                canonical = canon.canonical_bytes(obj) == raw
+            except (ContractError, ValueError, TypeError, RecursionError):
+                canonical = False
+            if not canonical:
+                raise _corrupt(f"the line after seq {seq} is not canonical JSON")
+            if got[1] is None and check_record({k: v for k, v in obj.items() if k != "seq"}) is not None:
+                raise _corrupt(f"the line after seq {seq} is not a well-formed record")
             if type(obj["seq"]) is not int or obj["seq"] != seq + 1:
                 raise _corrupt(f"seq is not contiguous after {seq}")
             seq += 1
