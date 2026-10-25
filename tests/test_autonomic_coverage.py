@@ -28,6 +28,8 @@ K2 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK2k2k2k2k2k2k2k2k2k2k2k2k2k2k2k2k2k2k
 PASSKEY = "sk-ecdsa-sha2-nistp256@openssh.com AAAAInNrLWVjZHNhLXNoYTItbmlzdHAyNTZAb3BlbnNzaC5jb20AAAAIbmlzdHAyNTY="
 ROOT = (f'k1 namespaces="levain-authority" {K1}\n'.encode())
 HEAD = (7, "h" * 64)
+STORE = "store-" + "0" * 32
+OTHER_STORE = "store-" + "1" * 32
 
 
 def stamp(when: datetime) -> str:
@@ -38,7 +40,7 @@ def record(**over) -> dict:
     rec = {"id": "gp-0123456789ab", "kind": "graduation",
            "actions": {"doc.append": risk_dict(LOW)},
            "lowest_posture": "ON_LOOP", "expires_at": stamp(NOW + timedelta(days=10)),
-           "triggers": None, "families": None, "store_id": "store-" + "0" * 32, "min_clean_fires": 20}
+           "triggers": None, "families": None, "store_id": STORE, "min_clean_fires": 20}
     rec.update(over)
     return rec
 
@@ -193,14 +195,34 @@ def test_the_cap_is_the_consent_grants_cap():
     {"families": "fam-x"},
     {"id": ""},
     {"unknown_term": 1},
+    {"store_id": None},
+    {"store_id": ""},
+    {"store_id": 7},
+    {"actions": {"doc.append": {1: True}}},
+    {"actions": {"doc.append": dict(risk_dict(LOW), nested={2: "x"})}},
 ])
 def test_a_malformed_record_is_refused(over):
     with pytest.raises(ValueError):
         policy(**over)
 
 
+def test_a_deeply_nested_risk_dict_is_refused_not_a_recursion_error():
+    deep: dict = {}
+    for _ in range(5000):
+        deep = {"d": deep}
+    with pytest.raises(ValueError):
+        policy(actions={"doc.append": deep})
+
+
+def test_a_bad_list_names_what_is_wrong_with_its_value():
+    with pytest.raises(ValueError, match=r"triggers must be null or a non-empty list of names \(got \[\]\)"):
+        policy(triggers=[])
+    with pytest.raises(ValueError, match=r"families must be null .*\(got 'fam-x'\)"):
+        policy(families="fam-x")
+
+
 def test_a_record_missing_a_binding_term_is_refused():
-    for name in ("id", "kind", "actions", "lowest_posture", "expires_at"):
+    for name in ("id", "kind", "actions", "lowest_posture", "expires_at", "store_id"):
         rec = record()
         del rec[name]
         with pytest.raises(ValueError):
@@ -233,14 +255,62 @@ def test_risk_dict_is_the_gates_rendering():
 
 # ---- operative and the snapshot -------------------------------------------------------------------------------
 
-def snapshot(*policies, root=ROOT, head=HEAD) -> CoverageSnapshot:
-    return CoverageSnapshot(head=head, root_bytes=root, policies=tuple(policies))
+def snapshot(*policies, root=ROOT, head=HEAD, store=STORE) -> CoverageSnapshot:
+    return CoverageSnapshot(head=head, root_bytes=root, policies=tuple(policies), store_id=store)
+
+
+class Recording:
+    """A view that records every cover() call, and answers covered at ON_LOOP."""
+
+    token = (HEAD, "sha256:x")
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def cover(self, e, now):
+        self.calls += 1
+        return Cover(Posture.ON_LOOP, "1:a@x")
 
 
 def test_a_candidate_at_or_above_confirm_never_consults_the_clamp():
+    view = Recording()
     for r in (Posture.CONFIRM, Posture.CONFIRM_ELEVATED, Posture.REFUSE_ESCALATE):
         assert operative(r, effect(), snapshot(), NOW) == (r, None)
         assert operative(r, effect(), None, NOW) == (r, None)
+        assert operative(r, effect(), view, NOW) == (r, None)
+    assert view.calls == 0
+
+
+def test_the_risk_floor_applies_at_or_above_confirm_too():
+    # the floor can only raise: a financial tools risk under a CONFIRM candidate runs at CONFIRM_ELEVATED
+    financial = ActionRisk(RiskClass.LOW, reversible=True, external=False, financial=True)
+    view = Recording()
+    assert operative(Posture.CONFIRM, effect(tools=financial), view, NOW) == (Posture.CONFIRM_ELEVATED, None)
+    assert operative(Posture.CONFIRM, effect(risk=financial), None, NOW) == (Posture.CONFIRM_ELEVATED, None)
+    assert operative(Posture.REFUSE_ESCALATE, effect(tools=financial), view, NOW) == \
+        (Posture.REFUSE_ESCALATE, None)
+    assert view.calls == 0
+
+
+def test_the_policy_keeps_its_store_id():
+    assert policy().store_id == STORE
+
+
+def test_a_policy_signed_for_another_store_covers_nothing_here():
+    other = policy(store_id=OTHER_STORE)
+    assert other.store_id == OTHER_STORE
+    assert snapshot(other).cover(effect(), NOW) == Cover(None, COVER_NONE)
+    assert operative(Posture.ON_LOOP, effect(), snapshot(other), NOW) == (Posture.CONFIRM, COVER_NONE)
+    # the same policy covers in the store it was signed for
+    assert operative(Posture.ON_LOOP, effect(), snapshot(other, store=OTHER_STORE), NOW)[0] == Posture.ON_LOOP
+
+
+def test_a_snapshot_needs_the_current_stores_id():
+    with pytest.raises(TypeError):
+        CoverageSnapshot(head=HEAD, root_bytes=ROOT, policies=())  # type: ignore[call-arg]
+    for bad in (None, "", 7):
+        with pytest.raises(TypeError):
+            snapshot(store=bad)
 
 
 def test_an_uncovered_effect_below_confirm_is_confirm():
@@ -298,13 +368,53 @@ def test_a_view_that_raises_is_uncovered():
     assert operative(Posture.ON_LOOP, effect(), Broken(), NOW) == (Posture.CONFIRM, COVER_NONE)
 
 
+class Answers:
+    """A view whose cover() returns ``answer`` whatever it is."""
+
+    token = (HEAD, "sha256:x")
+
+    def __init__(self, answer) -> None:
+        self.answer = answer
+
+    def cover(self, e, now):
+        return self.answer
+
+
+class LooksLikeACover:
+    posture = Posture.ON_LOOP
+    value = "1:a@x"
+
+
+@pytest.mark.parametrize("answer", [None, "1:a@x", LooksLikeACover(), (Posture.ON_LOOP, "1:a@x"),
+                                    Cover("ON_LOOP", "1:a@x"), Cover(1, "1:a@x"), Cover(Posture.ON_LOOP, 7)])
+def test_a_view_that_answers_anything_but_a_cover_is_uncovered(answer):
+    assert operative(Posture.ON_LOOP, effect(), Answers(answer), NOW) == (Posture.CONFIRM, COVER_NONE)
+
+
+@pytest.mark.parametrize("answer", [None, "1:a@x", LooksLikeACover(), Cover(Posture.ON_LOOP, 7)])
+def test_a_peek_at_a_view_that_answers_anything_but_a_cover_is_moved(answer):
+    view = Answers(answer)
+    assert peek_snapshot(view, view.token, effect(), NOW) == COVER_MOVED
+
+
+def test_a_peek_at_a_view_that_raises_is_moved():
+    class Broken:
+        token = (HEAD, "sha256:x")
+
+        def cover(self, e, now):
+            raise RuntimeError("boom")
+
+    # COVER_MOVED equals no decided fence, so a decided "none" is decided again rather than matched
+    assert peek_snapshot(Broken(), Broken.token, effect(), NOW) == COVER_MOVED
+
+
 def test_the_token_is_built_from_the_snapshots_own_fields():
     s = snapshot(policy())
     assert s.token == (HEAD, signers_digest(ROOT))
     assert s.signers_digest == "sha256:" + hashlib.sha256(ROOT).hexdigest()
     assert s.signers == parse_root_signers(ROOT)
     fields = {f.name for f in dataclasses.fields(CoverageSnapshot) if f.init}
-    assert fields == {"head", "root_bytes", "policies"}          # no token, digest or signers taken apart
+    assert fields == {"head", "root_bytes", "policies", "store_id"}   # no token, digest or signers taken apart
     with pytest.raises(dataclasses.FrozenInstanceError):
         s.head = (8, "x")  # type: ignore[misc]
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -313,11 +423,11 @@ def test_the_token_is_built_from_the_snapshots_own_fields():
 
 def test_a_snapshot_refuses_a_bad_head_or_non_bytes_root():
     with pytest.raises((TypeError, ValueError)):
-        CoverageSnapshot(head=(7,), root_bytes=ROOT, policies=())  # type: ignore[arg-type]
+        CoverageSnapshot(head=(7,), root_bytes=ROOT, policies=(), store_id=STORE)  # type: ignore[arg-type]
     with pytest.raises(TypeError):
-        CoverageSnapshot(head=HEAD, root_bytes=ROOT.decode(), policies=())  # type: ignore[arg-type]
+        CoverageSnapshot(head=HEAD, root_bytes=ROOT.decode(), policies=(), store_id=STORE)  # type: ignore[arg-type]
     with pytest.raises(TypeError):
-        CoverageSnapshot(head=HEAD, root_bytes=ROOT, policies=[policy()])  # type: ignore[arg-type]
+        CoverageSnapshot(head=HEAD, root_bytes=ROOT, policies=[policy()], store_id=STORE)  # type: ignore[arg-type]
 
 
 def test_uncovered_covers_nothing_at_its_token():
@@ -325,6 +435,13 @@ def test_uncovered_covers_nothing_at_its_token():
     assert u.token == (HEAD, "sha256:abc")
     assert u.cover(effect(), NOW) == Cover(None, COVER_NONE)
     assert peek_snapshot(u, (HEAD, "sha256:abc"), effect(), NOW) == COVER_NONE
+
+
+def test_uncovered_refuses_a_naive_now_like_the_snapshot():
+    u = Uncovered(head=HEAD, signers_digest="sha256:abc")
+    for view in (u, snapshot(policy())):
+        with pytest.raises(ValueError):
+            view.cover(effect(), NOW.replace(tzinfo=None))
 
 
 def test_peek_matches_only_the_same_token():
@@ -424,6 +541,23 @@ def test_an_unknown_key_type_or_bad_blob_is_not_listed():
     assert keys_of('k1 namespaces="levain-authority" ssh-ed25519 not*base64\n') == frozenset()
     assert keys_of('k1 namespaces="levain-authority" ssh-ed25519\n') == frozenset()
     assert keys_of(f'namespaces="levain-authority" {K1}\n') == frozenset()   # no principal field
+
+
+@pytest.mark.parametrize("blob", [
+    "AAA",                                   # not a whole number of base64 quads
+    K1.split()[1][:-1],                      # a truncated key
+    "AAAA=",                                 # padding past a whole quad
+    "AA=A",                                  # padding inside the blob
+    "AAAAA===",                              # three padding characters
+    "=AAA",
+])
+def test_a_blob_that_is_not_shaped_base64_is_not_listed(blob):
+    assert keys_of(f'k1 namespaces="levain-authority" ssh-ed25519 {blob}\n') == frozenset()
+
+
+@pytest.mark.parametrize("blob", ["AAAA", "AAA=", "AA==", K1.split()[1], PASSKEY.split()[1]])
+def test_a_blob_of_whole_padded_quads_is_listed(blob):
+    assert keys_of(f'k1 namespaces="levain-authority" ssh-ed25519 {blob}\n') == {f"ssh-ed25519 {blob}"}
 
 
 def test_a_bad_line_does_not_spoil_the_good_ones():

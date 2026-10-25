@@ -16,8 +16,10 @@ envelope in the authority log that signs ``actions`` (each at its whole risk dic
   replay with another's token (DESIGN_REV3_1 D2). :class:`Uncovered` is what a failed refresh caches.
 - :func:`parse_root_signers`: the root file's lines; any option but ``namespaces=`` means not listed.
 
-What binds a writer of the levain home is the action, its risk, the rung and the expiry. Triggers, families and
-``store_id`` are honest-config: rows the writer controls, compared here only as the honest engine's narrowing.
+What binds a writer of the levain home is the action, its risk, the rung, the expiry and the store: a policy covers
+only in the store whose id it signs (:attr:`CoverageSnapshot.store_id`), so a policy signed for one store and copied
+into another covers nothing there. Triggers and families are honest-config: rows the writer controls, compared here
+only as the honest engine's narrowing.
 
 Building the snapshot from the authority log (replay, the born and current signers of each policy) is not this
 module's: it imports nothing outside ``levain.autonomic`` (``tests/test_autonomic_leaf.py``), so a source outside
@@ -65,14 +67,15 @@ KEY_TYPES = frozenset({"ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp38
 _LOWEST = {"COOLING_OFF": Posture.COOLING_OFF, "ON_LOOP": Posture.ON_LOOP}
 
 # The record's fields (DESIGN_REV3 §3): those a policy must carry, and those it may.
-_REQUIRED = frozenset({"id", "kind", "actions", "lowest_posture", "expires_at"})
-_OPTIONAL = frozenset({"triggers", "families", "store_id", "min_clean_fires"})
+_REQUIRED = frozenset({"id", "kind", "actions", "lowest_posture", "expires_at", "store_id"})
+_OPTIONAL = frozenset({"triggers", "families", "min_clean_fires"})
 
 # The one timestamp form of the authority log (``levain.cockpit.consent.utc_stamp``).
 _STAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z")
 _STAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 
-_BLOB = re.compile(r"[A-Za-z0-9+/]+={0,2}")
+# a base64 blob: whole quads, padding only in the last one
+_BLOB = re.compile(r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{4}|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{2}==)")
 
 
 def risk_dict(risk: ActionRisk | None) -> dict[str, Any] | None:
@@ -86,6 +89,15 @@ def risk_dict(risk: ActionRisk | None) -> dict[str, Any] | None:
 def _canonical(obj: Any) -> str:
     # one text per value, so equality is by JSON type: ``true`` is not ``1``, and ``1.0`` is not ``1``
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def _str_keys(obj: Any) -> bool:
+    # every mapping key at every depth is a string: json.dumps would render ``{1: x}`` as ``{"1": x}``
+    if isinstance(obj, Mapping):
+        return all(isinstance(k, str) and _str_keys(v) for k, v in obj.items())
+    if isinstance(obj, (list, tuple)):
+        return all(_str_keys(v) for v in obj)
+    return True
 
 
 def stricter_risk(a: ActionRisk | None, b: ActionRisk | None) -> ActionRisk | None:
@@ -128,7 +140,8 @@ class GraduationPolicy:
 
     ``born_signer`` and ``current_signer`` are the public keys (``<type> <base64>``) of the signers of the link that
     brought this incarnation in and of the link that last renewed it. ``incarnation`` is the authority log's value
-    for it; with the expiry, it is the fence's cover value. Build it with :meth:`from_record`."""
+    for it; with the expiry, it is the fence's cover value. ``store_id`` is the store the policy was signed for; it
+    covers in no other. Build it with :meth:`from_record`."""
 
     grant_id: str
     incarnation: str
@@ -139,6 +152,7 @@ class GraduationPolicy:
     families: frozenset[str] | None
     born_signer: str | None
     current_signer: str | None
+    store_id: str
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any], *, incarnation: str, born_signer: str | None,
@@ -167,9 +181,11 @@ class GraduationPolicy:
             if not isinstance(name, str) or not name or not isinstance(risk, Mapping):
                 raise ValueError("each signed action is a name and its risk dict")
             try:
+                if not _str_keys(risk):
+                    raise ValueError
                 signed.append((name, _canonical(dict(risk))))
-            except (TypeError, ValueError):
-                raise ValueError(f"the risk dict of {name!r} is not JSON") from None
+            except (TypeError, ValueError, RecursionError):
+                raise ValueError(f"the risk dict of {name!r} is not JSON with string keys") from None
         lowest = record["lowest_posture"]
         if not isinstance(lowest, str) or lowest not in _LOWEST:
             raise ValueError(f"lowest_posture {lowest!r} is not one of {sorted(_LOWEST)}")
@@ -180,11 +196,14 @@ class GraduationPolicy:
             expires_at = datetime.strptime(expires, _STAMP_FORMAT).replace(tzinfo=timezone.utc)
         except ValueError:
             raise ValueError(f"expires_at {expires!r} is not a date") from None
+        store_id = record["store_id"]
+        if not isinstance(store_id, str) or not store_id:
+            raise ValueError(f"store_id {str(store_id)[:40]!r} is not a store's id")
         return cls(grant_id=gid, incarnation=incarnation, actions=tuple(sorted(signed)),
                    lowest_posture=_LOWEST[lowest], expires_at=expires_at,
                    triggers=_names(record.get("triggers"), "triggers"),
                    families=_names(record.get("families"), "families"),
-                   born_signer=born_signer, current_signer=current_signer)
+                   born_signer=born_signer, current_signer=current_signer, store_id=store_id)
 
     def signed_risk(self, action_name: str) -> str | None:
         """The canonical text of the risk dict this policy signs ``action_name`` at, or ``None``."""
@@ -203,7 +222,7 @@ def _names(value: Any, what: str) -> frozenset[str] | None:
     if value is None:
         return None
     if not isinstance(value, list) or not value or not all(isinstance(v, str) and v for v in value):
-        raise ValueError(f"{what} is null or a non-empty list of names")
+        raise ValueError(f"{what} must be null or a non-empty list of names (got {value!r:.80})")
     return frozenset(value)
 
 
@@ -233,7 +252,10 @@ def _key_of(public_key: str | None) -> str | None:
 
 def anchored(policy: GraduationPolicy, root_keys: frozenset[str]) -> bool:
     """Whether both links that define ``policy`` now (the one that brought its incarnation in, and the one that last
-    renewed it) are signed by keys in ``root_keys`` (:func:`authority_keys` of root's file)."""
+    renewed it) are signed by keys in ``root_keys`` (:func:`authority_keys` of root's file).
+
+    A key anchors whatever principal its root line names: unlike ``ssh-keygen -Y verify``, the principal is not
+    matched. Root owns that file, so a line root wrote under another principal is still root's word for the key."""
     born, current = _key_of(policy.born_signer), _key_of(policy.current_signer)
     return born is not None and current is not None and born in root_keys and current in root_keys
 
@@ -259,6 +281,12 @@ class Cover:
 _UNCOVERED = Cover(None, COVER_NONE)
 
 
+def _is_cover(cover: Any) -> bool:
+    # what a view answered is a Cover whose fields are of their types: anything else covers nothing
+    return (isinstance(cover, Cover) and isinstance(cover.value, str)
+            and (cover.posture is None or isinstance(cover.posture, Posture)))
+
+
 @runtime_checkable
 class CoverageView(Protocol):
     """A fixed coverage state: what one refresh produced. ``token`` names the state it was built from
@@ -276,7 +304,8 @@ class CoverageSource(Protocol):
     uncovered.
 
     :meth:`refresh` runs outside any store transaction: it reads the root file's bytes once, replays the authority
-    log, builds a :class:`CoverageSnapshot` from that replay's own head and those bytes, caches it and returns it.
+    log, builds a :class:`CoverageSnapshot` from that replay's own head, those bytes and the store's own id (its
+    ``meta`` row ``store_id``), caches it and returns it.
     A failed refresh caches and returns :class:`Uncovered` at the token a peek would read.
 
     :meth:`peek` reads the root file's digest and then the authority head (the last authority read), and returns
@@ -300,13 +329,15 @@ def _check_head(head: Any) -> None:
 
 @dataclass(frozen=True)
 class CoverageSnapshot:
-    """One refresh's coverage: the replayed log's ``head``, the root file's bytes as read once, and the replayed
-    graduation policies. The signers digest and the parsed signers are derived from ``root_bytes`` here, and the
-    ``token`` from those fields, so a snapshot cannot carry a token apart from the state it was built from."""
+    """One refresh's coverage: the replayed log's ``head``, the root file's bytes as read once, the replayed
+    graduation policies, and the id of the store the gate runs in (only a policy signed for it covers). The signers
+    digest and the parsed signers are derived from ``root_bytes`` here, and the ``token`` from those fields, so a
+    snapshot cannot carry a token apart from the state it was built from."""
 
     head: tuple[int, str]
     root_bytes: bytes
     policies: tuple[GraduationPolicy, ...]
+    store_id: str
     signers_digest: str = field(init=False)
     signers: tuple["RootSigner", ...] = field(init=False, repr=False)
     _root_keys: frozenset[str] = field(init=False, repr=False)
@@ -317,6 +348,8 @@ class CoverageSnapshot:
             raise TypeError("root_bytes is the root file's bytes")
         if not isinstance(self.policies, tuple) or not all(isinstance(p, GraduationPolicy) for p in self.policies):
             raise TypeError("policies is a tuple of GraduationPolicy")
+        if not isinstance(self.store_id, str) or not self.store_id:
+            raise TypeError("store_id is the current store's id")
         signers = parse_root_signers(self.root_bytes)
         object.__setattr__(self, "signers_digest", signers_digest(self.root_bytes))
         object.__setattr__(self, "signers", signers)
@@ -328,7 +361,8 @@ class CoverageSnapshot:
 
     def cover(self, effect: Effect, now: datetime) -> Cover:
         now = _aware(now)
-        hits = [p for p in self.policies if covered(p, effect) and live(p, now, self._root_keys)]
+        hits = [p for p in self.policies
+                if p.store_id == self.store_id and covered(p, effect) and live(p, now, self._root_keys)]
         if not hits:
             return _UNCOVERED
         strictest = max(p.lowest_posture for p in hits)
@@ -354,6 +388,7 @@ class Uncovered:
         return (self.head, self.signers_digest)
 
     def cover(self, effect: Effect, now: datetime) -> Cover:
+        _aware(now)
         return _UNCOVERED
 
 
@@ -361,35 +396,39 @@ def operative(candidate: Posture, effect: Effect, view: CoverageView | None,
               now: datetime) -> tuple[Posture, str | None]:
     """The rung ``effect`` runs at, and the fence's cover value (``None`` when the clamp was not consulted).
 
-    A candidate at or above ``CONFIRM`` is returned as it is, with no cover value (the clamp is not consulted).
-    Below ``CONFIRM``: uncovered (no view, a view that fails, no live anchored policy covering the effect) is
-    ``CONFIRM``; covered is the stricter of the candidate and the strictest covering policy's ``lowest_posture``.
-    Either way the floor of the stricter of the action's and the tools' risk can only raise it."""
+    A candidate at or above ``CONFIRM`` keeps its rung, with no cover value (the clamp is not consulted).
+    Below ``CONFIRM``: uncovered (no view, a view that raises or answers anything but a :class:`Cover`, no live
+    anchored policy covering the effect) is ``CONFIRM``; covered is the stricter of the candidate and the strictest
+    covering policy's ``lowest_posture``. On every path the floor of the stricter of the action's and the tools'
+    risk can only raise the rung."""
+    floor_risk = stricter_risk(effect.action_risk, effect.tools_risk)
+    floor = Posture.ABOVE_LOOP if floor_risk is None else risk_floor(floor_risk)
     if candidate >= Posture.CONFIRM:
-        return candidate, None
+        return max(candidate, floor), None
     try:
         cover = _UNCOVERED if view is None else view.cover(effect, now)
+        if not _is_cover(cover):
+            cover = _UNCOVERED
     except Exception:  # noqa: BLE001 - a view that cannot answer covers nothing
         cover = _UNCOVERED
     rung = Posture.CONFIRM if cover.posture is None else max(candidate, cover.posture)
-    floor_risk = stricter_risk(effect.action_risk, effect.tools_risk)
-    if floor_risk is not None:
-        rung = max(rung, risk_floor(floor_risk))
-    return rung, cover.value
+    return max(rung, floor), cover.value
 
 
 def peek_snapshot(view: CoverageView | None, token: tuple[tuple[int, str], str], effect: Effect,
                   now: datetime) -> str:
     """The pure half of a peek: the cover value ``view`` gives ``effect`` at ``now`` when ``token`` (the digest and
-    head just read) is the view's own, else :data:`COVER_MOVED`."""
+    head just read) is the view's own, else :data:`COVER_MOVED`. A view that raises or answers anything but a
+    :class:`Cover` is :data:`COVER_MOVED` too: it equals no decided fence, so the effect is decided again."""
     if view is None:
         return COVER_MOVED
     try:
         if view.token != token:
             return COVER_MOVED
-        return view.cover(effect, now).value
-    except Exception:  # noqa: BLE001 - a view that cannot answer covers nothing
-        return COVER_NONE
+        cover = view.cover(effect, now)
+    except Exception:  # noqa: BLE001 - a view that cannot answer forces a re-decide
+        return COVER_MOVED
+    return cover.value if _is_cover(cover) else COVER_MOVED
 
 
 @dataclass(frozen=True)
