@@ -222,6 +222,11 @@ def test_decide_key_narrows_a_git_exchange_by_advert_key_allowed():
               frame(path="/api/x", query="service=anything")):
         d = _decide(r, f)
         assert d.keyed and (d.attach, d.credential) == ("none", None), f
+    # a walled path (R-3/R-4: no canonical form) carries no key, git exchange or not
+    for path in ("//x", "//o/r.git/HEAD"):
+        assert parse(frame(path=path)).canonical_path is None, path
+        d = _decide(r, frame(path=path))
+        assert d.keyed and (d.attach, d.credential) == ("none", None), path
     for f in (frame(path=INFO_REFS, query=SVC), frame(method="POST", path="/o/r.git/git-upload-pack"),
               frame(path="/o/r.git/HEAD"), frame(path="/api/x")):
         assert _decide(r, f).attach == "attached", f
