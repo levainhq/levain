@@ -14,6 +14,7 @@ from levain.consent import limits as consent_limits
 from levain.contracts.canon import canonical_bytes
 from levain.qbroker import broker as qbroker
 from levain.qbroker.limits import LimitsUnavailable, PolicyLimits
+from levain.slot import limits_doc
 import tests.test_qbroker as base
 from tests.test_qbroker import make_broker
 from tests.test_qbroker_gate import gate
@@ -118,7 +119,7 @@ def test_policy_limits_turns_an_unexpected_failure_into_its_reason(tmp_path, mon
 
     def boom(data, **k):
         raise RuntimeError("the parser broke")
-    monkeypatch.setattr(consent_limits, "slot_doc", boom)
+    monkeypatch.setattr(limits_doc, "slot_doc", boom)          # the module PolicyLimits reads through
     with pytest.raises(LimitsUnavailable) as got:
         p("codex", "s")
     assert str(p.path) in got.value.reason and "RuntimeError" in got.value.reason
@@ -200,3 +201,21 @@ def test_an_unreadable_latch_row_is_held(L, resolver, clock, row):
     assert [g["gate"] for g in got] == ["limits-failed"] * 2 and "latch" in got[0]["reason"]
     with sqlite3.connect(store(L)) as conn:
         assert conn.execute("SELECT kind, count FROM latches").fetchall() == [row]
+
+
+# --- head ADDED ITEM: the document layer imports under ROOT_PYTHON (3.9) ----------------------------------------------
+
+def test_limits_doc_imports_only_the_stdlib_and_contracts():
+    import ast
+    import sys
+    tree = ast.parse(open(limits_doc.__file__, encoding="utf-8").read())
+    names = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+    names |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+    levain = {m for m in names if m.split(".")[0] == "levain"}
+    assert levain == {"levain.contracts", "levain.contracts.canon"}
+    assert all(m.split(".")[0] in sys.stdlib_module_names for m in names - levain)
+
+
+def test_consent_limits_re_exports_the_document_layer_unchanged():
+    for name in limits_doc.__all__:
+        assert getattr(consent_limits, name) is getattr(limits_doc, name), name

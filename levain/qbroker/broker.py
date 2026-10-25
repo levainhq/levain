@@ -56,7 +56,7 @@ session is the resolve's, never the frame's.
   :class:`levain.qbroker.limits.PolicyLimits`, read from ``L/policy/limits``; ``None``, a test's broker, every call
   GO, nothing counted). The callable raising :class:`~levain.qbroker.limits.LimitsUnavailable` answers
   ``limits-failed`` with its reason, and so does an answer that is not every kind of
-  :data:`levain.consent.limits.SLOT_KINDS` in its :data:`levain.consent.limits.SLOT_RANGE` (:func:`slot_limits`: a
+  :data:`levain.slot.limits_doc.SLOT_KINDS` in its :data:`levain.slot.limits_doc.SLOT_RANGE` (:func:`slot_limits`: a
   kind left out is never unlimited); the callable raising anything else answers ``limits-failed`` naming the
   exception, never ``broker-error``. A ``crossed`` or ``halted`` verdict answers over-limit, ``ok`` answers GO, and
   every other verdict answers ``limits-failed`` with the counter's reason (the store failed, not a budget: the operator
@@ -131,6 +131,7 @@ from levain.qbroker.receipts import Receipts
 from levain.qbroker.seam import answer_refusal, grant_allow_refusal, request_of
 from levain.qbroker.signers import SignersSnapshot, SignersSource
 from levain.qbroker.store import ANSWER_ROW_FORMAT, REQUEST_ROW_FORMAT, QueueStore, valid_request_id
+from levain.slot import limits_doc
 
 __all__ = ["ANSWER_BURST", "ANSWER_RATE", "CAP_MAX", "GATE_BURST", "GATE_RATE",
            "KINDS", "PENDING_PER_SESSION", "QUOTA_PER_RUN",
@@ -189,7 +190,7 @@ _GATE_OVER = frozenset({"crossed", "halted"})
 _SETTLED = frozenset({"allowed", "denied"})
 _GATE_KEYS = frozenset({"v", "op", "id", "cap", "agent", "tool_name", "input_digest", "tool_use_id"})
 _GATE_REQUIRED = _GATE_KEYS - {"tool_use_id"}
-# the limits in force for (agent, resolved session): every one of consent_limits.SLOT_KINDS, or LimitsUnavailable
+# the limits in force for (agent, resolved session): every one of limits_doc.SLOT_KINDS, or LimitsUnavailable
 # raised (levain.qbroker.limits.PolicyLimits is the one in production)
 LimitsSource = Callable[[str, str], "Mapping[str, float]"]
 # the counter's directory under requests/ (limits.db and its failure files)
@@ -211,17 +212,17 @@ def _private_dir(st: os.stat_result) -> bool:
 
 def slot_limits(in_force: Any) -> dict[str, float] | None:
     """What the counter runs with from the settings callable's answer: each of
-    :data:`levain.consent.limits.SLOT_KINDS` a number in its :data:`levain.consent.limits.SLOT_RANGE` (the token kinds
+    :data:`levain.slot.limits_doc.SLOT_KINDS` a number in its :data:`levain.slot.limits_doc.SLOT_RANGE` (the token kinds
     unlimited: a slot counts none), or ``None`` when the answer is not that (``None`` itself, a kind missing, a value
     that is not a number or is outside its range, NaN and infinities included): a kind left out is never read as
     unlimited (slot limits R1 F1). The range is compared before ``float()``, so an integer too large for a float is
     refused here rather than raising."""
     if not isinstance(in_force, Mapping):
         return None
-    full = {k: float("inf") for k in consent_limits.KINDS}
-    for kind in consent_limits.SLOT_KINDS:
+    full = {k: float("inf") for k in limits_doc.KINDS}
+    for kind in limits_doc.SLOT_KINDS:
         v = in_force.get(kind)
-        lo, hi = consent_limits.SLOT_RANGE[kind]
+        lo, hi = limits_doc.SLOT_RANGE[kind]
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
             return None
         full[kind] = float(v)
@@ -753,7 +754,7 @@ class Broker:
             return wire.refusal(rid, who)
         agent, tool_name, digest = message.get("agent"), message.get("tool_name"), message.get("input_digest")
         tid = message.get("tool_use_id")
-        if not _GATE_REQUIRED <= set(message) <= _GATE_KEYS or agent not in consent_limits.AGENTS \
+        if not _GATE_REQUIRED <= set(message) <= _GATE_KEYS or agent not in limits_doc.AGENTS \
                 or not isinstance(tool_name, str) or not tool_name or len(tool_name) > 256 \
                 or not isinstance(digest, str) or not digest or len(digest) > 256 \
                 or (tid is not None and not (isinstance(tid, str) and 0 < len(tid) <= TOOL_USE_ID_MAX)):

@@ -168,8 +168,9 @@ def test_policy_limits_reloads_on_change_and_reads_an_unchanged_file_once(tmp_pa
     d = policy(tmp_path)
     put(d, doc(default={"calls": 5}))
     reads = []
-    real = consent_limits.slot_doc
-    monkeypatch.setattr(consent_limits, "slot_doc", lambda data, **k: reads.append(1) or real(data, **k))
+    from levain.slot import limits_doc          # the module PolicyLimits reads through
+    real = limits_doc.slot_doc
+    monkeypatch.setattr(limits_doc, "slot_doc", lambda data, **k: reads.append(1) or real(data, **k))
     p = PolicyLimits(d, owner=ME)
     assert [p("codex", "s")["calls"] for _ in range(3)] == [5.0] * 3 and len(reads) == 1
     put(d, doc(default={"calls": 6}))

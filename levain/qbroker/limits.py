@@ -2,15 +2,15 @@
 
 Slot limits design (``project_memory/1025-6/limits/DESIGN.md`` §3; head rulings R0 and R1). :class:`PolicyLimits` is
 the broker's :data:`levain.qbroker.broker.LimitsSource`: called with (agent, session) on every limited GATE, it returns
-exactly :data:`levain.consent.limits.SLOT_KINDS`, or raises :class:`LimitsUnavailable` (any other exception inside it
+exactly :data:`levain.slot.limits_doc.SLOT_KINDS`, or raises :class:`LimitsUnavailable` (any other exception inside it
 is wrapped into one). It never returns ``None`` (the broker reads ``None`` from its callable as a fault too, never as
 "no limits").
 
-- The file MISSING (the policy directory itself sound): :data:`~levain.consent.limits.DEFAULTS` for the slot kinds
+- The file MISSING (the policy directory itself sound): :data:`~levain.slot.limits_doc.DEFAULTS` for the slot kinds
   (Q13 F5b: on by default; R0 ruling 1).
 - PRESENT BUT UNUSABLE: raises, so every limited GATE answers ``limits-failed`` (R0 ruling 2): not a regular file, a
   symlink, an owner other than root, writable by group or others, over
-  :data:`~levain.consent.limits.SLOT_LIMITS_MAX` bytes, or a document :func:`levain.consent.limits.slot_doc` refuses.
+  :data:`~levain.slot.limits_doc.SLOT_LIMITS_MAX` bytes, or a document :func:`levain.slot.limits_doc.slot_doc` refuses.
   No last-good fallback: defaults or an older file may be looser than what the operator set.
 - The policy directory absent, a symlink, not root's or writable by group or others: raises too (the store is broken).
 
@@ -29,7 +29,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from levain.consent import limits as consent_limits
+from levain.slot import limits_doc
 
 __all__ = ["POLICY_LIMITS", "LimitsUnavailable", "PolicyLimits"]
 
@@ -73,12 +73,12 @@ class PolicyLimits:
         try:
             doc = self._document()
             if doc is None:
-                return {k: float(consent_limits.DEFAULTS[k]) for k in consent_limits.SLOT_KINDS}
+                return {k: float(limits_doc.DEFAULTS[k]) for k in limits_doc.SLOT_KINDS}
             try:
-                got, _ = consent_limits.parse_limits_doc(doc, agent, slot=True)
-            except consent_limits.LimitsDocError as exc:   # slot_doc checked the document; an agent with no block
+                got = limits_doc.slot_values(doc, agent)
+            except limits_doc.LimitsDocError as exc:   # slot_doc checked the document; an agent with no block
                 raise LimitsUnavailable(self._unusable(exc.code)) from None
-            return {k: float(got[k]) for k in consent_limits.SLOT_KINDS}
+            return {k: float(got[k]) for k in limits_doc.SLOT_KINDS}
         except LimitsUnavailable:
             raise
         except Exception as exc:  # noqa: BLE001 - an fstat, a read or the parser failing is the same fail-closed answer
@@ -141,14 +141,14 @@ class PolicyLimits:
             return None, f"owned by uid {st.st_uid}, not {self._owner}"
         if st.st_mode & 0o022:
             return None, f"writable by group or others (mode {stat.S_IMODE(st.st_mode):04o})"
-        if st.st_size > consent_limits.SLOT_LIMITS_MAX:
-            return None, f"over {consent_limits.SLOT_LIMITS_MAX} bytes"
+        if st.st_size > limits_doc.SLOT_LIMITS_MAX:
+            return None, f"over {limits_doc.SLOT_LIMITS_MAX} bytes"
         try:
             with os.fdopen(fd, "rb", closefd=False) as fh:
-                data = fh.read(consent_limits.SLOT_LIMITS_MAX + 1)
+                data = fh.read(limits_doc.SLOT_LIMITS_MAX + 1)
         except OSError as exc:
             return None, f"it cannot be read ({errno.errorcode.get(exc.errno, type(exc).__name__)})"
         try:
-            return consent_limits.slot_doc(data), None
-        except consent_limits.LimitsDocError as exc:
+            return limits_doc.slot_doc(data), None
+        except limits_doc.LimitsDocError as exc:
             return None, str(exc)
