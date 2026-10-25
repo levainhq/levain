@@ -44,6 +44,7 @@ from levain.slot.bwrap import LEVAIN_BWRAP
 from levain.slot.ids import SlotId, loopback_alias
 from levain.slot.layout import RUN, STORE
 from levain.slot.runtime_grammar import AUTHS, KINDS, RenderBlob, parse_stdin
+from levain.slot.tickets import RENDERS_AS
 from levain.slot.wall import WallFacts
 
 VENDOR_PREFIX: Mapping[str, PurePosixPath] = {"darwin": PurePosixPath("/usr/local/lib/levain-vendor"),
@@ -304,7 +305,44 @@ def check_facts(blob: RenderBlob, facts: RenderFacts) -> None:
     own_loopback(blob, facts)
 
 
-# --- env (§3.4) ---------------------------------------------------------------------------------------------
+def check_ticket(blob: RenderBlob, kind: str, slot_class: str, ticket: str | None,
+                 ticket_facts: Mapping[str, object] | None) -> None:
+    """CONTRACT §3.5 "Ticket facts reach render", render's half (the second gate; CONTROL's ``MINT`` claims check is
+    the first): the blob against the ticket facts alloc carries (root's snapshot of CONTROL's record), refused by name
+    before render acts. A session with no ticket has nothing to check here.
+
+    - ``ticket-facts-missing``: a ticket without its facts (an interrupted ``prepare``), or a verifier ticket whose
+      facts hold no resolved ``verifier`` entry (no driver is authorised without one);
+    - ``ticket-kind-mismatch``: the alloc's kind and class are not what the ticket's kind renders as;
+    - ``ticket-routes-mismatch``: the blob's routes are not exactly the ticket's ``route`` + ``egress_routes``;
+    - ``ticket-model-mismatch``: the blob's model is not the ticket's ``model_requested`` (none for a verifier);
+    - ``ticket-steps-mismatch`` / ``ticket-driver-mismatch``: a verifier blob's ``verifier_steps`` are not the
+      ticket's, or its ``driver`` is not the resolved entry's ``driver_template``."""
+    if ticket is None:
+        return
+    if ticket_facts is None:
+        raise Refused("ticket-facts-missing", "alloc names a ticket without its facts")
+    if RENDERS_AS.get(str(ticket_facts.get("kind"))) != (kind, slot_class):
+        raise Refused("ticket-kind-mismatch", f"{ticket_facts.get('kind')!s:.16} is not {kind} {slot_class}")
+    want = sorted([*([ticket_facts["route"]] if "route" in ticket_facts else []),
+                   *ticket_facts["egress_routes"]])                                   # type: ignore[misc]
+    if sorted(blob.routes) != want:
+        raise Refused("ticket-routes-mismatch", "the blob's routes are not the ticket's")
+    if blob.model != ticket_facts.get("model_requested"):
+        raise Refused("ticket-model-mismatch", "the blob's model is not the ticket's")
+    if ticket_facts["kind"] != "verifier":
+        return
+    resolved = ticket_facts.get("verifier")
+    if not isinstance(resolved, Mapping):
+        raise Refused("ticket-facts-missing", "a verifier ticket without its resolved entry")
+    steps = [{"argv": list(s.argv), "wall_s": s.wall_s} for s in blob.verifier_steps or ()]
+    if canon.canonical_bytes(steps) != canon.canonical_bytes(ticket_facts.get("verifier_steps")):
+        raise Refused("ticket-steps-mismatch", "the blob's verifier_steps are not the ticket's")
+    if blob.driver != resolved.get("driver_template"):
+        raise Refused("ticket-driver-mismatch", "the blob's driver is not the ticket's driver_template")
+
+
+# --- env (§3.4)---------------------------------------------------------------------------------------------
 
 def _base_env(facts: RenderFacts, home: PurePosixPath, user: str) -> dict[str, str]:
     S = facts.S

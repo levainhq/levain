@@ -1286,9 +1286,10 @@ def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, obje
     caller and ticket together), the slot is taken by :func:`pick_slot`'s ticketed rules under the pool lock (no
     ``<slot>`` argument, never a credential or baseline slot, ``operator-slot-reserved`` for the operator's last
     one), alloc and the ``ATTACH`` claims name the ticket, and ``ATTACH``'s ``ticket_facts`` are written into alloc,
-    durably, before ``prepare`` returns. An alloc carrying a ticket without them is an interrupted ``prepare``, which
-    §3.5 has render refuse ``ticket-facts-missing``; render does not make that check yet (CONTROL's ``MINT`` compares
-    the claims with its own ticket record, ``claims-mismatch``, either way)."""
+    durably, before ``prepare`` returns. A failure after ``ATTACH`` answered (the facts write included) leaves CONTROL's
+    record ALLOCATED with the ticket bound and an alloc carrying the ticket without its facts: render refuses that
+    ``ticket-facts-missing`` before it acts (:func:`levain.slot.render.check_ticket`), so nothing renders, and the
+    session ends with its lease."""
     seams = ctx.seams
     ticketed = blob.ticket is not None
     if ticketed != (ctx.caller == DISPATCH):
@@ -1730,6 +1731,8 @@ def render(ctx: Ctx, req: RuntimeRequest, blob: RenderBlob) -> Dict[str, object]
         a = read_alloc(ctx, req.session)
         if a.policy is not None:
             raise Refused("not-allocated", req.session)
+        # §3.5's second gate, before step (1)'s CAS: a refusal here leaves the session ALLOCATED and acts on nothing
+        RD.check_ticket(blob, a.kind, a.slot.slot_class, a.ticket, a.ticket_facts)
         run = RenderRun(ctx, a, blob)
         try:
             for name, step in RENDER_STEPS:

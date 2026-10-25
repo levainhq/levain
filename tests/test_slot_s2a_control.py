@@ -678,9 +678,9 @@ def test_alloc_only_orphan_reclaimed(env):
     assert root.ask("REVOKE", session=S3)["generation"] == 0
     rec = env.record(S3)
     assert (rec.state, rec.generation, rec.claims, rec.lease_live, rec.event_kind) == ("REVOKED", 0, {}, False, "state")
-    assert env.seams.calls == [("wake",), ("drop", S3)]
+    assert env.seams.calls == [("wake",), ("wake",), ("drop", S3)]   # the start's wake, then REVOKE's
     assert root.ask("REVOKE", session=S3)["generation"] == 0          # a no-op answering its generation
-    assert env.seams.calls == [("wake",), ("drop", S3)]
+    assert env.seams.calls == [("wake",), ("wake",), ("drop", S3)]
     assert S3 in root.ask("REVOKED-SET")["sessions"]
     assert cas(root, S3, 0, "REVOKED", "FROZEN")["generation"] == 1    # END runs from alloc as usual
 

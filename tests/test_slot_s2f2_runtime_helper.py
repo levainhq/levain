@@ -635,7 +635,7 @@ def test_none_class_no_front_no_handle(world, request):
     a = R.Alloc(session=s, slot=slot, lease_seq=1, slot_rev=1, slot_uid=893, slot_gid=893, kind="verifier",
                 vendor="claude", auth="none", operator_uid=OP_UID, supervisor_uid=DISPATCH_UID,
                 staging_uid=OP_UID, created_at="2026-10-20T00:00:00Z", boot_id=BOOT, child_uid=892, ticket=ticket,
-                netns=slot.netns, cgroup=R.cgroup_path(slot, s))
+                netns=slot.netns, cgroup=R.cgroup_path(slot, s), ticket_facts=dict(facts, verifier=VERIFIER_ENTRY))
     (world.L / "alloc" / f"{s}.json").write_bytes(R.alloc_bytes(a))
     claims = {"operator_uid": OP_UID, "supervisor_uid": DISPATCH_UID, "slot": R.slot_obj(slot), "class": "none",
               "kind": "verifier", "vendor": "claude", "auth": "none", "lease_seq": 1, "slot_rev": 1,
@@ -662,6 +662,14 @@ def test_none_class_no_front_no_handle(world, request):
     assert world.chown_of(f"live/{s}/root") == (0, 0) and world.mode(f"live/{s}/root") == 0o755
     assert world.chown_of(f"live/{s}/in/repo.bundle") == (0, 892)
     assert os.listdir(world.L / "staging" / s) == ["driver_input.json"]   # unstaged here (2f's): never removed
+
+
+#: a resolved verifier entry (§3.5 VERIFIER IDENTITY) as CONTROL adds it to a verifier ticket's facts, which alloc
+#: carries: render's ticket check holds the blob's driver to its `driver_template` (3c-7 fix r1)
+VERIFIER_ENTRY = {"verifier_generation": 1, "verifier_id": "pytest-report",
+                  "verifier_artifact_digest": "sha256:" + "5" * 64, "declared_kind": "black-box",
+                  "driver_template": "pytest-report", "driver_template_digest": "sha256:" + "6" * 64,
+                  "steps_digest": "sha256:" + "7" * 64, "driver_input_digest": "sha256:" + "3" * 64}
 
 
 def test_render_refused_for_another_callers_session(world):

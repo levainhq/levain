@@ -76,6 +76,7 @@ from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
 from levain.slot import Refused
 from levain.slot.grammar import INDEX_SPACE, SESSION_RE
+from levain.slot.runtime_grammar import _verifier_steps
 
 JOURNAL = "tickets.jsonl"
 CEILING_FORMAT = "levain-dispatch-ceiling/1"
@@ -185,7 +186,10 @@ def check_facts(args: Mapping[str, object]) -> Dict[str, object]:
         try:
             if type(steps) is not list or len(canon.canonical_bytes(steps)) > VERIFIER_STEPS_MAX:
                 raise _field("verifier_steps")
-        except (ContractError, TypeError, ValueError, RecursionError):
+            # 3c-7 fix (codex r1 HIGH 1): the §5.6 shape alloc's `ticket_facts` parses with, so no ticket binds whose
+            # facts root's alloc write would then refuse
+            _verifier_steps(steps)
+        except (ContractError, TypeError, ValueError, RecursionError, Refused):
             raise _field("verifier_steps") from None
         facts["verifier_steps"] = steps
         for k in ("input_bundle_digest", "driver_input_digest"):
@@ -474,9 +478,11 @@ class TicketStore:
                         raise _inconsistent(f"a bind line names a ticket already {t.state}")
                     slot = None
                     if "slot" in obj or "lease_seq" in obj:
+                        # the key set first (fix r1, complement 1): `lease_seq` without `slot` is named here
+                        if set(obj) != {"op", "ticket", "session", "slot", "lease_seq"}:
+                            raise _inconsistent("a bind line's slot is malformed")
                         where = obj["slot"]
-                        if set(obj) != {"op", "ticket", "session", "slot", "lease_seq"} or not isinstance(where, dict) \
-                                or set(where) != {"class", "index"}:
+                        if not isinstance(where, dict) or set(where) != {"class", "index"}:
                             raise _inconsistent("a bind line's slot is malformed")
                         slot = check_slot((where["class"], where["index"], obj["lease_seq"]))
                     elif set(obj) != {"op", "ticket", "session"}:
@@ -697,6 +703,7 @@ class TicketStore:
         """``POOL``'s answer: :meth:`_free` for each class, the count the mint refuses at (DECISION: unclamped, so a
         count below 0 shows how far the open tickets are past the free slots)."""
         with self.lock:
+            self._live()          # fix r1 (codex 3): a poisoned journal answers no count from memory
             return {"egress_free": self._free("egress", slots_free), "none_free": self._free("none", slots_free)}
 
     def release_ended(self, entries: Mapping[Tuple[str, int], Tuple[int, str]]) -> List[str]:

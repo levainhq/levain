@@ -499,12 +499,28 @@ class PoolMirror:
                 if key not in listed:
                     cur.present = False
 
-    def mark_leased(self, cls: str, index: int, session: str, lease_seq: int, rev: int) -> None:
+    def mark_leased(self, cls: str, index: int, session: str, lease_seq: int,
+                    rev: int) -> "tuple[_Mirrored | None, _Mirrored | None]":
+        """The entry shows ``leased`` to ``session`` at ``rev`` when ``rev`` is greater than the mirror's. Returns
+        (the entry it replaced, the mark), the mark ``None`` when nothing changed: :meth:`unmark`'s arguments."""
         with self._mu:
             cur = self._e.get((cls, index))
             if cur is None or rev > cur.rev:
-                self._e[(cls, index)] = _Mirrored(rev, lease_seq, "leased", session,
-                                                   cur.eligible if cur is not None else False)
+                mark = _Mirrored(rev, lease_seq, "leased", session, cur.eligible if cur is not None else False)
+                self._e[(cls, index)] = mark
+                return cur, mark
+            return cur, None
+
+    def unmark(self, cls: str, index: int, prior: "_Mirrored | None", mark: "_Mirrored | None") -> None:
+        """Undo :meth:`mark_leased` (fix r1, complement 3: an ATTACH that refused after its mark): the entry goes back
+        to ``prior`` only while it is still that mark, so a sync merged in between stands."""
+        with self._mu:
+            if mark is None or self._e.get((cls, index)) is not mark:
+                return
+            if prior is None:
+                del self._e[(cls, index)]
+            else:   # a sync that left the slot out meanwhile flagged the mark absent: that flag stands
+                self._e[(cls, index)] = replace(prior, present=prior.present and mark.present)
 
     def free(self, cls: str) -> int:
         """The slots of ``cls`` a ticket could take: listed by the last sync, ``reusable`` AND ``dispatch_eligible``."""
@@ -962,7 +978,8 @@ class Control:
 
         Every record already at or past REVOKED gets its ``DROP-SESSION`` again (idempotent, §4.9): a
         CONTROL that died between the REVOKED write and the drop, or whose drop never got an ack, owes it
-        still. Then one reaper wake. The split keys off the STATE alone: a record past live that still says
+        still. Then a reaper wake, whatever the records were (the pool mirror is empty until root's sync). The
+        split keys off the STATE alone: a record past live that still says
         ``lease_live:true`` (CONTROL died between a CAS into REVOKED and its after-acts) has the flag cleared,
         then its drop and the wake like every other record past live.
 
@@ -1005,7 +1022,6 @@ class Control:
             # S1 3c-6b: the sink read whole (membership, seq), its torn tail cut, before any LINEAGE-APPEND is served;
             # a corrupt sink refuses the start ``lineage-corrupt``
             self.lineage.start()
-        past = False
         for rec in sorted(self.store.all(), key=lambda r: r.session):
             if rec.state in R.LIVE_STATES:
                 self._revoke_after_eof(rec.session)
@@ -1013,9 +1029,9 @@ class Control:
             if rec.lease_live:
                 self._revoke_after_eof(rec.session)      # past live: clears the flag only
             self._drop(rec.session)
-            past = True
-        if past:
-            self._wake()
+        # always (3c-7 fix r1, obs 2): the pool mirror starts empty and admits no mint until root's next SLOT-SYNC,
+        # which the woken reaper's pass sends
+        self._wake()
 
     def stop(self) -> None:
         """Stop serving WITHOUT revoking: the records stay as they are, and the next :meth:`start` revokes
@@ -1442,33 +1458,41 @@ class Control:
                     raise Refused("claims-mismatch")
             # §3.5 BINDING: the mirror shows the slot leased to this session at once, BEFORE the ticket leaves the
             # unbound count, so the free count never rises between the two (prepare wrote this lease already)
-            self.pool.mark_leased(slot[0], slot[1], session, slot[2],
-                                  int(claims["slot_rev"]))                               # type: ignore[arg-type]
-            with self.store.lock(session):
-                if self.store.get(session) is not None:
-                    raise Refused("session-exists")
-                if lease.ticket is not None:
-                    # journaled before the record exists: a crash between the two leaves the ticket bound and no
-                    # session, which runs nothing; CONTROL's next start unbinds it (head ruling H8)
-                    facts = dict(self._ticket_store().bind(lease.ticket, session, slot).facts)
-                try:
-                    rec = R.SessionState(session=session, generation=0, state=R.ALLOCATED, claims=claims,
-                                         lease_live=True, event_kind="state",
-                                         updated_at=R.timestamp(self._clock()))
-                    self.store.put(rec)
-                except R.NotDurable as e:
-                    # the record was renamed into place: it exists and the bind stands, so the ATTACH is SETTLED
-                    # below as one that landed (fix 2, codex 4 + complement 1), then its failure is answered
-                    landed = e
-                except BaseException:
-                    # 3c-5 fix 1 (L2 4a): no record was written, so the binding is undone and journaled; if that
-                    # append fails the store is poisoned and the restart's H8 pass unbinds it instead
-                    if facts is not None:
-                        try:
-                            self._ticket_store().unbind(str(lease.ticket), session)
-                        except Refused:
-                            pass
-                    raise
+            prior, mark = self.pool.mark_leased(slot[0], slot[1], session, slot[2],
+                                                int(claims["slot_rev"]))                 # type: ignore[arg-type]
+            try:
+                with self.store.lock(session):
+                    if self.store.get(session) is not None:
+                        raise Refused("session-exists")
+                    if lease.ticket is not None:
+                        # journaled before the record exists: a crash between the two leaves the ticket bound and no
+                        # session, which runs nothing; CONTROL's next start unbinds it (head ruling H8)
+                        facts = dict(self._ticket_store().bind(lease.ticket, session, slot).facts)
+                    try:
+                        rec = R.SessionState(session=session, generation=0, state=R.ALLOCATED, claims=claims,
+                                             lease_live=True, event_kind="state",
+                                             updated_at=R.timestamp(self._clock()))
+                        self.store.put(rec)
+                    except R.NotDurable as e:
+                        # the record was renamed into place: it exists and the bind stands, so the ATTACH is SETTLED
+                        # below as one that landed (fix 2, codex 4 + complement 1), then its failure is answered
+                        landed = e
+                    except BaseException:
+                        # 3c-5 fix 1 (L2 4a): no record was written, so the binding is undone and journaled; if
+                        # that append fails the store is poisoned and the restart's H8 pass unbinds it instead
+                        if facts is not None:
+                            try:
+                                self._ticket_store().unbind(str(lease.ticket), session)
+                            except Refused:
+                                pass
+                        raise
+            except Refused as e:
+                # fix r1 (complement 3): a refusal by name tells prepare CONTROL created nothing, and prepare puts
+                # its lease back, so the mark goes too; `record-unsettled` (and any non-refusal, answered
+                # `internal-error`) is ambiguous to prepare, which keeps the slot leased, so the mark stays
+                if e.name != "record-unsettled":
+                    self.pool.unmark(slot[0], slot[1], prior, mark)
+                raise
         except BaseException:
             with self._mu:
                 lease.used = False
@@ -1830,7 +1854,12 @@ class Control:
         for obj in raw:
             if type(obj) is not dict:
                 raise Refused("slot-state-malformed", "an entry is not an object")
-            st = R.parse_slot_state(canon.canonical_bytes(obj))
+            try:
+                data = canon.canonical_bytes(obj)
+            except (ContractError, TypeError, ValueError, RecursionError):
+                # fix r1 (complement 2): an in-process entry JSON cannot write (a wire frame is canonical already)
+                raise Refused("slot-state-malformed", "an entry is not a JSON value") from None
+            st = R.parse_slot_state(data)
             key = (st.slot.slot_class, st.slot.index)
             if key in seen:
                 raise Refused("bad-value", f"slots lists {st.slot.tag} twice")
