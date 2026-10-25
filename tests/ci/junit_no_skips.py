@@ -18,14 +18,15 @@ def main(path: str) -> int:
     skipped, xfailed, bad, total = [], 0, 0, 0
     for case in root.iter("testcase"):
         total += 1
+        failed = case.find("failure") is not None or case.find("error") is not None
         sk = case.find("skipped")
-        if sk is not None:
+        if failed:
+            bad += 1
+        elif sk is not None:
             if sk.get("type") == "pytest.xfail":
                 xfailed += 1
             else:
                 skipped.append(f"SKIPPED {case.get('classname')}::{case.get('name')}: {sk.get('message')}")
-        elif case.find("failure") is not None or case.find("error") is not None:
-            bad += 1
     passed = total - len(skipped) - xfailed - bad
     print(f"{passed} passed, {len(skipped)} skipped, {xfailed} xfailed, {bad} failed or errored, {total} collected")
     for line in skipped:
@@ -34,4 +35,7 @@ def main(path: str) -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print(__doc__.split("\n\n")[0] + "\n\nUsage: python tests/ci/junit_no_skips.py <junit.xml>", file=sys.stderr)
+        sys.exit(2)
     sys.exit(main(sys.argv[1]))
