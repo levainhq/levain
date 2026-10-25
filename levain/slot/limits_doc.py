@@ -10,9 +10,11 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 __all__ = ["AGENTS", "DEFAULTS", "KINDS", "LIMITS_FORMAT", "REPEAT_WINDOW", "SLOT_KINDS", "SLOT_LIMITS_MAX",
-           "SLOT_RANGE", "LimitsDocError", "slot_doc", "slot_values"]
+           "SLOT_RANGE", "POLICY_LIMITS", "LimitsDocError", "slot_doc", "slot_values"]
 
 LIMITS_FORMAT = "levain-limits/1"
+# the document's name under L/policy/: root writes it (the install helper's set-limits), the queue broker reads it
+POLICY_LIMITS = "limits"
 KINDS = ("calls", "active_hours", "fresh_tokens", "cache_read_tokens", "repeat")
 # F5b, ruled 10-19: on by default, set above the operator's measured sessions (design §3 holds the measurement and its command)
 DEFAULTS: Dict[str, float] = {"calls": 3000, "active_hours": 12, "fresh_tokens": 15_000_000,

@@ -15,6 +15,7 @@ from typing import Callable, Iterable, Literal, Mapping
 from levain.firing.hands import HostOS, Step, _abs
 from levain.slot import Refused
 from levain.slot.ids import SlotId
+from levain.slot.limits_doc import POLICY_LIMITS
 
 STORE: Mapping[str, Path] = {"darwin": Path("/private/var/levain"), "linux": Path("/var/levain")}    # §2.1
 RUN: Mapping[str, Path] = {"darwin": Path("/private/var/run/levain"), "linux": Path("/run/levain")}  # §2.2
@@ -286,17 +287,11 @@ def parse_pool_config(data: bytes) -> tuple[int, int]:
     return obj["slots"], obj["verifier_slots"]
 
 
-#: The slot limits' name under ``L/policy/``. Written here, not imported from :mod:`levain.qbroker.limits` (the reader),
-#: because root's 3.9 interpreter cannot import that module's chain and undo calls :func:`policy_limits_path` as root;
-#: a test pins the two equal.
-POLICY_LIMITS_NAME = "limits"
-
-
 def policy_limits_path(host: HostOS) -> Path:
     """``L/policy/limits``: the slot sessions' limits (``levain-limits/1``), root 0644, written only by the install
     helper's ``set-limits``, read by the queue broker, removed by ``undo``. Setup writes nothing here (no file is
     the defaults)."""
-    return STORE[host] / "policy" / POLICY_LIMITS_NAME
+    return STORE[host] / "policy" / POLICY_LIMITS
 
 
 def pool_config_steps(host: HostOS, slots: int, verifier_slots: int) -> list[Step]:

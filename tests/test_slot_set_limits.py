@@ -49,7 +49,6 @@ def test_set_limits_is_built():
 
 
 def test_the_policy_path_has_one_home():
-    assert layout.POLICY_LIMITS_NAME == POLICY_LIMITS        # written twice (root cannot import the reader), pinned
     for host in ("darwin", "linux"):
         assert layout.policy_limits_path(host) == layout.STORE[host] / "policy" / POLICY_LIMITS
 

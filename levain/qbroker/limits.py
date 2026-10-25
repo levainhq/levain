@@ -35,8 +35,7 @@ __all__ = ["POLICY_LIMITS", "LimitsUnavailable", "PolicyLimits"]
 
 log = logging.getLogger("levain.qbroker")
 
-# the file's name under L/policy/ (root writes it through the install helper's set-limits; this module only reads it)
-POLICY_LIMITS = "limits"
+POLICY_LIMITS = limits_doc.POLICY_LIMITS    # this module only reads the file; root writes it
 
 
 class LimitsUnavailable(Exception):

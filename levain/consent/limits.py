@@ -68,14 +68,14 @@ from typing import Any, Mapping
 from levain.autonomic.durable_sqlite import open_durable, write_transaction
 from levain.consent.record import tool_input_digest
 # the document layer has one home, importable under ROOT_PYTHON (3.9); re-exported here unchanged
-from levain.slot.limits_doc import (AGENTS, DEFAULTS, KINDS, LIMITS_FORMAT, REPEAT_WINDOW, SLOT_KINDS, SLOT_LIMITS_MAX,
+from levain.slot.limits_doc import (AGENTS, DEFAULTS, KINDS, LIMITS_FORMAT, POLICY_LIMITS, REPEAT_WINDOW, SLOT_KINDS, SLOT_LIMITS_MAX,
                                     SLOT_RANGE, LimitsDocError, slot_doc, slot_values)
 
 __all__ = ["ACTIVE_GAP", "DB_NAME", "DEFAULTS", "FAIL_DENY_AFTER", "GO", "KINDS", "LIMIT_TIER", "LIMIT_TOOL", "LIMITS_NAME",
            "Outcome", "REPEAT_WINDOW", "Verdict", "check", "file_extend", "release_if_extended", "retry_text", "stop_text",
            "verified_allow", "root_halted", "extended_by",
            "count_call", "extend", "load_limits", "session_root", "snapshot",
-           "AGENTS", "LIMITS_FORMAT", "LimitsDocError", "SLOT_KINDS", "SLOT_LIMITS_MAX", "SLOT_RANGE",
+           "AGENTS", "LIMITS_FORMAT", "LimitsDocError", "POLICY_LIMITS", "SLOT_KINDS", "SLOT_LIMITS_MAX", "SLOT_RANGE",
            "parse_limits_doc", "slot_doc", "slot_values"]
 
 DB_NAME = "limits.db"
