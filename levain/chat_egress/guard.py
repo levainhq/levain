@@ -152,7 +152,7 @@ def load_table(path: Path = TABLE_PATH) -> tuple[str, ...]:
     in coverage: DeniedTableError, refusing the launch, when it cannot be read, is malformed or a required network is
     not covered."""
     try:
-        raw = path.read_text()
+        raw = path.read_text(encoding="utf-8")
     except OSError as e:      # absent, a directory, unreadable: the launch is refused as the typed error
         raise DeniedTableError(f"denied table {path} cannot be read: {e.strerror or type(e).__name__}") from None
     except ValueError as e:   # a UnicodeDecodeError: not UTF-8
