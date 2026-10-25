@@ -17,6 +17,9 @@ Modes (`gate` modes block a writer-thread primitive; `scenario` is the hold scri
   replay-seed    admit three holds, all durable and unresolved, then block (the file a replay will read)
   replay-gate    (opens the file `replay-seed` left) block replay's `flush-opened`, after its batch was written
   close          T23: a flush that never returns, then `aclose(SHUTDOWN_WAIT_S)` and a normal exit
+  ack-w2         (3c-6a) a ticketed hold settled with its payload durable, then `ack` of its triple with the writer
+                 blocked after `os.write`, before the flush, of the `lineage-acked` line
+  ack-w1-torn    (3c-6a) the same, with HALF the `lineage-acked` line written, then block
 """
 from __future__ import annotations
 
@@ -65,6 +68,7 @@ gate = Gate()
 
 def install(mode: str) -> None:
     real_write, real_flush = L._os_write, L._flush
+    mode = {"ack-w2": "w2", "ack-w1-torn": "w1-torn"}.get(mode, mode)
 
     if mode in ("w1", "w1-torn"):
         def os_write(fd, data):
@@ -144,7 +148,20 @@ async def run(mode: str, path: str, arg: str) -> None:
         ev(at="aclose-end", took=time.monotonic() - t0, states=[h.state.name])
         return
     await prelude(led)
-    if mode == "prelude-only":
+    if mode in ("ack-w2", "ack-w1-torn"):
+        h2 = led.admit(SCOPE, CAP, bound, "r", {"lineage_base": {"run_id": "r-0123456789abcdef"}})
+        await h2.durable()
+        h2.send_gate()
+        h2.mark_sent()
+        h2.settle(AMOUNT, {"lineage": {"run_id": "r-0123456789abcdef", "settled": "yes"}})   # H6-28
+        await settle_resolved(h2)
+        ((triple, _),) = led.unacked()
+        ev(at="outbox", triple=list(triple), size=os.path.getsize(path))
+        gate.arm()
+        fut = led.ack([triple])
+        fut.add_done_callback(lambda f: ev(at="ack-counted"))
+        ev(at="ack-queued")
+    elif mode == "prelude-only":
         ev(at="gate", mode=mode)
     elif mode in ("w1", "w1-torn", "w2", "w3"):
         h2 = led.admit(SCOPE, CAP, bound, "r")

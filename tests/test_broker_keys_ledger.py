@@ -287,7 +287,7 @@ def _exit_case(monkeypatch, exit_: str, *, end_stubbed: bool = False) -> dict:
     up = _Up()
     seen = _durable_seen(monkeypatch)
     if end_stubbed:
-        monkeypatch.setattr(L.Hold, "end", lambda self: False)
+        monkeypatch.setattr(L.Hold, "end", lambda self, meta=None: False)
     hook: dict = {}
     if exit_ in _UNAVAILABLE or exit_ == "stale":
         seen_durable = L.Hold.durable
@@ -344,8 +344,8 @@ def _exit_case(monkeypatch, exit_: str, *, end_stubbed: bool = False) -> dict:
             if exit_ == "detached":
                 real_admit = rig.k._admit_hold
 
-                def admit_then_detach(*a):
-                    h = real_admit(*a)
+                def admit_then_detach(*a, **kw):
+                    h = real_admit(*a, **kw)
                     rig.conn.detached = True   # a phase 1 landing right after the admit
                     return h
 
@@ -547,9 +547,9 @@ def test_end_in_the_refusal_handler_does_not_raise(monkeypatch, ledger_state):
         else:
             hook["ledger"]._fault(None, "stall")
 
-    def end(self):
+    def end(self, meta=None):
         try:
-            r = real_end(self)
+            r = real_end(self, meta)
         except BaseException as e:
             ends.append(e)
             raise
@@ -806,7 +806,7 @@ def test_serve_attaches_before_start_and_closes_after(monkeypatch, tmp_path):
 # --- T4, T4b, T16: tripwires ----------------------------------------------------------------------------------------
 
 LEDGER_METHODS = frozenset({"admit", "attach", "aclose", "charged", "totals", "durable", "send_gate", "mark_sent",
-                            "end", "release", "settle", "uncertain"})
+                            "end", "release", "settle", "uncertain", "refused", "ack", "unacked"})
 #: the one ledger call a `finally` of keys.py may hold: `_serve`'s close, after `wait_done` (design §2.5, §2.7)
 FINALLY_ALLOW = {("_serve", "aclose"): 1}
 
