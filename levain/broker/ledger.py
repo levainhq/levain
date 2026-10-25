@@ -249,16 +249,18 @@ def lineage_payload(base: dict, outcome: str, at: str) -> dict:
 
 
 def _lineage_ok(meta: dict) -> bool:
-    """`meta["lineage"]` and `meta["lineage_base"]`, when present, are objects; a base must leave room for the payload
-    the ledger may build from it (a replay `restart` line that did not fit would be refused by the next replay)."""
+    """`meta["lineage"]` and `meta["lineage_base"]`, when present, are objects; a base must leave room for EVERY
+    payload the ledger may build from it (a replay `restart` line that did not fit would be refused by the next
+    replay): the `uncertain` one and the `released` one, whose null fields can make it the longer (r1 F5)."""
     if "lineage" in meta and type(meta["lineage"]) is not dict:
         return False
     if "lineage_base" in meta:
         base = meta["lineage_base"]
         if type(base) is not dict:
             return False
-        if not _meta_ok({"lineage": lineage_payload(base, UNCERTAIN, _AT_SAMPLE)}):
-            return False
+        for outcome in (UNCERTAIN, RELEASED):
+            if not _meta_ok({"lineage": lineage_payload(base, outcome, _AT_SAMPLE)}):
+                return False
     return True
 
 

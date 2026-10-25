@@ -310,6 +310,27 @@ def test_refused_refuses_malformed_and_unhealthy(tmp_path):
     asyncio.run(go())
 
 
+def _enc_len(meta) -> int:
+    return len(json.dumps(meta, sort_keys=True, separators=(",", ":"), ensure_ascii=True))
+
+
+def test_a_base_must_leave_room_for_both_payloads_the_ledger_may_build():
+    """r1 F5 (bound): the admit-time check of `lineage_base` covers BOTH payloads the ledger may build from it: the
+    `uncertain` one (restart, a SENT owner-end) and the `released` one (an unsent owner-end, close), which sets
+    `model_answered` / `provider_answered` null and `status` 0 and so is LONGER when the base lacks those keys. A base
+    whose uncertain payload fits exactly but whose released one does not is refused."""
+    def unc(b):
+        return _enc_len({"lineage": L.lineage_payload(b, L.UNCERTAIN, L._AT_SAMPLE)})
+
+    base = {"x": ""}
+    base["x"] = "y" * (L.META_MAX - unc(base))
+    assert unc(base) == L.META_MAX
+    assert _enc_len({"lineage": L.lineage_payload(base, L.RELEASED, L._AT_SAMPLE)}) > L.META_MAX
+    assert not L._lineage_ok({"lineage_base": base})
+    small = dict(base, x="y" * 10)
+    assert L._lineage_ok({"lineage_base": small})
+
+
 def test_outbox_committed_counts_pending_lines_and_unresolved_ticketed_holds(tmp_path):
     """r1 F1: `outbox_committed` is the outbox the ledger is committed to: durable payload lines with no ack, payload
     lines queued but not durable, and every live ticketed hold not yet resolved (each resolves with exactly one
