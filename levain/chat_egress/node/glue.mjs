@@ -31,6 +31,8 @@
 //
 // usage (S8's launcher): node glue.mjs --srt-dist <dist/sandbox dir> --listen-fd N --decider-fd N --obs-fd N
 //          --ca-fd N --lifeline-fd N --events <jsonl> --denied-table <denied_table.json>
+//          --credential-placements <json> (srt's credentialPlacements: one {class, host, scheme[, user]} per keyed
+//          record, no value; a record with no rule would go as srt's default, Bearer)
 // TEST SEAMS (never product; S8 passes none of them): --tls-ports, --http-ports (port stand-ins: macOS refuses a
 // non-root bind of 80/443), --carve (srt's allowedDomains literal-address carve-outs, for a 127.0.0.1 origin),
 // --resolve-map name=addr[,addr];..., --upstream-ca <pem>, --fifth-arg off and --terminate-ports (R15-14-3's
@@ -353,7 +355,9 @@ async function main(argv) {
   const sock = new NetSocket({ fd: Number(need('--decider-fd')), readable: true, writable: true });
   const obs = createObsChannel({ stream: new NetSocket({ fd: Number(need('--obs-fd')), readable: false, writable: true }),
     onFatal: why => fatal(7, why) });
-  const decider = createDecider({ input: sock, output: sock, timeoutMs: 130_000,
+  const placements = JSON.parse(opt('--credential-placements', '[]'));   // S8 always passes it; rigs may not
+  if (!Array.isArray(placements)) throw new Error('glue: --credential-placements is not a list');
+  const decider = createDecider({ input: sock, output: sock, timeoutMs: 130_000, credentialPlacements: placements,
     onDead: why => { console.error(`glue: decider dead: ${why}`); process.exit(3); } });
   const pem = readFileSync(Number(need('--ca-fd')), 'utf8');
   const mitmCA = createMitmCA({

@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from levain.chat_egress import advert, renew, strip
+from levain.chat_egress import advert, keys, renew, strip
 from levain.chat_egress import decider as dm
 from levain.chat_egress import records as rec
 from levain.chat_egress.resolver import Resolver, system_lookup
@@ -201,6 +201,7 @@ def start_egress(*, store: Any, launch_id: str, node: str, srt_dist: Path, event
     argv = [node, str(GLUE), "--srt-dist", str(srt_dist), "--listen-fd", str(lsock.fileno()),
             "--decider-fd", str(theirs.fileno()), "--obs-fd", str(obs_theirs.fileno()), "--ca-fd", str(ca_r),
             "--lifeline-fd", str(life_r), "--events", str(events), "--denied-table", str(DENIED_TABLE),
+            "--credential-placements", json.dumps(keys.credential_placements(routes), separators=(",", ":")),
             *(seams.glue_args if seams else ())]
     socks_srv = SocksRefuser()
     proc: subprocess.Popen | None = None
