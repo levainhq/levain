@@ -55,18 +55,17 @@ def make_origin():
 
 def _shutdown(L: Launch) -> None:
     """Always closes the launch's decider, whether the glue is still running, exited by itself or was stopped by the
-    test already; a second call is harmless."""
+    test already; a second call is harmless. A decider that does not close fails it, after the glue is reaped."""
     try:
-        os.close(L.life_w)
-    except OSError:
-        pass                                   # the test's own stop() closed it
-    try:
-        L.proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        L.proc.kill()
-        L.proc.wait(timeout=5)
+        L.close_life()                         # a no-op when the test's own stop() closed it
+        try:
+            L.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            L.proc.kill()
+            L.proc.wait(timeout=5)
     finally:
-        L.d.close(timeout_s=10)
+        closed = L.d.close(timeout_s=10)
+    assert closed, "a decider thread outlived the launch's close"
 
 
 @pytest.fixture
@@ -81,5 +80,11 @@ def make_launch_(tmp_path):
         return L
 
     yield make
-    for L in made:
-        _shutdown(L)
+    failed: list[BaseException] = []
+    for L in made:                             # one launch's failed teardown must not skip the rest
+        try:
+            _shutdown(L)
+        except BaseException as exc:           # noqa: BLE001 - re-raised below
+            failed.append(exc)
+    if failed:
+        raise failed[0]

@@ -171,7 +171,7 @@ def test_a_killed_glue_leaves_no_final_flush_and_the_report_says_unknown(make_or
         _wall_once(L, off)
     L.proc.send_signal(signal.SIGKILL)
     L.proc.wait(10)
-    os.close(L.life_w)
+    L.close_life()
     L.d.close(timeout_s=10)
     r = report.build_from_files(L.records.rows(L.launch_id), L.events)
     # the glue flushes a summary at a minute boundary: a kill after one reads as that summary (plus the later walls)
