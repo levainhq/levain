@@ -259,3 +259,19 @@ def test_an_unresolved_verifier_ticket_stops_the_follower(store, repo, served): 
         f.step()
     assert e.value.name == "ticket-unresolved" and not acked(served)
     f.close()
+
+
+def test_a_job_failed_elsewhere_is_passed_unacked_and_the_cursor_moves(store, repo, served):  # noqa: F811
+    """A run another verification outcome already failed: dispatch holds nothing from this event, so no ACK lets the
+    reaper trash the retained work; the follower moves past it."""
+    d = setup_verifier(store, repo, served)
+    other = {"kind": "state", "session": SESSION_V, "ticket": d.ticket, "state": "RETAINED",
+             "at": "2026-10-25T00:00:00.000000Z", "verifier_report_refused": "verifier-failed:exit"}
+    store.record_verification(d.run, envelope=None, event=other, repo=str(repo[0]), tree=base_tree(repo),
+                              model=model(0))
+    f = d.follower()
+    assert f.step() == CC.DEADLINE
+    assert store.get(d.job.id).history[-1].evidence == "verifier-failed:exit"
+    assert not acked(served)
+    assert store.event_cursor() == (served.events.journal_id, served.kept()[-1]["seq"])
+    f.close()

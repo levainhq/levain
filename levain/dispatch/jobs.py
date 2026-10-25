@@ -122,7 +122,8 @@ if TYPE_CHECKING:
 __all__ = [
     "CAUSES", "DB_NAME", "EDGES", "FORMAT", "STATES", "TERMINAL", "UNSIGNED_LEASE", "CapabilityRefused",
     "ENVELOPE_EVIDENCE_KEYS", "EnvelopeEnd", "EnvelopeRefused", "Job", "envelope_evidence",
-    "JobStore", "JobStoreError", "SignatureRefused", "Transition", "TransitionRefused", "default_dispatch_dir",
+    "JobStore", "JobStoreError", "AlreadyRecorded", "RecordConflict", "SignatureRefused", "Transition",
+    "TransitionRefused", "default_dispatch_dir",
 ]
 
 log = logging.getLogger("levain.dispatch.jobs")
@@ -230,6 +231,15 @@ class JobStoreError(DispatchError):
 
 class TransitionRefused(DispatchError):
     """A transition the edge table does not allow from the job's current state, or a job that does not exist."""
+
+
+class AlreadyRecorded(TransitionRefused):
+    """:meth:`JobStore.record_verification` refused a repeat: the store already holds THIS event's outcome for the run
+    (its report's digest as the run record's, or its refusal name as the job's ``verifier_refused`` evidence)."""
+
+
+class RecordConflict(TransitionRefused):
+    """:meth:`JobStore.record_verification` refused an event whose run already holds a record of another report."""
 
 
 class SignatureRefused(DispatchError):
@@ -560,6 +570,24 @@ def _terminal_event(event: Any, run: VerifierRun) -> tuple[str | None, str | Non
     if not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None:
         raise DispatchError("the session event's verifier_report_digest is not sha256:<64 hex>")
     return None, digest
+
+
+def _refuse_repeat(conn: sqlite3.Connection, job: Job, run: int, refused: str | None, digest: str | None) -> None:
+    """Refuse a verifier outcome job ``job`` cannot take for run ``run``: :class:`AlreadyRecorded` when the store
+    holds this outcome (the run's record carries this report digest, or a refusal of this name failed the job),
+    :class:`RecordConflict` when the run's record is another report's, :class:`TransitionRefused` when the job is
+    past verifying by any other cause. Returns when the job is verifying and the run unrecorded."""
+    row = conn.execute("SELECT envelope_digest FROM run_records WHERE job_id = ? AND run = ?", (job.id, run)).fetchone()
+    if row is not None:
+        if refused is None and row[0] == digest:
+            raise AlreadyRecorded(f"run {run} of job {job.id} is already recorded, with this report")
+        raise RecordConflict(f"run {run} of job {job.id} is already recorded, with another report; a run record is "
+                             "never replaced")
+    last = job.history[-1]
+    if refused is not None and (last.to_state, last.cause, last.evidence) == ("failed", "verifier_refused", refused):
+        raise AlreadyRecorded(f"job {job.id} already failed on this refusal")
+    if job.state != "verifying":
+        raise TransitionRefused(f"job {job.id} is {job.state}; only a verifying job records its verifier")
 
 
 def _stored_record(job_id: str, run: Any, text: Any, digest: Any) -> ArtifactRecord:
@@ -1353,13 +1381,7 @@ class JobStore:
         refused, report_digest = _terminal_event(event, run)
         with self._swept() as (conn, _stamp):
             job = self._must_load(conn, run.job_id)
-            recorded = conn.execute("SELECT 1 FROM run_records WHERE job_id = ? AND run = ?",
-                                    (job.id, run.run)).fetchone() is not None
-        if job.state != "verifying":
-            raise TransitionRefused(f"job {job.id} is {job.state}; only a verifying job records its verifier")
-        if recorded:
-            raise TransitionRefused(f"run {run.run} of job {job.id} is already recorded; a run record is never "
-                                    "replaced")
+            _refuse_repeat(conn, job, run.run, refused, report_digest)
         if repo != job.repo:
             raise DispatchError(f"the verifier ran for another repository than job {job.id}'s")
         contract = job.contract
@@ -1401,19 +1423,19 @@ class JobStore:
             problem = adopt.artifact_problem(repo, job, record)
             if problem is not None:
                 raise DispatchError(problem)
-        lost: str | None = None
+        lost: TransitionRefused | None = None
         with self._swept() as (conn, stamp):
             current = self._must_load(conn, job.id)
             if current.state != "verifying":
-                lost = current.state
+                try:
+                    _refuse_repeat(conn, current, run.run, refused, report_digest)
+                except TransitionRefused as exc:
+                    lost = exc
             elif record is None:
                 assert name is not None
                 # another writer may have recorded this run since the pre-read: its record stands, and this
                 # writer's infrastructure failure is refused rather than failing a job that holds it
-                if conn.execute("SELECT 1 FROM run_records WHERE job_id = ? AND run = ?",
-                                (job.id, run.run)).fetchone() is not None:
-                    raise TransitionRefused(f"run {run.run} of job {job.id} is already recorded; a run record is "
-                                            "never replaced")
+                _refuse_repeat(conn, current, run.run, refused, report_digest)
                 self._apply(conn, job.id, "failed", "verifier_refused", stamp, name)
             else:
                 try:
@@ -1422,8 +1444,8 @@ class JobStore:
                                  (job.id, record.run, canonical(record.to_mapping()), adopt.artifact_digest(record),
                                   report.digest, stamp))
                 except sqlite3.IntegrityError:
-                    raise TransitionRefused(f"run {record.run} of job {job.id} is already recorded; a run record "
-                                            "is never replaced") from None
+                    _refuse_repeat(conn, current, run.run, refused, report_digest)
+                    raise
                 failure = report.first_failure
                 if failure is not None:
                     self._apply(conn, job.id, "failed", "verifier_fail", stamp,
@@ -1449,7 +1471,7 @@ class JobStore:
             except adopt.GitFault:
                 pass
         if lost is not None:
-            raise TransitionRefused(f"job {job.id} is {lost}; only a verifying job records its verifier")
+            raise lost
         return out
 
     def run_records(self, job_id: str) -> list[ArtifactRecord]:

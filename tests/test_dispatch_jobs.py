@@ -1357,3 +1357,38 @@ def test_an_unreadable_stored_record_in_the_pass_count_is_a_damaged_store(tmp_pa
     with pytest.raises(JobStoreError, match="damaged"):
         verify(store, repo, job, 1)
     assert store.get(job.id).state == "verifying"
+
+
+OTHER_DIGEST = "sha256:" + "0" * 64
+
+
+def test_a_repeat_names_itself_and_another_report_for_the_run_is_a_conflict(store, repo):
+    """record_verification tells an idempotent repeat (this event's outcome held) from a conflict (another report's
+    record for the run) and from a job ended by another cause, so its caller ACKs only what the store holds."""
+    from levain.dispatch.jobs import AlreadyRecorded, RecordConflict
+    from tests import test_dispatch_verifier_report as tvr
+
+    job, _ = at_state(store, repo, "verifying")
+    r = tvr.vrun(job.id, 0)
+    raw, digest = tvr.envelope(r, tvr.body(("pass", "pass")))
+    verify(store, repo, job, 0, raw=raw, ev=tvr.event(r, at=VERIFIED_AT, verifier_report_digest=digest))
+    with pytest.raises(AlreadyRecorded):
+        verify(store, repo, job, 0, raw=raw, ev=tvr.event(r, at=VERIFIED_AT, verifier_report_digest=digest))
+    with pytest.raises(RecordConflict):
+        verify(store, repo, job, 0, raw=raw, ev=tvr.event(r, at=VERIFIED_AT, verifier_report_digest=OTHER_DIGEST))
+    with pytest.raises(RecordConflict):
+        verify(store, repo, job, 0, ev=tvr.event(r, at=VERIFIED_AT, verifier_report_refused="verifier-failed:exit"))
+
+
+def test_a_refusal_repeat_names_itself_and_a_job_failed_otherwise_is_a_plain_refusal(store, repo):
+    from levain.dispatch.jobs import AlreadyRecorded
+    from tests import test_dispatch_verifier_report as tvr
+
+    other, _ = at_state(store, repo, "verifying")
+    o = tvr.vrun(other.id, 0)
+    verify(store, repo, other, 0, ev=tvr.event(o, at=VERIFIED_AT, verifier_report_refused="verifier-failed:exit"))
+    with pytest.raises(AlreadyRecorded):
+        verify(store, repo, other, 0, ev=tvr.event(o, at=VERIFIED_AT, verifier_report_refused="verifier-failed:exit"))
+    with pytest.raises(TransitionRefused) as exc:
+        verify(store, repo, other, 0, ev=tvr.event(o, at=VERIFIED_AT, verifier_report_refused="verifier-failed:other"))
+    assert type(exc.value) is TransitionRefused

@@ -10,7 +10,10 @@ Slice 1 handles:
 
 - a ``state`` event into a terminal session state (``jobs._SESSION_TERMINAL``) that carries a verifier report digest or
   refusal: :meth:`JobStore.record_verification` with the inputs the caller's ``resolve`` gives for it, then
-  ``ARTIFACT-ACK {ticket, verifier_report_digest}`` (no digest for ``verifier_report_refused``);
+  ``ARTIFACT-ACK {ticket, verifier_report_digest}`` (no digest for ``verifier_report_refused``). The ACK goes only
+  when the store holds THIS event's outcome (written now, or :class:`levain.dispatch.jobs.AlreadyRecorded`); a run
+  holding another report's record stops the follower (``record-conflict``); a job ended by another cause is passed
+  WITHOUT an ACK, retention falling back to ``dispatch_retain_days``;
 - an ``artifact`` event: passed WITHOUT an ACK. Nothing reads the exported artifact yet, and an ACK before that read
   would let the reaper trash work dispatch never took; retention falls back to ``dispatch_retain_days``;
 - every other event (other states, ``pool``, a kind this module does not know): passed.
@@ -30,7 +33,7 @@ from typing import Any, Callable, Mapping
 
 from levain.cockpit.consent import utc_stamp
 from levain.dispatch import DispatchError
-from levain.dispatch.jobs import _SESSION_TERMINAL, JobStore, TransitionRefused
+from levain.dispatch.jobs import _SESSION_TERMINAL, AlreadyRecorded, JobStore, RecordConflict, TransitionRefused
 from levain.dispatch.verifier_report import VerifierRun
 from levain.slot import Refused
 from levain.slot import control_client as CC
@@ -146,11 +149,17 @@ class EventFollower:
         try:
             self.jobs.record_verification(call.run, envelope=call.envelope, event=dispatch_event, repo=call.repo,
                                           tree=call.tree, model=call.model)
+        except AlreadyRecorded:
+            pass                                       # an idempotent repeat: dispatch holds this outcome, so ACK
+        except RecordConflict as e:
+            raise FollowStopped("record-conflict", f"event {ev.seq}: {e}") from None
         except TransitionRefused as e:
-            # a repeat (the run recorded, or the job past verifying) is done; an unknown job is a disagreement
-            job = self.jobs.get(call.run.job_id)
-            if job is None:
+            if self.jobs.get(call.run.job_id) is None:
                 raise FollowStopped("job-unknown", f"event {ev.seq}: {e}") from None
+            # the job ended by another cause: dispatch took nothing from this event, and an ACK would let the reaper
+            # trash the retained work, so it is passed unacked (retention falls back to dispatch_retain_days)
+            log.info("verifier event %d (ticket %s) passed unacked: %s", ev.seq, body.get("ticket"), e)
+            return
         except DispatchError as e:
             raise FollowStopped("record-refused", f"event {ev.seq}: {e}") from None
         self._hit("written", ev.seq)
