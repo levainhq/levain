@@ -2090,7 +2090,7 @@ class Control:
         acks its report: the record's ``verifier_report_digest``, or ``verifier_report_refused`` with no digest named.
         Anything else is ``artifact-not-published`` (the other kind's digest included). The ack is written as
         ``artifact_acked: true`` (its own generation, ``event_kind: none``); an ack of a record already acked answers
-        ``{}`` and writes nothing. Then the reaper is woken: its retention step moves the RETAINED session to TRASH
+        ``{}`` and writes nothing. Then the reaper is woken, a repeat ack's too: its retention step moves the RETAINED session to TRASH
         (§7.7 3c)."""
         ticket = _handle(args["ticket"], "ticket")
         named = sorted({"artifact_digest", "verifier_report_digest"} & set(args))
@@ -2121,10 +2121,9 @@ class Control:
             published = (rec.fields.get(have) == digest) if digest is not None else (failed in rec.fields)
             if not published:
                 raise Refused("artifact-not-published")
-            if rec.fields.get("artifact_acked") is True:
-                return {}
-            self._write(rec, fields={**rec.fields, "artifact_acked": True}, event_kind="none")
-        self._wake()
+            if rec.fields.get("artifact_acked") is not True:
+                self._write(rec, fields={**rec.fields, "artifact_acked": True}, event_kind="none")
+        self._wake()                                     # a repeat ack too: a wake lost after the first is made good
         return {}
 
     def _op_session_events(self, conn: Conn, args: dict) -> dict[str, object]:

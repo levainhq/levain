@@ -597,3 +597,17 @@ def test_verifier_ticket_acks_its_report(st, refusal):  # noqa: F811
         assert refused(ack(rig, ticket=ticket)) == "artifact-not-published"
         assert ack(rig, ticket=ticket, verifier_report_digest=DIG)["ok"]
     assert rig.control.store.get(SESSION_V).fields["artifact_acked"] is True
+
+
+def test_a_repeat_artifact_ack_wakes_the_reaper_too(erig):
+    """3c-8 slice 2 fix r3 (b): an ack of a record already acked writes nothing but still wakes the reaper, so a wake
+    lost after the first ack is made good by dispatch's retry."""
+    wakes = []
+    erig.control._wake_reaper = lambda: wakes.append(1)
+    ticket, _r, _a = bound_session(erig)
+    to_retained(erig)
+    cas(erig, R.RETAINED, R.RETAINED, artifact_digest=DIG)
+    assert ack(erig, ticket=ticket, artifact_digest=DIG)["ok"]
+    gen, n = erig.control.store.get(SESSION).generation, len(wakes)
+    assert ack(erig, ticket=ticket, artifact_digest=DIG)["ok"]
+    assert erig.control.store.get(SESSION).generation == gen and len(wakes) == n + 1
